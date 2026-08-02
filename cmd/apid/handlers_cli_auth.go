@@ -289,7 +289,10 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 	// today?" from the GDPR export.
 	autoCreated := errors.Is(err, state.ErrNotFound)
 	if autoCreated {
-		acct, err = h.srv.store.CreateAccount(r.Context(), email, api.PlanFree)
+		res, err := h.srv.store.CreateAccountWithPersonalOrg(r.Context(), state.CreateAccountWithPersonalOrgParams{
+			Email: email,
+			Plan:  api.PlanFree,
+		})
 		if err != nil {
 			// Log only the operation path; the err.Error() string is
 			// flagged by CodeQL go/log-injection because it carries
@@ -301,6 +304,7 @@ func (h *cliAuthHandlers) postCliAuthPage(w http.ResponseWriter, r *http.Request
 			h.renderCliAuthError(w, r, "Could not sign you up", "Please try again.")
 			return
 		}
+		acct = res.Account
 		// codeql[go/log-injection] false-positive: acct.ID is server-generated via newID() (hex of crypto/rand{16}); CodeQL's taint engine conservatively tracks the email argument through CreateAccount into the returned Account struct, but acct.ID itself is not user-controllable. Mirrors the precedent in cmd/apid/handlers.go:67.
 		h.log.Info("cli_auth.auto_created_account",
 			"event", api.EventCliAuthAutoCreated,

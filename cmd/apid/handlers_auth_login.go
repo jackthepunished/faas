@@ -149,7 +149,11 @@ func (s *server) postSignup(w http.ResponseWriter, r *http.Request) {
 		// email will return state.ErrConflict; we collapse to the
 		// sign-in path so the duplicate caller signs in (idempotent)
 		// rather than learning "this email is taken".
-		created, createErr := s.store.CreateAccount(r.Context(), email, api.PlanFree)
+		res, createErr := s.store.CreateAccountWithPersonalOrg(r.Context(), state.CreateAccountWithPersonalOrgParams{
+			Email: email,
+			Plan:  api.PlanFree,
+		})
+		created := res.Account
 		if createErr != nil {
 			if errors.Is(createErr, state.ErrConflict) {
 				// Concurrent signup. Re-issue the verify path so

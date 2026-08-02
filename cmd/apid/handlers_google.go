@@ -312,15 +312,18 @@ func (s *server) provisionOrFetchGoogleAccount(ctx context.Context, info GoogleU
 
 	// Neither sub nor email is bound: create a fresh account on
 	// the Free plan and bind the link.
-	created, err := s.store.CreateAccount(ctx, email, api.PlanFree)
+	res, err := s.store.CreateAccountWithPersonalOrg(ctx, state.CreateAccountWithPersonalOrgParams{
+		Email: email,
+		Plan:  api.PlanFree,
+	})
 	if err != nil {
 		return state.Account{}, err
 	}
-	if err := s.store.UpsertOAuthLink(ctx, created.ID, "google", info.ID, email, info.VerifiedEmail); err != nil {
+	if err := s.store.UpsertOAuthLink(ctx, res.Account.ID, "google", info.ID, email, info.VerifiedEmail); err != nil {
 		// The link is the §11 invariant. Log but don't fail the
 		// sign-in — the customer can re-trigger the bind on the
 		// next login.
 		s.log.Error("google.upsert_link", "err", err)
 	}
-	return created, nil
+	return res.Account, nil
 }

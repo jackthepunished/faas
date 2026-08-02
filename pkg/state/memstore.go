@@ -568,6 +568,71 @@ func (m *MemStore) CreateAccount(_ context.Context, email string, plan api.Plan)
 	return a, nil
 }
 
+// CreateAccountWithPersonalOrg is the PR 3 canonical
+// account-creation entry point (issue #190 / ADR-061). The m.mu
+// lock is the atomicity boundary — under the lock we run the email
+// uniqueness probe, the personal-org uniqueness probe, the three
+// in-memory inserts, and return. The mutex serialises concurrent
+// callers so the partial-unique invariant the SQL partial index
+// enforces is preserved in MemStore.
+func (m *MemStore) CreateAccountWithPersonalOrg(_ context.Context, params CreateAccountWithPersonalOrgParams) (CreateAccountWithPersonalOrgResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 1. Email uniqueness probe.
+	for _, a := range m.accounts {
+		if a.Email == params.Email {
+			return CreateAccountWithPersonalOrgResult{}, ErrConflict
+		}
+	}
+	now := time.Now().UTC()
+	acct := Account{
+		ID:        newID(),
+		Email:     params.Email,
+		Plan:      params.Plan,
+		Status:    AccountActive,
+		CreatedAt: now,
+	}
+	m.accounts[acct.ID] = acct
+
+	// 2. Personal org uniqueness probe — mirrors the SQL partial
+	//    unique orgs_one_personal_per_account_uniq.
+	ownerID := acct.ID
+	for _, existing := range m.orgs {
+		if existing.Personal && existing.PersonalOwnerAccountID != nil &&
+			*existing.PersonalOwnerAccountID == ownerID {
+			// Roll back the account insert so the surrounding mutex
+			// doesn't observe a half-state if a future caller relies
+			// on the map's invariants.
+			delete(m.accounts, acct.ID)
+			return CreateAccountWithPersonalOrgResult{}, ErrConflict
+		}
+	}
+	org := Org{
+		ID:                     newID(),
+		Slug:                   PersonalOrgSlug(acct.ID),
+		Name:                   "Personal",
+		Personal:               true,
+		PersonalOwnerAccountID: &ownerID,
+		Plan:                   acct.Plan,
+		Status:                 OrgStatusActive,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}
+	m.orgs[org.ID] = org
+	m.orgsBySlug[strings.ToLower(org.Slug)] = org.ID
+
+	// 3. Owner membership row. The first owner for the org — the
+	//    last-owner guard from AddOrgMember is irrelevant here.
+	m.memberships[orgAccountKey{OrgID: org.ID, AccountID: acct.ID}] = OrgMembership{
+		OrgID:     org.ID,
+		AccountID: acct.ID,
+		Role:      OrgRoleOwner,
+		JoinedAt:  now,
+	}
+	return CreateAccountWithPersonalOrgResult{Account: acct, PersonalOrg: org}, nil
+}
+
 func (m *MemStore) AccountByID(_ context.Context, id string) (Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

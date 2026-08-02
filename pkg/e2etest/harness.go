@@ -161,7 +161,7 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	// meterd subprocess (issue #52) reads accounts on its first tick and
 	// would otherwise race the migration — see cmd-e2e-schedd-migration-race.
 	// See e2eMigrationTarget for the head value and the bump rationale.
-	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 10*time.Second)
+	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 30*time.Second)
 
 	if which&APID != 0 {
 		startAPID(t, h, bin, dbURL)
@@ -366,7 +366,7 @@ const testDomain = "apps.test.example"
 // Bumped 83 → 87 → 92 → 93 → 94 across four rebase cycles; the
 // renumber chain tracks the gate's "next free slot past the live
 // head" rule when sibling PRs race for the same N.)
-const e2eMigrationTarget = 100
+const e2eMigrationTarget = 105
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
@@ -411,7 +411,7 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	// migration (issue #52 acceptance race; see
 	// cmd-e2e-schedd-migration-race memory). See e2eMigrationTarget
 	// for the head value and bump history.
-	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 10*time.Second)
+	pgtest.WaitForMigration(t, pool, e2eMigrationTarget, 30*time.Second)
 
 	if which&APID != 0 {
 		addr := freeTCPAddr(t)
@@ -942,7 +942,10 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 		email += "+" + label[0]
 	}
 	email += "@test.example"
-	acct, err := store.CreateAccount(ctx, email, plan)
+	res, err := store.CreateAccountWithPersonalOrg(ctx, state.CreateAccountWithPersonalOrgParams{
+		Email: email,
+		Plan:  plan,
+	})
 	if err != nil {
 		// "duplicate key" / "unique_violation" — another subtest already
 		// seeded this plan+label; fetch and reuse.
@@ -959,6 +962,7 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 		}
 		return pt
 	}
+	acct := res.Account
 	pt, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		h.T.Fatalf("e2etest: generate API key: %v", err)

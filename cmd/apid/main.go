@@ -51,6 +51,13 @@ func seedDevAccount(ctx context.Context, store state.Store, token string) error 
 	}
 	acct, err := store.AccountByEmail(ctx, "dev@local")
 	if errors.Is(err, state.ErrNotFound) {
+		// Intentionally NOT routed through CreateAccountWithPersonalOrg — the
+		// dev bootstrap is a synthetic local-only fixture. Production
+		// signup paths (postSignup, OAuth callbacks, CLI activation) wrap
+		// every account through the helper; the dev bootstrap is opt-out by
+		// design. The PR 3 backfill (migrations/00101) and the e2e harness
+		// SeedAccount cover the "every account has a personal org"
+		// invariant.
 		acct, err = store.CreateAccount(ctx, "dev@local", api.PlanFree)
 		if err != nil {
 			return err

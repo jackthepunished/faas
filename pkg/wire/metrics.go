@@ -115,6 +115,16 @@ type OpsMetrics struct {
 	// from the control-plane dur histogram whose sub-millisecond
 	// buckets are wrong for a Postgres call.
 	auditWriteDur *prometheus.HistogramVec
+	// accountOrgMismatch: PR 3 (issue #190, ADR-061) registers the
+	// counter on every daemon; PR 4 (handlers) and PR 6 (billing
+	// webhook) emit on it when the dual-write path detects that
+	// account.* and the personal-org mirror disagree. Labelled by
+	// kind ∈ {plan, status, provider_customer_id,
+	// stripe_subscription_item} — the closed set of mirrored fields
+	// per ADR-061. Observation-only — writes never block on
+	// mismatch. PR 7's cutover gate is "rate() == 0 for ≥1 metering
+	// cycle"; this counter is the gate's input signal.
+	accountOrgMismatch *prometheus.CounterVec
 	// requestFailures: HTTP requests completed with status >= 400,
 	// labelled by account_id, the route template, and code ∈ {ok, err}
 	// (issue #278; PR #336 added the `code` label, issue #303 follow-up
@@ -683,6 +693,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_audit_write_failures_total",
 		Help: "Count of apid-side auth audit emits (IAM-4, ADR-035) whose events row could not be written, labelled by account_id. The handler has already returned 200; this is observation-only. account_id=\"__other__\" is the bounded admission overflow bucket — operators must check daemon slog for the original id (issue #278).",
 	}, []string{"account_id"})
+	// accountOrgMismatch (PR 3, issue #190, ADR-061). Closed label
+	// set pre-instantiated at boot so /metrics surfaces zero from
+	// the first scrape, matching the precedent at the requestTotal
+	// / requestFailures counter initialiser pattern (kind
+	// cardinality is a fixed 4). PR 4 / PR 6 emit on this counter
+	// from the dual-write paths.
+	accountOrgMismatch := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_account_org_mismatch_total",
+		Help: "Count of writes where the account.* and personal-org mirror disagreed, labelled by kind ∈ {plan, status, provider_customer_id, stripe_subscription_item} (issue #190, ADR-061). Observation-only — writes never block on mismatch. PR 7's cutover gate is rate() == 0 for ≥1 metering cycle.",
+	}, []string{"kind"})
+	for _, kind := range []string{
+		"plan", "status", "provider_customer_id", "stripe_subscription_item",
+	} {
+		accountOrgMismatch.WithLabelValues(kind)
+	}
 	// issue #286 — failed-login audit evidence (SOC 2 CC7.2). Counts
 	// every failed login attempt on the dashboard auth surface
 	// (`POST /login`, `POST /signup`, OAuth callback denial paths).
@@ -1124,7 +1149,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
 		ops, dur, watchdogKills, eventsWriteFail, auditWriteFail,
-		auditWriteDur, requestFailures, requestTotal, stripePushDur, paddlePushDur,
+		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
 		wakeIDV4Fallback,
@@ -1460,6 +1485,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		eventsWriteFail:                    eventsWriteFail,
 		auditWriteFail:                     auditWriteFail,
 		auditWriteDur:                      auditWriteDur,
+		accountOrgMismatch:                 accountOrgMismatch,
 		requestFailures:                    requestFailures,
 		requestTotal:                       requestTotal,
 		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
@@ -1571,6 +1597,21 @@ func (m *OpsMetrics) AuditWriteFailures(accountID string) prometheus.Counter {
 		return nil
 	}
 	return m.auditWriteFail.WithLabelValues(m.accountLabel(accountID))
+}
+
+// AccountOrgMismatch returns the per-kind account/org-mirror mismatch
+// counter (issue #190, ADR-061). kind ∈ {plan, status,
+// provider_customer_id, stripe_subscription_item} — the closed set of
+// mirrored fields. PR 3 registers the counter; PR 4 (handlers) and
+// PR 6 (billing webhook) call this from the dual-write paths. The
+// closed label set is pre-instantiated at boot so /metrics surfaces
+// zero from the first scrape. PR 7's cutover gate
+// ("rate() == 0 for ≥1 metering cycle") reads this counter.
+func (m *OpsMetrics) AccountOrgMismatch(kind string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.accountOrgMismatch.WithLabelValues(kind)
 }
 
 // AuditWriteFailureDuration returns the per-result observer for the

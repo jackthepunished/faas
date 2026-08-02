@@ -75,6 +75,72 @@ func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan
 	return acct, nil
 }
 
+// CreateAccountWithPersonalOrg is the PR 3 canonical
+// account-creation entry point (issue #190 / ADR-061). Runs the
+// three INSERTs under one tx so the "every account has exactly one
+// personal org" invariant is atomic at the SQL layer.
+//
+// The partial unique orgs_one_personal_per_account_uniq
+// (migrations/00099) is the SQL-level tripwire against any future
+// concurrent caller; ReadCommitted isolation is sufficient because
+// the tripwire fires at any level. The pgerrcode.MapErr funnel
+// maps 23505 (accounts.email UNIQUE) to state.ErrConflict so the
+// postSignup / OAuth ladders collapse to the idempotent-signin
+// path on a duplicate email.
+func (s *PgStore) CreateAccountWithPersonalOrg(ctx context.Context, params CreateAccountWithPersonalOrgParams) (CreateAccountWithPersonalOrgResult, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return CreateAccountWithPersonalOrgResult{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	// 1. Account INSERT.
+	acct, err := scanAccountCols(tx.QueryRow(ctx,
+		`insert into accounts (email, plan, status) values ($1, $2, 'active')
+		 returning id, email, plan, status, coalesce(provider_customer_id,''),
+		           coalesce(stripe_subscription_item,''), created_at,
+		           deletion_requested_at, last_quota_warning_at, past_due_at,
+		           mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash,
+		           mfa_required`,
+		params.Email, string(params.Plan)).Scan)
+	if err != nil {
+		return CreateAccountWithPersonalOrgResult{}, mapErr(err)
+	}
+
+	// 2. Personal org INSERT. personal_owner_account_id points back at
+	//    the freshly minted account; the partial unique enforces
+	//    at most one personal org per account.
+	org, err := scanOrg(tx.QueryRow(ctx, `
+		insert into orgs (
+		    id, slug, name, personal_org, personal_owner_account_id,
+		    plan, status, created_at, updated_at
+		) values (
+		    gen_random_uuid(), $1, 'Personal', true, $2,
+		    $3, 'active', now(), now()
+		)
+		returning id, slug, name, personal_org, personal_owner_account_id,
+		          plan, status, provider_customer_id, stripe_subscription_item,
+		          deleted_pending, created_at, updated_at
+	`, PersonalOrgSlug(acct.ID), acct.ID, string(acct.Plan)))
+	if err != nil {
+		return CreateAccountWithPersonalOrgResult{}, mapErr(err)
+	}
+
+	// 3. Owner membership INSERT. The exactly-one-owner partial unique
+	//    org_memberships_one_owner_idx enforces at the SQL layer.
+	if _, err := tx.Exec(ctx, `
+		insert into org_memberships (org_id, account_id, role, invited_by_account_id)
+		values ($1, $2, 'owner', null)
+	`, org.ID, acct.ID); err != nil {
+		return CreateAccountWithPersonalOrgResult{}, mapErr(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return CreateAccountWithPersonalOrgResult{}, fmt.Errorf("state: commit: %w", err)
+	}
+	return CreateAccountWithPersonalOrgResult{Account: acct, PersonalOrg: org}, nil
+}
+
 func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = $1`, id)

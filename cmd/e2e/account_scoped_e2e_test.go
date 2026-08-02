@@ -44,10 +44,14 @@ func seedAccount(t *testing.T, h *e2etest.Harness, ctx context.Context,
 	label string, plan api.Plan) (string, string) {
 	t.Helper()
 	store := state.NewPgStore(h.Pool)
-	acct, err := store.CreateAccount(ctx, "e2e+"+label+"@test.example", plan)
+	res, err := store.CreateAccountWithPersonalOrg(ctx, state.CreateAccountWithPersonalOrgParams{
+		Email: "e2e+" + label + "@test.example",
+		Plan:  plan,
+	})
 	if err != nil {
-		t.Fatalf("CreateAccount: %v", err)
+		t.Fatalf("CreateAccountWithPersonalOrg: %v", err)
 	}
+	acct := res.Account
 	pt, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		t.Fatalf("GenerateAPIKey: %v", err)
@@ -111,10 +115,14 @@ func TestE2E_ListInstancesForAccount_AcrossApps(t *testing.T) {
 	ctx := context.Background()
 	nodeID := defaultLocalComputeNodeID(t, ctx, store)
 
-	acct, err := store.CreateAccount(ctx, "e2e+fanin@test.example", api.PlanHobby)
+	res, err := store.CreateAccountWithPersonalOrg(ctx, state.CreateAccountWithPersonalOrgParams{
+		Email: "e2e+fanin@test.example",
+		Plan:  api.PlanHobby,
+	})
 	if err != nil {
-		t.Fatalf("CreateAccount fanin: %v", err)
+		t.Fatalf("CreateAccountWithPersonalOrg fanin: %v", err)
 	}
+	acct := res.Account
 	pt, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		t.Fatalf("GenerateAPIKey: %v", err)

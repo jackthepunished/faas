@@ -524,3 +524,77 @@ func TestPgStore_ConsumeOrgInvitation_ErrorPaths(t *testing.T) {
 		t.Errorf("re-consume: err = %v, want ErrOrgInvitationInvalid", err)
 	}
 }
+
+// PR 3 — CreateAccountWithPersonalOrg (issue #190 / ADR-061).
+// The PR 3 canonical account-creation entry point: account +
+// personal org + owner membership in a single tx.
+
+func TestPgStore_CreateAccountWithPersonalOrg_Happy(t *testing.T) {
+	s := newPgStore(t)
+	ctx := context.Background()
+	res, err := s.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "happy@x.com",
+		Plan:  api.PlanFree,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccountWithPersonalOrg: %v", err)
+	}
+	if res.Account.Email != "happy@x.com" {
+		t.Errorf("email = %q", res.Account.Email)
+	}
+	if res.Account.Plan != api.PlanFree {
+		t.Errorf("plan = %s, want free", res.Account.Plan)
+	}
+	if !res.PersonalOrg.Personal {
+		t.Errorf("personal = false, want true")
+	}
+	if res.PersonalOrg.PersonalOwnerAccountID == nil ||
+		*res.PersonalOrg.PersonalOwnerAccountID != res.Account.ID {
+		t.Errorf("personal_owner_account_id mismatch: got %+v want %s",
+			res.PersonalOrg.PersonalOwnerAccountID, res.Account.ID)
+	}
+	if res.PersonalOrg.Plan != api.PlanFree {
+		t.Errorf("personal org plan = %s, want free (mirrors account)", res.PersonalOrg.Plan)
+	}
+	if res.PersonalOrg.Status != OrgStatusActive {
+		t.Errorf("personal org status = %s, want active", res.PersonalOrg.Status)
+	}
+	// Owner membership row exists.
+	if _, err := s.OrgMemberByAccount(ctx, res.PersonalOrg.ID, res.Account.ID); err != nil {
+		t.Errorf("OrgMemberByAccount: %v", err)
+	}
+}
+
+func TestPgStore_CreateAccountWithPersonalOrg_DuplicateEmailReturnsErrConflict(t *testing.T) {
+	s := newPgStore(t)
+	ctx := context.Background()
+	if _, err := s.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "dup@x.com",
+		Plan:  api.PlanFree,
+	}); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	_, err := s.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "dup@x.com",
+		Plan:  api.PlanFree,
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestPgStore_CreateAccountWithPersonalOrg_SlugDeterministic(t *testing.T) {
+	s := newPgStore(t)
+	ctx := context.Background()
+	res, err := s.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "slug@x.com",
+		Plan:  api.PlanFree,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccountWithPersonalOrg: %v", err)
+	}
+	want := PersonalOrgSlug(res.Account.ID)
+	if res.PersonalOrg.Slug != want {
+		t.Errorf("slug = %q, want %q", res.PersonalOrg.Slug, want)
+	}
+}

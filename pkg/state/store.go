@@ -189,6 +189,36 @@ func clampLogLimit(limit int) int {
 type Store interface {
 	// Accounts & auth.
 	CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error)
+	// CreateAccountWithPersonalOrg is the PR 3 canonical
+	// account-creation entry point (issue #190 / ADR-061). It runs
+	// the account INSERT + orgs INSERT + org_memberships INSERT
+	// under a single transaction so the "every account has exactly
+	// one personal org" invariant is atomic at the SQL layer (the
+	// partial unique orgs_one_personal_per_account_uniq is the
+	// tripwire for any caller bypassing this helper).
+	//
+	// Returns:
+	//   - (CreateAccountWithPersonalOrgResult, nil) on success —
+	//     Account is the freshly minted row, PersonalOrg is the
+	//     matching personal org with plan/status mirroring the
+	//     account.
+	//   - (CreateAccountWithPersonalOrgResult{}, state.ErrConflict)
+	//     on a duplicate email — the accounts.email UNIQUE trips as
+	//     23505 and the existing mapErr funnel returns ErrConflict.
+	//     The handler-level ladder in postSignup / OAuth callbacks
+	//     collapses to the idempotent-signin path on this error.
+	//   - (CreateAccountWithPersonalOrgResult{}, other) on
+	//     transport / SQL errors.
+	//
+	// Iso-level is ReadCommitted (matches AddOrgMember and
+	// ConsumeOrgInvitation); the partial unique is the SQL-level
+	// tripwire at any isolation level.
+	//
+	// Callers that need a non-personal-org account (dev bootstrap
+	// at cmd/apid/main.go:54, backfill test fixtures) must call
+	// CreateAccount directly. All four production signup paths and
+	// the e2e harness SeedAccount route through this helper.
+	CreateAccountWithPersonalOrg(ctx context.Context, params CreateAccountWithPersonalOrgParams) (CreateAccountWithPersonalOrgResult, error)
 	AccountByID(ctx context.Context, id string) (Account, error)
 	AccountByEmail(ctx context.Context, email string) (Account, error)
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
