@@ -365,6 +365,7 @@ func collectSocketInodes(pid int, depth int, out map[uint64]struct{}, visited ma
 	// one task from the parent; multi-threaded apps that fork expose
 	// the child via any one of the parent's tasks.
 	taskDir := fmt.Sprintf("/proc/%d/task", pid)
+	//nolint:forbidigo // /proc/<pid>/task is a vetted kernel path inside the guest; the customer-path guard (openCustomerFile) is for host daemons reading customer bytes — this reads in-guest kernel state only.
 	tf, tErr := os.Open(taskDir)
 	if tErr != nil {
 		return
