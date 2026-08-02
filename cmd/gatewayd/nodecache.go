@@ -44,6 +44,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/overlay"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -90,11 +91,31 @@ type nodeCache struct {
 	cache   *gateway.NodeClientCache
 	log     *slog.Logger
 	metrics *gateway.Metrics
+	// events is the optional pkg/events.Platform (issue #517 / PR-C /
+	// ADR-064). When non-nil, the forwarder emits wake.proxy_first_byte
+	// on the first downstream byte. nil opts out — pre-PR-C fixtures
+	// + the legacy nodeCache wiring (deprecated; production always
+	// passes a Platform).
+	events *events.Platform
 	// subscribe is the dependency seam described on subscribeFunc
 	// above. Nil defaults to db.SubscribeWithReconnect in WatchEvictions.
 	subscribe subscribeFunc
 	// heartbeatStopped is described on the type doc above.
 	heartbeatStopped func()
+}
+
+// WithEvents (issue #517 / PR-C / ADR-064) installs the events
+// Platform that the forwarder will use to emit wake.proxy_first_byte.
+// Returns the receiver so the call reads as a fluent setter at the
+// wiring site in cmd/gatewayd/main.go:
+//
+//	cache := newNodeCache(...).WithEvents(eventsPlatform)
+//
+// nil opts out (the legacy test fixtures + the WithEvents-less
+// forwarder that the test suite still drives).
+func (n *nodeCache) WithEvents(p *events.Platform) *nodeCache {
+	n.events = p
+	return n
 }
 
 // newNodeCache wires the production cache: a *gateway.NodeClientCache
@@ -145,8 +166,12 @@ func newNodeCache(store *state.PgStore, vmmdTLS *tls.Config, log *slog.Logger, m
 // Forwarding returns the per-node http.Handler factory. cmd/gatewayd
 // installs it on the gateway.Handler via WithForwarding so every
 // request dispatches through the cache.
+//
+// PR-C (issue #517 / ADR-064): when n.events is non-nil the
+// forwarder emits wake.proxy_first_byte on the first downstream
+// byte. nil opts out.
 func (n *nodeCache) Forwarding() func(gateway.Target) http.Handler {
-	return gateway.ForwardingReverseProxy(n.cache, n.log)
+	return gateway.ForwardingReverseProxyWithEvents(n.cache, n.log, n.events)
 }
 
 // Close shuts down every cached *grpc.ClientConn. Called once at
