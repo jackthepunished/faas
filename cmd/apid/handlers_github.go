@@ -448,12 +448,15 @@ func (s *server) provisionOrFetchOAuthAccount(ctx context.Context, provider, sub
 	}
 
 	// 3. Fresh account.
-	created, err := s.store.CreateAccount(ctx, email, api.PlanFree)
+	res, err := s.store.CreateAccountWithPersonalOrg(ctx, state.CreateAccountWithPersonalOrgParams{
+		Email: email,
+		Plan:  api.PlanFree,
+	})
 	if err != nil {
 		return state.Account{}, err
 	}
-	if err := s.store.UpsertOAuthLink(ctx, created.ID, provider, sub, email, true); err != nil {
+	if err := s.store.UpsertOAuthLink(ctx, res.Account.ID, provider, sub, email, true); err != nil {
 		s.log.Error("oauth.upsert_link", "provider", provider, "err", err)
 	}
-	return created, nil
+	return res.Account, nil
 }

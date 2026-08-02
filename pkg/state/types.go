@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -1975,4 +1976,59 @@ type OrgInvitation struct {
 	RevokedAt          *time.Time
 	AcceptingAccountID *string
 	CreatedAt          time.Time
+}
+
+// PersonalOrgNamespace is the UUID v5 namespace that derives the
+// deterministic personal-org slug from each account's id (issue #190
+// / ADR-061, PR 3). Frozen at PR 3 design time; any rotation
+// requires a new ADR.
+//
+// Generated via
+// uuid.NewSHA1(uuid.NameSpaceURL,
+//
+//	[]byte("onebox-faas/iam-6/personal-org-namespace/v1"))
+//
+// at design time and pinned here via uuid.MustParse so the compiler
+// enforces well-formedness. The literal is binary-stable across
+// google/uuid versions because the SHA-1 input is a fixed byte slice
+// (precedent: pkg/meter/sampler.go's FloorNamespace).
+//
+// TestPersonalOrgNamespaceFrozen re-derives the value from the
+// v1-locked namespace string and asserts equality — it must remain
+// in lockstep if this file is ever edited.
+var PersonalOrgNamespace = uuid.MustParse("1f7c8c29-273e-5a18-ae00-58fceba4fe6c")
+
+// PersonalOrgSlug returns the deterministic personal-org slug for an
+// account id. Pure function: same input → same output, every call,
+// every process. The 14-char shape ("u-" + 12 hex chars) is the
+// shortest valid slug that fits the orgs_slug_shape CHECK
+// (`^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$`) while being machine-derived
+// rather than user-supplied.
+//
+// First-write-wins on the slug CHECK is preserved across retries
+// because the slug is deterministic — a backfill that re-runs
+// produces the same slug for each account row, and the
+// orgs_one_personal_per_account_uniq partial unique is the SQL-level
+// tripwire against any concurrent caller.
+func PersonalOrgSlug(accountID string) string {
+	hex := strings.ReplaceAll(uuid.NewSHA1(PersonalOrgNamespace, []byte(accountID)).String(), "-", "")
+	return "u-" + hex[:12]
+}
+
+// CreateAccountWithPersonalOrgParams is the input bundle for the
+// PR 3 wrap. Email and Plan are required; the personal org's slug
+// is derived deterministically from the account id (PersonalOrgSlug),
+// name defaults to "Personal", status defaults to OrgStatusActive.
+type CreateAccountWithPersonalOrgParams struct {
+	Email string
+	Plan  api.Plan
+}
+
+// CreateAccountWithPersonalOrgResult bundles the freshly minted
+// account + personal org so callers can read both without an extra
+// round-trip. PR 3 callsites currently read only Account; the
+// PersonalOrg field is reserved for PR 5's LoadOrg middleware.
+type CreateAccountWithPersonalOrgResult struct {
+	Account     Account
+	PersonalOrg Org
 }

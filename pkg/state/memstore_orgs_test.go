@@ -471,3 +471,69 @@ func TestMemStore_SoftDeleteOrg_And_StatusUpdates(t *testing.T) {
 		t.Errorf("status = %s, want deleted_pending", got.Status)
 	}
 }
+
+// PR 3 — CreateAccountWithPersonalOrg (issue #190 / ADR-061).
+// MemStore mirrors of the PgStore sister-file tests above. The
+// mutex serialises the three inserts so the partial-unique
+// invariant the SQL partial index enforces is preserved.
+
+func TestMemStore_CreateAccountWithPersonalOrg_Happy(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	res, err := m.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "happy@x.com",
+		Plan:  api.PlanFree,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccountWithPersonalOrg: %v", err)
+	}
+	if res.Account.Email != "happy@x.com" {
+		t.Errorf("email = %q", res.Account.Email)
+	}
+	if !res.PersonalOrg.Personal {
+		t.Errorf("personal = false, want true")
+	}
+	if res.PersonalOrg.PersonalOwnerAccountID == nil ||
+		*res.PersonalOrg.PersonalOwnerAccountID != res.Account.ID {
+		t.Errorf("personal_owner_account_id mismatch: got %+v want %s",
+			res.PersonalOrg.PersonalOwnerAccountID, res.Account.ID)
+	}
+	// Owner membership row exists.
+	if _, err := m.OrgMemberByAccount(ctx, res.PersonalOrg.ID, res.Account.ID); err != nil {
+		t.Errorf("OrgMemberByAccount: %v", err)
+	}
+}
+
+func TestMemStore_CreateAccountWithPersonalOrg_DuplicateEmailReturnsErrConflict(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	if _, err := m.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "dup@x.com",
+		Plan:  api.PlanFree,
+	}); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	_, err := m.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "dup@x.com",
+		Plan:  api.PlanFree,
+	})
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("err = %v, want ErrConflict", err)
+	}
+}
+
+func TestMemStore_CreateAccountWithPersonalOrg_SlugDeterministic(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	res, err := m.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: "slug@x.com",
+		Plan:  api.PlanFree,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccountWithPersonalOrg: %v", err)
+	}
+	want := PersonalOrgSlug(res.Account.ID)
+	if res.PersonalOrg.Slug != want {
+		t.Errorf("slug = %q, want %q", res.PersonalOrg.Slug, want)
+	}
+}
