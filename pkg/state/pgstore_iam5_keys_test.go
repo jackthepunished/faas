@@ -159,8 +159,8 @@ func TestPg_MarkAPIKeyRevoked_UnknownKeyReturnsErrNotFound(t *testing.T) {
 
 func TestPg_MarkAPIKeyRevoked_CrossAccountReturnsErrNotFound(t *testing.T) {
 	s, ctx := pgStore(t)
-	acctA := createAccount(t, s, ctx, pgTestEmail(t))
-	acctB := createAccount(t, s, ctx, pgTestEmail(t))
+	acctA := createAccount(t, s, ctx, pgTestEmail(t)+"-a")
+	acctB := createAccount(t, s, ctx, pgTestEmail(t)+"-b")
 	k, err := s.CreateAPIKeyWithExpiry(ctx, acctA, []byte{0xCC}, "cross", []string{"apps:read"}, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKeyWithExpiry: %v", err)
@@ -248,8 +248,8 @@ func TestPg_RotateAPIKey_UnknownKeyReturnsErrNotFound(t *testing.T) {
 
 func TestPg_RotateAPIKey_CrossAccountReturnsErrNotFound(t *testing.T) {
 	s, ctx := pgStore(t)
-	acctA := createAccount(t, s, ctx, pgTestEmail(t))
-	acctB := createAccount(t, s, ctx, pgTestEmail(t))
+	acctA := createAccount(t, s, ctx, pgTestEmail(t)+"-a")
+	acctB := createAccount(t, s, ctx, pgTestEmail(t)+"-b")
 	k, err := s.CreateAPIKeyWithExpiry(ctx, acctA, []byte{0x40}, "victim", []string{"admin"}, nil)
 	if err != nil {
 		t.Fatalf("CreateAPIKeyWithExpiry: %v", err)
