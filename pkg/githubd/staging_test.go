@@ -1,4 +1,4 @@
-// staging_test.go — tests for repackageRootTree (issue #432
+// staging_test.go — tests for RepackageRootTree (issue #432
 // phase 5 review follow-up).
 //
 // Pins the per-app RootDir subtree walk into a gzip+tap tarball
@@ -39,7 +39,7 @@ import (
 )
 
 // stagingFixture is the minimal MapFS shape needed to exercise
-// repackageRootTree. Most tests want a small flat tree plus a
+// RepackageRootTree. Most tests want a small flat tree plus a
 // subdirectory; keep it readable rather than data-driven.
 func stagingFixture() fstest.MapFS {
 	return fstest.MapFS{
@@ -95,8 +95,8 @@ func TestRepackageRootTree_EmptyRootDir_WalksWholeFS(t *testing.T) {
 	// not exist".
 	src := stagingFixture()
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
-	if err := repackageRootTree(context.Background(), src, "", dst); err != nil {
-		t.Fatalf("repackageRootTree: %v", err)
+	if err := RepackageRootTree(context.Background(), src, "", dst); err != nil {
+		t.Fatalf("RepackageRootTree: %v", err)
 	}
 	got := decodeTarball(t, dst)
 	// Three regular files at the root, one under worker/.
@@ -117,8 +117,8 @@ func TestRepackageRootTree_NonEmptyRootDir_RebasesEntries(t *testing.T) {
 		"worker/job.go":  &fstest.MapFile{Data: []byte("worker-job\n")},
 	}
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
-	if err := repackageRootTree(context.Background(), src, "worker", dst); err != nil {
-		t.Fatalf("repackageRootTree: %v", err)
+	if err := RepackageRootTree(context.Background(), src, "worker", dst); err != nil {
+		t.Fatalf("RepackageRootTree: %v", err)
 	}
 	got := decodeTarball(t, dst)
 	// app.go must NOT appear (it's outside the RootDir).
@@ -151,8 +151,8 @@ func TestRepackageRootTree_BodyRoundTrip(t *testing.T) {
 		"sub/data.json": &fstest.MapFile{Data: []byte(`{"k":"v"}` + "\n")},
 	}
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
-	if err := repackageRootTree(context.Background(), src, "", dst); err != nil {
-		t.Fatalf("repackageRootTree: %v", err)
+	if err := RepackageRootTree(context.Background(), src, "", dst); err != nil {
+		t.Fatalf("RepackageRootTree: %v", err)
 	}
 	got := decodeTarball(t, dst)
 	if string(got["hello.txt"]) != "hello, world\n" {
@@ -166,15 +166,15 @@ func TestRepackageRootTree_BodyRoundTrip(t *testing.T) {
 func TestRepackageRootTree_MissingRootDir_ReturnsError(t *testing.T) {
 	// RootDir points at a path that doesn't exist in the FS.
 	// fs.WalkDir surfaces the missing entry as the walkErr and
-	// repackageRootTree propagates it. The caller (stageAppSource)
+	// RepackageRootTree propagates it. The caller (stageAppSource)
 	// logs + skips the offending app.
 	src := fstest.MapFS{
 		"only-this.go": &fstest.MapFile{Data: []byte("x")},
 	}
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
-	err := repackageRootTree(context.Background(), src, "does-not-exist", dst)
+	err := RepackageRootTree(context.Background(), src, "does-not-exist", dst)
 	if err == nil {
-		t.Fatalf("repackageRootTree on missing rootDir: expected error, got nil")
+		t.Fatalf("RepackageRootTree on missing rootDir: expected error, got nil")
 	}
 	// The dst must be unlinked (the defer in stageAppSource does
 	// this; the helper itself leaves the file open until Close).
@@ -192,26 +192,26 @@ func TestRepackageRootTree_ContextCanceled(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancel so the first walk iter observes it
-	if err := repackageRootTree(ctx, src, "", dst); err == nil {
-		t.Fatalf("repackageRootTree on pre-cancelled ctx: expected error, got nil")
+	if err := RepackageRootTree(ctx, src, "", dst); err == nil {
+		t.Fatalf("RepackageRootTree on pre-cancelled ctx: expected error, got nil")
 	} else if !strings.Contains(err.Error(), context.Canceled.Error()) {
 		// The walk returns ctx.Err() verbatim; the test
 		// asserts the chain propagates it (errors.Is would
 		// also work, but the wrapper in stageAppSource
 		// rewrites the message; keep the assertion loose).
-		t.Logf("repackageRootTree on cancelled ctx returned: %v (acceptable)", err)
+		t.Logf("RepackageRootTree on cancelled ctx returned: %v (acceptable)", err)
 	}
 }
 
 func TestRepackageRootTree_SubdirectoriesIncluded(t *testing.T) {
 	// Directory entries must be present in the tarball so
-	// builderd's detector sees the layout. The repackageRootTree
+	// builderd's detector sees the layout. The RepackageRootTree
 	// helper emits a tar TypeDir entry per directory walked
 	// (tar.FileInfoHeader(IsDir) + WriteHeader, no body).
 	src := stagingFixture()
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
-	if err := repackageRootTree(context.Background(), src, "", dst); err != nil {
-		t.Fatalf("repackageRootTree: %v", err)
+	if err := RepackageRootTree(context.Background(), src, "", dst); err != nil {
+		t.Fatalf("RepackageRootTree: %v", err)
 	}
 	//nolint:forbidigo // test fixture path produced by t.TempDir(); not customer data
 	f, err := os.Open(dst) //nolint:gosec // test path
@@ -263,7 +263,7 @@ func TestRepackageRootTree_SymlinkSkipped(t *testing.T) {
 		"link":   &fstest.MapFile{Mode: fs.ModeSymlink, Data: []byte("app.go")},
 	}
 	dst := filepath.Join(t.TempDir(), "source.tar.gz")
-	_ = repackageRootTree(context.Background(), src, "", dst)
+	_ = RepackageRootTree(context.Background(), src, "", dst)
 	// Simulate the wrapper's contract: on error, unlink.
 	if _, err := os.Stat(dst); err == nil {
 		_ = os.Remove(dst)

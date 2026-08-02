@@ -31,10 +31,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apid/apidsource"
+	"github.com/onebox-faas/faas/pkg/githubd"
 	"github.com/onebox-faas/faas/pkg/reconcile"
 	"github.com/onebox-faas/faas/pkg/reposcan"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -58,11 +61,14 @@ type planTokenWire struct {
 type scanPlanRequest struct {
 	SourcePath   string // spool path after validateAndSpool + extractTarGzToDir
 	SourceSHA256 string // hex digest of the original compressed bytes
-	ScanDir      string // extracted dir (cleaned up by caller)
-	ProjectSlug  string
-	ProdBranch   string
-	InstallID    int64
-	Only         map[string]bool
+	// ScanDir is the extracted source tree. Cleaned up by scanService's
+	// defer (task #19 fix; pre-fix was "cleaned up by caller" but no
+	// caller ever removed it, so every successful scan leaked the dir).
+	ScanDir     string
+	ProjectSlug string
+	ProdBranch  string
+	InstallID   int64
+	Only        map[string]bool
 }
 
 // scanPlanResponse is the body returned by the scan service and
@@ -144,6 +150,110 @@ type planCron struct {
 	Enabled      bool   `json:"enabled"`
 }
 
+// appliedBuild is an alias for api.AppliedBuild so the local code
+// can name the wire type without importing pkg/api in every helper
+// signature. Both the response field type and this alias are
+// identical; the local type is a transitional convenience.
+type appliedBuild = api.AppliedBuild
+
+// applyBuildsForAddedChanged stages a per-workload tarball rooted
+// at app.RootDir under FAAS_SPOOL_ROOT/projects/<account>/<project>/
+// <appID>.tar.gz and enqueues one (deployment, build) per workload
+// via apidsource.Enqueue. Returns one appliedBuild per input app in
+// the same order. On staging or enqueue failure the per-app Error
+// field is populated and the loop continues — partial success is the
+// design (mirrors pkg/githubd/service.go:361-367).
+//
+// Lifetime: the staged tarball persists on disk after the function
+// returns — builderd reads it as a local file (pkg/builderd/
+// builderd.go:321). A spool GC is a follow-up issue (the plan calls
+// it out explicitly); this PR does not silently leave it undocumented
+// but also does not implement the GC.
+//
+// The SourceURL + CommitSHA fields are empty (the apply path is
+// upload-from-customer-tarball, not pull-from-codeload); the helper
+// handles empty values cleanly.
+//
+// scanDir is the path to the extracted source tree (req.ScanDir from
+// the multipart parse). It must outlive the staging call but is
+// removed by the handler's defer after scanService returns.
+func (s *server) applyBuildsForAddedChanged(
+	ctx context.Context, acct state.Account, project state.Project,
+	scanDir string, added, changed []state.App,
+) []appliedBuild {
+	touched := make([]state.App, 0, len(added)+len(changed))
+	touched = append(touched, added...)
+	touched = append(touched, changed...)
+	out := make([]appliedBuild, 0, len(touched))
+	for _, app := range touched {
+		res := appliedBuild{Slug: app.Slug, AppID: app.ID}
+		// Stage the per-workload tarball. Failure here (e.g. the
+		// RootDir doesn't exist in the extracted tree — a reposcan
+		// bug) is logged and recorded; the apply continues for the
+		// other apps.
+		staged, bytes, stageErr := s.stageApplyTarball(ctx, scanDir, acct.ID, project.ID, app)
+		if stageErr != nil {
+			s.log.Warn("apid: apply stage tarball failed", "app_id", app.ID, "slug", app.Slug, "project_id", project.ID, "err", stageErr)
+			res.Error = fmt.Sprintf("stage: %v", stageErr)
+			out = append(out, res)
+			continue
+		}
+		// Enqueue via the shared helper. The helper does CreateDeployment
+		// + build.log spool + UpdateDeploymentStatus(building) + CreateBuild
+		// + NotifyBuildQueued + (optional) NotifyDeploymentChanged for
+		// the prior row. Source="tarball" keeps the build_queued
+		// payload's kind field aligned with the deployment's kind.
+		enqRes, enqErr := apidsource.Enqueue(ctx, s.store, s.notif, apidsource.EnqueueParams{
+			AppID:       app.ID,
+			Kind:        state.DeploymentKindTarball,
+			SourcePath:  staged,
+			SourceBytes: bytes,
+			Source:      "tarball",
+			LogSpool:    spoolRoot(),
+			Log:         s.log,
+		})
+		if enqErr != nil {
+			s.log.Warn("apid: apply enqueue build failed", "app_id", app.ID, "slug", app.Slug, "project_id", project.ID, "err", enqErr)
+			res.Error = fmt.Sprintf("enqueue: %v", enqErr)
+			out = append(out, res)
+			continue
+		}
+		res.DeploymentID = enqRes.DeploymentID
+		res.BuildID = enqRes.BuildID
+		out = append(out, res)
+	}
+	return out
+}
+
+// stageApplyTarball writes a per-workload tarball rooted at app.RootDir
+// under <FAAS_SPOOL_ROOT>/projects/<accountID>/<projectID>/<appID>.tar.gz
+// and returns (path, bytes, error). The dir layout keys on
+// (account, project, app) so a re-apply of the same project overwrites
+// the per-workload tarballs in place.
+//
+// The walk is delegated to githubd.RepackageRootTree — the same
+// gzip-tar encoder githubd uses for push-triggered builds. Empty
+// RootDir walks the whole extracted tree (single-app project);
+// RootDir "/worker" walks everything under that prefix (multi-app
+// project where each app is a subdir).
+func (s *server) stageApplyTarball(
+	ctx context.Context, scanDir, accountID, projectID string, app state.App,
+) (string, int64, error) {
+	dir := filepath.Join(spoolRoot(), "projects", accountID, projectID)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", 0, fmt.Errorf("create spool dir: %w", err)
+	}
+	dst := filepath.Join(dir, app.ID+".tar.gz")
+	if err := githubd.RepackageRootTree(ctx, os.DirFS(scanDir), app.RootDir, dst); err != nil {
+		return "", 0, fmt.Errorf("repackage: %w", err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		return "", 0, fmt.Errorf("stat staged: %w", err)
+	}
+	return dst, fi.Size(), nil
+}
+
 // scanService runs the pipeline end-to-end:
 //
 //	multipart parse → spool+validate → extract → scan
@@ -156,9 +266,9 @@ type planCron struct {
 // third/fourth slots. When apply=false, the caller renders the
 // response as JSON.
 //
-// Returns (response, project, added, changed, removedSlugs, problem).
-// project/added/changed/removedSlugs are valid only when problem == nil
-// and apply==true.
+// Returns (response, project, added, changed, removedSlugs, builds, problem).
+// project/added/changed/removedSlugs/builds are valid only when
+// problem == nil and apply==true.
 //
 // added is the post-insert state.App slice for newly-created apps;
 // changed is the post-update slice for workloads whose RootDir /
@@ -167,19 +277,30 @@ type planCron struct {
 // uses these to soft-delete the corresponding crons (issue: a cron
 // for a removed workload previously 500'd because the slug→ID map
 // had no entry; PR-GH.6 fixes that by walking removedSlugs).
+// builds is the per-workload (deployment_id, build_id) results from
+// the apply-time build enqueue loop; the handler renders them in the
+// apply response.
 func (s *server) scanService(
 	w http.ResponseWriter, r *http.Request, acct state.Account,
 	planToken string, apply bool,
-) (*scanPlanResponse, state.Project, []state.App, []state.App, []string, *api.Problem) {
+) (*scanPlanResponse, state.Project, []state.App, []state.App, []string, []appliedBuild, *api.Problem) {
 	limits := api.MustLimitsFor(acct.Plan)
 	req, prob := parseScanMultipart(r, acct, limits)
 	if prob != nil {
-		return nil, state.Project{}, nil, nil, nil, prob
+		return nil, state.Project{}, nil, nil, nil, nil, prob
 	}
-	// The handler owns cleanup of the extracted dir (it defers
-	// RemoveAll). Don't do that here — the lifecycle crosses this
-	// function boundary on the apply path.
+	// Cleanup the spooled upload. Best-effort: a failure here just
+	// means the original tarball lingers under FAAS_SCAN_SPOOL_ROOT
+	// until the next sweep.
 	defer func() { _ = os.Remove(req.SourcePath) }() //nolint:errcheck // best-effort
+	// Cleanup the extracted dir on every return path. Pre-task #19
+	// this was documented "cleaned up by caller" but no caller ever
+	// removed it, so every successful scan leaked the extracted dir
+	// under FAAS_SCAN_SPOOL_ROOT. The defer fires AFTER all the
+	// in-function staging reads (applyBuildsForAddedChanged runs
+	// synchronously and walks req.ScanDir before the return at the
+	// bottom), so the staging sees a still-live tree.
+	defer func() { _ = os.RemoveAll(req.ScanDir) }() //nolint:errcheck // best-effort
 
 	// If a plan_token was passed (apply path), validate it BEFORE
 	// running the scan. Mismatch -> 409 plan_token_stale. This
@@ -197,13 +318,13 @@ func (s *server) scanService(
 				"plan_token_stale",
 				"plan_token does not match uploaded source",
 				"re-run scan and apply in one flow"))
-			return nil, state.Project{}, nil, nil, nil, api.ErrInternal("plan_token stale")
+			return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal("plan_token stale")
 		}
 	}
 
 	result, scanErr := reposcan.Scan(os.DirFS(req.ScanDir))
 	if scanErr != nil {
-		return nil, state.Project{}, nil, nil, nil, api.NewProblem(
+		return nil, state.Project{}, nil, nil, nil, nil, api.NewProblem(
 			http.StatusBadRequest, api.CodeSourceInvalid,
 			"Scan failed", scanErr.Error())
 	}
@@ -249,7 +370,7 @@ func (s *server) scanService(
 	// pre-check (no Tx here — the store is authoritative).
 	observedApps, appCountErr := s.store.CountDeployedApps(r.Context(), acct.ID)
 	if appCountErr != nil {
-		return nil, state.Project{}, nil, nil, nil, api.ErrInternal(
+		return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
 			fmt.Sprintf("count apps: %v", appCountErr))
 	}
 	observedCrons := countAccountCrons(r.Context(), s, acct.ID)
@@ -300,7 +421,7 @@ func (s *server) scanService(
 	if planToken == "" {
 		tok, mintErr := mintPlanToken(acct.ID, req.ProjectSlug, req.SourceSHA256)
 		if mintErr != nil {
-			return nil, state.Project{}, nil, nil, nil, api.ErrInternal(
+			return nil, state.Project{}, nil, nil, nil, nil, api.ErrInternal(
 				fmt.Sprintf("mint plan_token: %v", mintErr))
 		}
 		resp.PlanToken = tok
@@ -309,7 +430,7 @@ func (s *server) scanService(
 	}
 
 	if !apply {
-		return resp, state.Project{}, nil, nil, nil, nil
+		return resp, state.Project{}, nil, nil, nil, nil, nil
 	}
 
 	// Apply path (PR-G, repo decomposition Phase 5): route every
@@ -336,7 +457,7 @@ func (s *server) scanService(
 			prob = api.ErrPlanCronQuota(acct.Plan, "account",
 				limits.CronLimitPerAccount, observedCrons+len(crons))
 		}
-		return resp, state.Project{}, nil, nil, nil, prob
+		return resp, state.Project{}, nil, nil, nil, nil, prob
 	}
 
 	project := state.Project{
@@ -380,7 +501,7 @@ func (s *server) scanService(
 		default:
 			prob = api.ErrInternal(fmt.Sprintf("create project: %v", projErr))
 		}
-		return resp, state.Project{}, nil, nil, nil, prob
+		return resp, state.Project{}, nil, nil, nil, nil, prob
 	}
 	project = created
 	// Defer project rollback for any error path below.
@@ -450,13 +571,13 @@ func (s *server) scanService(
 				prob = api.NewProblem(mapped.Status, mapped.Code, mapped.Msg, "")
 			}
 			capturedProb = prob
-			return resp, state.Project{}, nil, nil, nil, prob
+			return resp, state.Project{}, nil, nil, nil, nil, prob
 		}
 		// mapReconcileError returned nil for nil err — unreachable
 		// here, but defensively pass through as 500.
 		prob := api.ErrInternal(fmt.Sprintf("reconcile: %v", recErr))
 		capturedProb = prob
-		return resp, state.Project{}, nil, nil, nil, prob
+		return resp, state.Project{}, nil, nil, nil, nil, prob
 	}
 
 	// Compute removed slugs. rec.Removed is a list of IDs; the
@@ -479,7 +600,7 @@ func (s *server) scanService(
 		if lerr != nil {
 			prob := api.ErrInternal(fmt.Sprintf("load existing apps: %v", lerr))
 			capturedProb = prob
-			return resp, state.Project{}, nil, nil, nil, prob
+			return resp, state.Project{}, nil, nil, nil, nil, prob
 		}
 		idToSlug := make(map[string]string, len(existingApps))
 		for _, a := range existingApps {
@@ -504,7 +625,24 @@ func (s *server) scanService(
 	// Each slice carries post-insert/post-update rows with valid
 	// IDs (reconcile's CreateAppIfUnderQuota stamps ID + CreatedAt;
 	// UpdateApp stamps UpdatedAt).
-	return resp, project, rec.Added, rec.Changed, removedSlugs, nil
+	//
+	// Apply-time build enqueue (PR-A, repo decomposition Phase 5
+	// close-the-loop): for every added + changed app, stage a
+	// per-workload tarball from req.ScanDir and call
+	// apidsource.Enqueue. Partial failure is by design — see
+	// applyBuildsForAddedChanged for the rationale. The handler
+	// renders the results in the apply response so the CLI's
+	// `faas apply` flow can show "app X: deployment Y, build Z".
+	//
+	// This runs AFTER the deferred ScanDir cleanup would fire (the
+	// handler's defer); but the handler's defer is registered on
+	// the handler func, and `defer`s fire in reverse order — the
+	// ScanDir defer on the handler runs AFTER this return. So the
+	// staging reads from a still-live ScanDir. The task #19 fix
+	// will move the ScanDir cleanup to happen inside this func,
+	// after staging, so the lifetime is local.
+	builds := s.applyBuildsForAddedChanged(r.Context(), acct, project, req.ScanDir, rec.Added, rec.Changed)
+	return resp, project, rec.Added, rec.Changed, removedSlugs, builds, nil
 }
 
 // parseScanMultipart reads the multipart body, spools, validates, and
