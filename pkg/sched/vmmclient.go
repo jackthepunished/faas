@@ -323,6 +323,17 @@ type AppSpec struct {
 	// on :8080 inside the guest, so the path is the customer's choice
 	// and the port is the host's choice. Additive per ADR-016.
 	HealthcheckPath string
+	// Runtime (issue #470 / PR #470-FU-B) is the runner id inside
+	// the guest (e.g. "node22", "python312"). vmmd stamps it on
+	// the live Instance so the framework_ready DGRAM receipt
+	// path can label vmmd_guest_framework_warmup_seconds by
+	// runner. Bounded cardinality (≤5 runner ids today; the
+	// runner set is guest-init build-time). Empty falls back to
+	// "unknown" in the histogram observer. The vmmd AppSpec
+	// field is required by CreateColdBoot and CreateFromSnapshot
+	// for parity with app_id; an empty value is a contract
+	// violation surfaced as InvalidArgument.
+	Runtime string
 }
 
 // SnapshotRef points at the snapshot to restore from and the Firecracker
@@ -822,6 +833,15 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 		// does HTTP GET <HealthcheckPath> against <HostIP>:8080
 		// and accepts 2xx.
 		HealthcheckPath: a.HealthcheckPath,
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22"). vmmd stamps it on the live Instance
+		// so the framework_ready DGRAM receipt path can label
+		// vmmd_guest_framework_warmup_seconds by runner. The
+		// sched sources it from the apps row at Wake time;
+		// see pkg/sched/engine.go's wake path that fills
+		// AppSpec.Runtime. Empty falls back to "unknown" in
+		// the histogram observer.
+		Runtime: a.Runtime,
 	}
 }
 

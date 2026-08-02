@@ -13,15 +13,18 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
 
 // FrameworkReadyReceiver is the host-side DGRAM listener. The
 // non-linux stub is a nil-receiver so cmd/vmmd/main.go's
-// defer recv.Close() compiles on every platform.
+// defer recv.Close() compiles on every platform. fd is an
+// atomic.Int32 to mirror the linux type exactly (CRIT-related
+// review feedback on PR #470-FU-B).
 type FrameworkReadyReceiver struct {
-	fd  int
+	fd  atomic.Int32
 	log *slog.Logger
 	mgr *fcvm.Manager
 }

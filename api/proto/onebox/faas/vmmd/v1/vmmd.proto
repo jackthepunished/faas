@@ -305,6 +305,20 @@ message AppSpec {
   // :8080 inside the guest, so the path is the customer's choice
   // and the port is the host's choice. Additive per ADR-016.
   string healthcheck_path = 11;
+  // runtime (issue #470 / PR #470-FU-B) is the runner id inside
+  // the guest (e.g. "node22", "python312", "go124"). schedd
+  // sources it from the apps row at Wake time and the vmmd
+  // stamps it on the live Instance so the framework_ready
+  // DGRAM receipt path can label the
+  // vmmd_guest_framework_warmup_seconds histogram by runner.
+  // Empty falls back to "unknown" (the histogram's observer
+  // collapses the empty string to keep cardinality bounded).
+  // Bounded cardinality (≤5 runner ids today) — the runner
+  // set is the guest-init build-time constant. Required by
+  // CreateColdBoot and CreateFromSnapshot for parity with
+  // app_id; an empty value is a contract violation surfaced as
+  // InvalidArgument.
+  string runtime = 12;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is

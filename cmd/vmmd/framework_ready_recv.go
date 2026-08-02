@@ -12,7 +12,7 @@
 // The wire shape (mirrored from
 // guest/init/framework_ready_proxy_linux.go):
 //
-//   [1B type=0x01][optional 4B BE uint32 warmup_ms][NUL][runtime]
+//	[1B type=0x01][optional 4B BE uint32 warmup_ms][NUL][runtime]
 //
 // The host strips the NUL-terminated runtime and uses the
 // preceding 4 bytes (if present) as the warmup_ms duration.
@@ -26,9 +26,12 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 
@@ -62,8 +65,15 @@ const frameworkReadyMaxDatagram = 64
 // owns the bound AF_VSOCK DGRAM socket and the read loop. The
 // receiver is held by the vmmd main loop and torn down on
 // context cancellation.
+//
+// fd is an atomic.Int32 (not a plain int) because Close() writes
+// to it from the main path while loop() reads it on every
+// recv call. Using a plain int trips `go test -race` between
+// the two goroutines (CRIT-related review feedback on PR
+// #470-FU-B). The zero value is meaningless; Close publishes
+// the sentinel -1 to break the loop.
 type FrameworkReadyReceiver struct {
-	fd  int
+	fd  atomic.Int32
 	log *slog.Logger
 	mgr *fcvm.Manager
 }
@@ -94,19 +104,26 @@ func StartFrameworkReadyReceiver(log *slog.Logger, mgr *fcvm.Manager) (*Framewor
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("framework_ready DGRAM bind port %d: %w", VsockFrameworkReadyHostPort, err)
 	}
-	r := &FrameworkReadyReceiver{fd: fd, log: log, mgr: mgr}
+	r := &FrameworkReadyReceiver{log: log, mgr: mgr}
+	r.fd.Store(int32(fd))
 	go r.loop()
 	log.Info("framework_ready receiver started", "vsock_host_port", VsockFrameworkReadyHostPort)
 	return r, nil
 }
 
 // Close releases the DGRAM socket. Safe to call multiple times.
+// Synchronises with the loop() reader via atomic.Int32.Load:
+// the loop checks r.fd < 0 on every iteration and exits when
+// Close publishes the sentinel.
 func (r *FrameworkReadyReceiver) Close() {
-	if r == nil || r.fd < 0 {
+	if r == nil {
 		return
 	}
-	_ = unix.Close(r.fd)
-	r.fd = -1
+	old := r.fd.Swap(-1)
+	if old < 0 {
+		return
+	}
+	_ = unix.Close(int(old))
 }
 
 // loop reads datagrams in a tight loop. Each receipt is parsed
@@ -117,12 +134,24 @@ func (r *FrameworkReadyReceiver) Close() {
 func (r *FrameworkReadyReceiver) loop() {
 	buf := make([]byte, frameworkReadyMaxDatagram)
 	for {
-		if r.fd < 0 {
+		// Atomic load: a concurrent Close publishes -1
+		// here. The check runs on every iteration so the
+		// loop exits within one recv of a Close call.
+		if r.fd.Load() < 0 {
 			return
 		}
-		n, from, err := unix.Recvfrom(r.fd, buf, 0)
+		n, from, err := unix.Recvfrom(int(r.fd.Load()), buf, 0)
 		if err != nil {
-			r.log.Debug("framework_ready recv loop ended", "err", err)
+			// EBADF is the expected terminal error when Close()
+			// publishes the -1 sentinel between the inner Load
+			// and the kernel entering the syscall. Log at Debug
+			// to keep the Info channel clean on graceful
+			// shutdown (MED-6 review feedback on PR #543).
+			// Other errors (EINTR, EAGAIN under non-blocking,
+			// ENOTCONN if the vsock device unloads) are also
+			// terminal for this loop — keep the Debug level so
+			// a noisy kernel doesn't alarm the operator.
+			r.log.Debug("framework_ready recv loop ended", "err", err, "ebadf", errors.Is(err, unix.EBADF))
 			return
 		}
 		sa, ok := from.(*unix.SockaddrVM)
@@ -149,8 +178,13 @@ func (r *FrameworkReadyReceiver) loop() {
 			continue
 		}
 		// Stamps the per-instance `framework_ready_at` clock
-		// and observes the warmup histogram.
-		stamped, appID, runtime, merr := r.mgr.MarkInstanceFrameworkReady(nil, instance, msg.WarmupMs)
+		// and observes the warmup histogram. Use a fresh
+		// context.Background here: the DGRAM loop is
+		// long-lived and the receipt itself is fire-and-forget
+		// (no caller-derived deadline). Passing a nil ctx
+		// would crash the downstream stamper/SQL call (MED-1
+		// review feedback on PR #543).
+		stamped, appID, runtime, merr := r.mgr.MarkInstanceFrameworkReady(context.Background(), instance, msg.WarmupMs)
 		if merr != nil {
 			r.log.Warn("framework_ready manager call", "err", merr)
 			continue

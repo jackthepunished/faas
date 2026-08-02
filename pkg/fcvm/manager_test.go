@@ -2174,8 +2174,8 @@ func TestMarkInstanceFrameworkReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cold boot: %v", err)
 	}
-	if inst.FrameworkReadyAt != (time.Time{}) {
-		t.Errorf("FrameworkReadyAt pre-stamp = %v, want zero", inst.FrameworkReadyAt)
+	if inst.FrameworkReadyAt != nil {
+		t.Errorf("FrameworkReadyAt pre-stamp = %v, want nil", inst.FrameworkReadyAt)
 	}
 	m.mu.Lock()
 	m.live["i-fr"].AppID = "app-test-1"

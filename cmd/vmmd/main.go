@@ -495,7 +495,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		fcVersion,
 		log,
 		cbm,
-	).WithFrameworkReady(frm)
+	).WithFrameworkReady(frm).
+		// Issue #470 / PR #470-FU-B: attach the SQL persistence
+		// seam so the framework_ready DGRAM receipt path can
+		// stamp the `instances.framework_ready_at` column. A
+		// small adapter wraps the pgstore SetInstanceFrameworkReadyAt
+		// to the local FrameworkReadyStamper interface (we
+		// don't want the Manager to depend on the full
+		// pkg/state surface).
+		WithFrameworkReadyStamper(stamperFromStore(store, log))
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
 	// read Grype scan sidecars at boot time. Mirrors the VMM's

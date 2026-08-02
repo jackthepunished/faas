@@ -18,14 +18,14 @@
 //
 // Wire (runner → proxy → vsock DGRAM):
 //
-//   proxy connect sends a single line: "<runtime> <warmup_ms>\n"
+//	proxy connect sends a single line: "<runtime> <warmup_ms>\n"
 //
-//   proxy replies with one of:
-//     "ok\n"   ← receipt accepted (forwarded to vsock)
+//	proxy replies with one of:
+//	  "ok\n"   ← receipt accepted (forwarded to vsock)
 //
-//   proxy forwards to vsock DGRAM (port 1027, msg_type 4) with
-//   the body:
-//     [1B type=0x01][optional 4B BE uint32 warmup_ms][NUL][runtime]
+//	proxy forwards to vsock DGRAM (port 1027, msg_type 4) with
+//	the body:
+//	  [1B type=0x01][optional 4B BE uint32 warmup_ms][NUL][runtime]
 //
 // The runner side is intentionally narrow: one line of text. The
 // complex shape (msg_type byte, NUL-terminated runtime, optional
@@ -41,7 +41,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -69,6 +68,21 @@ const FrameworkReadyProxyDir = "/run/guest-init"
 // shape the guest-init /run/guest-init/control.sock uses for the
 // supervisor-handshake protocol.
 const FrameworkReadyProxyMode = 0o660
+
+// VsockFrameworkReadyPort is the AF_VSOCK DGRAM port the
+// guest-init proxy sends to (and the host's FrameworkReadyReceiver
+// binds on). Mirrors the host constant
+// cmd/vmmd/framework_ready_recv.go::VsockFrameworkReadyHostPort = 1027.
+// The constants are duplicated by design (the guest-init and
+// cmd/vmmd packages cannot share compile-time symbols — they're
+// built into separate binaries at different stages of the boot
+// chain). The numeric value MUST match the host side; a drift
+// produces a silent "no signal" failure mode (the host filter
+// ignores the DGRAM, the engine times out, warm capture falls
+// through to init tier per the comment in cmd/vmmd/main.go).
+// Reviewers: please grep the PR for the literal 1027 — both
+// sides must agree.
+const VsockFrameworkReadyPort uint32 = 1027
 
 // startFrameworkReadyProxy brings up the unix-socket listener
 // and the vsock DGRAM sender (one shared outbound socket) and
@@ -226,8 +240,3 @@ func handleFrameworkReadyConn(conn *net.UnixConn, vsock int, log *slog.Logger) {
 	log.Debug("framework_ready forwarded",
 		"runtime", runtime, "warmup_ms", warmupMs)
 }
-
-// _ keeps filepath referenced on platforms where net and other
-// imports shift around. The proxy file is linux-only; this is a
-// belt-and-suspenders reference for the import block.
-var _ = filepath.Join
