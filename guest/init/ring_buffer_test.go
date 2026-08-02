@@ -13,6 +13,7 @@ package main
 import (
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -170,8 +171,15 @@ func TestSupervisor_LogBufferResetsOnRestart(t *testing.T) {
 		Start: func() error {
 			starts++
 			// Simulate runAppWithEnv's per-fork TrackCommand
-			// (the production trigger of resetLog).
-			s.TrackCommand(nil)
+			// (the production trigger of resetLog). Use a
+			// non-nil *exec.Cmd with a zero-value Cmd — the
+			// reset path doesn't read any field off the cmd,
+			// but a non-nil cmd is a more honest simulation of
+			// the production call shape. (LastAppPID() returns
+			// -1 for a Cmd without a Process field; that doesn't
+			// matter here because we're testing LogTail, not
+			// LastAppPID.)
+			s.TrackCommand(&exec.Cmd{})
 			if starts == 1 {
 				_, _ = s.LogBuffer().Write([]byte("restart1-marker\n"))
 				return io.EOF // non-nil error → triggers restart
