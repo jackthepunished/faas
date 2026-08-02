@@ -584,7 +584,7 @@ type OpsMetrics struct {
 	// base-stage time (pkg/imaged/base_stage.go) and re-read on
 	// every cold-boot by vmmd.
 	imageScanVulns *prometheus.CounterVec
-	// liveMigrationDecisions: Tier A5 / ADR-065 cross-node
+	// liveMigrationDecisions: Tier A5 / ADR-066 cross-node
 	// live-instance migration observability. Counter labelled by
 	// outcome ∈ {migrated, conflict, no_headroom, no_eligibility,
 	// lease_expired, peer_failure} — the closed set the
@@ -1195,7 +1195,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Per-image Grype finding counts, labelled by image (the OCI ref of the staged base ext4) and severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} (issue #299). The CRITICAL count is the vmmd admission gate's read side — a non-zero rate means vmmd refused to bring up an instance whose staged ext4 had a CRITICAL finding. The counter is incremented once per Grype scan at imaged base-stage time.",
 	}, []string{"image", "severity"})
 	commonCollectors = append(commonCollectors, imageScanVulns)
-	// ADR-065 / Tier A5: live-instance migration decision counter.
+	// ADR-066 / Tier A5: live-instance migration decision counter.
 	// Labelled by outcome ∈ {migrated, conflict, no_headroom,
 	// no_eligibility, lease_expired, peer_failure}. The migrated
 	// label is the §12 dashboard panel (sum over 5m); pairs with
@@ -1208,7 +1208,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// cmd/<other> scrapes that incidentally probe the prefix.
 	liveMigrationDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_live_migration_decisions_total",
-		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-065), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
+		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-066), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, liveMigrationDecisions)
 	// ADR-062 / issue #461: registry-credential mark-used failure
@@ -1315,7 +1315,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// so without this loop the dashboard's "live-migration
 	// throughput" panel would render "no data" until the first
 	// commit). Extending the outcome vocabulary requires
-	// extending this loop in lock-step with the ADR-065
+	// extending this loop in lock-step with the ADR-066
 	// Engine.MigrateLiveInstances dispatch.
 	for _, outcome := range []string{
 		"migrated", "conflict", "no_headroom",
@@ -1536,7 +1536,7 @@ func (m *OpsMetrics) RebalanceDecisions(outcome string) prometheus.Counter {
 }
 
 // LiveMigrationDecisions returns the labelled counter for the
-// four-phase cross-node LIVE-instance handoff (Tier A5 / ADR-065).
+// four-phase cross-node LIVE-instance handoff (Tier A5 / ADR-066).
 // Called from Engine.MigrateLiveInstances once per candidate
 // instance outcome (mirrors the rebalanceDecisions dispatch shape).
 // outcome ∈ {migrated, conflict, no_headroom, no_eligibility,
