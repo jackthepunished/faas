@@ -68,13 +68,20 @@ type scanPlanRequest struct {
 // scanPlanResponse is the body returned by the scan service and
 // the apply service. Marshaled to JSON for both the /scan and
 // /apply responses so the CLI can pass --json through verbatim.
+//
+// Workloads and Managed are the *api DTOs (not the reposcan
+// types) so the wire shape is consistent with the OpenAPI spec
+// and the SDK/test decoders. reposcan.Tier is a typed int; the
+// DTO's Tier is a string — using the DTO here is what makes
+// `plan.workloads[i].tier` serialize as "compose" instead of
+// `8`. The conversion lives in toPlanWorkload below.
 type scanPlanResponse struct {
 	ProjectSlug  string                  `json:"project_slug"`
 	RepoFullName string                  `json:"repo_full_name,omitempty"`
 	ScanSource   state.ProjectScanSource `json:"scan_source"`
 	Tier         string                  `json:"tier"`
-	Workloads    []reposcan.Workload     `json:"workloads"`
-	Managed      []reposcan.Managed      `json:"managed"`
+	Workloads    []api.PlanWorkload      `json:"workloads"`
+	Managed      []api.PlanManaged       `json:"managed"`
 	Crons        []planCron              `json:"crons"`
 	// CronNames parallels Crons: when /apply runs, the apply handler
 	// uses CronNames[i] to look up the freshly inserted app_id from
@@ -89,6 +96,41 @@ type scanPlanResponse struct {
 	CanApply      bool     `json:"can_apply"`
 	NotAllowed    bool     `json:"crons_not_allowed,omitempty"`
 	PlanToken     string   `json:"plan_token"`
+}
+
+// toPlanWorkload translates a reposcan.Workload into the wire-
+// shape DTO. The only non-trivial field is Tier: reposcan.Tier is
+// a typed int (1/3/5/8) and the wire shape is the .String()
+// representation ("single"/"convention"/"workspace"/"compose"/
+// "unknown"), matching the OpenAPI PlanWorkload.tier enum.
+func toPlanWorkload(w reposcan.Workload) api.PlanWorkload {
+	return api.PlanWorkload{
+		Name:       w.Name,
+		RootDir:    w.RootDir,
+		Dockerfile: w.Dockerfile,
+		Command:    w.Command,
+		Class:      string(w.Class),
+		Schedule:   w.Schedule,
+		Ports:      w.Ports,
+		EnvKeys:    w.EnvKeys,
+		Source:     w.Source,
+		Tier:       w.Tier.String(),
+	}
+}
+
+// toPlanManaged translates a reposcan.Managed into the wire-shape
+// DTO. Pure field copy — the reposcan and DTO fields align
+// one-to-one; this helper exists so the carrier conversion is
+// symmetrical with toPlanWorkload and stays at one call site if
+// either side grows new fields.
+func toPlanManaged(m reposcan.Managed) api.PlanManaged {
+	return api.PlanManaged{
+		Name:    m.Name,
+		Kind:    m.Kind,
+		EnvHint: m.EnvHint,
+		Source:  m.Source,
+		Image:   m.Image,
+	}
 }
 
 // planCron is the cron shape returned by the scan service. We keep
@@ -225,12 +267,24 @@ func (s *server) scanService(
 		canApply = false
 	}
 
+	// Convert the reposcan carrier slice into the wire-shape DTO so
+	// the JSON marshal sees string Tier (matching OpenAPI enum +
+	// pkg/api.PlanWorkload.Tier) instead of the raw int the
+	// reposcan type carries. See toPlanWorkload / toPlanManaged.
+	respWorkloads := make([]api.PlanWorkload, len(filteredW))
+	for i, w := range filteredW {
+		respWorkloads[i] = toPlanWorkload(w)
+	}
+	respManaged := make([]api.PlanManaged, len(filteredMc))
+	for i, m := range filteredMc {
+		respManaged[i] = toPlanManaged(m)
+	}
 	resp := &scanPlanResponse{
 		ProjectSlug:   req.ProjectSlug,
 		ScanSource:    reconcile.DeriveScanSource(filteredW),
 		Tier:          result.Tier.String(),
-		Workloads:     filteredW,
-		Managed:       filteredMc,
+		Workloads:     respWorkloads,
+		Managed:       respManaged,
 		Crons:         crons,
 		Warnings:      result.Warnings,
 		ObservedApps:  observedApps + len(filteredW),
