@@ -65,7 +65,7 @@ func TestMigrations_00026_ComputeNodeNotify(t *testing.T) {
 		t.Fatalf("insert compute_node: %v", err)
 	}
 
-	got := waitForNotification(t, notif, 5*time.Second)
+	got := waitForNodeNotification(t, notif, newID, 5*time.Second)
 	var p struct {
 		NodeID string `json:"node_id"`
 		Active bool   `json:"active"`
@@ -89,7 +89,7 @@ func TestMigrations_00026_ComputeNodeNotify(t *testing.T) {
 	); err != nil {
 		t.Fatalf("update compute_node active=false: %v", err)
 	}
-	got = waitForNotification(t, notif, 5*time.Second)
+	got = waitForNodeNotification(t, notif, newID, 5*time.Second)
 	if err := json.Unmarshal([]byte(got.Payload), &p); err != nil {
 		t.Fatalf("unmarshal UPDATE payload %q: %v", got.Payload, err)
 	}
@@ -101,17 +101,35 @@ func TestMigrations_00026_ComputeNodeNotify(t *testing.T) {
 	}
 }
 
-// waitForNotification blocks up to d for the next entry on the
-// notification channel. Failing the test after d elapses is the
-// right call here — a missing notification IS the regression, and
-// failing fast keeps the test signal clean.
-func waitForNotification(t *testing.T, ch <-chan db.Notification, d time.Duration) db.Notification {
+// waitForNodeNotification blocks up to d for the next entry on the
+// notification channel whose payload's node_id field equals want.
+// pg_notify is cluster-global (LISTEN sees every schema's writes), so a
+// parallel pgtest schema's compute_nodes INSERT can leak in here — we
+// drop those by JSON-decoding the payload and matching node_id before
+// returning. If no matching notification arrives within d, fail the
+// test (a missing trigger IS the regression).
+func waitForNodeNotification(t *testing.T, ch <-chan db.Notification, want string, d time.Duration) db.Notification {
 	t.Helper()
-	select {
-	case n := <-ch:
-		return n
-	case <-time.After(d):
-		t.Fatalf("no compute_node_changed notification within %s (trigger missing or channel not LISTENed)", d)
-		return db.Notification{}
+	deadline := time.After(d)
+	for {
+		select {
+		case n := <-ch:
+			var p struct {
+				NodeID string `json:"node_id"`
+			}
+			if err := json.Unmarshal([]byte(n.Payload), &p); err != nil {
+				// Malformed payloads from sibling schemas can't be ours;
+				// drop and keep waiting. A malformed payload from our own
+				// trigger would be a real regression and would re-surface
+				// in the assertion that called us.
+				continue
+			}
+			if p.NodeID == want {
+				return n
+			}
+		case <-deadline:
+			t.Fatalf("no compute_node_changed notification for node_id=%q within %s (trigger missing, channel not LISTENed, or sibling schema's payload flooded the queue)", want, d)
+			return db.Notification{}
+		}
 	}
 }
