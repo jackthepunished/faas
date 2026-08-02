@@ -66,6 +66,38 @@ create index if not exists instances_migrated_from_node_id_idx
   on instances (migrated_from_node_id)
   where migrated_from_node_id is not null;
 
+-- ADR-066: widen instances_state_check to accept 'migrating'
+-- (the Tier A5 transient state stamped at Phase 2 of the
+-- four-phase handoff). Mirrors the 00035 NOT VALID + VALIDATE
+-- pattern: concurrent apid/schedd writes skip the constraint
+-- during the validate pass; the validate pass scans once
+-- under SHARE UPDATE EXCLUSIVE (reads/writes allowed).
+-- 'migrating' is also transient (writes-then-leaves), so a
+-- clean DB validates no-op. If the validate pass ever fails
+-- (a row stuck in 'migrating'), the down-migrate would also
+-- fail — operators must guarantee the fleet is at rest
+-- before rolling back, same contract as 00035.
+alter table instances
+  drop constraint if exists instances_state_check;
+
+alter table instances
+  add constraint instances_state_check
+    check (state in (
+      'pending',
+      'parked',
+      'waking',
+      'cold_booting',
+      'running',
+      'snapshotting',
+      'migrating',
+      'stopped',
+      'failed',
+      'evicting_account_deleting'
+    )) not valid;
+
+alter table instances
+  validate constraint instances_state_check;
+
 -- +goose StatementEnd
 -- +goose Down
 -- +goose StatementBegin
