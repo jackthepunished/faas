@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -78,6 +79,14 @@ type runDeps struct {
 	// cold-start sweep still runs so an unplaced app from a prior
 	// run gets reconciled on boot.
 	subscribePlacementClaim func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribeRebalancer (Tier A4 / ADR-064) is the
+	// producer-side seam for the compute_node_changed consumer
+	// that drains orphans from a freshly-inactive compute_node
+	// onto the local schedd. Mirrors subscribePlacementClaim's
+	// shape; nil = subscriber not started (tests that don't
+	// want the channel can leave it nil — the cold-start sweep
+	// below still reconciles orphans on boot).
+	subscribeRebalancer func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
 	// subscribeNodeKeyChanges (ADR-053) is the producer-side seam
 	// for the 'compute_node_changed' pg_notify consumer that
 	// refreshes the in-memory NodeKeyRegistry on every relevant
@@ -144,6 +153,16 @@ func defaultDeps() runDeps {
 		// subscribeEgressDrift comment).
 		subscribePlacementClaim: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
+		},
+		// Tier A4 / ADR-064: subscribe to compute_node_changed
+		// and let Rebalancer filter to active=false. The router
+		// watcher + nodekeys + nodeVerifier above already share
+		// the same channel; the rebalancer is the fourth
+		// consumer. Pre-commit review in ADR-064 §"Trigger" — a
+		// single LISTEN shared by N subscribers is the canonical
+		// pattern (subscribers filter on the typed payload).
+		subscribeRebalancer: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
+			return db.Subscribe(ctx, p, []string{db.NotifyComputeNodeChanged})
 		},
 		// Production wires db.Subscribe on the
 		// 'compute_node_changed' channel. Migration 00075's
@@ -552,6 +571,53 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		go subscribeWithReconnect(ctx, "placement claim", log, deps.subscribePlacementClaim, pool, claimSub.Run)
 	}
 
+	// Tier A4 / ADR-064: rebalancer tunables. Read once at
+	// startup; panic on a malformed env (operator typo must
+	// surface at boot, not as silent api.* defaults that
+	// mask the typo at the next drain). Schedd main is the
+	// only place an operator-facing env override lives;
+	// every other limit stays a pkg/api/limits.go
+	// constant (CLAUDE.md hard limits policy). This block
+	// runs BEFORE the rebalancer goroutine + cold-start
+	// sweep below so an early drain event observes the
+	// tuned values, not the api.* defaults.
+	if v := os.Getenv("FAAS_REBALANCE_COOLDOWN_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_REBALANCE_COOLDOWN_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_REBALANCE_COOLDOWN_SECONDS: %s", v)
+		}
+		if v2 := os.Getenv("FAAS_REBALANCE_MAX_PER_TICK"); v2 != "" {
+			m, parseErr2 := strconv.Atoi(v2)
+			if parseErr2 != nil || m <= 0 {
+				return fmt.Errorf("FAAS_REBALANCE_MAX_PER_TICK: %s", v2)
+			}
+			engine.WithRebalanceConfig(n, m)
+		} else {
+			engine.WithRebalanceConfig(n, api.RebalanceMaxPerTickPerNode)
+		}
+	} else if v := os.Getenv("FAAS_REBALANCE_MAX_PER_TICK"); v != "" {
+		m, parseErr := strconv.Atoi(v)
+		if parseErr != nil || m <= 0 {
+			return fmt.Errorf("FAAS_REBALANCE_MAX_PER_TICK: %s", v)
+		}
+		engine.WithRebalanceConfig(api.RebalanceCooldownSeconds, m)
+	}
+
+	// Tier A4 / ADR-064: rebalancer subscriber. Watches
+	// compute_node_changed for active=false events and hands
+	// the dead node id to Engine.RebalanceOrphanedApps.
+	if deps.subscribeRebalancer != nil && ownerNodeID != "" {
+		reb := sched.NewRebalancer(
+			func(ctx context.Context, deadNodeID string) error {
+				return engine.RebalanceOrphanedApps(ctx, deadNodeID)
+			},
+			log,
+		)
+		go subscribeWithReconnect(ctx, "rebalancer", log, deps.subscribeRebalancer, pool, reb.Run)
+	}
+
 	// Cold-start sweep: pg_notify is fire-and-forget, so a schedd
 	// that was down while an apid createApp landed missed the
 	// kind="created" notify. ListUnplacedApps at boot closes that
@@ -578,6 +644,26 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Info("schedd: cold-start sweep: reconciled unplaced apps", "count", len(apps))
 		}
 	}()
+
+	// Tier A4 / ADR-064: rebalance cold-start sweep. Same
+	// fire-and-forget-notify reasoning as the unplaced
+	// sweep above — a schedd that was down while a drain
+	// event landed missed the compute_node_changed active=
+	// false notify. RebalanceOrphanedApps with
+	// deadNodeID="" reconciles every orphaned app
+	// regardless of which dead node owned it. Runs once.
+	// Errors are logged and dropped; the next notify (or
+	// the next schedd restart) is the next opportunity.
+	if ownerNodeID != "" {
+		go func() {
+			if err := engine.RebalanceOrphanedApps(ctx, ""); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Warn("schedd: cold-start sweep: rebalance orphans", "err", err)
+			}
+		}()
+	}
 
 	// PR #114 / ADR-025 axis 3: per-node liveness sweep. Every
 	// `HeartbeatInterval` (default 30s) the heartbeat goroutine

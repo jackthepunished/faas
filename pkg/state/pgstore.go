@@ -959,6 +959,142 @@ func (s *PgStore) SetAppNodeID(ctx context.Context, appID, nodeID string) error 
 	return nil
 }
 
+// ListOrphanedApps returns every non-deleted app whose
+// node_id points at an inactive compute_node — the input
+// set for pkg/sched/rebalancer.go (Tier A4 / migration 00092).
+//
+// SQL shape:
+//
+//	select <appsSelectColumns>
+//	  from apps a
+//	 where a.node_id is not null
+//	   and a.status in ('active', 'evicted_cold')
+//	   and not exists (
+//	     select 1 from compute_nodes n
+//	      where n.id = a.node_id and n.active = true)
+//	   and (a.reassigned_at is null
+//	        or a.reassigned_at < now() - make_interval(secs => $1))
+//	 order by a.reassigned_at asc nulls first, a.id asc
+//	 limit $2
+//
+// The status filter is the apps.status CHECK minus
+// `deleted` — the rebalancer reassigns live apps (active
+// or evicted_cold), not soft-deleted ones. The not-exists
+// clause is the orphaning predicate; the make_interval
+// bound is the cooldown filter so the SQL already does the
+// right thing on a flap-loop (a fresh reassignment stays
+// on its current owner for at least cooldownSeconds). The
+// partial index from migration 00093
+// (apps_node_id_status_partial_idx) covers the leading
+// WHERE clause; the partial index from migration 00092
+// (apps_reassigned_at_idx) covers the trailing cooldown
+// filter. Both indexes are bounded by the non-deleted app
+// fleet — a busy multi-node install has at most one
+// reassignment per app per cooldown window, so the indexes
+// stay narrow.
+//
+// cooldownSeconds < 0 disables the cooldown filter (the
+// rebalancer passes the default; tests sometimes pass 0 to
+// force-eligibility). maxPerTick < 1 returns an empty set
+// (the cap is a defensive zero — production always passes
+// RebalanceMaxPerTickPerNode > 0).
+func (s *PgStore) ListOrphanedApps(ctx context.Context, cooldownSeconds, maxPerTick int) ([]App, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	// cooldownSeconds < 0 disables the cooldown filter
+	// (production never does this; only tests that want
+	// every orphaned app to be eligible). The SQL renders
+	// the filter clause only when the value is non-negative.
+	var cooldownClause string
+	var args []any
+	if cooldownSeconds >= 0 {
+		cooldownClause = ` and (a.reassigned_at is null or a.reassigned_at < now() - make_interval(secs => $1))`
+		args = append(args, cooldownSeconds, maxPerTick)
+	} else {
+		args = append(args, maxPerTick)
+	}
+	sel := `select ` + appsSelectColumns + `
+	          from apps a
+	         where a.node_id is not null
+	           and a.status in ('active', 'evicted_cold')
+	           and not exists (
+	             select 1 from compute_nodes n
+	              where n.id = a.node_id and n.active = true)` +
+		cooldownClause + `
+	         order by a.reassigned_at asc nulls first, a.id asc
+	         limit $` + strconv.Itoa(len(args))
+	rows, err := s.pool.Query(ctx, sel, args...)
+	if err != nil {
+		return nil, fmt.Errorf("state: list orphaned apps: %w", err)
+	}
+	defer rows.Close()
+	return scanApps(rows)
+}
+
+// ReassignAppOwner atomically transfers app ownership from
+// fromNodeID to toNodeID and stamps reassigned_at = now()
+// (Tier A4 / migration 00092). Closes the Phase-2
+// follow-up "apps pinned to a dead node" gap
+// (ADR-064). The conditional UPDATE is
+//
+//	update apps
+//	   set node_id = $3, reassigned_at = now()
+//	 where id = $1 and node_id = $2
+//	   and status in ('active', 'evicted_cold')
+//
+// The fromNodeID + status predicates are load-bearing:
+//   - fromNodeID: a peer-claim-then-second-peer-claim race
+//     never silently succeeds with a stale from-node. If
+//     the first peer's UPDATE landed first, the second
+//     peer's UPDATE finds node_id = $3 (not $2) and
+//     RowsAffected() == 0.
+//   - status: the UPDATE only touches non-deleted apps
+//     (status IN 'active','evicted_cold'). A soft-deleted
+//     app row stays soft-deleted; the rebalancer
+//     ListOrphanedApps already filters those out at the
+//     SQL level (the apps.status CHECK has `deleted` as
+//     the third value), but the defence-in-depth here
+//     protects against a race between the read and the
+//     write.
+//
+// Both node IDs are FK-validated by apps_node_id_fkey (set
+// in migration 00090); a bad toNodeID returns 23503, a
+// bad fromNodeID just fails the WHERE clause (RowsAffected
+// == 0). Returns ErrConflict on RowsAffected()==0; the
+// caller (rebalancer) treats that as "peer won" / "app
+// gone" / "app moved to live" and drops silently.
+func (s *PgStore) ReassignAppOwner(ctx context.Context, appID, fromNodeID, toNodeID string) error {
+	if appID == "" {
+		return fmt.Errorf("state: reassign app owner: empty appID")
+	}
+	if fromNodeID == "" {
+		return fmt.Errorf("state: reassign app owner: empty fromNodeID")
+	}
+	if toNodeID == "" {
+		return fmt.Errorf("state: reassign app owner: empty toNodeID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update apps
+		    set node_id = $3, reassigned_at = now()
+		  where id = $1
+		    and node_id = $2
+		    and status in ('active', 'evicted_cold')`,
+		appID, fromNodeID, toNodeID)
+	if err != nil {
+		return fmt.Errorf("state: reassign app owner: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Peer already won, app moved to live, or app gone.
+		// The rebalancer treats all three as drop-silently;
+		// the disambiguation is logged at Debug, not surfaced
+		// to the caller (who would otherwise need a second
+		// round-trip on the hot path).
+		return ErrConflict
+	}
+	return nil
+}
+
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,
@@ -7118,7 +7254,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID); err != nil {
+		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -7164,7 +7300,7 @@ const appsSelectColumns = `
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
-	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, '')`
+	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, ''), reassigned_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

@@ -65,6 +65,7 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 | 061 | Organizations, memberships, and unpriced seats (IAM-6: account→org split, path-scoped APIs, automatic personal org) | proposed | issue #190 (PR 1 / PR 2+ staged rollout) |
 | 062 | Tier A per-node schedd + schedd-side async placement claim | proposed | Phase 2 / Gate A |
 | 063 | Tier A snapshot de-localization (residual local-cache semantics) | proposed | Phase 2 / Gate A |
+| 064 | Tier A4 cross-node app rebalance (post-drain owner recovery: conditional UPDATE + cooldown + per-tick cap) | proposed | Tier A4 follow-up to ADR-062 deferred item 1 |
 | 064 | Per-app private-registry Basic Auth (additive `oci.AuthPuller` + sealed `(app_id, host)` store + per-plan quota) | proposed | issue #461 |
 | 065 | Decimal-vs-binary GB-h consolidation (canonical `GBHours` divisor) | reserved | promised by ADR-060 §Decision 8 — separate PR |
 

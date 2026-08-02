@@ -308,14 +308,30 @@ type App struct {
 	// NodeID is the durable shard key that ties an app to its
 	// owner compute_node (Phase 2 / Gate A, migration 00090).
 	// Set once at CreateApp time by apid's PlacementScheduler
-	// and immutable post-create — no PATCH path mutates it.
-	// Every schedd gRPC handler enforces the owner match via
-	// pkg/scheddgrpc.authorizeApp / authorizeInstance; a
-	// non-owner schedd returns codes.FailedPrecondition rather
-	// than silently mutating state. The synthetic default-local
-	// row's id is the backfill target for every pre-Phase-2 row,
-	// so single-box installs preserve bit-for-bit behaviour.
+	// and immutable post-create — except via the Tier A4
+	// reassignment path (Store.ReassignAppOwner), which the
+	// pkg/sched/rebalancer.go watcher triggers when the owning
+	// compute_node flips active=false. Every schedd gRPC handler
+	// enforces the owner match via pkg/scheddgrpc.authorizeApp /
+	// authorizeInstance; a non-owner schedd returns
+	// codes.FailedPrecondition rather than silently mutating
+	// state. The synthetic default-local row's id is the
+	// backfill target for every pre-Phase-2 row, so single-box
+	// installs preserve bit-for-bit behaviour.
 	NodeID string
+	// ReassignedAt is the wall-clock time of the most recent
+	// successful cross-node reassignment (Tier A4, migration
+	// 00092). Stamped by Store.ReassignAppOwner in the same
+	// UPDATE that flips apps.node_id. The rebalancer's hot
+	// filter is `reassigned_at IS NULL OR reassigned_at <
+	// now() - interval '<cooldown>s'`, so a fresh
+	// reassignment suppresses further moves for at least
+	// RebalanceCooldownSeconds (default 60s, env-overridable
+	// via FAAS_REBALANCE_COOLDOWN_SECONDS; the constant lives
+	// in pkg/api/limits.go). Nullable: a NULL row is the
+	// never-reassigned case, always eligible for the first
+	// drain event.
+	ReassignedAt *time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
