@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -65,7 +66,7 @@ func (s *stubSchedd) ReportActivity(context.Context, []state.InstanceTouch) (int
 func (s *stubSchedd) ParkInstance(context.Context, string, string) error {
 	panic("stubSchedd.ParkInstance")
 }
-func (s *stubSchedd) StreamAppLogs(context.Context, string, int64) (scheddgrpc.LogStream, error) {
+func (s *stubSchedd) StreamAppLogs(context.Context, string, int64, time.Time, string) (scheddgrpc.LogStream, error) {
 	panic("stubSchedd.StreamAppLogs")
 }
 func (s *stubSchedd) StreamWarmHints(context.Context) (scheddgrpc.WarmHintStream, error) {

@@ -19,6 +19,19 @@ import (
 //     committed line until the caller's context is cancelled or the
 //     ring is closed (Kill/DestroyWithExport).
 //
+// PR-B (issue #517 / acceptance #3 + #4) extends the initial page
+// with two additive filters without changing the wire contract for
+// pre-PR-B clients:
+//
+//   - SinceWrittenAt: client-inclusive lower bound on the
+//     host-side line.WrittenAt (RFC 3339). Empty = no time bound
+//     (matches the pre-PR-B behaviour).
+//   - Gap frame: when req.GetSinceSeq() falls below the ring's
+//     lowest retained Seq, vmmd emits a synthetic `is_gap=true` frame
+//     BEFORE the initial-page loop, carrying the head-written-at
+//     timestamp so the client can surface a meaningful "you missed
+//     lines whose newest retained time is X" message.
+//
 // The stream.Send call is the natural gRPC backpressure surface: a
 // slow consumer starves the ring's Subscribe channel, which drops
 // new lines via the ring's non-blocking publish (counter at apid).
@@ -32,6 +45,13 @@ import (
 // We do NOT return a server-streaming "end of stream" frame; gRPC
 // carries the EOF out-of-band and the apid producer emits a terminal
 // `event: end` frame on top of that.
+//
+// A since_seq cursor that fell below the ring's high-water mark is
+// NOT an error — the producer emits the gap frame, then replays the
+// lines it still has, then enters the live tail. Pre-PR-B clients
+// that ignore the new frame see exactly the same line traffic they
+// saw before (minus the evicted range, which they could not have
+// replayed anyway).
 func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) error {
 	const op = "Logs"
 	start := time.Now()
@@ -62,12 +82,57 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 	}
 	streamLogger.Info("vmmd: Logs: stream opened",
 		"instance", req.GetInstance(),
-		"since_seq", req.GetSinceSeq())
-	// Initial page: lines with Seq > since_seq in commit order. The
-	// ring's Snapshot filters by Seq >= sinceSeq (>= so a sinceSeq
-	// equal to the last seq is still considered replayed; the caller
-	// who wants strict "after" semantics passes seq+1).
+		"since_seq", req.GetSinceSeq(),
+		"since_written_at", req.GetSinceWrittenAt().AsTime())
+	// Gap-frame synthesis (issue #517 / PR-B acceptance #4). When
+	// since_seq sits below the oldest line the ring currently
+	// retains, the producer surfaces an explicit gap frame BEFORE
+	// the initial-page loop. The frame is one-shot — subsequent
+	// replies are line frames (mirror of the existing flow).
+	//
+	// The condition is gated on `since_seq > 0` because the "0 =
+	// tail from now" sentinel must NOT trigger a gap frame on an
+	// empty ring (the caller asked to skip the initial page). When
+	// only the since_written_at bound could have triggered a gap
+	// (i.e. the caller did not pass since_seq, or the ring's lowest
+	// seq still covers it), we label the frame
+	// "since_below_retained" so the consumer can render a meaningful
+	// diagnostic instead of guessing.
+	if req.GetSinceSeq() > 0 {
+		lowest := ring.LowestRetainedSeq()
+		if lowest > 0 && req.GetSinceSeq() < lowest {
+			if err := stream.Send(gapResponse(ring.HeadWrittenAt(), "seq_below_retained")); err != nil {
+				sendErr = err
+				return err
+			}
+		}
+	} else if !req.GetSinceWrittenAt().AsTime().IsZero() {
+		// since_seq omitted (live-tail sentinel) but a since-time
+		// bound was passed AND the ring's oldest retained line is
+		// strictly newer than the caller's bound: the caller asked
+		// "give me everything since T" and the ring has nothing that
+		// old. Surface an explicit gap frame labelled with the bound.
+		headAt := ring.HeadWrittenAt()
+		if !headAt.IsZero() && headAt.After(req.GetSinceWrittenAt().AsTime()) {
+			if err := stream.Send(gapResponse(headAt, "since_below_retained")); err != nil {
+				sendErr = err
+				return err
+			}
+		}
+	}
+	// Initial page: lines with Seq > since_seq in commit order, plus
+	// the since_written_at filter (issue #517 / PR-B acceptance #3).
+	// The ring's Snapshot filters by Seq >= sinceSeq (>= so a
+	// sinceSeq equal to the last seq is still considered replayed;
+	// the caller who wants strict "after" semantics passes seq+1);
+	// the local sinceTime bound is applied in the same linear scan
+	// — a separate filter pass would double the work for the
+	// common case where only one bound is set.
+	sinceTime := req.GetSinceWrittenAt().AsTime()
 	for _, line := range ring.Snapshot(req.GetSinceSeq()) {
+		if !sinceTime.IsZero() && line.WrittenAt.Before(sinceTime) {
+			continue
+		}
 		if err := stream.Send(lineToPb(line)); err != nil {
 			sendErr = err
 			return err
@@ -104,4 +169,23 @@ func lineToPb(l logbuf.Line) *vmmdpb.LogsResponse {
 		Line:      l.Line,
 		WrittenAt: timestamppb.New(l.WrittenAt),
 	}
+}
+
+// gapResponse builds the synthetic "cursor fell below the ring's
+// high-water mark" frame (issue #517 / PR-B acceptance #4). The
+// Seq/Stream/Line/WrittenAt line-frame fields are zero on the wire;
+// is_gap is true, gap_to_written_at carries the head line's host-side
+// ingest time so the client can render a meaningful diagnostic, and
+// gap_reason names the bound that triggered the gap ("seq_below_retained"
+// when the since_seq cursor is older than the ring's lowest retained
+// seq, "since_below_retained" when the since_written_at cursor is
+// older than the ring's oldest retained line). Wire shape mirrors
+// the additive `is_gap` field PR-B introduced — pre-PR-B consumers
+// ignore it.
+func gapResponse(headAt time.Time, reason string) *vmmdpb.LogsResponse {
+	resp := &vmmdpb.LogsResponse{IsGap: true, GapReason: reason}
+	if !headAt.IsZero() {
+		resp.GapToWrittenAt = timestamppb.New(headAt)
+	}
+	return resp
 }

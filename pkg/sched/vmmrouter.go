@@ -33,6 +33,7 @@ import (
 	"io"
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -95,7 +96,11 @@ type RoutedVMM interface {
 	// unknown nodeID; codes.NotFound from vmmd surfaces as
 	// the gRPC status (the schedd-side handler lifts it to the
 	// apid-facing 404).
-	Logs(ctx context.Context, nodeID, instance string, sinceSeq int64) (LogStream, error)
+	// sinceWrittenAt (issue #517 / PR-B acceptance #3) is the
+	// host-side WrittenAt lower bound on the replay page; the
+	// zero-time value is the "no bound" sentinel and is skipped
+	// on the wire. Wire is additive per ADR-016.
+	Logs(ctx context.Context, nodeID, instance string, sinceSeq int64, sinceWrittenAt time.Time) (LogStream, error)
 }
 
 // DialFunc is the factory VMMRouter uses to open a per-target VMM
@@ -332,17 +337,22 @@ func (r *VMMRouter) UpdateEgressAllowlist(ctx context.Context, nodeID, appID str
 	return cli.UpdateEgressAllowlist(ctx, appID, allowlist)
 }
 
-// Logs (issue #254 / Move 4) routes the per-instance log stream
-// to the vmmd that owns the instance. Returns *api.Problem Capacity
-// on an unknown nodeID; gRPC-side failures (vmmd dial issue,
-// codes.NotFound when the instance is parked) bubble up as
-// typed errors the schedd-side handler decides to lift or map.
-func (r *VMMRouter) Logs(ctx context.Context, nodeID, instance string, sinceSeq int64) (LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B acceptance #3 +
+// #4) routes the per-instance log stream to the vmmd that owns
+// the instance. Returns *api.Problem Capacity on an unknown
+// nodeID; gRPC-side failures (vmmd dial issue, codes.NotFound
+// when the instance is parked) bubble up as typed errors the
+// schedd-side handler decides to lift or map.
+//
+// sinceWrittenAt (issue #517 / PR-B) is the host-side WrittenAt
+// lower bound on the replay page; the zero value means no
+// bound. Forwarded verbatim — the wire is additive per ADR-016.
+func (r *VMMRouter) Logs(ctx context.Context, nodeID, instance string, sinceSeq int64, sinceWrittenAt time.Time) (LogStream, error) {
 	cli, err := r.resolveFor(ctx, nodeID)
 	if err != nil {
 		return nil, err
 	}
-	return cli.Logs(ctx, instance, sinceSeq)
+	return cli.Logs(ctx, instance, sinceSeq, sinceWrittenAt)
 }
 
 // Compile-time assertion: VMMRouter satisfies the engine-facing

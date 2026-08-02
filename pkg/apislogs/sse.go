@@ -6,20 +6,27 @@
 // the helpers live here rather than being duplicated in each
 // daemon.
 //
-// Wire shape (Move 4 acceptance #5): the SSE response is
-// `text/event-stream` with the following frames:
+// Wire shape (Move 4 acceptance #5, issue #517 / PR-B): the SSE
+// response is `text/event-stream` with the following frames:
 //
 //	event: log\ndata: {"seq":<i>,"instance":<s>,"stream":<s>,"line":<s>,"written_at":<rfc3339>}\n\n
+//	event: gap\ndata: {"reason":<s>,"gap_to_written_at":<rfc3339>,"replay_advised":<b>}\n\n
 //	event: ping\ndata: {}\n\n   (heartbeat; sigil form `:\n\n`)
 //	event: degraded\ndata: {...}\n\n
 //	event: error\ndata: {"code":<s>,"message":<s>}\n\n
 //	event: end\ndata: {"reason":<s>|"timeout"|"not_found"|"schedd_unreachable"}\n\n
 //
-// The five-event vocabulary is the contract the SDK decoder
+// The six-event vocabulary is the contract the SDK decoder
 // (pkg/api/sse.go) matches against. New frames MUST add a new
 // sentinel rather than overload an existing one — a downstream
 // SDK filtering on `event: log` would silently misconsume a
 // not-yet-catalogued event.
+//
+// The `event: gap` frame is NOT terminal; the stream continues
+// after a gap with the surviving replay and the live tail (the
+// ring's lowest retained seq was below the cursor). `replay_advised`
+// is a hint the SDK may surface as a banner; the server itself
+// never reaches back into history.
 package apislogs
 
 import (
@@ -114,38 +121,96 @@ func StartSSE(w http.ResponseWriter) {
 	w.(http.Flusher).Flush()
 }
 
+// RenderAppLogGap writes a single `event: gap` SSE frame for the
+// given schedd gap frame (issue #517 / PR-B, AC4). The frame is
+// NOT terminal — the stream continues with the surviving replay
+// and the live tail. ops is nil-safe.
+//
+// Reason is one of a small taxonomy: "seq_below_retained" (the
+// ring evicted older lines between attach and our first read),
+// "since_below_retained" (the since-time predates the oldest
+// surviving line). vmmdgrpc.Logs labels the frame at the producer
+// and schedd propagates the label verbatim through StreamAppLogs;
+// this renderer surfaces it as the wire payload's "reason" key.
+// The SDK surface (pkg/api/sse.go::LogGapEvent) mirrors these
+// names verbatim.
+func RenderAppLogGap(w http.ResponseWriter, flusher http.Flusher, f scheddgrpc.LogFrame, appID string, ops *wire.OpsMetrics) {
+	reason := f.GapReason
+	if reason == "" {
+		// Defensive default — a gap frame without a label means
+		// a pre-PR-B vmmd / schedd is upstream. Surface the
+		// broader "seq_below_retained" so the consumer still
+		// gets a meaningful, non-empty reason.
+		reason = "seq_below_retained"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"reason":            reason,
+		"gap_to_written_at": f.GapToWrittenAt.UTC().Format(time.RFC3339Nano),
+		"replay_advised":    true,
+	})
+	_, _ = fmt.Fprintf(w, "event: gap\ndata: %s\n\n", payload)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	ops.ObserveLogEmitted(appID)
+}
+
 // ValidateLogFilters enforces the issue #309 filter contract on
-// the `--level` and `--grep` query params. ok=false on
-// rejection; the handler must then emit the SSE error frame
-// (WriteInvalidLevelError / WriteInvalidGrepError) and return.
+// the `--level`, `--grep`, `--since`, and `--deployment` query
+// params. ok=false on rejection; the handler must then emit the
+// SSE error frame (WriteInvalidLevelError / WriteInvalidGrepError
+// / WriteInvalidSinceError / WritePlanDeploymentFilterNotAllowedError)
+// and return.
 //
 // `reason` is the SSE error code that pinpoints the rejection
-// ("invalid_level" or "invalid_grep") — exported as a const
+// ("invalid_level", "invalid_grep", "invalid_since", or
+// "plan_deployment_filter_not_allowed") — exported as a const
 // string so the SDK decoder can branch without a second
 // package-level import.
-func ValidateLogFilters(r *http.Request) (level string, grep string, reason string, ok bool) {
+//
+// The return signature is positional rather than a struct so the
+// handler's call site stays compact; the new sinceWrittenAt and
+// deploymentID slots pair with the existing level/grep pair the
+// PR-A wiring introduced.
+func ValidateLogFilters(r *http.Request) (level string, grep string, sinceWrittenAt time.Time, deploymentID string, reason string, ok bool) {
 	q := r.URL.Query()
 	// --level: enum match against api.IsValidLogLevel so the CLI
 	// and the server share the same source of truth.
 	if l := q.Get("level"); l != "" && !api.IsValidLogLevel(l) {
-		return "", "", "invalid_level", false
+		return "", "", time.Time{}, "", "invalid_level", false
 	}
 	// --grep: reject embedded newlines so Move 4's substring
 	// matcher can never match across log line boundaries (same
 	// log-injection precedent as `CodeQL go/log-injection
 	// sanitisers`).
 	if g := q.Get("grep"); strings.ContainsAny(g, "\n\r") {
-		return "", "", "invalid_grep", false
+		return "", "", time.Time{}, "", "invalid_grep", false
 	}
-	return q.Get("level"), q.Get("grep"), "", true
+	// --since (issue #517 / PR-B, AC3): RFC3339 lower bound on
+	// log written_at. Empty = no time bound. Malformed = reject
+	// with invalid_since. The schedd/vmmd layer treats the
+	// bound as inclusive (>= sinceWrittenAt), matching the
+	// existing >= sinceSeq semantics.
+	sinceWrittenAt = time.Time{}
+	if s := q.Get("since"); s != "" {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			return "", "", time.Time{}, "", "invalid_since", false
+		}
+		sinceWrittenAt = t
+	}
+	deploymentID = q.Get("deployment")
+	return q.Get("level"), q.Get("grep"), sinceWrittenAt, deploymentID, "", true
 }
 
 // SSE error codes emitted by ValidateLogFilters. Stable strings
 // that the SDK decoder branches on (`pkg/api/sse.go`); renaming
 // any of these is a breaking change.
 const (
-	InvalidLevelCode = "invalid_level"
-	InvalidGrepCode  = "invalid_grep"
+	InvalidLevelCode                   = "invalid_level"
+	InvalidGrepCode                    = "invalid_grep"
+	InvalidSinceCode                   = "invalid_since"
+	PlanDeploymentFilterNotAllowedCode = "plan_deployment_filter_not_allowed"
 )
 
 // WriteInvalidLevelError writes the `event: error` +
@@ -164,6 +229,35 @@ func WriteInvalidLevelError(w http.ResponseWriter, flusher http.Flusher) {
 // `--grep` validation failure path.
 func WriteInvalidGrepError(w http.ResponseWriter, flusher http.Flusher) {
 	_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_grep\",\"message\":\"grep must not contain newline or carriage return\"}\n\n")
+	_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// WriteInvalidSinceError mirrors WriteInvalidLevelError for the
+// `--since` validation failure path (issue #517 / PR-B, AC3).
+// Triggered when the caller sends a value that is not a valid
+// RFC3339 timestamp; the SDK sees `code: invalid_since` and can
+// surface a "since must be RFC3339 (e.g. 2026-08-01T12:00:00Z)"
+// hint.
+func WriteInvalidSinceError(w http.ResponseWriter, flusher http.Flusher) {
+	_, _ = fmt.Fprint(w, "event: error\ndata: {\"code\":\"invalid_since\",\"message\":\"since must be RFC3339 (e.g. 2026-08-01T12:00:00Z)\"}\n\n")
+	_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// WritePlanDeploymentFilterNotAllowedError mirrors
+// WriteInvalidLevelError for the `--deployment` plan-gate
+// failure path (issue #517 / PR-B, AC3). Triggered when a Free
+// plan customer sends `?deployment=...` (LogDeploymentFilterMax
+// == 0 for Free). The `max` arg is the per-plan cap (0 for
+// Free); surfaced in the message so the SDK can show the user
+// what to upgrade to.
+func WritePlanDeploymentFilterNotAllowedError(w http.ResponseWriter, flusher http.Flusher, max int) {
+	_, _ = fmt.Fprintf(w, "event: error\ndata: {\"code\":\"plan_deployment_filter_not_allowed\",\"message\":\"your plan does not allow the ?deployment= filter (max=%d); upgrade to Hobby or above\"}\n\n", max)
 	_, _ = fmt.Fprint(w, "event: end\ndata: {}\n\n")
 	if flusher != nil {
 		flusher.Flush()

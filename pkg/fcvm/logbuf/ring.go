@@ -266,6 +266,48 @@ func (r *Ring) Subscribe() (<-chan Line, func()) {
 	return ch, cancel
 }
 
+// LowestRetainedSeq reports the Seq of the oldest line currently
+// retained by the ring, or 0 when the ring is empty (mirrors the
+// Snapshot "tail from now" sentinel).
+//
+// Used by vmmdgrpc.Server.Logs (issue #517 / PR-B acceptance #4) to
+// detect a cursor that fell below the ring's high-water mark and
+// surface an `event: gap` SSE frame instead of silently replaying
+// from a non-existent point. The attach-time lock is microseconds vs.
+// the gRPC dial round-trip; the value is consumed once per
+// StreamAppLogs attach.
+//
+// Locked under r.mu. The sequence number is monotonic per ring, so
+// the oldest retained line is always r.lines[r.head].Seq.
+func (r *Ring) LowestRetainedSeq() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size == 0 {
+		return 0
+	}
+	return r.lines[r.head].Seq
+}
+
+// HeadWrittenAt reports the host-side WrittenAt of the oldest line
+// the ring currently retains (the same line LowestRetainedSeq
+// references), or the zero time.Time when the ring is empty.
+//
+// The gap frame on issue #517 / PR-B acceptance #4 carries this
+// timestamp in `gap_to_written_at` so a client can surface a
+// meaningful "lines whose newest retained timestamp is X were
+// evicted" message; clock source is the host (ADR-022 entropy
+// hazard).
+//
+// Locked under r.mu.
+func (r *Ring) HeadWrittenAt() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size == 0 {
+		return time.Time{}
+	}
+	return r.lines[r.head].WrittenAt
+}
+
 // Close marks the ring as closed and tears down every active subscriber
 // channel. Subsequent Write calls return ErrClosed; Snapshot returns the
 // last-committed lines up to the close point. Idempotent.

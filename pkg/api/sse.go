@@ -55,6 +55,23 @@ type LogEvent struct {
 	WrittenAt  string `json:"written_at"`
 }
 
+// LogGapEvent is the parsed shape of an `event: gap` SSE frame
+// (issue #517 / PR-B, AC4). The frame is emitted by gatewayd when
+// the per-instance log ring no longer retains the cursor the
+// caller asked for; downstream consumers use Reason +
+// GapToWrittenAt to surface a banner ("some earlier logs were
+// lost; latest surviving line at <ts>"). ReplayAdvised is a hint
+// — the server never reaches back into history, so "advised" is
+// the SDK-facing verb even when the producer cannot replay.
+//
+// Field names mirror the wire exactly so the SDK caller can
+// json.Unmarshal the frame's Data into this struct directly.
+type LogGapEvent struct {
+	Reason         string `json:"reason"`            // "seq_below_retained" | "since_below_retained"
+	GapToWrittenAt string `json:"gap_to_written_at"` // RFC3339Nano
+	ReplayAdvised  bool   `json:"replay_advised"`
+}
+
 // Event is one Server-Sent Event frame as defined by the WHATWG
 // spec the apid SSE handlers emit. Field names mirror the wire
 // (`event:`, `data:`, `id:`) so a caller reading the source can map

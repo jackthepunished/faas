@@ -15,11 +15,12 @@ import (
 // `faas logs <app>` had no flag-based filtering — these fields are
 // optional; the zero value passes through every line.
 //
-// The wire contract today is advisory — apid's Move 3 stub at
-// streamAppLogs accepts but does not yet act on the params, so a
-// LogFilter at this layer only narrows the round-trip; once Move 4
-// lands vmmd's Logs(req) gRPC stream, the same fields drive the
-// server-side filter against the per-instance ring buffer.
+// Since issue #517 / PR-B the wire contract is enforced end-to-end:
+// gatewayd forwards Since to schedd, schedd forwards to vmmd, and
+// vmmd applies the bound against the per-instance ring buffer at
+// attach time. A cursor below the ring's lowest retained seq emits
+// an `event: gap` frame (decoded into LogGapEvent on the SDK side)
+// rather than silently replaying from a stale position.
 type LogFilter struct {
 	// Grep is a substring match applied to each log line.
 	Grep string
@@ -63,7 +64,10 @@ func IsValidLogLevel(s string) bool {
 //
 // deploymentID filters to a specific deployment (matches the
 // `?deployment=` query param the CLI's `faas logs --deployment` uses);
-// pass "" to receive all instances' frames.
+// pass "" to receive all instances' frames. Issue #517 / PR-B:
+// the deployment filter is now enforced server-side; Free plan
+// customers get a 400 plan_deployment_filter_not_allowed rejection
+// before the stream opens.
 //
 // opts narrows the per-line output by Grep / Since / Level; pass the
 // zero LogFilter for an unfiltered stream. Issue #309.

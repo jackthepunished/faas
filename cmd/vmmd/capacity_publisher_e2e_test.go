@@ -109,7 +109,7 @@ func (f *fakeSinkSchedAPI) ReportActivity(context.Context, []state.InstanceTouch
 func (f *fakeSinkSchedAPI) ParkWithReason(context.Context, string, string) error {
 	return nil
 }
-func (f *fakeSinkSchedAPI) StreamAppLogs(context.Context, string, int64, scheddgrpc.LogFrameSink) error {
+func (f *fakeSinkSchedAPI) StreamAppLogs(context.Context, string, int64, time.Time, string, scheddgrpc.LogFrameSink) error {
 	return nil
 }
 func (f *fakeSinkSchedAPI) StreamWarmHints(context.Context, scheddgrpc.WarmHintSink) error {

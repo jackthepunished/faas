@@ -68,10 +68,12 @@ func (f *fakeWakeVMM) UpdateEgressAllowlist(_ context.Context, _, _ string, _ []
 	return nil
 }
 
-// Logs (issue #254 / Move 4) — the cron loop tests never drive
-// the log stream path; the scheddgrpc handler tests do. Returns
-// a closed fakeLogStream so any accidental caller exits cleanly.
-func (f *fakeWakeVMM) Logs(_ context.Context, _, _ string, _ int64) (LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B) — the cron loop
+// tests never drive the log stream path; the scheddgrpc handler
+// tests do. Returns a closed fakeLogStream so any accidental caller
+// exits cleanly. PR-B adds the sinceWrittenAt time lower-bound; the
+// fake ignores it.
+func (f *fakeWakeVMM) Logs(_ context.Context, _, _ string, _ int64, _ time.Time) (LogStream, error) {
 	return &fakeLogStream{}, nil
 }
 

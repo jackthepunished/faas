@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"time"
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
@@ -27,7 +28,7 @@ type ScheddClient interface {
 	Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	ParkInstance(ctx context.Context, instanceID, reason string) error
-	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (LogStream, error)
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) (LogStream, error)
 	StreamWarmHints(ctx context.Context) (WarmHintStream, error)
 	Close() error
 }

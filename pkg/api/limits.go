@@ -199,6 +199,18 @@ type Limits struct {
 	// 'dead_letter' state value + partial index).
 	MaxQueueAttempts int
 
+	// LogDeploymentFilterMax (issue #517 / PR-B, AC3) caps how
+	// many concurrent `?deployment=` filters a customer may scope
+	// their log stream to. The wire surface is single-valued today
+	// (the SDK takes one deploymentID arg); this field is the
+	// plan-tier gate the handler enforces before forwarding to
+	// schedd. Free returns 0 so a Free customer's `?deployment=`
+	// is rejected with `plan_deployment_filter_not_allowed`; Hobby
+	// unlocks it for the typical Hobby customer's single-staging-
+	// deployment workload; Pro/Scale get the higher caps the
+	// per-tier multi-deployment fan-out needs.
+	LogDeploymentFilterMax int
+
 	// Cron limits (spec §4.4 / event-shaped surface). Two independent
 	// caps; both populated for every plan, Free is 0/0 so the
 	// per-store check returns QuotaError immediately. The handler
@@ -375,6 +387,12 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
+		// Log deployment filter (issue #517 / PR-B): Free is the
+		// abuse-floor tier — the filter is a paid feature.
+		// Handler returns WritePlanDeploymentFilterNotAllowedError
+		// before the store is touched; the 0 here is a
+		// defence-in-depth value the handler still reads.
+		LogDeploymentFilterMax: 0,
 		// CPU fairness (issue #301 / ADR-044): Free gets the smallest
 		// slice weight=2 and the tightest quota (100ms/100ms). 100 ms
 		// is enough headroom for a Free-tier app to handle a handful of
@@ -469,6 +487,12 @@ var planLimits = map[Plan]Limits{
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
 		RateLimitPerAccountRPM: 200,
+		// Log deployment filter (issue #517 / PR-B): Hobby gets
+		// 1 — the typical Hobby customer runs one staging
+		// deployment alongside their prod slot, and the filter
+		// scopes the log stream to it. Mirror shape of Hobby's
+		// per-app cron cap (5).
+		LogDeploymentFilterMax: 1,
 		// CPU fairness (issue #301): Hobby weight=4, quota 200ms/200ms.
 		// Doubles Free's quota — tracks the per-app concurrency bump
 		// (1 → 2) and the per-app rps (5 → 20).
@@ -546,6 +570,12 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
+		// Log deployment filter (issue #517 / PR-B): Pro gets 10
+		// — covers the typical multi-staging fan-out (prod + 3-5
+		// staging branches + a few ephemeral preview slots) without
+		// letting one app monopolise the schedd's per-instance
+		// goroutine fan-out.
+		LogDeploymentFilterMax: 10,
 		// CPU fairness (issue #301): Pro weight=8, quota 500ms/500ms.
 		// Half-bandwidth of 2 cores — tracks the per-app concurrency
 		// (5) and the per-app rps (100).
@@ -629,7 +659,12 @@ var planLimits = map[Plan]Limits{
 		// (FaasPerAccountRateLimitSpike) triggers well before any single
 		// paid customer's bucket fills, which is the intended signal:
 		// coordinated abuse, not baseline load.
-		RateLimitPerAccountRPM:  5000,
+		RateLimitPerAccountRPM: 5000,
+		// Log deployment filter (issue #517 / PR-B): Scale gets 50
+		// — 5× Pro (10→50), tracks Scale's larger app budget
+		// (100 apps vs Pro's 25) and the multi-region staging fan-out
+		// SaaS-scale customers typically run.
+		LogDeploymentFilterMax:  50,
 		ScaleUpTargetCPUAllowed: true,
 		// CPU fairness (issue #301): Scale weight=16, quota 1000ms/1000ms
 		// — i.e. the full bandwidth of one core. Scale runs 20 concurrent
@@ -1199,6 +1234,20 @@ func (p Plan) TrustedSignerCountMax() int {
 		return 0
 	}
 	return l.TrustedSignerCountMax
+}
+
+// LogDeploymentFilterMax returns the per-plan cap on the
+// `?deployment=` filter the customer may scope their app-logs
+// stream to (issue #517 / PR-B, AC3). Free returns 0 so the
+// handler rejects with `plan_deployment_filter_not_allowed`; paid
+// tiers return 1 / 10 / 50 (Hobby/Pro/Scale). Unknown plans fail
+// closed (return 0) — same contract as CronLimitPerApp above.
+func (p Plan) LogDeploymentFilterMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LogDeploymentFilterMax
 }
 
 // OrgMembersMax returns the per-non-personal-org member cap for the

@@ -100,10 +100,12 @@ func (v *statsFakeVMM) UpdateEgressAllowlist(context.Context, string, []netip.Pr
 	return nil
 }
 
-// Logs (issue #254 / Move 4) — instancestats tests don't drive the
-// log stream path; the scheddgrpc handler tests do. Returns nil
-// + an error so the caller's "no log stream" branch is exercised.
-func (v *statsFakeVMM) Logs(context.Context, string, int64) (sched.LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B) — instancestats
+// tests don't drive the log stream path; the scheddgrpc handler
+// tests do. Returns nil + an error so the caller's "no log stream"
+// branch is exercised. PR-B adds the sinceWrittenAt time lower-bound;
+// the fake ignores it.
+func (v *statsFakeVMM) Logs(context.Context, string, int64, time.Time) (sched.LogStream, error) {
 	return nil, errors.New("instancestats test stubs Logs; use scheddgrpc for Move 4 path")
 }
 
