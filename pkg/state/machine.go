@@ -31,13 +31,26 @@ const (
 	// transitions map below on purpose — the subscriber is the only
 	// writer, and the state is not reversible from the state machine.
 	StateEvictingAccountDeleting State = "evicting_account_deleting"
+	// StateMigrating (Tier A5 / ADR-065) — transient state stamped
+	// at Phase 3 of the four-phase cross-node live-instance handoff.
+	// The dying vmmd has paused the VM and written the snapshot;
+	// the new owner vmmd is restoring. CountsForRAM returns true
+	// (the snapshot occupies resident RAM on the dying node until
+	// the lease resolves). NOT a wake-side state: only schedd's
+	// Engine.MigrateLiveInstances drives a transition into here, and
+	// the only legal exit is StateRunning (commit succeeded) or
+	// StateParked (commit failed; the dying vmmd resumes the VM
+	// and the snapshot stays where it was). Mirrors the
+	// StateEvictingAccountDeleting precedent — a transient state
+	// outside the wake/reap hot path.
+	StateMigrating State = "migrating"
 )
 
 // States lists every state (deterministic order for tests + CHECK generation).
 var States = []State{
 	StateParked, StateWaking, StateColdBooting, StateRunning,
 	StateSnapshotting, StateStopped, StateFailed,
-	StateEvictingAccountDeleting,
+	StateEvictingAccountDeleting, StateMigrating,
 }
 
 // transitions is the legal edge set of the state machine (spec §6.1).
@@ -48,7 +61,7 @@ var transitions = map[State][]State{
 	StateParked:       {StateWaking, StateColdBooting},
 	StateWaking:       {StateRunning, StateColdBooting, StateFailed, StateStopped, StateEvictingAccountDeleting},
 	StateColdBooting:  {StateRunning, StateFailed, StateStopped, StateEvictingAccountDeleting},
-	StateRunning:      {StateSnapshotting, StateStopped, StateFailed, StateEvictingAccountDeleting},
+	StateRunning:      {StateSnapshotting, StateStopped, StateFailed, StateEvictingAccountDeleting, StateMigrating},
 	StateSnapshotting: {StateParked, StateStopped, StateEvictingAccountDeleting},
 	StateStopped:      {StateColdBooting},
 	StateFailed:       {StateParked, StateColdBooting, StateStopped}, // manual recovery / lazy cold-boot
@@ -56,6 +69,12 @@ var transitions = map[State][]State{
 	// physically removes the VM; the row is then dropped by the
 	// DeleteAccount walk after the 30-day grace window lapses.
 	StateEvictingAccountDeleting: {},
+	// StateMigrating → RUNNING on commit; → PARKED on rollback
+	// (the dying vmmd resumes the VM and the snapshot stays).
+	// Either edge ends the transient; the row is no longer
+	// considered migrating from that moment. Engine.MigrateLiveInstances
+	// owns both transitions.
+	StateMigrating: {StateRunning, StateParked, StateFailed},
 }
 
 // Valid reports whether s is a known state.
@@ -88,9 +107,15 @@ func (s State) CountsForConcurrency() bool {
 
 // CountsForRAM reports whether s holds resident RAM and so counts against the
 // admission ceiling (invariant §6.2-2: Σ(ram+8) over {WAKING, COLD_BOOTING,
-// RUNNING, SNAPSHOTTING} ≤ 47,600 MB).
+// RUNNING, SNAPSHOTTING, MIGRATING} ≤ 47,600 MB).
+//
+// StateMigrating holds the paused-VM snapshot resident on the dying
+// node during the four-phase handoff (ADR-065). It counts as live
+// RAM until either the commit succeeds (edge → RUNNING on the new
+// owner) or the rollback fires (edge → PARKED; the snapshot is
+// freed on the dying node once the dying vmmd resumes).
 func (s State) CountsForRAM() bool {
-	return s.CountsForConcurrency() || s == StateSnapshotting
+	return s.CountsForConcurrency() || s == StateSnapshotting || s == StateMigrating
 }
 
 // IsLive reports whether the named state is a live row that the

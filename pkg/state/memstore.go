@@ -1663,6 +1663,133 @@ func (m *MemStore) ReassignAppOwner(_ context.Context, appID, fromNodeID, toNode
 	return nil
 }
 
+// ListLiveInstancesOnNode mirrors
+// pkg/state/pgstore.go::ListLiveInstancesOnNode. Filters to
+// state ∈ {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING} — the
+// canonical IsLive predicate — and to the given node_id (or
+// every inactive-owner instance when nodeID is empty). Returns
+// an empty slice (not ErrNotFound) on no matches; callers
+// treat that as "nothing to migrate this tick". Migration
+// lineage fields on the returned Instance are zero values
+// (the memstore fixture is exercised by unit tests that
+// drive the four-phase handoff through the engine surface,
+// not through state row reads).
+func (m *MemStore) ListLiveInstancesOnNode(_ context.Context, nodeID string, maxPerTick int) ([]Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	out := make([]Instance, 0, maxPerTick)
+	for _, ins := range m.instances {
+		if !IsLive(ins.State) {
+			continue
+		}
+		if nodeID != "" && ins.NodeID != nodeID {
+			continue
+		}
+		// nodeID == "": cold-start variant. We don't model
+		// compute_nodes ownership in the memstore, so the
+		// in-memory filter is just "live and unowned-by-self"
+		// — the unit-test fixture for the cold-start sweep.
+		out = append(out, ins)
+		if len(out) >= maxPerTick {
+			break
+		}
+	}
+	return out, nil
+}
+
+// MarkInstanceMigrating mirrors pkg/state/pgstore.go::
+// MarkInstanceMigrating. Conditional on state='running' +
+// node_id=currentNodeID; the state-machine guard is the
+// in-memory equivalent of the SQL predicate. Returns
+// ErrConflict on a lost race / row gone.
+func (m *MemStore) MarkInstanceMigrating(_ context.Context, instanceID, currentNodeID string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: mark instance migrating: empty instanceID")
+	}
+	if currentNodeID == "" {
+		return fmt.Errorf("state: mark instance migrating: empty currentNodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.NodeID != currentNodeID || ins.State != "running" {
+		return ErrConflict
+	}
+	ins.State = "migrating"
+	m.instances[instanceID] = ins
+	return nil
+}
+
+// MigrateInstanceOwner mirrors pkg/state/pgstore.go::
+// MigrateInstanceOwner. Two-step in-memory transaction: flip
+// the instance row (conditional on state='migrating' +
+// node_id=fromNodeID), then stamp apps.migrated_at. Returns
+// ErrConflict on a lost race / row gone.
+func (m *MemStore) MigrateInstanceOwner(_ context.Context, instanceID, fromNodeID, toNodeID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: migrate instance owner: empty instanceID")
+	}
+	if fromNodeID == "" || toNodeID == "" {
+		return fmt.Errorf("state: migrate instance owner: empty from/to nodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != "migrating" || ins.NodeID != fromNodeID {
+		return ErrConflict
+	}
+	now := time.Now()
+	migFrom := fromNodeID
+	ins.NodeID = toNodeID
+	ins.MigratedFromNodeID = &migFrom
+	ins.MigratedAt = &now
+	ins.LeaseToken = leaseToken
+	ins.State = "running"
+	m.instances[instanceID] = ins
+	// Stamp apps.migrated_at to match the SQL transaction's
+	// second UPDATE.
+	if a, ok := m.apps[ins.AppID]; ok {
+		a.MigratedAt = &now
+		m.apps[ins.AppID] = a
+	}
+	return nil
+}
+
+// CancelInstanceMigration mirrors pkg/state/pgstore.go::
+// CancelInstanceMigration. Conditional on state='migrating' +
+// node_id=originalNodeID + lease_token=leaseToken; restores
+// state='parked' and clears lease_token.
+func (m *MemStore) CancelInstanceMigration(_ context.Context, instanceID, originalNodeID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: cancel instance migration: empty instanceID")
+	}
+	if originalNodeID == "" {
+		return fmt.Errorf("state: cancel instance migration: empty originalNodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != "migrating" || ins.NodeID != originalNodeID || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = "parked"
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

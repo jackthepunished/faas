@@ -627,6 +627,70 @@ type Store interface {
 	// second-peer-claim race never silently succeeds with a stale
 	// from-node.
 	ReassignAppOwner(ctx context.Context, appID, fromNodeID, toNodeID string) error
+
+	// ListLiveInstancesOnNode returns every live instance owned by
+	// nodeID — the candidate set for Engine.MigrateLiveInstances
+	// (Tier A5 / migration 00097, ADR-065, follow-up to ADR-064).
+	// "Live" is the canonical predicate at IsLive: state ∈
+	// {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING}. Sorted by
+	// instance id ASC for determinism so two peers observing the
+	// same drain event migrate the same set (they still race on
+	// MigrateInstanceOwner; this list is just the input set).
+	// Caller-side filter: deadNodeID == "" returns every live
+	// instance whose owning compute_node is inactive (the cold-
+	// start sweep variant). maxPerTick caps the result set; the
+	// caller passes api.MigrateLiveMaxPerTick
+	// (pkg/api/limits.go).
+	ListLiveInstancesOnNode(ctx context.Context, nodeID string, maxPerTick int) ([]Instance, error)
+	// MarkInstanceMigrating is the Phase-2 atom of the four-phase
+	// handoff (Tier A5 / ADR-065). Transitions the instance to
+	// state='migrating' under a conditional UPDATE that requires
+	// state='running' (the only state eligible for live migration;
+	// WAKING/COLD_BOOTING stay where they are and the dying vmmd
+	// drives the cold-boot to completion on the dead node) and
+	// requires node_id = currentNodeID (the dying vmmd — a
+	// concurrent owner change from a peer rebalancer would have
+	// flipped the row already, in which case we abort). The
+	// transition stamps state='migrating' atomically so a peer
+	// claim that races us sees the new state and bails. Returns
+	// ErrConflict on RowsAffected()==0 — peer already moved the
+	// instance to a non-RUNNING state, owner changed, or row gone.
+	MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID string) error
+	// MigrateInstanceOwner is the Phase-3 commit of the four-phase
+	// handoff (Tier A5 / ADR-065). Conditional UPDATE that flips
+	// instances.node_id from fromNodeID to toNodeID, stamps
+	// migrated_from_node_id = fromNodeID, stamps
+	// migrated_at = now(), writes lease_token (the per-migration
+	// UUID the new owner minted at Phase 1), transitions state
+	// from 'migrating' back to 'running', AND stamps
+	// apps.migrated_at = now() in the same transaction so the
+	// app-level lineage column stays coherent with the instance
+	// row. The conditional predicates are load-bearing:
+	//   1. state = 'migrating' (a peer rollback would have moved
+	//      the row back to 'parked' already)
+	//   2. node_id = fromNodeID (a peer re-owner would have
+	//      flipped this already)
+	//   3. lease_token = leaseToken (a stale lease can never
+	//      silently commit; the new owner must present the
+	//      same UUID it minted at Phase 1)
+	// Returns ErrConflict on RowsAffected()==0 — peer rollback,
+	// peer re-owner, lease expiry, or row gone.
+	MigrateInstanceOwner(ctx context.Context, instanceID, fromNodeID, toNodeID, leaseToken string) error
+	// CancelInstanceMigration is the Phase-4 rollback of the
+	// four-phase handoff (Tier A5 / ADR-065). Conditional UPDATE
+	// that transitions the instance back from 'migrating' to
+	// 'parked' on the original owner (the dying vmmd resumes the
+	// VM, the snapshot stays where it was). Predicates:
+	//   1. state = 'migrating'
+	//   2. node_id = originalNodeID (the dying vmmd — the
+	//      rollback is owner-local; a peer commit racing us
+	//      would have flipped node_id already)
+	//   3. lease_token = leaseToken (stale-lease safety)
+	// Returns ErrConflict on RowsAffected()==0 — peer already
+	// committed (no rollback needed), lease expired, or row
+	// gone. The store also clears the lease_token on rollback
+	// so a future re-attempt at migration mints a fresh one.
+	CancelInstanceMigration(ctx context.Context, instanceID, originalNodeID, leaseToken string) error
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)
