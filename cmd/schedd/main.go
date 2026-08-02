@@ -26,6 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
@@ -496,6 +497,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (pkg/audit/audit.go). Best-effort per ADR-035: never blocks
 	// the RUNNING transition.
 	engine.WithAudit(audit.New(store, log, ops, "schedd"))
+
+	// issue #517 / PR-C / ADR-064 — wire the wake-timeline fan-out
+	// (pkg/events.Platform) on the engine. Schedd is the canonical
+	// emit site for wake.queue_accepted / wake.admitted /
+	// wake.boot_started / wake.boot_completed / wake.boot_failed /
+	// wake.park_started / wake.park_completed / wake.stalled
+	// (vmmd / gatewayd / builderd / apid mirror corroborating
+	// observations). nil broadcaster is allowed — the Platform
+	// skips the in-process SSE fan-out and just writes the events
+	// row. Production SSE delivery for the /v1/apps/{slug}/wakes/
+	// {wake_id}/timeline endpoint uses pg_notify (cross-process),
+	// not the in-process Broadcaster.
+	engine.WithEvents(events.NewPlatform("schedd", store, log, ops, nil))
 
 	// Rebuild admission accounting from any instances still live from a prior
 	// run before we start admitting new wakes.

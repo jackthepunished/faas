@@ -1539,6 +1539,14 @@ type Store interface {
 	// stale on a failed restore, ADR-005).
 	CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, error)
 	LatestSnapshot(ctx context.Context, deploymentID string) (Snapshot, error)
+	// LatestSnapshotForTier (issue #470 / ADR-055) returns the freshest
+	// non-stale snapshot for the (deployment, tier) pair. Empty tier is
+	// treated as "init". Returns ErrNotFound when no non-stale row
+	// exists — schedd's tier-fallback chain treats that as "fall through
+	// to the next tier". Warm-tier apps use this to pick warm.snap when
+	// usable; cold-boot-only deployments continue to call
+	// LatestSnapshot (which now ranks warm above init on ties).
+	LatestSnapshotForTier(ctx context.Context, deploymentID, tier string) (Snapshot, error)
 	MarkSnapshotStale(ctx context.Context, snapshotID string) error
 
 	// Snapshot GC (imaged nightly + on FC upgrade, spec §4.6 + §4.4).
@@ -1710,6 +1718,15 @@ type Store interface {
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
+	// ListEventsByWakeID (issue #517 / PR-C, ADR-064) is the
+	// wake-timeline read-side query. Filters on the jsonb
+	// expression index events_wake_id_idx
+	// (migrations/00113_events_wake_id_idx.sql) and orders by at
+	// ASC so the customer-facing timeline endpoint surfaces a
+	// forward narrative. The since parameter is the RFC 3339
+	// lower bound (zero-value passes the floor); limit is
+	// bounded to 1000 by the handler.
+	ListEventsByWakeID(ctx context.Context, wakeID string, since time.Time, limit int) ([]Event, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first

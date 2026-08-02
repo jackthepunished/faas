@@ -55,6 +55,15 @@ type server struct {
 	// (slice 5/6). nil falls back to a fresh one so callers can defer
 	// initialization in unit tests.
 	events *events.Broadcaster
+	// eventsPlatform is the pkg/events.Platform (issue #517 / PR-C /
+	// ADR-064). When non-nil, the deploy handler emits
+	// wake.deploy_failed on the events table for every
+	// pre-build rejection (signature gate, image format, override
+	// cap). nil opts out (pre-PR-C unit tests + dev mode that
+	// doesn't want the events row side-effect). The same value
+	// lives on the cmd/apid wiring site so a single
+	// construction serves every consumer in this binary.
+	eventsPlatform *events.Platform
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -308,6 +317,19 @@ func (s *server) WithBillingProvider(p billing.Provider) *server {
 // zero value (both providers Disabled → consent routes 503).
 func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
 	s.oauthConfig = cfg
+	return s
+}
+
+// WithEventsPlatform attaches the pkg/events.Platform
+// (issue #517 / PR-C / ADR-064). When non-nil, the deploy
+// handler emits wake.deploy_failed on the events table for
+// every pre-build rejection (signature gate, image format,
+// override cap, missing slug). nil opts out — pre-PR-C
+// fixtures + the unit-test default. Mirrors the WithEvents
+// setter pattern on pkg/sched.Engine / pkg/fcvm.VMM /
+// pkg/builderd.Builderd.
+func (s *server) WithEventsPlatform(p *events.Platform) *server {
+	s.eventsPlatform = p
 	return s
 }
 
@@ -724,6 +746,14 @@ func (s *server) handler() http.Handler {
 	// routes are gated separately below.
 	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAuditEvents))))
 	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAuditEvent))))
+
+	// Issue #517 / PR-C / ADR-064: customer-facing wake-timeline
+	// surface. Sub-resource of /v1/apps/{slug} — same auth chain
+	// as the rest of the /v1/apps/* read surface, same §12
+	// per-app rate-limit budget. The query keys on the partial
+	// index events_wake_id_idx (migrations/00113) for O(frames)
+	// latency regardless of events table size.
+	mux.HandleFunc("GET /v1/apps/{slug}/wakes/{wake_id}/timeline", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listWakeTimeline))))
 
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.

@@ -28,6 +28,21 @@ type CreateAppRequest struct {
 	// (a synchronous JSON API that wants Content-Length). Explicit
 	// true on Free = rejected by apid with 403 plan_streaming_not_allowed.
 	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
+	// WarmSnapshotEnabled (issue #470 / ADR-055) opts the brand-new
+	// app into the two-tier snapshot path (warm.snap on top of
+	// init.snap). nil → plan default (Free/Hobby off; Pro/Scale on).
+	// Explicit true on Free/Hobby = rejected by apid with 403
+	// plan_warm_snapshot_not_allowed. Explicit false on Pro/Scale =
+	// opt out (an app the customer knows will run cold every time).
+	WarmSnapshotEnabled *bool `json:"warm_snapshot_enabled,omitempty"`
+	// WarmSnapshotMinRequests overrides the per-app request-count
+	// threshold for warm-tier capture at creation time. nil → plan
+	// default (5 on Pro/Scale; 0 on Free/Hobby). Range [1, 100].
+	WarmSnapshotMinRequests *int `json:"warm_snapshot_min_requests,omitempty"`
+	// WarmSnapshotMinMs overrides the per-app time-since-first-ready
+	// threshold for warm-tier capture at creation time. nil → plan
+	// default (2000 on Pro/Scale; 0 on Free/Hobby). Range [100, 60000].
+	WarmSnapshotMinMs *int `json:"warm_snapshot_min_ms,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -96,6 +111,27 @@ type UpdateAppRequest struct {
 	// design — builds run inside ephemeral builder microVMs
 	// (ADR-003) and the customer image is never shipped over the wire.
 	RequireSigned *bool `json:"require_signed,omitempty"`
+	// WarmSnapshotEnabled (issue #470 / ADR-055) toggles the
+	// two-tier snapshot path on an existing app. Pointer
+	// distinguishes "don't touch" (nil) from "explicit false"
+	// (opt out of warm capture). Plan-gated upstream: Free/Hobby
+	// + true returns 403 plan_warm_snapshot_not_allowed. The
+	// Pro/Scale default (on) applies to brand-new apps at
+	// CreateApp time; this PATCH lets a customer flip it on for
+	// a Free/Hobby app they later upgrade, or off for a Pro app
+	// they know runs cold every time.
+	WarmSnapshotEnabled *bool `json:"warm_snapshot_enabled,omitempty"`
+	// WarmSnapshotMinRequests overrides the per-app request-count
+	// threshold for warm-tier capture. nil → keep current value
+	// (or apply the plan default on a future create). Range
+	// [1, 100] — out-of-range values return 422
+	// invalid_warm_snapshot_min_requests.
+	WarmSnapshotMinRequests *int `json:"warm_snapshot_min_requests,omitempty"`
+	// WarmSnapshotMinMs overrides the per-app time-since-first-ready
+	// threshold for warm-tier capture. nil → keep current value.
+	// Range [100, 60000] — out-of-range values return 422
+	// invalid_warm_snapshot_min_ms.
+	WarmSnapshotMinMs *int `json:"warm_snapshot_min_ms,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -357,6 +393,20 @@ type AppResponse struct {
 	// per-app trusted publishers (GET /v1/apps/{slug}/trusted_signers).
 	// Source-tarball deploys are unaffected.
 	RequireSigned bool `json:"require_signed"`
+	// WarmSnapshotEnabled (issue #470 / ADR-055) reflects the
+	// per-app two-tier-snapshot flag. False on Free/Hobby (the
+	// plan default and the only legal state — apid rejects
+	// PATCH-true with 403 plan_warm_snapshot_not_allowed). True
+	// on Pro/Scale unless the customer explicitly opted out via
+	// PATCH. Surfaced so dashboards can show "warm snapshot on /
+	// off" alongside the streaming + require_signed pills.
+	WarmSnapshotEnabled bool `json:"warm_snapshot_enabled"`
+	// WarmSnapshotMinRequests / WarmSnapshotMinMs surface the
+	// per-app capture thresholds. Range [1, 100] and [100, 60000]
+	// respectively; out-of-range PATCH values are rejected at
+	// the apid handler before they reach the store.
+	WarmSnapshotMinRequests int `json:"warm_snapshot_min_requests"`
+	WarmSnapshotMinMs       int `json:"warm_snapshot_min_ms"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

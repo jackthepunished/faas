@@ -35,5 +35,17 @@ export type UpdateAppRequest = {
    * DEPRECATED on this surface. The customer PATCH /v1/apps/{slug} endpoint silently drops require_signed; the operator endpoint PATCH /v1/apps/{slug}/security is the only path that flips the flag (issue #472 / ADR-054). The field is parsed for backwards compatibility but never persisted from this endpoint.
    */
   require_signed?: boolean | null;
+  /**
+   * Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted → no change. PATCH-true on Free/Hobby is rejected with 403 plan_warm_snapshot_not_allowed.
+   */
+  warm_snapshot_enabled?: boolean | null;
+  /**
+   * Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]. Omitted → no change.
+   */
+  warm_snapshot_min_requests?: number | null;
+  /**
+   * Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → no change.
+   */
+  warm_snapshot_min_ms?: number | null;
 };
 

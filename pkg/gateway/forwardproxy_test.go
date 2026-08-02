@@ -15,16 +15,22 @@ package gateway_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -554,6 +560,101 @@ func stripHopByHopImpl(h http.Header) http.Header {
 		"Te", "Trailers", "Transfer-Encoding", "Upgrade",
 	} {
 		out.Del(k)
+	}
+	return out
+}
+
+// TestForwardingReverseProxyWithEvents_EmitsProxyFirstByte pins the
+// wake.proxy_first_byte emit (issue #517 / PR-C / ADR-064). The
+// forwarder is the customer-facing "how long until the upstream
+// answered" surface; the emit MUST land on the events table under
+// the right wake_id with a non-zero latency_ms (read back via
+// state.Store.ListEventsByWakeID — the same query the customer-
+// facing timeline endpoint uses).
+//
+// The test drives the streaming path with a fake bidi stream that
+// replies with a 200 init frame immediately, so the closure has
+// time to record a non-zero latency (we don't pin the exact
+// number — clock skew would flake).
+func TestForwardingReverseProxyWithEvents_EmitsProxyFirstByte(t *testing.T) {
+	store := state.NewMemStore()
+	platform := events.NewPlatform("gatewayd", store, slog.Default(), wire.NewOpsMetrics("gatewayd-test"), nil)
+
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+			}},
+		},
+	}
+	cli := &fakeVmmdClient{Stream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+
+	// WakeID lives on the Target (not the wire envelope) — the
+	// gateway-fanout cache sets it from the AdmitInstanceResponse
+	// at Wake time. The handler stamps the per-request headers
+	// (x-faas-app, x-faas-request-id) before dispatch.
+	proxy := gateway.ForwardingReverseProxyWithEvents(lookup, nil, platform)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/items", nil)
+	req.Header.Set("x-faas-app", "app-proxy-1")
+	req.Header.Set("x-faas-request-id", "req-proxy-1")
+	req.Header.Set("x-faas-instance", "inst-proxy-1")
+
+	rec := httptest.NewRecorder()
+	proxy(gateway.Target{
+		NodeID:     "node-1",
+		InstanceID: "inst-proxy-1",
+		WakeID:     "wake-proxy-1",
+	}).ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	// Read the events table back. The wake.proxy_first_byte row
+	// should be present exactly once under the wake_id we set
+	// on the Target.
+	rows, err := store.ListEventsByWakeID(context.Background(), "wake-proxy-1", time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("ListEventsByWakeID: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].Kind != "wake.proxy_first_byte" {
+		t.Errorf("kind = %q, want wake.proxy_first_byte", rows[0].Kind)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rows[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload["wake_id"] != "wake-proxy-1" {
+		t.Errorf("payload.wake_id = %v, want wake-proxy-1", payload["wake_id"])
+	}
+	if payload["app_id"] != "app-proxy-1" {
+		t.Errorf("payload.app_id = %v, want app-proxy-1", payload["app_id"])
+	}
+	if payload["request_id"] != "req-proxy-1" {
+		t.Errorf("payload.request_id = %v, want req-proxy-1", payload["request_id"])
+	}
+	if payload["instance_id"] != "inst-proxy-1" {
+		t.Errorf("payload.instance_id = %v, want inst-proxy-1", payload["instance_id"])
+	}
+	// latency_ms is computed from time.Since(stamped start) at the
+	// emit. The test asserts the value is present and well-formed
+	// (we don't pin the exact number — clock skew on a slow CI
+	// runner would flake).
+	if _, ok := payload["latency_ms"]; !ok {
+		t.Errorf("payload.latency_ms missing; got keys %v", keys(payload))
+	}
+}
+
+// keys is a small helper for diagnostics — keeps the test failure
+// messages readable when a payload field is missing.
+func keys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
 	}
 	return out
 }
