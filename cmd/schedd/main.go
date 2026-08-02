@@ -87,6 +87,15 @@ type runDeps struct {
 	// want the channel can leave it nil — the cold-start sweep
 	// below still reconciles orphans on boot).
 	subscribeRebalancer func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
+	// subscribeLiveMigrator (Tier A5 / ADR-066) is the
+	// producer-side seam for the compute_node_changed consumer
+	// that migrates live instances (state in {WAKING,
+	// COLD_BOOTING, RUNNING, SNAPSHOTTING}) from a freshly-
+	// inactive compute_node onto the local schedd via the
+	// four-phase handoff. Mirrors subscribeRebalancer's shape;
+	// nil = subscriber not started (the cold-start sweep
+	// below still reconciles live instances on boot).
+	subscribeLiveMigrator func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
 	// subscribeNodeKeyChanges (ADR-053) is the producer-side seam
 	// for the 'compute_node_changed' pg_notify consumer that
 	// refreshes the in-memory NodeKeyRegistry on every relevant
@@ -162,6 +171,15 @@ func defaultDeps() runDeps {
 		// single LISTEN shared by N subscribers is the canonical
 		// pattern (subscribers filter on the typed payload).
 		subscribeRebalancer: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
+			return db.Subscribe(ctx, p, []string{db.NotifyComputeNodeChanged})
+		},
+		// Tier A5 / ADR-066: live-instance migration watcher.
+		// Same channel as the parked-app rebalancer — both
+		// filter to active=false + valid node_id and dispatch
+		// to their respective Engine method. A separate
+		// subscribe keeps the watcher logic (filter shape +
+		// log context) cleanly scoped per ADR-066 §"Trigger".
+		subscribeLiveMigrator: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyComputeNodeChanged})
 		},
 		// Production wires db.Subscribe on the
@@ -605,6 +623,39 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.WithRebalanceConfig(api.RebalanceCooldownSeconds, m)
 	}
 
+	// Tier A5 / ADR-066: live-instance migration cap. Same
+	// rationale as the A4 rebalance block above — the
+	// per-engine override exists so an operator can tune
+	// without restarting schedd; a bad env panics via
+	// WithMigrateLiveConfig so a typo doesn't silently fall
+	// back to the api.* default.
+	if v := os.Getenv("FAAS_MIGRATE_LIVE_MAX_PER_TICK"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_MIGRATE_LIVE_MAX_PER_TICK must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_MIGRATE_LIVE_MAX_PER_TICK: %s", v)
+		}
+		engine.WithMigrateLiveConfig(n)
+	}
+
+	// Tier A5 / ADR-066: live-instance migration lease
+	// window. Same env-override rationale as the
+	// MAX_PER_TICK above. The default lives in
+	// pkg/api/limits.go (MigrateLiveLeaseSeconds); an operator
+	// tunes this on the OCIRegistry backend's snapshot-pull
+	// latency. A bad env returns a typed error so the daemon
+	// fails fast at boot rather than silently falling back.
+	if v := os.Getenv("FAAS_MIGRATE_LIVE_LEASE_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_MIGRATE_LIVE_LEASE_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_MIGRATE_LIVE_LEASE_SECONDS: %s", v)
+		}
+		engine.WithMigrateLiveLeaseSeconds(n)
+	}
+
 	// Tier A4 / ADR-064: rebalancer subscriber. Watches
 	// compute_node_changed for active=false events and hands
 	// the dead node id to Engine.RebalanceOrphanedApps.
@@ -616,6 +667,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log,
 		)
 		go subscribeWithReconnect(ctx, "rebalancer", log, deps.subscribeRebalancer, pool, reb.Run)
+	}
+
+	// Tier A5 / ADR-066: live-instance migration subscriber.
+	// Same channel + filter as the rebalancer, but the per-
+	// instance path is the four-phase handoff (Tier A5). The
+	// parked-app rebalancer (Tier A4) handles apps in
+	// 'parked'/'stopped' state; this one handles instances in
+	// {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING}. The two
+	// must remain distinct watchers — they have different
+	// retry loops, different metric labels, and different
+	// per-tick caps.
+	if deps.subscribeLiveMigrator != nil && ownerNodeID != "" {
+		lvm := sched.NewLiveMigrator(
+			func(ctx context.Context, deadNodeID string) (int, error) {
+				return engine.MigrateLiveInstances(ctx, deadNodeID)
+			},
+			log,
+		)
+		go subscribeWithReconnect(ctx, "live_migrator", log, deps.subscribeLiveMigrator, pool, lvm.Run)
 	}
 
 	// Cold-start sweep: pg_notify is fire-and-forget, so a schedd
@@ -661,6 +731,31 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 					return
 				}
 				log.Warn("schedd: cold-start sweep: rebalance orphans", "err", err)
+			}
+		}()
+	}
+
+	// Tier A5 / ADR-066: live-instance migration cold-start
+	// sweep. Same fire-and-forget-notify reasoning as the
+	// rebalance cold-start sweep above — a schedd that was
+	// down while a drain event landed missed the
+	// compute_node_changed active=false notify, so any live
+	// instance still owned by an inactive compute_node would
+	// be pinned until the next notify. MigrateLiveInstances
+	// with deadNodeID="" reconciles every dead-node-owned
+	// live instance regardless of which dead node. Runs once.
+	if ownerNodeID != "" {
+		go func() {
+			attempted, err := engine.MigrateLiveInstances(ctx, "")
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Warn("schedd: cold-start sweep: live migrate", "err", err)
+				return
+			}
+			if attempted > 0 {
+				log.Info("schedd: cold-start sweep: live migrate reconciled", "attempted", attempted)
 			}
 		}()
 	}

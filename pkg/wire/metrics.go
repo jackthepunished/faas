@@ -584,6 +584,27 @@ type OpsMetrics struct {
 	// base-stage time (pkg/imaged/base_stage.go) and re-read on
 	// every cold-boot by vmmd.
 	imageScanVulns *prometheus.CounterVec
+	// liveMigrationDecisions: Tier A5 / ADR-066 cross-node
+	// live-instance migration observability. Counter labelled by
+	// outcome ∈ {migrated, conflict, no_headroom, no_eligibility,
+	// lease_expired, peer_failure} — the closed set the
+	// Engine.MigrateLiveInstances batch loop can land in. The
+	// `migrated` label is the §12 dashboard panel (sum over 5m
+	// for the rate; pairs with rebalanceDecisions{outcome=migrated}
+	// to give a holistic "fleet cross-node moves / 5m" view that
+	// distinguishes PARKED-app rebalance from LIVE-instance
+	// migration). `lease_expired` is the tripwire for the
+	// four-phase handoff timing out — a persistent rate means
+	// MigrateLiveLeaseSeconds (pkg/api/limits.go) is too short for
+	// the OCIRegistry backend's snapshot pull latency. `peer_failure`
+	// is the tripwire for the new-owner vmmd failing the
+	// AdoptMigratedInstance RPC — operationally distinct from
+	// `conflict` (which is a peer claim race, not a transport
+	// failure). Single-registry: registered on every daemon
+	// (mirrors the rebalanceDecisions pattern); only schedd
+	// increments via ObserveLiveMigration. Pre-instantiated in
+	// NewOpsMetrics so the row surfaces in /metrics from boot.
+	liveMigrationDecisions *prometheus.CounterVec
 	// rebalanceDecisions: Tier A4 / ADR-064 cross-node app
 	// rebalance observability. Counter labelled by outcome ∈
 	// {migrated, conflict, no_headroom, cooldown,
@@ -1174,6 +1195,22 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Per-image Grype finding counts, labelled by image (the OCI ref of the staged base ext4) and severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} (issue #299). The CRITICAL count is the vmmd admission gate's read side — a non-zero rate means vmmd refused to bring up an instance whose staged ext4 had a CRITICAL finding. The counter is incremented once per Grype scan at imaged base-stage time.",
 	}, []string{"image", "severity"})
 	commonCollectors = append(commonCollectors, imageScanVulns)
+	// ADR-066 / Tier A5: live-instance migration decision counter.
+	// Labelled by outcome ∈ {migrated, conflict, no_headroom,
+	// no_eligibility, lease_expired, peer_failure}. The migrated
+	// label is the §12 dashboard panel (sum over 5m); pairs with
+	// rebalanceDecisions to distinguish PARKED-app rebalance from
+	// LIVE-instance migration. Pre-instantiated at boot so the row
+	// surfaces in /metrics from the moment schedd starts. Only
+	// schedd increments via ObserveLiveMigration in production, but
+	// the field is on the shared struct (single-registry pattern,
+	// memory wire/OpsMetrics) so /metrics doesn't show a 404 for
+	// cmd/<other> scrapes that incidentally probe the prefix.
+	liveMigrationDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_live_migration_decisions_total",
+		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-066), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, liveMigrationDecisions)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -1268,6 +1305,23 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// Grype severity set requires extending this loop in lock-step.
 	for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"} {
 		imageScanVulns.WithLabelValues("<unknown>", sev)
+	}
+	// Pre-instantiate every outcome in the closed set so the
+	// counter's HELP/TYPE and zero-valued rows surface in
+	// `/metrics` from the moment schedd boots — even before the
+	// first four-phase handoff resolves. Matches the rebalance
+	// decisions pre-instantiation shape (one row per outcome;
+	// Prometheus skips zero-valued CounterVec series by default,
+	// so without this loop the dashboard's "live-migration
+	// throughput" panel would render "no data" until the first
+	// commit). Extending the outcome vocabulary requires
+	// extending this loop in lock-step with the ADR-066
+	// Engine.MigrateLiveInstances dispatch.
+	for _, outcome := range []string{
+		"migrated", "conflict", "no_headroom",
+		"no_eligibility", "lease_expired", "peer_failure",
+	} {
+		liveMigrationDecisions.WithLabelValues(outcome)
 	}
 	// Pre-instantiate every label in the closed result set so the
 	// histogram's HELP/TYPE and zero-valued buckets surface in
@@ -1451,6 +1505,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ociEgressDeny:                      ociEgressDeny,
 		provenanceWrites:                   provenanceWrites,
 		imageScanVulns:                     imageScanVulns,
+		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
@@ -1478,6 +1533,18 @@ func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter
 // WatchdogKills — the returned Counter is safe to retain.
 func (m *OpsMetrics) RebalanceDecisions(outcome string) prometheus.Counter {
 	return m.rebalanceDecisions.WithLabelValues(outcome)
+}
+
+// LiveMigrationDecisions returns the labelled counter for the
+// four-phase cross-node LIVE-instance handoff (Tier A5 / ADR-066).
+// Called from Engine.MigrateLiveInstances once per candidate
+// instance outcome (mirrors the rebalanceDecisions dispatch shape).
+// outcome ∈ {migrated, conflict, no_headroom, no_eligibility,
+// lease_expired, peer_failure}. The returned Counter is safe to
+// retain — Prometheus's WithLabelValues is internally cached, so a
+// per-batch loop that fires 100 calls/sec doesn't allocate.
+func (m *OpsMetrics) LiveMigrationDecisions(outcome string) prometheus.Counter {
+	return m.liveMigrationDecisions.WithLabelValues(outcome)
 }
 
 // EventsWriteFailures returns the unlabelled counter for audit-log

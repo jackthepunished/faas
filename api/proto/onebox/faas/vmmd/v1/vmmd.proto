@@ -162,6 +162,45 @@ service Vmmd {
   // filesystem (defence in depth against a caller that hands back
   // a path vmmd never issued).
   rpc UmountParentExt4(UmountParentExt4Request) returns (UmountParentExt4Response);
+
+  // PrepareLiveMigration (Tier A5 / ADR-065) is Phase 1 of the
+  // four-phase cross-node live-instance handoff. Called by the
+  // new owner vmmd's schedd against the DYING vmmd: pauses the
+  // running VM, writes a fresh snapshot to the canonical storage
+  // backend (so the new owner can pull it over the wire), and
+  // returns the snapshot storage keys + a lease_token the new
+  // owner carries through Phase 3. The dying vmmd keeps the VM
+  // paused but resident; if Phase 3 doesn't commit within
+  // MigrateLiveLeaseSeconds (pkg/api/limits.go), the dying vmmd
+  // resumes the VM (Phase 4 cancel).
+  rpc PrepareLiveMigration(PrepareLiveMigrationRequest) returns (PrepareLiveMigrationResponse);
+
+  // AdoptMigratedInstance (Tier A5 / ADR-065) is Phase 2 of the
+  // four-phase handoff. Called by the new owner vmmd's schedd
+  // against the NEW owner vmmd: restores the snapshot the dying
+  // vmmd wrote at Phase 1, brings the VM up, and returns the new
+  // instance's HostIP + GuestUID so schedd can carry them
+  // through to the conditional UPDATE at Phase 3.
+  rpc AdoptMigratedInstance(AdoptMigratedInstanceRequest) returns (AdoptMigratedInstanceResponse);
+
+  // AcknowledgeMigration (Tier A5 / ADR-065) is Phase 3.5 of
+  // the four-phase handoff. Called by the new owner vmmd's
+  // schedd against the DYING vmmd AFTER the conditional UPDATE
+  // commits at Phase 3: tells the dying vmmd it can safely
+  // destroy the paused VM and free its netns/jail. The dying
+  // vmmd does not block on this — the conditional UPDATE has
+  // already moved the row — but a missing AcknowledgeMigration
+  // leaves a paused VM resident on the dying node (an
+  // observation metric, not a correctness issue).
+  rpc AcknowledgeMigration(AcknowledgeMigrationRequest) returns (AcknowledgeMigrationResponse);
+
+  // CancelLiveMigration (Tier A5 / ADR-065) is Phase 4 of the
+  // four-phase handoff. Called by the new owner vmmd's schedd
+  // against the DYING vmmd when Phase 3 fails (peer rollback,
+  // lease expiry, peer re-owner). The dying vmmd resumes the
+  // paused VM and returns it to RUNNING; the snapshot stays
+  // where it was (the dying vmmd's drive1 + mem are intact).
+  rpc CancelLiveMigration(CancelLiveMigrationRequest) returns (CancelLiveMigrationResponse);
 }
 
 // AppSpec flattens what the caller knows about an app. vmmd stores none of
@@ -816,4 +855,128 @@ message ForwardHTTPResponseInit {
   // in the X-Faas-Forward-Error header (operator-only; not
   // customer-visible).
   string error = 3;
+}
+
+// PrepareLiveMigrationRequest (Tier A5 / ADR-065) is the input
+// for Vmmd.PrepareLiveMigration. The new owner vmmd's schedd
+// fills this with the instance identity + the canonical
+// storage key under which the dying vmmd will write the
+// snapshot.
+message PrepareLiveMigrationRequest {
+  // The instance id whose VM the dying vmmd will pause +
+  // snapshot. vmmd identifies the local Firecracker VM by its
+  // instance id (mapped 1:1 at CreateFromSnapshot / CreateColdBoot
+  // time, kept in memory).
+  string instance_id = 1;
+  // The canonical storage backend key under which the dying vmmd
+  // will publish the snapshot. The new owner's schedd generated
+  // this key via pkg/sched.vmstateStorageKeyFor at the call site
+  // (mirroring the cold-boot snapshot key shape) so the new owner
+  // can pull the snapshot via the same Storage.Get call a wake
+  // would use.
+  string snapshot_storage_key = 2;
+}
+
+// PrepareLiveMigrationResponse carries the snapshot metadata +
+// the per-migration lease_token the new owner carries through
+// Phase 3. The lease_token is a UUIDv4 minted by the dying vmmd
+// at PrepareLiveMigration time (the dying vmmd is the lease
+// authority — it owns the pause/resume decision). The new owner's
+// schedd presents the same token at Phase 3 (MigrateInstanceOwner
+// predicate) and Phase 4 (CancelInstanceMigration predicate) so
+// a peer claim can never silently succeed with a stale lease.
+message PrepareLiveMigrationResponse {
+  // The mem blob key (canonical storage backend key the dying
+  // vmmd wrote under). Distinct from snapshot_storage_key only if
+  // the dying vmmd resolved a sub-namespace (currently 1:1).
+  string mem_storage_key = 1;
+  // The vmstate blob key (canonical storage backend key the
+  // dying vmmd wrote under).
+  string vmstate_storage_key = 2;
+  // The lease_token UUIDv4 the new owner carries through to
+  // Phase 3 + Phase 4. Distinct from the snapshot_storage_key so
+  // the new owner can mint its own UUIDv4 deterministically; the
+  // dying vmmd mints it so the lease's window is tied to the
+  // dying vmmd's lease clock, not the new owner's.
+  string lease_token = 3;
+}
+
+// AdoptMigratedInstanceRequest (Tier A5 / ADR-065) is the input
+// for Vmmd.AdoptMigratedInstance. The new owner vmmd's schedd
+// fills this with the snapshot metadata + the lease_token from
+// Phase 1; the new owner vmmd restores the VM and returns the
+// new instance's network identifiers.
+message AdoptMigratedInstanceRequest {
+  // The instance id (preserved across the migration — schedd
+  // does NOT mint a fresh id; the row stays the same, only the
+  // node_id changes at Phase 3).
+  string instance_id = 1;
+  // The app spec the new owner needs to bring the VM up
+  // (mirrors CreateFromSnapshotRequest's app_spec field — the
+  // snapshot is app-agnostic so the wire shape is identical).
+  AppSpec app_spec = 2;
+  // The mem + vmstate storage keys the dying vmmd returned from
+  // PrepareLiveMigration. The new owner resolves them via the
+  // shared StorageBackend (OCIRegistryStorageBackend for cross-
+  // node reads; LocalStorageBackend for single-box).
+  string mem_storage_key = 3;
+  string vmstate_storage_key = 4;
+  // The lease_token from PrepareLiveMigrationResponse. The new
+  // owner vmmd carries this through to the gateway listener so
+  // the instance row's lease_token column can be updated at
+  // Phase 3 + Phase 4 (the wire shape is the same — the column
+  // is the predicate on the conditional UPDATE).
+  string lease_token = 5;
+}
+
+// AdoptMigratedInstanceResponse carries the network identifiers
+// the new owner vmmd assigned to the restored VM. Schedd
+// captures these so a future Stat / instance-id audit can
+// re-derive the runtime state.
+message AdoptMigratedInstanceResponse {
+  // The new owner's host IP for this instance (the /30 vethHost
+  // address inside the new owner's tenant netns). schedd
+  // currently doesn't write this anywhere on the migration path
+  // — the instances table's host_ip column is set at wake time
+  // and stays — but it's included on the wire so the vmmd's
+  // audit log can correlate.
+  string host_ip = 1;
+  // The new owner's netns path the vmmd created. Same caveat
+  // as host_ip.
+  string netns = 2;
+  // The new owner's per-VM guest UID (20000-29999). Same
+  // caveat as host_ip.
+  int32 guest_uid = 3;
+}
+
+// AcknowledgeMigrationRequest (Tier A5 / ADR-065) is the input
+// for Vmmd.AcknowledgeMigration. The new owner vmmd's schedd
+// tells the dying vmmd "Phase 3 committed, you may destroy the
+// paused VM and free the netns/jail". Idempotent: a duplicate
+// ack returns success without re-running the destroy.
+message AcknowledgeMigrationRequest {
+  string instance_id = 1;
+  string lease_token = 2;
+}
+
+message AcknowledgeMigrationResponse {
+  // Empty struct reserved for future fields (e.g. freed-bytes
+  // accounting). Schema is locked at v1; adding fields requires
+  // the proto's `// versions:` block + ADR per the schema
+  // discipline (memory: proto-check no version comments).
+}
+
+// CancelLiveMigrationRequest (Tier A5 / ADR-065) is the input
+// for Vmmd.CancelLiveMigration. The new owner vmmd's schedd
+// tells the dying vmmd "abort — Phase 3 didn't commit; please
+// resume the paused VM". The dying vmmd resumes the VM and
+// returns it to RUNNING; the snapshot stays where it was.
+message CancelLiveMigrationRequest {
+  string instance_id = 1;
+  string lease_token = 2;
+}
+
+message CancelLiveMigrationResponse {
+  // Empty struct reserved for future fields. Same shape as
+  // AcknowledgeMigrationResponse.
 }

@@ -77,6 +77,18 @@ func (f *fakeWakeVMM) Logs(_ context.Context, _, _ string, _ int64, _ time.Time)
 	return &fakeLogStream{}, nil
 }
 
+// Tier A5 (ADR-066): the cron loop's fake doesn't drive
+// migrations — the methods are no-op stubs to satisfy
+// RoutedVMM. The engine never calls these on the cron path.
+func (f *fakeWakeVMM) PrepareLiveMigration(_ context.Context, _, _, _ string) (LiveMigrationPrepare, error) {
+	return LiveMigrationPrepare{}, nil
+}
+func (f *fakeWakeVMM) AdoptMigratedInstance(_ context.Context, _, _ string, _ AppSpec, _, _, _ string) (LiveMigrationAdopt, error) {
+	return LiveMigrationAdopt{}, nil
+}
+func (f *fakeWakeVMM) AcknowledgeMigration(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeWakeVMM) CancelLiveMigration(_ context.Context, _, _, _ string) error  { return nil }
+
 // recordingSynth captures every synthesize call. The cron loop's
 // "post a synthetic request through gatewayd so metering applies" path
 // goes through this stub instead of dialing the unix socket.

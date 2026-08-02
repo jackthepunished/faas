@@ -95,6 +95,20 @@ func (f *fakeRouterVMM) Logs(_ context.Context, _ string, _ int64, _ time.Time) 
 	return &fakeLogStream{}, nil
 }
 
+// Tier A5 (ADR-066) — vmmrouter tests don't drive migration.
+func (f *fakeRouterVMM) PrepareLiveMigration(context.Context, string, string, string) (LiveMigrationPrepare, error) {
+	return LiveMigrationPrepare{}, nil
+}
+func (f *fakeRouterVMM) AdoptMigratedInstance(context.Context, string, string, AppSpec, string, string, string) (LiveMigrationAdopt, error) {
+	return LiveMigrationAdopt{}, nil
+}
+func (f *fakeRouterVMM) AcknowledgeMigration(context.Context, string, string, string) error {
+	return nil
+}
+func (f *fakeRouterVMM) CancelLiveMigration(context.Context, string, string, string) error {
+	return nil
+}
+
 // trackingDial records every (target, tls) it sees and returns a
 // cached fakeRouterVMM on subsequent calls to the same target.
 // `dials` counts only fresh (cache-miss) dials — the load-bearing

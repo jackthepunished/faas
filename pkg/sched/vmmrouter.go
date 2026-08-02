@@ -42,14 +42,16 @@ import (
 // Each method takes nodeID as the first argument so the router can
 // forward to the right per-target vmmd connection.
 //
-// The 6-method surface mirrors VMM verbatim (CreateColdBoot,
-// CreateFromSnapshot, PauseAndSnapshot, Destroy, Ping, Stats). The
-// router's implementation looks up the per-node client by ID, dials
-// on first use, and forwards. If the ID has no row in the cache and
-// the router can't dial (e.g. an operator typo in target_url), the
-// call returns a *api.Problem with Code=Capacity — the same code the
-// ledger uses for "no headroom" so the gateway's 503 mapping is
-// consistent.
+// The 10-method surface mirrors VMM verbatim (CreateColdBoot,
+// CreateFromSnapshot, PauseAndSnapshot, Destroy, Ping, Stats,
+// plus the Tier A5 four-phase migration set: PrepareLiveMigration,
+// AdoptMigratedInstance, AcknowledgeMigration,
+// CancelLiveMigration). The router's implementation looks up the
+// per-node client by ID, dials on first use, and forwards. If the
+// ID has no row in the cache and the router can't dial (e.g. an
+// operator typo in target_url), the call returns a *api.Problem
+// with Code=Capacity — the same code the ledger uses for "no
+// headroom" so the gateway's 503 mapping is consistent.
 type RoutedVMM interface {
 	CreateColdBoot(ctx context.Context, nodeID, instance string, app AppSpec) (*WakeOutcome, error)
 	CreateFromSnapshot(ctx context.Context, nodeID, instance string, app AppSpec, snap SnapshotRef) (*WakeOutcome, error)
@@ -70,6 +72,27 @@ type RoutedVMM interface {
 	// forwards. Returns *api.Problem Capacity on an unknown
 	// nodeID (no target_url to dial).
 	Ping(ctx context.Context, nodeID string) (*PingOutcome, error)
+	// PrepareLiveMigration (Tier A5 / ADR-066) is Phase 1 of the
+	// four-phase cross-node live-instance handoff. Dials the
+	// DYING vmmd (the nodeID argument is the dying node). Returns
+	// the snapshot storage keys + the per-migration lease_token
+	// the dying vmmd minted. The instance is left paused on the
+	// dying node; Phase 4 (CancelLiveMigration) resumes it on
+	// a rollback.
+	PrepareLiveMigration(ctx context.Context, dyingNodeID, instanceID, snapshotStorageKey string) (LiveMigrationPrepare, error)
+	// AdoptMigratedInstance (Tier A5 / ADR-066) is Phase 2. Dials
+	// the NEW owner vmmd (nodeID is the new owner). Restores the
+	// snapshot the dying vmmd wrote at Phase 1 and returns the
+	// new instance's network identifiers.
+	AdoptMigratedInstance(ctx context.Context, newOwnerNodeID, instanceID string, app AppSpec, memKey, vmstateKey, leaseToken string) (LiveMigrationAdopt, error)
+	// AcknowledgeMigration (Tier A5 / ADR-066) is Phase 3.5.
+	// Dials the DYING vmmd and tells it "Phase 3 committed;
+	// destroy the paused VM". Idempotent.
+	AcknowledgeMigration(ctx context.Context, dyingNodeID, instanceID, leaseToken string) error
+	// CancelLiveMigration (Tier A5 / ADR-066) is Phase 4.
+	// Dials the DYING vmmd and tells it "abort — resume the
+	// paused VM". Idempotent on an already-resumed VM.
+	CancelLiveMigration(ctx context.Context, dyingNodeID, instanceID, leaseToken string) error
 	// Stats (issue #170 / PR-A, observability slice) forwards to the
 	// per-node VMM and decodes the typed wrapper. Same nodeID
 	// resolution path as the lifecycle RPCs; partial per-node failure
@@ -107,6 +130,29 @@ type RoutedVMM interface {
 // client. cmd/schedd wires the production sched.DialVMMContext;
 // tests inject a recording stub so they don't need a real socket.
 type DialFunc func(ctx context.Context, target string, tlsCfg *tls.Config) (VMM, error)
+
+// LiveMigrationPrepare is the typed return for RoutedVMM::
+// PrepareLiveMigration. Mirrors vmmdpb.PrepareLiveMigrationResponse
+// field-for-field; the typed view lets the migration handoff
+// orchestrator (pkg/sched/migration_handoff.go) carry the
+// snapshot storage keys + the lease_token without a proto
+// dependency in its signature.
+type LiveMigrationPrepare struct {
+	MemStorageKey     string
+	VMStateStorageKey string
+	LeaseToken        string
+}
+
+// LiveMigrationAdopt is the typed return for RoutedVMM::
+// AdoptMigratedInstance. Mirrors vmmdpb.AdoptMigratedInstanceResponse;
+// the network identifiers (HostIP, Netns, GuestUID) are surfaced
+// so the new owner vmmd's logs can correlate, even though schedd
+// doesn't currently persist them on the migration path.
+type LiveMigrationAdopt struct {
+	HostIP   string
+	Netns    string
+	GuestUID int
+}
 
 // VMMRouter is the dial-once-per-target cache that satisfies
 // RoutedVMM. The cache key is the nodeID string (every node has a
@@ -319,6 +365,62 @@ func (r *VMMRouter) Stats(ctx context.Context, nodeID string) (*StatsSnapshot, e
 		return nil, err
 	}
 	return cli.Stats(ctx)
+}
+
+// PrepareLiveMigration (Tier A5 / ADR-066) routes Phase 1 to
+// the DYING vmmd (the dyingNodeID argument). Same resolveFor
+// path as the lifecycle RPCs — dial-once-per-target semantics
+// carry over. On unknown nodeID, returns the router's
+// *api.Problem Capacity — the migration_handoff orchestrator
+// treats that as a transient peer failure and retries on the
+// next compute_node_changed re-fire (the lease is bounded by
+// MigrateLiveLeaseSeconds from pkg/api/limits.go).
+func (r *VMMRouter) PrepareLiveMigration(ctx context.Context, dyingNodeID, instanceID, snapshotStorageKey string) (LiveMigrationPrepare, error) {
+	cli, err := r.resolveFor(ctx, dyingNodeID)
+	if err != nil {
+		return LiveMigrationPrepare{}, err
+	}
+	return cli.PrepareLiveMigration(ctx, dyingNodeID, instanceID, snapshotStorageKey)
+}
+
+// AdoptMigratedInstance (Tier A5 / ADR-066) routes Phase 2 to
+// the NEW owner vmmd. Same resolveFor pattern. A dial failure
+// on the new owner surfaces as *api.Problem Capacity — the
+// orchestrator cancels the handoff at Phase 4 in that case
+// (the dying vmmd is told to resume the paused VM).
+func (r *VMMRouter) AdoptMigratedInstance(ctx context.Context, newOwnerNodeID, instanceID string, app AppSpec, memKey, vmstateKey, leaseToken string) (LiveMigrationAdopt, error) {
+	cli, err := r.resolveFor(ctx, newOwnerNodeID)
+	if err != nil {
+		return LiveMigrationAdopt{}, err
+	}
+	return cli.AdoptMigratedInstance(ctx, newOwnerNodeID, instanceID, app, memKey, vmstateKey, leaseToken)
+}
+
+// AcknowledgeMigration (Tier A5 / ADR-066) routes Phase 3.5
+// to the DYING vmmd. Best-effort — a non-OK status here is
+// logged but does not block the migration (Phase 3 has already
+// committed). The dying vmmd will eventually destroy the
+// paused VM on its own lease-expiry timeout; the ack is just
+// a "you can free the netns now" hint.
+func (r *VMMRouter) AcknowledgeMigration(ctx context.Context, dyingNodeID, instanceID, leaseToken string) error {
+	cli, err := r.resolveFor(ctx, dyingNodeID)
+	if err != nil {
+		return err
+	}
+	return cli.AcknowledgeMigration(ctx, dyingNodeID, instanceID, leaseToken)
+}
+
+// CancelLiveMigration (Tier A5 / ADR-066) routes Phase 4 to
+// the DYING vmmd. Idempotent on an already-resumed VM. A
+// non-OK status here is logged but does not block the rollback
+// (the row is already in 'parked' via Store.CancelInstanceMigration
+// at Phase 4).
+func (r *VMMRouter) CancelLiveMigration(ctx context.Context, dyingNodeID, instanceID, leaseToken string) error {
+	cli, err := r.resolveFor(ctx, dyingNodeID)
+	if err != nil {
+		return err
+	}
+	return cli.CancelLiveMigration(ctx, dyingNodeID, instanceID, leaseToken)
 }
 
 // UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) routes the

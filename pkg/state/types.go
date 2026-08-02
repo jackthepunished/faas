@@ -332,6 +332,23 @@ type App struct {
 	// never-reassigned case, always eligible for the first
 	// drain event.
 	ReassignedAt *time.Time
+	// MigratedAt is the wall-clock time of the most recent
+	// cross-node LIVE-INSTANCE migration for this app
+	// (Tier A5, migration 00098, ADR-066, follow-up to
+	// ADR-064). Distinct from ReassignedAt, which carries the
+	// PARKED-app rebalance commit. Both columns can coexist
+	// on the same app — an app whose instances migrated live
+	// last week AND whose owner was rebalanced to a new node
+	// via the A4 parked path yesterday has both stamps set.
+	// Nullable: a fresh app has never been migrated. The
+	// clock-skew CHECK tolerates `migrated_at <= now() +
+	// interval '1 minute'`; values clearly in the future
+	// still error loud (23514). Stamped by
+	// Store.MigrateInstanceOwner in the same UPDATE that
+	// flips instances.node_id. Telemetry only — the A5
+	// rebalancer's hot filter is on instances.state, not on
+	// apps.migrated_at.
+	MigratedAt *time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1030,6 +1047,37 @@ type Instance struct {
 	// pre-existing rows were backfilled to gen_random_uuid() (v4) on apply.
 	// Empty in test fixtures only when the fixture predates the column add.
 	WakeID string
+	// MigratedFromNodeID is the prior owner compute_node after a
+	// cross-node live-instance handoff (Tier A5, migration 00097,
+	// ADR-066, follow-up to ADR-064). FK to compute_nodes(id) ON
+	// DELETE SET NULL — the lineage reference stays honest when a
+	// node is decommissioned (the row stays, the column flips to
+	// NULL). Distinct from apps.node_id (the durable shard key for
+	// the app itself) and from instances.node_id (the current
+	// owner of this specific instance row). All three are nullable
+	// in different shapes: apps.node_id is NOT NULL post-Phase 2,
+	// instances.node_id is NOT NULL post-00024, and
+	// migrated_from_node_id is nullable forever (a fresh instance
+	// has no migration history). Set on the conditional UPDATE at
+	// Phase 3 of the four-phase handoff, read by the dashboard's
+	// "fleet migrated-from" panel via the
+	// instances_migrated_from_node_id_idx partial index.
+	MigratedFromNodeID *string
+	// MigratedAt is the wall-clock stamp of the commit (Phase 3
+	// of the four-phase handoff). The clock-skew CHECK tolerates
+	// `migrated_at <= now() + interval '1 minute'`; values clearly
+	// in the future still error loud (23514). Nullable forever.
+	MigratedAt *time.Time
+	// LeaseToken is the per-migration UUID minted by the new owner
+	// at Phase 1 of the four-phase handoff. It is part of the
+	// conditional-UPDATE predicate at Phase 3 (commit), so a peer
+	// claim can never silently succeed with a stale lease. The
+	// column is also the lookup key for the dying vmmd's
+	// pause-resume lease bookkeeping: when the new owner aborts
+	// (Phase 4 cancel), the dying vmmd resumes the VM on lease
+	// expiry. Mirrors the A4 `apps.reassigned_at` schema
+	// discipline. Nullable forever.
+	LeaseToken string
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis

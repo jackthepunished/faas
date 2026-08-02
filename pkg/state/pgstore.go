@@ -1095,6 +1095,224 @@ func (s *PgStore) ReassignAppOwner(ctx context.Context, appID, fromNodeID, toNod
 	return nil
 }
 
+// ListLiveInstancesOnNode returns every live instance owned by
+// nodeID — the candidate set for Engine.MigrateLiveInstances
+// (Tier A5 / migration 00097, ADR-066). Filtered to state='running'
+// only — the MarkInstanceMigrating predicate that gates Phase 2
+// requires state='running' + node_id=currentNodeID, so a WAKING /
+// COLD_BOOTING / SNAPSHOTTING instance on the dying node would
+// fail Phase 2 and bump outcome="conflict" (polluting the metric).
+// Those states stay on the dying node and the dying vmmd drives
+// the cold-boot to completion (ADR-005 cold-boot-from-disk); the
+// migration path is only the right primitive for RUNNING instances.
+//
+// Returns an empty slice (not ErrNotFound) when nodeID has no
+// live instances; callers treat that as "nothing to migrate this
+// tick".
+//
+// Sorted by instance id ASC for determinism so two peers observing
+// the same drain event read the same input set (they still race on
+// MigrateInstanceOwner; this list is just the candidate set).
+//
+// When nodeID == "" (cold-start sweep), the query ignores the
+// node-id filter and returns every live instance whose owning
+// compute_node is inactive. Mirrors ListOrphanedApps's empty-input
+// convention (Tier A4).
+func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, maxPerTick int) ([]Instance, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	var nodeClause string
+	var args []any
+	if nodeID != "" {
+		nodeClause = ` and i.node_id = $1`
+		args = append(args, nodeID, maxPerTick)
+	} else {
+		// Cold-start variant: filter to inactive-node owners
+		// (same shape as ListOrphanedApps).
+		nodeClause = ` and not exists (
+		                select 1 from compute_nodes n
+		                 where n.id = i.node_id and n.active = true)`
+		args = append(args, maxPerTick)
+	}
+	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''),
+	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
+	               i.started_at, i.last_request_at, i.parked_at,
+	               coalesce(i.node_id::text, ''), i.wake_id,
+	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
+	          from instances i
+	         where i.state = 'running'` +
+		nodeClause + `
+	         order by i.id asc
+	         limit $` + strconv.Itoa(len(args))
+	rows, err := s.pool.Query(ctx, sel, args...)
+	if err != nil {
+		return nil, fmt.Errorf("state: list live instances on node: %w", err)
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		ins, err := scanInstanceColsWithMigration(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ins)
+	}
+	return out, rows.Err()
+}
+
+// MarkInstanceMigrating is the Phase-2 atom of the four-phase
+// cross-node live-instance handoff (Tier A5 / ADR-066). Transitions
+// the instance to state='migrating' under a conditional UPDATE that
+// requires state='running' and node_id = currentNodeID. Returns
+// ErrConflict on RowsAffected()==0 — peer rollback, owner change, or
+// row gone. The conditional predicate is load-bearing: only RUNNING
+// instances are eligible for live migration; WAKING/COLD_BOOTING
+// stay on the dying node and the dying vmmd drives the cold-boot to
+// completion. A peer re-owner that already flipped node_id would
+// fail this UPDATE on the node_id predicate.
+//
+// The lease_token is NOT stamped here — Phase 1 mints the lease on
+// the new owner and Phase 3 writes it via MigrateInstanceOwner. The
+// intermediate state-transition just flips state='migrating' so a
+// peer claim that races us sees the new state and bails.
+func (s *PgStore) MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: mark instance migrating: empty instanceID")
+	}
+	if currentNodeID == "" {
+		return fmt.Errorf("state: mark instance migrating: empty currentNodeID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: mark instance migrating: empty leaseToken")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'migrating',
+		        lease_token = $3
+		  where id = $1
+		    and node_id = $2
+		    and state = 'running'`,
+		instanceID, currentNodeID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("state: mark instance migrating: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Peer rollback / owner change / row gone. The migration
+		// orchestrator treats this as "drop silently"; the next
+		// compute_node_changed event retries. The state machine
+		// prevents the instance from getting stuck in 'migrating'
+		// — if no peer picks up the lease, MigrateLiveLeaseSeconds
+		// (pkg/api/limits.go) fires CancelInstanceMigration.
+		return ErrConflict
+	}
+	return nil
+}
+
+// MigrateInstanceOwner is the Phase-3 commit of the four-phase
+// cross-node live-instance handoff (Tier A5 / ADR-066). Conditional
+// UPDATE that flips instances.node_id, stamps the migration lineage
+// columns (migrated_from_node_id, migrated_at, lease_token),
+// transitions state from 'migrating' back to 'running', AND stamps
+// apps.migrated_at in the same transaction so the app-level lineage
+// column stays coherent with the instance row.
+//
+// The conditional predicates are load-bearing:
+//  1. state = 'migrating' (peer rollback would have moved back to
+//     'parked' already)
+//  2. node_id = fromNodeID (peer re-owner would have flipped
+//     this already)
+//
+// Returns ErrConflict on RowsAffected()==0 — peer rollback, peer
+// re-owner, or row gone.
+func (s *PgStore) MigrateInstanceOwner(ctx context.Context, instanceID, fromNodeID, toNodeID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: migrate instance owner: empty instanceID")
+	}
+	if fromNodeID == "" || toNodeID == "" {
+		return fmt.Errorf("state: migrate instance owner: empty from/to nodeID")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("state: migrate instance owner begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// Two-UPDATE transaction:
+	//   1. instances row: conditional on state='migrating' +
+	//      node_id=fromNodeID, flips node_id, stamps lineage cols,
+	//      restores state='running'. Returns the app_id for the
+	//      second UPDATE.
+	//   2. apps row: stamps migrated_at = now() so the dashboard's
+	//      "fleet live-migration throughput" panel stays coherent.
+	var appID string
+	err = tx.QueryRow(ctx,
+		`update instances
+		    set node_id = $3,
+		        migrated_from_node_id = $2,
+		        migrated_at = now(),
+		        lease_token = $4,
+		        state = 'running'
+		  where id = $1
+		    and state = 'migrating'
+		    and node_id = $2
+		returning app_id`,
+		instanceID, fromNodeID, toNodeID, leaseToken).Scan(&appID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrConflict
+		}
+		return fmt.Errorf("state: migrate instance owner: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`update apps set migrated_at = now() where id = $1`,
+		appID); err != nil {
+		return fmt.Errorf("state: migrate instance owner (apps.migrated_at): %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: migrate instance owner commit: %w", err)
+	}
+	return nil
+}
+
+// CancelInstanceMigration is the Phase-4 rollback of the four-phase
+// cross-node live-instance handoff (Tier A5 / ADR-066). Conditional
+// UPDATE that transitions the instance back from 'migrating' to
+// 'parked' on the original owner. The dying vmmd resumes the VM;
+// the snapshot stays where it was. Predicates:
+//  1. state = 'migrating'
+//  2. node_id = originalNodeID (the rollback is owner-local; a
+//     peer commit racing us would have flipped node_id already)
+//  3. lease_token = leaseToken (stale-lease safety)
+//
+// Returns ErrConflict on RowsAffected()==0 — peer already committed
+// (no rollback needed), lease expired, or row gone. The UPDATE
+// also clears lease_token so a future re-attempt at migration
+// mints a fresh lease.
+func (s *PgStore) CancelInstanceMigration(ctx context.Context, instanceID, originalNodeID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: cancel instance migration: empty instanceID")
+	}
+	if originalNodeID == "" {
+		return fmt.Errorf("state: cancel instance migration: empty originalNodeID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'parked',
+		        lease_token = NULL
+		  where id = $1
+		    and state = 'migrating'
+		    and node_id = $2
+		    and lease_token = $3`,
+		instanceID, originalNodeID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("state: cancel instance migration: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,
@@ -7254,7 +7472,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
-		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt); err != nil {
+		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -7300,7 +7518,8 @@ const appsSelectColumns = `
 	coalesce(autoscale_target_rps, 0), coalesce(autoscale_target_cpu_pct, 0),
 	coalesce(project_id::text, ''), coalesce(root_dir, ''), workload_name,
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
-	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, ''), reassigned_at`
+	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, ''),
+	reassigned_at, migrated_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -7567,6 +7786,53 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	}
 	if parked != nil {
 		ins.ParkedAt = *parked
+	}
+	return ins, nil
+}
+
+// scanInstanceColsWithMigration is the 16-column variant of
+// scanInstanceCols that also lifts migrated_from_node_id,
+// migrated_at, and lease_token (Tier A5 / migration 00097,
+// ADR-066). Used only by ListLiveInstancesOnNode — the rest of
+// the codebase reads 13-column instances rows and doesn't need
+// the migration lineage. Column order matches
+// ListLiveInstancesOnNode's SELECT; keep them in lock-step.
+// migrated_from_node_id is nullable forever (a fresh instance
+// has no migration history), so it scans into a *string
+// pointer to preserve the distinction between "fresh" and
+// "previously migrated". migrated_at is nullable for the same
+// reason. lease_token is also nullable.
+//
+// Single-call scan: pgx rejects a 16-column SELECT with a 13-dest
+// scan followed by a 3-dest scan — the row surface is one
+// contiguous column stream and each scan call must consume all
+// columns in one go. The base 13 fields are duplicated here
+// rather than split across two scan calls so the row descriptor
+// stays consistent across rows.
+func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
+	ins := Instance{}
+	var started, lastReq, parked *time.Time
+	var migFromStr *string
+	var migAtTime *time.Time
+	var leaseStr *string
+	if err := scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
+		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID,
+		&migFromStr, &migAtTime, &leaseStr); err != nil {
+		return Instance{}, err
+	}
+	if started != nil {
+		ins.StartedAt = *started
+	}
+	if lastReq != nil {
+		ins.LastRequestAt = *lastReq
+	}
+	if parked != nil {
+		ins.ParkedAt = *parked
+	}
+	ins.MigratedFromNodeID = migFromStr
+	ins.MigratedAt = migAtTime
+	if leaseStr != nil {
+		ins.LeaseToken = *leaseStr
 	}
 	return ins, nil
 }

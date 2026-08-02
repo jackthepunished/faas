@@ -122,6 +122,20 @@ func (h *heartbeatFakeVMM) Logs(context.Context, string, int64, time.Time) (LogS
 	return &fakeLogStream{}, nil
 }
 
+// Tier A5 (ADR-066) — heartbeat tests don't drive migration.
+func (h *heartbeatFakeVMM) PrepareLiveMigration(context.Context, string, string, string) (LiveMigrationPrepare, error) {
+	return LiveMigrationPrepare{}, nil
+}
+func (h *heartbeatFakeVMM) AdoptMigratedInstance(context.Context, string, string, AppSpec, string, string, string) (LiveMigrationAdopt, error) {
+	return LiveMigrationAdopt{}, nil
+}
+func (h *heartbeatFakeVMM) AcknowledgeMigration(context.Context, string, string, string) error {
+	return nil
+}
+func (h *heartbeatFakeVMM) CancelLiveMigration(context.Context, string, string, string) error {
+	return nil
+}
+
 // Compile-time assertion that the dialer satisfies HeartbeatDialer.
 var _ HeartbeatDialer = (*heartbeatFakeDialer)(nil)
 

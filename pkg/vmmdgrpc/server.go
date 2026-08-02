@@ -125,6 +125,16 @@ type Server struct {
 	// constructors; production cmd/vmmd uses
 	// NewWithCPUAndNetAndActivity.
 	activity *activity.ActivityTracker
+	// migrations (Tier A5 / ADR-066) tracks in-flight
+	// Phase 1 → Phase 5 leases. The dying vmmd mints a
+	// lease at PrepareLiveMigration; the new owner vmmd
+	// validates it at AdoptMigratedInstance; the dying
+	// vmmd clears it on AcknowledgeMigration /
+	// CancelLiveMigration. nil-safe — handlers treat a
+	// nil tracker as "not wired" and return a typed
+	// codes.Unavailable, except for the idempotent
+	// Phase 4 / 5 ack paths which succeed.
+	migrations *migrationTracker
 }
 
 // New wires the server. ops may be nil (noop metrics), log may be nil
@@ -171,7 +181,7 @@ func NewWithCPUAndNetAndActivity(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string
 		// never exported. Tests that don't assert metrics use this path.
 		ops = wire.NewOpsMetrics("vmmd_test")
 	}
-	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net, activity: act}
+	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net, activity: act, migrations: newMigrationTracker()}
 }
 
 // ForgetCPU drops the cache baseline for an instance. Called from

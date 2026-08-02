@@ -199,6 +199,20 @@ func (f *fakeVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentE
 	return &vmmdpb.UmountParentExt4Response{}, nil
 }
 
+// Tier A5 (ADR-066) — gateway never drives the migration RPCs.
+func (f *fakeVmmdClient) PrepareLiveMigration(context.Context, *vmmdpb.PrepareLiveMigrationRequest, ...grpc.CallOption) (*vmmdpb.PrepareLiveMigrationResponse, error) {
+	return &vmmdpb.PrepareLiveMigrationResponse{}, nil
+}
+func (f *fakeVmmdClient) AdoptMigratedInstance(context.Context, *vmmdpb.AdoptMigratedInstanceRequest, ...grpc.CallOption) (*vmmdpb.AdoptMigratedInstanceResponse, error) {
+	return &vmmdpb.AdoptMigratedInstanceResponse{}, nil
+}
+func (f *fakeVmmdClient) AcknowledgeMigration(context.Context, *vmmdpb.AcknowledgeMigrationRequest, ...grpc.CallOption) (*vmmdpb.AcknowledgeMigrationResponse, error) {
+	return &vmmdpb.AcknowledgeMigrationResponse{}, nil
+}
+func (f *fakeVmmdClient) CancelLiveMigration(context.Context, *vmmdpb.CancelLiveMigrationRequest, ...grpc.CallOption) (*vmmdpb.CancelLiveMigrationResponse, error) {
+	return &vmmdpb.CancelLiveMigrationResponse{}, nil
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can

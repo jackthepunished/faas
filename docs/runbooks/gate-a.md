@@ -119,6 +119,76 @@ startup — the cold-start sweep reconciles every orphan
 regardless of which dead node owned it, so an interrupted
 drain doesn't leave apps permanently pinned to the dead node.
 
+### Drain behaviour — Tier A5 cross-node live-instance migration (ADR-066)
+
+Tier A4 only handles parked apps. **Tier A5** handles the
+remaining case: a `running` / `waking` / `cold_booting` /
+`snapshotting` instance on the drained node is migrated to
+an active peer via a four-phase handoff
+(`pkg/sched/migration_handoff.go`):
+
+  Phase 1  PrepareLiveMigration      — dying vmmd Park +
+                                        mint lease
+  Phase 2  MarkInstanceMigrating      — store conditional
+                                        UPDATE state=running
+                                        → state=migrating
+  Phase 3  AdoptMigratedInstance      — new owner vmmd
+                                        Restore from the
+                                        snapshot dying vmmd
+                                        wrote at Phase 1
+  Phase 3.5  MigrateInstanceOwner    — store single-tx
+                                        commit: node_id flip,
+                                        lineage stamp
+  Phase 5  AcknowledgeMigration       — dying vmmd lease
+                                        cleared (VM already
+                                        gone — Park's
+                                        contract)
+
+Phase 4 (rollback) runs on any failure between Phase 1 and
+Phase 3.5: `CancelLiveMigration` + `CancelInstanceMigration`
+restore the instance row to `state='running'` and the dying
+vmmd's lease entry is dropped.
+
+Per-drain-event cap: `MigrateLiveMaxPerTick = 10` (env-
+overridable via `FAAS_MIGRATE_LIVE_MAX_PER_TICK`). Lease
+window: `MigrateLiveLeaseSeconds = 90` (env-overridable via
+`FAAS_MIGRATE_LIVE_LEASE_SECONDS`). On lease expiry the
+dying vmmd drops the lease and the canonical snapshot stays
+in storage until the per-vmmd snapshot-drift sweep reaps it.
+
+**Caveat (read carefully):** Tier A5 destroys + recreates
+the VM (one-shot blip of ~350 ms cold-boot from snapshot).
+Firecracker does not expose VM-level live migration
+primitives — there is no pause-and-keep-running model. For
+true zero-downtime failover the operator must use the
+active-passive HA path (let the node drain cleanly before
+shutting down).
+
+**Prerequisite:** Tier A5 only works on fleets that have
+shipped `OCIRegistryStorageBackend` (ADR-054 / PR #457).
+`LocalStorageBackend` cannot share snapshots across nodes;
+on a default-local-only fleet the live migration path
+fails at Phase 3 (Restore can't resolve the storage keys).
+
+Observe the migrator's per-instance outcomes via the metric:
+
+```
+curl -s http://localhost:9100/metrics | grep schedd_live_migration_decisions_total
+```
+
+`outcome="migrated"` is the success signal; `outcome=
+"peer_failure"` is a gRPC dial / FC uAPI error (transient,
+next drain retries); `outcome="conflict"` is a peer winning
+the conditional-UPDATE race; `outcome="lease_expired"` is
+the lease timer firing before Phase 3.5 committed (the
+instance row stays in `state='migrating'` — a future
+watchdog will recover stuck rows).
+
+If a schedd was down while the drain notify fired, the next
+boot runs `Engine.MigrateLiveInstances(ctx, "")` once at
+startup — the cold-start sweep reconciles every dead-node-
+owned live instance regardless of which dead node owned it.
+
 ## Adding a second compute node
 
 The minimum operator surface for cutting over a second compute
