@@ -350,13 +350,7 @@ const testDomain = "apps.test.example"
 // per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
 // call pgtest.WaitForMigration with their own N and remain green.
 //
-// Bumped 84 → 86 when the cosign-deploy-enforcement PR (PR #504)
-// renumbered a second time: main had moved to slot 85 (builds_kind_
-// github) with 00083/00084 reservation placeholders landing in between,
-// leaving the static contiguity check (TestMigrationsContiguous) with
-// a slot-84 gap to surface. The first bump (83 → 84) caught the
-// parallel slot-83 race against PR #509; the second lands on the
-// next free slot past the live migration head.
+// Bumped 83 → 86 → 93 → 94 → 102 across six rebase cycles:
 //
 // (issue #461 / ADR-064 — registry_credentials landing on slot 94
 // after PR #529 (Tier A4 cross-node app rebalance, ADR-064) raced
@@ -366,7 +360,23 @@ const testDomain = "apps.test.example"
 // Bumped 83 → 87 → 92 → 93 → 94 across four rebase cycles; the
 // renumber chain tracks the gate's "next free slot past the live
 // head" rule when sibling PRs race for the same N.)
-const e2eMigrationTarget = 105
+//
+//   - 94 → 110 after PR #533 (Tier A5 cross-node live-instance
+//     migration, ADR-066) merged real migrations at 00103 +
+//     00104, then PR #536 (iam-6 personal-org backfill) merged
+//     real at 00105. The renumber commits in this branch's history
+//     (101/102 → 103/104 → 105/106 → 107/108 → 109/110) collided
+//     with main's new files, so all five were dropped on rebase
+//     (the work is now collapsed into a single post-rebase commit).
+//     The branch renumbered 00101 → 00109 + 00102 → 00110 past
+//     main's new head at 105; the 106-108 gap is filled by
+//     reserve_slot.sql fences at 00106/00107/00108 per ADR-041 so
+//     the embedded FS stays contiguous 1..110. (Slot 00105 is owned
+//     by main's 00105_personal_org_backfill.sql — no fence needed
+//     there.) Open PRs claim: 00101 (PR #531 issue #463 sidecars),
+//     00107 (PR #532 issue #517 PR-C canonical wake timeline) —
+//     none overlap with 00109/00110.
+const e2eMigrationTarget = 110
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

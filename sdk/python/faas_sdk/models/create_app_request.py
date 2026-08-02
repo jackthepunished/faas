@@ -28,6 +28,15 @@ class CreateAppRequest:
     idle_timeout_s: int | Unset = UNSET
     streaming_enabled: bool | Unset = UNSET
     """Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471)."""
+    warm_snapshot_enabled: bool | Unset = UNSET
+    """Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan
+    default. Free/Hobby PATCH-true is rejected."""
+    warm_snapshot_min_requests: int | Unset = UNSET
+    """Optional create-time override for the warm-tier request-count threshold (issue #470 / ADR-055). Range [1,
+    100]. Omitted → apid applies the plan default."""
+    warm_snapshot_min_ms: int | Unset = UNSET
+    """Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 /
+    ADR-055). Range [100, 60000]. Omitted → apid applies the plan default."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -49,6 +58,12 @@ class CreateAppRequest:
 
         streaming_enabled = self.streaming_enabled
 
+        warm_snapshot_enabled = self.warm_snapshot_enabled
+
+        warm_snapshot_min_requests = self.warm_snapshot_min_requests
+
+        warm_snapshot_min_ms = self.warm_snapshot_min_ms
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -68,6 +83,12 @@ class CreateAppRequest:
             field_dict["idle_timeout_s"] = idle_timeout_s
         if streaming_enabled is not UNSET:
             field_dict["streaming_enabled"] = streaming_enabled
+        if warm_snapshot_enabled is not UNSET:
+            field_dict["warm_snapshot_enabled"] = warm_snapshot_enabled
+        if warm_snapshot_min_requests is not UNSET:
+            field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
+        if warm_snapshot_min_ms is not UNSET:
+            field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
 
         return field_dict
 
@@ -98,6 +119,12 @@ class CreateAppRequest:
 
         streaming_enabled = d.pop("streaming_enabled", UNSET)
 
+        warm_snapshot_enabled = d.pop("warm_snapshot_enabled", UNSET)
+
+        warm_snapshot_min_requests = d.pop("warm_snapshot_min_requests", UNSET)
+
+        warm_snapshot_min_ms = d.pop("warm_snapshot_min_ms", UNSET)
+
         create_app_request = cls(
             slug=slug,
             type_=type_,
@@ -106,6 +133,9 @@ class CreateAppRequest:
             max_concurrency=max_concurrency,
             idle_timeout_s=idle_timeout_s,
             streaming_enabled=streaming_enabled,
+            warm_snapshot_enabled=warm_snapshot_enabled,
+            warm_snapshot_min_requests=warm_snapshot_min_requests,
+            warm_snapshot_min_ms=warm_snapshot_min_ms,
         )
 
         create_app_request.additional_properties = d

@@ -358,6 +358,26 @@ const (
 	// without conflating them in telemetry.
 	CodePlanStreamingNotAllowed = "plan_streaming_not_allowed"
 
+	// Issue #470 / ADR-055: per-app two-tier-snapshot flag (warm.snap
+	// on top of init.snap). Pro/Scale opt in by default; Free/Hobby
+	// reject PATCH-true with 403 plan_warm_snapshot_not_allowed so
+	// customers see the gate before the SQL CHECK trips on the
+	// INSERT. Same shape as CodePlanStreamingNotAllowed / egress:
+	// a single plan-locked feature with a distinct code so the
+	// CLI can render "warm-snapshot is a paid feature" alongside
+	// the streaming + allowlist copy without conflating them.
+	CodePlanWarmSnapshotNotAllowed = "plan_warm_snapshot_not_allowed"
+
+	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
+	// values from a PATCH (warm_snapshot_min_requests outside [1,
+	// 100] or warm_snapshot_min_ms outside [100, 60000]). 422 with
+	// these codes so the customer sees a validation error, not a
+	// SQL CHECK violation that the apid layer is supposed to
+	// intercept. Distinct codes per field so the CLI can render
+	// "min_requests out of range" vs "min_ms out of range".
+	CodeInvalidWarmSnapshotMinRequests = "invalid_warm_snapshot_min_requests"
+	CodeInvalidWarmSnapshotMinMs       = "invalid_warm_snapshot_min_ms"
+
 	// Issue #471 PR-B (the meat) — emitted when an active stream
 	// exceeds the per-plan MaxResponseBodyBytes cap (Hobby+: 100 MB;
 	// Free: 25 MB). 413 + this code so the client sees a distinct

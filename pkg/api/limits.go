@@ -299,6 +299,32 @@ type Limits struct {
 	// egress_allowlist_too_long when the PATCH body has more entries.
 	EgressAllowlistMaxSize int
 
+	// WarmSnapshotEnabled (issue #470 / ADR-055) is the plan-gated
+	// default for the per-app two-tier snapshot flag. Free/Hobby =
+	// false (warm-tier apps keep both warm.snap + init.snap, which
+	// is +130 MB per app on the parked disk budget — Hobby's pricing
+	// tier is too cheap for that). Pro/Scale = true (the doubled
+	// parked footprint is inside the 452 GB budget). Apid's
+	// updateApp handler rejects Free/Hobby PATCH-true with
+	// 403 plan_warm_snapshot_not_allowed; the default is applied
+	// at CreateApp time so a Pro customer's brand-new app gets a
+	// warm.snap without an extra PATCH.
+	WarmSnapshotEnabled bool
+	// WarmSnapshotMinRequestsDefault is the per-app request-count
+	// threshold for warm-tier capture, applied at CreateApp when
+	// the plan allows it. Free/Hobby = 0 (irrelevant because
+	// WarmSnapshotEnabled = false there). Pro/Scale = 5. Range
+	// [1, 100] (migration 00109 CHECK). The per-app PATCH may
+	// override; both the SQL CHECK and the apid handler reject
+	// out-of-range values.
+	WarmSnapshotMinRequestsDefault int
+	// WarmSnapshotMinMsDefault is the per-app time-since-first-ready
+	// threshold for warm-tier capture, applied at CreateApp when
+	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
+	// 2000 (matches Node.js Express / Flask framework startup).
+	// Range [100, 60000] (migration 00109 CHECK).
+	WarmSnapshotMinMsDefault int
+
 	// StreamingEnabled (issue #471) gates the per-app streaming
 	// response path through gatewayd (Flusher + periodic 200 ms /
 	// 256 KiB tx_bytes flush; ADR-047). Free defaults off — the
@@ -425,6 +451,13 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            false,
 		MaxResponseBodyBytes:        MaxResponseBodyBytesDefault,
 		ResponseWriteTimeoutSeconds: ResponseWriteTimeoutDefault,
+		// Warm-snapshot (issue #470 / ADR-055): Free is off by
+		// plan. Warm-tier apps keep warm.snap + init.snap on the
+		// parked disk budget; doubling the per-app snapshot
+		// footprint is incompatible with the Free pricing tier.
+		WarmSnapshotEnabled:            false,
+		WarmSnapshotMinRequestsDefault: 0,
+		WarmSnapshotMinMsDefault:       0,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -526,6 +559,15 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// Warm-snapshot (issue #470 / ADR-055): Hobby is gated off
+		// for the same cost-shape reason as Free — doubling the
+		// parked per-app snapshot footprint doesn't fit the
+		// €9/month Hobby price point. Pro/Scale customers pay
+		// enough that the +130 MB per warm-tier app is comfortably
+		// inside the 452 GB parked budget.
+		WarmSnapshotEnabled:            false,
+		WarmSnapshotMinRequestsDefault: 0,
+		WarmSnapshotMinMsDefault:       0,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -613,6 +655,14 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// Warm-snapshot (issue #470 / ADR-055): Pro is the first
+		// tier where warm-snapshot is on by default. Per the issue
+		// body's acceptance: "for a Pro+ app that has served ≥5
+		// successful requests ≥2 s after first-ready, restore
+		// from warm.snap should be ≤50 % of init.snap p50".
+		WarmSnapshotEnabled:            true,
+		WarmSnapshotMinRequestsDefault: 5,
+		WarmSnapshotMinMsDefault:       2000,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -708,6 +758,13 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// Warm-snapshot (issue #470 / ADR-055): Scale stays on
+		// by default — the per-app parked footprint cost fits
+		// inside the 452 GB budget, and the customer's wake-p50
+		// win is the largest dollar lever for SaaS workloads.
+		WarmSnapshotEnabled:            true,
+		WarmSnapshotMinRequestsDefault: 5,
+		WarmSnapshotMinMsDefault:       2000,
 	},
 }
 
@@ -1244,6 +1301,59 @@ func (p Plan) StreamingResponseAllowed() bool {
 		return false
 	}
 	return l.StreamingEnabled
+}
+
+// WarmSnapshotEnabled reports whether the plan's default for the
+// per-app two-tier snapshot flag is on. Pro/Scale return true; Free /
+// Hobby return false. The accessor is fail-closed — an unknown plan
+// reads as false, matching the Free default. Used by buildApp in
+// cmd/apid/handlers.go to populate a brand-new app's flag.
+//
+// Issue #470 / ADR-055: the equivalent gate ("can the customer opt in
+// to warm-snapshot?") lives on WarmSnapshotAllowed (separate method
+// below) so Free + Hobby PATCH-true can be rejected cleanly without
+// conflating the default and the gate.
+func (p Plan) WarmSnapshotEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.WarmSnapshotEnabled
+}
+
+// WarmSnapshotAllowed reports whether the plan permits a customer to
+// set apps.warm_snapshot_enabled=true via PATCH. Pro/Scale return true;
+// Free / Hobby return false so apid's updateApp handler can surface
+// 403 plan_warm_snapshot_not_allowed. Customers on any plan may PATCH
+// true → false (opt-out per-app).
+func (p Plan) WarmSnapshotAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.WarmSnapshotEnabled
+}
+
+// WarmSnapshotMinRequestsDefault returns the per-plan default for the
+// per-app request-count threshold. Pro/Scale: 5. Free/Hobby: 0 (the
+// column default — unused because warm-snapshot is gated off).
+func (p Plan) WarmSnapshotMinRequestsDefault() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WarmSnapshotMinRequestsDefault
+}
+
+// WarmSnapshotMinMsDefault returns the per-plan default for the per-app
+// time-since-first-ready threshold (ms). Pro/Scale: 2000. Free/Hobby:
+// 0 (unused). Used by buildApp in cmd/apid/handlers.go.
+func (p Plan) WarmSnapshotMinMsDefault() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WarmSnapshotMinMsDefault
 }
 
 // MaxResponseBodyBytes returns the per-response body cap in bytes for

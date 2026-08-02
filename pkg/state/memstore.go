@@ -1957,6 +1957,20 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetRequireSigned {
 		a.RequireSigned = boolOrFalse(p.RequireSigned)
 	}
+	// Issue #470 / ADR-055: per-app warm-snapshot knobs. Same Set-bit
+	// convention as require_signed / streaming_enabled — the Set bit
+	// distinguishes "don't touch" from "explicit reset". Apid already
+	// gated the plan (Free/Hobby + true is rejected) and the bounds
+	// (1..100 / 100..60000); the store is a plain column write.
+	if p.SetWarmSnapshotEnabled {
+		a.WarmSnapshotEnabled = boolOrFalse(p.WarmSnapshotEnabled)
+	}
+	if p.SetWarmSnapshotMinRequests {
+		a.WarmSnapshotMinRequests = intOrZero(p.WarmSnapshotMinRequests)
+	}
+	if p.SetWarmSnapshotMinMs {
+		a.WarmSnapshotMinMs = intOrZero(p.WarmSnapshotMinMs)
+	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
 	// apid handler never sets them (customers don't touch root_dir
@@ -4064,6 +4078,12 @@ func (m *MemStore) CreateSnapshot(_ context.Context, snap Snapshot) (Snapshot, e
 	if snap.StorageKey == "" {
 		return Snapshot{}, errors.New("state: MemStore.CreateSnapshot: storage_key required (populate via sched.SnapshotMemKey at the call site)")
 	}
+	if snap.Tier == "" {
+		// Issue #470 / ADR-055: empty tier is treated as "init" for
+		// legacy callers; new warm-tier capture code passes
+		// SnapshotTierWarm explicitly.
+		snap.Tier = SnapshotTierInit
+	}
 	if snap.ID == "" {
 		snap.ID = uuid.NewString()
 	}
@@ -4071,7 +4091,12 @@ func (m *MemStore) CreateSnapshot(_ context.Context, snap Snapshot) (Snapshot, e
 		snap.CreatedAt = time.Now()
 	}
 	for _, existing := range m.snapshots {
-		if existing.DeploymentID == snap.DeploymentID && existing.FCVersion == snap.FCVersion && existing.StorageKey == snap.StorageKey {
+		// Mirror the (deployment_id, tier) unique index from migration
+		// 00110: a non-stale row with the same (deployment_id, tier)
+		// is a duplicate — surface ErrConflict so callers fall through
+		// to the existing-imaged semantic. Different-tier rows on the
+		// same deployment are allowed (warm + init coexist).
+		if existing.DeploymentID == snap.DeploymentID && existing.Tier == snap.Tier && !existing.Stale {
 			return Snapshot{}, ErrConflict
 		}
 	}
@@ -4086,6 +4111,46 @@ func (m *MemStore) LatestSnapshot(_ context.Context, deploymentID string) (Snaps
 	found := false
 	for _, s := range m.snapshots {
 		if s.DeploymentID != deploymentID || s.Stale {
+			continue
+		}
+		if !found {
+			latest = s
+			found = true
+			continue
+		}
+		// Issue #470 / ADR-055: warm wins on a created_at tie. The
+		// (tier='warm') order-by clause in PgStore.LatestSnapshot
+		// mirrors this preference.
+		sWarm := s.Tier == SnapshotTierWarm
+		lWarm := latest.Tier == SnapshotTierWarm
+		switch {
+		case sWarm != lWarm && sWarm:
+			latest = s
+		case sWarm == lWarm && s.CreatedAt.After(latest.CreatedAt):
+			latest = s
+		}
+	}
+	if !found {
+		return Snapshot{}, ErrNotFound
+	}
+	return latest, nil
+}
+
+// LatestSnapshotForTier mirrors PgStore.LatestSnapshotForTier — returns
+// the freshest non-stale snapshot for (deploymentID, tier). Empty tier
+// is treated as "init" for legacy callers. Returns ErrNotFound when no
+// non-stale row exists; schedd's tier-fallback chain treats that as
+// "fall through to the next tier" (issue #470 / ADR-055).
+func (m *MemStore) LatestSnapshotForTier(_ context.Context, deploymentID, tier string) (Snapshot, error) {
+	if tier == "" {
+		tier = SnapshotTierInit
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var latest Snapshot
+	found := false
+	for _, s := range m.snapshots {
+		if s.DeploymentID != deploymentID || s.Stale || s.Tier != tier {
 			continue
 		}
 		if !found || s.CreatedAt.After(latest.CreatedAt) {
@@ -4151,6 +4216,11 @@ func (m *MemStore) ListSnapshotsForGC(_ context.Context) ([]SnapshotForGC, error
 			FCVersion: s.FCVersion,
 			MemBytes:  s.MemBytes,
 			DiskBytes: s.DiskBytes,
+			// Issue #470 / ADR-055: forward the tier so the GC loop's
+			// perAppKeepCurrentPrevious can keep (current warm +
+			// previous init) per warm-tier app and (current init +
+			// previous init) per init-only app.
+			Tier: s.Tier,
 			// #96 / ADR-025 axis 2: forward the canonical storage
 			// key so imaged's GC loop can Storage.Delete under it
 			// without a second hop through Snapshot.

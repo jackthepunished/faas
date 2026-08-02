@@ -50,7 +50,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #461 / ADR-062: Free has no private-registry
 			// credential surface (handler returns 403
 			// plan_registry_credentials_not_allowed).
-			RegistryCredentialMax: 0},
+			RegistryCredentialMax: 0,
+			// Issue #470 / ADR-055: Free is gated off for warm-tier
+			// snapshots — doubling the per-app parked footprint
+			// doesn't fit the Free pricing tier. The 0/0 defaults
+			// are defence-in-depth; the WarmSnapshotAllowed() gate
+			// surfaces the 403 to a Free customer PATCHing true.
+			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
 			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
@@ -99,7 +105,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// filter for the typical one-staging-deployment workload.
 			LogDeploymentFilterMax: 1,
 			// Issue #461 / ADR-064: Hobby = 2 — staging + production.
-			RegistryCredentialMax: 2},
+			RegistryCredentialMax: 2,
+			// Issue #470 / ADR-055: Hobby is gated off for the
+			// same cost-shape reason as Free — the doubled parked
+			// footprint doesn't fit the €9/month Hobby tier.
+			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
@@ -139,7 +149,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// per-instance goroutine fan-out.
 			LogDeploymentFilterMax: 10,
 			// Issue #461 / ADR-064: Pro = 5 — multi-region + CI shapes.
-			RegistryCredentialMax: 5},
+			RegistryCredentialMax: 5,
+			// Issue #470 / ADR-055: Pro is the first tier where
+			// warm-tier snapshots are on by default — 5 requests /
+			// 2000 ms is the sweet spot for the issue's acceptance
+			// (p50 halved vs init-tier).
+			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
@@ -184,7 +199,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// fan-out SaaS-scale customers typically run.
 			LogDeploymentFilterMax: 50,
 			// Issue #461 / ADR-064: Scale = 20 — broad fan-out.
-			RegistryCredentialMax: 20},
+			RegistryCredentialMax: 20,
+			// Issue #470 / ADR-055: Scale stays on by default —
+			// the per-app parked cost fits inside the 452 GB
+			// budget and the wake-p50 win is the largest dollar
+			// lever for SaaS workloads.
+			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
