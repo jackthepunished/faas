@@ -153,10 +153,17 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 		if !eventDataHasAppID(e.Data, app.ID) {
 			continue
 		}
-		out = append(out, wakeTimelineEvent(e))
+		// Bound check before append: the slice grows one at a time
+		// and CodeQL's go/uncontrolled-allocation-size taint tracking
+		// loses the `min(limit, Max)` cap if the cap is asserted
+		// AFTER the append (the +1 elements already in `out` flow
+		// forward into the next iteration's append). Capping first
+		// keeps the bound visible to the static analyzer AND the
+		// runtime (we never reach the append when full).
 		if len(out) >= limit {
 			break
 		}
+		out = append(out, wakeTimelineEvent(e))
 	}
 	var nextCursor string
 	if len(out) > 0 && len(rows) > limit {
