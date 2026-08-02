@@ -17,7 +17,11 @@
 //     index (ErrConflict path that pgstore.CreateSnapshot surfaces).
 //  6. Same-tier second insert on a STALE row bypasses the unique
 //     index (WHERE stale=false filter) — the recovery path.
-//  7. Replay safety.
+//  7. Replay safety: a second MigrateUp is a no-op. The migration
+//     uses ADD COLUMN IF NOT EXISTS + CREATE UNIQUE INDEX IF NOT
+//     EXISTS + DROP CONSTRAINT IF EXISTS / ADD CONSTRAINT (the
+//     constraint is idempotent via the prior drop). Same shape as
+//     migrations/00088_apps_warm_snapshot.sql.
 //
 // Slot note: see 00101_apps_warm_snapshot_test.go for the renumber
 // protocol. The seed UUIDs in this file carry 089 / 189 / 289
@@ -169,10 +173,11 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 		t.Errorf("recovered row stale = true, want false")
 	}
 
-	// (7) Replay safety: a second MigrateUp is a no-op (the migration
+	// (7) Replay safety: a second MigrateUp is a no-op. The migration
 	// uses ADD COLUMN IF NOT EXISTS + CREATE UNIQUE INDEX IF NOT
-	// EXISTS + ADD CONSTRAINT without IF NOT EXISTS but idempotent
-	// via DROP CONSTRAINT IF EXISTS first).
+	// EXISTS + DROP CONSTRAINT IF EXISTS / ADD CONSTRAINT (the
+	// constraint is idempotent via the prior drop). Same shape as
+	// migrations/00088_apps_warm_snapshot.sql.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("replay-safety: second MigrateUp failed: %v", err)
 	}

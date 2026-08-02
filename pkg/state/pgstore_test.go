@@ -1584,7 +1584,8 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 	id170 := mkSnap("1.7.0")
 	id180 := mkSnap("1.8.0")
 	id190 := mkSnap("1.9.0")
-	_, _ = id170, id190
+	_ = id170
+	_ = id190
 
 	// Sweep against 1.8.0: 1.7.0 and 1.9.0 should flip (id180 stays live).
 	n, err := s.MarkAllSnapshotsStaleByFCVersion(ctx, "1.8.0")

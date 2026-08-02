@@ -12,8 +12,11 @@
 //     stay on the init-tier path; warm-snapshot is operator opt-in).
 //  4. Opt-in round-trip: UPDATE writes true and reads back true.
 //  5. CHECK bounds reject out-of-range values for both min columns.
-//  6. Replay-safe: ADD COLUMN IF NOT EXISTS + ADD CONSTRAINT IF NOT
-//     EXISTS makes a second MigrateUp a no-op (PR #377 / ADR-041).
+//  6. Replay-safe: ADD COLUMN IF NOT EXISTS + the DO-block +
+//     pg_catalog.pg_constraint guard make a second MigrateUp a no-op
+//     (PR #377 / ADR-041; see migrations/00082_apps_scaling_policy.sql
+//     and migrations/00074_projects_and_workloads.sql for the
+//     precedent — Postgres has no `ADD CONSTRAINT IF NOT EXISTS`).
 //
 // Slot note: HEAD on origin/main is 00086 (apps_require_signed).
 // Slot 101 is the next contiguous real-schema slot at PR-creation
@@ -160,9 +163,12 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 		t.Errorf("warm_snapshot_min_ms=70000 should be rejected by CHECK (upper bound)")
 	}
 
-	// (7) Replay safety: a second MigrateUp is a no-op (the migration
-	// uses ADD COLUMN IF NOT EXISTS + ADD CONSTRAINT IF NOT EXISTS).
-	// PR #377 / ADR-041 contract.
+	// (7) Replay safety: a second MigrateUp is a no-op. The migration
+	// uses ADD COLUMN IF NOT EXISTS for the three columns and a
+	// DO-block + pg_catalog.pg_constraint lookup for the two CHECK
+	// constraints (Postgres has no `ADD CONSTRAINT IF NOT EXISTS`).
+	// PR #377 / ADR-041 contract; precedent at
+	// migrations/00082_apps_scaling_policy.sql:50-77.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("replay-safety: second MigrateUp failed: %v", err)
 	}

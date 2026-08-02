@@ -7656,23 +7656,26 @@ func scanAppInto(a *App, row pgx.Row) error {
 
 // appsSelectColumns is the projection every app SELECT/RETURNING
 // must use. Listed in the same order as scanAppInto — scanAppInto
-// reads columns positionally, so the order is load-bearing. The 5
-// trailing columns (project_id, root_dir, workload_name, workload_class,
-// start_command) are the ADR-050 Phase 1 additions. require_signed
-// (issue #472 / ADR-054) was added after streaming_enabled; keep this
+// reads columns positionally, so the order is load-bearing. Keep this
 // const and the App struct aligned: adding a column touches both.
-// The 3 trailing columns (scaling_policy, last_scale_out_at,
-// last_scale_in_at) are the issue #462 / ADR-058 PR-A additions. The
-// trailing node_id column is the Phase 2 / Gate A shard key
-// (migration 00090); apps.node_id is NOT NULL after backfill + the
-// empty-uuid CHECK, set once at CreateApp time by apid's
-// PlacementScheduler. The trailing reassigned_at column (migration
-// 00095) tracks when schedd's Tier A4 cross-node rebalance last
-// touched the row. The 3 trailing columns (warm_snapshot_enabled,
-// warm_snapshot_min_requests, warm_snapshot_min_ms) are the
-// issue #470 / ADR-055 additions (two-tier snapshot / warm.snap).
-// Keep this const and the App struct aligned: adding a column touches
-// both.
+//
+// Column provenance (most-recent first):
+//
+//	warm_snapshot_enabled, warm_snapshot_min_requests,
+//	  warm_snapshot_min_ms  — issue #470 / ADR-055 (two-tier snapshot;
+//	    migration 00101 adds the columns, migration 00102 adds the
+//	    per-tier unique index on snapshots)
+//	node_id, reassigned_at  — issue #533 / ADR-066 (Phase 2 / Gate A
+//	    shard key + Tier A4 cross-node rebalance)
+//	scaling_policy,
+//	  last_scale_out_at,
+//	  last_scale_in_at      — issue #462 / ADR-058 PR-A (scaling policy)
+//	require_signed          — issue #472 / ADR-054 (cosign enforce)
+//	streaming_enabled       — issue #471 PR-A (streaming response)
+//	project_id, root_dir,
+//	  workload_name,
+//	  workload_class,
+//	  start_command         — ADR-050 Phase 1 (repo decomposition)
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,

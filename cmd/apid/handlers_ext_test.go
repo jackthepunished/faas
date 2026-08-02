@@ -377,6 +377,119 @@ func TestUpdateAppAutoscaleDisableZero(t *testing.T) {
 	}
 }
 
+// TestUpdateAppWarmSnapshot_FreeGate locks the plan-tier gate for the
+// per-app two-tier snapshot flag (issue #470 / ADR-055). Free plans
+// cannot set warm_snapshot_enabled=true at all — the doubled parked
+// footprint (warm.snap + init.snap, +130 MB per app) doesn't fit the
+// Free pricing tier. The handler must 403
+// plan_warm_snapshot_not_allowed, not 422 / not 200. Customers on any
+// plan may PATCH true → false (opt-out per-app), but that's a no-op on
+// Free (already false). Mirrors TestUpdateAppAutoscaleRPS_FreeGate.
+func TestUpdateAppWarmSnapshot_FreeGate(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-warm")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/free-warm", api.UpdateAppRequest{WarmSnapshotEnabled: &tru}, nil)
+	assertProblem(t, rec, 403, api.CodePlanWarmSnapshotNotAllowed)
+}
+
+// TestUpdateAppWarmSnapshot_HobbyGate is the Hobby branch of the same
+// gate (issue #470 / ADR-055). Hobby is gated off for the same
+// cost-shape reason as Free — doubling the parked per-app snapshot
+// footprint doesn't fit the €9/month Hobby tier.
+func TestUpdateAppWarmSnapshot_HobbyGate(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-warm")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-warm", api.UpdateAppRequest{WarmSnapshotEnabled: &tru}, nil)
+	assertProblem(t, rec, 403, api.CodePlanWarmSnapshotNotAllowed)
+}
+
+// TestUpdateAppWarmSnapshot_ProHappy is the Pro happy path: Pro
+// plans may toggle warm_snapshot_enabled freely. The value round-trips
+// through UpdateApp → scanApp → appResponse. Mirrors
+// TestUpdateAppAutoscaleRPS_ProHappy.
+func TestUpdateAppWarmSnapshot_ProHappy(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-warm-ok")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/pro-warm-ok", api.UpdateAppRequest{WarmSnapshotEnabled: &tru}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !out.WarmSnapshotEnabled {
+		t.Errorf("WarmSnapshotEnabled = false, want true (PATCH round-trip)")
+	}
+}
+
+// TestUpdateAppWarmSnapshotMinRequests_OutOfRange pins the bounds on
+// the per-app request-count threshold (issue #470 / ADR-055). The
+// SQL CHECK `warm_snapshot_min_requests BETWEEN 1 AND 100` is the
+// load-bearing safety net; the apid handler must reject the
+// out-of-range value FIRST so the customer sees a clean 422
+// invalid_warm_snapshot_min_requests, not a SQL CHECK violation. We
+// test both edges (0 and 101) so a future off-by-one fix doesn't
+// silently widen the range.
+func TestUpdateAppWarmSnapshotMinRequests_OutOfRange(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-warm-minreq")
+	tooLow := 0
+	recLow := e.do(t, "PATCH", "/v1/apps/pro-warm-minreq", api.UpdateAppRequest{WarmSnapshotMinRequests: &tooLow}, nil)
+	assertProblem(t, recLow, 422, api.CodeInvalidWarmSnapshotMinRequests)
+	tooHigh := 101
+	recHigh := e.do(t, "PATCH", "/v1/apps/pro-warm-minreq", api.UpdateAppRequest{WarmSnapshotMinRequests: &tooHigh}, nil)
+	assertProblem(t, recHigh, 422, api.CodeInvalidWarmSnapshotMinRequests)
+}
+
+// TestUpdateAppWarmSnapshotMinMs_OutOfRange pins the bounds on the
+// per-app time-since-first-ready threshold. SQL CHECK is
+// `warm_snapshot_min_ms BETWEEN 100 AND 60000`. The 100 ms floor blocks
+// capturing too early (before JIT/AOT has a chance to fire); the 60 s
+// ceiling bounds the per-park latency cost the warm capture adds to
+// the cold path (R1 in the plan). We test both edges so a future
+// off-by-one fix doesn't widen the range silently.
+func TestUpdateAppWarmSnapshotMinMs_OutOfRange(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-warm-minms")
+	tooLow := 99
+	recLow := e.do(t, "PATCH", "/v1/apps/pro-warm-minms", api.UpdateAppRequest{WarmSnapshotMinMs: &tooLow}, nil)
+	assertProblem(t, recLow, 422, api.CodeInvalidWarmSnapshotMinMs)
+	tooHigh := 60001
+	recHigh := e.do(t, "PATCH", "/v1/apps/pro-warm-minms", api.UpdateAppRequest{WarmSnapshotMinMs: &tooHigh}, nil)
+	assertProblem(t, recHigh, 422, api.CodeInvalidWarmSnapshotMinMs)
+}
+
+// TestUpdateAppWarmSnapshotMinRequests_BoundaryAccepted locks the
+// inclusive bounds: 1 and 100 must be accepted (NOT rejected as
+// out-of-range). Mirrors the negative OutOfRange test — without this
+// pin a future `v < 1` / `v > 100` refactor that mistakenly uses
+// strict inequality would silently break the spec contract.
+func TestUpdateAppWarmSnapshotMinRequests_BoundaryAccepted(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-warm-boundary")
+	low := 1
+	rec := e.do(t, "PATCH", "/v1/apps/pro-warm-boundary", api.UpdateAppRequest{WarmSnapshotMinRequests: &low}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("min_requests=1: status %d: %s", rec.Code, rec.Body)
+	}
+	high := 100
+	rec = e.do(t, "PATCH", "/v1/apps/pro-warm-boundary", api.UpdateAppRequest{WarmSnapshotMinRequests: &high}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("min_requests=100: status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.WarmSnapshotMinRequests != 100 {
+		t.Errorf("WarmSnapshotMinRequests = %d, want 100 (boundary round-trip)", out.WarmSnapshotMinRequests)
+	}
+}
+
 // TestUpdateAppEgressAllowlist_FreeGate locks the plan-tier gate:
 // Free plans cannot set egress_allowlist at all. The handler must
 // return 403 plan_egress_allowlist_not_allowed, not 400, because the
