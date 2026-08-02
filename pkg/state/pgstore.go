@@ -3001,15 +3001,17 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	row := tx.QueryRow(ctx,
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
+		                          sidecars,
 		                          status)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending')
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending')
 		 returning `+deploymentSelectColumns,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
 		nullString(d.SourceURL), nullString(d.CommitSHA),
 		d.OverrideEntrypoint, d.OverrideCmd,
 		nullJSONRaw(d.OverrideEnv), nullJSONRaw(d.OverrideEnvSecrets),
-		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck))
+		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck),
+		notNullEmptyJSONRaw(d.Sidecars))
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -8217,7 +8219,8 @@ const deploymentSelectColumns = `
 	coalesce(override_entrypoint, ARRAY[]::text[]),
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
-	coalesce(override_port, 0), override_healthcheck`
+	coalesce(override_port, 0), override_healthcheck,
+	coalesce(sidecars, '[]'::jsonb)`
 
 // deploymentSelectColumnsWithRootfs is the variant used by read paths
 // that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
@@ -8237,7 +8240,8 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(override_entrypoint, ARRAY[]::text[]),
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
-	coalesce(override_port, 0), override_healthcheck`
+	coalesce(override_port, 0), override_healthcheck,
+	coalesce(sidecars, '[]'::jsonb)`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -8259,7 +8263,8 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.override_entrypoint, ARRAY[]::text[]),
 	coalesce(d.override_cmd, ARRAY[]::text[]),
 	d.override_env, d.override_env_secrets,
-	coalesce(d.override_port, 0), d.override_healthcheck`
+	coalesce(d.override_port, 0), d.override_healthcheck,
+	coalesce(d.sidecars, '[]'::jsonb)`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -8277,7 +8282,8 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.SourceURL, &d.CommitSHA,
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
-		&d.OverridePort, &d.OverrideHealthcheck); err != nil {
+		&d.OverridePort, &d.OverrideHealthcheck,
+		&d.Sidecars); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
@@ -8303,7 +8309,8 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.SourceURL, &d.CommitSHA,
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
-		&d.OverridePort, &d.OverrideHealthcheck); err != nil {
+		&d.OverridePort, &d.OverrideHealthcheck,
+		&d.Sidecars); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
@@ -8324,7 +8331,8 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 			&d.SourceURL, &d.CommitSHA,
 			&d.OverrideEntrypoint, &d.OverrideCmd,
 			&d.OverrideEnv, &d.OverrideEnvSecrets,
-			&d.OverridePort, &d.OverrideHealthcheck); err != nil {
+			&d.OverridePort, &d.OverrideHealthcheck,
+			&d.Sidecars); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)
@@ -8661,6 +8669,29 @@ func nullAppStatus(p *AppStatus) any {
 func nullJSONRaw(b json.RawMessage) any {
 	if len(b) == 0 {
 		return nil
+	}
+	return b
+}
+
+// notNullEmptyJSONRaw is the sidecar-shape variant of nullJSONRaw
+// (issue #463 / ADR-066 / migration 00095). The `deployments.sidecars`
+// column is jsonb NOT NULL DEFAULT '[]'::jsonb, so an explicit NULL
+// parameter at INSERT would 23502-fail (DEFAULT only applies to
+// columns not mentioned in the column list). This helper converts
+// an empty json.RawMessage to the literal `'[]'::jsonb' string so
+// the wire value is a valid 0-sidecar payload that satisfies the
+// NOT NULL constraint. Non-empty bytes pass through verbatim (pgx
+// sends them as raw jsonb bytes).
+//
+// Why a literal string instead of a byte slice: pgx's jsonb codec
+// inspects the value's Go type — a `[]byte` is encoded as raw
+// bytes, but for a literal cast we need to drive the value through
+// the text protocol as a parameter. The string form is the smallest
+// ergonomic shape that both pgx and the Postgres jsonb parser
+// unambiguously accept.
+func notNullEmptyJSONRaw(b json.RawMessage) any {
+	if len(b) == 0 {
+		return "[]" // pgx encodes Go string as text → jsonb parser sees `[]`
 	}
 	return b
 }

@@ -698,6 +698,20 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
+	// Sidecars (issue #463 / ADR-066). Up to 2 stateless sidecars
+	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
+	// `deployments.sidecars` column (migration 00095). Field is
+	// json.RawMessage (NOT []api.Sidecar) so the state package
+	// does NOT import pkg/api — see pkg/api ↔ pkg/state cycle
+	// (memory: pkg-api-cannot-import-pkg-state). The decoder
+	// logic lives at the handler boundary (cmd/apid/handlers_deployments.go)
+	// where pkg/api and pkg/state meet. PR-A only persists the
+	// shape; PR-B threads the array into imaged's pull path and
+	// guest-init's supervise loop. env values are stored
+	// envelope-sealed (namespace="sidecar_env"); PR-B unseals
+	// transiently at the pull path (mirrors app_env_secret
+	// unseal at the same seam).
+	Sidecars json.RawMessage `json:"sidecars,omitempty"`
 }
 
 // Build is one build pipeline run for a deployment (spec §9). Builderd writes
