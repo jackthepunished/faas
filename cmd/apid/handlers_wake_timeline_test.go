@@ -83,7 +83,7 @@ func TestListWakeTimeline_HappyPath(t *testing.T) {
 			t.Errorf("event[%d].kind = %q, want %q (must be ordered at ASC)", i, e.Kind, wantKinds[i])
 		}
 	}
-	if !(resp.Events[0].At < resp.Events[1].At) {
+	if resp.Events[0].At >= resp.Events[1].At {
 		t.Errorf("at ordering broken: %s !< %s", resp.Events[0].At, resp.Events[1].At)
 	}
 }

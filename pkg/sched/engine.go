@@ -1226,7 +1226,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// "wake took N ms before failing" latency is computable
 		// without joining the legacy state_transition rows.
 		if e.events != nil {
-			e.events.Emit(context.Background(), events.BootFailed{
+			e.events.Emit(ctx, events.BootFailed{
 				EmitAt:     time.Now().UTC(),
 				WakeID:     bootInput.wakeID,
 				AppID:      bootInput.appID,
@@ -1290,7 +1290,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// the structured reason. Pairs with wake.boot_started under
 		// the same wake_id (the prior emit at the Phase 3 entry).
 		if e.events != nil {
-			e.events.Emit(context.Background(), events.BootFailed{
+			e.events.Emit(ctx, events.BootFailed{
 				EmitAt:     time.Now().UTC(),
 				WakeID:     bootInput.wakeID,
 				AppID:      bootInput.appID,
@@ -1352,9 +1352,10 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// differ from the planned `method` above when restore fell
 	// back to cold boot (the F-1 stale-snapshot path).
 	completedMethod := method
-	if out.Method == vmmdpb.WakeMethod_WAKE_COLD_BOOT {
+	switch out.Method {
+	case vmmdpb.WakeMethod_WAKE_COLD_BOOT:
 		completedMethod = "cold_boot"
-	} else if out.Method == vmmdpb.WakeMethod_WAKE_RESTORE {
+	case vmmdpb.WakeMethod_WAKE_RESTORE:
 		completedMethod = "restore"
 	}
 	if e.events != nil {

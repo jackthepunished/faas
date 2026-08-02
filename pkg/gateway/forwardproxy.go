@@ -176,6 +176,8 @@ func proxyStartFromContext(ctx context.Context) time.Time {
 // today). The buffered unary path was removed; the streaming path
 // handles small/short responses correctly because the bridge pipes
 // bytes through Go's bufio and never enforces a latency floor.
+//
+//nolint:unused // removed-from-API 5-arg wrapper; kept for the pre-PR-C test corpus. Future cleanup PR drops it.
 func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, t Target) {
 	fwdOnceWithEvents(w, r, nodes, log, t, nil)
 }
@@ -247,6 +249,8 @@ func fwdOnceWithEvents(w http.ResponseWriter, r *http.Request, nodes NodeClientL
 // test corpus compiling. New code should call
 // fwdStreamOnceWithEvents directly. A future cleanup PR will drop
 // this wrapper.
+//
+//nolint:unused // deprecated 5-arg wrapper; kept for the pre-PR-C test corpus. Future cleanup PR drops it.
 func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target) {
 	fwdStreamOnceWithEvents(w, r, cli, log, t, nil)
 }
