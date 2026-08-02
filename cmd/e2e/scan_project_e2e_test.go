@@ -13,19 +13,24 @@
 //     harness exercises them together.
 //
 //   - The repo-decomposition §4 fixture expectation: a tarball
-//     carrying compose + Procfile + fly.toml + convention dirs
-//     produces a 7-entry / 5-unique-name plan (api from compose,
-//     web/worker/cron from Procfile, faas-fixture from fly.toml,
-//     api + worker from convention services/); the (RootDir, Name)
-//     merge key keeps the two `api` and two `worker` entries
-//     separate but they collapse under the unique-name view.
-//     One managed entry (postgres db), tier=compose,
-//     can_apply=true on the Pro plan (5 unique apps under the 25
-//     cap, 1 cron under the 20 cap).
+//     carrying compose + Procfile + fly.toml + render.yaml +
+//     convention dirs produces an 8-entry / 6-unique-name plan
+//     (api from compose, web/worker from Procfile, faas-fixture
+//     from fly.toml, nightly cronJob from render.yaml, cron
+//     (Procfile class=job, no Schedule), api + worker from
+//     convention services/); the (RootDir, Name) merge key keeps
+//     the two `api` and two `worker` entries separate but they
+//     collapse under the unique-name view. One managed entry
+//     (postgres db), tier=compose, can_apply=true on the Pro
+//     plan (6 unique apps under the 25 cap, 1 cron under the
+//     20 cap). Only render.yaml's nightly carries a Schedule, so
+//     only nightly promotes to planCron — see the cron assertion
+//     in TestScanProject_MultiTierFixture_UnderQuota.
 //
 //   - The over-quota gate: Free plan returns `can_apply=false`
 //     and `crons_not_allowed=true` for the same fixture (Free
-//     cron cap is 0; the Procfile `cron:` line trips the gate).
+//     cron cap is 0; the render.yaml nightly cronJob trips the
+//     gate).
 //
 //   - The --only filter: posting `only=web,api` produces a
 //     2-workload plan while the managed entry remains visible
@@ -69,8 +74,9 @@ import (
 
 // scanProjectFixture returns the bytes of a multi-tier customer
 // tarball. The shape mirrors a `git archive` of a real backend
-// monorepo: three Tier 1 sources (compose + Procfile + fly.toml)
-// and two Tier 3 convention members (services/{api,worker}/Dockerfile).
+// monorepo: four Tier 1 sources (compose + Procfile + fly.toml +
+// render.yaml) and two Tier 3 convention members
+// (services/{api,worker}/Dockerfile).
 //
 // Convention detector notes (pkg/reposcan/convention.go):
 //   - The detector walks `services/`, `apps/`, `packages/`, `cmd/`
@@ -127,10 +133,25 @@ primary_region = "fra"
     port = 80
     handlers = ["http"]
 `
+	// render.yaml carries a CronJob that surfaces a real
+	// Schedule on the workload — this is the only detector
+	// (besides k8s CronJob + app.yaml + serverless.yml) that
+	// emits a non-empty Schedule, which is what the
+	// scan_service cron-promotion logic keys on. Procfile's
+	// `cron:` line does NOT carry a schedule expression
+	// (pkg/reposcan/procfile.go: detectProcfile never sets
+	// schedule); the workload gets class=job but no Schedule,
+	// so the scan service skips it in planCron construction.
+	const renderYAML = `cronJobs:
+  - name: nightly
+    schedule: "0 3 * * *"
+    command: bundle exec rake nightly
+`
 	files := map[string]string{
 		"docker-compose.yml":         composeYML,
 		"Procfile":                   procfile,
 		"fly.toml":                   flyTOML,
+		"render.yaml":                renderYAML,
 		"services/api/Dockerfile":    "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n",
 		"services/worker/Dockerfile": "FROM alpine:3.19\nCMD [\"./worker\"]\n",
 	}
@@ -239,20 +260,22 @@ func workloadNames(plan api.PlanResponse) []string {
 // TestScanProject_MultiTierFixture_UnderQuota pins the §4 fixture
 // expectation on the Pro plan (apps under cap, crons under cap).
 // The fixture trips every Tier 1 detector (compose + Procfile +
-// fly.toml) and the Tier 3 convention detector (services/{api,
-// worker}/Dockerfile). The plan surface carries 7 workload
-// entries:
+// fly.toml + render.yaml) and the Tier 3 convention detector
+// (services/{api,worker}/Dockerfile). The plan surface carries 8
+// workload entries:
 //
 //   - api          (compose, rootDir="")
 //   - api          (convention, rootDir="services/api")
-//   - cron         (Procfile, rootDir="")
+//   - cron         (Procfile, rootDir="", class=job, Schedule="")
 //   - faas-fixture (fly.toml, rootDir="")
+//   - nightly      (render.yaml cronJob, rootDir="", class=job,
+//     Schedule="0 3 * * *")
 //   - web          (Procfile, rootDir="")
 //   - worker       (Procfile, rootDir="")
 //   - worker       (convention, rootDir="services/worker")
 //
-// Unique workload Names (5): api, cron, faas-fixture, web, worker.
-// Plus the postgres db managed entry and tier=compose.
+// Unique workload Names (6): api, cron, faas-fixture, nightly,
+// web, worker. Plus the postgres db managed entry and tier=compose.
 //
 // The (RootDir, Name) merge key keeps the two `api` and two
 // `worker` entries separate — see pkg/reposcan/scan.go Workload.Key.
@@ -290,27 +313,31 @@ func TestScanProject_MultiTierFixture_UnderQuota(t *testing.T) {
 	if plan.CronsNotAllowed {
 		t.Errorf("CronsNotAllowed = true on Pro plan; cron cap is %d", plan.LimitCrons)
 	}
-	wantNames := []string{"api", "cron", "faas-fixture", "web", "worker"}
+	wantNames := []string{"api", "cron", "faas-fixture", "nightly", "web", "worker"}
 	if got := workloadNames(plan); !equalStrings(got, wantNames) {
 		t.Errorf("workload names mismatch:\n got: %v\nwant: %v", got, wantNames)
 	}
-	// Per-workload field spot checks. WorkloadName-based map dedupes
-	// across (RootDir, Name) merge-key collisions; the canonical
-	// field expectation lands on the compose / Procfile entry
-	// because they're the first emitted under reposcan's stable
-	// sort. Compose's `api` has rootDir=""; the convention `api`
-	// is a separate entry the test asserts the count on above.
-	byName := map[string]api.PlanWorkload{}
+	// Per-workload field spot checks. Key by (RootDir, Name) so
+	// the (RootDir="", Name="api") compose entry and the
+	// (RootDir="services/api", Name="api") convention entry stay
+	// distinct — both surfaces are load-bearing for different
+	// assertions below.
+	byKey := map[string]api.PlanWorkload{}
 	for _, w := range plan.Workloads {
-		byName[w.Name] = w
+		byKey[w.RootDir+"\x00"+w.Name] = w
 	}
-	if w := byName["api"]; w.Class != "unknown" || len(w.Ports) != 1 || w.Ports[0] != 8080 {
-		t.Errorf("api workload = %+v; want class=unknown, ports=[8080]", w)
+	composeAPI := byKey["\x00api"]
+	if composeAPI.Class != "unknown" || len(composeAPI.Ports) != 1 || composeAPI.Ports[0] != 8080 {
+		t.Errorf("compose api workload = %+v; want class=unknown, ports=[8080]", composeAPI)
 	}
-	if w := byName["cron"]; w.Class != "job" {
+	conventionAPI := byKey["services/api\x00api"]
+	if conventionAPI.Class != "unknown" || len(conventionAPI.Ports) != 0 {
+		t.Errorf("convention api workload = %+v; want class=unknown, ports=[]", conventionAPI)
+	}
+	if w := byKey["\x00cron"]; w.Class != "job" {
 		t.Errorf("cron workload class = %q, want job", w.Class)
 	}
-	if w := byName["web"]; w.Class != "http" || len(w.Command) == 0 {
+	if w := byKey["\x00web"]; w.Class != "http" || len(w.Command) == 0 {
 		t.Errorf("web workload = %+v; want class=http, non-empty Command", w)
 	}
 	// Managed: exactly the postgres db from compose.image:.
@@ -318,20 +345,25 @@ func TestScanProject_MultiTierFixture_UnderQuota(t *testing.T) {
 		plan.Managed[0].Kind != "postgres" || plan.Managed[0].EnvHint != "DATABASE_URL" {
 		t.Errorf("managed = %+v; want single entry {db, postgres, DATABASE_URL}", plan.Managed)
 	}
-	// Crons: the Procfile cron row gets a planCron entry with the
-	// workload name, schedule "" (Procfile does not carry an
-	// expression), and path "/". Workload class is "job".
+	// Crons: the render.yaml nightly cronJob is the only entry
+	// that carries a Schedule, so the scan_service cron-promotion
+	// loop picks it up. Procfile's `cron:` line has class=job
+	// but Schedule="" (no expression) and is therefore skipped at
+	// scan_service.go:234 — that's expected behaviour, not a bug.
 	var sawCron bool
 	for _, c := range plan.Crons {
-		if c.WorkloadName == "cron" {
+		if c.WorkloadName == "nightly" {
 			sawCron = true
+			if c.Schedule != "0 3 * * *" {
+				t.Errorf("cron schedule = %q, want \"0 3 * * *\"", c.Schedule)
+			}
 			if !c.Enabled || c.Path != "/" {
 				t.Errorf("cron planCron = %+v; want Enabled=true Path=/", c)
 			}
 		}
 	}
 	if !sawCron {
-		t.Errorf("expected planCron entry for workload_name=cron; got: %+v", plan.Crons)
+		t.Errorf("expected planCron entry for workload_name=nightly; got: %+v", plan.Crons)
 	}
 	if plan.PlanToken == "" {
 		t.Errorf("PlanToken empty; scan service must mint a token even on the dry-run path")
