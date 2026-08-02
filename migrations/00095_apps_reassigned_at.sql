@@ -1,12 +1,12 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00092_apps_reassigned_at.sql
+-- filename: 00095_apps_reassigned_at.sql
 --
 -- Tier A4 — durable cooldown timestamp for cross-node app
 -- reassignment (ADR-064, follow-up to ADR-062).
 --
--- Pre-00092 the apps table has no reassigned_at column: once
+-- Pre-00095 the apps table has no reassigned_at column: once
 -- apps.node_id is set by the Phase-2 / Gate A claim path
 -- (migration 00091), it is immutable. Tier A4's rebalancer
 -- (pkg/sched/rebalancer.go) reassigns active/evicted_cold apps
@@ -29,7 +29,7 @@
 -- (reassigned_at <= now() + interval '1 minute'); values
 -- clearly in the future still error loud.
 --
--- No backfill: the column is nullable, and pre-00092 rows
+-- No backfill: the column is nullable, and pre-00095 rows
 -- are the legacy "never reassigned" state, which the
 -- rebalancer reads as "always eligible".
 --

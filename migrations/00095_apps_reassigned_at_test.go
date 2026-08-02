@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00092 (apps.reassigned_at + the
+// Migration-apply tests for 00095 (apps.reassigned_at + the
 // apps_reassigned_at_chk clock-skew CHECK + the partial
 // index apps_reassigned_at_idx, Tier A4 cross-node app
 // rebalance, ADR-064).
@@ -50,14 +50,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00092_1_ColumnShape pins the apps.reassigned_at
-// column shape after 00092 applies. data_type='timestamp with
+// TestMigration_00095_1_ColumnShape pins the apps.reassigned_at
+// column shape after 00095 applies. data_type='timestamp with
 // time zone' + is_nullable='YES'. Any drift (e.g. someone
 // tightening NOT NULL, or typing text instead of timestamptz)
 // fails loud — the rebalancer relies on the column being
 // nullable so a fresh INSERT with no reassignment history
 // succeeds.
-func TestMigration_00092_1_ColumnShape(t *testing.T) {
+func TestMigration_00095_1_ColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -82,13 +82,13 @@ func TestMigration_00092_1_ColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00092_2_AllowsNull pins the never-reassigned
+// TestMigration_00095_2_AllowsNull pins the never-reassigned
 // case. INSERT a row with reassigned_at = NULL; SELECT it
 // back; assert NULL round-trips. The rebalancer's
 // ListOrphanedApps filter explicitly returns NULL rows so a
 // never-reassigned orphaned app is always eligible for
 // reassignment on the first drain event.
-func TestMigration_00092_2_AllowsNull(t *testing.T) {
+func TestMigration_00095_2_AllowsNull(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -116,7 +116,7 @@ func TestMigration_00092_2_AllowsNull(t *testing.T) {
 		insert into apps (id, account_id, slug, type, ram_mb,
 		                  max_concurrency, idle_timeout_s, status,
 		                  node_id, reassigned_at, created_at)
-		values ($1, $2, $3, 'function', 128, 1, 30, 'parked',
+		values ($1, $2, $3, 'function', 128, 1, 30, 'active',
 		        $4, NULL, now())
 	`, appID, accountID, "rebal-null-"+accountID[:8], nodeID); err != nil {
 		t.Fatalf("insert app with reassigned_at = NULL: %v", err)
@@ -133,12 +133,12 @@ func TestMigration_00092_2_AllowsNull(t *testing.T) {
 	}
 }
 
-// TestMigration_00092_3_AllowsPastTimestamp pins the
+// TestMigration_00095_3_AllowsPastTimestamp pins the
 // normal post-reassignment case. UPDATE the app's
 // reassigned_at to now() - 1 hour; the row must round-trip.
 // The CHECK tolerates any timestamp in the past — no upper
 // bound is enforced except the clock-skew window.
-func TestMigration_00092_3_AllowsPastTimestamp(t *testing.T) {
+func TestMigration_00095_3_AllowsPastTimestamp(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -165,7 +165,7 @@ func TestMigration_00092_3_AllowsPastTimestamp(t *testing.T) {
 		insert into apps (id, account_id, slug, type, ram_mb,
 		                  max_concurrency, idle_timeout_s, status,
 		                  node_id, reassigned_at, created_at)
-		values ($1, $2, $3, 'function', 128, 1, 30, 'parked',
+		values ($1, $2, $3, 'function', 128, 1, 30, 'active',
 		        $4, now() - interval '1 hour', now())
 	`, appID, accountID, "rebal-past-"+accountID[:8], nodeID); err != nil {
 		t.Fatalf("insert app with past reassigned_at: %v", err)
@@ -182,14 +182,14 @@ func TestMigration_00092_3_AllowsPastTimestamp(t *testing.T) {
 	}
 }
 
-// TestMigration_00092_4_RejectsFutureTimestamp pins the
+// TestMigration_00095_4_RejectsFutureTimestamp pins the
 // clock-skew guard. UPDATE the app's reassigned_at to
 // now() + 1 hour (clearly past the CHECK's +1 minute
 // tolerance); the row must fail 23514. The CHECK is the
 // tripwire for a misconfigured clock or a buggy write
 // path that would otherwise pin an app's cooldown far in
 // the future.
-func TestMigration_00092_4_RejectsFutureTimestamp(t *testing.T) {
+func TestMigration_00095_4_RejectsFutureTimestamp(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -218,7 +218,7 @@ func TestMigration_00092_4_RejectsFutureTimestamp(t *testing.T) {
 		insert into apps (id, account_id, slug, type, ram_mb,
 		                  max_concurrency, idle_timeout_s, status,
 		                  node_id, reassigned_at, created_at)
-		values ($1, $2, $3, 'function', 128, 1, 30, 'parked',
+		values ($1, $2, $3, 'function', 128, 1, 30, 'active',
 		        $4, now() + interval '1 hour', now())
 	`, uuid.NewString(), accountID, "rebal-future-"+accountID[:8], nodeID)
 	if err == nil {
@@ -230,7 +230,7 @@ func TestMigration_00092_4_RejectsFutureTimestamp(t *testing.T) {
 	}
 }
 
-// TestMigration_00092_5_PartialIndex pins the partial-index
+// TestMigration_00095_5_PartialIndex pins the partial-index
 // shape. apps_reassigned_at_idx must exist as a btree index
 // over (reassigned_at) with a WHERE reassigned_at IS NOT
 // NULL predicate. The "NULL excluded" predicate is
@@ -239,7 +239,7 @@ func TestMigration_00092_4_RejectsFutureTimestamp(t *testing.T) {
 // cooldown"; a NULL app is always eligible so it must never
 // appear in the index). Drop the predicate and the index
 // would balloon to every app row.
-func TestMigration_00092_5_PartialIndex(t *testing.T) {
+func TestMigration_00095_5_PartialIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -279,12 +279,12 @@ func TestMigration_00092_5_PartialIndex(t *testing.T) {
 	}
 }
 
-// TestMigration_00092_6_ReplaySafe pins the idempotency
+// TestMigration_00095_6_ReplaySafe pins the idempotency
 // contract. A second MigrateUp() returns nil — every ADD
 // COLUMN is IF NOT EXISTS, every constraint add is paired
 // with a DROP IF EXISTS in the down block, every index add
 // is paired with DROP INDEX IF EXISTS (PR #377 / ADR-041).
-func TestMigration_00092_6_ReplaySafe(t *testing.T) {
+func TestMigration_00095_6_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -297,13 +297,13 @@ func TestMigration_00092_6_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00092_7_DownSymmetry pins the down path.
+// TestMigration_00095_7_DownSymmetry pins the down path.
 // Drive the SQL the down body carries directly, then re-
 // apply the up body and assert the column + CHECK + index
 // come back. A non-symmetric down would leave a broken
-// schema on a release that needs to roll back 00092 in
+// schema on a release that needs to roll back 00095 in
 // isolation.
-func TestMigration_00092_7_DownSymmetry(t *testing.T) {
+func TestMigration_00095_7_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()

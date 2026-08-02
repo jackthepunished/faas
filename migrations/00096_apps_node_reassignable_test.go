@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00093
+// Migration-apply tests for 00096
 // (apps_node_id_status_partial_idx, Tier A4 cross-node app
 // rebalance, ADR-064).
 //
@@ -38,13 +38,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00093_1_IndexExists pins the index presence.
+// TestMigration_00096_1_IndexExists pins the index presence.
 // apps_node_id_status_partial_idx must be visible in
-// pg_indexes after 00093 applies. A missing index would
+// pg_indexes after 00096 applies. A missing index would
 // leave the rebalancer's hot query doing a full apps scan,
 // which is fine on a 50-app fleet but breaks down on a
 // 50,000-app fleet with frequent drain events.
-func TestMigration_00093_1_IndexExists(t *testing.T) {
+func TestMigration_00096_1_IndexExists(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -64,12 +64,12 @@ func TestMigration_00093_1_IndexExists(t *testing.T) {
 	}
 }
 
-// TestMigration_00093_2_PartialPredicate pins the index
+// TestMigration_00096_2_PartialPredicate pins the index
 // shape. pg_get_indexdef must contain the partial predicate
 //
 //	WHERE (((node_id IS NOT NULL) AND
-//	        (status = ANY (ARRAY['parked'::text,
-//	                             'stopped'::text]))))
+//	        (status = ANY (ARRAY['active'::text,
+//	                             'evicted_cold'::text]))))
 //
 // Postgres' indexdef formatting is version-stable (the
 // pg_get_indexdef contract has not changed since 9.0), but
@@ -82,7 +82,7 @@ func TestMigration_00093_1_IndexExists(t *testing.T) {
 //	    WHERE (((node_id IS NOT NULL) AND
 //	            (status = ANY (ARRAY['active'::text,
 //	                                 'evicted_cold'::text]))))
-func TestMigration_00093_2_PartialPredicate(t *testing.T) {
+func TestMigration_00096_2_PartialPredicate(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -117,11 +117,11 @@ func TestMigration_00093_2_PartialPredicate(t *testing.T) {
 	}
 }
 
-// TestMigration_00093_3_ReplaySafe pins the idempotency
+// TestMigration_00096_3_ReplaySafe pins the idempotency
 // contract. A second MigrateUp() returns nil — CREATE INDEX
 // IF NOT EXISTS paired with DROP INDEX IF EXISTS in the
 // down block (PR #377 / ADR-041).
-func TestMigration_00093_3_ReplaySafe(t *testing.T) {
+func TestMigration_00096_3_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -134,12 +134,12 @@ func TestMigration_00093_3_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00093_4_DownSymmetry pins the down path.
+// TestMigration_00096_4_DownSymmetry pins the down path.
 // Drive the SQL the down body carries directly, then re-
 // apply the up body and assert the index comes back. A
 // non-symmetric down would leave a broken schema on a
-// release that needs to roll back 00093 in isolation.
-func TestMigration_00093_4_DownSymmetry(t *testing.T) {
+// release that needs to roll back 00096 in isolation.
+func TestMigration_00096_4_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -185,7 +185,7 @@ func TestMigration_00093_4_DownSymmetry(t *testing.T) {
 	}
 }
 
-// Migration 00093 has no schema change beyond the partial
+// Migration 00096 has no schema change beyond the partial
 // index — no round-trip fixture is needed. The four tests
 // above pin the index presence, predicate shape, replay
 // safety, and down symmetry.

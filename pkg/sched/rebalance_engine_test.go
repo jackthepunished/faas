@@ -491,14 +491,6 @@ func TestRebalanceOrphanedApps_EmitsRebalancedNotify(t *testing.T) {
 	}
 }
 
-// storeOrphanAll returns every app row, regardless of status.
-// Used by the engine tests to verify migrations without
-// re-implementing the MemStore walk.
-func storeOrphanAll(t *testing.T, store *state.MemStore) []state.App {
-	t.Helper()
-	return store.AllAppsForTest()
-}
-
 // countRebalancedNotifies returns the count of
 // db.NotifyAppChanged notifies whose payload contains
 // "rebalanced". Drops everything else (claimed, etc.).

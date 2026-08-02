@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00093_apps_node_reassignable.sql
+-- filename: 00096_apps_node_reassignable.sql
 --
 -- Tier A4 — partial composite index used by
 -- Store.ListOrphanedApps (ADR-064, follow-up to ADR-062).
@@ -31,13 +31,13 @@
 -- app row.
 --
 -- The reassigned_at filter is NOT indexed here — the
--- partial index from migration 00092
+-- partial index from migration 00095
 -- (apps_reassigned_at_idx WHERE reassigned_at IS NOT NULL)
 -- already covers that, and the rebalancer applies the
 -- cooldown predicate after the partial index narrows the
 -- candidate set. A query planner on a fleet of ≤ 50,000
 -- apps will use this index for the leading WHERE clause and
--- the 00092 index for the trailing cooldown filter.
+-- the 00095 index for the trailing cooldown filter.
 --
 -- Replay-safety: CREATE INDEX IF NOT EXISTS paired with
 -- DROP INDEX IF EXISTS in the down block (PR #377 /
