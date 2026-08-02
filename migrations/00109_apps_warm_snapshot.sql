@@ -1,4 +1,4 @@
--- filename: 00101_apps_warm_snapshot.sql
+-- filename: 00109_apps_warm_snapshot.sql
 -- +goose Up
 -- Issue #470 / ADR-055 — two-tier snapshot (init.snap + warm.snap) —
 -- per-app opt-in. Customers on Pro/Scale get the warm tier on by default

@@ -1,4 +1,4 @@
--- filename: 00102_snapshots_tier.sql
+-- filename: 00110_snapshots_tier.sql
 -- +goose Up
 -- Issue #470 / ADR-055 — snapshots get a tier column. Today every
 -- snapshot row is "init" (taken right after guest-init signals :8080
