@@ -1136,9 +1136,9 @@ func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, ma
 		args = append(args, maxPerTick)
 	}
 	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''),
-	               coalesce(i.guest_uid,0), coalesce(i.host_ip,''), i.ram_mb,
+	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
 	               i.started_at, i.last_request_at, i.parked_at,
-	               coalesce(i.node_id::text, ''), coalesce(i.wake_id, ''),
+	               coalesce(i.node_id::text, ''), i.wake_id,
 	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
 	          from instances i
 	         where i.state = 'running'` +
@@ -7802,16 +7802,32 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 // pointer to preserve the distinction between "fresh" and
 // "previously migrated". migrated_at is nullable for the same
 // reason. lease_token is also nullable.
+//
+// Single-call scan: pgx rejects a 16-column SELECT with a 13-dest
+// scan followed by a 3-dest scan — the row surface is one
+// contiguous column stream and each scan call must consume all
+// columns in one go. The base 13 fields are duplicated here
+// rather than split across two scan calls so the row descriptor
+// stays consistent across rows.
 func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
-	ins, err := scanInstanceCols(scan)
-	if err != nil {
-		return Instance{}, err
-	}
+	ins := Instance{}
+	var started, lastReq, parked *time.Time
 	var migFromStr *string
 	var migAtTime *time.Time
 	var leaseStr *string
-	if err := scan(&migFromStr, &migAtTime, &leaseStr); err != nil {
+	if err := scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
+		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID,
+		&migFromStr, &migAtTime, &leaseStr); err != nil {
 		return Instance{}, err
+	}
+	if started != nil {
+		ins.StartedAt = *started
+	}
+	if lastReq != nil {
+		ins.LastRequestAt = *lastReq
+	}
+	if parked != nil {
+		ins.ParkedAt = *parked
 	}
 	ins.MigratedFromNodeID = migFromStr
 	ins.MigratedAt = migAtTime
