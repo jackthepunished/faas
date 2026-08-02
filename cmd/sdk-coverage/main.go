@@ -259,9 +259,9 @@ var methodRouteMap = map[string]string{
 	// uses a hyphen. Pin the verb here so the gate stays the SDK's
 	// source of truth on verb choice, matching the trusted_signers
 	// pattern above.
-	"GET /v1/apps/{slug}/registry-credentials":          "ListAppRegistryCredentials",
-	"PUT /v1/apps/{slug}/registry-credentials":          "SetAppRegistryCredential",
-	"DELETE /v1/apps/{slug}/registry-credentials":       "DeleteAppRegistryCredential",
+	"GET /v1/apps/{slug}/registry-credentials":    "ListAppRegistryCredentials",
+	"PUT /v1/apps/{slug}/registry-credentials":    "SetAppRegistryCredential",
+	"DELETE /v1/apps/{slug}/registry-credentials": "DeleteAppRegistryCredential",
 }
 
 func main() {
