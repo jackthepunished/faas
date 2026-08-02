@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00101 (instances.migrated_from_node_id +
+// Migration-apply tests for 00103 (instances.migrated_from_node_id +
 // instances.migrated_at + instances.lease_token +
 // instances_migrated_at_chk + instances_migrated_from_node_id_idx,
 // Tier A5 cross-node live-instance migration, ADR-065, follow-up
@@ -66,13 +66,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00101_1_ColumnShape pins the schema of the
-// three new instances columns after 00101 applies. A regression
+// TestMigration_00103_1_ColumnShape pins the schema of the
+// three new instances columns after 00103 applies. A regression
 // (e.g. tightening NOT NULL on migrated_from_node_id, or
 // typing lease_token as integer) fails loud here — the engine
 // relies on all three being nullable at insert time (a fresh
 // instance has no migration history yet).
-func TestMigration_00101_1_ColumnShape(t *testing.T) {
+func TestMigration_00103_1_ColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -120,13 +120,13 @@ func TestMigration_00101_1_ColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_2_AllowsNull pins the never-migrated
+// TestMigration_00103_2_AllowsNull pins the never-migrated
 // case. INSERT an instance row with all three new columns
 // NULL; SELECT it back; assert NULL round-trips. The engine's
 // hot path (Phase 1 of the four-phase handoff) writes the
 // columns only after a successful snapshot; a fresh instance
 // must stay NULLable so the cold INSERT path is unchanged.
-func TestMigration_00101_2_AllowsNull(t *testing.T) {
+func TestMigration_00103_2_AllowsNull(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -202,12 +202,12 @@ func TestMigration_00101_2_AllowsNull(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_3_AllowsPastTimestamp pins the normal
+// TestMigration_00103_3_AllowsPastTimestamp pins the normal
 // post-migration case. UPDATE an instance's migrated_at to
 // now() - 1 hour; the row must round-trip. The CHECK tolerates
 // any timestamp in the past — no upper bound is enforced except
 // the clock-skew window.
-func TestMigration_00101_3_AllowsPastTimestamp(t *testing.T) {
+func TestMigration_00103_3_AllowsPastTimestamp(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -292,14 +292,14 @@ func TestMigration_00101_3_AllowsPastTimestamp(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_4_RejectsFutureTimestamp pins the
+// TestMigration_00103_4_RejectsFutureTimestamp pins the
 // clock-skew guard. INSERT an instance with
 // migrated_at = now() + 1 hour (clearly past the CHECK's
 // +1 minute tolerance); the row must fail 23514. The CHECK
 // is the tripwire for a misconfigured clock or a buggy write
 // path that would otherwise pin an instance's lineage far in
 // the future.
-func TestMigration_00101_4_RejectsFutureTimestamp(t *testing.T) {
+func TestMigration_00103_4_RejectsFutureTimestamp(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -356,14 +356,14 @@ func TestMigration_00101_4_RejectsFutureTimestamp(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_5_FKOnDelete pins the ON DELETE SET NULL
+// TestMigration_00103_5_FKOnDelete pins the ON DELETE SET NULL
 // behavior. Insert an instance pointing at a compute_node;
 // delete the compute_node; the instance row stays but its
 // migrated_from_node_id flips to NULL. The alternative —
 // CASCADE — would silently delete every instance row whose
 // node was ever decommissioned, which is unacceptable for a
 // historical lineage column.
-func TestMigration_00101_5_FKOnDelete(t *testing.T) {
+func TestMigration_00103_5_FKOnDelete(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -455,7 +455,7 @@ func TestMigration_00101_5_FKOnDelete(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_6_PartialIndex pins the partial-index
+// TestMigration_00103_6_PartialIndex pins the partial-index
 // shape. instances_migrated_from_node_id_idx must exist as a
 // btree over (migrated_from_node_id) with a WHERE
 // migrated_from_node_id IS NOT NULL predicate. The "NOT NULL"
@@ -463,7 +463,7 @@ func TestMigration_00101_5_FKOnDelete(t *testing.T) {
 // the index (the dashboard's "fleet migrated-from" panel scans
 // non-NULL rows only). Drop the predicate and the index
 // would balloon to every instance row.
-func TestMigration_00101_6_PartialIndex(t *testing.T) {
+func TestMigration_00103_6_PartialIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -505,12 +505,12 @@ func TestMigration_00101_6_PartialIndex(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_7_ReplaySafe pins the idempotency
+// TestMigration_00103_7_ReplaySafe pins the idempotency
 // contract. A second MigrateUp() returns nil — every ADD
 // COLUMN is IF NOT EXISTS, every constraint add is paired
 // with DROP IF EXISTS, every index add is paired with DROP
 // INDEX IF EXISTS (PR #377 / ADR-041).
-func TestMigration_00101_7_ReplaySafe(t *testing.T) {
+func TestMigration_00103_7_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -523,13 +523,13 @@ func TestMigration_00101_7_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00101_8_DownSymmetry pins the down path.
+// TestMigration_00103_8_DownSymmetry pins the down path.
 // Drive the SQL the down body carries directly, then re-
 // apply the up body and assert the columns + CHECK + index
 // come back. A non-symmetric down would leave a broken
-// schema on a release that needs to roll back 00101 in
+// schema on a release that needs to roll back 00103 in
 // isolation.
-func TestMigration_00101_8_DownSymmetry(t *testing.T) {
+func TestMigration_00103_8_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()

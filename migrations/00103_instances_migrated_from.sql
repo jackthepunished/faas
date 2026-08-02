@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00101_instances_migrated_from.sql
+-- filename: 00103_instances_migrated_from.sql
 --
 -- Tier A5 — additive migration lineage columns on `instances`
 -- (ADR-065 cross-node live-instance migration, follow-up to

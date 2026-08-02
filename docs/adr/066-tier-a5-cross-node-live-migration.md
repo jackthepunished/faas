@@ -179,7 +179,7 @@ deleted.
 
 ### Storage + indexes
 
-Migration `00101_instances_migrated_from.sql`:
+Migration `00103_instances_migrated_from.sql`:
 
 ```sql
 alter table instances
@@ -206,7 +206,7 @@ rows even on a busy fleet. The full unique index on
 `instances.node_id` already covers the
 `ListLiveInstancesOnNode` read path.
 
-Migration `00102_apps_migrated_at.sql`:
+Migration `00104_apps_migrated_at.sql`:
 
 ```sql
 alter table apps
@@ -302,11 +302,11 @@ typo doesn't silently fall back to the api.* default.
   gate; the unit tests pin the Store surface).
 - `pkg/sched/live_migrator_test.go` — table-driven
   watcher tests parallel to `rebalancer_test.go`.
-- `migrations/00101_instances_migrated_from_test.go` —
+- `migrations/00103_instances_migrated_from_test.go` —
   8 cases (column shape, null/past/future timestamp
   checks, FK on-delete cascade, partial index,
   replay-safe, down-symmetry).
-- `migrations/00102_apps_migrated_at_test.go` — 6
+- `migrations/00104_apps_migrated_at_test.go` — 6
   cases.
 
 ### Open follow-ups (deliberately deferred)
