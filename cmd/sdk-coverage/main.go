@@ -194,6 +194,14 @@ var methodRouteMap = map[string]string{
 	"GET /v1/audit-events":      "ListAuditEvents",
 	"GET /v1/audit-events/{id}": "GetAuditEvent",
 
+	// Issue #517 / PR-C / ADR-064 — wake timeline. The route is a
+	// sub-resource of /v1/apps/{slug}/wakes/{wake_id}/timeline; the
+	// auto-derivation would produce "GetAppsSlugWakesWake-idTimeline"
+	// (literal hyphens preserved in the path segment). The explicit
+	// map drops the path-separator noise and conforms to the SDK's
+	// flat verb naming.
+	"GET /v1/apps/{slug}/wakes/{wake_id}/timeline": "ListWakeTimeline",
+
 	// ADR-050 Phase 3 — repo decomposition. The two routes take
 	// multipart bodies so the SDK verb is named after the action
 	// (scan / apply) rather than the resource noun. The auto-

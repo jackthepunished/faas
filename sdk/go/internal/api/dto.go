@@ -696,6 +696,39 @@ type ListAuditEventsResponse struct {
 	Limit  int                  `json:"limit"`
 }
 
+// WakeTimelineEvent is one frame in the canonical wake timeline
+// (issue #517 / PR-C / ADR-064). The SDK treats Data as a generic
+// map (the canonical vocabulary — queue_accepted, admitted,
+// boot_started, boot_completed, boot_failed, readiness_200,
+// proxy_first_byte, park_started, park_completed, stalled,
+// build_succeeded, build_failed, deploy_failed — is documented in
+// ADR-064; a typed accessor that downcasts the Data map is
+// straightforward but not provided here to keep the SDK surface
+// schematic).
+//
+// At is RFC 3339 with nanosecond precision so frames that land in
+// the same wall-clock second still preserve at-ordering in
+// lexicographic string compare (the handler orders at ASC, oldest
+// first).
+type WakeTimelineEvent struct {
+	At    string         `json:"at"`
+	Kind  string         `json:"kind"`
+	Actor string         `json:"actor"`
+	Data  map[string]any `json:"data"`
+}
+
+// WakeTimelineResponse is the wire shape for
+// GET /v1/apps/{slug}/wakes/{wake_id}/timeline. NextCursor is the
+// last row's `at` formatted as RFC 3339 Nano — the caller passes
+// it back as ?since= to read the next page.
+type WakeTimelineResponse struct {
+	WakeID     string              `json:"wake_id"`
+	AppID      string              `json:"app_id"`
+	Events     []WakeTimelineEvent `json:"events"`
+	NextCursor string              `json:"next_cursor,omitempty"`
+	Limit      int                 `json:"limit"`
+}
+
 // AppMetricsResponse is the per-app metrics payload returned by
 // GET /v1/apps/{slug}/metrics?range= (issue #273 / ADR-042). Field-
 // for-field mirror of pkg/api.AppMetricsResponse — the SDK parity
