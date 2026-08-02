@@ -82,7 +82,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'ghcr.io', 'alice', '\x0001020304050607'::bytea)
+		        'ghcr.io', 'alice', decode('0001020304050607', 'hex'))
 	`); err != nil {
 		t.Fatalf("insert credential: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        '', 'alice', '\x00\x01')
+		        '', 'alice', decode('0001', 'hex'))
 	`); err == nil {
 		t.Errorf("insert with empty registry: got no error; want CHECK violation")
 	}
@@ -127,7 +127,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'ghcr.io', '', '\x00\x01')
+		        'ghcr.io', '', decode('0001', 'hex'))
 	`); err == nil {
 		t.Errorf("insert with empty username: got no error; want CHECK violation")
 	}
@@ -153,7 +153,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'ghcr.io', 'alice', '\x99\x99')
+		        'ghcr.io', 'alice', decode('9999', 'hex'))
 	`); err == nil {
 		t.Errorf("duplicate (app_id, registry) insert: got no error; want UNIQUE violation")
 	}
@@ -165,15 +165,26 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'registry.gregale.dev', 'bob', '\x00\x01')
+		        'registry.gregale.dev', 'bob', decode('0001', 'hex'))
 	`); err != nil {
 		t.Errorf("second registry on same app: %v (UNIQUE should allow different registry)", err)
 	}
 
-	// (9) FK cascade on account delete. Seed a separate account + app +
-	// cred so we don't tear down the rows from the previous steps that
-	// other tests might rely on (this file is the only consumer in
-	// practice, but defence in depth).
+	// (9) FK cascade on app delete. The migration declares
+	// `app_id ... REFERENCES apps(id) ON DELETE CASCADE`, so dropping
+	// the app should drop its credentials transitively. Seed a
+	// separate account + app + cred so we don't tear down the rows
+	// from the previous steps that other tests might rely on (this
+	// file is the only consumer in practice, but defence in depth).
+	//
+	// Note: we deliberately cascade via APP delete, not ACCOUNT delete.
+	// `apps.account_id` is NOT cascade (00001_init.sql:32) — it has a
+	// plain FK — so the account path is not a cascade. The credential's
+	// own FK on `account_id` IS cascade (mirrors `app_secrets`), so
+	// account delete would also cascade via the account_id FK IF the
+	// app were already gone. Verifying the app-delete path is the more
+	// meaningful contract: it proves the credential's app_id FK is
+	// configured correctly, which is the only FK the migration owns.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
 		values ('00000000-0000-0000-0000-000000000294',
@@ -196,24 +207,24 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000294',
 		        '00000000-0000-0000-0000-000000000394',
-		        'ghcr.io', 'alice', '\x00\x01')
+		        'ghcr.io', 'alice', decode('0001', 'hex'))
 	`); err != nil {
 		t.Fatalf("insert cascade credential: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		delete from accounts where id = '00000000-0000-0000-0000-000000000294'
+		delete from apps where id = '00000000-0000-0000-0000-000000000394'
 	`); err != nil {
-		t.Fatalf("delete cascade account: %v", err)
+		t.Fatalf("delete cascade app: %v", err)
 	}
 	var cascadeCount int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from app_registry_credentials
-		where account_id = '00000000-0000-0000-0000-000000000294'
+		where app_id = '00000000-0000-0000-0000-000000000394'
 	`).Scan(&cascadeCount); err != nil {
 		t.Fatalf("count after cascade: %v", err)
 	}
 	if cascadeCount != 0 {
-		t.Errorf("cred rows after account cascade = %d, want 0 (ON DELETE CASCADE)", cascadeCount)
+		t.Errorf("cred rows after app cascade = %d, want 0 (ON DELETE CASCADE)", cascadeCount)
 	}
 
 	// (10) Replay safety: a second MigrateUp is a no-op (the migration
