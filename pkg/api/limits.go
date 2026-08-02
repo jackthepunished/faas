@@ -787,7 +787,7 @@ const (
 	MinScaleInCooldownS  = 5
 	MaxScaleInCooldownS  = 86400
 
-	// Tier A4 (cross-node app rebalance, ADR-063 follow-up to
+	// Tier A4 (cross-node app rebalance, ADR-064 follow-up to
 	// ADR-062): pacing + per-tick cap on pkg/sched/rebalancer.go.
 	//
 	// RebalanceCooldownSeconds is the minimum gap between two

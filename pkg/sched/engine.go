@@ -159,7 +159,7 @@ type Engine struct {
 	// pre-Phase-2 tests stay green.
 	ownerNodeID string
 
-	// rebalanceCooldownSeconds is the Tier A4 (ADR-063) cooldown
+	// rebalanceCooldownSeconds is the Tier A4 (ADR-064) cooldown
 	// between two successful reassignments of the same app. Default
 	// api.RebalanceCooldownSeconds = 60s; overridable via
 	// FAAS_REBALANCE_COOLDOWN_SECONDS -> WithRebalanceConfig.
@@ -370,7 +370,7 @@ func (e *Engine) WithAudit(a *audit.Auditor) *Engine {
 // single-box posture: the chooser picks freely across active
 // nodes. Safe to call concurrently with the wake path: reads
 // of e.ownerNodeID race only with the initial stamp.
-// WithRebalanceConfig overrides the Tier A4 (ADR-063)
+// WithRebalanceConfig overrides the Tier A4 (ADR-064)
 // rebalancer tunables for this Engine. Production defaults
 // are api.RebalanceCooldownSeconds=60 and
 // api.RebalanceMaxPerTickPerNode=50; schedd main reads
@@ -1435,9 +1435,9 @@ func (e *Engine) ClaimUnplaced(ctx context.Context, appID string) error {
 	return nil
 }
 
-// RebalanceOrphanedApps reassigns parked/stopped apps orphaned
+// RebalanceOrphanedApps reassigns active/evicted_cold apps orphaned
 // by a dead node to the local schedd's owner_node. Tier A4
-// (ADR-063). Triggered by the rebalancer watcher's
+// (ADR-064). Triggered by the rebalancer watcher's
 // compute_node_changed(active=false) handler; also invoked
 // once at schedd cold-start with deadNodeID="" to sweep apps
 // missed by a missed notify.
@@ -1600,10 +1600,12 @@ func (e *Engine) RebalanceOrphanedApps(ctx context.Context, deadNodeID string) e
 			}
 			// Non-conflict failures (network blip, FK
 			// violation, ErrNotFound on a soft-deleted
-			// app) surface as a Warn but do NOT halt the
-			// batch — the remaining apps still need a
-			// decision. Return the first one at the end so
-			// callers (the rebalancer watcher) can log it.
+			// app) surface as a per-app Warn but do NOT
+			// halt the batch — the remaining apps still
+			// need a decision. A non-conflict error on the
+			// last app of a batch is recoverable on the next
+			// compute_node_changed re-fire, so swallowing
+			// it (vs. returning) is the safer default.
 			e.log.Warn("sched: rebalance: reassign failed",
 				"app_id", app.ID, "from_node", app.NodeID,
 				"to_node", e.ownerNodeID, "err", err)

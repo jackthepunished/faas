@@ -583,8 +583,9 @@ type Store interface {
 	// empty-uuid CHECK on apps.node_id reject bad values via the
 	// existing 23503 / 23514 paths.
 	SetAppNodeID(ctx context.Context, appID, nodeID string) error
-	// ListOrphanedApps returns every parked/stopped app whose node_id
-	// points at a compute_node with active=false — the input set for
+	// ListOrphanedApps returns every active/evicted_cold app whose
+	// node_id points at a compute_node with active=false — the input
+	// set for
 	// schedd's rebalancer (pkg/sched/rebalancer.go, Tier A4 migration
 	// 00092). Used by both the live compute_node_changed watcher (which
 	// filters by deadNodeID in memory) and the cold-start sweep (which
@@ -603,7 +604,7 @@ type Store interface {
 	// UPDATE stamps reassigned_at = now() in the same statement so
 	// the two columns stay coherent. Returns ErrConflict on
 	// RowsAffected()==0 — peer already won the race, app moved to
-	// a non-parked/non-stopped status, or the row is gone. The
+	// a non-active/non-evicted_cold status, or the row is gone. The
 	// fromNodeID predicate is load-bearing: a peer-claim-then-
 	// second-peer-claim race never silently succeeds with a stale
 	// from-node.

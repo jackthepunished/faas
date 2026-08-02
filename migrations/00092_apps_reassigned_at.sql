@@ -4,12 +4,12 @@
 -- filename: 00092_apps_reassigned_at.sql
 --
 -- Tier A4 — durable cooldown timestamp for cross-node app
--- reassignment (ADR-063, follow-up to ADR-062).
+-- reassignment (ADR-064, follow-up to ADR-062).
 --
 -- Pre-00092 the apps table has no reassigned_at column: once
 -- apps.node_id is set by the Phase-2 / Gate A claim path
 -- (migration 00091), it is immutable. Tier A4's rebalancer
--- (pkg/sched/rebalancer.go) reassigns parked/stopped apps
+-- (pkg/sched/rebalancer.go) reassigns active/evicted_cold apps
 -- from a dead compute_node to a live peer via the conditional
 -- UPDATE in Store.ReassignAppOwner — but a flap-loop
 -- (operator toggles compute_nodes.active=false / true

@@ -2,7 +2,7 @@
 
 // Migration-apply tests for 00093
 // (apps_node_id_status_partial_idx, Tier A4 cross-node app
-// rebalance, ADR-063).
+// rebalance, ADR-064).
 //
 // Pins the Tier A4 partial-index contract verbatim:
 //

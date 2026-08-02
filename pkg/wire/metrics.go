@@ -584,7 +584,7 @@ type OpsMetrics struct {
 	// base-stage time (pkg/imaged/base_stage.go) and re-read on
 	// every cold-boot by vmmd.
 	imageScanVulns *prometheus.CounterVec
-	// rebalanceDecisions: Tier A4 / ADR-063 cross-node app
+	// rebalanceDecisions: Tier A4 / ADR-064 cross-node app
 	// rebalance observability. Counter labelled by outcome ∈
 	// {migrated, conflict, no_headroom, cooldown,
 	// no_eligibility} — the closed set the rebalancer's batch
@@ -639,7 +639,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"from_state", "to_state"})
 	rebalanceDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_rebalance_decisions_total",
-		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-063), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
+		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-064), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
 	}, []string{"outcome"})
 	eventsWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_events_write_failures_total",
@@ -1447,7 +1447,7 @@ func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter
 }
 
 // RebalanceDecisions returns the per-(outcome) counter the Tier
-// A4 cross-node rebalancer (ADR-063) increments once per app
+// A4 cross-node rebalancer (ADR-064) increments once per app
 // per drain-event. outcome ∈ {migrated, conflict, no_headroom,
 // cooldown, no_eligibility}. Same caching rules as
 // WatchdogKills — the returned Counter is safe to retain.

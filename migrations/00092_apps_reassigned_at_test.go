@@ -3,7 +3,7 @@
 // Migration-apply tests for 00092 (apps.reassigned_at + the
 // apps_reassigned_at_chk clock-skew CHECK + the partial
 // index apps_reassigned_at_idx, Tier A4 cross-node app
-// rebalance, ADR-063).
+// rebalance, ADR-064).
 //
 // Pins the Tier A4 schema contract verbatim:
 //

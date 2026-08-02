@@ -1,4 +1,4 @@
-// memstore_rebalance_helpers.go — Tier A4 (ADR-063) test
+// memstore_rebalance_helpers.go — Tier A4 (ADR-064) test
 // seams on *MemStore. These methods are exposed on the
 // concrete *MemStore type (NOT on the Store interface) so
 // the pkg/sched rebalance engine tests can craft fixtures

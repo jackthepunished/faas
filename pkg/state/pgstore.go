@@ -1036,12 +1036,12 @@ func (s *PgStore) ListOrphanedApps(ctx context.Context, cooldownSeconds, maxPerT
 // fromNodeID to toNodeID and stamps reassigned_at = now()
 // (Tier A4 / migration 00092). Closes the Phase-2
 // follow-up "apps pinned to a dead node" gap
-// (ADR-062 §"Open follow-ups"). The conditional UPDATE is
+// (ADR-064). The conditional UPDATE is
 //
 //	update apps
 //	   set node_id = $3, reassigned_at = now()
 //	 where id = $1 and node_id = $2
-//	   and status in ('parked', 'stopped')
+//	   and status in ('active', 'evicted_cold')
 //
 // The fromNodeID + status predicates are load-bearing:
 //   - fromNodeID: a peer-claim-then-second-peer-claim race

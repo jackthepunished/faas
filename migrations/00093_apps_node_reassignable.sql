@@ -4,14 +4,14 @@
 -- filename: 00093_apps_node_reassignable.sql
 --
 -- Tier A4 — partial composite index used by
--- Store.ListOrphanedApps (ADR-063, follow-up to ADR-062).
+-- Store.ListOrphanedApps (ADR-064, follow-up to ADR-062).
 --
 -- The rebalancer's hot query (pkg/sched/rebalancer.go,
 -- Store.ListOrphanedApps) joins apps to compute_nodes and
 -- filters
 --
 --   apps.node_id IS NOT NULL
---     AND apps.status IN ('parked', 'stopped')
+--     AND apps.status IN ('active', 'evicted_cold')
 --     AND NOT EXISTS (compute_nodes WHERE id = apps.node_id
 --                                       AND active = true)
 --     AND (apps.reassigned_at IS NULL

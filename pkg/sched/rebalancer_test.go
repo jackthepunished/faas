@@ -1,5 +1,5 @@
 // rebalancer_test.go — table-driven tests for Tier A4's
-// Rebalancer watcher (ADR-063). Pins the watcher contract
+// Rebalancer watcher (ADR-064). Pins the watcher contract
 // parallel to pkg/sched/router_watcher_test.go:
 //
 //   - active=false JSON payload → handle called once with the

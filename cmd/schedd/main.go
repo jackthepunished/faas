@@ -79,7 +79,7 @@ type runDeps struct {
 	// cold-start sweep still runs so an unplaced app from a prior
 	// run gets reconciled on boot.
 	subscribePlacementClaim func(context.Context, *pgxpool.Pool) (<-chan db.Notification, func(), error)
-	// subscribeRebalancer (Tier A4 / ADR-063) is the
+	// subscribeRebalancer (Tier A4 / ADR-064) is the
 	// producer-side seam for the compute_node_changed consumer
 	// that drains orphans from a freshly-inactive compute_node
 	// onto the local schedd. Mirrors subscribePlacementClaim's
@@ -154,11 +154,11 @@ func defaultDeps() runDeps {
 		subscribePlacementClaim: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
 			return db.Subscribe(ctx, p, []string{db.NotifyAppChanged})
 		},
-		// Tier A4 / ADR-063: subscribe to compute_node_changed
+		// Tier A4 / ADR-064: subscribe to compute_node_changed
 		// and let Rebalancer filter to active=false. The router
 		// watcher + nodekeys + nodeVerifier above already share
 		// the same channel; the rebalancer is the fourth
-		// consumer. Pre-commit review in ADR-063 §"Trigger" — a
+		// consumer. Pre-commit review in ADR-064 §"Trigger" — a
 		// single LISTEN shared by N subscribers is the canonical
 		// pattern (subscribers filter on the typed payload).
 		subscribeRebalancer: func(ctx context.Context, p *pgxpool.Pool) (<-chan db.Notification, func(), error) {
@@ -571,13 +571,43 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		go subscribeWithReconnect(ctx, "placement claim", log, deps.subscribePlacementClaim, pool, claimSub.Run)
 	}
 
-	// Tier A4 / ADR-063: rebalancer subscriber. Watches
+	// Tier A4 / ADR-064: rebalancer tunables. Read once at
+	// startup; panic on a malformed env (operator typo must
+	// surface at boot, not as silent api.* defaults that
+	// mask the typo at the next drain). Schedd main is the
+	// only place an operator-facing env override lives;
+	// every other limit stays a pkg/api/limits.go
+	// constant (CLAUDE.md hard limits policy). This block
+	// runs BEFORE the rebalancer goroutine + cold-start
+	// sweep below so an early drain event observes the
+	// tuned values, not the api.* defaults.
+	if v := os.Getenv("FAAS_REBALANCE_COOLDOWN_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_REBALANCE_COOLDOWN_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_REBALANCE_COOLDOWN_SECONDS: %s", v)
+		}
+		if v2 := os.Getenv("FAAS_REBALANCE_MAX_PER_TICK"); v2 != "" {
+			m, parseErr2 := strconv.Atoi(v2)
+			if parseErr2 != nil || m <= 0 {
+				return fmt.Errorf("FAAS_REBALANCE_MAX_PER_TICK: %s", v2)
+			}
+			engine.WithRebalanceConfig(n, m)
+		} else {
+			engine.WithRebalanceConfig(n, api.RebalanceMaxPerTickPerNode)
+		}
+	} else if v := os.Getenv("FAAS_REBALANCE_MAX_PER_TICK"); v != "" {
+		m, parseErr := strconv.Atoi(v)
+		if parseErr != nil || m <= 0 {
+			return fmt.Errorf("FAAS_REBALANCE_MAX_PER_TICK: %s", v)
+		}
+		engine.WithRebalanceConfig(api.RebalanceCooldownSeconds, m)
+	}
+
+	// Tier A4 / ADR-064: rebalancer subscriber. Watches
 	// compute_node_changed for active=false events and hands
 	// the dead node id to Engine.RebalanceOrphanedApps.
-	// Reads FAAS_REBALANCE_COOLDOWN_SECONDS +
-	// FAAS_REBALANCE_MAX_PER_TICK (envOr-style) before this
-	// block runs so the engine picks up the tunables before
-	// any drain event lands.
 	if deps.subscribeRebalancer != nil && ownerNodeID != "" {
 		reb := sched.NewRebalancer(
 			func(ctx context.Context, deadNodeID string) error {
@@ -615,7 +645,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	}()
 
-	// Tier A4 / ADR-063: rebalance cold-start sweep. Same
+	// Tier A4 / ADR-064: rebalance cold-start sweep. Same
 	// fire-and-forget-notify reasoning as the unplaced
 	// sweep above — a schedd that was down while a drain
 	// event landed missed the compute_node_changed active=
@@ -651,36 +681,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// through runDeps.heartbeatInterval to exercise the wiring.
 	hb := sched.NewHeartbeat(store, sched.HeartbeatDialerFunc(deps.dialVMM), vmmTLS, log).
 		WithOwnerNodeID(ownerNodeID)
-	// Tier A4 / ADR-063: rebalancer tunables. Read once at
-	// startup; panic on a malformed env (operator typo must
-	// surface at boot, not as silent api.* defaults that
-	// mask the typo at the next drain). Schedd main is the
-	// only place an operator-facing env override lives;
-	// every other limit stays a pkg/api/limits.go
-	// constant (CLAUDE.md hard limits policy).
-	if v := os.Getenv("FAAS_REBALANCE_COOLDOWN_SECONDS"); v != "" {
-		n, parseErr := strconv.Atoi(v)
-		if parseErr != nil || n <= 0 {
-			log.Error("FAAS_REBALANCE_COOLDOWN_SECONDS must be a positive integer",
-				"value", v)
-			return fmt.Errorf("FAAS_REBALANCE_COOLDOWN_SECONDS: %s", v)
-		}
-		if v2 := os.Getenv("FAAS_REBALANCE_MAX_PER_TICK"); v2 != "" {
-			m, parseErr2 := strconv.Atoi(v2)
-			if parseErr2 != nil || m <= 0 {
-				return fmt.Errorf("FAAS_REBALANCE_MAX_PER_TICK: %s", v2)
-			}
-			engine.WithRebalanceConfig(n, m)
-		} else {
-			engine.WithRebalanceConfig(n, api.RebalanceMaxPerTickPerNode)
-		}
-	} else if v := os.Getenv("FAAS_REBALANCE_MAX_PER_TICK"); v != "" {
-		m, parseErr := strconv.Atoi(v)
-		if parseErr != nil || m <= 0 {
-			return fmt.Errorf("FAAS_REBALANCE_MAX_PER_TICK: %s", v)
-		}
-		engine.WithRebalanceConfig(api.RebalanceCooldownSeconds, m)
-	}
 	hb.Interval = cfg.HeartbeatInterval
 	hb.Staleness = cfg.HeartbeatStaleness
 	if deps.heartbeatInterval > 0 {
