@@ -24,6 +24,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/fcvm/activity"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
@@ -101,6 +102,12 @@ type Server struct {
 	ops   *wire.OpsMetrics
 	fcVer string
 	log   *slog.Logger
+	// events (issue #517 / PR-C / ADR-064) is the wake-timeline
+	// fan-out. vmmd is the corroborating-observation source for
+	// wake.boot_started (mirror at the gRPC server boundary) and
+	// the canonical emit site for wake.readiness_200 (the first
+	// 2xx probe). nil opts out (pre-PR-C fixtures).
+	events *events.Platform
 	// cpuCache holds the per-instance rate + accumulator used by
 	// Stats() to populate cpu_pct and cpu_seconds on the wire
 	// (issue #279, PR-B). The cache is fed by a small sample loop
@@ -184,6 +191,45 @@ func NewWithCPUAndNetAndActivity(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string
 	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net, activity: act, migrations: newMigrationTracker()}
 }
 
+// WithEvents (issue #517 / PR-C / ADR-064) wires the wake-timeline
+// fan-out (pkg/events.Platform) on the gRPC server. vmmd is the
+// corroborating-observation source for wake.boot_started (mirror
+// at the gRPC server boundary) and the canonical emit site for
+// wake.readiness_200 (the first 2xx probe). Returns the receiver
+// to match the fluent setter pattern; nil opts out (pre-PR-C
+// fixtures).
+func (s *Server) WithEvents(p *events.Platform) *Server {
+	s.events = p
+	return s
+}
+
+// emitBootStartedMirror (issue #517 / PR-C / ADR-064) is the
+// vmmd-side mirror of wake.boot_started. Schedd is the canonical
+// source (the engine emits the row at the Phase 3 entry); vmmd's
+// mirror is a corroborating observation that the boot RPC
+// actually entered the FC bring-up path on this vmmd instance.
+// The wake_id is recovered from the wire envelope (PR-A), which
+// schedd stamped on the bootCtx before dialing vmmd. nil events
+// opts out (pre-PR-C fixtures).
+func (s *Server) emitBootStartedMirror(ctx context.Context, instanceID, method string) {
+	if s.events == nil {
+		return
+	}
+	var wakeID, appID string
+	if fields, ok := wire.FromContext(ctx); ok {
+		wakeID = fields.WakeID
+		appID = fields.AppID
+	}
+	s.events.Emit(ctx, events.BootStarted{
+		EmitAt:      time.Now().UTC(),
+		WakeID:      wakeID,
+		AppID:       appID,
+		InstanceID:  instanceID,
+		Method:      method,
+		RequestedAt: time.Now().UTC(), // best-effort stamp (vmmd doesn't have schedd's startedAt)
+	})
+}
+
 // ForgetCPU drops the cache baseline for an instance. Called from
 // the Destroy path so the cache does not grow unbounded across the
 // vmmd process lifetime. Safe on a nil receiver / nil cache.
@@ -235,6 +281,13 @@ func (s *Server) CreateFromSnapshot(ctx context.Context, req *vmmdpb.CreateFromS
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
+	// issue #517 / PR-C / ADR-064 — mirror wake.boot_started at
+	// the gRPC server boundary. Schedd is the canonical emit site;
+	// this vmmd-side mirror is a corroborating observation that
+	// the boot RPC actually entered the FC bring-up path. Both
+	// rows share the wake_id from the wire envelope (PR-A) so
+	// the customer-facing timeline endpoint can join them.
+	s.emitBootStartedMirror(ctx, req.GetInstance(), "restore")
 	inst, err := s.vmm.Wake(ctx, wr)
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
@@ -253,6 +306,11 @@ func (s *Server) CreateColdBoot(ctx context.Context, req *vmmdpb.CreateColdBootR
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
+	// issue #517 / PR-C / ADR-064 — mirror wake.boot_started at
+	// the gRPC server boundary. Same canonical-site pairing as
+	// CreateFromSnapshot: schedd is the source of truth, vmmd's
+	// mirror is a corroborating observation.
+	s.emitBootStartedMirror(ctx, req.GetInstance(), "cold_boot")
 	inst, err := s.vmm.Wake(ctx, wr)
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {

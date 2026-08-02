@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/netns"
 )
@@ -498,6 +499,13 @@ func (v *fakeVMM) SendStatelessAdvisory(_ context.Context, l Lease, appID string
 	})
 	return nil
 }
+
+// WithEvents (issue #517 / PR-C / ADR-064) is the no-op stub for
+// the VMM interface's events hook. The test corpus never reads
+// the events fan-out (the production cmd/vmmd wires a real
+// Platform); the stub keeps the interface satisfied without
+// wiring a Platform through every test seam.
+func (v *fakeVMM) WithEvents(_ *events.Platform) VMM { return v }
 
 // advisoryCall mirrors the VMM.SendStatelessAdvisory arguments so
 // the test can assert what the VMM saw.

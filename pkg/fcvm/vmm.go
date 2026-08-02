@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/storage"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // JailerVMM is the production VMM. It provisions a jail chroot, launches
@@ -67,6 +69,17 @@ type JailerVMM struct {
 	// Without this, the tmp files (in /tmp) outlive the chroot and leak
 	// across thousands of wakes on a busy box.
 	materialisedTmp map[string][]string
+	// events is the wake-timeline fan-out (issue #517 / PR-C /
+	// ADR-064). vmmd is the corroborating-observation source for
+	// wake.boot_started (mirror) and the canonical emit site for
+	// wake.readiness_200 (the first 2xx probe). nil opts out
+	// (pre-PR-C test fixtures).
+	events *events.Platform
+	// readinessStartedAt is the waitReady loop's start timestamp;
+	// captured before the probe loop so the readiness_200 payload
+	// can carry the elapsed_ms field. Reset on every waitReady
+	// call. lazy — populated by waitReady, not at construction.
+	readinessStartedAt time.Time
 }
 
 // instanceRecord tracks one firecracker child + build-specific options so
@@ -174,6 +187,16 @@ func NewJailerVMM(chrootBase string, readyTimeout time.Duration) *JailerVMM {
 // window).
 func (v *JailerVMM) WithStorage(s storage.StorageBackend) *JailerVMM {
 	v.storage = s
+	return v
+}
+
+// WithEvents stamps the wake-timeline fan-out (issue #517 / PR-C /
+// ADR-064) on the VMM. vmmd is the corroborating-observation source
+// for wake.boot_started (mirror at the gRPC server) and the
+// canonical emit site for wake.readiness_200 (the first 2xx probe).
+// Sibling of WithStorage — nil opts out (pre-PR-C fixtures).
+func (v *JailerVMM) WithEvents(p *events.Platform) VMM {
+	v.events = p
 	return v
 }
 
@@ -1365,6 +1388,11 @@ func (v *JailerVMM) ownChrootRoot(root string, l Lease) error {
 func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath string) error {
 	deadline := time.Now().Add(v.readyTimeout)
 	addr := net.JoinHostPort(l.HostIP.String(), "8080")
+	// issue #517 / PR-C / ADR-064 — stamp the readiness probe start
+	// so the wake.readiness_200 emit can carry the elapsed_ms
+	// field. Per-VMM, not per-call (the deadline is the same); the
+	// loop resets to the deadline at the top of every iteration.
+	v.readinessStartedAt = time.Now()
 
 	// Legacy TCP-accept — pre-PR-D contract. Byte-identical to the
 	// pre-PR-D loop.
@@ -1376,6 +1404,7 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 			conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 			if err == nil {
 				_ = conn.Close()
+				v.emitReadiness200(ctx, l, healthcheckPath, 1)
 				return nil
 			}
 			if time.Now().After(deadline) {
@@ -1390,6 +1419,7 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 	// every iteration. The host loop is bounded by ctx.Done() and
 	// the deadline.
 	client := v.healthcheckClient()
+	probeCount := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1397,7 +1427,9 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 		if time.Now().After(deadline) {
 			return fmt.Errorf("guest %s not ready (healthcheck %s) after %s", l.Instance, healthcheckPath, v.readyTimeout)
 		}
+		probeCount++
 		if ok, err := healthcheckProbe(ctx, client, addr, healthcheckPath); err == nil && ok {
+			v.emitReadiness200(ctx, l, healthcheckPath, probeCount)
 			return nil
 		}
 		select {
@@ -1406,6 +1438,37 @@ func (v *JailerVMM) waitReady(ctx context.Context, l Lease, healthcheckPath stri
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// emitReadiness200 (issue #517 / PR-C / ADR-064) is the canonical
+// wake.readiness_200 emit. Called once per waitReady on the first
+// 2xx probe (or the first successful TCP-accept on the legacy
+// path). The wake_id is recovered from the wire envelope on the
+// supplied ctx (the schedd engine stamped it on bootCtx before
+// calling vmmd, per issue #517 PR-A). The vmmd emit is the
+// canonical source of truth for the readiness moment — the
+// timeline endpoint joins this row to wake.boot_started (schedd)
+// and wake.boot_completed (schedd) under the same wake_id.
+func (v *JailerVMM) emitReadiness200(ctx context.Context, l Lease, healthcheckPath string, probeCount int) {
+	if v.events == nil {
+		return
+	}
+	var wakeID, appID string
+	if fields, ok := wire.FromContext(ctx); ok {
+		wakeID = fields.WakeID
+		appID = fields.AppID
+	}
+	now := time.Now()
+	elapsed := now.Sub(v.readinessStartedAt)
+	v.events.Emit(ctx, events.Readiness200{
+		EmitAt:          now.UTC(),
+		WakeID:          wakeID,
+		AppID:           appID,
+		InstanceID:      l.Instance,
+		HealthcheckPath: healthcheckPath,
+		ProbeCount:      probeCount,
+		ElapsedMs:       elapsed.Milliseconds(),
+	})
 }
 
 // healthcheckProbe issues a single GET against

@@ -20,6 +20,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/netns"
@@ -135,6 +136,13 @@ type VMM interface {
 	// dial. ADR-035: best-effort, never blocks the vsock reader; on
 	// forward failure we drop the batch + log Warn.
 	SendStatelessAdvisory(ctx context.Context, l Lease, appID string, batch []AdvisoryEvent) error
+	// WithEvents (issue #517 / PR-C / ADR-064) wires the wake-timeline
+	// fan-out (pkg/events.Platform) on the VMM. vmmd is the canonical
+	// emit site for wake.readiness_200 (the first 2xx probe) and a
+	// corroborating observation for wake.boot_started (mirror at the
+	// gRPC server boundary). nil opts out (pre-PR-C fixtures).
+	// Mirrors WithStorage's nil-tolerance / one-shot wiring posture.
+	WithEvents(p *events.Platform) VMM
 }
 
 // Paths locates the kernel and base images on disk (spec §8). Injected so tests
@@ -396,6 +404,16 @@ func (m *Manager) SetHostIdentities(ids []*age.X25519Identity) {
 // check (bringUpScanCheck returns nil immediately).
 func (m *Manager) WithStorage(s storage.StorageBackend) {
 	m.storage = s
+}
+
+// VMM returns the underlying VMM (the one wired at NewManager). The
+// caller is allowed to attach side-channels (e.g. WithEvents) AFTER
+// Manager construction. The pointer is shared; mutations are
+// visible to every existing caller. Used by cmd/vmmd to wire the
+// wake-timeline fan-out (issue #517 / PR-C / ADR-064) without
+// forcing the Manager constructor to know about events.
+func (m *Manager) VMM() VMM {
+	return m.vmm
 }
 
 // SetImageScanMetrics wires the OpsMetrics handle the scan sidecar

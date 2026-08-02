@@ -31,6 +31,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/fcvm/activity"
 	"github.com/onebox-faas/faas/pkg/fcvm/cpustats"
@@ -410,6 +411,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// already exists.
 	var nodeID string
 	var pool *pgxpool.Pool
+	var store state.Store
 	if cfg.ComputeNode.NodeName != "" {
 		dbURL := cfg.DBURL
 		if dbURL == "" {
@@ -423,7 +425,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("vmmd: open db for self-registration: %w", err)
 		}
 		defer pool.Close()
-		store := deps.openStore(pool)
+		store = deps.openStore(pool)
 		cn, err := registerComputeNode(ctx, store, cfg.ComputeNode, listenTarget, deps.detectOverlayIP, log)
 		if err != nil {
 			return err
@@ -472,6 +474,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	} else {
 		log.Info("vmmd: storage backend = local", "fc_root", envOr("FAAS_STORAGE_ROOT", "/srv/fc"))
 	}
+	// issue #517 / PR-C / ADR-064 — Ops constructed ABOVE the
+	// Manager wiring so the wake-timeline fan-out (vmmd's canonical
+	// emit site for wake.readiness_200) can capture them at
+	// JailerVMM construction. Hoisted from the listener block
+	// below; same single-registry pattern as every other daemon.
+	ops := wire.NewOpsMetrics("vmmd")
 	mgr := fcvm.NewManager(
 		wire.ExecRunner{},
 		fcvm.NewJailerVMM(fcvm.JailChrootBase, 30*time.Second).WithStorage(storageBackend),
@@ -489,6 +497,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the same backend (the production PrefixRouter rooted at
 	// /srv/fc).
 	mgr.WithStorage(storageBackend)
+	// issue #517 / PR-C / ADR-064 — wire the wake-timeline fan-out
+	// (pkg/events.Platform) on the VMM. vmmd is the canonical emit
+	// site for wake.readiness_200 (the first 2xx probe) and a
+	// corroborating observation for wake.boot_started (mirror at
+	// the gRPC server boundary). nil events opts out (legacy
+	// default-local path). Schedd is the canonical writer for
+	// wake.boot_started — vmmd's mirror is a sanity check that the
+	// boot RPC actually entered the FC bring-up path.
+	vmm := mgr.VMM()
+	if vmm != nil && store != nil {
+		vmm.WithEvents(events.NewPlatform("vmmd", store, log, ops, nil))
+	}
 
 	// ADR-053: parent-base loopback registry. Constructed AFTER
 	// WithStorage so Manager.MountParentExt4's storage.Get has a
@@ -525,17 +545,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	}()
 
-	// Ops + listener. Resolve the listen target (issue #95): unix://
-	// default, tcp/dns optional; tcp targets require a complete mTLS
-	// cluster and the loader rejects partial configs.
-	//
-	// Hoisted above NewAdvisoryClient (Mega-PR B): the advisory
-	// client increments vmmd_stateless_advisory_batches_emitted_total
-	// on every Forward outcome, so OpsMetrics must exist before the
-	// client constructor captures it. Same single-registry pattern
-	// (memory wire-opsmetrics-single-registry) as every other
-	// vmmd-side metric.
-	ops := wire.NewOpsMetrics("vmmd")
+	// Ops metrics are constructed above (hoisted for the vmmd's
+	// wake-timeline fan-out — same single-registry pattern as
+	// every other daemon). The listener block below uses the same
+	// `ops` variable for the metrics HTTP handler.
 	// issue #299: wire the OpsMetrics the Manager's scan check
 	// feeds per-severity finding counts into (vmmd_trivy_image_vulns_total{image, severity}).
 	// The counter is pre-instantiated at boot on every daemon's
@@ -628,6 +641,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	activityTracker := activity.NewWithDefaults()
 	gsrv := grpc.NewServer(wire.ServerCredsOrEmpty(serverTLS)...)
 	impl := vmmdgrpc.NewWithCPUAndNetAndActivity(mgr, ops, fcVersion, log, cpuCache, netCache, activityTracker)
+	// issue #517 / PR-C / ADR-064 — wire the wake-timeline fan-out
+	// on the gRPC server. vmmd is the corroborating-observation
+	// source for wake.boot_started (mirror at the gRPC server
+	// boundary) and the canonical emit site for wake.readiness_200
+	// (the first 2xx probe). nil events opts out (legacy default-
+	// local path).
+	if store != nil {
+		impl.WithEvents(events.NewPlatform("vmmd", store, log, ops, nil))
+	}
 	impl.Register(gsrv)
 
 	// Optional /metrics endpoint.
