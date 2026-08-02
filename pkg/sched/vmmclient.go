@@ -42,6 +42,17 @@ type VMM interface {
 	// uses the legacy host vmstate_path"; a populated value means
 	// "vmmd publishes via the configured StorageBackend".
 	PauseAndSnapshot(ctx context.Context, instance, vmstatePath, storageKey, vmstateStorageKey string) (SnapshotBytes, error)
+	// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
+	// receipt of the guest-init "framework ready" vsock DGRAM
+	// signal (port 1027, msg=4). cmd/vmmd's DGRAM host recv loop
+	// calls this with the instance id and the optional warmup_ms
+	// payload. The handler stamps the per-instance
+	// `framework_ready_at` clock on the live Instance and observes
+	// the vmmd_guest_framework_warmup_seconds histogram. Returns
+	// gRPC NotFound when the instance is unknown; the cmd/vmmd
+	// listener treats that as a clean warn-level event (a DGRAM
+	// racing a wake-park cycle is expected during instance churn).
+	FrameworkReady(ctx context.Context, instance string, warmupMs int64) error
 	Destroy(ctx context.Context, instance string) error
 	// Ping is the wire-level liveness probe (issue #97 / ADR-025
 	// axis 3, PR #114). schedd's heartbeat loop calls this every
@@ -488,6 +499,21 @@ func (c *VMMClient) PauseAndSnapshot(ctx context.Context, instance, vmstatePath,
 		return SnapshotBytes{}, liftErr(err)
 	}
 	return SnapshotBytes{MemBytes: resp.GetMemBytes(), VMStateBytes: resp.GetVmstateBytes()}, nil
+}
+
+// FrameworkReady implements VMM. The wire RPC's NotFound return
+// (instance not live on this vmmd) is lifted to a structured gRPC
+// status error so the cmd/vmmd DGRAM listener can classify it as
+// "expected" (a stale DGRAM racing a wake-park cycle) and log at
+// Warn instead of Error. Other errors are returned verbatim.
+func (c *VMMClient) FrameworkReady(ctx context.Context, instance string, warmupMs int64) error {
+	if _, err := c.cli.FrameworkReady(ctx, &vmmdpb.FrameworkReadyRequest{
+		Instance: instance,
+		WarmupMs: warmupMs,
+	}); err != nil {
+		return liftErr(err)
+	}
+	return nil
 }
 
 func (c *VMMClient) Destroy(ctx context.Context, instance string) error {

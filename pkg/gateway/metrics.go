@@ -236,6 +236,14 @@ type Metrics struct {
 	// ObserveWakeLocality wrapper so the Handler hot path doesn't need
 	// to gate on every call.
 	wakeLocality *prometheus.CounterVec
+	// wakeSnapshotTier (issue #470 / PR #470-FU-A and B) is the
+	// per-wake-counter that backs the warm-tier dashboard panel.
+	// Tier ∈ {warm, init, cold}; counted on every wake
+	// completion. The dashboard panel "p50 wake latency by
+	// snapshot tier" joins this counter with the wake-latency
+	// histogram (the histogram stays unlabeled by tier to keep
+	// cardinality bounded; the counter is the join key).
+	wakeSnapshotTier *prometheus.CounterVec
 	// computeNodeChangedSubscriberAlive is the per-process liveness
 	// gauge for the LISTEN compute_node_changed subscriber loop
 	// (cmd/gatewayd/nodecache.go:102-141). PR scale-out readiness:
@@ -426,6 +434,16 @@ func NewMetrics() *Metrics {
 			Name: "gateway_wake_locality_total",
 			Help: "Wake-outcome classifier used to drive the sticky-vs-shared snapshot-store decision. outcome ∈ {local_snapshot, local_coldboot} today; remote_* outcomes slot in when a second compute node joins. Counting is restricted to admissions that actually brought up an instance — warm requests and at-capacity benign outcomes are not enumerated.",
 		}, []string{"outcome"}),
+		// PR #470-FU-B (issue #470): the per-wake snapshot-tier
+		// counter for the warm-tier dashboard panel. Tier values
+		// are {warm, init, cold}; the engine sets tier on the
+		// wake outcome (PR #470-FU-A) and the gateway increments
+		// here on every wake completion. Bounded cardinality
+		// (3 tier values) — the counter is cheap.
+		wakeSnapshotTier: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_wake_snapshot_tier_total",
+			Help: "Wake outcomes classified by the snapshot tier the engine selected. tier ∈ {warm, init, cold}. The warm-tier bucked rises as the framework-ready signal (PR #470-FU-B) populates the per-instance column and the engine's captureWarmSnapshot (PR #470-FU-A) issues a warm-tier PauseAndSnapshot.",
+		}, []string{"tier"}),
 		// PR scale-out readiness — liveness gauge for the LISTEN
 		// compute_node_changed subscriber. Bumped every
 		// `subscriberHeartbeatInterval` (30s) by the goroutine in
@@ -480,6 +498,16 @@ func NewMetrics() *Metrics {
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
 	}
+	// PR #470-FU-B (issue #470): pre-instantiate the closed
+	// (tier) set on the per-wake snapshot-tier counter so the
+	// warm-tier dashboard panel surfaces from boot. The set is
+	// intentionally small (warm / init / cold) — the engine
+	// drives the actual value. To add a new tier (e.g. "cold"
+	// vs "lifecycle_init"): extend this slice; the metric name
+	// stays stable.
+	for _, tier := range []string{"warm", "init", "cold"} {
+		m.wakeSnapshotTier.WithLabelValues(tier)
+	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
 	// (result) set on the walk-completeness counter so the §12
 	// dashboard panel surfaces from boot. result="partial" is the
@@ -499,7 +527,7 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive)
 	return m
 }
 
@@ -674,6 +702,28 @@ func (m *Metrics) ObserveWakeLocality(outcome string) {
 		return
 	}
 	m.wakeLocality.WithLabelValues(outcome).Inc()
+}
+
+// ObserveWakeSnapshotTier (issue #470 / PR #470-FU-B) increments
+// the per-wake snapshot-tier counter. tier ∈ {warm, init, cold};
+// the engine sets tier on the wake outcome (PR #470-FU-A) and the
+// handler increments here. The dashboard panel "p50 wake latency
+// by snapshot tier" joins this counter with the wake-latency
+// histogram on the wake completion time (the histogram is
+// unlabeled by tier to keep cardinality bounded). The counter
+// itself is bounded to 3 label values so the panel query is
+// safe. Empty tier falls back to "init" — the engine's default
+// tier when the snapshot is mid-creation or the wake outcome is
+// the legacy (pre-#470) parked-then-restored path. Nil-safe so
+// the Handler hot path doesn't need a nil guard.
+func (m *Metrics) ObserveWakeSnapshotTier(tier string) {
+	if m == nil {
+		return
+	}
+	if tier == "" {
+		tier = "init"
+	}
+	m.wakeSnapshotTier.WithLabelValues(tier).Inc()
 }
 
 // TouchComputeNodeChangedSubscriber bumps the subscriber-liveness gauge

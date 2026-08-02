@@ -25,6 +25,7 @@ const (
 	Vmmd_CreateFromSnapshot_FullMethodName      = "/onebox.faas.vmmd.v1.Vmmd/CreateFromSnapshot"
 	Vmmd_CreateColdBoot_FullMethodName          = "/onebox.faas.vmmd.v1.Vmmd/CreateColdBoot"
 	Vmmd_PauseAndSnapshot_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/PauseAndSnapshot"
+	Vmmd_FrameworkReady_FullMethodName          = "/onebox.faas.vmmd.v1.Vmmd/FrameworkReady"
 	Vmmd_Destroy_FullMethodName                 = "/onebox.faas.vmmd.v1.Vmmd/Destroy"
 	Vmmd_Stats_FullMethodName                   = "/onebox.faas.vmmd.v1.Vmmd/Stats"
 	Vmmd_Ping_FullMethodName                    = "/onebox.faas.vmmd.v1.Vmmd/Ping"
@@ -60,6 +61,22 @@ type VmmdClient interface {
 	// requested host-side paths, then destroys the live VM. After return the
 	// instance is gone (§6.1: PARKED is zero-RAM).
 	PauseAndSnapshot(ctx context.Context, in *PauseAndSnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error)
+	// FrameworkReady is the vmmd-side receipt of the guest-init
+	// "framework ready" vsock DGRAM (port 1027, msg=4) signal
+	// (issue #470, PR #470-FU-B). vmmd's host-side DGRAM listener
+	// (cmd/vmmd/manager.go) calls this with the instance id and the
+	// optional warmup_ms payload; the handler stamps the per-instance
+	// `framework_ready_at` column added by migration 00112 so the
+	// engine's captureWarmSnapshot (PR #470-FU-A) can decide when
+	// the warm-tier PauseAndSnapshot is allowed to run. The RPC is
+	// idempotent — re-stamps on every subsequent signal (the engine
+	// resets the column to NULL at the start of each warm-capture
+	// cycle so a stale stamp doesn't leak across cycles). No
+	// back-pressure: the DGRAM transport is fire-and-forget by
+	// analogy with the stateless-advisory port 1025 path; a missed
+	// DGRAM means the engine's warm-capture wait times out and
+	// falls through to init-tier (correctness-preserving).
+	FrameworkReady(ctx context.Context, in *FrameworkReadyRequest, opts ...grpc.CallOption) (*FrameworkReadyResponse, error)
 	// Destroy tears down a running instance. Idempotent on unknown instances.
 	Destroy(ctx context.Context, in *DestroyRequest, opts ...grpc.CallOption) (*DestroyResponse, error)
 	// Stats returns current liveness + allocator views. Used by schedd's
@@ -243,6 +260,16 @@ func (c *vmmdClient) PauseAndSnapshot(ctx context.Context, in *PauseAndSnapshotR
 	return out, nil
 }
 
+func (c *vmmdClient) FrameworkReady(ctx context.Context, in *FrameworkReadyRequest, opts ...grpc.CallOption) (*FrameworkReadyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FrameworkReadyResponse)
+	err := c.cc.Invoke(ctx, Vmmd_FrameworkReady_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vmmdClient) Destroy(ctx context.Context, in *DestroyRequest, opts ...grpc.CallOption) (*DestroyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DestroyResponse)
@@ -414,6 +441,22 @@ type VmmdServer interface {
 	// requested host-side paths, then destroys the live VM. After return the
 	// instance is gone (§6.1: PARKED is zero-RAM).
 	PauseAndSnapshot(context.Context, *PauseAndSnapshotRequest) (*SnapshotResponse, error)
+	// FrameworkReady is the vmmd-side receipt of the guest-init
+	// "framework ready" vsock DGRAM (port 1027, msg=4) signal
+	// (issue #470, PR #470-FU-B). vmmd's host-side DGRAM listener
+	// (cmd/vmmd/manager.go) calls this with the instance id and the
+	// optional warmup_ms payload; the handler stamps the per-instance
+	// `framework_ready_at` column added by migration 00112 so the
+	// engine's captureWarmSnapshot (PR #470-FU-A) can decide when
+	// the warm-tier PauseAndSnapshot is allowed to run. The RPC is
+	// idempotent — re-stamps on every subsequent signal (the engine
+	// resets the column to NULL at the start of each warm-capture
+	// cycle so a stale stamp doesn't leak across cycles). No
+	// back-pressure: the DGRAM transport is fire-and-forget by
+	// analogy with the stateless-advisory port 1025 path; a missed
+	// DGRAM means the engine's warm-capture wait times out and
+	// falls through to init-tier (correctness-preserving).
+	FrameworkReady(context.Context, *FrameworkReadyRequest) (*FrameworkReadyResponse, error)
 	// Destroy tears down a running instance. Idempotent on unknown instances.
 	Destroy(context.Context, *DestroyRequest) (*DestroyResponse, error)
 	// Stats returns current liveness + allocator views. Used by schedd's
@@ -576,6 +619,9 @@ func (UnimplementedVmmdServer) CreateColdBoot(context.Context, *CreateColdBootRe
 func (UnimplementedVmmdServer) PauseAndSnapshot(context.Context, *PauseAndSnapshotRequest) (*SnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PauseAndSnapshot not implemented")
 }
+func (UnimplementedVmmdServer) FrameworkReady(context.Context, *FrameworkReadyRequest) (*FrameworkReadyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FrameworkReady not implemented")
+}
 func (UnimplementedVmmdServer) Destroy(context.Context, *DestroyRequest) (*DestroyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Destroy not implemented")
 }
@@ -689,6 +735,24 @@ func _Vmmd_PauseAndSnapshot_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VmmdServer).PauseAndSnapshot(ctx, req.(*PauseAndSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Vmmd_FrameworkReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FrameworkReadyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).FrameworkReady(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_FrameworkReady_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).FrameworkReady(ctx, req.(*FrameworkReadyRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -945,6 +1009,10 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PauseAndSnapshot",
 			Handler:    _Vmmd_PauseAndSnapshot_Handler,
+		},
+		{
+			MethodName: "FrameworkReady",
+			Handler:    _Vmmd_FrameworkReady_Handler,
 		},
 		{
 			MethodName: "Destroy",

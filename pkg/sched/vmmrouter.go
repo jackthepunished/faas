@@ -61,6 +61,15 @@ type RoutedVMM interface {
 	// host-path branch is taken bit-for-bit; remote-node schedd sends
 	// state.SnapVMStateKey(deploymentID).
 	PauseAndSnapshot(ctx context.Context, nodeID, instance, vmstatePath, storageKey, vmstateStorageKey string) (SnapshotBytes, error)
+	// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
+	// receipt of the guest-init "framework ready" vsock DGRAM
+	// signal (port 1027). Schedd itself doesn't call this — the
+	// cmd/vmmd DGRAM host recv loop does — but the routed
+	// interface keeps it on the same surface as the other vmmd
+	// RPCs so a future test or a multi-node vmmd mesh can wire
+	// it through the router's per-node dial table. The default
+	// router implementation forwards to cli.FrameworkReady.
+	FrameworkReady(ctx context.Context, nodeID, instance string, warmupMs int64) error
 	Destroy(ctx context.Context, nodeID, instance string) error
 	// Ping is the wire-level liveness probe (issue #97 / ADR-025
 	// axis 3, PR #114). schedd's heartbeat loop calls this every
@@ -337,6 +346,19 @@ func (r *VMMRouter) Destroy(ctx context.Context, nodeID, instance string) error 
 		return err
 	}
 	return cli.Destroy(ctx, instance)
+}
+
+// FrameworkReady implements RoutedVMM. Pure pass-through to the
+// per-node client's FrameworkReady RPC; the router does not cache
+// (the cmd/vmmd DGRAM host recv loop calls this on every signal, so
+// the per-receipt dial overhead is amortized by the per-node
+// connection pool in resolveFor).
+func (r *VMMRouter) FrameworkReady(ctx context.Context, nodeID, instance string, warmupMs int64) error {
+	cli, err := r.resolveFor(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	return cli.FrameworkReady(ctx, instance, warmupMs)
 }
 
 // Ping implements RoutedVMM (issue #97 / ADR-025 axis 3, PR #114).

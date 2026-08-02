@@ -58,6 +58,20 @@ func (f *fakeRouterVMM) Destroy(_ context.Context, instance string) error {
 	f.mu.Unlock()
 	return nil
 }
+
+// FrameworkReady implements VMM (issue #470 / PR #470-FU-B). The
+// vmmrouter_test fake is for the per-node dial-cache contract; the
+// all-six-methods-routing assertion doesn't include FrameworkReady
+// yet (the cmd/vmmd DGRAM host recv loop calls it directly via
+// VMMClient, not through the router in the current production
+// wiring). The method is here so the fake stays a complete VMM
+// implementation and the compiler doesn't error out.
+func (f *fakeRouterVMM) FrameworkReady(_ context.Context, instance string, _ int64) error {
+	f.mu.Lock()
+	f.instanceCalls = append(f.instanceCalls, instance)
+	f.mu.Unlock()
+	return nil
+}
 func (f *fakeRouterVMM) Ping(_ context.Context) (*PingOutcome, error) {
 	f.mu.Lock()
 	f.instanceCalls = append(f.instanceCalls, "<ping>")

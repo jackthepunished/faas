@@ -32,6 +32,7 @@ type fakeVMM struct {
 	snapshots         int
 	destroys          int
 	pings             int  // PR #114: counts Ping calls (heartbeat path)
+	frameworkReadyCount int  // PR #470-FU-B: counts FrameworkReady calls (DGRAM receipt path)
 	prepares          int  // Tier A5: counts PrepareLiveMigration calls
 	adopts            int  // Tier A5: counts AdoptMigratedInstance calls
 	acks              int  // Tier A5: counts AcknowledgeMigration calls
@@ -196,6 +197,19 @@ func (f *fakeVMM) Destroy(ctx context.Context, _, _ string) error {
 		return f.destroyErr
 	}
 	f.destroys++
+	return nil
+}
+
+// FrameworkReady implements VMM for the engine-test fake (issue #470 /
+// PR #470-FU-B). The cmd/vmmd DGRAM host recv loop calls this on every
+// "framework ready" signal; the engine paths use it indirectly via
+// the live Instance row. Pure no-op for the test fake — the engine
+// tests that need to assert the receipt was dispatched to the
+// vmmd side will add a counter (IssuePR470BFrameworkReadyCalls).
+func (f *fakeVMM) FrameworkReady(_ context.Context, _, _ string, _ int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frameworkReadyCount++
 	return nil
 }
 

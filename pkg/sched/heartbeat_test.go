@@ -93,6 +93,14 @@ func (h *heartbeatFakeVMM) PauseAndSnapshot(context.Context, string, string, str
 }
 func (h *heartbeatFakeVMM) Destroy(context.Context, string) error { return nil }
 
+// FrameworkReady implements RoutedVMM for the heartbeat test fake
+// (issue #470 / PR #470-FU-B). The heartbeat loop only exercises
+// Ping (the wire-level liveness probe); the framework-ready
+// receipt path isn't in this test's surface.
+func (h *heartbeatFakeVMM) FrameworkReady(context.Context, string, int64) error {
+	return nil
+}
+
 // Stats implements VMM (issue #170 / PR-A). Heartbeat does not
 // call Stats — the instancestats poller does, via its own
 // dialer — so the heartbeat fake just returns an empty snapshot.

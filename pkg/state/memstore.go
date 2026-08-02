@@ -4226,6 +4226,41 @@ func (m *MemStore) UpdateInstanceStateToTerminal(_ context.Context, id, state st
 	return nil
 }
 
+// SetInstanceFrameworkReadyAt mirrors pgstore.SetInstanceFrameworkReadyAt
+// (PR #470-FU-B). Updates the in-memory instance row's
+// `FrameworkReadyAt` pointer to point at the supplied time. The pointer
+// indirection is required by the Instance struct definition so callers
+// can distinguish "no signal yet" (nil) from "signal arrived at zero"
+// (which is impossible given time.Time's zero check but kept for
+// symmetry). Returns ErrNotFound for missing rows.
+func (m *MemStore) SetInstanceFrameworkReadyAt(_ context.Context, id string, readyAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return ErrNotFound
+	}
+	ts := readyAt
+	ins.FrameworkReadyAt = &ts
+	m.instances[id] = ins
+	return nil
+}
+
+// ClearInstanceFrameworkReadyAt mirrors pgstore.ClearInstanceFrameworkReadyAt
+// (PR #470-FU-B). Resets the framework_ready_at pointer to nil so the
+// next warm-capture cycle starts without a stale stamp.
+func (m *MemStore) ClearInstanceFrameworkReadyAt(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return ErrNotFound
+	}
+	ins.FrameworkReadyAt = nil
+	m.instances[id] = ins
+	return nil
+}
+
 // ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
 // lookup (PR #74). Mirrors ListInstancesByStatesOlderThan but reads
 // terminal_at instead of the state-aware started_at/parked_at pair.

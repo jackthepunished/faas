@@ -1562,7 +1562,7 @@ func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, ma
 	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''),
 	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
 	               i.started_at, i.last_request_at, i.parked_at,
-	               coalesce(i.node_id::text, ''), i.wake_id,
+	               coalesce(i.node_id::text, ''), i.wake_id, i.framework_ready_at,
 	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
 	          from instances i
 	         where i.state = 'running'` +
@@ -5237,7 +5237,7 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 		`insert into instances (app_id, deployment_id, state, ram_mb, node_id, wake_id, started_at)
 		 values ($1, $2, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else $6::uuid end, now())
 		 returning id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id`,
+		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at`,
 		appID, deploymentID, state, ramMB, nodeID, wakeID)
 	return scanInstance(row)
 }
@@ -5245,7 +5245,7 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 func (s *PgStore) InstanceByID(ctx context.Context, id string) (Instance, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
 		 from instances where id = $1`, id)
 	return scanInstance(row)
 }
@@ -5253,7 +5253,7 @@ func (s *PgStore) InstanceByID(ctx context.Context, id string) (Instance, error)
 func (s *PgStore) ListInstancesForApp(ctx context.Context, appID string) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
 		 from instances where app_id = $1 order by started_at desc`, appID)
 	if err != nil {
 		return nil, err
@@ -5315,7 +5315,7 @@ func (s *PgStore) ListAllInstances(ctx context.Context) ([]Instance, error) {
 func (s *PgStore) ListInstancesForAccount(ctx context.Context, accountID string) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
@@ -5355,7 +5355,7 @@ func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID st
 	}
 	rows, err := s.pool.Query(ctx,
 		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
@@ -5388,7 +5388,7 @@ func (s *PgStore) ListLatestInstancePerApp(ctx context.Context, accountID string
 	rows, err := s.pool.Query(ctx,
 		`select distinct on (i.app_id)
 		        i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
@@ -5456,6 +5456,45 @@ func (s *PgStore) UpdateInstanceStateToTerminal(ctx context.Context, id, state s
 	return nil
 }
 
+// SetInstanceFrameworkReadyAt stamps `framework_ready_at` on the
+// instances row for the vmmd gRPC `FrameworkReady` handler
+// (PR #470-FU-B). Mirrors the no-op-on-missing-row convention of
+// UpdateInstanceState: zero rows affected -> ErrNotFound; callers
+// can distinguish "instance already gone" from transient DB errors.
+// Caller passes the wall-clock time the vmmd received the guest-init
+// vsock DGRAM (port 1027, msg=4). The engine in PR #470-FU-A waits
+// on this column before issuing the second PauseAndSnapshot that
+// captures the warm tier.
+func (s *PgStore) SetInstanceFrameworkReadyAt(ctx context.Context, id string, readyAt time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update instances set framework_ready_at = $2 where id = $1`,
+		id, readyAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ClearInstanceFrameworkReadyAt resets `framework_ready_at` to NULL.
+// Used by the engine at the start of each warm-capture cycle so a
+// stale stamp from the previous cycle doesn't leak into the next wake
+// decision. Same missing-row semantics as SetInstanceFrameworkReadyAt.
+func (s *PgStore) ClearInstanceFrameworkReadyAt(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update instances set framework_ready_at = NULL where id = $1`,
+		id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListInstancesByStatesOlderThan is the watchdog's lookup (spec §6.1).
 // Filters on state ∈ states and a state-aware "age" column:
 // started_at for WAKING / COLD_BOOTING (stamped on creation by the
@@ -5503,7 +5542,7 @@ func (s *PgStore) ListInstancesInTerminalStatesOlderThan(ctx context.Context, st
 	}
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, terminal_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, terminal_at
 		 from instances
 		 where state = any($1)
 		   and terminal_at is not null
@@ -8432,16 +8471,23 @@ func scanInstances(rows pgx.Rows) ([]Instance, error) {
 // regression that re-allows NULL surfaces as an empty string in Go rather
 // than a scan error (the SELECT column list pins the contract; a divergence
 // from there is a louder failure than a Scan error).
+//
+// framework_ready_at is the 14th column (PR #470-FU-B, migration 00112).
+// Nullable forever — legacy rows never had a vsock signal and Free/Hobby
+// plans never opt in. Scanned into a *time.Time so the nil/zero-value
+// distinction survives the Scan trip (pgx returns untyped nil for NULL
+// TIMESTAMPTZ, which is exactly the marker we want to keep on the struct).
 func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	ins := Instance{}
-	var started, lastReq, parked *time.Time
+	var started, lastReq, parked, frameworkReady *time.Time
 	// wake_id is the 13th column (migration 00028). It's NOT NULL post-
 	// 00028 but scanned into a string so any pre-migration-00028 row that
 	// somehow surfaced surfaces as "" rather than a NULL scan error — the
 	// SELECT column list is the contract that prevents column-order drift
 	// from silently swallowing wake_id into an unrelated field.
 	if err := scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
-		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID); err != nil {
+		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID,
+		&frameworkReady); err != nil {
 		return Instance{}, err
 	}
 	if started != nil {
@@ -8452,6 +8498,10 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	}
 	if parked != nil {
 		ins.ParkedAt = *parked
+	}
+	if frameworkReady != nil {
+		ts := *frameworkReady
+		ins.FrameworkReadyAt = &ts
 	}
 	return ins, nil
 }
@@ -8477,13 +8527,13 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 // stays consistent across rows.
 func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 	ins := Instance{}
-	var started, lastReq, parked *time.Time
+	var started, lastReq, parked, frameworkReady *time.Time
 	var migFromStr *string
 	var migAtTime *time.Time
 	var leaseStr *string
 	if err := scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
 		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID,
-		&migFromStr, &migAtTime, &leaseStr); err != nil {
+		&frameworkReady, &migFromStr, &migAtTime, &leaseStr); err != nil {
 		return Instance{}, err
 	}
 	if started != nil {
@@ -8495,6 +8545,10 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 	if parked != nil {
 		ins.ParkedAt = *parked
 	}
+	if frameworkReady != nil {
+		ts := *frameworkReady
+		ins.FrameworkReadyAt = &ts
+	}
 	ins.MigratedFromNodeID = migFromStr
 	ins.MigratedAt = migAtTime
 	if leaseStr != nil {
@@ -8503,26 +8557,29 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 	return ins, nil
 }
 
-// scanInstancesWithTerminal is the 13-column variant of scanInstanceCols
+// scanInstancesWithTerminal is the 14-column variant of scanInstanceCols
 // that also lifts terminal_at (PR #74) and node_id (issue #97). Used only
 // by ListInstancesInTerminalStatesOlderThan — the rest of the codebase
-// reads 12-column instances rows (incl. node_id) and doesn't need
+// reads 13-column instances rows (incl. node_id) and doesn't need
 // terminal_at, so threading it into scanInstanceCols would force every
 // SELECT to expose it for no reason. node_id is included here so the
 // retention sweep's row carries the same node info as a live row — the
 // GC delete later (DeleteInstance) doesn't need it, but a future
 // per-node retention policy might, and surfacing it now keeps the row
-// shape uniform across the read paths.
+// shape uniform across the read paths. framework_ready_at is the 14th
+// column (PR #470-FU-B migration 00112); for the retention sweep it's
+// always NULL (terminal rows pre-date the warm-capture path) but the
+// column is part of the row shape so we scan it for shape parity.
 func scanInstancesWithTerminal(rows pgx.Rows) ([]Instance, error) {
 	var out []Instance
 	for rows.Next() {
 		ins := Instance{}
-		var started, lastReq, parked, terminal *time.Time
+		var started, lastReq, parked, frameworkReady, terminal *time.Time
 		// Column order matches ListInstancesInTerminalStatesOlderThan's
-		// SELECT (now 14 columns after migration 00028 added wake_id
-		// before terminal_at).
+		// SELECT (now 15 columns after migration 00028 added wake_id,
+		// 00112 added framework_ready_at, before terminal_at).
 		if err := rows.Scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
-			&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID, &terminal); err != nil {
+			&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID, &frameworkReady, &terminal); err != nil {
 			return nil, err
 		}
 		if started != nil {
@@ -8533,6 +8590,10 @@ func scanInstancesWithTerminal(rows pgx.Rows) ([]Instance, error) {
 		}
 		if parked != nil {
 			ins.ParkedAt = *parked
+		}
+		if frameworkReady != nil {
+			ts := *frameworkReady
+			ins.FrameworkReadyAt = &ts
 		}
 		if terminal != nil {
 			ins.TerminalAt = terminal
