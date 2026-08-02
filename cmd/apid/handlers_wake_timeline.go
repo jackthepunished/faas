@@ -134,7 +134,17 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 			"Wake not found", "no events row with that wake_id belongs to this account"))
 		return
 	}
-	out := make([]api.WakeTimelineEvent, 0, limit)
+	// Cap the slice capacity at the same Max used at the
+	// limit-parsing site. The downstream `min(n, Max)`
+	// flow-tracks through the `limit+1` over-read at the
+	// ListEventsByWakeID call site, but CodeQL's
+	// go/uncontrolled-allocation-size taint tracking loses
+	// the bound across the cross-function call boundary and
+	// re-flags the make() here. Applying `min(limit, Max)` at
+	// the allocation site keeps the bound visible directly to
+	// the slice allocation. Per
+	// codeql-go-uncontrolled-allocation-size-min-pattern.
+	out := make([]api.WakeTimelineEvent, 0, min(limit, wakeTimelineLimitMax))
 	for _, e := range rows {
 		// Forge-proof: every row's data.app_id must equal the
 		// slug's resolved app id. A mismatch is dropped silently
