@@ -654,6 +654,27 @@ type OpsMetrics struct {
 	// instantiated at boot below so the row surfaces in /metrics
 	// from the moment imaged starts.
 	registryCredentialMarkUsedFailures prometheus.Counter
+	// wakePhaseEmitted: issue #517 / PR-C / ADR-064. Per-(phase,
+	// result) counter for pkg/events.Platform.Emit. phase is the
+	// substring after `wake.` (e.g. "boot_started",
+	// "readiness_200", "proxy_first_byte"); result ∈ {ok, failed}.
+	// Closed phase set is pre-instantiated at boot (mirror of
+	// stripePushDur) so the §12 wake-latency panel surfaces zero
+	// on an idle daemon and the histogram has a series to bucket
+	// into the moment the first wake fires. Single-registry:
+	// registered on every daemon so the struct stays a single
+	// registry — only schedd / vmmd / gatewayd / builderd / apid
+	// increment via Platform.Emit in production; other daemons
+	// sit at zero. Closed set is the 13 phases from
+	// pkg/events/wake.go.
+	wakePhaseEmitted *prometheus.CounterVec
+	// wakePhaseDur: lifecycle histogram for wake phases. Same
+	// (phase, result) tuple as wakePhaseEmitted. Buckets sized
+	// for the wake envelope: queue→admit <100ms; boot <30s;
+	// readiness <60s; proxy <5s. The 60s tail catches
+	// pathological stalls so the §12 panel can page on a
+	// per-phase p99.
+	wakePhaseDur *prometheus.HistogramVec
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -1141,6 +1162,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// vmmd) from "dialer refused it" (this metric on imaged) — they
 	// have different remediation paths.
 	var ociEgressDeny *prometheus.CounterVec
+	// Issue #517 / PR-C / ADR-064 — wake-phase collector pair.
+	// Counter gauges per-phase emit counts; histogram buckets
+	// the per-phase duration. Both labelled by the same closed
+	// (phase, result) tuple; the closed 13-phase set is
+	// pre-instantiated below so the §12 wake-latency panel exists
+	// from boot. The histogram buckets are sized for the wake
+	// envelope: queue→admit <100ms; boot <30s; readiness <60s;
+	// proxy <5s; the 60s tail catches pathological stalls.
+	wakePhaseEmitted := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_wake_phase_emitted_total",
+		Help: "Count of wake-timeline events emitted via pkg/events.Platform, labelled by phase (the substring after `wake.`, e.g. `boot_started`, `readiness_200`, `proxy_first_byte`) and result ∈ {ok, failed} (issue #517 / PR-C, ADR-064). Single-registry: registered on every daemon; only schedd / vmmd / gatewayd / builderd / apid increment via Platform.Emit. The closed 13-phase set is pre-instantiated at boot so the §12 wake-latency panel surfaces zero on an idle daemon.",
+	}, []string{"phase", "result"})
+	wakePhaseDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_wake_phase_duration_seconds",
+		Help: "Latency of pkg/events.Platform.Emit (the AppendEvent round-trip), labelled by phase and result (issue #517 / PR-C, ADR-064). Sized for the wake envelope: queue→admit <100ms; boot <30s; readiness <60s; proxy <5s; the 60s tail catches pathological stalls.",
+		Buckets: []float64{
+			0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+		},
+	}, []string{"phase", "result"})
 	// commonCollectors is the per-daemon collector set that every
 	// prefix registers. PR-E adds ociEgressDeny to the set when
 	// prefix == "imaged" — keeping the common slice as a single source
@@ -1170,6 +1210,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		githubdPathFilterTotal,
 		throttleSecondsTotal, throttleRatio,
 		egressSourceErrors,
+		wakePhaseEmitted, wakePhaseDur,
 	}
 	if cpuStatsCollectDurLocal != nil {
 		commonCollectors = append(commonCollectors, cpuStatsCollectDurLocal)
@@ -1331,7 +1372,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"} {
 		imageScanVulns.WithLabelValues("<unknown>", sev)
 	}
-	// Pre-instantiate every outcome in the closed set so the
+// Pre-instantiate every outcome in the closed set so the
 	// counter's HELP/TYPE and zero-valued rows surface in
 	// `/metrics` from the moment schedd boots — even before the
 	// first four-phase handoff resolves. Matches the rebalance
@@ -1347,6 +1388,25 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"no_eligibility", "lease_expired", "peer_failure",
 	} {
 		liveMigrationDecisions.WithLabelValues(outcome)
+	}
+	// Issue #517 / PR-C / ADR-064: pre-instantiate the closed
+	// 13-phase × 2-result label set for wakePhaseEmitted and
+	// wakePhaseDur so the §12 wake-latency panel surfaces zero
+	// on an idle daemon (mirrors the buildDuration / stripePush
+	// pre-instantiation precedents above). The phase list mirrors
+	// the constants in pkg/events/wake.go — extending the
+	// platform vocabulary requires extending this loop in
+	// lock-step. result ∈ {ok, failed}.
+	for _, phase := range []string{
+		"queue_accepted", "admitted", "boot_started", "boot_completed",
+		"boot_failed", "readiness_200", "proxy_first_byte",
+		"park_started", "park_completed", "stalled",
+		"build_succeeded", "build_failed", "deploy_failed",
+	} {
+		for _, result := range []string{"ok", "failed"} {
+			wakePhaseEmitted.WithLabelValues(phase, result)
+			wakePhaseDur.WithLabelValues(phase, result)
+		}
 	}
 	// Pre-instantiate every label in the closed result set so the
 	// histogram's HELP/TYPE and zero-valued buckets surface in
@@ -1478,7 +1538,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// before the first sampler tick.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	return &OpsMetrics{
-		registry:                           reg,
+registry:                           reg,
 		ops:                                ops,
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
@@ -1541,6 +1601,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		apidStatelessAdvisoryEventsTotal:   apidStatelessAdvisoryEventsTotal,
 		apidGithubdBridgeEnqueuedTotal:     apidGithubdBridgeEnqueuedTotal,
 		githubdPathFilterTotal:             githubdPathFilterTotal,
+		wakePhaseEmitted:                   wakePhaseEmitted,
+		wakePhaseDur:                       wakePhaseDur,
 	}
 }
 
@@ -2273,6 +2335,39 @@ func (m *OpsMetrics) StripePushDuration(result string) prometheus.Observer {
 // based on the runtime provider type — see pusherDispatch.
 func (m *OpsMetrics) PaddlePushDuration(result string) prometheus.Observer {
 	return m.paddlePushDur.WithLabelValues(result)
+}
+
+// WakePhaseEmitted returns the per-(phase, result) counter for
+// pkg/events.Platform.Emit (issue #517 / PR-C, ADR-064). phase is
+// the substring after `wake.` (e.g. "boot_started", "readiness_200",
+// "proxy_first_byte"); result is "ok" on AppendEvent success or
+// "failed" on AppendEvent error. The returned Counter is safe to
+// cache; the underlying CounterVec is shared across labels. The
+// callsite (pkg/events) lives on the per-daemon Platform, which
+// upstream callers reach via the engine's `Events` field — the
+// collector is single-registry so any daemon can call it without
+// a per-daemon switch (matching the auditWriteFail precedent).
+// nil-safe on a nil receiver.
+func (m *OpsMetrics) WakePhaseEmitted(phase, result string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.wakePhaseEmitted.WithLabelValues(phase, result)
+}
+
+// WakePhaseDuration returns the per-(phase, result) observer for
+// the dedicated <daemon>_wake_phase_duration_seconds histogram.
+// phase / result semantics match WakePhaseEmitted. The returned
+// Observer is safe to cache; the underlying HistogramVec is shared
+// across labels. Observers are sized for the wake envelope
+// (queue→admit <100ms; boot <30s; readiness <60s; proxy <5s) so
+// the §12 wake-latency panel can page on a per-phase p99.
+// nil-safe on a nil receiver.
+func (m *OpsMetrics) WakePhaseDuration(phase, result string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.wakePhaseDur.WithLabelValues(phase, result)
 }
 
 // ObserveBuildCount increments <daemon>_ops_total{op="build",code} by one
