@@ -274,6 +274,21 @@ func (stubVMM) Stats(context.Context) (*sched.StatsSnapshot, error) {
 }
 func (stubVMM) Close() error { return nil }
 
+// Tier A5 (ADR-066) — wiring tests don't drive migration; the
+// four RPCs are no-op stubs.
+func (stubVMM) PrepareLiveMigration(context.Context, string, string, string) (sched.LiveMigrationPrepare, error) {
+	return sched.LiveMigrationPrepare{}, nil
+}
+func (stubVMM) AdoptMigratedInstance(context.Context, string, string, sched.AppSpec, string, string, string) (sched.LiveMigrationAdopt, error) {
+	return sched.LiveMigrationAdopt{}, nil
+}
+func (stubVMM) AcknowledgeMigration(context.Context, string, string, string) error {
+	return nil
+}
+func (stubVMM) CancelLiveMigration(context.Context, string, string, string) error {
+	return nil
+}
+
 // UpdateEgressAllowlist (tier-2 PR-B) — wiring tests don't drive
 // the egress drift path. Returns nil so the VMM contract is
 // satisfied when schedd's deps.subscribeEgressDrift is left
