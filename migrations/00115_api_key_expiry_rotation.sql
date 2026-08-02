@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00106_api_key_expiry_rotation.sql — IAM-5 (issue #189 / ADR draft).
+-- 00115_api_key_expiry_rotation.sql — IAM-5 (issue #189 / ADR draft).
 --
 -- Three capabilities, all additive:
 --
@@ -65,7 +65,7 @@
 --
 -- The replay-safety contract is also pinned at PR time by the
 -- `db.MigrateUp` second-call assertion in
--- 00106_api_key_expiry_rotation_test.go (same precedent as
+-- 00115_api_key_expiry_rotation_test.go (same precedent as
 -- 00053_deployments_source_url_test.go:171-183).
 
 ALTER TABLE api_keys

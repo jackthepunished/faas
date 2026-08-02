@@ -1,13 +1,13 @@
 //go:build !no_pg
 
-// Migration-apply test for 00106_api_key_expiry_rotation.sql
+// Migration-apply test for 00115_api_key_expiry_rotation.sql
 // (issue #189 / IAM-5). Pins the additive schema that gives
 // every API key a per-row `expires_at` and `status`, plus a
 // per-account `key_grace_window_days` override.
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00106 (no prior
+//  1. Migration set applies cleanly through 00115 (no prior
 //     migration's surface is broken — IAM-1's `scopes` and
 //     IAM-6's `org_id` are preserved).
 //  2. `status` defaults to 'active' for fresh rows; the CHECK
@@ -40,7 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00106_APIKeyExpiryRotation(t *testing.T) {
+func TestMigrations_00115_APIKeyExpiryRotation(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
