@@ -920,6 +920,36 @@ const (
 	MigrateLiveMaxPerTick   = 10
 	MigrateLiveLeaseSeconds = 90
 
+	// Tier A6 (migrating-instance watchdog, ADR-067 follow-up to
+	// ADR-066): self-heal stuck state='migrating' rows that
+	// never committed (the new owner vmmd died mid-handoff, the
+	// network partition dropped the gRPC, the operator killed
+	// the new owner before the commit). The watchdog is the
+	// only writer that can move a row out of 'migrating' without
+	// a peer commit — every Phase 4 path (CancelInstanceMigration)
+	// requires a peer, and the peer is the very thing that's gone.
+	//
+	// MigratingWatchdogTickLimit is the per-tick cap on the
+	// reconcile batch. A backlog of stuck rows past this cap is
+	// itself a "you broke something" event (the metric fires
+	// `outcome="cap_exceeded"`); a backlog over 50 means a peer
+	// dropped tens of migrations in flight and the operator
+	// should investigate before the next drain. Defaults to 50;
+	// tunable via FAAS_MIGRATING_WATCHDOG_TICK_LIMIT (env-
+	// overridable, see cmd/schedd/main.go::runWithDeps).
+	//
+	// MigratingWatchdogIntervalSeconds is the per-tick cadence
+	// of the watchdog. Default 1s; matches the existing reaper /
+	// cron tick. A 1s cadence is overkill for a 90s lease window
+	// but matches the existing pattern (every other 1s tick in
+	// pkg/sched/loop.go is the same shape). Tunable via
+	// FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	MigratingWatchdogTickLimit       = 50
+	MigratingWatchdogIntervalSeconds = 1
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 

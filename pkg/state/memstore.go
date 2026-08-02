@@ -1862,6 +1862,88 @@ func (m *MemStore) CancelInstanceMigration(_ context.Context, instanceID, origin
 	return nil
 }
 
+// ListExpiredMigrations mirrors pkg/state/pgstore.go::
+// ListExpiredMigrations. Returns every instance in
+// state='migrating' with a non-empty lease_token, in
+// instance-id order, capped at maxPerTick. Returns nil
+// (not ErrNotFound) when empty.
+func (m *MemStore) ListExpiredMigrations(_ context.Context, maxPerTick int) ([]Instance, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Instance
+	for _, ins := range m.instances {
+		if ins.State != "migrating" || ins.LeaseToken == "" {
+			continue
+		}
+		out = append(out, ins)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > maxPerTick {
+		out = out[:maxPerTick]
+	}
+	return out, nil
+}
+
+// ReinviteMigratingInstance mirrors pkg/state/pgstore.go::
+// ReinviteMigratingInstance. Conditional on state='migrating'
+// + lease_token=leaseToken; flips state='running' and clears
+// lease_token. Returns ErrConflict on predicate miss.
+func (m *MemStore) ReinviteMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty leaseToken")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != "migrating" || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = "running"
+	now := time.Now().UTC()
+	ins.MigratedAt = &now
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
+// AbortMigratingInstance mirrors pkg/state/pgstore.go::
+// AbortMigratingInstance. Conditional on state='migrating' +
+// lease_token=leaseToken; flips state='parked', restores
+// node_id=migrated_from_node_id, clears lease_token.
+func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: abort migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: abort migrating instance: empty leaseToken")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != "migrating" || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = "parked"
+	if ins.MigratedFromNodeID != nil {
+		ins.NodeID = *ins.MigratedFromNodeID
+	}
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2694,6 +2776,23 @@ func (m *MemStore) SetBuildStartedAtForTest(id string, t time.Time) {
 	}
 	b.StartedAt = t
 	m.builds[id] = b
+}
+
+// SetInstanceMigratedFromForTest is a test-only hook that lets
+// the A6 watchdog tests stamp MigratedFromNodeID on a wedged
+// state='migrating' row so the dead-owner reconciliation path
+// has a destination to restore. Mirrors the other
+// SetXForTest helpers in this file.
+func (m *MemStore) SetInstanceMigratedFromForTest(instanceID, nodeID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return
+	}
+	copy := nodeID
+	ins.MigratedFromNodeID = &copy
+	m.instances[instanceID] = ins
 }
 
 // ClaimQueuedBuild atomically flips queued → running under m.mu (PR-A

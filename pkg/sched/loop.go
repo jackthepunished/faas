@@ -35,24 +35,25 @@ import (
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool             *pgxpool.Pool
-	engine           *Engine
-	log              *slog.Logger
-	gateway          GatewaySynth
-	now              func() time.Time
-	flowCounts       FlowCounter
-	ops              *wire.OpsMetrics       // issue #171 shared registry; nil safe
-	audit            *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
-	watchdog         *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention        *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat        *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	diskDrift        *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
-	instStats        InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	scaleup          *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
-	targets          *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
-	recentLoad       *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
-	reaperAggressive bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
-	reaperParkCap    int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	pool              *pgxpool.Pool
+	engine            *Engine
+	log               *slog.Logger
+	gateway           GatewaySynth
+	now               func() time.Time
+	flowCounts        FlowCounter
+	ops               *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	audit             *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
+	watchdog          *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention         *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat         *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	diskDrift         *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
+	migratingWatchdog *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
+	instStats         InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	scaleup           *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	targets           *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	recentLoad        *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	reaperAggressive  bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap     int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -256,6 +257,20 @@ func (l *Loop) WithReaperParkCap(cap int) *Loop {
 	return l
 }
 
+// WithMigratingWatchdog attaches the Tier A6 / ADR-067
+// wedged-migration self-healer. Mirrors the nil-skip semantics
+// of WithWatchdog / WithHeartbeat: a nil watchdog means the
+// select arm in Run never fires. Production cmd/schedd wires
+// the real MigratingWatchdog from the engine deps so the
+// watchdog shares the same store / engine / clock as the rest
+// of the loop. The watchdog's own interval governs the cadence
+// (default api.MigratingWatchdogIntervalSeconds = 1s, overridable
+// via FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS).
+func (l *Loop) WithMigratingWatchdog(w *MigratingWatchdog) *Loop {
+	l.migratingWatchdog = w
+	return l
+}
+
 // Run blocks until ctx is cancelled. It owns three event sources: the LISTEN
 // subscriber, the reaper tick, and the cron tick.
 func (l *Loop) Run(ctx context.Context) error {
@@ -417,6 +432,18 @@ func (l *Loop) Run(ctx context.Context) error {
 		recentLoadT = time.NewTicker(time.Second)
 		defer recentLoadT.Stop()
 	}
+	// Migrating-watchdog ticker (Tier A6 / ADR-067). 1 s cadence
+	// parallel to the §6.1 watchdog — the watchdog is the only writer
+	// that can move a row out of state='migrating' without a peer
+	// commit, so its tick resolution is the operator's tripwire
+	// latency for the new-owner vmmd dying mid-handoff. nil watchdog
+	// opts out (the migratingWatchdogTick helper returns nil for a
+	// nil ticker; the select case never fires).
+	var migratingWatchdogT *time.Ticker
+	if l.migratingWatchdog != nil {
+		migratingWatchdogT = time.NewTicker(l.migratingWatchdog.interval)
+		defer migratingWatchdogT.Stop()
+	}
 
 	for {
 		select {
@@ -446,6 +473,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runTargets(ctx)
 		case <-recentLoadTick(recentLoadT):
 			l.runRecentLoad(ctx)
+		case <-migratingWatchdogTick(migratingWatchdogT):
+			l.runMigratingReconcile(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -551,6 +580,19 @@ func recentLoadTick(t *time.Ticker) <-chan time.Time {
 	return t.C
 }
 
+// migratingWatchdogTick is the Tier A6 / ADR-067 wedged-migration
+// self-healer ticker. Same nil-safe shape as recentLoadTick —
+// nil ticker nil channel, so the select case in Run never
+// fires. Kept separate from recentLoadTick so each ticker type's
+// name shows up in stack traces if a future regression corrupts
+// the channel wiring.
+func migratingWatchdogTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
 // runHeartbeat dispatches one sweep of the per-node liveness
 // ticker. Exported as a method so tests can drive a single tick
 // without spinning up Run's goroutine. Tick errors are logged
@@ -630,6 +672,27 @@ func (l *Loop) runRetention(ctx context.Context) {
 	}
 	if deleted > 0 {
 		l.log.Info("retention: swept", "deleted", deleted)
+	}
+}
+
+// runMigratingReconcile dispatches one sweep of the Tier A6 /
+// ADR-067 migrating-instance watchdog. Same shape as
+// runRetention — exported as a method so tests drive a single
+// tick without spinning up Run. Tick errors are logged +
+// swallowed (the inner Engine.ReconcileExpiredMigrations is
+// per-row recoverable; a transient DB blip on the input
+// ListExpiredMigrations query is the only error that surfaces
+// here, and the next tick retries).
+func (l *Loop) runMigratingReconcile(ctx context.Context) {
+	if l.migratingWatchdog == nil {
+		// Direct-call guard for tests; the select case is already
+		// gated by the nil-ticker pattern in migratingWatchdogTick
+		// (a nil ticker returns a nil channel, so the case never
+		// fires).
+		return
+	}
+	if _, err := l.migratingWatchdog.handle(ctx); err != nil {
+		l.log.Warn("migrating watchdog: tick failed", "err", err)
 	}
 }
 

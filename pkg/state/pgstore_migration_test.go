@@ -355,3 +355,166 @@ func TestPgStore_CancelInstanceMigration(t *testing.T) {
 		}
 	}
 }
+
+// Tier A6 / ADR-067 migrating-instance watchdog parity tests.
+// Covers ListExpiredMigrations, ReinviteMigratingInstance, and
+// AbortMigratingInstance — the three new store methods the
+// watchdog's conditional UPDATEs depend on. Each test drives
+// the happy path and at least one ErrConflict branch for the
+// state-coverage gate (≥ 70% per Makefile test-state-coverage).
+//
+// The rows are seeded via the same fixture as the A5 tests
+// (MarkInstanceMigrating transitions an instance to
+// state='migrating' under a lease token; the A6 methods act on
+// the resulting row).
+
+func TestPgStore_ListExpiredMigrations(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	peer, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "reconcile-peer", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+	_, insID1 := seedRunningInstance(t, s, ctx, peer.ID)
+	_, insID2 := seedRunningInstance(t, s, ctx, peer.ID)
+	if err := s.MarkInstanceMigrating(ctx, insID1, peer.ID, "lease-recon-1"); err != nil {
+		t.Fatalf("MarkInstanceMigrating 1: %v", err)
+	}
+	if err := s.MarkInstanceMigrating(ctx, insID2, peer.ID, "lease-recon-2"); err != nil {
+		t.Fatalf("MarkInstanceMigrating 2: %v", err)
+	}
+	rows, err := s.ListExpiredMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows want 2", len(rows))
+	}
+	// ID ASC ordering.
+	if rows[0].ID != insID1 || rows[1].ID != insID2 {
+		t.Errorf("rows order: got %s,%s want %s,%s", rows[0].ID, rows[1].ID, insID1, insID2)
+	}
+	// Cap respected.
+	rows, err = s.ListExpiredMigrations(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations cap=1: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows want 1 (cap)", len(rows))
+	}
+	// Empty input is no-op (returns nil, not ErrNotFound).
+	rows, err = s.ListExpiredMigrations(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations cap=0: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("got %d rows want 0 (cap=0)", len(rows))
+	}
+}
+
+func TestPgStore_ReinviteMigratingInstance(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	peer, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "reinvite-peer", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+	_, insID := seedRunningInstance(t, s, ctx, peer.ID)
+	if err := s.MarkInstanceMigrating(ctx, insID, peer.ID, "lease-reinvite"); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+
+	// Happy: state='migrating' + lease match → flipped to running,
+	// lease cleared, migrated_at stamped.
+	if err := s.ReinviteMigratingInstance(ctx, insID, "lease-reinvite"); err != nil {
+		t.Fatalf("ReinviteMigratingInstance happy: %v", err)
+	}
+	// Verify the row is no longer in the watchdog's input set.
+	rows, err := s.ListExpiredMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == insID {
+			t.Errorf("row still in 'migrating' after a successful reinvite")
+		}
+	}
+
+	// Wrong lease → ErrConflict (cannot double-commit).
+	if err := s.ReinviteMigratingInstance(ctx, insID, "wrong-lease"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Reinvite wrong-lease: %v; want ErrConflict", err)
+	}
+	// Missing row → ErrConflict.
+	if err := s.ReinviteMigratingInstance(ctx, "00000000-0000-0000-0000-000000000099", "any"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Reinvite missing: %v; want ErrConflict", err)
+	}
+	// Empty args rejected.
+	for _, tt := range []struct {
+		name, id, lease string
+	}{
+		{"empty id", "", "lease"},
+		{"empty lease", insID, ""},
+	} {
+		if err := s.ReinviteMigratingInstance(ctx, tt.id, tt.lease); err == nil {
+			t.Errorf("Reinvite(%s): nil error; want rejection", tt.name)
+		}
+	}
+}
+
+func TestPgStore_AbortMigratingInstance(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	peer, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "abort-peer", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+	_, insID := seedRunningInstance(t, s, ctx, peer.ID)
+	if err := s.MarkInstanceMigrating(ctx, insID, peer.ID, "lease-abort"); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+
+	// Happy: state='migrating' + lease match → flipped to parked,
+	// lease cleared.
+	if err := s.AbortMigratingInstance(ctx, insID, "lease-abort"); err != nil {
+		t.Fatalf("AbortMigratingInstance happy: %v", err)
+	}
+	// Verify the row is no longer in the watchdog's input set.
+	rows, err := s.ListExpiredMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == insID {
+			t.Errorf("row still in 'migrating' after a successful abort")
+		}
+	}
+
+	// Wrong lease → ErrConflict.
+	if err := s.AbortMigratingInstance(ctx, insID, "wrong-lease"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Abort wrong-lease: %v; want ErrConflict", err)
+	}
+	// Missing row → ErrConflict.
+	if err := s.AbortMigratingInstance(ctx, "00000000-0000-0000-0000-000000000099", "any"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Abort missing: %v; want ErrConflict", err)
+	}
+	// Empty args rejected.
+	for _, tt := range []struct {
+		name, id, lease string
+	}{
+		{"empty id", "", "lease"},
+		{"empty lease", insID, ""},
+	} {
+		if err := s.AbortMigratingInstance(ctx, tt.id, tt.lease); err == nil {
+			t.Errorf("Abort(%s): nil error; want rejection", tt.name)
+		}
+	}
+}

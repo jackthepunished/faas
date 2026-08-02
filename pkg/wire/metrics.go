@@ -627,6 +627,22 @@ type OpsMetrics struct {
 	// be present so /metrics doesn't show a 404 for cmd/<other>
 	// scrapes that incidentally probe the prefix).
 	rebalanceDecisions *prometheus.CounterVec
+	// migratingReconcileDecisions: Tier A6 / ADR-067
+	// migrating-instance watchdog observability. Counter labelled
+	// by outcome ∈ {reinvited, hard_deleted, conflict, error} —
+	// the closed set the migration-reconcile loop can land in
+	// once per stuck state='migrating' row. `reinvited` is the
+	// happy path (active owner re-acked the same lease); the
+	// other two surface in the operator runbook as tripwires
+	// (a persistent `hard_deleted` rate means the new-owner vmmd
+	// keeps dying mid-handoff; a persistent `conflict` rate
+	// means peer schedds are racing hard on the same row).
+	// Single-registry: registered on every daemon (mirrors the
+	// rebalanceDecisions / liveMigrationDecisions pattern); only
+	// schedd increments via ObserveMigratingReconcile. Pre-
+	// instantiated in NewOpsMetrics so the row surfaces in
+	// /metrics from boot.
+	migratingReconcileDecisions *prometheus.CounterVec
 	// githubdPathFilterTotal: issue #432 phase 5 / ADR-050
 	// §109. Counter labelled by `mode` ∈ {paths, full_fallback,
 	// truncated, error, breaker_open} — the closed set
@@ -1236,6 +1252,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node LIVE-instance migration decisions (Tier A5 / ADR-066), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, lease_expired, peer_failure}. `migrated` is the §12 dashboard panel. `lease_expired` is the tripwire for the four-phase handoff timing out; `peer_failure` is the tripwire for the new-owner vmmd failing the AdoptMigratedInstance RPC. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via ObserveLiveMigration.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, liveMigrationDecisions)
+	// ADR-067 / Tier A6: migrating-instance watchdog reconcile counter.
+	// Labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}.
+	// The reinvited label is the §12 dashboard panel (sum over 5m for
+	// the rate of "new owner vmmd gracefully re-acked the in-flight
+	// lease"); the hard_deleted label is the tripwire for the new-owner
+	// vmmd persistently dying mid-handoff (operators must inspect
+	// `events` kind='migration_reconciled' for the failing node).
+	// Pre-instantiated at boot so the row surfaces in /metrics from
+	// the moment schedd starts. Only schedd increments via
+	// ObserveMigratingReconcile in production, but the field is on the
+	// shared struct (single-registry pattern, memory wire/OpsMetrics)
+	// so /metrics doesn't show a 404 for cmd/<other> scrapes that
+	// incidentally probe the prefix.
+	migratingReconcileDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_migrating_reconcile_total",
+		Help: "Cross-node migrating-instance watchdog reconcile decisions (Tier A6 / ADR-067), labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}. `reinvited` is the §12 dashboard panel (active owner re-acked the same lease); `hard_deleted` is the tripwire for the new-owner vmmd dying mid-handoff. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via ObserveMigratingReconcile.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, migratingReconcileDecisions)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -1347,6 +1381,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"no_eligibility", "lease_expired", "peer_failure",
 	} {
 		liveMigrationDecisions.WithLabelValues(outcome)
+	}
+	// Pre-instantiate the A6 migrating-instance reconcile outcome
+	// set so the §12 panel renders zero on a healthy box (rather
+	// than "no data" until the first dead-owner event). Extending
+	// the outcome vocabulary requires extending this loop in lock-
+	// step with the ADR-067 Engine.ReconcileExpiredMigrations
+	// dispatch.
+	for _, outcome := range []string{
+		"reinvited", "hard_deleted", "conflict", "error",
+	} {
+		migratingReconcileDecisions.WithLabelValues(outcome)
 	}
 	// Pre-instantiate every label in the closed result set so the
 	// histogram's HELP/TYPE and zero-valued buckets surface in
@@ -1533,6 +1578,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		imageScanVulns:                     imageScanVulns,
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
+		migratingReconcileDecisions:        migratingReconcileDecisions,
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
 		egressSourceErrors:                 egressSourceErrors,
@@ -1571,6 +1617,17 @@ func (m *OpsMetrics) RebalanceDecisions(outcome string) prometheus.Counter {
 // per-batch loop that fires 100 calls/sec doesn't allocate.
 func (m *OpsMetrics) LiveMigrationDecisions(outcome string) prometheus.Counter {
 	return m.liveMigrationDecisions.WithLabelValues(outcome)
+}
+
+// MigratingReconcileDecisions returns the labelled counter for the
+// Tier A6 / ADR-067 migrating-instance watchdog. Called from
+// Engine.ReconcileExpiredMigrations once per stuck state='migrating'
+// row (mirrors the rebalanceDecisions / liveMigrationDecisions
+// dispatch shape). outcome ∈ {reinvited, hard_deleted, conflict,
+// error}. The returned Counter is safe to retain — same caching
+// rules as LiveMigrationDecisions.
+func (m *OpsMetrics) MigratingReconcileDecisions(outcome string) prometheus.Counter {
+	return m.migratingReconcileDecisions.WithLabelValues(outcome)
 }
 
 // EventsWriteFailures returns the unlabelled counter for audit-log
