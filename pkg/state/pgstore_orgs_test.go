@@ -35,11 +35,8 @@ func newPgStore(t *testing.T) *PgStore {
 }
 
 func TestPgStore_OrgSurface_RoundTripsAndLastOwnerGuard(t *testing.T) {
-	pool := pgtest.Open(t)
-	if err := db.MigrateUp(context.Background(), pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v", err)
-	}
-	s := NewPgStore(pool)
+	s := newPgStore(t)
+	pool := s.pool
 	ctx := context.Background()
 
 	// Seed an account (the slug / FK on org_memberships.account_id does
