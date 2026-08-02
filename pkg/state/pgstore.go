@@ -8722,6 +8722,677 @@ func (s *PgStore) TouchSessionLastSeen(ctx context.Context, id string) error {
 	return err
 }
 
+// --- Organizations (ADR-061 / IAM-6, PR 2) -------------------------------
+//
+// PR 2 is the additive-schema milestone: schema lands here, apid stays
+// unchanged. Every method here uses inline SQL on s.pool for simple CRUD
+// (handles ErrNotFound / ErrConflict via pgerrcode); the tx-heavy
+// ConsumeOrgInvitation / RemoveOrgMember last-owner paths open their own
+// pgx.Tx and follow the BeginTx precedent at line 226 / 709 / 1269.
+
+// CreateOrg inserts a new org row. Slug collision returns ErrConflict;
+// the partial unique on personal_owner_account_id WHERE personal_org is
+// also caught here and surfaced as ErrConflict. Returns ErrConflict on
+// any 23505 in this method.
+func (s *PgStore) CreateOrg(ctx context.Context, o Org) (Org, error) {
+	if o.ID == "" {
+		o.ID = uuid.NewString()
+	}
+	if o.Plan == "" {
+		o.Plan = api.PlanFree
+	}
+	if o.Status == "" {
+		o.Status = OrgStatusActive
+	}
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = time.Now().UTC()
+	}
+	if o.UpdatedAt.IsZero() {
+		o.UpdatedAt = o.CreatedAt
+	}
+	var personalOwner *string
+	if o.PersonalOwnerAccountID != nil {
+		po := *o.PersonalOwnerAccountID
+		personalOwner = &po
+	}
+	tag, err := s.pool.Exec(ctx, `
+		insert into orgs (
+			id, slug, name, personal_org, personal_owner_account_id,
+			plan, status, provider_customer_id, stripe_subscription_item,
+			deleted_pending, created_at, updated_at
+		) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+	`, o.ID, o.Slug, o.Name, o.Personal, personalOwner,
+		string(o.Plan), string(o.Status),
+		nullIfEmpty(o.ProviderCustomerID), nullIfEmpty(o.StripeSubscriptionItem),
+		o.DeletedPending, o.CreatedAt, o.UpdatedAt)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return Org{}, ErrConflict
+		}
+		return Org{}, fmt.Errorf("state: create org: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return Org{}, fmt.Errorf("state: create org rows=%d", tag.RowsAffected())
+	}
+	return o, nil
+}
+
+// nullIfEmpty maps "" → NULL for nullable text columns.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// OrgByID is the canonical primary-key lookup.
+func (s *PgStore) OrgByID(ctx context.Context, id string) (Org, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, slug, name, personal_org, personal_owner_account_id,
+		       plan, status, provider_customer_id, stripe_subscription_item,
+		       deleted_pending, created_at, updated_at
+		  from orgs where id = $1
+	`, id)
+	return scanOrg(row)
+}
+
+// OrgBySlug case-folds the slug (matches orgs_slug_uniq).
+func (s *PgStore) OrgBySlug(ctx context.Context, slug string) (Org, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, slug, name, personal_org, personal_owner_account_id,
+		       plan, status, provider_customer_id, stripe_subscription_item,
+		       deleted_pending, created_at, updated_at
+		  from orgs where lower(slug) = lower($1)
+	`, slug)
+	return scanOrg(row)
+}
+
+// OrgByPersonalAccount returns the unique personal-org row.
+func (s *PgStore) OrgByPersonalAccount(ctx context.Context, accountID string) (Org, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, slug, name, personal_org, personal_owner_account_id,
+		       plan, status, provider_customer_id, stripe_subscription_item,
+		       deleted_pending, created_at, updated_at
+		  from orgs
+		 where personal_org = true and personal_owner_account_id = $1
+	`, accountID)
+	return scanOrg(row)
+}
+
+// ListOrgsForAccount JOINs the active memberships for an account.
+func (s *PgStore) ListOrgsForAccount(ctx context.Context, accountID string) ([]Org, error) {
+	rows, err := s.pool.Query(ctx, `
+		select distinct o.id, o.slug, o.name, o.personal_org, o.personal_owner_account_id,
+		       o.plan, o.status, o.provider_customer_id, o.stripe_subscription_item,
+		       o.deleted_pending, o.created_at, o.updated_at
+		  from orgs o
+		  join org_memberships m on m.org_id = o.id
+		 where m.account_id = $1 and m.removed_at is null
+		 order by o.slug
+	`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list orgs for account: %w", err)
+	}
+	defer rows.Close()
+	out := make([]Org, 0)
+	for rows.Next() {
+		o, err := scanOrg(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// UpdateOrgPlan / UpdateOrgStatus / SoftDeleteOrg are mirror updates.
+func (s *PgStore) UpdateOrgPlan(ctx context.Context, id string, plan api.Plan) error {
+	tag, err := s.pool.Exec(ctx, `update orgs set plan = $2, updated_at = now() where id = $1`, id, string(plan))
+	if err != nil {
+		return fmt.Errorf("state: update org plan: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PgStore) UpdateOrgStatus(ctx context.Context, id string, status OrgStatus) error {
+	tag, err := s.pool.Exec(ctx, `update orgs set status = $2, updated_at = now() where id = $1`, id, string(status))
+	if err != nil {
+		return fmt.Errorf("state: update org status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PgStore) SoftDeleteOrg(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `
+		update orgs
+		   set status = 'deleted_pending', deleted_pending = true, updated_at = now()
+		 where id = $1
+	`, id)
+	if err != nil {
+		return fmt.Errorf("state: soft delete org: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// scanOrg reads the canonical column tuple into Org. Used by every OrgBy*
+// reader and ListOrgsForAccount.
+func scanOrg(r rowScanner) (Org, error) {
+	var o Org
+	var plan, status string
+	var personalOwner *string
+	var providerCustomer, stripeSub *string
+	if err := r.Scan(
+		&o.ID, &o.Slug, &o.Name, &o.Personal, &personalOwner,
+		&plan, &status, &providerCustomer, &stripeSub,
+		&o.DeletedPending, &o.CreatedAt, &o.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Org{}, ErrNotFound
+		}
+		return Org{}, fmt.Errorf("state: scan org: %w", err)
+	}
+	if personalOwner != nil {
+		po := *personalOwner
+		o.PersonalOwnerAccountID = &po
+	}
+	if providerCustomer != nil {
+		o.ProviderCustomerID = *providerCustomer
+	}
+	if stripeSub != nil {
+		o.StripeSubscriptionItem = *stripeSub
+	}
+	o.Plan = api.Plan(plan)
+	o.Status = OrgStatus(status)
+	return o, nil
+}
+
+// AddOrgMember inserts a membership row. Returns ErrConflict on duplicate
+// PK, ErrOrgLastOwner when adding a second active owner would trip the
+// partial unique, ErrNotFound when the org row is missing.
+func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("state: add org member tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	var orgExists bool
+	if err := tx.QueryRow(ctx, `select exists(select 1 from orgs where id = $1)`, orgID).Scan(&orgExists); err != nil {
+		return fmt.Errorf("state: add org member org probe: %w", err)
+	}
+	if !orgExists {
+		return ErrNotFound
+	}
+
+	var inv *string
+	if invitedBy != nil {
+		ib := *invitedBy
+		inv = &ib
+	}
+	tag, err := tx.Exec(ctx, `
+		insert into org_memberships (org_id, account_id, role, invited_by_account_id)
+		values ($1, $2, $3, $4)
+	`, orgID, accountID, string(role), inv)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		switch {
+		case errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation:
+			// Partial unique org_memberships_one_owner_idx trips as 23505
+			// (and PK collision is also 23505). Disambiguate by role:
+			// adding an owner that's not the first → ErrOrgLastOwner,
+			// otherwise the caller already had a row → ErrConflict.
+			if role == OrgRoleOwner {
+				return ErrOrgLastOwner
+			}
+			return ErrConflict
+		case errors.As(err, &pgErr) && pgErr.Code == pgerrcode.CheckViolation:
+			return fmt.Errorf("state: add org member role check: %w", err)
+		}
+		return fmt.Errorf("state: add org member insert: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("state: add org member rows=%d", tag.RowsAffected())
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: add org member commit: %w", err)
+	}
+	return nil
+}
+
+// RemoveOrgMember stamps removed_at = now() and rejects removing the
+// only active owner. ErrOrgLastOwner when the row IS the only active
+// owner; ErrNotFound when the row is missing.
+func (s *PgStore) RemoveOrgMember(ctx context.Context, orgID, accountID string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("state: remove org member tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	var role string
+	var removedAt *time.Time
+	row := tx.QueryRow(ctx, `
+		select role, removed_at
+		  from org_memberships
+		 where org_id = $1 and account_id = $2
+		   for update
+	`, orgID, accountID)
+	if err := row.Scan(&role, &removedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("state: remove org member probe: %w", err)
+	}
+	if role == string(OrgRoleOwner) && removedAt == nil {
+		return ErrOrgLastOwner
+	}
+	if removedAt != nil {
+		// already removed; idempotent no-op
+		return nil
+	}
+	tag, err := tx.Exec(ctx, `
+		update org_memberships set removed_at = now()
+		 where org_id = $1 and account_id = $2
+	`, orgID, accountID)
+	if err != nil {
+		return fmt.Errorf("state: remove org member update: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: remove org member commit: %w", err)
+	}
+	return nil
+}
+
+// UpdateOrgMemberRole updates the role and rejects demoting the only
+// active owner.
+func (s *PgStore) UpdateOrgMemberRole(ctx context.Context, orgID, accountID string, role OrgRole) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("state: update org member role tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	var currentRole string
+	var removedAt *time.Time
+	row := tx.QueryRow(ctx, `
+		select role, removed_at
+		  from org_memberships
+		 where org_id = $1 and account_id = $2
+		   for update
+	`, orgID, accountID)
+	if err := row.Scan(&currentRole, &removedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("state: update org member role probe: %w", err)
+	}
+	if currentRole == string(OrgRoleOwner) && role != OrgRoleOwner && removedAt == nil {
+		return ErrOrgLastOwner
+	}
+	tag, err := tx.Exec(ctx, `
+		update org_memberships set role = $3
+		 where org_id = $1 and account_id = $2
+	`, orgID, accountID, string(role))
+	if err != nil {
+		var pgErr *pgconn.PgError
+		switch {
+		case errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation:
+			return ErrOrgLastOwner
+		case errors.As(err, &pgErr) && pgErr.Code == pgerrcode.CheckViolation:
+			return fmt.Errorf("state: update org member role check: %w", err)
+		}
+		return fmt.Errorf("state: update org member role: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: update org member role commit: %w", err)
+	}
+	return nil
+}
+
+// ListOrgMembers returns every (active + removed) membership row.
+func (s *PgStore) ListOrgMembers(ctx context.Context, orgID string) ([]OrgMembership, error) {
+	rows, err := s.pool.Query(ctx, `
+		select org_id, account_id, role, invited_by_account_id, joined_at, removed_at
+		  from org_memberships
+		 where org_id = $1
+		 order by joined_at
+	`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list org members: %w", err)
+	}
+	defer rows.Close()
+	out := make([]OrgMembership, 0)
+	for rows.Next() {
+		m, err := scanOrgMembership(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// OrgMemberByAccount returns the single (org, account) row.
+func (s *PgStore) OrgMemberByAccount(ctx context.Context, orgID, accountID string) (OrgMembership, error) {
+	row := s.pool.QueryRow(ctx, `
+		select org_id, account_id, role, invited_by_account_id, joined_at, removed_at
+		  from org_memberships
+		 where org_id = $1 and account_id = $2
+	`, orgID, accountID)
+	return scanOrgMembership(row)
+}
+
+// scanOrgMembership reads one membership row.
+func scanOrgMembership(r rowScanner) (OrgMembership, error) {
+	var m OrgMembership
+	var role string
+	var invitedBy *string
+	if err := r.Scan(&m.OrgID, &m.AccountID, &role, &invitedBy, &m.JoinedAt, &m.RemovedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return OrgMembership{}, ErrNotFound
+		}
+		return OrgMembership{}, fmt.Errorf("state: scan org membership: %w", err)
+	}
+	m.Role = OrgRole(role)
+	if invitedBy != nil {
+		ib := *invitedBy
+		m.InvitedByAccountID = &ib
+	}
+	return m, nil
+}
+
+// CreateOrgInvitation inserts a new pending invitation. The unique
+// on token_hash catches the (astronomically unlikely) duplicate.
+func (s *PgStore) CreateOrgInvitation(ctx context.Context, inv OrgInvitation) (OrgInvitation, error) {
+	if inv.ID == "" {
+		inv.ID = uuid.NewString()
+	}
+	if inv.CreatedAt.IsZero() {
+		inv.CreatedAt = time.Now().UTC()
+	}
+	var invitedBy *string
+	if inv.InvitedByAccountID != nil {
+		ib := *inv.InvitedByAccountID
+		invitedBy = &ib
+	}
+	tag, err := s.pool.Exec(ctx, `
+		insert into org_invitations (
+			id, org_id, email, role, token_hash, invited_by_account_id,
+			expires_at, created_at
+		) values ($1,$2,$3,$4,$5,$6,$7,$8)
+	`, inv.ID, inv.OrgID, inv.Email, string(inv.Role), inv.TokenHash,
+		invitedBy, inv.ExpiresAt, inv.CreatedAt)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return OrgInvitation{}, ErrConflict
+		}
+		return OrgInvitation{}, fmt.Errorf("state: create org invitation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return OrgInvitation{}, fmt.Errorf("state: create org invitation rows=%d", tag.RowsAffected())
+	}
+	return inv, nil
+}
+
+// OrgInvitationByTokenHash is the consume / revoke lookup.
+func (s *PgStore) OrgInvitationByTokenHash(ctx context.Context, hash []byte) (OrgInvitation, error) {
+	row := s.pool.QueryRow(ctx, `
+		select id, org_id, email::text, role, token_hash, invited_by_account_id,
+		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
+		  from org_invitations
+		 where token_hash = $1
+	`, hash)
+	return scanOrgInvitation(row)
+}
+
+// RevokeOrgInvitation stamps revoked_at on a still-pending row.
+func (s *PgStore) RevokeOrgInvitation(ctx context.Context, hash []byte, _ string) error {
+	tag, err := s.pool.Exec(ctx, `
+		update org_invitations set revoked_at = now()
+		 where token_hash = $1
+		   and consumed_at is null
+		   and revoked_at is null
+	`, hash)
+	if err != nil {
+		return fmt.Errorf("state: revoke org invitation: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrOrgInvitationInvalid
+	}
+	return nil
+}
+
+// ListOrgInvitationsForOrg returns every invitation row (any state).
+func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([]OrgInvitation, error) {
+	rows, err := s.pool.Query(ctx, `
+		select id, org_id, email::text, role, token_hash, invited_by_account_id,
+		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
+		  from org_invitations
+		 where org_id = $1
+		 order by created_at desc
+	`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list org invitations: %w", err)
+	}
+	defer rows.Close()
+	out := make([]OrgInvitation, 0)
+	for rows.Next() {
+		inv, err := scanOrgInvitation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
+// ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every
+// pending + past-expires_at row. Returns the count.
+func (s *PgStore) ExpireOrgInvitations(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		update org_invitations set revoked_at = $1
+		 where consumed_at is null
+		   and revoked_at is null
+		   and expires_at < $1
+	`, now)
+	if err != nil {
+		return 0, fmt.Errorf("state: expire org invitations: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// scanOrgInvitation reads one invitation row. email is cast back to text
+// from the citext column so callers see a normalised string.
+func scanOrgInvitation(r rowScanner) (OrgInvitation, error) {
+	var inv OrgInvitation
+	var role, email string
+	var invitedBy *string
+	var consumedAt, revokedAt *time.Time
+	var accepting *string
+	if err := r.Scan(
+		&inv.ID, &inv.OrgID, &email, &role, &inv.TokenHash, &invitedBy,
+		&inv.ExpiresAt, &consumedAt, &revokedAt, &accepting, &inv.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return OrgInvitation{}, ErrNotFound
+		}
+		return OrgInvitation{}, fmt.Errorf("state: scan org invitation: %w", err)
+	}
+	inv.Email = email
+	inv.Role = OrgRole(role)
+	if consumedAt != nil {
+		t := *consumedAt
+		inv.ConsumedAt = &t
+	}
+	if revokedAt != nil {
+		t := *revokedAt
+		inv.RevokedAt = &t
+	}
+	if invitedBy != nil {
+		ib := *invitedBy
+		inv.InvitedByAccountID = &ib
+	}
+	if accepting != nil {
+		a := *accepting
+		inv.AcceptingAccountID = &a
+	}
+	return inv, nil
+}
+
+// ConsumeOrgInvitation is the tx-heavy PR 5 acceptance path. Per
+// ADR-061 §Migration strategy every step runs under one tx with the
+// invitation row locked FOR UPDATE. Returns ErrOrgMemberCapExceeded on
+// the plan cap, ErrOrgInvitationInvalid / ErrOrgInvitationExpired on
+// state failures, ErrOrgAlreadyMember on the membership PK collision.
+func (s *PgStore) ConsumeOrgInvitation(ctx context.Context, hash []byte, accepting Account) (OrgMembership, OrgInvitation, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	// (1) Lock + read the invitation.
+	row := tx.QueryRow(ctx, `
+		select id, org_id, email::text, role, token_hash, invited_by_account_id,
+		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
+		  from org_invitations
+		 where token_hash = $1
+		   for update
+	`, hash)
+	inv, err := scanOrgInvitation(row)
+	if err != nil {
+		return OrgMembership{}, OrgInvitation{}, err
+	}
+
+	// (2) State validations.
+	now := time.Now().UTC()
+	if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
+	}
+	if inv.ExpiresAt.Before(now) {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationExpired
+	}
+	if !strings.EqualFold(inv.Email, accepting.Email) {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
+	}
+
+	// (3) Cap check. orgs.plan drives the limit; read inside the same tx.
+	//
+	// PR 7 cutover note: when plan / billing moves from accounts onto
+	// orgs, this step must run inside an explicit outer transaction with
+	// `SELECT … FROM orgs WHERE id = $1 FOR NO KEY UPDATE` to prevent a
+	// concurrent UpdateOrgPlan from racing a parallel accept. PR 2 uses
+	// the implicit FOR UPDATE on the invitation row plus the org-row
+	// implicit MVCC snapshot read, which is sufficient for the personal-org
+	// backfill path where plan changes are still serialized through the
+	// accounts table. The cutover PR will widen the lock surface here.
+	var planSlug string
+	if err := tx.QueryRow(ctx, `select plan from orgs where id = $1`, inv.OrgID).Scan(&planSlug); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return OrgMembership{}, OrgInvitation{}, ErrNotFound
+		}
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation plan: %w", err)
+	}
+	var activeMembers int
+	if err := tx.QueryRow(ctx, `
+		select count(*) from org_memberships
+		 where org_id = $1 and removed_at is null
+	`, inv.OrgID).Scan(&activeMembers); err != nil {
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation count: %w", err)
+	}
+	limits, _ := api.LimitsFor(api.Plan(planSlug))
+	limit := limits.OrgMembersMax
+	if limit > 0 && activeMembers >= limit {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgMemberCapExceeded
+	}
+
+	// (4) Already-member check (race guard).
+	var existing string
+	err = tx.QueryRow(ctx, `
+		select account_id from org_memberships
+		 where org_id = $1 and account_id = $2 and removed_at is null
+	`, inv.OrgID, accepting.ID).Scan(&existing)
+	switch {
+	case err == nil:
+		return OrgMembership{}, OrgInvitation{}, ErrOrgAlreadyMember
+	case errors.Is(err, pgx.ErrNoRows):
+		// expected
+	default:
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation existing: %w", err)
+	}
+
+	// (5) Insert membership.
+	var inviter *string
+	if inv.InvitedByAccountID != nil {
+		ib := *inv.InvitedByAccountID
+		inviter = &ib
+	}
+	tag, err := tx.Exec(ctx, `
+		insert into org_memberships (org_id, account_id, role, invited_by_account_id)
+		values ($1, $2, $3, $4)
+	`, inv.OrgID, accepting.ID, string(inv.Role), inviter)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return OrgMembership{}, OrgInvitation{}, ErrOrgAlreadyMember
+		}
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation insert: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation rows=%d", tag.RowsAffected())
+	}
+
+	// (6) Stamp invitation.
+	tag, err = tx.Exec(ctx, `
+		update org_invitations
+		   set consumed_at = $2, accepting_account_id = $3
+		 where id = $1
+	`, inv.ID, now, accepting.ID)
+	if err != nil {
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation stamp: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation stamp rows=%d", tag.RowsAffected())
+	}
+
+	// (7) Commit.
+	if err := tx.Commit(ctx); err != nil {
+		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation commit: %w", err)
+	}
+
+	// Return the inserted membership + stamped invitation (post-commit values).
+	acceptingID := accepting.ID
+	inv.AcceptingAccountID = &acceptingID
+	consumedAt := now
+	inv.ConsumedAt = &consumedAt
+	mem := OrgMembership{
+		OrgID:              inv.OrgID,
+		AccountID:          accepting.ID,
+		Role:               inv.Role,
+		InvitedByAccountID: inv.InvitedByAccountID,
+		JoinedAt:           now,
+		RemovedAt:          nil,
+	}
+	return mem, inv, nil
+}
+
 // rowScanner is the minimal Scan(dest ...any) error interface both
 // pgx.Row (single-row scan) and pgx.Rows (multi-row scan) satisfy.
 // Centralising the field list here means a future Session-struct

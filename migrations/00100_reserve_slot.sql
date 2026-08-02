@@ -1,0 +1,33 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00100_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Slot 100 is held by open PR #526 (issue #190 / ADR-061, PR 2 — the
+-- additive org / membership / invitation schema). The companion real
+-- migration is `00099_orgs_memberships_invitations.sql`. After PR #526
+-- lands, this reservation file is `git rm`d post-merge per ADR-041
+-- (the slot is then owned by the real 99 migration; open PR #525
+-- owns 92/93, PR #522 owns 94, PR #529 owns 95/96).
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

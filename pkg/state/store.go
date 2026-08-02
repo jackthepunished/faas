@@ -58,6 +58,24 @@ func (e *QuotaError) Is(target error) bool {
 // Concrete instances are *QuotaError so handlers can read limit/observed.
 var ErrQuotaExceeded = errors.New("state: deployed-app quota exceeded")
 
+// Org-specific sentinels (ADR-061 / IAM-6, PR 2).
+//
+// ErrOrgLastOwner: caller is the only active owner of a non-personal
+// org. Demoting/removing them would leave the org without an owner.
+// ErrOrgAlreadyMember: accepting account already has an active membership.
+// ErrOrgMemberCapExceeded: the org has hit Plan.OrgMembersMax() and the
+// insert (or membership-from-invitation) was rejected inside the tx.
+// ErrOrgInvitationInvalid: token not found, already consumed/revoked, or
+// wrong accepting account (email mismatch).
+// ErrOrgInvitationExpired: token consumed_at / revoked_at / expires_at past.
+var (
+	ErrOrgLastOwner         = errors.New("state: org last owner")
+	ErrOrgAlreadyMember     = errors.New("state: org already member")
+	ErrOrgMemberCapExceeded = errors.New("state: org member cap exceeded")
+	ErrOrgInvitationInvalid = errors.New("state: org invitation invalid")
+	ErrOrgInvitationExpired = errors.New("state: org invitation expired")
+)
+
 // ConsumeAccountCreditParams is the FIFO consumption request (issue
 // #279 PR-C). All fields are required except Reason, which the
 // reducer falls back to a system constant when empty. ProviderInvoiceID
@@ -1912,4 +1930,127 @@ type Store interface {
 	// before UpsertAppTrustedSigner to enforce
 	// Limits.TrustedSignerCountMax.
 	CountAppTrustedSigners(ctx context.Context, accountID, appID string) (int, error)
+
+	// --- Organizations (ADR-061, IAM-6, PR 2) -----------------------------
+	//
+	// PR 2 introduces the schema and state-store surface for orgs,
+	// memberships, and invitations. PR 3 stamps personal orgs onto every
+	// existing account (backfill); PR 5 adds the handlers that call these
+	// methods. PR 2 ships no handler-side callers, so the methods are
+	// exercised only by sister-file parity tests for now.
+	//
+	// The Store interface is INTERFACE-PURE — no pgx.Tx leaks. The single
+	// tx-heavy method (ConsumeOrgInvitation) opens and commits its own
+	// transaction internally; the only seam of note is that pgstore's
+	// internals use BeginTx inline.
+
+	// TODO(issue-190 PR 4): wrap CreateOrg (and every mutating org
+	// method below) with a pkg/authz RequireOrgAction(action) seam
+	// before handlers land in PR 5. PR 2 ships only the store surface;
+	// PR 4 introduces the closed role/action table and the middleware
+	// facade. Until then, callers (only sister-file parity tests today)
+	// bypass role enforcement; this is deliberate so PR 2 can merge
+	// without a circular dep on pkg/authz.
+
+	// CreateOrg inserts a new org row. Returns ErrConflict on slug
+	// collision (case-insensitive via the lower(slug) unique index).
+	// Personal = true rows must carry PersonalOwnerAccountID and the
+	// (personal_owner_account_id) WHERE personal_org = true partial
+	// unique enforces exactly-one-personal-per-account; a second personal
+	// org for the same account returns ErrConflict.
+	CreateOrg(ctx context.Context, o Org) (Org, error)
+
+	// OrgByID is the canonical lookup by primary key. Returns
+	// ErrNotFound when the row does not exist.
+	OrgByID(ctx context.Context, id string) (Org, error)
+
+	// OrgBySlug is the case-insensitive slug lookup that backs the
+	// path-scoped /v1/orgs/{slug}/* routes (PR 4/5).
+	OrgBySlug(ctx context.Context, slug string) (Org, error)
+
+	// OrgByPersonalAccount returns the unique personal-org row for an
+	// account. Returns ErrNotFound if the account has no personal org
+	// yet (pre-PR-3) or if a personal-org row was never backfilled.
+	OrgByPersonalAccount(ctx context.Context, accountID string) (Org, error)
+
+	// ListOrgsForAccount returns every org the account has an active
+	// membership in. Used by GET /v1/orgs in PR 4.
+	ListOrgsForAccount(ctx context.Context, accountID string) ([]Org, error)
+
+	// UpdateOrgPlan is the PR 7 seam — moves plan changes from
+	// UpdateAccountPlan onto the personal org inside one transaction.
+	UpdateOrgPlan(ctx context.Context, id string, plan api.Plan) error
+
+	// UpdateOrgStatus mirrors UpdateAccountStatus for PR 7's dunning
+	// pivot. Valid statuses are active / past_due / suspended /
+	// deleted_pending (CHECK enforced at SQL).
+	UpdateOrgStatus(ctx context.Context, id string, status OrgStatus) error
+
+	// SoftDeleteOrg sets deleted_pending = true. The hard-delete flow
+	// lands in PR 8; PR 2 only stamps the flag.
+	SoftDeleteOrg(ctx context.Context, id string) error
+
+	// AddOrgMember inserts a membership row. Returns ErrConflict on
+	// duplicate (org_id, account_id), and ErrOrgLastOwner if the
+	// (org_id, role='owner' AND removed_at IS NULL) partial unique
+	// trips (mapped from 23505). invitedBy may be nil when the
+	// member was the personal-org backfill (no inviter).
+	AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error
+
+	// RemoveOrgMember stamps removed_at = now() on the row. Returns
+	// ErrOrgLastOwner when the row is the only active owner — the
+	// ownership-transfer seam in PR 5 is the only path that can
+	// remove the last owner.
+	RemoveOrgMember(ctx context.Context, orgID, accountID string) error
+
+	// UpdateOrgMemberRole updates the role. Returns ErrOrgLastOwner
+	// when demoting the only active owner to a non-owner role.
+	UpdateOrgMemberRole(ctx context.Context, orgID, accountID string, role OrgRole) error
+
+	// ListOrgMembers returns every membership row (including
+	// removed_at != nil) ordered by joined_at. The handler layer
+	// filters removed rows at the API boundary.
+	ListOrgMembers(ctx context.Context, orgID string) ([]OrgMembership, error)
+
+	// OrgMemberByAccount returns the (org_id, account_id) row.
+	// Returns ErrNotFound when no membership exists.
+	OrgMemberByAccount(ctx context.Context, orgID, accountID string) (OrgMembership, error)
+
+	// CreateOrgInvitation inserts a new pending invitation. The handler
+	// (PR 5) generates the random token bytes and SHA-256-hashes them
+	// before calling this method; only the hash is stored. Returns
+	// ErrConflict on duplicate token_hash (astronomically unlikely).
+	CreateOrgInvitation(ctx context.Context, inv OrgInvitation) (OrgInvitation, error)
+
+	// OrgInvitationByTokenHash is the consume / revoke lookup. Returns
+	// ErrNotFound for unknown hashes.
+	OrgInvitationByTokenHash(ctx context.Context, hash []byte) (OrgInvitation, error)
+
+	// ConsumeOrgInvitation is the tx-heavy PR 5 acceptance path. It
+	// locks the invitation row FOR UPDATE, validates state (pending +
+	// not expired), email-equality against the accepting account,
+	// membership cap, then inserts the membership and stamps
+	// consumed_at + accepting_account_id atomically. Concurrent
+	// accepts race at the partial unique or at the cap check and
+	// surface as ErrOrgAlreadyMember / ErrOrgInvitationInvalid /
+	// ErrOrgMemberCapExceeded. Returns the resulting membership and
+	// the consumed invitation row.
+	ConsumeOrgInvitation(ctx context.Context, hash []byte, acceptingAccount Account) (OrgMembership, OrgInvitation, error)
+
+	// RevokeOrgInvitation stamps revoked_at = now() if the row is
+	// still pending. Returns ErrOrgInvitationInvalid when the
+	// invitation is already consumed or revoked.
+	RevokeOrgInvitation(ctx context.Context, hash []byte, byAccountID string) error
+
+	// ListOrgInvitationsForOrg returns every invitation row
+	// (regardless of state) ordered by created_at desc. The
+	// invitation-cleanup loop filters pending + expired at the
+	// caller.
+	ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([]OrgInvitation, error)
+
+	// ExpireOrgInvitations is the cleanup-tick method (modelled on
+	// the login-token cleanup loop) that stamps revoked_at on every
+	// pending + past-expires_at row in one UPDATE. Returns the count
+	// of rows transitioned so the caller can log a metric.
+	ExpireOrgInvitations(ctx context.Context, now time.Time) (int64, error)
 }

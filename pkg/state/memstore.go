@@ -244,6 +244,17 @@ type MemStore struct {
 	// (issue #472 / ADR-054). Populated by the admin CRUD handlers in
 	// cmd/apid/handlers_trusted_signers.go; not exposed to schedd.
 	trustedSigners map[trustedSignerKey]AppTrustedSigner
+	// orgs / memberships / invitations are the IAM-6 / ADR-061 in-memory
+	// mirrors. orgs is keyed by Org.ID; orgsBySlug (case-folded) backs
+	// the case-insensitive OrgBySlug lookup; memberships are keyed by
+	// the composite (orgID, accountID) PK; invitations by the SHA-256
+	// token hash (hex-encoded for map safety). All maps are guarded
+	// by m.mu and never escape the package — handlers go through
+	// Store (this interface) so the sqlc vs memstore parity holds.
+	orgs        map[string]Org
+	orgsBySlug  map[string]string // lower(slug) -> id
+	memberships map[orgAccountKey]OrgMembership
+	invitations map[string]OrgInvitation // hex(hash) -> OrgInvitation
 	// computeNodes mirrors the compute_nodes table; keyed by id (issue
 	// #97 / ADR-025 axis 3). The synthetic 'default-local' row is
 	// seeded by NewMemStore so tests don't have to call
@@ -496,6 +507,10 @@ func NewMemStore() *MemStore {
 		registryCreds:        map[registryCredKey]AppRegistryCredential{},
 		envs:                 map[envKey]AppEnv{},
 		trustedSigners:       map[trustedSignerKey]AppTrustedSigner{},
+		orgs:                 map[string]Org{},
+		orgsBySlug:           map[string]string{},
+		memberships:          map[orgAccountKey]OrgMembership{},
+		invitations:          map[string]OrgInvitation{},
 		// computeNodes is empty here; seedDefaultLocalNodeLocked
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
@@ -7264,4 +7279,381 @@ func derefPrefixes(p *[]netip.Prefix) []netip.Prefix {
 		return nil
 	}
 	return *p
+}
+
+// --- Organizations (ADR-061, IAM-6, PR 2) --------------------------------
+//
+// Mirrors the schema + sqlc surface 1:1 under m.mu. Errors returned here
+// must match the PgStore sentinel set (ErrConflict, ErrNotFound,
+// ErrOrgLastOwner, ErrOrgAlreadyMember, ErrOrgMemberCapExceeded,
+// ErrOrgInvitationInvalid, ErrOrgInvitationExpired) so sister-file tests
+// stay byte-comparable.
+
+// orgAccountKey is the (org_id, account_id) composite mirror of the
+// org_memberships PRIMARY KEY.
+type orgAccountKey struct {
+	OrgID     string
+	AccountID string
+}
+
+// CreateOrg inserts an org row. Returns ErrConflict on slug collision
+// (case-insensitive) or on a second personal org for the same account
+// (the partial unique orgs_one_personal_per_account_uniq is enforced
+// here in code; PgStore lets the SQL do it).
+func (m *MemStore) CreateOrg(_ context.Context, o Org) (Org, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if o.ID == "" {
+		o.ID = newID()
+	}
+	slugKey := strings.ToLower(o.Slug)
+	if _, exists := m.orgsBySlug[slugKey]; exists {
+		return Org{}, ErrConflict
+	}
+	// Defensive: Personal=true must carry PersonalOwnerAccountID. The SQL
+	// CHECK orgs_personal_owner_link would reject the row on insert, but
+	// the MemStore path dereferences the pointer below, so we guard
+	// before the scan to keep MemStore panic-free.
+	if o.Personal && o.PersonalOwnerAccountID == nil {
+		return Org{}, ErrConflict
+	}
+	if o.Personal {
+		for _, existing := range m.orgs {
+			if existing.Personal && existing.PersonalOwnerAccountID != nil &&
+				*existing.PersonalOwnerAccountID == *o.PersonalOwnerAccountID {
+				return Org{}, ErrConflict
+			}
+		}
+	}
+	if o.CreatedAt.IsZero() {
+		o.CreatedAt = time.Now().UTC()
+	}
+	if o.UpdatedAt.IsZero() {
+		o.UpdatedAt = o.CreatedAt
+	}
+	if o.Plan == "" {
+		o.Plan = api.PlanFree
+	}
+	if o.Status == "" {
+		o.Status = OrgStatusActive
+	}
+	m.orgs[o.ID] = o
+	m.orgsBySlug[slugKey] = o.ID
+	return o, nil
+}
+
+// OrgByID is the canonical primary-key lookup.
+func (m *MemStore) OrgByID(_ context.Context, id string) (Org, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[id]
+	if !ok {
+		return Org{}, ErrNotFound
+	}
+	return o, nil
+}
+
+// OrgBySlug case-folds the slug and returns the matching row.
+func (m *MemStore) OrgBySlug(_ context.Context, slug string) (Org, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.orgsBySlug[strings.ToLower(slug)]
+	if !ok {
+		return Org{}, ErrNotFound
+	}
+	return m.orgs[id], nil
+}
+
+// OrgByPersonalAccount returns the unique personal-org row for an
+// account. Returns ErrNotFound when no personal org exists yet
+// (pre-PR-3 era).
+func (m *MemStore) OrgByPersonalAccount(_ context.Context, accountID string) (Org, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, o := range m.orgs {
+		if o.Personal && o.PersonalOwnerAccountID != nil && *o.PersonalOwnerAccountID == accountID {
+			return o, nil
+		}
+	}
+	return Org{}, ErrNotFound
+}
+
+// ListOrgsForAccount returns every org the account has an active
+// membership in.
+func (m *MemStore) ListOrgsForAccount(_ context.Context, accountID string) ([]Org, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := map[string]struct{}{}
+	out := make([]Org, 0)
+	for k, mem := range m.memberships {
+		if k.AccountID != accountID || mem.RemovedAt != nil {
+			continue
+		}
+		if _, dup := seen[k.OrgID]; dup {
+			continue
+		}
+		seen[k.OrgID] = struct{}{}
+		if o, ok := m.orgs[k.OrgID]; ok {
+			out = append(out, o)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slug < out[j].Slug })
+	return out, nil
+}
+
+// UpdateOrgPlan / UpdateOrgStatus / SoftDeleteOrg are mirror updates.
+func (m *MemStore) UpdateOrgPlan(_ context.Context, id string, plan api.Plan) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	o.Plan = plan
+	o.UpdatedAt = time.Now().UTC()
+	m.orgs[id] = o
+	return nil
+}
+
+func (m *MemStore) UpdateOrgStatus(_ context.Context, id string, status OrgStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	o.Status = status
+	o.UpdatedAt = time.Now().UTC()
+	m.orgs[id] = o
+	return nil
+}
+
+func (m *MemStore) SoftDeleteOrg(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	o.DeletedPending = true
+	o.Status = OrgStatusDeletedPending
+	o.UpdatedAt = time.Now().UTC()
+	m.orgs[id] = o
+	return nil
+}
+
+// AddOrgMember inserts a membership row. Returns ErrConflict on
+// duplicate (org_id, account_id), ErrOrgLastOwner when the partial
+// unique would trip, and ErrNotFound on missing parent.
+func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.orgs[orgID]; !ok {
+		return ErrNotFound
+	}
+	k := orgAccountKey{OrgID: orgID, AccountID: accountID}
+	if _, exists := m.memberships[k]; exists {
+		return ErrConflict
+	}
+	if role == OrgRoleOwner {
+		for _, existing := range m.memberships {
+			if existing.OrgID == orgID && existing.Role == OrgRoleOwner && existing.RemovedAt == nil {
+				return ErrOrgLastOwner
+			}
+		}
+	}
+	now := time.Now().UTC()
+	m.memberships[k] = OrgMembership{
+		OrgID:              orgID,
+		AccountID:          accountID,
+		Role:               role,
+		InvitedByAccountID: invitedBy,
+		JoinedAt:           now,
+		RemovedAt:          nil,
+	}
+	return nil
+}
+
+// RemoveOrgMember stamps removed_at and rejects removing the only
+// active owner.
+func (m *MemStore) RemoveOrgMember(_ context.Context, orgID, accountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := orgAccountKey{OrgID: orgID, AccountID: accountID}
+	mem, ok := m.memberships[k]
+	if !ok {
+		return ErrNotFound
+	}
+	if mem.Role == OrgRoleOwner && mem.RemovedAt == nil {
+		return ErrOrgLastOwner
+	}
+	now := time.Now().UTC()
+	mem.RemovedAt = &now
+	m.memberships[k] = mem
+	return nil
+}
+
+// UpdateOrgMemberRole updates the role and rejects demoting the only
+// active owner.
+func (m *MemStore) UpdateOrgMemberRole(_ context.Context, orgID, accountID string, role OrgRole) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := orgAccountKey{OrgID: orgID, AccountID: accountID}
+	mem, ok := m.memberships[k]
+	if !ok {
+		return ErrNotFound
+	}
+	if mem.Role == OrgRoleOwner && role != OrgRoleOwner && mem.RemovedAt == nil {
+		return ErrOrgLastOwner
+	}
+	mem.Role = role
+	m.memberships[k] = mem
+	return nil
+}
+
+// ListOrgMembers returns every membership row, ordered by JoinedAt.
+func (m *MemStore) ListOrgMembers(_ context.Context, orgID string) ([]OrgMembership, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]OrgMembership, 0)
+	for _, mem := range m.memberships {
+		if mem.OrgID == orgID {
+			out = append(out, mem)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].JoinedAt.Before(out[j].JoinedAt) })
+	return out, nil
+}
+
+// OrgMemberByAccount looks up the (org, account) row.
+func (m *MemStore) OrgMemberByAccount(_ context.Context, orgID, accountID string) (OrgMembership, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mem, ok := m.memberships[orgAccountKey{OrgID: orgID, AccountID: accountID}]
+	if !ok {
+		return OrgMembership{}, ErrNotFound
+	}
+	return mem, nil
+}
+
+// CreateOrgInvitation inserts a pending invitation.
+func (m *MemStore) CreateOrgInvitation(_ context.Context, inv OrgInvitation) (OrgInvitation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if inv.ID == "" {
+		inv.ID = newID()
+	}
+	if inv.CreatedAt.IsZero() {
+		inv.CreatedAt = time.Now().UTC()
+	}
+	hashKey := hex.EncodeToString(inv.TokenHash)
+	if _, exists := m.invitations[hashKey]; exists {
+		return OrgInvitation{}, ErrConflict
+	}
+	m.invitations[hashKey] = inv
+	return inv, nil
+}
+
+// OrgInvitationByTokenHash is the consume/revoke lookup.
+func (m *MemStore) OrgInvitationByTokenHash(_ context.Context, hash []byte) (OrgInvitation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inv, ok := m.invitations[hex.EncodeToString(hash)]
+	if !ok {
+		return OrgInvitation{}, ErrNotFound
+	}
+	return inv, nil
+}
+
+// ConsumeOrgInvitation is the tx-heavy acceptance path. MemStore's
+// m.mu covers the same atomicity boundary that the PgStore transaction
+// does — every step below runs under the same lock so concurrent
+// callers see a serialised outcome matching the SQL-side FOR UPDATE.
+func (m *MemStore) ConsumeOrgInvitation(_ context.Context, hash []byte, acceptingAccount Account) (OrgMembership, OrgInvitation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hashKey := hex.EncodeToString(hash)
+	inv, ok := m.invitations[hashKey]
+	if !ok {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
+	}
+	if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
+	}
+	if !inv.ExpiresAt.IsZero() && inv.ExpiresAt.Before(time.Now().UTC()) {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationExpired
+	}
+	if !strings.EqualFold(inv.Email, acceptingAccount.Email) {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
+	}
+	// Insert membership; surface ErrOrgAlreadyMember if a parallel
+	// accept beat us.
+	k := orgAccountKey{OrgID: inv.OrgID, AccountID: acceptingAccount.ID}
+	if _, exists := m.memberships[k]; exists {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgAlreadyMember
+	}
+	now := time.Now().UTC()
+	acceptingID := acceptingAccount.ID
+	mem := OrgMembership{
+		OrgID:              inv.OrgID,
+		AccountID:          acceptingAccount.ID,
+		Role:               inv.Role,
+		InvitedByAccountID: inv.InvitedByAccountID,
+		JoinedAt:           now,
+		RemovedAt:          nil,
+	}
+	m.memberships[k] = mem
+	inv.ConsumedAt = &now
+	inv.AcceptingAccountID = &acceptingID
+	m.invitations[hashKey] = inv
+	return mem, inv, nil
+}
+
+// RevokeOrgInvitation stamps revoked_at on a still-pending row.
+func (m *MemStore) RevokeOrgInvitation(_ context.Context, hash []byte, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hashKey := hex.EncodeToString(hash)
+	inv, ok := m.invitations[hashKey]
+	if !ok {
+		return ErrNotFound
+	}
+	if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+		return ErrOrgInvitationInvalid
+	}
+	now := time.Now().UTC()
+	inv.RevokedAt = &now
+	m.invitations[hashKey] = inv
+	return nil
+}
+
+// ListOrgInvitationsForOrg returns every row ordered by created_at desc.
+func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]OrgInvitation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]OrgInvitation, 0)
+	for _, inv := range m.invitations {
+		if inv.OrgID == orgID {
+			out = append(out, inv)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every
+// pending + past-expires_at row.
+func (m *MemStore) ExpireOrgInvitations(_ context.Context, now time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int64
+	for k, inv := range m.invitations {
+		if inv.ConsumedAt == nil && inv.RevokedAt == nil && inv.ExpiresAt.Before(now) {
+			nowStamp := now
+			inv.RevokedAt = &nowStamp
+			m.invitations[k] = inv
+			n++
+		}
+	}
+	return n, nil
 }

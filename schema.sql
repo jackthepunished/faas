@@ -16,6 +16,20 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
+-- Name: public; Type: SCHEMA; Schema: -; Owner: -
+--
+
+-- *not* creating schema, since initdb creates it
+
+
+--
+-- Name: SCHEMA public; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON SCHEMA public IS '';
+
+
+--
 -- Name: citext; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -76,6 +90,20 @@ $$;
 
 
 --
+-- Name: compute_node_keys_notify(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.compute_node_keys_notify() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+begin
+    perform pg_notify('compute_node_changed', TG_TABLE_NAME);
+    return null;
+end;
+$$;
+
+
+--
 -- Name: compute_node_notify(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -91,6 +119,28 @@ begin
     );
     perform pg_notify('compute_node_changed', payload::text);
     return new;
+end;
+$$;
+
+
+--
+-- Name: egress_policy_notify(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.egress_policy_notify() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+begin
+    perform pg_notify(
+        'egress_policy_changed',
+        json_build_object(
+            'policy_id', new.id,
+            'public_iface', new.public_iface,
+            'masquerade_cidr', new.masquerade_cidr,
+            'changed_at', new.changed_at
+        )::text
+    );
+    return null;
 end;
 $$;
 
@@ -154,6 +204,28 @@ begin
     perform pg_notify('invocation_due', payload::text);
     return new;
 end;
+$$;
+
+
+--
+-- Name: pg_tier_rank(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pg_tier_rank(tier text) RETURNS integer
+    LANGUAGE sql IMMUTABLE
+    AS $$
+    SELECT CASE tier
+        WHEN 'compose'    THEN 8
+        WHEN 'k8s'        THEN 8
+        WHEN 'render'     THEN 8
+        WHEN 'fly'        THEN 8
+        WHEN 'serverless' THEN 8
+        WHEN 'procfile'   THEN 6
+        WHEN 'workspace'  THEN 4
+        WHEN 'convention' THEN 2
+        WHEN 'single'     THEN 1
+        ELSE 0
+    END
 $$;
 
 
@@ -258,6 +330,7 @@ CREATE TABLE public.alert_rules (
     last_evaluated_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid,
     CONSTRAINT alert_rules_comparison_chk CHECK ((comparison = ANY (ARRAY['gt'::text, 'gte'::text, 'lt'::text, 'lte'::text]))),
     CONSTRAINT alert_rules_cooldown_chk CHECK (((cooldown_minutes >= 5) AND (cooldown_minutes <= 1440))),
     CONSTRAINT alert_rules_failure_source_chk CHECK (((failure_source IS NULL) OR (failure_source = ANY (ARRAY['any'::text, 'cron'::text, 'queue'::text, 'delayed_task'::text, 'async_invoke'::text])))),
@@ -281,6 +354,7 @@ CREATE TABLE public.api_keys (
     last_used_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     scopes text[] DEFAULT '{admin}'::text[] NOT NULL,
+    org_id uuid,
     CONSTRAINT api_keys_scopes_vocab_chk CHECK (((scopes <@ ARRAY['admin'::text, 'deploy:write'::text, 'secrets:read'::text, 'secrets:write'::text, 'usage:read'::text, 'apps:read'::text, 'env:read'::text, 'env:write'::text]) AND (cardinality(scopes) > 0)))
 );
 
@@ -296,6 +370,7 @@ CREATE TABLE public.app_envs (
     value text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid,
     CONSTRAINT app_envs_key_shape CHECK (((key ~ '^[A-Z][A-Z0-9_]*$'::text) AND (length(key) <= 128)))
 );
 
@@ -311,7 +386,24 @@ CREATE TABLE public.app_secrets (
     ciphertext bytea NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid,
     CONSTRAINT app_secrets_key_shape CHECK (((key ~ '^[A-Z][A-Z0-9_]*$'::text) AND (length(key) <= 128)))
+);
+
+
+--
+-- Name: app_trusted_signers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_trusted_signers (
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    signer_name text NOT NULL,
+    cosign_public_key bytea NOT NULL,
+    added_at timestamp with time zone DEFAULT now() NOT NULL,
+    added_by_account_id uuid NOT NULL,
+    CONSTRAINT app_trusted_signers_name_shape CHECK ((signer_name ~ '^[a-z0-9][a-z0-9_-]{0,63}$'::text)),
+    CONSTRAINT app_trusted_signers_pem_shape CHECK (((octet_length(cosign_public_key) >= 64) AND (octet_length(cosign_public_key) <= 1024)))
 );
 
 
@@ -346,9 +438,17 @@ CREATE TABLE public.apps (
     workload_name text DEFAULT ''::text NOT NULL,
     workload_class text DEFAULT 'http'::text NOT NULL,
     start_command text,
+    streaming_enabled boolean DEFAULT false NOT NULL,
+    scaling_policy jsonb DEFAULT '{}'::jsonb NOT NULL,
+    last_scale_out_at timestamp with time zone,
+    last_scale_in_at timestamp with time zone,
+    require_signed boolean DEFAULT false NOT NULL,
+    org_id uuid,
     CONSTRAINT apps_autoscale_target_cpu_pct_range CHECK (((autoscale_target_cpu_pct IS NULL) OR ((autoscale_target_cpu_pct >= 0) AND (autoscale_target_cpu_pct <= 100)))),
     CONSTRAINT apps_autoscale_target_rps_nonneg CHECK (((autoscale_target_rps IS NULL) OR (autoscale_target_rps >= 0))),
     CONSTRAINT apps_idle_timeout_s_check CHECK (((idle_timeout_s IS NULL) OR (idle_timeout_s >= 10))),
+    CONSTRAINT apps_last_scale_in_at_le_now_chk CHECK (((last_scale_in_at IS NULL) OR (last_scale_in_at <= now()))),
+    CONSTRAINT apps_last_scale_out_at_le_now_chk CHECK (((last_scale_out_at IS NULL) OR (last_scale_out_at <= now()))),
     CONSTRAINT apps_max_concurrency_check CHECK ((max_concurrency >= 1)),
     CONSTRAINT apps_min_instances_check CHECK ((min_instances >= 0)),
     CONSTRAINT apps_ram_mb_check CHECK ((ram_mb > 0)),
@@ -396,6 +496,35 @@ CREATE TABLE public.build_provenance (
 
 
 --
+-- Name: builder_usage; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.builder_usage (
+    build_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    finished_at timestamp with time zone NOT NULL,
+    kind text DEFAULT 'none'::text NOT NULL,
+    seconds bigint DEFAULT 0 NOT NULL,
+    org_id uuid
+);
+
+
+--
+-- Name: TABLE builder_usage; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.builder_usage IS 'Per-build wall-clock seconds, one row per terminal build. Source: cmd/builderd reaper + markSucceeded/markFailed adapters. ADR-048. Informational only — not billed.';
+
+
+--
+-- Name: COLUMN builder_usage.kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.builder_usage.kind IS 'build kind (railpack|dockerfile|tarball). Mirrors builds.kind. ADR-048.';
+
+
+--
 -- Name: builds; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -411,7 +540,7 @@ CREATE TABLE public.builds (
     finished_at timestamp with time zone,
     enqueued_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT builds_failure_class_check CHECK (((failure_class IS NULL) OR (failure_class = ANY (ARRAY['oom'::text, 'timeout'::text, 'user_error'::text, 'infra'::text])))),
-    CONSTRAINT builds_kind_check CHECK ((kind = ANY (ARRAY['railpack'::text, 'dockerfile'::text, 'tarball'::text]))),
+    CONSTRAINT builds_kind_check CHECK ((kind = ANY (ARRAY['railpack'::text, 'dockerfile'::text, 'tarball'::text, 'github'::text]))),
     CONSTRAINT builds_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text])))
 );
 
@@ -465,6 +594,20 @@ ALTER SEQUENCE public.compute_node_heartbeats_id_seq OWNED BY public.compute_nod
 
 
 --
+-- Name: compute_node_keys; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_node_keys (
+    compute_node_id uuid NOT NULL,
+    key_id text NOT NULL,
+    public_key_pem text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT compute_node_keys_key_id_shape CHECK ((key_id ~ '^[a-f0-9]{64}$'::text)),
+    CONSTRAINT compute_node_keys_pem_shape CHECK ((public_key_pem ~~ '-----BEGIN PUBLIC KEY-----%'::text))
+);
+
+
+--
 -- Name: compute_nodes; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -479,12 +622,30 @@ CREATE TABLE public.compute_nodes (
     active boolean DEFAULT true NOT NULL,
     last_heartbeat_at timestamp with time zone DEFAULT now() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    region text,
+    zone text,
+    vcpu_budget integer DEFAULT 160 NOT NULL,
     CONSTRAINT compute_nodes_admission_ceiling_mb_check CHECK ((admission_ceiling_mb > 0)),
     CONSTRAINT compute_nodes_max_concurrency_check CHECK ((max_concurrency > 0)),
     CONSTRAINT compute_nodes_mem_mb_check CHECK ((mem_mb > 0)),
     CONSTRAINT compute_nodes_target_url_check CHECK ((target_url ~ '^(unix|tcp|dns)://'::text)),
+    CONSTRAINT compute_nodes_vcpu_budget_check CHECK ((vcpu_budget > 0)),
     CONSTRAINT compute_nodes_vpcpus_check CHECK ((vpcpus > 0))
 );
+
+
+--
+-- Name: COLUMN compute_nodes.region; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.region IS 'Locality label for the chooser tie-break (pkg/sched/placement.go). Free-form text; nullable so pre-00072 rows accept the schema. The seeded default-local row is backfilled to ''local''. ADR-025.';
+
+
+--
+-- Name: COLUMN compute_nodes.zone; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.compute_nodes.zone IS 'Finer locality inside region. Currently informational; nullable. ADR-025.';
 
 
 --
@@ -515,7 +676,8 @@ CREATE TABLE public.crons (
     path text DEFAULT '/'::text NOT NULL,
     enabled boolean DEFAULT true NOT NULL,
     last_fired_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid
 );
 
 
@@ -528,7 +690,8 @@ CREATE TABLE public.custom_domains (
     app_id uuid NOT NULL,
     verified_at timestamp with time zone,
     challenge_token text DEFAULT ''::text NOT NULL,
-    app_id_redirect uuid
+    app_id_redirect uuid,
+    org_id uuid
 );
 
 
@@ -594,8 +757,21 @@ CREATE TABLE public.deployments (
     override_port integer,
     override_healthcheck jsonb,
     CONSTRAINT deployments_commit_sha_shape_chk CHECK (((commit_sha IS NULL) OR (((char_length(commit_sha) >= 7) AND (char_length(commit_sha) <= 64)) AND (commit_sha ~ '^[0-9a-f]+$'::text)))),
-    CONSTRAINT deployments_kind_check CHECK ((kind = ANY (ARRAY['image'::text, 'tarball'::text, 'dockerfile'::text]))),
+    CONSTRAINT deployments_kind_check CHECK ((kind = ANY (ARRAY['image'::text, 'tarball'::text, 'dockerfile'::text, 'github'::text]))),
     CONSTRAINT deployments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'building'::text, 'imaging'::text, 'snapshotting'::text, 'live'::text, 'failed'::text, 'superseded'::text])))
+);
+
+
+--
+-- Name: egress_policy; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.egress_policy (
+    id text NOT NULL,
+    public_iface text NOT NULL,
+    masquerade_cidr text NOT NULL,
+    changed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT egress_policy_singleton CHECK ((id = 'singleton'::text))
 );
 
 
@@ -609,7 +785,8 @@ CREATE TABLE public.events (
     actor text NOT NULL,
     kind text NOT NULL,
     subject uuid,
-    data jsonb
+    data jsonb,
+    actor_account_id uuid
 );
 
 
@@ -638,6 +815,7 @@ CREATE TABLE public.gdpr_requests (
     action text NOT NULL,
     requested_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
+    org_id uuid,
     CONSTRAINT gdpr_requests_action_check CHECK ((action = ANY (ARRAY['export'::text, 'delete'::text, 'restore'::text])))
 );
 
@@ -653,7 +831,8 @@ CREATE TABLE public.github_installations (
     sealed_install_token bytea NOT NULL,
     token_expires_at timestamp with time zone NOT NULL,
     sealed_at timestamp with time zone DEFAULT now() NOT NULL,
-    audit_github_login text NOT NULL
+    audit_github_login text NOT NULL,
+    org_id uuid
 );
 
 
@@ -715,6 +894,7 @@ CREATE TABLE public.instances (
     terminal_at timestamp with time zone,
     node_id uuid NOT NULL,
     wake_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    org_id uuid,
     CONSTRAINT instances_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'parked'::text, 'waking'::text, 'cold_booting'::text, 'running'::text, 'snapshotting'::text, 'stopped'::text, 'failed'::text, 'evicting_account_deleting'::text])))
 );
 
@@ -745,6 +925,7 @@ CREATE TABLE public.invocations (
     attempts integer DEFAULT 0 NOT NULL,
     last_error text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid,
     CONSTRAINT invocations_source_check CHECK ((source = ANY (ARRAY['async_invoke'::text, 'queue'::text, 'delayed_task'::text, 'cron'::text]))),
     CONSTRAINT invocations_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'dispatching'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'dead_letter'::text])))
 );
@@ -786,6 +967,7 @@ CREATE TABLE public.invoices (
     raw jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid,
     CONSTRAINT invoices_amount_paid_cents_check CHECK ((amount_paid_cents >= 0)),
     CONSTRAINT invoices_currency_check CHECK ((currency = 'eur'::text)),
     CONSTRAINT invoices_provider_check CHECK ((provider = ANY (ARRAY['stripe'::text, 'paddle'::text]))),
@@ -823,6 +1005,67 @@ CREATE TABLE public.oauth_links (
 
 
 --
+-- Name: org_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.org_invitations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    org_id uuid NOT NULL,
+    email public.citext NOT NULL,
+    role text NOT NULL,
+    token_hash bytea NOT NULL,
+    invited_by_account_id uuid,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    accepting_account_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT org_invitations_role_chk CHECK ((role = ANY (ARRAY['admin'::text, 'developer'::text, 'viewer'::text, 'billing'::text]))),
+    CONSTRAINT org_invitations_state_chk CHECK ((((consumed_at IS NULL) AND (revoked_at IS NULL)) OR ((consumed_at IS NOT NULL) AND (revoked_at IS NULL)) OR ((consumed_at IS NULL) AND (revoked_at IS NOT NULL))))
+);
+
+
+--
+-- Name: org_memberships; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.org_memberships (
+    org_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    role text NOT NULL,
+    invited_by_account_id uuid,
+    joined_at timestamp with time zone DEFAULT now() NOT NULL,
+    removed_at timestamp with time zone,
+    CONSTRAINT org_memberships_removed_role_chk CHECK (((removed_at IS NULL) OR (role = ANY (ARRAY['admin'::text, 'developer'::text, 'viewer'::text, 'billing'::text])))),
+    CONSTRAINT org_memberships_role_chk CHECK ((role = ANY (ARRAY['owner'::text, 'admin'::text, 'developer'::text, 'viewer'::text, 'billing'::text])))
+);
+
+
+--
+-- Name: orgs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.orgs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    slug text NOT NULL,
+    name text NOT NULL,
+    personal_org boolean DEFAULT false NOT NULL,
+    personal_owner_account_id uuid,
+    plan text DEFAULT 'free'::text NOT NULL,
+    status text DEFAULT 'active'::text NOT NULL,
+    provider_customer_id text,
+    stripe_subscription_item text,
+    deleted_pending boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT orgs_personal_owner_link CHECK ((((personal_org = true) AND (personal_owner_account_id IS NOT NULL)) OR ((personal_org = false) AND (personal_owner_account_id IS NULL)))),
+    CONSTRAINT orgs_plan_chk CHECK ((plan = ANY (ARRAY['free'::text, 'hobby'::text, 'pro'::text, 'scale'::text]))),
+    CONSTRAINT orgs_slug_shape CHECK ((slug ~ '^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$'::text)),
+    CONSTRAINT orgs_status_chk CHECK ((status = ANY (ARRAY['active'::text, 'past_due'::text, 'suspended'::text, 'deleted_pending'::text])))
+);
+
+
+--
 -- Name: paddle_overage_dedupe; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -834,6 +1077,7 @@ CREATE TABLE public.paddle_overage_dedupe (
     state text DEFAULT 'completed'::text NOT NULL,
     claimed_at timestamp with time zone,
     claimed_by text,
+    org_id uuid,
     CONSTRAINT paddle_overage_dedupe_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'completed'::text])))
 );
 
@@ -852,17 +1096,10 @@ CREATE TABLE public.projects (
     scan_source text DEFAULT 'unknown'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT projects_account_slug_uniq UNIQUE (account_id, slug),
+    org_id uuid,
     CONSTRAINT projects_scan_source_chk CHECK ((scan_source = ANY (ARRAY['compose'::text, 'procfile'::text, 'k8s'::text, 'render'::text, 'fly'::text, 'serverless'::text, 'workspace'::text, 'convention'::text, 'single'::text, 'unknown'::text]))),
     CONSTRAINT projects_slug_shape CHECK ((slug ~ '^[a-z0-9][a-z0-9-]{0,62}$'::text))
 );
-
-
---
--- Name: projects_install_repo_uniq; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX projects_install_repo_uniq ON public.projects USING btree (install_id, repo_full_name) WHERE ((install_id IS NOT NULL) AND (repo_full_name IS NOT NULL));
 
 
 --
@@ -872,7 +1109,8 @@ CREATE UNIQUE INDEX projects_install_repo_uniq ON public.projects USING btree (i
 CREATE TABLE public.recent_build_claims (
     account_id uuid NOT NULL,
     claimed_at timestamp with time zone DEFAULT now() NOT NULL,
-    build_id uuid NOT NULL
+    build_id uuid NOT NULL,
+    org_id uuid
 );
 
 
@@ -889,6 +1127,41 @@ CREATE TABLE public.sessions (
     last_seen_at timestamp with time zone,
     revoked_at timestamp with time zone
 );
+
+
+--
+-- Name: snapshot_storage_daily; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.snapshot_storage_daily (
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    day date NOT NULL,
+    snapshot_bytes bigint DEFAULT 0 NOT NULL,
+    layer_bytes bigint DEFAULT 0 NOT NULL,
+    computed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE snapshot_storage_daily; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.snapshot_storage_daily IS 'Per-(account, app, day) byte totals from snapshots.mem_bytes + disk_bytes + overlay staging. Source: pkg/meter/storage.go cron tick. ADR-049 §B.3. Informational only — not billed today; the future "Pro plan 1 GB included" PR consumes this surface.';
+
+
+--
+-- Name: COLUMN snapshot_storage_daily.snapshot_bytes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.snapshot_storage_daily.snapshot_bytes IS 'Σ snapshots.mem_bytes + snapshots.disk_bytes (latest non-stale row per app per day). ADR-049 §B.3. Informational.';
+
+
+--
+-- Name: COLUMN snapshot_storage_daily.layer_bytes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.snapshot_storage_daily.layer_bytes IS 'Σ overlay staging bytes per app per day. ADR-049 §B.3. Informational.';
 
 
 --
@@ -914,8 +1187,51 @@ CREATE TABLE public.snapshots (
 CREATE TABLE public.stripe_push_dedupe (
     account_id uuid NOT NULL,
     hour timestamp with time zone NOT NULL,
-    pushed_at timestamp with time zone DEFAULT now() NOT NULL
+    pushed_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid
 );
+
+
+--
+-- Name: usage_daily; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.usage_daily (
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    day date NOT NULL,
+    mb_seconds bigint DEFAULT 0 NOT NULL,
+    requests bigint DEFAULT 0 NOT NULL,
+    cpu_usec bigint DEFAULT 0 NOT NULL,
+    tx_bytes bigint DEFAULT 0 NOT NULL,
+    net_tx_bytes bigint DEFAULT 0 NOT NULL,
+    net_rx_bytes bigint DEFAULT 0 NOT NULL,
+    cold_boot_count bigint DEFAULT 0 NOT NULL,
+    builder_seconds bigint DEFAULT 0 NOT NULL,
+    rolled_up_at timestamp with time zone DEFAULT now() NOT NULL,
+    org_id uuid
+);
+
+
+--
+-- Name: TABLE usage_daily; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.usage_daily IS 'Per-(account, app, day) materialised rollup of usage_minutes. Populated by the meterd cron tick FAAS_ROLLUP_INTERVAL (default 5 min) via INSERT ... SELECT ... GROUP BY with ON CONFLICT additive merge. Read by GET /v1/usage/daily. ADR-048. Informational — not billed.';
+
+
+--
+-- Name: COLUMN usage_daily.cold_boot_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_daily.cold_boot_count IS 'Per-day sum of usage_minutes.cold_boot_count for this (account, app, day). ADR-048. Informational — not billed.';
+
+
+--
+-- Name: COLUMN usage_daily.rolled_up_at; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_daily.rolled_up_at IS 'Timestamp the meterd cron last wrote this row. Stamped on every ON CONFLICT update so a stuck cron is visible in /v1/usage/daily metadata.';
 
 
 --
@@ -931,7 +1247,12 @@ CREATE TABLE public.usage_minutes (
     requests integer DEFAULT 0 NOT NULL,
     cpu_usec bigint DEFAULT 0 NOT NULL,
     tx_bytes bigint DEFAULT 0 NOT NULL,
-    net_tx_bytes bigint DEFAULT 0 NOT NULL
+    net_tx_bytes bigint DEFAULT 0 NOT NULL,
+    net_rx_bytes bigint DEFAULT 0 NOT NULL,
+    cold_boot_count integer DEFAULT 0 NOT NULL,
+    builder_seconds bigint DEFAULT 0 NOT NULL,
+    builder_kind text DEFAULT 'none'::text NOT NULL,
+    org_id uuid
 );
 
 
@@ -957,6 +1278,34 @@ COMMENT ON COLUMN public.usage_minutes.net_tx_bytes IS 'Cumulative byte delta on
 
 
 --
+-- Name: COLUMN usage_minutes.net_rx_bytes; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_minutes.net_rx_bytes IS 'Cumulative byte delta on root-side vethHost.tx_bytes (root→guest = ingress) for this instance in this minute. Source: vmmd pkg/fcvm/netstats.Cache TX path reading /sys/class/net/<vethHost>/statistics/tx_bytes → vmmd.Stats → schedd instancestats.Poller → meterd Sampler.SampleAndRoll → AppendUsage. ADR-048. Informational — not billed. Unit = interface bytes (includes Ethernet/IP framing).';
+
+
+--
+-- Name: COLUMN usage_minutes.cold_boot_count; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_minutes.cold_boot_count IS 'Per-minute count of WAKE_RESTORE→WAKE_COLD_BOOT transitions observed for this instance. Source: scheddgrpc.InstanceStatsRow.LastWakeMethod, sampled by meterd Sampler.SampleAndRoll. ADR-048. Informational — not billed. Idempotent on a redelivered tick within the same minute (only the transition counts).';
+
+
+--
+-- Name: COLUMN usage_minutes.builder_seconds; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_minutes.builder_seconds IS 'Billable builder VM seconds (2-vCPU / 2048-MB per spec §4.5), written once per build at build completion via state.Store.AppendBuilderUsage keyed by build_id. ADR-048. Informational — not billed. NOT counted in CountsForRAM() — runtime GB-RAM-hour billing is unchanged.';
+
+
+--
+-- Name: COLUMN usage_minutes.builder_kind; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.usage_minutes.builder_kind IS 'Build kind parallel to builds.kind (railpack / dockerfile / tarball); ''none'' for non-build rows. ADR-048. Informational — not billed.';
+
+
+--
 -- Name: usage_monthly; Type: VIEW; Schema: public; Owner: -
 --
 
@@ -968,7 +1317,14 @@ CREATE VIEW public.usage_monthly AS
     sum(cpu_usec) AS cpu_usec,
     sum(requests) AS requests,
     sum(tx_bytes) AS tx_bytes,
-    sum(net_tx_bytes) AS net_tx_bytes
+    sum(net_tx_bytes) AS net_tx_bytes,
+    sum(net_rx_bytes) AS net_rx_bytes,
+    sum(cold_boot_count) AS cold_boot_count,
+    sum(
+        CASE
+            WHEN (builder_kind <> 'none'::text) THEN builder_seconds
+            ELSE (0)::bigint
+        END) AS builder_seconds
    FROM public.usage_minutes
   GROUP BY account_id, app_id, (date_trunc('month'::text, minute));
 
@@ -1076,6 +1432,14 @@ ALTER TABLE ONLY public.app_secrets
 
 
 --
+-- Name: app_trusted_signers app_trusted_signers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_trusted_signers
+    ADD CONSTRAINT app_trusted_signers_pkey PRIMARY KEY (app_id, signer_name);
+
+
+--
 -- Name: apps apps_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1108,6 +1472,14 @@ ALTER TABLE ONLY public.build_provenance
 
 
 --
+-- Name: builder_usage builder_usage_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.builder_usage
+    ADD CONSTRAINT builder_usage_pkey PRIMARY KEY (build_id);
+
+
+--
 -- Name: builds builds_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1137,6 +1509,14 @@ ALTER TABLE ONLY public.compute_node_heartbeats
 
 ALTER TABLE ONLY public.compute_node_heartbeats
     ADD CONSTRAINT compute_node_heartbeats_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: compute_node_keys compute_node_keys_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_node_keys
+    ADD CONSTRAINT compute_node_keys_pkey PRIMARY KEY (compute_node_id, key_id);
 
 
 --
@@ -1193,6 +1573,14 @@ ALTER TABLE ONLY public.deployment_logs
 
 ALTER TABLE ONLY public.deployments
     ADD CONSTRAINT deployments_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: egress_policy egress_policy_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.egress_policy
+    ADD CONSTRAINT egress_policy_pkey PRIMARY KEY (id);
 
 
 --
@@ -1284,6 +1672,38 @@ ALTER TABLE ONLY public.oauth_links
 
 
 --
+-- Name: org_invitations org_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_invitations
+    ADD CONSTRAINT org_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: org_invitations org_invitations_token_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_invitations
+    ADD CONSTRAINT org_invitations_token_uniq UNIQUE (token_hash);
+
+
+--
+-- Name: org_memberships org_memberships_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_memberships
+    ADD CONSTRAINT org_memberships_pkey PRIMARY KEY (org_id, account_id);
+
+
+--
+-- Name: orgs orgs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.orgs
+    ADD CONSTRAINT orgs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: paddle_overage_dedupe paddle_overage_dedupe_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1292,11 +1712,35 @@ ALTER TABLE ONLY public.paddle_overage_dedupe
 
 
 --
+-- Name: projects projects_account_slug_uniq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.projects
+    ADD CONSTRAINT projects_account_slug_uniq UNIQUE (account_id, slug);
+
+
+--
+-- Name: projects projects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.projects
+    ADD CONSTRAINT projects_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: sessions sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: snapshot_storage_daily snapshot_storage_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.snapshot_storage_daily
+    ADD CONSTRAINT snapshot_storage_daily_pkey PRIMARY KEY (account_id, app_id, day);
 
 
 --
@@ -1313,6 +1757,14 @@ ALTER TABLE ONLY public.snapshots
 
 ALTER TABLE ONLY public.stripe_push_dedupe
     ADD CONSTRAINT stripe_push_dedupe_pkey PRIMARY KEY (account_id, hour);
+
+
+--
+-- Name: usage_daily usage_daily_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_daily
+    ADD CONSTRAINT usage_daily_pkey PRIMARY KEY (account_id, app_id, day);
 
 
 --
@@ -1380,10 +1832,24 @@ CREATE INDEX alert_rules_enabled_idx ON public.alert_rules USING btree (account_
 
 
 --
+-- Name: alert_rules_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX alert_rules_org_id_idx ON public.alert_rules USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: api_keys_account_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX api_keys_account_idx ON public.api_keys USING btree (account_id);
+
+
+--
+-- Name: api_keys_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX api_keys_org_id_idx ON public.api_keys USING btree (org_id) WHERE (org_id IS NOT NULL);
 
 
 --
@@ -1401,6 +1867,13 @@ CREATE INDEX app_envs_app_idx ON public.app_envs USING btree (app_id);
 
 
 --
+-- Name: app_envs_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_envs_org_id_idx ON public.app_envs USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: app_secrets_account_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1412,6 +1885,20 @@ CREATE INDEX app_secrets_account_idx ON public.app_secrets USING btree (account_
 --
 
 CREATE INDEX app_secrets_app_idx ON public.app_secrets USING btree (app_id);
+
+
+--
+-- Name: app_secrets_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_secrets_org_id_idx ON public.app_secrets USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: app_trusted_signers_app_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_trusted_signers_app_idx ON public.app_trusted_signers USING btree (app_id);
 
 
 --
@@ -1450,6 +1937,13 @@ CREATE INDEX apps_github_install_repo_branch_idx ON public.apps USING btree (git
 
 
 --
+-- Name: apps_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX apps_org_id_idx ON public.apps USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: apps_project_workload_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1457,10 +1951,31 @@ CREATE UNIQUE INDEX apps_project_workload_uniq ON public.apps USING btree (proje
 
 
 --
+-- Name: apps_streaming_enabled_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX apps_streaming_enabled_idx ON public.apps USING btree (streaming_enabled) WHERE (streaming_enabled = true);
+
+
+--
 -- Name: build_provenance_build_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX build_provenance_build_id_idx ON public.build_provenance USING btree (build_id);
+
+
+--
+-- Name: builder_usage_account_finished_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX builder_usage_account_finished_idx ON public.builder_usage USING btree (account_id, finished_at DESC);
+
+
+--
+-- Name: builder_usage_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX builder_usage_org_id_idx ON public.builder_usage USING btree (org_id) WHERE (org_id IS NOT NULL);
 
 
 --
@@ -1485,10 +2000,24 @@ CREATE INDEX compute_node_heartbeats_node_at_idx ON public.compute_node_heartbea
 
 
 --
+-- Name: compute_node_keys_node_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_node_keys_node_idx ON public.compute_node_keys USING btree (compute_node_id);
+
+
+--
 -- Name: compute_nodes_active_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX compute_nodes_active_idx ON public.compute_nodes USING btree (name) WHERE (active = true);
+
+
+--
+-- Name: compute_nodes_region_zone_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_nodes_region_zone_idx ON public.compute_nodes USING btree (region, zone) WHERE (active = true);
 
 
 --
@@ -1520,6 +2049,20 @@ CREATE INDEX crons_app_idx ON public.crons USING btree (app_id) WHERE enabled;
 
 
 --
+-- Name: crons_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX crons_org_id_idx ON public.crons USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: custom_domains_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX custom_domains_org_id_idx ON public.custom_domains USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: custom_domains_unverified_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1548,6 +2091,13 @@ CREATE INDEX deployments_failed_error_code_idx ON public.deployments USING btree
 
 
 --
+-- Name: events_actor_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX events_actor_account_idx ON public.events USING btree (actor_account_id) WHERE (actor_account_id IS NOT NULL);
+
+
+--
 -- Name: events_subject_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1562,6 +2112,13 @@ CREATE INDEX gdpr_requests_account_idx ON public.gdpr_requests USING btree (acco
 
 
 --
+-- Name: gdpr_requests_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX gdpr_requests_org_id_idx ON public.gdpr_requests USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: github_installations_login_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1569,10 +2126,24 @@ CREATE INDEX github_installations_login_idx ON public.github_installations USING
 
 
 --
+-- Name: github_installations_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX github_installations_org_id_idx ON public.github_installations USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: instances_app_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX instances_app_idx ON public.instances USING btree (app_id, state);
+
+
+--
+-- Name: instances_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX instances_org_id_idx ON public.instances USING btree (org_id) WHERE (org_id IS NOT NULL);
 
 
 --
@@ -1639,10 +2210,24 @@ CREATE INDEX invocations_instance_idx ON public.invocations USING btree (instanc
 
 
 --
+-- Name: invocations_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX invocations_org_id_idx ON public.invocations USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: invoices_account_period_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX invoices_account_period_idx ON public.invoices USING btree (account_id, period_end DESC, id DESC);
+
+
+--
+-- Name: invoices_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX invoices_org_id_idx ON public.invoices USING btree (org_id) WHERE (org_id IS NOT NULL);
 
 
 --
@@ -1660,6 +2245,48 @@ CREATE INDEX oauth_links_account_idx ON public.oauth_links USING btree (account_
 
 
 --
+-- Name: org_invitations_email_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX org_invitations_email_idx ON public.org_invitations USING btree (org_id, email) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: org_invitations_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX org_invitations_pending_idx ON public.org_invitations USING btree (org_id) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL));
+
+
+--
+-- Name: org_memberships_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX org_memberships_account_idx ON public.org_memberships USING btree (account_id) WHERE (removed_at IS NULL);
+
+
+--
+-- Name: org_memberships_one_owner_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX org_memberships_one_owner_idx ON public.org_memberships USING btree (org_id) WHERE ((role = 'owner'::text) AND (removed_at IS NULL));
+
+
+--
+-- Name: orgs_one_personal_per_account_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX orgs_one_personal_per_account_uniq ON public.orgs USING btree (personal_owner_account_id) WHERE (personal_org = true);
+
+
+--
+-- Name: orgs_slug_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX orgs_slug_uniq ON public.orgs USING btree (lower(slug));
+
+
+--
 -- Name: paddle_overage_dedupe_month_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1667,10 +2294,31 @@ CREATE INDEX paddle_overage_dedupe_month_idx ON public.paddle_overage_dedupe USI
 
 
 --
+-- Name: paddle_overage_dedupe_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX paddle_overage_dedupe_org_id_idx ON public.paddle_overage_dedupe USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: paddle_overage_dedupe_pending_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX paddle_overage_dedupe_pending_idx ON public.paddle_overage_dedupe USING btree (claimed_at) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: projects_install_repo_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX projects_install_repo_uniq ON public.projects USING btree (install_id, repo_full_name) WHERE ((install_id IS NOT NULL) AND (repo_full_name IS NOT NULL));
+
+
+--
+-- Name: projects_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX projects_org_id_idx ON public.projects USING btree (org_id) WHERE (org_id IS NOT NULL);
 
 
 --
@@ -1688,10 +2336,24 @@ CREATE INDEX recent_build_claims_claimed_at_idx ON public.recent_build_claims US
 
 
 --
+-- Name: recent_build_claims_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX recent_build_claims_org_id_idx ON public.recent_build_claims USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
 -- Name: sessions_active_account_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX sessions_active_account_idx ON public.sessions USING btree (account_id, issued_at DESC) WHERE (revoked_at IS NULL);
+
+
+--
+-- Name: snapshot_storage_daily_account_day_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX snapshot_storage_daily_account_day_idx ON public.snapshot_storage_daily USING btree (account_id, day DESC);
 
 
 --
@@ -1702,10 +2364,66 @@ CREATE INDEX snapshots_deployment_idx ON public.snapshots USING btree (deploymen
 
 
 --
+-- Name: snapshots_live_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX snapshots_live_idx ON public.snapshots USING btree (deployment_id) WHERE (stale = false);
+
+
+--
+-- Name: INDEX snapshots_live_idx; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON INDEX public.snapshots_live_idx IS 'Supports pkg/state/pgstore.go::LatestSnapshotBytes inner scan — bounds to non-stale rows under live deployments. ADR-049 §B.3 + PR #428 review blocker #3.';
+
+
+--
 -- Name: stripe_push_dedupe_hour_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX stripe_push_dedupe_hour_idx ON public.stripe_push_dedupe USING btree (hour);
+
+
+--
+-- Name: stripe_push_dedupe_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX stripe_push_dedupe_org_id_idx ON public.stripe_push_dedupe USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: usage_daily_account_day_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_daily_account_day_idx ON public.usage_daily USING btree (account_id, day DESC);
+
+
+--
+-- Name: usage_daily_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_daily_org_id_idx ON public.usage_daily USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: usage_minutes_account_minute_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_minutes_account_minute_idx ON public.usage_minutes USING btree (account_id, minute DESC);
+
+
+--
+-- Name: usage_minutes_minute_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_minutes_minute_idx ON public.usage_minutes USING btree (minute);
+
+
+--
+-- Name: usage_minutes_org_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX usage_minutes_org_id_idx ON public.usage_minutes USING btree (org_id) WHERE (org_id IS NOT NULL);
 
 
 --
@@ -1720,6 +2438,20 @@ CREATE TRIGGER apps_egress_allowlist_cidr BEFORE INSERT OR UPDATE OF egress_allo
 --
 
 CREATE TRIGGER compute_node_changed_trg AFTER INSERT OR UPDATE ON public.compute_nodes FOR EACH ROW EXECUTE FUNCTION public.compute_node_notify();
+
+
+--
+-- Name: compute_node_keys compute_node_keys_changed_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER compute_node_keys_changed_trg AFTER INSERT OR DELETE OR UPDATE ON public.compute_node_keys FOR EACH STATEMENT EXECUTE FUNCTION public.compute_node_keys_notify();
+
+
+--
+-- Name: egress_policy egress_policy_changed_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER egress_policy_changed_trg AFTER INSERT OR UPDATE ON public.egress_policy FOR EACH ROW EXECUTE FUNCTION public.egress_policy_notify();
 
 
 --
@@ -1792,11 +2524,27 @@ ALTER TABLE ONLY public.alert_rules
 
 
 --
+-- Name: alert_rules alert_rules_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.alert_rules
+    ADD CONSTRAINT alert_rules_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: api_keys api_keys_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.api_keys
     ADD CONSTRAINT api_keys_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: api_keys api_keys_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.api_keys
+    ADD CONSTRAINT api_keys_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --
@@ -1808,11 +2556,35 @@ ALTER TABLE ONLY public.app_envs
 
 
 --
+-- Name: app_envs app_envs_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_envs
+    ADD CONSTRAINT app_envs_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: app_secrets app_secrets_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.app_secrets
     ADD CONSTRAINT app_secrets_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_secrets app_secrets_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_secrets
+    ADD CONSTRAINT app_secrets_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: app_trusted_signers app_trusted_signers_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_trusted_signers
+    ADD CONSTRAINT app_trusted_signers_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --
@@ -1832,6 +2604,14 @@ ALTER TABLE ONLY public.apps
 
 
 --
+-- Name: apps apps_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.apps
+    ADD CONSTRAINT apps_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: apps apps_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1840,19 +2620,19 @@ ALTER TABLE ONLY public.apps
 
 
 --
--- Name: projects projects_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.projects
-    ADD CONSTRAINT projects_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
-
-
---
 -- Name: build_provenance build_provenance_build_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.build_provenance
     ADD CONSTRAINT build_provenance_build_id_fkey FOREIGN KEY (build_id) REFERENCES public.builds(id);
+
+
+--
+-- Name: builder_usage builder_usage_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.builder_usage
+    ADD CONSTRAINT builder_usage_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --
@@ -1880,6 +2660,14 @@ ALTER TABLE ONLY public.compute_node_heartbeats
 
 
 --
+-- Name: compute_node_keys compute_node_keys_compute_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_node_keys
+    ADD CONSTRAINT compute_node_keys_compute_node_id_fkey FOREIGN KEY (compute_node_id) REFERENCES public.compute_nodes(id) ON DELETE CASCADE;
+
+
+--
 -- Name: credit_ledger credit_ledger_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1904,6 +2692,14 @@ ALTER TABLE ONLY public.crons
 
 
 --
+-- Name: crons crons_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.crons
+    ADD CONSTRAINT crons_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: custom_domains custom_domains_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1917,6 +2713,14 @@ ALTER TABLE ONLY public.custom_domains
 
 ALTER TABLE ONLY public.custom_domains
     ADD CONSTRAINT custom_domains_app_id_redirect_fkey FOREIGN KEY (app_id_redirect) REFERENCES public.apps(id);
+
+
+--
+-- Name: custom_domains custom_domains_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.custom_domains
+    ADD CONSTRAINT custom_domains_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --
@@ -1936,11 +2740,35 @@ ALTER TABLE ONLY public.deployments
 
 
 --
+-- Name: events events_actor_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.events
+    ADD CONSTRAINT events_actor_account_id_fkey FOREIGN KEY (actor_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: gdpr_requests gdpr_requests_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.gdpr_requests
+    ADD CONSTRAINT gdpr_requests_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: github_installations github_installations_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.github_installations
     ADD CONSTRAINT github_installations_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: github_installations github_installations_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.github_installations
+    ADD CONSTRAINT github_installations_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --
@@ -1976,6 +2804,14 @@ ALTER TABLE ONLY public.instances
 
 
 --
+-- Name: instances instances_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.instances
+    ADD CONSTRAINT instances_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: invocations invocations_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2000,11 +2836,27 @@ ALTER TABLE ONLY public.invocations
 
 
 --
+-- Name: invocations invocations_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocations
+    ADD CONSTRAINT invocations_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: invoices invoices_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.invoices
     ADD CONSTRAINT invoices_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: invoices invoices_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invoices
+    ADD CONSTRAINT invoices_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --
@@ -2024,6 +2876,62 @@ ALTER TABLE ONLY public.oauth_links
 
 
 --
+-- Name: org_invitations org_invitations_accepting_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_invitations
+    ADD CONSTRAINT org_invitations_accepting_account_id_fkey FOREIGN KEY (accepting_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: org_invitations org_invitations_invited_by_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_invitations
+    ADD CONSTRAINT org_invitations_invited_by_account_id_fkey FOREIGN KEY (invited_by_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: org_invitations org_invitations_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_invitations
+    ADD CONSTRAINT org_invitations_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: org_memberships org_memberships_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_memberships
+    ADD CONSTRAINT org_memberships_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: org_memberships org_memberships_invited_by_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_memberships
+    ADD CONSTRAINT org_memberships_invited_by_account_id_fkey FOREIGN KEY (invited_by_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: org_memberships org_memberships_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.org_memberships
+    ADD CONSTRAINT org_memberships_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE CASCADE;
+
+
+--
+-- Name: orgs orgs_personal_owner_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.orgs
+    ADD CONSTRAINT orgs_personal_owner_account_id_fkey FOREIGN KEY (personal_owner_account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
 -- Name: paddle_overage_dedupe paddle_overage_dedupe_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2032,11 +2940,43 @@ ALTER TABLE ONLY public.paddle_overage_dedupe
 
 
 --
+-- Name: paddle_overage_dedupe paddle_overage_dedupe_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.paddle_overage_dedupe
+    ADD CONSTRAINT paddle_overage_dedupe_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: projects projects_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.projects
+    ADD CONSTRAINT projects_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: projects projects_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.projects
+    ADD CONSTRAINT projects_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: recent_build_claims recent_build_claims_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.recent_build_claims
     ADD CONSTRAINT recent_build_claims_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: recent_build_claims recent_build_claims_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.recent_build_claims
+    ADD CONSTRAINT recent_build_claims_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --
@@ -2061,6 +3001,30 @@ ALTER TABLE ONLY public.snapshots
 
 ALTER TABLE ONLY public.stripe_push_dedupe
     ADD CONSTRAINT stripe_push_dedupe_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: stripe_push_dedupe stripe_push_dedupe_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.stripe_push_dedupe
+    ADD CONSTRAINT stripe_push_dedupe_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: usage_daily usage_daily_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_daily
+    ADD CONSTRAINT usage_daily_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: usage_minutes usage_minutes_org_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.usage_minutes
+    ADD CONSTRAINT usage_minutes_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
 
 
 --

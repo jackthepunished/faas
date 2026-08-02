@@ -696,6 +696,95 @@ func (q *Queries) CreateInstance(ctx context.Context, db DBTX, arg CreateInstanc
 	return i, err
 }
 
+const createOrg = `-- name: CreateOrg :one
+
+insert into orgs (
+    slug,
+    name,
+    personal_org,
+    personal_owner_account_id,
+    plan,
+    status,
+    provider_customer_id,
+    stripe_subscription_item,
+    deleted_pending
+) values (
+    $1, $2, $3, $4, $5, $6, nullif($7, ''), nullif($8, ''), false
+)
+returning
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+`
+
+type CreateOrgParams struct {
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	PersonalOwnerAccountID pgtype.UUID
+	Plan                   string
+	Status                 string
+	Column7                interface{}
+	Column8                interface{}
+}
+
+type CreateOrgRow struct {
+	ID                     pgtype.UUID
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	Coalesce               interface{}
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	DeletedPending         bool
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+}
+
+// --- Organizations (ADR-061, IAM-6, PR 2) -------------------------------
+//
+// PR 2's sqlc queries cover the deterministic reads + simple writes. The
+// tx-heavy methods (CreateOrg with initial owner membership; RemoveOrgMember
+// with last-owner FOR UPDATE; ConsumeOrgInvitation with cap check + email
+// equality + membership insert + invitation UPDATE in one tx) stay as
+// inline SQL in pgstore.go — they don't fit the :one / :many / :exec
+// sqlc surface cleanly and the existing precedent (CreateAppIfUnderQuota,
+// ConsumeRecoveryCode, ApplyProjectPlan) renders those inline.
+func (q *Queries) CreateOrg(ctx context.Context, db DBTX, arg CreateOrgParams) (CreateOrgRow, error) {
+	row := db.QueryRow(ctx, createOrg,
+		arg.Slug,
+		arg.Name,
+		arg.PersonalOrg,
+		arg.PersonalOwnerAccountID,
+		arg.Plan,
+		arg.Status,
+		arg.Column7,
+		arg.Column8,
+	)
+	var i CreateOrgRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.PersonalOrg,
+		&i.Coalesce,
+		&i.Plan,
+		&i.Status,
+		&i.ProviderCustomerID,
+		&i.StripeSubscriptionItem,
+		&i.DeletedPending,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const createSession = `-- name: CreateSession :one
 insert into sessions (id, account_id, issued_ip, issued_ua)
 values ($1, $2, nullif($3, '')::inet, nullif($4, ''))
@@ -923,6 +1012,22 @@ func (q *Queries) DomainByName(ctx context.Context, db DBTX, domain interface{})
 		&i.VerifiedAt,
 	)
 	return i, err
+}
+
+const expireOrgInvitations = `-- name: ExpireOrgInvitations :execrows
+update org_invitations
+set revoked_at = now()
+where consumed_at is null
+  and revoked_at is null
+  and expires_at <= $1
+`
+
+func (q *Queries) ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error) {
+	result, err := db.Exec(ctx, expireOrgInvitations, expiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getSession = `-- name: GetSession :one
@@ -1497,15 +1602,24 @@ type ListEventsParams struct {
 	Limit   int32
 }
 
-func (q *Queries) ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]Event, error) {
+type ListEventsRow struct {
+	ID      int64
+	At      pgtype.Timestamptz
+	Actor   string
+	Kind    string
+	Subject pgtype.UUID
+	Data    []byte
+}
+
+func (q *Queries) ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]ListEventsRow, error) {
 	rows, err := db.Query(ctx, listEvents, arg.Subject, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Event{}
+	items := []ListEventsRow{}
 	for rows.Next() {
-		var i Event
+		var i ListEventsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.At,
@@ -1565,6 +1679,180 @@ func (q *Queries) ListInstancesForApp(ctx context.Context, db DBTX, appID pgtype
 			&i.StartedAt,
 			&i.LastRequestAt,
 			&i.ParkedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOrgInvitationsForOrg = `-- name: ListOrgInvitationsForOrg :many
+select
+    id,
+    org_id,
+    email::text as email,
+    role,
+    token_hash,
+    coalesce(invited_by_account_id::text, ''),
+    expires_at,
+    consumed_at,
+    revoked_at,
+    coalesce(accepting_account_id::text, ''),
+    created_at
+from org_invitations
+where org_id = $1
+order by created_at desc
+`
+
+type ListOrgInvitationsForOrgRow struct {
+	ID         pgtype.UUID
+	OrgID      pgtype.UUID
+	Email      string
+	Role       string
+	TokenHash  []byte
+	Coalesce   interface{}
+	ExpiresAt  pgtype.Timestamptz
+	ConsumedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+	Coalesce_2 interface{}
+	CreatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) ListOrgInvitationsForOrg(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgInvitationsForOrgRow, error) {
+	rows, err := db.Query(ctx, listOrgInvitationsForOrg, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOrgInvitationsForOrgRow{}
+	for rows.Next() {
+		var i ListOrgInvitationsForOrgRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrgID,
+			&i.Email,
+			&i.Role,
+			&i.TokenHash,
+			&i.Coalesce,
+			&i.ExpiresAt,
+			&i.ConsumedAt,
+			&i.RevokedAt,
+			&i.Coalesce_2,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOrgMembers = `-- name: ListOrgMembers :many
+select
+    org_id, account_id, role,
+    coalesce(invited_by_account_id::text, ''),
+    joined_at, removed_at
+from org_memberships
+where org_id = $1
+order by joined_at
+`
+
+type ListOrgMembersRow struct {
+	OrgID     pgtype.UUID
+	AccountID pgtype.UUID
+	Role      string
+	Coalesce  interface{}
+	JoinedAt  pgtype.Timestamptz
+	RemovedAt pgtype.Timestamptz
+}
+
+func (q *Queries) ListOrgMembers(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgMembersRow, error) {
+	rows, err := db.Query(ctx, listOrgMembers, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOrgMembersRow{}
+	for rows.Next() {
+		var i ListOrgMembersRow
+		if err := rows.Scan(
+			&i.OrgID,
+			&i.AccountID,
+			&i.Role,
+			&i.Coalesce,
+			&i.JoinedAt,
+			&i.RemovedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOrgsForAccount = `-- name: ListOrgsForAccount :many
+select
+    o.id, o.slug, o.name, o.personal_org,
+    coalesce(o.personal_owner_account_id::text, ''),
+    o.plan, o.status,
+    coalesce(o.provider_customer_id, ''),
+    coalesce(o.stripe_subscription_item, ''),
+    o.deleted_pending,
+    o.created_at, o.updated_at
+from orgs o
+join org_memberships m on m.org_id = o.id
+where m.account_id = $1
+  and m.removed_at is null
+order by o.slug
+`
+
+type ListOrgsForAccountRow struct {
+	ID                     pgtype.UUID
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	Coalesce               interface{}
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	DeletedPending         bool
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+}
+
+func (q *Queries) ListOrgsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListOrgsForAccountRow, error) {
+	rows, err := db.Query(ctx, listOrgsForAccount, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListOrgsForAccountRow{}
+	for rows.Next() {
+		var i ListOrgsForAccountRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.PersonalOrg,
+			&i.Coalesce,
+			&i.Plan,
+			&i.Status,
+			&i.ProviderCustomerID,
+			&i.StripeSubscriptionItem,
+			&i.DeletedPending,
+			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1649,6 +1937,238 @@ update custom_domains set verified_at = now() where domain = $1
 func (q *Queries) MarkDomainVerified(ctx context.Context, db DBTX, domain interface{}) error {
 	_, err := db.Exec(ctx, markDomainVerified, domain)
 	return err
+}
+
+const orgByID = `-- name: OrgByID :one
+select
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+from orgs
+where id = $1
+`
+
+type OrgByIDRow struct {
+	ID                     pgtype.UUID
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	Coalesce               interface{}
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	DeletedPending         bool
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+}
+
+func (q *Queries) OrgByID(ctx context.Context, db DBTX, id pgtype.UUID) (OrgByIDRow, error) {
+	row := db.QueryRow(ctx, orgByID, id)
+	var i OrgByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.PersonalOrg,
+		&i.Coalesce,
+		&i.Plan,
+		&i.Status,
+		&i.ProviderCustomerID,
+		&i.StripeSubscriptionItem,
+		&i.DeletedPending,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const orgByPersonalAccount = `-- name: OrgByPersonalAccount :one
+select
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+from orgs
+where personal_org = true
+  and personal_owner_account_id = $1
+`
+
+type OrgByPersonalAccountRow struct {
+	ID                     pgtype.UUID
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	Coalesce               interface{}
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	DeletedPending         bool
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+}
+
+func (q *Queries) OrgByPersonalAccount(ctx context.Context, db DBTX, personalOwnerAccountID pgtype.UUID) (OrgByPersonalAccountRow, error) {
+	row := db.QueryRow(ctx, orgByPersonalAccount, personalOwnerAccountID)
+	var i OrgByPersonalAccountRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.PersonalOrg,
+		&i.Coalesce,
+		&i.Plan,
+		&i.Status,
+		&i.ProviderCustomerID,
+		&i.StripeSubscriptionItem,
+		&i.DeletedPending,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const orgBySlug = `-- name: OrgBySlug :one
+select
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+from orgs
+where lower(slug) = lower($1)
+`
+
+type OrgBySlugRow struct {
+	ID                     pgtype.UUID
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	Coalesce               interface{}
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	DeletedPending         bool
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+}
+
+func (q *Queries) OrgBySlug(ctx context.Context, db DBTX, lower string) (OrgBySlugRow, error) {
+	row := db.QueryRow(ctx, orgBySlug, lower)
+	var i OrgBySlugRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.PersonalOrg,
+		&i.Coalesce,
+		&i.Plan,
+		&i.Status,
+		&i.ProviderCustomerID,
+		&i.StripeSubscriptionItem,
+		&i.DeletedPending,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const orgInvitationByTokenHash = `-- name: OrgInvitationByTokenHash :one
+select
+    id,
+    org_id,
+    email::text as email,
+    role,
+    token_hash,
+    coalesce(invited_by_account_id::text, ''),
+    expires_at,
+    consumed_at,
+    revoked_at,
+    coalesce(accepting_account_id::text, ''),
+    created_at
+from org_invitations
+where token_hash = $1
+`
+
+type OrgInvitationByTokenHashRow struct {
+	ID         pgtype.UUID
+	OrgID      pgtype.UUID
+	Email      string
+	Role       string
+	TokenHash  []byte
+	Coalesce   interface{}
+	ExpiresAt  pgtype.Timestamptz
+	ConsumedAt pgtype.Timestamptz
+	RevokedAt  pgtype.Timestamptz
+	Coalesce_2 interface{}
+	CreatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) OrgInvitationByTokenHash(ctx context.Context, db DBTX, tokenHash []byte) (OrgInvitationByTokenHashRow, error) {
+	row := db.QueryRow(ctx, orgInvitationByTokenHash, tokenHash)
+	var i OrgInvitationByTokenHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.Email,
+		&i.Role,
+		&i.TokenHash,
+		&i.Coalesce,
+		&i.ExpiresAt,
+		&i.ConsumedAt,
+		&i.RevokedAt,
+		&i.Coalesce_2,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const orgMemberByAccount = `-- name: OrgMemberByAccount :one
+select
+    org_id, account_id, role,
+    coalesce(invited_by_account_id::text, ''),
+    joined_at, removed_at
+from org_memberships
+where org_id = $1 and account_id = $2
+`
+
+type OrgMemberByAccountParams struct {
+	OrgID     pgtype.UUID
+	AccountID pgtype.UUID
+}
+
+type OrgMemberByAccountRow struct {
+	OrgID     pgtype.UUID
+	AccountID pgtype.UUID
+	Role      string
+	Coalesce  interface{}
+	JoinedAt  pgtype.Timestamptz
+	RemovedAt pgtype.Timestamptz
+}
+
+func (q *Queries) OrgMemberByAccount(ctx context.Context, db DBTX, arg OrgMemberByAccountParams) (OrgMemberByAccountRow, error) {
+	row := db.QueryRow(ctx, orgMemberByAccount, arg.OrgID, arg.AccountID)
+	var i OrgMemberByAccountRow
+	err := row.Scan(
+		&i.OrgID,
+		&i.AccountID,
+		&i.Role,
+		&i.Coalesce,
+		&i.JoinedAt,
+		&i.RemovedAt,
+	)
+	return i, err
 }
 
 const revokeAllSessions = `-- name: RevokeAllSessions :many
@@ -1792,6 +2312,15 @@ func (q *Queries) SetDeploymentFailed(ctx context.Context, db DBTX, arg SetDeplo
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const softDeleteOrg = `-- name: SoftDeleteOrg :exec
+update orgs set deleted_pending = true, status = 'deleted_pending', updated_at = now() where id = $1
+`
+
+func (q *Queries) SoftDeleteOrg(ctx context.Context, db DBTX, id pgtype.UUID) error {
+	_, err := db.Exec(ctx, softDeleteOrg, id)
+	return err
 }
 
 const touchKeyLastUsed = `-- name: TouchKeyLastUsed :exec
@@ -2003,6 +2532,34 @@ func (q *Queries) UpdateInstanceState(ctx context.Context, db DBTX, arg UpdateIn
 	return err
 }
 
+const updateOrgPlan = `-- name: UpdateOrgPlan :exec
+update orgs set plan = $2, updated_at = now() where id = $1
+`
+
+type UpdateOrgPlanParams struct {
+	ID   pgtype.UUID
+	Plan string
+}
+
+func (q *Queries) UpdateOrgPlan(ctx context.Context, db DBTX, arg UpdateOrgPlanParams) error {
+	_, err := db.Exec(ctx, updateOrgPlan, arg.ID, arg.Plan)
+	return err
+}
+
+const updateOrgStatus = `-- name: UpdateOrgStatus :exec
+update orgs set status = $2, updated_at = now() where id = $1
+`
+
+type UpdateOrgStatusParams struct {
+	ID     pgtype.UUID
+	Status string
+}
+
+func (q *Queries) UpdateOrgStatus(ctx context.Context, db DBTX, arg UpdateOrgStatusParams) error {
+	_, err := db.Exec(ctx, updateOrgStatus, arg.ID, arg.Status)
+	return err
+}
+
 const usageByMonth = `-- name: UsageByMonth :many
 select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes
 from usage_monthly
@@ -2015,15 +2572,26 @@ type UsageByMonthParams struct {
 	Month     pgtype.Interval
 }
 
-func (q *Queries) UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageMonthly, error) {
+type UsageByMonthRow struct {
+	AccountID  pgtype.UUID
+	AppID      pgtype.UUID
+	Month      pgtype.Interval
+	MbSeconds  int64
+	CpuUsec    int64
+	Requests   int64
+	TxBytes    int64
+	NetTxBytes int64
+}
+
+func (q *Queries) UsageByMonth(ctx context.Context, db DBTX, arg UsageByMonthParams) ([]UsageByMonthRow, error) {
 	rows, err := db.Query(ctx, usageByMonth, arg.AccountID, arg.Month)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []UsageMonthly{}
+	items := []UsageByMonthRow{}
 	for rows.Next() {
-		var i UsageMonthly
+		var i UsageByMonthRow
 		if err := rows.Scan(
 			&i.AccountID,
 			&i.AppID,

@@ -366,7 +366,7 @@ const testDomain = "apps.test.example"
 // Bumped 83 → 87 → 92 → 93 → 94 across four rebase cycles; the
 // renumber chain tracks the gate's "next free slot past the live
 // head" rule when sibling PRs race for the same N.)
-const e2eMigrationTarget = 94
+const e2eMigrationTarget = 100
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
