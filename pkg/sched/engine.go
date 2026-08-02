@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -149,6 +150,16 @@ type Engine struct {
 	// nil opts out (no row written); production cmd/schedd wires the
 	// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
 	audit *audit.Auditor
+
+	// events is the wake-timeline fan-out (issue #517 / PR-C,
+	// ADR-064). Sibling of audit — pkg/events.Platform drives the
+	// canonical wake.* event vocabulary (queue_accepted, admitted,
+	// boot_started, boot_completed, boot_failed, park_started,
+	// park_completed, stalled) from the schedd wake path. nil opts
+	// out (no row written); production cmd/schedd wires the same
+	// `events.NewPlatform("schedd", store, log, ops, broadcaster)`
+	// instance cmd/main.go uses.
+	events *events.Platform
 
 	// ownerNodeID is the durable Phase 2 / Gate A shard key this
 	// schedd serves. Empty = legacy single-box posture (the
@@ -377,6 +388,23 @@ func (e *Engine) WithVerifier(v LayerVerifier) *Engine {
 // same `audit.New(store, log, ops, "schedd")` instance Loop uses.
 func (e *Engine) WithAudit(a *audit.Auditor) *Engine {
 	e.audit = a
+	return e
+}
+
+// WithEvents stamps the wake-timeline fan-out (issue #517 / PR-C,
+// ADR-064) on the engine. Sibling of WithAudit — pkg/events.
+// Platform drives the canonical wake.* event vocabulary
+// (queue_accepted, admitted, boot_started, boot_completed,
+// boot_failed, park_started, park_completed, stalled) from the
+// schedd wake path. nil opts out (no row written) so pre-PR-C
+// fixtures keep their existing behaviour. Production cmd/schedd
+// wires the same `events.NewPlatform("schedd", store, log, ops,
+// broadcaster)` instance cmd/main.go uses.
+func (e *Engine) WithEvents(p *events.Platform) *Engine {
+	if e == nil {
+		return e
+	}
+	e.events = p
 	return e
 }
 
@@ -926,6 +954,49 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		e.log.Warn("sched: stamp apps.last_scale_out_at failed", "app", appID, "err", err)
 	}
 
+	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
+	// the Phase 2 admission gate boundary, BEFORE the structured
+	// admit timestamp. The customer-facing timeline order is
+	// queue_accepted → admitted → boot_started → boot_completed
+	// (a wake is "queued" when it passes the lock-window
+	// admission, "admitted" when the ledger reservation is
+	// confirmed). emit is best-effort and never rolls back the
+	// admit. nil opts out (pre-PR-C fixtures).
+	var requestID string
+	if e.events != nil {
+		if fields, ok := wire.FromContext(ctx); ok {
+			requestID = fields.RequestID
+		}
+	}
+	if e.events != nil {
+		e.events.Emit(ctx, events.QueueAccepted{
+			EmitAt:      time.Now().UTC(),
+			WakeID:      wakeID,
+			AppID:       appID,
+			RequestID:   requestID,
+			QueueWaitMs: 0, // queue wait is a separate derivation (gaps analysis)
+		})
+	}
+
+	// issue #517 / PR-C / ADR-064 — emit wake.admitted on the
+	// successful ledger admit. Pairs with wake.queue_accepted and
+	// wake.boot_started under the same wake_id so the customer
+	// timeline surfaces "queue → admit → boot" as three distinct
+	// timestamps. emit is best-effort: a failure is Warn + counter
+	// and never rolls back the admit. Subject is the account so a
+	// GDPR export can isolate per-account wake timelines.
+	if e.events != nil {
+		now := time.Now().UTC()
+		e.events.Emit(ctx, events.Admitted{
+			EmitAt:    now,
+			WakeID:    wakeID,
+			AppID:     appID,
+			RequestID: requestID,
+			AccountID: acct.ID,
+			Plan:      string(acct.Plan),
+		})
+	}
+
 	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
 	if err != nil {
 		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
@@ -971,6 +1042,13 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	// Capture the boot inputs we need across the unlocked window. These
 	// are values (not references) — they remain valid after release.
+	// startedAt stamps the wake's accept moment (issue #517 / PR-C /
+	// ADR-064) so the boot_started emit + boot_completed emit pair
+	// can compute the boot span under the same wake_id. Hoisted
+	// here so the timestamp is the same one the boot_started row
+	// uses (RequestedAt), and the watchdog's "started_at" anchor
+	// stays consistent.
+	startedAt := time.Now().UTC()
 	bootInput := bootInput{
 		insID:     ins.ID,
 		appID:     appID,
@@ -995,8 +1073,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// path, and the Phase 4 commit's WakeResult all surface the
 		// same value. The row already carries wake_id (CreateInstance
 		// stamped it); this is the value the caller observes.
-		wakeID: wakeID,
+		wakeID:    wakeID,
+		startedAt: startedAt,
 	}
+	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
+	// the boundary between Phase 2 (admit + ledger) and Phase 3
+	// (unlocked vmmd RPC). The customer-facing timeline endpoint
+	// joins this row to the wake.boot_started / boot_completed /
+	// readiness_200 / proxy_first_byte rows that downstream
+	// emit sites will write under the same wake_id. nil events
+	// opts out (pre-PR-C fixtures) — guarded so the test
+	// corpus doesn't need to wire a Platform.
+	//
+	// NOTE: queue_accepted is now emitted at the admission gate
+	// (above) so the customer-facing timeline reads as
+	// queue_accepted → admitted → boot_started. The earlier
+	// Phase 2→3 boundary emit was redundant.
 	release()
 
 	// ADR-038 / Tier 3 phase 3: cold-boot layer attestation. The
@@ -1055,6 +1147,28 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		InstanceID:   bootInput.insID,
 		WakeID:       wakeID,
 	})
+	// issue #517 / PR-C / ADR-064 — emit wake.boot_started at the
+	// entry to Phase 3 (the unlocked vmmd RPC). The customer-facing
+	// timeline endpoint joins this row to wake.boot_completed /
+	// wake.boot_failed / wake.readiness_200 (vmmd-side emit) under
+	// the same wake_id. method is "restore" or "cold_boot" so the
+	// dashboard can split p50/p95 by wake method without joining
+	// the legacy state_transition rows.
+	method := "cold_boot"
+	if bootInput.haveSnap {
+		method = "restore"
+	}
+	if e.events != nil {
+		e.events.Emit(bootCtx, events.BootStarted{
+			EmitAt:      time.Now().UTC(),
+			WakeID:      bootInput.wakeID,
+			AppID:       bootInput.appID,
+			InstanceID:  bootInput.insID,
+			NodeID:      bootInput.nodeID,
+			Method:      method,
+			RequestedAt: bootInput.startedAt, // best-effort stamp
+		})
+	}
 	if bootInput.haveSnap && bootInput.snapKey != "" {
 		// #96 / ADR-025 axis 2: read the storage key the snap row
 		// carries (imaged stamps it from the snapshot_written
@@ -1107,6 +1221,23 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// `kind='wake_boot_error'` finds both this and the
 		// SetInstanceRuntime-failure case below.
 		e.ledger.Release(bootInput.insID)
+		// issue #517 / PR-C / ADR-064 — emit wake.boot_failed with
+		// the structured reason. The customer-facing timeline pairs
+		// this with wake.boot_started under the same wake_id so the
+		// "wake took N ms before failing" latency is computable
+		// without joining the legacy state_transition rows.
+		if e.events != nil {
+			e.events.Emit(context.Background(), events.BootFailed{
+				EmitAt:     time.Now().UTC(),
+				WakeID:     bootInput.wakeID,
+				AppID:      bootInput.appID,
+				InstanceID: bootInput.insID,
+				NodeID:     bootInput.nodeID,
+				Method:     method,
+				Reason:     "vmm_boot_failed",
+				FailedAt:   time.Now().UTC(),
+			})
+		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "vmm_boot_failed")
 		return WakeResult{}, err
 	}
@@ -1156,6 +1287,21 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// Firecracker can't pin the Wake goroutine forever.
 		e.bestEffortDestroy(ctx, bootInput.nodeID, bootInput.insID)
 		e.ledger.Release(bootInput.insID)
+		// issue #517 / PR-C / ADR-064 — emit wake.boot_failed with
+		// the structured reason. Pairs with wake.boot_started under
+		// the same wake_id (the prior emit at the Phase 3 entry).
+		if e.events != nil {
+			e.events.Emit(context.Background(), events.BootFailed{
+				EmitAt:     time.Now().UTC(),
+				WakeID:     bootInput.wakeID,
+				AppID:      bootInput.appID,
+				InstanceID: bootInput.insID,
+				NodeID:     bootInput.nodeID,
+				Method:     method,
+				Reason:     "record_runtime_failed",
+				FailedAt:   time.Now().UTC(),
+			})
+		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)
 	}
@@ -1198,6 +1344,34 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
+	// issue #517 / PR-C / ADR-064 — emit wake.boot_completed. The
+	// three sibling emits (wake.boot_started, wake.boot_completed,
+	// wake.readiness_200 from vmmd) give the customer-facing
+	// timeline endpoint span latencies per wake method under the
+	// same wake_id. The actual method reported here is
+	// vmmd's authoritative observation (`out.Method`), which may
+	// differ from the planned `method` above when restore fell
+	// back to cold boot (the F-1 stale-snapshot path).
+	completedMethod := method
+	if out.Method == vmmdpb.WakeMethod_WAKE_COLD_BOOT {
+		completedMethod = "cold_boot"
+	} else if out.Method == vmmdpb.WakeMethod_WAKE_RESTORE {
+		completedMethod = "restore"
+	}
+	if e.events != nil {
+		now := time.Now().UTC()
+		e.events.Emit(ctx, events.BootCompleted{
+			EmitAt:      now,
+			WakeID:      bootInput.wakeID,
+			AppID:       bootInput.appID,
+			InstanceID:  bootInput.insID,
+			NodeID:      bootInput.nodeID,
+			Method:      completedMethod,
+			StartedAt:   bootInput.startedAt,
+			CompletedAt: now,
+		})
+	}
+
 	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port}, nil
 }
 
@@ -1233,6 +1407,14 @@ type bootInput struct {
 	// can carry many wake_ids over its lifetime as the app parks and
 	// wakes again.
 	wakeID string
+	// startedAt is the wake's accept instant (issue #517 / PR-C /
+	// ADR-064). Captured at bootInput construction so the
+	// boot_started.RequestedAt + boot_completed.StartedAt pair
+	// share a stamp; consumed by the wake.boot_completed emit
+	// after the vmmd RPC returns. Best-effort — the watchdog's
+	// §6.1 anchor uses instances.started_at separately, so this
+	// drift is bounded by 1 row read.
+	startedAt time.Time
 }
 
 // timedDestroy issues a vmm.Destroy bounded by `timeout` and the
@@ -2293,6 +2475,22 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 		// started_at + 20s, slightly inflating the budget).
 	}
 	e.emitInstanceChanged(ctx, ins.ID, ins.AppID, state.StateSnapshotting, ins.WakeID)
+	// issue #517 / PR-C / ADR-064 — emit wake.park_started at the
+	// RUNNING→SNAPSHOTTING transition. Pairs with wake.park_completed
+	// below under the same wake_id so the timeline endpoint can
+	// surface "park took N ms" without joining the legacy
+	// state_transition rows. The wake_id is the one the just-finished
+	// boot produced (ins.WakeID), per ADR-035 the audit join key.
+	if e.events != nil {
+		e.events.Emit(ctx, events.ParkStarted{
+			EmitAt:     now.UTC(),
+			WakeID:     ins.WakeID,
+			AppID:      ins.AppID,
+			InstanceID: ins.ID,
+			NodeID:     ins.NodeID,
+			StartedAt:  now.UTC(),
+		})
+	}
 
 	b, err := e.vmm.PauseAndSnapshot(ctx, ins.NodeID, ins.ID, vmstate, storageKey, vmstateStorageKey)
 	if err != nil {
@@ -2306,6 +2504,24 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	}
 	e.ledger.Release(ins.ID)
 	e.transition(ctx, ins.ID, ins.AppID, state.StateParked)
+	// issue #517 / PR-C / ADR-064 — emit wake.park_completed on the
+	// successful park. The snapshot_id is the storage key the next
+	// wake will use to restore (per ADR-025 axis 2), so the timeline
+	// row lets an operator trace "this wake restored from the
+	// snapshot produced by that wake" by joining the storage_key
+	// back to the upcoming wake.row's restore_path metadata.
+	if e.events != nil {
+		e.events.Emit(ctx, events.ParkCompleted{
+			EmitAt:      time.Now().UTC(),
+			WakeID:      ins.WakeID,
+			AppID:       ins.AppID,
+			InstanceID:  ins.ID,
+			NodeID:      ins.NodeID,
+			StartedAt:   now.UTC(),
+			CompletedAt: time.Now().UTC(),
+			SnapshotID:  storageKey,
+		})
+	}
 	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b)
 	return nil
 }
@@ -2617,6 +2833,21 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 	// (commit 4) handles the events row's AppendEvent call as part
 	// of the normal transition path; we just supply the kind and
 	// reason so the audit row is searchable on `kind='watchdog_timeout'`.
+	// issue #517 / PR-C / ADR-064 — emit wake.stalled alongside the
+	// legacy watchdog_timeout audit row. The legacy row is preserved
+	// for GDPR-export compatibility (backwards-compat invariant per
+	// the plan); the typed row gives the customer-facing timeline
+	// endpoint a structured payload with the exact reason.
+	if e.events != nil {
+		e.events.Emit(ctx, events.Stalled{
+			EmitAt:     time.Now().UTC(),
+			WakeID:     fresh.WakeID,
+			AppID:      appID,
+			InstanceID: instanceID,
+			NodeID:     fresh.NodeID,
+			Reason:     string(reason),
+		})
+	}
 	e.transitionWithKind(ctx, instanceID, appID, terminal, "watchdog_timeout", string(reason))
 	if e.ops != nil {
 		e.ops.WatchdogKills(string(reason), string(terminal)).Inc()
