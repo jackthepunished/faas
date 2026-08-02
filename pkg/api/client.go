@@ -1097,6 +1097,29 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
 }
 
+// Per-app private-registry Basic Auth (issue #461 / ADR-062). Password
+// is sealed at rest server-side; the SDK only carries plaintext in the
+// PUT body and never sees the ciphertext. Hosts MUST be supplied with
+// an explicit "https://" prefix; apid rejects schemeless / http://
+// inputs with 400 invalid_registry_host at normalizeRegistryHost.
+//
+// Method names follow the MethodResource convention the sdk-coverage
+// gate expects (ListAppRegistryCredentials / SetAppRegistryCredential /
+// DeleteAppRegistryCredential). See cmd/sdk-coverage/main.go::methodRouteMap
+// for the pin table.
+func (c *Client) ListAppRegistryCredentials(ctx context.Context, slug string) (AppRegistryCredentialListResponse, error) {
+	var out AppRegistryCredentialListResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/registry-credentials", nil, &out)
+}
+func (c *Client) SetAppRegistryCredential(ctx context.Context, slug, registry, username, password string) (AppRegistryCredentialResponse, error) {
+	var out AppRegistryCredentialResponse
+	return out, c.do(ctx, "PUT", "/v1/apps/"+slug+"/registry-credentials",
+		PutAppRegistryCredentialRequest{Registry: registry, Username: username, Password: password}, &out)
+}
+func (c *Client) DeleteAppRegistryCredential(ctx context.Context, slug, registry string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/registry-credentials?registry="+url.QueryEscape(registry), nil, nil)
+}
+
 // Env vars (issue #395 / ADR-045). Plaintext by contract — values are
 // non-sensitive runtime config. Value never appears in the GET
 // response; only the key set + timestamps do (AppEnvResponse shape).

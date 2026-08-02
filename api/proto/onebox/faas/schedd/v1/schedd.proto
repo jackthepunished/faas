@@ -358,6 +358,20 @@ message ListInstanceStatsResponse {
 // since_seq to each vmmd without translation. Each instance's ring
 // is independent, so Seq scopes are per-instance, not global.
 //
+// deployment_id (issue #517 / PR-B acceptance #3) is the optional
+// per-deployment filter. Empty = fan out to every live instance for
+// the app; non-empty = scope the per-instance goroutine to
+// instances whose state.Instance.DeploymentID matches. Instances
+// with empty DeploymentID match any non-empty deployment_id filter
+// (legacy rows without deployment attribution). Wire is additive
+// per ADR-016; pre-PR-B callers send empty and observe the full
+// fan-out.
+//
+// since_written_at (issue #517 / PR-B acceptance #3) is the
+// per-instance written_at lower bound on the replay page, mirrored
+// at the schedd hop so the bound survives the gatewayd → schedd →
+// vmmd transit. Empty = no bound. Wire is additive per ADR-016.
+//
 // Additive per ADR-016.
 message StreamAppLogsRequest {
   // app_id is apps.id (the gateway resolves host→app).
@@ -365,11 +379,28 @@ message StreamAppLogsRequest {
   // since_seq is the per-instance replay cursor. 0 = tail from now.
   // Negative values are treated as 0 by the schedd.
   int64  since_seq = 2;
+  // deployment_id is the issue #517 / PR-B acceptance #3
+  // per-deployment filter; empty = full fan-out.
+  string deployment_id = 3;
+  // since_written_at is the issue #517 / PR-B acceptance #3
+  // host-side lower bound on the per-instance written_at; empty =
+  // no bound.
+  google.protobuf.Timestamp since_written_at = 4;
 }
 
 // StreamAppLogsResponse is one frame of the per-app log stream.
 // The instance_id is populated so a consumer can interleave
 // multi-instance frames deterministically (Move 4 acceptance #5).
+//
+// is_gap (issue #517 / PR-B acceptance #4) is true on a synthetic
+// "cursor fell below the ring's high-water mark" frame. When true,
+// instance_id is the instance whose ring reported the gap; the
+// line-frame fields (seq/stream/line/written_at) are unset;
+// gap_to_written_at carries the host-side ingest time of the oldest
+// line that instance currently retains; gap_reason names the bound
+// that triggered the gap ("seq_below_retained" or "since_below_retained").
+// Wire is additive per ADR-016 — pre-PR-B clients receive is_gap=false
+// and observe a normal line frame.
 //
 // Wire is additive: new fields go at the end. The seq/stream/line
 // triple mirrors vmmd's LogsResponse; written_at is the host-side
@@ -388,6 +419,16 @@ message StreamAppLogsResponse {
   // written_at is the host-side time the line was committed to
   // the per-instance ring (RFC 3339 nano).
   google.protobuf.Timestamp written_at = 5;
+  // is_gap is the issue #517 / PR-B acceptance #4 discriminator;
+  // true only on synthetic gap frames.
+  bool is_gap = 6;
+  // gap_to_written_at is the host-side ingest time of the oldest
+  // line the instance's ring currently retains; meaningful only on
+  // is_gap=true frames.
+  google.protobuf.Timestamp gap_to_written_at = 7;
+  // gap_reason is the bound that triggered the gap; meaningful only
+  // on is_gap=true frames. Mirrors vmmd's LogsResponse.gap_reason.
+  string gap_reason = 8;
 }
 
 // StreamWarmHintsRequest kicks off the sticky-warm affinity stream.

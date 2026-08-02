@@ -357,7 +357,16 @@ const testDomain = "apps.test.example"
 // a slot-84 gap to surface. The first bump (83 → 84) caught the
 // parallel slot-83 race against PR #509; the second lands on the
 // next free slot past the live migration head.
-const e2eMigrationTarget = 86
+//
+// (issue #461 / ADR-064 — registry_credentials landing on slot 94
+// after PR #529 (Tier A4 cross-node app rebalance, ADR-064) raced
+// from 92 to 93 between my pushes, holding both 92 and 93 as real
+// migrations on its branch. 92 stays as a reservation fence here so
+// the embedded FS stays contiguous from 1..94 without a 92 gap.
+// Bumped 83 → 87 → 92 → 93 → 94 across four rebase cycles; the
+// renumber chain tracks the gate's "next free slot past the live
+// head" rule when sibling PRs race for the same N.)
+const e2eMigrationTarget = 94
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

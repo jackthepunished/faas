@@ -9,6 +9,7 @@ package scheddgrpc
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -35,9 +36,11 @@ func (noopEngine) AdmitInstance(context.Context, string) (sched.WakeResult, erro
 func (noopEngine) ReportActivity(context.Context, []state.InstanceTouch) (int, error) {
 	return 0, nil
 }
-func (noopEngine) ParkWithReason(context.Context, string, string) error             { return nil }
-func (noopEngine) StreamAppLogs(context.Context, string, int64, LogFrameSink) error { return nil }
-func (noopEngine) StreamWarmHints(context.Context, WarmHintSink) error              { return nil }
+func (noopEngine) ParkWithReason(context.Context, string, string) error { return nil }
+func (noopEngine) StreamAppLogs(context.Context, string, int64, time.Time, string, LogFrameSink) error {
+	return nil
+}
+func (noopEngine) StreamWarmHints(context.Context, WarmHintSink) error { return nil }
 func (noopEngine) CapacitySink() CapacitySink {
 	return func(sched.CapacityReport) error { return nil }
 }

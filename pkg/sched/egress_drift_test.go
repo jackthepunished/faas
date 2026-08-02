@@ -117,11 +117,12 @@ func (r *recordingRouterVMM) Stats(_ context.Context, _ string) (*StatsSnapshot,
 	return &StatsSnapshot{}, nil
 }
 
-// Logs (issue #254 / Move 4) — the egress_drift test rig doesn't
-// drive log streams, so the recordingRouterVMM returns a no-op
-// fake stream that closes immediately. Tests that exercise the
-// Move 4 path inject a different fake.
-func (r *recordingRouterVMM) Logs(_ context.Context, _, _ string, _ int64) (LogStream, error) {
+// Logs (issue #254 / Move 4, issue #517 / PR-B) — the egress_drift
+// test rig doesn't drive log streams, so the recordingRouterVMM
+// returns a no-op fake stream that closes immediately. Tests that
+// exercise the Move 4 path inject a different fake. PR-B adds the
+// sinceWrittenAt time lower-bound; the fake ignores it.
+func (r *recordingRouterVMM) Logs(_ context.Context, _, _ string, _ int64, _ time.Time) (LogStream, error) {
 	return &fakeLogStream{}, nil
 }
 

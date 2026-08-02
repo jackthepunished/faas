@@ -5556,20 +5556,34 @@ func (s *PgStore) AppendBuilderUsage(ctx context.Context, accountID, appID, buil
 
 func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error) {
 	monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
-	// Compare via date_trunc('month', ...) on the parameter side too.
-	// The view's month column is timestamptz (date_trunc('month', timestamptz)
-	// is timestamptz). A plain `month = $2::timestamptz` still depends on the
-	// session timezone for the parameter's interpretation, which breaks on
-	// non-UTC hosts (issue #52 PR #59 follow-up: pgx encodes time.Time as a
-	// bare timestamp literal; in TZ=Europe/Istanbul that becomes
-	// 2026-07-01 00:00:00+03, while the view value is 2026-07-01 00:00:00+03
-	// but anchored to UTC internally — they compare unequal even with the
-	// explicit cast). date_trunc normalizes both sides to the month's start
-	// in UTC, sidestepping session-TZ semantics entirely.
+	monthEnd := monthStart.AddDate(0, 1, 0)
+	// Compare against a UTC-bucketed range on usage_minutes; the
+	// usage_monthly view defines `month = date_trunc('month', minute)`
+	// against a timestamptz, which means the view's bucket itself is
+	// session-TZ dependent. Querying usage_minutes directly with a
+	// UTC-anchored half-open range (same shape as UsageByHour /
+	// UsageByAccount) sidesteps the view's TZ shape AND avoids
+	// re-introducing `date_trunc('month', ...)` on either side of the
+	// comparison. The literal `monthStart` is returned as Usage.Month
+	// so the API surface stays byte-stable for callers that format
+	// the value. (memory: pkg-state-usage-monthly-tz-compare)
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count from usage_monthly
-		 where account_id = $1 and date_trunc('month', $2::timestamptz) = month order by app_id`,
-		accountID, monthStart)
+		`select account_id, app_id,
+		        $2::timestamptz as month,
+		        sum(mb_seconds)::bigint     as mb_seconds,
+		        sum(cpu_usec)::bigint       as cpu_usec,
+		        sum(requests)::bigint       as requests,
+		        sum(tx_bytes)::bigint       as tx_bytes,
+		        sum(net_tx_bytes)::bigint   as net_tx_bytes,
+		        sum(net_rx_bytes)::bigint   as net_rx_bytes,
+		        sum(cold_boot_count)::bigint as cold_boot_count
+		   from usage_minutes
+		  where account_id = $1
+		    and minute >= $2
+		    and minute <  $3
+		  group by account_id, app_id
+		  order by app_id`,
+		accountID, monthStart, monthEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -5591,9 +5605,15 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 // $1..$N split as ListDeploymentsForAccount.
 //
 // Month filtering (when month != nil) applies a half-open UTC range
-// [month, month+1mo) to period_end — same convention as UsageByMonth's
-// date_trunc('month', ...) guard, sidestepping the session-TZ compare
-// trap (memory: pkg-state-usage-monthly-tz-compare).
+// [month, month+1mo) to period_end. Both bounds are pre-computed in
+// Go in UTC (monthStart / monthEnd), so the SQL compares timestamptz
+// to timestamptz on UTC instants — no `date_trunc('month', ...)` on
+// either side. The earlier form `date_trunc('month', $2::timestamptz)`
+// bucketed in the SESSION timezone, so on non-UTC Postgres sessions
+// the half-open boundary leaked (memory:
+// pkg-state-usage-monthly-tz-compare). The fix uses bare
+// `period_end >= $2` — same shape as the existing UsageByAccount
+// minute-range filter — and a session-static TZ test pins it.
 //
 // Cursor (before) is strict-less on period_end only. The id tie-break
 // is implicit in the unique index ordering; rows sharing the same
@@ -5620,7 +5640,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
-			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end >= $2
 			    and period_end <  $3
 			  order by period_end desc, id desc
 			  limit $4`,
@@ -5635,7 +5655,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
-			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end >= $2
 			    and period_end <  $3
 			    and period_end < $4
 			  order by period_end desc, id desc
@@ -6252,13 +6272,23 @@ func (s *PgStore) LoadAllOverageCapCents(ctx context.Context) (map[string]int64,
 // surface. The migration on usage_minutes is unchanged; we SELECT
 // against the existing table.
 func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string) (int64, error) {
+	// Anchor the month lower bound in UTC on the Go side. The previous
+	// shape `minute >= date_trunc('month', now())` returned the local
+	// month's start in the session timezone (a timestamptz), so on a
+	// non-UTC Postgres session the bound was a different UTC instant
+	// from the start of the UTC calendar month — usage_minutes rows
+	// bucketed into the first UTC hour of the month were skipped.
+	// Matches the project convention (memory:
+	// pkg-state-usage-monthly-tz-compare) used elsewhere in this file.
+	now := time.Now().UTC()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	var mbSeconds int64
 	if err := s.pool.QueryRow(ctx,
 		`select COALESCE(SUM(mb_seconds), 0)::bigint
 		   from usage_minutes
 		  where account_id = $1
-		    and minute >= date_trunc('month', now())`,
-		accountID).Scan(&mbSeconds); err != nil {
+		    and minute >= $2`,
+		accountID, monthStart).Scan(&mbSeconds); err != nil {
 		return 0, err
 	}
 	// mb_seconds / 3600 = GB-h; GB-h * 100 = cents. Integer math.
@@ -6826,6 +6856,157 @@ func (s *PgStore) CountAppSecrets(ctx context.Context, accountID, appID string) 
 		`select count(*) from app_secrets where account_id = $1 and app_id = $2`,
 		accountID, appID).Scan(&n)
 	return n, err
+}
+
+// --- per-app private-registry Basic Auth (issue #461 / ADR-062) -------------
+//
+// Mirror of the sealed-secrets shape (lines 6446-6551) keyed by
+// (app_id, registry) instead of (app_id, key). The password column is
+// the same age-sealed bytea; username is plaintext metadata. apid is
+// the sole writer (handlers_registry_auth.go); imaged is the sole
+// reader (pkg/imaged/handler.go::buildImageLayer — transient unseal).
+//
+// Cross-account isolation: every query scopes by (account_id, app_id,
+// registry). The (account_id, app_id) ownership predicate is the SQL
+// IDOR guard; the FK on (account_id, app_id) is the schema-level
+// guarantee.
+
+// UpsertAppRegistryCredential inserts or replaces the
+// (app_id, registry) row. username + password_encrypted are replaced
+// on conflict; created_at is preserved (the ON CONFLICT clause omits
+// it). updated_at is bumped on every call so imaged's MarkUsed check
+// sees a fresh mtime on rotation flows.
+func (s *PgStore) UpsertAppRegistryCredential(ctx context.Context, accountID, appID, registry, username string, passwordEncrypted []byte) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into app_registry_credentials (account_id, app_id, registry, username, password_encrypted)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (app_id, registry) do update
+		   set username = excluded.username,
+		       password_encrypted = excluded.password_encrypted,
+		       updated_at = now()`,
+		accountID, appID, registry, username, passwordEncrypted)
+	return err
+}
+
+// GetAppRegistryCredential returns the row for (app_id, registry).
+// Returns ErrNotFound when no row matches the
+// (account_id, app_id, registry) triple — the (account_id, app_id)
+// ownership predicate is the SQL IDOR guard. The schema FK is
+// defence in depth.
+func (s *PgStore) GetAppRegistryCredential(ctx context.Context, accountID, appID, registry string) (AppRegistryCredential, error) {
+	var r AppRegistryCredential
+	err := s.pool.QueryRow(ctx,
+		`select account_id, app_id, registry, username, password_encrypted, created_at, updated_at, last_used_at
+		 from app_registry_credentials
+		 where account_id = $1 and app_id = $2 and registry = $3`,
+		accountID, appID, registry).Scan(
+		&r.AccountID, &r.AppID, &r.Registry, &r.Username, &r.PasswordEncrypted,
+		&r.CreatedAt, &r.UpdatedAt, &r.LastUsedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AppRegistryCredential{}, ErrNotFound
+		}
+		return AppRegistryCredential{}, err
+	}
+	return r, nil
+}
+
+// ListAppRegistryCredentials returns every (registry, username,
+// ciphertext) row on the app. Order by registry ASC for deterministic
+// wire output. Returns nil slice (not error) when the app has no
+// credentials — the handler renders an empty list.
+func (s *PgStore) ListAppRegistryCredentials(ctx context.Context, accountID, appID string) ([]AppRegistryCredential, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, registry, username, password_encrypted, created_at, updated_at, last_used_at
+		 from app_registry_credentials
+		 where account_id = $1 and app_id = $2
+		 order by registry asc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppRegistryCredential
+	for rows.Next() {
+		var r AppRegistryCredential
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Registry, &r.Username, &r.PasswordEncrypted,
+			&r.CreatedAt, &r.UpdatedAt, &r.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteAppRegistryCredential removes the (app_id, registry) row
+// scoped to accountID. Returns ErrNotFound when no row matches.
+func (s *PgStore) DeleteAppRegistryCredential(ctx context.Context, accountID, appID, registry string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from app_registry_credentials where account_id = $1 and app_id = $2 and registry = $3`,
+		accountID, appID, registry)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CountAppRegistryCredentials is the quota helper. Used by apid's PUT
+// handler to enforce Limits.RegistryCredentialMax BEFORE
+// UpsertAppRegistryCredential. Mirrors CountAppSecrets.
+func (s *PgStore) CountAppRegistryCredentials(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from app_registry_credentials where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// RegistryCredentialQuotaCheck collapses the "count rows on app"
+// + "does (app, host) exist" pair into a single CTE query. apid's
+// PUT handler calls this instead of running CountAppRegistryCredentials
+// + GetAppRegistryCredential back-to-back — one round-trip, same
+// shape as AppSecretQuotaCheck (if that ever lands). The CTE form
+// is single-pass: the count and the exists check both read from
+// the same scan. `(n, false, nil)` is the "host isn't set yet"
+// answer.
+func (s *PgStore) RegistryCredentialQuotaCheck(ctx context.Context, accountID, appID, registry string) (int, bool, error) {
+	var n int
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		with counts as (
+		    select count(*) as n,
+		           bool_or(registry = $3) as exists
+		    from app_registry_credentials
+		    where account_id = $1 and app_id = $2
+		)
+		select coalesce(n, 0), coalesce(exists, false)
+		from counts`,
+		accountID, appID, registry).Scan(&n, &exists)
+	return n, exists, err
+}
+
+// MarkAppRegistryCredentialUsed updates last_used_at + updated_at to
+// now(). Returns ErrNotFound when no row matches the
+// (account_id, app_id, registry) triple. Callers MUST treat
+// ErrNotFound as non-fatal — the deployment already succeeded, and a
+// missing-on-cascade is an expected race with account/app delete.
+func (s *PgStore) MarkAppRegistryCredentialUsed(ctx context.Context, accountID, appID, registry string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update app_registry_credentials
+		 set last_used_at = now(), updated_at = now()
+		 where account_id = $1 and app_id = $2 and registry = $3`,
+		accountID, appID, registry)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- app env vars (issue #395 / ADR-045) -------------------------------------

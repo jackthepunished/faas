@@ -19,12 +19,16 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 )
 
 // fakeImage is the in-memory state of one image served by a FakeRegistry. The
@@ -375,20 +379,128 @@ func BaseLayerImage(repo, body string) (fakeImage, string) {
 type FakeRegistry struct {
 	srv    *httptest.Server
 	images map[string]fakeImage // repo → image (one image per repo, the e2e test only uses one)
+
+	// Auth gate (issue #461 / ADR-062). When set, every /v2/* call must
+	// carry a Bearer token issued by /token; /token requires the matching
+	// Basic Auth. Nil = anonymous, the existing posture.
+	mu       sync.Mutex
+	authUser string
+	authPass string
+	tokens   map[string]struct{} // issued bearer tokens; opaque random strings
 }
 
 // NewFakeRegistry returns a running registry bound to 127.0.0.1. The caller
 // must Close() it.
 func NewFakeRegistry() *FakeRegistry {
-	f := &FakeRegistry{images: map[string]fakeImage{}}
+	f := &FakeRegistry{images: map[string]fakeImage{}, tokens: map[string]struct{}{}}
 	mux := http.NewServeMux()
 
 	// Public endpoints the OCI client hits. No auth — anon public pull.
 	mux.HandleFunc("/v2/", f.route)
 	mux.HandleFunc("/v2", f.route)
+	// Bearer-token exchange endpoint. Only wired (rejects anonymous) when
+	// RequireBasicAuth is set; before that, the path returns 404 so an
+	// anonymous pull that accidentally probes /token doesn't change
+	// behavior.
+	mux.HandleFunc("/token", f.token)
 
 	f.srv = httptest.NewServer(mux)
 	return f
+}
+
+// RequireBasicAuth installs a per-FakeRegistry Basic Auth gate. After this
+// call:
+//
+//   - /v2/... returns 401 with a Bearer challenge whose realm is
+//     "<FakeRegistry.URL()>/token", service "fake-registry", and a scope
+//     matching the requested repo. The challenge drives imaged's
+//     pkg/oci.RegistryClient.fetchToken path.
+//   - /token requires `Authorization: Basic base64(user:pass)` matching
+//     the user/pass arguments; on success it issues a fresh random bearer
+//     token (kept in memory) and returns the distribution-spec
+//     `{"token": "..."}` envelope.
+//   - /v2/... with a valid Bearer token then serves the manifest / blob
+//     normally.
+//
+// Used by the registry-auth e2e to assert imaged's transient unseal + auth
+// threading end-to-end. Per-call gates are intentionally NOT modelled —
+// the e2e harness uses one credential per (FakeRegistry, image) tuple.
+func (f *FakeRegistry) RequireBasicAuth(user, pass string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authUser = user
+	f.authPass = pass
+}
+
+// authEnabled reports whether the Basic Auth gate is on. Reads under mu.
+func (f *FakeRegistry) authEnabled() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authUser != "" || f.authPass != ""
+}
+
+// issueToken mints a fresh random bearer token and records it. Locked.
+func (f *FakeRegistry) issueToken() string {
+	var b [24]byte
+	_, _ = rand.Read(b[:])
+	tok := base64.RawURLEncoding.EncodeToString(b[:])
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokens[tok] = struct{}{}
+	return tok
+}
+
+// tokenValid reports whether the bearer token was issued by this server.
+func (f *FakeRegistry) tokenValid(t string) bool {
+	if t == "" {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.tokens[t]
+	return ok
+}
+
+// token handles GET /token. Only wired when RequireBasicAuth was called
+// (anonymous calls return 404 so the public path stays unaffected). On
+// success emits `{"token": "<random>"}` — the distribution-spec shape
+// pkg/oci/auth.go::FetchToken consumes.
+func (f *FakeRegistry) token(w http.ResponseWriter, r *http.Request) {
+	if !f.authEnabled() {
+		http.NotFound(w, r)
+		return
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="fake-registry"`)
+		http.Error(w, "missing basic auth", http.StatusUnauthorized)
+		return
+	}
+	f.mu.Lock()
+	wantUser, wantPass := f.authUser, f.authPass
+	f.mu.Unlock()
+	if user != wantUser || pass != wantPass {
+		w.Header().Set("WWW-Authenticate", `Basic realm="fake-registry"`)
+		http.Error(w, "bad credentials", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"token":      f.issueToken(),
+		"expires_in": 60,
+	})
+}
+
+// bearerChallenge returns a `WWW-Authenticate: Bearer ...` value with
+// realm=server.URL + /token, service="fake-registry", scope keyed to
+// the requested repo. Used by route() when the gate is on and the
+// incoming request has no valid Bearer token.
+func (f *FakeRegistry) bearerChallenge(scope string) string {
+	realm := strings.TrimSuffix(f.srv.URL, "/") + "/token"
+	if scope == "" {
+		return fmt.Sprintf(`Bearer realm=%q,service="fake-registry"`, realm)
+	}
+	return fmt.Sprintf(`Bearer realm=%q,service="fake-registry",scope=%q`, realm, scope)
 }
 
 // URL is the host:port the OCI client should connect to. Pass to imaged via
@@ -421,6 +533,23 @@ func (f *FakeRegistry) Close() { f.srv.Close() }
 // route dispatches /v2/<repo>/manifests/<ref> and /v2/<repo>/blobs/<digest>.
 // No auth — the harness is local-only.
 func (f *FakeRegistry) route(w http.ResponseWriter, r *http.Request) {
+	// Auth gate (issue #461 / ADR-062). When RequireBasicAuth was
+	// installed, every /v2/* request must carry a valid Bearer token
+	// issued by /token. Missing / invalid → 401 with the Bearer
+	// challenge that drives pkg/oci.RegistryClient.fetchToken. The
+	// challenge's scope is `repository:<repo>` to mirror the
+	// distribution-spec convention.
+	if f.authEnabled() {
+		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !f.tokenValid(bearer) {
+			path := r.URL.Path
+			repo, _, _ := parseOCIPath(path)
+			scope := "repository:" + repo
+			w.Header().Set("WWW-Authenticate", f.bearerChallenge(scope))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	path := r.URL.Path
 	repo, kind, ref := parseOCIPath(path)
 	if repo == "" {

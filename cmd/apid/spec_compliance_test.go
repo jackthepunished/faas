@@ -30,8 +30,9 @@ const (
 	serverSrcPath = "server.go"
 	dtoFile       = "dto.go"
 	secretsFile   = "secrets.go"
-	envFile       = "env.go"    // issue #395 / ADR-045
-	alertsFile    = "alerts.go" // issue #396 PR 3 / ADR-045
+	envFile       = "env.go"           // issue #395 / ADR-045
+	registryFile  = "registry_auth.go" // issue #461 / ADR-062
+	alertsFile    = "alerts.go"        // issue #396 PR 3 / ADR-045
 	manifestFile  = "appmanifest.go"
 	cliauthFile   = "cliauth.go"
 	mfaFile       = "mfa.go"
@@ -491,6 +492,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", dtoFile),
 		filepath.Join(root, "pkg", "api", secretsFile),
 		filepath.Join(root, "pkg", "api", envFile),
+		filepath.Join(root, "pkg", "api", registryFile),
 		filepath.Join(root, "pkg", "api", alertsFile),
 		filepath.Join(root, "pkg", "api", manifestFile),
 		filepath.Join(root, "pkg", "api", cliauthFile),

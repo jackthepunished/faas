@@ -851,6 +851,20 @@ func (x *ListInstanceStatsResponse) GetRows() []*InstanceStatsRow {
 // since_seq to each vmmd without translation. Each instance's ring
 // is independent, so Seq scopes are per-instance, not global.
 //
+// deployment_id (issue #517 / PR-B acceptance #3) is the optional
+// per-deployment filter. Empty = fan out to every live instance for
+// the app; non-empty = scope the per-instance goroutine to
+// instances whose state.Instance.DeploymentID matches. Instances
+// with empty DeploymentID match any non-empty deployment_id filter
+// (legacy rows without deployment attribution). Wire is additive
+// per ADR-016; pre-PR-B callers send empty and observe the full
+// fan-out.
+//
+// since_written_at (issue #517 / PR-B acceptance #3) is the
+// per-instance written_at lower bound on the replay page, mirrored
+// at the schedd hop so the bound survives the gatewayd → schedd →
+// vmmd transit. Empty = no bound. Wire is additive per ADR-016.
+//
 // Additive per ADR-016.
 type StreamAppLogsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -858,9 +872,16 @@ type StreamAppLogsRequest struct {
 	AppId string `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
 	// since_seq is the per-instance replay cursor. 0 = tail from now.
 	// Negative values are treated as 0 by the schedd.
-	SinceSeq      int64 `protobuf:"varint,2,opt,name=since_seq,json=sinceSeq,proto3" json:"since_seq,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SinceSeq int64 `protobuf:"varint,2,opt,name=since_seq,json=sinceSeq,proto3" json:"since_seq,omitempty"`
+	// deployment_id is the issue #517 / PR-B acceptance #3
+	// per-deployment filter; empty = full fan-out.
+	DeploymentId string `protobuf:"bytes,3,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
+	// since_written_at is the issue #517 / PR-B acceptance #3
+	// host-side lower bound on the per-instance written_at; empty =
+	// no bound.
+	SinceWrittenAt *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=since_written_at,json=sinceWrittenAt,proto3" json:"since_written_at,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *StreamAppLogsRequest) Reset() {
@@ -907,9 +928,33 @@ func (x *StreamAppLogsRequest) GetSinceSeq() int64 {
 	return 0
 }
 
+func (x *StreamAppLogsRequest) GetDeploymentId() string {
+	if x != nil {
+		return x.DeploymentId
+	}
+	return ""
+}
+
+func (x *StreamAppLogsRequest) GetSinceWrittenAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.SinceWrittenAt
+	}
+	return nil
+}
+
 // StreamAppLogsResponse is one frame of the per-app log stream.
 // The instance_id is populated so a consumer can interleave
 // multi-instance frames deterministically (Move 4 acceptance #5).
+//
+// is_gap (issue #517 / PR-B acceptance #4) is true on a synthetic
+// "cursor fell below the ring's high-water mark" frame. When true,
+// instance_id is the instance whose ring reported the gap; the
+// line-frame fields (seq/stream/line/written_at) are unset;
+// gap_to_written_at carries the host-side ingest time of the oldest
+// line that instance currently retains; gap_reason names the bound
+// that triggered the gap ("seq_below_retained" or "since_below_retained").
+// Wire is additive per ADR-016 — pre-PR-B clients receive is_gap=false
+// and observe a normal line frame.
 //
 // Wire is additive: new fields go at the end. The seq/stream/line
 // triple mirrors vmmd's LogsResponse; written_at is the host-side
@@ -928,7 +973,17 @@ type StreamAppLogsResponse struct {
 	Line string `protobuf:"bytes,4,opt,name=line,proto3" json:"line,omitempty"`
 	// written_at is the host-side time the line was committed to
 	// the per-instance ring (RFC 3339 nano).
-	WrittenAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=written_at,json=writtenAt,proto3" json:"written_at,omitempty"`
+	WrittenAt *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=written_at,json=writtenAt,proto3" json:"written_at,omitempty"`
+	// is_gap is the issue #517 / PR-B acceptance #4 discriminator;
+	// true only on synthetic gap frames.
+	IsGap bool `protobuf:"varint,6,opt,name=is_gap,json=isGap,proto3" json:"is_gap,omitempty"`
+	// gap_to_written_at is the host-side ingest time of the oldest
+	// line the instance's ring currently retains; meaningful only on
+	// is_gap=true frames.
+	GapToWrittenAt *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=gap_to_written_at,json=gapToWrittenAt,proto3" json:"gap_to_written_at,omitempty"`
+	// gap_reason is the bound that triggered the gap; meaningful only
+	// on is_gap=true frames. Mirrors vmmd's LogsResponse.gap_reason.
+	GapReason     string `protobuf:"bytes,8,opt,name=gap_reason,json=gapReason,proto3" json:"gap_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -996,6 +1051,27 @@ func (x *StreamAppLogsResponse) GetWrittenAt() *timestamppb.Timestamp {
 		return x.WrittenAt
 	}
 	return nil
+}
+
+func (x *StreamAppLogsResponse) GetIsGap() bool {
+	if x != nil {
+		return x.IsGap
+	}
+	return false
+}
+
+func (x *StreamAppLogsResponse) GetGapToWrittenAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.GapToWrittenAt
+	}
+	return nil
+}
+
+func (x *StreamAppLogsResponse) GetGapReason() string {
+	if x != nil {
+		return x.GapReason
+	}
+	return ""
 }
 
 // StreamWarmHintsRequest kicks off the sticky-warm affinity stream.
@@ -1386,10 +1462,12 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\btx_valid\x18\a \x01(\rR\atxValid\"\x1a\n" +
 	"\x18ListInstanceStatsRequest\"X\n" +
 	"\x19ListInstanceStatsResponse\x12;\n" +
-	"\x04rows\x18\x01 \x03(\v2'.onebox.faas.schedd.v1.InstanceStatsRowR\x04rows\"J\n" +
+	"\x04rows\x18\x01 \x03(\v2'.onebox.faas.schedd.v1.InstanceStatsRowR\x04rows\"\xb5\x01\n" +
 	"\x14StreamAppLogsRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12\x1b\n" +
-	"\tsince_seq\x18\x02 \x01(\x03R\bsinceSeq\"\xb1\x01\n" +
+	"\tsince_seq\x18\x02 \x01(\x03R\bsinceSeq\x12#\n" +
+	"\rdeployment_id\x18\x03 \x01(\tR\fdeploymentId\x12D\n" +
+	"\x10since_written_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x0esinceWrittenAt\"\xae\x02\n" +
 	"\x15StreamAppLogsResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x10\n" +
@@ -1397,7 +1475,11 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x06stream\x18\x03 \x01(\tR\x06stream\x12\x12\n" +
 	"\x04line\x18\x04 \x01(\tR\x04line\x129\n" +
 	"\n" +
-	"written_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\twrittenAt\"\x18\n" +
+	"written_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\twrittenAt\x12\x15\n" +
+	"\x06is_gap\x18\x06 \x01(\bR\x05isGap\x12E\n" +
+	"\x11gap_to_written_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\x0egapToWrittenAt\x12\x1d\n" +
+	"\n" +
+	"gap_reason\x18\b \x01(\tR\tgapReason\"\x18\n" +
 	"\x16StreamWarmHintsRequest\"\x84\x01\n" +
 	"\x17StreamWarmHintsResponse\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12\x17\n" +
@@ -1474,29 +1556,31 @@ var file_onebox_faas_schedd_v1_schedd_proto_depIdxs = []int32{
 	19, // 3: onebox.faas.schedd.v1.AdmitInstanceResponse.problem:type_name -> google.protobuf.Struct
 	5,  // 4: onebox.faas.schedd.v1.ReportActivityRequest.touches:type_name -> onebox.faas.schedd.v1.Touch
 	10, // 5: onebox.faas.schedd.v1.ListInstanceStatsResponse.rows:type_name -> onebox.faas.schedd.v1.InstanceStatsRow
-	20, // 6: onebox.faas.schedd.v1.StreamAppLogsResponse.written_at:type_name -> google.protobuf.Timestamp
-	20, // 7: onebox.faas.schedd.v1.StreamWarmHintsResponse.written_at:type_name -> google.protobuf.Timestamp
-	1,  // 8: onebox.faas.schedd.v1.Schedd.Wake:input_type -> onebox.faas.schedd.v1.WakeRequest
-	3,  // 9: onebox.faas.schedd.v1.Schedd.AdmitInstance:input_type -> onebox.faas.schedd.v1.AdmitInstanceRequest
-	6,  // 10: onebox.faas.schedd.v1.Schedd.ReportActivity:input_type -> onebox.faas.schedd.v1.ReportActivityRequest
-	8,  // 11: onebox.faas.schedd.v1.Schedd.ParkInstance:input_type -> onebox.faas.schedd.v1.ParkInstanceRequest
-	11, // 12: onebox.faas.schedd.v1.Schedd.ListInstanceStats:input_type -> onebox.faas.schedd.v1.ListInstanceStatsRequest
-	13, // 13: onebox.faas.schedd.v1.Schedd.StreamAppLogs:input_type -> onebox.faas.schedd.v1.StreamAppLogsRequest
-	15, // 14: onebox.faas.schedd.v1.Schedd.StreamWarmHints:input_type -> onebox.faas.schedd.v1.StreamWarmHintsRequest
-	17, // 15: onebox.faas.schedd.v1.Schedd.ReportCapacity:input_type -> onebox.faas.schedd.v1.CapacityReport
-	2,  // 16: onebox.faas.schedd.v1.Schedd.Wake:output_type -> onebox.faas.schedd.v1.WakeResponse
-	4,  // 17: onebox.faas.schedd.v1.Schedd.AdmitInstance:output_type -> onebox.faas.schedd.v1.AdmitInstanceResponse
-	7,  // 18: onebox.faas.schedd.v1.Schedd.ReportActivity:output_type -> onebox.faas.schedd.v1.ReportActivityResponse
-	9,  // 19: onebox.faas.schedd.v1.Schedd.ParkInstance:output_type -> onebox.faas.schedd.v1.ParkInstanceResponse
-	12, // 20: onebox.faas.schedd.v1.Schedd.ListInstanceStats:output_type -> onebox.faas.schedd.v1.ListInstanceStatsResponse
-	14, // 21: onebox.faas.schedd.v1.Schedd.StreamAppLogs:output_type -> onebox.faas.schedd.v1.StreamAppLogsResponse
-	16, // 22: onebox.faas.schedd.v1.Schedd.StreamWarmHints:output_type -> onebox.faas.schedd.v1.StreamWarmHintsResponse
-	18, // 23: onebox.faas.schedd.v1.Schedd.ReportCapacity:output_type -> onebox.faas.schedd.v1.ReportCapacityAck
-	16, // [16:24] is the sub-list for method output_type
-	8,  // [8:16] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	20, // 6: onebox.faas.schedd.v1.StreamAppLogsRequest.since_written_at:type_name -> google.protobuf.Timestamp
+	20, // 7: onebox.faas.schedd.v1.StreamAppLogsResponse.written_at:type_name -> google.protobuf.Timestamp
+	20, // 8: onebox.faas.schedd.v1.StreamAppLogsResponse.gap_to_written_at:type_name -> google.protobuf.Timestamp
+	20, // 9: onebox.faas.schedd.v1.StreamWarmHintsResponse.written_at:type_name -> google.protobuf.Timestamp
+	1,  // 10: onebox.faas.schedd.v1.Schedd.Wake:input_type -> onebox.faas.schedd.v1.WakeRequest
+	3,  // 11: onebox.faas.schedd.v1.Schedd.AdmitInstance:input_type -> onebox.faas.schedd.v1.AdmitInstanceRequest
+	6,  // 12: onebox.faas.schedd.v1.Schedd.ReportActivity:input_type -> onebox.faas.schedd.v1.ReportActivityRequest
+	8,  // 13: onebox.faas.schedd.v1.Schedd.ParkInstance:input_type -> onebox.faas.schedd.v1.ParkInstanceRequest
+	11, // 14: onebox.faas.schedd.v1.Schedd.ListInstanceStats:input_type -> onebox.faas.schedd.v1.ListInstanceStatsRequest
+	13, // 15: onebox.faas.schedd.v1.Schedd.StreamAppLogs:input_type -> onebox.faas.schedd.v1.StreamAppLogsRequest
+	15, // 16: onebox.faas.schedd.v1.Schedd.StreamWarmHints:input_type -> onebox.faas.schedd.v1.StreamWarmHintsRequest
+	17, // 17: onebox.faas.schedd.v1.Schedd.ReportCapacity:input_type -> onebox.faas.schedd.v1.CapacityReport
+	2,  // 18: onebox.faas.schedd.v1.Schedd.Wake:output_type -> onebox.faas.schedd.v1.WakeResponse
+	4,  // 19: onebox.faas.schedd.v1.Schedd.AdmitInstance:output_type -> onebox.faas.schedd.v1.AdmitInstanceResponse
+	7,  // 20: onebox.faas.schedd.v1.Schedd.ReportActivity:output_type -> onebox.faas.schedd.v1.ReportActivityResponse
+	9,  // 21: onebox.faas.schedd.v1.Schedd.ParkInstance:output_type -> onebox.faas.schedd.v1.ParkInstanceResponse
+	12, // 22: onebox.faas.schedd.v1.Schedd.ListInstanceStats:output_type -> onebox.faas.schedd.v1.ListInstanceStatsResponse
+	14, // 23: onebox.faas.schedd.v1.Schedd.StreamAppLogs:output_type -> onebox.faas.schedd.v1.StreamAppLogsResponse
+	16, // 24: onebox.faas.schedd.v1.Schedd.StreamWarmHints:output_type -> onebox.faas.schedd.v1.StreamWarmHintsResponse
+	18, // 25: onebox.faas.schedd.v1.Schedd.ReportCapacity:output_type -> onebox.faas.schedd.v1.ReportCapacityAck
+	18, // [18:26] is the sub-list for method output_type
+	10, // [10:18] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_onebox_faas_schedd_v1_schedd_proto_init() }

@@ -610,6 +610,19 @@ type OpsMetrics struct {
 	// breakerFailureThreshold consecutive failures, then auto-
 	// resets after breakerCooldown).
 	githubdPathFilterTotal *prometheus.CounterVec
+	// registryCredentialMarkUsedFailures: ADR-062 / issue #461.
+	// Counts every failure of imaged's
+	// store.MarkAppRegistryCredentialUsed call after a successful
+	// authenticated pull. The deployment itself succeeds (mark-used
+	// is intentionally non-fatal per ADR-062 §Decision 8) but the
+	// counter is the operator's tripwire: a persistent rate means
+	// `last_used_at` is lagging reality and the rotation heuristics
+	// may rotate still-in-use credentials. No labels — closed set
+	// (the failure is just "DB write refused" / "row vanished" /
+	// "transient connection drop"), bounded cardinality. Pre-
+	// instantiated at boot below so the row surfaces in /metrics
+	// from the moment imaged starts.
+	registryCredentialMarkUsedFailures prometheus.Counter
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -1161,6 +1174,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Per-image Grype finding counts, labelled by image (the OCI ref of the staged base ext4) and severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} (issue #299). The CRITICAL count is the vmmd admission gate's read side — a non-zero rate means vmmd refused to bring up an instance whose staged ext4 had a CRITICAL finding. The counter is incremented once per Grype scan at imaged base-stage time.",
 	}, []string{"image", "severity"})
 	commonCollectors = append(commonCollectors, imageScanVulns)
+	// ADR-062 / issue #461: registry-credential mark-used failure
+	// counter. Unlabelled Counter (no cardinality risk); pre-
+	// instantiated at boot so the row surfaces in /metrics from
+	// the moment imaged starts. Only imaged increments it in
+	// production, but the field is on the shared struct (single-
+	// registry pattern, memory wire/OpsMetrics).
+	registryCredentialMarkUsedFailures := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_registry_credential_mark_used_failures_total",
+		Help: "Count of imaged's store.MarkAppRegistryCredentialUsed failures after a successful authenticated pull (ADR-062, issue #461). The deployment itself succeeds — mark-used is intentionally non-fatal per ADR-062 §Decision 8 — but a persistent non-zero rate means `last_used_at` is lagging reality and rotation heuristics may evict still-in-use credentials. No labels; failure shape is closed (DB write refused, row vanished, transient connection drop).",
+	})
+	commonCollectors = append(commonCollectors, registryCredentialMarkUsedFailures)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -1375,66 +1399,67 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// before the first sampler tick.
 	throttleSecondsTotal.WithLabelValues(topAppOtherAccountLabel, topAppOtherLabel)
 	return &OpsMetrics{
-		registry:                         reg,
-		ops:                              ops,
-		dur:                              dur,
-		watchdogKills:                    watchdogKills,
-		rebalanceDecisions:               rebalanceDecisions,
-		eventsWriteFail:                  eventsWriteFail,
-		auditWriteFail:                   auditWriteFail,
-		auditWriteDur:                    auditWriteDur,
-		requestFailures:                  requestFailures,
-		requestTotal:                     requestTotal,
-		accountLabels:                    newAccountLabelSet(maxAccountLabelValues),
-		failedLoginTotal:                 failedLoginTotal,
-		failedLoginDropped:               failedLoginDropped,
-		failedLoginAuditWriteFailures:    failedLoginAuditWriteFailures,
-		alertEvalSkippedDegradedTotal:    alertEvalSkippedDegradedTotal,
-		alertEvalFiredTotal:              alertEvalFiredTotal,
-		alertDeliveryAttemptsTotal:       alertDeliveryAttemptsTotal,
-		alertEvaluatorEnabled:            alertEvaluatorEnabled,
-		pgBackupLastPushed:               pgBackupLastPushed,
-		ipLabels:                         newIPLabelSet(maxIPLabelValues),
-		topTenantRPS:                     topTenantRPS,
-		topAccounts:                      newTopAccountSet(topAccountSetCap),
-		throttleSecondsTotal:             throttleSecondsTotal,
-		throttleRatio:                    throttleRatio,
-		topApps:                          newTopAppSet(topAppSetCap),
-		throttleSecondsLastSeen:          newCPUThrottleLastSeen(),
-		cpuSecondsLast:                   newCPUSecondsLastSeen(),
-		stripePushDur:                    stripePushDur,
-		paddlePushDur:                    paddlePushDur,
-		buildDur:                         buildDur,
-		buildQueueWait:                   buildQueueWait,
-		residentGBPerCustomer:            residentGBPerCustomer,
-		billingCapExceededTotal:          billingCapExceededTotal,
-		meterdFloorAppliedTotal:          meterdFloorAppliedTotal,
-		wakeIDV4Fallback:                 wakeIDV4Fallback,
-		snapshotDiskDrift:                snapshotDiskDrift,
-		capacitySignatureRejected:        capacitySignatureRejected,
-		imagedOCIPull:                    imagedOCIPull,
-		instanceCPUPct:                   instanceCPUPct,
-		instanceRSSMB:                    instanceRSSMB,
-		instanceInflightReqs:             instanceInflightReqs,
-		instanceCPUSecondsTotal:          instanceCPUSecondsTotal,
-		instanceStatsCollectDur:          instanceStatsCollectDur,
-		instanceStatsPartialErrors:       instanceStatsPartialErrors,
-		cpuStatsCollectDur:               cpuStatsCollectDurLocal,
-		scaleUpDecisions:                 scaleUpDecisions,
-		scaleDownDecisions:               scaleDownDecisions,
-		scaleUpAdmitRPS:                  scaleUpAdmitRPS,
-		sseClients:                       sseClients,
-		egressDeny:                       egressDeny,
-		ociEgressDeny:                    ociEgressDeny,
-		provenanceWrites:                 provenanceWrites,
-		imageScanVulns:                   imageScanVulns,
-		apidLogsEmittedTotal:             apidLogsEmittedTotal,
-		egressSourceErrors:               egressSourceErrors,
-		oauthDisabledTotal:               oauthDisabledTotal,
-		advisoryBatchesEmittedTotal:      advisoryBatchesEmittedTotal,
-		apidStatelessAdvisoryEventsTotal: apidStatelessAdvisoryEventsTotal,
-		apidGithubdBridgeEnqueuedTotal:   apidGithubdBridgeEnqueuedTotal,
-		githubdPathFilterTotal:           githubdPathFilterTotal,
+		registry:                           reg,
+		ops:                                ops,
+		dur:                                dur,
+		watchdogKills:                      watchdogKills,
+		eventsWriteFail:                    eventsWriteFail,
+		auditWriteFail:                     auditWriteFail,
+		auditWriteDur:                      auditWriteDur,
+		requestFailures:                    requestFailures,
+		requestTotal:                       requestTotal,
+		accountLabels:                      newAccountLabelSet(maxAccountLabelValues),
+		failedLoginTotal:                   failedLoginTotal,
+		failedLoginDropped:                 failedLoginDropped,
+		failedLoginAuditWriteFailures:      failedLoginAuditWriteFailures,
+		alertEvalSkippedDegradedTotal:      alertEvalSkippedDegradedTotal,
+		alertEvalFiredTotal:                alertEvalFiredTotal,
+		alertDeliveryAttemptsTotal:         alertDeliveryAttemptsTotal,
+		alertEvaluatorEnabled:              alertEvaluatorEnabled,
+		pgBackupLastPushed:                 pgBackupLastPushed,
+		ipLabels:                           newIPLabelSet(maxIPLabelValues),
+		topTenantRPS:                       topTenantRPS,
+		topAccounts:                        newTopAccountSet(topAccountSetCap),
+		throttleSecondsTotal:               throttleSecondsTotal,
+		throttleRatio:                      throttleRatio,
+		topApps:                            newTopAppSet(topAppSetCap),
+		throttleSecondsLastSeen:            newCPUThrottleLastSeen(),
+		cpuSecondsLast:                     newCPUSecondsLastSeen(),
+		stripePushDur:                      stripePushDur,
+		paddlePushDur:                      paddlePushDur,
+		buildDur:                           buildDur,
+		buildQueueWait:                     buildQueueWait,
+		residentGBPerCustomer:              residentGBPerCustomer,
+		billingCapExceededTotal:            billingCapExceededTotal,
+		meterdFloorAppliedTotal:            meterdFloorAppliedTotal,
+		wakeIDV4Fallback:                   wakeIDV4Fallback,
+		snapshotDiskDrift:                  snapshotDiskDrift,
+		capacitySignatureRejected:          capacitySignatureRejected,
+		imagedOCIPull:                      imagedOCIPull,
+		instanceCPUPct:                     instanceCPUPct,
+		instanceRSSMB:                      instanceRSSMB,
+		instanceInflightReqs:               instanceInflightReqs,
+		instanceCPUSecondsTotal:            instanceCPUSecondsTotal,
+		instanceStatsCollectDur:            instanceStatsCollectDur,
+		instanceStatsPartialErrors:         instanceStatsPartialErrors,
+		cpuStatsCollectDur:                 cpuStatsCollectDurLocal,
+		scaleUpDecisions:                   scaleUpDecisions,
+		scaleDownDecisions:                 scaleDownDecisions,
+		scaleUpAdmitRPS:                    scaleUpAdmitRPS,
+		sseClients:                         sseClients,
+		egressDeny:                         egressDeny,
+		ociEgressDeny:                      ociEgressDeny,
+		provenanceWrites:                   provenanceWrites,
+		imageScanVulns:                     imageScanVulns,
+		rebalanceDecisions:                 rebalanceDecisions,
+		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
+		apidLogsEmittedTotal:               apidLogsEmittedTotal,
+		egressSourceErrors:                 egressSourceErrors,
+		oauthDisabledTotal:                 oauthDisabledTotal,
+		advisoryBatchesEmittedTotal:        advisoryBatchesEmittedTotal,
+		apidStatelessAdvisoryEventsTotal:   apidStatelessAdvisoryEventsTotal,
+		apidGithubdBridgeEnqueuedTotal:     apidGithubdBridgeEnqueuedTotal,
+		githubdPathFilterTotal:             githubdPathFilterTotal,
 	}
 }
 
@@ -2063,6 +2088,27 @@ func (m *OpsMetrics) EgressSourceErrors() prometheus.Counter {
 		return nil
 	}
 	return m.egressSourceErrors
+}
+
+// RegistryCredentialMarkUsedFailures returns the bare Counter that
+// records imaged's
+// store.MarkAppRegistryCredentialUsed failures after a successful
+// authenticated pull (ADR-062 / issue #461). Safe on a nil
+// receiver so call sites can be written without a nil-check; the
+// caller's expected use is:
+//
+//	ops.RegistryCredentialMarkUsedFailures().Inc()
+//
+// Registered on every daemon via the single-registry pattern; only
+// imaged's markRegistryCredentialUsed increments in production.
+// The deployment itself succeeds — mark-used is intentionally
+// non-fatal per ADR-062 §Decision 8 — but a persistent non-zero
+// rate means `last_used_at` is lagging reality.
+func (m *OpsMetrics) RegistryCredentialMarkUsedFailures() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.registryCredentialMarkUsedFailures
 }
 
 // Registry returns the underlying registry — pass to promhttp.HandlerFor

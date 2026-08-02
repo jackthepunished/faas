@@ -34,7 +34,7 @@ type fakeEngine struct {
 	// in the StreamAppLogs handler tests. Default nil = no-op
 	// (returns nil immediately), so the existing test suite stays
 	// broken-free.
-	streamLogFn func(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error
+	streamLogFn func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error
 	// streamWarmHintsFn (ADR-025 axis 4) drives the per-event
 	// fan-out in the StreamWarmHints handler tests. Default nil =
 	// no-op (returns nil immediately).
@@ -73,13 +73,19 @@ func (f *fakeEngine) ParkWithReason(ctx context.Context, instanceID, reason stri
 	return nil
 }
 
-// StreamAppLogs (issue #254 / Move 4) — the default fake drains
-// the sink immediately and returns nil. Tests that exercise the
-// per-frame fan-out wire (pkg/scheddgrpc/logs_test.go) inject a
-// custom streamLogFn via the fakeEngine.
-func (f *fakeEngine) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sink scheddgrpc.LogFrameSink) error {
+// StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B) — the
+// default fake drains the sink immediately and returns nil.
+// Tests that exercise the per-frame fan-out wire
+// (pkg/scheddgrpc/logs_test.go) inject a custom streamLogFn via
+// the fakeEngine.
+//
+// PR-B adds two additive args (sinceWrittenAt, deploymentID); the
+// default impl ignores them and the existing test using
+// streamLogFn must update its signature to match (see
+// pkg/scheddgrpc/logs_test.go::TestStreamAppLogs_HappyPath).
+func (f *fakeEngine) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
 	if f.streamLogFn != nil {
-		return f.streamLogFn(ctx, appID, sinceSeq, sink)
+		return f.streamLogFn(ctx, appID, sinceSeq, sinceWrittenAt, deploymentID, sink)
 	}
 	return nil
 }

@@ -21,12 +21,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
+
+	"filippo.io/age"
 )
 
 // Notifier is the minimal interface imaged needs from pkg/db. The real
@@ -170,6 +174,17 @@ type Handler struct {
 	// Interface (not concrete *VMMClient) so tests can inject a
 	// fakeVMMClient (defined in vmmclient.go) without dialing.
 	vmmClient VMMClientIface
+	// secretboxIdentity (issue #461 / ADR-062) is the host age
+	// identity used to TRANSIENTLY unseal per-app private-registry
+	// Basic Auth passwords during the pull path. The plaintext
+	// password lives only inside one call frame and is GC'd on
+	// return — NEVER attached to a Deployment, audit payload, log
+	// line, or returned error. Wired via WithSecretboxIdentity at
+	// daemon startup from FAAS_HOST_AGE_IDENTITY_PATH (the same
+	// path apid loads for MFA unseal). Nil-safe: with no identity
+	// wired, the registry credential lookup is skipped and pulls
+	// stay anonymous (matches the Free plan / no-credential case).
+	secretboxIdentity *age.X25519Identity
 }
 
 // New returns a Handler. The OCI puller is injected so tests can substitute
@@ -499,6 +514,25 @@ func (h *Handler) WithVMMClient(c VMMClientIface) *Handler {
 	return h
 }
 
+// WithSecretboxIdentity wires the host age identity used to
+// unseal per-app private-registry Basic Auth passwords in the
+// pull path (issue #461 / ADR-062). Mirrors the apid
+// FAAS_HOST_AGE_IDENTITY_PATH loading — same file, same key,
+// same in-process lifetime.
+//
+// The identity is the SAME age.X25519Identity vmmd uses for
+// seal/unseal across the box. imaged does NOT load the
+// recipient; that's apid-only. The identity is required only
+// when an app has a private-registry credential stored; nil =
+// anonymous pulls for every app (matches Free plan + no-cred
+// Hobby paths). Unit tests pass nil — the registry credential
+// path is exercised by a separate hermetic test file
+// (handler_auth_test.go).
+func (h *Handler) WithSecretboxIdentity(ident *age.X25519Identity) *Handler {
+	h.secretboxIdentity = ident
+	return h
+}
+
 // CloseVMMClient closes the vmmd gRPC client wired at startup.
 // Exposed (rather than a method on VMMClient only) so cmd/imaged
 // can call h.CloseVMMClient() on SIGTERM without exposing the
@@ -778,6 +812,101 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 // succeeds. The per-deploy Handler override wins over the image's Cmd,
 // per the deploy contract.
 //
+// resolveRegistryAuth looks up a per-app private-registry Basic Auth
+// credential keyed by the OCI ref's host, transiently unseals the
+// password via the wired secretbox identity, and returns the
+// *oci.BasicAuth the puller should carry on its realm request. The
+// plaintext lives only inside this call frame and is GC'd on return —
+// NEVER attached to dep, audit, log, or the returned error.
+//
+// Three return paths:
+//   - (nil, nil): no credential stored for this host → anonymous pull
+//     (Free-plan / Hobby-without-private / public-registry case).
+//   - (auth, nil): credential found + unsealed successfully → puller
+//     threads `auth` into PullXxxWithAuth.
+//   - (nil, err): non-ErrNotFound lookup failure, or unseal failure →
+//     caller fails the deployment loudly (a sealed blob we can't open
+//     is a configuration error, not a soft miss).
+//
+// Issue #461 / ADR-062: keyed by (accountID, appID, host) — the
+// (accountID, appID) tuple is the IDOR-safe guard the apid handlers
+// already enforce, and the host comes from the OCI ref (NOT the
+// customer-supplied deployment image_ref). Pulling the host from the
+// parsed ref ensures a customer can never accidentally widen the
+// credential to a different registry by manipulating a request body.
+func (h *Handler) resolveRegistryAuth(ctx context.Context, app state.App, host string) (*oci.BasicAuth, error) {
+	if h.secretboxIdentity == nil {
+		return nil, nil
+	}
+	if host == "" {
+		return nil, nil
+	}
+	cred, err := h.store.GetAppRegistryCredential(ctx, app.AccountID, app.ID, host)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("imaged: lookup registry credential for %s: %w",
+			logsanitize.Field(host), err)
+	}
+	// OpenBytes returns (namespace, plaintext, err); the
+	// namespace is the literal "registry_creds" we sealed
+	// under at PUT time (mirrors handlers_secrets.go's
+	// app_secret namespace check). A namespace mismatch
+	// means the envelope was sealed for a different
+	// secretbox slot — refuse rather than passing through.
+	ns, plaintext, err := secretbox.OpenBytes(h.secretboxIdentity, cred.PasswordEncrypted)
+	if err != nil {
+		// Don't echo the unseal error verbatim — it can include
+		// corrupted-byte markers that aid an attacker probing the
+		// seal format. Replace with a fixed-shape message.
+		return nil, fmt.Errorf("imaged: open registry credential for %s: %w",
+			logsanitize.Field(host), err)
+	}
+	if ns != "registry_creds" {
+		return nil, fmt.Errorf("imaged: open registry credential for %s: namespace=%q",
+			logsanitize.Field(host), ns)
+	}
+	return &oci.BasicAuth{
+		Username: cred.Username,
+		Password: string(plaintext),
+	}, nil
+}
+
+// markRegistryCredentialUsed records that the credential for host
+// was used to successfully authenticate a pull (issue #461 /
+// ADR-062). The update is best-effort — a non-fatal warn log on
+// failure. The schema's last_used_at is observed metadata
+// (operator dashboards), NOT a deployment precondition, so a
+// transient update failure must not abort an otherwise-successful
+// build. Returns immediately on nil appAuth (anonymous pull).
+//
+// Callers MUST invoke this AFTER a successful authenticated pull
+// and never on error paths — the contract per ADR-062 §Decision 8
+// is "LastUsedAt updated only after a successful authenticated
+// pull".
+//
+// Failure channel: every failed MarkAppRegistryCredentialUsed
+// increments the daemon-wide
+// imaged_registry_credential_mark_used_failures_total counter
+// (ADR-062 / issue #461) so operators can detect a lagging
+// last_used_at — non-fatal here would otherwise be silent. h.ops
+// is nil-checked for unit-test paths that don't wire metrics.
+func (h *Handler) markRegistryCredentialUsed(ctx context.Context, app state.App, host string, appAuth *oci.BasicAuth) {
+	if appAuth == nil || host == "" {
+		return
+	}
+	if err := h.store.MarkAppRegistryCredentialUsed(ctx, app.AccountID, app.ID, host); err != nil {
+		// Warn, never fail. The deployment already succeeded.
+		h.log.Warn("imaged: mark registry credential used failed",
+			"registry", logsanitize.Field(host),
+			"err", err.Error())
+		if c := h.ops.RegistryCredentialMarkUsedFailures(); c != nil {
+			c.Inc()
+		}
+	}
+}
+
 // ref is the full OCI reference (`host/repo@sha256:...`) apid stored into
 // dep.ImageDigest. We use the full ref (not just the bare digest) for every
 // OCI call so the puller dials the right registry — a bare digest resolves
@@ -785,6 +914,40 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 // deploys (issue #53 / M5 acceptance on Lima).
 func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.Deployment, acct state.Account) error {
 	ref := dep.ImageDigest
+
+	// Issue #461 / ADR-062: resolve the per-app private-registry Basic
+	// Auth credential (if any) keyed by the OCI ref's host. The plaintext
+	// password lives only inside this call frame. We capture the host
+	// here so both the M5 fallback (legacy PullDigest/PullLayers) and the
+	// M6 two-drive (aboveBaseLayers) branches can thread it through. A
+	// lookup or unseal failure here fails the deployment loudly — a
+	// credential we can't open is a configuration error, not a soft miss.
+	//
+	// refHost is the parsed registry host ("ghcr.io",
+	// "registry.gregale.dev", ...) used as the credential key.
+	// Empty string means anonymous — either the ref failed to
+	// parse (StatefulDenyListMatch below will reject anyway) or
+	// the registry host is empty (docker.io default).
+	var appAuth *oci.BasicAuth
+	refHost := ""
+	if parsedRef, parseErr := oci.ParseReference(ref); parseErr == nil {
+		refHost = parsedRef.APIHost()
+		appAuth, parseErr = h.resolveRegistryAuth(ctx, app, refHost)
+		if parseErr != nil {
+			_ = h.markDeployFailed(ctx, dep.ID, parseErr, "imaged: resolve registry auth")
+			return parseErr
+		}
+	}
+	defer func() {
+		// Zero the plaintext on the way out so the GC can
+		// reclaim it even if the runtime kept a reference to
+		// the struct's backing memory. Best-effort — Go does
+		// not guarantee zeroization, but it's the most we can
+		// do at the language boundary without unsafe.
+		if appAuth != nil {
+			appAuth.Password = ""
+		}
+	}()
 
 	// Wave 0 / year-one stateless-only: refuse well-known stateful
 	// base images before we burn the PullDigest round-trip. The check
@@ -813,17 +976,22 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		}
 	}
 
-	digest, err := h.oci.PullDigest(ctx, ref)
+	digest, err := pullDigestWithAuth(ctx, h.oci, ref, appAuth)
 	if err != nil {
 		_ = h.markDeployFailed(ctx, dep.ID, err, "oci pull failed")
 		return fmt.Errorf("imaged: oci pull: %w", err)
 	}
+	// Issue #461 / ADR-062: best-effort mark credential used on
+	// successful authenticated pull. Best-effort so a transient
+	// mark-used failure cannot abort an otherwise-successful
+	// build; non-fatal warn log inside markRegistryCredentialUsed.
+	h.markRegistryCredentialUsed(ctx, app, refHost, appAuth)
 
 	if err := h.transition(ctx, dep.ID, state.DeployImaging, ""); err != nil {
 		return err
 	}
 
-	imageCfg, err := h.oci.PullImageConfig(ctx, ref)
+	imageCfg, err := pullImageConfigWithAuth(ctx, h.oci, ref, appAuth)
 	if err != nil {
 		_ = h.markDeployFailed(ctx, dep.ID, err, "oci pull config")
 		return fmt.Errorf("imaged: pull image config: %w", err)
@@ -864,7 +1032,15 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		return fmt.Errorf("imaged: storageFor: %w", err)
 	}
 	if mp, ok := h.oci.(oci.ManifestPuller); ok {
-		above, diffs, err := h.aboveBaseLayers(ctx, mp, dep.ImageDigest, app.Runtime, manifest)
+		// Issue #461 / ADR-062: thread the customer's per-app
+		// registry credential through the M6 two-drive path.
+		// aboveBaseLayers dispatches app manifest + app blobs
+		// with `appAuth`, and base manifest + base blobs with
+		// nil (the base is always public
+		// ghcr.io/onebox-faas/...). Production RegistryClient
+		// satisfies AuthManifestPuller so both paths carry the
+		// correct auth shape.
+		above, diffs, err := h.aboveBaseLayers(ctx, mp, dep.ImageDigest, app.Runtime, manifest, appAuth)
 		if err != nil {
 			// aboveBaseLayers can surface any of the three puller-side
 			// sentinels (image-not-found on app manifest 404, manifest-list
@@ -875,6 +1051,10 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 			_ = h.markDeployFailed(ctx, dep.ID, err, "imaged: above-base")
 			return err
 		}
+		// Issue #461 / ADR-062: mark credential used after a successful
+		// above-base resolution — every authenticated pull above this
+		// line was either app manifest, app config, or app blob.
+		h.markRegistryCredentialUsed(ctx, app, refHost, appAuth)
 		defer func() {
 			for _, c := range above.closers {
 				_ = c.Close()
@@ -920,12 +1100,15 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		// decode-and-stitch in the legacy path; for the dashboard it's
 		// just a slower blob pull).
 		start := time.Now()
-		pulled, err := h.oci.PullLayers(ctx, ref)
+		pulled, err := pullLayersWithAuth(ctx, h.oci, ref, appAuth)
 		h.ops.ObserveImagedOCIPull("blob", pullResult(err), time.Since(start))
 		if err != nil {
 			_ = h.markDeployFailed(ctx, dep.ID, err, "oci pull layers")
 			return fmt.Errorf("imaged: pull layers: %w", err)
 		}
+		// Issue #461 / ADR-062: mark credential used after a
+		// successful M5 fallback layer pull.
+		h.markRegistryCredentialUsed(ctx, app, refHost, appAuth)
 		defer func() {
 			for _, r := range pulled.Layers {
 				_ = r.Close()
@@ -1483,19 +1666,29 @@ type aboveBaseStream struct {
 // break the 130 MB fleet-snapshot economics. drive0 (base ext4) and drive1
 // (this ext4) overlay at guest-init; this function returns only the parts
 // that go into drive1.
+//
+// appAuth (issue #461 / ADR-062) is the customer's per-app
+// private-registry Basic Auth credential, transiently unsealed by
+// buildImageLayer before calling this method. App manifest + app
+// blob pulls carry it; base manifest + base blob pulls stay
+// anonymous (the base is always public ghcr.io/onebox-faas/...).
+// Production RegistryClient satisfies oci.AuthManifestPuller so
+// both paths dispatch via PullManifestWithAuth / PullBlobWithAuth;
+// offline DefaultPuller satisfies the interface too (auth
+// ignored).
 func (h *Handler) aboveBaseLayers(ctx context.Context, mp oci.ManifestPuller,
-	appRef, runtime string, _ api.AppManifest) (aboveBaseStream, []string, error) {
+	appRef, runtime string, _ api.AppManifest, appAuth *oci.BasicAuth) (aboveBaseStream, []string, error) {
 	appRepo := repoWithHost(appRef)
 	if appRepo == "" {
 		return aboveBaseStream{}, nil, fmt.Errorf("imaged: cannot derive repo from %q", appRef)
 	}
 	start := time.Now()
-	appManifest, err := mp.PullManifest(ctx, appRef)
+	appManifest, err := pullManifestWithAuth(ctx, mp, appRef, appAuth)
 	h.ops.ObserveImagedOCIPull("manifest", pullResult(err), time.Since(start))
 	if err != nil {
 		return aboveBaseStream{}, nil, fmt.Errorf("manifest: %w", err)
 	}
-	appCfg, err := h.pullConfig(ctx, mp, appRepo, appManifest.Config.Digest)
+	appCfg, err := h.pullConfig(ctx, mp, appRepo, appManifest.Config.Digest, appAuth)
 	if err != nil {
 		return aboveBaseStream{}, nil, fmt.Errorf("app config: %w", err)
 	}
@@ -1521,12 +1714,16 @@ func (h *Handler) aboveBaseLayers(ctx context.Context, mp oci.ManifestPuller,
 		return aboveBaseStream{}, nil, fmt.Errorf("imaged: cannot derive repo from base %q", baseRef)
 	}
 	start = time.Now()
-	baseManifest, err := mp.PullManifest(ctx, baseRef)
+	// Base manifest stays anonymous — the base is always public
+	// (ghcr.io/onebox-faas/...). Mismatched auth on a public
+	// base pull would break the build path (the base has no
+	// realm challenge, so the realm endpoint would 401).
+	baseManifest, err := pullManifestWithAuth(ctx, mp, baseRef, nil)
 	h.ops.ObserveImagedOCIPull("manifest", pullResult(err), time.Since(start))
 	if err != nil {
 		return aboveBaseStream{}, nil, fmt.Errorf("base manifest: %w", err)
 	}
-	baseCfg, err := h.pullConfig(ctx, mp, baseRepo, baseManifest.Config.Digest)
+	baseCfg, err := h.pullConfig(ctx, mp, baseRepo, baseManifest.Config.Digest, nil)
 	if err != nil {
 		return aboveBaseStream{}, nil, fmt.Errorf("base config: %w", err)
 	}
@@ -1558,7 +1755,7 @@ func (h *Handler) aboveBaseLayers(ctx context.Context, mp oci.ManifestPuller,
 			return aboveBaseStream{}, nil, fmt.Errorf("imaged: missing blob for diff %s", diffID)
 		}
 		start = time.Now()
-		rc, err := mp.PullBlob(ctx, appRepo, desc.Digest)
+		rc, err := pullBlobWithAuth(ctx, mp, appRepo, desc.Digest, appAuth)
 		h.ops.ObserveImagedOCIPull("blob", pullResult(err), time.Since(start))
 		if err != nil {
 			for _, c := range closers {
@@ -1592,9 +1789,13 @@ func pullResult(err error) string {
 // pullConfig fetches and parses the OCI image config referenced by a manifest.
 // The config carries the env/entrypoint (run by guest-init) AND the
 // rootfs.diff_ids that drive the two-drive math.
-func (h *Handler) pullConfig(ctx context.Context, mp oci.ManifestPuller, repo, digest string) (oci.Config, error) {
+//
+// `auth` (issue #461 / ADR-062) threads the customer's per-app
+// private-registry Basic Auth credential through the blob fetch.
+// Pass nil for base pulls (the base is always public).
+func (h *Handler) pullConfig(ctx context.Context, mp oci.ManifestPuller, repo, digest string, auth *oci.BasicAuth) (oci.Config, error) {
 	start := time.Now()
-	r, err := mp.PullBlob(ctx, repo, digest)
+	r, err := pullBlobWithAuth(ctx, mp, repo, digest, auth)
 	if err != nil {
 		h.ops.ObserveImagedOCIPull("config", "err", time.Since(start))
 		return oci.Config{}, err
@@ -1622,6 +1823,54 @@ func repoWithHost(ref string) string {
 		return r.Repository
 	}
 	return r.Registry + "/" + r.Repository
+}
+
+// pullDigestWithAuth dispatches PullDigest through the AuthPuller seam
+// when the production RegistryClient is wired; falls back to the
+// anonymous PullDigest for offline DefaultPuller. auth == nil collapses
+// to the anonymous path on both branches (issue #461 / ADR-062).
+func pullDigestWithAuth(ctx context.Context, p oci.Puller, ref string, auth *oci.BasicAuth) (string, error) {
+	if ap, ok := p.(oci.AuthPuller); ok {
+		return ap.PullDigestWithAuth(ctx, ref, auth)
+	}
+	return p.PullDigest(ctx, ref)
+}
+
+// pullImageConfigWithAuth mirrors pullDigestWithAuth for PullImageConfig.
+func pullImageConfigWithAuth(ctx context.Context, p oci.Puller, ref string, auth *oci.BasicAuth) (oci.ImageConfig, error) {
+	if ap, ok := p.(oci.AuthPuller); ok {
+		return ap.PullImageConfigWithAuth(ctx, ref, auth)
+	}
+	return p.PullImageConfig(ctx, ref)
+}
+
+// pullLayersWithAuth mirrors pullDigestWithAuth for PullLayers.
+func pullLayersWithAuth(ctx context.Context, p oci.Puller, ref string, auth *oci.BasicAuth) (oci.PullLayersResult, error) {
+	if ap, ok := p.(oci.AuthPuller); ok {
+		return ap.PullLayersWithAuth(ctx, ref, auth)
+	}
+	return p.PullLayers(ctx, ref)
+}
+
+// pullManifestWithAuth dispatches PullManifest through the
+// AuthManifestPuller seam when wired; falls back to the anonymous
+// PullManifest otherwise. The M6 two-drive path calls this for both
+// app manifest + base manifest pulls (issue #461 / ADR-062).
+func pullManifestWithAuth(ctx context.Context, mp oci.ManifestPuller, ref string, auth *oci.BasicAuth) (oci.Manifest, error) {
+	if amp, ok := mp.(oci.AuthManifestPuller); ok {
+		return amp.PullManifestWithAuth(ctx, ref, auth)
+	}
+	return mp.PullManifest(ctx, ref)
+}
+
+// pullBlobWithAuth mirrors pullManifestWithAuth for PullBlob. The M6
+// two-drive path uses this for app blobs (auth carried) AND base
+// blobs (auth == nil).
+func pullBlobWithAuth(ctx context.Context, mp oci.ManifestPuller, repo, digest string, auth *oci.BasicAuth) (io.ReadCloser, error) {
+	if amp, ok := mp.(oci.AuthManifestPuller); ok {
+		return amp.PullBlobWithAuth(ctx, repo, digest, auth)
+	}
+	return mp.PullBlob(ctx, repo, digest)
 }
 
 // --- F5: filesystem cleanup -------------------------------------------------

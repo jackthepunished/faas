@@ -24,29 +24,6 @@ import (
 //go:embed pgstore.go
 var pgStoreUsageByHourSource string
 
-// extractFn returns the substring of pgstore.go source covering
-// a function body — bounded by the next `func (` signature so
-// we don't drag in unrelated SQL.
-func extractFn(src, sig string) string {
-	start := strings.Index(src, sig)
-	if start < 0 {
-		return ""
-	}
-	// Look for the next top-level `func (` after `start`.
-	rest := src[start+len(sig):]
-	// Skip until we find the close of the body — use the next
-	// `\nfunc (` to bound. 8 KiB is far more than the actual
-	// function bodies (~40 lines).
-	end := strings.Index(rest, "\nfunc (")
-	if end < 0 {
-		end = len(rest)
-	}
-	if end > 8192 {
-		end = 8192
-	}
-	return src[start : start+len(sig)+end]
-}
-
 func TestUsageByHour_UsesUTCTruncation(t *testing.T) {
 	body := extractFn(pgStoreUsageByHourSource, "func (s *PgStore) UsageByHour(")
 	if body == "" {

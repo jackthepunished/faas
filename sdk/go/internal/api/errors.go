@@ -747,3 +747,15 @@ func ErrResetTokenExpired() *Problem {
 		"this password-reset link has expired; request a new one.").
 		WithDocs("https://docs.gregale.dev/auth/reset")
 }
+
+// ErrInvalidRegistryHost is the 400 returned when the request body's
+// registry field fails the normalized-host gate (lowercase DNS[:port],
+// no scheme/path). Wrapping the underlying detail keeps the specific
+// failure visible to the CLI without leaking the input verbatim into
+// a 5xx. Mirrors pkg/api/errors.go::ErrInvalidRegistryHost for SDK-side
+// validation (issue #461 / ADR-064).
+func ErrInvalidRegistryHost(detail error) *Problem {
+	return NewProblem(http.StatusBadRequest, "invalid_registry_host",
+		"Invalid registry host", detail.Error()).
+		WithDocs("https://docs.gregale.dev/registry-credentials#registry-format")
+}

@@ -39,8 +39,14 @@ import (
 // would force every test through `//go:build metal` and a fake
 // gRPC server, neither of which fits the unit-test loop. See
 // cmd/gatewayd/app_logs_test.go::controllableScheddClient.
+//
+// sinceWrittenAt (issue #517 / PR-B, AC3) is the RFC3339 lower
+// bound the handler forwards to schedd for the per-instance
+// ring filter; zero = no time bound. deploymentID (AC3) scopes
+// the per-instance goroutine fan-out to one deployment; empty =
+// all live instances.
 type logStreamer interface {
-	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64) (scheddgrpc.LogStream, error)
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) (scheddgrpc.LogStream, error)
 }
 
 // logStreamerResolver is the per-app dial factory the
@@ -147,7 +153,8 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 			"No running instance", "the app is parked; wake it first"))
 		return
 	}
-	if _, _, reason, ok := apislogs.ValidateLogFilters(r); !ok {
+	level, grep, sinceWrittenAt, deploymentID, reason, ok := apislogs.ValidateLogFilters(r)
+	if !ok {
 		apislogs.StartSSE(w)
 		flusher, _ := w.(http.Flusher)
 		switch reason {
@@ -155,14 +162,31 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 			apislogs.WriteInvalidLevelError(w, flusher)
 		case apislogs.InvalidGrepCode:
 			apislogs.WriteInvalidGrepError(w, flusher)
+		case apislogs.InvalidSinceCode:
+			apislogs.WriteInvalidSinceError(w, flusher)
 		}
 		return
 	}
+	// Plan-gate the ?deployment= filter (issue #517 / PR-B, AC3).
+	// Free customers (LogDeploymentFilterMax == 0) get a hard
+	// rejection; Hobby+ may scope to N deployments per the per-plan
+	// table in pkg/api/limits.go. The wire surface today is
+	// single-valued so we compare directly against the cap. The
+	// rejection is a one-liner that delegates to enforceDeploymentFilter
+	// so the plan-gate rule has its own whitebox coverage without
+	// needing to drive the full Auth + Store chain.
+	if deploymentID != "" {
+		if !enforceDeploymentFilter(w, acct.Plan) {
+			return
+		}
+	}
 	sinceSeq := apislogs.ParseInt64Query(r, "since_seq", 0)
+	_ = level
+	_ = grep
 
 	apislogs.StartSSE(w)
 	flusher, _ := w.(http.Flusher)
-	h.serveAppLogs(r.Context(), w, flusher, app.ID, sinceSeq)
+	h.serveAppLogs(r.Context(), w, flusher, app.ID, sinceSeq, sinceWrittenAt, deploymentID)
 }
 
 // serveAppLogs is the receive-pump body. Mirrors the legacy
@@ -173,7 +197,7 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 // load-test seam — the 9 whitebox tests in this package drive
 // serveAppLogs directly with a stub stream without standing up
 // the auth + LoadApp chain.
-func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64) {
+func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) {
 	// Phase 2 / Gate A: resolve the owner schedd for appID via
 	// the per-node router. The fallback path (legacy single
 	// schedd) is gone — the router covers the single-box
@@ -183,7 +207,7 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 		apislogs.RenderAppLogsError(w, flusher, err)
 		return
 	}
-	stream, err := sched.StreamAppLogs(ctx_, appID, sinceSeq)
+	stream, err := sched.StreamAppLogs(ctx_, appID, sinceSeq, sinceWrittenAt, deploymentID)
 	if err != nil {
 		// codes.Unimplemented from the stub → "schedd not wired
 		// (dev mode)"; codes.NotFound from a real schedd → "no
@@ -283,6 +307,15 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 				apislogs.RenderAppLogsError(w, flusher, r.err)
 				return
 			}
+			// Gap vs line (issue #517 / PR-B, AC4): schedd forwards
+			// synthetic gap frames whenever a vmmd's ring no longer
+			// retains the cursor the caller asked for. Render the
+			// matching SSE envelope; the stream continues after a
+			// gap with the surviving replay and the live tail.
+			if r.frame.IsGap {
+				apislogs.RenderAppLogGap(w, flusher, r.frame, appID, h.Ops)
+				continue
+			}
 			apislogs.RenderAppLogEvent(w, flusher, r.frame, appID, h.Ops)
 		}
 	}
@@ -297,4 +330,27 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 type recvResult struct {
 	frame scheddgrpc.LogFrame
 	err   error
+}
+
+// enforceDeploymentFilter writes the
+// plan_deployment_filter_not_allowed SSE error frame and returns
+// false when the customer's plan is not allowed to scope logs by
+// deployment. Returns true (no write, no early-out) when the
+// customer is on Hobby/Pro/Scale (whose per-plan cap is > 0) and
+// must therefore not be gated.
+//
+// Extracted from stream() so the plan-gate rule has its own
+// whitebox coverage (TestServeAppLogs_FreeRejectsDeploymentFilter
+// + the Hobby-allowed sibling) without standing up the full Auth
+// + Store chain — same whitebox-seam pattern as
+// runServeAppLogs/safeBuffer elsewhere in this package.
+func enforceDeploymentFilter(w http.ResponseWriter, plan api.Plan) bool {
+	max := plan.LogDeploymentFilterMax()
+	if max > 0 {
+		return true
+	}
+	apislogs.StartSSE(w)
+	flusher, _ := w.(http.Flusher)
+	apislogs.WritePlanDeploymentFilterNotAllowedError(w, flusher, max)
+	return false
 }

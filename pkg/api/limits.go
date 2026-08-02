@@ -118,6 +118,21 @@ type Limits struct {
 	// Free tier keeps its "ship any image" path.
 	TrustedSignerCountMax int // Free 0, Hobby 4, Pro 8, Scale 16
 
+	// RegistryCredentialMax (issue #461 / ADR-062) bounds the per-app
+	// count of sealed Basic Auth credentials, one row per (app, host).
+	// Free = 0 — Free cannot pull from private registries (the abuse
+	// path of credentialed pulls on a single-concurrency plan is not
+	// the product target). Hobby/Pro/Scale opt in with a small
+	// fan-out budget: a Hobby customer's typical surface is one
+	// staging + one prod registry (2); Pro/Scale absorb the
+	// multi-region CI shape (5/20). Per-app, not per-account, because
+	// the credential is app-scoped (different apps can target
+	// different registries). apid's setRegistryCredential handler
+	// gates 403 plan_registry_credentials_not_allowed when
+	// RegistryCredentialMax == 0 and 413 plan_registry_credential_quota
+	// when the count reaches the cap and the upsert is a fresh host.
+	RegistryCredentialMax int
+
 	// MinInstancesAllowed toggles the per-app cold-wake floor (ux_spec
 	// §6.5). Free keeps the default scale-to-zero behaviour because
 	// `min_instances = N` keeps N × RAMMB resident at all times, which
@@ -198,6 +213,18 @@ type Limits struct {
 	// (migrations/00060_invocations_dead_letter.sql lands the
 	// 'dead_letter' state value + partial index).
 	MaxQueueAttempts int
+
+	// LogDeploymentFilterMax (issue #517 / PR-B, AC3) caps how
+	// many concurrent `?deployment=` filters a customer may scope
+	// their log stream to. The wire surface is single-valued today
+	// (the SDK takes one deploymentID arg); this field is the
+	// plan-tier gate the handler enforces before forwarding to
+	// schedd. Free returns 0 so a Free customer's `?deployment=`
+	// is rejected with `plan_deployment_filter_not_allowed`; Hobby
+	// unlocks it for the typical Hobby customer's single-staging-
+	// deployment workload; Pro/Scale get the higher caps the
+	// per-tier multi-deployment fan-out needs.
+	LogDeploymentFilterMax int
 
 	// Cron limits (spec §4.4 / event-shaped surface). Two independent
 	// caps; both populated for every plan, Free is 0/0 so the
@@ -337,6 +364,9 @@ var planLimits = map[Plan]Limits{
 		// signature enforcement is a regulated-workload feature that
 		// Free never needs (issue #472 / ADR-054).
 		TrustedSignerCountMax: 0,
+		// Issue #461: Free has no private-registry credential surface.
+		// Handler returns 403 plan_registry_credentials_not_allowed.
+		RegistryCredentialMax: 0,
 		// Move 1: async invoke and queues are paid-only (§4.4); Free
 		// keeps HTTP-only. The tiny 1 KB payload cap is the binding
 		// constraint should a Free customer spoof the gate.
@@ -375,6 +405,12 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
+		// Log deployment filter (issue #517 / PR-B): Free is the
+		// abuse-floor tier — the filter is a paid feature.
+		// Handler returns WritePlanDeploymentFilterNotAllowedError
+		// before the store is touched; the 0 here is a
+		// defence-in-depth value the handler still reads.
+		LogDeploymentFilterMax: 0,
 		// CPU fairness (issue #301 / ADR-044): Free gets the smallest
 		// slice weight=2 and the tightest quota (100ms/100ms). 100 ms
 		// is enough headroom for a Free-tier app to handle a handful of
@@ -414,6 +450,8 @@ var planLimits = map[Plan]Limits{
 		// signing key + an emergency break-glass. Anything beyond
 		// that is "you're a Pro" territory.
 		TrustedSignerCountMax: 4,
+		// Issue #461: Hobby = 2 — staging + production.
+		RegistryCredentialMax: 2,
 		// 64 KB envelope = 0.25 % of Hobby's 25 MB tarball budget — small
 		// enough to keep the drain tick bounded, large enough for typical
 		// JSON event payloads.
@@ -469,6 +507,12 @@ var planLimits = map[Plan]Limits{
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
 		RateLimitPerAccountRPM: 200,
+		// Log deployment filter (issue #517 / PR-B): Hobby gets
+		// 1 — the typical Hobby customer runs one staging
+		// deployment alongside their prod slot, and the filter
+		// scopes the log stream to it. Mirror shape of Hobby's
+		// per-app cron cap (5).
+		LogDeploymentFilterMax: 1,
 		// CPU fairness (issue #301): Hobby weight=4, quota 200ms/200ms.
 		// Doubles Free's quota — tracks the per-app concurrency bump
 		// (1 → 2) and the per-app rps (5 → 20).
@@ -501,8 +545,10 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 16 * 1024,
 		EnvVarsMax:          64,
 		EnvValueMaxBytes:    16 * 1024,
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		// Issue #461: Pro = 5 — multi-region + CI shapes.
+		RegistryCredentialMax: 5,
+		MinInstancesAllowed:   true,
+		MaxInstancesAllowed:   true,
 		// TrustedSignerCountMax: Pro covers a small-team rotation
 		// matrix (5-8 publishers). Enough for "every dev has their own
 		// key" workflows without letting the table grow unbounded.
@@ -546,6 +592,12 @@ var planLimits = map[Plan]Limits{
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
+		// Log deployment filter (issue #517 / PR-B): Pro gets 10
+		// — covers the typical multi-staging fan-out (prod + 3-5
+		// staging branches + a few ephemeral preview slots) without
+		// letting one app monopolise the schedd's per-instance
+		// goroutine fan-out.
+		LogDeploymentFilterMax: 10,
 		// CPU fairness (issue #301): Pro weight=8, quota 500ms/500ms.
 		// Half-bandwidth of 2 cores — tracks the per-app concurrency
 		// (5) and the per-app rps (100).
@@ -580,8 +632,10 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 32 * 1024,
 		EnvVarsMax:          256,
 		EnvValueMaxBytes:    32 * 1024,
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		// Issue #461: Scale = 20 — broad fan-out for SaaS-scale apps.
+		RegistryCredentialMax: 20,
+		MinInstancesAllowed:   true,
+		MaxInstancesAllowed:   true,
 		// TrustedSignerCountMax: Scale is the regulated-workload
 		// tier; 16 publishers covers "every platform team's CI
 		// plus break-glass" without letting the table grow into
@@ -629,7 +683,12 @@ var planLimits = map[Plan]Limits{
 		// (FaasPerAccountRateLimitSpike) triggers well before any single
 		// paid customer's bucket fills, which is the intended signal:
 		// coordinated abuse, not baseline load.
-		RateLimitPerAccountRPM:  5000,
+		RateLimitPerAccountRPM: 5000,
+		// Log deployment filter (issue #517 / PR-B): Scale gets 50
+		// — 5× Pro (10→50), tracks Scale's larger app budget
+		// (100 apps vs Pro's 25) and the multi-region staging fan-out
+		// SaaS-scale customers typically run.
+		LogDeploymentFilterMax:  50,
 		ScaleUpTargetCPUAllowed: true,
 		// CPU fairness (issue #301): Scale weight=16, quota 1000ms/1000ms
 		// — i.e. the full bandwidth of one core. Scale runs 20 concurrent
@@ -1220,6 +1279,20 @@ func (p Plan) TrustedSignerCountMax() int {
 		return 0
 	}
 	return l.TrustedSignerCountMax
+}
+
+// LogDeploymentFilterMax returns the per-plan cap on the
+// `?deployment=` filter the customer may scope their app-logs
+// stream to (issue #517 / PR-B, AC3). Free returns 0 so the
+// handler rejects with `plan_deployment_filter_not_allowed`; paid
+// tiers return 1 / 10 / 50 (Hobby/Pro/Scale). Unknown plans fail
+// closed (return 0) — same contract as CronLimitPerApp above.
+func (p Plan) LogDeploymentFilterMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LogDeploymentFilterMax
 }
 
 // OrgMembersMax returns the per-non-personal-org member cap for the

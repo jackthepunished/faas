@@ -28,6 +28,8 @@ from .app_manifest_env import AppManifestEnv
 from .app_manifest_env_secrets import AppManifestEnvSecrets
 from .app_metrics_response import AppMetricsResponse
 from .app_metrics_response_range import AppMetricsResponseRange
+from .app_registry_credential_list_response import AppRegistryCredentialListResponse
+from .app_registry_credential_response import AppRegistryCredentialResponse
 from .app_response import AppResponse
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
@@ -151,6 +153,7 @@ from .problem import Problem
 from .project_apply_request import ProjectApplyRequest
 from .project_scan_request import ProjectScanRequest
 from .put_app_env_request import PutAppEnvRequest
+from .put_app_registry_credential_request import PutAppRegistryCredentialRequest
 from .put_app_secret_request import PutAppSecretRequest
 from .queue_dead_letter_message import QueueDeadLetterMessage
 from .queue_dead_letter_response import QueueDeadLetterResponse
@@ -222,6 +225,8 @@ __all__ = (
     "AppManifestEnvSecrets",
     "AppMetricsResponse",
     "AppMetricsResponseRange",
+    "AppRegistryCredentialListResponse",
+    "AppRegistryCredentialResponse",
     "AppResponse",
     "AppResponseRuntime",
     "AppResponseType",
@@ -343,6 +348,7 @@ __all__ = (
     "ProjectApplyRequest",
     "ProjectScanRequest",
     "PutAppEnvRequest",
+    "PutAppRegistryCredentialRequest",
     "PutAppSecretRequest",
     "QueueDeadLetterMessage",
     "QueueDeadLetterResponse",

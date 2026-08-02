@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
@@ -106,8 +107,9 @@ func (f *fakeVMM) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 // pkg/scheddgrpc and inject a real pkg/vmmdgrpc Server over
 // bufconn. Returns a closed sched.LogStream so the caller's Recv
 // sees EOF immediately (the right no-op for tests that don't care
-// about log content).
-func (f *fakeVMM) Logs(_ context.Context, _ string, _ int64) (sched.LogStream, error) {
+// about log content). PR-B adds the sinceWrittenAt time lower-bound;
+// the fake ignores it.
+func (f *fakeVMM) Logs(_ context.Context, _ string, _ int64, _ time.Time) (sched.LogStream, error) {
 	return nil, io.EOF
 }
 

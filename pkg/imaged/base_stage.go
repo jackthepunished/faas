@@ -283,7 +283,7 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parse runtime ref %q: %w", ref, err)
 	}
-	runtimeCfg, err := h.pullConfig(ctx, mp, ociRef.Registry+"/"+ociRef.Repository, manifest.Config.Digest)
+	runtimeCfg, err := h.pullConfig(ctx, mp, ociRef.Registry+"/"+ociRef.Repository, manifest.Config.Digest, nil)
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: pull runtime config: %w", err)
 	}
@@ -297,7 +297,7 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parse parent ref %q: %w", parentRef, err)
 	}
-	parentCfg, err := h.pullConfig(ctx, mp, parentOCI.Registry+"/"+parentOCI.Repository, parentManifest.Config.Digest)
+	parentCfg, err := h.pullConfig(ctx, mp, parentOCI.Registry+"/"+parentOCI.Repository, parentManifest.Config.Digest, nil)
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: pull parent config: %w", err)
 	}

@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -38,7 +39,7 @@ type controllableScheddClient struct {
 	stream scheddgrpc.LogStream
 }
 
-func (c *controllableScheddClient) StreamAppLogs(_ context.Context, _ string, _ int64) (scheddgrpc.LogStream, error) {
+func (c *controllableScheddClient) StreamAppLogs(_ context.Context, _ string, _ int64, _ time.Time, _ string) (scheddgrpc.LogStream, error) {
 	return c.stream, nil
 }
 
@@ -126,7 +127,7 @@ func runServeAppLogs(t *testing.T, h *AppLogsHandler, stream *controllableSchedd
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -194,7 +195,7 @@ func TestServeAppLogs_CtxCancelReturnsWithoutTerminalFrame(t *testing.T) {
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.serveAppLogs(ctx, rec, rec, "app-1", 0)
+		h.serveAppLogs(ctx, rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	// Let the receive goroutine settle into Recv().
@@ -281,7 +282,7 @@ func TestServeAppLogs_FramesRenderInOrder(t *testing.T) {
 	rec := newFlusherRecorder()
 	done := make(chan struct{})
 	go func() {
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	// Let the receive goroutine settle into Recv().
@@ -329,7 +330,7 @@ func TestServeAppLogs_CleanEndEmitsEmptyEndEvent(t *testing.T) {
 	go func() {
 		stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 1, Stream: "stdout", Line: "hi\n", WrittenAt: time.Now()})
 		stream.closeStream() // -> io.EOF on Recv
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -363,7 +364,7 @@ func TestServeAppLogs_GenericErrorDelegatesToRenderAppLogsError(t *testing.T) {
 	go func() {
 		stream.pushFrame(scheddgrpc.LogFrame{InstanceID: "i-1", Seq: 1, Stream: "stdout", Line: "first\n", WrittenAt: time.Now()})
 		stream.finish(errors.New("vmmd dial failed"))
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -397,7 +398,7 @@ func TestServeAppLogs_NotFoundDelegatesToRenderAppLogsError(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		stream.finish(status.Error(codes.NotFound, "state: not found"))
-		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0)
+		h.serveAppLogs(context.Background(), rec, rec, "app-1", 0, time.Time{}, "")
 		close(done)
 	}()
 	<-done
@@ -416,3 +417,66 @@ func TestServeAppLogs_NotFoundDelegatesToRenderAppLogsError(t *testing.T) {
 // suppress unused-import warnings when io.EOF is no longer
 // referenced directly inside this file's tests after refactors.
 var _ = io.EOF
+
+// --- plan-gate tests (issue #517 / PR-B, AC3) -----------------------
+//
+// enforceDeploymentFilter is the package-private helper extracted
+// from stream() so the per-plan cap has direct whitebox coverage
+// without standing up the full Auth + Store chain. These tests
+// pin the contract:
+//
+//   - Free (LogDeploymentFilterMax == 0): writes the SSE error
+//     frame and returns false so stream() short-circuits.
+//   - Hobby / Pro / Scale (>0): no write, returns true.
+//
+// The wire shape is asserted via the flusherRecorder body so the
+// stable SSE code "plan_deployment_filter_not_allowed" + the
+// `event: error` framing both ship.
+
+func TestEnforceDeploymentFilter_FreeRejects(t *testing.T) {
+	rec := newFlusherRecorder()
+	allowed := enforceDeploymentFilter(rec, api.PlanFree)
+	if allowed {
+		t.Fatal("Free plan must be rejected (cap=0)")
+	}
+	body := rec.body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Errorf("missing event: error frame: %q", body)
+	}
+	if !strings.Contains(body, "plan_deployment_filter_not_allowed") {
+		t.Errorf("missing stable code: %q", body)
+	}
+	if !strings.Contains(body, "max=0") {
+		t.Errorf("missing cap in message (max=0 for Free): %q", body)
+	}
+}
+
+func TestEnforceDeploymentFilter_HobbyAllows(t *testing.T) {
+	rec := newFlusherRecorder()
+	if !enforceDeploymentFilter(rec, api.PlanHobby) {
+		t.Fatal("Hobby plan must be allowed (cap=1)")
+	}
+	if got := rec.body.String(); got != "" {
+		t.Errorf("Hobby must not write any frame, got %q", got)
+	}
+}
+
+func TestEnforceDeploymentFilter_ProAllows(t *testing.T) {
+	rec := newFlusherRecorder()
+	if !enforceDeploymentFilter(rec, api.PlanPro) {
+		t.Fatal("Pro plan must be allowed (cap=10)")
+	}
+	if got := rec.body.String(); got != "" {
+		t.Errorf("Pro must not write any frame, got %q", got)
+	}
+}
+
+func TestEnforceDeploymentFilter_ScaleAllows(t *testing.T) {
+	rec := newFlusherRecorder()
+	if !enforceDeploymentFilter(rec, api.PlanScale) {
+		t.Fatal("Scale plan must be allowed (cap=50)")
+	}
+	if got := rec.body.String(); got != "" {
+		t.Errorf("Scale must not write any frame, got %q", got)
+	}
+}

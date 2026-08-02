@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // VMM is the slice of vmmd schedd depends on. Defined as an interface so the
@@ -87,7 +88,11 @@ type VMM interface {
 	// the vmmdpb.Logs RPC. vmmd returns codes.NotFound when the
 	// instance is not live on this node — the caller (apid) maps
 	// that to its own 404 problem.
-	Logs(ctx context.Context, instance string, sinceSeq int64) (LogStream, error)
+	// since_written_at (issue #517 / PR-B acceptance #3) is the
+	// host-side WrittenAt lower bound on the replay page. Wire
+	// is additive per ADR-016; the zero-time value is the
+	// "no bound" sentinel and is skipped on the wire.
+	Logs(ctx context.Context, instance string, sinceSeq int64, sinceWrittenAt time.Time) (LogStream, error)
 }
 
 // LogReceiver is the per-instance callback the vmmd Logs RPC hands
@@ -119,11 +124,32 @@ type LogStream interface {
 
 // LogLine is the typed view of one vmmd Logs(frame). Decoupled
 // from vmmdpb so the VMM interface + tests don't import the proto.
+//
+// IsGap (issue #517 / PR-B acceptance #4) is true only on the
+// synthetic "cursor fell below the ring's high-water mark" frame
+// emitted by vmmdgrpc.Logs. Pre-PR-B callers ignore it; the false
+// value preserves the Move 4 contract.
+//
+// GapToWrittenAt is meaningful only when IsGap is true; it
+// carries the host-side ingest time of the OLDEST line the ring
+// currently retains so upstream consumers can render a
+// meaningful "you missed lines whose newest retained time is X"
+// message.
+//
+// GapReason names the bound that triggered the gap; meaningful
+// only when IsGap is true. vmmdgrpc.Logs sets it to
+// "seq_below_retained" when the caller's since_seq cursor is older
+// than the ring's lowest retained seq, or "since_below_retained"
+// when the caller's since_written_at cursor is older than the
+// ring's oldest retained line. Empty on line frames.
 type LogLine struct {
-	Seq       int64
-	Stream    string
-	Line      string
-	WrittenAt time.Time
+	Seq            int64
+	Stream         string
+	Line           string
+	WrittenAt      time.Time
+	IsGap          bool
+	GapToWrittenAt time.Time
+	GapReason      string
 }
 
 // PingOutcome is the sched-side view of vmmdpb.PingResponse.
@@ -475,16 +501,20 @@ func (c *VMMClient) UpdateEgressAllowlist(ctx context.Context, appID string, all
 	return nil
 }
 
-// Logs implements VMM (issue #254 / Move 4). The returned LogStream
-// is a thin wrapper over vmmdpb.Vmmd_LogsClient that decouples the
-// VMM interface from the proto: every caller in pkg/sched works in
-// the typed LogLine shape (no proto import).
+// Logs implements VMM (issue #254 / Move 4, issue #517 / PR-B).
+// The returned LogStream is a thin wrapper over vmmdpb.Vmmd_LogsClient
+// that decouples the VMM interface from the proto: every caller in
+// pkg/sched works in the typed LogLine shape (no proto import).
 //
 // sinceSeq is clamped to ≥0 here so downstream callers never have
 // to repeat the check; vmmd's Snapshot filters by Seq >= sinceSeq
 // and a negative cursor is meaningless (it would replay from
 // the oldest snapshot).
-func (c *VMMClient) Logs(ctx context.Context, instance string, sinceSeq int64) (LogStream, error) {
+//
+// sinceWrittenAt (issue #517 / PR-B acceptance #3) is the host-
+// side WrittenAt lower bound on the replay page; the zero-time
+// value is the "no bound" sentinel and is skipped on the wire.
+func (c *VMMClient) Logs(ctx context.Context, instance string, sinceSeq int64, sinceWrittenAt time.Time) (LogStream, error) {
 	if sinceSeq < 0 {
 		sinceSeq = 0
 	}
@@ -494,11 +524,15 @@ func (c *VMMClient) Logs(ctx context.Context, instance string, sinceSeq int64) (
 	// documentation / future-validation.
 	fields, _ := wire.FromContext(ctx)
 	ctx = wire.WithCorrelationOutgoing(ctx, fields)
-	cli, err := c.cli.Logs(ctx, &vmmdpb.LogsRequest{
+	req := &vmmdpb.LogsRequest{
 		Instance: instance,
 		SinceSeq: sinceSeq,
 		WakeId:   fields.WakeID,
-	})
+	}
+	if !sinceWrittenAt.IsZero() {
+		req.SinceWrittenAt = timestamppb.New(sinceWrittenAt)
+	}
+	cli, err := c.cli.Logs(ctx, req)
 	if err != nil {
 		return nil, liftErr(err)
 	}
@@ -518,20 +552,31 @@ type grpcLogStream struct {
 // Recv blocks until the next frame is available or the stream ends.
 // A clean vmmd-side shutdown (ring closed, ctx cancelled) surfaces
 // as io.EOF; any other failure is the gRPC status lifted via
-// grpcerr. The proto's timestamp field is decoded back to time.Time
+// grpcerr. The proto's timestamp fields are decoded back to time.Time
 // so callers never see a *timestamppb.Timestamp.
+//
+// On a gap frame (issue #517 / PR-B acceptance #4) the line-frame
+// fields (Seq/Stream/Line/WrittenAt) are zero and IsGap is true.
+// GapToWrittenAt carries the ring's head-line WrittenAt and
+// GapReason names the bound that triggered the gap, so the upstream
+// consumer can surface a meaningful diagnostic without guessing.
 func (s *grpcLogStream) Recv() (LogLine, error) {
 	resp, err := s.cli.Recv()
 	if err != nil {
 		return LogLine{}, err
 	}
 	line := LogLine{
-		Seq:    resp.GetSeq(),
-		Stream: resp.GetStream(),
-		Line:   resp.GetLine(),
+		Seq:       resp.GetSeq(),
+		Stream:    resp.GetStream(),
+		Line:      resp.GetLine(),
+		IsGap:     resp.GetIsGap(),
+		GapReason: resp.GetGapReason(),
 	}
 	if t := resp.GetWrittenAt(); t != nil {
 		line.WrittenAt = t.AsTime()
+	}
+	if t := resp.GetGapToWrittenAt(); t != nil {
+		line.GapToWrittenAt = t.AsTime()
 	}
 	return line, nil
 }
