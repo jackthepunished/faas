@@ -703,6 +703,29 @@ const (
 	// DefaultLvFcUsedPct closure returns 0 and the gauge degrades to "no data".
 	LvFcName = "lv-fc"
 
+	// Characterization boot (ADR-051 §"Characterization window"). On the
+	// first cold boot of a new deployment, guest-init observes what the
+	// app binds, runs L7 probes, and ships a report over AF_VSOCK
+	// STREAM (port 1026 / msgtype 3). Both bounds live here so a single
+	// edit moves the whole observation window; the guest and the host
+	// mirror against this single source.
+	//
+	// CharacterizationDeadline bounds the GUEST's observation window
+	// (guest/init/characterize_linux.go::waitForBind). 10 s covers the
+	// L7 probe budget (2 s) + shipReport's 4-attempt retry budget
+	// (~1.85 s with backoff) + headroom for a slow customer app boot.
+	// Never below the host's wait (CharacterizationHostDeadline) — the
+	// guest gives up earlier than the host and both sides fall back to
+	// the scan-hint class without failing the deploy (per
+	// ADR-051 §"Failure messages become specific").
+	CharacterizationDeadline = 10 * time.Second
+	// CharacterizationHostDeadline bounds the HOST's
+	// WaitCharacterizationReport dial+read inside Wake
+	// (pkg/fcvm/manager.go::characterizationWait). 4 s gives margin
+	// for the guest's 4 shipReport attempts + slow vsock proxies on
+	// nested KVM (Lima caveat, spec §14).
+	CharacterizationHostDeadline = 4 * time.Second
+
 	// Build artifact export (M6): vmmd loopback-mounts the chroot-local drive1
 	// on Destroy to copy out /build/out/image.tar (and friends). 4 GiB is
 	// well above the §14 target (~130 MB) so it's not the limiting factor; it's

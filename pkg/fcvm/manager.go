@@ -348,7 +348,7 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 		exportDirs:           make(map[string]string),
 		metrics:              metrics,
 		conntrackCap:         api.ConntrackCapProbe(),
-		characterizationWait: 4 * time.Second,
+		characterizationWait: api.CharacterizationHostDeadline,
 	}
 }
 

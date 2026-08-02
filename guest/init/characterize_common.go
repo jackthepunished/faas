@@ -89,6 +89,50 @@ func scanListeningFile(path string, owned map[uint64]struct{}) (int, string, boo
 	return 0, "", false
 }
 
+// scanEstablishedFile parses one /proc/net/tcp{,6} for the count of
+// ESTABLISHED entries (state 01) whose inode is in `owned`.
+// Mirrors scanListeningFile's parser shape but only returns the
+// count — the host's worker-vs-job classification only needs the
+// magnitude, not the per-connection address (ADR-051 §"Consequences"
+// rules table: ≥1 outbound + still running → `worker`). Excludes
+// LISTEN (state 0A) so it doesn't double-count the bind we already
+// observed.
+//
+// Lives here (no build tag) so the parser is unit-tested on every
+// platform with a temp-file fixture — the linux-only thing is the
+// path passed in.
+func scanEstablishedFile(path string, owned map[uint64]struct{}) int {
+	//nolint:forbidigo // /proc/net/tcp{,6} is a vetted kernel path inside the
+	// guest; the customer-path guard (openCustomerFile) is for host daemons
+	// reading customer bytes — this reads in-guest kernel state only.
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	n := 0
+	for sc.Scan() {
+		line := sc.Text()
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		if fields[3] != "01" { // not ESTABLISHED (skip LISTEN, TIME_WAIT, etc.)
+			continue
+		}
+		var inode uint64
+		if _, sErr := fmt.Sscanf(fields[len(fields)-1], "%d", &inode); sErr != nil {
+			continue
+		}
+		if _, isOwned := owned[inode]; !isOwned {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // hexIPToString flips 8 hex chars (4 bytes for tcp, 16 hex for tcp6)
 // into dotted-decimal (v4) or colon-hex (v6). Kept conservative;
 // the host re-derives the class anyway so a malformed address here

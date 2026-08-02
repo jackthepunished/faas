@@ -194,6 +194,7 @@ func runCharacterization(ctx context.Context, args RunArgs) CharacterizationResu
 		ObservedPort:          res.Port,
 		ExitCode:              res.ExitCode,
 		ListeningAddrs:        []string{addr},
+		OutboundCount:         countOutboundLinux(args.AppPID()),
 		LogTail:               truncateLog(args.RingBufferTail(), VsockCharacterizationMaxBody),
 		PortNormalizationMode: string(res.Mode),
 	}
@@ -211,9 +212,12 @@ func runCharacterization(ctx context.Context, args RunArgs) CharacterizationResu
 // waitForBind polls /proc/net/tcp{,6} for a LISTEN socket owned by
 // the app's PID tree. Returns the first match and the address
 // string for the report. On timeout returns observed=false and
-// observedAddr="" — the host treats this as `class=job`.
+// observedAddr="" — the host treats this as `class=job`. The
+// deadline comes from api.CharacterizationDeadline (ADR-051
+// §"Characterization window"), the single source shared with the
+// host's wait in pkg/fcvm/manager.go.
 func waitForBind(ctx context.Context, args RunArgs, res *CharacterizationResult) (bool, string) {
-	deadline := args.Now().Add(10 * time.Second)
+	deadline := args.Now().Add(api.CharacterizationDeadline)
 	for {
 		if port, addr, ok := probeListening(args.AppPID()); ok {
 			res.Port = port
@@ -249,45 +253,138 @@ func probeListeningLinux(pid int) (int, string, bool) {
 	return 0, "", false
 }
 
-// ownedSocketInodes walks /proc/<pid>/fd/* looking for the symlink
-// target of the form `socket:[<inode>]`. Returns the inodes the
-// process owns. Returns nil if /proc isn't mounted (e.g. /proc
-// unmounted post-pivot — defensive, shouldn't happen here).
+// countOutboundLinux returns the number of ESTABLISHED TCP
+// connections owned by the app's process tree at this moment.
+// This is the worker-signal the host uses (per ADR-051
+// §"Consequences"): job = 0 outbound + exit 0; worker = ≥1
+// outbound + still running. The query is a snapshot — we read
+// /proc/net/tcp + /proc/net/tcp6 once and return. Race-free: the
+// kernel owns these counters under the socket lock; our read is a
+// single open + scan, no incremental update between /proc reads.
+//
+// Calls ownedSocketInodes for the immediate PID only — recursive
+// process-tree walk is a separate concern (a follow-up if Node
+// cluster-mode proves this misses worker sockets in practice).
+// Returns 0 on any failure path (a missing /proc, a parse error,
+// an empty inode set) — a missing count is a legitimate "no
+// outbound" signal, not a boot-fatal error.
+func countOutboundLinux(pid int) int {
+	if pid <= 0 {
+		return 0
+	}
+	ownedInodes := ownedSocketInodes(pid)
+	if len(ownedInodes) == 0 {
+		return 0
+	}
+	return scanEstablishedFile("/proc/net/tcp", ownedInodes) +
+		scanEstablishedFile("/proc/net/tcp6", ownedInodes)
+}
+
+// ownedSocketInodesRecursiveDepth bounds the recursive process-tree
+// walk in ownedSocketInodes. 8 covers a Node cluster master + a few
+// worker generations, a Go app that uses setpgid + a couple of
+// re-execs, and any realistic customer shape. A larger cap invites a
+// runaway walk on a pathological forker; a smaller cap would miss
+// legitimate fork chains. Pinned by TestOwnedSocketInodes_DepthBounded.
+const ownedSocketInodesRecursiveDepth = 8
+
+// ownedSocketInodes walks /proc/<pid>/fd/* for the pid AND for every
+// child reachable via /proc/<pid>/task/<tid>/children, looking for
+// the symlink target of the form `socket:[<inode>]`. Returns the
+// union of socket inodes the process tree owns. Returns nil if
+// /proc isn't mounted (e.g. /proc unmounted post-pivot — defensive,
+// shouldn't happen here).
+//
+// The recursive walk is the load-bearing fix for ADR-051
+// §"Common failures": a Node cluster-mode app (master forks
+// workers, each binds :8080), a Go app that uses setpgid, or any
+// customer that forks long-lived children, has its worker sockets
+// invisible to an immediate-PID-only walk. Bounded by
+// ownedSocketInodesRecursiveDepth and a visited-set so a kernel-
+// level cycle in /proc/<pid>/task/<tid>/children cannot loop.
 func ownedSocketInodes(pid int) map[uint64]struct{} {
+	out := make(map[uint64]struct{})
+	visited := make(map[int]bool)
+	collectSocketInodes(pid, 0, out, visited)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// collectSocketInodes walks one PID's /proc/<pid>/fd, then recurses
+// into every child PID listed under /proc/<pid>/task/<tid>/children,
+// up to ownedSocketInodesRecursiveDepth. visited guards against
+// cycles (defensive — PIDs are unique per process so a true cycle
+// is impossible without CLONE_NEWPID, which the guest doesn't
+// allow). Returns silently on any read failure per the tolerated-
+// failure pattern (resume hook line 70, stateless advisory line 79).
+func collectSocketInodes(pid int, depth int, out map[uint64]struct{}, visited map[int]bool) {
+	if pid <= 0 || depth > ownedSocketInodesRecursiveDepth || visited[pid] {
+		return
+	}
+	visited[pid] = true
+
+	// 1. Collect this PID's socket inodes.
 	dir := fmt.Sprintf("/proc/%d/fd", pid)
 	//nolint:forbidigo // /proc/<pid>/fd is a vetted kernel path inside the
 	// guest; the customer-path guard (openCustomerFile) is for host daemons
 	// reading customer bytes — this reads in-guest kernel state only.
 	f, err := os.Open(dir)
-	if err != nil {
-		return nil
+	if err == nil {
+		for {
+			names, rErr := f.Readdirnames(64)
+			for _, n := range names {
+				link, lErr := os.Readlink(dir + "/" + n)
+				if lErr != nil {
+					continue
+				}
+				// Format: "socket:[12345]"
+				if !strings.HasPrefix(link, "socket:[") || !strings.HasSuffix(link, "]") {
+					continue
+				}
+				var inode uint64
+				if _, sErr := fmt.Sscanf(link[len("socket:["):len(link)-1], "%d", &inode); sErr == nil {
+					out[inode] = struct{}{}
+				}
+			}
+			if rErr == io.EOF {
+				break
+			}
+			if rErr != nil {
+				break
+			}
+		}
+		_ = f.Close()
 	}
-	defer func() { _ = f.Close() }()
-	out := make(map[uint64]struct{})
-	for {
-		names, err := f.Readdirnames(64)
-		for _, n := range names {
-			link, lErr := os.Readlink(dir + "/" + n)
-			if lErr != nil {
+
+	// 2. Recurse into children. /proc/<pid>/task/<tid>/children
+	// is one whitespace-separated PID list per task. A thread with
+	// no children has an empty file (read returns 0 bytes, no error).
+	// We read every task's children list — a forked process inherits
+	// one task from the parent; multi-threaded apps that fork expose
+	// the child via any one of the parent's tasks.
+	taskDir := fmt.Sprintf("/proc/%d/task", pid)
+	tf, tErr := os.Open(taskDir)
+	if tErr != nil {
+		return
+	}
+	tNames, _ := tf.Readdirnames(64)
+	_ = tf.Close()
+	for _, tid := range tNames {
+		childrenPath := fmt.Sprintf("%s/%s/children", taskDir, tid)
+		data, cErr := os.ReadFile(childrenPath)
+		if cErr != nil || len(data) == 0 {
+			continue
+		}
+		for _, field := range strings.Fields(string(data)) {
+			var child int
+			if _, pErr := fmt.Sscanf(field, "%d", &child); pErr != nil {
 				continue
 			}
-			// Format: "socket:[12345]"
-			if !strings.HasPrefix(link, "socket:[") || !strings.HasSuffix(link, "]") {
-				continue
-			}
-			var inode uint64
-			if _, sErr := fmt.Sscanf(link[len("socket:["):len(link)-1], "%d", &inode); sErr == nil {
-				out[inode] = struct{}{}
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return out
+			collectSocketInodes(child, depth+1, out, visited)
 		}
 	}
-	return out
 }
 
 // runL7Probes kicks off the three probes concurrently against the

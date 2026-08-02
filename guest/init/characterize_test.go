@@ -191,6 +191,89 @@ func TestScanListeningFile_IgnoresNonListen(t *testing.T) {
 	}
 }
 
+func TestScanEstablishedFile_MatchOwnedInode(t *testing.T) {
+	// One ESTABLISHED entry, owned by the app. Mirrors the LISTEN
+	// counterpart's shape — same /proc/net/tcp wire format, only the
+	// state filter flips (01 ESTABLISHED vs 0A LISTEN).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "net_tcp")
+	content := strings.Join([]string{
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                      ",
+		" 0: 0100007F:1F90 0100007F:0050 01 00000000:00000000 00:00000000 00000000     0        0 12345                   ",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fake proc/net/tcp: %v", err)
+	}
+	if got := scanEstablishedFile(path, map[uint64]struct{}{12345: {}}); got != 1 {
+		t.Errorf("scanEstablishedFile = %d, want 1", got)
+	}
+}
+
+func TestScanEstablishedFile_IgnoresListen(t *testing.T) {
+	// LISTEN (0A) entries must not be counted as outbound — the bind
+	// observation already saw them via scanListeningFile. Otherwise
+	// a server-class app would always classify as worker.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "net_tcp")
+	content := strings.Join([]string{
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                      ",
+		" 0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345                   ",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fake proc/net/tcp: %v", err)
+	}
+	if got := scanEstablishedFile(path, map[uint64]struct{}{12345: {}}); got != 0 {
+		t.Errorf("scanEstablishedFile counted LISTEN entry: got %d, want 0", got)
+	}
+}
+
+func TestScanEstablishedFile_IgnoresUnowned(t *testing.T) {
+	// ESTABLISHED but inode not in the owned set (e.g. a
+	// guest-init–internal socket, an unrelated process). The
+	// owned-inode filter matches scanListeningFile's contract.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "net_tcp")
+	content := strings.Join([]string{
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                      ",
+		" 0: 0100007F:1F90 0100007F:0050 01 00000000:00000000 00:00000000 00000000     0        0 12345                   ",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fake proc/net/tcp: %v", err)
+	}
+	if got := scanEstablishedFile(path, map[uint64]struct{}{99999: {}}); got != 0 {
+		t.Errorf("scanEstablishedFile counted unowned inode: got %d, want 0", got)
+	}
+}
+
+func TestScanEstablishedFile_CountsMultiple(t *testing.T) {
+	// Three ESTABLISHED entries, two owned — count must be 2, not 3.
+	// Pins that the function is a true count, not "first match wins".
+	dir := t.TempDir()
+	path := filepath.Join(dir, "net_tcp")
+	content := strings.Join([]string{
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                      ",
+		" 0: 0100007F:1F90 0100007F:0050 01 00000000:00000000 00:00000000 00000000     0        0 11111                   ",
+		" 1: 0100007F:1F91 0100007F:0050 01 00000000:00000000 00:00000000 00000000     0        0 22222                   ",
+		" 2: 0100007F:1F92 0100007F:0050 01 00000000:00000000 00:00000000 00000000     0        0 33333                   ",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fake proc/net/tcp: %v", err)
+	}
+	if got := scanEstablishedFile(path, map[uint64]struct{}{11111: {}, 33333: {}}); got != 2 {
+		t.Errorf("scanEstablishedFile = %d, want 2", got)
+	}
+}
+
+func TestScanEstablishedFile_MissingFileIsZero(t *testing.T) {
+	// Defensive contract: a missing /proc path returns 0, not an
+	// error. The caller treats 0 as a legitimate "no outbound"
+	// signal (a job that never connects out, or a guest kernel
+	// without /proc/net/tcp compiled in).
+	if got := scanEstablishedFile("/does/not/exist", map[uint64]struct{}{1: {}}); got != 0 {
+		t.Errorf("scanEstablishedFile(missing) = %d, want 0", got)
+	}
+}
+
 func TestProbeListening_NoChildEarlyOut(t *testing.T) {
 	// pid <= 0 short-circuits — caller polls again. Pin the contract
 	// so a regression to "scan all inodes anyway" doesn't silently
