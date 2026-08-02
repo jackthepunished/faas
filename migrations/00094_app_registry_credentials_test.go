@@ -82,7 +82,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'ghcr.io', 'alice', E'\\x000102030405 sealed-payload-stub'::bytea)
+		        'ghcr.io', 'alice', '\x0001020304050607'::bytea)
 	`); err != nil {
 		t.Fatalf("insert credential: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        '', 'alice', '\x00\x01 stub')
+		        '', 'alice', '\x00\x01')
 	`); err == nil {
 		t.Errorf("insert with empty registry: got no error; want CHECK violation")
 	}
@@ -127,7 +127,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'ghcr.io', '', '\x00\x01 stub')
+		        'ghcr.io', '', '\x00\x01')
 	`); err == nil {
 		t.Errorf("insert with empty username: got no error; want CHECK violation")
 	}
@@ -153,7 +153,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'ghcr.io', 'alice', '\x99\x99 different-blob')
+		        'ghcr.io', 'alice', '\x99\x99')
 	`); err == nil {
 		t.Errorf("duplicate (app_id, registry) insert: got no error; want UNIQUE violation")
 	}
@@ -165,7 +165,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000094',
 		        '00000000-0000-0000-0000-000000000194',
-		        'registry.gregale.dev', 'bob', '\x00\x01 stub-2')
+		        'registry.gregale.dev', 'bob', '\x00\x01')
 	`); err != nil {
 		t.Errorf("second registry on same app: %v (UNIQUE should allow different registry)", err)
 	}
@@ -196,7 +196,7 @@ func TestMigrations_00094_AppRegistryCredentials(t *testing.T) {
 		  (account_id, app_id, registry, username, password_encrypted)
 		values ('00000000-0000-0000-0000-000000000294',
 		        '00000000-0000-0000-0000-000000000394',
-		        'ghcr.io', 'alice', '\x00\x01 cascade-blob')
+		        'ghcr.io', 'alice', '\x00\x01')
 	`); err != nil {
 		t.Fatalf("insert cascade credential: %v", err)
 	}
