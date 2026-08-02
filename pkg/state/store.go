@@ -1778,6 +1778,65 @@ type Store interface {
 	// UpsertAppSecret to enforce Limits.SecretCountMax.
 	CountAppSecrets(ctx context.Context, accountID, appID string) (int, error)
 
+	// Per-app private-registry Basic Auth (issue #461 / ADR-062). apid
+	// is the only writer; imaged is the only reader. PasswordEncrypted
+	// is the age-sealed bytea produced by pkg/secretbox.SealBytes with
+	// namespace="registry_creds" — the plaintext password is never
+	// stored, never logged, never returned over the wire.
+	//
+	// Registry is the normalized host the customer supplied (lowercase,
+	// no scheme, no path, no trailing slash, port preserved — see
+	// apid's normalizeRegistryHost helper). imaged normalizes the
+	// incoming ref.Host() the same way before the SQL query.
+	//
+	// UpsertAppRegistryCredential writes-or-replaces the
+	// (app_id, registry) row. accountID is passed for ownership
+	// verification (the handler must own the app before it can set a
+	// credential on it); the row also stores account_id for audit and
+	// the G6 GDPR cascade.
+	UpsertAppRegistryCredential(ctx context.Context, accountID, appID, registry, username string, passwordEncrypted []byte) error
+	// GetAppRegistryCredential returns the row for (app_id, registry).
+	// Returns ErrNotFound if the row doesn't exist or the
+	// (accountID, appID) ownership doesn't match — defense in depth so
+	// a stale ID→slug mapping can't cross accounts.
+	GetAppRegistryCredential(ctx context.Context, accountID, appID, registry string) (AppRegistryCredential, error)
+	// ListAppRegistryCredentials returns every (registry, username,
+	// ciphertext) row on the app. The handler renders registry +
+	// username + timestamps only — ciphertext stays server-side.
+	// Ordered by registry ASC for deterministic wire output.
+	ListAppRegistryCredentials(ctx context.Context, accountID, appID string) ([]AppRegistryCredential, error)
+	// DeleteAppRegistryCredential removes the (app_id, registry) row.
+	// Returns ErrNotFound if the row doesn't exist — the handler
+	// renders 400 CodeRegistryCredentialsNotFound (not a 404) because
+	// the URL resource IS the registry host, by design (mirrors
+	// DeleteAppSecret).
+	DeleteAppRegistryCredential(ctx context.Context, accountID, appID, registry string) error
+	// CountAppRegistryCredentials is the quota check helper. apid
+	// calls it before UpsertAppRegistryCredential to enforce
+	// Limits.RegistryCredentialMax — but the helper also needs to
+	// detect an existing (app_id, registry) row so a password rotation
+	// does not consume quota. The handler does the
+	// "Get → if found → allow update past cap" check explicitly so
+	// the count helper stays a simple count.
+	CountAppRegistryCredentials(ctx context.Context, accountID, appID string) (int, error)
+	// RegistryCredentialQuotaCheck combines the "count this app's
+	// rows" + "does (app, host) already exist" probe into a single
+	// query. apid's PUT handler calls this instead of running
+	// CountAppRegistryCredentials + GetAppRegistryCredential back-to-
+	// back — the round-trip cost is the same shape as the
+	// AppSecret / AppEnv quota paths. The (count, exists) shape
+	// mirrors the secrets handler's preflight contract: existing
+	// (app, host) replaces in place and does not consume quota.
+	// Returns (n, false, nil) when the host isn't set yet.
+	RegistryCredentialQuotaCheck(ctx context.Context, accountID, appID, registry string) (count int, exists bool, err error)
+	// MarkAppRegistryCredentialUsed is called by imaged after a
+	// successful authenticated pull. Updates last_used_at + updated_at
+	// to now(). Returns ErrNotFound if the row doesn't exist or the
+	// (accountID, appID) ownership doesn't match — callers MUST treat
+	// ErrNotFound as non-fatal (the deployment already succeeded;
+	// missing-on-cascade is an expected race with account/app delete).
+	MarkAppRegistryCredentialUsed(ctx context.Context, accountID, appID, registry string) error
+
 	// AppEnv is plaintext runtime config (issue #395 / ADR-045). The
 	// four methods mirror the secrets surface 1:1 minus the ciphertext
 	// argument — values are stored as TEXT, not sealed bytea.

@@ -739,6 +739,20 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.setSecret))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.deleteSecret))))
 
+	// Per-app private-registry Basic Auth (issue #461 / ADR-062).
+	// Password is sealed server-side under namespace "registry_creds";
+	// the same host.age recipient apid loads for app secrets is
+	// reused — same key file, same in-process lifetime. imaged
+	// unseals transiently in the pull path; password NEVER leaves
+	// the store plaintext. MFA-gated because the credential can
+	// unlock a deploy pipeline.
+	mux.HandleFunc("GET /v1/apps/{slug}/registry-credentials",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesRegistryCredentialsReadSurface...)(s.listRegistryCredentials))))
+	mux.HandleFunc("PUT /v1/apps/{slug}/registry-credentials",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesRegistryCredentialsWriteSurface...)(s.setRegistryCredential))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/registry-credentials",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesRegistryCredentialsWriteSurface...)(s.deleteRegistryCredential))))
+
 	// Customer env vars (issue #395 / ADR-045). Plaintext VALUE flows
 	// through PUT over TLS; persisted as-is (no seal step) by
 	// handlers_env.go. env:write is NOT MFA-gated because env vars are
@@ -1467,6 +1481,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func decodeJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	return nil
+}
+
+// decodeJSONSized mirrors decodeJSON but with a caller-supplied
+// body byte cap. Used by handlers that need a tighter cap than the
+// 1 MiB default (e.g. handlers_registry_auth.go caps at 1 MiB
+// anyway — but the seam lets future handlers pass a smaller cap
+// without re-implementing the DisallowUnknownFields dance).
+func decodeJSONSized(r *http.Request, v any, maxBytes int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return err

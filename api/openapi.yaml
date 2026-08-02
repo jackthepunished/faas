@@ -69,6 +69,12 @@ tags:
     description: Customer-facing security event timeline (IAM-4, ADR-035). Append-only; read-only.
   - name: secrets
     description: Per-app sealed secrets (sealed at rest).
+  - name: registry
+    description: |
+      Per-app private-registry Basic Auth credentials (issue #461 / ADR-062).
+      Password is sealed at rest with secretbox under the host X25519
+      recipient (namespace `registry_creds`); imaged transiently unseals
+      in the pull path. The plaintext never lands in PG.
   - name: env
     description: |
       Per-app plaintext env vars (issue #395, ADR-045). Non-sensitive
@@ -1544,6 +1550,91 @@ paths:
       responses:
         '204': { description: No body. The sealed-secret envelope was removed. }
         '400': { $ref: '#/components/responses/SecretNotFound' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Per-app private-registry credentials (issue #461 / ADR-062) ────────
+  # Sealed Basic Auth per (app, registry_host). Free plan returns 403
+  # (RegistryCredentialMax == 0). Password is never returned; DELETE
+  # uses ?registry=<host> query param because registry hosts may carry
+  # a :port and path segments don't escape cleanly.
+
+  /v1/apps/{slug}/registry-credentials:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [registry]
+      operationId: listRegistryCredentials
+      summary: List sealed private-registry credentials on an app.
+      description: |
+        Returns every (registry, username, timestamps) triple on the app.
+        Plaintext passwords are never returned — imaged transiently
+        unseals the ciphertext in the pull path. Quota metadata
+        (`quota_max`, `count`) is included so the CLI can render a
+        progress bar without a second call.
+      responses:
+        '200':
+          description: List of credential envelopes on the app (plaintext never returned).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppRegistryCredentialListResponse'
+                example: {"credentials":[{"registry":"registry.gregale.dev","username":"alice","created_at":"2026-08-01T11:25:00Z","updated_at":"2026-08-01T11:25:00Z"}],"quota_max":2,"count":1}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    put:
+      tags: [registry]
+      operationId: setRegistryCredential
+      summary: Set or replace a sealed private-registry credential.
+      description: |
+        Seals the plaintext password against the host X25519 recipient
+        (namespace `"registry_creds"`) and upserts the `(app_id, registry)`
+        row. The plaintext never lands in PG. Re-PUTs of an existing
+        `(app, host)` replace the ciphertext and bump `updated_at`
+        WITHOUT consuming a new quota slot.
+      requestBody:
+        required: true
+        description: "Registry host + username + plaintext password. Sealed at rest."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutAppRegistryCredentialRequest'
+              example: {"registry":"registry.gregale.dev","username":"alice","password":"s3cret-basic-auth-pw"}
+      responses:
+        '200':
+          description: The stored credential envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppRegistryCredentialResponse'
+                example: {"registry":"registry.gregale.dev","username":"alice","created_at":"2026-08-01T11:25:00Z","updated_at":"2026-08-01T11:25:00Z"}
+        '400': { $ref: '#/components/responses/InvalidRegistryHost' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PlanRegistryCredentialsNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PlanRegistryCredentialQuota' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    delete:
+      tags: [registry]
+      operationId: deleteRegistryCredential
+      summary: Delete a sealed private-registry credential.
+      description: |
+        Removes the `(app_id, registry)` row. The registry host is the
+        URL resource and is supplied via the `?registry=` query param
+        (URL-encoded). Hosts may carry a `:port` — path segments don't
+        escape cleanly.
+      parameters:
+        - name: registry
+          in: query
+          required: true
+          description: "Registry host to delete (URL-encoded; matches the host stored on the row)."
+          schema: { type: string, maxLength: 253 }
+      responses:
+        '204': { description: No body. The credential row was removed. }
+        '400': { $ref: '#/components/responses/RegistryCredentialNotFound' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -4894,6 +4985,68 @@ components:
         quota_max: { type: integer }
         count: { type: integer }
 
+    # ─── Private-registry credentials (issue #461 / ADR-062) ──────────────
+
+    PutAppRegistryCredentialRequest:
+      description: |
+        Set a private-registry Basic Auth credential: normalized registry
+        host + username + plaintext password. The password is sealed
+        server-side under namespace `"registry_creds"` against the host
+        X25519 recipient and never persisted in plaintext.
+      type: object
+      required: [registry, username, password]
+      properties:
+        registry:
+          type: string
+          description: "Registry host. Must include explicit `https://` prefix (schemeless + http:// are rejected per ADR-062 §https-only clarification; customer's Basic Auth never leaves the box over cleartext). Trailing slash optional; embedded path / query / fragment rejected."
+          pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$'
+          maxLength: 253
+          example: "https://registry.gregale.dev"
+        username:
+          type: string
+          description: "Basic Auth username (metadata, NOT sealed)."
+          maxLength: 256
+          example: "alice"
+        password:
+          type: string
+          description: "Plaintext Basic Auth password. Sealed server-side; never persisted or returned."
+          maxLength: 4096
+          format: password
+          example: "s3cret-basic-auth-pw"
+
+    AppRegistryCredentialResponse:
+      description: |
+        A sealed private-registry credential envelope: registry + username
+        + timestamps. Plaintext password NEVER appears in this shape.
+      type: object
+      required: [registry, username, created_at, updated_at]
+      properties:
+        registry:
+          type: string
+          example: "registry.gregale.dev"
+        username:
+          type: string
+          example: "alice"
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        last_used_at:
+          type: string
+          format: date-time
+          description: "Timestamp of the last successful authenticated pull. Omitted when the credential has not been used yet."
+
+    AppRegistryCredentialListResponse:
+      description: |
+        Wrapped list response: rows + quota metadata. The Free plan
+        returns 403 on PUT and an empty list on GET.
+      type: object
+      required: [credentials, quota_max, count]
+      properties:
+        credentials:
+          type: array
+          items: { $ref: '#/components/schemas/AppRegistryCredentialResponse' }
+        quota_max: { type: integer, description: "Per-app cap from the customer's plan (Free 0, Hobby 2, Pro 5, Scale 20)." }
+        count: { type: integer }
+
     # ─── Env vars (issue #395 / ADR-045) ──────────────────────────────────
 
     PutAppEnvRequest:
@@ -5858,6 +6011,43 @@ components:
 
     SecretNotFound:
       description: 'code: secret_not_found'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    # Private-registry credentials (issue #461 / ADR-062): mirror
+    # the secrets response shape so SDK callers reuse the same
+    # error-decoding branch. Plan quota is 403, value size / per-app
+    # quota is 413, host validation is 400.
+    PlanRegistryCredentialsNotAllowed:
+      description: 'code: plan_registry_credentials_not_allowed — Free plan cannot store private-registry credentials.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanRegistryCredentialQuota:
+      description: 'code: plan_registry_credential_quota — per-app host cap reached (Hobby 2 / Pro 5 / Scale 20).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    InvalidRegistryHost:
+      description: 'code: invalid_registry_host — host missing scheme/path, uppercase, port out of range, or field-length cap exceeded.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    RegistryCredentialNotFound:
+      description: 'code: registry_credential_not_found — DELETE on a host that has no sealed credential.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    ServiceUnavailable:
+      description: |
+        Generic 503 envelope. Used by the apid capacity gate (e.g.
+        host age recipient not loaded → registry credential PUT
+        returns 503 instead of accepting plaintext).
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

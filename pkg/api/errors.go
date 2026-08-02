@@ -296,6 +296,18 @@ const (
 	// trusted-signer quota error as an env-var quota error.
 	CodePlanLimitTrustedSigners = "plan_limit_trusted_signers"
 
+	// Per-app private-registry Basic Auth (issue #461 / ADR-062).
+	// Distinct from CodeSecret* because the lifecycle and quota shape
+	// differ: a registry credential is keyed by (app, host) and the
+	// password is sealed + transiently unsealed in imaged, never
+	// returned to the customer. Codes are surfaced for the dashboard
+	// to render plan-tier upsell vs. quota guidance without parsing
+	// prose.
+	CodePlanRegistryCredentialNotAllowed = "plan_registry_credentials_not_allowed" // 403, Free
+	CodePlanRegistryCredentialQuota      = "plan_registry_credential_quota"        // 413, per-app cap reached
+	CodeInvalidRegistryHost              = "invalid_registry_host"                 // 400, normalized-host gate
+	CodeRegistryCredentialNotFound       = "registry_credential_not_found"         // 404, DELETE absent
+
 	// Plan-tier feature gates (M8 §6.5). Distinct from CodePlanLimit*
 	// because the failure mode is "your plan doesn't unlock this knob
 	// at all" rather than "you used more than the plan allows".
@@ -644,6 +656,17 @@ func StatusForCode(code string) int {
 		return http.StatusBadRequest
 	case CodeSecretValueTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// Issue #461 / ADR-062 — per-app private-registry Basic Auth.
+	// The DELETE-absent posture is 400 (mirrors CodeSecretNotFound
+	// convention; the URL resource IS the host, distinct from
+	// CodeNotFound which is reserved for app-not-found). Plan
+	// quota is 403, value size is 413, host validation is 400.
+	case CodePlanRegistryCredentialNotAllowed:
+		return http.StatusForbidden
+	case CodePlanRegistryCredentialQuota:
+		return http.StatusRequestEntityTooLarge
+	case CodeInvalidRegistryHost, CodeRegistryCredentialNotFound:
+		return http.StatusBadRequest
 	// Env vars (issue #395 / ADR-045): mirror the secrets status shape
 	// so SDK callers can reuse the same error-decoding pattern. Plan
 	// quota is 403, value size is 413, key regex + not-found are 400.
@@ -1179,6 +1202,55 @@ func ErrEnvVarNotFound(key string) *Problem {
 		"Env var not set",
 		fmt.Sprintf("no env var named %q on this app.", key)).
 		WithDocs("https://docs.gregale.dev/env")
+}
+
+// ErrPlanRegistryCredentialsNotAllowed is returned when the customer's
+// plan has RegistryCredentialMax == 0 (Free today, issue #461 /
+// ADR-062). The 403 fires BEFORE the store is touched so a Free
+// customer gets a clean upsell signal — not a quota hint. The plan
+// truly doesn't unlock the surface, so the only path forward is a
+// plan upgrade.
+func ErrPlanRegistryCredentialsNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanRegistryCredentialNotAllowed,
+		"Plan doesn't allow private-registry credentials",
+		fmt.Sprintf("the %s plan cannot store private-registry credentials; upgrade to Hobby or higher.", p)).
+		WithDocs("https://docs.gregale.dev/registry-credentials")
+}
+
+// ErrPlanRegistryCredentialQuota is returned when the customer's plan
+// unlocks the surface but the per-app cap was reached. Distinct from
+// ErrPlanRegistryCredentialsNotAllowed so the CLI can branch on
+// upsell-vs-delete copy without parsing the body. The detail exposes
+// the cap + current count so a customer knows which (app, host) pair
+// to drop.
+func ErrPlanRegistryCredentialQuota(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusRequestEntityTooLarge, CodePlanRegistryCredentialQuota,
+		"Per-app registry credential quota reached",
+		fmt.Sprintf("the %s plan caps private-registry credentials at %d per app; got %d. Delete one before adding another.", l.Plan, l.RegistryCredentialMax, observed)).
+		WithLimit(int64(l.RegistryCredentialMax), int64(observed)).
+		WithDocs("https://docs.gregale.dev/registry-credentials#quota")
+}
+
+// ErrInvalidRegistryHost is returned when the request body's registry
+// field fails the normalized-host gate (lowercase DNS[:port], no
+// scheme/path). Wrapping `detail` keeps the specific failure visible
+// to the CLI without leaking the input verbatim into a 5xx.
+func ErrInvalidRegistryHost(detail error) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeInvalidRegistryHost,
+		"Invalid registry host",
+		detail.Error()).
+		WithDocs("https://docs.gregale.dev/registry-credentials#registry-format")
+}
+
+// ErrRegistryCredentialNotFound is returned by DELETE
+// /v1/apps/{slug}/registry-credentials?registry=... when no row exists
+// for the (app, host). Distinct from CodeNotFound because the URL
+// resource is the registry host, not the app.
+func ErrRegistryCredentialNotFound(host string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeRegistryCredentialNotFound,
+		"Registry credential not set",
+		fmt.Sprintf("no credential stored for registry %q on this app.", host)).
+		WithDocs("https://docs.gregale.dev/registry-credentials")
 }
 
 // ErrPlanMinInstancesNotAllowed is returned when a Free or Hobby account

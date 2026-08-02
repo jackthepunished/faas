@@ -118,6 +118,21 @@ type Limits struct {
 	// Free tier keeps its "ship any image" path.
 	TrustedSignerCountMax int // Free 0, Hobby 4, Pro 8, Scale 16
 
+	// RegistryCredentialMax (issue #461 / ADR-062) bounds the per-app
+	// count of sealed Basic Auth credentials, one row per (app, host).
+	// Free = 0 — Free cannot pull from private registries (the abuse
+	// path of credentialed pulls on a single-concurrency plan is not
+	// the product target). Hobby/Pro/Scale opt in with a small
+	// fan-out budget: a Hobby customer's typical surface is one
+	// staging + one prod registry (2); Pro/Scale absorb the
+	// multi-region CI shape (5/20). Per-app, not per-account, because
+	// the credential is app-scoped (different apps can target
+	// different registries). apid's setRegistryCredential handler
+	// gates 403 plan_registry_credentials_not_allowed when
+	// RegistryCredentialMax == 0 and 413 plan_registry_credential_quota
+	// when the count reaches the cap and the upsert is a fresh host.
+	RegistryCredentialMax int
+
 	// MinInstancesAllowed toggles the per-app cold-wake floor (ux_spec
 	// §6.5). Free keeps the default scale-to-zero behaviour because
 	// `min_instances = N` keeps N × RAMMB resident at all times, which
@@ -349,6 +364,9 @@ var planLimits = map[Plan]Limits{
 		// signature enforcement is a regulated-workload feature that
 		// Free never needs (issue #472 / ADR-054).
 		TrustedSignerCountMax: 0,
+		// Issue #461: Free has no private-registry credential surface.
+		// Handler returns 403 plan_registry_credentials_not_allowed.
+		RegistryCredentialMax: 0,
 		// Move 1: async invoke and queues are paid-only (§4.4); Free
 		// keeps HTTP-only. The tiny 1 KB payload cap is the binding
 		// constraint should a Free customer spoof the gate.
@@ -432,6 +450,8 @@ var planLimits = map[Plan]Limits{
 		// signing key + an emergency break-glass. Anything beyond
 		// that is "you're a Pro" territory.
 		TrustedSignerCountMax: 4,
+		// Issue #461: Hobby = 2 — staging + production.
+		RegistryCredentialMax: 2,
 		// 64 KB envelope = 0.25 % of Hobby's 25 MB tarball budget — small
 		// enough to keep the drain tick bounded, large enough for typical
 		// JSON event payloads.
@@ -525,8 +545,10 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 16 * 1024,
 		EnvVarsMax:          64,
 		EnvValueMaxBytes:    16 * 1024,
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		// Issue #461: Pro = 5 — multi-region + CI shapes.
+		RegistryCredentialMax: 5,
+		MinInstancesAllowed:   true,
+		MaxInstancesAllowed:   true,
 		// TrustedSignerCountMax: Pro covers a small-team rotation
 		// matrix (5-8 publishers). Enough for "every dev has their own
 		// key" workflows without letting the table grow unbounded.
@@ -610,8 +632,10 @@ var planLimits = map[Plan]Limits{
 		SecretValueMaxBytes: 32 * 1024,
 		EnvVarsMax:          256,
 		EnvValueMaxBytes:    32 * 1024,
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		// Issue #461: Scale = 20 — broad fan-out for SaaS-scale apps.
+		RegistryCredentialMax: 20,
+		MinInstancesAllowed:   true,
+		MaxInstancesAllowed:   true,
 		// TrustedSignerCountMax: Scale is the regulated-workload
 		// tier; 16 publishers covers "every platform team's CI
 		// plus break-glass" without letting the table grow into

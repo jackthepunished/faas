@@ -6722,6 +6722,157 @@ func (s *PgStore) CountAppSecrets(ctx context.Context, accountID, appID string) 
 	return n, err
 }
 
+// --- per-app private-registry Basic Auth (issue #461 / ADR-062) -------------
+//
+// Mirror of the sealed-secrets shape (lines 6446-6551) keyed by
+// (app_id, registry) instead of (app_id, key). The password column is
+// the same age-sealed bytea; username is plaintext metadata. apid is
+// the sole writer (handlers_registry_auth.go); imaged is the sole
+// reader (pkg/imaged/handler.go::buildImageLayer — transient unseal).
+//
+// Cross-account isolation: every query scopes by (account_id, app_id,
+// registry). The (account_id, app_id) ownership predicate is the SQL
+// IDOR guard; the FK on (account_id, app_id) is the schema-level
+// guarantee.
+
+// UpsertAppRegistryCredential inserts or replaces the
+// (app_id, registry) row. username + password_encrypted are replaced
+// on conflict; created_at is preserved (the ON CONFLICT clause omits
+// it). updated_at is bumped on every call so imaged's MarkUsed check
+// sees a fresh mtime on rotation flows.
+func (s *PgStore) UpsertAppRegistryCredential(ctx context.Context, accountID, appID, registry, username string, passwordEncrypted []byte) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into app_registry_credentials (account_id, app_id, registry, username, password_encrypted)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (app_id, registry) do update
+		   set username = excluded.username,
+		       password_encrypted = excluded.password_encrypted,
+		       updated_at = now()`,
+		accountID, appID, registry, username, passwordEncrypted)
+	return err
+}
+
+// GetAppRegistryCredential returns the row for (app_id, registry).
+// Returns ErrNotFound when no row matches the
+// (account_id, app_id, registry) triple — the (account_id, app_id)
+// ownership predicate is the SQL IDOR guard. The schema FK is
+// defence in depth.
+func (s *PgStore) GetAppRegistryCredential(ctx context.Context, accountID, appID, registry string) (AppRegistryCredential, error) {
+	var r AppRegistryCredential
+	err := s.pool.QueryRow(ctx,
+		`select account_id, app_id, registry, username, password_encrypted, created_at, updated_at, last_used_at
+		 from app_registry_credentials
+		 where account_id = $1 and app_id = $2 and registry = $3`,
+		accountID, appID, registry).Scan(
+		&r.AccountID, &r.AppID, &r.Registry, &r.Username, &r.PasswordEncrypted,
+		&r.CreatedAt, &r.UpdatedAt, &r.LastUsedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AppRegistryCredential{}, ErrNotFound
+		}
+		return AppRegistryCredential{}, err
+	}
+	return r, nil
+}
+
+// ListAppRegistryCredentials returns every (registry, username,
+// ciphertext) row on the app. Order by registry ASC for deterministic
+// wire output. Returns nil slice (not error) when the app has no
+// credentials — the handler renders an empty list.
+func (s *PgStore) ListAppRegistryCredentials(ctx context.Context, accountID, appID string) ([]AppRegistryCredential, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, registry, username, password_encrypted, created_at, updated_at, last_used_at
+		 from app_registry_credentials
+		 where account_id = $1 and app_id = $2
+		 order by registry asc`,
+		accountID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppRegistryCredential
+	for rows.Next() {
+		var r AppRegistryCredential
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Registry, &r.Username, &r.PasswordEncrypted,
+			&r.CreatedAt, &r.UpdatedAt, &r.LastUsedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteAppRegistryCredential removes the (app_id, registry) row
+// scoped to accountID. Returns ErrNotFound when no row matches.
+func (s *PgStore) DeleteAppRegistryCredential(ctx context.Context, accountID, appID, registry string) error {
+	tag, err := s.pool.Exec(ctx,
+		`delete from app_registry_credentials where account_id = $1 and app_id = $2 and registry = $3`,
+		accountID, appID, registry)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// CountAppRegistryCredentials is the quota helper. Used by apid's PUT
+// handler to enforce Limits.RegistryCredentialMax BEFORE
+// UpsertAppRegistryCredential. Mirrors CountAppSecrets.
+func (s *PgStore) CountAppRegistryCredentials(ctx context.Context, accountID, appID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from app_registry_credentials where account_id = $1 and app_id = $2`,
+		accountID, appID).Scan(&n)
+	return n, err
+}
+
+// RegistryCredentialQuotaCheck collapses the "count rows on app"
+// + "does (app, host) exist" pair into a single CTE query. apid's
+// PUT handler calls this instead of running CountAppRegistryCredentials
+// + GetAppRegistryCredential back-to-back — one round-trip, same
+// shape as AppSecretQuotaCheck (if that ever lands). The CTE form
+// is single-pass: the count and the exists check both read from
+// the same scan. `(n, false, nil)` is the "host isn't set yet"
+// answer.
+func (s *PgStore) RegistryCredentialQuotaCheck(ctx context.Context, accountID, appID, registry string) (int, bool, error) {
+	var n int
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		with counts as (
+		    select count(*) as n,
+		           bool_or(registry = $3) as exists
+		    from app_registry_credentials
+		    where account_id = $1 and app_id = $2
+		)
+		select coalesce(n, 0), coalesce(exists, false)
+		from counts`,
+		accountID, appID, registry).Scan(&n, &exists)
+	return n, exists, err
+}
+
+// MarkAppRegistryCredentialUsed updates last_used_at + updated_at to
+// now(). Returns ErrNotFound when no row matches the
+// (account_id, app_id, registry) triple. Callers MUST treat
+// ErrNotFound as non-fatal — the deployment already succeeded, and a
+// missing-on-cascade is an expected race with account/app delete.
+func (s *PgStore) MarkAppRegistryCredentialUsed(ctx context.Context, accountID, appID, registry string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update app_registry_credentials
+		 set last_used_at = now(), updated_at = now()
+		 where account_id = $1 and app_id = $2 and registry = $3`,
+		accountID, appID, registry)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // --- app env vars (issue #395 / ADR-045) -------------------------------------
 //
 // Mirror of the sealed-secrets shape (lines 4608-4676) minus the

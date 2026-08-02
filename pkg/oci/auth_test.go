@@ -296,7 +296,7 @@ func TestRegistryClient_AnonymousFlowEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	c := NewRegistryClient(WithEndpoint("http", strings.TrimPrefix(srv.URL, "http://")), WithTimeout(5*time.Second))
-	got, err := c.fetchToken(context.Background(), parseChallenge(`Bearer realm="`+srv.URL+`/token"`))
+	got, err := c.fetchToken(context.Background(), parseChallenge(`Bearer realm="`+srv.URL+`/token"`), nil)
 	if err != nil {
 		t.Fatalf("fetchToken: %v", err)
 	}
