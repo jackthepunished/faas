@@ -106,13 +106,17 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 				"Invalid limit", "limit must be a positive integer"))
 			return
 		}
-		// Cap at the SDK-documented max. Using min(n, Max) here
-		// (instead of an if/reassign) keeps the bound visible to
-		// CodeQL's go/uncontrolled-allocation-size taint tracking —
-		// the if-reassign pattern flow-traces n as user-controlled
-		// into the make(…,0,limit) below and fires a CWE-770 false
-		// positive. The min() form is a direct dataflow cap.
-		limit = min(n, wakeTimelineLimitMax)
+		// Explicit early-return on overflow is the CodeQL-blessed
+		// sanitizer shape for go/uncontrolled-allocation-size (CWE-770):
+		// the rule looks for an early-return after an upper-bound check
+		// rather than a min() clamp. Rejecting n > Max closes the taint
+		// path at its source so the make()s downstream read a constant.
+		if n > wakeTimelineLimitMax {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+				"Invalid limit", "limit must be between 1 and "+strconv.Itoa(wakeTimelineLimitMax)))
+			return
+		}
+		limit = n
 	}
 	// Over-read by 1 so we can detect "is there a next page?" without
 	// a second SQL roundtrip. The partial index events_wake_id_idx
@@ -134,17 +138,14 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 			"Wake not found", "no events row with that wake_id belongs to this account"))
 		return
 	}
-	// Cap the slice capacity at the same Max used at the
-	// limit-parsing site. The downstream `min(n, Max)`
-	// flow-tracks through the `limit+1` over-read at the
-	// ListEventsByWakeID call site, but CodeQL's
-	// go/uncontrolled-allocation-size taint tracking loses
-	// the bound across the cross-function call boundary and
-	// re-flags the make() here. Applying `min(limit, Max)` at
-	// the allocation site keeps the bound visible directly to
-	// the slice allocation. Per
+	// `limit` is hard-bounded at the parse site by the explicit
+	// early-return on `n > wakeTimelineLimitMax`. CodeQL's
+	// go/uncontrolled-allocation-size sanitizer now sees an
+	// unconditional upper-bound check before this allocation
+	// and stops flow-tracing `limit` through the limit+1
+	// over-read and the downstream append loop. Per
 	// codeql-go-uncontrolled-allocation-size-min-pattern.
-	out := make([]api.WakeTimelineEvent, 0, min(limit, wakeTimelineLimitMax))
+	out := make([]api.WakeTimelineEvent, 0, limit)
 	for _, e := range rows {
 		// Forge-proof: every row's data.app_id must equal the
 		// slug's resolved app id. A mismatch is dropped silently
@@ -153,13 +154,11 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 		if !eventDataHasAppID(e.Data, app.ID) {
 			continue
 		}
-		// Bound check before append: the slice grows one at a time
-		// and CodeQL's go/uncontrolled-allocation-size taint tracking
-		// loses the `min(limit, Max)` cap if the cap is asserted
-		// AFTER the append (the +1 elements already in `out` flow
-		// forward into the next iteration's append). Capping first
-		// keeps the bound visible to the static analyzer AND the
-		// runtime (we never reach the append when full).
+		// Cap is enforced before the append: the slice grows one element
+		// per iteration and the static analyzer can prove the upper
+		// bound (`limit`, set at the parse site) is the cap of `out`.
+		// The break-after-append would re-grow before checking, which
+		// CodeQL's taint tracking sees as unbounded.
 		if len(out) >= limit {
 			break
 		}

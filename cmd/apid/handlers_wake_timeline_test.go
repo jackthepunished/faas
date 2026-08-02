@@ -156,6 +156,24 @@ func TestListWakeTimeline_SinceFiltersOlderRows(t *testing.T) {
 	}
 }
 
+// TestListWakeTimeline_LimitAboveMaxIs400 pins the explicit
+// early-return on overflow (the CodeQL-blessed sanitizer for
+// go/uncontrolled-allocation-size, CWE-770). The previous shape
+// silently clamped `limit` to Max; the new shape returns 400 so
+// `limit` is bounded at the parse site by an unconditional
+// upper-bound check that the static analyzer can see — closing
+// the taint path that previously reached the make() at the
+// render site.
+func TestListWakeTimeline_LimitAboveMaxIs400(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app := seedAppForTimeline(t, e, "tl-app-5")
+	rec := e.do(t, http.MethodGet,
+		"/v1/apps/"+app.Slug+"/wakes/wake-tl-5/timeline?limit=2000", nil, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400 (limit > Max must reject, not clamp)", rec.Code, rec.Body.String())
+	}
+}
+
 // seedAppForTimeline is the testEnv-side helper. Reuses the
 // audit test's seedAppForAudit shape (POST /v1/apps + decode
 // the AppResponse) so the wake-timeline tests don't fork the
