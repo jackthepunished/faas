@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/statefuldenylist"
 )
 
 // Wire DTOs for the v1 REST API (spec Appendix A). Defined once here so apid and
@@ -2141,6 +2143,19 @@ func (s *Sidecar) Validate(limits Limits) *Problem {
 	if !sidecarImageRe.MatchString(s.Image) {
 		return ErrSidecarInvalidImage(s.Name,
 			fmt.Errorf("not a digest-pinned reference (got %q)", s.Image))
+	}
+	// Stateful denylist gate (ADR-066 §Decision 4). The image is
+	// already digest-pinned above, so the reference shape is
+	// `repo@sha256:...`; the statefuldenylist matcher strips the
+	// digest suffix + any registry hostname and probes every path
+	// segment against the denylist set. The matcher is shared with
+	// the imaged runtime gate (pkg/statefuldenylist) so the
+	// apid-side 403 and the imaged pull-path rejection agree on
+	// every reference shape. A 403 here pre-empts the request
+	// before it ever reaches imaged — the customer sees a useful
+	// error in their browser, not a pending→failed transition.
+	if hint, denied := statefuldenylist.Match(s.Image); denied {
+		return ErrSidecarStatefulDeniedWithHint(s.Name, s.Image, hint)
 	}
 	if s.Type != SidecarTypeInit && s.Type != SidecarTypeSidecar {
 		return ErrSidecarInvalidType(s.Name, string(s.Type))

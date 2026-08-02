@@ -1428,10 +1428,37 @@ func ErrSidecarInvalidImage(name string, err error) *Problem {
 // Redis, MySQL, MongoDB, etc.). 403 because the request shape is
 // valid but the policy denies it. Stateful workloads go on
 // dedicated infra, not FaaS.
+//
+// Deprecated for new callers: prefer ErrSidecarStatefulDeniedWithHint
+// (issue #463 / ADR-066 §Decision 4 followup), which surfaces the
+// remediation hint from pkg/statefuldenylist.Set in the RFC 7807
+// Detail field. Kept for symmetry with the existing pkg/imaged
+// surface that takes (name, image) only.
 func ErrSidecarStatefulDenied(name, image string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
 		"Stateful sidecar image is not allowed",
 		fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-066 §Decision 4).", name, image)).
+		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+}
+
+// ErrSidecarStatefulDeniedWithHint is the API-gate sidecar variant
+// of ErrSidecarStatefulDenied that surfaces the remediation hint
+// from pkg/statefuldenylist.Set ("use Neon", "use Upstash", …) in
+// the RFC 7807 Detail field. The customer-facing copy is the hint
+// (so the dashboard / CLI can render actionable remediation);
+// name + image are present in the body so audit-log consumers can
+// still attribute the rejection to a specific sidecar.
+//
+// Empty hint is gracefully degraded (the message still names the
+// sidecar + image even when the Set row has no remediation copy —
+// defence against a future Set entry being added without a hint).
+func ErrSidecarStatefulDeniedWithHint(name, image, hint string) *Problem {
+	detail := fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-066 §Decision 4).", name, image)
+	if hint != "" {
+		detail += " Remediation: " + hint + "."
+	}
+	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
+		"Stateful sidecar image is not allowed", detail).
 		WithDocs("https://docs.gregale.dev/sidecars#stateless")
 }
 

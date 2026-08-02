@@ -63,7 +63,7 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
    to the store layer can't bypass the API gate.
 
 **2. JSONB column on `deployments`, not a normalized table.**
-   `migrations/00095_deployments_sidecars.sql` adds
+   `migrations/00096_deployments_sidecars.sql` adds
    `deployments.sidecars jsonb NOT NULL DEFAULT '[]'::jsonb`
    plus the CHECK constraint. JSONB is adequate because:
    (a) per-instance O(2) reads; (b) no per-sidecar queries;
@@ -158,8 +158,8 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
 | apid boot without age recipient loaded | `ErrCapacity` 503 at POST (recipient not loaded → refusing to seal). Same posture as `setSecret` handlers. |
 | Sidecar env value exceeds `EnvValueMaxBytes` | `ErrSecretValueTooLarge` 413 at apid; value clamped before sealing. |
 | Sealed env `OpenBytes` failure at wake (PR-B runtime) | PR-A doesn't wire Open. PR-B treats as "credential unusable" — fails the deploy with redacted error. PR-A's only contract here is: never store plaintext, never log plaintext, never put plaintext in audit. |
-| Slot 95 collision with sibling PR | Drop `00095_reserve_slot.sql` on rebase if the sibling PR landed first; bump to 096+ (ADR-041). The cross-PR slot gate's `slots_from_paths` regex carve-out hides reservations. |
-| `e2eMigrationTarget` stays at 94 → 95 in `cmd/e2e/harness.go:352` | Migrations tests use literal UUIDs; e2e harness waits for `95`. |
+| Slot 96 vs sibling PR #526 holding slot 95 | PR #526's `00095_reserve_slot.sql` already fences 95 on its branch; PR-A (this ADR) renumbered 95 → 96 and planted `00095_reserve_slot.sql` of its own. Whichever lands second drops the other's reservation on rebase. The cross-PR slot gate's `slots_from_paths` regex carve-out hides reservations. |
+| `e2eMigrationTarget` 94 → 96 in `pkg/e2etest/harness.go` | Migrations tests use literal UUIDs (renumbered 95 → 96); e2e harness waits for `96`. |
 | `pkg/api ↔ pkg/state cycle` | `pkg/state/Deployment.Sidecars` is `json.RawMessage` (no `pkg/api` import). Decoder helper at the handler boundary. |
 | Migration bytea literal pitfall | n/a — jsonb shape (`migration-test-bytea-literal-shape.md` does not apply). |
 | Field name overlap with future fields (e.g. `Sidecar.Priority`) | The Type field is a closed set enum string; future fields are additive. |
@@ -225,14 +225,14 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
 
 ## Consequences
 
-- **`migrations/00095_deployments_sidecars.sql`** (new):
+- **`migrations/00096_deployments_sidecars.sql`** (new):
   `ALTER TABLE deployments ADD COLUMN IF NOT EXISTS
   sidecars jsonb NOT NULL DEFAULT '[]'::jsonb` + CHECK
   `jsonb_array_length(sidecars) <= 2`. Replay-safe via the
   IF NOT EXISTS guard (ADR-041 / PR #377).
-- **`migrations/00095_deployments_sidecars_test.go`** (new):
-  literal-UUID pins `...000095` / `...000195` / `...000295` /
-  `...000395` mirroring `00094_app_registry_credentials_test.go`.
+- **`migrations/00096_deployments_sidecars_test.go`** (new):
+  literal-UUID pins `...000096` / `...000196` / `...000296` /
+  `...000396` mirroring `00094_app_registry_credentials_test.go`. PR-A also plants `00095_reserve_slot.sql` to fence the slot held by open PR #526.
   7 cases: apply-through, 0-cap insert, 2-cap insert, 3-cap
   CHECK-rejection, round-trip shape preservation, NULL DEFAULT
   fill, replay-safety.
@@ -282,14 +282,15 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
 - **`sdk/go/internal/api/errors.go`** (hand-curated subset,
   per `sdk-go-errors-hand-curated-subset.md`) gains 8 mirror
   constructors so the Go SDK compile stays green.
-- **`cmd/e2e/harness.go::e2eMigrationTarget`** 94 → 95.
+- **`pkg/e2etest/harness.go::e2eMigrationTarget`** 94 → 96.
 - **`pkg/state/embed_test.go`** + `apply_walk_test.go` expected
-  range 1..95.
+range 1..96.
 - **`docs/adr/README.md`** table gains the ADR-069 row.
-- **No new migration beyond 00095.** Slot policy per
-  `cross-pr-slot-gate-reservation-fence-pattern.md`; if a
-  sibling PR claims 095 first, renumber to 096 + add
-  `00095_reserve_slot.sql`.
+- **No new migration beyond 00096.** Slot policy per
+  `cross-pr-slot-gate-reservation-fence-pattern.md`; open PR #526
+  holds slot 095, so PR-A renumbered 95 → 96 and planted
+  `00095_reserve_slot.sql` (the canonical `select 1;` fence body
+  copy from `00087_reserve_slot.sql`).
 - **No SDK surface change** (no new HTTP routes).
 - **No CLI surface change** in PR-A.
 - **No `pkg/fcvm` / `pkg/imaged` / `guest/init` /
@@ -353,7 +354,7 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
   column `jsonb NOT NULL DEFAULT 'shape'::jsonb` precedent,
   no GIN index, application-layer validation.
 - `migrations/00087_reserve_slot.sql` — canonical fence
-  body if slot 095 races.
+  body — this PR uses that fence to hold slot 95 against PR #526.
 - `cmd/apid/auth_facade.go::loadApp` (auth_facade.go:75-80) —
   IDOR-safe slug→App with `app.AccountID == acct.ID` predicate.
 - `cmd/apid/handlers_secrets.go::setSecretRecipient` —
@@ -364,14 +365,14 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
 - `pkg/state/queries.sql` (hand-coded SQL per ADR-017) —
   pgstore uses hand-coded SQL on the jsonb column.
 - `pkg/state/migration_apply_walk_test.go` + `embed_test.go` —
-  the contiguous-range gate; PR-A bumps to 1..95.
+  the contiguous-range gate; PR-A bumps to 1..96.
 - `sdk-go-errors-hand-curated-subset.md` — the hand-curated
   subset pattern; PR-A mirrors the 8 new errors in
   `sdk/go/internal/api/errors.go`.
 - `spec-sync-stale-embed-on-openapi-change.md` — re-run
   `make spec-sync` after the yaml change.
 - `cross-pr-slot-gate-reservation-fence-pattern.md` — slot
-  fence if 095 races.
+  fence; PR-A plants `00095_reserve_slot.sql` against PR #526.
 - `pkg/imaged/handler_image_build_test.go`'s
   `StatefulBaseImageDenylist` fixture — replicated in
   `Sidecar.Validate` via the same hash set; `pkg/api`
@@ -427,12 +428,12 @@ Unit tests (no KVM):
 - `pkg/state/pgstore_*_test.go` (extend) — JSONB
   round-trip + 2-cap rejection + nil→`[]` default
   fill.
-- `migrations/00095_deployments_sidecars_test.go` (new) —
+- `migrations/00096_deployments_sidecars_test.go` (new) —
   pgtest (7 cases mirroring `00094_app_registry_
   credentials_test.go`).
 - `pkg/state/migration_apply_walk_test.go` (extend) —
-  bump range to 1..95.
-- `migrations/embed_test.go` (extend) — bump N to 95.
+  bump range to 1..96.
+- `migrations/embed_test.go` (extend) — bump N to 96.
 - `cmd/apid/handlers_deployments_test.go` (extend) —
   passthrough coverage:
   - 4 cases of `TestCreateDeployment_AllPlansAllowSidecars`
@@ -479,7 +480,7 @@ Cross-PR slot gate:
 # PR-creation time check
 ls migrations/ | grep -E '^[0-9]' | sort | tail -3
 git log --all --oneline -- migrations/ | head -5
-# Confirm 095 is free; if not, renumber-fence per the
+# Confirm 096 is free; if not, renumber-fence per the
 # cross-pr-slot-gate-reservation-fence-pattern.md memory.
 ```
 
@@ -496,11 +497,12 @@ Pre-merge checklist:
       (out-of-band ops commit; documented above).
 - [ ] `docs/adr/README.md` table row for ADR-069 added on the
       PR.
-- [ ] `migrations/00095_deployments_sidecars.sql` applied
+- [ ] `migrations/00096_deployments_sidecars.sql` applied
       cleanly via `make test` on a fresh pgtest DB.
-- [ ] Cross-PR slot gate: no sibling PR claims 095 (or the
-      renumber-fence is in place).
-- [ ] `cmd/e2e/harness.go::e2eMigrationTarget = 95` on the PR.
+- [ ] Cross-PR slot gate: PR #526 holds slot 95 as a fence;
+      PR-A plants its own `00095_reserve_slot.sql` and uses
+      slot 96.
+- [ ] `pkg/e2etest/harness.go::e2eMigrationTarget = 96` on the PR.
 - [ ] `api/openapi.yaml` + `pkg/apid/openapi.yaml` parity
       (`make spec-check` green).
 - [ ] `sdk-go/internal/api/errors.go` mirrors all 8 new
