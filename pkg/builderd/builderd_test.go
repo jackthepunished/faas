@@ -2,6 +2,7 @@ package builderd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 
@@ -1289,5 +1291,82 @@ func TestProcessOne_ProvenanceCopiesDeploymentSourceFields(t *testing.T) {
 	}
 	if prov.CommitSHA != wantSHA {
 		t.Errorf("CommitSHA = %q, want %q (populator must copy from deployments.commit_sha)", prov.CommitSHA, wantSHA)
+	}
+}
+
+// TestMarkSucceededAndFailed_EmitBuildEvents pins the
+// wake.build_succeeded / wake.build_failed emit (issue #517 /
+// PR-C / ADR-064). The two metrics funnels MUST write the
+// typed events row under the right deployment + carry the
+// image_digest + duration payload so the customer-facing
+// timeline endpoint (commit 8) can render the build phase
+// without a hand-rolled SELECT data->>'deployment_id' FROM
+// events.
+//
+// The test seeds two builds: a success path (markSucceeded)
+// and a failure path (markFailed). Both run with b.events
+// wired; the events table is read back via store.ListEvents
+// (the same query the production apid wake-timeline endpoint
+// uses).
+func TestMarkSucceededAndFailed_EmitBuildEvents(t *testing.T) {
+	store := state.NewMemStore()
+	srcTar := filepath.Join(t.TempDir(), "src.tar.gz")
+	makeTarballWithName(t, srcTar, []string{"package.json"})
+	buildID, depID, _ := seedDeployment(t, store, srcTar)
+	srcTar2 := filepath.Join(t.TempDir(), "src2.tar.gz")
+	makeTarballWithName(t, srcTar2, []string{"package.json"})
+	buildID2, depID2, _ := seedDeploymentWithSlug(t, store, srcTar2, "build-evt-fail")
+
+	eventsPlatform := events.NewPlatform("builderd", store, slog.New(slog.NewTextHandler(io.Discard, nil)), wire.NewOpsMetrics("builderd-test"), nil)
+
+	b := New(store, &fakeNotifier{}, nil, NewCache(t.TempDir()), NewDetector(), nil, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithEvents(eventsPlatform)
+
+	// Flip both rows to running so the markX CAS guard passes.
+	if err := store.UpdateBuildStatus(context.Background(), buildID, state.BuildRunning, "", true, false); err != nil {
+		t.Fatalf("seed running: %v", err)
+	}
+	if err := store.UpdateBuildStatus(context.Background(), buildID2, state.BuildRunning, "", true, false); err != nil {
+		t.Fatalf("seed running #2: %v", err)
+	}
+
+	// Success path.
+	b.markSucceeded(context.Background(), buildID, "ok", time.Now().Add(-50*time.Millisecond))
+	// Failure path — using FailureInfra (covers the most common
+	// non-user-error path; FailureUserError is a separate funnel
+	// in metrics but the typed event uses the same string).
+	b.markFailed(context.Background(), depID2, buildID2, state.FailureInfra, "synthetic infra", time.Now().Add(-30*time.Millisecond))
+
+	// Read the events table back. Two rows expected:
+	// wake.build_succeeded (buildID) and wake.build_failed
+	// (buildID2). Subject is the build events' Subject
+	// (nil — these are system-level events not pinned to a
+	// single app subject) so the empty-subject filter
+	// matches.
+	rows, err := store.ListEvents(context.Background(), "", 100)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	gotByKind := map[string]int{}
+	gotByDep := map[string]string{}
+	for _, row := range rows {
+		var payload map[string]any
+		_ = json.Unmarshal(row.Data, &payload)
+		gotByKind[row.Kind]++
+		if dep, ok := payload["deployment_id"].(string); ok {
+			gotByDep[row.Kind] = dep
+		}
+	}
+	if gotByKind["wake.build_succeeded"] != 1 {
+		t.Errorf("wake.build_succeeded count = %d, want 1 (gotByKind=%v)", gotByKind["wake.build_succeeded"], gotByKind)
+	}
+	if gotByKind["wake.build_failed"] != 1 {
+		t.Errorf("wake.build_failed count = %d, want 1 (gotByKind=%v)", gotByKind["wake.build_failed"], gotByKind)
+	}
+	if gotByDep["wake.build_succeeded"] != depID {
+		t.Errorf("wake.build_succeeded deployment_id = %q, want %q", gotByDep["wake.build_succeeded"], depID)
+	}
+	if gotByDep["wake.build_failed"] != depID2 {
+		t.Errorf("wake.build_failed deployment_id = %q, want %q", gotByDep["wake.build_failed"], depID2)
 	}
 }

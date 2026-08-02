@@ -126,3 +126,5 @@ export type { UpdateCronRequest } from './UpdateCronRequest.js';
 export type { UsageExportResponse } from './UsageExportResponse.js';
 export type { UsageResponse } from './UsageResponse.js';
 export type { UsageSummaryResponse } from './UsageSummaryResponse.js';
+export type { WakeTimelineEvent } from './WakeTimelineEvent.js';
+export type { WakeTimelineResponse } from './WakeTimelineResponse.js';

@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 
@@ -132,6 +133,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// it once (not inline in the /metrics block) is what makes the build
 	// series real rather than a throwaway (ADR-030).
 	ops := wire.NewOpsMetrics("builderd")
+	// issue #517 / PR-C / ADR-064: thread the events Platform
+	// so markSucceeded / markFailed emit
+	// wake.build_succeeded / wake.build_failed on the events
+	// table. nil opts out (the cmd/builderd tests still drive
+	// Builderd without an events Platform). The Platform writes
+	// the events row + bumps wake_phase_emitted_total.
+	eventsPlatform := events.NewPlatform("builderd", store, log, ops, nil)
 	b := builderdpkg.New(store, notif, driver, nil, nil, resid, builderdpkg.Config{
 		CacheDir:       cfg.CacheDir,
 		MetricsAddr:    cfg.MetricsAddr,
@@ -141,7 +149,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// "default-local" in LoadConfig; multi-node deployments
 		// override per-builder via the toml field.
 		BuilderNodeID: cfg.BuilderNodeID,
-	}, log).WithOpsMetrics(ops)
+	}, log).WithOpsMetrics(ops).WithEvents(eventsPlatform)
 	// builderd.New instantiates its own *Cache from cfg.CacheDir;
 	// we construct a sibling Cache at the same root for the GC loop
 	// (Cache.Sweep is pure filesystem, no shared state with Builderd).

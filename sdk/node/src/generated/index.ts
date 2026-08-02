@@ -132,6 +132,8 @@ export type { UpdateCronRequest } from './models/UpdateCronRequest.js';
 export type { UsageExportResponse } from './models/UsageExportResponse.js';
 export type { UsageResponse } from './models/UsageResponse.js';
 export type { UsageSummaryResponse } from './models/UsageSummaryResponse.js';
+export type { WakeTimelineEvent } from './models/WakeTimelineEvent.js';
+export type { WakeTimelineResponse } from './models/WakeTimelineResponse.js';
 
 export { AccountService } from './services/AccountService.js';
 export { AdminService } from './services/AdminService.js';
@@ -151,6 +153,7 @@ export { InvocationsService } from './services/InvocationsService.js';
 export { KeysService } from './services/KeysService.js';
 export { MetaService } from './services/MetaService.js';
 export { MfaService } from './services/MfaService.js';
+export { ObservabilityService } from './services/ObservabilityService.js';
 export { ProjectsService } from './services/ProjectsService.js';
 export { QueuesService } from './services/QueuesService.js';
 export { RegistryService } from './services/RegistryService.js';

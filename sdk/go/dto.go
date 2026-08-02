@@ -91,6 +91,10 @@ type (
 	AuditEventResponse      = api.AuditEventResponse
 	ListAuditEventsResponse = api.ListAuditEventsResponse
 
+	// Wake timeline (issue #517 / PR-C / ADR-064).
+	WakeTimelineEvent    = api.WakeTimelineEvent
+	WakeTimelineResponse = api.WakeTimelineResponse
+
 	// Secrets.
 	AppSecretListResponse = api.AppSecretListResponse
 	PutAppSecretRequest   = api.PutAppSecretRequest

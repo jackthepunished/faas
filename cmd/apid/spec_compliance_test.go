@@ -38,6 +38,7 @@ const (
 	mfaFile       = "mfa.go"
 	sessionsFile  = "sessions.go" // IAM-3 (ADR-039)
 	errorsFile    = "errors.go"
+	wakeTLFile    = "wake_timeline.go" // issue #517 PR-C / ADR-064
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -499,6 +500,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", mfaFile),
 		filepath.Join(root, "pkg", "api", sessionsFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
+		filepath.Join(root, "pkg", "api", wakeTLFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

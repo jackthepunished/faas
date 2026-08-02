@@ -4769,6 +4769,54 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 	return out, nil
 }
 
+// ListEventsByWakeID (issue #517 / PR-C, ADR-064) — the
+// in-memory twin of the pgstore ListEventsByWakeID sqlc query.
+// Filters on the jsonb data.wake_id key (the index shape on the
+// production path), orders by `at` ASC (oldest → newest) so the
+// customer-facing timeline reads as a forward narrative, and
+// respects the optional `since` lower bound + `limit` cap (the
+// handler enforces max 1000). Insertion order is not equivalent
+// to at-order: emit sites run under different locks and the
+// in-memory append order interleaves the wake phases. Sort by
+// `at` so the result matches the production ORDER BY at ASC.
+func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Event
+	for i := 0; i < len(m.events); i++ {
+		e := m.events[i]
+		if !e.At.After(since) {
+			continue
+		}
+		// The wake_id is a key on the jsonb data blob; the
+		// in-memory Event has Data as []byte. Decode lazily
+		// — the per-row cost is one json.Unmarshal + map
+		// lookup, amortised across the test corpus. For very
+		// high-volume unit tests this would matter, but the
+		// list is bounded by MemStore's test fixture sizes.
+		var payload struct {
+			WakeID string `json:"wake_id"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.WakeID != wakeID {
+			continue
+		}
+		out = append(out, e)
+	}
+	// Sort by at ASC. Stable across insertion order (the wake
+	// phases are emitted at different lock depths so the
+	// append order is not the same as the at-order).
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].At.Before(out[j].At)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // --- Usage ------------------------------------------------------------------
 
 // AppendUsage writes one (instance, minute) usage row and updates the

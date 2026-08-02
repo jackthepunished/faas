@@ -1,0 +1,42 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00113_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Slot 113 is held by open PR-D (issue #517 follow-on — jailer /
+-- Firecracker stderr capture table + sanitizer audit script,
+-- ADR-045 follow-up). The companion real migration on PR-D is
+-- the stderr capture table that records jailer / Firecracker
+-- stderr into the events table with kind `wake.jail_stderr`. The
+-- reservation rides the +1 offset from PR-C's real migration at
+-- 00114_events_wake_id_idx.sql so the embedded set stays
+-- contiguous 1..114 on this branch.
+--
+-- Whichever side lands first (PR-C with the 113 reservation +
+-- 114 real migration, or PR-D with its real 113 + 114
+-- reservation), the other drops its reservation on rebase. The
+-- cross-PR slot gate hides reservation files via the
+-- slots_from_paths regex carve-out, so the simultaneous
+-- reservations do not surface as a collision.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

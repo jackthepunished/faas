@@ -563,6 +563,56 @@ func TestOpsMetrics_SnapshotDiskDriftNilSafe(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_WakePhaseClosedSet (issue #517 / PR-C / ADR-064) —
+// the wake-phase collector pair is registered on every daemon
+// (single-registry pattern, memory wire-opsmetrics-single-registry)
+// and pre-instantiated with the closed 13-phase × 2-result label
+// set so the §12 wake-latency panel surfaces zero on an idle
+// daemon. The accessor must be nil-safe on a nil receiver so
+// engine unit tests without metrics keep working.
+func TestOpsMetrics_WakePhaseClosedSet(t *testing.T) {
+	for _, prefix := range []string{"schedd", "vmmd", "gatewayd", "apid", "builderd"} {
+		m := wire.NewOpsMetrics(prefix)
+		// Increment one phase to verify the counter surfaces
+		// under the correct metric name.
+		m.WakePhaseEmitted("boot_started", "ok").Inc()
+		// Observe a duration to verify the histogram is wired.
+		m.WakePhaseDuration("boot_started", "ok").Observe(0.123)
+		body := render(t, m)
+		if !strings.Contains(body, prefix+"_wake_phase_emitted_total{phase=\"boot_started\",result=\"ok\"} 1") {
+			t.Errorf("prefix=%s missing wake_phase_emitted counter; body:\n%s", prefix, body)
+		}
+		if !strings.Contains(body, prefix+"_wake_phase_duration_seconds_count{phase=\"boot_started\",result=\"ok\"} 1") {
+			t.Errorf("prefix=%s missing wake_phase_duration histogram; body:\n%s", prefix, body)
+		}
+		// Each pre-instantiated (phase, result) tuple must
+		// surface in /metrics with value 0 — verify a couple
+		// of representative cells.
+		for _, want := range []string{
+			prefix + `_wake_phase_emitted_total{phase="readiness_200",result="ok"} 0`,
+			prefix + `_wake_phase_emitted_total{phase="build_failed",result="failed"} 0`,
+			prefix + `_wake_phase_duration_seconds_count{phase="proxy_first_byte",result="ok"} 0`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("prefix=%s missing pre-instantiated cell %q", prefix, want)
+			}
+		}
+	}
+}
+
+// TestOpsMetrics_WakePhaseNilSafe — nil-receiver guard. The
+// pkg/events.Platform unit tests construct Platform without an
+// OpsMetrics; the accessors must be no-ops on nil receivers.
+func TestOpsMetrics_WakePhaseNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.WakePhaseEmitted("boot_started", "ok"); got != nil {
+		t.Errorf("nil.WakePhaseEmitted = %v, want nil", got)
+	}
+	if got := m.WakePhaseDuration("boot_started", "ok"); got != nil {
+		t.Errorf("nil.WakePhaseDuration = %v, want nil", got)
+	}
+}
+
 // TestOpsMetrics_ObserveOAuthDisabled (issue #419 / ADR-046) — the
 // sign-in OAuth consent handlers increment
 // `apid_oauth_disabled_total{provider}` on every 503

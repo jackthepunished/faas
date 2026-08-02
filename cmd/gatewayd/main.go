@@ -40,6 +40,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
@@ -564,7 +565,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// cache so the WatchEvictions heartbeat goroutine has a sink for
 	// gateway_compute_node_changed_subscriber_alive. deps.metrics is
 	// always non-nil after NewMetrics (cmd/gatewayd/main.go:284).
-	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics)
+	//
+	// issue #517 / PR-C / ADR-064: thread the events Platform into
+	// the node cache so the forwarder emits wake.proxy_first_byte
+	// on the first downstream byte. The Platform writes the events
+	// row + bumps wake_phase_emitted_total{wake.proxy_first_byte}.
+	// We do NOT pass a Broadcaster — gatewayd is the public
+	// listener (CLAUDE.md ownership), not an SSE fan-out source.
+	gatewayOps := wire.NewOpsMetrics("gatewayd")
+	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
+	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
 	deps.pgStore = pgStore
 	// Issue #471 / ADR-047 (PR-A): merge the per-process streaming
