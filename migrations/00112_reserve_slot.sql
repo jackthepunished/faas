@@ -1,0 +1,39 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00112_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Slot 112 is held by open PR #540 (test(state): raise pkg/state
+-- coverage to 86% + fix latent PgStore bugs) as a partner fence
+-- for its real migration at 00111_webhook_deliveries.sql. This
+-- reservation bridges the gap on this branch so the embedded
+-- set stays contiguous 1..114 while PR #540 is still open.
+--
+-- Whichever side lands first (PR-C with the 112 reservation +
+-- 114 real migration, or PR #540 with its real 111 + 112
+-- reservation), the other drops its reservation on rebase. The
+-- cross-PR slot gate hides reservation files via the
+-- slots_from_paths regex carve-out, so the simultaneous
+-- reservations do not surface as a collision.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00113_events_wake_id_idx.sql
+-- filename: 00114_events_wake_id_idx.sql
 --
 -- issue #517 / PR-C / ADR-064 — wake-timeline expression index.
 --
@@ -29,18 +29,19 @@
 -- is the intended outcome (legacy rows are out of scope of
 -- PR-C, see ADR-064 §"Compatibility").
 --
--- Migration slot: 00113. PR-D's jailer / Firecracker stderr capture
--- table (issue #517 final PR, ADR-045 follow-up) rides the +1
--- offset at 00114 on this branch (the cross-PR gate hides
+-- Migration slot: 00114. PR-D's jailer / Firecracker stderr capture
+-- table (issue #517 final PR, ADR-045 follow-up) is held by the
+-- 00113 reservation on this branch (the cross-PR gate hides
 -- simultaneous reservations via the slots_from_paths regex carve-
 -- out per ADR-041).
 --
 -- Renumber history (post-#533-merge reset + post-#525-merge bump +
 -- post-#540-collision bump): this PR's real migration has been at
--- 92 → 97 → 99 → 101 → 103 → 105 → 107 → 111 → 113 across nine
+-- 92 → 97 → 99 → 101 → 103 → 105 → 107 → 111 → 113 → 114 across ten
 -- rebase cycles. PR #540 (state coverage 86%) opened with a real
--- migration at 00111, so PR-C bumped from 111 to 113 (next free
--- slot after main's 110 + the 111/112 pair held by PR #540).
+-- migration at 00111 plus a partner reservation at 00112, so PR-C
+-- bumped from 111 to 113 then 114 (next free slot after main's 110
+-- + the 111/112 pair held by PR #540).
 
 create index if not exists events_wake_id_idx
   on events ((data->>'wake_id'))
