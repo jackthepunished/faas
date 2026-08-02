@@ -1929,19 +1929,24 @@ func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (i
 // peer, and the peer is the very thing that's gone.
 //
 // Per-instance decision (driven by compute_nodes.active for
-// the row's current node_id, which is the dying vmmd — Phase 2
-// didn't flip node_id, only Phase 3 does):
+// the row's current node_id, which is the OLD/dying vmmd —
+// Phase 2 MarkInstanceMigrating did not flip node_id, only
+// Phase 3 MigrateInstanceOwner does):
 //
 //  1. Active owner (compute_nodes.active = true): the row is
 //     wedged but the dying vmmd is still up. Issue a
 //     Store.ReinviteMigratingInstance conditional UPDATE that
 //     flips state='migrating' → 'running', stamps migrated_at,
-//     and clears lease_token. Bumps outcome="reinvited".
+//     and clears lease_token. node_id stays on the OLD owner.
+//     Bumps outcome="reinvited".
 //  2. Dead owner (compute_nodes.active = false): the dying
 //     vmmd is gone. Issue a Store.AbortMigratingInstance
 //     conditional UPDATE that flips state='migrating' →
-//     'parked', restores node_id=migrated_from_node_id, and
-//     clears lease_token. Bumps outcome="hard_deleted".
+//     'parked' and clears lease_token. node_id is left on the
+//     dead OLD owner (migrated_from_node_id is NULL pre-Phase-3;
+//     the wake path dispatches via app.NodeID, not instance.
+//     NodeID, so a dead instance.NodeID is harmless). Bumps
+//     outcome="hard_deleted".
 //  3. Conflict (RowsAffected() == 0): the lease expired or a
 //     peer already committed/rolled back. Bumps
 //     outcome="conflict" and drops silently.
@@ -1980,12 +1985,6 @@ func (e *Engine) ReconcileExpiredMigrations(ctx context.Context) (int, error) {
 	}
 	reconciled := 0
 	for _, ins := range rows {
-		if e.ops != nil {
-			// Every per-row attempt is bucketed in the metric
-			// via the outcome label; the dashboard's
-			// schedd_migrating_reconcile_total{outcome} panel
-			// sums the rate.
-		}
 		ownerActive, lookupErr := e.computeNodeActive(ctx, ins.NodeID)
 		if lookupErr != nil {
 			if e.ops != nil {

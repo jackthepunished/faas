@@ -1917,8 +1917,12 @@ func (m *MemStore) ReinviteMigratingInstance(_ context.Context, instanceID, leas
 
 // AbortMigratingInstance mirrors pkg/state/pgstore.go::
 // AbortMigratingInstance. Conditional on state='migrating' +
-// lease_token=leaseToken; flips state='parked', restores
-// node_id=migrated_from_node_id, clears lease_token.
+// lease_token=leaseToken; flips state='parked', clears lease_token.
+// node_id is left UNCHANGED — same rationale as the pgstore
+// implementation (A5 Phase-2 leaves node_id on the OLD owner and
+// migrated_from_node_id is NULL pre-Phase-3; the wake path
+// dispatches via app.NodeID, so a dead instance.NodeID is
+// harmless).
 func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
 	if instanceID == "" {
 		return fmt.Errorf("state: abort migrating instance: empty instanceID")
@@ -1936,9 +1940,6 @@ func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseTo
 		return ErrConflict
 	}
 	ins.State = "parked"
-	if ins.MigratedFromNodeID != nil {
-		ins.NodeID = *ins.MigratedFromNodeID
-	}
 	ins.LeaseToken = ""
 	m.instances[instanceID] = ins
 	return nil
@@ -2779,10 +2780,13 @@ func (m *MemStore) SetBuildStartedAtForTest(id string, t time.Time) {
 }
 
 // SetInstanceMigratedFromForTest is a test-only hook that lets
-// the A6 watchdog tests stamp MigratedFromNodeID on a wedged
-// state='migrating' row so the dead-owner reconciliation path
-// has a destination to restore. Mirrors the other
-// SetXForTest helpers in this file.
+// future tests (e.g. a post-Phase-3 conflict path test) stamp
+// MigratedFromNodeID on a wedged state='migrating' row. The
+// A6 watchdog itself does NOT read MigratedFromNodeID (the
+// column is NULL pre-Phase-3, which is exactly when the watchdog
+// fires), so the current watchdog tests do not exercise this
+// helper. Kept in place for symmetry with the other SetXForTest
+// helpers and as a future-proofing seam.
 func (m *MemStore) SetInstanceMigratedFromForTest(instanceID, nodeID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

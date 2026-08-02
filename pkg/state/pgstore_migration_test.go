@@ -22,6 +22,8 @@ package state_test
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -516,5 +518,104 @@ func TestPgStore_AbortMigratingInstance(t *testing.T) {
 		if err := s.AbortMigratingInstance(ctx, tt.id, tt.lease); err == nil {
 			t.Errorf("Abort(%s): nil error; want rejection", tt.name)
 		}
+	}
+}
+
+// TestPgStore_A5VsA6_Race pins the cross-method race-safety
+// contract between the A5 peer-commit path (MigrateInstanceOwner)
+// and the A6 watchdog reinvite path (ReinviteMigratingInstance).
+// Both run conditionally on (state='migrating', lease_token=$1)
+// so exactly one must win; the loser must return ErrConflict.
+//
+// Why this matters: the A5 phase-3 commit and the A6 watchdog
+// can fire on the same row concurrently when the dying owner
+// recovers mid-reconcile (e.g. vmmd restart during a peer
+// restart). If the predicates are not load-bearing, both can
+// commit and the row ends up in a torn state — node_id flipping
+// twice, state_machine corrupt. This test pins the
+// exactly-one-wins contract.
+func TestPgStore_A5VsA6_Race(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	oldOwner, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "race-old", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed old owner: %v", err)
+	}
+	newOwner, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "race-new", TargetURL: "tcp://10.0.0.3:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed new owner: %v", err)
+	}
+	_, insID := seedRunningInstance(t, s, ctx, oldOwner.ID)
+	const lease = "race-lease"
+	if err := s.MarkInstanceMigrating(ctx, insID, oldOwner.ID, lease); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+
+	// Fire A5 peer-commit and A6 watchdog reinvite concurrently.
+	// Both are conditional on state='migrating' + lease_token=$1
+	// so exactly one must win.
+	var (
+		wg       sync.WaitGroup
+		a5Err    error
+		a6Err    error
+		startGun sync.WaitGroup
+	)
+	startGun.Add(1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		startGun.Wait()
+		a5Err = s.MigrateInstanceOwner(ctx, insID, oldOwner.ID, newOwner.ID, lease)
+	}()
+	go func() {
+		defer wg.Done()
+		startGun.Wait()
+		a6Err = s.ReinviteMigratingInstance(ctx, insID, lease)
+	}()
+	startGun.Done()
+	wg.Wait()
+
+	// Count winners. Exactly one must succeed; the loser must
+	// surface ErrConflict (predicate miss on state or lease).
+	var wins int32
+	if a5Err == nil {
+		atomic.AddInt32(&wins, 1)
+	}
+	if a6Err == nil {
+		atomic.AddInt32(&wins, 1)
+	}
+	if wins != 1 {
+		t.Fatalf("exactly-one-wins violated: a5=%v a6=%v (wins=%d)", a5Err, a6Err, wins)
+	}
+	// Loser must be ErrConflict (NOT ErrNotFound; the row is still
+	// there, just in a different state).
+	if a5Err != nil && !errors.Is(a5Err, state.ErrConflict) {
+		t.Errorf("a5 loser err=%v; want ErrConflict", a5Err)
+	}
+	if a6Err != nil && !errors.Is(a6Err, state.ErrConflict) {
+		t.Errorf("a6 loser err=%v; want ErrConflict", a6Err)
+	}
+
+	// After the race, the row must be in a coherent terminal state:
+	// either 'running' (A5 won — node_id=newOwner) or 'running'
+	// (A6 won — node_id=oldOwner, lease cleared). Either is valid;
+	// the row MUST NOT still be in 'migrating' (that would mean
+	// both methods failed, which is the row-corrupting case).
+	final, err := s.InstanceByID(ctx, insID)
+	if err != nil {
+		t.Fatalf("InstanceByID post-race: %v", err)
+	}
+	if final.State != "running" {
+		t.Fatalf("post-race state=%q; want 'running' (row still 'migrating' would mean both methods failed)", final.State)
+	}
+	if final.LeaseToken != "" {
+		t.Errorf("post-race lease_token=%q; want empty (both methods clear the lease on success)", final.LeaseToken)
 	}
 }

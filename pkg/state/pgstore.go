@@ -1470,11 +1470,21 @@ func (s *PgStore) ReinviteMigratingInstance(ctx context.Context, instanceID, lea
 
 // AbortMigratingInstance is the dead-owner hard-delete gate of
 // the Tier A6 / ADR-067 migrating-instance watchdog. Conditional
-// UPDATE that flips state='migrating' → 'parked', restores
-// node_id = migrated_from_node_id (the live, parked state the row
-// was in before Phase 2 of the original handoff), and clears
+// UPDATE that flips state='migrating' → 'parked' and clears
 // lease_token so a future re-attempt at migration mints a fresh
-// lease. The conditional predicates are the same as
+// lease. node_id is left UNCHANGED — the row's node_id is still
+// the OLD owner (A5 Phase-2 MarkInstanceMigrating flipped state
+// but did not flip node_id; Phase-3 MigrateInstanceOwner never
+// ran), and there is no better destination to point at: the OLD
+// owner is the one whose vmmd died, the NEW owner never wrote a
+// snapshot, and migrated_from_node_id is NULL pre-Phase-3 (so
+// setting node_id = migrated_from_node_id would zero it out and
+// break the wake path's WakeResult.NodeID — see engine.go:681).
+// The wake path dispatches via app.NodeID (engine.go:1394-1400)
+// so a parked row on a dead instance.NodeID is fine; the next
+// customer request wakes cold on the live apps.node_id.
+//
+// The conditional predicates are the same as
 // ReinviteMigratingInstance. Returns ErrConflict on
 // RowsAffected()==0.
 func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseToken string) error {
@@ -1487,7 +1497,6 @@ func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseT
 	tag, err := s.pool.Exec(ctx,
 		`update instances
 		    set state = 'parked',
-		        node_id = migrated_from_node_id,
 		        lease_token = NULL
 		  where id = $1
 		    and state = 'migrating'

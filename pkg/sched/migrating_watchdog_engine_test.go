@@ -137,10 +137,10 @@ func TestReconcileExpiredMigrations_DeadOwnerParked(t *testing.T) {
 	e.WithOpsMetrics(ops)
 	nodeID := seedComputeNodeForReconcile(t, store, false)
 	instanceID, _ := seedReconcileFixture(t, store, nodeID)
-	// Stamp migrated_from_node_id so the abort path has a
-	// destination to restore. The dead-owner UPDATE writes
-	// node_id = migrated_from_node_id.
-	store.SetInstanceMigratedFromForTest(instanceID, "orig-"+uuid.NewString())
+	// The watchdog's abort path leaves instance.NodeID alone
+	// (migrated_from_node_id is NULL pre-Phase-3; the wake path
+	// dispatches via app.NodeID, not instance.NodeID). Verify
+	// the row's node_id stays on the dead OLD owner after abort.
 
 	reconciled, err := e.ReconcileExpiredMigrations(context.Background())
 	if err != nil {
@@ -158,6 +158,15 @@ func TestReconcileExpiredMigrations_DeadOwnerParked(t *testing.T) {
 	}
 	if got := readMigratingReconcileMetric(t, ops, "hard_deleted"); got != 1 {
 		t.Fatalf("metric hard_deleted=%d want 1", got)
+	}
+	// NodeID must still be the dead OLD owner — the wake path
+	// uses app.NodeID for placement; the dead instance.NodeID is
+	// harmless and resetting it would break engine.go:681's
+	// WakeResult.NodeID.
+	if ins, err := store.InstanceByID(context.Background(), instanceID); err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	} else if ins.NodeID != nodeID {
+		t.Errorf("post-abort instance.NodeID=%q want %q (dead OLD owner — must not change)", ins.NodeID, nodeID)
 	}
 }
 

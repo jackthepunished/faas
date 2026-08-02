@@ -683,6 +683,12 @@ func (l *Loop) runRetention(ctx context.Context) {
 // per-row recoverable; a transient DB blip on the input
 // ListExpiredMigrations query is the only error that surfaces
 // here, and the next tick retries).
+//
+// context.Canceled is treated as a normal shutdown signal
+// (matches migrating_watchdog.go's own ctx-cancel handling);
+// we don't surface it as a Warn, since the schedd is about to
+// exit and operators don't need a flurry of "tick failed" logs
+// at shutdown.
 func (l *Loop) runMigratingReconcile(ctx context.Context) {
 	if l.migratingWatchdog == nil {
 		// Direct-call guard for tests; the select case is already
@@ -691,8 +697,15 @@ func (l *Loop) runMigratingReconcile(ctx context.Context) {
 		// fires).
 		return
 	}
-	if _, err := l.migratingWatchdog.handle(ctx); err != nil {
-		l.log.Warn("migrating watchdog: tick failed", "err", err)
+	reconciled, err := l.migratingWatchdog.handle(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			l.log.Warn("migrating watchdog: tick failed", "err", err)
+		}
+		return
+	}
+	if reconciled > 0 {
+		l.log.Debug("migrating watchdog: tick reconciled", "reconciled", reconciled)
 	}
 }
 
