@@ -63,6 +63,13 @@ tags:
     description: Per-app FIFO queues (send / receive / ack).
   - name: delayed_tasks
     description: Scheduled future invocations (cron-style, one-shot).
+  - name: observability
+    description: |
+      Per-app observability surfaces (issue #517 / PR-C / ADR-064) —
+      structured event timelines a customer or operator can query
+      for a single wake. Cross-tagged with `apps` so a tag filter
+      of `apps` surfaces lifecycle endpoints alongside the wake
+      timeline.
   - name: keys
     description: API key management.
   - name: audit
@@ -3111,6 +3118,7 @@ paths:
         in: path
         required: true
         schema: { type: string }
+        description: "App slug (lowercase, kebab-case; per-account unique)."
       - name: wake_id
         in: path
         required: true
@@ -3183,7 +3191,7 @@ paths:
                     actor: gatewayd
                     data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", instance_id: "inst-1", node_id: "node-1", latency_ms: 40 }
         '400':
-          description: Bad request — malformed `since` or `limit`.
+          description: Malformed query parameter on the wake-timeline read — `since` not RFC 3339 or `limit` out of range.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
