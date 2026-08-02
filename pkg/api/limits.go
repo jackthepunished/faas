@@ -314,7 +314,7 @@ type Limits struct {
 	// threshold for warm-tier capture, applied at CreateApp when
 	// the plan allows it. Free/Hobby = 0 (irrelevant because
 	// WarmSnapshotEnabled = false there). Pro/Scale = 5. Range
-	// [1, 100] (migration 00101 CHECK). The per-app PATCH may
+	// [1, 100] (migration 00109 CHECK). The per-app PATCH may
 	// override; both the SQL CHECK and the apid handler reject
 	// out-of-range values.
 	WarmSnapshotMinRequestsDefault int
@@ -322,7 +322,7 @@ type Limits struct {
 	// threshold for warm-tier capture, applied at CreateApp when
 	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
 	// 2000 (matches Node.js Express / Flask framework startup).
-	// Range [100, 60000] (migration 00101 CHECK).
+	// Range [100, 60000] (migration 00109 CHECK).
 	WarmSnapshotMinMsDefault int
 
 	// StreamingEnabled (issue #471) gates the per-app streaming

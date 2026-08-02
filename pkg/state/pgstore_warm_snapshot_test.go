@@ -55,7 +55,7 @@ func seedTierAppAndDeploymentPg(t *testing.T, pool *pgxpool.Pool, deploymentID s
 }
 
 // TestPg_CreateSnapshot_DefaultsTierToInit confirms the SQL DEFAULT
-// 'init' on snapshots.tier (migration 00102) covers legacy callers
+// 'init' on snapshots.tier (migration 00110) covers legacy callers
 // that don't pass a tier.
 func TestPg_CreateSnapshot_DefaultsTierToInit(t *testing.T) {
 	s, pool, ctx := pgStoreWithPool(t)
@@ -79,7 +79,7 @@ func TestPg_CreateSnapshot_DefaultsTierToInit(t *testing.T) {
 }
 
 // TestPg_CreateSnapshot_TwoTierCoexist pins the
-// (deployment_id, tier) unique-index behaviour from migration 00102:
+// (deployment_id, tier) unique-index behaviour from migration 00110:
 // init + warm can both exist for one deployment; a duplicate init
 // insert hits the unique index and surfaces as ErrConflict (the
 // pgstore UniqueViolation branch from R6 — now reachable again).

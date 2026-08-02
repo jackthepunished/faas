@@ -4092,7 +4092,7 @@ func (m *MemStore) CreateSnapshot(_ context.Context, snap Snapshot) (Snapshot, e
 	}
 	for _, existing := range m.snapshots {
 		// Mirror the (deployment_id, tier) unique index from migration
-		// 00102: a non-stale row with the same (deployment_id, tier)
+		// 00110: a non-stale row with the same (deployment_id, tier)
 		// is a duplicate — surface ErrConflict so callers fall through
 		// to the existing-imaged semantic. Different-tier rows on the
 		// same deployment are allowed (warm + init coexist).

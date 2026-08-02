@@ -364,10 +364,18 @@ const testDomain = "apps.test.example"
 //   - 94 → 110 after PR #533 (Tier A5 cross-node live-instance
 //     migration, ADR-066) merged real migrations at 00103 +
 //     00104, then PR #536 (iam-6 personal-org backfill) merged
-//     real at 00105. The branch renumbered 00101 → 00109 +
-//     00102 → 00110 past main's new head at 105; the 106-108
-//     gap is filled by reserve_slot.sql fences per ADR-041 so
-//     the embedded FS stays contiguous 1..110.
+//     real at 00105. The renumber commits in this branch's history
+//     (101/102 → 103/104 → 105/106 → 107/108 → 109/110) collided
+//     with main's new files, so all five were dropped on rebase
+//     (the work is now collapsed into a single post-rebase commit).
+//     The branch renumbered 00101 → 00109 + 00102 → 00110 past
+//     main's new head at 105; the 106-108 gap is filled by
+//     reserve_slot.sql fences at 00106/00107/00108 per ADR-041 so
+//     the embedded FS stays contiguous 1..110. (Slot 00105 is owned
+//     by main's 00105_personal_org_backfill.sql — no fence needed
+//     there.) Open PRs claim: 00101 (PR #531 issue #463 sidecars),
+//     00107 (PR #532 issue #517 PR-C canonical wake timeline) —
+//     none overlap with 00109/00110.
 const e2eMigrationTarget = 110
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:

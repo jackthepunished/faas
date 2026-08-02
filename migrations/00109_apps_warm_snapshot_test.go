@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00101AppsWarmSnapshot #470,
+// Migration-apply test for 00109AppsWarmSnapshot #470,
 // ADR-055). Pins the new columns + CHECK bounds + replay-safety
 // contract.
 //
 // Pins:
 //
-//  1. The migration set applies cleanly through 00101.
+//  1. The migration set applies cleanly through 00109.
 //  2. The three columns accept the canonical shapes and round-trip.
 //  3. Defaults are false / 5 / 2000 (regression check — pre-PR rows
 //     stay on the init-tier path; warm-snapshot is operator opt-in).
@@ -38,17 +38,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
+func TestMigrations_00109_AppsWarmSnapshot(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000101`,
-	// `...000201`) so a reader scanning the test fixtures can pin each
+	// Seed UUIDs carry the slot number in the last group (`...000109`,
+	// `...000209`) so a reader scanning the test fixtures can pin each
 	// row to this migration without grepping the file name. The literal
 	// slot value MUST stay in sync with the filename; renumber per
-	// `migrations/README.md` if a sibling PR grabs 00101 first.
+	// `migrations/README.md` if a sibling PR grabs 00109 first.
 
-	// (1) Apply through 00101. A regression that drops a slot between
+	// (1) Apply through 00109. A regression that drops a slot between
 	// 1 and 101 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 101)", err)
@@ -58,7 +58,7 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 	// reruns so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000101',
+		values ('00000000-0000-0000-0000-000000000109',
 		        'warm-snapshot-test@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -66,8 +66,8 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000...000201',
-		        '00000000-0000-0000-0000-000000000101',
+		values ('00000000-0000-0000-0000-000...000209',
+		        '00000000-0000-0000-0000-000000000109',
 		        'warm-snapshot-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -87,7 +87,7 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 	)
 	if err := pool.QueryRow(ctx, `
 		select warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms
-		  from apps where id = '00000000-0000-0000-0000-000...000201'
+		  from apps where id = '00000000-0000-0000-0000-000...000209'
 	`).Scan(&enabled, &minReqs, &minMs); err != nil {
 		t.Fatalf("read default warm_snapshot_*: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 		   set warm_snapshot_enabled = true,
 		       warm_snapshot_min_requests = 10,
 		       warm_snapshot_min_ms = 3000
-		 where id = '00000000-0000-0000-0000-000...000201'
+		 where id = '00000000-0000-0000-0000-000...000209'
 	`); err != nil {
 		t.Fatalf("update warm_snapshot_*: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 	)
 	if err := pool.QueryRow(ctx, `
 		select warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms
-		  from apps where id = '00000000-0000-0000-0000-000...000201'
+		  from apps where id = '00000000-0000-0000-0000-000...000209'
 	`).Scan(&enabled2, &minReqs2, &minMs2); err != nil {
 		t.Fatalf("read opted-in warm_snapshot_*: %v", err)
 	}
@@ -138,13 +138,13 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 	// (5) CHECK bounds: warm_snapshot_min_requests BETWEEN 1 AND 100.
 	if _, err := pool.Exec(ctx, `
 		update apps set warm_snapshot_min_requests = 0
-		 where id = '00000000-0000-0000-0000-000...000201'
+		 where id = '00000000-0000-0000-0000-000...000209'
 	`); err == nil {
 		t.Errorf("warm_snapshot_min_requests=0 should be rejected by CHECK (lower bound)")
 	}
 	if _, err := pool.Exec(ctx, `
 		update apps set warm_snapshot_min_requests = 101
-		 where id = '00000000-0000-0000-0000-000...000201'
+		 where id = '00000000-0000-0000-0000-000...000209'
 	`); err == nil {
 		t.Errorf("warm_snapshot_min_requests=101 should be rejected by CHECK (upper bound)")
 	}
@@ -152,13 +152,13 @@ func TestMigrations_00101_AppsWarmSnapshot(t *testing.T) {
 	// (6) CHECK bounds: warm_snapshot_min_ms BETWEEN 100 AND 60000.
 	if _, err := pool.Exec(ctx, `
 		update apps set warm_snapshot_min_ms = 50
-		 where id = '00000000-0000-0000-0000-000...000201'
+		 where id = '00000000-0000-0000-0000-000...000209'
 	`); err == nil {
 		t.Errorf("warm_snapshot_min_ms=50 should be rejected by CHECK (lower bound)")
 	}
 	if _, err := pool.Exec(ctx, `
 		update apps set warm_snapshot_min_ms = 70000
-		 where id = '00000000-0000-0000-0000-000...000201'
+		 where id = '00000000-0000-0000-0000-000...000209'
 	`); err == nil {
 		t.Errorf("warm_snapshot_min_ms=70000 should be rejected by CHECK (upper bound)")
 	}

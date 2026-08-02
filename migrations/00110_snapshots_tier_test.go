@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00102_snapshots_tier.sql (issue #470,
+// Migration-apply test for 00110_snapshots_tier.sql (issue #470,
 // ADR-055). Pins the tier column, the CHECK constraint, and the
 // (deployment_id, tier) unique index for non-stale rows.
 //
 // Pins:
 //
-//  1. The migration set applies cleanly through 00102 (covered by
+//  1. The migration set applies cleanly through 00110 (covered by
 //     00101_apps_warm_snapshot_test.go too; we run again here to
 //     make a missing migration file between the two obvious).
 //  2. Default tier is 'init' (NOT NULL DEFAULT 'init').
@@ -39,11 +39,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00102_SnapshotsTier(t *testing.T) {
+func TestMigrations_00110_SnapshotsTier(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00102.
+	// (1) Apply through 00110.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 89)", err)
 	}
@@ -53,7 +53,7 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	// pin each row to this migration without grepping the file name.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000102',
+		values ('00000000-0000-0000-0000-000000000110',
 		        'snapshots-tier-test@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -61,8 +61,8 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000202',
-		        '00000000-0000-0000-0000-000000000102',
+		values ('00000000-0000-0000-0000-000000000210',
+		        '00000000-0000-0000-0000-000000000110',
 		        'snapshots-tier-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -70,8 +70,8 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, created_at)
-		values ('00000000-0000-0000-0000-000000000302',
-		        '00000000-0000-0000-0000-000000000202',
+		values ('00000000-0000-0000-0000-000000000310',
+		        '00000000-0000-0000-0000-000000000210',
 		        'sha256:deadbeef', 'live', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -81,14 +81,14 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	// (2) Default tier: insert without explicit tier reads back 'init'.
 	if _, err := pool.Exec(ctx, `
 		insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale)
-		values ('00000000-0000-0000-0000-000000000302', 'fc-1.0', 1000, 500, 'snap/seed/mem', false)
+		values ('00000000-0000-0000-0000-000000000310', 'fc-1.0', 1000, 500, 'snap/seed/mem', false)
 	`); err != nil {
 		t.Fatalf("seed init snapshot: %v", err)
 	}
 	var tier string
 	if err := pool.QueryRow(ctx, `
 		select tier from snapshots
-		 where deployment_id = '00000000-0000-0000-0000-000000000302' and stale = false
+		 where deployment_id = '00000000-0000-0000-0000-000000000310' and stale = false
 		 order by created_at desc limit 1
 	`).Scan(&tier); err != nil {
 		t.Fatalf("read default tier: %v", err)
@@ -100,7 +100,7 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	// (3) Tier CHECK rejects values outside the allowed set.
 	if _, err := pool.Exec(ctx, `
 		insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
-		values ('00000000-0000-0000-0000-000000000302', 'fc-1.0', 1000, 500, 'snap/seed/mem', false, 'bogus')
+		values ('00000000-0000-0000-0000-000000000310', 'fc-1.0', 1000, 500, 'snap/seed/mem', false, 'bogus')
 	`); err == nil {
 		t.Errorf("tier='bogus' should be rejected by CHECK")
 	}
@@ -110,7 +110,7 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	// load-bearing acceptance for the warm-tier capture flow.
 	if _, err := pool.Exec(ctx, `
 		insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
-		values ('00000000-0000-0000-0000-000000000302', 'fc-1.0', 1000, 500, 'snap/seed/warm/mem', false, 'warm')
+		values ('00000000-0000-0000-0000-000000000310', 'fc-1.0', 1000, 500, 'snap/seed/warm/mem', false, 'warm')
 	`); err != nil {
 		t.Fatalf("seed warm snapshot: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 		    count(*) filter (where tier = 'init'),
 		    count(*) filter (where tier = 'warm')
 		from snapshots
-		where deployment_id = '00000000-0000-0000-0000-000000000302' and stale = false
+		where deployment_id = '00000000-0000-0000-0000-000000000310' and stale = false
 	`).Scan(&initCount, &warmCount); err != nil {
 		t.Fatalf("count tiers: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	// can ignore duplicate emissions).
 	if _, err := pool.Exec(ctx, `
 		insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
-		values ('00000000-0000-0000-0000-000000000302', 'fc-1.0', 1000, 500, 'snap/seed/init-dup/mem', false, 'init')
+		values ('00000000-0000-0000-0000-000000000310', 'fc-1.0', 1000, 500, 'snap/seed/init-dup/mem', false, 'init')
 	`); err == nil {
 		t.Errorf("second init-tier row on same deployment should hit unique index")
 	}
@@ -147,13 +147,13 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	// rows (WHERE stale=false), so the recovery insert succeeds.
 	if _, err := pool.Exec(ctx, `
 		update snapshots set stale = true
-		 where deployment_id = '00000000-0000-0000-0000-000000000302' and tier = 'init'
+		 where deployment_id = '00000000-0000-0000-0000-000000000310' and tier = 'init'
 	`); err != nil {
 		t.Fatalf("stale init row: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into snapshots (deployment_id, fc_version, mem_bytes, disk_bytes, storage_key, stale, tier)
-		values ('00000000-0000-0000-0000-000000000302', 'fc-1.1', 1100, 550, 'snap/seed/init-recovered/mem', false, 'init')
+		values ('00000000-0000-0000-0000-000000000310', 'fc-1.1', 1100, 550, 'snap/seed/init-recovered/mem', false, 'init')
 	`); err != nil {
 		t.Errorf("fresh init row after stale: %v (recovery path should NOT hit unique index)", err)
 	}
@@ -161,7 +161,7 @@ func TestMigrations_00102_SnapshotsTier(t *testing.T) {
 	var stale bool
 	if err := pool.QueryRow(ctx, `
 		select tier, stale from snapshots
-		 where deployment_id = '00000000-0000-0000-0000-000000000302'
+		 where deployment_id = '00000000-0000-0000-0000-000000000310'
 		   and storage_key = 'snap/seed/init-recovered/mem'
 	`).Scan(&recoveredTier, &stale); err != nil {
 		t.Fatalf("read recovered row: %v", err)

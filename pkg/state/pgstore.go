@@ -761,7 +761,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		ramMB = 128
 	}
 	// warm_snapshot_min_requests / warm_snapshot_min_ms have CHECK bounds
-	// (1..100 / 100..60000) added by migration 00101. A caller that
+	// (1..100 / 100..60000) added by migration 00109. A caller that
 	// leaves them at the Go int zero trips the CHECK at insert time —
 	// mirror the ramMB / maxConcurrency floors above and clamp to the
 	// smallest legal value (1 / 100). apid still applies the plan-gated
@@ -862,7 +862,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		ramMB = 128
 	}
 	// Issue #470 / ADR-055: warm_snapshot_min_* have CHECK bounds (1..100 /
-	// 100..60000) added by migration 00101. Mirror the ramMB floor above
+	// 100..60000) added by migration 00109. Mirror the ramMB floor above
 	// so a zero-value App struct (test fixtures, internal callers) lands
 	// inside the bound instead of tripping the CHECK at insert time.
 	warmMinRequests := app.WarmSnapshotMinRequests
@@ -7663,7 +7663,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 //
 //	warm_snapshot_enabled, warm_snapshot_min_requests,
 //	  warm_snapshot_min_ms  — issue #470 / ADR-055 (two-tier snapshot;
-//	    migration 00101 adds the columns, migration 00102 adds the
+//	    migration 00109 adds the columns, migration 00110 adds the
 //	    per-tier unique index on snapshots)
 //	node_id, reassigned_at  — issue #533 / ADR-066 (Phase 2 / Gate A
 //	    shard key + Tier A4 cross-node rebalance)
@@ -8046,7 +8046,7 @@ func scanSnapshot(row pgx.Row) (Snapshot, error) {
 	// The 9th column is tier (issue #470 / ADR-055). Every query
 	// in this file now selects the tier column explicitly; the
 	// scan returns "init" if the column is NULL (legacy rows from
-	// before migration 00102 applied).
+	// before migration 00110 applied).
 	var tier *string
 	if err := row.Scan(&s.ID, &s.DeploymentID, &s.FCVersion, &s.MemBytes, &s.DiskBytes, &s.StorageKey, &s.Stale, &s.CreatedAt, &tier); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

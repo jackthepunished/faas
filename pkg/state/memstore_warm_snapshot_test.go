@@ -83,7 +83,7 @@ func TestMemStore_CreateSnapshot_TwoTierCoexist(t *testing.T) {
 		t.Fatalf("seed warm: %v", err)
 	}
 	// Duplicate init insert should hit ErrConflict (the same constraint
-	// migration 00102's UNIQUE INDEX enforces on PgStore).
+	// migration 00110's UNIQUE INDEX enforces on PgStore).
 	if _, err := m.CreateSnapshot(ctx, Snapshot{
 		DeploymentID: "00000000-0000-0000-0000-0000000000c1", FCVersion: "fc-1.0",
 		StorageKey: "snap/00000000-0000-0000-0000-0000000000c1/init-dup/mem", Tier: SnapshotTierInit,
