@@ -447,6 +447,9 @@ export class AppsService {
     since,
     limit = 200,
   }: {
+    /**
+     * App slug (lowercase, kebab-case; per-account unique).
+     */
     slug: string,
     /**
      * The per-wake correlation handle minted by the schedd
@@ -479,7 +482,7 @@ export class AppsService {
         'limit': limit,
       },
       errors: {
-        400: `Bad request — malformed \`since\` or \`limit\`.`,
+        400: `Malformed query parameter on the wake-timeline read — \`since\` not RFC 3339 or \`limit\` out of range.`,
         401: `code: unauthorized`,
         404: `No such app (slug) or wake_id is unknown.`,
         429: `429. Two response shapes:
