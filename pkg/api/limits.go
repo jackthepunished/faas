@@ -898,7 +898,7 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
-	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
+// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
 	// 365 days is the issue-189 spec: long enough to be
 	// "set-and-forget" for a customer's CI rotation, short enough
@@ -918,6 +918,18 @@ const (
 	// takes precedence; 0 in the per-account column means
 	// "atomic revocation" (no grace).
 	DefaultAPIKeyGraceWindowDays = 7
+
+	// Sidecar containers (issue #463 / ADR-068). The 2-sidecar
+	// hard cap is a GLOBAL constant, not a per-plan matrix field.
+	// Every plan inherits the same `SidecarCapMax = 2` (Free
+	// included). The cap is structurally tight: 1 init + 1
+	// sidecar is the smallest useful surface for a stateless
+	// workload, and the schema CHECK on `deployments.sidecars`
+	// (migration 00116) pins the cap at the second-line defence
+	// layer (migrations/00116_deployments_sidecars.sql). A future
+	// PR can grow this to a per-plan matrix if telemetry shows
+	// demand — the constant is the single source of truth.
+	SidecarCapMax = 2
 
 	// Streaming response caps (issue #471 / ADR-047). Free stays on the
 	// 25 MB / 300 s envelope (spec §4.1 baseline) so the abuse-floor
@@ -1324,6 +1336,20 @@ func (p Plan) MaxInstancesAllowed() bool {
 	return l.MaxInstancesAllowed
 }
 
+// SidecarAllowed (issue #463 / ADR-066 §Decision 1) reports whether
+// the plan may attach sidecars to a deployment. PR-A's accessor
+// returns true for every plan — the load-bearing gate is the GLOBAL
+// `SidecarCapMax` constant, not a per-plan matrix. A future PR
+// may grow this to a per-plan field (e.g. Free = 0, Hobby/Pro/Scale
+// = 2) if telemetry shows Free-tier abuse; for PR-A the method
+// exists so the apid handler can read a single source of truth
+// without inlining the global cap. The companion
+// `ErrSidecarNotAllowedOnPlan` constructor is reserved for that
+// future per-plan gate.
+func (p Plan) SidecarAllowed() bool {
+	return true
+}
+
 // EgressAllowlistAllowed reports whether the plan may set a per-app
 // outbound IP allowlist (ADR-031). Pro + Scale opt in; Free + Hobby
 // stay off — the abuse-desk hygiene this surface gives is a paid
@@ -1726,6 +1752,32 @@ func (l Limits) AdmissionMB() int {
 // to the overhead constant updates exactly one place.
 func BillableRAMMB(ramMB int) int {
 	return ramMB + PerVMOverheadMB
+}
+
+// BillableRAMMBWithSidecars is the sidecar-shape variant of
+// BillableRAMMB (issue #463 / ADR-066 §Decision 6). The billable
+// shutter is `plan.RAMMB + Σ(sidecar.ram_mb) + PerVMOverheadMB`:
+// sidecars share the per-VM overhead (one netns, one cgroup
+// scope per instance), but each sidecar contributes its own
+// RAM to the admission ceiling. Caller is responsible for
+// enforcing the SidecarCapMax bounds — this helper is purely
+// the arithmetic.
+//
+// PR-A defines the math; PR-B wires the consumer (schedd's
+// admission ledger + meterd's sampler). The sibling helper
+// (no-sidecars form) is BillableRAMMB — both shapes coexist.
+// A future cleanup can fold the single-arg form into this
+// helper as a variadic / empty-slice overload, but for PR-A
+// the two-form separation keeps the no-sidecar call sites
+// unambiguous.
+func BillableRAMMBWithSidecars(ramMB int, sidecarMBs []int) int {
+	total := ramMB + PerVMOverheadMB
+	for _, m := range sidecarMBs {
+		if m > 0 {
+			total += m
+		}
+	}
+	return total
 }
 
 // IdleTimeoutBounds returns the [floor, ceiling] seconds a customer may configure

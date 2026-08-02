@@ -409,6 +409,14 @@ type AppResponse struct {
 	WarmSnapshotMinMs       int `json:"warm_snapshot_min_ms"`
 }
 
+// Sidecars is the array shape on `CreateDeploymentRequest.Sidecars`
+// (issue #463 / ADR-066). Defined as a named slice so callers can
+// pin the `Validate(limits)` method (Go does not allow defining
+// methods on `[]T` directly, but `type T []Foo` makes the method
+// attach to the named alias). See Sidecar / Sidecars.Validate
+// below for the contract.
+type Sidecars []Sidecar
+
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
 // variant is used for tarball/dockerfile deploys).
 type CreateDeploymentRequest struct {
@@ -430,6 +438,16 @@ type CreateDeploymentRequest struct {
 	// tarball deploys ignore this field (Railpack path bypasses the
 	// verify hook entirely).
 	RequireSigned *bool `json:"require_signed,omitempty"`
+	// Sidecars (issue #463 / ADR-066) attaches up to 2 stateless
+	// sidecars (1 init + 1 sidecar) to the deployment. nil/empty
+	// = no sidecars. PR-A persists the field; PR-B wires the
+	// runtime effect (imaged + fcvm + guest-init + cgroup); PR-C
+	// wires e2e + observability. The handler calls
+	// `Sidecars.Validate(limits)` before persisting — a failed
+	// validation 400s the whole request (the sidecar is never
+	// silently dropped; the customer who set it expects it to
+	// apply).
+	Sidecars Sidecars `json:"sidecars,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -2005,4 +2023,188 @@ type AppSecurityRequest struct {
 // field so the CLI can render the new state without a follow-up GET.
 type AppSecurityResponse struct {
 	RequireSigned bool `json:"require_signed"`
+}
+
+// SidecarType is the closed enum on Sidecar.Type (issue #463 /
+// ADR-066 §Decision 1). The 2-sidecar cap is enforced as 1 init +
+// 1 sidecar per deployment — `Sidecars.Validate` rejects any other
+// shape (e.g. 2 init) with `ErrSidecarInvalidType`.
+type SidecarType string
+
+const (
+	// SidecarTypeInit runs ONCE before the main workload. Exit
+	// code 0 → continue, non-zero → fail the deploy with
+	// `failure_class=user_error` (PR-B's runtime contract). The
+	// common shape is a DB migrator: "run this image once, then
+	// start the app".
+	SidecarTypeInit SidecarType = "init"
+	// SidecarTypeSidecar runs ALONGSIDE the main workload for
+	// the lifetime of the instance. Common shape is a metrics
+	// scraper exposing /metrics on the tenant netns.
+	SidecarTypeSidecar SidecarType = "sidecar"
+)
+
+// sidecarNameRe matches RFC 1123 label: lowercase alphanumeric + dash,
+// 1..63 chars, starts with [a-z0-9]. Mirrors the `apps.slug` regex
+// shape so the dashboard and CLI can use the same identifier
+// grammar for app-sidecar and app-slug paths. Anchored.
+var sidecarNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// sidecarImageRe is the digest-pinning predicate for a sidecar
+// image reference. Mirrors the canonical pattern at
+// cmd/apid/handlers.go:484 (digestPinnedRE) — duplicated here
+// because pkg/api cannot import cmd/apid (the daemon import
+// direction is one-way: cmd/apid → pkg/api). PR-B's runtime
+// effect may promote this to a single shared helper in pkg/oci
+// if imaged's pull path also wants the API gate inline; for
+// PR-A the two-call-site duplication is acceptable.
+var sidecarImageRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}$`)
+
+// Sidecar is one entry in the deploy request's `sidecars` array
+// (issue #463 / ADR-066). At most one with type=init and at most
+// one with type=sidecar per app (the 2-sidecar hard cap, enforced
+// by `Sidecars.Validate` + the schema CHECK on
+// `deployments.sidecars` in migration 00095).
+//
+// The env map is stored envelope-sealed at rest via
+// `secretbox.SealBytes` (namespace="sidecar_env", mirrors
+// `AppSecret`'s namespace="secrets"); the wire shape is plaintext
+// (the apid handler seals post-decode). Plaintext values NEVER
+// appear in any `slog` field, audit payload, error string, or
+// HTTP response — pinned by capture-based tests in
+// cmd/apid/handlers_deployments_test.go.
+//
+// The image reference MUST be digest-pinned (`repo@sha256:...`).
+// Tag-pinning is the documented OCI supply-chain attack vector;
+// the runtime image already enforces this in pkg/imaged; the
+// API gate surfaces a useful error at the client side before
+// the request reaches imaged.
+//
+// RamMB is the cgroup memory ceiling for this sidecar (PR-B
+// wires the cgroup scope). 0 means "absent / inherit the app's
+// plan RAM" (the common case). 32..512 enforced at the API
+// layer; the "+8 MB" baseline (PerVMOverheadMB) is added once
+// per instance in PR-B's admission, not per sidecar.
+type Sidecar struct {
+	// Name matches the RFC 1123 label grammar. Unique within a
+	// single request. Required.
+	Name string `json:"name"`
+	// Image is the digest-pinned OCI reference (`repo@sha256:...`).
+	// Tag references rejected. Required.
+	Image string `json:"image"`
+	// Type is the closed enum (init | sidecar). At most one of
+	// each per deployment. Required.
+	Type SidecarType `json:"type"`
+	// Cmd is the argv array (the image's ENTRYPOINT is unchanged;
+	// Cmd overrides the CMD). Every element non-empty if present.
+	Cmd []string `json:"cmd,omitempty"`
+	// Env is the env map. Key per `ValidateEnvKey`
+	// (^[A-Z][A-Z0-9_]*$); per-value byte cap per
+	// `Limits.EnvValueMaxBytes`. Values are sealed at rest via
+	// secretbox. Plaintext on the wire; sealed on the column.
+	Env map[string]string `json:"env,omitempty"`
+	// Port is the listen port. 0 means "absent / fall back to
+	// image default" (1..65535 enforced at the API layer). The
+	// host-side plumbing that propagates this value to netns +
+	// vmmd waitReady + runners ships in PR-B / PR-C; PR-A only
+	// persists the field.
+	Port int `json:"port,omitempty"`
+	// RamMB is the cgroup memory ceiling for this sidecar. 0
+	// means "absent / inherit the plan RAM" (the common case).
+	// 32..512 enforced at the API layer.
+	RamMB int `json:"ram_mb,omitempty"`
+	// Essential defaults to true. If true and the sidecar exits
+	// non-zero: type=init → fail the deploy with
+	// `failure_class=user_error`; type=sidecar → restart-loop.
+	// If false: warn-log + restart-cap (PR-B's runtime contract).
+	// *bool so the wire form can distinguish "don't set" (nil)
+	// from "explicit true/false". PR-A only persists the field;
+	// the runtime effect is PR-B.
+	Essential *bool `json:"essential,omitempty"`
+}
+
+// Validate enforces ADR-066 §Decisions 1, 2, 4, 5: name grammar,
+// digest-pinning, type ∈ {init, sidecar}, cmd element non-empty,
+// env key grammar + per-value byte cap, port 0/absent or 1..65535,
+// ram_mb 0/inherit or 32..512, stateful denylist.
+//
+// Returns nil on success or a *Problem with RFC 7807 status 400
+// (or 403 for stateful image). The handler maps this directly to
+// api.WriteProblem; no further error wrapping needed.
+func (s *Sidecar) Validate(limits Limits) *Problem {
+	if s == nil {
+		return nil
+	}
+	if !sidecarNameRe.MatchString(s.Name) {
+		return ErrSidecarInvalidName(s.Name)
+	}
+	if !sidecarImageRe.MatchString(s.Image) {
+		return ErrSidecarInvalidImage(s.Name,
+			fmt.Errorf("not a digest-pinned reference (got %q)", s.Image))
+	}
+	if s.Type != SidecarTypeInit && s.Type != SidecarTypeSidecar {
+		return ErrSidecarInvalidType(s.Name, string(s.Type))
+	}
+	for i, c := range s.Cmd {
+		if c == "" {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid sidecar",
+				fmt.Sprintf("sidecar[%q].cmd[%d] is empty; every argv element must be non-empty.", s.Name, i))
+		}
+	}
+	for k, v := range s.Env {
+		if p := ValidateEnvKey(k); p != nil {
+			return p
+		}
+		if limits.EnvValueMaxBytes > 0 && len(v) > limits.EnvValueMaxBytes {
+			return NewProblem(http.StatusRequestEntityTooLarge,
+				CodeEnvVarValueTooLarge, "Invalid sidecar env",
+				fmt.Sprintf("sidecar[%q].env[%q] value is %d bytes; max is %d.",
+					s.Name, k, len(v), limits.EnvValueMaxBytes)).
+				WithLimit(int64(limits.EnvValueMaxBytes), int64(len(v)))
+		}
+	}
+	if s.Port != 0 && (s.Port < 1 || s.Port > 65535) {
+		return ErrSidecarInvalidPort(s.Port)
+	}
+	if s.RamMB != 0 && (s.RamMB < 32 || s.RamMB > 512) {
+		return ErrSidecarInvalidRamMB(s.RamMB)
+	}
+	return nil
+}
+
+// Validate enforces the 2-cap (global `SidecarCapMax` constant),
+// type-uniqueness (at most one init + one sidecar), name
+// uniqueness, and per-sidecar `Validate`.
+//
+// The limits argument is reserved for a future per-plan
+// `SidecarAllowed` gate (PR-A's accessor returns true for every
+// plan; the gate is currently unused). Passing the limits keeps
+// the signature forward-compatible without an ADR delta.
+func (ss Sidecars) Validate(limits Limits) *Problem {
+	if len(ss) == 0 {
+		return nil
+	}
+	if len(ss) > SidecarCapMax {
+		return ErrSidecarCapExceeded(len(ss), SidecarCapMax)
+	}
+	seen := map[SidecarType]int{}
+	names := map[string]bool{}
+	for i := range ss {
+		if p := ss[i].Validate(limits); p != nil {
+			return p
+		}
+		if names[ss[i].Name] {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid sidecar",
+				fmt.Sprintf("sidecar name %q appears more than once.", ss[i].Name))
+		}
+		names[ss[i].Name] = true
+		seen[ss[i].Type]++
+		if seen[ss[i].Type] > 1 {
+			return ErrSidecarInvalidType(ss[i].Name,
+				fmt.Sprintf("at most one sidecar of type %q (got %d)", ss[i].Type, seen[ss[i].Type]))
+		}
+	}
+	return nil
 }

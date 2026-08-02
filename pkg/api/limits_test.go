@@ -442,6 +442,74 @@ func TestPlanMinInstancesAllowed(t *testing.T) {
 	}
 }
 
+// TestSidecarCapMax pins the global constant (issue #463 / ADR-066
+// §Decision 1). The 2-sidecar hard cap is a GLOBAL const, not a
+// per-plan matrix field — a future PR may grow this to a per-plan
+// matrix if telemetry shows demand, but for PR-A every plan
+// inherits the same 2-cap. The companion schema CHECK on
+// `deployments.sidecars` (migration 00095) is the second-line
+// defence — see migrations/00095_deployments_sidecars_test.go.
+func TestSidecarCapMax(t *testing.T) {
+	if SidecarCapMax != 2 {
+		t.Errorf("SidecarCapMax = %d, want 2 (issue #463 / ADR-066 §Decision 1)", SidecarCapMax)
+	}
+}
+
+// TestPlanSidecarAllowed pins the per-plan accessor (issue #463 /
+// ADR-066 §Decision 1). PR-A's accessor returns true for every
+// plan — the load-bearing gate is the GLOBAL `SidecarCapMax`
+// constant, not a per-plan matrix. The accessor exists so a future
+// per-plan gate (Free = 0, paid = 2) can be wired in one place
+// without the apid handler branching on Plan strings. Mirrors
+// TestPlanMinInstancesAllowed above.
+func TestPlanSidecarAllowed(t *testing.T) {
+	for _, p := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
+		if !p.SidecarAllowed() {
+			t.Errorf("%s.SidecarAllowed() = false; PR-A returns true for all plans (global cap is the load-bearing gate)", p)
+		}
+	}
+}
+
+// TestBillableRAMMBWithSidecars pins the sidecar-shape billing
+// math (issue #463 / ADR-066 §Decision 6). The billable shutter
+// is `plan.RAMMB + Σ(sidecar.ram_mb) + PerVMOverheadMB`: sidecars
+// share the per-VM overhead (one netns, one cgroup scope per
+// instance), but each sidecar contributes its own RAM. PR-A
+// defines the math; PR-B wires the consumer (schedd's admission
+// ledger + meterd's sampler).
+func TestBillableRAMMBWithSidecars(t *testing.T) {
+	cases := []struct {
+		name       string
+		planRAM    int
+		sidecarMBs []int
+		want       int
+	}{
+		// No sidecars: matches BillableRAMMB exactly.
+		{"no-sidecars", 256, nil, 256 + PerVMOverheadMB},
+		// One init: 256 + 64 + 8 = 328.
+		{"one-init-64", 256, []int{64}, 256 + 64 + PerVMOverheadMB},
+		// Two sidecars: 256 + 64 + 32 + 8 = 360.
+		{"two-sidecars", 256, []int{64, 32}, 256 + 64 + 32 + PerVMOverheadMB},
+		// Empty sidecarMBs slice is the no-sidecars shape.
+		{"empty-slice", 256, []int{}, 256 + PerVMOverheadMB},
+		// Zero in the slice is a "absent / inherit" sentinel — skipped
+		// by the helper (the apid handler normalises ram_mb=0 → absent
+		// at validation time, but the helper is defensive anyway).
+		{"zero-skipped", 256, []int{0, 64}, 256 + 64 + PerVMOverheadMB},
+		// Scale shape: 1024 + 64 + 64 + 8 = 1160 (matches ADR-066
+		// §Financial-model addendum scenario column).
+		{"scale-two-sidecars", 1024, []int{64, 64}, 1024 + 64 + 64 + PerVMOverheadMB},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := BillableRAMMBWithSidecars(c.planRAM, c.sidecarMBs)
+			if got != c.want {
+				t.Errorf("BillableRAMMBWithSidecars(%d, %v) = %d, want %d", c.planRAM, c.sidecarMBs, got, c.want)
+			}
+		})
+	}
+}
+
 // TestPlanScaleUpTargetRPSAllowed pins the per-plan gate that apid's
 // updateApp handler uses for the per-app autoscale_target_rps field
 // (issue #172, ADR-037). Free/Hobby → false (Hobby lost the gate
