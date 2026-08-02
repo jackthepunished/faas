@@ -2,10 +2,21 @@
 
 - **Status:** accepted
 - **Date:** 2026-08-02
+- **Closes:** #517
 - **Decision:** Close issue #517. The work it scopes was decomposed across three
   merged PRs (PR-A, PR-B, PR-C) that together satisfy every acceptance criterion
   in the issue body. This ADR records that evidence and the one residual thread
   that is intentionally deferred to a follow-up issue.
+
+### Note on slot-collision hygiene
+
+This ADR is filed under number 067 because that was the next free slot at the
+time of writing. The repo's `docs/adr/` directory has duplicate-number collisions
+on **ADR-062** (two files) and **ADR-064** (two files) on `main` at the time of
+filing — both predate this PR and are not addressed here. If you are reading
+this ADR as part of a #517 closure review, treat the cited filenames (e.g.
+`docs/adr/064-wake-timeline-canonical-vocabulary.md`) as the source of truth,
+not the bare ADR number.
 
 ## Context
 
@@ -47,7 +58,7 @@ check.
 | 3 | Log filters enforced before data leaves the platform | PR-B `3c5dad17` + `f1634765` | `pkg/sched/logs.go` (server-side filter pipeline), `pkg/api/limits.go` (plan-gated limits), `pkg/apislogs/sse.go` |
 | 4 | Dropped / unavailable ranges explicit in wire protocol + tests | PR-B `3c5dad17` + `f1634765` | `pkg/sched/vmmclient.go::LogLine{IsGap, GapReason, GapToWrittenAt}`, `pkg/fcvm/logbuf/ring.go` (gap emission), `pkg/vmmdgrpc/logs.go` (gap frame wire), tests `pkg/fcvm/logbuf/ring_gap_test.go`, `pkg/vmmdgrpc/logs_gap_test.go`, `pkg/sched/logs_filter_test.go` |
 | 5 | Firecracker / jailer config failures summarized safely, customer-safe error reference, no host command lines exposed | **Partial** — see "Residual thread" below | `pkg/logsanitize/sanitize.go`, `pkg/grpcerr` |
-| 6 | No secrets / auth headers / cookies / request bodies / raw host paths in logs | PR-A `e3bf0981` + ADR-061 | envelope helper drops empty fields; `pkg/logsanitize` audit pattern |
+| 6 | No secrets / auth headers / cookies / request bodies / raw host paths in logs | PR-A `e3bf0981` | envelope helper drops empty fields (see `pkg/wire/logging.go`); `pkg/logsanitize` audit pattern. Note: PR-A's commit message references "ADR-061" but that slot was reassigned to iam-6; no standalone envelope-sanitization ADR was filed. |
 
 ## Test surface (verbatim test names a reviewer can `go test -run`)
 
@@ -98,12 +109,20 @@ sanitization with customer-safe error reference"*) to land that surface.
 
 ## Cross-references
 
-- `docs/adr/061-organizations-and-memberships.md` — envelope + correlation ADR
-  (PR-A).
+- `pkg/wire/logging.go`, `pkg/wire/grpcmetadata.go` — canonical envelope +
+  correlation helpers (PR-A #520, commit `e3bf0981`). No standalone ADR was
+  filed for the envelope shape; PR-A's commit message references "ADR-061" but
+  that slot was reassigned to iam-6 (organizations/memberships, PR #536)
+  before the logging ADR could land under its own number. Treat the wire
+  helpers as the source of truth.
 - `docs/adr/064-wake-timeline-canonical-vocabulary.md` — wake.* event vocabulary
-  (PR-C).
-- `docs/adr/041-migration-slot-reservation.md` — next free migration slot is
-  `00106` if the AC #5 follow-up needs one.
+  (PR-C). Note: at filing time `docs/adr/` has two ADR-064 files; cite by
+  filename, not by ADR number.
+- `docs/adr/041-migration-slot-reservation.md` — migration slot reservation
+  convention. If the AC #5 follow-up needs a schema change, the next free
+  slot must be discovered at PR-creation time via
+  `ls migrations/ | sort -n | tail -1` — slot numbers rot between this ADR
+  being written and any future follow-up landing.
 - `pkg/wire/logging.go`, `pkg/wire/grpcmetadata.go` — canonical envelope helpers.
 - `pkg/sched/logs.go` — server-side filter enforcement.
 - `pkg/fcvm/logbuf/ring.go` — guest log ring with seq + gap metadata.
@@ -111,10 +130,15 @@ sanitization with customer-safe error reference"*) to land that surface.
 - `pkg/api/sse.go` — public wire DTO (the `event: gap` frame).
 - `pkg/events/platform.go` — structured platform events fan-out.
 
-## Verification
+## Verification (defensive re-verification)
 
-- `go test -race -count=1 -timeout=15m ./...` must remain green on this PR.
-- `gofmt -l .` must be clean.
+This PR is docs-only — it touches no Go code, no proto, no OpenAPI. The
+following checks are run defensively so the merge commit cannot silently
+break a gate:
+
+- `go test -race -count=1 -timeout=15m ./...` must remain green.
+- `gofmt -l .` must be clean (a no-op for markdown, but verifies the rest of
+  the tree).
 - `golangci-lint run` must report 0 issues.
 - `make proto-check` must be clean (no `*.pb.go` drift).
 - `make spec-check` must be clean (no OpenAPI drift).
