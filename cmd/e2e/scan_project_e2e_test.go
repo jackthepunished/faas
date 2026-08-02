@@ -12,16 +12,16 @@
 //     step has its own unit tests; only an httptest+Postgres
 //     harness exercises them together.
 //
-//   - The repo-decomposition §4 fixture expectation: a single
-//     tarball carrying compose + Procfile + fly.toml + a
-//     convention dir produces a 6-entry / 7-unique-name plan
-//     (api from compose, web/worker/cron from Procfile,
-//     faas-fixture from fly.toml, services/api + services/worker
-//     from convention; the Procfile `worker` and compose `worker`
-//     are distinct entries under the (RootDir, Name) merge key
-//     and both emit), one managed entry (postgres db),
-//     tier=compose, can_apply=true on the Pro plan (5 unique
-//     apps under the 25 cap, 1 cron under the 20 cap).
+//   - The repo-decomposition §4 fixture expectation: a tarball
+//     carrying compose + Procfile + fly.toml + convention dirs
+//     produces a 7-entry / 5-unique-name plan (api from compose,
+//     web/worker/cron from Procfile, faas-fixture from fly.toml,
+//     api + worker from convention services/); the (RootDir, Name)
+//     merge key keeps the two `api` and two `worker` entries
+//     separate but they collapse under the unique-name view.
+//     One managed entry (postgres db), tier=compose,
+//     can_apply=true on the Pro plan (5 unique apps under the 25
+//     cap, 1 cron under the 20 cap).
 //
 //   - The over-quota gate: Free plan returns `can_apply=false`
 //     and `crons_not_allowed=true` for the same fixture (Free
@@ -69,17 +69,28 @@ import (
 
 // scanProjectFixture returns the bytes of a multi-tier customer
 // tarball. The shape mirrors a `git archive` of a real backend
-// monorepo: one top-level prefix, three Tier 1 sources
-// (compose + Procfile + fly.toml), two Tier 3 convention members
-// (services/{api,worker}/Dockerfile). The total compressed size
-// is well under the smallest plan's 100 MB cap (memory:
-// pkg/api/limits.go SourceTarballMaxMB[PlanFree] = 100).
+// monorepo: three Tier 1 sources (compose + Procfile + fly.toml)
+// and two Tier 3 convention members (services/{api,worker}/Dockerfile).
+//
+// Convention detector notes (pkg/reposcan/convention.go):
+//   - The detector walks `services/`, `apps/`, `packages/`, `cmd/`
+//     as TOP-LEVEL entries of the fsys — putting them under a
+//     `faas-fixture/` prefix means the detector never sees them.
+//   - The emitted workload Name is e.Name() — the bare directory
+//     name, NOT the full path. So `services/api` produces a
+//     workload named `api` (with RootDir="services/api"), which
+//     is a distinct (RootDir, Name) merge key from compose's
+//     `api` (RootDir=""). Both stay in the plan.
+//
+// The total compressed size is well under the smallest plan's
+// 100 MB cap (memory: pkg/api/limits.go SourceTarballMaxMB[PlanFree]
+// = 100).
 func scanProjectFixture(t *testing.T) []byte {
 	t.Helper()
 	const composeYML = `services:
   api:
     build:
-      context: services/api
+      context: .
     environment:
       DATABASE_URL: postgres://localhost/api
       REDIS_URL: redis://localhost:6379
@@ -87,7 +98,7 @@ func scanProjectFixture(t *testing.T) []byte {
       - "8080:8080"
   worker:
     build:
-      context: services/worker
+      context: .
     environment:
       DATABASE_URL: postgres://localhost/api
       REDIS_URL: redis://localhost:6379
@@ -117,11 +128,11 @@ primary_region = "fra"
     handlers = ["http"]
 `
 	files := map[string]string{
-		"faas-fixture/docker-compose.yml":         composeYML,
-		"faas-fixture/Procfile":                   procfile,
-		"faas-fixture/fly.toml":                   flyTOML,
-		"faas-fixture/services/api/Dockerfile":    "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n",
-		"faas-fixture/services/worker/Dockerfile": "FROM alpine:3.19\nCMD [\"./worker\"]\n",
+		"docker-compose.yml":         composeYML,
+		"Procfile":                   procfile,
+		"fly.toml":                   flyTOML,
+		"services/api/Dockerfile":    "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n",
+		"services/worker/Dockerfile": "FROM alpine:3.19\nCMD [\"./worker\"]\n",
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -229,16 +240,23 @@ func workloadNames(plan api.PlanResponse) []string {
 // expectation on the Pro plan (apps under cap, crons under cap).
 // The fixture trips every Tier 1 detector (compose + Procfile +
 // fly.toml) and the Tier 3 convention detector (services/{api,
-// worker}/Dockerfile). The plan surface carries 6 workload
-// entries (the Procfile `worker` and compose `worker` are
-// distinct under the (RootDir, Name) merge key, so the entries
-// for `worker` are emitted twice — once with rootDir="" and once
-// with rootDir="services/worker"). By unique Name the plan has
-// 7 workloads: api, cron, faas-fixture, services/api,
-// services/worker, web, worker. Plus the postgres db managed
-// entry and tier=compose.
+// worker}/Dockerfile). The plan surface carries 7 workload
+// entries:
+//
+//   - api          (compose, rootDir="")
+//   - api          (convention, rootDir="services/api")
+//   - cron         (Procfile, rootDir="")
+//   - faas-fixture (fly.toml, rootDir="")
+//   - web          (Procfile, rootDir="")
+//   - worker       (Procfile, rootDir="")
+//   - worker       (convention, rootDir="services/worker")
+//
+// Unique workload Names (5): api, cron, faas-fixture, web, worker.
+// Plus the postgres db managed entry and tier=compose.
+//
+// The (RootDir, Name) merge key keeps the two `api` and two
+// `worker` entries separate — see pkg/reposcan/scan.go Workload.Key.
 func TestScanProject_MultiTierFixture_UnderQuota(t *testing.T) {
-	t.Parallel()
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -272,11 +290,16 @@ func TestScanProject_MultiTierFixture_UnderQuota(t *testing.T) {
 	if plan.CronsNotAllowed {
 		t.Errorf("CronsNotAllowed = true on Pro plan; cron cap is %d", plan.LimitCrons)
 	}
-	wantNames := []string{"api", "cron", "faas-fixture", "services/api", "services/worker", "web", "worker"}
+	wantNames := []string{"api", "cron", "faas-fixture", "web", "worker"}
 	if got := workloadNames(plan); !equalStrings(got, wantNames) {
 		t.Errorf("workload names mismatch:\n got: %v\nwant: %v", got, wantNames)
 	}
-	// Per-workload field spot checks.
+	// Per-workload field spot checks. WorkloadName-based map dedupes
+	// across (RootDir, Name) merge-key collisions; the canonical
+	// field expectation lands on the compose / Procfile entry
+	// because they're the first emitted under reposcan's stable
+	// sort. Compose's `api` has rootDir=""; the convention `api`
+	// is a separate entry the test asserts the count on above.
 	byName := map[string]api.PlanWorkload{}
 	for _, w := range plan.Workloads {
 		byName[w.Name] = w
@@ -321,7 +344,6 @@ func TestScanProject_MultiTierFixture_UnderQuota(t *testing.T) {
 // (per pkg/api/limits.go PlanFree). The app-count check stays
 // under cap (5/1), so the only failing axis is the cron gate.
 func TestScanProject_FreePlan_CronNotAllowed(t *testing.T) {
-	t.Parallel()
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -370,7 +392,6 @@ func TestScanProject_FreePlan_CronNotAllowed(t *testing.T) {
 // signal). The filter accepts a comma-separated workload name
 // list; entries not matching are dropped.
 func TestScanProject_OnlyFilter_ManagedUnaffected(t *testing.T) {
-	t.Parallel()
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -410,7 +431,6 @@ func TestScanProject_OnlyFilter_ManagedUnaffected(t *testing.T) {
 // regression in the multipart-extract-seam pair is caught at CI
 // time, not on the EX44 box.
 func TestScanProject_NestedTarballEntries(t *testing.T) {
-	t.Parallel()
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -435,19 +455,26 @@ func TestScanProject_NestedTarballEntries(t *testing.T) {
 	if len(plan.Workloads) == 0 {
 		t.Errorf("nested-entry scan returned 0 workloads; the post-#528 fix landed but wire contract regressed")
 	}
-	// The fixture carries `services/api/Dockerfile` (two levels of
-	// nesting under the top-level prefix); the convention detector
-	// must surface the corresponding workload. This is the
-	// load-bearing wire assertion that the nested-entry seam works.
+	// The fixture carries `services/api/Dockerfile` (nested two
+	// levels under repo root); the convention detector must surface
+	// the corresponding workload. The detector emits Name=e.Name()
+	// (just `api`) with RootDir="services/api", so the
+	// load-bearing wire assertion looks for the RootDir tuple,
+	// not the bare name. This is what pins the post-#528 nested-
+	// entry seam from the wire surface — a future regression in
+	// the multipart-extract path that drops nested entries would
+	// drop this workload entirely (compose's `api` has rootDir=""
+	// and is a distinct entry under the (RootDir, Name) merge
+	// key).
 	var sawServicesAPI bool
 	for _, w := range plan.Workloads {
-		if w.Name == "services/api" {
+		if w.RootDir == "services/api" {
 			sawServicesAPI = true
 		}
 	}
 	if !sawServicesAPI {
-		t.Errorf("expected services/api workload (nested entry seam); workloads = %+v",
-			workloadNames(plan))
+		t.Errorf("expected convention-detected workload with root_dir=services/api (nested entry seam); workloads = %+v",
+			plan.Workloads)
 	}
 }
 
