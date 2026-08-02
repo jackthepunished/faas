@@ -1638,6 +1638,59 @@ func (q *Queries) ListEvents(ctx context.Context, db DBTX, arg ListEventsParams)
 	return items, nil
 }
 
+const listEventsByWakeID = `-- name: ListEventsByWakeID :many
+select id, at, actor, kind, subject, data
+from events
+where data->>'wake_id' = $1
+  and at > $2
+order by at asc
+limit $3
+`
+
+type ListEventsByWakeIDParams struct {
+	Data  []byte
+	At    pgtype.Timestamptz
+	Limit int32
+}
+
+// issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
+// Filters on the jsonb expression index events_wake_id_idx
+// (migrations/00092_events_wake_id_idx.sql) and orders by at ASC
+// so the customer-facing timeline endpoint surfaces a forward
+// narrative. The $2 lower bound is the `since` RFC 3339 cursor
+// from the endpoint query string; the $3 limit is bounded to
+// 1000 by the handler. Index path: partial index on
+// (data->>'wake_id') WHERE data->>'wake_id' IS NOT NULL means
+// only rows with a wake_id tag (i.e. the 13 wake.* kinds) are
+// indexed — legacy audit rows are not in scope of PR-C, see
+// ADR-064 §"Compatibility".
+func (q *Queries) ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]Event, error) {
+	rows, err := db.Query(ctx, listEventsByWakeID, arg.Data, arg.At, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Event{}
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.At,
+			&i.Actor,
+			&i.Kind,
+			&i.Subject,
+			&i.Data,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listInstancesForApp = `-- name: ListInstancesForApp :many
 select id, app_id, deployment_id, state, coalesce(netns, ''), coalesce(guest_uid, 0),
        coalesce(host_ip::text, ''), ram_mb, started_at, last_request_at, parked_at

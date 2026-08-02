@@ -4699,6 +4699,45 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 	return out, nil
 }
 
+// ListEventsByWakeID (issue #517 / PR-C, ADR-064) — the
+// in-memory twin of the pgstore ListEventsByWakeID sqlc query.
+// Walks the events slice forward (oldest → newest) so the
+// customer-facing timeline reads as a forward narrative, and
+// filters on the jsonb data.wake_id key (the index shape on the
+// production path). since is the optional RFC 3339 lower bound;
+// limit is the hard cap (the handler enforces max 1000).
+func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Event
+	// Walk forward (i=0 oldest, i++ newest) so the returned
+	// slice is in at-ASC order. Mirrors the ORDER BY at ASC in
+	// the sqlc query.
+	for i := 0; i < len(m.events) && (limit <= 0 || len(out) < limit); i++ {
+		e := m.events[i]
+		if !e.At.After(since) {
+			continue
+		}
+		// The wake_id is a key on the jsonb data blob; the
+		// in-memory Event has Data as []byte. Decode lazily
+		// — the per-row cost is one json.Unmarshal + map
+		// lookup, amortised across the test corpus. For very
+		// high-volume unit tests this would matter, but the
+		// list is bounded by MemStore's test fixture sizes.
+		var payload struct {
+			WakeID string `json:"wake_id"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.WakeID != wakeID {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
 // --- Usage ------------------------------------------------------------------
 
 // AppendUsage writes one (instance, minute) usage row and updates the

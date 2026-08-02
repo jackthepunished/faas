@@ -225,6 +225,25 @@ values ($1, $2, $3, $4);
 select id, at, actor, kind, subject, data
 from events where subject = $1 order by at desc limit $2;
 
+-- name: ListEventsByWakeID :many
+-- issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
+-- Filters on the jsonb expression index events_wake_id_idx
+-- (migrations/00092_events_wake_id_idx.sql) and orders by at ASC
+-- so the customer-facing timeline endpoint surfaces a forward
+-- narrative. The $2 lower bound is the `since` RFC 3339 cursor
+-- from the endpoint query string; the $3 limit is bounded to
+-- 1000 by the handler. Index path: partial index on
+-- (data->>'wake_id') WHERE data->>'wake_id' IS NOT NULL means
+-- only rows with a wake_id tag (i.e. the 13 wake.* kinds) are
+-- indexed — legacy audit rows are not in scope of PR-C, see
+-- ADR-064 §"Compatibility".
+select id, at, actor, kind, subject, data
+from events
+where data->>'wake_id' = $1
+  and at > $2
+order by at asc
+limit $3;
+
 -- name: AppendUsage :exec
 -- Idempotent on (instance_id, minute) for mb_seconds / requests
 -- (M7 hardening, PR feat/m7-beta-hardening): a redelivered

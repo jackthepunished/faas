@@ -1669,6 +1669,15 @@ type Store interface {
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
+	// ListEventsByWakeID (issue #517 / PR-C, ADR-064) is the
+	// wake-timeline read-side query. Filters on the jsonb
+	// expression index events_wake_id_idx
+	// (migrations/00092_events_wake_id_idx.sql) and orders by at
+	// ASC so the customer-facing timeline endpoint surfaces a
+	// forward narrative. The since parameter is the RFC 3339
+	// lower bound (zero-value passes the floor); limit is
+	// bounded to 1000 by the handler.
+	ListEventsByWakeID(ctx context.Context, wakeID string, since time.Time, limit int) ([]Event, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first

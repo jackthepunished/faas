@@ -5774,6 +5774,52 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 	return out, rows.Err()
 }
 
+// ListEventsByWakeID (issue #517 / PR-C, ADR-064) — the
+// production read-side query for the customer-facing
+// GET /v1/apps/{slug}/wakes/{wake_id}/timeline endpoint. Filters
+// on the jsonb expression index events_wake_id_idx
+// (migrations/00092_events_wake_id_idx.sql) and orders by at ASC
+// so the timeline reads as a forward narrative. Uses raw SQL
+// (mirroring AppendEvent / ListEvents) so the method shape stays
+// consistent with the rest of the events table surface — the
+// sqlc-generated ListEventsByWakeID in pkg/state/sqlc is used by
+// the migration test suite, not the production reader.
+func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var rows pgx.Rows
+	var err error
+	if since.IsZero() {
+		rows, err = s.pool.Query(ctx,
+			`select id, at, actor, kind, subject, data from events
+			 where data->>'wake_id' = $1
+			 order by at asc limit $2`,
+			wakeID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`select id, at, actor, kind, subject, data from events
+			 where data->>'wake_id' = $1 and at > $2
+			 order by at asc limit $3`,
+			wakeID, since, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, err
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // --- usage -------------------------------------------------------------------
 
 func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
