@@ -737,19 +737,67 @@ type AccountLimits struct {
 }
 
 // APIKeyResponse is an API key returned to the customer. The plaintext
-// appears ONLY on creation (POST /v1/keys), never on GET — only the prefix
-// + label + scopes + last_used_at + id are returned thereafter. Scopes is
-// the explicit permission set attached to the key (e.g. ["admin"],
+// appears ONLY on creation (POST /v1/keys) and rotation
+// (POST /v1/keys/{id}/rotate), never on GET — only the prefix + label
+// + scopes + last_used_at + id + status are returned thereafter. Scopes
+// is the explicit permission set attached to the key (e.g. ["admin"],
 // ["apps:read", "deploy:write"]); see ADR-034 rev2.
+//
+// IAM-5 (issue #189): ExpiresAt is RFC3339; omitted when the key never
+// expires (admin keys default to nil expiry). Status is one of "active",
+// "grace", "revoked". RevokedAt mirrors ExpiresAt semantics. RotatedFromID
+// is the predecessor key's id when this row was minted by rotateKey;
+// empty otherwise.
 type APIKeyResponse struct {
-	ID         string   `json:"id"`
-	Prefix     string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
-	Label      string   `json:"label,omitempty"`
-	Scopes     []string `json:"scopes"`
-	LastUsedAt string   `json:"last_used_at,omitempty"`
-	CreatedAt  string   `json:"created_at"`
-	// Plaintext appears ONLY on the create response, never persisted.
+	ID            string   `json:"id"`
+	Prefix        string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
+	Label         string   `json:"label,omitempty"`
+	Scopes        []string `json:"scopes"`
+	LastUsedAt    string   `json:"last_used_at,omitempty"`
+	CreatedAt     string   `json:"created_at"`
+	ExpiresAt     string   `json:"expires_at,omitempty"`
+	Status        string   `json:"status,omitempty"`          // "active"|"grace"|"revoked"
+	RevokedAt     string   `json:"revoked_at,omitempty"`      // RFC3339
+	RotatedFromID string   `json:"rotated_from_id,omitempty"` // predecessor key id
+	// Plaintext appears ONLY on the create + rotate responses, never persisted.
 	Plaintext string `json:"plaintext,omitempty"`
+}
+
+// RotateKeyResponse is the body of POST /v1/keys/{id}/rotate
+// (issue #189 / IAM-5). Key is the new key (status='active'); Key is
+// the loader-facing shape (id, prefix, label, scopes, status). The
+// KeyPlaintext is returned exactly once; the old plaintext is
+// NEVER returned (only the hash is stored). OldKeyExpiresAt is the
+// grace deadline applied to the old key — the customer's CI rotates
+// over by then. OldKeyID is the predecessor's id (matches Key.RotatedFromID).
+type RotateKeyResponse struct {
+	Key             APIKeyResponse `json:"key"`
+	KeyPlaintext    string         `json:"key_plaintext"`
+	OldKeyID        string         `json:"old_key_id"`
+	OldKeyExpiresAt string         `json:"old_key_expires_at"` // RFC3339
+}
+
+// SetGraceWindowRequest is the body of
+// PATCH /v1/account/keys/grace_window_days (issue #189 / IAM-5).
+// Days is the per-account override for the rotation grace window
+// (issue #189 / IAM-5). Days < 0 is rejected; Days == 0 means
+// "atomic rotation" (no grace); a positive value is the number of
+// days the old key remains usable after the new one is minted.
+// Omit (or pass null) to clear the override and fall back to the
+// plan default (api.DefaultAPIKeyGraceWindowDays = 7).
+type SetGraceWindowRequest struct {
+	Days *int `json:"days"`
+}
+
+// GraceWindowResponse is the body of GET /v1/account/keys/grace_window_days
+// (issue #189 / IAM-5). Days is the per-account override; null when
+// the account has no override (PlanDefault wins). PlanDefault is the
+// plan-level default the rotation handler uses when the row is null
+// — surfaced here so the dashboard can render "Plan default: 7 days"
+// next to the override field.
+type GraceWindowResponse struct {
+	Days        *int `json:"days"`
+	PlanDefault int  `json:"plan_default"`
 }
 
 // CreateKeyRequest is the body of POST /v1/keys. Label is optional

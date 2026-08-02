@@ -930,6 +930,35 @@ func (c *Client) DeleteKey(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/keys/"+id, nil, nil)
 }
 
+// RotateKey mints a new key and demotes the old key in a single
+// transaction (issue #189 / IAM-5). The new plaintext is returned
+// exactly once; the old plaintext is never re-issued.
+//
+// OldKey.ExpiresAt is the GRACE deadline applied to the old key
+// (set to now() when grace_window_days=0, atomic rotation). The
+// customer's CI captures the new plaintext at rotation time and
+// rolls over before old_key_expires_at.
+func (c *Client) RotateKey(ctx context.Context, id string) (RotateKeyResponse, error) {
+	var out RotateKeyResponse
+	return out, c.do(ctx, "POST", "/v1/keys/"+id+"/rotate", nil, &out)
+}
+
+// GetGraceWindow returns the customer's per-account rotation
+// grace-window override (issue #189 / IAM-5). days=null means
+// "no override" — the rotation handler uses the plan default.
+func (c *Client) GetGraceWindow(ctx context.Context) (GraceWindowResponse, error) {
+	var out GraceWindowResponse
+	return out, c.do(ctx, "GET", "/v1/account/keys/grace_window_days", nil, &out)
+}
+
+// SetGraceWindow writes the per-account rotation grace-window
+// override. days=0 means atomic rotation; days=nil clears the
+// override and falls back to the plan default.
+func (c *Client) SetGraceWindow(ctx context.Context, days *int) (GraceWindowResponse, error) {
+	var out GraceWindowResponse
+	return out, c.do(ctx, "PATCH", "/v1/account/keys/grace_window_days", SetGraceWindowRequest{Days: days}, &out)
+}
+
 // Audit events (IAM-4, ADR-035). The events table is append-only
 // (spec §5), so this surface is read-only by design. since and
 // kindPrefix are optional — pass empty strings to read the full

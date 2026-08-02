@@ -156,6 +156,14 @@ type server struct {
 	// apid_op_duration_seconds without each one wrapping itself.
 	// Nil = observation disabled (unit tests).
 	ops *wire.OpsMetrics
+	// graceWindowCache (issue #189 / IAM-5) caches the per-account
+	// rotation grace override (accounts.key_grace_window_days). The
+	// bearer-key auth path does NOT read it (the lazy expiry gate
+	// is in pkg/state.AuthenticateKey); only rotateKey reads it,
+	// and a 60 s TTL bounds the admin-update propagation latency.
+	// nil-safe: the rotate handler queries the store directly when
+	// the cache is nil (the dev/test boot path).
+	graceWindowCache *graceWindowCache
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -521,6 +529,12 @@ func newServerWithDeps(
 		// store.ApplyProjectPlan directly; post-PR-G every
 		// workload-mutating path goes through Service.Reconcile.
 		reconcileSvc: buildReconcileService(store, aud.pkgAuditor(), log),
+		// IAM-5 (issue #189): rotation grace-window cache. 60 s
+		// TTL bounds the admin-update propagation latency; the
+		// invalidate-on-write path closes the loop. nil in
+		// legacy tests that pre-date the cache — the rotateKey
+		// handler falls back to the store directly.
+		graceWindowCache: newGraceWindowCache(),
 	}
 }
 
@@ -562,6 +576,16 @@ func (s *server) handler() http.Handler {
 	// /v1/account carries the method default (read or admin).
 	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.whoami))))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan)))))
+	// IAM-5 (issue #189): per-account rotation grace-window
+	// override. Admin-only because the rotation primitive is
+	// admin-only (POST /v1/keys/{id}/rotate mirrors the same
+	// scope). GET surfaces the current value (with the plan
+	// default alongside so the dashboard can render "Override: 7
+	// days / Plan default: 7 days"); PATCH writes the override
+	// and invalidates the in-process cache so the next rotation
+	// sees the new value.
+	mux.HandleFunc("GET /v1/account/keys/grace_window_days", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.getGraceWindow))))
+	mux.HandleFunc("PATCH /v1/account/keys/grace_window_days", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.setGraceWindow))))
 	// G6 account self-service (spec §17 G6, ADR-021). /v1/account/dpa
 	// is intentionally mounted without s.auth — the DPA is a public
 	// artefact a prospect reads before signing up. The export + delete
@@ -731,6 +755,12 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listKeys))))
 	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.createKey))))
 	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteKey))))
+	// IAM-5 (issue #189): rotation endpoint. Admin-only because
+	// rotation mints a new key that retains the predecessor's
+	// scopes — limiting to admin matches the existing key-mint
+	// gate (POST /v1/keys) and avoids a non-admin scope-expanding
+	// via the rotation path.
+	mux.HandleFunc("POST /v1/keys/{id}/rotate", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.rotateKey))))
 
 	// Operator-only billing surface (issue #279). The admin allowlist
 	// is enforced inside the handler (adminAllows), not just at the

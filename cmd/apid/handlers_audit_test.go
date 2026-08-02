@@ -94,7 +94,14 @@ func TestAuditEvents_KeyMintEmitsEvent(t *testing.T) {
 }
 
 // TestAuditEvents_KeyDeleteEmitsEvent drives DELETE /v1/keys/{id}
-// and asserts a key.deleted row landed.
+// and asserts a key.revoked row landed.
+//
+// IAM-5 (issue #189): the audit kind is `key.revoked` (not the
+// legacy `key.deleted`) because the operation is now a soft
+// revoke — the row stays in the table for audit lineage
+// (rotated_from_id chain). The dashboard's "Keys" page filters
+// by reason in data.reason ("manual" vs "rotation" vs
+// "expired").
 func TestAuditEvents_KeyDeleteEmitsEvent(t *testing.T) {
 	e := setup(t, api.PlanPro)
 
@@ -121,13 +128,13 @@ func TestAuditEvents_KeyDeleteEmitsEvent(t *testing.T) {
 	}
 	var found *state.Event
 	for i := range rows {
-		if rows[i].Kind == "key.deleted" {
+		if rows[i].Kind == "key.revoked" {
 			found = &rows[i]
 			break
 		}
 	}
 	if found == nil {
-		t.Fatalf("no key.deleted event row; rows=%+v", rows)
+		t.Fatalf("no key.revoked event row; rows=%+v", rows)
 	}
 	var data map[string]any
 	if err := json.Unmarshal(found.Data, &data); err != nil {
