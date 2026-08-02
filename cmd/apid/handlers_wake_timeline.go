@@ -106,10 +106,13 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 				"Invalid limit", "limit must be a positive integer"))
 			return
 		}
-		if n > wakeTimelineLimitMax {
-			n = wakeTimelineLimitMax
-		}
-		limit = n
+		// Cap at the SDK-documented max. Using min(n, Max) here
+		// (instead of an if/reassign) keeps the bound visible to
+		// CodeQL's go/uncontrolled-allocation-size taint tracking —
+		// the if-reassign pattern flow-traces n as user-controlled
+		// into the make(…,0,limit) below and fires a CWE-770 false
+		// positive. The min() form is a direct dataflow cap.
+		limit = min(n, wakeTimelineLimitMax)
 	}
 	// Over-read by 1 so we can detect "is there a next page?" without
 	// a second SQL roundtrip. The partial index events_wake_id_idx
