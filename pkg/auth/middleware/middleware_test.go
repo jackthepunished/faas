@@ -293,6 +293,103 @@ func TestRequireSession_BearerInvalidFormat(t *testing.T) {
 	}
 }
 
+// --- IAM-5: API-key lifecycle sentinels (issue #189) ---------------------
+
+// TestRequireSession_BearerExpiredKeyReturns401 pins the
+// middleware→RFC 7807 contract for the api_key_expired path.
+// The store has already lazily marked the key revoked before
+// the middleware sees the sentinel; the middleware's only job
+// is (a) emit key.expired audit, (b) write 401 api_key_expired.
+//
+// The audit row is the load-bearing piece — operations use it
+// to alert customers that their key expired and they need to
+// rotate. Without the audit, the 401 looks identical to a
+// generic auth failure and the dashboard can't surface
+// "key expired, rotate me" copy.
+func TestRequireSession_BearerExpiredKeyReturns401(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	hash := api.HashAPIKey(validBearerKey)
+	authn.authKey[string(hash)] = authResult{
+		acct: mkActiveAccount("acct-1"),
+		key:  mkKey("key-1"),
+		err:  state.ErrAPIKeyExpired,
+	}
+
+	mw := newMW(t, authn, nil, nil, audit)
+	hits := 0
+	h := mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) { hits++ })
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", map[string]string{"Authorization": "Bearer " + validBearerKey}, nil)
+	h(rec, r)
+
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (expired key must 401)", hits)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), api.CodeAPIKeyExpired) {
+		t.Errorf("body missing %s: %q", api.CodeAPIKeyExpired, rec.Body.String())
+	}
+	// Audit: one key.expired row, no other key.* event.
+	rows := audit.rowsOf("key.expired")
+	if len(rows) != 1 {
+		t.Fatalf("key.expired audit rows = %d, want 1", len(rows))
+	}
+	if rows[0].data["key_id"] != "key-1" {
+		t.Errorf("audited key_id = %v, want key-1", rows[0].data["key_id"])
+	}
+	if len(audit.rowsOf("key.auth_rejected_revoked")) != 0 {
+		t.Errorf("key.auth_rejected_revoked should not fire on expired (distinct sentinel)")
+	}
+}
+
+// TestRequireSession_BearerRevokedKeyReturns401 pins the
+// api_key_revoked path. The sentinel is terminal —
+// auth_rejected_revoked is the audit kind, distinct from
+// key.expired because the customer recover path differs
+// (revoked = re-mint; expired = rotate).
+func TestRequireSession_BearerRevokedKeyReturns401(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	hash := api.HashAPIKey(validBearerKey)
+	authn.authKey[string(hash)] = authResult{
+		acct: mkActiveAccount("acct-1"),
+		key:  mkKey("key-1"),
+		err:  state.ErrAPIKeyRevoked,
+	}
+
+	mw := newMW(t, authn, nil, nil, audit)
+	hits := 0
+	h := mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) { hits++ })
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", map[string]string{"Authorization": "Bearer " + validBearerKey}, nil)
+	h(rec, r)
+
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (revoked key must 401)", hits)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), api.CodeAPIKeyRevoked) {
+		t.Errorf("body missing %s: %q", api.CodeAPIKeyRevoked, rec.Body.String())
+	}
+	rows := audit.rowsOf("key.auth_rejected_revoked")
+	if len(rows) != 1 {
+		t.Fatalf("key.auth_rejected_revoked audit rows = %d, want 1", len(rows))
+	}
+	if rows[0].data["key_id"] != "key-1" {
+		t.Errorf("audited key_id = %v, want key-1", rows[0].data["key_id"])
+	}
+	if len(audit.rowsOf("key.expired")) != 0 {
+		t.Errorf("key.expired should not fire on revoked (distinct sentinel)")
+	}
+}
+
 func TestRequireSession_BearerInactiveAccount(t *testing.T) {
 	authn := newFakeAuthn()
 	hash := api.HashAPIKey(validBearerKey)

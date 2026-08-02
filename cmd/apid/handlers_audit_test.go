@@ -143,6 +143,15 @@ func TestAuditEvents_KeyDeleteEmitsEvent(t *testing.T) {
 	if data["key_id"] != created.ID {
 		t.Errorf("Data.key_id = %v, want %s", data["key_id"], created.ID)
 	}
+	// IAM-5 (issue #189): the soft-revoke path stamps
+	// data.reason = "manual"; rotation stamps "rotation"; the
+	// lazy-expiry gate (state.AuthenticateKey) is the only
+	// emitter of "expired". The dashboard's "Keys" page filters
+	// by this field, so the contract is load-bearing. Pin it
+	// here so a future refactor can't silently drop the field.
+	if reason, _ := data["reason"].(string); reason != "manual" {
+		t.Errorf("Data.reason = %q, want %q", reason, "manual")
+	}
 }
 
 // TestAuditEvents_AccountDeletionScheduledEmitsEvent (IAM-4) drives
