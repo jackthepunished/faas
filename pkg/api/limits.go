@@ -785,6 +785,20 @@ const (
 	// nested KVM (Lima caveat, spec §14).
 	CharacterizationHostDeadline = 4 * time.Second
 
+	// LogRingBufferBytes is the capacity of the Supervisor's
+	// stdout/stderr ring buffer (ADR-051 Phase 4 Slice A PR-B).
+	// 64 KiB covers the boot-time tail of any realistic customer
+	// app (a Node cold start, a Python import chain) without
+	// forcing a multi-page journal capture on every cold boot.
+	// Characterized at plan time: a typical FastAPI app's
+	// first-second log volume is ~4-8 KiB, so 64 KiB preserves the
+	// entire boot window with margin. The wire-side truncation
+	// (VsockCharacterizationMaxBody, 32 KiB) still clamps the
+	// reported LogTail; this buffer is the over-budget source the
+	// report reads from. A future bump to VsockCharacterizationMaxBody
+	// must be matched here.
+	LogRingBufferBytes = 64 * 1024
+
 	// Build artifact export (M6): vmmd loopback-mounts the chroot-local drive1
 	// on Destroy to copy out /build/out/image.tar (and friends). 4 GiB is
 	// well above the §14 target (~130 MB) so it's not the limiting factor; it's

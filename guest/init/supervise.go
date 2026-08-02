@@ -3,8 +3,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"sync/atomic"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // Supervisor runs the customer app and restarts it on crash up to Max times,
@@ -28,10 +31,19 @@ type Supervisor struct {
 	// lastExitCode is the terminal exit code observed by the most-
 	// recent successful Start. -1 until the first observation.
 	lastExitCode atomic.Int64
-	// LastLogBytes is a 64 KiB ring buffer of the supervisor's
-	// stdout+stderr capture. Reset on every restart. Read by
-	// characterize_linux.go's RingBufferTail() callback to populate
-	// the report's LogTail field for the deploy row.
+	// lastLog is the supervisor's stdout/stderr ring buffer, allocated
+	// lazily on the first LogBuffer() call. Reset on every restart by
+	// TrackCommand (see TrackCommand's doc comment for the reset-
+	// before-store ordering rationale). Read by characterize_linux.go's
+	// RingBufferTail() callback via LogTail() to populate the report's
+	// LogTail field for the deploy row.
+	//
+	// atomic.Pointer matches lastCmd above — Supervisor stays
+	// non-copyable per the copylocks/atomic noCopy invariant. The
+	// lazy-allocation pattern means a Supervisor that never has its
+	// log buffer read pays zero allocation cost (matters for tests
+	// that exercise the supervisor with no characterize probe).
+	lastLog atomic.Pointer[ringBuffer]
 }
 
 // LastExitCode returns -1 if no fork has observed an exit yet;
@@ -49,7 +61,16 @@ func (s *Supervisor) LastExitCode() int {
 // that calls cmd.Run(). A forked-but-not-tracked cmd means
 // LastAppPID returns -1 and the characterize probe's bind-wait
 // times out (correctly classified as `job`).
+//
+// Also resets the log ring buffer (if allocated) so the new fork
+// starts a fresh 64 KiB window. Reset-before-store ordering: a
+// concurrent LastAppPID+LogTail reader that sees the new PID will
+// also see the empty buffer, never the previous restart's bytes
+// paired with the new PID. The characterize probe spins anyway, so
+// either ordering is "correct"; reset-before-store is the slightly
+// safer pairing for operators reading the LogTail audit.
 func (s *Supervisor) TrackCommand(cmd *exec.Cmd) {
+	s.resetLog() // fresh window per restart (Slice A PR-B contract)
 	s.lastCmd.Store(cmd)
 }
 
@@ -60,6 +81,59 @@ func (s *Supervisor) LastAppPID() int {
 		return cmd.Process.Pid
 	}
 	return -1
+}
+
+// LogBuffer returns an io.Writer that captures bytes written to it
+// into the supervisor's ring buffer. The buffer is allocated on the
+// first call (lazy); subsequent calls return the same buffer so the
+// customer's stdout/stderr pipes share a single capture window per
+// fork. The returned writer is goroutine-safe (the underlying
+// ringBuffer holds a sync.Mutex).
+//
+// runAppWithEnv (guest/init/main_linux.go) wraps this writer in an
+// io.MultiWriter(os.Stdout, ...) so live console output survives —
+// operators watching journalctl -u faas-vmmd still see the boot log
+// streaming. The ring buffer captures a copy for the characterize
+// report's LogTail field.
+func (s *Supervisor) LogBuffer() io.Writer {
+	// Fast path: buffer already allocated.
+	if rb := s.lastLog.Load(); rb != nil {
+		return rb
+	}
+	// Slow path: allocate and CAS-store. The loop is wait-free for
+	// the common case where no concurrent caller raced us; in the
+	// contended case (two goroutines call LogBuffer() concurrently
+	// for the first time), exactly one wins the CAS and the other
+	// loads the winner's buffer on retry.
+	rb := newRingBuffer(api.LogRingBufferBytes)
+	if s.lastLog.CompareAndSwap(nil, rb) {
+		return rb
+	}
+	return s.lastLog.Load()
+}
+
+// LogTail returns the most-recent captured bytes (up to
+// api.LogRingBufferBytes). Returns "" if the buffer has not been
+// allocated yet (no LogBuffer() call has happened) — same shape as
+// the empty-string sentinel the RingBufferTail callback returned
+// before PR-B. Read by characterize_linux.go's RingBufferTail
+// callback to populate the report's LogTail field.
+func (s *Supervisor) LogTail() string {
+	if rb := s.lastLog.Load(); rb != nil {
+		return rb.Tail()
+	}
+	return ""
+}
+
+// resetLog clears the ring buffer (if allocated). Called from
+// TrackCommand on every fork so each restart's capture window is
+// independent. Safe to call when the buffer has never been allocated
+// (a no-op); this lets TrackCommand call resetLog unconditionally
+// without paying the cost of an allocation check.
+func (s *Supervisor) resetLog() {
+	if rb := s.lastLog.Load(); rb != nil {
+		rb.Reset()
+	}
 }
 
 // trackExit is called when Start returns; -1 indicates non-ExitError.

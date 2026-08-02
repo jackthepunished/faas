@@ -168,7 +168,20 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	// tests the exact code path the production execve uses.
 	env = StampOverridePortEnv(env, m.EffectivePort())
 	cmd.Env = env
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	// ADR-051 Phase 4 Slice A PR-B: tee the customer's stdout/stderr
+	// into the supervisor's ring buffer so the characterize probe can
+	// populate the report's LogTail field. The MultiWriter preserves
+	// the live console stream (os.Stdout) so operators watching
+	// journalctl -u faas-vmmd still see the boot log in real time.
+	// When sup is nil (unit tests that exercise runAppWithEnv directly
+	// without a supervisor), we fall back to the legacy bare stdout
+	// wiring — those tests don't read LogTail.
+	if sup != nil {
+		mw := io.MultiWriter(os.Stdout, sup.LogBuffer())
+		cmd.Stdout, cmd.Stderr = mw, mw
+	} else {
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	}
 	if uid := lookupUID(m.EffectiveUser()); uid > 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(uid)},
@@ -508,12 +521,19 @@ func runCharacterizationForSup(sup *Supervisor, manifest api.AppManifest) {
 			return sup.LastExitCode(), nil
 		},
 		RingBufferTail: func() string {
-			// Empty until the supervisor's stdout/stderr capture
-			// (PR-C doesn't add it; customer deploy-row log surfacing
-			// ships in a follow-up). The wire field stays empty
-			// for v1, the platform contract of "no signal not
-			// won't boot" is preserved.
-			return ""
+			// Populated from the supervisor's ring buffer (Slice A
+			// PR-B). The buffer is allocated lazily on the first
+			// LogBuffer() call (cmd.Stdout wiring in runAppWithEnv),
+			// so a sup without a forked app returns "" — same
+			// shape as the pre-PR-B empty string. The wire-side
+			// truncateLog at characterize_linux.go:198 clamps the
+			// returned bytes to VsockCharacterizationMaxBody (32
+			// KiB), so the 64 KiB buffer's over-budget tail never
+			// overflows the JSON body.
+			if sup == nil {
+				return ""
+			}
+			return sup.LogTail()
 		},
 		Log: log,
 	}

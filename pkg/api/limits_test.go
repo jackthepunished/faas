@@ -689,3 +689,36 @@ func TestCharacterizationDeadlines(t *testing.T) {
 			CharacterizationDeadline, readyTimeout)
 	}
 }
+
+// TestLogRingBufferBytes pins the ADR-051 Slice A PR-B ring buffer
+// capacity. The characterize probe reads this buffer's Tail() into
+// the report's LogTail field (after truncateLog's wire-side clamp
+// at VsockCharacterizationMaxBody = 32 KiB). Three invariants:
+//
+//   - non-zero: a zero-sized buffer would silently drop every boot
+//     log byte, regressing the LogTail field back to the pre-PR-B
+//     empty-string sentinel.
+//   - >= 32 KiB: the buffer must be at least as large as the
+//     wire-body cap so a customer's boot log that fills the buffer
+//     can still surface the wire's full 32 KiB without truncation
+//     inside the buffer itself.
+//   - <= 1 MiB: a single-megabyte ring buffer per guest is the
+//     largest reasonable allocation; anything larger would silently
+//     bloat the per-guest memory budget (every Supervisor carries
+//     one of these, even on boxes where the characterize probe is
+//     disabled).
+func TestLogRingBufferBytes(t *testing.T) {
+	if LogRingBufferBytes <= 0 {
+		t.Fatalf("LogRingBufferBytes = %d, want > 0", LogRingBufferBytes)
+	}
+	const wireBodyCap = 32 * 1024 // VsockCharacterizationMaxBody
+	if LogRingBufferBytes < wireBodyCap {
+		t.Errorf("LogRingBufferBytes = %d, want >= %d (VsockCharacterizationMaxBody) so the buffer holds the full wire body without internal truncation",
+			LogRingBufferBytes, wireBodyCap)
+	}
+	const saneUpperBound = 1024 * 1024 // 1 MiB
+	if LogRingBufferBytes > saneUpperBound {
+		t.Errorf("LogRingBufferBytes = %d, want <= %d (1 MiB sanity upper bound; per-guest ring buffer must not silently bloat memory)",
+			LogRingBufferBytes, saneUpperBound)
+	}
+}
