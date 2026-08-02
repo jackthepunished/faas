@@ -41,7 +41,7 @@ export class ObservabilityService {
      * engine (UUID v4 in production). The endpoint returns
      * every `wake.*` events row whose `data.wake_id`
      * matches — the partial index `events_wake_id_idx`
-     * (migrations/00111) serves the read in O(frames)
+     * (migrations/00113) serves the read in O(frames)
      * regardless of the events table size.
      *
      */
