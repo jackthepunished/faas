@@ -78,6 +78,7 @@ type AlertRule struct {
 	LastEvaluatedAt     pgtype.Timestamptz
 	CreatedAt           pgtype.Timestamptz
 	UpdatedAt           pgtype.Timestamptz
+	OrgID               pgtype.UUID
 }
 
 type ApiKey struct {
@@ -88,6 +89,7 @@ type ApiKey struct {
 	LastUsedAt pgtype.Timestamptz
 	CreatedAt  pgtype.Timestamptz
 	Scopes     []string
+	OrgID      pgtype.UUID
 }
 
 type App struct {
@@ -119,6 +121,12 @@ type App struct {
 	WorkloadName           string
 	WorkloadClass          string
 	StartCommand           pgtype.Text
+	StreamingEnabled       bool
+	ScalingPolicy          []byte
+	LastScaleOutAt         pgtype.Timestamptz
+	LastScaleInAt          pgtype.Timestamptz
+	RequireSigned          bool
+	OrgID                  pgtype.UUID
 }
 
 type AppEnv struct {
@@ -128,6 +136,7 @@ type AppEnv struct {
 	Value     string
 	CreatedAt pgtype.Timestamptz
 	UpdatedAt pgtype.Timestamptz
+	OrgID     pgtype.UUID
 }
 
 type AppSecret struct {
@@ -137,6 +146,16 @@ type AppSecret struct {
 	Ciphertext []byte
 	CreatedAt  pgtype.Timestamptz
 	UpdatedAt  pgtype.Timestamptz
+	OrgID      pgtype.UUID
+}
+
+type AppTrustedSigner struct {
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	SignerName       string
+	CosignPublicKey  []byte
+	AddedAt          pgtype.Timestamptz
+	AddedByAccountID pgtype.UUID
 }
 
 type Build struct {
@@ -169,6 +188,18 @@ type BuildProvenance struct {
 	SbomStorageKey  pgtype.Text
 }
 
+// Per-build wall-clock seconds, one row per terminal build. Source: cmd/builderd reaper + markSucceeded/markFailed adapters. ADR-048. Informational only — not billed.
+type BuilderUsage struct {
+	BuildID    pgtype.UUID
+	AccountID  pgtype.UUID
+	AppID      pgtype.UUID
+	FinishedAt pgtype.Timestamptz
+	// build kind (railpack|dockerfile|tarball). Mirrors builds.kind. ADR-048.
+	Kind    string
+	Seconds int64
+	OrgID   pgtype.UUID
+}
+
 type CliAuthCode struct {
 	TokenHash  []byte
 	AccountID  pgtype.UUID
@@ -189,6 +220,11 @@ type ComputeNode struct {
 	Active             bool
 	LastHeartbeatAt    pgtype.Timestamptz
 	CreatedAt          pgtype.Timestamptz
+	// Locality label for the chooser tie-break (pkg/sched/placement.go). Free-form text; nullable so pre-00072 rows accept the schema. The seeded default-local row is backfilled to 'local'. ADR-025.
+	Region pgtype.Text
+	// Finer locality inside region. Currently informational; nullable. ADR-025.
+	Zone       pgtype.Text
+	VcpuBudget int32
 }
 
 type ComputeNodeHeartbeat struct {
@@ -197,6 +233,13 @@ type ComputeNodeHeartbeat struct {
 	ReceivedAt      pgtype.Timestamptz
 	LastHeartbeatAt pgtype.Timestamptz
 	Source          string
+}
+
+type ComputeNodeKey struct {
+	ComputeNodeID pgtype.UUID
+	KeyID         string
+	PublicKeyPem  string
+	CreatedAt     pgtype.Timestamptz
 }
 
 type CreditLedger struct {
@@ -218,6 +261,7 @@ type Cron struct {
 	Enabled     bool
 	LastFiredAt pgtype.Timestamptz
 	CreatedAt   pgtype.Timestamptz
+	OrgID       pgtype.UUID
 }
 
 type CustomDomain struct {
@@ -226,6 +270,7 @@ type CustomDomain struct {
 	VerifiedAt     pgtype.Timestamptz
 	ChallengeToken string
 	AppIDRedirect  pgtype.UUID
+	OrgID          pgtype.UUID
 }
 
 type Deployment struct {
@@ -263,13 +308,21 @@ type DeploymentLog struct {
 	WrittenAt    pgtype.Timestamptz
 }
 
+type EgressPolicy struct {
+	ID             string
+	PublicIface    string
+	MasqueradeCidr string
+	ChangedAt      pgtype.Timestamptz
+}
+
 type Event struct {
-	ID      int64
-	At      pgtype.Timestamptz
-	Actor   string
-	Kind    string
-	Subject pgtype.UUID
-	Data    []byte
+	ID             int64
+	At             pgtype.Timestamptz
+	Actor          string
+	Kind           string
+	Subject        pgtype.UUID
+	Data           []byte
+	ActorAccountID pgtype.UUID
 }
 
 type GdprRequest struct {
@@ -279,6 +332,7 @@ type GdprRequest struct {
 	Action       string
 	RequestedAt  pgtype.Timestamptz
 	CompletedAt  pgtype.Timestamptz
+	OrgID        pgtype.UUID
 }
 
 type GithubInstallation struct {
@@ -289,6 +343,7 @@ type GithubInstallation struct {
 	TokenExpiresAt     pgtype.Timestamptz
 	SealedAt           pgtype.Timestamptz
 	AuditGithubLogin   string
+	OrgID              pgtype.UUID
 }
 
 type GooseDbVersion struct {
@@ -321,6 +376,7 @@ type Instance struct {
 	TerminalAt    pgtype.Timestamptz
 	NodeID        pgtype.UUID
 	WakeID        pgtype.UUID
+	OrgID         pgtype.UUID
 }
 
 type Invocation struct {
@@ -345,6 +401,7 @@ type Invocation struct {
 	Attempts       int32
 	LastError      pgtype.Text
 	CreatedAt      pgtype.Timestamptz
+	OrgID          pgtype.UUID
 }
 
 type InvocationsPendingPerApp struct {
@@ -372,6 +429,7 @@ type Invoice struct {
 	Raw               []byte
 	CreatedAt         pgtype.Timestamptz
 	UpdatedAt         pgtype.Timestamptz
+	OrgID             pgtype.UUID
 }
 
 type LoginToken struct {
@@ -390,6 +448,44 @@ type OauthLink struct {
 	CreatedAt       pgtype.Timestamptz
 }
 
+type Org struct {
+	ID                     pgtype.UUID
+	Slug                   string
+	Name                   string
+	PersonalOrg            bool
+	PersonalOwnerAccountID pgtype.UUID
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     pgtype.Text
+	StripeSubscriptionItem pgtype.Text
+	DeletedPending         bool
+	CreatedAt              pgtype.Timestamptz
+	UpdatedAt              pgtype.Timestamptz
+}
+
+type OrgInvitation struct {
+	ID                 pgtype.UUID
+	OrgID              pgtype.UUID
+	Email              interface{}
+	Role               string
+	TokenHash          []byte
+	InvitedByAccountID pgtype.UUID
+	ExpiresAt          pgtype.Timestamptz
+	ConsumedAt         pgtype.Timestamptz
+	RevokedAt          pgtype.Timestamptz
+	AcceptingAccountID pgtype.UUID
+	CreatedAt          pgtype.Timestamptz
+}
+
+type OrgMembership struct {
+	OrgID              pgtype.UUID
+	AccountID          pgtype.UUID
+	Role               string
+	InvitedByAccountID pgtype.UUID
+	JoinedAt           pgtype.Timestamptz
+	RemovedAt          pgtype.Timestamptz
+}
+
 type PaddleOverageDedupe struct {
 	AccountID   pgtype.UUID
 	Month       pgtype.Timestamptz
@@ -398,6 +494,7 @@ type PaddleOverageDedupe struct {
 	State       string
 	ClaimedAt   pgtype.Timestamptz
 	ClaimedBy   pgtype.Text
+	OrgID       pgtype.UUID
 }
 
 type Project struct {
@@ -410,12 +507,14 @@ type Project struct {
 	ScanSource       string
 	CreatedAt        pgtype.Timestamptz
 	UpdatedAt        pgtype.Timestamptz
+	OrgID            pgtype.UUID
 }
 
 type RecentBuildClaim struct {
 	AccountID pgtype.UUID
 	ClaimedAt pgtype.Timestamptz
 	BuildID   pgtype.UUID
+	OrgID     pgtype.UUID
 }
 
 type Session struct {
@@ -439,10 +538,42 @@ type Snapshot struct {
 	StorageKey   string
 }
 
+// Per-(account, app, day) byte totals from snapshots.mem_bytes + disk_bytes + overlay staging. Source: pkg/meter/storage.go cron tick. ADR-049 §B.3. Informational only — not billed today; the future "Pro plan 1 GB included" PR consumes this surface.
+type SnapshotStorageDaily struct {
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Day       pgtype.Date
+	// Σ snapshots.mem_bytes + snapshots.disk_bytes (latest non-stale row per app per day). ADR-049 §B.3. Informational.
+	SnapshotBytes int64
+	// Σ overlay staging bytes per app per day. ADR-049 §B.3. Informational.
+	LayerBytes int64
+	ComputedAt pgtype.Timestamptz
+}
+
 type StripePushDedupe struct {
 	AccountID pgtype.UUID
 	Hour      pgtype.Timestamptz
 	PushedAt  pgtype.Timestamptz
+	OrgID     pgtype.UUID
+}
+
+// Per-(account, app, day) materialised rollup of usage_minutes. Populated by the meterd cron tick FAAS_ROLLUP_INTERVAL (default 5 min) via INSERT ... SELECT ... GROUP BY with ON CONFLICT additive merge. Read by GET /v1/usage/daily. ADR-048. Informational — not billed.
+type UsageDaily struct {
+	AccountID  pgtype.UUID
+	AppID      pgtype.UUID
+	Day        pgtype.Date
+	MbSeconds  int64
+	Requests   int64
+	CpuUsec    int64
+	TxBytes    int64
+	NetTxBytes int64
+	NetRxBytes int64
+	// Per-day sum of usage_minutes.cold_boot_count for this (account, app, day). ADR-048. Informational — not billed.
+	ColdBootCount  int64
+	BuilderSeconds int64
+	// Timestamp the meterd cron last wrote this row. Stamped on every ON CONFLICT update so a stuck cron is visible in /v1/usage/daily metadata.
+	RolledUpAt pgtype.Timestamptz
+	OrgID      pgtype.UUID
 }
 
 type UsageMinute struct {
@@ -458,15 +589,27 @@ type UsageMinute struct {
 	TxBytes int64
 	// Cumulative byte delta on root-side vethHost.rx_bytes for this instance in this minute. Source: vmmd pkg/fcvm/netstats.Cache reading /sys/class/net/<vethHost>/statistics/rx_bytes → vmmd.Stats → schedd instancestats.Poller → meterd Sampler.SampleAndRoll → AppendUsage. ADR-046. Informational — not billed. Unit = interface bytes (includes Ethernet/IP framing).
 	NetTxBytes int64
+	// Cumulative byte delta on root-side vethHost.tx_bytes (root→guest = ingress) for this instance in this minute. Source: vmmd pkg/fcvm/netstats.Cache TX path reading /sys/class/net/<vethHost>/statistics/tx_bytes → vmmd.Stats → schedd instancestats.Poller → meterd Sampler.SampleAndRoll → AppendUsage. ADR-048. Informational — not billed. Unit = interface bytes (includes Ethernet/IP framing).
+	NetRxBytes int64
+	// Per-minute count of WAKE_RESTORE→WAKE_COLD_BOOT transitions observed for this instance. Source: scheddgrpc.InstanceStatsRow.LastWakeMethod, sampled by meterd Sampler.SampleAndRoll. ADR-048. Informational — not billed. Idempotent on a redelivered tick within the same minute (only the transition counts).
+	ColdBootCount int32
+	// Billable builder VM seconds (2-vCPU / 2048-MB per spec §4.5), written once per build at build completion via state.Store.AppendBuilderUsage keyed by build_id. ADR-048. Informational — not billed. NOT counted in CountsForRAM() — runtime GB-RAM-hour billing is unchanged.
+	BuilderSeconds int64
+	// Build kind parallel to builds.kind (railpack / dockerfile / tarball); 'none' for non-build rows. ADR-048. Informational — not billed.
+	BuilderKind string
+	OrgID       pgtype.UUID
 }
 
 type UsageMonthly struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	Month      pgtype.Interval
-	MbSeconds  int64
-	CpuUsec    int64
-	Requests   int64
-	TxBytes    int64
-	NetTxBytes int64
+	AccountID      pgtype.UUID
+	AppID          pgtype.UUID
+	Month          pgtype.Interval
+	MbSeconds      int64
+	CpuUsec        int64
+	Requests       int64
+	TxBytes        int64
+	NetTxBytes     int64
+	NetRxBytes     int64
+	ColdBootCount  int64
+	BuilderSeconds int64
 }

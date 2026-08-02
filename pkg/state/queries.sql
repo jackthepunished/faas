@@ -375,3 +375,154 @@ where node_id = $1
 order by received_at desc
 limit $3;
 
+-- --- Organizations (ADR-061, IAM-6, PR 2) -------------------------------
+--
+-- PR 2's sqlc queries cover the deterministic reads + simple writes. The
+-- tx-heavy methods (CreateOrg with initial owner membership; RemoveOrgMember
+-- with last-owner FOR UPDATE; ConsumeOrgInvitation with cap check + email
+-- equality + membership insert + invitation UPDATE in one tx) stay as
+-- inline SQL in pgstore.go — they don't fit the :one / :many / :exec
+-- sqlc surface cleanly and the existing precedent (CreateAppIfUnderQuota,
+-- ConsumeRecoveryCode, ApplyProjectPlan) renders those inline.
+
+-- name: CreateOrg :one
+insert into orgs (
+    slug,
+    name,
+    personal_org,
+    personal_owner_account_id,
+    plan,
+    status,
+    provider_customer_id,
+    stripe_subscription_item,
+    deleted_pending
+) values (
+    $1, $2, $3, $4, $5, $6, nullif($7, ''), nullif($8, ''), false
+)
+returning
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at;
+
+-- name: OrgByID :one
+select
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+from orgs
+where id = $1;
+
+-- name: OrgBySlug :one
+select
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+from orgs
+where lower(slug) = lower($1);
+
+-- name: OrgByPersonalAccount :one
+select
+    id, slug, name, personal_org,
+    coalesce(personal_owner_account_id::text, ''),
+    plan, status,
+    coalesce(provider_customer_id, ''),
+    coalesce(stripe_subscription_item, ''),
+    deleted_pending,
+    created_at, updated_at
+from orgs
+where personal_org = true
+  and personal_owner_account_id = $1;
+
+-- name: ListOrgsForAccount :many
+select
+    o.id, o.slug, o.name, o.personal_org,
+    coalesce(o.personal_owner_account_id::text, ''),
+    o.plan, o.status,
+    coalesce(o.provider_customer_id, ''),
+    coalesce(o.stripe_subscription_item, ''),
+    o.deleted_pending,
+    o.created_at, o.updated_at
+from orgs o
+join org_memberships m on m.org_id = o.id
+where m.account_id = $1
+  and m.removed_at is null
+order by o.slug;
+
+-- name: UpdateOrgPlan :exec
+update orgs set plan = $2, updated_at = now() where id = $1;
+
+-- name: UpdateOrgStatus :exec
+update orgs set status = $2, updated_at = now() where id = $1;
+
+-- name: SoftDeleteOrg :exec
+update orgs set deleted_pending = true, status = 'deleted_pending', updated_at = now() where id = $1;
+
+-- name: ListOrgMembers :many
+select
+    org_id, account_id, role,
+    coalesce(invited_by_account_id::text, ''),
+    joined_at, removed_at
+from org_memberships
+where org_id = $1
+order by joined_at;
+
+-- name: OrgMemberByAccount :one
+select
+    org_id, account_id, role,
+    coalesce(invited_by_account_id::text, ''),
+    joined_at, removed_at
+from org_memberships
+where org_id = $1 and account_id = $2;
+
+-- name: OrgInvitationByTokenHash :one
+select
+    id,
+    org_id,
+    email::text as email,
+    role,
+    token_hash,
+    coalesce(invited_by_account_id::text, ''),
+    expires_at,
+    consumed_at,
+    revoked_at,
+    coalesce(accepting_account_id::text, ''),
+    created_at
+from org_invitations
+where token_hash = $1;
+
+-- name: ListOrgInvitationsForOrg :many
+select
+    id,
+    org_id,
+    email::text as email,
+    role,
+    token_hash,
+    coalesce(invited_by_account_id::text, ''),
+    expires_at,
+    consumed_at,
+    revoked_at,
+    coalesce(accepting_account_id::text, ''),
+    created_at
+from org_invitations
+where org_id = $1
+order by created_at desc;
+
+-- name: ExpireOrgInvitations :execrows
+update org_invitations
+set revoked_at = now()
+where consumed_at is null
+  and revoked_at is null
+  and expires_at <= $1;
+

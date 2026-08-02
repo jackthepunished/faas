@@ -1812,3 +1812,119 @@ func (p Project) IsZero() bool {
 // AllowUpward re-classifies an error via errors.Is like the other
 // shared sentinels (ErrNotFound, ErrConflict, ErrQuotaExceeded).
 var ErrScanSourceDowngrade = errors.New("state: scan_source downgrade rejected")
+
+// --- Organizations (ADR-061, IAM-6) -----------------------------------------
+//
+// PR 2 introduces `orgs`, `org_memberships`, and `org_invitations` tables
+// plus nullable `org_id` columns on the 19 tenant-root tables
+// (see docs/iam-6-ownership-inventory.md §B). The Go types here mirror
+// those tables 1:1 and are the surface PR 5's handlers consume.
+//
+// The OrgRole / OrgStatus / OrgInvitationStatus enums match the SQL
+// CHECK shapes — the pgstore maps a CHECK violation (SQLSTATE 23514)
+// to ErrOrgRoleForbidden / ErrOrgInvitationInvalid / etc. via the
+// existing mapErr helper. MemStore enforces the same enum in code.
+
+// OrgRole is one of the five RBAC roles per ADR-061 §Role vocabulary.
+// "owner" is reachable only via TransferOwnership (PR 5); the handler
+// PATCH /members/{id} never sets it (the SQL CHECK on
+// org_memberships.role ALSO enforces this — see migration 00095).
+type OrgRole string
+
+const (
+	OrgRoleOwner     OrgRole = "owner"
+	OrgRoleAdmin     OrgRole = "admin"
+	OrgRoleDeveloper OrgRole = "developer"
+	OrgRoleViewer    OrgRole = "viewer"
+	OrgRoleBilling   OrgRole = "billing"
+)
+
+// OrgStatus mirrors AccountStatus so meterd / dunning can pivot onto
+// orgs with no enum fork (PR 7).
+type OrgStatus string
+
+const (
+	OrgStatusActive         OrgStatus = "active"
+	OrgStatusPastDue        OrgStatus = "past_due"
+	OrgStatusSuspended      OrgStatus = "suspended"
+	OrgStatusDeletedPending OrgStatus = "deleted_pending"
+)
+
+// OrgInvitationStatus is the runtime materialisation of the
+// (consumed_at, revoked_at) state machine; the SQL CHECK on
+// org_invitations pins the three valid combinations and the store
+// translates one to this enum for handler consumption.
+type OrgInvitationStatus string
+
+const (
+	OrgInvitationPending  OrgInvitationStatus = "pending"
+	OrgInvitationConsumed OrgInvitationStatus = "consumed"
+	OrgInvitationRevoked  OrgInvitationStatus = "revoked"
+	OrgInvitationExpired  OrgInvitationStatus = "expired"
+)
+
+// Org is the tenant root. Owns apps, projects, domains, builds,
+// deployments, secrets, env, API keys, billing customer identifiers,
+// dunning state, plan, and quotas (ADR-061 §Definitions).
+//
+// One personal org per account is immutable: it cannot accept
+// additional members, transfer ownership, or be deleted independently
+// of the account (Personal = true). PersonalOwnerAccountID is set on
+// personal orgs only (the partial unique on
+// (personal_owner_account_id) WHERE personal_org = true enforces
+// exactly-one-personal-per-account at the SQL layer).
+type Org struct {
+	ID                     string
+	Slug                   string
+	Name                   string
+	Personal               bool
+	PersonalOwnerAccountID *string
+	Plan                   api.Plan
+	Status                 OrgStatus
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	DeletedPending         bool
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+// OrgMembership is the (org, account) join row. The pair is the PK;
+// one account has at most one membership per org.
+//
+// Role + RemovedAt semantics: an "active" member has RemovedAt == nil
+// and contributes to the per-org member cap (Plan.OrgMembersMax()).
+// A "removed" member has RemovedAt != nil; the row stays for audit
+// purposes (who used to be in the org) but does not count.
+//
+// InvitedByAccountID is ON DELETE SET NULL per ADR-061 §D — the
+// inviter attribution survives account deletion.
+type OrgMembership struct {
+	OrgID              string
+	AccountID          string
+	Role               OrgRole
+	InvitedByAccountID *string
+	JoinedAt           time.Time
+	RemovedAt          *time.Time
+}
+
+// OrgInvitation is a one-shot token-bearing invite. The token is
+// 32 random bytes generated in the PR 5 handler; only the SHA-256
+// hash is stored (matching the login_tokens / cli_auth_codes shape).
+//
+// Email + Role are immutable once written; ExpiresAt is the only
+// timestamp the cleanup loop uses to retire pending invitations.
+// InvitedByAccountID and AcceptingAccountID both use ON DELETE SET
+// NULL per ADR-061 §D.
+type OrgInvitation struct {
+	ID                 string
+	OrgID              string
+	Email              string
+	Role               OrgRole
+	TokenHash          []byte
+	InvitedByAccountID *string
+	ExpiresAt          time.Time
+	ConsumedAt         *time.Time
+	RevokedAt          *time.Time
+	AcceptingAccountID *string
+	CreatedAt          time.Time
+}
