@@ -39,6 +39,11 @@ import (
 // seedInstanceForMigration creates an account + app + instance
 // in the supplied MemStore at the given node, in state
 // 'running', with the supplied RAM. Returns the instanceID.
+//
+// Capture the account ID returned by CreateAccount (MemStore
+// auto-generates it) and stamp the App row with that real
+// value — BuildAppSpecForMigration / AccountByID lookups
+// would 404 on a literal "1" placeholder.
 func seedInstanceForMigration(t *testing.T, store *state.MemStore, nodeID string) string {
 	t.Helper()
 	ctx := context.Background()
@@ -46,12 +51,13 @@ func seedInstanceForMigration(t *testing.T, store *state.MemStore, nodeID string
 	// helper is called multiple times in the same test; use
 	// a UUID-suffixed email so the unique-email invariant
 	// holds across calls.
-	if _, err := store.CreateAccount(ctx, "u-"+uuid.NewString()+"@m", "hobby"); err != nil {
+	acct, err := store.CreateAccount(ctx, "u-"+uuid.NewString()+"@m", "hobby")
+	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	// MemStore.CreateApp takes the App struct directly.
 	app := state.App{
-		ID: uuid.NewString(), AccountID: "1", Slug: "mig-" + uuid.NewString(),
+		ID: uuid.NewString(), AccountID: acct.ID, Slug: "mig-" + uuid.NewString(),
 		NodeID: nodeID, Status: state.AppActive, RAMMB: 256,
 	}
 	if _, err := store.CreateApp(ctx, app); err != nil {
@@ -102,12 +108,15 @@ func TestMarkInstanceMigrating_HappyPath(t *testing.T) {
 	insID := seedInstanceForMigration(t, store, "dying")
 	ctx := context.Background()
 
-	if err := store.MarkInstanceMigrating(ctx, insID, "dying"); err != nil {
+	if err := store.MarkInstanceMigrating(ctx, insID, "dying", "lease-1"); err != nil {
 		t.Fatalf("MarkInstanceMigrating: %v", err)
 	}
 	ins, _ := store.InstanceByID(ctx, insID)
 	if string(ins.State) != string(state.StateMigrating) {
 		t.Fatalf("state = %s, want migrating", ins.State)
+	}
+	if ins.LeaseToken != "lease-1" {
+		t.Fatalf("lease_token = %q, want lease-1 (Phase 2 stamps it)", ins.LeaseToken)
 	}
 }
 
@@ -118,7 +127,7 @@ func TestMarkInstanceMigrating_ConflictOnParkedInstance(t *testing.T) {
 	if err := store.UpdateInstanceState(ctx, insID, string(state.StateParked)); err != nil {
 		t.Fatalf("UpdateInstanceState: %v", err)
 	}
-	err := store.MarkInstanceMigrating(ctx, insID, "dying")
+	err := store.MarkInstanceMigrating(ctx, insID, "dying", "lease-1")
 	if !errors.Is(err, state.ErrConflict) {
 		t.Fatalf("MarkInstanceMigrating on parked instance = %v, want ErrConflict", err)
 	}
@@ -127,7 +136,7 @@ func TestMarkInstanceMigrating_ConflictOnParkedInstance(t *testing.T) {
 func TestMarkInstanceMigrating_ConflictOnWrongNode(t *testing.T) {
 	store := state.NewMemStore()
 	insID := seedInstanceForMigration(t, store, "node-A")
-	err := store.MarkInstanceMigrating(context.Background(), insID, "node-B")
+	err := store.MarkInstanceMigrating(context.Background(), insID, "node-B", "lease-1")
 	if !errors.Is(err, state.ErrConflict) {
 		t.Fatalf("MarkInstanceMigrating with wrong nodeID = %v, want ErrConflict", err)
 	}
@@ -137,7 +146,7 @@ func TestMigrateInstanceOwner_HappyPath(t *testing.T) {
 	store := state.NewMemStore()
 	insID := seedInstanceForMigration(t, store, "dying")
 	ctx := context.Background()
-	if err := store.MarkInstanceMigrating(ctx, insID, "dying"); err != nil {
+	if err := store.MarkInstanceMigrating(ctx, insID, "dying", "lease-1"); err != nil {
 		t.Fatalf("MarkInstanceMigrating: %v", err)
 	}
 	lease := "lease-" + uuid.NewString()
@@ -176,26 +185,40 @@ func TestMigrateInstanceOwner_ConflictOnNotMigrating(t *testing.T) {
 
 // TestCancelInstanceMigration_RequiresMatchingLease pins the
 // race-safety contract: cancel succeeds only with the lease
-// token the migration was committed under. The full happy
-// path (cancel-after-MarkInstanceMigrating-then-cancel-after-
-// lease-mint) is exercised by the integration test in a
-// follow-up PR; the unit test here covers the rejection path
-// (a stale lease token is rejected).
+// token the migration was committed under. Phase 2 stamps
+// lease_token onto the row (the same UUID the dying vmmd
+// minted at Phase 1), so a cancel with a non-matching token
+// is rejected with ErrConflict. The full happy path
+// (cancel-after-Phase-2-stamp) is exercised by the harness
+// tests in migration_harness_test.go (Phase 3 fails →
+// CancelInstanceMigration with the right lease_token).
 func TestCancelInstanceMigration_RequiresMatchingLease(t *testing.T) {
 	store := state.NewMemStore()
 	insID := seedInstanceForMigration(t, store, "dying")
 	ctx := context.Background()
-	if err := store.MarkInstanceMigrating(ctx, insID, "dying"); err != nil {
+	if err := store.MarkInstanceMigrating(ctx, insID, "dying", "lease-1"); err != nil {
 		t.Fatalf("MarkInstanceMigrating: %v", err)
 	}
-	// No lease was minted by MarkInstanceMigrating (the
-	// lease is minted by the dying vmmd at Phase 1 and
-	// arrives via the PrepareLiveMigration response). A
-	// cancel with any non-empty lease token must therefore
-	// fail with ErrConflict — the row has no matching
-	// lease. This is the race-safety contract: a stale
-	// cancel cannot silently succeed.
+	// A cancel with a non-matching lease must fail with
+	// ErrConflict — the row has lease_token='lease-1' and a
+	// 'stale-lease' token does not match. This is the
+	// race-safety contract: a stale cancel cannot silently
+	// succeed.
 	if err := store.CancelInstanceMigration(ctx, insID, "dying", "stale-lease"); !errors.Is(err, state.ErrConflict) {
 		t.Fatalf("CancelInstanceMigration with stale lease = %v, want ErrConflict", err)
+	}
+	// The matching-lease happy path: cancel with the right
+	// token transitions state back to 'parked' and clears
+	// lease_token (so a future re-attempt mints a fresh
+	// lease).
+	if err := store.CancelInstanceMigration(ctx, insID, "dying", "lease-1"); err != nil {
+		t.Fatalf("CancelInstanceMigration with matching lease: %v", err)
+	}
+	ins, _ := store.InstanceByID(ctx, insID)
+	if string(ins.State) != string(state.StateParked) {
+		t.Fatalf("state = %s, want parked", ins.State)
+	}
+	if ins.LeaseToken != "" {
+		t.Fatalf("lease_token = %q, want empty (cleared on cancel)", ins.LeaseToken)
 	}
 }

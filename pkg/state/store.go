@@ -651,11 +651,16 @@ type Store interface {
 	// requires node_id = currentNodeID (the dying vmmd — a
 	// concurrent owner change from a peer rebalancer would have
 	// flipped the row already, in which case we abort). The
-	// transition stamps state='migrating' atomically so a peer
-	// claim that races us sees the new state and bails. Returns
-	// ErrConflict on RowsAffected()==0 — peer already moved the
-	// instance to a non-RUNNING state, owner changed, or row gone.
-	MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID string) error
+	// transition stamps state='migrating' atomically AND stamps
+	// lease_token = the per-migration UUID the new owner minted
+	// at Phase 1 — the rollback predicate (CancelInstanceMigration)
+	// requires the lease_token match, so the stamp has to land at
+	// Phase 2 (before any Phase-3 failure could strand the row in
+	// 'migrating' without a lease). A peer claim that races us
+	// sees the new state and bails. Returns ErrConflict on
+	// RowsAffected()==0 — peer already moved the instance to a
+	// non-RUNNING state, owner changed, or row gone.
+	MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID, leaseToken string) error
 	// MigrateInstanceOwner is the Phase-3 commit of the four-phase
 	// handoff (Tier A5 / ADR-066). Conditional UPDATE that flips
 	// instances.node_id from fromNodeID to toNodeID, stamps

@@ -74,7 +74,6 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -90,6 +89,18 @@ type MigrationHarness struct {
 	vmm     RoutedVMM
 	metrics apiMigrationMetrics
 	log     *slog.Logger
+	// specBuilder is the canonical AppSpec constructor the
+	// harness uses at Phase 3. Wiring it as a closure (rather
+	// than re-implementing the builder here) keeps the spec
+	// shape in lock-step with the Wake-time builder at
+	// Engine.BuildAppSpecForMigration — a divergence would
+	// silently regress the migration (wrong LayerKey →
+	// cold-boot from base; wrong VCPU → Scale under-provision;
+	// dropped HealthcheckPath → readiness probe skipped;
+	// swallowed secrets/env errors → empty guest env.json).
+	// Tests inject a stub; production wiring points this at
+	// the engine method.
+	specBuilder func(ctx context.Context, instanceID string) (AppSpec, error)
 	// newOwnerNodeID is the local schedd's owner node — the
 	// new owner for every handoff this orchestrator drives.
 	// Set at construction; never mutated (a hot-swap would be
@@ -125,6 +136,12 @@ type apiMigrationMetrics interface {
 // from FAAS_NODE_NAME resolution and for capping maxPerTick /
 // leaseSeconds from the env-overridable limits.
 //
+// specBuilder is required; NewMigrationHarness panics on a
+// nil builder so a missed wiring surfaces at startup rather
+// than as silent spec corruption at the first four-phase
+// handoff. Production wiring passes Engine.BuildAppSpecForMigration
+// (closure-bound to keep pkg/sched import graph one-way).
+//
 // The metrics parameter is intentionally typed as an interface
 // (rather than *api.Limit) so tests can inject a no-op recorder
 // without dragging the full pkg/wire registry into the test
@@ -136,12 +153,17 @@ func NewMigrationHarness(
 	metrics apiMigrationMetrics,
 	log *slog.Logger,
 	newOwnerNodeID string,
+	specBuilder func(ctx context.Context, instanceID string) (AppSpec, error),
 ) *MigrationHarness {
+	if specBuilder == nil {
+		panic("sched: NewMigrationHarness: specBuilder is nil (migration will silently corrupt AppSpec at first handoff)")
+	}
 	return &MigrationHarness{
 		store:          store,
 		vmm:            vmm,
 		metrics:        metrics,
 		log:            log,
+		specBuilder:    specBuilder,
 		newOwnerNodeID: newOwnerNodeID,
 		maxPerTick:     api.MigrateLiveMaxPerTick,
 		leaseSeconds:   api.MigrateLiveLeaseSeconds,
@@ -217,9 +239,11 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 	// Phase 2: MarkInstanceMigrating on the local store. The
 	// conditional UPDATE flips the instance state from
 	// 'running' to 'migrating' under the
-	// state='running' + node_id=fromNodeID predicate. A peer
-	// rollback / owner change / row-gone returns ErrConflict.
-	if err := h.store.MarkInstanceMigrating(leaseCtx, instanceID, fromNodeID); err != nil {
+	// state='running' + node_id=fromNodeID predicate, AND
+	// stamps lease_token so the rollback at Phase 4 has a
+	// matching predicate. A peer rollback / owner change /
+	// row-gone returns ErrConflict.
+	if err := h.store.MarkInstanceMigrating(leaseCtx, instanceID, fromNodeID, prepared.LeaseToken); err != nil {
 		if errors.Is(err, state.ErrConflict) {
 			h.metrics.LiveMigrationDecisions("conflict").Inc()
 			h.log.Debug("sched: migrate one: Phase 2 peer conflict",
@@ -375,66 +399,19 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 	return nil
 }
 
-// loadAppSpecForInstance rebuilds the AppSpec shape vmmd needs
-// to restore a paused VM from the local app + deployment view.
-// The lookup walks: instance → app + deployment → drive0 base
-// key + drive1 layer key + sealed env + api env + egress
-// allowlist. For A5 v1 the wire shape carries the AppSpec end-
-// to-end; a future PR can lift this into the parent
-// Engine.MigrateLiveInstances so the orchestrator doesn't re-
-// fetch (saves a round-trip per instance).
+// loadAppSpecForInstance delegates to Engine.BuildAppSpecForMigration
+// so the spec shape stays in lock-step with the Wake-time builder.
+// A divergence here would silently regress the migration: a wrong
+// LayerKey cold-boots from the base, a wrong VCPU under-provisions
+// Scale-tier apps, a dropped HealthcheckPath skips the readiness
+// probe, swallowed secrets/env errors empty the guest's env.json.
 //
-// Returns an error if the instance / app / deployment / layer
-// triple can't be resolved. The caller treats this as a Phase 3
-// setup failure and rolls back Phase 2 + Phase 4.
+// Returning a typed error here lets MigrateOne's Phase 3 setup
+// branch roll back Phase 2 (state→parked) and fire Phase 4
+// (dying-vmmd cancel).
 func (h *MigrationHarness) loadAppSpecForInstance(ctx context.Context, instanceID string) (AppSpec, error) {
-	// Best-effort: read the instance row, then the app + dep
-	// rows. The MemStore / PgStore backends both implement the
-	// InstanceByID + AppByID + LiveDeployment surface the engine
-	// uses at Wake time — the migration path reuses it bit-for-bit.
-	ins, err := h.store.InstanceByID(ctx, instanceID)
-	if err != nil {
-		return AppSpec{}, fmt.Errorf("sched: load app spec: instance by id: %w", err)
+	if h.specBuilder == nil {
+		return AppSpec{}, fmt.Errorf("sched: load app spec: harness has no spec builder (wiring bug)")
 	}
-	app, err := h.store.AppByID(ctx, ins.AppID)
-	if err != nil {
-		return AppSpec{}, fmt.Errorf("sched: load app spec: app by id: %w", err)
-	}
-	dep, err := h.store.LiveDeployment(ctx, ins.AppID)
-	if err != nil {
-		return AppSpec{}, fmt.Errorf("sched: load app spec: live deployment: %w", err)
-	}
-	// Sealed env + api env + allowlist are all per-app; the
-	// engine reads them at Wake time and we mirror that here.
-	// For A5 v1 we use empty slices if the lookup fails so the
-	// migration doesn't block on a secrets table hiccup (the
-	// guest's env.json ends up empty for the migration window;
-	// a fresh wake restores them). The wire shape is unchanged.
-	sealedRows, _ := h.store.ListAppSecrets(ctx, app.AccountID, app.ID)
-	apiEnvRows, _ := h.store.ListAppEnv(ctx, app.AccountID, app.ID)
-	sealed := make([]fcvm.SealedEnvEntry, 0, len(sealedRows))
-	for _, s := range sealedRows {
-		sealed = append(sealed, fcvm.SealedEnvEntry{Key: s.Key, Ciphertext: s.Ciphertext})
-	}
-	apiEnv := make([]fcvm.APIEnvEntry, 0, len(apiEnvRows))
-	for _, e := range apiEnvRows {
-		apiEnv = append(apiEnv, fcvm.APIEnvEntry{Key: e.Key, Value: e.Value})
-	}
-	allowlist := make([]string, 0, len(app.EgressAllowlist))
-	for _, p := range app.EgressAllowlist {
-		allowlist = append(allowlist, p.String())
-	}
-	spec := AppSpec{
-		BaseKey:         dep.RootfsKey, // drive0 base key (Storage.Get)
-		LayerKey:        dep.RootfsKey, // drive1 per-app layer (same key for A5 v1; the engine constructs the per-app layer from dep.RootfsKey at wake time)
-		VCPUCount:       int32(app.MaxConcurrency),
-		MemSizeMiB:      int32(app.RAMMB),
-		EgressMbit:      0,
-		SealedEnv:       sealed,
-		APIEnv:          apiEnv,
-		EgressAllowlist: allowlist,
-		Port:            dep.OverridePort,
-		HealthcheckPath: "",
-	}
-	return spec, nil
+	return h.specBuilder(ctx, instanceID)
 }

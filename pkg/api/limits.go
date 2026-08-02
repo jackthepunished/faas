@@ -877,7 +877,9 @@ const (
 	// instance into a fresh four-phase handoff; excess candidates
 	// stay on the dead node and retry on the next
 	// compute_node_changed re-fire. Defaults to 10; tunable via
-	// FAAS_MIGRATE_LIVE_MAX_PER_TICK.
+	// FAAS_MIGRATE_LIVE_MAX_PER_TICK (env-overridable, see
+	// cmd/schedd/main.go::runWithDeps; propagated via
+	// Engine.WithMigrateLiveConfig).
 	//
 	// MigrateLiveLeaseSeconds is the upper bound on the four-phase
 	// handoff — Phase 1 mints a lease_token, Phase 3 commits or
@@ -886,13 +888,13 @@ const (
 	// snapshot-upload + restore round-trip on the OCIRegistry
 	// backend (latency dominated by the registry pull, not the
 	// local VM lifecycle). Defaults to 90s; tunable via
-	// FAAS_MIGRATE_LIVE_LEASE_SECONDS.
+	// FAAS_MIGRATE_LIVE_LEASE_SECONDS (env-overridable, see
+	// cmd/schedd/main.go::runWithDeps; propagated via
+	// Engine.WithMigrateLiveLeaseSeconds).
 	//
 	// Hard limits policy (CLAUDE.md): every limit is a constant
-	// here, never inlined. Constants are read in
-	// cmd/schedd/config.go and propagated to
-	// Engine.MigrateLiveInstances through the EngineOpts struct.
-	MigrateLiveMaxPerTick  = 10
+	// here, never inlined.
+	MigrateLiveMaxPerTick   = 10
 	MigrateLiveLeaseSeconds = 90
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.

@@ -1097,11 +1097,18 @@ func (s *PgStore) ReassignAppOwner(ctx context.Context, appID, fromNodeID, toNod
 
 // ListLiveInstancesOnNode returns every live instance owned by
 // nodeID — the candidate set for Engine.MigrateLiveInstances
-// (Tier A5 / migration 00097, ADR-066). "Live" is the canonical
-// predicate at IsLive: state ∈ {WAKING, COLD_BOOTING, RUNNING,
-// SNAPSHOTTING}. Returns an empty slice (not ErrNotFound) when
-// nodeID has no live instances; callers treat that as "nothing
-// to migrate this tick".
+// (Tier A5 / migration 00097, ADR-066). Filtered to state='running'
+// only — the MarkInstanceMigrating predicate that gates Phase 2
+// requires state='running' + node_id=currentNodeID, so a WAKING /
+// COLD_BOOTING / SNAPSHOTTING instance on the dying node would
+// fail Phase 2 and bump outcome="conflict" (polluting the metric).
+// Those states stay on the dying node and the dying vmmd drives
+// the cold-boot to completion (ADR-005 cold-boot-from-disk); the
+// migration path is only the right primitive for RUNNING instances.
+//
+// Returns an empty slice (not ErrNotFound) when nodeID has no
+// live instances; callers treat that as "nothing to migrate this
+// tick".
 //
 // Sorted by instance id ASC for determinism so two peers observing
 // the same drain event read the same input set (they still race on
@@ -1134,7 +1141,7 @@ func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, ma
 	               coalesce(i.node_id::text, ''), coalesce(i.wake_id, ''),
 	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
 	          from instances i
-	         where i.state in ('waking','cold_booting','running','snapshotting')` +
+	         where i.state = 'running'` +
 		nodeClause + `
 	         order by i.id asc
 	         limit $` + strconv.Itoa(len(args))
@@ -1169,20 +1176,24 @@ func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, ma
 // the new owner and Phase 3 writes it via MigrateInstanceOwner. The
 // intermediate state-transition just flips state='migrating' so a
 // peer claim that races us sees the new state and bails.
-func (s *PgStore) MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID string) error {
+func (s *PgStore) MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID, leaseToken string) error {
 	if instanceID == "" {
 		return fmt.Errorf("state: mark instance migrating: empty instanceID")
 	}
 	if currentNodeID == "" {
 		return fmt.Errorf("state: mark instance migrating: empty currentNodeID")
 	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: mark instance migrating: empty leaseToken")
+	}
 	tag, err := s.pool.Exec(ctx,
 		`update instances
-		    set state = 'migrating'
+		    set state = 'migrating',
+		        lease_token = $3
 		  where id = $1
 		    and node_id = $2
 		    and state = 'running'`,
-		instanceID, currentNodeID)
+		instanceID, currentNodeID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("state: mark instance migrating: %w", err)
 	}

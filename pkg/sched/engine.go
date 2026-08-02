@@ -181,6 +181,14 @@ type Engine struct {
 	// VM on the new owner), so the cap is intentionally lower
 	// than the parked-app rebalance cap.
 	migrateLiveMaxPerTick int
+	// migrateLiveLeaseSeconds (Tier A5 / ADR-066) is the per-
+	// engine override for the lease window. Default
+	// api.MigrateLiveLeaseSeconds = 90; overridable via
+	// FAAS_MIGRATE_LIVE_LEASE_SECONDS -> WithMigrateLiveLeaseSeconds.
+	// The lease bounds the four-phase handoff end-to-end so a
+	// stuck-three-phase handoff surfaces as
+	// outcome="lease_expired" rather than a hung goroutine.
+	migrateLiveLeaseSeconds int
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
@@ -411,6 +419,20 @@ func (e *Engine) WithMigrateLiveConfig(maxPerTick int) *Engine {
 		panic(fmt.Sprintf("sched: WithMigrateLiveConfig: maxPerTick must be > 0, got %d", maxPerTick))
 	}
 	e.migrateLiveMaxPerTick = maxPerTick
+	return e
+}
+
+// WithMigrateLiveLeaseSeconds (Tier A5 / ADR-066) sets the
+// per-engine override for the live-instance migration lease
+// window (the upper bound on the four-phase handoff). Same
+// "panic on bad env" contract as WithMigrateLiveConfig: a typo
+// in FAAS_MIGRATE_LIVE_LEASE_SECONDS must not silently fall
+// back to the api.* default.
+func (e *Engine) WithMigrateLiveLeaseSeconds(seconds int) *Engine {
+	if seconds <= 0 {
+		panic(fmt.Sprintf("sched: WithMigrateLiveLeaseSeconds: seconds must be > 0, got %d", seconds))
+	}
+	e.migrateLiveLeaseSeconds = seconds
 	return e
 }
 
@@ -1675,6 +1697,90 @@ func (e *Engine) admissionCeilingForOwn(ctx context.Context) int {
 	return n.AdmissionCeilingMB
 }
 
+// BuildAppSpecForMigration (Tier A5 / ADR-066) rebuilds the
+// AppSpec shape vmmd needs to restore a migrated VM from the
+// local app + deployment view. The lookup walks: instance → app
+// + deployment → drive0 base key + drive1 layer key + sealed
+// env (filtered through dep.OverrideEnvSecrets) + api env +
+// egress allowlist + override port + override healthcheck path.
+//
+// This method is the migration path's analogue of the Wake-time
+// spec builder (engine.go:911-948). The two MUST stay in lock-
+// step — a divergence silently regresses the migration:
+//
+//   - wrong LayerKey → cold-boot from the base, not the layer
+//     (the snapshot the dying vmmd wrote is irrelevant; the
+//     guest overlayfs mounts the base as drive1 too)
+//   - wrong VCPUCount (e.g. app.MaxConcurrency) → Scale-tier
+//     apps under-provisioned post-migration
+//   - dropped EgressMbit → no per-plan tc cap on the migrated
+//     netns (Scale tier ships at 200 Mbit; a 0 cap removes it)
+//   - dropped HealthcheckPath → readiness probe skipped; vmmd
+//     falls back to TCP-accept which can pass for an unready
+//     app (issue #460 / ADR-053, ADR-057 / PR-D)
+//   - swallowed secrets/env errors → guest env.json ships
+//     empty; Stripe keys and DB creds silently disappear
+//
+// Returns an error if the instance / app / deployment triple
+// can't be resolved. The caller (MigrationHarness.loadAppSpecForInstance)
+// treats this as a Phase 3 setup failure and rolls back
+// Phase 2 + Phase 4.
+func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string) (AppSpec, error) {
+	ins, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		return AppSpec{}, fmt.Errorf("sched: build app spec: instance by id: %w", err)
+	}
+	app, err := e.store.AppByID(ctx, ins.AppID)
+	if err != nil {
+		return AppSpec{}, fmt.Errorf("sched: build app spec: app by id: %w", err)
+	}
+	dep, err := e.store.LiveDeployment(ctx, ins.AppID)
+	if err != nil {
+		return AppSpec{}, fmt.Errorf("sched: build app spec: live deployment: %w", err)
+	}
+	acct, err := e.store.AccountByID(ctx, app.AccountID)
+	if err != nil {
+		return AppSpec{}, fmt.Errorf("sched: build app spec: account by id: %w", err)
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	// Sealed env is filtered through dep.OverrideEnvSecrets
+	// (jsonb) when present, mirroring the Wake path at
+	// engine.go:907-910. A migration without the override
+	// surface ships the full secret set; one with the override
+	// ships only the requested env_keys. A missing-required
+	// key fails loud (the legacy "stage everything" path is
+	// preserved when OverrideEnvSecrets is nil).
+	sealedEnv, err := e.loadSealedEnvFor(ctx, app.AccountID, app.ID, envSecretsFromDep(dep))
+	if err != nil {
+		return AppSpec{}, fmt.Errorf("sched: build app spec: sealed env: %w", err)
+	}
+	return AppSpec{
+		BaseKey:    baseKey(app.Runtime),
+		LayerKey:   layerKey(dep.RootfsKey, dep.ID),
+		VCPUCount:  int32(limits.VCPU),
+		MemSizeMiB: int32(app.RAMMB),
+		EgressMbit: int32(limits.EgressMbit),
+		SealedEnv:  sealedEnv,
+		// ADR-045: api_env plaintext layer; the loadAPIEnv
+		// helper already fail-softs on a lookup error and logs
+		// Warn (engine.go:2382-2396). A hiccup here ships an
+		// empty api_env block, NOT a failed migration — the
+		// overlayfs upper layers carry the same precedence
+		// rules as Wake time and the customer's runtime config
+		// (most of it) lives in sealedEnv + manifest_env.
+		APIEnv: e.loadAPIEnv(ctx, app.AccountID, app.ID),
+		// ADR-031: per-app egress allowlist; same CIDR-string
+		// flattening as the Wake path.
+		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
+		// Issue #460 / ADR-053 (PR-C): per-deployment override
+		// port. 0 = legacy 8080 (vmmd wire default).
+		Port: dep.OverridePort,
+		// Issue #460 / ADR-053, ADR-057 (PR-D): per-deployment
+		// override readiness probe path. "" = legacy TCP-accept.
+		HealthcheckPath: healthcheckPathFromDep(dep),
+	}, nil
+}
+
 // MigrateLiveInstances (Tier A5 / ADR-066) is the live-instance
 // counterpart to RebalanceOrphanedApps. Given a dying nodeID,
 // it lists every live instance on that node (state in
@@ -1730,9 +1836,13 @@ func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (i
 	}
 
 	harness := NewMigrationHarness(e.store, e.vmm, e.ops, e.log,
-		e.ownerNodeID)
+		e.ownerNodeID, e.BuildAppSpecForMigration)
 	harness.SetMaxPerTick(maxPerTick)
-	harness.SetLeaseSeconds(api.MigrateLiveLeaseSeconds)
+	leaseSeconds := api.MigrateLiveLeaseSeconds
+	if e.migrateLiveLeaseSeconds > 0 {
+		leaseSeconds = e.migrateLiveLeaseSeconds
+	}
+	harness.SetLeaseSeconds(leaseSeconds)
 
 	migrated, attempted := 0, 0
 	for _, ins := range liveInstances {

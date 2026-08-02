@@ -639,6 +639,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.WithMigrateLiveConfig(n)
 	}
 
+	// Tier A5 / ADR-066: live-instance migration lease
+	// window. Same env-override rationale as the
+	// MAX_PER_TICK above. The default lives in
+	// pkg/api/limits.go (MigrateLiveLeaseSeconds); an operator
+	// tunes this on the OCIRegistry backend's snapshot-pull
+	// latency. A bad env returns a typed error so the daemon
+	// fails fast at boot rather than silently falling back.
+	if v := os.Getenv("FAAS_MIGRATE_LIVE_LEASE_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_MIGRATE_LIVE_LEASE_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_MIGRATE_LIVE_LEASE_SECONDS: %s", v)
+		}
+		engine.WithMigrateLiveLeaseSeconds(n)
+	}
+
 	// Tier A4 / ADR-064: rebalancer subscriber. Watches
 	// compute_node_changed for active=false events and hands
 	// the dead node id to Engine.RebalanceOrphanedApps.

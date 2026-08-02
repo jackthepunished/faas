@@ -1665,15 +1665,16 @@ func (m *MemStore) ReassignAppOwner(_ context.Context, appID, fromNodeID, toNode
 
 // ListLiveInstancesOnNode mirrors
 // pkg/state/pgstore.go::ListLiveInstancesOnNode. Filters to
-// state ∈ {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING} — the
-// canonical IsLive predicate — and to the given node_id (or
-// every inactive-owner instance when nodeID is empty). Returns
-// an empty slice (not ErrNotFound) on no matches; callers
-// treat that as "nothing to migrate this tick". Migration
-// lineage fields on the returned Instance are zero values
-// (the memstore fixture is exercised by unit tests that
-// drive the four-phase handoff through the engine surface,
-// not through state row reads).
+// state = 'running' (matches MarkInstanceMigrating's predicate;
+// WAKING/COLD_BOOTING/SNAPSHOTTING stay on the dying node and
+// the dying vmmd drives the cold-boot to completion) and to the
+// given node_id (or every inactive-owner instance when nodeID
+// is empty). Returns an empty slice (not ErrNotFound) on no
+// matches; callers treat that as "nothing to migrate this
+// tick". Migration lineage fields on the returned Instance are
+// zero values (the memstore fixture is exercised by unit tests
+// that drive the four-phase handoff through the engine
+// surface, not through state row reads).
 func (m *MemStore) ListLiveInstancesOnNode(_ context.Context, nodeID string, maxPerTick int) ([]Instance, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1682,7 +1683,7 @@ func (m *MemStore) ListLiveInstancesOnNode(_ context.Context, nodeID string, max
 	}
 	out := make([]Instance, 0, maxPerTick)
 	for _, ins := range m.instances {
-		if !IsLive(ins.State) {
+		if ins.State != string(StateRunning) {
 			continue
 		}
 		if nodeID != "" && ins.NodeID != nodeID {
@@ -1690,8 +1691,8 @@ func (m *MemStore) ListLiveInstancesOnNode(_ context.Context, nodeID string, max
 		}
 		// nodeID == "": cold-start variant. We don't model
 		// compute_nodes ownership in the memstore, so the
-		// in-memory filter is just "live and unowned-by-self"
-		// — the unit-test fixture for the cold-start sweep.
+		// in-memory filter is just "running" — the
+		// unit-test fixture for the cold-start sweep.
 		out = append(out, ins)
 		if len(out) >= maxPerTick {
 			break
@@ -1703,14 +1704,19 @@ func (m *MemStore) ListLiveInstancesOnNode(_ context.Context, nodeID string, max
 // MarkInstanceMigrating mirrors pkg/state/pgstore.go::
 // MarkInstanceMigrating. Conditional on state='running' +
 // node_id=currentNodeID; the state-machine guard is the
-// in-memory equivalent of the SQL predicate. Returns
-// ErrConflict on a lost race / row gone.
-func (m *MemStore) MarkInstanceMigrating(_ context.Context, instanceID, currentNodeID string) error {
+// in-memory equivalent of the SQL predicate. Stamps
+// lease_token alongside state='migrating' so the rollback
+// predicate at Phase 4 (CancelInstanceMigration) can match.
+// Returns ErrConflict on a lost race / row gone.
+func (m *MemStore) MarkInstanceMigrating(_ context.Context, instanceID, currentNodeID, leaseToken string) error {
 	if instanceID == "" {
 		return fmt.Errorf("state: mark instance migrating: empty instanceID")
 	}
 	if currentNodeID == "" {
 		return fmt.Errorf("state: mark instance migrating: empty currentNodeID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: mark instance migrating: empty leaseToken")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1722,6 +1728,7 @@ func (m *MemStore) MarkInstanceMigrating(_ context.Context, instanceID, currentN
 		return ErrConflict
 	}
 	ins.State = "migrating"
+	ins.LeaseToken = leaseToken
 	m.instances[instanceID] = ins
 	return nil
 }
