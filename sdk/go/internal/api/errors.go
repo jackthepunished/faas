@@ -145,6 +145,22 @@ const (
 	CodeSecretValueTooLarge = "secret_value_too_large"
 	CodeSecretNotFound      = "secret_not_found"
 
+	// Sidecar containers (issue #463 / ADR-066). Eight RFC 7807
+	// codes for the sidecar surface. The cap and type-uniqueness
+	// codes are the load-bearing 400-class shapes; the stateful
+	// and not-on-plan codes are defence-in-depth for future
+	// per-plan tier-ups. PR-A mirrors the codes here so the
+	// hand-curated sdk-go subset keeps the Go SDK compile green.
+	// Mirrored in pkg/api/errors.go (the source of truth).
+	CodeSidecarCapExceeded      = "sidecar_cap_exceeded"
+	CodeSidecarInvalidType      = "sidecar_invalid_type"
+	CodeSidecarInvalidImage     = "sidecar_invalid_image"
+	CodeSidecarStatefulDenied   = "sidecar_stateful_denied"
+	CodeSidecarInvalidName      = "sidecar_invalid_name"
+	CodeSidecarInvalidPort      = "sidecar_invalid_port"
+	CodeSidecarInvalidRamMB     = "sidecar_invalid_ram_mb"
+	CodeSidecarNotAllowedOnPlan = "sidecar_not_allowed_on_plan"
+
 	// Plan-tier feature gates (M8 §6.5). Distinct from CodePlanLimit*
 	// because the failure mode is "your plan doesn't unlock this knob
 	// at all" rather than "you used more than the plan allows".
