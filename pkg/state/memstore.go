@@ -7583,7 +7583,7 @@ func (m *MemStore) ConsumeOrgInvitation(_ context.Context, hash []byte, acceptin
 	if !inv.ExpiresAt.IsZero() && inv.ExpiresAt.Before(time.Now().UTC()) {
 		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationExpired
 	}
-	if strings.EqualFold(inv.Email, acceptingAccount.Email) == false {
+	if !strings.EqualFold(inv.Email, acceptingAccount.Email) {
 		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
 	}
 	// Insert membership; surface ErrOrgAlreadyMember if a parallel

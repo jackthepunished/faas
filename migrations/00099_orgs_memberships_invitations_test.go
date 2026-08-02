@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00095_orgs_memberships_invitations.sql
+// Migration-apply test for 00099_orgs_memberships_invitations.sql
 // (issue #190 / ADR-061, PR 2). Pins the additive org / membership /
 // invitation schema + every load-bearing invariant the downstream
 // PRs (3 backfill, 4 auth facade, 5 invite handlers, 6 API-key org
@@ -8,7 +8,7 @@
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00095.
+//  1. Migration set applies cleanly through 00099.
 //  2. orgs: column shape, slug CHECK, case-insensitive unique,
 //     exactly-one-personal-org partial unique, personal-vs-shared
 //     CHECK, plan / status CHECKs.
@@ -24,10 +24,10 @@
 //  7. Per-table partial indexes for org_id exist.
 //  8. Replay-safe: second MigrateUp is a no-op (ADR-041).
 //
-// Slot note: 00095 is the next free slot after slot 94 (app_registry_credentials
+// Slot note: 00099 is the next free slot after slot 94 (app_registry_credentials
 // per PR #522). Renumbering requires updating the seed UUIDs below,
 // e2eMigrationTarget in pkg/e2etest/harness.go, and the companion
-// 00096_reserve_slot.sql (which ADR-041 says to git rm post-merge).
+// 00100_reserve_slot.sql (which ADR-041 says to git rm post-merge).
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -42,25 +42,25 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
+func TestMigrations_00099_OrgsMembershipsInvitations(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number (`...000095`) so a reader scanning
+	// Seed UUIDs carry the slot number (`...000099`) so a reader scanning
 	// the test fixtures can pin each row to this migration without
 	// grepping the file name. Literal slot must stay in sync with the
 	// filename + e2eMigrationTarget.
 
-	// (1) Apply through 00095.
+	// (1) Apply through slot 99.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 95)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 99)", err)
 	}
 
 	// (2) Seed an account. Trusted-signer slot 86's account row is also
-	// available; we use slot 95's own seed for isolation.
+	// available; we use slot 99's own seed for isolation.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000095',
+		values ('00000000-0000-0000-0000-000000000099',
 		        'orgs-seed@example.com', 'free', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -69,7 +69,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// Second seeded account for the membership / FK-cascade assertions.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000195',
+		values ('00000000-0000-0000-0000-000000000199',
 		        'orgs-seed-2@example.com', 'free', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -111,14 +111,14 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into orgs (slug, name, personal_org, personal_owner_account_id)
 		values ('personal-95', 'Personal',
-		        true, '00000000-0000-0000-0000-000000000095')
+		        true, '00000000-0000-0000-0000-000000000099')
 	`); err != nil {
 		t.Fatalf("seed personal org: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into orgs (slug, name, personal_org, personal_owner_account_id)
 		values ('personal-95-dup', 'Dup Personal',
-		        true, '00000000-0000-0000-0000-000000000095')
+		        true, '00000000-0000-0000-0000-000000000099')
 	`); err == nil {
 		t.Errorf("orgs exactly-one-personal per account: duplicate insert should have been rejected")
 	}
@@ -128,7 +128,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into orgs (slug, name, personal_org, personal_owner_account_id)
 		values ('shared-bad', 'Shared Bad',
-		        false, '00000000-0000-0000-0000-000000000095')
+		        false, '00000000-0000-0000-0000-000000000099')
 	`); err == nil {
 		t.Errorf("orgs_personal_owner_link: shared org with personal_owner_account_id should fail CHECK")
 	}
@@ -144,7 +144,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// (8) Seed a shared (non-personal) org for membership assertions.
 	if _, err := pool.Exec(ctx, `
 		insert into orgs (id, slug, name, personal_org)
-		values ('00000000-0000-0000-0000-000000000295',
+		values ('00000000-0000-0000-0000-000000000299',
 		        'shared-95', 'Shared Co', false)
 		on conflict (id) do nothing
 	`); err != nil {
@@ -161,13 +161,13 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// (9) org_memberships PK duplicate is rejected.
 	if _, err := pool.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role)
-		values ($1, '00000000-0000-0000-0000-000000000095', 'owner')
+		values ($1, '00000000-0000-0000-0000-000000000099', 'owner')
 	`, personalOrgID); err != nil {
 		t.Fatalf("seed owner membership: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role)
-		values ($1, '00000000-0000-0000-0000-000000000095', 'admin')
+		values ($1, '00000000-0000-0000-0000-000000000099', 'admin')
 	`, personalOrgID); err == nil {
 		t.Errorf("org_memberships PK: duplicate (org_id, account_id) should be rejected")
 	}
@@ -175,8 +175,8 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// (10) org_memberships role CHECK: invalid role rejected.
 	if _, err := pool.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role)
-		values ('00000000-0000-0000-0000-000000000295',
-		        '00000000-0000-0000-0000-000000000195', 'superuser')
+		values ('00000000-0000-0000-0000-000000000299',
+		        '00000000-0000-0000-0000-000000000199', 'superuser')
 	`); err == nil {
 		t.Errorf("org_memberships_role_chk: 'superuser' should be rejected")
 	}
@@ -185,15 +185,15 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// org, then a second owner for a different account on the same org.
 	if _, err := pool.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role)
-		values ('00000000-0000-0000-0000-000000000295',
-		        '00000000-0000-0000-0000-000000000095', 'owner')
+		values ('00000000-0000-0000-0000-000000000299',
+		        '00000000-0000-0000-0000-000000000099', 'owner')
 	`); err != nil {
 		t.Fatalf("seed shared owner: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role)
-		values ('00000000-0000-0000-0000-000000000295',
-		        '00000000-0000-0000-0000-000000000195', 'owner')
+		values ('00000000-0000-0000-0000-000000000299',
+		        '00000000-0000-0000-0000-000000000199', 'owner')
 	`); err == nil {
 		t.Errorf("org_memberships_one_owner partial unique: second active owner should be rejected")
 	}
@@ -202,8 +202,8 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// is rejected; setting a row to removed_at + non-owner role is fine.
 	if _, err := pool.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role, removed_at)
-		values ('00000000-0000-0000-0000-000000000295',
-		        '00000000-0000-0000-0000-000000000195', 'owner', now())
+		values ('00000000-0000-0000-0000-000000000299',
+		        '00000000-0000-0000-0000-000000000199', 'owner', now())
 	`); err == nil {
 		t.Errorf("org_memberships_removed_role_chk: removed owner should be rejected")
 	}
@@ -211,14 +211,14 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// (13) FK cascade from orgs on memberships. Drop the shared org, the
 	// membership rows must disappear.
 	if _, err := pool.Exec(ctx, `
-		delete from orgs where id = '00000000-0000-0000-0000-000000000295'
+		delete from orgs where id = '00000000-0000-0000-0000-000000000299'
 	`); err != nil {
 		t.Fatalf("delete shared org: %v", err)
 	}
 	var remaining int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from org_memberships
-		 where org_id = '00000000-0000-0000-0000-000000000295'
+		 where org_id = '00000000-0000-0000-0000-000000000299'
 	`).Scan(&remaining); err != nil {
 		t.Fatalf("count memberships after cascade: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 		insert into org_invitations (org_id, email, role, token_hash, invited_by_account_id, expires_at)
 		values ($1, 'inviter-test@example.com', 'viewer',
 		        decode(repeat('cc', 32), 'hex'),
-		        '00000000-0000-0000-0000-000000000195',
+		        '00000000-0000-0000-0000-000000000199',
 		        now() + interval '1 day')
 	`, personalOrgID); err != nil {
 		t.Fatalf("seed invitation with inviter: %v", err)
@@ -279,7 +279,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// Account 195 currently has no membership or owned row that would
 	// block the delete; delete it, then assert invited_by is NULL.
 	if _, err := pool.Exec(ctx, `
-		delete from accounts where id = '00000000-0000-0000-0000-000000000195'
+		delete from accounts where id = '00000000-0000-0000-0000-000000000199'
 	`); err != nil {
 		t.Fatalf("delete account 195: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// asserting NULL. We use the slot-95 account which still exists.
 	if _, err := pool.Exec(ctx, `
 		insert into events (actor, actor_account_id, kind, data)
-		values ('system', '00000000-0000-0000-0000-000000000095',
+		values ('system', '00000000-0000-0000-0000-000000000099',
 		        'org.test', '{}'::jsonb)
 	`); err != nil {
 		t.Fatalf("seed event: %v", err)
@@ -310,7 +310,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 	// slot-95 account has no apps yet).
 	if _, err := pool.Exec(ctx, `
 		insert into apps (account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000095', 'evt-test-app-95',
+		values ('00000000-0000-0000-0000-000000000099', 'evt-test-app-95',
 		        'function', 128, 1, 30, 'active', now())
 	`); err != nil {
 		t.Fatalf("seed app for event test: %v", err)
@@ -322,7 +322,7 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 		t.Fatalf("delete app before account: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		delete from accounts where id = '00000000-0000-0000-0000-000000000095'
+		delete from accounts where id = '00000000-0000-0000-0000-000000000099'
 	`); err != nil {
 		t.Fatalf("delete account 95 for events test: %v", err)
 	}

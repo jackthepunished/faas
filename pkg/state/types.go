@@ -1828,7 +1828,7 @@ var ErrScanSourceDowngrade = errors.New("state: scan_source downgrade rejected")
 // OrgRole is one of the five RBAC roles per ADR-061 §Role vocabulary.
 // "owner" is reachable only via TransferOwnership (PR 5); the handler
 // PATCH /members/{id} never sets it (the SQL CHECK on
-// org_memberships.role ALSO enforces this — see migration 00095).
+// org_memberships.role ALSO enforces this — see migration 00099).
 type OrgRole string
 
 const (

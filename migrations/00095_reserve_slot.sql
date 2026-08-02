@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00096_reserve_slot.sql — slot reservation placeholder
+-- 00095_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -12,7 +12,7 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Slot 96 is held by open PR #529 (Tier A4 cross-node app
+-- Slot 95 is held by open PR #529 (Tier A4 cross-node app
 -- rebalance, ADR-064) as a real migration. This placeholder keeps
 -- PR #526's embedded set contiguous 1..100 without leaving 95/98
 -- gaps. The cross-PR slot gate hides reservation files via the

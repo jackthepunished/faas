@@ -1,4 +1,4 @@
--- filename: 00095_orgs_memberships_invitations.sql
+-- filename: 00099_orgs_memberships_invitations.sql
 -- +goose Up
 -- Organizations, memberships, and invitations (issue #190 / IAM-6 / ADR-061).
 -- This is the **expansion** phase of the staged rollout: it adds the new
@@ -7,9 +7,11 @@
 -- NULL until the backfill lands). PR 3 stamps every account's personal
 -- org + owner membership and begins the dual-write; PR 5 adds the handlers.
 --
--- Slot 95 is the next free slot on `origin/main` (slot 86 landed cosign
--- trusted-publishers per PR #504). The companion reservation file
--- `00096_reserve_slot.sql` is removed post-merge per ADR-041.
+-- Slot 99 is the next free slot on `origin/main` after slot 94
+-- (app_registry_credentials per PR #522) + slots 95/96 (apps_node_shard /
+-- apps_node_reassignable per PR #529 / Tier A4). Slots 97/98 are held
+-- by the companion reservation fences; the companion reservation file
+-- `00100_reserve_slot.sql` is removed post-merge per ADR-041.
 --
 -- Companion docs:
 --   - docs/adr/061-organizations-and-memberships.md (decision)
