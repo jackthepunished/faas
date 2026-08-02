@@ -747,6 +747,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAuditEvents))))
 	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAuditEvent))))
 
+	// Issue #517 / PR-C / ADR-064: customer-facing wake-timeline
+	// surface. Sub-resource of /v1/apps/{slug} — same auth chain
+	// as the rest of the /v1/apps/* read surface, same §12
+	// per-app rate-limit budget. The query keys on the partial
+	// index events_wake_id_idx (migrations/00092) for O(frames)
+	// latency regardless of events table size.
+	mux.HandleFunc("GET /v1/apps/{slug}/wakes/{wake_id}/timeline", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listWakeTimeline))))
+
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.
 	mux.HandleFunc("GET /v1/apps/{slug}/secrets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listSecrets))))
