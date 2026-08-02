@@ -147,29 +147,47 @@ primary_region = "fra"
     schedule: "0 3 * * *"
     command: bundle exec rake nightly
 `
-	files := map[string]string{
-		"docker-compose.yml":         composeYML,
-		"Procfile":                   procfile,
-		"fly.toml":                   flyTOML,
-		"render.yaml":                renderYAML,
-		"services/api/Dockerfile":    "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n",
-		"services/worker/Dockerfile": "FROM alpine:3.19\nCMD [\"./worker\"]\n",
+	// entries is the tar payload as an ordered slice so the tar
+	// header sequence is deterministic across runs. The
+	// cmd/apid/extract.go extractor (extractTarGzInto) strips a
+	// single top-level prefix from every entry, derived from the
+	// FIRST header it sees — so the order of these entries is
+	// load-bearing. Top-level (no-slash) entries must come before
+	// the services/{api,worker}/ entries: if `services/api/Dockerfile`
+	// landed first, the extractor would treat `services` as the
+	// archive root and strip it from the subsequent services/*/file
+	// entries, collapsing `services/api/Dockerfile` to `api/Dockerfile`
+	// at the spool root — and the convention detector would never
+	// see a `services/` directory. A map[string]string iteration
+	// here would be randomized and trip the flake approximately
+	// half the time. This mirrors what `git archive` produces for
+	// real customer repos: the top-level config files appear
+	// before the nested service dirs.
+	entries := []struct {
+		name, body string
+	}{
+		{"faas-fixture/docker-compose.yml", composeYML},
+		{"faas-fixture/Procfile", procfile},
+		{"faas-fixture/fly.toml", flyTOML},
+		{"faas-fixture/render.yaml", renderYAML},
+		{"faas-fixture/services/api/Dockerfile", "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n"},
+		{"faas-fixture/services/worker/Dockerfile", "FROM alpine:3.19\nCMD [\"./worker\"]\n"},
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
-	for name, body := range files {
+	for _, e := range entries {
 		hdr := &tar.Header{
-			Name:     name,
+			Name:     e.name,
 			Mode:     0o644,
-			Size:     int64(len(body)),
+			Size:     int64(len(e.body)),
 			Typeflag: tar.TypeReg,
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
-			t.Fatalf("tar header %s: %v", name, err)
+			t.Fatalf("tar header %s: %v", e.name, err)
 		}
-		if _, err := tw.Write([]byte(body)); err != nil {
-			t.Fatalf("tar write %s: %v", name, err)
+		if _, err := tw.Write([]byte(e.body)); err != nil {
+			t.Fatalf("tar write %s: %v", e.name, err)
 		}
 	}
 	if err := tw.Close(); err != nil {
@@ -318,15 +336,15 @@ func TestScanProject_MultiTierFixture_UnderQuota(t *testing.T) {
 		t.Errorf("workload names mismatch:\n got: %v\nwant: %v", got, wantNames)
 	}
 	// Per-workload field spot checks. Key by (RootDir, Name) so
-	// the (RootDir="", Name="api") compose entry and the
-	// (RootDir="services/api", Name="api") convention entry stay
-	// distinct — both surfaces are load-bearing for different
+	// the compose api (rootDir=".", the literal `context: .` from
+	// the fixture) and the convention api (rootDir="services/api")
+	// stay distinct — both surfaces are load-bearing for different
 	// assertions below.
 	byKey := map[string]api.PlanWorkload{}
 	for _, w := range plan.Workloads {
 		byKey[w.RootDir+"\x00"+w.Name] = w
 	}
-	composeAPI := byKey["\x00api"]
+	composeAPI := byKey[".\x00api"]
 	if composeAPI.Class != "unknown" || len(composeAPI.Ports) != 1 || composeAPI.Ports[0] != 8080 {
 		t.Errorf("compose api workload = %+v; want class=unknown, ports=[8080]", composeAPI)
 	}
