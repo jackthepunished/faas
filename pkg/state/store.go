@@ -1944,6 +1944,14 @@ type Store interface {
 	// transaction internally; the only seam of note is that pgstore's
 	// internals use BeginTx inline.
 
+	// TODO(issue-190 PR 4): wrap CreateOrg (and every mutating org
+	// method below) with a pkg/authz RequireOrgAction(action) seam
+	// before handlers land in PR 5. PR 2 ships only the store surface;
+	// PR 4 introduces the closed role/action table and the middleware
+	// facade. Until then, callers (only sister-file parity tests today)
+	// bypass role enforcement; this is deliberate so PR 2 can merge
+	// without a circular dep on pkg/authz.
+
 	// CreateOrg inserts a new org row. Returns ErrConflict on slug
 	// collision (case-insensitive via the lower(slug) unique index).
 	// Personal = true rows must carry PersonalOwnerAccountID and the

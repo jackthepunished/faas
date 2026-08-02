@@ -92,6 +92,27 @@ func TestMemStore_CreateOrg_PersonalOrgUniquePerAccount(t *testing.T) {
 	}
 }
 
+func TestMemStore_CreateOrg_PersonalRequiresOwnerPointer(t *testing.T) {
+	// A Personal=true row must carry PersonalOwnerAccountID. The SQL
+	// CHECK orgs_personal_owner_link rejects the insert, and the
+	// MemStore path mirrors that with an ErrConflict short-circuit so it
+	// does not dereference a nil pointer before surfacing the constraint.
+	m := NewMemStore()
+	ctx := context.Background()
+
+	bad := Org{
+		Slug:                   "personal-nil-owner",
+		Name:                   "Personal No Owner",
+		Personal:               true,
+		PersonalOwnerAccountID: nil,
+		Plan:                   api.PlanFree,
+		Status:                 OrgStatusActive,
+	}
+	if _, err := m.CreateOrg(ctx, bad); !errors.Is(err, ErrConflict) {
+		t.Errorf("Personal=true with nil owner pointer: err = %v, want ErrConflict (no panic)", err)
+	}
+}
+
 func TestMemStore_OrgByID_OrgBySlug_OrgByPersonalAccount(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()

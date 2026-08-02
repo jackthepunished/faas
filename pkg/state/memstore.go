@@ -7310,6 +7310,13 @@ func (m *MemStore) CreateOrg(_ context.Context, o Org) (Org, error) {
 	if _, exists := m.orgsBySlug[slugKey]; exists {
 		return Org{}, ErrConflict
 	}
+	// Defensive: Personal=true must carry PersonalOwnerAccountID. The SQL
+	// CHECK orgs_personal_owner_link would reject the row on insert, but
+	// the MemStore path dereferences the pointer below, so we guard
+	// before the scan to keep MemStore panic-free.
+	if o.Personal && o.PersonalOwnerAccountID == nil {
+		return Org{}, ErrConflict
+	}
 	if o.Personal {
 		for _, existing := range m.orgs {
 			if existing.Personal && existing.PersonalOwnerAccountID != nil &&

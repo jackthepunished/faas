@@ -226,16 +226,17 @@ func TestMigrations_00095_OrgsMembershipsInvitations(t *testing.T) {
 		t.Errorf("memberships after org cascade = %d, want 0", remaining)
 	}
 
-	// (14) org_invitations role CHECK rejects 'owner'.
+	// (14) org_invitations role CHECK rejects 'owner'. The personal org
+	// (still live at this point) gives us a non-personal FK target so
+	// only the CHECK trips — same CHECK is exercised on the shared org
+	// below in (15), but the FK-vs-CHECK ambiguity there is the reason
+	// this earlier assertion uses the personal org.
 	if _, err := pool.Exec(ctx, `
 		insert into org_invitations (org_id, email, role, token_hash, expires_at)
-		values ('00000000-0000-0000-0000-000000000295'::uuid,
-		        'x@example.com', 'owner', decode(repeat('aa', 32), 'hex'), now() + interval '1 day')
-	`); err == nil {
-		// The 'shared' org above was just deleted by cascade, so the FK
-		// to orgs will reject this even before the role CHECK runs.
-		// Both signals (FK or CHECK) mean the constraint is in place.
-		t.Logf("org_invitations 'owner' insert rejected (FK or CHECK) — acceptable")
+		values ($1, 'owner-invite@example.com', 'owner',
+		        decode(repeat('aa', 32), 'hex'), now() + interval '1 day')
+	`, personalOrgID); err == nil {
+		t.Errorf("org_invitations_role_chk: 'owner' should be rejected")
 	}
 
 	// (15) org_invitations state CHECK: setting both consumed_at and

@@ -9294,6 +9294,15 @@ func (s *PgStore) ConsumeOrgInvitation(ctx context.Context, hash []byte, accepti
 	}
 
 	// (3) Cap check. orgs.plan drives the limit; read inside the same tx.
+	//
+	// PR 7 cutover note: when plan / billing moves from accounts onto
+	// orgs, this step must run inside an explicit outer transaction with
+	// `SELECT … FROM orgs WHERE id = $1 FOR NO KEY UPDATE` to prevent a
+	// concurrent UpdateOrgPlan from racing a parallel accept. PR 2 uses
+	// the implicit FOR UPDATE on the invitation row plus the org-row
+	// implicit MVCC snapshot read, which is sufficient for the personal-org
+	// backfill path where plan changes are still serialized through the
+	// accounts table. The cutover PR will widen the lock surface here.
 	var planSlug string
 	if err := tx.QueryRow(ctx, `select plan from orgs where id = $1`, inv.OrgID).Scan(&planSlug); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
