@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00112_reserve_slot.sql — slot reservation placeholder
+-- 00114_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -12,17 +12,17 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Slot 112 is held by open PR #532 (issue #517 PR-D — jailer /
+-- Slot 114 is held by open PR #532 (issue #517 PR-D — jailer /
 -- Firecracker stderr capture table + sanitizer audit script,
 -- ADR-045 follow-up). The companion real migration on PR-D is
 -- the stderr capture table that records jailer / Firecracker
 -- stderr into the events table with kind `wake.jail_stderr`. The
 -- reservation rides the +1 offset from PR-C's real migration at
--- 00111_events_wake_id_idx.sql so the embedded set stays
--- contiguous from 1 through 112.
+-- 00113_events_wake_id_idx.sql so the embedded set stays
+-- contiguous from 1 through 114.
 --
--- Whichever side lands first (PR-C with the 111 real migration
--- + 112 reservation, or PR-D with its own real 111/112
+-- Whichever side lands first (PR-C with the 113 real migration
+-- + 114 reservation, or PR-D with its own real 113/114
 -- migrations), the other drops its reservation on rebase. The
 -- cross-PR slot gate hides reservation files via the
 -- slots_from_paths regex carve-out, so the simultaneous

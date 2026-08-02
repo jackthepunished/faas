@@ -1664,7 +1664,7 @@ type ListEventsByWakeIDRow struct {
 
 // issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
 // Filters on the jsonb expression index events_wake_id_idx
-// (migrations/00111_events_wake_id_idx.sql) and orders by at ASC
+// (migrations/00113_events_wake_id_idx.sql) and orders by at ASC
 // so the customer-facing timeline endpoint surfaces a forward
 // narrative. The $2 lower bound is the `since` RFC 3339 cursor
 // from the endpoint query string; the $3 limit is bounded to
