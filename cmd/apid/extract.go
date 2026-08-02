@@ -102,6 +102,47 @@ func extractTarGzToDir(src string, lim extractLimits) (string, *api.Problem) {
 	return dst, nil
 }
 
+// pathStaysUnder returns true iff `target` is lexically inside
+// `root`, including the case where target == root. Mirrors the
+// defensive guard at pkg/rootfs/layer.go:148-165 (safeJoin). It does
+// not defend against pre-existing symlink ancestors; dst is freshly
+// created (0o700) by extractTarGzToDir and extraction rejects all
+// symlink/hardlink entry types, so the lexical check is sufficient.
+//
+// Contract: the post-`filepath.Rel` result is rejected only when it
+// is `".."` or starts with `"../"`. Every other value is inside
+// root — including `"."` (target == root), a nested path like
+// `"foo/bar"`, and the empty string (the only `Rel` can produce in
+// practice for inputs that resolve identically on every OS; harmless
+// to accept). `filepath.Rel` errors out only on cases that imply
+// containment failure (different volumes on Windows, etc.) and we
+// treat those as escapes too.
+//
+// Callers must pass `target` and `root` after `filepath.Clean`. Both
+// come out of `filepath.Join` already cleaned, so the production
+// call site (extractTarGzInto below) is fine; a future caller that
+// builds paths some other way must clean first.
+//
+// This is the post-Join belt-and-braces guard against a
+// customer-supplied archive that slipped past escapesArchiveRoot
+// upstream. The original guard `!filepath.IsLocal(filepath.Dir(target))
+// && filepath.Dir(target) != dst` was wrong: filepath.IsLocal is
+// relative to process cwd, so an absolute dst produced a false
+// `IsLocal == false` for every nested entry on any box whose
+// FAAS_SCAN_SPOOL_ROOT is absolute (every Linux box; every Mac dev
+// box). Replaced after the bug surfaced during the issue #432
+// phase 5 local validation on Mac (post-flip path-filter PR #521).
+func pathStaysUnder(target, root string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
 func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
 	//nolint:forbidigo // src is a daemon-spooled path under FAAS_SCAN_SPOOL_ROOT
 	// (set by scanService above); not a customer-supplied path. The
@@ -201,18 +242,27 @@ func extractTarGzInto(src, dst string, lim extractLimits) *api.Problem {
 		}
 
 		target := filepath.Join(dst, filepath.FromSlash(name))
-		// final defensive IsLocal check after Join — catches any
-		// input that slipped past the segment-split predicate
-		// (Windows path semantics, trailing dots, etc.).
+		// final defensive containment check after Join — confirms
+		// the joined target stays under `dst`. Mirrors the
+		// safeJoin predicate at pkg/rootfs/layer.go:148-165.
+		// `filepath.IsLocal` would answer "is this path relative to
+		// process cwd?" — the wrong question here, since absolute
+		// spool dirs (`/var/spool/faas/scans/<id>`) make every nested
+		// post-Join path absolute and IsLocal returns false, breaking
+		// every nested entry. `filepath.Rel(dst, target)` is the
+		// correct lexical-containment predicate: a relative result of
+		// ".." or "../*" means the target escaped; "."
+		// (`target == dst`) and any non-traversing rel are inside.
 		// codeql[go/path-injection] false-positive: escapesArchiveRoot
-		// rejected any ".." or absolute path upstream (line ~150),
+		// rejected any ".." or absolute path upstream (line ~158),
 		// and `dst` is a daemon-owned 0o700 scratch dir under
-		// FAAS_SCAN_SPOOL_ROOT — never customer-controllable. CodeQL's
-		// taint engine doesn't trace escapesArchiveRoot as a sanitizer
-		// (same precedent as pkg/rootfs/layer.go:35 and
-		// pkg/rootfs/build.go:541). The post-Join filepath.IsLocal
-		// check below is the belt-and-braces runtime guard.
-		if !filepath.IsLocal(filepath.Dir(target)) && filepath.Dir(target) != dst {
+		// FAAS_SCAN_SPOOL_ROOT — never customer-controllable. The
+		// post-Join filepath.Rel check below is the belt-and-braces
+		// runtime guard (same precedent as pkg/rootfs/layer.go:35 and
+		// pkg/rootfs/build.go:541; CodeQL's taint engine doesn't
+		// trace filepath.Rel as a sanitizer either — this suppression
+		// mirrors the one we already have for filepath.IsLocal).
+		if !pathStaysUnder(target, dst) {
 			return api.ErrSourceInvalid("path escape after join rejected")
 		}
 

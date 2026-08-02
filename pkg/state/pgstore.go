@@ -5420,20 +5420,34 @@ func (s *PgStore) AppendBuilderUsage(ctx context.Context, accountID, appID, buil
 
 func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time.Time) ([]Usage, error) {
 	monthStart := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
-	// Compare via date_trunc('month', ...) on the parameter side too.
-	// The view's month column is timestamptz (date_trunc('month', timestamptz)
-	// is timestamptz). A plain `month = $2::timestamptz` still depends on the
-	// session timezone for the parameter's interpretation, which breaks on
-	// non-UTC hosts (issue #52 PR #59 follow-up: pgx encodes time.Time as a
-	// bare timestamp literal; in TZ=Europe/Istanbul that becomes
-	// 2026-07-01 00:00:00+03, while the view value is 2026-07-01 00:00:00+03
-	// but anchored to UTC internally — they compare unequal even with the
-	// explicit cast). date_trunc normalizes both sides to the month's start
-	// in UTC, sidestepping session-TZ semantics entirely.
+	monthEnd := monthStart.AddDate(0, 1, 0)
+	// Compare against a UTC-bucketed range on usage_minutes; the
+	// usage_monthly view defines `month = date_trunc('month', minute)`
+	// against a timestamptz, which means the view's bucket itself is
+	// session-TZ dependent. Querying usage_minutes directly with a
+	// UTC-anchored half-open range (same shape as UsageByHour /
+	// UsageByAccount) sidesteps the view's TZ shape AND avoids
+	// re-introducing `date_trunc('month', ...)` on either side of the
+	// comparison. The literal `monthStart` is returned as Usage.Month
+	// so the API surface stays byte-stable for callers that format
+	// the value. (memory: pkg-state-usage-monthly-tz-compare)
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count from usage_monthly
-		 where account_id = $1 and date_trunc('month', $2::timestamptz) = month order by app_id`,
-		accountID, monthStart)
+		`select account_id, app_id,
+		        $2::timestamptz as month,
+		        sum(mb_seconds)::bigint     as mb_seconds,
+		        sum(cpu_usec)::bigint       as cpu_usec,
+		        sum(requests)::bigint       as requests,
+		        sum(tx_bytes)::bigint       as tx_bytes,
+		        sum(net_tx_bytes)::bigint   as net_tx_bytes,
+		        sum(net_rx_bytes)::bigint   as net_rx_bytes,
+		        sum(cold_boot_count)::bigint as cold_boot_count
+		   from usage_minutes
+		  where account_id = $1
+		    and minute >= $2
+		    and minute <  $3
+		  group by account_id, app_id
+		  order by app_id`,
+		accountID, monthStart, monthEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -5455,9 +5469,15 @@ func (s *PgStore) UsageByMonth(ctx context.Context, accountID string, month time
 // $1..$N split as ListDeploymentsForAccount.
 //
 // Month filtering (when month != nil) applies a half-open UTC range
-// [month, month+1mo) to period_end — same convention as UsageByMonth's
-// date_trunc('month', ...) guard, sidestepping the session-TZ compare
-// trap (memory: pkg-state-usage-monthly-tz-compare).
+// [month, month+1mo) to period_end. Both bounds are pre-computed in
+// Go in UTC (monthStart / monthEnd), so the SQL compares timestamptz
+// to timestamptz on UTC instants — no `date_trunc('month', ...)` on
+// either side. The earlier form `date_trunc('month', $2::timestamptz)`
+// bucketed in the SESSION timezone, so on non-UTC Postgres sessions
+// the half-open boundary leaked (memory:
+// pkg-state-usage-monthly-tz-compare). The fix uses bare
+// `period_end >= $2` — same shape as the existing UsageByAccount
+// minute-range filter — and a session-static TZ test pins it.
 //
 // Cursor (before) is strict-less on period_end only. The id tie-break
 // is implicit in the unique index ordering; rows sharing the same
@@ -5484,7 +5504,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
-			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end >= $2
 			    and period_end <  $3
 			  order by period_end desc, id desc
 			  limit $4`,
@@ -5499,7 +5519,7 @@ func (s *PgStore) ListInvoicesForAccount(ctx context.Context, accountID string, 
 			        currency, pdf_available, created_at, updated_at
 			   from invoices
 			  where account_id = $1
-			    and period_end >= date_trunc('month', $2::timestamptz)
+			    and period_end >= $2
 			    and period_end <  $3
 			    and period_end < $4
 			  order by period_end desc, id desc
@@ -6116,13 +6136,23 @@ func (s *PgStore) LoadAllOverageCapCents(ctx context.Context) (map[string]int64,
 // surface. The migration on usage_minutes is unchanged; we SELECT
 // against the existing table.
 func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string) (int64, error) {
+	// Anchor the month lower bound in UTC on the Go side. The previous
+	// shape `minute >= date_trunc('month', now())` returned the local
+	// month's start in the session timezone (a timestamptz), so on a
+	// non-UTC Postgres session the bound was a different UTC instant
+	// from the start of the UTC calendar month — usage_minutes rows
+	// bucketed into the first UTC hour of the month were skipped.
+	// Matches the project convention (memory:
+	// pkg-state-usage-monthly-tz-compare) used elsewhere in this file.
+	now := time.Now().UTC()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	var mbSeconds int64
 	if err := s.pool.QueryRow(ctx,
 		`select COALESCE(SUM(mb_seconds), 0)::bigint
 		   from usage_minutes
 		  where account_id = $1
-		    and minute >= date_trunc('month', now())`,
-		accountID).Scan(&mbSeconds); err != nil {
+		    and minute >= $2`,
+		accountID, monthStart).Scan(&mbSeconds); err != nil {
 		return 0, err
 	}
 	// mb_seconds / 3600 = GB-h; GB-h * 100 = cents. Integer math.

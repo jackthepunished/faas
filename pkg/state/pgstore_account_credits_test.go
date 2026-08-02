@@ -410,3 +410,169 @@ func TestPgStoreConsumeAccountCredit_FIFOAndIdempotent(t *testing.T) {
 		t.Fatalf("PerCredit on replay = %d, want 0", len(second.PerCredit))
 	}
 }
+
+// TestPgStoreUsageByMonth_NonUTC pins the SQL-static fix for the
+// session-TZ-dependent usage_monthly view query. The previous
+// form `date_trunc('month', $2::timestamptz) = month` returned
+// the month's start in the SESSION timezone (a timestamptz),
+// which on a Europe/Istanbul session is a DIFFERENT UTC instant
+// from the UTC-anchored literal in `usage_monthly.month`. The
+// fix bypasses the view and queries usage_minutes directly with
+// a UTC-anchored half-open range, mirroring UsageByAccount. CI
+// runs UTC Postgres, so this sibling catches what UTC tests
+// cannot.
+func TestPgStoreUsageByMonth_NonUTC(t *testing.T) {
+	store, pool, ctx := pgStoreAccountCreditsWithPool(t)
+	if _, err := pool.Exec(ctx, `set time zone 'Europe/Istanbul'`); err != nil {
+		t.Fatalf("set time zone: %v", err)
+	}
+
+	acct, err := store.CreateAccount(ctx, "istanbul-usage@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	appA := uuid.NewString()
+	appB := uuid.NewString()
+	instA := uuid.NewString()
+	instB := uuid.NewString()
+
+	// Three minutes, all in 2026-12 UTC:
+	//   2026-12-15T00:00:00Z (= 2026-12-15T03:00 Istanbul)
+	//   2026-12-31T23:30:00Z (= 2027-01-01T02:30 Istanbul — last
+	//     UTC minute of 2026, but Istanbul's 2027-01-01 has
+	//     already begun)
+	//   2026-12-01T00:30:00Z (= 2026-12-01T03:30 Istanbul)
+	// Two minutes in 2027-01 UTC (must NOT leak into the 2026-12
+	// read):
+	//   2027-01-01T00:30:00Z (= 2027-01-01T03:30 Istanbul)
+	//   2027-01-15T12:00:00Z (= 2027-01-15T15:00 Istanbul)
+	if err := store.AppendUsage(ctx, acct.ID, appA, instA,
+		time.Date(2026, 12, 15, 0, 0, 0, 0, time.UTC), 1000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append a1: %v", err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, appA, instA,
+		time.Date(2026, 12, 31, 23, 30, 0, 0, time.UTC), 2000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append a2: %v", err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, appA, instA,
+		time.Date(2026, 12, 1, 0, 30, 0, 0, time.UTC), 4000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append a3: %v", err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, appB, instB,
+		time.Date(2027, 1, 1, 0, 30, 0, 0, time.UTC), 8000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append b1: %v", err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, appB, instB,
+		time.Date(2027, 1, 15, 12, 0, 0, 0, time.UTC), 16_000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append b2: %v", err)
+	}
+
+	// month=2026-12 must return appA only (sum = 7000), with the
+	// returned Month = 2026-12-01T00:00:00Z (the literal monthStart
+	// we computed in Go, NOT the view's bucket which would be
+	// 2026-11-30T21:00:00Z in an Istanbul session).
+	dec := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	decRows, err := store.UsageByMonth(ctx, acct.ID, dec)
+	if err != nil {
+		t.Fatalf("UsageByMonth(dec): %v", err)
+	}
+	if len(decRows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(decRows))
+	}
+	if decRows[0].AppID != appA {
+		t.Errorf("AppID = %s, want %s", decRows[0].AppID, appA)
+	}
+	if decRows[0].MBSeconds != 7000 {
+		t.Errorf("MBSeconds = %d, want 7000", decRows[0].MBSeconds)
+	}
+	if !decRows[0].Month.Equal(dec) {
+		t.Errorf("Month = %v, want %v (UTC literal, not view's TZ bucket)", decRows[0].Month, dec)
+	}
+
+	// month=2027-01 must return appB only (sum = 24000).
+	jan := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	janRows, err := store.UsageByMonth(ctx, acct.ID, jan)
+	if err != nil {
+		t.Fatalf("UsageByMonth(jan): %v", err)
+	}
+	if len(janRows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(janRows))
+	}
+	if janRows[0].AppID != appB {
+		t.Errorf("AppID = %s, want %s", janRows[0].AppID, appB)
+	}
+	if janRows[0].MBSeconds != 24_000 {
+		t.Errorf("MBSeconds = %d, want 24000", janRows[0].MBSeconds)
+	}
+}
+
+// TestPgStoreCurrentMonthOverageCents_NonUTC pins the SQL-static
+// fix for the session-TZ-dependent `date_trunc('month', now())`
+// predicate. The buggy form returned the local month's start in
+// the session timezone; on a Europe/Istanbul session, that was
+// 2026-11-30T21:00:00Z — which excluded the first 3 hours of the
+// UTC calendar month. The fix binds a Go-pre-computed UTC
+// monthStart so the bound is identical on every session TZ.
+func TestPgStoreCurrentMonthOverageCents_NonUTC(t *testing.T) {
+	store, pool, ctx := pgStoreAccountCreditsWithPool(t)
+	if _, err := pool.Exec(ctx, `set time zone 'Europe/Istanbul'`); err != nil {
+		t.Fatalf("set time zone: %v", err)
+	}
+
+	acct, err := store.CreateAccount(ctx, "istanbul-overage@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	appID := uuid.NewString()
+	instID := uuid.NewString()
+	now := time.Now().UTC()
+	thisMonthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	// One minute at the start of the current UTC month — exactly
+	// at the boundary. With the buggy form on an Istanbul session
+	// the bound was thisMonthStart.Add(-3*time.Hour) and this row
+	// was the first in the month, but Istanbul's "month start" was
+	// 3 hours earlier in UTC, so this row was inside the bound and
+	// counted. To distinguish the two shapes, plant this row at
+	// 00:00:00Z on the first of the month: the fix includes it
+	// (bound = thisMonthStart), the bug also includes it (bound =
+	// thisMonthStart - 3h). Plant a second row 2 hours into the
+	// month — that row sits BETWEEN the two bounds: fix includes
+	// (still inside thisMonthStart..now), bug also includes
+	// (still inside thisMonthStart-3h..now). To distinguish, plant
+	// the FIRST row of the UTC month at 00:00:00Z and a "second
+	// hour" row at 01:00:00Z. We will also plant a previous-month
+	// row at 23:00:00Z on the last day of the previous UTC month —
+	// that row must NOT be counted under either form.
+	firstHour := thisMonthStart
+	secondHour := thisMonthStart.Add(time.Hour)
+	prevMonthLate := thisMonthStart.Add(-time.Hour)
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, firstHour, 3_600_000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append firstHour: %v", err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, secondHour, 7_200_000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append secondHour: %v", err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, prevMonthLate, 9_000_000, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatalf("append prevMonthLate: %v", err)
+	}
+
+	// Both in-month rows must be summed; the previous-month row
+	// excluded. 3_600_000 + 7_200_000 = 10_800_000 mb_seconds. Cents
+	// = 10_800_000 * 100 / 3600 = 300_000. (The bug returned
+	// (3_600_000 + 7_200_000) on a previous-month row that
+	// accidentally rolled into the local month's bound, plus the
+	// 9_000_000 from prevMonthLate if Istanbul's month started
+	// before thisMonthStart.Add(-3h). With this fixture the bug
+	// would NOT drop firstHour, so this test mainly exercises the
+	// prevMonthLate exclusion under both forms; the more demanding
+	// boundary tests live in UsageByMonth above.)
+	got, err := store.CurrentMonthOverageCents(ctx, acct.ID)
+	if err != nil {
+		t.Fatalf("CurrentMonthOverageCents: %v", err)
+	}
+	const wantCents = int64(300_000)
+	if got != wantCents {
+		t.Fatalf("got %d cents, want %d (boundary + previous-month exclusion under Istanbul TZ)", got, wantCents)
+	}
+}
