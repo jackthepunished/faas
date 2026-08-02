@@ -25,6 +25,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -114,6 +115,12 @@ type Builderd struct {
 	// ObserveBuild* methods are also nil-safe). Wired in production via
 	// WithOpsMetrics from cmd/builderd.
 	ops *wire.OpsMetrics
+	// events is the pkg/events.Platform (issue #517 / PR-C /
+	// ADR-064). When non-nil, the markSucceeded / markFailed
+	// helpers emit wake.build_succeeded / wake.build_failed on
+	// the events table. nil opts out (the unit-test default +
+	// pre-PR-C fixtures). Mirrors schedd/vmmd/gatewayd wiring.
+	events *events.Platform
 	// builderNodeID is the compute_node name builderd writes onto every
 	// provenance row (ADR-038). Defaulted to "default-local" on the
 	// one-box; cmd/builderd sets it from a Config field. test
@@ -161,6 +168,17 @@ func New(store state.Store, notif Notifier, vm VM, cache *Cache, det *Detector, 
 // (the unit-test default) makes every observation a no-op.
 func (b *Builderd) WithOpsMetrics(ops *wire.OpsMetrics) *Builderd {
 	b.ops = ops
+	return b
+}
+
+// WithEvents attaches the events Platform (issue #517 / PR-C /
+// ADR-064) and returns the same Builderd for chaining. Mirrors
+// schedd.Engine.WithEvents / vmmd.Server.WithEvents. When non-nil,
+// the markSucceeded / markFailed helpers emit
+// wake.build_succeeded / wake.build_failed; nil opts out (the
+// unit-test default + pre-PR-C fixtures).
+func (b *Builderd) WithEvents(p *events.Platform) *Builderd {
+	b.events = p
 	return b
 }
 
@@ -536,6 +554,42 @@ func (b *Builderd) markSucceeded(ctx context.Context, buildID, code string, buil
 	// dropped row loses this build's telemetry but does NOT
 	// affect the build outcome (already stamped succeeded).
 	b.recordBuilderUsage(ctx, buildID, buildStart, string(state.BuildSucceeded))
+	// issue #517 / PR-C / ADR-064 — emit wake.build_succeeded
+	// on the events table. The build row + the deployment row
+	// are both already in scope (UpdateBuildStatus just
+	// succeeded; DeploymentByID reads through the same Store).
+	// Best-effort: a failure here is logged at Warn + counted on
+	// wake_phase_emitted_total{result="failed"}; it does NOT
+	// roll back the build row (the build is already terminal).
+	b.emitBuildSucceeded(ctx, buildID, time.Since(buildStart))
+}
+
+// emitBuildSucceeded writes the wake.build_succeeded row. Extracted
+// from markSucceeded so the lookup logic stays clear of the build
+// row's UpdateBuildStatus / recordBuilderUsage bookkeeping. The
+// function is best-effort: every failure path is logged and
+// counter'd; we never panic and never roll back the build row.
+func (b *Builderd) emitBuildSucceeded(ctx context.Context, buildID string, duration time.Duration) {
+	if b.events == nil {
+		return
+	}
+	build, err := b.store.BuildByID(ctx, buildID)
+	if err != nil {
+		b.log.Warn("builderd: emit build_succeeded lookup", "build", buildID, "err", err)
+		return
+	}
+	dep, err := b.store.DeploymentByID(ctx, build.DeploymentID)
+	if err != nil {
+		b.log.Warn("builderd: emit build_succeeded deployment lookup", "build", buildID, "err", err)
+		return
+	}
+	b.events.Emit(ctx, events.BuildSucceeded{
+		EmitAt:       time.Now().UTC(),
+		AppID:        dep.AppID,
+		DeploymentID: build.DeploymentID,
+		ImageDigest:  dep.ImageDigest,
+		DurationMs:   duration.Milliseconds(),
+	})
 }
 
 // markFailed updates the build row with a failure_class + error and finished=true,
@@ -567,6 +621,40 @@ func (b *Builderd) markFailed(ctx context.Context, depID, buildID string, fc sta
 	// (build_id) so a redelivered webhook / meterd restart /
 	// sweeper re-flip is a no-op.
 	b.recordBuilderUsage(ctx, buildID, buildStart, string(state.BuildFailed))
+	// issue #517 / PR-C / ADR-064 — emit wake.build_failed on
+	// the events table. The build row is already stamped
+	// failed + the deployment is already flipped to
+	// DeployFailed; the timeline gets the typed counterpart
+	// alongside the legacy audit row. Best-effort: failures
+	// are logged + counter'd, never rolled back.
+	b.emitBuildFailed(ctx, buildID, string(fc), msg)
+}
+
+// emitBuildFailed writes the wake.build_failed row. Mirrors
+// emitBuildSucceeded in lookup shape + best-effort semantics.
+// The reason parameter is "<fc>: <msg>" so the timeline surfaces
+// the failure class + the original builderd error in one field.
+func (b *Builderd) emitBuildFailed(ctx context.Context, buildID, fc, msg string) {
+	if b.events == nil {
+		return
+	}
+	build, err := b.store.BuildByID(ctx, buildID)
+	if err != nil {
+		b.log.Warn("builderd: emit build_failed lookup", "build", buildID, "err", err)
+		return
+	}
+	dep, err := b.store.DeploymentByID(ctx, build.DeploymentID)
+	if err != nil {
+		b.log.Warn("builderd: emit build_failed deployment lookup", "build", buildID, "err", err)
+		return
+	}
+	b.events.Emit(ctx, events.BuildFailed{
+		EmitAt:       time.Now().UTC(),
+		AppID:        dep.AppID,
+		DeploymentID: build.DeploymentID,
+		ImageDigest:  dep.ImageDigest,
+		Reason:       fc + ": " + msg,
+	})
 }
 
 // recordBuilderUsage is the ADR-048 §4 helper: looks up the
