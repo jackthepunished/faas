@@ -133,6 +133,23 @@ func (s *stubVmmdClient) UmountParentExt4(context.Context, *vmmdpb.UmountParentE
 	return &vmmdpb.UmountParentExt4Response{}, nil
 }
 
+// Tier A5 (ADR-066) — the four migration RPCs are not driven
+// from the gateway; they are schedd→vmmd only. Stubs return
+// empty responses so the gRPC VmmdClient interface stays
+// satisfied.
+func (s *stubVmmdClient) PrepareLiveMigration(context.Context, *vmmdpb.PrepareLiveMigrationRequest, ...grpc.CallOption) (*vmmdpb.PrepareLiveMigrationResponse, error) {
+	return &vmmdpb.PrepareLiveMigrationResponse{}, nil
+}
+func (s *stubVmmdClient) AdoptMigratedInstance(context.Context, *vmmdpb.AdoptMigratedInstanceRequest, ...grpc.CallOption) (*vmmdpb.AdoptMigratedInstanceResponse, error) {
+	return &vmmdpb.AdoptMigratedInstanceResponse{}, nil
+}
+func (s *stubVmmdClient) AcknowledgeMigration(context.Context, *vmmdpb.AcknowledgeMigrationRequest, ...grpc.CallOption) (*vmmdpb.AcknowledgeMigrationResponse, error) {
+	return &vmmdpb.AcknowledgeMigrationResponse{}, nil
+}
+func (s *stubVmmdClient) CancelLiveMigration(context.Context, *vmmdpb.CancelLiveMigrationRequest, ...grpc.CallOption) (*vmmdpb.CancelLiveMigrationResponse, error) {
+	return &vmmdpb.CancelLiveMigrationResponse{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).

@@ -630,7 +630,7 @@ type Store interface {
 
 	// ListLiveInstancesOnNode returns every live instance owned by
 	// nodeID — the candidate set for Engine.MigrateLiveInstances
-	// (Tier A5 / migration 00097, ADR-065, follow-up to ADR-064).
+	// (Tier A5 / migration 00097, ADR-066, follow-up to ADR-064).
 	// "Live" is the canonical predicate at IsLive: state ∈
 	// {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING}. Sorted by
 	// instance id ASC for determinism so two peers observing the
@@ -643,7 +643,7 @@ type Store interface {
 	// (pkg/api/limits.go).
 	ListLiveInstancesOnNode(ctx context.Context, nodeID string, maxPerTick int) ([]Instance, error)
 	// MarkInstanceMigrating is the Phase-2 atom of the four-phase
-	// handoff (Tier A5 / ADR-065). Transitions the instance to
+	// handoff (Tier A5 / ADR-066). Transitions the instance to
 	// state='migrating' under a conditional UPDATE that requires
 	// state='running' (the only state eligible for live migration;
 	// WAKING/COLD_BOOTING stay where they are and the dying vmmd
@@ -657,7 +657,7 @@ type Store interface {
 	// instance to a non-RUNNING state, owner changed, or row gone.
 	MarkInstanceMigrating(ctx context.Context, instanceID, currentNodeID string) error
 	// MigrateInstanceOwner is the Phase-3 commit of the four-phase
-	// handoff (Tier A5 / ADR-065). Conditional UPDATE that flips
+	// handoff (Tier A5 / ADR-066). Conditional UPDATE that flips
 	// instances.node_id from fromNodeID to toNodeID, stamps
 	// migrated_from_node_id = fromNodeID, stamps
 	// migrated_at = now(), writes lease_token (the per-migration
@@ -677,7 +677,7 @@ type Store interface {
 	// peer re-owner, lease expiry, or row gone.
 	MigrateInstanceOwner(ctx context.Context, instanceID, fromNodeID, toNodeID, leaseToken string) error
 	// CancelInstanceMigration is the Phase-4 rollback of the
-	// four-phase handoff (Tier A5 / ADR-065). Conditional UPDATE
+	// four-phase handoff (Tier A5 / ADR-066). Conditional UPDATE
 	// that transitions the instance back from 'migrating' to
 	// 'parked' on the original owner (the dying vmmd resumes the
 	// VM, the snapshot stays where it was). Predicates:

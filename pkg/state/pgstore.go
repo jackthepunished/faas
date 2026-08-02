@@ -1097,7 +1097,7 @@ func (s *PgStore) ReassignAppOwner(ctx context.Context, appID, fromNodeID, toNod
 
 // ListLiveInstancesOnNode returns every live instance owned by
 // nodeID — the candidate set for Engine.MigrateLiveInstances
-// (Tier A5 / migration 00097, ADR-065). "Live" is the canonical
+// (Tier A5 / migration 00097, ADR-066). "Live" is the canonical
 // predicate at IsLive: state ∈ {WAKING, COLD_BOOTING, RUNNING,
 // SNAPSHOTTING}. Returns an empty slice (not ErrNotFound) when
 // nodeID has no live instances; callers treat that as "nothing
@@ -1155,7 +1155,7 @@ func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, ma
 }
 
 // MarkInstanceMigrating is the Phase-2 atom of the four-phase
-// cross-node live-instance handoff (Tier A5 / ADR-065). Transitions
+// cross-node live-instance handoff (Tier A5 / ADR-066). Transitions
 // the instance to state='migrating' under a conditional UPDATE that
 // requires state='running' and node_id = currentNodeID. Returns
 // ErrConflict on RowsAffected()==0 — peer rollback, owner change, or
@@ -1199,7 +1199,7 @@ func (s *PgStore) MarkInstanceMigrating(ctx context.Context, instanceID, current
 }
 
 // MigrateInstanceOwner is the Phase-3 commit of the four-phase
-// cross-node live-instance handoff (Tier A5 / ADR-065). Conditional
+// cross-node live-instance handoff (Tier A5 / ADR-066). Conditional
 // UPDATE that flips instances.node_id, stamps the migration lineage
 // columns (migrated_from_node_id, migrated_at, lease_token),
 // transitions state from 'migrating' back to 'running', AND stamps
@@ -1207,10 +1207,10 @@ func (s *PgStore) MarkInstanceMigrating(ctx context.Context, instanceID, current
 // column stays coherent with the instance row.
 //
 // The conditional predicates are load-bearing:
-//   1. state = 'migrating' (peer rollback would have moved back to
-//      'parked' already)
-//   2. node_id = fromNodeID (peer re-owner would have flipped
-//      this already)
+//  1. state = 'migrating' (peer rollback would have moved back to
+//     'parked' already)
+//  2. node_id = fromNodeID (peer re-owner would have flipped
+//     this already)
 //
 // Returns ErrConflict on RowsAffected()==0 — peer rollback, peer
 // re-owner, or row gone.
@@ -1264,14 +1264,14 @@ func (s *PgStore) MigrateInstanceOwner(ctx context.Context, instanceID, fromNode
 }
 
 // CancelInstanceMigration is the Phase-4 rollback of the four-phase
-// cross-node live-instance handoff (Tier A5 / ADR-065). Conditional
+// cross-node live-instance handoff (Tier A5 / ADR-066). Conditional
 // UPDATE that transitions the instance back from 'migrating' to
 // 'parked' on the original owner. The dying vmmd resumes the VM;
 // the snapshot stays where it was. Predicates:
-//   1. state = 'migrating'
-//   2. node_id = originalNodeID (the rollback is owner-local; a
-//      peer commit racing us would have flipped node_id already)
-//   3. lease_token = leaseToken (stale-lease safety)
+//  1. state = 'migrating'
+//  2. node_id = originalNodeID (the rollback is owner-local; a
+//     peer commit racing us would have flipped node_id already)
+//  3. lease_token = leaseToken (stale-lease safety)
 //
 // Returns ErrConflict on RowsAffected()==0 — peer already committed
 // (no rollback needed), lease expired, or row gone. The UPDATE
@@ -7782,7 +7782,7 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 // scanInstanceColsWithMigration is the 16-column variant of
 // scanInstanceCols that also lifts migrated_from_node_id,
 // migrated_at, and lease_token (Tier A5 / migration 00097,
-// ADR-065). Used only by ListLiveInstancesOnNode — the rest of
+// ADR-066). Used only by ListLiveInstancesOnNode — the rest of
 // the codebase reads 13-column instances rows and doesn't need
 // the migration lineage. Column order matches
 // ListLiveInstancesOnNode's SELECT; keep them in lock-step.

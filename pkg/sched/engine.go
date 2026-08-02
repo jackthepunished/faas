@@ -172,6 +172,16 @@ type Engine struct {
 	// applies (no global state).
 	rebalanceMaxPerTick int
 
+	// migrateLiveMaxPerTick (Tier A5 / ADR-066) caps the
+	// per-drain-event batch for live-instance migration. Default
+	// api.MigrateLiveMaxPerTick = 10; overridable via
+	// FAAS_MIGRATE_LIVE_MAX_PER_TICK -> WithMigrateLiveConfig.
+	// Live-instance migration is more expensive than parked-
+	// app rebalance (each migration spins up a new firecracker
+	// VM on the new owner), so the cap is intentionally lower
+	// than the parked-app rebalance cap.
+	migrateLiveMaxPerTick int
+
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
 
@@ -388,6 +398,19 @@ func (e *Engine) WithRebalanceConfig(cooldownSeconds, maxPerTick int) *Engine {
 	}
 	e.rebalanceCooldownSeconds = cooldownSeconds
 	e.rebalanceMaxPerTick = maxPerTick
+	return e
+}
+
+// WithMigrateLiveConfig (Tier A5 / ADR-066) sets the per-engine
+// override for the live-instance migration per-tick cap. Same
+// "panic on bad env" contract as WithRebalanceConfig: a typo in
+// FAAS_MIGRATE_LIVE_MAX_PER_TICK must not silently fall back to
+// the api.* default.
+func (e *Engine) WithMigrateLiveConfig(maxPerTick int) *Engine {
+	if maxPerTick <= 0 {
+		panic(fmt.Sprintf("sched: WithMigrateLiveConfig: maxPerTick must be > 0, got %d", maxPerTick))
+	}
+	e.migrateLiveMaxPerTick = maxPerTick
 	return e
 }
 
@@ -1650,6 +1673,94 @@ func (e *Engine) admissionCeilingForOwn(ctx context.Context) int {
 		return 0
 	}
 	return n.AdmissionCeilingMB
+}
+
+// MigrateLiveInstances (Tier A5 / ADR-066) is the live-instance
+// counterpart to RebalanceOrphanedApps. Given a dying nodeID,
+// it lists every live instance on that node (state in
+// {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING}) and runs the
+// four-phase handoff via MigrationHarness.MigrateOne for each,
+// capped by MigrateLiveMaxPerTick.
+//
+// Per-instance work is sequential within a single MigrateLiveInstances
+// call (a future PR can fan-out via worker pool, but the lease
+// clock + the per-instance gauge is simpler this way). The
+// caller is the cmd/schedd drain watcher — same trigger shape
+// as RebalanceOrphanedApps but on a different state filter.
+//
+// Returns the count of instances we attempted; per-instance
+// outcomes land in schedd_live_migration_decisions_total.
+//
+// Failure modes:
+//   - deadNodeID == e.ownerNodeID: nothing to do (can't migrate
+//     from yourself to yourself); return 0 silently.
+//   - ownerNodeID == "": legacy single-box posture; return 0
+//     with a log.
+//   - ListLiveInstancesOnNode error: propagate.
+//   - per-instance harness error: logged Warn + metric, the
+//     loop continues. A failed migration is left to the next
+//     compute_node_changed re-fire (lease-expiry on the dying
+//     vmmd clears the entry).
+func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (int, error) {
+	if e.ownerNodeID == "" {
+		e.log.Info("sched: live migrate skipped — no owner_node_id",
+			"dead_node_id", deadNodeID)
+		return 0, nil
+	}
+	if deadNodeID == "" || deadNodeID == e.ownerNodeID {
+		return 0, nil
+	}
+	maxPerTick := api.MigrateLiveMaxPerTick
+	if e.migrateLiveMaxPerTick > 0 {
+		maxPerTick = e.migrateLiveMaxPerTick
+	}
+	liveInstances, err := e.store.ListLiveInstancesOnNode(ctx, deadNodeID, maxPerTick)
+	if err != nil {
+		return 0, fmt.Errorf("sched: live migrate: list: %w", err)
+	}
+	if len(liveInstances) == 0 {
+		return 0, nil
+	}
+	if len(liveInstances) > maxPerTick {
+		e.log.Info("sched: live migrate: capped",
+			"dead_node_id", deadNodeID,
+			"available", len(liveInstances),
+			"cap", maxPerTick)
+		liveInstances = liveInstances[:maxPerTick]
+	}
+
+	harness := NewMigrationHarness(e.store, e.vmm, e.ops, e.log,
+		e.ownerNodeID)
+	harness.SetMaxPerTick(maxPerTick)
+	harness.SetLeaseSeconds(api.MigrateLiveLeaseSeconds)
+
+	migrated, attempted := 0, 0
+	for _, ins := range liveInstances {
+		attempted++
+		err := harness.MigrateOne(ctx, ins.ID, deadNodeID)
+		if err == nil {
+			migrated++
+			continue
+		}
+		// ErrConflict is expected under contention (peer
+		// re-owner / peer rollback); log Debug, not Warn.
+		// Anything else is a per-instance failure; log Warn
+		// and continue with the rest of the batch.
+		if errors.Is(err, state.ErrConflict) {
+			e.log.Debug("sched: live migrate: peer conflict",
+				"instance_id", ins.ID, "from", deadNodeID,
+				"to", e.ownerNodeID)
+			continue
+		}
+		e.log.Warn("sched: live migrate: instance failed",
+			"instance_id", ins.ID, "from", deadNodeID,
+			"to", e.ownerNodeID, "err", err)
+	}
+	e.log.Info("sched: live migrate batch done",
+		"dead_node_id", deadNodeID,
+		"attempted", attempted, "migrated", migrated,
+		"to_node", e.ownerNodeID)
+	return attempted, nil
 }
 
 // Prime boots a freshly-built deployment once, snapshots it, and parks it —

@@ -1,4 +1,4 @@
-// migration_handoff.go — Tier A5 (ADR-065) cross-node live-instance
+// migration_handoff.go — Tier A5 (ADR-066) cross-node live-instance
 // handoff orchestrator.
 //
 // Schedd's per-instance live-migration is a four-phase commit:
@@ -76,6 +76,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // MigrationHarness owns the four-phase cross-node live-instance
@@ -113,11 +114,10 @@ type MigrationHarness struct {
 // import pkg/wire (which would force-test pkg/wire's
 // constructors). The real implementation is
 // pkg/wire.NewOpsMetrics, whose LiveMigrationDecisions
-// accessor matches this signature.
+// accessor returns a prometheus.Counter (which satisfies
+// interface{ Inc() }).
 type apiMigrationMetrics interface {
-	LiveMigrationDecisions(outcome string) interface {
-		Inc()
-	}
+	LiveMigrationDecisions(outcome string) prometheus.Counter
 }
 
 // NewMigrationHarness builds the orchestrator. The caller

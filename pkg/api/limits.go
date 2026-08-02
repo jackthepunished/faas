@@ -867,7 +867,7 @@ const (
 	RebalanceCooldownSeconds   = 60
 	RebalanceMaxPerTickPerNode = 50
 
-	// Tier A5 (cross-node live-instance migration, ADR-065
+	// Tier A5 (cross-node live-instance migration, ADR-066
 	// follow-up to ADR-064): pacing + lease window on
 	// pkg/sched/migration_handoff.go.
 	//

@@ -72,7 +72,7 @@ type RoutedVMM interface {
 	// forwards. Returns *api.Problem Capacity on an unknown
 	// nodeID (no target_url to dial).
 	Ping(ctx context.Context, nodeID string) (*PingOutcome, error)
-	// PrepareLiveMigration (Tier A5 / ADR-065) is Phase 1 of the
+	// PrepareLiveMigration (Tier A5 / ADR-066) is Phase 1 of the
 	// four-phase cross-node live-instance handoff. Dials the
 	// DYING vmmd (the nodeID argument is the dying node). Returns
 	// the snapshot storage keys + the per-migration lease_token
@@ -80,16 +80,16 @@ type RoutedVMM interface {
 	// dying node; Phase 4 (CancelLiveMigration) resumes it on
 	// a rollback.
 	PrepareLiveMigration(ctx context.Context, dyingNodeID, instanceID, snapshotStorageKey string) (LiveMigrationPrepare, error)
-	// AdoptMigratedInstance (Tier A5 / ADR-065) is Phase 2. Dials
+	// AdoptMigratedInstance (Tier A5 / ADR-066) is Phase 2. Dials
 	// the NEW owner vmmd (nodeID is the new owner). Restores the
 	// snapshot the dying vmmd wrote at Phase 1 and returns the
 	// new instance's network identifiers.
 	AdoptMigratedInstance(ctx context.Context, newOwnerNodeID, instanceID string, app AppSpec, memKey, vmstateKey, leaseToken string) (LiveMigrationAdopt, error)
-	// AcknowledgeMigration (Tier A5 / ADR-065) is Phase 3.5.
+	// AcknowledgeMigration (Tier A5 / ADR-066) is Phase 3.5.
 	// Dials the DYING vmmd and tells it "Phase 3 committed;
 	// destroy the paused VM". Idempotent.
 	AcknowledgeMigration(ctx context.Context, dyingNodeID, instanceID, leaseToken string) error
-	// CancelLiveMigration (Tier A5 / ADR-065) is Phase 4.
+	// CancelLiveMigration (Tier A5 / ADR-066) is Phase 4.
 	// Dials the DYING vmmd and tells it "abort — resume the
 	// paused VM". Idempotent on an already-resumed VM.
 	CancelLiveMigration(ctx context.Context, dyingNodeID, instanceID, leaseToken string) error
@@ -367,7 +367,7 @@ func (r *VMMRouter) Stats(ctx context.Context, nodeID string) (*StatsSnapshot, e
 	return cli.Stats(ctx)
 }
 
-// PrepareLiveMigration (Tier A5 / ADR-065) routes Phase 1 to
+// PrepareLiveMigration (Tier A5 / ADR-066) routes Phase 1 to
 // the DYING vmmd (the dyingNodeID argument). Same resolveFor
 // path as the lifecycle RPCs — dial-once-per-target semantics
 // carry over. On unknown nodeID, returns the router's
@@ -380,10 +380,10 @@ func (r *VMMRouter) PrepareLiveMigration(ctx context.Context, dyingNodeID, insta
 	if err != nil {
 		return LiveMigrationPrepare{}, err
 	}
-	return cli.PrepareLiveMigration(ctx, instanceID, snapshotStorageKey)
+	return cli.PrepareLiveMigration(ctx, dyingNodeID, instanceID, snapshotStorageKey)
 }
 
-// AdoptMigratedInstance (Tier A5 / ADR-065) routes Phase 2 to
+// AdoptMigratedInstance (Tier A5 / ADR-066) routes Phase 2 to
 // the NEW owner vmmd. Same resolveFor pattern. A dial failure
 // on the new owner surfaces as *api.Problem Capacity — the
 // orchestrator cancels the handoff at Phase 4 in that case
@@ -393,10 +393,10 @@ func (r *VMMRouter) AdoptMigratedInstance(ctx context.Context, newOwnerNodeID, i
 	if err != nil {
 		return LiveMigrationAdopt{}, err
 	}
-	return cli.AdoptMigratedInstance(ctx, instanceID, app, memKey, vmstateKey, leaseToken)
+	return cli.AdoptMigratedInstance(ctx, newOwnerNodeID, instanceID, app, memKey, vmstateKey, leaseToken)
 }
 
-// AcknowledgeMigration (Tier A5 / ADR-065) routes Phase 3.5
+// AcknowledgeMigration (Tier A5 / ADR-066) routes Phase 3.5
 // to the DYING vmmd. Best-effort — a non-OK status here is
 // logged but does not block the migration (Phase 3 has already
 // committed). The dying vmmd will eventually destroy the
@@ -407,10 +407,10 @@ func (r *VMMRouter) AcknowledgeMigration(ctx context.Context, dyingNodeID, insta
 	if err != nil {
 		return err
 	}
-	return cli.AcknowledgeMigration(ctx, instanceID, leaseToken)
+	return cli.AcknowledgeMigration(ctx, dyingNodeID, instanceID, leaseToken)
 }
 
-// CancelLiveMigration (Tier A5 / ADR-065) routes Phase 4 to
+// CancelLiveMigration (Tier A5 / ADR-066) routes Phase 4 to
 // the DYING vmmd. Idempotent on an already-resumed VM. A
 // non-OK status here is logged but does not block the rollback
 // (the row is already in 'parked' via Store.CancelInstanceMigration
@@ -420,7 +420,7 @@ func (r *VMMRouter) CancelLiveMigration(ctx context.Context, dyingNodeID, instan
 	if err != nil {
 		return err
 	}
-	return cli.CancelLiveMigration(ctx, instanceID, leaseToken)
+	return cli.CancelLiveMigration(ctx, dyingNodeID, instanceID, leaseToken)
 }
 
 // UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B) routes the

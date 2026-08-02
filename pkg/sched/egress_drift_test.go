@@ -126,6 +126,21 @@ func (r *recordingRouterVMM) Logs(_ context.Context, _, _ string, _ int64, _ tim
 	return &fakeLogStream{}, nil
 }
 
+// Tier A5 (ADR-066): no-op stubs to satisfy RoutedVMM. The
+// egress drift test doesn't drive the migration path.
+func (r *recordingRouterVMM) PrepareLiveMigration(context.Context, string, string, string) (LiveMigrationPrepare, error) {
+	return LiveMigrationPrepare{}, nil
+}
+func (r *recordingRouterVMM) AdoptMigratedInstance(context.Context, string, string, AppSpec, string, string, string) (LiveMigrationAdopt, error) {
+	return LiveMigrationAdopt{}, nil
+}
+func (r *recordingRouterVMM) AcknowledgeMigration(context.Context, string, string, string) error {
+	return nil
+}
+func (r *recordingRouterVMM) CancelLiveMigration(context.Context, string, string, string) error {
+	return nil
+}
+
 // seedEgressApp populates the store with one account + one app +
 // one deployment + a caller-supplied list of live instances, each
 // pinned to a nodeID. Returns the account, app, and the

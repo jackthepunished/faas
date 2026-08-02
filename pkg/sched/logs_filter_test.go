@@ -98,6 +98,20 @@ func (r *deploymentFilterFakeVMM) UpdateEgressAllowlist(context.Context, string,
 	return nil
 }
 
+// Tier A5 (ADR-066) — logs filter tests don't drive migration.
+func (r *deploymentFilterFakeVMM) PrepareLiveMigration(context.Context, string, string, string) (LiveMigrationPrepare, error) {
+	return LiveMigrationPrepare{}, nil
+}
+func (r *deploymentFilterFakeVMM) AdoptMigratedInstance(context.Context, string, string, AppSpec, string, string, string) (LiveMigrationAdopt, error) {
+	return LiveMigrationAdopt{}, nil
+}
+func (r *deploymentFilterFakeVMM) AcknowledgeMigration(context.Context, string, string, string) error {
+	return nil
+}
+func (r *deploymentFilterFakeVMM) CancelLiveMigration(context.Context, string, string, string) error {
+	return nil
+}
+
 // programmableLogStream lets a test push a deterministic sequence
 // of LogLine values, then io.EOF. Used to deliver gap frames from
 // the vmmd-side producer. Frames are pre-buffered at construction;

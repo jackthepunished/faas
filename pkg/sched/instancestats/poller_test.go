@@ -81,6 +81,23 @@ type statsFakeVMM struct {
 func (v *statsFakeVMM) Ping(_ context.Context) (*sched.PingOutcome, error) {
 	return &sched.PingOutcome{FcVersion: "1.10.0", ServerTime: time.Now()}, nil
 }
+
+// Tier A5 (ADR-066) — instancestats tests don't drive
+// migration; the four RPCs are no-op stubs to satisfy
+// sched.VMM. Production migration goes through
+// pkg/sched/migration_handoff_test.go.
+func (v *statsFakeVMM) PrepareLiveMigration(context.Context, string, string, string) (sched.LiveMigrationPrepare, error) {
+	return sched.LiveMigrationPrepare{}, nil
+}
+func (v *statsFakeVMM) AdoptMigratedInstance(context.Context, string, string, sched.AppSpec, string, string, string) (sched.LiveMigrationAdopt, error) {
+	return sched.LiveMigrationAdopt{}, nil
+}
+func (v *statsFakeVMM) AcknowledgeMigration(context.Context, string, string, string) error {
+	return nil
+}
+func (v *statsFakeVMM) CancelLiveMigration(context.Context, string, string, string) error {
+	return nil
+}
 func (v *statsFakeVMM) CreateColdBoot(context.Context, string, sched.AppSpec) (*sched.WakeOutcome, error) {
 	return &sched.WakeOutcome{}, nil
 }

@@ -31,7 +31,7 @@ const (
 	// transitions map below on purpose — the subscriber is the only
 	// writer, and the state is not reversible from the state machine.
 	StateEvictingAccountDeleting State = "evicting_account_deleting"
-	// StateMigrating (Tier A5 / ADR-065) — transient state stamped
+	// StateMigrating (Tier A5 / ADR-066) — transient state stamped
 	// at Phase 3 of the four-phase cross-node live-instance handoff.
 	// The dying vmmd has paused the VM and written the snapshot;
 	// the new owner vmmd is restoring. CountsForRAM returns true
@@ -110,7 +110,7 @@ func (s State) CountsForConcurrency() bool {
 // RUNNING, SNAPSHOTTING, MIGRATING} ≤ 47,600 MB).
 //
 // StateMigrating holds the paused-VM snapshot resident on the dying
-// node during the four-phase handoff (ADR-065). It counts as live
+// node during the four-phase handoff (ADR-066). It counts as live
 // RAM until either the commit succeeds (edge → RUNNING on the new
 // owner) or the rollback fires (edge → PARKED; the snapshot is
 // freed on the dying node once the dying vmmd resumes).

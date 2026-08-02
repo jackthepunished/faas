@@ -71,8 +71,16 @@ func TestConcurrencyAccounting(t *testing.T) {
 }
 
 func TestRAMAccounting(t *testing.T) {
-	// Invariant §6.2-2: these four hold resident RAM.
-	want := map[State]bool{StateWaking: true, StateColdBooting: true, StateRunning: true, StateSnapshotting: true}
+	// Invariant §6.2-2: these five hold resident RAM. Tier A5
+	// (ADR-066) added StateMigrating — the paused-VM
+	// snapshot is resident on the dying node during the
+	// four-phase handoff; the RAM must count against the
+	// admission ceiling so the invariant stays honest.
+	want := map[State]bool{
+		StateWaking: true, StateColdBooting: true,
+		StateRunning: true, StateSnapshotting: true,
+		StateMigrating: true,
+	}
 	for _, s := range States {
 		if got := s.CountsForRAM(); got != want[s] {
 			t.Errorf("%s.CountsForRAM() = %v, want %v", s, got, want[s])
@@ -95,9 +103,10 @@ func TestRAMAccounting(t *testing.T) {
 // `State(s).CountsForRAM()` indirection surfaces here.
 //
 // The set's exact membership is the load-bearing contract:
-// {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING} — the same four
-// states counted for RAM (§6.2-2). PARKED, STOPPED, FAILED,
-// EVICTING_ACCOUNT_DELETING are NOT live.
+// {WAKING, COLD_BOOTING, RUNNING, SNAPSHOTTING, MIGRATING} —
+// the same five states counted for RAM (§6.2-2). PARKED,
+// STOPPED, FAILED, EVICTING_ACCOUNT_DELETING are NOT live.
+// Tier A5 (ADR-066) added MIGRATING to this set.
 //
 // The want map is keyed by State (not string), so renaming a
 // state constant fails at compile time rather than silently
@@ -110,6 +119,7 @@ func TestIsLive(t *testing.T) {
 		StateColdBooting:             true,
 		StateRunning:                 true,
 		StateSnapshotting:            true,
+		StateMigrating:               true,
 		StateParked:                  false,
 		StateStopped:                 false,
 		StateFailed:                  false,

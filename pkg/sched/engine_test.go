@@ -32,11 +32,19 @@ type fakeVMM struct {
 	snapshots         int
 	destroys          int
 	pings             int  // PR #114: counts Ping calls (heartbeat path)
+	prepares          int  // Tier A5: counts PrepareLiveMigration calls
+	adopts            int  // Tier A5: counts AdoptMigratedInstance calls
+	acks              int  // Tier A5: counts AcknowledgeMigration calls
+	cancels           int  // Tier A5: counts CancelLiveMigration calls
 	forceColdFallback bool // CreateFromSnapshot reports a cold-boot fallback (ADR-005)
 	wakeErr           error
 	snapErr           error
 	destroyErr        error
 	pingErr           error // PR #114: injectable Ping failure for heartbeat tests
+	prepareErr        error // Tier A5: injectable PrepareLiveMigration error
+	adoptErr          error // Tier A5: injectable AdoptMigratedInstance error
+	ackErr            error // Tier A5: injectable AcknowledgeMigration error
+	cancelErr         error // Tier A5: injectable CancelLiveMigration error
 	// lastSnapRef records the SnapshotRef CreateFromSnapshot was
 	// invoked with on its most recent call. F-2 review finding —
 	// Wake's storage_key plumbing deserves a test pin; storing the
@@ -203,6 +211,102 @@ func (f *fakeVMM) Ping(_ context.Context, _ string) (*PingOutcome, error) {
 	}
 	f.pings++
 	return &PingOutcome{FcVersion: "1.10.0", ServerTime: time.Now()}, nil
+}
+
+// PrepareLiveMigration implements RoutedVMM for the Tier A5
+// (ADR-066) four-phase handoff. The fake mints a deterministic
+// lease token ("lease-<instance>") and echoes back the snapshot
+// keys. Tests that need a per-call error inject prepareErr; the
+// counters prepares / adopts / acks / cancels let the suite
+// assert each phase ran.
+func (f *fakeVMM) PrepareLiveMigration(ctx context.Context, _, instanceID, snapshotStorageKey string) (LiveMigrationPrepare, error) {
+	if d := f.sleepFor; d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return LiveMigrationPrepare{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.prepareErr != nil {
+		return LiveMigrationPrepare{}, f.prepareErr
+	}
+	f.prepares++
+	vmstateKey := snapshotStorageKey
+	if len(vmstateKey) >= 4 && vmstateKey[len(vmstateKey)-4:] == "/mem" {
+		vmstateKey = vmstateKey[:len(vmstateKey)-4] + "/vmstate"
+	} else {
+		vmstateKey = vmstateKey + "-vmstate"
+	}
+	return LiveMigrationPrepare{
+		MemStorageKey:     snapshotStorageKey,
+		VMStateStorageKey: vmstateKey,
+		LeaseToken:        "lease-" + instanceID,
+	}, nil
+}
+
+// AdoptMigratedInstance implements RoutedVMM for the Tier A5
+// handoff. Returns a fixed HostIP / Netns / GuestUID pair
+// (parallels the wake outcome shape).
+func (f *fakeVMM) AdoptMigratedInstance(ctx context.Context, _, instanceID string, _ AppSpec, _, _, _ string) (LiveMigrationAdopt, error) {
+	if d := f.sleepFor; d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return LiveMigrationAdopt{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.adoptErr != nil {
+		return LiveMigrationAdopt{}, f.adoptErr
+	}
+	f.adopts++
+	return LiveMigrationAdopt{
+		HostIP:   "10.100.0.2",
+		Netns:    "fc-" + instanceID,
+		GuestUID: 20001,
+	}, nil
+}
+
+// AcknowledgeMigration implements RoutedVMM for the Tier A5
+// handoff. Idempotent — duplicate acks are no-ops. Tracks ack
+// count for test assertions.
+func (f *fakeVMM) AcknowledgeMigration(ctx context.Context, _, _, _ string) error {
+	if d := f.sleepFor; d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ackErr != nil {
+		return f.ackErr
+	}
+	f.acks++
+	return nil
+}
+
+// CancelLiveMigration implements RoutedVMM for the Tier A5
+// handoff. Tracks cancel count.
+func (f *fakeVMM) CancelLiveMigration(ctx context.Context, _, _, _ string) error {
+	if d := f.sleepFor; d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
+	f.cancels++
+	return nil
 }
 
 // Stats implements RoutedVMM (issue #170 / PR-A). Engine tests do
