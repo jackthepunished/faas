@@ -1042,12 +1042,28 @@ func TestSec11_EgressPolicyMigrationShape(t *testing.T) {
 	//    test should track that without churn. We DO assert the
 	//    singleton CHECK constraint, which is load-bearing for the
 	//    watcher's expectation of "exactly one row".
+	// Scope the catalog lookup to current_schema(). The bare
+	// `pg_class.relname = 'egress_policy'` shape trips a latent
+	// flake under pgtest.Open: each test schema is isolated but
+	// pg_class is cluster-wide, so a sibling test that has
+	// (transiently) created+dropped an egress_policy in another
+	// schema leaves the OID visible at plan time, then
+	// pg_get_constraintdef raises "could not open relation with
+	// OID N" at execution time. Same root cause as memory
+	// migrations-info-schema-scoping-pattern (PR #339) — every
+	// information_schema / pg_catalog lookup in a migration-apply
+	// test must filter on the test's own schema. Scoping by
+	// `t.relnamespace = (SELECT oid FROM pg_namespace WHERE
+	// nspname = current_schema())` matches the canonical pattern
+	// and reads as a single self-contained predicate.
 	var constraintDef string
 	err := pool.QueryRow(context.Background(),
 		`SELECT pg_get_constraintdef(c.oid)
 		   FROM pg_constraint c
 		   JOIN pg_class t ON t.oid = c.conrelid
-		  WHERE t.relname = 'egress_policy'
+		   JOIN pg_namespace n ON n.oid = t.relnamespace
+		  WHERE n.nspname = current_schema()
+		    AND t.relname = 'egress_policy'
 		    AND c.contype = 'c'
 		    AND c.conname = 'egress_policy_singleton'`,
 	).Scan(&constraintDef)
