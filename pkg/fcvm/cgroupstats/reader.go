@@ -21,6 +21,13 @@ import (
 // tests inject via the fcvm cgroupRoot var instead.
 const defaultRoot = "/sys/fs/cgroup"
 
+// linuxGOOS is the runtime.GOOS string for Linux hosts. Extracted
+// to a const so golangci-lint v2.4.0 goconst stops flagging the
+// two runtime.GOOS guards in this file as a duplicate literal
+// (occurrences collide with reader_test.go's per-test skips and
+// trip the ≥3 min-occurrences threshold).
+const linuxGOOS = "linux"
+
 // cpuStatField is the cgroup v2 cpu.stat key that represents the
 // cumulative CPU time consumed by this scope, in microseconds. The
 // poller does the delta math against its previous cumulative, so this
@@ -128,7 +135,7 @@ func NewWithDefaults() *Reader { return New(defaultRoot, nil) }
 // 2-level path (ParentCgroupRoot/<instance>) for pre-issue-301
 // callers; new callers must always pass the real plan.
 func (r *Reader) Sample(instance string, plan api.Plan) (Sample, bool) {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != linuxGOOS {
 		return Sample{}, false
 	}
 	scope := filepath.Join(r.root, fcvm.ParentCgroupFor(plan), fcvm.PerInstanceScope(instance))
@@ -167,7 +174,7 @@ func (r *Reader) Sample(instance string, plan api.Plan) (Sample, bool) {
 // instance id, and a stable order makes the per-tick dial loop
 // easier to reason about in logs.
 func (r *Reader) Instances() ([]InstanceInfo, error) {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != linuxGOOS {
 		return nil, nil
 	}
 	base := filepath.Join(r.root, fcvm.ParentCgroupRoot)
