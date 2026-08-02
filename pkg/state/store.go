@@ -1672,7 +1672,7 @@ type Store interface {
 	// ListEventsByWakeID (issue #517 / PR-C, ADR-064) is the
 	// wake-timeline read-side query. Filters on the jsonb
 	// expression index events_wake_id_idx
-	// (migrations/00107_events_wake_id_idx.sql) and orders by at
+	// (migrations/00111_events_wake_id_idx.sql) and orders by at
 	// ASC so the customer-facing timeline endpoint surfaces a
 	// forward narrative. The since parameter is the RFC 3339
 	// lower bound (zero-value passes the floor); limit is

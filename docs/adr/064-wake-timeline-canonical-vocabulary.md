@@ -120,7 +120,7 @@ silently (forge-proof).
 ### 4. Partial jsonb expression index
 
 ```sql
--- migrations/00107_events_wake_id_idx.sql
+-- migrations/00111_events_wake_id_idx.sql
 CREATE INDEX IF NOT EXISTS events_wake_id_idx
   ON events ((data->>'wake_id'))
   WHERE data->>'wake_id' IS NOT NULL;
@@ -240,7 +240,7 @@ both joined by `wake_id`.
 - `cmd/apid/handlers_wake_timeline.go` — endpoint handler.
 - `cmd/apid/audit_subscriber.go` — deploy-failed emit.
 - `pkg/wire/metrics.go` — `wakePhaseEmitted` + `wakePhaseDur`.
-- `migrations/00107_events_wake_id_idx.sql` — partial index.
+- `migrations/00111_events_wake_id_idx.sql` — partial index.
 - `cmd/e2e/wake_timeline_metal_test.go` — M5 §14 acceptance.
 - `docs/runbooks/WakeTimelineEndpointRollout.md` — canary
   rollout.
