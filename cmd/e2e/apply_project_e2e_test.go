@@ -9,6 +9,14 @@
 // build enqueued; after PR-A each added/changed workload gets a
 // (deployment, build) pair + a build_queued notify.
 //
+// PR #541 review M1: a single APID harness is built and started
+// once for the whole themed file (TestApplyProject). Each
+// subtest reuses the harness and seeds an isolated account via
+// the harness's label-based SeedAccount dedupe. This replaces
+// the original pattern of one harness per top-level test (~64
+// daemon-suite rebuilds) and keeps ./cmd/e2e within its 15-minute
+// race/coverage ceiling.
+//
 // Coverage in this file:
 //
 //   - Multi-workload happy path: scan + apply a 6-workload repo,
@@ -164,13 +172,11 @@ func applyProjectMultipart(t *testing.T, h *e2etest.Harness, key, slug, planToke
 // typically returns in <500ms.
 const applyRequestTimeout = 10 * time.Second
 
-// TestApplyProject_MultiWorkloadHappyPath drives a 6-workload
-// customer tarball through POST /v1/projects and asserts every
-// workload lands as a state.App row with the right slug +
-// RootDir + WorkloadClass. This is the bare-minimum wire contract
-// the apply path must satisfy; the build-enqueue coverage lives
-// in apply_project_builds_e2e_test.go.
-func TestApplyProject_MultiWorkloadHappyPath(t *testing.T) {
+// TestApplyProject is the single top-level test for this themed
+// file. It opens one APID harness + Postgres pool and runs each
+// subtest against the shared instance with an isolated account.
+// PR #541 review M1 fix.
+func TestApplyProject(t *testing.T) {
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -179,305 +185,195 @@ func TestApplyProject_MultiWorkloadHappyPath(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
 
-	body := applyProjectFixture(t)
-	ar := applyProjectMultipart(t, h, key, "happy", "", body)
-
-	if ar.ProjectID == "" {
-		t.Fatalf("ApplyResponse.ProjectID is empty")
-	}
-	// Six workloads in the fixture: api (compose), worker (compose),
-	// faas-apply (fly.toml if present), services/api, services/worker,
-	// cron (Procfile). The fixture above intentionally omits fly.toml
-	// and render.yaml so we get exactly 5 from compose + convention.
-	// We assert >= 2 (the conservative lower bound — reposcan
-	// detector changes could legitimately add more) and the unique
-	// app ids are all present.
-	if len(ar.Apps) < 2 {
-		t.Fatalf("expected >= 2 apps, got %d", len(ar.Apps))
-	}
-	for _, a := range ar.Apps {
-		if a.Slug == "" {
-			t.Fatalf("app has empty slug: %+v", a)
+	t.Run("MultiWorkloadHappyPath", func(t *testing.T) {
+		key := h.SeedAccount(context.Background(), api.PlanPro, "apply-happy")
+		body := applyProjectFixture(t)
+		ar := applyProjectMultipart(t, h, key, "happy", "", body)
+		if ar.ProjectID == "" {
+			t.Fatalf("ApplyResponse.ProjectID is empty")
 		}
-		if a.ID == "" {
-			t.Fatalf("app %q has empty id", a.Slug)
+		if len(ar.Apps) < 2 {
+			t.Fatalf("expected >= 2 apps, got %d", len(ar.Apps))
 		}
-	}
-
-	// PG-side: every returned app_id has a row in apps with the
-	// claimed slug + an active status. Catches the case where the
-	// HTTP response lied but the DB didn't follow.
-	for _, a := range ar.Apps {
-		var gotSlug, gotStatus string
-		err := pool.QueryRow(context.Background(),
-			`select slug, status from apps where id = $1`, a.ID).Scan(&gotSlug, &gotStatus)
-		if err != nil {
-			t.Fatalf("apps row for %q: %v", a.ID, err)
+		for _, a := range ar.Apps {
+			if a.Slug == "" {
+				t.Fatalf("app has empty slug: %+v", a)
+			}
+			if a.ID == "" {
+				t.Fatalf("app %q has empty id", a.Slug)
+			}
 		}
-		if gotSlug != a.Slug {
-			t.Fatalf("apps.slug=%q want %q", gotSlug, a.Slug)
+		// PG-side: every returned app_id has a row in apps with the
+		// claimed slug + an active status. Catches the case where the
+		// HTTP response lied but the DB didn't follow.
+		for _, a := range ar.Apps {
+			var gotSlug, gotStatus string
+			err := pool.QueryRow(context.Background(),
+				`select slug, status from apps where id = $1`, a.ID).Scan(&gotSlug, &gotStatus)
+			if err != nil {
+				t.Fatalf("apps row for %q: %v", a.ID, err)
+			}
+			if gotSlug != a.Slug {
+				t.Fatalf("apps.slug=%q want %q", gotSlug, a.Slug)
+			}
+			if gotStatus != string(state.AppActive) {
+				t.Fatalf("apps.status=%q want active", gotStatus)
+			}
 		}
-		if gotStatus != string(state.AppActive) {
-			t.Fatalf("apps.status=%q want active", gotStatus)
-		}
-	}
-}
-
-// TestApplyProject_ProjectRowAndScanSource pins that the apply
-// path creates a projects row carrying the right ScanSource +
-// ProductionBranch. The reposcan.DeriveScanSource function picks
-// compose > Procfile > fly.toml > render.yaml > k8s > Dockerfile;
-// the fixture has docker-compose.yml so ScanSource must be
-// 'compose'.
-func TestApplyProject_ProjectRowAndScanSource(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "scansource", "", applyProjectFixture(t))
-	if ar.ScanSource != "compose" {
-		t.Fatalf("ScanSource=%q want compose (fixture has docker-compose.yml)", ar.ScanSource)
-	}
-	if ar.Tier != "compose" {
-		t.Fatalf("Tier=%q want compose", ar.Tier)
-	}
-
-	var prodBranch string
-	err := pool.QueryRow(context.Background(),
-		`select production_branch from projects where id = $1`, ar.ProjectID).Scan(&prodBranch)
-	if err != nil {
-		t.Fatalf("projects row: %v", err)
-	}
-	if prodBranch == "" {
-		t.Fatalf("production_branch is empty (default should be 'main')")
-	}
-}
-
-// TestApplyProject_ApplyResponseShape pins the wire shape of the
-// apply response: project_id, apps[] with slug+id, the embedded
-// PlanResponse (workloads + managed + can_apply + plan_token).
-// Catches accidental removals / renames — the cli + sdk-coverage
-// gate both decode this shape.
-func TestApplyProject_ApplyResponseShape(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "wire-shape", "", applyProjectFixture(t))
-
-	if ar.ProjectID == "" {
-		t.Fatalf("project_id is empty")
-	}
-	if ar.ProjectSlug != "wire-shape" {
-		t.Fatalf("project_slug=%q want wire-shape", ar.ProjectSlug)
-	}
-	if ar.PlanToken == "" {
-		t.Fatalf("plan_token is empty (apply should still mint one for re-apply use)")
-	}
-	if !ar.CanApply {
-		t.Fatalf("can_apply=false on a Pro plan under cap (apps=%d, limit=%d)",
-			len(ar.Workloads), ar.LimitApps)
-	}
-	if len(ar.Apps) != len(ar.Workloads) {
-		t.Fatalf("apps (%d) != workloads (%d): every workload must produce an app row",
-			len(ar.Apps), len(ar.Workloads))
-	}
-}
-
-// TestApplyProject_NoLeakedScanDir pins task #19: the extracted
-// source dir under FAAS_SCAN_SPOOL_ROOT must be cleaned up after
-// a successful apply. Pre-task #19 every successful scan leaked
-// the dir; the test walks the spool root and asserts no leftover
-// dirs remain.
-func TestApplyProject_NoLeakedScanDir(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	// Redirect FAAS_SCAN_SPOOL_ROOT to a t.TempDir() so we can
-	// observe leak behaviour without picking up unrelated dirs.
-	spoolDir := t.TempDir()
-	h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
-		"FAAS_SCAN_SPOOL_ROOT=" + spoolDir,
-		"FAAS_SPOOL_ROOT=" + t.TempDir(),
 	})
-	key := h.SeedAccount(context.Background(), api.PlanPro)
 
-	_ = applyProjectMultipart(t, h, key, "no-leak", "", applyProjectFixture(t))
-
-	// The spool dir is created lazily by the extractor; we want
-	// to assert it's empty AFTER the request returns. Walk the dir.
-	entries, err := os.ReadDir(spoolDir)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("readdir %s: %v", spoolDir, err)
-	}
-	if len(entries) > 0 {
-		var names []string
-		for _, e := range entries {
-			names = append(names, e.Name())
+	t.Run("ProjectRowAndScanSource", func(t *testing.T) {
+		key := h.SeedAccount(context.Background(), api.PlanPro, "apply-scansource")
+		ar := applyProjectMultipart(t, h, key, "scansource", "", applyProjectFixture(t))
+		if ar.ScanSource != "compose" {
+			t.Fatalf("ScanSource=%q want compose (fixture has docker-compose.yml)", ar.ScanSource)
 		}
-		t.Fatalf("FAAS_SCAN_SPOOL_ROOT leaked %d entries after apply: %s", len(entries), strings.Join(names, ","))
-	}
-}
-
-// TestApplyProject_DeploymentKindTarball pins the parity trap
-// plan §A4 calls out: deployments_kind_check allows
-// {image,tarball,dockerfile,github}; the apply path uses
-// DeploymentKindTarball. Pre-PR-A the apply path didn't enqueue
-// builds so this didn't surface; post-PR-A the build row's kind
-// is the source of truth and a wrong value trips the CHECK.
-func TestApplyProject_DeploymentKindTarball(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "kind", "", applyProjectFixture(t))
-	// Pick the first app + look for a deployment row in the
-	// expected state.
-	if len(ar.Apps) == 0 {
-		t.Fatalf("no apps in apply response")
-	}
-	appID := ar.Apps[0].ID
-	var depKind string
-	err := pool.QueryRow(context.Background(),
-		`select kind from deployments where app_id = $1 order by created_at desc limit 1`,
-		appID).Scan(&depKind)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			t.Fatalf("no deployment row for app %q (PR-A didn't enqueue a build)", appID)
+		if ar.Tier != "compose" {
+			t.Fatalf("Tier=%q want compose", ar.Tier)
 		}
-		t.Fatalf("deployments query: %v", err)
-	}
-	if depKind != "tarball" {
-		t.Fatalf("deployment.kind=%q want tarball (the only kind in both CHECKs that the apply path can use)", depKind)
-	}
-}
-
-// TestApplyProject_BuildRowCreated is the bare-minimum
-// build-enqueue assertion: every added app gets one build row
-// with kind=tarball + status=queued. Detailed coverage of the
-// builds slice (deployment_id, build_id, payload shape, notify)
-// lives in apply_project_builds_e2e_test.go.
-func TestApplyProject_BuildRowCreated(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "build-row", "", applyProjectFixture(t))
-	if len(ar.Apps) == 0 {
-		t.Fatalf("no apps")
-	}
-	for _, a := range ar.Apps {
-		var buildCount int
+		var prodBranch string
 		err := pool.QueryRow(context.Background(),
-			`select count(*) from builds b join deployments d on d.id = b.deployment_id where d.app_id = $1`,
-			a.ID).Scan(&buildCount)
+			`select production_branch from projects where id = $1`, ar.ProjectID).Scan(&prodBranch)
 		if err != nil {
-			t.Fatalf("build count for %s: %v", a.ID, err)
+			t.Fatalf("projects row: %v", err)
 		}
-		if buildCount < 1 {
-			t.Fatalf("app %s has zero build rows (PR-A must enqueue one)", a.Slug)
+		if prodBranch == "" {
+			t.Fatalf("production_branch is empty (default should be 'main')")
 		}
-	}
-}
-
-// TestApplyProject_AppIDsAreUnique pins that every ApplyResponse
-// app entry has a distinct ID. A bug where ApplyResponse.Apps
-// shares an ID across workloads would break the CLI's "applied
-// X → app_id" line.
-func TestApplyProject_AppIDsAreUnique(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "unique-ids", "", applyProjectFixture(t))
-	seen := make(map[string]bool, len(ar.Apps))
-	for _, a := range ar.Apps {
-		if seen[a.ID] {
-			t.Fatalf("duplicate app id %q for slug %q", a.ID, a.Slug)
-		}
-		seen[a.ID] = true
-	}
-}
-
-// TestApplyProject_StagedTarballOnDisk pins that the per-workload
-// tarball landed under FAAS_SPOOL_ROOT/projects/<acct>/<project>/.
-// builderd reads this path directly (pkg/builderd/builderd.go:321)
-// so a missing file would surface as a builderd-side error; the
-// apply path's contract is "the file is on disk before we respond".
-func TestApplyProject_StagedTarballOnDisk(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	spoolRoot := t.TempDir()
-	h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
-		"FAAS_SPOOL_ROOT=" + spoolRoot,
 	})
-	key := h.SeedAccount(context.Background(), api.PlanPro)
 
-	ar := applyProjectMultipart(t, h, key, "staged-on-disk", "", applyProjectFixture(t))
-	if len(ar.Apps) == 0 {
-		t.Fatalf("no apps")
-	}
-	// The dir layout is <spoolRoot>/projects/<acct>/<project>/<appID>.tar.gz.
-	// We don't have the account ID directly; walk the spoolRoot for
-	// any *.tar.gz under projects/ — there must be at least one per app.
-	var found int
-	err := filepath.Walk(spoolRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	t.Run("ApplyResponseShape", func(t *testing.T) {
+		key := h.SeedAccount(context.Background(), api.PlanPro, "apply-wireshape")
+		ar := applyProjectMultipart(t, h, key, "wire-shape", "", applyProjectFixture(t))
+		if ar.ProjectID == "" {
+			t.Fatalf("project_id is empty")
 		}
-		if info.IsDir() {
+		if ar.ProjectSlug != "wire-shape" {
+			t.Fatalf("project_slug=%q want wire-shape", ar.ProjectSlug)
+		}
+		if ar.PlanToken == "" {
+			t.Fatalf("plan_token is empty (apply should still mint one for re-apply use)")
+		}
+		if !ar.CanApply {
+			t.Fatalf("can_apply=false on a Pro plan under cap (apps=%d, limit=%d)",
+				len(ar.Workloads), ar.LimitApps)
+		}
+		if len(ar.Apps) != len(ar.Workloads) {
+			t.Fatalf("apps (%d) != workloads (%d): every workload must produce an app row",
+				len(ar.Apps), len(ar.Workloads))
+		}
+	})
+
+	t.Run("NoLeakedScanDir", func(t *testing.T) {
+		// This subtest needs FAAS_SCAN_SPOOL_ROOT + FAAS_SPOOL_ROOT
+		// overrides; spawn a child harness with the env. We can't
+		// reuse the parent's Start because the harness is shared.
+		// Instead, point the env vars at temp dirs and assert no
+		// leftovers after the apply completes.
+		spoolDir := t.TempDir()
+		h2 := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
+			"FAAS_SCAN_SPOOL_ROOT=" + spoolDir,
+			"FAAS_SPOOL_ROOT=" + t.TempDir(),
+		})
+		key := h2.SeedAccount(context.Background(), api.PlanPro, "apply-noleak")
+		_ = applyProjectMultipart(t, h2, key, "no-leak", "", applyProjectFixture(t))
+		entries, err := os.ReadDir(spoolDir)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("readdir %s: %v", spoolDir, err)
+		}
+		if len(entries) > 0 {
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Fatalf("FAAS_SCAN_SPOOL_ROOT leaked %d entries after apply: %s", len(entries), strings.Join(names, ","))
+		}
+	})
+
+	t.Run("DeploymentKindTarball", func(t *testing.T) {
+		key := h.SeedAccount(context.Background(), api.PlanPro, "apply-kind")
+		ar := applyProjectMultipart(t, h, key, "kind", "", applyProjectFixture(t))
+		if len(ar.Apps) == 0 {
+			t.Fatalf("no apps in apply response")
+		}
+		appID := ar.Apps[0].ID
+		var depKind string
+		err := pool.QueryRow(context.Background(),
+			`select kind from deployments where app_id = $1 order by created_at desc limit 1`,
+			appID).Scan(&depKind)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				t.Fatalf("no deployment row for app %q (PR-A didn't enqueue a build)", appID)
+			}
+			t.Fatalf("deployments query: %v", err)
+		}
+		if depKind != "tarball" {
+			t.Fatalf("deployment.kind=%q want tarball (the only kind in both CHECKs that the apply path can use)", depKind)
+		}
+	})
+
+	t.Run("BuildRowCreated", func(t *testing.T) {
+		key := h.SeedAccount(context.Background(), api.PlanPro, "apply-buildrow")
+		ar := applyProjectMultipart(t, h, key, "build-row", "", applyProjectFixture(t))
+		if len(ar.Apps) == 0 {
+			t.Fatalf("no apps")
+		}
+		for _, a := range ar.Apps {
+			var buildCount int
+			err := pool.QueryRow(context.Background(),
+				`select count(*) from builds b join deployments d on d.id = b.deployment_id where d.app_id = $1`,
+				a.ID).Scan(&buildCount)
+			if err != nil {
+				t.Fatalf("build count for %s: %v", a.ID, err)
+			}
+			if buildCount < 1 {
+				t.Fatalf("app %s has zero build rows (PR-A must enqueue one)", a.Slug)
+			}
+		}
+	})
+
+	t.Run("AppIDsAreUnique", func(t *testing.T) {
+		key := h.SeedAccount(context.Background(), api.PlanPro, "apply-uniqueids")
+		ar := applyProjectMultipart(t, h, key, "unique-ids", "", applyProjectFixture(t))
+		seen := make(map[string]bool, len(ar.Apps))
+		for _, a := range ar.Apps {
+			if seen[a.ID] {
+				t.Fatalf("duplicate app id %q for slug %q", a.ID, a.Slug)
+			}
+			seen[a.ID] = true
+		}
+	})
+
+	t.Run("StagedTarballOnDisk", func(t *testing.T) {
+		// Same env-override reason as NoLeakedScanDir.
+		spoolRoot := t.TempDir()
+		h2 := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
+			"FAAS_SPOOL_ROOT=" + spoolRoot,
+		})
+		key := h2.SeedAccount(context.Background(), api.PlanPro, "apply-staged")
+		ar := applyProjectMultipart(t, h2, key, "staged-on-disk", "", applyProjectFixture(t))
+		if len(ar.Apps) == 0 {
+			t.Fatalf("no apps")
+		}
+		var found int
+		err := filepath.Walk(spoolRoot, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(path, ".tar.gz") && strings.Contains(path, "/projects/") {
+				found++
+			}
 			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk spool: %v", err)
 		}
-		if strings.HasSuffix(path, ".tar.gz") && strings.Contains(path, "/projects/") {
-			found++
+		if found < len(ar.Apps) {
+			t.Fatalf("staged tarballs on disk: %d, want >= %d (one per app)", found, len(ar.Apps))
 		}
-		return nil
 	})
-	if err != nil {
-		t.Fatalf("walk spool: %v", err)
-	}
-	if found < len(ar.Apps) {
-		t.Fatalf("staged tarballs on disk: %d, want >= %d (one per app)", found, len(ar.Apps))
-	}
 }

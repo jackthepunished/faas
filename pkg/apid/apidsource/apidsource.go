@@ -34,11 +34,11 @@
 // (RFC 7807 vs gRPC asGRPC vs reposcan Problem). The helper returns
 // plain wrapped errors so callers can decide how to surface them.
 //
-// The Store + Notifier interfaces mirror the existing minimal slice
-// in cmd/apid/githubd_bridge.go (the bridge's interface set was
-// already the canonical seam for this flow). pkg/state.Store
-// satisfies both via structural typing; the apid-side
-// cmd/apid/pgNotifier satisfies Notifier structurally too.
+// The Store + Notifier interfaces here are the canonical minimal
+// slice for the deploy+build flow; cmd/apid/githubd_bridge.go
+// defines an equivalent local interface for its unit-test seam.
+// pkg/state.Store satisfies Store via structural typing; the
+// apid-side cmd/apid/pgNotifier satisfies Notifier structurally.
 package apidsource
 
 import (
@@ -96,11 +96,12 @@ type Notifier interface {
 //	Handler     — function handler when Type=function. Empty for
 //	              all other paths.
 //	Source      — the JSON `"source"` payload value (the kind of
-//	              source that triggered the build). Matches the
-//	              notifySourceGithub convention in githubd_bridge.go
-//	              ("github") and the apid-side convention ("tarball"
-//	              | "dockerfile"). Keep this value aligned with
-//	              DeploymentKind to avoid two vocabularies diverging.
+//	              source that triggered the build). Optional: when
+//	              empty, the helper derives it from Kind so the
+//	              payload stays consistent across callers. Pass a
+//	              non-empty value only to preserve a legacy
+//	              wire-contract quirk (none today; field is
+//	              derived-from-Kind by default).
 //	LogSpool    — absolute path to the build-spool root. The helper
 //	              writes <LogSpool>/<deployment_id>/build.log. Same
 //	              value as cmd/apid.deployInputs.spoolRoot() and
@@ -221,6 +222,17 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 		return EnqueueResult{}, fmt.Errorf("apidsource.Enqueue: create build: %w", err)
 	}
 
+	// Resolve the wire "source" field. Default to Kind so the
+	// build_queued payload's `source` field tracks `kind` and
+	// dashboards split-by-source stay consistent across the three
+	// callers. An explicit Source is honored for legacy wire-
+	// contract quirks (none today; the field is derivable from
+	// Kind for every caller).
+	source := p.Source
+	if source == "" {
+		source = string(p.Kind)
+	}
+
 	// Step 6: NotifyBuildQueued. Best-effort. builderd's poll-
 	// recovery (state.Store.ClaimNextQueuedBuild, FOR UPDATE SKIP
 	// LOCKED) files missing notifies.
@@ -229,7 +241,7 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 		"deployment": d.ID,
 		"app":        p.AppID,
 		"kind":       string(p.Kind),
-		"source":     p.Source,
+		"source":     source,
 	})
 	if err := notif.Notify(ctx, db.NotifyBuildQueued, string(queuedPayload)); err != nil {
 		p.Log.Warn("apidsource.Enqueue: notify build_queued (durable recovery will pick it up)",
@@ -240,7 +252,7 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 	// Skipped on first deploy (no prev).
 	if prev.ID != "" {
 		supPayload, _ := json.Marshal(map[string]any{
-			"kind":          p.Source,
+			"kind":          source,
 			"status":        "superseded",
 			"app_id":        p.AppID,
 			"deployment_id": prev.ID,
@@ -253,7 +265,7 @@ func Enqueue(ctx context.Context, store Store, notif Notifier, p EnqueueParams) 
 	}
 
 	p.Log.Info("apidsource.Enqueue: build enqueued",
-		"deployment", d.ID, "app", p.AppID, "kind", p.Kind, "build", build.ID, "source", p.Source)
+		"deployment", d.ID, "app", p.AppID, "kind", p.Kind, "build", build.ID, "source", source)
 
 	return EnqueueResult{DeploymentID: d.ID, BuildID: build.ID}, nil
 }

@@ -193,8 +193,14 @@ func (s *server) applyBuildsForAddedChanged(
 		// other apps.
 		staged, bytes, stageErr := s.stageApplyTarball(ctx, scanDir, acct.ID, project.ID, app)
 		if stageErr != nil {
+			// Surface a generic message on the wire — the
+			// full error (which includes operator paths
+			// like the spool root) goes to slog only. The
+			// dashboard renders this string in the apply
+			// response, and we don't want to leak server
+			// layout to the customer.
 			s.log.Warn("apid: apply stage tarball failed", "app_id", app.ID, "slug", app.Slug, "project_id", project.ID, "err", stageErr)
-			res.Error = fmt.Sprintf("stage: %v", stageErr)
+			res.Error = "stage failed (server logs carry the detail)"
 			out = append(out, res)
 			continue
 		}
@@ -208,13 +214,17 @@ func (s *server) applyBuildsForAddedChanged(
 			Kind:        state.DeploymentKindTarball,
 			SourcePath:  staged,
 			SourceBytes: bytes,
-			Source:      "tarball",
 			LogSpool:    spoolRoot(),
 			Log:         s.log,
 		})
 		if enqErr != nil {
+			// Same wire/server split as the stage branch
+			// above: surface a generic message to the
+			// customer, log the full error (which can carry
+			// pgx field names, row IDs, spool paths) to
+			// slog only.
 			s.log.Warn("apid: apply enqueue build failed", "app_id", app.ID, "slug", app.Slug, "project_id", project.ID, "err", enqErr)
-			res.Error = fmt.Sprintf("enqueue: %v", enqErr)
+			res.Error = "enqueue failed (server logs carry the detail)"
 			out = append(out, res)
 			continue
 		}
@@ -634,13 +644,14 @@ func (s *server) scanService(
 	// renders the results in the apply response so the CLI's
 	// `faas apply` flow can show "app X: deployment Y, build Z".
 	//
-	// This runs AFTER the deferred ScanDir cleanup would fire (the
-	// handler's defer); but the handler's defer is registered on
-	// the handler func, and `defer`s fire in reverse order — the
-	// ScanDir defer on the handler runs AFTER this return. So the
-	// staging reads from a still-live ScanDir. The task #19 fix
-	// will move the ScanDir cleanup to happen inside this func,
-	// after staging, so the lifetime is local.
+	// ScanDir lifetime: this function reads from req.ScanDir,
+	// which is cleaned up by the handler's defer on req.ScanDir
+	// (registered above). Defers fire in reverse order, so the
+	// handler's defer runs AFTER this function returns — meaning
+	// req.ScanDir is still on disk while staging reads it, which
+	// is what we want. A future refactor that moves the ScanDir
+	// cleanup into this func must keep staging reads ahead of
+	// the cleanup.
 	builds := s.applyBuildsForAddedChanged(r.Context(), acct, project, req.ScanDir, rec.Added, rec.Changed)
 	return resp, project, rec.Added, rec.Changed, removedSlugs, builds, nil
 }

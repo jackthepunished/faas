@@ -165,17 +165,17 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 		// to gain this; the in-tx ordering is invisible above the Store
 		// seam.
 		//
-		// Source="image" preserves the legacy apid supersede payload's
-		// hardcoded `kind` field — imaged's F5 handler keys off
-		// status=="superseded", not the kind, but a wire-level change
-		// here would be observable by dashboards / future consumers.
+		// The wire "source" payload value is now derived from Kind
+		// inside apidsource.Enqueue (H1 fix from PR #541 review) — the
+		// legacy hardcoded "image" diverged from Kind for tarball /
+		// dockerfile deploys and produced misleading split-by-source
+		// dashboards.
 		_, err := apidsource.Enqueue(ctx(r), s.store, s.notif, apidsource.EnqueueParams{
 			AppID:       app.ID,
 			Kind:        kind,
 			SourcePath:  sourcePath,
 			SourceBytes: sourceBytes,
 			Handler:     handler,
-			Source:      "image",
 			LogSpool:    spoolRoot(),
 			Log:         s.log,
 		})

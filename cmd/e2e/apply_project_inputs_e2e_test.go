@@ -13,6 +13,13 @@
 //   7. Audit taxonomy: project.created / workload.added /
 //      workload.changed / workload.removed rows surface via the
 //      events API.
+//
+// PR #541 review M1: a single APID harness is built and started
+// once for the whole themed file (TestApplyProject_Inputs).
+// Each subtest reuses the harness and seeds an isolated account
+// via the harness's label-based SeedAccount dedupe. This
+// replaces the original pattern of one harness per top-level
+// test.
 
 package e2e_test
 
@@ -271,11 +278,11 @@ func managedServicesFixture(t *testing.T, prefix string) []byte {
 	return buf.Bytes()
 }
 
-// ---- auth / scope / MFA ----
-
-// TestApplyProject_Inputs_NoAuth pins 401 for a request with no
-// Authorization header.
-func TestApplyProject_Inputs_NoAuth(t *testing.T) {
+// TestApplyProject_Inputs is the single top-level test for this
+// themed file. It opens one APID harness + Postgres pool and
+// runs each subtest against the shared instance with an
+// isolated account. PR #541 review M1 fix.
+func TestApplyProject_Inputs(t *testing.T) {
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -285,558 +292,374 @@ func TestApplyProject_Inputs_NoAuth(t *testing.T) {
 	}
 	h := e2etest.Start(t, pool, e2etest.APID)
 
-	status, _ := applyProjectAs(t, h, "", "", "no-auth", inputsFixture(t, "faas-noauth"))
-	if status != http.StatusUnauthorized {
-		t.Fatalf("status=%d want 401", status)
-	}
-}
-
-// TestApplyProject_Inputs_BadScope pins 403 for a request with
-// a valid token but a missing scope. The exact scope name lives
-// in pkg/api; we just assert the status code.
-func TestApplyProject_Inputs_BadScope(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-
-	status, _ := applyProjectAs(t, h, "Bearer wrong-scope-token", "", "bad-scope", inputsFixture(t, "faas-badscope"))
-	if status == http.StatusOK {
-		t.Fatalf("bad-scope request succeeded (regression: scope check missing)")
-	}
-	if status != http.StatusUnauthorized && status != http.StatusForbidden {
-		t.Fatalf("status=%d want 401/403", status)
-	}
-}
-
-// TestApplyProject_Inputs_MFARequired pins that an apply while
-// MFA is required but not yet completed returns 403 mfa_required.
-// The harness is wired so MFA can be forced; we toggle a flag via
-// e2etest.Harness.SetMFARequired if it exists, otherwise the
-// test is a no-op pin.
-func TestApplyProject_Inputs_MFARequired(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	// Without forcing MFA, the apply succeeds — this baseline
-	// pins the "happy path with MFA not required" case.
-	status, _ := applyProjectAs(t, h, "Bearer "+key, "", "mfa-off", inputsFixture(t, "faas-mfa"))
-	if status != http.StatusOK {
-		t.Fatalf("apply without MFA required returned %d (want 200)", status)
-	}
-}
-
-// ---- plan_token ----
-
-// TestApplyProject_Inputs_PlanTokenReuseSameValue pins that
-// re-applying with the SAME plan_token returned by the first
-// apply is idempotent — the second apply is treated as a no-op
-// (or at minimum, returns 200/OK rather than 409).
-func TestApplyProject_Inputs_PlanTokenReuseSameValue(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar1 := applyProjectMultipart(t, h, key, "token-reuse", "", inputsFixture(t, "faas-token-reuse"))
-	if ar1.PlanToken == "" {
-		t.Fatalf("first apply returned empty plan_token")
-	}
-	status, _ := applyProjectWithToken(t, h, key, "token-reuse", ar1.PlanToken, inputsFixture(t, "faas-token-reuse"))
-	if status != http.StatusOK {
-		t.Fatalf("same-token re-apply status=%d want 200 (idempotent path)", status)
-	}
-}
-
-// TestApplyProject_Inputs_PlanTokenMismatch pins that an apply
-// with a DIFFERENT plan_token from the one returned by the first
-// apply trips plan_token_mismatch (409).
-func TestApplyProject_Inputs_PlanTokenMismatch(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar1 := applyProjectMultipart(t, h, key, "token-mm", "", inputsFixture(t, "faas-token-mm"))
-	if ar1.PlanToken == "" {
-		t.Fatalf("first apply returned empty plan_token")
-	}
-	status, _ := applyProjectWithToken(t, h, key, "token-mm", "bogus-token", inputsFixture(t, "faas-token-mm"))
-	if status != http.StatusConflict {
-		t.Fatalf("mismatched token status=%d want 409", status)
-	}
-}
-
-// TestApplyProject_Inputs_PlanTokenStale pins that an apply
-// using a plan_token from an older project (after a successful
-// re-apply that minted a new token) returns 409 stale. We
-// approximate "older token" by using a synthetic 64-hex token.
-func TestApplyProject_Inputs_PlanTokenStale(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	// Synthetic token: 32 hex chars = 16 bytes. Format assumed
-	// by the validator; a wrong-shape token trips 409.
-	status, _ := applyProjectWithToken(t, h, key, "token-stale",
-		"0123456789abcdef0123456789abcdef", inputsFixture(t, "faas-token-stale"))
-	if status != http.StatusConflict && status != http.StatusUnprocessableEntity {
-		t.Fatalf("stale-token status=%d want 409/422", status)
-	}
-}
-
-// ---- Idempotency-Key ----
-
-// TestApplyProject_Inputs_IdempotencyKeyReplay pins that two
-// applies with the SAME Idempotency-Key return the SAME
-// project_id (the second is treated as a replay of the first).
-func TestApplyProject_Inputs_IdempotencyKeyReplay(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	idemKey := fmt.Sprintf("idem-%s", time.Now().Format("20060102T150405.000000000"))
-	body := inputsFixture(t, "faas-idem")
-
-	s1, b1 := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem", body)
-	s2, b2 := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem", body)
-	if s1 != http.StatusOK || s2 != http.StatusOK {
-		t.Fatalf("status s1=%d s2=%d want 200/200 (b1=%s b2=%s)", s1, s2, b1, b2)
-	}
-	var ar1, ar2 api.ApplyResponse
-	_ = json.Unmarshal(b1, &ar1)
-	_ = json.Unmarshal(b2, &ar2)
-	if ar1.ProjectID == "" || ar2.ProjectID == "" {
-		t.Fatalf("empty project_id in idem replay")
-	}
-	if ar1.ProjectID != ar2.ProjectID {
-		t.Fatalf("idem replay produced different project_ids: %q vs %q", ar1.ProjectID, ar2.ProjectID)
-	}
-}
-
-// TestApplyProject_Inputs_IdempotencyKeyDifferentBody pins that
-// two applies with the SAME Idempotency-Key but DIFFERENT bodies
-// return 409 idempotency_mismatch (the safety net for retry
-// storms that change payload mid-retry).
-func TestApplyProject_Inputs_IdempotencyKeyDifferentBody(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	idemKey := fmt.Sprintf("idem-diff-%s", time.Now().Format("20060102T150405.000000000"))
-	s1, _ := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem-diff", inputsFixture(t, "faas-idem-diff-1"))
-	s2, _ := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem-diff", inputsFixture(t, "faas-idem-diff-2"))
-	if s1 != http.StatusOK {
-		t.Fatalf("first apply status=%d want 200", s1)
-	}
-	// The second apply with a different body but same key
-	// must NOT be silently accepted as a replay — either 409
-	// (mismatch) or 422 (validation). 200 would be a regression.
-	if s2 == http.StatusOK {
-		t.Fatalf("different-body idem replay returned 200 (regression: server ignored payload diff)")
-	}
-}
-
-// ---- malicious tarballs ----
-
-// TestApplyProject_Inputs_PathTraversalRejected pins that a
-// tarball containing `..` in entry names is rejected — the apply
-// returns 4xx and creates zero project rows.
-func TestApplyProject_Inputs_PathTraversalRejected(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	status, _ := applyProjectAs(t, h, "Bearer "+key, "", "traversal",
-		maliciousPathTraversalFixture(t, "faas-trav"))
-	if status == http.StatusOK {
-		t.Fatalf("path-traversal tarball accepted (regression: extractor allowed .. in entry)")
-	}
-	// 4xx range — 400 bad_request or 422 validation.
-	if status < 400 || status >= 500 {
-		t.Fatalf("status=%d want 4xx", status)
-	}
-}
-
-// TestApplyProject_Inputs_AbsolutePathRejected pins that a
-// tarball with absolute entry paths is rejected.
-func TestApplyProject_Inputs_AbsolutePathRejected(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	status, _ := applyProjectAs(t, h, "Bearer "+key, "", "abs",
-		maliciousAbsoluteFixture(t, "faas-abs"))
-	if status == http.StatusOK {
-		t.Fatalf("absolute-path tarball accepted (regression)")
-	}
-	if status < 400 || status >= 500 {
-		t.Fatalf("status=%d want 4xx", status)
-	}
-}
-
-// TestApplyProject_Inputs_SymlinkRejected pins that a tarball
-// with a symlink pointing outside the extract root is rejected.
-// This is the canonical Zip-Slip port to tar.
-func TestApplyProject_Inputs_SymlinkRejected(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	status, _ := applyProjectAs(t, h, "Bearer "+key, "", "sym",
-		maliciousSymlinkFixture(t, "faas-sym"))
-	if status == http.StatusOK {
-		t.Fatalf("symlink-outside-root tarball accepted (regression: Zip-Slip)")
-	}
-	if status < 400 || status >= 500 {
-		t.Fatalf("status=%d want 4xx", status)
-	}
-}
-
-// TestApplyProject_Inputs_EntryCountCap pins that a tarball with
-// more than MaxApplyEntries entries is rejected (server cap).
-func TestApplyProject_Inputs_EntryCountCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	// MaxApplyEntries is pkg/api/limits.go; the limit is encoded
-	// there. We use 10_000 to be safely above any reasonable cap
-	// (5_000 today). If the cap moves up, this test will start
-	// passing with 200 — that's the "raise cap" tripwire.
-	status, _ := applyProjectAs(t, h, "Bearer "+key, "", "cap",
-		entryCountCapFixture(t, "faas-cap", 10_000))
-	if status == http.StatusOK {
-		t.Logf("entry-count cap test: 10000-entry tarball accepted — cap may have been raised; verify pkg/api/limits.go MaxApplyEntries")
-		return
-	}
-	if status != http.StatusRequestEntityTooLarge && status != http.StatusUnprocessableEntity {
-		t.Fatalf("status=%d want 413/422 (entry cap rejection)", status)
-	}
-}
-
-// TestApplyProject_Inputs_BodyHashStable pins the wire-side
-// audit contract: the apply response carries a content hash
-// (sha256 of the staged tarball) that builderd uses to detect
-// drift between staging and claim.
-func TestApplyProject_Inputs_BodyHashStable(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	body := inputsFixture(t, "faas-hash")
-	ar := applyProjectMultipart(t, h, key, "hash", "", body)
-	// Pin: re-applying with the same body must produce a
-	// stable hash (no time-dependent fields). We can't access
-	// the hash directly (it's an internal field), but the
-	// plan_token should also be stable across replays of the
-	// same input.
-	if ar.PlanToken == "" {
-		t.Fatalf("plan_token empty on hash test")
-	}
-	// Hash the body — if there's a hash in the audit log it
-	// should match. We just record the expected sha256 here
-	// for downstream tests to consume.
-	expected := sha256.Sum256(body)
-	_ = hex.EncodeToString(expected[:])
-}
-
-// TestApplyProject_Inputs_PathCanonicalised pins that the
-// extractor canonicalises paths: a tarball with `./services`
-// (leading `./`) extracts the same way as `services` — and the
-// apply succeeds.
-func TestApplyProject_Inputs_PathCanonicalised(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	// Build a tarball with `./` prefix in entry names.
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	for _, e := range []struct{ name, body string }{
-		{"./faas-canon/services/api/Dockerfile", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
-		{"./faas-canon/services/api/index.js", "exports.handler = () => 1;\n"},
-	} {
-		hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
-		_ = tw.WriteHeader(hdr)
-		_, _ = tw.Write([]byte(e.body))
-	}
-	_ = tw.Close()
-	_ = gz.Close()
-
-	status, _ := applyProjectAs(t, h, "Bearer "+key, "", "canon", buf.Bytes())
-	if status != http.StatusOK {
-		t.Fatalf("dot-prefixed paths status=%d want 200 (extractor should canonicalise)", status)
-	}
-}
-
-// ---- managed services (ADR-047) ----
-
-// TestApplyProject_Inputs_ManagedReportedNotProvisioned pins
-// ADR-047: a render.yaml `services:` block is reported in the
-// plan but the apply creates ZERO apps for it. Only the
-// `cronJobs:` block produces workloads.
-func TestApplyProject_Inputs_ManagedReportedNotProvisioned(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "managed", "", managedServicesFixture(t, "faas-mgd"))
-
-	// Plan response reports the managed services (the caller's
-	// UI renders them as "you should provision these yourself").
-	// But ar.Apps contains zero managed-service rows — only the
-	// api workload from compose.
-	for _, a := range ar.Apps {
-		if strings.Contains(a.Slug, "redis") || strings.Contains(a.Slug, "postgres") {
-			t.Fatalf("managed service %q surfaced as an app row (ADR-047 violated)", a.Slug)
+	t.Run("NoAuth", func(t *testing.T) {
+		// Pins 401 for a request with no Authorization header.
+		status, _ := applyProjectAs(t, h, "", "", "no-auth", inputsFixture(t, "faas-noauth"))
+		if status != http.StatusUnauthorized {
+			t.Fatalf("status=%d want 401", status)
 		}
-	}
-	// Sanity: at least one real app from compose.
-	if len(ar.Apps) == 0 {
-		t.Fatalf("no apps at all from compose+managed fixture")
-	}
-}
+	})
 
-// ---- audit taxonomy ----
+	t.Run("BadScope", func(t *testing.T) {
+		// Pins 403 for a request with a valid token but a
+		// missing scope. The exact scope name lives in
+		// pkg/api; we just assert the status code.
+		status, _ := applyProjectAs(t, h, "Bearer wrong-scope-token", "", "bad-scope", inputsFixture(t, "faas-badscope"))
+		if status == http.StatusOK {
+			t.Fatalf("bad-scope request succeeded (regression: scope check missing)")
+		}
+		if status != http.StatusUnauthorized && status != http.StatusForbidden {
+			t.Fatalf("status=%d want 401/403", status)
+		}
+	})
 
-// TestApplyProject_Inputs_AuditProjectCreated pins that a
-// successful apply emits an audit event with kind=
-// project.created. The dashboard renders this; missing →
-// "applied but no audit trail".
-func TestApplyProject_Inputs_AuditProjectCreated(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
+	t.Run("MFARequired", func(t *testing.T) {
+		// Pins that an apply while MFA is required but not
+		// yet completed returns 403 mfa_required. The
+		// harness is wired so MFA can be forced; we toggle a
+		// flag via e2etest.Harness.SetMFARequired if it
+		// exists, otherwise the test is a no-op pin.
+		// Without forcing MFA, the apply succeeds — this
+		// baseline pins the "happy path with MFA not
+		// required" case.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-mfa")
+		status, _ := applyProjectAs(t, h, "Bearer "+key, "", "mfa-off", inputsFixture(t, "faas-mfa"))
+		if status != http.StatusOK {
+			t.Fatalf("apply without MFA required returned %d (want 200)", status)
+		}
+	})
 
-	_ = applyProjectMultipart(t, h, key, "audit-create", "", inputsFixture(t, "faas-audit-create"))
+	t.Run("PlanTokenReuseSameValue", func(t *testing.T) {
+		// Pins that re-applying with the SAME plan_token
+		// returned by the first apply is idempotent — the
+		// second apply is treated as a no-op (or at minimum,
+		// returns 200/OK rather than 409).
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-token-reuse")
+		ar1 := applyProjectMultipart(t, h, key, "token-reuse", "", inputsFixture(t, "faas-token-reuse"))
+		if ar1.PlanToken == "" {
+			t.Fatalf("first apply returned empty plan_token")
+		}
+		status, _ := applyProjectWithToken(t, h, key, "token-reuse", ar1.PlanToken, inputsFixture(t, "faas-token-reuse"))
+		if status != http.StatusOK {
+			t.Fatalf("same-token re-apply status=%d want 200 (idempotent path)", status)
+		}
+	})
 
-	var eventCount int
-	err := pool.QueryRow(context.Background(),
-		`select count(*) from events where kind = 'project.created'`).Scan(&eventCount)
-	if err != nil {
-		t.Logf("events table may not exist on this schema: %v", err)
-		return
-	}
-	if eventCount == 0 {
-		t.Fatalf("apply did not emit project.created event (dashboard audit trail broken)")
-	}
-}
+	t.Run("PlanTokenMismatch", func(t *testing.T) {
+		// Pins that an apply with a DIFFERENT plan_token
+		// from the one returned by the first apply trips
+		// plan_token_mismatch (409).
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-token-mm")
+		ar1 := applyProjectMultipart(t, h, key, "token-mm", "", inputsFixture(t, "faas-token-mm"))
+		if ar1.PlanToken == "" {
+			t.Fatalf("first apply returned empty plan_token")
+		}
+		status, _ := applyProjectWithToken(t, h, key, "token-mm", "bogus-token", inputsFixture(t, "faas-token-mm"))
+		if status != http.StatusConflict {
+			t.Fatalf("mismatched token status=%d want 409", status)
+		}
+	})
 
-// TestApplyProject_Inputs_AuditWorkloadAdded pins that adding a
-// new workload in a 2nd apply emits workload.added. We exercise
-// it with a single-apply first, then a 2-workload re-apply.
-func TestApplyProject_Inputs_AuditWorkloadAdded(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
+	t.Run("PlanTokenStale", func(t *testing.T) {
+		// Pins that an apply using a plan_token from an
+		// older project (after a successful re-apply that
+		// minted a new token) returns 409 stale. We
+		// approximate "older token" by using a synthetic
+		// 32-hex token (16 bytes — the format the validator
+		// accepts; a wrong-shape token trips 409).
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-token-stale")
+		status, _ := applyProjectWithToken(t, h, key, "token-stale",
+			"0123456789abcdef0123456789abcdef", inputsFixture(t, "faas-token-stale"))
+		if status != http.StatusConflict && status != http.StatusUnprocessableEntity {
+			t.Fatalf("stale-token status=%d want 409/422", status)
+		}
+	})
 
-	// First apply: 1 workload.
-	_ = applyProjectMultipart(t, h, key, "audit-add", "", inputsFixture(t, "faas-audit-add-1"))
-	// Second apply: 2 workloads.
-	_ = applyProjectMultipart(t, h, key, "audit-add", "", twoWorkloadFixture(t, "faas-audit-add-2"))
+	t.Run("IdempotencyKeyReplay", func(t *testing.T) {
+		// Pins that two applies with the SAME
+		// Idempotency-Key return the SAME project_id (the
+		// second is treated as a replay of the first).
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-idem")
+		idemKey := fmt.Sprintf("idem-%s", time.Now().Format("20060102T150405.000000000"))
+		body := inputsFixture(t, "faas-idem")
+		s1, b1 := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem", body)
+		s2, b2 := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem", body)
+		if s1 != http.StatusOK || s2 != http.StatusOK {
+			t.Fatalf("status s1=%d s2=%d want 200/200 (b1=%s b2=%s)", s1, s2, b1, b2)
+		}
+		var ar1, ar2 api.ApplyResponse
+		_ = json.Unmarshal(b1, &ar1)
+		_ = json.Unmarshal(b2, &ar2)
+		if ar1.ProjectID == "" || ar2.ProjectID == "" {
+			t.Fatalf("empty project_id in idem replay")
+		}
+		if ar1.ProjectID != ar2.ProjectID {
+			t.Fatalf("idem replay produced different project_ids: %q vs %q", ar1.ProjectID, ar2.ProjectID)
+		}
+	})
 
-	var eventCount int
-	err := pool.QueryRow(context.Background(),
-		`select count(*) from events where kind = 'workload.added'`).Scan(&eventCount)
-	if err != nil {
-		t.Logf("events table may not exist on this schema: %v", err)
-		return
-	}
-	if eventCount == 0 {
-		t.Fatalf("2nd apply did not emit workload.added event")
-	}
-}
+	t.Run("IdempotencyKeyDifferentBody", func(t *testing.T) {
+		// Pins that two applies with the SAME
+		// Idempotency-Key but DIFFERENT bodies return 409
+		// idempotency_mismatch (the safety net for retry
+		// storms that change payload mid-retry).
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-idem-diff")
+		idemKey := fmt.Sprintf("idem-diff-%s", time.Now().Format("20060102T150405.000000000"))
+		s1, _ := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem-diff", inputsFixture(t, "faas-idem-diff-1"))
+		s2, _ := applyProjectAs(t, h, "Bearer "+key, idemKey, "idem-diff", inputsFixture(t, "faas-idem-diff-2"))
+		if s1 != http.StatusOK {
+			t.Fatalf("first apply status=%d want 200", s1)
+		}
+		// The second apply with a different body but same
+		// key must NOT be silently accepted as a replay —
+		// either 409 (mismatch) or 422 (validation). 200
+		// would be a regression.
+		if s2 == http.StatusOK {
+			t.Fatalf("different-body idem replay returned 200 (regression: server ignored payload diff)")
+		}
+	})
 
-// TestApplyProject_Inputs_AuditWorkloadRemoved pins that
-// removing a workload in a 2nd apply emits workload.removed.
-func TestApplyProject_Inputs_AuditWorkloadRemoved(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
+	t.Run("PathTraversalRejected", func(t *testing.T) {
+		// Pins that a tarball containing `..` in entry
+		// names is rejected — the apply returns 4xx and
+		// creates zero project rows.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-trav")
+		status, _ := applyProjectAs(t, h, "Bearer "+key, "", "traversal",
+			maliciousPathTraversalFixture(t, "faas-trav"))
+		if status == http.StatusOK {
+			t.Fatalf("path-traversal tarball accepted (regression: extractor allowed .. in entry)")
+		}
+		// 4xx range — 400 bad_request or 422 validation.
+		if status < 400 || status >= 500 {
+			t.Fatalf("status=%d want 4xx", status)
+		}
+	})
 
-	// First apply: 2 workloads.
-	_ = applyProjectMultipart(t, h, key, "audit-rm", "", twoWorkloadFixture(t, "faas-audit-rm-1"))
-	// Second apply: 1 workload.
-	_ = applyProjectMultipart(t, h, key, "audit-rm", "", oneWorkloadFixtureFromPrefix(t, "faas-audit-rm-2"))
+	t.Run("AbsolutePathRejected", func(t *testing.T) {
+		// Pins that a tarball with absolute entry paths is
+		// rejected.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-abs")
+		status, _ := applyProjectAs(t, h, "Bearer "+key, "", "abs",
+			maliciousAbsoluteFixture(t, "faas-abs"))
+		if status == http.StatusOK {
+			t.Fatalf("absolute-path tarball accepted (regression)")
+		}
+		if status < 400 || status >= 500 {
+			t.Fatalf("status=%d want 4xx", status)
+		}
+	})
 
-	var eventCount int
-	err := pool.QueryRow(context.Background(),
-		`select count(*) from events where kind = 'workload.removed'`).Scan(&eventCount)
-	if err != nil {
-		t.Logf("events table may not exist on this schema: %v", err)
-		return
-	}
-	if eventCount == 0 {
-		t.Fatalf("removal did not emit workload.removed event")
-	}
-}
+	t.Run("SymlinkRejected", func(t *testing.T) {
+		// Pins that a tarball with a symlink pointing
+		// outside the extract root is rejected. This is the
+		// canonical Zip-Slip port to tar.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-sym")
+		status, _ := applyProjectAs(t, h, "Bearer "+key, "", "sym",
+			maliciousSymlinkFixture(t, "faas-sym"))
+		if status == http.StatusOK {
+			t.Fatalf("symlink-outside-root tarball accepted (regression: Zip-Slip)")
+		}
+		if status < 400 || status >= 500 {
+			t.Fatalf("status=%d want 4xx", status)
+		}
+	})
 
-// TestApplyProject_Inputs_AuditWorkloadChanged pins that
-// changing a workload's source emits workload.changed.
-func TestApplyProject_Inputs_AuditWorkloadChanged(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
+	t.Run("EntryCountCap", func(t *testing.T) {
+		// Pins that a tarball with more than MaxApplyEntries
+		// entries is rejected (server cap).
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-cap")
+		// MaxApplyEntries is pkg/api/limits.go; the limit
+		// is encoded there. We use 10_000 to be safely
+		// above any reasonable cap (5_000 today). If the
+		// cap moves up, this test will start passing with
+		// 200 — that's the "raise cap" tripwire.
+		status, _ := applyProjectAs(t, h, "Bearer "+key, "", "cap",
+			entryCountCapFixture(t, "faas-cap", 10_000))
+		if status == http.StatusOK {
+			t.Logf("entry-count cap test: 10000-entry tarball accepted — cap may have been raised; verify pkg/api/limits.go MaxApplyEntries")
+			return
+		}
+		if status != http.StatusRequestEntityTooLarge && status != http.StatusUnprocessableEntity {
+			t.Fatalf("status=%d want 413/422 (entry cap rejection)", status)
+		}
+	})
 
-	// First apply: 2-workload body=1.
-	_ = applyProjectMultipart(t, h, key, "audit-chg", "", twoWorkloadFixture(t, "faas-audit-chg-1"))
-	// Second apply: 2-workload body=99.
-	_ = applyProjectMultipart(t, h, key, "audit-chg", "", twoWorkloadChangedFixture(t, "faas-audit-chg-2"))
+	t.Run("BodyHashStable", func(t *testing.T) {
+		// Pins the wire-side audit contract: the apply
+		// response carries a content hash (sha256 of the
+		// staged tarball) that builderd uses to detect
+		// drift between staging and claim.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-hash")
+		body := inputsFixture(t, "faas-hash")
+		ar := applyProjectMultipart(t, h, key, "hash", "", body)
+		// Pin: re-applying with the same body must produce
+		// a stable hash (no time-dependent fields). We
+		// can't access the hash directly (it's an internal
+		// field), but the plan_token should also be stable
+		// across replays of the same input.
+		if ar.PlanToken == "" {
+			t.Fatalf("plan_token empty on hash test")
+		}
+		// Hash the body — if there's a hash in the audit
+		// log it should match. We just record the expected
+		// sha256 here for downstream tests to consume.
+		expected := sha256.Sum256(body)
+		_ = hex.EncodeToString(expected[:])
+	})
 
-	var eventCount int
-	err := pool.QueryRow(context.Background(),
-		`select count(*) from events where kind = 'workload.changed'`).Scan(&eventCount)
-	if err != nil {
-		t.Logf("events table may not exist on this schema: %v", err)
-		return
-	}
-	if eventCount == 0 {
-		t.Fatalf("change did not emit workload.changed event")
-	}
-}
+	t.Run("PathCanonicalised", func(t *testing.T) {
+		// Pins that the extractor canonicalises paths: a
+		// tarball with `./services` (leading `./`) extracts
+		// the same way as `services` — and the apply
+		// succeeds.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-canon")
+		// Build a tarball with `./` prefix in entry names.
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		for _, e := range []struct{ name, body string }{
+			{"./faas-canon/services/api/Dockerfile", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
+			{"./faas-canon/services/api/index.js", "exports.handler = () => 1;\n"},
+		} {
+			hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
+			_ = tw.WriteHeader(hdr)
+			_, _ = tw.Write([]byte(e.body))
+		}
+		_ = tw.Close()
+		_ = gz.Close()
+		status, _ := applyProjectAs(t, h, "Bearer "+key, "", "canon", buf.Bytes())
+		if status != http.StatusOK {
+			t.Fatalf("dot-prefixed paths status=%d want 200 (extractor should canonicalise)", status)
+		}
+	})
 
-// TestApplyProject_Inputs_AuditAccountScoped pins that the
-// audit events for an apply are scoped to the calling account —
-// a second account's apply does NOT see the first account's
-// events. Cross-account leakage would be a §11 security
-// violation.
-func TestApplyProject_Inputs_AuditAccountScoped(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
+	t.Run("ManagedReportedNotProvisioned", func(t *testing.T) {
+		// Pins ADR-047: a render.yaml `services:` block is
+		// reported in the plan but the apply creates ZERO
+		// apps for it. Only the `cronJobs:` block produces
+		// workloads.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-managed")
+		ar := applyProjectMultipart(t, h, key, "managed", "", managedServicesFixture(t, "faas-mgd"))
+		// Plan response reports the managed services (the
+		// caller's UI renders them as "you should provision
+		// these yourself"). But ar.Apps contains zero
+		// managed-service rows — only the api workload from
+		// compose.
+		for _, a := range ar.Apps {
+			if strings.Contains(a.Slug, "redis") || strings.Contains(a.Slug, "postgres") {
+				t.Fatalf("managed service %q surfaced as an app row (ADR-047 violated)", a.Slug)
+			}
+		}
+		// Sanity: at least one real app from compose.
+		if len(ar.Apps) == 0 {
+			t.Fatalf("no apps at all from compose+managed fixture")
+		}
+	})
 
-	keyA := h.SeedAccount(context.Background(), api.PlanPro, "acctA")
-	keyB := h.SeedAccount(context.Background(), api.PlanPro, "acctB")
-	_ = applyProjectMultipart(t, h, keyA, "scope-a", "", inputsFixture(t, "faas-scope-a"))
+	t.Run("AuditProjectCreated", func(t *testing.T) {
+		// Pins that a successful apply emits an audit event
+		// with kind=project.created. The dashboard renders
+		// this; missing → "applied but no audit trail".
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-audit-create")
+		_ = applyProjectMultipart(t, h, key, "audit-create", "", inputsFixture(t, "faas-audit-create"))
+		var eventCount int
+		err := pool.QueryRow(context.Background(),
+			`select count(*) from events where kind = 'project.created'`).Scan(&eventCount)
+		if err != nil {
+			t.Fatalf("events query: %v", err)
+		}
+		if eventCount == 0 {
+			t.Fatalf("apply did not emit project.created event (dashboard audit trail broken)")
+		}
+	})
 
-	// Pin: account B has no project rows for scope-a.
-	var projCount int
-	_ = pool.QueryRow(context.Background(),
-		`select count(*) from projects where slug = 'scope-a'`).Scan(&projCount)
-	// The project exists exactly once (under account A's
-	// scope), and account B's apply to a different slug must
-	// not see it. We verify by applying from B with the same
-	// slug — that should fail with 409 slug_taken (the slug
-	// uniqueness scope is global, not per-account, to avoid
-	// impersonation).
-	_ = projCount
-	status, _ := applyProjectAs(t, h, "Bearer "+keyB, "", "scope-a", inputsFixture(t, "faas-scope-b"))
-	if status != http.StatusConflict && status != http.StatusUnprocessableEntity {
-		t.Fatalf("cross-account slug replay status=%d want 409/422", status)
-	}
-	// Silence unused warnings — path import is referenced by
-	// the path-canonicalisation logic elsewhere in this file.
-	_ = path.Join
+	t.Run("AuditWorkloadAdded", func(t *testing.T) {
+		// Pins that adding a new workload in a 2nd apply
+		// emits workload.added. We exercise it with a
+		// single-apply first, then a 2-workload re-apply.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-audit-add")
+		// First apply: 1 workload.
+		_ = applyProjectMultipart(t, h, key, "audit-add", "", inputsFixture(t, "faas-audit-add-1"))
+		// Second apply: 2 workloads.
+		_ = applyProjectMultipart(t, h, key, "audit-add", "", twoWorkloadFixture(t, "faas-audit-add-2"))
+		var eventCount int
+		err := pool.QueryRow(context.Background(),
+			`select count(*) from events where kind = 'workload.added'`).Scan(&eventCount)
+		if err != nil {
+			t.Fatalf("events query: %v", err)
+		}
+		if eventCount == 0 {
+			t.Fatalf("2nd apply did not emit workload.added event")
+		}
+	})
+
+	t.Run("AuditWorkloadRemoved", func(t *testing.T) {
+		// Pins that removing a workload in a 2nd apply
+		// emits workload.removed.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-audit-rm")
+		// First apply: 2 workloads.
+		_ = applyProjectMultipart(t, h, key, "audit-rm", "", twoWorkloadFixture(t, "faas-audit-rm-1"))
+		// Second apply: 1 workload.
+		_ = applyProjectMultipart(t, h, key, "audit-rm", "", oneWorkloadFixtureFromPrefix(t, "faas-audit-rm-2"))
+		var eventCount int
+		err := pool.QueryRow(context.Background(),
+			`select count(*) from events where kind = 'workload.removed'`).Scan(&eventCount)
+		if err != nil {
+			t.Fatalf("events query: %v", err)
+		}
+		if eventCount == 0 {
+			t.Fatalf("removal did not emit workload.removed event")
+		}
+	})
+
+	t.Run("AuditWorkloadChanged", func(t *testing.T) {
+		// Pins that changing a workload's source emits
+		// workload.changed.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "inputs-audit-chg")
+		// First apply: 2-workload body=1.
+		_ = applyProjectMultipart(t, h, key, "audit-chg", "", twoWorkloadFixture(t, "faas-audit-chg-1"))
+		// Second apply: 2-workload body=99.
+		_ = applyProjectMultipart(t, h, key, "audit-chg", "", twoWorkloadChangedFixture(t, "faas-audit-chg-2"))
+		var eventCount int
+		err := pool.QueryRow(context.Background(),
+			`select count(*) from events where kind = 'workload.changed'`).Scan(&eventCount)
+		if err != nil {
+			t.Fatalf("events query: %v", err)
+		}
+		if eventCount == 0 {
+			t.Fatalf("change did not emit workload.changed event")
+		}
+	})
+
+	t.Run("AuditAccountScoped", func(t *testing.T) {
+		// Pins that the audit events for an apply are scoped
+		// to the calling account — a second account's apply
+		// does NOT see the first account's events.
+		// Cross-account leakage would be a §11 security
+		// violation.
+		keyA := h.SeedAccount(context.Background(), api.PlanPro, "inputs-acctA")
+		keyB := h.SeedAccount(context.Background(), api.PlanPro, "inputs-acctB")
+		_ = applyProjectMultipart(t, h, keyA, "scope-a", "", inputsFixture(t, "faas-scope-a"))
+		// Pin: account B has no project rows for scope-a.
+		var projCount int
+		if err := pool.QueryRow(context.Background(),
+			`select count(*) from projects where slug = 'scope-a'`).Scan(&projCount); err != nil {
+			t.Fatalf("count projects: %v", err)
+		}
+		// The project exists exactly once (under account A's
+		// scope), and account B's apply to a different slug
+		// must not see it. We verify by applying from B with
+		// the same slug — that should fail with 409
+		// slug_taken (the slug uniqueness scope is global,
+		// not per-account, to avoid impersonation).
+		_ = projCount
+		status, _ := applyProjectAs(t, h, "Bearer "+keyB, "", "scope-a", inputsFixture(t, "faas-scope-b"))
+		if status != http.StatusConflict && status != http.StatusUnprocessableEntity {
+			t.Fatalf("cross-account slug replay status=%d want 409/422", status)
+		}
+		// Silence unused warnings — path import is
+		// referenced by the path-canonicalisation logic
+		// elsewhere in this file.
+		_ = path.Join
+	})
 }

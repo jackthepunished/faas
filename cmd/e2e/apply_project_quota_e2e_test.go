@@ -19,6 +19,12 @@
 //   - DB has zero rows in projects / apps for the over-cap apply.
 //   - No build rows were created either (PR-A: a quota failure
 //     must not enqueue any builds).
+//
+// PR #541 review M1: a single APID harness is built and started
+// once for the whole themed file (TestApplyProject_Quota). Each
+// subtest reuses the harness and seeds an isolated account via
+// the harness's label-based SeedAccount dedupe. This replaces
+// the original pattern of one harness per top-level test.
 
 package e2e_test
 
@@ -31,6 +37,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,14 +46,30 @@ import (
 	"github.com/onebox-faas/faas/pkg/e2etest"
 )
 
-// quotaFixture builds an N-workload tarball with N convention-
-// detector workloads. Used to push plans over their DeployedApps
-// cap without involving the multi-tier detectors.
+// quotaFixture builds an N-workload tarball with exactly N
+// workloads detected by the scanner. The compose service names
+// (svc0..svcN) match the convention-detected Dockerfiles under
+// services/svc0..svcN so reposcan merges them by (RootDir, Name)
+// into a single workload per pair. Without this merge, the
+// compose service "api" + convention Dockerfile "svc0" produced
+// 2 workloads from a fixture claiming 1 (PR #541 review M2).
 func quotaFixture(t *testing.T, workloadCount int) []byte {
 	t.Helper()
+	if workloadCount < 0 {
+		t.Fatalf("quotaFixture: workloadCount=%d must be >= 0", workloadCount)
+	}
+	// Compose block: one service per requested workload, named
+	// `svc0`..`svcN-1`, with matching build context so the
+	// compose + convention detectors merge.
+	var composeLines strings.Builder
+	composeLines.WriteString("services:\n")
+	for i := 0; i < workloadCount; i++ {
+		composeLines.WriteString("  svc" + itoa(i) + ":\n")
+		composeLines.WriteString("    build: { context: services/svc" + itoa(i) + " }\n")
+	}
 	entries := make([]struct{ name, body string }, 0, workloadCount+1)
 	entries = append(entries, struct{ name, body string }{
-		"faas-quota/docker-compose.yml", "services:\n  api:\n    build: { context: services/api }\n",
+		"faas-quota/docker-compose.yml", composeLines.String(),
 	})
 	for i := 0; i < workloadCount; i++ {
 		entries = append(entries, struct{ name, body string }{
@@ -123,237 +146,11 @@ func applyProjectExpectProblem(t *testing.T, h *e2etest.Harness, key, slug strin
 	}
 }
 
-// TestApplyProject_Quota_FreePlanOverCap pins the Free plan
-// (DeployedApps=1) with a 2-workload repo. Status 403, code
-// plan_limit_apps, zero rows created.
-func TestApplyProject_Quota_FreePlanOverCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanFree)
-
-	// 2-workload repo for a 1-app-cap plan.
-	applyProjectExpectProblem(t, h, key, "free-over", quotaFixture(t, 2),
-		http.StatusForbidden, api.CodePlanLimitApps)
-
-	// Pin: zero project rows for this account.
-	var projCount int
-	_ = pool.QueryRow(context.Background(),
-		`select count(*) from projects where account_id = (select id from accounts where api_key = $1)`,
-		key).Scan(&projCount)
-	if projCount != 0 {
-		t.Fatalf("Free over-cap apply left %d project rows (rollback failed)", projCount)
-	}
-}
-
-// TestApplyProject_Quota_HobbyPlanUnderCap pins that Hobby
-// (DeployedApps=5) accepts a 2-workload repo and creates
-// 2 apps + 2 builds.
-func TestApplyProject_Quota_HobbyPlanUnderCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanHobby)
-
-	ar := applyProjectMultipart(t, h, key, "hobby-ok", "", quotaFixture(t, 2))
-	if len(ar.Apps) < 2 {
-		t.Fatalf("Hobby accepted only %d apps, want 2", len(ar.Apps))
-	}
-	if len(ar.Builds) < 2 {
-		t.Fatalf("Hobby enqueued only %d builds, want 2", len(ar.Builds))
-	}
-}
-
-// TestApplyProject_Quota_HobbyPlanOverCap pins Hobby (5 apps)
-// with a 6-workload repo. Status 403, code plan_limit_apps.
-func TestApplyProject_Quota_HobbyPlanOverCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanHobby)
-
-	applyProjectExpectProblem(t, h, key, "hobby-over", quotaFixture(t, 6),
-		http.StatusForbidden, api.CodePlanLimitApps)
-}
-
-// TestApplyProject_Quota_ProPlanUnderCap pins Pro (25 apps) +
-// 4-workload repo accepted.
-func TestApplyProject_Quota_ProPlanUnderCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanPro)
-
-	ar := applyProjectMultipart(t, h, key, "pro-ok", "", quotaFixture(t, 4))
-	if len(ar.Apps) < 4 {
-		t.Fatalf("Pro accepted only %d apps, want 4", len(ar.Apps))
-	}
-}
-
-// TestApplyProject_Quota_ScalePlanUnderCap pins Scale (100 apps)
-// + 6-workload repo accepted.
-func TestApplyProject_Quota_ScalePlanUnderCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanScale)
-
-	ar := applyProjectMultipart(t, h, key, "scale-ok", "", quotaFixture(t, 6))
-	if len(ar.Apps) < 6 {
-		t.Fatalf("Scale accepted only %d apps, want 6", len(ar.Apps))
-	}
-}
-
-// TestApplyProject_Quota_CronsNotAllowed pins the Free plan
-// (CronLimitPerAccount=0). A repo with a cron workload returns
-// 402 plan_crons_not_allowed; zero rows created.
-func TestApplyProject_Quota_CronsNotAllowed(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanFree)
-
-	// render.yaml produces a cron workload (schedule: "0 3 * * *").
-	const renderYAML = `cronJobs:
-  - name: nightly
-    schedule: "0 3 * * *"
-    command: bundle exec rake nightly
-`
-	entries := []struct{ name, body string }{
-		{"faas-cron/docker-compose.yml", "services:\n  api:\n    build: { context: . }\n"},
-		{"faas-cron/render.yaml", renderYAML},
-		{"faas-cron/Dockerfile", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
-	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	for _, e := range entries {
-		hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
-		_ = tw.WriteHeader(hdr)
-		_, _ = tw.Write([]byte(e.body))
-	}
-	_ = tw.Close()
-	_ = gz.Close()
-
-	applyProjectExpectProblem(t, h, key, "free-cron", buf.Bytes(),
-		http.StatusPaymentRequired, api.CodePlanCronsNotAllowed)
-}
-
-// TestApplyProject_Quota_OverCapZeroBuilds pins that an over-cap
-// apply creates zero build rows. The apply path must roll back
-// cleanly — even a partial apply that enqueued some builds before
-// tripping the quota gate would leave orphan build rows that
-// builderd might claim.
-func TestApplyProject_Quota_OverCapZeroBuilds(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanFree)
-
-	applyProjectExpectProblem(t, h, key, "zero-builds", quotaFixture(t, 2),
-		http.StatusForbidden, api.CodePlanLimitApps)
-
-	// Pin: zero build rows for this account.
-	var buildCount int
-	_ = pool.QueryRow(context.Background(),
-		`select count(*) from builds b join deployments d on d.id = b.deployment_id join apps a on a.id = d.app_id join accounts acc on acc.id = a.account_id where acc.api_key = $1`,
-		key).Scan(&buildCount)
-	if buildCount != 0 {
-		t.Fatalf("over-cap apply left %d build rows (rollback failed)", buildCount)
-	}
-}
-
-// TestApplyProject_Quota_ProblemCarriesLimitAndObserved pins the
-// RFC 7807 contract: the problem body carries limit + observed
-// values + a docs URL. The dashboard renders these; a missing
-// field would render "Apply failed (unknown limit)".
-func TestApplyProject_Quota_ProblemCarriesLimitAndObserved(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanFree)
-
-	// Post a 5-workload fixture against Free (limit 1). The
-	// problem should carry limit=1 and observed=5.
-	body := quotaFixture(t, 5)
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	src, _ := mw.CreateFormFile("source", "fixture.tar.gz")
-	_, _ = src.Write(body)
-	_ = mw.WriteField("project_slug", "free-bulk")
-	_ = mw.Close()
-	req, _ := http.NewRequestWithContext(context.Background(),
-		http.MethodPost, h.APIDURL+"/v1/projects", &buf)
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-	resp, err := h.HTTPClient().Do(req)
-	if err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status=%d want 403", resp.StatusCode)
-	}
-	var p api.Problem
-	if err := json.Unmarshal(raw, &p); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	// The Problem type embeds the limit + observed in the body
-	// JSON. Inspect the raw body for the keys.
-	for _, want := range []string{`"limit"`, `"observed"`, `"docs"`} {
-		if !problemBodyContains(raw, want) {
-			t.Fatalf("problem body missing %s (body=%s)", want, raw)
-		}
-	}
-}
-
-// problemBodyContains is a tiny substring helper; avoids pulling in
-// strings.Contains for one call. Renamed from `contains` to avoid
-// the package-level declaration in account_e2e_test.go.
+// problemBodyContains is a tiny substring helper used by the
+// ProblemCarriesLimitAndObserved subtest to check the problem
+// body's JSON keys without pulling in strings.Contains for one
+// call. Renamed from `contains` to avoid the package-level
+// declaration in account_e2e_test.go.
 func problemBodyContains(haystack []byte, needle string) bool {
 	if len(needle) == 0 {
 		return true
@@ -366,9 +163,11 @@ func problemBodyContains(haystack []byte, needle string) bool {
 	return false
 }
 
-// TestApplyProject_Quota_FreeAcceptedAsOneApp pins that Free
-// (DeployedApps=1) accepts a 1-workload repo. The boundary case.
-func TestApplyProject_Quota_FreeAcceptedAsOneApp(t *testing.T) {
+// TestApplyProject_Quota is the single top-level test for this
+// themed file. It opens one APID harness + Postgres pool and runs
+// each subtest against the shared instance with an isolated
+// account. PR #541 review M1 fix.
+func TestApplyProject_Quota(t *testing.T) {
 	pool := pgtest.Open(t)
 	if pool == nil {
 		return
@@ -377,35 +176,176 @@ func TestApplyProject_Quota_FreeAcceptedAsOneApp(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanFree)
 
-	ar := applyProjectMultipart(t, h, key, "free-ok", "", quotaFixture(t, 1))
-	if len(ar.Apps) != 1 {
-		t.Fatalf("Free accepted %d apps, want 1", len(ar.Apps))
-	}
-	if len(ar.Builds) != 1 {
-		t.Fatalf("Free enqueued %d builds, want 1", len(ar.Builds))
-	}
-}
+	t.Run("FreePlanOverCap", func(t *testing.T) {
+		// Pins the Free plan (DeployedApps=1) with a 2-workload
+		// repo. Status 403, code plan_limit_apps, zero rows created.
+		key := h.SeedAccount(context.Background(), api.PlanFree, "quota-free-over")
+		applyProjectExpectProblem(t, h, key, "free-over", quotaFixture(t, 2),
+			http.StatusForbidden, api.CodePlanLimitApps)
+		var projCount int
+		if err := pool.QueryRow(context.Background(),
+			`select count(*) from projects where account_id = (select id from accounts where api_key = $1)`,
+			key).Scan(&projCount); err != nil {
+			t.Fatalf("count projects: %v", err)
+		}
+		if projCount != 0 {
+			t.Fatalf("Free over-cap apply left %d project rows (rollback failed)", projCount)
+		}
+	})
 
-// TestApplyProject_Quota_HobbyCronsAtCap pins Hobby
-// (CronLimitPerAccount=5) with a 6-cron repo. The crons gate
-// is independent of the apps gate.
-func TestApplyProject_Quota_HobbyCronsAtCap(t *testing.T) {
-	pool := pgtest.Open(t)
-	if pool == nil {
-		return
-	}
-	if err := dbMigrateUp(t, pool); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	h := e2etest.Start(t, pool, e2etest.APID)
-	key := h.SeedAccount(context.Background(), api.PlanHobby)
+	t.Run("HobbyPlanUnderCap", func(t *testing.T) {
+		// Pins that Hobby (DeployedApps=5) accepts a 2-workload
+		// repo and creates 2 apps + 2 builds.
+		key := h.SeedAccount(context.Background(), api.PlanHobby, "quota-hobby-ok")
+		ar := applyProjectMultipart(t, h, key, "hobby-ok", "", quotaFixture(t, 2))
+		if len(ar.Apps) < 2 {
+			t.Fatalf("Hobby accepted only %d apps, want 2", len(ar.Apps))
+		}
+		if len(ar.Builds) < 2 {
+			t.Fatalf("Hobby enqueued only %d builds, want 2", len(ar.Builds))
+		}
+	})
 
-	// A single workload with a Schedule promotes to planCron.
-	// 6 such workloads → 6 crons, over Hobby's cap of 5.
-	entries := []struct{ name, body string }{
-		{"faas-hobby-crons/render.yaml", `cronJobs:
+	t.Run("HobbyPlanOverCap", func(t *testing.T) {
+		// Pins Hobby (5 apps) with a 6-workload repo. Status 403,
+		// code plan_limit_apps.
+		key := h.SeedAccount(context.Background(), api.PlanHobby, "quota-hobby-over")
+		applyProjectExpectProblem(t, h, key, "hobby-over", quotaFixture(t, 6),
+			http.StatusForbidden, api.CodePlanLimitApps)
+	})
+
+	t.Run("ProPlanUnderCap", func(t *testing.T) {
+		// Pins Pro (25 apps) + 4-workload repo accepted.
+		key := h.SeedAccount(context.Background(), api.PlanPro, "quota-pro-ok")
+		ar := applyProjectMultipart(t, h, key, "pro-ok", "", quotaFixture(t, 4))
+		if len(ar.Apps) < 4 {
+			t.Fatalf("Pro accepted only %d apps, want 4", len(ar.Apps))
+		}
+	})
+
+	t.Run("ScalePlanUnderCap", func(t *testing.T) {
+		// Pins Scale (100 apps) + 6-workload repo accepted.
+		key := h.SeedAccount(context.Background(), api.PlanScale, "quota-scale-ok")
+		ar := applyProjectMultipart(t, h, key, "scale-ok", "", quotaFixture(t, 6))
+		if len(ar.Apps) < 6 {
+			t.Fatalf("Scale accepted only %d apps, want 6", len(ar.Apps))
+		}
+	})
+
+	t.Run("CronsNotAllowed", func(t *testing.T) {
+		// Pins the Free plan (CronLimitPerAccount=0). A repo with
+		// a cron workload returns 402 plan_crons_not_allowed;
+		// zero rows created.
+		key := h.SeedAccount(context.Background(), api.PlanFree, "quota-free-cron")
+		const renderYAML = `cronJobs:
+  - name: nightly
+    schedule: "0 3 * * *"
+    command: bundle exec rake nightly
+`
+		entries := []struct{ name, body string }{
+			{"faas-cron/docker-compose.yml", "services:\n  api:\n    build: { context: . }\n"},
+			{"faas-cron/render.yaml", renderYAML},
+			{"faas-cron/Dockerfile", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
+		}
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		for _, e := range entries {
+			hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
+			_ = tw.WriteHeader(hdr)
+			_, _ = tw.Write([]byte(e.body))
+		}
+		_ = tw.Close()
+		_ = gz.Close()
+		applyProjectExpectProblem(t, h, key, "free-cron", buf.Bytes(),
+			http.StatusPaymentRequired, api.CodePlanCronsNotAllowed)
+	})
+
+	t.Run("OverCapZeroBuilds", func(t *testing.T) {
+		// Pins that an over-cap apply creates zero build rows.
+		// The apply path must roll back cleanly — even a partial
+		// apply that enqueued some builds before tripping the
+		// quota gate would leave orphan build rows that
+		// builderd might claim.
+		key := h.SeedAccount(context.Background(), api.PlanFree, "quota-zero-builds")
+		applyProjectExpectProblem(t, h, key, "zero-builds", quotaFixture(t, 2),
+			http.StatusForbidden, api.CodePlanLimitApps)
+		var buildCount int
+		if err := pool.QueryRow(context.Background(),
+			`select count(*) from builds b join deployments d on d.id = b.deployment_id join apps a on a.id = d.app_id join accounts acc on acc.id = a.account_id where acc.api_key = $1`,
+			key).Scan(&buildCount); err != nil {
+			t.Fatalf("count builds: %v", err)
+		}
+		if buildCount != 0 {
+			t.Fatalf("over-cap apply left %d build rows (rollback failed)", buildCount)
+		}
+	})
+
+	t.Run("ProblemCarriesLimitAndObserved", func(t *testing.T) {
+		// Pins the RFC 7807 contract: the problem body carries
+		// limit + observed values + a docs URL. The dashboard
+		// renders these; a missing field would render
+		// "Apply failed (unknown limit)".
+		key := h.SeedAccount(context.Background(), api.PlanFree, "quota-bulk-problem")
+		body := quotaFixture(t, 5)
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		src, _ := mw.CreateFormFile("source", "fixture.tar.gz")
+		_, _ = src.Write(body)
+		_ = mw.WriteField("project_slug", "free-bulk")
+		_ = mw.Close()
+		req, _ := http.NewRequestWithContext(context.Background(),
+			http.MethodPost, h.APIDURL+"/v1/projects", &buf)
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
+		resp, err := h.HTTPClient().Do(req)
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status=%d want 403", resp.StatusCode)
+		}
+		var p api.Problem
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		// The Problem type embeds the limit + observed in the
+		// body JSON. Inspect the raw body for the keys.
+		for _, want := range []string{`"limit"`, `"observed"`, `"docs"`} {
+			if !problemBodyContains(raw, want) {
+				t.Fatalf("problem body missing %s (body=%s)", want, raw)
+			}
+		}
+	})
+
+	t.Run("FreeAcceptedAsOneApp", func(t *testing.T) {
+		// Pins that Free (DeployedApps=1) accepts a 1-workload
+		// repo. The boundary case.
+		key := h.SeedAccount(context.Background(), api.PlanFree, "quota-free-ok")
+		ar := applyProjectMultipart(t, h, key, "free-ok", "", quotaFixture(t, 1))
+		if len(ar.Apps) != 1 {
+			t.Fatalf("Free accepted %d apps, want 1", len(ar.Apps))
+		}
+		if len(ar.Builds) != 1 {
+			t.Fatalf("Free enqueued %d builds, want 1", len(ar.Builds))
+		}
+	})
+
+	t.Run("HobbyCronsAtCap", func(t *testing.T) {
+		// Pins Hobby (CronLimitPerAccount=5) with a 6-cron repo.
+		// The crons gate is independent of the apps gate.
+		key := h.SeedAccount(context.Background(), api.PlanHobby, "quota-hobby-crons-over")
+		// A single workload with a Schedule promotes to
+		// planCron. 6 such workloads → 6 crons, over Hobby's
+		// cap of 5.
+		entries := []struct{ name, body string }{
+			{"faas-hobby-crons/render.yaml", `cronJobs:
   - name: nightly1
     schedule: "0 3 * * *"
     command: echo 1
@@ -425,24 +365,18 @@ func TestApplyProject_Quota_HobbyCronsAtCap(t *testing.T) {
     schedule: "0 8 * * *"
     command: echo 6
 `},
-	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	for _, e := range entries {
-		hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
-		_ = tw.WriteHeader(hdr)
-		_, _ = tw.Write([]byte(e.body))
-	}
-	_ = tw.Close()
-	_ = gz.Close()
-
-	applyProjectExpectProblem(t, h, key, "hobby-crons-over", buf.Bytes(),
-		http.StatusForbidden, api.CodePlanCronQuota)
+		}
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		for _, e := range entries {
+			hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
+			_ = tw.WriteHeader(hdr)
+			_, _ = tw.Write([]byte(e.body))
+		}
+		_ = tw.Close()
+		_ = gz.Close()
+		applyProjectExpectProblem(t, h, key, "hobby-crons-over", buf.Bytes(),
+			http.StatusForbidden, api.CodePlanCronQuota)
+	})
 }
-
-// Local alias to keep the time import named even when not used
-// in a particular sub-test build.
-type timeAlias = struct{ Seconds int }
-
-func init() { _ = timeAlias{}.Seconds; _ = time.Second }

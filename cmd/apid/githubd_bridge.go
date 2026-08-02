@@ -116,15 +116,6 @@ const githubdBridgeMaxSourceBytes = 2 << 30 // 2 GB upper bound (Scale plan)
 // or the staging step silently produced an empty file.
 const githubdBridgeMinSourceBytes = 1
 
-// notifySourceGithub is the `source` / `kind` payload value the
-// bridge stamps on its build_queued + supersede notifies. The
-// value matches the GitHub bridge's existing taxonomy
-// (DeploymentKindGitHub = "github"); using a constant here
-// keeps the JSON payload + the state enum on the same
-// vocabulary so a future dashboard parser doesn't have to
-// second-guess the spelling.
-const notifySourceGithub = "github"
-
 // notifyAppField is the JSON payload key that carries the app
 // id. The bridge emits it in both the build_queued payload
 // and the slog Warn lines so the operator can grep for it
@@ -289,7 +280,6 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 		SourceBytes: req.SourceBytes,
 		SourceURL:   req.SourceUrl,
 		CommitSHA:   req.CommitSha,
-		Source:      notifySourceGithub,
 		LogSpool:    g.spool,
 		Log:         g.log,
 	})
