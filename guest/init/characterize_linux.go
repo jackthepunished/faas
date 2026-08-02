@@ -262,12 +262,13 @@ func probeListeningLinux(pid int) (int, string, bool) {
 // kernel owns these counters under the socket lock; our read is a
 // single open + scan, no incremental update between /proc reads.
 //
-// Calls ownedSocketInodes for the immediate PID only — recursive
-// process-tree walk is a separate concern (a follow-up if Node
-// cluster-mode proves this misses worker sockets in practice).
-// Returns 0 on any failure path (a missing /proc, a parse error,
-// an empty inode set) — a missing count is a legitimate "no
-// outbound" signal, not a boot-fatal error.
+// Walks the entire app process tree via ownedSocketInodes (which
+// recurses through /proc/<pid>/task/<tid>/children), so Node
+// cluster-mode workers and setpgid-rebased children count toward
+// the worker's outbound signal. Returns 0 on any failure path (a
+// missing /proc, a parse error, an empty inode set) — a missing
+// count is a legitimate "no outbound" signal, not a boot-fatal
+// error.
 func countOutboundLinux(pid int) int {
 	if pid <= 0 {
 		return 0
