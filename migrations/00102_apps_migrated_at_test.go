@@ -1,8 +1,8 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00098 (apps.migrated_at +
+// Migration-apply tests for 00102 (apps.migrated_at +
 // apps_migrated_at_chk, Tier A5 cross-node live-instance
-// migration, ADR-065, follow-up to ADR-064).
+// migration, ADR-066, follow-up to ADR-064).
 //
 // Pins the Tier A5 schema contract verbatim:
 //
@@ -15,7 +15,7 @@
 //	2. CHECK apps_migrated_at_chk tolerates NULL and tolerates
 //	   a past timestamp; values clearly in the future still
 //	   error 23514 (clock-skew guard, same shape as 00095 /
-//	   00097).
+//	   00101).
 //	3. Replay-safety: a second MigrateUp() returns nil —
 //	   ADD COLUMN IF NOT EXISTS paired with DROP CONSTRAINT
 //	   IF EXISTS / DROP COLUMN IF EXISTS (PR #377 / ADR-041).
@@ -47,13 +47,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00098_1_ColumnShape pins the schema of the
-// new apps.migrated_at column after 00098 applies. A
+// TestMigration_00102_1_ColumnShape pins the schema of the
+// new apps.migrated_at column after 00102 applies. A
 // regression (e.g. tightening NOT NULL on migrated_at) fails
 // loud here — the engine's hot path relies on the column
 // being nullable at insert time (a fresh app has never been
 // migrated).
-func TestMigration_00098_1_ColumnShape(t *testing.T) {
+func TestMigration_00102_1_ColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -89,12 +89,12 @@ func TestMigration_00098_1_ColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00098_2_AllowsNull pins the never-migrated
+// TestMigration_00102_2_AllowsNull pins the never-migrated
 // case. INSERT an app row with migrated_at NULL; SELECT it
 // back; assert NULL round-trips. The engine's hot path on
 // InsertApp must NOT write a non-NULL value in this PR —
 // PR #440 appsSelectColumns regression precedent.
-func TestMigration_00098_2_AllowsNull(t *testing.T) {
+func TestMigration_00102_2_AllowsNull(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -129,12 +129,12 @@ func TestMigration_00098_2_AllowsNull(t *testing.T) {
 	}
 }
 
-// TestMigration_00098_3_AllowsPastTimestamp pins the normal
+// TestMigration_00102_3_AllowsPastTimestamp pins the normal
 // post-migration case. UPDATE an app's migrated_at to now() -
 // 1 hour; the row must round-trip. The CHECK tolerates any
 // timestamp in the past — no upper bound is enforced except
 // the clock-skew window.
-func TestMigration_00098_3_AllowsPastTimestamp(t *testing.T) {
+func TestMigration_00102_3_AllowsPastTimestamp(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -169,13 +169,13 @@ func TestMigration_00098_3_AllowsPastTimestamp(t *testing.T) {
 	}
 }
 
-// TestMigration_00098_4_RejectsFutureTimestamp pins the
+// TestMigration_00102_4_RejectsFutureTimestamp pins the
 // clock-skew guard. INSERT an app with migrated_at = now() +
 // 1 hour (clearly past the CHECK's +1 minute tolerance); the
 // row must fail 23514. The CHECK is the tripwire for a
 // misconfigured clock or a buggy write path that would
 // otherwise pin an app's lineage far in the future.
-func TestMigration_00098_4_RejectsFutureTimestamp(t *testing.T) {
+func TestMigration_00102_4_RejectsFutureTimestamp(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -205,11 +205,11 @@ func TestMigration_00098_4_RejectsFutureTimestamp(t *testing.T) {
 	}
 }
 
-// TestMigration_00098_5_ReplaySafe pins the idempotency
+// TestMigration_00102_5_ReplaySafe pins the idempotency
 // contract. A second MigrateUp() returns nil — ADD COLUMN
 // IF NOT EXISTS paired with DROP CONSTRAINT IF EXISTS / DROP
 // COLUMN IF EXISTS in the down block (PR #377 / ADR-041).
-func TestMigration_00098_5_ReplaySafe(t *testing.T) {
+func TestMigration_00102_5_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -222,12 +222,12 @@ func TestMigration_00098_5_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00098_6_DownSymmetry pins the down path.
+// TestMigration_00102_6_DownSymmetry pins the down path.
 // Drive the SQL the down body carries directly, then re-
 // apply the up body and assert the column + CHECK come back.
 // A non-symmetric down would leave a broken schema on a
-// release that needs to roll back 00098 in isolation.
-func TestMigration_00098_6_DownSymmetry(t *testing.T) {
+// release that needs to roll back 00102 in isolation.
+func TestMigration_00102_6_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()

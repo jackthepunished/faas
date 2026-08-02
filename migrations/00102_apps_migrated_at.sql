@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00098_apps_migrated_at.sql
+-- filename: 00102_apps_migrated_at.sql
 --
 -- Tier A5 — additive migration timestamp on `apps`
 -- (ADR-065 cross-node live-instance migration, follow-up to
@@ -17,7 +17,7 @@
 -- both stamps set.
 --
 -- Nullable at insert; a fresh app has never been migrated.
--- The clock-skew CHECK mirrors 00095 / 00097:
+-- The clock-skew CHECK mirrors 00095 / 00101:
 -- `migrated_at <= now() + interval '1 minute'` tolerates
 -- minor NTP drift; values clearly in the future still
 -- error loud (23514).

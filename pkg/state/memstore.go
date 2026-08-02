@@ -1724,10 +1724,10 @@ func (m *MemStore) MarkInstanceMigrating(_ context.Context, instanceID, currentN
 	if !ok {
 		return ErrNotFound
 	}
-	if ins.NodeID != currentNodeID || ins.State != "running" {
+	if ins.NodeID != currentNodeID || ins.State != string(StateRunning) {
 		return ErrConflict
 	}
-	ins.State = "migrating"
+	ins.State = string(StateMigrating)
 	ins.LeaseToken = leaseToken
 	m.instances[instanceID] = ins
 	return nil
@@ -1760,7 +1760,7 @@ func (m *MemStore) MigrateInstanceOwner(_ context.Context, instanceID, fromNodeI
 	ins.MigratedFromNodeID = &migFrom
 	ins.MigratedAt = &now
 	ins.LeaseToken = leaseToken
-	ins.State = "running"
+	ins.State = string(StateRunning)
 	m.instances[instanceID] = ins
 	// Stamp apps.migrated_at to match the SQL transaction's
 	// second UPDATE.

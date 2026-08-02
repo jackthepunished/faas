@@ -51,6 +51,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"time"
 
@@ -279,10 +280,10 @@ func (s *Server) AdoptMigratedInstance(ctx context.Context, req *vmmdpb.AdoptMig
 	if _, err := s.migrations.get(req.GetInstanceId(), req.GetLeaseToken()); err != nil {
 		var code int
 		var apiCode string
-		switch err.(type) {
-		case errLeaseMismatch:
+		var lm errLeaseMismatch
+		if errors.As(err, &lm) {
 			code, apiCode = int(codes.PermissionDenied), api.CodeUnauthorized
-		default:
+		} else {
 			code, apiCode = int(codes.NotFound), api.CodeNotFound
 		}
 		err2 := api.NewProblem(code, apiCode, "Lease lookup failed", err.Error()).
@@ -315,11 +316,13 @@ func (s *Server) AcknowledgeMigration(ctx context.Context, req *vmmdpb.Acknowled
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
-	if _, err := s.migrations.get(req.GetInstanceId(), req.GetLeaseToken()); err != nil {
+	if _, getErr := s.migrations.get(req.GetInstanceId(), req.GetLeaseToken()); getErr != nil {
 		// Stale ack — lease already cleared. Idempotent
-		// success.
+		// success. The error is intentionally swallowed so
+		// a peer that re-sends the ack on a stale lease
+		// sees no failure (the lease is gone anyway).
 		s.ops.Observe(op, time.Since(start), nil)
-		return &vmmdpb.AcknowledgeMigrationResponse{}, nil
+		return &vmmdpb.AcknowledgeMigrationResponse{}, nil //nolint:nilerr
 	}
 	s.migrations.delete(req.GetInstanceId())
 	s.ops.Observe(op, time.Since(start), nil)
@@ -350,24 +353,26 @@ func (s *Server) CancelLiveMigration(ctx context.Context, req *vmmdpb.CancelLive
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
-	if _, err := s.migrations.get(req.GetInstanceId(), req.GetLeaseToken()); err != nil {
-		// Stale cancel — idempotent success.
+	if _, getErr := s.migrations.get(req.GetInstanceId(), req.GetLeaseToken()); getErr != nil {
+		// Stale cancel — idempotent success. The error is
+		// intentionally swallowed: a re-sent cancel on a
+		// stale lease is a no-op (the lease is gone).
 		s.ops.Observe(op, time.Since(start), nil)
-		return &vmmdpb.CancelLiveMigrationResponse{}, nil
+		return &vmmdpb.CancelLiveMigrationResponse{}, nil //nolint:nilerr
 	}
 	s.migrations.delete(req.GetInstanceId())
 	s.ops.Observe(op, time.Since(start), nil)
 	return &vmmdpb.CancelLiveMigrationResponse{}, nil
 }
 
-// leaseExpiryLoop sweeps the migration tracker on a 5-second
+// LeaseExpiryLoop sweeps the migration tracker on a 5-second
 // tick and drops entries whose lease has expired. The
 // canonical snapshot stays in storage until the per-vmmd
 // snapshot-drift sweep reaps it.
 //
-// Started by the Server constructor next to the cpuCache /
+// Started by cmd/vmmd's runWithDeps next to the cpuCache /
 // netCache / activity goroutines. Exits on vmmd shutdown.
-func (s *Server) leaseExpiryLoop(ctx context.Context) {
+func (s *Server) LeaseExpiryLoop(ctx context.Context) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {

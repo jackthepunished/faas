@@ -696,6 +696,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// usage_minutes.net_tx_bytes additively per minute.
 	go runNetworkEgressPoll(ctx, mgr, netCache, ops, nil, nil, nil, 0, log)
 
+	// Tier A5 (ADR-066) live-migration lease sweeper. Drops
+	// tracker entries whose lease has expired so a dead vmmd's
+	// orphaned leases don't leak memory across long-running
+	// processes. Started unconditionally — the tracker is
+	// empty in non-migration vmmds and listExpired returns
+	// an empty slice fast.
+	go impl.LeaseExpiryLoop(ctx)
+
 	// ADR-025 axis 5: vmmd publishes live capacity (live_count,
 	// leased_count, used_mb, ram_headroom_mb, vcpu_busy) to
 	// schedd on a 1 s cadence. The publisher only runs on the
