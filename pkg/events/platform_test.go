@@ -2,7 +2,6 @@ package events
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -28,11 +27,10 @@ func TestPlatform_Emit_StoresRow(t *testing.T) {
 
 	before := time.Now().UTC()
 	ev := QueueAccepted{
-		EmitAt:      time.Now(),
-		WakeID:      "w-1",
-		AppID:       "a-1",
-		RequestID:   "r-1",
-		QueueWaitMs: 42,
+		EmitAt:    time.Now(),
+		WakeID:    "w-1",
+		AppID:     "a-1",
+		RequestID: "r-1",
 	}
 	p.Emit(context.Background(), ev)
 	after := time.Now().UTC()
@@ -164,42 +162,6 @@ func TestPlatform_Emit_NilEvent(t *testing.T) {
 	if len(ops.emittedCalls) != 0 {
 		t.Errorf("emittedCalls = %v, want []", ops.emittedCalls)
 	}
-}
-
-// TestPlatform_Phase_ClosesError — the Phase(ctx, "boot_started")
-// closure observes ok on nil err and failed on non-nil err.
-// Mirrors pkg/wire.Observe / ObserveCode.
-func TestPlatform_Phase_ClosesError(t *testing.T) {
-	ops := newStubOps()
-	p := NewPlatform("schedd", newStubStore(), silentLog(), ops, nil)
-	closer := p.Phase(context.Background(), "boot_started")
-	closer(50*time.Millisecond, nil)
-	closer(80*time.Millisecond, errors.New("stub"))
-
-	ops.mu.Lock()
-	defer ops.mu.Unlock()
-	if len(ops.durationCalls) != 2 {
-		t.Fatalf("durationCalls = %v, want 2", ops.durationCalls)
-	}
-	if ops.durationCalls[0] != "boot_started:ok" {
-		t.Errorf("durationCalls[0] = %q, want boot_started:ok", ops.durationCalls[0])
-	}
-	if ops.durationCalls[1] != "boot_started:failed" {
-		t.Errorf("durationCalls[1] = %q, want boot_started:failed", ops.durationCalls[1])
-	}
-	if len(ops.durationSecs) != 2 {
-		t.Errorf("durationSecs = %v, want 2", ops.durationSecs)
-	}
-}
-
-// TestPlatform_Phase_NilOps — the closure is a no-op on a
-// platform with nil ops so unit tests without metrics keep
-// working.
-func TestPlatform_Phase_NilOps(t *testing.T) {
-	p := NewPlatform("schedd", newStubStore(), silentLog(), nil, nil)
-	closer := p.Phase(context.Background(), "boot_started")
-	closer(50*time.Millisecond, nil)
-	closer(80*time.Millisecond, errors.New("stub"))
 }
 
 // TestPlatform_Actor — the constructor enforces the actor name.

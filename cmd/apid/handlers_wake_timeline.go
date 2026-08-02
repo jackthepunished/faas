@@ -147,12 +147,16 @@ func (s *server) listWakeTimeline(w http.ResponseWriter, r *http.Request, acct s
 	}
 	var nextCursor string
 	if len(out) > 0 && len(rows) > limit {
-		// next page — return the last row's `at` as the cursor.
-		// The +1 overscan row is the one that proves a next page
-		// exists; it's already in `out` only if it survived the
-		// app_id filter, so re-derive from `rows` to be safe.
-		// RFC 3339 with nanosecond precision so the cursor
-		// round-trips back into `since` without truncation.
+		// next page — the cursor is the last in-window row's `at`,
+		// formatted as RFC 3339 with nanosecond precision so it
+		// round-trips back into `since` without truncation. The
+		// +1 overscan row (rows[limit]) is the one that proves a
+		// next page exists; rows[limit-1] is the last row whose
+		// index is ≤ limit-1 (i.e. the in-window set). The
+		// forge-proof may have dropped rows, so we re-derive the
+		// cursor from `rows` rather than from `out` — the rows
+		// slice is the SQL result set, which is the source of
+		// truth for the at-ordering.
 		nextCursor = rows[limit-1].At.UTC().Format(time.RFC3339Nano)
 	}
 	writeJSON(w, http.StatusOK, api.WakeTimelineResponse{

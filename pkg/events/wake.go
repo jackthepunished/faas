@@ -34,7 +34,9 @@ import "time"
 const (
 	// WakeQueueAccepted — schedd accepted the wake into the queue
 	// (regular Wake RPC or cron dispatch boundary). Payload:
-	// {wake_id, app_id, request_id, queue_wait_ms}.
+	// {wake_id, app_id, request_id}. (queue_wait_ms was rejected
+	// from the schema — see the QueueAccepted struct doc-comment
+	// for the rationale.)
 	WakeQueueAccepted = "wake.queue_accepted"
 	// WakeAdmitted — schedd admitted the wake past the per-app
 	// concurrency gate. Payload: {wake_id, app_id, request_id,
@@ -132,12 +134,21 @@ func addrString(s string) *string {
 // from both the regular Wake RPC (pkg/sched/engine.go) and the
 // cron dispatch boundary (pkg/sched/loop.go) so the customer-facing
 // timeline surfaces both paths joined by request_id.
+//
+// queue_wait_ms is intentionally NOT part of the payload schema:
+// schedd's Wake RPC entry doesn't carry a server-side accepted_at
+// stamp, and adding one to derive the queue wait is a wire-shape
+// change deferred to a follow-up PR. The schedule latency is
+// observable from the existing instances.started_at ↔ events.at
+// join (the boot_started.RequestedAt field carries the same
+// timestamp once the engine captures it — see pkg/sched/engine.go
+// bootInput.startedAt). A future PR will wire an accepted_at
+// through the gRPC metadata envelope and add the field here.
 type QueueAccepted struct {
-	EmitAt      time.Time
-	WakeID      string
-	AppID       string
-	RequestID   string
-	QueueWaitMs int64
+	EmitAt    time.Time
+	WakeID    string
+	AppID     string
+	RequestID string
 }
 
 func (e QueueAccepted) Kind() string     { return WakeQueueAccepted }
@@ -145,10 +156,9 @@ func (e QueueAccepted) At() time.Time    { return e.EmitAt }
 func (e QueueAccepted) Subject() *string { return nil }
 func (e QueueAccepted) Payload() map[string]any {
 	return map[string]any{
-		"wake_id":       e.WakeID,
-		"app_id":        e.AppID,
-		"request_id":    e.RequestID,
-		"queue_wait_ms": e.QueueWaitMs,
+		"wake_id":    e.WakeID,
+		"app_id":     e.AppID,
+		"request_id": e.RequestID,
 	}
 }
 

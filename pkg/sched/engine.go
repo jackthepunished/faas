@@ -970,11 +970,10 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	}
 	if e.events != nil {
 		e.events.Emit(ctx, events.QueueAccepted{
-			EmitAt:      time.Now().UTC(),
-			WakeID:      wakeID,
-			AppID:       appID,
-			RequestID:   requestID,
-			QueueWaitMs: 0, // queue wait is a separate derivation (gaps analysis)
+			EmitAt:    time.Now().UTC(),
+			WakeID:    wakeID,
+			AppID:     appID,
+			RequestID: requestID,
 		})
 	}
 

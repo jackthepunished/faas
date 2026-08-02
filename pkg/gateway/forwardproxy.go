@@ -107,6 +107,12 @@ func stripHopByHop(h http.Header) http.Header {
 //
 // PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
 // streaming RPC is the only bridge today — see fwdStreamOnce below.
+//
+// Deprecated: PR-C (issue #517 / ADR-064) added the events-aware
+// sibling; the legacy 3-arg signature exists only to keep the
+// pre-PR-C caller surface compiling. Gateway production wiring
+// has moved to ForwardingReverseProxyWithEvents. A future cleanup
+// PR will drop this wrapper.
 func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
 	return ForwardingReverseProxyWithEvents(nodes, log, nil)
 }
@@ -159,6 +165,11 @@ func proxyStartFromContext(ctx context.Context) time.Time {
 // is the only panic-safety net — if a future maintainer adds a step
 // that panics on a malformed request, we still observe the request
 // via slog instead of crashing the listener.
+//
+// Deprecated: PR-C (issue #517 / ADR-064) added the events-aware
+// sibling; this 5-arg signature exists only to keep the pre-PR-C
+// test corpus compiling. New code should call fwdOnceWithEvents
+// directly. A future cleanup PR will drop this wrapper.
 //
 // PR-D / ADR-047: this is now a thin wrapper that delegates to
 // fwdStreamOnce (the bidi ForwardHTTPStream RPC is the only bridge
@@ -230,6 +241,12 @@ func fwdOnceWithEvents(w http.ResponseWriter, r *http.Request, nodes NodeClientL
 // 503, anything else → 502). The Handler's statusRecorder
 // translates 4xx/5xx into "no body bytes to meter" so the
 // e2e quota AC stays correct under error paths.
+//
+// Deprecated: PR-C (issue #517 / ADR-064) added the events-aware
+// sibling; this 5-arg signature exists only to keep the pre-PR-C
+// test corpus compiling. New code should call
+// fwdStreamOnceWithEvents directly. A future cleanup PR will drop
+// this wrapper.
 func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target) {
 	fwdStreamOnceWithEvents(w, r, cli, log, t, nil)
 }

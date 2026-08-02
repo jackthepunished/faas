@@ -37,21 +37,26 @@ func TestListWakeTimeline_HappyPath(t *testing.T) {
 	platform := events.NewPlatform("test", e.store, slog.New(slog.NewTextHandler(io.Discard, nil)), wire.NewOpsMetrics("apid-tl-test"), nil)
 	e.s.WithEventsPlatform(platform)
 
-	// Three frames in oldest-first order. The Platform.Emit
-	// uses time.Now() for EmitAt so we can read them back
-	// monotonically.
+	// Three frames in oldest-first order. MemStore.AppendEvent
+	// stamps time.Now() at the call moment (not the typed
+	// EmitAt — see pkg/state/memstore.go:~4345), so sleep between
+	// calls to guarantee monotonic at-stamps. The 5ms gap is well
+	// above the memstore's per-call resolution (~1µs on a
+	// developer Mac) so the order is stable.
 	wakeID := "wake-tl-1"
 	ctx := context.Background()
 	platform.Emit(ctx, events.QueueAccepted{
-		EmitAt: time.Now().Add(-300 * time.Millisecond).UTC(),
-		WakeID: wakeID, AppID: app.ID, RequestID: "r-1", QueueWaitMs: 12,
+		EmitAt: time.Now().UTC(),
+		WakeID: wakeID, AppID: app.ID, RequestID: "r-1",
 	})
+	time.Sleep(5 * time.Millisecond)
 	platform.Emit(ctx, events.Admitted{
-		EmitAt: time.Now().Add(-200 * time.Millisecond).UTC(),
+		EmitAt: time.Now().UTC(),
 		WakeID: wakeID, AppID: app.ID, RequestID: "r-1", AccountID: e.acct.ID, Plan: string(e.acct.Plan),
 	})
+	time.Sleep(5 * time.Millisecond)
 	platform.Emit(ctx, events.BootStarted{
-		EmitAt: time.Now().Add(-100 * time.Millisecond).UTC(),
+		EmitAt: time.Now().UTC(),
 		WakeID: wakeID, AppID: app.ID, InstanceID: "inst-1", NodeID: "node-1", Method: "restore",
 	})
 
@@ -124,7 +129,7 @@ func TestListWakeTimeline_SinceFiltersOlderRows(t *testing.T) {
 	platform := events.NewPlatform("test", e.store, slog.New(slog.NewTextHandler(io.Discard, nil)), wire.NewOpsMetrics("apid-tl-test"), nil)
 	wakeID := "wake-tl-4"
 	platform.Emit(context.Background(), events.QueueAccepted{
-		EmitAt: time.Now().UTC(), WakeID: wakeID, AppID: app.ID, RequestID: "r-old", QueueWaitMs: 5,
+		EmitAt: time.Now().UTC(), WakeID: wakeID, AppID: app.ID, RequestID: "r-old",
 	})
 	// Sleep 50ms so the second row's stamped `At` is strictly
 	// after the first (MemStore.AppendEvent stamps time.Now(),

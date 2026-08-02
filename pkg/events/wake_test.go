@@ -38,15 +38,18 @@ func TestWakeEvent_AllKindsImplementInterface(t *testing.T) {
 // contract; the customer-facing JSON surfaces {"wake_id": ...}.
 // Catch a typo'd key here before it ships.
 func TestQueueAccepted_Shape(t *testing.T) {
-	ev := QueueAccepted{EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1", RequestID: "r-1", QueueWaitMs: 42}
+	ev := QueueAccepted{EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1", RequestID: "r-1"}
 	if got := ev.Kind(); got != WakeQueueAccepted {
 		t.Errorf("Kind = %q, want %q", got, WakeQueueAccepted)
 	}
 	if got := ev.Payload()["wake_id"]; got != "w-1" {
 		t.Errorf("payload.wake_id = %v, want w-1", got)
 	}
-	if got := ev.Payload()["queue_wait_ms"]; got != int64(42) {
-		t.Errorf("payload.queue_wait_ms = %v, want 42", got)
+	if got := ev.Payload()["request_id"]; got != "r-1" {
+		t.Errorf("payload.request_id = %v, want r-1", got)
+	}
+	if _, present := ev.Payload()["queue_wait_ms"]; present {
+		t.Errorf("payload.queue_wait_ms must be absent (rejected from schema, see QueueAccepted doc-comment)")
 	}
 	if got := ev.Subject(); got != nil {
 		t.Errorf("Subject = %v, want nil", got)

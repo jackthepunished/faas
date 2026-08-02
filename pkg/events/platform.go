@@ -9,8 +9,9 @@
 //     registry (so the §12 wake-latency panel surfaces the
 //     distribution),
 //   - a wake-phase duration observation on the per-daemon histogram
-//     (driven by the Phase(ctx, name) closure returned to the
-//     caller),
+//     (the per-call AppendEvent duration, observed by Emit itself
+//     — the per-boot_span Phase(ctx, name) closure was removed
+//     from the API, see PR #532 review),
 //   - an in-process SSE pub/sub via Broadcaster.PublishTopic on the
 //     `wake` topic (so the dashboard's "live wake" surface react
 //     within milliseconds without depending on pg_notify),
@@ -190,27 +191,6 @@ func (p *Platform) Emit(ctx context.Context, ev WakeEvent) {
 	// automatically without re-stamping.
 	p.log.Info("events: emit",
 		"actor", p.actor, "kind", kind, "subject", subject)
-}
-
-// Phase returns a closure that records the duration of one wake
-// phase. The caller wraps the wake phase in `start := time.Now()`
-// at the entry point and `defer p.Phase(ctx, "boot_started")(time.
-// Since(start))` at the exit point; the closure observes the
-// histogram under result="ok" unless err is non-nil, in which
-// case it observes under result="failed". Mirrors the
-// pkg/wire.Observe / pkg/wire.ObserveCode precedent.
-func (p *Platform) Phase(ctx context.Context, kind string) func(time.Duration, error) {
-	phase := wakePhaseFromKind(kind)
-	return func(dur time.Duration, err error) {
-		if p.ops == nil {
-			return
-		}
-		result := "ok"
-		if err != nil {
-			result = "failed"
-		}
-		p.ops.WakePhaseDuration(phase, result).Observe(dur.Seconds())
-	}
 }
 
 // wakePhaseFromKind strips the `wake.` prefix and returns the
