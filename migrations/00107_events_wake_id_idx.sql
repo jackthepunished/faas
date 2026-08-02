@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00092_events_wake_id_idx.sql
+-- filename: 00107_events_wake_id_idx.sql
 --
 -- issue #517 / PR-C / ADR-064 — wake-timeline expression index.
 --
@@ -29,9 +29,18 @@
 -- is the intended outcome (legacy rows are out of scope of
 -- PR-C, see ADR-064 §"Compatibility").
 --
--- Migration slot: 00092. The cross-PR gate reserves 00093 for
+-- Migration slot: 00107. The cross-PR gate reserves 00108 for
 -- PR-D's jailer / Firecracker stderr capture table (issue #517
 -- final PR, ADR-045 follow-up).
+--
+-- Renumber history (post-#533-merge reset): this PR's real migration
+-- was at 92 → 97 → 99 → 101 → 103 → 105 → 107 across seven rebase
+-- cycles before the post-#533 renumber reset strategy dropped the
+-- intermediate renumber commits. After dropping the chain on this
+-- rebase, the final slot landed at 107 (next free after main's
+-- real migrations at 103, 104, 105). Companion reservation
+-- `00108_reserve_slot.sql` (this branch) holds slot 108 for
+-- PR-D's stderr capture table per ADR-045.
 
 create index if not exists events_wake_id_idx
   on events ((data->>'wake_id'))

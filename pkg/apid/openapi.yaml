@@ -3103,6 +3103,94 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Wake timeline (issue #517 / PR-C / ADR-064) ──────────────────────────
+
+  /v1/apps/{slug}/wakes/{wake_id}/timeline:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        schema: { type: string }
+      - name: wake_id
+        in: path
+        required: true
+        schema: { type: string }
+        description: |
+          The per-wake correlation handle minted by the schedd
+          engine (UUID v4 in production). The endpoint returns
+          every `wake.*` events row whose `data.wake_id`
+          matches — the partial index `events_wake_id_idx`
+          (migrations/00107) serves the read in O(frames)
+          regardless of the events table size.
+    get:
+      tags: [apps, observability]
+      operationId: listWakeTimeline
+      summary: List the canonical wake-timeline frames for one wake.
+      description: |
+        Oldest-first (forward narrative). Returns every typed
+        `wake.*` events row for the given wake_id: queue_accepted
+        → admitted → boot_started → boot_completed →
+        readiness_200 → proxy_first_byte. Build and deploy
+        failures (`wake.build_failed`, `wake.deploy_failed`,
+        `wake.boot_failed`) are joined in alongside the success
+        path so a single GET shows the whole lifecycle.
+
+        The endpoint is a sub-resource of `/v1/apps/{slug}`;
+        auth and rate-limit share the §12 per-app budget with
+        logs/metrics/wake. Cross-account access 404s the
+        same way unknown slugs do (forge-proof: every row's
+        `data.app_id` is verified to match the resolved app).
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: "Only return rows with `at >= since` (RFC 3339)."
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+          description: "Max frames to return. Silently capped at 1000."
+      responses:
+        '200':
+          description: Wake-timeline frames.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WakeTimelineResponse'
+              example:
+                wake_id: "abcdef01-2345-6789-abcd-ef0123456789"
+                app_id: "0123456789abcdef0123456789abcdef"
+                limit: 200
+                next_cursor: ""
+                events:
+                  - at: "2026-07-25T13:25:00.123Z"
+                    kind: wake.queue_accepted
+                    actor: schedd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", queue_wait_ms: 12 }
+                  - at: "2026-07-25T13:25:00.135Z"
+                    kind: wake.admitted
+                    actor: schedd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", account_id: "fdecba98-7654-3210-fedc-ba9876543210", plan: "pro" }
+                  - at: "2026-07-25T13:25:00.420Z"
+                    kind: wake.boot_started
+                    actor: schedd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", instance_id: "inst-1", node_id: "node-1", method: "restore" }
+                  - at: "2026-07-25T13:25:01.180Z"
+                    kind: wake.readiness_200
+                    actor: vmmd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", instance_id: "inst-1", node_id: "node-1", healthcheck_path: "/healthz", probe_count: 1, elapsed_ms: 760 }
+                  - at: "2026-07-25T13:25:01.220Z"
+                    kind: wake.proxy_first_byte
+                    actor: gatewayd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", instance_id: "inst-1", node_id: "node-1", latency_ms: 40 }
+        '400':
+          description: Bad request — malformed `since` or `limit`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No such app (slug) or wake_id is unknown.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Usage ────────────────────────────────────────────────────────────────
 
   /v1/usage:
@@ -4955,6 +5043,58 @@ components:
           type: integer
           description: "Effective limit applied (always 1..100)."
           example: 50
+
+    WakeTimelineEvent:
+      description: |
+        One frame of the wake timeline (issue #517 / PR-C /
+        ADR-064). The shape mirrors the typed event payloads
+        the producers write — see `pkg/events/wake.go`. The
+        canonical `wake.*` vocabulary is documented in
+        `docs/adr/064-wake-timeline-canonical-vocabulary.md`
+        (12 success-path kinds + 3 failure-path kinds: build,
+        deploy, boot).
+      type: object
+      required: [at, kind, actor, data]
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: "RFC 3339 UTC. Oldest-first (forward narrative)."
+        kind:
+          type: string
+          description: "Canonical `wake.*` kind. See ADR-064."
+          example: wake.boot_started
+        actor:
+          type: string
+          description: "Daemon that wrote the row (`schedd` / `vmmd` / `gatewayd` / `builderd` / `apid`)."
+          example: schedd
+        data:
+          type: object
+          additionalProperties: true
+          description: "Producer-supplied payload (json object)."
+
+    WakeTimelineResponse:
+      description: "Envelope for `GET /v1/apps/{slug}/wakes/{wake_id}/timeline`."
+      type: object
+      required: [wake_id, app_id, events, limit]
+      properties:
+        wake_id:
+          type: string
+          description: "Echo of the path-segment wake_id."
+        app_id:
+          type: string
+          format: uuid
+          description: "Resolved app id (the slug's owning app)."
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/WakeTimelineEvent' }
+        next_cursor:
+          type: string
+          description: "Opaque RFC 3339 cursor for the next page. Empty when this is the last page."
+        limit:
+          type: integer
+          description: "Effective limit applied (always 1..1000)."
+          example: 200
 
     # ─── Secrets ──────────────────────────────────────────────────────────
 

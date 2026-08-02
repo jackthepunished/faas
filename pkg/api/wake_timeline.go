@@ -11,7 +11,7 @@
 //     `data` column and would force a sequential scan to filter.
 //   - The audit endpoint is unkeyed (kind-prefix only); the
 //     wake-timeline is keyed on a single canonical handle so the
-//     partial index events_wake_id_idx (migrations/00092) can
+//     partial index events_wake_id_idx (migrations/00107) can
 //     serve it in O(frames-for-this-wake).
 //   - The wake-timeline is a sub-resource of /v1/apps/{slug},
 //     mirroring /v1/apps/{slug}/logs + /v1/apps/{slug}/metrics +

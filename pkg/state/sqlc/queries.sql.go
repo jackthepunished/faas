@@ -1653,9 +1653,18 @@ type ListEventsByWakeIDParams struct {
 	Limit int32
 }
 
+type ListEventsByWakeIDRow struct {
+	ID      int64
+	At      pgtype.Timestamptz
+	Actor   string
+	Kind    string
+	Subject pgtype.UUID
+	Data    []byte
+}
+
 // issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
 // Filters on the jsonb expression index events_wake_id_idx
-// (migrations/00092_events_wake_id_idx.sql) and orders by at ASC
+// (migrations/00107_events_wake_id_idx.sql) and orders by at ASC
 // so the customer-facing timeline endpoint surfaces a forward
 // narrative. The $2 lower bound is the `since` RFC 3339 cursor
 // from the endpoint query string; the $3 limit is bounded to
@@ -1664,15 +1673,15 @@ type ListEventsByWakeIDParams struct {
 // only rows with a wake_id tag (i.e. the 13 wake.* kinds) are
 // indexed — legacy audit rows are not in scope of PR-C, see
 // ADR-064 §"Compatibility".
-func (q *Queries) ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]Event, error) {
+func (q *Queries) ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]ListEventsByWakeIDRow, error) {
 	rows, err := db.Query(ctx, listEventsByWakeID, arg.Data, arg.At, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Event{}
+	items := []ListEventsByWakeIDRow{}
 	for rows.Next() {
-		var i Event
+		var i ListEventsByWakeIDRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.At,

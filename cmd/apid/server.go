@@ -751,7 +751,7 @@ func (s *server) handler() http.Handler {
 	// surface. Sub-resource of /v1/apps/{slug} — same auth chain
 	// as the rest of the /v1/apps/* read surface, same §12
 	// per-app rate-limit budget. The query keys on the partial
-	// index events_wake_id_idx (migrations/00092) for O(frames)
+	// index events_wake_id_idx (migrations/00107) for O(frames)
 	// latency regardless of events table size.
 	mux.HandleFunc("GET /v1/apps/{slug}/wakes/{wake_id}/timeline", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listWakeTimeline))))
 

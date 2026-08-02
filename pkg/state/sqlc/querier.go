@@ -110,10 +110,10 @@ type Querier interface {
 	ListDomainsForAccount(ctx context.Context, db DBTX, accountID pgtype.UUID) ([]ListDomainsForAccountRow, error)
 	ListDomainsForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListDomainsForAppRow, error)
 	ListEnabledCrons(ctx context.Context, db DBTX) ([]ListEnabledCronsRow, error)
-ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]ListEventsRow, error)
+	ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]ListEventsRow, error)
 	// issue #517 / PR-C / ADR-064 — wake-timeline read-side query.
 	// Filters on the jsonb expression index events_wake_id_idx
-	// (migrations/00092_events_wake_id_idx.sql) and orders by at ASC
+	// (migrations/00107_events_wake_id_idx.sql) and orders by at ASC
 	// so the customer-facing timeline endpoint surfaces a forward
 	// narrative. The $2 lower bound is the `since` RFC 3339 cursor
 	// from the endpoint query string; the $3 limit is bounded to
@@ -122,7 +122,7 @@ ListEvents(ctx context.Context, db DBTX, arg ListEventsParams) ([]ListEventsRow,
 	// only rows with a wake_id tag (i.e. the 13 wake.* kinds) are
 	// indexed — legacy audit rows are not in scope of PR-C, see
 	// ADR-064 §"Compatibility".
-	ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]Event, error)
+	ListEventsByWakeID(ctx context.Context, db DBTX, arg ListEventsByWakeIDParams) ([]ListEventsByWakeIDRow, error)
 	ListInstancesForApp(ctx context.Context, db DBTX, appID pgtype.UUID) ([]ListInstancesForAppRow, error)
 	ListOrgInvitationsForOrg(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgInvitationsForOrgRow, error)
 	ListOrgMembers(ctx context.Context, db DBTX, orgID pgtype.UUID) ([]ListOrgMembersRow, error)

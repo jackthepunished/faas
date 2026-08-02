@@ -5778,7 +5778,7 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 // production read-side query for the customer-facing
 // GET /v1/apps/{slug}/wakes/{wake_id}/timeline endpoint. Filters
 // on the jsonb expression index events_wake_id_idx
-// (migrations/00092_events_wake_id_idx.sql) and orders by at ASC
+// (migrations/00107_events_wake_id_idx.sql) and orders by at ASC
 // so the timeline reads as a forward narrative. Uses raw SQL
 // (mirroring AppendEvent / ListEvents) so the method shape stays
 // consistent with the rest of the events table surface — the

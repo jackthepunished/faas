@@ -1,7 +1,7 @@
 # WakeTimelineEndpointRollout
 
 Source: issue #517 PR-C / ADR-064. Spec: §6.1 (events table),
-§12 (wake-latency panel). Migration: 00092_events_wake_id_idx.
+§12 (wake-latency panel). Migration: 00107_events_wake_id_idx.
 Endpoint: `GET /v1/apps/{slug}/wakes/{wake_id}/timeline`.
 Severity: info (this is a canary rollout, not an incident).
 
