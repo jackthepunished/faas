@@ -415,3 +415,145 @@ func TestToColdBootRequest_ForwardsHealthcheckPath(t *testing.T) {
 		})
 	}
 }
+
+// TestSidecarsFromProto pins the wire → fcvm.WorkloadSpec flatten
+// (issue #463 / ADR-069 / PR-B). nil in / nil out matches the
+// sibling helpers (sealedFromProto / apiEnvFromProto) so the
+// Manager's nil/empty equivalence survives the wire.
+//
+// Two-sidecar case mirrors the AC #2 cap (1 init + 1 sidecar).
+// Each field on the wire has a 1:1 mirror on WorkloadSpec —
+// DriveID maps from SidecarSpec.drive_slot (the FC Drive.DriveID
+// the host mounts in the jail chroot), Name/Type from the wire
+// verbatim, RamMB and Port as ints.
+func TestSidecarsFromProto(t *testing.T) {
+	if got := sidecarsFromProto(nil); got != nil {
+		t.Errorf("nil input: got %+v, want nil", got)
+	}
+	if got := sidecarsFromProto([]*vmmdpb.SidecarSpec{}); got != nil {
+		t.Errorf("empty input: got %+v, want nil", got)
+	}
+
+	pbs := []*vmmdpb.SidecarSpec{
+		{
+			Name: "migrator", Image: "ghcr.io/org/m@sha256:00", Type: "init",
+			RamMb: 64, Port: 9091, Essential: true,
+			StorageKey: "apps/foo/00000000-0000-0000-0000-aaaaaaaa-migrator.ext4",
+			DriveSlot:  "layer-sidecar-0",
+		},
+		{
+			Name: "scraper", Image: "ghcr.io/org/s@sha256:01", Type: "sidecar",
+			RamMb: 128, Port: 9092, Essential: false,
+			StorageKey: "apps/foo/00000000-0000-0000-0000-aaaaaaaa-scraper.ext4",
+			DriveSlot:  "layer-sidecar-1",
+		},
+	}
+	got := sidecarsFromProto(pbs)
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2", len(got))
+	}
+	if got[0].Name != "migrator" || got[0].Type != "init" {
+		t.Errorf("entry 0 name/type: got %+v", got[0])
+	}
+	if got[0].RamMB != 64 || got[0].Port != 9091 || !got[0].Essential {
+		t.Errorf("entry 0 ram/port/essential: got %+v", got[0])
+	}
+	if got[0].DriveID != "layer-sidecar-0" {
+		t.Errorf("entry 0 DriveID = %q, want layer-sidecar-0", got[0].DriveID)
+	}
+	if got[0].StorageKey != "apps/foo/00000000-0000-0000-0000-aaaaaaaa-migrator.ext4" {
+		t.Errorf("entry 0 StorageKey wrong: got %q", got[0].StorageKey)
+	}
+	if got[1].Name != "scraper" || got[1].Type != "sidecar" {
+		t.Errorf("entry 1 name/type: got %+v", got[1])
+	}
+	if got[1].Essential {
+		t.Errorf("entry 1 essential = true, want false")
+	}
+	if got[1].DriveID != "layer-sidecar-1" {
+		t.Errorf("entry 1 DriveID = %q, want layer-sidecar-1", got[1].DriveID)
+	}
+}
+
+// TestToWakeRequest_WithSidecars asserts the AppSpec.sidecars wire
+// field is threaded onto WakeRequest.Sidecars verbatim (issue
+// #463 / ADR-069 / PR-B). The Manager's nil-vs-empty equivalence
+// is the load-bearing property here — empty wire (legacy pre-
+// PR-B caller) leaves wr.Sidecars == nil and the single-workload
+// path runs unchanged.
+func TestToWakeRequest_WithSidecars(t *testing.T) {
+	req := &vmmdpb.CreateFromSnapshotRequest{
+		Instance: "inst-s",
+		App: &vmmdpb.AppSpec{
+			BaseKey: "/b", LayerKey: "/l",
+			VcpuCount: 2, MemSizeMib: 256,
+			Sidecars: []*vmmdpb.SidecarSpec{
+				{Name: "migrator", Image: "ghcr.io/m@sha256:00", Type: "init",
+					RamMb: 64, DriveSlot: "layer-sidecar-0",
+					StorageKey: "apps/foo/d-migrator.ext4", Essential: true},
+				{Name: "scraper", Image: "ghcr.io/s@sha256:01", Type: "sidecar",
+					RamMb: 128, DriveSlot: "layer-sidecar-1",
+					StorageKey: "apps/foo/d-scraper.ext4"},
+			},
+		},
+	}
+	wr, err := toWakeRequest(req)
+	if err != nil {
+		t.Fatalf("toWakeRequest: %v", err)
+	}
+	if len(wr.Sidecars) != 2 {
+		t.Fatalf("Sidecars len = %d, want 2", len(wr.Sidecars))
+	}
+	if wr.Sidecars[0].Name != "migrator" || !wr.Sidecars[0].Essential {
+		t.Errorf("entry 0: got %+v", wr.Sidecars[0])
+	}
+	if wr.Sidecars[1].Name != "scraper" || wr.Sidecars[1].Essential {
+		t.Errorf("entry 1: got %+v", wr.Sidecars[1])
+	}
+}
+
+// TestToWakeRequest_NoSidecars keeps the legacy single-workload
+// path loud: when AppSpec.sidecars is empty, wr.Sidecars must be
+// nil (NOT an empty slice) so the Manager's nil-equivalence check
+// takes the legacy branch.
+func TestToWakeRequest_NoSidecars(t *testing.T) {
+	req := &vmmdpb.CreateFromSnapshotRequest{
+		Instance: "inst-0",
+		App:      &vmmdpb.AppSpec{BaseKey: "/b", LayerKey: "/l"},
+	}
+	wr, err := toWakeRequest(req)
+	if err != nil {
+		t.Fatalf("toWakeRequest: %v", err)
+	}
+	if wr.Sidecars != nil {
+		t.Errorf("wr.Sidecars = %+v, want nil for legacy single-workload", wr.Sidecars)
+	}
+}
+
+// TestToColdBootRequest_WithSidecars mirrors TestToWakeRequest
+// for the cold-boot path. Deploy's first boot must stage the
+// same drives + cgroups as every subsequent wake — otherwise
+// the very first request lands under a different cgroup tree
+// and throttle counters fire wrong labels.
+func TestToColdBootRequest_WithSidecars(t *testing.T) {
+	req := &vmmdpb.CreateColdBootRequest{
+		Instance: "inst-c",
+		App: &vmmdpb.AppSpec{
+			BaseKey: "/b", LayerKey: "/l",
+			Sidecars: []*vmmdpb.SidecarSpec{
+				{Name: "migrator", Type: "init", DriveSlot: "layer-sidecar-0",
+					StorageKey: "apps/foo/d-migrator.ext4"},
+			},
+		},
+	}
+	wr, err := toColdBootRequest(req)
+	if err != nil {
+		t.Fatalf("toColdBootRequest: %v", err)
+	}
+	if len(wr.Sidecars) != 1 {
+		t.Fatalf("Sidecars len = %d, want 1", len(wr.Sidecars))
+	}
+	if wr.Sidecars[0].Name != "migrator" || wr.Sidecars[0].DriveID != "layer-sidecar-0" {
+		t.Errorf("entry 0: got %+v", wr.Sidecars[0])
+	}
+}

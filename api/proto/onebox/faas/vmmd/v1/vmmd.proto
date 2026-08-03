@@ -288,6 +288,60 @@ message AppSpec {
   // :8080 inside the guest, so the path is the customer's choice
   // and the port is the host's choice. Additive per ADR-016.
   string healthcheck_path = 11;
+  // sidecars (issue #463 / ADR-069 / PR-B) lists the per-workload
+  // sidecar specs that vmmd must provision alongside the main
+  // workload. Each entry maps 1:1 to a row in
+  // `deployment_sidecar_layers` (migration 00119); the wire carries
+  // the same fields imaged persisted at build time so vmmd can
+  // stage the per-workload drive + cgroup without re-reading the
+  // DB. Empty list = no sidecars (the year-one common case).
+  // Additive per ADR-016; pre-PR-B callers leave the field empty
+  // and vmmd keeps the legacy single-workload path.
+  //
+  // The wire is intentionally narrow: name + image digest + type +
+  // ram_mb + drive_slot (the per-sidecar slot name, e.g.
+  // "layer-sidecar-1") + storage_key. cmd/env/port are read by
+  // guest-init from the workload.json written to the sidecar's
+  // drive1 (ADR-069 §Sidecar staging) — they are NOT on the wire
+  // because vmmd never reads them; guest-init does.
+  repeated SidecarSpec sidecars = 12;
+}
+
+// SidecarSpec (issue #463 / ADR-069 / PR-B) is one sidecar's
+// per-workload wire shape. vmmd uses storage_key + ram_mb to
+// stage the sidecar's drive1 + cgroup scope; the rest is for
+// guest-init's per-workload supervisor (cmd/env/port via
+// workload.json).
+//
+// drive_slot is the FC Drive.DriveID (the path-component suffix
+// vmmd mounts inside the jail chroot, e.g. "layer-sidecar-1").
+// It is supplied by imaged at build time so the wire shape
+// stays decoupled from the order of Workloads on the proto.
+message SidecarSpec {
+  // name matches the api.Sidecar.Name shape
+  // (alpha-num + dash + underscore, max 32 chars).
+  string name       = 1;
+  // image is the digest-pinned OCI ref.
+  string image      = 2;
+  // type is "init" or "sidecar".
+  string type       = 3;
+  // ram_mb is the per-sidecar cgroup memory.max (32..512).
+  int32  ram_mb     = 4;
+  // port is the listen port inside the guest netns (1..65535).
+  // 0 means "absent / inherit the main workload's port".
+  uint32 port       = 5;
+  // essential — when true, an init sidecar that exits non-zero
+  // fails the deploy with failure_class=user_error (PR-B's
+  // guest-init path emits the wake.sidecar_init_exit event).
+  bool   essential  = 6;
+  // storage_key is the canonical StorageBackend key
+  // (apps/<slug>/<depID>-<name>.ext4). vmmd resolves it locally
+  // via Storage.Get before staging into the jail chroot.
+  string storage_key = 7;
+  // drive_slot is the FC Drive.DriveID vmmd mounts inside the
+  // jail chroot (e.g. "layer-sidecar-1"). Mirrors
+  // pkg/fcvm.DriveSidecarPrefix + index.
+  string drive_slot = 8;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is

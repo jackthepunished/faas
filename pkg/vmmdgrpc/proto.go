@@ -83,6 +83,13 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		// so the path is the customer's choice and the port is
 		// the host's choice.
 		HealthcheckPath: app.GetHealthcheckPath(),
+		// Issue #463 / ADR-069 / PR-B: per-workload sidecar
+		// wire. schedd populates AppSpec.sidecars from
+		// deployment_sidecar_layers at wake time; vmmd turns
+		// each entry into one FC Drive + one nested cgroup
+		// scope. Empty slice = legacy single-workload path
+		// (pre-PR-B callers). Additive per ADR-016.
+		Sidecars: sidecarsFromProto(app.GetSidecars()),
 	}
 	if snap != nil {
 		// #96 / ADR-025 axis 2 (slice 3) — mem_path is gone from the
@@ -162,6 +169,11 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		// path so deploy's first boot primes the same probe
 		// semantics on the freshly-deployed app.
 		HealthcheckPath: app.GetHealthcheckPath(),
+		// Issue #463 / ADR-069 / PR-B: see toWakeRequest.
+		// Cold-boot mirrors the per-workload sidecar wire so
+		// deploy's first boot stages the same drives +
+		// cgroups as every subsequent wake.
+		Sidecars: sidecarsFromProto(app.GetSidecars()),
 	}, nil
 }
 
@@ -201,6 +213,39 @@ func apiEnvFromProto(pbs []*vmmdpb.APIEnvEntry) []fcvm.APIEnvEntry {
 		out = append(out, fcvm.APIEnvEntry{
 			Key:   p.GetKey(),
 			Value: p.GetValue(),
+		})
+	}
+	return out
+}
+
+// sidecarsFromProto (issue #463 / ADR-069 / PR-B) flattens the
+// AppSpec.sidecars wire slice into fcvm.WorkloadSpec entries.
+// Nil in / nil out matches sealedFromProto + apiEnvFromProto —
+// the Manager treats nil and empty equivalently (legacy
+// single-workload path).
+//
+// We don't re-validate name grammar, denylist, ram_mb range, or
+// essential semantics here — schedd's caller (the wake path)
+// already pulled the rows from deployment_sidecar_layers
+// (which imaged stamped at build time after running the same
+// gates), and the wire shape is a 1:1 mirror of those rows.
+// vmmd trusts the wire as it trusts every other wake-field
+// (the gRPC server runs on a unix socket reachable only by the
+// faas group; ADR-014 / ADR-015).
+func sidecarsFromProto(pbs []*vmmdpb.SidecarSpec) []fcvm.WorkloadSpec {
+	if len(pbs) == 0 {
+		return nil
+	}
+	out := make([]fcvm.WorkloadSpec, 0, len(pbs))
+	for _, p := range pbs {
+		out = append(out, fcvm.WorkloadSpec{
+			Name:       p.GetName(),
+			Type:       p.GetType(),
+			StorageKey: p.GetStorageKey(),
+			DriveID:    p.GetDriveSlot(),
+			RamMB:      int(p.GetRamMb()),
+			Port:       int(p.GetPort()),
+			Essential:  p.GetEssential(),
 		})
 	}
 	return out

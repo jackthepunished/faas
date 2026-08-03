@@ -743,6 +743,15 @@ type WakeRequest struct {
 	// upstream — Free/Hobby never get here; Pro ≤ 16; Scale ≤ 64. The
 	// caller (apid) is responsible for size + per-plan gating.
 	EgressAllowlist []string
+	// Sidecars (issue #463 / ADR-069 / PR-B) is the per-workload
+	// workloads slice carried on the wake wire. schedd resolves
+	// the deployment's jsonb sidecars envelope into one
+	// WorkloadSpec per sidecar (the main workload is implicit —
+	// Workloads[0] in BringUp builds it from WakeRequest.LayerKey
+	// + the plan's RAM). vmmd turns each entry into one FC Drive +
+	// one nested cgroup scope. Empty slice = legacy single-
+	// workload path (pre-PR-B callers). Additive per ADR-016.
+	Sidecars []WorkloadSpec
 }
 
 // SealedEnvEntry is one (key, ciphertext) pair as stored in app_secrets. The
