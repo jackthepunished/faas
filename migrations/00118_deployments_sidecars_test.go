@@ -78,7 +78,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	// (3) Empty-array insert passes — the default fill path. '[]'
 	// is a valid 0-sidecar payload (read back as `[]`, not NULL).
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, image_ref, status, sidecars, created_at)
+		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
 		values ('00000000-0000-0000-0000-000000000319',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
@@ -94,7 +94,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	// enforces length + NOT NULL + jsonb-array-of-objects (PG's
 	// jsonb type already validates array-of-some-value).
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, image_ref, status, sidecars, created_at)
+		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
 		values ('00000000-0000-0000-0000-000000000419',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
@@ -118,7 +118,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	// test: the schema enforces the cap even when the API gate is
 	// bypassed (manual SQL, future grpc handler, debug shell).
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, image_ref, status, sidecars, created_at)
+		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
 		values ('00000000-0000-0000-0000-000000000519',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
@@ -166,7 +166,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	// proves the ALTER TABLE … NOT NULL DEFAULT did not break
 	// legacy INSERTs that don't mention the column.
 	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, image_ref, status, created_at)
+		insert into deployments (id, app_id, image_digest, status, created_at)
 		values ('00000000-0000-0000-0000-000000000619',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
