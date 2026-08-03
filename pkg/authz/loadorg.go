@@ -17,6 +17,8 @@
 package authz
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -36,6 +38,35 @@ import (
 // trim + length-cap here so an oversize / whitespace-only value
 // degrades to passthrough rather than a 500 from the SQL CHECK.
 const maxSlugLen = 64
+
+// logHashShort returns a short, fixed-length, non-reversible
+// fingerprint of an account id (or any opaque server-side
+// identifier) for use in error logs. The output is a 16-hex-char
+// prefix of the SHA-256 digest — 64 bits is plenty of entropy to
+// disambiguate per-account log entries while staying short enough
+// to read in a 1-line log line.
+//
+// The function name is load-bearing: CodeQL's CleartextLogging
+// module treats any call whose callee name matches the
+// notSensitive() regex (which includes `hash` / `sha` / `md5` /
+// `redact` / `obfuscate`) as an obfuscator barrier, so data
+// originating from an HTTP header or URL query parameter stops
+// flowing at the call to logHashShort. This is the structural
+// reason the load-org error-path Warn lines in this file do not
+// raise go/clear-text-logging alerts: account_id is hashed before
+// it reaches slog. Renaming this function (or inlining the hash
+// computation) re-opens the alert.
+//
+// Returns "<hash:0>" for empty input so the field is always
+// present in the JSON log output — empty values are ambiguous
+// between "not set" and "literal empty string".
+func logHashShort(s string) string {
+	if s == "" {
+		return "<hash:0>"
+	}
+	sum := sha256.Sum256([]byte(s))
+	return "h:" + hex.EncodeToString(sum[:8])
+}
 
 // LoadOrgConfig configures LoadOrgWithResolver. The zero value is
 // usable: header defaults to "X-Active-Org", query to "org", and
@@ -147,26 +178,32 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 			api.WriteProblem(w, api.ErrOrgNotFound(slug))
 			return
 		}
-		// Note: slug+account_id is correlation data. If this
-		// log line is shipped to a third-party aggregator, the
-		// pair must be scrubbed or hashed (slugs are public but
-		// the cross-reference is not). The slug comes from the
-		// X-Active-Org header (request-derived, capped to 64 chars
-		// at loadorg.go:131) and acct.ID flows through the same
-		// principal container; both are wrapped with logsanitize.Field
-		// so ASCII control chars (CR/LF/NUL/DEL) become U+00B7 before
-		// they reach the log stream. The inline strings.ReplaceAll
-		// calls match the canonical CodeQL auto-sanitiser pattern
-		// (separate "\r" and "\n" replacements) so go/clear-text-
-		// logging + go/log-injection close on this line; logsanitize.Field
-		// is the defence-in-depth strip for NUL/DEL/etc. The test
-		// TestLoadOrg_LogSanitizesSlug pins the round-trip shape.
+		// Note: this log line omits the slug on purpose. The slug
+		// comes from the X-Active-Org header (or the ?org= query
+		// parameter), and the CodeQL go/clear-text-logging rule
+		// (CWE-200) flags any HTTP-header / URL-query source flowing
+		// into a log call — strings.ReplaceAll closes go/log-injection
+		// but the cleartext rule's barrier model only honours
+		// header.Get for headers OTHER than Authorization / Cookie,
+		// and url.Values.Get has no barrier at all. The slug is
+		// already captured in the audit row above
+		// (org.load.not_found → ErrOrgNotFound(slug)) and in the
+		// emitAudit call below, so a missing-slug log line is the
+		// structural fix. account_id is server-generated from the
+		// session cookie (also a CodeQL-tracked header source) so
+		// we hash it via logHashShort, which matches the
+		// `notSensitive()` regex that CodeQL's CleartextLogging
+		// module recognises as an obfuscator barrier. The
+		// logsanitize.Field wrapper strips ASCII control chars
+		// (defence-in-depth for NUL/DEL/CRLF on the hash output).
+		// TestLoadOrg_LogSanitizesSlug pins the sanitization of the
+		// slug even though the slug is no longer logged in the
+		// org-lookup-failed path; the membership-lookup-failed
+		// path below has the same defensive treatment.
 		//
-		// codeql[go/clear-text-logging] false-positive: inline strings.ReplaceAll closes it.
-		// codeql[go/log-injection] false-positive: inline strings.ReplaceAll closes it.
-		safeSlug := strings.ReplaceAll(strings.ReplaceAll(slug, "\r", ""), "\n", "")
-		safeAcct := strings.ReplaceAll(strings.ReplaceAll(acct.ID, "\r", ""), "\n", "")
-		cfg.Log.Warn("org lookup failed", "slug", logsanitize.Field(safeSlug), "account_id", logsanitize.Field(safeAcct), "error", err.Error())
+		// codeql[go/clear-text-logging] false-positive: logHashShort matches the rule's notSensitive() obfuscator regex.
+		// codeql[go/log-injection] false-positive: logHashShort strips CR/LF/NUL/DEL; same root cause as the cert_expiry.go:333 case.
+		cfg.Log.Warn("org lookup failed", "account_id_hash", logsanitize.Field(logHashShort(acct.ID)), "error", err.Error())
 		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"Org lookup failed",
@@ -186,10 +223,9 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 			api.WriteProblem(w, api.ErrOrgRoleForbidden("access this organization"))
 			return
 		}
-		// codeql[go/clear-text-logging] false-positive: inline strings.ReplaceAll closes it.
-		// codeql[go/log-injection] false-positive: inline strings.ReplaceAll closes it.
-		safeAcct2 := strings.ReplaceAll(strings.ReplaceAll(acct.ID, "\r", ""), "\n", "")
-		cfg.Log.Warn("membership lookup failed", "org_id", logsanitize.Field(org.ID), "account_id", logsanitize.Field(safeAcct2), "error", err.Error())
+		// codeql[go/clear-text-logging] false-positive: logHashShort matches the rule's notSensitive() obfuscator regex.
+		// codeql[go/log-injection] false-positive: same root cause as the org-lookup-failed call site above; cert_expiry.go:333 has the same fix.
+		cfg.Log.Warn("membership lookup failed", "org_id", logsanitize.Field(org.ID), "account_id_hash", logsanitize.Field(logHashShort(acct.ID)), "error", err.Error())
 		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"Membership lookup failed",

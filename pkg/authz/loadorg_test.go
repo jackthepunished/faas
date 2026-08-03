@@ -325,22 +325,35 @@ func (stubBrokenResolver) OrgMemberByAccount(_ context.Context, _, _ string) (st
 	return state.OrgMembership{}, state.ErrNotFound
 }
 
-// TestLoadOrg_LogSanitizesSlug — CodeQL probes #152-156 fired on the
+// TestLoadOrg_LogDoesNotLeakSlug — CodeQL probes #152-156 fired on the
 // org-lookup-failed Warn line because the slug flows from the
 // X-Active-Org header (an attacker-controlled source) directly into
-// slog. The fix wraps slug + acct.ID with pkg/logsanitize.Field so
-// ASCII control characters (CR/LF/NUL) become U+00B7 before they
-// reach the log stream. This test pins that: a header containing
-// "acme\nfake-line" must round-trip through the log as
-// "acme·fake-line" — a malicious actor cannot forge log lines via
-// CR/LF injection. Without sanitization, the log stream would emit
-// two lines per event and one customer's diagnostic would silently
-// rotate into another's, breaking the audit story.
+// slog. The structural fix is two-part:
 //
-// The synthetic resolver error is what makes this test cover the
-// Warn branch — the empty stubResolver returns state.ErrNotFound,
-// which goes through the 404 path (no log line).
-func TestLoadOrg_LogSanitizesSlug(t *testing.T) {
+//  1. The slug is NOT logged at all in the org-lookup-failed path —
+//     CodeQL's go/clear-text-logging rule (CWE-200) treats any HTTP
+//     header / URL query parameter flowing to a log call as a
+//     finding, and the rule's barrier model only honours header.Get
+//     for headers OTHER than Authorization/Cookie (X-Active-Org
+//     matches the barrier) but url.Values.Get has no barrier at
+//     all, so any logged slug re-opens the alert. The slug is
+//     already captured in the audit row (org.load.not_found →
+//     ErrOrgNotFound(slug)) so the Warn can drop it.
+//
+//  2. account_id is hashed via logHashShort before reaching slog —
+//     logHashShort's name matches the CodeQL notSensitive() regex
+//     (which includes "hash"), so it's recognised as an obfuscator
+//     barrier. The output is `h:<16 hex chars>`, a fixed-shape
+//     prefix that disambiguates per-account log entries without
+//     ever exposing the raw account id. The "h:" prefix is the
+//     canonical signal to a human reader that the value is a
+//     fingerprint, not a literal id.
+//
+// This test pins both contracts. The synthetic resolver error
+// is what makes the test cover the Warn branch — the empty
+// stubResolver returns state.ErrNotFound, which goes through the
+// 404 path (no log line).
+func TestLoadOrg_LogDoesNotLeakSlug(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 
@@ -355,7 +368,7 @@ func TestLoadOrg_LogSanitizesSlug(t *testing.T) {
 	mw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec, req)
 
 	// The middleware should have written a 500 — and the log line
-	// must contain the sanitized slug, not the raw header value.
+	// must NOT contain the raw slug, even after sanitization.
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
 	}
@@ -364,25 +377,45 @@ func TestLoadOrg_LogSanitizesSlug(t *testing.T) {
 		t.Fatal("expected a log line; got empty buffer")
 	}
 
-	// Decode the JSON log line so we can inspect the "slug" field
-	// directly (instead of grepping for substrings across the
-	// whole JSON).
+	// Decode the JSON log line so we can inspect fields directly
+	// (instead of grepping for substrings across the whole JSON).
 	var entry map[string]any
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &entry); err != nil {
 		t.Fatalf("log line not JSON: %v (raw=%q)", err, out)
 	}
-	slugField, ok := entry["slug"].(string)
+
+	// Contract 1: no "slug" field in the log line. (Earlier
+	// revisions of this test asserted the sanitized slug was
+	// present; the structural fix removes the slug entirely.)
+	if _, hasSlug := entry["slug"]; hasSlug {
+		t.Errorf("log line still contains a slug field: %+v", entry)
+	}
+	// Belt-and-suspenders: even with the slug field removed, a
+	// copy of the raw header value must not appear anywhere in
+	// the JSON output. A malicious header cannot forge log lines
+	// by smuggling CR/LF into a value that gets concatenated
+	// into the log stream.
+	if strings.Contains(out, "acme\nfake-line") {
+		t.Errorf("raw header value (acme\\nfake-line) found in log output: %q", out)
+	}
+
+	// Contract 2: account_id_hash is present, has the "h:" prefix,
+	// is 18 chars long (h: + 16 hex), and contains no raw account
+	// id. The hash is deterministic for the same input, so two
+	// runs of the test produce the same fingerprint.
+	hashField, ok := entry["account_id_hash"].(string)
 	if !ok {
-		t.Fatalf("slug field missing or not a string: %+v", entry)
+		t.Fatalf("account_id_hash field missing or not a string: %+v", entry)
 	}
-	if strings.Contains(slugField, "\n") || strings.Contains(slugField, "\r") {
-		t.Errorf("slug field still contains CR/LF: %q", slugField)
+	if !strings.HasPrefix(hashField, "h:") {
+		t.Errorf("account_id_hash = %q, want h: prefix", hashField)
 	}
-	if !strings.Contains(slugField, "acme") || !strings.Contains(slugField, "fake-line") {
-		t.Errorf("slug field lost legitimate content: %q", slugField)
+	if len(hashField) != len("h:")+16 {
+		t.Errorf("account_id_hash = %q, want h: + 16 hex chars (got %d)", hashField, len(hashField))
 	}
-	// The original "acme\nfake-line" must NOT appear verbatim.
-	if strings.Contains(slugField, "acme\nfake-line") {
-		t.Errorf("slug field un-sanitized: %q", slugField)
+	// The raw account id is "acct-1" (set by reqWithPrincipal);
+	// it must not appear in the hash output.
+	if strings.Contains(hashField, "acct-1") {
+		t.Errorf("account_id_hash leaks raw account id: %q", hashField)
 	}
 }
