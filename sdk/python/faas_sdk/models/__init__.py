@@ -55,6 +55,8 @@ from .auth_providers import AuthProviders
 from .billing_portal_response import BillingPortalResponse
 from .build_export_response import BuildExportResponse
 from .build_provenance_response import BuildProvenanceResponse
+from .change_member_role_request import ChangeMemberRoleRequest
+from .change_member_role_request_role import ChangeMemberRoleRequestRole
 from .change_plan_request import ChangePlanRequest
 from .change_plan_request_plan import ChangePlanRequestPlan
 from .consume_invoice_response import ConsumeInvoiceResponse
@@ -78,6 +80,7 @@ from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEn
 from .create_deployment_request import CreateDeploymentRequest
 from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
+from .create_org_request import CreateOrgRequest
 from .cron_response import CronResponse
 from .custom_domain_response import CustomDomainResponse
 from .daily_usage_list_response import DailyUsageListResponse
@@ -103,6 +106,10 @@ from .grace_window_response import GraceWindowResponse
 from .install_bind_request import InstallBindRequest
 from .install_bind_response import InstallBindResponse
 from .instance_response import InstanceResponse
+from .invitation_list_response import InvitationListResponse
+from .invitation_with_token_response import InvitationWithTokenResponse
+from .invite_member_request import InviteMemberRequest
+from .invite_member_request_role import InviteMemberRequestRole
 from .invocation import Invocation
 from .invocation_headers import InvocationHeaders
 from .invocation_payload import InvocationPayload
@@ -125,6 +132,7 @@ from .list_audit_events_response import ListAuditEventsResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
+from .member_list_response import MemberListResponse
 from .mfa_confirm_request import MFAConfirmRequest
 from .mfa_confirm_response import MFAConfirmResponse
 from .mfa_disable_request import MFADisableRequest
@@ -136,6 +144,18 @@ from .mfa_recover_response import MFARecoverResponse
 from .mfa_verify_request import MFAVerifyRequest
 from .mfa_verify_response import MFAVerifyResponse
 from .o_auth_provider_capability import OAuthProviderCapability
+from .org_invitation_response import OrgInvitationResponse
+from .org_invitation_response_role import OrgInvitationResponseRole
+from .org_invitation_response_status import OrgInvitationResponseStatus
+from .org_list_response import OrgListResponse
+from .org_me_response import OrgMeResponse
+from .org_member_response import OrgMemberResponse
+from .org_member_response_role import OrgMemberResponseRole
+from .org_response import OrgResponse
+from .org_response_plan import OrgResponsePlan
+from .org_response_status import OrgResponseStatus
+from .org_with_role import OrgWithRole
+from .org_with_role_role import OrgWithRoleRole
 from .password_forgot_response_200 import PasswordForgotResponse200
 from .password_forgot_response_200_status import PasswordForgotResponse200Status
 from .password_login_request import PasswordLoginRequest
@@ -144,6 +164,8 @@ from .password_login_response_plan import PasswordLoginResponsePlan
 from .password_reset_confirm import PasswordResetConfirm
 from .password_reset_request import PasswordResetRequest
 from .password_signup_request import PasswordSignupRequest
+from .patch_org_request import PatchOrgRequest
+from .patch_org_request_plan import PatchOrgRequestPlan
 from .plan_cron import PlanCron
 from .plan_managed import PlanManaged
 from .plan_response import PlanResponse
@@ -191,6 +213,7 @@ from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .transfer_ownership_request import TransferOwnershipRequest
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
@@ -261,6 +284,8 @@ __all__ = (
     "BillingPortalResponse",
     "BuildExportResponse",
     "BuildProvenanceResponse",
+    "ChangeMemberRoleRequest",
+    "ChangeMemberRoleRequestRole",
     "ChangePlanRequest",
     "ChangePlanRequestPlan",
     "ConsumedCreditRow",
@@ -284,6 +309,7 @@ __all__ = (
     "CreateDeploymentRequest",
     "CreateKeyRequest",
     "CreateKeyRequestScopesItem",
+    "CreateOrgRequest",
     "CronResponse",
     "CustomDomainResponse",
     "DailyUsageListResponse",
@@ -309,6 +335,10 @@ __all__ = (
     "InstallBindRequest",
     "InstallBindResponse",
     "InstanceResponse",
+    "InvitationListResponse",
+    "InvitationWithTokenResponse",
+    "InviteMemberRequest",
+    "InviteMemberRequestRole",
     "Invocation",
     "InvocationHeaders",
     "InvocationPayload",
@@ -331,6 +361,7 @@ __all__ = (
     "ListInstancesResponse",
     "ListInvocationsResponse",
     "ListSecretsForAccountResponse",
+    "MemberListResponse",
     "MFAConfirmRequest",
     "MFAConfirmResponse",
     "MFADisableRequest",
@@ -342,6 +373,18 @@ __all__ = (
     "MFAVerifyRequest",
     "MFAVerifyResponse",
     "OAuthProviderCapability",
+    "OrgInvitationResponse",
+    "OrgInvitationResponseRole",
+    "OrgInvitationResponseStatus",
+    "OrgListResponse",
+    "OrgMemberResponse",
+    "OrgMemberResponseRole",
+    "OrgMeResponse",
+    "OrgResponse",
+    "OrgResponsePlan",
+    "OrgResponseStatus",
+    "OrgWithRole",
+    "OrgWithRoleRole",
     "PasswordForgotResponse200",
     "PasswordForgotResponse200Status",
     "PasswordLoginRequest",
@@ -350,6 +393,8 @@ __all__ = (
     "PasswordResetConfirm",
     "PasswordResetRequest",
     "PasswordSignupRequest",
+    "PatchOrgRequest",
+    "PatchOrgRequestPlan",
     "PlanCron",
     "PlanManaged",
     "PlanResponse",
@@ -397,6 +442,7 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "TransferOwnershipRequest",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
     "UpdateAlertRuleRequestComparison",

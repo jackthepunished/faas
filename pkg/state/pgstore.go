@@ -10138,6 +10138,121 @@ func (s *PgStore) UpdateOrgMemberRole(ctx context.Context, orgID, accountID stri
 	return nil
 }
 
+// TransferOrgOwnership atomically promotes toAccountID to owner and
+// demotes fromAccountID to admin under one tx (PR 5; ADR-061). The
+// exactly-one-owner invariant is enforced by the partial unique
+// org_memberships_one_owner_idx (migrations/00099); the tripwire is
+// sqlstate 23505 if either side of the swap would briefly leave two
+// active owners.
+//
+// Reads both rows FOR UPDATE before the writes so a concurrent
+// RemoveOrgMember / UpdateOrgMemberRole cannot race the swap (the
+// row locks held during the tx) — pgx serialises both reads at the
+// pgx.TxOptions{} default (ReadCommitted) which matches AddOrgMember
+// and RemoveOrgMember's existing isolation level (see store.go:230-232).
+//
+// Sentinel mapping:
+//   - either side missing → ErrNotFound
+//   - fromAccountID is not the active owner → ErrOrgLastOwner
+//     (the partial unique is the tripwire; defensively also probe
+//     role explicitly so the error surfaces cleanly on the rare
+//     path where the partial unique is not the failing constraint)
+//   - to-account is removed → ErrNotFound (a removed invitee
+//     cannot become owner)
+//   - both rows present + invariants hold → swap succeeds
+func (s *PgStore) TransferOrgOwnership(ctx context.Context, orgID, fromAccountID, toAccountID string) error {
+	if fromAccountID == toAccountID {
+		// No-op would silently skip the swap if the caller is
+		// already the only owner. Refuse explicitly so the handler
+		// surface is consistent (ErrOrgLastOwner mirrors the
+		// self-transfer-is-illegal invariant; PR 5 front-loads the
+		// check so we don't issue a no-op write).
+		return ErrOrgLastOwner
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("state: transfer org ownership tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck
+
+	// (1) Probe fromAccountID: must be the active owner right now.
+	var fromRole string
+	var fromRemoved *time.Time
+	row := tx.QueryRow(ctx, `
+		select role, removed_at
+		  from org_memberships
+		 where org_id = $1 and account_id = $2
+		   for update
+	`, orgID, fromAccountID)
+	if err := row.Scan(&fromRole, &fromRemoved); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("state: transfer ownership from probe: %w", err)
+	}
+	if fromRole != string(OrgRoleOwner) || fromRemoved != nil {
+		return ErrOrgLastOwner
+	}
+
+	// (2) Probe toAccountID: must be an active, non-owner member.
+	// Promoting a viewer/admin to owner is the swap; the active
+	// membership is what makes the swap legitimate. Reject a
+	// already-owner path with ErrOrgLastOwner so the partial unique
+	// tripwire is bypassed upstream (cleaner wire-shape error).
+	var toRole string
+	var toRemoved *time.Time
+	row = tx.QueryRow(ctx, `
+		select role, removed_at
+		  from org_memberships
+		 where org_id = $1 and account_id = $2
+		   for update
+	`, orgID, toAccountID)
+	if err := row.Scan(&toRole, &toRemoved); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("state: transfer ownership to probe: %w", err)
+	}
+	if toRemoved != nil {
+		return ErrNotFound
+	}
+	if toRole == string(OrgRoleOwner) {
+		return ErrOrgLastOwner
+	}
+
+	// (3) Demote fromAccountID to admin first. Order matters: if
+	// the demote succeeded and the promote raced with another
+	// transfer, the partial unique org_memberships_one_owner_idx
+	// would 23505 on the second owner. The reverse order (promote
+	// first) would briefly leave two active owners, which is the
+	// exact invariant the partial unique is meant to prevent.
+	// Demote-first means a 23505 on the promote step surfaces as
+	// ErrOrgLastOwner and the tx rolls back cleanly.
+	if _, err := tx.Exec(ctx, `
+		update org_memberships
+		   set role = $3
+		 where org_id = $1 and account_id = $2
+	`, orgID, fromAccountID, string(OrgRoleAdmin)); err != nil {
+		return fmt.Errorf("state: transfer ownership demote: %w", err)
+	}
+	// (4) Promote toAccountID to owner.
+	if _, err := tx.Exec(ctx, `
+		update org_memberships
+		   set role = $3
+		 where org_id = $1 and account_id = $2
+	`, orgID, toAccountID, string(OrgRoleOwner)); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+			return ErrOrgLastOwner
+		}
+		return fmt.Errorf("state: transfer ownership promote: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: transfer ownership commit: %w", err)
+	}
+	return nil
+}
+
 // ListOrgMembers returns every (active + removed) membership row.
 func (s *PgStore) ListOrgMembers(ctx context.Context, orgID string) ([]OrgMembership, error) {
 	rows, err := s.pool.Query(ctx, `

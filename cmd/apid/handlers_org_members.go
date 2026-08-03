@@ -1,0 +1,398 @@
+// Organization member-management handlers (issue #190 / IAM-6 /
+// ADR-061, PR 5).
+//
+// Mounted at:
+//   - GET    /v1/orgs/{slug}/members                  listOrgMembers
+//   - POST   /v1/orgs/{slug}/members                  inviteOrgMember
+//   - PATCH  /v1/orgs/{slug}/members/{user_id}        changeOrgMemberRole
+//   - DELETE /v1/orgs/{slug}/members/{user_id}        removeOrgMember
+//
+// All four compose s.authLimited + s.requireMFA + s.requireScope +
+// s.loadOrg (mounted in cmd/apid/server.go). The slug-or-membership
+// resolution already happened in the LoadOrg middleware; handlers
+// read the stamped membership via authz.MembershipFrom and call
+// authz.AuthorizeOrgAction with the closed OrgAction vocabulary.
+//
+// POST /v1/orgs/{slug}/members creates an OrgInvitation (NOT a
+// direct AddOrgMember) — the handler mints a 32-byte plaintext
+// token, returns it ONCE in the response, and stores only the
+// SHA-256 hash. The accept flow lives in PR 8 (issue #190 PR-8)
+// alongside SSO; PR 5 ships the invite-creation surface plus the
+// /v1/invitations/{token} peek in handlers_org_invitations.go.
+
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/authz"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// OrgInvitationTokenBytes is the size of the plaintext token the
+// handler mints for an invitation (32 bytes → 44 chars base64url).
+// Mirrors LoginTokenSize (pkg/auth/handlers_login.go) — large
+// enough to make collision astronomically unlikely while keeping
+// the URL-embedded token manageable.
+const OrgInvitationTokenBytes = 32
+
+// defaultOrgInvitationTtl is the lifetime of a freshly-minted
+// invitation. 14 days is generous (matches the cli_auth_code
+// timeline); admins can revoke earlier via RevokeOrgInvitation.
+const defaultOrgInvitationTtl = 14 * 24 * time.Hour
+
+// listOrgMembers returns the active members of the org (removed
+// rows are filtered at the boundary). Each row carries the joined
+// account.email so the dashboard can render "bob@acme.com" without
+// a second round-trip.
+//
+// Mounted at GET /v1/orgs/{slug}/members.
+func (s *server) listOrgMembers(w http.ResponseWriter, r *http.Request, _ state.Account) {
+	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionView, s.audit); p != nil {
+		api.WriteProblem(w, p)
+		return
+	}
+	mem, ok := authz.MembershipFrom(r)
+	if !ok || mem == nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"LoadOrg wired before AuthorizeOrgAction",
+			"no membership on request; check the route table"))
+		return
+	}
+	rows, err := s.store.ListOrgMembers(r.Context(), mem.OrgID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"ListOrgMembers failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	out := api.ListMembersResponse{Members: make([]api.OrgMemberResponse, 0, len(rows))}
+	for _, row := range rows {
+		if row.RemovedAt != nil {
+			continue // Filter at the API boundary; removed rows stay in DB for audit.
+		}
+		out.Members = append(out.Members, api.OrgMemberResponseFromRow(s.memberToRow(r.Context(), row)))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// inviteOrgMember mints a 32-byte plaintext token, hashes it for
+// storage, and returns the plaintext ONCE. The accept flow is PR 8;
+// PR 5 ships the create side + the peek side
+// (handlers_org_invitations.go).
+//
+// Mounted at POST /v1/orgs/{slug}/members.
+func (s *server) inviteOrgMember(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionInviteMembers, s.audit); p != nil {
+		api.WriteProblem(w, p)
+		return
+	}
+	mem, ok := authz.MembershipFrom(r)
+	if !ok || mem == nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"LoadOrg wired before AuthorizeOrgAction",
+			"no membership on request; check the route table"))
+		return
+	}
+	var req api.InviteMemberRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	email := strings.TrimSpace(strings.ToLower(req.Email))
+	role := state.OrgRole(strings.TrimSpace(req.Role))
+	if email == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, api.CodeValidation,
+			"Email required", "email must be a non-empty string"))
+		return
+	}
+	if !containsOrgMemberRoleForInvite(string(role)) {
+		// owner is the only excluded role (the SQL CHECK on
+		// org_invitations.role mirrors the constraint — a
+		// transfer-ownership endpoint is the only path to owner).
+		api.WriteProblem(w, api.ErrOrgRoleForbidden("invite members"))
+		return
+	}
+	// Reject invitations to the personal org: a personal org
+	// doesn't accept members (the backfill in PR 3 stamps the
+	// owner-only row, and the personal_org name-space is the
+	// caller's own account).
+	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"OrgByID failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	if org.Personal {
+		api.WriteProblem(w, api.ErrOrgPersonalImmutable())
+		return
+	}
+	// Cap check: Plan.OrgPendingInvitationsMax() is 0 until the
+	// financial model populates; the doc-string on the limit
+	// accessor (pkg/api/limits.go:1594-1600) makes the > 0
+	// semantics explicit so this branch opens as soon as the
+	// model lands. The Pending count is the row count +
+	// consumed-not-revoked; for PR 5 we count pending-only rows
+	// (active invitations the customer has not yet processed).
+	limit := org.Plan.OrgPendingInvitationsMax()
+	if limit > 0 {
+		pending, err := s.countPendingOrgInvitations(r.Context(), org.ID)
+		if err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity,
+				"ListOrgInvitationsForOrg failed",
+				"try again; if the problem persists, contact support"))
+			return
+		}
+		if pending >= limit {
+			api.WriteProblem(w, api.ErrOrgInvitationCapExceeded(limit, pending))
+			return
+		}
+	}
+	// Mint 32 bytes from crypto/rand; base64url-encode for the
+	// email link.
+	plaintext := make([]byte, OrgInvitationTokenBytes)
+	if _, err := rand.Read(plaintext); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"crypto/rand failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	token := base64.RawURLEncoding.EncodeToString(plaintext)
+	hash := sha256.Sum256(plaintext)
+	invitedBy := acct.ID
+	now := time.Now()
+	inv, err := s.store.CreateOrgInvitation(r.Context(), state.OrgInvitation{
+		OrgID:              org.ID,
+		Email:              email,
+		Role:               role,
+		TokenHash:          hash[:],
+		InvitedByAccountID: &invitedBy,
+		ExpiresAt:          now.Add(defaultOrgInvitationTtl),
+		CreatedAt:          now,
+	})
+	if err != nil {
+		if errors.Is(err, state.ErrConflict) {
+			// Duplicate token_hash is astronomically unlikely
+			// (32 bytes); return a 500 so the customer doesn't
+			// think the invite was a no-op.
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity,
+				"CreateOrgInvitation collided",
+				"rare token-hash collision; retry"))
+			return
+		}
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"CreateOrgInvitation failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	s.audit.Emit(r.Context(), "org.invitation.created", &acct.ID, map[string]any{
+		"org_id":     org.ID,
+		"slug":       org.Slug,
+		"email":      email,
+		"role":       string(role),
+		"expires_at": inv.ExpiresAt,
+	})
+	row := invitationToRow(inv, org.Slug, now)
+	writeJSON(w, http.StatusCreated, api.OrgInvitationWithToken{
+		OrgInvitationResponse: api.OrgInvitationResponseFromRow(row),
+		Token:                 token,
+	})
+}
+
+// changeOrgMemberRole updates a member's role. The role-change
+// action is owner-only (PR 4 closed the matrix); the handler
+// refuses "owner" on a direct PATCH — transfer-ownership is the
+// only path to owner.
+//
+// Mounted at PATCH /v1/orgs/{slug}/members/{user_id}.
+func (s *server) changeOrgMemberRole(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionChangeRole, s.audit); p != nil {
+		api.WriteProblem(w, p)
+		return
+	}
+	mem, ok := authz.MembershipFrom(r)
+	if !ok || mem == nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"LoadOrg wired before AuthorizeOrgAction",
+			"no membership on request; check the route table"))
+		return
+	}
+	targetID := r.PathValue("user_id")
+	if targetID == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Missing user_id", "user_id must be a non-empty string"))
+		return
+	}
+	var req api.ChangeRoleRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	role := state.OrgRole(strings.TrimSpace(req.Role))
+	if !containsOrgDirectPatchRole(string(role)) {
+		// owner is the only excluded role — transfer-ownership
+		// is the only path to owner. Returns ErrOrgRoleForbidden
+		// so the wire shape matches the matrix-checked path.
+		api.WriteProblem(w, api.ErrOrgRoleForbidden("change role"))
+		return
+	}
+	if err := s.store.UpdateOrgMemberRole(r.Context(), mem.OrgID, targetID, role); err != nil {
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
+				"Member not found", "the target account is not an active member of this org"))
+		case errors.Is(err, state.ErrOrgLastOwner):
+			api.WriteProblem(w, api.ErrOrgLastOwner())
+		default:
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity,
+				"UpdateOrgMemberRole failed",
+				"try again; if the problem persists, contact support"))
+		}
+		return
+	}
+	s.audit.Emit(r.Context(), "org.member_role_changed", &acct.ID, map[string]any{
+		"org_id":         mem.OrgID,
+		"target_account": targetID,
+		"new_role":       string(role),
+	})
+	// Re-read the row so the response carries the joined account
+	// email / role pair (the store doesn't return the updated
+	// row, so a single-org lookup is the only way to surface it).
+	updated, err := s.store.OrgMemberByAccount(r.Context(), mem.OrgID, targetID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"OrgMemberByAccount (post-update) failed",
+			"refresh and try again"))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.OrgMemberResponseFromRow(s.memberToRow(r.Context(), updated)))
+}
+
+// removeOrgMember stamps removed_at on the membership row. The
+// exactly-one-owner invariant lives in pkg/state::RemoveOrgMember's
+// tx — the handler maps the sentinel to ErrOrgLastOwner.
+//
+// Mounted at DELETE /v1/orgs/{slug}/members/{user_id}.
+func (s *server) removeOrgMember(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionRemoveMembers, s.audit); p != nil {
+		api.WriteProblem(w, p)
+		return
+	}
+	mem, ok := authz.MembershipFrom(r)
+	if !ok || mem == nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"LoadOrg wired before AuthorizeOrgAction",
+			"no membership on request; check the route table"))
+		return
+	}
+	targetID := r.PathValue("user_id")
+	if targetID == "" {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Missing user_id", "user_id must be a non-empty string"))
+		return
+	}
+	if targetID == mem.AccountID {
+		// Self-removal would leave the org without the active
+		// caller. The store surfaces ErrOrgLastOwner if this is
+		// the last owner; for the more common case where the
+		// caller is admin, refusing at the boundary avoids the
+		// awkward shape of "you removed yourself; you can no
+		// longer access this org". The dashboard side UI
+		// should disable the button; defence in depth here.
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation,
+			"Cannot remove self",
+			"transfer ownership or ask another owner to remove you"))
+		return
+	}
+	if err := s.store.RemoveOrgMember(r.Context(), mem.OrgID, targetID); err != nil {
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
+				"Member not found", "the target account is not an active member of this org"))
+		case errors.Is(err, state.ErrOrgLastOwner):
+			api.WriteProblem(w, api.ErrOrgLastOwner())
+		default:
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity,
+				"RemoveOrgMember failed",
+				"try again; if the problem persists, contact support"))
+		}
+		return
+	}
+	s.audit.Emit(r.Context(), "org.member_removed", &acct.ID, map[string]any{
+		"org_id":         mem.OrgID,
+		"target_account": targetID,
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// containsOrgMemberRoleForInvite is the membership check for the
+// invite-side role. Mirrors api.AllowedOrgMemberRolesForInvite but
+// accepts a flat string lookup rather than the slice index (the
+// pkg/api containsString helper is unexported — this local copy
+// keeps cmd/apid's vendored check explicit at the seam).
+func containsOrgMemberRoleForInvite(role string) bool {
+	for _, r := range api.AllowedOrgMemberRolesForInvite {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// containsOrgDirectPatchRole is the membership check for the
+// PATCH-side role.
+func containsOrgDirectPatchRole(role string) bool {
+	for _, r := range api.AllowedOrgDirectPatchRoles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// countPendingOrgInvitations returns the number of pending rows
+// for the org (consumed_at == nil && revoked_at == nil &&
+// expires_at > now). The store doesn't have a single-purpose
+// counter, so the handler reads ListOrgInvitationsForOrg and
+// filters at the boundary — same posture as the member-list's
+// RemovedAt filter.
+func (s *server) countPendingOrgInvitations(ctx context.Context, orgID string) (int, error) {
+	rows, err := s.store.ListOrgInvitationsForOrg(ctx, orgID)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	pending := 0
+	for _, inv := range rows {
+		if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+			continue
+		}
+		if !inv.ExpiresAt.IsZero() && now.After(inv.ExpiresAt) {
+			continue
+		}
+		pending++
+	}
+	return pending, nil
+}

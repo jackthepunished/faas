@@ -39,6 +39,7 @@ const (
 	sessionsFile  = "sessions.go" // IAM-3 (ADR-039)
 	errorsFile    = "errors.go"
 	wakeTLFile    = "wake_timeline.go" // issue #517 PR-C / ADR-064
+	orgsFile      = "orgs.go"          // issue #190 / IAM-6 / ADR-061 PR 5
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -95,6 +96,13 @@ var dtoExclude = map[string]bool{
 	"SessionsRevokeRequest":        true, // IAM-3 (ADR-039): the only field is csrf_token, which is inlined in the OpenAPI spec rather than $ref'd
 	"AlertRuleRow":                 true, // internal conversion struct (state row → wire DTO); never sent over the wire on its own
 	"RotateAlertRuleSecretRequest": true, // PR 3 / ADR-045: server-mints the secret; request body is empty, not in spec
+	// Issue #190 / IAM-6 / ADR-061 PR 5 — typed inputs at the
+	// pkg/api ↔ pkg/state seam. The wire DTOs are OrgResponse /
+	// OrgMemberResponse / OrgInvitationResponse; the *Row types
+	// are the typed counterparts (state row → wire DTO).
+	"OrgRow":           true,
+	"OrgMemberRow":     true,
+	"OrgInvitationRow": true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -502,6 +510,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", sessionsFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
 		filepath.Join(root, "pkg", "api", wakeTLFile),
+		filepath.Join(root, "pkg", "api", orgsFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

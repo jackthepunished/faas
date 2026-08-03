@@ -8151,6 +8151,48 @@ func (m *MemStore) UpdateOrgMemberRole(_ context.Context, orgID, accountID strin
 	return nil
 }
 
+// TransferOrgOwnership atomically promotes toAccountID to owner and
+// demotes fromAccountID to admin under m.mu. Mirrors PgStore's
+// sentinel-mapping (ErrNotFound / ErrOrgLastOwner) and demote-first
+// ordering. No-op on fromAccountID == toAccountID returns
+// ErrOrgLastOwner (a self-transfer would silently skip the swap and
+// the wire-shape contract is to refuse).
+func (m *MemStore) TransferOrgOwnership(_ context.Context, orgID, fromAccountID, toAccountID string) error {
+	if fromAccountID == toAccountID {
+		return ErrOrgLastOwner
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fromKey := orgAccountKey{OrgID: orgID, AccountID: fromAccountID}
+	fromMem, ok := m.memberships[fromKey]
+	if !ok {
+		return ErrNotFound
+	}
+	if fromMem.Role != OrgRoleOwner || fromMem.RemovedAt != nil {
+		return ErrOrgLastOwner
+	}
+	toKey := orgAccountKey{OrgID: orgID, AccountID: toAccountID}
+	toMem, ok := m.memberships[toKey]
+	if !ok {
+		return ErrNotFound
+	}
+	if toMem.RemovedAt != nil {
+		return ErrNotFound
+	}
+	if toMem.Role == OrgRoleOwner {
+		return ErrOrgLastOwner
+	}
+	// Demote-first mirrors PgStore's ordering. MemStore is single-
+	// critical-section so the partial unique race PgStore guards
+	// against can't occur here — but the ordering keeps the two
+	// implementations byte-identical at the concurrency seam.
+	fromMem.Role = OrgRoleAdmin
+	m.memberships[fromKey] = fromMem
+	toMem.Role = OrgRoleOwner
+	m.memberships[toKey] = toMem
+	return nil
+}
+
 // ListOrgMembers returns every membership row, ordered by JoinedAt.
 func (m *MemStore) ListOrgMembers(_ context.Context, orgID string) ([]OrgMembership, error) {
 	m.mu.Lock()
