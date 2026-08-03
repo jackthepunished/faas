@@ -36,9 +36,10 @@ Three pieces remained vs. the literal issue acceptance criteria:
 ## Decisions
 
 1. **New `deployments.min_instances` column** with the inheritance default = 0 (=
-   "inherit from parent app"). The column lands in migration 00131 (the backfill
-   migration); the deployments table gains the column via the same ALTER TABLE pair
-   as the apps.align_min_instances UPDATE so the migration set stays contiguous.
+   "inherit from parent app"). The column lands in migration 00133 (a separate
+   `ALTER TABLE deployments ADD COLUMN` migration); 00131 stays focused on the
+   apps.align_min_instances backfill and the migration set stays contiguous
+   (00131 + 00132 + 00133, with 00129/00130 as fences past PR #623's slot claim).
 
 2. **Effective per-instance floor**
    `= max(app.EffectiveMinInstances(), d.EffectiveMinInstances())`. Composed at the
@@ -81,8 +82,9 @@ so the merge order does not matter — goose would 42P07 "duplicate version 129"
 whichever PR lands second. The prior reservation fences at 124/125 from PR #618 land
 as part of PR #618's own embedded set; the new content at 131/132 is real, not a fence.
 
-* 00131: `apps_align_min_instances.sql` (backfill)
+* 00131: `apps_align_min_instances.sql` (apps backfill)
 * 00132: `instances_app_deployment_idx.sql` (partial index)
+* 00133: `deployments_min_instances.sql` (ADD COLUMN min_instances)
 
 ## Failure modes
 

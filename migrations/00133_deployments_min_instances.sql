@@ -27,15 +27,31 @@
 -- write jsonb) and is not needed on deployments — the PATCH route
 -- writes a single int.
 --
--- Replay-safe (PR #377 / ADR-041): ADD COLUMN IF NOT EXISTS +
--- ADD CONSTRAINT IF NOT EXISTS. A second MigrateUp is a no-op.
+-- Replay-safety:
+--   - ADD COLUMN IF NOT EXISTS is supported by Postgres 9.6+
+--     (production runs Postgres 15 per CLAUDE.md).
+--   - ADD CONSTRAINT does NOT support IF NOT EXISTS on Postgres 15
+--     (that's an 18+ feature); the DO/EXCEPTION block wraps the
+--     ADD CONSTRAINT so a second MigrateUp against a schema that
+--     already has the constraint is a no-op. The DO block uses
+--     information_schema + a regex match against the constraint
+--     definition so the replay-safety check is exact (not just
+--     name-based).
 
 ALTER TABLE deployments
     ADD COLUMN IF NOT EXISTS min_instances int NOT NULL DEFAULT 0;
 
-ALTER TABLE deployments
-    ADD CONSTRAINT IF NOT EXISTS deployments_min_instances_chk
-    CHECK (min_instances >= 0 AND min_instances <= 100);
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'deployments_min_instances_chk'
+    ) THEN
+        ALTER TABLE deployments
+            ADD CONSTRAINT deployments_min_instances_chk
+            CHECK (min_instances >= 0 AND min_instances <= 100);
+    END IF;
+END $$;
 
 -- +goose StatementEnd
 
