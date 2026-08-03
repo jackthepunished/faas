@@ -8041,7 +8041,9 @@ func (m *MemStore) ListOrgsForAccount(_ context.Context, accountID string) ([]Or
 	return out, nil
 }
 
-// UpdateOrgPlan / UpdateOrgStatus / SoftDeleteOrg are mirror updates.
+// UpdateOrgPlan / UpdateOrgName / UpdateOrgStatus / SoftDeleteOrg are
+// mirror updates. Each stamps UpdatedAt so the wire shape is monotonic
+// per row.
 func (m *MemStore) UpdateOrgPlan(_ context.Context, id string, plan api.Plan) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -8050,6 +8052,23 @@ func (m *MemStore) UpdateOrgPlan(_ context.Context, id string, plan api.Plan) er
 		return ErrNotFound
 	}
 	o.Plan = plan
+	o.UpdatedAt = time.Now().UTC()
+	m.orgs[id] = o
+	return nil
+}
+
+// UpdateOrgName is the name half of PATCH /v1/orgs/{slug} (PR 5). The
+// handler trims + bounds the name before reaching the Store; the
+// MemStore is permissive but the validation contract is identical to
+// the PgStore path.
+func (m *MemStore) UpdateOrgName(_ context.Context, id, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	o.Name = name
 	o.UpdatedAt = time.Now().UTC()
 	m.orgs[id] = o
 	return nil
@@ -8148,6 +8167,48 @@ func (m *MemStore) UpdateOrgMemberRole(_ context.Context, orgID, accountID strin
 	}
 	mem.Role = role
 	m.memberships[k] = mem
+	return nil
+}
+
+// TransferOrgOwnership atomically promotes toAccountID to owner and
+// demotes fromAccountID to admin under m.mu. Mirrors PgStore's
+// sentinel-mapping (ErrNotFound / ErrOrgLastOwner) and demote-first
+// ordering. No-op on fromAccountID == toAccountID returns
+// ErrOrgLastOwner (a self-transfer would silently skip the swap and
+// the wire-shape contract is to refuse).
+func (m *MemStore) TransferOrgOwnership(_ context.Context, orgID, fromAccountID, toAccountID string) error {
+	if fromAccountID == toAccountID {
+		return ErrOrgLastOwner
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fromKey := orgAccountKey{OrgID: orgID, AccountID: fromAccountID}
+	fromMem, ok := m.memberships[fromKey]
+	if !ok {
+		return ErrNotFound
+	}
+	if fromMem.Role != OrgRoleOwner || fromMem.RemovedAt != nil {
+		return ErrOrgLastOwner
+	}
+	toKey := orgAccountKey{OrgID: orgID, AccountID: toAccountID}
+	toMem, ok := m.memberships[toKey]
+	if !ok {
+		return ErrNotFound
+	}
+	if toMem.RemovedAt != nil {
+		return ErrNotFound
+	}
+	if toMem.Role == OrgRoleOwner {
+		return ErrOrgLastOwner
+	}
+	// Demote-first mirrors PgStore's ordering. MemStore is single-
+	// critical-section so the partial unique race PgStore guards
+	// against can't occur here — but the ordering keeps the two
+	// implementations byte-identical at the concurrency seam.
+	fromMem.Role = OrgRoleAdmin
+	m.memberships[fromKey] = fromMem
+	toMem.Role = OrgRoleOwner
+	m.memberships[toKey] = toMem
 	return nil
 }
 

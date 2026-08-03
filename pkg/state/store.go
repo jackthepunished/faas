@@ -2262,6 +2262,12 @@ type Store interface {
 	// UpdateAccountPlan onto the personal org inside one transaction.
 	UpdateOrgPlan(ctx context.Context, id string, plan api.Plan) error
 
+	// UpdateOrgName updates the org's display name. Returns ErrNotFound
+	// when the id is unknown. The handler bounds the name length and
+	// trims whitespace before reaching the Store (the SQL CHECK rejects
+	// empty strings and names >256 bytes — 23514).
+	UpdateOrgName(ctx context.Context, id, name string) error
+
 	// UpdateOrgStatus mirrors UpdateAccountStatus for PR 7's dunning
 	// pivot. Valid statuses are active / past_due / suspended /
 	// deleted_pending (CHECK enforced at SQL).
@@ -2287,6 +2293,22 @@ type Store interface {
 	// UpdateOrgMemberRole updates the role. Returns ErrOrgLastOwner
 	// when demoting the only active owner to a non-owner role.
 	UpdateOrgMemberRole(ctx context.Context, orgID, accountID string, role OrgRole) error
+
+	// TransferOrgOwnership is the org-handler-only path to owner role.
+	// It atomically (a) demotes the current owner to admin and (b)
+	// promotes the to-account to owner inside one PostgreSQL
+	// transaction. The exactly-one-owner invariant is enforced by
+	// the partial unique org_memberships_one_owner_idx
+	// (migrations/00099); the tx fails with ErrOrgLastOwner if
+	// either row violates the invariant during the swap.
+	//
+	// Returns ErrNotFound if EITHER the from-account or to-account
+	// has no current active membership in the org (the from-account
+	// is the current owner — caller-side RBAC has already gated).
+	// Returns ErrOrgLastOwner if the from-account is not the active
+	// owner (already-transferred or never-owned; the partial unique
+	// is the tripwire).
+	TransferOrgOwnership(ctx context.Context, orgID, fromAccountID, toAccountID string) error
 
 	// ListOrgMembers returns every membership row (including
 	// removed_at != nil) ordered by joined_at. The handler layer

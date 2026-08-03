@@ -273,6 +273,28 @@ var methodRouteMap = map[string]string{
 	"GET /v1/apps/{slug}/registry-credentials":    "ListAppRegistryCredentials",
 	"PUT /v1/apps/{slug}/registry-credentials":    "SetAppRegistryCredential",
 	"DELETE /v1/apps/{slug}/registry-credentials": "DeleteAppRegistryCredential",
+
+	// Issue #190 / IAM-6 / ADR-061 PR 5 — /v1/orgs/{slug}/... customer
+	// surface. The auto-derivation would produce names with the
+	// `{slug}` / `{user_id}` / `{token}` placeholders preserved as
+	// title-cased path segments ("GetOrgsSlug", "DeleteOrgsSlug"),
+	// matching the failure log we hit on the first PR 5 push. The
+	// explicit map below drops the path-segment noise and conforms
+	// to the SDK's flat resource-verb naming — same convention as
+	// the crons / alerts / keys clusters above. Account-scoped
+	// list + create skip the X-Active-Org hint, path-scoped routes
+	// require it (apid loadOrg middleware stamps the membership).
+	"GET /v1/orgs":                             "ListOrgs",
+	"POST /v1/orgs":                            "CreateOrg",
+	"GET /v1/orgs/{slug}":                      "GetOrg",
+	"PATCH /v1/orgs/{slug}":                    "PatchOrg",
+	"DELETE /v1/orgs/{slug}":                   "DeleteOrg",
+	"GET /v1/orgs/{slug}/members":              "ListOrgMembers",
+	"POST /v1/orgs/{slug}/members":             "InviteOrgMember",
+	"PATCH /v1/orgs/{slug}/members/{user_id}":  "ChangeOrgMemberRole",
+	"DELETE /v1/orgs/{slug}/members/{user_id}": "RemoveOrgMember",
+	"POST /v1/orgs/{slug}/transfer_ownership":  "TransferOrgOwnership",
+	"GET /v1/invitations/{token}":              "PeekInvitation",
 }
 
 func main() {

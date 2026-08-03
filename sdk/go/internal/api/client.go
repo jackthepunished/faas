@@ -732,3 +732,104 @@ func (c *Client) ListDeployments(ctx context.Context, before string, limit int) 
 	}
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
+
+// Org surface (issue #190 / IAM-6 / ADR-061, PR 5). The 11 methods
+// below mirror the spec routes documented under api/openapi.yaml
+// paths /v1/orgs*, /v1/invitations/{token}. Each maps 1:1 to a
+// spec route so the sdk-coverage gate (cmd/sdk-coverage) doesn't
+// false-positive on drift. Bearer-auth only; account-scoped routes
+// (`ListOrgs`, `CreateOrg`) skip the X-Active-Org hint, path-scoped
+// routes require it (the apid loadOrg middleware resolves the slug
+// from the path and stamps the membership onto the principal).
+
+// ListOrgs returns the orgs the caller has an active membership in
+// (the personal org + every shared org the caller belongs to).
+// Account-scoped — no X-Active-Org hint needed.
+func (c *Client) ListOrgs(ctx context.Context) (OrgListResponse, error) {
+	var out OrgListResponse
+	return out, c.do(ctx, "GET", "/v1/orgs", nil, &out)
+}
+
+// CreateOrg creates a new shared (non-personal) org. The caller
+// becomes the first owner. Personal orgs are minted by the PR 3
+// backfill and cannot be re-created here.
+func (c *Client) CreateOrg(ctx context.Context, req CreateOrgRequest) (OrgResponse, error) {
+	var out OrgResponse
+	return out, c.do(ctx, "POST", "/v1/orgs", req, &out)
+}
+
+// GetOrg returns the active org by slug. Authz: any active member
+// (`org.view`); non-members see 403 `org_role_forbidden`. Unknown
+// slugs are 404 `org_not_found`.
+func (c *Client) GetOrg(ctx context.Context, slug string) (OrgResponse, error) {
+	var out OrgResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/"+slug, nil, &out)
+}
+
+// PatchOrg applies a partial update to the org (name and/or plan).
+// Authz routing:
+//   - Name → org.manage_billing (owner + billing)
+//   - Plan → org.change_plan     (owner only)
+//
+// Personal orgs are immutable (409 `org_personal_immutable`).
+func (c *Client) PatchOrg(ctx context.Context, slug string, req PatchOrgRequest) (OrgResponse, error) {
+	var out OrgResponse
+	return out, c.do(ctx, "PATCH", "/v1/orgs/"+slug, req, &out)
+}
+
+// DeleteOrg soft-deletes the org (sets status=deleted_pending).
+// Hard-delete + GDPR purge land in PR 8. Personal orgs are
+// immutable.
+func (c *Client) DeleteOrg(ctx context.Context, slug string) error {
+	return c.do(ctx, "DELETE", "/v1/orgs/"+slug, nil, nil)
+}
+
+// ListOrgMembers returns the active member list. Removed rows are
+// filtered at the API boundary; live-cap count drops on remove
+// even though the row stays for audit.
+func (c *Client) ListOrgMembers(ctx context.Context, slug string) (MemberListResponse, error) {
+	var out MemberListResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/"+slug+"/members", nil, &out)
+}
+
+// InviteOrgMember mints a 32-byte plaintext token (returned ONCE
+// in the response) and stores only the SHA-256 hash. Token expires
+// after 14 days. Role cannot be `owner`.
+func (c *Client) InviteOrgMember(ctx context.Context, slug string, req InviteMemberRequest) (InvitationWithTokenResponse, error) {
+	var out InvitationWithTokenResponse
+	return out, c.do(ctx, "POST", "/v1/orgs/"+slug+"/members", req, &out)
+}
+
+// ChangeOrgMemberRole changes a member's role. Owner-only
+// (`org.change_role`). Role cannot be `owner`; transfer-ownership is
+// the only path to owner.
+func (c *Client) ChangeOrgMemberRole(ctx context.Context, slug, accountID string, req ChangeMemberRoleRequest) (OrgMemberResponse, error) {
+	var out OrgMemberResponse
+	return out, c.do(ctx, "PATCH", "/v1/orgs/"+slug+"/members/"+accountID, req, &out)
+}
+
+// RemoveOrgMember removes a member. Owner-only
+// (`org.remove_members`). Stamps `removed_at` on the row (the row
+// stays for audit; live-cap count drops). Self-removal is rejected
+// at the boundary.
+func (c *Client) RemoveOrgMember(ctx context.Context, slug, accountID string) error {
+	return c.do(ctx, "DELETE", "/v1/orgs/"+slug+"/members/"+accountID, nil, nil)
+}
+
+// TransferOrgOwnership atomically promotes new_owner_account_id to
+// owner and demotes the caller to admin. The new owner must already
+// be an active member of the org.
+func (c *Client) TransferOrgOwnership(ctx context.Context, slug string, req TransferOwnershipRequest) (OrgResponse, error) {
+	var out OrgResponse
+	return out, c.do(ctx, "POST", "/v1/orgs/"+slug+"/transfer_ownership", req, &out)
+}
+
+// PeekInvitation is a read-only lookup that returns the invitation
+// metadata (email, role, org slug, expires_at) without consuming
+// the token. Used by the dashboard to render "you've been invited
+// to Acme Inc. as developer" before the invitee accepts. The accept
+// flow lands in PR 8.
+func (c *Client) PeekInvitation(ctx context.Context, token string) (OrgInvitationResponse, error) {
+	var out OrgInvitationResponse
+	return out, c.do(ctx, "GET", "/v1/invitations/"+token, nil, &out)
+}

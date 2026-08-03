@@ -746,3 +746,104 @@ type AppMetricsResponse struct {
 	ColdStartPct float64 `json:"cold_start_pct"`
 	WakeP95MS    float64 `json:"wake_p95_ms"`
 }
+
+// Org surface (issue #190 / IAM-6 / ADR-061, PR 5). The wire
+// shapes mirror pkg/api/orgs.go (the canonical source) byte-for-byte
+// so the public SDK surface stays consistent with pkg/api.Client —
+// the sdk-coverage gate (cmd/sdk-coverage) reads pkg/api/*.go and
+// fails on any spec-route/method drift, which is the contract
+// we're upholding here. The redeclaration (rather than type-aliasing)
+// is forced by the separate-module layout: sdk/go is its own Go
+// module (module github.com/poyrazK/faas-go) and cannot import
+// pkg/api (which lives in module github.com/onebox-faas/faas).
+
+// CreateOrgRequest is the body of POST /v1/orgs.
+type CreateOrgRequest struct {
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+}
+
+// PatchOrgRequest is the body of PATCH /v1/orgs/{slug}. Both fields
+// are pointer-typed so the wire form distinguishes "not set" from
+// "clear".
+type PatchOrgRequest struct {
+	Name *string `json:"name,omitempty"`
+	Plan *string `json:"plan,omitempty"`
+}
+
+// InviteMemberRequest is the body of POST /v1/orgs/{slug}/members.
+// Role cannot be `owner`; transfer-ownership is the only path.
+type InviteMemberRequest struct {
+	Email string `json:"email"`
+	Role  string `json:"role"`
+}
+
+// ChangeMemberRoleRequest is the body of PATCH
+// /v1/orgs/{slug}/members/{user_id}. Role cannot be `owner`.
+type ChangeMemberRoleRequest struct {
+	Role string `json:"role"`
+}
+
+// TransferOwnershipRequest is the body of POST
+// /v1/orgs/{slug}/transfer_ownership.
+type TransferOwnershipRequest struct {
+	NewOwnerAccountID string `json:"new_owner_account_id"`
+}
+
+// OrgResponse is the canonical org wire shape.
+type OrgResponse struct {
+	ID        string `json:"id"`
+	Slug      string `json:"slug"`
+	Name      string `json:"name"`
+	Personal  bool   `json:"personal"`
+	Plan      string `json:"plan"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// OrgListResponse is the body of GET /v1/orgs. Sorted by slug.
+type OrgListResponse struct {
+	Orgs []OrgResponse `json:"orgs"`
+}
+
+// OrgMemberResponse is the wire shape for a single org membership row.
+type OrgMemberResponse struct {
+	AccountID string `json:"account_id"`
+	Email     string `json:"email"`
+	Role      string `json:"role"`
+	JoinedAt  string `json:"joined_at"`
+}
+
+// MemberListResponse is the body of GET /v1/orgs/{slug}/members.
+type MemberListResponse struct {
+	Members []OrgMemberResponse `json:"members"`
+}
+
+// OrgInvitationResponse is the wire shape for a single invitation row.
+// Plaintext token is NEVER re-served — returned ONCE on the create
+// call via InvitationWithTokenResponse.
+type OrgInvitationResponse struct {
+	ID        string `json:"id"`
+	OrgID     string `json:"org_id"`
+	OrgSlug   string `json:"org_slug"`
+	Email     string `json:"email"`
+	Role      string `json:"role"`
+	Status    string `json:"status"`
+	ExpiresAt string `json:"expires_at"`
+	CreatedAt string `json:"created_at"`
+}
+
+// InvitationWithTokenResponse is the body of POST
+// /v1/orgs/{slug}/members — the canonical invitation shape plus the
+// one-time plaintext token.
+type InvitationWithTokenResponse struct {
+	OrgInvitationResponse
+	Token string `json:"token"`
+}
+
+// InvitationListResponse is the body of GET
+// /v1/orgs/{slug}/invitations. Sorted by created_at DESC.
+type InvitationListResponse struct {
+	Invitations []OrgInvitationResponse `json:"invitations"`
+}
