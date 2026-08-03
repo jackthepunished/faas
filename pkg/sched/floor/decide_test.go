@@ -129,48 +129,63 @@ func TestDecide_Total(t *testing.T) {
 	}
 }
 
-// TestEffectiveCooldown pins the residual cooldown arithmetic.
-func TestEffectiveCooldown(t *testing.T) {
+// TestDecide_Cooldown pins the residual cooldown arithmetic — the
+// branch at decide() around the LastScaleOutAt / ScaleOutCooldownS
+// guard. Asserts the OutcomeCooldownHeld branch fires when
+// LastScaleOutAt is within ScaleOutCooldownS, and OutcomeAdmit
+// fires when it has elapsed (or when the cooldown wasn't opted in
+// / never stamped).
+func TestDecide_Cooldown(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
 		name      string
 		last      time.Time
 		cooldownS int
-		wantZero  bool
+		want      Outcome
 	}{
 		{
-			name:      "never stamped → zero",
+			name:      "never stamped → admit (cooldown bypassed)",
 			last:      time.Time{},
 			cooldownS: 60,
-			wantZero:  true,
+			want:      OutcomeAdmit,
 		},
 		{
-			name:      "cooldown disabled → zero",
+			name:      "cooldown disabled (0s) → admit",
 			last:      now,
 			cooldownS: 0,
-			wantZero:  true,
+			want:      OutcomeAdmit,
 		},
 		{
-			name:      "elapsed → zero",
+			name:      "elapsed → admit",
 			last:      now.Add(-120 * time.Second),
 			cooldownS: 60,
-			wantZero:  true,
+			want:      OutcomeAdmit,
 		},
 		{
-			name:      "in window → positive residual",
+			name:      "in window → cooldown_held",
 			last:      now.Add(-30 * time.Second),
 			cooldownS: 60,
-			wantZero:  false,
+			want:      OutcomeCooldownHeld,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := effectiveCooldown(c.last, c.cooldownS, now)
-			if c.wantZero && got != 0 {
-				t.Errorf("effectiveCooldown = %v, want 0", got)
+			s := AppStats{
+				AppID:             "app-1",
+				AccountID:         "acct-1",
+				Plan:              api.PlanHobby,
+				Floor:             2,
+				Concurrency:       0,
+				MaxConcurrency:    2,
+				RAMMB:             256,
+				WorkloadClass:     state.WorkloadClassHTTP,
+				LastScaleOutAt:    c.last,
+				ScaleOutCooldownS: c.cooldownS,
+				Now:               now,
 			}
-			if !c.wantZero && got <= 0 {
-				t.Errorf("effectiveCooldown = %v, want > 0", got)
+			got := decide(s)
+			if got.Outcome != c.want {
+				t.Errorf("decide(%+v) outcome = %s, want %s", s, got.Outcome, c.want)
 			}
 		})
 	}

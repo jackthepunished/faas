@@ -1000,6 +1000,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// customer's SLA is "min N resident at all times". Uses the
 		// same engine + ledger as the other triggers so the engine's
 		// wake-gate remains the single admission authority.
+		//
+		// FAAS_FLOOR_INTERVAL_SECONDS overrides the trigger cadence
+		// (operator can dampen during incidents without restarting).
+		// Default falls back to cfg.ScaleUpInterval so a single
+		// shared dial governs all three triggers when no env is set;
+		// api.FloorDecisionIntervalSeconds (1s) is the trigger's own
+		// last-resort default. A non-positive / unparseable env
+		// returns a typed error so a typo surfaces at boot rather
+		// than silently damping the floor reconciler off.
+		floorInterval := cfg.ScaleUpInterval
+		if v := os.Getenv("FAAS_FLOOR_INTERVAL_SECONDS"); v != "" {
+			n, parseErr := strconv.Atoi(v)
+			if parseErr != nil || n <= 0 {
+				return fmt.Errorf("FAAS_FLOOR_INTERVAL_SECONDS: %s", v)
+			}
+			floorInterval = time.Duration(n) * time.Second
+		}
 		floorTrigger := floor.New(
 			store,
 			schedFloorLedger{ledger: engine.Ledger()},
@@ -1007,7 +1024,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			floor.Options{
 				Logger:       log,
 				Metrics:      ops,
-				Interval:     cfg.ScaleUpInterval,
+				Interval:     floorInterval,
 				Auditor:      schedulerAuditor,
 				PlanResolver: schedFloorPlanResolver{store: store},
 			},
@@ -1015,7 +1032,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		floorTrigger.WithOwnerNodeID(ownerNodeID)
 		loop.WithFloor(floorTrigger)
 		log.Info("min-instances floor reconciler enabled",
-			"interval", cfg.ScaleUpInterval,
+			"interval", floorInterval,
 			"owner_node_id", ownerNodeID)
 		// Issue #171: wire the recent-load mirror off the same
 		// scraper so the reaper sees per-app RPS without duplicating

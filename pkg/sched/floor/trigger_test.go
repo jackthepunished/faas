@@ -233,10 +233,14 @@ func TestTick_WorkerClassDisabled(t *testing.T) {
 	}
 }
 
-// TestTick_RamCeilingPreCheck verifies the §6.2-2 ceiling defense:
-// an app whose billable RAM exceeds current headroom must yield
-// without calling AdmitInstance.
-func TestTick_RamCeilingPreCheck(t *testing.T) {
+// TestTick_BillableExceedsHeadroom verifies the §6.2-2 ceiling
+// defense: an app whose billable RAM (RAMMB + 8 MB overhead) alone
+// exceeds current headroom must yield without calling
+// AdmitInstance. The pre-check is the BillableRAMMB > headroom
+// guard at trigger.go (v1 "yield to headroom" per ADR-071
+// §Decision 3); a future FAAS_FLOOR_RESERVED_MB env knob may widen
+// this to a stricter absolute-ceiling check.
+func TestTick_BillableExceedsHeadroom(t *testing.T) {
 	app := floorApp("app1", api.PlanPro, 1)
 	app.RAMMB = 1024 // Pro ceiling includes 8 MB overhead → 1032 MB.
 	store := &fakeStore{apps: []state.App{app}}

@@ -193,22 +193,6 @@ func decide(s AppStats) Decision {
 	return Decision{Outcome: OutcomeAdmit, AdmitNow: true}
 }
 
-// EffectiveCooldown computes the residual scale-out cooldown in
-// seconds (mirrors pkg/sched/engine.go cooldownSRemaining). Used by
-// Tick to surface the cooldown decision. Returns 0 when no
-// cooldown applies.
-func effectiveCooldown(lastScaleOut time.Time, scaleOutCooldownS int, now time.Time) time.Duration {
-	if lastScaleOut.IsZero() || scaleOutCooldownS <= 0 {
-		return 0
-	}
-	cooldown := time.Duration(scaleOutCooldownS) * time.Second
-	residual := cooldown - now.Sub(lastScaleOut)
-	if residual < 0 {
-		return 0
-	}
-	return residual
-}
-
 // backoffEntry is the per-app state the trigger tracks. Mutations
 // are guarded by Trigger.mu (the package-level sync.Mutex).
 type backoffEntry struct {
@@ -423,17 +407,17 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.ledger != nil {
 			conc = t.ledger.Concurrency(app.ID)
 		}
-		// Projected RAM admission: billable RAM (RAMMB + 8 MB overhead)
-		// fits inside current headroom. Pre-check protects against the
-		// FAILED-row hazard on a saturated box.
-		projected := 0
+		// §6.2-2 RAM ceiling pre-check: yield to live wakes when the
+		// app's billable RAM alone (RAMMB + 8 MB overhead) would
+		// exceed the remaining headroom. The engine's NodeLedger.Admit
+		// is unchanged and remains the absolute backstop; this
+		// pre-check is the policy layer above (ADR-071 §Decision 3,
+		// v1 = "yield to headroom"; a future FAAS_FLOOR_RESERVED_MB
+		// knob may widen this guard). Bounds the FAILED-row hazard on
+		// a RAM-saturated box.
 		isRamCeiling := false
-		if t.ledger != nil {
-			projected = residentRAM + api.BillableRAMMB(app.RAMMB)
-			_ = projected
-			if api.BillableRAMMB(app.RAMMB) > headroom {
-				isRamCeiling = true
-			}
+		if t.ledger != nil && api.BillableRAMMB(app.RAMMB) > headroom {
+			isRamCeiling = true
 		}
 		var lastScaleOut time.Time
 		if app.LastScaleOutAt != nil {
