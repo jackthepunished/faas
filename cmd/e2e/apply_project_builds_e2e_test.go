@@ -503,7 +503,7 @@ func TestApplyProject_Builds_BuildIDIsUUIDv7(t *testing.T) {
 		}
 		// Every char must be hex.
 		for _, c := range b.BuildID {
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			if c < '0' || c > '9' && c < 'a' || c > 'f' {
 				t.Fatalf("build id %q contains non-hex char %q", b.BuildID, c)
 			}
 		}
