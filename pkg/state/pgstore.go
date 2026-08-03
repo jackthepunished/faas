@@ -3172,6 +3172,86 @@ func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string,
 	return nil
 }
 
+// SetDeploymentSidecarLayer is the per-workload filesystem handle
+// for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
+// keyed by (deployment_id, sidecar_name). The whole row is
+// overwritten on conflict — bytes + content_digest + storage_key
+// — so a re-imaged rebuild's new key replaces the prior build's
+// key without orphaned-key drift (the cleanupAppFiles path in
+// pkg/imaged/handler.go deletes the OLD key before this returns,
+// keeping storage in sync). updated_at is refreshed on every
+// conflict; created_at is stamped once on the initial INSERT.
+//
+// Returns ErrNotFound when the deployment row doesn't exist —
+// the FK CASCADE in migration 00119 makes this case unreachable
+// in practice, but we surface it explicitly so a misuse at the
+// caller (e.g. imaged on a removed deployment) fails closed.
+func (s *PgStore) SetDeploymentSidecarLayer(ctx context.Context, l DeploymentSidecarLayer) (DeploymentSidecarLayer, error) {
+	// Defence-in-depth: confirm the FK target row exists so the
+	// caller gets a clean ErrNotFound before Postgres raises 23503
+	// on the INSERT. The FK CASCADE handles delete-orphaning; this
+	// check is for read-then-write paths in imaged.
+	var exists string
+	if err := s.pool.QueryRow(ctx,
+		`select id from deployments where id = $1`, l.DeploymentID,
+	).Scan(&exists); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return DeploymentSidecarLayer{}, ErrNotFound
+		}
+		return DeploymentSidecarLayer{}, fmt.Errorf("state: sidecar layer parent check: %w", err)
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into deployment_sidecar_layers
+		    (deployment_id, sidecar_name, storage_key, bytes, content_digest)
+		values ($1, $2, $3, $4, $5)
+		on conflict (deployment_id, sidecar_name) do update
+		set storage_key    = excluded.storage_key,
+		    bytes          = excluded.bytes,
+		    content_digest = excluded.content_digest,
+		    updated_at     = now()
+		returning deployment_id, sidecar_name, storage_key, bytes, content_digest, created_at, updated_at
+	`, l.DeploymentID, l.SidecarName, l.StorageKey, l.Bytes, l.ContentDigest)
+	var got DeploymentSidecarLayer
+	if err := row.Scan(&got.DeploymentID, &got.SidecarName, &got.StorageKey,
+		&got.Bytes, &got.ContentDigest, &got.CreatedAt, &got.UpdatedAt); err != nil {
+		return DeploymentSidecarLayer{}, fmt.Errorf("state: sidecar layer upsert: %w", err)
+	}
+	return got, nil
+}
+
+// ListDeploymentSidecarLayers returns the deployment's full sidecar
+// set ordered by sidecar_name ASC (issue #463 / ADR-069 / PR-B).
+// Returns an empty slice when no sidecars exist; ErrNotFound only
+// when the deployment itself is missing. vmmd's Wake path
+// consumes this eagerly — Order-by-name keeps the workload slice
+// deterministic across restarts so snapshots hash to the same
+// drive set every time.
+func (s *PgStore) ListDeploymentSidecarLayers(ctx context.Context, deploymentID string) ([]DeploymentSidecarLayer, error) {
+	rows, err := s.pool.Query(ctx, `
+		select deployment_id, sidecar_name, storage_key, bytes, content_digest, created_at, updated_at
+		from deployment_sidecar_layers
+		where deployment_id = $1
+		order by sidecar_name asc
+	`, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list sidecar layers: %w", err)
+	}
+	defer rows.Close()
+	out := []DeploymentSidecarLayer{}
+	for rows.Next() {
+		var l DeploymentSidecarLayer
+		if err := rows.Scan(&l.DeploymentID, &l.SidecarName, &l.StorageKey,
+			&l.Bytes, &l.ContentDigest, &l.CreatedAt, &l.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("state: scan sidecar layer: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate sidecar layers: %w", err)
+	}
+	return out, nil
+}
+
 // SetDeploymentSourceURL stamps the upstream URL + commit SHA on a
 // deployment (Tier 3 / issue #197 B3.10 schema half, migrations/00047).
 // Populated by githubd's CreateDeployment callback once the deployment
