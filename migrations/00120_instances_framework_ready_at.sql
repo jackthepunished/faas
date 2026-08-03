@@ -1,4 +1,4 @@
--- filename: 00112_instances_framework_ready_at.sql
+-- filename: 00120_instances_framework_ready_at.sql
 -- +goose Up
 -- Issue #470 / PR #470-FU-B — two-tier snapshot (warm.snap) requires a
 -- per-instance "framework ready" timestamp stamped by the hostside vmmd

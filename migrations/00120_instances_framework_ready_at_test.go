@@ -1,13 +1,13 @@
 //go:build !no_pg
 
-// Migration-apply test for 00112_instances_framework_ready_at.sql
+// Migration-apply test for 00120_instances_framework_ready_at.sql
 // (issue #470, PR #470-FU-B). Pins the framework_ready_at column on
 // the instances table that PR #470-FU-A's engine waits on, and
 // PR #470-FU-B's vmmd gRPC `FrameworkReady` RPC writes to.
 //
 // Pins:
 //
-//  1. The migration set applies cleanly through 00112 (covered by
+//  1. The migration set applies cleanly through 00120 (covered by
 //     00109_apps_warm_snapshot_test.go and 00110_snapshots_tier_test.go
 //     too; we run again here to make a missing migration file
 //     between any of them obvious).
@@ -23,10 +23,16 @@
 //     uses ADD COLUMN IF NOT EXISTS (idempotent at the column
 //     level).
 //
-// Slot note: 00112 was picked at PR-creation time per ADR-041;
-// slot 111 was already owned by open PR #540
-// (00111_webhook_deliveries.sql). The seed UUIDs in this file
-// carry 112 (account), 212 (app), 312 (deployment), 412 (instance).
+// Slot note: 00120 was picked on the final rebase onto main
+// (1768ed4b) past main's 00118_deployments_sidecars.sql.
+// Originally the migration was 00112 (PR-creation slot per
+// ADR-041) but sibling PRs (#540 webhook_deliveries, #531
+// sidecars) raced the gate to higher numbers, so the renumber
+// chain 112 → 116 → 117 → 118 → 119 → 120 collapsed into a
+// single jump on this rebase. Slot 119 is a partner fence at
+// migrations/00119_reserve_slot.sql that bridges 118 → 120.
+// The seed UUIDs in this file carry 120 (account), 220 (app),
+// 320 (deployment), 420 (instance).
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -41,22 +47,22 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
+func TestMigrations_00120_InstancesFrameworkReadyAt(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00112.
+	// (1) Apply through 00120.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 112)", err)
 	}
 
 	// Seed an account, app, deployment, and one instance. Seed UUIDs
-	// carry the slot number in the last group (`...000112` etc.) so
+	// carry the slot number in the last group (`...000120` etc.) so
 	// a reader can pin each row to this migration without grepping
 	// the file name.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000112',
+		values ('00000000-0000-0000-0000-000000000120',
 		        'framework-ready-test@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -64,8 +70,8 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000212',
-		        '00000000-0000-0000-0000-000000000112',
+		values ('00000000-0000-0000-0000-000000000220',
+		        '00000000-0000-0000-0000-000000000120',
 		        'framework-ready-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -73,8 +79,8 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, created_at)
-		values ('00000000-0000-0000-0000-000000000312',
-		        '00000000-0000-0000-0000-000000000212',
+		values ('00000000-0000-0000-0000-000000000320',
+		        '00000000-0000-0000-0000-000000000220',
 		        'sha256:deadbeef', 'live', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -91,9 +97,9 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into instances (id, app_id, deployment_id, node_id, state, ram_mb, started_at)
-		values ('00000000-0000-0000-0000-000000000412',
-		        '00000000-0000-0000-0000-000000000212',
-		        '00000000-0000-0000-0000-000000000312',
+		values ('00000000-0000-0000-0000-000000000420',
+		        '00000000-0000-0000-0000-000000000220',
+		        '00000000-0000-0000-0000-000000000320',
 		        $1, 'running', 256, now())
 		on conflict (id) do nothing
 	`, nodeID); err != nil {
@@ -104,7 +110,7 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	var frameworkReadyAt *time.Time
 	if err := pool.QueryRow(ctx, `
 		select framework_ready_at from instances
-		 where id = '00000000-0000-0000-0000-000000000412'
+		 where id = '00000000-0000-0000-0000-000000000420'
 	`).Scan(&frameworkReadyAt); err != nil {
 		t.Fatalf("read framework_ready_at on freshly-seeded row: %v", err)
 	}
@@ -121,14 +127,14 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	stamp := time.Now().UTC().Truncate(time.Microsecond)
 	if _, err := pool.Exec(ctx, `
 		update instances set framework_ready_at = $1
-		 where id = '00000000-0000-0000-0000-000000000412'
+		 where id = '00000000-0000-0000-0000-000000000420'
 	`, stamp); err != nil {
 		t.Fatalf("update framework_ready_at: %v", err)
 	}
 	var roundTrip *time.Time
 	if err := pool.QueryRow(ctx, `
 		select framework_ready_at from instances
-		 where id = '00000000-0000-0000-0000-000000000412'
+		 where id = '00000000-0000-0000-0000-000000000420'
 	`).Scan(&roundTrip); err != nil {
 		t.Fatalf("read round-trip framework_ready_at: %v", err)
 	}
@@ -143,13 +149,13 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	// might re-clear the column on a fresh warm-capture cycle).
 	if _, err := pool.Exec(ctx, `
 		update instances set framework_ready_at = NULL
-		 where id = '00000000-0000-0000-0000-000000000412'
+		 where id = '00000000-0000-0000-0000-000000000420'
 	`); err != nil {
 		t.Fatalf("reset framework_ready_at to NULL: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
 		select framework_ready_at from instances
-		 where id = '00000000-0000-0000-0000-000000000412'
+		 where id = '00000000-0000-0000-0000-000000000420'
 	`).Scan(&frameworkReadyAt); err != nil {
 		t.Fatalf("read post-reset framework_ready_at: %v", err)
 	}
