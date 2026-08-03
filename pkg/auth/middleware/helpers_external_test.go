@@ -14,8 +14,13 @@ import (
 // RequireScope sees the same shape RequireSession produces.
 // Uses the exported middleware.WithPrincipal helper (added for this
 // test surface) so the unexported ctx-key typing stays in pkg/middleware.
-func authWithPrincipal(ctx context.Context, acct state.Account, key *state.APIKey) context.Context {
-	return middleware.WithPrincipal(ctx, acct, key)
+//
+// The membership parameter is the active-org Membership stamped by
+// pkg/authz.LoadOrgWithResolver (issue #190 / IAM-6 / ADR-061).
+// Pre-PR-4 tests pass nil; PR-4+ tests that exercise LoadOrg
+// compose a *state.OrgMembership via pkg/state.
+func authWithPrincipal(ctx context.Context, acct state.Account, key *state.APIKey, mem *state.OrgMembership) context.Context {
+	return middleware.WithPrincipal(ctx, acct, key, mem)
 }
 
 // Compile-time check that state.APIKey is the same type both

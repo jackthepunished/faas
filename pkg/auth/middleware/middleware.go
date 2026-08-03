@@ -409,7 +409,7 @@ func (d *keyTouchDebounce) shouldTouch(keyID string, now time.Time, window time.
 // --- RequireSession ------------------------------------------------------
 
 // RequireSession authenticates the request via bearer-key or
-// session-cookie. On success stamps principal{Acct, Key} into
+// session-cookie. On success stamps principal{Acct, Key, Membership=nil} into
 // r.Context() via withPrincipal and calls next. On failure writes
 // a 401 problem (or 402 for inactive accounts).
 //
@@ -463,7 +463,7 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 						return
 					}
 				}
-				*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key}))
+				*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: &key, Membership: nil}))
 				// TouchKeyLastUsed is observability, not auth —
 				// detached context + bounded timeout so a slow PG
 				// cannot block the user's request, and a canceled
@@ -528,7 +528,7 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 							}
 						}
 						//nolint:contextcheck // same pointer-mutation contract: withPrincipal derives from r.Context() so the principal stamps into the OUTER r, not a captured local ctx.
-						*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil}))
+						*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil, Membership: nil}))
 						//nolint:contextcheck // same pointer-mutation contract: withMFAPending derives from r.Context() so the flag stamps into the OUTER r.
 						*r = *r.WithContext(withMFAPending(r.Context(), session.IsMFAPending(env)))
 						next(w, r, acct)

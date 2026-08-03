@@ -78,6 +78,7 @@ var routeExclude = map[string]bool{
 	"GET /status":                             true, // public HTML status page
 	"GET /status/slo.json":                    true, // public status JSON
 	"GET /healthz":                            true, // loopback infra probe
+	"GET /v1/orgs/me":                         true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the

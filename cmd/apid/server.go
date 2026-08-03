@@ -14,6 +14,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/apid"
 	"github.com/onebox-faas/faas/pkg/auth"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
+	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -182,6 +183,18 @@ type server struct {
 	//
 	// ADR-044.
 	authMw *authmw.Middleware
+	// orgResolver is the pkg/authz.OrgResolver the LoadOrg
+	// middleware reads to resolve (slug, membership) for the
+	// X-Active-Org / ?org= hint. Wraps the same pkg/state.Store
+	// s.store already holds — see (*server).loadOrg. nil is
+	// tolerated for unit tests that don't exercise LoadOrg
+	// (cmd/apid/auth_facade.go's s.loadOrg is a no-op when
+	// orgResolver is nil; the route table only mounts the
+	// middleware when this is non-nil, so a nil pointer never
+	// reaches the middleware at runtime).
+	//
+	// Issue #190 / IAM-6 / ADR-061, PR 4.
+	orgResolver *authz.StoreBackedResolver
 	// oauthConfig is the boot-resolved sign-in OAuth provider state
 	// (issue #419 / ADR-046). Computed once in cmd/apid/main.go
 	// via auth.LoadSignInConfigFromEnv, passed into newServerWithDeps,
@@ -514,6 +527,19 @@ func newServerWithDeps(
 			log,
 			apiAuthLimiter,
 		),
+		// Issue #190 / IAM-6 / ADR-061, PR 4: org resolver backs
+		// s.loadOrg (cmd/apid/auth_facade.go). Wraps the same
+		// pkg/state.Store the rest of the daemon uses; PR 7 may
+		// add a small LRU cache here when admission pressure
+		// makes the per-request SELECT hot.
+		//
+		// nil when store is nil — a handful of legacy tests
+		// (TestStatusJSONHandlerNoPrometheusURL and friends)
+		// construct a server with no store to exercise degraded
+		// paths. s.loadOrg treats a nil resolver as pass-through
+		// (cmd/apid/auth_facade.go::loadOrg), so LoadOrg is
+		// inert for those tests — no DB call attempted.
+		orgResolver: maybeStoreBackedResolver(store),
 		// oauthConfig (issue #419 / ADR-046) is left at the
 		// zero value here (both providers Disabled); production
 		// wires the env-resolved config via (*server).WithOAuthConfig
@@ -575,6 +601,14 @@ func (s *server) handler() http.Handler {
 	// whole account, so it requires the admin scope; the read-only
 	// /v1/account carries the method default (read or admin).
 	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.whoami))))
+	// IAM-6 (issue #190 / ADR-061, PR 4): active-org whoami. The
+	// route is undocumented in api/openapi.yaml for PR 4 — PR 5
+	// adds the spec coverage + the rest of the /v1/orgs/{slug}/...
+	// surface. Loads the org via s.loadOrg (the pkg/authz middleware
+	// that resolves X-Active-Org / ?org=) and returns the membership
+	// role. No header → {"org": null} (passthrough, pre-PR-5 routes
+	// stay account-scoped).
+	mux.HandleFunc("GET /v1/orgs/me", s.auth(s.loadOrg(s.whoamiActiveOrg)))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan)))))
 	// IAM-5 (issue #189): per-account rotation grace-window
 	// override. Admin-only because the rotation primitive is
