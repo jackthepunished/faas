@@ -321,15 +321,43 @@ func TestE2E_OrgLifecycle_HappyPath(t *testing.T) {
 	// 11. New owner (bob) removes the demoted admin (alice).
 	// This step proves the role matrix wires correctly: bob is
 	// now owner, so OrgAction remove_members is allowed.
+	// RemoveOrgMember is a soft delete (stamps removed_at); the
+	// membership row stays for audit — alice must NOT appear in
+	// the active members list, and her row's removed_at must be
+	// non-nil. The listOrgMembers handler filters at the API
+	// boundary (cmd/apid/handlers_org_members.go:75-78).
 	raw, status = doReq(t, h, bobKey,
 		http.MethodDelete, "/v1/orgs/acme/members/"+aliceAcct.ID, nil,
 		map[string]string{"X-Active-Org": "acme"})
 	if status != http.StatusNoContent {
 		t.Fatalf("remove member: %d %s", status, raw)
 	}
-	_, err = store.OrgMemberByAccount(ctx, acmeID, aliceAcct.ID)
-	if err == nil {
-		t.Errorf("alice still has a membership row after remove")
+	row, err = store.OrgMemberByAccount(ctx, acmeID, aliceAcct.ID)
+	if err != nil {
+		t.Fatalf("OrgMemberByAccount alice (post-remove): %v", err)
+	}
+	if row.RemovedAt == nil {
+		t.Errorf("alice membership not soft-deleted; removed_at = nil")
+	}
+	// alice must not appear in the active members list — the
+	// handler filters at the boundary.
+	raw, status = doReq(t, h, bobKey, http.MethodGet, "/v1/orgs/acme/members", nil,
+		map[string]string{"X-Active-Org": "acme"})
+	if status != http.StatusOK {
+		t.Fatalf("list members (post-remove): %d %s", status, raw)
+	}
+	var memberList struct {
+		Members []struct {
+			AccountID string `json:"account_id"`
+		} `json:"members"`
+	}
+	if err := json.Unmarshal(raw, &memberList); err != nil {
+		t.Fatalf("decode members: %v", err)
+	}
+	for _, m := range memberList.Members {
+		if m.AccountID == aliceAcct.ID {
+			t.Errorf("alice still in active members list after remove: %s", raw)
+		}
 	}
 
 	// 12. Soft-delete the org as the new owner (POST 7 in the
@@ -459,8 +487,13 @@ func TestE2E_OrgLifecycle_PeekTerminalStates(t *testing.T) {
 	mint := func(t *testing.T, suffix string) (token string, inv state.OrgInvitation) {
 		t.Helper()
 		plaintext := make([]byte, 32)
-		for i := range plaintext {
-			plaintext[i] = byte(i + len(suffix)*7) // deterministic per-case
+		// Per-case offsets: "consumed"/"revoked"/"expired" share a
+		// length-of-suffix pattern that would collide on token_hash
+		// (the UNIQUE constraint), so encode the suffix byte itself
+		// into the first byte as a distinguisher.
+		plaintext[0] = suffix[0]
+		for i := 1; i < len(plaintext); i++ {
+			plaintext[i] = byte(i)
 		}
 		hash := sha256.Sum256(plaintext)
 		token = base64.RawURLEncoding.EncodeToString(plaintext)
@@ -617,14 +650,19 @@ func TestE2E_OrgLifecycle_LastOwnerGuard(t *testing.T) {
 	}
 
 	// DELETE alice's own membership (the only owner). Must 409.
+	// The handler rejects self-removal at the boundary with a
+	// 409 validation_failed + "Cannot remove self" (defence in
+	// depth — the Store would also block via ErrOrgLastOwner, but
+	// the boundary check gives the dashboard a stable wire shape
+	// that doesn't change between "admin" and "owner" callers).
 	raw, status = doReq(t, h, aliceKey, http.MethodDelete,
 		"/v1/orgs/solo/members/"+aliceAcct.ID, nil,
 		map[string]string{"X-Active-Org": "solo"})
 	if status != http.StatusConflict {
 		t.Errorf("remove last owner: status = %d, want 409 (body=%s)", status, raw)
 	}
-	if !strings.Contains(string(raw), "org_last_owner") {
-		t.Errorf("body did not contain org_last_owner: %s", raw)
+	if !strings.Contains(string(raw), "Cannot remove self") {
+		t.Errorf("body did not contain 'Cannot remove self': %s", raw)
 	}
 
 	// PATCH owner → admin (which would orphan the role) must be
@@ -632,7 +670,7 @@ func TestE2E_OrgLifecycle_LastOwnerGuard(t *testing.T) {
 	// store would block it via the partial unique, but the
 	// handler returns a stable 403 with org_role_forbidden
 	// because PATCH /members can never reach owner).
-	raw, status = doReq(t, h, aliceKey, http.MethodPatch,
+	_, status = doReq(t, h, aliceKey, http.MethodPatch,
 		"/v1/orgs/solo/members/"+aliceAcct.ID,
 		api.ChangeMemberRoleRequest{Role: "admin"},
 		map[string]string{"X-Active-Org": "solo"})

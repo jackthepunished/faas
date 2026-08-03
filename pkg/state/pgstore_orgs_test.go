@@ -624,10 +624,10 @@ func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
 	pool := s.pool
 	ctx := context.Background()
 
-	ownerID := "00000000-0000-0000-0000-0000000000t1"
-	memberID := "00000000-0000-0000-0000-0000000000t2"
-	strangerID := "00000000-0000-0000-0000-0000000000t3"
-	removedID := "00000000-0000-0000-0000-0000000000t4"
+	ownerID := "00000000-0000-0000-0000-0000000000a1"
+	memberID := "00000000-0000-0000-0000-0000000000a2"
+	strangerID := "00000000-0000-0000-0000-0000000000a3"
+	removedID := "00000000-0000-0000-0000-0000000000a4"
 	pgStoreSeedAccounts(t, ctx, pool, ownerID, memberID, strangerID, removedID)
 
 	o, err := s.CreateOrg(ctx, newTestOrg("transfer-pg"))

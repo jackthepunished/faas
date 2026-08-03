@@ -202,11 +202,6 @@ func TestDeriveOrgInvitationStatus_PinsStateMachine(t *testing.T) {
 	}
 }
 
-// timeLike aliases time.Time so we can declare *timeLike in the
-// table-driven test above (Go doesn't allow taking the address of a
-// function-call result).
-type timeLike = time.Time
-
 // mustTime is the test helper for time.Parse; panics on a bad
 // constant. The literals are static so any regression is a typo
 // rather than a flaky clock.
