@@ -184,6 +184,15 @@ func joinReasons(reasons []string) string {
 // The helper runs at the staleness check cadence (1s by default)
 // regardless of Touch rate, so a /readyz scrape sees the flip
 // within ~1s of staleness.
+//
+// Concurrency note: touch() BOTH writes the timestamp AND flips
+// the signal ready. The helper goroutine only writes false (on
+// staleness). Without the optimistic ready-set on touch, a
+// /readyz scrape that lands AFTER the previous tick flipped
+// stale but BEFORE the next tick would observe the stale bit —
+// even though the touch was fresh. The goroutine catches
+// staleness; the touch path is the hot recovery path readers
+// (LB probes, ops dashboards) observe.
 func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(), stopper func()) {
 	s := &ReadySignal{}
 	s.ready.Store(false)
@@ -200,6 +209,13 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 	}
 	if cadence < 10*time.Millisecond {
 		cadence = 10 * time.Millisecond
+	}
+	// touch: write the timestamp AND flip the signal ready. The
+	// goroutine catches the stale-flip; the touch path is the hot
+	// recovery path /readyz scrapes observe.
+	touchFn := func() {
+		lastTouch.Store(time.Now().UnixNano())
+		s.Set(true, "")
 	}
 	go func() {
 		defer close(done)
@@ -221,13 +237,15 @@ func NewStalenessSignal(stale time.Duration) (signal *ReadySignal, touch func(),
 					s.Set(false, "stale")
 					continue
 				}
+				// Fresh — re-flip ready so the signal is invariant
+				// under tick/touch interleaving. touch() also writes
+				// ready, but a tick that arrives just after a stale
+				// flip and before the next touch would observe stale
+				// state from the prior tick without this re-set.
 				s.Set(true, "")
 			}
 		}
 	}()
-	// touch is exposed via the closure — call sites pass it wherever
-	// a "fresh" event fires.
-	touchFn := func() { lastTouch.Store(time.Now().UnixNano()) }
 	stopperFn := func() {
 		close(stop)
 		<-done
