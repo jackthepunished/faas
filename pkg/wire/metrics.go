@@ -96,6 +96,22 @@ type OpsMetrics struct {
 	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
 	// panel is the §12 warm-capture-error alert's primary signal.
 	warmSnapshotErrors *prometheus.CounterVec
+	// guestInitDuration (issue #470 / PR C / ADR-072) measures the
+	// wall-clock time between the vmmd DGRAM recv of the framework-ready
+	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
+	// by {app, runner} so a Grafana panel can split per runtime. The
+	// sentinels ("", "") are pre-instantiated so the dashboard panel
+	// has a non-zero series from boot. Bucket set is spec §6.3 verbatim
+	// {.05, .1, .2, .3, .35, .5, .8, 1, 1.5, 3, 5} — the consecutive
+	// 0.3/0.35 pair is intentional (the 350 ms warm-wake budget needs
+	// tight resolution near 0.35).
+	guestInitDuration *prometheus.HistogramVec
+	// wakeSnapshotTier (issue #470 / PR C / ADR-072) — closed-set
+	// counter for the warm-vs-init-vs-cold-boot choice Engine.usableSnapshotForWake
+	// makes on every wake. Labels ∈ {warm, init, cold_boot_fallback}.
+	// Pre-instantiated at boot so the wake-tier-mix panel has zero
+	// rows from idle fleet, non-zero as soon as production wakes happen.
+	wakeSnapshotTier *prometheus.CounterVec
 	// eventsWriteFail: introduced in commit 4 for the audit-log
 	// emission. A non-zero rate indicates that transitions are
 	// succeeding but the events row isn't being written — the state
@@ -789,6 +805,22 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")
+	// Issue #470 / PR C / ADR-072: guest-init duration histogram.
+	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
+	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_guest_init_duration_seconds",
+		Help:    "Wall-clock seconds between the vmmd DGRAM recv of the framework-ready signal and the Manager.MarkInstanceFrameworkReady return (issue #470 / PR C / ADR-072). Labelled by {app, runner} — the empty-tuple sentinel is pre-instantiated so dashboards render from boot. Bucket set is spec §6.3 verbatim.",
+		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
+	}, []string{"app", "runner"})
+	guestInitDuration.WithLabelValues("", "")
+	// Issue #470 / PR C / ADR-072: wake tier mix counter.
+	wakeSnapshotTier := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_wake_snapshot_tier_total",
+		Help: "Count of wakes that picked a given snapshot tier (issue #470 / PR C / ADR-072), labelled by tier ∈ {warm, init, cold_boot_fallback}. Pre-instantiated at boot so the wake-tier-mix Grafana panel has zero rows from idle fleet, non-zero as soon as production wakes happen.",
+	}, []string{"tier"})
+	wakeSnapshotTier.WithLabelValues("warm")
+	wakeSnapshotTier.WithLabelValues("init")
+	wakeSnapshotTier.WithLabelValues("cold_boot_fallback")
 	rebalanceDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_rebalance_decisions_total",
 		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-064), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
@@ -1342,7 +1374,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, guestInitDuration, wakeSnapshotTier, eventsWriteFail, auditWriteFail,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -1750,6 +1782,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
 		warmSnapshotErrors:                 warmSnapshotErrors,
+		guestInitDuration:                  guestInitDuration,
+		wakeSnapshotTier:                   wakeSnapshotTier,
 		eventsWriteFail:                    eventsWriteFail,
 		auditWriteFail:                     auditWriteFail,
 		auditWriteDur:                      auditWriteDur,
@@ -1849,6 +1883,30 @@ func (m *OpsMetrics) WarmSnapshotErrors(reason string) prometheus.Counter {
 		return nil
 	}
 	return m.warmSnapshotErrors.WithLabelValues(reason)
+}
+
+// GuestInitDuration returns the {(app, runner)}-labeled histogram
+// observer for guest-init boot duration (issue #470 / PR C / ADR-072).
+// The empty-tuple sentinel ("", "") is pre-instantiated at boot so
+// dashboards render from a fresh process. nil-safe — returns nil if
+// m is nil (callers must use Observe with nil-safe wrappers if they
+// need to).
+func (m *OpsMetrics) GuestInitDuration(app, runner string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.guestInitDuration.WithLabelValues(app, runner)
+}
+
+// WakeSnapshotTier returns the per-tier counter the engine increments
+// on every wake (issue #470 / PR C / ADR-072). The closed set
+// {warm, init, cold_boot_fallback} is pre-instantiated at boot so the
+// wake-tier-mix Grafana panel has zero rows from idle fleet.
+func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.wakeSnapshotTier.WithLabelValues(tier)
 }
 
 // RebalanceDecisions returns the per-(outcome) counter the Tier

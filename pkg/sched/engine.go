@@ -1026,7 +1026,16 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// Free/Hobby account skips the warm tier and reads the init row
 	// directly. The warm row is still on disk for the customer's
 	// eventual re-upgrade (sticky-on-downgrade, ADR-055 §5).
-	snap, haveSnap := e.usableSnapshotForWake(ctx, dep.ID, string(acct.Plan))
+	//
+	// Issue #470 / PR C / ADR-072: the third return value is the
+	// chosen tier ∈ {warm, init, cold_boot_fallback}. Increment the
+	// wake-tier-mix counter so the dashboard shows the ratio of warm
+	// restores vs init restores vs cold-boot fallbacks. nil-safe
+	// accessor (OpsMetrics = nil → no-op).
+	snap, haveSnap, chosenTier := e.usableSnapshotForWake(ctx, dep.ID, string(acct.Plan))
+	if e.ops != nil {
+		e.ops.WakeSnapshotTier(chosenTier).Inc()
+	}
 
 	initState := state.StateColdBooting
 	if haveSnap {
@@ -3314,15 +3323,34 @@ func (e *Engine) usableSnapshot(ctx context.Context, deploymentID string) (state
 // init-tier row instead. The warm row is left on disk for the
 // customer's eventual re-upgrade; the next park the plan allows
 // warm again will pick up where the engine left off.
-func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan string) (state.Snapshot, bool) {
+//
+// The third return value is the chosen tier
+// ∈ {warm, init, cold_boot_fallback}; the caller (the lone
+// usableSnapshotForWake call site in this file) is responsible for
+// incrementing the WakeSnapshotTier counter (issue #470 / PR C /
+// ADR-072). Returning the tier from this function — instead of
+// calling the metric accessor directly — keeps the function
+// testable without a metric registry.
+func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan string) (state.Snapshot, bool, string) {
 	if !planAllowsWarm(plan) {
 		snap, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierInit)
 		if err != nil || snap.Stale || snap.FCVersion != e.fcVer {
-			return state.Snapshot{}, false
+			return state.Snapshot{}, false, "cold_boot_fallback"
 		}
-		return snap, true
+		return snap, true, "init"
 	}
-	return e.usableSnapshot(ctx, deploymentID)
+	// PR C / ADR-072: prefer warm when available. LatestSnapshot
+	// already ranks warm > init, but checking tier explicitly lets us
+	// distinguish warm-wake from init-wake for the operator metric.
+	warm, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierWarm)
+	if err == nil && !warm.Stale && warm.FCVersion == e.fcVer {
+		return warm, true, "warm"
+	}
+	snap, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierInit)
+	if err != nil || snap.Stale || snap.FCVersion != e.fcVer {
+		return state.Snapshot{}, false, "cold_boot_fallback"
+	}
+	return snap, true, "init"
 }
 
 // planAllowsWarm is a thin wrapper that resolves the plan's

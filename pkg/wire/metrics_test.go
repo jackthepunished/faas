@@ -903,3 +903,75 @@ func TestOpsMetrics_ObserveSidecarRestartNilSafe(t *testing.T) {
 	// Must NOT panic.
 	m.ObserveSidecarRestart("app-1", "metrics")
 }
+
+// TestOpsMetrics_GuestInitDuration (issue #470 / PR C / ADR-074)
+// pins the bucket set (spec §6.3 verbatim: {.05, .1, .2, .3, .35,
+// .5, .8, 1, 1.5, 3, 5}) and the label set (app, runner). The
+// empty-tuple sentinel ("", "") is pre-instantiated so dashboards
+// render from boot — a regression that drops the sentinel would
+// break the §12 panel surface. Prometheus buckets are inclusive on
+// the upper bound (le), so 0.30 and 0.34 both satisfy le="0.35".
+func TestOpsMetrics_GuestInitDuration(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	// Real observations across the bucket spread.
+	m.GuestInitDuration("app-1", "node22").Observe(0.04) // ≤ 0.05
+	m.GuestInitDuration("app-1", "node22").Observe(0.30) // ≤ 0.3
+	m.GuestInitDuration("app-1", "node22").Observe(0.34) // ≤ 0.35
+	m.GuestInitDuration("app-2", "python312").Observe(2.0) // ≤ 3
+
+	body := render(t, m)
+	for _, want := range []string{
+		`vmmd_guest_init_duration_seconds_bucket{app="app-1",runner="node22",le="0.05"} 1`,
+		`vmmd_guest_init_duration_seconds_bucket{app="app-1",runner="node22",le="0.3"} 2`,
+		`vmmd_guest_init_duration_seconds_bucket{app="app-1",runner="node22",le="0.35"} 3`,
+		`vmmd_guest_init_duration_seconds_bucket{app="app-2",runner="python312",le="3"} 1`,
+		`vmmd_guest_init_duration_seconds_bucket{app="",runner="",le="0.05"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_GuestInitDurationNilSafe (issue #470 / PR C /
+// ADR-074) — mirrors the WarmSnapshotErrors nil-safe pin.
+func TestOpsMetrics_GuestInitDurationNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.GuestInitDuration("app", "runner"); got != nil {
+		t.Errorf("nil.GuestInitDuration = %v, want nil", got)
+	}
+}
+
+// TestOpsMetrics_WakeSnapshotTier (issue #470 / PR C / ADR-074)
+// pins the closed-set tier label ({warm, init, cold_boot_fallback}).
+// All three labels are pre-instantiated at boot so the
+// wake-tier-mix panel has zero rows from idle fleet.
+func TestOpsMetrics_WakeSnapshotTier(t *testing.T) {
+	m := wire.NewOpsMetrics("schedd")
+	m.WakeSnapshotTier("warm").Inc()
+	m.WakeSnapshotTier("warm").Inc()
+	m.WakeSnapshotTier("warm").Inc()
+	m.WakeSnapshotTier("init").Inc()
+	m.WakeSnapshotTier("cold_boot_fallback").Inc()
+
+	body := render(t, m)
+	for _, want := range []string{
+		`schedd_wake_snapshot_tier_total{tier="warm"} 3`,
+		`schedd_wake_snapshot_tier_total{tier="init"} 1`,
+		`schedd_wake_snapshot_tier_total{tier="cold_boot_fallback"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_WakeSnapshotTierNilSafe (issue #470 / PR C /
+// ADR-074) — mirrors the WarmSnapshotErrors nil-safe pin.
+func TestOpsMetrics_WakeSnapshotTierNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.WakeSnapshotTier("warm"); got != nil {
+		t.Errorf("nil.WakeSnapshotTier = %v, want nil", got)
+	}
+}
+}

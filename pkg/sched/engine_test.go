@@ -3289,7 +3289,7 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
 	// Free plan returns the init row even though a warm row exists.
-	snap, ok := e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanFree))
+	snap, ok, tier := e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanFree))
 	if !ok {
 		t.Fatal("PlanFree: usableSnapshotForWake returned no snap")
 	}
@@ -3299,9 +3299,12 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 	if snap.StorageKey != state.SnapMemKey(dep.ID) {
 		t.Errorf("Free plan: storage_key = %q, want %q", snap.StorageKey, state.SnapMemKey(dep.ID))
 	}
+	if tier != "init" {
+		t.Errorf("Free plan: chosen tier = %q, want init", tier)
+	}
 
 	// Pro plan returns the warm row (warm > init on tie).
-	snap, ok = e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanPro))
+	snap, ok, tier = e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanPro))
 	if !ok {
 		t.Fatal("PlanPro: usableSnapshotForWake returned no snap")
 	}
@@ -3310,5 +3313,8 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 	}
 	if snap.StorageKey != state.WarmSnapMemKey(dep.ID) {
 		t.Errorf("Pro plan: storage_key = %q, want %q", snap.StorageKey, state.WarmSnapMemKey(dep.ID))
+	}
+	if tier != "warm" {
+		t.Errorf("Pro plan: chosen tier = %q, want warm", tier)
 	}
 }
