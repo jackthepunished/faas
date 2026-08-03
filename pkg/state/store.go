@@ -157,6 +157,24 @@ var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
 // audit row. Issue #294 closes the gap that SOC 2 CC6.1 expects.
 var ErrReplay = errors.New("state: webhook replay rejected")
 
+// ErrAPIKeyExpired is returned by AuthenticateKey when the matched
+// key has expires_at < now(). The first auth attempt after expiry
+// flips the row to status='revoked' atomically before returning, so
+// a second attempt returns ErrAPIKeyRevoked. The audit
+// `key.expired` row is emitted by the auth middleware, not the
+// store (the store has no Auditor dependency).
+//
+// Issue #189 / IAM-5.
+var ErrAPIKeyExpired = errors.New("state: api key expired")
+
+// ErrAPIKeyRevoked is returned by AuthenticateKey when the matched
+// key has status='revoked'. The state is terminal — there is no
+// recovery path. The auth middleware maps this to a 401 with the
+// `api_key_revoked` Problem code.
+//
+// Issue #189 / IAM-5.
+var ErrAPIKeyRevoked = errors.New("state: api key revoked")
+
 // MaxDeploymentLogPage caps the per-call row count for
 // ListDeploymentLogs. Both implementations clamp the caller's
 // `limit` to this value before allocating — defense in depth so a
@@ -440,6 +458,14 @@ type Store interface {
 	// AccountByKeyHash + APIKeyByHash being two round-trips and ensures
 	// the principal is assembled atomically. Returns ErrNotFound when
 	// the hash has no matching key.
+	//
+	// IAM-5 (issue #189) extends the contract: an authenticated key
+	// whose status='revoked' returns ErrAPIKeyRevoked; a key whose
+	// expires_at is in the past is lazily flipped to status='revoked'
+	// and revoked_at stamped before this method returns
+	// ErrAPIKeyExpired. The audit `key.expired` row is emitted by
+	// the auth middleware (which has the Auditor dependency), not
+	// here. See pkg/auth/middleware for the HTTP-side translation.
 	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
 	// TouchKeyLastUsed bumps the key's last_used_at to now(). Called
 	// fire-and-forget on every successful bearer auth in the apid
@@ -447,6 +473,82 @@ type Store interface {
 	// (PRD §4.4) without coupling request latency to a non-critical
 	// observability write.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
+
+	// CreateAPIKeyWithExpiry is the IAM-5 (issue #189) shape. The
+	// caller passes an explicit expiresAt (nil = never expires, the
+	// admin contract); the five-arg CreateAPIKey stays for the 17+
+	// test/handler sites that don't care about expiry. Production
+	// apid.createKey uses this new shape so the dashboard sees
+	// expires_at on every fresh non-admin key.
+	//
+	// Issue #189 / IAM-5.
+	CreateAPIKeyWithExpiry(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+
+	// CountAPIKeys returns the number of non-revoked keys owned
+	// by the account. Used by the create + rotate handlers to
+	// enforce limits.KeysMax BEFORE minting a new key. The
+	// "non-revoked" filter matches the partial index
+	// api_keys_active_grace_idx; the query is O(1) per
+	// account in the common case. Returns 0 on a fresh account.
+	//
+	// Issue #189 / IAM-5.
+	CountAPIKeys(ctx context.Context, accountID string) (int, error)
+
+	// MarkAPIKeyRevoked is the soft-delete path for keys
+	// (replaces DeleteAPIKeyReturning in the IAM-5 surface).
+	// Flips status to 'revoked' and stamps revoked_at if not
+	// already set. Repeated calls are idempotent (returns the
+	// same row, no error). Returns ErrNotFound when the key
+	// doesn't exist OR belongs to a different account.
+	//
+	// Audit emission is the caller's responsibility; this
+	// method is store-only.
+	//
+	// Issue #189 / IAM-5.
+	MarkAPIKeyRevoked(ctx context.Context, accountID, keyID string) (APIKey, error)
+
+	// RotateAPIKey atomically mints a new key (status='active')
+	// and demotes the old key in a single transaction. The old
+	// key's status flips to 'grace' (when graceWindow > 0) or
+	// 'revoked' (atomic rotation) and its expires_at is
+	// OVERWRITTEN to now() + graceWindow. The new key inherits
+	// label + scopes + account_id from the predecessor; the
+	// caller's pre-minted hash is stored directly (no
+	// post-step patch).
+	//
+	// The two returned keys are the post-commit rows in
+	// (newKey, oldKey) order. The caller is responsible for
+	// surfacing newKey.plaintext (generated upstream) and
+	// oldKey.ExpiresAt (the grace deadline) to the API
+	// response.
+	//
+	// Errors:
+	//   * ErrNotFound  — old key doesn't exist / wrong account.
+	//   * state.ErrAPIKeyRevoked — old key already in 'revoked'
+	//     (rotation of a revoked key is a 404, not idempotent).
+	//
+	// Issue #189 / IAM-5.
+	RotateAPIKey(ctx context.Context, accountID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (newKey, oldKey APIKey, err error)
+
+	// GetAccountKeyGraceWindow returns the per-account override
+	// (accounts.key_grace_window_days). nil = no override; the
+	// caller falls through to the plan default (7d). The
+	// auth hot path does NOT call this; only the rotate
+	// handler does, via a short-TTL in-process cache
+	// (cmd/apid.graceWindowCache).
+	//
+	// Issue #189 / IAM-5.
+	GetAccountKeyGraceWindow(ctx context.Context, accountID string) (*int, error)
+
+	// SetAccountKeyGraceWindow sets the per-account override.
+	// days == nil clears the override (falls through to plan
+	// default). The handler invalidates the in-process
+	// graceWindowCache entry after a successful write. The
+	// audit `key.grace_window_set` event is emitted by the
+	// handler, not the store.
+	//
+	// Issue #189 / IAM-5.
+	SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
 	//

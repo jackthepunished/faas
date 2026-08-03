@@ -19,7 +19,23 @@ export type APIKeyResponse = {
   last_used_at?: string | null;
   created_at: string;
   /**
-   * PRESENT ONLY on POST /v1/keys response. Never returned again.
+   * When the key expires (RFC 3339). Absent on never-expiring admin keys.
+   */
+  expires_at?: string | null;
+  /**
+   * Status state machine. `active` = ready; `grace` = in the post-rotation window; `revoked` = terminal.
+   */
+  status?: 'active' | 'grace' | 'revoked';
+  /**
+   * When the key was revoked (RFC 3339). Absent on active/grace keys.
+   */
+  revoked_at?: string | null;
+  /**
+   * Predecessor key id when this row was minted by rotateKey. Absent on a fresh mint.
+   */
+  rotated_from_id?: string | null;
+  /**
+   * PRESENT ONLY on POST /v1/keys and POST /v1/keys/{id}/rotate responses. Never returned again.
    */
   plaintext?: string | null;
 };

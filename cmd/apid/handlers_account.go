@@ -341,6 +341,71 @@ func gatherExport(ctx context.Context, s *server, acct state.Account, includeSec
 	}, nil
 }
 
+// getGraceWindow returns the current per-account grace override
+// (issue #189 / IAM-5). The endpoint is admin-only — the rotation
+// primitive is admin-only, and the override is meaningless for a
+// non-admin caller. The PlanDefault field is unconditionally
+// populated so the dashboard can render the "Override: N / Plan
+// default: 7" pair without a second round-trip.
+//
+// Auth: admin scope (ScopesAdminOnly); middleware already
+// short-circuits non-admin callers.
+func (s *server) getGraceWindow(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	days, err := s.store.GetAccountKeyGraceWindow(ctx(r), acct.ID)
+	if err != nil && !errors.Is(err, state.ErrNotFound) {
+		api.WriteProblem(w, api.ErrCapacity("could not read grace window"))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.GraceWindowResponse{
+		Days:        days,
+		PlanDefault: api.DefaultAPIKeyGraceWindowDays,
+	})
+}
+
+// setGraceWindow writes the per-account grace override and
+// invalidates the in-process cache so the next rotation sees the
+// new value (issue #189 / IAM-5). The body is {days: 0|7|null};
+// nil clears the override and falls back to the plan default (7).
+// Days < 0 is rejected with 400 (negative days is meaningless) and
+// emits no audit row.
+//
+// Auth: admin scope (ScopesAdminOnly).
+//
+// Audit: key.grace_window_set carries both old and new values so
+// the dashboard can render the toggle history. The audit row is
+// the only place the OLD value is observable — once the PATCH
+// lands, the cache is empty and the next read is the new value.
+func (s *server) setGraceWindow(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	var req api.SetGraceWindowRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid body", err.Error()))
+		return
+	}
+	if req.Days != nil && *req.Days < 0 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid grace window",
+			"days must be >= 0 (0 = atomic rotation, null = use plan default)"))
+		return
+	}
+
+	// Read the prior value for the audit row. The cache may
+	// short-circuit this — invalidated-or-stale cache is fine.
+	oldDays, _ := s.resolveGraceWindow(ctx(r), acct.ID) // best-effort
+	_ = s.store.SetAccountKeyGraceWindow(ctx(r), acct.ID, req.Days)
+	if s.graceWindowCache != nil {
+		s.graceWindowCache.Invalidate(acct.ID)
+	}
+	s.audit.Emit(ctx(r), "key.grace_window_set", &acct.ID, map[string]any{
+		"old_days": oldDays,
+		"new_days": req.Days, // *int — JSON null for the cleared case
+	})
+	writeJSON(w, http.StatusOK, api.GraceWindowResponse{
+		Days:        req.Days,
+		PlanDefault: api.DefaultAPIKeyGraceWindowDays,
+	})
+}
+
 // --- per-resource list helpers (each ≤50 LoC, exported for tests) -------
 
 // buildDeploymentsForExport shapes pre-fetched deployment rows into

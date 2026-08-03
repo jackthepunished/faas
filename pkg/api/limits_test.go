@@ -56,7 +56,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// doesn't fit the Free pricing tier. The 0/0 defaults
 			// are defence-in-depth; the WarmSnapshotAllowed() gate
 			// surfaces the 403 to a Free customer PATCHing true.
-			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0},
+			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
+			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
+			KeysMax: 3},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
 			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
@@ -109,7 +111,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #470 / ADR-055: Hobby is gated off for the
 			// same cost-shape reason as Free — the doubled parked
 			// footprint doesn't fit the €9/month Hobby tier.
-			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0},
+			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
+			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
+			KeysMax: 10},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
@@ -154,7 +158,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// warm-tier snapshots are on by default — 5 requests /
 			// 2000 ms is the sweet spot for the issue's acceptance
 			// (p50 halved vs init-tier).
-			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000},
+			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000,
+			// Issue #189 / IAM-5: Pro = 50 keys (2 per app across 25 apps).
+			KeysMax: 50},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
@@ -204,7 +210,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the per-app parked cost fits inside the 452 GB
 			// budget and the wake-p50 win is the largest dollar
 			// lever for SaaS workloads.
-			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000},
+			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000,
+			// Issue #189 / IAM-5: Scale = 200 keys (2 per app across 100 apps).
+			KeysMax: 200},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -344,6 +352,9 @@ func TestPlansAreMonotonic(t *testing.T) {
 			// Issue #461 / ADR-062: per-app registry credential quota
 			// (Free=0 → Hobby=2 → Pro=5 → Scale=20).
 			{"RegistryCredentialMax", lo.RegistryCredentialMax, hi.RegistryCredentialMax},
+			// Issue #189 / IAM-5: per-account API-key quota
+			// (Free=3 → Hobby=10 → Pro=50 → Scale=200).
+			{"KeysMax", lo.KeysMax, hi.KeysMax},
 		}
 		for _, c := range checks {
 			if c.hi < c.lo {
@@ -560,6 +571,45 @@ func TestPlanCronLimits(t *testing.T) {
 		}
 		if got := c.plan.CronLimitPerAccount(); got != c.wantPerAcct {
 			t.Errorf("%s.CronLimitPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+	}
+}
+
+// TestPlanKeysMax pins the per-account API-key cap for the plan
+// (issue #189 / IAM-5). Free 3, Hobby 10, Pro 50, Scale 200 — see
+// pkg/api/limits.go::KeysMax docstring. apid's createKey handler
+// reads this value (via Plan.KeysMax()) and rejects with 409
+// api_key_limit_exceeded at the cap; rotateKey is quota-neutral
+// and is allowed at the cap. Unknown plans must fail closed (return 0)
+// so a missing plan row never silently unlocks the auth surface — same
+// contract as CronLimitPerAccount above.
+func TestPlanKeysMax(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 3},
+		{PlanHobby, 10},
+		{PlanPro, 50},
+		{PlanScale, 200},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.KeysMax(); got != c.want {
+			t.Errorf("%s.KeysMax() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanKeysMaxAccessorsMatchTable pins that the accessor reads the
+// same value the Limits struct holds. Catches a regression where a
+// future contributor edits the struct field but forgets the accessor
+// (or vice versa). Mirrors TestOrgAccessorsMatchTable.
+func TestPlanKeysMaxAccessorsMatchTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.KeysMax(), l.KeysMax; got != want {
+			t.Errorf("Plan(%s).KeysMax() = %d, table = %d", p, got, want)
 		}
 	}
 }
