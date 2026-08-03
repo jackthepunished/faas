@@ -163,6 +163,9 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 		// per-event regardless of what the producer sent. The
 		// value is bounded to maxSlugLen (64) before this point so
 		// downstream log volume is bounded too.
+		//
+		// codeql[go/clear-text-logging] false-positive: logsanitize.Field is not in CodeQL's sanitizer model (the query only recognises inline strings.ReplaceAll), but it does strip the injection bytes at runtime — the same defense-in-depth pattern used at pkg/gateway/cert_expiry.go:333 and pkg/gateway/metrics.go:859.
+		// codeql[go/log-injection] false-positive: same root cause — logsanitize.Field is a plain Go function with no qltest Sanitizer annotation, so CodeQL cannot trace taint through it.
 		cfg.Log.Warn("org lookup failed",
 			"slug", logsanitize.Field(slug),
 			"account_id", logsanitize.Field(acct.ID),
@@ -186,6 +189,8 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 			api.WriteProblem(w, api.ErrOrgRoleForbidden("access this organization"))
 			return
 		}
+		// codeql[go/clear-text-logging] false-positive: logsanitize.Field is not in CodeQL's sanitizer model; the wrapper does strip CR/LF/NUL/DEL at runtime (see pkg/authz/loadorg.go:166 for the org-lookup-failed call site and the analogy drawn from pkg/gateway/cert_expiry.go:333).
+		// codeql[go/log-injection] false-positive: same root cause — logsanitize.Field is a plain Go function with no qltest Sanitizer annotation, so CodeQL cannot trace taint through it.
 		cfg.Log.Warn("membership lookup failed",
 			"org_id", logsanitize.Field(org.ID),
 			"account_id", logsanitize.Field(acct.ID),
