@@ -64,26 +64,11 @@ var allowRoleMatrix = map[OrgAction]map[state.OrgRole]bool{
 	},
 }
 
-// ActionAuthorizer is the contract every Store accessor must call
-// before mutating an org/membership/invitation. This is the seam
-// the PR 2 review-fix TODO comment in pkg/state/store.go references:
-//
-//	"Every org/membership/invitation accessor must be served
-//	 through pkg/authz.RequireOrgAction(action); the Store is
-//	 intentionally authz-unaware, and a handler that calls
-//	 these methods directly bypasses the org-membership check."
-//
-// The interface lets PR 5+ handlers compose with a stub in tests
-// without spinning up a real OrgResolver.
-type ActionAuthorizer interface {
-	AuthorizeOrgAction(ctx context.Context, action OrgAction) *api.Problem
-}
-
 // AuthorizeOrgAction returns nil if the active-org principal on ctx
 // has the role required for `action`, or a typed *api.Problem
-// otherwise. The 403 problem uses api.CodeOrgRoleForbidden
-// (PR-1-shipped at pkg/api/errors.go:594) with the action and the
-// caller's role in the detail string.
+// otherwise. The 403 problem uses api.CodeOrgRoleForbidden (PR 1
+// of issue #190 / IAM-6 / ADR-061) with the action and the caller's
+// role in the detail string.
 //
 // Callers that don't compose LoadOrg (pre-PR-5 routes) get a 403 with
 // the action and a "<no active org>" detail — those routes should
@@ -92,7 +77,7 @@ type ActionAuthorizer interface {
 //
 // If `audit` is non-nil, denials emit an "authz.denied" audit row
 // keyed by the principal's account id (matching the key.expired /
-// key.auth_rejected_revoked pattern in pkg/auth/middleware/middleware.go:441-453).
+// key.auth_rejected_revoked pattern in pkg/auth/middleware).
 func AuthorizeOrgAction(ctx context.Context, action OrgAction, audit AuditEmitter) *api.Problem {
 	acct, _, mem, ok := principalFromCtx(ctx)
 	if !ok {
@@ -102,7 +87,7 @@ func AuthorizeOrgAction(ctx context.Context, action OrgAction, audit AuditEmitte
 			api.CodeCapacity,
 			"AuthorizeOrgAction wired before RequireSession",
 			"no principal on context; check the route table")
-		emitAudit(ctx, audit, acct, action, p)
+		emitAudit(ctx, audit, acct, action.String(), p)
 		return p
 	}
 	if mem == nil {
@@ -110,7 +95,7 @@ func AuthorizeOrgAction(ctx context.Context, action OrgAction, audit AuditEmitte
 		// X-Active-Org / ?org= hint. Treat as 403, not 404, so
 		// the wire shape is consistent across deny paths.
 		p := api.ErrOrgRoleForbidden(action.String())
-		emitAudit(ctx, audit, acct, action, p)
+		emitAudit(ctx, audit, acct, action.String(), p)
 		return p
 	}
 	allowed, known := allowRoleMatrix[action]
@@ -124,14 +109,14 @@ func AuthorizeOrgAction(ctx context.Context, action OrgAction, audit AuditEmitte
 			api.CodeCapacity,
 			"Authorization table missing entry",
 			"action "+action.String()+" is not in the allowRoleMatrix; update pkg/authz/authorize.go")
-		emitAudit(ctx, audit, acct, action, p)
+		emitAudit(ctx, audit, acct, action.String(), p)
 		return p
 	}
 	if allowed[mem.Role] {
 		return nil
 	}
 	p := api.ErrOrgRoleForbidden(action.String())
-	emitAudit(ctx, audit, acct, action, p)
+	emitAudit(ctx, audit, acct, action.String(), p)
 	return p
 }
 
@@ -139,7 +124,13 @@ func AuthorizeOrgAction(ctx context.Context, action OrgAction, audit AuditEmitte
 // don't need to nil-check at every site. Audit emission is opt-in per
 // call to keep the cost off the hot path until PR 5+ builds the
 // audit-row indexing it needs.
-func emitAudit(ctx context.Context, audit AuditEmitter, acct state.Account, action OrgAction, p *api.Problem) {
+//
+// The action parameter is a string (not OrgAction) so callers can emit
+// resolution-failure events like "org.load.not_found" alongside
+// authorization-failure events like "org.delete" without bypassing
+// the OrgAction closed-vocabulary discipline: deny sites convert
+// via OrgAction.String; load sites pass their own namespaced strings.
+func emitAudit(ctx context.Context, audit AuditEmitter, acct state.Account, action string, p *api.Problem) {
 	if audit == nil {
 		return
 	}
@@ -148,7 +139,7 @@ func emitAudit(ctx context.Context, audit AuditEmitter, acct state.Account, acti
 		detail = p.Detail
 	}
 	audit.Emit(ctx, "authz.denied", nil, map[string]any{
-		"action":      action.String(),
+		"action":      action,
 		"account_id":  acct.ID,
 		"status":      p.Code,
 		"http_status": p.Status,
@@ -189,13 +180,3 @@ func (a OrgAction) String() string {
 // visible to readers. PR 5 will land a small helper for the SSE
 // paths that need to flush before the body starts (those compose
 // the same call with a custom writer).
-
-// ActionAuthorizer is currently unused at runtime — handlers call
-// AuthorizeOrgAction(ctx, action, audit) directly. The interface
-// stays exported so PR 5+ handlers that want to inject a custom
-// audit emitter or a tenant-scoped policy override can declare an
-// ActionAuthorizer field without taking a dependency on the
-// package-level function signature. The interface contract is
-// enforced by authorize_test.go's fakeAudit-based deny-path
-// assertions; a future drift in the AuthorizeOrgAction method
-// shape surfaces as a compile error in the test file.

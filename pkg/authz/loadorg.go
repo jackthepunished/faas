@@ -1,49 +1,40 @@
-// LoadOrgWithResolver resolves the caller's active-org membership for
-// the current request and stamps it onto the request context for
-// downstream handlers + AuthorizeOrgAction. The middleware is the
-// half of the authz seam PR 4 (issue #190 / IAM-6 / ADR-061) ships
-// alongside the AuthorizeOrgAction table.
+// Package authz (loadorg.go) — LoadOrgWithResolver resolves the
+// caller's active-org membership for the current request and stamps
+// it onto the request's principal so downstream handlers + AuthorizeOrgAction
+// see the same membership. This is half of the authz seam PR 4 of
+// issue #190 / IAM-6 / ADR-061 ships alongside the AuthorizeOrgAction table.
 //
-// # Reading the active org
+// Header (X-Active-Org) wins over query (?org=); neither set → pass-through.
+// Unknown slug → 404 org_not_found; known org but caller is not a
+// member → 403 org_role_forbidden (IDOR-safe — both 4xx so a
+// non-member of an existing org sees the same shape as a non-member
+// of a non-existent org, only the code differs). No principal on
+// ctx → 500 CodeCapacity (wiring bug, not user error).
 //
-// The middleware reads the org slug from two surfaces, in priority
-// order:
-//
-//  1. The X-Active-Org request header (recommended for SDK and CLI
-//     callers — survives query-string stripping by intermediate
-//     proxies).
-//  2. The ?org=<slug> query string (the dashboard's primary path;
-//     matches the api/openapi.yaml Idempotency-Key convention of
-//     accepting both header and query forms for the same parameter).
-//
-// If both are set, the header wins. If neither is set, the middleware
-// passes through with no membership stamped — every pre-PR-5 route
-// stays account-scoped and the wire shape is unchanged.
-//
-// Fail-closed behaviour
-//
-//   - RequireSession did not run (no principal on ctx) → 500
-//     api.CodeCapacity. This is a wiring bug, not a user error.
-//   - Unknown org slug → 404 api.CodeOrgNotFound. Slug shape is
-//     validated by the regex in pkg/api/errors.go::OrgSlugPattern.
-//   - Known org but caller is not a member → 403
-//     api.CodeOrgRoleForbidden. IDOR-safe: both 404 and 403 are 4xx
-//     so an attacker can't enumerate slugs.
-//
-// Audit emission is opt-in via LoadOrgConfig.Audit; passing nil keeps
-// PR 4's hot path allocation-free. PR 5+ will plumb the real audit
-// emitter through cmd/apid/main.go.
+// Audit emission is opt-in via LoadOrgConfig.Audit; passing nil
+// keeps the PR 4 hot path allocation-free. PR 5+ plumbs the real
+// pkg/audit emitter through cmd/apid/main.go.
 package authz
 
 import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
+
+// maxSlugLen is the upper bound LoadOrgWithResolver accepts on the
+// incoming slug before looking it up. It is intentionally larger
+// than the schema's 3..32 char CHECK (migration 00099) so any
+// future widening of the schema does not invalidate this gate.
+// The full regex lives in pkg/api.OrgSlugPattern; we only
+// trim + length-cap here so an oversize / whitespace-only value
+// degrades to passthrough rather than a 500 from the SQL CHECK.
+const maxSlugLen = 64
 
 // LoadOrgConfig configures LoadOrgWithResolver. The zero value is
 // usable: header defaults to "X-Active-Org", query to "org", and
@@ -81,10 +72,10 @@ type LoadOrgConfig struct {
 // and the production mux both honour this).
 func LoadOrgWithResolver(cfg LoadOrgConfig, r OrgResolver) func(http.Handler) http.Handler {
 	if r == nil {
-		// Same panic shape as pkg/middleware/authlimit.go:161-165.
-		// Refuse to silently fall back to a nil-resolver no-op
-		// — that's exactly the fail-open path this middleware
-		// exists to prevent.
+		// Same panic shape as pkg/middleware/authlimit.go. Refuse
+		// to silently fall back to a nil-resolver no-op — that's
+		// exactly the fail-open path this middleware exists to
+		// prevent.
 		panic("authz: LoadOrgWithResolver requires a non-nil OrgResolver")
 	}
 	if cfg.HeaderName == "" {
@@ -111,47 +102,59 @@ func LoadOrgWithResolver(cfg LoadOrgConfig, r OrgResolver) func(http.Handler) ht
 // can drive it directly with an httptest.ResponseRecorder and a
 // stub OrgResolver.
 func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req *http.Request, next http.Handler) {
-	ctx := req.Context()
-
-	// (1) Recover the principal. RequireSession stamps it before
-	// LoadOrg runs (the cmd/apid route table composes
-	// s.auth → s.loadOrg). If the principal is missing, the route
-	// is mis-wired — fail closed.
-	acct, _, _, ok := principalFromCtx(ctx)
+	// (1) Recover the principal directly from the request.
+	// RequireSession stamps it before LoadOrg runs (the cmd/apid
+	// route table composes s.auth → s.loadOrg). If the principal
+	// is missing, the route is mis-wired — fail closed.
+	// We go through *http.Request (not ctx) because the principal
+	// is keyed on the request, not on a ctx value that LoadOrg
+	// itself stamps — anyone reading the principal at the top of
+	// this function must read it from req, not from a ctx that's
+	// only stamped at the bottom of this function.
+	acct, _, _, ok := principalFromRequest(req)
 	if !ok {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"LoadOrg wired before RequireSession",
-			"no principal on request context; check the route table"))
+			"no principal on request; check the route table"))
 		return
 	}
 
-	// (2) Read the slug from header (preferred) or query.
-	slug := req.Header.Get(cfg.HeaderName)
+	// (2) Read the slug from header (preferred) or query, then
+	// trim + length-cap. Empty / whitespace-only / oversize →
+	// passthrough (the SQL CHECK rejects oversize values with a
+	// non-ErrNotFound error, which would otherwise surface as 500).
+	slug := strings.TrimSpace(req.Header.Get(cfg.HeaderName))
 	if slug == "" {
-		slug = req.URL.Query().Get(cfg.QueryName)
+		slug = strings.TrimSpace(req.URL.Query().Get(cfg.QueryName))
 	}
-	if slug == "" {
-		// Passthrough: no active org requested. Pre-PR-5 routes
-		// stay account-scoped; the membership field on the
-		// principal is left nil.
+	if slug == "" || len(slug) > maxSlugLen {
+		// Passthrough: no active org requested (or the hint is
+		// malformed — header/query grabbers accept anything; the
+		// schema is the only authority). Pre-PR-5 routes stay
+		// account-scoped; the membership field on the principal
+		// is left nil.
 		next.ServeHTTP(w, req)
 		return
 	}
 
 	// (3) Resolve the org.
-	org, err := r.OrgBySlug(ctx, slug)
+	org, err := r.OrgBySlug(req.Context(), slug)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
-			emitAudit(ctx, cfg.Audit, acct, "org.load.not_found", api.ErrOrgNotFound(slug))
+			emitAudit(req.Context(), cfg.Audit, acct, "org.load.not_found", api.ErrOrgNotFound(slug))
 			api.WriteProblem(w, api.ErrOrgNotFound(slug))
 			return
 		}
+		// Note: slug+account_id is correlation data. If this
+		// log line is shipped to a third-party aggregator, the
+		// pair must be scrubbed or hashed (slugs are public but
+		// the cross-reference is not).
 		cfg.Log.Warn("org lookup failed",
 			"slug", slug,
 			"account_id", acct.ID,
 			"error", err.Error())
-		emitAudit(ctx, cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
+		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"Org lookup failed",
 			"try again; if the problem persists, contact support"))
@@ -163,10 +166,10 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 	}
 
 	// (4) Resolve the membership. Non-member → 403 IDOR-safe.
-	mem, err := r.OrgMemberByAccount(ctx, org.ID, acct.ID)
+	mem, err := r.OrgMemberByAccount(req.Context(), org.ID, acct.ID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
-			emitAudit(ctx, cfg.Audit, acct, "org.load.not_member", api.ErrOrgRoleForbidden("access this organization"))
+			emitAudit(req.Context(), cfg.Audit, acct, "org.load.not_member", api.ErrOrgRoleForbidden("access this organization"))
 			api.WriteProblem(w, api.ErrOrgRoleForbidden("access this organization"))
 			return
 		}
@@ -174,7 +177,7 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 			"org_id", org.ID,
 			"account_id", acct.ID,
 			"error", err.Error())
-		emitAudit(ctx, cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
+		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"Membership lookup failed",
 			"try again; if the problem persists, contact support"))
@@ -190,21 +193,18 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 	// Pointer-mutation contract (issue #278 / PR #332): we mutate
 	// *req so downstream observeWrap (cmd/apid) sees the new
 	// membership via MembershipFrom.
-	newCtx := WithActiveOrg(ctx, &mem)
-	newCtx = WithRequestOnContext(newCtx, req)
+	//
+	// Order matters: WithRequestOnContext must run BEFORE
+	// WithActiveOrg so the latter can find the request via the
+	// httpReqCtxKey{} stamp. WithActiveOrg falls back to a no-op
+	// ctx otherwise (the principal is still on the request, but
+	// the membership slot would not be updated).
+	newCtx := WithRequestOnContext(req.Context(), req)
+	newCtx = WithActiveOrg(newCtx, &mem)
 	*req = *req.WithContext(newCtx)
 
 	// (6) Continue.
 	next.ServeHTTP(w, req)
-}
-
-// LoadOrg is the convenience wrapper that calls LoadOrgWithResolver
-// with no Audit emitter. Equivalent to pkg/middleware.AuthLimit in
-// shape (single-arg, sensible defaults). PR 4 cmd/apid wiring calls
-// LoadOrgWithResolver directly so the audit emitter can be plumbed
-// in PR 5 without changing the route table.
-func LoadOrg(cfg LoadOrgConfig, r OrgResolver) func(http.Handler) http.Handler {
-	return LoadOrgWithResolver(cfg, r)
 }
 
 // Compile-time guard: the constructor signature must stay

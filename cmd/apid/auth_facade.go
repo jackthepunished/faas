@@ -102,16 +102,23 @@ func (s *server) loadOrg(next accountHandler) accountHandler {
 		return next
 	}
 	auditEmitter := loadOrgAuditFrom(s.audit)
-	mw := authz.LoadOrg(authz.LoadOrgConfig{
+	mw := authz.LoadOrgWithResolver(authz.LoadOrgConfig{
 		Log:        s.log,
 		Audit:      auditEmitter,
 		HeaderName: "X-Active-Org",
 		QueryName:  "org",
 	}, s.orgResolver)
 
+	// AccountHandler-style middlewares require an http.Handler
+	// adapter, so we wrap `next` in an http.HandlerFunc. The
+	// closure captures `acct` so the inner dispatch sees the
+	// same account the route table mounted us with — without
+	// this capture, audit rows would lose the principal when
+	// LoadOrgWithResolver's chain re-enters our wrapped handler.
+	// Do NOT simplify to `mw(http.HandlerFunc(next))` — the
+	// accountHandler→http.HandlerFunc conversion would drop the
+	// third argument used by the rest of the cmd/apid route table.
 	return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
-		// Wrap next as http.HandlerFunc so it satisfies the
-		// authz.LoadOrg chain, then dispatch into it.
 		wrapped := mw(http.HandlerFunc(func(w2 http.ResponseWriter, r2 *http.Request) {
 			next(w2, r2, acct)
 		}))

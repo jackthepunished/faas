@@ -21,18 +21,23 @@
 // All tests boot a dedicated apid so the seeded accounts don't bleed.
 // Build tag: (none). CI-safe. Requires Postgres (skip via
 // FAAS_SKIP_PG_TESTS) and a buildable ./cmd/apid.
+//
+// Without Postgres (e.g. a dev box without a Postgres service
+// container) pgtest.Open(t) returns nil at every test entry and
+// the tests skip — exactly the same pattern as
+// personal_org_backfill_e2e_test.go (PR 3). The unit tests in
+// pkg/authz/loadorg_test.go cover the middleware per-request
+// semantics with httptest + a stub resolver so the LoadOrg path
+// is exercised at `make test` even without Postgres.
 
 package e2e_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -291,38 +296,13 @@ func TestE2E_LoadOrg_HeaderBeatsQuery(t *testing.T) {
 	}
 }
 
-// doReqWithHeaders is a small extension of doReq (defined in
-// quota_e2e_test.go) that lets the caller set request headers
-// (X-Active-Org in particular). Defined here so this file is the
-// only place that touches the LoadOrg header surface — keeps the
-// PR-4 test concerns co-located.
+// doReqWithHeaders is a thin wrapper over doReq that lets the
+// caller set request headers (X-Active-Org in particular). Keeps
+// the LoadOrg header surface co-located with this file's tests;
+// the actual request shape lives in quota_e2e_test.go::doReq so
+// changes to the auth/Content-Type headers don't drift between
+// the two files.
 func doReqWithHeaders(t *testing.T, h *e2etest.Harness, key, method, path string, body any, headers map[string]string) ([]byte, int) {
 	t.Helper()
-	var r io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		r = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(context.Background(), method, h.APIDURL+path, r)
-	if err != nil {
-		t.Fatalf("new req: %v", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-	resp, err := h.HTTPClient().Do(req)
-	if err != nil {
-		t.Fatalf("%s %s: %v", method, path, err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	return b, resp.StatusCode
+	return doReq(t, h, key, method, path, body, headers)
 }

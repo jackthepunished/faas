@@ -176,6 +176,9 @@ func TestAuthorizeOrgAction_NoPrincipal(t *testing.T) {
 // org_role_forbidden. The wire shape stays consistent across
 // deny paths: every "you can't do this" is 403, regardless of
 // whether the reason is missing membership or wrong role.
+//
+// The audit-emit shape is asserted separately in
+// TestAuthorizeOrgAction_AuditOnNoMembership below.
 func TestAuthorizeOrgAction_NoMembership(t *testing.T) {
 	req := httptest.NewRequest("GET", "/v1/orgs/me", nil)
 	acct := state.Account{ID: "acct-1"}
@@ -243,6 +246,38 @@ func TestAuthorizeOrgAction_AuditOnDeny(t *testing.T) {
 	}
 	if len(audit2.events) != 0 {
 		t.Errorf("audit events on allow = %d, want 0", len(audit2.events))
+	}
+}
+
+// TestAuthorizeOrgAction_AuditOnNoMembership — when the route was
+// reached but the caller didn't pass an X-Active-Org / ?org= hint
+// (LoadOrg ran but stamped no membership), AuthorizeOrgAction must
+// emit exactly one audit row with the action in fields. Paired with
+// TestAuthorizeOrgAction_NoMembership above, which asserts the
+// 403 status without an audit emitter.
+func TestAuthorizeOrgAction_AuditOnNoMembership(t *testing.T) {
+	audit := &fakeAudit{}
+	req := httptest.NewRequest("GET", "/v1/orgs/me", nil)
+	acct := state.Account{ID: "acct-1"}
+	req = req.WithContext(middleware.WithPrincipal(req.Context(), acct, nil, nil))
+	ctx := WithRequestOnContext(req.Context(), req)
+
+	p := AuthorizeOrgAction(ctx, OrgActionView, audit)
+	if p == nil {
+		t.Fatal("AuthorizeOrgAction: want deny")
+	}
+	if len(audit.events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(audit.events))
+	}
+	e := audit.events[0]
+	if e.event != "authz.denied" {
+		t.Errorf("event = %q, want authz.denied", e.event)
+	}
+	if e.fields["action"] != string(OrgActionView) {
+		t.Errorf("fields[action] = %v, want %s", e.fields["action"], OrgActionView)
+	}
+	if e.fields["account_id"] != "acct-1" {
+		t.Errorf("fields[account_id] = %v, want acct-1", e.fields["account_id"])
 	}
 }
 

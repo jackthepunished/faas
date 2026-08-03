@@ -108,7 +108,12 @@ func postOK(t *testing.T, h *e2etest.Harness, key, path string, body any) int {
 }
 
 // doReq issues a JSON request and returns (body bytes, status).
-func doReq(t *testing.T, h *e2etest.Harness, key, method, path string, body any) ([]byte, int) {
+// extraHeaders (optional) are added before the request is sent —
+// X-Active-Org in particular. Empty/nil means: set Auth + Content-Type
+// only. The auth-facade surface (Authorization, Content-Type) is
+// always set unconditionally so callers can't accidentally bypass
+// auth by passing `Authorization: ""` via extraHeaders.
+func doReq(t *testing.T, h *e2etest.Harness, key, method, path string, body any, extraHeaders ...map[string]string) ([]byte, int) {
 	t.Helper()
 	var r io.Reader
 	if body != nil {
@@ -124,6 +129,11 @@ func doReq(t *testing.T, h *e2etest.Harness, key, method, path string, body any)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
+	for _, extra := range extraHeaders {
+		for k, v := range extra {
+			req.Header.Set(k, v)
+		}
+	}
 	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
 	defer cancel()
 	req = req.WithContext(ctx)

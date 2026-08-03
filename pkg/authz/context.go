@@ -8,24 +8,44 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// principalFromCtx is a thin re-export over authmw.PrincipalFrom so
-// pkg/authz callers don't need to import the middleware package
-// directly (and so we have one place to evolve the principal shape
-// — the org role, in particular, may grow more fields in PR 6/7).
+// principalFromRequest is the per-request accessor. The principal is
+// keyed on *http.Request (pkg/auth/middleware's choice) so we read it
+// directly from req. This is the seam a handler must use when it
+// already has the request in hand.
 //
 // Returns ok=false when RequireSession didn't run — same fail-closed
 // contract as the underlying accessor.
+func principalFromRequest(r *http.Request) (state.Account, *state.APIKey, *state.OrgMembership, bool) {
+	return authmw.PrincipalFrom(r)
+}
+
+// principalFromCtx is the ctx-only accessor. It exists for callers
+// (notably AuthorizeOrgAction) that don't have the request in hand
+// but recovered a ctx from one. The seam depends on a prior
+// LoadOrgWithResolver call having stamped the request via
+// WithRequestOnContext — that stamp is set in handleLoadOrg
+// after a successful resolver lookup, so a call BEFORE LoadOrg
+// returns (ok=false) and AFTER LoadOrg returns (ok=true) on the
+// same request will disagree. handleLoadOrg itself reads via
+// principalFromRequest to avoid that round-trip; this function
+// is the forward-compat path for code that only has ctx.
+//
+// PR 7 may add a gRPC chain that doesn't carry *http.Request; that
+// caller will need its own principalFromGRPC accessor.
 func principalFromCtx(ctx context.Context) (state.Account, *state.APIKey, *state.OrgMembership, bool) {
-	// principalFromCtx receives context.Context but pkg/auth/middleware
-	// keys on *http.Request. The cmd/apid route table ensures
-	// every LoadOrg-bearing handler is HTTP, so we cast through a
-	// sentinel ctx value that LoadOrgWithResolver stamps before
-	// calling AuthorizeOrgAction. See context.go::fromContextRequest
-	// + loadorg.go::handleLoadOrg's ctx stamping.
 	if r, ok := ctx.Value(httpReqCtxKey{}).(*http.Request); ok && r != nil {
 		return authmw.PrincipalFrom(r)
 	}
 	return state.Account{}, nil, nil, false
+}
+
+// fromContextRequest is the internal helper WithActiveOrg uses to
+// recover the request from ctx. Same fail-closed contract as the
+// other accessors; behaves as a no-op when called before the request
+// has been stamped (returns the original ctx unchanged).
+func fromContextRequest(ctx context.Context) (*http.Request, bool) {
+	r, ok := ctx.Value(httpReqCtxKey{}).(*http.Request)
+	return r, ok && r != nil
 }
 
 // MembershipFrom is the org-aware accessor for the rest of the
@@ -34,6 +54,10 @@ func principalFromCtx(ctx context.Context) (state.Account, *state.APIKey, *state
 // pass through LoadOrg (the pre-PR-5 default) or that came in without
 // an X-Active-Org / ?org= hint.
 //
+// Contract: ok == false means no membership present; ok == true
+// means mem != nil. Callers MUST NOT add a defensive `mem == nil`
+// check on the ok==true branch.
+//
 // Authoritative for the 9 org actions defined in action.go — call
 // AuthorizeOrgAction(ctx, action, audit) instead of branching on
 // the membership role directly. The OrgRole read accessor exists
@@ -41,7 +65,7 @@ func principalFromCtx(ctx context.Context) (state.Account, *state.APIKey, *state
 // /v1/orgs/me handler in cmd/apid/handlers_org_me.go).
 func MembershipFrom(r *http.Request) (*state.OrgMembership, bool) {
 	_, _, mem, ok := authmw.PrincipalFrom(r)
-	if !ok || mem == nil {
+	if !ok {
 		return nil, false
 	}
 	return mem, true
@@ -72,8 +96,13 @@ func ActiveOrgID(r *http.Request) (string, bool) {
 // mem may be nil (clears an existing membership) — the typical use
 // is to REPLACE the membership with one resolved from a different
 // org slug mid-request.
+//
+// Returns ctx unchanged when the request is not stamped on the
+// context (LoadOrgWithResolver did not run yet). Callers from tests
+// that exercise WithActiveOrg outside LoadOrg must call
+// WithRequestOnContext first.
 func WithActiveOrg(ctx context.Context, mem *state.OrgMembership) context.Context {
-	if r, ok := ctx.Value(httpReqCtxKey{}).(*http.Request); ok && r != nil {
+	if r, ok := fromContextRequest(ctx); ok {
 		acct, key, _, ok := authmw.PrincipalFrom(r)
 		if !ok {
 			return ctx
@@ -83,13 +112,12 @@ func WithActiveOrg(ctx context.Context, mem *state.OrgMembership) context.Contex
 	return ctx
 }
 
-// WithRequestOnContext is the LoadOrgWithResolver-side helper that
-// wraps the request as a ctx value so principalFromCtx can recover
-// it. Unexported — only LoadOrgWithResolver calls it.
-//
-// The seam exists so AuthorizeOrgAction(r.Context(), action, audit)
-// can read the same principal as the handler without taking
-// *http.Request directly. PR 7 may add a parallel gRPC chain.
+// WithRequestOnContext stamps the request as a ctx value so
+// AuthorizeOrgAction (and WithActiveOrg) can recover it later.
+// Unexported — only LoadOrgWithResolver calls it. The seam exists
+// so AuthorizeOrgAction(r.Context(), action, audit) can read the
+// same principal as the handler without taking *http.Request
+// directly. PR 7 may add a parallel gRPC chain.
 func WithRequestOnContext(ctx context.Context, r *http.Request) context.Context {
 	return context.WithValue(ctx, httpReqCtxKey{}, r)
 }

@@ -72,7 +72,11 @@ type orgMeOrg struct {
 //     a real bug that surfaces in audit).
 func (s *server) whoamiActiveOrg(w http.ResponseWriter, r *http.Request, _ state.Account) {
 	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
+	if !ok {
+		// Apply the same {"org": null} passthrough that LoadOrg
+		// uses when neither the X-Active-Org header nor the ?org=
+		// query is set. Tested by TestE2E_LoadOrg_HeaderMiss
+		// (cmd/e2e/load_org_e2e_test.go).
 		writeOrgMeJSON(w, orgMeResponse{Org: nil})
 		return
 	}
