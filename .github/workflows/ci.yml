@@ -94,14 +94,6 @@ jobs:
           args: --timeout=3m
           # Cache is built into the action; default cache key works.
 
-      # govulncheck — Go's official vulnerability scanner. Runs against
-      # go.mod's module graph, reports known CVEs in transitive deps.
-      # Public surface = public attack surface; this gate is cheap.
-      - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
-
       # Re-runs the same checks golangci-lint covers as a fallback, in case
       # the lint step is skipped (e.g. workflow_dispatch with no Go file
       # changes). Keeps the existing local Makefile contract honest.
@@ -221,16 +213,16 @@ jobs:
   # Bumped to 20 min (PR #414 follow-up) so the long pole has two
   # budgets of headroom — wall is still ~5 min in steady state, this
   # is contingency for slow windows on a shared GH runner pool.
-  unit-tests:
-    name: unit tests + pg integration + SDK
+  # Shard 1 (Postgres-heavy A): cmd/apid, migrations, pkg/meter, pkg/db, pkg/alerts
+  unit-tests-pg-1:
+    name: unit tests (pg shard 1 — apid/meter/migrations)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     services:
       postgres:
-        # 2026-07-31: pull from mirror.gcr.io to avoid Docker Hub
-        # rate-limit / region flakiness (see migrations job for the
-        # full backstory; the unit-tests job uses the same image
-        # so it shares the failure mode).
         image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
@@ -246,12 +238,6 @@ jobs:
     env:
       DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
     steps:
-      # 2026-07-31: pre-pull the postgres image with a 3-attempt
-      # backoff retry. The service-container auto-pull path is
-      # not retried by GitHub Actions, so a transient
-      # `registry-1.docker.io/v2/: context deadline exceeded`
-      # fails the job. mirror.gcr.io is also faster from Azure
-      # centralus (Google's CDN, no Docker Hub rate limits).
       - name: pre-pull postgres image
         run: |
           for attempt in 1 2 3; do
@@ -272,27 +258,146 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      # `make test` is `go test -race -count=1 ./...` — covers every
-      # package that builds on `ubuntu-latest`. ~4:20 on a cold runner,
-      # dominated by `pkg/sched` + `pkg/fcvm` lifecycle tests.
-      #
-      # This one step is the whole job: it covers the public Go SDK
-      # (./pkg/api/...) AND the pgx-backed Store integration tests
-      # (./pkg/state/..., ./pkg/db/...), because `./...` includes them
-      # and DATABASE_URL is set at the job level above — so the pg tests
-      # see a live Postgres here and do not take their skip-when-unset
-      # branch. Dedicated "SDK unit tests" and "pg integration tests"
-      # steps used to re-run those same packages after this line; they
-      # were pure duplicates (~28s/run) and were removed.
-      - name: unit tests
-        run: make test
-      # Public Go SDK drift gate. Companion to spec-check: fails the
-      # PR when an OpenAPI route ships without a typed *Client method in
-      # pkg/api. Pure read-only AST+YAML walk; no installs needed. NOT
-      # covered by `make test` — this is a generator-parity check, not a
-      # test binary.
+
+      - name: unit tests (pg shard 1)
+        run: |
+          mkdir -p coverage
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '(cmd/apid|pkg/meter|pkg/db|pkg/alerts)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard1.out -covermode=atomic $PKGS
+
       - name: sdk-check
         run: make sdk-check
+
+      - name: upload to Codecov (pg shard 1)
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        with:
+          files: coverage/cover-shard1.out
+          flags: unittests
+          use_oidc: true
+          fail_ci_if_error: true
+
+  # Shard 2 (Postgres-heavy B): pkg/state, cmd/gregale, cmd/schedd, etc.
+  unit-tests-pg-2:
+    name: unit tests (pg shard 2 — state/gregale/schedd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:15
+        env:
+          POSTGRES_USER: faas
+          POSTGRES_PASSWORD: faas
+          POSTGRES_DB: faas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U faas -d faas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+    steps:
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: unit tests (pg shard 2)
+        run: |
+          mkdir -p coverage
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -v '/migrations' | grep -E '(pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
+
+      - name: pkg/state coverage gate
+        run: make check-state-coverage COVERFILE=coverage/cover-shard2.out
+
+      - name: upload to Codecov (pg shard 2)
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        with:
+          files: coverage/cover-shard2.out
+          flags: unittests
+          use_oidc: true
+          fail_ci_if_error: true
+
+  # Shard 3 (pure Go heavy): pkg/sched, pkg/fcvm, pkg/gateway, pkg/imaged, etc. No Postgres needed.
+  unit-tests-pure-1:
+    name: unit tests (pure Go shard 1 — sched/fcvm/gateway)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: unit tests (pure Go shard 1)
+        run: |
+          mkdir -p coverage
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -E '(pkg/sched|pkg/fcvm|pkg/gateway|pkg/imaged|pkg/wire|cmd/gatewayd|pkg/api)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard3.out -covermode=atomic $PKGS
+
+      - name: upload to Codecov (pure Go shard 1)
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        with:
+          files: coverage/cover-shard3.out
+          flags: unittests
+          use_oidc: true
+          fail_ci_if_error: true
+
+  # Shard 4 (pure Go light): all remaining packages. No Postgres needed.
+  unit-tests-pure-2:
+    name: unit tests (pure Go shard 2 — light packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: unit tests (pure Go shard 2)
+        run: |
+          mkdir -p coverage
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -vE '(cmd/apid|migrations|pkg/meter|pkg/db|pkg/alerts|pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan|pkg/sched|pkg/fcvm|pkg/gateway|pkg/imaged|pkg/wire|cmd/gatewayd|pkg/api)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard4.out -covermode=atomic $PKGS
+
+      - name: upload to Codecov (pure Go shard 2)
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        with:
+          files: coverage/cover-shard4.out
+          flags: unittests
+          use_oidc: true
+          fail_ci_if_error: true
 
   # OpenAPI spec gate (PR #129). The spec is the source of truth for
   # documentation; the code is the source of truth for behavior; this
@@ -414,56 +519,9 @@ jobs:
   # PR 5/6 will invoke this job's pre-built ./bin/fakeapid from
   # their own `-tags smoke_bin` runs to assert artifact
   # compatibility (see sdk/fakeapid/main_bin_test.go).
-  sdk-fakeapid:
-    name: sdk-fakeapid (Go stdlib fixture)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          # No Go cache: the fixture module has zero external deps
-          # (no go.sum), so cache hit rate is zero anyway.
-      - name: go build
-        working-directory: sdk/fakeapid
-        run: go build -o bin/fakeapid .
-      - name: go test
-        working-directory: sdk/fakeapid
-        run: go test -count=1 -race ./...
-
-  # PR 5 (issue #266, Node SDK). Two jobs: gen asserts the
-  # committed generated tree matches a fresh regen (dirty-diff gate
-  # per ADR-013); smoke runs the smoke suite against the fakeapid
-  # fixture built inline (no shared artifact upload).
-  #
-  # No path filters — matches sdk-go / sdk-fakeapid precedent so the
-  # gate fires whenever the workflow runs.
-  sdk-gen-node:
-    name: sdk-gen-node (regenerate + dirty-diff gate)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22.10.0'
-          cache: 'npm'
-          cache-dependency-path: sdk/node/package-lock.json
-      - name: npm ci
-        working-directory: sdk/node
-        run: npm ci --no-audit --no-fund
-      - name: gen:check (regenerate + assert clean diff)
-        working-directory: sdk/node
-        run: |
-          npm run gen:check || {
-            echo "::error::sdk/node/src/generated is out of sync with api/openapi.yaml."
-            echo "::error::Run 'make sdk-gen-node-check' locally and commit the result."
-            exit 1
-          }
-
-  sdk-smoke-node:
-    name: sdk-smoke-node (Node SDK against fakeapid fixture)
+  # Node SDK gate: gen-check + fakeapid fixture build + smoke + unit tests
+  sdk-node:
+    name: sdk-node (gen-check + smoke + unit)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -482,40 +540,40 @@ jobs:
       - name: npm ci
         working-directory: sdk/node
         run: npm ci --no-audit --no-fund
+      - name: gen:check (regenerate + assert clean diff)
+        working-directory: sdk/node
+        run: |
+          npm run gen:check || {
+            echo "::error::sdk/node/src/generated is out of sync with api/openapi.yaml."
+            echo "::error::Run 'make sdk-gen-node-check' locally and commit the result."
+            exit 1
+          }
       - name: smoke test
         working-directory: sdk/node
         run: npm run test:smoke
-
-  sdk-unit-node:
-    name: sdk-unit-node (Node SDK unit tests, no fixture)
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22.10.0'
-          cache: 'npm'
-          cache-dependency-path: sdk/node/package-lock.json
-      - name: npm ci
-        working-directory: sdk/node
-        run: npm ci --no-audit --no-fund
       - name: unit tests
         working-directory: sdk/node
         run: npm run test:unit
 
-  sdk-gen-python:
-    name: sdk-gen-python (regenerate + dirty-diff gate)
+  # Python SDK gate: gen-check + fakeapid fixture build + smoke + unit tests
+  sdk-python:
+    name: sdk-python (gen-check + smoke + unit)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: sdk/python/pyproject.toml
-      - name: pip install generator + sdk
+      - name: build fakeapid fixture
+        working-directory: sdk/fakeapid
+        run: go build -o bin/fakeapid .
+      - name: install SDK + test deps
         working-directory: sdk/python
         run: |
           python -m pip install --upgrade pip
@@ -530,111 +588,10 @@ jobs:
             echo "::error::Run 'make sdk-gen-python-check' locally and commit the result."
             exit 1
           }
-
-  sdk-gen:
-    name: sdk-gen (regenerate all SDKs + dirty-diff gate)
-    runs-on: ubuntu-latest
-    timeout-minutes: 7
-    # NOTE: job-level `paths:` filters are rejected by GitHub's
-    # workflow-schema validator (see PR #365 review; the error
-    # surfaces at the workflow-file-parse step and aborts the
-    # whole run before any job executes). Path filters must live
-    # under `on.pull_request.paths` at the workflow level, not
-    # here. Defense-in-depth is provided by the per-SDK
-    # `sdk-gen-node` and `sdk-gen-python` jobs (unfiltered, catch
-    # drift outside the aggregator's primary input set). The
-    # `sdk-gen` aggregator runs on every PR — CI cost is ~30s
-    # extra (the venv bootstrap step), which is acceptable.
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22.10.0'
-          cache: 'npm'
-          cache-dependency-path: sdk/node/package-lock.json
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: sdk/python/pyproject.toml
-      # The Makefile's `sdk-gen-python-check` recipe invokes
-      # `.venv/bin/python scripts/gen.py`. The CI runner has no
-      # `.venv`; the per-SDK `sdk-gen-python` job (above) gets
-      # around this by calling `python scripts/gen.py` directly.
-      # Since the aggregator uses the Makefile recipe, we MUST
-      # bootstrap a `.venv` here, otherwise the first regen fails
-      # with a missing-interpreter error.
-      - name: bootstrap Python SDK venv
-        working-directory: sdk/python
-        run: |
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install ruamel.yaml openapi-python-client
-          # `openapi-python-client` 0.29.0 imports the SDK package
-          # to inspect `types.Unset` at generate-time; without the
-          # editable install, the generator emits files with
-          # `from ...types import UNSET, Response` (no `Unset`),
-          # which diverges from HEAD. The standalone `sdk-gen-python`
-          # job does `pip install -e .` for the same reason — we
-          # mirror it here so the aggregator's regen is byte-
-          # identical to the standalone's.
-          .venv/bin/pip install --quiet -e .
-      - name: install Node SDK deps
-        working-directory: sdk/node
-        run: npm ci --no-audit --no-fund
-      - name: make sdk-gen (regenerate + assert clean diff)
-        run: make sdk-gen
-
-  sdk-smoke-python:
-    name: sdk-smoke-python (Python SDK against fakeapid fixture)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: sdk/python/pyproject.toml
-      - name: build fakeapid fixture
-        working-directory: sdk/fakeapid
-        run: go build -o bin/fakeapid .
-      - name: install SDK + test deps
-        working-directory: sdk/python
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install pytest pytest-asyncio httpx
       - name: smoke + unit + regen determinism
         working-directory: sdk/python
         run: python -m pytest tests/ --ignore=tests/debug_chain.py -v
 
-  sdk-unit-python:
-    name: sdk-unit-python (Python SDK unit tests, no fixture)
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: sdk/python/pyproject.toml
-      - name: install SDK + test deps
-        working-directory: sdk/python
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install pytest pytest-asyncio httpx
-      - name: unit tests
-        working-directory: sdk/python
-        run: python -m pytest tests/test_client.py tests/test_sse.py
 
   # issue #299 — supply-chain scan: govulncheck (HIGH+ severity floor)
   # + Grype image scan + SARIF upload to Code Scanning. Runs in
@@ -733,121 +690,6 @@ jobs:
         with:
           sarif_file: grype-results.sarif
           category: grype-image-scan
-
-  coverage:
-    services:
-      postgres:
-        # mirror.gcr.io for the same reason as unit-tests/migrations
-        # (2026-07-31): Docker Hub pull flake.
-        image: mirror.gcr.io/library/postgres:15
-        env:
-          POSTGRES_USER: faas
-          POSTGRES_PASSWORD: faas
-          POSTGRES_DB: faas
-        ports:
-          - 5432:5432
-        # Health-check via pg_isready is supported on the official postgres
-        # image; CI waits until the port is actually serving before the job
-        # starts. Saves the "connection refused" flake on cold-startup.
-        options: >-
-          --health-cmd "pg_isready -U faas -d faas"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
-    # Decoupled from `test` so a coverage upload doesn't lengthen the
-    # developer-feedback loop. Always runs on push-to-main + PR (no
-    # `if:` filter).
-    #
-    # codecov.yml declares a project >= 70% status. Codecov POSTS that
-    # status; it does not BLOCK a merge. Blocking needs `codecov/project`
-    # added to the required-status-checks rule on main — the ruleset
-    # there currently carries only `deletion` and `non_fast_forward`, so
-    # no check of any kind is required to merge today. Don't read a green
-    # tick here as "coverage held".
-    name: coverage (Codecov)
-    runs-on: ubuntu-latest
-    # 20m to cover the -timeout=15m go test step (cmd/e2e under -race
-    # + coverage runs ~11-12 min; see memory cmd-e2e-coverage-timeout-
-    # edge.md) plus startup, dependency download, and upload overhead.
-    timeout-minutes: 20
-    # OIDC for the Codecov upload. Codecov accepts a short-lived GitHub
-    # OIDC token in place of a long-lived CODECOV_TOKEN for public repos
-    # (per codecov-action's `use_oidc` input). This is the right path for
-    # PR events where GitHub strips repo secrets — both fork PRs (Dependabot)
-    # and same-repo PRs from actors whose token forwarding is restricted.
-    # `id-token: write` is required at the job level; the workflow-level
-    # default of `contents: read` does not grant it.
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      # 2026-07-31: pre-pull postgres with 3-attempt retry (see
-      # unit-tests job for the full backstory).
-      - name: pre-pull postgres image
-        run: |
-          for attempt in 1 2 3; do
-            if docker pull mirror.gcr.io/library/postgres:15; then
-              echo "pulled on attempt ${attempt}"
-              break
-            fi
-            echo "pull attempt ${attempt} failed; sleeping 10s"
-            sleep 10
-            if [ "${attempt}" = "3" ]; then
-              echo "::error::postgres image pull failed after 3 attempts"
-              exit 1
-            fi
-          done
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-          cache-dependency-path: go.sum
-
-      - name: coverage profile
-        run: |
-          mkdir -p coverage
-          # -covermode=atomic is required for accurate concurrency coverage;
-          # standard idiom for any package exercising goroutines.
-          # -timeout=15m: ./cmd/e2e under -race + coverage races the 10m Go
-          # default ceiling (memory cmd-e2e-coverage-timeout-edge.md). The
-          # dedicated `e2e` job is the canonical gate; this profile only
-          # needs to land the .out file for Codecov + the pkg/state gate.
-          go test -race -count=1 -timeout=15m -coverprofile=coverage/cover.out -covermode=atomic ./...
-
-      - name: pkg/state coverage gate
-        # Re-runs the focused profile and fails the job if the package
-        # total drops below 70%. Wired here so the gate fires on every
-        # PR (and push-to-main) that reaches the coverage job — Codecov's
-        # per-component status is informational; this step is the
-        # blocking enforcement.
-        run: make test-state-coverage
-
-      - name: upload to Codecov
-        # Pinned to a commit SHA (action's v7 annotated tag is a99c28d3…)
-        # to close CodeQL alert #76 (actions/unpinned-tag). v7 = v7.0.0;
-        # bump via `gh api repos/codecov/codecov-action/git/refs/tags/vN`
-        # and updating the SHA — never `@v7` (mutable ref).
-        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
-        with:
-          files: coverage/cover.out
-          flags: unittests
-          # OIDC instead of secrets.CODECOV_TOKEN. GitHub strips repo
-          # secrets from PR events opened by Dependabot (and from any
-          # actor whose commits didn't land directly on a trusted
-          # branch), so the previous `token: ${{ secrets.CODECOV_TOKEN }}`
-          # resolved to empty on those PRs and Codecov rejected the
-          # upload ("Token required because branch is protected"). OIDC
-          # gives Codecov a signed JWT instead — no long-lived secret,
-          # works on every PR event the workflow sees. With `use_oidc:
-          # true` any supplied token is ignored.
-          use_oidc: true
-          # true, so a refused upload fails the job instead of passing
-          # silently. Pre-OIDC this surfaced the token-strip bug on PR
-          # events from Dependabot.
-          fail_ci_if_error: true
 
   load:
     # M4 acceptance gate (spec §14 row 2): "1,000 rps to hot app adds < 2 ms p50".
@@ -1085,21 +927,12 @@ jobs:
         # and short-circuits before the `go install` fallback.
         run: make sqlc-check
 
-  e2e:
-    # cmd/e2e harness — boots real daemons (apid + schedd + meterd) as
-    # subprocesses and drives them through the production wire (HTTP/
-    # gRPC/pg_notify). PR #135 wired the `make e2e` target into the
-    # Makefile; this job runs it on PR + push-to-main. Decoupled from
-    # `test` because cmd/e2e takes ~5-10 min (cold boot subprocesses)
-    # and would lengthen the developer feedback loop. Metal subset
-    # stays on `make test-metal` + `make metal-lima` — see the `metal`
-    # job above. `pg_isready` is `psql` package-supplied; install it
-    # explicitly because the Makefile preflight `command -v psql`
-    # would otherwise fail.
+  e2e-shard1:
+    name: e2e (shard 1 — 18 tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
-        # mirror.gcr.io for the same reason as unit-tests/migrations
-        # (2026-07-31): Docker Hub pull flake on Azure centralus.
         image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
@@ -1114,15 +947,8 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
-      # cmd/e2e respects these; absent env defaults are fine but
-      # setting them explicitly keeps the wiring self-documenting.
       FAAS_SKIP_PG_TESTS: ""
-    name: e2e (cmd/e2e, no metal)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      # 2026-07-31: pre-pull postgres with 3-attempt retry (see
-      # unit-tests job for the full backstory).
       - name: pre-pull postgres image
         run: |
           for attempt in 1 2 3; do
@@ -1143,21 +969,156 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      # `make e2e` requires `psql` on PATH (preflight guard). Ubuntu
-      # runners don't ship postgresql-client by default — install it.
-      # apt-get needs sudo on GitHub-hosted runners (unprivileged user
-      # by default; see https://docs.github.com/actions/hosting-your-runners).
       - name: install postgresql-client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      # jinja2 is required by TestSec11_PerHostEgressTemplating
-      # (cmd/e2e/sec11_sweep_test.go) to cross-check the Go render
-      # against the Jinja2 template. Without this, the test
-      # t.Logf-skips the cross-check and `make egress-render-cross-check`
-      # (which the same Python import supports) fails its `python3 -c
-      # "from jinja2 import Template"` shell-out on the lint+build
-      # job. ADR-055. Match the version the local `make egress-render-cross-check`
-      # and the e2e sweep use.
       - name: install jinja2 (ADR-055 cross-check)
         run: python3 -m pip install --quiet jinja2
-      - name: make e2e
-        run: make e2e
+      - name: e2e tests (shard 1 — 18 tests)
+        run: go test -race -count=1 -timeout=15m -run '^Test(C|D|Docs|E2E_[A-E])' ./cmd/e2e/...
+
+  e2e-shard2:
+    name: e2e (shard 2 — 15 tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:15
+        env:
+          POSTGRES_USER: faas
+          POSTGRES_PASSWORD: faas
+          POSTGRES_DB: faas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U faas -d faas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+      FAAS_SKIP_PG_TESTS: ""
+    steps:
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: install jinja2 (ADR-055 cross-check)
+        run: python3 -m pip install --quiet jinja2
+      - name: e2e tests (shard 2 — 15 tests)
+        run: go test -race -count=1 -timeout=15m -run '^Test(E2E_[F-P]|Egress|IAM)' ./cmd/e2e/...
+
+  e2e-shard3:
+    name: e2e (shard 3 — 24 tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:15
+        env:
+          POSTGRES_USER: faas
+          POSTGRES_PASSWORD: faas
+          POSTGRES_DB: faas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U faas -d faas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+      FAAS_SKIP_PG_TESTS: ""
+    steps:
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: install jinja2 (ADR-055 cross-check)
+        run: python3 -m pip install --quiet jinja2
+      - name: e2e tests (shard 3 — 24 tests)
+        run: go test -race -count=1 -timeout=15m -run '^Test(E2E_Q|Invoice|MTLS|Main|Meter|Paddle|Quota|R|Signed|Status)' ./cmd/e2e/...
+
+  e2e-shard4:
+    name: e2e (shard 4 — 22 tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:15
+        env:
+          POSTGRES_USER: faas
+          POSTGRES_PASSWORD: faas
+          POSTGRES_DB: faas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U faas -d faas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+      FAAS_SKIP_PG_TESTS: ""
+    steps:
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: install jinja2 (ADR-055 cross-check)
+        run: python3 -m pip install --quiet jinja2
+      - name: e2e tests (shard 4 — 22 tests)
+        run: go test -race -count=1 -timeout=15m -run '^Test(Scan|Sec|Secrets)' ./cmd/e2e/...

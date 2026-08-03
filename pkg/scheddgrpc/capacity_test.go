@@ -226,6 +226,7 @@ func TestReportCapacity_ContextCancelSurfacesCanceled(t *testing.T) {
 		}
 	} else {
 		cancel()
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Drive CloseAndRecv to wait for the handler's response.
