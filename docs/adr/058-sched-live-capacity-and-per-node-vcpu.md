@@ -72,7 +72,7 @@ node's failure does not block placement on others.
 
 ### Tier A2 — per-node vCPU budget
 
-**Schema.** New migration `00081_compute_nodes_vcpu_budget.sql` adds
+**Schema.** New migration `00123_compute_nodes_vcpu_budget.sql` adds
 `vcpu_budget INT NOT NULL DEFAULT 160 CHECK (vcpu_budget > 0)` to
 `compute_nodes`. Default 160 matches `api.VCPUSlots` and the legacy
 single-box posture. The migration is replay-safe (PR #377 / ADR-041):
@@ -178,7 +178,7 @@ Unit tests (no KVM):
   legacy single-box posture preserved bit-for-bit.
 - `pkg/sched/admission_vcpu_test.go` — per-node enforcement,
   `VCPUBudget=0` fallback, RAM + vCPU as independent gates.
-- `migrations/00081_compute_nodes_vcpu_budget_test.go` — column shape
+- `migrations/00123_compute_nodes_vcpu_budget_test.go` — column shape
   + CHECK constraint + default + replay-safety + down→up round-trip.
 
 Integration:

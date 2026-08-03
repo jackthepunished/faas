@@ -107,7 +107,7 @@ type Request struct {
 	NodeCeilingMB int
 	// VCPUBudget is the per-node vCPU admission budget from
 	// compute_nodes.vcpu_budget for the chosen node (Tier A2,
-	// migration 00081). The chooser already verified the request
+	// migration 00123). The chooser already verified the request
 	// fits; the ledger uses this instead of the legacy box-wide
 	// api.VCPUSlots so a node with a smaller budget enforces that
 	// smaller cap. Zero or negative falls back to api.VCPUSlots
@@ -176,7 +176,7 @@ func (l *NodeLedger) Admit(r Request) error {
 			r.NodeID, node.residentRAM, r.admissionMB(), ceiling))
 	}
 
-	// Per-node vCPU headroom (Tier A2, migration 00081). Replaces
+	// Per-node vCPU headroom (Tier A2, migration 00123). Replaces
 	// the legacy box-wide api.VCPUSlots gate. The Engine reads the
 	// row budget from compute_nodes.vcpu_budget and threads it
 	// into the Request; r.VCPUBudget > 0 means a real row budget;

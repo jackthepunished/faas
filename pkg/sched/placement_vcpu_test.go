@@ -48,7 +48,7 @@ func TestChoosePlacement_RejectsOverVCPUBudget(t *testing.T) {
 // "no budget" path: a node with vcpu_budget=0 is skipped, even
 // if it has RAM headroom. This protects against an operator that
 // forgets to set the budget, or a row that was inserted before
-// migration 00081 ran (the DEFAULT 160 should backfill, but a
+// migration 00123 ran (the DEFAULT 160 should backfill, but a
 // test or a manual psql that bypasses the default is a real
 // risk).
 func TestChoosePlacement_VCPUBudgetZeroExcluded(t *testing.T) {
