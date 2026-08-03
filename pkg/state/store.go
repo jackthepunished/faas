@@ -1859,6 +1859,17 @@ type Store interface {
 	// lower bound (zero-value passes the floor); limit is
 	// bounded to 1000 by the handler.
 	ListEventsByWakeID(ctx context.Context, wakeID string, since time.Time, limit int) ([]Event, error)
+	// ListEventsBySidecar (issue #463 / ADR-069 / PR-B) is the
+	// sidecar-aware read-side query for the customer-facing
+	// timeline endpoint. Filters on the jsonb expression
+	// data->>'sidecar_name' = $1 and the closed wake.kind IN
+	// ('wake.sidecar_init_exit', 'wake.sidecar_restart') so a
+	// query never returns non-sidecar rows even if a future
+	// event reuses the field name. Orders by at ASC and respects
+	// the same since / limit contract as ListEventsByWakeID so
+	// the customer-facing timeline endpoint can chain the two
+	// queries under the same cursor.
+	ListEventsBySidecar(ctx context.Context, sidecarName string, since time.Time, limit int) ([]Event, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first

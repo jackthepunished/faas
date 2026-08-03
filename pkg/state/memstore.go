@@ -5166,6 +5166,52 @@ func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since ti
 	return out, nil
 }
 
+// ListEventsBySidecar (issue #463 / ADR-069 / PR-B) is the
+// sidecar-aware read-side twin of ListEventsByWakeID. Filters on
+// the jsonb data.sidecar_name key AND the closed wake.kind IN
+// ('wake.sidecar_init_exit', 'wake.sidecar_restart') so a query
+// never returns non-sidecar rows even if a future event reuses
+// the field name. Orders by at ASC so the per-sidecar timeline
+// reads forward; respects the same since / limit contract as
+// ListEventsByWakeID.
+//
+// The kind filter is the load-bearing piece: a sidecar_name key
+// on a non-sidecar row would be silently returned without it,
+// which would surface an unrelated event in a sidecar's audit
+// view. Closed-enum filter matches the kind constants in
+// pkg/events/wake.go (WakeSidecarInitExit, WakeSidecarRestart).
+func (m *MemStore) ListEventsBySidecar(_ context.Context, sidecarName string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Event
+	for i := 0; i < len(m.events); i++ {
+		e := m.events[i]
+		if !e.At.After(since) {
+			continue
+		}
+		if e.Kind != "wake.sidecar_init_exit" && e.Kind != "wake.sidecar_restart" {
+			continue
+		}
+		var payload struct {
+			SidecarName string `json:"sidecar_name"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.SidecarName != sidecarName {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].At.Before(out[j].At)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // --- Usage ------------------------------------------------------------------
 
 // AppendUsage writes one (instance, minute) usage row and updates the

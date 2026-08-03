@@ -6438,6 +6438,66 @@ func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since t
 	return out, rows.Err()
 }
 
+// ListEventsBySidecar (issue #463 / ADR-069 / PR-B) is the
+// sidecar-aware read-side twin of ListEventsByWakeID. Filters on
+// the jsonb expression data->>'sidecar_name' AND the closed
+// kind IN ('wake.sidecar_init_exit', 'wake.sidecar_restart') so
+// the query never returns non-sidecar rows even if a future
+// event reuses the field name. Orders by at ASC; respects the
+// same since / limit contract as ListEventsByWakeID.
+//
+// Index: the existing events_wake_id_idx jsonb expression index
+// (migrations/00113_events_wake_id_idx.sql) covers
+// data->>'wake_id', NOT data->>'sidecar_name'. PR-B does not
+// add a parallel sidecar index — the kind filter is selective
+// enough that the planner picks an events_kind_at_idx scan and
+// the sidecar_name jsonb filter is applied as a residual. If
+// sidecar event volume climbs, a follow-up migration adds
+// events_sidecar_name_idx with the same shape as
+// events_wake_id_idx.
+func (s *PgStore) ListEventsBySidecar(ctx context.Context, sidecarName string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	// Closed kind enum — mirrors the constants in
+	// pkg/events/wake.go (WakeSidecarInitExit,
+	// WakeSidecarRestart). The closed list keeps the planner
+	// honest (an unknown kind won't quietly satisfy the
+	// filter) and matches the in-memory twin's filter in
+	// memstore.go.
+	const kindFilter = "kind in ('wake.sidecar_init_exit', 'wake.sidecar_restart')"
+	var rows pgx.Rows
+	var err error
+	if since.IsZero() {
+		rows, err = s.pool.Query(ctx,
+			`select id, at, actor, kind, subject, data from events
+			 where `+kindFilter+` and data->>'sidecar_name' = $1
+			 order by at asc limit $2`,
+			sidecarName, limit)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`select id, at, actor, kind, subject, data from events
+			 where `+kindFilter+` and data->>'sidecar_name' = $1 and at > $2
+			 order by at asc limit $3`,
+			sidecarName, since, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, err
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // --- usage -------------------------------------------------------------------
 
 func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {

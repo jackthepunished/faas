@@ -32,6 +32,8 @@ func TestWakeEvent_AllKindsImplementInterface(t *testing.T) {
 	var _ WakeEvent = BuildSucceeded{EmitAt: now, AppID: "a", DeploymentID: "d", ImageDigest: "sha256:abc", DurationMs: 12000}
 	var _ WakeEvent = BuildFailed{EmitAt: now, AppID: "a", DeploymentID: "d", ImageDigest: "sha256:abc", Reason: "compile"}
 	var _ WakeEvent = DeployFailed{EmitAt: now, AppID: "a", DeploymentID: "d", Reason: "scan"}
+	var _ WakeEvent = SidecarInitExit{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", SidecarName: "metrics", Status: "init_ok", ExitCode: 0, DurationMs: 42}
+	var _ WakeEvent = SidecarRestart{EmitAt: now, WakeID: "w", AppID: "a", InstanceID: "i", SidecarName: "metrics", Attempt: 1, PreviousExitCode: 137}
 }
 
 // TestQueueAccepted_Shape — the payload keys are the wire
@@ -99,5 +101,53 @@ func TestWakePhaseFromKind(t *testing.T) {
 		if got := wakePhaseFromKind(c.in); got != c.want {
 			t.Errorf("wakePhaseFromKind(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// TestSidecarInitExit_Shape — issue #463 / ADR-069 / PR-B. The
+// closed status enum ("init_ok" | "init_failed") is the load-bearing
+// field: schedd's "did init fail" decision reads status, not exit_code,
+// so the wire shape must stay stable. A typo on the status value
+// would silently regress AC #1 (init non-zero exit → user_error).
+func TestSidecarInitExit_Shape(t *testing.T) {
+	ev := SidecarInitExit{
+		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",
+		InstanceID: "i-1", SidecarName: "metrics", Status: "init_failed",
+		ExitCode: 1, DurationMs: 80,
+	}
+	if got := ev.Kind(); got != WakeSidecarInitExit {
+		t.Errorf("Kind = %q, want %q", got, WakeSidecarInitExit)
+	}
+	if got := ev.Payload()["sidecar_name"]; got != "metrics" {
+		t.Errorf("payload.sidecar_name = %v, want metrics", got)
+	}
+	if got := ev.Payload()["status"]; got != "init_failed" {
+		t.Errorf("payload.status = %v, want init_failed", got)
+	}
+	if got := ev.Payload()["exit_code"]; got != 1 {
+		t.Errorf("payload.exit_code = %v, want 1", got)
+	}
+	if got := ev.Payload()["duration_ms"]; got != int64(80) {
+		t.Errorf("payload.duration_ms = %v, want 80", got)
+	}
+}
+
+// TestSidecarRestart_Shape — issue #463 / ADR-069 / PR-B. Attempt
+// is 1-indexed; PreviousExitCode lets operators distinguish OOM
+// (137) from user_error (1) from signal-driven (-1) without
+// joining against the vmmd log.
+func TestSidecarRestart_Shape(t *testing.T) {
+	ev := SidecarRestart{
+		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",
+		InstanceID: "i-1", SidecarName: "metrics", Attempt: 2, PreviousExitCode: 137,
+	}
+	if got := ev.Kind(); got != WakeSidecarRestart {
+		t.Errorf("Kind = %q, want %q", got, WakeSidecarRestart)
+	}
+	if got := ev.Payload()["attempt"]; got != 2 {
+		t.Errorf("payload.attempt = %v, want 2", got)
+	}
+	if got := ev.Payload()["previous_exit_code"]; got != 137 {
+		t.Errorf("payload.previous_exit_code = %v, want 137", got)
 	}
 }
