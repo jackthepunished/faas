@@ -276,11 +276,26 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// fwdOnce); everything else is forwarded as-is. The body
 	// is NOT included — it streams in via the body-copy
 	// goroutine below.
+	//
+	// PR-C (issue #463 / ADR-069 / ADR-071 / PR-C §5): the
+	// per-request sidecar-port override (stamped by the
+	// handler when the routing-key resolver picks a sidecar)
+	// takes precedence over Target.Port. The handler can't
+	// mutate Target.Port on the per-target cursor (the
+	// target set is shared across all instances of a
+	// deployment), so the override rides the request context
+	// and the forwarder reads it here. Port=0 means "no
+	// override" — the forwarder falls back to Target.Port
+	// (the main workload's port).
+	port := uint32(t.Port)
+	if sidecarPort := SidecarPortFrom(r); sidecarPort != 0 {
+		port = uint32(sidecarPort)
+	}
 	init := &vmmdpb.ForwardHTTPRequestInit{
 		Instance:   r.Header.Get("x-faas-instance"),
 		Method:     r.Method,
 		RequestUri: r.URL.RequestURI(),
-		Port:       uint32(t.Port),
+		Port:       port,
 		Stream:     true,
 	}
 	for name, vals := range stripHopByHop(r.Header) {
