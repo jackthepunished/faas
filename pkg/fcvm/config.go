@@ -97,6 +97,11 @@ const (
 	DriveLayer         = "layer"      // legacy alias for DriveLayerMain
 	DriveLayerMain     = "layer-main" // PR-B canonical main workload drive id
 	DriveSidecarPrefix = "layer-sidecar-"
+	// WorkloadNameMain is the reserved name on WorkloadSpec.Name / .Type
+	// for the main workload. Sidecar names must not collide with it
+	// (buildWorkloadsForColdBoot rejects "main" with a host-side
+	// defence-in-depth; the apid gate is the user-facing surface).
+	WorkloadNameMain = "main"
 )
 
 // coldBootArgs is the kernel command line for a cold boot (spec §4.4: console

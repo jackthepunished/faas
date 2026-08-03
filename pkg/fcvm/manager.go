@@ -1284,8 +1284,8 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	if len(req.Sidecars) > 0 {
 		// Main workload manifest on drive1.
 		if err := m.vmm.StageWorkloadManifest(req.Instance, -1, WorkloadSpec{
-			Name:      "main",
-			Type:      "main",
+			Name:      WorkloadNameMain,
+			Type:      WorkloadNameMain,
 			RamMB:     req.MemSizeMiB,
 			Port:      req.Port,
 			Essential: true,
@@ -1309,7 +1309,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		// partial-failure on those doesn't leave the orchestrator
 		// with a roster pointing at non-existent drives.
 		mainSpec := WorkloadSpec{
-			Name: "main", Type: "main",
+			Name: WorkloadNameMain, Type: WorkloadNameMain,
 			RamMB: req.MemSizeMiB, Port: req.Port,
 			Essential: true,
 		}
@@ -1355,7 +1355,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		// customer pays for the plan RAM, not the +8 MB overhead).
 		// The +8 MB lives on the parent scope and is shared across
 		// all workload children.
-		if wErr := writeWorkloadCgroup(parentScope, "main", req.MemSizeMiB); wErr != nil {
+		if wErr := writeWorkloadCgroup(parentScope, WorkloadNameMain, req.MemSizeMiB); wErr != nil {
 			m.log.Warn("cgroup fence: writeWorkloadCgroup main failed, continuing",
 				"instance", req.Instance, "err", wErr)
 		}
@@ -2315,8 +2315,8 @@ func buildWorkloadsForColdBoot(req WakeRequest) []WorkloadSpec {
 	out := make([]WorkloadSpec, 0, 1+len(req.Sidecars))
 	// Workloads[0] is always the main workload.
 	out = append(out, WorkloadSpec{
-		Name:       "main",
-		Type:       "main",
+		Name:       WorkloadNameMain,
+		Type:       WorkloadNameMain,
 		StorageKey: req.LayerKey,
 		DriveID:    DriveLayerMain,
 		RamMB:      req.MemSizeMiB,
@@ -2324,7 +2324,7 @@ func buildWorkloadsForColdBoot(req WakeRequest) []WorkloadSpec {
 		Essential:  true,
 	})
 	for _, sc := range req.Sidecars {
-		if sc.Name == "main" {
+		if sc.Name == WorkloadNameMain {
 			continue
 		}
 		out = append(out, WorkloadSpec{
@@ -2366,7 +2366,7 @@ func workloadNamesFor(sidecars []WorkloadSpec) []string {
 		return nil
 	}
 	out := make([]string, 0, 1+len(sidecars))
-	out = append(out, "main")
+	out = append(out, WorkloadNameMain)
 	for _, sc := range sidecars {
 		out = append(out, sc.Name)
 	}
