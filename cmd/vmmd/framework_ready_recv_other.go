@@ -31,7 +31,13 @@ type FrameworkReadyReceiver struct {
 }
 
 // Close is a no-op on non-linux platforms.
-func (r *FrameworkReadyReceiver) Close() {}
+func (r *FrameworkReadyReceiver) Close() {
+	if r != nil {
+		_ = r.fd.Load()
+		_ = r.log
+		_ = r.mgr
+	}
+}
 
 // StartFrameworkReadyReceiver returns an error on non-linux
 // platforms. The cmd main() soft-fails on this path so the dev

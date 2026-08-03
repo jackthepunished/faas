@@ -15,3 +15,6 @@ import "log/slog"
 func startFrameworkReadyProxy(_ *slog.Logger) error {
 	return nil
 }
+
+var _ = startFrameworkReadyProxy
+
