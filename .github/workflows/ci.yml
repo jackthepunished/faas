@@ -768,10 +768,11 @@ jobs:
     # tick here as "coverage held".
     name: coverage (Codecov)
     runs-on: ubuntu-latest
-    # 20m to cover the -timeout=15m go test step (cmd/e2e under -race
-    # + coverage runs ~11-12 min; see memory cmd-e2e-coverage-timeout-
-    # edge.md) plus startup, dependency download, and upload overhead.
-    timeout-minutes: 20
+    # 25m to cover the -timeout=18m go test step (cmd/e2e under -race
+    # + coverage runs ~14-15 min after PR #541's themed apply tests;
+    # see memory cmd-e2e-coverage-timeout-edge.md) plus startup,
+    # dependency download, and upload overhead.
+    timeout-minutes: 25
     # OIDC for the Codecov upload. Codecov accepts a short-lived GitHub
     # OIDC token in place of a long-lived CODECOV_TOKEN for public repos
     # (per codecov-action's `use_oidc` input). This is the right path for
@@ -811,11 +812,13 @@ jobs:
           mkdir -p coverage
           # -covermode=atomic is required for accurate concurrency coverage;
           # standard idiom for any package exercising goroutines.
-          # -timeout=15m: ./cmd/e2e under -race + coverage races the 10m Go
-          # default ceiling (memory cmd-e2e-coverage-timeout-edge.md). The
+          # -timeout=18m: ./cmd/e2e under -race + coverage races the 10m Go
+          # default ceiling (memory cmd-e2e-coverage-timeout-edge.md). PR
+          # #541 added ~50 themed apply e2e tests, pushing the cumulative
+          # cmd/e2e wall past the previous 15m ceiling on this job. The
           # dedicated `e2e` job is the canonical gate; this profile only
           # needs to land the .out file for Codecov + the pkg/state gate.
-          go test -race -count=1 -timeout=15m -coverprofile=coverage/cover.out -covermode=atomic ./...
+          go test -race -count=1 -timeout=18m -coverprofile=coverage/cover.out -covermode=atomic ./...
 
       - name: pkg/state coverage gate
         # Re-runs the focused profile and fails the job if the package
@@ -1119,7 +1122,7 @@ jobs:
       FAAS_SKIP_PG_TESTS: ""
     name: e2e (cmd/e2e, no metal)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       # 2026-07-31: pre-pull postgres with 3-attempt retry (see
       # unit-tests job for the full backstory).

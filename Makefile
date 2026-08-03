@@ -83,14 +83,14 @@ proto-normalize: proto
 
 .PHONY: test
 test: ## Unit tests — must pass on any machine, no KVM needed.
-	# -timeout=15m: ./cmd/e2e under -race walks pkg/e2etest.buildApid
-	# per test (unique -o path → cache miss), landing ~11-12 min on a
-	# busy runner and racing Go's 10m default ceiling. The coverage job
-	# already pins -timeout=15m (PR #452, ci.yml coverage job); mirror
-	# here for the unit-tests job so PR #499's heavier merge payload no
-	# longer trips the structural ceiling on reruns. Memory:
+	# -timeout=18m: ./cmd/e2e under -race walks pkg/e2etest.buildApid
+	# per test (unique -o path → cache miss). PR #541 (apply-time build
+	# enqueue, ADR-068) added ~50 themed apply e2e tests, pushing the
+	# cumulative cmd/e2e wall past the previous 15m ceiling on the
+	# `unit tests` CI job. The dedicated `e2e (cmd/e2e, no metal)` job
+	# also bumped to 20m for the same reason. Memory:
 	# cmd-e2e-coverage-timeout-edge.md
-	$(GO) test -race -count=1 -timeout=15m $(PKGS)
+	$(GO) test -race -count=1 -timeout=18m $(PKGS)
 
 .PHONY: test-state-coverage
 test-state-coverage: ## Assert pkg/state coverage ≥ 70% (excluding generated pkg/state/sqlc/**). Needs DATABASE_URL pointing at a reachable Postgres; PgStore tests skip cleanly otherwise.
@@ -131,7 +131,11 @@ leakcheck: ## Assert zero leaked netns/TAPs/jail uids/cgroups after tests
 e2e: ## End-to-end tests in cmd/e2e (needs Postgres reachable; metal subset via test-metal). Issue M7.
 	@command -v psql >/dev/null 2>&1 || (echo "psql not on PATH; e2e needs DATABASE_URL set to a reachable Postgres" ; exit 1)
 	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set; set it to a reachable Postgres to run e2e" ; exit 1)
-	$(GO) test -race -count=1 -timeout=15m ./cmd/e2e/...
+	# -timeout=20m: PR #541 added ~50 themed apply e2e tests, each
+	# spawning `go build` for 7 daemons via pkg/e2etest.buildBinaries.
+	# Cumulative wall time hit 15m on CI; 20m gives headroom for
+	# reruns + cold-cache cold-runner edge cases.
+	$(GO) test -race -count=1 -timeout=20m ./cmd/e2e/...
 
 .PHONY: backup-pg
 backup-pg: ## Take a Postgres base backup into /var/lib/pgsql/basebackup/basebackup-<UTC>/ (spec §14 M8)
