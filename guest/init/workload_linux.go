@@ -159,6 +159,20 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		log = slog.Default()
 	}
 
+	// Defensive cap-2 enforcement (issue #463 / ADR-069 / PR-B
+	// review finding #2). The migrations 00118 + 00119 cap the
+	// per-deployment sidecar count at 2 server-side; guest-init
+	// re-asserts the same limit so a malformed /etc/faas/
+	// workloads.json (e.g. one stamped by an older vmmd, or a
+	// hand-crafted fixture in a metal test) can't trick the
+	// orchestrator into supervising more than 2 sidecars.
+	// Matches SidecarCapMax in pkg/api/limits.go — if the cap
+	// is ever raised, raise both constants together and update
+	// the unit test guest/init/workload_linux_test.go.
+	if len(roster.Sidecars) > 2 {
+		return fmt.Errorf("workload roster: deployment has %d sidecars; cap is 2 (ADR-069 §Decision 1)", len(roster.Sidecars))
+	}
+
 	// Step 1: run init sidecars sequentially (AC #1).
 	for i := range roster.Sidecars {
 		sc := roster.Sidecars[i]

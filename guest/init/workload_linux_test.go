@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -169,5 +170,33 @@ func TestSupervisor_LastErr_NilAndStored(t *testing.T) {
 	sup.trackRunErr(stored)
 	if got := sup.lastErr(); got != stored {
 		t.Errorf("after trackRunErr, lastErr = %v, want %v", got, stored)
+	}
+}
+
+// TestRunWorkloads_CapRejectsThreeSidecars pins the in-guest
+// cap-2 defensive check (PR-B review finding #2). The server-
+// side cap (migration 00119 trigger) rejects a 3rd row before
+// the roster is ever stamped; guest-init still re-asserts the
+// limit so a malformed /etc/faas/workloads.json (e.g. stamped
+// by an older vmmd, or hand-crafted for a metal test) can't
+// trick the orchestrator into supervising more than 2 sidecars.
+// The error must be returned BEFORE any exec.Command, so this
+// test uses an empty mainManifest — a real runWorkloads would
+// fail later, but the cap rejection must short-circuit first.
+func TestRunWorkloads_CapRejectsThreeSidecars(t *testing.T) {
+	roster := workloadRoster{
+		Main: workloadSpec{Name: "main", Type: "main", Essential: true},
+		Sidecars: []workloadSpec{
+			{Name: "metrics", Type: "sidecar", Essential: true},
+			{Name: "logger", Type: "sidecar", Essential: true},
+			{Name: "audit", Type: "sidecar", Essential: true},
+		},
+	}
+	err := runWorkloads(api.AppManifest{}, roster, nil, nil, nil)
+	if err == nil {
+		t.Fatal("runWorkloads with 3 sidecars: got nil, want cap rejection")
+	}
+	if !strings.Contains(err.Error(), "cap is 2") {
+		t.Errorf("runWorkloads error = %v, want cap-2 message", err)
 	}
 }
