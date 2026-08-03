@@ -25,10 +25,10 @@ import (
 func seedWarmEnabledApp(t *testing.T, e testEnv, slug string) {
 	t.Helper()
 	app, err := e.store.CreateApp(context.Background(), state.App{
-		AccountID:    e.acct.ID,
-		Slug:         slug,
-		Type:         state.AppTypeApp,
-		Status:       state.AppActive,
+		AccountID:           e.acct.ID,
+		Slug:                slug,
+		Type:                state.AppTypeApp,
+		Status:              state.AppActive,
 		WarmSnapshotEnabled: true,
 	})
 	if err != nil {
