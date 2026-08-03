@@ -74,6 +74,7 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 | 069 | Sidecar containers: init + metrics, hard cap 2 (JSONB on `deployments.sidecars`, stateless-only, envelope-sealed env, billing math `plan RAM + Σ(sidecar.ram_mb) + PerVMOverheadMB`) | proposed | issue #463 (PR A ships contract + storage; PR B wires runtime effect; PR C wires e2e + observability; ADR renumbered 066→067→068→069 post #542 merge) |
 | 070 | Tier A7 edge split (gatewayd-public / gatewayd-internal; in-process split per box, unix-socket hop, sticky-warm routing, central rate limits, cert replication by lex-min leader) | proposed | Tier A7 — the outer-edge tier that completes the multi-box migration started in ADR-062 (ADR renumbered 068→070 post #540/#543 collisions; PR #547) |
 | 071 | Warm-snapshot engine hot-path (Park captures warm + init in one appMu window; warm-only failure path destroys VM; sticky-on-downgrade) | proposed | issue #470 PR A (extends PR #525 data layer + PR #543 framework_ready signal; ADR slot 071 — slot 070 taken by Tier A7 post #547 merge) |
+| 072 | PR-C sidecar billing + observability + portnorm (closes issue #463: AC #1 init_failed emit, AC #3 restart counter, AC #4 OOM gate, AC #5 billing math consumer, AC #6 customer-image cmd, NEW routing-key portnorm) | proposed | issue #463 PR-C (ADR slot 072 — slot 071 taken by issue #470 PR A; closes the sidecar issue; supersedes nothing) |
 
 ADR-011 and ADR-012 are required by the UX spec (§11) before git-deploy work
 begins at M7.5; both landed on 2026-07-17 alongside the M7.5 PR open.
