@@ -2070,6 +2070,20 @@ func buildWorkloadsForColdBoot(req WakeRequest) []WorkloadSpec {
 	if len(req.Sidecars) == 0 {
 		return nil
 	}
+	// Reject any sidecar named "main" (PR-B review finding #3).
+	// The "main" leaf is reserved for the main workload (Workloads[0]
+	// below) — it doubles as the cgroup scope name under the
+	// per-instance scope (writeWorkloadCgroup) and as the
+	// guest-init orchestrator's filter key in runCharacterizationForSup
+	// (only the main supervisor's PID drives bind detection). A
+	// sidecar that shadows the name would either (a) collide on
+	// the cgroup mkdir path or (b) silently take over the
+	// characterize probe. apid's API gate (PR-A) blocks the same
+	// name on POST, but this is the host-side defence-in-depth so
+	// an older apid or a hand-crafted WakeRequest from a metal
+	// test cannot bypass it. We skip the offending sidecar so a
+	// single bad entry doesn't fail the whole deployment; the
+	// apid gate's error message is the user-facing surface.
 	out := make([]WorkloadSpec, 0, 1+len(req.Sidecars))
 	// Workloads[0] is always the main workload.
 	out = append(out, WorkloadSpec{
@@ -2082,6 +2096,9 @@ func buildWorkloadsForColdBoot(req WakeRequest) []WorkloadSpec {
 		Essential:  true,
 	})
 	for _, sc := range req.Sidecars {
+		if sc.Name == "main" {
+			continue
+		}
 		out = append(out, WorkloadSpec{
 			Name:       sc.Name,
 			Type:       sc.Type,
