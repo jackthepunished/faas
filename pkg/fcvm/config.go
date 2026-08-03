@@ -93,10 +93,10 @@ type Entropy struct{}
 // the overlayfs lowerdir stack is ordered base → main →
 // sidecar-1 → … → sidecar-N.
 const (
-	DriveBase           = "base"
-	DriveLayer          = "layer"     // legacy alias for DriveLayerMain
-	DriveLayerMain      = "layer-main" // PR-B canonical main workload drive id
-	DriveSidecarPrefix  = "layer-sidecar-"
+	DriveBase          = "base"
+	DriveLayer         = "layer"      // legacy alias for DriveLayerMain
+	DriveLayerMain     = "layer-main" // PR-B canonical main workload drive id
+	DriveSidecarPrefix = "layer-sidecar-"
 )
 
 // coldBootArgs is the kernel command line for a cold boot (spec §4.4: console
@@ -125,7 +125,7 @@ const coldBootArgs = "console=off reboot=k panic=1 pci=off quiet " +
 type ColdBootSpec struct {
 	KernelKey  string // StorageBackend key (e.g. "kernel/1.10.0")
 	BaseKey    string // StorageBackend key for drive0 shared ro base rootfs
-	LayerKey   string // StorageBackend key for drive1 per-app app layer
+	LayerKey   string // StorageBackend key for drive1 per-app app layer (legacy single-workload path)
 	VcpuCount  int    // 2, or 4 for Scale
 	MemSizeMiB int    // plan RAM
 	Tap        string // netns-side tap device (always "tap0")
@@ -136,6 +136,15 @@ type ColdBootSpec struct {
 	// accepts 2xx as ready. Forwarded from WakeRequest.HealthcheckPath
 	// by Manager.bringUp.
 	HealthcheckPath string
+	// Workloads (issue #463 / ADR-069 / PR-B) is the per-workload
+	// drive set. Non-empty → BootColdBoot emits one FC Drive per
+	// entry (in addition to the base drive); the manager threads
+	// Workloads[0] as the main workload's drive1 and
+	// Workloads[1..N] as sidecar drives. Empty = legacy
+	// single-workload path (LayerKey above), pre-PR-B callers.
+	// The base drive is always the first DriveID; Workloads do
+	// NOT replace it. Additive per ADR-016.
+	Workloads []WorkloadSpec
 }
 
 // BuildColdBootConfig assembles the Firecracker config for a cold boot. MMDS and
@@ -145,13 +154,69 @@ type ColdBootSpec struct {
 // It derives GuestVsockCID so the in-guest resume listener is reachable at a
 // globally unique vsock address (ADR-022). The Manager passes 0 when the slot
 // is not yet known (test seams); production always passes the real slot.
+//
+// Drive layout (issue #463 / ADR-069 / PR-B):
+//
+//   - DriveBase (drive0, RO, root): shared read-only base.
+//   - DriveLayerMain (drive1, RW): the main workload's drive1.
+//   - DriveSidecarPrefix + index (drive2..N, RO): sidecar drive1s.
+//
+// PR-B additive: when ColdBootSpec.Workloads is empty, the
+// legacy single-workload shape (DriveBase + DriveLayer) is
+// emitted unchanged. When Workloads is non-empty, the manager
+// pre-resolved the StorageBackend keys via materializeFromStorage
+// so PathOnHost already points at the staged tmp files (the
+// caller fills PathOnHost from BootColdBoot's resolution loop).
+//
+// Sidecar drives are read-only because each sidecar's per-workload
+// upper is the shared rw overlay (ADR-069 §"no shared writable
+// layer between workloads" — there is one upper for the whole
+// guest, and per-workload writes from main + sidecars coalesce
+// there; the load-bearing property is that no sidecar gets a
+// second writable layer it could use to escape quota accounting).
+// The main drive stays RW so the customer's container can
+// write to /tmp, install pip packages, etc.
 func BuildColdBootConfig(s ColdBootSpec, slot int) VMConfig {
+	drives := []Drive{
+		{DriveID: DriveBase, PathOnHost: s.BaseKey, IsRootDevice: true, IsReadOnly: true},
+	}
+	if len(s.Workloads) == 0 {
+		// Legacy single-workload path. DriveLayer is the
+		// alias for DriveLayerMain (see const block).
+		drives = append(drives, Drive{DriveID: DriveLayer, PathOnHost: s.LayerKey, IsRootDevice: false, IsReadOnly: false})
+	} else {
+		// PR-B: one drive per workload, in spec order.
+		// Workloads[0] is always the main workload
+		// (DriveLayerMain, RW); Workloads[1..N] are
+		// sidecars (DriveSidecarPrefix+idx, RO).
+		//
+		// BootColdBoot pre-resolves each StorageBackend key
+		// via materializeFromStorage and overwrites the
+		// StorageKey field with the staged tmp path before
+		// calling BuildColdBootConfig. Tests that bypass
+		// BootColdBoot (Boot with an already-resolved
+		// VMConfig) keep the StorageKey semantics intact
+		// — BuildColdBootConfig doesn't touch Storage.Get.
+		for i, w := range s.Workloads {
+			driveID := w.DriveID
+			if driveID == "" {
+				if i == 0 {
+					driveID = DriveLayerMain
+				} else {
+					driveID = fmt.Sprintf("%s%d", DriveSidecarPrefix, i-1)
+				}
+			}
+			drives = append(drives, Drive{
+				DriveID:      driveID,
+				PathOnHost:   w.StorageKey,
+				IsRootDevice: false,
+				IsReadOnly:   i != 0, // main RW; sidecars RO
+			})
+		}
+	}
 	return VMConfig{
-		BootSource: BootSource{KernelImagePath: s.KernelKey, BootArgs: coldBootArgs},
-		Drives: []Drive{
-			{DriveID: DriveBase, PathOnHost: s.BaseKey, IsRootDevice: true, IsReadOnly: true},
-			{DriveID: DriveLayer, PathOnHost: s.LayerKey, IsRootDevice: false, IsReadOnly: false},
-		},
+		BootSource:        BootSource{KernelImagePath: s.KernelKey, BootArgs: coldBootArgs},
+		Drives:            drives,
 		MachineConfig:     Machine{VcpuCount: s.VcpuCount, MemSizeMib: s.MemSizeMiB, Smt: false},
 		NetworkInterfaces: []NetIface{{IfaceID: "eth0", HostDevName: s.Tap}},
 		Entropy:           &Entropy{},
@@ -171,14 +236,23 @@ func NewVsockDevice(slot int) *VsockDevice {
 }
 
 // Validate rejects a cold-boot spec that would produce a non-bootable VM.
+//
+// Issue #463 / ADR-069 / PR-B: LayerKey is optional when Workloads
+// is non-empty — the main workload's StorageBackend key lives on
+// Workloads[0].StorageKey instead. The legacy single-workload
+// path (no Workloads) still requires LayerKey; a mixed shape
+// (LayerKey + Workloads) is rejected because callers must not
+// specify the main workload twice.
 func (s ColdBootSpec) Validate() error {
 	switch {
 	case s.KernelKey == "":
 		return fmt.Errorf("fcvm: cold boot: empty kernel key")
 	case s.BaseKey == "":
 		return fmt.Errorf("fcvm: cold boot: empty base rootfs key")
-	case s.LayerKey == "":
+	case len(s.Workloads) == 0 && s.LayerKey == "":
 		return fmt.Errorf("fcvm: cold boot: empty app-layer key")
+	case len(s.Workloads) > 0 && s.LayerKey != "":
+		return fmt.Errorf("fcvm: cold boot: LayerKey must be empty when Workloads is set")
 	case s.VcpuCount < 1:
 		return fmt.Errorf("fcvm: cold boot: vcpu_count %d < 1", s.VcpuCount)
 	case s.MemSizeMiB < 1:

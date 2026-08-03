@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -111,6 +112,17 @@ type VMM interface {
 	// different path and the payload is plaintext-by-contract (no
 	// unseal step).
 	StageAPIEnv(instance string, jsonBlob []byte) error
+	// StageWorkloadManifest (issue #463 / ADR-069 / PR-B) writes
+	// /etc/faas/workload.json on a workload's drive so guest-init
+	// can fork/exec the workload under the right supervisor. Pass
+	// driveIdx = -1 for the main workload (drive1); pass 0..N-1
+	// for sidecar drives in the order schedd sent them on the
+	// wake wire. The call MUST be before the VM is exposed to
+	// the customer (the manifest is read by guest-init during
+	// its first boot phase); implementations MUST treat a
+	// missing drive file as a contract violation and error
+	// out (the VM cannot boot without the manifest).
+	StageWorkloadManifest(instance string, driveIdx int, w WorkloadSpec) error
 	// LogRing returns the per-instance ring buffer of the running VM's
 	// stdout/stderr stream (issue #254, Move 4), or nil if instance is
 	// not alive on this vmmd. The vmmd gRPC Logs(req) handler dials this
@@ -229,6 +241,20 @@ type Instance struct {
 	// can resolve Instance.HealthcheckPath without a second request
 	// lookup (PR-C mirror).
 	HealthcheckPath string
+
+	// WorkloadNames (issue #463 / ADR-069 / PR-B) is the set of
+	// workload names whose cgroup child scopes vmmd wrote under
+	// the per-instance scope at Wake time. Nil/empty = legacy
+	// single-workload path (no child scopes exist). The set
+	// starts with "main" and appends each sidecar name in
+	// stability order (the order schedd sent in WakeRequest.
+	// Sidecars). Captured so cleanup() can remove the child
+	// scopes BEFORE the parent scope (which vmm.Kill does via
+	// os.RemoveAll). The kernel cascade-removes children when
+	// the parent goes away, but on a slow controller the parent
+	// removal can race with leakcheck; the explicit pre-remove
+	// shortens the leak window.
+	WorkloadNames []string
 
 	// Characterization (ADR-051 Phase 4 / PR-D) is the
 	// CharacterizationReport the host received via
@@ -827,6 +853,12 @@ type ColdBootRequest struct {
 	// that wants to invoke ColdBoot without going through WakeRequest
 	// shouldn't have to drop a field.
 	HealthcheckPath string
+	// Sidecars (issue #463 / ADR-069 / PR-B) is the per-workload
+	// sidecar wire forwarded to WakeRequest.Sidecars. Empty =
+	// legacy single-workload path. See WakeRequest.Sidecars for
+	// the contract. Same symmetry rationale as Port /
+	// HealthcheckPath / EgressAllowlist above.
+	Sidecars []WorkloadSpec
 }
 
 // ColdBoot boots an instance from rootfs with no snapshot. It is Wake with a nil
@@ -846,6 +878,11 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		// readiness probe path so Wake stamps it onto the live
 		// Instance. Empty = legacy TCP-accept on :8080.
 		HealthcheckPath: req.HealthcheckPath,
+		// Issue #463 / ADR-069 / PR-B: forward the per-workload
+		// sidecar wire so Wake threads each entry into the
+		// per-workload drive + cgroup + manifest stage. Empty
+		// = legacy single-workload path.
+		Sidecars: req.Sidecars,
 	})
 }
 
@@ -877,7 +914,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		if err != nil {
 			m.cleanup(context.WithoutCancel(ctx), lease, netns.NewConfig(
 				lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP,
-			))
+			), nil)
 		}
 	}()
 	nc := netns.NewConfig(lease.Instance, lease.Netns, lease.VethHost, lease.VethPeer, lease.HostIP)
@@ -1005,6 +1042,44 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		}
 	}
 
+	// Issue #463 / ADR-069 / PR-B: per-workload manifest staging.
+	// Each sidecar drive (and the main drive1) gets a
+	// /etc/faas/workload.json written with the workload's name,
+	// type, ram_mb, port, and essential flag. Guest-init reads
+	// these at boot to fork/exec the workload under the right
+	// supervisor. The main drive's manifest is redundant with
+	// the customer-supplied app.json (the legacy single-workload
+	// path) but writing it makes guest-init's "all workloads are
+	// uniform" code path identical for both shapes — there is
+	// NO legacy fast path inside guest-init that skips the
+	// manifest read when Workloads[0] is the only entry.
+	//
+	// Sidecar drive indices are 0-based; the drive slot
+	// BuildColdBootConfig emits is fmt.Sprintf("%s%d",
+	// DriveSidecarPrefix, idx) for the (idx+1)-th workload, so
+	// index 0 in the sidecar slice = "layer-sidecar-0" in the
+	// FC config. The in-chroot basename is the constant
+	// sidecarDriveImageName(0) = "sidecar-0.ext4".
+	if len(req.Sidecars) > 0 {
+		// Main workload manifest on drive1.
+		if err := m.vmm.StageWorkloadManifest(req.Instance, -1, WorkloadSpec{
+			Name:      "main",
+			Type:      "main",
+			RamMB:     req.MemSizeMiB,
+			Port:      req.Port,
+			Essential: true,
+		}); err != nil {
+			return nil, fmt.Errorf("wake %s: stage main workload manifest: %w", req.Instance, err)
+		}
+		// Sidecar manifests, one per sidecar in stability order.
+		for i, sc := range req.Sidecars {
+			if err := m.vmm.StageWorkloadManifest(req.Instance, i, sc); err != nil {
+				return nil, fmt.Errorf("wake %s: stage sidecar %d (%s) workload manifest: %w",
+					req.Instance, i, sc.Name, err)
+			}
+		}
+	}
+
 	// cgroup fence (spec §4.4 / issue #301 / ADR-044) — written AFTER
 	// bringUp returns because the scope is created by jailer during
 	// Boot/Restore and does not exist before then. writePlanCgroup
@@ -1023,6 +1098,37 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"instance", req.Instance, "plan", req.Plan, "err", err)
 	}
 
+	// Issue #463 / ADR-069 / PR-B: per-workload cgroup scopes. The
+	// parent scope (writePlanCgroup above) holds the plan ceiling; we
+	// carve one child scope per workload with memory.max = workload's
+	// ram_mb. The host-side firecracker process stays in the parent
+	// scope (jailer's --cgroup arg); the child scopes are defense-in-
+	// depth leaves that the kernel cascade-removes when vmm.Kill
+	// removes the parent. The PRIMARY OOM isolation happens inside
+	// the guest (guest-init's per-workload cgroup partition); this
+	// host-side layer is a second line of defense for the host's
+	// firecracker process and a per-workload memory.failcnt triage
+	// signal. Same "warn + continue" posture as writePlanCgroup
+	// because the VM is already up and leaking a host-side cap is
+	// strictly better than failing the wake.
+	if len(req.Sidecars) > 0 {
+		parentScope := filepath.Join(cgroupRoot, ParentCgroupFor(req.Plan), PerInstanceScope(req.Instance))
+		// Main workload: matches the per-instance memory.max (the
+		// customer pays for the plan RAM, not the +8 MB overhead).
+		// The +8 MB lives on the parent scope and is shared across
+		// all workload children.
+		if wErr := writeWorkloadCgroup(parentScope, "main", req.MemSizeMiB); wErr != nil {
+			m.log.Warn("cgroup fence: writeWorkloadCgroup main failed, continuing",
+				"instance", req.Instance, "err", wErr)
+		}
+		for _, sc := range req.Sidecars {
+			if wErr := writeWorkloadCgroup(parentScope, sc.Name, sc.RamMB); wErr != nil {
+				m.log.Warn("cgroup fence: writeWorkloadCgroup sidecar failed, continuing",
+					"instance", req.Instance, "sidecar", sc.Name, "err", wErr)
+			}
+		}
+	}
+
 	// ADR-051 Phase 4 / PR-D: on cold boot, gate the wake on the
 	// characterization report. The guest dials host CID 2 at port
 	// 1026 with the report framed as [4B msg_type=3][4B body_len][JSON].
@@ -1039,7 +1145,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"port_norm_mode", report.PortNormalizationMode)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, Characterization: report}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and
@@ -1119,6 +1225,12 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 			// waitReady does HTTP GET <HealthcheckPath> against
 			// <HostIP>:8080 and accepts 2xx as ready.
 			HealthcheckPath: req.HealthcheckPath,
+			// Issue #463 / ADR-069 / PR-B: per-workload drives
+			// (main + sidecars). Empty = legacy single-workload
+			// path. Non-empty → Restore stages one extra drive
+			// per entry (read-only for sidecars, read-write for
+			// the main workload's drive1). Additive per ADR-016.
+			Workloads: buildWorkloadsForRestore(req),
 		}
 		if rErr := m.vmm.Restore(ctx, lease, rs); rErr == nil {
 			return WakeRestore, nil
@@ -1147,9 +1259,17 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 	}
 
 	spec := ColdBootSpec{
-		KernelKey:  m.paths.Kernel,
-		BaseKey:    req.BaseKey,
-		LayerKey:   req.LayerKey,
+		KernelKey: m.paths.Kernel,
+		BaseKey:   req.BaseKey,
+		// LayerKey is the legacy single-workload path. When
+		// Workloads is non-empty (PR-B / sidecars present),
+		// buildWorkloadsForColdBoot copies req.LayerKey into
+		// Workloads[0].StorageKey; spec.LayerKey must be empty
+		// here so the ColdBootSpec.Validate() "LayerKey must be
+		// empty when Workloads is set" check doesn't reject
+		// the spec. The Validate contract is the load-bearing
+		// guard against double-spec'ing the main workload.
+		LayerKey:   layerKeyForColdBoot(req),
 		VcpuCount:  req.VcpuCount,
 		MemSizeMiB: req.MemSizeMiB,
 		Tap:        nc.Tap,
@@ -1159,6 +1279,11 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		// waitReady does HTTP GET <HealthcheckPath> against
 		// <HostIP>:8080 and accepts 2xx as ready.
 		HealthcheckPath: req.HealthcheckPath,
+		// Issue #463 / ADR-069 / PR-B: per-workload drives
+		// (main + sidecars). buildWorkloadsForColdBoot emits an
+		// empty slice on the legacy single-workload path so
+		// BootColdBoot falls through to the LayerKey branch.
+		Workloads: buildWorkloadsForColdBoot(req),
 	}
 	if err := m.vmm.BootColdBoot(ctx, lease, spec); err != nil {
 		return WakeColdBoot, fmt.Errorf("wake %s: cold boot: %w", req.Instance, err)
@@ -1254,7 +1379,7 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	m.mu.Lock()
 	delete(m.live, instance)
 	m.mu.Unlock()
-	m.cleanup(ctx, inst.Lease, inst.Net)
+	m.cleanup(ctx, inst.Lease, inst.Net, inst.WorkloadNames)
 	m.log.Info("parked", "instance", instance, "mem_bytes", info.MemBytes)
 	return info, nil
 }
@@ -1299,7 +1424,7 @@ func (m *Manager) DestroyWithExport(ctx context.Context, instance, exportDir str
 	// mid-Destroy leaves the netns + cgroup on disk; observed on the Lima
 	// arm64 metal path where nested-KVM cold boot can take >25s. The vmm wait
 	// above used the original ctx and is allowed to be cancelled by it.
-	m.cleanup(context.WithoutCancel(ctx), inst.Lease, inst.Net)
+	m.cleanup(context.WithoutCancel(ctx), inst.Lease, inst.Net, inst.WorkloadNames)
 	m.mu.Lock()
 	delete(m.exportDirs, instance)
 	m.mu.Unlock()
@@ -1866,7 +1991,19 @@ func listChainHandles(ctx context.Context, cap CaptureRunner, netnsName, family,
 // cleanup is the unwind path: best-effort kill the VM, best-effort tear down the
 // network, and always release the lease. Errors are logged, never returned — a
 // cleanup that gives up would leak.
-func (m *Manager) cleanup(ctx context.Context, lease Lease, nc netns.Config) {
+func (m *Manager) cleanup(ctx context.Context, lease Lease, nc netns.Config, workloadNames []string) {
+	// Issue #463 / ADR-069 / PR-B: tear down per-workload cgroup child
+	// scopes BEFORE vmm.Kill removes the parent scope. The kernel
+	// cascade-removes children when the parent goes, but the parent
+	// removal needs cgroup.procs to be empty in the parent first;
+	// reaping the workload children explicitly shortens the leak
+	// window for a `make leakcheck` run that immediately follows
+	// cleanup. Best-effort: children with EBUSY are logged and
+	// swallowed (same posture as vmm.Kill's parent removal below).
+	if len(workloadNames) > 0 {
+		parentScope := filepath.Join(cgroupRoot, ParentCgroupFor(lease.Plan), PerInstanceScope(lease.Instance))
+		removeWorkloadCgroups(parentScope, workloadNames)
+	}
 	if err := m.vmm.Kill(ctx, lease); err != nil {
 		m.log.Warn("cleanup: kill vm", "instance", lease.Instance, "err", err)
 	}
@@ -1888,3 +2025,90 @@ func (m *Manager) cleanup(ctx context.Context, lease Lease, nc netns.Config) {
 type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
+
+// buildWorkloadsForColdBoot (issue #463 / ADR-069 / PR-B)
+// assembles the per-workload drive slice cold-boot stages.
+// Returns nil when WakeRequest.Sidecars is empty so BootColdBoot
+// falls through to the legacy single-workload path (LayerKey);
+// otherwise returns [main, sidecar-1, …, sidecar-N] where
+// the main workload's StorageKey is taken from req.LayerKey.
+//
+// The drive-slot suffix uses DriveSidecarPrefix + index so
+// guest-init's overlay assembly can key off it; the per-
+// workload cgroup (PR-B's nested scope) uses WorkloadSpec.Name
+// as the leaf directory under the instance cgroup.
+func buildWorkloadsForColdBoot(req WakeRequest) []WorkloadSpec {
+	if len(req.Sidecars) == 0 {
+		return nil
+	}
+	out := make([]WorkloadSpec, 0, 1+len(req.Sidecars))
+	// Workloads[0] is always the main workload.
+	out = append(out, WorkloadSpec{
+		Name:       "main",
+		Type:       "main",
+		StorageKey: req.LayerKey,
+		DriveID:    DriveLayerMain,
+		RamMB:      req.MemSizeMiB,
+		Port:       req.Port,
+		Essential:  true,
+	})
+	for _, sc := range req.Sidecars {
+		out = append(out, WorkloadSpec{
+			Name:       sc.Name,
+			Type:       sc.Type,
+			StorageKey: sc.StorageKey,
+			DriveID:    sc.DriveID, // imaged populated this on the wire
+			RamMB:      sc.RamMB,
+			Port:       sc.Port,
+			Essential:  sc.Essential,
+		})
+	}
+	return out
+}
+
+// buildWorkloadsForRestore is the wake-restore twin of
+// buildWorkloadsForColdBoot (issue #463 / ADR-069 / PR-B).
+// The cold-boot helper derives Workloads from req.LayerKey +
+// req.Sidecars; the restore twin must use the SAME shape so
+// the per-workload drive ordering matches across first-boot
+// and every subsequent wake. Future restore-side state
+// (snapshot hash, etc.) should be threaded here when PR-C
+// wires the snapshot-blob-per-workload invariant.
+func buildWorkloadsForRestore(req WakeRequest) []WorkloadSpec {
+	return buildWorkloadsForColdBoot(req)
+}
+
+// workloadNamesFor (issue #463 / ADR-069 / PR-B) returns the
+// child-scope names that writeWorkloadCgroup populates under
+// the per-instance scope at Wake time. Returns nil (= legacy
+// single-workload path) when Sidecars is empty so the deferred
+// child-scope removal in cleanup is a no-op for pre-PR-B
+// callers. The ordering is "main" first, then sidecars in
+// req.Sidecars order; this matches the deduping order in
+// buildWorkloadsForColdBoot so the two helper outputs stay
+// in lockstep.
+func workloadNamesFor(sidecars []WorkloadSpec) []string {
+	if len(sidecars) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 1+len(sidecars))
+	out = append(out, "main")
+	for _, sc := range sidecars {
+		out = append(out, sc.Name)
+	}
+	return out
+}
+
+// layerKeyForColdBoot (issue #463 / ADR-069 / PR-B) returns the
+// LayerKey to stamp on the ColdBootSpec. Empty when Workloads
+// is non-empty so the spec's "LayerKey must be empty when
+// Workloads is set" Validate check accepts it; non-empty on
+// the legacy single-workload path so the BootColdBoot branch
+// that resolves spec.LayerKey runs unchanged. The two are
+// mutually exclusive — never both populated.
+func layerKeyForColdBoot(req WakeRequest) string {
+	if len(req.Sidecars) > 0 {
+		return ""
+	}
+	return req.LayerKey
+}

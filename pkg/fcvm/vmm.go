@@ -269,9 +269,26 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	if err != nil {
 		return fmt.Errorf("vmm: stage base: %w", err)
 	}
-	layerSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.LayerKey)
-	if err != nil {
-		return fmt.Errorf("vmm: stage layer: %w", err)
+	// Issue #463 / ADR-069 / PR-B: when Workloads is empty, the
+	// legacy single-workload path resolves spec.LayerKey once.
+	// When Workloads is non-empty, we resolve each workload's
+	// StorageBackend key in turn and overwrite the StorageKey
+	// field with the staged tmp path so BuildColdBootConfig's
+	// PathOnHost reads point at the chroot-basename tmp files.
+	if len(spec.Workloads) == 0 {
+		layerSrc, mErr := v.materializeFromStorage(ctx, l.Instance, spec.LayerKey)
+		if mErr != nil {
+			return fmt.Errorf("vmm: stage layer: %w", mErr)
+		}
+		spec.LayerKey = layerSrc
+	} else {
+		for i := range spec.Workloads {
+			resolved, mErr := v.materializeFromStorage(ctx, l.Instance, spec.Workloads[i].StorageKey)
+			if mErr != nil {
+				return fmt.Errorf("vmm: stage workload %d (%s): %w", i, spec.Workloads[i].Name, mErr)
+			}
+			spec.Workloads[i].StorageKey = resolved
+		}
 	}
 	// Build VMConfig from the resolved paths. Drive paths become the
 	// tmp paths so provision (line ~941) stages them as basenames.
@@ -279,7 +296,6 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	// caller (Manager) before Boot runs.
 	spec.KernelKey = kernelSrc
 	spec.BaseKey = baseSrc
-	spec.LayerKey = layerSrc
 	// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment override
 	// readiness probe path. Empty keeps the legacy TCP-accept on :8080
 	// (pre-PR-D default). Non-empty → waitReady does HTTP GET
@@ -439,8 +455,11 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// identical); for the OCI backend it's the streamed bytes. Tmp
 	// cleanup reuses trackMaterialised — already wired for the mem
 	// blob — so the Kill deferred above sweeps all three.
-	if spec.KernelKey == "" || spec.BaseKey == "" || spec.LayerKey == "" {
-		return fmt.Errorf("vmm: restore spec missing kernel/base/layer: %+v", spec)
+	if spec.KernelKey == "" || spec.BaseKey == "" {
+		return fmt.Errorf("vmm: restore spec missing kernel/base: %+v", spec)
+	}
+	if len(spec.Workloads) == 0 && spec.LayerKey == "" {
+		return fmt.Errorf("vmm: restore spec missing layer: %+v", spec)
 	}
 	kernelSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.KernelKey)
 	if err != nil {
@@ -450,9 +469,32 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err != nil {
 		return fmt.Errorf("vmm: stage base: %w", err)
 	}
-	layerSrc, err := v.materializeFromStorage(ctx, l.Instance, spec.LayerKey)
-	if err != nil {
-		return fmt.Errorf("vmm: stage layer: %w", err)
+	// Issue #463 / ADR-069 / PR-B: when Workloads is empty, the
+	// legacy single-workload path resolves spec.LayerKey once and
+	// stages it as the rw drive1. When Workloads is non-empty, we
+	// resolve each workload's StorageBackend key in turn and stage
+	// the resolved path as either rw (main, idx==0) or ro (sidecars).
+	var layerSrc string
+	resolvedWorkloads := make([]string, 0, len(spec.Workloads))
+	if len(spec.Workloads) == 0 {
+		layerSrc, err = v.materializeFromStorage(ctx, l.Instance, spec.LayerKey)
+		if err != nil {
+			return fmt.Errorf("vmm: stage layer: %w", err)
+		}
+	} else {
+		for i, w := range spec.Workloads {
+			resolved, mErr := v.materializeFromStorage(ctx, l.Instance, w.StorageKey)
+			if mErr != nil {
+				return fmt.Errorf("vmm: stage workload %d (%s): %w", i, w.Name, mErr)
+			}
+			resolvedWorkloads = append(resolvedWorkloads, resolved)
+			if i == 0 {
+				// Main workload — must be rw so the customer's
+				// container can write to /tmp etc. Sidecars go
+				// ro below.
+				layerSrc = resolved
+			}
+		}
 	}
 	if _, err := stageReadOnly(root, kernelSrc); err != nil {
 		return fmt.Errorf("vmm: stage kernel: %w", err)
@@ -465,6 +507,16 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if layerSrc != "" {
 		if _, err := stageWritable(root, layerSrc, l.UID, l.GID); err != nil {
 			return fmt.Errorf("vmm: stage layer: %w", err)
+		}
+	}
+	// PR-B: stage each sidecar drive as read-only (the upper/writable
+	// overlay is shared with main; sidecars never get their own rw
+	// path, which is the load-bearing invariant — a runaway sidecar
+	// cannot escape quota accounting by writing past its read-only
+	// boundary).
+	for i := 1; i < len(resolvedWorkloads); i++ {
+		if _, err := stageReadOnly(root, resolvedWorkloads[i]); err != nil {
+			return fmt.Errorf("vmm: stage sidecar %d: %w", i-1, err)
 		}
 	}
 
@@ -1103,6 +1155,36 @@ func (v *JailerVMM) exportBuildArtifacts(instance, exportDir string) error {
 // sees "layer.ext4").
 const layerImageName = "layer.ext4"
 
+// sidecarDriveImageName returns the in-chroot basename for a sidecar
+// drive at the given index (issue #463 / ADR-069 / PR-B). Index 0
+// is the first sidecar; the per-workload drive slot the boot
+// config PUTs to FC uses the same name, so the per-workload file
+// inside the chroot can be looked up without a side-channel
+// registry. The drive slot that BuildColdBootConfig emits is
+// fmt.Sprintf("%s%d", DriveSidecarPrefix, i-1) for the i-th
+// workload (i==0 is main); we drop the "layer-" prefix here so
+// the in-chroot file reads naturally as "sidecar-0.ext4" while
+// the FC drive ID is "layer-sidecar-0".
+func sidecarDriveImageName(idx int) string {
+	return fmt.Sprintf("sidecar-%d.ext4", idx)
+}
+
+// workloadManifestPath is the in-guest location guest-init reads to
+// discover a workload's runtime shape (issue #463 / ADR-069 / PR-B).
+// Each sidecar drive carries /etc/faas/workload.json (the manifest
+// the guest-init supervisor uses to fork/exec the workload). The
+// main workload's drive carries the same file at the same path so
+// guest-init can read all workloads uniformly; the main workload
+// invariant makes the manifest's type="main" / name="main" entries
+// redundant but stable. Image-side sealed env / plaintext env
+// continue to live at the older /etc/faas/secrets.env and
+// /etc/faas/env.json paths on drive1 (the main workload's drive)
+// — sidecar env is baked into the sidecar's ext4 at build time
+// by imaged (per PR-A's `app_secrets` + `app_envs` flow); the
+// wake-time env wire stays flat (no per-workload entries) so the
+// vmmd proto surface is unchanged.
+const workloadManifestPath = "etc/faas/workload.json"
+
 // secretsEnvPath is the in-guest location guest-init reads after pivot_root
 // (spec §11/G2). JSON-encoded envelope shape is documented on secretbox.Open.
 // The same file is written once per wake — overwriting any prior content —
@@ -1197,6 +1279,112 @@ func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 		return fmt.Errorf("write env.json: %w", err)
 	}
 	return nil
+}
+
+// StageWorkloadManifest (issue #463 / ADR-069 / PR-B) writes the
+// per-workload manifest at /etc/faas/workload.json on a sidecar's
+// drive. The manifest is the contract guest-init's supervisor reads
+// to fork/exec the workload, so it MUST land on every workload's
+// drive before the VM cold-boots. The main workload's drive also
+// gets the manifest stamped — guest-init reads all workloads
+// uniformly — but the main workload's manifest is the trivial
+// convenience case (cmd/port are the customer's app spec; named
+// fields are the customer's pinned values from the apps row).
+//
+// driveIdx is the 0-based sidecar index (0 for the first sidecar,
+// 1 for the second, etc.) — the same index BuildColdBootConfig
+// uses to derive the FC drive ID. For the main workload, pass
+// driveIdx = -1 and we'll point at drive1 (the legacy
+// single-workload path) instead of the sidecarLeaf naming convention.
+//
+// The drive is loopback-mounted rw, the file is written with mode
+// 0o400 (read-only for the in-guest workloads), and umount runs in
+// a defer. We capture the manifest's command list and port verbatim
+// from the WorkloadSpec that schedd sent on the wake wire; vmmd
+// trusts the wire as it trusts every other wake-field (the gRPC
+// server runs on a unix socket reachable only by the faas group;
+// ADR-014 / ADR-015).
+func (v *JailerVMM) StageWorkloadManifest(instance string, driveIdx int, w WorkloadSpec) error {
+	if driveIdx < 0 {
+		// Main workload: stamp on drive1 (the legacy path).
+		drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
+		return v.writeWorkloadManifest(drive1, w)
+	}
+	drive := filepath.Join(v.chrootBase, v.fcName, instance, sidecarDriveImageName(driveIdx))
+	return v.writeWorkloadManifest(drive, w)
+}
+
+// writeWorkloadManifest is the mount/umount/write helper
+// StageWorkloadManifest delegates to. Public so the test seam can
+// drive it directly without routing through a Manager. The
+// mountpoint is cleaned up by a deferred RemoveAll; the umount
+// runs in a defer so a failed write doesn't leak the mount.
+func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
+	if _, err := os.Stat(drive); err != nil {
+		return fmt.Errorf("stat workload drive: %w", err)
+	}
+	mp, err := os.MkdirTemp("", "faas-vmm-workload-")
+	if err != nil {
+		return fmt.Errorf("mkdir mountpoint: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(mp) }()
+	if out, err := exec.Command("mount", "-o", "loop,rw", drive, mp).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
+	}
+	defer func() { _ = exec.Command("umount", mp).Run() }()
+	// Marshal the manifest. encoding/json sorts map keys
+	// alphabetically so re-reads produce the same bytes; we don't
+	// need that contract here (guest-init parses each file once
+	// at boot) but the determinism is free.
+	manifest := workloadManifest{
+		Name:      w.Name,
+		Type:      w.Type,
+		RamMB:     w.RamMB,
+		Port:      w.Port,
+		Essential: w.Essential,
+		// StorageKey is omitted: the guest doesn't need to know
+		// the host-side path; it just reads the workload spec
+		// from the manifest and ignores the storage key. ADR-069
+		// §"Downstream" wording.
+	}
+	blob, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("marshal workload manifest: %w", err)
+	}
+	if int64(len(blob)) > api.MaxExportedLayerBytes {
+		// Defensive cap: a runaway manifest is a contract bug
+		// upstream (imaged should not produce one), but the
+		// cap here keeps a wild payload from filling the
+		// drive's 256 MB / 512 MB / 1 GB / 2 GB plan ceilings.
+		return fmt.Errorf("workload manifest %d bytes exceeds cap %d", len(blob), api.MaxExportedLayerBytes)
+	}
+	target := filepath.Join(mp, workloadManifestPath)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("mkdir etc/faas: %w", err)
+	}
+	if err := os.WriteFile(target, blob, 0o400); err != nil {
+		return fmt.Errorf("write workload.json: %w", err)
+	}
+	return nil
+}
+
+// workloadManifest is the on-disk shape of /etc/faas/workload.json
+// (issue #463 / ADR-069 / PR-B). The field set is the minimum
+// guest-init needs to fork/exec a workload: Name + Type for the
+// supervisor's map key, RamMB for the in-guest cgroup partition
+// (PR-B's primary OOM isolation), Port for the port-normalization
+// wiring (ADR-053), and Essential for the restart policy. Cmd is
+// left to the per-workload OVERLAY content (the sidecar image's
+// entrypoint) — the manifest is the vmmd-side envelope, not the
+// customer-supplied entrypoint. The guest-init reads the customer's
+// entrypoint from the image's own /etc/faas/app.json, which imaged
+// stencils at build time.
+type workloadManifest struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	RamMB     int    `json:"ram_mb"`
+	Port      int    `json:"port"`
+	Essential bool   `json:"essential"`
 }
 
 // exportMax resolves the per-export byte cap. Zero means "unset" — fall back

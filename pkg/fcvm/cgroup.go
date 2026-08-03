@@ -2,8 +2,10 @@ package fcvm
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -127,4 +129,116 @@ func writeMemoryMax(instance string, planMB int) error {
 	}
 	scope := filepath.Join(cgroupRoot, ParentCgroupRoot, PerInstanceScope(instance))
 	return writeMemoryMaxTo(scope, planMB)
+}
+
+// writeWorkloadCgroup (issue #463 / ADR-069 / PR-B) creates a child
+// cgroup scope under the per-instance scope with memory.max =
+// workload.RamMB. The parent scope's memory.max stays at the plan
+// ceiling (writePlanCgroup wrote it); the kernel evaluates the
+// innermost effective memory.max, so a sidecar child that hits
+// its cap is contained while the main workload's child stays
+// untouched.
+//
+// The child scope is a leaf — no processes are fork'd into it (the
+// firecracker process remains in the parent scope set by jailer,
+// and the guest's in-VM processes run inside the guest's own
+// cgroup namespace which is invisible to the host). The leaf
+// exists to enforce a defense-in-depth cap on the host-side
+// firecracker process and to track per-workload memory events
+// (memory.failcnt, memory.events) for triage. The AC #4 "sidecar
+// OOM doesn't kill main" guarantee is primarily enforced inside
+// the guest by guest-init's per-workload cgroup partition; the
+// host-side leaf is a second line of defense that matters when
+// the host-side firecracker process itself runs away.
+//
+// workloadName is the leaf directory name (e.g. "main",
+// "metrics", "logger"); we don't allow "/" or ".." in the name
+// because the path is constructed by filepath.Join and any
+// traversal would escape the parent scope. The defense is a
+// simple reject — there's no benign caller that needs a path
+// separator in a workload name.
+//
+// Idempotent: the same workloadName + ramMB pair produces a
+// no-op write. The scope path is removed by vmm.Kill's
+// os.RemoveAll(scopePath) on the parent, which cascades to
+// children (Parent's cgroup.procs is empty once firecracker is
+// reaped, so the kernel allows the child leaves to be removed).
+// The leaf may sit unattached for a few hundred ms during Kill;
+// that's fine — leakcheck is gate-time, not real-time.
+func writeWorkloadCgroup(parentScope, workloadName string, ramMB int) error {
+	if workloadName == "" {
+		return fmt.Errorf("fcvm: cgroup: workload name empty")
+	}
+	if strings.ContainsAny(workloadName, "/\\") || workloadName == "." || workloadName == ".." {
+		return fmt.Errorf("fcvm: cgroup: workload name %q contains path separator", workloadName)
+	}
+	if ramMB < 1 {
+		return fmt.Errorf("fcvm: cgroup: workload %q ramMB %d < 1", workloadName, ramMB)
+	}
+	childScope := filepath.Join(parentScope, workloadName)
+	if err := os.MkdirAll(childScope, 0o755); err != nil {
+		return fmt.Errorf("fcvm: cgroup: mkdir %s: %w", childScope, err)
+	}
+	// Write memory.max directly (NOT via writeMemoryMaxTo). The
+	// latter wraps input through BillableRAMMB which adds the
+	// +8 MB per-VM overhead; that overhead is allocated ONLY on
+	// the parent scope (it's the host-side firecracker process
+	// overhead, not a per-workload surcharge). Workloads' ram_mb
+	// is the billable RAM the customer paid for; adding +8 MB
+	// here would push the workload cap above the plan ceiling.
+	bytes := int64(ramMB) << 20
+	path := filepath.Join(childScope, "memory.max")
+	body := fmt.Sprintf("%d\n", bytes)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("fcvm: cgroup: child scope %s missing: %w", childScope, err)
+		}
+		return fmt.Errorf("fcvm: cgroup: write %s: %w", path, err)
+	}
+	return nil
+}
+
+// removeWorkloadCgroups removes every workload child scope under
+// the parent scope (issue #463 / ADR-069 / PR-B). Called by
+// vmm.Kill AFTER the per-instance scope's cgroup.procs has been
+// drained (the kernel cascade removes children automatically when
+// the parent is removed via os.RemoveAll, but on a controller
+// where the kernel hasn't yet flushed the parents's procs this
+// explicit pre-remove shortens the leakage window for leakcheck).
+//
+// The function is best-effort: a missing child is fine (already
+// removed by the kernel cascade), but a non-IsNotExist error is
+// logged + swallowed so the teardown chain doesn't fail on a
+// transient EBUSY. Returns the list of leaves that were
+// successfully removed so the structured-log path can include
+// the count without re-stat'ing the directory.
+func removeWorkloadCgroups(parentScope string, workloadNames []string) []string {
+	removed := make([]string, 0, len(workloadNames))
+	for _, name := range workloadNames {
+		if name == "" {
+			continue
+		}
+		child := filepath.Join(parentScope, name)
+		// Stat first so we can distinguish "was there, removed it"
+		// from "already gone, no-op". The latter is the expected
+		// shape on a second call (idempotent teardown) and on the
+		// kernel-cascade path (parent removal already swept the
+		// children). The structured-log "removed" list is reported
+		// back to the caller for triage; including already-gone
+		// names would inflate the count and obscure real signal.
+		if _, err := os.Stat(child); err != nil {
+			if !os.IsNotExist(err) {
+				slog.Default().Warn("cgroup workload scope stat failed; continuing teardown",
+					"path", child, "err", err)
+			}
+			continue
+		}
+		if err := os.RemoveAll(child); err != nil && !os.IsNotExist(err) {
+			slog.Default().Warn("cgroup workload scope remove failed; continuing teardown",
+				"path", child, "err", err)
+			continue
+		}
+		removed = append(removed, name)
+	}
+	return removed
 }
