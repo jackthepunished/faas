@@ -100,12 +100,22 @@ BEGIN
     -- Same query works for both because NEW carries the row's
     -- deployment_id whether we're inserting a fresh row or
     -- rewriting an existing one.
+    -- `current_count` is the number of rows for this deployment_id
+    -- ALREADY in the table at the time of this trigger call. We
+    -- reject the operation when the row count would exceed
+    -- SidecarCapMax (=2). Because the trigger fires BEFORE the
+    -- row is written, the post-insert count is current_count + 1
+    -- (INSERT) or unchanged (UPDATE that doesn't move the row to
+    -- a different deployment). We compare against the post-write
+    -- ceiling: if the existing count is already at or above
+    -- SidecarCapMax, refuse — that is, current_count >= 2 is a
+    -- hard reject, since adding another row would push us to 3.
     SELECT count(*) INTO current_count
         FROM deployment_sidecar_layers
         WHERE deployment_id = NEW.deployment_id;
 
-    IF current_count > 2 THEN
-        RAISE EXCEPTION 'deployment_sidecar_layers: deployment % exceeds the 2-row cap (count=%)',
+    IF current_count >= 2 THEN
+        RAISE EXCEPTION 'deployment_sidecar_layers: deployment % exceeds the 2-row cap (existing=%, new would make 3)',
             NEW.deployment_id, current_count
             USING ERRCODE = 'check_violation';
     END IF;
@@ -114,10 +124,26 @@ BEGIN
 END;
 $$;
 
-CREATE TRIGGER deployment_sidecar_layers_cap_trg
-    BEFORE INSERT OR UPDATE ON deployment_sidecar_layers
-    FOR EACH ROW
-    EXECUTE FUNCTION deployment_sidecar_layers_cap_check();
+-- Replay-safety: the trigger has no `IF NOT EXISTS` clause (Postgres
+-- 14+'s `CREATE OR REPLACE TRIGGER` was added in PG 14 but the project's
+-- minimum supported version is the same and a few pg_dump tools still
+-- emit the old form). Wrap in a DO block that checks pg_trigger
+-- first so a re-run on a DB that already has the trigger is a no-op.
+-- Matches the `00053_deployments_source_url.sql` DO-block-guarded
+-- constraint pattern (replay-safety_test.go). PR #377 / ADR-041
+-- contract.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'deployment_sidecar_layers_cap_trg'
+    ) THEN
+        CREATE TRIGGER deployment_sidecar_layers_cap_trg
+            BEFORE INSERT OR UPDATE ON deployment_sidecar_layers
+            FOR EACH ROW
+            EXECUTE FUNCTION deployment_sidecar_layers_cap_check();
+    END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS deployment_sidecar_layers_storage_key_idx
     ON deployment_sidecar_layers (storage_key);
