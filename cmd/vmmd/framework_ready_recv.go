@@ -178,13 +178,14 @@ func (r *FrameworkReadyReceiver) loop() {
 			continue
 		}
 		// Stamps the per-instance `framework_ready_at` clock
-		// and observes the warmup histogram. Use a fresh
-		// context.Background here: the DGRAM loop is
-		// long-lived and the receipt itself is fire-and-forget
-		// (no caller-derived deadline). Passing a nil ctx
-		// would crash the downstream stamper/SQL call (MED-1
-		// review feedback on PR #543).
-		stamped, appID, runtime, merr := r.mgr.MarkInstanceFrameworkReady(context.Background(), instance, msg.WarmupMs)
+		// and observes the warmup histogram. Pass the loop
+		// parameter ctx (not r.ctx) to the Manager call so
+		// the contextcheck lint recognizes it as the
+		// inherited context (r.ctx is the same value, but
+		// the lint is enforced on the parameter chain, not
+		// the struct field). MED-1 review feedback on PR
+		// #543.
+		stamped, appID, runtime, merr := r.mgr.MarkInstanceFrameworkReady(ctx, instance, msg.WarmupMs)
 		if merr != nil {
 			r.log.Warn("framework_ready manager call", "err", merr)
 			continue
