@@ -59,7 +59,7 @@ and per-sidecar gateway portnorm.
   types + `pkg/state.ListEventsBySidecar` read API.
 - `pkg/fcvm/sidecar_metal_test.go` metal tests
   (TestMetalSidecarBoot, TestMetalSidecarPortReachable,
-  TestMetalTwoSidecarsDistinctUUID).
+  TestMetalTwoSidecarsColdBoot).
 
 **Out of scope for PR-B (deferred to PR-C):**
 
@@ -211,7 +211,7 @@ and per-sidecar gateway portnorm.
   name-filter, limit cap, empty result.
 - `pkg/fcvm/sidecar_metal_test.go` (new) — `TestMetalSidecarBoot`,
   `TestMetalSidecarPortReachable`,
-  `TestMetalTwoSidecarsDistinctUUID`,
+  `TestMetalTwoSidecarsColdBoot`,
   `TestMetalSidecarOOMIsolation` (skipped, see Scope above).
 
 ## Acceptance criteria → commit map
@@ -235,7 +235,7 @@ and per-sidecar gateway portnorm.
 
 - `make test` — green across `pkg/`, `cmd/`, `guest/`.
 - `make test-metal` (EX44 only) — gates TestMetalSidecarBoot +
-  TestMetalSidecarPortReachable + TestMetalTwoSidecarsDistinctUUID.
+  TestMetalSidecarPortReachable + TestMetalTwoSidecarsColdBoot.
 - `make leakcheck` — child-first cgroup scope removal pattern
   keeps the per-instance scope clean after Destroy.
 - `make lint` — golangci-lint v2.4.0 + custom checks (per CLAUDE.md).

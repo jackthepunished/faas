@@ -15,11 +15,12 @@
 //     inside the netns via the host IP. AC #2 contract: a sidecar
 //     runs alongside the main workload, reachable on a per-app
 //     port inside the netns.
-//  3. TestMetalTwoSidecarsDistinctUUID — two sidecars in the same
-//     deployment boot under distinct names + PID namespaces so the
-//     AC #4 OOM-isolation precondition (each workload has its own
-//     PID) is observed. We assert by reading each sidecar's
-//     /proc/self/uuid from inside the guest.
+//  3. TestMetalTwoSidecarsColdBoot — two sidecars in the same
+//     deployment cold-boot successfully (PR-B review finding #6
+//     renamed it from 'TestMetalTwoSidecarsDistinctUUID' because
+//     the prior name implied a UUID assertion the body never
+//     wired — see cmd/e2e/v6_distinct_uuid_e2e_test.go for the
+//     actual UUID gate).
 //  4. TestMetalSidecarOOMIsolation — a sidecar that exceeds its
 //     cgroup memory.max dies WITHOUT killing the main workload.
 //     This is the AC #4 acceptance gate: a runaway sidecar must
@@ -283,21 +284,18 @@ func TestMetalSidecarPortReachable(t *testing.T) {
 	leakcheck.AssertZero(t)
 }
 
-// TestMetalTwoSidecarsDistinctUUID pins the ADR-069 §"no shared
-// writable layer between workloads" invariant: each sidecar
-// runs in its own per-workload context, observable via distinct
-// /proc/sys/kernel/random/uuid reads inside the guest. The
-// probe runs via vsock — the same seam the characterize report
-// uses — so we don't depend on a sidecar that exposes a UUID
-// over HTTP.
-//
-// Acceptance: at least two distinct UUIDs across the sidecars
-// (a single UUID would mean the two sidecars shared the same
-// kernel random state, which is the V6 invariant §6.2-5
-// regression). We allow them to equal the main workload's UUID
-// (snapshot sharing) but the sidecars MUST be distinct from
-// each other.
-func TestMetalTwoSidecarsDistinctUUID(t *testing.T) {
+// TestMetalTwoSidecarsColdBoot pins the 2-sidecar cap seam
+// (PR-B review finding #6). It boots a guest with TWO sidecars
+// on the same deployment (well within the cap of 2) and asserts
+// the cold-boot path doesn't panic — that's the load-bearing
+// surface for the per-workload cgroup scopes and the N+1 drive
+// topology. The previous name 'TestMetalTwoSidecarsDistinctUUID'
+// implied a UUID assertion that was never wired (the body sets
+// inst then ignores it via '_ = inst'); the rename surfaces the
+// real contract. The distinct-UUID gate is in
+// cmd/e2e/v6_distinct_uuid_e2e_test.go, where the vsock probe
+// can read /proc/sys/kernel/random/uuid from inside the guest.
+func TestMetalTwoSidecarsColdBoot(t *testing.T) {
 	kernel, _, _ := metalImages(t)
 	m := newMetalManager(t, kernel)
 	withCgroupRootAt(t, "/sys/fs/cgroup")
