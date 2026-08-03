@@ -78,11 +78,26 @@ type AppStore interface {
 	ListAppsByNodeID(ctx context.Context, nodeID string) ([]state.App, error)
 }
 
+// DeploymentStore is the per-deployment slice the trigger needs
+// (issue #557 closure / ADR-072). The per-deployment floor sweep
+// walks ListAllDeployments / ListDeploymentsByNodeID, reads the
+// parent app's floor via AppByID, and admits via
+// Engine.AdmitInstanceForDeployment.
+type DeploymentStore interface {
+	ListAllDeployments(ctx context.Context) ([]state.Deployment, error)
+	ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]state.Deployment, error)
+	AppByID(ctx context.Context, id string) (state.App, error)
+	ConcurrencyForDeployment(ctx context.Context, appID, deploymentID string) (int, error)
+}
+
 // Ledger is the read-only slice of NodeLedger the trigger needs.
 // Concurrency counts toward max_concurrency; ResidentRAM and
 // HeadroomMB back the §6.2-2 ceiling pre-check.
+// ConcurrencyForDeployment backs the per-deployment floor arithmetic
+// (issue #557 closure / ADR-072).
 type Ledger interface {
 	Concurrency(appID string) int
+	ConcurrencyForDeployment(appID, deploymentID string) int
 	ResidentRAM() int
 	HeadroomMB() int
 }
@@ -90,8 +105,12 @@ type Ledger interface {
 // Engine is the slice of sched.Engine the trigger needs. AdmitInstance
 // performs the full admission (per-app cap, cooldown, min-floor gate,
 // RAM ceiling §6.2-2, vCPU) — the caller does NOT pre-check.
+// AdmitInstanceForDeployment is the per-deployment entry point
+// used by the per-deployment sweep (issue #557 closure / ADR-072);
+// its `deploymentID` is required, not optional.
 type Engine interface {
 	AdmitInstance(ctx context.Context, appID string) (AdmitResult, error)
+	AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (AdmitResult, error)
 }
 
 // Auditor is the seam the trigger uses to emit `floor.wake` audit
@@ -204,15 +223,16 @@ type backoffEntry struct {
 // via New(); the only public methods are Tick, Interval, and
 // WithOwnerNodeID.
 type Trigger struct {
-	appStore     AppStore
-	ledger       Ledger
-	engine       Engine
-	auditor      Auditor
-	planResolver PlanResolver
-	metrics      *wire.OpsMetrics
-	log          *slog.Logger
-	interval     time.Duration
-	ownerNodeID  string
+	appStore       AppStore
+	deploymentStore DeploymentStore
+	ledger          Ledger
+	engine          Engine
+	auditor         Auditor
+	planResolver    PlanResolver
+	metrics         *wire.OpsMetrics
+	log             *slog.Logger
+	interval        time.Duration
+	ownerNodeID     string
 
 	// mu guards the per-app backoff map. Read paths in Tick take
 	// the lock once per app, holding it just long enough to copy
@@ -237,7 +257,13 @@ type Options struct {
 // that path). This is the load-bearing property that lets schedd
 // wire the trigger before every downstream dependency is fully
 // online.
-func New(appStore AppStore, ledger Ledger, engine Engine, opts Options) *Trigger {
+//
+// deploymentStore is optional: when nil, the trigger falls back to
+// the per-app-only walk (pre-#557 posture) and ignores per-deployment
+// floors. The per-deployment axis is the issue #557 closure / ADR-072
+// addition; the one-box deploy shape that doesn't carry per-deployment
+// floors can pass nil and keep the legacy behaviour.
+func New(appStore AppStore, deploymentStore DeploymentStore, ledger Ledger, engine Engine, opts Options) *Trigger {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -245,15 +271,16 @@ func New(appStore AppStore, ledger Ledger, engine Engine, opts Options) *Trigger
 		opts.Interval = api.FloorDecisionIntervalSeconds * time.Second
 	}
 	return &Trigger{
-		appStore:     appStore,
-		ledger:       ledger,
-		engine:       engine,
-		auditor:      opts.Auditor,
-		planResolver: opts.PlanResolver,
-		metrics:      opts.Metrics,
-		log:          opts.Logger,
-		interval:     opts.Interval,
-		backoff:      map[string]*backoffEntry{},
+		appStore:       appStore,
+		deploymentStore: deploymentStore,
+		ledger:          ledger,
+		engine:          engine,
+		auditor:         opts.Auditor,
+		planResolver:    opts.PlanResolver,
+		metrics:         opts.Metrics,
+		log:             opts.Logger,
+		interval:        opts.Interval,
+		backoff:         map[string]*backoffEntry{},
 	}
 }
 
@@ -358,13 +385,166 @@ func (t *Trigger) recordFailure(appID string) {
 // calls. Returns nil on success; errors are logged inside the loop
 // (the trigger never aborts the loop on a transient store outage).
 //
-// The trigger is read-only on the apps table; the only side effect
-// is the Engine.AdmitInstance call on the admit branch and the
-// metric observations. AdmitInstance is the same path the gateway
-// uses on a request-driven wake, so the trigger cannot bypass the
-// cap.
+// The trigger is read-only on the apps + deployments tables; the
+// only side effect is the Engine.AdmitInstance / AdmitInstanceForDeployment
+// call on the admit branch and the metric observations. AdmitInstance
+// is the same path the gateway uses on a request-driven wake, so
+// the trigger cannot bypass the cap.
+//
+// Issue #557 closure / ADR-072 — the sweep walks the deployment list
+// when deploymentStore is wired. The unit of admission is now the
+// (app, deployment) pair; the per-app axis (apps with no deployment
+// floor) is honored via the floor-met shortcut (every deployment
+// at floor → app is at floor). The per-app shortcut is preserved
+// for legacy callers that don't wire deploymentStore.
 func (t *Trigger) Tick(ctx context.Context) error {
-	if t == nil || t.appStore == nil {
+	if t == nil {
+		return nil
+	}
+	// Per-deployment walk is the issue #557 closure path. Legacy
+	// callers (no deploymentStore wired) fall through to the per-app
+	// walk below.
+	if t.deploymentStore != nil {
+		return t.tickPerDeployment(ctx)
+	}
+	return t.tickPerApp(ctx)
+}
+
+// tickPerDeployment is the per-(app, deployment) floor sweep. For
+// each deployment, compute the effective floor =
+// `max(app.EffectiveMinInstances(), d.EffectiveMinInstances())` and
+// admit up to that floor.
+func (t *Trigger) tickPerDeployment(ctx context.Context) error {
+	var deps []state.Deployment
+	var err error
+	if t.ownerNodeID != "" {
+		deps, err = t.deploymentStore.ListDeploymentsByNodeID(ctx, t.ownerNodeID)
+	} else {
+		deps, err = t.deploymentStore.ListAllDeployments(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("floor: list deployments: %w", err)
+	}
+	now := time.Now()
+	var residentRAM, headroom int
+	if t.ledger != nil {
+		residentRAM = t.ledger.ResidentRAM()
+		headroom = t.ledger.HeadroomMB()
+	}
+	for _, d := range deps {
+		app, appErr := t.deploymentStore.AppByID(ctx, d.AppID)
+		if appErr != nil {
+			t.observe(d.AppID, OutcomeError)
+			continue
+		}
+		effective := app.EffectiveMinInstances()
+		if dFloor := d.EffectiveMinInstances(); dFloor > effective {
+			effective = dFloor
+		}
+		if effective <= 0 {
+			t.observe(d.AppID, OutcomeDisabled)
+			continue
+		}
+		plan := api.PlanFree
+		if t.planResolver != nil {
+			if resolved, ok := t.planResolver.ResolvePlan(ctx, app.AccountID); ok {
+				plan = resolved
+			}
+		}
+		if !plan.MinInstancesAllowed() {
+			t.observe(d.AppID, OutcomeDisabled)
+			continue
+		}
+		if app.WorkloadClass == state.WorkloadClassWorker {
+			t.observe(d.AppID, OutcomeDisabled)
+			continue
+		}
+		var conc int
+		if t.ledger != nil {
+			conc = t.ledger.ConcurrencyForDeployment(d.AppID, d.ID)
+		}
+		if conc >= effective {
+			t.observe(d.AppID, OutcomeFloorMet)
+			continue
+		}
+		if conc >= effectiveMaxConcurrency(app, plan) {
+			t.observe(d.AppID, OutcomeAtCapacity)
+			continue
+		}
+		// RAM ceiling pre-check (same as tickPerApp).
+		isRamCeiling := false
+		if t.ledger != nil && api.BillableRAMMB(app.RAMMB) > headroom {
+			isRamCeiling = true
+		}
+		var lastScaleOut time.Time
+		if app.LastScaleOutAt != nil {
+			lastScaleOut = *app.LastScaleOutAt
+		}
+		stats := AppStats{
+			AppID:             d.AppID,
+			AccountID:         app.AccountID,
+			Plan:              plan,
+			Floor:             effective,
+			Concurrency:       conc,
+			MaxConcurrency:    effectiveMaxConcurrency(app, plan),
+			ResidentRAMMB:     residentRAM,
+			HeadroomMB:        headroom,
+			RAMMB:             app.RAMMB,
+			WorkloadClass:     app.WorkloadClass,
+			LastScaleOutAt:    lastScaleOut,
+			ScaleOutCooldownS: scalingOutCooldownS(app),
+			Now:               now,
+			BackoffUntil:      t.peekBackoff(d.AppID),
+			IsRamCeiling:      isRamCeiling,
+		}
+		decision := decide(stats)
+		t.observe(d.AppID, decision.Outcome)
+		if !decision.AdmitNow {
+			continue
+		}
+		result, err := t.engine.AdmitInstanceForDeployment(ctx, d.AppID, d.ID)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
+			t.recordFailure(d.AppID)
+			t.observeError(d.AppID, "admit_error")
+			t.log.Warn("floor: per-deployment admit error",
+				"app", d.AppID, "deployment", d.ID, "err", err)
+			continue
+		}
+		t.recordSuccess(d.AppID)
+		if result.AtCapacity {
+			t.observe(d.AppID, OutcomeAtCapacity)
+			continue
+		}
+		t.incAdmitted()
+		if t.auditor != nil {
+			acctID := app.AccountID
+			// Dual-emit (ADR-072 §Decision 6): the issue AC names
+			// `instances.warmed_min_instances`; the original PR #618
+			// shipped `floor.wake`. Both kinds are emitted for one
+			// release as a compat layer. The follow-up PR drops
+			// `floor.wake`.
+			payload := map[string]any{
+				"app_id":             d.AppID,
+				"deployment_id":      d.ID,
+				"floor":              effective,
+				"concurrency_before": conc,
+				"wake_id":            result.InstanceID,
+			}
+			t.auditor.Emit(ctx, "instances.warmed_min_instances", &acctID, payload)
+			t.auditor.Emit(ctx, "floor.wake", &acctID, payload)
+		}
+	}
+	return nil
+}
+
+// tickPerApp is the legacy per-app-only walk (issue #557 PR #618).
+// Preserved for callers that don't wire deploymentStore; the unit of
+// admission is the app, not the (app, deployment) pair.
+func (t *Trigger) tickPerApp(ctx context.Context) error {
+	if t.appStore == nil {
 		return nil
 	}
 	var apps []state.App
@@ -407,14 +587,6 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.ledger != nil {
 			conc = t.ledger.Concurrency(app.ID)
 		}
-		// §6.2-2 RAM ceiling pre-check: yield to live wakes when the
-		// app's billable RAM alone (RAMMB + 8 MB overhead) would
-		// exceed the remaining headroom. The engine's NodeLedger.Admit
-		// is unchanged and remains the absolute backstop; this
-		// pre-check is the policy layer above (ADR-071 §Decision 3,
-		// v1 = "yield to headroom"; a future FAAS_FLOOR_RESERVED_MB
-		// knob may widen this guard). Bounds the FAILED-row hazard on
-		// a RAM-saturated box.
 		isRamCeiling := false
 		if t.ledger != nil && api.BillableRAMMB(app.RAMMB) > headroom {
 			isRamCeiling = true
@@ -445,9 +617,6 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if !decision.AdmitNow {
 			continue
 		}
-		// Commit: Engine.AdmitInstance. AtCapacity is success
-		// (engine deleted the unattached row); only non-nil errors
-		// record backoff.
 		result, err := t.engine.AdmitInstance(ctx, app.ID)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {

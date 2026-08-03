@@ -736,6 +736,114 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID string) (WakeResult, e
 	return e.admitAndDispatch(ctx, appID, true)
 }
 
+// AdmitInstanceForDeployment is the floor-trigger entry point that
+// admits a specific deployment (issue #557 closure / ADR-072).
+// The signature differs from AdmitInstance by accepting an explicit
+// deploymentID; the floor trigger's per-deployment sweep threads the
+// deployment it wants woke. The wake path's per-request target is
+// still resolved by admitAndDispatch's `resolveApp` (LiveDeployment),
+// which guarantees the wake and the floor admit land on the same
+// deployment id — passing an out-of-band id here would race the
+// customer's next deploy.
+//
+// The empty-deploymentID case is the legacy AdmitInstance path: the
+// caller falls through to AdmitInstance (which resolves the live
+// deployment internally). Pass empty rather than resolving to
+// LatestDeployment — the trigger must NOT silently wake a
+// superseded deployment.
+func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+	if deploymentID == "" {
+		return e.AdmitInstance(ctx, appID)
+	}
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
+}
+
+// admitAndDispatchForDeployment mirrors admitAndDispatch but threads
+// a specific deploymentID through to the ledger. Resolution of the
+// app + account + limits still happens via resolveApp; only the
+// deployment is overridden. If the override deployment is no longer
+// live (a newer deploy happened mid-tick), the call returns
+// {AtCapacity: true} — the trigger's next sweep re-evaluates.
+func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
+	// ── Phase 2: admit window, under appMu ──────────────────
+	release := e.lockApp(appID)
+	app, acct, limits, _, err := e.resolveApp(ctx, appID)
+	if err != nil {
+		release()
+		return WakeResult{}, err
+	}
+
+	// Worker class is the same short-circuit as admitAndDispatch.
+	if app.WorkloadClass == state.WorkloadClassWorker {
+		release()
+		return WakeResult{AtCapacity: true}, nil
+	}
+
+	// Look up the override deployment; if it's gone or no longer live,
+	// treat as at-capacity (next tick re-evaluates).
+	dep, depErr := e.store.DeploymentByID(ctx, deploymentID)
+	if depErr != nil {
+		release()
+		if errors.Is(depErr, state.ErrNotFound) {
+			return WakeResult{AtCapacity: true}, nil
+		}
+		return WakeResult{}, depErr
+	}
+	if dep.Status != state.DeployLive {
+		release()
+		return WakeResult{AtCapacity: true}, nil
+	}
+
+	placement, err := e.choosePlacementLocked(ctx, Request{
+		AppID: appID, Plan: acct.Plan,
+		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
+	})
+	if err != nil {
+		release()
+		return WakeResult{}, err
+	}
+
+	wakeUUID, err := uuid.NewV7()
+	if err != nil {
+		wakeUUID = uuid.New()
+		if e.ops != nil {
+			e.ops.WakeIDV4Fallback().Inc()
+		}
+		e.log.Warn("floor admit: uuid.NewV7 failed, fell back to v4",
+			"app", appID, "deployment", deploymentID, "err", err)
+	}
+	wakeID := wakeUUID.String()
+
+	ins, err := e.store.CreateInstance(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID)
+	if err != nil {
+		release()
+		return WakeResult{}, fmt.Errorf("sched: floor admit: create instance: %w", err)
+	}
+	e.emitInstanceChanged(ctx, ins.ID, appID, state.StateColdBooting, wakeID)
+
+	if err := e.ledger.Admit(Request{
+		Instance: ins.ID, AppID: appID, DeploymentID: deploymentID, Plan: acct.Plan,
+		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
+		NodeID:        placement.NodeID,
+		NodeCeilingMB: placement.CeilingMB,
+		VCPUBudget:    placement.VCPUBudget,
+	}); err != nil {
+		_ = e.store.DeleteInstance(ctx, ins.ID)
+		e.emitInstanceChanged(ctx, ins.ID, appID, state.StateFailed, wakeID)
+		if liftCapacityToResult {
+			var prob *api.Problem
+			if errors.As(err, &prob) {
+				return WakeResult{AtCapacity: true}, nil
+			}
+		}
+		release()
+		return WakeResult{}, err
+	}
+
+	release()
+	return WakeResult{InstanceID: ins.ID}, nil
+}
+
 // admitAndDispatch is the shared Phase 2–4 body used by both Wake and
 // AdmitInstance. It takes the per-app lock once for Phase 2, drops it
 // across the slow vmmd RPC (Phase 3), and re-acquires for the
@@ -930,7 +1038,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	e.emitInstanceChanged(ctx, ins.ID, appID, initState, wakeID)
 
 	if err := e.ledger.Admit(Request{
-		Instance: ins.ID, AppID: appID, Plan: acct.Plan,
+		Instance: ins.ID, AppID: appID, DeploymentID: dep.ID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
@@ -2315,7 +2423,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	e.emitInstanceChanged(ctx, ins.ID, appID, state.StateColdBooting, primeWakeID)
 
 	if err := e.ledger.Admit(Request{
-		Instance: ins.ID, AppID: appID, Plan: acct.Plan,
+		Instance: ins.ID, AppID: appID, DeploymentID: deploymentID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,

@@ -724,6 +724,21 @@ type DeploymentResponse struct {
 	// OverrideHealthcheck is the readiness-probe override
 	// verbatim. Persisted; the actual HTTP probe is a follow-up.
 	OverrideHealthcheck *DeploymentHealthcheck `json:"override_healthcheck,omitempty"`
+	// MinInstances is the per-deployment cold-wake floor override
+	// (issue #557 closure / ADR-072). 0 = "inherit from parent
+	// app" (the post-migration default); a positive value is the
+	// deployment's own floor. Effective per-instance floor =
+	// max(app.EffectiveMinInstances(), d.EffectiveMinInstances()).
+	MinInstances int `json:"min_instances"`
+}
+
+// UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
+// (issue #557 closure / ADR-072). MinInstances is the only mutable
+// field on a deployment — the image / digest / overrides / sidecars
+// are immutable post-create (a new deployment is the canonical way
+// to change them).
+type UpdateDeploymentRequest struct {
+	MinInstances *int `json:"min_instances"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's

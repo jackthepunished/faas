@@ -42,6 +42,7 @@ func (f *fakeStore) ListAppsByNodeID(_ context.Context, _ string) ([]state.App, 
 type fakeLedger struct {
 	mu          sync.Mutex
 	conc        map[string]int
+	depConc     map[string]int // key: appID+"\x00"+deploymentID
 	residentRAM int
 	headroom    int
 }
@@ -50,6 +51,12 @@ func (l *fakeLedger) Concurrency(appID string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.conc[appID]
+}
+
+func (l *fakeLedger) ConcurrencyForDeployment(appID, deploymentID string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.depConc[appID+"\x00"+deploymentID]
 }
 
 func (l *fakeLedger) ResidentRAM() int {
@@ -84,6 +91,25 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult
 		return r, nil
 	}
 	return AdmitResult{InstanceID: "ins-" + appID}, nil
+}
+
+// AdmitInstanceForDeployment mirrors AdmitInstance on the
+// per-deployment entry point (issue #557 closure / ADR-072). The
+// trigger's per-deployment walk calls this; the per-app walk still
+// calls AdmitInstance. The fake records both with the same
+// `appID|deploymentID` shape so the tests can assert either path.
+func (e *fakeEngine) AdmitInstanceForDeployment(_ context.Context, appID, deploymentID string) (AdmitResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, appID+"|"+deploymentID)
+	key := appID + "|" + deploymentID
+	if err, ok := e.errs[key]; ok {
+		return AdmitResult{}, err
+	}
+	if r, ok := e.results[key]; ok {
+		return r, nil
+	}
+	return AdmitResult{InstanceID: "ins-" + appID + "-" + deploymentID}, nil
 }
 
 // fakePlanResolver returns the canned plan for an account id.
@@ -156,7 +182,7 @@ func TestTick_AdmitsUpToFloor(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	auditor := &fakeAuditor{}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		Auditor:      auditor,
 		PlanResolver: resolver,
@@ -199,7 +225,7 @@ func TestTick_FreePlanDisabled(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanFree}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -221,7 +247,7 @@ func TestTick_WorkerClassDisabled(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -248,7 +274,7 @@ func TestTick_BillableExceedsHeadroom(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, residentRAM: 47_000, headroom: 600}
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanPro}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -268,7 +294,7 @@ func TestTick_AtCapacityRecordedNotErrored(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 1}, headroom: 47_600}
 	engine := &fakeEngine{results: map[string]AdmitResult{"app1": {AtCapacity: true}}}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -296,7 +322,7 @@ func TestTick_EngineErrorRecordsBackoff(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
 	engine := &fakeEngine{errs: map[string]error{"app1": errors.New("vmmd unreachable")}}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -338,7 +364,7 @@ func TestTick_ScaleOutCooldownHeld(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -359,7 +385,7 @@ func TestTick_OwnerNodeIDRoutesToListAppsByNodeID(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -419,7 +445,7 @@ func TestTick_NilSafe(t *testing.T) {
 // TestTick_StoreErrorBubbles verifies that an appStore outage
 // surfaces as an error from Tick so the loop can log it.
 func TestTick_StoreErrorBubbles(t *testing.T) {
-	tr := New(&errStore{}, &fakeLedger{}, &fakeEngine{}, Options{Metrics: wire.NewOpsMetrics("schedd")})
+	tr := New(&errStore{}, nil, &fakeLedger{}, &fakeEngine{}, Options{Metrics: wire.NewOpsMetrics("schedd")})
 	if err := tr.Tick(context.Background()); err == nil {
 		t.Error("Tick on errStore returned nil, want error")
 	}
@@ -432,7 +458,7 @@ func TestTick_NilLedgerIsSafe(t *testing.T) {
 	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
-	tr := New(store, nil, engine, Options{
+	tr := New(store, nil, nil, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
@@ -452,7 +478,7 @@ func TestTick_NilPlanResolverDefaultsToFree(t *testing.T) {
 	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
 	engine := &fakeEngine{}
-	tr := New(store, ledger, engine, Options{Metrics: wire.NewOpsMetrics("schedd")})
+	tr := New(store, nil, ledger, engine, Options{Metrics: wire.NewOpsMetrics("schedd")})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
@@ -470,7 +496,7 @@ func TestTick_AuditorEmitsFloorWake(t *testing.T) {
 	engine := &fakeEngine{results: map[string]AdmitResult{"app1": {InstanceID: "iid-xyz"}}}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	auditor := &fakeAuditor{}
-	tr := New(store, ledger, engine, Options{
+	tr := New(store, nil, ledger, engine, Options{
 		Metrics:      wire.NewOpsMetrics("schedd"),
 		Auditor:      auditor,
 		PlanResolver: resolver,

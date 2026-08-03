@@ -702,6 +702,30 @@ type Store interface {
 	// scale-up tick. Default-local is a valid nodeID — the single-box
 	// schedd reads the same shape as a peer schedd.
 	ListAppsByNodeID(ctx context.Context, nodeID string) ([]App, error)
+	// ListAllDeployments returns every non-deleted deployment (issue
+	// #557 closure / ADR-072). The floor reconciler's wake sweep walks
+	// this when no owner-node sharding is configured (the one-box
+	// posture). Multi-box schedd callers read ListDeploymentsByNodeID.
+	ListAllDeployments(ctx context.Context) ([]Deployment, error)
+	// ListDeploymentsByNodeID returns every deployment whose parent
+	// app's owner_node matches nodeID (Phase 2 / Gate A + issue #557
+	// closure). Mirror of ListAppsByNodeID for the per-deployment
+	// axis. The JOIN through apps lets the planner hit apps_node_id_idx
+	// first; per-app deployments fall out via the deployments_app_id_idx
+	// index added in migration 00007.
+	ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error)
+	// ConcurrencyForDeployment returns the live-instance count for a
+	// (app, deployment) pair — the sum of state IN ('RUNNING',
+	// 'WAKING', 'COLD_BOOTING'). Backed by the partial index added
+	// in migration 00130.
+	ConcurrencyForDeployment(ctx context.Context, appID, deploymentID string) (int, error)
+	// UpdateDeploymentMinInstances stamps the per-deployment cold-wake
+	// floor (issue #557 closure / ADR-072). The handler validates
+	// against the parent app's plan ceiling before reaching this
+	// method; the DB CHECK constraint (migration 00129) is the
+	// belt-and-suspenders bound. Returns the fresh row so the
+	// handler can build the response without a second round-trip.
+	UpdateDeploymentMinInstances(ctx context.Context, id string, min int) (Deployment, error)
 	// ListInstancesByNodeID returns every instance whose owning app's
 	// owner_node matches nodeID. Same Phase 2 / Gate A contract; the
 	// reaper's parked-instance timer + the watchdog's kill-stuck path

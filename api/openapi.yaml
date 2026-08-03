@@ -1912,6 +1912,41 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [deployments]
+      operationId: updateDeploymentMinInstances
+      summary: Set the per-deployment cold-wake floor.
+      description: |
+        Update the deployment's min_instances (issue #557 closure /
+        ADR-072). The only mutable field on a deployment post-create;
+        image / digest / overrides / sidecars stay immutable (a new
+        deployment is the canonical way to change them). Pass
+        min_instances=0 to inherit from the parent app's floor.
+        Validated against the parent app's plan MaxMinInstances cap.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [min_instances]
+              properties:
+                min_instances:
+                  type: integer
+                  minimum: 0
+                  description: "Per-deployment cold-wake floor override. 0 = inherit from parent app."
+      responses:
+        '200':
+          description: The updated deployment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/deployments/{id}/logs:
     parameters:
@@ -4912,6 +4947,20 @@ components:
             - $ref: '#/components/schemas/DeploymentHealthcheck'
             - type: 'null'
           description: "Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a bare TCP accept."
+        min_instances:
+          type: integer
+          minimum: 0
+          description: "Per-deployment cold-wake floor override (issue #557 closure / ADR-072). 0 = inherit from parent app (default); positive value is the deployment's own floor. Effective per-instance floor = max(app.EffectiveMinInstances(), d.EffectiveMinInstances()). Validated against the parent app's plan MaxMinInstances cap on PATCH."
+
+    UpdateDeploymentRequest:
+      description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
+      type: object
+      required: [min_instances]
+      properties:
+        min_instances:
+          type: integer
+          minimum: 0
+          description: "Per-deployment cold-wake floor override. 0 = inherit from parent app."
 
     DeploymentListResponse:
       description: "Paginated deployment list with a `next_before` cursor for backward pagination."

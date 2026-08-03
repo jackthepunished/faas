@@ -712,6 +712,16 @@ type Deployment struct {
 	// transiently at the pull path (mirrors app_env_secret
 	// unseal at the same seam).
 	Sidecars json.RawMessage `json:"sidecars,omitempty"`
+	// MinInstances is the per-deployment cold-wake floor override
+	// (issue #557 closure / ADR-072). Default 0 = "inherit from
+	// parent app"; an explicit positive value is the deployment's
+	// own floor. Effective per-instance floor =
+	// `max(app.EffectiveMinInstances(), d.EffectiveMinInstances())`
+	// (composed at the trigger, not here). Validated against the
+	// parent app's plan ceiling at the PATCH handler; this struct
+	// does NOT carry the plan context, so the helper is just
+	// min(0, MinInstances)→0 + raw value.
+	MinInstances int `json:"min_instances,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem

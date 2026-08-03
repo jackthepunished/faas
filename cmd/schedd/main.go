@@ -1019,6 +1019,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		floorTrigger := floor.New(
 			store,
+			store, // deploymentStore — issue #557 closure / ADR-072 (per-deployment walk)
 			schedFloorLedger{ledger: engine.Ledger()},
 			schedFloorEngine{engine: engine},
 			floor.Options{
@@ -1269,6 +1270,16 @@ func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floo
 	return floor.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
+// AdmitInstanceForDeployment implements floor.Engine (issue #557
+// closure / ADR-072 — per-deployment floor wake).
+func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID)
+	if err != nil {
+		return floor.AdmitResult{}, err
+	}
+	return floor.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
 // schedFloorPlanResolver (issue #557 / ADR-071) adapts
 // state.Store.AccountByID into floor.PlanResolver. The trigger
 // walks apps per-tick and consults the resolver to gate the
@@ -1301,6 +1312,12 @@ type schedFloorLedger struct {
 // Concurrency implements floor.Ledger.
 func (s schedFloorLedger) Concurrency(appID string) int {
 	return s.ledger.Concurrency(appID)
+}
+
+// ConcurrencyForDeployment implements floor.Ledger (issue #557
+// closure / ADR-072 — per-(app, deployment) live count).
+func (s schedFloorLedger) ConcurrencyForDeployment(appID, deploymentID string) int {
+	return s.ledger.ConcurrencyForDeployment(appID, deploymentID)
 }
 
 // ResidentRAM implements floor.Ledger.

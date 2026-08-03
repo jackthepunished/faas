@@ -369,7 +369,29 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 		// correctly. Pre-#557 this read policy.MinInstances only, so a
 		// customer who configured via the legacy PATCH got a warm
 		// floor they were never billed for.
+		//
+		// Issue #557 closure / ADR-072 §Decision 2: the per-deployment
+		// axis is layered as max(app, deployment). The deployment
+		// contribution is read from the instance row's deployment_id
+		// (already populated in pgstore.CreateInstance); legacy rows
+		// with empty deployment_id (test seams only) fall through to
+		// the per-app floor alone.
 		floor := app.EffectiveMinInstances()
+		for _, ins := range ins {
+			if !state.State(ins.State).CountsForRAM() {
+				continue
+			}
+			if ins.DeploymentID == "" {
+				continue
+			}
+			dep, err := s.store.DeploymentByID(ctx, ins.DeploymentID)
+			if err != nil {
+				continue
+			}
+			if dFloor := dep.EffectiveMinInstances(); dFloor > floor {
+				floor = dFloor
+			}
+		}
 		if floor > 0 && liveCount < floor {
 			gap := floor - liveCount
 			billable := api.BillableRAMMB(app.RAMMB)
