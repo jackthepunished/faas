@@ -837,21 +837,12 @@ jobs:
         # and short-circuits before the `go install` fallback.
         run: make sqlc-check
 
-  e2e:
-    # cmd/e2e harness — boots real daemons (apid + schedd + meterd) as
-    # subprocesses and drives them through the production wire (HTTP/
-    # gRPC/pg_notify). PR #135 wired the `make e2e` target into the
-    # Makefile; this job runs it on PR + push-to-main. Decoupled from
-    # `test` because cmd/e2e takes ~5-10 min (cold boot subprocesses)
-    # and would lengthen the developer feedback loop. Metal subset
-    # stays on `make test-metal` + `make metal-lima` — see the `metal`
-    # job above. `pg_isready` is `psql` package-supplied; install it
-    # explicitly because the Makefile preflight `command -v psql`
-    # would otherwise fail.
+  e2e-shard1:
+    name: e2e (shard 1 — TestA-L)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
-        # mirror.gcr.io for the same reason as unit-tests/migrations
-        # (2026-07-31): Docker Hub pull flake on Azure centralus.
         image: mirror.gcr.io/library/postgres:15
         env:
           POSTGRES_USER: faas
@@ -866,15 +857,8 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
-      # cmd/e2e respects these; absent env defaults are fine but
-      # setting them explicitly keeps the wiring self-documenting.
       FAAS_SKIP_PG_TESTS: ""
-    name: e2e (cmd/e2e, no metal)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      # 2026-07-31: pre-pull postgres with 3-attempt retry (see
-      # unit-tests job for the full backstory).
       - name: pre-pull postgres image
         run: |
           for attempt in 1 2 3; do
@@ -895,21 +879,58 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
-      # `make e2e` requires `psql` on PATH (preflight guard). Ubuntu
-      # runners don't ship postgresql-client by default — install it.
-      # apt-get needs sudo on GitHub-hosted runners (unprivileged user
-      # by default; see https://docs.github.com/actions/hosting-your-runners).
       - name: install postgresql-client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      # jinja2 is required by TestSec11_PerHostEgressTemplating
-      # (cmd/e2e/sec11_sweep_test.go) to cross-check the Go render
-      # against the Jinja2 template. Without this, the test
-      # t.Logf-skips the cross-check and `make egress-render-cross-check`
-      # (which the same Python import supports) fails its `python3 -c
-      # "from jinja2 import Template"` shell-out on the lint+build
-      # job. ADR-055. Match the version the local `make egress-render-cross-check`
-      # and the e2e sweep use.
       - name: install jinja2 (ADR-055 cross-check)
         run: python3 -m pip install --quiet jinja2
-      - name: make e2e
-        run: make e2e
+      - name: e2e tests (shard 1 — TestA-L)
+        run: go test -race -count=1 -timeout=15m -run '^Test[A-L]' ./cmd/e2e/...
+
+  e2e-shard2:
+    name: e2e (shard 2 — TestM-Z)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:15
+        env:
+          POSTGRES_USER: faas
+          POSTGRES_PASSWORD: faas
+          POSTGRES_DB: faas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U faas -d faas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+      FAAS_SKIP_PG_TESTS: ""
+    steps:
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: install jinja2 (ADR-055 cross-check)
+        run: python3 -m pip install --quiet jinja2
+      - name: e2e tests (shard 2 — TestM-Z)
+        run: go test -race -count=1 -timeout=15m -run '^Test[M-Z]' ./cmd/e2e/...
