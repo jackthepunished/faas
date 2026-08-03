@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00119_warm_hint.sql — Tier A7 edge split (ADR-070).
+-- 00120_warm_hint.sql — Tier A7 edge split (ADR-070).
 --
 -- The sticky-warm hint that gatewayd reads to bias per-app routing
 -- toward the node that most recently warmed the app used to live
