@@ -1332,6 +1332,16 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
 	}
 	defer func() { _ = exec.Command("umount", mp).Run() }()
+	// Pre-marshal byte cap projection (PR-B review finding #7).
+	// Marshalling an unbounded Name field before checking size
+	// would let a malicious or buggy wire payload allocate
+	// without bound; the cap here MUST run before json.Marshal
+	// (which calls AppendQuote on every byte of the string).
+	// The projection is conservative — the workloadManifest
+	// struct shape is fixed, and only Name can vary.
+	if projected := projectedWorkloadManifestBytes(w); projected > api.MaxExportedLayerBytes {
+		return fmt.Errorf("workload manifest projected %d bytes exceeds cap %d (name=%q)", projected, api.MaxExportedLayerBytes, w.Name)
+	}
 	// Marshal the manifest. encoding/json sorts map keys
 	// alphabetically so re-reads produce the same bytes; we don't
 	// need that contract here (guest-init parses each file once
@@ -1351,13 +1361,6 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 	if err != nil {
 		return fmt.Errorf("marshal workload manifest: %w", err)
 	}
-	if int64(len(blob)) > api.MaxExportedLayerBytes {
-		// Defensive cap: a runaway manifest is a contract bug
-		// upstream (imaged should not produce one), but the
-		// cap here keeps a wild payload from filling the
-		// drive's 256 MB / 512 MB / 1 GB / 2 GB plan ceilings.
-		return fmt.Errorf("workload manifest %d bytes exceeds cap %d", len(blob), api.MaxExportedLayerBytes)
-	}
 	target := filepath.Join(mp, workloadManifestPath)
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return fmt.Errorf("mkdir etc/faas: %w", err)
@@ -1366,6 +1369,64 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 		return fmt.Errorf("write workload.json: %w", err)
 	}
 	return nil
+}
+
+// projectedWorkloadManifestBytes (issue #463 / ADR-069 / PR-B
+// review finding #7) returns a conservative upper bound on the
+// marshalled workloadManifest byte size for the given input.
+// The struct shape is fixed; only Name can vary, and JSON's
+// AppendQuote escapes 6 characters (`\`, `"`, and control
+// chars) on top of the raw byte count. The estimate is
+// deliberately generous — overestimating just rejects a
+// payload that wouldn't have hit the cap anyway, so the
+// false-positive rate is zero. The projection runs BEFORE
+// json.Marshal so an unbounded Name can't allocate
+// without bound during marshalling.
+//
+// Layout:
+//
+//	{"essential":BOOL,"name":"...","port":INT,"ram_mb":INT,"type":"..."}
+//
+// Braces, colons, commas, and quoted keys/values dominate the
+// fixed overhead; only Name contributes variable bytes.
+func projectedWorkloadManifestBytes(w WorkloadSpec) int64 {
+	// Per JSON spec, the 6 chars that get escaped (\ " \b \t
+	// \n \f \r plus U+0000-U+001F) take 2 bytes each after
+	// quoting. The defensive escape multiplier handles
+	// worst-case ASCII control characters (most Names are
+	// safe DNS-1123 labels with no escapes — the multiplier
+	// is just safety margin).
+	nameBytes := int64(len(w.Name)) * 2
+	// Two int fields (port, ram_mb) and a bool. 11 bytes per
+	// int is the worst case for a 32-bit value; 5 bytes for
+	// "false". The 3 quoted keys + 2 numeric values + 1 bool
+	// contribute a fixed overhead; we over-estimate at 64.
+	const fixedOverhead = 64
+	return nameBytes + fixedOverhead
+}
+
+// projectedWorkloadRosterBytes (issue #463 / ADR-069 / PR-B
+// review finding #7) is the roster-shape twin of
+// projectedWorkloadManifestBytes. The roster is 1 main +
+// len(sidecars) manifests wrapped in
+//
+//	{"main":{...},"sidecars":[{...},...]}
+//
+// so the projection is the sum of per-workload projections
+// plus a small wrapper overhead. SidecarCapMax bounds
+// len(sidecars) so the projection is bounded — a future PR
+// that lifts the cap doesn't change the formula here, only
+// the constant.
+func projectedWorkloadRosterBytes(main WorkloadSpec, sidecars []WorkloadSpec) int64 {
+	var total int64 = projectedWorkloadManifestBytes(main)
+	for _, sc := range sidecars {
+		total += projectedWorkloadManifestBytes(sc)
+	}
+	// Wrapper: {"main":{...},"sidecars":[]} — 32 bytes of
+	// braces/commas/colons plus a "main" key and a "sidecars"
+	// key. 64 is the conservative ceiling.
+	const wrapperOverhead = 64
+	return total + wrapperOverhead
 }
 
 // workloadManifest is the on-disk shape of /etc/faas/workload.json
@@ -1438,6 +1499,15 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 	}
 	defer func() { _ = exec.Command("umount", mp).Run() }()
 
+	// Pre-marshal byte cap projection (PR-B review finding #7).
+	// Cap runs BEFORE json.Marshal — matches the posture
+	// writeWorkloadManifest adopts. The roster is at most 1
+	// main + SidecarCapMax (2) sidecars, so the projection
+	// multiplies per-workload projections by len(sidecars)+1.
+	if projected := projectedWorkloadRosterBytes(main, sidecars); projected > api.MaxExportedLayerBytes {
+		return fmt.Errorf("workload roster projected %d bytes exceeds cap %d (sidecars=%d)", projected, api.MaxExportedLayerBytes, len(sidecars))
+	}
+
 	roster := workloadRoster{
 		Main: workloadManifest{
 			Name:      main.Name,
@@ -1459,10 +1529,6 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 	blob, err := json.Marshal(roster)
 	if err != nil {
 		return fmt.Errorf("marshal workload roster: %w", err)
-	}
-	if int64(len(blob)) > api.MaxExportedLayerBytes {
-		// Defensive cap, matches StageWorkloadManifest's posture.
-		return fmt.Errorf("workload roster %d bytes exceeds cap %d", len(blob), api.MaxExportedLayerBytes)
 	}
 	target := filepath.Join(mp, workloadRosterPath)
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
