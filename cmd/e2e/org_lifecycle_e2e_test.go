@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -391,6 +392,7 @@ func TestE2E_OrgLifecycle_NonMemberIDOR(t *testing.T) {
 		{"patch", http.MethodPatch, "/v1/orgs/iso", api.PatchOrgRequest{Name: strPtr("Hijacked")}},
 		{"invite", http.MethodPost, "/v1/orgs/iso/members", api.InviteMemberRequest{Email: "carol@x.com", Role: "viewer"}},
 		{"delete", http.MethodDelete, "/v1/orgs/iso", nil},
+		{"transfer_ownership", http.MethodPost, "/v1/orgs/iso/transfer_ownership", api.TransferOwnershipRequest{NewOwnerAccountID: "00000000-0000-0000-0000-000000000000"}},
 	} {
 		probe := probe
 		t.Run(probe.name, func(t *testing.T) {
@@ -414,6 +416,115 @@ func TestE2E_OrgLifecycle_NonMemberIDOR(t *testing.T) {
 	// consume aliceAcct so the compiler doesn't warn about the
 	// unused binding (it's read by the closure above).
 	_ = aliceAcct
+}
+
+// TestE2E_OrgLifecycle_PeekTerminalStates — every terminal-state
+// invitation (consumed / revoked / expired) collapses onto the
+// same wire shape: 410 Gone + org_invitation_invalid. This is the
+// security oracle fix from the PR 5 review — an attacker who has
+// a leaked token cannot enumerate which rows are still live by
+// the code returned. The Expired constructor is reserved for the
+// PR 8 accept flow where the caller is the legitimate invitee.
+func TestE2E_OrgLifecycle_PeekTerminalStates(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	h := e2etest.Start(t, pool, e2etest.APID)
+	ctx := context.Background()
+
+	aliceKey := h.SeedAccount(ctx, api.PlanHobby, "pr5-peek-a")
+	store := state.NewPgStore(pool)
+	aliceAcct, err := store.AccountByEmail(ctx, seedEmail(api.PlanHobby, "pr5-peek-a"))
+	if err != nil {
+		t.Fatalf("AccountByEmail alice: %v", err)
+	}
+	raw, status := doReq(t, h, aliceKey, http.MethodPost, "/v1/orgs",
+		api.CreateOrgRequest{Slug: "peek-test", Name: "Peek Test"})
+	if status != http.StatusCreated {
+		t.Fatalf("create org: %d %s", status, raw)
+	}
+	peekOrg, err := store.OrgBySlug(ctx, "peek-test")
+	if err != nil {
+		t.Fatalf("OrgBySlug: %v", err)
+	}
+
+	// mint a fresh invitation row, then stamp it into one of the
+	// three terminal states. Each sub-test owns its own seeded
+	// invitee account + plaintext so the partial uniques don't
+	// trip across cases.
+	mint := func(t *testing.T, suffix string) (token string, inv state.OrgInvitation) {
+		t.Helper()
+		plaintext := make([]byte, 32)
+		for i := range plaintext {
+			plaintext[i] = byte(i + len(suffix)*7) // deterministic per-case
+		}
+		hash := sha256.Sum256(plaintext)
+		token = base64.RawURLEncoding.EncodeToString(plaintext)
+		created, err := store.CreateOrgInvitation(ctx, state.OrgInvitation{
+			OrgID:     peekOrg.ID,
+			Email:     suffix + "@x.com",
+			Role:      state.OrgRoleDeveloper,
+			TokenHash: hash[:],
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("CreateOrgInvitation (%s): %v", suffix, err)
+		}
+		created.TokenHash = hash[:]
+		return token, created
+	}
+	probe := func(t *testing.T, token string) {
+		t.Helper()
+		raw, status := doReq(t, h, aliceKey, http.MethodGet,
+			"/v1/invitations/"+token, nil)
+		if status != http.StatusGone {
+			t.Errorf("status = %d, want 410 (body=%s)", status, raw)
+		}
+		if !strings.Contains(string(raw), "org_invitation_invalid") {
+			t.Errorf("body did not contain org_invitation_invalid: %s", raw)
+		}
+	}
+
+	t.Run("consumed", func(t *testing.T) {
+		acceptorID := "00000000-0000-0000-0000-000000000d11"
+		acceptorEmail := "consumed@x.com"
+		if _, err := pool.Exec(ctx,
+			"insert into accounts (id, email, plan, created_at) values ($1::uuid, $2, 'free', now()) on conflict do nothing",
+			acceptorID, acceptorEmail); err != nil {
+			t.Fatalf("seed acceptor: %v", err)
+		}
+		token, inv := mint(t, "consumed")
+		if _, _, err := store.ConsumeOrgInvitation(ctx, inv.TokenHash,
+			state.Account{ID: acceptorID, Email: acceptorEmail}); err != nil {
+			t.Fatalf("ConsumeOrgInvitation: %v", err)
+		}
+		probe(t, token)
+	})
+
+	t.Run("revoked", func(t *testing.T) {
+		token, inv := mint(t, "revoked")
+		if err := store.RevokeOrgInvitation(ctx, inv.TokenHash, aliceAcct.ID); err != nil {
+			t.Fatalf("RevokeOrgInvitation: %v", err)
+		}
+		probe(t, token)
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		token, inv := mint(t, "expired")
+		// Backdate expires_at — DeriveOrgInvitationStatus reads the
+		// timestamp directly so we don't need ExpireOrgInvitations
+		// (the cleanup tick is for batch sweeps, not per-row setup).
+		if _, err := pool.Exec(ctx,
+			"update org_invitations set expires_at = now() - interval '1 hour' where id = $1::uuid",
+			inv.ID); err != nil {
+			t.Fatalf("backdate expires_at: %v", err)
+		}
+		probe(t, token)
+	})
 }
 
 // TestE2E_OrgLifecycle_PersonalImmutable — the personal org is
@@ -548,3 +659,183 @@ func TestE2E_OrgLifecycle_LastOwnerGuard(t *testing.T) {
 // strPtr is a small helper for pointer-fields in request bodies.
 // Matches the convention in cmd/apid/handlers_org_test.go.
 func strPtr(s string) *string { return &s }
+
+// TestE2E_OrgLifecycle_PatchOrg exercises PATCH /v1/orgs/{slug}
+// end-to-end. The patchOrg handler was the load-bearing seam PR
+// 5's review caught: the handler claimed to support name updates
+// but never persisted them (only UpdateOrgPlan existed on the
+// Store). This test pins the post-fix contract:
+//
+//   - name update persists (Store::UpdateOrgName is now wired)
+//   - plan update persists (Store::UpdateOrgPlan, the pre-existing path)
+//   - personal org PATCH → 409 org_personal_immutable
+//   - empty name (after trim) → 422 validation
+//   - unknown plan → 422 org_slug_invalid (the closed-enum validator)
+//
+// Each assertion is the load-bearing wire contract; a future
+// refactor that drops one of these would silently break the
+// customer-visible rename / plan-change flow.
+func TestE2E_OrgLifecycle_PatchOrg(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	h := e2etest.Start(t, pool, e2etest.APID)
+	ctx := context.Background()
+
+	aliceKey := h.SeedAccount(ctx, api.PlanHobby, "pr5-patch")
+	store := state.NewPgStore(pool)
+	aliceAcct, err := store.AccountByEmail(ctx, seedEmail(api.PlanHobby, "pr5-patch"))
+	if err != nil {
+		t.Fatalf("AccountByEmail alice: %v", err)
+	}
+
+	// Create "patchme" so we have a non-personal org to mutate.
+	raw, status := doReq(t, h, aliceKey, http.MethodPost, "/v1/orgs",
+		api.CreateOrgRequest{Slug: "patchme", Name: "Patch Me"})
+	if status != http.StatusCreated {
+		t.Fatalf("create org: %d %s", status, raw)
+	}
+
+	// (a) Name update persists. Pre-fix this returned 200 OK with
+	// the OLD name — the regression the PR review caught.
+	raw, status = doReq(t, h, aliceKey, http.MethodPatch, "/v1/orgs/patchme",
+		api.PatchOrgRequest{Name: strPtr("Renamed Inc.")},
+		map[string]string{"X-Active-Org": "patchme"})
+	if status != http.StatusOK {
+		t.Fatalf("patch name: %d %s", status, raw)
+	}
+	var patched struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &patched); err != nil {
+		t.Fatalf("decode patch: %v", err)
+	}
+	if patched.Name != "Renamed Inc." {
+		t.Errorf("response name = %q, want %q", patched.Name, "Renamed Inc.")
+	}
+	// Sanity: the row in Postgres reflects the new name (the
+	// store-level pin; the response body alone isn't enough —
+	// a regression that wrote the response but skipped the
+	// UpdateOrgName would slip through without this check).
+	row, err := store.OrgBySlug(ctx, "patchme")
+	if err != nil {
+		t.Fatalf("OrgBySlug: %v", err)
+	}
+	if row.Name != "Renamed Inc." {
+		t.Errorf("persisted name = %q, want %q", row.Name, "Renamed Inc.")
+	}
+
+	// (b) Plan update persists. The handler validates against the
+	// closed api.Plans set; "pro" is in the set so this must
+	// succeed.
+	raw, status = doReq(t, h, aliceKey, http.MethodPatch, "/v1/orgs/patchme",
+		api.PatchOrgRequest{Plan: strPtr("pro")},
+		map[string]string{"X-Active-Org": "patchme"})
+	if status != http.StatusOK {
+		t.Fatalf("patch plan: %d %s", status, raw)
+	}
+	row, err = store.OrgBySlug(ctx, "patchme")
+	if err != nil {
+		t.Fatalf("OrgBySlug post-plan: %v", err)
+	}
+	if string(row.Plan) != "pro" {
+		t.Errorf("persisted plan = %q, want pro", row.Plan)
+	}
+
+	// (c) Unknown plan rejected at the boundary with the
+	// closed-enum wire shape (org_slug_invalid, mirroring the
+	// slug validator). The handler must NOT round-trip the
+	// request to the Store and surface a SQL CHECK 500.
+	raw, status = doReq(t, h, aliceKey, http.MethodPatch, "/v1/orgs/patchme",
+		api.PatchOrgRequest{Plan: strPtr("enterprise")},
+		map[string]string{"X-Active-Org": "patchme"})
+	if status != http.StatusUnprocessableEntity {
+		t.Errorf("unknown plan: status = %d, want 422 (body=%s)", status, raw)
+	}
+	if !strings.Contains(string(raw), "org_slug_invalid") {
+		t.Errorf("unknown plan: body did not contain org_slug_invalid: %s", raw)
+	}
+
+	// (d) Empty name (after trim) → 422 validation.
+	raw, status = doReq(t, h, aliceKey, http.MethodPatch, "/v1/orgs/patchme",
+		api.PatchOrgRequest{Name: strPtr("   ")},
+		map[string]string{"X-Active-Org": "patchme"})
+	if status != http.StatusUnprocessableEntity {
+		t.Errorf("empty name: status = %d, want 422 (body=%s)", status, raw)
+	}
+
+	// (e) Personal org PATCH → 409 org_personal_immutable. The
+	// seed account owns a personal org (PR 3 backfill); the slug
+	// is `state.PersonalOrgSlug(aliceAcct.ID)` which the harness
+	// makes available.
+	personalSlug := state.PersonalOrgSlug(aliceAcct.ID)
+	raw, status = doReq(t, h, aliceKey, http.MethodPatch,
+		"/v1/orgs/"+personalSlug,
+		api.PatchOrgRequest{Name: strPtr("Whatever")},
+		map[string]string{"X-Active-Org": personalSlug})
+	if status != http.StatusConflict {
+		t.Errorf("patch personal: status = %d, want 409 (body=%s)", status, raw)
+	}
+	if !strings.Contains(string(raw), "org_personal_immutable") {
+		t.Errorf("patch personal: body did not contain org_personal_immutable: %s", raw)
+	}
+}
+
+// TestE2E_OrgLifecycle_ListOrgsForCaller_PersonalSlugPin — the
+// personal-org slug in the listOrgsForCaller response MUST equal
+// state.PersonalOrgSlug(accountID) (the frozen UUID v5 namespace
+// from PR 3). If the slug drifted (different namespace, different
+// derivation, accidental re-key), the dashboard's "Personal | Acme
+// Inc." switcher would 404 the moment the user clicked the personal
+// row. This pins the wire-shape contract.
+func TestE2E_OrgLifecycle_ListOrgsForCaller_PersonalSlugPin(t *testing.T) {
+	pool := pgtest.Open(t)
+	if pool == nil {
+		return
+	}
+	if err := db.MigrateUp(context.Background(), pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	h := e2etest.Start(t, pool, e2etest.APID)
+	ctx := context.Background()
+
+	key := h.SeedAccount(ctx, api.PlanFree, "pr5-list-pin")
+	store := state.NewPgStore(pool)
+	acct, err := store.AccountByEmail(ctx, seedEmail(api.PlanFree, "pr5-list-pin"))
+	if err != nil {
+		t.Fatalf("AccountByEmail: %v", err)
+	}
+	wantSlug := state.PersonalOrgSlug(acct.ID)
+
+	raw, status := doReq(t, h, key, http.MethodGet, "/v1/orgs", nil)
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/orgs: %d %s", status, raw)
+	}
+	var resp struct {
+		Orgs []struct {
+			ID       string `json:"id"`
+			Slug     string `json:"slug"`
+			Personal bool   `json:"personal"`
+		} `json:"orgs"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(resp.Orgs) == 0 {
+		t.Fatalf("expected at least the personal org in /v1/orgs, got 0 (body=%s)", raw)
+	}
+	var personalOK bool
+	for _, o := range resp.Orgs {
+		if o.Slug == wantSlug && o.Personal {
+			personalOK = true
+			break
+		}
+	}
+	if !personalOK {
+		t.Errorf("personal slug missing from /v1/orgs: want %q (Personal=true), body=%s", wantSlug, raw)
+	}
+}

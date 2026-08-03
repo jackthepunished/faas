@@ -2262,6 +2262,12 @@ type Store interface {
 	// UpdateAccountPlan onto the personal org inside one transaction.
 	UpdateOrgPlan(ctx context.Context, id string, plan api.Plan) error
 
+	// UpdateOrgName updates the org's display name. Returns ErrNotFound
+	// when the id is unknown. The handler bounds the name length and
+	// trims whitespace before reaching the Store (the SQL CHECK rejects
+	// empty strings and names >256 bytes — 23514).
+	UpdateOrgName(ctx context.Context, id, name string) error
+
 	// UpdateOrgStatus mirrors UpdateAccountStatus for PR 7's dunning
 	// pivot. Valid statuses are active / past_due / suspended /
 	// deleted_pending (CHECK enforced at SQL).

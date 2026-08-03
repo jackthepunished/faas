@@ -56,16 +56,11 @@ const defaultOrgInvitationTtl = 14 * 24 * time.Hour
 //
 // Mounted at GET /v1/orgs/{slug}/members.
 func (s *server) listOrgMembers(w http.ResponseWriter, r *http.Request, _ state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionView, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionView) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
 	rows, err := s.store.ListOrgMembers(r.Context(), mem.OrgID)
@@ -81,6 +76,12 @@ func (s *server) listOrgMembers(w http.ResponseWriter, r *http.Request, _ state.
 		if row.RemovedAt != nil {
 			continue // Filter at the API boundary; removed rows stay in DB for audit.
 		}
+		// TODO(perf, PR-6+): memberToRow issues AccountByID per
+		// row, which is N+1. For a 50-member org the read costs
+		// 51 round-trips. Replace with a Store.ListOrgMembersWithEmail
+		// that JOINs org_memberships.account_id = accounts.id in
+		// a single query. Acceptable for PR 5 (small orgs); flag
+		// here so PR 6 picks it up alongside the api_keys cut-over.
 		out.Members = append(out.Members, api.OrgMemberResponseFromRow(s.memberToRow(r.Context(), row)))
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -93,16 +94,11 @@ func (s *server) listOrgMembers(w http.ResponseWriter, r *http.Request, _ state.
 //
 // Mounted at POST /v1/orgs/{slug}/members.
 func (s *server) inviteOrgMember(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionInviteMembers, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionInviteMembers) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
 	var req api.InviteMemberRequest
@@ -118,102 +114,82 @@ func (s *server) inviteOrgMember(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	if !containsOrgMemberRoleForInvite(string(role)) {
-		// owner is the only excluded role (the SQL CHECK on
-		// org_invitations.role mirrors the constraint — a
-		// transfer-ownership endpoint is the only path to owner).
 		api.WriteProblem(w, api.ErrOrgRoleForbidden("invite members"))
 		return
 	}
-	// Reject invitations to the personal org: a personal org
-	// doesn't accept members (the backfill in PR 3 stamps the
-	// owner-only row, and the personal_org name-space is the
-	// caller's own account).
-	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"OrgByID failed",
-			"try again; if the problem persists, contact support"))
+	org, ok := s.loadMutableOrgByMembership(r.Context(), w, mem)
+	if !ok {
 		return
 	}
-	if org.Personal {
-		api.WriteProblem(w, api.ErrOrgPersonalImmutable())
+	if !s.enforcePendingInvitationCap(r.Context(), w, org) {
 		return
 	}
-	// Cap check: Plan.OrgPendingInvitationsMax() is 0 until the
-	// financial model populates; the doc-string on the limit
-	// accessor (pkg/api/limits.go:1594-1600) makes the > 0
-	// semantics explicit so this branch opens as soon as the
-	// model lands. The Pending count is the row count +
-	// consumed-not-revoked; for PR 5 we count pending-only rows
-	// (active invitations the customer has not yet processed).
-	limit := org.Plan.OrgPendingInvitationsMax()
-	if limit > 0 {
-		pending, err := s.countPendingOrgInvitations(r.Context(), org.ID)
-		if err != nil {
-			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-				api.CodeCapacity,
-				"ListOrgInvitationsForOrg failed",
-				"try again; if the problem persists, contact support"))
-			return
-		}
-		if pending >= limit {
-			api.WriteProblem(w, api.ErrOrgInvitationCapExceeded(limit, pending))
-			return
-		}
-	}
-	// Mint 32 bytes from crypto/rand; base64url-encode for the
-	// email link.
-	plaintext := make([]byte, OrgInvitationTokenBytes)
-	if _, err := rand.Read(plaintext); err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"crypto/rand failed",
-			"try again; if the problem persists, contact support"))
+	token, tokenHash, mintErr := s.mintOrgInvitationToken(w)
+	if mintErr {
 		return
 	}
-	token := base64.RawURLEncoding.EncodeToString(plaintext)
-	hash := sha256.Sum256(plaintext)
-	invitedBy := acct.ID
-	now := time.Now()
-	inv, err := s.store.CreateOrgInvitation(r.Context(), state.OrgInvitation{
-		OrgID:              org.ID,
+	inv, now, ok := s.persistOrgInvitation(r.Context(), w, org, state.OrgInvitation{
 		Email:              email,
 		Role:               role,
-		TokenHash:          hash[:],
-		InvitedByAccountID: &invitedBy,
-		ExpiresAt:          now.Add(defaultOrgInvitationTtl),
-		CreatedAt:          now,
+		TokenHash:          tokenHash,
+		InvitedByAccountID: &acct.ID,
 	})
+	if !ok {
+		return
+	}
+	s.audit.Emit(r.Context(), "org.invitation.created", &acct.ID, map[string]any{
+		"org_id": org.ID, "slug": org.Slug, "email": email,
+		"role": string(role), "expires_at": inv.ExpiresAt,
+	})
+	writeJSON(w, http.StatusCreated, api.OrgInvitationWithToken{
+		OrgInvitationResponse: api.OrgInvitationResponseFromRow(invitationToRow(inv, org.Slug, now)),
+		Token:                 token,
+	})
+}
+
+// persistOrgInvitation creates an OrgInvitation row with the
+// default TTL and stamps the supplied fields. On conflict (token-
+// hash collision — astronomically unlikely at 32 bytes) writes a
+// 500 Problem; on other Store failures also writes a 500 Problem.
+// Returns the persisted row + now() + true; false on any error.
+func (s *server) persistOrgInvitation(ctx context.Context, w http.ResponseWriter, org state.Org, base state.OrgInvitation) (state.OrgInvitation, time.Time, bool) {
+	now := time.Now()
+	base.OrgID = org.ID
+	base.ExpiresAt = now.Add(defaultOrgInvitationTtl)
+	base.CreatedAt = now
+	inv, err := s.store.CreateOrgInvitation(ctx, base)
 	if err != nil {
 		if errors.Is(err, state.ErrConflict) {
 			// Duplicate token_hash is astronomically unlikely
 			// (32 bytes); return a 500 so the customer doesn't
 			// think the invite was a no-op.
 			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-				api.CodeCapacity,
-				"CreateOrgInvitation collided",
+				api.CodeCapacity, "CreateOrgInvitation collided",
 				"rare token-hash collision; retry"))
-			return
+		} else {
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity, "CreateOrgInvitation failed",
+				"try again; if the problem persists, contact support"))
 		}
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"CreateOrgInvitation failed",
-			"try again; if the problem persists, contact support"))
-		return
+		return state.OrgInvitation{}, time.Time{}, false
 	}
-	s.audit.Emit(r.Context(), "org.invitation.created", &acct.ID, map[string]any{
-		"org_id":     org.ID,
-		"slug":       org.Slug,
-		"email":      email,
-		"role":       string(role),
-		"expires_at": inv.ExpiresAt,
-	})
-	row := invitationToRow(inv, org.Slug, now)
-	writeJSON(w, http.StatusCreated, api.OrgInvitationWithToken{
-		OrgInvitationResponse: api.OrgInvitationResponseFromRow(row),
-		Token:                 token,
-	})
+	return inv, now, true
+}
+
+// mintOrgInvitationToken generates 32 bytes from crypto/rand and
+// returns the base64url-encoded plaintext + SHA-256 hash. On failure
+// the helper writes the 500 Problem and returns mintErr=true so the
+// caller short-circuits.
+func (s *server) mintOrgInvitationToken(w http.ResponseWriter) (token string, tokenHash []byte, mintErr bool) {
+	plaintext := make([]byte, OrgInvitationTokenBytes)
+	if _, err := rand.Read(plaintext); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity, "crypto/rand failed",
+			"try again; if the problem persists, contact support"))
+		return "", nil, true
+	}
+	hash := sha256.Sum256(plaintext)
+	return base64.RawURLEncoding.EncodeToString(plaintext), hash[:], false
 }
 
 // changeOrgMemberRole updates a member's role. The role-change
@@ -223,16 +199,11 @@ func (s *server) inviteOrgMember(w http.ResponseWriter, r *http.Request, acct st
 //
 // Mounted at PATCH /v1/orgs/{slug}/members/{user_id}.
 func (s *server) changeOrgMemberRole(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionChangeRole, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionChangeRole) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
 	targetID := r.PathValue("user_id")
@@ -277,12 +248,8 @@ func (s *server) changeOrgMemberRole(w http.ResponseWriter, r *http.Request, acc
 	// Re-read the row so the response carries the joined account
 	// email / role pair (the store doesn't return the updated
 	// row, so a single-org lookup is the only way to surface it).
-	updated, err := s.store.OrgMemberByAccount(r.Context(), mem.OrgID, targetID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"OrgMemberByAccount (post-update) failed",
-			"refresh and try again"))
+	updated, ok := s.rehydrateMembership(r.Context(), w, mem, targetID)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, api.OrgMemberResponseFromRow(s.memberToRow(r.Context(), updated)))
@@ -294,16 +261,11 @@ func (s *server) changeOrgMemberRole(w http.ResponseWriter, r *http.Request, acc
 //
 // Mounted at DELETE /v1/orgs/{slug}/members/{user_id}.
 func (s *server) removeOrgMember(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionRemoveMembers, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionRemoveMembers) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
 	targetID := r.PathValue("user_id")

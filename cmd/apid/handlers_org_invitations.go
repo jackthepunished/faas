@@ -78,14 +78,15 @@ func (s *server) peekInvitation(w http.ResponseWriter, r *http.Request, _ state.
 	now := time.Now()
 	status := api.DeriveOrgInvitationStatus(inv.ConsumedAt, inv.RevokedAt, inv.ExpiresAt, now)
 	if status == "consumed" || status == "revoked" || status == "expired" {
-		// Don't leak the org slug + email + role for an
-		// already-terminal invitation — return the same
-		// "invalid" shape a malformed token would.
-		if status == "expired" {
-			api.WriteProblem(w, api.ErrOrgInvitationExpired())
-		} else {
-			api.WriteProblem(w, api.ErrOrgInvitationInvalid())
-		}
+		// Collapse every terminal-state token (consumed /
+		// revoked / expired) onto a single ErrOrgInvitationInvalid
+		// so an attacker who has a leaked token cannot enumerate
+		// which rows are still live by the code returned. The
+		// Expired constructor is reserved for the PR 8 accept
+		// flow where the caller is the legitimate invitee and
+		// needs to know "this token is past its TTL" so the
+		// dashboard can render a "request a new invite" CTA.
+		api.WriteProblem(w, api.ErrOrgInvitationInvalid())
 		return
 	}
 	row := invitationToRow(inv, org.Slug, now)
@@ -97,16 +98,11 @@ func (s *server) peekInvitation(w http.ResponseWriter, r *http.Request, _ state.
 //
 // Mounted at POST /v1/orgs/{slug}/transfer_ownership.
 func (s *server) transferOrgOwnership(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionTransferOwnership, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionTransferOwnership) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
 	var req api.TransferOwnershipRequest
@@ -149,12 +145,8 @@ func (s *server) transferOrgOwnership(w http.ResponseWriter, r *http.Request, ac
 		"from_account": acct.ID,
 		"to_account":   newOwnerID,
 	})
-	updated, err := s.store.OrgByID(r.Context(), mem.OrgID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"OrgByID (post-transfer) failed",
-			"refresh and try again"))
+	updated, ok := s.rehydrateOrg(r.Context(), w, mem)
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, api.OrgResponseFromRow(orgToRow(updated)))

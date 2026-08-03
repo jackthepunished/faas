@@ -8041,7 +8041,9 @@ func (m *MemStore) ListOrgsForAccount(_ context.Context, accountID string) ([]Or
 	return out, nil
 }
 
-// UpdateOrgPlan / UpdateOrgStatus / SoftDeleteOrg are mirror updates.
+// UpdateOrgPlan / UpdateOrgName / UpdateOrgStatus / SoftDeleteOrg are
+// mirror updates. Each stamps UpdatedAt so the wire shape is monotonic
+// per row.
 func (m *MemStore) UpdateOrgPlan(_ context.Context, id string, plan api.Plan) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -8050,6 +8052,23 @@ func (m *MemStore) UpdateOrgPlan(_ context.Context, id string, plan api.Plan) er
 		return ErrNotFound
 	}
 	o.Plan = plan
+	o.UpdatedAt = time.Now().UTC()
+	m.orgs[id] = o
+	return nil
+}
+
+// UpdateOrgName is the name half of PATCH /v1/orgs/{slug} (PR 5). The
+// handler trims + bounds the name before reaching the Store; the
+// MemStore is permissive but the validation contract is identical to
+// the PgStore path.
+func (m *MemStore) UpdateOrgName(_ context.Context, id, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	o.Name = name
 	o.UpdatedAt = time.Now().UTC()
 	m.orgs[id] = o
 	return nil

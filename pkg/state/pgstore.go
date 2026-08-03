@@ -9919,11 +9919,29 @@ func (s *PgStore) ListOrgsForAccount(ctx context.Context, accountID string) ([]O
 	return out, rows.Err()
 }
 
-// UpdateOrgPlan / UpdateOrgStatus / SoftDeleteOrg are mirror updates.
+// UpdateOrgPlan / UpdateOrgName / UpdateOrgStatus / SoftDeleteOrg are
+// mirror updates. Each stamps `updated_at = now()` so the wire shape's
+// UpdatedAt is monotonic per row.
 func (s *PgStore) UpdateOrgPlan(ctx context.Context, id string, plan api.Plan) error {
 	tag, err := s.pool.Exec(ctx, `update orgs set plan = $2, updated_at = now() where id = $1`, id, string(plan))
 	if err != nil {
 		return fmt.Errorf("state: update org plan: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateOrgName is the name half of the PATCH /v1/orgs/{slug} contract
+// (PR 5). The SQL CHECK on orgs.name rejects empty strings and names
+// >256 bytes with sqlstate 23514 — the handler trims + bounds before
+// reaching here so the surface is always 200/404. Returns ErrNotFound
+// when no row matches.
+func (s *PgStore) UpdateOrgName(ctx context.Context, id, name string) error {
+	tag, err := s.pool.Exec(ctx, `update orgs set name = $2, updated_at = now() where id = $1`, id, name)
+	if err != nil {
+		return fmt.Errorf("state: update org name: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound

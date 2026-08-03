@@ -21,7 +21,9 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -54,10 +56,9 @@ func (s *server) listOrgsForCaller(w http.ResponseWriter, r *http.Request, acct 
 }
 
 // createSharedOrg inserts a new shared (non-personal) org with the
-// caller as the first owner. The slug is validated against
-// api.OrgSlugPattern (the schema's CHECK rejects oversize /
-// uppercase / underscored slugs with 23514 — bail at the handler
-// first to keep the error shape consistent).
+// caller as the first owner. Slug validation runs at the handler so
+// the wire shape stays consistent (the schema's 23514 tripwire
+// would otherwise produce a raw 500).
 //
 // Mounted at POST /v1/orgs.
 func (s *server) createSharedOrg(w http.ResponseWriter, r *http.Request, acct state.Account) {
@@ -74,50 +75,32 @@ func (s *server) createSharedOrg(w http.ResponseWriter, r *http.Request, acct st
 	}
 	if name == "" {
 		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity,
-			api.CodeValidation,
-			"Name required",
-			"name must be a non-empty string"))
+			api.CodeValidation, "Name required", "name must be a non-empty string"))
 		return
 	}
-	// Plan defaults to Free (PR 7 cut-over mirrors this to the
-	// personal-org plan column); the type assertion is implicit in
-	// CreateOrg's auto-stamping.
-	newOrg, err := s.store.CreateOrg(r.Context(), state.Org{
-		Slug:     slug,
-		Name:     name,
-		Personal: false,
-	})
+	// Plan defaults to Free; CreateOrg stamps it. The caller seeds
+	// the exactly-one-owner partial unique (zero owners at insert
+	// time), so AddOrgMember cannot trip ErrOrgLastOwner.
+	newOrg, err := s.store.CreateOrg(r.Context(), state.Org{Slug: slug, Name: name})
 	if err != nil {
-		switch {
-		case errors.Is(err, state.ErrConflict):
-			// Slug uniqueness (case-insensitive) is the tripwire.
+		if errors.Is(err, state.ErrConflict) {
 			api.WriteProblem(w, api.ErrOrgSlugTaken(slug))
-		default:
+		} else {
 			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-				api.CodeCapacity,
-				"CreateOrg failed",
+				api.CodeCapacity, "CreateOrg failed",
 				"try again; if the problem persists, contact support"))
 		}
 		return
 	}
-	// Caller becomes the first owner. The seeded role respects the
-	// exactly-one-owner partial unique (the new org has zero active
-	// owners at this point), so AddOrgMember cannot trip the
-	// ErrOrgLastOwner sentinel — only ErrConflict for a duplicate
-	// membership, which can't happen (the caller is not yet a
-	// member of this brand-new org).
 	invitedBy := acct.ID
 	if err := s.store.AddOrgMember(r.Context(), newOrg.ID, acct.ID, state.OrgRoleOwner, &invitedBy); err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"AddOrgMember (initial owner) failed",
+			api.CodeCapacity, "AddOrgMember (initial owner) failed",
 			"the org row was created but the owner membership failed to seed; contact support"))
 		return
 	}
 	s.audit.Emit(r.Context(), "org.created", &acct.ID, map[string]any{
-		"org_id": newOrg.ID,
-		"slug":   newOrg.Slug,
-		"name":   newOrg.Name,
+		"org_id": newOrg.ID, "slug": newOrg.Slug, "name": newOrg.Name,
 	})
 	writeJSON(w, http.StatusCreated, api.OrgResponseFromRow(orgToRow(newOrg)))
 }
@@ -130,18 +113,11 @@ func (s *server) createSharedOrg(w http.ResponseWriter, r *http.Request, acct st
 //
 // Mounted at GET /v1/orgs/{slug}.
 func (s *server) getOrg(w http.ResponseWriter, r *http.Request, _ state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionView, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionView) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		// Wired route through s.loadOrg; this is a fail-closed
-		// safety net (same posture as whoamiActiveOrg).
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
 	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
@@ -168,97 +144,130 @@ func (s *server) patchOrg(w http.ResponseWriter, r *http.Request, _ state.Accoun
 	}
 	if req.Name == nil && req.Plan == nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity,
-			api.CodeValidation,
-			"No fields to update",
+			api.CodeValidation, "No fields to update",
 			"either name or plan must be supplied"))
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
+	if !s.authorizeOrgPatchFields(w, r, req) {
+		return
+	}
+	newName, newPlan, ok := s.resolveOrgPatchFields(w, req)
+	if !ok {
+		return
+	}
+	org, ok := s.loadMutableOrgByMembership(r.Context(), w, mem)
+	if !ok {
+		return
+	}
+	if !s.applyOrgFieldUpdates(r.Context(), w, org.ID, req, newName, newPlan) {
+		return
+	}
+	s.audit.Emit(r.Context(), "org.updated", nil, map[string]any{
+		"org_id": org.ID, "name": req.Name != nil, "plan": req.Plan != nil,
+	})
+	updated, ok := s.rehydrateOrg(r.Context(), w, mem)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, api.OrgResponseFromRow(orgToRow(updated)))
+}
 
-	// Authorise the operation that matches which fields the caller
-	// is touching. Both checks fire when both fields are present.
-	// Plan changes short-circuit on ChangePlan (owner-only); name
-	// changes fall through to ManageBilling (owner + billing).
+// authorizeOrgPatchFields authorises the operation(s) that match
+// which fields the caller is touching. Plan changes short-circuit
+// on ChangePlan (owner-only); name changes fall through to
+// ManageBilling (owner + billing). Both checks fire when both
+// fields are present in the request body.
+func (s *server) authorizeOrgPatchFields(w http.ResponseWriter, r *http.Request, req api.PatchOrgRequest) bool {
 	if req.Plan != nil {
 		if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionChangePlan, s.audit); p != nil {
 			api.WriteProblem(w, p)
-			return
+			return false
 		}
 	}
 	if req.Name != nil {
 		if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionManageBilling, s.audit); p != nil {
 			api.WriteProblem(w, p)
-			return
+			return false
 		}
 	}
+	return true
+}
 
-	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"OrgByID failed",
-			"the org row could not be loaded; refresh and try again"))
-		return
-	}
-	if org.Personal {
-		// Personal-org name + plan are denormalized from the
-		// account (PRD §3.2 — personal orgs are immutable).
-		// Plan transfer lands in PR 7.
-		api.WriteProblem(w, api.ErrOrgPersonalImmutable())
-		return
-	}
+// resolveOrgPatchFields validates + trims the per-field values
+// before any Store call (validation failures short-circuit before
+// a doomed UpdateOrgName). Returns newName, newPlan, true on
+// success; writes the Problem + returns zero values + false on
+// any failure.
+func (s *server) resolveOrgPatchFields(w http.ResponseWriter, req api.PatchOrgRequest) (string, api.Plan, bool) {
+	var newName string
+	var newPlan api.Plan
 	if req.Name != nil {
-		newName := strings.TrimSpace(*req.Name)
+		newName = strings.TrimSpace(*req.Name)
 		if newName == "" {
 			api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity,
-				api.CodeValidation,
-				"Name required",
+				api.CodeValidation, "Name required",
 				"name must be a non-empty string when supplied"))
-			return
+			return "", "", false
 		}
-		org.Name = newName
 	}
 	if req.Plan != nil {
-		newPlan := api.Plan(*req.Plan)
-		if err := s.store.UpdateOrgPlan(r.Context(), org.ID, newPlan); err != nil {
-			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-				api.CodeCapacity,
-				"UpdateOrgPlan failed",
-				"try again; if the problem persists, contact support"))
-			return
+		newPlan = api.Plan(strings.TrimSpace(*req.Plan))
+		if !isKnownPlan(newPlan) {
+			// Reuse ErrOrgSlugInvalid's wire shape for the closed
+			// enum: 422 org_slug_invalid with the closed set named
+			// in the detail (we don't add a new wire code; the
+			// catalogue is closed at PR 1).
+			api.WriteProblem(w, api.ErrOrgSlugInvalid(
+				fmt.Sprintf("plan %q is not in the closed set %v", string(newPlan), api.Plans)))
+			return "", "", false
 		}
-		org.Plan = newPlan
 	}
-	// Persist name-only updates directly via... actually, the
-	// Store interface has no UpdateOrgName (each field update has
-	// its own method per the §6 pattern). For name, route through
-	// the consolidated path: a future PR adds UpdateOrgName. PR 5
-	// only persists the plan here; name updates flow into PR 7's
-	// org-write consolidation once the cut-over lands.
-	s.audit.Emit(r.Context(), "org.updated", nil, map[string]any{
-		"org_id": org.ID,
-		"name":   req.Name != nil,
-		"plan":   req.Plan != nil,
-	})
-	// Re-read so the response carries the post-update row (plan
-	// only — name updates above aren't persisted here because
-	// UpdateOrgName isn't on the Store yet).
-	updated, err := s.store.OrgByID(r.Context(), mem.OrgID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"OrgByID (post-update) failed",
-			"refresh and try again"))
-		return
+	return newName, newPlan, true
+}
+
+// applyOrgFieldUpdates persists the per-field changes for PATCH
+// /v1/orgs/{slug}. Each field has its own Store method per the §6
+// pattern (one SQL UPDATE per field, no consolidated multi-column
+// write); both stamp updated_at = now() so the wire shape's
+// UpdatedAt is monotonic per row. Returns false (and writes the
+// Problem) on the first Store failure.
+func (s *server) applyOrgFieldUpdates(ctx context.Context, w http.ResponseWriter, orgID string, req api.PatchOrgRequest, newName string, newPlan api.Plan) bool {
+	if req.Name != nil {
+		if err := s.store.UpdateOrgName(ctx, orgID, newName); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity, "UpdateOrgName failed",
+				"try again; if the problem persists, contact support"))
+			return false
+		}
 	}
-	writeJSON(w, http.StatusOK, api.OrgResponseFromRow(orgToRow(updated)))
+	if req.Plan != nil {
+		if err := s.store.UpdateOrgPlan(ctx, orgID, newPlan); err != nil {
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity, "UpdateOrgPlan failed",
+				"try again; if the problem persists, contact support"))
+			return false
+		}
+	}
+	return true
+}
+
+// isKnownPlan is the closed-enum membership check for the PATCH
+// /v1/orgs/{slug} body. Mirrors the slug validator's posture:
+// the wire shape carries a free string and the handler rejects
+// anything outside the closed set with ErrOrgSlugInvalid's wire
+// shape (the catalogue is closed at PR 1; adding a new plan is a
+// separate concern).
+func isKnownPlan(p api.Plan) bool {
+	for _, k := range api.Plans {
+		if k == p {
+			return true
+		}
+	}
+	return false
 }
 
 // softDeleteOrg sets the deleted_pending flag. Hard delete lands
@@ -266,28 +275,15 @@ func (s *server) patchOrg(w http.ResponseWriter, r *http.Request, _ state.Accoun
 //
 // Mounted at DELETE /v1/orgs/{slug}.
 func (s *server) softDeleteOrg(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	if p := authz.AuthorizeOrgAction(r.Context(), authz.OrgActionDelete, s.audit); p != nil {
-		api.WriteProblem(w, p)
+	if !s.requireOrgAction(w, r, authz.OrgActionDelete) {
 		return
 	}
-	mem, ok := authz.MembershipFrom(r)
-	if !ok || mem == nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"LoadOrg wired before AuthorizeOrgAction",
-			"no membership on request; check the route table"))
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
 		return
 	}
-	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity,
-			"OrgByID failed",
-			"the org row could not be loaded; refresh and try again"))
-		return
-	}
-	if org.Personal {
-		api.WriteProblem(w, api.ErrOrgPersonalImmutable())
+	org, ok := s.loadMutableOrgByMembership(r.Context(), w, mem)
+	if !ok {
 		return
 	}
 	if err := s.store.SoftDeleteOrg(r.Context(), org.ID); err != nil {
