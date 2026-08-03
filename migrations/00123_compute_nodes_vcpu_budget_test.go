@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00081 (compute_nodes.vcpu_budget,
+// Migration-apply tests for 00123 (compute_nodes.vcpu_budget,
 // Tier A2 — per-node vCPU admission budget).
 //
 // Pins the Tier A2 acceptance gate verbatim:
-// <the migration set applies cleanly through 00081; the column
+// <the migration set applies cleanly through 00123; the column
 // accepts the canonical int shape and round-trips; default is 160;
 // replay-safe: ADD COLUMN IF NOT EXISTS makes a second MigrateUp
 // no-op.>
@@ -19,7 +19,7 @@
 //	   specifying vcpu_budget gets 160 (the migration default +
 //	   the single-box backwards-compat posture).
 //	5. The default-local row seeded by migration 00024 carries
-//	   vcpu_budget=160 after 00081 applies (no operator tuning
+//	   vcpu_budget=160 after 00123 applies (no operator tuning
 //	   needed for the legacy single-box path).
 //	6. Replay-safety: a second MigrateUp() returns nil — the
 //	   ADD COLUMN IF NOT EXISTS makes the migration idempotent.
@@ -43,11 +43,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00081_1_VCPUBudgetColumnShape pins the column shape
-// after migration 00081 applies. data_type=integer + is_nullable=NO
+// TestMigration_00123_1_VCPUBudgetColumnShape pins the column shape
+// after migration 00123 applies. data_type=integer + is_nullable=NO
 // + column_default=160. Any drift (e.g. someone typing smallint, or
 // adding a permissive NULL, or dropping the default) fails loud.
-func TestMigration_00081_1_VCPUBudgetColumnShape(t *testing.T) {
+func TestMigration_00123_1_VCPUBudgetColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -79,12 +79,12 @@ func TestMigration_00081_1_VCPUBudgetColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00081_2_CheckConstraintRejectsZero pins the
+// TestMigration_00123_2_CheckConstraintRejectsZero pins the
 // defensive CHECK (vcpu_budget > 0). A future operator that
 // upserts vcpu_budget=0 must hit SQLSTATE 23514 (check_violation),
 // not silently accept it — zero would make every chooser candidate
 // filter refuse the row and the fleet would silently lose capacity.
-func TestMigration_00081_2_CheckConstraintRejectsZero(t *testing.T) {
+func TestMigration_00123_2_CheckConstraintRejectsZero(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -115,11 +115,11 @@ func TestMigration_00081_2_CheckConstraintRejectsZero(t *testing.T) {
 	}
 }
 
-// TestMigration_00081_3_CanonicalRoundTrip pins the column's
+// TestMigration_00123_3_CanonicalRoundTrip pins the column's
 // int shape: insert a row with vcpu_budget=320 (operator-tuned
 // heterogeneous fleet — a smaller box with vpcpus=40 and
 // vcpu_budget=320), read it back, assert 320.
-func TestMigration_00081_3_CanonicalRoundTrip(t *testing.T) {
+func TestMigration_00123_3_CanonicalRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -145,12 +145,12 @@ func TestMigration_00081_3_CanonicalRoundTrip(t *testing.T) {
 	}
 }
 
-// TestMigration_00081_4_DefaultBackfill pins the migration
+// TestMigration_00123_4_DefaultBackfill pins the migration
 // default. A row INSERTed without specifying vcpu_budget must
 // land at 160 — the legacy single-box posture + the contract
 // that an operator never has to manually set the budget on the
 // synthetic default-local row seeded by migration 00024.
-func TestMigration_00081_4_DefaultBackfill(t *testing.T) {
+func TestMigration_00123_4_DefaultBackfill(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -176,9 +176,9 @@ func TestMigration_00081_4_DefaultBackfill(t *testing.T) {
 	}
 }
 
-// TestMigration_00081_5_DefaultLocalRowBackfill pins the
+// TestMigration_00123_5_DefaultLocalRowBackfill pins the
 // load-bearing single-box backfill. Migration 00024 seeded a
-// synthetic default-local row; after 00081 applies, that row
+// synthetic default-local row; after 00123 applies, that row
 // carries vcpu_budget=160 via the column default without
 // operator action. (We can't predict the synthetic row's id on
 // a fresh DB, so we look it up by name.)
@@ -186,11 +186,11 @@ func TestMigration_00081_4_DefaultBackfill(t *testing.T) {
 // Hard-fail on missing row: the contract this test depends on
 // is "every fresh-DB apply ends with a default-local row".
 // A skip would mask a regression where 00024's seed was dropped
-// or 00081's backfill skipped the row entirely. pgtest.Open
+// or 00123's backfill skipped the row entirely. pgtest.Open
 // runs the full migration set, so the row is always present on a
 // clean run; a missing row is a real bug, not a test-rig
 // limitation.
-func TestMigration_00081_5_DefaultLocalRowBackfill(t *testing.T) {
+func TestMigration_00123_5_DefaultLocalRowBackfill(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -210,13 +210,13 @@ func TestMigration_00081_5_DefaultLocalRowBackfill(t *testing.T) {
 	}
 }
 
-// TestMigration_00081_6_ReplaySafe pins the idempotency contract.
+// TestMigration_00123_6_ReplaySafe pins the idempotency contract.
 // A second MigrateUp() returns nil — the ADD COLUMN IF NOT EXISTS
 // makes the migration a no-op. This is the tripwire for the
 // replay-safety pattern PR #377 / ADR-041 established; without
 // it, a hot-reload of the binary would 42710 ("column already
 // exists") and refuse to boot.
-func TestMigration_00081_6_ReplaySafe(t *testing.T) {
+func TestMigration_00123_6_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -231,16 +231,16 @@ func TestMigration_00081_6_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00081_7_DownSymmetry pins the down path. We
+// TestMigration_00123_7_DownSymmetry pins the down path. We
 // don't have a MigrateDownTo helper in pkg/db today (only
 // MigrateUp), so we drive goose directly via a SQL probe: read
 // the migration's own -- +goose Down body and verify the column
 // drops cleanly. A non-symmetric down would leave a broken
-// schema on a release that needs to roll back 00081 in isolation.
+// schema on a release that needs to roll back 00123 in isolation.
 //
 // On skip: this test only runs on a Postgres-backed test
 // (FAAS_SKIP_PG_TESTS=1 to opt out).
-func TestMigration_00081_7_DownSymmetry(t *testing.T) {
+func TestMigration_00123_7_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
