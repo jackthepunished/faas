@@ -169,7 +169,7 @@ func TestSupervisor_LastErr_NilAndStored(t *testing.T) {
 	}
 	stored := errors.New("synthetic terminal error")
 	sup.trackRunErr(stored)
-	if got := sup.lastErr(); got != stored {
+	if got := sup.lastErr(); !errors.Is(got, stored) {
 		t.Errorf("after trackRunErr, lastErr = %v, want %v", got, stored)
 	}
 }

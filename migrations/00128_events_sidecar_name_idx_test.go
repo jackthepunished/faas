@@ -63,7 +63,9 @@ func TestMigrations_00128_EventsSidecarNameIdx(t *testing.T) {
 	// exposes the indexdef verbatim; we assert the two
 	// load-bearing pieces:
 	//   (a) the partial WHERE clause on the closed kinds,
-	//   (b) the expression key (data->>'sidecar_name')::text.
+	//   (b) the expression key (data->>'sidecar_name') — no
+	//       `::text` cast (Postgres rejects it inside CREATE
+	//       INDEX; `->>` already returns text).
 	// A regression that drops the partial predicate would
 	// bloat the index to cover every events row (mostly
 	// non-sidecar events); a regression that drops the

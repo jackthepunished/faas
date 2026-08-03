@@ -28,13 +28,14 @@
 -- that dominate the table are excluded) and lets the planner
 -- use it directly for ListEventsBySidecar's predicate. The
 -- planner's btree-on-expression index match is exact — the
--- index key is `(data->>'sidecar_name')::text`, the predicate
--- is `data->>'sidecar_name' = $1`, so an index-only scan
--- suffices. A future PR that adds another closed sidecar-kind
--- must add the kind to the WHERE list (the planner can still
--- use the index for the jsonb predicate but the kind filter
--- falls back to a heap filter — fine, the index size stays
--- the same).
+-- index key is `(data->>'sidecar_name')` (the `->>` operator
+-- already returns text; an explicit `::text` cast is rejected
+-- by Postgres inside CREATE INDEX), the predicate is
+-- `data->>'sidecar_name' = $1`, so an index-only scan suffices.
+-- A future PR that adds another closed sidecar-kind must add
+-- the kind to the WHERE list (the planner can still use the
+-- index for the jsonb predicate but the kind filter falls back
+-- to a heap filter — fine, the index size stays the same).
 --
 -- Storage cost is bounded: at the closed-kinds rate (a few
 -- events per sidecar restart cycle), the index never grows
@@ -46,7 +47,7 @@
 -- ADR-041 contract).
 
 CREATE INDEX IF NOT EXISTS events_sidecar_name_idx
-    ON public.events ((data->>'sidecar_name')::text)
+    ON public.events ((data->>'sidecar_name'))
     WHERE kind IN ('wake.sidecar_init_exit', 'wake.sidecar_restart');
 
 -- +goose StatementEnd
