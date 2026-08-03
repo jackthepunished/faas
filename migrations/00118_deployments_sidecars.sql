@@ -35,15 +35,15 @@
 -- names share a namespace; use the pg_constraint existence check
 -- below).
 --
--- Slot: 00117 (HEAD on origin/main is 00115 = api_key_expiry_rotation,
+-- Slot: 00118 (HEAD on origin/main is 00115 = api_key_expiry_rotation,
 -- PR #539, issue #189 iam-5 API key expiry + rotation). Renumber
--- chain on the PR branch: 95 → 96 → 97 → 98 → 101 → 105 → 106 → 107 → 108 → 111 → 112 → 116 → 117
--- across twelve rebase cycles against sibling PRs that grabbed the
--- intermediate slots (PR #525 → 109/110 warm snapshot, PR #540 →
--- 116 webhook_deliveries, etc.). If a sibling PR
--- claims 00117 first, renumber
--- per migrations/README.md (ADR-041 fence) and update the test
--- filename + test function name +
+-- chain on the PR branch: 95 → 96 → 97 → 98 → 101 → 105 → 106 → 107 → 108 → 111 → 112 → 116 → 117 → 118
+-- across thirteen rebase cycles against sibling PRs that grabbed
+-- the intermediate slots (PR #525 → 109/110 warm snapshot, PR #540 →
+-- 116 webhook_deliveries → 117 webhook_deliveries again, PR #543 →
+-- 117 reserve + 118 instances_framework_ready_at, etc.). If a sibling
+-- PR claims 00118 first, renumber per migrations/README.md
+-- (ADR-041 fence) and update the test filename + test function name +
 -- pkg/e2etest/harness.go::e2eMigrationTarget together.
 
 ALTER TABLE deployments

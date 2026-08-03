@@ -925,8 +925,8 @@ const (
 	// included). The cap is structurally tight: 1 init + 1
 	// sidecar is the smallest useful surface for a stateless
 	// workload, and the schema CHECK on `deployments.sidecars`
-	// (migration 00116) pins the cap at the second-line defence
-	// layer (migrations/00116_deployments_sidecars.sql). A future
+	// (migration 00118) pins the cap at the second-line defence
+	// layer (migrations/00118_deployments_sidecars.sql). A future
 	// PR can grow this to a per-plan matrix if telemetry shows
 	// demand — the constant is the single source of truth.
 	SidecarCapMax = 2

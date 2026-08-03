@@ -1,7 +1,7 @@
 //go:build !no_pg
 
 // pgstore_sidecars_test.go — round-trip tests for the sidecars
-// jsonb column added by migration 00117 (issue #463 / ADR-068).
+// jsonb column added by migration 00118 (issue #463 / ADR-068).
 //
 // Build tag: !no_pg matches the rest of the pgstore-side tests; set
 // FAAS_SKIP_PG_TESTS=1 to opt out locally without rebuilding.

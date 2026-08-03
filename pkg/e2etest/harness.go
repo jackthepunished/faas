@@ -361,7 +361,7 @@ const testDomain = "apps.test.example"
 // renumber chain tracks the gate's "next free slot past the live
 // head" rule when sibling PRs race for the same N.)
 //
-//   - 94 → 110 after PR #533 (Tier A5 cross-node live-instance
+//   - 94 → 118 after PR #533 (Tier A5 cross-node live-instance
 //     migration, ADR-066) merged real migrations at 00103 +
 //     00104, then PR #536 (iam-6 personal-org backfill) merged
 //     real at 00105, then PR #525 (issue #470 M8 warm snapshot)
@@ -371,17 +371,20 @@ const testDomain = "apps.test.example"
 //     merged real at 00114, then PR #532 (issue #517 PR-C)
 //     merged real at 00107. The renumber commits in this
 //     branch's history (101/102 → 103/104 → 105/106 → 107/108 →
-//     109/110 → 111 → 112 → 116) collided with main's new files,
-//     so all eight were dropped on rebase (the work is now
+//     109/110 → 111 → 112 → 116 → 117) collided with main's new
+//     files, so all nine were dropped on rebase (the work is now
 //     collapsed into a single post-rebase commit). The branch
-//     renumbered 00101 → 00117 past main's new head at 115; the
-//     106-108 gap is filled by reserve_slot.sql fences at
-//     00106/00107/00108 per ADR-041 so the embedded FS stays
-//     contiguous 1..116. (Slots 00105/00109/00110/00114/00115
-//     are owned by main's real migrations — no fence needed
-//     there.) PR #531 (issue #463 sidecars) claims 00117. No
-//     open PR overlaps with 00117.
-const e2eMigrationTarget = 117
+//     renumbered 00101 → 00118 past main's new head at 115; the
+//     106-108 + 116 + 117 gaps are filled by reserve_slot.sql
+//     fences at 00106/00107/00108/00116/00117 per ADR-041 so the
+//     embedded FS stays contiguous 1..118. (Slots
+//     00105/00109/00110/00114/00115 are owned by main's real
+//     migrations — no fence needed there.) PR #531 (issue #463
+//     sidecars) claims 00118. PR #540 jumped to 00117 between
+//     my 116 → 117 push and the resulting CI run, then PR #543
+//     reserved 117 + claimed 118; the renumber 117 → 118 keeps
+//     the slot gate clear against the open-PR set.
+const e2eMigrationTarget = 118
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
