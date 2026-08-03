@@ -497,23 +497,64 @@ func (s *server) scanService(
 	// appear under any project. The rollback is best-effort:
 	// a DeleteProject failure logs but does not mask the
 	// reconcile error the caller is returning.
-	created, projErr := s.store.CreateProject(r.Context(), project)
-	if projErr != nil {
-		var prob *api.Problem
-		switch {
-		case errors.Is(projErr, state.ErrConflict):
-			prob = api.NewProblem(http.StatusConflict,
-				api.CodeValidation, "Project slug collision",
-				"this project slug is already taken")
-		case errors.Is(projErr, state.ErrNotFound):
-			prob = api.NewProblem(http.StatusNotFound,
-				api.CodeValidation, "Account not found", "")
-		default:
-			prob = api.ErrInternal(fmt.Sprintf("create project: %v", projErr))
+	// Upsert-by-slug (ADR-068 amendment, post-merge review):
+	// POST /v1/projects is idempotent on (account_id, slug). A
+	// second apply with the same slug re-uses the existing project
+	// row so reconcile can diff the workloads (adds / changes /
+	// soft-deletes). Without upsert, every diff test (re-apply
+	// same body to assert no-op) trips projects_account_slug_uniq
+	// and returns 409.
+	//
+	// Production branch / install_id / scan_source are kept from
+	// the original row — the request's values are applied only on
+	// the first insert; re-applies leave them alone. Customers
+	// change those via the dashboard, not by re-applying.
+	//
+	// Race window: two concurrent applies with the same slug both
+	// miss ProjectBySlug, both call CreateProject, one wins and the
+	// loser hits ErrConflict → we re-load and proceed. Two-step
+	// (read-then-insert) is cheaper than ON CONFLICT DO NOTHING +
+	// RETURNING + fallback SELECT, and the ErrConflict→reload path
+	// is rare.
+	var projectCreated bool
+	existing, lookupErr := s.store.ProjectBySlug(r.Context(), acct.ID, req.ProjectSlug)
+	switch {
+	case lookupErr == nil:
+		// Reuse existing row. Don't rollback if reconcile fails —
+		// the project pre-dated this apply.
+		project = existing
+		projectCreated = false
+	case errors.Is(lookupErr, state.ErrNotFound):
+		created, projErr := s.store.CreateProject(r.Context(), project)
+		if projErr != nil {
+			if errors.Is(projErr, state.ErrConflict) {
+				// Lost a race against a concurrent apply — the
+				// winner just inserted; re-load and reuse.
+				if reloaded, reloadErr := s.store.ProjectBySlug(r.Context(), acct.ID, req.ProjectSlug); reloadErr == nil {
+					project = reloaded
+					projectCreated = false
+				} else {
+					prob := api.NewProblem(http.StatusConflict,
+						api.CodeValidation, "Project slug collision",
+						"this project slug is already taken")
+					return resp, state.Project{}, nil, nil, nil, nil, prob
+				}
+			} else if errors.Is(projErr, state.ErrNotFound) {
+				prob := api.NewProblem(http.StatusNotFound,
+					api.CodeValidation, "Account not found", "")
+				return resp, state.Project{}, nil, nil, nil, nil, prob
+			} else {
+				prob := api.ErrInternal(fmt.Sprintf("create project: %v", projErr))
+				return resp, state.Project{}, nil, nil, nil, nil, prob
+			}
+		} else {
+			project = created
+			projectCreated = true
 		}
+	default:
+		prob := api.ErrInternal(fmt.Sprintf("load existing project: %v", lookupErr))
 		return resp, state.Project{}, nil, nil, nil, nil, prob
 	}
-	project = created
 	// Defer project rollback for any error path below.
 	// capturedProb tracks whether we already wrapped the
 	// reconcile error; the defer fires BEFORE the return
@@ -521,10 +562,16 @@ func (s *server) scanService(
 	//
 	// rollbackCtx is captured explicitly so the defer closure
 	// doesn't extend the lifetime of r (contextcheck linter).
+	// projectCreated gates the rollback: we only delete a project
+	// that THIS request inserted. Re-applying an existing project
+	// is upsert-by-slug (ADR-068 amendment); a reconcile failure
+	// there must not DeleteProject the customer's pre-existing
+	// row, which would orphan any apps the customer has since
+	// provisioned through the dashboard.
 	rollbackCtx := r.Context()
 	var capturedProb *api.Problem
 	defer func() {
-		if capturedProb != nil && project.ID != "" {
+		if capturedProb != nil && projectCreated && project.ID != "" {
 			if dErr := s.store.DeleteProject(rollbackCtx, project.ID); dErr != nil {
 				// Best-effort: a DeleteProject failure doesn't
 				// mask the underlying reconcile error the

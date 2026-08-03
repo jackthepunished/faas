@@ -187,6 +187,56 @@ Negative:
   any future change to the build-enqueue contract must touch
   the helper, not the callers.
 
+## Amendment (post-merge review): upsert-by-slug on apply
+
+`POST /v1/projects` is **idempotent on `(account_id, slug)`**.
+A second apply with the same slug re-uses the existing project
+row instead of returning `409 Project slug collision`. This is
+load-bearing for the diff semantics (ADR-068 §Decision): the
+diff engine needs to compare the new workload set against the
+existing project's apps to compute `+ / ~ / -` deltas, and a
+rejected insert would leave the customer with no path to
+re-apply.
+
+Why not ON CONFLICT DO NOTHING RETURNING + fallback SELECT?
+Two-round-trip pessimistic `ProjectBySlug → CreateProject →
+(ErrConflict → ProjectBySlug)` is one round trip on the happy
+path, two on the (rare) race, and reads as the same shape as
+the rest of the scan service. The race path is opt-in only —
+two simultaneous applies with the same slug is a logged edge
+case, not a hot path.
+
+### Field preservation
+
+The existing project's `production_branch`, `install_id`, and
+`scan_source` are kept verbatim on re-apply. The request's
+values are inserted on first-create only. Customers change
+those fields through the dashboard, not by re-applying a
+tarball — accepting the request's value on every apply would
+silently overwrite `production_branch` if a customer pushed a
+dev branch by mistake.
+
+### Rollback semantics
+
+The `DeleteProject` rollback path that fires on a reconcile
+error (PR-GH.6 review H9 fix) is gated on `projectCreated` —
+the flag tracks whether *this* request inserted the project
+row. Re-applying an existing project must NOT delete it on
+failure: the customer's pre-existing project may already have
+apps provisioned through the dashboard, and an idempotent
+apply's reconcile failure must not orphan them.
+
+### Tested in
+
+- `cmd/e2e/apply_project_diff_e2e_test.go` — `Diff_Unchanged`,
+  `Diff_Added`, `Diff_Removed`, `Diff_Changed`,
+  `Diff_CronSoftDeleted`, `Diff_DomainCascade`,
+  `Diff_EnvCascade` all re-apply with the same slug to assert
+  no-op / add / remove / change deltas.
+- `cmd/e2e/apply_project_guards_e2e_test.go` —
+  `Guard_NeverEmpty` and `Guard_ScanSourceStable` re-apply and
+  assert the existing project's state is preserved.
+
 ## References
 
 - ADR-050 — repo decomposition and project object.
@@ -198,3 +248,28 @@ Negative:
 - `cmd/apid/scan_service.go::applyBuildsForAddedChanged` — the
   new apply-time enqueue loop.
 - `cmd/e2e/apply_project_*_e2e_test.go` — six test files.
+
+## Amendment (round-3 CI): compose detector source prefix
+
+Diff path's `reconcile.DeriveScanSource` priority list probed
+the detector-class name as a source prefix (e.g. `"compose:"`).
+The compose detector emits the **actual manifest filename**
+instead (`"docker-compose.yml: api"`, `"compose.yaml: api"`,
+`"compose.yml: api"`, `"docker-compose.yaml: api"`). With one
+workload, neither matched the prefix list → fell through to
+`len(workloads)==1` → `"single"`. With two workloads, the
+fall-through was `"unknown"`. The monotonic-upgrade guard
+(`pkg/reconcile/guards.go:114`) rejected the 1→2 transition as
+a "downgrade" (single→unknown → rank 1→0).
+
+Fix lives in `pkg/reconcile/diff.go::matchDetectorSource`:
+the compose class probes against a known set of compose-family
+filenames (`composeSourceFilenames`) before falling back to the
+bare `"compose:"` prefix. Other detectors keep their original
+behaviour — the string their source writers emit
+(`"fly:"`, `"k8s/deployment.yaml:"`, etc.) starts with the
+detector name, so the priority list still matches them.
+
+Tested in `pkg/reconcile/reconcile_test.go::TestReconcile_DeriveScanSource_MirrorsApid`
+additions: `docker-compose.yml filename is recognised as compose`,
+`compose.yml filename is recognised as compose`.
