@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping
 from typing import Any, TypeVar, cast
+from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -17,16 +18,22 @@ T = TypeVar("T", bound="APIKeyResponse")
 @_attrs_define
 class APIKeyResponse:
     """API key metadata: id, prefix (first 8 chars), label, scopes, created/last-used timestamps, request count.
-    **Plaintext is returned only on POST**.
+    **Plaintext is returned only on POST**. `org_id` (PR 6 / issue #190 / IAM-6 / ADR-061) is the org the key was minted
+    against; legacy account-scoped responses stamp `org_id = caller's personal org`. See `org.create_api_key` /
+    `org.revoke_api_key` for the new org-scoped verbs.
 
         Example:
-            {'id': '0123456789abcdef0123456789abcdef', 'prefix': 'fp_live_ab12cd34', 'label': 'ci-deploy', 'scopes':
-                ['apps:read', 'deploy:write'], 'created_at': '2026-08-02T11:25:00Z', 'expires_at': '2027-08-02T11:25:00Z',
-                'status': 'active', 'last_used_at': '2026-07-25T13:25:00Z'}
+            {'id': '0123456789abcdef0123456789abcdef', 'org_id': '8b1f5e5d-273e-5a18-ae00-58fceba4fe6c', 'prefix':
+                'fp_live_ab12cd34', 'label': 'ci-deploy', 'scopes': ['apps:read', 'deploy:write'], 'created_at':
+                '2026-08-02T11:25:00Z', 'expires_at': '2027-08-02T11:25:00Z', 'status': 'active', 'last_used_at':
+                '2026-07-25T13:25:00Z'}
 
     """
 
     id: str
+    org_id: UUID
+    """Org the key was minted against (PR 6). Always set — every `api_keys` row carries an org_id post-migration
+    00127. Personal-org scoped keys stamp the caller's personal org id here."""
     prefix: str
     """First 16 chars of the key (e.g. `fp_live_abc12345…`)."""
     scopes: list[APIKeyResponseScopesItem]
@@ -51,6 +58,8 @@ class APIKeyResponse:
 
     def to_dict(self) -> dict[str, Any]:
         id = self.id
+
+        org_id = str(self.org_id)
 
         prefix = self.prefix
 
@@ -112,6 +121,7 @@ class APIKeyResponse:
         field_dict.update(
             {
                 "id": id,
+                "org_id": org_id,
                 "prefix": prefix,
                 "scopes": scopes,
                 "created_at": created_at,
@@ -138,6 +148,8 @@ class APIKeyResponse:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         id = d.pop("id")
+
+        org_id = UUID(d.pop("org_id"))
 
         prefix = d.pop("prefix")
 
@@ -237,6 +249,7 @@ class APIKeyResponse:
 
         api_key_response = cls(
             id=id,
+            org_id=org_id,
             prefix=prefix,
             scopes=scopes,
             created_at=created_at,

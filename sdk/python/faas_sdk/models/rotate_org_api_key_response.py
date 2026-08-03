@@ -11,14 +11,14 @@ if TYPE_CHECKING:
     from ..models.api_key_response import APIKeyResponse
 
 
-T = TypeVar("T", bound="RotateKeyResponse")
+T = TypeVar("T", bound="RotateOrgAPIKeyResponse")
 
 
 @_attrs_define
-class RotateKeyResponse:
-    """Response body of POST /v1/keys/{id}/rotate. The new `key_plaintext` is returned exactly once; the old plaintext is
-    NEVER returned (only the hash is stored). `old_key_expires_at` is the grace deadline applied to the predecessor —
-    the customer's CI rotates over by then.
+class RotateOrgAPIKeyResponse:
+    """Response body of POST /v1/orgs/{slug}/keys/{id}/rotate. Mirrors `RotateKeyResponse`; org-scoped because the request
+    was — both keys carry the same `org_id` in `APIKeyResponse.org_id`. The new `key_plaintext` is returned exactly
+    once; the old plaintext is NEVER returned.
 
     """
 
@@ -28,12 +28,15 @@ class RotateKeyResponse:
     minted against; legacy account-scoped responses stamp `org_id = caller's personal org`. See `org.create_api_key`
     / `org.revoke_api_key` for the new org-scoped verbs."""
     key_plaintext: str
-    """New plaintext (PRESENT ONLY on this response). Capture immediately; the API never returns it again."""
+    """New plaintext (PRESENT ONLY on this response). Capture immediately; the API never returns it again. Org-
+    scoped mint; the plaintext belongs to the active org's id."""
     old_key_id: str
-    """Predecessor key id (matches Key.rotated_from_id)."""
+    """Predecessor key id (matches Key.rotated_from_id). Same org as the new key (rotation is org-local, never re-
+    bound)."""
     old_key_expires_at: datetime.datetime
     """Grace deadline applied to the old key (RFC 3339, UTC). When grace_window_days=0 the deadline is 'now'
-    (atomic rotation)."""
+    (atomic rotation). Mirrors the legacy `RotateKeyResponse.old_key_expires_at` contract; the org binding carries
+    through in `APIKeyResponse.org_id`."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -71,15 +74,15 @@ class RotateKeyResponse:
 
         old_key_expires_at = datetime.datetime.fromisoformat(d.pop("old_key_expires_at"))
 
-        rotate_key_response = cls(
+        rotate_org_api_key_response = cls(
             key=key,
             key_plaintext=key_plaintext,
             old_key_id=old_key_id,
             old_key_expires_at=old_key_expires_at,
         )
 
-        rotate_key_response.additional_properties = d
-        return rotate_key_response
+        rotate_org_api_key_response.additional_properties = d
+        return rotate_org_api_key_response
 
     @property
     def additional_keys(self) -> list[str]:

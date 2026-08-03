@@ -80,6 +80,8 @@ from .create_deployment_overrides_env_secrets import CreateDeploymentOverridesEn
 from .create_deployment_request import CreateDeploymentRequest
 from .create_key_request import CreateKeyRequest
 from .create_key_request_scopes_item import CreateKeyRequestScopesItem
+from .create_org_api_key_request import CreateOrgAPIKeyRequest
+from .create_org_api_key_request_scopes_item import CreateOrgAPIKeyRequestScopesItem
 from .create_org_request import CreateOrgRequest
 from .cron_response import CronResponse
 from .custom_domain_response import CustomDomainResponse
@@ -131,6 +133,7 @@ from .issue_account_credit_body import IssueAccountCreditBody
 from .list_audit_events_response import ListAuditEventsResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
+from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
 from .member_list_response import MemberListResponse
 from .mfa_confirm_request import MFAConfirmRequest
@@ -197,6 +200,8 @@ from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
 from .rotate_key_response import RotateKeyResponse
+from .rotate_org_api_key_request import RotateOrgAPIKeyRequest
+from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
 from .scaling_policy import ScalingPolicy
 from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
@@ -309,6 +314,8 @@ __all__ = (
     "CreateDeploymentRequest",
     "CreateKeyRequest",
     "CreateKeyRequestScopesItem",
+    "CreateOrgAPIKeyRequest",
+    "CreateOrgAPIKeyRequestScopesItem",
     "CreateOrgRequest",
     "CronResponse",
     "CustomDomainResponse",
@@ -360,6 +367,7 @@ __all__ = (
     "ListAuditEventsResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
+    "ListOrgAPIKeysResponse",
     "ListSecretsForAccountResponse",
     "MemberListResponse",
     "MFAConfirmRequest",
@@ -426,6 +434,8 @@ __all__ = (
     "RepoResponse",
     "RotateAlertRuleSecretResponse",
     "RotateKeyResponse",
+    "RotateOrgAPIKeyRequest",
+    "RotateOrgAPIKeyResponse",
     "ScalingPolicy",
     "ScalingTarget",
     "ScalingTargetMetric",
