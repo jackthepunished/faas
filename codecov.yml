@@ -7,9 +7,10 @@ codecov:
     # MUST equal the number of coverage uploads CI sends per commit.
     # Codecov holds ALL notifications — including the project/patch
     # commit statuses below — until it has received this many uploads.
-    # ci.yml has two uploading jobs (`unit-tests-heavy` and
-    # `unit-tests-light`, both uploading under flag `unittests`).
-    after_n_builds: 2
+    # ci.yml has four uploading unit test jobs (`unit-tests-pg-1`,
+    # `unit-tests-pg-2`, `unit-tests-pure-1`, `unit-tests-pure-2`,
+    # all uploading under flag `unittests`).
+    after_n_builds: 4
     wait_for_ci: true
 
 coverage:

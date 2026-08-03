@@ -213,14 +213,11 @@ jobs:
   # Bumped to 20 min (PR #414 follow-up) so the long pole has two
   # budgets of headroom — wall is still ~5 min in steady state, this
   # is contingency for slow windows on a shared GH runner pool.
-  # Shard 1 (Postgres-heavy): cmd/apid, pkg/state, migrations, etc.
-  unit-tests-heavy:
-    name: unit tests (shard 1 — pg-heavy)
+  # Shard 1 (Postgres-heavy A): cmd/apid, migrations, pkg/meter, pkg/db, pkg/alerts
+  unit-tests-pg-1:
+    name: unit tests (pg shard 1 — apid/meter/migrations)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 10
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -259,19 +256,16 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: unit tests (shard 1 — pg-heavy)
+      - name: unit tests (pg shard 1)
         run: |
           mkdir -p coverage
-          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -E '(cmd/apid|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/state|pkg/db|pkg/alerts|pkg/meter|pkg/reconcile|pkg/reposcan|migrations)')
-          go test -race -count=1 -p 4 -timeout=15m -coverprofile=coverage/cover-shard1.out -covermode=atomic $PKGS
-
-      - name: pkg/state coverage gate
-        run: make check-state-coverage COVERFILE=coverage/cover-shard1.out
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -E '(cmd/apid|migrations|pkg/meter|pkg/db|pkg/alerts)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard1.out -covermode=atomic $PKGS
 
       - name: sdk-check
         run: make sdk-check
 
-      - name: upload to Codecov (shard 1)
+      - name: upload to Codecov (pg shard 1)
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
           files: coverage/cover-shard1.out
@@ -279,11 +273,71 @@ jobs:
           use_oidc: true
           fail_ci_if_error: true
 
-  # Shard 2 (pure Go): pkg/sched, pkg/fcvm, pkg/gateway, pkg/imaged, etc. No Postgres needed.
-  unit-tests-light:
-    name: unit tests (shard 2 — pure Go)
+  # Shard 2 (Postgres-heavy B): pkg/state, cmd/gregale, cmd/schedd, etc.
+  unit-tests-pg-2:
+    name: unit tests (pg shard 2 — state/gregale/schedd)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:15
+        env:
+          POSTGRES_USER: faas
+          POSTGRES_PASSWORD: faas
+          POSTGRES_DB: faas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U faas -d faas"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://faas:faas@localhost:5432/faas?sslmode=disable
+    steps:
+      - name: pre-pull postgres image
+        run: |
+          for attempt in 1 2 3; do
+            if docker pull mirror.gcr.io/library/postgres:15; then
+              echo "pulled on attempt ${attempt}"
+              break
+            fi
+            echo "pull attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+            if [ "${attempt}" = "3" ]; then
+              echo "::error::postgres image pull failed after 3 attempts"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: unit tests (pg shard 2)
+        run: |
+          mkdir -p coverage
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -E '(pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
+
+      - name: pkg/state coverage gate
+        run: make check-state-coverage COVERFILE=coverage/cover-shard2.out
+
+      - name: upload to Codecov (pg shard 2)
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        with:
+          files: coverage/cover-shard2.out
+          flags: unittests
+          use_oidc: true
+          fail_ci_if_error: true
+
+  # Shard 3 (pure Go heavy): pkg/sched, pkg/fcvm, pkg/gateway, pkg/imaged, etc. No Postgres needed.
+  unit-tests-pure-1:
+    name: unit tests (pure Go shard 1 — sched/fcvm/gateway)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
@@ -295,16 +349,46 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: unit tests (shard 2 — pure Go)
+      - name: unit tests (pure Go shard 1)
         run: |
           mkdir -p coverage
-          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -vE '(cmd/apid|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/state|pkg/db|pkg/alerts|pkg/meter|pkg/reconcile|pkg/reposcan|migrations)')
-          go test -race -count=1 -p 4 -timeout=15m -coverprofile=coverage/cover-shard2.out -covermode=atomic $PKGS
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -E '(pkg/sched|pkg/fcvm|pkg/gateway|pkg/imaged|pkg/wire|cmd/gatewayd|pkg/api)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard3.out -covermode=atomic $PKGS
 
-      - name: upload to Codecov (shard 2)
+      - name: upload to Codecov (pure Go shard 1)
         uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
-          files: coverage/cover-shard2.out
+          files: coverage/cover-shard3.out
+          flags: unittests
+          use_oidc: true
+          fail_ci_if_error: true
+
+  # Shard 4 (pure Go light): all remaining packages. No Postgres needed.
+  unit-tests-pure-2:
+    name: unit tests (pure Go shard 2 — light packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: unit tests (pure Go shard 2)
+        run: |
+          mkdir -p coverage
+          PKGS=$(go list ./... | grep -v '/cmd/e2e' | grep -vE '(cmd/apid|migrations|pkg/meter|pkg/db|pkg/alerts|pkg/state|cmd/gregale|cmd/meterd|cmd/schedd|cmd/schema-dump|pkg/reconcile|pkg/reposcan|pkg/sched|pkg/fcvm|pkg/gateway|pkg/imaged|pkg/wire|cmd/gatewayd|pkg/api)')
+          go test -race -count=1 -p 4 -timeout=10m -coverprofile=coverage/cover-shard4.out -covermode=atomic $PKGS
+
+      - name: upload to Codecov (pure Go shard 2)
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        with:
+          files: coverage/cover-shard4.out
           flags: unittests
           use_oidc: true
           fail_ci_if_error: true
