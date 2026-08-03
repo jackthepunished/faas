@@ -174,7 +174,7 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // cleanly with Status='active' and ExpiresAt=nil.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		        coalesce(last_used_at, 'epoch'::timestamptz),
 		        expires_at, status, revoked_at, rotated_from_id
 		 from api_keys where key_sha256 = $1`, hash)
@@ -238,18 +238,22 @@ func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, AP
 	return acct, key, nil
 }
 
-// scanAPIKey reads the ten-column api_keys projection (id,
-// account_id, key_sha256, label, scopes, created_at, last_used_at,
-// expires_at, status, revoked_at, rotated_from_id — eleven if you
-// count the optional NULLable cols). Columns not enumerated in the
-// tuple (e.g. legacy callers from before IAM-1) still work because
-// every query in this package writes the full column list; the
-// shared helper makes the projections stay in lockstep. The four
-// trailing columns are the IAM-5 (issue #189) surface — pgtype's
-// native nullable support means a NULL column produces a
-// pgtype.Timestamptz{Valid:false} that the scan helper converts to
-// a nil *time.Time. rotated_from_id is a uuid pointer; the others
-// are nullable timestamps.
+// scanAPIKey reads the eleven-column api_keys projection (id,
+// account_id, org_id, key_sha256, label, scopes, created_at,
+// last_used_at, expires_at, status, revoked_at, rotated_from_id).
+// Columns not enumerated in the tuple (e.g. legacy callers from
+// before IAM-1) still work because every query in this package
+// writes the full column list; the shared helper makes the
+// projections stay in lockstep. The four trailing columns are the
+// IAM-5 (issue #189) surface — pgtype's native nullable support
+// means a NULL column produces a pgtype.Timestamptz{Valid:false}
+// that the scan helper converts to a nil *time.Time.
+// rotated_from_id is a uuid pointer; the others are nullable
+// timestamps. PR 6 (issue #190 / IAM-6) inserts org_id as a
+// NOT-NULL column (migration 00127), seated between account_id
+// and key_sha256 so every pgstore INSERT/RETURNING list puts it
+// at the same index — the move is mechanical and isolated to
+// this file.
 //
 // The list-sites that pre-date IAM-5 (e.g. CreateAPIKey,
 // DeleteAPIKeyReturning, ListAPIKeys) keep the seven-column
@@ -259,7 +263,9 @@ func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, AP
 // scan and ignores the new fields. To keep the diff small,
 // every existing call site now writes the full eleven columns
 // (the new ones are NULL by default; the constraint is the
-// floor, the store is the wall).
+// floor, the store is the wall). The same shape applies for the
+// PR 6 org_id: every SELECT/RETURNING reads the full twelve
+// columns.
 func scanAPIKey(row pgx.Row) (APIKey, error) {
 	var (
 		k         APIKey
@@ -268,7 +274,7 @@ func scanAPIKey(row pgx.Row) (APIKey, error) {
 		revokedAt pgtype.Timestamptz
 		rotated   *string
 	)
-	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt, &k.LastUsedAt,
+	if err := row.Scan(&k.ID, &k.AccountID, &k.OrgID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt, &k.LastUsedAt,
 		&expiresAt, &k.Status, &revokedAt, &rotated); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return APIKey{}, ErrNotFound
@@ -727,9 +733,27 @@ func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byt
 	// NULL / 'active' / NULL / NULL. Production handlers use
 	// CreateAPIKeyWithExpiry (added below) so the dashboard
 	// sees expires_at on every fresh non-admin key.
+	//
+	// PR 6 (issue #190 / IAM-6) extends the INSERT to stamp
+	// org_id from the account's personal org via a subquery.
+	// The partial unique orgs_one_personal_per_account_uniq
+	// (migration 00099) guarantees the subquery returns at most
+	// one row. The subquery is the SQL-level equivalent of the
+	// caller passing orgID = personal org; the seven legacy
+	// account-scoped callers (CLI login, dev seed, e2e
+	// fixtures) don't have an active-org hint but the column is
+	// NOT NULL post-migration 00127, so the store resolves the
+	// personal org id on the caller's behalf. PR 9 (ADR-061
+	// §C) plans to drop the legacy `account_id` column at the
+	// end of the dual-write window.
 	row := s.pool.QueryRow(ctx,
-		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		`insert into api_keys (account_id, key_sha256, label, scopes, org_id)
+		 values ($1, $2, $3, $4,
+		         (select id from orgs
+		            where personal_owner_account_id = $1
+		              and personal_org = true
+		            limit 1))
+		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		           coalesce(last_used_at, 'epoch'::timestamptz),
 		           expires_at, status, revoked_at, rotated_from_id`,
 		accountID, hash, nullString(label), scopes)
@@ -745,10 +769,17 @@ func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byt
 // a Go caller can pass nil for "never expires" without needing
 // a separate bool.
 func (s *PgStore) CreateAPIKeyWithExpiry(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error) {
+	// PR 6 (issue #190 / IAM-6): org_id stamped from the caller's
+	// personal org (see CreateAPIKey docstring for the rationale;
+	// the SQL subquery mirrors migration 00099's partial unique).
 	row := s.pool.QueryRow(ctx,
-		`insert into api_keys (account_id, key_sha256, label, scopes, expires_at)
-		 values ($1, $2, $3, $4, $5)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		`insert into api_keys (account_id, key_sha256, label, scopes, expires_at, org_id)
+		 values ($1, $2, $3, $4, $5,
+		         (select id from orgs
+		            where personal_owner_account_id = $1
+		              and personal_org = true
+		            limit 1))
+		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		           coalesce(last_used_at, 'epoch'::timestamptz),
 		           expires_at, status, revoked_at, rotated_from_id`,
 		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt))
@@ -776,7 +807,7 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`delete from api_keys where id = $1 and account_id = $2
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		           coalesce(last_used_at, 'epoch'::timestamptz),
 		           expires_at, status, revoked_at, rotated_from_id`,
 		keyID, accountID)
@@ -785,7 +816,7 @@ func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID st
 
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		        coalesce(last_used_at, 'epoch'::timestamptz),
 		        expires_at, status, revoked_at, rotated_from_id
 		 from api_keys where account_id = $1 order by created_at desc`,
@@ -803,6 +834,23 @@ func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, 
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+// GetAPIKey returns a single api_keys row by (accountID, keyID).
+// Cross-account reads collapse to ErrNotFound at the SQL level — the
+// WHERE pins both account_id and id so a probe with a foreign key id
+// returns the same ErrNotFound as a missing row. Used by the legacy
+// rotateKey (PR 6 dual-write) to discover the old row's org_id before
+// the rotation. Returns ErrNotFound when no matching row exists.
+//
+// Issue #190 / IAM-6, PR 6.
+func (s *PgStore) GetAPIKey(ctx context.Context, accountID, keyID string) (APIKey, error) {
+	return scanAPIKey(s.pool.QueryRow(ctx,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
+		   from api_keys where account_id = $1 and id = $2`,
+		accountID, keyID))
 }
 
 func (s *PgStore) TouchKeyLastUsed(ctx context.Context, keyID string) error {
@@ -842,7 +890,7 @@ func (s *PgStore) MarkAPIKeyRevoked(ctx context.Context, accountID, keyID string
 		    set status = 'revoked',
 		        revoked_at = coalesce(revoked_at, now())
 		  where id = $1 and account_id = $2
-		  returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		            coalesce(last_used_at, 'epoch'::timestamptz),
 		            expires_at, status, revoked_at, rotated_from_id`,
 		keyID, accountID)
@@ -906,7 +954,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 	// new key inherits them. We re-read with FOR UPDATE so the
 	// projection is consistent with the lock above.
 	old, err := scanAPIKeyRow(ctx, tx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		        coalesce(last_used_at, 'epoch'::timestamptz),
 		        expires_at, status, revoked_at, rotated_from_id
 		   from api_keys where id = $1`, oldKeyID)
@@ -917,16 +965,22 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 	// Step 3: insert the new key. The new label defaults to the
 	// old label if the caller passed "" (the handler is the
 	// single caller and always supplies the old label).
+	// PR 6 (issue #190 / IAM-6): org_id is inherited from the
+	// predecessor. The rotation is org-local: a key with
+	// org_id = A rotated in place stays org_id = A on the new
+	// row. Revoking old + handing the customer a new plaintext
+	// is the only contract; replacing the binding would
+	// silently leak key material across orgs.
 	if newLabel == "" {
 		newLabel = old.Label
 	}
 	newKey, err := scanAPIKeyRow(ctx, tx,
-		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id)
-		 values ($1, $2, $3, $4, 'active', $5)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id, org_id)
+		 values ($1, $2, $3, $4, 'active', $5, $6)
+		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 		           coalesce(last_used_at, 'epoch'::timestamptz),
 		           expires_at, status, revoked_at, rotated_from_id`,
-		accountID, newHash, newLabel, old.Scopes, oldKeyID)
+		accountID, newHash, newLabel, old.Scopes, oldKeyID, old.OrgID)
 	if err != nil {
 		return APIKey{}, APIKey{}, err
 	}
@@ -942,7 +996,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 			        expires_at = now(),
 			        revoked_at = coalesce(revoked_at, now())
 			  where id = $1
-			  returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 			            coalesce(last_used_at, 'epoch'::timestamptz),
 			            expires_at, status, revoked_at, rotated_from_id`,
 			oldKeyID)
@@ -955,7 +1009,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 			    set status = 'grace',
 			        expires_at = now() + ($1)::interval
 			  where id = $2
-			  returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
 			            coalesce(last_used_at, 'epoch'::timestamptz),
 			            expires_at, status, revoked_at, rotated_from_id`,
 			graceWindow.String(), oldKeyID)
@@ -1002,6 +1056,195 @@ func (s *PgStore) SetAccountKeyGraceWindow(ctx context.Context, accountID string
 	_, err := s.pool.Exec(ctx,
 		`update accounts set key_grace_window_days = $1 where id = $2`, days, accountID)
 	return err
+}
+
+// --- org-bound api keys (issue #190 / IAM-6, PR 6) ---
+
+// CreateOrgAPIKey persists a key with an explicit org binding.
+// The caller supplies both orgID (principal.Membership.OrgID
+// from loadOrg) and accountID (the resolved membership's account
+// owner) so the INSERT is single-statement and the NOT NULL
+// constraint on api_keys.org_id (migration 00127) is satisfied
+// without a subquery. The returning projection reads the same
+// 12-column shape scanAPIKey consumes — the column is at index
+// 3, between account_id and key_sha256, so all five new
+// methods can share scanAPIKey / scanAPIKeyRow without a
+// bespoke scanner.
+func (s *PgStore) CreateOrgAPIKey(ctx context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`insert into api_keys (account_id, key_sha256, label, scopes, expires_at, org_id)
+		 values ($1, $2, $3, $4, $5, $6)
+		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           expires_at, status, revoked_at, rotated_from_id`,
+		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt), orgID)
+	return scanAPIKey(row)
+}
+
+// ListOrgAPIKeys returns every non-revoked key for the org.
+// "Non-revoked" = status IN ('active', 'grace'); the partial
+// index api_keys_active_grace_idx keeps the common case O(1) —
+// the plan's org_id-NOT NULL flip forces the index to be hit
+// for any non-pathological key query.
+func (s *PgStore) ListOrgAPIKeys(ctx context.Context, orgID string) ([]APIKey, error) {
+	rows, err := s.pool.Query(ctx,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
+		 from api_keys
+		 where org_id = $1
+		   and status in ('active','grace')
+		 order by created_at desc`,
+		orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []APIKey
+	for rows.Next() {
+		k, err := scanAPIKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// GetOrgAPIKey fetches a single key by id, scoped to orgID. The
+// WHERE clause pins (id, org_id) so a key that exists but
+// belongs to a different org returns ErrNotFound at the SQL
+// layer — the IDOR-safe collapse (matches DeleteAPIKeyReturning's
+// (accountID, keyID) predicate).
+func (s *PgStore) GetOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
+		 from api_keys
+		 where id = $1 and org_id = $2`,
+		keyID, orgID)
+	return scanAPIKey(row)
+}
+
+// RevokeOrgAPIKey is the org-scoped soft-delete path. Same
+// idempotent contract as MarkAPIKeyRevoked but the WHERE clause
+// pins (id, org_id) so a cross-org probe returns ErrNotFound.
+// Returns the post-update row so the handler can stamp the
+// audit `api_key.revoked` event with the dismissed scopes.
+func (s *PgStore) RevokeOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`update api_keys
+		    set status = 'revoked',
+		        revoked_at = coalesce(revoked_at, now())
+		  where id = $1 and org_id = $2
+		  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		            coalesce(last_used_at, 'epoch'::timestamptz),
+		            expires_at, status, revoked_at, rotated_from_id`,
+		keyID, orgID)
+	return scanAPIKey(row)
+}
+
+// RotateOrgAPIKey mirrors RotateAPIKey but the lock predicate
+// is (id, org_id). The new row's org_id is inherited from the
+// old row (a rotation is org-local — the customer's binding to
+// the active org stays; replacing it would silently leak key
+// material across orgs). Two returned keys are (newKey, oldKey)
+// in that order, matching RotateAPIKey.
+func (s *PgStore) RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (APIKey, APIKey, error) {
+	if graceWindow < 0 {
+		graceWindow = 0
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // best-effort on early return
+
+	// Step 1: lock the old row + verify (id, org_id) + status.
+	var (
+		oldOrg  string
+		oldStat string
+	)
+	if err := tx.QueryRow(ctx,
+		`select org_id, status from api_keys where id = $1 for update`, oldKeyID).
+		Scan(&oldOrg, &oldStat); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return APIKey{}, APIKey{}, ErrNotFound
+		}
+		return APIKey{}, APIKey{}, err
+	}
+	if oldOrg != orgID {
+		return APIKey{}, APIKey{}, ErrNotFound
+	}
+	if oldStat == string(APIKeyStatusRevoked) {
+		return APIKey{}, APIKey{}, ErrAPIKeyRevoked
+	}
+
+	// Step 2: read the old row's content (label, scopes, account_id) so the
+	// new key inherits them.
+	old, err := scanAPIKeyRow(ctx, tx,
+		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
+		   from api_keys where id = $1`, oldKeyID)
+	if err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+
+	// Step 3: insert the new key. account_id + org_id are inherited
+	// from the predecessor; rotation is org-local.
+	if newLabel == "" {
+		newLabel = old.Label
+	}
+	newKey, err := scanAPIKeyRow(ctx, tx,
+		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id, org_id)
+		 values ($1, $2, $3, $4, 'active', $5, $6)
+		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           expires_at, status, revoked_at, rotated_from_id`,
+		old.AccountID, newHash, newLabel, old.Scopes, oldKeyID, old.OrgID)
+	if err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+
+	// Step 4: update the old key. expires_at is overwritten to
+	// the grace deadline (same graceWindow semantics as the
+	// legacy RotateAPIKey).
+	if graceWindow == 0 {
+		old, err = scanAPIKeyRow(ctx, tx,
+			`update api_keys
+			    set status = 'revoked',
+			        expires_at = now(),
+			        revoked_at = coalesce(revoked_at, now())
+			  where id = $1
+			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            expires_at, status, revoked_at, rotated_from_id`,
+			oldKeyID)
+		if err != nil {
+			return APIKey{}, APIKey{}, err
+		}
+	} else {
+		old, err = scanAPIKeyRow(ctx, tx,
+			`update api_keys
+			    set status = 'grace',
+			        expires_at = now() + ($1)::interval
+			  where id = $2
+			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
+			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            expires_at, status, revoked_at, rotated_from_id`,
+			graceWindow.String(), oldKeyID)
+		if err != nil {
+			return APIKey{}, APIKey{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+	return newKey, old, nil
 }
 
 // --- apps --------------------------------------------------------------------

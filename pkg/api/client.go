@@ -971,6 +971,61 @@ func (c *Client) SetGraceWindow(ctx context.Context, days *int) (GraceWindowResp
 	return out, c.do(ctx, "PATCH", "/v1/account/keys/grace_window_days", SetGraceWindowRequest{Days: days}, &out)
 }
 
+// PR 6 (issue #190 / IAM-6 / ADR-061) — org-scoped API key surface.
+// Every method takes the org slug as the first argument; the wire
+// paths under /v1/orgs/{slug}/keys/* are the canonical replacement
+// for the legacy /v1/keys/* paths (which stamp org_id = caller's
+// personal org but otherwise stay working through PR 9).
+//
+// The org-scoped and account-scoped surfaces emit the same wire
+// shape (APIKeyResponse), so swapping the SDK client call is the
+// only change a downstream consumer makes.
+
+// ListOrgAPIKeys returns every API key the org owns, including
+// rotated/revoked rows. The active org must be set via the X-Active-Org
+// header (the client picks that up from the WithActiveOrg option or
+// the request middleware). Returns the response wrapper that includes
+// the total list and the per-row org_id.
+func (c *Client) ListOrgAPIKeys(ctx context.Context, slug string) (ListOrgAPIKeysResponse, error) {
+	var out ListOrgAPIKeysResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/"+slug+"/keys", nil, &out)
+}
+
+// CreateOrgAPIKey mints a new API key against the org. Returns the
+// standard APIKeyResponse — plaintext is present on this single
+// response and never returned again. `scopes` is optional; nil
+// defaults to ["admin"] on the server side (mirrors CreateKey).
+func (c *Client) CreateOrgAPIKey(ctx context.Context, slug, label string, scopes []string) (APIKeyResponse, error) {
+	var out APIKeyResponse
+	return out, c.do(ctx, "POST", "/v1/orgs/"+slug+"/keys", CreateOrgAPIKeyRequest{Label: label, Scopes: scopes}, &out)
+}
+
+// GetOrgAPIKey fetches a single key by id within the org. Cross-org
+// probes collapse to 404 server-side (IDOR-safe; matches
+// DeleteAppReturning).
+func (c *Client) GetOrgAPIKey(ctx context.Context, slug, id string) (APIKeyResponse, error) {
+	var out APIKeyResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/"+slug+"/keys/"+id, nil, &out)
+}
+
+// RevokeOrgAPIKey soft-revokes an API key within the org. Returns no
+// body (204); subsequent bearer-auth attempts hit ErrAPIKeyRevoked.
+func (c *Client) RevokeOrgAPIKey(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/orgs/"+slug+"/keys/"+id, nil, nil)
+}
+
+// RotateOrgAPIKey mints a new key and demotes the predecessor in
+// one transaction (mirrors RotateKey semantics on the org-scoped
+// path). The new key inherits the predecessor's label when `label`
+// is empty. The grace window resolves from the per-account override
+// (set via SetGraceWindow), with the api.DefaultAPIKeyGraceWindowDays
+// fallback.
+func (c *Client) RotateOrgAPIKey(ctx context.Context, slug, id, label string) (RotateOrgAPIKeyResponse, error) {
+	var out RotateOrgAPIKeyResponse
+	return out, c.do(ctx, "POST", "/v1/orgs/"+slug+"/keys/"+id+"/rotate",
+		RotateOrgAPIKeyRequest{Label: label}, &out)
+}
+
 // Audit events (IAM-4, ADR-035). The events table is append-only
 // (spec §5), so this surface is read-only by design. since and
 // kindPrefix are optional — pass empty strings to read the full

@@ -62,6 +62,28 @@ var allowRoleMatrix = map[OrgAction]map[state.OrgRole]bool{
 	OrgActionDelete: {
 		state.OrgRoleOwner: true,
 	},
+	// PR 6 (issue #190 / IAM-6) — org-bound API key mint/rotate
+	// and revoke. Owner + admin; mirrors the org.manage_members
+	// pattern (the existing precedent that "owner + admin =
+	// day-to-day ops, owner only = invariant-affecting"). Mint
+	// is the one action that hands out credential material; it
+	// is the most security-sensitive of the org actions a
+	// developer-role caller could otherwise attempt, so it's
+	// admin+owner only (developer/viewer/billing are
+	// intentionally absent).
+	OrgActionCreateApiKey: {
+		state.OrgRoleOwner: true,
+		state.OrgRoleAdmin: true,
+	},
+	// Revoke mirrors create — same role set, same rationale
+	// (revoking a contractor's key is the same blast radius as
+	// minting one). Locked to owner + admin so an attacker who
+	// somehow got a developer's bearer can't lock the team
+	// out of CI by deleting every active key.
+	OrgActionRevokeApiKey: {
+		state.OrgRoleOwner: true,
+		state.OrgRoleAdmin: true,
+	},
 }
 
 // AuthorizeOrgAction returns nil if the active-org principal on ctx

@@ -302,6 +302,21 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/orgs/{slug}/members/{user_id}": "RemoveOrgMember",
 	"POST /v1/orgs/{slug}/transfer_ownership":  "TransferOrgOwnership",
 	"GET /v1/invitations/{token}":              "PeekInvitation",
+
+	// PR 6 (issue #190 / IAM-6 / ADR-061) — org-scoped API key
+	// surface. The auto-derivation would produce
+	// "GetOrgsSlugKeys" / "PostOrgsSlugKeys" etc., which read as
+	// Swagger-style artefacts and don't match the SDK's
+	// Resource-noun convention (ListOrgAPIKeys / CreateOrgAPIKey).
+	// Five routes share the keys sub-namespace on an arbitrary
+	// org slug; pin them so the gate stays the SDK's source of
+	// truth on verb choice, matching the trusted_signers /
+	// registry-credentials pattern above.
+	"GET /v1/orgs/{slug}/keys":              "ListOrgAPIKeys",
+	"POST /v1/orgs/{slug}/keys":             "CreateOrgAPIKey",
+	"GET /v1/orgs/{slug}/keys/{id}":         "GetOrgAPIKey",
+	"DELETE /v1/orgs/{slug}/keys/{id}":      "RevokeOrgAPIKey",
+	"POST /v1/orgs/{slug}/keys/{id}/rotate": "RotateOrgAPIKey",
 }
 
 func main() {

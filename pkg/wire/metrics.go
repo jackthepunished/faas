@@ -405,6 +405,25 @@ type OpsMetrics struct {
 	// indicates a customer-configured floor is active (Hobby /
 	// Pro / Scale only; PR-A's PATCH gate rejects Free).
 	meterdFloorAppliedTotal *prometheus.CounterVec
+	// auditOrgEvent: closed-vocab counter for org-action authorization
+	// outcomes (issue #190 / IAM-6 / ADR-061, PR 6). Labelled by
+	// `action` only — the 11-verb AllOrgActions vocabulary is a
+	// closed set, so cardinality is bounded at 11 × {allowed,
+	// denied} = 22 series. Do NOT label by org — 11 × ~10K orgs
+	// balloons past 100K Prometheus series, defeating the
+	// scraper's TSDB compression (the audit_log Postgres table is
+	// the per-org record; this metric is the aggregate rate
+	// answer to "is org.delete denying more than usual?").
+	//
+	// authzDenied counts every AuthorizeOrgAction / RequireOrgAction
+	// deny path (including the LoadOrg guard's "<no active org>"
+	// 403 — see AuthorizeOrgAction in pkg/authz/authorize.go).
+	// authzAllowed counts every allow path. Useful dashboard
+	// question: "is org.delete deny rate spiking today?" is
+	// `rate(audit_org_event{action="org.delete",result="denied"}[5m])`.
+	auditOrgEvent *prometheus.CounterVec
+	authzDenied   *prometheus.CounterVec
+	authzAllowed  *prometheus.CounterVec
 	// imagedOCIPull: per-call latency of imaged's OCI registry pulls
 	// (manifest, config, blob, above-base). Sized to api.OCIPullTimeoutSeconds
 	// (60 s); the 5 s control-plane bucket is wrong for the multi-second
@@ -922,6 +941,34 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_meterd_floor_applied_total",
 		Help: "Count of meterd sample ticks where the per-app min_instances GB-h floor was applied and synthetic usage_minutes rows were appended (ADR-060, issue #515). Incremented once per (app, tick) when live instance count is below ScalingPolicy.MinInstances. Per-plan label so the §12 dashboard can split floor-applied apps across plans. Floor is Hobby/Pro/Scale only; PR-A's PATCH gate rejects Free.",
 	}, []string{"plan"})
+	// auditOrgEvent (PR 6 / issue #190): closed 11-verb counter per
+	// outcome. The increment site lives in pkg/authz/authorize.go
+	// (deny paths) — apid emits one Counter per deny + one per allow;
+	// schedd / meterd / gatewayd do not call AuthorizeOrgAction
+	// today, so their registries have the counters registered but
+	// always-zero (matches the single-registry pattern in
+	// [wire-opsmetrics-single-registry]). result ∈ {allowed, denied}.
+	auditOrgEvent := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_audit_org_event_total",
+		Help: "Count of AuthorizeOrgAction invocations, labelled by action (closed 11-verb OrgAction vocabulary) and result (allowed | denied). Deny rate by action is the dashboard signal for 'is some action suddenly rejecting every caller?'; allow rate is the floor. Per-org breakdown lives in the audit_events Postgres table — Prometheus cardinality would explode past 110K series if labelled by org.",
+	}, []string{"action", "result"})
+	// authzDenied / authzAllowed are the simpler split that the rest
+	// of the codebase uses to keep allow-only and deny-only dashboards
+	// (e.g. one GRAFANA panel each). They share the
+	// audit_org_event_total time series internally — registered as
+	// separate collectors to keep the metric name readable for the
+	// common queries. Same metric, two collectors: that double-counts
+	// the storage cost (one extra series per action), which is why we
+	// keep the explicit pair rather than going to a single
+	// result-labelled counter.
+	authzDenied := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_authz_denied_total",
+		Help: "Per-action count of AuthorizeOrgAction deny paths (action: closed 11-verb OrgAction vocabulary). The dashboard panel is rate(_denied[5m]) by action.",
+	}, []string{"action"})
+	authzAllowed := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_authz_allowed_total",
+		Help: "Per-action count of AuthorizeOrgAction allow paths (action: closed 11-verb OrgAction vocabulary). The dashboard panel is rate(_allowed[5m]) by action.",
+	}, []string{"action"})
 	wakeIDV4Fallback := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_wake_id_v4_fallback_total",
 		Help: "Count of wake_id mints where uuid.NewV7 returned an error and the engine fell back to uuid.New (v4). Any non-zero rate indicates a broken crypto/rand subsystem and breaks the time-ordering invariant the instances_wake_id_app_idx partial index is built on. Should never increment in production.",
@@ -1268,6 +1315,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
+		auditOrgEvent, authzDenied, authzAllowed,
 		wakeIDV4Fallback,
 		snapshotDiskDrift,
 		imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs,
@@ -1691,6 +1739,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		residentGBPerCustomer:              residentGBPerCustomer,
 		billingCapExceededTotal:            billingCapExceededTotal,
 		meterdFloorAppliedTotal:            meterdFloorAppliedTotal,
+		auditOrgEvent:                      auditOrgEvent,
+		authzDenied:                        authzDenied,
+		authzAllowed:                       authzAllowed,
 		wakeIDV4Fallback:                   wakeIDV4Fallback,
 		snapshotDiskDrift:                  snapshotDiskDrift,
 		capacitySignatureRejected:          capacitySignatureRejected,

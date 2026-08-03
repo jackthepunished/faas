@@ -295,6 +295,8 @@ func TestOrgActionString(t *testing.T) {
 		OrgActionManageBilling:     "org.manage_billing",
 		OrgActionChangePlan:        "org.change_plan",
 		OrgActionDelete:            "org.delete",
+		OrgActionCreateApiKey:      "org.create_api_key",
+		OrgActionRevokeApiKey:      "org.revoke_api_key",
 	}
 	for action, want := range cases {
 		if got := action.String(); got != want {
@@ -317,6 +319,8 @@ func TestAllOrgActions_Complete(t *testing.T) {
 		OrgActionManageBilling:     true,
 		OrgActionChangePlan:        true,
 		OrgActionDelete:            true,
+		OrgActionCreateApiKey:      true,
+		OrgActionRevokeApiKey:      true,
 	}
 	got := map[OrgAction]bool{}
 	for _, a := range AllOrgActions {

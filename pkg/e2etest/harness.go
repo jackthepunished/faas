@@ -422,7 +422,9 @@ const testDomain = "apps.test.example"
 //     Slots 127/128 (issue #463 / ADR-069 / PR-B) add the
 //     `deployment_sidecar_layers` table and the
 //     `events_sidecar_name_idx` partial expression index.
-const e2eMigrationTarget = 128
+//     Slot 129 (issue #190 / ADR-061 / PR-6) flips api_keys.org_id
+//     to NOT NULL after the personal-org backfill.
+const e2eMigrationTarget = 129
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
