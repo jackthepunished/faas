@@ -107,6 +107,13 @@ type fakeVMM struct {
 	// but per-call (one entry per workload, not aggregated).
 	stagedWorkloads  []stagedWorkload
 	stageWorkloadErr error
+	// Issue #463 / ADR-069 / PR-B: deployment-level roster at
+	// /etc/faas/workloads.json on drive1. Mirrors stagedWorkloads
+	// but the arg shape is (main, sidecars[]) — a single call
+	// captures the whole roster, vs. N calls for the per-drive
+	// manifests.
+	stagedRosters  []stagedRoster
+	stageRosterErr error
 	// stageCallSeq is a monotonic counter incremented once per call to
 	// StageSecretsEnv or StageAPIEnv, captured on each entry's seq
 	// field. Used by TestWake_SealedAndAPIEnv_BothStage to assert the
@@ -491,6 +498,33 @@ func (v *fakeVMM) StageWorkloadManifest(instance string, driveIdx int, w Workloa
 	})
 	v.mu.Unlock()
 	return v.stageWorkloadErr
+}
+
+// stagedRoster (issue #463 / ADR-069 / PR-B) captures one
+// StageWorkloadRoster call. main is the main workload's spec;
+// sidecars is the per-sidecar array (possibly nil/empty).
+// Tests assert the call shape (single call, main spec carries
+// the plan RAM, sidecars preserve stability order).
+type stagedRoster struct {
+	instance string
+	main     WorkloadSpec
+	sidecars []WorkloadSpec
+}
+
+// stagedRosters + stageRosterErr mirror the stagedWorkloads shape
+// for the roster write. The fake never validates the JSON the
+// production writeWorkloadRoster emits — the test surface only
+// checks call ordering + arg shape (same posture as
+// stagedWorkloads above).
+func (v *fakeVMM) StageWorkloadRoster(instance string, main WorkloadSpec, sidecars []WorkloadSpec) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.stagedRosters = append(v.stagedRosters, stagedRoster{
+		instance: instance,
+		main:     main,
+		sidecars: append([]WorkloadSpec(nil), sidecars...),
+	})
+	return v.stageRosterErr
 }
 
 // InstancePID is the in-process fake for the M8 §11 SeccompStatus

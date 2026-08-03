@@ -1387,6 +1387,93 @@ type workloadManifest struct {
 	Essential bool   `json:"essential"`
 }
 
+// workloadRosterPath is the in-guest location guest-init reads
+// to discover the deployment-level roster (issue #463 / ADR-069 /
+// PR-B). vmmd writes this file once on drive1 at wake time;
+// guest-init reads it after assembleOverlay + pivot_root. Lives at
+// a sibling path of workloadManifestPath (which is per-drive).
+// The orchestrator (guest/init/workload_linux.go) reads the roster,
+// not the per-drive manifest; the per-drive stamp remains as a
+// reverse-compat / operator-visibility affordance.
+const workloadRosterPath = "etc/faas/workloads.json"
+
+// workloadRoster is the on-disk shape of /etc/faas/workloads.json
+// (issue #463 / ADR-069 / PR-B). The Main field carries the main
+// workload's spec; Sidecars carries the per-sidecar array. Mirrors
+// guest/init/workload_linux.go::workloadRoster exactly (a rename
+// here requires a parallel rename in the guest-init shape).
+type workloadRoster struct {
+	Main     workloadManifest   `json:"main"`
+	Sidecars []workloadManifest `json:"sidecars"`
+}
+
+// StageWorkloadRoster (issue #463 / ADR-069 / PR-B) writes the
+// deployment-level roster at /etc/faas/workloads.json on drive1
+// (the main workload's drive). The orchestrator reads this file
+// after pivot_root to discover the main workload's spec + the
+// per-sidecar array, so the file MUST land on drive1 before
+// guest-init can route through runWorkloads. The legacy
+// single-workload path (no roster) is a guest-init fallback — boot
+// routes to runAppWithEnv unchanged.
+//
+// We mount drive1 once, write both the roster file and verify the
+// per-drive main manifest is in place (StageWorkloadManifest
+// stamps drive1 too with the main spec; that's the operator-visibility
+// affordance for debugging tools, the orchestrator ignores it).
+//
+// sidecars may be nil/empty — boot runs the legacy path. Caller
+// filters out the main workload before passing.
+func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, sidecars []WorkloadSpec) error {
+	drive1 := filepath.Join(v.chrootBase, v.fcName, instance, layerImageName)
+	if _, err := os.Stat(drive1); err != nil {
+		return fmt.Errorf("stat drive1: %w", err)
+	}
+	mp, err := os.MkdirTemp("", "faas-vmm-roster-")
+	if err != nil {
+		return fmt.Errorf("mkdir mountpoint: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(mp) }()
+	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
+	}
+	defer func() { _ = exec.Command("umount", mp).Run() }()
+
+	roster := workloadRoster{
+		Main: workloadManifest{
+			Name:      main.Name,
+			Type:      main.Type,
+			RamMB:     main.RamMB,
+			Port:      main.Port,
+			Essential: main.Essential,
+		},
+	}
+	for _, sc := range sidecars {
+		roster.Sidecars = append(roster.Sidecars, workloadManifest{
+			Name:      sc.Name,
+			Type:      sc.Type,
+			RamMB:     sc.RamMB,
+			Port:      sc.Port,
+			Essential: sc.Essential,
+		})
+	}
+	blob, err := json.Marshal(roster)
+	if err != nil {
+		return fmt.Errorf("marshal workload roster: %w", err)
+	}
+	if int64(len(blob)) > api.MaxExportedLayerBytes {
+		// Defensive cap, matches StageWorkloadManifest's posture.
+		return fmt.Errorf("workload roster %d bytes exceeds cap %d", len(blob), api.MaxExportedLayerBytes)
+	}
+	target := filepath.Join(mp, workloadRosterPath)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("mkdir etc/faas: %w", err)
+	}
+	if err := os.WriteFile(target, blob, 0o400); err != nil {
+		return fmt.Errorf("write workloads.json: %w", err)
+	}
+	return nil
+}
+
 // exportMax resolves the per-export byte cap. Zero means "unset" — fall back
 // to api.MaxExportedLayerBytes. We read via a tiny helper so tests can
 // inject a tighter cap.

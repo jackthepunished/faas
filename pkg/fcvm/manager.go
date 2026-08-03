@@ -123,6 +123,18 @@ type VMM interface {
 	// missing drive file as a contract violation and error
 	// out (the VM cannot boot without the manifest).
 	StageWorkloadManifest(instance string, driveIdx int, w WorkloadSpec) error
+	// StageWorkloadRoster (issue #463 / ADR-069 / PR-B) writes the
+	// deployment-level roster at /etc/faas/workloads.json on drive1.
+	// guest-init's runWorkloads orchestrator reads this file at boot
+	// to discover the main workload's spec + the per-sidecar array;
+	// without it, the orchestrator sees a "legacy single-workload"
+	// shape and routes through runAppWithEnv unchanged. Pass the
+	// main workload's spec as the first arg and the sidecar specs
+	// (already filtered to type!="main") as the second. Implementations
+	// MUST treat a missing drive1 file as a contract violation
+	// and error out (the VM cannot boot into the orchestrator without
+	// the roster).
+	StageWorkloadRoster(instance string, main WorkloadSpec, sidecars []WorkloadSpec) error
 	// LogRing returns the per-instance ring buffer of the running VM's
 	// stdout/stderr stream (issue #254, Move 4), or nil if instance is
 	// not alive on this vmmd. The vmmd gRPC Logs(req) handler dials this
@@ -1077,6 +1089,23 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 				return nil, fmt.Errorf("wake %s: stage sidecar %d (%s) workload manifest: %w",
 					req.Instance, i, sc.Name, err)
 			}
+		}
+		// Deployment-level roster at /etc/faas/workloads.json on
+		// drive1 (issue #463 / ADR-069 / PR-B). Guest-init's
+		// runWorkloads orchestrator reads this file at boot to
+		// discover the main workload's spec + the per-sidecar
+		// array; without it, the orchestrator sees a "legacy
+		// single-workload" shape and routes through runAppWithEnv
+		// unchanged. Written AFTER per-drive manifests so any
+		// partial-failure on those doesn't leave the orchestrator
+		// with a roster pointing at non-existent drives.
+		mainSpec := WorkloadSpec{
+			Name: "main", Type: "main",
+			RamMB: req.MemSizeMiB, Port: req.Port,
+			Essential: true,
+		}
+		if err := m.vmm.StageWorkloadRoster(req.Instance, mainSpec, req.Sidecars); err != nil {
+			return nil, fmt.Errorf("wake %s: stage workload roster: %w", req.Instance, err)
 		}
 	}
 
