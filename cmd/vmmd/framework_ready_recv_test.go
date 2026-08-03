@@ -81,8 +81,8 @@ func TestParseFrameworkReadyDatagram(t *testing.T) {
 		},
 		{
 			name: "type + warmup + python312 runtime",
-			body: makeReady(0, "python312"),
-			want: want{warmupMs: 0, runtime: "python312"},
+			body: makeReady(250, "python312"),
+			want: want{warmupMs: 250, runtime: "python312"},
 		},
 		{
 			name: "type + warmup, no NUL separator at all",

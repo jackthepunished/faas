@@ -81,10 +81,10 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 		t.Fatalf("seed deployment: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		insert into instances (id, deployment_id, node_id, state, created_at)
+		insert into instances (id, deployment_id, node_id, state, ram_mb, started_at)
 		values ('00000000-0000-0000-0000-000000000412',
 		        '00000000-0000-0000-0000-000000000312',
-		        'local-0', 'running', now())
+		        'local-0', 'running', 256, now())
 		on conflict (id) do nothing
 	`); err != nil {
 		t.Fatalf("seed instance: %v", err)

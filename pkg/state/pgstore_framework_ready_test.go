@@ -59,8 +59,8 @@ func seedFrameworkReadyInstancePg(t *testing.T, pool *pgxpool.Pool) (appID, depl
 		t.Fatalf("seed deployment: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		insert into instances (id, deployment_id, node_id, state, created_at)
-		values ($1, $2, 'local-0', 'running', now())
+		insert into instances (id, deployment_id, node_id, state, ram_mb, started_at)
+		values ($1, $2, 'local-0', 'running', 256, now())
 		on conflict (id) do nothing
 	`, IDs.ins, IDs.dep); err != nil {
 		t.Fatalf("seed instance: %v", err)
