@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00125 (issue #463 / ADR-069 / PR-B
+// Migration-apply test for 00128 (issue #463 / ADR-069 / PR-B
 // review finding #5 — events_sidecar_name_idx). Pins:
 //
-//  1. The migration set applies cleanly through 00125.
+//  1. The migration set applies cleanly through 00128.
 //  2. The new index exists (pg_indexes).
 //  3. The index is a partial expression index over the two
 //     closed sidecar-event kinds (matches ListEventsBySidecar's
@@ -16,8 +16,9 @@
 // Slot note: PR-B originally claimed 00121; main's recent merges
 // reserved 00121 as a fence (main's 00121_reserve_slot.sql) and
 // added 00122 framework_ready_at + 00123 compute_nodes_vcpu_budget,
-// so the sidecar layers migration renumbered to 00124 and the
-// index migration followed it to 00125. Bump filename +
+// then PR #547 (open) added 00124_reserve_slot + 00125_warm_hint +
+// 00126_pg_ratelimit. PR-B's sidecar layers migration renumbered to
+// 00127 and this index migration followed it to 00128. Bump filename +
 // test function name + ApplyUp range together if the slot
 // changes again.
 
@@ -32,15 +33,15 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00125_EventsSidecarNameIdx(t *testing.T) {
+func TestMigrations_00128_EventsSidecarNameIdx(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00125. A regression that drops a slot
-	// between 1 and 124 surfaces here before the per-assertion
+	// (1) Apply through 00128. A regression that drops a slot
+	// between 1 and 127 surfaces here before the per-assertion
 	// pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 124)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 127)", err)
 	}
 
 	// (2) Index existence. Pin the index name so a future

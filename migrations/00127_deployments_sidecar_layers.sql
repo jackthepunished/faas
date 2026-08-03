@@ -44,13 +44,13 @@
 -- (PR #377 / ADR-041 contract). Existing rows (if any from a partial
 -- PR-B rebase) backfill nothing — the table is new.
 --
--- Slot: 00124 (post-rebase renumber 119→123→124). See migrations/README.md §"Slot fence discipline"
+-- Slot: 00127 (post-rebase renumber 119→123→124→127). See migrations/README.md §"Slot fence discipline"
 -- for the renumber procedure. The original PR-B plan claimed 00119;
 -- main's recent merges added real migrations + fences at 00119/00120/00121/00122
 -- (00122_instances_framework_ready_at.sql) and 00123_compute_nodes_vcpu_budget.sql,
--- so the sidecar layers migration renumbered to 00124 — the next free slot
--- past main's 00123 compute_nodes_vcpu_budget, before the index migration
--- at 00125.
+-- PR #547 (open) added 00124_reserve_slot + 00125_warm_hint + 00126_pg_ratelimit,
+-- so the sidecar layers migration renumbered to 00127 — past PR #547's 00126
+-- ceiling, before the index migration at 00128.
 
 CREATE TABLE IF NOT EXISTS deployment_sidecar_layers (
     deployment_id  uuid NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,

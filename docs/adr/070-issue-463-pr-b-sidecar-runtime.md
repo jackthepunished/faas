@@ -95,24 +95,24 @@ and per-sidecar gateway portnorm.
 
 ### Schema / migrations
 
-- `migrations/00124_deployments_sidecar_layers.sql` — new table
+- `migrations/00127_deployments_sidecar_layers.sql` — new table
   `deployment_sidecar_layers(deployment_id, sidecar_name,
   storage_key, bytes, content_digest)` with FK to
   `deployments(id)` ON DELETE CASCADE and unique
   `(deployment_id, sidecar_name)`. Originally filed at slot
-  00119; renumbered to 00123 then 00124 post-rebase (main
-  reserved 00119 as a fence for PR #470-FU-B and added real
-  migrations at 00120/00121/00122, then 00123
-  compute_nodes_vcpu_budget).
-- `migrations/00124_deployments_sidecar_layers_test.go` — cap
+  00119; renumbered to 00123 then 00124 then 00127
+  post-rebase (main reserved 00119 as a fence for PR #470-FU-B
+  and added real migrations at 00120/00121/00122/00123, then
+  PR #547 added 00124/00125/00126).
+- `migrations/00127_deployments_sidecar_layers_test.go` — cap
   pin + FK cascade pin.
 - `migrations/00120_reserve_slot.sql` — fence `select 1;` only
   (the slot-fence dance; rebased-out before PR-C merges).
-- `migrations/00125_events_sidecar_name_idx.sql` — partial
+- `migrations/00128_events_sidecar_name_idx.sql` — partial
   expression index for `ListEventsBySidecar`'s jsonb filter
   (PR-B review finding #5). Originally filed at slot 00121;
-  renumbered to 00124 then 00125 to follow the sidecar layers
-  migration in lockstep.
+  renumbered to 00124 then 00125 then 00128 to follow the
+  sidecar layers migration in lockstep.
 
 ### State
 
