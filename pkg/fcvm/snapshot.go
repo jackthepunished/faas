@@ -128,6 +128,13 @@ type RestoreSpec struct {
 	BaseKey     string
 	LayerKey    string
 	VsockDevice *VsockDevice
+	// Workloads (issue #463 / ADR-069 / PR-B) is the per-workload
+	// drive set, mirroring ColdBootSpec.Workloads. Restore
+	// materializes each entry's StorageKey via Storage.Get and
+	// re-stages the ext4s as basenames under the new chroot
+	// before the FC snapshot-load. Empty = legacy single-
+	// workload path (LayerKey above). Additive per ADR-016.
+	Workloads []WorkloadSpec
 	// StorageKey is the prefix-matched key under which the mem blob lives
 	// (e.g. "snap/<deploymentID>/mem"). Restore resolves it via
 	// Storage.Get into a tmp file used as the FC restore source.

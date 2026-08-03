@@ -714,6 +714,35 @@ type Deployment struct {
 	Sidecars json.RawMessage `json:"sidecars,omitempty"`
 }
 
+// DeploymentSidecarLayer is one sidecar's per-workload filesystem
+// handle (issue #463 / ADR-069 / PR-B). imaged writes one row per
+// sidecar during the buildImageLayer pass; vmmd reads it at wake
+// time to resolve the StorageBackend key into a tmp path. The
+// 2-row cap is mirrored at the schema layer via the
+// `deployments.sidecars` jsonb CHECK constraint (migration 00118);
+// this table's own constraint is just the PK uniqueness
+// (deployment_id, sidecar_name). The FK CASCADE means deleting
+// the deployment carries the rows with it (defence-in-depth —
+// imaged's cleanupAppFiles also explicitly removes the storage
+// keys).
+//
+// SidecarName is the customer-chosen name from
+// `pkg/api/dto.go::Sidecar.Name`. StorageKey follows the
+// convention `apps/<slug>/<depID>-<sidecarName>.ext4`. ContentDigest
+// is the OCI digest of the sidecar image at pull time
+// (sha256:...; matches PR-A's digest-pinned contract). CreatedAt /
+// UpdatedAt are stamped by Postgres defaults and refreshed on
+// UPDATE.
+type DeploymentSidecarLayer struct {
+	DeploymentID  string    `json:"deployment_id"`
+	SidecarName   string    `json:"sidecar_name"`
+	StorageKey    string    `json:"storage_key"`
+	Bytes         int64     `json:"bytes"`
+	ContentDigest string    `json:"content_digest"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 // Build is one build pipeline run for a deployment (spec §9). Builderd writes
 // status transitions; apid only creates the queued row.
 type Build struct {

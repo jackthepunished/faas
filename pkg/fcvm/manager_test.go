@@ -102,6 +102,18 @@ type fakeVMM struct {
 	// Issue #395 / ADR-045: plaintext api_env staging mirror.
 	stagedAPIEnv   []stagedAPIEnvEntry
 	stageAPIEnvErr error
+	// Issue #463 / ADR-069 / PR-B: per-workload manifest staging
+	// on each sidecar drive. Mirrors stagedSecrets / stagedAPIEnv
+	// but per-call (one entry per workload, not aggregated).
+	stagedWorkloads  []stagedWorkload
+	stageWorkloadErr error
+	// Issue #463 / ADR-069 / PR-B: deployment-level roster at
+	// /etc/faas/workloads.json on drive1. Mirrors stagedWorkloads
+	// but the arg shape is (main, sidecars[]) — a single call
+	// captures the whole roster, vs. N calls for the per-drive
+	// manifests.
+	stagedRosters  []stagedRoster
+	stageRosterErr error
 	// stageCallSeq is a monotonic counter incremented once per call to
 	// StageSecretsEnv or StageAPIEnv, captured on each entry's seq
 	// field. Used by TestWake_SealedAndAPIEnv_BothStage to assert the
@@ -141,6 +153,18 @@ type stagedAPIEnvEntry struct {
 	instance string
 	seq      int // capture of stageCallSeq at the moment of call
 	blob     []byte
+}
+
+// stagedWorkload (issue #463 / ADR-069 / PR-B) captures one
+// StageWorkloadManifest call. driveIdx == -1 is the main workload
+// (drive1); 0..N-1 are sidecar drives in the order schedd sent
+// them on the wake wire. Tests assert the call ordering (main
+// first, then sidecars in stability order) and the spec shape
+// (Name, RamMB, Port, Essential).
+type stagedWorkload struct {
+	instance string
+	driveIdx int
+	spec     WorkloadSpec
 }
 
 func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig, _ string) error {
@@ -456,6 +480,51 @@ func (v *fakeVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 	})
 	v.mu.Unlock()
 	return v.stageAPIEnvErr
+}
+
+// StageWorkloadManifest is the fakeVMM stub for the per-workload
+// drive-side staging (issue #463 / ADR-069 / PR-B). Records the
+// call so tests can assert the workload spec shape and the
+// drive index order without a real loopback mount. The fake
+// does NOT validate the manifest blob — the production
+// writeWorkloadManifest writes JSON, but the test surface
+// only checks call ordering + arg shape.
+func (v *fakeVMM) StageWorkloadManifest(instance string, driveIdx int, w WorkloadSpec) error {
+	v.mu.Lock()
+	v.stagedWorkloads = append(v.stagedWorkloads, stagedWorkload{
+		instance: instance,
+		driveIdx: driveIdx,
+		spec:     w,
+	})
+	v.mu.Unlock()
+	return v.stageWorkloadErr
+}
+
+// stagedRoster (issue #463 / ADR-069 / PR-B) captures one
+// StageWorkloadRoster call. main is the main workload's spec;
+// sidecars is the per-sidecar array (possibly nil/empty).
+// Tests assert the call shape (single call, main spec carries
+// the plan RAM, sidecars preserve stability order).
+type stagedRoster struct {
+	instance string
+	main     WorkloadSpec
+	sidecars []WorkloadSpec
+}
+
+// stagedRosters + stageRosterErr mirror the stagedWorkloads shape
+// for the roster write. The fake never validates the JSON the
+// production writeWorkloadRoster emits — the test surface only
+// checks call ordering + arg shape (same posture as
+// stagedWorkloads above).
+func (v *fakeVMM) StageWorkloadRoster(instance string, main WorkloadSpec, sidecars []WorkloadSpec) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.stagedRosters = append(v.stagedRosters, stagedRoster{
+		instance: instance,
+		main:     main,
+		sidecars: append([]WorkloadSpec(nil), sidecars...),
+	})
+	return v.stageRosterErr
 }
 
 // InstancePID is the in-process fake for the M8 §11 SeccompStatus
@@ -1190,7 +1259,7 @@ func TestCleanupReleaseErrorIsLogged(t *testing.T) {
 	lease := Lease{Instance: "ghost-cleanup", UID: 20000, GID: 20000}
 	nc := netnsConfigForTest(lease)
 	// Should not panic; should log warn. We're proving the swallow.
-	m.cleanup(context.Background(), lease, nc)
+	m.cleanup(context.Background(), lease, nc, nil)
 }
 
 // netnsConfigForTest builds a minimal netns.Config matching the lease so

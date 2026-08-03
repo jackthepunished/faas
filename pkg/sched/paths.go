@@ -78,6 +78,23 @@ func AppLayerKey(slug, deploymentID string) string {
 	return "apps/" + slug + "/" + deploymentID + ".ext4"
 }
 
+// AppSidecarLayerKey returns the storage key for ONE sidecar's
+// per-workload ext4 layer (issue #463 / ADR-069 / PR-B). Mirrors
+// the apps/<slug>/<depID>.ext4 shape with a "-<sidecarName>"
+// suffix so each sidecar's ext4 lives next to the main app layer
+// in the same prefix. Production PrefixRouter maps "apps/" to
+// /var/lib/faas/apps; the cleanup walk in
+// pkg/imaged/handler.go::cleanupAppFiles uses these keys to drop
+// stale sidecar ext4s when an app is deleted or replaced.
+//
+// sidecarName is the customer-chosen name (validated to a portable
+// charset at pkg/api/dto.go::Sidecar.Validate) — alpha-num +
+// dash + underscore, max 32 chars, no slashes — so embedding it
+// in the storage key is safe.
+func AppSidecarLayerKey(slug, deploymentID, sidecarName string) string {
+	return "apps/" + slug + "/" + deploymentID + "-" + sidecarName + ".ext4"
+}
+
 // SnapshotMemKey returns the storage key for a deployment's snapshot mem
 // blob (the RAM state at Pause). Mirrors the legacy
 // <snapDir>/<deploymentID>/mem path. Thin wrapper over

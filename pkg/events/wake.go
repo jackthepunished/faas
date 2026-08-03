@@ -94,6 +94,22 @@ const (
 	// WakeDeployFailed — apid's deploy rollback path. Payload:
 	// {app_id, deployment_id, reason}.
 	WakeDeployFailed = "wake.deploy_failed"
+	// WakeSidecarInitExit — guest-init's runWorkloads orchestrator
+	// recorded a type=="init" sidecar's terminal exit (issue #463 /
+	// ADR-069 / PR-B). Status is the closed enum: "init_ok" (exit
+	// code 0) or "init_failed" (non-zero exit). A failed init fails
+	// the deploy with failure_class: user_error (AC #1). Payload:
+	// {wake_id, app_id, instance_id, sidecar_name, status, exit_code,
+	// duration_ms}.
+	WakeSidecarInitExit = "wake.sidecar_init_exit"
+	// WakeSidecarRestart — guest-init's runWorkloads orchestrator
+	// restarted an essential sidecar after a crash (issue #463 /
+	// ADR-069 / PR-B). Non-essential sidecars do NOT emit this —
+	// their crash is logged on the orchestrator's stderr and the
+	// supervisor returns immediately (Max=0 policy, AC #2). Payload:
+	// {wake_id, app_id, instance_id, sidecar_name, attempt,
+	// previous_exit_code}.
+	WakeSidecarRestart = "wake.sidecar_restart"
 )
 
 // WakeEvent is the contract pkg/events.Platform.Emit consumes. The
@@ -476,5 +492,75 @@ func (e DeployFailed) Payload() map[string]any {
 		"app_id":        e.AppID,
 		"deployment_id": e.DeploymentID,
 		"reason":        e.Reason,
+	}
+}
+
+// SidecarInitExit — guest-init's runWorkloads orchestrator
+// recorded a type=="init" sidecar's terminal exit (issue #463 /
+// ADR-069 / PR-B). Status is the closed enum: "init_ok" (exit
+// code 0) or "init_failed" (non-zero exit). A failed init fails
+// the deploy with failure_class: user_error (AC #1). DurationMs is
+// the wall-clock from supervisor.Run start to terminal exit so
+// operators can see init-side init latency in the wake timeline.
+// WakeID + AppID + InstanceID join back to the canonical
+// schedd-emitted rows so the sidecar's lifecycle is visible in
+// the same timeline as the main wake.
+type SidecarInitExit struct {
+	EmitAt      time.Time
+	WakeID      string
+	AppID       string
+	InstanceID  string
+	SidecarName string
+	Status      string // "init_ok" | "init_failed"
+	ExitCode    int
+	DurationMs  int64
+}
+
+func (e SidecarInitExit) Kind() string     { return WakeSidecarInitExit }
+func (e SidecarInitExit) At() time.Time    { return e.EmitAt }
+func (e SidecarInitExit) Subject() *string { return nil }
+func (e SidecarInitExit) Payload() map[string]any {
+	return map[string]any{
+		"wake_id":      e.WakeID,
+		"app_id":       e.AppID,
+		"instance_id":  e.InstanceID,
+		"sidecar_name": e.SidecarName,
+		"status":       e.Status,
+		"exit_code":    e.ExitCode,
+		"duration_ms":  e.DurationMs,
+	}
+}
+
+// SidecarRestart — guest-init's runWorkloads orchestrator
+// restarted an essential sidecar after a crash (issue #463 /
+// ADR-069 / PR-B). Non-essential sidecars do NOT emit this —
+// their crash is logged on the orchestrator's stderr and the
+// supervisor returns immediately (Max=0 policy, AC #2). Attempt
+// is the 1-indexed restart number (1 = first restart); the main
+// workload's restart budget lives on the supervisor's Max field
+// (MaxRestarts). PreviousExitCode carries the run's exit code so
+// operators can distinguish OOM (137) from user_error (1) from
+// signal-driven exit (-1).
+type SidecarRestart struct {
+	EmitAt           time.Time
+	WakeID           string
+	AppID            string
+	InstanceID       string
+	SidecarName      string
+	Attempt          int
+	PreviousExitCode int
+}
+
+func (e SidecarRestart) Kind() string     { return WakeSidecarRestart }
+func (e SidecarRestart) At() time.Time    { return e.EmitAt }
+func (e SidecarRestart) Subject() *string { return nil }
+func (e SidecarRestart) Payload() map[string]any {
+	return map[string]any{
+		"wake_id":            e.WakeID,
+		"app_id":             e.AppID,
+		"instance_id":        e.InstanceID,
+		"sidecar_name":       e.SidecarName,
+		"attempt":            e.Attempt,
+		"previous_exit_code": e.PreviousExitCode,
 	}
 }

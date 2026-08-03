@@ -153,8 +153,15 @@ type MemStore struct {
 	// to the production shape.
 	deploymentLogs map[string][]LogEntry
 	deploymentSeq  map[string]int64
-	snapshots      []Snapshot
-	events         []Event
+	// deploymentSidecarLayers (issue #463 / ADR-069 / PR-B)
+	// mirrors the per-workload filesystem handle table. Keyed by
+	// "<deploymentID>\x00<sidecarName>" to give O(1) upsert +
+	// list-by-deployment; the NUL separator is safe (sidecar
+	// names are validated to a portable charset and
+	// deploymentIDs are UUIDs).
+	deploymentSidecarLayers map[string]DeploymentSidecarLayer
+	snapshots               []Snapshot
+	events                  []Event
 	// usage holds one row per (instance, minute) — mirrors PgStore's
 	// usage_minutes PK. Aggregated into `usageByMonth` (per app, per
 	// calendar month) so UsageByMonth can keep returning the spec §10
@@ -458,11 +465,15 @@ func NewMemStore() *MemStore {
 		oauthLinks:       map[string]OAuthLink{},
 		deploymentLogs:   map[string][]LogEntry{},
 		deploymentSeq:    map[string]int64{},
-		snapshots:        []Snapshot{},
-		events:           []Event{},
-		usage:            []usageMinute{},
-		usageByMonth:     []Usage{},
-		idem:             map[string]idemEntry{},
+		// Issue #463 / ADR-069 / PR-B — per-workload filesystem
+		// handles (mirrors migration 00119's PK + ON CONFLICT
+		// semantics).
+		deploymentSidecarLayers: map[string]DeploymentSidecarLayer{},
+		snapshots:               []Snapshot{},
+		events:                  []Event{},
+		usage:                   []usageMinute{},
+		usageByMonth:            []Usage{},
+		idem:                    map[string]idemEntry{},
 		// stripeByCustomer is the reverse-lookup map AccountByProviderCustomerID
 		// walks; populated by UpdateAccountProviderCustomerID.
 
@@ -2773,6 +2784,56 @@ func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, 
 	d.RootfsBytes = bytes
 	m.deployments[id] = d
 	return nil
+}
+
+// SetDeploymentSidecarLayer mirrors PgStore (issue #463 /
+// ADR-069 / PR-B). Upserts on the (deployment_id, sidecar_name)
+// pair — same idempotency contract as the schema CHECK + ON
+// CONFLICT DO UPDATE; the in-memory map key (deploymentID +
+// "\x00" + sidecarName) gives the same uniqueness. Defers to
+// SetDeploymentRootfs's "deployment row must exist" check so a
+// caller can't strand rows against a missing deployment.
+func (m *MemStore) SetDeploymentSidecarLayer(_ context.Context, l DeploymentSidecarLayer) (DeploymentSidecarLayer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.deployments[l.DeploymentID]; !ok {
+		return DeploymentSidecarLayer{}, ErrNotFound
+	}
+	key := l.DeploymentID + "\x00" + l.SidecarName
+	now := time.Now()
+	if existing, ok := m.deploymentSidecarLayers[key]; ok {
+		existing.StorageKey = l.StorageKey
+		existing.Bytes = l.Bytes
+		existing.ContentDigest = l.ContentDigest
+		existing.UpdatedAt = now
+		m.deploymentSidecarLayers[key] = existing
+		return existing, nil
+	}
+	l.CreatedAt = now
+	l.UpdatedAt = now
+	m.deploymentSidecarLayers[key] = l
+	return l, nil
+}
+
+// ListDeploymentSidecarLayers mirrors PgStore — returns the
+// full sidecar set ordered by sidecar_name ASC. Empty slice
+// (not nil) when no rows; ErrNotFound only if the deployment
+// itself is missing.
+func (m *MemStore) ListDeploymentSidecarLayers(_ context.Context, deploymentID string) ([]DeploymentSidecarLayer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.deployments[deploymentID]; !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]DeploymentSidecarLayer, 0, len(m.deploymentSidecarLayers))
+	for _, l := range m.deploymentSidecarLayers {
+		if l.DeploymentID != deploymentID {
+			continue
+		}
+		out = append(out, l)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SidecarName < out[j].SidecarName })
+	return out, nil
 }
 
 // SetDeploymentSourceURL mirrors the pgstore / migrations/00047 column pair
@@ -5131,6 +5192,52 @@ func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since ti
 	// Sort by at ASC. Stable across insertion order (the wake
 	// phases are emitted at different lock depths so the
 	// append order is not the same as the at-order).
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].At.Before(out[j].At)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListEventsBySidecar (issue #463 / ADR-069 / PR-B) is the
+// sidecar-aware read-side twin of ListEventsByWakeID. Filters on
+// the jsonb data.sidecar_name key AND the closed wake.kind IN
+// ('wake.sidecar_init_exit', 'wake.sidecar_restart') so a query
+// never returns non-sidecar rows even if a future event reuses
+// the field name. Orders by at ASC so the per-sidecar timeline
+// reads forward; respects the same since / limit contract as
+// ListEventsByWakeID.
+//
+// The kind filter is the load-bearing piece: a sidecar_name key
+// on a non-sidecar row would be silently returned without it,
+// which would surface an unrelated event in a sidecar's audit
+// view. Closed-enum filter matches the kind constants in
+// pkg/events/wake.go (WakeSidecarInitExit, WakeSidecarRestart).
+func (m *MemStore) ListEventsBySidecar(_ context.Context, sidecarName string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Event
+	for i := 0; i < len(m.events); i++ {
+		e := m.events[i]
+		if !e.At.After(since) {
+			continue
+		}
+		if e.Kind != "wake.sidecar_init_exit" && e.Kind != "wake.sidecar_restart" {
+			continue
+		}
+		var payload struct {
+			SidecarName string `json:"sidecar_name"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.SidecarName != sidecarName {
+			continue
+		}
+		out = append(out, e)
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].At.Before(out[j].At)
 	})

@@ -44,6 +44,12 @@ type Supervisor struct {
 	// log buffer read pays zero allocation cost (matters for tests
 	// that exercise the supervisor with no characterize probe).
 	lastLog atomic.Pointer[ringBuffer]
+	// lastRunErr (issue #463 / ADR-069 / PR-B) is the terminal
+	// error from the most-recent Run() invocation. The orchestrator
+	// (runWorkloads) reads this after WaitGroup.Wait() to surface
+	// the main workload's terminal state. nil = clean exit or
+	// never ran.
+	lastRunErr atomic.Pointer[error]
 }
 
 // LastExitCode returns -1 if no fork has observed an exit yet;
@@ -141,6 +147,33 @@ func (s *Supervisor) trackExit(code int) {
 	s.lastExitCode.Store(int64(code))
 }
 
+// lastErr (issue #463 / ADR-069 / PR-B) returns the terminal
+// error from the most-recent Run() invocation, or nil if the
+// supervisor never ran. The orchestrator (runWorkloads) reads
+// this after WaitGroup.Wait() returns to surface the main
+// workload's terminal state. Sidecar supervisors' lastErr() is
+// logged but ignored — non-essential sidecars can exit 0 and
+// the deploy still succeeds.
+//
+// nil in two distinct cases: (1) supervisor never ran (the
+// caller didn't dispatch Run on it), or (2) Run returned nil
+// (clean exit). The orchestrator only consults lastErr() on
+// supervisors it dispatched, so case (1) is impossible.
+func (s *Supervisor) lastErr() error { //nolint:unused // consumed by runWorkloads (guest/init/workload_linux.go) across packages
+	if p := s.lastRunErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// trackRunErr records the terminal error from Run(). Called
+// inside Run() itself before it returns so the orchestrator
+// can read it after WaitGroup.Wait(). atomic.Pointer matches
+// the other state fields — Supervisor stays non-copyable.
+func (s *Supervisor) trackRunErr(err error) {
+	s.lastRunErr.Store(&err)
+}
+
 // Run starts the app and supervises it. It returns nil if the app ever exits
 // cleanly, or the last error once the restart budget is exhausted.
 //
@@ -165,10 +198,13 @@ func (s *Supervisor) Run() error {
 			s.trackExit(0)
 		}
 		if err == nil {
+			s.trackRunErr(nil)
 			return nil // clean exit; nothing to supervise
 		}
 		if restarts >= s.Max {
-			return fmt.Errorf("app crash-looped after %d restart(s): %w", restarts, err)
+			final := fmt.Errorf("app crash-looped after %d restart(s): %w", restarts, err)
+			s.trackRunErr(final)
+			return final
 		}
 		restarts++
 		if s.OnCrash != nil {

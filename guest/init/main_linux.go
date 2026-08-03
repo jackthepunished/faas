@@ -136,6 +136,26 @@ func boot() error {
 		slog.Default().Warn("env.json could not be loaded; proceeding without api env", "err_kind", errorKind(apiErr))
 	}
 
+	// Issue #463 / ADR-069 / PR-B: discover the workload roster
+	// (deployment-level main + sidecars). A missing
+	// /etc/faas/workloads.json is the legacy single-workload path
+	// — boot falls through to the existing runAppWithEnv-driven
+	// Supervisor and the characterize probe. A present file
+	// hands off to runWorkloads which runs init sidecars
+	// sequentially, then main + type="sidecar" workloads in
+	// parallel under per-workload Supervisors.
+	roster, rosterErr := discoverRoster(os.DirFS("/"))
+	if rosterErr == nil && len(roster.Sidecars) > 0 {
+		return runWorkloads(manifest, roster, secrets, apiEnv, slog.Default())
+	}
+	// Roster absent or empty Sidecars = legacy path. Log the
+	// roster error if it was a parse failure (the legacy
+	// "file missing" case is silent — most pre-PR-B VMs have
+	// no roster file).
+	if rosterErr != nil && !isNotExist(rosterErr) {
+		slog.Default().Warn("workloads.json could not be parsed; proceeding without sidecars", "err_kind", errorKind(rosterErr))
+	}
+
 	// ADR-051 Phase 4: Supervisor holds atomic.Pointer (Run is a
 	// pointer receiver, see supervise.go). We assign the struct
 	// fields one at a time so the Start closure can refer to
@@ -428,6 +448,21 @@ func mountBasics() error {
 }
 
 // assembleOverlay mounts the app layer and stacks it over the read-only base.
+//
+// PR-B / issue #463 / ADR-069: N+1 drive topology. drive0 (vda) is the
+// shared read-only base; drive1 (vdb) is the per-app rw upper; drive2
+// (vdc), drive3 (vdd), ... are sidecar drives mounted read-only as
+// additional overlay lowers. The single writable upper stays on drive1
+// (ADR-069 §"no shared writable layer between workloads"). The merged
+// root's precedence is base → main → sidecar-0 → sidecar-1 → … so a
+// workload's /etc/faas/workload.json (per-drive stamp) is visible from
+// the merged root even though the base ships none.
+//
+// The legacy 2-drive path (no sidecars) is preserved as the default
+// branch: assembleOverlay does NOT touch /proc/partitions or the
+// roster file unless a /etc/faas/workloads.json on drive1 lists
+// sidecars. Pre-PR-B VMs never had a roster file, so this keeps the
+// legacy shape working unchanged.
 func assembleOverlay() error {
 	if err := os.MkdirAll(layerMount, 0o755); err != nil {
 		return err
@@ -440,11 +475,99 @@ func assembleOverlay() error {
 			return err
 		}
 	}
-	opts := "lowerdir=/,upperdir=" + layerMount + "/upper,workdir=" + layerMount + "/work"
+	// PR-B: discover sidecar count by reading the roster on drive1.
+	// Absent file = legacy 2-drive path; present file with empty
+	// sidecars = legacy supervisor shape; present file with non-empty
+	// sidecars = mount each sidecar drive and stack as additional
+	// read-only lowers.
+	sidecarDevices, err := discoverSidecarDevices(layerMount)
+	if err != nil {
+		return fmt.Errorf("discover sidecars: %w", err)
+	}
+	for _, dev := range sidecarDevices {
+		mp := layerMount + "/lower-" + dev.name
+		if err := os.MkdirAll(mp, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", mp, err)
+		}
+		if err := syscall.Mount(dev.device, mp, "ext4", syscall.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("mount sidecar %s at %s: %w", dev.device, mp, err)
+		}
+	}
+	// Build lowerdir in stack order (lowest precedence first): base
+	// = the kernel root (= `/`); sidecar-0, sidecar-1, ... appended
+	// in stability order so sidecar-N has the highest precedence
+	// among the read-only layers.
+	lowerdir := "/"
+	for _, dev := range sidecarDevices {
+		lowerdir += ":" + layerMount + "/lower-" + dev.name
+	}
+	opts := "lowerdir=" + lowerdir +
+		",upperdir=" + layerMount + "/upper" +
+		",workdir=" + layerMount + "/work"
 	if err := syscall.Mount("overlay", newRoot, "overlay", 0, opts); err != nil {
 		return fmt.Errorf("mount overlay: %w", err)
 	}
 	return nil
+}
+
+// sidecarDevice (issue #463 / ADR-069 / PR-B) is one entry on the
+// sidecar drive list assembleOverlay mounts. name is the
+// stable suffix used as the lower-<name> mountpoint and as the
+// per-drive stamp suffix; device is the kernel device path
+// (e.g. /dev/vdc). The PR-B plan keeps the device naming simple —
+// sidecar-N lives on /dev/vd<c+1> where c is the sidecar index —
+// so the helper doesn't need to walk /proc/partitions or decode
+// virtio-blk names. If a future caller needs a different layout,
+// the device field is the only thing to override.
+type sidecarDevice struct {
+	name   string // "sidecar-0", "sidecar-1", ...
+	device string // "/dev/vdc", "/dev/vdd", ...
+}
+
+// discoverSidecarDevices reads the roster file from drive1 (the
+// main workload's drive, mounted at mountRoot by the caller) and
+// returns one entry per sidecar workload. The roster is the
+// authoritative source for the sidecar count because the FC
+// config's drive list and the wake-time wire agree on it — schedd
+// is the single writer, vmmd mirrors it into BuildColdBootConfig,
+// and guest-init learns it by reading the same file the
+// orchestrator consumes. Without the roster file (legacy path),
+// the function returns nil and assembleOverlay emits the legacy
+// 2-drive overlay.
+//
+// A missing or malformed roster file is the legacy path: the
+// function logs and returns nil. A roster file that lists more
+// sidecars than the underlying device count can support (e.g.
+// 3 sidecars but no vde) is caught at mount time by the syscall
+// in assembleOverlay's loop; this helper never touches devices.
+func discoverSidecarDevices(mountRoot string) ([]sidecarDevice, error) {
+	rosterPath := mountRoot + "/" + workloadRosterPath
+	data, err := os.ReadFile(rosterPath)
+	if err != nil {
+		if isNotExist(err) {
+			return nil, nil // legacy 2-drive path
+		}
+		return nil, fmt.Errorf("read roster %s: %w", rosterPath, err)
+	}
+	var roster workloadRoster
+	if err := json.Unmarshal(data, &roster); err != nil {
+		return nil, fmt.Errorf("parse roster %s: %w", rosterPath, err)
+	}
+	if len(roster.Sidecars) == 0 {
+		return nil, nil // present but empty — legacy supervisor shape
+	}
+	out := make([]sidecarDevice, 0, len(roster.Sidecars))
+	for i := range roster.Sidecars {
+		// Device naming: /dev/vda = drive0 (base), /dev/vdb =
+		// drive1 (main, the per-app rw upper). Sidecar 0 starts
+		// at /dev/vdc (drive2) and increments. The cap of 2
+		// sidecars per deployment (ADR-068) caps this at vdd.
+		out = append(out, sidecarDevice{
+			name:   fmt.Sprintf("sidecar-%d", i),
+			device: fmt.Sprintf("/dev/vd%c", 'c'+i),
+		})
+	}
+	return out, nil
 }
 
 // pivotInto makes root the new root filesystem.

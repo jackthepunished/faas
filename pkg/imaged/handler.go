@@ -1149,6 +1149,148 @@ func (h *Handler) buildImageLayer(ctx context.Context, app state.App, dep state.
 		}
 		h.log.Info("imaged: build app layer (m5 fallback)", "app", app.Slug, "digest", digest, "key", result.ImageKey, "bytes", result.ContentBytes)
 	}
+	// Issue #463 / ADR-069 / PR-B: after the main app's drive1
+	// is built and stamped, build + stamp one ext4 per sidecar
+	// the deployment carries. Per-sidecar ext4 lives at
+	// apps/<slug>/<depID>-<sidecarName>.ext4 (sibling of the
+	// main layer key); the per-workload row in
+	// deployment_sidecar_layers (migration 00119) is the
+	// vmmd-readable handle. Sidecar builds are best-effort in
+	// the sense that ONE sidecar failing fails the whole
+	// deploy — a partial sidecar set is worse than a clean
+	// failure because vmmd expects every name in the jsonb
+	// contract surface to have a row.
+	return h.buildSidecarLayers(ctx, app, dep, acct)
+}
+
+// buildSidecarLayers handles the per-sidecar image build for
+// issue #463 / ADR-069 / PR-B. For each sidecar in the
+// deployment's sidecars jsonb:
+//
+//  1. Decode the api.Sidecar typed shape (validation already
+//     happened at the apid handler boundary — pkg/api ↔ pkg/state
+//     cycle avoidance per pkg-api-cannot-import-pkg-state memory).
+//  2. Pull the sidecar's OCI ref (same puller path as the main
+//     image, per-sidecar Auth credential).
+//  3. Compute diff_ids above the same base the main image uses
+//     (the per-app base digest, captured by imaged during base
+//     staging — pkg/imaged/base_stage.go).
+//  4. Build the sidecar ext4 via rootfs.Builder, same Builder
+//     call as the main path. ADR-040's verbatim-Linkname +
+//     clamp-on-traversal invariant lives in rootfs.ApplyLayerGz
+//     so the sidecar layers inherit it for free.
+//  5. Upsert the per-workload row via
+//     SetDeploymentSidecarLayer.
+//
+// Stateless denylist re-check: pkg/statefuldenylist.Match
+// re-validates each sidecar image before pull — the API gate
+// ran at apid time, but a malicious or buggy CI script that
+// edits the row directly must still trip the deny list at the
+// store boundary.
+//
+// Returns nil when the deployment carries zero sidecars (the
+// common case today); the api.Sidecar parse and the per-sidecar
+// pullers only run when there's actual work to do.
+func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep state.Deployment, acct state.Account) error {
+	if len(dep.Sidecars) == 0 || string(dep.Sidecars) == "null" {
+		return nil
+	}
+	var sidecars api.Sidecars
+	if err := json.Unmarshal(dep.Sidecars, &sidecars); err != nil {
+		_ = h.transition(ctx, dep.ID, state.DeployFailed, "decode sidecars: "+err.Error())
+		return fmt.Errorf("imaged: decode sidecars: %w", err)
+	}
+	if len(sidecars) == 0 {
+		return nil
+	}
+	for _, sc := range sidecars {
+		if sc.Name == "" {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, "sidecar: missing name")
+			return fmt.Errorf("imaged: sidecar missing name")
+		}
+		// Re-validate the deny list at the storage boundary.
+		// The API gate already rejected stateful image refs;
+		// this catches any post-hoc mutation.
+		if hint, denied := StatefulDenyListMatch(sc.Image); denied {
+			msg := fmt.Sprintf("sidecar %q image refused: stateful pattern; %s", sc.Name, hint)
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
+			return fmt.Errorf("imaged: %s", msg)
+		}
+		layerKey := sched.AppSidecarLayerKey(app.Slug, dep.ID, sc.Name)
+		// Per-sidecar pull path. We use the same h.oci
+		// ManifestPuller as the main image; per-sidecar
+		// auth may differ (a sidecar image can sit on a
+		// separate private registry than the main image),
+		// but for PR-B the simplest correct shape is one
+		// auth per ref — resolve via the same path as the
+		// main image, keyed on the sidecar ref's host.
+		var auth *oci.BasicAuth
+		if parsedRef, parseErr := oci.ParseReference(sc.Image); parseErr == nil {
+			auth, _ = h.resolveRegistryAuth(ctx, app, parsedRef.APIHost())
+		}
+		// Sidecar pull: use the M5 stream path (pullLayersWithAuth)
+		// rather than the two-drive base-diff path. Sidecars are
+		// treated as opaque layer streams — the customer uploads
+		// the full image and the build ext4s everything above the
+		// rootfs's empty lower dir. This mirrors the M5 fallback
+		// in buildImageLayer and keeps the sidecar semantics
+		// independent of the main image's runtime selection.
+		start := time.Now()
+		pulled, err := pullLayersWithAuth(ctx, h.oci, sc.Image, auth)
+		h.ops.ObserveImagedOCIPull("sidecar_blob", pullResult(err), time.Since(start))
+		if err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q pull: %s", sc.Name, err.Error()))
+			return fmt.Errorf("imaged: sidecar %q pull: %w", sc.Name, err)
+		}
+		defer func() {
+			for _, r := range pulled.Layers {
+				_ = r.Close()
+			}
+		}()
+		be, err := h.storageFor()
+		if err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, "sidecar storage init: "+err.Error())
+			return fmt.Errorf("imaged: sidecar storage init: %w", err)
+		}
+		// rootfs.Builder.Build input. The sidecar's
+		// `ram_mb` is the memory.max the sidecar cgroup gets
+		// carved (PR-B step 6 wires that on the host side via
+		// writeWorkloadCgroup). The Manifest's entrypoint is a
+		// placeholder — guest-init reads the per-workload
+		// workload.json (issue #463 / ADR-069 §Sidecar staging)
+		// for the sidecar's argv/env/port at boot time, not
+		// the rootfs-baked app.json. The placeholder exists
+		// because pkg/api.AppManifest.Validate rejects an
+		// empty entrypoint; using a constant argv keeps the
+		// build happy without baking a customer-visible Cmd
+		// into the ext4.
+		result, err := h.builder.Build(ctx, rootfs.BuildInput{
+			Layers:        layersAsReaders(pulled.Layers),
+			Manifest:      api.SidecarBuildManifest(),
+			GuestInitPath: h.guestInitPath,
+			Plan:          acct.Plan,
+			Storage:       be,
+			StorageKey:    layerKey,
+		})
+		if err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q build: %s", sc.Name, err.Error()))
+			return fmt.Errorf("imaged: sidecar %q build: %w", sc.Name, err)
+		}
+		if _, err := h.store.SetDeploymentSidecarLayer(ctx, state.DeploymentSidecarLayer{
+			DeploymentID:  dep.ID,
+			SidecarName:   sc.Name,
+			StorageKey:    layerKey,
+			Bytes:         result.ContentBytes,
+			ContentDigest: sc.Image,
+		}); err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q stamp: %s", sc.Name, err.Error()))
+			return fmt.Errorf("imaged: sidecar %q stamp: %w", sc.Name, err)
+		}
+		h.log.Info("imaged: build sidecar layer",
+			"app", app.Slug, "sidecar", sc.Name, "kind", sc.Type,
+			"key", layerKey, "bytes", result.ContentBytes,
+			"layers", len(pulled.Layers))
+	}
 	return nil
 }
 
@@ -1980,6 +2122,26 @@ func (h *Handler) cleanupAppFiles(ctx context.Context, appID string) error {
 		appsKey := sched.AppLayerKey(app.Slug, d.ID)
 		if err := be.Delete(ctx, appsKey); err != nil {
 			h.log.Warn("imaged: app cleanup ext4", "key", appsKey, "err", err)
+		}
+		// Issue #463 / ADR-069 / PR-B: walk the deployment's
+		// per-workload sidecar ext4 set and delete each. The
+		// store-side FK CASCADE on `deployment_sidecar_layers`
+		// keeps the row consistent; this loop removes the
+		// storage artifact that the row used to reference.
+		// We swallow List errors as Warn (the FK-side cascade
+		// means the row goes with the deployment even if the
+		// storage sweep fails, and a future rebuild would
+		// generate fresh keys).
+		if layers, listErr := h.store.ListDeploymentSidecarLayers(ctx, d.ID); listErr == nil {
+			for _, l := range layers {
+				if delErr := be.Delete(ctx, l.StorageKey); delErr != nil {
+					h.log.Warn("imaged: app cleanup sidecar ext4",
+						"key", l.StorageKey, "sidecar", l.SidecarName, "err", delErr)
+				}
+			}
+		} else {
+			h.log.Warn("imaged: app cleanup list sidecar layers",
+				"deployment", d.ID, "err", listErr)
 		}
 		memKey := state.SnapMemKey(d.ID)
 		vmKey := state.SnapVMStateKey(d.ID)

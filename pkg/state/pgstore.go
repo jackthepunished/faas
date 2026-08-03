@@ -3185,6 +3185,86 @@ func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string,
 	return nil
 }
 
+// SetDeploymentSidecarLayer is the per-workload filesystem handle
+// for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
+// keyed by (deployment_id, sidecar_name). The whole row is
+// overwritten on conflict — bytes + content_digest + storage_key
+// — so a re-imaged rebuild's new key replaces the prior build's
+// key without orphaned-key drift (the cleanupAppFiles path in
+// pkg/imaged/handler.go deletes the OLD key before this returns,
+// keeping storage in sync). updated_at is refreshed on every
+// conflict; created_at is stamped once on the initial INSERT.
+//
+// Returns ErrNotFound when the deployment row doesn't exist —
+// the FK CASCADE in migration 00119 makes this case unreachable
+// in practice, but we surface it explicitly so a misuse at the
+// caller (e.g. imaged on a removed deployment) fails closed.
+func (s *PgStore) SetDeploymentSidecarLayer(ctx context.Context, l DeploymentSidecarLayer) (DeploymentSidecarLayer, error) {
+	// Defence-in-depth: confirm the FK target row exists so the
+	// caller gets a clean ErrNotFound before Postgres raises 23503
+	// on the INSERT. The FK CASCADE handles delete-orphaning; this
+	// check is for read-then-write paths in imaged.
+	var exists string
+	if err := s.pool.QueryRow(ctx,
+		`select id from deployments where id = $1`, l.DeploymentID,
+	).Scan(&exists); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return DeploymentSidecarLayer{}, ErrNotFound
+		}
+		return DeploymentSidecarLayer{}, fmt.Errorf("state: sidecar layer parent check: %w", err)
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into deployment_sidecar_layers
+		    (deployment_id, sidecar_name, storage_key, bytes, content_digest)
+		values ($1, $2, $3, $4, $5)
+		on conflict (deployment_id, sidecar_name) do update
+		set storage_key    = excluded.storage_key,
+		    bytes          = excluded.bytes,
+		    content_digest = excluded.content_digest,
+		    updated_at     = now()
+		returning deployment_id, sidecar_name, storage_key, bytes, content_digest, created_at, updated_at
+	`, l.DeploymentID, l.SidecarName, l.StorageKey, l.Bytes, l.ContentDigest)
+	var got DeploymentSidecarLayer
+	if err := row.Scan(&got.DeploymentID, &got.SidecarName, &got.StorageKey,
+		&got.Bytes, &got.ContentDigest, &got.CreatedAt, &got.UpdatedAt); err != nil {
+		return DeploymentSidecarLayer{}, fmt.Errorf("state: sidecar layer upsert: %w", err)
+	}
+	return got, nil
+}
+
+// ListDeploymentSidecarLayers returns the deployment's full sidecar
+// set ordered by sidecar_name ASC (issue #463 / ADR-069 / PR-B).
+// Returns an empty slice when no sidecars exist; ErrNotFound only
+// when the deployment itself is missing. vmmd's Wake path
+// consumes this eagerly — Order-by-name keeps the workload slice
+// deterministic across restarts so snapshots hash to the same
+// drive set every time.
+func (s *PgStore) ListDeploymentSidecarLayers(ctx context.Context, deploymentID string) ([]DeploymentSidecarLayer, error) {
+	rows, err := s.pool.Query(ctx, `
+		select deployment_id, sidecar_name, storage_key, bytes, content_digest, created_at, updated_at
+		from deployment_sidecar_layers
+		where deployment_id = $1
+		order by sidecar_name asc
+	`, deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list sidecar layers: %w", err)
+	}
+	defer rows.Close()
+	out := []DeploymentSidecarLayer{}
+	for rows.Next() {
+		var l DeploymentSidecarLayer
+		if err := rows.Scan(&l.DeploymentID, &l.SidecarName, &l.StorageKey,
+			&l.Bytes, &l.ContentDigest, &l.CreatedAt, &l.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("state: scan sidecar layer: %w", err)
+		}
+		out = append(out, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate sidecar layers: %w", err)
+	}
+	return out, nil
+}
+
 // SetDeploymentSourceURL stamps the upstream URL + commit SHA on a
 // deployment (Tier 3 / issue #197 B3.10 schema half, migrations/00047).
 // Populated by githubd's CreateDeployment callback once the deployment
@@ -6392,6 +6472,74 @@ func (s *PgStore) ListEventsByWakeID(ctx context.Context, wakeID string, since t
 			 where data->>'wake_id' = $1 and at > $2
 			 order by at asc limit $3`,
 			wakeID, since, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 16)
+	for rows.Next() {
+		var e Event
+		var rawData []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.Actor, &e.Kind, &e.Subject, &rawData); err != nil {
+			return nil, err
+		}
+		e.Data = json.RawMessage(rawData)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ListEventsBySidecar (issue #463 / ADR-069 / PR-B) is the
+// sidecar-aware read-side twin of ListEventsByWakeID. Filters on
+// the jsonb expression data->>'sidecar_name' AND the closed
+// kind IN ('wake.sidecar_init_exit', 'wake.sidecar_restart') so
+// the query never returns non-sidecar rows even if a future
+// event reuses the field name. Orders by at ASC; respects the
+// same since / limit contract as ListEventsByWakeID.
+//
+// Index: the existing events_wake_id_idx jsonb expression index
+// (migrations/00113_events_wake_id_idx.sql) covers
+// data->>'wake_id', NOT data->>'sidecar_name'. PR-B does not
+// add a parallel sidecar index — the kind filter is selective
+// enough that the planner picks an events_kind_at_idx scan and
+// the sidecar_name jsonb filter is applied as a residual. If
+// sidecar event volume climbs, a follow-up migration adds
+// events_sidecar_name_idx with the same shape as
+// events_wake_id_idx.
+func (s *PgStore) ListEventsBySidecar(ctx context.Context, sidecarName string, since time.Time, limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	// Closed kind enum — mirrors the constants in
+	// pkg/events/wake.go (WakeSidecarInitExit,
+	// WakeSidecarRestart). The closed list keeps the planner
+	// honest (an unknown kind won't quietly satisfy the
+	// filter) and matches the in-memory twin's filter in
+	// memstore.go.
+	//
+	// Index: events_sidecar_name_idx (migration 00121) is a
+	// partial expression index restricted to the same closed
+	// kinds, keyed on (data->>'sidecar_name')::text. The
+	// planner picks it up for this query's predicate (verified
+	// by TestMigrations_00121_EventsSidecarNameIdx's EXPLAIN
+	// check). A future PR that adds a new closed sidecar-kind
+	// must update the index's WHERE clause in lockstep.
+	const kindFilter = "kind in ('wake.sidecar_init_exit', 'wake.sidecar_restart')"
+	var rows pgx.Rows
+	var err error
+	if since.IsZero() {
+		rows, err = s.pool.Query(ctx,
+			`select id, at, actor, kind, subject, data from events
+			 where `+kindFilter+` and data->>'sidecar_name' = $1
+			 order by at asc limit $2`,
+			sidecarName, limit)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`select id, at, actor, kind, subject, data from events
+			 where `+kindFilter+` and data->>'sidecar_name' = $1 and at > $2
+			 order by at asc limit $3`,
+			sidecarName, since, limit)
 	}
 	if err != nil {
 		return nil, err

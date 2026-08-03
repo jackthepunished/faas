@@ -1147,6 +1147,36 @@ type Store interface {
 	// wire and vmmd resolves it via Storage.Get before staging the chroot.
 	SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error
 
+	// Per-workload filesystem handles for sidecars (issue #463 /
+	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
+	// jsonb) stays the contract layer; this is the per-sidecar
+	// storage-key handle imaged writes and vmmd reads at wake
+	// time. The 2-row cap is enforced upstream by the
+	// `deployments.sidecars` CHECK constraint — this interface
+	// does not duplicate it (its row count could exceed
+	// SidecarCapMax via a hand-INSERT and that would only
+	// surface when vmmd reads a row that no jsonb entry
+	// references, which is a defence-in-depth concern, not a
+	// correctness gate).
+	//
+	// SetDeploymentSidecarLayer upserts one sidecar's layer
+	// handle. Imaged calls it once per sidecar in
+	// buildImageLayer's per-sidecar loop. Returns the refreshed
+	// row with CreatedAt / UpdatedAt populated. ON CONFLICT
+	// updates bytes + content_digest + storage_key +
+	// updated_at so a re-imaged rebuild's new key replaces the
+	// prior build's key without orphaned-key drift.
+	SetDeploymentSidecarLayer(ctx context.Context, layer DeploymentSidecarLayer) (DeploymentSidecarLayer, error)
+	// ListDeploymentSidecarLayers returns the deployment's full
+	// sidecar set, ordered by sidecar_name ASC for deterministic
+	// iteration. Returns an empty slice when the deployment has
+	// no sidecars (NOT NULL DEFAULT '[]' sidebars up the
+	// contract). ErrNotFound is reserved for "deployment row
+	// missing entirely" — a deployment with zero sidecars
+	// returns ([]nil, nil). vmmd's Wake path consumes this
+	// eagerly to convert into wake.Workloads entries.
+	ListDeploymentSidecarLayers(ctx context.Context, deploymentID string) ([]DeploymentSidecarLayer, error)
+
 	// SetDeploymentSourceURL records the canonical upstream URL +
 	// commit SHA the build was triggered from (Tier 3 / issue #197
 	// B3.10 schema half, migrations/00047). Populated by githubd's
@@ -1851,6 +1881,17 @@ type Store interface {
 	// lower bound (zero-value passes the floor); limit is
 	// bounded to 1000 by the handler.
 	ListEventsByWakeID(ctx context.Context, wakeID string, since time.Time, limit int) ([]Event, error)
+	// ListEventsBySidecar (issue #463 / ADR-069 / PR-B) is the
+	// sidecar-aware read-side query for the customer-facing
+	// timeline endpoint. Filters on the jsonb expression
+	// data->>'sidecar_name' = $1 and the closed wake.kind IN
+	// ('wake.sidecar_init_exit', 'wake.sidecar_restart') so a
+	// query never returns non-sidecar rows even if a future
+	// event reuses the field name. Orders by at ASC and respects
+	// the same since / limit contract as ListEventsByWakeID so
+	// the customer-facing timeline endpoint can chain the two
+	// queries under the same cursor.
+	ListEventsBySidecar(ctx context.Context, sidecarName string, since time.Time, limit int) ([]Event, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first
