@@ -14,6 +14,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -35,6 +36,16 @@ const envTraceRingCap = "FAAS_TRACE_RING_CAP"
 
 // envObserverToken is the env var for the X-Faas-Trace-Auth header
 // gate. Empty value disables the GET endpoint (returns 404).
+//
+// Security note (issue #555 review): this token is the sole trust
+// boundary on GET /v1/traces/{trace_id}. With a valid token the
+// holder can read any trace in the last 24h — across all accounts,
+// across all apps. Treat FAAS_TRACE_OBSERVER_TOKEN with the same
+// care as a database superuser password: distribute via systemd
+// LoadCredential (see §11) and rotate via the same cadence as the
+// dashboard session signing key. An empty value is the safe
+// default; the handler returns 404 in that case so a missing
+// config does not silently disable auth.
 const envObserverToken = "FAAS_TRACE_OBSERVER_TOKEN"
 
 // TraceSetup is the runtime bundle the daemon installs at boot.
@@ -90,9 +101,12 @@ func InstallTracePipeline(ctx context.Context, name, version string, log *slog.L
 	}
 
 	// SpanExporter list: the ring exporter is always present; the
-	// OTLP exporter is conditional. WithBatcher fans out to each.
-	ringExporter := NewTraceRingExporter(ring, log)
-	exporters := []sdktrace.SpanExporter{ringExporter}
+	// OTLP exporter is conditional. Both share a single batch via
+	// the multi-exporter shape so we don't pay the per-batch
+	// overhead twice (issue #555 review: a previous revision
+	// mounted the ring exporter twice, doubling the ring's per-
+	// span cost).
+	exporters := []sdktrace.SpanExporter{NewTraceRingExporter(ring, log)}
 	otlpExporter, otlpErr := buildOTLPExporter(ctx, log)
 	if otlpErr != nil {
 		// The OTLP endpoint is optional. Log a warning and run
@@ -101,22 +115,15 @@ func InstallTracePipeline(ctx context.Context, name, version string, log *slog.L
 		// down.
 		log.Warn("trace_setup: OTLP exporter disabled", "err", otlpErr)
 	}
+	if otlpExporter != nil {
+		exporters = append(exporters, otlpExporter)
+	}
 
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(ringExporter),
-		// Adding the OTLP exporter with a separate WithBatcher
-		// would give it its own batch window; instead, both
-		// exporters share one batch via the multi-exporter shape.
 		sdktrace.WithBatcher(multiExporter(exporters)),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 	)
-	// Drop the noop if both batchers are set; we wired them
-	// above. (The duplicate ringExporter under two batchers is
-	// intentional — the ring is shared, but the SDK configures
-	// each batch processor independently. The second call is
-	// harmless.)
-	_ = otlpExporter
 	otel.SetTracerProvider(tp)
 
 	handler := NewTraceHandler(TraceHandlerConfig{
@@ -167,22 +174,31 @@ func buildOTLPExporter(ctx context.Context, log *slog.Logger) (sdktrace.SpanExpo
 // multiExporter fans ExportSpans / Shutdown to a list of exporters.
 // The SDK doesn't ship a public multi-exporter helper in v1.43; this
 // is the canonical short implementation.
+//
+// Errors are joined with errors.Join so the daemon drain can see
+// every sub-exporter failure (issue #555 review: a previous
+// revision silently dropped all errors, hiding "OTLP collector
+// shutdown timed out" from the operator).
 type multiExporter []sdktrace.SpanExporter
 
 func (m multiExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	var errs []error
 	for _, e := range m {
 		if err := e.ExportSpans(ctx, spans); err != nil {
 			// Continue to the next exporter so a single
 			// failure does not starve the others.
-			_ = err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m multiExporter) Shutdown(ctx context.Context) error {
+	var errs []error
 	for _, e := range m {
-		_ = e.Shutdown(ctx)
+		if err := e.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

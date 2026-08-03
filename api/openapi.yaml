@@ -7373,8 +7373,8 @@ components:
       required: [trace_id, spans]
       properties:
         trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        started: { type: string, format: date-time }
-        last_seen: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
         spans:
           type: array
           items: { $ref: '#/components/schemas/TraceSpan' }

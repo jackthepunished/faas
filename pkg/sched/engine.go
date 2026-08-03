@@ -538,6 +538,35 @@ func (e *Engine) WithTracer(tr oteltrace.Tracer) *Engine {
 	return e
 }
 
+// startCreateSpan begins a vmmd.create_* client span under the active
+// wakeCtx (issue #555 PR-3). Returns the new child ctx and a nil-safe
+// end func the caller MUST defer. extraAttrs is appended to the
+// common app/instance/deployment triple; pass nil for the cold-boot
+// path (no snap_id). When e.tracer is nil the helper is a no-op and
+// the returned end func is also nil-safe.
+func (e *Engine) startCreateSpan(wakeCtx context.Context, name, snapID string, bootInput bootInput) (context.Context, oteltrace.Span) {
+	if e.tracer == nil {
+		return wakeCtx, nil
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("app_id", bootInput.appID),
+		attribute.String("instance_id", bootInput.insID),
+		attribute.String("deployment_id", bootInput.depID),
+	}
+	if snapID != "" {
+		attrs = append(attrs, attribute.String("snap_id", snapID))
+	}
+	return e.tracer.Start(wakeCtx, name, oteltrace.WithAttributes(attrs...))
+}
+
+// endSpan is the nil-safe closer for startCreateSpan's return value.
+// Kept as a tiny helper so the call sites read as a defer pair.
+func endSpan(s oteltrace.Span) {
+	if s != nil {
+		s.End()
+	}
+}
+
 // CapacityTable returns the per-node live-capacity table for
 // the ReportCapacity gRPC handler to drive (ADR-025 axis 5).
 // The handler calls table.Replace per stream Recv; the chooser
@@ -1298,17 +1327,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// The vmmd-side gRPC stats handler (otelgrpc) starts a
 		// server span for the CreateFromSnapshot RPC; this client
 		// span is the parent linkage in the trace tree.
-		var createSpan oteltrace.Span
-		if e.tracer != nil {
-			bootCtx, createSpan = e.tracer.Start(bootCtx, "vmmd.create_from_snapshot",
-				oteltrace.WithAttributes(
-					attribute.String("app_id", bootInput.appID),
-					attribute.String("instance_id", bootInput.insID),
-					attribute.String("snap_id", bootInput.snapID),
-					attribute.String("deployment_id", bootInput.depID),
-				),
-			)
-		}
+		bootCtx, createSpan := e.startCreateSpan(bootCtx, "vmmd.create_from_snapshot", bootInput.snapID, bootInput)
 		out, err = e.vmm.CreateFromSnapshot(bootCtx, bootInput.nodeID, bootInput.insID, bootInput.spec, SnapshotRef{
 			DeploymentID:      bootInput.depID,
 			FCVersion:         bootInput.snapVer,
@@ -1316,29 +1335,16 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			VMStatePath:       vmstatePath,
 			VMStateStorageKey: vmstateStorageKey,
 		})
-		if createSpan != nil {
-			createSpan.End()
-		}
+		endSpan(createSpan)
 	} else {
 		// Either no snap row at all (cold path), or a snap row with
 		// an empty StorageKey (F-1 contract violation — fall back to
 		// a real cold boot per ADR-005: snapshots are cache, not
 		// truth; wake must never depend on a snapshot existing).
 		// Issue #555 PR-3: vmmd.create_cold_boot child span.
-		var createSpan oteltrace.Span
-		if e.tracer != nil {
-			bootCtx, createSpan = e.tracer.Start(bootCtx, "vmmd.create_cold_boot",
-				oteltrace.WithAttributes(
-					attribute.String("app_id", bootInput.appID),
-					attribute.String("instance_id", bootInput.insID),
-					attribute.String("deployment_id", bootInput.depID),
-				),
-			)
-		}
+		bootCtx, createSpan := e.startCreateSpan(bootCtx, "vmmd.create_cold_boot", "", bootInput)
 		out, err = e.vmm.CreateColdBoot(bootCtx, bootInput.nodeID, bootInput.insID, bootInput.spec)
-		if createSpan != nil {
-			createSpan.End()
-		}
+		endSpan(createSpan)
 	}
 	if err != nil {
 		// Boot error path. Release the reservation, transition to

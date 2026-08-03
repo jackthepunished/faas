@@ -14,6 +14,17 @@
 // running. The SDK noop provider lets every site call tracer.Start
 // without a nil-check; the shutdown func is a no-op when the
 // provider is noop.
+//
+// Security note (issue #555 review): OTEL_EXPORTER_OTLP_ENDPOINT is
+// an operator-controlled trust input. Init does not validate the
+// URL — the SDK dials whatever host:port the operator puts in the
+// env, over plaintext (otlptracehttp.WithInsecure). On a one-box
+// deployment the collector is expected to bind 127.0.0.1; on a
+// multi-box deployment the operator MUST set up mTLS or a private
+// network between the daemon and the collector. Never accept this
+// value from a customer-facing source (request headers, manifest
+// env) — that would let a tenant exfiltrate trace data to an
+// attacker-controlled host.
 package otelinit
 
 import (
@@ -22,6 +33,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -131,9 +143,12 @@ func Init(ctx context.Context, cfg Config, log *slog.Logger) (ShutdownFunc, erro
 
 	rate := defaultSamplingRate
 	if v := os.Getenv(envSamplingRate); v != "" {
-		var parsed float64
-		if _, err := fmt.Sscanf(v, "%f", &parsed); err != nil {
-			log.Warn("otelinit: invalid OTEL_TRACES_SAMPLER_ARG, falling back", "value", v)
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			// Issue #555 review: the previous fmt.Sscanf accepted
+			// trailing junk ("1.0xyz" parsed as 1.0); ParseFloat
+			// rejects it. Falls back to defaultSamplingRate.
+			log.Warn("otelinit: invalid OTEL_TRACES_SAMPLER_ARG, falling back", "value", v, "err", err)
 		} else {
 			rate = parsed
 		}

@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/onebox-faas/faas/pkg/wire/otelinit"
 )
@@ -170,30 +171,45 @@ func TestLiftSpanContext_FromActiveSpan(t *testing.T) {
 	}
 }
 
-// TestLiftFromMD asserts the gRPC-MD reader returns the same trace
-// context as the slog envelope. We seed the global TextMapPropagator
-// with a TraceContext propagator and use a fake inbound context
-// (with metadata). The x-faas-* helper then lifts.
+// TestLiftFromMD pins the gRPC-MD round trip: a context carrying
+// inbound x-faas-* metadata lifts to the expected trace_id/span_id
+// pair (issue #555 review: the previous revision built a carrier
+// LiftFromMD never read, asserting only the empty-md path).
 func TestLiftFromMD(t *testing.T) {
 	prev := otel.GetTextMapPropagator()
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
 
-	// Simulate a server-side inbound MD layer: build a metadata
-	// carrier and walk it through the propagator's Extract.
-	// In-process we use propagation.TextMapCarrier directly.
-	carrier := propagation.MapCarrier{
-		"x-faas-trace-id": "00000000000000000000000000000001",
-		"x-faas-span-id":  "0000000000000001",
+	const wantTID = "00000000000000000000000000000001"
+	const wantSID = "0000000000000001"
+	md := metadata.New(map[string]string{
+		"x-faas-trace-id": wantTID,
+		"x-faas-span-id":  wantSID,
+	})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	ids, ok := otelinit.LiftFromMD(ctx)
+	if !ok {
+		t.Fatal("LiftFromMD on a metadata-bearing ctx returned ok=false")
 	}
-	// Wrap the carrier in an inboundMetadataCarrier-style context
-	// that wire.CorrelationFromIncoming recognises. Because we
-	// can't easily fake gRPC metadata in a unit test, we exercise
-	// the empty-md path here and rely on integration tests for
-	// the full MD round-trip.
-	_ = carrier
+	if ids.TraceID != wantTID {
+		t.Errorf("TraceID = %q, want %q", ids.TraceID, wantTID)
+	}
+	if ids.SpanID != wantSID {
+		t.Errorf("SpanID = %q, want %q", ids.SpanID, wantSID)
+	}
+}
+
+// TestLiftFromMD_EmptyMD pins the negative contract: a context
+// without inbound metadata returns ok=false and zero-valued IDs.
+// A regression here would mean the slog envelope starts showing
+// bogus trace_ids on every request.
+func TestLiftFromMD_EmptyMD(t *testing.T) {
 	ids, ok := otelinit.LiftFromMD(context.Background())
 	if ok {
 		t.Errorf("expected ok=false on bg ctx, got %+v", ids)
+	}
+	if ids.TraceID != "" || ids.SpanID != "" {
+		t.Errorf("expected zero-valued IDs, got %+v", ids)
 	}
 }

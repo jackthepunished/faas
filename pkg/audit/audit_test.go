@@ -367,3 +367,41 @@ func TestAuditor_Emit_AppendEventFailureWithNilOpsAlsoDoesNotPanic(t *testing.T)
 
 	a.Emit(context.Background(), "cron.fired", &acct, map[string]any{"cron_id": "c-1"})
 }
+
+// TestAuditor_Emit_NoSpanPreservesCustomerTraceID pins the symmetric
+// merge contract (issue #555 review): when ctx carries no OTel
+// SpanContext, a customer-supplied trace_id in the data map is left
+// alone — the lift is best-effort and never overwrites an explicit
+// caller-supplied value, regardless of whether OTel is active.
+func TestAuditor_Emit_NoSpanPreservesCustomerTraceID(t *testing.T) {
+	store := state.NewMemStore()
+	a := audit.New(store, silentLog(), newStubAuditOps(), "apid")
+	acctRec, err := store.CreateAccount(context.Background(), "apid-audit-no-span@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+
+	a.Emit(context.Background(), "cron.fired", &acctRec.ID, map[string]any{
+		"trace_id": "00000000000000000000000000000000",
+		"cron_id":  "c-1",
+	})
+
+	rows, _ := store.ListEvents(context.Background(), acctRec.ID, 0)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(rows[0].Data, &data); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if data["trace_id"] != "00000000000000000000000000000000" {
+		t.Errorf("trace_id = %v, want customer value preserved", data["trace_id"])
+	}
+	if data["cron_id"] != "c-1" {
+		t.Errorf("cron_id dropped: %v", data)
+	}
+	// Without an active span, span_id must NOT be invented.
+	if _, ok := data["span_id"]; ok {
+		t.Errorf("span_id = %v, want absent when no span is active", data["span_id"])
+	}
+}

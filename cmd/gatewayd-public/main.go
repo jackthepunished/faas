@@ -406,13 +406,15 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 	if err := controlSrv.Shutdown(sctx); err != nil {
 		log.Warn("gatewayd-public: control Shutdown", "err", err)
 	}
-	// Flush any in-flight spans from the BatchSpanProcessor. We
-	// use a fresh context (the daemon's ctx is already cancelled)
-	// so the SDK shutdown can flush its full batch. The 5s upper
-	// bound matches the public-server shutdown grace so a slow
-	// collector doesn't stall the daemon drain.
+	// Flush any in-flight spans from the BatchSpanProcessor.
+	// WithoutCancel detaches from the daemon's cancelled ctx so the
+	// SDK shutdown can flush its full batch; the 5s upper bound
+	// matches the public-server shutdown grace so a slow collector
+	// doesn't stall the daemon drain. (Issue #555 review: the
+	// previous revision used context.Background(), discarding any
+	// deadline the wire.Daemon harness set on ctx.)
 	if traceSetup != nil {
-		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		if err := traceSetup.Shutdown(flushCtx); err != nil {
 			log.Warn("gatewayd-public: trace shutdown", "err", err)
 		}
