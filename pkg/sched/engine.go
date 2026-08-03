@@ -2714,6 +2714,16 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 		return fmt.Errorf("sched: park: snapshot %s: %w", ins.ID, err)
 	}
 	e.ledger.Release(ins.ID)
+	// issue #470 / PR A / ADR-055 — warm capture runs BEFORE the
+	// PARKED transition while the row is still RUNNING. Running
+	// the warm capture against a PARKED row is illegal (the state
+	// machine's PARKED→STOPPED edge is not allowed, so a warm
+	// failure here would have nowhere to land). Running it first
+	// also better matches the plan's "warm runs while the runner
+	// is alive" semantic — the VM is still in RUNNING state for
+	// the brief window between the warm pause and the vmmd
+	// resume.
+	warmErr := e.captureWarmSnapshotLocked(ctx, ins)
 	e.transition(ctx, ins.ID, ins.AppID, state.StateParked)
 	// issue #517 / PR-C / ADR-064 — emit wake.park_completed on the
 	// successful park. The snapshot_id is the storage key the next
@@ -2739,26 +2749,15 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	// snapshot_written payload can be routed by imaged's row writer.
 	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b, state.SnapshotTierInit)
 
-	// Warm-tier capture (issue #470 / PR A / ADR-055). Runs under the
-	// same appMu window the init capture ran under, so the second
-	// pause/resume can never race a concurrent Wake for the same
-	// deployment. Best-effort: a failed warm capture destroys the VM
-	// (no warm AND no init for this park — the user gets a cold-boot
-	// next wake per ADR-005), and parks a STOPPED row with a
-	// warm_capture_error audit kind so the operator can see the cause.
-	//
-	// The successful path leaves the runner RUNNING across the pause
-	// (vmmd resumes the VM after publishing both blobs), so the
-	// notification + captured row only become useful after the engine
-	// tears the instance down via the existing init-tier capture. The
-	// Manager.WarmSnapshot wrapper does NOT touch m.live[instance] /
-	// cidToID — ADR-055 §3.2 invariant.
-	if err := e.captureWarmSnapshotLocked(ctx, ins); err != nil {
-		// Surface a structured log line; the STOPPED row + audit kind
-		// already tells the operator what happened. Returning nil
-		// because the init capture succeeded and the row is PARKED —
-		// the warm capture is best-effort, not a Park failure.
-		e.log.Warn("sched: capture warm snapshot failed", "instance", ins.ID, "err", err)
+	if warmErr != nil {
+		// warmErr was captured above (between the init snapshot and
+		// the PARKED transition). A failure has already transitioned
+		// the row to STOPPED via transitionWithKind, so we just
+		// surface the log line and return — the init row was written
+		// but the blob has no surviving VM (the warm failure destroyed
+		// it); the next wake cold-boots (ADR-005) and PR C's GC sweep
+		// evicts the orphaned init row.
+		e.log.Warn("sched: capture warm snapshot failed", "instance", ins.ID, "err", warmErr)
 	}
 	return nil
 }

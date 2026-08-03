@@ -1690,8 +1690,13 @@ func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter
 //     reconciles the delete.
 //
 // The returned Counter is safe to retain — Prometheus's
-// WithLabelValues is internally cached.
+// WithLabelValues is internally cached. nil-receiver guard mirrors
+// the EgressDeny / OCIEgressDeny pattern so unit tests without
+// metrics keep working.
 func (m *OpsMetrics) WarmSnapshotErrors(reason string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
 	return m.warmSnapshotErrors.WithLabelValues(reason)
 }
 

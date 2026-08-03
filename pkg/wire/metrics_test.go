@@ -808,3 +808,39 @@ func TestOpsMetrics_PreInstantiatesGithubdPathFilterSeries(t *testing.T) {
 		}
 	}
 }
+
+// TestOpsMetrics_WarmSnapshotErrors (issue #470 / PR A / ADR-055)
+// pins the warm-snapshot-error counter's label set. The closed
+// {vmm_call, store_write} set is pre-instantiated at boot so the
+// dashboard surfaces zero on an idle daemon; a regression that
+// lets the reason label free-form would break the closed-set
+// cardinality budget and trip here.
+func TestOpsMetrics_WarmSnapshotErrors(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	// Real observations.
+	m.WarmSnapshotErrors("vmm_call").Inc()
+	m.WarmSnapshotErrors("vmm_call").Inc()
+	m.WarmSnapshotErrors("store_write").Inc()
+
+	body := render(t, m)
+	for _, want := range []string{
+		`vmmd_warm_snapshot_errors_total{reason="vmm_call"} 2`,
+		`vmmd_warm_snapshot_errors_total{reason="store_write"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_WarmSnapshotErrorsNilSafe (issue #470 / PR A /
+// ADR-055) — the accessor must be no-op on a nil receiver so
+// vmmd / schedd unit tests without metrics keep working (same
+// nil-safe posture as EgressDeny). The convention is `nil →
+// return nil`.
+func TestOpsMetrics_WarmSnapshotErrorsNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.WarmSnapshotErrors("vmm_call"); got != nil {
+		t.Errorf("nil.WarmSnapshotErrors = %v, want nil", got)
+	}
+}
