@@ -1,4 +1,4 @@
-# ADR-067 · Issue #517 closure evidence (LOGGING: correlation, server-side filters, explicit gap semantics)
+# ADR-068 · Issue #517 closure evidence (LOGGING: correlation, server-side filters, explicit gap semantics)
 
 - **Status:** accepted
 - **Date:** 2026-08-02
@@ -10,13 +10,15 @@
 
 ### Note on slot-collision hygiene
 
-This ADR is filed under number 067 because that was the next free slot at the
-time of writing. The repo's `docs/adr/` directory has duplicate-number collisions
-on **ADR-062** (two files) and **ADR-064** (two files) on `main` at the time of
-filing — both predate this PR and are not addressed here. If you are reading
-this ADR as part of a #517 closure review, treat the cited filenames (e.g.
-`docs/adr/064-wake-timeline-canonical-vocabulary.md`) as the source of truth,
-not the bare ADR number.
+This ADR was originally filed under number 067. After rebasing onto the main
+landed with PR #538 ("tier-a6-migrating-watchdog", ADR-067), this ADR was
+renumbered to 068 to avoid the filename collision. The repo's `docs/adr/`
+directory now has duplicate-number collisions on **ADR-053** (two files),
+**ADR-056** (two files), **ADR-057** (two files), **ADR-058** (two files),
+**ADR-062** (two files), and **ADR-064** (two files) — none are addressed in
+this PR. If you are reading this ADR as part of a #517 closure review, treat
+the cited filenames (e.g. `docs/adr/064-wake-timeline-canonical-vocabulary.md`)
+as the source of truth, not the bare ADR number.
 
 ## Context
 

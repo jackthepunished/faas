@@ -296,6 +296,25 @@ const (
 	// trusted-signer quota error as an env-var quota error.
 	CodePlanLimitTrustedSigners = "plan_limit_trusted_signers"
 
+	// IAM-5 API-key lifecycle (issue #189). Distinct from the
+	// secret/env surface because the lifecycle diverges: secrets
+	// and env vars are config rows, API keys are revocable
+	// credentials with a status state machine (active | grace |
+	// revoked) and a per-account grace override. Three codes:
+	//   * CodeAPIKeyExpired = 401, the bearer key has expired
+	//     (auth-time gate; the auth middleware emits key.expired).
+	//   * CodeAPIKeyRevoked = 401, the key is in status='revoked'
+	//     (manual delete, rotation atomic, or lazy-expiry).
+	//   * CodeAPIKeyLimitExceeded = 409, the per-account cap
+	//     (Plan.KeysMax, IAM-5) is reached. Mirrors ErrPlanLimitSecrets
+	//     shape but on 409 because the customer's history (one
+	//     revoking-key insistence) is idempotent — they can re-issue
+	//     after a delete and the operation completes, but adding a
+	//     fresh key while at the cap is a quota block.
+	CodeAPIKeyExpired       = "api_key_expired"
+	CodeAPIKeyRevoked       = "api_key_revoked"
+	CodeAPIKeyLimitExceeded = "api_key_limit_exceeded"
+
 	// Per-app private-registry Basic Auth (issue #461 / ADR-062).
 	// Distinct from CodeSecret* because the lifecycle and quota shape
 	// differ: a registry credential is keyed by (app, host) and the
@@ -696,6 +715,17 @@ func StatusForCode(code string) int {
 		return http.StatusBadRequest
 	case CodeEnvVarValueTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// IAM-5 (issue #189): api-key lifecycle. Both gate errors are
+	// 401 (the bearer key is invalid for the same reason any
+	// unauthenticated call is — the customer's credential is no
+	// longer usable). The quota error is 409 to mirror the alert-rule
+	// quota shape (issue #396) — the operation is well-formed but
+	// caps the platform; the SDK can branch on the code for
+	// actionable retry guidance.
+	case CodeAPIKeyExpired, CodeAPIKeyRevoked:
+		return http.StatusUnauthorized
+	case CodeAPIKeyLimitExceeded:
+		return http.StatusConflict
 	// Trusted cosign signers (issue #472 / ADR-054): mirror the env
 	// status shape. PUT body shape is 400, quota is 403, not-found is
 	// 404 (the URL resource IS the signer name; we deliberately
@@ -1172,6 +1202,47 @@ func ErrPlanLimitEnvVars(l Limits, observed int) *Problem {
 		fmt.Sprintf("%s plan allows %d env var(s) per app; you have %d.", l.Plan, l.EnvVarsMax, observed)).
 		WithLimit(int64(l.EnvVarsMax), int64(observed)).
 		WithDocs("https://docs.gregale.dev/env#limits")
+}
+
+// ErrAPIKeyExpired is returned by the auth middleware when the
+// bearer key's expires_at is in the past (issue #189 / IAM-5).
+// The store has lazily marked the key revoked before the middleware
+// sees the error; the middleware emits the key.expired audit event.
+// 401 mirrors the legacy "invalid token" surface — the customer's
+// SDK sees an auth failure and re-auths, the dashboard surfaces
+// "key expired, rotate it" copy.
+func ErrAPIKeyExpired() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeAPIKeyExpired,
+		"API key expired",
+		"the bearer key has expired; rotate it and use the new plaintext").
+		WithDocs("https://docs.gregale.dev/auth#expiry")
+}
+
+// ErrAPIKeyRevoked is returned by the auth middleware when the
+// bearer key's status is 'revoked' (issue #189 / IAM-5). The
+// revocation may have been manual (DELETE), atomic rotation
+// (grace_window_days=0), or lazy-expiry (the auth path observed
+// expires_at < now). 401 mirrors the legacy "invalid token" surface.
+func ErrAPIKeyRevoked() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeAPIKeyRevoked,
+		"API key revoked",
+		"the bearer key has been revoked; mint a new one via POST /v1/keys").
+		WithDocs("https://docs.gregale.dev/auth#revocation")
+}
+
+// ErrAPIKeyLimitExceeded is returned when a POST /v1/keys would
+// push the account over Plan.KeysMax (issue #189 / IAM-5). Rotated
+// keys (status='revoked') are excluded from the count so the
+// customer's history can grow without bound; revoking a key is the
+// path to free up a slot. 409 mirrors the alert-rule quota shape
+// (issue #396) — the operation is well-formed, the cap is the gate.
+func ErrAPIKeyLimitExceeded(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusConflict, CodeAPIKeyLimitExceeded,
+		"API key limit reached",
+		fmt.Sprintf("%s plan allows %d API key(s) per account; you have %d active or in grace. Revoke a key before minting a new one.",
+			l.Plan, l.KeysMax, observed)).
+		WithLimit(int64(l.KeysMax), int64(observed)).
+		WithDocs("https://docs.gregale.dev/auth#quotas")
 }
 
 // ErrPlanLimitTrustedSigners is returned when a trusted-signer PUT

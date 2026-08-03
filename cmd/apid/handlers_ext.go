@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1103,12 +1104,37 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"Invalid scopes", err.Error()))
 		return
 	}
+	// IAM-5 (issue #189): cap check before mint. CountAPIKeys
+	// excludes status='revoked' so the customer's history (revoked
+	// keys left in the table for audit lineage) doesn't pin them
+	// out of quota. rotateKey is quota-neutral and is always
+	// permitted at the cap (the old key retired just before the
+	// new one is minted — net 0).
+	limits := api.MustLimitsFor(acct.Plan)
+	if cur, cerr := s.store.CountAPIKeys(ctx(r), acct.ID); cerr == nil && cur >= limits.KeysMax {
+		api.WriteProblem(w, api.ErrAPIKeyLimitExceeded(limits, cur))
+		return
+	} else if cerr != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not count keys"))
+		return
+	}
 	plaintext, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not generate key"))
 		return
 	}
-	k, err := s.store.CreateAPIKey(ctx(r), acct.ID, hash, req.Label, scopes)
+	// IAM-5: expiry policy. Non-admin scopes get a 365-day
+	// expires_at (spec: "set-and-forget" CI rotation, plus a
+	// bounded exposure window for exfiltrated keys). Admin keys
+	// default to nil expiry (legacy admin semantics — never
+	// expire, must be explicitly revoked). The customer can
+	// rotate an admin key with grace=0 to opt into finite expiry.
+	var expiresAt *time.Time
+	if !slices.Contains(scopes, api.ScopeAdmin) {
+		t := time.Now().UTC().Add(time.Duration(api.DefaultAPIKeyLifetimeDays) * 24 * time.Hour)
+		expiresAt = &t
+	}
+	k, err := s.store.CreateAPIKeyWithExpiry(ctx(r), acct.ID, hash, req.Label, scopes, expiresAt)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
@@ -1118,18 +1144,27 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// IAM-4 (ADR-035): record the key mint. subject = account_id (the
 	// owner); data.scopes is the per-key permission set so the
 	// audit row can answer "who minted which scopes today?".
-	s.audit.Emit(ctx(r), "key.created", &acct.ID, map[string]any{
+	auditPayload := map[string]any{
 		"key_id": k.ID,
 		"scopes": scopes,
-	})
-	writeJSON(w, http.StatusCreated, api.APIKeyResponse{
+	}
+	if k.ExpiresAt != nil {
+		auditPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	s.audit.Emit(ctx(r), "key.created", &acct.ID, auditPayload)
+	resp := api.APIKeyResponse{
 		ID:        k.ID,
 		Prefix:    keyPrefix(plaintext),
 		Label:     k.Label,
 		Scopes:    k.Scopes,
 		CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
-		Plaintext: plaintext,
-	})
+		Status:    k.Status,
+	}
+	if k.ExpiresAt != nil {
+		resp.ExpiresAt = k.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	resp.Plaintext = plaintext
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Account) {
@@ -1146,9 +1181,19 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 			Label:     k.Label,
 			Scopes:    k.Scopes,
 			CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
+			Status:    k.Status,
 		}
 		if !k.LastUsedAt.IsZero() {
 			resp.LastUsedAt = k.LastUsedAt.UTC().Format(time.RFC3339)
+		}
+		if k.ExpiresAt != nil {
+			resp.ExpiresAt = k.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		if k.RevokedAt != nil {
+			resp.RevokedAt = k.RevokedAt.UTC().Format(time.RFC3339)
+		}
+		if k.RotatedFromID != nil {
+			resp.RotatedFromID = *k.RotatedFromID
 		}
 		out = append(out, resp)
 	}
@@ -1157,22 +1202,152 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 
 func (s *server) deleteKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	deleted, err := s.store.DeleteAPIKeyReturning(ctx(r), acct.ID, id)
+	// IAM-5 (issue #189): DELETE is now a soft revoke. The row
+	// stays in the table for audit lineage (rotated_from_id chain
+	// preserves the predecessor's id; revoced_at marks the kill).
+	// Repeated DELETE on a revoked key is idempotent — MarkAPIKeyRevoked
+	// is a "update if not revoked" and returns the row either way.
+	updated, err := s.store.MarkAPIKeyRevoked(ctx(r), acct.ID, id)
 	if err != nil {
-		s.notFound(w, "no such key")
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such key")
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not revoke key"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"deleted","account":"`+acct.ID+`"}`)
+	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"revoked","account":"`+acct.ID+`"}`)
 	// IAM-4 + IAM-1 (ADR-034 rev2 / ADR-035): record the key
 	// revocation carrying the dismissed scopes so an operator can
 	// answer "what did this key allow before it died?" without
-	// re-deriving it from logs. Single DELETE…RETURNING gives us
-	// the row shape without a pre-fetch race.
-	s.audit.Emit(ctx(r), "key.deleted", &acct.ID, map[string]any{
-		"key_id": deleted.ID,
-		"scopes": deleted.Scopes,
+	// re-deriving it from logs. The `reason` field is "manual"
+	// (this path) vs "rotation" (rotateKey) vs "expired" (lazy
+	// auth-time gate). Dashboard filters by reason.
+	s.audit.Emit(ctx(r), "key.revoked", &acct.ID, map[string]any{
+		"key_id": updated.ID,
+		"scopes": updated.Scopes,
+		"reason": "manual",
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// rotateKey mints a new key and demotes the old key in a single
+// transaction (issue #189 / IAM-5). The new key inherits the
+// old key's label + scopes so the rotation is a no-op for the
+// customer's CI scripts. The old key's expires_at is overwritten
+// to the grace deadline (now() + graceWindow), so a customer
+// who wants to schedule the kill has a hard deadline instead of
+// an open-ended "until someone deletes the row".
+//
+// Quota: rotation is quota-neutral (-1 +1 = 0 net). The cap
+// check happens BEFORE the rotation so a customer ALREADY at the
+// cap can still rotate (the old key retires just before the new
+// one is minted). The CreateAPIKey cap check (Plan.KeysMax) does
+// not run on the rotation path.
+//
+// Audit: key.rotated carries the linkage
+// ({old_key_id, new_key_id, grace_window_days, old_key_expires_at}).
+// When the rotation is non-atomic (graceWindow > 0), we do NOT
+// also emit key.revoked — the old key is in 'grace', not
+// 'revoked', and the audit row would mislead. When the rotation
+// is atomic (graceWindow == 0), the underlying UPDATE flips
+// status='revoked' directly; the key.rotated event is the
+// only audit row the customer sees, and it carries the
+// equivalent information.
+//
+// Response: {key, key_plaintext, old_key_id, old_key_expires_at}.
+// The old plaintext is never returned — we only store the hash.
+func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+
+	// Resolve grace window. Per-account override wins; nil = use
+	// the plan default (api.DefaultAPIKeyGraceWindowDays = 7). The
+	// cache keeps the per-rotation handler off a hot PG path;
+	// admin updates invalidate the cache and propagate on the
+	// next rotation.
+	var graceWindow time.Duration
+	gw, err := s.resolveGraceWindow(ctx(r), acct.ID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not resolve grace window"))
+		return
+	}
+	if gw == nil {
+		graceWindow = time.Duration(api.DefaultAPIKeyGraceWindowDays) * 24 * time.Hour
+	} else {
+		graceWindow = time.Duration(*gw) * 24 * time.Hour
+	}
+
+	// Mint the new plaintext + hash BEFORE the rotation so the
+	// store op can persist the real hash. The handler is the only
+	// site that ever sees the plaintext in memory.
+	plaintext, hash, err := api.GenerateAPIKey()
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not generate key"))
+		return
+	}
+
+	// Inherit the old label so the customer's CI config doesn't
+	// need to chase a label change. The store layer reads the
+	// old row's label in the transaction; the empty string tells
+	// the store to use the old row's value as-is.
+	newKey, oldKey, err := s.store.RotateAPIKey(ctx(r), acct.ID, id, hash, "", graceWindow)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such key")
+			return
+		}
+		if errors.Is(err, state.ErrAPIKeyRevoked) {
+			s.notFound(w, "key already revoked")
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not rotate key"))
+		return
+	}
+
+	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"rotated","account":"`+acct.ID+`"}`)
+	var graceWindowDays int
+	if graceWindow > 0 {
+		graceWindowDays = int(graceWindow / (24 * time.Hour))
+	}
+	auditPayload := map[string]any{
+		"old_key_id":         oldKey.ID,
+		"new_key_id":         newKey.ID,
+		"grace_window_days":  graceWindowDays,
+		"old_key_expires_at": oldKey.ExpiresAt.UTC().Format(time.RFC3339),
+	}
+	s.audit.Emit(ctx(r), "key.rotated", &acct.ID, auditPayload)
+	s.log.Info("key rotated",
+		"old_key", oldKey.ID, "new_key", newKey.ID,
+		"account", acct.ID, "grace_window_days", graceWindowDays)
+
+	resp := api.RotateKeyResponse{
+		Key: api.APIKeyResponse{
+			ID:            newKey.ID,
+			Prefix:        keyPrefix(plaintext),
+			Label:         newKey.Label,
+			Scopes:        newKey.Scopes,
+			CreatedAt:     newKey.CreatedAt.UTC().Format(time.RFC3339),
+			Status:        newKey.Status,
+			RotatedFromID: oldKey.ID,
+		},
+		KeyPlaintext: plaintext,
+		OldKeyID:     oldKey.ID,
+	}
+	if oldKey.ExpiresAt != nil {
+		resp.OldKeyExpiresAt = oldKey.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// resolveGraceWindow reads the per-account grace override via the
+// in-process cache, falling back to the store on a miss. The
+// handler is the only caller; nil-safe when the cache is nil
+// (legacy tests that pre-date the cache field).
+func (s *server) resolveGraceWindow(ctx context.Context, accountID string) (*int, error) {
+	if s.graceWindowCache == nil {
+		return s.store.GetAccountKeyGraceWindow(ctx, accountID)
+	}
+	return s.graceWindowCache.resolveGraceWindow(ctx, s.store, accountID)
 }
 
 // --- usage -----------------------------------------------------------------

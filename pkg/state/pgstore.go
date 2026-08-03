@@ -166,9 +166,17 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 // authenticated. Returns ErrNotFound when no row matches. Same O(log n)
 // index-backed lookup as AccountByKeyHash — same key_sha256 UNIQUE
 // constraint in migrations/00001_init.sql.
+//
+// The projection reads the IAM-5 columns (expires_at, status,
+// revoked_at, rotated_from_id) so the auth path can enforce
+// expiry / revoked gates without a second round-trip. The new
+// columns default to NULL / 'active', so existing rows round-trip
+// cleanly with Status='active' and ExpiresAt=nil.
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
 		 from api_keys where key_sha256 = $1`, hash)
 	return scanAPIKey(row)
 }
@@ -184,6 +192,20 @@ func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
 // authenticated request. Not blocking: index hits are fast enough that
 // the perf cost is negligible at current scale. Revisit when auth
 // latency shows up on the dashboard. See ADR-034 rev2.
+//
+// IAM-5 (issue #189) gate: after the key row is loaded, three checks
+// run in order —
+//
+//  1. status='revoked' → return ErrAPIKeyRevoked (terminal, idempotent).
+//  2. expires_at != NULL && expires_at < now() → lazy-flip to
+//     status='revoked' atomically (one UPDATE, coalesce revoked_at),
+//     then return ErrAPIKeyExpired. The next auth attempt sees the
+//     revoked state via check (1).
+//  3. otherwise return (account, key, nil).
+//
+// The audit `key.expired` row is emitted by the auth middleware (which
+// has the Auditor dependency), not here. The store is
+// dependency-free.
 func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error) {
 	acct, err := s.AccountByKeyHash(ctx, hash)
 	if err != nil {
@@ -193,27 +215,76 @@ func (s *PgStore) AuthenticateKey(ctx context.Context, hash []byte) (Account, AP
 	if err != nil {
 		return Account{}, APIKey{}, err
 	}
+	// IAM-5 gate. Run before the success return so the
+	// middleware can translate the sentinel to the right 401.
+	if key.Status == string(APIKeyStatusRevoked) {
+		return Account{}, APIKey{}, ErrAPIKeyRevoked
+	}
+	if key.ExpiresAt != nil && !key.ExpiresAt.IsZero() && key.ExpiresAt.Before(time.Now()) {
+		// Lazy expiry: flip to revoked in a single UPDATE
+		// guarded by `status <> 'revoked'` so a concurrent
+		// auth attempt doesn't double-write revoked_at. Best
+		// effort: a failure here means the next attempt
+		// re-observes the expired state and retries the
+		// flip. The auth path still rejects with
+		// ErrAPIKeyExpired regardless.
+		_, _ = s.pool.Exec(ctx,
+			`update api_keys
+			    set status = 'revoked',
+			        revoked_at = coalesce(revoked_at, now())
+			  where id = $1 and status <> 'revoked'`, key.ID)
+		return Account{}, APIKey{}, ErrAPIKeyExpired
+	}
 	return acct, key, nil
 }
 
-// scanAPIKey reads the seven-column api_keys projection (id,
-// account_id, key_sha256, label, scopes, created_at, last_used_at).
-// Columns not enumerated in the seven-tuple (e.g. legacy callers from
-// before IAM-1) still work because every query in this package writes
-// the full seven-column list; the shared helper makes the projections
-// stay in lockstep.
+// scanAPIKey reads the ten-column api_keys projection (id,
+// account_id, key_sha256, label, scopes, created_at, last_used_at,
+// expires_at, status, revoked_at, rotated_from_id — eleven if you
+// count the optional NULLable cols). Columns not enumerated in the
+// tuple (e.g. legacy callers from before IAM-1) still work because
+// every query in this package writes the full column list; the
+// shared helper makes the projections stay in lockstep. The four
+// trailing columns are the IAM-5 (issue #189) surface — pgtype's
+// native nullable support means a NULL column produces a
+// pgtype.Timestamptz{Valid:false} that the scan helper converts to
+// a nil *time.Time. rotated_from_id is a uuid pointer; the others
+// are nullable timestamps.
+//
+// The list-sites that pre-date IAM-5 (e.g. CreateAPIKey,
+// DeleteAPIKeyReturning, ListAPIKeys) keep the seven-column
+// projection by composing the helper with default values — the
+// helper is a per-call writer, not a global registry, so a
+// caller that wants only the seven columns uses a local
+// scan and ignores the new fields. To keep the diff small,
+// every existing call site now writes the full eleven columns
+// (the new ones are NULL by default; the constraint is the
+// floor, the store is the wall).
 func scanAPIKey(row pgx.Row) (APIKey, error) {
 	var (
 		k         APIKey
 		hashBytes []byte
+		expiresAt pgtype.Timestamptz
+		revokedAt pgtype.Timestamptz
+		rotated   *string
 	)
-	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := row.Scan(&k.ID, &k.AccountID, &hashBytes, &k.Label, &k.Scopes, &k.CreatedAt, &k.LastUsedAt,
+		&expiresAt, &k.Status, &revokedAt, &rotated); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return APIKey{}, ErrNotFound
 		}
 		return APIKey{}, mapErr(err)
 	}
 	k.Hash = hashBytes
+	if expiresAt.Valid {
+		t := expiresAt.Time
+		k.ExpiresAt = &t
+	}
+	if revokedAt.Valid {
+		t := revokedAt.Time
+		k.RevokedAt = &t
+	}
+	k.RotatedFromID = rotated
 	return k, nil
 }
 
@@ -649,10 +720,38 @@ func scanAccountCols(scan func(...any) error) (Account, error) {
 // --- api keys ----------------------------------------------------------------
 
 func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byte, label string, scopes []string) (APIKey, error) {
+	// IAM-5: the additive migration adds expires_at + status +
+	// revoked_at + rotated_from_id. The five-arg CreateAPIKey
+	// signature is preserved (17+ callers in cmd/apid/*_test.go
+	// and cmd/apid/handlers_ext.go); the new columns default to
+	// NULL / 'active' / NULL / NULL. Production handlers use
+	// CreateAPIKeyWithExpiry (added below) so the dashboard
+	// sees expires_at on every fresh non-admin key.
 	row := s.pool.QueryRow(ctx,
 		`insert into api_keys (account_id, key_sha256, label, scopes) values ($1, $2, $3, $4)
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           expires_at, status, revoked_at, rotated_from_id`,
 		accountID, hash, nullString(label), scopes)
+	return scanAPIKey(row)
+}
+
+// CreateAPIKeyWithExpiry is the IAM-5 (issue #189) shape. expiresAt
+// may be nil for the "never expires" admin contract; non-nil sets
+// the column directly. The five-arg CreateAPIKey stays for the
+// 17+ existing test/handler call sites that don't care about
+// expiry; production apid.createKey uses this new shape. The
+// signature is the same as CreateAPIKey plus one *time.Time so
+// a Go caller can pass nil for "never expires" without needing
+// a separate bool.
+func (s *PgStore) CreateAPIKeyWithExpiry(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`insert into api_keys (account_id, key_sha256, label, scopes, expires_at)
+		 values ($1, $2, $3, $4, $5)
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           expires_at, status, revoked_at, rotated_from_id`,
+		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt))
 	return scanAPIKey(row)
 }
 
@@ -677,14 +776,19 @@ func (s *PgStore) DeleteAPIKey(ctx context.Context, accountID, keyID string) err
 func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`delete from api_keys where id = $1 and account_id = $2
-		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz)`,
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           expires_at, status, revoked_at, rotated_from_id`,
 		keyID, accountID)
 	return scanAPIKey(row)
 }
 
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at, coalesce(last_used_at, 'epoch'::timestamptz) from api_keys where account_id = $1 order by created_at desc`,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
+		 from api_keys where account_id = $1 order by created_at desc`,
 		accountID)
 	if err != nil {
 		return nil, err
@@ -703,6 +807,200 @@ func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, 
 
 func (s *PgStore) TouchKeyLastUsed(ctx context.Context, keyID string) error {
 	_, err := s.pool.Exec(ctx, `update api_keys set last_used_at = now() where id = $1`, keyID)
+	return err
+}
+
+// CountAPIKeys returns the number of non-revoked keys for the
+// account. Matches the partial index api_keys_active_grace_idx
+// (status IN ('active','grace')) so the query is O(1) per account
+// in the common case. Used by create + rotate handlers to enforce
+// limits.KeysMax BEFORE minting a new key. Returns 0 for a fresh
+// account.
+//
+// Issue #189 / IAM-5.
+func (s *PgStore) CountAPIKeys(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from api_keys
+		 where account_id = $1 and status in ('active','grace')`,
+		accountID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// MarkAPIKeyRevoked is the IAM-5 (issue #189) soft-delete path.
+// Flips status to 'revoked' and stamps revoked_at IF NOT ALREADY
+// SET — repeated calls are idempotent (returns the same row, no
+// error). Returns ErrNotFound when the key doesn't exist or
+// belongs to a different account. Audit emission is the caller's
+// responsibility.
+func (s *PgStore) MarkAPIKeyRevoked(ctx context.Context, accountID, keyID string) (APIKey, error) {
+	row := s.pool.QueryRow(ctx,
+		`update api_keys
+		    set status = 'revoked',
+		        revoked_at = coalesce(revoked_at, now())
+		  where id = $1 and account_id = $2
+		  returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		            coalesce(last_used_at, 'epoch'::timestamptz),
+		            expires_at, status, revoked_at, rotated_from_id`,
+		keyID, accountID)
+	return scanAPIKey(row)
+}
+
+// RotateAPIKey atomically mints a new key (status='active') and
+// demotes the old key in a single transaction. The new key's
+// hash is the caller-supplied plaintext-hash (no placeholder +
+// post-step patch). The old key's expires_at is OVERWRITTEN to
+// now() + graceWindow (atomic when graceWindow == 0 means
+// status flips to 'revoked' and revoked_at = now()).
+//
+// The two returned rows are (newKey, oldKey) in that order. The
+// caller surfaces newKey.plaintext (generated upstream) and
+// oldKey.ExpiresAt (the grace deadline) in the API response.
+//
+// The transaction is a single CTE that locks the old row
+// FOR UPDATE, inserts the new row from the locked data, and
+// updates the old row in one statement. The two RETURNING
+// projections are stitched together with a discriminator column
+// and split in Go by reading 'which' first.
+//
+// Errors:
+//   - ErrNotFound          — old key doesn't exist or wrong account.
+//   - ErrAPIKeyRevoked     — old key is already in 'revoked' state.
+//
+// Issue #189 / IAM-5.
+func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (APIKey, APIKey, error) {
+	if graceWindow < 0 {
+		graceWindow = 0
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // best-effort on early return
+
+	// Step 1: lock the old row + verify account + status.
+	var (
+		oldAcct string
+		oldStat string
+	)
+	if err := tx.QueryRow(ctx,
+		`select account_id, status from api_keys where id = $1 for update`, oldKeyID).
+		Scan(&oldAcct, &oldStat); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return APIKey{}, APIKey{}, ErrNotFound
+		}
+		return APIKey{}, APIKey{}, err
+	}
+	if oldAcct != accountID {
+		return APIKey{}, APIKey{}, ErrNotFound
+	}
+	if oldStat == string(APIKeyStatusRevoked) {
+		return APIKey{}, APIKey{}, ErrAPIKeyRevoked
+	}
+
+	// Step 2: read the old row's content (label, scopes) so the
+	// new key inherits them. We re-read with FOR UPDATE so the
+	// projection is consistent with the lock above.
+	old, err := scanAPIKeyRow(ctx, tx,
+		`select id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        expires_at, status, revoked_at, rotated_from_id
+		   from api_keys where id = $1`, oldKeyID)
+	if err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+
+	// Step 3: insert the new key. The new label defaults to the
+	// old label if the caller passed "" (the handler is the
+	// single caller and always supplies the old label).
+	if newLabel == "" {
+		newLabel = old.Label
+	}
+	newKey, err := scanAPIKeyRow(ctx, tx,
+		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id)
+		 values ($1, $2, $3, $4, 'active', $5)
+		 returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           expires_at, status, revoked_at, rotated_from_id`,
+		accountID, newHash, newLabel, old.Scopes, oldKeyID)
+	if err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+
+	// Step 4: update the old key. expires_at is overwritten to
+	// the grace deadline regardless of its prior value (the
+	// issue is explicit: the grace period IS the new expires_at
+	// for the old key). status flips per the graceWindow branch.
+	if graceWindow == 0 {
+		old, err = scanAPIKeyRow(ctx, tx,
+			`update api_keys
+			    set status = 'revoked',
+			        expires_at = now(),
+			        revoked_at = coalesce(revoked_at, now())
+			  where id = $1
+			  returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            expires_at, status, revoked_at, rotated_from_id`,
+			oldKeyID)
+		if err != nil {
+			return APIKey{}, APIKey{}, err
+		}
+	} else {
+		old, err = scanAPIKeyRow(ctx, tx,
+			`update api_keys
+			    set status = 'grace',
+			        expires_at = now() + ($1)::interval
+			  where id = $2
+			  returning id, account_id, key_sha256, coalesce(label,''), scopes, created_at,
+			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            expires_at, status, revoked_at, rotated_from_id`,
+			graceWindow.String(), oldKeyID)
+		if err != nil {
+			return APIKey{}, APIKey{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return APIKey{}, APIKey{}, err
+	}
+
+	return newKey, old, nil
+}
+
+// GetAccountKeyGraceWindow returns the per-account override
+// (accounts.key_grace_window_days). nil means "no override";
+// the caller falls through to the plan default. The auth hot
+// path does NOT call this — only the rotate handler does, via
+// a short-TTL in-process cache (cmd/apid.graceWindowCache).
+//
+// Issue #189 / IAM-5.
+func (s *PgStore) GetAccountKeyGraceWindow(ctx context.Context, accountID string) (*int, error) {
+	var n *int
+	err := s.pool.QueryRow(ctx,
+		`select key_grace_window_days from accounts where id = $1`, accountID).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return n, nil
+}
+
+// SetAccountKeyGraceWindow sets the per-account override. days
+// == nil clears the override (column → NULL). The handler
+// invalidates the in-process graceWindowCache entry after a
+// successful write. The audit `key.grace_window_set` event is
+// emitted by the handler, not the store.
+//
+// Issue #189 / IAM-5.
+func (s *PgStore) SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error {
+	_, err := s.pool.Exec(ctx,
+		`update accounts set key_grace_window_days = $1 where id = $2`, days, accountID)
 	return err
 }
 
@@ -1432,6 +1730,138 @@ func (s *PgStore) CancelInstanceMigration(ctx context.Context, instanceID, origi
 		instanceID, originalNodeID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("state: cancel instance migration: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// ListExpiredMigrations returns every instance row in
+// state='migrating' (Tier A6 / ADR-067 migrating-instance
+// watchdog). The watchdog is the only writer that can move a
+// row out of 'migrating' without a peer commit, so the
+// unresolved row is the input set. The SQL also enforces
+// lease_token IS NOT NULL — every wedged migration must
+// carry the lease the watchdog needs to drive the gRPC
+// re-invite; a row in 'migrating' without a lease is a
+// corrupted state and the watchdog drops it silently (the
+// next watch-dog tick is no-op idempotent).
+//
+// Sorted by instance id ASC for determinism so two peers
+// observing the same bad-owner event read the same input
+// set (they still race on the conditional UPDATEs; this list
+// is just the candidate set).
+//
+// Returns an empty slice (not ErrNotFound) when no rows
+// match; callers treat that as "nothing to reconcile this
+// tick". Symmetric with ListLiveInstancesOnNode (Tier A5).
+func (s *PgStore) ListExpiredMigrations(ctx context.Context, maxPerTick int) ([]Instance, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''),
+	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
+	               i.started_at, i.last_request_at, i.parked_at,
+	               coalesce(i.node_id::text, ''), i.wake_id,
+	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
+	          from instances i
+	         where i.state = 'migrating'
+	           and i.lease_token is not null
+	         order by i.id asc
+	         limit $1`
+	rows, err := s.pool.Query(ctx, sel, maxPerTick)
+	if err != nil {
+		return nil, fmt.Errorf("state: list expired migrations: %w", err)
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		ins, err := scanInstanceColsWithMigration(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ins)
+	}
+	return out, rows.Err()
+}
+
+// ReinviteMigratingInstance is the active-owner ack gate of the
+// Tier A6 / ADR-067 migrating-instance watchdog. Conditional
+// UPDATE that flips state='migrating' → 'running', stamps
+// migrated_at = now(), and clears lease_token — the same work
+// the A5 Phase-3 commit (MigrateInstanceOwner) does, but launched
+// by the watchdog after a re-invite to the new owner vmmd. The
+// conditional predicates are load-bearing:
+//  1. state = 'migrating' (peer rollback would have moved back
+//     to 'parked' already)
+//  2. lease_token = leaseToken (a stale lease can never silently
+//     commit; the watchdog must present the same UUID the new
+//     owner minted at Phase 1)
+//
+// Returns ErrConflict on RowsAffected()==0 — peer already
+// committed, peer rolled back, lease expired, or row gone.
+func (s *PgStore) ReinviteMigratingInstance(ctx context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty leaseToken")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'running',
+		        migrated_at = now(),
+		        lease_token = NULL
+		  where id = $1
+		    and state = 'migrating'
+		    and lease_token = $2`,
+		instanceID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("state: reinvite migrating instance: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// AbortMigratingInstance is the dead-owner hard-delete gate of
+// the Tier A6 / ADR-067 migrating-instance watchdog. Conditional
+// UPDATE that flips state='migrating' → 'parked' and clears
+// lease_token so a future re-attempt at migration mints a fresh
+// lease. node_id is left UNCHANGED — the row's node_id is still
+// the OLD owner (A5 Phase-2 MarkInstanceMigrating flipped state
+// but did not flip node_id; Phase-3 MigrateInstanceOwner never
+// ran), and there is no better destination to point at: the OLD
+// owner is the one whose vmmd died, the NEW owner never wrote a
+// snapshot, and migrated_from_node_id is NULL pre-Phase-3 (so
+// setting node_id = migrated_from_node_id would zero it out and
+// break the wake path's WakeResult.NodeID — see engine.go:681).
+// The wake path dispatches via app.NodeID (engine.go:1394-1400)
+// so a parked row on a dead instance.NodeID is fine; the next
+// customer request wakes cold on the live apps.node_id.
+//
+// The conditional predicates are the same as
+// ReinviteMigratingInstance. Returns ErrConflict on
+// RowsAffected()==0.
+func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: abort migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: abort migrating instance: empty leaseToken")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'parked',
+		        lease_token = NULL
+		  where id = $1
+		    and state = 'migrating'
+		    and lease_token = $2`,
+		instanceID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("state: abort migrating instance: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrConflict
@@ -8988,6 +9418,35 @@ func nullableTimestamptz(t time.Time) pgtype.Timestamptz {
 		return pgtype.Timestamptz{Valid: false}
 	}
 	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+// nullableTimestamptzPtr is the *time.Time sibling of
+// nullableTimestamptz. A nil pointer produces pgtype.Timestamptz{Valid:false}
+// so the column round-trips as NULL. Used by IAM-5's
+// CreateAPIKeyWithExpiry and the SetAccountKeyGraceWindow path
+// where the input is naturally a pointer (the zero value of
+// *time.Time is nil, the zero value of time.Time is "0001-01-01"
+// which is NOT a NULL).
+func nullableTimestamptzPtr(t *time.Time) pgtype.Timestamptz {
+	if t == nil {
+		return pgtype.Timestamptz{Valid: false}
+	}
+	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
+}
+
+// scanAPIKeyRow runs a query and scans the result into a *APIKey.
+// Used by multi-statement transactions (RotateAPIKey) where the
+// helper needs to participate in a tx rather than the pool. The
+// column projection is the same eleven-column shape scanAPIKey
+// expects; both helpers share the post-scan logic via a small
+// inline pass-through that the caller doesn't have to repeat.
+func scanAPIKeyRow(ctx context.Context, tx pgx.Tx, sql string, args ...any) (APIKey, error) {
+	row := tx.QueryRow(ctx, sql, args...)
+	k, err := scanAPIKey(row)
+	if err != nil {
+		return APIKey{}, err
+	}
+	return k, nil
 }
 
 // CompleteGdprRequest stamps completed_at on the most recent

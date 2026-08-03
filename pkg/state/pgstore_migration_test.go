@@ -22,6 +22,8 @@ package state_test
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -353,5 +355,275 @@ func TestPgStore_CancelInstanceMigration(t *testing.T) {
 		if err := s.CancelInstanceMigration(ctx, tt.instanceID, tt.node, tt.lease); err == nil {
 			t.Errorf("CancelInstanceMigration(%s): nil error; want rejection", tt.name)
 		}
+	}
+}
+
+// Tier A6 / ADR-067 migrating-instance watchdog parity tests.
+// Covers ListExpiredMigrations, ReinviteMigratingInstance, and
+// AbortMigratingInstance — the three new store methods the
+// watchdog's conditional UPDATEs depend on. Each test drives
+// the happy path and at least one ErrConflict branch for the
+// state-coverage gate (≥ 70% per Makefile test-state-coverage).
+//
+// The rows are seeded via the same fixture as the A5 tests
+// (MarkInstanceMigrating transitions an instance to
+// state='migrating' under a lease token; the A6 methods act on
+// the resulting row).
+
+func TestPgStore_ListExpiredMigrations(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	peer, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "reconcile-peer", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+	_, insID1 := seedRunningInstance(t, s, ctx, peer.ID)
+	_, insID2 := seedRunningInstance(t, s, ctx, peer.ID)
+	if err := s.MarkInstanceMigrating(ctx, insID1, peer.ID, "lease-recon-1"); err != nil {
+		t.Fatalf("MarkInstanceMigrating 1: %v", err)
+	}
+	if err := s.MarkInstanceMigrating(ctx, insID2, peer.ID, "lease-recon-2"); err != nil {
+		t.Fatalf("MarkInstanceMigrating 2: %v", err)
+	}
+	rows, err := s.ListExpiredMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows want 2", len(rows))
+	}
+	// Both seeded rows must be present. ID ASC ordering is a
+	// soft contract (the SQL has order by i.id asc) but the
+	// seedRunningInstance helper uses gen_random_uuid(), which
+	// returns v4 UUIDs in non-monotonic order — so a strict
+	// "insID1 first" assertion flakes under parallel CI runs.
+	// Assert membership; the deterministic ORDER BY itself is
+	// pinned by the engine-side tests in pkg/sched.
+	gotIDs := map[string]bool{rows[0].ID: true, rows[1].ID: true}
+	if !gotIDs[insID1] || !gotIDs[insID2] {
+		t.Errorf("rows mismatch: got %s,%s want both %s and %s present",
+			rows[0].ID, rows[1].ID, insID1, insID2)
+	}
+	// Cap respected.
+	rows, err = s.ListExpiredMigrations(ctx, 1)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations cap=1: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows want 1 (cap)", len(rows))
+	}
+	// Empty input is no-op (returns nil, not ErrNotFound).
+	rows, err = s.ListExpiredMigrations(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations cap=0: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("got %d rows want 0 (cap=0)", len(rows))
+	}
+}
+
+func TestPgStore_ReinviteMigratingInstance(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	peer, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "reinvite-peer", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+	_, insID := seedRunningInstance(t, s, ctx, peer.ID)
+	if err := s.MarkInstanceMigrating(ctx, insID, peer.ID, "lease-reinvite"); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+
+	// Happy: state='migrating' + lease match → flipped to running,
+	// lease cleared, migrated_at stamped.
+	if err := s.ReinviteMigratingInstance(ctx, insID, "lease-reinvite"); err != nil {
+		t.Fatalf("ReinviteMigratingInstance happy: %v", err)
+	}
+	// Verify the row is no longer in the watchdog's input set.
+	rows, err := s.ListExpiredMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == insID {
+			t.Errorf("row still in 'migrating' after a successful reinvite")
+		}
+	}
+
+	// Wrong lease → ErrConflict (cannot double-commit).
+	if err := s.ReinviteMigratingInstance(ctx, insID, "wrong-lease"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Reinvite wrong-lease: %v; want ErrConflict", err)
+	}
+	// Missing row → ErrConflict.
+	if err := s.ReinviteMigratingInstance(ctx, "00000000-0000-0000-0000-000000000099", "any"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Reinvite missing: %v; want ErrConflict", err)
+	}
+	// Empty args rejected.
+	for _, tt := range []struct {
+		name, id, lease string
+	}{
+		{"empty id", "", "lease"},
+		{"empty lease", insID, ""},
+	} {
+		if err := s.ReinviteMigratingInstance(ctx, tt.id, tt.lease); err == nil {
+			t.Errorf("Reinvite(%s): nil error; want rejection", tt.name)
+		}
+	}
+}
+
+func TestPgStore_AbortMigratingInstance(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	peer, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "abort-peer", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+	_, insID := seedRunningInstance(t, s, ctx, peer.ID)
+	if err := s.MarkInstanceMigrating(ctx, insID, peer.ID, "lease-abort"); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+
+	// Happy: state='migrating' + lease match → flipped to parked,
+	// lease cleared.
+	if err := s.AbortMigratingInstance(ctx, insID, "lease-abort"); err != nil {
+		t.Fatalf("AbortMigratingInstance happy: %v", err)
+	}
+	// Verify the row is no longer in the watchdog's input set.
+	rows, err := s.ListExpiredMigrations(ctx, 100)
+	if err != nil {
+		t.Fatalf("ListExpiredMigrations: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == insID {
+			t.Errorf("row still in 'migrating' after a successful abort")
+		}
+	}
+
+	// Wrong lease → ErrConflict.
+	if err := s.AbortMigratingInstance(ctx, insID, "wrong-lease"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Abort wrong-lease: %v; want ErrConflict", err)
+	}
+	// Missing row → ErrConflict.
+	if err := s.AbortMigratingInstance(ctx, "00000000-0000-0000-0000-000000000099", "any"); !errors.Is(err, state.ErrConflict) {
+		t.Errorf("Abort missing: %v; want ErrConflict", err)
+	}
+	// Empty args rejected.
+	for _, tt := range []struct {
+		name, id, lease string
+	}{
+		{"empty id", "", "lease"},
+		{"empty lease", insID, ""},
+	} {
+		if err := s.AbortMigratingInstance(ctx, tt.id, tt.lease); err == nil {
+			t.Errorf("Abort(%s): nil error; want rejection", tt.name)
+		}
+	}
+}
+
+// TestPgStore_A5VsA6_Race pins the cross-method race-safety
+// contract between the A5 peer-commit path (MigrateInstanceOwner)
+// and the A6 watchdog reinvite path (ReinviteMigratingInstance).
+// Both run conditionally on (state='migrating', lease_token=$1)
+// so exactly one must win; the loser must return ErrConflict.
+//
+// Why this matters: the A5 phase-3 commit and the A6 watchdog
+// can fire on the same row concurrently when the dying owner
+// recovers mid-reconcile (e.g. vmmd restart during a peer
+// restart). If the predicates are not load-bearing, both can
+// commit and the row ends up in a torn state — node_id flipping
+// twice, state_machine corrupt. This test pins the
+// exactly-one-wins contract.
+func TestPgStore_A5VsA6_Race(t *testing.T) {
+	s, _, ctx := pgStoreWithPool(t)
+	oldOwner, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "race-old", TargetURL: "tcp://10.0.0.2:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed old owner: %v", err)
+	}
+	newOwner, err := s.CreateComputeNode(ctx, state.ComputeNode{
+		Name: "race-new", TargetURL: "tcp://10.0.0.3:7000",
+		VPCPUs: 80, MemMB: 28000, MaxConcurrency: 100, AdmissionCeilingMB: 23800,
+		VCPUBudget: api.VCPUSlots, Active: true,
+	})
+	if err != nil {
+		t.Fatalf("seed new owner: %v", err)
+	}
+	_, insID := seedRunningInstance(t, s, ctx, oldOwner.ID)
+	const lease = "race-lease"
+	if err := s.MarkInstanceMigrating(ctx, insID, oldOwner.ID, lease); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+
+	// Fire A5 peer-commit and A6 watchdog reinvite concurrently.
+	// Both are conditional on state='migrating' + lease_token=$1
+	// so exactly one must win.
+	var (
+		wg       sync.WaitGroup
+		a5Err    error
+		a6Err    error
+		startGun sync.WaitGroup
+	)
+	startGun.Add(1)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		startGun.Wait()
+		a5Err = s.MigrateInstanceOwner(ctx, insID, oldOwner.ID, newOwner.ID, lease)
+	}()
+	go func() {
+		defer wg.Done()
+		startGun.Wait()
+		a6Err = s.ReinviteMigratingInstance(ctx, insID, lease)
+	}()
+	startGun.Done()
+	wg.Wait()
+
+	// Count winners. Exactly one must succeed; the loser must
+	// surface ErrConflict (predicate miss on state or lease).
+	var wins int32
+	if a5Err == nil {
+		atomic.AddInt32(&wins, 1)
+	}
+	if a6Err == nil {
+		atomic.AddInt32(&wins, 1)
+	}
+	if wins != 1 {
+		t.Fatalf("exactly-one-wins violated: a5=%v a6=%v (wins=%d)", a5Err, a6Err, wins)
+	}
+	// Loser must be ErrConflict (NOT ErrNotFound; the row is still
+	// there, just in a different state).
+	if a5Err != nil && !errors.Is(a5Err, state.ErrConflict) {
+		t.Errorf("a5 loser err=%v; want ErrConflict", a5Err)
+	}
+	if a6Err != nil && !errors.Is(a6Err, state.ErrConflict) {
+		t.Errorf("a6 loser err=%v; want ErrConflict", a6Err)
+	}
+
+	// After the race, the row must be in a coherent terminal state:
+	// either 'running' (A5 won — node_id=newOwner) or 'running'
+	// (A6 won — node_id=oldOwner, lease cleared). Either is valid;
+	// the row MUST NOT still be in 'migrating' (that would mean
+	// both methods failed, which is the row-corrupting case).
+	final, err := s.InstanceByID(ctx, insID)
+	if err != nil {
+		t.Fatalf("InstanceByID post-race: %v", err)
+	}
+	if final.State != "running" {
+		t.Fatalf("post-race state=%q; want 'running' (row still 'migrating' would mean both methods failed)", final.State)
+	}
+	if final.LeaseToken != "" {
+		t.Errorf("post-race lease_token=%q; want empty (both methods clear the lease on success)", final.LeaseToken)
 	}
 }

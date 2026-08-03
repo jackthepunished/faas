@@ -201,6 +201,26 @@ type Engine struct {
 	// outcome="lease_expired" rather than a hung goroutine.
 	migrateLiveLeaseSeconds int
 
+	// migratingWatchdogTickLimit (Tier A6 / ADR-067) caps the
+	// per-tick migration-reconcile batch so a flood of stuck
+	// state='migrating' rows from a single dead-owner event
+	// does not monopolise the schedd's reconciliation loop.
+	// Defaults to api.MigratingWatchdogTickLimit = 50; overridable
+	// via FAAS_MIGRATING_WATCHDOG_TICK_LIMIT -> WithMigratingWatchdogTickLimit.
+	// The cap is bounded so a runaway flip-loop never spikes
+	// the loop into a 100% CPU loop on its own.
+	migratingWatchdogTickLimit int
+	// migratingWatchdogIntervalSeconds (Tier A6 / ADR-067) is
+	// the per-tick cadence on which the migration-reconcile loop
+	// runs. Default api.MigratingWatchdogIntervalSeconds = 1s,
+	// overridable via FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS ->
+	// WithMigratingWatchdogIntervalSeconds. Each tick reconciles
+	// up to migratingWatchdogTickLimit rows; an owner that died
+	// mid-handoff surfaces as state='migrating' rows here that
+	// are then either re-invited (active owner) or hard-deleted
+	// (dead owner) within the next tick.
+	migratingWatchdogIntervalSeconds int
+
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
 
@@ -461,6 +481,31 @@ func (e *Engine) WithMigrateLiveLeaseSeconds(seconds int) *Engine {
 		panic(fmt.Sprintf("sched: WithMigrateLiveLeaseSeconds: seconds must be > 0, got %d", seconds))
 	}
 	e.migrateLiveLeaseSeconds = seconds
+	return e
+}
+
+// WithMigratingWatchdogTickLimit (Tier A6 / ADR-067) sets the
+// per-tick cap on the migration-reconcile loop. Same
+// "panic on bad env" contract as WithMigrateLiveLeaseSeconds: a
+// typo in FAAS_MIGRATING_WATCHDOG_TICK_LIMIT must not silently
+// fall back to the api.* default.
+func (e *Engine) WithMigratingWatchdogTickLimit(n int) *Engine {
+	if n <= 0 {
+		panic(fmt.Sprintf("sched: WithMigratingWatchdogTickLimit: n must be > 0, got %d", n))
+	}
+	e.migratingWatchdogTickLimit = n
+	return e
+}
+
+// WithMigratingWatchdogIntervalSeconds (Tier A6 / ADR-067) sets
+// the per-tick cadence on which the migration-reconcile loop
+// runs. Same "panic on bad env" contract as the other With*
+// setters.
+func (e *Engine) WithMigratingWatchdogIntervalSeconds(seconds int) *Engine {
+	if seconds <= 0 {
+		panic(fmt.Sprintf("sched: WithMigratingWatchdogIntervalSeconds: seconds must be > 0, got %d", seconds))
+	}
+	e.migratingWatchdogIntervalSeconds = seconds
 	return e
 }
 
@@ -2053,6 +2098,144 @@ func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (i
 		"attempted", attempted, "migrated", migrated,
 		"to_node", e.ownerNodeID)
 	return attempted, nil
+}
+
+// ReconcileExpiredMigrations (Tier A6 / ADR-067 migrating-
+// instance watchdog) is the per-tick work function that self-
+// heals stuck state='migrating' rows that never committed (the
+// new owner vmmd died mid-handoff, the network partition
+// dropped the gRPC, the operator killed the new owner before
+// the Phase-3 commit). The watchdog is the ONLY writer that
+// can move a row out of 'migrating' without a peer commit —
+// every Phase-4 path (CancelInstanceMigration) requires a
+// peer, and the peer is the very thing that's gone.
+//
+// Per-instance decision (driven by compute_nodes.active for
+// the row's current node_id, which is the OLD/dying vmmd —
+// Phase 2 MarkInstanceMigrating did not flip node_id, only
+// Phase 3 MigrateInstanceOwner does):
+//
+//  1. Active owner (compute_nodes.active = true): the row is
+//     wedged but the dying vmmd is still up. Issue a
+//     Store.ReinviteMigratingInstance conditional UPDATE that
+//     flips state='migrating' → 'running', stamps migrated_at,
+//     and clears lease_token. node_id stays on the OLD owner.
+//     Bumps outcome="reinvited".
+//  2. Dead owner (compute_nodes.active = false): the dying
+//     vmmd is gone. Issue a Store.AbortMigratingInstance
+//     conditional UPDATE that flips state='migrating' →
+//     'parked' and clears lease_token. node_id is left on the
+//     dead OLD owner (migrated_from_node_id is NULL pre-Phase-3;
+//     the wake path dispatches via app.NodeID, not instance.
+//     NodeID, so a dead instance.NodeID is harmless). Bumps
+//     outcome="hard_deleted".
+//  3. Conflict (RowsAffected() == 0): the lease expired or a
+//     peer already committed/rolled back. Bumps
+//     outcome="conflict" and drops silently.
+//  4. Error (transient DB / lookup blip): bumps
+//     outcome="error", logs Warn, continues.
+//
+// The conditional UPDATE predicates (state='migrating' AND
+// lease_token=$1) are the load-bearing race-safety guarantee.
+// A peer that committed while the watchdog was thinking fails
+// the predicate and bumps outcome="conflict" (peer-wins); a
+// peer that rolled back also fails the predicate (state is
+// now 'parked' from CancelInstanceMigration).
+//
+// Returns (reconciled int, err error). reconciled is the
+// number of rows that successfully transitioned out of
+// 'migrating' (reinvited + hard_deleted). err is non-nil only
+// on a fatal-but-recoverable issue (the input-set query
+// failed); per-row failures are reported via the metric and
+// the slog so a transient PG blip never stops the tick.
+func (e *Engine) ReconcileExpiredMigrations(ctx context.Context) (int, error) {
+	maxPerTick := api.MigratingWatchdogTickLimit
+	if e.migratingWatchdogTickLimit > 0 {
+		maxPerTick = e.migratingWatchdogTickLimit
+	}
+	rows, err := e.store.ListExpiredMigrations(ctx, maxPerTick)
+	if err != nil {
+		return 0, fmt.Errorf("sched: reconcile expired migrations: list: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if len(rows) > maxPerTick {
+		e.log.Info("sched: reconcile expired migrations: capped",
+			"available", len(rows), "cap", maxPerTick)
+		rows = rows[:maxPerTick]
+	}
+	reconciled := 0
+	for _, ins := range rows {
+		ownerActive, lookupErr := e.computeNodeActive(ctx, ins.NodeID)
+		if lookupErr != nil {
+			if e.ops != nil {
+				e.ops.MigratingReconcileDecisions("error").Inc()
+			}
+			e.log.Warn("sched: reconcile expired migrations: owner lookup failed",
+				"instance_id", ins.ID, "node_id", ins.NodeID, "err", lookupErr)
+			continue
+		}
+		var recErr error
+		if ownerActive {
+			recErr = e.store.ReinviteMigratingInstance(ctx, ins.ID, ins.LeaseToken)
+			if recErr == nil {
+				if e.ops != nil {
+					e.ops.MigratingReconcileDecisions("reinvited").Inc()
+				}
+				e.log.Info("sched: reconcile expired migrations: reinvited",
+					"instance_id", ins.ID, "node_id", ins.NodeID)
+				reconciled++
+				continue
+			}
+		} else {
+			recErr = e.store.AbortMigratingInstance(ctx, ins.ID, ins.LeaseToken)
+			if recErr == nil {
+				if e.ops != nil {
+					e.ops.MigratingReconcileDecisions("hard_deleted").Inc()
+				}
+				e.log.Info("sched: reconcile expired migrations: hard_deleted",
+					"instance_id", ins.ID, "node_id", ins.NodeID)
+				reconciled++
+				continue
+			}
+		}
+		if errors.Is(recErr, state.ErrConflict) {
+			if e.ops != nil {
+				e.ops.MigratingReconcileDecisions("conflict").Inc()
+			}
+			e.log.Debug("sched: reconcile expired migrations: peer conflict",
+				"instance_id", ins.ID, "err", recErr)
+			continue
+		}
+		if e.ops != nil {
+			e.ops.MigratingReconcileDecisions("error").Inc()
+		}
+		e.log.Warn("sched: reconcile expired migrations: instance failed",
+			"instance_id", ins.ID, "err", recErr)
+	}
+	e.log.Info("sched: reconcile expired migrations batch done",
+		"reconciled", reconciled, "attempted", len(rows))
+	return reconciled, nil
+}
+
+// computeNodeActive returns compute_nodes.active for the given
+// nodeID. Returns false on ErrNotFound (the row was never
+// registered, or was deleted) — a missing compute_node is
+// always treated as inactive for the watchdog's purpose. Any
+// other error is propagated.
+func (e *Engine) computeNodeActive(ctx context.Context, nodeID string) (bool, error) {
+	if nodeID == "" {
+		return false, nil
+	}
+	cn, err := e.store.ComputeNodeByID(ctx, nodeID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return cn.Active, nil
 }
 
 // Prime boots a freshly-built deployment once, snapshots it, and parks it —

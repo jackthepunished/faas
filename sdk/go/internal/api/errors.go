@@ -197,6 +197,22 @@ const (
 	// only; v6 mirror is a separate ADR).
 	CodeInvalidEgressAllowlist = "invalid_egress_allowlist"
 
+	// IAM-5 API-key lifecycle (issue #189). Distinct from the
+	// secret/env surface because the lifecycle diverges: secrets
+	// and env vars are config rows, API keys are revocable
+	// credentials with a status state machine (active | grace |
+	// revoked) and a per-account grace override. Three codes:
+	//
+	//   * CodeAPIKeyExpired = 401, the bearer key has expired
+	//     (auth-time gate; the auth middleware emits key.expired).
+	//   * CodeAPIKeyRevoked = 401, the key is in status='revoked'
+	//     (manual delete, rotation atomic, or lazy-expiry).
+	//   * CodeAPIKeyLimitExceeded = 409, the per-account cap
+	//     (Plan.KeysMax, IAM-5) is reached.
+	CodeAPIKeyExpired       = "api_key_expired"
+	CodeAPIKeyRevoked       = "api_key_revoked"
+	CodeAPIKeyLimitExceeded = "api_key_limit_exceeded"
+
 	// Account self-service (spec §17 G6, ADR-021). The
 	// "confirm_required" code is returned when a DELETE arrives without
 	// the confirmation header so a stale CLI prompt can't silently wipe

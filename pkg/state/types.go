@@ -158,6 +158,16 @@ type Account struct {
 	// keys ignore this column per the IAM-2 design decision (keys are
 	// already cryptographically scoped).
 	MFARequired bool
+	// KeyGraceWindowDays overrides the plan-default API-key rotation
+	// grace window (issue #189 / IAM-5, default 7 days). NIL falls
+	// through to the plan default; 0 forces atomic rotation (the old
+	// key is revoked the moment the new one is minted); a positive
+	// value sets the grace explicitly. The auth hot path does NOT
+	// read this column — only the rotation handler does, via a
+	// short-TTL in-process cache (cmd/apid.graceWindowCache). The
+	// CHECK constraint accounts_key_grace_window_days_check enforces
+	// the (NULL or >= 0) shape at the DB layer.
+	KeyGraceWindowDays *int
 }
 
 // Active reports whether the account may deploy (not suspended/deleted).
@@ -176,14 +186,59 @@ func (a Account) MFAEnrolled() bool { return a.MFAEnrolledAt != nil }
 // authorization scopes attached to the key (e.g. "admin", "read", "write");
 // the apid middleware checks them on every authenticated request. See
 // ADR-034 and the IAM-1 plan.
+//
+// The trailing four fields are the IAM-5 (issue #189) surface:
+//
+//   - ExpiresAt: nullable; nil = never expires (legacy admin keys +
+//     the additive migration's promise to existing rows). The auth
+//     path enforces the gate in state.AuthenticateKey, not via a DB
+//     constraint. New non-admin keys receive `now() + 365 days` at
+//     creation; admin keys stay nullable per the existing contract.
+//   - Status: APIKeyStatus = 'active' | 'grace' | 'revoked'. The
+//     state machine is enforced by the store (AuthenticateKey,
+//     MarkAPIKeyRevoked, RotateAPIKey); the SQL CHECK is the floor.
+//     See APIKeyStatus for the full contract.
+//   - RevokedAt: terminal timestamp, set on explicit revoke, atomic
+//     rotation, or lazy expiry. The lazy path is one UPDATE per
+//     expired key on the first auth attempt that observes it
+//     (state.AuthenticateKey), not a background sweeper.
+//   - RotatedFromID: FK to the predecessor on the new key after
+//     rotation. nil on the original key. The reverse direction
+//     (which new key replaced this one) is a one-step walk at the
+//     call site — there is no rotated_to_id column to keep the
+//     key row immutable post-rotation.
+//
+// APIKeyStatus is the state machine for an API key (issue #189 /
+// IAM-5). Three states; the CHECK constraint in migration 00106
+// (`api_keys_status_check`) is the SQL floor, the store methods
+// are the wall.
+//
+//   - Active: ready to authenticate. The default for fresh
+//     non-admin keys.
+//   - Grace: post-rotation window. The old key still authenticates
+//     until its overwritten expires_at.
+//   - Revoked: terminal. Lazy expiry (state.AuthenticateKey),
+//     explicit DELETE, and atomic rotation all flip here.
+type APIKeyStatus string
+
+const (
+	APIKeyStatusActive  APIKeyStatus = "active"
+	APIKeyStatusGrace   APIKeyStatus = "grace"
+	APIKeyStatusRevoked APIKeyStatus = "revoked"
+)
+
 type APIKey struct {
-	ID         string
-	AccountID  string
-	Hash       []byte
-	Label      string
-	Scopes     []string
-	LastUsedAt time.Time
-	CreatedAt  time.Time
+	ID            string
+	AccountID     string
+	Hash          []byte
+	Label         string
+	Scopes        []string
+	LastUsedAt    time.Time
+	CreatedAt     time.Time
+	ExpiresAt     *time.Time
+	Status        string
+	RevokedAt     *time.Time
+	RotatedFromID *string
 }
 
 // App is a deployed application (or function). The Manifest carries the

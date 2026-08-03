@@ -69,7 +69,8 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 | 064 | Per-app private-registry Basic Auth (additive `oci.AuthPuller` + sealed `(app_id, host)` store + per-plan quota) | proposed | issue #461 |
 | 065 | Decimal-vs-binary GB-h consolidation (canonical `GBHours` divisor) | reserved | promised by ADR-060 §Decision 8 — separate PR |
 | 066 | Tier A5 cross-node live-instance migration (four-phase handoff: Park → mint lease → MigrateInstanceOwner → ack) | proposed | Tier A5 follow-up to ADR-062 deferred item 2 (live instances on the dying node) |
-| 067 | Issue #517 closure evidence — AC→PR mapping for LOGGING (correlation, server-side filters, gap semantics) | accepted | issue #517 (PR-A #520, PR-B #524, PR-C #532; docs-only PR) |
+| 067 | Tier A6 migrating-instance watchdog (1 s ticker that self-heals stuck `state='migrating'` rows: re-invite active owner via gRPC, hard-delete dead owner) | proposed | Tier A6 follow-up to ADR-066 §"Open follow-ups" item 1 |
+| 068 | Issue #517 closure evidence — AC→PR mapping for LOGGING (correlation, server-side filters, gap semantics) | accepted | issue #517 (PR-A #520, PR-B #524, PR-C #532; docs-only PR, renumbered 067→068 post #538 collision) |
 
 ADR-011 and ADR-012 are required by the UX spec (§11) before git-deploy work
 begins at M7.5; both landed on 2026-07-17 alongside the M7.5 PR open.

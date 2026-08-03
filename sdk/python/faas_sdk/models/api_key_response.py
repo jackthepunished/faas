@@ -8,6 +8,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.api_key_response_scopes_item import APIKeyResponseScopesItem, check_api_key_response_scopes_item
+from ..models.api_key_response_status import APIKeyResponseStatus, check_api_key_response_status
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="APIKeyResponse")
@@ -20,8 +21,8 @@ class APIKeyResponse:
 
         Example:
             {'id': '0123456789abcdef0123456789abcdef', 'prefix': 'fp_live_ab12cd34', 'label': 'ci-deploy', 'scopes':
-                ['apps:read', 'deploy:write'], 'created_at': '2026-07-25T13:25:00Z', 'last_used_at': '2026-07-25T13:25:00Z',
-                'plaintext': 'fp_live_abcd1234567890abcdef12345678'}
+                ['apps:read', 'deploy:write'], 'created_at': '2026-08-02T11:25:00Z', 'expires_at': '2027-08-02T11:25:00Z',
+                'status': 'active', 'last_used_at': '2026-07-25T13:25:00Z'}
 
     """
 
@@ -36,8 +37,16 @@ class APIKeyResponse:
     created_at: datetime.datetime
     label: None | str | Unset = UNSET
     last_used_at: datetime.datetime | None | Unset = UNSET
+    expires_at: datetime.datetime | None | Unset = UNSET
+    """When the key expires (RFC 3339). Absent on never-expiring admin keys."""
+    status: APIKeyResponseStatus | Unset = UNSET
+    """Status state machine. `active` = ready; `grace` = in the post-rotation window; `revoked` = terminal."""
+    revoked_at: datetime.datetime | None | Unset = UNSET
+    """When the key was revoked (RFC 3339). Absent on active/grace keys."""
+    rotated_from_id: None | str | Unset = UNSET
+    """Predecessor key id when this row was minted by rotateKey. Absent on a fresh mint."""
     plaintext: None | str | Unset = UNSET
-    """PRESENT ONLY on POST /v1/keys response. Never returned again."""
+    """PRESENT ONLY on POST /v1/keys and POST /v1/keys/{id}/rotate responses. Never returned again."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -66,6 +75,32 @@ class APIKeyResponse:
         else:
             last_used_at = self.last_used_at
 
+        expires_at: None | str | Unset
+        if isinstance(self.expires_at, Unset):
+            expires_at = UNSET
+        elif isinstance(self.expires_at, datetime.datetime):
+            expires_at = self.expires_at.isoformat()
+        else:
+            expires_at = self.expires_at
+
+        status: str | Unset = UNSET
+        if not isinstance(self.status, Unset):
+            status = self.status
+
+        revoked_at: None | str | Unset
+        if isinstance(self.revoked_at, Unset):
+            revoked_at = UNSET
+        elif isinstance(self.revoked_at, datetime.datetime):
+            revoked_at = self.revoked_at.isoformat()
+        else:
+            revoked_at = self.revoked_at
+
+        rotated_from_id: None | str | Unset
+        if isinstance(self.rotated_from_id, Unset):
+            rotated_from_id = UNSET
+        else:
+            rotated_from_id = self.rotated_from_id
+
         plaintext: None | str | Unset
         if isinstance(self.plaintext, Unset):
             plaintext = UNSET
@@ -86,6 +121,14 @@ class APIKeyResponse:
             field_dict["label"] = label
         if last_used_at is not UNSET:
             field_dict["last_used_at"] = last_used_at
+        if expires_at is not UNSET:
+            field_dict["expires_at"] = expires_at
+        if status is not UNSET:
+            field_dict["status"] = status
+        if revoked_at is not UNSET:
+            field_dict["revoked_at"] = revoked_at
+        if rotated_from_id is not UNSET:
+            field_dict["rotated_from_id"] = rotated_from_id
         if plaintext is not UNSET:
             field_dict["plaintext"] = plaintext
 
@@ -133,6 +176,56 @@ class APIKeyResponse:
 
         last_used_at = _parse_last_used_at(d.pop("last_used_at", UNSET))
 
+        def _parse_expires_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                expires_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return expires_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        expires_at = _parse_expires_at(d.pop("expires_at", UNSET))
+
+        _status = d.pop("status", UNSET)
+        status: APIKeyResponseStatus | Unset
+        if isinstance(_status, Unset):
+            status = UNSET
+        else:
+            status = check_api_key_response_status(_status)
+
+        def _parse_revoked_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                revoked_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return revoked_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        revoked_at = _parse_revoked_at(d.pop("revoked_at", UNSET))
+
+        def _parse_rotated_from_id(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        rotated_from_id = _parse_rotated_from_id(d.pop("rotated_from_id", UNSET))
+
         def _parse_plaintext(data: object) -> None | str | Unset:
             if data is None:
                 return data
@@ -149,6 +242,10 @@ class APIKeyResponse:
             created_at=created_at,
             label=label,
             last_used_at=last_used_at,
+            expires_at=expires_at,
+            status=status,
+            revoked_at=revoked_at,
+            rotated_from_id=rotated_from_id,
             plaintext=plaintext,
         )
 

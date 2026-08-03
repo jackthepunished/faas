@@ -430,7 +430,32 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 		tok := bearerToken(r)
 		if api.ValidAPIKeyFormat(tok) {
 			acct, key, err := m.Authn.AuthenticateKey(r.Context(), api.HashAPIKey(tok))
-			if err == nil {
+			// IAM-5 (issue #189): translate the IAM-5 sentinels
+			// to RFC 7807 + emit the audit row. The store
+			// already lazily marked the key status='revoked'
+			// for the expired case; we just translate the
+			// error and emit the audit event from here so the
+			// store stays independent of the audit seam.
+			if err != nil {
+				if errors.Is(err, state.ErrAPIKeyExpired) {
+					m.Audit.Emit(r.Context(), "key.expired", nil, map[string]any{
+						"key_id": key.ID,
+					})
+					api.WriteProblem(w, api.ErrAPIKeyExpired())
+					return
+				}
+				if errors.Is(err, state.ErrAPIKeyRevoked) {
+					m.Audit.Emit(r.Context(), "key.auth_rejected_revoked", nil, map[string]any{
+						"key_id": key.ID,
+					})
+					api.WriteProblem(w, api.ErrAPIKeyRevoked())
+					return
+				}
+				// Fall through to the session-cookie branch —
+				// the key may have been deleted or the hash is
+				// simply unknown; both surface as "invalid
+				// bearer" through the legacy 401 path.
+			} else {
 				if !acct.Active() {
 					if acct.Status != state.AccountDeletedPending || !isAccountScopedPath(r.URL.Path) {
 						api.WriteProblem(w, api.NewProblem(http.StatusPaymentRequired, api.CodeBillingPastDue,

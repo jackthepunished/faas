@@ -244,6 +244,19 @@ type Limits struct {
 	CronLimitPerApp     int
 	CronLimitPerAccount int
 
+	// KeysMax (issue #189 / IAM-5) caps the per-account count of
+	// active + grace API keys. Revoked keys are exempt — they
+	// remain in the table for audit lineage but no longer count
+	// against quoata. apid's createKey handler rejects with 409
+	// api_key_limit_exceeded once the count reaches the cap;
+	// rotateKey is quota-neutral (one new key replaces one old:
+	// -1 +1 = 0 net) and is allowed at the cap. Per-plan values:
+	// Free 3, Hobby 10, Pro 50, Scale 200 — tracks the typical
+	// auth surface per tier (Free's 1-app customer might run 1 key
+	// per deploy target; Scale's 100-app customer might run a
+	// handful per team).
+	KeysMax int
+
 	// Organization limits (issue #190 / IAM-6 / ADR-061). Two
 	// per-org caps; both populated for every plan, currently 0
 	// until the financial model authorizes the per-plan values.
@@ -417,6 +430,11 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// IAM-5 (issue #189): Free gets 3 keys — one for the customer's
+		// primary deploy target + one for a staging slot + one for
+		// break-glass. The abuse-vector (scripted key rotation under
+		// 1-concurrency) is bounded by the per-account rate limit.
+		KeysMax: 3,
 		// IAM-6 / ADR-061: org membership is plan-gated until the
 		// financial model authorizes a per-plan value. Free reads
 		// 0/0 so the membership gate refuses before the store is
@@ -522,6 +540,11 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// IAM-5 (issue #189): Hobby gets 10 keys — 2 per app across
+		// the Hobby app budget (5) keeps every deploy target
+		// (CI / staging / prod / personal / monitoring) with a
+		// dedicated key.
+		KeysMax: 10,
 		// IAM-6 / ADR-061: org caps land in PR 2 once the financial
 		// model authorizes them. PR 1 ships 0/0 so the fail-closed
 		// gate refuses across every plan until the values are
@@ -622,6 +645,10 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// IAM-5 (issue #189): Pro gets 50 keys — 2 per app across the
+		// Pro app budget (25) plus a per-team allowance (CI / staging
+		// / prod / personal / monitoring / break-glass).
+		KeysMax: 50,
 		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
 		// per-plan values from the financial model.
 		OrgMembersMax:            0,
@@ -718,6 +745,10 @@ var planLimits = map[Plan]Limits{
 		// at the per-app cap, the typical SaaS fan-out.
 		CronLimitPerApp:     100,
 		CronLimitPerAccount: 500,
+		// IAM-5 (issue #189): Scale gets 200 keys — 2 per app across
+		// the Scale app budget (100) plus a per-team allowance, with
+		// headroom for the rotating-CI shape of a SaaS-scale customer.
+		KeysMax: 200,
 		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
 		// per-plan values from the financial model.
 		OrgMembersMax:            0,
@@ -867,6 +898,27 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
+	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
+	// 365 days is the issue-189 spec: long enough to be
+	// "set-and-forget" for a customer's CI rotation, short enough
+	// that an exfiltrated key expires within a year of theft even
+	// without rotation. Admin keys default to nil expiry (per
+	// existing admin semantics — never expire, must be explicitly
+	// revoked). Legacy admin keys (pre-IAM-5) keep null expiry
+	// forever; rotation is the migration path for customers who
+	// want a finite window on their admin keys.
+	DefaultAPIKeyLifetimeDays = 365
+
+	// DefaultAPIKeyGraceWindowDays (issue #189 / IAM-5) is the
+	// plan-level default for the rotation grace window. 7 days
+	// gives the customer's CI / staging / prod fleet one
+	// rotation cycle to switch over without coordinated downtime.
+	// The per-account override (accounts.key_grace_window_days)
+	// takes precedence; 0 in the per-account column means
+	// "atomic revocation" (no grace).
+	DefaultAPIKeyGraceWindowDays = 7
+
 	// Streaming response caps (issue #471 / ADR-047). Free stays on the
 	// 25 MB / 300 s envelope (spec §4.1 baseline) so the abuse-floor
 	// tier can't pin a long stream against the box. Hobby/Pro/Scale
@@ -990,6 +1042,36 @@ const (
 	// here, never inlined.
 	MigrateLiveMaxPerTick   = 10
 	MigrateLiveLeaseSeconds = 90
+
+	// Tier A6 (migrating-instance watchdog, ADR-067 follow-up to
+	// ADR-066): self-heal stuck state='migrating' rows that
+	// never committed (the new owner vmmd died mid-handoff, the
+	// network partition dropped the gRPC, the operator killed
+	// the new owner before the commit). The watchdog is the
+	// only writer that can move a row out of 'migrating' without
+	// a peer commit — every Phase 4 path (CancelInstanceMigration)
+	// requires a peer, and the peer is the very thing that's gone.
+	//
+	// MigratingWatchdogTickLimit is the per-tick cap on the
+	// reconcile batch. A backlog of stuck rows past this cap is
+	// itself a "you broke something" event (the metric fires
+	// `outcome="cap_exceeded"`); a backlog over 50 means a peer
+	// dropped tens of migrations in flight and the operator
+	// should investigate before the next drain. Defaults to 50;
+	// tunable via FAAS_MIGRATING_WATCHDOG_TICK_LIMIT (env-
+	// overridable, see cmd/schedd/main.go::runWithDeps).
+	//
+	// MigratingWatchdogIntervalSeconds is the per-tick cadence
+	// of the watchdog. Default 1s; matches the existing reaper /
+	// cron tick. A 1s cadence is overkill for a 90s lease window
+	// but matches the existing pattern (every other 1s tick in
+	// pkg/sched/loop.go is the same shape). Tunable via
+	// FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	MigratingWatchdogTickLimit       = 50
+	MigratingWatchdogIntervalSeconds = 1
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
@@ -1416,6 +1498,22 @@ func (p Plan) CronLimitPerAccount() int {
 		return 0
 	}
 	return l.CronLimitPerAccount
+}
+
+// KeysMax returns the per-account API-key cap for the plan
+// (issue #189 / IAM-5). Free 3, Hobby 10, Pro 50, Scale 200. The
+// handler enforces the cap at createKey (409
+// api_key_limit_exceeded); rotateKey is quota-neutral and is allowed
+// at the cap. Revoked keys (status='revoked') are excluded from the
+// count so the customer's historical lineage doesn't pin them out of
+// quota. Unknown plans fail closed (return 0) — same contract as
+// CronLimitPerAccount above.
+func (p Plan) KeysMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.KeysMax
 }
 
 // AlertRuleLimitPerApp returns the per-app alert-rule cap for the

@@ -203,6 +203,285 @@ func TestDeleteAPIKeyNotFoundAndCrossAccount(t *testing.T) {
 	}
 }
 
+// --- IAM-5: API-key expiry + rotation (issue #189) -------------------------
+
+// TestAuthenticateKey_RejectsRevoked pins that a key in
+// status='revoked' cannot authenticate. The auth middleware
+// surfaces this as a 401 with api_key_revoked; the store just
+// returns the sentinel.
+func TestAuthenticateKey_RejectsRevoked(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanFree)
+	k, _ := m.CreateAPIKey(ctx, a.ID, []byte("hash1"), "lbl", []string{"admin"})
+
+	// Sanity: not revoked yet.
+	if _, _, err := m.AuthenticateKey(ctx, []byte("hash1")); err != nil {
+		t.Fatalf("pre-revoke auth: %v", err)
+	}
+
+	// Mark revoked.
+	if _, err := m.MarkAPIKeyRevoked(ctx, a.ID, k.ID); err != nil {
+		t.Fatalf("MarkAPIKeyRevoked: %v", err)
+	}
+	_, _, err := m.AuthenticateKey(ctx, []byte("hash1"))
+	if !errors.Is(err, ErrAPIKeyRevoked) {
+		t.Errorf("post-revoke auth: want ErrAPIKeyRevoked, got %v", err)
+	}
+}
+
+// TestAuthenticateKey_LazyExpirySetsRevoked pins the auth-time
+// lazy-expiry gate. expires_at in the past causes the auth call
+// to (a) flip status='revoked' + stamp revoked_at, (b) return
+// ErrAPIKeyExpired. A second auth call after that returns
+// ErrAPIKeyRevoked.
+func TestAuthenticateKey_LazyExpirySetsRevoked(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanFree)
+	expired := time.Now().Add(-1 * time.Hour)
+	k, _ := m.CreateAPIKeyWithExpiry(ctx, a.ID, []byte("hash1"), "lbl", []string{"apps:read"}, &expired)
+	if k.Status != "active" {
+		t.Fatalf("pre-auth status: got %q, want active", k.Status)
+	}
+	_, _, err := m.AuthenticateKey(ctx, []byte("hash1"))
+	if !errors.Is(err, ErrAPIKeyExpired) {
+		t.Errorf("lazy expiry: want ErrAPIKeyExpired, got %v", err)
+	}
+	// Status now flipped to revoked.
+	row, _ := m.APIKeyByHash(ctx, []byte("hash1"))
+	if row.Status != "revoked" {
+		t.Errorf("post-expiry status: got %q, want revoked", row.Status)
+	}
+	if row.RevokedAt == nil {
+		t.Errorf("post-expiry revoked_at: got nil, want timestamp")
+	}
+	// Subsequent auth returns ErrAPIKeyRevoked (not ErrAPIKeyExpired again).
+	_, _, err = m.AuthenticateKey(ctx, []byte("hash1"))
+	if !errors.Is(err, ErrAPIKeyRevoked) {
+		t.Errorf("post-expiry second auth: want ErrAPIKeyRevoked, got %v", err)
+	}
+}
+
+// TestMarkAPIKeyRevoked_Idempotent pins the contract that
+// repeated revoke calls are no-ops (not errors). Audit seam
+// relies on this — the key.revoked audit is emitted in the
+// handler, so the store must not surface a duplicate error.
+func TestMarkAPIKeyRevoked_Idempotent(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanFree)
+	k, _ := m.CreateAPIKey(ctx, a.ID, []byte("hash1"), "lbl", []string{"admin"})
+
+	first, err := m.MarkAPIKeyRevoked(ctx, a.ID, k.ID)
+	if err != nil {
+		t.Fatalf("first revoke: %v", err)
+	}
+	if first.Status != "revoked" {
+		t.Errorf("first status: got %q, want revoked", first.Status)
+	}
+	second, err := m.MarkAPIKeyRevoked(ctx, a.ID, k.ID)
+	if err != nil {
+		t.Fatalf("second revoke: %v", err)
+	}
+	if second.Status != "revoked" {
+		t.Errorf("second status: got %q, want revoked", second.Status)
+	}
+	// revoked_at unchanged.
+	if !first.RevokedAt.Equal(*second.RevokedAt) {
+		t.Errorf("revoked_at changed: first=%v second=%v", first.RevokedAt, second.RevokedAt)
+	}
+}
+
+// TestCountAPIKeys_RespectsStatusFilter pins that the per-account
+// cap check excludes status='revoked' rows. A customer who has
+// 3 active + 5 revoked has 3 keys, not 8 — so the IAM-5 cap
+// check (Plan.KeysMax) lets them mint more.
+func TestCountAPIKeys_RespectsStatusFilter(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanFree)
+	// 3 active
+	for i := 0; i < 3; i++ {
+		_, err := m.CreateAPIKey(ctx, a.ID, []byte("h"+string(rune('a'+i))), "k", []string{"admin"})
+		if err != nil {
+			t.Fatalf("seed active: %v", err)
+		}
+	}
+	// 5 revoked
+	for i := 0; i < 5; i++ {
+		k, err := m.CreateAPIKey(ctx, a.ID, []byte("r"+string(rune('a'+i))), "k", []string{"admin"})
+		if err != nil {
+			t.Fatalf("seed revoked: %v", err)
+		}
+		_, _ = m.MarkAPIKeyRevoked(ctx, a.ID, k.ID)
+	}
+	n, err := m.CountAPIKeys(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("CountAPIKeys: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("CountAPIKeys: got %d, want 3 (revoked rows excluded)", n)
+	}
+}
+
+// TestRotateAPIKey_GraceStatus pins the rotation primitive's
+// grace branch. A 7-day grace window sets the old key's
+// status='grace' and overwrites expires_at to now+7d. The new
+// key inherits the old key's label + scopes and has
+// status='active' + rotated_from_id set.
+func TestRotateAPIKey_GraceStatus(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanHobby)
+	oldKey, _ := m.CreateAPIKey(ctx, a.ID, []byte("old"), "ci-deploy", []string{"apps:read", "deploy:write"})
+
+	grace := 7 * 24 * time.Hour
+	before := time.Now()
+	newKey, oldKeyAfter, err := m.RotateAPIKey(ctx, a.ID, oldKey.ID, []byte("new"), "", grace)
+	if err != nil {
+		t.Fatalf("RotateAPIKey: %v", err)
+	}
+	// New key shape.
+	if newKey.Status != "active" {
+		t.Errorf("new status: got %q, want active", newKey.Status)
+	}
+	if newKey.RotatedFromID == nil || *newKey.RotatedFromID != oldKey.ID {
+		t.Errorf("new rotated_from_id: got %v, want %s", newKey.RotatedFromID, oldKey.ID)
+	}
+	if newKey.Label != "ci-deploy" {
+		t.Errorf("new label: got %q, want ci-deploy (inherited)", newKey.Label)
+	}
+	// Old key shape.
+	if oldKeyAfter.Status != "grace" {
+		t.Errorf("old status: got %q, want grace", oldKeyAfter.Status)
+	}
+	if oldKeyAfter.ExpiresAt == nil {
+		t.Fatal("old expires_at: got nil, want grace deadline")
+	}
+	wantDeadline := before.Add(grace)
+	if oldKeyAfter.ExpiresAt.Before(wantDeadline.Add(-1*time.Second)) ||
+		oldKeyAfter.ExpiresAt.After(wantDeadline.Add(1*time.Second)) {
+		t.Errorf("old expires_at: got %v, want ~%v", oldKeyAfter.ExpiresAt, wantDeadline)
+	}
+}
+
+// TestRotateAPIKey_Atomic pins the rotation primitive's atomic
+// branch. graceWindow=0 flips status='revoked' + sets
+// expires_at=now + revoked_at=now.
+func TestRotateAPIKey_Atomic(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanHobby)
+	oldKey, _ := m.CreateAPIKey(ctx, a.ID, []byte("old"), "ci", []string{"admin"})
+
+	before := time.Now()
+	_, oldKeyAfter, err := m.RotateAPIKey(ctx, a.ID, oldKey.ID, []byte("new"), "", 0)
+	if err != nil {
+		t.Fatalf("RotateAPIKey: %v", err)
+	}
+	if oldKeyAfter.Status != "revoked" {
+		t.Errorf("old status: got %q, want revoked", oldKeyAfter.Status)
+	}
+	if oldKeyAfter.RevokedAt == nil {
+		t.Fatal("old revoked_at: got nil, want now")
+	}
+	if oldKeyAfter.RevokedAt.Before(before) {
+		t.Errorf("old revoked_at: got %v, want >= %v", oldKeyAfter.RevokedAt, before)
+	}
+}
+
+// TestRotateAPIKey_OldKeyExpiresAtOverwritten pins the issue's
+// explicit contract: rotation OVERWRITES the old key's
+// expires_at to the grace deadline, regardless of any prior
+// value. A pre-rotated key with expires_at=now+1y gets
+// rewritten to now+7d.
+func TestRotateAPIKey_OldKeyExpiresAtOverwritten(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanHobby)
+	originalExp := time.Now().Add(365 * 24 * time.Hour)
+	oldKey, _ := m.CreateAPIKeyWithExpiry(ctx, a.ID, []byte("old"), "ci", []string{"admin"}, &originalExp)
+	if oldKey.ExpiresAt == nil {
+		t.Fatal("setup: old key has no expires_at")
+	}
+
+	grace := 7 * 24 * time.Hour
+	_, oldKeyAfter, err := m.RotateAPIKey(ctx, a.ID, oldKey.ID, []byte("new"), "", grace)
+	if err != nil {
+		t.Fatalf("RotateAPIKey: %v", err)
+	}
+	if oldKeyAfter.ExpiresAt == nil {
+		t.Fatal("post-rotation expires_at: got nil")
+	}
+	// Original was ~365d out; rotation must have rewritten to ~7d.
+	delta := time.Until(*oldKeyAfter.ExpiresAt)
+	if delta > 8*24*time.Hour || delta < 6*24*time.Hour {
+		t.Errorf("post-rotation expires_at delta: got %v, want ~7d", delta)
+	}
+}
+
+// TestRotateAPIKey_RejectsAlreadyRevoked pins the early-return
+// when the old key is already revoked — the handler surfaces
+// 404 "key already revoked" so a customer cannot rotate a dead
+// key (the rotation primitive would have no successor to
+// demote).
+func TestRotateAPIKey_RejectsAlreadyRevoked(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanHobby)
+	oldKey, _ := m.CreateAPIKey(ctx, a.ID, []byte("old"), "ci", []string{"admin"})
+	_, _ = m.MarkAPIKeyRevoked(ctx, a.ID, oldKey.ID)
+
+	_, _, err := m.RotateAPIKey(ctx, a.ID, oldKey.ID, []byte("new"), "", 7*24*time.Hour)
+	if !errors.Is(err, ErrAPIKeyRevoked) {
+		t.Errorf("rotate revoked key: want ErrAPIKeyRevoked, got %v", err)
+	}
+}
+
+// TestSetAccountKeyGraceWindow pins the per-account override
+// round-trip. Nil clears the column, a positive value stamps
+// it, a negative value is rejected by the SQL CHECK.
+func TestSetAccountKeyGraceWindow(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	a, _ := m.CreateAccount(ctx, "a@x.com", api.PlanHobby)
+
+	// nil → no override.
+	if err := m.SetAccountKeyGraceWindow(ctx, a.ID, nil); err != nil {
+		t.Fatalf("set nil: %v", err)
+	}
+	got, err := m.GetAccountKeyGraceWindow(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("get after nil: %v", err)
+	}
+	if got != nil {
+		t.Errorf("get after nil: got %v, want nil", got)
+	}
+
+	// 14 → override.
+	d14 := 14
+	if err := m.SetAccountKeyGraceWindow(ctx, a.ID, &d14); err != nil {
+		t.Fatalf("set 14: %v", err)
+	}
+	got, err = m.GetAccountKeyGraceWindow(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("get after 14: %v", err)
+	}
+	if got == nil || *got != 14 {
+		t.Errorf("get after 14: got %v, want 14", got)
+	}
+
+	// nil again → cleared.
+	if err := m.SetAccountKeyGraceWindow(ctx, a.ID, nil); err != nil {
+		t.Fatalf("set nil again: %v", err)
+	}
+	got, _ = m.GetAccountKeyGraceWindow(ctx, a.ID)
+	if got != nil {
+		t.Errorf("get after second nil: got %v, want nil", got)
+	}
+}
+
 // --- Apps --------------------------------------------------------------------
 
 func TestCreateAndLookupApp(t *testing.T) {

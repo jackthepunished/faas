@@ -146,6 +146,23 @@ type Config struct {
 	// already drain at their own cadences.
 	ReaperAggressiveParkCap int `toml:"reaper_aggressive_park_cap"`
 
+	// MigratingWatchdogTickLimit (ADR-067) caps the per-tick
+	// batch of state='migrating' rows the watchdog self-heals.
+	// Zero reverts to api.MigratingWatchdogTickLimit (= 50).
+	// The cap prevents a wedged-migration storm from monopolising
+	// the schedd worker pool when many rows are stuck at once
+	// (e.g. after a multi-node outage).
+	MigratingWatchdogTickLimit int `toml:"migrating_watchdog_tick_limit"`
+
+	// MigratingWatchdogIntervalSeconds (ADR-067) is the watchdog
+	// tick cadence in seconds. Zero reverts to
+	// api.MigratingWatchdogIntervalSeconds (= 1). The 1 s default
+	// matches the §6.1 instance watchdog — operators that want
+	// less aggressive reconciliation (e.g. to lower DB load)
+	// can bump this; the conditional UPDATE on
+	// state='migrating' keeps the per-row work idempotent.
+	MigratingWatchdogIntervalSeconds int `toml:"migrating_watchdog_interval_seconds"`
+
 	// NodeName is the multi-box gate (ADR-056, mirrored from vmmd's
 	// [compute_node].name). When set, schedd constructs the
 	// handshake-layer NodeVerifier and surfaces a populated
@@ -286,6 +303,13 @@ func LoadConfig(path string) (*Config, error) {
 		// can flip FAAS_REAPER_AGGRESSIVE=false to disable in-place
 		// without redeploying.
 		ReaperAggressive: true,
+		// ADR-067: 0 means "use the api.* default"
+		// (api.MigratingWatchdogTickLimit = 50,
+		// api.MigratingWatchdogIntervalSeconds = 1). cmd/schedd/main.go
+		// fills them in at loop-construction time so an unset TOML
+		// and an unset env var both resolve to the spec defaults.
+		MigratingWatchdogTickLimit:       0,
+		MigratingWatchdogIntervalSeconds: 0,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
