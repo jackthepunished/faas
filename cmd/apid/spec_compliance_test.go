@@ -325,18 +325,19 @@ func testRoutesParity(t *testing.T, root string, spec *specDoc) {
 
 	// `serverSrcPath` is the canonical apid route table. After
 	// issue #254 / Move 4 PR-2 (gatewayd AppLogsHandler) the
-	// `GET /v1/apps/{slug}/logs` route is owned by cmd/gatewayd
-	// (ADR-043: gatewayd is the only public listener and already
-	// imports pkg/scheddgrpc). The scanner therefore walks both
-	// daemons' route tables — apid's server.go plus the gatewayd
-	// files that mount a `mux.Handle` for customer-facing routes.
-	// The gatewayd AppLogsHandler dispatch is wired via
-	// `mux.Handle("GET /v1/apps/{slug}/logs", ...)` in
-	// cmd/gatewayd/main.go; the applogs route is the only route
-	// the two daemons share today.
+	// `GET /v1/apps/{slug}/logs` route is owned by cmd/gatewayd-internal
+	// (ADR-043 + ADR-068 / Tier A7 split: gatewayd-internal is the
+	// routing + wake + proxy daemon and imports pkg/scheddgrpc). The
+	// scanner therefore walks both daemons' route tables — apid's
+	// server.go plus the gatewayd-internal run.go that mounts a
+	// `mux.Handle` for customer-facing routes. The AppLogsHandler
+	// dispatch is wired via `mux.Handle("GET /v1/apps/{slug}/logs", ...)`
+	// in cmd/gatewayd-internal/run.go (moved from cmd/gatewayd/main.go
+	// in tier-a7 PR-A); the applogs route is the only route the two
+	// daemons share today.
 	sources := []string{
 		filepath.Join(root, "cmd/apid", serverSrcPath),
-		filepath.Join(root, "cmd/gatewayd", "main.go"),
+		filepath.Join(root, "cmd/gatewayd-internal", "run.go"),
 	}
 	var codeRoutes []string
 	for _, p := range sources {
