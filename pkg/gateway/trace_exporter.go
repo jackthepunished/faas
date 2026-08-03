@@ -146,7 +146,12 @@ func attrValueString(v attribute.Value) string {
 	case attribute.FLOAT64:
 		return strings.TrimSpace(fmt.Sprintf("%v", v.AsFloat64()))
 	default:
-		return v.Emit()
+		// v.Emit() was deprecated in OTel SDK v1.44 in favor of
+		// v.String() (issue #555 review: surfaced as staticcheck
+		// SA1019 on the trace-export hop after the v1.44.0 pin).
+		// Covers slice values (string/bool/int/float) which the
+		// AsXxx methods above do not.
+		return v.String()
 	}
 }
 
