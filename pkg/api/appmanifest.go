@@ -117,3 +117,27 @@ func ReadManifest(r io.Reader) (AppManifest, error) {
 	}
 	return m, nil
 }
+
+// SidecarBuildManifest returns a placeholder AppManifest imaged
+// bakes into a sidecar's drive1 (issue #463 / ADR-069 / PR-B).
+//
+// The placeholder exists because pkg/api.AppManifest.Validate
+// rejects an empty entrypoint, and rootfs.Builder.Build calls
+// Validate on its way through. Sidecars do not have a customer
+// entrypoint — guest-init reads the per-workload workload.json
+// (one per drive, written by vmmd at boot per
+// pkg/fcvm/vmm.go::StageSecretsEnv generalization) to discover
+// argv/env/port for each sidecar at runtime. The placeholder is
+// therefore never executed: guest-init's per-workload supervisor
+// execs the sidecar argv from workload.json, not the rootfs-
+// baked app.json. The string "/bin/sidecar-placeholder" is a
+// stable marker an operator can grep for if the placeholder
+// ever surfaces in a crash log (it should not — guest-init
+// reads workload.json exclusively for sidecars).
+func SidecarBuildManifest() AppManifest {
+	return AppManifest{
+		Entrypoint: []string{"/bin/sidecar-placeholder"},
+		Port:       DefaultAppPort,
+		Healthz:    "/healthz",
+	}
+}

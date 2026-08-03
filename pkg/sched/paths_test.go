@@ -121,3 +121,41 @@ func TestIsParentBaseKey(t *testing.T) {
 		}
 	}
 }
+
+// TestAppSidecarLayerKey pins the per-workload storage-key shape
+// (issue #463 / ADR-069 / PR-B). Pinned here so the imaged
+// handler + vmmd Wake path + cleanupAppFiles all agree on a
+// single canonical layout — a regression here would split storage
+// across two locations and silently orphan key references.
+func TestAppSidecarLayerKey(t *testing.T) {
+	cases := []struct {
+		slug, depID, sidecarName, want string
+	}{
+		{
+			"my-app",
+			"00000000-0000-0000-0000-deadbeefcafe",
+			"migrator",
+			"apps/my-app/00000000-0000-0000-0000-deadbeefcafe-migrator.ext4",
+		},
+		{
+			"my-app",
+			"00000000-0000-0000-0000-deadbeefcafe",
+			"scraper",
+			"apps/my-app/00000000-0000-0000-0000-deadbeefcafe-scraper.ext4",
+		},
+	}
+	for _, c := range cases {
+		got := AppSidecarLayerKey(c.slug, c.depID, c.sidecarName)
+		if got != c.want {
+			t.Errorf("AppSidecarLayerKey(%q, %q, %q) = %q; want %q",
+				c.slug, c.depID, c.sidecarName, got, c.want)
+		}
+	}
+	// Two sidecars on the same deployment produce two distinct keys
+	// (the load-bearing property — imaged must not silently
+	// overwrite a prior sidecar's ext4).
+	if AppSidecarLayerKey("a", "d", "alpha") ==
+		AppSidecarLayerKey("a", "d", "beta") {
+		t.Errorf("two sidecars collided on the same key")
+	}
+}
