@@ -586,6 +586,23 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"old":    oldApp,
 		"new":    newApp,
 	})
+	// Issue #470 / PR C / ADR-072: emit a second audit row when the
+	// warm-snapshot opt-in flips true → false. The app.updated
+	// row already carries the old/new snapshot of warm_snapshot_
+	// enabled; this row is a single-purpose, single-keyword-
+	// greppable signal so operators can `gregale audit-events
+	// --kind-prefix warm_snapshot` and see all three lifecycle
+	// kinds (promoted/stale/disabled) in one stream. Not emitted
+	// when the field was already false (no-op) or when the
+	// operator left it unset (no intent to flip).
+	if req.WarmSnapshotEnabled != nil && app.WarmSnapshotEnabled && !updated.WarmSnapshotEnabled {
+		s.audit.Emit(ctx(r), "app.warm_snapshot_disabled", &acct.ID, map[string]any{
+			"app_id": updated.ID,
+			"slug":   updated.Slug,
+			"old":    true,
+			"new":    false,
+		})
+	}
 	writeJSON(w, http.StatusOK, s.appResponse(updated))
 }
 
