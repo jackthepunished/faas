@@ -7,12 +7,9 @@ codecov:
     # MUST equal the number of coverage uploads CI sends per commit.
     # Codecov holds ALL notifications — including the project/patch
     # commit statuses below — until it has received this many uploads.
-    # ci.yml has exactly one uploading job (`coverage`, flag
-    # `unittests`), so a value of 2 meant Codecov waited forever for a
-    # second upload that no workflow sends, and no status was ever
-    # posted. If you add a second uploading job (e.g. a separate
-    # integration-coverage flag), bump this to match.
-    after_n_builds: 1
+    # ci.yml has two uploading jobs (`unit-tests-heavy` and
+    # `unit-tests-light`, both uploading under flag `unittests`).
+    after_n_builds: 2
     wait_for_ci: true
 
 coverage:
