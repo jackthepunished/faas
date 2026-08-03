@@ -34,6 +34,7 @@
 package secretbox
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -174,7 +175,11 @@ const DefaultHostAgeRecipientPath = "/etc/faas/secrets/host.age.pub"
 // both daemons are owned by root so the file is root-readable (and the
 // public key is intentionally non-secret anyway).
 func WriteRecipientFile(path string, id *age.X25519Identity) error {
-	if err := os.WriteFile(path, []byte(RecipientString(id)), 0o444); err != nil {
+	want := []byte(RecipientString(id))
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, want) {
+		return nil
+	}
+	if err := os.WriteFile(path, want, 0o444); err != nil {
 		return fmt.Errorf("secretbox: write recipient %q: %w", path, err)
 	}
 	return nil
