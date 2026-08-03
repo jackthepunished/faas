@@ -39,6 +39,7 @@ from .app_secret_response import AppSecretResponse
 from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
 from .app_trusted_signer_list_response import AppTrustedSignerListResponse
+from .applied_build import AppliedBuild
 from .apply_response import ApplyResponse
 from .apply_response_apps_item import ApplyResponseAppsItem
 from .apps_metrics_response import AppsMetricsResponse
@@ -218,6 +219,7 @@ __all__ = (
     "APIKeyResponseScopesItem",
     "AppEnvListResponse",
     "AppEnvResponse",
+    "AppliedBuild",
     "ApplyResponse",
     "ApplyResponseAppsItem",
     "AppManifest",

@@ -38,6 +38,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -45,7 +46,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -166,11 +166,6 @@ func applyProjectMultipart(t *testing.T, h *e2etest.Harness, key, slug, planToke
 	}
 	return ar
 }
-
-// scanRequestTimeout is the per-request timeout used by the
-// multipart helpers. 10s is generous; in CI the apply endpoint
-// typically returns in <500ms.
-const applyRequestTimeout = 10 * time.Second
 
 // TestApplyProject is the single top-level test for this themed
 // file. It opens one APID harness + Postgres pool and runs each
@@ -303,7 +298,7 @@ func TestApplyProject(t *testing.T) {
 			`select kind from deployments where app_id = $1 order by created_at desc limit 1`,
 			appID).Scan(&depKind)
 		if err != nil {
-			if err == pgx.ErrNoRows {
+			if errors.Is(err, pgx.ErrNoRows) {
 				t.Fatalf("no deployment row for app %q (PR-A didn't enqueue a build)", appID)
 			}
 			t.Fatalf("deployments query: %v", err)

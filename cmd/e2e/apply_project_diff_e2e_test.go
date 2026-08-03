@@ -88,33 +88,6 @@ func oneWorkloadFixtureFromPrefix(t *testing.T, prefix string) []byte {
 	return buf.Bytes()
 }
 
-// threeWorkloadFixture builds an N=3 repo so a 2nd apply can
-// remove one workload (going 3→2) and assert the diff result
-// cleanly.
-func threeWorkloadFixture(t *testing.T, prefix string) []byte {
-	t.Helper()
-	entries := []struct{ name, body string }{
-		{prefix + "/docker-compose.yml", "services:\n  api:\n    build: { context: services/api }\n  worker:\n    build: { context: services/worker }\n  cron:\n    build: { context: services/cron }\n"},
-		{prefix + "/services/api/Dockerfile", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
-		{prefix + "/services/api/index.js", "exports.handler = () => 1;\n"},
-		{prefix + "/services/worker/Dockerfile", "FROM alpine:3.19\nCMD [\"./worker\"]\n"},
-		{prefix + "/services/worker/index.js", "exports.handler = () => 2;\n"},
-		{prefix + "/services/cron/Dockerfile", "FROM alpine:3.19\nCMD [\"./cron\"]\n"},
-		{prefix + "/services/cron/index.js", "exports.handler = () => 3;\n"},
-	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	for _, e := range entries {
-		hdr := &tar.Header{Name: e.name, Mode: 0o644, Size: int64(len(e.body)), Typeflag: tar.TypeReg}
-		_ = tw.WriteHeader(hdr)
-		_, _ = tw.Write([]byte(e.body))
-	}
-	_ = tw.Close()
-	_ = gz.Close()
-	return buf.Bytes()
-}
-
 // twoWorkloadChangedFixture builds a 2-workload repo where the
 // `api` workload's index.js content differs from the first apply
 // — this exercises the `~` changed path (new deployment +

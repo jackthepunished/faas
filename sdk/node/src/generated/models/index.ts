@@ -24,6 +24,7 @@ export type { AppSecretResponse } from './AppSecretResponse.js';
 export type { AppSecurityRequest } from './AppSecurityRequest.js';
 export type { AppSecurityResponse } from './AppSecurityResponse.js';
 export type { AppTrustedSignerListResponse } from './AppTrustedSignerListResponse.js';
+export type { AppliedBuild } from './AppliedBuild.js';
 export type { ApplyResponse } from './ApplyResponse.js';
 export type { AppsMetricsResponse } from './AppsMetricsResponse.js';
 export type { AsyncInvokeResponse } from './AsyncInvokeResponse.js';

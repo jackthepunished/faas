@@ -43,7 +43,6 @@ type recordingNotifier struct {
 type notifyCall struct {
 	channel string
 	payload string
-	err     error
 }
 
 func (r *recordingNotifier) Notify(_ context.Context, channel, payload string) error {
@@ -51,12 +50,6 @@ func (r *recordingNotifier) Notify(_ context.Context, channel, payload string) e
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, notifyCall{channel: channel, payload: payload})
 	return nil
-}
-
-func (r *recordingNotifier) failNext(_ error) {
-	// Reserved for tests that need to inject a notify error at a
-	// specific call index; kept off the hot path so the happy-path
-	// tests don't allocate an error.
 }
 
 func (r *recordingNotifier) callCount() int {

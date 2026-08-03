@@ -253,6 +253,13 @@ func TestApplyProject_Builds(t *testing.T) {
 		// per-workload sentinel files (or the root marker,
 		// if RootDir is "").
 		containsSentinel := func(path, sentinel string) bool {
+			// Vetted-id path: the spool tarball was just
+			// written by the harness under FAAS_SPOOL_ROOT
+			// (see startAPID in pkg/e2etest/harness.go) —
+			// not a customer-supplied path. The forbidigo
+			// rule allows `os.Open` here because the
+			// caller has full provenance of the path.
+			//nolint:forbidigo // tarball path is harness-staged, not customer input
 			f, err := os.Open(path)
 			if err != nil {
 				return false
@@ -432,7 +439,7 @@ func TestApplyProject_Builds(t *testing.T) {
 			}
 			// Every char must be hex.
 			for _, c := range b.BuildID {
-				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				if c < '0' || c > '9' && c < 'a' || c > 'f' {
 					t.Fatalf("build id %q contains non-hex char %q", b.BuildID, c)
 				}
 			}

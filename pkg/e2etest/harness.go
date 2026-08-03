@@ -423,10 +423,24 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 		// before the main HTTP listener is reached. The e2e harness
 		// doesn't scrape /metrics; the scrape observer is still wired
 		// into the main mux so the dashboard panels stay accurate.
+		// Per-test FAAS_SPOOL_ROOT + FAAS_SCAN_SPOOL_ROOT — see
+		// startAPID in Start for the rationale (PR #541 themed e2e
+		// files share one APID across many subtests; without these,
+		// concurrent applies race on /var/spool/faas/builds and fail
+		// with 503 capacity_unavailable).
+		spoolRoot := filepath.Join(h.TmpDir, "spool")
+		scanRoot := filepath.Join(h.TmpDir, "scan-spool")
+		for _, d := range []string{spoolRoot, scanRoot} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatalf("e2etest: mkdir spool: %v", err)
+			}
+		}
 		env := append(testEnvCommon(dbURL),
 			"FAAS_APID_LISTEN="+addr,
 			"FAAS_APPS_DOMAIN="+testDomain,
 			"FAAS_APID_METRICS_ADDR=",
+			"FAAS_SPOOL_ROOT="+spoolRoot,
+			"FAAS_SCAN_SPOOL_ROOT="+scanRoot,
 		)
 		env = append(env, extraEnv...)
 		h.procs = append(h.procs, startProc(t, bin, "apid", env))
@@ -467,9 +481,26 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 	t.Helper()
 	addr := freeTCPAddr(t)
+	// Per-test spool roots. PR #541 collapsed the apply e2es into one
+	// themed file (TestApplyProject_*) which shares one APID subprocess
+	// across many t.Run subtests. Without per-test FAAS_SPOOL_ROOT +
+	// FAAS_SCAN_SPOOL_ROOT, every subtest writes to the system-wide
+	// default (/var/spool/faas/builds) and concurrent applies race
+	// each other to mkdir the same parent — yielding 503
+	// capacity_unavailable "could not create spool dir" in
+	// cmd/apid/extract.go and cmd/apid/deploy_inputs.go.
+	spoolRoot := filepath.Join(h.TmpDir, "spool")
+	scanRoot := filepath.Join(h.TmpDir, "scan-spool")
+	for _, d := range []string{spoolRoot, scanRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("e2etest: mkdir spool: %v", err)
+		}
+	}
 	env := append(testEnvCommon(dbURL),
 		"FAAS_APID_LISTEN="+addr,
 		"FAAS_APPS_DOMAIN="+testDomain,
+		"FAAS_SPOOL_ROOT="+spoolRoot,
+		"FAAS_SCAN_SPOOL_ROOT="+scanRoot,
 	)
 	h.procs = append(h.procs, startProc(t, bin, "apid", env))
 	h.APIDURL = "http://" + addr
