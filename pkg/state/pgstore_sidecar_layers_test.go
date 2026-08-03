@@ -10,6 +10,7 @@ package state_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -175,7 +176,7 @@ func TestPgStore_DeploymentSidecarLayer_NotFoundOnMissingDeployment(t *testing.T
 		Bytes:         128,
 		ContentDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000fff",
 	})
-	if err != state.ErrNotFound {
+	if !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("missing deployment: got %v; want state.ErrNotFound", err)
 	}
 }

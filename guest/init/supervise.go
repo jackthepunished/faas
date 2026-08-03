@@ -159,7 +159,7 @@ func (s *Supervisor) trackExit(code int) {
 // caller didn't dispatch Run on it), or (2) Run returned nil
 // (clean exit). The orchestrator only consults lastErr() on
 // supervisors it dispatched, so case (1) is impossible.
-func (s *Supervisor) lastErr() error {
+func (s *Supervisor) lastErr() error { //nolint:unused // consumed by runWorkloads (guest/init/workload_linux.go) across packages
 	if p := s.lastRunErr.Load(); p != nil {
 		return *p
 	}

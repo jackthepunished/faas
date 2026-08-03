@@ -7,6 +7,7 @@ package state
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -128,7 +129,7 @@ func TestMemStore_SetDeploymentSidecarLayer_MissingDeployment(t *testing.T) {
 		Bytes:         1,
 		ContentDigest: "sha256:00",
 	})
-	if err != ErrNotFound {
+	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("got %v; want ErrNotFound", err)
 	}
 }

@@ -1418,7 +1418,7 @@ func projectedWorkloadManifestBytes(w WorkloadSpec) int64 {
 // that lifts the cap doesn't change the formula here, only
 // the constant.
 func projectedWorkloadRosterBytes(main WorkloadSpec, sidecars []WorkloadSpec) int64 {
-	var total int64 = projectedWorkloadManifestBytes(main)
+	total := projectedWorkloadManifestBytes(main)
 	for _, sc := range sidecars {
 		total += projectedWorkloadManifestBytes(sc)
 	}
