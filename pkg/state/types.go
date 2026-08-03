@@ -1171,6 +1171,27 @@ type Instance struct {
 	// expiry. Mirrors the A4 `apps.reassigned_at` schema
 	// discipline. Nullable forever.
 	LeaseToken string
+	// FrameworkReadyAt is the wall-clock stamp the vmmd records
+	// when the guest-init signals "framework ready" via vsock DGRAM
+	// port 1027 (msg=4). Two-tier snapshot (issue #470, PR
+	// #470-FU-B): the engine waits on this column BEFORE issuing
+	// the second PauseAndSnapshot that captures the warm tier, so
+	// the warm snapshot is captured AFTER the framework has
+	// compiled routes, primed JIT, populated ORM pools, etc.
+	// Without this stamp the engine would snapshot the app the
+	// moment it returned from `waitReady` -- framework listeners
+	// cold, JIT at tier 0, route tables empty -- and warm-tier
+	// restore would pay the framework-warmup cost on every wake.
+	// Nullable forever: legacy rows never had a vsock signal;
+	// Free/Hobby plans never opt in; instances that flipped
+	// warm-snapshot off mid-flight stay null. The engine treats
+	// null as "no warm capture available, fall through to init
+	// tier". The vmmd gRPC `FrameworkReady` RPC writes the column
+	// (PR #470-FU-B); the engine reads it via the existing
+	// `e.store.GetInstance(ctx, id)` path. NOT NULL NOT enforced
+	// (no CHECK constraint in migration 00112). Pre-existing rows
+	// are backfilled with the migration's DEFAULT NULL.
+	FrameworkReadyAt *time.Time
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis

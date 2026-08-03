@@ -92,6 +92,17 @@ type VmmdAPI interface {
 	// previously returned. Idempotent on unknown mountpoints so
 	// imaged's defer-after-error pattern is safe.
 	UmountParentExt4(ctx context.Context, mountpoint string) error
+	// MarkInstanceFrameworkReady (issue #470 / PR #470-FU-B)
+	// stamps the per-instance `framework_ready_at` clock on the
+	// live Instance, observes the
+	// vmmd_guest_framework_warmup_seconds histogram (if wired),
+	// and returns the values the gRPC handler needs to publish
+	// back to schedd (instance id + app id + runtime). Returns
+	// (false, "", "", nil) when the instance is unknown — the wire
+	// RPC translates that to a NotFound gRPC code so a stale
+	// DGRAM receipt from a guest that's already gone is a clean,
+	// observable error rather than a silent success.
+	MarkInstanceFrameworkReady(ctx context.Context, instance string, warmupMs int64) (stamped bool, appID, runtime string, err error)
 }
 
 // Server implements vmmdpb.VmmdServer.
@@ -364,6 +375,65 @@ func (s *Server) PauseAndSnapshot(ctx context.Context, req *vmmdpb.PauseAndSnaps
 		MemBytes:     info.MemBytes,
 		VmstateBytes: info.VMStateBytes,
 	}, nil
+}
+
+// FrameworkReady is the vmmd-side receipt of the guest-init "framework
+// ready" vsock DGRAM (port 1027, msg=4) signal (issue #470, PR
+// #470-FU-B). The handler:
+//
+//  1. Validates the wire instance id is non-empty.
+//  2. Calls Manager.MarkInstanceFrameworkReady which stamps the
+//     per-instance `framework_ready_at` clock on the live Instance
+//     and observes the vmmd_guest_framework_warmup_seconds histogram.
+//  3. Returns NotFound when the instance is unknown (the DGRAM
+//     listener in cmd/vmmd may have stale packets in flight for an
+//     instance that was already destroyed via a parallel wake-park
+//     cycle — surfaces the situation observably instead of silently
+//     dropping it).
+//
+// The handler is idempotent: re-stamping on every subsequent signal
+// is the intended behavior (the engine's captureWarmSnapshot
+// explicitly resets the column to NULL at the start of each
+// warm-capture cycle so a stale stamp can't leak across cycles).
+// Back-pressure is intentionally absent — DGRAM is fire-and-forget
+// by analogy with the stateless-advisory port 1025 path; a missed
+// DGRAM means the engine's warm-capture wait times out and falls
+// through to init-tier (correctness-preserving).
+func (s *Server) FrameworkReady(ctx context.Context, req *vmmdpb.FrameworkReadyRequest) (*vmmdpb.FrameworkReadyResponse, error) {
+	const op = "FrameworkReady"
+	start := time.Now()
+	if req.GetInstance() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing instance",
+			"instance is required on FrameworkReady").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#framework_ready")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	stamped, appID, runtime, err := s.vmm.MarkInstanceFrameworkReady(ctx, req.GetInstance(), req.GetWarmupMs())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	if !stamped {
+		err := api.NewProblem(int(codes.NotFound), api.CodeNotFound,
+			"Instance not live",
+			"framework_ready receipt for an instance that is not live on this vmmd").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#framework_ready")
+		return nil, grpcerr.ToStatus(err)
+	}
+	// Surface appID + runtime into the structured log so the
+	// Prometheus exemplar downstream picks them up. We don't
+	// currently ship them on the wire (the response is empty by
+	// design — the engine reads the SQL column directly) but the
+	// log line is the audit trail for "which vmmd saw which signal
+	// for which app".
+	s.log.Info("framework_ready stamped",
+		"instance", req.GetInstance(),
+		"app_id", appID,
+		"runtime", runtime,
+		"warmup_ms", req.GetWarmupMs())
+	return &vmmdpb.FrameworkReadyResponse{}, nil
 }
 
 // Destroy tears down an instance. Idempotent for unknown instances. The

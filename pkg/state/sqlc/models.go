@@ -362,21 +362,22 @@ type IdempotencyKey struct {
 }
 
 type Instance struct {
-	ID            pgtype.UUID
-	AppID         pgtype.UUID
-	DeploymentID  pgtype.UUID
-	State         string
-	Netns         pgtype.Text
-	GuestUid      pgtype.Int4
-	HostIp        *netip.Addr
-	RamMb         int32
-	StartedAt     pgtype.Timestamptz
-	LastRequestAt pgtype.Timestamptz
-	ParkedAt      pgtype.Timestamptz
-	TerminalAt    pgtype.Timestamptz
-	NodeID        pgtype.UUID
-	WakeID        pgtype.UUID
-	OrgID         pgtype.UUID
+	ID               pgtype.UUID
+	AppID            pgtype.UUID
+	DeploymentID     pgtype.UUID
+	State            string
+	Netns            pgtype.Text
+	GuestUid         pgtype.Int4
+	HostIp           *netip.Addr
+	RamMb            int32
+	StartedAt        pgtype.Timestamptz
+	LastRequestAt    pgtype.Timestamptz
+	ParkedAt         pgtype.Timestamptz
+	TerminalAt       pgtype.Timestamptz
+	NodeID           pgtype.UUID
+	WakeID           pgtype.UUID
+	OrgID            pgtype.UUID
+	FrameworkReadyAt pgtype.Timestamptz
 }
 
 type Invocation struct {

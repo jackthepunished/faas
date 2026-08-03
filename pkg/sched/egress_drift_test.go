@@ -105,6 +105,14 @@ func (r *recordingRouterVMM) PauseAndSnapshot(context.Context, string, string, s
 	return SnapshotBytes{}, nil
 }
 func (r *recordingRouterVMM) Destroy(context.Context, string, string) error { return nil }
+
+// FrameworkReady implements RoutedVMM for the egress-drift test
+// fake (issue #470 / PR #470-FU-B). No-op — the egress-drift
+// tests don't exercise the warm-capture path; the engine tests
+// cover the framework-ready wiring.
+func (r *recordingRouterVMM) FrameworkReady(context.Context, string, string, int64) error {
+	return nil
+}
 func (r *recordingRouterVMM) Ping(_ context.Context, _ string) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }

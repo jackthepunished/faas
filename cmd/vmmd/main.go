@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"filippo.io/age"
@@ -460,6 +461,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 
 	cbm := fcvm.NewColdBootMetrics()
+	// PR #470-FU-B (issue #470): the framework-ready receiver
+	// needs the vmmd_guest_framework_warmup_seconds histogram
+	// wired so the MarkInstanceFrameworkReady receipt can
+	// observe per-runner warmup durations. nil-safe on the
+	// Manager side, so a producer binary that doesn't wire
+	// metrics still runs.
+	frm := fcvm.NewFrameworkReadyMetrics()
 	// #96 / ADR-025 axis 2: vmmd publishes the mem blob via the configured
 	// StorageBackend after a successful Snapshot, and resolves it back
 	// from the key on Restore. The env-driven fork (FAAS_STORAGE_BACKEND)
@@ -487,7 +495,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		fcVersion,
 		log,
 		cbm,
-	)
+	).WithFrameworkReady(frm).
+		// Issue #470 / PR #470-FU-B: attach the SQL persistence
+		// seam so the framework_ready DGRAM receipt path can
+		// stamp the `instances.framework_ready_at` column. A
+		// small adapter wraps the pgstore SetInstanceFrameworkReadyAt
+		// to the local FrameworkReadyStamper interface (we
+		// don't want the Manager to depend on the full
+		// pkg/state surface).
+		WithFrameworkReadyStamper(stamperFromStore(store, log))
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
 	// read Grype scan sidecars at boot time. Mirrors the VMM's
@@ -575,6 +591,34 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		mgr.SetAdvisoryClient(advisoryCli)
 		log.Info("vmmd: stateless advisory client wired", "target", advisoryTarget)
 	}
+
+	// PR #470-FU-B (issue #470): the host-side DGRAM recv loop
+	// for the framework-ready signal. Soft-fatal on bind failure
+	// in BOTH directions:
+	//
+	//   - non-linux (Mac dev box): the stub returns an error; we
+	//     log at Warn and continue so the dev workflow isn't gated.
+	//   - linux WITHOUT the AF_VSOCK kernel module loaded (CI unit
+	//     test container, build hosts without /dev/vsock): bind
+	//     returns EADDRNOTAVAIL. The unit-test seam must keep
+	//     running — the warm-tier path is dormant but the rest of
+	//     vmmd (gRPC, host key, capacity publisher) still needs to
+	//     come up so cmd/vmmd tests can exercise it.
+	//
+	// The production-only vsock path is opt-in: an operator running
+	// the full vmmd on a host whose kernel supports vsock would
+	// see the receiver come up. If bind fails on a real production
+	// host, the warm-tier migration is silently dropped — but the
+	// gRPC server still serves readiness, and the watchdog tick
+	// (memory `schedd-watchdog-tick`) is unaffected.
+	recv, err := StartFrameworkReadyReceiver(ctx, log, mgr)
+	if err != nil {
+		log.Warn("vmmd: framework_ready receiver unavailable", "err", err, "goos", runtime.GOOS)
+		recv = nil
+	}
+	if recv != nil {
+		defer recv.Close()
+	}
 	log.Info("vmmd ready", "fc_version", fcVersion, "max_slots", fcvm.MaxSlots,
 		"uid_lo", fcvm.JailUIDBase, "uid_hi", fcvm.JailUIDMax,
 		"host_key_path", keyPath, "recipient_path", pubPath,
@@ -661,6 +705,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// one reader). Mount at /metrics/fallback so a scrape that only
 		// wants the ops series stays clean.
 		mux.Handle(metricsPath+"/fallback", cbm.Handler())
+		// PR #470-FU-B: the framework-ready warmup histogram has its
+		// own registry (one writer = the DGRAM recv loop, one reader
+		// = Prometheus). Mount at /metrics/framework-warmup so the
+		// dashboard panel picks it up without polluting /metrics.
+		mux.Handle(metricsPath+"/framework-warmup", frm.Handler())
 		httpSrv = &http.Server{
 			Addr:              cfg.MetricsAddr,
 			Handler:           mux,

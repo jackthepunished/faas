@@ -7,27 +7,26 @@
 -- This file is a deliberate no-op kept only to satisfy the
 -- migrations/embed_test.go::TestMigrationsContiguous requirement
 -- that the embedded migration set is exactly {1, 2, …, N} with
--- no gaps. It carries no schema change and does not appear in any
--- apply path (the replay-safety gate in ci.yml drops files whose
--- basename matches the reservation regex from its "added
--- migration versions" computation).
+-- no gaps. It carries no schema change but does occupy the slot
+-- in goose's version table on apply (so the deploy gate sees a
+-- row at slot 112). The cross-PR slot gate's reservation carve-out
+-- (scripts/ci/check_migration_slots.sh::slots_from_paths) does
+-- NOT hide this file from the carve-out's collision check —
+-- only the unique-prefix test gets the carve-out; contiguity
+-- counts every embedded .sql file. PR #391 introduced the pattern.
 --
--- Slot 112 is held by open PR #540 (test(state): raise pkg/state
--- coverage to 86% + fix latent PgStore bugs) as a partner fence
--- for its real migration at 00111_webhook_deliveries.sql. This
--- reservation bridges the gap on this branch so the embedded
--- set stays contiguous 1..114 while PR #540 is still open.
---
--- Whichever side lands first (PR-C with the 112 reservation +
--- 114 real migration, or PR #540 with its real 111 + 112
--- reservation), the other drops its reservation on rebase. The
--- cross-PR slot gate hides reservation files via the
--- slots_from_paths regex carve-out, so the simultaneous
--- reservations do not surface as a collision.
+-- Slot 112 is the original PR-creation slot for PR #543 (issue
+-- #470 PR #470-FU-B, framework_ready signal). On the first rebase
+-- onto main (1768ed4b) the renumber chain 112 → 116 → 117 → 118
+-- → 119 → 120 collapsed into a single 112 → 120 jump and the
+-- 112 fence was renamed to 119. After PR #547 (Tier A7
+-- gatewayd split) opened slots 119/120/121 on main, this
+-- branch's 120 was renumbered to 122 — but the 112 fence had
+-- been consumed by the earlier rename and is restored here so
+-- the embedded FS stays contiguous 1..122.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
--- but produces no schema change. Future-proof against upstream
--- generator drift without chasing each new template revision.
+-- but produces no schema change.
 --
 select 1;
 

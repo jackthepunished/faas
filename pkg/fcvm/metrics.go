@@ -140,6 +140,77 @@ func (m *ColdBootMetrics) ObserveFallback() {
 	m.fallback.Inc()
 }
 
+// FrameworkReadyMetrics owns the vmmd_guest_framework_warmup_seconds
+// histogram (issue #470 / PR #470-FU-B, ADR-015). The histogram
+// observes the wall-clock duration between guest-init boot and the
+// runner's first non-5xx response (the warmup_ms the guest sends
+// over vsock DGRAM port 1027 / msg=4). Each observation is labelled
+// by {runtime, app}; the dashboard panel "warm-snapshot cohort,
+// p50/p95 warmup by runner" uses this. The runtime label is bounded
+// (≤5 values: node22, node24, python312, python313, go124) so
+// cardinality stays bounded; the app label is the apps.id UUID and
+// is intentionally unbounded — callers SHOULD use the
+// pkg/wire.OtherLabelSet admission primitive if exporting to a shared
+// Prometheus, but the per-vmmd dedicated registry pattern (this
+// struct) keeps it safe.
+//
+// Nil-safe — Manager.MarkInstanceFrameworkReady calls ObserveWarmup
+// with a nil-check so unit tests can construct a Manager without
+// wiring metrics.
+type FrameworkReadyMetrics struct {
+	reg    *prometheus.Registry
+	warmup *prometheus.HistogramVec
+}
+
+// NewFrameworkReadyMetrics registers vmmd_guest_framework_warmup_seconds
+// on a fresh per-daemon registry. Pass the returned struct to
+// fcvm.NewManager.WithFrameworkReady (the writer) AND to the http
+// mux (the reader). Calling ObserveWarmup on a nil receiver is a
+// safe no-op.
+func NewFrameworkReadyMetrics() *FrameworkReadyMetrics {
+	reg := prometheus.NewRegistry()
+	m := &FrameworkReadyMetrics{
+		reg: reg,
+		warmup: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "vmmd_guest_framework_warmup_seconds",
+			Help: "Wall-clock duration between guest-init boot and the runner's first non-5xx response (issue #470 / PR #470-FU-B). Bounded `runtime` label (≤5 values); `app` label is the per-wake apps.id UUID.",
+			// PRD-470 buckets: the wake budget is 350 ms p50, so we
+			// need tight resolution around 100-500 ms. The long tail
+			// matters for cold-start diagnosis (a 5 s warmup is the
+			// "warm tier is not actually warming" signal).
+			Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
+		}, []string{"runtime", "app"}),
+	}
+	reg.MustRegister(m.warmup)
+	return m
+}
+
+// Registry exposes the underlying registry — vmmd's mux mounts this
+// alongside the OpsMetrics + ColdBootMetrics registries via
+// promhttp.HandlerFor.
+func (m *FrameworkReadyMetrics) Registry() *prometheus.Registry { return m.reg }
+
+// Handler returns an http.Handler serving the warmup histogram.
+func (m *FrameworkReadyMetrics) Handler() http.Handler {
+	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{Registry: m.reg})
+}
+
+// ObserveWarmup records one warmup duration. Safe on a nil receiver.
+// Empty runtime is collapsed to "unknown" so the warmup histogram
+// stays queryable even for legacy wakes that pre-date PR #470-FU-B.
+func (m *FrameworkReadyMetrics) ObserveWarmup(runtime, app string, seconds float64) {
+	if m == nil {
+		return
+	}
+	if runtime == "" {
+		runtime = "unknown"
+	}
+	if app == "" {
+		app = "unknown"
+	}
+	m.warmup.WithLabelValues(runtime, app).Observe(seconds)
+}
+
 // DashboardGauges is the wire handle schedd mounts at /metrics. Use
 // NewDashboardGauges to build, then Handler() to register on the
 // per-daemon mux. The struct is safe for concurrent use; the internal

@@ -2153,3 +2153,110 @@ func TestManagerVersionMismatchSkipsFallbackLog(t *testing.T) {
 		t.Errorf("restore-fallback Warn fired on version-mismatch path (must be PlanWake-only):\n%s", buf.String())
 	}
 }
+
+// TestMarkInstanceFrameworkReady (issue #470 / PR #470-FU-B)
+// exercises the vmmd-side receipt of the guest-init
+// "framework ready" DGRAM. Stamps the per-instance
+// framework_ready_at clock and observes the warmup histogram
+// when wired.
+func TestMarkInstanceFrameworkReady(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm).WithFrameworkReady(NewFrameworkReadyMetrics())
+
+	// Cold-boot an instance to populate the live map. The
+	// req() helper doesn't stamp AppID / Runtime by default;
+	// the framework-ready receipt path reads both from the
+	// live Instance, so we thread them in via a direct map
+	// patch under the manager's mutex. The patch mirrors the
+	// production wake path where the schedd's WakeRequest
+	// sources both values from the apps row.
+	inst, err := m.ColdBoot(context.Background(), req("i-fr"))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	if inst.FrameworkReadyAt != nil {
+		t.Errorf("FrameworkReadyAt pre-stamp = %v, want nil", inst.FrameworkReadyAt)
+	}
+	m.mu.Lock()
+	m.live["i-fr"].AppID = "app-test-1"
+	m.live["i-fr"].Runtime = "node22"
+	m.mu.Unlock()
+
+	// Stamp and verify the live Instance is updated.
+	before := time.Now()
+	stamped, appID, runtime, err := m.MarkInstanceFrameworkReady(context.Background(), "i-fr", 250)
+	if err != nil {
+		t.Fatalf("MarkInstanceFrameworkReady: %v", err)
+	}
+	if !stamped {
+		t.Fatal("stamped = false, want true")
+	}
+	if appID == "" {
+		t.Errorf("appID empty after stamp")
+	}
+	if runtime == "" {
+		t.Errorf("runtime empty after stamp")
+	}
+	// Re-read the live Instance via the manager (ColdBoot
+	// returns a snapshot copy; the live map is the source of
+	// truth for the stamp).
+	m.mu.Lock()
+	got := m.live["i-fr"]
+	m.mu.Unlock()
+	if got.FrameworkReadyAt.Before(before) {
+		t.Errorf("FrameworkReadyAt = %v, want >= %v", got.FrameworkReadyAt, before)
+	}
+}
+
+// TestMarkInstanceFrameworkReady_UnknownInstance asserts the
+// receipt of a DGRAM for an instance that has already been
+// torn down (a stale receipt racing the wake-park cycle)
+// returns (false, "", "", nil) — the gRPC handler translates
+// that to a NotFound code rather than silently swallowing.
+func TestMarkInstanceFrameworkReady_UnknownInstance(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	stamped, appID, runtime, err := m.MarkInstanceFrameworkReady(context.Background(), "i-does-not-exist", 100)
+	if err != nil {
+		t.Fatalf("MarkInstanceFrameworkReady: %v", err)
+	}
+	if stamped {
+		t.Error("stamped = true, want false (unknown instance)")
+	}
+	if appID != "" || runtime != "" {
+		t.Errorf("appID=%q runtime=%q, want both empty on unknown", appID, runtime)
+	}
+}
+
+// TestInstanceByCID (issue #470 / PR #470-FU-B) is the
+// reverse lookup the host's DGRAM recv loop uses to map
+// a peer AF_VSOCK CID back to the live Instance id.
+func TestInstanceByCID(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	inst, err := m.ColdBoot(context.Background(), req("i-cid"))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	cid := GuestVsockCID(inst.Lease.Slot)
+	got, err := m.InstanceByCID(cid)
+	if err != nil {
+		t.Fatalf("InstanceByCID: %v", err)
+	}
+	if got != "i-cid" {
+		t.Errorf("InstanceByCID(%d) = %q, want %q", cid, got, "i-cid")
+	}
+}
+
+// TestInstanceByCID_UnknownCID asserts a stale CID (one
+// that no live instance owns) returns the documented error.
+func TestInstanceByCID_UnknownCID(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	if _, err := m.InstanceByCID(0xDEADBEEF); err == nil {
+		t.Error("InstanceByCID(unknown) = nil, want error")
+	}
+}

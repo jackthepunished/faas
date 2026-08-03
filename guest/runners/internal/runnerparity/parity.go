@@ -24,6 +24,9 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/guest/runners/internal"
 )
 
 // FakeHandler is a self-contained executable that reads the §4.9 envelope
@@ -137,16 +140,25 @@ func (f FakeHandler) WriteMaterialize(t *testing.T) string {
 // the handler's Content-Type verbatim.
 //
 // The handler closure is invoked with the materialized handler script
-// path so the runner's per-package `handle` signature
-// (func(w http.ResponseWriter, r *http.Request, handlerPath string))
-// stays unchanged — production visibility of `handle` is preserved.
-func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string)) {
+// path AND a RunnerSignal so the runner's per-package `handle`
+// signature (added an issue #470 / PR #470-FU-B fourth arg) stays
+// unchanged — production visibility of `handle` is preserved.
+func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal)) {
 	t.Helper()
 	script := fake.WriteMaterialize(t)
 
+	// Issue #470 / PR #470-FU-B: pass a real signal so the
+	// production code path is exercised end-to-end. The signal
+	// tries to dial the proxy at /run/guest-init/framework-ready.sock;
+	// on a test box that file doesn't exist, the signal's
+	// sync.Once absorbs the error and the runner's request
+	// handling proceeds normally. We pass a per-runner id so the
+	// parity test asserts the wire-line shape ("ok\n" / "err ...").
+	signal := internal.NewRunnerSignal("parity", time.Now())
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handler(w, r, script)
+		handler(w, r, script, signal)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

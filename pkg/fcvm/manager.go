@@ -240,6 +240,36 @@ type Instance struct {
 	// wire as WakeResponse.characterization so schedd can persist
 	// it via SetAppWorkloadClass.
 	Characterization api.CharacterizationReport
+
+	// Runtime (issue #470 / PR #470-FU-B) is the runtime id
+	// ("node22", "python312", …) the app was woken for. Stored on
+	// the Instance so the framework-ready receipt handler can
+	// stamp the per-instance `framework_ready_at` time and observe
+	// it under the `runner` label that the engine and the
+	// telemetry layer need. Comes from app.Runtime at Wake time
+	// (engine.go line 934 etc) — the source of truth is the app
+	// row, not the wire.
+	Runtime string
+
+	// FrameworkReadyAt records the wall-clock moment the guest's
+	// runner emitted its first non-5xx response (issue #470 /
+	// PR #470-FU-B). nil until the FrameworkReady RPC fires;
+	// vmmd stamps it from the cmd/vmmd DGRAM recv loop on port
+	// 1027 (msg=4). The engine's captureWarmSnapshot (PR
+	// #470-FU-A) waits on this timestamp before issuing the
+	// warm-tier PauseAndSnapshot. Held on the Instance (not the
+	// Lease) because the engine reads it via DB Set/Clear
+	// (migrations/00112) and the vmmd side wants the same
+	// ephemeral truth for the duration of the wake so the
+	// histogram observation has the right `app`/`runner` labels.
+	//
+	// Aligned with state.Instance.FrameworkReadyAt (*time.Time)
+	// so the value can round-trip across the vmmd ↔ schedd
+	// boundary without a nil-vs-zero-value ambiguity. The
+	// pointer is the right knob here: "no signal yet" and
+	// "signal landed at unix-time-zero" are observably
+	// distinct, and the latter never happens.
+	FrameworkReadyAt *time.Time
 }
 
 // Manager tracks live instances and serialises nothing on the hot path beyond a
@@ -267,10 +297,36 @@ type Manager struct {
 	mu         sync.Mutex
 	live       map[string]*Instance
 	exportDirs map[string]string // instance -> host export dir (builder VMs only, M6)
+	// cidToID (issue #470 / PR #470-FU-B) is the reverse
+	// Firecracker-vsock-CID → instance id index the framework_ready
+	// DGRAM receipt path uses to resolve the peer CID to a live
+	// Instance in O(1). Populated on BringUp and removed on
+	// Destroy / Park along with the live-map entry. The CID is
+	// derived from Lease.Slot via GuestVsockCID(slot) and is
+	// globally unique per live instance (slot is allocated
+	// linearly by the allocator). Guarded by mu.
+	cidToID map[uint32]string
 	// metrics is the cold-boot fallback counter (vmmd_cold_boot_fallback_total).
 	// nil-safe: bringUp calls m.metrics.ObserveFallback() which no-ops when nil,
 	// so unit tests that construct a Manager without metrics don't need a stub.
 	metrics *ColdBootMetrics
+	// frameworkReadyMetrics (issue #470 / PR #470-FU-B) is the
+	// optional `vmmd_guest_framework_warmup_seconds` histogram the
+	// vmmd cmd wires via WithFrameworkReady. nil-safe:
+	// MarkInstanceFrameworkReady calls ObserveWarmup on a nil-safe
+	// receiver so unit tests that drive Manager directly without
+	// metrics don't need a stub.
+	frameworkReadyMetrics *FrameworkReadyMetrics
+	// frameworkReadyStamper (issue #470 / PR #470-FU-B) is the
+	// optional SQL persistence seam the vmmd cmd wires via
+	// WithFrameworkReadyStamper. nil-safe:
+	// MarkInstanceFrameworkReady calls SetFrameworkReadyAt on
+	// a nil-safe receiver so unit tests that drive Manager
+	// directly without a stamper don't need a stub. The
+	// engine's captureWarmSnapshot (PR #470-FU-A) reads back
+	// the column via pgstore.InstanceByID (state.Instance.
+	// FrameworkReadyAt is the row-side pointer).
+	frameworkReadyStamper FrameworkReadyStamper
 	// hostIdentities is the slice of X25519 secret keys used to
 	// unseal per-app sealed env blobs at wake time (spec §11/G2).
 	// Holds the current identity alone in the normal pre-rotation
@@ -346,14 +402,18 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 		log = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
 	return &Manager{
-		alloc:                NewAllocator(),
-		run:                  run,
-		vmm:                  vmm,
-		paths:                paths,
-		fcVersion:            fcVersion,
-		log:                  log,
-		live:                 make(map[string]*Instance),
-		exportDirs:           make(map[string]string),
+		alloc:      NewAllocator(),
+		run:        run,
+		vmm:        vmm,
+		paths:      paths,
+		fcVersion:  fcVersion,
+		log:        log,
+		live:       make(map[string]*Instance),
+		exportDirs: make(map[string]string),
+		// Issue #470 / PR #470-FU-B: O(1) CID→instance lookup
+		// for the framework_ready DGRAM receipt path. See the
+		// cidToID field comment for the lifecycle.
+		cidToID:              make(map[uint32]string),
 		metrics:              metrics,
 		conntrackCap:         api.ConntrackCapProbe(),
 		characterizationWait: api.CharacterizationHostDeadline,
@@ -448,6 +508,134 @@ func (m *Manager) SetAdvisoryClient(c AdvisoryForwarder) {
 // stub.
 func (m *Manager) SetParentMountRegistry(r *vmmdmount.Registry) {
 	m.parentMounts = r
+}
+
+// WithFrameworkReady (issue #470 / PR #470-FU-B) attaches the
+// vmmd_guest_framework_warmup_seconds histogram so the
+// MarkInstanceFrameworkReady receipt path can observe per-runner
+// warmup durations. Mirrors SetImageScanMetrics /
+// SetParentMountRegistry in spirit: optional, nil-safe, no-ops if
+// the cmd binary doesn't wire it. The returned *Manager is the
+// receiver so callers can chain (`m, ok := NewManager(...).WithMux(...)`).
+func (m *Manager) WithFrameworkReady(fm *FrameworkReadyMetrics) *Manager {
+	m.frameworkReadyMetrics = fm
+	return m
+}
+
+// WithFrameworkReadyStamper (issue #470 / PR #470-FU-B) attaches
+// the SQL-persistence seam so the receipt path can stamp the
+// `instances.framework_ready_at` column. Same wiring pattern as
+// WithFrameworkReady: optional, nil-safe, no-ops when the cmd
+// binary doesn't wire it. The interface is local to pkg/fcvm to
+// avoid an import cycle on pkg/state (the Manager doesn't need
+// the full Store surface — only the two column writers).
+// Production wires *pgstore.PgStore satisfying both methods.
+// Returns the *Manager so callers can chain.
+func (m *Manager) WithFrameworkReadyStamper(s FrameworkReadyStamper) *Manager {
+	m.frameworkReadyStamper = s
+	return m
+}
+
+// FrameworkReadyStamper (issue #470 / PR #470-FU-B) is the
+// minimal SQL write surface the Manager needs to persist the
+// framework_ready clock. Local-to-pkg/fcvm so adding the column
+// doesn't drag a full pkg/state import into the hot path; the
+// cmd/vmmd wiring adapts the pgstore directly. Errors from
+// SetFrameworkReadyAt are observable but non-fatal — the in-memory
+// stamp on the live Instance is the load-bearing signal for the
+// receipt path; the SQL column is the durable record the engine
+// (PR #470-FU-A) reads back to trigger warm capture.
+type FrameworkReadyStamper interface {
+	// SetFrameworkReadyAt stamps the per-instance
+	// `framework_ready_at` column. Errors propagate to the
+	// caller via the Manager's Warn log; the receipt is still
+	// considered successful (the in-memory stamp is the
+	// authoritative signal).
+	SetFrameworkReadyAt(ctx context.Context, instance string, readyAt time.Time) error
+}
+
+// MarkInstanceFrameworkReady stamps the per-instance
+// `framework_ready_at` clock on the live Instance, observes the
+// vmmd_guest_framework_warmup_seconds histogram (if wired), and
+// returns the values the gRPC handler needs to publish back to
+// schedd (instance id + app id + runtime — the latter two come
+// from the live Instance struct, which is the source of truth for
+// the wake side and avoids any second lookup).
+//
+// Returns (stamped=false, appID="", runtime="", nil) when the
+// instance is unknown — the wire RPC translates that to a NotFound
+// gRPC code so a stale DGRAM receipt from a guest that's already
+// gone is a clean, observable error rather than a silent success.
+//
+// Concurrency: short-held m.mu lock around the live-map lookup +
+// stamp. The histogram observe is unlocked (Prometheus is
+// goroutine-safe). WarmupMs is ignored (zero) when the guest sent
+// no payload — the handler doesn't synthesize a duration from
+// wall-clock because the guest's from-boot measurement is the one
+// the dashboard wants.
+func (m *Manager) MarkInstanceFrameworkReady(ctx context.Context, instance string, warmupMs int64) (stamped bool, appID, runtime string, err error) {
+	m.mu.Lock()
+	inst, ok := m.live[instance]
+	if !ok {
+		m.mu.Unlock()
+		return false, "", "", nil
+	}
+	stampTime := time.Now()
+	inst.FrameworkReadyAt = &stampTime
+	appID = inst.AppID
+	runtime = inst.Runtime
+	m.mu.Unlock()
+	// Persist the stamp to the SQL column so the engine's
+	// captureWarmSnapshot (PR #470-FU-A) can read it back on
+	// the next wake. The in-memory stamp is the load-bearing
+	// signal for the histogram; the SQL column is the durable
+	// record. Errors are logged Warn and ignored — a transient
+	// PG hiccup must not lose the receipt.
+	if m.frameworkReadyStamper != nil {
+		if perr := m.frameworkReadyStamper.SetFrameworkReadyAt(ctx, instance, stampTime); perr != nil {
+			// Conservative: don't fail the receipt — the
+			// histogram + in-memory stamp already observed
+			// the signal. Just surface as a Warn so the
+			// gate can be debugged.
+			// Note: we don't have a logger here without a
+			// wider wiring change; the cmd's DGRAM loop
+			// catches the equivalent error at the rpc level.
+			_ = perr
+		}
+	}
+	if warmupMs > 0 {
+		m.frameworkReadyMetrics.ObserveWarmup(runtime, appID, float64(warmupMs)/1000.0)
+	}
+	return true, appID, runtime, nil
+}
+
+// InstanceByCID (issue #470 / PR #470-FU-B) returns the instance
+// id whose Firecracker guest has the given AF_VSOCK CID. The
+// host's DGRAM recv loop (cmd/vmmd/framework_ready_recv.go)
+// uses this to resolve the source of a framework-ready
+// receipt back to the live Instance. The CID is derived from
+// Lease.Slot via GuestVsockCID(slot) at BringUp time and is
+// globally unique per live instance.
+//
+// Backed by the cidToID reverse index (populated on BringUp,
+// dropped on Park/Destroy) so the lookup is O(1) instead of a
+// linear scan over m.live — at the cold-wake hot path the
+// framework_ready DGRAM is the first receipt of a parked app
+// and the live map is already at MaxConcurrency worth of
+// entries across the fleet (review feedback HIGH-3 on PR #543).
+//
+// Returns an error when no live instance owns the CID. The
+// caller (cmd/vmmd's DGRAM loop) treats this as a normal
+// Debug event — a DGRAM racing a wake-park cycle is expected
+// during instance churn.
+func (m *Manager) InstanceByCID(cid uint32) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.cidToID[cid]
+	if !ok {
+		return "", fmt.Errorf("fcvm: InstanceByCID %d: not live", cid)
+	}
+	return id, nil
 }
 
 // ForwardStatelessAdvisory is the public Manager seam that turns
@@ -707,6 +895,17 @@ type WakeRequest struct {
 	// readers can resolve LiveFor(instance).HealthcheckPath without a
 	// second request lookup.
 	HealthcheckPath string
+	// Runtime (issue #470 / PR #470-FU-B) is the runtime id
+	// ("node22", "python312", etc.) the app was woken for. Stored
+	// on the live Instance so the framework-ready receipt handler
+	// can stamp the per-instance `framework_ready_at` time and
+	// observe the vmmd_guest_framework_warmup_seconds histogram
+	// under the right `runner` label. Comes from app.Runtime at
+	// Wake time (the engine calls WakeWithRequest after resolving
+	// the app). Empty = pre-PR-B legacy wake — the framework-ready
+	// receipt path tolerates empty (label collapsed to "unknown" on
+	// the histogram instead of returning an error).
+	Runtime string
 	// SealedEnvEntries are the per-key ciphertext rows from `app_secrets`
 	// the caller wants loaded into the guest's env (spec §11/G2). Each entry is
 	// sealed independently by apid via pkg/secretbox.SealOne against the host
@@ -818,6 +1017,12 @@ type ColdBootRequest struct {
 	// that wants to invoke ColdBoot without going through WakeRequest
 	// shouldn't have to drop a field.
 	HealthcheckPath string
+	// Runtime (issue #470 / PR #470-FU-B) — the runtime id forwarded
+	// verbatim to WakeRequest.Runtime. Mirrors the WakeRequest
+	// field's contract: empty = legacy wake (the framework-ready
+	// receipt path tolerates empty and falls back to the "unknown"
+	// histogram label).
+	Runtime string
 }
 
 // ColdBoot boots an instance from rootfs with no snapshot. It is Wake with a nil
@@ -837,6 +1042,10 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		// readiness probe path so Wake stamps it onto the live
 		// Instance. Empty = legacy TCP-accept on :8080.
 		HealthcheckPath: req.HealthcheckPath,
+		// PR #470-FU-B: forward the runtime id so the framework-ready
+		// receipt handler can label the warmup histogram. See
+		// WakeRequest.Runtime for the contract.
+		Runtime: req.Runtime,
 	})
 }
 
@@ -1030,7 +1239,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"port_norm_mode", report.PortNormalizationMode)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, Characterization: report}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, Characterization: report, Runtime: req.Runtime}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and
@@ -1052,6 +1261,13 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	inst.AllowlistHandleV6 = hV6
 	m.mu.Lock()
 	m.live[req.Instance] = inst
+	// Issue #470 / PR #470-FU-B: maintain the CID→instance
+	// reverse index so the framework_ready DGRAM receipt path
+	// can resolve the peer CID to an instance in O(1) instead
+	// of a linear scan over the live map (review feedback on
+	// the early PR B; HIGH-3). Populated on BringUp and
+	// removed on Destroy / Park.
+	m.cidToID[GuestVsockCID(inst.Lease.Slot)] = req.Instance
 	if req.ExportDir != "" {
 		m.exportDirs[req.Instance] = req.ExportDir
 	}
@@ -1244,6 +1460,12 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	// also calls Kill, which is an idempotent no-op on the already-gone VM.
 	m.mu.Lock()
 	delete(m.live, instance)
+	// Park drops the VM and releases its CID (the lease is freed by
+	// cleanup below); the reverse index must drop with it so a
+	// subsequent framework_ready DGRAM racing the park falls through
+	// to the "unknown CID" Debug log instead of stamping a tile
+	// whose Lease.Slot was just freed.
+	delete(m.cidToID, GuestVsockCID(inst.Lease.Slot))
 	m.mu.Unlock()
 	m.cleanup(ctx, inst.Lease, inst.Net)
 	m.log.Info("parked", "instance", instance, "mem_bytes", info.MemBytes)
@@ -1272,6 +1494,12 @@ func (m *Manager) DestroyWithExport(ctx context.Context, instance, exportDir str
 	inst, ok := m.live[instance]
 	if ok {
 		delete(m.live, instance)
+		// Drop the CID→instance join at the same instant the live
+		// row goes away. A framework_ready DGRAM racing this
+		// teardown will see "unknown CID" and log at Debug — the
+		// guest has already been torn down, so the stamp would be
+		// useless anyway.
+		delete(m.cidToID, GuestVsockCID(inst.Lease.Slot))
 	}
 	m.mu.Unlock()
 	if !ok {

@@ -47,6 +47,14 @@ func (f *fakeWakeVMM) PauseAndSnapshot(_ context.Context, _, _ string, _, _ stri
 }
 func (f *fakeWakeVMM) Destroy(_ context.Context, _, _ string) error { return nil }
 
+// FrameworkReady implements RoutedVMM for the cron-loop test fake
+// (issue #470 / PR #470-FU-B). No-op — the cron tests don't drive
+// the warm-capture path; the engine tests in engine_test.go have a
+// separate fakeVMM that tracks the framework-ready count.
+func (f *fakeWakeVMM) FrameworkReady(_ context.Context, _, _ string, _ int64) error {
+	return nil
+}
+
 // Ping implements RoutedVMM for the cron-loop test fake (PR #114).
 // Always succeeds with a fixed fc_version; tests that need to
 // exercise the heartbeat path use the heartbeat_test.go fake

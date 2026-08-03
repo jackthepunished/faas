@@ -1592,6 +1592,28 @@ type Store interface {
 	// routes here when the target state is STOPPED or FAILED; every other
 	// transition still uses UpdateInstanceState / UpdateInstanceStateWithTimestamp.
 	UpdateInstanceStateToTerminal(ctx context.Context, id, state string, terminalAt time.Time) error
+	// SetInstanceFrameworkReadyAt stamps the column added by
+	// migrations/00112_instances_framework_ready_at.sql — the wall-clock
+	// time the vmmd received the guest-init "framework ready" vsock
+	// DGRAM (port 1027, msg=4) for this instance. The engine's
+	// captureWarmSnapshot (PR #470-FU-A) waits on this column before
+	// issuing the second PauseAndSnapshot that captures the warm tier.
+	// Idempotent: callers can re-stamp on subsequent warm-capture cycles
+	// (the engine resets to NULL at the start of each cycle and stamps
+	// again when the new signal arrives). Errors only on
+	// (a) instance missing — ErrNotFound, or (b) database error.
+	// Cancellation via ctx is honoured at the next pool.Ping boundary.
+	// NOT state-coupled: the column is nullable and writable in any
+	// state (engine waits before SNAPSHOTTING begins; vmmd may stamp
+	// while state is RUNNING or already PARKED).
+	SetInstanceFrameworkReadyAt(ctx context.Context, id string, readyAt time.Time) error
+	// ClearInstanceFrameworkReadyAt resets the column to NULL. Used by
+	// the engine at the start of each warm-capture cycle so a stale
+	// stamp from the previous cycle doesn't leak into the next wake
+	// decision. Symmetric counterpart to SetInstanceFrameworkReadyAt.
+	// Nullable-on-disk semantics mean the column is always
+	// NULL-or-timestamp; there is no separate "delete" notion.
+	ClearInstanceFrameworkReadyAt(ctx context.Context, id string) error
 	// ListInstancesByStatesOlderThan is the §6.1 watchdog's lookup.
 	// Returns rows currently in any of the given states whose
 	// "age timestamp" is strictly older than threshold. The age

@@ -1082,6 +1082,14 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// Mirror of `Port` above: empty OverrideHealthcheck
 		// (legacy / no-override) → empty path → legacy probe.
 		HealthcheckPath: healthcheckPathFromDep(dep),
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22"). Threaded onto the vmmd AppSpec so
+		// the framework_ready DGRAM receipt path can label
+		// vmmd_guest_framework_warmup_seconds by runner. See
+		// buildAppSpec (engine.go:1757) for the same field
+		// wired on the (re)build path. Empty falls back to
+		// "unknown" in the histogram observer.
+		Runtime: app.Runtime,
 	}
 
 	// Capture the boot inputs we need across the unlocked window. These
@@ -2005,6 +2013,14 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 		// Issue #460 / ADR-053, ADR-057 (PR-D): per-deployment
 		// override readiness probe path. "" = legacy TCP-accept.
 		HealthcheckPath: healthcheckPathFromDep(dep),
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22", "python312"). The sched sources it
+		// from the apps row at Wake time and threads it onto
+		// the vmmd AppSpec so the framework_ready DGRAM receipt
+		// path can label
+		// vmmd_guest_framework_warmup_seconds by runner. Empty
+		// falls back to "unknown" in the histogram observer.
+		Runtime: app.Runtime,
 	}, nil
 }
 
@@ -2336,6 +2352,14 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		// its declared egress policy rather than awaiting a later
 		// wake.
 		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22"). Threaded onto the vmmd AppSpec so
+		// the framework_ready DGRAM receipt path can label
+		// vmmd_guest_framework_warmup_seconds by runner. See
+		// buildAppSpec (engine.go:1757) for the same field
+		// wired on the (re)build path. Empty falls back to
+		// "unknown" in the histogram observer.
+		Runtime: app.Runtime,
 	}
 	// ADR-038 / Tier 3 phase 3: same verify path as Wake. Prime
 	// is the deploy-pipeline first boot; a tampered layer here

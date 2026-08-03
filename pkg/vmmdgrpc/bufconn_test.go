@@ -61,8 +61,13 @@ type fakeVMM struct {
 	// umountParentFn (ADR-053) mirrors mountParentFn for the
 	// UmountParentExt4 handler test. nil = success.
 	umountParentFn func(ctx context.Context, mountpoint string) error
-	live           int
-	leased         int
+	// frameworkReadyFn (issue #470 / PR #470-FU-B) lets the
+	// FrameworkReady handler test inject errors or override the
+	// (stamped, appID, runtime) return tuple. nil = stamps
+	// successfully with empty app/runner labels.
+	frameworkReadyFn func(ctx context.Context, instance string, warmupMs int64) (bool, string, string, error)
+	live             int
+	leased           int
 }
 
 func (f *fakeVMM) Wake(ctx context.Context, req fcvm.WakeRequest) (*fcvm.Instance, error) {
@@ -194,6 +199,19 @@ func (f *fakeVMM) UmountParentExt4(ctx context.Context, mountpoint string) error
 		return f.umountParentFn(ctx, mountpoint)
 	}
 	return nil
+}
+
+// MarkInstanceFrameworkReady (issue #470 / PR #470-FU-B) — wraps
+// the optional hook so the FrameworkReady handler test can inject
+// errors or override the (stamped, appID, runtime) return tuple.
+// nil hook → returns (true, "", "") so the handler's "stamped"
+// branch is taken by default. The dedicated FrameworkReady test
+// pins the wire envelope shape.
+func (f *fakeVMM) MarkInstanceFrameworkReady(ctx context.Context, instance string, warmupMs int64) (bool, string, string, error) {
+	if f.frameworkReadyFn != nil {
+		return f.frameworkReadyFn(ctx, instance, warmupMs)
+	}
+	return true, "", "", nil
 }
 
 // errNotLive is a sentinel for the Manager-equivalent "not live" error.
