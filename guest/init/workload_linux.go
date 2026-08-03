@@ -220,12 +220,33 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 	// supervisor (Max=0 policy); an essential sidecar or
 	// main workload crash triggers the supervisor's restart
 	// policy and eventually a non-zero Run() return.
+	//
+	// Panic-safety (PR-B review finding #4): `defer wg.Done()`
+	// is the FIRST defer so it runs even if a later recover()
+	// re-panics. A bare recover turns a supervisor-panic into
+	// a non-fatal log line so one bad sidecar doesn't take
+	// down WaitGroup.Wait() — the rest of the workloads keep
+	// running. mainSup is intentionally NOT recovered: a
+	// panic in the main supervisor is the deploy's terminal
+	// failure and must propagate to the orchestrator's
+	// return value.
 	var wg sync.WaitGroup
 	wg.Add(len(supervisors))
-	for _, sup := range supervisors {
+	for i, sup := range supervisors {
 		sup := sup
+		isMain := i == 0 // supervisors[0] is mainSup (see Step 2)
 		go func() {
 			defer wg.Done()
+			if isMain {
+				_ = sup.Run()
+				return
+			}
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error("runWorkloads: sidecar supervisor panicked",
+						"index", i, "recover", fmt.Sprintf("%v", r))
+				}
+			}()
 			_ = sup.Run()
 		}()
 	}
