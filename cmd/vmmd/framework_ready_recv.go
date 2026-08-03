@@ -73,6 +73,7 @@ const frameworkReadyMaxDatagram = 64
 // #470-FU-B). The zero value is meaningless; Close publishes
 // the sentinel -1 to break the loop.
 type FrameworkReadyReceiver struct {
+	ctx context.Context
 	fd  atomic.Int32
 	log *slog.Logger
 	mgr *fcvm.Manager
@@ -91,7 +92,7 @@ type FrameworkReadyReceiver struct {
 // receiver stores a pointer (not a value) so a Manager
 // reinstalled by the cmd main loop after a config reload is
 // reflected without restarting the listener.
-func StartFrameworkReadyReceiver(log *slog.Logger, mgr *fcvm.Manager) (*FrameworkReadyReceiver, error) {
+func StartFrameworkReadyReceiver(ctx context.Context, log *slog.Logger, mgr *fcvm.Manager) (*FrameworkReadyReceiver, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -104,7 +105,7 @@ func StartFrameworkReadyReceiver(log *slog.Logger, mgr *fcvm.Manager) (*Framewor
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("framework_ready DGRAM bind port %d: %w", VsockFrameworkReadyHostPort, err)
 	}
-	r := &FrameworkReadyReceiver{log: log, mgr: mgr}
+	r := &FrameworkReadyReceiver{ctx: ctx, log: log, mgr: mgr}
 	r.fd.Store(int32(fd))
 	go r.loop()
 	log.Info("framework_ready receiver started", "vsock_host_port", VsockFrameworkReadyHostPort)
@@ -178,14 +179,11 @@ func (r *FrameworkReadyReceiver) loop() {
 			continue
 		}
 		// Stamps the per-instance `framework_ready_at` clock
-		// and observes the warmup histogram. Pass the loop
-		// parameter ctx (not r.ctx) to the Manager call so
-		// the contextcheck lint recognizes it as the
-		// inherited context (r.ctx is the same value, but
-		// the lint is enforced on the parameter chain, not
-		// the struct field). MED-1 review feedback on PR
-		// #543.
-		stamped, appID, runtime, merr := r.mgr.MarkInstanceFrameworkReady(ctx, instance, msg.WarmupMs)
+		// and observes the warmup histogram. Pass the
+		// receiver's stored ctx (the cmd main loop context)
+		// so a cmd shutdown cancels the call before it
+		// returns to the loop.
+		stamped, appID, runtime, merr := r.mgr.MarkInstanceFrameworkReady(r.ctx, instance, msg.WarmupMs)
 		if merr != nil {
 			r.log.Warn("framework_ready manager call", "err", merr)
 			continue

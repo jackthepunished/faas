@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync/atomic"
@@ -35,6 +36,6 @@ func (r *FrameworkReadyReceiver) Close() {}
 // StartFrameworkReadyReceiver returns an error on non-linux
 // platforms. The cmd main() soft-fails on this path so the dev
 // box can still bring up vmmd without AF_VSOCK support.
-func StartFrameworkReadyReceiver(_ *slog.Logger, _ *fcvm.Manager) (*FrameworkReadyReceiver, error) {
+func StartFrameworkReadyReceiver(_ context.Context, _ *slog.Logger, _ *fcvm.Manager) (*FrameworkReadyReceiver, error) {
 	return nil, fmt.Errorf("framework_ready DGRAM recv: AF_VSOCK requires Linux")
 }

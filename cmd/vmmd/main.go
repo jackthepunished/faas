@@ -611,7 +611,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// host, the warm-tier migration is silently dropped — but the
 	// gRPC server still serves readiness, and the watchdog tick
 	// (memory `schedd-watchdog-tick`) is unaffected.
-	recv, err := StartFrameworkReadyReceiver(log, mgr)
+	recv, err := StartFrameworkReadyReceiver(ctx, log, mgr)
 	if err != nil {
 		log.Warn("vmmd: framework_ready receiver unavailable", "err", err, "goos", runtime.GOOS)
 		recv = nil
