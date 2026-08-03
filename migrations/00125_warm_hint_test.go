@@ -1,10 +1,10 @@
 //go:build !no_pg
 
 // Migration-apply tests for the Tier A7 edge split (ADR-070) —
-// slots 123, 124. Pins:
+// slots 125, 126. Pins:
 //
-//  1. The migration set applies cleanly through 124.
-//  2. 00123 (warm_hint):
+//  1. The migration set applies cleanly through 126.
+//  2. 00125 (warm_hint):
 //     - The table exists and accepts canonical (app_id, node_id,
 //     written_at) inserts.
 //     - The CHECK constraint on written_at allows recent values
@@ -13,7 +13,7 @@
 //     - The index on node_id exists (for the future "list all hot
 //     apps on node X" dashboard query).
 //     - Replay-safe: a second MigrateUp is a no-op.
-//  3. 00124 (pg_ratelimit_counters):
+//  3. 00126 (pg_ratelimit_counters):
 //     - The table exists and accepts canonical (scope, subject_id,
 //     plan, tokens) inserts.
 //     - tokens is bigint (not float — the "no floats near money"
@@ -24,19 +24,18 @@
 //     exists.
 //     - Replay-safe: a second MigrateUp is a no-op.
 //
-// Slot note: 00122 (instances_framework_ready_at on main) is the
-// previous real schema — the embedded migration set is contiguous
-// 1..N where N is the highest slot in the embedded set (N = 124
+// Slot note: 00124 (this PR's own reserve_slot fence, held to bridge
+// to 125) is the previous slot in this branch's embedded set; the
+// cross-PR slot gate keeps 122 + 123 with PRs #543 (real) + #540
+// (real) respectively. The embedded migration set is contiguous
+// 1..N where N is the highest slot in the embedded set (N = 126
 // here). The literal UUID slot values `000116` / `000216` /
 // `000316` / `000416` are test fixture identifiers — unrelated
-// to the slot numbers, chosen so the UUIDs stay unique within
-// this PR's fixture set (per ADR-041 + the migration-test-uuid-
+// to the slot numbers (per ADR-041 + the migration-test-uuid-
 // sed-residual memory). Renumber history: this PR originally
 // added migrations at 116/117/118, then renumbered to 119/120,
-// then to 120/121, then to 123/124 to dodge PR #543's
-// instances_framework_ready_at at 122 and PR #552's
-// events_sidecar_name_idx at 121 (the cross-PR slot gate
-// surfaced both at rebase time).
+// then to 120/121, then to 123/124, then to 125/126 to dodge
+// PR #540's webhook_deliveries at 123 (gate surfaced at rebase).
 package migrations_test
 
 import (
@@ -49,13 +48,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00123_WarmHint pins the warm_hint table shape.
-func TestMigrations_00123_WarmHint(t *testing.T) {
+// TestMigrations_00125_WarmHint pins the warm_hint table shape.
+func TestMigrations_00125_WarmHint(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing slot between 1 and 124)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing slot between 1 and 126)", err)
 	}
 
 	// (1) Confirm the table exists with the canonical columns.
@@ -147,9 +146,9 @@ func TestMigrations_00123_WarmHint(t *testing.T) {
 	}
 }
 
-// TestMigrations_00124_PgRateLimit pins the pg_ratelimit_counters
+// TestMigrations_00126_PgRateLimit pins the pg_ratelimit_counters
 // table shape (the central rate-limit counter, ADR-070 item 7).
-func TestMigrations_00124_PgRateLimit(t *testing.T) {
+func TestMigrations_00126_PgRateLimit(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -260,13 +259,13 @@ func TestMigrations_00124_PgRateLimit(t *testing.T) {
 	}
 }
 
-// TestMigrations_ReserveSlot removed: this PR has no fence in this
-// renumber chain (main owns 00119_reserve_slot + 00120/00121 were
-// briefly fences waiting for this PR's real schemas; PR #543 has
-// its 122 framework_ready real schema; PR #552 has 121 real too).
-// This PR's renumber chain is 116/117/118 → 119/120 → 120/121 →
-// 123/124 with no fence slot of its own. The migration set
-// applies contiguously from 00122 (instances_framework_ready_at,
-// on main) through 00124 (this PR's last migration). A future
-// fence, if needed, would land at the next free slot; not in
-// this PR.
+// TestMigrations_ReserveSlot removed: this PR holds its own fences
+// at 120, 121, and 124 to bridge to its real schemas at 125/126.
+// The fences at 120/121 replaced main's dropped fences that were
+// waiting for this PR's real schemas (their fences + this PR's
+// real schemas would have been duplicate-slot conflicts on main).
+// The 124 fence bridges past PR #540's 123 webhook_deliveries
+// (real) on main. The migration set applies contiguously from
+// 00122 (instances_framework_ready_at, on main, real) through
+// 00126 (this PR's last migration). A future fence, if needed,
+// would land at the next free slot; not in this PR.

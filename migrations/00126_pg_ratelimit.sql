@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00124_pg_ratelimit.sql — Tier A7 edge split (ADR-070 item 7).
+-- 00126_pg_ratelimit.sql — Tier A7 edge split (ADR-070 item 7).
 --
 -- Today's per-process token bucket (pkg/gateway/ratelimit.go) is
 -- correct for one-box (one gatewayd, one bucket per app). After the
@@ -40,7 +40,7 @@
 --     "no floats near money" invariant from CLAUDE.md applies.
 --
 -- Replay-safe (ADR-041): CREATE TABLE IF NOT EXISTS + ADD CONSTRAINT
--- IF NOT EXISTS via DO-block (same pattern as 00123).
+-- IF NOT EXISTS via DO-block (same pattern as 00125).
 
 CREATE TABLE IF NOT EXISTS pg_ratelimit_counters (
     scope        text             NOT NULL CHECK (scope IN ('app', 'account')),
