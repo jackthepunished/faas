@@ -143,6 +143,15 @@ func (f *fakeVMM) UmountParentExt4(_ context.Context, _ string) error {
 	return nil
 }
 
+// MarkInstanceFrameworkReady (issue #470 / PR #470-FU-B) — the
+// sched-side fakeVMM doesn't drive the warm-capture path; the
+// framework-ready receipt is owned by cmd/vmmd's DGRAM host recv
+// loop. Returns (true, "", "", nil) so any test that looks up a
+// non-existent instance still sees the receipt-accepted shape.
+func (f *fakeVMM) MarkInstanceFrameworkReady(_ context.Context, _ string, _ int64) (bool, string, string, error) {
+	return true, "", "", nil
+}
+
 // newClient stands up a vmmdgrpc.Server on bufconn and returns a sched.VMMClient
 // dialed to it.
 func newClient(t *testing.T, fake *fakeVMM) *sched.VMMClient {

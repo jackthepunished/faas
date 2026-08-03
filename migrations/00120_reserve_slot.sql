@@ -1,18 +1,34 @@
--- Issue #463 / ADR-069 — PR-B sidecar runtime reservation fence.
---
--- Pin slot 00120 ahead of the sidecar work in case a sibling PR
--- claims 00119 mid-PR. After rebase lands cleanly, this fence is
--- `git rm`'d (per the cross-PR slot-collision discipline).
---
--- Slot: 00120. Latest on origin/main is 00118 (PR-A sidecars).
--- Fence discipline: migrations/README.md.
-
 -- +goose Up
 -- +goose StatementBegin
-SELECT 1;
+--
+-- 00120_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change but does occupy the slot
+-- in goose's version table on apply.
+--
+-- Slot 120 is the partner fence for this branch's real
+-- migration at 00122_instances_framework_ready_at.sql after the
+-- 112 → 122 renumber. The original plan was to claim 120 as the
+-- PR-creation slot per ADR-041, but PR #547 (Tier A7 gatewayd
+-- split) opened against main claiming slots 119/120/121 — its
+-- 00120_warm_hint.sql is a real migration on that branch. This
+-- branch's real migration was therefore renumbered 120 → 122,
+-- and the 120 fence is restored here so the embedded FS stays
+-- contiguous 1..122 until either side lands and the other drops
+-- its reservation.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-SELECT 1;
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

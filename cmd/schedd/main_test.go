@@ -289,6 +289,15 @@ func (stubVMM) CancelLiveMigration(context.Context, string, string, string) erro
 	return nil
 }
 
+// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
+// receipt of the guest-init "framework ready" DGRAM. The schedd
+// wiring tests don't drive the DGRAM path (the vmmd→vmmd flow
+// is exercised in pkg/vmmdgrpc/bufconn_test.go) so the stub
+// returns nil to satisfy the closed VMM interface.
+func (stubVMM) FrameworkReady(context.Context, string, int64) error {
+	return nil
+}
+
 // UpdateEgressAllowlist (tier-2 PR-B) — wiring tests don't drive
 // the egress drift path. Returns nil so the VMM contract is
 // satisfied when schedd's deps.subscribeEgressDrift is left

@@ -219,6 +219,17 @@ func (f *fakeVmmdClient) CancelLiveMigration(context.Context, *vmmdpb.CancelLive
 	return &vmmdpb.CancelLiveMigrationResponse{}, nil
 }
 
+// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
+// receipt of the guest-init "framework ready" DGRAM. The
+// forwardproxy never invokes this RPC (the signal path is
+// vmmd→vmmd via the schedd gRPC bridge), but the vmmd gRPC
+// client interface is closed, so the fake must satisfy it.
+// Returns an empty success; tests that exercise the
+// framework-ready receipt live in pkg/vmmdgrpc/bufconn_test.go.
+func (f *fakeVmmdClient) FrameworkReady(context.Context, *vmmdpb.FrameworkReadyRequest, ...grpc.CallOption) (*vmmdpb.FrameworkReadyResponse, error) {
+	return &vmmdpb.FrameworkReadyResponse{}, nil
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can

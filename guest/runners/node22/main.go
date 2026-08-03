@@ -31,6 +31,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/onebox-faas/faas/guest/runners/internal"
 )
 
 // envelope matches the §4.9 request contract verbatim.
@@ -64,8 +66,15 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	// Issue #470 / PR #470-FU-B: the framework-ready signal fires
+	// once per wake when the runner's first non-5xx response lands.
+	// The runner's start time is captured here (runner boot ≈
+	// guest-init boot; the host sees the wake as the wire start)
+	// and the signal is fired from inside the request handler
+	// after the handler's response envelope is parsed.
+	signal := internal.NewRunnerSignal("node22", time.Now())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handle(w, r, *handlerPath)
+		handle(w, r, *handlerPath, signal)
 	})
 
 	// Issue #460 / ADR-053 (PR-C): PORT env var carries the
@@ -87,7 +96,14 @@ func main() {
 // handler. The runner is the request translator — it knows nothing
 // about Node beyond "spawn the binary with the handler path" and "pipe
 // the envelope JSON over stdin".
-func handle(w http.ResponseWriter, r *http.Request, handlerPath string) {
+//
+// Issue #470 / PR #470-FU-B: after the handler's response envelope
+// is parsed, fires the framework-ready signal if the response
+// status is non-5xx (the engine's captureWarmSnapshot waits on
+// the first non-5xx response — 5xx is "framework still warming
+// up", not "ready to capture"). The RunnerSignal's sync.Once
+// collapses parallel calls into one.
+func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	env := envelope{
@@ -119,6 +135,12 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string) {
 			return
 		}
 		_, _ = w.Write(decoded)
+	}
+	// Fire the framework-ready signal after the response has been
+	// written. Status < 500 → ready. 5xx is "framework still warming
+	// up" — the engine's wait on the SQL column will continue.
+	if resp.Status < 500 {
+		signal.SignalReady(time.Since(signal.StartTime()).Milliseconds())
 	}
 }
 

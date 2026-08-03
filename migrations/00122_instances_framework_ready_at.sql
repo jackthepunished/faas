@@ -1,0 +1,58 @@
+-- filename: 00122_instances_framework_ready_at.sql
+-- +goose Up
+-- Issue #470 / PR #470-FU-B — two-tier snapshot (warm.snap) requires a
+-- per-instance "framework ready" timestamp stamped by the hostside vmmd
+-- listener when the guest-init signals via vsock DGRAM port 1027 (msg=4).
+-- The engine in PR #470-FU-A waits on this column before issuing the
+-- SECOND PauseAndSnapshot that captures the warm tier; the schedd can't
+-- poll the guest (it lives behind the firewall) and the vmmd needs
+-- somewhere durable to record the receipt so the wake path can decide
+-- "is this warm.snap actually warm?". The vmmd gRPC `FrameworkReady`
+-- RPC writes the column; the engine reads it via the existing
+-- `e.store.GetInstance(ctx, id)` path.
+--
+-- One additive column on `instances`:
+--
+--   framework_ready_at  TIMESTAMPTZ NULL
+--
+-- Nullable on purpose: zero rows have it set on initial migration apply
+-- (legacy rows have no warm-tier capture path), and instances that
+-- took init-only snapshots (Free/Hobby plans, warm-snapshot disabled,
+-- or pre-#470-FU deploys) never stamp it. The column is purely
+-- telemetry-grade at this layer; the engine treats `null` as "no warm
+-- capture available, fall through to init tier".
+--
+-- No CHECK constraint binding it to specific states: the instance state
+-- machine flips `running -> snapshotting -> parked` mid-capture, and
+-- the framework-ready signal may arrive before OR during the
+-- SNAPSHOTTING transition (the guest is "ready" before the host knows
+-- to ask). Pinning the column to a state would either false-reject
+-- legitimate stamps or force a state-machine rewrite — neither
+-- justified for telemetry data. The query that reads it filters
+-- `state in ('running', 'parked', 'cold_booting', 'waking')` in
+-- PR #470-FU-A's `usableSnapshotForWake`.
+--
+-- No partial index. The wake path already loads the instance row by
+-- PK (instances_pkey on id); this column is only read after the PK
+-- lookup, so the index would never appear in a plan. The dashboard
+-- query "oldest framework_ready_at" runs once per minute at most.
+--
+-- Replay-safe (ADR-041): `ADD COLUMN IF NOT EXISTS` is idempotent at
+-- the column level; a second MigrateUp against a schema already holding
+-- the column is a clean no-op.
+-- +goose StatementBegin
+ALTER TABLE instances
+    ADD COLUMN IF NOT EXISTS framework_ready_at TIMESTAMPTZ NULL;
+-- +goose StatementEnd
+
+-- +goose Down
+-- Reverse: drop the column. Durably the only row contents lost are
+-- the framework-ready timestamps themselves; the snapshots.tier='warm'
+-- rows that they gated still exist (PR #525 keeps them) and the
+-- engine falls through to init-tier on restore as if the column had
+-- always been `null`. Down-migration is a soft loss of telemetry, not
+-- of snapshot bytes.
+-- +goose StatementBegin
+ALTER TABLE instances
+    DROP COLUMN IF EXISTS framework_ready_at;
+-- +goose StatementEnd

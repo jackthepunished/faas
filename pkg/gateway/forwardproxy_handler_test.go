@@ -150,6 +150,18 @@ func (s *stubVmmdClient) CancelLiveMigration(context.Context, *vmmdpb.CancelLive
 	return &vmmdpb.CancelLiveMigrationResponse{}, nil
 }
 
+// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
+// receipt of the guest-init "framework ready" DGRAM. The
+// forwardproxy handler never invokes this RPC (it's a vmmd→vmmd
+// receipt path routed via the schedd), but the vmmd gRPC
+// client interface demands the method so the stub satisfies
+// the full surface. Returns an empty success; tests that
+// exercise the framework-ready data path live in
+// pkg/vmmdgrpc/bufconn_test.go.
+func (s *stubVmmdClient) FrameworkReady(context.Context, *vmmdpb.FrameworkReadyRequest, ...grpc.CallOption) (*vmmdpb.FrameworkReadyResponse, error) {
+	return &vmmdpb.FrameworkReadyResponse{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).

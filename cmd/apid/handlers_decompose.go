@@ -32,7 +32,7 @@ import (
 // is the same scanPlanResponse that the apply endpoint emits so the
 // CLI's `--json` mode passes the bytes through verbatim.
 func (s *server) scanProject(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	resp, _, _, _, _, prob := s.scanService(w, r, acct, "", false)
+	resp, _, _, _, _, _, prob := s.scanService(w, r, acct, "", false)
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
@@ -59,9 +59,12 @@ func (s *server) scanProject(w http.ResponseWriter, r *http.Request, acct state.
 //  4. Emitting the project.created audit row (gated by the
 //     CreateProject call inside scanService — duplicate slugs are
 //     rejected with ErrConflict before reconcile runs).
+//  5. Rendering per-workload appliedBuild results in the response
+//     so the CLI's `faas apply` flow can show "app X: deployment Y,
+//     build Z" per workload (PR-A, Phase 5 close-the-loop).
 func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	planToken := r.URL.Query().Get("plan_token")
-	resp, insertedProject, added, changed, removedSlugs, prob := s.scanService(w, r, acct, planToken, true)
+	resp, insertedProject, added, changed, removedSlugs, builds, prob := s.scanService(w, r, acct, planToken, true)
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
@@ -212,8 +215,9 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 	// can render "applied: <slug> → <app_id>".
 	type applyResp struct {
 		scanPlanResponse
-		ProjectID string       `json:"project_id"`
-		AppIDs    []appSummary `json:"apps"`
+		ProjectID string         `json:"project_id"`
+		AppIDs    []appSummary   `json:"apps"`
+		Builds    []appliedBuild `json:"builds,omitempty"`
 	}
 	appIDs := make([]appSummary, 0, len(added)+len(changed))
 	for _, a := range added {
@@ -226,6 +230,7 @@ func (s *server) applyProject(w http.ResponseWriter, r *http.Request, acct state
 		scanPlanResponse: *resp,
 		ProjectID:        insertedProject.ID,
 		AppIDs:           appIDs,
+		Builds:           builds,
 	}
 
 	s.audit.Emit(r.Context(), "project.created", &acct.ID, map[string]any{

@@ -27,6 +27,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/onebox-faas/faas/guest/runners/internal"
 )
 
 type envelope struct {
@@ -58,8 +60,11 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	// Issue #470 / PR #470-FU-B: framework_ready signal fires once
+	// per wake when the runner's first non-5xx response lands.
+	signal := internal.NewRunnerSignal("go124", time.Now())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handle(w, r, *handlerPath)
+		handle(w, r, *handlerPath, signal)
 	})
 
 	// Issue #460 / ADR-053 (PR-C): PORT env var carries the
@@ -81,7 +86,7 @@ func main() {
 // handler. The runner is the request translator — it knows nothing
 // about Go beyond "exec the file with the handler path" and "pipe
 // the envelope JSON over stdin".
-func handle(w http.ResponseWriter, r *http.Request, handlerPath string) {
+func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	env := envelope{
@@ -112,6 +117,11 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string) {
 			return
 		}
 		_, _ = w.Write(decoded)
+	}
+	// Issue #470 / PR #470-FU-B: fire the framework-ready signal
+	// after the response has been written. Status < 500 → ready.
+	if resp.Status < 500 {
+		signal.SignalReady(time.Since(signal.StartTime()).Milliseconds())
 	}
 }
 

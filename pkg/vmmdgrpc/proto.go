@@ -83,6 +83,15 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 		// so the path is the customer's choice and the port is
 		// the host's choice.
 		HealthcheckPath: app.GetHealthcheckPath(),
+		// Issue #470 / PR #470-FU-B: the runner id (e.g.
+		// "node22") is forwarded verbatim so the vmmd can
+		// stamp it on the live Instance and the framework_ready
+		// DGRAM receipt path can label the
+		// vmmd_guest_framework_warmup_seconds histogram by
+		// runner. Empty falls back to "unknown" in the
+		// histogram observer. Bounded cardinality (≤5 runner
+		// ids today; the runner set is guest-init build-time).
+		Runtime: app.GetRuntime(),
 		// Issue #463 / ADR-069 / PR-B: per-workload sidecar
 		// wire. schedd populates AppSpec.sidecars from
 		// deployment_sidecar_layers at wake time; vmmd turns
@@ -169,6 +178,10 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 		// path so deploy's first boot primes the same probe
 		// semantics on the freshly-deployed app.
 		HealthcheckPath: app.GetHealthcheckPath(),
+		// Issue #470 / PR #470-FU-B: see toWakeRequest.
+		// Cold-boot mirrors the runtime so deploy's first
+		// boot primes the same per-runner histogram labelling.
+		Runtime: app.GetRuntime(),
 		// Issue #463 / ADR-069 / PR-B: see toWakeRequest.
 		// Cold-boot mirrors the per-workload sidecar wire so
 		// deploy's first boot stages the same drives +

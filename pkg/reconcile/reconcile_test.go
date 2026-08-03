@@ -524,6 +524,27 @@ func TestReconcile_DeriveScanSource_MirrorsApid(t *testing.T) {
 			want: state.ProjectScanSourceCompose,
 		},
 		{
+			// Repro for the round-3 CI failure: the compose
+			// detector emits the actual filename in the source
+			// (e.g. "docker-compose.yml: api"), not a literal
+			// "compose:" prefix. The priority list must accept
+			// every compose-family filename or scan_source
+			// falls through to "single" / "unknown" and the
+			// monotonic-upgrade guard rejects the re-apply.
+			name: "docker-compose.yml filename is recognised as compose",
+			workloads: []reposcan.Workload{
+				{Name: "api", Source: "docker-compose.yml: api"},
+			},
+			want: state.ProjectScanSourceCompose,
+		},
+		{
+			name: "compose.yml filename is recognised as compose",
+			workloads: []reposcan.Workload{
+				{Name: "api", Source: "compose.yml: api"},
+			},
+			want: state.ProjectScanSourceCompose,
+		},
+		{
 			name: "single workload with root-floor source",
 			workloads: []reposcan.Workload{
 				{Name: "app", Source: "root-floor"},

@@ -466,6 +466,23 @@ func cmdDeployTarball(args []string) int {
 		}
 		PrintOK(osStdout, "Created project %s with %d app(s) and %d cron(s)",
 			apply.ProjectID, len(apply.Apps), len(plan.Crons))
+		// Per-workload build lines (PR-A, repo decomposition Phase 5
+		// close-the-loop). The apply path enqueued one (deployment,
+		// build) per added/changed workload; surface them so the
+		// operator can `faas logs <build_id>` to follow progress.
+		// Partial-failure rows have Error populated and no IDs.
+		// We ignore Fprintf errors: stdout is the only sink and a
+		// closed pipe (e.g. `... | head`) would otherwise flip the
+		// exit code on a successful apply — matches the
+		// commands_decompose_test stub which drops Fprintf errors
+		// on the same path.
+		for _, b := range apply.Builds {
+			if b.Error != "" {
+				_, _ = fmt.Fprintf(osStdout, "  ! %s: %s\n", b.Slug, b.Error)
+				continue
+			}
+			_, _ = fmt.Fprintf(osStdout, "  ✓ %s: deployment=%s build=%s\n", b.Slug, b.DeploymentID, b.BuildID)
+		}
 		return 0
 	}
 

@@ -14,7 +14,7 @@
 //   - stageAppSource: Service method that stages one app's
 //     RootDir subtree into <WorkDir>/build-sources/<account>/
 //     <app>/<commit_sha>/source.tar.gz.
-//   - repackageRootTree: the per-app gzip-tar walk.
+//   - RepackageRootTree: the per-app gzip-tar walk.
 //
 // The staging path is stable for the daemon's lifetime (keyed
 // on commit SHA), so a re-push of the same SHA overwrites the
@@ -76,10 +76,10 @@ func (s *Service) stageAppSource(ctx context.Context, tree SourceTree, app state
 	dstTarball := filepath.Join(stagingDir, "source.tar.gz")
 
 	// Honor ctx cancellation by short-circuiting the walk. The
-	// repackageRootTree walker checks ctx between files (cheap;
+	// RepackageRootTree walker checks ctx between files (cheap;
 	// inotify-style). A cancelled ctx returns a partial tarball
 	// — the caller logs + skips, the next re-push re-stages.
-	if err := repackageRootTree(ctx, tree.FS(), app.RootDir, dstTarball); err != nil {
+	if err := RepackageRootTree(ctx, tree.FS(), app.RootDir, dstTarball); err != nil {
 		// Best-effort: don't leave a half-written tarball on
 		// disk (a future EnqueueBuild would pick it up via
 		// the (account, app, sha) cache key and read a
@@ -103,7 +103,7 @@ func (s *Service) stageAppSource(ctx context.Context, tree SourceTree, app state
 	return dstTarball, st.Size(), sourceURL, nil
 }
 
-// repackageRootTree walks the fs.FS subtree under rootDir and
+// RepackageRootTree walks the fs.FS subtree under rootDir and
 // writes a gzip-compressed tar archive to dstTarball. The
 // output is byte-for-byte what builderd's gzip.NewReader
 // (pkg/builderd/detect.go:48) expects to read.
@@ -123,7 +123,7 @@ func (s *Service) stageAppSource(ctx context.Context, tree SourceTree, app state
 // ctx cancellation is honored between files (not within a
 // single file — io.Copy would block on a slow read). The
 // walker checks ctx.Err() at the top of each iteration.
-func repackageRootTree(ctx context.Context, src fs.FS, rootDir, dstTarball string) error {
+func RepackageRootTree(ctx context.Context, src fs.FS, rootDir, dstTarball string) error {
 	dst, err := os.Create(dstTarball) //nolint:gosec // dst is operator-controlled
 	if err != nil {
 		return fmt.Errorf("create tarball: %w", err)
