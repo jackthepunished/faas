@@ -80,7 +80,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
 		values ('00000000-0000-0000-0000-000000000319',
-		        '00000000-0000-0000-0000-000000000208',
+		        '00000000-0000-0000-0000-000000000219',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending', '[]'::jsonb, now())
 		on conflict (id) do nothing
@@ -96,7 +96,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
 		values ('00000000-0000-0000-0000-000000000419',
-		        '00000000-0000-0000-0000-000000000208',
+		        '00000000-0000-0000-0000-000000000219',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending',
 		        '[
@@ -120,7 +120,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
 		values ('00000000-0000-0000-0000-000000000519',
-		        '00000000-0000-0000-0000-000000000208',
+		        '00000000-0000-0000-0000-000000000219',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending',
 		        '[
@@ -168,7 +168,7 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_digest, status, created_at)
 		values ('00000000-0000-0000-0000-000000000619',
-		        '00000000-0000-0000-0000-000000000208',
+		        '00000000-0000-0000-0000-000000000219',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending', now())
 	`); err != nil {
