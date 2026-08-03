@@ -249,6 +249,7 @@ func TestMigrations_00119_DeploymentsSidecarLayers(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("insert two rows under the cap: %v", err)
 	}
+	var err error
 	_, err = pool.Exec(ctx, `
 		insert into deployment_sidecar_layers
 		    (deployment_id, sidecar_name, storage_key, bytes, content_digest)

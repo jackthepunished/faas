@@ -6465,6 +6465,14 @@ func (s *PgStore) ListEventsBySidecar(ctx context.Context, sidecarName string, s
 	// honest (an unknown kind won't quietly satisfy the
 	// filter) and matches the in-memory twin's filter in
 	// memstore.go.
+	//
+	// Index: events_sidecar_name_idx (migration 00121) is a
+	// partial expression index restricted to the same closed
+	// kinds, keyed on (data->>'sidecar_name')::text. The
+	// planner picks it up for this query's predicate (verified
+	// by TestMigrations_00121_EventsSidecarNameIdx's EXPLAIN
+	// check). A future PR that adds a new closed sidecar-kind
+	// must update the index's WHERE clause in lockstep.
 	const kindFilter = "kind in ('wake.sidecar_init_exit', 'wake.sidecar_restart')"
 	var rows pgx.Rows
 	var err error
