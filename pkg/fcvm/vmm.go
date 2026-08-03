@@ -1445,11 +1445,13 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 	// need that contract here (guest-init parses each file once
 	// at boot) but the determinism is free.
 	manifest := workloadManifest{
-		Name:      w.Name,
-		Type:      w.Type,
-		RamMB:     w.RamMB,
-		Port:      w.Port,
-		Essential: w.Essential,
+		Name:       w.Name,
+		Type:       w.Type,
+		RamMB:      w.RamMB,
+		Port:       w.Port,
+		Essential:  w.Essential,
+		Cmd:        w.Cmd,
+		Entrypoint: w.Entrypoint,
 		// StorageKey is omitted: the guest doesn't need to know
 		// the host-side path; it just reads the workload spec
 		// from the manifest and ignores the storage key. ADR-069
@@ -1470,23 +1472,24 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 }
 
 // projectedWorkloadManifestBytes (issue #463 / ADR-069 / PR-B
-// review finding #7) returns a conservative upper bound on the
-// marshalled workloadManifest byte size for the given input.
-// The struct shape is fixed; only Name can vary, and JSON's
-// AppendQuote escapes 6 characters (`\`, `"`, and control
-// chars) on top of the raw byte count. The estimate is
-// deliberately generous — overestimating just rejects a
-// payload that wouldn't have hit the cap anyway, so the
-// false-positive rate is zero. The projection runs BEFORE
-// json.Marshal so an unbounded Name can't allocate
-// without bound during marshalling.
+// review finding #7; PR-C §6 extends for cmd/entrypoint) returns
+// a conservative upper bound on the marshalled workloadManifest
+// byte size for the given input. The struct shape is fixed; only
+// Name + Cmd + Entrypoint can vary, and JSON's AppendQuote escapes
+// 6 characters (`\`, `"`, and control chars) on top of the raw
+// byte count. The estimate is deliberately generous —
+// overestimating just rejects a payload that wouldn't have hit
+// the cap anyway, so the false-positive rate is zero. The
+// projection runs BEFORE json.Marshal so an unbounded Name can't
+// allocate without bound during marshalling.
 //
 // Layout:
 //
-//	{"essential":BOOL,"name":"...","port":INT,"ram_mb":INT,"type":"..."}
+//	{"essential":BOOL,"name":"...","port":INT,"ram_mb":INT,"type":"...",
+//	 "cmd":[...],"entrypoint":[...]}
 //
 // Braces, colons, commas, and quoted keys/values dominate the
-// fixed overhead; only Name contributes variable bytes.
+// fixed overhead; Name + Cmd + Entrypoint contribute variable bytes.
 func projectedWorkloadManifestBytes(w WorkloadSpec) int64 {
 	// Per JSON spec, the 6 chars that get escaped (\ " \b \t
 	// \n \f \r plus U+0000-U+001F) take 2 bytes each after
@@ -1495,12 +1498,29 @@ func projectedWorkloadManifestBytes(w WorkloadSpec) int64 {
 	// safe DNS-1123 labels with no escapes — the multiplier
 	// is just safety margin).
 	nameBytes := int64(len(w.Name)) * 2
-	// Two int fields (port, ram_mb) and a bool. 11 bytes per
-	// int is the worst case for a 32-bit value; 5 bytes for
-	// "false". The 3 quoted keys + 2 numeric values + 1 bool
-	// contribute a fixed overhead; we over-estimate at 64.
-	const fixedOverhead = 64
-	return nameBytes + fixedOverhead
+	// Cmd/Entrypoint (PR-C §6): each entry contributes its
+	// quoted length + 2 bytes for the comma + 2 bytes for the
+	// brackets. The 2× escape multiplier is the same conservative
+	// bound as Name — images with shell-style command lines
+	// (e.g. `["/bin/sh","-c","echo $HOME"]`) are mostly safe
+	// ASCII, but the multiplier guards against a deploy that
+	// ships a control-character-laden argument.
+	cmdBytes := int64(0)
+	for _, c := range w.Cmd {
+		cmdBytes += int64(len(c)) * 2
+	}
+	entrypointBytes := int64(0)
+	for _, e := range w.Entrypoint {
+		entrypointBytes += int64(len(e)) * 2
+	}
+	// Two int fields (port, ram_mb) and a bool + 2 array
+	// fields. 11 bytes per int is the worst case for a 32-bit
+	// value; 5 bytes for "false". The 5 quoted keys + 2 numeric
+	// values + 1 bool + 2 array brackets contribute a fixed
+	// overhead; we over-estimate at 128 to absorb the new
+	// cmd/entrypoint keys.
+	const fixedOverhead = 128
+	return nameBytes + cmdBytes + entrypointBytes + fixedOverhead
 }
 
 // projectedWorkloadRosterBytes (issue #463 / ADR-069 / PR-B
@@ -1528,22 +1548,26 @@ func projectedWorkloadRosterBytes(main WorkloadSpec, sidecars []WorkloadSpec) in
 }
 
 // workloadManifest is the on-disk shape of /etc/faas/workload.json
-// (issue #463 / ADR-069 / PR-B). The field set is the minimum
-// guest-init needs to fork/exec a workload: Name + Type for the
-// supervisor's map key, RamMB for the in-guest cgroup partition
-// (PR-B's primary OOM isolation), Port for the port-normalization
-// wiring (ADR-053), and Essential for the restart policy. Cmd is
-// left to the per-workload OVERLAY content (the sidecar image's
-// entrypoint) — the manifest is the vmmd-side envelope, not the
-// customer-supplied entrypoint. The guest-init reads the customer's
-// entrypoint from the image's own /etc/faas/app.json, which imaged
-// stencils at build time.
+// (issue #463 / ADR-069 / PR-B; issue #463 / PR-C §6 adds cmd/entrypoint).
+// The field set is the minimum guest-init needs to fork/exec a workload:
+// Name + Type for the supervisor's map key, RamMB for the in-guest cgroup
+// partition (PR-B's primary OOM isolation), Port for the port-normalization
+// wiring (ADR-053), and Essential for the restart policy. Cmd/Entrypoint
+// override the per-workload image's baked entrypoint (the sidecar
+// image's /usr/local/bin/start.sh, the main workload's app.json).
+//
+// Both fields are omitempty so the legacy PR-B path (no customer
+// override) writes the same byte shape as before — dashboards
+// and pre-§6 guest-init binaries that don't recognize cmd still
+// parse the manifest byte-for-byte.
 type workloadManifest struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	RamMB     int    `json:"ram_mb"`
-	Port      int    `json:"port"`
-	Essential bool   `json:"essential"`
+	Cmd        []string `json:"cmd,omitempty"`
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Essential  bool     `json:"essential"`
+	Name       string   `json:"name"`
+	Port       int      `json:"port"`
+	RamMB      int      `json:"ram_mb"`
+	Type       string   `json:"type"`
 }
 
 // workloadRosterPath is the in-guest location guest-init reads

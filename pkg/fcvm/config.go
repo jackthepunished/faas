@@ -434,11 +434,12 @@ func JailerCommand(s JailerSpec) []string {
 	}
 }
 
-// WorkloadSpec (issue #463 / ADR-069 / PR-B) is one workload's
-// per-drive shape. The main workload is Workloads[0]; sidecars
-// are Workloads[1..N]. Each entry carries the StorageBackend key
-// for the drive's ext4 + the FC Drive.DriveID vmmd mounts inside
-// the jail chroot + the workload's cgroup RAM ceiling.
+// WorkloadSpec (issue #463 / ADR-069 / PR-B; issue #463 / PR-C §6
+// adds cmd/entrypoint) is one workload's per-drive shape. The main
+// workload is Workloads[0]; sidecars are Workloads[1..N]. Each
+// entry carries the StorageBackend key for the drive's ext4 + the
+// FC Drive.DriveID vmmd mounts inside the jail chroot + the
+// workload's cgroup RAM ceiling.
 //
 // Name is the customer-chosen sidecar name (alpha-num +
 // dash + underscore, max 32 chars) — main is the literal "main".
@@ -449,6 +450,16 @@ func JailerCommand(s JailerSpec) []string {
 //
 // RamMB is the per-workload cgroup memory.max. 0 = "absent /
 // inherit the plan RAM" (the common case for the main workload).
+//
+// Cmd and Entrypoint (PR-C §6) are the customer-image override
+// surface. Empty (the default) means "use the baked image
+// entrypoint": /usr/local/bin/start.sh for sidecars, the main
+// workload's baked entrypoint for the main workload. When non-empty,
+// guest-init exec's Entrypoint[0] with Entrypoint[1:] as argv[0:]
+// and Cmd as the append argv. Pattern mirrors the OCI image-spec
+// shape so a deploy that ships a Dockerfile (or imaged) has a
+// single canonical way to override the entrypoint without stamping
+// a new base layer.
 type WorkloadSpec struct {
 	Name       string // "main" for the main workload; sidecar name for the rest
 	Type       string // "main", "init", "sidecar"
@@ -457,4 +468,6 @@ type WorkloadSpec struct {
 	RamMB      int    // 0 = inherit plan RAM
 	Port       int    // 0 = inherit main port (8080)
 	Essential  bool   // type=="init" + essential=true → fail deploy on non-zero exit
+	Cmd        []string
+	Entrypoint []string
 }

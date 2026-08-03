@@ -77,11 +77,13 @@ import (
 // counterpart compiles on every platform but emits identical
 // JSON because the field tags match exactly.
 type workloadSpec struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"` // "main" | "init" | "sidecar"
-	RamMB     int    `json:"ram_mb"`
-	Port      int    `json:"port"`
-	Essential bool   `json:"essential"`
+	Cmd        []string `json:"cmd,omitempty"`
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Essential  bool     `json:"essential"`
+	Name       string   `json:"name"`
+	Port       int      `json:"port"`
+	RamMB      int      `json:"ram_mb"`
+	Type       string   `json:"type"` // "main" | "init" | "sidecar"
 }
 
 // workloadRosterPath is the deployment-level roster location
@@ -374,11 +376,21 @@ func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log 
 // the sidecar's entrypoint is /usr/local/bin/start.sh by
 // convention.
 func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Supervisor) error {
-	// The sidecar's cmd is the customer-image default.
-	// PR-C will read this from a per-workload field; today
-	// every sidecar image ships /usr/local/bin/start.sh
-	// (imaged's stamp during buildSidecarLayer).
-	cmd := exec.Command("/usr/local/bin/start.sh")
+	// PR-C §6: the customer-image override surface. The
+	// manifest on the per-drive ext4 carries Cmd/Entrypoint
+	// when the deploy ships a custom entrypoint (e.g. a
+	// Dockerfile that EXPOSE's an alternate binary). The
+	// precedence matches the OCI image-spec:
+	//   - Entrypoint non-empty: exec Entrypoint[0] with
+	//     Entrypoint[1:] as argv[0:].
+	//   - Entrypoint empty + Cmd non-empty: exec Cmd[0]
+	//     with Cmd[1:] as argv[1:].
+	//   - Both empty: fall back to the baked image
+	//     entrypoint (/usr/local/bin/start.sh).
+	// The fallback preserves the PR-B contract for images
+	// that don't set cmd/entrypoint.
+	argv0, argv := resolveSidecarCommand(spec)
+	cmd := exec.Command(argv0, argv...)
 	cmd.Env = os.Environ()
 	// Sidecar env can layer on top of the customer's baked
 	// env (imaged wrote the per-sidecar env into the ext4 at
@@ -413,4 +425,27 @@ func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Super
 		return fmt.Errorf("run sidecar %s: %w", spec.Name, err)
 	}
 	return nil
+}
+
+// resolveSidecarCommand (PR-C §6) is the pure-argv derivation
+// helper that turns a workloadSpec into the (argv0, argv) tuple
+// runSidecar hands to exec.Command. Extracted so the precedence
+// rules (Entrypoint > Cmd > baked start.sh) are testable
+// without a real fork. The fallback path (/usr/local/bin/start.sh)
+// preserves the PR-B contract for images that don't set
+// cmd/entrypoint at deploy time.
+func resolveSidecarCommand(spec workloadSpec) (argv0 string, argv []string) {
+	switch {
+	case len(spec.Entrypoint) > 0:
+		argv0 = spec.Entrypoint[0]
+		argv = append([]string(nil), spec.Entrypoint[1:]...)
+		argv = append(argv, spec.Cmd...)
+	case len(spec.Cmd) > 0:
+		argv0 = spec.Cmd[0]
+		argv = append([]string(nil), spec.Cmd[1:]...)
+	default:
+		argv0 = "/usr/local/bin/start.sh"
+		argv = nil
+	}
+	return argv0, argv
 }
