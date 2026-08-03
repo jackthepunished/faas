@@ -202,7 +202,7 @@ func TestMigrations_00127_DeploymentsSidecarLayers(t *testing.T) {
 	var idxCount int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from pg_indexes
-		where schemaname = 'public'
+		where schemaname = current_schema()
 		  and tablename = 'deployment_sidecar_layers'
 		  and indexname = 'deployment_sidecar_layers_storage_key_idx'
 	`).Scan(&idxCount); err != nil {

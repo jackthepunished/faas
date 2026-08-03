@@ -45,11 +45,15 @@ func TestMigrations_00128_EventsSidecarNameIdx(t *testing.T) {
 	}
 
 	// (2) Index existence. Pin the index name so a future
-	// renamer surfaces in CI.
+	// renamer surfaces in CI. The schema filter uses
+	// current_schema() rather than 'public' literal because
+	// pgtest isolates every test in its own search_path
+	// schema, so the index lands in the test schema, not
+	// public.
 	var idxCount int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from pg_indexes
-		where schemaname = 'public'
+		where schemaname = current_schema()
 		  and tablename = 'events'
 		  and indexname = 'events_sidecar_name_idx'
 	`).Scan(&idxCount); err != nil {
@@ -74,7 +78,7 @@ func TestMigrations_00128_EventsSidecarNameIdx(t *testing.T) {
 	var indexDef string
 	if err := pool.QueryRow(ctx, `
 		select indexdef from pg_indexes
-		where schemaname = 'public'
+		where schemaname = current_schema()
 		  and tablename = 'events'
 		  and indexname = 'events_sidecar_name_idx'
 	`).Scan(&indexDef); err != nil {
