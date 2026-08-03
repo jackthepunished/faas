@@ -182,6 +182,9 @@ from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
 from .set_grace_window_request import SetGraceWindowRequest
 from .set_password_request import SetPasswordRequest
+from .sidecar import Sidecar
+from .sidecar_env import SidecarEnv
+from .sidecar_type import SidecarType
 from .storage_usage_list_response import StorageUsageListResponse
 from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_follow import StreamAppLogsFollow
@@ -384,6 +387,9 @@ __all__ = (
     "SessionsRevokeAllResponse",
     "SetGraceWindowRequest",
     "SetPasswordRequest",
+    "Sidecar",
+    "SidecarEnv",
+    "SidecarType",
     "StorageUsageListResponse",
     "StorageUsageResponse",
     "StreamAppLogsFollow",
