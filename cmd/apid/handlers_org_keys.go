@@ -92,7 +92,7 @@ func (s *server) listOrgAPIKeys(w http.ResponseWriter, r *http.Request, _ state.
 		api.WriteProblem(w, p)
 		return
 	}
-	keys, err := s.store.ListOrgAPIKeys(ctx(r), mem.OrgID)
+	keys, err := s.store.ListOrgAPIKeys(r.Context(), mem.OrgID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list keys"))
 		return
@@ -144,7 +144,7 @@ func (s *server) createOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 	// minted against two orgs still counts against the single
 	// Plan.KeysMax bucket.
 	limits := api.MustLimitsFor(acct.Plan)
-	if cur, cerr := s.store.CountAPIKeys(ctx(r), acct.ID); cerr == nil && cur >= limits.KeysMax {
+	if cur, cerr := s.store.CountAPIKeys(r.Context(), acct.ID); cerr == nil && cur >= limits.KeysMax {
 		api.WriteProblem(w, api.ErrAPIKeyLimitExceeded(limits, cur))
 		return
 	} else if cerr != nil {
@@ -170,12 +170,12 @@ func (s *server) createOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 		t := time.Now().UTC().Add(time.Duration(api.DefaultAPIKeyLifetimeDays) * 24 * time.Hour)
 		expiresAt = &t
 	}
-	k, err := s.store.CreateOrgAPIKey(ctx(r), mem.OrgID, acct.ID, hash, req.Label, scopes, expiresAt)
+	k, err := s.store.CreateOrgAPIKey(r.Context(), mem.OrgID, acct.ID, hash, req.Label, scopes, expiresAt)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"created","org":"`+mem.OrgID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"created","org":"`+mem.OrgID+`"}`)
 	s.log.Info("api key created", "key", k.ID, "account", acct.ID, "org", mem.OrgID)
 	auditPayload := map[string]any{
 		"key_id": k.ID,
@@ -185,7 +185,7 @@ func (s *server) createOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 	if k.ExpiresAt != nil {
 		auditPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	s.audit.Emit(ctx(r), "api_key.created", &acct.ID, auditPayload)
+	s.audit.Emit(r.Context(), "api_key.created", &acct.ID, auditPayload)
 	resp := orgAPIKeyResponse(k)
 	resp.Plaintext = plaintext
 	writeJSON(w, http.StatusCreated, resp)
@@ -215,7 +215,7 @@ func (s *server) getOrgAPIKey(w http.ResponseWriter, r *http.Request, _ state.Ac
 		return
 	}
 	id := r.PathValue("id")
-	k, err := s.store.GetOrgAPIKey(ctx(r), mem.OrgID, id)
+	k, err := s.store.GetOrgAPIKey(r.Context(), mem.OrgID, id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -251,14 +251,14 @@ func (s *server) revokeOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	id := r.PathValue("id")
-	updated, err := s.store.RevokeOrgAPIKey(ctx(r), mem.OrgID, id)
+	updated, err := s.store.RevokeOrgAPIKey(r.Context(), mem.OrgID, id)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not revoke key"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"revoked","org":"`+mem.OrgID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"revoked","org":"`+mem.OrgID+`"}`)
 	s.log.Info("api key revoked", "key", updated.ID, "account", acct.ID, "org", mem.OrgID)
-	s.audit.Emit(ctx(r), "api_key.revoked", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "api_key.revoked", &acct.ID, map[string]any{
 		"key_id": updated.ID,
 		"scopes": updated.Scopes,
 		"reason": "manual",
@@ -314,7 +314,7 @@ func (s *server) rotateOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 	// same helper the legacy rotateKey uses). nil = plan default
 	// (api.DefaultAPIKeyGraceWindowDays = 7).
 	var graceWindow time.Duration
-	gw, err := s.resolveGraceWindow(ctx(r), acct.ID)
+	gw, err := s.resolveGraceWindow(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not resolve grace window"))
 		return
@@ -333,7 +333,7 @@ func (s *server) rotateOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	id := r.PathValue("id")
-	newKey, oldKey, err := s.store.RotateOrgAPIKey(ctx(r), mem.OrgID, id, hash, req.Label, graceWindow)
+	newKey, oldKey, err := s.store.RotateOrgAPIKey(r.Context(), mem.OrgID, id, hash, req.Label, graceWindow)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -346,7 +346,7 @@ func (s *server) rotateOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrCapacity("could not rotate key"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"rotated","org":"`+mem.OrgID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"rotated","org":"`+mem.OrgID+`"}`)
 	var graceWindowDays int
 	if graceWindow > 0 {
 		graceWindowDays = int(graceWindow / (24 * time.Hour))
@@ -355,7 +355,7 @@ func (s *server) rotateOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 	// org_id. The legacy event does NOT fire on this path (the
 	// canonical /v1/orgs/{slug}/keys surface only emits the new
 	// event).
-	s.audit.Emit(ctx(r), "api_key.rotated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "api_key.rotated", &acct.ID, map[string]any{
 		"old_key_id":         oldKey.ID,
 		"new_key_id":         newKey.ID,
 		"grace_window_days":  graceWindowDays,

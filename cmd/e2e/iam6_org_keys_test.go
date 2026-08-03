@@ -146,10 +146,22 @@ func TestE2E_OrgKeysList(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("decode list: %v (body=%s)", err, raw)
 	}
-	if len(body.Keys) != 1 {
-		t.Fatalf("keys = %d, want 1 (body=%s)", len(body.Keys), raw)
+	// SeedAccount bootstraps a bootstrap-time "e2e" admin key on
+	// every fresh account, so the org-scoped list contains at least
+	// two rows: the seed key + the one we just minted. Locate the
+	// minted row by ID rather than asserting the total count, so
+	// the assertion survives harness evolution.
+	var mintedListed *apiKeyWire
+	for i := range body.Keys {
+		if body.Keys[i].ID == minted.ID {
+			mintedListed = &body.Keys[i]
+			break
+		}
 	}
-	k := body.Keys[0]
+	if mintedListed == nil {
+		t.Fatalf("minted key %q not in list (body=%s)", minted.ID, raw)
+	}
+	k := *mintedListed
 	if k.ID != minted.ID {
 		t.Errorf("id = %q, want %q", k.ID, minted.ID)
 	}

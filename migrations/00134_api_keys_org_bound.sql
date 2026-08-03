@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00127_api_keys_org_bound.sql — IAM-6 (issue #190 / ADR-061, PR 6).
+-- 00134_api_keys_org_bound.sql — IAM-6 (issue #190 / ADR-061, PR 6).
 --
 -- The `api_keys.org_id` column was added nullable in migration 00099
 -- (alongside the partial index `api_keys_org_id_idx` ON (org_id)

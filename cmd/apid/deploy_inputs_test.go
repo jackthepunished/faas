@@ -104,7 +104,8 @@ func TestValidateTarballShape_RejectsAbsolutePath(t *testing.T) {
 	body := buildTestTarGz(t, entries, nil)
 	path := writeTarToSpool(t, dir, body)
 
-	if prob := validateTarballShape(path); prob == nil {
+	prob := validateTarballShape(path)
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected reject for absolute path entry, got nil problem")
 	}
 }
@@ -118,7 +119,8 @@ func TestValidateTarballShape_RejectsDotDotPath(t *testing.T) {
 	body := buildTestTarGz(t, entries, nil)
 	path := writeTarToSpool(t, dir, body)
 
-	if prob := validateTarballShape(path); prob == nil {
+	prob := validateTarballShape(path)
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected reject for .. entry, got nil problem")
 	}
 }
@@ -139,7 +141,8 @@ func TestValidateTarballShape_RejectsSymlinkAbsoluteLinkname(t *testing.T) {
 	body := buildTestTarGz(t, entries, nil)
 	path := writeTarToSpool(t, dir, body)
 
-	if prob := validateTarballShape(path); prob == nil {
+	prob := validateTarballShape(path)
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected reject for symlink with absolute Linkname, got nil problem")
 	}
 }
@@ -158,7 +161,8 @@ func TestValidateTarballShape_RejectsSymlinkDotDotLinkname(t *testing.T) {
 	body := buildTestTarGz(t, entries, nil)
 	path := writeTarToSpool(t, dir, body)
 
-	if prob := validateTarballShape(path); prob == nil {
+	prob := validateTarballShape(path)
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected reject for symlink with .. Linkname, got nil problem")
 	}
 }
@@ -179,7 +183,8 @@ func TestValidateTarballShape_RejectsHardlinkAbsoluteLinkname(t *testing.T) {
 	body := buildTestTarGz(t, entries, nil)
 	path := writeTarToSpool(t, dir, body)
 
-	if prob := validateTarballShape(path); prob == nil {
+	prob := validateTarballShape(path)
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected reject for hardlink with absolute Linkname, got nil problem")
 	}
 }
@@ -209,7 +214,8 @@ func TestValidateTarballShape_FileCountBoundary(t *testing.T) {
 	// 10,001 entries: must reject.
 	over := buildTestTarGz(t, mkEntries(10001), nil)
 	path = writeTarToSpool(t, dir, over)
-	if prob := validateTarballShape(path); prob == nil {
+	prob := validateTarballShape(path)
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("10001 entries should be rejected, got nil problem")
 	}
 
@@ -246,11 +252,11 @@ func TestValidateTarballShape_EscapeBeforeCountCap(t *testing.T) {
 	path := writeTarToSpool(t, dir, raw)
 
 	prob := validateTarballShape(path)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected reject, got nil problem")
 	}
-	if !strings.Contains(prob.Detail, "symlink/hardlink") {
-		t.Errorf("expected symlink-specific detail, got %q (a flipped order would surface as 'too many files')", prob.Detail)
+	if !strings.Contains(prob.Detail, "symlink/hardlink") { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("expected symlink-specific detail, got %q (a flipped order would surface as 'too many files')", prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 }
 
@@ -313,11 +319,11 @@ func TestValidateAndSpool_ByteCapBoundary(t *testing.T) {
 	part2, cleanup2 := newMultipartFilePart(t, "src.tar.gz", raw2)
 	defer cleanup2()
 	_, _, prob = validateAndSpool(part2, limits)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("over-cap payload should reject, got nil problem")
 	}
-	if prob.Code != api.CodeSourceTooLarge {
-		t.Errorf("expected CodeSourceTooLarge, got %q (detail=%q)", prob.Code, prob.Detail)
+	if prob.Code != api.CodeSourceTooLarge { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("expected CodeSourceTooLarge, got %q (detail=%q)", prob.Code, prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 }
 
@@ -684,11 +690,11 @@ func TestScanForStatefulShape_DockerfileFlagWithoutDockerfile(t *testing.T) {
 	})
 	path := writeTarToSpool(t, dir, raw)
 	prob := scanForStatefulShape(path, true)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected fail-fast on missing Dockerfile, got nil")
 	}
-	if prob.Code != api.CodeSourceInvalid {
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeSourceInvalid)
+	if prob.Code != api.CodeSourceInvalid { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeSourceInvalid) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 	if !strings.Contains(prob.Detail, "Dockerfile") {
 		t.Errorf("detail %q does not mention Dockerfile", prob.Detail)
@@ -734,11 +740,11 @@ func TestScanForStatefulShape_TopLevelDataDir(t *testing.T) {
 	})
 	path := writeTarToSpool(t, dir, raw)
 	prob := scanForStatefulShape(path, false)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected rejection, got nil")
 	}
-	if prob.Code != api.CodeStatelessOnlyViolation {
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	if prob.Code != api.CodeStatelessOnlyViolation { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 	if !strings.Contains(prob.Detail, "data/") {
 		t.Errorf("detail %q does not mention data/", prob.Detail)
@@ -756,11 +762,11 @@ func TestScanForStatefulShape_TopLevelDBDir(t *testing.T) {
 	}, map[string][]byte{"myproject/db/main.sqlite": {}})
 	path := writeTarToSpool(t, dir, raw)
 	prob := scanForStatefulShape(path, false)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected rejection, got nil")
 	}
-	if prob.Code != api.CodeStatelessOnlyViolation {
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	if prob.Code != api.CodeStatelessOnlyViolation { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 	if !strings.Contains(prob.Detail, "db/") {
 		t.Errorf("detail %q does not mention db/", prob.Detail)
@@ -782,11 +788,11 @@ func TestScanForStatefulShape_DockerfileVolume(t *testing.T) {
 	})
 	path := writeTarToSpool(t, dir, raw)
 	prob := scanForStatefulShape(path, false)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected rejection, got nil")
 	}
-	if prob.Code != api.CodeStatelessOnlyViolation {
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
+	if prob.Code != api.CodeStatelessOnlyViolation { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 	if !strings.Contains(prob.Detail, "VOLUME") || !strings.Contains(prob.Detail, "/var/lib/myapp") {
 		t.Errorf("detail %q does not mention VOLUME /var/lib/myapp", prob.Detail)
@@ -806,11 +812,11 @@ func TestScanForStatefulShape_DockerfileMkfs(t *testing.T) {
 	})
 	path := writeTarToSpool(t, dir, raw)
 	prob := scanForStatefulShape(path, false)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected rejection, got nil")
 	}
-	if !strings.Contains(prob.Detail, "mkfs") {
-		t.Errorf("detail %q does not mention mkfs", prob.Detail)
+	if !strings.Contains(prob.Detail, "mkfs") { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("detail %q does not mention mkfs", prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 }
 
@@ -827,11 +833,11 @@ func TestScanForStatefulShape_DockerfileMountExt4(t *testing.T) {
 	})
 	path := writeTarToSpool(t, dir, raw)
 	prob := scanForStatefulShape(path, false)
-	if prob == nil {
+	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatal("expected rejection, got nil")
 	}
-	if !strings.Contains(prob.Detail, "mkfs") && !strings.Contains(prob.Detail, "mount") {
-		t.Errorf("detail %q does not mention mkfs/mount", prob.Detail)
+	if !strings.Contains(prob.Detail, "mkfs") && !strings.Contains(prob.Detail, "mount") { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("detail %q does not mention mkfs/mount", prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 }
 

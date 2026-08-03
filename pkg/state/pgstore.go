@@ -59,20 +59,25 @@ const heartbeatHistoryMaxRows = 2000
 // --- accounts ---------------------------------------------------------------
 
 func (s *PgStore) CreateAccount(ctx context.Context, email string, plan api.Plan) (Account, error) {
-	row := s.pool.QueryRow(ctx,
-		`insert into accounts (email, plan, status) values ($1, $2, 'active') returning id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required`,
-		email, string(plan))
-	acct, err := scanAccount(row)
+	// PR 6 (issue #190 / IAM-6 / ADR-061): CreateAccount now ALSO
+	// writes the personal-org + owner-membership rows so the legacy
+	// entry point stays drop-in compatible with the migration 00129
+	// NOT NULL flip on api_keys.org_id. Pre-PR-6 callers (CLI login,
+	// dev seed, all pgstore tests) used CreateAccount + then a
+	// CreateAPIKey* that joins on the personal org — the join
+	// returned NULL after PR-6's flip and 23502'd every insert.
+	// CreateAccountWithPersonalOrg (PR 3) is the canonical path and
+	// is the same shape under the hood; we delegate to it so the
+	// logic is in one place. PR 9 deletes CreateAccount when the
+	// legacy dual-write window closes.
+	res, err := s.CreateAccountWithPersonalOrg(ctx, CreateAccountWithPersonalOrgParams{
+		Email: email,
+		Plan:  plan,
+	})
 	if err != nil {
-		// Funnel through mapErr so a unique-email collision surfaces as
-		// state.ErrConflict (the same shape every other insert returns).
-		// A future hardening could use `on conflict (email) do nothing
-		// returning ...` to make the race atomic; today the handler
-		// ladder AccountByEmail → CreateAccount relies on this funnel
-		// to detect the dup-key outcome.
-		return Account{}, mapErr(err)
+		return Account{}, err
 	}
-	return acct, nil
+	return res.Account, nil
 }
 
 // CreateAccountWithPersonalOrg is the PR 3 canonical

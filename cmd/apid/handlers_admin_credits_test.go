@@ -108,11 +108,11 @@ func TestIssueCredit_HappyPath(t *testing.T) {
 			break
 		}
 	}
-	if found == nil {
+	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
 		t.Fatalf("credit.issued audit row missing for account %s", target.ID)
 	}
-	if found.Actor != "apid" {
-		t.Errorf("audit Actor = %q, want apid", found.Actor)
+	if found.Actor != "apid" { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+		t.Errorf("audit Actor = %q, want apid", found.Actor) //nolint:staticcheck // t.Fatal on prior line proves non-nil
 	}
 }
 

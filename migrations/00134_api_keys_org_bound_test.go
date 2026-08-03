@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00127_api_keys_org_bound.sql
+// Migration-apply test for 00134_api_keys_org_bound.sql
 // (issue #190 / IAM-6 / ADR-061, PR 6). Pins the org-bound
 // `api_keys.org_id` not-null flip:
-//  1. Migration set applies cleanly through 00127.
+//  1. Migration set applies cleanly through 00134.
 //  2. The api_keys.org_id column is NOT NULL after the flip.
 //  3. Pre-existing api_keys rows get a deterministic org_id
 //     stamped via the personal-org backfill shape (matches 00105).
@@ -23,7 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00127_APIKeysOrgBound(t *testing.T) {
+func TestMigrations_00134_APIKeysOrgBound(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -88,7 +88,7 @@ func TestMigrations_00127_APIKeysOrgBound(t *testing.T) {
 
 	// Seed two api_keys rows against the seeded accounts. We use
 	// raw INSERTs so we land in the "pre-PR-6: api_keys.org_id is
-	// NULL" state, exactly the shape the 00127 backfill targets.
+	// NULL" state, exactly the shape the 00134 backfill targets.
 	type seedKey struct {
 		id, accountID, hash string
 	}
@@ -106,7 +106,7 @@ func TestMigrations_00127_APIKeysOrgBound(t *testing.T) {
 		}
 	}
 
-	// Run the 00127 backfill UPDATE directly (same SQL the migration
+	// Run the 00134 backfill UPDATE directly (same SQL the migration
 	// runs). Updating seeded rows is the deterministic test — the
 	// migration itself has just-applied above.
 	if _, err := pool.Exec(ctx, `
@@ -117,7 +117,7 @@ func TestMigrations_00127_APIKeysOrgBound(t *testing.T) {
 		   AND o.personal_org = true
 		   AND k.org_id IS NULL
 	`); err != nil {
-		t.Fatalf("00127 update: %v", err)
+		t.Fatalf("00134 update: %v", err)
 	}
 
 	// Probe 1: every api_keys row has a non-null org_id.
@@ -128,7 +128,7 @@ func TestMigrations_00127_APIKeysOrgBound(t *testing.T) {
 		t.Fatalf("null org_id probe: %v", err)
 	}
 	if nullOrgIDCount != 0 {
-		t.Errorf("api_keys rows with NULL org_id after 00127: %d", nullOrgIDCount)
+		t.Errorf("api_keys rows with NULL org_id after 00134: %d", nullOrgIDCount)
 	}
 
 	// Probe 2: every api_keys row's org_id matches its account's
@@ -188,8 +188,8 @@ func TestMigrations_00127_APIKeysOrgBound(t *testing.T) {
 	}
 }
 
-func TestMigrations_00127_ReplaySafety(t *testing.T) {
-	// The 00127 update is guarded by `WHERE k.org_id IS NULL`, so a
+func TestMigrations_00134_ReplaySafety(t *testing.T) {
+	// The 00134 update is guarded by `WHERE k.org_id IS NULL`, so a
 	// second MigrateUp must be a no-op.
 	ctx := context.Background()
 	pool := pgtest.Open(t)
