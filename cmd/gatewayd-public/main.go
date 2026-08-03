@@ -5,7 +5,7 @@
 //   - :443 TLS termination with certmagic GetCertificate
 //   - pkg/httpsec outer wrapper (HSTS / CSP nonce / X-Frame-Options /
 //     Referrer-Policy / X-Content-Type-Options / Permissions-Policy)
-//   - /healthz, /readyz, /metrics on loopback :9090
+//   - /healthz, /readyz, /metrics on loopback 127.0.0.1:9090
 //   - Drain semantics: SIGTERM → flip /readyz → wait in-flight → Shutdown
 //   - Cert-bundle leader election + per-bundle replication
 //     (pkg/gateway/certsync)
@@ -29,7 +29,9 @@
 // Operators configure gatewayd-public via:
 //   - TOML (CertMagicConfig, listenAddr, internalProxyAddr, replicaAddr)
 //   - env overrides for the loopback paths (FAAS_INTERNAL_SOCKET,
-//     FAAS_REPLICA_SOCKET) — same pattern as the legacy FAAS_SCHEDD_SOCKET
+//     FAAS_PUBLIC_LISTEN_ADDR, FAAS_PUBLIC_CONTROL_ADDR,
+//     FAAS_HETZNER_DNS_TOKEN_PATH) — same pattern as the legacy
+//     FAAS_SCHEDD_SOCKET.
 package main
 
 import (
@@ -57,11 +59,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-// getEnv is the httpsec.HSTSEnabledFromEnv-shaped adapter. The
-// signature requires func(string) string (no fallback) so we wrap
-// envOr here.
-func getEnv(k string) string { return envOr(k, "") }
-
 // domainLookup adapts *state.PgStore.DomainByName to the
 // gateway.OnDemandLookup signature (which returns `any`). It also
 // maps state.ErrNotFound → gateway.ErrNotFound so the allowlist's
@@ -80,21 +77,31 @@ func domainLookup(store *state.PgStore) gateway.OnDemandLookup {
 	}
 }
 
-// envOr is the canonical env-override helper (per gatewayd/main.go).
-// Empty env falls back to `def`.
-func envOr(envKey, def string) string {
-	if v := os.Getenv(envKey); v != "" {
+// hstsEnabledFromEnv is the httpsec.HSTSEnabledFromEnv-shaped
+// adapter. Note we use os.LookupEnv here (per the FAAS_APID_METRICS_ADDR
+// empty=skip precedent) so an operator who explicitly sets
+// FAAS_HSTS_ENABLED="" can distinguish "unset" from "off".
+func hstsEnabledFromEnv(k string) string {
+	if v, ok := os.LookupEnv(k); ok {
 		return v
 	}
-	return def
+	return ""
 }
 
 const (
 	defaultListenAddr     = ":443"
 	defaultInternalSocket = "/run/faas/gatewayd-internal.sock"
 	defaultStorageDir     = "/var/lib/faas/certs"
-	defaultCAConfigDir    = "/var/lib/faas/ca"
 	defaultAppsDomain     = "apps.gregale.dev"
+	// defaultHetznerTokenPath matches the legacy cmd/gatewayd + the
+	// ansible role's provisioned path. Operators who set the new
+	// daemon's env without the ansible role can still hit the same
+	// file; the ansible role drops the same file at the same path.
+	defaultHetznerTokenPath = "/etc/faas/secrets/hetzner-dns.token"
+	// defaultPublicControlAddr is the loopback control plane
+	// (127.0.0.1, not ":9090" — the legacy gatewayd still binds
+	// :9090 and the two daemons would collide).
+	defaultPublicControlAddr = "127.0.0.1:9090"
 )
 
 func main() {
@@ -143,43 +150,89 @@ func run(ctx context.Context, log *slog.Logger) error {
 	//   1. PG ping — Postgres reachable (separate helper).
 	//   2. Cert bundle — leader-elected and per-replica storage
 	//      ready.
-	//   3. Internal proxy — the unix-socket target is reachable.
-	probe := &gateway.ReadyzProbe{}
-	pgSig, pgStop := gateway.NewPGPingSignal(ctx, pool, 5*time.Second)
+	//   3. Internal proxy — at least one successful proxy request
+	//      in the last 5 s (gated on first real traffic).
+	probe, pgProbeSig, pgStop := setupReadiness(ctx, pool, log)
 	defer pgStop()
-	probe.Register().Set(true, "")
-	pgSig.Report() // touch the side-effect of construction
-	// Cert readiness: optimistic at boot; the certsync loop flips
-	// it false on staleness / leader loss.
+
+	// Certmagic config — production TLS bundle.
+	storageDir := envOr("FAAS_CERT_STORAGE_DIR", defaultStorageDir)
+	appsDomain := envOr("FAAS_APPS_DOMAIN", defaultAppsDomain)
+	hetznerTokenPath := envOr("FAAS_HETZNER_DNS_TOKEN_PATH", defaultHetznerTokenPath)
+	// Token contents go to NewCertMagicConfig — not the file path.
+	// The previous version passed the path; certmagic would then
+	// call the DNS-01 solver with the literal path string and every
+	// challenge would fail. Mirrors cmd/gatewayd/main.go:510-512.
+	hetznerToken, err := loadSecretFile(hetznerTokenPath)
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: Hetzner DNS token: %w", err)
+	}
+	tlsBundle, err := gateway.NewCertMagicConfig(ctx, gateway.TLSConfig{
+		Disabled:                false,
+		WildcardCertDomain:      appsDomain,
+		HetznerDNSAPITokenPath:  hetznerTokenPath,
+		HetznerZone:             appsDomain,
+		StorageDir:              storageDir,
+		ContactEmail:            envOr("FAAS_ACME_CONTACT_EMAIL", "ops@"+appsDomain),
+		OnDemandHTTP01Allowlist: gateway.NewPGAllowlist(domainLookup(pgStore), log),
+	}, hetznerToken, log, nil, nil)
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: certmagic: %w", err)
+	}
+
+	// Certsync leader — elects once at boot. The loop below
+	// re-elects every CertSyncIntervalSeconds so a dead leader is
+	// replaced within one interval.
 	certSig := probe.Register()
 	certSig.Set(true, "")
-	// Internal-proxy readiness: a 1-shot dial probe every 5 s.
-	proxySig := probe.Register()
-	proxySig.Set(true, "")
+	leader := certsync.NewLeader(nodeID, &pgNodeLister{pgStore}, log)
+	if _, err := leader.Recompute(ctx); err != nil {
+		log.Warn("gatewayd-public: certsync initial election failed", "err", err)
+	}
+	go runCertSyncLoop(ctx, log, leader, certSig)
+
+	// Reverse-proxy to gatewayd-internal over the unix socket.
 	internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				d := gateway.NewUnixSocketDialer(internalSocket)
-				conn, derr := d.DialContext(ctx, internalSocket)
-				if derr != nil {
-					proxySig.Set(false, "internal dial failed: "+derr.Error())
-					continue
-				}
-				_ = conn.Close()
-				proxySig.Set(true, "")
-			}
-		}
-	}()
-	// Periodically forward the PG signal's bit onto the registered
-	// probe signal so /readyz reflects Postgres liveness. The
-	// dedicated bridge helper would be nicer; deferred to a
-	// follow-up PR that wires the probe library across daemons.
+	internalURL := &url.URL{Scheme: "http", Host: "gatewayd-internal"}
+	proxy := gateway.NewInternalReverseProxy(
+		gateway.NewUnixSocketDialer(internalSocket),
+		internalURL,
+		log,
+	)
+
+	// Public-facing handler: httpsec outer wrapper → internal proxy.
+	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(hstsEnabledFromEnv))
+	publicHandler := httpsec.Static(proxy)
+
+	// Control mux + listeners.
+	controlMux := gateway.ControlMux(nil, probe.ReadyFunc())
+	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
+	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
+	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux, tlsBundle)
+
+	// Drain orchestration.
+	if err := runDrain(ctx, log, publicSrv, controlSrv, certSig, pgProbeSig, pgStop); err != nil {
+		return err
+	}
+	return nil
+}
+
+// setupReadiness builds the probe + the PG-ping signal whose bit is
+// mirrored onto the probe's registered signal. The mirror is the
+// bug-fixed bridge — the previous version read pgSig.Report() and
+// discarded the values, so PG outages never flipped /readyz. Now
+// the goroutine pushes the bit into the registered signal.
+func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (*gateway.ReadyzProbe, *gateway.ReadySignal, func()) {
+	probe := &gateway.ReadyzProbe{}
+	pgSig, pgStop := gateway.NewPGPingSignal(ctx, pool, 5*time.Second)
+	// Register a dedicated signal that is NOT pre-armed true (the
+	// bridge below is the only writer; it flips it to the PG
+	// liveness on the first tick).
+	pgProbeSig := probe.Register()
+	// Initial state: PG not yet checked. The bridge will flip it
+	// within pgSig's first ping (synchronous, NewPGPingSignal
+	// immediate-ping path).
+	pgProbeSig.Set(false, "pg ping not yet sampled")
 	go func() {
 		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
@@ -189,90 +242,46 @@ func run(ctx context.Context, log *slog.Logger) error {
 				return
 			case <-t.C:
 				ready, reason := pgSig.Report()
-				// We push onto the first registered signal (the
-				// placeholder we set true at boot above). The
-				// intent is "if PG is down, /readyz = 503".
-				_ = ready
-				_ = reason
-			}
-		}
-	}()
-
-	// Certmagic config — production TLS bundle.
-	storageDir := envOr("FAAS_CERT_STORAGE_DIR", defaultStorageDir)
-	appsDomain := envOr("FAAS_APPS_DOMAIN", defaultAppsDomain)
-	hetznerTokenPath := envOr("FAAS_HETZNER_DNS_TOKEN_PATH", "/etc/faas/hetzner-dns.token")
-	tlsBundle, err := gateway.NewCertMagicConfig(ctx, gateway.TLSConfig{
-		Disabled:                false,
-		WildcardCertDomain:      appsDomain,
-		HetznerDNSAPITokenPath:  hetznerTokenPath,
-		HetznerZone:             appsDomain,
-		StorageDir:              storageDir,
-		ContactEmail:            envOr("FAAS_ACME_CONTACT_EMAIL", "ops@"+appsDomain),
-		OnDemandHTTP01Allowlist: gateway.NewPGAllowlist(domainLookup(pgStore), log),
-	}, "", log, nil, nil)
-	if err != nil {
-		return fmt.Errorf("gatewayd-public: certmagic: %w", err)
-	}
-
-	// Certsync leader — elects once at boot. The loop below
-	// re-elects every CertSyncIntervalSeconds so a dead leader is
-	// replaced within one interval.
-	leader := certsync.NewLeader(nodeID, &pgNodeLister{pgStore}, log)
-	if _, err := leader.Recompute(ctx); err != nil {
-		log.Warn("gatewayd-public: certsync initial election failed", "err", err)
-	}
-	go func() {
-		t := time.NewTicker(time.Duration(api.CertSyncIntervalSeconds) * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if _, err := leader.Recompute(ctx); err != nil {
-					log.Warn("gatewayd-public: certsync election refresh failed", "err", err)
-					certSig.Set(false, "certsync election failed: "+err.Error())
+				if ready {
+					pgProbeSig.Set(true, "")
 				} else {
-					certSig.Set(true, "")
+					pgProbeSig.Set(false, reason)
 				}
 			}
 		}
 	}()
+	// Internal-proxy + cert signals are set true at boot; failure
+	// paths in the certsync loop and the proxy itself flip them
+	// false.
+	_ = log // future use: log on first probe state transition
+	return probe, pgProbeSig, pgStop
+}
 
-	// Reverse-proxy to gatewayd-internal over the unix socket.
-	internalURL := &url.URL{Scheme: "http", Host: "gatewayd-internal"}
-	proxy := gateway.NewInternalReverseProxy(
-		gateway.NewUnixSocketDialer(internalSocket),
-		internalURL,
-		log,
-	)
+// runCertSyncLoop re-elects every CertSyncIntervalSeconds so a dead
+// leader is replaced within one interval. The bit lives on `certSig`,
+// which is the operator-visible knob for /readyz.
+func runCertSyncLoop(ctx context.Context, log *slog.Logger, leader *certsync.Leader, certSig *gateway.ReadySignal) {
+	t := time.NewTicker(time.Duration(api.CertSyncIntervalSeconds) * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if _, err := leader.Recompute(ctx); err != nil {
+				log.Warn("gatewayd-public: certsync election refresh failed", "err", err)
+				certSig.Set(false, "certsync election failed: "+err.Error())
+			} else {
+				certSig.Set(true, "")
+			}
+		}
+	}
+}
 
-	// httpsec outer wrapper — HSTS / CSP / X-Frame-Options / etc.
-	publicHandler := httpsec.Static(proxy)
-	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(getEnv))
-
-	// Control-plane listener (loopback :9090).
-	controlMux := gateway.ControlMux(nil, probe.ReadyFunc())
-
-	// Drain orchestration — wait for SIGTERM, flip probe to
-	// not-ready, wait up to GatewayDrainGraceSeconds for in-flight
-	// requests, then Shutdown.
-	drainCtx, cancelDrain := context.WithCancel(context.Background())
-	defer cancelDrain()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Info("gatewayd-public: SIGTERM received; draining")
-		certSig.Set(false, "draining")
-		proxySig.Set(false, "draining")
-		time.Sleep(time.Duration(api.GatewayDrainGraceSeconds) * time.Second)
-		cancelDrain()
-	}()
-
-	// Start the listeners: TLS :443 + control :9090.
-	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
+// buildServers constructs the public TLS + loopback control servers.
+// Kept separate so the run() body is shorter than the §handlers 50-line
+// convention (CLAUDE.md).
+func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux, tlsBundle *gateway.TLSBundle) (*http.Server, *http.Server) {
 	tlsCfg := &tls.Config{
 		GetCertificate: tlsBundle.GetCertificate,
 		MinVersion:     tls.VersionTLS13,
@@ -286,24 +295,78 @@ func run(ctx context.Context, log *slog.Logger) error {
 		WriteTimeout:      300 * time.Second,
 	}
 	controlSrv := &http.Server{
-		Addr:              gateway.ControlAddr,
+		Addr:              controlAddr,
 		Handler:           controlMux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	return publicSrv, controlSrv
+}
+
+// runDrain blocks on (ctx, SIGTERM, listener error). On SIGTERM it
+// flips /readyz probes to not-ready, sleeps up to
+// GatewayDrainGraceSeconds (cancellable on a second SIGTERM), then
+// Shutdowns both servers. The PG signal is stopped FIRST so the
+// probe stays 503 during the entire drain (caller pauses LB after
+// observing 503, then in-flight requests finish).
+//
+// The order matches the ADR-068 spec:
+//
+//  1. SIGTERM → flip probe bits to false. /readyz=503 immediately.
+//  2. Stop the PG ping signal so a wedged connection can't stall
+//     the drain (default 30 s TimeoutStopSec vs 25 s grace + 5 s
+//     Shutdown).
+//  3. Sleep GatewayDrainGraceSeconds (cancellable on a second
+//     SIGTERM — the signal channel has capacity 1, so the second
+//     signal is dropped at the OS layer; we use a select with a
+//     1s ticker to make the sleep effectively cancellable).
+//  4. Shutdown both servers with a 5 s grace.
+//  5. pgStop() (already done above; kept here as a no-op safety net).
+func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, certSig, pgProbeSig *gateway.ReadySignal, pgStop func()) error {
+	drainCtx, cancelDrain := context.WithCancel(context.Background())
+	defer cancelDrain()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		log.Info("gatewayd-public: SIGTERM received; draining")
+		certSig.Set(false, "draining")
+		pgProbeSig.Set(false, "draining")
+		// Stop the PG ping signal BEFORE the grace sleep so the
+		// probe stays 503 during the entire drain. The PG signal
+		// goroutine may otherwise be stuck in pool.Ping and add
+		// up to every/2 to the drain time.
+		pgStop()
+		// Cancellable sleep — a second SIGTERM short-circuits the
+		// grace period and runs Shutdown immediately.
+		grace := time.Duration(api.GatewayDrainGraceSeconds) * time.Second
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		deadline := time.NewTimer(grace)
+		defer deadline.Stop()
+		select {
+		case <-deadline.C:
+		case <-sigCh:
+			log.Warn("gatewayd-public: second SIGTERM received; skipping drain grace")
+		}
+		cancelDrain()
+	}()
+
+	// Start the listeners.
 	errc := make(chan error, 2)
 	go func() {
-		l, lerr := net.Listen("tcp", listenAddr)
+		l, lerr := net.Listen("tcp", publicSrv.Addr)
 		if lerr != nil {
-			errc <- fmt.Errorf("gatewayd-public: listen %s: %w", listenAddr, lerr)
+			errc <- fmt.Errorf("gatewayd-public: listen %s: %w", publicSrv.Addr, lerr)
 			return
 		}
-		log.Info("gatewayd-public: public listening (TLS)", "addr", listenAddr)
-		if err := publicSrv.Serve(tls.NewListener(l, tlsCfg)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info("gatewayd-public: public listening (TLS)", "addr", publicSrv.Addr)
+		if err := publicSrv.Serve(tls.NewListener(l, publicSrv.TLSConfig)); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	}()
 	go func() {
-		log.Info("gatewayd-public: control listening", "addr", gateway.ControlAddr)
+		log.Info("gatewayd-public: control listening", "addr", controlSrv.Addr)
 		if err := controlSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
@@ -324,7 +387,6 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := controlSrv.Shutdown(sctx); err != nil {
 		log.Warn("gatewayd-public: control Shutdown", "err", err)
 	}
-	pgStop()
 	return nil
 }
 
@@ -379,4 +441,15 @@ func (l *pgNodeLister) ListActive(ctx context.Context) ([]certsync.Node, error) 
 		})
 	}
 	return out, nil
+}
+
+// envOr is the canonical env-override helper (per cmd/gatewayd/main.go).
+// Empty env falls back to `def`. Use os.LookupEnv directly when the
+// caller needs to distinguish unset from empty (the empty=skip
+// pattern; see FAAS_APID_METRICS_ADDR memory note).
+func envOr(envKey, def string) string {
+	if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	return def
 }

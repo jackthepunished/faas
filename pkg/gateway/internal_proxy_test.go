@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"log/slog"
 	"net"
@@ -32,9 +33,6 @@ func (d *stubDialer) DialContext(ctx context.Context, target string) (net.Conn, 
 	if d.dialErr != nil {
 		return nil, d.dialErr
 	}
-	// Dial the test server's listener directly (loopback TCP — the
-	// unix-socket shape is exercised by NewUnixSocketDialer's own
-	// test below).
 	return net.Dial("tcp", d.server.Listener.Addr().String())
 }
 
@@ -79,11 +77,40 @@ func TestInternalReverseProxy_StripsHopByHopHeaders(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rr.Code)
 	}
+	// X-Custom is non-hop-by-hop, must survive on the upstream
+	// side (the test asserts the upstream received it via the
+	// seen-custom-header flag above).
 }
 
-// TestInternalReverseProxy_AppendsXForwardedFor verifies XFF is
-// appended (not replaced) so the chain survives multi-hop.
-func TestInternalReverseProxy_AppendsXForwardedFor(t *testing.T) {
+// TestInternalReverseProxy_StripsResponseHopByHop pins the
+// response-side hop-by-hop strip (RFC 7230 §6.1 — the internal
+// daemon may have set Connection: close and we don't want to
+// leak that to the customer).
+func TestInternalReverseProxy_StripsResponseHopByHop(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.Header().Set("X-Forwarded-For", "1.2.3.4")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	dialer := &stubDialer{server: upstream}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := rr.Header().Get("Connection"); got != "" {
+		t.Errorf("Connection leaked to response: %q", got)
+	}
+	if got := rr.Header().Get("X-Forwarded-For"); got != "1.2.3.4" {
+		t.Errorf("X-Forwarded-For response = %q, want 1.2.3.4", got)
+	}
+}
+
+// TestInternalReverseProxy_StripsAndRebuildsXFF pins the security
+// load-bearing XFF contract: the inbound XFF is stripped (the
+// customer could forge any IP) and only the public daemon's
+// RemoteAddr is forwarded. Internal daemons reading XFF trust
+// exactly one hop.
+func TestInternalReverseProxy_StripsAndRebuildsXFF(t *testing.T) {
 	var got []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Values("X-Forwarded-For")
@@ -94,17 +121,36 @@ func TestInternalReverseProxy_AppendsXForwardedFor(t *testing.T) {
 	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "10.0.0.5:12345"
-	// Pre-existing XFF — must be appended-to, not replaced.
-	req.Header.Set("X-Forwarded-For", "192.0.2.1")
+	// Forged XFF — must be stripped, not forwarded.
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, req)
-	if len(got) != 2 {
-		t.Fatalf("upstream got %d X-Forwarded-For values, want 2: %v", len(got), got)
+	if len(got) != 1 {
+		t.Fatalf("upstream got %d X-Forwarded-For values, want 1 (only the public RemoteAddr): %v", len(got), got)
 	}
-	// Order: pre-existing first, then the appended (per RFC 7230
-	// convention).
-	if got[0] != "192.0.2.1" || got[1] != "10.0.0.5" {
-		t.Errorf("XFF order = %v, want [192.0.2.1, 10.0.0.5]", got)
+	if got[0] != "10.0.0.5" {
+		t.Errorf("XFF = %q, want 10.0.0.5 (the public daemon's RemoteAddr, not the forged value)", got[0])
+	}
+}
+
+// TestInternalReverseProxy_SetsXForwardedProtoHTTPS pins the
+// TLS-detection side of the XFF bundle.
+func TestInternalReverseProxy_SetsXForwardedProtoHTTPS(t *testing.T) {
+	var gotProto string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotProto = r.Header.Get("X-Forwarded-Proto")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	dialer := &stubDialer{server: upstream}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.5:12345"
+	req.TLS = &tls.ConnectionState{} // simulate the public TLS terminator
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if gotProto != "https" {
+		t.Errorf("X-Forwarded-Proto = %q, want https", gotProto)
 	}
 }
 
@@ -120,8 +166,8 @@ func TestInternalReverseProxy_DialFailure_502BadGateway(t *testing.T) {
 	if rr.Code != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", rr.Code)
 	}
-	if !strings.Contains(rr.Body.String(), "internal dial failed") {
-		t.Errorf("body = %q, want substring \"internal dial failed\"", rr.Body.String())
+	if !strings.Contains(rr.Body.String(), "internal round-trip failed") {
+		t.Errorf("body = %q, want substring \"internal round-trip failed\"", rr.Body.String())
 	}
 }
 
@@ -163,9 +209,6 @@ func TestInternalReverseProxy_NilDialer_502(t *testing.T) {
 // that the unix-socket dialer honours ctx cancellation (the public
 // daemon's drain sequence relies on this).
 func TestNewUnixSocketDialer_RespectsContextCancel(t *testing.T) {
-	// Path that does not exist — the dial will block on connect
-	// (no listener at the path). Cancellling the ctx must abort the
-	// dial quickly.
 	d := NewUnixSocketDialer("/tmp/this-socket-does-not-exist.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel BEFORE dial — fastest possible abort
@@ -200,5 +243,64 @@ func TestIsHopByHop_Predicate(t *testing.T) {
 		if got := isHopByHop(h); got != want {
 			t.Errorf("isHopByHop(%q) = %v, want %v", h, got, want)
 		}
+	}
+}
+
+// TestStripHopByHopInPlace_DoesNotDoubleAlloc pins the in-place
+// strip behaviour. The proxy uses the in-place variant to avoid
+// the Clone + rebuild double-alloc on the hot path.
+func TestStripHopByHopInPlace_DoesNotDoubleAlloc(t *testing.T) {
+	h := http.Header{
+		"Connection":      []string{"close"},
+		"Upgrade":         []string{"websocket"},
+		"X-Custom":        []string{"stays"},
+		"X-Forwarded-For": []string{"1.2.3.4"},
+	}
+	stripHopByHopInPlace(h)
+	if h.Get("Connection") != "" {
+		t.Errorf("Connection not stripped")
+	}
+	if h.Get("Upgrade") != "" {
+		t.Errorf("Upgrade not stripped")
+	}
+	if h.Get("X-Custom") != "stays" {
+		t.Errorf("X-Custom dropped")
+	}
+	if h.Get("X-Forwarded-For") != "1.2.3.4" {
+		t.Errorf("X-Forwarded-For dropped (not a hop-by-hop)")
+	}
+}
+
+// TestCopyResponseBody_ContextCancel verifies the body copy
+// goroutine returns when ctx is cancelled (the conn-bound write
+// loop does not pin the public listener).
+func TestCopyResponseBody_ContextCancel(t *testing.T) {
+	// Source returns io.EOF immediately so the goroutine completes
+	// fast; the assertion is that the function returns within the
+	// ctx deadline (no goroutine leak).
+	src := io.NopCloser(strings.NewReader("hello"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var buf strings.Builder
+	n, err := copyResponseBody(ctx, &buf, src)
+	if err != nil {
+		t.Errorf("copyResponseBody err = %v, want nil", err)
+	}
+	if n != 5 || buf.String() != "hello" {
+		t.Errorf("copyResponseBody wrote %q (n=%d), want \"hello\" (n=5)", buf.String(), n)
+	}
+}
+
+// TestCopyResponseBody_ShortInput pins the EOF short-circuit.
+func TestCopyResponseBody_ShortInput(t *testing.T) {
+	src := io.NopCloser(strings.NewReader(""))
+	ctx := context.Background()
+	var buf strings.Builder
+	n, err := copyResponseBody(ctx, &buf, src)
+	if err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+	if n != 0 {
+		t.Errorf("n = %d, want 0", n)
 	}
 }

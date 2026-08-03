@@ -1,5 +1,6 @@
 // Package certsync — per-replica certmagic leader election + cert
-// replication for the Tier A7 edge split (ADR-069).
+// replication for the Tier A7 edge split (ADR-068 §Architectural
+// decisions item 6).
 //
 // Background: gatewayd-public runs N replicas (one per box in
 // multi-box; today just one per box, but the design is N-replica-
@@ -23,7 +24,7 @@
 // into "renew" (leader) + "store" (per-replica), while account
 // state is shared.
 //
-// Wire format (ADR-069):
+// Wire format (ADR-068 item 6):
 //
 //	┌─ 4B magic "CSYN" ─┬─ 4B version (0x00000001) ─┬─ 8B cert length ─┬─ N cert PEM ─┬─ 8B key length ─┬─ M key PEM ─┐
 //
@@ -46,6 +47,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,8 +55,7 @@ import (
 	"time"
 )
 
-// Wire constants. Keep in sync with cmd/gatewayd-public/certsync.go
-// (the daemon-side wire reader).
+// Wire constants. Keep in sync with the daemon-side wire reader.
 const (
 	WireMagic   uint32 = 0x4353594E // "CSYN" big-endian
 	WireVersion uint32 = 0x00000001
@@ -64,6 +65,23 @@ const (
 // ErrNotLeader is returned by Renew when the local replica is a
 // follower. Followers MUST NOT call certmagic's Renew.
 var ErrNotLeader = errors.New("certsync: replica is not the leader")
+
+// PushDialer is the seam the leader uses to reach a follower's
+// receiver socket. The default unix-socket wiring is the
+// NewUnixPushDialer helper; tests pass a fake that writes to a
+// buffer so the wire format is exercised without os plumbing.
+type PushDialer interface {
+	DialPush(ctx context.Context, addr string) (net.Conn, error)
+}
+
+// UnixPushDialer is the production PushDialer: it dials a unix
+// socket at the address stored on each follower Node.
+type UnixPushDialer struct{}
+
+func (UnixPushDialer) DialPush(ctx context.Context, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "unix", addr)
+}
 
 // NodeLister returns the active compute_node rows (id, name, addr)
 // sorted by id. The default implementation queries Postgres; tests
@@ -110,6 +128,9 @@ type Leader struct {
 	leaderID string
 	// lister is the source of truth for nodes.
 	lister NodeLister
+	// pusher is the dialer used to push certs to followers (the
+	// leader-side outbound socket). nil falls back to UnixPushDialer.
+	pusher PushDialer
 	// log is the slog.Logger used for election events.
 	log *slog.Logger
 	// now is the clock — overridable for tests.
@@ -118,7 +139,7 @@ type Leader struct {
 
 // NewLeader returns a Leader wired to lister + log. now defaults to
 // time.Now (overridable for tests that want to skip the staleness
-// check).
+// check). pusher defaults to UnixPushDialer.
 func NewLeader(nodeID string, lister NodeLister, log *slog.Logger) *Leader {
 	if log == nil {
 		log = slog.Default()
@@ -126,9 +147,19 @@ func NewLeader(nodeID string, lister NodeLister, log *slog.Logger) *Leader {
 	return &Leader{
 		nodeID: nodeID,
 		lister: lister,
+		pusher: UnixPushDialer{},
 		log:    log,
 		now:    time.Now,
 	}
+}
+
+// SetPushDialer replaces the default unix-socket push dialer.
+// Tests use it to capture the wire bytes; production wiring is
+// the default (no call needed).
+func (l *Leader) SetPushDialer(p PushDialer) {
+	l.mu.Lock()
+	l.pusher = p
+	l.mu.Unlock()
 }
 
 // Recompute runs one election pass: list active nodes, sort by id,
@@ -199,11 +230,109 @@ func (l *Leader) Peers() []Node {
 //
 // `do` must return (certPEM, keyPEM, error). The Leader wraps
 // `do` so callers cannot accidentally bypass the election check.
+//
+// Renew does NOT push the result to followers — callers that want
+// synchronous push must call Push after a successful Renew. The
+// split is intentional: Renew is the cancel-on-ctx idiom, and
+// Push is the fire-and-forget semantics (per-replica failures
+// only log; the slow-path CertSyncIntervalSeconds cron re-tries).
 func (l *Leader) Renew(ctx context.Context, host string, do func(context.Context, string) ([]byte, []byte, error)) (certPEM, keyPEM []byte, err error) {
 	if !l.IsLeader() {
 		return nil, nil, ErrNotLeader
 	}
 	return do(ctx, host)
+}
+
+// PushResult describes the outcome of a single Push call. The
+// leader logs this; failure on a single follower is non-fatal
+// (the slow-path cron re-pushes within CertSyncIntervalSeconds).
+type PushResult struct {
+	FollowerID string
+	Addr       string
+	Err        error
+}
+
+// Push pushes the cert + key PEM bytes to every follower via the
+// wire format. Returns the per-follower result; the caller logs
+// non-nil errors and lets the slow-path cron re-attempt.
+//
+// Followers that are not in the current peer list are silently
+// skipped — they're stale entries from a previous election. The
+// fast-path heartbeat re-pulls the peer list on every push.
+//
+// Error cases:
+//   - Not leader: returns ErrNotLeader (defensive — callers usually
+//     check IsLeader first).
+//   - Dial failure on a follower: per-follower error; the rest
+//     still get pushed.
+//   - Write failure on a follower: per-follower error.
+//   - ctx cancelled: returns ctx.Err; partial writes are not
+//     rolled back (the follower's next-read sees the new bytes
+//     OR the old ones, never a torn pair, because the wire message
+//     is fully self-contained).
+func (l *Leader) Push(ctx context.Context, host string, certPEM, keyPEM []byte) []PushResult {
+	if !l.IsLeader() {
+		return []PushResult{{Err: ErrNotLeader}}
+	}
+	l.mu.RLock()
+	pusher := l.pusher
+	peers := l.Peers()
+	l.mu.RUnlock()
+	if pusher == nil {
+		pusher = UnixPushDialer{}
+	}
+	wire := EncodeWire(certPEM, keyPEM)
+	results := make([]PushResult, 0, len(peers))
+	for _, p := range peers {
+		select {
+		case <-ctx.Done():
+			results = append(results, PushResult{FollowerID: p.ID, Addr: p.Addr, Err: ctx.Err()})
+			continue
+		default:
+		}
+		conn, err := pusher.DialPush(ctx, p.Addr)
+		if err != nil {
+			results = append(results, PushResult{FollowerID: p.ID, Addr: p.Addr, Err: fmt.Errorf("dial: %w", err)})
+			continue
+		}
+		if _, err := conn.Write(wire); err != nil {
+			_ = conn.Close()
+			results = append(results, PushResult{FollowerID: p.ID, Addr: p.Addr, Err: fmt.Errorf("write: %w", err)})
+			continue
+		}
+		if err := conn.Close(); err != nil {
+			results = append(results, PushResult{FollowerID: p.ID, Addr: p.Addr, Err: fmt.Errorf("close: %w", err)})
+			continue
+		}
+		results = append(results, PushResult{FollowerID: p.ID, Addr: p.Addr})
+	}
+	return results
+}
+
+// RenewAndPush is the production wiring: renew via the leader
+// path, then push to every follower. Failures on Push are logged
+// but never returned — the leader's own cert is the source of
+// truth, and the slow-path cron re-pushes within
+// CertSyncIntervalSeconds.
+func (l *Leader) RenewAndPush(ctx context.Context, host string, do func(context.Context, string) ([]byte, []byte, error), log *slog.Logger) error {
+	cert, key, err := l.Renew(ctx, host, do)
+	if err != nil {
+		return err
+	}
+	if !l.IsLeader() {
+		// Belt-and-braces: Renew should already have returned
+		// ErrNotLeader, but mid-flight elections can flip the
+		// result between the two calls.
+		return ErrNotLeader
+	}
+	for _, r := range l.Push(ctx, host, cert, key) {
+		if r.Err != nil {
+			if log != nil {
+				log.Warn("certsync: push failed", "host", host, "follower", r.FollowerID, "addr", r.Addr, "err", r.Err)
+			}
+		}
+	}
+	return nil
 }
 
 // WriteCertAndKeyToDisk is the canonical helper the leader uses
@@ -226,8 +355,8 @@ func WriteCertAndKeyToDisk(ctx context.Context, storageDir, host string, certPEM
 	return nil
 }
 
-// EncodeWire serialises cert + key PEMs into the ADR-069 wire
-// format. The header is fixed-width (24 B); the body is
+// EncodeWire serialises cert + key PEMs into the ADR-068 item 6
+// wire format. The header is fixed-width (24 B); the body is
 // concatenated PEMs. Used by the leader when pushing to followers.
 func EncodeWire(certPEM, keyPEM []byte) []byte {
 	buf := make([]byte, 0, HeaderSize+len(certPEM)+len(keyPEM))
@@ -242,8 +371,8 @@ func EncodeWire(certPEM, keyPEM []byte) []byte {
 	return buf
 }
 
-// DecodeWire parses the ADR-069 wire format. Returns (certPEM,
-// keyPEM, error). Used by the follower's sync receiver.
+// DecodeWire parses the ADR-068 item 6 wire format. Returns
+// (certPEM, keyPEM, error). Used by the follower's sync receiver.
 //
 // Errors:
 //   - buf shorter than HeaderSize → io.ErrUnexpectedEOF
@@ -260,8 +389,8 @@ var ErrWireMagic = &WireError{Reason: "bad magic"}
 // ErrWireVersion is returned by DecodeWire when the version is unsupported.
 var ErrWireVersion = &WireError{Reason: "unsupported version"}
 
-// DecodeWire parses the ADR-069 wire format from buf. Returns
-// (certPEM, keyPEM, error).
+// DecodeWire parses the ADR-068 item 6 wire format from buf.
+// Returns (certPEM, keyPEM, error).
 func DecodeWire(buf []byte) (certPEM, keyPEM []byte, err error) {
 	if len(buf) < HeaderSize {
 		return nil, nil, io.ErrUnexpectedEOF
@@ -301,15 +430,4 @@ func (f *FakeLister) ListActive(_ context.Context) ([]Node, error) {
 		return nil, f.Err
 	}
 	return f.Nodes, nil
-}
-
-// HostFromWire extracts the host header from a sync message's
-// metadata. In v1.0 the host is encoded in the certmagic storage
-// path (not in the wire format above) — this helper exists for
-// future expansion if we add a per-message host field.
-//
-// Currently a no-op; here so callers don't import strings +
-// filepath redundantly.
-func HostFromWire(_ []byte) string {
-	return ""
 }

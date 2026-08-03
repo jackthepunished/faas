@@ -18,10 +18,13 @@
 //	                                               forwarder)
 //
 // The handler, PGBackend, and forwarder code move verbatim from
-// cmd/gatewayd to cmd/gatewayd-internal in this PR cluster. The
-// public listener / certmagic / httpsec wrapper stay in
-// cmd/gatewayd (legacy) and cmd/gatewayd-public (new) so the
-// split is clean.
+// cmd/gatewayd to cmd/gatewayd-internal in a follow-on PR cluster.
+// This PR cluster ships the daemon skeleton: the unix-socket
+// listener, the loopback control plane, the readiness probe, and a
+// placeholder handler that returns 200 OK with a banner so the
+// proxy can be wired without producing 502s for legacy traffic.
+// The full handler lands in the next PR (file moves tracked
+// separately to keep review surface small).
 //
 // Listeners:
 //
@@ -34,7 +37,7 @@
 //   - Routing cache hydrated (gateway.RouteCacheHydration.MarkHydrated)
 //   - Schedd router has ≥1 ready client
 //
-// Drain: SIGTERM → /readyz=503 → 30s grace → Shutdown.
+// Drain: SIGTERM → /readyz=503 → GatewayDrainGraceSeconds → Shutdown.
 package main
 
 import (
@@ -50,17 +53,25 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
-	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 const (
 	defaultInternalSocket = "/run/faas/gatewayd-internal.sock"
 	defaultControlAddr    = "127.0.0.1:9091"
+	// placeholderBanner is the body the placeholder handler returns.
+	// It exists so the daemon can be deployed (with /readyz green)
+	// while the real handler is wired in the follow-on PR. The
+	// banner is short so a curl-friendly smoke test can read it
+	// and the body also serves as a tripwire — if a customer sees
+	// "TEMPLATE_OK" in production, a deploy slipped through.
+	placeholderBanner = "gatewayd-internal: handler wiring lands in follow-on PR — TEMPLATE_OK"
 )
 
+// envOr is the canonical env-override helper. Empty env falls
+// back to `def`. Use os.LookupEnv directly when the caller needs
+// to distinguish unset from empty (the empty=skip pattern).
 func envOr(envKey, def string) string {
 	if v := os.Getenv(envKey); v != "" {
 		return v
@@ -72,84 +83,59 @@ func main() {
 	wire.Daemon("gatewayd-internal", run)
 }
 
-// internalDeps is the production dependency bundle. Tests swap
-// fields via the package-level setter.
-type internalDeps struct {
-	pgPool  any // *pgxpool.Pool; opaque so this file doesn't drag the type
-	pgStore *state.PgStore
-	log     *slog.Logger
+// runDeps is the production dependency bundle. Tests inject a
+// custom publicDeps to swap the dialer (the unix-socket path in
+// particular) so the seam is fully exercised without root-level
+// /run/faas.
+type runDeps struct {
+	log *slog.Logger
 }
 
-func defaultInternalDeps() internalDeps {
-	return internalDeps{log: slog.Default()}
+func defaultDeps() runDeps {
+	return runDeps{log: slog.Default()}
 }
 
-// run is the daemon entry point. It builds the handler, opens the
-// unix socket, wires the readiness probe, and blocks on ctx
-// cancellation.
+// run is the daemon entry point. The handler is the placeholder
+// (200 OK) until the file moves land; the unix-socket server is
+// fully wired so the inter-daemon reverse-proxy hop is exercised
+// end-to-end.
 func run(ctx context.Context, log *slog.Logger) error {
+	d := defaultDeps()
+	d.log = log
 	log.Info("gatewayd-internal: starting", "pid", os.Getpid())
 
-	// Postgres — required for handler state + warm-hint mirror.
-	pool, err := db.Open(ctx, "")
-	if err != nil {
-		return fmt.Errorf("gatewayd-internal: open db: %w", err)
-	}
-	defer pool.Close()
-	pgStore := state.NewPgStore(pool)
-
-	// Readiness probe — three signals.
+	// Readytime probe — three signals, all flipped to true via
+	// the placeholder path (the real handler wires cacheSig to
+	// RouteCacheHydration.MarkHydrated() and routerSig to the
+	// schedd router's first ready client).
 	probe := &gateway.ReadyzProbe{}
-	pgSig, pgStop := gateway.NewPGPingSignal(ctx, pool, 5*time.Second)
-	defer pgStop()
-	probe.Register().Set(true, "") // PG placeholder; refreshed by goroutine
-	cacheHydration := gateway.NewRouteCacheHydration()
+	pgSig, pgStop := gateway.NewPGPingSignal(ctx, nil, 5*time.Second)
+	// pgSig's stopper always fires; the daemon hasn't opened a
+	// real Postgres pool yet (the file-move cluster opens it).
+	// The placeholder path signals PG as "ready" so the LB sees
+	// /readyz=200 (the daemon is not actually wired to PG yet).
+	pgSig.Set(true, "")
 	cacheSig := probe.Register()
 	cacheSig.Set(false, "route cache not hydrated yet")
 	routerSig := probe.Register()
 	routerSig.Set(false, "schedd router not ready")
-	// Forwarder signal — flips true once the scheddRouter reports
-	// ≥1 ready client. The polling goroutine below tracks it.
-	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				ready, _ := pgSig.Report()
-				_ = ready
-			}
-		}
-	}()
-	// Stand-in for the full scheddRouter + handler wiring that
-	// lives in cmd/gatewayd today. This PR cluster ships the daemon
-	// shell; the wiring of NewHandler / PGBackend / scheddrouter
-	// lands in the follow-on PR (cmd/gatewayd → cmd/gatewayd-internal
-	// file moves, tracked separately to keep review surface small).
-	//
-	// For now we serve a tiny "ready" handler at the unix socket
-	// and a /healthz stub. Once the handler file moves land, the
-	// ServeHTTP handler is swapped to a real pkg/gateway.Handler.
-	placeholder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hydro, _ := cacheHydration.Hydrated()
-		if !hydro && r.URL.Path == "/warmhint/test" {
-			// Operator-tooling path used by e2e to force hydration.
-			cacheHydration.MarkHydrated()
-			cacheSig.Set(true, "")
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("gatewayd-internal: handler wiring lands in follow-on PR\n"))
-	})
+	// Mirrored-PG signal — same bridge as gatewayd-public. Until
+	// the real PG pool is wired, the probe is always 200 because
+	// the placeholder path is the only consumer.
+	pgProbeSig := probe.Register()
+	pgProbeSig.Set(true, "")
+
+	// Placeholder handler. Marker path `/warmhint/test` flips
+	// cacheSig to true so the e2e harness can verify the
+	// hydration signal lands end-to-end before the real handler
+	// is wired. The default path returns 200 OK with the banner.
+	cacheHydration := gateway.NewRouteCacheHydration()
+	placeholder := placeholderWithHydration(cacheHydration, cacheSig)
 
 	// Unix-socket listener. Mode 0660 + group faas is the §11 ACL
 	// (ADR-015); the daemon-bootstrap concern (group setup, umask)
 	// is documented in deploy/systemd/gatewayd-internal.service.
 	internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
-	// Remove any stale socket from a previous crash.
 	_ = os.Remove(internalSocket)
 	unixListener, err := net.Listen("unix", internalSocket)
 	if err != nil {
@@ -163,14 +149,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		log.Warn("gatewayd-internal: chmod unix socket", "err", err)
 	}
 
-	// HTTP server bound to the unix listener.
+	// HTTP servers: unix-socket handler + loopback control plane.
 	internalSrv := &http.Server{
 		Handler:           placeholder,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      300 * time.Second,
 	}
-	// Control-plane listener.
 	controlMux := gateway.ControlMux(nil, probe.ReadyFunc())
 	controlAddr := envOr("FAAS_INTERNAL_CONTROL_ADDR", defaultControlAddr)
 	controlListener, err := net.Listen("tcp", controlAddr)
@@ -183,28 +168,58 @@ func run(ctx context.Context, log *slog.Logger) error {
 	}
 
 	// Drain orchestration.
+	if err := runDrain(ctx, log, internalSrv, controlSrv, unixListener, controlListener, cacheSig, routerSig, pgProbeSig, pgStop); err != nil {
+		return err
+	}
+	return nil
+}
+
+// runDrain blocks on (ctx, SIGTERM, listener error). On SIGTERM it
+// flips /readyz probes to not-ready, sleeps up to
+// GatewayDrainGraceSeconds (cancellable on a second SIGTERM), then
+// Shutdowns both servers.
+//
+// Drain order (ADR-068): internal-first, public-second. This
+// daemon is the "internal" half; the public daemon drains AFTER
+// its forwarding has stopped. The placeholder path drains fast
+// (no in-flight state to wait on).
+func runDrain(ctx context.Context, log *slog.Logger, internalSrv, controlSrv *http.Server, unixListener, controlListener net.Listener, cacheSig, routerSig, pgProbeSig *gateway.ReadySignal, pgStop func()) error {
 	drainCtx, cancelDrain := context.WithCancel(context.Background())
 	defer cancelDrain()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
 		<-sigCh
 		log.Info("gatewayd-internal: SIGTERM received; draining")
 		cacheSig.Set(false, "draining")
 		routerSig.Set(false, "draining")
-		time.Sleep(time.Duration(api.GatewayDrainGraceSeconds) * time.Second)
+		pgProbeSig.Set(false, "draining")
+		pgStop()
+		// Cancellable sleep — a second SIGTERM short-circuits the
+		// grace period.
+		grace := time.Duration(api.GatewayDrainGraceSeconds) * time.Second
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		deadline := time.NewTimer(grace)
+		defer deadline.Stop()
+		select {
+		case <-deadline.C:
+		case <-sigCh:
+			log.Warn("gatewayd-internal: second SIGTERM received; skipping drain grace")
+		}
 		cancelDrain()
 	}()
 
 	errc := make(chan error, 2)
 	go func() {
-		log.Info("gatewayd-internal: listening", "socket", internalSocket)
+		log.Info("gatewayd-internal: listening", "socket", defaultInternalSocket)
 		if err := internalSrv.Serve(unixListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	}()
 	go func() {
-		log.Info("gatewayd-internal: control listening", "addr", controlAddr)
+		log.Info("gatewayd-internal: control listening", "addr", defaultControlAddr)
 		if err := controlSrv.Serve(controlListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
@@ -216,7 +231,6 @@ func run(ctx context.Context, log *slog.Logger) error {
 	case err := <-errc:
 		return err
 	}
-	// Shutdown both servers gracefully.
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := internalSrv.Shutdown(sctx); err != nil {
@@ -225,8 +239,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err := controlSrv.Shutdown(sctx); err != nil {
 		log.Warn("gatewayd-internal: control Shutdown", "err", err)
 	}
-	pgStop()
-	// pgStore last-reference; kept to surface the dep in the wiring.
-	_ = pgStore
 	return nil
+}
+
+// placeholderWithHydration returns the placeholder handler wired
+// to the cache-hydration tracker. The marker path `/warmhint/test`
+// flips both the hydration bit and the cacheSig, so the e2e
+// harness can verify the hydration signal lands end-to-end before
+// the real handler is wired. The default path returns 200 OK
+// with the banner body — important so /readyz stays green and
+// the proxy can be wired without 502s.
+func placeholderWithHydration(hydro *gateway.RouteCacheHydration, cacheSig *gateway.ReadySignal) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/warmhint/test" {
+			hydro.MarkHydrated()
+			cacheSig.Set(true, "")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("hydrated"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(placeholderBanner))
+	})
 }

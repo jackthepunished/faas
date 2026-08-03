@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00117_pg_ratelimit.sql — Tier A7 edge split (ADR-070).
+-- 00117_pg_ratelimit.sql — Tier A7 edge split (ADR-068 item 7).
 --
 -- Today's per-process token bucket (pkg/gateway/ratelimit.go) is
 -- correct for one-box (one gatewayd, one bucket per app). After the
@@ -18,13 +18,15 @@
 -- hashtext((scope, subject_id)::record::text)) = 0 … RETURNING
 -- tokens` so two replicas contending on the same row serialise.
 --
--- Bench (ADR-040 follow-up): P50 0.8 ms, P99 3.2 ms on EX44.
+-- Bench (ADR-068 bench follow-up): P50 0.8 ms, P99 3.2 ms on EX44.
 --
 -- Schema invariants:
 --   - PRIMARY KEY (scope, subject_id, plan) so the ON CONFLICT
 --     clause has a deterministic target.
 --   - CHECK on scope value to keep the enum closed; future scopes
---     need a fresh ADR + migration.
+--     need a fresh ADR + migration. The canonical list lives in
+--     pkg/api/limits.go (rate-limit scope constants); this CHECK
+--     is the SQL-side duplicate for defense-in-depth.
 --   - CHECK on tokens >= 0 — the consume path uses NOT tokens >= 0
 --     to detect overflow at the SQL layer; tokens should never go
 --     negative because the limiter math is positive.
@@ -32,6 +34,10 @@
 --   - Partial index on (subject_id) WHERE scope = 'app' (the hot
 --     read path) — the per-account lookup is rarer so the partial
 --     index covers the common case.
+--   - tokens is bigint (no fractional tokens today). If a future
+--     ADR adds fractional refill (e.g. 0.5 tokens per second),
+--     rename to numeric(20,4) in a follow-up migration. The
+--     "no floats near money" invariant from CLAUDE.md applies.
 --
 -- Replay-safe (ADR-041): CREATE TABLE IF NOT EXISTS + ADD CONSTRAINT
 -- IF NOT EXISTS via DO-block (same pattern as 00116).
@@ -40,7 +46,7 @@ CREATE TABLE IF NOT EXISTS pg_ratelimit_counters (
     scope        text             NOT NULL CHECK (scope IN ('app', 'account')),
     subject_id   uuid             NOT NULL,
     plan         text             NOT NULL CHECK (plan IN ('free', 'hobby', 'pro', 'scale')),
-    tokens       double precision NOT NULL CHECK (tokens >= 0),
+    tokens       bigint           NOT NULL CHECK (tokens >= 0),
     last_refill  timestamptz      NOT NULL DEFAULT now(),
     PRIMARY KEY (scope, subject_id, plan)
 );

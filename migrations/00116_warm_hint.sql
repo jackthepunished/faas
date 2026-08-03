@@ -26,22 +26,25 @@
 -- Schema invariants:
 --   - PRIMARY KEY (app_id) so the ON CONFLICT clause serialises
 --     concurrent writers at the row level (PG row lock).
+--   - written_at is NOT NULL with DEFAULT now() — there is no
+--     "partial write" state for this table.
 --   - CHECK (written_at <= now() + interval '1 minute') to keep
 --     clock skew from poisoning the cache (same pattern as
 --     migrations/00091_instances_migrated_at.sql:191-193).
---   - Partial index on node_id where node_id IS NOT NULL so a
---     future "list all apps warm on node X" query (operator
---     dashboard) is O(apps-on-this-node), not O(apps).
+--   - Index on (node_id) supports future "list all apps warm on
+--     node X" queries (operator dashboard); see operator-ops.md
+--     §warm-hint-bulk-lookup for the use case.
 --
--- Replay-safe (ADR-041): CREATE TABLE IF NOT EXISTS + ADD CONSTRAINT
--- IF NOT EXISTS pattern via DO-block guards (matching
--- migrations/00082_apps_scaling_policy.sql:50-77). Second MigrateUp
--- is a no-op.
+-- Replay-safe (ADR-041): CREATE TABLE IF NOT EXISTS + DO-block-guarded
+-- ADD CONSTRAINT (matching migrations/00082_apps_scaling_policy.sql:50-77).
+-- A second MigrateUp is a no-op.
 --
--- Wire: pkg/db/notify.go adds NotifyWarmHintPublished = "warm_hint_published".
--- Consumers: cmd/gatewayd-public/warmhint_cache.go and the existing
--- cmd/gatewayd/warmhints.go consumer (which migrates to
--- cmd/gatewayd-internal/warmhints.go in the same PR cluster).
+-- Wire: pkg/db/notify.go::NotifyWarmHintPublished = "warm_hint_published".
+-- Consumers (this PR cluster wires the public side; the file-move
+-- cluster wires the internal side):
+--   - cmd/gatewayd-public/warmhint_cache.go (NEW)
+--   - cmd/gatewayd-internal/warmhints.go (NEW, moved from
+--     cmd/gatewayd/warmhints.go)
 
 CREATE TABLE IF NOT EXISTS warm_hint (
     app_id     uuid        PRIMARY KEY,
@@ -58,13 +61,15 @@ BEGIN
     ) THEN
         ALTER TABLE warm_hint
             ADD CONSTRAINT warm_hint_written_at_chk
-            CHECK (written_at IS NULL OR written_at <= now() + interval '1 minute');
+            CHECK (written_at <= now() + interval '1 minute');
     END IF;
 END$$;
 
-CREATE INDEX IF NOT EXISTS warm_hint_node_id_partial_idx
-    ON warm_hint (node_id)
-    WHERE node_id IS NOT NULL;
+-- Index on node_id for the future "list all hot apps on node X"
+-- dashboard query. node_id is NOT NULL, so the WHERE clause would
+-- be dead — a plain index is the right shape.
+CREATE INDEX IF NOT EXISTS warm_hint_node_id_idx
+    ON warm_hint (node_id);
 -- +goose StatementEnd
 
 -- +goose Down
@@ -73,6 +78,6 @@ CREATE INDEX IF NOT EXISTS warm_hint_node_id_partial_idx
 -- is unregistered by removing every LISTEN at consumer shutdown; the
 -- channel itself persists in Postgres until the cluster restarts
 -- (acceptable; not a correctness issue).
-DROP INDEX IF EXISTS warm_hint_node_id_partial_idx;
+DROP INDEX IF EXISTS warm_hint_node_id_idx;
 DROP TABLE IF EXISTS warm_hint;
 -- +goose StatementEnd
