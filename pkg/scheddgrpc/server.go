@@ -722,6 +722,24 @@ func (s *Server) ReportCapacity(stream scheddpb.Schedd_ReportCapacityServer) err
 // Reader); the handler returns an empty response rather than a
 // gRPC error so the meterd sampler can degrade to "no CPU data"
 // without restarting the loop.
+// int32SliceToProto (issue #463 / ADR-070 / PR-C) maps an
+// int-sidecar-MB slice to the protobuf []int32 shape. Nil/empty
+// yields nil so the wire stays compact (no empty repeated field
+// over the gRPC stream). The proto field's int32 width is
+// deliberately wider than the SidecarCapMax * 32..512 ceiling
+// (= 1024) — the int32 width is for future-proofing, not a
+// near-term budget signal.
+func int32SliceToProto(in []int) []int32 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]int32, len(in))
+	for i, v := range in {
+		out[i] = int32(v)
+	}
+	return out
+}
+
 func (s *Server) ListInstanceStats(ctx context.Context, _ *scheddpb.ListInstanceStatsRequest) (*scheddpb.ListInstanceStatsResponse, error) {
 	const op = "ListInstanceStats"
 	start := time.Now()
@@ -735,13 +753,14 @@ func (s *Server) ListInstanceStats(ctx context.Context, _ *scheddpb.ListInstance
 		cpuStart := time.Now()
 		for _, r := range s.stats.SnapshotAll() {
 			row := &scheddpb.InstanceStatsRow{
-				InstanceId: r.InstanceID,
-				AppId:      r.AppID,
-				NodeId:     r.NodeID,
-				CpuUsec:    r.CPUUsageUsec,
-				CpuValid:   uint32(r.CPU),
-				NetTxBytes: r.TXBytes,
-				TxValid:    uint32(r.TX),
+				InstanceId:    r.InstanceID,
+				AppId:         r.AppID,
+				NodeId:        r.NodeID,
+				CpuUsec:       r.CPUUsageUsec,
+				CpuValid:      uint32(r.CPU),
+				NetTxBytes:    r.TXBytes,
+				TxValid:       uint32(r.TX),
+				SidecarRamMbs: int32SliceToProto(r.SidecarMBs),
 			}
 			rows = append(rows, row)
 		}

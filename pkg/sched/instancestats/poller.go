@@ -142,10 +142,37 @@ func (p *Poller) Tick(ctx context.Context) error {
 		}
 		byNode[in.NodeID] = append(byNode[in.NodeID], in)
 	}
+	// Issue #463 / ADR-070 / PR-C: pre-load the per-deployment
+	// sidecar RAM slice ONCE per Tick (rather than once per
+	// instance) so a 100-instance fleet with 5 deployments is
+	// 5 DB reads per minute, not 100. The map is dense on
+	// deploymentID; an instance whose deployment_id is absent
+	// (= legacy no-sidecars deploy or a transient cache miss)
+	// falls back to nil, which the sampler collapses to the
+	// legacy single-arg admission form.
+	sidecarByDeploy := make(map[string][]int, len(byNode))
+	for _, in := range instances {
+		if in.DeploymentID == "" {
+			continue
+		}
+		if _, seen := sidecarByDeploy[in.DeploymentID]; seen {
+			continue
+		}
+		mbs, err := p.Store.DeploymentSidecarRAMs(ctx, in.DeploymentID)
+		if err != nil {
+			// Fail-closed: leave the deployment entry absent;
+			// downstream admission reverts to the no-sidecar
+			// form. The next tick retries.
+			p.Log.Warn("instance stats: deployment sidecar RAM lookup failed",
+				"deployment_id", in.DeploymentID, "err", err)
+			continue
+		}
+		sidecarByDeploy[in.DeploymentID] = mbs
+	}
 	rows := make([]InstanceStat, 0, len(instances))
 	rolled := make([]wire.InstanceStatRow, 0, len(instances))
 	for _, node := range nodes {
-		nodeRows, nodeRolled := p.tickNode(ctx, node, byNode[node.ID])
+		nodeRows, nodeRolled := p.tickNode(ctx, node, byNode[node.ID], sidecarByDeploy)
 		rows = append(rows, nodeRows...)
 		rolled = append(rolled, nodeRolled...)
 	}
@@ -166,7 +193,7 @@ func (p *Poller) Tick(ctx context.Context) error {
 // result into InstanceStat rows + wire rollup rows. On dial
 // failure it logs, increments the per-node error counter, and
 // returns empty slices — the caller continues to the next node.
-func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings []state.Instance) ([]InstanceStat, []wire.InstanceStatRow) {
+func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings []state.Instance, sidecarByDeploy map[string][]int) ([]InstanceStat, []wire.InstanceStatRow) {
 	if p.Dialer == nil {
 		return nil, nil
 	}
@@ -219,6 +246,12 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			CPU:              Unknown,
 			RSS:              Unknown,
 			SampledAt:        now,
+			// Issue #463 / ADR-070 / PR-C: sidecar RAM slice
+			// from the pre-loaded cache. Nil when the
+			// deployment row has no sidecars or the lookup
+			// failed — both collapse to the legacy no-sidecar
+			// admission form on the meterd side.
+			SidecarMBs: sidecarByDeploy[durable.DeploymentID],
 		}
 		wireRow := wire.InstanceStatRow{
 			AppID:            durable.AppID,

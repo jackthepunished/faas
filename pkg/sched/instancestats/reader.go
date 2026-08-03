@@ -153,6 +153,17 @@ type InstanceStat struct {
 	// RX is the validity of RXBytes. Mirrors TX semantics:
 	// Unknown on first sample / regression / cache miss.
 	RX Validity
+	// SidecarMBs (issue #463 / ADR-070 §Decision 6 / PR-C) is
+	// the per-sidecar RAM slice sourced from the deployment's
+	// `sidecars jsonb` column at Tick time. Nil/empty = legacy
+	// no-sidecar shape (meterd's sampler collapses to the
+	// single-arg helper). Length is bounded by
+	// api.SidecarCapMax = 2; the broker that populates this
+	// field (pkg/state.DeploymentSidecarRAMs) is the same one
+	// schedd's Request builder reads at Admit time, so a
+	// deployment with no sidecars on Admit stays no-sidecars on
+	// every tick until the next deploy.
+	SidecarMBs []int
 }
 
 // Reader is the stable, concurrency-safe read API the future

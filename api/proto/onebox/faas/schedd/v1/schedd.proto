@@ -339,6 +339,14 @@ message InstanceStatsRow {
   // it (pkg/meter/sampler.go).
   uint64 net_tx_bytes = 6;
   uint32 tx_valid     = 7;
+  // Issue #463 / ADR-070 §Decision 6 / PR-C: per-sidecar RAM
+  // slice sourced from the deployment's `sidecars jsonb` column
+  // at Admit time. Empty/nil when the deployment has no sidecars —
+  // the meterd sampler collapses to the no-sidecar admission
+  // shutter via api.BillableRAMMBWithSidecars. Wire discipline
+  // ADR-016 additive — new field at the end. Card ceiling:
+  // len(sidecar_ram_mbs) ≤ api.SidecarCapMax = 2.
+  repeated int32 sidecar_ram_mbs = 8;
 }
 
 message ListInstanceStatsRequest {
