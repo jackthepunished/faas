@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply test for 00119 (issue #463 / ADR-069 / PR-B —
+// Migration-apply test for 00123 (issue #463 / ADR-069 / PR-B —
 // per-workload filesystem handle for sidecars). Pins the
 // `deployment_sidecar_layers` table shape:
 //
-//  1. The migration set applies cleanly through 00119.
+//  1. The migration set applies cleanly through 00123.
 //  2. The new table is reachable from the FK side: a deployment row
 //     can carry a sidecar layer row.
 //  3. Unique PK `(deployment_id, sidecar_name)` rejects dup
@@ -16,11 +16,12 @@
 //  5. The storage_key index exists (query planner can use it).
 //  6. Replay-safety: a second MigrateUp is a no-op (PR #377 / ADR-041).
 //
-// Slot note: HEAD on origin/main is 00118 (PR-A sidecars, PR #531).
-// If a sibling PR claims 00119 first, renumber per
-// migrations/README.md and update this test's filename + test
-// function name + ApplyUp range + pkg/e2etest/harness.go::
-// e2eMigrationTarget constant together.
+// Slot note: PR-B originally claimed 00119; main's recent merges
+// added 00119/00120/00121 reservation fences + 00122 framework_ready_at
+// (PR #470-FU-B), so this migration renumbered to 00123 — the next
+// free slot past main's 00122. Bump filename + test function name +
+// ApplyUp range + pkg/e2etest/harness.go::e2eMigrationTarget together
+// if the slot changes again.
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -35,7 +36,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00119_DeploymentsSidecarLayers(t *testing.T) {
+func TestMigrations_00123_DeploymentsSidecarLayers(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -50,7 +51,7 @@ func TestMigrations_00119_DeploymentsSidecarLayers(t *testing.T) {
 	// between 1 and 118 surfaces here before the per-assertion
 	// pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 118)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 122)", err)
 	}
 
 	// (2) Seed an account + app + deployments, reusing the

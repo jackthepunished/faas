@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00121 (issue #463 / ADR-069 / PR-B
+// Migration-apply test for 00124 (issue #463 / ADR-069 / PR-B
 // review finding #5 — events_sidecar_name_idx). Pins:
 //
-//  1. The migration set applies cleanly through 00121.
+//  1. The migration set applies cleanly through 00124.
 //  2. The new index exists (pg_indexes).
 //  3. The index is a partial expression index over the two
 //     closed sidecar-event kinds (matches ListEventsBySidecar's
@@ -13,13 +13,12 @@
 //  5. Replay-safety: a second MigrateUp is a no-op (PR #377 /
 //     ADR-041).
 //
-// Slot note: HEAD on origin/main before this PR was 00118
-// (PR-A sidecars, PR #531). The PR-B migration 00119 (sidecar
-// layers) and the reservation fence at 00120 land in the same
-// PR. Migration 00121 follows the fence. If a sibling PR
-// claims 00121 first, renumber per migrations/README.md and
-// update this test's filename + test function name + ApplyUp
-// range together.
+// Slot note: PR-B originally claimed 00121; main's recent merges
+// reserved 00121 as a fence (main's 00121_reserve_slot.sql), so
+// the index renumbered to 00124 — directly after the sidecar
+// layers migration (00123) in the same PR. Bump filename +
+// test function name + ApplyUp range together if the slot
+// changes again.
 
 package migrations_test
 
@@ -32,15 +31,15 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00121_EventsSidecarNameIdx(t *testing.T) {
+func TestMigrations_00124_EventsSidecarNameIdx(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00121. A regression that drops a slot
-	// between 1 and 120 surfaces here before the per-assertion
+	// (1) Apply through 00124. A regression that drops a slot
+	// between 1 and 123 surfaces here before the per-assertion
 	// pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 120)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 123)", err)
 	}
 
 	// (2) Index existence. Pin the index name so a future
