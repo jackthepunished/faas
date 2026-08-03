@@ -103,6 +103,14 @@ type VmmdAPI interface {
 	// DGRAM receipt from a guest that's already gone is a clean,
 	// observable error rather than a silent success.
 	MarkInstanceFrameworkReady(ctx context.Context, instance string, warmupMs int64) (stamped bool, appID, runtime string, err error)
+	// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+	// capture entry point. See Manager.WarmSnapshot for the
+	// full contract. The handler is intentionally narrow — it
+	// just lifts the wire fields into a SnapshotSpec and
+	// translates the Manager error into an Internal gRPC code
+	// (the engine's captureWarmSnapshotLocked decides whether
+	// to Destroy the VM on failure).
+	WarmSnapshot(ctx context.Context, instance string, spec fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error)
 }
 
 // Server implements vmmdpb.VmmdServer.
@@ -364,6 +372,54 @@ func (s *Server) PauseAndSnapshot(ctx context.Context, req *vmmdpb.PauseAndSnaps
 	}
 	info, err := s.vmm.Park(ctx, req.GetInstance(), fcvm.SnapshotSpec{
 		VMStatePath:       req.GetVmstatePath(),
+		StorageKey:        req.GetStorageKey(),
+		VMStateStorageKey: req.GetVmstateStorageKey(),
+	})
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	return &vmmdpb.SnapshotResponse{
+		MemBytes:     info.MemBytes,
+		VmstateBytes: info.VMStateBytes,
+	}, nil
+}
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier twin
+// of PauseAndSnapshot. The handler validates the wire instance
+// id + both storage keys (warm captures always publish through
+// the configured StorageBackend — there is no legacy host-path
+// fallback for the warm tier). Manager.WarmSnapshot does the
+// pause + /snapshot/create + storage publish + VM resume in
+// one atomic sequence; the engine's captureWarmSnapshotLocked
+// (pkg/sched/engine.go) is the only entry point. On failure the
+// error bubbles up as Internal — the engine's failure path
+// fires m.Destroy + transitions the instance to STOPPED with
+// reason "warm_snapshot_failed" (see ADR-055).
+//
+// The handler is a thin pass-through to Manager.WarmSnapshot.
+// All side effects (CID/lease tracking, ring buffer, audit) live
+// one layer down on the Manager.
+func (s *Server) WarmSnapshot(ctx context.Context, req *vmmdpb.WarmSnapshotRequest) (*vmmdpb.SnapshotResponse, error) {
+	const op = "WarmSnapshot"
+	start := time.Now()
+	if req.GetInstance() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing instance",
+			"instance is required on WarmSnapshot").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#warm-snapshot")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	if req.GetStorageKey() == "" || req.GetVmstateStorageKey() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing storage keys",
+			"storage_key and vmstate_storage_key are required on WarmSnapshot (warm captures are storage-backend-only)").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#warm-snapshot")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	info, err := s.vmm.WarmSnapshot(ctx, req.GetInstance(), fcvm.SnapshotSpec{
 		StorageKey:        req.GetStorageKey(),
 		VMStateStorageKey: req.GetVmstateStorageKey(),
 	})

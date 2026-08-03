@@ -112,6 +112,24 @@ func SnapshotVMStateKey(deploymentID string) string {
 	return state.SnapVMStateKey(deploymentID)
 }
 
+// SnapshotWarmMemKey (issue #470 / PR #470-FU-A) returns the storage
+// key for a deployment's warm-tier snapshot mem blob. Mirrors the
+// /warm/ segment of <snapDir>/<deploymentID>/warm/mem. Thin wrapper
+// over state.WarmSnapMemKey so the canonical form lives in one place.
+// The engine's captureWarmSnapshotLocked (pkg/sched/engine.go) calls
+// this when framing the vmmdgrpc.WarmSnapshot RPC.
+func SnapshotWarmMemKey(deploymentID string) string {
+	return state.WarmSnapMemKey(deploymentID)
+}
+
+// SnapshotWarmVMStateKey (issue #470 / PR #470-FU-A) is the warm-tier
+// sibling of SnapshotVMStateKey. Mirrors the /warm/ segment of
+// <snapDir>/<deploymentID>/warm/vmstate. Thin wrapper over
+// state.WarmSnapVMStateKey for the same reason as SnapshotWarmMemKey.
+func SnapshotWarmVMStateKey(deploymentID string) string {
+	return state.WarmSnapVMStateKey(deploymentID)
+}
+
 // BaseKey returns the storage key for a runtime's shared drive0 base ext4
 // image. Returns "base/base.ext4" for plain apps, "base/runner-<runtime>.ext4"
 // for function apps. The key is per-arch (issue #197 B3.3) — the same

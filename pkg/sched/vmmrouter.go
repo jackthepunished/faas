@@ -61,6 +61,14 @@ type RoutedVMM interface {
 	// host-path branch is taken bit-for-bit; remote-node schedd sends
 	// state.SnapVMStateKey(deploymentID).
 	PauseAndSnapshot(ctx context.Context, nodeID, instance, vmstatePath, storageKey, vmstateStorageKey string) (SnapshotBytes, error)
+	// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+	// twin of PauseAndSnapshot. Always storage-backend-only
+	// (warm captures have no legacy host-path fallback). The
+	// router resolves the per-node vmmd by nodeID and forwards
+	// to VMMClient.WarmSnapshot. Returns Capacity on an unknown
+	// nodeID to keep the failure semantics consistent with the
+	// rest of the routed surface.
+	WarmSnapshot(ctx context.Context, nodeID, instance, storageKey, vmstateStorageKey string) (SnapshotBytes, error)
 	// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
 	// receipt of the guest-init "framework ready" vsock DGRAM
 	// signal (port 1027). Schedd itself doesn't call this — the
@@ -337,6 +345,18 @@ func (r *VMMRouter) PauseAndSnapshot(ctx context.Context, nodeID, instance, vmst
 		return SnapshotBytes{}, err
 	}
 	return cli.PauseAndSnapshot(ctx, instance, vmstatePath, storageKey, vmstateStorageKey)
+}
+
+// WarmSnapshot implements RoutedVMM (issue #470 / PR #470-FU-A).
+// Resolves the per-node client by nodeID and forwards to
+// VMMClient.WarmSnapshot. Returns Capacity on an unknown nodeID
+// (same as PauseAndSnapshot).
+func (r *VMMRouter) WarmSnapshot(ctx context.Context, nodeID, instance, storageKey, vmstateStorageKey string) (SnapshotBytes, error) {
+	cli, err := r.resolveFor(ctx, nodeID)
+	if err != nil {
+		return SnapshotBytes{}, err
+	}
+	return cli.WarmSnapshot(ctx, instance, storageKey, vmstateStorageKey)
 }
 
 // Destroy implements RoutedVMM.

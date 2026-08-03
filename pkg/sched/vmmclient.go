@@ -42,6 +42,15 @@ type VMM interface {
 	// uses the legacy host vmstate_path"; a populated value means
 	// "vmmd publishes via the configured StorageBackend".
 	PauseAndSnapshot(ctx context.Context, instance, vmstatePath, storageKey, vmstateStorageKey string) (SnapshotBytes, error)
+	// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+	// twin of PauseAndSnapshot. Storage key args are required
+	// (warm captures are storage-backend-only). Returns the
+	// snapshot byte counts so the engine can stamp the rows on
+	// the snapshots table. The vmmdgrpc.WarmSnapshot handler
+	// returns NotFound when the instance is unknown — the
+	// engine treats that as a "VM already gone" failure and
+	// destroys the live entry instead of writing a warm row.
+	WarmSnapshot(ctx context.Context, instance, storageKey, vmstateStorageKey string) (SnapshotBytes, error)
 	// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
 	// receipt of the guest-init "framework ready" vsock DGRAM
 	// signal (port 1027, msg=4). cmd/vmmd's DGRAM host recv loop
@@ -503,6 +512,23 @@ func (c *VMMClient) PauseAndSnapshot(ctx context.Context, instance, vmstatePath,
 	resp, err := c.cli.PauseAndSnapshot(ctx, &vmmdpb.PauseAndSnapshotRequest{
 		Instance:          instance,
 		VmstatePath:       vmstatePath,
+		StorageKey:        storageKey,
+		VmstateStorageKey: vmstateStorageKey,
+	})
+	if err != nil {
+		return SnapshotBytes{}, liftErr(err)
+	}
+	return SnapshotBytes{MemBytes: resp.GetMemBytes(), VMStateBytes: resp.GetVmstateBytes()}, nil
+}
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) wraps the new
+// vmmdgrpc.WarmSnapshot RPC. Forwards over gRPC to the
+// generated client and lifts the typed response into
+// SnapshotBytes. The instance + storage keys are required fields
+// — see vmmdgrpc.server.WarmSnapshot for the wire validation.
+func (c *VMMClient) WarmSnapshot(ctx context.Context, instance, storageKey, vmstateStorageKey string) (SnapshotBytes, error) {
+	resp, err := c.cli.WarmSnapshot(ctx, &vmmdpb.WarmSnapshotRequest{
+		Instance:          instance,
 		StorageKey:        storageKey,
 		VmstateStorageKey: vmstateStorageKey,
 	})

@@ -91,6 +91,13 @@ func (h *heartbeatFakeVMM) CreateFromSnapshot(context.Context, string, AppSpec, 
 func (h *heartbeatFakeVMM) PauseAndSnapshot(context.Context, string, string, string, string) (SnapshotBytes, error) {
 	return SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the heartbeat
+// test's no-op seam — the heartbeat path doesn't fire warm
+// captures.
+func (h *heartbeatFakeVMM) WarmSnapshot(context.Context, string, string, string) (SnapshotBytes, error) {
+	return SnapshotBytes{}, nil
+}
 func (h *heartbeatFakeVMM) Destroy(context.Context, string) error { return nil }
 
 // FrameworkReady implements RoutedVMM for the heartbeat test fake

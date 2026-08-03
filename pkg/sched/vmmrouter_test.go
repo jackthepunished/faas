@@ -52,6 +52,15 @@ func (f *fakeRouterVMM) PauseAndSnapshot(_ context.Context, instance, _, _, _ st
 	f.mu.Unlock()
 	return SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the vmmrouter
+// test's no-op seam — the router surface keeps the warm RPC
+// for engine_roundtrip tests but the present router_test cases
+// don't drive warm captures.
+func (f *fakeRouterVMM) WarmSnapshot(_ context.Context, _, _, _ string) (SnapshotBytes, error) {
+	return SnapshotBytes{}, nil
+}
+
 func (f *fakeRouterVMM) Destroy(_ context.Context, instance string) error {
 	f.mu.Lock()
 	f.instanceCalls = append(f.instanceCalls, instance)

@@ -90,6 +90,12 @@ type OpsMetrics struct {
 	// (from_state → to_state) — alerting on a non-zero rate of
 	// "waking→cold_booting" labels is the spec §6.1 health signal.
 	watchdogKills *prometheus.CounterVec
+	// warmSnapshotErrors (issue #470 / PR A / ADR-055). Labelled by
+	// reason ∈ {vmm_call, store_write}; the closed set disambiguates
+	// the two failure modes without leaking the deployment_id into
+	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
+	// panel is the §12 warm-capture-error alert's primary signal.
+	warmSnapshotErrors *prometheus.CounterVec
 	// eventsWriteFail: introduced in commit 4 for the audit-log
 	// emission. A non-zero rate indicates that transitions are
 	// succeeding but the events row isn't being written — the state
@@ -718,6 +724,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_watchdog_kills_total",
 		Help: "Count of instances the §6.1 watchdog transitioned out of a stuck state, labelled by from→to state.",
 	}, []string{"from_state", "to_state"})
+	// warmSnapshotErrors (issue #470 / PR A / ADR-055). Counts
+	// warm-tier snapshot failures vmm.WarmSnapshot raised. The fleet
+	// is healthy if rate() stays under the warm-capture-error alert
+	// (`monitoring/alerts/warm-snapshot.yml`); a sustained rate
+	// implies imaged's snapshot_written subscriber is the next
+	// place to look (no row → "snapshot_written" dropped).
+	warmSnapshotErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_warm_snapshot_errors_total",
+		Help: "Count of warm-tier snapshot failures (issue #470 / PR A / ADR-055), labelled by reason ∈ {vmm_call, store_write}. The vmm_call bucket is the dominant cause — disk-full, container-induced pause, or vmmd abort during /snapshot/create. The store_write bucket fires when CreateSnapshot rejected the staging row (schema mismatch, unique violation non-tier). The OpsMetrics.WarmSnapshotErrors() helper returns the per-reason counter.",
+	}, []string{"reason"})
+	warmSnapshotErrors.WithLabelValues("vmm_call")
+	warmSnapshotErrors.WithLabelValues("store_write")
 	rebalanceDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_rebalance_decisions_total",
 		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-064), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
@@ -1204,7 +1222,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, eventsWriteFail, auditWriteFail,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -1587,6 +1605,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ops:                                ops,
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
+		warmSnapshotErrors:                 warmSnapshotErrors,
 		eventsWriteFail:                    eventsWriteFail,
 		auditWriteFail:                     auditWriteFail,
 		auditWriteDur:                      auditWriteDur,
@@ -1658,6 +1677,27 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 // CounterVec is shared with other label tuples.
 func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter {
 	return m.watchdogKills.WithLabelValues(fromState, toState)
+}
+
+// WarmSnapshotErrors returns the per-reason counter the warm-tier
+// capture (issue #470 / PR A / ADR-055) increments on every soft
+// failure. The two label values are the only ones schedd emits:
+//   - "vmm_call" — vmm.WarmSnapshot returned a non-nil error and
+//     the engine transitioned the instance to STOPPED.
+//   - "store_write" — CreateSnapshot rejected the staging row.
+//     The corresponding vmm call still succeeded; the blob is on
+//     disk but the audit row is missing. PR C's ngcpath hook
+//     reconciles the delete.
+//
+// The returned Counter is safe to retain — Prometheus's
+// WithLabelValues is internally cached. nil-receiver guard mirrors
+// the EgressDeny / OCIEgressDeny pattern so unit tests without
+// metrics keep working.
+func (m *OpsMetrics) WarmSnapshotErrors(reason string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.warmSnapshotErrors.WithLabelValues(reason)
 }
 
 // RebalanceDecisions returns the per-(outcome) counter the Tier

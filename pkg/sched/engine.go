@@ -863,8 +863,12 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	wakeID := wakeUUID.String()
 
 	// Restore iff a fresh, version-matched snapshot exists; else cold boot
-	// (ADR-005: cold boot always works, snapshot is cache).
-	snap, haveSnap := e.usableSnapshot(ctx, dep.ID)
+	// (ADR-005: cold boot always works, snapshot is cache). The plan
+	// gate (issue #470 / PR A / ADR-055) is consulted here: a
+	// Free/Hobby account skips the warm tier and reads the init row
+	// directly. The warm row is still on disk for the customer's
+	// eventual re-upgrade (sticky-on-downgrade, ADR-055 §5).
+	snap, haveSnap := e.usableSnapshotForWake(ctx, dep.ID, string(acct.Plan))
 
 	initState := state.StateColdBooting
 	if haveSnap {
@@ -2699,6 +2703,27 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 		})
 	}
 
+	// issue #470 / PR A / ADR-070 — warm capture runs FIRST, while
+	// the VM is still live (RUNNING). The init tier's trailing Kill
+	// in vmm.Snapshot would otherwise destroy the VM the warm tier
+	// is trying to snapshot. Reordering also matches §6.3's warm-wake
+	// budget semantic: the runner is alive across the pause window
+	// and only the init tier's trailing Kill ends the customer-
+	// visible lifetime.
+	//
+	// capturedWarm returns (info, err). On error the helper has
+	// already Destroyed the VM and transitioned the row to STOPPED
+	// (the state machine forbids PARKED→STOPPED, so the warm
+	// failure must land BEFORE the PARKED transition).
+	warmInfo, warmErr := e.captureWarmSnapshotLocked(ctx, ins)
+	if warmErr != nil {
+		// Init blob on disk is orphaned — the next wake cold-boots
+		// (ADR-005) and PR C's GC sweep evicts the orphaned init row.
+		e.log.Warn("sched: capture warm snapshot failed", "instance", ins.ID, "err", warmErr)
+		return warmErr
+	}
+	_ = warmInfo
+
 	b, err := e.vmm.PauseAndSnapshot(ctx, ins.NodeID, ins.ID, vmstate, storageKey, vmstateStorageKey)
 	if err != nil {
 		// Snapshot failed (disk?) — free RAM and land in STOPPED; next wake
@@ -2729,8 +2754,150 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 			SnapshotID:  storageKey,
 		})
 	}
-	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b)
+	// Init-tier capture is the "cold" snapshot the next wake falls back
+	// to when no warm row exists or the plan no longer allows warm
+	// (issue #470 / PR A / ADR-070). Tagged tier="init" so the
+	// snapshot_written payload can be routed by imaged's row writer.
+	// The warm tier's row is owned by imaged's snapshot_written
+	// subscriber (PR #525) — the engine emits a sibling notify
+	// payload (tier=warm) from captureWarmSnapshotLocked on the
+	// success path so imaged writes both rows. The engine does NOT
+	// write the warm row directly to avoid a unique-violation on
+	// (deployment_id, tier) between engine and imaged.
+	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b, state.SnapshotTierInit)
 	return nil
+}
+
+// captureWarmSnapshotLocked (issue #470 / PR A / ADR-070) is the
+// warm-tier counterpart to snapshotAndPark's init-tier capture. It
+// runs under appMu inside the Park site — caller already holds the
+// lock. The four gates (any one fails → no warm capture) are:
+//  1. app.WarmSnapshotEnabled (the operator-opt-in flag — sticky on
+//     plan downgrade per ADR-070 §Plan gate)
+//  2. acct.Plan.WarmSnapshotAllowed() (the plan-gate that rejects
+//     warm at wake time anyway; doing it here too avoids burning
+//     pause/resume cycles for nothing)
+//  3. ins.FrameworkReadyAt != nil (the PR #543 stamp — a freshly
+//     primed instance is not yet warm; this is the only difference
+//     between the manual Prime path and the reaper-driven Park path)
+//  4. now - FrameworkReadyAt >= app.WarmSnapshotMinMs (the
+//     time-since-first-ready floor; A.3 covers the time half of
+//     the gate, the request-count half is PR C's audit work)
+//
+// On success: returns (nil, info) after emitting snapshot_written
+// {tier:warm}. imaged's snapshot_written subscriber (PR #525) is
+// the SINGLE writer of the warm-tier snapshots row — the engine
+// does NOT call store.CreateSnapshot for tier=warm directly, to
+// avoid a (deployment_id, tier) unique-violation with imaged's
+// subscriber. The caller (snapshotAndPark) threads the byte counts
+// through for log side-effects only; the audit row's MemBytes come
+// from the imaged-side write.
+//
+// On failure: Destroy + ledger.Release + transitionWithKind(STOPPED,
+// warm_capture_error, warm_snapshot_failed). The warm capture runs
+// BEFORE the init capture (caller's responsibility), so the VM is
+// still live at this point — Destroy releases the jailer / cgroup /
+// netns / chroot cleanly. The init capture NEVER runs in this branch
+// (the caller returns early). The next wake cold-boots (ADR-005).
+func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instance) (SnapshotBytes, error) {
+	// Gate 1 + 2: the easy cheap read. Load app + account once so
+	// the warm-failure path can also seal the audit row with the
+	// correct app/account pair.
+	app, err := e.store.AppByID(ctx, ins.AppID)
+	if err != nil {
+		return SnapshotBytes{}, fmt.Errorf("sched: warm capture: load app: %w", err)
+	}
+	if !app.WarmSnapshotEnabled {
+		return SnapshotBytes{}, nil
+	}
+	acct, err := e.store.AccountByID(ctx, app.AccountID)
+	if err != nil {
+		return SnapshotBytes{}, fmt.Errorf("sched: warm capture: load account: %w", err)
+	}
+	if !acct.Plan.WarmSnapshotAllowed() {
+		return SnapshotBytes{}, nil
+	}
+
+	// Gate 3 + 4: framework-ready stamp + time-since-first-ready
+	// floor. A nil FrameworkReadyAt means the runner never sent
+	// its DGRAM (it crashed, never woke, or the warmup timed out).
+	// WarmSnapshotMinMs is bounded [100, 60000] by apid's edit
+	// validator (handlers_ext.go:249-257), so denormalising to a
+	// duration is safe.
+	if ins.FrameworkReadyAt == nil {
+		return SnapshotBytes{}, nil
+	}
+	if app.WarmSnapshotMinMs > 0 {
+		minAge := time.Duration(app.WarmSnapshotMinMs) * time.Millisecond
+		if time.Since(*ins.FrameworkReadyAt) < minAge {
+			return SnapshotBytes{}, nil
+		}
+	}
+
+	// Compute the per-tier storage keys. The /warm/ segment keeps
+	// the blobs physically separate from the init tier so imaged's
+	// per-tier GC (PR C) can keep 2+2 without conflating them.
+	warmMemKey, warmVMStateStorageKey := e.warmKeysFor(ins.NodeID, ins.DeploymentID)
+
+	b, err := e.vmm.WarmSnapshot(ctx, ins.NodeID, ins.ID, warmMemKey, warmVMStateStorageKey)
+	if err != nil {
+		// Warm capture failed. The VM may be in a wedged state
+		// (paused — vmmd did the pause but the snapshot RPC
+		// failed before resume). Destroy + release + STOPPED so
+		// the next wake can cold-boot cleanly. Skip the init
+		// capture: there's no warm AND no init to keep — the
+		// operator gets a cold-boot next wake (ADR-005).
+		destroyErr := e.vmm.Destroy(ctx, ins.NodeID, ins.ID)
+		if destroyErr != nil {
+			e.log.Warn("sched: warm capture: destroy after snapshot failure", "instance", ins.ID, "err", destroyErr)
+		}
+		e.ledger.Release(ins.ID)
+		e.transitionWithKind(ctx, ins.ID, ins.AppID, state.StateStopped, "warm_capture_error", "warm_snapshot_failed")
+		if e.ops != nil {
+			e.ops.WarmSnapshotErrors("vmm_call").Inc()
+		}
+		return SnapshotBytes{}, fmt.Errorf("sched: warm capture: vmm WarmSnapshot: %w", err)
+	}
+
+	// Success: emit snapshot_written{tier:warm} so imaged's
+	// subscriber writes the warm-tier row (PR #525). The init
+	// capture (running next in the caller's Park sequence) emits
+	// its own snapshot_written{tier:init}; imaged's subscriber
+	// fans both out into distinct rows. We do NOT call
+	// store.CreateSnapshot tier=warm here to avoid a unique-
+	// violation on (deployment_id, tier) with imaged's row.
+	vmstatePath := SnapDir() + "/" + ins.DeploymentID + "/warm/vmstate"
+	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstatePath, b, state.SnapshotTierWarm)
+	return b, nil
+}
+
+// warmKeysFor returns the canonical StorageBackend keys the
+// warm-tier capture publishes the mem + vmstate blobs under.
+// Symmetric with vmstateStorageKeyFor: empty result for
+// default-local (vmmd's legacy host-path branch), populated for
+// remote nodes (StorageBackend publish path). Empty nodeID is
+// treated as a misroute (Warn + return "") matching the legacy
+// helper's defensive posture so a placement decision that
+// omits node_id at the source surfaces in logs rather than
+// silently picking the wrong storage carrier.
+//
+// The /warm/ segment lives under pkg/state.WarmSnapMemKey /
+// WarmSnapVMStateKey so PR-C's per-tier GC keeps 2 warm + 2 init
+// per app without conflating tiers. Mem and vmstate always share
+// the same local/remote branch — the carrier is a per-node
+// decision, not a per-blob one.
+func (e *Engine) warmKeysFor(nodeID, depID string) (memKey, vmstateKey string) {
+	if nodeID == "" {
+		if e.log != nil {
+			e.log.Warn("engine: warmKeysFor called with empty nodeID; routing to host-path fallback",
+				"deployment_id", depID)
+		}
+		return "", ""
+	}
+	if nodeID == e.defaultLocalNodeID {
+		return "", ""
+	}
+	return state.WarmSnapMemKey(depID), state.WarmSnapVMStateKey(depID)
 }
 
 // resolveApp loads the app, account, plan limits, and current live deployment a
@@ -2936,6 +3103,49 @@ func (e *Engine) usableSnapshot(ctx context.Context, deploymentID string) (state
 		return state.Snapshot{}, false
 	}
 	return snap, true
+}
+
+// usableSnapshotForWake (issue #470 / PR A / ADR-055) is the tier-aware
+// counterpart to usableSnapshot. It honours the plan gate: a Free or
+// Hobby account (WarmSnapshotAllowed() == false) skips the warm-tier
+// lookup entirely and reads the init-tier row directly. Pro/Scale
+// accounts consult LatestSnapshot, which already ranks warm > init on
+// the (tier='warm') DESC, created_at DESC order (PR #525 /
+// pkg/state/pgstore.go:5669).
+//
+// The function is the only place the wake path consults the tier
+// column — Phase 3 reads snap.StorageKey and Threads it through
+// SnapshotRef{StorageKey: snapKey}, so the "warm row" preference
+// surfaces naturally because warm-tier publication keys live at
+// <snap/<dep>/warm/mem> vs init's <snap/<dep>/mem>. vmmd resolves
+// the key through the StorageBackend, so the storage path is
+// transparent to the engine.
+//
+// Sticky-on-downgrade (ADR-055 §5): apps.warm_snapshot_enabled stays
+// true across a Pro→Free downgrade, but the next wake sees the
+// init-tier row instead. The warm row is left on disk for the
+// customer's eventual re-upgrade; the next park the plan allows
+// warm again will pick up where the engine left off.
+func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan string) (state.Snapshot, bool) {
+	if !planAllowsWarm(plan) {
+		snap, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierInit)
+		if err != nil || snap.Stale || snap.FCVersion != e.fcVer {
+			return state.Snapshot{}, false
+		}
+		return snap, true
+	}
+	return e.usableSnapshot(ctx, deploymentID)
+}
+
+// planAllowsWarm is a thin wrapper that resolves the plan's
+// WarmSnapshotAllowed() at the Wake site without dragging the
+// whole api.Limits table into engine.go's import graph. Returns
+// false for unknown plans (Free/Hobby/explicit false) and true only
+// for Pro/Scale. The string form is what the Wake already has on
+// hand (acct.Plan) so we don't re-resolve the api.Limits row.
+func planAllowsWarm(plan string) bool {
+	p := api.Plan(plan)
+	return p.WarmSnapshotAllowed()
 }
 
 // StuckReason is the watchdog's reason for forcing a transition
@@ -3161,9 +3371,18 @@ func (e *Engine) emitInstanceChanged(ctx context.Context, instanceID, appID stri
 	}
 }
 
-func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstatePath string, b SnapshotBytes) {
+// emitSnapshotWritten publishes the snapshot_written payload imaged
+// consumes to record a row in the snapshots table. The tier argument
+// (issue #470 / PR A / ADR-055) lets the same payload carry
+// tier="warm" when the engine captured a warm snapshot and tier="init"
+// for the legacy cold capture. imaged's subscriber reads the field
+// from the JSON and writes the matching snapshots.tier column.
+func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstatePath string, b SnapshotBytes, tier string) {
 	if e.notif == nil {
 		return
+	}
+	if tier == "" {
+		tier = state.SnapshotTierInit
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"deployment_id": deploymentID,
@@ -3172,9 +3391,10 @@ func (e *Engine) emitSnapshotWritten(ctx context.Context, deploymentID, vmstateP
 		"mem_bytes":     b.MemBytes,
 		"vmstate_bytes": b.VMStateBytes,
 		"fc_version":    e.fcVer,
+		"tier":          tier,
 	})
 	if err := e.notif.Notify(ctx, db.NotifySnapshotWritten, string(payload)); err != nil {
-		e.log.Warn("emit snapshot_written", "deployment", deploymentID, "err", err)
+		e.log.Warn("emit snapshot_written", "deployment", deploymentID, "tier", tier, "err", err)
 	}
 }
 

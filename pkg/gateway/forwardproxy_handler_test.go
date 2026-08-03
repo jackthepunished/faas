@@ -80,6 +80,16 @@ func (s *stubVmmdClient) CreateColdBoot(context.Context, *vmmdpb.CreateColdBootR
 func (s *stubVmmdClient) PauseAndSnapshot(context.Context, *vmmdpb.PauseAndSnapshotRequest, ...grpc.CallOption) (*vmmdpb.SnapshotResponse, error) {
 	panic("PauseAndSnapshot: not stubbed in handler integration test")
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the forwardproxy
+// handler integration test's no-op seam — the gateway forward
+// path doesn't fire warm captures (the engine reaper is the
+// only entry point). The stub intentionally panics if the
+// test path ever wires it through so it surfaces as a clear
+// test mistake rather than a silent no-op.
+func (s *stubVmmdClient) WarmSnapshot(context.Context, *vmmdpb.WarmSnapshotRequest, ...grpc.CallOption) (*vmmdpb.SnapshotResponse, error) {
+	panic("WarmSnapshot: not stubbed in handler integration test")
+}
 func (s *stubVmmdClient) Destroy(context.Context, *vmmdpb.DestroyRequest, ...grpc.CallOption) (*vmmdpb.DestroyResponse, error) {
 	return &vmmdpb.DestroyResponse{}, nil
 }

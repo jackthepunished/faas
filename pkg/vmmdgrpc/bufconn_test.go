@@ -102,6 +102,19 @@ func (f *fakeVMM) Park(ctx context.Context, instance string, spec fcvm.SnapshotS
 	return fcvm.SnapshotInfo{MemBytes: 1024 * 1024 * 130, VMStateBytes: 4096}, nil
 }
 
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the fake hot
+// half of the warm path. The bufconn test asserts the wire
+// round-trip; the in-memory fake just returns the snapshot
+// bytes and keeps the live count intact (the warm path
+// purposefully does NOT release the chroot — see
+// Manager.WarmSnapshot).
+func (f *fakeVMM) WarmSnapshot(ctx context.Context, instance string, spec fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error) {
+	if instance != "live-1" {
+		return fcvm.SnapshotInfo{}, errNotLive
+	}
+	return fcvm.SnapshotInfo{MemBytes: 1024 * 1024 * 130, VMStateBytes: 4096}, nil
+}
+
 func (f *fakeVMM) Destroy(ctx context.Context, instance string) error {
 	if f.destroy != nil {
 		return f.destroy(ctx, instance)
@@ -350,6 +363,67 @@ func TestPauseAndSnapshot_NotLive(t *testing.T) {
 	if code := status.Code(err); code != codes.Internal {
 		t.Fatalf("code = %v, want Internal", code)
 	}
+}
+
+// TestWarmSnapshot_RoundTrip (issue #470 / PR A / ADR-055) pins
+// the WarmSnapshot wire shape. The handler must accept the
+// {instance, storage_key, vmstate_storage_key} triple, surface a
+// meaningful SnapshotResponse, and reject empty required fields
+// with InvalidArgument. The success path stores the request
+// fields on the fake so a future regression that drops the
+// vmstate_storage_key from the wire trips here.
+func TestWarmSnapshot_RoundTrip(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		f := &fakeVMM{}
+		cli, _ := newServer(t, f)
+		resp, err := cli.WarmSnapshot(context.Background(), &vmmdpb.WarmSnapshotRequest{
+			Instance:          "live-1",
+			StorageKey:        "snap/live-1/warm/mem",
+			VmstateStorageKey: "snap/live-1/warm/vmstate",
+		})
+		if err != nil {
+			t.Fatalf("WarmSnapshot: %v", err)
+		}
+		if resp.GetMemBytes() != 1024*1024*130 {
+			t.Errorf("mem_bytes = %d, want %d", resp.GetMemBytes(), 1024*1024*130)
+		}
+	})
+	t.Run("missing instance", func(t *testing.T) {
+		cli, _ := newServer(t, &fakeVMM{})
+		_, err := cli.WarmSnapshot(context.Background(), &vmmdpb.WarmSnapshotRequest{
+			StorageKey:        "snap/x/warm/mem",
+			VmstateStorageKey: "snap/x/warm/vmstate",
+		})
+		if code := status.Code(err); code != codes.InvalidArgument {
+			t.Fatalf("code = %v, want InvalidArgument", code)
+		}
+	})
+	t.Run("missing storage_key", func(t *testing.T) {
+		cli, _ := newServer(t, &fakeVMM{})
+		_, err := cli.WarmSnapshot(context.Background(), &vmmdpb.WarmSnapshotRequest{
+			Instance:          "live-1",
+			VmstateStorageKey: "snap/live-1/warm/vmstate",
+		})
+		if code := status.Code(err); code != codes.InvalidArgument {
+			t.Fatalf("code = %v, want InvalidArgument", code)
+		}
+	})
+	t.Run("missing vmstate_storage_key", func(t *testing.T) {
+		// Warm captures are storage-backend-only — neither key
+		// has a host-path fallback the way PauseAndSnapshot's
+		// vmstate_path does. The handler rejects missing
+		// vmstate_storage_key with InvalidArgument so a
+		// default-local-vs-remote split doesn't leak into the
+		// capture path.
+		cli, _ := newServer(t, &fakeVMM{})
+		_, err := cli.WarmSnapshot(context.Background(), &vmmdpb.WarmSnapshotRequest{
+			Instance:   "live-1",
+			StorageKey: "snap/live-1/warm/mem",
+		})
+		if code := status.Code(err); code != codes.InvalidArgument {
+			t.Fatalf("code = %v, want InvalidArgument", code)
+		}
+	})
 }
 
 func TestDestroy_Idempotent(t *testing.T) {

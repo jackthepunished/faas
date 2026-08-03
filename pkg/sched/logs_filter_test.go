@@ -87,6 +87,13 @@ func (r *deploymentFilterFakeVMM) CreateFromSnapshot(context.Context, string, st
 func (r *deploymentFilterFakeVMM) PauseAndSnapshot(context.Context, string, string, string, string, string) (SnapshotBytes, error) {
 	return SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the logs-filter
+// test's no-op seam — the logs stream path doesn't fire warm
+// captures.
+func (r *deploymentFilterFakeVMM) WarmSnapshot(context.Context, string, string, string, string) (SnapshotBytes, error) {
+	return SnapshotBytes{}, nil
+}
 func (r *deploymentFilterFakeVMM) Destroy(context.Context, string, string) error { return nil }
 
 // FrameworkReady implements RoutedVMM for the logs-filter test

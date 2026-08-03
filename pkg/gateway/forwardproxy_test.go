@@ -70,6 +70,15 @@ func (f *fakeVmmdClient) CreateColdBoot(context.Context, *vmmdpb.CreateColdBootR
 func (f *fakeVmmdClient) PauseAndSnapshot(context.Context, *vmmdpb.PauseAndSnapshotRequest, ...grpc.CallOption) (*vmmdpb.SnapshotResponse, error) {
 	panic("PauseAndSnapshot: not stubbed")
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the
+// forwardproxy test's no-op seam — the gateway forward path
+// doesn't fire warm captures. The stub intentionally panics
+// so a future test that wires it through surfaces as a clean
+// test mistake.
+func (f *fakeVmmdClient) WarmSnapshot(context.Context, *vmmdpb.WarmSnapshotRequest, ...grpc.CallOption) (*vmmdpb.SnapshotResponse, error) {
+	panic("WarmSnapshot: not stubbed")
+}
 func (f *fakeVmmdClient) Destroy(context.Context, *vmmdpb.DestroyRequest, ...grpc.CallOption) (*vmmdpb.DestroyResponse, error) {
 	panic("Destroy: not stubbed")
 }
