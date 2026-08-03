@@ -122,6 +122,8 @@ var schemaSpecOnly = map[string]bool{
 	"ChangePlanRequest": true, // inline {Plan string} in cmd/apid/handlers_ext.go
 	"CreateKeyRequest":  true, // inline {Label string} in cmd/apid/handlers_ext.go
 	"RateLimitPlain":    true, // documentation-only shape for the authlimiter 429
+	"Trace":             true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
+	"TraceSpan":         true, // issue #555: subtree of Trace; gateway-internal type
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.

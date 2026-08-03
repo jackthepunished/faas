@@ -7092,6 +7092,46 @@ components:
           type: string
           pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
+    Trace:
+      description: |
+        Issue #555. A single OpenTelemetry trace — the span tree for one
+        request (one wake). The shape mirrors the SDK's ReadOnlySpan
+        flattened to JSON: trace_id + span_id are W3C hex, attributes
+        are a string map (the operator's debug session is a grep, not
+        a query). The same trace_id may host a
+        `gateway.handler` → `gateway.route` → `sched.wake` →
+        `vmmd.create_*` → `guest.resume` → `guest.readiness` chain
+        (issue #555 acceptance #1).
+      type: object
+      required: [trace_id, spans]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        started_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        spans:
+          type: array
+          items: { $ref: '#/components/schemas/TraceSpan' }
+
+    TraceSpan:
+      description: |
+        One span in a trace. Mirrors the OTel SDK's ReadOnlySpan
+        attributes (kind, name, status, parent linkage, timing) so
+        the customer's debug session can reconstruct the call tree.
+      type: object
+      required: [trace_id, span_id, name]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        parent_span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        name: { type: string, example: sched.wake }
+        start_time: { type: string, format: date-time }
+        end_time: { type: string, format: date-time }
+        status: { type: string, enum: [ok, error] }
+        status_message: { type: string }
+        attributes:
+          type: object
+          additionalProperties: { type: string }
+
   responses:
 
     Unauthorized:
@@ -7357,44 +7397,3 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
         text/plain:
           schema: { $ref: '#/components/schemas/RateLimitPlain' }
-
-
-    Trace:
-      description: |
-        Issue #555. A single OpenTelemetry trace — the span tree for one
-        request (one wake). The shape mirrors the SDK's ReadOnlySpan
-        flattened to JSON: trace_id + span_id are W3C hex, attributes
-        are a string map (the operator's debug session is a grep, not
-        a query). The same trace_id may host a
-        `gateway.handler` → `gateway.route` → `sched.wake` →
-        `vmmd.create_*` → `guest.resume` → `guest.readiness` chain
-        (issue #555 acceptance #1).
-      type: object
-      required: [trace_id, spans]
-      properties:
-        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        started_at: { type: string, format: date-time }
-        last_seen_at: { type: string, format: date-time }
-        spans:
-          type: array
-          items: { $ref: '#/components/schemas/TraceSpan' }
-
-    TraceSpan:
-      description: |
-        One span in a trace. Mirrors the OTel SDK's ReadOnlySpan
-        attributes (kind, name, status, parent linkage, timing) so
-        the customer's debug session can reconstruct the call tree.
-      type: object
-      required: [trace_id, span_id, name]
-      properties:
-        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
-        parent_span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
-        name: { type: string, example: sched.wake }
-        start_time: { type: string, format: date-time }
-        end_time: { type: string, format: date-time }
-        status: { type: string, enum: [ok, error] }
-        status_message: { type: string }
-        attributes:
-          type: object
-          additionalProperties: { type: string }
