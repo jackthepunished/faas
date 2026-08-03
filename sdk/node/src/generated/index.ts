@@ -145,6 +145,8 @@ export type { Sidecar } from './models/Sidecar.js';
 export type { Slug } from './models/Slug.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';
+export type { Trace } from './models/Trace.js';
+export type { TraceSpan } from './models/TraceSpan.js';
 export type { TransferOwnershipRequest } from './models/TransferOwnershipRequest.js';
 export type { TrustedSigner } from './models/TrustedSigner.js';
 export type { UpdateAlertRuleRequest } from './models/UpdateAlertRuleRequest.js';
