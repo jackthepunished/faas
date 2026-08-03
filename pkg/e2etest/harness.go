@@ -424,10 +424,7 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 		// doesn't scrape /metrics; the scrape observer is still wired
 		// into the main mux so the dashboard panels stay accurate.
 		// Per-test FAAS_SPOOL_ROOT + FAAS_SCAN_SPOOL_ROOT — see
-		// startAPID in Start for the rationale (PR #541 themed e2e
-		// files share one APID across many subtests; without these,
-		// concurrent applies race on /var/spool/faas/builds and fail
-		// with 503 capacity_unavailable).
+		// startAPID in Start for the rationale.
 		spoolRoot := filepath.Join(h.TmpDir, "spool")
 		scanRoot := filepath.Join(h.TmpDir, "scan-spool")
 		for _, d := range []string{spoolRoot, scanRoot} {
@@ -481,14 +478,15 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 	t.Helper()
 	addr := freeTCPAddr(t)
-	// Per-test spool roots. PR #541 collapsed the apply e2es into one
-	// themed file (TestApplyProject_*) which shares one APID subprocess
-	// across many t.Run subtests. Without per-test FAAS_SPOOL_ROOT +
-	// FAAS_SCAN_SPOOL_ROOT, every subtest writes to the system-wide
-	// default (/var/spool/faas/builds) and concurrent applies race
-	// each other to mkdir the same parent — yielding 503
+	// Per-test spool roots. Without per-test FAAS_SPOOL_ROOT +
+	// FAAS_SCAN_SPOOL_ROOT, every test writes to the system-wide default
+	// (/var/spool/faas/builds) and concurrent tests in the same
+	// package race each other to mkdir the same parent — yielding 503
 	// capacity_unavailable "could not create spool dir" in
-	// cmd/apid/extract.go and cmd/apid/deploy_inputs.go.
+	// cmd/apid/extract.go and cmd/apid/deploy_inputs.go. (Go runs
+	// tests in the same package serially unless -parallel is set, but
+	// once any package-level parallelism is introduced, the per-test
+	// temp dirs keep behaviour stable.)
 	spoolRoot := filepath.Join(h.TmpDir, "spool")
 	scanRoot := filepath.Join(h.TmpDir, "scan-spool")
 	for _, d := range []string{spoolRoot, scanRoot} {
