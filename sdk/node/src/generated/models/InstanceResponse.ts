@@ -16,5 +16,6 @@ export type InstanceResponse = {
   started_at?: string | null;
   last_request_at?: string | null;
   parked_at?: string | null;
+  min_instances_target?: number | null;
 };
 

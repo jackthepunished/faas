@@ -116,21 +116,21 @@ type PlanResolver interface {
 // than multiple positional args) lets the test rig cover every
 // branch compactly.
 type AppStats struct {
-	AppID           string
-	AccountID       string
-	Plan            api.Plan
-	Floor           int           // EffectiveMinInstances (max of column + jsonb)
-	Concurrency     int           // ledger.Concurrency
-	MaxConcurrency  int           // plan MaxConcurrency
-	ResidentRAMMB   int           // ledger.ResidentRAM at tick time
-	HeadroomMB      int           // ledger.HeadroomMB at tick time
-	RAMMB           int           // app.RAMMB
-	WorkloadClass   state.WorkloadClass
-	LastScaleOutAt  time.Time     // zero = never stamped
-	ScaleOutCooldownS int         // 0 = no cooldown
-	Now             time.Time
-	BackoffUntil    time.Time     // zero = not in backoff
-	IsRamCeiling    bool          // pre-computed: would admit breach HeadroomMB
+	AppID             string
+	AccountID         string
+	Plan              api.Plan
+	Floor             int // EffectiveMinInstances (max of column + jsonb)
+	Concurrency       int // ledger.Concurrency
+	MaxConcurrency    int // plan MaxConcurrency
+	ResidentRAMMB     int // ledger.ResidentRAM at tick time
+	HeadroomMB        int // ledger.HeadroomMB at tick time
+	RAMMB             int // app.RAMMB
+	WorkloadClass     state.WorkloadClass
+	LastScaleOutAt    time.Time // zero = never stamped
+	ScaleOutCooldownS int       // 0 = no cooldown
+	Now               time.Time
+	BackoffUntil      time.Time // zero = not in backoff
+	IsRamCeiling      bool      // pre-computed: would admit breach HeadroomMB
 }
 
 // Decision is the typed result of decide(). Outcome must always be

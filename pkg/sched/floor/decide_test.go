@@ -16,18 +16,18 @@ func TestDecide_Total(t *testing.T) {
 	lastScaleOut := now.Add(-30 * time.Second)
 	cooldownS := 60
 	ramOK := AppStats{
-		AppID:            "app-1",
-		AccountID:        "acct-1",
-		Plan:             api.PlanHobby,
-		Floor:            2,
-		Concurrency:      0,
-		MaxConcurrency:   2,
-		RAMMB:            256,
-		WorkloadClass:    state.WorkloadClassHTTP,
-		LastScaleOutAt:   time.Time{},
+		AppID:             "app-1",
+		AccountID:         "acct-1",
+		Plan:              api.PlanHobby,
+		Floor:             2,
+		Concurrency:       0,
+		MaxConcurrency:    2,
+		RAMMB:             256,
+		WorkloadClass:     state.WorkloadClassHTTP,
+		LastScaleOutAt:    time.Time{},
 		ScaleOutCooldownS: 0,
-		Now:              now,
-		IsRamCeiling:     false,
+		Now:               now,
+		IsRamCeiling:      false,
 	}
 	cases := []struct {
 		name     string
@@ -80,15 +80,15 @@ func TestDecide_Total(t *testing.T) {
 			want:   OutcomeCooldownHeld,
 		},
 		{
-			name:   "cooldown zero (no opt-in) → admit",
-			mutate: func(s *AppStats) { s.LastScaleOutAt = lastScaleOut; s.ScaleOutCooldownS = 0 },
-			want:   OutcomeAdmit,
+			name:     "cooldown zero (no opt-in) → admit",
+			mutate:   func(s *AppStats) { s.LastScaleOutAt = lastScaleOut; s.ScaleOutCooldownS = 0 },
+			want:     OutcomeAdmit,
 			admitNow: true,
 		},
 		{
-			name:   "cooldown elapsed → admit",
-			mutate: func(s *AppStats) { s.LastScaleOutAt = now.Add(-120 * time.Second); s.ScaleOutCooldownS = cooldownS },
-			want:   OutcomeAdmit,
+			name:     "cooldown elapsed → admit",
+			mutate:   func(s *AppStats) { s.LastScaleOutAt = now.Add(-120 * time.Second); s.ScaleOutCooldownS = cooldownS },
+			want:     OutcomeAdmit,
 			admitNow: true,
 		},
 		{
@@ -97,9 +97,9 @@ func TestDecide_Total(t *testing.T) {
 			want:   OutcomeBackoffHeld,
 		},
 		{
-			name:   "backoff elapsed → admit",
-			mutate: func(s *AppStats) { s.BackoffUntil = now.Add(-1 * time.Second) },
-			want:   OutcomeAdmit,
+			name:     "backoff elapsed → admit",
+			mutate:   func(s *AppStats) { s.BackoffUntil = now.Add(-1 * time.Second) },
+			want:     OutcomeAdmit,
 			admitNow: true,
 		},
 		{
@@ -108,9 +108,9 @@ func TestDecide_Total(t *testing.T) {
 			want:   OutcomeRamCeiling,
 		},
 		{
-			name:   "happy path → admit",
-			mutate: func(s *AppStats) {},
-			want:   OutcomeAdmit,
+			name:     "happy path → admit",
+			mutate:   func(s *AppStats) {},
+			want:     OutcomeAdmit,
 			admitNow: true,
 		},
 	}

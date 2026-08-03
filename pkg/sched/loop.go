@@ -1195,11 +1195,11 @@ func (l *Loop) emitScaleDownAudit(ctx context.Context, appID string, desired int
 // logged but does not roll back the Park calls.
 func (l *Loop) emitFloorReleasedAudit(ctx context.Context, appID string, floor, postPark int, now time.Time) {
 	data, err := json.Marshal(map[string]any{
-		"app":        appID,
-		"floor":      floor,
-		"post_park":  postPark,
-		"reason":     "min_instances_lowered",
-		"now":        now.UTC().Format(time.RFC3339Nano),
+		"app":       appID,
+		"floor":     floor,
+		"post_park": postPark,
+		"reason":    "min_instances_lowered",
+		"now":       now.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		l.log.Warn("reaper: marshal floor-released audit", "err", err)

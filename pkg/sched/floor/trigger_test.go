@@ -157,8 +157,8 @@ func TestTick_AdmitsUpToFloor(t *testing.T) {
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	auditor := &fakeAuditor{}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
-		Auditor: auditor,
+		Metrics:      wire.NewOpsMetrics("schedd"),
+		Auditor:      auditor,
 		PlanResolver: resolver,
 	})
 
@@ -200,7 +200,7 @@ func TestTick_FreePlanDisabled(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanFree}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -222,7 +222,7 @@ func TestTick_WorkerClassDisabled(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -249,7 +249,7 @@ func TestTick_BillableExceedsHeadroom(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanPro}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -269,7 +269,7 @@ func TestTick_AtCapacityRecordedNotErrored(t *testing.T) {
 	engine := &fakeEngine{results: map[string]AdmitResult{"app1": {AtCapacity: true}}}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -297,7 +297,7 @@ func TestTick_EngineErrorRecordsBackoff(t *testing.T) {
 	engine := &fakeEngine{errs: map[string]error{"app1": errors.New("vmmd unreachable")}}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -339,7 +339,7 @@ func TestTick_ScaleOutCooldownHeld(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -360,7 +360,7 @@ func TestTick_OwnerNodeIDRoutesToListAppsByNodeID(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 
@@ -433,7 +433,7 @@ func TestTick_NilLedgerIsSafe(t *testing.T) {
 	engine := &fakeEngine{}
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	tr := New(store, nil, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
+		Metrics:      wire.NewOpsMetrics("schedd"),
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
@@ -471,8 +471,8 @@ func TestTick_AuditorEmitsFloorWake(t *testing.T) {
 	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
 	auditor := &fakeAuditor{}
 	tr := New(store, ledger, engine, Options{
-		Metrics: wire.NewOpsMetrics("schedd"),
-		Auditor: auditor,
+		Metrics:      wire.NewOpsMetrics("schedd"),
+		Auditor:      auditor,
 		PlanResolver: resolver,
 	})
 	if err := tr.Tick(context.Background()); err != nil {
