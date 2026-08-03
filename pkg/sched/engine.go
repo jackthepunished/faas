@@ -3065,6 +3065,26 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 	// violation on (deployment_id, tier) with imaged's row.
 	vmstatePath := SnapDir() + "/" + ins.DeploymentID + "/warm/vmstate"
 	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstatePath, b, state.SnapshotTierWarm)
+	// Issue #470 / PR C / ADR-072: emit app.warm_snapshot_promoted
+	// so operators can grep gregale audit-events --kind-prefix
+	// warm_snapshot to see lifecycle activity. Subject is
+	// &app.AccountID (matches app.updated's account-scoped shape at
+	// handlers_ext.go:569 — diverges from app.characterized's nil
+	// subject deliberately for account-scoped listing per ADR-072
+	// §3.2). MemBytes comes from b; the snap row id is unknown at
+	// this point (imaged's subscriber writes it), so payload
+	// carries the deployment id instead.
+	if e.audit != nil {
+		e.audit.Emit(ctx, "app.warm_snapshot_promoted", &app.AccountID, map[string]any{
+			"app_id":                 app.ID,
+			"deployment_id":          ins.DeploymentID,
+			"warm_min_requests":      app.WarmSnapshotMinRequests,
+			"warm_min_ms":            app.WarmSnapshotMinMs,
+			"mem_bytes":              b.MemBytes,
+			"tier":                   state.SnapshotTierWarm,
+			"framework_ready_to_park_ms": time.Since(*ins.FrameworkReadyAt).Milliseconds(),
+		})
+	}
 	return b, nil
 }
 
