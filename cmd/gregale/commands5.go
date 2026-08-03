@@ -437,8 +437,18 @@ func cmdAppScale(slug string, args []string) int {
 	min := fs.Int("min", 0, "min instances kept warm (Pro/Scale only; 0 = scale to zero)")
 	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
 	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
+	// Issue #470 / PR C / ADR-072: warm-snapshot opt-in flags.
+	// Mirror commands2.go:cmdApp so `gregale app <slug> scale --warm-snapshot`
+	// is the canonical ES-2.4 form.
+	warm := fs.Bool("warm-snapshot", false, "enable warm-snapshot tier (Pro/Scale only)")
+	noWarm := fs.Bool("no-warm-snapshot", false, "disable warm-snapshot tier")
+	warmMinReq := fs.Int("warm-snapshot-min-requests", 0, "warm-snapshot min-request gate (1..100; 0 = use server default)")
+	warmMinMs := fs.Int("warm-snapshot-min-ms", 0, "warm-snapshot min-ms-since-ready gate (100..60000; 0 = use server default)")
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+	if *warm && *noWarm {
+		return printErr("Invalid flags", fmt.Errorf("--warm-snapshot and --no-warm-snapshot are mutually exclusive"))
 	}
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
@@ -467,10 +477,27 @@ func cmdAppScale(slug string, args []string) int {
 		v := *cpu
 		req.AutoscaleTargetCPUPct = &v
 	}
+	if explicit["warm-snapshot"] {
+		v := true
+		req.WarmSnapshotEnabled = &v
+	}
+	if explicit["no-warm-snapshot"] {
+		v := false
+		req.WarmSnapshotEnabled = &v
+	}
+	if explicit["warm-snapshot-min-requests"] {
+		v := *warmMinReq
+		req.WarmSnapshotMinRequests = &v
+	}
+	if explicit["warm-snapshot-min-ms"] {
+		v := *warmMinMs
+		req.WarmSnapshotMinMs = &v
+	}
 	if req.RAMMB == nil && req.MaxConcurrency == nil &&
 		req.IdleTimeoutS == nil && req.MinInstances == nil &&
-		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> scale [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N]", "apps")
+		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
+		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil {
+		PrintUsage(os.Stderr, "usage: gregale app <slug> scale [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N]", "apps")
 		return 1
 	}
 	client, err := authedClient()
