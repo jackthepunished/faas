@@ -231,7 +231,14 @@ func runDrain(ctx context.Context, log *slog.Logger, internalSrv, controlSrv *ht
 	case err := <-errc:
 		return err
 	}
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Shutdown both servers gracefully. 5 s grace.
+	// context.WithoutCancel detaches from the parent's cancellation
+	// so a SIGTERM-driven parent cancel can't short-circuit the
+	// grace period before in-flight requests finish (golangci-lint
+	// v8 contextcheck: `Background` would lose any deadline set by
+	// the wire.Daemon harness; WithoutCancel keeps the deadline
+	// without inheriting the parent cancel).
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := internalSrv.Shutdown(sctx); err != nil {
 		log.Warn("gatewayd-internal: internal Shutdown", "err", err)

@@ -298,10 +298,9 @@ func TestLeader_Renew_ClosureErrorPropagated(t *testing.T) {
 // dial + write. It implements PushDialer so the production
 // code path is exercised.
 type capturePushDialer struct {
-	mu       sync.Mutex
-	conns    []string
-	writes   [][]byte
-	writeErr error // injected into Write when non-nil
+	mu     sync.Mutex
+	conns  []string
+	writes [][]byte
 }
 
 func (c *capturePushDialer) DialPush(_ context.Context, addr string) (net.Conn, error) {

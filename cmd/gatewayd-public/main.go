@@ -108,24 +108,6 @@ func main() {
 	wire.Daemon("gatewayd-public", run)
 }
 
-// publicDeps is the production dependency bundle. Tests can swap
-// fields via setPublicDepsForTest.
-type publicDeps struct {
-	pgPool  *pgxpool.Pool
-	pgStore *state.PgStore
-	listen  func(network, addr string) (net.Listener, error)
-	tlsCert *gateway.TLSBundle
-	log     *slog.Logger
-	nodeID  string
-}
-
-func defaultPublicDeps() publicDeps {
-	return publicDeps{
-		listen: net.Listen,
-		log:    slog.Default(),
-	}
-}
-
 // run is the daemon entry point. It builds the listener stack,
 // wires the readiness probe, and blocks on ctx cancellation.
 func run(ctx context.Context, log *slog.Logger) error {
@@ -174,7 +156,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		HetznerZone:             appsDomain,
 		StorageDir:              storageDir,
 		ContactEmail:            envOr("FAAS_ACME_CONTACT_EMAIL", "ops@"+appsDomain),
-		OnDemandHTTP01Allowlist: gateway.NewPGAllowlist(domainLookup(pgStore), log),
+		OnDemandHTTP01Allowlist: gateway.NewPGAllowlist(domainLookup(pgStore), log), //nolint:contextcheck // NewPGAllowlist does not take a ctx
 	}, hetznerToken, log, nil, nil)
 	if err != nil {
 		return fmt.Errorf("gatewayd-public: certmagic: %w", err)
@@ -379,7 +361,13 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 		return err
 	}
 	// Shutdown both servers gracefully. 5 s grace.
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// context.WithoutCancel detaches from the parent's cancellation
+	// so a SIGTERM-driven parent cancel can't short-circuit the
+	// grace period before in-flight requests finish (golangci-lint
+	// v8 contextcheck: `Background` would lose any deadline set by
+	// the wire.Daemon harness; WithoutCancel keeps the deadline
+	// without inheriting the parent cancel).
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := publicSrv.Shutdown(sctx); err != nil {
 		log.Warn("gatewayd-public: public Shutdown", "err", err)
