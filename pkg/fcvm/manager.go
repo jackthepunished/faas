@@ -86,6 +86,27 @@ type VMM interface {
 	// Snapshot pauses the running VM, writes a full snapshot to spec's paths, and
 	// destroys the VM (spec §4.4). The instance is gone when this returns.
 	Snapshot(ctx context.Context, l Lease, spec SnapshotSpec) (SnapshotInfo, error)
+	// SnapshotKeepAlive (issue #470 / PR #470-FU-A) is the warm-tier
+	// twin of Snapshot: pause + /snapshot/create + publish mem + vmstate
+	// through the configured StorageBackend, then return WITHOUT the
+	// trailing Kill. The VM stays paused until the caller fires Resume
+	// (see ResumeVM below). Returns (SnapshotInfo, error) in the same
+	// shape as Snapshot so the wire envelope and DB row write are
+	// identical. The warm path is gated entirely by the engine's
+	// captureWarmSnapshotLocked (pkg/sched/engine.go) — production
+	// vmmd callers use PauseAndSnapshot for the legacy init-tier
+	// capture and the new WarmSnapshot RPC for the warm-tier capture.
+	SnapshotKeepAlive(ctx context.Context, l Lease, spec SnapshotSpec) (SnapshotInfo, error)
+	// ResumeVM (issue #470 / PR #470-FU-A) is the host-side resume
+	// half of the warm snapshot. PATCH /vm {"state":"Resumed"} on
+	// the live Firecracker socket so the paused VM continues
+	// executing. The Manager.live[instance] + cidToID entries
+	// stay intact — Manager.WarmSnapshot is the only caller and
+	// it never releases the lease. Idempotent on an already-running
+	// VM (the Firecracker API returns 409 Conflict, which we treat
+	// as a soft pass-through so a redundant WarmSnapshot retried by
+	// an upstream blip doesn't surface as a hard error).
+	ResumeVM(ctx context.Context, l Lease) error
 	// Kill stops the firecracker process and removes the jail chroot. It is
 	// best-effort and idempotent — safe to call on an instance that never fully
 	// booted.
@@ -1645,6 +1666,56 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	m.mu.Unlock()
 	m.cleanup(ctx, inst.Lease, inst.Net, inst.WorkloadNames)
 	m.log.Info("parked", "instance", instance, "mem_bytes", info.MemBytes)
+	return info, nil
+}
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+// capture entry point. The flow:
+//
+//  1. Look up the live Instance by name (caller is the engine's
+//     captureWarmSnapshotLocked; the instance is in RUNNING state
+//     and the runner is alive and can keep serving requests across
+//     the pause window).
+//  2. Call vmm.SnapshotKeepAlive (pause + /snapshot/create + publish
+//     mem + vmstate through the configured StorageBackend) WITHOUT
+//     releasing the chroot.
+//  3. Call vmm.ResumeVM to PATCH /vm {"state":"Resumed"} so the
+//     runner can keep accepting requests. Manager.live[instance] +
+//     cidToID stay intact — the warm path is purposefully a thin
+//     wrapper around SnapshotKeepAlive + ResumeVM, no teardown.
+//  4. Return the SnapshotInfo the engine writes into the snapshots
+//     row (tier='warm').
+//
+// Failure path: any error from SnapshotKeepAlive OR ResumeVM is
+// surfaced as-is. The engine's captureWarmSnapshotLocked decides
+// whether to Destroy the VM and skip the init-tier capture (the
+// locked decision in PR-A: yes, destroy on warm failure). The
+// Manager itself does NOT touch m.live on the error path — the
+// engine owns the destroy so the audit/state-machine transitions
+// stay in one place.
+func (m *Manager) WarmSnapshot(ctx context.Context, instance string, spec SnapshotSpec) (SnapshotInfo, error) {
+	m.mu.Lock()
+	inst, ok := m.live[instance]
+	m.mu.Unlock()
+	if !ok {
+		return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: not live", instance)
+	}
+	info, err := m.vmm.SnapshotKeepAlive(ctx, inst.Lease, spec)
+	if err != nil {
+		// The VM is still paused (SnapshotKeepAlive publishes on
+		// success but the chroot is still alive). Best-effort
+		// resume so the runner can keep serving — failure to
+		// resume surfaces to the engine's destroy path with the
+		// original error wrapped.
+		if rerr := m.vmm.ResumeVM(ctx, inst.Lease); rerr != nil {
+			return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: snapshot: %w (resume after snapshot failure: %v)", instance, err, rerr)
+		}
+		return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: snapshot: %w", instance, err)
+	}
+	if err := m.vmm.ResumeVM(ctx, inst.Lease); err != nil {
+		return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: resume: %w", instance, err)
+	}
+	m.log.Info("warm_snapshot", "instance", instance, "mem_bytes", info.MemBytes)
 	return info, nil
 }
 

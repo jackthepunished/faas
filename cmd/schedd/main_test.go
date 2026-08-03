@@ -262,6 +262,14 @@ func (stubVMM) CreateFromSnapshot(context.Context, string, sched.AppSpec, sched.
 func (stubVMM) PauseAndSnapshot(context.Context, string, string, string, string) (sched.SnapshotBytes, error) {
 	return sched.SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the cmd/schedd
+// main_test stubVMM's no-op seam — the schedd-bootstrap integration
+// test doesn't exercise the warm-capture path (it lives in
+// pkg/sched/engine_test.go).
+func (stubVMM) WarmSnapshot(context.Context, string, string, string) (sched.SnapshotBytes, error) {
+	return sched.SnapshotBytes{}, nil
+}
 func (stubVMM) Destroy(context.Context, string) error { return nil }
 func (stubVMM) Ping(context.Context) (*sched.PingOutcome, error) {
 	return &sched.PingOutcome{FcVersion: "1.10.0"}, nil

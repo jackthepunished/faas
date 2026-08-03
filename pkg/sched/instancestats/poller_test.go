@@ -117,6 +117,12 @@ func (v *statsFakeVMM) CreateFromSnapshot(context.Context, string, sched.AppSpec
 func (v *statsFakeVMM) PauseAndSnapshot(context.Context, string, string, string, string) (sched.SnapshotBytes, error) {
 	return sched.SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the instancestats
+// test's no-op seam — the poller doesn't fire warm captures.
+func (v *statsFakeVMM) WarmSnapshot(context.Context, string, string, string) (sched.SnapshotBytes, error) {
+	return sched.SnapshotBytes{}, nil
+}
 func (v *statsFakeVMM) Destroy(context.Context, string) error { return nil }
 
 // UpdateEgressAllowlist (tier-2 PR-B) — instancestats tests don't

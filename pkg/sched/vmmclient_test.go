@@ -65,6 +65,16 @@ func (f *fakeVMM) Park(ctx context.Context, instance string, spec fcvm.SnapshotS
 	return fcvm.SnapshotInfo{MemBytes: 130 * 1024 * 1024, VMStateBytes: 4096}, nil
 }
 
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the vmmclient
+// test's no-op seam — the vmmclient_test fake implements
+// vmmdgrpc.VmmdAPI for the bufconn round-trip wire test, not
+// the engine's captureWarmSnapshotLocked path (which lives in
+// engine_test). The fake's Park handles the legacy PauseAndSnapshot
+// RPC; WarmSnapshot does the same for the new RPC.
+func (f *fakeVMM) WarmSnapshot(ctx context.Context, instance string, spec fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error) {
+	return fcvm.SnapshotInfo{MemBytes: 130 * 1024 * 1024, VMStateBytes: 4096}, nil
+}
+
 func (f *fakeVMM) Destroy(ctx context.Context, instance string) error {
 	if f.destFn != nil {
 		return f.destFn(ctx, instance)

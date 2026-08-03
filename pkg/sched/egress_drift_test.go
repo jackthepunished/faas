@@ -104,6 +104,13 @@ func (r *recordingRouterVMM) CreateFromSnapshot(context.Context, string, string,
 func (r *recordingRouterVMM) PauseAndSnapshot(context.Context, string, string, string, string, string) (SnapshotBytes, error) {
 	return SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the egress-drift
+// test's no-op seam — the egress drift path doesn't fire warm
+// captures (the engine reaper is the only entry point).
+func (r *recordingRouterVMM) WarmSnapshot(context.Context, string, string, string, string) (SnapshotBytes, error) {
+	return SnapshotBytes{}, nil
+}
 func (r *recordingRouterVMM) Destroy(context.Context, string, string) error { return nil }
 
 // FrameworkReady implements RoutedVMM for the egress-drift test

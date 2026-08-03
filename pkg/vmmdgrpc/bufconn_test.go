@@ -102,6 +102,19 @@ func (f *fakeVMM) Park(ctx context.Context, instance string, spec fcvm.SnapshotS
 	return fcvm.SnapshotInfo{MemBytes: 1024 * 1024 * 130, VMStateBytes: 4096}, nil
 }
 
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the fake hot
+// half of the warm path. The bufconn test asserts the wire
+// round-trip; the in-memory fake just returns the snapshot
+// bytes and keeps the live count intact (the warm path
+// purposefully does NOT release the chroot — see
+// Manager.WarmSnapshot).
+func (f *fakeVMM) WarmSnapshot(ctx context.Context, instance string, spec fcvm.SnapshotSpec) (fcvm.SnapshotInfo, error) {
+	if instance != "live-1" {
+		return fcvm.SnapshotInfo{}, errNotLive
+	}
+	return fcvm.SnapshotInfo{MemBytes: 1024 * 1024 * 130, VMStateBytes: 4096}, nil
+}
+
 func (f *fakeVMM) Destroy(ctx context.Context, instance string) error {
 	if f.destroy != nil {
 		return f.destroy(ctx, instance)

@@ -81,6 +81,23 @@ type fakeVMM struct {
 	// path passed to TriggerResumeHook. Tests assert both ordering (Boot
 	// doesn't fire it, Restore does) and the dial-time argument.
 	resumeHookCalls []resumeHookCall
+	// resumeErr (issue #470 / PR #470-FU-A) is returned from
+	// ResumeVM when non-nil. The engine's captureWarmSnapshotLocked
+	// tests flip this to simulate a Firecracker 5xx after
+	// SnapshotKeepAlive — the engine's failure path then
+	// transitions to STOPPED instead of PARKED.
+	resumeErr error
+	// resumed records every instance the engine asked to resume.
+	// Tests assert that captureWarmSnapshotLocked fires ResumeVM
+	// exactly once per Park cycle on the success path and zero
+	// times on the failure path.
+	resumed []string
+	// keepAliveSnapshotted records every instance the engine's
+	// captureWarmSnapshotLocked routed through SnapshotKeepAlive
+	// (the warm-tier capture). Distinct from snapshotted because
+	// the legacy Park flow uses Snapshot (atomic Snap+Kill) and
+	// tests assert both paths are exercised for one Park.
+	keepAliveSnapshotted []string
 	// bootCgroupFail, when non-nil, causes Boot to return this error after
 	// creating the cgroup scope — used to simulate a cgroup write failure
 	// (e.g. memory.max WriteFile failing due to permissions) without
@@ -425,6 +442,33 @@ func (v *fakeVMM) Snapshot(_ context.Context, l Lease, _ SnapshotSpec) (Snapshot
 	v.snapshotted = append(v.snapshotted, l.Instance)
 	v.mu.Unlock()
 	return SnapshotInfo{MemBytes: 4096}, v.snapErr
+}
+
+// SnapshotKeepAlive (issue #470 / PR #470-FU-A) is the fake hot
+// path the engine's captureWarmSnapshotLocked exercises. The
+// fake records the call + args and returns the configured
+// snapErr on demand. The fakeVMM does NOT touch v.killed because
+// the warm path explicitly keeps the VM paused (the engine's
+// legacy snapshotAndPark → Kill cycle is still the one that
+// releases the chroot).
+func (v *fakeVMM) SnapshotKeepAlive(_ context.Context, l Lease, _ SnapshotSpec) (SnapshotInfo, error) {
+	v.mu.Lock()
+	v.keepAliveSnapshotted = append(v.keepAliveSnapshotted, l.Instance)
+	err := v.snapErr
+	v.mu.Unlock()
+	return SnapshotInfo{MemBytes: 4096}, err
+}
+
+// ResumeVM (issue #470 / PR #470-FU-A) is the fake counterpart to
+// the host-side Resume: it records the call and returns the
+// configured resumeErr. The engine's captureWarmSnapshotLocked
+// sets resumeErr to simulate a Firecracker 5xx during resume.
+func (v *fakeVMM) ResumeVM(_ context.Context, l Lease) error {
+	v.mu.Lock()
+	v.resumed = append(v.resumed, l.Instance)
+	err := v.resumeErr
+	v.mu.Unlock()
+	return err
 }
 
 func (v *fakeVMM) Kill(_ context.Context, l Lease) error {

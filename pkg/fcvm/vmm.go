@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -830,6 +831,7 @@ func (v *JailerVMM) SendStatelessAdvisory(ctx context.Context, l Lease, appID st
 	return nil
 }
 
+// Snapshot pauses the running VM, writes a full snapshot to
 // spec's durable paths, and destroys the VM (spec §4.4).
 //
 // #96 / ADR-025 axis 2 — when spec.StorageKey is set, the produced mem
@@ -840,7 +842,45 @@ func (v *JailerVMM) SendStatelessAdvisory(ctx context.Context, l Lease, appID st
 // failure we leave MemPath populated so the legacy code path can still
 // recover the snapshot on the next read — the storage publish is best-
 // effort with a Warn log rather than a hard error.
+//
+// Issue #470 / PR #470-FU-A: Snapshot is now a thin wrapper around
+// SnapshotKeepAlive + v.Kill. The pause + /snapshot/create + mem/vmstate
+// publish logic lives in SnapshotKeepAlive so the warm-tier capture
+// (Manager.WarmSnapshot → vmm.WarmSnapshot → vmmdgrpc.WarmSnapshot)
+// can reuse it without a Kill at the end. The engine's
+// captureWarmSnapshotLocked fires the warm path FIRST (RUNNING instance,
+// runner is alive), then Snapshot fires the init-tier capture with
+// the trailing Kill (the legacy park step).
 func (v *JailerVMM) Snapshot(ctx context.Context, l Lease, spec SnapshotSpec) (SnapshotInfo, error) {
+	info, err := v.SnapshotKeepAlive(ctx, l, spec)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	// Snapshot semantics: the VM is destroyed after a successful snapshot.
+	_ = v.Kill(ctx, l)
+	return info, nil
+}
+
+// SnapshotKeepAlive (issue #470 / PR #470-FU-A) is the warm-tier
+// twin of Snapshot. Pauses the VM, hits /snapshot/create, streams the
+// mem and vmstate blobs through the configured StorageBackend, and
+// returns WITHOUT the trailing Kill. Caller is responsible for the
+// subsequent Resume (VMM.ResumeVM) and for keeping the live Instance
+// entry intact.
+//
+// The pause / create / publish sequence is lifted verbatim from the
+// pre-PR-A Snapshot so the legacy wire shape and storage behaviour
+// stay bit-for-bit identical. The split keeps every PR-A diff in one
+// place (the new method + the new ResumeVM helper) and makes the
+// pre-existing pause/create/publish code the single source of truth
+// for both init-tier and warm-tier captures.
+//
+// Error mapping mirrors Snapshot: pause / create / moveOut / open /
+// put failures are wrapped with the firecracker-side status so the
+// gRPC handler can lift them into a stable *api.Problem (Internal
+// for the vmmd side, distinct from the engine's Destroy-the-VM
+// failure handler in pkg/sched.engine.captureWarmSnapshotLocked).
+func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec SnapshotSpec) (SnapshotInfo, error) {
 	root := v.chrootRoot(l.Instance)
 	if err := v.apiPatch(ctx, l.Instance, "/vm", map[string]any{"state": "Paused"}); err != nil {
 		return SnapshotInfo{}, fmt.Errorf("vmm: pause: %w", err)
@@ -935,9 +975,53 @@ func (v *JailerVMM) Snapshot(ctx context.Context, l Lease, spec SnapshotSpec) (S
 		}
 	}
 
-	// Snapshot semantics: the VM is destroyed after a successful snapshot.
-	_ = v.Kill(ctx, l)
+	// SnapshotKeepAlive purposely does NOT Kill the VM — the
+	// warm-tier capture keeps the VM paused until the engine's
+	// pre-existing snapshotAndPark (init-tier capture) finishes
+	// and the legacy Snapshot() wrapper releases the chroot. The
+	// responsible caller (Manager.WarmSnapshot → vmm.WarmSnapshot
+	// → vmmdgrpc.WarmSnapshot) MUST fire ResumeVM on success.
 	return SnapshotInfo{MemBytes: memBytes, VMStateBytes: stateBytes}, nil
+}
+
+// ResumeVM (issue #470 / PR #470-FU-A) is the host-side resume
+// half of the warm snapshot. PATCH /vm {"state":"Resumed"} on the
+// live Firecracker socket so the paused VM continues executing.
+//
+// Firecracker returns 409 Conflict if the VM is already Running
+// (we treat this as a soft pass-through so a redundant resume after
+// the runner's framework_ready DGRAM raced a kill is observable
+// but not fatal). Any other 4xx/5xx is wrapped as a hard error and
+// bubbled up to the engine's failure path: vmm.Destroy + skip the
+// init-tier capture. The CID-to-lease join and the live Instance
+// entry are NOT touched here — that contract lives on
+// Manager.WarmSnapshot / Manager.Park, not on the host VMM.
+func (v *JailerVMM) ResumeVM(ctx context.Context, l Lease) error {
+	if v == nil {
+		return fmt.Errorf("vmm: ResumeVM: nil receiver")
+	}
+	if l.Instance == "" {
+		return fmt.Errorf("vmm: ResumeVM: empty instance")
+	}
+	// PATCH /vm {"state":"Resumed"} — the Firecracker API mirror of
+	// /vm {"state":"Paused"} that SnapshotKeepAlive fired moments
+	// ago. The retry loop in apiCallWithClient swallows transient
+	// socket races (the FC API socket is created by firecracker
+	// itself a few ms after startJailer returns; the same race
+	// applies on a long-paused VM that just got hit by /snapshot/
+	// create — the socket is fine, but defensive retries are
+	// cheap).
+	err := v.apiPatch(ctx, l.Instance, "/vm", map[string]any{"state": "Resumed"})
+	if err == nil {
+		return nil
+	}
+	// 409 Conflict ⇒ VM is already running. Treat as success so a
+	// redundant WarmSnapshot (engine retried after a transient
+	// vmmd restart) doesn't surface as a hard error.
+	if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "Conflict") {
+		return nil
+	}
+	return fmt.Errorf("vmm: resume: %w", err)
 }
 
 // Kill stops the jailer process (if any) and removes the chroot. Idempotent.

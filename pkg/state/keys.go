@@ -62,3 +62,24 @@ func SnapMemKey(deploymentID string) string {
 func SnapVMStateKey(deploymentID string) string {
 	return "snap/" + deploymentID + "/vmstate"
 }
+
+// WarmSnapMemKey (issue #470 / PR #470-FU-A) returns the canonical
+// StorageBackend key for a deployment's warm-tier snapshot mem blob.
+// Mirrors <snapDir>/<deploymentID>/warm/mem on the local backend.
+// The warm tier captures the VM in RUNNING state (runner is alive and
+// can keep serving requests across the pause window) so the next wake
+// resumes handlers mid-flight instead of going through cold boot. The
+// /warm/ segment keeps the blob physically separate from the init-tier
+// /mem blob so PR-C's per-tier GC floor (2 warm + 2 init) can address
+// them with a single prefix match.
+func WarmSnapMemKey(deploymentID string) string {
+	return "snap/" + deploymentID + "/warm/mem"
+}
+
+// WarmSnapVMStateKey (issue #470 / PR #470-FU-A) is the warm-tier
+// sibling of SnapVMStateKey. Mirrors <snapDir>/<deploymentID>/warm/vmstate
+// and lands under the same /warm/ namespace as WarmSnapMemKey so a
+// single wildcard GC predicate covers both blobs.
+func WarmSnapVMStateKey(deploymentID string) string {
+	return "snap/" + deploymentID + "/warm/vmstate"
+}

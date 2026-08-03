@@ -25,6 +25,7 @@ const (
 	Vmmd_CreateFromSnapshot_FullMethodName      = "/onebox.faas.vmmd.v1.Vmmd/CreateFromSnapshot"
 	Vmmd_CreateColdBoot_FullMethodName          = "/onebox.faas.vmmd.v1.Vmmd/CreateColdBoot"
 	Vmmd_PauseAndSnapshot_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/PauseAndSnapshot"
+	Vmmd_WarmSnapshot_FullMethodName            = "/onebox.faas.vmmd.v1.Vmmd/WarmSnapshot"
 	Vmmd_FrameworkReady_FullMethodName          = "/onebox.faas.vmmd.v1.Vmmd/FrameworkReady"
 	Vmmd_Destroy_FullMethodName                 = "/onebox.faas.vmmd.v1.Vmmd/Destroy"
 	Vmmd_Stats_FullMethodName                   = "/onebox.faas.vmmd.v1.Vmmd/Stats"
@@ -61,6 +62,41 @@ type VmmdClient interface {
 	// requested host-side paths, then destroys the live VM. After return the
 	// instance is gone (§6.1: PARKED is zero-RAM).
 	PauseAndSnapshot(ctx context.Context, in *PauseAndSnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error)
+	// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+	// capture path. The caller is the schedd engine's
+	// captureWarmSnapshotLocked, fired from Engine.Park while the
+	// instance is still RUNNING on this vmmd (the runner is alive
+	// and can keep serving requests across the pause window). The
+	// handler:
+	//  1. PATCH /vm {"state":"Paused"} (Firecracker pause).
+	//  2. PUT /snapshot/create with the warm-tier storage keys
+	//     (mem_file_path, snapshot_path) supplied by the caller.
+	//  3. Publish both blobs through the configured StorageBackend
+	//     (mem at storage_key, vmstate at vmstate_storage_key).
+	//  4. PATCH /vm {"state":"Resumed"} — the VM resumes in place
+	//     and the live Instance entries (Manager.m.live, cidToID)
+	//     stay intact. The post-resume guest-init entropy re-seed
+	//     is intentionally NOT triggered here: the warm snapshot
+	//     captured an already-randomised state, and the next
+	//     wake restores from a fresh snapshot that owns its own
+	//     seeds; firing the hook here would inject duplicate
+	//     entropy into a running guest and burn CPU on a no-op.
+	//  5. Return the snapshot byte counts (matches
+	//     PauseAndSnapshotResponse shape).
+	//
+	// The RPC is idempotent on a no-op pause? no — a re-fire of
+	// WarmSnapshot on a VM that already produced a warm row would
+	// create a second row at the same storage key (overwrite path
+	// is storage-backend-defined). The engine gates each Park on
+	// `framework_ready_at` and inserts the warm row inside the
+	// appMu window so duplicate parks are not scheduled; the wire
+	// does not need to enforce this.
+	//
+	// Error mapping: pause / snapshot / resume failures bubble up
+	// as Internal with the firecracker side's status / message. The
+	// engine's failure path is "Destroy the VM and skip the init
+	// capture" — see pkg/sched/engine.go::captureWarmSnapshotLocked.
+	WarmSnapshot(ctx context.Context, in *WarmSnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error)
 	// FrameworkReady is the vmmd-side receipt of the guest-init
 	// "framework ready" vsock DGRAM (port 1027, msg=4) signal
 	// (issue #470, PR #470-FU-B). vmmd's host-side DGRAM listener
@@ -260,6 +296,16 @@ func (c *vmmdClient) PauseAndSnapshot(ctx context.Context, in *PauseAndSnapshotR
 	return out, nil
 }
 
+func (c *vmmdClient) WarmSnapshot(ctx context.Context, in *WarmSnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SnapshotResponse)
+	err := c.cc.Invoke(ctx, Vmmd_WarmSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vmmdClient) FrameworkReady(ctx context.Context, in *FrameworkReadyRequest, opts ...grpc.CallOption) (*FrameworkReadyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FrameworkReadyResponse)
@@ -441,6 +487,41 @@ type VmmdServer interface {
 	// requested host-side paths, then destroys the live VM. After return the
 	// instance is gone (§6.1: PARKED is zero-RAM).
 	PauseAndSnapshot(context.Context, *PauseAndSnapshotRequest) (*SnapshotResponse, error)
+	// WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+	// capture path. The caller is the schedd engine's
+	// captureWarmSnapshotLocked, fired from Engine.Park while the
+	// instance is still RUNNING on this vmmd (the runner is alive
+	// and can keep serving requests across the pause window). The
+	// handler:
+	//  1. PATCH /vm {"state":"Paused"} (Firecracker pause).
+	//  2. PUT /snapshot/create with the warm-tier storage keys
+	//     (mem_file_path, snapshot_path) supplied by the caller.
+	//  3. Publish both blobs through the configured StorageBackend
+	//     (mem at storage_key, vmstate at vmstate_storage_key).
+	//  4. PATCH /vm {"state":"Resumed"} — the VM resumes in place
+	//     and the live Instance entries (Manager.m.live, cidToID)
+	//     stay intact. The post-resume guest-init entropy re-seed
+	//     is intentionally NOT triggered here: the warm snapshot
+	//     captured an already-randomised state, and the next
+	//     wake restores from a fresh snapshot that owns its own
+	//     seeds; firing the hook here would inject duplicate
+	//     entropy into a running guest and burn CPU on a no-op.
+	//  5. Return the snapshot byte counts (matches
+	//     PauseAndSnapshotResponse shape).
+	//
+	// The RPC is idempotent on a no-op pause? no — a re-fire of
+	// WarmSnapshot on a VM that already produced a warm row would
+	// create a second row at the same storage key (overwrite path
+	// is storage-backend-defined). The engine gates each Park on
+	// `framework_ready_at` and inserts the warm row inside the
+	// appMu window so duplicate parks are not scheduled; the wire
+	// does not need to enforce this.
+	//
+	// Error mapping: pause / snapshot / resume failures bubble up
+	// as Internal with the firecracker side's status / message. The
+	// engine's failure path is "Destroy the VM and skip the init
+	// capture" — see pkg/sched/engine.go::captureWarmSnapshotLocked.
+	WarmSnapshot(context.Context, *WarmSnapshotRequest) (*SnapshotResponse, error)
 	// FrameworkReady is the vmmd-side receipt of the guest-init
 	// "framework ready" vsock DGRAM (port 1027, msg=4) signal
 	// (issue #470, PR #470-FU-B). vmmd's host-side DGRAM listener
@@ -619,6 +700,9 @@ func (UnimplementedVmmdServer) CreateColdBoot(context.Context, *CreateColdBootRe
 func (UnimplementedVmmdServer) PauseAndSnapshot(context.Context, *PauseAndSnapshotRequest) (*SnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PauseAndSnapshot not implemented")
 }
+func (UnimplementedVmmdServer) WarmSnapshot(context.Context, *WarmSnapshotRequest) (*SnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WarmSnapshot not implemented")
+}
 func (UnimplementedVmmdServer) FrameworkReady(context.Context, *FrameworkReadyRequest) (*FrameworkReadyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FrameworkReady not implemented")
 }
@@ -735,6 +819,24 @@ func _Vmmd_PauseAndSnapshot_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VmmdServer).PauseAndSnapshot(ctx, req.(*PauseAndSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Vmmd_WarmSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WarmSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).WarmSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_WarmSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).WarmSnapshot(ctx, req.(*WarmSnapshotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1009,6 +1111,10 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PauseAndSnapshot",
 			Handler:    _Vmmd_PauseAndSnapshot_Handler,
+		},
+		{
+			MethodName: "WarmSnapshot",
+			Handler:    _Vmmd_WarmSnapshot_Handler,
 		},
 		{
 			MethodName: "FrameworkReady",

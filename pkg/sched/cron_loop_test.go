@@ -45,6 +45,14 @@ func (f *fakeWakeVMM) CreateFromSnapshot(_ context.Context, _, _ string, _ AppSp
 func (f *fakeWakeVMM) PauseAndSnapshot(_ context.Context, _, _ string, _, _ string, _ string) (SnapshotBytes, error) {
 	return SnapshotBytes{}, nil
 }
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the cron-loop
+// test's no-op seam — the cron path doesn't fire warm captures
+// (the engine's reaper is the only entry point) but the
+// RoutedVMM interface contract requires the method.
+func (f *fakeWakeVMM) WarmSnapshot(_ context.Context, _, _, _, _ string) (SnapshotBytes, error) {
+	return SnapshotBytes{}, nil
+}
 func (f *fakeWakeVMM) Destroy(_ context.Context, _, _ string) error { return nil }
 
 // FrameworkReady implements RoutedVMM for the cron-loop test fake

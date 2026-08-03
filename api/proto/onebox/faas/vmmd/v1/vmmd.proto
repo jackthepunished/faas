@@ -31,6 +31,42 @@ service Vmmd {
   // instance is gone (§6.1: PARKED is zero-RAM).
   rpc PauseAndSnapshot(PauseAndSnapshotRequest) returns (SnapshotResponse);
 
+  // WarmSnapshot (issue #470 / PR #470-FU-A) is the warm-tier
+  // capture path. The caller is the schedd engine's
+  // captureWarmSnapshotLocked, fired from Engine.Park while the
+  // instance is still RUNNING on this vmmd (the runner is alive
+  // and can keep serving requests across the pause window). The
+  // handler:
+  //  1. PATCH /vm {"state":"Paused"} (Firecracker pause).
+  //  2. PUT /snapshot/create with the warm-tier storage keys
+  //     (mem_file_path, snapshot_path) supplied by the caller.
+  //  3. Publish both blobs through the configured StorageBackend
+  //     (mem at storage_key, vmstate at vmstate_storage_key).
+  //  4. PATCH /vm {"state":"Resumed"} — the VM resumes in place
+  //     and the live Instance entries (Manager.m.live, cidToID)
+  //     stay intact. The post-resume guest-init entropy re-seed
+  //     is intentionally NOT triggered here: the warm snapshot
+  //     captured an already-randomised state, and the next
+  //     wake restores from a fresh snapshot that owns its own
+  //     seeds; firing the hook here would inject duplicate
+  //     entropy into a running guest and burn CPU on a no-op.
+  //  5. Return the snapshot byte counts (matches
+  //     PauseAndSnapshotResponse shape).
+  //
+  // The RPC is idempotent on a no-op pause? no — a re-fire of
+  // WarmSnapshot on a VM that already produced a warm row would
+  // create a second row at the same storage key (overwrite path
+  // is storage-backend-defined). The engine gates each Park on
+  // `framework_ready_at` and inserts the warm row inside the
+  // appMu window so duplicate parks are not scheduled; the wire
+  // does not need to enforce this.
+  //
+  // Error mapping: pause / snapshot / resume failures bubble up
+  // as Internal with the firecracker side's status / message. The
+  // engine's failure path is "Destroy the VM and skip the init
+  // capture" — see pkg/sched/engine.go::captureWarmSnapshotLocked.
+  rpc WarmSnapshot(WarmSnapshotRequest) returns (SnapshotResponse);
+
   // FrameworkReady is the vmmd-side receipt of the guest-init
   // "framework ready" vsock DGRAM (port 1027, msg=4) signal
   // (issue #470, PR #470-FU-B). vmmd's host-side DGRAM listener
@@ -558,6 +594,28 @@ message PauseAndSnapshotRequest {
 message SnapshotResponse {
   int64 mem_bytes     = 1;
   int64 vmstate_bytes = 2;
+}
+
+// WarmSnapshotRequest (issue #470 / PR #470-FU-A) is the input
+// to Vmmd.WarmSnapshot. Carries the instance id + the warm-tier
+// storage keys the engine's captureWarmSnapshotLocked
+// constructed via pkg/sched.vmstateStorageKeyFor (warm variant).
+// vmstate_storage_key is required for parity with the existing
+// PauseAndSnapshot wire — the warm path always publishes through
+// the configured StorageBackend (no legacy host-path fallback;
+// warm-tier captures are multi-node-friendly by design).
+message WarmSnapshotRequest {
+  // Compute-node-relative instance id (instances.id). vmmd
+  // resolves the live Firecracker VM from its in-memory map.
+  // Empty → InvalidArgument.
+  string instance = 1;
+  // Canonical StorageBackend key the mem blob is published
+  // under. Required (warm captures are storage-mediated).
+  string storage_key = 2;
+  // Canonical StorageBackend key the vmstate blob is published
+  // under. Required, mirroring PauseAndSnapshot's vmstate path
+  // contract (PRD-025 axis 2 slice 4).
+  string vmstate_storage_key = 3;
 }
 
 // FrameworkReady is the vmmd-side receipt of the guest-init "framework

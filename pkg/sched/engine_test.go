@@ -30,6 +30,7 @@ type fakeVMM struct {
 	coldBoots           int
 	restores            int
 	snapshots           int
+	warmSnapshots       int // PR #470-FU-A: counts WarmSnapshot calls (warm-tier capture path)
 	destroys            int
 	pings               int  // PR #114: counts Ping calls (heartbeat path)
 	frameworkReadyCount int  // PR #470-FU-B: counts FrameworkReady calls (DGRAM receipt path)
@@ -180,6 +181,29 @@ func (f *fakeVMM) PauseAndSnapshot(ctx context.Context, _, _, _, _, _ string) (S
 		return SnapshotBytes{}, f.snapErr
 	}
 	f.snapshots++
+	return SnapshotBytes{MemBytes: 130 * 1024 * 1024, VMStateBytes: 4096}, nil
+}
+
+// WarmSnapshot (issue #470 / PR #470-FU-A) is the fake hot
+// half of the warm path. Distinct counter from
+// fakeVMM.snapshots so the engine_test captureWarmSnapshot
+// tests can assert warm + init both ran inside one Park cycle.
+// snapErr is reused (the production-side pause / resume failures
+// funnel through the same wire shape).
+func (f *fakeVMM) WarmSnapshot(ctx context.Context, _, _, _, _ string) (SnapshotBytes, error) {
+	if d := f.sleepFor; d > 0 {
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return SnapshotBytes{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snapErr != nil {
+		return SnapshotBytes{}, f.snapErr
+	}
+	f.warmSnapshots++
 	return SnapshotBytes{MemBytes: 130 * 1024 * 1024, VMStateBytes: 4096}, nil
 }
 
