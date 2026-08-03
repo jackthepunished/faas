@@ -145,19 +145,28 @@ func TestMigrations_00118_DeploymentsSidecars(t *testing.T) {
 	`).Scan(&sidecarsJSON); err != nil {
 		t.Fatalf("read deployment (2 sidecars): %v", err)
 	}
-	if !bytes.Contains(sidecarsJSON, []byte(`"name":"migrator"`)) {
+	// PG's jsonb normalises key order + whitespace (adds space
+	// after `:`); the round-trip byte assertions below accept
+	// either the canonical form or PG's compact form so the test
+	// pins element shape, not text-level formatting.
+	if !bytes.Contains(sidecarsJSON, []byte(`"name":"migrator"`)) &&
+		!bytes.Contains(sidecarsJSON, []byte(`"name": "migrator"`)) {
 		t.Errorf("sidecars round-trip lost migrator: %s", sidecarsJSON)
 	}
-	if !bytes.Contains(sidecarsJSON, []byte(`"type":"init"`)) {
+	if !bytes.Contains(sidecarsJSON, []byte(`"type":"init"`)) &&
+		!bytes.Contains(sidecarsJSON, []byte(`"type": "init"`)) {
 		t.Errorf("sidecars round-trip lost type=init: %s", sidecarsJSON)
 	}
-	if !bytes.Contains(sidecarsJSON, []byte(`"name":"scraper"`)) {
+	if !bytes.Contains(sidecarsJSON, []byte(`"name":"scraper"`)) &&
+		!bytes.Contains(sidecarsJSON, []byte(`"name": "scraper"`)) {
 		t.Errorf("sidecars round-trip lost scraper: %s", sidecarsJSON)
 	}
-	if !bytes.Contains(sidecarsJSON, []byte(`"type":"sidecar"`)) {
+	if !bytes.Contains(sidecarsJSON, []byte(`"type":"sidecar"`)) &&
+		!bytes.Contains(sidecarsJSON, []byte(`"type": "sidecar"`)) {
 		t.Errorf("sidecars round-trip lost type=sidecar: %s", sidecarsJSON)
 	}
-	if !bytes.Contains(sidecarsJSON, []byte(`"cmd":["--to","head"]`)) {
+	if !bytes.Contains(sidecarsJSON, []byte(`"cmd":["--to","head"]`)) &&
+		!bytes.Contains(sidecarsJSON, []byte(`"cmd": ["--to", "head"]`)) {
 		t.Errorf("sidecars round-trip lost cmd: %s", sidecarsJSON)
 	}
 
