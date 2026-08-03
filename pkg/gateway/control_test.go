@@ -57,7 +57,12 @@ func TestControlMuxReadyz(t *testing.T) {
 			t.Errorf("readyz status = %d, want 200", resp.StatusCode)
 		}
 	})
-	t.Run("ready by default", func(t *testing.T) {
+	t.Run("not-ready when no callback registered", func(t *testing.T) {
+		// Post-#568 (ADR-070) the pre-split always-200 default was
+		// inverted to always-503. A daemon that forgets to wire a
+		// probe is a wiring bug; we surface it via /readyz so the
+		// operator sees the daemon draining, instead of forwarding
+		// traffic to a partial-boot instance.
 		mux := ControlMux(NewMetrics(), nil)
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
@@ -66,8 +71,12 @@ func TestControlMuxReadyz(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("readyz status = %d, want 200", resp.StatusCode)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("readyz status = %d, want 503", resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(body), "no probe registered") {
+			t.Errorf("readyz body = %q, want substring \"no probe registered\"", string(body))
 		}
 	})
 }

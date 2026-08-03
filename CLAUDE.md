@@ -49,7 +49,7 @@ EX44 or a cloud KVM box.
 ## Repo map
 
 ```
-cmd/{apid,gatewayd,schedd,vmmd,builderd,imaged,meterd,faas}   daemons + CLI (Go)
+cmd/{apid,gatewayd,gatewayd-public,gatewayd-internal,schedd,vmmd,builderd,imaged,meterd,faas}   daemons + CLI (Go)
 pkg/{api,state,fcvm,netns,oci,rootfs,meter,stripex,wire,apid}   shared libs
 pkg/api/limits.go     EVERY plan quota/limit lives in this one table — never inline a limit
 guest/init            static Go PID1 inside every microVM
@@ -65,7 +65,14 @@ docs/adr/
 - `schedd` is the ONLY writer to `instances` and owner of the state machine (§6).
 - `apid` is the ONLY writer to customer-intent tables (apps, deployments, domains).
 - `vmmd` is the ONLY component that touches firecracker/jailer, and the only root one.
-- `gatewayd` is the ONLY public listener on the box.
+- `gatewayd-public` is the ONLY public listener on the box (TLS-only edge;
+  introduced by the Tier A7 split, ADR-070). `gatewayd-internal` is the
+  routing + wake + proxy daemon that listens on a unix socket inside
+  the box and is reached only by `gatewayd-public`. The legacy
+  `gatewayd` daemon stays in-tree during the migration window. Cross-box
+  HA is achieved by having N boxes each with one `gatewayd-public` in
+  front of their local `gatewayd-internal` set — NOT by having multiple
+  public listeners on one box.
 - Components talk via Postgres rows + `pg_notify`, or gRPC on unix sockets in /run/faas/.
   Never add a direct call that bypasses an owner (e.g. apid must not call vmmd).
 

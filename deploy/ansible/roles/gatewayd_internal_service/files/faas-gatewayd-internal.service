@@ -1,0 +1,53 @@
+[Unit]
+Description=onebox-faas gatewayd-internal — routing + wake + proxy (Tier A7 split, ADR-070)
+Documentation=https://docs.gregale.dev/ops/gatewayd-internal
+# gatewayd-internal is the daemon gatewayd-public forwards to. It
+# must come up AFTER apid (route table source of truth) and schedd
+# (per-node Wake gRPC). Internal does NOT bind a public port — it
+# listens on a unix socket inside the box (ADR-015/018).
+After=faas-cp.slice network-online.target faas-apid.service faas-schedd.service
+Wants=faas-cp.slice faas-apid.service faas-schedd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gatewayd-internal
+Restart=on-failure
+RestartSec=2s
+
+Slice=faas-cp.slice
+MemoryMax=512M
+
+# Hardening baseline — gatewayd-internal is NOT root; runs as faas:faas.
+User=faas
+Group=faas
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# Unix-only (no AF_INET/AF_INET6 — we never dial external IPs from
+# here; all forwarding is via the unix socket to the public daemon
+# and gRPC to per-node schedd/vmmd over loopback mTLS).
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+
+# RuntimeDirectory=faas gives us /run/faas for the
+# gatewayd-internal.sock the public daemon dials. Mode 0660 + group
+# faas is the §11 ACL (ADR-015) — only faas:faas can dial.
+RuntimeDirectory=faas
+RuntimeDirectoryMode=0750
+ReadWritePaths=/run/faas
+
+[Install]
+WantedBy=multi-user.target
