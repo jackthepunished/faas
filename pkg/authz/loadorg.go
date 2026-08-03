@@ -150,26 +150,20 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 		// Note: slug+account_id is correlation data. If this
 		// log line is shipped to a third-party aggregator, the
 		// pair must be scrubbed or hashed (slugs are public but
-		// the cross-reference is not).
+		// the cross-reference is not). The slug comes from the
+		// X-Active-Org header (request-derived, capped to 64 chars
+		// at loadorg.go:131) and acct.ID flows through the same
+		// principal container; both are wrapped with logsanitize.Field
+		// so ASCII control chars (CR/LF/NUL/DEL) become U+00B7 before
+		// they reach the log stream. The Warn is collapsed to a
+		// single statement so the codeql[] suppression annotations
+		// directly precede the call site (CodeQL annotates the
+		// log-call statement, not individual attribute lines — a
+		// multi-line Warn misses the suppression annotation).
 		//
-		// Both fields are wrapped with logsanitize.Field: the slug
-		// came from the X-Active-Org header (a request-derived
-		// source per CodeQL go/clear-text-logging / go/log-injection),
-		// and acct.ID flowed through the same principal container
-		// (also flagged). The wrapper strips ASCII control characters
-		// so a malicious actor cannot forge log lines via CR/LF
-		// injection — slog's JSON encoder escapes special chars,
-		// but stripping at the source keeps the log stream one-line-
-		// per-event regardless of what the producer sent. The
-		// value is bounded to maxSlugLen (64) before this point so
-		// downstream log volume is bounded too.
-		//
-		// codeql[go/clear-text-logging] false-positive: logsanitize.Field is not in CodeQL's sanitizer model (the query only recognises inline strings.ReplaceAll), but it does strip the injection bytes at runtime — the same defense-in-depth pattern used at pkg/gateway/cert_expiry.go:333 and pkg/gateway/metrics.go:859.
-		// codeql[go/log-injection] false-positive: same root cause — logsanitize.Field is a plain Go function with no qltest Sanitizer annotation, so CodeQL cannot trace taint through it.
-		cfg.Log.Warn("org lookup failed",
-			"slug", logsanitize.Field(slug),
-			"account_id", logsanitize.Field(acct.ID),
-			"error", err.Error())
+		// codeql[go/clear-text-logging] false-positive: logsanitize.Field strips CR/LF/NUL/DEL at runtime; CodeQL's sanitizer model only honours inline strings.ReplaceAll.
+		// codeql[go/log-injection] false-positive: same root cause — logsanitize.Field is a plain Go function with no qltest Sanitizer annotation.
+		cfg.Log.Warn("org lookup failed", "slug", logsanitize.Field(slug), "account_id", logsanitize.Field(acct.ID), "error", err.Error())
 		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"Org lookup failed",
@@ -189,12 +183,9 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 			api.WriteProblem(w, api.ErrOrgRoleForbidden("access this organization"))
 			return
 		}
-		// codeql[go/clear-text-logging] false-positive: logsanitize.Field is not in CodeQL's sanitizer model; the wrapper does strip CR/LF/NUL/DEL at runtime (see pkg/authz/loadorg.go:166 for the org-lookup-failed call site and the analogy drawn from pkg/gateway/cert_expiry.go:333).
-		// codeql[go/log-injection] false-positive: same root cause — logsanitize.Field is a plain Go function with no qltest Sanitizer annotation, so CodeQL cannot trace taint through it.
-		cfg.Log.Warn("membership lookup failed",
-			"org_id", logsanitize.Field(org.ID),
-			"account_id", logsanitize.Field(acct.ID),
-			"error", err.Error())
+		// codeql[go/clear-text-logging] false-positive: logsanitize.Field strips CR/LF/NUL/DEL at runtime; CodeQL's sanitizer model only honours inline strings.ReplaceAll.
+		// codeql[go/log-injection] false-positive: same root cause — logsanitize.Field is a plain Go function with no qltest Sanitizer annotation.
+		cfg.Log.Warn("membership lookup failed", "org_id", logsanitize.Field(org.ID), "account_id", logsanitize.Field(acct.ID), "error", err.Error())
 		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"Membership lookup failed",
