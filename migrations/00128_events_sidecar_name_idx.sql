@@ -47,7 +47,7 @@
 -- ADR-041 contract).
 
 CREATE INDEX IF NOT EXISTS events_sidecar_name_idx
-    ON public.events ((data->>'sidecar_name'))
+    ON events ((data->>'sidecar_name'))
     WHERE kind IN ('wake.sidecar_init_exit', 'wake.sidecar_restart');
 
 -- +goose StatementEnd

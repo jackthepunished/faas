@@ -521,13 +521,13 @@ func (e SidecarInitExit) At() time.Time    { return e.EmitAt }
 func (e SidecarInitExit) Subject() *string { return nil }
 func (e SidecarInitExit) Payload() map[string]any {
 	return map[string]any{
-		"wake_id":       e.WakeID,
-		"app_id":        e.AppID,
-		"instance_id":   e.InstanceID,
-		"sidecar_name":  e.SidecarName,
-		"status":        e.Status,
-		"exit_code":     e.ExitCode,
-		"duration_ms":   e.DurationMs,
+		"wake_id":      e.WakeID,
+		"app_id":       e.AppID,
+		"instance_id":  e.InstanceID,
+		"sidecar_name": e.SidecarName,
+		"status":       e.Status,
+		"exit_code":    e.ExitCode,
+		"duration_ms":  e.DurationMs,
 	}
 }
 
@@ -542,13 +542,13 @@ func (e SidecarInitExit) Payload() map[string]any {
 // operators can distinguish OOM (137) from user_error (1) from
 // signal-driven exit (-1).
 type SidecarRestart struct {
-	EmitAt            time.Time
-	WakeID            string
-	AppID             string
-	InstanceID        string
-	SidecarName       string
-	Attempt           int
-	PreviousExitCode  int
+	EmitAt           time.Time
+	WakeID           string
+	AppID            string
+	InstanceID       string
+	SidecarName      string
+	Attempt          int
+	PreviousExitCode int
 }
 
 func (e SidecarRestart) Kind() string     { return WakeSidecarRestart }

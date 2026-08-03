@@ -160,8 +160,8 @@ type MemStore struct {
 	// names are validated to a portable charset and
 	// deploymentIDs are UUIDs).
 	deploymentSidecarLayers map[string]DeploymentSidecarLayer
-	snapshots      []Snapshot
-	events         []Event
+	snapshots               []Snapshot
+	events                  []Event
 	// usage holds one row per (instance, minute) — mirrors PgStore's
 	// usage_minutes PK. Aggregated into `usageByMonth` (per app, per
 	// calendar month) so UsageByMonth can keep returning the spec §10
@@ -469,11 +469,11 @@ func NewMemStore() *MemStore {
 		// handles (mirrors migration 00119's PK + ON CONFLICT
 		// semantics).
 		deploymentSidecarLayers: map[string]DeploymentSidecarLayer{},
-		snapshots:        []Snapshot{},
-		events:           []Event{},
-		usage:            []usageMinute{},
-		usageByMonth:     []Usage{},
-		idem:             map[string]idemEntry{},
+		snapshots:               []Snapshot{},
+		events:                  []Event{},
+		usage:                   []usageMinute{},
+		usageByMonth:            []Usage{},
+		idem:                    map[string]idemEntry{},
 		// stripeByCustomer is the reverse-lookup map AccountByProviderCustomerID
 		// walks; populated by UpdateAccountProviderCustomerID.
 
