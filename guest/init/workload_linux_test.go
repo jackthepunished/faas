@@ -193,7 +193,7 @@ func TestRunWorkloads_CapRejectsThreeSidecars(t *testing.T) {
 			{Name: "audit", Type: "sidecar", Essential: true},
 		},
 	}
-	err := runWorkloads(api.AppManifest{}, roster, nil, nil, nil)
+	err := runWorkloads(api.AppManifest{}, roster, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("runWorkloads with 3 sidecars: got nil, want cap rejection")
 	}

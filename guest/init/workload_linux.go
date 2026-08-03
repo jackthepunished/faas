@@ -51,6 +51,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -59,6 +60,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -154,7 +156,7 @@ func discoverRoster(fsys fs.FS) (workloadRoster, error) {
 // their baked ext4 images at the canonical
 // /usr/local/bin/start.sh (or whatever the customer image
 // provides) — guest-init exec's them verbatim.
-func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, apiEnv map[string]string, log *slog.Logger) error {
+func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, apiEnv map[string]string, log *slog.Logger, sidecarProxy *sidecarEventsProxy) error {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -181,14 +183,57 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		}
 		log.Info("runWorkloads: init sidecar starting",
 			"name", sc.Name, "essential", sc.Essential)
+		// Issue #463 / ADR-069 / ADR-071 / PR-C §3: stamp the
+		// wall-clock start so the sidecar_init_exit envelope
+		// (init_ok / init_failed) carries a meaningful
+		// duration_ms. The start is captured INSIDE the loop
+		// (not above it) so each init sidecar's duration is
+		// per-sidecar, not cumulative across the roster.
+		startedAt := time.Now()
 		sup := newSupervisorFor(sc, secrets, apiEnv, log)
-		if err := sup.Run(); err != nil {
+		runErr := sup.Run()
+		elapsedMs := time.Since(startedAt).Milliseconds()
+		// Translate the supervisor's terminal error into the
+		// status the audit needs. The supervisor's Run returns
+		// nil on a clean exit; a non-nil error wraps the
+		// sidecar's exit or restart-budget exhaustion (AC #1's
+		// hard fail). We attempt to surface the underlying
+		// exec.ExitError code for the audit so operators see
+		// the real shell exit rather than the supervisor's
+		// "crash-looped after N restart(s)" wrapper. A non
+		//-ExitError (e.g. supervisor-internal panic-recovered)
+		// falls back to -1 and gets recorded as such.
+		exitCode := 0
+		status := "init_ok"
+		if runErr != nil {
+			status = "init_failed"
+			var ee *exec.ExitError
+			if errors.As(runErr, &ee) {
+				exitCode = ee.ExitCode()
+			} else {
+				exitCode = -1
+			}
+		}
+		// Send the sidecar_init_exit envelope AFTER the
+		// supervisor returns, so the audit captures the
+		// terminal state. A send error is logged + ignored
+		// (the supervisor's terminal state remains the
+		// source of truth for "did the deploy succeed"); we
+		// never silently fail a deploy because the audit
+		// signal didn't make it home.
+		if sendErr := sidecarProxy.SendInitExit(sc.Name, status, exitCode, elapsedMs); sendErr != nil {
+			log.Warn("runWorkloads: sidecar init_exit send failed",
+				"name", sc.Name, "status", status, "err", sendErr)
+		}
+		if runErr != nil {
 			// AC #1: init non-zero exit → user_error.
 			log.Error("runWorkloads: init sidecar failed",
-				"name", sc.Name, "essential", sc.Essential, "err", err)
-			return fmt.Errorf("init sidecar %q failed: %w", sc.Name, err)
+				"name", sc.Name, "essential", sc.Essential,
+				"exit_code", exitCode, "duration_ms", elapsedMs, "err", runErr)
+			return fmt.Errorf("init sidecar %q failed: %w", sc.Name, runErr)
 		}
-		log.Info("runWorkloads: init sidecar ok", "name", sc.Name)
+		log.Info("runWorkloads: init sidecar ok",
+			"name", sc.Name, "duration_ms", elapsedMs)
 	}
 
 	// Step 2: spawn main + type="sidecar" workloads in parallel.

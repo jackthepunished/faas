@@ -697,6 +697,29 @@ func (m *Manager) InstanceByCID(cid uint32) (string, error) {
 	return id, nil
 }
 
+// InstanceAppID (issue #463 / ADR-069 / ADR-071 / PR-C §3)
+// returns the apps.id UUID that the given instance was woken
+// for. The host's DGRAM recv loop uses this to stamp the sidecar
+// event audit rows (init_failed, restart) with the (appID,
+// sidecar) join key the events platform indexes on. The lookup
+// is O(1) on the live map and shares the m.mu lock with
+// MarkInstanceFrameworkReady / InstanceByCID so a Park/Destroy
+// racing a DGRAM recv sees the same view.
+//
+// Returns an error when the instance is not live. The caller
+// (cmd/vmmd's DGRAM loop) treats this as a normal Debug
+// event — a DGRAM racing a wake-park cycle is expected
+// during instance churn and the audit is best-effort.
+func (m *Manager) InstanceAppID(instance string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.live[instance]
+	if !ok {
+		return "", fmt.Errorf("fcvm: InstanceAppID %s: not live", instance)
+	}
+	return inst.AppID, nil
+}
+
 // ForwardStatelessAdvisory is the public Manager seam that turns
 // one guest-init fanotify batch into one apid audit row. The vsock
 // DGRAM receiver in cmd/vmmd calls this with the parsed batch.

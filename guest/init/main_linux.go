@@ -94,6 +94,22 @@ func boot() error {
 		slog.Default().Warn("framework_ready proxy unavailable", "err", err)
 	}
 
+	// Issue #463 / ADR-069 / ADR-071 / PR-C §3,§4: the sidecar
+	// events proxy. Outbound-only vsock DGRAM on the same port
+	// (1027) as framework_ready; the leading type byte
+	// disambiguates the event class (0x01 = framework_ready,
+	// 0x02 = sidecar_init_exit, 0x03 = sidecar_restart). The
+	// proxy is held by runWorkloads so the orchestrator can emit
+	// init_ok / init_failed on the init sidecar exit paths and
+	// surface restart events from supervisor.OnCrash. Soft-fail:
+	// bind errors log at Warn and the contract is "no signal"
+	// not "won't boot" — the supervisor's restart policy remains
+	// the source of truth for "did the deploy succeed".
+	sidecarProxy, sidecarErr := startSidecarEventsProxy(slog.Default())
+	if sidecarErr != nil {
+		slog.Default().Warn("sidecar events proxy unavailable", "err", sidecarErr)
+	}
+
 	mode, buildManifest, err := decideMode(os.DirFS("/"))
 	if err != nil {
 		return err
@@ -146,7 +162,7 @@ func boot() error {
 	// parallel under per-workload Supervisors.
 	roster, rosterErr := discoverRoster(os.DirFS("/"))
 	if rosterErr == nil && len(roster.Sidecars) > 0 {
-		return runWorkloads(manifest, roster, secrets, apiEnv, slog.Default())
+		return runWorkloads(manifest, roster, secrets, apiEnv, slog.Default(), sidecarProxy)
 	}
 	// Roster absent or empty Sidecars = legacy path. Log the
 	// roster error if it was a parse failure (the legacy
