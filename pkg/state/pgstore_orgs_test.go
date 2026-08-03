@@ -667,9 +667,16 @@ func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
 	}
 
 	// Restore: hand ownership back so subsequent cases have the
-	// canonical starting state (owner + member).
+	// canonical starting state (owner + developer member). The
+	// restore promotes ownerID back to owner but the success-path
+	// demote rule left memberID as admin; reset memberID to
+	// developer explicitly so the post-failure sanity check
+	// below matches the seeded state.
 	if err := s.TransferOrgOwnership(ctx, o.ID, memberID, ownerID); err != nil {
 		t.Fatalf("restore: %v", err)
+	}
+	if err := s.UpdateOrgMemberRole(ctx, o.ID, memberID, OrgRoleDeveloper); err != nil {
+		t.Fatalf("reset member role: %v", err)
 	}
 
 	// Case 2: self-transfer (from == to). The handler front-loads
