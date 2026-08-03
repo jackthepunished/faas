@@ -6,7 +6,7 @@
 //
 // Wire (runner → proxy):
 //
-//   proxy connect sends a single line: "<runtime> <warmup_ms>\n"
+//	proxy connect sends a single line: "<runtime> <warmup_ms>\n"
 //
 // The proxy at /run/guest-init/framework-ready.sock (see
 // guest/init/framework_ready_proxy_linux.go) accepts the line,

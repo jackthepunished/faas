@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00119_reserve_slot.sql — slot reservation placeholder
+-- 00121_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -12,17 +12,16 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Slot 119 bridges the gap between main's 118_deployments_sidecars
--- and this branch's 120_instances_framework_ready_at. The renumber
--- chain (112 → 116 → 117 → 118 → 119 → 120) tracked sibling PRs
--- racing for the same N; on this final rebase onto main
--- (1768ed4b) the chain collapsed into a single 112 → 120 jump,
--- and 119 is the partner fence that keeps the embedded set
--- contiguous 1..120. Whichever side lands first, the other drops
--- its reservation on rebase. The cross-PR slot gate hides
--- reservation files via the slots_from_paths regex carve-out,
--- so the simultaneous reservations do not surface as a
--- collision.
+-- Slot 121 bridges the gap between PR #547's
+-- 00120_warm_hint.sql and this branch's
+-- 00122_instances_framework_ready_at. PR #547 jumped to 120
+-- after the first rebase onto main (1768ed4b), which forced
+-- the renumber chain's 112 → 120 jump to fold into a 112 →
+-- 122 jump on this rebase. Whichever side lands first, the
+-- other drops its reservation on rebase. The cross-PR slot
+-- gate hides reservation files via the slots_from_paths regex
+-- carve-out, so the simultaneous reservations do not surface
+-- as a collision.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change. Future-proof against upstream

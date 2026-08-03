@@ -350,7 +350,7 @@ const testDomain = "apps.test.example"
 // per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
 // call pgtest.WaitForMigration with their own N and remain green.
 //
-// Bumped 83 → 86 → 93 → 94 → 102 across six rebase cycles:
+// Bumped 83 → 86 → 93 → 94 → 102 → 118 → 120 across eleven rebase cycles:
 //
 // (issue #461 / ADR-064 — registry_credentials landing on slot 94
 // after PR #529 (Tier A4 cross-node app rebalance, ADR-064) raced
@@ -361,7 +361,7 @@ const testDomain = "apps.test.example"
 // renumber chain tracks the gate's "next free slot past the live
 // head" rule when sibling PRs race for the same N.)
 //
-//   - 94 → 118 after PR #533 (Tier A5 cross-node live-instance
+//   - 94 → 110 after PR #533 (Tier A5 cross-node live-instance
 //     migration, ADR-066) merged real migrations at 00103 +
 //     00104, then PR #536 (iam-6 personal-org backfill) merged
 //     real at 00105, then PR #525 (issue #470 M8 warm snapshot)
@@ -371,20 +371,55 @@ const testDomain = "apps.test.example"
 //     merged real at 00114, then PR #532 (issue #517 PR-C)
 //     merged real at 00107. The renumber commits in this
 //     branch's history (101/102 → 103/104 → 105/106 → 107/108 →
-//     109/110 → 111 → 112 → 116 → 117) collided with main's new
-//     files, so all nine were dropped on rebase (the work is now
-//     collapsed into a single post-rebase commit). The branch
-//     renumbered 00101 → 00118 past main's new head at 115; the
-//     106-108 + 116 + 117 gaps are filled by reserve_slot.sql
-//     fences at 00106/00107/00108/00116/00117 per ADR-041 so the
-//     embedded FS stays contiguous 1..118. (Slots
-//     00105/00109/00110/00114/00115 are owned by main's real
-//     migrations — no fence needed there.) PR #531 (issue #463
-//     sidecars) claims 00118. PR #540 jumped to 00117 between
-//     my 116 → 117 push and the resulting CI run, then PR #543
-//     reserved 117 + claimed 118; the renumber 117 → 118 keeps
-//     the slot gate clear against the open-PR set.
-const e2eMigrationTarget = 118
+//     109/110) collided with main's new files, so all five were
+//     dropped on rebase (the work is now collapsed into a single
+//     post-rebase commit). The branch renumbered 00101 → 00109 +
+//     00102 → 00110 past main's new head at 105; the 106-108 gap
+//     is filled by reserve_slot.sql fences at 00106/00107/00108
+//     per ADR-041 so the embedded FS stays contiguous 1..110.
+//     (Slot 00105 is owned by main's 00105_personal_org_backfill.sql
+//     — no fence needed there.) Open PRs claim: 00101 (PR #531
+//     issue #463 sidecars), 00107 (PR #532 issue #517 PR-C
+//     canonical wake timeline) — none overlap with 00109/00110.
+//
+//   - 110 → 118 after PR #531 (issue #463 sidecars) merged real
+//     at 00118_deployments_sidecars.sql. The PR was the first
+//     sibling to take the slot past 110; the renumber chain
+//     110 → 111 → 112 on this branch + 113/114/115/116/117
+//     reserve_slot fences collapsed into a single 110 → 118
+//     jump. The 111-117 gaps are filled by main's reserve_slot
+//     fences at 00111/00112/00113/00116/00117 (slot 115 was
+//     real — 00115_api_key_expiry_rotation.sql; slot 114 was
+//     real — 00114_events_wake_id_idx.sql).
+//
+//   - 118 → 120 → 122 on the final two rebases onto main
+//     (1768ed4b) for PR #543 (issue #470 / PR #470-FU-B,
+//     framework_ready signal). The renumber chain (112 → 116 →
+//     117 → 118 → 119 → 120) tracked sibling PRs racing for the
+//     same N (#540 webhook, #531 sidecars) but on the first
+//     rebase all five renumber commits + their reserve_slot
+//     fences collapsed into a single 112 → 120 jump. The 119
+//     gap is filled by 00119_reserve_slot.sql per ADR-041 so
+//     the embedded FS stays contiguous 1..120. PR #543 held
+//     the 119 fence on that branch; PR #531 claimed 118 (now
+//     main's real migration 00118_deployments_sidecars.sql —
+//     fence dropped on merge).
+//
+//     After the first rebase merged (slot 120 live on the
+//     branch), PR #547 (Tier A7 gatewayd split) opened against
+//     main claiming slots 00119/00120/00121. The cross-PR slot
+//     gate then rejected PR #543's push with "migration slot
+//     00120 is also claimed by open PR #547", forcing a second
+//     renumber: 120 → 122. The 119 fence (already on this
+//     branch from the previous cycle) was renamed 119 → 121 to
+//     keep the embedded FS contiguous 1..122 while PR #547's
+//     00119_reserve_slot.sql + 00120_warm_hint.sql occupy slots
+//     119 + 120 on main. Whichever side lands first, the other
+//     drops its reservation on rebase. Slot 122 adds the
+//     `instances.framework_ready_at TIMESTAMPTZ NULL` column
+//     that vmmd's `FrameworkReady` gRPC handler writes to when
+//     the guest-init signals via vsock DGRAM port 1027 (msg=4).
+const e2eMigrationTarget = 122
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
