@@ -1,10 +1,10 @@
 //go:build !no_pg
 
 // Migration-apply tests for the Tier A7 edge split (ADR-070) —
-// slots 120, 121. Pins:
+// slots 123, 124. Pins:
 //
-//  1. The migration set applies cleanly through 121.
-//  2. 00120 (warm_hint):
+//  1. The migration set applies cleanly through 124.
+//  2. 00123 (warm_hint):
 //     - The table exists and accepts canonical (app_id, node_id,
 //     written_at) inserts.
 //     - The CHECK constraint on written_at allows recent values
@@ -13,7 +13,7 @@
 //     - The index on node_id exists (for the future "list all hot
 //     apps on node X" dashboard query).
 //     - Replay-safe: a second MigrateUp is a no-op.
-//  3. 00121 (pg_ratelimit_counters):
+//  3. 00124 (pg_ratelimit_counters):
 //     - The table exists and accepts canonical (scope, subject_id,
 //     plan, tokens) inserts.
 //     - tokens is bigint (not float — the "no floats near money"
@@ -24,16 +24,19 @@
 //     exists.
 //     - Replay-safe: a second MigrateUp is a no-op.
 //
-// Slot note: 00118 (deployments_sidecars on main) is the previous
-// real schema — the embedded migration set is contiguous 1..N
-// where N is the highest slot in the embedded set (N = 121 here).
-// The literal UUID slot values `000116` / `000216` / `000316` /
-// `000416` are test fixture identifiers — unrelated to the slot
-// numbers, chosen so the UUIDs stay unique within this PR's
-// fixture set. Renumber history: this PR originally added
-// migrations at 116/117/118, then renumbered to 119/120, then
-// to 120/121 after PR #540 rebase shifted its webhook schema to
-// 119 (ADR-070 §Migration slot renumber).
+// Slot note: 00122 (instances_framework_ready_at on main) is the
+// previous real schema — the embedded migration set is contiguous
+// 1..N where N is the highest slot in the embedded set (N = 124
+// here). The literal UUID slot values `000116` / `000216` /
+// `000316` / `000416` are test fixture identifiers — unrelated
+// to the slot numbers, chosen so the UUIDs stay unique within
+// this PR's fixture set (per ADR-041 + the migration-test-uuid-
+// sed-residual memory). Renumber history: this PR originally
+// added migrations at 116/117/118, then renumbered to 119/120,
+// then to 120/121, then to 123/124 to dodge PR #543's
+// instances_framework_ready_at at 122 and PR #552's
+// events_sidecar_name_idx at 121 (the cross-PR slot gate
+// surfaced both at rebase time).
 package migrations_test
 
 import (
@@ -46,13 +49,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00120_WarmHint pins the warm_hint table shape.
-func TestMigrations_00120_WarmHint(t *testing.T) {
+// TestMigrations_00123_WarmHint pins the warm_hint table shape.
+func TestMigrations_00123_WarmHint(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing slot between 1 and 121)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing slot between 1 and 124)", err)
 	}
 
 	// (1) Confirm the table exists with the canonical columns.
@@ -144,9 +147,9 @@ func TestMigrations_00120_WarmHint(t *testing.T) {
 	}
 }
 
-// TestMigrations_00121_PgRateLimit pins the pg_ratelimit_counters
+// TestMigrations_00124_PgRateLimit pins the pg_ratelimit_counters
 // table shape (the central rate-limit counter, ADR-070 item 7).
-func TestMigrations_00121_PgRateLimit(t *testing.T) {
+func TestMigrations_00124_PgRateLimit(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -258,11 +261,12 @@ func TestMigrations_00121_PgRateLimit(t *testing.T) {
 }
 
 // TestMigrations_ReserveSlot removed: this PR has no fence in this
-// renumber chain (PR #540 has the 119 webhook schema at a fenced
-// slot, PR #543 has its 122 framework_ready real schema — both
-// were renumbered past; this PR's renumber chain is 116/117/118
-// → 119/120 → 120/121 with no fence slot in between). The
-// migration set applies contiguously from 00118 (deployments_sidecars,
-// on main) through 00121 (this PR's last migration). A future
+// renumber chain (main owns 00119_reserve_slot + 00120/00121 were
+// briefly fences waiting for this PR's real schemas; PR #543 has
+// its 122 framework_ready real schema; PR #552 has 121 real too).
+// This PR's renumber chain is 116/117/118 → 119/120 → 120/121 →
+// 123/124 with no fence slot of its own. The migration set
+// applies contiguously from 00122 (instances_framework_ready_at,
+// on main) through 00124 (this PR's last migration). A future
 // fence, if needed, would land at the next free slot; not in
 // this PR.
