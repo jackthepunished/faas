@@ -111,12 +111,6 @@ func twoWorkloadChangedFixture(t *testing.T, prefix string) []byte {
 	return buf.Bytes()
 }
 
-// diffCount and pgRow are intentionally not defined here: every
-// diff test below calls pool.QueryRow directly with its own SQL.
-// Earlier reviews asked for a shared helper but factoring it across
-// heterogeneous queries (apps, deployments, builds, status columns)
-// obscured intent more than it deduped.
-
 // TestApplyProject_Diff_Unchanged pins the no-op diff: a 2nd apply
 // with identical workloads creates zero new build rows. The
 // apps + deployments counts stay the same. This is the regression
@@ -139,16 +133,29 @@ func TestApplyProject_Diff_Unchanged(t *testing.T) {
 		t.Fatalf("first apply builds=%d want 2", len(ar1.Builds))
 	}
 	buildsBefore := len(ar1.Builds)
-
 	ar2 := applyProjectMultipart(t, h, key, "diff-unchanged", "", body)
-	if len(ar2.Apps) != 2 {
-		t.Fatalf("second apply apps=%d want 2 (no workloads added/removed)", len(ar2.Apps))
+	// Wire response `Apps` carries added∪changed only
+	// (handlers_decompose.go:222) — a no-op re-apply returns 0. The
+	// diff semantic we care about is "no NEW apps" + "no NEW
+	// builds"; project membership stays at 2 because the existing
+	// rows are reused (ADR-068 amendment). Verify both.
+	if len(ar2.Apps) != 0 {
+		t.Fatalf("no-op re-apply apps=%d want 0 (added∪changed is empty on a diff-noop)", len(ar2.Apps))
 	}
 	if len(ar2.Builds) != 0 {
 		t.Fatalf("unchanged re-apply enqueued %d builds, want 0 (regression: every apply churns builds)", len(ar2.Builds))
 	}
 	if buildsBefore == 0 {
 		t.Fatalf("first apply builds was 0 — test setup issue")
+	}
+	var appsAfter int
+	if err := pool.QueryRow(context.Background(),
+		`select count(*) from apps where project_id = $1 and status <> 'deleted'`,
+		ar1.ProjectID).Scan(&appsAfter); err != nil {
+		t.Fatalf("count apps after re-apply: %v", err)
+	}
+	if appsAfter != 2 {
+		t.Fatalf("project membership after re-apply=%d want 2 (existing rows must not be deleted)", appsAfter)
 	}
 }
 
@@ -416,6 +423,3 @@ func TestApplyProject_Diff_EnvCascade(t *testing.T) {
 		t.Fatalf("removed 'worker' app still has %d envs (cascade failed)", envCount)
 	}
 }
-
-// Local time import pin (matches the pattern used by the other
-// apply_project_*_test.go files so gofmt keeps the import).

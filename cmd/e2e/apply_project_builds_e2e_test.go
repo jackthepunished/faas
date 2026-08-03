@@ -45,17 +45,20 @@ import (
 )
 
 // buildProjectFixture returns a tarball with two workloads
-// (services/api + services/worker) so the build-enqueue loop runs
-// the per-app path at least twice. Each workload gets a unique
-// file inside so the per-RootDir staging can be asserted.
+// (compose-detected api + worker) so the build-enqueue loop runs
+// the per-app path at least twice. The per-service Dockerfile +
+// index.js live at the repo root with .api/.worker suffixes so
+// the convention detector does NOT also emit (RootDir="services/api",
+// Name="api") which would collide on apps_slug_key with the
+// compose-detected workload.
 func buildProjectFixture(t *testing.T) []byte {
 	t.Helper()
 	entries := []struct{ name, body string }{
 		{"faas-build/docker-compose.yml", "services:\n  api:\n    build: { context: . }\n  worker:\n    build: { context: . }\n"},
-		{"faas-build/services/api/Dockerfile", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
-		{"faas-build/services/api/index.js", "exports.handler = () => 'api';\n"},
-		{"faas-build/services/worker/Dockerfile", "FROM alpine:3.19\nCMD [\"./worker\"]\n"},
-		{"faas-build/services/worker/index.js", "exports.handler = () => 'worker';\n"},
+		{"faas-build/Dockerfile.api", "FROM alpine:3.19\nCMD [\"./api\"]\n"},
+		{"faas-build/index.api.js", "exports.handler = () => 'api';\n"},
+		{"faas-build/Dockerfile.worker", "FROM alpine:3.19\nCMD [\"./worker\"]\n"},
+		{"faas-build/index.worker.js", "exports.handler = () => 'worker';\n"},
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -500,7 +503,7 @@ func TestApplyProject_Builds_BuildIDIsUUIDv7(t *testing.T) {
 		}
 		// Every char must be hex.
 		for _, c := range b.BuildID {
-			if c < '0' || (c > '9' && c < 'a') || c > 'f' {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
 				t.Fatalf("build id %q contains non-hex char %q", b.BuildID, c)
 			}
 		}

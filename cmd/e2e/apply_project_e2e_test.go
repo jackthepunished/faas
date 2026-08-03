@@ -48,11 +48,14 @@ import (
 )
 
 // applyProjectFixture builds the §4 multi-tier tarball (same as
-// scan_project_e2e_test.go's fixture) plus the conventional
-// services/{api,worker}/ sub-dirs. The fixture is engineered so
-// every Tier 1 detector fires and the convention detector picks
-// up the two services. Each workload is something a customer
-// would actually deploy.
+// scan_project_e2e_test.go's fixture). The compose's services use
+// `build: { context: . }` so the compose detector emits
+// (RootDir=".", Name="api") and (RootDir=".", Name="worker"). The
+// Dockerfile + index.js for each service live at the repo root with
+// `.api` / `.worker` suffixes so they DON'T trigger the convention
+// detector under services/{api,worker}/. Putting both there would
+// produce (RootDir="services/api", Name="api") with the same slug
+// as the compose workload, tripping apps_slug_key on insert.
 func applyProjectFixture(t *testing.T) []byte {
 	t.Helper()
 	const composeYML = `services:
@@ -71,10 +74,10 @@ func applyProjectFixture(t *testing.T) []byte {
 		name, body string
 	}{
 		{"faas-apply/docker-compose.yml", composeYML},
-		{"faas-apply/services/api/Dockerfile", "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n"},
-		{"faas-apply/services/api/index.js", "exports.handler = () => 1;\n"},
-		{"faas-apply/services/worker/Dockerfile", "FROM alpine:3.19\nEXPOSE 8081\nCMD [\"./worker\"]\n"},
-		{"faas-apply/services/worker/index.js", "exports.handler = () => 2;\n"},
+		{"faas-apply/Dockerfile.api", "FROM alpine:3.19\nEXPOSE 8080\nCMD [\"./api\"]\n"},
+		{"faas-apply/index.api.js", "exports.handler = () => 1;\n"},
+		{"faas-apply/Dockerfile.worker", "FROM alpine:3.19\nEXPOSE 8081\nCMD [\"./worker\"]\n"},
+		{"faas-apply/index.worker.js", "exports.handler = () => 2;\n"},
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -159,10 +162,6 @@ func applyProjectMultipart(t *testing.T, h *e2etest.Harness, key, slug, planToke
 	return ar
 }
 
-// scanRequestTimeout is the per-request timeout used by the
-// multipart helpers. 10s is generous; in CI the apply endpoint
-// typically returns in <500ms.
-
 // TestApplyProject_MultiWorkloadHappyPath drives a 6-workload
 // customer tarball through POST /v1/projects and asserts every
 // workload lands as a state.App row with the right slug +
@@ -189,9 +188,12 @@ func TestApplyProject_MultiWorkloadHappyPath(t *testing.T) {
 	// Six workloads in the fixture: api (compose), worker (compose),
 	// faas-apply (fly.toml if present), services/api, services/worker,
 	// cron (Procfile). The fixture above intentionally omits fly.toml
-	// and render.yaml so we get exactly 5 from compose + convention.
-	// We assert >= 2 (the conservative lower bound — reposcan
-	// detector changes could legitimately add more) and the unique
+	// and render.yaml, AND keeps the per-service Dockerfiles at the
+	// repo root (.api/.worker) so the convention detector does NOT
+	// pick up a separate services/{api,worker} workload that would
+	// collide on apps_slug_key with the compose one. We get exactly
+	// 3 from compose + convention: api, worker, cron. We assert
+	// >= 2 (conservative lower bound) and the unique-slug invariant.
 	// app ids are all present.
 	if len(ar.Apps) < 2 {
 		t.Fatalf("expected >= 2 apps, got %d", len(ar.Apps))
