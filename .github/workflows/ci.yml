@@ -218,6 +218,9 @@ jobs:
     name: unit tests (pg shard 1 — apid/meter/migrations)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
@@ -278,6 +281,9 @@ jobs:
     name: unit tests (pg shard 2 — state/gregale/schedd)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     services:
       postgres:
         image: mirror.gcr.io/library/postgres:15
