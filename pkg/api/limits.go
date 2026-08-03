@@ -152,6 +152,21 @@ type Limits struct {
 	// `Plan.MaxInstancesAllowed()` reads this field.
 	MaxInstancesAllowed bool
 
+	// MaxMinInstances (issue #557 / ADR-071) bounds the per-app
+	// cold-wake floor independent of MaxConcurrency. ADR-071
+	// §Decision 5: Hobby 1, Pro 3, Scale 10, Free 0. The cap is
+	// tighter than today's implicit MaxConcurrency clamp (1/2/5/20)
+	// because the floor is resident RAM against the §6.2-2
+	// 47,600 MB ceiling — a Scale customer pinning the floor at
+	// MaxConcurrency=20 would commit ~20.6 GB (~43% of ceiling)
+	// from a single API call. Mirrors TrustedSignerCountMax's
+	// posture: a per-plan value cap, not a plan-tier lock. Plan
+	// lock is the existing MinInstancesAllowed bool. Free=0 here
+	// means even if MinInstancesAllowed is unlocked, Free has no
+	// floor — but Free's MinInstancesAllowed=false keeps it
+	// locked off regardless.
+	MaxMinInstances int // Free 0, Hobby 1, Pro 3, Scale 10
+
 	// ScaleUpTargetRPSAllowed toggles `autoscale_target_rps` per plan
 	// (issue #169 / #172). Hobby + Pro + Scale opt in; Free does not
 	// (Free is single-concurrency and the per-request cost envelope
@@ -534,6 +549,11 @@ var planLimits = map[Plan]Limits{
 		// they're paying for.
 		MinInstancesAllowed: true,
 		MaxInstancesAllowed: true,
+		// MaxMinInstances (ADR-071): Hobby gets 1 — one warm
+		// instance is the minimum the floor feature exists to
+		// deliver (the customer's "first request never pays the
+		// §6.3 wake budget" expectation).
+		MaxMinInstances: 1,
 		// Cron: Hobby gets a small per-app budget (5) and a per-account
 		// budget that absorbs ~2 Hobby-tier apps (10). Tracks the
 		// Hobby apps cap (5) with headroom for the cron-example
@@ -614,6 +634,11 @@ var planLimits = map[Plan]Limits{
 		RegistryCredentialMax: 5,
 		MinInstancesAllowed:   true,
 		MaxInstancesAllowed:   true,
+		// MaxMinInstances (ADR-071): Pro = 3 — covers a small
+		// "always-warm fan-out for a customer-facing API" pattern
+		// without letting one Pro app reserve a quarter of the
+		// box's RAM ceiling.
+		MaxMinInstances: 3,
 		// TrustedSignerCountMax: Pro covers a small-team rotation
 		// matrix (5-8 publishers). Enough for "every dev has their own
 		// key" workflows without letting the table grow unbounded.
@@ -713,6 +738,14 @@ var planLimits = map[Plan]Limits{
 		RegistryCredentialMax: 20,
 		MinInstancesAllowed:   true,
 		MaxInstancesAllowed:   true,
+		// MaxMinInstances (ADR-071): Scale = 10 — half of
+		// MaxConcurrency (20). At Scale's 1024 MB instance RAM
+		// and 8 MB overhead, 10 instances resident = 10,320 MB
+		// (~22% of the §6.2-2 47,600 MB ceiling), leaving
+		// comfortable headroom for live wakes while still
+		// delivering the "always-warm for traffic spikes" UX
+		// the tier promises.
+		MaxMinInstances: 10,
 		// TrustedSignerCountMax: Scale is the regulated-workload
 		// tier; 16 publishers covers "every platform team's CI
 		// plus break-glass" without letting the table grow into
@@ -813,6 +846,21 @@ const (
 	// PerVMOverheadMB is added to every instance's ram_mb for admission and
 	// billing (VMM + jailer + TAP slack, spec §1, §4.7).
 	PerVMOverheadMB = 8
+
+	// FloorDecisionIntervalSeconds (issue #557 / ADR-071 §Decision 1)
+	// is the cadence at which the proactive floor trigger in
+	// pkg/sched/floor wakes instances up to the per-app floor. 1 s
+	// is the customer-facing promise: a Hobby customer who PATCHes
+	// min_instances=1 must see one RUNNING instance within one
+	// second. Tunable via FAAS_FLOOR_INTERVAL_SECONDS at schedd.
+	FloorDecisionIntervalSeconds = 1
+
+	// MaxFloorBackoffSeconds (ADR-071 §Decision 4) caps the per-app
+	// exponential backoff the floor trigger applies on a non-nil
+	// AdmitInstance error. 60 s bounds the FAILED-row hazard on a
+	// RAM-saturated box: a stuck ceiling produces at most ~6 FAILED
+	// rows per app per hour, not 3,600 (one per second).
+	MaxFloorBackoffSeconds = 60
 
 	// CPU (spec §1).
 	CPUOvercommit = 8
@@ -1615,6 +1663,21 @@ func (p Plan) TrustedSignerCountMax() int {
 		return 0
 	}
 	return l.TrustedSignerCountMax
+}
+
+// MaxMinInstances returns the per-plan cap on the per-app
+// cold-wake floor (issue #557 / ADR-071). Free 0, Hobby 1, Pro 3,
+// Scale 10. The apid updateApp handler rejects values above this
+// with CodeMaxMinInstancesExceeded (422) carrying the limit + the
+// observed value + a docs URL — the CLI renders the rejection
+// with actionable retry guidance. Unknown plans fail closed
+// (return 0) — same contract as TrustedSignerCountMax.
+func (p Plan) MaxMinInstances() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.MaxMinInstances
 }
 
 // LogDeploymentFilterMax returns the per-plan cap on the

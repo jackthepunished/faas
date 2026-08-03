@@ -21,6 +21,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"math"
@@ -43,6 +44,13 @@ import (
 // Returns 200 with an empty `instances` array for an account with
 // zero live instances — never 404. next_before is the last row's id
 // when len(out) == limit; omitted (empty) otherwise.
+//
+// Issue #557 / ADR-071: each row carries the parent app's
+// EffectiveMinInstances() via the min_instances_target wire field so
+// dashboards can verify the proactive floor is being met. Apps are
+// looked up in one batch query (one AppByID call per unique
+// AppID) — a single page at limit=100 maps to ≤100 AppIDs but in
+// practice tenants run one app per page.
 func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	prob, limit := api.ParseLimit(r.URL.Query().Get("limit"), 25, 100, "instances")
 	if prob != nil {
@@ -58,9 +66,10 @@ func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request,
 	if rows == nil {
 		rows = []state.Instance{}
 	}
+	floors := s.batchMinInstancesTargets(ctx(r), rows)
 	out := make([]api.InstanceResponse, 0, len(rows))
 	for _, ins := range rows {
-		out = append(out, instanceResponse(ins))
+		out = append(out, instanceResponse(ins, floors[ins.AppID]))
 	}
 	var nextBefore string
 	if len(out) == limit && len(out) > 0 {
@@ -70,6 +79,32 @@ func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request,
 		Instances:  out,
 		NextBefore: nextBefore,
 	})
+}
+
+// batchMinInstancesTargets (issue #557 / ADR-071) returns a map of
+// AppID → EffectiveMinInstances for every distinct parent app on
+// the page. Single missing-app case is silent (returns 0 — the
+// same as a customer who never opted in). Bounded by the caller's
+// limit (≤ 100); the lookup is one round-trip per unique AppID, not
+// per row.
+func (s *server) batchMinInstancesTargets(rctx context.Context, rows []state.Instance) map[string]int {
+	if len(rows) == 0 {
+		return map[string]int{}
+	}
+	seen := map[string]struct{}{}
+	out := map[string]int{}
+	for _, ins := range rows {
+		if _, dup := seen[ins.AppID]; dup {
+			continue
+		}
+		seen[ins.AppID] = struct{}{}
+		app, err := s.store.AppByID(rctx, ins.AppID)
+		if err != nil {
+			continue
+		}
+		out[ins.AppID] = app.EffectiveMinInstances()
+	}
+	return out
 }
 
 // listSecretsForAccount serves GET /v1/secrets. Each row carries the

@@ -3505,19 +3505,24 @@ func (e *Engine) isOnScaleOutCooldown(app *state.App, concurrency int) bool {
 	return time.Since(*app.LastScaleOutAt) < cooldown
 }
 
-// atMinFloorWithNoSignal (PR-C, issue #462) returns true when the
-// customer has configured ScalingPolicy.MinInstances > 0 AND the
-// live concurrency has reached that floor. The "no signal" suffix
-// captures the customer-facing semantic: an idle wake (no inflight
-// reading) cannot push concurrency below the floor — the
-// dashboard sees this as a no-op scale-out attempt.
+// atMinFloorWithNoSignal (PR-C, issue #462 / issue #557 ADR-071)
+// returns true when the customer has opted into floor enforcement
+// via ScalingPolicy.MinInstances (jsonb) AND the live concurrency
+// has reached that floor. The "no signal" suffix captures the
+// customer-facing semantic: a no-inflight-reading wake cannot push
+// concurrency above the floor — the dashboard sees this as a no-op
+// scale-out attempt.
+//
+// This gate does NOT read the legacy column (apps.min_instances).
+// The legacy column is a reaper-side concern (don't park below
+// the floor) plus a billing concern (ADR-060 floor-billed from t=0);
+// the proactive wake direction is owned by pkg/sched/floor
+// (ADR-071). Mixing the two here would block legitimate request-
+// driven wakes on the floor, regressing the §4.3 burst semantics.
 //
 // When ScalingPolicy is nil OR MinInstances == 0, the customer has
 // not opted into floor enforcement, so the branch does NOT fire —
-// every existing wake proceeds to the ledger. PR-D closes the
-// worker-class bypass closure and adds an explicit wake-path gate
-// for worker-class apps (the targets trigger currently no-ops for
-// them because MaxInflightForApp returns (0, false)).
+// every existing wake proceeds to the ledger.
 func (e *Engine) atMinFloorWithNoSignal(app *state.App, concurrency int) bool {
 	if app.ScalingPolicy == nil {
 		return false

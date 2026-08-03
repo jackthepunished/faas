@@ -76,6 +76,13 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		if *req.MinInstances < 0 || *req.MinInstances > limits.MaxConcurrency {
 			return api.ErrInvalidMinInstances(*req.MinInstances, limits.MaxConcurrency)
 		}
+		// ADR-071 §Decision 5: per-plan MaxMinInstances cap
+		// (Hobby 1, Pro 3, Scale 10). Tighter than MaxConcurrency
+		// to protect the §6.2-2 RAM ceiling from a single API
+		// call pinning a large fraction of the box.
+		if *req.MinInstances > acct.Plan.MaxMinInstances() {
+			return api.ErrMaxMinInstancesExceeded(*req.MinInstances, acct.Plan.MaxMinInstances())
+		}
 	}
 	if req.EgressAllowlist != nil {
 		// Plan tier first: a Free/Hobby PATCH must surface 403 even
@@ -304,6 +311,13 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		// the apid gate only rejects the negative / over-cap cases.
 		if sp.MinInstances < 0 || sp.MinInstances > limits.MaxConcurrency {
 			return api.ErrInvalidMinInstances(sp.MinInstances, limits.MaxConcurrency)
+		}
+		// ADR-071 §Decision 5: per-plan MaxMinInstances cap
+		// (Hobby 1, Pro 3, Scale 10). Tighter than MaxConcurrency
+		// to protect the §6.2-2 RAM ceiling from a single API
+		// call pinning a large fraction of the box.
+		if sp.MinInstances > acct.Plan.MaxMinInstances() {
+			return api.ErrMaxMinInstancesExceeded(sp.MinInstances, acct.Plan.MaxMinInstances())
 		}
 		// Bounds on max_instances: must be in [MinInstances, plan.MaxConcurrency].
 		// 0 means "use plan max_concurrency"; the engine reads the
@@ -826,7 +840,7 @@ func (s *server) listInstances(w http.ResponseWriter, r *http.Request, acct stat
 	}
 	out := make([]api.InstanceResponse, 0, len(instances))
 	for _, ins := range instances {
-		out = append(out, instanceResponse(ins))
+		out = append(out, instanceResponse(ins, app.EffectiveMinInstances()))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1979,15 +1993,22 @@ func (s *server) buildProvenanceResponse(p state.BuildProvenance) api.BuildProve
 	}
 }
 
-func instanceResponse(ins state.Instance) api.InstanceResponse {
+// instanceResponse projects a state.Instance into the wire
+// InstanceResponse. The minInstancesTarget parameter carries the
+// parent app's effective min_instances (issue #557 / ADR-071) so
+// dashboards can verify the proactive floor is being met on a
+// per-instance basis. Zero is omitted via the JSON `omitempty`
+// contract — customers who never opted in see no field.
+func instanceResponse(ins state.Instance, minInstancesTarget int) api.InstanceResponse {
 	r := api.InstanceResponse{
-		ID:           ins.ID,
-		AppID:        ins.AppID,
-		DeploymentID: ins.DeploymentID,
-		State:        ins.State,
-		HostIP:       ins.HostIP,
-		RAMMB:        ins.RAMMB,
-		WakeID:       ins.WakeID,
+		ID:                 ins.ID,
+		AppID:              ins.AppID,
+		DeploymentID:       ins.DeploymentID,
+		State:              ins.State,
+		HostIP:             ins.HostIP,
+		RAMMB:              ins.RAMMB,
+		WakeID:             ins.WakeID,
+		MinInstancesTarget: minInstancesTarget,
 	}
 	if !ins.StartedAt.IsZero() {
 		r.StartedAt = ins.StartedAt.UTC().Format(time.RFC3339)

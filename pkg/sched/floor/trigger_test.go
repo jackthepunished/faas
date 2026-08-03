@@ -1,0 +1,517 @@
+package floor
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
+)
+
+// --- test doubles --------------------------------------------------------
+
+// fakeStore is a minimal AppStore. ListAllApps returns a fixed list;
+// ListAppsByNodeID filters the list by node id.
+type fakeStore struct {
+	apps    []state.App
+	listErr error
+}
+
+func (f *fakeStore) ListAllApps(_ context.Context) ([]state.App, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.apps, nil
+}
+
+func (f *fakeStore) ListAppsByNodeID(_ context.Context, _ string) ([]state.App, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.apps, nil
+}
+
+// fakeLedger is a minimal Ledger. Concurrency returns the value from
+// a per-app map; ResidentRAM/HeadroomMB return fixed values. Tests
+// pass headroom=47_600 explicitly to keep the §6.2-2 ceiling
+// pre-check non-blocking unless the test explicitly tightens it.
+type fakeLedger struct {
+	mu          sync.Mutex
+	conc        map[string]int
+	residentRAM int
+	headroom    int
+}
+
+func (l *fakeLedger) Concurrency(appID string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.conc[appID]
+}
+
+func (l *fakeLedger) ResidentRAM() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.residentRAM
+}
+
+func (l *fakeLedger) HeadroomMB() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.headroom
+}
+
+// fakeEngine is a minimal Engine. Records every AdmitInstance call
+// and ships back a canned AdmitResult or canned error per app.
+type fakeEngine struct {
+	mu      sync.Mutex
+	calls   []string
+	results map[string]AdmitResult
+	errs    map[string]error
+}
+
+func (e *fakeEngine) AdmitInstance(_ context.Context, appID string) (AdmitResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, appID)
+	if err, ok := e.errs[appID]; ok {
+		return AdmitResult{}, err
+	}
+	if r, ok := e.results[appID]; ok {
+		return r, nil
+	}
+	return AdmitResult{InstanceID: "ins-" + appID}, nil
+}
+
+// fakePlanResolver returns the canned plan for an account id.
+type fakePlanResolver struct {
+	plans map[string]api.Plan
+}
+
+func (p *fakePlanResolver) ResolvePlan(_ context.Context, accountID string) (api.Plan, bool) {
+	pl, ok := p.plans[accountID]
+	return pl, ok
+}
+
+// fakeAuditor records every Emit call for audit-kind assertions.
+type fakeAuditor struct {
+	mu        sync.Mutex
+	emissions []fakeEmission
+}
+
+type fakeEmission struct {
+	kind      string
+	accountID string
+	data      map[string]any
+}
+
+func (a *fakeAuditor) Emit(_ context.Context, kind string, accountID *string, data map[string]any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	acct := ""
+	if accountID != nil {
+		acct = *accountID
+	}
+	a.emissions = append(a.emissions, fakeEmission{kind, acct, data})
+}
+
+// errStore is a fakeStore variant whose ListAllApps always errors.
+type errStore struct{}
+
+func (e *errStore) ListAllApps(_ context.Context) ([]state.App, error) {
+	return nil, errors.New("store down")
+}
+
+func (e *errStore) ListAppsByNodeID(_ context.Context, _ string) ([]state.App, error) {
+	return nil, errors.New("store down")
+}
+
+// --- helpers -------------------------------------------------------------
+
+// floorApp returns a state.App wired for the floor trigger with the
+// supplied min_instances on the legacy column. AccountID defaults to
+// "acct1" so tests stay short. Plan is resolved out-of-band by
+// fakePlanResolver — it's not on state.App.
+func floorApp(id string, _ api.Plan, minInstances int) state.App {
+	return state.App{
+		ID:            id,
+		AccountID:     "acct1",
+		MinInstances:  minInstances,
+		RAMMB:         256,
+		WorkloadClass: state.WorkloadClassHTTP,
+	}
+}
+
+// --- tests ---------------------------------------------------------------
+
+// TestTick_AdmitsUpToFloor is the issue #557 acceptance criterion
+// #1: an app with min_instances=2 and 0 running instances MUST be
+// admitted twice across consecutive ticks until the floor is met.
+func TestTick_AdmitsUpToFloor(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	auditor := &fakeAuditor{}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		Auditor: auditor,
+		PlanResolver: resolver,
+	})
+
+	// Tick 1: floor=2, conc=0 → admit once → engine creates instance.
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 1: %v", err)
+	}
+	if len(engine.calls) != 1 || engine.calls[0] != "app1" {
+		t.Errorf("Tick 1 engine.calls = %v, want [app1]", engine.calls)
+	}
+	if len(auditor.emissions) != 1 || auditor.emissions[0].kind != "floor.wake" {
+		t.Errorf("Tick 1 auditor emissions = %+v, want one floor.wake", auditor.emissions)
+	}
+
+	// Simulate the engine's effect on the ledger: conc now 1.
+	ledger.conc["app1"] = 1
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+	if len(engine.calls) != 2 {
+		t.Errorf("Tick 2 engine.calls = %v, want second app1 admit", engine.calls)
+	}
+
+	// Now conc=2 → floor met → no admit.
+	ledger.conc["app1"] = 2
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
+	}
+	if len(engine.calls) != 2 {
+		t.Errorf("Tick 3 engine.calls = %v, want no admits (floor met)", engine.calls)
+	}
+}
+
+// TestTick_FreePlanDisabled verifies the plan gate: a Free-plan app
+// is silently dropped even when the customer wrote min_instances=2.
+func TestTick_FreePlanDisabled(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanFree, 2)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanFree}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (Free plan disabled)", engine.calls)
+	}
+}
+
+// TestTick_WorkerClassDisabled verifies the workload-class gate:
+// worker-class apps never get floor wakes even when the customer
+// set min_instances.
+func TestTick_WorkerClassDisabled(t *testing.T) {
+	app := floorApp("app1", api.PlanHobby, 2)
+	app.WorkloadClass = state.WorkloadClassWorker
+	store := &fakeStore{apps: []state.App{app}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (worker class disabled)", engine.calls)
+	}
+}
+
+// TestTick_RamCeilingPreCheck verifies the §6.2-2 ceiling defense:
+// an app whose billable RAM exceeds current headroom must yield
+// without calling AdmitInstance.
+func TestTick_RamCeilingPreCheck(t *testing.T) {
+	app := floorApp("app1", api.PlanPro, 1)
+	app.RAMMB = 1024 // Pro ceiling includes 8 MB overhead → 1032 MB.
+	store := &fakeStore{apps: []state.App{app}}
+	// Headroom smaller than the projected admit.
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, residentRAM: 47_000, headroom: 600}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanPro}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (RAM ceiling)", engine.calls)
+	}
+}
+
+// TestTick_AtCapacityRecordedNotErrored verifies the bifurcation:
+// the engine returning AtCapacity=true is SUCCESS (no FAILED row,
+// no backoff), but the trigger records the at_capacity outcome.
+func TestTick_AtCapacityRecordedNotErrored(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 1}, headroom: 47_600}
+	engine := &fakeEngine{results: map[string]AdmitResult{"app1": {AtCapacity: true}}}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 1 {
+		t.Errorf("engine.calls = %v, want [app1]", engine.calls)
+	}
+	// Second tick must NOT be in backoff (AtCapacity is success).
+	ledger.conc["app1"] = 0
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+	if len(engine.calls) != 2 {
+		t.Errorf("Tick 2 engine.calls = %v, want second admit (AtCapacity cleared backoff)", engine.calls)
+	}
+}
+
+// TestTick_EngineErrorRecordsBackoff verifies the per-app exponential
+// backoff: a non-nil error from AdmitInstance must put the app to
+// sleep; the next tick within the window must NOT call the engine.
+func TestTick_EngineErrorRecordsBackoff(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{errs: map[string]error{"app1": errors.New("vmmd unreachable")}}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 1: %v", err)
+	}
+	if len(engine.calls) != 1 {
+		t.Errorf("Tick 1 engine.calls = %v, want [app1]", engine.calls)
+	}
+	// Immediate retry → backoff must block.
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+	if len(engine.calls) != 1 {
+		t.Errorf("Tick 2 engine.calls = %v, want [] (backoff held)", engine.calls)
+	}
+	// Clear the backoff by hand so the assertion about success is
+	// deterministic.
+	tr.recordSuccess("app1")
+	engine.errs = nil
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
+	}
+	if len(engine.calls) != 2 {
+		t.Errorf("Tick 3 engine.calls = %v, want second admit (backoff cleared)", engine.calls)
+	}
+}
+
+// TestTick_ScaleOutCooldownHeld verifies the per-app cooldown check
+// behaves like the engine: LastScaleOutAt within ScaleOutCooldownS
+// blocks the admit.
+func TestTick_ScaleOutCooldownHeld(t *testing.T) {
+	now := time.Now()
+	stamp := now.Add(-1 * time.Second)
+	app := floorApp("app1", api.PlanHobby, 2)
+	app.LastScaleOutAt = &stamp
+	app.ScalingPolicy = &state.ScalingPolicy{ScaleOutCooldownS: 60}
+	store := &fakeStore{apps: []state.App{app}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (cooldown held)", engine.calls)
+	}
+}
+
+// TestTick_OwnerNodeIDRoutesToListAppsByNodeID verifies that
+// WithOwnerNodeID flips the trigger from ListAllApps to
+// ListAppsByNodeID. Both fakes are instrumented to expose which
+// method schedd hit.
+func TestTick_OwnerNodeIDRoutesToListAppsByNodeID(t *testing.T) {
+	store := &instrumentedStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+
+	// Unsharded → ListAllApps.
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick (unsharded): %v", err)
+	}
+	if !store.listAllCalls {
+		t.Error("unsharded Tick did not call ListAllApps")
+	}
+	if store.listByIDCalls != 0 {
+		t.Errorf("unsharded Tick called ListAppsByNodeID %d times, want 0", store.listByIDCalls)
+	}
+
+	// Sharded → ListAppsByNodeID.
+	tr.WithOwnerNodeID("node-1")
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick (sharded): %v", err)
+	}
+	if store.listByIDCalls != 1 {
+		t.Errorf("sharded Tick called ListAppsByNodeID %d times, want 1", store.listByIDCalls)
+	}
+}
+
+// instrumentedStore records which method the trigger called. Apps
+// are returned from either method so the assertion is purely about
+// the routing decision.
+type instrumentedStore struct {
+	apps          []state.App
+	listAllCalls  bool
+	listByIDCalls int
+}
+
+func (s *instrumentedStore) ListAllApps(_ context.Context) ([]state.App, error) {
+	s.listAllCalls = true
+	return s.apps, nil
+}
+
+func (s *instrumentedStore) ListAppsByNodeID(_ context.Context, _ string) ([]state.App, error) {
+	s.listByIDCalls++
+	return s.apps, nil
+}
+
+// TestTick_NilSafe verifies the nil-receiver contract: Tick on a nil
+// *Trigger is a no-op.
+func TestTick_NilSafe(t *testing.T) {
+	var tr *Trigger
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Errorf("nil.Tick = %v, want nil", err)
+	}
+	if got := tr.Interval(); got != 0 {
+		t.Errorf("nil.Interval = %v, want 0", got)
+	}
+}
+
+// TestTick_StoreErrorBubbles verifies that an appStore outage
+// surfaces as an error from Tick so the loop can log it.
+func TestTick_StoreErrorBubbles(t *testing.T) {
+	tr := New(&errStore{}, &fakeLedger{}, &fakeEngine{}, Options{Metrics: wire.NewOpsMetrics("schedd")})
+	if err := tr.Tick(context.Background()); err == nil {
+		t.Error("Tick on errStore returned nil, want error")
+	}
+}
+
+// TestTick_NilLedgerIsSafe verifies the trigger's defensive posture
+// when downstream dependencies are nil (load-bearing for schedd's
+// early-boot wiring). The trigger no-ops rather than panics.
+func TestTick_NilLedgerIsSafe(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	tr := New(store, nil, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick with nil ledger: %v", err)
+	}
+	if len(engine.calls) != 1 {
+		t.Errorf("engine.calls = %v, want [app1] (nil ledger treated as conc=0)", engine.calls)
+	}
+}
+
+// TestTick_NilPlanResolverDefaultsToFree verifies the resolver
+// default: missing plan → Free → OutcomeDisabled. Customers whose
+// account lookup races the trigger see a clean disabled-outcome path
+// rather than a panic.
+func TestTick_NilPlanResolverDefaultsToFree(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{}
+	tr := New(store, ledger, engine, Options{Metrics: wire.NewOpsMetrics("schedd")})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (nil resolver → Free → disabled)", engine.calls)
+	}
+}
+
+// TestTick_AuditorEmitsFloorWake verifies the audit emission contract
+// on the happy path. The data payload includes app_id, floor,
+// concurrency_before, and wake_id (= AdmitResult.InstanceID).
+func TestTick_AuditorEmitsFloorWake(t *testing.T) {
+	store := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{results: map[string]AdmitResult{"app1": {InstanceID: "iid-xyz"}}}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	auditor := &fakeAuditor{}
+	tr := New(store, ledger, engine, Options{
+		Metrics: wire.NewOpsMetrics("schedd"),
+		Auditor: auditor,
+		PlanResolver: resolver,
+	})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(auditor.emissions) != 1 {
+		t.Fatalf("auditor.emissions = %+v, want exactly 1", auditor.emissions)
+	}
+	em := auditor.emissions[0]
+	if em.kind != "floor.wake" {
+		t.Errorf("kind = %q, want floor.wake", em.kind)
+	}
+	if em.accountID != "acct1" {
+		t.Errorf("accountID = %q, want acct1", em.accountID)
+	}
+	if em.data["app_id"] != "app1" {
+		t.Errorf("data[app_id] = %v, want app1", em.data["app_id"])
+	}
+	if em.data["wake_id"] != "iid-xyz" {
+		t.Errorf("data[wake_id] = %v, want iid-xyz", em.data["wake_id"])
+	}
+}
+
+// TestEffectiveMaxConcurrency pins the legacy-app clamp: a pre-PR-A
+// app whose MaxConcurrency is 0 falls back to the plan ceiling, so
+// the trigger does not silently allow unlimited admits.
+func TestEffectiveMaxConcurrency(t *testing.T) {
+	cases := []struct {
+		name string
+		app  state.App
+		plan api.Plan
+		want int
+	}{
+		{"unset clamps to plan", state.App{MaxConcurrency: 0}, api.PlanHobby, 2},
+		{"under plan kept", state.App{MaxConcurrency: 1}, api.PlanHobby, 1},
+		{"over plan clamped", state.App{MaxConcurrency: 999}, api.PlanHobby, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := effectiveMaxConcurrency(c.app, c.plan)
+			if got != c.want {
+				t.Errorf("effectiveMaxConcurrency = %d, want %d", got, c.want)
+			}
+		})
+	}
+}

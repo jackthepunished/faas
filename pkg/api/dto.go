@@ -899,6 +899,15 @@ type InstanceResponse struct {
 	// the app against gateway logs and slog entries (which also
 	// carry this field).
 	WakeID string `json:"wake_id,omitempty"`
+	// MinInstancesTarget (issue #557 / ADR-071) is the parent app's
+	// effective min_instances at the time this instance was admitted.
+	// Populated by apid's list-instances handler via
+	// state.App.EffectiveMinInstances() (max of apps.min_instances
+	// + ScalingPolicy.MinInstances). Zero is omitted — it means
+	// "customer never opted into a floor". A pointer would surface
+	// the difference between 0 and unset; the JSON contract uses
+	// omitempty so absent and 0 are indistinguishable to clients.
+	MinInstancesTarget int `json:"min_instances_target,omitempty"`
 }
 
 // ListInstancesResponse is the page shape for GET /v1/instances

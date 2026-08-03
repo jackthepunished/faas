@@ -24,6 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/sched/floor"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/sched/targets"
@@ -51,6 +52,7 @@ type Loop struct {
 	instStats         InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 	scaleup           *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
 	targets           *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	floor             *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
 	recentLoad        *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
 	reaperAggressive  bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap     int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
@@ -219,6 +221,21 @@ func (l *Loop) WithScaleUp(t *scaleup.Trigger) *Loop {
 // via nil. The trigger's own Interval() governs the cadence.
 func (l *Loop) WithTargets(t *targets.Trigger) *Loop {
 	l.targets = t
+	return l
+}
+
+// WithFloor (issue #557 / ADR-071) attaches the proactive
+// min-instances floor reconciler. The trigger walks every app the
+// schedd owns each tick and admits instances up to the effective
+// min_instances floor (max of legacy column + ScalingPolicy jsonb).
+// Nil opts out — the floorTick arm of Run's select never fires. The
+// trigger's own Interval() governs the cadence (default
+// api.FloorDecisionIntervalSeconds = 1s). Distinct from WithScaleUp
+// and WithTargets: those are reactive (RPS / CPU / inflight signal);
+// the floor trigger is proactive — it runs regardless of traffic
+// because the customer's SLA is "min N resident at all times".
+func (l *Loop) WithFloor(t *floor.Trigger) *Loop {
+	l.floor = t
 	return l
 }
 
@@ -423,6 +440,20 @@ func (l *Loop) Run(ctx context.Context) error {
 		targetsT = time.NewTicker(interval)
 		defer targetsT.Stop()
 	}
+	// Floor reconciler ticker (issue #557 / ADR-071). 1 s cadence
+	// mirrors scaleupTick / targetsTick; nil opts out. The trigger
+	// supervises its own nil-safety (New(nil, ...) → Tick no-ops)
+	// so a nil-safe wire here would also work, but a typed nil
+	// ticker keeps the select arm dead as an explicit choice.
+	var floorT *time.Ticker
+	if l.floor != nil {
+		interval := l.floor.Interval()
+		if interval <= 0 {
+			interval = api.FloorDecisionIntervalSeconds * time.Second
+		}
+		floorT = time.NewTicker(interval)
+		defer floorT.Stop()
+	}
 	// Recent-load mirror ticker (issue #171). 1 s cadence keeps the
 	// per-app RPS window current between reaper ticks (the reaper
 	// itself runs at 10 s). nil mirror opts out — no ticker, no
@@ -471,6 +502,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runScaleUp(ctx)
 		case <-targetsTick(targetsT):
 			l.runTargets(ctx)
+		case <-floorTick(floorT):
+			l.runFloor(ctx)
 		case <-recentLoadTick(recentLoadT):
 			l.runRecentLoad(ctx)
 		case <-migratingWatchdogTick(migratingWatchdogT):
@@ -554,6 +587,15 @@ func scaleupTick(t *time.Ticker) <-chan time.Time {
 // targetsTick (PR-C, issue #462) is the concurrent_requests target
 // scale-up trigger ticker. Same nil-safe shape as scaleupTick.
 func targetsTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
+// floorTick (issue #557 / ADR-071) is the proactive min-instances
+// floor reconciler ticker. Same nil-safe shape as scaleupTick.
+func floorTick(t *time.Ticker) <-chan time.Time {
 	if t == nil {
 		return nil
 	}
@@ -732,6 +774,21 @@ func (l *Loop) runTargets(ctx context.Context) {
 	}
 }
 
+// runFloor (issue #557 / ADR-071) dispatches one tick of the
+// proactive min-instances floor reconciler. Same shape as
+// runTargets — Tick errors are logged, never returned, so a
+// transient store outage can't tear down the loop. The trigger
+// itself is nil-safe (Tick on a nil *Trigger is a no-op); the
+// nil-check here is defence-in-depth for the typed-nil ticker arm.
+func (l *Loop) runFloor(ctx context.Context) {
+	if l.floor == nil {
+		return
+	}
+	if err := l.floor.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("floor tick error", "err", err)
+	}
+}
+
 // runRecentLoad dispatches one tick of the aggressive-reaper signal
 // mirror (issue #171). Same shape as runScaleUp — Touch errors are
 // swallowed (the mirror keeps its previous ring; the reaper sees
@@ -879,8 +936,11 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// ux_spec §6.5: per-app floor the reaper honors
 				// when parking idle instances. Plan-tier-gated
 				// upstream (apid updateApp handler), so the
-				// value is always >= 0 here.
-				MinInstances: a.MinInstances,
+				// value is always >= 0 here. ADR-071: read via
+				// EffectiveMinInstances so the reaper agrees
+				// with the engine gate and the meterd sampler
+				// (closes the column/jsonb revenue gap).
+				MinInstances: a.EffectiveMinInstances(),
 				OpenConns:    open,
 				// ADR-051 PR-D: workload class drives the
 				// reaper-exempt carve-out. Workers skip
@@ -1022,12 +1082,15 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		runningByApp[s.AppID]++
 	}
-	// floorByApp (PR-C, issue #462): per-app MinInstances for the
-	// min_floor_already comparison. Sourced from the `apps` slice
-	// passed into runReaperAggressive.
+	// floorByApp (PR-C, issue #462 + issue #557 / ADR-071): per-app
+	// MinInstances for the min_floor_already comparison. Sourced from
+	// EffectiveMinInstances() (max of legacy column + ScalingPolicy
+	// jsonb) so the reaper agrees with the meter and the floor
+	// trigger — divergent configs must not silently park a customer
+	// below the floor they actually configured.
 	floorByApp := map[string]int{}
 	for _, a := range apps {
-		floorByApp[a.ID] = a.MinInstances
+		floorByApp[a.ID] = a.EffectiveMinInstances()
 	}
 	// For each considered app, emit either `park` (≥ 1 instance
 	// parked), `min_floor_already` (running already at the floor
@@ -1063,6 +1126,21 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		l.ops.ObserveScaleDown(appID, "park")
 		l.emitScaleDownAudit(ctx, appID, desiredByApp[appID], ids, now)
+		// Issue #557 / ADR-071: if the post-park running count is
+		// below the customer's effective min_instances, that means
+		// the floor was lowered since the last tick — emit a
+		// `instances.parked_min_instances_released` audit row so
+		// operators can correlate the bill change with the PATCH
+		// that caused it. Pre-#557 this case was silent. The
+		// post-park count is the running count minus len(ids); we
+		// clamp at 0 to be defensive against racing parks.
+		postPark := runningByApp[appID] - len(ids)
+		if postPark < 0 {
+			postPark = 0
+		}
+		if floorByApp[appID] > postPark {
+			l.emitFloorReleasedAudit(ctx, appID, floorByApp[appID], postPark, now)
+		}
 		aggressiveParkOK := false
 		for _, id := range ids {
 			if err := l.engine.Park(ctx, id); err != nil {
@@ -1104,6 +1182,32 @@ func (l *Loop) emitScaleDownAudit(ctx context.Context, appID string, desired int
 	subject := appID
 	if err := l.engine.Store().AppendEvent(ctx, "schedd", "reaper_scale_down", &subject, data); err != nil {
 		l.log.Warn("reaper: scale-down audit write failed", "app", appID, "err", err)
+	}
+}
+
+// emitFloorReleasedAudit (issue #557 / ADR-071) writes one events
+// row per aggressive-park tick where the post-park running count
+// drops below the customer's effective min_instances. The semantic
+// is "the customer's floor dropped, so we're releasing instances
+// the floor would have kept resident". Pre-#557 the reaper silently
+// released those; operators couldn't tell whether the bill change
+// came from traffic or from a PATCH. Best-effort: a failure is
+// logged but does not roll back the Park calls.
+func (l *Loop) emitFloorReleasedAudit(ctx context.Context, appID string, floor, postPark int, now time.Time) {
+	data, err := json.Marshal(map[string]any{
+		"app":        appID,
+		"floor":      floor,
+		"post_park":  postPark,
+		"reason":     "min_instances_lowered",
+		"now":        now.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		l.log.Warn("reaper: marshal floor-released audit", "err", err)
+		return
+	}
+	subject := appID
+	if err := l.engine.Store().AppendEvent(ctx, "schedd", "instances.parked_min_instances_released", &subject, data); err != nil {
+		l.log.Warn("reaper: floor-released audit write failed", "app", appID, "err", err)
 	}
 }
 

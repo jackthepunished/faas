@@ -5272,6 +5272,13 @@ components:
         started_at: { type: [string, "null"], format: date-time }
         last_request_at: { type: [string, "null"], format: date-time }
         parked_at: { type: [string, "null"], format: date-time }
+        # issue #557 / ADR-071: per-instance echo of the parent app's
+        # effective min_instances at the time the instance was
+        # admitted. Populated by apid via state.App.EffectiveMinInstances()
+        # — max of apps.min_instances (legacy column) and
+        # ScalingPolicy.MinInstances (jsonb). null when the customer
+        # never opted in.
+        min_instances_target: { type: [integer, "null"], minimum: 0 }
 
     # ─── Domains ──────────────────────────────────────────────────────────
 
