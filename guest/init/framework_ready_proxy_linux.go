@@ -175,6 +175,37 @@ func startFrameworkReadyProxy(log *slog.Logger) error {
 	return nil
 }
 
+// parseProxyLine parses one "<runtime> [warmup_ms]" line from the
+// runner side of the proxy. Extracted so the bounded conversion
+// is unit-testable without spinning up a unix socket + vsock fd.
+//
+// Returns runtime (always non-empty), warmupMs (0 when not given),
+// and err for any malformed input. warmupMs is bounded to uint32
+// at parse time so the caller can cast to uint32 without an
+// upper-bound check (this is what triggers go/integer-overflow
+// when narrowing a signed 64-bit value).
+func parseProxyLine(line string) (string, uint64, error) {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 1 || len(fields) > 2 {
+		return "", 0, fmt.Errorf("format: '<runtime> [warmup_ms]'")
+	}
+	runtime := fields[0]
+	var warmupMs uint64
+	if len(fields) == 2 {
+		// ParseUint with bitSize=32 does the upper-bound check
+		// against math.MaxUint32 AND rejects negative inputs in
+		// the same call — both directions go/integer-overflow
+		// flags. The wire is a 4-byte BE uint32, so anything
+		// outside [0, math.MaxUint32] is unrepresentable anyway.
+		w, perr := strconv.ParseUint(fields[1], 10, 32)
+		if perr != nil {
+			return "", 0, fmt.Errorf("parse warmup_ms: %w", perr)
+		}
+		warmupMs = w
+	}
+	return runtime, warmupMs, nil
+}
+
 // handleFrameworkReadyConn reads one line from the runner
 // ("<runtime> <warmup_ms>\n"), frames it for vsock DGRAM, and
 // sends to VMADDR_CID_HOST:VsockFrameworkReadyPort. Closes the
@@ -191,20 +222,17 @@ func handleFrameworkReadyConn(conn *net.UnixConn, vsock int, log *slog.Logger) {
 		log.Warn("proxy read line", "err", err)
 		return
 	}
-	fields := strings.Fields(strings.TrimSpace(line))
-	if len(fields) < 1 || len(fields) > 2 {
-		_, _ = conn.Write([]byte("err format: '<runtime> [warmup_ms]'\n"))
-		return
-	}
-	runtime := fields[0]
-	var warmupMs int64
-	if len(fields) == 2 {
-		w, perr := strconv.ParseInt(fields[1], 10, 64)
-		if perr != nil {
+	runtime, warmupMs, perr := parseProxyLine(line)
+	if perr != nil {
+		// Mirror the historical error strings on the wire so the
+		// runner-side log shim doesn't change.
+		msg := perr.Error()
+		if strings.HasPrefix(msg, "format:") {
+			_, _ = conn.Write([]byte("err format: '<runtime> [warmup_ms]'\n"))
+		} else {
 			_, _ = conn.Write([]byte("err parse warmup_ms\n"))
-			return
 		}
-		warmupMs = w
+		return
 	}
 
 	// Frame: [1B type=0x01][optional 4B BE uint32 warmup_ms]
