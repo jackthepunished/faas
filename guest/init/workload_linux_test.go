@@ -102,7 +102,7 @@ func TestDiscoverRoster_MalformedFile(t *testing.T) {
 // deployments.sidecars jsonb column.
 func TestNewSupervisorFor_NonEssentialZeroRestarts(t *testing.T) {
 	spec := workloadSpec{Name: "metrics", Type: "sidecar", Essential: false, RamMB: 64}
-	sup := newSupervisorFor(spec, nil, nil, nil)
+	sup := newSupervisorFor(spec, nil, nil, nil, nil)
 	if sup == nil {
 		t.Fatal("newSupervisorFor returned nil")
 	}
@@ -125,7 +125,7 @@ func TestNewSupervisorFor_NonEssentialZeroRestarts(t *testing.T) {
 // crash-loop must NOT silently take down the deploy.
 func TestNewSupervisorFor_EssentialUsesMaxRestarts(t *testing.T) {
 	spec := workloadSpec{Name: "metrics", Type: "sidecar", Essential: true, RamMB: 64}
-	sup := newSupervisorFor(spec, nil, nil, nil)
+	sup := newSupervisorFor(spec, nil, nil, nil, nil)
 	if sup.Max != MaxRestarts {
 		t.Errorf("essential Max = %d, want %d", sup.Max, MaxRestarts)
 	}

@@ -94,47 +94,18 @@ const frameworkReadyMaxDatagram = 1024
 //
 // emitter (issue #463 / ADR-069 / ADR-071 / PR-C) is the
 // audit sink for the sidecar event classes (init_exit /
-// restart). Set by WithSidecarEmitter after construction;
-// nil falls back to a no-op emitter so the framework_ready
-// path is unaffected by a missing sidecar wiring (e.g.
-// local-dev without a state.Store).
+// restart). Set by WithSidecarEmitter after construction (the
+// method lives in sidecar_events_wire.go so cmd/vmmd/main.go
+// can call it on every build); nil falls back to a no-op
+// emitter so the framework_ready path is unaffected by a
+// missing sidecar wiring (e.g. local-dev without a
+// state.Store).
 type FrameworkReadyReceiver struct {
 	ctx     context.Context
 	fd      atomic.Int32
 	log     *slog.Logger
 	mgr     *fcvm.Manager
 	emitter SidecarEventEmitter
-}
-
-// WithSidecarEmitter attaches the audit sink for sidecar event
-// classes (issue #463 / ADR-069 / ADR-071 / PR-C). Production
-// wires EmitterThroughPlatform wrapping the canonical
-// pkg/events.Platform; tests substitute a fake so the dispatch
-// path is unit-testable without spinning up a real state.Store.
-// A nil emitter is replaced by the no-op default so callers
-// can opt out cleanly without nil-checking at the dispatch
-// site. Receiver-pointer receiver so successive With* calls
-// chain into the same listener.
-func (r *FrameworkReadyReceiver) WithSidecarEmitter(emitter SidecarEventEmitter) *FrameworkReadyReceiver {
-	if r == nil {
-		return r
-	}
-	if emitter == nil {
-		emitter = noopSidecarEventEmitter{}
-	}
-	r.emitter = emitter
-	return r
-}
-
-// SidecarEmitter returns the receiver's currently-configured
-// emitter, supplying the no-op default if WithSidecarEmitter
-// hasn't been called. Used by tests that want to swap an
-// emitter in without affecting the loop() reader.
-func (r *FrameworkReadyReceiver) SidecarEmitter() SidecarEventEmitter {
-	if r == nil || r.emitter == nil {
-		return noopSidecarEventEmitter{}
-	}
-	return r.emitter
 }
 
 // StartFrameworkReadyReceiver binds the host-side DGRAM

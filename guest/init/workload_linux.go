@@ -190,7 +190,7 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		// (not above it) so each init sidecar's duration is
 		// per-sidecar, not cumulative across the roster.
 		startedAt := time.Now()
-		sup := newSupervisorFor(sc, secrets, apiEnv, log)
+		sup := newSupervisorFor(sc, secrets, apiEnv, log, sidecarProxy)
 		runErr := sup.Run()
 		elapsedMs := time.Since(startedAt).Milliseconds()
 		// Translate the supervisor's terminal error into the
@@ -244,7 +244,7 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		if sc.Type != "sidecar" {
 			continue
 		}
-		supervisors = append(supervisors, newSupervisorFor(sc, secrets, apiEnv, log))
+		supervisors = append(supervisors, newSupervisorFor(sc, secrets, apiEnv, log, sidecarProxy))
 	}
 
 	// ADR-051 Phase 4 (Slice A PR-B / issue #463 / ADR-069):
@@ -325,14 +325,18 @@ func newSupervisorForMain(spec workloadSpec, manifest api.AppManifest, secrets, 
 }
 
 // newSupervisorFor builds a sidecar supervisor
-// (issue #463 / ADR-069 / PR-B). The sidecar's entrypoint is
-// the customer's image default — guest-init exec's the
-// sidecar's baked /usr/local/bin/start.sh (or whatever the
-// image provides). The essential flag drives the restart
-// policy: non-essential = Max=0 (no restart, log-and-
-// continue); essential = Max=MaxRestarts (restart per the
-// platform contract).
-func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log *slog.Logger) *Supervisor {
+// (issue #463 / ADR-069 / PR-B + PR-C §4). The sidecar's
+// entrypoint is the customer's image default — guest-init
+// exec's the sidecar's baked /usr/local/bin/start.sh (or
+// whatever the image provides). The essential flag drives
+// the restart policy: non-essential = Max=0 (no restart,
+// log-and-continue); essential = Max=MaxRestarts (restart
+// per the platform contract). PR-C §4 wires the supervisor's
+// OnCrash hook to call SendRestart on the proxy so the host
+// can increment schedd_sidecar_restart_total{app, sidecar}.
+// A nil sidecarProxy (no-signal contract when bind fails)
+// keeps the OnCrash hook log-only.
+func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log *slog.Logger, sidecarProxy *sidecarEventsProxy) *Supervisor {
 	maxRestarts := MaxRestarts
 	if !spec.Essential {
 		maxRestarts = 0 // non-essential sidecar: log crash, do not restart
@@ -342,6 +346,18 @@ func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log 
 	supRef.OnCrash = func(attempt int, err error) {
 		fmt.Fprintf(os.Stderr, "guest-init: sidecar %s crashed (restart %d/%d): %v\n",
 			spec.Name, attempt, maxRestarts, err)
+		// PR-C §4: ship the sidecar_restart envelope so vmmd
+		// can increment <daemon>_sidecar_restart_total AND
+		// emit events.SidecarRestart. A send error is
+		// best-effort (logged + ignored); the supervisor's
+		// restart policy remains the source of truth for
+		// "did the sidecar actually come back".
+		if sidecarProxy != nil {
+			if sErr := sidecarProxy.SendRestart(spec.Name, attempt); sErr != nil {
+				log.Warn("sidecar restart emit failed",
+					"sidecar", spec.Name, "attempt", attempt, "err", sErr)
+			}
+		}
 	}
 	return supRef
 }
