@@ -1708,7 +1708,7 @@ func (m *Manager) WarmSnapshot(ctx context.Context, instance string, spec Snapsh
 		// resume surfaces to the engine's destroy path with the
 		// original error wrapped.
 		if rerr := m.vmm.ResumeVM(ctx, inst.Lease); rerr != nil {
-			return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: snapshot: %w (resume after snapshot failure: %v)", instance, err, rerr)
+			return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: %w", instance, errors.Join(err, fmt.Errorf("resume after snapshot failure: %w", rerr)))
 		}
 		return SnapshotInfo{}, fmt.Errorf("warm_snapshot %s: snapshot: %w", instance, err)
 	}

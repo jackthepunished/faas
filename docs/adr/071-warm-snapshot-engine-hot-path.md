@@ -15,25 +15,24 @@ The Firecracker primitive gap makes this non-trivial: there is no `pause-snapsho
 ## Capture sequence (single appMu window, ~300–500 ms total)
 
 1. RUNNING instance with `framework_ready_at != NULL` (PR #543 stamp).
-2. Engine holds appMu (the existing `Park` lock). `snapshotAndPark` runs the legacy init-tier capture first: `vmm.PauseAndSnapshot` → `snap/<dep>/mem` + `snap/<dep>/vmstate` published → `emitSnapshotWritten{ tier:"init" }` → `transition(STATEParked)`.
-3. **Wait — no, the warm capture runs BEFORE the PARKED transition.** The state machine's `PARKED → STOPPED` edge is not allowed (`pkg/state/machine.go:61`), so a warm failure bound to that edge would have nowhere to land. Restated:
-   - Init capture runs (`vmm.PauseAndSnapshot`): blob published, `snapshot_written{tier:"init"}` emitted.
-   - **Warm capture runs while the row is still RUNNING.** `vmm.WarmSnapshot` → `snap/<dep>/warm/mem` + `snap/<dep>/warm/vmstate` published → `store.CreateSnapshot{ tier:"warm" }` writes the row directly (engine-side, not via imaged) → `emitSnapshotWritten{ tier:"warm" }` → vmmd `PATCH /vm Resumed` → runner back to RUNNING.
+2. Engine holds appMu (the existing `Park` lock). `snapshotAndPark` runs the warm capture FIRST while the row is still RUNNING — the state machine's `PARKED → STOPPED` edge is not allowed (`pkg/state/machine.go:61`), so a warm failure must land on the legal `RUNNING → STOPPED` edge before the PARKED transition fires.
+   - Warm capture: `vmm.WarmSnapshot` → `snap/<dep>/warm/mem` + `snap/<dep>/warm/vmstate` published → `emitSnapshotWritten{ tier:"warm" }` → vmmd `PATCH /vm Resumed` → runner back to RUNNING.
+   - Init capture: `vmm.PauseAndSnapshot` → `snap/<dep>/mem` + `snap/<dep>/vmstate` published → `emitSnapshotWritten{ tier:"init" }`.
    - `transition(STATEParked)`.
-   - Init-tier row's audit is owned by imaged's `snapshot_written` subscriber (PR #525). The warm-tier row is written by the engine directly to avoid a round-trip through imaged for the hot path.
-4. **Failure path** (warm capture error):
+   - Both rows are written by imaged's `snapshot_written` subscriber (PR #525) — the engine is sole notifier, imaged is sole writer. No direct `store.CreateSnapshot` call from the engine.
+3. **Failure path** (warm capture error):
    - `vmm.Destroy(ins.NodeID, ins.ID)` releases the jailer / cgroup / netns.
    - `ledger.Release(ins.ID)`.
    - `transitionWithKind(STATEStopped, "warm_capture_error", "warm_snapshot_failed")` — RUNNING → STOPPED is a legal edge.
    - `WarmSnapshotErrors("vmm_call").Inc()`.
-   - The init blob is on disk but the VM is destroyed; PR C's GC sweep evicts the orphaned init row. The next wake cold-boots (ADR-005).
+   - Init capture is **skipped** (the VM is destroyed, so `PauseAndSnapshot` would target a dead process). No init row is written for this Park. PR C's GC sweep evicts the orphaned warm blob (if any). The next wake cold-boots (ADR-005).
 
 ## Plan gate (sticky-on-downgrade)
 
 - `pkg/api.Plan.WarmSnapshotAllowed()` is the single source of truth. Cap returns `false` (Free, Hobby).
 - `Engine.captureWarmSnapshotLocked` is gated by `app.WarmSnapshotEnabled && acct.Plan.WarmSnapshotAllowed()`. The plan gate is consulted at the Park site too (skip the warm capture round-trip for plans that won't use it).
 - `Engine.usableSnapshotForWake(ctx, dep.ID, plan)` is the wake counterpart. Free/Hobby reads `LatestSnapshotForTier(init)` directly. Pro/Scale calls `LatestSnapshot` which already ranks warm > init on `(tier='warm') DESC, created_at DESC` (PR #525).
-- **Sticky-on-downgrade** (ADR-055 §5): `apps.warm_snapshot_enabled` stays `true` across a Pro→Free downgrade. The plan gate at wake time reads the warm row off the disk but ignores it. The next park the plan allows warm again will pick up where the engine left off.
+- **Sticky-on-downgrade** (ADR-070 §Plan gate): `apps.warm_snapshot_enabled` stays `true` across a Pro→Free downgrade. The plan gate at wake time reads the warm row off the disk but ignores it. The next park the plan allows warm again will pick up where the engine left off.
 
 ## Per-tier storage keys
 

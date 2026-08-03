@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -2972,6 +2973,14 @@ func TestCaptureWarmSnapshot_HappyPath(t *testing.T) {
 
 	vmm := &fakeVMM{}
 	notif := &fakeNotifier{}
+	// Run a fake imaged subscriber over the recorded events so
+	// the test mirrors PR #525's row-writer semantics: the
+	// engine is sole notifier, imaged is sole writer. The pre-fix
+	// version seeded both rows manually; the new shape processes
+	// the snapshot_written payloads the engine emitted. Without
+	// this pass, the warm row assertion below would fail with
+	// ErrNotFound.
+	imaged := &mockImaged{store: store, fcVer: "1.10.0"}
 	e := newEngine(t, store, vmm, notif, "1.10.0")
 
 	insID := primeRunPlusFrameworkReady(t, store, vmm, notif, e, app.ID, dep.ID)
@@ -2979,8 +2988,14 @@ func TestCaptureWarmSnapshot_HappyPath(t *testing.T) {
 	if err := e.Park(context.Background(), insID); err != nil {
 		t.Fatalf("Park: %v", err)
 	}
+	// Drain the recorded snapshot_written events through the fake
+	// imaged subscriber so the rows land in the snapshots table.
+	// The engine is sole notifier; imaged is sole writer.
+	imaged.Drain(notif)
 	// 1) Both init and warm tiers were captured in the same appMu
-	// window — fakeVMM recorded 1 init + 1 warm call after the
+	// window — warm fires first (RUNNING → paused → RUNNING), then
+	// init (RUNNING → PARKED via the legacy PauseAndSnapshot). The
+	// fakeVMM counters recorded 1 init + 1 warm call after the
 	// prime counter reset.
 	if vmm.snapshots != 1 {
 		t.Errorf("init snapshots = %d, want 1", vmm.snapshots)
@@ -2988,21 +3003,10 @@ func TestCaptureWarmSnapshot_HappyPath(t *testing.T) {
 	if vmm.warmSnapshots != 1 {
 		t.Errorf("warm snapshots = %d, want 1", vmm.warmSnapshots)
 	}
-	// 2) Only the warm row is written by the engine directly (the
-	// engine's captureWarmSnapshotLocked calls store.CreateSnapshot
-	// for tier=warm). The init row is written by imaged's
-	// snapshot_written subscriber in production — that's the same
-	// subscriber that pinned the PR #525 row-writer semantics. To
-	// mirror the production path here, the test seeds the init row
-	// directly via the store and confirms the warm row the engine
-	// wrote is present.
-	if _, err := store.CreateSnapshot(context.Background(), state.Snapshot{
-		DeploymentID: dep.ID, FCVersion: "1.10.0",
-		MemBytes: 130 * 1024 * 1024, StorageKey: state.SnapMemKey(dep.ID),
-		Tier: state.SnapshotTierInit,
-	}); err != nil {
-		t.Fatalf("CreateSnapshot init: %v", err)
-	}
+	// 2) Both rows are present in the snapshots table; the
+	// rows came from imaged's subscriber, NOT the engine. This is
+	// the contract captureWarmSnapshotLocked relies on: the engine
+	// is sole notifier, imaged is sole writer.
 	initSnap, err := store.LatestSnapshotForTier(context.Background(), dep.ID, state.SnapshotTierInit)
 	if err != nil {
 		t.Fatalf("LatestSnapshotForTier init: %v", err)
@@ -3017,17 +3021,119 @@ func TestCaptureWarmSnapshot_HappyPath(t *testing.T) {
 	if warmSnap.Tier != state.SnapshotTierWarm {
 		t.Errorf("warm row tier = %q, want warm", warmSnap.Tier)
 	}
-	// 3) Snapshot_written emitted twice — once tier=init, once tier=warm.
-	if notif.count("snapshot_written") != 2 {
-		t.Errorf("snapshot_written = %d, want 2 (init + warm)", notif.count("snapshot_written"))
+	// mockImaged writes the engine's payload storage_key verbatim
+	// (vmstate_path = full host path that the VMM hands back).
+	// The /warm/ segment in that path is what proves the engine
+	// routed the warm capture through the right key namespace — a
+	// regression to init's path would land here with /mem instead of
+	// /warm/vmstate.
+	if !strings.Contains(warmSnap.StorageKey, "/warm/vmstate") {
+		t.Errorf("warm row storage_key = %q, want suffix /warm/vmstate (engine must route warm capture through /warm/ namespace)",
+			warmSnap.StorageKey)
 	}
-	// 4) Instance landed in PARKED — the warm capture doesn't move
-	// the state (it's RUNNING → warm → RUNNING → PARKED via the
-	// init capture's transition).
+	if strings.Contains(warmSnap.StorageKey, "/snap/"+dep.ID+"/warm/mem") {
+		t.Errorf("warm row storage_key = %q must not be the init-tier mem key", warmSnap.StorageKey)
+	}
+	// 3) Snapshot_written emitted twice — warm first (RUNNING still),
+	// then init (PAUSED → PARKED).
+	if notif.count("snapshot_written") != 2 {
+		t.Errorf("snapshot_written = %d, want 2 (warm + init)", notif.count("snapshot_written"))
+	}
+	// The order matters: warm.notify fires BEFORE the init
+	// capture's PauseAndSnapshot, so tier="warm" should be the
+	// first notification captured after the prime counter reset.
+	first, ok := notif.firstPayload(db.NotifySnapshotWritten)
+	if !ok {
+		t.Fatalf("no snapshot_written payload recorded")
+	}
+	if got := first.Payload["tier"]; got != state.SnapshotTierWarm {
+		t.Errorf("first notifySnapshotWritten tier = %v, want warm (warm capture fires first)", got)
+	}
+	// 4) Instance landed in PARKED.
 	ins, _ := store.InstanceByID(context.Background(), insID)
 	if ins.State != string(state.StateParked) {
 		t.Errorf("state = %q, want parked", ins.State)
 	}
+}
+
+// mockImaged (issue #470 / PR A review) is a minimal in-process
+// stand-in for imaged's snapshot_written subscriber. It mirrors
+// PR #525's row-writer semantics: parse the payload, derive the
+// tier from the JSON, and call store.CreateSnapshot with the right
+// tier so the engine can stay out of the row-writing business.
+// Wired via fakeNotifier.AddHandler so a different PR can swap in
+// the real subscriber by replacing fakeNotifier without touching
+// the engine.
+type mockImaged struct {
+	store state.Store
+	fcVer string
+}
+
+// handle processes a single snapshot_written payload (parses the
+// JSON, derives tier from the field, writes the snapshots row).
+func (m *mockImaged) handle(payload []byte) error {
+	var p map[string]any
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return err
+	}
+	tier, _ := p["tier"].(string)
+	if tier == "" {
+		tier = state.SnapshotTierInit
+	}
+	depID, _ := p["deployment_id"].(string)
+	storageKey, _ := p["vmstate_path"].(string)
+	memBytes, _ := p["mem_bytes"].(float64)
+	_, err := m.store.CreateSnapshot(context.Background(), state.Snapshot{
+		DeploymentID: depID,
+		FCVersion:    m.fcVer,
+		MemBytes:     int64(memBytes),
+		StorageKey:   storageKey,
+		Tier:         tier,
+	})
+	return err
+}
+
+// Drain (issue #470 / PR A review) replays the recorder's
+// snapshot_written events through handle in order. Production
+// delivers them via a Postgres LISTEN connection; the recorder
+// just appends to a slice. Channel-name dispatch mirrors the
+// production prod-subscribed channel name (db.NotifySnapshotWritten).
+func (m *mockImaged) Drain(n *fakeNotifier) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, e := range n.events {
+		if e.channel != db.NotifySnapshotWritten {
+			continue
+		}
+		if err := m.handle([]byte(e.payload)); err != nil {
+			// Production imaged logs + drops on a single bad
+			// payload; tests stop at first failure so a
+			// regression that breaks the JSON shape surfaces.
+			panic("mockImaged.handle: " + err.Error())
+		}
+	}
+}
+
+// firstPayload (issue #470 / PR A review) returns the channel +
+// parsed payload of the first event matching channel. Used to
+// assert the warm capture fires its snapshot_written emit BEFORE
+// the init capture's emit (PRD-070 §Capture sequence step 2).
+func (n *fakeNotifier) firstPayload(channel string) (ev struct {
+	Payload map[string]any
+}, ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, e := range n.events {
+		if e.channel != channel {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal([]byte(e.payload), &p); err != nil {
+			return struct{ Payload map[string]any }{}, false
+		}
+		return struct{ Payload map[string]any }{Payload: p}, true
+	}
+	return struct{ Payload map[string]any }{}, false
 }
 
 func TestCaptureWarmSnapshot_FailureDestroysVM(t *testing.T) {
@@ -3050,8 +3156,16 @@ func TestCaptureWarmSnapshot_FailureDestroysVM(t *testing.T) {
 	// succeeded; the warm pause + /snapshot/create failed.
 	vmm.warmSnapErr = errors.New("vmmd_warm_snapshot_exploded")
 
-	if err := e.Park(context.Background(), insID); err != nil {
-		t.Fatalf("Park: %v", err)
+	// Park returns the warm-capture error wrapped; the warm path
+	// already Destroyed the VM and transitioned the row to STOPPED,
+	// so the error here is the load-bearing diagnostic, not a
+	// fatal that should t.Fatal. We assert on it below.
+	parkErr := e.Park(context.Background(), insID)
+	if parkErr == nil {
+		t.Fatalf("Park: expected warm-capture error, got nil")
+	}
+	if !strings.Contains(parkErr.Error(), "vmmd_warm_snapshot_exploded") {
+		t.Errorf("Park err = %q, want substring %q", parkErr, "vmmd_warm_snapshot_exploded")
 	}
 	// 1) VM destroyed on warm failure.
 	if vmm.destroys != 1 {
@@ -3059,17 +3173,27 @@ func TestCaptureWarmSnapshot_FailureDestroysVM(t *testing.T) {
 	}
 	// 2) Instance STOPPED (warm destroyed the VM; no warm AND no
 	// init to keep — operator gets a cold-boot next wake per
-	// ADR-005).
+	// ADR-005). 3) init snapshot was never captured (Park returned
+	// before the legacy init PauseAndSnapshot ran).
+	if vmm.snapshots != 0 {
+		t.Errorf("init snapshots = %d, want 0 (warm failure aborts the Park before init capture)", vmm.snapshots)
+	}
 	ins, _ := store.InstanceByID(context.Background(), insID)
 	if ins.State != string(state.StateStopped) {
 		t.Errorf("state = %q, want stopped", ins.State)
 	}
-	// 3) No warm-tier row written (the capture failed).
+	// 4) No warm-tier row written (the capture failed).
 	_, err := store.LatestSnapshotForTier(context.Background(), dep.ID, state.SnapshotTierWarm)
 	if err == nil {
 		t.Errorf("warm row exists; want ErrNotFound")
 	}
-	// 4) Resident RAM is 0 — the warm failure path released the
+	// 5) No init-tier row written either (warm failure aborts the
+	// whole Park; the legacy init PauseAndSnapshot never ran).
+	_, err = store.LatestSnapshotForTier(context.Background(), dep.ID, state.SnapshotTierInit)
+	if err == nil {
+		t.Errorf("init row exists; want ErrNotFound (warm failure aborts Park before init capture)")
+	}
+	// 6) Resident RAM is 0 — the warm failure path released the
 	// ledger reservation.
 	if got := e.Ledger().ResidentRAM(); got != 0 {
 		t.Errorf("resident = %d, want 0 (released on warm failure)", got)

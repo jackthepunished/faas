@@ -732,7 +732,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// place to look (no row → "snapshot_written" dropped).
 	warmSnapshotErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_warm_snapshot_errors_total",
-		Help: "Count of warm-tier snapshot failures (issue #470 / PR A / ADR-055), labelled by reason ∈ {vmm_call, store_write}. The vmm_call bucket is the dominant cause — disk-full, cont–induced pause, or vmmd abort during /snapshot/create. The store_write bucket fires when CreateSnapshot rejected the staging row (schema mismatch, unique violation non-tier). The OpsMetrics.WarmSnapshotErrors() helper returns the per-reason counter.",
+		Help: "Count of warm-tier snapshot failures (issue #470 / PR A / ADR-055), labelled by reason ∈ {vmm_call, store_write}. The vmm_call bucket is the dominant cause — disk-full, container-induced pause, or vmmd abort during /snapshot/create. The store_write bucket fires when CreateSnapshot rejected the staging row (schema mismatch, unique violation non-tier). The OpsMetrics.WarmSnapshotErrors() helper returns the per-reason counter.",
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")

@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -996,6 +995,11 @@ func (v *JailerVMM) SnapshotKeepAlive(ctx context.Context, l Lease, spec Snapsho
 // init-tier capture. The CID-to-lease join and the live Instance
 // entry are NOT touched here — that contract lives on
 // Manager.WarmSnapshot / Manager.Park, not on the host VMM.
+//
+// The 409 status is matched via the typed fcAPIError surfaced by
+// apiCallWithClient (NOT a substring on err.Error()) so a future
+// Firecracker "Conflict: chassis is locked" 409 with similar
+// wording doesn't get silently swallowed as success.
 func (v *JailerVMM) ResumeVM(ctx context.Context, l Lease) error {
 	if v == nil {
 		return fmt.Errorf("vmm: ResumeVM: nil receiver")
@@ -1015,10 +1019,13 @@ func (v *JailerVMM) ResumeVM(ctx context.Context, l Lease) error {
 	if err == nil {
 		return nil
 	}
-	// 409 Conflict ⇒ VM is already running. Treat as success so a
-	// redundant WarmSnapshot (engine retried after a transient
-	// vmmd restart) doesn't surface as a hard error.
-	if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "Conflict") {
+	// 409 Conflict on a no-op state transition (VM already Running)
+	// is observable but not fatal — treat as success so a redundant
+	// WarmSnapshot (engine retried after a transient vmmd restart)
+	// doesn't surface as a hard error. Any other status / fault is
+	// a real failure and bubbles up.
+	var apiErr *fcAPIError
+	if errors.As(err, &apiErr) && apiErr.statusCode == http.StatusConflict {
 		return nil
 	}
 	return fmt.Errorf("vmm: resume: %w", err)
@@ -2133,6 +2140,28 @@ func (v *JailerVMM) apiPatch(ctx context.Context, instance, path string, body an
 	return v.apiCall(ctx, http.MethodPatch, instance, path, body)
 }
 
+// fcAPIError (issue #470 / PR #470-FU-A) is the typed error
+// apiCallWithClient surfaces on a 3xx/4xx/5xx Firecracker API
+// response. Carries the HTTP status code (not the body) so callers
+// like ResumeVM can branch on status without string-matching
+// "409"/"Conflict" substrings that could catch unrelated faults.
+// Falls back to apiCall's old formatting when status is 0 (a
+// transport-level error before a response was received).
+type fcAPIError struct {
+	method     string
+	path       string
+	statusCode int
+	statusText string
+	body       string
+}
+
+func (e *fcAPIError) Error() string {
+	if e.statusCode == 0 {
+		return fmt.Sprintf("firecracker %s %s: transport error: %s", e.method, e.path, e.body)
+	}
+	return fmt.Sprintf("firecracker %s %s: %s: %s", e.method, e.path, e.statusText, e.body)
+}
+
 func (v *JailerVMM) apiCall(ctx context.Context, method, instance, path string, body any) error {
 	return v.apiCallWithClient(ctx, v.fcClient(instance), method, path, body)
 }
@@ -2170,7 +2199,13 @@ func (v *JailerVMM) apiCallWithClient(ctx context.Context, client *http.Client, 
 			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode >= 300 {
 				msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-				return fmt.Errorf("firecracker %s %s: %s: %s", method, path, resp.Status, bytes.TrimSpace(msg))
+				return &fcAPIError{
+					method:     method,
+					path:       path,
+					statusCode: resp.StatusCode,
+					statusText: resp.Status,
+					body:       string(bytes.TrimSpace(msg)),
+				}
 			}
 			return nil
 		}
