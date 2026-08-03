@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00116 (issue #463 / ADR-067 — sidecar
+// Migration-apply test for 00117 (issue #463 / ADR-067 — sidecar
 // containers, hard cap 2). Pins the deployments.sidecars shape:
 //
-//  1. The migration set applies cleanly through 00116.
+//  1. The migration set applies cleanly through 00117.
 //  2. NOT NULL DEFAULT '[]'::jsonb backfills legacy rows correctly.
 //  3. The CHECK constraint enforces the 2-cap at the schema layer
 //     (a 3-sidecar INSERT is rejected).
@@ -14,13 +14,13 @@
 //     fill) both read back as `[]`.
 //  7. Replay-safe: a second MigrateUp is a no-op (PR #377 / ADR-041).
 //
-// Slot note: HEAD on origin/main is 00105 (personal_org_backfill,
-// PR #536, ADR-061 issue #190 PR3 personal-org backfill). Renumber
-// chain on the PR branch: 95 → 96 → 97 → 98 → 101 → 105 → 106 → 107 → 108 → 112 → 116
-// across eleven rebase cycles against sibling PRs that grabbed the
-// intermediate slots (PR #525 landed slots 109/110; PR #540 landed slot 111 webhook_deliveries), so 108
-// was no longer free on the post-rebase tree). If a sibling PR
-// claims 00116 first, renumber per the fence pattern and update
+// Slot note: HEAD on origin/main is 00115 (api_key_expiry_rotation,
+// PR #539, issue #189 iam-5 API key expiry + rotation). Renumber
+// chain on the PR branch: 95 → 96 → 97 → 98 → 101 → 105 → 106 → 107 → 108 → 111 → 112 → 116 → 117
+// across twelve rebase cycles against sibling PRs that grabbed the
+// intermediate slots (PR #525 → 109/110 warm snapshot, PR #540 →
+// 116 webhook_deliveries, etc.). If a sibling PR
+// claims 00117 first, renumber per the fence pattern and update
 // this test's filename + test function name + ApplyUp range +
 // pkg/e2etest/harness.go::e2eMigrationTarget constant together.
 //
@@ -37,28 +37,28 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
+func TestMigrations_00117_DeploymentsSidecars(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000116`,
+	// Seed UUIDs carry the slot number in the last group (`...000117`,
 	// `...000208`, `...000308`, `...000408`, `...000508`, `...000608`)
 	// so a reader scanning the test fixtures can pin each row to this
 	// migration without grepping the file name. The literal slot value
 	// MUST stay in sync with the filename; renumber per
-	// migrations/README.md if a sibling PR grabs 00116 first.
+	// migrations/README.md if a sibling PR grabs 00117 first.
 
-	// (1) Apply through 00116. A regression that drops a slot
-	// between 1 and 116 surfaces here before the per-assertion pins.
+	// (1) Apply through 00117. A regression that drops a slot
+	// between 1 and 117 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 116)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 117)", err)
 	}
 
 	// (2) Seed an account + app. The literal UUIDs are fixed across
 	// reruns so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000116',
+		values ('00000000-0000-0000-0000-000000000117',
 		        'sidecars-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -66,8 +66,8 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000216',
-		        '00000000-0000-0000-0000-000000000116',
+		values ('00000000-0000-0000-0000-000000000217',
+		        '00000000-0000-0000-0000-000000000117',
 		        'sidecars-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -78,7 +78,7 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	// is a valid 0-sidecar payload (read back as `[]`, not NULL).
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_ref, status, sidecars, created_at)
-		values ('00000000-0000-0000-0000-000000000316',
+		values ('00000000-0000-0000-0000-000000000317',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending', '[]'::jsonb, now())
@@ -94,7 +94,7 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	// jsonb type already validates array-of-some-value).
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_ref, status, sidecars, created_at)
-		values ('00000000-0000-0000-0000-000000000416',
+		values ('00000000-0000-0000-0000-000000000417',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending',
@@ -118,7 +118,7 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	// bypassed (manual SQL, future grpc handler, debug shell).
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_ref, status, sidecars, created_at)
-		values ('00000000-0000-0000-0000-000000000516',
+		values ('00000000-0000-0000-0000-000000000517',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending',
@@ -140,7 +140,7 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	var sidecarsJSON []byte
 	if err := pool.QueryRow(ctx, `
 		select sidecars from deployments
-		where id = '00000000-0000-0000-0000-000000000416'
+		where id = '00000000-0000-0000-0000-000000000417'
 	`).Scan(&sidecarsJSON); err != nil {
 		t.Fatalf("read deployment (2 sidecars): %v", err)
 	}
@@ -166,7 +166,7 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	// legacy INSERTs that don't mention the column.
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, image_ref, status, created_at)
-		values ('00000000-0000-0000-0000-000000000616',
+		values ('00000000-0000-0000-0000-000000000617',
 		        '00000000-0000-0000-0000-000000000208',
 		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
 		        'pending', now())
@@ -175,7 +175,7 @@ func TestMigrations_00116_DeploymentsSidecars(t *testing.T) {
 	}
 	if err := pool.QueryRow(ctx, `
 		select sidecars from deployments
-		where id = '00000000-0000-0000-0000-000000000616'
+		where id = '00000000-0000-0000-0000-000000000617'
 	`).Scan(&sidecarsJSON); err != nil {
 		t.Fatalf("read default sidecars: %v", err)
 	}

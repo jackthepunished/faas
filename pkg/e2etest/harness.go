@@ -374,14 +374,14 @@ const testDomain = "apps.test.example"
 //     109/110 → 111 → 112 → 116) collided with main's new files,
 //     so all eight were dropped on rebase (the work is now
 //     collapsed into a single post-rebase commit). The branch
-//     renumbered 00101 → 00116 past main's new head at 115; the
+//     renumbered 00101 → 00117 past main's new head at 115; the
 //     106-108 gap is filled by reserve_slot.sql fences at
 //     00106/00107/00108 per ADR-041 so the embedded FS stays
 //     contiguous 1..116. (Slots 00105/00109/00110/00114/00115
 //     are owned by main's real migrations — no fence needed
-//     there.) PR #531 (issue #463 sidecars) claims 00116. No
-//     open PR overlaps with 00116.
-const e2eMigrationTarget = 116
+//     there.) PR #531 (issue #463 sidecars) claims 00117. No
+//     open PR overlaps with 00117.
+const e2eMigrationTarget = 117
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

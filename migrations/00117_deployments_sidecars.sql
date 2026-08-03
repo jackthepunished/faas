@@ -35,13 +35,13 @@
 -- names share a namespace; use the pg_constraint existence check
 -- below).
 --
--- Slot: 00116 (HEAD on origin/main is 00105 = personal_org_backfill,
--- PR #536, ADR-061 issue #190 PR3 personal-org backfill). Renumber
--- chain on the PR branch: 95 → 96 → 97 → 98 → 101 → 105 → 106 → 107 → 108 → 112 → 116
--- across eleven rebase cycles against sibling PRs that grabbed the
--- intermediate slots (PR #525 landed slots 109/110; PR #540 landed slot 111 webhook_deliveries), so 108
--- was no longer free on the post-rebase tree). If a sibling PR
--- claims 00116 first, renumber
+-- Slot: 00117 (HEAD on origin/main is 00115 = api_key_expiry_rotation,
+-- PR #539, issue #189 iam-5 API key expiry + rotation). Renumber
+-- chain on the PR branch: 95 → 96 → 97 → 98 → 101 → 105 → 106 → 107 → 108 → 111 → 112 → 116 → 117
+-- across twelve rebase cycles against sibling PRs that grabbed the
+-- intermediate slots (PR #525 → 109/110 warm snapshot, PR #540 →
+-- 116 webhook_deliveries, etc.). If a sibling PR
+-- claims 00117 first, renumber
 -- per migrations/README.md (ADR-041 fence) and update the test
 -- filename + test function name +
 -- pkg/e2etest/harness.go::e2eMigrationTarget together.
