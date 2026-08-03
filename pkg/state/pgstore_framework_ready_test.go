@@ -69,10 +69,10 @@ func seedFrameworkReadyInstancePg(t *testing.T, pool *pgxpool.Pool) (appID, depl
 		t.Fatalf("lookup default-local compute_node id: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		insert into instances (id, deployment_id, node_id, state, ram_mb, started_at)
-		values ($1, $2, $3, 'running', 256, now())
+		insert into instances (id, app_id, deployment_id, node_id, state, ram_mb, started_at)
+		values ($1, $2, $3, $4, 'running', 256, now())
 		on conflict (id) do nothing
-	`, IDs.ins, IDs.dep, nodeID); err != nil {
+	`, IDs.ins, IDs.app, IDs.dep, nodeID); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 	return IDs.app, IDs.dep, IDs.ins

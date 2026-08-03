@@ -90,8 +90,9 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 		t.Fatalf("lookup default-local compute_node id: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		insert into instances (id, deployment_id, node_id, state, ram_mb, started_at)
+		insert into instances (id, app_id, deployment_id, node_id, state, ram_mb, started_at)
 		values ('00000000-0000-0000-0000-000000000412',
+		        '00000000-0000-0000-0000-000000000212',
 		        '00000000-0000-0000-0000-000000000312',
 		        $1, 'running', 256, now())
 		on conflict (id) do nothing
