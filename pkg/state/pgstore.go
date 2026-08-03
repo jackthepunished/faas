@@ -1737,6 +1737,138 @@ func (s *PgStore) CancelInstanceMigration(ctx context.Context, instanceID, origi
 	return nil
 }
 
+// ListExpiredMigrations returns every instance row in
+// state='migrating' (Tier A6 / ADR-067 migrating-instance
+// watchdog). The watchdog is the only writer that can move a
+// row out of 'migrating' without a peer commit, so the
+// unresolved row is the input set. The SQL also enforces
+// lease_token IS NOT NULL — every wedged migration must
+// carry the lease the watchdog needs to drive the gRPC
+// re-invite; a row in 'migrating' without a lease is a
+// corrupted state and the watchdog drops it silently (the
+// next watch-dog tick is no-op idempotent).
+//
+// Sorted by instance id ASC for determinism so two peers
+// observing the same bad-owner event read the same input
+// set (they still race on the conditional UPDATEs; this list
+// is just the candidate set).
+//
+// Returns an empty slice (not ErrNotFound) when no rows
+// match; callers treat that as "nothing to reconcile this
+// tick". Symmetric with ListLiveInstancesOnNode (Tier A5).
+func (s *PgStore) ListExpiredMigrations(ctx context.Context, maxPerTick int) ([]Instance, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''),
+	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
+	               i.started_at, i.last_request_at, i.parked_at,
+	               coalesce(i.node_id::text, ''), i.wake_id,
+	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
+	          from instances i
+	         where i.state = 'migrating'
+	           and i.lease_token is not null
+	         order by i.id asc
+	         limit $1`
+	rows, err := s.pool.Query(ctx, sel, maxPerTick)
+	if err != nil {
+		return nil, fmt.Errorf("state: list expired migrations: %w", err)
+	}
+	defer rows.Close()
+	var out []Instance
+	for rows.Next() {
+		ins, err := scanInstanceColsWithMigration(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ins)
+	}
+	return out, rows.Err()
+}
+
+// ReinviteMigratingInstance is the active-owner ack gate of the
+// Tier A6 / ADR-067 migrating-instance watchdog. Conditional
+// UPDATE that flips state='migrating' → 'running', stamps
+// migrated_at = now(), and clears lease_token — the same work
+// the A5 Phase-3 commit (MigrateInstanceOwner) does, but launched
+// by the watchdog after a re-invite to the new owner vmmd. The
+// conditional predicates are load-bearing:
+//  1. state = 'migrating' (peer rollback would have moved back
+//     to 'parked' already)
+//  2. lease_token = leaseToken (a stale lease can never silently
+//     commit; the watchdog must present the same UUID the new
+//     owner minted at Phase 1)
+//
+// Returns ErrConflict on RowsAffected()==0 — peer already
+// committed, peer rolled back, lease expired, or row gone.
+func (s *PgStore) ReinviteMigratingInstance(ctx context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty leaseToken")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'running',
+		        migrated_at = now(),
+		        lease_token = NULL
+		  where id = $1
+		    and state = 'migrating'
+		    and lease_token = $2`,
+		instanceID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("state: reinvite migrating instance: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// AbortMigratingInstance is the dead-owner hard-delete gate of
+// the Tier A6 / ADR-067 migrating-instance watchdog. Conditional
+// UPDATE that flips state='migrating' → 'parked' and clears
+// lease_token so a future re-attempt at migration mints a fresh
+// lease. node_id is left UNCHANGED — the row's node_id is still
+// the OLD owner (A5 Phase-2 MarkInstanceMigrating flipped state
+// but did not flip node_id; Phase-3 MigrateInstanceOwner never
+// ran), and there is no better destination to point at: the OLD
+// owner is the one whose vmmd died, the NEW owner never wrote a
+// snapshot, and migrated_from_node_id is NULL pre-Phase-3 (so
+// setting node_id = migrated_from_node_id would zero it out and
+// break the wake path's WakeResult.NodeID — see engine.go:681).
+// The wake path dispatches via app.NodeID (engine.go:1394-1400)
+// so a parked row on a dead instance.NodeID is fine; the next
+// customer request wakes cold on the live apps.node_id.
+//
+// The conditional predicates are the same as
+// ReinviteMigratingInstance. Returns ErrConflict on
+// RowsAffected()==0.
+func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: abort migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: abort migrating instance: empty leaseToken")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'parked',
+		        lease_token = NULL
+		  where id = $1
+		    and state = 'migrating'
+		    and lease_token = $2`,
+		instanceID, leaseToken)
+	if err != nil {
+		return fmt.Errorf("state: abort migrating instance: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,

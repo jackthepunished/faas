@@ -828,6 +828,47 @@ type Store interface {
 	// gone. The store also clears the lease_token on rollback
 	// so a future re-attempt at migration mints a fresh one.
 	CancelInstanceMigration(ctx context.Context, instanceID, originalNodeID, leaseToken string) error
+
+	// ListExpiredMigrations returns every instance row in
+	// state='migrating' (Tier A6 / ADR-067). The watchdog is
+	// the only writer that can move a row out of 'migrating'
+	// without a peer commit, so the unresolved row is the
+	// input set. Sorted by instance id ASC for determinism.
+	// maxPerTick caps the result set (the caller passes
+	// api.MigratingWatchdogTickLimit via pkg/api/limits.go).
+	// Returns an empty slice (not ErrNotFound) when no rows
+	// match; callers treat that as "nothing to reconcile this
+	// tick".
+	ListExpiredMigrations(ctx context.Context, maxPerTick int) ([]Instance, error)
+	// ReinviteMigratingInstance is the active-owner ack gate of
+	// the Tier A6 / ADR-067 watchdog. Conditional UPDATE that
+	// flips state='migrating' → 'running', stamps
+	// migrated_at = now(), and clears lease_token — the same
+	// work the A5 Phase-3 commit (MigrateInstanceOwner) does,
+	// but launched by the watchdog after a re-invite to the
+	// new owner vmmd. The conditional predicates are load-
+	// bearing:
+	//   1. state = 'migrating' (peer rollback would have moved
+	//      back to 'parked' already)
+	//   2. lease_token = leaseToken (the new owner must present
+	//      the same UUID it minted at Phase 1; a stale lease
+	//      can never silently commit)
+	// Returns ErrConflict on RowsAffected()==0 — peer already
+	// committed, peer rolled back, lease expired, or row gone.
+	ReinviteMigratingInstance(ctx context.Context, instanceID, leaseToken string) error
+	// AbortMigratingInstance is the dead-owner hard-delete gate
+	// of the Tier A6 / ADR-067 watchdog. Conditional UPDATE
+	// that flips state='migrating' → 'parked', restores
+	// node_id = migrated_from_node_id (the live, parked state
+	// the row was in before Phase 2 of the original handoff),
+	// and clears lease_token so a future re-attempt at
+	// migration mints a fresh lease. The conditional
+	// predicates are the same as ReinviteMigratingInstance:
+	//   1. state = 'migrating'
+	//   2. lease_token = leaseToken
+	// Returns ErrConflict on RowsAffected()==0 — peer already
+	// committed, peer rolled back, lease expired, or row gone.
+	AbortMigratingInstance(ctx context.Context, instanceID, leaseToken string) error
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)

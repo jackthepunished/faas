@@ -2047,6 +2047,89 @@ func (m *MemStore) CancelInstanceMigration(_ context.Context, instanceID, origin
 	return nil
 }
 
+// ListExpiredMigrations mirrors pkg/state/pgstore.go::
+// ListExpiredMigrations. Returns every instance in
+// state='migrating' with a non-empty lease_token, in
+// instance-id order, capped at maxPerTick. Returns nil
+// (not ErrNotFound) when empty.
+func (m *MemStore) ListExpiredMigrations(_ context.Context, maxPerTick int) ([]Instance, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Instance
+	for _, ins := range m.instances {
+		if ins.State != string(StateMigrating) || ins.LeaseToken == "" {
+			continue
+		}
+		out = append(out, ins)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > maxPerTick {
+		out = out[:maxPerTick]
+	}
+	return out, nil
+}
+
+// ReinviteMigratingInstance mirrors pkg/state/pgstore.go::
+// ReinviteMigratingInstance. Conditional on state='migrating'
+// + lease_token=leaseToken; flips state='running' and clears
+// lease_token. Returns ErrConflict on predicate miss.
+func (m *MemStore) ReinviteMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty leaseToken")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != string(StateMigrating) || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = string(StateRunning)
+	now := time.Now().UTC()
+	ins.MigratedAt = &now
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
+// AbortMigratingInstance mirrors pkg/state/pgstore.go::
+// AbortMigratingInstance. Conditional on state='migrating' +
+// lease_token=leaseToken; flips state='parked', clears lease_token.
+// node_id is left UNCHANGED — same rationale as the pgstore
+// implementation (A5 Phase-2 leaves node_id on the OLD owner and
+// migrated_from_node_id is NULL pre-Phase-3; the wake path
+// dispatches via app.NodeID, so a dead instance.NodeID is
+// harmless).
+func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: abort migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: abort migrating instance: empty leaseToken")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != string(StateMigrating) || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = string(StateParked)
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2893,6 +2976,26 @@ func (m *MemStore) SetBuildStartedAtForTest(id string, t time.Time) {
 	}
 	b.StartedAt = t
 	m.builds[id] = b
+}
+
+// SetInstanceMigratedFromForTest is a test-only hook that lets
+// future tests (e.g. a post-Phase-3 conflict path test) stamp
+// MigratedFromNodeID on a wedged state='migrating' row. The
+// A6 watchdog itself does NOT read MigratedFromNodeID (the
+// column is NULL pre-Phase-3, which is exactly when the watchdog
+// fires), so the current watchdog tests do not exercise this
+// helper. Kept in place for symmetry with the other SetXForTest
+// helpers and as a future-proofing seam.
+func (m *MemStore) SetInstanceMigratedFromForTest(instanceID, nodeID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return
+	}
+	copy := nodeID
+	ins.MigratedFromNodeID = &copy
+	m.instances[instanceID] = ins
 }
 
 // ClaimQueuedBuild atomically flips queued → running under m.mu (PR-A
