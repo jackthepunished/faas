@@ -6197,10 +6197,17 @@ func (s *PgStore) MarkSnapshotStale(ctx context.Context, snapshotID string) erro
 // (current warm + previous init) per app for warm-tier apps, while
 // Free/Hobby apps keep just the single init-tier row. The tier column
 // arrives as a 9th value via Scan's last argument.
+//
+// Issue #470 / PR C / ADR-072: also projects a.warm_snapshot_enabled as
+// the 13th Scan value so the per-tier GC policy can decide whether to
+// apply the 2+2 floor (warm-enabled apps) or the 2-init-only floor
+// (warm-disabled apps) without a per-row AppByID round-trip. Same
+// denormalisation pattern as AppSlug.
 func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, error) {
 	rows, err := s.pool.Query(ctx,
 		`select s.id, s.deployment_id::text, d.app_id::text, a.account_id::text, a.slug,
-		        s.fc_version, s.mem_bytes, s.disk_bytes, s.storage_key, s.stale, s.created_at, s.tier
+		        s.fc_version, s.mem_bytes, s.disk_bytes, s.storage_key, s.stale, s.created_at, s.tier,
+		        a.warm_snapshot_enabled
 		   from snapshots s
 		   join deployments d on d.id = s.deployment_id
 		   join apps a       on a.id = d.app_id
@@ -6216,7 +6223,8 @@ func (s *PgStore) ListSnapshotsForGC(ctx context.Context) ([]SnapshotForGC, erro
 	for rows.Next() {
 		var r SnapshotForGC
 		if err := rows.Scan(&r.ID, &r.DeploymentID, &r.AppID, &r.AccountID, &r.AppSlug,
-			&r.FCVersion, &r.MemBytes, &r.DiskBytes, &r.StorageKey, &r.Stale, &r.CreatedAt, &r.Tier); err != nil {
+			&r.FCVersion, &r.MemBytes, &r.DiskBytes, &r.StorageKey, &r.Stale, &r.CreatedAt, &r.Tier,
+			&r.AppWarmSnapshotEnabled); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

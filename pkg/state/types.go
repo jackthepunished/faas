@@ -1685,6 +1685,13 @@ type SnapshotForGC struct {
 	StorageKey string
 	Stale      bool
 	CreatedAt  time.Time
+	// AppWarmSnapshotEnabled (issue #470 / PR C / ADR-072) projects
+	// apps.warm_snapshot_enabled from the JOIN so the GC policy can
+	// apply the 2+2 floor only on apps that opted in to the warm
+	// tier. Apps with warm_snapshot_enabled=false keep only the
+	// 2-init floor. Denormalised to avoid an AppByID round-trip per
+	// eviction row.
+	AppWarmSnapshotEnabled bool
 }
 
 // LoginToken is one row in login_tokens (M7.5 magic-link). The token

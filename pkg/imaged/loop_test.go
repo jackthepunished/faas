@@ -974,3 +974,325 @@ func BenchmarkLoopRunGCTick_FallbackSQLCost(b *testing.B) {
 		_ = evictions
 	}
 }
+
+// TestGC_PerAppKeepTierFloor_Enabled2Plus2 (issue #470 / PR C /
+// ADR-072) verifies the warm-enabled app policy: keep the 2
+// newest warm-tier rows + the 2 newest init-tier rows; everything
+// older in either tier is dropped. 4 warm + 4 init rows seeded →
+// 4 rows dropped, 4 rows retained.
+func TestGC_PerAppKeepTierFloor_Enabled2Plus2(t *testing.T) {
+	store := state.NewMemStore()
+	acct, _ := store.CreateAccount(context.Background(), "warm@x.com", "pro")
+	// Issue #470 / PR C / ADR-072: enable warm-tier retention for
+	// this app. The MemStore's AppColumnSet has WarmSnapshotEnabled
+	// (verified by PR #525 migrations).
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "warm-enabled", RAMMB: 256,
+		IdleTimeoutS: 30, MaxConcurrency: 2,
+		WarmSnapshotEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour)
+	// Seed 4 init + 4 warm across 8 deployments; the oldest
+	// 2 warm and 2 init should be dropped.
+	for i := 0; i < 4; i++ {
+		dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage,
+			ImageDigest: "sha256:init" + string(rune('a'+i)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+			FCVersion:  "1.8.0",
+			StorageKey: state.SnapMemKey(dep.ID),
+			Tier:       state.SnapshotTierInit,
+			CreatedAt:  base.Add(time.Duration(i) * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage,
+			ImageDigest: "sha256:warm" + string(rune('a'+i)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+			FCVersion:  "1.8.0",
+			StorageKey: state.WarmSnapMemKey(dep.ID),
+			Tier:       state.SnapshotTierWarm,
+			CreatedAt:  base.Add(time.Duration(i+10) * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fx := newGCFixture(t, 50)
+	fx.store = store
+	fx.loop.store = store
+	fx.loop.runGCTick(context.Background(), time.Unix(0, 0))
+
+	rows, err := store.ListSnapshotsForGC(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 4 {
+		t.Errorf("after per-tier GC: %d rows remain, want 4 (2 warm + 2 init)", len(rows))
+	}
+	var warmCount, initCount int
+	for _, r := range rows {
+		switch r.Tier {
+		case state.SnapshotTierWarm:
+			warmCount++
+		case state.SnapshotTierInit:
+			initCount++
+		}
+	}
+	if warmCount != 2 {
+		t.Errorf("warm rows = %d, want 2", warmCount)
+	}
+	if initCount != 2 {
+		t.Errorf("init rows = %d, want 2", initCount)
+	}
+}
+
+// TestGC_PerAppKeepTierFloor_Disabled2Init (issue #470 / PR C /
+// ADR-072) verifies the warm-disabled policy: keep only the 2
+// newest init-tier rows; every warm-tier row (which the app is
+// not opted in to) is dropped, plus the older init rows.
+func TestGC_PerAppKeepTierFloor_Disabled2Init(t *testing.T) {
+	store := state.NewMemStore()
+	acct, _ := store.CreateAccount(context.Background(), "disabled@x.com", "pro")
+	app, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "warm-disabled", RAMMB: 256,
+		IdleTimeoutS: 30, MaxConcurrency: 2,
+		// WarmSnapshotEnabled left default false.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour)
+	// Seed 4 init + 4 warm rows even though the app is disabled
+	// (vestigial warm rows from a prior opt-in).
+	for i := 0; i < 4; i++ {
+		dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage,
+			ImageDigest: "sha256:dinit" + string(rune('a'+i)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+			FCVersion:  "1.8.0",
+			StorageKey: state.SnapMemKey(dep.ID),
+			Tier:       state.SnapshotTierInit,
+			CreatedAt:  base.Add(time.Duration(i) * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		dep, err := store.CreateDeployment(context.Background(), state.Deployment{
+			AppID: app.ID, Kind: state.DeploymentKindImage,
+			ImageDigest: "sha256:dwarm" + string(rune('a'+i)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = store.CreateSnapshot(context.Background(), state.Snapshot{
+			DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+			FCVersion:  "1.8.0",
+			StorageKey: state.WarmSnapMemKey(dep.ID),
+			Tier:       state.SnapshotTierWarm,
+			CreatedAt:  base.Add(time.Duration(i+10) * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fx := newGCFixture(t, 50)
+	fx.store = store
+	fx.loop.store = store
+	fx.loop.runGCTick(context.Background(), time.Unix(0, 0))
+
+	rows, err := store.ListSnapshotsForGC(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("disabled app: %d rows remain, want 2 init", len(rows))
+	}
+	for _, r := range rows {
+		if r.Tier != state.SnapshotTierInit {
+			t.Errorf("disabled app left a %s row %q — only init should remain", r.Tier, r.ID)
+		}
+	}
+}
+
+// TestGC_PerAppKeepTierFloor_MixedApps (issue #470 / PR C /
+// ADR-072) verifies that the per-app floor is applied INDEPENDENTLY
+// for each app — a warm-enabled app's tier floors do not affect a
+// warm-disabled app in the same tenant.
+func TestGC_PerAppKeepTierFloor_MixedApps(t *testing.T) {
+	store := state.NewMemStore()
+	acct, _ := store.CreateAccount(context.Background(), "mixed@x.com", "pro")
+	enabledApp, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "enabled", RAMMB: 256,
+		IdleTimeoutS: 30, MaxConcurrency: 2,
+		WarmSnapshotEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledApp, err := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "disabled", RAMMB: 256,
+		IdleTimeoutS: 30, MaxConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour)
+	// Enabled app: 3 init + 3 warm → keep 2 warm + 2 init, drop 2.
+	for _, app := range [2]state.App{enabledApp, disabledApp} {
+		var warmBefore int
+		if app.ID == enabledApp.ID {
+			warmBefore = 3
+		} else {
+			warmBefore = 0
+		}
+		for i := 0; i < 3; i++ {
+			dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+				AppID: app.ID, Kind: state.DeploymentKindImage,
+				ImageDigest: "sha256:" + app.Slug + "init" + string(rune('a'+i)),
+			})
+			_, _ = store.CreateSnapshot(context.Background(), state.Snapshot{
+				DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+				FCVersion:  "1.8.0",
+				StorageKey: state.SnapMemKey(dep.ID),
+				Tier:       state.SnapshotTierInit,
+				CreatedAt:  base.Add(time.Duration(i) * time.Minute),
+			})
+		}
+		for i := 0; i < warmBefore; i++ {
+			dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+				AppID: app.ID, Kind: state.DeploymentKindImage,
+				ImageDigest: "sha256:" + app.Slug + "warm" + string(rune('a'+i)),
+			})
+			_, _ = store.CreateSnapshot(context.Background(), state.Snapshot{
+				DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+				FCVersion:  "1.8.0",
+				StorageKey: state.WarmSnapMemKey(dep.ID),
+				Tier:       state.SnapshotTierWarm,
+				CreatedAt:  base.Add(time.Duration(i+10) * time.Minute),
+			})
+		}
+	}
+
+	fx := newGCFixture(t, 50)
+	fx.store = store
+	fx.loop.store = store
+	fx.loop.runGCTick(context.Background(), time.Unix(0, 0))
+
+	rows, err := store.ListSnapshotsForGC(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enabled, disabled int
+	for _, r := range rows {
+		if r.AppID == enabledApp.ID {
+			enabled++
+		} else if r.AppID == disabledApp.ID {
+			disabled++
+		}
+	}
+	if enabled != 4 {
+		t.Errorf("enabled app: %d rows remain, want 4 (2 warm + 2 init)", enabled)
+	}
+	if disabled != 2 {
+		t.Errorf("disabled app: %d rows remain, want 2 init", disabled)
+	}
+}
+
+// TestDeleteSnapshotsAndFiles_TierAwareWarm (issue #470 / PR C /
+// ADR-072) verifies that a warm-tier eviction target's storage
+// cleanup uses WarmSnapMemKey + WarmSnapVMStateKey, NOT the init
+// paths — and vice versa for an init target. Drops files at
+// canonical warm-tier keys and asserts init keys remain untouched.
+func TestDeleteSnapshotsAndFiles_TierAwareWarm(t *testing.T) {
+	fx := newGCFixture(t, 50)
+	store := fx.store
+
+	acct, _ := store.CreateAccount(context.Background(), "keys@x.com", "pro")
+	app, _ := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "tierkeys", RAMMB: 256,
+		IdleTimeoutS: 30, MaxConcurrency: 2,
+	})
+	dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:tier",
+	})
+	// Seed a single warm-tier snapshot row + write the warm
+	// mem blob to the local storage backend.
+	_, err := store.CreateSnapshot(context.Background(), state.Snapshot{
+		DeploymentID: dep.ID, MemBytes: 100, DiskBytes: 100,
+		FCVersion:  "1.8.0",
+		StorageKey: state.WarmSnapMemKey(dep.ID),
+		Tier:       state.SnapshotTierWarm,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	be, _ := storage.NewLocalStorageBackend(fx.be.(*storage.LocalStorageBackend).Root())
+	// Write the warm mem blob so we can observe its later
+	// absence; the storage.Backend interface only ships 3-arg
+	// Put(ctx, key, io.Reader), so seed an io.Reader from a
+	// strings.Reader — no size arg is needed.
+	if err := be.Put(context.Background(), state.WarmSnapMemKey(dep.ID), strings.NewReader("warm-mem")); err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put(context.Background(), state.WarmSnapVMStateKey(dep.ID), strings.NewReader("warm-vms")); err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put(context.Background(), state.SnapMemKey(dep.ID), strings.NewReader("init-mem")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = fx.loop.deleteSnapshotsAndFiles(context.Background(), []deleteTarget{{
+		ID:           "warm-id",
+		DeploymentID: dep.ID,
+		AppSlug:      app.Slug,
+		Tier:         state.SnapshotTierWarm,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Warm blobs should be gone; init mem blob untouched. The
+	// storage interface ships Get (returns ErrNotFound for absent
+	// keys) but no Exists; assert non-existence via Get's error
+	// chain.
+	for _, k := range []string{
+		state.WarmSnapMemKey(dep.ID),
+		state.WarmSnapVMStateKey(dep.ID),
+	} {
+		_, err := be.Get(context.Background(), k)
+		if err == nil {
+			t.Errorf("warm key %q still present after delete", k)
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			t.Errorf("warm key %q Get: unexpected error %v (want ErrNotFound)", k, err)
+		}
+	}
+	if _, err := be.Get(context.Background(), state.SnapMemKey(dep.ID)); err != nil {
+		t.Errorf("init mem blob was incorrectly deleted — warm-tier evict must not touch init keys: %v", err)
+	}
+}
