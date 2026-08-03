@@ -4,7 +4,9 @@
 # component and runs only on the EX44 hardware. The ansible role ships
 # the unit + example toml in place; the operator runs `systemctl enable
 # --now faas-vmmd` once the box has been provisioned with a /srv/fc/base
-# kernel, firecracker binary, and the `faas-vmmd` system user.
+# kernel and the firecracker binary. The `faas-vmmd` system user is
+# created by this role (see below) — it is required for the vmmd
+# socket at /run/faas/vmmd.sock to chown correctly.
 
 - name: vmmd_service — install /etc/faas (create dir, mode 0750)
   ansible.builtin.file:
@@ -41,6 +43,35 @@
     name: faas
     state: present
     system: true
+
+# Owner of the vmmd unix socket. The runtime toml default
+# `owner_user = "faas-vmmd"` (cmd/vmmd/config.go::Config.OwnerUser,
+# deploy/etc/vmmd.toml.example:15) requires this uid to exist on
+# the host — pkg/wire/ListenOrRecreate looks it up via user.Lookup
+# to chown the socket (pkg/wire/grpc.go:340-343). Without it,
+# the 61fedaa and earlier binaries refuse to bind
+# (`user.Lookup("faas-vmmd"): no such user`) and the for-loop
+# in pkg/wire/ListenOrRecreate fails before vmmd reaches
+# `vmmd ready`. The 8f90e2a5 fallback (silently set daemonUser=""
+# on lookup error) hides the gap on the latest build but is
+# not present in the rollback binary — so a post-rollback box
+# goes into a crash loop on this single missing user.
+#
+# Bootstrapping this user is the only host-side fix that closes
+# the gap for both the current and the rollback binaries.
+# Mode: nologin, no home dir, no password — vmmd is a daemon,
+# never a login target. Group membership is `faas` so the
+# sibling CHOWN in ListenOrRecreate groups the socket correctly.
+# Idempotent: ansible.user with state=present is a no-op when
+# the uid already exists.
+- name: vmmd_service — ensure 'faas-vmmd' system user exists (vmmd socket owner)
+  ansible.builtin.user:
+    name: faas-vmmd
+    group: faas
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    password: "*"
 
 # ADR-053: parent-base loopback mount scratch dir. vmmd owns the
 # loopback mounts (cmd/vmmd/main.go wires pkg/vmmdmount.Registry)

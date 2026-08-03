@@ -156,6 +156,29 @@ jobs:
           set -euo pipefail
 
           FAAS_SERVICES="vmmd apid schedd gatewayd imaged meterd githubd"
+          # Restart order: vmmd first (the only root component, the
+          # socket owner of /run/faas/vmmd.sock), then everyone that
+          # depends on vmmd (apid, schedd, gatewayd, imaged, meterd),
+          # then githubd (the only one without a vmmd dependency).
+          # This replaces the previous `${FAAS_SERVICES}` order which
+          # had the right start-dag but iterates the SAME loop twice
+          # across the main restart and the roll_back branch — every
+          # extra vmmd restart races the still-running previous vmmd
+          # and can leave /run/faas/vmmd.sock orphaned (the inode is
+          # held open by the previous vmmd fd, the dirent is gone,
+          # dialers get `no such file or directory` even though
+          # `ss -lnx` shows the listen entry). CI run 30837572523
+          # hit this twice.
+          #
+          # PR #610's `After=faas-vmmd.service` on the imaged unit
+          # only orders systemd STARTUP, not the loop-driven
+          # restart in this script. The explicit order below is
+          # what actually drives the dependency during deploy.
+          FAAS_RESTART_ORDER="vmmd apid schedd gatewayd imaged meterd githubd"
+          if [[ "${FAAS_SERVICES}" != "${FAAS_RESTART_ORDER}" ]]; then
+            echo "::error::FAAS_SERVICES and FAAS_RESTART_ORDER diverged; update both to keep dependency ordering correct"
+            exit 1
+          fi
           BINARIES="apid schedd gatewayd imaged meterd githubd vmmd gregale migrate"
           # Deliberately NOT under /opt/faas/bin: this dir survives a failed
           # deploy (so the previous build stays inspectable) and nothing that
@@ -250,7 +273,7 @@ jobs:
                 install -m 0755 "${ROLLBACK_DIR}/${bin}" "/opt/faas/bin/${bin}"
               fi
             done
-            for svc in ${FAAS_SERVICES}; do
+            for svc in ${FAAS_RESTART_ORDER}; do
               systemctl restart "faas-${svc}.service" || true
             done
             if wait_healthy; then
@@ -455,11 +478,46 @@ jobs:
           # Reset any systemd start-limit-hit counters from previous crash loops
           systemctl reset-failed
 
-          # Restart all FaaS services.
-          for svc in ${FAAS_SERVICES}; do
+          # Restart all FaaS services in dependency order. vmmd MUST
+          # come first so /run/faas/vmmd.sock is bound before imaged
+          # (and any other daemon that dials it) starts. Each restart
+          # is wrapped in a brief settle so the new process actually
+          # reaches `vmmd ready` / `grpc listening` before the next
+          # unit starts — without this, the script can race past
+          # vmmd while it's still in `activating` and the imaged
+          # dials hit `no such file or directory` (run 30835745646,
+          # 30837572523).
+          for svc in ${FAAS_RESTART_ORDER}; do
             systemctl reset-failed "faas-${svc}.service" || true
             systemctl restart "faas-${svc}.service" || true
           done
+          # Verify the vmmd socket is actually visible at the bind
+          # path. The known-bad pattern is: vmmd is `active` per
+          # systemctl, its journal says `grpc listening unix:///run/faas/vmmd.sock`,
+          # `ss -lnx` shows the listen entry, but the dirent has
+          # been unlinked and `stat /run/faas/vmmd.sock` returns
+          # `No such file or directory`. New dialers (imaged) fail
+          # with `dial unix /run/faas/vmmd.sock: connect: no such
+          # file or directory` even though vmmd is alive. Catching
+          # this BEFORE the health gate saves the roll_back cycle
+          # (which would otherwise do another `systemctl restart
+          # vmmd` and re-introduce the same race).
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if [[ -S /run/faas/vmmd.sock ]]; then
+              echo "✓ vmmd.sock present (attempt ${i})"
+              break
+            fi
+            echo "…vmmd.sock not yet at /run/faas (attempt ${i}/10); retrying"
+            sleep 1
+          done
+          if [[ ! -S /run/faas/vmmd.sock ]]; then
+            echo "::error::vmmd.sock still missing after 10s despite vmmd being active — known deploy-time race (run 30837572523); failing fast instead of letting the health gate timeout"
+            systemctl status faas-vmmd.service --no-pager || true
+            journalctl -u faas-vmmd -n 30 --no-pager || true
+            ss -lnx 2>&1 | grep vmmd || true
+            stat /run/faas/vmmd.sock 2>&1 || true
+            exit 1
+          fi
 
           # Health gate. Probes gatewayd (loopback :8080), not apid directly
           # — spec §11 binds apid to loopback-only and gatewayd
