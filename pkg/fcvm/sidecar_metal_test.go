@@ -53,8 +53,8 @@ import (
 // creating one in dir if none exists. Mirrors ensureBusyboxExt4's
 // fixture/build-fallback pattern but the sidecar ext4 ships:
 //
-//   /usr/local/bin/start.sh  (the canonical sidecar entrypoint)
-//   /etc/sidecar/start.sh    (operator-visibility alias)
+//	/usr/local/bin/start.sh  (the canonical sidecar entrypoint)
+//	/etc/sidecar/start.sh    (operator-visibility alias)
 //
 // The start.sh exec's `busybox httpd -f -p <port>` so the test
 // can verify the sidecar listens on the customer-pinned port

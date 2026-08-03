@@ -7,7 +7,10 @@
 -- Slot: 00120. Latest on origin/main is 00118 (PR-A sidecars).
 -- Fence discipline: migrations/README.md.
 
+-- +goose Up
+-- +goose StatementBegin
 SELECT 1;
+-- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin

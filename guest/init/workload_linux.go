@@ -129,18 +129,18 @@ func discoverRoster(fsys fs.FS) (workloadRoster, error) {
 // runWorkloads (issue #463 / ADR-069 / PR-B) is the boot-side
 // orchestrator. The dispatch order:
 //
-//   1. Run init sidecars sequentially (each blocking). A non-zero
-//      init exit fails the deploy immediately — no main workload
-//      starts. (AC #1.)
-//   2. Run main + type="sidecar" workloads in parallel, each under
-//      its own Supervisor. A main workload crash restarts per the
-//      supervisor's Max policy; an essential sidecar crash has the
-//      same policy; a non-essential sidecar crash is logged and
-//      the other workloads continue. (AC #2 / AC #4.)
-//   3. Returns when every supervisor has exited (clean or
-//      exhausted its restart budget). The main workload's exit
-//      code is the deploy's exit code; non-essential sidecar
-//      exits are logged but ignored.
+//  1. Run init sidecars sequentially (each blocking). A non-zero
+//     init exit fails the deploy immediately — no main workload
+//     starts. (AC #1.)
+//  2. Run main + type="sidecar" workloads in parallel, each under
+//     its own Supervisor. A main workload crash restarts per the
+//     supervisor's Max policy; an essential sidecar crash has the
+//     same policy; a non-essential sidecar crash is logged and
+//     the other workloads continue. (AC #2 / AC #4.)
+//  3. Returns when every supervisor has exited (clean or
+//     exhausted its restart budget). The main workload's exit
+//     code is the deploy's exit code; non-essential sidecar
+//     exits are logged but ignored.
 //
 // The legacy single-workload path (no roster) is the caller's
 // responsibility — boot() in main_linux.go owns that fallback.
