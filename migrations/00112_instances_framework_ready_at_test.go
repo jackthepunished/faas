@@ -80,13 +80,22 @@ func TestMigrations_00112_InstancesFrameworkReadyAt(t *testing.T) {
 	`); err != nil {
 		t.Fatalf("seed deployment: %v", err)
 	}
+	// node_id is a UUID FK referencing compute_nodes(id); the 00024
+	// migration seeds a default-local row during apply. Look it up
+	// rather than hand-rolling a UUID (the schema rejects text).
+	var nodeID string
+	if err := pool.QueryRow(ctx, `
+		select id from compute_nodes where name = 'default-local' limit 1
+	`).Scan(&nodeID); err != nil {
+		t.Fatalf("lookup default-local compute_node id: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		insert into instances (id, deployment_id, node_id, state, ram_mb, started_at)
 		values ('00000000-0000-0000-0000-000000000412',
 		        '00000000-0000-0000-0000-000000000312',
-		        'local-0', 'running', 256, now())
+		        $1, 'running', 256, now())
 		on conflict (id) do nothing
-	`); err != nil {
+	`, nodeID); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 

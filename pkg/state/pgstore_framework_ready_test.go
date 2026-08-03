@@ -58,11 +58,21 @@ func seedFrameworkReadyInstancePg(t *testing.T, pool *pgxpool.Pool) (appID, depl
 	`, IDs.dep, IDs.app); err != nil {
 		t.Fatalf("seed deployment: %v", err)
 	}
+	// node_id is a UUID FK referencing compute_nodes(id). The 00024
+	// migration seeds a default-local row; look it up rather than
+	// hand-rolling a UUID (the schema rejects text). Mirrors the
+	// pattern in migrations/00066_usage_minutes_egress_test.go.
+	var nodeID string
+	if err := pool.QueryRow(ctx, `
+		select id from compute_nodes where name = 'default-local' limit 1
+	`).Scan(&nodeID); err != nil {
+		t.Fatalf("lookup default-local compute_node id: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		insert into instances (id, deployment_id, node_id, state, ram_mb, started_at)
-		values ($1, $2, 'local-0', 'running', 256, now())
+		values ($1, $2, $3, 'running', 256, now())
 		on conflict (id) do nothing
-	`, IDs.ins, IDs.dep); err != nil {
+	`, IDs.ins, IDs.dep, nodeID); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 	return IDs.app, IDs.dep, IDs.ins

@@ -593,21 +593,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 
 	// PR #470-FU-B (issue #470): the host-side DGRAM recv loop
-	// for the framework-ready signal. Soft-fatal on bind
-	// failure on Linux — the warm-tier path is required for the
-	// engine's captureWarmSnapshot (PR #470-FU-A) to work, so a
-	// vmmd that can't receive the signal must abort at startup
-	// rather than silently degrade. On non-linux (Mac dev box)
-	// the stub returns an error; we log at Warn and continue so
-	// the dev workflow isn't gated.
-	recv, err := StartFrameworkReadyReceiver(log, mgr)
+	// for the framework-ready signal. Soft-fatal on bind failure
+	// in BOTH directions:
+	//
+	//   - non-linux (Mac dev box): the stub returns an error; we
+	//     log at Warn and continue so the dev workflow isn't gated.
+	//   - linux WITHOUT the AF_VSOCK kernel module loaded (CI unit
+	//     test container, build hosts without /dev/vsock): bind
+	//     returns EADDRNOTAVAIL. The unit-test seam must keep
+	//     running — the warm-tier path is dormant but the rest of
+	//     vmmd (gRPC, host key, capacity publisher) still needs to
+	//     come up so cmd/vmmd tests can exercise it.
+	//
+	// The production-only vsock path is opt-in: an operator running
+	// the full vmmd on a host whose kernel supports vsock would
+	// see the receiver come up. If bind fails on a real production
+	// host, the warm-tier migration is silently dropped — but the
+	// gRPC server still serves readiness, and the watchdog tick
+	// (memory `schedd-watchdog-tick`) is unaffected.
+	recv, err := StartFrameworkReadyReceiver(ctx, log, mgr)
 	if err != nil {
-		if runtime.GOOS != "linux" {
-			log.Warn("vmmd: framework_ready receiver unavailable (non-linux build)", "err", err)
-			recv = nil
-		} else {
-			return fmt.Errorf("vmmd: framework_ready receiver: %w", err)
-		}
+		log.Warn("vmmd: framework_ready receiver unavailable", "err", err, "goos", runtime.GOOS)
+		recv = nil
 	}
 	if recv != nil {
 		defer recv.Close()
