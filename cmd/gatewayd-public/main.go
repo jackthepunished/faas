@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -181,10 +182,40 @@ func run(ctx context.Context, log *slog.Logger) error {
 		internalURL,
 		log,
 	)
+	// Issue #555 PR-3: mount otelhttp.NewTransport so the outbound
+	// request to gatewayd-internal carries the same trace context
+	// (gateway.route span). The wrapper sits UNDER the proxy's
+	// RoundTripper so the inbound span context is propagated on the
+	// outbound hop.
+	proxy.Transport = otelhttp.NewTransport(proxy.Transport)
 
-	// Public-facing handler: httpsec outer wrapper → internal proxy.
+	// Trace pipeline (issue #555 PR-2). Builds the in-memory ring,
+	// wires the OTLP/HTTP exporter when OTEL_EXPORTER_OTLP_ENDPOINT
+	// is set, and installs the GET /v1/traces/{trace_id} handler.
+	// The trace setup is gatewayd-public's responsibility because
+	// the ring is per-daemon (ADR-070 cross-box HA is N boxes each
+	// with their own ring; the GET endpoint reaches this box only).
+	traceSetup, err := gateway.InstallTracePipeline(ctx, "gatewayd-public", wire.Version, log)
+	if err != nil {
+		return fmt.Errorf("gatewayd-public: trace setup: %w", err)
+	}
+	// traceHandler mounts under /v1/traces/ (the trace handler
+	// reads the path suffix). Wrap the proxy in a mux that
+	// routes /v1/traces/ to the handler and falls through to the
+	// proxy for everything else.
+	traceMux := http.NewServeMux()
+	traceMux.Handle("/v1/traces/", traceSetup.Handler)
+	traceMux.Handle("/", proxy)
+
+	// Public-facing handler: httpsec outer wrapper → trace mux → internal proxy.
 	httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(hstsEnabledFromEnv))
-	publicHandler := httpsec.Static(proxy)
+	// Issue #555 PR-3: otelhttp.NewHandler extracts W3C traceparent
+	// from inbound headers and starts a server span per request; the
+	// emitted spans flow into the TraceRing (PR-2) + OTLP exporter.
+	// This wrap sits INSIDE httpsec.Security so the response headers
+	// (HSTS, CSP nonce, etc.) don't show up as span attributes (the
+	// OTel view is the request itself, not the security headers).
+	publicHandler := httpsec.Static(otelhttp.NewHandler(traceMux, "gatewayd-public.handler"))
 
 	// Control mux + listeners.
 	controlMux := gateway.ControlMux(nil, probe.ReadyFunc())
@@ -193,7 +224,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux, tlsBundle)
 
 	// Drain orchestration.
-	if err := runDrain(ctx, log, publicSrv, controlSrv, certSig, pgProbeSig, pgStop); err != nil {
+	if err := runDrain(ctx, log, publicSrv, controlSrv, certSig, pgProbeSig, pgStop, traceSetup); err != nil {
 		return err
 	}
 	return nil
@@ -303,7 +334,7 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 //     1s ticker to make the sleep effectively cancellable).
 //  4. Shutdown both servers with a 5 s grace.
 //  5. pgStop() (already done above; kept here as a no-op safety net).
-func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, certSig, pgProbeSig *gateway.ReadySignal, pgStop func()) error {
+func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http.Server, certSig, pgProbeSig *gateway.ReadySignal, pgStop func(), traceSetup *gateway.TraceSetup) error {
 	drainCtx, cancelDrain := context.WithCancel(context.Background())
 	defer cancelDrain()
 	sigCh := make(chan os.Signal, 1)
@@ -374,6 +405,18 @@ func runDrain(ctx context.Context, log *slog.Logger, publicSrv, controlSrv *http
 	}
 	if err := controlSrv.Shutdown(sctx); err != nil {
 		log.Warn("gatewayd-public: control Shutdown", "err", err)
+	}
+	// Flush any in-flight spans from the BatchSpanProcessor. We
+	// use a fresh context (the daemon's ctx is already cancelled)
+	// so the SDK shutdown can flush its full batch. The 5s upper
+	// bound matches the public-server shutdown grace so a slow
+	// collector doesn't stall the daemon drain.
+	if traceSetup != nil {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := traceSetup.Shutdown(flushCtx); err != nil {
+			log.Warn("gatewayd-public: trace shutdown", "err", err)
+		}
+		cancel()
 	}
 	return nil
 }
