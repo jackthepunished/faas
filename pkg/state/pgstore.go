@@ -1763,7 +1763,7 @@ func (s *PgStore) ListExpiredMigrations(ctx context.Context, maxPerTick int) ([]
 	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''),
 	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
 	               i.started_at, i.last_request_at, i.parked_at,
-	               coalesce(i.node_id::text, ''), i.wake_id,
+	               coalesce(i.node_id::text, ''), i.wake_id, i.framework_ready_at,
 	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
 	          from instances i
 	         where i.state = 'migrating'
@@ -8506,21 +8506,26 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	return ins, nil
 }
 
-// scanInstanceColsWithMigration is the 16-column variant of
-// scanInstanceCols that also lifts migrated_from_node_id,
-// migrated_at, and lease_token (Tier A5 / migration 00097,
-// ADR-066). Used only by ListLiveInstancesOnNode — the rest of
-// the codebase reads 13-column instances rows and doesn't need
-// the migration lineage. Column order matches
-// ListLiveInstancesOnNode's SELECT; keep them in lock-step.
+// scanInstanceColsWithMigration is the 17-column variant of
+// scanInstanceCols that also lifts framework_ready_at (PR #543 /
+// migration 00120), migrated_from_node_id, migrated_at, and
+// lease_token (Tier A5 / migration 00097, ADR-066). Used by
+// ListLiveInstancesOnNode and ListExpiredMigrations — the rest
+// of the codebase reads 13-column instances rows and doesn't
+// need the migration lineage. Column order matches the SELECTs
+// in those two functions; keep them in lock-step.
 // migrated_from_node_id is nullable forever (a fresh instance
 // has no migration history), so it scans into a *string
 // pointer to preserve the distinction between "fresh" and
 // "previously migrated". migrated_at is nullable for the same
-// reason. lease_token is also nullable.
+// reason. lease_token is also nullable. framework_ready_at is
+// nullable on every pre-warm-capture row — for migrating
+// instances it is always NULL (the warm-capture path predates
+// migration), but the column is part of the row shape so we
+// scan it for shape parity.
 //
-// Single-call scan: pgx rejects a 16-column SELECT with a 13-dest
-// scan followed by a 3-dest scan — the row surface is one
+// Single-call scan: pgx rejects a 17-column SELECT with a 13-dest
+// scan followed by a 4-dest scan — the row surface is one
 // contiguous column stream and each scan call must consume all
 // columns in one go. The base 13 fields are duplicated here
 // rather than split across two scan calls so the row descriptor
