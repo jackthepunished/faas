@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -150,9 +151,21 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 		// log line is shipped to a third-party aggregator, the
 		// pair must be scrubbed or hashed (slugs are public but
 		// the cross-reference is not).
+		//
+		// Both fields are wrapped with logsanitize.Field: the slug
+		// came from the X-Active-Org header (a request-derived
+		// source per CodeQL go/clear-text-logging / go/log-injection),
+		// and acct.ID flowed through the same principal container
+		// (also flagged). The wrapper strips ASCII control characters
+		// so a malicious actor cannot forge log lines via CR/LF
+		// injection — slog's JSON encoder escapes special chars,
+		// but stripping at the source keeps the log stream one-line-
+		// per-event regardless of what the producer sent. The
+		// value is bounded to maxSlugLen (64) before this point so
+		// downstream log volume is bounded too.
 		cfg.Log.Warn("org lookup failed",
-			"slug", slug,
-			"account_id", acct.ID,
+			"slug", logsanitize.Field(slug),
+			"account_id", logsanitize.Field(acct.ID),
 			"error", err.Error())
 		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
@@ -174,8 +187,8 @@ func handleLoadOrg(cfg LoadOrgConfig, r OrgResolver, w http.ResponseWriter, req 
 			return
 		}
 		cfg.Log.Warn("membership lookup failed",
-			"org_id", org.ID,
-			"account_id", acct.ID,
+			"org_id", logsanitize.Field(org.ID),
+			"account_id", logsanitize.Field(acct.ID),
 			"error", err.Error())
 		emitAudit(req.Context(), cfg.Audit, acct, "org.load.error", api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,

@@ -12,7 +12,11 @@
 package authz
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -303,5 +307,82 @@ func TestLoadOrg_QueryMalformed_PassThrough(t *testing.T) {
 	}
 	if !next.called {
 		t.Fatal("next handler not called; want passthrough")
+	}
+}
+
+// stubBrokenResolver returns a non-ErrNotFound error from OrgBySlug
+// so the middleware takes the "lookup failed" branch (the only branch
+// that emits a Warn log). The empty-org stubResolver returns
+// state.ErrNotFound which is the 404 path — that doesn't reach the
+// log line at all, so we need a separate fake to exercise the
+// sanitization gate.
+type stubBrokenResolver struct{}
+
+func (stubBrokenResolver) OrgBySlug(_ context.Context, _ string) (state.Org, error) {
+	return state.Org{}, errors.New("synthetic pg outage")
+}
+func (stubBrokenResolver) OrgMemberByAccount(_ context.Context, _, _ string) (state.OrgMembership, error) {
+	return state.OrgMembership{}, state.ErrNotFound
+}
+
+// TestLoadOrg_LogSanitizesSlug — CodeQL probes #152-156 fired on the
+// org-lookup-failed Warn line because the slug flows from the
+// X-Active-Org header (an attacker-controlled source) directly into
+// slog. The fix wraps slug + acct.ID with pkg/logsanitize.Field so
+// ASCII control characters (CR/LF/NUL) become U+00B7 before they
+// reach the log stream. This test pins that: a header containing
+// "acme\nfake-line" must round-trip through the log as
+// "acme·fake-line" — a malicious actor cannot forge log lines via
+// CR/LF injection. Without sanitization, the log stream would emit
+// two lines per event and one customer's diagnostic would silently
+// rotate into another's, breaking the audit story.
+//
+// The synthetic resolver error is what makes this test cover the
+// Warn branch — the empty stubResolver returns state.ErrNotFound,
+// which goes through the 404 path (no log line).
+func TestLoadOrg_LogSanitizesSlug(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	cfg := LoadOrgConfig{
+		HeaderName: "X-Active-Org",
+		QueryName:  "org",
+		Log:        logger,
+	}
+	req := reqWithPrincipal(t, "GET", "/v1/orgs/me", "acme\nfake-line")
+	mw := LoadOrgWithResolver(cfg, stubBrokenResolver{})
+	rec := httptest.NewRecorder()
+	mw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec, req)
+
+	// The middleware should have written a 500 — and the log line
+	// must contain the sanitized slug, not the raw header value.
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	out := logBuf.String()
+	if out == "" {
+		t.Fatal("expected a log line; got empty buffer")
+	}
+
+	// Decode the JSON log line so we can inspect the "slug" field
+	// directly (instead of grepping for substrings across the
+	// whole JSON).
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &entry); err != nil {
+		t.Fatalf("log line not JSON: %v (raw=%q)", err, out)
+	}
+	slugField, ok := entry["slug"].(string)
+	if !ok {
+		t.Fatalf("slug field missing or not a string: %+v", entry)
+	}
+	if strings.Contains(slugField, "\n") || strings.Contains(slugField, "\r") {
+		t.Errorf("slug field still contains CR/LF: %q", slugField)
+	}
+	if !strings.Contains(slugField, "acme") || !strings.Contains(slugField, "fake-line") {
+		t.Errorf("slug field lost legitimate content: %q", slugField)
+	}
+	// The original "acme\nfake-line" must NOT appear verbatim.
+	if strings.Contains(slugField, "acme\nfake-line") {
+		t.Errorf("slug field un-sanitized: %q", slugField)
 	}
 }
