@@ -29,6 +29,7 @@ import (
 	"net/http"
 
 	"github.com/onebox-faas/faas/pkg/auth/middleware"
+	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -77,6 +78,56 @@ func (s *server) requireScope(allowed ...string) func(accountHandler) accountHan
 // Behaviour matches cmd/apid/server.go:1611-1617.
 func (s *server) loadApp(w http.ResponseWriter, r *http.Request, acct state.Account, slug string) (state.App, bool) {
 	return s.authMw.LoadApp(w, r, acct, slug)
+}
+
+// loadOrg wraps an accountHandler with pkg/authz.LoadOrg — the
+// middleware that resolves the X-Active-Org / ?org= hint to an
+// OrgMembership and stamps it onto the principal (issue #190 /
+// IAM-6 / ADR-061, PR 4). Unlike loadApp (which is a value-returning
+// helper), loadOrg is a middleware: it returns an accountHandler
+// that the route table mounts inside s.auth.
+//
+// Returns a pass-through accountHandler when s.orgResolver is nil
+// (unit tests that don't exercise LoadOrg) so the route table never
+// dereferences a nil pointer.
+//
+// The audit emitter is wired from s.audit when available so denials
+// surface in pkg/audit as authz.denied rows; nil is tolerated and
+// means no audit rows are emitted (PR 4 default; PR 5+ may add a
+// dedicated metric counter via pkg/wire/metrics.go).
+func (s *server) loadOrg(next accountHandler) accountHandler {
+	if s.orgResolver == nil {
+		// No resolver wired → pass-through. Tests that don't
+		// exercise LoadOrg land here.
+		return next
+	}
+	auditEmitter := loadOrgAuditFrom(s.audit)
+	mw := authz.LoadOrg(authz.LoadOrgConfig{
+		Log:        s.log,
+		Audit:      auditEmitter,
+		HeaderName: "X-Active-Org",
+		QueryName:  "org",
+	}, s.orgResolver)
+
+	return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
+		// Wrap next as http.HandlerFunc so it satisfies the
+		// authz.LoadOrg chain, then dispatch into it.
+		wrapped := mw(http.HandlerFunc(func(w2 http.ResponseWriter, r2 *http.Request) {
+			next(w2, r2, acct)
+		}))
+		wrapped.ServeHTTP(w, r)
+	}
+}
+
+// loadOrgAuditFrom bridges cmd/apid's *auditor to pkg/authz.AuditEmitter.
+// Returns nil when the audit pipeline isn't wired — the same
+// nil-tolerant default that lets PR 4 ship without forcing every
+// test to construct an auditor.
+func loadOrgAuditFrom(a *auditor) authz.AuditEmitter {
+	if a == nil {
+		return nil
+	}
+	return auditorAsAuthzAuditor(a)
 }
 
 // authAccountHandler converts a pkg/middleware.AccountHandler back to

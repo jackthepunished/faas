@@ -1,0 +1,201 @@
+package authz
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// allowRoleMatrix maps every OrgAction to the set of roles that may
+// perform it. The table is the single source of truth — handlers MUST
+// route through AuthorizeOrgAction (or one of the RequireRole helpers
+// below) instead of branching on role directly. PR 5 will enforce this
+// in code review for every org handler.
+//
+// The matrix is built once at package init via init() below; the
+// compile-time assertion in authorize_test.go pins every
+// (action, role) cell. A missing cell returns false (deny), not panic
+// — fail closed.
+var allowRoleMatrix = map[OrgAction]map[state.OrgRole]bool{
+	OrgActionView: {
+		state.OrgRoleOwner:     true,
+		state.OrgRoleAdmin:     true,
+		state.OrgRoleDeveloper: true,
+		state.OrgRoleViewer:    true,
+		state.OrgRoleBilling:   true,
+	},
+	OrgActionManageMembers: {
+		state.OrgRoleOwner: true,
+		state.OrgRoleAdmin: true,
+	},
+	OrgActionInviteMembers: {
+		state.OrgRoleOwner: true,
+		state.OrgRoleAdmin: true,
+	},
+	OrgActionRemoveMembers: {
+		// Per ADR-061, removal is owner-only because removing an
+		// admin or developer affects the org's ability to operate
+		// — even admins cannot unilaterally remove peers. The
+		// exactly-one-owner invariant is enforced separately in
+		// pkg/state::RemoveOrgMember's tx.
+		state.OrgRoleOwner: true,
+	},
+	OrgActionChangeRole: {
+		// The role-change action is the one action that can
+		// directly affect ownership invariants (a malicious admin
+		// could promote themselves to owner), so it stays owner-
+		// only.
+		state.OrgRoleOwner: true,
+	},
+	OrgActionTransferOwnership: {
+		state.OrgRoleOwner: true,
+	},
+	OrgActionManageBilling: {
+		state.OrgRoleOwner:   true,
+		state.OrgRoleBilling: true,
+	},
+	OrgActionChangePlan: {
+		state.OrgRoleOwner: true,
+	},
+	OrgActionDelete: {
+		state.OrgRoleOwner: true,
+	},
+}
+
+// ActionAuthorizer is the contract every Store accessor must call
+// before mutating an org/membership/invitation. This is the seam
+// the PR 2 review-fix TODO comment in pkg/state/store.go references:
+//
+//	"Every org/membership/invitation accessor must be served
+//	 through pkg/authz.RequireOrgAction(action); the Store is
+//	 intentionally authz-unaware, and a handler that calls
+//	 these methods directly bypasses the org-membership check."
+//
+// The interface lets PR 5+ handlers compose with a stub in tests
+// without spinning up a real OrgResolver.
+type ActionAuthorizer interface {
+	AuthorizeOrgAction(ctx context.Context, action OrgAction) *api.Problem
+}
+
+// AuthorizeOrgAction returns nil if the active-org principal on ctx
+// has the role required for `action`, or a typed *api.Problem
+// otherwise. The 403 problem uses api.CodeOrgRoleForbidden
+// (PR-1-shipped at pkg/api/errors.go:594) with the action and the
+// caller's role in the detail string.
+//
+// Callers that don't compose LoadOrg (pre-PR-5 routes) get a 403 with
+// the action and a "<no active org>" detail — those routes should
+// reach AuthorizeOrgAction only when they are explicitly org-scoped
+// (PR 5 will own that gate).
+//
+// If `audit` is non-nil, denials emit an "authz.denied" audit row
+// keyed by the principal's account id (matching the key.expired /
+// key.auth_rejected_revoked pattern in pkg/auth/middleware/middleware.go:441-453).
+func AuthorizeOrgAction(ctx context.Context, action OrgAction, audit AuditEmitter) *api.Problem {
+	acct, _, mem, ok := principalFromCtx(ctx)
+	if !ok {
+		// Fail closed. Should never happen on a wired route —
+		// RequireSession runs before LoadOrg.
+		p := api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"AuthorizeOrgAction wired before RequireSession",
+			"no principal on context; check the route table")
+		emitAudit(ctx, audit, acct, action, p)
+		return p
+	}
+	if mem == nil {
+		// The route was reached but the caller didn't pass an
+		// X-Active-Org / ?org= hint. Treat as 403, not 404, so
+		// the wire shape is consistent across deny paths.
+		p := api.ErrOrgRoleForbidden(action.String())
+		emitAudit(ctx, audit, acct, action, p)
+		return p
+	}
+	allowed, known := allowRoleMatrix[action]
+	if !known {
+		// Defensive: every OrgAction should be in the matrix. A
+		// missing entry means a developer added an OrgAction
+		// constant without updating the matrix — fail closed so
+		// the omission surfaces in tests rather than silently
+		// allowing the action.
+		p := api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"Authorization table missing entry",
+			"action "+action.String()+" is not in the allowRoleMatrix; update pkg/authz/authorize.go")
+		emitAudit(ctx, audit, acct, action, p)
+		return p
+	}
+	if allowed[mem.Role] {
+		return nil
+	}
+	p := api.ErrOrgRoleForbidden(action.String())
+	emitAudit(ctx, audit, acct, action, p)
+	return p
+}
+
+// emitAudit is a tiny helper that no-ops when audit is nil so callers
+// don't need to nil-check at every site. Audit emission is opt-in per
+// call to keep the cost off the hot path until PR 5+ builds the
+// audit-row indexing it needs.
+func emitAudit(ctx context.Context, audit AuditEmitter, acct state.Account, action OrgAction, p *api.Problem) {
+	if audit == nil {
+		return
+	}
+	detail := ""
+	if p != nil {
+		detail = p.Detail
+	}
+	audit.Emit(ctx, "authz.denied", nil, map[string]any{
+		"action":      action.String(),
+		"account_id":  acct.ID,
+		"status":      p.Code,
+		"http_status": p.Status,
+		"detail":      detail,
+	})
+}
+
+// AuditEmitter is the minimal interface pkg/authz needs from the
+// audit package. Avoids importing pkg/audit directly so pkg/authz
+// stays testable without booting the audit daemon. The real
+// implementation is pkg/audit.EmitRow (or whatever the audit
+// package exposes — wired in cmd/apid/main.go).
+//
+// If you change this signature, also update the audit-fake in
+// authorize_test.go.
+type AuditEmitter interface {
+	Emit(ctx context.Context, event string, accountID *string, fields map[string]any)
+}
+
+// String renders OrgAction for log/problem-detail purposes. Stable
+// across renames (the wire form is the action's declared value).
+func (a OrgAction) String() string {
+	return string(a)
+}
+
+// RequireRole is the package-level helper for handlers that want to
+// short-circuit before doing any work. It mirrors pkg/auth/middleware's
+// RequireScope shape:
+//
+//	if p := authz.AuthorizeOrgAction(ctx, authz.OrgActionManageMembers, s.audit); p != nil {
+//	    api.WriteProblem(w, p)
+//	    return
+//	}
+//
+// is the canonical call shape. We do NOT export a separate
+// RequireRole wrapper because the return-and-write idiom is one line
+// and the explicit return value makes the audit-emission contract
+// visible to readers. PR 5 will land a small helper for the SSE
+// paths that need to flush before the body starts (those compose
+// the same call with a custom writer).
+
+// ActionAuthorizer is currently unused at runtime — handlers call
+// AuthorizeOrgAction(ctx, action, audit) directly. The interface
+// stays exported so PR 5+ handlers that want to inject a custom
+// audit emitter or a tenant-scoped policy override can declare an
+// ActionAuthorizer field without taking a dependency on the
+// package-level function signature. The interface contract is
+// enforced by authorize_test.go's fakeAudit-based deny-path
+// assertions; a future drift in the AuthorizeOrgAction method
+// shape surfaces as a compile error in the test file.

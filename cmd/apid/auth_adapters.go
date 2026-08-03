@@ -13,6 +13,7 @@ package main
 
 import (
 	"github.com/onebox-faas/faas/pkg/auth/middleware"
+	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -49,11 +50,24 @@ func auditorAsAuthAuditor(a *auditor) middleware.Auditor {
 
 type auditorAuthAdapter struct{ *auditor }
 
+// auditorAsAuthzAuditor returns authz.AuditEmitter as a view over
+// an *auditor. Issue #190 / IAM-6 / ADR-061 PR 4 — LoadOrg
+// (cmd/apid/auth_facade.go::loadOrg) emits authz.denied rows when
+// the membership lookup fails. The adapter is a free pass-through
+// because *auditor.Emit and authz.AuditEmitter.Emit share the same
+// (ctx, event, *string, map[string]any) signature.
+func auditorAsAuthzAuditor(a *auditor) authz.AuditEmitter {
+	return auditorAuthzAdapter{a}
+}
+
+type auditorAuthzAdapter struct{ *auditor }
+
 // Compile-time assertions: the adapters must satisfy the exported
-// pkg/auth interfaces. A future method added to either interface
-// surfaces as a compile error here.
+// pkg/auth + pkg/authz interfaces. A future method added to either
+// interface surfaces as a compile error here.
 var (
 	_ middleware.Authenticator = storeAuthAdapter{}
 	_ middleware.SessionLookup = storeAuthAdapter{}
 	_ middleware.Auditor       = auditorAuthAdapter{}
+	_ authz.AuditEmitter       = auditorAuthzAdapter{}
 )

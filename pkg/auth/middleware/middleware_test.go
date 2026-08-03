@@ -690,7 +690,7 @@ func TestRequireScope_BearerWithScopePasses(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := mkRequest("GET", "/v1/apps", nil, nil)
 	// Stamp a bearer principal carrying the required scope.
-	r = r.WithContext(authWithPrincipal(r.Context(), mkActiveAccount("acct-1"), &state.APIKey{Scopes: []string{api.ScopeAppsRead}}))
+	r = r.WithContext(authWithPrincipal(r.Context(), mkActiveAccount("acct-1"), &state.APIKey{Scopes: []string{api.ScopeAppsRead}}, nil))
 	h(rec, r, state.Account{ID: "acct-1"})
 
 	if hits != 1 {
@@ -707,7 +707,7 @@ func TestRequireScope_BearerWithWrongScopeForbidden(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	r := mkRequest("GET", "/v1/apps", nil, nil)
-	r = r.WithContext(authWithPrincipal(r.Context(), mkActiveAccount("acct-1"), &state.APIKey{Scopes: []string{"bogus"}}))
+	r = r.WithContext(authWithPrincipal(r.Context(), mkActiveAccount("acct-1"), &state.APIKey{Scopes: []string{"bogus"}}, nil))
 	h(rec, r, state.Account{ID: "acct-1"})
 
 	if hits != 0 {
@@ -731,7 +731,7 @@ func TestRequireScope_SessionCookieIsImplicitAdmin(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r := mkRequest("GET", "/v1/apps/x/secrets/list", nil, nil)
 	// Session-cookie principal: Key == nil.
-	r = r.WithContext(authWithPrincipal(r.Context(), mkActiveAccount("acct-1"), nil))
+	r = r.WithContext(authWithPrincipal(r.Context(), mkActiveAccount("acct-1"), nil, nil))
 	h(rec, r, state.Account{ID: "acct-1"})
 
 	if hits != 1 {

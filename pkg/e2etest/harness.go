@@ -983,6 +983,39 @@ func (h *Harness) SeedAccount(ctx context.Context, plan api.Plan, label ...strin
 	return pt
 }
 
+// SeedOrg creates a non-personal organization with the given name +
+// slug, adds accountID with role, and returns the org. Used by the
+// PR-4 LoadOrg e2e tests (cmd/e2e/load_org_e2e_test.go) to set up
+// the multi-org matrix; PR-5+ tests will reuse it for member +
+// invitation assertions.
+//
+// On slug collision (another subtest already used this slug) the
+// helper does NOT look up the existing org — that's the caller's
+// job via store.OrgBySlug. The h.Fatal on conflict keeps the
+// intent obvious in failing tests.
+//
+// Personal org (Personal: true) is rejected here — e2e tests that
+// need a personal org should call SeedAccount (which wraps
+// CreateAccountWithPersonalOrg) and read the slug off the result.
+func (h *Harness) SeedOrg(ctx context.Context, accountID, slug, name string, role state.OrgRole) state.Org {
+	h.T.Helper()
+	store := state.NewPgStore(h.Pool)
+	org, err := store.CreateOrg(ctx, state.Org{
+		Slug:     slug,
+		Name:     name,
+		Plan:     api.PlanFree,
+		Personal: false,
+		Status:   state.OrgStatusActive,
+	})
+	if err != nil {
+		h.T.Fatalf("e2etest: seed org %s: %v", slug, err)
+	}
+	if err := store.AddOrgMember(ctx, org.ID, accountID, role, nil); err != nil {
+		h.T.Fatalf("e2etest: add %s to org %s: %v", role, slug, err)
+	}
+	return org
+}
+
 // HTTPClient returns a client with a generous timeout. The e2e test's longest
 // single request is the deploy (imaged pull → rootfs build → snapshot), which
 // can take several seconds in CI; 30s leaves room.
