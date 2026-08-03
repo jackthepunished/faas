@@ -1916,6 +1916,15 @@ type Store interface {
 	// the customer-facing timeline endpoint can chain the two
 	// queries under the same cursor.
 	ListEventsBySidecar(ctx context.Context, sidecarName string, since time.Time, limit int) ([]Event, error)
+	// DeploymentSidecarRAMs (issue #463 / ADR-070 / PR-C) returns
+	// the per-deployment sidecar RAM slice from the jsonb column.
+	// Empty/nil when the deployment has no sidecars — matching the
+	// no-sidecar admission shape; BillableRAMMBWithSidecars collapses
+	// to the legacy single-arg helper in that case. Implementation
+	// lives at pkg/state/deployment_sidecar_rams.go on both
+	// PgStore and MemStore so schedd's Request builder and the
+	// meterd sampler share one read path.
+	DeploymentSidecarRAMs(ctx context.Context, deploymentID string) ([]int, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first
