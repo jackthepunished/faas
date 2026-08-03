@@ -72,11 +72,20 @@ type orgMeOrg struct {
 //     a real bug that surfaces in audit).
 func (s *server) whoamiActiveOrg(w http.ResponseWriter, r *http.Request, _ state.Account) {
 	mem, ok := authz.MembershipFrom(r)
-	if !ok {
+	if !ok || mem == nil {
 		// Apply the same {"org": null} passthrough that LoadOrg
 		// uses when neither the X-Active-Org header nor the ?org=
 		// query is set. Tested by TestE2E_LoadOrg_HeaderMiss
 		// (cmd/e2e/load_org_e2e_test.go).
+		//
+		// The mem == nil check is load-bearing: the principal's
+		// Membership slot is nil-stamped by RequireSession
+		// (pkg/auth/middleware/middleware.go:466, 531) and only
+		// mutated by LoadOrg on a successful resolve. MembershipFrom
+		// returns ok=true when the principal exists but the
+		// membership slot is nil — i.e. before LoadOrg ran. We
+		// treat that as the passthrough case so a header-miss
+		// request doesn't deref mem.OrgID.
 		writeOrgMeJSON(w, orgMeResponse{Org: nil})
 		return
 	}

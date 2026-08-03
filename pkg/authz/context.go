@@ -58,6 +58,16 @@ func fromContextRequest(ctx context.Context) (*http.Request, bool) {
 // means mem != nil. Callers MUST NOT add a defensive `mem == nil`
 // check on the ok==true branch.
 //
+// The defensive nil check below matters because RequireSession
+// stamps the principal with Membership: nil at
+// pkg/auth/middleware/middleware.go:466,531 — PrincipalFrom(r)
+// returns ok=true even when the membership slot is the zero value.
+// Returning (nil, false) for that case keeps the contract uniform:
+// "ok == true means mem != nil" is the only shape the rest of the
+// codebase can rely on. Callers that skip this seam (e.g. tests
+// constructing principals directly) get the same ok==false shape
+// the load-middleware-passthrough path returns.
+//
 // Authoritative for the 9 org actions defined in action.go — call
 // AuthorizeOrgAction(ctx, action, audit) instead of branching on
 // the membership role directly. The OrgRole read accessor exists
@@ -65,7 +75,7 @@ func fromContextRequest(ctx context.Context) (*http.Request, bool) {
 // /v1/orgs/me handler in cmd/apid/handlers_org_me.go).
 func MembershipFrom(r *http.Request) (*state.OrgMembership, bool) {
 	_, _, mem, ok := authmw.PrincipalFrom(r)
-	if !ok {
+	if !ok || mem == nil {
 		return nil, false
 	}
 	return mem, true
