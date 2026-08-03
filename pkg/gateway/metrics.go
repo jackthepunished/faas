@@ -258,6 +258,18 @@ type Metrics struct {
 	computeNodeChangedSubscriberAlive prometheus.Gauge
 }
 
+// Wake-snapshot-tier counter label set. The engine drives these
+// values (pkg/sched/engine.go::Wake writes warm / init / cold per
+// the resolved snapshot row); the gateway forwards them to the
+// dashboard panel "wake latency by snapshot-tier" (PR #470-FU-C
+// Grafana dashboard). Stable strings — renames here are a metric
+// break (deletion of series).
+const (
+	tierWarm = "warm"
+	tierInit = "init"
+	tierCold = "cold"
+)
+
 func NewMetrics() *Metrics {
 	reg := prometheus.NewRegistry()
 	m := &Metrics{
@@ -505,7 +517,7 @@ func NewMetrics() *Metrics {
 	// drives the actual value. To add a new tier (e.g. "cold"
 	// vs "lifecycle_init"): extend this slice; the metric name
 	// stays stable.
-	for _, tier := range []string{"warm", "init", "cold"} {
+	for _, tier := range []string{tierWarm, tierInit, tierCold} {
 		m.wakeSnapshotTier.WithLabelValues(tier)
 	}
 	// ADR-024 H3 follow-up (Finding 2): pre-instantiate the closed
@@ -721,7 +733,7 @@ func (m *Metrics) ObserveWakeSnapshotTier(tier string) {
 		return
 	}
 	if tier == "" {
-		tier = "init"
+		tier = tierInit
 	}
 	m.wakeSnapshotTier.WithLabelValues(tier).Inc()
 }

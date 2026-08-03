@@ -76,7 +76,7 @@ func (s *RunnerSignal) StartTime() time.Time { return s.startTime }
 
 // SignalReady should be called from the runner's response
 // middleware AFTER the handler returns a non-5xx status. Safe to
-// call on every request — the underlying sync.Once collapes
+// call on every request — the underlying sync.Once collapses
 // parallel calls into one (the engine's captureWarmSnapshot in
 // PR #470-FU-A waits on the SQL-column first-non-NULL row, not
 // on the wire signal itself, so an extra signal is a no-op).
