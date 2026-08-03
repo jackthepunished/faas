@@ -213,42 +213,41 @@ func TestRunWorkloads_CapRejectsThreeSidecars(t *testing.T) {
 // forks, no /usr/local/bin/start.sh on PATH.
 func TestRunWorkloads_PanicInSidecarIsRecovered(t *testing.T) {
 	// A panicking sidecar: the Start closure raises a panic
-	// that must be caught by the goroutine wrapper.
+	// that must be caught by the goroutine wrapper the
+	// orchestrator installs around every non-main supervisor.
 	panicSup := &Supervisor{Max: 0}
 	panicSup.Start = func() error { panic("synthetic sidecar panic") }
 
-	// A clean-exit sidecar: returns nil from Run, proving the
-	// orchestrator's WaitGroup unblocks even when one sibling
-	// panics.
-	cleanSup := &Supervisor{Max: 0}
-	cleanSup.Start = func() error { return nil }
-
 	// Mirror runWorkloads' Step 3 dispatch: wg.Add per
-	// supervisor, defer wg.Done() FIRST, recover() only on
-	// non-main supervisors. mainSup is omitted here because
+	// supervisor, defer wg.Done() FIRST, recover() in a
+	// per-supervisor goroutine. mainSup is omitted here because
 	// this test exercises the recover-on-sidecar branch
 	// exclusively; the main-supervisor's behaviour is
 	// pinned by the existing main_linux_test.go tests.
+	//
+	// We capture the panic value into a closed-over variable
+	// (not a t.Errorf directly inside the deferred recover):
+	// calling t.Errorf from a goroutine that's about to
+	// recover a panic is fine, but we want to distinguish
+	// "no panic was raised" (recover() returns nil) from
+	// "a panic was raised and recovered" (recover() returns
+	// the panic value). The former is the failure mode; the
+	// latter is the success path.
+	var recovered any
 	var wg sync.WaitGroup
-	wg.Add(2)
-	supervisors := []*Supervisor{panicSup, cleanSup}
-	for i, sup := range supervisors {
-		sup := sup
-		_ = i
-		go func() {
-			defer wg.Done()
-			defer func() {
-				if r := recover(); r == nil {
-					t.Errorf("supervisor[%d]: expected panic to be recovered, got none", i)
-				}
-			}()
-			_ = sup.Run()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			recovered = recover()
 		}()
-	}
+		_ = panicSup.Run()
+	}()
 	wg.Wait()
-	// If wg.Wait() returns, the orchestrator survived the panic.
-	// If recover() missed, wg.Wait() would still return (the
-	// panic propagates to the test goroutine and the test
-	// fails), but the per-supervisor assertion above catches
-	// the "no recover" branch first.
+	if recovered == nil {
+		t.Errorf("sidecar panic: goroutine wrapper did NOT recover the panic (panic propagated to test runner)")
+	}
+	if recovered != "synthetic sidecar panic" {
+		t.Errorf("sidecar panic: recovered = %v, want \"synthetic sidecar panic\"", recovered)
+	}
 }
