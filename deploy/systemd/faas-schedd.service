@@ -22,12 +22,18 @@ EnvironmentFile=/etc/faas/sealed.env
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
+# PrivateTmp=no + RuntimeDirectory=faas — see faas-vmmd.service for the
+# reasoning. Without dropping PrivateTmp, schedd.sock lands inside
+# schedd's per-mount-namespace tmpfs and imaged (which dials it) gets
+# `no such file or directory` (run 30839233808).
+PrivateTmp=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-ReadWritePaths=/var/log/faas
+ReadWritePaths=/run/faas /var/log/faas
+RuntimeDirectory=faas
+RuntimeDirectoryMode=0770
 
 [Install]
 WantedBy=multi-user.target
