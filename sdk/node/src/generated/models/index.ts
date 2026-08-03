@@ -144,6 +144,7 @@ export type { TrustedSigner } from './TrustedSigner.js';
 export type { UpdateAlertRuleRequest } from './UpdateAlertRuleRequest.js';
 export type { UpdateAppRequest } from './UpdateAppRequest.js';
 export type { UpdateCronRequest } from './UpdateCronRequest.js';
+export type { UpdateDeploymentRequest } from './UpdateDeploymentRequest.js';
 export type { UsageExportResponse } from './UsageExportResponse.js';
 export type { UsageResponse } from './UsageResponse.js';
 export type { UsageSummaryResponse } from './UsageSummaryResponse.js';

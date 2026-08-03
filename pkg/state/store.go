@@ -717,12 +717,12 @@ type Store interface {
 	// ConcurrencyForDeployment returns the live-instance count for a
 	// (app, deployment) pair — the sum of state IN ('RUNNING',
 	// 'WAKING', 'COLD_BOOTING'). Backed by the partial index added
-	// in migration 00130.
+	// in migration 00132.
 	ConcurrencyForDeployment(ctx context.Context, appID, deploymentID string) (int, error)
 	// UpdateDeploymentMinInstances stamps the per-deployment cold-wake
 	// floor (issue #557 closure / ADR-072). The handler validates
 	// against the parent app's plan ceiling before reaching this
-	// method; the DB CHECK constraint (migration 00129) is the
+	// method; the DB CHECK constraint (migration 00131) is the
 	// belt-and-suspenders bound. Returns the fresh row so the
 	// handler can build the response without a second round-trip.
 	UpdateDeploymentMinInstances(ctx context.Context, id string, min int) (Deployment, error)

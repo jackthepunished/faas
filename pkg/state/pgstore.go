@@ -3125,8 +3125,8 @@ func (s *PgStore) ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([
 // STOPPED do not count (they're shutting down or idle).
 //
 // Backed by the partial index `instances_app_deployment_idx`
-// (migration 00130) which restricts the index to the three live
-// states. A pre-00130 deploy has the index in place but the
+// (migration 00132) which restricts the index to the three live
+// states. A pre-00132 deploy has the index in place but the
 // instances.deployment_id column may be NULL on legacy rows — the
 // predicate `deployment_id = $2` excludes those rows from the
 // match, which under-counts but is safe (the trigger floors on
@@ -3154,7 +3154,7 @@ func (s *PgStore) ConcurrencyForDeployment(ctx context.Context, appID, deploymen
 //
 // The caller (apid) validates the value against the parent app's
 // plan ceiling (api.Plan.MaxMinInstances) before reaching this
-// method. The DB-level CHECK constraint (migration 00129) is the
+// method. The DB-level CHECK constraint (migration 00131) is the
 // belt-and-suspenders bound.
 func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, min int) (Deployment, error) {
 	row := s.pool.QueryRow(ctx, `

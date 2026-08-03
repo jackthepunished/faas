@@ -26,7 +26,7 @@ Three pieces remained vs. the literal issue acceptance criteria:
    the issue's wording is the audit kind downstream consumers grep for. We ship both
    for one release as a compat layer; a follow-up drops `floor.wake`.
 
-3. **00129 migration.** ADR-071 §Downstream files `00129_align_min_instances.sql` as
+3. **00131 migration.** ADR-071 §Downstream files `00131_align_min_instances.sql` as
    cleanup for divergent `apps.min_instances` vs `apps.scaling_policy->>'min_instances'`
    rows. The helper returns `max(column, jsonb)` so divergent rows behave correctly today
    (safer direction — billing and enforcement both see what the customer configured).
@@ -36,7 +36,7 @@ Three pieces remained vs. the literal issue acceptance criteria:
 ## Decisions
 
 1. **New `deployments.min_instances` column** with the inheritance default = 0 (=
-   "inherit from parent app"). The column lands in migration 00129 (the backfill
+   "inherit from parent app"). The column lands in migration 00131 (the backfill
    migration); the deployments table gains the column via the same ALTER TABLE pair
    as the apps.align_min_instances UPDATE so the migration set stays contiguous.
 
@@ -66,7 +66,7 @@ Three pieces remained vs. the literal issue acceptance criteria:
    one extra Emit per wake is the load-bearing change. A follow-up PR drops
    `floor.wake` after one release's downstream tooling migrates.
 
-7. **Migration `00129_apps_align_min_instances.sql`** lands in this PR (no longer a
+7. **Migration `00131_apps_align_min_instances.sql`** lands in this PR (no longer a
    follow-up). The backfill projects the legacy column into the jsonb on rows where
    the column is strictly greater than the jsonb; the inverse direction (jsonb > column)
    is untouched on purpose (the jsonb is the customer's explicit PATCH intent).
@@ -74,12 +74,15 @@ Three pieces remained vs. the literal issue acceptance criteria:
 ## Migration slot landscape (post-rebase)
 
 Main's highest migration slot is 00128 (events_sidecar_name_idx). PR #618 originally
-targeted 129 + 130 in this branch. After the rebase onto origin/main the slots are
-still 129 + 130 (the prior reservation fences at 124/125 from PR #618 land as part of
-PR #618's own embedded set; the new content at 129/130 is real, not a fence).
+targeted 129 + 130 in this branch, but PR #623 (iam-6 PR-6, open against main) has
+already claimed slot 129 (`00129_api_keys_org_bound.sql`). Per the cross-PR slot gate
+race memory (`migration-gates-collision-and-replay.md`), PR #618 renumbers to 131 + 132
+so the merge order does not matter — goose would 42P07 "duplicate version 129" on
+whichever PR lands second. The prior reservation fences at 124/125 from PR #618 land
+as part of PR #618's own embedded set; the new content at 131/132 is real, not a fence.
 
-* 00129: `apps_align_min_instances.sql` (backfill)
-* 00130: `instances_app_deployment_idx.sql` (partial index)
+* 00131: `apps_align_min_instances.sql` (backfill)
+* 00132: `instances_app_deployment_idx.sql` (partial index)
 
 ## Failure modes
 
@@ -88,7 +91,7 @@ PR #618's own embedded set; the new content at 129/130 is real, not a fence).
 | Customer deploys with no override; trigger wakes N extra instances on first tick | Expected behaviour (ADR-060 "billed from t=0"); release note + dashboard banner |
 | Customer pins `deployments.min_instances=5` and `apps.min_instances=10` | Effective = 10; the trigger honours the higher; meter bills at 10 |
 | Customer pins `deployments.min_instances=8` on Free plan | PATCH handler returns 422 plan_min_instances_not_allowed |
-| Pre-00129 rows with NULL `instances.deployment_id` | `ConcurrencyForDeployment` predicate `deployment_id = $2` excludes NULL rows; under-counts but safe (engine backstop) |
+| Pre-00131 rows with NULL `instances.deployment_id` | `ConcurrencyForDeployment` predicate `deployment_id = $2` excludes NULL rows; under-counts but safe (engine backstop) |
 | Trigger walks `ListAllDeployments` on a fleet > 100 apps × 10 deploys | Same planner index plan as `ListAllApps`; sub-10ms at v1 scale |
 
 ## Security
@@ -143,7 +146,7 @@ schema migration is replay-safe per ADR-041.
 
 ## Downstream
 
-* Migration 00129 lives here; migration 00130 (instances_app_deployment_idx) is the
+* Migration 00131 lives here; migration 00132 (instances_app_deployment_idx) is the
   partial index backing `ConcurrencyForDeployment`.
 * `instances.deployment_id` is already populated by `pkg/state/pgstore.go::CreateInstance`
   (line 5250 — INSERT includes `deployment_id`). No backfill needed.

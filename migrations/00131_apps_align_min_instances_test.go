@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00129 (ADR-071 §Downstream / issue #557
+// Migration-apply test for 00131 (ADR-071 §Downstream / issue #557
 // closure — apps.align_min_instances backfill). Pins:
 //
-//  1. The migration set applies cleanly through 00129.
+//  1. The migration set applies cleanly through 00131.
 //  2. Pre-migration: an app row with (col=3, jsonb={min_instances:0})
 //     has divergent sources; the helper returns max()=3.
 //  3. Post-migration: the same row has (col=3, jsonb={min_instances:3})
@@ -16,10 +16,10 @@
 //
 // Slot note: slot 128 is the highest existing on the rebased branch
 // (00128_events_sidecar_name_idx). PR #618 originally claimed slots
-// 129/130 then renumbered (per cross-PR fence pattern memory) — the
-// fence at slot 124 from PR-A is unchanged. This test pins 00129's
-// apply + backfill; renumber would need filename + test name +
-// apply range bump together.
+// 129/130 then renumbered past PR #623's slot 129 (per cross-PR slot
+// gate race memory) — the fence at slot 124 from PR-A is unchanged.
+// This test pins 00131's apply + backfill; renumber would need
+// filename + test name + apply range bump together.
 package migrations_test
 
 import (
@@ -30,27 +30,27 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
+func TestMigrations_00131_AppsAlignMinInstances(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00129. A regression that drops a slot
-	// between 1 and 128 surfaces here before the per-assertion pins.
+	// (1) Apply through 00131. A regression that drops a slot
+	// between 1 and 130 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 128)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 130)", err)
 	}
 
-	// Seed three divergent app rows BEFORE the 00129 UPDATE runs by
+	// Seed three divergent app rows BEFORE the 00131 UPDATE runs by
 	// writing them post-MigrateUp — the migration itself only
 	// matches rows where col > jsonb, so we then exercise both the
 	// (col > jsonb) and (jsonb >= col) directions on the same schema
-	// state. The ApplyUp range above includes 00129 already, so the
+	// state. The ApplyUp range above includes 00131 already, so the
 	// backfill has run; we seed divergent rows, verify the helper's
 	// read-side returns max(), and re-run the migration's UPDATE
 	// verbatim (mirroring the production predicate) to assert the
 	// forward projection.
 	//
-	// Why post-00129 seeding instead of pre-migration seeding: the
+	// Why post-00131 seeding instead of pre-migration seeding: the
 	// shape we want to pin is "after the migration, divergent rows
 	// are aligned" — re-deriving that pre/post invariant requires
 	// two schema states which goose's MigrateUp doesn't expose in
@@ -64,18 +64,18 @@ func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
 	// renumber chains but these are fixture ids not slot numbers).
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
-		values ('00000000-0000-0000-0000-000000000129', 'scale', 'align-test@example.com')
+		values ('00000000-0000-0000-0000-000000000131', 'scale', 'align-test@example.com')
 	`); err != nil {
 		t.Fatalf("seed accounts: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, min_instances, scaling_policy)
 		values
-		  ('00000000-0000-0000-0000-000000000129', '00000000-0000-0000-0000-000000000129',
+		  ('00000000-0000-0000-0000-000000000131', '00000000-0000-0000-0000-000000000131',
 		   'align-test', 3, '{"min_instances":0}'::jsonb),
-		  ('00000000-0000-0000-0000-000000000229', '00000000-0000-0000-0000-000000000129',
+		  ('00000000-0000-0000-0000-000000000231', '00000000-0000-0000-0000-000000000131',
 		   'align-noop', 0, '{}'::jsonb),
-		  ('00000000-0000-0000-0000-000000000329', '00000000-0000-0000-0000-000000000129',
+		  ('00000000-0000-0000-0000-000000000331', '00000000-0000-0000-0000-000000000131',
 		   'align-jsonb-wins', 1, '{"min_instances":5}'::jsonb)
 	`); err != nil {
 		t.Fatalf("seed apps: %v", err)
@@ -90,7 +90,7 @@ func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
 	var divergent int
 	if err := pool.QueryRow(ctx, `
 		select min_instances from apps
-		where id = '00000000-0000-0000-0000-000000000129'
+		where id = '00000000-0000-0000-0000-000000000131'
 	`).Scan(&divergent); err != nil {
 		t.Fatalf("read divergent col: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
 	var divergentJSONB int
 	if err := pool.QueryRow(ctx, `
 		select (scaling_policy->>'min_instances')::int from apps
-		where id = '00000000-0000-0000-0000-000000000129'
+		where id = '00000000-0000-0000-0000-000000000131'
 	`).Scan(&divergentJSONB); err != nil {
 		t.Fatalf("read divergent jsonb: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
 	// The max() invariant collapses to (col, jsonb) = (3, 3).
 	if err := pool.QueryRow(ctx, `
 		select (scaling_policy->>'min_instances')::int from apps
-		where id = '00000000-0000-0000-0000-000000000129'
+		where id = '00000000-0000-0000-0000-000000000131'
 	`).Scan(&divergentJSONB); err != nil {
 		t.Fatalf("read post-backfill jsonb: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
 	var noopJSONB string
 	if err := pool.QueryRow(ctx, `
 		select min_instances, scaling_policy::text from apps
-		where id = '00000000-0000-0000-0000-000000000229'
+		where id = '00000000-0000-0000-0000-000000000231'
 	`).Scan(&noopCol, &noopJSONB); err != nil {
 		t.Fatalf("read noop row: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestMigrations_00129_AppsAlignMinInstances(t *testing.T) {
 	var intentJSONB int
 	if err := pool.QueryRow(ctx, `
 		select min_instances, (scaling_policy->>'min_instances')::int from apps
-		where id = '00000000-0000-0000-0000-000000000329'
+		where id = '00000000-0000-0000-0000-000000000331'
 	`).Scan(&intentCol, &intentJSONB); err != nil {
 		t.Fatalf("read intent row: %v", err)
 	}

@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply test for 00130 (issue #557 closure / ADR-072 —
+// Migration-apply test for 00132 (issue #557 closure / ADR-072 —
 // instances_app_deployment_idx partial index backing the per-deployment
 // concurrency SELECT). Pins:
 //
-//  1. The migration set applies cleanly through 00130.
+//  1. The migration set applies cleanly through 00132.
 //  2. The index exists and is a partial index restricted to the three
 //     live states (RUNNING, WAKING, COLD_BOOTING).
 //  3. The index keys on (app_id, deployment_id) — prefix matches the
@@ -13,7 +13,7 @@
 //     must mention the index, NOT a Seq Scan on instances).
 //  5. Replay-safety: a second MigrateUp is a no-op.
 //
-// Slot note: 00129 is the previous slot in this branch's embedded set;
+// Slot note: 00131 is the previous slot in this branch's embedded set;
 // renumber would need filename + test name + apply range bump together.
 package migrations_test
 
@@ -26,13 +26,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00130_InstancesAppDeploymentIdx(t *testing.T) {
+func TestMigrations_00132_InstancesAppDeploymentIdx(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00130.
+	// (1) Apply through 00132.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 129)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 131)", err)
 	}
 
 	// (2) Index existence. pg_indexes scoping uses current_schema()
@@ -80,30 +80,30 @@ func TestMigrations_00130_InstancesAppDeploymentIdx(t *testing.T) {
 	// Scan on instances would surface here.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
-		values ('00000000-0000-0000-0000-000000000130', 'scale', 'idx-test@example.com')
+		values ('00000000-0000-0000-0000-000000000132', 'scale', 'idx-test@example.com')
 	`); err != nil {
 		t.Fatalf("seed accounts: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug)
-		values ('00000000-0000-0000-0000-000000000130',
-		        '00000000-0000-0000-0000-000000000130',
+		values ('00000000-0000-0000-0000-000000000132',
+		        '00000000-0000-0000-0000-000000000132',
 		        'idx-test')
 	`); err != nil {
 		t.Fatalf("seed apps: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (id, app_id, kind, source_path, source_bytes, status, image_digest)
-		values ('00000000-0000-0000-0000-000000000130',
-		        '00000000-0000-0000-0000-000000000130',
+		values ('00000000-0000-0000-0000-000000000132',
+		        '00000000-0000-0000-0000-000000000132',
 		        'tarball', '/tmp/test.tar', 0, 'ready', 'sha256:0')
 	`); err != nil {
 		t.Fatalf("seed deployments: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into instances (app_id, deployment_id, state, ram_mb, node_id, wake_id, started_at)
-		values ('00000000-0000-0000-0000-000000000130',
-		        '00000000-0000-0000-0000-000000000130',
+		values ('00000000-0000-0000-0000-000000000132',
+		        '00000000-0000-0000-0000-000000000132',
 		        'RUNNING', 256, 'node-1', 'wake-1', now())
 	`); err != nil {
 		t.Fatalf("seed instances row: %v", err)
@@ -113,8 +113,8 @@ func TestMigrations_00130_InstancesAppDeploymentIdx(t *testing.T) {
 		select count(*) from instances
 		where app_id = $1 and deployment_id = $2
 		  and state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
-	`, "00000000-0000-0000-0000-000000000130",
-		"00000000-0000-0000-0000-000000000130")
+	`, "00000000-0000-0000-0000-000000000132",
+		"00000000-0000-0000-0000-000000000132")
 	if err != nil {
 		t.Fatalf("explain: %v", err)
 	}

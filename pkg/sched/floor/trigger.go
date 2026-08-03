@@ -223,7 +223,7 @@ type backoffEntry struct {
 // via New(); the only public methods are Tick, Interval, and
 // WithOwnerNodeID.
 type Trigger struct {
-	appStore       AppStore
+	appStore        AppStore
 	deploymentStore DeploymentStore
 	ledger          Ledger
 	engine          Engine
@@ -271,7 +271,7 @@ func New(appStore AppStore, deploymentStore DeploymentStore, ledger Ledger, engi
 		opts.Interval = api.FloorDecisionIntervalSeconds * time.Second
 	}
 	return &Trigger{
-		appStore:       appStore,
+		appStore:        appStore,
 		deploymentStore: deploymentStore,
 		ledger:          ledger,
 		engine:          engine,

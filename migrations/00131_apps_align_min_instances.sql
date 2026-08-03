@@ -1,4 +1,4 @@
--- filename: 00129_apps_align_min_instances.sql
+-- filename: 00131_apps_align_min_instances.sql
 -- +goose Up
 
 -- ADR-071 §Downstream / issue #557 closure cleanup. Project the

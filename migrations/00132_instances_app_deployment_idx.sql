@@ -1,4 +1,4 @@
--- filename: 00130_instances_app_deployment_idx.sql
+-- filename: 00132_instances_app_deployment_idx.sql
 -- +goose Up
 -- +goose StatementBegin
 

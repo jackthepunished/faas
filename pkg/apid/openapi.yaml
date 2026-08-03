@@ -1942,10 +1942,21 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentResponse'
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: |
+            `400 Bad Request` — request body failed JSON decode or
+            `min_instances` was outside the inclusive `[0, plan_cap]`
+            range. Stable code `min_instances_invalid`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — request was syntactically valid
+            but the parent app's plan refuses the override (e.g. a
+            Free app PATCHing `min_instances=1`). Stable code
+            `plan_min_instances_not_allowed`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/deployments/{id}/logs:
@@ -4960,7 +4971,7 @@ components:
         min_instances:
           type: integer
           minimum: 0
-          description: "Per-deployment cold-wake floor override. 0 = inherit from parent app."
+          description: "Per-deployment cold-wake floor override for PATCH /v1/deployments/{id}. 0 = inherit from parent app; positive value is the deployment's own floor. Effective per-instance floor = max(app, deployment). Validated against the parent app's plan MaxMinInstances cap."
 
     DeploymentListResponse:
       description: "Paginated deployment list with a `next_before` cursor for backward pagination."

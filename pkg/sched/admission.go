@@ -35,10 +35,10 @@ import (
 // because each reservation remembers its nodeID.
 type NodeLedger struct {
 	mu               sync.Mutex
-	resident         map[string]*nodeReservation         // node_id -> accounting (per-node ceiling check)
-	perApp           map[string]int                      // app_id -> instances counting toward concurrency (global, §6.2-1)
-	perAppDeployment map[string]int                      // app_id|"\x00"|deployment_id -> per-deployment concurrency (ADR-072, issue #557 closure)
-	entries          map[string]*reservation             // instance_id -> reservation (cross-node lookup for Release)
+	resident         map[string]*nodeReservation // node_id -> accounting (per-node ceiling check)
+	perApp           map[string]int              // app_id -> instances counting toward concurrency (global, §6.2-1)
+	perAppDeployment map[string]int              // app_id|"\x00"|deployment_id -> per-deployment concurrency (ADR-072, issue #557 closure)
+	entries          map[string]*reservation     // instance_id -> reservation (cross-node lookup for Release)
 }
 
 type nodeReservation struct {
@@ -53,12 +53,12 @@ type nodeReservation struct {
 // the box-wide counter in that case so the migration is non-breaking
 // for tests that don't plumb node IDs.
 type reservation struct {
-	appID         string
-	deploymentID  string // empty = legacy pre-#557 reservations (test seams); populated post-#557 via Admit's DeploymentID field
-	nodeID        string // empty = legacy box-wide accounting (test seams)
-	admissionMB   int    // ram_mb + PerVMOverheadMB
-	vcpu          int
-	countsConc    bool // still in {WAKING,COLD_BOOTING,RUNNING}
+	appID        string
+	deploymentID string // empty = legacy pre-#557 reservations (test seams); populated post-#557 via Admit's DeploymentID field
+	nodeID       string // empty = legacy box-wide accounting (test seams)
+	admissionMB  int    // ram_mb + PerVMOverheadMB
+	vcpu         int
+	countsConc   bool // still in {WAKING,COLD_BOOTING,RUNNING}
 }
 
 // NewNodeLedger returns an empty per-node ledger. Backwards-compat
@@ -80,8 +80,8 @@ func NewLedger() *NodeLedger { return NewNodeLedger() }
 
 // Request is an admission request for one instance (a wake or a build).
 type Request struct {
-	Instance       string
-	AppID          string
+	Instance string
+	AppID    string
 	// DeploymentID is the target deployment for the wake (ADR-072 /
 	// issue #557 closure). The Engine resolves it from the wake
 	// target before calling Admit — the gateway passes the latest

@@ -48,5 +48,9 @@ export type DeploymentResponse = {
    * Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a bare TCP accept.
    */
   override_healthcheck?: (DeploymentHealthcheck | null);
+  /**
+   * Per-deployment cold-wake floor override (issue #557 closure / ADR-072). 0 = inherit from parent app (default); positive value is the deployment's own floor. Effective per-instance floor = max(app.EffectiveMinInstances(), d.EffectiveMinInstances()). Validated against the parent app's plan MaxMinInstances cap on PATCH.
+   */
+  min_instances?: number;
 };
 
