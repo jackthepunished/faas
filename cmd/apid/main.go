@@ -576,7 +576,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("apid: load host age recipient %q: %w", recipientPath, err)
 		}
 		setSecretRecipient = func() *age.X25519Recipient { return r }
-		// Issue #463 / ADR-066: the sidecar seal helper reuses the
+		// Issue #463 / ADR-068: the sidecar seal helper reuses the
 		// same host age recipient (one age identity per host). A
 		// separate getter keeps the seal helpers testable in
 		// isolation without leaking the secret-handler test seam.

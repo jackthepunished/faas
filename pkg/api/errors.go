@@ -339,7 +339,7 @@ const (
 	// --max-concurrency").
 	CodeInvalidMinInstances = "invalid_min_instances"
 
-	// Sidecar containers (issue #463 / ADR-066). Eight RFC 7807
+	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
 	// codes are the load-bearing 400-class shapes; the stateful
 	// and not-on-plan codes are defence-in-depth for future
@@ -1384,7 +1384,7 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 }
 
 // ErrSidecarCapExceeded is returned when the request carries more
-// than SidecarCapMax sidecars (issue #463 / ADR-066 §Decision 1).
+// than SidecarCapMax sidecars (issue #463 / ADR-068 §Decision 1).
 // 400 because the request shape is wrong; the cap is the load-bearing
 // invariant. The schema CHECK on `deployments.sidecars` is the
 // second-line defence; this error surfaces before that check
@@ -1392,7 +1392,7 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 func ErrSidecarCapExceeded(seen, cap int) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSidecarCapExceeded,
 		"Too many sidecars",
-		fmt.Sprintf("request carried %d sidecars; the cap is %d (issue #463 / ADR-066 §Decision 1).", seen, cap)).
+		fmt.Sprintf("request carried %d sidecars; the cap is %d (issue #463 / ADR-068 §Decision 1).", seen, cap)).
 		WithLimit(int64(cap), int64(seen)).
 		WithDocs("https://docs.gregale.dev/sidecars#cap")
 }
@@ -1413,7 +1413,7 @@ func ErrSidecarInvalidType(name, got string) *Problem {
 }
 
 // ErrSidecarInvalidImage is returned when the sidecar image is not
-// digest-pinned (issue #463 / ADR-066 §Decision 5). Tag-pinning is
+// digest-pinned (issue #463 / ADR-068 §Decision 5). Tag-pinning is
 // the documented OCI supply-chain attack vector; the runtime
 // already enforces this; the API gate surfaces a useful error at
 // the client side.
@@ -1430,14 +1430,14 @@ func ErrSidecarInvalidImage(name string, err error) *Problem {
 // dedicated infra, not FaaS.
 //
 // Deprecated for new callers: prefer ErrSidecarStatefulDeniedWithHint
-// (issue #463 / ADR-066 §Decision 4 followup), which surfaces the
+// (issue #463 / ADR-068 §Decision 4 followup), which surfaces the
 // remediation hint from pkg/statefuldenylist.Set in the RFC 7807
 // Detail field. Kept for symmetry with the existing pkg/imaged
 // surface that takes (name, image) only.
 func ErrSidecarStatefulDenied(name, image string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
 		"Stateful sidecar image is not allowed",
-		fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-066 §Decision 4).", name, image)).
+		fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)).
 		WithDocs("https://docs.gregale.dev/sidecars#stateless")
 }
 
@@ -1453,7 +1453,7 @@ func ErrSidecarStatefulDenied(name, image string) *Problem {
 // sidecar + image even when the Set row has no remediation copy —
 // defence against a future Set entry being added without a hint).
 func ErrSidecarStatefulDeniedWithHint(name, image, hint string) *Problem {
-	detail := fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-066 §Decision 4).", name, image)
+	detail := fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)
 	if hint != "" {
 		detail += " Remediation: " + hint + "."
 	}
@@ -1493,14 +1493,14 @@ func ErrSidecarInvalidRamMB(ramMB int) *Problem {
 
 // ErrSidecarNotAllowedOnPlan is reserved for a future per-plan
 // gate (PR-A does NOT apply this gate — the global SidecarCapMax
-// is the load-bearing surface; see ADR-066 §Decision 1). The
+// is the load-bearing surface; see ADR-068 §Decision 1). The
 // constructor exists so a follow-up PR doesn't have to invent
 // a new code. 403 because it's a plan-tier decision, not a
 // shape violation.
 func ErrSidecarNotAllowedOnPlan(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodeSidecarNotAllowedOnPlan,
 		"Plan doesn't allow sidecars",
-		fmt.Sprintf("the %s plan doesn't allow sidecars (issue #463 / ADR-066).", p)).
+		fmt.Sprintf("the %s plan doesn't allow sidecars (issue #463 / ADR-068).", p)).
 		WithDocs("https://docs.gregale.dev/plans#sidecars")
 }
 

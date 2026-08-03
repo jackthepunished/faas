@@ -412,7 +412,7 @@ type AppResponse struct {
 }
 
 // Sidecars is the array shape on `CreateDeploymentRequest.Sidecars`
-// (issue #463 / ADR-066). Defined as a named slice so callers can
+// (issue #463 / ADR-068). Defined as a named slice so callers can
 // pin the `Validate(limits)` method (Go does not allow defining
 // methods on `[]T` directly, but `type T []Foo` makes the method
 // attach to the named alias). See Sidecar / Sidecars.Validate
@@ -440,7 +440,7 @@ type CreateDeploymentRequest struct {
 	// tarball deploys ignore this field (Railpack path bypasses the
 	// verify hook entirely).
 	RequireSigned *bool `json:"require_signed,omitempty"`
-	// Sidecars (issue #463 / ADR-066) attaches up to 2 stateless
+	// Sidecars (issue #463 / ADR-068) attaches up to 2 stateless
 	// sidecars (1 init + 1 sidecar) to the deployment. nil/empty
 	// = no sidecars. PR-A persists the field; PR-B wires the
 	// runtime effect (imaged + fcvm + guest-init + cgroup); PR-C
@@ -2028,7 +2028,7 @@ type AppSecurityResponse struct {
 }
 
 // SidecarType is the closed enum on Sidecar.Type (issue #463 /
-// ADR-066 §Decision 1). The 2-sidecar cap is enforced as 1 init +
+// ADR-068 §Decision 1). The 2-sidecar cap is enforced as 1 init +
 // 1 sidecar per deployment — `Sidecars.Validate` rejects any other
 // shape (e.g. 2 init) with `ErrSidecarInvalidType`.
 type SidecarType string
@@ -2063,7 +2063,7 @@ var sidecarNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 var sidecarImageRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}$`)
 
 // Sidecar is one entry in the deploy request's `sidecars` array
-// (issue #463 / ADR-066). At most one with type=init and at most
+// (issue #463 / ADR-068). At most one with type=init and at most
 // one with type=sidecar per app (the 2-sidecar hard cap, enforced
 // by `Sidecars.Validate` + the schema CHECK on
 // `deployments.sidecars` in migration 00095).
@@ -2125,7 +2125,7 @@ type Sidecar struct {
 	Essential *bool `json:"essential,omitempty"`
 }
 
-// Validate enforces ADR-066 §Decisions 1, 2, 4, 5: name grammar,
+// Validate enforces ADR-068 §Decisions 1, 2, 4, 5: name grammar,
 // digest-pinning, type ∈ {init, sidecar}, cmd element non-empty,
 // env key grammar + per-value byte cap, port 0/absent or 1..65535,
 // ram_mb 0/inherit or 32..512, stateful denylist.
@@ -2144,7 +2144,7 @@ func (s *Sidecar) Validate(limits Limits) *Problem {
 		return ErrSidecarInvalidImage(s.Name,
 			fmt.Errorf("not a digest-pinned reference (got %q)", s.Image))
 	}
-	// Stateful denylist gate (ADR-066 §Decision 4). The image is
+	// Stateful denylist gate (ADR-068 §Decision 4). The image is
 	// already digest-pinned above, so the reference shape is
 	// `repo@sha256:...`; the statefuldenylist matcher strips the
 	// digest suffix + any registry hostname and probes every path

@@ -364,19 +364,24 @@ const testDomain = "apps.test.example"
 //   - 94 → 110 after PR #533 (Tier A5 cross-node live-instance
 //     migration, ADR-066) merged real migrations at 00103 +
 //     00104, then PR #536 (iam-6 personal-org backfill) merged
-//     real at 00105. The renumber commits in this branch's history
-//     (101/102 → 103/104 → 105/106 → 107/108 → 109/110) collided
-//     with main's new files, so all five were dropped on rebase
-//     (the work is now collapsed into a single post-rebase commit).
-//     The branch renumbered 00101 → 00109 + 00102 → 00110 past
-//     main's new head at 105; the 106-108 gap is filled by
-//     reserve_slot.sql fences at 00106/00107/00108 per ADR-041 so
-//     the embedded FS stays contiguous 1..110. (Slot 00105 is owned
-//     by main's 00105_personal_org_backfill.sql — no fence needed
-//     there.) Open PRs claim: 00101 (PR #531 issue #463 sidecars),
-//     00107 (PR #532 issue #517 PR-C canonical wake timeline) —
-//     none overlap with 00109/00110.
-const e2eMigrationTarget = 110
+//     real at 00105, then PR #525 (issue #470 M8 warm snapshot)
+//     merged real at 00109 + 00110, then PR #539 (iam-5 key
+//     expiry) merged real at 00115 (renumbered 00106 → 00115 on
+//     its branch), then PR #538 (Tier A6 migrating watchdog)
+//     merged real at 00114, then PR #532 (issue #517 PR-C)
+//     merged real at 00107. The renumber commits in this
+//     branch's history (101/102 → 103/104 → 105/106 → 107/108 →
+//     109/110 → 111 → 112 → 116) collided with main's new files,
+//     so all eight were dropped on rebase (the work is now
+//     collapsed into a single post-rebase commit). The branch
+//     renumbered 00101 → 00116 past main's new head at 115; the
+//     106-108 gap is filled by reserve_slot.sql fences at
+//     00106/00107/00108 per ADR-041 so the embedded FS stays
+//     contiguous 1..116. (Slots 00105/00109/00110/00114/00115
+//     are owned by main's real migrations — no fence needed
+//     there.) PR #531 (issue #463 sidecars) claims 00116. No
+//     open PR overlaps with 00116.
+const e2eMigrationTarget = 116
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

@@ -898,7 +898,7 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
-// API-key lifetime (issue #189 / IAM-5). New non-admin keys
+	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
 	// 365 days is the issue-189 spec: long enough to be
 	// "set-and-forget" for a customer's CI rotation, short enough
@@ -1025,7 +1025,7 @@ const (
 	RebalanceCooldownSeconds   = 60
 	RebalanceMaxPerTickPerNode = 50
 
-	// Tier A5 (cross-node live-instance migration, ADR-066
+	// Tier A5 (cross-node live-instance migration, ADR-068
 	// follow-up to ADR-064): pacing + lease window on
 	// pkg/sched/migration_handoff.go.
 	//
@@ -1056,7 +1056,7 @@ const (
 	MigrateLiveLeaseSeconds = 90
 
 	// Tier A6 (migrating-instance watchdog, ADR-067 follow-up to
-	// ADR-066): self-heal stuck state='migrating' rows that
+	// ADR-068): self-heal stuck state='migrating' rows that
 	// never committed (the new owner vmmd died mid-handoff, the
 	// network partition dropped the gRPC, the operator killed
 	// the new owner before the commit). The watchdog is the
@@ -1336,7 +1336,7 @@ func (p Plan) MaxInstancesAllowed() bool {
 	return l.MaxInstancesAllowed
 }
 
-// SidecarAllowed (issue #463 / ADR-066 §Decision 1) reports whether
+// SidecarAllowed (issue #463 / ADR-068 §Decision 1) reports whether
 // the plan may attach sidecars to a deployment. PR-A's accessor
 // returns true for every plan — the load-bearing gate is the GLOBAL
 // `SidecarCapMax` constant, not a per-plan matrix. A future PR
@@ -1755,7 +1755,7 @@ func BillableRAMMB(ramMB int) int {
 }
 
 // BillableRAMMBWithSidecars is the sidecar-shape variant of
-// BillableRAMMB (issue #463 / ADR-066 §Decision 6). The billable
+// BillableRAMMB (issue #463 / ADR-068 §Decision 6). The billable
 // shutter is `plan.RAMMB + Σ(sidecar.ram_mb) + PerVMOverheadMB`:
 // sidecars share the per-VM overhead (one netns, one cgroup
 // scope per instance), but each sidecar contributes its own

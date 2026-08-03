@@ -1,16 +1,16 @@
 //go:build !no_pg
 
 // pgstore_sidecars_test.go — round-trip tests for the sidecars
-// jsonb column added by migration 00095 (issue #463 / ADR-066).
+// jsonb column added by migration 00116 (issue #463 / ADR-068).
 //
 // Build tag: !no_pg matches the rest of the pgstore-side tests; set
 // FAAS_SKIP_PG_TESTS=1 to opt out locally without rebuilding.
 package state_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -56,6 +56,7 @@ func TestPgStore_Deployment_Sidecars_JSONRoundTrip(t *testing.T) {
 
 	dep, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID:       app.ID,
+		Kind:        state.DeploymentKindImage,
 		ImageDigest: "sha256:sidecars",
 		Sidecars:    raw,
 	})
@@ -67,7 +68,13 @@ func TestPgStore_Deployment_Sidecars_JSONRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeploymentByID: %v", err)
 	}
-	if !bytes.Equal(got.Sidecars, raw) {
+	// PG's jsonb normalises key order + whitespace; a raw
+	// bytes.Equal never holds. We decode both sides through
+	// json.Unmarshal and compare with reflect.DeepEqual, which
+	// is correct for the JSON value semantics (unordered keys,
+	// numeric equivalence, …). The `interface{} == interface{}`
+	// shortcut panics on uncomparable kinds (slices, maps).
+	if !reflect.DeepEqual(decodeJSONB(t, got.Sidecars), decodeJSONB(t, raw)) {
 		t.Errorf("Sidecars round-trip drifted\n  got:  %s\n  want: %s", got.Sidecars, raw)
 	}
 }
@@ -89,6 +96,7 @@ func TestPgStore_Deployment_Sidecars_NilDefaultsToEmptyArray(t *testing.T) {
 
 	dep, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID:       app.ID,
+		Kind:        state.DeploymentKindImage,
 		ImageDigest: "sha256:no-sidecars",
 	})
 	if err != nil {
@@ -99,9 +107,22 @@ func TestPgStore_Deployment_Sidecars_NilDefaultsToEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeploymentByID: %v", err)
 	}
-	if !bytes.Equal(bytes.TrimSpace(got.Sidecars), []byte(`[]`)) {
+	if !reflect.DeepEqual(decodeJSONB(t, got.Sidecars), []interface{}{}) {
 		t.Errorf("Sidecars default = %s; want []", got.Sidecars)
 	}
+}
+
+// decodeJSONB unmarshals a jsonb raw payload into an
+// `interface{}` so the round-trip and default assertions can use
+// reflect.DeepEqual (PG's jsonb normalises key order + whitespace,
+// which makes bytes.Equal a wrong primitive here).
+func decodeJSONB(t *testing.T, raw []byte) interface{} {
+	t.Helper()
+	var out interface{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode JSONB %q: %v", raw, err)
+	}
+	return out
 }
 
 // TestPgStore_Deployment_Sidecars_2CapRejection pins the schema-level
@@ -117,6 +138,7 @@ func TestPgStore_Deployment_Sidecars_2CapRejection(t *testing.T) {
 
 	if _, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID:       app.ID,
+		Kind:        state.DeploymentKindImage,
 		ImageDigest: "sha256:setup-2cap",
 	}); err != nil {
 		t.Fatalf("setup CreateDeployment: %v", err)

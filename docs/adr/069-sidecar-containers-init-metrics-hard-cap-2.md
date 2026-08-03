@@ -1,4 +1,8 @@
+<<<<<<<< HEAD:docs/adr/069-sidecar-containers-init-metrics-hard-cap-2.md
 # ADR-069 — Sidecar containers: init + metrics (issue #463)
+========
+# ADR-068 — Sidecar containers: init + metrics (issue #463)
+>>>>>>>> 2b8e996c (fix(sidecars): PR #531 post-rebase renumber 95→116 + ADR-066→068):docs/adr/068-sidecar-containers-init-metrics-hard-cap-2.md
 
 - **Status:** proposed
 - **Date:** 2026-08-02
@@ -284,8 +288,13 @@ acceptance gate from issue #463 is 8 checkboxes; PR-A closes the
   constructors so the Go SDK compile stays green.
 - **`pkg/e2etest/harness.go::e2eMigrationTarget`** 94 → 96.
 - **`pkg/state/embed_test.go`** + `apply_walk_test.go` expected
+<<<<<<<< HEAD:docs/adr/069-sidecar-containers-init-metrics-hard-cap-2.md
 range 1..96.
 - **`docs/adr/README.md`** table gains the ADR-069 row.
+========
+  range 1..96.
+- **`docs/adr/README.md`** table gains the ADR-068 row.
+>>>>>>>> 2b8e996c (fix(sidecars): PR #531 post-rebase renumber 95→116 + ADR-066→068):docs/adr/068-sidecar-containers-init-metrics-hard-cap-2.md
 - **No new migration beyond 00096.** Slot policy per
   `cross-pr-slot-gate-reservation-fence-pattern.md`; open PR #526
   holds slot 095, so PR-A renumbered 95 → 96 and planted
@@ -495,7 +504,11 @@ Pre-merge checklist:
 - [ ] Financial-model addendum row + scenario columns committed
       to the EX44 box `ex44_faas_financial_model.xlsx`
       (out-of-band ops commit; documented above).
+<<<<<<<< HEAD:docs/adr/069-sidecar-containers-init-metrics-hard-cap-2.md
 - [ ] `docs/adr/README.md` table row for ADR-069 added on the
+========
+- [ ] `docs/adr/README.md` table row for ADR-068 added on the
+>>>>>>>> 2b8e996c (fix(sidecars): PR #531 post-rebase renumber 95→116 + ADR-066→068):docs/adr/068-sidecar-containers-init-metrics-hard-cap-2.md
       PR.
 - [ ] `migrations/00096_deployments_sidecars.sql` applied
       cleanly via `make test` on a fresh pgtest DB.

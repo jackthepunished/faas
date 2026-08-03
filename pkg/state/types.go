@@ -389,7 +389,7 @@ type App struct {
 	ReassignedAt *time.Time
 	// MigratedAt is the wall-clock time of the most recent
 	// cross-node LIVE-INSTANCE migration for this app
-	// (Tier A5, migration 00098, ADR-066, follow-up to
+	// (Tier A5, migration 00098, ADR-068, follow-up to
 	// ADR-064). Distinct from ReassignedAt, which carries the
 	// PARKED-app rebalance commit. Both columns can coexist
 	// on the same app — an app whose instances migrated live
@@ -698,7 +698,7 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
-	// Sidecars (issue #463 / ADR-066). Up to 2 stateless sidecars
+	// Sidecars (issue #463 / ADR-068). Up to 2 stateless sidecars
 	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
 	// `deployments.sidecars` column (migration 00095). Field is
 	// json.RawMessage (NOT []api.Sidecar) so the state package
@@ -1142,7 +1142,7 @@ type Instance struct {
 	WakeID string
 	// MigratedFromNodeID is the prior owner compute_node after a
 	// cross-node live-instance handoff (Tier A5, migration 00097,
-	// ADR-066, follow-up to ADR-064). FK to compute_nodes(id) ON
+	// ADR-068, follow-up to ADR-064). FK to compute_nodes(id) ON
 	// DELETE SET NULL — the lineage reference stays honest when a
 	// node is decommissioned (the row stays, the column flips to
 	// NULL). Distinct from apps.node_id (the durable shard key for

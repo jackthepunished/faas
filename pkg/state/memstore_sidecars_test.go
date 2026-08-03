@@ -35,7 +35,7 @@ func memSidecarsFixture(t *testing.T) (*MemStore, context.Context, App) {
 // encoding (whitespace, key ordering, type coercion) is a regression
 // the moment PR-B lands.
 //
-// 2-sidecar payload mirrors the schema in ADR-066 §Decision 1 — the
+// 2-sidecar payload mirrors the schema in ADR-068 §Decision 1 — the
 // 2-cap is the load-bearing gate. The test pins 1 init + 1 sidecar
 // (the canonical customer shape from issue #463).
 func TestMemStore_Deployment_Sidecars_RoundTrip(t *testing.T) {
@@ -92,7 +92,7 @@ func TestMemStore_Deployment_Sidecars_DefaultEmpty(t *testing.T) {
 // TestMemStore_Deployment_Sidecars_VariousJSONPayloads pins that
 // arbitrary, well-formed JSONB payloads survive the round-trip. The
 // schema defines no per-sidecar shape (the api-side `Sidecar.Validate`
-// is the load-bearing gate per ADR-066 §Decision 2); the state layer
+// is the load-bearing gate per ADR-068 §Decision 2); the state layer
 // just carries bytes. This test asserts that the bytes pass through
 // unimpeded.
 func TestMemStore_Deployment_Sidecars_VariousJSONPayloads(t *testing.T) {

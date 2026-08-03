@@ -4,7 +4,7 @@
 /* eslint-disable */
 /**
  * One entry in the deploy request's `sidecars` array
- * (issue #463 / ADR-066). Up to 2 sidecars per app (1 init
+ * (issue #463 / ADR-068). Up to 2 sidecars per app (1 init
  * + 1 sidecar; the array is type-uniqueness + 2-capped at
  * the schema layer via migration 00095's CHECK constraint).
  * Stateless only — stateful base images (Postgres, Redis,

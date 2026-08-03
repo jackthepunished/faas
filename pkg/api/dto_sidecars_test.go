@@ -171,7 +171,7 @@ func TestSidecar_Validate_Rejects(t *testing.T) {
 			s:       Sidecar{Name: "ok", Image: goodImage, Type: SidecarTypeSidecar, RamMB: 1024},
 			wantSub: "sidecar ram_mb",
 		},
-		// Stateful image rejection (issue #463 / ADR-066 §Decision 4).
+		// Stateful image rejection (issue #463 / ADR-068 §Decision 4).
 		// The shared pkg/statefuldenylist matcher strips the digest
 		// suffix + any registry hostname and probes every path
 		// segment against the denylist set. These references are
@@ -508,7 +508,7 @@ func TestSidecarImage_OpenAPIRegexParity(t *testing.T) {
 				t.Fatalf("drift on %q: Go=%v OpenAPI=%v (wantOK=%v). "+
 					"Update one regex to match the other — both must agree "+
 					"to keep the schema-validation / runtime-gate contract "+
-					"intact (issue #463 / ADR-066).",
+					"intact (issue #463 / ADR-068).",
 					tc.ref, goOK, openapiOK, tc.wantOK)
 			}
 			if goOK != tc.wantOK {

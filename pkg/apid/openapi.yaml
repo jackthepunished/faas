@@ -4632,7 +4632,7 @@ components:
         new_balance: { type: integer, minimum: 0 }
 
     CreateDeploymentRequest:
-      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload. The optional `overrides` object (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the image. The override field list is FROZEN — six fields, no more — and any extra field on the override object 400s the request (the handler's decoder rejects unknown keys; see ADR-053 §Decision 1). The optional `sidecars` array (issue #463 / ADR-066) attaches up to 2 stateless sidecars (1 init + 1 sidecar) per app — a one-shot DB migrator as `init`, a metrics scraper as `sidecar`. nil/omitted = no sidecars."
+      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload. The optional `overrides` object (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the image. The override field list is FROZEN — six fields, no more — and any extra field on the override object 400s the request (the handler's decoder rejects unknown keys; see ADR-053 §Decision 1). The optional `sidecars` array (issue #463 / ADR-068) attaches up to 2 stateless sidecars (1 init + 1 sidecar) per app — a one-shot DB migrator as `init`, a metrics scraper as `sidecar`. nil/omitted = no sidecars."
       type: object
       properties:
         image:
@@ -4655,7 +4655,7 @@ components:
           description: "Per-deploy signature-enforcement opt-in (issue #472 / ADR-054). nil = inherit apps.require_signed; *true is a no-op when the app flag is already on; *false is rejected with 403 deploy_signature_invalid when the app flag is on (operator policy wins)."
           type: [boolean, "null"]
           example: true
-        # Issue #463 / ADR-066: up to 2 stateless sidecars
+        # Issue #463 / ADR-068: up to 2 stateless sidecars
         # (1 init + 1 sidecar). The runtime effect (imaged,
         # fcvm, guest-init) ships in PR-B; PR-A persists the
         # shape and the handler envelope-seals env values.
@@ -4664,7 +4664,7 @@ components:
           maxItems: 2
           items:
             $ref: '#/components/schemas/Sidecar'
-          description: "Up to 2 stateless sidecars (1 init + 1 sidecar). nil/omitted = no sidecars. See ADR-066 for the hard 2-cap and stateless-only contract."
+          description: "Up to 2 stateless sidecars (1 init + 1 sidecar). nil/omitted = no sidecars. See ADR-068 for the hard 2-cap and stateless-only contract."
 
     CreateDeploymentOverrides:
       description: |
@@ -4740,7 +4740,7 @@ components:
     Sidecar:
       description: |
         One entry in the deploy request's `sidecars` array
-        (issue #463 / ADR-066). Up to 2 sidecars per app (1 init
+        (issue #463 / ADR-068). Up to 2 sidecars per app (1 init
         + 1 sidecar; the array is type-uniqueness + 2-capped at
         the schema layer via migration 00095's CHECK constraint).
         Stateless only — stateful base images (Postgres, Redis,

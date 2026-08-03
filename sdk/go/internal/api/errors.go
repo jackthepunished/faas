@@ -145,7 +145,7 @@ const (
 	CodeSecretValueTooLarge = "secret_value_too_large"
 	CodeSecretNotFound      = "secret_not_found"
 
-	// Sidecar containers (issue #463 / ADR-066). Eight RFC 7807
+	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
 	// codes are the load-bearing 400-class shapes; the stateful
 	// and not-on-plan codes are defence-in-depth for future

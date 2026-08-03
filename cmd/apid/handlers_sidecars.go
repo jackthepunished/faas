@@ -34,7 +34,7 @@ import (
 var setSidecarRecipient func() *age.X25519Recipient
 
 // sealSidecars is the apid-side envelope-seal helper for sidecar
-// env values (issue #463 / ADR-066 §Decision 3). It is the load-
+// env values (issue #463 / ADR-068 §Decision 3). It is the load-
 // bearing gateway between the wire shape (plaintext env per sidecar)
 // and the persisted shape (envelope-sealed ciphertext per env key).
 //
@@ -398,7 +398,7 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 			"ref":           req.Image,
 		})
 	}
-	// Issue #463 / ADR-066: sidecar audit event (delegated to its
+	// Issue #463 / ADR-068: sidecar audit event (delegated to its
 	// own helper so the sidecar surface is grep-able from one place).
 	emitSidecarSetAudit(ctxr, s.audit, acct, app, d, req.Sidecars)
 }
