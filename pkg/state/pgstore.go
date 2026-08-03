@@ -1296,7 +1296,7 @@ func (s *PgStore) ListAppsByNodeID(ctx context.Context, nodeID string) ([]App, e
 // last_request_at, parked_at, node_id, wake_id).
 func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]Instance, error) {
 	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
 		   from instances i
 		   join apps a on a.id = i.app_id
 		  where a.node_id = $1`
@@ -5277,7 +5277,7 @@ func (s *PgStore) ListLatestInstancesForApp(ctx context.Context, appID string, l
 	}
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
 		 from instances where app_id = $1 order by started_at desc limit $2`, appID, limit)
 	if err != nil {
 		return nil, err
@@ -5295,7 +5295,7 @@ func (s *PgStore) ListLatestInstancesForApp(ctx context.Context, appID string, l
 func (s *PgStore) ListAllInstances(ctx context.Context) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
 		 from instances
 		 where state in ('running','waking','cold_booting','snapshotting')
 		 order by started_at desc`)
@@ -5516,7 +5516,7 @@ func (s *PgStore) ListInstancesByStatesOlderThan(ctx context.Context, states []S
 	}
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
 		 from instances
 		 where state = any($1)
 		   and case when state = 'snapshotting' then parked_at else started_at end < $2`,
@@ -5586,7 +5586,7 @@ func (s *PgStore) SetInstanceRuntime(ctx context.Context, id, netns, hostIP stri
 func (s *PgStore) RunningInstanceForApp(ctx context.Context, appID string) (Instance, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
 		 from instances where app_id = $1 and state = 'running'
 		 order by started_at desc nulls last limit 1`, appID)
 	return scanInstance(row)
