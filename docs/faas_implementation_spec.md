@@ -91,7 +91,7 @@ Format for future ADRs: `ADR-NNN · title · status · decision · consequences`
 
 ## 4. Component specifications
 
-Each component: single Go binary, own systemd unit, structured logs (JSON, `slog`), Prometheus `/metrics`, config via one TOML file + env overrides. All inter-component APIs are gRPC over unix sockets in `/run/faas/` except gatewayd→apps (plain HTTP).
+Each component: single Go binary, own systemd unit, structured logs (JSON, `slog`), Prometheus `/metrics`, config via one TOML file + env overrides. All inter-component APIs are gRPC over unix sockets in `/run/faas/` except gatewayd→apps (plain HTTP). Verbosity is operator-controlled via the `FAAS_LOG_LEVEL` env var (one of `debug`, `info`, `warn`, `error`, case-insensitive); a `SIGHUP` re-reads it at runtime (issue #518 PR-A). Default is `info`; an unrecognised value falls back to `info` and logs a one-shot warn — daemons never refuse to start on log misconfiguration.
 
 ### 4.1 `gatewayd` — edge proxy
 
