@@ -33,9 +33,30 @@ ProtectHome=yes
 # and NOT visible from the host — every other daemon that dials
 # /run/faas/vmmd.sock would get `no such file or directory` even though
 # `ss -lnx` shows the LISTEN entry (run 30839233808).
+#
+# This unit is the SOLE owner of /run/faas on disk. schedd and
+# gatewayd do NOT declare RuntimeDirectory=faas — when systemd sees
+# RuntimeDirectory=faas on multiple units, only the first one to
+# start gets its bind-mount propagated to the host /run; the others
+# silently fall through to writing into the existing dirent, which
+# puts their .sock into the first service's per-unit tmpfs instead
+# of the host's. schedd.sock + vmmd.sock land in two different
+# filesystem layers and only schedd.sock is visible from the host
+# (run 30841750214, post-#619). Keeping the declaration on vmmd
+# alone ensures all writes go through the same bind-mount.
+#
+# RuntimeDirectory creates the dir as root:root. Mode 0775 gives the
+# OWNER group (root, not faas) write+execute, so faas-schedd still gets
+# `bind: permission denied` even though it sits in the `faas` group.
+# We can't change the OWNER via RuntimeDirectory (vmmd has no User=,
+# and there's no `RuntimeDirectoryGroup=` directive), so ExecStartPre
+# re-chowns to root:faas 0775 right after systemd creates the dir.
+# Idempotent on restart (chown of matching ownership is a no-op).
+ExecStartPre=/usr/bin/chown root:faas /run/faas
+ExecStartPre=/usr/bin/chmod 0775 /run/faas
 PrivateTmp=no
 RuntimeDirectory=faas
-RuntimeDirectoryMode=0770
+RuntimeDirectoryMode=0775
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
