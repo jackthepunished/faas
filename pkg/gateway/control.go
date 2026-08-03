@@ -27,6 +27,12 @@ const ControlAddr = ":9090"
 // ControlMux returns the *http.ServeMux with /healthz, /readyz, /metrics.
 // /readyz is wired to a Ready func the daemon registers on construction
 // (e.g. "true once routing cache is hydrated from Postgres").
+//
+// nil-ready behaviour is the SAFE default post-Tier-A7: a daemon that
+// forgets to wire a probe is marked not-ready rather than silently ready,
+// so the LB never routes traffic to a partial-boot instance. The pre-split
+// always-200 default was a latent bug (cmd/gatewayd/main.go:878 wired nil
+// and /readyz was useless); ADR-070 closes that.
 func ControlMux(m *Metrics, ready ReadyFunc) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -34,7 +40,16 @@ func ControlMux(m *Metrics, ready ReadyFunc) *http.ServeMux {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if ready == nil || ready() {
+		if ready == nil {
+			// A nil probe is a wiring bug post-#568. Mark not-ready so
+			// the LB drain kicks in; the operator sees /readyz=503 and
+			// fixes the registration. Surface the reason in the body
+			// for grep-friendliness.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not-ready: no probe registered"))
+			return
+		}
+		if ready() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ready"))
 			return
@@ -49,8 +64,9 @@ func ControlMux(m *Metrics, ready ReadyFunc) *http.ServeMux {
 }
 
 // ReadyFunc reports whether the daemon is ready to serve traffic. Used by
-// /readyz. Returns true by default; replaced by main once the routing cache
-// is hydrated and (post-TLS) the cert store is loaded.
+// /readyz. The pre-split contract ("returns true by default") was
+// intentionally inverted by ADR-070 — every post-split daemon must wire a
+// real probe (see pkg/gateway/readiness.go::ReadyzProbe.ReadyFunc).
 type ReadyFunc func() bool
 
 // RunControlServer starts the control-plane listener and blocks until ctx is

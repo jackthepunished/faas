@@ -1,34 +1,28 @@
+-- filename: 00120_reserve_slot.sql
+-- Fence at slot 120 — held by this PR so the migration set stays
+-- contiguous 1..N where N = 124 (this PR's highest). Main dropped
+-- its own 00120_reserve_slot.sql when this branch's 00120_warm_hint
+-- landed on the branch; without a replacement fence the embedded
+-- set has a gap at 120 (TestMigrationsContiguous fails:
+-- `migration slot 120 is missing`).
+--
+-- ADR-041 (migration slot reservation convention): the fence body
+-- is a no-op `select 1;` inside goose's StatementBegin/End markers
+-- so goose applies it cleanly and writes a row in goose_db_version.
+-- A later PR that wants slot 120 for a real schema shadows this
+-- fence; the same PR drops this file via `git rm` so the carved-
+-- out slot lands cleanly on main.
+
 -- +goose Up
 -- +goose StatementBegin
---
--- 00120_reserve_slot.sql — slot reservation placeholder
--- (ADR-041 / PR #391 migration gate carve-out).
---
--- This file is a deliberate no-op kept only to satisfy the
--- migrations/embed_test.go::TestMigrationsContiguous requirement
--- that the embedded migration set is exactly {1, 2, …, N} with
--- no gaps. It carries no schema change but does occupy the slot
--- in goose's version table on apply.
---
--- Slot 120 is the partner fence for this branch's real
--- migration at 00122_instances_framework_ready_at.sql after the
--- 112 → 122 renumber. The original plan was to claim 120 as the
--- PR-creation slot per ADR-041, but PR #547 (Tier A7 gatewayd
--- split) opened against main claiming slots 119/120/121 — its
--- 00120_warm_hint.sql is a real migration on that branch. This
--- branch's real migration was therefore renumbered 120 → 122,
--- and the 120 fence is restored here so the embedded FS stays
--- contiguous 1..122 until either side lands and the other drops
--- its reservation.
---
--- Body: `select 1;` — executes against the live DB at apply time
--- but produces no schema change.
---
-select 1;
-
+SELECT 1;
+-- +goose StatementEnd
+-- +goose StatementBegin
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
--- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+SELECT 1;
+-- +goose StatementEnd
+-- +goose StatementBegin
 -- +goose StatementEnd

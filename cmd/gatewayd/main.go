@@ -875,7 +875,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// Private listener: control plane only — never authenticated (it's on a
 	// private bind), never reachable from the public-internet path.
-	controlMux := gateway.ControlMux(handler.Metrics(), nil)
+	//
+	// Issue #568 / ADR-070 (Tier A7 edge split): the pre-split daemon
+	// wired `nil` here, which made /readyz return 200 unconditionally.
+	// That was acceptable for single-box (no LB to drain) but fails
+	// closed wrong after the split: a partial-boot daemon would
+	// happily accept traffic even though the routing cache, the cert-
+	// bundle, and the warm-hint subscription are not yet ready.
+	//
+	// The pre-split daemon's readiness contract is the loosest of the
+	// three flavours (gatewayd-public, gatewayd-internal, legacy
+	// gatewayd): "we have a Postgres connection OR we're a unit test
+	// that intentionally skips one". The split daemons (tasks #17,
+	// #18) wire the full ReadyzProbe from pkg/gateway/readiness.go
+	// with hydration tracking, schedd-router readiness, and PG ping.
+	// Here we wire the legacy one — "deps.pgStore != nil" — which is
+	// the strongest signal the pre-split daemon can honestly assert
+	// (the route cache is lazy-fill; the only "I cannot serve" state
+	// the legacy code has is "PG connection missing").
+	legacyReady := gateway.ReadyFunc(func() bool {
+		return deps.pgStore != nil
+	})
+	controlMux := gateway.ControlMux(handler.Metrics(), legacyReady)
 	// Finding 6 (issue #314): mount the dashboard quota endpoint on the
 	// control mux so an in-box caller (operator's curl today, future
 	// apid-side dial) can read per-app bucket state without going through

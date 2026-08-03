@@ -919,7 +919,7 @@ const (
 	// "atomic revocation" (no grace).
 	DefaultAPIKeyGraceWindowDays = 7
 
-	// Sidecar containers (issue #463 / ADR-068). The 2-sidecar
+	// Sidecar containers (issue #463 / ADR-070). The 2-sidecar
 	// hard cap is a GLOBAL constant, not a per-plan matrix field.
 	// Every plan inherits the same `SidecarCapMax = 2` (Free
 	// included). The cap is structurally tight: 1 init + 1
@@ -1025,7 +1025,7 @@ const (
 	RebalanceCooldownSeconds   = 60
 	RebalanceMaxPerTickPerNode = 50
 
-	// Tier A5 (cross-node live-instance migration, ADR-068
+	// Tier A5 (cross-node live-instance migration, ADR-070
 	// follow-up to ADR-064): pacing + lease window on
 	// pkg/sched/migration_handoff.go.
 	//
@@ -1056,7 +1056,7 @@ const (
 	MigrateLiveLeaseSeconds = 90
 
 	// Tier A6 (migrating-instance watchdog, ADR-067 follow-up to
-	// ADR-068): self-heal stuck state='migrating' rows that
+	// ADR-070): self-heal stuck state='migrating' rows that
 	// never committed (the new owner vmmd died mid-handoff, the
 	// network partition dropped the gRPC, the operator killed
 	// the new owner before the commit). The watchdog is the
@@ -1084,6 +1084,41 @@ const (
 	// here, never inlined.
 	MigratingWatchdogTickLimit       = 50
 	MigratingWatchdogIntervalSeconds = 1
+
+	// Tier A7 (edge split — gatewayd-public / gatewayd-internal,
+	// ADR-070): drain + replica registry + warm-hint-cache tunables.
+	//
+	// GatewayDrainGraceSeconds is the upper bound on the in-flight
+	// request window after SIGTERM before http.Server.Shutdown
+	// returns. Tuned to be 5s shorter than the systemd unit's
+	// TimeoutStopSec (60s) so the daemon exits cleanly inside the
+	// unit's grace. Tunable via FAAS_GATEWAY_DRAIN_GRACE_SECONDS.
+	//
+	// ReplicaHeartbeatIntervalSeconds is the cadence at which an
+	// internal daemon re-asserts its presence to the public daemon
+	// over the /run/faas/gatewayd-public.sock unix socket. The
+	// public daemon marks a peer unready after 2× this interval
+	// without a heartbeat (no extra constant — the 2x factor lives
+	// in cmd/gatewayd-public/replicas.go::isStale). Tunable via
+	// FAAS_REPLICA_HEARTBEAT_SECONDS.
+	//
+	// WarmHintCacheSize caps the per-daemon in-memory mirror of the
+	// `warm_hint` table. Hot apps fit in the first 1000 entries; a
+	// larger cache trades RAM for cold-miss latency. Tunable via
+	// FAAS_WARM_HINT_CACHE_SIZE.
+	//
+	// CertSyncIntervalSeconds is the leader-side safety-net cron
+	// cadence (the fast-path is the certmagic OnEvent callback).
+	// 30s is the worst-case lag a follower replica carries a stale
+	// cert; in steady state the OnEvent fast path keeps lag ≤1s.
+	// Tunable via FAAS_CERT_SYNC_INTERVAL_SECONDS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	GatewayDrainGraceSeconds        = 25
+	ReplicaHeartbeatIntervalSeconds = 5
+	WarmHintCacheSize               = 1000
+	CertSyncIntervalSeconds         = 30
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
@@ -1336,7 +1371,7 @@ func (p Plan) MaxInstancesAllowed() bool {
 	return l.MaxInstancesAllowed
 }
 
-// SidecarAllowed (issue #463 / ADR-068 §Decision 1) reports whether
+// SidecarAllowed (issue #463 / ADR-070 §Decision 1) reports whether
 // the plan may attach sidecars to a deployment. PR-A's accessor
 // returns true for every plan — the load-bearing gate is the GLOBAL
 // `SidecarCapMax` constant, not a per-plan matrix. A future PR
@@ -1755,7 +1790,7 @@ func BillableRAMMB(ramMB int) int {
 }
 
 // BillableRAMMBWithSidecars is the sidecar-shape variant of
-// BillableRAMMB (issue #463 / ADR-068 §Decision 6). The billable
+// BillableRAMMB (issue #463 / ADR-070 §Decision 6). The billable
 // shutter is `plan.RAMMB + Σ(sidecar.ram_mb) + PerVMOverheadMB`:
 // sidecars share the per-VM overhead (one netns, one cgroup
 // scope per instance), but each sidecar contributes its own

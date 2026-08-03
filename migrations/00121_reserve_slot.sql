@@ -1,37 +1,32 @@
+-- filename: 00121_reserve_slot.sql
+-- Fence at slot 121 — held by this PR so the migration set stays
+-- contiguous 1..N where N = 124 (this PR's highest). Main dropped
+-- its own 00121_reserve_slot.sql when this branch's 00121_pg_ratelimit
+-- landed on the branch; without a replacement fence the embedded
+-- set has a gap at 121 (TestMigrationsContiguous fails:
+-- `migration slot 121 is missing`).
+--
+-- Note: this slot is also contested with PR #552, which has a real
+-- schema (events_sidecar_name_idx) at 121. Whichever side lands
+-- first, the other's 121 fence drops on rebase. The cross-PR slot
+-- gate hides reservation files via the slots_from_paths regex
+-- carve-out, so simultaneous reservations do not surface as a
+-- collision.
+--
+-- ADR-041 (migration slot reservation convention): the fence body
+-- is a no-op `select 1;` inside goose's StatementBegin/End markers
+-- so goose applies it cleanly and writes a row in goose_db_version.
+
 -- +goose Up
 -- +goose StatementBegin
---
--- 00121_reserve_slot.sql — slot reservation placeholder
--- (ADR-041 / PR #391 migration gate carve-out).
---
--- This file is a deliberate no-op kept only to satisfy the
--- migrations/embed_test.go::TestMigrationsContiguous requirement
--- that the embedded migration set is exactly {1, 2, …, N} with
--- no gaps. It carries no schema change and does not appear in any
--- apply path (the replay-safety gate in ci.yml drops files whose
--- basename matches the reservation regex from its "added
--- migration versions" computation).
---
--- Slot 121 bridges the gap between PR #547's
--- 00120_warm_hint.sql and this branch's
--- 00122_instances_framework_ready_at. PR #547 jumped to 120
--- after the first rebase onto main (1768ed4b), which forced
--- the renumber chain's 112 → 120 jump to fold into a 112 →
--- 122 jump on this rebase. Whichever side lands first, the
--- other drops its reservation on rebase. The cross-PR slot
--- gate hides reservation files via the slots_from_paths regex
--- carve-out, so the simultaneous reservations do not surface
--- as a collision.
---
--- Body: `select 1;` — executes against the live DB at apply time
--- but produces no schema change. Future-proof against upstream
--- generator drift without chasing each new template revision.
---
-select 1;
-
+SELECT 1;
+-- +goose StatementEnd
+-- +goose StatementBegin
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
--- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+SELECT 1;
+-- +goose StatementEnd
+-- +goose StatementBegin
 -- +goose StatementEnd

@@ -239,6 +239,16 @@ const (
 	//   single-sourced in apid. The Loop in pkg/loop subscribes;
 	//   the audit row lands in `events` like any other kind.
 	NotifyAuditEvent = "audit_event"
+	// NotifyWarmHintPublished {"app_id":uuid, "node_id":uuid}
+	//   schedd → gatewayd-public + gatewayd-internal: the sticky-warm
+	//   affinity hint for an app was just published. The row lives
+	//   in the warm_hint table (migrations/00116_warm_hint.sql);
+	//   both gatewayd-public and gatewayd-internal subscribe
+	//   independently (their per-process LRU mirrors converge within
+	//   one Postgres NOTIFY delivery, ~5 ms end-to-end). The payload
+	//   is informational — consumers can re-read the row to defend
+	//   against notify loss.
+	NotifyWarmHintPublished = "warm_hint_published"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

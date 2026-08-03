@@ -598,3 +598,130 @@ func TestPgStore_CreateAccountWithPersonalOrg_SlugDeterministic(t *testing.T) {
 		t.Errorf("slug = %q, want %q", res.PersonalOrg.Slug, want)
 	}
 }
+
+// TestPgStore_TransferOrgOwnership_AllBranches exercises the new
+// TxOrgOwnership method (issue #190 / ADR-061, PR 5). Sister parity
+// to TestTransferOrgOwnership_MemStorePin in
+// cmd/apid/handlers_org_test.go. The PgStore path differs from the
+// MemStore in three load-bearing ways the test pins:
+//
+//   - Tx-wrapped (s.pool.BeginTx) with FOR UPDATE row locks on both
+//     sides of the swap.
+//   - Demote-first ordering so the partial unique
+//     org_memberships_one_owner_idx trips on the promote step, not
+//     the demote step (23505 → ErrOrgLastOwner).
+//   - pgconn.PgError code mapping for the partial-unique tripwire.
+//
+// Five sub-cases, one per sentinel the handler distinguishes:
+//
+//   - success → both rows updated, previous owner demoted to admin
+//   - self-transfer (from == to) → ErrOrgLastOwner
+//   - from is not the active owner → ErrOrgLastOwner
+//   - to is not an active member → ErrNotFound
+//   - to is removed → ErrNotFound
+func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
+	s := newPgStore(t)
+	pool := s.pool
+	ctx := context.Background()
+
+	ownerID := "00000000-0000-0000-0000-0000000000a1"
+	memberID := "00000000-0000-0000-0000-0000000000a2"
+	strangerID := "00000000-0000-0000-0000-0000000000a3"
+	removedID := "00000000-0000-0000-0000-0000000000a4"
+	pgStoreSeedAccounts(t, ctx, pool, ownerID, memberID, strangerID, removedID)
+
+	o, err := s.CreateOrg(ctx, newTestOrg("transfer-pg"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("add owner: %v", err)
+	}
+	if err := s.AddOrgMember(ctx, o.ID, memberID, OrgRoleDeveloper, nil); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+	if err := s.AddOrgMember(ctx, o.ID, removedID, OrgRoleViewer, nil); err != nil {
+		t.Fatalf("add removed: %v", err)
+	}
+	if err := s.RemoveOrgMember(ctx, o.ID, removedID); err != nil {
+		t.Fatalf("remove removed: %v", err)
+	}
+
+	// Case 1: success. owner → admin, member → owner.
+	if err := s.TransferOrgOwnership(ctx, o.ID, ownerID, memberID); err != nil {
+		t.Fatalf("TransferOrgOwnership: %v", err)
+	}
+	row, err := s.OrgMemberByAccount(ctx, o.ID, memberID)
+	if err != nil {
+		t.Fatalf("OrgMemberByAccount(new owner): %v", err)
+	}
+	if row.Role != OrgRoleOwner {
+		t.Errorf("new owner role = %q, want owner", row.Role)
+	}
+	row, err = s.OrgMemberByAccount(ctx, o.ID, ownerID)
+	if err != nil {
+		t.Fatalf("OrgMemberByAccount(prev owner): %v", err)
+	}
+	if row.Role != OrgRoleAdmin {
+		t.Errorf("prev owner role = %q, want admin (demoted)", row.Role)
+	}
+
+	// Restore: hand ownership back so subsequent cases have the
+	// canonical starting state (owner + developer member). The
+	// restore promotes ownerID back to owner but the success-path
+	// demote rule left memberID as admin; reset memberID to
+	// developer explicitly so the post-failure sanity check
+	// below matches the seeded state.
+	if err := s.TransferOrgOwnership(ctx, o.ID, memberID, ownerID); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if err := s.UpdateOrgMemberRole(ctx, o.ID, memberID, OrgRoleDeveloper); err != nil {
+		t.Fatalf("reset member role: %v", err)
+	}
+
+	// Case 2: self-transfer (from == to). The handler front-loads
+	// the check, but the Store is also defensive — a no-op would
+	// silently skip the swap and the wire contract is to refuse.
+	if err := s.TransferOrgOwnership(ctx, o.ID, ownerID, ownerID); !errors.Is(err, ErrOrgLastOwner) {
+		t.Errorf("self-transfer: err = %v, want ErrOrgLastOwner", err)
+	}
+
+	// Case 3: from is not the active owner. Member is not the
+	// owner right now (we just restored in Case 1), so a
+	// transfer from member is the "caller is not the owner" path.
+	if err := s.TransferOrgOwnership(ctx, o.ID, memberID, ownerID); !errors.Is(err, ErrOrgLastOwner) {
+		t.Errorf("non-owner caller: err = %v, want ErrOrgLastOwner", err)
+	}
+
+	// Case 4: to is not an active member of the org. strangerID
+	// was seeded but never added as a member — the FOR UPDATE
+	// probe on toAccountID returns pgx.ErrNoRows → ErrNotFound.
+	if err := s.TransferOrgOwnership(ctx, o.ID, ownerID, strangerID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("non-member target: err = %v, want ErrNotFound", err)
+	}
+
+	// Case 5: to is a removed member. removedID was added then
+	// RemoveOrgMember'd; the row exists with removed_at != nil so
+	// the Store must return ErrNotFound (a removed invitee cannot
+	// become owner).
+	if err := s.TransferOrgOwnership(ctx, o.ID, ownerID, removedID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("removed target: err = %v, want ErrNotFound", err)
+	}
+
+	// Sanity: owner is still owner, member is still member. The
+	// failed cases must not have written anything.
+	row, err = s.OrgMemberByAccount(ctx, o.ID, ownerID)
+	if err != nil {
+		t.Fatalf("sanity OrgMemberByAccount: %v", err)
+	}
+	if row.Role != OrgRoleOwner {
+		t.Errorf("post-failure owner role = %q, want owner", row.Role)
+	}
+	row, err = s.OrgMemberByAccount(ctx, o.ID, memberID)
+	if err != nil {
+		t.Fatalf("sanity OrgMemberByAccount member: %v", err)
+	}
+	if row.Role != OrgRoleDeveloper {
+		t.Errorf("post-failure member role = %q, want developer", row.Role)
+	}
+}

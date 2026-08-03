@@ -609,6 +609,29 @@ func (s *server) handler() http.Handler {
 	// role. No header → {"org": null} (passthrough, pre-PR-5 routes
 	// stay account-scoped).
 	mux.HandleFunc("GET /v1/orgs/me", s.auth(s.loadOrg(s.whoamiActiveOrg)))
+
+	// Orgs (ADR-061 / IAM-6 / issue #190, PR 5). Customer-visible
+	// org CRUD + member management + invitations + ownership
+	// transfer. The full surface is mounted here in one block so
+	// the route table reads top-down by resource. Patterns:
+	//   - account-scoped (no s.loadOrg): GET/POST /v1/orgs
+	//   - invitation peek (no s.loadOrg, no scope): GET /v1/invitations/{token}
+	//   - org-scoped (s.loadOrg mounted inside scope wrapper):
+	//     GET/PATCH/DELETE /v1/orgs/{slug}, /v1/orgs/{slug}/members[/...],
+	//     /v1/orgs/{slug}/transfer_ownership
+	// Post-PATCH name updates land in PR 7 once the Store gains
+	// UpdateOrgName (PR 5 only persists plan via UpdateOrgPlan).
+	mux.HandleFunc("GET /v1/orgs", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listOrgsForCaller)))
+	mux.HandleFunc("POST /v1/orgs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createSharedOrg)))))
+	mux.HandleFunc("GET /v1/orgs/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.getOrg)))))
+	mux.HandleFunc("PATCH /v1/orgs/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.patchOrg)))))
+	mux.HandleFunc("DELETE /v1/orgs/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.softDeleteOrg)))))
+	mux.HandleFunc("GET /v1/orgs/{slug}/members", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.listOrgMembers)))))
+	mux.HandleFunc("POST /v1/orgs/{slug}/members", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.inviteOrgMember)))))
+	mux.HandleFunc("PATCH /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.changeOrgMemberRole)))))
+	mux.HandleFunc("DELETE /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.removeOrgMember)))))
+	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.transferOrgOwnership)))))
+	mux.HandleFunc("GET /v1/invitations/{token}", s.authLimited(s.peekInvitation))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan)))))
 	// IAM-5 (issue #189): per-account rotation grace-window
 	// override. Admin-only because the rotation primitive is

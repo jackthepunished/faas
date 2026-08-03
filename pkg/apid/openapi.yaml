@@ -134,6 +134,13 @@ tags:
       the dry-run that returns the PlanResponse (can_apply, plan_token);
       /v1/projects is the transactional apply that creates the project,
       its apps, and its crons in one Tx.
+  - name: orgs
+    description: |
+      Organization surface (issue #190 / IAM-6 / ADR-061). Path-scoped
+      org CRUD, member management, invitations, and ownership transfer.
+      The active-org hint is accepted via `X-Active-Org` / `?org=`
+      on every org-scoped route (matches LoadOrg middleware precedence);
+      path-scoped routes resolve via `{slug}` regardless.
 
 security:
   - bearerAuth: []
@@ -3574,6 +3581,409 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5) ──────────────────
+  # Customer-visible org surface. Account-scoped (/v1/orgs list +
+  # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
+  # active-org hint is accepted via X-Active-Org / ?org= on every
+  # org-scoped route; PR 8 owns POST /v1/invitations/{token}/accept
+  # (the SSO + GDPR bundle).
+  /v1/orgs:
+    get:
+      tags: [orgs]
+      operationId: listOrgs
+      summary: List orgs the caller has an active membership in.
+      description: |
+        Returns the personal org + every shared org the caller
+        belongs to. Account-scoped (no `X-Active-Org` header needed).
+        The list is sorted by slug.
+      responses:
+        '200':
+          description: The org list (may contain at most 1 personal + N shared).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrgListResponse' }
+              example:
+                orgs:
+                  - id: "0123456789abcdef0123456789abcdef"
+                    slug: "acme"
+                    name: "Acme Inc."
+                    personal: false
+                    plan: "pro"
+                    status: "active"
+                    created_at: "2026-08-02T11:25:00Z"
+                    updated_at: "2026-08-02T11:25:00Z"
+                  - id: "abcdef0123456789abcdef0123456789"
+                    slug: "u-1a2b3c4d5e6f"
+                    name: "Personal"
+                    personal: true
+                    plan: "free"
+                    status: "active"
+                    created_at: "2026-06-15T08:00:00Z"
+                    updated_at: "2026-06-15T08:00:00Z"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [orgs]
+      operationId: createOrg
+      summary: Create a shared org (caller becomes the first owner).
+      description: |
+        Mints a new shared (non-personal) org + the caller's owner
+        membership in one transaction. The slug must match
+        `^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$` (3..32 chars); name is
+        trimmed-non-empty (1..256 chars). Personal orgs cannot be
+        created via this endpoint — every account already has a
+        personal org (PR 3 backfill / migration 00099).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrgRequest' }
+            example: { slug: "acme", name: "Acme Inc." }
+      responses:
+        '201':
+          description: The new shared org.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgResponse' } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: |
+            `409 Conflict` — slug already taken (`org_slug_taken`) or the
+            caller is already a member of an org with the same slug
+            (`org_already_member`).
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — slug violates the `OrgSlugPattern`
+            regex (lowercase alphanumeric + dashes, 3..32 chars).
+            Stable code `org_slug_invalid`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    get:
+      tags: [orgs]
+      operationId: getOrg
+      summary: Get one org by slug.
+      description: |
+        Returns the org row + the caller's role on the org. Authz:
+        any active member of the org (`org.view`); non-members see
+        403 `org_role_forbidden`. Unknown slugs are 404
+        `org_not_found` (IDOR-safe — same wire shape as the
+        pkg/authz.LoadOrg middleware).
+      responses:
+        '200':
+          description: The org + the caller's role.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is authenticated but lacks the
+            `org.view` action on the target org. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [orgs]
+      operationId: updateOrg
+      summary: Update the org (name and/or plan).
+      description: |
+        Partial update; both fields are pointer-typed so the
+        handler distinguishes "omitted" from "clear". Authz
+        routing:
+          - `name` → `org.manage_billing` (owner + billing)
+          - `plan` → `org.change_plan` (owner only)
+        Personal orgs are immutable (`org_personal_immutable` 409).
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/PatchOrgRequest' } }
+      responses:
+        '200':
+          description: The updated org.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgResponse' } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller lacks `org.manage_billing` (name)
+            or `org.change_plan` (plan), OR the resulting member count
+            would exceed the plan cap (`OrgMembersMax`).
+            Stable codes `org_role_forbidden` | `org_member_cap_exceeded`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `409 Conflict` — the target org is the caller's personal
+            org (created by the PR 3 backfill); personal orgs cannot be soft-deleted.
+            immutable and cannot be modified by PATCH. Stable code
+            `org_personal_immutable`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — slug violates the
+            `OrgSlugPattern` regex (lowercase alphanumeric + dashes,
+            3..32 chars). Stable code `org_slug_invalid`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [orgs]
+      operationId: deleteOrg
+      summary: Soft-delete the org.
+      description: |
+        Sets `status='deleted_pending'` + `deleted_pending=true`
+        on the row (PR 5). Hard delete + GDPR purge lands in PR 8.
+        Authz: owner-only (`org.delete`). Personal orgs are
+        immutable.
+      responses:
+        '204': { description: Org soft-deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is authenticated but lacks the
+            `org.delete` action. Owner-only. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `409 Conflict` — the target org is the caller's personal
+            org (created by the PR 3 backfill); personal orgs are immutable on PATCH (name/plan).
+            immutable and cannot be modified by PATCH. Stable code
+            `org_personal_immutable`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    get:
+      tags: [orgs]
+      operationId: listOrgMembers
+      summary: List active members of the org.
+      description: |
+        Returns the active membership rows (the store returns
+        both active + removed; the handler filters at the API
+        boundary). Each row carries the joined `account.email`
+        so the dashboard can render `bob@acme.com` without a
+        second round-trip. Removed rows do NOT count toward the
+        member cap (per ADR-061 §B).
+      responses:
+        '200':
+          description: The active member list.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/MemberListResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is authenticated but lacks the
+            `org.view` action. Stable code `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [orgs]
+      operationId: addOrgMember
+      summary: Invite a new member (returns plaintext token ONCE).
+      description: |
+        Mints a 32-byte plaintext token, hashes it via SHA-256 for
+        storage, and returns the plaintext ONCE in the response.
+        The token expires after 14 days; admins can revoke earlier
+        via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
+        the accept surface). Role cannot be `owner`; transfer-
+        ownership is the only path to owner.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/InviteMemberRequest' } }
+      responses:
+        '201':
+          description: The invitation + the one-time plaintext token.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/InvitationWithTokenResponse' } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller lacks `org.invite_members`, OR
+            the resulting pending-invitation count would exceed the
+            plan cap (`OrgPendingInvitationsMax`).
+            Stable codes `org_role_forbidden` | `org_invitation_cap_exceeded`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '409':
+          description: |
+            `409 Conflict` — the target org is the caller's personal
+            org (created by the PR 3 backfill); personal orgs are immutable on POST /members (invite).
+            immutable and cannot be modified by PATCH. Stable code
+            `org_personal_immutable`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/members/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - $ref: '#/components/parameters/OrgAccountID'
+    patch:
+      tags: [orgs]
+      operationId: updateOrgMemberRole
+      summary: Change a member's role.
+      description: |
+        Owner-only (`org.change_role`). Role cannot be `owner` on
+        this endpoint; transfer-ownership is the only path to owner.
+        The exactly-one-owner invariant lives in
+        `pkg/state::UpdateOrgMemberRole`'s tx; demoting the last
+        active owner surfaces as 409 `org_last_owner`.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/ChangeMemberRoleRequest' } }
+      responses:
+        '200':
+          description: The updated member row.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgMemberResponse' } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is authenticated but lacks the
+            `org.change_role` action. Owner-only. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404':
+          description: |
+            `404 Not Found` — caller is authenticated but the
+            `{user_id}` path param does not correspond to any active
+            member of the target org, OR the target org belongs to
+            another tenant (IDOR-safe cross-tenant collapse).
+            Stable code `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '409':
+          description: |
+            `409 Conflict` — caller attempted to demote or remove
+            the only remaining active owner of the org. The
+            exactly-one-owner invariant lives on the
+            `org_memberships_one_owner_idx` partial unique index
+            (migration 00099). Stable code `org_last_owner`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [orgs]
+      operationId: removeOrgMember
+      summary: Remove a member.
+      description: |
+        Owner-only (`org.remove_members`). Stamps `removed_at` on
+        the row (the row stays for audit; live-cap count drops).
+        Self-removal is rejected at the boundary; the last-owner
+        invariant surfaces as 409 `org_last_owner`.
+      responses:
+        '204': { description: Member removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is authenticated but lacks the
+            `org.remove_members` action. Owner-only. Self-removal
+            is refused at the boundary. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404':
+          description: |
+            `404 Not Found` — caller is authenticated but the
+            target slug is unknown, OR `{user_id}` does not
+            correspond to an active member, OR the org belongs
+            to another tenant (IDOR-safe cross-tenant collapse).
+            Stable codes `org_role_forbidden` | `NotFound`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '409':
+          description: |
+            `409 Conflict` — caller attempted to remove (DELETE) the only
+            the only remaining active owner of the org. The
+            exactly-one-owner invariant lives on the
+            `org_memberships_one_owner_idx` partial unique index
+            (migration 00099). Stable code `org_last_owner`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/transfer_ownership:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    post:
+      tags: [orgs]
+      operationId: transferOrgOwnership
+      summary: Transfer ownership to another active member.
+      description: |
+        Atomically promotes `new_owner_account_id` to owner and
+        demotes the caller to admin via `Store.TransferOrgOwnership`
+        (a single PostgreSQL tx with `FOR UPDATE` locks on both
+        rows). The exactly-one-owner invariant is enforced by the
+        partial unique `org_memberships_one_owner_idx`
+        (migration 00099). The new owner must already be an active
+        member of the org.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/TransferOwnershipRequest' } }
+      responses:
+        '200':
+          description: The org (post-transfer).
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgResponse' } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is authenticated but is not the
+            active owner of the target org. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404':
+          description: 'code: NotFound (new owner is not a member)'
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '409':
+          description: 'code: org_last_owner (caller not the active owner OR new owner already owner)'
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/invitations/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        description: |
+          Plaintext or base64url-encoded invitation token. Tokens are
+          returned ONCE on the create call (`POST /v1/orgs/{slug}/members`)
+          and never re-served.
+        schema: { type: string, description: "Plaintext or base64url-encoded invitation token." }
+    get:
+      tags: [orgs]
+      operationId: peekInvitation
+      summary: Peek at a pending invitation by token (no consumption).
+      description: |
+        Read-only lookup that returns the invitation metadata
+        (email, role, org slug, expires_at) without consuming the
+        token. Used by the dashboard to render "you've been invited
+        to Acme Inc. as developer" without forcing the invitee
+        to accept yet. The accept flow lands in PR 8.
+      responses:
+        '200':
+          description: The pending invitation.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgInvitationResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '410':
+          description: 'code: org_invitation_invalid | org_invitation_expired | org_invitation_invalid (already consumed/revoked)'
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
   # `apid` embeds api/openapi.yaml at build time and serves the same bytes
   # customers see in the repo. The /json variant re-emits the spec in JSON
@@ -3668,6 +4078,35 @@ components:
       required: true
       schema: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 }
       description: Secret key. Must start with a letter; A-Z, 0-9, underscore.
+
+    # Issue #190 / IAM-6 / ADR-061 (PR 5) — path-scoped org surface.
+    # Slug matches the canonical regex in pkg/api/errors.go::OrgSlugPattern.
+    # Max 32 chars (LoadOrg middleware caps at 64; oversize values
+    # degrade to passthrough rather than a SQL CHECK 500).
+    OrgSlug:
+      name: slug
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$'
+        minLength: 3
+        maxLength: 32
+      description: |
+        Org slug. Lowercase letters, digits, hyphens; must start
+        and end with alnum. 3..32 chars. Mirrors `OrgSlugPattern`
+        in `pkg/api/errors.go` exactly so the spec drift gate
+        (`make spec-check`) stays green.
+    OrgAccountID:
+      name: user_id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' }
+      description: |
+        Account UUID (the membership row's account_id). The
+        path segment is named `user_id` for backwards
+        compatibility with the dashboard's existing
+        /members/:user_id routes.
 
     # Issue #394 — queue introspection pagination. Shared by the two
     # read-list endpoints (peek / dead_letter) so the `description`
@@ -6351,6 +6790,260 @@ components:
           type: boolean
           description: "The current state of the require_signed flag after the patch."
           example: true
+
+    # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5) ───────────────
+    # DTOs for the /v1/orgs/{slug}/... customer surface (org CRUD,
+    # member management, invitations, ownership transfer). The
+    # superset shape `OrgWithRole` (GET /v1/orgs/me) lives here too
+    # so the whoami endpoint emits the canonical OrgResponse + role.
+
+    CreateOrgRequest:
+      description: |
+        POST /v1/orgs body. Slug matches `OrgSlugPattern`
+        (lowercase alphanumeric + dashes, 3..32 chars); name is
+        trimmed-non-empty, capped at 256 chars. Personal orgs
+        cannot be created via this endpoint — every account
+        already owns an immutable personal org (PR 3 backfill).
+      type: object
+      required: [slug, name]
+      properties:
+        slug:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$'
+          minLength: 3
+          maxLength: 32
+          example: "acme"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          example: "Acme Inc."
+
+    PatchOrgRequest:
+      description: |
+        PATCH /v1/orgs/{slug} body. Both fields are pointer-typed
+        so the handler distinguishes "omitted" (leave alone) from
+        "zero" (clear/empty). Authz routing:
+          - name → org.manage_billing (owner + billing roles)
+          - plan → org.change_plan (owner only)
+      type: object
+      properties:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 256
+          example: "Acme Inc. (renamed)"
+        plan:
+          type: [string, "null"]
+          enum: [free, hobby, pro, scale]
+          example: "pro"
+
+    OrgResponse:
+      description: |
+        Canonical org wire shape. RFC3339 timestamps; zero-time
+        serialises as empty string. Mirrors `pkg/api.OrgResponse`.
+      type: object
+      required: [id, slug, name, personal, plan, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          description: Org UUID (stable across renames).
+        slug:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$'
+          minLength: 3
+          maxLength: 32
+          description: Lowercase slug. Personal orgs use `u-<12hex>`.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        personal:
+          type: boolean
+          description: True iff this is the caller's personal org (every account has exactly one).
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
+          description: Plan tier. Personal orgs default to `free`.
+        status:
+          type: string
+          enum: [active, past_due, suspended, deleted_pending]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    OrgListResponse:
+      description: "GET /v1/orgs response. Sorted by slug."
+      type: object
+      required: [orgs]
+      properties:
+        orgs:
+          type: array
+          items: { $ref: '#/components/schemas/OrgResponse' }
+
+    OrgWithRole:
+      description: |
+        OrgResponse + the caller's role on the active org. Used by
+        GET /v1/orgs/me (`OrgMeResponse.org`). The role field is
+        a closed enum: owner|admin|developer|viewer|billing.
+      allOf:
+        - $ref: '#/components/schemas/OrgResponse'
+        - type: object
+          required: [role]
+          properties:
+            role:
+              type: string
+              enum: [owner, admin, developer, viewer, billing]
+
+    OrgMeResponse:
+      description: |
+        GET /v1/orgs/me response. `org` is null when no X-Active-Org /
+        ?org= hint was supplied (the passthrough case every
+        pre-PR-5 route depends on).
+      type: object
+      required: [org]
+      properties:
+        org:
+          type: [string, "null"]
+          allOf:
+            - $ref: '#/components/schemas/OrgWithRole'
+          description: null when no active-org hint was supplied; otherwise the active org + caller's role.
+
+    OrgMemberResponse:
+      description: |
+        Wire shape for a single org membership row. Email is the
+        joined account.email; the account_id is also surfaced for
+        non-ambiguous referential purposes (e.g. role-change / remove
+        path segments).
+      type: object
+      required: [account_id, email, role, joined_at]
+      properties:
+        account_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        email:
+          type: string
+          format: email
+          example: "bob@acme.com"
+        role:
+          type: string
+          enum: [owner, admin, developer, viewer, billing]
+        joined_at: { type: string, format: date-time }
+
+    MemberListResponse:
+      description: "GET /v1/orgs/{slug}/members response. Only active members (removed rows filtered)."
+      type: object
+      required: [members]
+      properties:
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/OrgMemberResponse' }
+
+    ChangeMemberRoleRequest:
+      description: |
+        PATCH /v1/orgs/{slug}/members/{user_id} body. Role cannot
+        be `owner` on this endpoint — transfer-ownership is the
+        only path to owner.
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [admin, developer, viewer, billing]
+
+    InviteMemberRequest:
+      description: |
+        POST /v1/orgs/{slug}/members body. Role cannot be `owner`.
+        The handler mints a 32-byte plaintext token (returned ONCE
+        in the response) and stores only the SHA-256 hash. The
+        token expires after 14 days.
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        role:
+          type: string
+          enum: [admin, developer, viewer, billing]
+
+    OrgInvitationResponse:
+      description: |
+        Wire shape for a single invitation row. Status is the
+        runtime-derived value (pending | consumed | revoked |
+        expired) computed from the (consumed_at, revoked_at,
+        expires_at) tuple. Plaintext token is NEVER re-served —
+        it's returned ONCE on the create call via
+        InvitationWithTokenResponse.
+      type: object
+      required: [id, org_id, org_slug, email, role, status, expires_at, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-f0-9]{32}$'
+          description: 32-hex opaque invitation id (NOT canonical UUID).
+        org_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        org_slug:
+          type: string
+          pattern: '^[a-z0-9]([a-z0-9-]{1,30})[a-z0-9]$'
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [admin, developer, viewer, billing]
+        status:
+          type: string
+          enum: [pending, consumed, revoked, expired]
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    InvitationWithTokenResponse:
+      description: |
+        POST /v1/orgs/{slug}/members response. Carries the
+        one-time plaintext token in addition to the canonical
+        invitation shape. Never re-served on subsequent reads —
+        losing the token means revoking the invitation and
+        inviting again.
+      allOf:
+        - $ref: '#/components/schemas/OrgInvitationResponse'
+        - type: object
+          required: [token]
+          properties:
+            token:
+              type: string
+              description: |
+                32-byte plaintext token, base64url-encoded (44 chars).
+                Returned ONCE; never re-served. SHA-256 hash is what's
+                stored. Treat as a secret — anyone with this token
+                can accept the invitation.
+              example: "Y3J5cHRvX3JhbmRvbV8zMl9ieXRlc19iYXNlNjR1cmw="
+
+    InvitationListResponse:
+      description: "GET /v1/orgs/{slug}/invitations response. Sorted by created_at DESC."
+      type: object
+      required: [invitations]
+      properties:
+        invitations:
+          type: array
+          items: { $ref: '#/components/schemas/OrgInvitationResponse' }
+
+    TransferOwnershipRequest:
+      description: |
+        POST /v1/orgs/{slug}/transfer_ownership body. The new owner
+        must already be an active member of the org; the previous
+        owner becomes admin on success. The exactly-one-owner
+        invariant is enforced by the partial unique index
+        `org_memberships_one_owner_idx` (migration 00099).
+      type: object
+      required: [new_owner_account_id]
+      properties:
+        new_owner_account_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
   responses:
 
