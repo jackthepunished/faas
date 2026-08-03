@@ -31,6 +31,23 @@ service Vmmd {
   // instance is gone (§6.1: PARKED is zero-RAM).
   rpc PauseAndSnapshot(PauseAndSnapshotRequest) returns (SnapshotResponse);
 
+  // FrameworkReady is the vmmd-side receipt of the guest-init
+  // "framework ready" vsock DGRAM (port 1027, msg=4) signal
+  // (issue #470, PR #470-FU-B). vmmd's host-side DGRAM listener
+  // (cmd/vmmd/manager.go) calls this with the instance id and the
+  // optional warmup_ms payload; the handler stamps the per-instance
+  // `framework_ready_at` column added by migration 00112 so the
+  // engine's captureWarmSnapshot (PR #470-FU-A) can decide when
+  // the warm-tier PauseAndSnapshot is allowed to run. The RPC is
+  // idempotent — re-stamps on every subsequent signal (the engine
+  // resets the column to NULL at the start of each warm-capture
+  // cycle so a stale stamp doesn't leak across cycles). No
+  // back-pressure: the DGRAM transport is fire-and-forget by
+  // analogy with the stateless-advisory port 1025 path; a missed
+  // DGRAM means the engine's warm-capture wait times out and
+  // falls through to init-tier (correctness-preserving).
+  rpc FrameworkReady(FrameworkReadyRequest) returns (FrameworkReadyResponse);
+
   // Destroy tears down a running instance. Idempotent on unknown instances.
   rpc Destroy(DestroyRequest) returns (DestroyResponse);
 
@@ -288,6 +305,20 @@ message AppSpec {
   // :8080 inside the guest, so the path is the customer's choice
   // and the port is the host's choice. Additive per ADR-016.
   string healthcheck_path = 11;
+  // runtime (issue #470 / PR #470-FU-B) is the runner id inside
+  // the guest (e.g. "node22", "python312", "go124"). schedd
+  // sources it from the apps row at Wake time and the vmmd
+  // stamps it on the live Instance so the framework_ready
+  // DGRAM receipt path can label the
+  // vmmd_guest_framework_warmup_seconds histogram by runner.
+  // Empty falls back to "unknown" (the histogram's observer
+  // collapses the empty string to keep cardinality bounded).
+  // Bounded cardinality (≤5 runner ids today) — the runner
+  // set is the guest-init build-time constant. Required by
+  // CreateColdBoot and CreateFromSnapshot for parity with
+  // app_id; an empty value is a contract violation surfaced as
+  // InvalidArgument.
+  string runtime = 12;
 }
 
 // SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
@@ -469,6 +500,36 @@ message PauseAndSnapshotRequest {
 message SnapshotResponse {
   int64 mem_bytes     = 1;
   int64 vmstate_bytes = 2;
+}
+
+// FrameworkReady is the vmmd-side receipt of the guest-init "framework
+// ready" vsock DGRAM (port 1027, msg=4) signal (issue #470, PR
+// #470-FU-B). The vmmd host-side DGRAM listener calls this with the
+// instance id and the optional warmup_ms payload the guest chose to
+// send. The handler stamps the per-instance `framework_ready_at`
+// column added by migration 00112 so the schedd engine's
+// captureWarmSnapshot (PR #470-FU-A) can decide when the warm-tier
+// PauseAndSnapshot is allowed to run.
+message FrameworkReadyRequest {
+  // Instance id (UUIDv4) of the running instance the vmmd is
+  // managing. Required — vmmd uses this to look up the Instance
+  // (and validate the receipt matches a known row before stamping).
+  string instance = 1;
+  // WarmupMs is the optional 4-byte big-endian uint32 the guest
+  // may include in the DGRAM body after the 1-byte type=0x01
+  // marker. It is the runtime-reported warmup duration from
+  // boot to first non-5xx response. Zero is "guest sent no
+  // payload"; non-zero is the basis for the
+  // `vmmd_guest_framework_warmup_seconds` histogram observation.
+  int64 warmup_ms = 2;
+}
+
+// FrameworkReadyResponse is the wire-level acknowledgement. Empty
+// today — the wire shape is forward-compatible with future fields
+// (e.g. a "stamped_at" wall-clock echo) without a schema bump, but
+// no caller reads them yet. The engine in PR #470-FU-A doesn't
+// care about the response value; it polls the SQL column directly.
+message FrameworkReadyResponse {
 }
 
 message DestroyRequest {

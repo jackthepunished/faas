@@ -26,25 +26,26 @@ import (
 // fakeVMM is a sched.VMM that records calls and stands in for firecracker. It is
 // shared by engine_test and loop_test (both package sched).
 type fakeVMM struct {
-	mu                sync.Mutex
-	coldBoots         int
-	restores          int
-	snapshots         int
-	destroys          int
-	pings             int  // PR #114: counts Ping calls (heartbeat path)
-	prepares          int  // Tier A5: counts PrepareLiveMigration calls
-	adopts            int  // Tier A5: counts AdoptMigratedInstance calls
-	acks              int  // Tier A5: counts AcknowledgeMigration calls
-	cancels           int  // Tier A5: counts CancelLiveMigration calls
-	forceColdFallback bool // CreateFromSnapshot reports a cold-boot fallback (ADR-005)
-	wakeErr           error
-	snapErr           error
-	destroyErr        error
-	pingErr           error // PR #114: injectable Ping failure for heartbeat tests
-	prepareErr        error // Tier A5: injectable PrepareLiveMigration error
-	adoptErr          error // Tier A5: injectable AdoptMigratedInstance error
-	ackErr            error // Tier A5: injectable AcknowledgeMigration error
-	cancelErr         error // Tier A5: injectable CancelLiveMigration error
+	mu                  sync.Mutex
+	coldBoots           int
+	restores            int
+	snapshots           int
+	destroys            int
+	pings               int  // PR #114: counts Ping calls (heartbeat path)
+	frameworkReadyCount int  // PR #470-FU-B: counts FrameworkReady calls (DGRAM receipt path)
+	prepares            int  // Tier A5: counts PrepareLiveMigration calls
+	adopts              int  // Tier A5: counts AdoptMigratedInstance calls
+	acks                int  // Tier A5: counts AcknowledgeMigration calls
+	cancels             int  // Tier A5: counts CancelLiveMigration calls
+	forceColdFallback   bool // CreateFromSnapshot reports a cold-boot fallback (ADR-005)
+	wakeErr             error
+	snapErr             error
+	destroyErr          error
+	pingErr             error // PR #114: injectable Ping failure for heartbeat tests
+	prepareErr          error // Tier A5: injectable PrepareLiveMigration error
+	adoptErr            error // Tier A5: injectable AdoptMigratedInstance error
+	ackErr              error // Tier A5: injectable AcknowledgeMigration error
+	cancelErr           error // Tier A5: injectable CancelLiveMigration error
 	// lastSnapRef records the SnapshotRef CreateFromSnapshot was
 	// invoked with on its most recent call. F-2 review finding —
 	// Wake's storage_key plumbing deserves a test pin; storing the
@@ -196,6 +197,19 @@ func (f *fakeVMM) Destroy(ctx context.Context, _, _ string) error {
 		return f.destroyErr
 	}
 	f.destroys++
+	return nil
+}
+
+// FrameworkReady implements VMM for the engine-test fake (issue #470 /
+// PR #470-FU-B). The cmd/vmmd DGRAM host recv loop calls this on every
+// "framework ready" signal; the engine paths use it indirectly via
+// the live Instance row. Pure no-op for the test fake — the engine
+// tests that need to assert the receipt was dispatched to the
+// vmmd side will add a counter (IssuePR470BFrameworkReadyCalls).
+func (f *fakeVMM) FrameworkReady(_ context.Context, _, _ string, _ int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frameworkReadyCount++
 	return nil
 }
 

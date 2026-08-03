@@ -86,14 +86,27 @@ func pgStoreWithPool(t *testing.T) (*state.PgStore, *pgxpool.Pool, context.Conte
 }
 
 // seedLiveDeploy creates account+app+live-deployment and returns their ids.
-func seedLiveDeploy(t *testing.T, s *state.PgStore, ctx context.Context) (acctID, appID, depID string) {
+// The optional emailSuffix disambiguates the account.email UNIQUE key and
+// the optional slug disambiguates apps.slug (a global UNIQUE column, not
+// (account_id, slug)-scoped — see migrations/00001_init.sql:33) when a
+// test wants multiple independent accounts/apps (issue #470 / migration
+// 00089 tests seed three deployments, one per fixture row).
+func seedLiveDeploy(t *testing.T, s *state.PgStore, ctx context.Context, emailSuffix ...string) (acctID, appID, depID string) {
 	t.Helper()
-	acct, err := s.CreateAccount(ctx, "u@example.com", api.PlanPro)
+	suffix := ""
+	if len(emailSuffix) > 0 {
+		suffix = emailSuffix[0]
+	}
+	slug := "pg-app"
+	if len(emailSuffix) > 1 {
+		slug = "pg-app-" + emailSuffix[1]
+	}
+	acct, err := s.CreateAccount(ctx, "u"+suffix+"@example.com", api.PlanPro)
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	app, err := s.CreateApp(ctx, state.App{
-		AccountID: acct.ID, Slug: "pg-app", Type: state.AppTypeApp,
+		AccountID: acct.ID, Slug: slug, Type: state.AppTypeApp,
 		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60,
 	})
 	if err != nil {
@@ -1497,12 +1510,19 @@ func TestPg_DeleteSnapshotsByID_BulkAndIdempotent(t *testing.T) {
 
 	// Insert two snapshots via the public CreateSnapshot surface
 	// (also exercises the storage_key contract via F-1 — pgstore.go:1245).
+	// Migration 00089 added a UNIQUE INDEX on (deployment_id, tier) WHERE
+	// stale=false so two live init-tier rows for the same deployment
+	// collide; mark the first row stale before inserting the second
+	// (matches production: each capture supersedes the prior).
 	snapA, err := s.CreateSnapshot(ctx, state.Snapshot{
 		DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
 		StorageKey: state.SnapMemKey(depID) + "/a",
 	})
 	if err != nil {
 		t.Fatalf("CreateSnapshot A: %v", err)
+	}
+	if err := s.MarkSnapshotStale(ctx, snapA.ID); err != nil {
+		t.Fatalf("MarkSnapshotStale A: %v", err)
 	}
 	snapB, err := s.CreateSnapshot(ctx, state.Snapshot{
 		DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
@@ -1538,11 +1558,20 @@ func TestPg_DeleteSnapshotsByID_BulkAndIdempotent(t *testing.T) {
 
 func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, _, depID := seedLiveDeploy(t, s, ctx)
 
-	// Seed three snapshots across three FC versions. Only the
-	// matching-version row should stay live; the other two flip.
+	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false;
+	// only one live init-tier row is allowed per deployment. Seed three
+	// separate deployments — one per FC version — so we end up with
+	// three live init-tier rows for the sweep to act on. The sweep is a
+	// global UPDATE so the post-sweep live-row count is what matters.
+	// Capture the depID for the "matching" version (1.8.0) so the
+	// LatestSnapshot readback below can scope to that deployment.
+	var dep180 string
 	mkSnap := func(v string) string {
+		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+v, v)
+		if v == "1.8.0" {
+			dep180 = depID
+		}
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: v, MemBytes: 100, DiskBytes: 100,
 			StorageKey: state.SnapMemKey(depID) + "/" + v,
@@ -1552,17 +1581,13 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 		}
 		return snap.ID
 	}
-	// Three FC versions; only the matching one (1.8.0) stays live
-	// after the sweep. id170/id190 are captured as vars (not `_, _`)
-	// so the assignment expressions read like a fixture table —
-	// their values are checked implicitly via the LatestSnapshot
-	// readback below (only id180 should be live).
 	id170 := mkSnap("1.7.0")
 	id180 := mkSnap("1.8.0")
 	id190 := mkSnap("1.9.0")
-	_, _ = id170, id190
+	_ = id170
+	_ = id190
 
-	// Sweep against 1.8.0: 1.7.0 and 1.9.0 should flip.
+	// Sweep against 1.8.0: 1.7.0 and 1.9.0 should flip (id180 stays live).
 	n, err := s.MarkAllSnapshotsStaleByFCVersion(ctx, "1.8.0")
 	if err != nil {
 		t.Fatalf("MarkAllSnapshotsStaleByFCVersion: %v", err)
@@ -1571,8 +1596,9 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 		t.Errorf("marked %d stale, want 2", n)
 	}
 
-	// Confirm by reading back via LatestSnapshot (which filters stale).
-	latest, err := s.LatestSnapshot(ctx, depID)
+	// Confirm via LatestSnapshot on the 1.8.0 deployment — it must
+	// return id180 (still live) and not be ErrNotFound.
+	latest, err := s.LatestSnapshot(ctx, dep180)
 	if err != nil {
 		t.Fatalf("LatestSnapshot: %v", err)
 	}
@@ -1600,9 +1626,18 @@ func TestPg_MarkAllSnapshotsStaleByFCVersion_OnlyFlipsNonCurrent(t *testing.T) {
 
 func TestPg_MarkOldSnapshotsStale_OnlyFlipsGivenIDs(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, _, depID := seedLiveDeploy(t, s, ctx)
 
+	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false;
+	// only one live init-tier row is allowed per deployment. Seed three
+	// separate deployments (one per snapshot A/B/C) so we can flip
+	// exactly two of three and verify the survivor stays live.
+	// Capture depB so the LatestSnapshot readback below can scope to it.
+	var depB string
 	mkSnap := func(suffix string) string {
+		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+suffix, suffix)
+		if suffix == "b" {
+			depB = depID
+		}
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
 			StorageKey: state.SnapMemKey(depID) + "/" + suffix,
@@ -1630,8 +1665,8 @@ func TestPg_MarkOldSnapshotsStale_OnlyFlipsGivenIDs(t *testing.T) {
 		t.Errorf("MarkOldSnapshotsStale(nil) = (%d, %v), want (0, nil)", n0, err)
 	}
 
-	// LatestSnapshot filters stale; the survivor is B.
-	latest, err := s.LatestSnapshot(ctx, depID)
+	// LatestSnapshot filters stale; the survivor on depB is B.
+	latest, err := s.LatestSnapshot(ctx, depB)
 	if err != nil {
 		t.Fatalf("LatestSnapshot: %v", err)
 	}
@@ -1713,10 +1748,14 @@ func TestPg_ListLiveSnapshotStats_ExcludesStaleAndOrdersByMemBytesDesc(t *testin
 		t.Fatalf("migrate: %v", err)
 	}
 	s := state.NewPgStore(pool)
-	_, _, depID := seedLiveDeploy(t, s, ctx)
 
 	// Insert three snapshots: one stale (filtered), two live.
+	// Migration 00089 added UNIQUE (deployment_id, tier) WHERE stale=false;
+	// only one live init-tier row is allowed per deployment. Seed three
+	// separate deployments — one per snapshot — so we get three rows
+	// (one stale, two live) without colliding on the partial index.
 	mkSnap := func(suffix string, stale bool) string {
+		_, _, depID := seedLiveDeploy(t, s, ctx, "-"+suffix, suffix)
 		snap, err := s.CreateSnapshot(ctx, state.Snapshot{
 			DeploymentID: depID, FCVersion: "1.8.0", MemBytes: 100, DiskBytes: 100,
 			StorageKey: state.SnapMemKey(depID) + "/" + suffix,

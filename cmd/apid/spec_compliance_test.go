@@ -38,6 +38,7 @@ const (
 	mfaFile       = "mfa.go"
 	sessionsFile  = "sessions.go" // IAM-3 (ADR-039)
 	errorsFile    = "errors.go"
+	wakeTLFile    = "wake_timeline.go" // issue #517 PR-C / ADR-064
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -77,6 +78,7 @@ var routeExclude = map[string]bool{
 	"GET /status":                             true, // public HTML status page
 	"GET /status/slo.json":                    true, // public status JSON
 	"GET /healthz":                            true, // loopback infra probe
+	"GET /v1/orgs/me":                         true, // PR-4 LoadOrg seam (issue #190 / IAM-6 / ADR-061); documented in PR 5 alongside the rest of /v1/orgs/{slug}
 }
 
 // dtoExclude lists pkg/api exported DTOs that are intentionally not in the
@@ -499,6 +501,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", mfaFile),
 		filepath.Join(root, "pkg", "api", sessionsFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
+		filepath.Join(root, "pkg", "api", wakeTLFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

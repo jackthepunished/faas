@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -121,41 +120,63 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if req.StreamingEnabled != nil {
 		streaming = *req.StreamingEnabled
 	}
+	// Issue #470 / ADR-055: per-app two-tier snapshot flag. Apply
+	// the plan-level default when the request didn't carry one —
+	// a Pro customer's brand-new app gets warm.snap capture
+	// without an extra PATCH round-trip. Free/Hobby default to
+	// false (the only legal value on those tiers; apid rejects
+	// PATCH-true with 403 plan_warm_snapshot_not_allowed). The
+	// per-request override on Pro/Scale lets a customer opt out
+	// (e.g. an app they know runs cold every request).
+	warmEnabled := acct.Plan.WarmSnapshotEnabled()
+	if req.WarmSnapshotEnabled != nil {
+		warmEnabled = *req.WarmSnapshotEnabled
+	}
+	// Apply the per-app threshold defaults from the plan; an
+	// explicit override on the request wins. Out-of-range values
+	// were already rejected at the JSON-decode layer
+	// (api.ValidateWarmSnapshotBounds), so the only path that
+	// produces an out-of-range value here is a buggy test or
+	// internal caller.
+	warmMinReqs := acct.Plan.WarmSnapshotMinRequestsDefault()
+	if req.WarmSnapshotMinRequests != nil {
+		warmMinReqs = *req.WarmSnapshotMinRequests
+	}
+	warmMinMs := acct.Plan.WarmSnapshotMinMsDefault()
+	if req.WarmSnapshotMinMs != nil {
+		warmMinMs = *req.WarmSnapshotMinMs
+	}
 	return state.App{
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
-		StreamingEnabled: streaming,
+		StreamingEnabled:    streaming,
+		WarmSnapshotEnabled: warmEnabled,
+		// Coerce to the plan minimums when the request asked for a
+		// warm config but the plan says warm-snapshot is off: the
+		// store ignores them anyway (the cold-boot path doesn't
+		// read min_requests / min_ms), and the apid response
+		// projects the plan defaults so dashboards stay consistent.
+		WarmSnapshotMinRequests: warmMinReqs,
+		WarmSnapshotMinMs:       warmMinMs,
 	}, nil
 }
 
 func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	// DeployedApps (the per-account cap on apps) is enforced at app-create
-	// time via store.CreateAppIfUnderQuota — the deploy path cannot
-	// bypass it because the parent apps row must already exist. The
-	// active-app gate that prevents an orphan deployment row pointing
-	// at a soft-deleted app lives inside store.CreateDeployment
-	// (PR-A: SELECT 1 FROM apps WHERE id=$1 AND status='active' FOR UPDATE).
-	// If the app was deleted between this AppBySlug and the
-	// CreateDeployment INSERT, the store returns ErrNotFound and we
-	// surface the same 404 as a missing slug.
-	app, err := s.store.AppBySlug(ctx(r), r.PathValue("slug"))
-	if err != nil || app.AccountID != acct.ID {
-		s.notFound(w, "no such app")
+	// DeployedApps is enforced at app-create time; the active-app
+	// gate lives in store.CreateDeployment (returns ErrNotFound on a
+	// soft-deleted app, which we surface as 404 here). Multipart
+	// uploads go down the createDeploymentMultipart branch; the
+	// JSON branch is the rest of this handler. Extracted to
+	// loadAppAndPreflight so createDeployment stays under the
+	// CLAUDE.md 50-line handler cap.
+	app, ok, limits := s.loadAppAndPreflight(w, r, acct)
+	if !ok {
 		return
 	}
-	ct := r.Header.Get("Content-Type")
-	// Lookup the plan limits once. Both branches need them:
-	//   - multipart: cap upload size at SourceTarballMaxMB
-	//   - JSON:     validate override env byte + count caps
-	// Hoisting avoids a second MustLimitsFor call in the override
-	// branch (issue #460 / ADR-053).
-	limits := api.MustLimitsFor(acct.Plan)
-	if strings.HasPrefix(ct, "multipart/form-data") {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
 		// Cap upload size at the plan's SourceTarballMaxMB before any
 		// multipart parsing — MaxBytesReader returns a *MaxBytesError on
-		// overflow, which r.MultipartReader surfaces as a parse error that
-		// createDeploymentMultipart already maps to 413. The pre-Check
-		// in deploy_inputs.go only fires when ContentLength is known.
+		// overflow which createDeploymentMultipart maps to 413.
 		max := int64(limits.SourceTarballMaxMB) * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, max)
 		s.createDeploymentMultipart(w, r, acct, app)
@@ -171,177 +192,62 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 			"Image required", "image: deploys require a digest-pinned reference, e.g. registry.gregale.dev/app@sha256:..."))
 		return
 	}
-	// Issue #472 / ADR-054: pre-flight signature-enforcement gate.
-	// Runs after the digest check (a missing image is a more
-	// fundamental request shape error than a missing signer) and
-	// before the override Validate (so a fail-closed deployment
-	// doesn't pay the override-validation cost). The flag is on
-	// the apps row (apps.require_signed); we do NOT trust the
-	// customer's req.RequireSigned opt-in to override the operator
-	// policy — the per-app flag wins (fail-closed). A customer
-	// attempt to clear an operator-on flag is rejected here:
-	//
-	//   app.require_signed=true  &  req.RequireSigned=*false   → 403
-	//
-	// The "no trusted signers configured" check is the actual
-	// fail-closed trip — the operator toggled the flag but never
-	// onboarded a publisher. We surface this immediately at
-	// accept-time so the customer sees 403 with a clear message,
-	// not a pending→failed two-step inside imaged.
-	if app.RequireSigned {
-		signers, sErr := s.store.ListAppTrustedSigners(ctx(r), acct.ID, app.ID)
-		if sErr != nil {
-			api.WriteProblem(w, api.ErrCapacity("could not load trusted signers"))
-			return
-		}
-		if len(signers) == 0 {
-			api.WriteProblem(w, api.ErrDeploySignatureInvalid(
-				"apps.require_signed=true but no trusted publishers are configured for this app; ask the operator to onboard a publisher via PUT /v1/apps/{slug}/trusted_signers/{name}."))
-			return
-		}
-		// Customer-request override: an attempt to turn the flag
-		// off on this single deploy is rejected with operator >
-		// customer. A nil request field is "leave the per-app flag
-		// alone" (the apid default); *true is a no-op (the flag
-		// is already on); only *false collides.
-		if req.RequireSigned != nil && !*req.RequireSigned {
-			api.WriteProblem(w, api.ErrDeploySignatureInvalid(
-				"apps.require_signed=true on this app; per-deploy opt-out is not permitted (operator policy wins)."))
-			return
-		}
+	// Pre-CreateDeployment validation gates (#472 / #460 / #463).
+	// Gate order matters (signature → override → sidecar); each
+	// helper short-circuits only on its own failure.
+	if p := enforceSignatureGate(ctx(r), s, acct, app, &req); p != nil {
+		api.WriteProblem(w, p)
+		return
 	}
-	// Issue #460 / ADR-053: validate the override object AFTER the
-	// image digest check (digest first — a missing image is a more
-	// fundamental request shape error than a malformed override).
-	// A failed override validation 400s the whole request — the
-	// override is NEVER silently dropped (ADR-053 §Decision 2).
-	// Plan tier comes from the authenticated account (limits already
-	// hoisted above the multipart branch).
-	var overrides *api.CreateDeploymentOverrides
-	if req.Overrides != nil {
-		if p := req.Overrides.Validate(limits); p != nil {
-			api.WriteProblem(w, p)
-			return
-		}
-		overrides = req.Overrides
+	overrides, p := validateOverrides(&req, limits)
+	if p != nil {
+		api.WriteProblem(w, p)
+		return
 	}
-	// PR-B: the prior-deployment supersede is folded into
-	// store.CreateDeployment's tx (pkg/state/pgstore.go). apid no longer
-	// holds a "supersede then create" two-step — the in-tx ordering
-	// guarantees the previous live deployment is NEVER observed
-	// superseded without the new pending row also being visible. We
-	// read the prior row BEFORE the call via LatestDeployment so the
-	// supersede-notify can carry its id; this keeps the return shape
-	// 2-tuple and backward-compatible with pre-PR-B call sites.
+	if p := validateAndPlanSidecars(&req, acct, limits); p != nil {
+		api.WriteProblem(w, p)
+		return
+	}
+	// PR-B: prior-deployment supersede is in store.CreateDeployment's tx;
+	// we read prev BEFORE the call so the supersede-notify can carry
+	// its id (LatestDeployment returns the post-supersede row).
 	prev, _ := s.store.LatestDeployment(ctx(r), app.ID)
-	dep := state.Deployment{
-		AppID: app.ID, ImageDigest: req.Image, Kind: state.DeploymentKindImage, Status: state.DeployPending,
-	}
-	if overrides != nil {
-		// Convert the validated override into the DB shape. The
-		// json.RawMessage columns carry the marshalled map; nil
-		// means "no override" (the store writes NULL).
-		if len(overrides.Entrypoint) > 0 {
-			dep.OverrideEntrypoint = overrides.Entrypoint
-		}
-		if len(overrides.Cmd) > 0 {
-			dep.OverrideCmd = overrides.Cmd
-		}
-		if len(overrides.Env) > 0 {
-			if b, err := json.Marshal(overrides.Env); err == nil {
-				dep.OverrideEnv = b
-			}
-		}
-		if len(overrides.EnvSecrets) > 0 {
-			if b, err := json.Marshal(overrides.EnvSecrets); err == nil {
-				dep.OverrideEnvSecrets = b
-			}
-		}
-		if overrides.Port != 0 {
-			dep.OverridePort = overrides.Port
-		}
-		if overrides.Healthcheck != nil {
-			if b, err := json.Marshal(overrides.Healthcheck); err == nil {
-				dep.OverrideHealthcheck = b
-			}
-		}
+	dep, sErr := buildDeploymentForInsert(app, &req, overrides, limits)
+	if sErr != nil {
+		api.WriteProblem(w, sErr)
+		return
 	}
 	d, err := s.store.CreateDeployment(ctx(r), dep)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
 	}
-	// IAM-2 (issue #186): 2nd-deploy chokepoint. The deployment
-	// row is now visible; CountDeployments reflects this one
-	// (the SQL filter excludes failed/superseded). If the new
-	// count is >= 2, the customer crossed the threshold on
-	// this deploy — arm mfa_required for the next login.
+	// IAM-2 2nd-deploy chokepoint: arm mfa_required when this is the
+	// customer's 2nd live deployment. Post-CreateDeployment notify +
+	// audit + log fan-out is in notifyAndAuditDeployment.
 	s.maybeFlipMFAOnDeploy(ctx(r), acct)
-	// F-03: deployment_changed emits now carry status + deployment_id.
-	// status="pending" tells listeners this row is still in-flight (builderd
-	// will eventually stamp rootfs_path → imaged converts to ext4); later
-	// transitions re-emit with status="live"|"failed"|"superseded".
-	// deployment_id==to here, but imaged switches on deployment_id in
-	// handleDeployment. Apid does not synthesise every transition — the
-	// state machine walks pending→building→imaging→snapshotting→live and
-	// each row write is followed by a NotifyDeploymentChanged. The image
-	// branch below covers the first hop (submitted); later hops land in
-	// cmd/apid/deploy_steps.go.
-	_ = s.notif.Notify(ctx(r), db.NotifyDeploymentChanged,
-		fmt.Sprintf(`{"kind":"image","status":"pending","app_id":"%s","deployment_id":"%s","to":"%s"}`, app.ID, d.ID, d.ID))
-	// PR-B: if a prior row was just superseded inside the same tx,
-	// fire a second NotifyDeploymentChanged so imaged's F5 cleanup
-	// handler (handleDeploymentChanged) can drop the prior snapshot.
-	// The notify carries status="superseded" + to=prev.ID; if no prev
-	// existed (first deploy on this app), skip the second notify.
-	if prev.ID != "" {
-		_ = s.notif.Notify(ctx(r), db.NotifyDeploymentChanged,
-			fmt.Sprintf(`{"kind":"image","status":"superseded","app_id":"%s","deployment_id":"%s","to":"%s"}`, app.ID, prev.ID, prev.ID))
-	}
-	// Sanitize req.Image at the log sink — CodeQL go/log-injection (CWE-117).
-	// isDigestPinned already rejects malformed refs with 400 before this line,
-	// but a future field/wrapper change would break that invariant. Sanitizing
-	// here means the log statement stays safe regardless of upstream changes.
-	// d.ID and app.ID are server-generated UUIDs — no sanitize needed.
-	s.log.Info("deployment created", "deployment", d.ID, "app", app.ID, "ref", logsanitize.Field(req.Image))
-	// IAM-4 (issue #291): record the deployment. data.supersedes
-	// is the previous deployment_id (PR-B: read before the
-	// CreateDeployment tx via LatestDeployment, line 167 in the
-	// pre-PR-#340 layout). Empty when this is the first deploy
-	// on the app — dashboards can distinguish "first deploy"
-	// from "supersede" without inspecting app history.
-	//
-	// Issue #460 / ADR-053: data.has_overrides is the audit-side
-	// mirror of the HasOverrides response field. Set true when the
-	// deployment carried any override_* column. The override values
-	// themselves are NEVER in the audit payload — only the boolean
-	// (ADR-053 §Decision 4 + ADR-045 §Decision 6 mirror: env values
-	// never cross the audit sink).
-	hasOverrides := req.Overrides != nil
-	s.audit.Emit(ctx(r), "app.deployed", &acct.ID, map[string]any{
-		"app_id":        app.ID,
-		"deployment_id": d.ID,
-		"ref":           req.Image,
-		"supersedes":    prev.ID,
-		"has_overrides": hasOverrides,
-	})
-	// Issue #472 / ADR-054: emit app.signed_image_accepted here ONLY
-	// when require_signed is on for this deploy. imaged will later
-	// emit app.signature_invalid / app.signature_missing from its
-	// verify hook (Bucket 4), but the "request passed the operator
-	// gate" event is apid's surface — the deploy is acked before
-	// imaged even runs the verify. The audit row answers "which
-	// signature-gated deploy was accepted on what app" without a
-	// follow-up GET. Empty ref column keeps the row distinct from
-	// the plain app.deployed event (different `kind`).
-	if app.RequireSigned {
-		s.audit.Emit(ctx(r), "app.signed_image_accepted", &acct.ID, map[string]any{
-			"app_id":        app.ID,
-			"deployment_id": d.ID,
-			"ref":           req.Image,
-		})
-	}
+	notifyAndAuditDeployment(ctx(r), s, acct, app, d, prev, &req)
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
+}
+
+// loadAppAndPreflight resolves the app from the URL slug, enforces
+// IDOR (app.AccountID == acct.ID), and hoists the per-plan limits.
+// On any failure path, writes the appropriate error response and
+// returns ok=false; on success returns (app, true, limits).
+//
+// Extracted from createDeployment (handlers.go) so the handler stays
+// under the CLAUDE.md 50-line cap. The IDOR check is identical to
+// loadApp in auth_facade.go; the difference is we ALSO return the
+// per-plan limits, which createDeployment needs both for the
+// multipart-source-tarball cap and the override / sidecar
+// validators.
+func (s *server) loadAppAndPreflight(w http.ResponseWriter, r *http.Request, acct state.Account) (state.App, bool, api.Limits) {
+	app, err := s.store.AppBySlug(ctx(r), r.PathValue("slug"))
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such app")
+		return state.App{}, false, api.Limits{}
+	}
+	return app, true, api.MustLimitsFor(acct.Plan)
 }
 
 func (s *server) appResponse(a state.App) api.AppResponse {
@@ -392,6 +298,14 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 		// the streaming flag, and so a customer can verify their
 		// PATCH landed without a second round-trip.
 		RequireSigned: a.RequireSigned,
+		// Issue #470 / ADR-055: per-app two-tier-snapshot flag +
+		// thresholds. Surfaced so dashboards can show "warm snapshot
+		// on / off" alongside the streaming + require_signed pills,
+		// and so a customer can verify the per-app override values
+		// they PATCHed.
+		WarmSnapshotEnabled:     a.WarmSnapshotEnabled,
+		WarmSnapshotMinRequests: a.WarmSnapshotMinRequests,
+		WarmSnapshotMinMs:       a.WarmSnapshotMinMs,
 	}
 }
 

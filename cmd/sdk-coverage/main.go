@@ -105,43 +105,46 @@ var sdkMethodExclude = map[string]bool{
 //
 // Key = "<METHOD> <path>"; value = SDK method name.
 var methodRouteMap = map[string]string{
-	"DELETE /v1/keys/{id}":                 "DeleteKey",
-	"DELETE /v1/domains/{domain}":          "DeleteDomain",
-	"DELETE /v1/crons/{id}":                "DeleteCron",
-	"DELETE /v1/apps/{slug}":               "DeleteApp",
-	"DELETE /v1/apps/{slug}/secrets/{key}": "UnsetSecret",
-	"PUT /v1/apps/{slug}/secrets/{key}":    "SetSecret",
-	"PATCH /v1/apps/{slug}":                "UpdateApp",
-	"POST /v1/apps/{slug}/rename":          "RenameApp",
-	"GET /v1/apps/{slug}":                  "GetApp",
-	"GET /v1/apps/{slug}/instances":        "ListInstances",
-	"POST /v1/apps/{slug}/park":            "Park",
-	"POST /v1/apps/{slug}/wake":            "Wake",
-	"POST /v1/apps/{slug}/rollback":        "Rollback",
-	"POST /v1/apps/{slug}/deployments":     "Deploy",
-	"GET /v1/account/export":               "ExportAccount",
-	"DELETE /v1/account":                   "DeleteAccount",
-	"PATCH /v1/account/plan":               "ChangePlan",
-	"GET /v1/account":                      "Whoami",
-	"POST /v1/account/restore":             "RestoreAccount",
-	"GET /v1/apps/{slug}/logs":             "StreamAppLogs",
-	"GET /v1/deployments/{id}/logs":        "StreamDeploymentLogs",
-	"GET /v1/deployments/{id}":             "GetDeployment",
-	"GET /v1/deployments":                  "ListDeployments",
-	"GET /v1/apps":                         "ListApps",
-	"POST /v1/apps":                        "CreateApp",
-	"GET /status/slo.json":                 "GetStatusSLO",
-	"PATCH /v1/crons/{id}":                 "UpdateCron",
-	"POST /v1/crons":                       "CreateCron",
-	"GET /v1/crons":                        "ListCrons",
-	"GET /v1/usage/summary":                "UsageSummary",
-	"GET /v1/usage":                        "GetUsage",
-	"GET /v1/usage/daily":                  "UsageDaily",
-	"GET /v1/usage/storage":                "StorageUsage",
-	"GET /v1/invoices":                     "ListInvoices",
-	"GET /v1/apps/{slug}/secrets":          "ListSecrets",
-	"GET /v1/domains":                      "ListDomains",
-	"POST /v1/domains":                     "CreateDomain",
+	"DELETE /v1/keys/{id}":                     "DeleteKey",
+	"POST /v1/keys/{id}/rotate":                "RotateKey",
+	"PATCH /v1/account/keys/grace_window_days": "SetGraceWindow",
+	"GET /v1/account/keys/grace_window_days":   "GetGraceWindow",
+	"DELETE /v1/domains/{domain}":              "DeleteDomain",
+	"DELETE /v1/crons/{id}":                    "DeleteCron",
+	"DELETE /v1/apps/{slug}":                   "DeleteApp",
+	"DELETE /v1/apps/{slug}/secrets/{key}":     "UnsetSecret",
+	"PUT /v1/apps/{slug}/secrets/{key}":        "SetSecret",
+	"PATCH /v1/apps/{slug}":                    "UpdateApp",
+	"POST /v1/apps/{slug}/rename":              "RenameApp",
+	"GET /v1/apps/{slug}":                      "GetApp",
+	"GET /v1/apps/{slug}/instances":            "ListInstances",
+	"POST /v1/apps/{slug}/park":                "Park",
+	"POST /v1/apps/{slug}/wake":                "Wake",
+	"POST /v1/apps/{slug}/rollback":            "Rollback",
+	"POST /v1/apps/{slug}/deployments":         "Deploy",
+	"GET /v1/account/export":                   "ExportAccount",
+	"DELETE /v1/account":                       "DeleteAccount",
+	"PATCH /v1/account/plan":                   "ChangePlan",
+	"GET /v1/account":                          "Whoami",
+	"POST /v1/account/restore":                 "RestoreAccount",
+	"GET /v1/apps/{slug}/logs":                 "StreamAppLogs",
+	"GET /v1/deployments/{id}/logs":            "StreamDeploymentLogs",
+	"GET /v1/deployments/{id}":                 "GetDeployment",
+	"GET /v1/deployments":                      "ListDeployments",
+	"GET /v1/apps":                             "ListApps",
+	"POST /v1/apps":                            "CreateApp",
+	"GET /status/slo.json":                     "GetStatusSLO",
+	"PATCH /v1/crons/{id}":                     "UpdateCron",
+	"POST /v1/crons":                           "CreateCron",
+	"GET /v1/crons":                            "ListCrons",
+	"GET /v1/usage/summary":                    "UsageSummary",
+	"GET /v1/usage":                            "GetUsage",
+	"GET /v1/usage/daily":                      "UsageDaily",
+	"GET /v1/usage/storage":                    "StorageUsage",
+	"GET /v1/invoices":                         "ListInvoices",
+	"GET /v1/apps/{slug}/secrets":              "ListSecrets",
+	"GET /v1/domains":                          "ListDomains",
+	"POST /v1/domains":                         "CreateDomain",
 
 	// Issue #396 / ADR-045 PR 3 — alert rules. The auto-derivation
 	// would produce names with literal hyphens for the rotate-secret
@@ -193,6 +196,14 @@ var methodRouteMap = map[string]string{
 	// the SDK's flat resource naming.
 	"GET /v1/audit-events":      "ListAuditEvents",
 	"GET /v1/audit-events/{id}": "GetAuditEvent",
+
+	// Issue #517 / PR-C / ADR-064 — wake timeline. The route is a
+	// sub-resource of /v1/apps/{slug}/wakes/{wake_id}/timeline; the
+	// auto-derivation would produce "GetAppsSlugWakesWake-idTimeline"
+	// (literal hyphens preserved in the path segment). The explicit
+	// map drops the path-separator noise and conforms to the SDK's
+	// flat verb naming.
+	"GET /v1/apps/{slug}/wakes/{wake_id}/timeline": "ListWakeTimeline",
 
 	// ADR-050 Phase 3 — repo decomposition. The two routes take
 	// multipart bodies so the SDK verb is named after the action

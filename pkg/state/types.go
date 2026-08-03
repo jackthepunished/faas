@@ -158,6 +158,16 @@ type Account struct {
 	// keys ignore this column per the IAM-2 design decision (keys are
 	// already cryptographically scoped).
 	MFARequired bool
+	// KeyGraceWindowDays overrides the plan-default API-key rotation
+	// grace window (issue #189 / IAM-5, default 7 days). NIL falls
+	// through to the plan default; 0 forces atomic rotation (the old
+	// key is revoked the moment the new one is minted); a positive
+	// value sets the grace explicitly. The auth hot path does NOT
+	// read this column — only the rotation handler does, via a
+	// short-TTL in-process cache (cmd/apid.graceWindowCache). The
+	// CHECK constraint accounts_key_grace_window_days_check enforces
+	// the (NULL or >= 0) shape at the DB layer.
+	KeyGraceWindowDays *int
 }
 
 // Active reports whether the account may deploy (not suspended/deleted).
@@ -176,14 +186,59 @@ func (a Account) MFAEnrolled() bool { return a.MFAEnrolledAt != nil }
 // authorization scopes attached to the key (e.g. "admin", "read", "write");
 // the apid middleware checks them on every authenticated request. See
 // ADR-034 and the IAM-1 plan.
+//
+// The trailing four fields are the IAM-5 (issue #189) surface:
+//
+//   - ExpiresAt: nullable; nil = never expires (legacy admin keys +
+//     the additive migration's promise to existing rows). The auth
+//     path enforces the gate in state.AuthenticateKey, not via a DB
+//     constraint. New non-admin keys receive `now() + 365 days` at
+//     creation; admin keys stay nullable per the existing contract.
+//   - Status: APIKeyStatus = 'active' | 'grace' | 'revoked'. The
+//     state machine is enforced by the store (AuthenticateKey,
+//     MarkAPIKeyRevoked, RotateAPIKey); the SQL CHECK is the floor.
+//     See APIKeyStatus for the full contract.
+//   - RevokedAt: terminal timestamp, set on explicit revoke, atomic
+//     rotation, or lazy expiry. The lazy path is one UPDATE per
+//     expired key on the first auth attempt that observes it
+//     (state.AuthenticateKey), not a background sweeper.
+//   - RotatedFromID: FK to the predecessor on the new key after
+//     rotation. nil on the original key. The reverse direction
+//     (which new key replaced this one) is a one-step walk at the
+//     call site — there is no rotated_to_id column to keep the
+//     key row immutable post-rotation.
+//
+// APIKeyStatus is the state machine for an API key (issue #189 /
+// IAM-5). Three states; the CHECK constraint in migration 00106
+// (`api_keys_status_check`) is the SQL floor, the store methods
+// are the wall.
+//
+//   - Active: ready to authenticate. The default for fresh
+//     non-admin keys.
+//   - Grace: post-rotation window. The old key still authenticates
+//     until its overwritten expires_at.
+//   - Revoked: terminal. Lazy expiry (state.AuthenticateKey),
+//     explicit DELETE, and atomic rotation all flip here.
+type APIKeyStatus string
+
+const (
+	APIKeyStatusActive  APIKeyStatus = "active"
+	APIKeyStatusGrace   APIKeyStatus = "grace"
+	APIKeyStatusRevoked APIKeyStatus = "revoked"
+)
+
 type APIKey struct {
-	ID         string
-	AccountID  string
-	Hash       []byte
-	Label      string
-	Scopes     []string
-	LastUsedAt time.Time
-	CreatedAt  time.Time
+	ID            string
+	AccountID     string
+	Hash          []byte
+	Label         string
+	Scopes        []string
+	LastUsedAt    time.Time
+	CreatedAt     time.Time
+	ExpiresAt     *time.Time
+	Status        string
+	RevokedAt     *time.Time
+	RotatedFromID *string
 }
 
 // App is a deployed application (or function). The Manifest carries the
@@ -305,7 +360,6 @@ type App struct {
 	// reaper park branch.
 	LastScaleOutAt *time.Time
 	LastScaleInAt  *time.Time
-	CreatedAt      time.Time
 	// NodeID is the durable shard key that ties an app to its
 	// owner compute_node (Phase 2 / Gate A, migration 00090).
 	// Set once at CreateApp time by apid's PlacementScheduler
@@ -322,7 +376,7 @@ type App struct {
 	NodeID string
 	// ReassignedAt is the wall-clock time of the most recent
 	// successful cross-node reassignment (Tier A4, migration
-	// 00092). Stamped by Store.ReassignAppOwner in the same
+	// 00095). Stamped by Store.ReassignAppOwner in the same
 	// UPDATE that flips apps.node_id. The rebalancer's hot
 	// filter is `reassigned_at IS NULL OR reassigned_at <
 	// now() - interval '<cooldown>s'`, so a fresh
@@ -335,7 +389,7 @@ type App struct {
 	ReassignedAt *time.Time
 	// MigratedAt is the wall-clock time of the most recent
 	// cross-node LIVE-INSTANCE migration for this app
-	// (Tier A5, migration 00098, ADR-066, follow-up to
+	// (Tier A5, migration 00098, ADR-068, follow-up to
 	// ADR-064). Distinct from ReassignedAt, which carries the
 	// PARKED-app rebalance commit. Both columns can coexist
 	// on the same app — an app whose instances migrated live
@@ -350,6 +404,30 @@ type App struct {
 	// rebalancer's hot filter is on instances.state, not on
 	// apps.migrated_at.
 	MigratedAt *time.Time
+	// WarmSnapshotEnabled (issue #470 / ADR-055) toggles the
+	// two-tier snapshot path (init.snap + warm.snap). When true
+	// and the customer's plan is Pro or Scale, schedd captures a
+	// second snapshot after the framework listener reports ready,
+	// and the wake-path prefers warm.snap on restore. The column
+	// is per-app (operators may PATCH it via /v1/apps/{slug}); the
+	// plan-gated default lives in pkg/api/limits.go
+	// (WarmSnapshotDefault).
+	WarmSnapshotEnabled bool
+	// WarmSnapshotMinRequests is the minimum successful request
+	// count before schedd promotes a warm-tier capture. Range
+	// [1, 100], default 5. Lowering this shortens the time to
+	// first warm.snap but risks capturing mid-warmup states; the
+	// range bound is enforced both at the SQL CHECK layer and at
+	// the apid handler so a bad PATCH can't degrade the box.
+	WarmSnapshotMinRequests int
+	// WarmSnapshotMinMs is the minimum time-since-first-ready in
+	// milliseconds before schedd promotes a warm-tier capture.
+	// Range [100, 60000], default 2000. The 100 ms floor blocks
+	// capturing too early (before JIT/AOT has a chance to fire);
+	// the 60 s ceiling bounds the per-park latency cost the warm
+	// capture adds to the cold path (R1 in the plan).
+	WarmSnapshotMinMs int
+	CreatedAt         time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -620,6 +698,20 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
+	// Sidecars (issue #463 / ADR-068). Up to 2 stateless sidecars
+	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
+	// `deployments.sidecars` column (migration 00095). Field is
+	// json.RawMessage (NOT []api.Sidecar) so the state package
+	// does NOT import pkg/api — see pkg/api ↔ pkg/state cycle
+	// (memory: pkg-api-cannot-import-pkg-state). The decoder
+	// logic lives at the handler boundary (cmd/apid/handlers_deployments.go)
+	// where pkg/api and pkg/state meet. PR-A only persists the
+	// shape; PR-B threads the array into imaged's pull path and
+	// guest-init's supervise loop. env values are stored
+	// envelope-sealed (namespace="sidecar_env"); PR-B unseals
+	// transiently at the pull path (mirrors app_env_secret
+	// unseal at the same seam).
+	Sidecars json.RawMessage `json:"sidecars,omitempty"`
 }
 
 // Build is one build pipeline run for a deployment (spec §9). Builderd writes
@@ -1050,7 +1142,7 @@ type Instance struct {
 	WakeID string
 	// MigratedFromNodeID is the prior owner compute_node after a
 	// cross-node live-instance handoff (Tier A5, migration 00097,
-	// ADR-066, follow-up to ADR-064). FK to compute_nodes(id) ON
+	// ADR-068, follow-up to ADR-064). FK to compute_nodes(id) ON
 	// DELETE SET NULL — the lineage reference stays honest when a
 	// node is decommissioned (the row stays, the column flips to
 	// NULL). Distinct from apps.node_id (the durable shard key for
@@ -1079,6 +1171,27 @@ type Instance struct {
 	// expiry. Mirrors the A4 `apps.reassigned_at` schema
 	// discipline. Nullable forever.
 	LeaseToken string
+	// FrameworkReadyAt is the wall-clock stamp the vmmd records
+	// when the guest-init signals "framework ready" via vsock DGRAM
+	// port 1027 (msg=4). Two-tier snapshot (issue #470, PR
+	// #470-FU-B): the engine waits on this column BEFORE issuing
+	// the second PauseAndSnapshot that captures the warm tier, so
+	// the warm snapshot is captured AFTER the framework has
+	// compiled routes, primed JIT, populated ORM pools, etc.
+	// Without this stamp the engine would snapshot the app the
+	// moment it returned from `waitReady` -- framework listeners
+	// cold, JIT at tier 0, route tables empty -- and warm-tier
+	// restore would pay the framework-warmup cost on every wake.
+	// Nullable forever: legacy rows never had a vsock signal;
+	// Free/Hobby plans never opt in; instances that flipped
+	// warm-snapshot off mid-flight stay null. The engine treats
+	// null as "no warm capture available, fall through to init
+	// tier". The vmmd gRPC `FrameworkReady` RPC writes the column
+	// (PR #470-FU-B); the engine reads it via the existing
+	// `e.store.GetInstance(ctx, id)` path. NOT NULL NOT enforced
+	// (no CHECK constraint in migration 00112). Pre-existing rows
+	// are backfilled with the migration's DEFAULT NULL.
+	FrameworkReadyAt *time.Time
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis
@@ -1392,8 +1505,30 @@ type UpdateAppParams struct {
 	// deploys are unaffected.
 	RequireSigned    *bool
 	SetRequireSigned bool
-	Status           *AppStatus
-	Manifest         *AppManifest
+	// WarmSnapshotEnabled (issue #470 / ADR-055) toggles the
+	// two-tier snapshot path. SetWarmSnapshotEnabled distinguishes
+	// "unset" (don't touch) from "explicit false" (disable warm
+	// capture). Plan-gated upstream: apid returns
+	// 403 plan_warm_snapshot_not_allowed when the customer's plan
+	// is Free or Hobby AND the value would be true. Customers may
+	// PATCH true → false on any plan to opt out per-app.
+	WarmSnapshotEnabled    *bool
+	SetWarmSnapshotEnabled bool
+	// WarmSnapshotMinRequests (issue #470 / ADR-055) is the
+	// request-count threshold for warm-tier capture. Range [1, 100].
+	// SetWarmSnapshotMinRequests distinguishes "unset" from
+	// "explicit zero" (illegal — the SQL CHECK rejects 0).
+	WarmSnapshotMinRequests    *int
+	SetWarmSnapshotMinRequests bool
+	// WarmSnapshotMinMs (issue #470 / ADR-055) is the
+	// time-since-first-ready threshold for warm-tier capture.
+	// Range [100, 60000]. SetWarmSnapshotMinMs distinguishes
+	// "unset" from "explicit low value" (illegal — the SQL CHECK
+	// rejects <100).
+	WarmSnapshotMinMs    *int
+	SetWarmSnapshotMinMs bool
+	Status               *AppStatus
+	Manifest             *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
@@ -1436,6 +1571,15 @@ type Snapshot struct {
 	FCVersion    string
 	MemBytes     int64
 	DiskBytes    int64
+	// Tier (issue #470 / ADR-055) is which snapshot tier this row
+	// belongs to: "init" (taken right after guest-init signals
+	// :8080 bound; restore pays framework warmup) or "warm"
+	// (taken after N successful requests ≥ warm_snapshot_min_ms,
+	// when the framework is hot — restore skips the warmup cost).
+	// The DEFAULT 'init' on the column covers every pre-PR row.
+	// Empty string in Go is treated as "init" by LatestSnapshotForTier
+	// so legacy callers stay valid.
+	Tier string
 	// StorageKey is the canonical StorageBackend key for the mem
 	// blob (issue #96, ADR-025 axis 2). Local backends resolve it
 	// to a file under /srv/fc; remote backends (OCI registry)
@@ -1449,6 +1593,16 @@ type Snapshot struct {
 	Stale      bool
 	CreatedAt  time.Time
 }
+
+// Snapshot tier constants (issue #470 / ADR-055). Use these rather
+// than bare string literals so the snapshot_written payload wire
+// shape and the LatestSnapshotForTier callers cannot drift. The
+// CHECK constraint on snapshots.tier enforces the same vocabulary at
+// the DB layer (migrations/00102_snapshots_tier.sql).
+const (
+	SnapshotTierInit string = "init"
+	SnapshotTierWarm string = "warm"
+)
 
 // SnapshotForGC is the join-projection used by the imaged nightly GC
 // (spec §4.6: keep current + previous deployment's snapshots per app;
@@ -1475,9 +1629,12 @@ type SnapshotForGC struct {
 	FCVersion string
 	MemBytes  int64
 	DiskBytes int64
-	// StorageKey mirrors Snapshot.StorageKey; populated from the
-	// join so imaged's snapshot GC can Storage.Delete under the
-	// canonical key (issue #96, ADR-025 axis 2 final slice).
+	// Tier (issue #470 / ADR-055) is the snapshot tier — see
+	// Snapshot.Tier for the semantics. The GC projection carries
+	// it so the perAppKeepCurrentPrevious policy can keep
+	// (current warm + previous init) per app instead of the
+	// legacy (current + previous) regardless-of-tier rule.
+	Tier       string
 	StorageKey string
 	Stale      bool
 	CreatedAt  time.Time

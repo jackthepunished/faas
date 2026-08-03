@@ -709,6 +709,18 @@ type snapshotWrittenPayload struct {
 	MemBytes     int64  `json:"mem_bytes"`
 	VMStateBytes int64  `json:"vmstate_bytes"`
 	FCVersion    string `json:"fc_version"`
+	// Tier (issue #470 / PR #470-FU-B) is the snapshot tier this
+	// row belongs to: "init" (taken right after guest-init binds
+	// :8080; restore pays framework warmup) or "warm" (taken
+	// after N successful requests meet warm_snapshot_min_ms,
+	// when the framework is hot). Empty falls back to "init"
+	// (the legacy pre-#470 default) so the CHECK constraint and
+	// the existing memory tier-untagged writes stay valid.
+	// schedd sources this from its vmmd_grpc.PauseAndSnapshot
+	// call (PR #470-FU-A wires the tier through); until that
+	// lands, this field is empty and the row is recorded as
+	// init per the DB column default.
+	Tier string `json:"tier,omitempty"`
 }
 
 // snapshotBootPayload is the JSON shape builderd emits on `snapshot_boot`
@@ -1453,6 +1465,13 @@ func (h *Handler) handleSnapshotWritten(ctx context.Context, p snapshotWrittenPa
 		StorageKey:   p.StorageKey, // see snapshotWrittenPayload.StorageKey
 		MemBytes:     p.MemBytes,
 		DiskBytes:    p.VMStateBytes,
+		// Tier (issue #470 / PR #470-FU-B). Empty payload falls
+		// back to "init" (the DB column default and the legacy
+		// pre-#470 behaviour); warm-tier rows are only ever
+		// written by schedd's captureWarmSnapshot path
+		// (PR #470-FU-A), which is the only flow that knows the
+		// framework-ready signal has actually fired.
+		Tier: p.Tier,
 	}
 	if _, err := h.store.CreateSnapshot(ctx, snap); err != nil && !errors.Is(err, state.ErrConflict) {
 		return fmt.Errorf("imaged: create snapshot: %w", err)

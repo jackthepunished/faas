@@ -854,6 +854,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// local_snapshot / local_coldboot; remote_* outcomes slot in
 		// when a second compute node joins.
 		h.metrics.ObserveWakeLocality(wakeMethod.String())
+		// Snapshot-tier counter (issue #470 / PR #470-FU-B). The
+		// tier ∈ {warm, init, cold} refinement of the wake
+		// outcome is produced by PR #470-FU-A (engine
+		// usableSnapshotForWake). Until the engine threads the
+		// tier onto the Admit response, we map the existing
+		// WakeMethod to the closest tier: snapshot→init (today
+		// every restored snapshot is init; warm is a refinement)
+		// and cold-boot→cold. Update to the real tier field once
+		// PR #470-FU-A lands; the Observe method's empty-string
+		// fallback already covers the transition seam.
+		h.metrics.ObserveWakeSnapshotTier(tierFromWakeMethod(wakeMethod))
 	}
 }
 

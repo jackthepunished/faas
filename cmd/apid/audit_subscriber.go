@@ -33,9 +33,11 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 )
 
 // auditEventPayload mirrors the JSON shape `pkg/imaged/handler.go`
@@ -62,7 +64,7 @@ type auditEventPayload struct {
 // The function returns when ctx is cancelled. The initial Subscribe
 // error is fatal — the boot-time check is the design and silent
 // drop is the bug we're closing.
-func runAuditSubscriber(ctx context.Context, pool *pgxpool.Pool, a *auditor, log *slog.Logger) error {
+func runAuditSubscriber(ctx context.Context, pool *pgxpool.Pool, a *auditor, log *slog.Logger, evts *events.Platform) error {
 	ch, err := db.SubscribeWithReconnect(ctx, pool, []string{db.NotifyAuditEvent}, log)
 	if err != nil {
 		return err
@@ -114,6 +116,27 @@ func runAuditSubscriber(ctx context.Context, pool *pgxpool.Pool, a *auditor, log
 				subject = &appID
 			}
 			a.Emit(ctx, p.Kind, subject, data)
+			// issue #517 / PR-C / ADR-064: emit the typed
+			// wake.deploy_failed row for the two
+			// verify-rejection kinds. These are the deploy
+			// "rollback" surface — the deploy row exists, the
+			// build was attempted, and imaged rejected it on
+			// signature grounds. The audit row is the
+			// GDPR-compatible record; the typed event row is
+			// the timeline-readable counterpart.
+			// wake.build_failed is the build-path counterpart
+			// (builderd emits that one on its own
+			// UpdateBuildStatus=BuildFailed path — see
+			// pkg/builderd/builderd.go::markFailed). nil
+			// opts out.
+			if evts != nil && (p.Kind == "app.signature_invalid" || p.Kind == "app.signature_missing") {
+				evts.Emit(ctx, events.DeployFailed{
+					EmitAt:       time.Now().UTC(),
+					AppID:        p.AppID,
+					DeploymentID: p.DeploymentID,
+					Reason:       p.Kind,
+				})
+			}
 		}
 	}
 }

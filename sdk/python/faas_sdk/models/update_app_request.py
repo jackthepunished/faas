@@ -40,6 +40,15 @@ class UpdateAppRequest:
     """DEPRECATED on this surface. The customer PATCH /v1/apps/{slug} endpoint silently drops require_signed; the
     operator endpoint PATCH /v1/apps/{slug}/security is the only path that flips the flag (issue #472 / ADR-054).
     The field is parsed for backwards compatibility but never persisted from this endpoint."""
+    warm_snapshot_enabled: bool | None | Unset = UNSET
+    """Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted → no change. PATCH-true on Free/Hobby is
+    rejected with 403 plan_warm_snapshot_not_allowed."""
+    warm_snapshot_min_requests: int | None | Unset = UNSET
+    """Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]. Omitted → no
+    change."""
+    warm_snapshot_min_ms: int | None | Unset = UNSET
+    """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
+    [100, 60000]. Omitted → no change."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +114,24 @@ class UpdateAppRequest:
         else:
             require_signed = self.require_signed
 
+        warm_snapshot_enabled: bool | None | Unset
+        if isinstance(self.warm_snapshot_enabled, Unset):
+            warm_snapshot_enabled = UNSET
+        else:
+            warm_snapshot_enabled = self.warm_snapshot_enabled
+
+        warm_snapshot_min_requests: int | None | Unset
+        if isinstance(self.warm_snapshot_min_requests, Unset):
+            warm_snapshot_min_requests = UNSET
+        else:
+            warm_snapshot_min_requests = self.warm_snapshot_min_requests
+
+        warm_snapshot_min_ms: int | None | Unset
+        if isinstance(self.warm_snapshot_min_ms, Unset):
+            warm_snapshot_min_ms = UNSET
+        else:
+            warm_snapshot_min_ms = self.warm_snapshot_min_ms
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -128,6 +155,12 @@ class UpdateAppRequest:
             field_dict["scaling_policy"] = scaling_policy
         if require_signed is not UNSET:
             field_dict["require_signed"] = require_signed
+        if warm_snapshot_enabled is not UNSET:
+            field_dict["warm_snapshot_enabled"] = warm_snapshot_enabled
+        if warm_snapshot_min_requests is not UNSET:
+            field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
+        if warm_snapshot_min_ms is not UNSET:
+            field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
 
         return field_dict
 
@@ -228,6 +261,33 @@ class UpdateAppRequest:
 
         require_signed = _parse_require_signed(d.pop("require_signed", UNSET))
 
+        def _parse_warm_snapshot_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        warm_snapshot_enabled = _parse_warm_snapshot_enabled(d.pop("warm_snapshot_enabled", UNSET))
+
+        def _parse_warm_snapshot_min_requests(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        warm_snapshot_min_requests = _parse_warm_snapshot_min_requests(d.pop("warm_snapshot_min_requests", UNSET))
+
+        def _parse_warm_snapshot_min_ms(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        warm_snapshot_min_ms = _parse_warm_snapshot_min_ms(d.pop("warm_snapshot_min_ms", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -239,6 +299,9 @@ class UpdateAppRequest:
             streaming_enabled=streaming_enabled,
             scaling_policy=scaling_policy,
             require_signed=require_signed,
+            warm_snapshot_enabled=warm_snapshot_enabled,
+            warm_snapshot_min_requests=warm_snapshot_min_requests,
+            warm_snapshot_min_ms=warm_snapshot_min_ms,
         )
 
         update_app_request.additional_properties = d

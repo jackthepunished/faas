@@ -895,6 +895,14 @@ CREATE TABLE public.instances (
     node_id uuid NOT NULL,
     wake_id uuid DEFAULT gen_random_uuid() NOT NULL,
     org_id uuid,
+    -- Issue #470 / PR #470-FU-B: per-instance stamp of the
+    -- guest-init framework_ready DGRAM receipt. Mirrors the
+    -- 00112_instances_framework_ready_at.sql migration. Read
+    -- by the engine's captureWarmSnapshot (PR #470-FU-A) to
+    -- know when to issue a warm-tier PauseAndSnapshot. NULL
+    -- = no signal landed yet (engine falls through to init
+    -- tier capture).
+    framework_ready_at timestamp with time zone,
     CONSTRAINT instances_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'parked'::text, 'waking'::text, 'cold_booting'::text, 'running'::text, 'snapshotting'::text, 'stopped'::text, 'failed'::text, 'evicting_account_deleting'::text])))
 );
 

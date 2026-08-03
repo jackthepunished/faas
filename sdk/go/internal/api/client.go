@@ -511,6 +511,37 @@ func (c *Client) DeleteKey(ctx context.Context, id string) error {
 // 50-row default window. limit is bounded server-side at 100; values
 // larger are silently capped per the same convention as ListSecrets.
 
+// ListWakeTimeline returns the typed wake-stage timeline for a given
+// wake_id (issue #517 / PR-C / ADR-064). Oldest-first; the dashboard
+// reads it as a forward narrative (queue_accepted → admitted →
+// boot_started → boot_completed → readiness_200 → proxy_first_byte).
+//
+// since is an RFC 3339 timestamp; rows strictly older are skipped
+// (the dashboard's "load older" infinite-scroll). limit is bounded
+// server-side at 1000; values larger are silently capped per the
+// same convention as ListSecrets / ListAuditEvents.
+//
+// Cross-account visibility is enforced server-side: the slug must
+// resolve to the caller's account, and each row's data.app_id is
+// forge-checked against the resolved app id. A row that mismatches
+// is dropped silently so a malicious admin can't surface a
+// foreign-tenant frame in this timeline.
+func (c *Client) ListWakeTimeline(ctx context.Context, slug, wakeID, since string, limit int) (WakeTimelineResponse, error) {
+	var out WakeTimelineResponse
+	q := url.Values{}
+	if since != "" {
+		q.Set("since", since)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/apps/" + slug + "/wakes/" + wakeID + "/timeline"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // ListAuditEvents returns the caller's auth audit events newest-first.
 // includeAnonymous (Wave 0 PR-C / ADR-047) toggles subject=NULL rows —
 // the defensive case where the app row was deleted between wake and

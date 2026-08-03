@@ -50,7 +50,15 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #461 / ADR-062: Free has no private-registry
 			// credential surface (handler returns 403
 			// plan_registry_credentials_not_allowed).
-			RegistryCredentialMax: 0},
+			RegistryCredentialMax: 0,
+			// Issue #470 / ADR-055: Free is gated off for warm-tier
+			// snapshots — doubling the per-app parked footprint
+			// doesn't fit the Free pricing tier. The 0/0 defaults
+			// are defence-in-depth; the WarmSnapshotAllowed() gate
+			// surfaces the 403 to a Free customer PATCHing true.
+			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
+			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
+			KeysMax: 3},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
 			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
 			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
@@ -99,7 +107,13 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// filter for the typical one-staging-deployment workload.
 			LogDeploymentFilterMax: 1,
 			// Issue #461 / ADR-064: Hobby = 2 — staging + production.
-			RegistryCredentialMax: 2},
+			RegistryCredentialMax: 2,
+			// Issue #470 / ADR-055: Hobby is gated off for the
+			// same cost-shape reason as Free — the doubled parked
+			// footprint doesn't fit the €9/month Hobby tier.
+			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
+			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
+			KeysMax: 10},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
@@ -139,7 +153,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// per-instance goroutine fan-out.
 			LogDeploymentFilterMax: 10,
 			// Issue #461 / ADR-064: Pro = 5 — multi-region + CI shapes.
-			RegistryCredentialMax: 5},
+			RegistryCredentialMax: 5,
+			// Issue #470 / ADR-055: Pro is the first tier where
+			// warm-tier snapshots are on by default — 5 requests /
+			// 2000 ms is the sweet spot for the issue's acceptance
+			// (p50 halved vs init-tier).
+			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000,
+			// Issue #189 / IAM-5: Pro = 50 keys (2 per app across 25 apps).
+			KeysMax: 50},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
@@ -184,7 +205,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// fan-out SaaS-scale customers typically run.
 			LogDeploymentFilterMax: 50,
 			// Issue #461 / ADR-064: Scale = 20 — broad fan-out.
-			RegistryCredentialMax: 20},
+			RegistryCredentialMax: 20,
+			// Issue #470 / ADR-055: Scale stays on by default —
+			// the per-app parked cost fits inside the 452 GB
+			// budget and the wake-p50 win is the largest dollar
+			// lever for SaaS workloads.
+			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000,
+			// Issue #189 / IAM-5: Scale = 200 keys (2 per app across 100 apps).
+			KeysMax: 200},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -324,6 +352,9 @@ func TestPlansAreMonotonic(t *testing.T) {
 			// Issue #461 / ADR-062: per-app registry credential quota
 			// (Free=0 → Hobby=2 → Pro=5 → Scale=20).
 			{"RegistryCredentialMax", lo.RegistryCredentialMax, hi.RegistryCredentialMax},
+			// Issue #189 / IAM-5: per-account API-key quota
+			// (Free=3 → Hobby=10 → Pro=50 → Scale=200).
+			{"KeysMax", lo.KeysMax, hi.KeysMax},
 		}
 		for _, c := range checks {
 			if c.hi < c.lo {
@@ -408,6 +439,74 @@ func TestPlanMinInstancesAllowed(t *testing.T) {
 		if got := c.plan.MinInstancesAllowed(); got != c.want {
 			t.Errorf("%s.MinInstancesAllowed() = %v, want %v", c.plan, got, c.want)
 		}
+	}
+}
+
+// TestSidecarCapMax pins the global constant (issue #463 / ADR-066
+// §Decision 1). The 2-sidecar hard cap is a GLOBAL const, not a
+// per-plan matrix field — a future PR may grow this to a per-plan
+// matrix if telemetry shows demand, but for PR-A every plan
+// inherits the same 2-cap. The companion schema CHECK on
+// `deployments.sidecars` (migration 00095) is the second-line
+// defence — see migrations/00095_deployments_sidecars_test.go.
+func TestSidecarCapMax(t *testing.T) {
+	if SidecarCapMax != 2 {
+		t.Errorf("SidecarCapMax = %d, want 2 (issue #463 / ADR-066 §Decision 1)", SidecarCapMax)
+	}
+}
+
+// TestPlanSidecarAllowed pins the per-plan accessor (issue #463 /
+// ADR-066 §Decision 1). PR-A's accessor returns true for every
+// plan — the load-bearing gate is the GLOBAL `SidecarCapMax`
+// constant, not a per-plan matrix. The accessor exists so a future
+// per-plan gate (Free = 0, paid = 2) can be wired in one place
+// without the apid handler branching on Plan strings. Mirrors
+// TestPlanMinInstancesAllowed above.
+func TestPlanSidecarAllowed(t *testing.T) {
+	for _, p := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
+		if !p.SidecarAllowed() {
+			t.Errorf("%s.SidecarAllowed() = false; PR-A returns true for all plans (global cap is the load-bearing gate)", p)
+		}
+	}
+}
+
+// TestBillableRAMMBWithSidecars pins the sidecar-shape billing
+// math (issue #463 / ADR-066 §Decision 6). The billable shutter
+// is `plan.RAMMB + Σ(sidecar.ram_mb) + PerVMOverheadMB`: sidecars
+// share the per-VM overhead (one netns, one cgroup scope per
+// instance), but each sidecar contributes its own RAM. PR-A
+// defines the math; PR-B wires the consumer (schedd's admission
+// ledger + meterd's sampler).
+func TestBillableRAMMBWithSidecars(t *testing.T) {
+	cases := []struct {
+		name       string
+		planRAM    int
+		sidecarMBs []int
+		want       int
+	}{
+		// No sidecars: matches BillableRAMMB exactly.
+		{"no-sidecars", 256, nil, 256 + PerVMOverheadMB},
+		// One init: 256 + 64 + 8 = 328.
+		{"one-init-64", 256, []int{64}, 256 + 64 + PerVMOverheadMB},
+		// Two sidecars: 256 + 64 + 32 + 8 = 360.
+		{"two-sidecars", 256, []int{64, 32}, 256 + 64 + 32 + PerVMOverheadMB},
+		// Empty sidecarMBs slice is the no-sidecars shape.
+		{"empty-slice", 256, []int{}, 256 + PerVMOverheadMB},
+		// Zero in the slice is a "absent / inherit" sentinel — skipped
+		// by the helper (the apid handler normalises ram_mb=0 → absent
+		// at validation time, but the helper is defensive anyway).
+		{"zero-skipped", 256, []int{0, 64}, 256 + 64 + PerVMOverheadMB},
+		// Scale shape: 1024 + 64 + 64 + 8 = 1160 (matches ADR-066
+		// §Financial-model addendum scenario column).
+		{"scale-two-sidecars", 1024, []int{64, 64}, 1024 + 64 + 64 + PerVMOverheadMB},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := BillableRAMMBWithSidecars(c.planRAM, c.sidecarMBs)
+			if got != c.want {
+				t.Errorf("BillableRAMMBWithSidecars(%d, %v) = %d, want %d", c.planRAM, c.sidecarMBs, got, c.want)
+			}
+		})
 	}
 }
 
@@ -540,6 +639,45 @@ func TestPlanCronLimits(t *testing.T) {
 		}
 		if got := c.plan.CronLimitPerAccount(); got != c.wantPerAcct {
 			t.Errorf("%s.CronLimitPerAccount() = %d, want %d", c.plan, got, c.wantPerAcct)
+		}
+	}
+}
+
+// TestPlanKeysMax pins the per-account API-key cap for the plan
+// (issue #189 / IAM-5). Free 3, Hobby 10, Pro 50, Scale 200 — see
+// pkg/api/limits.go::KeysMax docstring. apid's createKey handler
+// reads this value (via Plan.KeysMax()) and rejects with 409
+// api_key_limit_exceeded at the cap; rotateKey is quota-neutral
+// and is allowed at the cap. Unknown plans must fail closed (return 0)
+// so a missing plan row never silently unlocks the auth surface — same
+// contract as CronLimitPerAccount above.
+func TestPlanKeysMax(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 3},
+		{PlanHobby, 10},
+		{PlanPro, 50},
+		{PlanScale, 200},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.KeysMax(); got != c.want {
+			t.Errorf("%s.KeysMax() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanKeysMaxAccessorsMatchTable pins that the accessor reads the
+// same value the Limits struct holds. Catches a regression where a
+// future contributor edits the struct field but forgets the accessor
+// (or vice versa). Mirrors TestOrgAccessorsMatchTable.
+func TestPlanKeysMaxAccessorsMatchTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.KeysMax(), l.KeysMax; got != want {
+			t.Errorf("Plan(%s).KeysMax() = %d, table = %d", p, got, want)
 		}
 	}
 }

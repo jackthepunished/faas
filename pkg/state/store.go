@@ -157,6 +157,24 @@ var ErrCronQuotaExceeded = errors.New("state: cron quota exceeded")
 // audit row. Issue #294 closes the gap that SOC 2 CC6.1 expects.
 var ErrReplay = errors.New("state: webhook replay rejected")
 
+// ErrAPIKeyExpired is returned by AuthenticateKey when the matched
+// key has expires_at < now(). The first auth attempt after expiry
+// flips the row to status='revoked' atomically before returning, so
+// a second attempt returns ErrAPIKeyRevoked. The audit
+// `key.expired` row is emitted by the auth middleware, not the
+// store (the store has no Auditor dependency).
+//
+// Issue #189 / IAM-5.
+var ErrAPIKeyExpired = errors.New("state: api key expired")
+
+// ErrAPIKeyRevoked is returned by AuthenticateKey when the matched
+// key has status='revoked'. The state is terminal — there is no
+// recovery path. The auth middleware maps this to a 401 with the
+// `api_key_revoked` Problem code.
+//
+// Issue #189 / IAM-5.
+var ErrAPIKeyRevoked = errors.New("state: api key revoked")
+
 // MaxDeploymentLogPage caps the per-call row count for
 // ListDeploymentLogs. Both implementations clamp the caller's
 // `limit` to this value before allocating — defense in depth so a
@@ -440,6 +458,14 @@ type Store interface {
 	// AccountByKeyHash + APIKeyByHash being two round-trips and ensures
 	// the principal is assembled atomically. Returns ErrNotFound when
 	// the hash has no matching key.
+	//
+	// IAM-5 (issue #189) extends the contract: an authenticated key
+	// whose status='revoked' returns ErrAPIKeyRevoked; a key whose
+	// expires_at is in the past is lazily flipped to status='revoked'
+	// and revoked_at stamped before this method returns
+	// ErrAPIKeyExpired. The audit `key.expired` row is emitted by
+	// the auth middleware (which has the Auditor dependency), not
+	// here. See pkg/auth/middleware for the HTTP-side translation.
 	AuthenticateKey(ctx context.Context, hash []byte) (Account, APIKey, error)
 	// TouchKeyLastUsed bumps the key's last_used_at to now(). Called
 	// fire-and-forget on every successful bearer auth in the apid
@@ -447,6 +473,82 @@ type Store interface {
 	// (PRD §4.4) without coupling request latency to a non-critical
 	// observability write.
 	TouchKeyLastUsed(ctx context.Context, keyID string) error
+
+	// CreateAPIKeyWithExpiry is the IAM-5 (issue #189) shape. The
+	// caller passes an explicit expiresAt (nil = never expires, the
+	// admin contract); the five-arg CreateAPIKey stays for the 17+
+	// test/handler sites that don't care about expiry. Production
+	// apid.createKey uses this new shape so the dashboard sees
+	// expires_at on every fresh non-admin key.
+	//
+	// Issue #189 / IAM-5.
+	CreateAPIKeyWithExpiry(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+
+	// CountAPIKeys returns the number of non-revoked keys owned
+	// by the account. Used by the create + rotate handlers to
+	// enforce limits.KeysMax BEFORE minting a new key. The
+	// "non-revoked" filter matches the partial index
+	// api_keys_active_grace_idx; the query is O(1) per
+	// account in the common case. Returns 0 on a fresh account.
+	//
+	// Issue #189 / IAM-5.
+	CountAPIKeys(ctx context.Context, accountID string) (int, error)
+
+	// MarkAPIKeyRevoked is the soft-delete path for keys
+	// (replaces DeleteAPIKeyReturning in the IAM-5 surface).
+	// Flips status to 'revoked' and stamps revoked_at if not
+	// already set. Repeated calls are idempotent (returns the
+	// same row, no error). Returns ErrNotFound when the key
+	// doesn't exist OR belongs to a different account.
+	//
+	// Audit emission is the caller's responsibility; this
+	// method is store-only.
+	//
+	// Issue #189 / IAM-5.
+	MarkAPIKeyRevoked(ctx context.Context, accountID, keyID string) (APIKey, error)
+
+	// RotateAPIKey atomically mints a new key (status='active')
+	// and demotes the old key in a single transaction. The old
+	// key's status flips to 'grace' (when graceWindow > 0) or
+	// 'revoked' (atomic rotation) and its expires_at is
+	// OVERWRITTEN to now() + graceWindow. The new key inherits
+	// label + scopes + account_id from the predecessor; the
+	// caller's pre-minted hash is stored directly (no
+	// post-step patch).
+	//
+	// The two returned keys are the post-commit rows in
+	// (newKey, oldKey) order. The caller is responsible for
+	// surfacing newKey.plaintext (generated upstream) and
+	// oldKey.ExpiresAt (the grace deadline) to the API
+	// response.
+	//
+	// Errors:
+	//   * ErrNotFound  — old key doesn't exist / wrong account.
+	//   * state.ErrAPIKeyRevoked — old key already in 'revoked'
+	//     (rotation of a revoked key is a 404, not idempotent).
+	//
+	// Issue #189 / IAM-5.
+	RotateAPIKey(ctx context.Context, accountID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (newKey, oldKey APIKey, err error)
+
+	// GetAccountKeyGraceWindow returns the per-account override
+	// (accounts.key_grace_window_days). nil = no override; the
+	// caller falls through to the plan default (7d). The
+	// auth hot path does NOT call this; only the rotate
+	// handler does, via a short-TTL in-process cache
+	// (cmd/apid.graceWindowCache).
+	//
+	// Issue #189 / IAM-5.
+	GetAccountKeyGraceWindow(ctx context.Context, accountID string) (*int, error)
+
+	// SetAccountKeyGraceWindow sets the per-account override.
+	// days == nil clears the override (falls through to plan
+	// default). The handler invalidates the in-process
+	// graceWindowCache entry after a successful write. The
+	// audit `key.grace_window_set` event is emitted by the
+	// handler, not the store.
+	//
+	// Issue #189 / IAM-5.
+	SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
 	//
@@ -726,6 +828,47 @@ type Store interface {
 	// gone. The store also clears the lease_token on rollback
 	// so a future re-attempt at migration mints a fresh one.
 	CancelInstanceMigration(ctx context.Context, instanceID, originalNodeID, leaseToken string) error
+
+	// ListExpiredMigrations returns every instance row in
+	// state='migrating' (Tier A6 / ADR-067). The watchdog is
+	// the only writer that can move a row out of 'migrating'
+	// without a peer commit, so the unresolved row is the
+	// input set. Sorted by instance id ASC for determinism.
+	// maxPerTick caps the result set (the caller passes
+	// api.MigratingWatchdogTickLimit via pkg/api/limits.go).
+	// Returns an empty slice (not ErrNotFound) when no rows
+	// match; callers treat that as "nothing to reconcile this
+	// tick".
+	ListExpiredMigrations(ctx context.Context, maxPerTick int) ([]Instance, error)
+	// ReinviteMigratingInstance is the active-owner ack gate of
+	// the Tier A6 / ADR-067 watchdog. Conditional UPDATE that
+	// flips state='migrating' → 'running', stamps
+	// migrated_at = now(), and clears lease_token — the same
+	// work the A5 Phase-3 commit (MigrateInstanceOwner) does,
+	// but launched by the watchdog after a re-invite to the
+	// new owner vmmd. The conditional predicates are load-
+	// bearing:
+	//   1. state = 'migrating' (peer rollback would have moved
+	//      back to 'parked' already)
+	//   2. lease_token = leaseToken (the new owner must present
+	//      the same UUID it minted at Phase 1; a stale lease
+	//      can never silently commit)
+	// Returns ErrConflict on RowsAffected()==0 — peer already
+	// committed, peer rolled back, lease expired, or row gone.
+	ReinviteMigratingInstance(ctx context.Context, instanceID, leaseToken string) error
+	// AbortMigratingInstance is the dead-owner hard-delete gate
+	// of the Tier A6 / ADR-067 watchdog. Conditional UPDATE
+	// that flips state='migrating' → 'parked', restores
+	// node_id = migrated_from_node_id (the live, parked state
+	// the row was in before Phase 2 of the original handoff),
+	// and clears lease_token so a future re-attempt at
+	// migration mints a fresh lease. The conditional
+	// predicates are the same as ReinviteMigratingInstance:
+	//   1. state = 'migrating'
+	//   2. lease_token = leaseToken
+	// Returns ErrConflict on RowsAffected()==0 — peer already
+	// committed, peer rolled back, lease expired, or row gone.
+	AbortMigratingInstance(ctx context.Context, instanceID, leaseToken string) error
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)
@@ -1449,6 +1592,28 @@ type Store interface {
 	// routes here when the target state is STOPPED or FAILED; every other
 	// transition still uses UpdateInstanceState / UpdateInstanceStateWithTimestamp.
 	UpdateInstanceStateToTerminal(ctx context.Context, id, state string, terminalAt time.Time) error
+	// SetInstanceFrameworkReadyAt stamps the column added by
+	// migrations/00112_instances_framework_ready_at.sql — the wall-clock
+	// time the vmmd received the guest-init "framework ready" vsock
+	// DGRAM (port 1027, msg=4) for this instance. The engine's
+	// captureWarmSnapshot (PR #470-FU-A) waits on this column before
+	// issuing the second PauseAndSnapshot that captures the warm tier.
+	// Idempotent: callers can re-stamp on subsequent warm-capture cycles
+	// (the engine resets to NULL at the start of each cycle and stamps
+	// again when the new signal arrives). Errors only on
+	// (a) instance missing — ErrNotFound, or (b) database error.
+	// Cancellation via ctx is honoured at the next pool.Ping boundary.
+	// NOT state-coupled: the column is nullable and writable in any
+	// state (engine waits before SNAPSHOTTING begins; vmmd may stamp
+	// while state is RUNNING or already PARKED).
+	SetInstanceFrameworkReadyAt(ctx context.Context, id string, readyAt time.Time) error
+	// ClearInstanceFrameworkReadyAt resets the column to NULL. Used by
+	// the engine at the start of each warm-capture cycle so a stale
+	// stamp from the previous cycle doesn't leak into the next wake
+	// decision. Symmetric counterpart to SetInstanceFrameworkReadyAt.
+	// Nullable-on-disk semantics mean the column is always
+	// NULL-or-timestamp; there is no separate "delete" notion.
+	ClearInstanceFrameworkReadyAt(ctx context.Context, id string) error
 	// ListInstancesByStatesOlderThan is the §6.1 watchdog's lookup.
 	// Returns rows currently in any of the given states whose
 	// "age timestamp" is strictly older than threshold. The age
@@ -1498,6 +1663,14 @@ type Store interface {
 	// stale on a failed restore, ADR-005).
 	CreateSnapshot(ctx context.Context, snap Snapshot) (Snapshot, error)
 	LatestSnapshot(ctx context.Context, deploymentID string) (Snapshot, error)
+	// LatestSnapshotForTier (issue #470 / ADR-055) returns the freshest
+	// non-stale snapshot for the (deployment, tier) pair. Empty tier is
+	// treated as "init". Returns ErrNotFound when no non-stale row
+	// exists — schedd's tier-fallback chain treats that as "fall through
+	// to the next tier". Warm-tier apps use this to pick warm.snap when
+	// usable; cold-boot-only deployments continue to call
+	// LatestSnapshot (which now ranks warm above init on ties).
+	LatestSnapshotForTier(ctx context.Context, deploymentID, tier string) (Snapshot, error)
 	MarkSnapshotStale(ctx context.Context, snapshotID string) error
 
 	// Snapshot GC (imaged nightly + on FC upgrade, spec §4.6 + §4.4).
@@ -1669,6 +1842,15 @@ type Store interface {
 	// Audit (append-only, spec §6.1).
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, data []byte) error
 	ListEvents(ctx context.Context, subject string, limit int) ([]Event, error)
+	// ListEventsByWakeID (issue #517 / PR-C, ADR-064) is the
+	// wake-timeline read-side query. Filters on the jsonb
+	// expression index events_wake_id_idx
+	// (migrations/00113_events_wake_id_idx.sql) and orders by at
+	// ASC so the customer-facing timeline endpoint surfaces a
+	// forward narrative. The since parameter is the RFC 3339
+	// lower bound (zero-value passes the floor); limit is
+	// bounded to 1000 by the handler.
+	ListEventsByWakeID(ctx context.Context, wakeID string, since time.Time, limit int) ([]Event, error)
 
 	// Usage (apid reads for GET /v1/usage; meterd writes in production).
 	// AppendUsage is idempotent on (instance_id, minute): the first

@@ -681,6 +681,18 @@ func (m *MemStore) APIKeyByHash(_ context.Context, hash []byte) (APIKey, error) 
 // AuthenticateKey mirrors the key+account lookup the apid auth
 // middleware needs. Single lock acquisition; returns ErrNotFound when
 // the hash has no matching key. See ADR-034.
+//
+// IAM-5 (issue #189) gate: identical to PgStore.AuthenticateKey.
+// After the key row is loaded, three checks run in order —
+//
+//  1. status='revoked' → return ErrAPIKeyRevoked (terminal, idempotent).
+//  2. expires_at != nil && expires_at < now() → lazy-flip to
+//     status='revoked' in-memory, then return ErrAPIKeyExpired.
+//  3. otherwise return (account, key, nil).
+//
+// The MemStore mutation is the analogue of the pgstore UPDATE:
+// coalesce(revoked_at, now()) → the first observation stamps, the
+// second is a no-op.
 func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, APIKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -691,6 +703,19 @@ func (m *MemStore) AuthenticateKey(_ context.Context, hash []byte) (Account, API
 	acct, ok := m.accounts[k.AccountID]
 	if !ok {
 		return Account{}, APIKey{}, ErrNotFound
+	}
+	if k.Status == string(APIKeyStatusRevoked) {
+		return Account{}, APIKey{}, ErrAPIKeyRevoked
+	}
+	if k.ExpiresAt != nil && !k.ExpiresAt.IsZero() && k.ExpiresAt.Before(time.Now()) {
+		k.Status = string(APIKeyStatusRevoked)
+		if k.RevokedAt == nil {
+			now := time.Now()
+			k.RevokedAt = &now
+		}
+		m.keys[k.ID] = k
+		m.keyByHash[hex.EncodeToString(k.Hash)] = k
+		return Account{}, APIKey{}, ErrAPIKeyExpired
 	}
 	return acct, k, nil
 }
@@ -1018,7 +1043,20 @@ func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
 	}
-	k := APIKey{ID: newID(), AccountID: accountID, Hash: hash, Label: label, Scopes: scopes, CreatedAt: time.Now()}
+	// IAM-5: explicit Status="active" so the auth gate in
+	// AuthenticateKey doesn't reject keys created via the
+	// pre-existing 5-arg path (the 17+ test/handler call sites
+	// that don't yet know about expiry). The pgstore path
+	// relies on the SQL DEFAULT 'active' for the same shape.
+	k := APIKey{
+		ID:        newID(),
+		AccountID: accountID,
+		Hash:      hash,
+		Label:     label,
+		Scopes:    scopes,
+		CreatedAt: time.Now(),
+		Status:    string(APIKeyStatusActive),
+	}
 	m.keys[k.ID] = k
 	m.keyByHash[h] = k
 	return k, nil
@@ -1076,6 +1114,153 @@ func (m *MemStore) TouchKeyLastUsed(_ context.Context, keyID string) error {
 	}
 	k.LastUsedAt = time.Now()
 	m.keys[keyID] = k
+	return nil
+}
+
+// CreateAPIKeyWithExpiry mirrors PgStore. The five-arg CreateAPIKey
+// stays (it's the shape 17+ test/handler call sites use); this is
+// the IAM-5 path that lets the handler set expires_at on a fresh
+// key. expiresAt == nil → Status="active", ExpiresAt=nil (the
+// admin "never expires" contract); non-nil → Status="active",
+// ExpiresAt=&t. MemStore preserves the post-migration default
+// (status='active', all nullable fields nil) for the
+// pre-migration call site.
+func (m *MemStore) CreateAPIKeyWithExpiry(_ context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := hex.EncodeToString(hash)
+	if _, dup := m.keyByHash[h]; dup {
+		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	k := APIKey{
+		ID:        newID(),
+		AccountID: accountID,
+		Hash:      hash,
+		Label:     label,
+		Scopes:    scopes,
+		CreatedAt: time.Now(),
+		Status:    string(APIKeyStatusActive),
+		ExpiresAt: expiresAt,
+	}
+	m.keys[k.ID] = k
+	m.keyByHash[h] = k
+	return k, nil
+}
+
+// CountAPIKeys mirrors PgStore. The "non-revoked" filter matches
+// the partial index api_keys_active_grace_idx on the pg side.
+func (m *MemStore) CountAPIKeys(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, k := range m.keys {
+		if k.AccountID == accountID && (k.Status == string(APIKeyStatusActive) || k.Status == string(APIKeyStatusGrace)) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// MarkAPIKeyRevoked mirrors PgStore. Idempotent: if the key is
+// already revoked, the row is left as-is and returned.
+func (m *MemStore) MarkAPIKeyRevoked(_ context.Context, accountID, keyID string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keys[keyID]
+	if !ok || k.AccountID != accountID {
+		return APIKey{}, ErrNotFound
+	}
+	if k.Status != string(APIKeyStatusRevoked) {
+		k.Status = string(APIKeyStatusRevoked)
+		if k.RevokedAt == nil {
+			now := time.Now()
+			k.RevokedAt = &now
+		}
+		m.keys[k.ID] = k
+		m.keyByHash[hex.EncodeToString(k.Hash)] = k
+	}
+	return k, nil
+}
+
+// RotateAPIKey mirrors PgStore. graceWindow == 0 → atomic (old
+// key revoked immediately); > 0 → grace (old key gets status='grace'
+// + expires_at = now+graceWindow). MemStore's atomicity is
+// "no concurrent callers" by virtue of m.mu; the same is true
+// of every other mutating method on this struct.
+func (m *MemStore) RotateAPIKey(_ context.Context, accountID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (APIKey, APIKey, error) {
+	if graceWindow < 0 {
+		graceWindow = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.keys[oldKeyID]
+	if !ok || old.AccountID != accountID {
+		return APIKey{}, APIKey{}, ErrNotFound
+	}
+	if old.Status == string(APIKeyStatusRevoked) {
+		return APIKey{}, APIKey{}, ErrAPIKeyRevoked
+	}
+	if newLabel == "" {
+		newLabel = old.Label
+	}
+	rotatedFrom := old.ID
+	newKey := APIKey{
+		ID:            newID(),
+		AccountID:     accountID,
+		Hash:          newHash,
+		Label:         newLabel,
+		Scopes:        old.Scopes,
+		CreatedAt:     time.Now(),
+		Status:        string(APIKeyStatusActive),
+		RotatedFromID: &rotatedFrom,
+	}
+	m.keys[newKey.ID] = newKey
+	m.keyByHash[hex.EncodeToString(newKey.Hash)] = newKey
+
+	now := time.Now()
+	if graceWindow == 0 {
+		old.Status = string(APIKeyStatusRevoked)
+		old.ExpiresAt = &now
+		if old.RevokedAt == nil {
+			old.RevokedAt = &now
+		}
+	} else {
+		old.Status = string(APIKeyStatusGrace)
+		deadline := now.Add(graceWindow)
+		old.ExpiresAt = &deadline
+		// revoked_at stays nil in the grace case — the grace
+		// deadline IS the new expires_at; revoke happens
+		// later if the old key isn't rotated away or
+		// re-revoked manually.
+	}
+	m.keys[old.ID] = old
+	m.keyByHash[hex.EncodeToString(old.Hash)] = old
+	return newKey, old, nil
+}
+
+// GetAccountKeyGraceWindow mirrors PgStore. nil = no override.
+func (m *MemStore) GetAccountKeyGraceWindow(_ context.Context, accountID string) (*int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[accountID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return a.KeyGraceWindowDays, nil
+}
+
+// SetAccountKeyGraceWindow mirrors PgStore. days == nil clears
+// the override. The MemStore value is a *int; the pgstore binds
+// the same *int directly to a nullable integer column.
+func (m *MemStore) SetAccountKeyGraceWindow(_ context.Context, accountID string, days *int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[accountID]
+	if !ok {
+		return ErrNotFound
+	}
+	a.KeyGraceWindowDays = days
+	m.accounts[accountID] = a
 	return nil
 }
 
@@ -1862,6 +2047,89 @@ func (m *MemStore) CancelInstanceMigration(_ context.Context, instanceID, origin
 	return nil
 }
 
+// ListExpiredMigrations mirrors pkg/state/pgstore.go::
+// ListExpiredMigrations. Returns every instance in
+// state='migrating' with a non-empty lease_token, in
+// instance-id order, capped at maxPerTick. Returns nil
+// (not ErrNotFound) when empty.
+func (m *MemStore) ListExpiredMigrations(_ context.Context, maxPerTick int) ([]Instance, error) {
+	if maxPerTick < 1 {
+		return nil, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Instance
+	for _, ins := range m.instances {
+		if ins.State != string(StateMigrating) || ins.LeaseToken == "" {
+			continue
+		}
+		out = append(out, ins)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if len(out) > maxPerTick {
+		out = out[:maxPerTick]
+	}
+	return out, nil
+}
+
+// ReinviteMigratingInstance mirrors pkg/state/pgstore.go::
+// ReinviteMigratingInstance. Conditional on state='migrating'
+// + lease_token=leaseToken; flips state='running' and clears
+// lease_token. Returns ErrConflict on predicate miss.
+func (m *MemStore) ReinviteMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: reinvite migrating instance: empty leaseToken")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != string(StateMigrating) || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = string(StateRunning)
+	now := time.Now().UTC()
+	ins.MigratedAt = &now
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
+// AbortMigratingInstance mirrors pkg/state/pgstore.go::
+// AbortMigratingInstance. Conditional on state='migrating' +
+// lease_token=leaseToken; flips state='parked', clears lease_token.
+// node_id is left UNCHANGED — same rationale as the pgstore
+// implementation (A5 Phase-2 leaves node_id on the OLD owner and
+// migrated_from_node_id is NULL pre-Phase-3; the wake path
+// dispatches via app.NodeID, so a dead instance.NodeID is
+// harmless).
+func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseToken string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: abort migrating instance: empty instanceID")
+	}
+	if leaseToken == "" {
+		return fmt.Errorf("state: abort migrating instance: empty leaseToken")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.State != string(StateMigrating) || ins.LeaseToken != leaseToken {
+		return ErrConflict
+	}
+	ins.State = string(StateParked)
+	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
 func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1956,6 +2224,20 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	// write. imaged reads this at buildImageLayer time.
 	if p.SetRequireSigned {
 		a.RequireSigned = boolOrFalse(p.RequireSigned)
+	}
+	// Issue #470 / ADR-055: per-app warm-snapshot knobs. Same Set-bit
+	// convention as require_signed / streaming_enabled — the Set bit
+	// distinguishes "don't touch" from "explicit reset". Apid already
+	// gated the plan (Free/Hobby + true is rejected) and the bounds
+	// (1..100 / 100..60000); the store is a plain column write.
+	if p.SetWarmSnapshotEnabled {
+		a.WarmSnapshotEnabled = boolOrFalse(p.WarmSnapshotEnabled)
+	}
+	if p.SetWarmSnapshotMinRequests {
+		a.WarmSnapshotMinRequests = intOrZero(p.WarmSnapshotMinRequests)
+	}
+	if p.SetWarmSnapshotMinMs {
+		a.WarmSnapshotMinMs = intOrZero(p.WarmSnapshotMinMs)
 	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
@@ -2694,6 +2976,26 @@ func (m *MemStore) SetBuildStartedAtForTest(id string, t time.Time) {
 	}
 	b.StartedAt = t
 	m.builds[id] = b
+}
+
+// SetInstanceMigratedFromForTest is a test-only hook that lets
+// future tests (e.g. a post-Phase-3 conflict path test) stamp
+// MigratedFromNodeID on a wedged state='migrating' row. The
+// A6 watchdog itself does NOT read MigratedFromNodeID (the
+// column is NULL pre-Phase-3, which is exactly when the watchdog
+// fires), so the current watchdog tests do not exercise this
+// helper. Kept in place for symmetry with the other SetXForTest
+// helpers and as a future-proofing seam.
+func (m *MemStore) SetInstanceMigratedFromForTest(instanceID, nodeID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return
+	}
+	copy := nodeID
+	ins.MigratedFromNodeID = &copy
+	m.instances[instanceID] = ins
 }
 
 // ClaimQueuedBuild atomically flips queued → running under m.mu (PR-A
@@ -3924,6 +4226,41 @@ func (m *MemStore) UpdateInstanceStateToTerminal(_ context.Context, id, state st
 	return nil
 }
 
+// SetInstanceFrameworkReadyAt mirrors pgstore.SetInstanceFrameworkReadyAt
+// (PR #470-FU-B). Updates the in-memory instance row's
+// `FrameworkReadyAt` pointer to point at the supplied time. The pointer
+// indirection is required by the Instance struct definition so callers
+// can distinguish "no signal yet" (nil) from "signal arrived at zero"
+// (which is impossible given time.Time's zero check but kept for
+// symmetry). Returns ErrNotFound for missing rows.
+func (m *MemStore) SetInstanceFrameworkReadyAt(_ context.Context, id string, readyAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return ErrNotFound
+	}
+	ts := readyAt
+	ins.FrameworkReadyAt = &ts
+	m.instances[id] = ins
+	return nil
+}
+
+// ClearInstanceFrameworkReadyAt mirrors pgstore.ClearInstanceFrameworkReadyAt
+// (PR #470-FU-B). Resets the framework_ready_at pointer to nil so the
+// next warm-capture cycle starts without a stale stamp.
+func (m *MemStore) ClearInstanceFrameworkReadyAt(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return ErrNotFound
+	}
+	ins.FrameworkReadyAt = nil
+	m.instances[id] = ins
+	return nil
+}
+
 // ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
 // lookup (PR #74). Mirrors ListInstancesByStatesOlderThan but reads
 // terminal_at instead of the state-aware started_at/parked_at pair.
@@ -4064,6 +4401,12 @@ func (m *MemStore) CreateSnapshot(_ context.Context, snap Snapshot) (Snapshot, e
 	if snap.StorageKey == "" {
 		return Snapshot{}, errors.New("state: MemStore.CreateSnapshot: storage_key required (populate via sched.SnapshotMemKey at the call site)")
 	}
+	if snap.Tier == "" {
+		// Issue #470 / ADR-055: empty tier is treated as "init" for
+		// legacy callers; new warm-tier capture code passes
+		// SnapshotTierWarm explicitly.
+		snap.Tier = SnapshotTierInit
+	}
 	if snap.ID == "" {
 		snap.ID = uuid.NewString()
 	}
@@ -4071,7 +4414,12 @@ func (m *MemStore) CreateSnapshot(_ context.Context, snap Snapshot) (Snapshot, e
 		snap.CreatedAt = time.Now()
 	}
 	for _, existing := range m.snapshots {
-		if existing.DeploymentID == snap.DeploymentID && existing.FCVersion == snap.FCVersion && existing.StorageKey == snap.StorageKey {
+		// Mirror the (deployment_id, tier) unique index from migration
+		// 00110: a non-stale row with the same (deployment_id, tier)
+		// is a duplicate — surface ErrConflict so callers fall through
+		// to the existing-imaged semantic. Different-tier rows on the
+		// same deployment are allowed (warm + init coexist).
+		if existing.DeploymentID == snap.DeploymentID && existing.Tier == snap.Tier && !existing.Stale {
 			return Snapshot{}, ErrConflict
 		}
 	}
@@ -4086,6 +4434,46 @@ func (m *MemStore) LatestSnapshot(_ context.Context, deploymentID string) (Snaps
 	found := false
 	for _, s := range m.snapshots {
 		if s.DeploymentID != deploymentID || s.Stale {
+			continue
+		}
+		if !found {
+			latest = s
+			found = true
+			continue
+		}
+		// Issue #470 / ADR-055: warm wins on a created_at tie. The
+		// (tier='warm') order-by clause in PgStore.LatestSnapshot
+		// mirrors this preference.
+		sWarm := s.Tier == SnapshotTierWarm
+		lWarm := latest.Tier == SnapshotTierWarm
+		switch {
+		case sWarm != lWarm && sWarm:
+			latest = s
+		case sWarm == lWarm && s.CreatedAt.After(latest.CreatedAt):
+			latest = s
+		}
+	}
+	if !found {
+		return Snapshot{}, ErrNotFound
+	}
+	return latest, nil
+}
+
+// LatestSnapshotForTier mirrors PgStore.LatestSnapshotForTier — returns
+// the freshest non-stale snapshot for (deploymentID, tier). Empty tier
+// is treated as "init" for legacy callers. Returns ErrNotFound when no
+// non-stale row exists; schedd's tier-fallback chain treats that as
+// "fall through to the next tier" (issue #470 / ADR-055).
+func (m *MemStore) LatestSnapshotForTier(_ context.Context, deploymentID, tier string) (Snapshot, error) {
+	if tier == "" {
+		tier = SnapshotTierInit
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var latest Snapshot
+	found := false
+	for _, s := range m.snapshots {
+		if s.DeploymentID != deploymentID || s.Stale || s.Tier != tier {
 			continue
 		}
 		if !found || s.CreatedAt.After(latest.CreatedAt) {
@@ -4151,6 +4539,11 @@ func (m *MemStore) ListSnapshotsForGC(_ context.Context) ([]SnapshotForGC, error
 			FCVersion: s.FCVersion,
 			MemBytes:  s.MemBytes,
 			DiskBytes: s.DiskBytes,
+			// Issue #470 / ADR-055: forward the tier so the GC loop's
+			// perAppKeepCurrentPrevious can keep (current warm +
+			// previous init) per warm-tier app and (current init +
+			// previous init) per init-only app.
+			Tier: s.Tier,
 			// #96 / ADR-025 axis 2: forward the canonical storage
 			// key so imaged's GC loop can Storage.Delete under it
 			// without a second hop through Snapshot.
@@ -4695,6 +5088,54 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 		if subj == nil || (e.Subject != nil && *e.Subject == *subj) {
 			out = append(out, e)
 		}
+	}
+	return out, nil
+}
+
+// ListEventsByWakeID (issue #517 / PR-C, ADR-064) — the
+// in-memory twin of the pgstore ListEventsByWakeID sqlc query.
+// Filters on the jsonb data.wake_id key (the index shape on the
+// production path), orders by `at` ASC (oldest → newest) so the
+// customer-facing timeline reads as a forward narrative, and
+// respects the optional `since` lower bound + `limit` cap (the
+// handler enforces max 1000). Insertion order is not equivalent
+// to at-order: emit sites run under different locks and the
+// in-memory append order interleaves the wake phases. Sort by
+// `at` so the result matches the production ORDER BY at ASC.
+func (m *MemStore) ListEventsByWakeID(_ context.Context, wakeID string, since time.Time, limit int) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Event
+	for i := 0; i < len(m.events); i++ {
+		e := m.events[i]
+		if !e.At.After(since) {
+			continue
+		}
+		// The wake_id is a key on the jsonb data blob; the
+		// in-memory Event has Data as []byte. Decode lazily
+		// — the per-row cost is one json.Unmarshal + map
+		// lookup, amortised across the test corpus. For very
+		// high-volume unit tests this would matter, but the
+		// list is bounded by MemStore's test fixture sizes.
+		var payload struct {
+			WakeID string `json:"wake_id"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			continue
+		}
+		if payload.WakeID != wakeID {
+			continue
+		}
+		out = append(out, e)
+	}
+	// Sort by at ASC. Stable across insertion order (the wake
+	// phases are emitted at different lock depths so the
+	// append order is not the same as the at-order).
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].At.Before(out[j].At)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

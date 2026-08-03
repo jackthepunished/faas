@@ -321,6 +321,52 @@ func TestHandleSnapshotWritten(t *testing.T) {
 	if snap.MemBytes != 134217728 || snap.StorageKey != state.SnapMemKey(dep.ID) {
 		t.Errorf("snapshot row wrong: %+v", snap)
 	}
+	// Issue #470 / PR #470-FU-B: tier defaults to "init" when the
+	// payload omits the field (legacy schedd callers). The DB
+	// column default 'init' is the source of truth; the imaged
+	// handler mirrors it on the Go side.
+	if snap.Tier != state.SnapshotTierInit {
+		t.Errorf("Tier = %q, want %q (default)", snap.Tier, state.SnapshotTierInit)
+	}
+}
+
+// TestHandleSnapshotWritten_Tier (issue #470 / PR #470-FU-B)
+// exercises the warm-tier payload path: when schedd's
+// captureWarmSnapshot emits a snapshot_written with tier="warm",
+// imaged stamps tier="warm" on the row. The MemStore test
+// doubles as the wire-shape regression — a future payload-shape
+// change that drops the tier field would slip back to "init"
+// and trip this assertion.
+func TestHandleSnapshotWritten_Tier(t *testing.T) {
+	store := state.NewMemStore()
+	acct, _ := store.CreateAccount(context.Background(), "u@example.com", "pro")
+	app, _ := store.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "warm-img", RAMMB: 512, IdleTimeoutS: 60, MaxConcurrency: 5,
+	})
+	dep, _ := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, ImageDigest: "sha256:warm", Kind: state.DeploymentKindImage,
+	})
+	_ = store.UpdateDeploymentStatus(context.Background(), dep.ID, state.DeploySnapshotting, "")
+	notif := &fakeNotifier{}
+	h := New(store, notif, fakePuller{}, &fakeBuilder{}, "./init", t.TempDir(), silentLogger())
+
+	h.HandleNotification(context.Background(), db.Notification{
+		Channel: db.NotifySnapshotWritten,
+		Payload: `{"deployment_id":"` + dep.ID + `",` +
+			`"vmstate_path":"/srv/fc/snap/` + dep.ID + `/vmstate",` +
+			`"storage_key":"snap/` + dep.ID + `/warm/mem",` +
+			`"mem_bytes":134217728,` +
+			`"vmstate_bytes":40960,"fc_version":"firecracker-1.10",` +
+			`"tier":"warm"}`,
+	})
+
+	snap, err := store.LatestSnapshot(context.Background(), dep.ID)
+	if err != nil {
+		t.Fatalf("LatestSnapshot: %v", err)
+	}
+	if snap.Tier != state.SnapshotTierWarm {
+		t.Errorf("Tier = %q, want %q (warm payload)", snap.Tier, state.SnapshotTierWarm)
+	}
 	if findNotify(notif, db.NotifyDeploymentChanged) == nil {
 		t.Error("expected a deployment_changed live fan-out")
 	}

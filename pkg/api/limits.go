@@ -244,6 +244,19 @@ type Limits struct {
 	CronLimitPerApp     int
 	CronLimitPerAccount int
 
+	// KeysMax (issue #189 / IAM-5) caps the per-account count of
+	// active + grace API keys. Revoked keys are exempt — they
+	// remain in the table for audit lineage but no longer count
+	// against quoata. apid's createKey handler rejects with 409
+	// api_key_limit_exceeded once the count reaches the cap;
+	// rotateKey is quota-neutral (one new key replaces one old:
+	// -1 +1 = 0 net) and is allowed at the cap. Per-plan values:
+	// Free 3, Hobby 10, Pro 50, Scale 200 — tracks the typical
+	// auth surface per tier (Free's 1-app customer might run 1 key
+	// per deploy target; Scale's 100-app customer might run a
+	// handful per team).
+	KeysMax int
+
 	// Organization limits (issue #190 / IAM-6 / ADR-061). Two
 	// per-org caps; both populated for every plan, currently 0
 	// until the financial model authorizes the per-plan values.
@@ -298,6 +311,32 @@ type Limits struct {
 	// (Pro: 16; Scale: 64). apid's updateApp rejects with 400
 	// egress_allowlist_too_long when the PATCH body has more entries.
 	EgressAllowlistMaxSize int
+
+	// WarmSnapshotEnabled (issue #470 / ADR-055) is the plan-gated
+	// default for the per-app two-tier snapshot flag. Free/Hobby =
+	// false (warm-tier apps keep both warm.snap + init.snap, which
+	// is +130 MB per app on the parked disk budget — Hobby's pricing
+	// tier is too cheap for that). Pro/Scale = true (the doubled
+	// parked footprint is inside the 452 GB budget). Apid's
+	// updateApp handler rejects Free/Hobby PATCH-true with
+	// 403 plan_warm_snapshot_not_allowed; the default is applied
+	// at CreateApp time so a Pro customer's brand-new app gets a
+	// warm.snap without an extra PATCH.
+	WarmSnapshotEnabled bool
+	// WarmSnapshotMinRequestsDefault is the per-app request-count
+	// threshold for warm-tier capture, applied at CreateApp when
+	// the plan allows it. Free/Hobby = 0 (irrelevant because
+	// WarmSnapshotEnabled = false there). Pro/Scale = 5. Range
+	// [1, 100] (migration 00109 CHECK). The per-app PATCH may
+	// override; both the SQL CHECK and the apid handler reject
+	// out-of-range values.
+	WarmSnapshotMinRequestsDefault int
+	// WarmSnapshotMinMsDefault is the per-app time-since-first-ready
+	// threshold for warm-tier capture, applied at CreateApp when
+	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
+	// 2000 (matches Node.js Express / Flask framework startup).
+	// Range [100, 60000] (migration 00109 CHECK).
+	WarmSnapshotMinMsDefault int
 
 	// StreamingEnabled (issue #471) gates the per-app streaming
 	// response path through gatewayd (Flusher + periodic 200 ms /
@@ -391,6 +430,11 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// IAM-5 (issue #189): Free gets 3 keys — one for the customer's
+		// primary deploy target + one for a staging slot + one for
+		// break-glass. The abuse-vector (scripted key rotation under
+		// 1-concurrency) is bounded by the per-account rate limit.
+		KeysMax: 3,
 		// IAM-6 / ADR-061: org membership is plan-gated until the
 		// financial model authorizes a per-plan value. Free reads
 		// 0/0 so the membership gate refuses before the store is
@@ -425,6 +469,13 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            false,
 		MaxResponseBodyBytes:        MaxResponseBodyBytesDefault,
 		ResponseWriteTimeoutSeconds: ResponseWriteTimeoutDefault,
+		// Warm-snapshot (issue #470 / ADR-055): Free is off by
+		// plan. Warm-tier apps keep warm.snap + init.snap on the
+		// parked disk budget; doubling the per-app snapshot
+		// footprint is incompatible with the Free pricing tier.
+		WarmSnapshotEnabled:            false,
+		WarmSnapshotMinRequestsDefault: 0,
+		WarmSnapshotMinMsDefault:       0,
 	},
 	PlanHobby: {
 		Plan:                PlanHobby,
@@ -489,6 +540,11 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// IAM-5 (issue #189): Hobby gets 10 keys — 2 per app across
+		// the Hobby app budget (5) keeps every deploy target
+		// (CI / staging / prod / personal / monitoring) with a
+		// dedicated key.
+		KeysMax: 10,
 		// IAM-6 / ADR-061: org caps land in PR 2 once the financial
 		// model authorizes them. PR 1 ships 0/0 so the fail-closed
 		// gate refuses across every plan until the values are
@@ -526,6 +582,15 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// Warm-snapshot (issue #470 / ADR-055): Hobby is gated off
+		// for the same cost-shape reason as Free — doubling the
+		// parked per-app snapshot footprint doesn't fit the
+		// €9/month Hobby price point. Pro/Scale customers pay
+		// enough that the +130 MB per warm-tier app is comfortably
+		// inside the 452 GB parked budget.
+		WarmSnapshotEnabled:            false,
+		WarmSnapshotMinRequestsDefault: 0,
+		WarmSnapshotMinMsDefault:       0,
 	},
 	PlanPro: {
 		Plan:                PlanPro,
@@ -580,6 +645,10 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// IAM-5 (issue #189): Pro gets 50 keys — 2 per app across the
+		// Pro app budget (25) plus a per-team allowance (CI / staging
+		// / prod / personal / monitoring / break-glass).
+		KeysMax: 50,
 		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
 		// per-plan values from the financial model.
 		OrgMembersMax:            0,
@@ -613,6 +682,14 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// Warm-snapshot (issue #470 / ADR-055): Pro is the first
+		// tier where warm-snapshot is on by default. Per the issue
+		// body's acceptance: "for a Pro+ app that has served ≥5
+		// successful requests ≥2 s after first-ready, restore
+		// from warm.snap should be ≤50 % of init.snap p50".
+		WarmSnapshotEnabled:            true,
+		WarmSnapshotMinRequestsDefault: 5,
+		WarmSnapshotMinMsDefault:       2000,
 	},
 	PlanScale: {
 		Plan:                PlanScale,
@@ -668,6 +745,10 @@ var planLimits = map[Plan]Limits{
 		// at the per-app cap, the typical SaaS fan-out.
 		CronLimitPerApp:     100,
 		CronLimitPerAccount: 500,
+		// IAM-5 (issue #189): Scale gets 200 keys — 2 per app across
+		// the Scale app budget (100) plus a per-team allowance, with
+		// headroom for the rotating-CI shape of a SaaS-scale customer.
+		KeysMax: 200,
 		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
 		// per-plan values from the financial model.
 		OrgMembersMax:            0,
@@ -708,6 +789,13 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// Warm-snapshot (issue #470 / ADR-055): Scale stays on
+		// by default — the per-app parked footprint cost fits
+		// inside the 452 GB budget, and the customer's wake-p50
+		// win is the largest dollar lever for SaaS workloads.
+		WarmSnapshotEnabled:            true,
+		WarmSnapshotMinRequestsDefault: 5,
+		WarmSnapshotMinMsDefault:       2000,
 	},
 }
 
@@ -810,6 +898,39 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
+	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
+	// 365 days is the issue-189 spec: long enough to be
+	// "set-and-forget" for a customer's CI rotation, short enough
+	// that an exfiltrated key expires within a year of theft even
+	// without rotation. Admin keys default to nil expiry (per
+	// existing admin semantics — never expire, must be explicitly
+	// revoked). Legacy admin keys (pre-IAM-5) keep null expiry
+	// forever; rotation is the migration path for customers who
+	// want a finite window on their admin keys.
+	DefaultAPIKeyLifetimeDays = 365
+
+	// DefaultAPIKeyGraceWindowDays (issue #189 / IAM-5) is the
+	// plan-level default for the rotation grace window. 7 days
+	// gives the customer's CI / staging / prod fleet one
+	// rotation cycle to switch over without coordinated downtime.
+	// The per-account override (accounts.key_grace_window_days)
+	// takes precedence; 0 in the per-account column means
+	// "atomic revocation" (no grace).
+	DefaultAPIKeyGraceWindowDays = 7
+
+	// Sidecar containers (issue #463 / ADR-068). The 2-sidecar
+	// hard cap is a GLOBAL constant, not a per-plan matrix field.
+	// Every plan inherits the same `SidecarCapMax = 2` (Free
+	// included). The cap is structurally tight: 1 init + 1
+	// sidecar is the smallest useful surface for a stateless
+	// workload, and the schema CHECK on `deployments.sidecars`
+	// (migration 00118) pins the cap at the second-line defence
+	// layer (migrations/00118_deployments_sidecars.sql). A future
+	// PR can grow this to a per-plan matrix if telemetry shows
+	// demand — the constant is the single source of truth.
+	SidecarCapMax = 2
+
 	// Streaming response caps (issue #471 / ADR-047). Free stays on the
 	// 25 MB / 300 s envelope (spec §4.1 baseline) so the abuse-floor
 	// tier can't pin a long stream against the box. Hobby/Pro/Scale
@@ -904,7 +1025,7 @@ const (
 	RebalanceCooldownSeconds   = 60
 	RebalanceMaxPerTickPerNode = 50
 
-	// Tier A5 (cross-node live-instance migration, ADR-066
+	// Tier A5 (cross-node live-instance migration, ADR-068
 	// follow-up to ADR-064): pacing + lease window on
 	// pkg/sched/migration_handoff.go.
 	//
@@ -933,6 +1054,36 @@ const (
 	// here, never inlined.
 	MigrateLiveMaxPerTick   = 10
 	MigrateLiveLeaseSeconds = 90
+
+	// Tier A6 (migrating-instance watchdog, ADR-067 follow-up to
+	// ADR-068): self-heal stuck state='migrating' rows that
+	// never committed (the new owner vmmd died mid-handoff, the
+	// network partition dropped the gRPC, the operator killed
+	// the new owner before the commit). The watchdog is the
+	// only writer that can move a row out of 'migrating' without
+	// a peer commit — every Phase 4 path (CancelInstanceMigration)
+	// requires a peer, and the peer is the very thing that's gone.
+	//
+	// MigratingWatchdogTickLimit is the per-tick cap on the
+	// reconcile batch. A backlog of stuck rows past this cap is
+	// itself a "you broke something" event (the metric fires
+	// `outcome="cap_exceeded"`); a backlog over 50 means a peer
+	// dropped tens of migrations in flight and the operator
+	// should investigate before the next drain. Defaults to 50;
+	// tunable via FAAS_MIGRATING_WATCHDOG_TICK_LIMIT (env-
+	// overridable, see cmd/schedd/main.go::runWithDeps).
+	//
+	// MigratingWatchdogIntervalSeconds is the per-tick cadence
+	// of the watchdog. Default 1s; matches the existing reaper /
+	// cron tick. A 1s cadence is overkill for a 90s lease window
+	// but matches the existing pattern (every other 1s tick in
+	// pkg/sched/loop.go is the same shape). Tunable via
+	// FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	MigratingWatchdogTickLimit       = 50
+	MigratingWatchdogIntervalSeconds = 1
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
@@ -1185,6 +1336,20 @@ func (p Plan) MaxInstancesAllowed() bool {
 	return l.MaxInstancesAllowed
 }
 
+// SidecarAllowed (issue #463 / ADR-068 §Decision 1) reports whether
+// the plan may attach sidecars to a deployment. PR-A's accessor
+// returns true for every plan — the load-bearing gate is the GLOBAL
+// `SidecarCapMax` constant, not a per-plan matrix. A future PR
+// may grow this to a per-plan field (e.g. Free = 0, Hobby/Pro/Scale
+// = 2) if telemetry shows Free-tier abuse; for PR-A the method
+// exists so the apid handler can read a single source of truth
+// without inlining the global cap. The companion
+// `ErrSidecarNotAllowedOnPlan` constructor is reserved for that
+// future per-plan gate.
+func (p Plan) SidecarAllowed() bool {
+	return true
+}
+
 // EgressAllowlistAllowed reports whether the plan may set a per-app
 // outbound IP allowlist (ADR-031). Pro + Scale opt in; Free + Hobby
 // stay off — the abuse-desk hygiene this surface gives is a paid
@@ -1244,6 +1409,59 @@ func (p Plan) StreamingResponseAllowed() bool {
 		return false
 	}
 	return l.StreamingEnabled
+}
+
+// WarmSnapshotEnabled reports whether the plan's default for the
+// per-app two-tier snapshot flag is on. Pro/Scale return true; Free /
+// Hobby return false. The accessor is fail-closed — an unknown plan
+// reads as false, matching the Free default. Used by buildApp in
+// cmd/apid/handlers.go to populate a brand-new app's flag.
+//
+// Issue #470 / ADR-055: the equivalent gate ("can the customer opt in
+// to warm-snapshot?") lives on WarmSnapshotAllowed (separate method
+// below) so Free + Hobby PATCH-true can be rejected cleanly without
+// conflating the default and the gate.
+func (p Plan) WarmSnapshotEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.WarmSnapshotEnabled
+}
+
+// WarmSnapshotAllowed reports whether the plan permits a customer to
+// set apps.warm_snapshot_enabled=true via PATCH. Pro/Scale return true;
+// Free / Hobby return false so apid's updateApp handler can surface
+// 403 plan_warm_snapshot_not_allowed. Customers on any plan may PATCH
+// true → false (opt-out per-app).
+func (p Plan) WarmSnapshotAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.WarmSnapshotEnabled
+}
+
+// WarmSnapshotMinRequestsDefault returns the per-plan default for the
+// per-app request-count threshold. Pro/Scale: 5. Free/Hobby: 0 (the
+// column default — unused because warm-snapshot is gated off).
+func (p Plan) WarmSnapshotMinRequestsDefault() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WarmSnapshotMinRequestsDefault
+}
+
+// WarmSnapshotMinMsDefault returns the per-plan default for the per-app
+// time-since-first-ready threshold (ms). Pro/Scale: 2000. Free/Hobby:
+// 0 (unused). Used by buildApp in cmd/apid/handlers.go.
+func (p Plan) WarmSnapshotMinMsDefault() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WarmSnapshotMinMsDefault
 }
 
 // MaxResponseBodyBytes returns the per-response body cap in bytes for
@@ -1306,6 +1524,22 @@ func (p Plan) CronLimitPerAccount() int {
 		return 0
 	}
 	return l.CronLimitPerAccount
+}
+
+// KeysMax returns the per-account API-key cap for the plan
+// (issue #189 / IAM-5). Free 3, Hobby 10, Pro 50, Scale 200. The
+// handler enforces the cap at createKey (409
+// api_key_limit_exceeded); rotateKey is quota-neutral and is allowed
+// at the cap. Revoked keys (status='revoked') are excluded from the
+// count so the customer's historical lineage doesn't pin them out of
+// quota. Unknown plans fail closed (return 0) — same contract as
+// CronLimitPerAccount above.
+func (p Plan) KeysMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.KeysMax
 }
 
 // AlertRuleLimitPerApp returns the per-app alert-rule cap for the
@@ -1518,6 +1752,32 @@ func (l Limits) AdmissionMB() int {
 // to the overhead constant updates exactly one place.
 func BillableRAMMB(ramMB int) int {
 	return ramMB + PerVMOverheadMB
+}
+
+// BillableRAMMBWithSidecars is the sidecar-shape variant of
+// BillableRAMMB (issue #463 / ADR-068 §Decision 6). The billable
+// shutter is `plan.RAMMB + Σ(sidecar.ram_mb) + PerVMOverheadMB`:
+// sidecars share the per-VM overhead (one netns, one cgroup
+// scope per instance), but each sidecar contributes its own
+// RAM to the admission ceiling. Caller is responsible for
+// enforcing the SidecarCapMax bounds — this helper is purely
+// the arithmetic.
+//
+// PR-A defines the math; PR-B wires the consumer (schedd's
+// admission ledger + meterd's sampler). The sibling helper
+// (no-sidecars form) is BillableRAMMB — both shapes coexist.
+// A future cleanup can fold the single-arg form into this
+// helper as a variadic / empty-slice overload, but for PR-A
+// the two-form separation keeps the no-sidecar call sites
+// unambiguous.
+func BillableRAMMBWithSidecars(ramMB int, sidecarMBs []int) int {
+	total := ramMB + PerVMOverheadMB
+	for _, m := range sidecarMBs {
+		if m > 0 {
+			total += m
+		}
+	}
+	return total
 }
 
 // IdleTimeoutBounds returns the [floor, ceiling] seconds a customer may configure

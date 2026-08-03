@@ -98,6 +98,16 @@ func (v *statsFakeVMM) AcknowledgeMigration(context.Context, string, string, str
 func (v *statsFakeVMM) CancelLiveMigration(context.Context, string, string, string) error {
 	return nil
 }
+
+// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
+// receipt of the guest-init "framework ready" DGRAM. The
+// instancestats poller drives the wake/stats/heartbeat path,
+// not the framework-ready path, so the stub returns nil to
+// satisfy the closed VMM interface. The actual receipt data
+// path is exercised in pkg/vmmdgrpc/bufconn_test.go.
+func (v *statsFakeVMM) FrameworkReady(context.Context, string, int64) error {
+	return nil
+}
 func (v *statsFakeVMM) CreateColdBoot(context.Context, string, sched.AppSpec) (*sched.WakeOutcome, error) {
 	return &sched.WakeOutcome{}, nil
 }

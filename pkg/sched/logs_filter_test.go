@@ -88,6 +88,14 @@ func (r *deploymentFilterFakeVMM) PauseAndSnapshot(context.Context, string, stri
 	return SnapshotBytes{}, nil
 }
 func (r *deploymentFilterFakeVMM) Destroy(context.Context, string, string) error { return nil }
+
+// FrameworkReady implements RoutedVMM for the logs-filter test
+// fake (issue #470 / PR #470-FU-B). No-op — the logs-filter tests
+// exercise the per-deployment log filtering path, not the
+// warm-capture receipt path.
+func (r *deploymentFilterFakeVMM) FrameworkReady(context.Context, string, string, int64) error {
+	return nil
+}
 func (r *deploymentFilterFakeVMM) Ping(context.Context, string) (*PingOutcome, error) {
 	return &PingOutcome{FcVersion: "1.10.0"}, nil
 }

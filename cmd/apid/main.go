@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/auth"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/grace"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logintoken"
@@ -286,7 +287,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// error is fatal — silent drop is the bug we're closing.
 		if srv.audit != nil {
 			go func() {
-				if err := runAuditSubscriber(ctx, pool, srv.audit, log); err != nil && ctx.Err() == nil {
+				// issue #517 / PR-C / ADR-064: thread the
+				// events Platform through the audit
+				// subscriber so verify-rejection kinds
+				// (app.signature_invalid /
+				// app.signature_missing) also emit the
+				// typed wake.deploy_failed row.
+				if err := runAuditSubscriber(ctx, pool, srv.audit, log, srv.eventsPlatform); err != nil && ctx.Err() == nil {
 					log.Error("audit: subscriber exited", "err", err)
 				}
 			}()
@@ -534,6 +541,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unset (the daemon stays up; only the listener is skipped below).
 	ops := wire.NewOpsMetrics("apid")
 	srv.WithOpsMetrics(ctx, ops)
+	// issue #517 / PR-C / ADR-064: thread the events Platform
+	// into the server so the audit subscriber (which receives
+	// the signature-rejection kinds from imaged's verify hook)
+	// can emit the typed wake.deploy_failed row. nil opts out
+	// (the unit tests don't wire it). The Platform writes the
+	// events row + bumps wake_phase_emitted_total.
+	eventsPlatform := events.NewPlatform("apid", store, log, ops, nil)
+	srv.WithEventsPlatform(eventsPlatform)
 
 	// Status page (spec §12 public surface). The Prometheus URL is
 	// the local box's Prometheus installed by deploy/ansible/roles/
@@ -561,6 +576,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("apid: load host age recipient %q: %w", recipientPath, err)
 		}
 		setSecretRecipient = func() *age.X25519Recipient { return r }
+		// Issue #463 / ADR-068: the sidecar seal helper reuses the
+		// same host age recipient (one age identity per host). A
+		// separate getter keeps the seal helpers testable in
+		// isolation without leaking the secret-handler test seam.
+		setSidecarRecipient = func() *age.X25519Recipient { return r }
 		log.Info("host age recipient loaded", "path", recipientPath)
 	} else {
 		log.Warn("FAAS_HOST_AGE_RECIPIENT_PATH unset — secrets PUT will return 503")

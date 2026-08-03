@@ -63,6 +63,13 @@ tags:
     description: Per-app FIFO queues (send / receive / ack).
   - name: delayed_tasks
     description: Scheduled future invocations (cron-style, one-shot).
+  - name: observability
+    description: |
+      Per-app observability surfaces (issue #517 / PR-C / ADR-064) —
+      structured event timelines a customer or operator can query
+      for a single wake. Cross-tagged with `apps` so a tag filter
+      of `apps` surfaces lifecycle endpoints alongside the wake
+      timeline.
   - name: keys
     description: API key management.
   - name: audit
@@ -2988,6 +2995,110 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/keys/{id}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    post:
+      tags: [keys]
+      operationId: rotateKey
+      summary: Rotate an API key.
+      description: |
+        Mints a new key (status='active') and demotes the old key in
+        a single transaction (issue #189 / IAM-5). The new key
+        inherits the predecessor's label + scopes so the customer's
+        CI config does not need to chase a label change.
+
+        The old key's `expires_at` is OVERWRITTEN to the grace
+        deadline (now + grace_window_days, where grace_window_days
+        resolves from the per-account override or the 7-day plan
+        default). Status flips to 'grace' for the window, then to
+        'revoked' at the deadline. Setting
+        `accounts.key_grace_window_days = 0` makes rotation atomic
+        (old key revoked immediately).
+
+        Returns the new plaintext exactly once — the old plaintext
+        is not re-issued (we only store the SHA-256 hash). The
+        customer's CI script captures the new plaintext at the
+        moment of rotation and uses the new key thereafter; the old
+        key remains valid only for the grace window.
+
+        Quota: rotation is quota-neutral (-1 +1 = 0 net). A
+        customer AT the per-account cap can still rotate.
+      responses:
+        '200':
+          description: New key minted, old key now in 'grace' (or 'revoked' if grace_window_days=0).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateKeyResponse'
+              example:
+                key:
+                  id: "0123456789abcdef0123456789abcdef"
+                  prefix: "fp_live_ab"
+                  label: "ci-deploy"
+                  scopes: ["apps:read","deploy:write"]
+                  created_at: "2026-08-02T11:25:00Z"
+                  status: "active"
+                  rotated_from_id: "fedcba9876543210fedcba9876543210"
+                key_plaintext: "fp_live_NEW_PLAINTEXT_HERE"
+                old_key_id: "fedcba9876543210fedcba9876543210"
+                old_key_expires_at: "2026-08-09T11:25:00Z"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "No such key, or the key is already revoked."
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/account/keys/grace_window_days:
+    get:
+      tags: [keys]
+      operationId: getGraceWindow
+      summary: Read the per-account rotation grace-window override.
+      description: |
+        Returns the customer's current override (the value stored in
+        `accounts.key_grace_window_days`) and the plan default
+        alongside. `days=null` means "no override" — the rotation
+        handler uses the plan default (api.DefaultAPIKeyGraceWindowDays = 7).
+      responses:
+        '200':
+          description: Current override + plan default.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraceWindowResponse'
+              example: { days: 7, plan_default: 7 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [keys]
+      operationId: setGraceWindow
+      summary: Set the per-account rotation grace-window override.
+      description: |
+        Writes the override and invalidates the in-process cache so
+        the next rotation observes the new value. `days=0` is atomic
+        rotation (no grace); `days=null` (or omission) clears the
+        override and falls back to the plan default.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetGraceWindowRequest'
+            example: { days: 14 }
+      responses:
+        '200':
+          description: Override applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraceWindowResponse'
+              example: { days: 14, plan_default: 7 }
+        '400':
+          description: "Invalid body (e.g. negative days)."
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Audit events (IAM-4 / ADR-035) ───────────────────────────────────────
 
   /v1/audit-events:
@@ -3101,6 +3212,95 @@ paths:
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Wake timeline (issue #517 / PR-C / ADR-064) ──────────────────────────
+
+  /v1/apps/{slug}/wakes/{wake_id}/timeline:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        schema: { type: string }
+        description: "App slug (lowercase, kebab-case; per-account unique)."
+      - name: wake_id
+        in: path
+        required: true
+        schema: { type: string }
+        description: |
+          The per-wake correlation handle minted by the schedd
+          engine (UUID v4 in production). The endpoint returns
+          every `wake.*` events row whose `data.wake_id`
+          matches — the partial index `events_wake_id_idx`
+          (migrations/00113) serves the read in O(frames)
+          regardless of the events table size.
+    get:
+      tags: [apps, observability]
+      operationId: listWakeTimeline
+      summary: List the canonical wake-timeline frames for one wake.
+      description: |
+        Oldest-first (forward narrative). Returns every typed
+        `wake.*` events row for the given wake_id: queue_accepted
+        → admitted → boot_started → boot_completed →
+        readiness_200 → proxy_first_byte. Build and deploy
+        failures (`wake.build_failed`, `wake.deploy_failed`,
+        `wake.boot_failed`) are joined in alongside the success
+        path so a single GET shows the whole lifecycle.
+
+        The endpoint is a sub-resource of `/v1/apps/{slug}`;
+        auth and rate-limit share the §12 per-app budget with
+        logs/metrics/wake. Cross-account access 404s the
+        same way unknown slugs do (forge-proof: every row's
+        `data.app_id` is verified to match the resolved app).
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: "Only return rows with `at >= since` (RFC 3339)."
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+          description: "Max frames to return. Silently capped at 1000."
+      responses:
+        '200':
+          description: Wake-timeline frames.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WakeTimelineResponse'
+              example:
+                wake_id: "abcdef01-2345-6789-abcd-ef0123456789"
+                app_id: "0123456789abcdef0123456789abcdef"
+                limit: 200
+                next_cursor: ""
+                events:
+                  - at: "2026-07-25T13:25:00.123Z"
+                    kind: wake.queue_accepted
+                    actor: schedd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", queue_wait_ms: 12 }
+                  - at: "2026-07-25T13:25:00.135Z"
+                    kind: wake.admitted
+                    actor: schedd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", account_id: "fdecba98-7654-3210-fedc-ba9876543210", plan: "pro" }
+                  - at: "2026-07-25T13:25:00.420Z"
+                    kind: wake.boot_started
+                    actor: schedd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", instance_id: "inst-1", node_id: "node-1", method: "restore" }
+                  - at: "2026-07-25T13:25:01.180Z"
+                    kind: wake.readiness_200
+                    actor: vmmd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", instance_id: "inst-1", node_id: "node-1", healthcheck_path: "/healthz", probe_count: 1, elapsed_ms: 760 }
+                  - at: "2026-07-25T13:25:01.220Z"
+                    kind: wake.proxy_first_byte
+                    actor: gatewayd
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", instance_id: "inst-1", node_id: "node-1", latency_ms: 40 }
+        '400':
+          description: Malformed query parameter on the wake-timeline read — `since` not RFC 3339 or `limit` out of range.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No such app (slug) or wake_id is unknown.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Usage ────────────────────────────────────────────────────────────────
@@ -3976,6 +4176,31 @@ components:
           description: "Per-app cosign signature-enforcement flag (issue #472 / ADR-054). When true, OCI image deploys must carry a valid signature from a publisher in the per-app trusted_signers list. Default false."
           type: boolean
           example: false
+        # Issue #470 / ADR-055: per-app two-tier snapshot flag +
+        # thresholds. True on Pro/Scale by default; Free/Hobby
+        # always false (the only legal state on those tiers —
+        # apid rejects PATCH-true with 403
+        # plan_warm_snapshot_not_allowed). Customer PATCH may
+        # toggle the flag or override the per-app thresholds;
+        # out-of-range threshold values are rejected with 422
+        # invalid_warm_snapshot_min_*.
+        warm_snapshot_enabled:
+          description: "Per-app two-tier snapshot flag (issue #470 / ADR-055). True on Pro/Scale by default; Free/Hobby always false."
+          type: boolean
+          example: true
+        warm_snapshot_min_requests:
+          description: "Effective per-app request-count threshold for warm-tier capture on this app (issue #470 / ADR-055). Range [1, 100]."
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 5
+
+        warm_snapshot_min_ms:
+          description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]."
+          type: integer
+          minimum: 100
+          maximum: 60000
+          example: 2000
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -3997,6 +4222,28 @@ components:
           description: "Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471)."
           type: boolean
           example: false
+        # Issue #470 / ADR-055: optional at create-time. Omitted
+        # → apid applies the plan default (Pro/Scale = true;
+        # Free/Hobby = false — the only legal state on those
+        # tiers). PATCH-true on Free/Hobby is rejected with 403
+        # plan_warm_snapshot_not_allowed.
+        warm_snapshot_enabled:
+          description: "Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan default. Free/Hobby PATCH-true is rejected."
+          type: boolean
+          example: true
+        warm_snapshot_min_requests:
+          description: "Optional create-time override for the warm-tier request-count threshold (issue #470 / ADR-055). Range [1, 100]. Omitted → apid applies the plan default."
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 5
+
+        warm_snapshot_min_ms:
+          description: "Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → apid applies the plan default."
+          type: integer
+          minimum: 100
+          maximum: 60000
+          example: 2000
 
     UpdateAppRequest:
       description: "Partial update — every field is optional; omitted fields are unchanged."
@@ -4086,6 +4333,26 @@ components:
           description: "DEPRECATED on this surface. The customer PATCH /v1/apps/{slug} endpoint silently drops require_signed; the operator endpoint PATCH /v1/apps/{slug}/security is the only path that flips the flag (issue #472 / ADR-054). The field is parsed for backwards compatibility but never persisted from this endpoint."
           type: [boolean, "null"]
           example: false
+        # Issue #470 / ADR-055: per-app warm-snapshot flag +
+        # thresholds. PATCH-true on Free/Hobby is rejected with
+        # 403 plan_warm_snapshot_not_allowed; out-of-range
+        # threshold values return 422 invalid_warm_snapshot_min_*.
+        warm_snapshot_enabled:
+          description: "Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted → no change. PATCH-true on Free/Hobby is rejected with 403 plan_warm_snapshot_not_allowed."
+          type: [boolean, "null"]
+          example: true
+        warm_snapshot_min_requests:
+          description: "Per-app request-count threshold for warm-tier capture (issue #470 / ADR-055). Range [1, 100]. Omitted → no change."
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 100
+          example: 5
+        warm_snapshot_min_ms:
+          description: "Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → no change."
+          type: [integer, "null"]
+          minimum: 100
+          maximum: 60000
+          example: 2000
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -4365,7 +4632,7 @@ components:
         new_balance: { type: integer, minimum: 0 }
 
     CreateDeploymentRequest:
-      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload. The optional `overrides` object (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the image. The override field list is FROZEN — six fields, no more — and any extra field on the override object 400s the request (the handler's decoder rejects unknown keys; see ADR-053 §Decision 1)."
+      description: "Two content-types accepted (see operation description): prebuilt OCI image reference, or multipart source upload. The optional `overrides` object (issue #460 / ADR-053) lets a customer redeploy the same digest-pinned image with a different entrypoint / cmd / env / env_secrets / port / healthcheck without rebuilding the image. The override field list is FROZEN — six fields, no more — and any extra field on the override object 400s the request (the handler's decoder rejects unknown keys; see ADR-053 §Decision 1). The optional `sidecars` array (issue #463 / ADR-068) attaches up to 2 stateless sidecars (1 init + 1 sidecar) per app — a one-shot DB migrator as `init`, a metrics scraper as `sidecar`. nil/omitted = no sidecars."
       type: object
       properties:
         image:
@@ -4388,6 +4655,16 @@ components:
           description: "Per-deploy signature-enforcement opt-in (issue #472 / ADR-054). nil = inherit apps.require_signed; *true is a no-op when the app flag is already on; *false is rejected with 403 deploy_signature_invalid when the app flag is on (operator policy wins)."
           type: [boolean, "null"]
           example: true
+        # Issue #463 / ADR-068: up to 2 stateless sidecars
+        # (1 init + 1 sidecar). The runtime effect (imaged,
+        # fcvm, guest-init) ships in PR-B; PR-A persists the
+        # shape and the handler envelope-seals env values.
+        sidecars:
+          type: array
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/Sidecar'
+          description: "Up to 2 stateless sidecars (1 init + 1 sidecar). nil/omitted = no sidecars. See ADR-068 for the hard 2-cap and stateless-only contract."
 
     CreateDeploymentOverrides:
       description: |
@@ -4459,6 +4736,80 @@ components:
         interval_s: { type: integer, minimum: 0, description: "Probe interval in seconds; 0 = use image default." }
         timeout_s:  { type: integer, minimum: 0, description: "Probe timeout in seconds; 0 = use image default." }
         retries:    { type: integer, minimum: 0, description: "Consecutive failures before the instance is considered unhealthy; 0 = use image default." }
+
+    Sidecar:
+      description: |
+        One entry in the deploy request's `sidecars` array
+        (issue #463 / ADR-068). Up to 2 sidecars per app (1 init
+        + 1 sidecar; the array is type-uniqueness + 2-capped at
+        the schema layer via migration 00095's CHECK constraint).
+        Stateless only — stateful base images (Postgres, Redis,
+        MySQL, MongoDB, etc.) are rejected at the API gate
+        with 403 `sidecar_stateful_denied` and again at imaged
+        (PR-B). Image references must be digest-pinned
+        (`repo@sha256:...`); tag references are rejected with
+        400 `sidecar_invalid_image`. Env values are
+        envelope-sealed at rest via secretbox (namespace
+        `"sidecar_env"`); the wire shape is plaintext, the
+        column is sealed ciphertext.
+
+        - `name` matches RFC 1123 label (lowercase alphanumeric
+          + dash, 1..63 chars, starts with [a-z0-9]). Unique
+          within a single request.
+        - `image` is the digest-pinned OCI reference. Tag
+          references rejected. State images rejected.
+        - `type` ∈ {`init`, `sidecar`}. At most one of each per
+          deployment.
+        - `cmd` is the argv (image's ENTRYPOINT unchanged; CMD
+          overridden). Every element non-empty.
+        - `env` is plaintext on the wire, sealed at rest. Keys
+          per `^[A-Z][A-Z0-9_]*$`; per-value byte cap = plan
+          `EnvValueMaxBytes`. Plaintext values NEVER appear in
+          any log, audit, or error.
+        - `port` ∈ {0, 1..65535}. 0 = absent.
+        - `ram_mb` ∈ {0, 32..512}. 0 = inherit plan RAM.
+        - `essential` defaults to true. If true and the sidecar
+          exits non-zero: type=init → fail the deploy
+          (`failure_class=user_error`); type=sidecar → restart-
+          loop. If false: warn + restart-cap (PR-B's runtime).
+      type: object
+      required: [name, image, type]
+      properties:
+        name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+          minLength: 1
+          maxLength: 63
+          description: "RFC 1123 label (lowercase alphanumeric + dash, 1..63 chars, starts with [a-z0-9])."
+        image:
+          type: string
+          pattern: '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]+)?/[A-Za-z0-9_./-]+@sha256:[0-9a-f]{64}$'
+          description: "Digest-pinned OCI reference (repo@sha256:...). Tag references rejected with 400 `sidecar_invalid_image`."
+        type:
+          type: string
+          enum: [init, sidecar]
+          description: "`init` runs once before the main workload (DB migrator shape). `sidecar` runs alongside (metrics scraper shape)."
+        cmd:
+          type: array
+          items: { type: string, minLength: 1 }
+          description: "Argv. Image's ENTRYPOINT unchanged; CMD overridden. Every element non-empty."
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: "Plaintext env map (sealed at rest). Keys `^[A-Z][A-Z0-9_]*$`; per-value byte cap = plan EnvValueMaxBytes."
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: "Listen port. 0 = absent / fall back to image default."
+        ram_mb:
+          type: integer
+          minimum: 0
+          maximum: 512
+          description: "Cgroup memory ceiling for this sidecar. 0 = inherit plan RAM; 32..512 enforced at the API."
+        essential:
+          type: boolean
+          description: "Defaults to true. type=init non-zero exit → fail deploy; type=sidecar non-zero exit → restart-loop. PR-B's runtime."
 
     # ─── Instances ────────────────────────────────────────────────────────
 
@@ -4906,10 +5257,19 @@ components:
           example: [admin]
         last_used_at: { type: [string, "null"], format: date-time }
         created_at: { type: string, format: date-time, example: "2026-07-25T13:25:00Z" }
+        # IAM-5 (issue #189) — expiry + status surface. expires_at
+        # is RFC 3339 or absent (admin keys default to no expiry).
+        # status is "active" | "grace" | "revoked". revoked_at
+        # mirrors expires_at semantics. rotated_from_id is the
+        # predecessor key's id when this row was minted by rotate.
+        expires_at: { type: [string, "null"], format: date-time, description: "When the key expires (RFC 3339). Absent on never-expiring admin keys." }
+        status: { type: string, enum: [active, grace, revoked], description: "Status state machine. `active` = ready; `grace` = in the post-rotation window; `revoked` = terminal." }
+        revoked_at: { type: [string, "null"], format: date-time, description: "When the key was revoked (RFC 3339). Absent on active/grace keys." }
+        rotated_from_id: { type: [string, "null"], description: "Predecessor key id when this row was minted by rotateKey. Absent on a fresh mint." }
         plaintext:
           type: [string, "null"]
-          description: PRESENT ONLY on POST /v1/keys response. Never returned again.
-      example: {id: "0123456789abcdef0123456789abcdef", prefix: "fp_live_ab12cd34", label: "ci-deploy", scopes: [apps:read, deploy:write], created_at: "2026-07-25T13:25:00Z", last_used_at: "2026-07-25T13:25:00Z", plaintext: "fp_live_abcd1234567890abcdef12345678"}
+          description: PRESENT ONLY on POST /v1/keys and POST /v1/keys/{id}/rotate responses. Never returned again.
+      example: {id: "0123456789abcdef0123456789abcdef", prefix: "fp_live_ab12cd34", label: "ci-deploy", scopes: [apps:read, deploy:write], created_at: "2026-08-02T11:25:00Z", expires_at: "2027-08-02T11:25:00Z", status: "active", last_used_at: "2026-07-25T13:25:00Z"}
 
     CreateKeyRequest:
       description: "API key creation payload — label and optional scopes. Plaintext is returned exactly once in the 201 response. Scopes defaults to `[\"admin\"]` when omitted so existing callers preserve the legacy full-access behavior. See IAM-1, ADR-034 rev2."
@@ -4921,6 +5281,30 @@ components:
           items: { type: string, enum: [admin, deploy:write, secrets:read, secrets:write, usage:read, apps:read, env:read, env:write] }
           description: "Requested permission set. Server validates each entry against the closed vocabulary and rejects unknown scopes at mint time. `admin` is the legacy full-access scope; the other five cover narrower surfaces (see APIKeyResponse.scopes). See IAM-1, ADR-034 rev2."
           example: [apps:read, deploy:write]
+
+    RotateKeyResponse:
+      description: "Response body of POST /v1/keys/{id}/rotate. The new `key_plaintext` is returned exactly once; the old plaintext is NEVER returned (only the hash is stored). `old_key_expires_at` is the grace deadline applied to the predecessor — the customer's CI rotates over by then."
+      type: object
+      required: [key, key_plaintext, old_key_id, old_key_expires_at]
+      properties:
+        key: { $ref: '#/components/schemas/APIKeyResponse' }
+        key_plaintext: { type: string, description: "New plaintext (PRESENT ONLY on this response). Capture immediately; the API never returns it again." }
+        old_key_id: { type: string, description: "Predecessor key id (matches Key.rotated_from_id)." }
+        old_key_expires_at: { type: string, format: date-time, description: "Grace deadline applied to the old key (RFC 3339, UTC). When grace_window_days=0 the deadline is 'now' (atomic rotation)." }
+
+    SetGraceWindowRequest:
+      description: "Body of PATCH /v1/account/keys/grace_window_days. `days` is the per-account override for the rotation grace window. `days=0` is atomic rotation; `days=null` (or omitted) clears the override and falls back to the plan default (api.DefaultAPIKeyGraceWindowDays = 7)."
+      type: object
+      properties:
+        days: { type: [integer, "null"], minimum: 0, description: "Per-account override in days. 0 = atomic, null = use plan default." }
+
+    GraceWindowResponse:
+      description: "Body of GET /v1/account/keys/grace_window_days. `days` is the customer's override (null = no override); `plan_default` is the platform default the rotation handler uses when the row is null."
+      type: object
+      required: [days, plan_default]
+      properties:
+        days: { type: [integer, "null"], minimum: 0 }
+        plan_default: { type: integer, minimum: 0, description: "Platform default grace window in days (api.DefaultAPIKeyGraceWindowDays = 7)." }
 
     # ─── Audit events (IAM-4 / ADR-035) ──────────────────────────────────
 
@@ -4978,6 +5362,58 @@ components:
           type: integer
           description: "Effective limit applied (always 1..100)."
           example: 50
+
+    WakeTimelineEvent:
+      description: |
+        One frame of the wake timeline (issue #517 / PR-C /
+        ADR-064). The shape mirrors the typed event payloads
+        the producers write — see `pkg/events/wake.go`. The
+        canonical `wake.*` vocabulary is documented in
+        `docs/adr/064-wake-timeline-canonical-vocabulary.md`
+        (12 success-path kinds + 3 failure-path kinds: build,
+        deploy, boot).
+      type: object
+      required: [at, kind, actor, data]
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: "RFC 3339 UTC. Oldest-first (forward narrative)."
+        kind:
+          type: string
+          description: "Canonical `wake.*` kind. See ADR-064."
+          example: wake.boot_started
+        actor:
+          type: string
+          description: "Daemon that wrote the row (`schedd` / `vmmd` / `gatewayd` / `builderd` / `apid`)."
+          example: schedd
+        data:
+          type: object
+          additionalProperties: true
+          description: "Producer-supplied payload (json object)."
+
+    WakeTimelineResponse:
+      description: "Envelope for `GET /v1/apps/{slug}/wakes/{wake_id}/timeline`."
+      type: object
+      required: [wake_id, app_id, events, limit]
+      properties:
+        wake_id:
+          type: string
+          description: "Echo of the path-segment wake_id."
+        app_id:
+          type: string
+          format: uuid
+          description: "Resolved app id (the slug's owning app)."
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/WakeTimelineEvent' }
+        next_cursor:
+          type: string
+          description: "Opaque RFC 3339 cursor for the next page. Empty when this is the last page."
+        limit:
+          type: integer
+          description: "Effective limit applied (always 1..1000)."
+          example: 200
 
     # ─── Secrets ──────────────────────────────────────────────────────────
 

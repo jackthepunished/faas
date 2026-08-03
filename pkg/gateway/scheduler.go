@@ -111,6 +111,40 @@ func scheddWakeMethodToGateway(m int32) WakeMethod {
 	return WakeMethodColdBoot
 }
 
+// tierFromWakeMethod (issue #470 / PR #470-FU-B) maps the
+// existing WakeMethod to the closest snapshot-tier label for
+// the gateway_wake_snapshot_tier_total counter. Today
+// WakeMethod is a 2-value enum (snapshot vs cold-boot); the
+// tier refinement is a 3-value set (warm, init, cold). The
+// bridge is coarser than the eventual PR #470-FU-A feed
+// (which will thread the real tier through the Admit
+// response) but it ensures the counter has a non-zero baseline
+// before PR A lands. Mapping:
+//
+//   - WakeMethodSnapshotRestore → "init"
+//     (today every restored snapshot is init; warm is a
+//     refinement that PR A will surface as a distinct value)
+//   - WakeMethodColdBoot → "cold"
+//   - WakeMethodUnspecified → "init" (zero-value fallback)
+//
+// This is a deliberate temporary bridge. PR #470-FU-A
+// replaces the call site with the engine's actual tier field
+// — the metric's empty-string fallback in
+// ObserveWakeSnapshotTier covers the transition seam.
+func tierFromWakeMethod(m WakeMethod) string {
+	switch m {
+	case WakeMethodSnapshotRestore:
+		return "init"
+	case WakeMethodColdBoot:
+		return "cold"
+	default:
+		// WakeMethodUnspecified and any future addition — the
+		// counter's empty-string fallback ("init") is the safe
+		// default; mirror it here.
+		return "init"
+	}
+}
+
 // Scheduler is what the gateway needs from schedd. AdmitInstance blocks
 // until schedd has either admitted + dispatched a NEW instance or decided
 // the app is already at max_concurrency (atCapacity=true).

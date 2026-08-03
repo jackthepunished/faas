@@ -1,0 +1,39 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00119_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change but does occupy the slot
+-- in goose's version table on apply.
+--
+-- Slot 119 is the partner fence that bridges this branch's
+-- 00118_deployments_sidecars_test.go on main and this branch's
+-- 00122_instances_framework_ready_at.sql after the 112 → 122
+-- renumber. PR #547 (Tier A7 gatewayd split) opened against main
+-- claiming slots 119/120/121 as a real migration + reservation
+-- pattern (its 00119_reserve_slot.sql + 00120_warm_hint.sql +
+-- 00121_pg_ratelimit.sql). This branch restores the 119 fence
+-- after renumbering its own 119 → 121 to dodge the slot
+-- collision with PR #547.
+--
+-- Whichever side lands second, the other drops its 119 fence on
+-- rebase. The cross-PR slot gate's reservation carve-out hides
+-- this file from the collision check but the contiguity test
+-- counts every embedded .sql, so the fence is mandatory on this
+-- branch until the renumber chain settles.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

@@ -26,6 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
@@ -497,6 +498,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// the RUNNING transition.
 	engine.WithAudit(audit.New(store, log, ops, "schedd"))
 
+	// issue #517 / PR-C / ADR-064 — wire the wake-timeline fan-out
+	// (pkg/events.Platform) on the engine. Schedd is the canonical
+	// emit site for wake.queue_accepted / wake.admitted /
+	// wake.boot_started / wake.boot_completed / wake.boot_failed /
+	// wake.park_started / wake.park_completed / wake.stalled
+	// (vmmd / gatewayd / builderd / apid mirror corroborating
+	// observations). nil broadcaster is allowed — the Platform
+	// skips the in-process SSE fan-out and just writes the events
+	// row. Production SSE delivery for the /v1/apps/{slug}/wakes/
+	// {wake_id}/timeline endpoint uses pg_notify (cross-process),
+	// not the in-process Broadcaster.
+	engine.WithEvents(events.NewPlatform("schedd", store, log, ops, nil))
+
 	// Rebuild admission accounting from any instances still live from a prior
 	// run before we start admitting new wakes.
 	if err := engine.SeedLedger(ctx); err != nil {
@@ -654,6 +668,31 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("FAAS_MIGRATE_LIVE_LEASE_SECONDS: %s", v)
 		}
 		engine.WithMigrateLiveLeaseSeconds(n)
+	}
+
+	// Tier A6 / ADR-067: migrating-instance watchdog. Self-heal
+	// stuck state='migrating' rows that never committed (the new
+	// owner vmmd died mid-handoff, etc.). The watchdog is the
+	// only writer that can move a row out of 'migrating' without
+	// a peer commit. Same env-override rationale as the A5
+	// blocks above — explicit fail-fast on bad input.
+	if v := os.Getenv("FAAS_MIGRATING_WATCHDOG_TICK_LIMIT"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_MIGRATING_WATCHDOG_TICK_LIMIT must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_MIGRATING_WATCHDOG_TICK_LIMIT: %s", v)
+		}
+		engine.WithMigratingWatchdogTickLimit(n)
+	}
+	if v := os.Getenv("FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS: %s", v)
+		}
+		engine.WithMigratingWatchdogIntervalSeconds(n)
 	}
 
 	// Tier A4 / ADR-064: rebalancer subscriber. Watches
@@ -865,6 +904,32 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// (sched.MaxParksPerTickPerApp = 8).
 		WithReaperAggressive(cfg.ReaperAggressive).
 		WithReaperParkCap(cfg.ReaperAggressiveParkCap)
+
+	// ADR-067: Tier A6 migrating-instance watchdog — self-heals
+	// rows stuck in state='migrating' after a new-owner vmmd dies
+	// mid-handoff. 1 s tick (api.MigratingWatchdogIntervalSeconds);
+	// per-tick cap = cfg.MigratingWatchdogTickLimit (default
+	// api.MigratingWatchdogTickLimit = 50). Active owners are
+	// reinvited (state→running); dead owners are parked
+	// (state→parked, node_id→migrated_from_node_id).
+	//
+	// cfg.*=0 means "use the api.* default" — cmd/schedd fills
+	// them in here so an unset TOML and an unset env var both
+	// resolve to the spec defaults (mirrors the existing
+	// ReaperAggressive / ReaperAggressiveParkCap zero-handling).
+	mwdInterval := cfg.MigratingWatchdogIntervalSeconds
+	if mwdInterval <= 0 {
+		mwdInterval = api.MigratingWatchdogIntervalSeconds
+	}
+	mwdTickLimit := cfg.MigratingWatchdogTickLimit
+	if mwdTickLimit <= 0 {
+		mwdTickLimit = api.MigratingWatchdogTickLimit
+	}
+	engine.WithMigratingWatchdogTickLimit(mwdTickLimit)
+	loop.WithMigratingWatchdog(sched.NewMigratingWatchdog(
+		engine.ReconcileExpiredMigrations,
+		time.Duration(mwdInterval)*time.Second,
+		log))
 	if cfg.GatewayMetricsURL != "" {
 		// Issue #171: share a single HTTPPromScraper between the
 		// scale-up trigger and the aggressive-reaper signal mirror.

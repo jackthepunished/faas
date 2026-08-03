@@ -14,6 +14,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/apid"
 	"github.com/onebox-faas/faas/pkg/auth"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
+	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -55,6 +56,15 @@ type server struct {
 	// (slice 5/6). nil falls back to a fresh one so callers can defer
 	// initialization in unit tests.
 	events *events.Broadcaster
+	// eventsPlatform is the pkg/events.Platform (issue #517 / PR-C /
+	// ADR-064). When non-nil, the deploy handler emits
+	// wake.deploy_failed on the events table for every
+	// pre-build rejection (signature gate, image format, override
+	// cap). nil opts out (pre-PR-C unit tests + dev mode that
+	// doesn't want the events row side-effect). The same value
+	// lives on the cmd/apid wiring site so a single
+	// construction serves every consumer in this binary.
+	eventsPlatform *events.Platform
 	// sessions seals + verifies dashboard cookies. nil falls back to an
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
@@ -147,6 +157,14 @@ type server struct {
 	// apid_op_duration_seconds without each one wrapping itself.
 	// Nil = observation disabled (unit tests).
 	ops *wire.OpsMetrics
+	// graceWindowCache (issue #189 / IAM-5) caches the per-account
+	// rotation grace override (accounts.key_grace_window_days). The
+	// bearer-key auth path does NOT read it (the lazy expiry gate
+	// is in pkg/state.AuthenticateKey); only rotateKey reads it,
+	// and a 60 s TTL bounds the admin-update propagation latency.
+	// nil-safe: the rotate handler queries the store directly when
+	// the cache is nil (the dev/test boot path).
+	graceWindowCache *graceWindowCache
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -165,6 +183,18 @@ type server struct {
 	//
 	// ADR-044.
 	authMw *authmw.Middleware
+	// orgResolver is the pkg/authz.OrgResolver the LoadOrg
+	// middleware reads to resolve (slug, membership) for the
+	// X-Active-Org / ?org= hint. Wraps the same pkg/state.Store
+	// s.store already holds — see (*server).loadOrg. nil is
+	// tolerated for unit tests that don't exercise LoadOrg
+	// (cmd/apid/auth_facade.go's s.loadOrg is a no-op when
+	// orgResolver is nil; the route table only mounts the
+	// middleware when this is non-nil, so a nil pointer never
+	// reaches the middleware at runtime).
+	//
+	// Issue #190 / IAM-6 / ADR-061, PR 4.
+	orgResolver *authz.StoreBackedResolver
 	// oauthConfig is the boot-resolved sign-in OAuth provider state
 	// (issue #419 / ADR-046). Computed once in cmd/apid/main.go
 	// via auth.LoadSignInConfigFromEnv, passed into newServerWithDeps,
@@ -308,6 +338,19 @@ func (s *server) WithBillingProvider(p billing.Provider) *server {
 // zero value (both providers Disabled → consent routes 503).
 func (s *server) WithOAuthConfig(cfg auth.SignInConfig) *server {
 	s.oauthConfig = cfg
+	return s
+}
+
+// WithEventsPlatform attaches the pkg/events.Platform
+// (issue #517 / PR-C / ADR-064). When non-nil, the deploy
+// handler emits wake.deploy_failed on the events table for
+// every pre-build rejection (signature gate, image format,
+// override cap, missing slug). nil opts out — pre-PR-C
+// fixtures + the unit-test default. Mirrors the WithEvents
+// setter pattern on pkg/sched.Engine / pkg/fcvm.VMM /
+// pkg/builderd.Builderd.
+func (s *server) WithEventsPlatform(p *events.Platform) *server {
+	s.eventsPlatform = p
 	return s
 }
 
@@ -484,6 +527,19 @@ func newServerWithDeps(
 			log,
 			apiAuthLimiter,
 		),
+		// Issue #190 / IAM-6 / ADR-061, PR 4: org resolver backs
+		// s.loadOrg (cmd/apid/auth_facade.go). Wraps the same
+		// pkg/state.Store the rest of the daemon uses; PR 7 may
+		// add a small LRU cache here when admission pressure
+		// makes the per-request SELECT hot.
+		//
+		// nil when store is nil — a handful of legacy tests
+		// (TestStatusJSONHandlerNoPrometheusURL and friends)
+		// construct a server with no store to exercise degraded
+		// paths. s.loadOrg treats a nil resolver as pass-through
+		// (cmd/apid/auth_facade.go::loadOrg), so LoadOrg is
+		// inert for those tests — no DB call attempted.
+		orgResolver: maybeStoreBackedResolver(store),
 		// oauthConfig (issue #419 / ADR-046) is left at the
 		// zero value here (both providers Disabled); production
 		// wires the env-resolved config via (*server).WithOAuthConfig
@@ -499,6 +555,12 @@ func newServerWithDeps(
 		// store.ApplyProjectPlan directly; post-PR-G every
 		// workload-mutating path goes through Service.Reconcile.
 		reconcileSvc: buildReconcileService(store, aud.pkgAuditor(), log),
+		// IAM-5 (issue #189): rotation grace-window cache. 60 s
+		// TTL bounds the admin-update propagation latency; the
+		// invalidate-on-write path closes the loop. nil in
+		// legacy tests that pre-date the cache — the rotateKey
+		// handler falls back to the store directly.
+		graceWindowCache: newGraceWindowCache(),
 	}
 }
 
@@ -539,7 +601,25 @@ func (s *server) handler() http.Handler {
 	// whole account, so it requires the admin scope; the read-only
 	// /v1/account carries the method default (read or admin).
 	mux.HandleFunc("GET /v1/account", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.whoami))))
+	// IAM-6 (issue #190 / ADR-061, PR 4): active-org whoami. The
+	// route is undocumented in api/openapi.yaml for PR 4 — PR 5
+	// adds the spec coverage + the rest of the /v1/orgs/{slug}/...
+	// surface. Loads the org via s.loadOrg (the pkg/authz middleware
+	// that resolves X-Active-Org / ?org=) and returns the membership
+	// role. No header → {"org": null} (passthrough, pre-PR-5 routes
+	// stay account-scoped).
+	mux.HandleFunc("GET /v1/orgs/me", s.auth(s.loadOrg(s.whoamiActiveOrg)))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan)))))
+	// IAM-5 (issue #189): per-account rotation grace-window
+	// override. Admin-only because the rotation primitive is
+	// admin-only (POST /v1/keys/{id}/rotate mirrors the same
+	// scope). GET surfaces the current value (with the plan
+	// default alongside so the dashboard can render "Override: 7
+	// days / Plan default: 7 days"); PATCH writes the override
+	// and invalidates the in-process cache so the next rotation
+	// sees the new value.
+	mux.HandleFunc("GET /v1/account/keys/grace_window_days", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.getGraceWindow))))
+	mux.HandleFunc("PATCH /v1/account/keys/grace_window_days", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.setGraceWindow))))
 	// G6 account self-service (spec §17 G6, ADR-021). /v1/account/dpa
 	// is intentionally mounted without s.auth — the DPA is a public
 	// artefact a prospect reads before signing up. The export + delete
@@ -709,6 +789,12 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/keys", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listKeys))))
 	mux.HandleFunc("POST /v1/keys", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.createKey))))
 	mux.HandleFunc("DELETE /v1/keys/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.deleteKey))))
+	// IAM-5 (issue #189): rotation endpoint. Admin-only because
+	// rotation mints a new key that retains the predecessor's
+	// scopes — limiting to admin matches the existing key-mint
+	// gate (POST /v1/keys) and avoids a non-admin scope-expanding
+	// via the rotation path.
+	mux.HandleFunc("POST /v1/keys/{id}/rotate", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.rotateKey))))
 
 	// Operator-only billing surface (issue #279). The admin allowlist
 	// is enforced inside the handler (adminAllows), not just at the
@@ -724,6 +810,14 @@ func (s *server) handler() http.Handler {
 	// routes are gated separately below.
 	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAuditEvents))))
 	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAuditEvent))))
+
+	// Issue #517 / PR-C / ADR-064: customer-facing wake-timeline
+	// surface. Sub-resource of /v1/apps/{slug} — same auth chain
+	// as the rest of the /v1/apps/* read surface, same §12
+	// per-app rate-limit budget. The query keys on the partial
+	// index events_wake_id_idx (migrations/00113) for O(frames)
+	// latency regardless of events table size.
+	mux.HandleFunc("GET /v1/apps/{slug}/wakes/{wake_id}/timeline", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listWakeTimeline))))
 
 	// Customer secrets (spec §11/G2). Plaintext VALUE flows through PUT
 	// over TLS; sealed server-side by handlers_secrets.go.

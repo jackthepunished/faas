@@ -296,6 +296,25 @@ const (
 	// trusted-signer quota error as an env-var quota error.
 	CodePlanLimitTrustedSigners = "plan_limit_trusted_signers"
 
+	// IAM-5 API-key lifecycle (issue #189). Distinct from the
+	// secret/env surface because the lifecycle diverges: secrets
+	// and env vars are config rows, API keys are revocable
+	// credentials with a status state machine (active | grace |
+	// revoked) and a per-account grace override. Three codes:
+	//   * CodeAPIKeyExpired = 401, the bearer key has expired
+	//     (auth-time gate; the auth middleware emits key.expired).
+	//   * CodeAPIKeyRevoked = 401, the key is in status='revoked'
+	//     (manual delete, rotation atomic, or lazy-expiry).
+	//   * CodeAPIKeyLimitExceeded = 409, the per-account cap
+	//     (Plan.KeysMax, IAM-5) is reached. Mirrors ErrPlanLimitSecrets
+	//     shape but on 409 because the customer's history (one
+	//     revoking-key insistence) is idempotent — they can re-issue
+	//     after a delete and the operation completes, but adding a
+	//     fresh key while at the cap is a quota block.
+	CodeAPIKeyExpired       = "api_key_expired"
+	CodeAPIKeyRevoked       = "api_key_revoked"
+	CodeAPIKeyLimitExceeded = "api_key_limit_exceeded"
+
 	// Per-app private-registry Basic Auth (issue #461 / ADR-062).
 	// Distinct from CodeSecret* because the lifecycle and quota shape
 	// differ: a registry credential is keyed by (app, host) and the
@@ -319,6 +338,22 @@ const (
 	// can render actionable retry guidance ("raise your plan or lower
 	// --max-concurrency").
 	CodeInvalidMinInstances = "invalid_min_instances"
+
+	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
+	// codes for the sidecar surface. The cap and type-uniqueness
+	// codes are the load-bearing 400-class shapes; the stateful
+	// and not-on-plan codes are defence-in-depth for future
+	// per-plan tier-ups (PR-A does NOT apply the plan gate; the
+	// code is reserved so a follow-up PR doesn't have to invent
+	// a new one).
+	CodeSidecarCapExceeded      = "sidecar_cap_exceeded"
+	CodeSidecarInvalidType      = "sidecar_invalid_type"
+	CodeSidecarInvalidImage     = "sidecar_invalid_image"
+	CodeSidecarStatefulDenied   = "sidecar_stateful_denied"
+	CodeSidecarInvalidName      = "sidecar_invalid_name"
+	CodeSidecarInvalidPort      = "sidecar_invalid_port"
+	CodeSidecarInvalidRamMB     = "sidecar_invalid_ram_mb"
+	CodeSidecarNotAllowedOnPlan = "sidecar_not_allowed_on_plan"
 
 	// Move 1 event-shaped surfaces (spec §4.4, §4.9). The CLI exit-code
 	// table treats them as 403/422/402; surfacing the codes separately
@@ -357,6 +392,26 @@ const (
 	// "streaming is a paid feature" vs "allowlist is a paid feature"
 	// without conflating them in telemetry.
 	CodePlanStreamingNotAllowed = "plan_streaming_not_allowed"
+
+	// Issue #470 / ADR-055: per-app two-tier-snapshot flag (warm.snap
+	// on top of init.snap). Pro/Scale opt in by default; Free/Hobby
+	// reject PATCH-true with 403 plan_warm_snapshot_not_allowed so
+	// customers see the gate before the SQL CHECK trips on the
+	// INSERT. Same shape as CodePlanStreamingNotAllowed / egress:
+	// a single plan-locked feature with a distinct code so the
+	// CLI can render "warm-snapshot is a paid feature" alongside
+	// the streaming + allowlist copy without conflating them.
+	CodePlanWarmSnapshotNotAllowed = "plan_warm_snapshot_not_allowed"
+
+	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
+	// values from a PATCH (warm_snapshot_min_requests outside [1,
+	// 100] or warm_snapshot_min_ms outside [100, 60000]). 422 with
+	// these codes so the customer sees a validation error, not a
+	// SQL CHECK violation that the apid layer is supposed to
+	// intercept. Distinct codes per field so the CLI can render
+	// "min_requests out of range" vs "min_ms out of range".
+	CodeInvalidWarmSnapshotMinRequests = "invalid_warm_snapshot_min_requests"
+	CodeInvalidWarmSnapshotMinMs       = "invalid_warm_snapshot_min_ms"
 
 	// Issue #471 PR-B (the meat) — emitted when an active stream
 	// exceeds the per-plan MaxResponseBodyBytes cap (Hobby+: 100 MB;
@@ -676,6 +731,17 @@ func StatusForCode(code string) int {
 		return http.StatusBadRequest
 	case CodeEnvVarValueTooLarge:
 		return http.StatusRequestEntityTooLarge
+	// IAM-5 (issue #189): api-key lifecycle. Both gate errors are
+	// 401 (the bearer key is invalid for the same reason any
+	// unauthenticated call is — the customer's credential is no
+	// longer usable). The quota error is 409 to mirror the alert-rule
+	// quota shape (issue #396) — the operation is well-formed but
+	// caps the platform; the SDK can branch on the code for
+	// actionable retry guidance.
+	case CodeAPIKeyExpired, CodeAPIKeyRevoked:
+		return http.StatusUnauthorized
+	case CodeAPIKeyLimitExceeded:
+		return http.StatusConflict
 	// Trusted cosign signers (issue #472 / ADR-054): mirror the env
 	// status shape. PUT body shape is 400, quota is 403, not-found is
 	// 404 (the URL resource IS the signer name; we deliberately
@@ -1154,6 +1220,47 @@ func ErrPlanLimitEnvVars(l Limits, observed int) *Problem {
 		WithDocs("https://docs.gregale.dev/env#limits")
 }
 
+// ErrAPIKeyExpired is returned by the auth middleware when the
+// bearer key's expires_at is in the past (issue #189 / IAM-5).
+// The store has lazily marked the key revoked before the middleware
+// sees the error; the middleware emits the key.expired audit event.
+// 401 mirrors the legacy "invalid token" surface — the customer's
+// SDK sees an auth failure and re-auths, the dashboard surfaces
+// "key expired, rotate it" copy.
+func ErrAPIKeyExpired() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeAPIKeyExpired,
+		"API key expired",
+		"the bearer key has expired; rotate it and use the new plaintext").
+		WithDocs("https://docs.gregale.dev/auth#expiry")
+}
+
+// ErrAPIKeyRevoked is returned by the auth middleware when the
+// bearer key's status is 'revoked' (issue #189 / IAM-5). The
+// revocation may have been manual (DELETE), atomic rotation
+// (grace_window_days=0), or lazy-expiry (the auth path observed
+// expires_at < now). 401 mirrors the legacy "invalid token" surface.
+func ErrAPIKeyRevoked() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeAPIKeyRevoked,
+		"API key revoked",
+		"the bearer key has been revoked; mint a new one via POST /v1/keys").
+		WithDocs("https://docs.gregale.dev/auth#revocation")
+}
+
+// ErrAPIKeyLimitExceeded is returned when a POST /v1/keys would
+// push the account over Plan.KeysMax (issue #189 / IAM-5). Rotated
+// keys (status='revoked') are excluded from the count so the
+// customer's history can grow without bound; revoking a key is the
+// path to free up a slot. 409 mirrors the alert-rule quota shape
+// (issue #396) — the operation is well-formed, the cap is the gate.
+func ErrAPIKeyLimitExceeded(l Limits, observed int) *Problem {
+	return NewProblem(http.StatusConflict, CodeAPIKeyLimitExceeded,
+		"API key limit reached",
+		fmt.Sprintf("%s plan allows %d API key(s) per account; you have %d active or in grace. Revoke a key before minting a new one.",
+			l.Plan, l.KeysMax, observed)).
+		WithLimit(int64(l.KeysMax), int64(observed)).
+		WithDocs("https://docs.gregale.dev/auth#quotas")
+}
+
 // ErrPlanLimitTrustedSigners is returned when a trusted-signer PUT
 // would exceed the plan's per-app count (issue #472 / ADR-054).
 // Observed is the post-write count. The 403 mirrors ErrPlanLimitEnvVars
@@ -1274,6 +1381,127 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		fmt.Sprintf("min_instances must be in [0, %d] (plan max_concurrency); got %d.", maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
 		WithDocs("https://docs.gregale.dev/apps#min-instances")
+}
+
+// ErrSidecarCapExceeded is returned when the request carries more
+// than SidecarCapMax sidecars (issue #463 / ADR-068 §Decision 1).
+// 400 because the request shape is wrong; the cap is the load-bearing
+// invariant. The schema CHECK on `deployments.sidecars` is the
+// second-line defence; this error surfaces before that check
+// (the API gate fires first).
+func ErrSidecarCapExceeded(seen, cap int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarCapExceeded,
+		"Too many sidecars",
+		fmt.Sprintf("request carried %d sidecars; the cap is %d (issue #463 / ADR-068 §Decision 1).", seen, cap)).
+		WithLimit(int64(cap), int64(seen)).
+		WithDocs("https://docs.gregale.dev/sidecars#cap")
+}
+
+// ErrSidecarInvalidType is returned when a sidecar carries a `type`
+// other than {init, sidecar}, or when the request carries more than
+// one init or more than one sidecar (the per-type-uniqueness rule).
+// 400 because the request shape is wrong.
+func ErrSidecarInvalidType(name, got string) *Problem {
+	if got == "" {
+		return NewProblem(http.StatusBadRequest, CodeSidecarInvalidType,
+			"Invalid sidecar type",
+			fmt.Sprintf("sidecar %q must declare type=init or type=sidecar.", name))
+	}
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidType,
+		"Invalid sidecar type",
+		fmt.Sprintf("sidecar %q type %q; must be init or sidecar.", name, got))
+}
+
+// ErrSidecarInvalidImage is returned when the sidecar image is not
+// digest-pinned (issue #463 / ADR-068 §Decision 5). Tag-pinning is
+// the documented OCI supply-chain attack vector; the runtime
+// already enforces this; the API gate surfaces a useful error at
+// the client side.
+func ErrSidecarInvalidImage(name string, err error) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidImage,
+		"Invalid sidecar image",
+		fmt.Sprintf("sidecar %q image must be digest-pinned (repo@sha256:...): %v", name, err))
+}
+
+// ErrSidecarStatefulDenied is returned when the sidecar image is in
+// the `pkg/imaged` `StatefulBaseImageDenylist` set (Postgres,
+// Redis, MySQL, MongoDB, etc.). 403 because the request shape is
+// valid but the policy denies it. Stateful workloads go on
+// dedicated infra, not FaaS.
+//
+// Deprecated for new callers: prefer ErrSidecarStatefulDeniedWithHint
+// (issue #463 / ADR-068 §Decision 4 followup), which surfaces the
+// remediation hint from pkg/statefuldenylist.Set in the RFC 7807
+// Detail field. Kept for symmetry with the existing pkg/imaged
+// surface that takes (name, image) only.
+func ErrSidecarStatefulDenied(name, image string) *Problem {
+	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
+		"Stateful sidecar image is not allowed",
+		fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)).
+		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+}
+
+// ErrSidecarStatefulDeniedWithHint is the API-gate sidecar variant
+// of ErrSidecarStatefulDenied that surfaces the remediation hint
+// from pkg/statefuldenylist.Set ("use Neon", "use Upstash", …) in
+// the RFC 7807 Detail field. The customer-facing copy is the hint
+// (so the dashboard / CLI can render actionable remediation);
+// name + image are present in the body so audit-log consumers can
+// still attribute the rejection to a specific sidecar.
+//
+// Empty hint is gracefully degraded (the message still names the
+// sidecar + image even when the Set row has no remediation copy —
+// defence against a future Set entry being added without a hint).
+func ErrSidecarStatefulDeniedWithHint(name, image, hint string) *Problem {
+	detail := fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)
+	if hint != "" {
+		detail += " Remediation: " + hint + "."
+	}
+	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
+		"Stateful sidecar image is not allowed", detail).
+		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+}
+
+// ErrSidecarInvalidName is returned when the sidecar name does
+// not match the RFC 1123 label grammar (lowercase alphanumeric +
+// dash, 1..63 chars, starts with [a-z0-9]).
+func ErrSidecarInvalidName(name string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidName,
+		"Invalid sidecar name",
+		fmt.Sprintf("sidecar name %q must match RFC 1123 label (lowercase alphanumeric + dash, 1..63 chars, starts with [a-z0-9]).", name))
+}
+
+// ErrSidecarInvalidPort is returned when the sidecar port is out
+// of range. Port 0 means "absent" (the OCI image's default port
+// is used by the runtime).
+func ErrSidecarInvalidPort(port int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidPort,
+		"Invalid sidecar port",
+		fmt.Sprintf("sidecar port %d must be 0 (absent) or in [1, 65535].", port))
+}
+
+// ErrSidecarInvalidRamMB is returned when the sidecar ram_mb is
+// out of range. 0 means "absent / inherit the plan RAM". The
+// 32..512 range is the platform floor/ceiling (the guest-init +
+// watchdog overhead is the binding floor at 32 MB; 512 MB is the
+// soft per-sidecar ceiling).
+func ErrSidecarInvalidRamMB(ramMB int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidRamMB,
+		"Invalid sidecar ram_mb",
+		fmt.Sprintf("sidecar ram_mb %d must be 0 (inherit plan RAM) or in [32, 512].", ramMB))
+}
+
+// ErrSidecarNotAllowedOnPlan is reserved for a future per-plan
+// gate (PR-A does NOT apply this gate — the global SidecarCapMax
+// is the load-bearing surface; see ADR-068 §Decision 1). The
+// constructor exists so a follow-up PR doesn't have to invent
+// a new code. 403 because it's a plan-tier decision, not a
+// shape violation.
+func ErrSidecarNotAllowedOnPlan(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodeSidecarNotAllowedOnPlan,
+		"Plan doesn't allow sidecars",
+		fmt.Sprintf("the %s plan doesn't allow sidecars (issue #463 / ADR-068).", p)).
+		WithDocs("https://docs.gregale.dev/plans#sidecars")
 }
 
 // ErrPlanMaxInstancesNotAllowed (issue #462 / ADR-058) is the

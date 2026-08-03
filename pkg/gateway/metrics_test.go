@@ -558,6 +558,25 @@ func TestMetricsWakeLocalityPreinstantiated(t *testing.T) {
 	}
 }
 
+// TestMetricsWakeSnapshotTierPreinstantiated (issue #470 / PR #470-FU-B)
+// pins the closed (tier) set on the per-wake snapshot-tier counter at
+// zero from the moment the daemon binds, so the warm-tier dashboard
+// panel surfaces from boot. Catches a future change that drops the
+// pre-instantiation loop or renames a tier value.
+func TestMetricsWakeSnapshotTierPreinstantiated(t *testing.T) {
+	m := NewMetrics()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	for _, tier := range []string{"warm", "init", "cold"} {
+		want := fmt.Sprintf(`gateway_wake_snapshot_tier_total{tier=%q} 0`, tier)
+		if !strings.Contains(body, want) {
+			t.Errorf("pre-instantiated %s missing from /metrics body:\n%s", want, body)
+		}
+	}
+}
+
 // TestMetricsWakeLocalityObserved asserts the counter increments per
 // outcome and that an unknown outcome is passed through (Prometheus
 // default behaviour — the closed set is closed by the pre-instantiation
@@ -589,6 +608,64 @@ func TestMetricsWakeLocalityObserved(t *testing.T) {
 func TestObserveWakeLocalityNilSafe(t *testing.T) {
 	var m *Metrics
 	m.ObserveWakeLocality("local_snapshot") // must not panic
+}
+
+// TestMetricsWakeSnapshotTierObserved (issue #470 / PR #470-FU-B)
+// asserts the per-wake snapshot-tier counter increments per
+// tier and that the empty-string fallthrough lands on "init"
+// (the engine's default tier on the pre-#470 legacy path).
+func TestMetricsWakeSnapshotTierObserved(t *testing.T) {
+	m := NewMetrics()
+	m.ObserveWakeSnapshotTier("warm")
+	m.ObserveWakeSnapshotTier("warm")
+	m.ObserveWakeSnapshotTier("warm")
+	m.ObserveWakeSnapshotTier("init")
+	m.ObserveWakeSnapshotTier("cold")
+	m.ObserveWakeSnapshotTier("") // empty → "init" fallback
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	// warm=3, init=1+1=2 (the "" fallback lands on init), cold=1.
+	for _, want := range []string{
+		`gateway_wake_snapshot_tier_total{tier="warm"} 3`,
+		`gateway_wake_snapshot_tier_total{tier="init"} 2`,
+		`gateway_wake_snapshot_tier_total{tier="cold"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing exposition line %q in body:\n%s", want, body)
+		}
+	}
+}
+
+// TestObserveWakeSnapshotTierNilSafe — the wrapper must not panic
+// on a nil receiver (mirrors TestObserveWakeLocalityNilSafe).
+func TestObserveWakeSnapshotTierNilSafe(t *testing.T) {
+	var m *Metrics
+	m.ObserveWakeSnapshotTier("warm") // must not panic
+	m.ObserveWakeSnapshotTier("")     // must not panic with empty
+}
+
+// TestTierFromWakeMethod (issue #470 / PR #470-FU-B) locks the
+// temporary bridge that maps the existing 2-value WakeMethod
+// to the closest 3-value tier label. PR #470-FU-A replaces the
+// call site with the engine's actual tier field; this test
+// guards the bridge so the transition seam is observable.
+func TestTierFromWakeMethod(t *testing.T) {
+	cases := []struct {
+		method WakeMethod
+		want   string
+	}{
+		{WakeMethodSnapshotRestore, "init"},
+		{WakeMethodColdBoot, "cold"},
+		{WakeMethodUnspecified, "init"},
+	}
+	for _, c := range cases {
+		if got := tierFromWakeMethod(c.method); got != c.want {
+			t.Errorf("tierFromWakeMethod(%v) = %q, want %q", c.method, got, c.want)
+		}
+	}
 }
 
 // TestComputeNodeChangedSubscriberAliveRegisters — PR scale-out

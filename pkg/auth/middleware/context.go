@@ -19,11 +19,17 @@ import (
 
 // principal is the authenticated caller. Key is nil when the caller
 // authenticated via the dashboard session cookie (in which case
-// RequireScope treats the caller as implicitly admin). Mirrors
+// RequireScope treats the caller as implicitly admin). Membership is
+// the caller's resolved OrgMembership against the active org for the
+// current request, stamped by pkg/authz.LoadOrgWithResolver (issue
+// #190 / IAM-6 / ADR-061, PR 4). Membership is nil for requests that
+// did not pass through LoadOrg (the common case for every pre-PR-5
+// route) or that came in without an X-Active-Org / ?org= hint. Mirrors
 // cmd/apid/server.go:1239.
 type principal struct {
-	Acct state.Account
-	Key  *state.APIKey
+	Acct       state.Account
+	Key        *state.APIKey
+	Membership *state.OrgMembership
 }
 
 type ctxKey int
@@ -61,12 +67,37 @@ func withPrincipal(ctx context.Context, p principal) context.Context {
 // the raw authenticated shape. Callers that need the
 // "session = admin" truth must compose with RequireScope or
 // duplicate its rule.
+//
+// Membership is intentionally NOT surfaced here — see PrincipalFrom
+// for the org-aware accessor. AccountFromContext stays stable for
+// the 38 existing accountHandler bodies (ADR-046 seam).
 func AccountFromContext(r *http.Request) (state.Account, *state.APIKey, bool) {
 	p, ok := principalFrom(r)
 	if !ok {
 		return state.Account{}, nil, false
 	}
 	return p.Acct, p.Key, true
+}
+
+// PrincipalFrom returns the full authenticated shape — Account,
+// APIKey, and the active-org Membership — stashed by RequireSession
+// + pkg/authz.LoadOrgWithResolver (issue #190 / IAM-6 / ADR-061).
+//
+// Membership is nil when the request did not pass through LoadOrg
+// (the pre-PR-5 default) or when the caller did not supply an
+// X-Active-Org / ?org= hint. Authoritative for the 9 org actions
+// defined in pkg/authz — call AuthorizeOrgAction(r, action) instead
+// of branching on the membership role directly.
+//
+// Returns ok=false if the request never went through RequireSession
+// (the middleware wasn't wired) — same fail-closed contract as
+// AccountFromContext.
+func PrincipalFrom(r *http.Request) (state.Account, *state.APIKey, *state.OrgMembership, bool) {
+	p, ok := principalFrom(r)
+	if !ok {
+		return state.Account{}, nil, nil, false
+	}
+	return p.Acct, p.Key, p.Membership, true
 }
 
 // WithPrincipal stamps a principal onto ctx. Exported so tests
@@ -79,8 +110,13 @@ func AccountFromContext(r *http.Request) (state.Account, *state.APIKey, bool) {
 // pre-minted identities) and is the only correct way to bypass
 // the bearer/session dance without breaking RequireScope's
 // fail-closed contract.
-func WithPrincipal(ctx context.Context, acct state.Account, key *state.APIKey) context.Context {
-	return withPrincipal(ctx, principal{Acct: acct, Key: key})
+//
+// The membership parameter is the active-org membership resolved
+// by pkg/authz.LoadOrgWithResolver (issue #190 / IAM-6 / ADR-061).
+// Callers that don't compose LoadOrg pass nil; pre-PR-5 routes stay
+// account-scoped.
+func WithPrincipal(ctx context.Context, acct state.Account, key *state.APIKey, mem *state.OrgMembership) context.Context {
+	return withPrincipal(ctx, principal{Acct: acct, Key: key, Membership: mem})
 }
 
 // --- session-cookie plumbing --------------------------------------------

@@ -38,6 +38,7 @@ import (
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	evts "github.com/onebox-faas/faas/pkg/events"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -106,15 +107,57 @@ func stripHopByHop(h http.Header) http.Header {
 //
 // PR-D / ADR-047: the legacy unary ForwardHTTP RPC was removed. The
 // streaming RPC is the only bridge today — see fwdStreamOnce below.
+//
+// Deprecated: PR-C (issue #517 / ADR-064) added the events-aware
+// sibling; the legacy 3-arg signature exists only to keep the
+// pre-PR-C caller surface compiling. Gateway production wiring
+// has moved to ForwardingReverseProxyWithEvents. A future cleanup
+// PR will drop this wrapper.
 func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
+	return ForwardingReverseProxyWithEvents(nodes, log, nil)
+}
+
+// ForwardingReverseProxyWithEvents (issue #517 / PR-C / ADR-064) is
+// the events-aware variant of ForwardingReverseProxy. The Platform
+// emits wake.proxy_first_byte on the first downstream byte (the
+// Response Init frame's WriteHeader). nil events opts out (legacy
+// callers and the test corpus).
+func ForwardingReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform) func(t Target) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return func(t Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			fwdOnce(w, r, nodes, log, t)
+			// Stamp the proxy start so the wake.proxy_first_byte
+			// emit can compute latency_ms = first_byte - start.
+			// The metric is the customer-facing "how long until
+			// the upstream answered"; pre-PR-C the gateway had
+			// no introspection here.
+			ctx := contextWithProxyStart(r.Context(), time.Now())
+			fwdOnceWithEvents(w, r.WithContext(ctx), nodes, log, t, events)
 		})
 	}
+}
+
+// proxyStartKey is the unexported context key for the proxy start
+// timestamp. Used by wake.proxy_first_byte to compute latency_ms
+// without re-deriving it from the Accept timestamp (PR-A).
+type proxyStartKey struct{}
+
+// contextWithProxyStart returns a copy of ctx with the proxy start
+// timestamp stored under proxyStartKey.
+func contextWithProxyStart(ctx context.Context, t time.Time) context.Context {
+	return context.WithValue(ctx, proxyStartKey{}, t)
+}
+
+// proxyStartFromContext returns the proxy start timestamp stored
+// on ctx, or a zero time if the stamp is missing (the legacy
+// fwdOnce path, which doesn't thread the events seam).
+func proxyStartFromContext(ctx context.Context) time.Time {
+	if v, ok := ctx.Value(proxyStartKey{}).(time.Time); ok {
+		return v
+	}
+	return time.Time{}
 }
 
 // fwdOnce runs a single forward. Extracted so the test harness can
@@ -123,12 +166,29 @@ func ForwardingReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Tar
 // that panics on a malformed request, we still observe the request
 // via slog instead of crashing the listener.
 //
+// Deprecated: PR-C (issue #517 / ADR-064) added the events-aware
+// sibling; this 5-arg signature exists only to keep the pre-PR-C
+// test corpus compiling. New code should call fwdOnceWithEvents
+// directly. A future cleanup PR will drop this wrapper.
+//
 // PR-D / ADR-047: this is now a thin wrapper that delegates to
 // fwdStreamOnce (the bidi ForwardHTTPStream RPC is the only bridge
 // today). The buffered unary path was removed; the streaming path
 // handles small/short responses correctly because the bridge pipes
 // bytes through Go's bufio and never enforces a latency floor.
+//
+//nolint:unused // removed-from-API 5-arg wrapper; kept for the pre-PR-C test corpus. Future cleanup PR drops it.
 func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, t Target) {
+	fwdOnceWithEvents(w, r, nodes, log, t, nil)
+}
+
+// fwdOnceWithEvents (issue #517 / PR-C / ADR-064) is the
+// events-aware variant of fwdOnce. The events seam threads
+// through to fwdStreamOnce so wake.proxy_first_byte can be
+// emitted on the first downstream byte (the Response Init
+// frame's WriteHeader). nil opts out (pre-PR-C fixtures + the
+// legacy fwdOnce entry).
+func fwdOnceWithEvents(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log *slog.Logger, t Target, events *evts.Platform) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Error("gateway: forwarder panic",
@@ -161,7 +221,7 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 	// signal for the vmmd-side cap-lift; the gateway forwarder
 	// strips it before bridging (see the x-faas-* skip below) so
 	// the guest never observes the internal signal.
-	fwdStreamOnce(w, r, cli, log, t)
+	fwdStreamOnceWithEvents(w, r, cli, log, t, events)
 }
 
 // fwdStreamOnce is the streaming counterpart of fwdOnce (issue
@@ -183,7 +243,23 @@ func fwdOnce(w http.ResponseWriter, r *http.Request, nodes NodeClientLookup, log
 // 503, anything else → 502). The Handler's statusRecorder
 // translates 4xx/5xx into "no body bytes to meter" so the
 // e2e quota AC stays correct under error paths.
+//
+// Deprecated: PR-C (issue #517 / ADR-064) added the events-aware
+// sibling; this 5-arg signature exists only to keep the pre-PR-C
+// test corpus compiling. New code should call
+// fwdStreamOnceWithEvents directly. A future cleanup PR will drop
+// this wrapper.
+//
+//nolint:unused // deprecated 5-arg wrapper; kept for the pre-PR-C test corpus. Future cleanup PR drops it.
 func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target) {
+	fwdStreamOnceWithEvents(w, r, cli, log, t, nil)
+}
+
+// fwdStreamOnceWithEvents (issue #517 / PR-C / ADR-064) is the
+// events-aware variant of fwdStreamOnce. wake.proxy_first_byte is
+// emitted on the first downstream byte (the Response Init
+// frame's WriteHeader). nil events opts out (pre-PR-C fixtures).
+func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform) {
 	ctx, cancel := context.WithTimeout(r.Context(), 910*time.Second)
 	defer cancel()
 
@@ -305,6 +381,34 @@ func fwdStreamOnce(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient
 			}
 			w.WriteHeader(int(init.GetStatus()))
 			wroteHeader = true
+			// issue #517 / PR-C / ADR-064 — emit
+			// wake.proxy_first_byte on the first downstream
+			// byte. The wake_id is the per-wake correlation
+			// handle minted by the engine (Target.WakeID — the
+			// gateway-fanout cache sets it from the
+			// AdmitInstanceResponse on the wake). requestID
+			// is the inbound x-faas-request-id minted by the
+			// gateway edge. latency_ms is the gap from the
+			// proxy start (stamped on the request context by
+			// the closure) to the first byte. nil opts out
+			// (pre-PR-C fixtures).
+			//
+			// `evs` aliases the parameter so the package
+			// name `evts.ProxyFirstByte` is still reachable
+			// inside the if-block (the local parameter
+			// otherwise shadows the package).
+			if evs := events; evs != nil {
+				started := proxyStartFromContext(r.Context())
+				evs.Emit(r.Context(), evts.ProxyFirstByte{
+					EmitAt:     time.Now().UTC(),
+					WakeID:     t.WakeID,
+					AppID:      r.Header.Get("x-faas-app"),
+					RequestID:  r.Header.Get("x-faas-request-id"),
+					InstanceID: t.InstanceID,
+					NodeID:     t.NodeID,
+					LatencyMs:  time.Since(started).Milliseconds(),
+				})
+			}
 			continue
 		}
 		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {

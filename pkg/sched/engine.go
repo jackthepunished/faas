@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -150,6 +151,16 @@ type Engine struct {
 	// same `audit.New(store, log, ops, "schedd")` instance Loop uses.
 	audit *audit.Auditor
 
+	// events is the wake-timeline fan-out (issue #517 / PR-C,
+	// ADR-064). Sibling of audit — pkg/events.Platform drives the
+	// canonical wake.* event vocabulary (queue_accepted, admitted,
+	// boot_started, boot_completed, boot_failed, park_started,
+	// park_completed, stalled) from the schedd wake path. nil opts
+	// out (no row written); production cmd/schedd wires the same
+	// `events.NewPlatform("schedd", store, log, ops, broadcaster)`
+	// instance cmd/main.go uses.
+	events *events.Platform
+
 	// ownerNodeID is the durable Phase 2 / Gate A shard key this
 	// schedd serves. Empty = legacy single-box posture (the
 	// chooser is free to pick any active node). Non-empty =
@@ -189,6 +200,26 @@ type Engine struct {
 	// stuck-three-phase handoff surfaces as
 	// outcome="lease_expired" rather than a hung goroutine.
 	migrateLiveLeaseSeconds int
+
+	// migratingWatchdogTickLimit (Tier A6 / ADR-067) caps the
+	// per-tick migration-reconcile batch so a flood of stuck
+	// state='migrating' rows from a single dead-owner event
+	// does not monopolise the schedd's reconciliation loop.
+	// Defaults to api.MigratingWatchdogTickLimit = 50; overridable
+	// via FAAS_MIGRATING_WATCHDOG_TICK_LIMIT -> WithMigratingWatchdogTickLimit.
+	// The cap is bounded so a runaway flip-loop never spikes
+	// the loop into a 100% CPU loop on its own.
+	migratingWatchdogTickLimit int
+	// migratingWatchdogIntervalSeconds (Tier A6 / ADR-067) is
+	// the per-tick cadence on which the migration-reconcile loop
+	// runs. Default api.MigratingWatchdogIntervalSeconds = 1s,
+	// overridable via FAAS_MIGRATING_WATCHDOG_INTERVAL_SECONDS ->
+	// WithMigratingWatchdogIntervalSeconds. Each tick reconciles
+	// up to migratingWatchdogTickLimit rows; an owner that died
+	// mid-handoff surfaces as state='migrating' rows here that
+	// are then either re-invited (active owner) or hard-deleted
+	// (dead owner) within the next tick.
+	migratingWatchdogIntervalSeconds int
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
@@ -380,6 +411,23 @@ func (e *Engine) WithAudit(a *audit.Auditor) *Engine {
 	return e
 }
 
+// WithEvents stamps the wake-timeline fan-out (issue #517 / PR-C,
+// ADR-064) on the engine. Sibling of WithAudit — pkg/events.
+// Platform drives the canonical wake.* event vocabulary
+// (queue_accepted, admitted, boot_started, boot_completed,
+// boot_failed, park_started, park_completed, stalled) from the
+// schedd wake path. nil opts out (no row written) so pre-PR-C
+// fixtures keep their existing behaviour. Production cmd/schedd
+// wires the same `events.NewPlatform("schedd", store, log, ops,
+// broadcaster)` instance cmd/main.go uses.
+func (e *Engine) WithEvents(p *events.Platform) *Engine {
+	if e == nil {
+		return e
+	}
+	e.events = p
+	return e
+}
+
 // WithOwnerNodeID stamps the Phase 2 / Gate A owner shard key
 // on the engine. cmd/schedd wires the same id it passes to
 // scheddgrpc.WithOwner; choosePlacementLocked pins
@@ -433,6 +481,31 @@ func (e *Engine) WithMigrateLiveLeaseSeconds(seconds int) *Engine {
 		panic(fmt.Sprintf("sched: WithMigrateLiveLeaseSeconds: seconds must be > 0, got %d", seconds))
 	}
 	e.migrateLiveLeaseSeconds = seconds
+	return e
+}
+
+// WithMigratingWatchdogTickLimit (Tier A6 / ADR-067) sets the
+// per-tick cap on the migration-reconcile loop. Same
+// "panic on bad env" contract as WithMigrateLiveLeaseSeconds: a
+// typo in FAAS_MIGRATING_WATCHDOG_TICK_LIMIT must not silently
+// fall back to the api.* default.
+func (e *Engine) WithMigratingWatchdogTickLimit(n int) *Engine {
+	if n <= 0 {
+		panic(fmt.Sprintf("sched: WithMigratingWatchdogTickLimit: n must be > 0, got %d", n))
+	}
+	e.migratingWatchdogTickLimit = n
+	return e
+}
+
+// WithMigratingWatchdogIntervalSeconds (Tier A6 / ADR-067) sets
+// the per-tick cadence on which the migration-reconcile loop
+// runs. Same "panic on bad env" contract as the other With*
+// setters.
+func (e *Engine) WithMigratingWatchdogIntervalSeconds(seconds int) *Engine {
+	if seconds <= 0 {
+		panic(fmt.Sprintf("sched: WithMigratingWatchdogIntervalSeconds: seconds must be > 0, got %d", seconds))
+	}
+	e.migratingWatchdogIntervalSeconds = seconds
 	return e
 }
 
@@ -926,6 +999,48 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		e.log.Warn("sched: stamp apps.last_scale_out_at failed", "app", appID, "err", err)
 	}
 
+	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
+	// the Phase 2 admission gate boundary, BEFORE the structured
+	// admit timestamp. The customer-facing timeline order is
+	// queue_accepted → admitted → boot_started → boot_completed
+	// (a wake is "queued" when it passes the lock-window
+	// admission, "admitted" when the ledger reservation is
+	// confirmed). emit is best-effort and never rolls back the
+	// admit. nil opts out (pre-PR-C fixtures).
+	var requestID string
+	if e.events != nil {
+		if fields, ok := wire.FromContext(ctx); ok {
+			requestID = fields.RequestID
+		}
+	}
+	if e.events != nil {
+		e.events.Emit(ctx, events.QueueAccepted{
+			EmitAt:    time.Now().UTC(),
+			WakeID:    wakeID,
+			AppID:     appID,
+			RequestID: requestID,
+		})
+	}
+
+	// issue #517 / PR-C / ADR-064 — emit wake.admitted on the
+	// successful ledger admit. Pairs with wake.queue_accepted and
+	// wake.boot_started under the same wake_id so the customer
+	// timeline surfaces "queue → admit → boot" as three distinct
+	// timestamps. emit is best-effort: a failure is Warn + counter
+	// and never rolls back the admit. Subject is the account so a
+	// GDPR export can isolate per-account wake timelines.
+	if e.events != nil {
+		now := time.Now().UTC()
+		e.events.Emit(ctx, events.Admitted{
+			EmitAt:    now,
+			WakeID:    wakeID,
+			AppID:     appID,
+			RequestID: requestID,
+			AccountID: acct.ID,
+			Plan:      string(acct.Plan),
+		})
+	}
+
 	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, envSecretsFromDep(dep))
 	if err != nil {
 		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
@@ -967,10 +1082,25 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// Mirror of `Port` above: empty OverrideHealthcheck
 		// (legacy / no-override) → empty path → legacy probe.
 		HealthcheckPath: healthcheckPathFromDep(dep),
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22"). Threaded onto the vmmd AppSpec so
+		// the framework_ready DGRAM receipt path can label
+		// vmmd_guest_framework_warmup_seconds by runner. See
+		// buildAppSpec (engine.go:1757) for the same field
+		// wired on the (re)build path. Empty falls back to
+		// "unknown" in the histogram observer.
+		Runtime: app.Runtime,
 	}
 
 	// Capture the boot inputs we need across the unlocked window. These
 	// are values (not references) — they remain valid after release.
+	// startedAt stamps the wake's accept moment (issue #517 / PR-C /
+	// ADR-064) so the boot_started emit + boot_completed emit pair
+	// can compute the boot span under the same wake_id. Hoisted
+	// here so the timestamp is the same one the boot_started row
+	// uses (RequestedAt), and the watchdog's "started_at" anchor
+	// stays consistent.
+	startedAt := time.Now().UTC()
 	bootInput := bootInput{
 		insID:     ins.ID,
 		appID:     appID,
@@ -995,8 +1125,22 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// path, and the Phase 4 commit's WakeResult all surface the
 		// same value. The row already carries wake_id (CreateInstance
 		// stamped it); this is the value the caller observes.
-		wakeID: wakeID,
+		wakeID:    wakeID,
+		startedAt: startedAt,
 	}
+	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
+	// the boundary between Phase 2 (admit + ledger) and Phase 3
+	// (unlocked vmmd RPC). The customer-facing timeline endpoint
+	// joins this row to the wake.boot_started / boot_completed /
+	// readiness_200 / proxy_first_byte rows that downstream
+	// emit sites will write under the same wake_id. nil events
+	// opts out (pre-PR-C fixtures) — guarded so the test
+	// corpus doesn't need to wire a Platform.
+	//
+	// NOTE: queue_accepted is now emitted at the admission gate
+	// (above) so the customer-facing timeline reads as
+	// queue_accepted → admitted → boot_started. The earlier
+	// Phase 2→3 boundary emit was redundant.
 	release()
 
 	// ADR-038 / Tier 3 phase 3: cold-boot layer attestation. The
@@ -1055,6 +1199,28 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		InstanceID:   bootInput.insID,
 		WakeID:       wakeID,
 	})
+	// issue #517 / PR-C / ADR-064 — emit wake.boot_started at the
+	// entry to Phase 3 (the unlocked vmmd RPC). The customer-facing
+	// timeline endpoint joins this row to wake.boot_completed /
+	// wake.boot_failed / wake.readiness_200 (vmmd-side emit) under
+	// the same wake_id. method is "restore" or "cold_boot" so the
+	// dashboard can split p50/p95 by wake method without joining
+	// the legacy state_transition rows.
+	method := "cold_boot"
+	if bootInput.haveSnap {
+		method = "restore"
+	}
+	if e.events != nil {
+		e.events.Emit(bootCtx, events.BootStarted{
+			EmitAt:      time.Now().UTC(),
+			WakeID:      bootInput.wakeID,
+			AppID:       bootInput.appID,
+			InstanceID:  bootInput.insID,
+			NodeID:      bootInput.nodeID,
+			Method:      method,
+			RequestedAt: bootInput.startedAt, // best-effort stamp
+		})
+	}
 	if bootInput.haveSnap && bootInput.snapKey != "" {
 		// #96 / ADR-025 axis 2: read the storage key the snap row
 		// carries (imaged stamps it from the snapshot_written
@@ -1107,6 +1273,23 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// `kind='wake_boot_error'` finds both this and the
 		// SetInstanceRuntime-failure case below.
 		e.ledger.Release(bootInput.insID)
+		// issue #517 / PR-C / ADR-064 — emit wake.boot_failed with
+		// the structured reason. The customer-facing timeline pairs
+		// this with wake.boot_started under the same wake_id so the
+		// "wake took N ms before failing" latency is computable
+		// without joining the legacy state_transition rows.
+		if e.events != nil {
+			e.events.Emit(ctx, events.BootFailed{
+				EmitAt:     time.Now().UTC(),
+				WakeID:     bootInput.wakeID,
+				AppID:      bootInput.appID,
+				InstanceID: bootInput.insID,
+				NodeID:     bootInput.nodeID,
+				Method:     method,
+				Reason:     "vmm_boot_failed",
+				FailedAt:   time.Now().UTC(),
+			})
+		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "vmm_boot_failed")
 		return WakeResult{}, err
 	}
@@ -1156,6 +1339,21 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		// Firecracker can't pin the Wake goroutine forever.
 		e.bestEffortDestroy(ctx, bootInput.nodeID, bootInput.insID)
 		e.ledger.Release(bootInput.insID)
+		// issue #517 / PR-C / ADR-064 — emit wake.boot_failed with
+		// the structured reason. Pairs with wake.boot_started under
+		// the same wake_id (the prior emit at the Phase 3 entry).
+		if e.events != nil {
+			e.events.Emit(ctx, events.BootFailed{
+				EmitAt:     time.Now().UTC(),
+				WakeID:     bootInput.wakeID,
+				AppID:      bootInput.appID,
+				InstanceID: bootInput.insID,
+				NodeID:     bootInput.nodeID,
+				Method:     method,
+				Reason:     "record_runtime_failed",
+				FailedAt:   time.Now().UTC(),
+			})
+		}
 		e.transitionWithKind(ctx, bootInput.insID, bootInput.appID, state.StateFailed, "wake_boot_error", "record_runtime_failed")
 		return WakeResult{}, fmt.Errorf("sched: wake: record runtime: %w", err)
 	}
@@ -1198,6 +1396,35 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 
 	e.transition(ctx, bootInput.insID, bootInput.appID, state.StateRunning)
 
+	// issue #517 / PR-C / ADR-064 — emit wake.boot_completed. The
+	// three sibling emits (wake.boot_started, wake.boot_completed,
+	// wake.readiness_200 from vmmd) give the customer-facing
+	// timeline endpoint span latencies per wake method under the
+	// same wake_id. The actual method reported here is
+	// vmmd's authoritative observation (`out.Method`), which may
+	// differ from the planned `method` above when restore fell
+	// back to cold boot (the F-1 stale-snapshot path).
+	completedMethod := method
+	switch out.Method {
+	case vmmdpb.WakeMethod_WAKE_COLD_BOOT:
+		completedMethod = "cold_boot"
+	case vmmdpb.WakeMethod_WAKE_RESTORE:
+		completedMethod = "restore"
+	}
+	if e.events != nil {
+		now := time.Now().UTC()
+		e.events.Emit(ctx, events.BootCompleted{
+			EmitAt:      now,
+			WakeID:      bootInput.wakeID,
+			AppID:       bootInput.appID,
+			InstanceID:  bootInput.insID,
+			NodeID:      bootInput.nodeID,
+			Method:      completedMethod,
+			StartedAt:   bootInput.startedAt,
+			CompletedAt: now,
+		})
+	}
+
 	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port}, nil
 }
 
@@ -1233,6 +1460,14 @@ type bootInput struct {
 	// can carry many wake_ids over its lifetime as the app parks and
 	// wakes again.
 	wakeID string
+	// startedAt is the wake's accept instant (issue #517 / PR-C /
+	// ADR-064). Captured at bootInput construction so the
+	// boot_started.RequestedAt + boot_completed.StartedAt pair
+	// share a stamp; consumed by the wake.boot_completed emit
+	// after the vmmd RPC returns. Best-effort — the watchdog's
+	// §6.1 anchor uses instances.started_at separately, so this
+	// drift is bounded by 1 row read.
+	startedAt time.Time
 }
 
 // timedDestroy issues a vmm.Destroy bounded by `timeout` and the
@@ -1778,6 +2013,14 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 		// Issue #460 / ADR-053, ADR-057 (PR-D): per-deployment
 		// override readiness probe path. "" = legacy TCP-accept.
 		HealthcheckPath: healthcheckPathFromDep(dep),
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22", "python312"). The sched sources it
+		// from the apps row at Wake time and threads it onto
+		// the vmmd AppSpec so the framework_ready DGRAM receipt
+		// path can label
+		// vmmd_guest_framework_warmup_seconds by runner. Empty
+		// falls back to "unknown" in the histogram observer.
+		Runtime: app.Runtime,
 	}, nil
 }
 
@@ -1871,6 +2114,144 @@ func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (i
 		"attempted", attempted, "migrated", migrated,
 		"to_node", e.ownerNodeID)
 	return attempted, nil
+}
+
+// ReconcileExpiredMigrations (Tier A6 / ADR-067 migrating-
+// instance watchdog) is the per-tick work function that self-
+// heals stuck state='migrating' rows that never committed (the
+// new owner vmmd died mid-handoff, the network partition
+// dropped the gRPC, the operator killed the new owner before
+// the Phase-3 commit). The watchdog is the ONLY writer that
+// can move a row out of 'migrating' without a peer commit —
+// every Phase-4 path (CancelInstanceMigration) requires a
+// peer, and the peer is the very thing that's gone.
+//
+// Per-instance decision (driven by compute_nodes.active for
+// the row's current node_id, which is the OLD/dying vmmd —
+// Phase 2 MarkInstanceMigrating did not flip node_id, only
+// Phase 3 MigrateInstanceOwner does):
+//
+//  1. Active owner (compute_nodes.active = true): the row is
+//     wedged but the dying vmmd is still up. Issue a
+//     Store.ReinviteMigratingInstance conditional UPDATE that
+//     flips state='migrating' → 'running', stamps migrated_at,
+//     and clears lease_token. node_id stays on the OLD owner.
+//     Bumps outcome="reinvited".
+//  2. Dead owner (compute_nodes.active = false): the dying
+//     vmmd is gone. Issue a Store.AbortMigratingInstance
+//     conditional UPDATE that flips state='migrating' →
+//     'parked' and clears lease_token. node_id is left on the
+//     dead OLD owner (migrated_from_node_id is NULL pre-Phase-3;
+//     the wake path dispatches via app.NodeID, not instance.
+//     NodeID, so a dead instance.NodeID is harmless). Bumps
+//     outcome="hard_deleted".
+//  3. Conflict (RowsAffected() == 0): the lease expired or a
+//     peer already committed/rolled back. Bumps
+//     outcome="conflict" and drops silently.
+//  4. Error (transient DB / lookup blip): bumps
+//     outcome="error", logs Warn, continues.
+//
+// The conditional UPDATE predicates (state='migrating' AND
+// lease_token=$1) are the load-bearing race-safety guarantee.
+// A peer that committed while the watchdog was thinking fails
+// the predicate and bumps outcome="conflict" (peer-wins); a
+// peer that rolled back also fails the predicate (state is
+// now 'parked' from CancelInstanceMigration).
+//
+// Returns (reconciled int, err error). reconciled is the
+// number of rows that successfully transitioned out of
+// 'migrating' (reinvited + hard_deleted). err is non-nil only
+// on a fatal-but-recoverable issue (the input-set query
+// failed); per-row failures are reported via the metric and
+// the slog so a transient PG blip never stops the tick.
+func (e *Engine) ReconcileExpiredMigrations(ctx context.Context) (int, error) {
+	maxPerTick := api.MigratingWatchdogTickLimit
+	if e.migratingWatchdogTickLimit > 0 {
+		maxPerTick = e.migratingWatchdogTickLimit
+	}
+	rows, err := e.store.ListExpiredMigrations(ctx, maxPerTick)
+	if err != nil {
+		return 0, fmt.Errorf("sched: reconcile expired migrations: list: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if len(rows) > maxPerTick {
+		e.log.Info("sched: reconcile expired migrations: capped",
+			"available", len(rows), "cap", maxPerTick)
+		rows = rows[:maxPerTick]
+	}
+	reconciled := 0
+	for _, ins := range rows {
+		ownerActive, lookupErr := e.computeNodeActive(ctx, ins.NodeID)
+		if lookupErr != nil {
+			if e.ops != nil {
+				e.ops.MigratingReconcileDecisions("error").Inc()
+			}
+			e.log.Warn("sched: reconcile expired migrations: owner lookup failed",
+				"instance_id", ins.ID, "node_id", ins.NodeID, "err", lookupErr)
+			continue
+		}
+		var recErr error
+		if ownerActive {
+			recErr = e.store.ReinviteMigratingInstance(ctx, ins.ID, ins.LeaseToken)
+			if recErr == nil {
+				if e.ops != nil {
+					e.ops.MigratingReconcileDecisions("reinvited").Inc()
+				}
+				e.log.Info("sched: reconcile expired migrations: reinvited",
+					"instance_id", ins.ID, "node_id", ins.NodeID)
+				reconciled++
+				continue
+			}
+		} else {
+			recErr = e.store.AbortMigratingInstance(ctx, ins.ID, ins.LeaseToken)
+			if recErr == nil {
+				if e.ops != nil {
+					e.ops.MigratingReconcileDecisions("hard_deleted").Inc()
+				}
+				e.log.Info("sched: reconcile expired migrations: hard_deleted",
+					"instance_id", ins.ID, "node_id", ins.NodeID)
+				reconciled++
+				continue
+			}
+		}
+		if errors.Is(recErr, state.ErrConflict) {
+			if e.ops != nil {
+				e.ops.MigratingReconcileDecisions("conflict").Inc()
+			}
+			e.log.Debug("sched: reconcile expired migrations: peer conflict",
+				"instance_id", ins.ID, "err", recErr)
+			continue
+		}
+		if e.ops != nil {
+			e.ops.MigratingReconcileDecisions("error").Inc()
+		}
+		e.log.Warn("sched: reconcile expired migrations: instance failed",
+			"instance_id", ins.ID, "err", recErr)
+	}
+	e.log.Info("sched: reconcile expired migrations batch done",
+		"reconciled", reconciled, "attempted", len(rows))
+	return reconciled, nil
+}
+
+// computeNodeActive returns compute_nodes.active for the given
+// nodeID. Returns false on ErrNotFound (the row was never
+// registered, or was deleted) — a missing compute_node is
+// always treated as inactive for the watchdog's purpose. Any
+// other error is propagated.
+func (e *Engine) computeNodeActive(ctx context.Context, nodeID string) (bool, error) {
+	if nodeID == "" {
+		return false, nil
+	}
+	cn, err := e.store.ComputeNodeByID(ctx, nodeID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return cn.Active, nil
 }
 
 // Prime boots a freshly-built deployment once, snapshots it, and parks it —
@@ -1971,6 +2352,14 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		// its declared egress policy rather than awaiting a later
 		// wake.
 		EgressAllowlist: prefixesToCIDRStrings(app.EgressAllowlist),
+		// Issue #470 / PR #470-FU-B: per-deployment runner id
+		// (e.g. "node22"). Threaded onto the vmmd AppSpec so
+		// the framework_ready DGRAM receipt path can label
+		// vmmd_guest_framework_warmup_seconds by runner. See
+		// buildAppSpec (engine.go:1757) for the same field
+		// wired on the (re)build path. Empty falls back to
+		// "unknown" in the histogram observer.
+		Runtime: app.Runtime,
 	}
 	// ADR-038 / Tier 3 phase 3: same verify path as Wake. Prime
 	// is the deploy-pipeline first boot; a tampered layer here
@@ -2293,6 +2682,22 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 		// started_at + 20s, slightly inflating the budget).
 	}
 	e.emitInstanceChanged(ctx, ins.ID, ins.AppID, state.StateSnapshotting, ins.WakeID)
+	// issue #517 / PR-C / ADR-064 — emit wake.park_started at the
+	// RUNNING→SNAPSHOTTING transition. Pairs with wake.park_completed
+	// below under the same wake_id so the timeline endpoint can
+	// surface "park took N ms" without joining the legacy
+	// state_transition rows. The wake_id is the one the just-finished
+	// boot produced (ins.WakeID), per ADR-035 the audit join key.
+	if e.events != nil {
+		e.events.Emit(ctx, events.ParkStarted{
+			EmitAt:     now.UTC(),
+			WakeID:     ins.WakeID,
+			AppID:      ins.AppID,
+			InstanceID: ins.ID,
+			NodeID:     ins.NodeID,
+			StartedAt:  now.UTC(),
+		})
+	}
 
 	b, err := e.vmm.PauseAndSnapshot(ctx, ins.NodeID, ins.ID, vmstate, storageKey, vmstateStorageKey)
 	if err != nil {
@@ -2306,6 +2711,24 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	}
 	e.ledger.Release(ins.ID)
 	e.transition(ctx, ins.ID, ins.AppID, state.StateParked)
+	// issue #517 / PR-C / ADR-064 — emit wake.park_completed on the
+	// successful park. The snapshot_id is the storage key the next
+	// wake will use to restore (per ADR-025 axis 2), so the timeline
+	// row lets an operator trace "this wake restored from the
+	// snapshot produced by that wake" by joining the storage_key
+	// back to the upcoming wake.row's restore_path metadata.
+	if e.events != nil {
+		e.events.Emit(ctx, events.ParkCompleted{
+			EmitAt:      time.Now().UTC(),
+			WakeID:      ins.WakeID,
+			AppID:       ins.AppID,
+			InstanceID:  ins.ID,
+			NodeID:      ins.NodeID,
+			StartedAt:   now.UTC(),
+			CompletedAt: time.Now().UTC(),
+			SnapshotID:  storageKey,
+		})
+	}
 	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstate, b)
 	return nil
 }
@@ -2617,6 +3040,21 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 	// (commit 4) handles the events row's AppendEvent call as part
 	// of the normal transition path; we just supply the kind and
 	// reason so the audit row is searchable on `kind='watchdog_timeout'`.
+	// issue #517 / PR-C / ADR-064 — emit wake.stalled alongside the
+	// legacy watchdog_timeout audit row. The legacy row is preserved
+	// for GDPR-export compatibility (backwards-compat invariant per
+	// the plan); the typed row gives the customer-facing timeline
+	// endpoint a structured payload with the exact reason.
+	if e.events != nil {
+		e.events.Emit(ctx, events.Stalled{
+			EmitAt:     time.Now().UTC(),
+			WakeID:     fresh.WakeID,
+			AppID:      appID,
+			InstanceID: instanceID,
+			NodeID:     fresh.NodeID,
+			Reason:     string(reason),
+		})
+	}
 	e.transitionWithKind(ctx, instanceID, appID, terminal, "watchdog_timeout", string(reason))
 	if e.ops != nil {
 		e.ops.WatchdogKills(string(reason), string(terminal)).Inc()
