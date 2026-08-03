@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00117_pg_ratelimit.sql — Tier A7 edge split (ADR-068 item 7).
+-- 00120_pg_ratelimit.sql — Tier A7 edge split (ADR-070 item 7).
 --
 -- Today's per-process token bucket (pkg/gateway/ratelimit.go) is
 -- correct for one-box (one gatewayd, one bucket per app). After the
@@ -18,7 +18,7 @@
 -- hashtext((scope, subject_id)::record::text)) = 0 … RETURNING
 -- tokens` so two replicas contending on the same row serialise.
 --
--- Bench (ADR-068 bench follow-up): P50 0.8 ms, P99 3.2 ms on EX44.
+-- Bench (ADR-070 bench follow-up): P50 0.8 ms, P99 3.2 ms on EX44.
 --
 -- Schema invariants:
 --   - PRIMARY KEY (scope, subject_id, plan) so the ON CONFLICT
@@ -40,7 +40,7 @@
 --     "no floats near money" invariant from CLAUDE.md applies.
 --
 -- Replay-safe (ADR-041): CREATE TABLE IF NOT EXISTS + ADD CONSTRAINT
--- IF NOT EXISTS via DO-block (same pattern as 00116).
+-- IF NOT EXISTS via DO-block (same pattern as 00119).
 
 CREATE TABLE IF NOT EXISTS pg_ratelimit_counters (
     scope        text             NOT NULL CHECK (scope IN ('app', 'account')),

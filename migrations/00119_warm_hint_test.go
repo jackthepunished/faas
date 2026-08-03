@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply tests for the Tier A7 edge split (ADR-068) —
-// slots 116, 117, 118. Pins:
+// Migration-apply tests for the Tier A7 edge split (ADR-070) —
+// slots 119, 120. Pins:
 //
-//  1. The migration set applies cleanly through 118.
-//  2. 00116 (warm_hint):
+//  1. The migration set applies cleanly through 120.
+//  2. 00119 (warm_hint):
 //     - The table exists and accepts canonical (app_id, node_id,
 //     written_at) inserts.
 //     - The CHECK constraint on written_at allows recent values
@@ -13,7 +13,7 @@
 //     - The index on node_id exists (for the future "list all hot
 //     apps on node X" dashboard query).
 //     - Replay-safe: a second MigrateUp is a no-op.
-//  3. 00117 (pg_ratelimit_counters):
+//  3. 00120 (pg_ratelimit_counters):
 //     - The table exists and accepts canonical (scope, subject_id,
 //     plan, tokens) inserts.
 //     - tokens is bigint (not float — the "no floats near money"
@@ -23,14 +23,17 @@
 //     - The hot-path partial index on (subject_id) WHERE scope='app'
 //     exists.
 //     - Replay-safe: a second MigrateUp is a no-op.
-//  4. 00118 (reserve_slot): the select 1; body applies cleanly.
 //
-// Slot note: 00115 should be the previous slot (the embedded
-// migration set is contiguous 1..N where N is the highest slot
-// in the embedded set). The renumbering history is captured in
-// this PR's ADR-068 §Migration slot renumber. The literal UUID
-// slot values `000116` / `000216` / `000316` / `000416` are the
-// test fixture identifiers downstream code references.
+// Slot note: 00118 (deployments_sidecars on main) is the previous
+// slot — the embedded migration set is contiguous 1..N where N
+// is the highest slot in the embedded set (N = 120 here). The
+// literal UUID slot values `000116` / `000216` / `000316` / `000416`
+// are test fixture identifiers — unrelated to the slot numbers,
+// chosen so the UUIDs stay unique within this PR's fixture set.
+// Renumber history: this PR originally added migrations at 116/117/118
+// but main added sidecars + fences at those slots in the interim, so
+// the real schemas renumbered to 119/120 (ADR-070 §Migration slot
+// renumber).
 package migrations_test
 
 import (
@@ -43,13 +46,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00116_WarmHint pins the warm_hint table shape.
-func TestMigrations_00116_WarmHint(t *testing.T) {
+// TestMigrations_00119_WarmHint pins the warm_hint table shape.
+func TestMigrations_00119_WarmHint(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing slot between 1 and 116)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing slot between 1 and 119)", err)
 	}
 
 	// (1) Confirm the table exists with the canonical columns.
@@ -141,9 +144,9 @@ func TestMigrations_00116_WarmHint(t *testing.T) {
 	}
 }
 
-// TestMigrations_00117_PgRateLimit pins the pg_ratelimit_counters
-// table shape (the central rate-limit counter, ADR-068 item 7).
-func TestMigrations_00117_PgRateLimit(t *testing.T) {
+// TestMigrations_00120_PgRateLimit pins the pg_ratelimit_counters
+// table shape (the central rate-limit counter, ADR-070 item 7).
+func TestMigrations_00120_PgRateLimit(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -254,20 +257,9 @@ func TestMigrations_00117_PgRateLimit(t *testing.T) {
 	}
 }
 
-// TestMigrations_00118_ReserveSlot exercises the fence-body
-// migration (select 1;) — the migration is a no-op but the
-// apply path must still execute it cleanly.
-func TestMigrations_00118_ReserveSlot(t *testing.T) {
-	ctx := context.Background()
-	pool := pgtest.Open(t)
-
-	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v", err)
-	}
-	// The fence body is `select 1;` — no schema change to assert.
-	// The replay-safety pin is the load-bearing one: a second
-	// MigrateUp must succeed.
-	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("replay-safety: second MigrateUp failed: %v", err)
-	}
-}
+// TestMigrations_00119_ReserveSlot removed: no fence at 121 in this PR.
+// The slot between 00120 (pg_ratelimit_counters) and the next main
+// migration is unowned by this branch — the migration set applies
+// contiguously from 00118 (deployments_sidecars, on main) through
+// 00120 (this PR's last migration). A future fence, if needed,
+// would land at the next free slot; not in this PR.
