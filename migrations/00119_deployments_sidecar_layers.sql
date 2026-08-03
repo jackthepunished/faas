@@ -56,22 +56,63 @@ CREATE TABLE IF NOT EXISTS deployment_sidecar_layers (
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
 
-    PRIMARY KEY (deployment_id, sidecar_name),
-    -- 2-row cap mirrors the jsonb CHECK on `deployments.sidecars`.
-    -- Deferred so a multi-row INSERT of two valid sidecars inside
-    -- one transaction never trips the limit at row level.
-    CONSTRAINT deployment_sidecar_layers_cap_chk
-        CHECK (true) DEFERRABLE INITIALLY DEFERRED
+    PRIMARY KEY (deployment_id, sidecar_name)
 );
 
--- Defence-in-depth: a separate COUNT(*) trigger isn't useful here
--- (the PK is the uniqueness we care about), but a per-deployment
--- row-count cap is enforced by a partial unique index trick isn't
--- possible in Postgres without a function-based constraint. The
--- deferred cap lives one level up via the `deployments.sidecars`
--- jsonb CHECK plus a post-INSERT trigger if needed; for PR-B we
--- keep the table itself permit-any-count and let the jsonb
--- constraint upstream catch the abuse.
+-- Per-deployment 2-row cap (issue #463 / ADR-069 / PR-B review
+-- finding #1). The PR-B original used `CHECK (true) DEFERRABLE
+-- INITIALLY DEFERRED` as a placeholder; that constraint is a no-op.
+-- The real enforcement is a BEFORE INSERT OR UPDATE trigger that
+-- counts existing rows for the same deployment_id and RAISE
+-- EXCEPTIONs when the count would exceed 2. Why a trigger and not a
+-- function-based CHECK: Postgres rejects function-based CHECKs that
+-- subquery the same table (circular), so a per-row-count constraint
+-- can only live in a trigger or a denormalised counter table. The
+-- trigger is the standard Postgres pattern, well-understood by the
+-- operator, and runs only on PK-projected rows (the
+-- (deployment_id, sidecar_name) PK gives uniqueness so the trigger
+-- can't double-fire on a re-imaged rebuild).
+--
+-- Why not rely solely on the `deployments.sidecars` jsonb CHECK:
+-- the jsonb CHECK enforces <= 2 entries in the jsonb array; a hand-
+-- INSERT into `deployment_sidecar_layers` could bypass the apid
+-- API gate and store a third row that no jsonb entry references.
+-- The trigger closes that escape hatch.
+--
+-- Why the count threshold is 2: matches SidecarCapMax in
+-- pkg/api/limits.go (issue #463 / ADR-069 §Decision 1). If a
+-- future PR lifts the cap, raise both constants together — the
+-- trigger MUST be re-applied via a fresh migration so the operator
+-- sees the limit change in git history.
+CREATE OR REPLACE FUNCTION deployment_sidecar_layers_cap_check()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    current_count integer;
+BEGIN
+    -- NEW-row predicate on UPDATE; existing-row count on INSERT.
+    -- Same query works for both because NEW carries the row's
+    -- deployment_id whether we're inserting a fresh row or
+    -- rewriting an existing one.
+    SELECT count(*) INTO current_count
+        FROM deployment_sidecar_layers
+        WHERE deployment_id = NEW.deployment_id;
+
+    IF current_count > 2 THEN
+        RAISE EXCEPTION 'deployment_sidecar_layers: deployment % exceeds the 2-row cap (count=%)',
+            NEW.deployment_id, current_count
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER deployment_sidecar_layers_cap_trg
+    BEFORE INSERT OR UPDATE ON deployment_sidecar_layers
+    FOR EACH ROW
+    EXECUTE FUNCTION deployment_sidecar_layers_cap_check();
 
 CREATE INDEX IF NOT EXISTS deployment_sidecar_layers_storage_key_idx
     ON deployment_sidecar_layers (storage_key);
@@ -82,6 +123,8 @@ CREATE INDEX IF NOT EXISTS deployment_sidecar_layers_storage_key_idx
 -- +goose StatementBegin
 
 DROP INDEX IF EXISTS deployment_sidecar_layers_storage_key_idx;
+DROP TRIGGER IF EXISTS deployment_sidecar_layers_cap_trg ON deployment_sidecar_layers;
+DROP FUNCTION IF EXISTS deployment_sidecar_layers_cap_check();
 DROP TABLE IF EXISTS deployment_sidecar_layers;
 
 -- +goose StatementEnd

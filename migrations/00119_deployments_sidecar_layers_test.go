@@ -28,6 +28,7 @@ package migrations_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/db"
@@ -213,5 +214,54 @@ func TestMigrations_00119_DeploymentsSidecarLayers(t *testing.T) {
 	// INDEX IF NOT EXISTS`). PR #377 / ADR-041 contract.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("replay-safety: second MigrateUp failed: %v", err)
+	}
+
+	// (9) PR-B review finding #1 — the per-deployment 2-row cap
+	// is enforced by a BEFORE INSERT OR UPDATE trigger, not a no-op
+	// CHECK (true). Insert two rows against a fresh deployment
+	// (well within the cap), then a third — must fail with
+	// check_violation (SQLSTATE 23514) raised by
+	// deployment_sidecar_layers_cap_check(). The previous PR-B
+	// version of this migration accepted the third row silently;
+	// this test pins the closed behaviour so a future revert to
+	// `CHECK (true)` would surface in CI.
+	if _, err := pool.Exec(ctx, `
+		insert into deployments (id, app_id, image_digest, status, sidecars, created_at)
+		values ('00000000-0000-0000-0000-000000000519',
+		        '00000000-0000-0000-0000-000000000219',
+		        'ghcr.io/foo/bar@sha256:0000000000000000000000000000000000000000000000000000000000000000',
+		        'pending', '[]'::jsonb, now())
+	`); err != nil {
+		t.Fatalf("seed cap-test deployment: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		insert into deployment_sidecar_layers
+		    (deployment_id, sidecar_name, storage_key, bytes, content_digest)
+		values
+		    ('00000000-0000-0000-0000-000000000519',
+		     'cap-sidecar-1',
+		     'apps/cap-1.ext4', 1024,
+		     'sha256:0000000000000000000000000000000000000000000000000000000000000c01'),
+		    ('00000000-0000-0000-0000-000000000519',
+		     'cap-sidecar-2',
+		     'apps/cap-2.ext4', 1024,
+		     'sha256:0000000000000000000000000000000000000000000000000000000000000c02')
+	`); err != nil {
+		t.Fatalf("insert two rows under the cap: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		insert into deployment_sidecar_layers
+		    (deployment_id, sidecar_name, storage_key, bytes, content_digest)
+		values
+		    ('00000000-0000-0000-0000-000000000519',
+		     'cap-sidecar-3',
+		     'apps/cap-3.ext4', 1024,
+		     'sha256:0000000000000000000000000000000000000000000000000000000000000c03')
+	`)
+	if err == nil {
+		t.Errorf("third sidecar row on one deployment: got no error; want trigger cap rejection (SQLSTATE 23514)")
+	} else if !strings.Contains(err.Error(), "exceeds the 2-row cap") &&
+		!strings.Contains(err.Error(), "check_violation") {
+		t.Errorf("third sidecar row: got %v; want trigger rejection citing the 2-row cap", err)
 	}
 }
