@@ -290,10 +290,28 @@ jobs:
           rm -rf /opt/faas/bin/deploy-tmp
 
           # Ensure state/log/runtime directories exist prior to systemd ProtectSystem=strict
-          # (ReadWritePaths targets MUST exist on disk before daemon start)
+          # (ReadWritePaths targets MUST exist on disk before daemon start).
+          #
+          # /run/faas is created as a plain root:root 0755 dir as a bootstrap
+          # fallback — systemd's RuntimeDirectory=faas (vmmd, schedd, gatewayd)
+          # creates /faas as a per-unit tmpfs and bind-mounts it at /run/faas
+          # inside the service's mount namespace, and that bind-mount is
+          # what makes /run/faas/<svc>.sock visible from the host. If this
+          # script chowns /run/faas to faas:faas (the old PR #608 behaviour),
+          # systemd's RuntimeDirectory sees the existing dir with the wrong
+          # ownership and silently skips the bind-mount — every daemon that
+          # dials /run/faas/vmmd.sock then gets `no such file or directory`
+          # even though `ss -lnx` shows the LISTEN entry. The RuntimeDirectory
+          # semantics also stamp /run/faas with per-service ownership on each
+          # restart (vmmd→root, schedd→faas-schedd, gatewayd→faas), so a
+          # blanket `chown -R faas:faas` here would race the restart loop.
+          #
+          # Operators upgrading a box that previously had the chown applied
+          # need to `rm -rf /run/faas` once after stopping vmmd/schedd/gatewayd
+          # so RuntimeDirectory creates it fresh. The next deploy will do the
+          # right thing automatically.
           mkdir -p /run/faas /etc/faas/secrets /var/lib/faas/githubd /var/log/faas /var/spool/faas
-          chown -R faas:faas /run/faas /var/lib/faas /var/log/faas /var/spool/faas 2>/dev/null || true
-          chmod 0775 /run/faas
+          chown -R faas:faas /var/lib/faas /var/log/faas /var/spool/faas 2>/dev/null || true
           chmod 0770 /var/lib/faas /var/lib/faas/githubd /var/log/faas /var/spool/faas 2>/dev/null || true
 
           # Migration preflight, then apply. `migrate -status` reports the
