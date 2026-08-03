@@ -26,7 +26,16 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
+# RuntimeDirectory=faas (not ReadWritePaths alone) makes /run/faas a
+# real directory on the host /run tmpfs, bind-mounted into this unit's
+# mount namespace and propagated back. With PrivateTmp=yes the dirent
+# would be created inside vmmd's per-mount-namespace tmpfs instance
+# and NOT visible from the host — every other daemon that dials
+# /run/faas/vmmd.sock would get `no such file or directory` even though
+# `ss -lnx` shows the LISTEN entry (run 30839233808).
+PrivateTmp=no
+RuntimeDirectory=faas
+RuntimeDirectoryMode=0770
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
