@@ -20,7 +20,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -34,7 +33,7 @@ import (
 
 	githubdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/githubd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/apid/apidsource"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -116,15 +115,6 @@ const githubdBridgeMaxSourceBytes = 2 << 30 // 2 GB upper bound (Scale plan)
 // staging would land. Below this we reject — the source is unreadable
 // or the staging step silently produced an empty file.
 const githubdBridgeMinSourceBytes = 1
-
-// notifySourceGithub is the `source` / `kind` payload value the
-// bridge stamps on its build_queued + supersede notifies. The
-// value matches the GitHub bridge's existing taxonomy
-// (DeploymentKindGitHub = "github"); using a constant here
-// keeps the JSON payload + the state enum on the same
-// vocabulary so a future dashboard parser doesn't have to
-// second-guess the spelling.
-const notifySourceGithub = "github"
 
 // notifyAppField is the JSON payload key that carries the app
 // id. The bridge emits it in both the build_queued payload
@@ -261,11 +251,18 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 			st.Size(), req.SourceBytes)
 	}
 
-	// Create the deployment row. The kind is hard-coded to the
-	// githubd path so ADR-048 metering can split it from the
-	// apid-side tarball/deploy builds. The previous non-terminal
-	// deployment row is superseded inside store.CreateDeployment's
-	// tx (pkg/state/pgstore.go::CreateDeployment — the in-tx
+	// The shared apidsource.Enqueue helper handles CreateDeployment +
+	// build.log spool + UpdateDeploymentStatus(building) + CreateBuild +
+	// NotifyBuildQueued + (optional) NotifyDeploymentChanged (supersede).
+	// The bridge keeps its own auth preamble above (DAC + app/account/
+	// active gate + source-path allowlist + on-disk stat/size check);
+	// the helper takes over once those gates pass.
+	//
+	// The kind is hard-coded to DeploymentKindGitHub so ADR-048
+	// metering can split githubd-triggered builds from apid-side
+	// tarball/deploy builds. The previous non-terminal deployment
+	// row is superseded inside store.CreateDeployment's tx
+	// (pkg/state/pgstore.go::CreateDeployment — the in-tx
 	// supersede is a Phase 5 PR-B feature).
 	//
 	// SourceURL carries the upstream archive URL (provenance-only;
@@ -276,76 +273,18 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	// intentionally NOT in pkg/state.Deployment yet — they're
 	// carried in the proto for forward-compat and stashed in
 	// SourceURL if/when a future migration adds columns.
-	prev, _ := g.store.LatestDeployment(ctx, app.ID)
-	d, err := g.store.CreateDeployment(ctx, state.Deployment{
+	res, err := apidsource.Enqueue(ctx, g.store, g.notif, apidsource.EnqueueParams{
 		AppID:       app.ID,
 		Kind:        state.DeploymentKindGitHub,
 		SourcePath:  req.SourcePath,
 		SourceBytes: req.SourceBytes,
 		SourceURL:   req.SourceUrl,
-		Handler:     "",
-		Status:      state.DeployPending,
 		CommitSHA:   req.CommitSha,
+		LogSpool:    g.spool,
+		Log:         g.log,
 	})
 	if err != nil {
-		// Map the platform's RFC 7807 Problem to a gRPC status
-		// (pkg/grpcerr.ToStatus). The bridge respects the same
-		// Code-to-gRPC-code mapping as the rest of the apid
-		// control-plane surface.
-		return nil, g.asGRPC("create deployment", err)
-	}
-
-	// Create the build row. The log path is siphoed to the
-	// build-spool root so builderd can write to it directly
-	// (mirrors cmd/apid/deploy_inputs.go:192-201).
-	logDir := filepath.Join(g.spool, d.ID)
-	_ = os.MkdirAll(logDir, 0o755)
-	logPath := filepath.Join(logDir, "build.log")
-	_, _ = os.Create(logPath)
-	// Mark the deployment as 'building' so the dashboard + the
-	// Deployments API surface the row in the in-flight state
-	// before builderd claims it. apid-side deploy_inputs.go:196
-	// does the same; the pattern is the tracked-row state
-	// machine, not the optional post-write.
-	_ = g.store.UpdateDeploymentStatus(ctx, d.ID, state.DeployBuilding, "")
-
-	build, err := g.store.CreateBuild(ctx, d.ID, state.DeploymentKindGitHub, req.SourceBytes, logPath)
-	if err != nil {
-		return nil, g.asGRPC("create build", err)
-	}
-
-	// Emit build_queued. builderd LISTENs on this exact channel
-	// (cmd/builderd/main.go:151, 226). The payload shape is the
-	// same as the apid-side deploy_inputs.go:207-209 emit — json
-	// with {build, deployment, app, kind} — so any future
-	// shape via the test fixtures lands both sides at once.
-	payload, _ := json.Marshal(map[string]any{
-		"build":        build.ID,
-		"deployment":   d.ID,
-		notifyAppField: app.ID,
-		"kind":         string(state.DeploymentKindGitHub),
-		"source":       notifySourceGithub,
-	})
-	if err := g.notif.Notify(ctx, db.NotifyBuildQueued, string(payload)); err != nil {
-		// Notify is best-effort: the build row is durable and
-		// builderd's poll-recovery (pkg/state/pgstore.go:2386
-		// ClaimNextQueuedBuild) files missing notifies. Log + skip.
-		g.log.Warn("githubd bridge: notify build_queued failed (durable recovery will pick it up)",
-			"build", build.ID, "deployment", d.ID, notifyAppField, app.ID, "err", err)
-	}
-
-	// Phase 5 PR-B: emit a second NotifyDeploymentChanged so the
-	// imaged F5-cleanup handler drops the prior snapshot. Skipped
-	// on first deploy (no prev).
-	if prev.ID != "" {
-		supPayload, _ := json.Marshal(map[string]any{
-			"kind":          notifySourceGithub,
-			"status":        "superseded",
-			"app_id":        app.ID,
-			"deployment_id": prev.ID,
-			"to":            prev.ID,
-		})
-		_ = g.notif.Notify(ctx, db.NotifyDeploymentChanged, string(supPayload))
+		return nil, g.asGRPC("enqueue", err)
 	}
 
 	// §12 metric: apid_githubd_bridge_enqueued_total. The
@@ -354,11 +293,11 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	g.ops.IncGithubdBridgeEnqueued(wire.GithubdBridgeKindGitHub)
 
 	g.log.Info("githubd bridge: build enqueued",
-		"build", build.ID, "deployment", d.ID, notifyAppField, app.ID,
+		"build", res.BuildID, "deployment", res.DeploymentID, notifyAppField, app.ID,
 		"commit_sha", req.CommitSha, "repo", req.RepoFullName, "branch", req.Branch)
 	return &githubdpb.EnqueueBuildResponse{
-		BuildId:      build.ID,
-		DeploymentId: d.ID,
+		BuildId:      res.BuildID,
+		DeploymentId: res.DeploymentID,
 		AppId:        app.ID,
 	}, nil
 }

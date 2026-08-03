@@ -206,16 +206,39 @@ func diffFieldsChanged(a state.App, w reposcan.Workload, startCmd string) []stri
 // Exported so apid (PR-GH.2) and any future caller can derive the
 // project scan_source without importing cmd/apid (which would
 // create a cyclic dep through pkg/reconcile).
+// composeSourceFilenames is the set of filenames the compose
+// detector emits as the source prefix. The detector writes
+// `src + ": " + name` (pkg/reposcan/compose.go:148) where src is
+// the actual manifest filename, so the priority list (which
+// probes the detector-class name "compose") must additionally
+// probe each filename. Without this, a repo with one
+// docker-compose.yml service falls through to len==1 → "single"
+// instead of "compose", and any later re-apply that grows to N
+// workloads trips the monotonic-upgrade guard with a downgrade
+// to "unknown".
+var composeSourceFilenames = []string{
+	"docker-compose.yml",
+	"docker-compose.yaml",
+	"compose.yml",
+	"compose.yaml",
+}
+
 func DeriveScanSource(workloads []reposcan.Workload) state.ProjectScanSource {
 	// Priority order matches the detector fan-out in
 	// pkg/reposcan/scan.go:145-156. The first match wins.
+	//
+	// The compose detector emits source strings starting with the
+	// actual manifest filename (e.g. "docker-compose.yml: api"),
+	// not a literal "compose:" prefix. We probe both the
+	// detector-class name and the filename set per entry so the
+	// priority list reads as detector classes, not filenames.
 	priority := []string{
 		"compose", "procfile", "k8s", "render", "fly",
 		"serverless", "app.yaml", "workspaces", "convention",
 	}
 	for _, want := range priority {
 		for _, w := range workloads {
-			if strings.HasPrefix(w.Source, want+":") || strings.HasPrefix(w.Source, want+".") {
+			if matchDetectorSource(want, w.Source) {
 				return state.ProjectScanSource(want)
 			}
 		}
@@ -224,6 +247,27 @@ func DeriveScanSource(workloads []reposcan.Workload) state.ProjectScanSource {
 		return state.ProjectScanSourceSingle
 	}
 	return state.ProjectScanSourceUnknown
+}
+
+// matchDetectorSource returns true if a workload source string
+// was emitted by the named detector class. Most detectors write
+// `<name>:<space>…` (e.g. "fly: web", "k8s/deployment.yaml: web");
+// the compose detector writes the actual manifest filename
+// (e.g. "docker-compose.yml: api"). The compose class is
+// matched specially against composeSourceFilenames.
+func matchDetectorSource(detector, source string) bool {
+	if detector == "compose" {
+		for _, fn := range composeSourceFilenames {
+			if strings.HasPrefix(source, fn+":") {
+				return true
+			}
+		}
+		// Fallback: also accept the bare "compose:" prefix in
+		// case a future detector variant emits it.
+		return strings.HasPrefix(source, "compose:") || strings.HasPrefix(source, "compose.")
+	}
+	return strings.HasPrefix(source, detector+":") ||
+		strings.HasPrefix(source, detector+".")
 }
 
 // tierRank is the state-side monotonic-upgrade ranking. Higher

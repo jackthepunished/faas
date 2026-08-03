@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
-	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/apid/apidsource"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -154,28 +154,30 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	deploymentID := ""
-	buildLog := ""
 	if sourcePath != "" {
 		// PR-B: the prior-deployment supersede is folded into
 		// store.CreateDeployment's tx (pkg/state/pgstore.go). The tarball
 		// branch picks up the parity the image: branch used to lack —
 		// every successful source deploy now atomically supersedes the
 		// prior non-terminal row. The second NotifyDeploymentChanged
-		// for `prev` (further down) lets imaged F5-cleanup the prior
-		// snapshot. No call-site change was needed to gain this; the
-		// in-tx ordering is invisible above the Store seam. We read
-		// prev via LatestDeployment BEFORE the call so the return
-		// shape stays 2-tuple.
-		prev, _ := s.store.LatestDeployment(ctx(r), app.ID)
-		d, err := s.store.CreateDeployment(ctx(r), state.Deployment{
+		// for `prev` (fired by apidsource.Enqueue below) lets imaged
+		// F5-cleanup the prior snapshot. No call-site change was needed
+		// to gain this; the in-tx ordering is invisible above the Store
+		// seam.
+		//
+		// The wire "source" payload value is now derived from Kind
+		// inside apidsource.Enqueue (H1 fix from PR #541 review) — the
+		// legacy hardcoded "image" diverged from Kind for tarball /
+		// dockerfile deploys and produced misleading split-by-source
+		// dashboards.
+		_, err := apidsource.Enqueue(ctx(r), s.store, s.notif, apidsource.EnqueueParams{
 			AppID:       app.ID,
 			Kind:        kind,
 			SourcePath:  sourcePath,
 			SourceBytes: sourceBytes,
 			Handler:     handler,
-			LogPath:     buildLog,
-			Status:      state.DeployPending,
+			LogSpool:    spoolRoot(),
+			Log:         s.log,
 		})
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
@@ -184,42 +186,26 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 		// IAM-2 (issue #186): 2nd-deploy chokepoint. Same wiring
 		// as the image branch in handlers.go::createDeployment.
 		// The deployment row is now visible; if the new count
-		// is >= 2, arm mfa_required for the next login.
+		// is >= 2, arm mfa_required for the next login. The
+		// helper's CreateDeployment already incremented the
+		// CountDeployments view (the in-tx supersede is invisible
+		// above the Store seam), so calling this here is
+		// behaviour-equivalent to the pre-refactor
+		// "post-CreateDeployment, pre-CreateBuild" site — see
+		// handlers_mfa.go:790-797.
 		s.maybeFlipMFAOnDeploy(ctx(r), acct)
-		// Spool the log file alongside the source so builderd can write to
-		// it directly. The path is created lazily so empty log_path stays
-		// safe for image: deploys.
-		logDir := filepath.Join(spoolRoot(), d.ID)
-		_ = os.MkdirAll(logDir, 0o755)
-		logPath := filepath.Join(logDir, "build.log")
-		_, _ = os.Create(logPath)
-		if err := s.store.UpdateDeploymentStatus(ctx(r), d.ID, state.DeployBuilding, ""); err == nil {
-			// Update log_path by re-reading and writing via the dedicated
-			// path. For simplicity the deployment row keeps an empty
-			// log_path here; builderd re-stamps it once it starts (M6).
-			_ = logPath
-		}
-		build, err := s.store.CreateBuild(ctx(r), d.ID, kind, sourceBytes, logPath)
+		// Look up the durable deployment row to build the wire
+		// response. LatestDeployment returns the row we just
+		// inserted (state.Store.CreateDeployment is its own tx
+		// and the row is committed before Enqueue returns).
+		d, err := s.store.LatestDeployment(ctx(r), app.ID)
 		if err != nil {
-			api.WriteProblem(w, api.ErrCapacity("could not create build row"))
+			api.WriteProblem(w, api.ErrCapacity("could not read deployment"))
 			return
 		}
-		_ = s.notif.Notify(ctx(r), db.NotifyBuildQueued,
-			fmt.Sprintf(`{"build":"%s","deployment":"%s","app":"%s","kind":"%s"}`,
-				build.ID, d.ID, app.ID, kind))
-		// PR-B parity: if a prior row was just superseded inside the
-		// same tx, fire a second NotifyDeploymentChanged so imaged's F5
-		// cleanup handler drops the prior snapshot. Skipped on first
-		// deploy (no prev).
-		if prev.ID != "" {
-			_ = s.notif.Notify(ctx(r), db.NotifyDeploymentChanged,
-				fmt.Sprintf(`{"kind":"image","status":"superseded","app_id":"%s","deployment_id":"%s","to":"%s"}`, app.ID, prev.ID, prev.ID))
-		}
-		s.log.Info("source deploy queued", "deployment", d.ID, "app", app.ID, "kind", kind, "build", build.ID)
 		writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 		return
 	}
-	_ = deploymentID
 }
 
 // validateAndSpool reads the multipart file part, validates the tarball

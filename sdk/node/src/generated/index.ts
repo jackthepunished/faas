@@ -19,6 +19,7 @@ export type { APIKeyExportResponse } from './models/APIKeyExportResponse.js';
 export type { APIKeyResponse } from './models/APIKeyResponse.js';
 export type { AppEnvListResponse } from './models/AppEnvListResponse.js';
 export type { AppEnvResponse } from './models/AppEnvResponse.js';
+export type { AppliedBuild } from './models/AppliedBuild.js';
 export type { ApplyResponse } from './models/ApplyResponse.js';
 export type { AppManifest } from './models/AppManifest.js';
 export type { AppMetricsResponse } from './models/AppMetricsResponse.js';

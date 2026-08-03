@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.applied_build import AppliedBuild
     from ..models.apply_response_apps_item import ApplyResponseAppsItem
     from ..models.plan_cron import PlanCron
     from ..models.plan_managed import PlanManaged
@@ -39,6 +40,13 @@ class ApplyResponse:
     crons_not_allowed: bool | Unset = UNSET
     project_id: str | Unset = UNSET
     apps: list[ApplyResponseAppsItem] | Unset = UNSET
+    builds: list[AppliedBuild] | Unset = UNSET
+    """Per-workload build enqueue results. Populated when the apply
+    path actually enqueued one (deployment, build) per added or
+    changed workload (PR-A, repo decomposition Phase 5 close-
+    the-loop). On staging or enqueue failure the per-app Error
+    field is populated and the IDs are empty.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -98,6 +106,13 @@ class ApplyResponse:
                 apps_item = apps_item_data.to_dict()
                 apps.append(apps_item)
 
+        builds: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.builds, Unset):
+            builds = []
+            for builds_item_data in self.builds:
+                builds_item = builds_item_data.to_dict()
+                builds.append(builds_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -134,11 +149,14 @@ class ApplyResponse:
             field_dict["project_id"] = project_id
         if apps is not UNSET:
             field_dict["apps"] = apps
+        if builds is not UNSET:
+            field_dict["builds"] = builds
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.applied_build import AppliedBuild
         from ..models.apply_response_apps_item import ApplyResponseAppsItem
         from ..models.plan_cron import PlanCron
         from ..models.plan_managed import PlanManaged
@@ -207,6 +225,15 @@ class ApplyResponse:
 
                 apps.append(apps_item)
 
+        _builds = d.pop("builds", UNSET)
+        builds: list[AppliedBuild] | Unset = UNSET
+        if _builds is not UNSET:
+            builds = []
+            for builds_item_data in _builds:
+                builds_item = AppliedBuild.from_dict(builds_item_data)
+
+                builds.append(builds_item)
+
         apply_response = cls(
             project_slug=project_slug,
             scan_source=scan_source,
@@ -225,6 +252,7 @@ class ApplyResponse:
             crons_not_allowed=crons_not_allowed,
             project_id=project_id,
             apps=apps,
+            builds=builds,
         )
 
         apply_response.additional_properties = d

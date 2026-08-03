@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { AppliedBuild } from './AppliedBuild.js';
 import type { PlanCron } from './PlanCron.js';
 import type { PlanManaged } from './PlanManaged.js';
 import type { PlanWorkload } from './PlanWorkload.js';
@@ -29,5 +30,14 @@ export type ApplyResponse = {
     slug: string;
     id: string;
   }>;
+  /**
+   * Per-workload build enqueue results. Populated when the apply
+   * path actually enqueued one (deployment, build) per added or
+   * changed workload (PR-A, repo decomposition Phase 5 close-
+   * the-loop). On staging or enqueue failure the per-app Error
+   * field is populated and the IDs are empty.
+   *
+   */
+  builds?: Array<AppliedBuild>;
 };
 

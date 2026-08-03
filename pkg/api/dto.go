@@ -1955,16 +1955,36 @@ type PlanResponse struct {
 // ApplyResponse is the success body for POST /v1/projects. Carries
 // the inserted project_id + per-app IDs so the CLI's --yes flow
 // can render "applied: <slug> → <app_id>".
+//
+// Builds carries the per-workload (deployment_id, build_id) results
+// from the apply-time build-enqueue loop (PR-A, repo decomposition
+// Phase 5 close-the-loop). omitempty keeps existing --json consumers
+// stable; the field is only populated when the apply path actually
+// enqueued builds (i.e. when at least one app was added or changed).
 type ApplyResponse struct {
 	PlanResponse
 	ProjectID string             `json:"project_id"`
 	Apps      []ApplyResponseApp `json:"apps"`
+	Builds    []AppliedBuild     `json:"builds,omitempty"`
 }
 
 // ApplyResponseApp is the per-app line in the apply response.
 type ApplyResponseApp struct {
 	Slug string `json:"slug"`
 	ID   string `json:"id"`
+}
+
+// AppliedBuild is the per-workload build result that
+// cmd/apid/scanService returns alongside the reconcile Result.
+// Renders as {slug, app_id, deployment_id, build_id, error?}.
+// On staging or enqueue failure, Error is non-empty and the
+// deployment/build IDs are empty. Partial failure is by design.
+type AppliedBuild struct {
+	Slug         string `json:"slug"`
+	AppID        string `json:"app_id"`
+	DeploymentID string `json:"deployment_id,omitempty"`
+	BuildID      string `json:"build_id,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // --- cosign trusted-publisher wire types (issue #472 / ADR-054) -------------
