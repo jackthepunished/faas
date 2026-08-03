@@ -6234,11 +6234,11 @@ func (s *PgStore) CreateComputeNode(ctx context.Context, node ComputeNode) (Comp
 // former is the watchdog's heartbeat stamp (next task); the latter is
 // the row's creation time and stays monotonic.
 //
-// vcpu_budget (Tier A2, migration 00081) is operator-tunable per
+// vcpu_budget (Tier A2, migration 00123) is operator-tunable per
 // node. The upsert re-applies the caller's value on conflict so
 // a vmmd self-registering with its config.toml value wins against
 // a stale row; the operator can re-tune later via
-// PUT /v1/compute-nodes/{id}. Migration 00081 backfilled existing
+// PUT /v1/compute-nodes/{id}. Migration 00123 backfilled existing
 // rows to api.VCPUSlots (160); pre-migration rows see the same
 // default via the column DEFAULT clause.
 func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error) {

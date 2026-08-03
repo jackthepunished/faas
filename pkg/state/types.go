@@ -1253,7 +1253,7 @@ type ComputeNode struct {
 	MaxConcurrency     int
 	AdmissionCeilingMB int
 	// VCPUBudget is the per-node vCPU admission ceiling (migration
-	// 00081, Tier A2). schedd's NodeLedger checks vCPU against
+	// 00123, Tier A2). schedd's NodeLedger checks vCPU against
 	// this value rather than the legacy box-wide api.VCPUSlots.
 	// Defaults to 160 (api.VCPUSlots) on the synthetic default-local
 	// row seeded by migration 00024; operators tune it per-node in

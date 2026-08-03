@@ -1,4 +1,4 @@
--- filename: 00081_compute_nodes_vcpu_budget.sql
+-- filename: 00123_compute_nodes_vcpu_budget.sql
 -- +goose Up
 -- Per-node vCPU admission budget (Tier A2).
 --
