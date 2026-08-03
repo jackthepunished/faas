@@ -72,6 +72,7 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 | 067 | Tier A6 migrating-instance watchdog (1 s ticker that self-heals stuck `state='migrating'` rows: re-invite active owner via gRPC, hard-delete dead owner) | proposed | Tier A6 follow-up to ADR-066 §"Open follow-ups" item 1 |
 | 068 | Issue #517 closure evidence — AC→PR mapping for LOGGING (correlation, server-side filters, gap semantics) | accepted | issue #517 (PR-A #520, PR-B #524, PR-C #532; docs-only PR, renumbered 067→068 post #538 collision) |
 | 069 | Sidecar containers: init + metrics, hard cap 2 (JSONB on `deployments.sidecars`, stateless-only, envelope-sealed env, billing math `plan RAM + Σ(sidecar.ram_mb) + PerVMOverheadMB`) | proposed | issue #463 (PR A ships contract + storage; PR B wires runtime effect; PR C wires e2e + observability; ADR renumbered 066→067→068→069 post #542 merge) |
+| 070 | Tier A7 edge split (gatewayd-public / gatewayd-internal; in-process split per box, unix-socket hop, sticky-warm routing, central rate limits, cert replication by lex-min leader) | proposed | Tier A7 — the outer-edge tier that completes the multi-box migration started in ADR-062 (ADR renumbered 068→070 post #540/#543 collisions; PR #547) |
 
 ADR-011 and ADR-012 are required by the UX spec (§11) before git-deploy work
 begins at M7.5; both landed on 2026-07-17 alongside the M7.5 PR open.

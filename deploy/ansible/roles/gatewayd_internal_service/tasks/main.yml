@@ -1,0 +1,22 @@
+# gatewayd_internal_service — install systemd unit + socket
+# permissions for gatewayd-internal (Tier A7 split, ADR-070).
+#
+# The internal daemon listens ONLY on a unix socket inside the box.
+# Public network exposure is impossible by design — no
+# AmbientCapabilities, no RestrictAddressFamilies other than
+# AF_UNIX. The unix socket is provisioned at /run/faas via
+# RuntimeDirectory=faas in the unit.
+
+- name: gatewayd_internal_service — install systemd unit
+  ansible.builtin.copy:
+    src: faas-gatewayd-internal.service
+    dest: /etc/systemd/system/faas-gatewayd-internal.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: gatewayd_internal_unit
+
+- name: gatewayd_internal_service — systemctl daemon-reload (idempotent, after new unit file)
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: gatewayd_internal_unit.changed

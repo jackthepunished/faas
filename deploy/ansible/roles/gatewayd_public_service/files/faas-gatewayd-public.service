@@ -1,0 +1,51 @@
+[Unit]
+Description=onebox-faas gatewayd-public — TLS-only edge (Tier A7 split, ADR-070)
+Documentation=https://docs.gregale.dev/ops/gatewayd-public
+# gatewayd-public depends on apid (route cache mirror subscribes to
+# app_changed / domain_changed pg_notify) and gatewayd-internal (the
+# unix-socket target we forward every inbound request to). Internal
+# must be ready before the public daemon can pass /readyz itself.
+After=faas-cp.slice network-online.target faas-apid.service faas-gatewayd-internal.service
+Wants=faas-cp.slice faas-apid.service faas-gatewayd-internal.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gatewayd-public
+Restart=on-failure
+RestartSec=2s
+
+Slice=faas-cp.slice
+MemoryMax=512M
+
+# Public listener: TLS on :443 + ACME HTTP-01 on :80.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Hardening baseline — gatewayd-public is NOT root; runs as faas:faas.
+User=faas
+Group=faas
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+
+RuntimeDirectory=faas
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/lib/faas/certs
+ReadOnlyPaths=/etc/faas
+
+[Install]
+WantedBy=multi-user.target
