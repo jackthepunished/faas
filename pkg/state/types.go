@@ -389,7 +389,7 @@ type App struct {
 	ReassignedAt *time.Time
 	// MigratedAt is the wall-clock time of the most recent
 	// cross-node LIVE-INSTANCE migration for this app
-	// (Tier A5, migration 00098, ADR-066, follow-up to
+	// (Tier A5, migration 00098, ADR-068, follow-up to
 	// ADR-064). Distinct from ReassignedAt, which carries the
 	// PARKED-app rebalance commit. Both columns can coexist
 	// on the same app — an app whose instances migrated live
@@ -698,6 +698,20 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
+	// Sidecars (issue #463 / ADR-068). Up to 2 stateless sidecars
+	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
+	// `deployments.sidecars` column (migration 00095). Field is
+	// json.RawMessage (NOT []api.Sidecar) so the state package
+	// does NOT import pkg/api — see pkg/api ↔ pkg/state cycle
+	// (memory: pkg-api-cannot-import-pkg-state). The decoder
+	// logic lives at the handler boundary (cmd/apid/handlers_deployments.go)
+	// where pkg/api and pkg/state meet. PR-A only persists the
+	// shape; PR-B threads the array into imaged's pull path and
+	// guest-init's supervise loop. env values are stored
+	// envelope-sealed (namespace="sidecar_env"); PR-B unseals
+	// transiently at the pull path (mirrors app_env_secret
+	// unseal at the same seam).
+	Sidecars json.RawMessage `json:"sidecars,omitempty"`
 }
 
 // Build is one build pipeline run for a deployment (spec §9). Builderd writes
@@ -1128,7 +1142,7 @@ type Instance struct {
 	WakeID string
 	// MigratedFromNodeID is the prior owner compute_node after a
 	// cross-node live-instance handoff (Tier A5, migration 00097,
-	// ADR-066, follow-up to ADR-064). FK to compute_nodes(id) ON
+	// ADR-068, follow-up to ADR-064). FK to compute_nodes(id) ON
 	// DELETE SET NULL — the lineage reference stays honest when a
 	// node is decommissioned (the row stays, the column flips to
 	// NULL). Distinct from apps.node_id (the durable shard key for

@@ -125,6 +125,7 @@ export type { SessionListResponse } from './models/SessionListResponse.js';
 export type { SessionsRevokeAllResponse } from './models/SessionsRevokeAllResponse.js';
 export type { SetGraceWindowRequest } from './models/SetGraceWindowRequest.js';
 export type { SetPasswordRequest } from './models/SetPasswordRequest.js';
+export type { Sidecar } from './models/Sidecar.js';
 export type { Slug } from './models/Slug.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './models/StorageUsageResponse.js';

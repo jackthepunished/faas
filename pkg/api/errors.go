@@ -339,6 +339,22 @@ const (
 	// --max-concurrency").
 	CodeInvalidMinInstances = "invalid_min_instances"
 
+	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
+	// codes for the sidecar surface. The cap and type-uniqueness
+	// codes are the load-bearing 400-class shapes; the stateful
+	// and not-on-plan codes are defence-in-depth for future
+	// per-plan tier-ups (PR-A does NOT apply the plan gate; the
+	// code is reserved so a follow-up PR doesn't have to invent
+	// a new one).
+	CodeSidecarCapExceeded      = "sidecar_cap_exceeded"
+	CodeSidecarInvalidType      = "sidecar_invalid_type"
+	CodeSidecarInvalidImage     = "sidecar_invalid_image"
+	CodeSidecarStatefulDenied   = "sidecar_stateful_denied"
+	CodeSidecarInvalidName      = "sidecar_invalid_name"
+	CodeSidecarInvalidPort      = "sidecar_invalid_port"
+	CodeSidecarInvalidRamMB     = "sidecar_invalid_ram_mb"
+	CodeSidecarNotAllowedOnPlan = "sidecar_not_allowed_on_plan"
+
 	// Move 1 event-shaped surfaces (spec §4.4, §4.9). The CLI exit-code
 	// table treats them as 403/422/402; surfacing the codes separately
 	// lets the dashboard render a "move to Scale to lift the cap"
@@ -1365,6 +1381,127 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		fmt.Sprintf("min_instances must be in [0, %d] (plan max_concurrency); got %d.", maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
 		WithDocs("https://docs.gregale.dev/apps#min-instances")
+}
+
+// ErrSidecarCapExceeded is returned when the request carries more
+// than SidecarCapMax sidecars (issue #463 / ADR-068 §Decision 1).
+// 400 because the request shape is wrong; the cap is the load-bearing
+// invariant. The schema CHECK on `deployments.sidecars` is the
+// second-line defence; this error surfaces before that check
+// (the API gate fires first).
+func ErrSidecarCapExceeded(seen, cap int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarCapExceeded,
+		"Too many sidecars",
+		fmt.Sprintf("request carried %d sidecars; the cap is %d (issue #463 / ADR-068 §Decision 1).", seen, cap)).
+		WithLimit(int64(cap), int64(seen)).
+		WithDocs("https://docs.gregale.dev/sidecars#cap")
+}
+
+// ErrSidecarInvalidType is returned when a sidecar carries a `type`
+// other than {init, sidecar}, or when the request carries more than
+// one init or more than one sidecar (the per-type-uniqueness rule).
+// 400 because the request shape is wrong.
+func ErrSidecarInvalidType(name, got string) *Problem {
+	if got == "" {
+		return NewProblem(http.StatusBadRequest, CodeSidecarInvalidType,
+			"Invalid sidecar type",
+			fmt.Sprintf("sidecar %q must declare type=init or type=sidecar.", name))
+	}
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidType,
+		"Invalid sidecar type",
+		fmt.Sprintf("sidecar %q type %q; must be init or sidecar.", name, got))
+}
+
+// ErrSidecarInvalidImage is returned when the sidecar image is not
+// digest-pinned (issue #463 / ADR-068 §Decision 5). Tag-pinning is
+// the documented OCI supply-chain attack vector; the runtime
+// already enforces this; the API gate surfaces a useful error at
+// the client side.
+func ErrSidecarInvalidImage(name string, err error) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidImage,
+		"Invalid sidecar image",
+		fmt.Sprintf("sidecar %q image must be digest-pinned (repo@sha256:...): %v", name, err))
+}
+
+// ErrSidecarStatefulDenied is returned when the sidecar image is in
+// the `pkg/imaged` `StatefulBaseImageDenylist` set (Postgres,
+// Redis, MySQL, MongoDB, etc.). 403 because the request shape is
+// valid but the policy denies it. Stateful workloads go on
+// dedicated infra, not FaaS.
+//
+// Deprecated for new callers: prefer ErrSidecarStatefulDeniedWithHint
+// (issue #463 / ADR-068 §Decision 4 followup), which surfaces the
+// remediation hint from pkg/statefuldenylist.Set in the RFC 7807
+// Detail field. Kept for symmetry with the existing pkg/imaged
+// surface that takes (name, image) only.
+func ErrSidecarStatefulDenied(name, image string) *Problem {
+	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
+		"Stateful sidecar image is not allowed",
+		fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)).
+		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+}
+
+// ErrSidecarStatefulDeniedWithHint is the API-gate sidecar variant
+// of ErrSidecarStatefulDenied that surfaces the remediation hint
+// from pkg/statefuldenylist.Set ("use Neon", "use Upstash", …) in
+// the RFC 7807 Detail field. The customer-facing copy is the hint
+// (so the dashboard / CLI can render actionable remediation);
+// name + image are present in the body so audit-log consumers can
+// still attribute the rejection to a specific sidecar.
+//
+// Empty hint is gracefully degraded (the message still names the
+// sidecar + image even when the Set row has no remediation copy —
+// defence against a future Set entry being added without a hint).
+func ErrSidecarStatefulDeniedWithHint(name, image, hint string) *Problem {
+	detail := fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)
+	if hint != "" {
+		detail += " Remediation: " + hint + "."
+	}
+	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
+		"Stateful sidecar image is not allowed", detail).
+		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+}
+
+// ErrSidecarInvalidName is returned when the sidecar name does
+// not match the RFC 1123 label grammar (lowercase alphanumeric +
+// dash, 1..63 chars, starts with [a-z0-9]).
+func ErrSidecarInvalidName(name string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidName,
+		"Invalid sidecar name",
+		fmt.Sprintf("sidecar name %q must match RFC 1123 label (lowercase alphanumeric + dash, 1..63 chars, starts with [a-z0-9]).", name))
+}
+
+// ErrSidecarInvalidPort is returned when the sidecar port is out
+// of range. Port 0 means "absent" (the OCI image's default port
+// is used by the runtime).
+func ErrSidecarInvalidPort(port int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidPort,
+		"Invalid sidecar port",
+		fmt.Sprintf("sidecar port %d must be 0 (absent) or in [1, 65535].", port))
+}
+
+// ErrSidecarInvalidRamMB is returned when the sidecar ram_mb is
+// out of range. 0 means "absent / inherit the plan RAM". The
+// 32..512 range is the platform floor/ceiling (the guest-init +
+// watchdog overhead is the binding floor at 32 MB; 512 MB is the
+// soft per-sidecar ceiling).
+func ErrSidecarInvalidRamMB(ramMB int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeSidecarInvalidRamMB,
+		"Invalid sidecar ram_mb",
+		fmt.Sprintf("sidecar ram_mb %d must be 0 (inherit plan RAM) or in [32, 512].", ramMB))
+}
+
+// ErrSidecarNotAllowedOnPlan is reserved for a future per-plan
+// gate (PR-A does NOT apply this gate — the global SidecarCapMax
+// is the load-bearing surface; see ADR-068 §Decision 1). The
+// constructor exists so a follow-up PR doesn't have to invent
+// a new code. 403 because it's a plan-tier decision, not a
+// shape violation.
+func ErrSidecarNotAllowedOnPlan(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodeSidecarNotAllowedOnPlan,
+		"Plan doesn't allow sidecars",
+		fmt.Sprintf("the %s plan doesn't allow sidecars (issue #463 / ADR-068).", p)).
+		WithDocs("https://docs.gregale.dev/plans#sidecars")
 }
 
 // ErrPlanMaxInstancesNotAllowed (issue #462 / ADR-058) is the
