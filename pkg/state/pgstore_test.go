@@ -2463,7 +2463,10 @@ func TestPg_CountLiveInstancesByDeployment(t *testing.T) {
 	snapshottingID := mustCreate(state.StateSnapshotting)
 
 	// And one for a different deployment — must NOT be counted.
-	_, _, otherDepID := seedLiveDeploy(t, s, ctx, "555-other")
+	// The seedLiveDeploy helper takes email + slug suffixes; pass
+	// both so we don't collide on the global apps.slug UNIQUE key
+	// (the first seed created "pg-app").
+	_, _, otherDepID := seedLiveDeploy(t, s, ctx, "555-other", "other")
 	otherRunning, err := s.CreateInstance(ctx, appID, otherDepID, string(state.StateRunning), 256, nodeID, "")
 	if err != nil {
 		t.Fatalf("CreateInstance other: %v", err)

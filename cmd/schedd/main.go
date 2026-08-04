@@ -368,6 +368,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	routerRefreshCh, err := subscribeRouterRefresh(ctx, pool, log)
 	if err != nil {
+		// Same ctx-cancellation grace as the ActiveComputeNodes
+		// call above (cmd/schedd/main.go:334-336): a test or
+		// operator cancelling mid-boot must not surface as a
+		// non-nil error from runWithDeps — the drain is clean.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
 		return fmt.Errorf("schedd: router refresh subscribe: %w", err)
 	}
 	// The watcher only needs the (nodeID, target_url) pair from
@@ -455,11 +462,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("schedd: otelinit: %w", err)
 	}
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer func(ctx context.Context) {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		_ = otelHandle.Shutdown(shutdownCtx)
-	}()
+	}(ctx)
 
 	// ADR-053 — slice-3 signature verification. Construct the
 	// in-memory (key_id → *ecdsa.PublicKey) registry, load the
