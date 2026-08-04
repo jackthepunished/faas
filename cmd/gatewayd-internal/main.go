@@ -83,6 +83,14 @@ func main() {
 	wire.Daemon("gatewayd-internal", run)
 }
 
+// prodRun is referenced here (and only here) so golangci-lint's
+// `unused` checker does not flag the production-runner chain
+// (synthAdapter, watchInvalidations, newNodeCache, etc.) that
+// PR-A moves into this package but does not yet wire. PR-B
+// replaces `run` (the placeholder handler) with `prodRun` and
+// deletes this reference line.
+var _ = prodRun
+
 // runDeps is the production dependency bundle. Tests inject a
 // custom publicDeps to swap the dialer (the unix-socket path in
 // particular) so the seam is fully exercised without root-level
