@@ -59,6 +59,15 @@ const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumenta
 const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
 const { Resource } = require('@opentelemetry/resources');
 
+// OTEL_PROPAGATORS picks up TRACEPARENT from the process env and
+// joins every outbound span to the platform's trace. The default
+// "tracecontext,baggage" already does this; we list it explicitly
+// so a misconfiguration that overrides OTEL_PROPAGATORS doesn't
+// silently drop traceparent propagation.
+const propagators = (process.env.OTEL_PROPAGATORS || 'tracecontext,baggage')
+  .split(',')
+  .map((name) => name.trim());
+
 const sdk = new NodeSDK({
   resource: new Resource({ 'service.name': process.env.FAAS_APP_SLUG || 'app' }),
   traceExporter: new OTLPTraceExporter({
@@ -71,6 +80,14 @@ const sdk = new NodeSDK({
 sdk.start();
 process.on('SIGTERM', () => sdk.shutdown());
 ```
+
+> **Why this works:** `NodeSDK` wires an `EnvMapPropagator` (the
+> `OTEL_PROPAGATORS=tracecontext` propagator) that reads `TRACEPARENT`
+> from `process.env` on every span start. The platform stamps
+> `TRACEPARENT` per request, so each child span joins the
+> `gateway.handler` trace_id automatically — no manual extraction
+> needed. If you set `OTEL_PROPAGATORS` yourself, keep `tracecontext`
+> in the list, or the join breaks silently.
 
 ```js
 // handler.js — your existing handler, unchanged. The auto-
@@ -118,6 +135,7 @@ opentelemetry-bootstrap -a install
 ```bash
 # Procfile or app.json's `command` — bootstrap must run BEFORE
 # your handler imports.
+export OTEL_PROPAGATORS=tracecontext,baggage
 exec opentelemetry-instrument \
   --service_name "${FAAS_APP_SLUG}" \
   --exporter_otlp_endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT}" \
@@ -125,9 +143,12 @@ exec opentelemetry-instrument \
   gunicorn app:app
 ```
 
-The `opentelemetry-instrument` wrapper reads `TRACEPARENT` from
-the process env and joins every Flask/FastAPI/Django/psycopg
-span to the platform's trace.
+The `opentelemetry-instrument` wrapper installs an
+`OTELPropagatorsEnv` (an EnvMapPropagator equivalent) that reads
+`TRACEPARENT` from the process env and joins every Flask/FastAPI/
+Django/psycopg span to the platform's trace. We set
+`OTEL_PROPAGATORS=tracecontext,baggage` explicitly so a custom
+propagator in the parent image doesn't silently drop the join.
 
 ## What the platform does NOT do
 

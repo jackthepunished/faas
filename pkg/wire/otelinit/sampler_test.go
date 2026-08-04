@@ -305,6 +305,41 @@ func TestDeploymentAware_DescriptionPinsShape(t *testing.T) {
 	}
 }
 
+// TestDeploymentAware_DeploymentAttrKey pins the contract between
+// the sampler and schedd's sched.wake span attribute. schedd stamps
+// "deployment_id" at pkg/sched/engine.go:1362; if that key ever
+// drifts (e.g. "deploymentID", "deployment.id"), the sampler
+// silently stops overriding. This test pins the literal value
+// the sampler looks for so a drift on either side surfaces as a
+// test failure, not a silent regression.
+//
+// We test through the sampler rather than exposing the unexported
+// constant directly: the sampler is the contract surface, and a
+// test against the sampler catches both "constant renamed" and
+// "attribute lookup changed".
+func TestDeploymentAware_DeploymentAttrKey(t *testing.T) {
+	c := otelinit.NewDeploymentCounter(100)
+	sampler := otelinit.NewDeploymentAware(sdktrace.NeverSample(), otelinit.WithCounter(c))
+
+	// Inside the window: a root span with the canonical attribute
+	// must be sampled despite the wrapped NeverSample.
+	res := sampler.ShouldSample(params(
+		attribute.String("deployment_id", "dep-A"),
+	))
+	if res.Decision != sdktrace.RecordAndSample {
+		t.Errorf("canonical 'deployment_id' attribute: decision=%v, want RecordAndSample (key drift?)", res.Decision)
+	}
+
+	// Wrong key: the sampler must NOT see this as a per-deployment
+	// override — it falls through to the wrapped NeverSample.
+	res2 := sampler.ShouldSample(params(
+		attribute.String("deploymentID", "dep-A"), // camelCase drift
+	))
+	if res2.Decision != sdktrace.Drop {
+		t.Errorf("drifted 'deploymentID' attribute: decision=%v, want Drop (sampler should ignore wrong key)", res2.Decision)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

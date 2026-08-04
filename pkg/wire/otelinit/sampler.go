@@ -231,21 +231,12 @@ func (s *DeploymentAware) ShouldSample(p sdktrace.SamplingParameters) sdktrace.S
 }
 
 // Description returns the OTel SDK's sampler description string.
-// Required by the Sampler interface. Format mirrors sdktrace's
-// conventions: "<wrapper>(<root>)".
+// Required by the Sampler interface. The boot log line in
+// otelinit.go ("sampler", "sampler_arg", "window_size") is the
+// canonical summary; Description() exists only because the
+// interface requires it.
 func (s *DeploymentAware) Description() string {
-	return fmt.Sprintf("DeploymentAware(window=%d, root=%s)", s.windowSize(), s.root.Description())
-}
-
-// Counter returns the underlying DeploymentCounter so the
-// out-of-band watcher can call Reset on the same counter the
-// sampler consults. Returns nil only if the sampler was
-// mis-constructed (defensive; not expected).
-func (s *DeploymentAware) Counter() *DeploymentCounter {
-	if s == nil {
-		return nil
-	}
-	return s.counter
+	return fmt.Sprintf("DeploymentAware(window=%d)", s.windowSize())
 }
 
 func (s *DeploymentAware) windowSize() int {
