@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -666,9 +667,7 @@ func TestGitHubAuthCallback_EmitsAuditLoginEvent(t *testing.T) {
 			break
 		}
 	}
-	if authLogin == nil {
-		t.Fatalf("no auth.login event row landed; rows=%+v", rows)
-	}
+	authLogin = mustAuditEventGitHub(t, authLogin, fmt.Sprintf("no auth.login event row landed; rows=%+v", rows))
 	if authLogin.Subject == nil || authLogin.Subject.String() != uuidStringOf(link.AccountID) {
 		t.Errorf("Subject = %v, want %s", authLogin.Subject, link.AccountID)
 	}
@@ -793,4 +792,17 @@ func TestGitHubAuthCallback_TokenExchangeSendsAcceptJSON(t *testing.T) {
 	if got := f.acceptSeen.Load(); got < 1 {
 		t.Errorf("access_token request did not carry Accept: application/json; saw %d", got)
 	}
+}
+
+// mustAuditEventGitHub mirrors mustAuditEvent (declared in
+// handlers_audit_test.go) for the auth.login audit-row lookup.
+// Go forbids duplicate function names in the same package even
+// across _test.go files in package main, so we use a file-scoped
+// name. Same SA5011 false positive.
+func mustAuditEventGitHub(t *testing.T, ev *state.Event, msg string) *state.Event {
+	t.Helper()
+	if ev == nil {
+		t.Fatal(msg)
+	}
+	return ev
 }

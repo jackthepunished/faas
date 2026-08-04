@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -154,9 +155,7 @@ func TestHandlers_DeleteKey_SoftRevokesAndIdempotent(t *testing.T) {
 			break
 		}
 	}
-	if found == nil {
-		t.Fatalf("revoked key not in list")
-	}
+	found = mustAPIKeyResponse(t, found, "revoked key not in list")
 	if found.Status != "revoked" {
 		t.Errorf("Status: got %q, want revoked", found.Status)
 	}
@@ -453,9 +452,7 @@ func TestHandlers_KeyRotationAuditEmitted(t *testing.T) {
 			break
 		}
 	}
-	if found == nil {
-		t.Fatalf("no key.rotated event row; rows=%+v", rows)
-	}
+	found = mustAuditEventKeys(t, found, fmt.Sprintf("no key.rotated event row; rows=%+v", rows))
 	var data map[string]any
 	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("data not JSON: %v", err)
@@ -469,4 +466,30 @@ func TestHandlers_KeyRotationAuditEmitted(t *testing.T) {
 	if got, ok := data["grace_window_days"].(float64); !ok || int(got) != api.DefaultAPIKeyGraceWindowDays {
 		t.Errorf("data.grace_window_days: got %v, want %d", data["grace_window_days"], api.DefaultAPIKeyGraceWindowDays)
 	}
+}
+
+// mustAPIKeyResponse is the SA5011 escape hatch for the listKeys
+// revoked-key search: listKeys can legitimately omit the just-revoked
+// row, but we want a real row for assertions. A helper that
+// t.Fatal()s and returns the value lets staticcheck see the value
+// is non-nil at the call site.
+func mustAPIKeyResponse(t *testing.T, k *api.APIKeyResponse, msg string) *api.APIKeyResponse {
+	t.Helper()
+	if k == nil {
+		t.Fatal(msg)
+	}
+	return k
+}
+
+// mustAuditEventKeys mirrors mustAuditEvent (declared in
+// handlers_audit_test.go) for the key.rotated audit-row lookup.
+// Go forbids duplicate function names in the same package even
+// across _test.go files in package main, so we use a file-scoped
+// name. Same SA5011 false positive.
+func mustAuditEventKeys(t *testing.T, ev *state.Event, msg string) *state.Event {
+	t.Helper()
+	if ev == nil {
+		t.Fatal(msg)
+	}
+	return ev
 }
