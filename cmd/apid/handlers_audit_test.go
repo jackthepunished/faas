@@ -132,11 +132,9 @@ func TestAuditEvents_KeyDeleteEmitsEvent(t *testing.T) {
 			break
 		}
 	}
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no key.revoked event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no key.revoked event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["key_id"] != created.ID {
@@ -177,11 +175,9 @@ func TestAuditEvents_AccountDeletionScheduledEmitsEvent(t *testing.T) {
 			break
 		}
 	}
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no account.deletion_scheduled event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no account.deletion_scheduled event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["via"] != "rest" {
@@ -318,10 +314,8 @@ func TestAuditEvents_GetEndpointReturnsRow(t *testing.T) {
 			break
 		}
 	}
-	if target == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("no key.created row to fetch")
-	}
-	idStr := strconv.FormatInt(target.ID, 10) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	target = mustAuditEvent(t, target, "no key.created row to fetch")
+	idStr := strconv.FormatInt(target.ID, 10)
 	getRec := e.do(t, http.MethodGet, "/v1/audit-events/"+idStr, nil, nil)
 	if getRec.Code != http.StatusOK {
 		t.Fatalf("GET /v1/audit-events/%s: code=%d body=%s", idStr, getRec.Code, getRec.Body.String())
@@ -437,11 +431,11 @@ func TestAuditEvents_ListEndpointReturnsCronFired(t *testing.T) {
 			break
 		}
 	}
-	if fired == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
+	if fired == nil {
 		t.Fatalf("no cron.fired row in list response (kind_prefix=cron.); events=%+v", list.Events)
 	}
-	if fired.Actor != "schedd" { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("fired.Actor = %q, want schedd", fired.Actor) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if fired.Actor != "schedd" {
+		t.Errorf("fired.Actor = %q, want schedd", fired.Actor)
 	}
 	if fired.Subject != uuidStringOf(e.acct.ID) {
 		t.Errorf("fired.Subject = %q, want %s", fired.Subject, uuidStringOf(e.acct.ID))
@@ -565,11 +559,11 @@ func TestAuditEvents_ListEndpointRespectsStatelessAdvisoryKindPrefix(t *testing.
 			break
 		}
 	}
-	if accounted == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
+	if accounted == nil {
 		t.Fatalf("no accounted stateless.advisory row in list response; events=%+v", list.Events)
 	}
-	if accounted.Actor != "apid" { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("accounted.Actor = %q, want apid", accounted.Actor) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if accounted.Actor != "apid" {
+		t.Errorf("accounted.Actor = %q, want apid", accounted.Actor)
 	}
 	if accounted.Subject != uuidStringOf(e.acct.ID) {
 		t.Errorf("accounted.Subject = %q, want %s", accounted.Subject, uuidStringOf(e.acct.ID))
@@ -758,7 +752,7 @@ func TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated(t *testing.T) {
 			authLogin = &rows[i]
 		}
 	}
-	if keyCreated == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
+	if keyCreated == nil {
 		t.Fatalf("no key.created row; rows=%+v", rows)
 	}
 	if authLogin == nil {
@@ -881,11 +875,9 @@ func TestAuditEvents_DashboardDeleteEmitsEventWithViaDashboard(t *testing.T) {
 			break
 		}
 	}
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no account.deletion_scheduled row from dashboard path; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no account.deletion_scheduled row from dashboard path; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not JSON: %v", err)
 	}
 	if data["via"] != "dashboard" {
@@ -1033,11 +1025,9 @@ func TestAuditEvents_AppCreatedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "app.created")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no app.created event row; rows=%+v", rows)
-	}
-	if found.Subject == nil || found.Subject.String() != uuidStringOf(e.acct.ID) { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(e.acct.ID)) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	found = mustAuditEvent(t, found, fmt.Sprintf("no app.created event row; rows=%+v", rows))
+	if found.Subject == nil || found.Subject.String() != uuidStringOf(e.acct.ID) {
+		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(e.acct.ID))
 	}
 	var data map[string]any
 	if err := json.Unmarshal(found.Data, &data); err != nil {
@@ -1075,11 +1065,9 @@ func TestAuditEvents_AppDeployedEmitsEvent(t *testing.T) {
 	// Two rows are expected: app.created (from seedAppForAudit) and
 	// app.deployed. Pick the second kind specifically.
 	found := findEventByKind(rows, "app.deployed")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no app.deployed event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no app.deployed event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["app_id"] != app.ID {
@@ -1122,11 +1110,9 @@ func TestAuditEvents_AppDeployedEmitsSupersedesOnSecondDeploy(t *testing.T) {
 			}
 		}
 	}
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no app.deployed row for second deployment %s; rows=%+v", secondDep, rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no app.deployed row for second deployment %s; rows=%+v", secondDep, rows))
 	var data map[string]any
-	_ = json.Unmarshal(found.Data, &data) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	_ = json.Unmarshal(found.Data, &data)
 	if data["supersedes"] != firstDep {
 		t.Errorf("Data.supersedes = %v, want %s (first deployment)", data["supersedes"], firstDep)
 	}
@@ -1158,11 +1144,9 @@ func TestAuditEvents_AppUpdatedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "app.updated")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no app.updated event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no app.updated event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["app_id"] != app.ID {
@@ -1209,11 +1193,9 @@ func TestAuditEvents_AppDeletedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "app.deleted")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no app.deleted event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no app.deleted event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["app_id"] != app.ID {
@@ -1254,11 +1236,9 @@ func TestAuditEvents_AppRolledBackEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "app.rolled_back")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no app.rolled_back event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no app.rolled_back event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["app_id"] != app.ID {
@@ -1290,11 +1270,9 @@ func TestAuditEvents_DomainAddedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "domain.added")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no domain.added event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no domain.added event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["app_id"] != app.ID {
@@ -1326,11 +1304,9 @@ func TestAuditEvents_DomainRemovedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "domain.removed")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no domain.removed event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no domain.removed event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["app_id"] != app.ID {
@@ -1365,11 +1341,9 @@ func TestAuditEvents_CronCreatedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "cron.created")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no cron.created event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no cron.created event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["cron_id"] != created.ID {
@@ -1416,11 +1390,9 @@ func TestAuditEvents_CronUpdatedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "cron.updated")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no cron.updated event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no cron.updated event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["cron_id"] != created.ID {
@@ -1474,11 +1446,9 @@ func TestAuditEvents_CronDeletedEmitsEvent(t *testing.T) {
 		t.Fatalf("ListEvents: %v", err)
 	}
 	found := findEventByKind(rows, "cron.deleted")
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no cron.deleted event row; rows=%+v", rows)
-	}
+	found = mustAuditEvent(t, found, fmt.Sprintf("no cron.deleted event row; rows=%+v", rows))
 	var data map[string]any
-	if err := json.Unmarshal(found.Data, &data); err != nil { //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	if err := json.Unmarshal(found.Data, &data); err != nil {
 		t.Fatalf("Data not valid JSON: %v", err)
 	}
 	if data["cron_id"] != created.ID {
