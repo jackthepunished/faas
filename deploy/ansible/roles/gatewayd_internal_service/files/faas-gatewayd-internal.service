@@ -10,7 +10,11 @@ Wants=faas-cp.slice faas-apid.service faas-schedd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gatewayd-internal
+# Binary is shipped by the ansible bootstrap step (this role's
+# `tasks/main.yml` invokes `install -m 0755 ... /opt/faas/bin/<bin>`
+# from the builder tarball; cd-controlplane.yml line 278 does the
+# same on the cd path).
+ExecStart=/opt/faas/bin/gatewayd-internal
 Restart=on-failure
 RestartSec=2s
 

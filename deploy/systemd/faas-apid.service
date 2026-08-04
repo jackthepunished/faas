@@ -8,7 +8,9 @@ Wants=faas-cp.slice
 Type=simple
 User=faas-apid
 Group=faas
-ExecStart=/usr/local/bin/apid --config /etc/faas/apid.toml
+# Binary is shipped by cd-controlplane.yml "Install binaries"
+# step (line 278: `install -m 0755 ... /opt/faas/bin/<bin>`).
+ExecStart=/opt/faas/bin/apid --config /etc/faas/apid.toml
 Restart=on-failure
 RestartSec=2s
 

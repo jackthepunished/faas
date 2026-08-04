@@ -10,7 +10,10 @@ Wants=faas-cp.slice faas-apid.service faas-gatewayd-internal.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gatewayd-public
+# Binary is shipped by this workflow's "Install binaries" step
+# (line ~278: `install -m 0755 /opt/faas/bin/deploy-tmp/$bin
+# /opt/faas/bin/$bin`).
+ExecStart=/opt/faas/bin/gatewayd-public
 Restart=on-failure
 RestartSec=2s
 

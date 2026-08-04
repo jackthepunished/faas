@@ -9,7 +9,9 @@ Wants=faas-tenant.slice faas-cp.slice
 [Service]
 Type=simple
 # vmmd is the only root component — RequiredBy ordering reflects that.
-ExecStart=/usr/local/bin/vmmd --config /etc/faas/vmmd.toml
+# Binary is shipped by cd-controlplane.yml "Install binaries"
+# step (line 278: `install -m 0755 ... /opt/faas/bin/<bin>`).
+ExecStart=/opt/faas/bin/vmmd --config /etc/faas/vmmd.toml
 Restart=on-failure
 RestartSec=2s
 

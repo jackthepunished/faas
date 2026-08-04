@@ -8,7 +8,11 @@ Wants=faas-cp.slice
 Type=simple
 User=faas-meterd
 Group=faas
-ExecStart=/usr/local/bin/meterd --config /etc/faas/meterd.toml
+# Binary is shipped by the ansible bootstrap step (this role's
+# `tasks/main.yml` invokes `install -m 0755 ... /opt/faas/bin/<bin>`
+# from the builder tarball; cd-controlplane.yml line 278 does the
+# same on the cd path).
+ExecStart=/opt/faas/bin/meterd --config /etc/faas/meterd.toml
 Restart=on-failure
 RestartSec=2s
 

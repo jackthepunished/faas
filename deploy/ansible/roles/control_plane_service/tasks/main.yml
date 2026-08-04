@@ -51,6 +51,25 @@
     - { src: "faas-meterd.service",  dest: "/etc/systemd/system/faas-meterd.service" }
   register: cp_units
 
+# Tier A7 PR-D — pre-create /run/faas with the canonical
+# root:faas 0775 ownership before any faas-*.service unit starts.
+# Closes the restart-cycle race where faas-vmmd.service's
+# RuntimeDirectory=faas recreates the dir as root:root 0755 and
+# the ExecStartPre chown flips it to root:faas 0775, but schedd
+# + apid dial /run/faas/vmmd.sock during the chown window and
+# get bind: permission denied (cd-controlplane run 31121004495,
+# post PR #633 deploy 2026-08-04).
+- name: control_plane_service — install /run/faas tmpfiles.d rule (PR-D)
+  ansible.builtin.copy:
+    src: "faas.conf"
+    dest: /etc/tmpfiles.d/faas.conf
+    owner: root
+    group: root
+    mode: "0644"
+- name: control_plane_service — apply /run/faas tmpfiles.d rule (PR-D)
+  ansible.builtin.command: systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
+  changed_when: false
+
 - name: control_plane_service — systemctl daemon-reload (only when unit files changed)
   ansible.builtin.systemd:
     daemon_reload: true
@@ -96,7 +115,7 @@
       FAAS_SCHEDD_ADDR=/run/faas/schedd.sock for meterd — meterd refuses to
       start without FAAS_SCHEDD_ADDR per issue #52's strict-exit rule) and
       the binaries are installed at
-      /usr/local/bin/{apid,schedd,imaged,meterd}.
+      /opt/faas/bin/{apid,schedd,imaged,meterd}.
 
 # Security review A4: scope FAAS_SESSION_KEY to apid via systemd
 # LoadCredential. The role does NOT create the secret file — the

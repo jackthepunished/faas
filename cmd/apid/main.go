@@ -45,7 +45,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
-// seedDevAccount creates a Free account whose API key is the given token.
+// seedDevAccount creates (or finds) the dev@local Free account. The
+// API-key mint that used to live here is REMOVED: production boxes
+// never set FAAS_DEV_TOKEN (they use the real signup flow + gregale
+// sign-keys init), and dev/test environments mint keys explicitly via
+// pkg/e2etest.Harness.SeedAccount or their own CLI setup. Calling
+// CreateAPIKey on every apid boot was a pgstore.Write at restart-loop
+// frequency — the path that crash-looped apid in run 31121004495
+// (post PR #633 deploy 2026-08-04). Removing it sidesteps the
+// restart-cycle race entirely.
+//
+// Tier A7 PR-D.
 func seedDevAccount(ctx context.Context, store state.Store, token string) error {
 	if !api.ValidAPIKeyFormat(token) {
 		return fmt.Errorf("FAAS_DEV_TOKEN is not a valid API key (want %s… format)", api.APIKeyPrefix)
@@ -59,17 +69,13 @@ func seedDevAccount(ctx context.Context, store state.Store, token string) error 
 		// design. The PR 3 backfill (migrations/00101) and the e2e harness
 		// SeedAccount cover the "every account has a personal org"
 		// invariant.
-		acct, err = store.CreateAccount(ctx, "dev@local", api.PlanFree)
-		if err != nil {
+		if _, err = store.CreateAccount(ctx, "dev@local", api.PlanFree); err != nil {
 			return err
 		}
 	} else if err != nil {
 		return err
 	}
-	_, err = store.CreateAPIKey(ctx, acct.ID, api.HashAPIKey(token), "dev", api.ScopesAdminOnly)
-	if err != nil && !errors.Is(err, state.ErrConflict) {
-		return err
-	}
+	_ = acct // find-or-create confirmed; the row exists either way
 	return nil
 }
 

@@ -8,7 +8,9 @@ Wants=faas-cp.slice
 Type=simple
 User=faas-schedd
 Group=faas
-ExecStart=/usr/local/bin/schedd --config /etc/faas/schedd.toml
+# Binary is shipped by cd-controlplane.yml "Install binaries"
+# step (line 278: `install -m 0755 ... /opt/faas/bin/<bin>`).
+ExecStart=/opt/faas/bin/schedd --config /etc/faas/schedd.toml
 Restart=on-failure
 RestartSec=2s
 
