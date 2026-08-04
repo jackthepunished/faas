@@ -914,9 +914,9 @@ func TestOpsMetrics_ObserveSidecarRestartNilSafe(t *testing.T) {
 func TestOpsMetrics_GuestInitDuration(t *testing.T) {
 	m := wire.NewOpsMetrics("vmmd")
 	// Real observations across the bucket spread.
-	m.GuestInitDuration("app-1", "node22").Observe(0.04) // ≤ 0.05
-	m.GuestInitDuration("app-1", "node22").Observe(0.30) // ≤ 0.3
-	m.GuestInitDuration("app-1", "node22").Observe(0.34) // ≤ 0.35
+	m.GuestInitDuration("app-1", "node22").Observe(0.04)   // ≤ 0.05
+	m.GuestInitDuration("app-1", "node22").Observe(0.30)   // ≤ 0.3
+	m.GuestInitDuration("app-1", "node22").Observe(0.34)   // ≤ 0.35
 	m.GuestInitDuration("app-2", "python312").Observe(2.0) // ≤ 3
 
 	body := render(t, m)

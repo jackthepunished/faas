@@ -91,6 +91,7 @@ func writeTarToSpool(t *testing.T, root string, raw []byte) string {
 	}
 	return path
 }
+
 // mustProblem fails the test when prob is nil and returns it
 // non-nil otherwise. Side-steps the SA5011 false positive on
 // `if prob == nil { t.Fatal(...) } if prob.X` because t.Fatal

@@ -905,10 +905,10 @@ func TestCmdAppScale_WarmSnapshotShow(t *testing.T) {
 	// avoid re-bridging the GET path here we assert on the AppResponse
 	// fields instead of the formatted text.
 	a := api.AppResponse{
-		Slug:                  "jane-api",
-		WarmSnapshotEnabled:   true,
+		Slug:                    "jane-api",
+		WarmSnapshotEnabled:     true,
 		WarmSnapshotMinRequests: 7,
-		WarmSnapshotMinMs:      1500,
+		WarmSnapshotMinMs:       1500,
 	}
 	if !a.WarmSnapshotEnabled {
 		t.Errorf("show: warm_snapshot_enabled = false, want true")
