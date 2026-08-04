@@ -76,6 +76,13 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		if *req.MinInstances < 0 || *req.MinInstances > limits.MaxConcurrency {
 			return api.ErrInvalidMinInstances(*req.MinInstances, limits.MaxConcurrency)
 		}
+		// ADR-071 §Decision 5: per-plan MaxMinInstances cap
+		// (Hobby 1, Pro 3, Scale 10). Tighter than MaxConcurrency
+		// to protect the §6.2-2 RAM ceiling from a single API
+		// call pinning a large fraction of the box.
+		if *req.MinInstances > acct.Plan.MaxMinInstances() {
+			return api.ErrMaxMinInstancesExceeded(*req.MinInstances, acct.Plan.MaxMinInstances())
+		}
 	}
 	if req.EgressAllowlist != nil {
 		// Plan tier first: a Free/Hobby PATCH must surface 403 even
@@ -304,6 +311,13 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		// the apid gate only rejects the negative / over-cap cases.
 		if sp.MinInstances < 0 || sp.MinInstances > limits.MaxConcurrency {
 			return api.ErrInvalidMinInstances(sp.MinInstances, limits.MaxConcurrency)
+		}
+		// ADR-071 §Decision 5: per-plan MaxMinInstances cap
+		// (Hobby 1, Pro 3, Scale 10). Tighter than MaxConcurrency
+		// to protect the §6.2-2 RAM ceiling from a single API
+		// call pinning a large fraction of the box.
+		if sp.MinInstances > acct.Plan.MaxMinInstances() {
+			return api.ErrMaxMinInstancesExceeded(sp.MinInstances, acct.Plan.MaxMinInstances())
 		}
 		// Bounds on max_instances: must be in [MinInstances, plan.MaxConcurrency].
 		// 0 means "use plan max_concurrency"; the engine reads the
@@ -642,6 +656,77 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct stat
 	writeJSON(w, http.StatusOK, s.deploymentResponse(d))
 }
 
+// updateDeploymentMinInstances (issue #557 closure / ADR-072) is the
+// PATCH /v1/deployments/{id} handler. The only mutable field on a
+// deployment post-create is the cold-wake floor (min_instances);
+// image / digest / overrides / sidecars stay immutable (a new
+// deployment is the canonical way to change them).
+//
+// Validation:
+//   - 404 on a missing deployment or a deployment that belongs to a
+//     different account (IDOR-safe).
+//   - 422 on a negative value or a value > plan.MaxMinInstances().
+//     The plan cap applies to the EFFECTIVE floor per instance
+//     (max(app, deployment)), not separately per axis — keeps the
+//     Scale ceiling at 10 even when a customer pins both axes.
+//   - 400 on a malformed body.
+//
+// Audit: emits a deployment.min_instances_changed row via the
+// existing auditor (kind list frozen by ADR-072 §Decision 6).
+func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	d, err := s.store.DeploymentByID(ctx(r), id)
+	if err != nil {
+		s.notFound(w, "no such deployment")
+		return
+	}
+	app, err := s.store.AppByID(ctx(r), d.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such deployment")
+		return
+	}
+	var req api.UpdateDeploymentRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	if req.MinInstances == nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"min_instances required",
+			"min_instances must be present (use 0 to inherit from the parent app)"))
+		return
+	}
+	v := *req.MinInstances
+	if v < 0 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"min_instances must be >= 0",
+			fmt.Sprintf("min_instances = %d; must be >= 0.", v)))
+		return
+	}
+	planMax := planMaxFor(acct)
+	if v > planMax {
+		api.WriteProblem(w, api.ErrMaxMinInstancesExceeded(v, planMax))
+		return
+	}
+	updated, err := s.store.UpdateDeploymentMinInstances(ctx(r), id, v)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such deployment")
+			return
+		}
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "update failed", err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
+}
+
+// planMaxFor resolves the per-plan MaxMinInstances cap for the
+// account. Falls back to 0 for unknown plans (fail-closed — Free
+// plan cannot configure any floor).
+func planMaxFor(acct state.Account) int {
+	return acct.Plan.MaxMinInstances()
+}
+
 // rollbackApp re-primes the most recent superseded deployment per spec §9.
 // Implemented as a synchronous status swap; imaged/schedd react via
 // pg_notify and re-prime on their side. The previous "live" deployment is
@@ -826,7 +911,7 @@ func (s *server) listInstances(w http.ResponseWriter, r *http.Request, acct stat
 	}
 	out := make([]api.InstanceResponse, 0, len(instances))
 	for _, ins := range instances {
-		out = append(out, instanceResponse(ins))
+		out = append(out, instanceResponse(ins, app.EffectiveMinInstances()))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1907,6 +1992,7 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 		ErrorCode:    d.ErrorCode,
 		CreatedAt:    d.CreatedAt.UTC().Format(time.RFC3339),
 		HasOverrides: hasOverrides,
+		MinInstances: d.MinInstances,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint
@@ -1979,15 +2065,22 @@ func (s *server) buildProvenanceResponse(p state.BuildProvenance) api.BuildProve
 	}
 }
 
-func instanceResponse(ins state.Instance) api.InstanceResponse {
+// instanceResponse projects a state.Instance into the wire
+// InstanceResponse. The minInstancesTarget parameter carries the
+// parent app's effective min_instances (issue #557 / ADR-071) so
+// dashboards can verify the proactive floor is being met on a
+// per-instance basis. Zero is omitted via the JSON `omitempty`
+// contract — customers who never opted in see no field.
+func instanceResponse(ins state.Instance, minInstancesTarget int) api.InstanceResponse {
 	r := api.InstanceResponse{
-		ID:           ins.ID,
-		AppID:        ins.AppID,
-		DeploymentID: ins.DeploymentID,
-		State:        ins.State,
-		HostIP:       ins.HostIP,
-		RAMMB:        ins.RAMMB,
-		WakeID:       ins.WakeID,
+		ID:                 ins.ID,
+		AppID:              ins.AppID,
+		DeploymentID:       ins.DeploymentID,
+		State:              ins.State,
+		HostIP:             ins.HostIP,
+		RAMMB:              ins.RAMMB,
+		WakeID:             ins.WakeID,
+		MinInstancesTarget: minInstancesTarget,
 	}
 	if !ins.StartedAt.IsZero() {
 		r.StartedAt = ins.StartedAt.UTC().Format(time.RFC3339)

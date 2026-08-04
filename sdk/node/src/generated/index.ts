@@ -150,6 +150,7 @@ export type { TrustedSigner } from './models/TrustedSigner.js';
 export type { UpdateAlertRuleRequest } from './models/UpdateAlertRuleRequest.js';
 export type { UpdateAppRequest } from './models/UpdateAppRequest.js';
 export type { UpdateCronRequest } from './models/UpdateCronRequest.js';
+export type { UpdateDeploymentRequest } from './models/UpdateDeploymentRequest.js';
 export type { UsageExportResponse } from './models/UsageExportResponse.js';
 export type { UsageResponse } from './models/UsageResponse.js';
 export type { UsageSummaryResponse } from './models/UsageSummaryResponse.js';

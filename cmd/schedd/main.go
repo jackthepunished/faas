@@ -29,6 +29,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/sched/floor"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
 	"github.com/onebox-faas/faas/pkg/sched/instancestats"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
@@ -866,6 +867,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// instancestats.Reader is wired). The engine adapter converts
 	// sched.WakeResult → scaleup.AdmitResult (a small subset —
 	// the trigger only inspects AtCapacity).
+	//
+	// Issue #557 / ADR-071: lift the auditor to a local so the
+	// floor trigger can share the same actor="schedd" instance
+	// and emit `floor.wake` audit rows on every proactive admit.
+	schedulerAuditor := audit.New(store, log, ops, "schedd")
 	loop := sched.NewLoop(pool, engine, log).
 		WithFlowCounter(flowcount.NewReader(wire.ExecRunner{})).
 		WithWatchdog(sched.NewWatchdog(store, engine, log)).
@@ -897,7 +903,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// cron-fire path can emit a `cron.fired` events row after
 		// MarkCronFired. Best-effort failure semantics from
 		// pkg/audit/audit.go — never rolls back the fire.
-		WithAudit(audit.New(store, log, ops, "schedd")).
+		//
+		// Issue #557 / ADR-071: the same schedulerAuditor instance
+		// is also wired into the floor trigger so floor.wake events
+		// share the actor="schedd" attribution.
+		WithAudit(schedulerAuditor).
 		// Issue #171: aggressive reaper toggle + per-tick park cap.
 		// cfg.ReaperAggressive defaults ON; FAAS_REAPER_AGGRESSIVE=false
 		// disables in-place. cfg.ReaperAggressiveParkCap=0 → default
@@ -981,6 +991,50 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Info("concurrent_requests target trigger enabled",
 				"interval", cfg.ScaleUpInterval)
 		}
+		// Issue #557 / ADR-071: proactive min-instances floor
+		// reconciler. Walks every app the schedd owns each tick and
+		// admits instances up to the effective floor (max of legacy
+		// column + ScalingPolicy jsonb). Distinct from the scale-up
+		// and targets triggers — those are reactive (RPS / CPU /
+		// inflight signal); the floor trigger is proactive, the
+		// customer's SLA is "min N resident at all times". Uses the
+		// same engine + ledger as the other triggers so the engine's
+		// wake-gate remains the single admission authority.
+		//
+		// FAAS_FLOOR_INTERVAL_SECONDS overrides the trigger cadence
+		// (operator can dampen during incidents without restarting).
+		// Default falls back to cfg.ScaleUpInterval so a single
+		// shared dial governs all three triggers when no env is set;
+		// api.FloorDecisionIntervalSeconds (1s) is the trigger's own
+		// last-resort default. A non-positive / unparseable env
+		// returns a typed error so a typo surfaces at boot rather
+		// than silently damping the floor reconciler off.
+		floorInterval := cfg.ScaleUpInterval
+		if v := os.Getenv("FAAS_FLOOR_INTERVAL_SECONDS"); v != "" {
+			n, parseErr := strconv.Atoi(v)
+			if parseErr != nil || n <= 0 {
+				return fmt.Errorf("FAAS_FLOOR_INTERVAL_SECONDS: %s", v)
+			}
+			floorInterval = time.Duration(n) * time.Second
+		}
+		floorTrigger := floor.New(
+			store,
+			store, // deploymentStore — issue #557 closure / ADR-072 (per-deployment walk)
+			schedFloorLedger{ledger: engine.Ledger()},
+			schedFloorEngine{engine: engine},
+			floor.Options{
+				Logger:       log,
+				Metrics:      ops,
+				Interval:     floorInterval,
+				Auditor:      schedulerAuditor,
+				PlanResolver: schedFloorPlanResolver{store: store},
+			},
+		)
+		floorTrigger.WithOwnerNodeID(ownerNodeID)
+		loop.WithFloor(floorTrigger)
+		log.Info("min-instances floor reconciler enabled",
+			"interval", floorInterval,
+			"owner_node_id", ownerNodeID)
 		// Issue #171: wire the recent-load mirror off the same
 		// scraper so the reaper sees per-app RPS without duplicating
 		// the scraping wiring. nil scraper ⇒ mirror is a no-op
@@ -1194,6 +1248,86 @@ func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (ta
 		return targets.AdmitResult{}, err
 	}
 	return targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// schedFloorEngine (issue #557 / ADR-071) adapts *sched.Engine to
+// the floor.Engine interface. Mirrors schedTargetsEngine above —
+// delegates to engine.AdmitInstance and lifts InstanceID +
+// AtCapacity into floor.AdmitResult. AtCapacity is forwarded so
+// the trigger's at_capacity branch re-observes the wake-gate
+// rejection (no FAILED row, no backoff — engine already handled
+// the unattached row).
+type schedFloorEngine struct {
+	engine *sched.Engine
+}
+
+// AdmitInstance implements floor.Engine.
+func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstance(ctx, appID)
+	if err != nil {
+		return floor.AdmitResult{}, err
+	}
+	return floor.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// AdmitInstanceForDeployment implements floor.Engine (issue #557
+// closure / ADR-072 — per-deployment floor wake).
+func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (floor.AdmitResult, error) {
+	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID)
+	if err != nil {
+		return floor.AdmitResult{}, err
+	}
+	return floor.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// schedFloorPlanResolver (issue #557 / ADR-071) adapts
+// state.Store.AccountByID into floor.PlanResolver. The trigger
+// walks apps per-tick and consults the resolver to gate the
+// floor-wake (Free plan → OutcomeDisabled). Returns false when the
+// account lookup misses so the trigger falls back to PlanFree
+// (fail-closed).
+type schedFloorPlanResolver struct {
+	store state.Store
+}
+
+// ResolvePlan implements floor.PlanResolver.
+func (s schedFloorPlanResolver) ResolvePlan(ctx context.Context, accountID string) (api.Plan, bool) {
+	acct, err := s.store.AccountByID(ctx, accountID)
+	if err != nil {
+		return api.PlanFree, false
+	}
+	return acct.Plan, true
+}
+
+// schedFloorLedger (issue #557 / ADR-071) adapts *sched.NodeLedger
+// to floor.Ledger. The floor trigger reads Concurrency (per-app
+// gate), ResidentRAM (global Σ), and HeadroomMB (§6.2-2 ceiling
+// pre-check). Concurrency + ResidentRAM are already exposed by
+// schedTargetsLedger; HeadroomMB is the new method the floor
+// trigger adds.
+type schedFloorLedger struct {
+	ledger *sched.NodeLedger
+}
+
+// Concurrency implements floor.Ledger.
+func (s schedFloorLedger) Concurrency(appID string) int {
+	return s.ledger.Concurrency(appID)
+}
+
+// ConcurrencyForDeployment implements floor.Ledger (issue #557
+// closure / ADR-072 — per-(app, deployment) live count).
+func (s schedFloorLedger) ConcurrencyForDeployment(appID, deploymentID string) int {
+	return s.ledger.ConcurrencyForDeployment(appID, deploymentID)
+}
+
+// ResidentRAM implements floor.Ledger.
+func (s schedFloorLedger) ResidentRAM() int {
+	return s.ledger.ResidentRAM()
+}
+
+// HeadroomMB implements floor.Ledger.
+func (s schedFloorLedger) HeadroomMB() int {
+	return s.ledger.HeadroomMB()
 }
 
 // schedTargetsLedger (PR-C, issue #462) adapts *sched.NodeLedger

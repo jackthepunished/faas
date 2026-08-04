@@ -338,6 +338,16 @@ const (
 	// can render actionable retry guidance ("raise your plan or lower
 	// --max-concurrency").
 	CodeInvalidMinInstances = "invalid_min_instances"
+	// CodeMaxMinInstancesExceeded (issue #557 / ADR-071 §Decision 5)
+	// is a 422 for shape violations: the requested min_instances
+	// exceeds the per-plan MaxMinInstances cap (Hobby 1, Pro 3,
+	// Scale 10). Distinct from CodeInvalidMinInstances because the
+	// request shape is fine (non-negative int), it's the
+	// plan-bounded value that was wrong. WithLimit carries the
+	// plan cap and the observed value so the CLI renders
+	// actionable retry guidance ("raise your plan or lower
+	// --min-instances").
+	CodeMaxMinInstancesExceeded = "max_min_instances_exceeded"
 
 	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
@@ -1380,6 +1390,21 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		"Invalid min_instances",
 		fmt.Sprintf("min_instances must be in [0, %d] (plan max_concurrency); got %d.", maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
+		WithDocs("https://docs.gregale.dev/apps#min-instances")
+}
+
+// ErrMaxMinInstancesExceeded (issue #557 / ADR-071 §Decision 5) is
+// returned when the requested min_instances exceeds the per-plan
+// MaxMinInstances cap (Hobby 1, Pro 3, Scale 10). 422 with
+// WithLimit carrying the cap and the observed value so the CLI
+// can render actionable retry guidance ("raise your plan or lower
+// --min-instances"). Distinct from ErrInvalidMinInstances which
+// rejects negative values or values above MaxConcurrency.
+func ErrMaxMinInstancesExceeded(got, planMax int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeMaxMinInstancesExceeded,
+		"min_instances exceeds plan cap",
+		fmt.Sprintf("min_instances must be in [0, %d] for this plan; got %d.", planMax, got)).
+		WithLimit(int64(planMax), int64(got)).
 		WithDocs("https://docs.gregale.dev/apps#min-instances")
 }
 

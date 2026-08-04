@@ -14,7 +14,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// EgressAllowlistAllowed/MaxSize default to false/0 (Go zero), so
 		// Free/Hobby rows below omit them intentionally — mirrors the
 		// MinInstancesAllowed row shape.
-		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096,
+		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096, MaxMinInstances: 0,
 			// Issue #395 / ADR-045: Free gets 8 keys / 4 KB per value.
 			EnvVarsMax: 8, EnvValueMaxBytes: 4096,
 			// ADR-044: per-plan CPUWeight/CPUQuotaUS/CPUPeriodUS — issue
@@ -59,7 +59,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
 			KeysMax: 3},
-		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192,
+		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
 			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
 			// in-house) without letting one app accumulate an unbounded allowlist.
@@ -115,7 +115,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
 			KeysMax: 10},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
-		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384,
+		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
 			// larger team rotation surface (multiple repos × multiple CI providers).
 			TrustedSignerCountMax: 8,
@@ -163,7 +163,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			KeysMax: 50},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
-		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768,
+		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
 			// Issue #472 / ADR-058: Scale gets 16 trusted publishers — 2× Pro for the
 			// enterprise rotation surface (multi-team, multi-cloud, multi-CI).
 			TrustedSignerCountMax: 16,
@@ -452,6 +452,29 @@ func TestPlanMinInstancesAllowed(t *testing.T) {
 func TestSidecarCapMax(t *testing.T) {
 	if SidecarCapMax != 2 {
 		t.Errorf("SidecarCapMax = %d, want 2 (issue #463 / ADR-066 §Decision 1)", SidecarCapMax)
+	}
+}
+
+// TestPlanMaxMinInstances pins the per-plan max-floor cap (issue #557
+// / ADR-071 §Decision 5). Free 0, Hobby 1, Pro 3, Scale 10. The cap
+// is tighter than MaxConcurrency (1/2/5/20) to protect the §6.2-2
+// RAM ceiling from a single API call. Unknown plans fail closed
+// (return 0) — same contract as TrustedSignerCountMax.
+func TestPlanMaxMinInstances(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 1},
+		{PlanPro, 3},
+		{PlanScale, 10},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.MaxMinInstances(); got != c.want {
+			t.Errorf("%s.MaxMinInstances() = %d, want %d", c.plan, got, c.want)
+		}
 	}
 }
 

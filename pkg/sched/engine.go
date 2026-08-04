@@ -736,6 +736,114 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID string) (WakeResult, e
 	return e.admitAndDispatch(ctx, appID, true)
 }
 
+// AdmitInstanceForDeployment is the floor-trigger entry point that
+// admits a specific deployment (issue #557 closure / ADR-072).
+// The signature differs from AdmitInstance by accepting an explicit
+// deploymentID; the floor trigger's per-deployment sweep threads the
+// deployment it wants woke. The wake path's per-request target is
+// still resolved by admitAndDispatch's `resolveApp` (LiveDeployment),
+// which guarantees the wake and the floor admit land on the same
+// deployment id — passing an out-of-band id here would race the
+// customer's next deploy.
+//
+// The empty-deploymentID case is the legacy AdmitInstance path: the
+// caller falls through to AdmitInstance (which resolves the live
+// deployment internally). Pass empty rather than resolving to
+// LatestDeployment — the trigger must NOT silently wake a
+// superseded deployment.
+func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+	if deploymentID == "" {
+		return e.AdmitInstance(ctx, appID)
+	}
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
+}
+
+// admitAndDispatchForDeployment mirrors admitAndDispatch but threads
+// a specific deploymentID through to the ledger. Resolution of the
+// app + account + limits still happens via resolveApp; only the
+// deployment is overridden. If the override deployment is no longer
+// live (a newer deploy happened mid-tick), the call returns
+// {AtCapacity: true} — the trigger's next sweep re-evaluates.
+func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID string, liftCapacityToResult bool) (WakeResult, error) {
+	// ── Phase 2: admit window, under appMu ──────────────────
+	release := e.lockApp(appID)
+	app, acct, limits, _, err := e.resolveApp(ctx, appID)
+	if err != nil {
+		release()
+		return WakeResult{}, err
+	}
+
+	// Worker class is the same short-circuit as admitAndDispatch.
+	if app.WorkloadClass == state.WorkloadClassWorker {
+		release()
+		return WakeResult{AtCapacity: true}, nil
+	}
+
+	// Look up the override deployment; if it's gone or no longer live,
+	// treat as at-capacity (next tick re-evaluates).
+	dep, depErr := e.store.DeploymentByID(ctx, deploymentID)
+	if depErr != nil {
+		release()
+		if errors.Is(depErr, state.ErrNotFound) {
+			return WakeResult{AtCapacity: true}, nil
+		}
+		return WakeResult{}, depErr
+	}
+	if dep.Status != state.DeployLive {
+		release()
+		return WakeResult{AtCapacity: true}, nil
+	}
+
+	placement, err := e.choosePlacementLocked(ctx, Request{
+		AppID: appID, Plan: acct.Plan,
+		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
+	})
+	if err != nil {
+		release()
+		return WakeResult{}, err
+	}
+
+	wakeUUID, err := uuid.NewV7()
+	if err != nil {
+		wakeUUID = uuid.New()
+		if e.ops != nil {
+			e.ops.WakeIDV4Fallback().Inc()
+		}
+		e.log.Warn("floor admit: uuid.NewV7 failed, fell back to v4",
+			"app", appID, "deployment", deploymentID, "err", err)
+	}
+	wakeID := wakeUUID.String()
+
+	ins, err := e.store.CreateInstance(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID)
+	if err != nil {
+		release()
+		return WakeResult{}, fmt.Errorf("sched: floor admit: create instance: %w", err)
+	}
+	e.emitInstanceChanged(ctx, ins.ID, appID, state.StateColdBooting, wakeID)
+
+	if err := e.ledger.Admit(Request{
+		Instance: ins.ID, AppID: appID, DeploymentID: deploymentID, Plan: acct.Plan,
+		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
+		NodeID:        placement.NodeID,
+		NodeCeilingMB: placement.CeilingMB,
+		VCPUBudget:    placement.VCPUBudget,
+	}); err != nil {
+		_ = e.store.DeleteInstance(ctx, ins.ID)
+		e.emitInstanceChanged(ctx, ins.ID, appID, state.StateFailed, wakeID)
+		if liftCapacityToResult {
+			var prob *api.Problem
+			if errors.As(err, &prob) {
+				return WakeResult{AtCapacity: true}, nil
+			}
+		}
+		release()
+		return WakeResult{}, err
+	}
+
+	release()
+	return WakeResult{InstanceID: ins.ID}, nil
+}
+
 // admitAndDispatch is the shared Phase 2–4 body used by both Wake and
 // AdmitInstance. It takes the per-app lock once for Phase 2, drops it
 // across the slow vmmd RPC (Phase 3), and re-acquires for the
@@ -930,7 +1038,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	e.emitInstanceChanged(ctx, ins.ID, appID, initState, wakeID)
 
 	if err := e.ledger.Admit(Request{
-		Instance: ins.ID, AppID: appID, Plan: acct.Plan,
+		Instance: ins.ID, AppID: appID, DeploymentID: dep.ID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
@@ -2315,7 +2423,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	e.emitInstanceChanged(ctx, ins.ID, appID, state.StateColdBooting, primeWakeID)
 
 	if err := e.ledger.Admit(Request{
-		Instance: ins.ID, AppID: appID, Plan: acct.Plan,
+		Instance: ins.ID, AppID: appID, DeploymentID: deploymentID, Plan: acct.Plan,
 		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
 		NodeID:        placement.NodeID,
 		NodeCeilingMB: placement.CeilingMB,
@@ -3505,19 +3613,24 @@ func (e *Engine) isOnScaleOutCooldown(app *state.App, concurrency int) bool {
 	return time.Since(*app.LastScaleOutAt) < cooldown
 }
 
-// atMinFloorWithNoSignal (PR-C, issue #462) returns true when the
-// customer has configured ScalingPolicy.MinInstances > 0 AND the
-// live concurrency has reached that floor. The "no signal" suffix
-// captures the customer-facing semantic: an idle wake (no inflight
-// reading) cannot push concurrency below the floor — the
-// dashboard sees this as a no-op scale-out attempt.
+// atMinFloorWithNoSignal (PR-C, issue #462 / issue #557 ADR-071)
+// returns true when the customer has opted into floor enforcement
+// via ScalingPolicy.MinInstances (jsonb) AND the live concurrency
+// has reached that floor. The "no signal" suffix captures the
+// customer-facing semantic: a no-inflight-reading wake cannot push
+// concurrency above the floor — the dashboard sees this as a no-op
+// scale-out attempt.
+//
+// This gate does NOT read the legacy column (apps.min_instances).
+// The legacy column is a reaper-side concern (don't park below
+// the floor) plus a billing concern (ADR-060 floor-billed from t=0);
+// the proactive wake direction is owned by pkg/sched/floor
+// (ADR-071). Mixing the two here would block legitimate request-
+// driven wakes on the floor, regressing the §4.3 burst semantics.
 //
 // When ScalingPolicy is nil OR MinInstances == 0, the customer has
 // not opted into floor enforcement, so the branch does NOT fire —
-// every existing wake proceeds to the ledger. PR-D closes the
-// worker-class bypass closure and adds an explicit wake-path gate
-// for worker-class apps (the targets trigger currently no-ops for
-// them because MaxInflightForApp returns (0, false)).
+// every existing wake proceeds to the ledger.
 func (e *Engine) atMinFloorWithNoSignal(app *state.App, concurrency int) bool {
 	if app.ScalingPolicy == nil {
 		return false

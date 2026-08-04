@@ -1664,16 +1664,37 @@ func TestDeploymentResponse_RoundTrip(t *testing.T) {
 func TestInstanceResponse_TimestampsCovered(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	ins := state.Instance{ID: "i1", AppID: "a1", DeploymentID: "d1", State: "running"}
-	r := instanceResponse(ins)
+	r := instanceResponse(ins, 0)
 	if r.StartedAt != "" || r.LastRequestAt != "" || r.ParkedAt != "" {
 		t.Errorf("zero-time should produce empty strings: %+v", r)
 	}
 	ins.StartedAt = now
 	ins.LastRequestAt = now
 	ins.ParkedAt = now
-	r = instanceResponse(ins)
+	r = instanceResponse(ins, 2)
 	if r.StartedAt == "" || r.LastRequestAt == "" || r.ParkedAt == "" {
 		t.Errorf("populated timestamps should serialize: %+v", r)
+	}
+}
+
+// TestInstanceResponse_MinInstancesTargetOmittedWhenZero pins the
+// issue #557 / ADR-071 wire contract: min_instances_target uses
+// `omitempty` so customers who never opted in see no field — the
+// absence is the same as 0. The active-path branches (1/3/10 by
+// plan) carry the value through byte-for-byte.
+func TestInstanceResponse_MinInstancesTargetOmittedWhenZero(t *testing.T) {
+	zero := instanceResponse(state.Instance{ID: "i1", AppID: "a1"}, 0)
+	if zero.MinInstancesTarget != 0 {
+		t.Errorf("zero MinInstancesTarget should be 0, got %d", zero.MinInstancesTarget)
+	}
+	// `omitempty` on an int field with value 0 omits from JSON.
+	// The dto-level contract is sufficient; the per-byte assertion
+	// is enforced by `make spec-check` on the openapi.yaml.
+	for _, v := range []int{1, 2, 3, 5, 10} {
+		got := instanceResponse(state.Instance{ID: "i1", AppID: "a1"}, v)
+		if got.MinInstancesTarget != v {
+			t.Errorf("MinInstancesTarget = %d, want %d", got.MinInstancesTarget, v)
+		}
 	}
 }
 

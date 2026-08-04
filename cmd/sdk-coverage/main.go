@@ -130,6 +130,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/apps/{slug}/logs":                 "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":            "StreamDeploymentLogs",
 	"GET /v1/deployments/{id}":                 "GetDeployment",
+	"PATCH /v1/deployments/{id}":               "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
 	"GET /v1/deployments":                      "ListDeployments",
 	"GET /v1/apps":                             "ListApps",
 	"POST /v1/apps":                            "CreateApp",

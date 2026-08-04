@@ -363,9 +363,37 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 		// "no floor" is preferable to "floor without live
 		// rows" — partial floor state is more confusing to
 		// the customer than a missed minute.
-		policy := state.ScalingPolicyOrDefault(app.ScalingPolicy)
-		if policy.MinInstances > 0 && liveCount < policy.MinInstances {
-			gap := policy.MinInstances - liveCount
+		// ADR-071 §Decision 2: read the effective floor (max of legacy
+		// column + jsonb ScalingPolicy) so a bare SetAppMinInstances
+		// PATCH — which only writes the legacy column — is billed
+		// correctly. Pre-#557 this read policy.MinInstances only, so a
+		// customer who configured via the legacy PATCH got a warm
+		// floor they were never billed for.
+		//
+		// Issue #557 closure / ADR-072 §Decision 2: the per-deployment
+		// axis is layered as max(app, deployment). The deployment
+		// contribution is read from the instance row's deployment_id
+		// (already populated in pgstore.CreateInstance); legacy rows
+		// with empty deployment_id (test seams only) fall through to
+		// the per-app floor alone.
+		floor := app.EffectiveMinInstances()
+		for _, ins := range ins {
+			if !state.State(ins.State).CountsForRAM() {
+				continue
+			}
+			if ins.DeploymentID == "" {
+				continue
+			}
+			dep, err := s.store.DeploymentByID(ctx, ins.DeploymentID)
+			if err != nil {
+				continue
+			}
+			if dFloor := dep.EffectiveMinInstances(); dFloor > floor {
+				floor = dFloor
+			}
+		}
+		if floor > 0 && liveCount < floor {
+			gap := floor - liveCount
 			billable := api.BillableRAMMB(app.RAMMB)
 			floorTotal := int64(gap) * MBSecondsPerMinute(billable)
 			perRow := floorTotal / int64(gap)

@@ -418,6 +418,18 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id, nil, &out)
 }
 
+// PatchDeployment sets the per-deployment cold-wake floor override
+// (issue #557 closure / ADR-072). MinInstances is the only mutable
+// field on a deployment post-create — image / digest / overrides /
+// sidecars stay immutable (a new deployment is the canonical way to
+// change them). Pass MinInstances=0 to inherit from the parent app's
+// floor; a positive value is the deployment's own floor. The handler
+// validates against the parent app's plan MaxMinInstances cap.
+func (c *Client) PatchDeployment(ctx context.Context, id string, req UpdateDeploymentRequest) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "PATCH", "/v1/deployments/"+id, req, &out)
+}
+
 // GetBuildsIdProvenance returns the ADR-038 build_provenance row for
 // a build id. Backs the `faas build provenance <id>` CLI command.
 // The backend surfaces a missing row as a 404 with code

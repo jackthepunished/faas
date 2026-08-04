@@ -171,6 +171,60 @@ export class DeploymentsService {
     });
   }
   /**
+   * Set the per-deployment cold-wake floor.
+   * Update the deployment's min_instances (issue #557 closure /
+   * ADR-072). The only mutable field on a deployment post-create;
+   * image / digest / overrides / sidecars stay immutable (a new
+   * deployment is the canonical way to change them). Pass
+   * min_instances=0 to inherit from the parent app's floor.
+   * Validated against the parent app's plan MaxMinInstances cap.
+   *
+   * @returns DeploymentResponse The updated deployment.
+   * @throws ApiError
+   */
+  public static updateDeploymentMinInstances({
+    id,
+    requestBody,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+    requestBody: {
+      /**
+       * Per-deployment cold-wake floor override. 0 = inherit from parent app.
+       */
+      min_instances: number;
+    },
+  }): CancelablePromise<DeploymentResponse> {
+    return __request(OpenAPI, {
+      method: 'PATCH',
+      url: '/v1/deployments/{id}',
+      path: {
+        'id': id,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `\`400 Bad Request\` — request body failed JSON decode or
+        \`min_instances\` was outside the inclusive \`[0, plan_cap]\`
+        range. Stable code \`min_instances_invalid\`.
+        `,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        422: `\`422 Unprocessable Entity\` — request was syntactically valid
+        but the parent app's plan refuses the override (e.g. a
+        Free app PATCHing \`min_instances=1\`). Stable code
+        \`plan_min_instances_not_allowed\`.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
    * Stream build logs (SSE).
    * Server-Sent Events stream of build logs. `follow=1` holds the
    * connection open until the build completes.

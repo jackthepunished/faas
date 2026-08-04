@@ -724,6 +724,21 @@ type DeploymentResponse struct {
 	// OverrideHealthcheck is the readiness-probe override
 	// verbatim. Persisted; the actual HTTP probe is a follow-up.
 	OverrideHealthcheck *DeploymentHealthcheck `json:"override_healthcheck,omitempty"`
+	// MinInstances is the per-deployment cold-wake floor override
+	// (issue #557 closure / ADR-072). 0 = "inherit from parent
+	// app" (the post-migration default); a positive value is the
+	// deployment's own floor. Effective per-instance floor =
+	// max(app.EffectiveMinInstances(), d.EffectiveMinInstances()).
+	MinInstances int `json:"min_instances"`
+}
+
+// UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
+// (issue #557 closure / ADR-072). MinInstances is the only mutable
+// field on a deployment — the image / digest / overrides / sidecars
+// are immutable post-create (a new deployment is the canonical way
+// to change them).
+type UpdateDeploymentRequest struct {
+	MinInstances *int `json:"min_instances"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's
@@ -899,6 +914,15 @@ type InstanceResponse struct {
 	// the app against gateway logs and slog entries (which also
 	// carry this field).
 	WakeID string `json:"wake_id,omitempty"`
+	// MinInstancesTarget (issue #557 / ADR-071) is the parent app's
+	// effective min_instances at the time this instance was admitted.
+	// Populated by apid's list-instances handler via
+	// state.App.EffectiveMinInstances() (max of apps.min_instances
+	// + ScalingPolicy.MinInstances). Zero is omitted — it means
+	// "customer never opted into a floor". A pointer would surface
+	// the difference between 0 and unset; the JSON contract uses
+	// omitempty so absent and 0 are indistinguishable to clients.
+	MinInstancesTarget int `json:"min_instances_target,omitempty"`
 }
 
 // ListInstancesResponse is the page shape for GET /v1/instances

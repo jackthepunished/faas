@@ -3015,8 +3015,9 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
 		                          sidecars,
-		                          status)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending')
+		                          status,
+		                          min_instances)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17)
 		 returning `+deploymentSelectColumns,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3024,7 +3025,8 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		d.OverrideEntrypoint, d.OverrideCmd,
 		nullJSONRaw(d.OverrideEnv), nullJSONRaw(d.OverrideEnvSecrets),
 		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck),
-		notNullEmptyJSONRaw(d.Sidecars))
+		notNullEmptyJSONRaw(d.Sidecars),
+		d.MinInstances)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -3062,6 +3064,114 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 		 from deployments where app_id = $1 and status = 'superseded'
 		 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
+}
+
+// ListAllDeployments returns every non-deleted deployment (parent
+// app is not 'deleted'). Issue #557 closure / ADR-072 — the floor
+// reconciler's wake sweep walks this list when no owner-node sharding
+// is configured (the one-box posture). The single-box posture
+// reads it; multi-box reads ListDeploymentsByNodeID.
+//
+// The filter on apps.status excludes deployments whose parent app
+// has been soft-deleted (status='deleted'). The deployment rows
+// themselves do not carry a `deleted` flag — the deployment is
+// treated as inert once its parent app is gone. The JOIN through
+// apps uses the apps_pkey index (primary key) so the planner
+// resolves it as a nested-loop with an inner index scan per
+// deployment row. At v1 scale (O(deploy rate × app lifetime)
+// per the ListDeploymentsForApp comment) this stays sub-10ms.
+func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+deploymentSelectColumns+`
+		   from deployments d
+		   join apps a on a.id = d.app_id
+		  where a.status <> 'deleted'
+		  order by d.created_at desc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
+// ListDeploymentsByNodeID returns every deployment whose parent
+// app's owner_node is the given compute_nodes.id. Phase 2 / Gate A
+// / issue #557 closure — the floor trigger's owner-shard walk.
+// Mirrors ListAppsByNodeID and ListOwnedCronsByNodeID. The planner
+// hits apps_node_id_idx first and then does a nested-loop on
+// deployments.app_id via the deployments_app_id_idx index (added in
+// migration 00007). At v1 scale (one box, ~100 apps × ~10 deploys)
+// the plan stays a single index scan + nested loop, sub-5ms.
+func (s *PgStore) ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+deploymentSelectColumns+`
+		   from deployments d
+		   join apps a on a.id = d.app_id
+		  where a.node_id = $1
+		    and a.status <> 'deleted'
+		  order by d.created_at desc`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
+// ConcurrencyForDeployment returns the live-instance count for a
+// (app, deployment) pair. Used by the floor trigger's per-deployment
+// floor arithmetic and the reaper's per-deployment idle floor
+// check. The three live states (RUNNING, WAKING, COLD_BOOTING) match
+// pkg/state/machine.go CountsForConcurrency. PARKING / PARKED /
+// STOPPED do not count (they're shutting down or idle).
+//
+// Backed by the partial index `instances_app_deployment_idx`
+// (migration 00132) which restricts the index to the three live
+// states. A pre-00132 deploy has the index in place but the
+// instances.deployment_id column may be NULL on legacy rows — the
+// predicate `deployment_id = $2` excludes those rows from the
+// match, which under-counts but is safe (the trigger floors on
+// max(), so under-count means the trigger wakes one extra — the
+// engine's NodeLedger.Admit remains the absolute backstop).
+func (s *PgStore) ConcurrencyForDeployment(ctx context.Context, appID, deploymentID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		select count(*) from instances
+		 where app_id = $1
+		   and deployment_id = $2
+		   and state in ('RUNNING', 'WAKING', 'COLD_BOOTING')
+	`, appID, deploymentID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// UpdateDeploymentMinInstances overwrites deployments.min_instances.
+// Issue #557 closure / ADR-072 — the PATCH route at
+// /v1/deployments/{id} writes through this method. Returns the
+// fresh Deployment row (via the canonical scanDeployment) so the
+// handler can build the response without a second round-trip.
+//
+// The caller (apid) validates the value against the parent app's
+// plan ceiling (api.Plan.MaxMinInstances) before reaching this
+// method. The DB-level CHECK constraint (migration 00131) is the
+// belt-and-suspenders bound.
+func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, min int) (Deployment, error) {
+	row := s.pool.QueryRow(ctx, `
+		update deployments set min_instances = $2
+		 where id = $1
+		 returning `+deploymentSelectColumns, id, min)
+	d, err := scanDeployment(row)
+	if err != nil {
+		// pgx returns ErrNoRows when the UPDATE matches zero rows;
+		// translate to the store's canonical not-found error so the
+		// handler emits RFC 7807 not_found.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, err
+	}
+	return d, nil
 }
 
 // ListDeploymentsForApp returns deployments for an app, ordered DESC by
@@ -8420,7 +8530,8 @@ const deploymentSelectColumns = `
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
-	coalesce(sidecars, '[]'::jsonb)`
+	coalesce(sidecars, '[]'::jsonb),
+	min_instances`
 
 // deploymentSelectColumnsWithRootfs is the variant used by read paths
 // that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
@@ -8441,7 +8552,8 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
-	coalesce(sidecars, '[]'::jsonb)`
+	coalesce(sidecars, '[]'::jsonb),
+	min_instances`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -8464,7 +8576,8 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.override_cmd, ARRAY[]::text[]),
 	d.override_env, d.override_env_secrets,
 	coalesce(d.override_port, 0), d.override_healthcheck,
-	coalesce(d.sidecars, '[]'::jsonb)`
+	coalesce(d.sidecars, '[]'::jsonb),
+	d.min_instances`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -8483,7 +8596,7 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.Sidecars); err != nil {
+		&d.Sidecars, &d.MinInstances); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
@@ -8510,7 +8623,7 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.Sidecars); err != nil {
+		&d.Sidecars, &d.MinInstances); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
@@ -8532,7 +8645,7 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 			&d.OverrideEntrypoint, &d.OverrideCmd,
 			&d.OverrideEnv, &d.OverrideEnvSecrets,
 			&d.OverridePort, &d.OverrideHealthcheck,
-			&d.Sidecars); err != nil {
+			&d.Sidecars, &d.MinInstances); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)

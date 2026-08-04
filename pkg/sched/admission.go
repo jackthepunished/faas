@@ -34,10 +34,11 @@ import (
 // The entries map preserves the legacy O(1) Release(instance) lookup
 // because each reservation remembers its nodeID.
 type NodeLedger struct {
-	mu       sync.Mutex
-	resident map[string]*nodeReservation // node_id -> accounting (per-node ceiling check)
-	perApp   map[string]int              // app_id -> instances counting toward concurrency (global, §6.2-1)
-	entries  map[string]*reservation     // instance_id -> reservation (cross-node lookup for Release)
+	mu               sync.Mutex
+	resident         map[string]*nodeReservation // node_id -> accounting (per-node ceiling check)
+	perApp           map[string]int              // app_id -> instances counting toward concurrency (global, §6.2-1)
+	perAppDeployment map[string]int              // app_id|"\x00"|deployment_id -> per-deployment concurrency (ADR-072, issue #557 closure)
+	entries          map[string]*reservation     // instance_id -> reservation (cross-node lookup for Release)
 }
 
 type nodeReservation struct {
@@ -52,11 +53,12 @@ type nodeReservation struct {
 // the box-wide counter in that case so the migration is non-breaking
 // for tests that don't plumb node IDs.
 type reservation struct {
-	appID       string
-	nodeID      string // empty = legacy box-wide accounting (test seams)
-	admissionMB int    // ram_mb + PerVMOverheadMB
-	vcpu        int
-	countsConc  bool // still in {WAKING,COLD_BOOTING,RUNNING}
+	appID        string
+	deploymentID string // empty = legacy pre-#557 reservations (test seams); populated post-#557 via Admit's DeploymentID field
+	nodeID       string // empty = legacy box-wide accounting (test seams)
+	admissionMB  int    // ram_mb + PerVMOverheadMB
+	vcpu         int
+	countsConc   bool // still in {WAKING,COLD_BOOTING,RUNNING}
 }
 
 // NewNodeLedger returns an empty per-node ledger. Backwards-compat
@@ -64,9 +66,10 @@ type reservation struct {
 // NewLedger everywhere) compile unchanged — the rename is gradual.
 func NewNodeLedger() *NodeLedger {
 	return &NodeLedger{
-		resident: map[string]*nodeReservation{},
-		perApp:   map[string]int{},
-		entries:  map[string]*reservation{},
+		resident:         map[string]*nodeReservation{},
+		perApp:           map[string]int{},
+		perAppDeployment: map[string]int{},
+		entries:          map[string]*reservation{},
 	}
 }
 
@@ -77,8 +80,16 @@ func NewLedger() *NodeLedger { return NewNodeLedger() }
 
 // Request is an admission request for one instance (a wake or a build).
 type Request struct {
-	Instance       string
-	AppID          string
+	Instance string
+	AppID    string
+	// DeploymentID is the target deployment for the wake (ADR-072 /
+	// issue #557 closure). The Engine resolves it from the wake
+	// target before calling Admit — the gateway passes the latest
+	// ready deployment id, the floor trigger passes the per-sweep
+	// deployment id. Empty is the legacy single-box posture
+	// (test seams + pre-#557 reservations); the per-deployment
+	// concurrency counter is only incremented when this is non-empty.
+	DeploymentID   string
 	Plan           api.Plan
 	RAMMB          int // the app's ram_mb (already validated ≤ plan cap)
 	VCPU           int // vcpus for this instance
@@ -197,12 +208,15 @@ func (l *NodeLedger) Admit(r Request) error {
 	}
 
 	l.entries[r.Instance] = &reservation{
-		appID: r.AppID, nodeID: r.NodeID,
+		appID: r.AppID, deploymentID: r.DeploymentID, nodeID: r.NodeID,
 		admissionMB: r.admissionMB(), vcpu: r.VCPU, countsConc: true,
 	}
 	node.residentRAM += r.admissionMB()
 	node.usedVCPU += r.VCPU
 	l.perApp[r.AppID]++
+	if r.DeploymentID != "" {
+		l.perAppDeployment[r.AppID+"\x00"+r.DeploymentID]++
+	}
 	return nil
 }
 
@@ -253,6 +267,13 @@ func (l *NodeLedger) BeginSnapshot(instance string) {
 		e.countsConc = false
 		l.perApp[e.appID]--
 		l.cleanupApp(e.appID)
+		if e.deploymentID != "" {
+			key := e.appID + "\x00" + e.deploymentID
+			l.perAppDeployment[key]--
+			if l.perAppDeployment[key] <= 0 {
+				delete(l.perAppDeployment, key)
+			}
+		}
 	}
 }
 
@@ -284,6 +305,13 @@ func (l *NodeLedger) Release(instance string) {
 	if e.countsConc {
 		l.perApp[e.appID]--
 		l.cleanupApp(e.appID)
+		if e.deploymentID != "" {
+			key := e.appID + "\x00" + e.deploymentID
+			l.perAppDeployment[key]--
+			if l.perAppDeployment[key] <= 0 {
+				delete(l.perAppDeployment, key)
+			}
+		}
 	}
 }
 
@@ -361,6 +389,25 @@ func (l *NodeLedger) Concurrency(appID string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.perApp[appID]
+}
+
+// ConcurrencyForDeployment returns the per-(app, deployment) live
+// instance count that the ledger tracks (ADR-072, issue #557 closure).
+// The floor trigger reads this for per-deployment floor arithmetic;
+// the reaper reads the same path. Returns 0 when no instance of the
+// (app, deployment) pair is currently admitted (or the deployment
+// id was empty on the Admit request — the legacy test seam).
+//
+// Per-deployment counter keys are `appID + "\x00" + deploymentID`.
+// The "\x00" separator is invalid in both Postgres UUIDs and our
+// internal id namespace, so a key collision is impossible.
+func (l *NodeLedger) ConcurrencyForDeployment(appID, deploymentID string) int {
+	if appID == "" || deploymentID == "" {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.perAppDeployment[appID+"\x00"+deploymentID]
 }
 
 // UsedVCPU returns reserved vCPU slots (global sum across nodes).

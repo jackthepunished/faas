@@ -464,6 +464,25 @@ type OpsMetrics struct {
 	// outcome-pre-instantiation, same app cardinality bound (apps
 	// with autoscale configured OR apps with min_instances set).
 	scaleDownDecisions *prometheus.CounterVec
+	// floorReconcileDecisions: per-app proactive min-instances floor
+	// decisions (issue #557 / ADR-071 §Decision 1). Counter labelled
+	// by app_id and outcome ∈ {admit, floor_met, disabled,
+	// at_capacity, ram_ceiling, cooldown_held, error, backoff_held}.
+	// App cardinality is bounded by Hobby+ apps with
+	// min_instances > 0; outcomes pre-instantiated so the series
+	// surface in /metrics from boot. Same precedent as
+	// scaleUpDecisions.
+	floorReconcileDecisions *prometheus.CounterVec
+	// floorReconcileErrors: per-app floor trigger error counter.
+	// Labelled by app_id and kind ∈ {admit_denied, admit_error}.
+	// Alert on `rate(...) > 0 for 5m` — sustained errors mean the
+	// customer's floor isn't being satisfied.
+	floorReconcileErrors *prometheus.CounterVec
+	// floorInstancesAdmitted: global counter, incremented once per
+	// successful proactive floor wake. Used as the "is the floor
+	// working" baseline; sustained-zero on a tier with Hobby+
+	// accounts is a quiet alarm (the dashboard "warm floor" panel).
+	floorInstancesAdmitted prometheus.Counter
 	// scaleUpAdmitRPS: per-instance RPS at the moment the trigger
 	// admitted a new instance. Sized to the per-instance RPS target
 	// range (1–1000); p95/p99 over this histogram is the spec §12
@@ -1077,6 +1096,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_scale_down_decisions_total",
 		Help: "Per-app aggressive-reaper decisions (issue #171). outcome ∈ {park, keep, min_floor_already}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
+	// Issue #557 / ADR-071 §Decision 1: proactive min-instances
+	// floor reconciler observability. Closed outcome set
+	// ({admit, floor_met, disabled, at_capacity, ram_ceiling,
+	// cooldown_held, error, backoff_held}); pre-instantiated below
+	// so the rows surface in /metrics from boot.
+	floorReconcileDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_floor_reconcile_decisions_total",
+		Help: "Per-app proactive min-instances floor reconciler decisions (issue #557 / ADR-071). outcome ∈ {admit, floor_met, disabled, at_capacity, ram_ceiling, cooldown_held, error, backoff_held}; app label is the apps.id.",
+	}, []string{"app", "outcome"})
+	// Issue #557 / ADR-071 §Decision 4: per-app error counter. Kind
+	// ∈ {admit_denied, admit_error}; sustained rate > 0 means the
+	// customer's floor isn't being satisfied — alertable.
+	floorReconcileErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_floor_reconcile_errors_total",
+		Help: "Per-app proactive min-instances floor reconciler errors (issue #557 / ADR-071). kind ∈ {admit_denied, admit_error}; app label is the apps.id. Alert on rate > 0 for 5m — sustained errors mean the customer's floor isn't being satisfied.",
+	}, []string{"app", "kind"})
+	// Issue #557 / ADR-071 §Decision 1: global counter incremented
+	// once per successful proactive floor wake. Baseline for the
+	// "warm floor" dashboard panel.
+	floorInstancesAdmitted := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_floor_instances_admitted_total",
+		Help: "Total number of instances admitted by the proactive min-instances floor reconciler (issue #557 / ADR-071). Global counter; sustained-zero on a tier with Hobby+ accounts is a quiet alarm.",
+	})
 	sseClients := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_sse_clients",
 		Help: "Number of currently open /v1/events SSE connections (Move 3, M7.5 prep). The dashboard's per-page EventSource is one connection; the CLI's faas tail is another. Zero is the idle value.",
@@ -1585,6 +1627,19 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"park", "keep", "min_floor_already"} {
 		scaleDownDecisions.WithLabelValues("", outcome)
 	}
+	// Issue #557 / ADR-071 §Decision 1: pre-instantiate the eight
+	// closed outcome values for the proactive floor reconciler so
+	// the rows surface in /metrics from boot. Same precedent as
+	// the scale-up / scale-down pre-instantiation loops.
+	for _, outcome := range []string{
+		"admit", "floor_met", "disabled", "at_capacity",
+		"ram_ceiling", "cooldown_held", "error", "backoff_held",
+	} {
+		floorReconcileDecisions.WithLabelValues("", outcome)
+	}
+	for _, kind := range []string{"admit_denied", "admit_error"} {
+		floorReconcileErrors.WithLabelValues("", kind)
+	}
 	// issue #279 (PR-B, CPU-hour visibility): pre-instantiate the
 	// empty (app, node) row so the help/TYPE surfaces in /metrics
 	// from boot. Same precedent as the scale-up / scale-down
@@ -1649,6 +1704,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		cpuStatsCollectDur:                 cpuStatsCollectDurLocal,
 		scaleUpDecisions:                   scaleUpDecisions,
 		scaleDownDecisions:                 scaleDownDecisions,
+		floorReconcileDecisions:            floorReconcileDecisions,
+		floorReconcileErrors:               floorReconcileErrors,
+		floorInstancesAdmitted:             floorInstancesAdmitted,
 		scaleUpAdmitRPS:                    scaleUpAdmitRPS,
 		sseClients:                         sseClients,
 		egressDeny:                         egressDeny,
@@ -2912,6 +2970,38 @@ func (m *OpsMetrics) ObserveScaleDown(app, outcome string) {
 		return
 	}
 	m.scaleDownDecisions.WithLabelValues(app, outcome).Inc()
+}
+
+// ObserveFloor records one proactive min-instances floor reconciler
+// decision (issue #557 / ADR-071 §Decision 1). One observation per
+// app per tick. outcome ∈ {admit, floor_met, disabled, at_capacity,
+// ram_ceiling, cooldown_held, error, backoff_held}. Safe on a nil
+// receiver so schedd unit tests without metrics keep working.
+func (m *OpsMetrics) ObserveFloor(app, outcome string) {
+	if m == nil {
+		return
+	}
+	m.floorReconcileDecisions.WithLabelValues(app, outcome).Inc()
+}
+
+// IncFloorReconcileError records one proactive floor reconcile error
+// (issue #557 / ADR-071 §Decision 4). kind ∈ {admit_denied,
+// admit_error}. Safe on a nil receiver.
+func (m *OpsMetrics) IncFloorReconcileError(app, kind string) {
+	if m == nil {
+		return
+	}
+	m.floorReconcileErrors.WithLabelValues(app, kind).Inc()
+}
+
+// IncFloorInstanceAdmitted increments the global "floor wake
+// succeeded" counter (issue #557 / ADR-071 §Decision 1). Safe on a
+// nil receiver.
+func (m *OpsMetrics) IncFloorInstanceAdmitted() {
+	if m == nil {
+		return
+	}
+	m.floorInstancesAdmitted.Inc()
 }
 
 // ObserveScaleUpAdmitRPS records the per-instance RPS at the moment

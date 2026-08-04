@@ -1753,6 +1753,76 @@ func (m *MemStore) ListAppsByNodeID(_ context.Context, nodeID string) ([]App, er
 	return out, nil
 }
 
+// ListAllDeployments mirrors PgStore.ListAllDeployments. Issue #557
+// closure / ADR-072 — the floor reconciler's wake sweep calls this
+// in unit tests + the e2e harness's fake schedd. Excludes deployments
+// whose parent app is soft-deleted (the deployment has no
+// `deleted` flag of its own).
+func (m *MemStore) ListAllDeployments(_ context.Context) ([]Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Deployment
+	for _, d := range m.deployments {
+		if a, ok := m.apps[d.AppID]; !ok || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ListDeploymentsByNodeID mirrors PgStore.ListDeploymentsByNodeID.
+// Same JOIN-through-apps predicate as the SQL version.
+func (m *MemStore) ListDeploymentsByNodeID(_ context.Context, nodeID string) ([]Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Deployment
+	for _, d := range m.deployments {
+		a, ok := m.apps[d.AppID]
+		if !ok || a.NodeID != nodeID || a.Status == AppDeleted {
+			continue
+		}
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ConcurrencyForDeployment mirrors PgStore.ConcurrencyForDeployment.
+// Reads the in-memory instances slice with the same predicate the
+// SQL uses (state IN {'RUNNING','WAKING','COLD_BOOTING'}).
+func (m *MemStore) ConcurrencyForDeployment(_ context.Context, appID, deploymentID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, inst := range m.instances {
+		if inst.AppID != appID || inst.DeploymentID != deploymentID {
+			continue
+		}
+		switch inst.State {
+		case "RUNNING", "WAKING", "COLD_BOOTING":
+			n++
+		}
+	}
+	return n, nil
+}
+
+// UpdateDeploymentMinInstances mirrors PgStore.UpdateDeploymentMinInstances.
+// The handler validates against the parent app's plan ceiling; the
+// store writes unconditionally and returns ErrNotFound on a missing row.
+func (m *MemStore) UpdateDeploymentMinInstances(_ context.Context, id string, min int) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	d.MinInstances = min
+	m.deployments[id] = d
+	return d, nil
+}
+
 // ListInstancesByNodeID mirrors pkg/state/pgstore.go:875. Same
 // in-process predicate; for the in-memory store this is a linear
 // scan over m.instances — fine for tests + the e2e harness.
