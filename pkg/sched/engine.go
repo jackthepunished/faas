@@ -2880,12 +2880,13 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	// boot produced (ins.WakeID), per ADR-035 the audit join key.
 	if e.events != nil {
 		e.events.Emit(ctx, events.ParkStarted{
-			EmitAt:     now.UTC(),
-			WakeID:     ins.WakeID,
-			AppID:      ins.AppID,
-			InstanceID: ins.ID,
-			NodeID:     ins.NodeID,
-			StartedAt:  now.UTC(),
+			EmitAt:       now.UTC(),
+			WakeID:       ins.WakeID,
+			AppID:        ins.AppID,
+			DeploymentID: ins.DeploymentID,
+			InstanceID:   ins.ID,
+			NodeID:       ins.NodeID,
+			StartedAt:    now.UTC(),
 		})
 	}
 
@@ -2930,14 +2931,15 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	// back to the upcoming wake.row's restore_path metadata.
 	if e.events != nil {
 		e.events.Emit(ctx, events.ParkCompleted{
-			EmitAt:      time.Now().UTC(),
-			WakeID:      ins.WakeID,
-			AppID:       ins.AppID,
-			InstanceID:  ins.ID,
-			NodeID:      ins.NodeID,
-			StartedAt:   now.UTC(),
-			CompletedAt: time.Now().UTC(),
-			SnapshotID:  storageKey,
+			EmitAt:       time.Now().UTC(),
+			WakeID:       ins.WakeID,
+			AppID:        ins.AppID,
+			DeploymentID: ins.DeploymentID,
+			InstanceID:   ins.ID,
+			NodeID:       ins.NodeID,
+			StartedAt:    now.UTC(),
+			CompletedAt:  time.Now().UTC(),
+			SnapshotID:   storageKey,
 		})
 	}
 	// Init-tier capture is the "cold" snapshot the next wake falls back

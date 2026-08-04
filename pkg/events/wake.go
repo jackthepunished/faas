@@ -353,45 +353,62 @@ func (e ProxyFirstByte) Payload() map[string]any {
 
 // ParkStarted — schedd transitioning the instance to
 // SNAPSHOTTING. The dual WakeParkCompleted row carries the snapshot_id.
+//
+// DeploymentID (issue #555 PR-6) is the deployment_id the parked
+// instance belongs to. The DeploymentCounterWatcher
+// (pkg/sched/deployment_counter_watcher.go) reads the deployment_id
+// off the in-process event payload and resets the per-deployment
+// sampling window when the last live instance parks.
 type ParkStarted struct {
-	EmitAt     time.Time
-	WakeID     string
-	AppID      string
-	InstanceID string
-	NodeID     string
-	StartedAt  time.Time
+	EmitAt       time.Time
+	WakeID       string
+	AppID        string
+	DeploymentID string
+	InstanceID   string
+	NodeID       string
+	StartedAt    time.Time
 }
 
 func (e ParkStarted) Kind() string     { return WakeParkStarted }
 func (e ParkStarted) At() time.Time    { return e.EmitAt }
 func (e ParkStarted) Subject() *string { return nil }
 func (e ParkStarted) Payload() map[string]any {
-	return map[string]any{
+	p := map[string]any{
 		"wake_id":     e.WakeID,
 		"app_id":      e.AppID,
 		"instance_id": e.InstanceID,
 		"node_id":     e.NodeID,
 		"started_at":  e.StartedAt.UTC(),
 	}
+	if e.DeploymentID != "" {
+		p["deployment_id"] = e.DeploymentID
+	}
+	return p
 }
 
 // ParkCompleted — snapshot succeeded; instance is PARKED.
+//
+// DeploymentID (issue #555 PR-6) is the deployment_id the parked
+// instance belongs to. Watched by the DeploymentCounterWatcher for
+// the per-deployment 100% sampling window reset (issue #555
+// acceptance #5).
 type ParkCompleted struct {
-	EmitAt      time.Time
-	WakeID      string
-	AppID       string
-	InstanceID  string
-	NodeID      string
-	StartedAt   time.Time
-	CompletedAt time.Time
-	SnapshotID  string
+	EmitAt       time.Time
+	WakeID       string
+	AppID        string
+	DeploymentID string
+	InstanceID   string
+	NodeID       string
+	StartedAt    time.Time
+	CompletedAt  time.Time
+	SnapshotID   string
 }
 
 func (e ParkCompleted) Kind() string     { return WakeParkCompleted }
 func (e ParkCompleted) At() time.Time    { return e.EmitAt }
 func (e ParkCompleted) Subject() *string { return nil }
 func (e ParkCompleted) Payload() map[string]any {
-	return map[string]any{
+	p := map[string]any{
 		"wake_id":      e.WakeID,
 		"app_id":       e.AppID,
 		"instance_id":  e.InstanceID,
@@ -400,6 +417,10 @@ func (e ParkCompleted) Payload() map[string]any {
 		"completed_at": e.CompletedAt.UTC(),
 		"snapshot_id":  e.SnapshotID,
 	}
+	if e.DeploymentID != "" {
+		p["deployment_id"] = e.DeploymentID
+	}
+	return p
 }
 
 // Stalled — watchdog path. The existing `watchdog_timeout` audit

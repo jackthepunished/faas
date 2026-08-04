@@ -4125,3 +4125,81 @@ func TestMemStore_StampAppScaleIn(t *testing.T) {
 		t.Errorf("StampAppScaleIn(missing) = %v, want ErrNotFound", err)
 	}
 }
+
+// TestMem_CountLiveInstancesByDeployment mirrors the pgstore test
+// for the in-memory Store (issue #555 PR-6). Counts every instance
+// in {waking, cold_booting, running} for the given deployment_id;
+// instances in PARKED / STOPPED / SNAPSHOTTING are excluded;
+// unknown deployment_ids return 0.
+func TestMem_CountLiveInstancesByDeployment(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	acc, err := m.CreateAccount(ctx, "count-live@x.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: "count-live", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 2, IdleTimeoutS: 60,
+		Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	depA, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:a"})
+	if err != nil {
+		t.Fatalf("CreateDeployment depA: %v", err)
+	}
+	if err := m.MarkDeploymentLive(ctx, depA.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive depA: %v", err)
+	}
+	depB, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:b"})
+	if err != nil {
+		t.Fatalf("CreateDeployment depB: %v", err)
+	}
+
+	nodeID := "node-555"
+
+	mustCreate := func(depID, stateStr string) {
+		t.Helper()
+		if _, err := m.CreateInstance(ctx, app.ID, depID, stateStr, 256, nodeID, ""); err != nil {
+			t.Fatalf("CreateInstance %s/%s: %v", depID, stateStr, err)
+		}
+	}
+
+	// dep-A: 1 waking + 1 cold_booting + 1 running = 3 live.
+	mustCreate(depA.ID, "waking")
+	mustCreate(depA.ID, "cold_booting")
+	mustCreate(depA.ID, "running")
+	// dep-A: 1 parked + 1 snapshotting = NOT counted.
+	mustCreate(depA.ID, "parked")
+	mustCreate(depA.ID, "snapshotting")
+	// dep-B: 1 running = NOT counted under dep-A.
+	mustCreate(depB.ID, "running")
+
+	got, err := m.CountLiveInstancesByDeployment(ctx, depA.ID)
+	if err != nil {
+		t.Fatalf("CountLiveInstancesByDeployment: %v", err)
+	}
+	if got != 3 {
+		t.Errorf("dep-A count = %d, want 3 (waking + cold_booting + running)", got)
+	}
+
+	gotUnknown, err := m.CountLiveInstancesByDeployment(ctx, "no-such-deployment")
+	if err != nil {
+		t.Fatalf("unknown dep: %v", err)
+	}
+	if gotUnknown != 0 {
+		t.Errorf("unknown dep count = %d, want 0", gotUnknown)
+	}
+
+	gotEmpty, err := m.CountLiveInstancesByDeployment(ctx, "")
+	if err != nil {
+		t.Fatalf("empty dep: %v", err)
+	}
+	if gotEmpty != 0 {
+		t.Errorf("empty dep count = %d, want 0", gotEmpty)
+	}
+}

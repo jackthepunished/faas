@@ -2886,6 +2886,30 @@ func (m *MemStore) LiveDeployment(_ context.Context, appID string) (Deployment, 
 	return latest, nil
 }
 
+// CountLiveInstancesByDeployment mirrors PgStore.CountLiveInstancesByDeployment
+// for the in-memory test seam (issue #555 PR-6). The state filter
+// matches the SQL — {waking, cold_booting, running} — and the
+// string comparison uses lowercase state constants from
+// pkg/state/machine.go (StateWaking, StateColdBooting, StateRunning).
+func (m *MemStore) CountLiveInstancesByDeployment(_ context.Context, deploymentID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if deploymentID == "" {
+		return 0, nil
+	}
+	n := 0
+	for _, ins := range m.instances {
+		if ins.DeploymentID != deploymentID {
+			continue
+		}
+		switch State(ins.State) {
+		case StateWaking, StateColdBooting, StateRunning:
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *MemStore) LatestSupersededDeployment(_ context.Context, appID string) (Deployment, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

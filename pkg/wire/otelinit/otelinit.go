@@ -55,13 +55,14 @@ const envEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
 // envSamplingRate is the OTel-standard env var for the head sampler.
 // Issue #555 acceptance #5: 1 req/s default; first 100 requests of a
 // new deployment are 100% sampled (the per-deployment counter lives
-// in a sibling PR, not here — this PR lands the bare sampler).
+// in this PR — see sampler.go).
 const envSamplingRate = "OTEL_TRACES_SAMPLER_ARG"
 
 // defaultSamplingRate is the head sampler rate when OTEL_TRACES_SAMPLER_ARG
-// is unset. Issue #555 says 1 req/s by default — we model that as 1.0
-// ratio baseline; the per-deployment 100% sampling window is layered
-// on top in a follow-up PR.
+// is unset. The DeploymentAware wrapper (sampler.go) consults the
+// per-deployment counter BEFORE this ratio applies, so the effective
+// decision for the first 100 root spans of any deployment is
+// RecordAndSample regardless of this default.
 const defaultSamplingRate = 1.0
 
 // batchTimeout is the maximum time the BatchSpanProcessor holds a
@@ -69,10 +70,30 @@ const defaultSamplingRate = 1.0
 // so the shutdown flush does not stall the daemon drain.
 const batchTimeout = 2 * time.Second
 
-// ShutdownFunc is returned by Init. It is safe to call on a no-op
-// provider (returns nil). The func is bounded by ctx; an unbounded
-// shutdown can block forever if the OTLP collector is unresponsive.
+// ShutdownFunc is the func returned in Handle.Shutdown. It is safe to
+// call on a no-op provider (returns nil). The func is bounded by ctx;
+// an unbounded shutdown can block forever if the OTLP collector is
+// unresponsive.
 type ShutdownFunc func(ctx context.Context) error
+
+// Handle is the bundle of state Init returns to its caller. Most
+// daemons only need Shutdown; schedd additionally reads
+// DeploymentCounter so the DeploymentCounterWatcher (PR-6) can reset
+// the per-deployment 100% sampling window on the "last live instance
+// parked" transition (issue #555 acceptance #5).
+//
+// The DeploymentCounter is non-nil on BOTH the no-op path and the
+// OTLP-wired path — counter state is pure in-memory and the watcher
+// is independent of whether an exporter is configured.
+type Handle struct {
+	// Shutdown flushes the batch processor and shuts down the
+	// exporter. No-op on the no-OTLP-endpoint path.
+	Shutdown ShutdownFunc
+	// DeploymentCounter is the per-deployment 100% sampling window
+	// counter. Sampler and watcher consult / reset the same
+	// instance (see sampler.go and pkg/sched/deployment_counter_watcher.go).
+	DeploymentCounter *DeploymentCounter
+}
 
 // Config is the minimally-required set of fields to bootstrap a
 // daemon's OTel pipeline. The OTel SDK is otherwise self-configuring
@@ -83,20 +104,25 @@ type Config struct {
 	Name string
 	// Version is the daemon version (typically wire.Version, ldflags-overridable).
 	Version string
+	// WindowSize overrides the per-deployment 100% sampling window
+	// size. 0 (the default) maps to DefaultWindowSize (100, per
+	// issue #555 acceptance #5). The override exists so tests can
+	// run with a 3- or 5-span window.
+	WindowSize int
 }
 
-// Init wires up the OTel SDK per the config. Returns a shutdown that
-// flushes the batch processor and shuts down the exporter. The
-// shutdown is a no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset (the
-// noop provider path). Init is safe to call at most once per
-// daemon; subsequent calls panic via SetTracerProvider.
+// Init wires up the OTel SDK per the config. Returns a Handle whose
+// Shutdown func flushes the batch processor and shuts down the
+// exporter. The shutdown is a no-op when OTEL_EXPORTER_OTLP_ENDPOINT
+// is unset (the noop provider path). Init is safe to call at most
+// once per daemon; subsequent calls panic via SetTracerProvider.
 //
 // log is the daemon's correlation logger. It is used for one-time
 // boot diagnostics (which exporter was selected, endpoint status); it
 // is NOT attached to the OTel pipeline — slog stays separate from
 // the OTel SDK per CLAUDE.md conventions (slog is the log canonical,
 // OTel is the trace canonical).
-func Init(ctx context.Context, cfg Config, log *slog.Logger) (ShutdownFunc, error) {
+func Init(ctx context.Context, cfg Config, log *slog.Logger) (*Handle, error) {
 	if cfg.Name == "" {
 		return nil, errors.New("otelinit: Name is required")
 	}
@@ -120,14 +146,26 @@ func Init(ctx context.Context, cfg Config, log *slog.Logger) (ShutdownFunc, erro
 		propagation.Baggage{},
 	))
 
+	// The per-deployment counter is constructed on every Init — the
+	// watcher (PR-6) resets it on the "last live instance parked"
+	// transition. The counter is independent of the exporter
+	// configuration: a daemon without an OTLP endpoint still
+	// maintains the counter so the window semantics hold once the
+	// operator toggles the endpoint on.
+	counter := NewDeploymentCounter(cfg.WindowSize)
+
 	endpoint := os.Getenv(envEndpoint)
 	if endpoint == "" {
 		// No exporter configured. Install the SDK noop provider so
 		// call sites do not have to nil-check. The shutdown returned
-		// here is a no-op.
+		// here is a no-op. The counter is still constructed so the
+		// watcher can wire against it.
 		otel.SetTracerProvider(noop.NewTracerProvider())
 		log.Info("otelinit: no OTEL_EXPORTER_OTLP_ENDPOINT set; spans are no-op")
-		return func(context.Context) error { return nil }, nil
+		return &Handle{
+			Shutdown:          func(context.Context) error { return nil },
+			DeploymentCounter: counter,
+		}, nil
 	}
 
 	// OTLP/HTTP exporter. otlptracehttp.WithEndpoint expects
@@ -153,7 +191,14 @@ func Init(ctx context.Context, cfg Config, log *slog.Logger) (ShutdownFunc, erro
 			rate = parsed
 		}
 	}
-	sampler := sdktrace.ParentBased(sdktrace.TraceIDRatioBased(rate))
+	// Sampler chain: ParentBased(DeploymentAware(TraceIDRatioBased(rate))).
+	// ParentBased is the outer wrapper so child spans inherit the
+	// parent's SampledFlag (W3C parent-trace invariant). The
+	// DeploymentAware wrapper only sees root spans and either forces
+	// RecordAndSample inside the per-deployment window or delegates
+	// to TraceIDRatioBased (issue #555 acceptance #5).
+	root := sdktrace.TraceIDRatioBased(rate)
+	sampler := sdktrace.ParentBased(NewDeploymentAware(root, WithCounter(counter)))
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(client,
@@ -165,15 +210,18 @@ func Init(ctx context.Context, cfg Config, log *slog.Logger) (ShutdownFunc, erro
 	)
 	otel.SetTracerProvider(tp)
 	log.Info("otelinit: wired OTLP/HTTP exporter",
-		"endpoint", endpoint, "sampler", "parent_based_trace_id_ratio",
-		"sampler_arg", rate)
+		"endpoint", endpoint, "sampler", "parent_based_deployment_aware_trace_id_ratio",
+		"sampler_arg", rate, "window_size", counter.WindowSize())
 
-	return func(shutdownCtx context.Context) error {
-		// Outer timeout is the higher of (ctx deadline, 5s) so a
-		// long-running batch does not stall the daemon drain.
-		flushCtx, cancel := context.WithTimeout(shutdownCtx, 5*time.Second)
-		defer cancel()
-		return tp.Shutdown(flushCtx)
+	return &Handle{
+		Shutdown: func(shutdownCtx context.Context) error {
+			// Outer timeout is the higher of (ctx deadline, 5s) so a
+			// long-running batch does not stall the daemon drain.
+			flushCtx, cancel := context.WithTimeout(shutdownCtx, 5*time.Second)
+			defer cancel()
+			return tp.Shutdown(flushCtx)
+		},
+		DeploymentCounter: counter,
 	}, nil
 }
 

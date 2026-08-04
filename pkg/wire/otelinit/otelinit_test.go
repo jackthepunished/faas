@@ -49,15 +49,22 @@ func TestInit_NoEndpointIsNoOp(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 
 	var buf bytes.Buffer
-	shutdown, err := otelinit.Init(context.Background(), otelinit.Config{Name: "test-daemon", Version: "1.0.0"}, captureLogs(&buf))
+	h, err := otelinit.Init(context.Background(), otelinit.Config{Name: "test-daemon", Version: "1.0.0"}, captureLogs(&buf))
 	if err != nil {
 		t.Fatalf("Init: %v", err)
+	}
+
+	// The deployment counter is independent of the exporter
+	// configuration (issue #555 acceptance #5) — it must be
+	// non-nil on the no-op path so the watcher can wire against it.
+	if h.DeploymentCounter == nil {
+		t.Error("Handle.DeploymentCounter is nil on no-op path; want non-nil")
 	}
 
 	// Shutdown must not error and must not block.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := shutdown(ctx); err != nil {
+	if err := h.Shutdown(ctx); err != nil {
 		t.Errorf("shutdown: %v", err)
 	}
 
@@ -105,9 +112,12 @@ func TestInit_WithEndpoint_WiresProvider(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
 
 	var buf bytes.Buffer
-	shutdown, err := otelinit.Init(context.Background(), otelinit.Config{Name: "test-daemon", Version: "1.0.0"}, captureLogs(&buf))
+	h, err := otelinit.Init(context.Background(), otelinit.Config{Name: "test-daemon", Version: "1.0.0"}, captureLogs(&buf))
 	if err != nil {
 		t.Fatalf("Init: %v", err)
+	}
+	if h.DeploymentCounter == nil {
+		t.Error("Handle.DeploymentCounter is nil on OTLP path; want non-nil")
 	}
 
 	// Emit one span and force a flush.
@@ -118,7 +128,7 @@ func TestInit_WithEndpoint_WiresProvider(t *testing.T) {
 	// Shutdown flushes the batch.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := shutdown(ctx); err != nil {
+	if err := h.Shutdown(ctx); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
