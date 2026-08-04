@@ -95,14 +95,13 @@ var configPath = envOrGateway("FAAS_GATEWAYD_CONFIG", "/etc/faas/gatewayd.toml")
 // deployments are unaffected.
 var controlAddr = envOrGateway("FAAS_GATEWAY_CONTROL_LISTEN", "127.0.0.1:9090")
 
-// streamingEnabledFromEnv is the per-process opt-in for the
-// streaming response path (issue #471 / ADR-047). PR-A wires the
-// flag end-to-end but the actual Flusher path ships in PR-B; while
-// PR-A's buffered-fallback AC #4 needs the flag to flow into the
-// Handler, the runtime behaviour is unchanged (every request still
-// buffers). Production default is false — operators opt in per-cluster
-// after PR-B ships; the e2e harness sets it to true via the
-// FAAS_GATEWAY_STREAMING env var.
+// streamingEnabledFromEnv is the per-process opt-in for the streaming
+// response path (issue #471 / ADR-047). The flag flows into Handler
+// end-to-end; PR-B enables the Flusher path. The runtime default is
+// false — operators opt in per-cluster via FAAS_GATEWAY_STREAMING.
+// cmd/e2e/streaming_metal_test.go flips this on via the harness's
+// extraEnv parameter; the metal build tag keeps the streaming test
+// off the default unit/e2e lane.
 func streamingEnabledFromEnv() bool {
 	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", "false")))
 	return v == "1" || v == "true" || v == "yes"
@@ -144,10 +143,8 @@ type runDeps struct {
 	// streamingEnabled (issue #471 / ADR-047) is the per-process
 	// opt-in for the streaming response path. Production passes
 	// envOr(TOML) || env("FAAS_GATEWAY_STREAMING"); tests leave it
-	// false. PR-A wires the flag into the Handler but the actual
-	// Flusher path ships in PR-B; PR-A only uses the flag to emit
-	// the buffered-fallback deprecation log when an SSE-emitting app
-	// lands on the legacy buffered path.
+	// false. The flag also drives the buffered-fallback deprecation
+	// log when an SSE-emitting app lands on the legacy buffered path.
 	streamingEnabled bool
 	// synth is the internal unix-socket RPC server schedd dials for cron
 	// dispatch (spec §4.4, M7). nil in tests; production wires it after
@@ -267,11 +264,11 @@ func defaultServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// run is the production run() body moved verbatim from
-// cmd/gatewayd/main.go. The `prod` prefix avoids colliding with
-// the placeholder's `run` in cmd/gatewayd-internal/main.go (PR-A
-// keeps the placeholder serving TEMPLATE_OK so wait_healthy stays
-// green; PR-B drops the placeholder and renames run → run).
+// run is the production body, moved verbatim from cmd/gatewayd/main.go
+// during the Tier A7 split (PR-A moved the file, PR-B dropped the
+// placeholder that was previously serving TEMPLATE_OK from this
+// package; the `prod` prefix was the placeholder-era workaround so
+// the two `run` symbols could coexist in `package main`).
 func run(ctx context.Context, log *slog.Logger) error {
 	pool, err := db.Open(ctx, "")
 	if err != nil {
@@ -470,9 +467,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// :9090/metrics by gateway.RunControlServer; the gate/handler pick
 	// it up via deps.metrics in runWithDeps.
 	//
-	// ADR-068 / Tier A7 split: TLS termination moves to gatewayd-public
-	// (certmagic, httpsec, :443/:80 ACME mux). The legacy binary stays
-	// plain HTTP on :8080; PR-A removes the resolved-TLS branch entirely.
+	// ADR-068 / Tier A7 split: TLS termination moved to gatewayd-public
+	// (certmagic, httpsec, :443/:80 ACME mux). This daemon stays
+	// plain HTTP on :8080; the resolved-TLS branch was removed in PR-A.
 	deps.metrics = gateway.NewMetrics()
 
 	// Forward the operator-configured apid loopback URL through the
@@ -587,14 +584,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
 	handler.SetWakeGateHook()
-	// Issue #471 / ADR-047: per-process streaming opt-in. PR-A wires
-	// the flag end-to-end but the actual Flusher path ships in PR-B;
-	// while PR-A the Handler still buffers every response (so
-	// behaviour is unchanged). The buffered-fallback AC #4 needs the
-	// flag to flow into the Handler so a misconfigured SSE-emitting
-	// app surfaces the once-per-process deprecation log instead of a
-	// silent buffered blob. The flag here is the merged
-	// (cfg.StreamingEnabled || env(FAAS_GATEWAY_STREAMING)) — run()
+	// Issue #471 / ADR-047: per-process streaming opt-in. The Handler
+	// buffers every response unless the flag is on; when off, a
+	// misconfigured SSE-emitting app surfaces the once-per-process
+	// deprecation log instead of a silent buffered blob. The flag
+	// here is the merged (cfg.StreamingEnabled || env(FAAS_GATEWAY_STREAMING))
+	// — run()
 	// populates deps.streamingEnabled; tests inject the bit directly.
 	handler.WithStreamingEnabled(deps.streamingEnabled)
 	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
@@ -848,12 +843,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	errc := make(chan error, 4)
 	var servers []*http.Server
 	addSrv := func(s *http.Server) { servers = append(servers, s) }
-	// Legacy plain-:8080 path. Existing e2e harness depends on this.
-	// ADR-068 / Tier A7 split: TLS termination moved to gatewayd-public
-	// (certmagic, httpsec, :443/:80 ACME mux). After PR-A this daemon no
-	// longer builds a *gateway.TLSBundle; PR-B removes the public :8080
-	// listener entirely when the unix-socket handler chain lands in
-	// cmd/gatewayd-internal/.
+	// Plain-:8080 path. ADR-068 / Tier A7 split: TLS termination
+	// moved to gatewayd-public (certmagic, httpsec, :443/:80 ACME
+	// mux); this daemon no longer builds a *gateway.TLSBundle. The
+	// e2e harness hits this listener over plain HTTP.
 	srv := deps.newSrv(listenAddr, publicHandler)
 	public := srv
 	public.Addr = listenAddr
