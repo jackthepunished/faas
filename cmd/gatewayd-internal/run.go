@@ -69,7 +69,14 @@ var gatewaydInternalSocket = envOrGateway("FAAS_GATEWAY_SYNTH_SOCKET", "/run/faa
 
 // listenAddr is the public listener (TLS lands here in M8). Overridable via
 // FAAS_GATEWAY_LISTEN so the e2e harness can bind a free port without colliding
-// with a dev daemon on :8080.
+// with a dev daemon on :8080. The sentinel value "off" disables the
+// public listener entirely — used by faas-gatewayd-internal.service in
+// production (ADR-068 / ADR-070 Tier A7 split), where the public edge
+// is owned by gatewayd-public (which forwards here over the unix
+// socket at /run/faas/gatewayd-internal.sock). Without "off", both
+// daemons try to bind :8080; gatewayd-internal starts first and wins,
+// leaving gatewayd-public crash-looping with "address already in use"
+// (run 31121004495).
 var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", ":8080")
 
 // configPath is the on-disk TOML config. Overridable via FAAS_GATEWAYD_CONFIG
@@ -847,34 +854,45 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// moved to gatewayd-public (certmagic, httpsec, :443/:80 ACME
 	// mux); this daemon no longer builds a *gateway.TLSBundle. The
 	// e2e harness hits this listener over plain HTTP.
-	srv := deps.newSrv(listenAddr, publicHandler)
-	public := srv
-	public.Addr = listenAddr
-	if public.ReadTimeout == 0 {
-		public.ReadTimeout = 60 * time.Second
-	}
-	if public.WriteTimeout == 0 {
-		// Issue #471 / ADR-047 (PR-A): honour the TOML override
-		// (cfg.ResponseWriteTimeout, propagated via runDeps). 0
-		// means "use the spec §4.1 baseline" — see run() for the
-		// precedence. PR-B lifts the Hobby+ per-plan cap to 900 s
-		// via http.ResponseController and a per-request timeout
-		// (http.Server.WriteTimeout is global, so the per-app
-		// override can never land at this layer).
-		public.WriteTimeout = writeTimeoutOrDefault(deps.writeTimeout)
-	}
-	addSrv(public)
-	l, lerr := deps.listen("tcp", listenAddr)
-	if lerr != nil {
-		log.Error("gatewayd public listen failed", "addr", listenAddr, "err", lerr)
-		return lerr
-	}
-	go func() {
-		log.Info("gatewayd public listening", "addr", listenAddr)
-		if err := public.Serve(l); err != nil && err != http.ErrServerClosed {
-			errc <- err
+	//
+	// When FAAS_GATEWAY_LISTEN=off, skip the public listener entirely:
+	// the daemon serves only on the unix socket at
+	// /run/faas/gatewayd-internal.sock (forwarded to by gatewayd-public)
+	// and the control plane (controlAddr). This is the production shape
+	// per ADR-068 / Tier A7 split; faas-gatewayd-internal.service ships
+	// with FAAS_GATEWAY_LISTEN=off in Environment=.
+	if listenAddr != "off" {
+		srv := deps.newSrv(listenAddr, publicHandler)
+		public := srv
+		public.Addr = listenAddr
+		if public.ReadTimeout == 0 {
+			public.ReadTimeout = 60 * time.Second
 		}
-	}()
+		if public.WriteTimeout == 0 {
+			// Issue #471 / ADR-047 (PR-A): honour the TOML override
+			// (cfg.ResponseWriteTimeout, propagated via runDeps). 0
+			// means "use the spec §4.1 baseline" — see run() for the
+			// precedence. PR-B lifts the Hobby+ per-plan cap to 900 s
+			// via http.ResponseController and a per-request timeout
+			// (http.Server.WriteTimeout is global, so the per-app
+			// override can never land at this layer).
+			public.WriteTimeout = writeTimeoutOrDefault(deps.writeTimeout)
+		}
+		addSrv(public)
+		l, lerr := deps.listen("tcp", listenAddr)
+		if lerr != nil {
+			log.Error("gatewayd public listen failed", "addr", listenAddr, "err", lerr)
+			return lerr
+		}
+		go func() {
+			log.Info("gatewayd public listening", "addr", listenAddr)
+			if err := public.Serve(l); err != nil && err != http.ErrServerClosed {
+				errc <- err
+			}
+		}()
+	} else {
+		log.Info("gatewayd public listener disabled (FAAS_GATEWAY_LISTEN=off); serving on unix socket only")
+	}
 	ctrlAddr := controlAddr
 	if deps.controlAddr != "" {
 		ctrlAddr = deps.controlAddr
