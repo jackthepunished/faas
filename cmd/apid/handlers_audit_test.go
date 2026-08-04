@@ -431,9 +431,7 @@ func TestAuditEvents_ListEndpointReturnsCronFired(t *testing.T) {
 			break
 		}
 	}
-	if fired == nil {
-		t.Fatalf("no cron.fired row in list response (kind_prefix=cron.); events=%+v", list.Events)
-	}
+	fired = mustAuditEventResponse(t, fired, fmt.Sprintf("no cron.fired row in list response (kind_prefix=cron.); events=%+v", list.Events))
 	if fired.Actor != "schedd" {
 		t.Errorf("fired.Actor = %q, want schedd", fired.Actor)
 	}
@@ -559,9 +557,7 @@ func TestAuditEvents_ListEndpointRespectsStatelessAdvisoryKindPrefix(t *testing.
 			break
 		}
 	}
-	if accounted == nil {
-		t.Fatalf("no accounted stateless.advisory row in list response; events=%+v", list.Events)
-	}
+	accounted = mustAuditEventResponse(t, accounted, fmt.Sprintf("no accounted stateless.advisory row in list response; events=%+v", list.Events))
 	if accounted.Actor != "apid" {
 		t.Errorf("accounted.Actor = %q, want apid", accounted.Actor)
 	}
@@ -752,12 +748,8 @@ func TestAuditEvents_CliAuthExchangeEmitsAuthLoginAndKeyCreated(t *testing.T) {
 			authLogin = &rows[i]
 		}
 	}
-	if keyCreated == nil {
-		t.Fatalf("no key.created row; rows=%+v", rows)
-	}
-	if authLogin == nil {
-		t.Fatalf("no auth.login row; rows=%+v", rows)
-	}
+	keyCreated = mustAuditEvent(t, keyCreated, fmt.Sprintf("no key.created row; rows=%+v", rows))
+	authLogin = mustAuditEvent(t, authLogin, fmt.Sprintf("no auth.login row; rows=%+v", rows))
 
 	// Subject pinning: both rows scoped to acct.ID.
 	wantSubject := uuidStringOf(acct.ID)
@@ -1623,6 +1615,18 @@ func TestAuditEvents_CronForeignOwnerReturns404DoesNotEmit(t *testing.T) {
 // that t.Fatal()s and returns the value lets staticcheck see the value
 // is non-nil at the call site.
 func mustAuditEvent(t *testing.T, ev *state.Event, msg string) *state.Event {
+	t.Helper()
+	if ev == nil {
+		t.Fatal(msg)
+	}
+	return ev
+}
+
+// mustAuditEventResponse is the same SA5011 escape hatch for the
+// *api.AuditEventResponse type (the Wire-level DTO, not the store
+// row). The list-shaped audit tests walk list.Events looking for a
+// matching Kind and want a real response to assert against.
+func mustAuditEventResponse(t *testing.T, ev *api.AuditEventResponse, msg string) *api.AuditEventResponse {
 	t.Helper()
 	if ev == nil {
 		t.Fatal(msg)
