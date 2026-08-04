@@ -30,15 +30,27 @@ func TestSeedDevAccount_ValidToken(t *testing.T) {
 	if err := seedDevAccount(context.Background(), s, tok); err != nil {
 		t.Fatalf("seedDevAccount: %v", err)
 	}
-	acct, err := s.AccountByKeyHash(context.Background(), api.HashAPIKey(tok))
+	// Tier A7 PR-D: seedDevAccount no longer mints the API key —
+	// it only find-or-creates the dev@local account. Tests that
+	// want the token to authenticate must mint the key themselves
+	// (mirrors what pkg/e2etest.Harness.SeedAccount does for the
+	// e2e harness).
+	acct, err := s.AccountByEmail(context.Background(), "dev@local")
+	if err != nil {
+		t.Fatalf("AccountByEmail: %v", err)
+	}
+	if _, err := s.CreateAPIKey(context.Background(), acct.ID, api.HashAPIKey(tok), "dev", api.ScopesAdminOnly); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	got, err := s.AccountByKeyHash(context.Background(), api.HashAPIKey(tok))
 	if err != nil {
 		t.Fatalf("AccountByKeyHash: %v", err)
 	}
-	if acct.Email != "dev@local" {
-		t.Errorf("email = %q, want dev@local", acct.Email)
+	if got.Email != "dev@local" {
+		t.Errorf("email = %q, want dev@local", got.Email)
 	}
-	if acct.Plan != api.PlanFree {
-		t.Errorf("plan = %v, want free", acct.Plan)
+	if got.Plan != api.PlanFree {
+		t.Errorf("plan = %v, want free", got.Plan)
 	}
 }
 
@@ -90,6 +102,20 @@ func TestRunWithDeps_ServesUntilCancel(t *testing.T) {
 		}
 		return ""
 	}
+	// Tier A7 PR-D: seedDevAccount no longer mints the key. Seed
+	// one explicitly so the auth path has something to resolve.
+	preSeed := state.NewMemStore()
+	if err := seedDevAccount(context.Background(), preSeed, tok); err != nil {
+		t.Fatalf("seedDevAccount: %v", err)
+	}
+	preAcct, err := preSeed.AccountByEmail(context.Background(), "dev@local")
+	if err != nil {
+		t.Fatalf("AccountByEmail: %v", err)
+	}
+	if _, err := preSeed.CreateAPIKey(context.Background(), preAcct.ID, api.HashAPIKey(tok), "dev", api.ScopesAdminOnly); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	deps.store = func() state.Store { return preSeed }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -254,6 +280,15 @@ func TestAuthActiveAccountAllowed(t *testing.T) {
 	s := state.NewMemStore()
 	tok := api.APIKeyPrefix + "0123456789abcdef0123456789abcdef0123456789abcdef"
 	if err := seedDevAccount(context.Background(), s, tok); err != nil {
+		t.Fatal(err)
+	}
+	// Tier A7 PR-D: seedDevAccount no longer mints the key; mint
+	// one explicitly so the auth path has something to resolve.
+	acct, err := s.AccountByEmail(context.Background(), "dev@local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateAPIKey(context.Background(), acct.ID, api.HashAPIKey(tok), "dev", api.ScopesAdminOnly); err != nil {
 		t.Fatal(err)
 	}
 	srv := newServer(s, discardLogger(), "", noopNotifier{})

@@ -8,7 +8,9 @@ Wants=faas-cp.slice faas-vmmd.service
 Type=simple
 User=faas-imaged
 Group=faas
-ExecStart=/usr/local/bin/imaged --config /etc/faas/imaged.toml
+# Binary is shipped by cd-controlplane.yml "Install binaries"
+# step (line 278: `install -m 0755 ... /opt/faas/bin/<bin>`).
+ExecStart=/opt/faas/bin/imaged --config /etc/faas/imaged.toml
 Restart=on-failure
 RestartSec=2s
 

@@ -10,7 +10,9 @@ Wants=faas-cp.slice faas-apid.service faas-schedd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gatewayd-internal
+# Binary is shipped by cd-controlplane.yml "Install binaries"
+# step (line 278: `install -m 0755 ... /opt/faas/bin/<bin>`).
+ExecStart=/opt/faas/bin/gatewayd-internal
 Restart=on-failure
 RestartSec=2s
 

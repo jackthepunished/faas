@@ -127,12 +127,30 @@ jobs:
       # Install controlplane systemd units (service + slice definitions)
       # and faas-vmmd.service unit so updated unit files (e.g. LoadCredential,
       # environment limits, dependencies) land on the host prior to service restart.
-      - name: Install systemd service units
+      - name: Install systemd service units + tmpfiles.d rule
         run: |
           set -euo pipefail
           # SCP all unit files in deploy/controlplane/systemd/
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             deploy/controlplane/systemd/* "root@${{ env.CP_HOST }}:/etc/systemd/system/"
+          # Tier A7 PR-D — install the tmpfiles.d rule that
+          # pre-creates /run/faas with the canonical root:faas 0775
+          # ownership before any faas-*.service unit starts. Closes
+          # the restart-cycle race where faas-vmmd.service's
+          # RuntimeDirectory=faas recreates /run/faas as root:root
+          # 0755, the ExecStartPre chown flips it to root:faas 0775,
+          # but schedd + apid dial /run/faas/vmmd.sock during the
+          # chown window and get bind: permission denied
+          # (cd-controlplane run 31121004495, post PR #633 deploy
+          # 2026-08-04).
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            deploy/controlplane/tmpfiles.d/faas.conf \
+            "root@${{ env.CP_HOST }}:/etc/tmpfiles.d/faas.conf"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            root@${{ env.CP_HOST }} \
+            "set -euo pipefail
+               install -m 0644 -o root -g root /etc/tmpfiles.d/faas.conf /etc/tmpfiles.d/faas.conf
+               systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf"
           # SCP faas-vmmd.service unit
           UNIT_SRC="deploy/etc/faas-vmmd.service"
           UNIT_DST="/etc/systemd/system/faas-vmmd.service"
@@ -252,10 +270,6 @@ jobs:
                 install -m 0755 "${ROLLBACK_DIR}/${bin}" "/opt/faas/bin/${bin}"
               fi
             done
-            # Same /run/faas reset as the main restart path — rollback
-            # uses the same vmmd-only RuntimeDirectory and the dirent
-            # state may be just as stale as the failed deploy left it.
-            rm -rf /run/faas
             # Same drop-in sweep — see main restart path for the long version.
             rm -rf /etc/systemd/system/faas-schedd.service.d \
                    /etc/systemd/system/faas-vmmd.service.d \
@@ -265,6 +279,17 @@ jobs:
             systemctl daemon-reload
             for svc in ${FAAS_RESTART_ORDER}; do
               systemctl restart "faas-${svc}.service" || true
+              # Mirror the main-restart settle: vmmd needs the
+              # /run/faas/vmmd.sock visibility gate, the rest get
+              # a 3s stagger (see the main path for context).
+              if [[ "${svc}" == "vmmd" ]]; then
+                for i in 1 2 3 4 5 6 7 8 9 10; do
+                  [[ -S /run/faas/vmmd.sock ]] && break
+                  sleep 1
+                done
+              else
+                sleep 3
+              fi
             done
             if wait_healthy; then
               echo "::warning::rollback succeeded — box is serving the PREVIOUS build"
@@ -383,20 +408,24 @@ jobs:
           # Reset any systemd start-limit-hit counters from previous crash loops
           systemctl reset-failed
 
-          # Drop any stale /run/faas before restarting vmmd. vmmd's
-          # RuntimeDirectory=faas (the SOLE owner across the faas
-          # service set) bind-mounts a per-unit tmpfs at /run/faas,
-          # but if /run/faas already exists with foreign ownership
-          # (faas:faas from a prior bootstrap chown, or faas-schedd
-          # from schedd's previous RuntimeDirectory), systemd
-          # silently skips the bind-mount — every subsequent daemon
-          # that dials /run/faas/<svc>.sock gets `no such file or
-          # directory` even though `ss -lnx` shows the listen entry
-          # (run 30841750214, #619). Dropping the dir here is a
-          # no-op on a freshly bootstrapped box and idempotent on
-          # every deploy thereafter; vmmd's RuntimeDirectory will
-          # recreate it as the canonical root-owned bind-mount.
-          rm -rf /run/faas
+          # Drop any stale drop-ins that re-declare RuntimeDirectory=faas
+          # on schedd/gatewayd. These sneak in via operator workarounds
+          # (e.g. the run 30839233808 diagnostic that lived as
+          # /etc/systemd/system/faas-schedd.service.d/10-runtime-directory.conf)
+          # and quietly re-introduce the per-unit tmpfs collision even
+          # though the canonical unit file is correct — `systemctl show`
+          # would still report `RuntimeDirectory=faas` for schedd. The
+          # scp above overwrites the canonical unit, but drop-ins take
+          # precedence. This is intentionally idempotent.
+          #
+          # NOTE (PR-D 2026-08-04): the prior `rm -rf /run/faas` step
+          # that lived here actively broke the chown race: wiping the
+          # tmpfiles.d-managed dir just made systemd recreate it as
+          # root:root 0755 instead of the root:faas 0775 that
+          # `systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf`
+          # sets up above. The ExecStartPre chown on faas-vmmd.service
+          # now flips the ownership idempotently as the runtime
+          # self-heal; we don't need to pre-rm the dir anymore.
 
           # Remove any drop-ins that re-declare RuntimeDirectory=faas
           # on schedd/gatewayd. These sneak in via operator workarounds
@@ -417,15 +446,33 @@ jobs:
           # Restart all FaaS services in dependency order. vmmd MUST
           # come first so /run/faas/vmmd.sock is bound before imaged
           # (and any other daemon that dials it) starts. Each restart
-          # is wrapped in a brief settle so the new process actually
-          # reaches `vmmd ready` / `grpc listening` before the next
-          # unit starts — without this, the script can race past
-          # vmmd while it's still in `activating` and the imaged
-          # dials hit `no such file or directory` (run 30835745646,
-          # 30837572523).
+          # is wrapped in a per-svc settle: vmmd gets a vmmd.sock
+          # visibility poll (covers the RuntimeDirectory bind-mount
+          # race), the rest get a 3s sleep so the cumulative RSS
+          # stays below the faas-cp.slice 6 GB ceiling during the
+          # restart window (PR-D, post PR #633 deploy 2026-08-04
+          # saw OOM kills in apid+schedd without the settle, run
+          # 31121004495).
           for svc in ${FAAS_RESTART_ORDER}; do
             systemctl reset-failed "faas-${svc}.service" || true
             systemctl restart "faas-${svc}.service" || true
+            if [[ "${svc}" == "vmmd" ]]; then
+              # vmmd is the SOLE /run/faas owner — schedd + apid
+              # dial /run/faas/vmmd.sock via gRPC. Without this
+              # gate they restart-loop with `dial: no such file or
+              # directory` for ~10s until vmmd's RuntimeDirectory=faas
+              # + ExecStart chown + bind-mount finishes (run
+              # 30837572523, run 31121004495).
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                [[ -S /run/faas/vmmd.sock ]] && break
+                sleep 1
+              done
+            else
+              # 3s covers the PG pool init + grpc server bind +
+              # slog buffer warm-up of every daemon except vmmd
+              # (which gets the socket-poll gate above).
+              sleep 3
+            fi
           done
           # Verify the vmmd socket is actually visible at the bind
           # path. The known-bad pattern is: vmmd is `active` per
