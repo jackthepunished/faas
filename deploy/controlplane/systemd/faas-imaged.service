@@ -14,6 +14,20 @@ RestartSec=2s
 Slice=faas-cp.slice
 MemoryMax=1G
 EnvironmentFile=/etc/faas/sealed.env
+
+# imaged → vmmd parent-ref overlay mount (ADR-053) is done locally by
+# imaged via exec.Command("mount", "-t", "overlay", …). The child mount
+# process inherits imaged's caps; with User=faas-imaged + no ambient
+# caps, CapEff=0 in the child and mount(8) returns "must be superuser
+# to use mount" (run 31121004495 + ongoing crash-loops). The cap is
+# already in CapabilityBoundingSet (full set, inherited from the
+# default systemd unit); promoting it to AmbientCapabilities lets the
+# non-root user actually USE it without expanding the bounding set.
+# NoNewPrivileges=yes is preserved (caps are ambient at fork time, no
+# setuid binary involved). Scoped to cap_sys_admin only — no other
+# ambient cap is granted.
+AmbientCapabilities=cap_sys_admin
+
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
