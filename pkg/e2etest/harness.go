@@ -566,6 +566,14 @@ func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 // tests that don't exercise async-invoke. Centralised so a future env
 // var or config knob lands in one place instead of two (Start vs
 // StartWithEnv had identical templates before PR #218).
+//
+// gateway_metrics_url is intentionally set to an empty string in PR-A:
+// the legacy 'gatewayd' binary is gone, and the placeholder
+// gatewayd-internal exposes /metrics as a 404 (ControlMux is wired
+// with nil metrics). Schedd's scaleup trigger therefore has no URL to
+// scrape and the ticker arm never fires (cmd/schedd/config.go:110-
+// 118, issue #169 / #172). PR-B restores the live metrics URL once the
+// real handler is wired.
 func writeScheddConfig(t *testing.T, h *Harness, tmp string, includeSynth bool) string {
 	t.Helper()
 	sockPath := filepath.Join(h.SockDir, "schedd.sock")
@@ -580,6 +588,7 @@ func writeScheddConfig(t *testing.T, h *Harness, tmp string, includeSynth bool) 
 owner_user = %q
 vmmd_socket = %q
 gateway_synth_socket = %q
+gateway_metrics_url = ""
 `,
 		sockPath, "root", vmmdSock, gatewaySynth,
 	)
@@ -589,38 +598,51 @@ gateway_synth_socket = %q
 	return cfgPath
 }
 
-// startGatewayd reserves per-test ports for the gateway pair and
-// populates h.GatewayURL / h.GatewayControlURL. The legacy 'gatewayd'
-// binary is gone (Tier A7 / ADR-070 split); its source now lives in
-// cmd/gatewayd-internal/. PR-A does not boot the split pair — that
-// arrives in PR-B (which needs the certmagic/Hetzner-token stubs for
-// gatewayd-public). The signature keeps bin/dbURL/extraEnv so the
-// call-sites in this file don't churn when PR-B lands.
+// startGatewayd boots the placeholder gatewayd-internal daemon (the
+// legacy 'gatewayd' binary is gone — its source moved to
+// cmd/gatewayd-internal/ in Tier A7 / ADR-070 PR-A). The placeholder
+// is sufficient for PR-A's e2e tests because:
 //
-// When PR-B lands this function regains the prior behaviour: write a
-// per-test gatewayd-internal.toml, build the binary, call startProc,
-// waitTCP, etc. The doc-comment block above (synth socket, apid loopback)
-// belongs to that restored path; PR-B will uncomment it.
+//   - It binds the per-test synth unix socket at
+//     SockDir/gatewayd-internal.sock, which schedd's drain goroutine
+//     needs to forward invocation_due envelopes (cmd/schedd/main.go:
+//     319-345). Without the listener, schedd's drain is silently
+//     disabled and TestE2E_AsyncInvoke_PostEnqueuesRowAndDrainCompletesIt
+//     deadlocks waiting for state='completed'.
+//   - It serves the loopback control plane on controlAddr with the
+//     /healthz + /readyz routes. schedd's GatewayMetricsURL is set
+//     to empty in writeScheddConfig so the scaleup scraper is
+//     disabled — PR-B restores the live metrics URL.
+//
+// What PR-A does NOT do: it does not boot gatewayd-public (the TLS
+// edge). Tests that hit h.GatewayURL over plain HTTP will get a 200
+// OK with the TEMPLATE_OK banner, NOT a real proxy response. That
+// is the documented PR-A gap; PR-B replaces the placeholder with
+// prodRun() so customer traffic reaches the real handler chain.
+//
+// The `extraEnv` parameter is unused until PR-B; the per-name blank
+// assignment suppresses the unused-parameter lint.
 func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []string) {
 	t.Helper()
-	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd' binary is gone
-	// (its source moved into cmd/gatewayd-internal/). PR-B will boot
-	// the split pair (gatewayd-public + gatewayd-internal) here.
-	// For now we still build the gatewayd-internal binary (see
-	// buildBinaries) and reserve the per-test ports, but skip
-	// startProc + waitTCP. Tests that depend on h.GatewayURL will
-	// fail at first HTTP call (no listener on addr), which is the
-	// expected PR-A gap. The `bin`, `dbURL`, `extraEnv` parameters
-	// are unused until PR-B; the per-name blank assignments suppress
-	// the unused-parameter lint that would otherwise fire.
-	_, _, _ = bin, dbURL, extraEnv
+	_ = extraEnv
+	if h.SockDir == "" {
+		h.SockDir = filepath.Join(h.TmpDir, "socks")
+	}
 	addr := freeTCPAddr(t)
 	controlAddr := freeTCPAddr(t)
 	if h.ScheddSock == "" {
 		h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
 	}
+	synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
+	env := append(testEnvCommon(dbURL),
+		"FAAS_INTERNAL_SOCKET="+synthSock,
+		"FAAS_INTERNAL_CONTROL_ADDR="+controlAddr,
+		"FAAS_SKIP_SOCKET_GROUP=1",
+	)
+	h.procs = append(h.procs, startProc(t, bin, "gatewayd-internal", env))
 	h.GatewayURL = "http://" + addr
 	h.GatewayControlURL = "http://" + controlAddr
+	waitTCP(t, controlAddr, 10*time.Second)
 }
 
 // testEnvCommon returns the env every daemon gets in the harness:
