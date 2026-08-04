@@ -485,9 +485,7 @@ func TestMFAVerify_StepsUpPendingCookie(t *testing.T) {
 			stepUpCookie = c
 		}
 	}
-	if stepUpCookie == nil {
-		t.Fatalf("/verify did not re-issue cookie")
-	}
+	stepUpCookie = mustStepUpCookie(t, stepUpCookie, "/verify did not re-issue cookie")
 	env, err := e.mgr.Verify(stepUpCookie.Value)
 	if err != nil {
 		t.Fatalf("verify post-/verify cookie: %v", err)
@@ -1064,3 +1062,16 @@ func TestMFARecover_MailerErrorDoesNotFailBurn(t *testing.T) {
 // errSMTPFlake is a stand-in SMTP relay failure. Defined here so
 // the burn-email test isn't coupled to a real mail package.
 var errSMTPFlake = errors.New("smtp: relay temporarily unavailable")
+
+// mustStepUpCookie is the SA5011 escape hatch for the /verify
+// cookie re-issue test: the cookie loop can legitimately omit the
+// step-up cookie, but we want a real cookie for assertions below.
+// A helper that t.Fatal()s and returns the value lets staticcheck
+// see the value is non-nil at the call site.
+func mustStepUpCookie(t *testing.T, c *http.Cookie, msg string) *http.Cookie {
+	t.Helper()
+	if c == nil {
+		t.Fatal(msg)
+	}
+	return c
+}

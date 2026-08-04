@@ -16,6 +16,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -127,9 +128,7 @@ func TestConsumeInvoice_HappyPath(t *testing.T) {
 			break
 		}
 	}
-	if consumed == nil {
-		t.Fatalf("credit.consumed audit row missing for account %s", target.ID)
-	}
+	consumed = mustAuditEvent(t, consumed, fmt.Sprintf("credit.consumed audit row missing for account %s", target.ID))
 	if consumed.Actor != "apid" {
 		t.Errorf("audit Actor = %q, want apid", consumed.Actor)
 	}
