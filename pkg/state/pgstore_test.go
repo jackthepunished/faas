@@ -2491,13 +2491,12 @@ func TestPg_CountLiveInstancesByDeployment(t *testing.T) {
 		t.Errorf("unknown deployment_id count = %d, want 0", gotUnknown)
 	}
 
-	// Empty deployment_id → 0, nil (the SQL parameter is an empty
-	// string; the planner returns count=0 for `WHERE deployment_id = ''`).
-	gotEmpty, err := s.CountLiveInstancesByDeployment(ctx, "")
-	if err != nil {
-		t.Fatalf("empty deployment_id: %v", err)
-	}
-	if gotEmpty != 0 {
-		t.Errorf("empty deployment_id count = %d, want 0", gotEmpty)
+	// Empty deployment_id is rejected at the SQL boundary — the
+	// column is UUID, not text, and the planner raises 22P02 on
+	// `WHERE deployment_id = ''`. The store's contract is "non-empty
+	// UUID or caller's responsibility"; the watcher guards the empty
+	// case before the call. We pin that contract here.
+	if _, err := s.CountLiveInstancesByDeployment(ctx, ""); err == nil {
+		t.Errorf("empty deployment_id: expected error from UUID type cast, got nil")
 	}
 }

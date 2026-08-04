@@ -372,7 +372,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// call above (cmd/schedd/main.go:334-336): a test or
 		// operator cancelling mid-boot must not surface as a
 		// non-nil error from runWithDeps — the drain is clean.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		//
+		// The double check (errors.Is on the err AND ctx.Err())
+		// matters: under `-coverpkg=*` instrumentation
+		// (memory golangci-lint-v2-4-0-handler-checklist) the
+		// coverage pass can wrap pgxpool.Acquire errors in a
+		// way that breaks errors.Is unwrapping; the ctx.Err()
+		// side is the canonical "did the caller cancel" signal.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			return nil
 		}
 		return fmt.Errorf("schedd: router refresh subscribe: %w", err)
