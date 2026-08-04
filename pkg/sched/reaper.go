@@ -22,11 +22,11 @@ const MinInstanceAge = 30 * time.Second
 
 // InstanceInfo is the snapshot schedd hands the selectors for one instance.
 type InstanceInfo struct {
-	Instance     string
-	AppID        string
-	Plan         api.Plan
-	State        state.State
-	RAMMB        int
+	Instance string
+	AppID    string
+	Plan     api.Plan
+	State    state.State
+	RAMMB    int
 	// SidecarMBs (issue #463 / ADR-070 / PR-C) is the per-sidecar
 	// RAM slice sourced from the deployment's `sidecars jsonb`
 	// column at reaper time. Empty/nil means "no sidecars" and

@@ -89,9 +89,9 @@ type Request struct {
 	// deployment id. Empty is the legacy single-box posture
 	// (test seams + pre-#557 reservations); the per-deployment
 	// concurrency counter is only incremented when this is non-empty.
-	DeploymentID   string
-	Plan           api.Plan
-	RAMMB          int // the app's ram_mb (already validated ≤ plan cap)
+	DeploymentID string
+	Plan         api.Plan
+	RAMMB        int // the app's ram_mb (already validated ≤ plan cap)
 	// SidecarMBs (issue #463 / ADR-070 §Decision 6 / PR-C) is the
 	// per-sidecar RAM slice sourced from the deployment's
 	// `sidecars jsonb` column at Admit time. Each entry adds to the

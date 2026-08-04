@@ -269,14 +269,14 @@ func TestRunWorkloads_PanicInSidecarIsRecovered(t *testing.T) {
 // (argv0, argv) tuple exactly.
 func TestResolveSidecarCommand(t *testing.T) {
 	cases := []struct {
-		name     string
-		spec     workloadSpec
+		name      string
+		spec      workloadSpec
 		wantArgv0 string
 		wantArgv  []string
 	}{
 		{
-			name: "no overrides → baked start.sh",
-			spec: workloadSpec{Name: "metrics", Type: "sidecar"},
+			name:      "no overrides → baked start.sh",
+			spec:      workloadSpec{Name: "metrics", Type: "sidecar"},
 			wantArgv0: "/usr/local/bin/start.sh",
 			wantArgv:  nil,
 		},
