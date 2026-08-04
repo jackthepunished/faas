@@ -1,5 +1,5 @@
 [Unit]
-Description=onebox-faas gatewayd-public — TLS-only edge (Tier A7 split, ADR-070)
+Description=onebox-faas gatewayd-public — plain-HTTP edge (Tier A7 split, ADR-070; TLS terminates at Caddy upstream)
 Documentation=https://docs.gregale.dev/ops/gatewayd-public
 # gatewayd-public depends on apid (route cache mirror subscribes to
 # app_changed / domain_changed pg_notify) and gatewayd-internal (the
@@ -16,15 +16,16 @@ RestartSec=2s
 
 # Hard ceiling from the control-plane budget (spec §13: 512M for
 # gatewayd). gatewayd-public is smaller than the legacy gatewayd
-# (no wake gate, no forwarder, no per-process buckets) so 256M is
-# honest; the legacy value is kept as a safety ceiling in case a
-# later PR adds the rate-limit read-through cache here.
+# (no wake gate, no forwarder, no per-process buckets, no certmagic)
+# so 256M is honest; the legacy value is kept as a safety ceiling in
+# case a later PR adds the rate-limit read-through cache here.
 Slice=faas-cp.slice
 MemoryMax=512M
 
-# Public listener: TLS on :443 + ACME HTTP-01 on :80. CAP_NET_BIND_SERVICE
-# is the only capability needed (the daemon runs as faas user, not root).
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+# Public listener: plain HTTP on 127.0.0.1:8080 behind Caddy upstream
+# (api.gregale.dev). No low-port bind, no TLS termination in this
+# daemon — CAP_NET_BIND_SERVICE is therefore unused.
+AmbientCapabilities=
 
 # Hardening baseline — gatewayd-public is NOT root; runs as faas:faas.
 User=faas
@@ -38,7 +39,11 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# gatewayd-public dials gatewayd-internal.sock (AF_UNIX) and accepts
+# Caddy's reverse-proxy on 127.0.0.1:8080 (AF_INET). It does NOT make
+# outbound HTTP — the reverse-proxy is inbound-only. AF_INET6 dropped
+# because the bind is loopback v4.
+RestrictAddressFamilies=AF_UNIX AF_INET
 SystemCallArchitectures=native
 LockPersonality=yes
 RestrictNamespaces=yes
@@ -48,16 +53,14 @@ ProtectHostname=yes
 ProtectClock=yes
 ProtectProc=invisible
 
-# CertMagic per-replica storage at /var/lib/faas/certs (mode 0700,
-# faas:faas). ReadWritePaths carves out exactly the dirs we write to.
-#
-# /run/faas is owned by faas-vmmd.service (the SOLE RuntimeDirectory=faas
-# across the faas service set). The public daemon dials
-# gatewayd-internal.sock, which lives in the host /run/faas (vmmd's
-# bind-mount) — so we need ReadWritePaths=/run/faas. Declaring
-# RuntimeDirectory=faas here would just create a second per-unit tmpfs
-# whose bind-mount wouldn't propagate back to /run.
-ReadWritePaths=/var/lib/faas/certs /run/faas
+# Plain-HTTP mode: no certmagic storage. /run/faas is owned by
+# faas-vmmd.service (the SOLE RuntimeDirectory=faas across the faas
+# service set). The public daemon dials gatewayd-internal.sock,
+# which lives in the host /run/faas (vmmd's bind-mount) — so we
+# need ReadWritePaths=/run/faas. Declaring RuntimeDirectory=faas
+# here would just create a second per-unit tmpfs whose bind-mount
+# wouldn't propagate back to /run.
+ReadWritePaths=/run/faas
 ReadOnlyPaths=/etc/faas
 
 [Install]

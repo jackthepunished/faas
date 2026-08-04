@@ -1,40 +1,17 @@
-# gatewayd_public_service — install systemd unit + storage for
+# gatewayd_public_service — install systemd unit for
 # gatewayd-public (Tier A7 split, ADR-070).
 #
-# Mirrors the gatewayd_service role shape: ship the unit, let the
-# operator systemctl enable --now faas-gatewayd-public once the
-# hetzner-dns.token is in place.
+# Plain-HTTP edge: TLS terminates at Caddy + Cloudflare upstream
+# (api.gregale.dev). This daemon serves plain HTTP on 127.0.0.1:8080
+# and reverse-proxies to gatewayd-internal. There is no certmagic
+# storage, no ACME account dir, and no operator-supplied Hetzner DNS
+# token — those concerns live with the upstream Caddy.
 #
 # What's NOT here (operator-provisioned):
-#   - the hetzner-dns.token file (mode 0400, root:faas)
-#   - the FAAS_NODE_ID / FAAS_NODE_NAME env file (operator-supplied
-#     via systemd drop-in or a dedicated secrets dir)
-#   - the cert storage contents (CertMagic creates them on first
-#     start)
-
-- name: gatewayd_public_service — install /var/lib/faas/certs (CertMagic storage)
-  # CertMagic's file storage wants mode 0700. The systemd unit runs
-  # the daemon as faas:faas; CertMagic writes renewed certs into
-  # this directory. The dir MUST be owned by faas:faas — root:faas
-  # 0700 leaves group-writable only for root, and the daemon
-  # (running as faas) cannot write its renewed certs there.
-  ansible.builtin.file:
-    path: /var/lib/faas/certs
-    state: directory
-    owner: faas
-    group: faas
-    mode: "0700"
-
-- name: gatewayd_public_service — install /var/lib/faas/ca (shared ACME account dir)
-  # Shared across replicas — only the leader writes the LE account
-  # state; followers read it. Mode 0750 + group faas is the ADR-069
-  # contract.
-  ansible.builtin.file:
-    path: /var/lib/faas/ca
-    state: directory
-    owner: faas
-    group: faas
-    mode: "0750"
+#   - the Caddy upstream config (out of this role; reverse-proxy to
+#     http://127.0.0.1:8080)
+#   - enable the unit (`systemctl enable --now faas-gatewayd-public`)
+#   - run the daemon (Caddy reverse-proxy upstream is the trigger)
 
 - name: gatewayd_public_service — install systemd unit
   ansible.builtin.copy:
