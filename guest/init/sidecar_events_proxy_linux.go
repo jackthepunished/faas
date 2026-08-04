@@ -194,13 +194,14 @@ func (p *sidecarEventsProxy) SendRestart(sidecar string, attempt int) error {
 	return p.send(VsockSidecarEventsTypeRestart, body)
 }
 
-// codeql[go/uncontrolled-allocation-size] false-positive: send()'s early-return guard at the top rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512), so the make() inside is provably bounded; CodeQL's taint analyzer can't simplify through the 1+len(body) arithmetic.
+// codeql[go/allocation-size-overflow] false-positive: send()'s early-return guard rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512); the make() below allocates a fixed-size scratch buffer and slices it, so the taint can't reach the make() size argument at all.
 func (p *sidecarEventsProxy) send(t byte, body []byte) error {
-	if len(body)+1 > sidecarMaxDatagram {
-		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", len(body)+1, sidecarMaxDatagram)
+	bodyLen := len(body)
+	if bodyLen+1 > sidecarMaxDatagram {
+		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", bodyLen+1, sidecarMaxDatagram)
 	}
-	// codeql[go/uncontrolled-allocation-size] false-positive: the early-return above rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512), so the make() below is provably bounded.
-	buf := make([]byte, 1+len(body))
+	// codeql[go/allocation-size-overflow] false-positive: the early-return above rejects any payload whose bodyLen+1 exceeds sidecarMaxDatagram (512); buf below is allocated with a compile-time constant and sliced — no tainted size ever reaches make().
+	buf := make([]byte, sidecarMaxDatagram)[:1+bodyLen]
 	buf[0] = t
 	copy(buf[1:], body)
 	dst := &unix.SockaddrVM{
