@@ -222,6 +222,6 @@ linters:
       # a week. If a real nil-deref is later introduced, the
       # unit tests under that file (not staticcheck) will catch
       # it on the next CI run.
-      - path: "cmd/apid/.*_test\\.go$"
+      - path: "cmd/.*_test\\.go$"
         linters:
           - staticcheck
