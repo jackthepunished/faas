@@ -201,18 +201,18 @@ func (p *sidecarEventsProxy) SendRestart(sidecar string, attempt int) error {
 // payloads well under the limit) so a future schema drift is
 // caught loudly rather than silently truncated by the kernel.
 func (p *sidecarEventsProxy) send(t byte, body []byte) error {
-	bodyLen := len(body)
-	if bodyLen+1 > sidecarMaxDatagram {
-		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", bodyLen+1, sidecarMaxDatagram)
+	if len(body)+1 > sidecarMaxDatagram {
+		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", len(body)+1, sidecarMaxDatagram)
 	}
-	// Explicit min() so CodeQL's "uncontrolled-allocation size" rule
-	// sees a bounded expression. The earlier if() guarantees
-	// bodyLen+1 ≤ sidecarMaxDatagram; the min() makes that visible
-	// to the analyzer. bodyLen is the bound, not the arithmetic
-	// expression bodyLen+1 (CodeQL's taint flow can't simplify
-	// through the addition).
-	sz := min(bodyLen+1, sidecarMaxDatagram)
-	buf := make([]byte, sz)
+	// codeql[go/uncontrolled-allocation-size]: the early-return
+	// above guarantees len(body)+1 ≤ sidecarMaxDatagram (512), so
+	// the allocation below is provably bounded. CodeQL's taint
+	// analyzer follows len(body) into the make() argument via the
+	// 1+len(body) arithmetic; suppressing the alert here matches
+	// the column-1 suppression pattern (PR-C pre-merge audit,
+	// 2026-08-04).
+	// codeql[go/uncontrolled-allocation-size]
+	buf := make([]byte, 1+len(body))
 	buf[0] = t
 	copy(buf[1:], body)
 	dst := &unix.SockaddrVM{
