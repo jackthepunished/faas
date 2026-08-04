@@ -667,7 +667,7 @@ groups:
           family: tls_cert_expiry
         annotations:
           summary: "Cert-expiry refresher walk was partial"
-          description: "At least one tick in the last hour completed with a partial walk result — the refresher either saw a subtree disappear mid-walk (concurrent certmagic renewal — usually benign) or hit a filesystem error. If the partial persists across multiple ticks, the cert-expiry gauges will stop refreshing and the §12 alerts will go stale. Check `/var/lib/faas/certs/certificates/` permissions and the gatewayd slog for `cert expiry walk was partial` Warn lines."
+          description: "At least one tick in the last hour completed with a partial walk result — the refresher either saw a subtree disappear mid-walk (concurrent certmagic renewal — usually benign) or hit a filesystem error. If the partial persists across multiple ticks, the cert-expiry gauges will stop refreshing and the §12 alerts will go stale. Check `/var/lib/faas/certs/certificates/` permissions and the legacy `faas-gatewayd` slog for `cert expiry walk was partial` Warn lines. PR #633 stripped certmagic from `gatewayd-public`; this alert is legacy-daemon-only and will be removed with the certsync sweep (PR-C)."
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTLSCertExpiryPage.md"
 
       # ─────────────────────────────────────────────────────────────────

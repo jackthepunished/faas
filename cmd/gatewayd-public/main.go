@@ -70,19 +70,15 @@ func hstsEnabledFromEnv(k string) string {
 
 const (
 	// defaultListenAddr is the loopback bind for the public listener.
-	// Bound to 127.0.0.1 (NOT host-network :8080) so only Caddy on
-	// the same box can reach it — this closes the rate-limiter-bypass
-	// risk where an attacker on the host network hits the listener
-	// directly to skip gatewayd-internal's per-process limiter.
+	// Caddy (api.gregale.dev) reverse-proxies here.
 	defaultListenAddr = "127.0.0.1:8080"
 	// defaultInternalSocket is the unix socket gatewayd-public dials
-	// to reach gatewayd-internal. The path is owned by faas-vmmd's
-	// /run/faas tmpfs (the SOLE RuntimeDirectory=faas across the faas
-	// service set).
+	// to reach gatewayd-internal; the path lives under faas-vmmd's
+	// /run/faas tmpfs (the SOLE RuntimeDirectory=faas).
 	defaultInternalSocket = "/run/faas/gatewayd-internal.sock"
 	// defaultPublicControlAddr is the loopback control plane
-	// (/healthz, /readyz, /metrics). Not host-network :9090 because
-	// the legacy gatewayd still binds there.
+	// (/healthz, /readyz, /metrics). Loopback (not :9090) because
+	// the legacy gatewayd daemon binds :9090.
 	defaultPublicControlAddr = "127.0.0.1:9090"
 )
 
@@ -199,16 +195,14 @@ func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 			}
 		}
 	}()
-	// No certsync leader, no internal-proxy "first traffic" gate —
-	// once both listeners are bound and the PG ping signal reports
-	// live, /readyz=200.
-	_ = log // future use: log on first probe state transition
+	// Single readiness signal: PG ping. /readyz=200 once PG is
+	// reachable; 503 (with the PG-ping reason) otherwise.
+	_ = log
 	return probe, pgProbeSig, pgStop
 }
 
 // buildServers constructs the plain-HTTP public + loopback control
-// servers. Kept separate so the run() body is shorter than the
-// §handlers 50-line convention (CLAUDE.md).
+// servers.
 func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux) (*http.Server, *http.Server) {
 	publicSrv := &http.Server{
 		Addr:              listenAddr,

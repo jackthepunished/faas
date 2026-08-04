@@ -5,6 +5,15 @@ Metric: `gateway_tls_on_demand_denied_total{reason}` (gatewayd `/metrics`).
 Spec: §11 abuse-vector observability + ADR-024 H3 (closed in PR #345).
 Severity: warn.
 
+> **Legacy daemon only (revised 2026-08-04).** This runbook applies
+> to the legacy `cmd/gatewayd/` daemon and to `cmd/gatewayd-public/`
+> *before* PR #633. The production deployment terminates TLS at
+> Caddy + Cloudflare upstream of `api.gregale.dev`, not in the
+> daemon. PR #633 stripped certmagic + Hetzner DNS-01 from
+> `gatewayd-public`; the legacy daemon keeps them during the
+> migration window. PR-C sweeps the certmagic packages and
+> this runbook will be archived alongside them.
+
 ## Symptom
 
 On-demand cert mint denials exceed 1/min over the rolling 5-minute
