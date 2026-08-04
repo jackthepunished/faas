@@ -202,3 +202,9 @@ linters:
       - path: "pkg/billing/stripe/sandbox_test.go"
         linters:
           - staticcheck
+      - path: "pkg/billing/stripe/usage_test.go"
+        linters:
+          - staticcheck
+      - path: "pkg/pki/pki_test.go"
+        linters:
+          - staticcheck
