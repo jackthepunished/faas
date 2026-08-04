@@ -1,7 +1,17 @@
 # ADR-024 · CertMagic TLS production cut-over + test closure
 
-- **Status:** accepted
-- **Date:** 2026-07-21
+- **Status:** accepted (legacy daemon only — revised 2026-08-04)
+- **Date:** 2026-07-21 (revised 2026-08-04)
+- **Revised 2026-08-04:** The CertMagic + Hetzner DNS-01 plumbing
+  described in this ADR applies to the **legacy `cmd/gatewayd/`
+  daemon** only, and to the Tier A7 split's `cmd/gatewayd-public/`
+  *before* PR #633. PR #633 (tier-a7 recovery) stripped certmagic +
+  Hetzner from `gatewayd-public`: the production deployment
+  terminates TLS upstream at Caddy + Cloudflare (`api.gregale.dev`),
+  not in the daemon. The cert-magic surface remains in tree for the
+  legacy daemon's migration window; PR-C sweeps it together with
+  `pkg/gateway/{tls_wire,tls,dns01_hetzner,allowlist,certsync,
+  cert_expiry}`.
 - **Decision:** Ship gatewayd's TLS termination via the already-merged
   CertMagic plumbing (`pkg/gateway/tls*.go`, `dns01_hetzner.go`,
   `allowlist.go`, `acme.go`, `cmd/gatewayd/{main,config,secrets}.go`, the

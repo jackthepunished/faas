@@ -1156,10 +1156,18 @@ const (
 	// FAAS_WARM_HINT_CACHE_SIZE.
 	//
 	// CertSyncIntervalSeconds is the leader-side safety-net cron
-	// cadence (the fast-path is the certmagic OnEvent callback).
-	// 30s is the worst-case lag a follower replica carries a stale
-	// cert; in steady state the OnEvent fast path keeps lag ≤1s.
-	// Tunable via FAAS_CERT_SYNC_INTERVAL_SECONDS.
+	// cadence for the legacy certsync replicator (the fast-path is
+	// the certmagic OnEvent callback). 30s is the worst-case lag
+	// a follower replica carries a stale cert; in steady state
+	// the OnEvent fast path keeps lag ≤1s. Tunable via
+	// FAAS_CERT_SYNC_INTERVAL_SECONDS.
+	//
+	// Legacy daemon only (revised 2026-08-04): the certsync
+	// replicator + this constant are owned by `cmd/gatewayd/` for
+	// the migration window. PR #633 stripped certsync from
+	// `gatewayd-public`; PR-C will sweep the constant + the
+	// `pkg/gateway/certsync` package together once the legacy
+	// daemon is retired.
 	//
 	// Hard limits policy (CLAUDE.md): every limit is a constant
 	// here, never inlined.

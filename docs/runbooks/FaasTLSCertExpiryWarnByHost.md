@@ -5,6 +5,15 @@ Metric: `gateway_tls_cert_expiry_by_host_seconds{hostname,kind}` (gatewayd `/met
 Spec: §12 + ADR-024 H3 follow-up (Finding 2).
 Severity: warn.
 
+> **Legacy daemon only (revised 2026-08-04).** This runbook applies
+> to the legacy `cmd/gatewayd/` daemon and to `cmd/gatewayd-public/`
+> *before* PR #633. The production deployment terminates TLS at
+> Caddy + Cloudflare upstream of `api.gregale.dev`, not in the
+> daemon. PR #633 stripped certmagic + Hetzner DNS-01 from
+> `gatewayd-public`; the legacy daemon keeps them during the
+> migration window. PR-C sweeps the certmagic packages and
+> this runbook will be archived alongside them.
+
 ## Symptom
 
 Per-host cert expiry is between 14 and 30 days. certmagic normally

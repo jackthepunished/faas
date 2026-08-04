@@ -1,15 +1,24 @@
 # ADR-070 · Tier A7 edge split — gatewayd-public / gatewayd-internal
 
-- **Status:** proposed
-- **Date:** 2026-08-03
+- **Status:** accepted (revised 2026-08-04 — TLS lives upstream; see
+  "TLS at Caddy + Cloudflare" below)
+- **Date:** 2026-08-03 (revised 2026-08-04)
 - **Decision:** Split the monolithic `cmd/gatewayd` daemon into two
   single-purpose daemons connected by a unix-socket hop. The split
   is **in-process on a single box**: one box runs one `gatewayd-public`
-  (TLS-only edge, the only public listener) fronting N
+  (plain-HTTP edge, the only public listener) fronting N
   `gatewayd-internal` replicas (routing + wake + proxy). Cross-box
   HA is achieved by having N boxes each with one `gatewayd-public`
   in front of their local `gatewayd-internal` set — NOT by putting
   multiple public listeners on one box.
+- **Revised 2026-08-04:** `gatewayd-public` serves plain HTTP on
+  `127.0.0.1:8080` (loopback only). TLS termination is the upstream
+  Caddy + Cloudflare job (`api.gregale.dev`). certmagic + Hetzner
+  DNS-01 and per-replica cert-bundle replication (sections 6 and
+  the "Cert replication" decision) never made it into code — the
+  actual production deployment shipped without them and the legacy
+  `cmd/gatewayd/` was the consumer of `pkg/gateway/certsync` and
+  the certmagic packages during the migration window.
 - **Why:** The Tier A multi-box primitives (per-node schedd, snapshot
   de-localization, cross-node rebalance, cross-node live migration,
   migrating-instance watchdog — ADRs 062–067) are all in code. What's
@@ -22,22 +31,21 @@
   invariant for free but breaks per-process state (rate limiter
   buckets split, warm hints split, cert storage split, mTLS-to-vmmd
   not handled). Splitting it in-process — one `gatewayd-public`
-  (TLS-only) fronting N `gatewayd-internal` replicas (routing +
-  wake + proxy) over a unix-socket hop — keeps the existing
-  forwarder shape, gives us a clean cert-renew race model, and lets
-  us keep "the only public listener" as a per-box invariant
+  (plain-HTTP edge behind Caddy+Cloudflare) fronting N
+  `gatewayd-internal` replicas (routing + wake + proxy) over a
+  unix-socket hop — keeps the existing forwarder shape and lets us
+  keep "the only public listener" as a per-box invariant
   (`gatewayd-public` is still ONE process surface per box).
 - **Consequences:**
   - Two new daemons: `cmd/gatewayd-public` and `cmd/gatewayd-internal`.
     Legacy `cmd/gatewayd` stays in-tree for the migration window
     (the legacy and split daemons run side-by-side; the LB points
     at `gatewayd-public` once the operator flips the env).
-  - Three new library files: `pkg/gateway/internal_proxy.go`
-    (public→internal reverse-proxy over unix socket),
-    `pkg/gateway/readiness.go` (probe + PG ping + staleness signals),
-    `pkg/gateway/routes_hydration.go` (route-cache hydration
-    tracker), and `pkg/gateway/certsync/certsync.go` (leader
-    election + cert replication).
+  - `pkg/gateway/internal_proxy.go` (public→internal reverse-proxy
+    over unix socket) and `pkg/gateway/readiness.go` (probe + PG
+    ping + staleness signals) ship in production. `pkg/gateway/
+    certsync/certsync.go` ships as the legacy daemon's leader
+    election only — sweep in PR-C.
   - Three new migrations: 00116 `warm_hint` (sticky-warm hint
     table + `warm_hint_published` pg_notify), 00117
     `pg_ratelimit_counters` (centralized rate-limit counters,
@@ -45,13 +53,18 @@
     slot (follow-on ADR-069/070/071 fences).
   - Four new constants in `pkg/api/limits.go`:
     `GatewayDrainGraceSeconds=25`, `ReplicaHeartbeatIntervalSeconds=5`,
-    `WarmHintCacheSize=1000`, `CertSyncIntervalSeconds=30`.
+    `WarmHintCacheSize=1000`, `CertSyncIntervalSeconds=30`. The
+    first three are consumed by the production daemons;
+    `CertSyncIntervalSeconds` is currently consumed only by the
+    legacy `cmd/gatewayd/` daemon's `pkg/gateway/certsync` path
+    (sweep in PR-C).
   - CLAUDE.md §"Component ownership" invariant rewrites:
     "gatewayd is the only public listener on the box" →
     "the platform exposes exactly ONE public ingress per box; that
-    ingress is `gatewayd-public`. Internal-only `gatewayd-internal`
-    listens on a unix socket inside the box. Cross-box remote
-    ingress is `gatewayd-public` on the other box's public IP."
+    ingress is `gatewayd-public` (plain-HTTP behind Caddy+Cloudflare).
+    Internal-only `gatewayd-internal` listens on a unix socket
+    inside the box. Cross-box remote ingress is `gatewayd-public`
+    on the other box's public IP."
   - The pre-split `/readyz` always-200 default is **inverted** to
     always-503 when no probe is wired. The legacy daemon is
     migrated to a real probe (`deps.pgStore != nil`). The new
@@ -59,6 +72,10 @@
   - Two new systemd units (`faas-gatewayd-public.service`,
     `faas-gatewayd-internal.service`) + two new ansible roles
     (`gatewayd_public_service`, `gatewayd_internal_service`).
+    `faas-gatewayd-public.service` is plain-HTTP at `127.0.0.1:8080`,
+    `RestrictAddressFamilies=AF_UNIX AF_INET`, no
+    `AmbientCapabilities=CAP_NET_BIND_SERVICE`, no
+    `ReadWritePaths=/var/lib/faas/certs`.
   - Slot-neutral for the LEGACY migration set; **this PR cluster
     ships 116–118 as the new edge-tier slots** (the 116 reservation
     from the open issue #517 follow-up is preserved; we add 116
@@ -69,10 +86,12 @@
 1. **In-process split, not multi-process on one box.** We chose to
    keep "one public listener per box" as the load-bearing invariant
    (CLAUDE.md §11). The split happens INSIDE the public-listener
-   process: `gatewayd-public` owns TLS + certmagic; everything
-   inside (routing, wake, forwarder, rate limit) lives in
-   `gatewayd-internal`. This matches the §11 single-public-listener
-   rule without inventing a new perimeter.
+   process: `gatewayd-public` owns the box-side public-listener
+   surface; everything inside (routing, wake, forwarder, rate
+   limit) lives in `gatewayd-internal`. TLS terminates upstream
+   (Caddy + Cloudflare — revised 2026-08-04 after the certmagic
+   strip); this matches the §11 single-public-listener rule without
+   inventing a new perimeter.
 2. **Unix-socket hop, same box only in v1.0.** `gatewayd-public`
    dials `/run/faas/gatewayd-internal.sock` (ADR-015/018 pattern,
    mode 0660 + group faas) to forward every inbound request. The
@@ -107,15 +126,16 @@
    Default stays "process" (today's behaviour); operators flip when
    they go multi-box. Same staged-rollout risk mitigation as
    ADR-040.
-6. **Cert replication (per-replica FileStorage + leader-by-lex-min).**
-   Each `gatewayd-public` runs `NewCertMagicConfig` independently
-   against its own `StorageDir` (per-replica at
-   `/var/lib/faas/certs/<replica-id>/`). The leader-elected replica
-   (lex-min `compute_node.id` among active public daemons) owns
-   renewal; followers replicate via a tiny unix-socket wire format
-   (ADR-069 — `pkg/gateway/certsync`). The shared
-   `CAConfigDir` (`/var/lib/faas/ca/`) carries the ACME account
-   key — only the leader writes, followers read.
+6. **Cert replication (revised 2026-08-04 — never shipped).** The
+   original ADR prescribed per-replica FileStorage +
+   leader-by-lex-min (`pkg/gateway/certsync`) so N `gatewayd-public`
+   replicas on N boxes could each terminate TLS with a fresh cert.
+   The actual production deployment terminates TLS at Caddy +
+   Cloudflare upstream, so the per-replica FileStorage + leader
+   election never landed in `gatewayd-public`. The legacy
+   `cmd/gatewayd/` daemon still consumes `pkg/gateway/certsync`
+   during the migration window; sweep both together with the
+   certmagic packages in PR-C.
 7. **Readiness inversion.** The pre-split `/readyz` always-200
    default was a latent bug (cmd/gatewayd/main.go:878 wired `nil`).
    After the split, a partial-boot daemon must NOT accept traffic
@@ -141,7 +161,7 @@
    drains on SIGTERM (sets `/readyz=503`, stops accepting from the
    unix socket, waits in-flight, posts `deregister` to
    `gatewayd-public`, exits). `gatewayd-public` then drains (sets
-   `/readyz=503`, stops accepting on :443/:80, waits in-flight,
+   `/readyz=503`, stops accepting on `127.0.0.1:8080`, waits in-flight,
    exits). The order matters: if the public daemon drains first,
    in-flight requests die on the unix socket.
 10. **Network surface hardening.**
@@ -152,14 +172,18 @@
     because the legacy daemon dials external IPs through the
     forwarder; the internal daemon's only outbound is gRPC to
     per-node schedd/vmmd via `pkg/wire.DialContext` (loopback mTLS
-    or unix socket).
-11. **Listener boundaries.** `gatewayd-public` owns:
-    - `:80` ACME HTTP-01 + `.well-known/acme-challenge/*`
-    - `:443` TLS termination with certmagic `GetCertificate`
-    - `/healthz`, `/readyz`, `/metrics` on loopback `:9090`
+    or unix socket). `faas-gatewayd-public.service` is
+    `RestrictAddressFamilies=AF_UNIX AF_INET` (revised 2026-08-04
+    after the certmagic strip — drop AF_INET6 because the bind is
+    loopback v4).
+11. **Listener boundaries.** `gatewayd-public` owns (revised 2026-08-04):
+    - `127.0.0.1:8080` plain-HTTP listener (TLS terminates at
+      Caddy upstream; certmagic + `:80`/`:443` are gone)
+    - `/healthz`, `/readyz`, `/metrics` on loopback `127.0.0.1:9090`
     - `pkg/httpsec` outer wrapper (HSTS / CSP nonce /
       X-Frame-Options / Referrer-Policy / X-Content-Type-Options /
-      Permissions-Policy)
+      Permissions-Policy) — note that HSTS is benign over plain
+      HTTP (RFC 6797 §8.1)
     `gatewayd-internal` owns:
     - `/run/faas/gatewayd-internal.sock` (HTTP/1.1)
     - `/healthz`, `/readyz`, `/metrics` on loopback `:9091`
@@ -170,16 +194,12 @@
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `FAAS_PUBLIC_LISTEN_ADDR` | `:443` | `gatewayd-public`'s TLS listener. |
+| `FAAS_PUBLIC_LISTEN_ADDR` | `127.0.0.1:8080` | `gatewayd-public`'s plain-HTTP listener (loopback; TLS at Caddy upstream). |
 | `FAAS_INTERNAL_SOCKET` | `/run/faas/gatewayd-internal.sock` | Unix socket the public daemon dials. |
 | `FAAS_INTERNAL_CONTROL_ADDR` | `127.0.0.1:9091` | `gatewayd-internal`'s control listener. |
-| `FAAS_CERT_STORAGE_DIR` | `/var/lib/faas/certs` | Per-replica certmagic storage. |
-| `FAAS_APPS_DOMAIN` | `apps.gregale.dev` | DNS-01 mint zone. |
-| `FAAS_HETZNER_DNS_TOKEN_PATH` | `/etc/faas/hetzner-dns.token` | DNS-01 solver token. |
-| `FAAS_ACME_CONTACT_EMAIL` | `ops@<apps_domain>` | CertMagic registration email. |
-| `FAAS_NODE_ID` | (PG lookup) | Override for compute_nodes.id when PG is unreachable at boot. |
-| `FAAS_NODE_NAME` | `default-local` | Override for compute_nodes.name. |
 | `[ratelimit] mode` | `process` | `process` (legacy) or `central` (Postgres-backed counter). |
+| `FAAS_NODE_ID` / `FAAS_NODE_NAME` | (PG lookup) | Legacy override for `compute_nodes` rows when the legacy daemon was bootstrapped off a fresh box. No consumer in `gatewayd-public` after the certmagic strip; the legacy daemon keeps the lookup, the public daemon does not. |
+| `FAAS_HETZNER_DNS_TOKEN_PATH` / `FAAS_CERT_STORAGE_DIR` / `FAAS_APPS_DOMAIN` / `FAAS_ACME_CONTACT_EMAIL` | (deleted) | Were the certmagic DNS-01 surface; deleted in PR #633 alongside the certmagic strip. |
 
 Constants live in `pkg/api/limits.go` (canonical hard-limits table;
 never inline a limit per CLAUDE.md).
@@ -231,32 +251,47 @@ never inline a limit per CLAUDE.md).
 - `pkg/gateway/internal_proxy_test.go` (new) — hop-by-hop,
   X-Forwarded-For append, dial-failure 502, upstream 5xx pass-through.
 - `pkg/gateway/certsync/certsync.go` (new) — leader election,
-  peer sync wire format, file writer.
+  peer sync wire format, file writer. **Legacy only** as of
+  2026-08-04 — sweep in PR-C.
 - `pkg/gateway/certsync/certsync_test.go` (new) — lex-min election,
-  wire round-trip, magic + version rejection, file writer.
+  wire round-trip, magic + version rejection, file writer. Legacy
+  coverage; PR-C cleans the package.
 - `cmd/gatewayd/main.go` (edited) — wired real `ReadyFunc` at
-  line 878 (was `nil`).
-- `cmd/gatewayd-public/main.go` (new) — TLS-only edge daemon.
-- `cmd/gatewayd-public/` — bootstraps certmagic, httpsec, the
-  internal-proxy, the certsync leader, and the readiness probe.
+  line 878 (was `nil`). Legacy daemon only.
+- `cmd/gatewayd-public/main.go` (new) — plain-HTTP edge daemon
+  (revised 2026-08-04: drops certmagic, secrets.go, certsync block,
+  resolveNodeIdentity, pgNodeLister, domainLookup, runCertSyncLoop;
+  binds `127.0.0.1:8080` loopback).
+- `cmd/gatewayd-public/` — bootstraps httpsec, the internal-proxy,
+  and the readiness probe (single PG-ping signal).
+- `cmd/gatewayd-public/secrets.go` — deleted 2026-08-04 (the Hetzner
+  token loader was the only consumer of `loadSecretFile`; the
+  legacy daemon keeps its identical loader).
 - `cmd/gatewayd-internal/main.go` (new) — routing + wake + proxy
   daemon (skeleton; the handler file moves land in a follow-on PR).
-- `pkg/api/limits.go` (edited) — 4 new constants.
+- `pkg/api/limits.go` (edited) — 4 new constants. `GatewayDrainGraceSeconds`,
+  `ReplicaHeartbeatIntervalSeconds`, `WarmHintCacheSize` are
+  production consumers; `CertSyncIntervalSeconds` is legacy-daemon
+  only (sweep in PR-C).
 - `migrations/00116_warm_hint.sql` (new) — `warm_hint` table +
   CHECK + partial index.
 - `migrations/00117_pg_ratelimit.sql` (new) —
   `pg_ratelimit_counters` table.
 - `migrations/00118_reserve_slot.sql` (new) — follow-on ADR fence.
-- `deploy/systemd/faas-gatewayd-public.service` (new) — TLS-only
-  edge unit with `CAP_NET_BIND_SERVICE` + cert storage
-  ReadWritePaths.
+- `deploy/systemd/faas-gatewayd-public.service` (new) —
+  plain-HTTP edge unit (revised 2026-08-04: drops
+  `CAP_NET_BIND_SERVICE` + `/var/lib/faas/certs` ReadWritePaths;
+  binds `127.0.0.1:8080`; `RestrictAddressFamilies=AF_UNIX AF_INET`).
 - `deploy/systemd/faas-gatewayd-internal.service` (new) — unix-only
   internal unit with `RestrictAddressFamilies=AF_UNIX`.
 - `deploy/ansible/roles/gatewayd_public_service/` (new) — ansible
-  role for storage dirs + unit drop.
+  role for unit drop (revised 2026-08-04: drops
+  `/var/lib/faas/certs` + `/var/lib/faas/ca` directory-creation
+  tasks).
 - `deploy/ansible/roles/gatewayd_internal_service/` (new) — ansible
   role for the unix-socket-only unit.
-- `CLAUDE.md` (edited) — Component ownership invariant rewrite.
+- `CLAUDE.md` (edited) — Component ownership invariant rewrite
+  (plain-HTTP semantics, not TLS-only).
 
 ## Tests
 
@@ -318,16 +353,20 @@ never inline a limit per CLAUDE.md).
 - `make lint` — `golangci-lint` + repo-wide `gofmt -l` gate.
 - `make spec-check` — vacuum + AST parity + git clean.
 - `make migrations-check` — embedded set stays contiguous 1..118.
-- Manual smoke (Lima / EX44):
+- Manual smoke (Lima / EX44), revised 2026-08-04:
   1. `make bootstrap && make run` with one `gatewayd-public` +
      one `gatewayd-internal`.
   2. `curl -s http://127.0.0.1:9090/readyz` → 200 after PG ping
      succeeds.
-  3. `curl -s https://example.apps.gregale.dev/ | head -5` →
-     customer app response.
-  4. Kill `gatewayd-internal`; `curl -s https://...` → 502 Bad
-     Gateway (`internal dial failed`).
-  5. Restart `gatewayd-internal`; `curl -s https://...` → 200.
+  3. `curl -s http://127.0.0.1:8080/healthz` → 200 once both
+     listeners are bound (revised: plain HTTP, not TLS).
+  4. Confirm Caddy is upstream and reverse-proxying to
+     `127.0.0.1:8080`; the actual customer-app smoke
+     (`https://app.apps.gregale.dev/`) is Caddy's job, not
+     `gatewayd-public`'s.
+  5. Kill `gatewayd-internal`; the customer's HTTPS request gets
+     502 Bad Gateway (`internal dial failed`); restart internal,
+     request succeeds again.
 
 ## Migration slot
 
@@ -366,10 +405,12 @@ follows the existing post-#533-merge renumber-reset pattern.
 - **Multi-process on one box (`gatewayd-public` × N + `gatewayd-internal`
   × N behind an external LB).** Rejected — violates CLAUDE.md
   "single public listener per box" and breaks per-process state
-  (rate limiter buckets split, warm hints split, cert storage
-  split). The whole point of the split is to KEEP single-process
-  state on the internal tier while presenting a single TLS surface
-  to the public.
+  (rate limiter buckets split, warm hints split). The whole
+  point of the split is to KEEP single-process state on the
+  internal tier while presenting a single plain-HTTP surface
+  to the upstream Caddy+Cloudflare. (TLS is now Caddy's job;
+  the original 2026-08-03 ADR spoke of "single TLS surface to
+  the public" — superseded 2026-08-04.)
 - **`apps.last_warm_node_id` column.** Rejected — same writer-
   invariant problem (would force schedd to write a customer-intent
   table); also breaks schedd/apid writer roles.
