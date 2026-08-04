@@ -2,21 +2,226 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { APIKeyResponse } from '../models/APIKeyResponse.js';
 import type { ChangeMemberRoleRequest } from '../models/ChangeMemberRoleRequest.js';
+import type { CreateOrgAPIKeyRequest } from '../models/CreateOrgAPIKeyRequest.js';
 import type { CreateOrgRequest } from '../models/CreateOrgRequest.js';
 import type { InvitationWithTokenResponse } from '../models/InvitationWithTokenResponse.js';
 import type { InviteMemberRequest } from '../models/InviteMemberRequest.js';
+import type { ListOrgAPIKeysResponse } from '../models/ListOrgAPIKeysResponse.js';
 import type { MemberListResponse } from '../models/MemberListResponse.js';
 import type { OrgInvitationResponse } from '../models/OrgInvitationResponse.js';
 import type { OrgListResponse } from '../models/OrgListResponse.js';
 import type { OrgMemberResponse } from '../models/OrgMemberResponse.js';
 import type { OrgResponse } from '../models/OrgResponse.js';
 import type { PatchOrgRequest } from '../models/PatchOrgRequest.js';
+import type { RotateOrgAPIKeyRequest } from '../models/RotateOrgAPIKeyRequest.js';
+import type { RotateOrgAPIKeyResponse } from '../models/RotateOrgAPIKeyResponse.js';
 import type { TransferOwnershipRequest } from '../models/TransferOwnershipRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
 export class OrgsService {
+  /**
+   * List API keys minted against the active org.
+   * Returns every key the org owns (active + grace + revoked).
+   * Mirrors `GET /v1/keys`; PR 6's canonical path. The `org_id`
+   * on every row will match `{slug}` because the store filters
+   * server-side on the loaded membership.
+   *
+   * @returns ListOrgAPIKeysResponse Org-scoped API key list.
+   * @throws ApiError
+   */
+  public static listOrgApiKeys({
+    slug,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+  }): CancelablePromise<ListOrgAPIKeysResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/orgs/{slug}/keys',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        404: `Org slug not found, or caller has no membership.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Mint a new API key for the active org.
+   * Returns the plaintext exactly once (same as `POST /v1/keys`).
+   * The new row's `org_id` is the loaded membership's org; personal
+   * orgs are mintable (the `org_personal_immutable` 409 applies to
+   * mutations on the org row, not key mints against it).
+   *
+   * @returns APIKeyResponse New API key minted against the org.
+   * @throws ApiError
+   */
+  public static createOrgApiKey({
+    slug,
+    requestBody,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    requestBody: CreateOrgAPIKeyRequest,
+  }): CancelablePromise<APIKeyResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/orgs/{slug}/keys',
+      path: {
+        'slug': slug,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `Invalid body (unknown scope, label too long).`,
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        404: `Active-org header missing or unknown; caller has no membership on the resolved slug.`,
+        429: `Per-account key quota (\`api.Plan.KeysMax\`) reached.`,
+      },
+    });
+  }
+  /**
+   * Fetch a single API key by id (org-scoped).
+   * Lookup mirror of `GET /v1/keys/{id}` (the legacy path does not
+   * exist by id in pre-PR-6 — this path is the canonical single-key
+   * read). The response is the standard `APIKeyResponse` (no
+   * plaintext). Cross-org probes collapse to 404.
+   *
+   * @returns APIKeyResponse Single API key.
+   * @throws ApiError
+   */
+  public static getOrgApiKey({
+    slug,
+    id,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<APIKeyResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/orgs/{slug}/keys/{id}',
+      path: {
+        'slug': slug,
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        404: `Key id not in org, or org slug not found.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Revoke an API key (org-scoped).
+   * Soft-delete mirror of `DELETE /v1/keys/{id}`. Status flips to
+   * 'revoked'; subsequent bearer-auth attempts hit `ErrAPIKeyRevoked`
+   * (401 unauthenticated). The audit row carries `org_id` (PR 6
+   * closes the ADR-061 §E "audit scoped to org" gap).
+   *
+   * @returns void
+   * @throws ApiError
+   */
+  public static revokeOrgApiKey({
+    slug,
+    id,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: 'DELETE',
+      url: '/v1/orgs/{slug}/keys/{id}',
+      path: {
+        'slug': slug,
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        404: `Key id not in this org, or active-org slug not found.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Rotate an API key (org-scoped).
+   * Org-scoped counterpart of `POST /v1/keys/{id}/rotate`. Mints a
+   * new key (status='active') and demotes the predecessor into the
+   * grace window in one transaction. The new key inherits the
+   * predecessor's `org_id` — rotation never silently rebinds across
+   * orgs. Quota is neutral (-1 +1 = 0).
+   *
+   * @returns RotateOrgAPIKeyResponse New key minted, predecessor in 'grace' (or 'revoked' if grace_window_days=0).
+   * @throws ApiError
+   */
+  public static rotateOrgApiKey({
+    slug,
+    id,
+    requestBody,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+    requestBody?: RotateOrgAPIKeyRequest,
+  }): CancelablePromise<RotateOrgAPIKeyResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/orgs/{slug}/keys/{id}/rotate',
+      path: {
+        'slug': slug,
+        'id': id,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        404: `Key id not in org, or org slug not found, or predecessor already revoked.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
   /**
    * List orgs the caller has an active membership in.
    * Returns the personal org + every shared org the caller

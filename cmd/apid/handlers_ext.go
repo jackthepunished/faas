@@ -1219,7 +1219,26 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		t := time.Now().UTC().Add(time.Duration(api.DefaultAPIKeyLifetimeDays) * 24 * time.Hour)
 		expiresAt = &t
 	}
-	k, err := s.store.CreateAPIKeyWithExpiry(ctx(r), acct.ID, hash, req.Label, scopes, expiresAt)
+	// PR 6 (issue #190 / IAM-6) dual-write: the legacy /v1/keys
+	// POST persists the key against the caller's personal org
+	// so api_keys.org_id is populated (the 00127 NOT NULL flip).
+	// When the personal-org backfill (PR 3) hasn't run yet for
+	// this account (very old test fixtures — PR 3 is a soft
+	// migration, not a hard schema flip), fall back to the
+	// legacy CreateAPIKeyWithExpiry so the customer is never
+	// locked out of their own key mint. ErrNotFound is the
+	// expected signal; any other error is a 500.
+	org, perr := s.store.OrgByPersonalAccount(ctx(r), acct.ID)
+	var k state.APIKey
+	switch {
+	case perr == nil:
+		k, err = s.store.CreateOrgAPIKey(ctx(r), org.ID, acct.ID, hash, req.Label, scopes, expiresAt)
+	case errors.Is(perr, state.ErrNotFound):
+		k, err = s.store.CreateAPIKeyWithExpiry(ctx(r), acct.ID, hash, req.Label, scopes, expiresAt)
+	default:
+		api.WriteProblem(w, api.ErrCapacity("could not resolve personal org"))
+		return
+	}
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
@@ -1229,6 +1248,12 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// IAM-4 (ADR-035): record the key mint. subject = account_id (the
 	// owner); data.scopes is the per-key permission set so the
 	// audit row can answer "who minted which scopes today?".
+	//
+	// PR 6 dual-emit: the legacy `key.created` event stays byte-
+	// identical (schema break would trip legacy dashboards) and
+	// the new `api_key.created` event carries the org_id stamp
+	// so PR 5+ dashboards can group by org. PR 9 drops the
+	// legacy event.
 	auditPayload := map[string]any{
 		"key_id": k.ID,
 		"scopes": scopes,
@@ -1237,8 +1262,20 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		auditPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 	s.audit.Emit(ctx(r), "key.created", &acct.ID, auditPayload)
+	if perr == nil {
+		newPayload := map[string]any{
+			"key_id": k.ID,
+			"scopes": scopes,
+			"org_id": k.OrgID,
+		}
+		if k.ExpiresAt != nil {
+			newPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		s.audit.Emit(ctx(r), "api_key.created", &acct.ID, newPayload)
+	}
 	resp := api.APIKeyResponse{
 		ID:        k.ID,
+		OrgID:     k.OrgID,
 		Prefix:    keyPrefix(plaintext),
 		Label:     k.Label,
 		Scopes:    k.Scopes,
@@ -1371,11 +1408,26 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 
+	// PR 6 (issue #190 / IAM-6) dual-write: discover the old key's
+	// org_id before rotating so the RotateOrgAPIKey call can pin
+	// the (id, org_id) lock predicate. GetAPIKey collapses
+	// cross-account reads to ErrNotFound at the SQL level — the
+	// same IDOR-safe shape the legacy MarkAPIKeyRevoked uses.
+	oldKey, err := s.store.GetAPIKey(ctx(r), acct.ID, id)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			s.notFound(w, "no such key")
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not load key"))
+		return
+	}
+
 	// Inherit the old label so the customer's CI config doesn't
 	// need to chase a label change. The store layer reads the
 	// old row's label in the transaction; the empty string tells
 	// the store to use the old row's value as-is.
-	newKey, oldKey, err := s.store.RotateAPIKey(ctx(r), acct.ID, id, hash, "", graceWindow)
+	newKey, oldKey, err := s.store.RotateOrgAPIKey(ctx(r), oldKey.OrgID, id, hash, "", graceWindow)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -1401,6 +1453,16 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"old_key_expires_at": oldKey.ExpiresAt.UTC().Format(time.RFC3339),
 	}
 	s.audit.Emit(ctx(r), "key.rotated", &acct.ID, auditPayload)
+	// PR 6 dual-emit: the new `api_key.rotated` carries org_id
+	// so the PR 5+ dashboard can group rotations by org. PR 9
+	// drops the legacy event.
+	s.audit.Emit(ctx(r), "api_key.rotated", &acct.ID, map[string]any{
+		"old_key_id":         oldKey.ID,
+		"new_key_id":         newKey.ID,
+		"grace_window_days":  graceWindowDays,
+		"old_key_expires_at": oldKey.ExpiresAt.UTC().Format(time.RFC3339),
+		"org_id":             oldKey.OrgID,
+	})
 	s.log.Info("key rotated",
 		"old_key", oldKey.ID, "new_key", newKey.ID,
 		"account", acct.ID, "grace_window_days", graceWindowDays)
@@ -1408,6 +1470,7 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	resp := api.RotateKeyResponse{
 		Key: api.APIKeyResponse{
 			ID:            newKey.ID,
+			OrgID:         newKey.OrgID,
 			Prefix:        keyPrefix(plaintext),
 			Label:         newKey.Label,
 			Scopes:        newKey.Scopes,

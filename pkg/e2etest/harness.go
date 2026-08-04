@@ -422,7 +422,15 @@ const testDomain = "apps.test.example"
 //     Slots 127/128 (issue #463 / ADR-069 / PR-B) add the
 //     `deployment_sidecar_layers` table and the
 //     `events_sidecar_name_idx` partial expression index.
-const e2eMigrationTarget = 128
+//     Slots 131/132/133 (issue #557 / ADR-072, PR #618) add the
+//     apps.min_instances + instances.app_id/deployment_id + deployments
+//     .min_instances columns + checks/indexes for the per-deployment
+//     floor reconciler. Slots 129 + 130 are fenced on main per ADR-041
+//     to keep the embedded set contiguous 1..133 while the cross-PR
+//     collision detector excludes the reservations. Slot 134 (issue
+//     #190 / ADR-061 / PR-6) flips api_keys.org_id to NOT NULL after
+//     the personal-org backfill.
+const e2eMigrationTarget = 134
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

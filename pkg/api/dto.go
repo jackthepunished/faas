@@ -772,19 +772,29 @@ type AccountLimits struct {
 }
 
 // APIKeyResponse is an API key returned to the customer. The plaintext
-// appears ONLY on creation (POST /v1/keys) and rotation
-// (POST /v1/keys/{id}/rotate), never on GET — only the prefix + label
-// + scopes + last_used_at + id + status are returned thereafter. Scopes
-// is the explicit permission set attached to the key (e.g. ["admin"],
-// ["apps:read", "deploy:write"]); see ADR-034 rev2.
+// appears ONLY on creation (POST /v1/keys, POST /v1/orgs/{slug}/keys)
+// and rotation (POST /v1/keys/{id}/rotate,
+// POST /v1/orgs/{slug}/keys/{id}/rotate), never on GET — only the
+// prefix + label + scopes + last_used_at + id + status are returned
+// thereafter. Scopes is the explicit permission set attached to the key
+// (e.g. ["admin"], ["apps:read", "deploy:write"]); see ADR-034 rev2.
 //
 // IAM-5 (issue #189): ExpiresAt is RFC3339; omitted when the key never
 // expires (admin keys default to nil expiry). Status is one of "active",
 // "grace", "revoked". RevokedAt mirrors ExpiresAt semantics. RotatedFromID
 // is the predecessor key's id when this row was minted by rotateKey;
 // empty otherwise.
+//
+// OrgID (issue #190 / IAM-6, PR 6): the org this key was minted against.
+// Migration 00127 makes api_keys.org_id NOT NULL so every row carries
+// a value — the legacy /v1/keys paths stamp it from the caller's
+// personal org, and the org-scoped /v1/orgs/{slug}/keys paths stamp
+// it from principal.Membership.OrgID. The field is backwards-compat
+// ADD: existing SDK clients ignore unknown fields, and the schema is
+// unchanged at the wire level except for the new property.
 type APIKeyResponse struct {
 	ID            string   `json:"id"`
+	OrgID         string   `json:"org_id"`
 	Prefix        string   `json:"prefix"` // "fp_live_abc12345…" (first 16 chars)
 	Label         string   `json:"label,omitempty"`
 	Scopes        []string `json:"scopes"`
@@ -846,6 +856,53 @@ type GraceWindowResponse struct {
 type CreateKeyRequest struct {
 	Label  string   `json:"label,omitempty"`
 	Scopes []string `json:"scopes,omitempty"`
+}
+
+// CreateOrgAPIKeyRequest is the body of POST /v1/orgs/{slug}/keys
+// (issue #190 / IAM-6, PR 6). Mirrors CreateKeyRequest's shape so
+// the SDK + dashboard can swap one request body for the other via
+// the active-org hint. The handler validates Scopes against the
+// same closed vocabulary (admin, apps:read, deploy:write,
+// secrets:read, secrets:write, usage:read) — the only difference
+// from CreateKeyRequest is the explicit org binding (so the
+// developer role cannot silently escalate to a contractor key in
+// another org via the admin-scope default).
+type CreateOrgAPIKeyRequest struct {
+	Label  string   `json:"label,omitempty"`
+	Scopes []string `json:"scopes,omitempty"`
+}
+
+// ListOrgAPIKeysResponse is the body of GET /v1/orgs/{slug}/keys
+// (PR 6). Keys is sorted by created_at desc to match the legacy
+// ListAPIKeys response ordering. The handler filters out revoked
+// rows so the dashboard's "active deploy keys" view only counts
+// keys the customer can still sign with — the "show revoked"
+// toggle lives at the dashboard side, not here.
+type ListOrgAPIKeysResponse struct {
+	Keys []APIKeyResponse `json:"keys"`
+}
+
+// RotateOrgAPIKeyRequest is the body of
+// POST /v1/orgs/{slug}/keys/{id}/rotate (PR 6). Label is the new
+// label; empty means "inherit the old label" (the canonical
+// handler shape, mirrors LegacyRotateKey). The org binding is
+// inherited from the predecessor — rotation is org-local, never
+// re-bound.
+type RotateOrgAPIKeyRequest struct {
+	Label string `json:"label,omitempty"`
+}
+
+// RotateOrgAPIKeyResponse is the body of
+// POST /v1/orgs/{slug}/keys/{id}/rotate (PR 6). Same shape as
+// RotateKeyResponse with org_id stamped on the new Key. The
+// handler returns the legacy `key.rotated` + the new
+// `api_key.rotated` audit events for one release cycle (PR 9
+// drops the legacy event).
+type RotateOrgAPIKeyResponse struct {
+	Key             APIKeyResponse `json:"key"`
+	KeyPlaintext    string         `json:"key_plaintext"`
+	OldKeyID        string         `json:"old_key_id"`
+	OldKeyExpiresAt string         `json:"old_key_expires_at"` // RFC3339
 }
 
 // CustomDomainResponse is a custom domain's wire shape. VerifiedAt is the

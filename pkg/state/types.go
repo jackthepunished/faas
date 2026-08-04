@@ -228,8 +228,16 @@ const (
 )
 
 type APIKey struct {
-	ID            string
-	AccountID     string
+	ID        string
+	AccountID string
+	// OrgID is the org the key was minted against (issue #190 / IAM-6,
+	// PR 6). Migration 00127 flips api_keys.org_id from NULL to
+	// NOT NULL after the deterministic personal-org backfill, so every
+	// row carries a non-empty string. The PR 7 (schedd/meterd/gatewayd
+	// cutover) bump to AuthenticateKey's signature will thread this
+	// into admission decisions; PR 6 only adds the field so the
+	// Store/handler/auth triple don't need a coordinated rename.
+	OrgID         string
 	Hash          []byte
 	Label         string
 	Scopes        []string

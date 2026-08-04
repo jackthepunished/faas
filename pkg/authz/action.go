@@ -20,7 +20,7 @@ package authz
 
 import "github.com/onebox-faas/faas/pkg/state"
 
-// OrgAction is one of the nine role-checked verbs the org surface
+// OrgAction is one of the eleven role-checked verbs the org surface
 // understands. The vocabulary is closed (issue #190 / IAM-6 / ADR-061):
 // PR 5/6 add handlers that compose these constants — they do NOT add
 // new ad-hoc verbs.
@@ -72,6 +72,17 @@ const (
 	// OrgActionDelete is DELETE /v1/orgs/{slug} (the soft-delete
 	// path — sets deleted_pending; PR 8 wires the actual purge).
 	OrgActionDelete OrgAction = "org.delete"
+
+	// OrgActionCreateApiKey is POST /v1/orgs/{slug}/keys +
+	// POST /v1/orgs/{slug}/keys/{id}/rotate (mint + rotate share
+	// the verb — both gate key-material issuance, the only
+	// difference is whether the key replaces an old one). Owner
+	// + admin. PR 6 ships this verb.
+	OrgActionCreateApiKey OrgAction = "org.create_api_key"
+
+	// OrgActionRevokeApiKey is DELETE /v1/orgs/{slug}/keys/{id}.
+	// Owner + admin. PR 6 ships this verb.
+	OrgActionRevokeApiKey OrgAction = "org.revoke_api_key"
 )
 
 // AllOrgActions is the closed vocabulary in iteration order. Used by
@@ -87,6 +98,8 @@ var AllOrgActions = []OrgAction{
 	OrgActionManageBilling,
 	OrgActionChangePlan,
 	OrgActionDelete,
+	OrgActionCreateApiKey,
+	OrgActionRevokeApiKey,
 }
 
 // AllOrgRoles is the closed role vocabulary in priority order. The

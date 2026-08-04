@@ -1116,6 +1116,23 @@ func (m *MemStore) ListAPIKeys(_ context.Context, accountID string) ([]APIKey, e
 	return out, nil
 }
 
+// GetAPIKey mirrors PgStore. Returns ErrNotFound when the key is
+// missing OR owned by a different account (the cross-account collapse
+// matches the SQL-side IDOR-safe shape). Used by legacy rotateKey
+// (PR 6 dual-write) to discover the old row's org_id before the
+// rotation.
+//
+// Issue #190 / IAM-6, PR 6.
+func (m *MemStore) GetAPIKey(_ context.Context, accountID, keyID string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keys[keyID]
+	if !ok || k.AccountID != accountID {
+		return APIKey{}, ErrNotFound
+	}
+	return k, nil
+}
+
 func (m *MemStore) TouchKeyLastUsed(_ context.Context, keyID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1273,6 +1290,134 @@ func (m *MemStore) SetAccountKeyGraceWindow(_ context.Context, accountID string,
 	a.KeyGraceWindowDays = days
 	m.accounts[accountID] = a
 	return nil
+}
+
+// --- Org-bound API keys (issue #190 / IAM-6, PR 6) ------------------------
+//
+// Same shape as the legacy per-account API key methods, but filtered by
+// org_id. The shared `keys` map is the index; the filter is in-Go so
+// there is no separate map keyed by org_id (MemStore's test-only scope
+// doesn't need the index — keeps the canonical "every key in one map"
+// invariant pgstore's pg_class read-models mirror).
+
+func (m *MemStore) CreateOrgAPIKey(_ context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.accounts[accountID]; !ok {
+		return APIKey{}, ErrNotFound
+	}
+	h := hex.EncodeToString(hash)
+	if _, dup := m.keyByHash[h]; dup {
+		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	k := APIKey{
+		ID:        newID(),
+		AccountID: accountID,
+		OrgID:     orgID,
+		Hash:      hash,
+		Label:     label,
+		Scopes:    scopes,
+		CreatedAt: time.Now(),
+		Status:    string(APIKeyStatusActive),
+		ExpiresAt: expiresAt,
+	}
+	m.keys[k.ID] = k
+	m.keyByHash[h] = k
+	return k, nil
+}
+
+func (m *MemStore) ListOrgAPIKeys(_ context.Context, orgID string) ([]APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]APIKey, 0)
+	for _, k := range m.keys {
+		if k.OrgID != orgID {
+			continue
+		}
+		if k.Status != string(APIKeyStatusActive) && k.Status != string(APIKeyStatusGrace) {
+			continue
+		}
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *MemStore) GetOrgAPIKey(_ context.Context, orgID, keyID string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keys[keyID]
+	if !ok || k.OrgID != orgID {
+		return APIKey{}, ErrNotFound
+	}
+	return k, nil
+}
+
+func (m *MemStore) RevokeOrgAPIKey(_ context.Context, orgID, keyID string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.keys[keyID]
+	if !ok || k.OrgID != orgID {
+		return APIKey{}, ErrNotFound
+	}
+	if k.Status != string(APIKeyStatusRevoked) {
+		k.Status = string(APIKeyStatusRevoked)
+		if k.RevokedAt == nil {
+			now := time.Now()
+			k.RevokedAt = &now
+		}
+		m.keys[k.ID] = k
+		m.keyByHash[hex.EncodeToString(k.Hash)] = k
+	}
+	return k, nil
+}
+
+func (m *MemStore) RotateOrgAPIKey(_ context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (APIKey, APIKey, error) {
+	if graceWindow < 0 {
+		graceWindow = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.keys[oldKeyID]
+	if !ok || old.OrgID != orgID {
+		return APIKey{}, APIKey{}, ErrNotFound
+	}
+	if old.Status == string(APIKeyStatusRevoked) {
+		return APIKey{}, APIKey{}, ErrAPIKeyRevoked
+	}
+	if newLabel == "" {
+		newLabel = old.Label
+	}
+	rotatedFrom := old.ID
+	newKey := APIKey{
+		ID:            newID(),
+		AccountID:     old.AccountID,
+		OrgID:         old.OrgID,
+		Hash:          newHash,
+		Label:         newLabel,
+		Scopes:        old.Scopes,
+		CreatedAt:     time.Now(),
+		Status:        string(APIKeyStatusActive),
+		RotatedFromID: &rotatedFrom,
+	}
+	m.keys[newKey.ID] = newKey
+	m.keyByHash[hex.EncodeToString(newKey.Hash)] = newKey
+
+	now := time.Now()
+	if graceWindow == 0 {
+		old.Status = string(APIKeyStatusRevoked)
+		old.ExpiresAt = &now
+		if old.RevokedAt == nil {
+			old.RevokedAt = &now
+		}
+	} else {
+		old.Status = string(APIKeyStatusGrace)
+		deadline := now.Add(graceWindow)
+		old.ExpiresAt = &deadline
+	}
+	m.keys[old.ID] = old
+	m.keyByHash[hex.EncodeToString(old.Hash)] = old
+	return newKey, old, nil
 }
 
 // --- Projects (ADR-050, Phase 1) -------------------------------------------

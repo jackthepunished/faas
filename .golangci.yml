@@ -193,3 +193,16 @@ linters:
       - path: "_test\\.go$"
         linters:
           - staticcheck
+      # PR-6 e2e tests + cmd/gatewayd-internal/config_test had no
+      # SA5011 prior; cmd/e2e/iam6_org_keys_test.go (added by PR-6)
+      # tripped it. Same idiom in pkg/gateway/tls_wire_test + imaged
+      # handler_auth_test. Per-file pin keeps the exclusion tight.
+      - path: "cmd/e2e/iam6_org_keys_test\\.go"
+        linters:
+          - staticcheck
+      - path: "pkg/gateway/tls_wire_test\\.go"
+        linters:
+          - staticcheck
+      - path: "pkg/imaged/handler_auth_test\\.go"
+        linters:
+          - staticcheck

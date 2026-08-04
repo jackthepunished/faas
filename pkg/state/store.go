@@ -452,6 +452,13 @@ type Store interface {
 	// operator investigating "who signed in as alice?" can identify
 	// which key authenticated. Returns ErrNotFound if no row matches.
 	APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error)
+	// GetAPIKey returns a single api_keys row by (accountID, keyID).
+	// Used by the legacy rotateKey (issue #190 / IAM-6, PR 6) dual-write
+	// to discover the old key's org_id before the rotation. Cross-account
+	// reads collapse to ErrNotFound at the SQL level (the WHERE pins
+	// both account_id and id) — the same IDOR-safe shape the older
+	// MarkAPIKeyRevoked uses. Returns ErrNotFound if no matching row.
+	GetAPIKey(ctx context.Context, accountID, keyID string) (APIKey, error)
 	// AuthenticateKey resolves a bearer token to the matching account
 	// AND key in a single Store call. This is the canonical lookup for
 	// the apid auth middleware (cmd/apid server.go s.auth) — it avoids
@@ -549,6 +556,48 @@ type Store interface {
 	//
 	// Issue #189 / IAM-5.
 	SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error
+
+	// Org-bound API keys (issue #190 / IAM-6, PR 6).
+	//
+	// The org-scoped counterparts to CreateAPIKeyWithExpiry /
+	// MarkAPIKeyRevoked / RotateAPIKey. The org_id is
+	// principal.Membership.OrgID from the loadOrg middleware, so
+	// the schema-level NOT NULL constraint (migration 00127) is
+	// satisfied without a personal-org subquery. The org_id IS
+	// the canonical bind; account_id is denormalised for
+	// AuthenticateKey compatibility through PR 7.
+	//
+	// Cross-org read collapse: GetOrgAPIKey and RevokeOrgAPIKey
+	// collapse (a) row missing, (b) row exists for a different
+	// org to the same ErrNotFound at the SQL level (the WHERE
+	// clause pins org_id). This is the IDOR-safe shape — same
+	// precedent as DeleteAPIKeyReturning's (a)/(b) collapse; the
+	// operator cannot probe other orgs' key ids.
+	//
+	// CreateOrgAPIKey persists a key against an explicit org.
+	// The resulting row carries (account_id, org_id) both stamped
+	// — the LoadOrg middleware stamps the active membership onto
+	// the principal so the handler has both ready without a
+	// round-trip. The legacy /v1/keys POST handler routes
+	// through this method with org_id = caller's personal org
+	// (the dual-write shape from the plan). The AccountID stamp
+	// survives through PR 7 (AuthenticateKey signature bump) so
+	// the principal is assembled exactly as it was pre-PR-6.
+	//
+	// ListOrgAPIKeys returns every non-revoked key for the org
+	// (status IN ('active', 'grace')). Ordered by created_at
+	// DESC to match ListAPIKeys. Empty for a fresh org.
+	//
+	// RotateOrgAPIKey mirrors RotateAPIKey but the lock
+	// predicate is (id, org_id); rotation is org-local (org_id
+	// is inherited onto the new row, never re-derived via
+	// subquery — see PgStore implementation). Same graceWindow
+	// semantics, same returned-key ordering.
+	CreateOrgAPIKey(ctx context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+	ListOrgAPIKeys(ctx context.Context, orgID string) ([]APIKey, error)
+	GetOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error)
+	RevokeOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error)
+	RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (newKey, oldKey APIKey, err error)
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
 	//
