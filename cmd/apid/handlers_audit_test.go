@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -73,11 +74,9 @@ func TestAuditEvents_KeyMintEmitsEvent(t *testing.T) {
 			break
 		}
 	}
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("no key.created event row; rows=%+v", rows)
-	}
-	if found.Subject == nil || found.Subject.String() != uuidStringOf(e.acct.ID) { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(e.acct.ID)) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	found = mustAuditEvent(t, found, fmt.Sprintf("no key.created event row; rows=%+v", rows))
+	if found.Subject == nil || found.Subject.String() != uuidStringOf(e.acct.ID) {
+		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(e.acct.ID))
 	}
 	var data map[string]any
 	if err := json.Unmarshal(found.Data, &data); err != nil {
@@ -1646,4 +1645,17 @@ func TestAuditEvents_CronForeignOwnerReturns404DoesNotEmit(t *testing.T) {
 	if _, err := e.store.CronByID(context.Background(), created.ID); err != nil {
 		t.Errorf("foreign DELETE must not have removed the cron, CronByID err: %v", err)
 	}
+}
+
+// mustAuditEvent is the SA5011 escape hatch for the key.created /
+// audit-row lookups: ListEvents can legitimately return 0 rows of a
+// given Kind, but we want a real event for assertions below. A helper
+// that t.Fatal()s and returns the value lets staticcheck see the value
+// is non-nil at the call site.
+func mustAuditEvent(t *testing.T, ev *state.Event, msg string) *state.Event {
+	t.Helper()
+	if ev == nil {
+		t.Fatal(msg)
+	}
+	return ev
 }

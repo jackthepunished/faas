@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -108,11 +109,9 @@ func TestIssueCredit_HappyPath(t *testing.T) {
 			break
 		}
 	}
-	if found == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatalf("credit.issued audit row missing for account %s", target.ID)
-	}
-	if found.Actor != "apid" { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("audit Actor = %q, want apid", found.Actor) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	found = mustEvent(t, found, fmt.Sprintf("credit.issued audit row missing for account %s", target.ID))
+	if found.Actor != "apid" {
+		t.Errorf("audit Actor = %q, want apid", found.Actor)
 	}
 }
 
@@ -253,4 +252,17 @@ func TestIssueCredit_Idempotent(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("account_credits rows = %d, want 1 (idempotent)", len(rows))
 	}
+}
+
+// mustEvent is the SA5011 escape hatch for the credit.issued /
+// audit-row lookups: ListEvents can legitimately return 0 rows
+// of a given Kind, but we want a real event for assertions below.
+// A helper that t.Fatal()s and returns the value lets staticcheck
+// see the value is non-nil at the call site.
+func mustEvent(t *testing.T, ev *state.Event, msg string) *state.Event {
+	t.Helper()
+	if ev == nil {
+		t.Fatal(msg)
+	}
+	return ev
 }
