@@ -589,57 +589,38 @@ gateway_synth_socket = %q
 	return cfgPath
 }
 
-// startGatewayd boots gatewayd in the TLS-disabled path (cfg.TLS.Disabled=true)
-// so tests don't need a Hetzner DNS token + storage dir. The control
-// listener binds to a known address so wake-latency assertions can scrape
-// /metrics; the public listener binds to the per-test free port.
+// startGatewayd reserves per-test ports for the gateway pair and
+// populates h.GatewayURL / h.GatewayControlURL. The legacy 'gatewayd'
+// binary is gone (Tier A7 / ADR-070 split); its source now lives in
+// cmd/gatewayd-internal/. PR-A does not boot the split pair — that
+// arrives in PR-B (which needs the certmagic/Hetzner-token stubs for
+// gatewayd-public). The signature keeps bin/dbURL/extraEnv so the
+// call-sites in this file don't churn when PR-B lands.
 //
-// The synth unix socket (spec §4.4) is the path gatewayd listens on for
-// synthetic cron / async-invoke envelopes from schedd. It is paired with
-// the gateway_synth_socket line the Schedd block writes into the per-test
-// schedd.toml; both must use the same path or schedd's dial fails and the
-// drain goroutine is silently disabled.
-//
-// apid_loopback is wired to h.APIDURL (set by startAPID before this runs)
-// so gatewayd's apidProxy actually proxies to the per-test apid — without
-// it, gatewayd falls back to the production default http://127.0.0.1:8081
-// and a test that hits the gateway would forward to a phantom apid.
-//
-// extraEnv is appended last so a test can inject extra knobs if needed
-// (none today; mirrors startMeterd's signature).
+// When PR-B lands this function regains the prior behaviour: write a
+// per-test gatewayd-internal.toml, build the binary, call startProc,
+// waitTCP, etc. The doc-comment block above (synth socket, apid loopback)
+// belongs to that restored path; PR-B will uncomment it.
 func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []string) {
 	t.Helper()
+	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd' binary is gone
+	// (its source moved into cmd/gatewayd-internal/). PR-B will boot
+	// the split pair (gatewayd-public + gatewayd-internal) here.
+	// For now we still build the gatewayd-internal binary (see
+	// buildBinaries) and reserve the per-test ports, but skip
+	// startProc + waitTCP. Tests that depend on h.GatewayURL will
+	// fail at first HTTP call (no listener on addr), which is the
+	// expected PR-A gap. The `bin`, `dbURL`, `extraEnv` parameters
+	// are unused until PR-B; the per-name blank assignments suppress
+	// the unused-parameter lint that would otherwise fire.
+	_, _, _ = bin, dbURL, extraEnv
 	addr := freeTCPAddr(t)
 	controlAddr := freeTCPAddr(t)
 	if h.ScheddSock == "" {
 		h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
 	}
-	apidLoopback := h.APIDURL
-	if apidLoopback == "" {
-		apidLoopback = "http://127.0.0.1:8081"
-	}
-	gwCfg := filepath.Join(t.TempDir(), "gatewayd.toml")
-	if err := os.WriteFile(gwCfg, []byte(
-		fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\napid_loopback=%q\n",
-			addr, controlAddr, apidLoopback),
-	), 0o600); err != nil {
-		t.Fatalf("e2etest: write gatewayd.toml: %v", err)
-	}
-	synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
-	env := append(testEnvCommon(dbURL),
-		"FAAS_GATEWAY_LISTEN="+addr,
-		"FAAS_GATEWAYD_CONFIG="+gwCfg,
-		"FAAS_GATEWAY_CONTROL_LISTEN="+controlAddr,
-		"FAAS_GATEWAY_SYNTH_SOCKET="+synthSock,
-		"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
-		"FAAS_APPS_DOMAIN="+testDomain,
-	)
-	env = append(env, extraEnv...)
-	h.procs = append(h.procs, startProc(t, bin, "gatewayd", env))
 	h.GatewayURL = "http://" + addr
 	h.GatewayControlURL = "http://" + controlAddr
-	waitTCP(t, addr, 10*time.Second)
-	waitTCP(t, controlAddr, 10*time.Second)
 }
 
 // testEnvCommon returns the env every daemon gets in the harness:
@@ -761,7 +742,12 @@ func (h *Harness) stop() {
 func buildBinaries(t *testing.T, bin string) {
 	t.Helper()
 	modulePath := modulePath(t)
-	for _, d := range []string{"apid", "schedd", "vmmd", "imaged", "gatewayd", "meterd", "builderd"} {
+	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd' binary is gone
+	// (its source moved into cmd/gatewayd-internal/). PR-B will boot
+	// the split pair (gatewayd-public + gatewayd-internal) in
+	// startGatewayd; for now we just build the new daemons so the
+	// binary dir is consistent.
+	for _, d := range []string{"apid", "schedd", "vmmd", "imaged", "gatewayd-internal", "meterd", "builderd"} {
 		out := filepath.Join(bin, d)
 		cmd := exec.Command("go", "build", "-o", out, modulePath+"/cmd/"+d)
 		cmd.Stderr = os.Stderr
