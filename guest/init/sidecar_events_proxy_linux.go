@@ -194,11 +194,12 @@ func (p *sidecarEventsProxy) SendRestart(sidecar string, attempt int) error {
 	return p.send(VsockSidecarEventsTypeRestart, body)
 }
 
-// codeql[go/uncontrolled-allocation-size] false-positive: the early-return guard at the top of send() rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512), so the make() below is provably bounded; CodeQL's taint analyzer can't simplify through the 1+len(body) arithmetic.
+// codeql[go/uncontrolled-allocation-size] false-positive: send()'s early-return guard at the top rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512), so the make() inside is provably bounded; CodeQL's taint analyzer can't simplify through the 1+len(body) arithmetic.
 func (p *sidecarEventsProxy) send(t byte, body []byte) error {
 	if len(body)+1 > sidecarMaxDatagram {
 		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", len(body)+1, sidecarMaxDatagram)
 	}
+	// codeql[go/uncontrolled-allocation-size] false-positive: the early-return above rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512), so the make() below is provably bounded.
 	buf := make([]byte, 1+len(body))
 	buf[0] = t
 	copy(buf[1:], body)
