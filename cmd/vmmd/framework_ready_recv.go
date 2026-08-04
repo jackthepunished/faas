@@ -65,6 +65,16 @@ const (
 	VsockFrameworkReadyHostTypeRestart  byte = 0x03
 )
 
+// Sidecar init-exit status closed enum (issue #463 / ADR-069 /
+// PR-C §3). Pinned at package scope so goconst stops flagging
+// the inline literal at parseFrameworkReadyDatagram's validator
+// (the same enum is used by guest-init's send path and the
+// wire types in sidecar_events_emit.go / sidecar_events_wire.go).
+const (
+	sidecarStatusInitOK     = "init_ok"
+	sidecarStatusInitFailed = "init_failed"
+)
+
 // frameworkReadyMaxDatagram is the upper bound on the DGRAM
 // body the host will accept. The guest-side wire for type=0x01 is
 // at most 5 bytes (1B type + 4B BE uint32 warmup_ms + NUL) plus
@@ -255,7 +265,7 @@ func (r *FrameworkReadyReceiver) dispatchFrameworkReady(instance string, warmupM
 // recv) is logged at Debug, not Warn — the audit is
 // best-effort.
 func (r *FrameworkReadyReceiver) dispatchSidecarInitExit(instance string, wire sidecarInitExitWire) {
-	if wire.Status != "init_ok" && wire.Status != "init_failed" {
+	if wire.Status != sidecarStatusInitOK && wire.Status != sidecarStatusInitFailed {
 		r.log.Warn("sidecar_init_exit unknown status", "instance", instance, "status", wire.Status)
 		return
 	}
@@ -265,7 +275,7 @@ func (r *FrameworkReadyReceiver) dispatchSidecarInitExit(instance string, wire s
 		return
 	}
 	r.emitter.EmitSidecarInitExit(r.ctx, instance, appID, "" /* wakeID not on wire — see pkg/events.SidecarInitExit's struct doc */, wire)
-	if wire.Status == "init_failed" {
+	if wire.Status == sidecarStatusInitFailed {
 		// AC #1 surface: a failed init is a hard fail, and
 		// the operator-visible audit must show
 		// failure_class: user_error. The audit row is keyed

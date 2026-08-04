@@ -77,9 +77,8 @@ func SplitHostSelectorWithSuffix(host, appsSuffix string) (appHost, sidecarName 
 	// Strip the suffix first so the `--` search bounds
 	// itself to the bare app+selector. The reattach
 	// happens after the split.
-	body := host
 	if appsSuffix != "" && strings.HasSuffix(host, appsSuffix) {
-		body = strings.TrimSuffix(host, appsSuffix)
+		body := strings.TrimSuffix(host, appsSuffix)
 		// Split inside the body (no suffix). This is the
 		// canonical "--" split: the FIRST occurrence wins,
 		// so a sidecar-name with `--` in it would parse
