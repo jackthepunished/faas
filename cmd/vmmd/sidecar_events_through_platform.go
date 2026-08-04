@@ -62,6 +62,19 @@ type sidecarAuditStore interface {
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, payload []byte) error
 }
 
+// sidecarFailureClassUserError is the AC #1 shibboleth for a
+// failed init sidecar (issue #463 / ADR-069 / ADR-071 /
+// PR-C §3). The literal is a closed enum the deployments UI
+// greps on (matches state.FailureUserError in pkg/state/types.go
+// for builderd pre-build hook failures). Pinned at package
+// scope so the jsonb payload, the comment cross-ref, and any
+// future log filter share the same value. A typo here would
+// silently break the dashboard's red-traffic-light on a
+// user-side init failure; the unit test
+// TestSidecarInitFailedAuditPayload_FailureClass asserts the
+// wire value.
+const sidecarFailureClassUserError = "user_error"
+
 // sidecarAuditEventActor is the actor stamped on every
 // sidecar audit row. cmd/vmmd is the canonical emitter.
 const sidecarAuditEventActor = "vmmd"
@@ -192,7 +205,7 @@ func buildSidecarInitFailedPayload(instanceID, appID, wakeID string, env sidecar
 		DurationMs   int64  `json:"duration_ms"`
 	}
 	body := payload{
-		FailureClass: "user_error", // AC #1 shibboleth — never inline-alias.
+		FailureClass: sidecarFailureClassUserError, // AC #1 shibboleth — never inline-alias.
 		Sidecar:      env.Sidecar,
 		InstanceID:   instanceID,
 		AppID:        appID,

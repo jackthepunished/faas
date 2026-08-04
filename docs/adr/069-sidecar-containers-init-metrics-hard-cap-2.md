@@ -312,6 +312,12 @@ range 1..96.
   `pkg/wire/metrics.go` reserves `schedd_sidecar_restart_total
   {app,sidecar}` (bounded by the 2-cap); metric cardinality
   validated across redeploys with novel sidecar names.
+- **Note (PR-C 2026-08-04):** the counter is registered as
+  `vmmd_sidecar_restart_total` (vmmd is the canonical
+  producer today, in `dispatchSidecarRestart`); the
+  `<daemon>_sidecar_restart_total` shape is preserved so a
+  future schedd-side producer can host the same family under
+  its own prefix without a rename. See ADR-072 §"Decisions 2".
 - **No follow-up ADR proposed for PR-A.** Future ADR scope
   (per-account sidecar fan-out, sidecar priority ordering,
   sidecar resource classes) is unaddressed and deferred.

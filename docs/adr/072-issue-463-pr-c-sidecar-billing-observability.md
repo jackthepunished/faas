@@ -16,9 +16,16 @@ deferred:
 
 - **AC #1** — `WakeSidecarInitExit{kind: init_failed}` emits from
   guest-init on non-zero exit. Closed at PR-C §3.
-- **AC #3** — `schedd_sidecar_restart_total{app, sidecar}`
+- **AC #3** — `<daemon>_sidecar_restart_total{app, sidecar}`
   Prometheus counter increments on every supervisor restart.
-  Closed at PR-C §4.
+  Closed at PR-C §4. vmmd is the canonical producer today
+  (where `dispatchSidecarRestart` runs); the metric name uses
+  `<daemon>_sidecar_restart_total` so schedd can host the
+  same counter tomorrow without a name change. The PR-C
+  PR body talks about the vmmd-counter surface; ADR-069 first
+  reserved the name as `schedd_sidecar_restart_total` in
+  §Decision 6 but production wiring moved the canonical
+  increment to vmmd in PR-C §4.
 - **AC #4** — `TestMetalSidecarOOMIsolation` no longer skipped.
   Closed at PR-C §7.
 - **AC #5** — `pkg/meter/sampler` reports `plan.RAMMB + Σ(sidecar.ram_mb) + 8`
@@ -40,10 +47,14 @@ and no follow-up required.
   `InstanceStatsRow.SidecarMBs`, broadcast over the schedd
   gRPC once per minute per instance.
 - `pkg/wire/metrics.go` exposes
-  `schedd_sidecar_restart_total{app, sidecar}` as a
-  `*prometheus.CounterVec`. The label set is bounded by
-  `SidecarCapMax × apps` (≤ 200 series worst-case at the
-  Scale plan's 100-app ceiling).
+  `<daemon>_sidecar_restart_total{app, sidecar}` as a
+  `*prometheus.CounterVec`. vmmd is the canonical
+  producer today; the metric is registered as
+  `vmmd_sidecar_restart_total` and any future
+  schedd-side increment reuses the same family
+  (`<daemon>_sidecar_restart_total`). The label set is
+  bounded by `SidecarCapMax × apps` (≤ 200 series
+  worst-case at the Scale plan's 100-app ceiling).
 - `guest/init/sidecar_events_proxy_linux.go` (new) emits the
   sidecar lifecycle events on the same AF_VSOCK DGRAM channel
   PR #470 carved for `framework_ready`, port 1027, with a
@@ -103,10 +114,14 @@ Scale plan ceiling (20 concurrent), that's 160 bytes per app
 per minute — orders of magnitude below the existing per-minute
 stats payload's CPU + RAM rows.
 
-### 2. Restart counter — `schedd_sidecar_restart_total{app, sidecar}`
+### 2. Restart counter — `vmmd_sidecar_restart_total{app, sidecar}`
 
 The counter is a `prometheus.CounterVec` with labels `app` and
-`sidecar`. The label set is bounded by `SidecarCapMax × apps`
+`sidecar`, registered as `vmmd_sidecar_restart_total`. vmmd
+hosts `dispatchSidecarRestart` (where the canonical
+`ObserveSidecarRestart(app, sidecar)` lives today); a future
+schedd-side producer would register the same family under its
+own daemon prefix. The label set is bounded by `SidecarCapMax × apps`
 (200 series worst-case at the Scale plan's 100-app ceiling).
 Well below Prometheus's `scrape_sample_limit` default (10⁶).
 
@@ -203,8 +218,6 @@ Why busybox httpd and not a real malloc-helper workload?
 - `pkg/meter/sampler.go` — `sampleAppAndLive` uses the new
   helper. Floor rows (synthetic `MinInstances`) keep the
   no-sidecar form.
-- `pkg/billing/billable.go` (new) — read-only mirror of the
-  helper for the Stripe-shaped billable summary builder.
 - `pkg/meter/sampler_test.go` — `TestSample_AppWithSidecars`
   pinned at 512 MB + 64 MB sidecar; asserts
   `AdmissionMB = 512 + 64 + 8`.

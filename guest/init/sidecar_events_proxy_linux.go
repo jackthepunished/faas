@@ -18,7 +18,7 @@
 //   - sidecar_restart    (type=0x03 on port 1027) — fired when
 //     a long-running sidecar supervisor exhausts a Restart
 //     attempt cycle (i.e. a fresh fork). vmmd increments
-//     schedd_sidecar_restart_total{app,sidecar} and emits
+//     vmmd_sidecar_restart_total{app,sidecar} and emits
 //     pkg/events.SidecarRestart (AC #3).
 //
 // Wire (guest-init → vsock DGRAM, port 1027):

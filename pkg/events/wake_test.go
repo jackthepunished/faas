@@ -109,6 +109,10 @@ func TestWakePhaseFromKind(t *testing.T) {
 // field: schedd's "did init fail" decision reads status, not exit_code,
 // so the wire shape must stay stable. A typo on the status value
 // would silently regress AC #1 (init non-zero exit → user_error).
+//
+// WakeID is set to "w-1" for the field-typing seam; production
+// today emits "" (see struct doc). Downstream readers should
+// treat the field as optional on the wake.*.sidecar_* kinds.
 func TestSidecarInitExit_Shape(t *testing.T) {
 	ev := SidecarInitExit{
 		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",
@@ -135,7 +139,8 @@ func TestSidecarInitExit_Shape(t *testing.T) {
 // TestSidecarRestart_Shape — issue #463 / ADR-069 / PR-B. Attempt
 // is 1-indexed; PreviousExitCode lets operators distinguish OOM
 // (137) from user_error (1) from signal-driven (-1) without
-// joining against the vmmd log.
+// joining against the vmmd log. WakeID is "w-1" for the field
+// seam; production today emits "" (see struct doc).
 func TestSidecarRestart_Shape(t *testing.T) {
 	ev := SidecarRestart{
 		EmitAt: time.Unix(0, 0).UTC(), WakeID: "w-1", AppID: "a-1",

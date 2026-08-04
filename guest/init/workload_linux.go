@@ -76,6 +76,15 @@ import (
 // Linux (the in-guest PID 1 of every microVM). The vmmd
 // counterpart compiles on every platform but emits identical
 // JSON because the field tags match exactly.
+//
+// JSON field-order pinning: field declarations stay in
+// alphabetical order (mirroring pkg/fcvm.workloadManifest).
+// The two structs are a wire pair — a reorder here MUST land
+// on the vmmd side in the same commit, and the projected-byte
+// budget in pkg/fcvm/vmm.go (projectedWorkloadManifestBytes)
+// must be re-derived. See the comment on
+// pkg/fcvm/vmm.go::workloadManifest for the rationale and the
+// round-trip test that pins the parsed-equivalence contract.
 type workloadSpec struct {
 	Cmd        []string `json:"cmd,omitempty"`
 	Entrypoint []string `json:"entrypoint,omitempty"`
@@ -334,8 +343,8 @@ func newSupervisorForMain(spec workloadSpec, manifest api.AppManifest, secrets, 
 // the restart policy: non-essential = Max=0 (no restart,
 // log-and-continue); essential = Max=MaxRestarts (restart
 // per the platform contract). PR-C §4 wires the supervisor's
-// OnCrash hook to call SendRestart on the proxy so the host
-// can increment schedd_sidecar_restart_total{app, sidecar}.
+// OnCrash hook to call SendRestart on the proxy so vmmd
+// can increment vmmd_sidecar_restart_total{app, sidecar}.
 // A nil sidecarProxy (no-signal contract when bind fails)
 // keeps the OnCrash hook log-only.
 func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log *slog.Logger, sidecarProxy *sidecarEventsProxy) *Supervisor {

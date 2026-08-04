@@ -5,7 +5,7 @@
 // needs to dispatch two non-framework-ready event classes
 // (sidecar_init_exit, sidecar_restart) to a sink the cmd main
 // loop owns — pkg/events.Platform with a real state.Store
-// AppendEvent, plus the schedd_sidecar_restart_total counter
+// AppendEvent, plus the vmmd_sidecar_restart_total counter
 // (PR-C §4). The receiver itself cannot own those because
 // (a) state.Store is constructed in cmd main, not in this
 // file, and (b) the dispatch needs the app_id resolved from

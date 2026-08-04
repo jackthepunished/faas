@@ -60,9 +60,9 @@ const VsockFrameworkReadyHostPort uint32 = 1027
 // — a future event class picks the next free byte and is its own
 // PR.
 const (
-	VsockFrameworkReadyHostTypeReady     byte = 0x01
-	VsockFrameworkReadyHostTypeInitExit  byte = 0x02
-	VsockFrameworkReadyHostTypeRestart   byte = 0x03
+	VsockFrameworkReadyHostTypeReady    byte = 0x01
+	VsockFrameworkReadyHostTypeInitExit byte = 0x02
+	VsockFrameworkReadyHostTypeRestart  byte = 0x03
 )
 
 // frameworkReadyMaxDatagram is the upper bound on the DGRAM
@@ -264,7 +264,7 @@ func (r *FrameworkReadyReceiver) dispatchSidecarInitExit(instance string, wire s
 		r.log.Debug("sidecar_init_exit unknown instance", "instance", instance, "err", perr)
 		return
 	}
-	r.emitter.EmitSidecarInitExit(r.ctx, instance, appID, "" /* wakeID not on wire */, wire)
+	r.emitter.EmitSidecarInitExit(r.ctx, instance, appID, "" /* wakeID not on wire — see pkg/events.SidecarInitExit's struct doc */, wire)
 	if wire.Status == "init_failed" {
 		// AC #1 surface: a failed init is a hard fail, and
 		// the operator-visible audit must show
@@ -279,7 +279,7 @@ func (r *FrameworkReadyReceiver) dispatchSidecarInitExit(instance string, wire s
 
 // dispatchSidecarRestart (issue #463 / ADR-069 / ADR-071 /
 // PR-C §4): the type=0x03 dispatch path. Same join as init_exit;
-// PR-C §4 increments the schedd_sidecar_restart_total counter
+// PR-C §4 increments the vmmd_sidecar_restart_total counter
 // in the emitter (the counter lives on wire.OpsMetrics which the
 // emitter wraps). Wired here so the §3 commit ships both
 // dispatch arms; the §4 commit only needs to add the
@@ -291,7 +291,7 @@ func (r *FrameworkReadyReceiver) dispatchSidecarRestart(instance string, wire si
 		r.log.Debug("sidecar_restart unknown instance", "instance", instance, "err", perr)
 		return
 	}
-	r.emitter.EmitSidecarRestart(r.ctx, instance, appID, "" /* wakeID not on wire */, wire)
+	r.emitter.EmitSidecarRestart(r.ctx, instance, appID, "" /* wakeID not on wire — see pkg/events.SidecarRestart's struct doc */, wire)
 }
 
 // parseFWKind is the discriminator for

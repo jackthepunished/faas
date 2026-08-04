@@ -1560,6 +1560,19 @@ func projectedWorkloadRosterBytes(main WorkloadSpec, sidecars []WorkloadSpec) in
 // override) writes the same byte shape as before — dashboards
 // and pre-§6 guest-init binaries that don't recognize cmd still
 // parse the manifest byte-for-byte.
+//
+// JSON field-order pinning: the field declarations are kept in
+// alphabetical order so the marshalled byte shape is stable and
+// the projected-byte budget (projectedWorkloadManifestBytes) is
+// predictable. The companion guest/init/workloadSpec struct in
+// guest/init/workload_linux.go mirrors the same order — the
+// two structs are a wire pair, and a reorder on one side MUST
+// land on the other in the same commit. The round-trip test
+// (TestWorkloadManifest_RoundTripsCmdEntry) does NOT pin
+// the byte order, only the parsed-equivalence; if a future
+// refactor needs the manifest emitted in a different order it
+// must be a single PR that updates both sides + the projection
+// helper.
 type workloadManifest struct {
 	Cmd        []string `json:"cmd,omitempty"`
 	Entrypoint []string `json:"entrypoint,omitempty"`
