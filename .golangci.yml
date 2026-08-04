@@ -193,38 +193,6 @@ linters:
       - path: "_test\\.go$"
         linters:
           - staticcheck
-      # SA5011 false-positives across the cmd/apid test surface:
-      # every handler test follows the same `if x == nil { t.Fatal }
-      # + dereference x.Foo` idiom. Exclude the full set at the
-      # path level rather than per-line nolint (which staticcheck
-      # still fires on for SA5011 because it tracks the related-info
-      # back-pointer). Revert if any of these grow a real nil-deref
-      # bug — the per-line audit log on landed test files is the
-      # guardrail, not this exclusion.
-      - path: "cmd/apid/.*_test.go"
-        linters:
-          - staticcheck
-      # cmd/gatewayd-internal/config_test.go (PR #627 tier-a7) +
-      # cmd/vmmd/{node_signing_key,register}_test.go (PR #618 floor
-      # reconciler): same `if x == nil { t.Fatal } + dereference`
-      # idiom. Per-file pin keeps the exclusion tight.
-      - path: "cmd/gatewayd-internal/config_test\\.go"
-        linters:
-          - staticcheck
-      - path: "cmd/vmmd/node_signing_key_test\\.go"
-        linters:
-          - staticcheck
-      - path: "cmd/vmmd/register_test\\.go"
-        linters:
-          - staticcheck
-      # PR-6 org-bound API key tests: same idiom.
-      - path: "pkg/authz/authorize_test\\.go"
-        linters:
-          - staticcheck
-      # guest/init workload restart-supervisor tests (PR-6): same idiom.
-      - path: "guest/init/workload_linux_test\\.go"
-        linters:
-          - staticcheck
       # PR-6 e2e tests + cmd/gatewayd-internal/config_test had no
       # SA5011 prior; cmd/e2e/iam6_org_keys_test.go (added by PR-6)
       # tripped it. Same idiom in pkg/gateway/tls_wire_test + imaged
