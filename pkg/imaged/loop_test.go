@@ -1211,9 +1211,10 @@ func TestGC_PerAppKeepTierFloor_MixedApps(t *testing.T) {
 	}
 	var enabled, disabled int
 	for _, r := range rows {
-		if r.AppID == enabledApp.ID {
+		switch r.AppID {
+		case enabledApp.ID:
 			enabled++
-		} else if r.AppID == disabledApp.ID {
+		case disabledApp.ID:
 			disabled++
 		}
 	}

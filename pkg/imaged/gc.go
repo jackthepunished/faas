@@ -117,37 +117,6 @@ func perAppKeepTierFloor(rows []state.SnapshotForGC) []deleteTarget {
 // smaller id wins "newer", which is arbitrary but deterministic across
 // runs. That's enough for "doesn't evict the wrong one when a
 // rollback-and-redeploy lands in the same nanosecond".
-//
-// Soft-deleted apps (status='deleted') are filtered out by the SQL
-// layer in Store.ListSnapshotsForGC, so we don't have to handle them
-// here. Same for stale rows.
-func perAppKeepCurrentPrevious(rows []state.SnapshotForGC) []deleteTarget {
-	byApp := make(map[string][]state.SnapshotForGC, len(rows))
-	for _, r := range rows {
-		byApp[r.AppID] = append(byApp[r.AppID], r)
-	}
-	var drop []deleteTarget
-	for _, appRows := range byApp {
-		// Sort newest-first so [0] is current, [1] is previous.
-		sort.SliceStable(appRows, func(i, j int) bool {
-			if appRows[i].CreatedAt.Equal(appRows[j].CreatedAt) {
-				return appRows[i].ID < appRows[j].ID
-			}
-			return appRows[i].CreatedAt.After(appRows[j].CreatedAt)
-		})
-		for i := 2; i < len(appRows); i++ {
-			drop = append(drop, deleteTarget{
-				ID:           appRows[i].ID,
-				DeploymentID: appRows[i].DeploymentID,
-				// B1.1: AppSlug is on SnapshotForGC (issue #195);
-				// no per-eviction re-resolve needed.
-				AppSlug: appRows[i].AppSlug,
-				Tier:    appRows[i].Tier,
-			})
-		}
-	}
-	return drop
-}
 
 // evictOldestFromHeaviestAccount returns the snapshot ID(s) to delete when
 // fleet disk pressure (lv-fc ≥ SnapshotBudgetAlarmPct) is on. The unit of

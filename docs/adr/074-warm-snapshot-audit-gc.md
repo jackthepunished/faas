@@ -16,11 +16,13 @@ writable by PR A. Seven atomic commits in merge order:
 2. **cmd/gregale flags** — `--warm-snapshot`, `--no-warm-snapshot`,
    `--warm-snapshot-min-requests N`, `--warm-snapshot-min-ms N`.
 3. **pkg/wire metrics + vmmd observer + sched tier-aware wake** —
-   `vmmd_warm_snapshot_errors_total` (already shipped by PR A;
-   this PR confirms wiring), `vmmd_guest_init_duration_seconds`,
-   `gateway_wake_snapshot_tier_total`. The vmmd DGRAM observer times
-   full boot vs framework-ready. The sched tier-aware wake counters
-   which tier was chosen.
+   `vmmd_warm_snapshot_errors_total` + `schedd_warm_snapshot_errors_total`
+   (both prefixes exist: vmmd host-side capture path, schedd
+   engine path — same `{reason}` label set on each), `vmmd_guest_init_duration_seconds`,
+   `schedd_wake_snapshot_tier_total`. The vmmd DGRAM observer
+   times full boot vs framework-ready. The sched tier-aware wake
+   counter increments from inside `usableSnapshotForWake` based
+   on the chosen tier.
 4. **pkg/imaged GC 2+2 floor + warm storage keys** — `WarmSnapMemKey`
    and `WarmSnapVMStateKey` (already shipped by PR A); this PR extends
    `SnapshotForGC` with `AppWarmSnapshotEnabled` and replaces
@@ -51,9 +53,11 @@ has gaps that block operations:
   for failures (PR A emits that), but success / stale / disabled have no
   row.
 - `vmmd_warm_snapshot_errors_total` is emitted to `/metrics` but no panel
-  exists. Likewise `gateway_wake_snapshot_tier_total` does not exist yet
+  exists. Likewise `schedd_wake_snapshot_tier_total` does not exist yet
   (the wake tier selection happens in PR A's `usableSnapshotForWake`
-  without a counter).
+  without a counter). PR C wires the wake-tier counter inside
+  `usableSnapshotForWake` and adds `schedd_warm_snapshot_errors_total`
+  for the engine-side capture-failure path.
 - `vmmd_guest_init_duration_seconds` is absent — operators have no
   histogram of guest-init boot duration per app/runner.
 
@@ -115,9 +119,9 @@ framework-ready stamped, min-ms elapsed). The column stays dormant.
 
 | ID | Type | Query | Purpose |
 |---|---|---|---|
-| 1 | timeseries | `sum by (reason) (rate(vmmd_warm_snapshot_errors_total[5m]))` | Failures per reason |
+| 1 | timeseries | `sum by (reason) (rate({vmmd,schedd}_warm_snapshot_errors_total[5m]))` | Failures per reason (both prefixes) |
 | 2 | timeseries | `histogram_quantile(0.50/0.95, sum by (le, app) (rate(vmmd_guest_init_duration_seconds_bucket[5m])))` | Boot duration p50/p95 |
-| 3 | timeseries | `sum by (tier) (rate(gateway_wake_snapshot_tier_total[5m]))` | Wake tier mix |
+| 3 | timeseries | `sum by (tier) (rate(schedd_wake_snapshot_tier_total[5m]))` | Wake tier mix |
 | 4 | stats | `count(snapshots{tier="warm"})` / `count(snapshots{tier="init"})` | Population by tier |
 
 ### 3.5 Histogram bucket set

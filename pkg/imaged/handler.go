@@ -2272,42 +2272,78 @@ func (h *Handler) MarkFCSnapshotsStale(ctx context.Context, fcVersion string) (i
 	if fcVersion == "" {
 		return 0, errors.New("imaged: MarkFCSnapshotsStale: empty fc version")
 	}
+	// Snapshot per-app non-stale row counts BEFORE the sweep so
+	// emitWarmSnapshotStale can compute per-app "rows flipped" for
+	// each emit. ListSnapshotsForGC filters stale=false; after the
+	// sweep the same query returns only survivors.
+	beforeByApp, err := h.snapshotNonStaleByApp(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("imaged: mark stale by fc: pre-sweep list: %w", err)
+	}
 	n, err := h.store.MarkAllSnapshotsStaleByFCVersion(ctx, fcVersion)
 	if err != nil {
 		return 0, fmt.Errorf("imaged: mark stale by fc: %w", err)
 	}
 	if n > 0 && h.audit != nil {
-		h.emitWarmSnapshotStale(ctx, fcVersion, n)
+		afterByApp, listErr := h.snapshotNonStaleByApp(ctx)
+		if listErr != nil {
+			// Best-effort: log the list failure and still return
+			// n to the caller (the mark-stale itself succeeded).
+			h.log.Warn("imaged: warm_snapshot_stale post-sweep list",
+				"err", listErr)
+		} else {
+			h.emitWarmSnapshotStale(ctx, fcVersion, beforeByApp, afterByApp)
+		}
 	}
 	return n, nil
 }
 
-// emitWarmSnapshotStale (issue #470 / PR C / ADR-072) emits one
-// app.warm_snapshot_stale audit row per app whose snapshot(s)
-// just transitioned stale due to the FC-version sweep. Walks
-// apps via the existing ListAppsByAccount-side fixtures — the
-// GC projection excludes stale rows, so the affected-app set
-// is the union of (a) apps with surviving non-stale rows AND
-// (b) apps whose ALL rows went stale. The latter is harder to
-// enumerate without an extra SQL query, so we emit per
-// surviving app and rely on the warm_snapshot_write_failures
-// counter for fleet-level totals. Best-effort: an audit-write
-// failure is logged and does NOT roll back the mark-stale
-// (ADR-005 says FC version is the source of truth; the audit
-// row is observer signal only).
-func (h *Handler) emitWarmSnapshotStale(ctx context.Context, fcVersion string, fleetTotal int64) {
+// snapshotNonStaleByApp returns the {appID: count} of non-stale
+// rows currently in ListSnapshotsForGC. Used to compute per-app
+// delta for the warm_snapshot_stale audit emit. Empty apps are
+// omitted from the map.
+func (h *Handler) snapshotNonStaleByApp(ctx context.Context) (map[string]int64, error) {
 	rows, err := h.store.ListSnapshotsForGC(ctx)
 	if err != nil {
-		h.log.Warn("imaged: warm_snapshot_stale list", "err", err)
-		return
+		return nil, err
 	}
-	seen := make(map[string]struct{})
+	out := make(map[string]int64, len(rows))
 	for _, r := range rows {
-		if r.AppID != "" {
-			seen[r.AppID] = struct{}{}
+		if r.AppID == "" {
+			continue
 		}
+		out[r.AppID]++
 	}
-	for appID := range seen {
+	return out, nil
+}
+
+// emitWarmSnapshotStale (issue #470 / PR C / ADR-072) emits one
+// app.warm_snapshot_stale audit row per app that had at least
+// one snapshot row transition to stale during the FC-version
+// sweep. stale_count is the per-app count of rows that flipped
+// (NOT the fleet total — operators reading the audit row expect
+// the value to be scoped to the app_id subject).
+//
+// Caveat (ADR-072 §3.2): apps whose ENTIRE fleet went stale in
+// this sweep emit no row because ListSnapshotsForGC filters
+// stale=false. Those apps surface through the fleet-level
+// warm_snapshot_write_failures counter, not per-app audit.
+// Best-effort: an audit-write failure is logged and does NOT
+// roll back the mark-stale (ADR-005 says FC version is the
+// source of truth; the audit row is observer signal only).
+func (h *Handler) emitWarmSnapshotStale(ctx context.Context, fcVersion string, beforeByApp map[string]int64, afterByApp map[string]int64) {
+	for appID, before := range beforeByApp {
+		after, ok := afterByApp[appID]
+		if !ok {
+			// No surviving non-stale rows → all of this app's
+			// rows went stale. The fleet-level counter is the
+			// only signal; per-app audit omitted (caveat).
+			continue
+		}
+		staleThisApp := before - after
+		if staleThisApp <= 0 {
+			continue
+		}
 		app, err := h.store.AppByID(ctx, appID)
 		if err != nil {
 			h.log.Warn("imaged: warm_snapshot_stale app load",
@@ -2318,7 +2354,7 @@ func (h *Handler) emitWarmSnapshotStale(ctx context.Context, fcVersion string, f
 			"app_id":      app.ID,
 			"slug":        app.Slug,
 			"fc_version":  fcVersion,
-			"stale_count": fleetTotal,
+			"stale_count": staleThisApp,
 		})
 	}
 }
