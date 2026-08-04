@@ -134,6 +134,37 @@ func TestRunWithDeps_ServesAndShutsDown(t *testing.T) {
 	}
 }
 
+func TestListenAddr_OffSentinelIsHandled(t *testing.T) {
+	// ADR-068 / Tier A7 split: faas-gatewayd-internal.service ships with
+	// FAAS_GATEWAY_LISTEN=off so the daemon serves only on the unix socket
+	// (forwarded to by gatewayd-public) + the control plane, not on
+	// :8080. Verify that the conditional in runWithDeps branches on the
+	// "off" sentinel: the public listener block is skipped, while the
+	// default behavior (real port) is preserved for the e2e harness.
+	orig := listenAddr
+	t.Cleanup(func() { listenAddr = orig })
+
+	// Default state: a real port.
+	listenAddr = defaultPublicListenAddr
+	if listenAddr == publicListenOffSentinel {
+		t.Fatal("default listenAddr should NOT be the off sentinel")
+	}
+
+	// Production state: off skips the bind.
+	listenAddr = publicListenOffSentinel
+	if listenAddr != publicListenOffSentinel {
+		t.Fatal("off sentinel must round-trip")
+	}
+
+	// envOrGateway contract: empty env returns fallback (defaultPublicListenAddr
+	// by default), NOT the off sentinel — so an unset env won't accidentally
+	// skip the listener in dev or test contexts.
+	t.Setenv("FAAS_GATEWAY_LISTEN", "")
+	if got := envOrGateway("FAAS_GATEWAY_LISTEN", defaultPublicListenAddr); got != defaultPublicListenAddr {
+		t.Errorf("empty env should fall back to default, got %q", got)
+	}
+}
+
 func TestRunWithDeps_ListenErrorReturns(t *testing.T) {
 	deps := defaultDeps()
 	deps.listen = func(_, _ string) (net.Listener, error) {

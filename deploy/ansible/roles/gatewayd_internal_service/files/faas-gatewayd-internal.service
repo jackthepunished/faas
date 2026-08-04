@@ -21,6 +21,18 @@ RestartSec=2s
 Slice=faas-cp.slice
 MemoryMax=512M
 
+# Internal daemon does NOT bind a public port. No
+# AmbientCapabilities=CAP_NET_BIND_SERVICE. ADR-068 / ADR-070 Tier A7
+# split: the public edge is gatewayd-public, which forwards here over
+# the unix socket at /run/faas/gatewayd-internal.sock. Setting
+# FAAS_GATEWAY_LISTEN=off skips the public listener (the sentinel
+# checked in cmd/gatewayd-internal/run.go), so the daemon serves only
+# on the unix socket + the control plane (127.0.0.1:9090).
+# Without "off", both daemons try to bind :8080; gatewayd-internal
+# starts first and wins, leaving gatewayd-public crash-looping with
+# "address already in use" (run 31121004495).
+Environment=FAAS_GATEWAY_LISTEN=off
+
 # Hardening baseline — gatewayd-internal is NOT root; runs as faas:faas.
 User=faas
 Group=faas
