@@ -83,6 +83,14 @@ func main() {
 	wire.Daemon("gatewayd-internal", run)
 }
 
+// prodRun is referenced here (and only here) so golangci-lint's
+// `unused` checker does not flag the production-runner chain
+// (synthAdapter, watchInvalidations, newNodeCache, etc.) that
+// PR-A moves into this package but does not yet wire. PR-B
+// replaces `run` (the placeholder handler) with `prodRun` and
+// deletes this reference line.
+var _ = prodRun
+
 // runDeps is the production dependency bundle. Tests inject a
 // custom publicDeps to swap the dialer (the unix-socket path in
 // particular) so the seam is fully exercised without root-level
@@ -109,21 +117,27 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// RouteCacheHydration.MarkHydrated() and routerSig to the
 	// schedd router's first ready client).
 	probe := &gateway.ReadyzProbe{}
-	pgSig, pgStop := gateway.NewPGPingSignal(ctx, nil, 5*time.Second)
-	// pgSig's stopper always fires; the daemon hasn't opened a
-	// real Postgres pool yet (the file-move cluster opens it).
-	// The placeholder path signals PG as "ready" so the LB sees
-	// /readyz=200 (the daemon is not actually wired to PG yet).
-	pgSig.Set(true, "")
+	// The placeholder has no Postgres pool to ping. Calling
+	// gateway.NewPGPingSignal(ctx, nil, …) was a SIGSEGV: the
+	// helper's first tick calls pool.Ping(pctx) on a nil pinger
+	// (pkg/gateway/readiness.go:296), which crashes the daemon
+	// before the unix-socket listener is bound — the deploy
+	// pipeline's wait_healthy gate then fails because
+	// gatewayd-internal never becomes active. Construct an
+	// always-ready signal directly via probe.Register() and stub
+	// the stopper as a no-op. When the real handler wires a pool
+	// in the follow-on PR-cluster, this block is replaced with:
+	//
+	//   pgSig, pgStop := gateway.NewPGPingSignal(ctx, pool, api.ReplicaHeartbeatIntervalSeconds)
+	//   pgProbeSig := probe.Register()
+	//   go func() { … bridge pgSig.Report() into pgProbeSig … }()
+	pgProbeSig := probe.Register()
+	pgProbeSig.Set(true, "")
+	pgStop := func() {}
 	cacheSig := probe.Register()
 	cacheSig.Set(false, "route cache not hydrated yet")
 	routerSig := probe.Register()
 	routerSig.Set(false, "schedd router not ready")
-	// Mirrored-PG signal — same bridge as gatewayd-public. Until
-	// the real PG pool is wired, the probe is always 200 because
-	// the placeholder path is the only consumer.
-	pgProbeSig := probe.Register()
-	pgProbeSig.Set(true, "")
 
 	// Placeholder handler. Marker path `/warmhint/test` flips
 	// cacheSig to true so the e2e harness can verify the

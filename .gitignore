@@ -39,3 +39,6 @@ vmlinux-*
 /schedd
 /vmmd
 /githubd
+/gatewayd
+/gatewayd-public
+/gatewayd-internal

@@ -569,6 +569,14 @@ func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 // tests that don't exercise async-invoke. Centralised so a future env
 // var or config knob lands in one place instead of two (Start vs
 // StartWithEnv had identical templates before PR #218).
+//
+// gateway_metrics_url is intentionally set to an empty string in PR-A:
+// the legacy 'gatewayd' binary is gone, and the placeholder
+// gatewayd-internal exposes /metrics as a 404 (ControlMux is wired
+// with nil metrics). Schedd's scaleup trigger therefore has no URL to
+// scrape and the ticker arm never fires (cmd/schedd/config.go:110-
+// 118, issue #169 / #172). PR-B restores the live metrics URL once the
+// real handler is wired.
 func writeScheddConfig(t *testing.T, h *Harness, tmp string, includeSynth bool) string {
 	t.Helper()
 	sockPath := filepath.Join(h.SockDir, "schedd.sock")
@@ -583,6 +591,7 @@ func writeScheddConfig(t *testing.T, h *Harness, tmp string, includeSynth bool) 
 owner_user = %q
 vmmd_socket = %q
 gateway_synth_socket = %q
+gateway_metrics_url = ""
 `,
 		sockPath, "root", vmmdSock, gatewaySynth,
 	)
@@ -592,56 +601,50 @@ gateway_synth_socket = %q
 	return cfgPath
 }
 
-// startGatewayd boots gatewayd in the TLS-disabled path (cfg.TLS.Disabled=true)
-// so tests don't need a Hetzner DNS token + storage dir. The control
-// listener binds to a known address so wake-latency assertions can scrape
-// /metrics; the public listener binds to the per-test free port.
+// startGatewayd boots the placeholder gatewayd-internal daemon (the
+// legacy 'gatewayd' binary is gone — its source moved to
+// cmd/gatewayd-internal/ in Tier A7 / ADR-070 PR-A). The placeholder
+// is sufficient for PR-A's e2e tests because:
 //
-// The synth unix socket (spec §4.4) is the path gatewayd listens on for
-// synthetic cron / async-invoke envelopes from schedd. It is paired with
-// the gateway_synth_socket line the Schedd block writes into the per-test
-// schedd.toml; both must use the same path or schedd's dial fails and the
-// drain goroutine is silently disabled.
+//   - It binds the per-test synth unix socket at
+//     SockDir/gatewayd-internal.sock, which schedd's drain goroutine
+//     needs to forward invocation_due envelopes (cmd/schedd/main.go:
+//     319-345). Without the listener, schedd's drain is silently
+//     disabled and TestE2E_AsyncInvoke_PostEnqueuesRowAndDrainCompletesIt
+//     deadlocks waiting for state='completed'.
+//   - It serves the loopback control plane on controlAddr with the
+//     /healthz + /readyz routes. schedd's GatewayMetricsURL is set
+//     to empty in writeScheddConfig so the scaleup scraper is
+//     disabled — PR-B restores the live metrics URL.
 //
-// apid_loopback is wired to h.APIDURL (set by startAPID before this runs)
-// so gatewayd's apidProxy actually proxies to the per-test apid — without
-// it, gatewayd falls back to the production default http://127.0.0.1:8081
-// and a test that hits the gateway would forward to a phantom apid.
+// What PR-A does NOT do: it does not boot gatewayd-public (the TLS
+// edge). Tests that hit h.GatewayURL over plain HTTP will get a 200
+// OK with the TEMPLATE_OK banner, NOT a real proxy response. That
+// is the documented PR-A gap; PR-B replaces the placeholder with
+// prodRun() so customer traffic reaches the real handler chain.
 //
-// extraEnv is appended last so a test can inject extra knobs if needed
-// (none today; mirrors startMeterd's signature).
+// The `extraEnv` parameter is unused until PR-B; the per-name blank
+// assignment suppresses the unused-parameter lint.
 func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []string) {
 	t.Helper()
+	_ = extraEnv
+	if h.SockDir == "" {
+		h.SockDir = filepath.Join(h.TmpDir, "socks")
+	}
 	addr := freeTCPAddr(t)
 	controlAddr := freeTCPAddr(t)
 	if h.ScheddSock == "" {
 		h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
 	}
-	apidLoopback := h.APIDURL
-	if apidLoopback == "" {
-		apidLoopback = "http://127.0.0.1:8081"
-	}
-	gwCfg := filepath.Join(t.TempDir(), "gatewayd.toml")
-	if err := os.WriteFile(gwCfg, []byte(
-		fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\napid_loopback=%q\n",
-			addr, controlAddr, apidLoopback),
-	), 0o600); err != nil {
-		t.Fatalf("e2etest: write gatewayd.toml: %v", err)
-	}
 	synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
 	env := append(testEnvCommon(dbURL),
-		"FAAS_GATEWAY_LISTEN="+addr,
-		"FAAS_GATEWAYD_CONFIG="+gwCfg,
-		"FAAS_GATEWAY_CONTROL_LISTEN="+controlAddr,
-		"FAAS_GATEWAY_SYNTH_SOCKET="+synthSock,
-		"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
-		"FAAS_APPS_DOMAIN="+testDomain,
+		"FAAS_INTERNAL_SOCKET="+synthSock,
+		"FAAS_INTERNAL_CONTROL_ADDR="+controlAddr,
+		"FAAS_SKIP_SOCKET_GROUP=1",
 	)
-	env = append(env, extraEnv...)
-	h.procs = append(h.procs, startProc(t, bin, "gatewayd", env))
+	h.procs = append(h.procs, startProc(t, bin, "gatewayd-internal", env))
 	h.GatewayURL = "http://" + addr
 	h.GatewayControlURL = "http://" + controlAddr
-	waitTCP(t, addr, 10*time.Second)
 	waitTCP(t, controlAddr, 10*time.Second)
 }
 
@@ -764,7 +767,12 @@ func (h *Harness) stop() {
 func buildBinaries(t *testing.T, bin string) {
 	t.Helper()
 	modulePath := modulePath(t)
-	for _, d := range []string{"apid", "schedd", "vmmd", "imaged", "gatewayd", "meterd", "builderd"} {
+	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd' binary is gone
+	// (its source moved into cmd/gatewayd-internal/). PR-B will boot
+	// the split pair (gatewayd-public + gatewayd-internal) in
+	// startGatewayd; for now we just build the new daemons so the
+	// binary dir is consistent.
+	for _, d := range []string{"apid", "schedd", "vmmd", "imaged", "gatewayd-internal", "meterd", "builderd"} {
 		out := filepath.Join(bin, d)
 		cmd := exec.Command("go", "build", "-o", out, modulePath+"/cmd/"+d)
 		cmd.Stderr = os.Stderr

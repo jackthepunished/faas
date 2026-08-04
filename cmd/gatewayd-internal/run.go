@@ -1,23 +1,23 @@
-// Command gatewayd — edge proxy (spec §4.1).
+// Command gatewayd — routing + wake + proxy daemon (legacy / Tier A7 split, ADR-070).
 //
-// gatewayd is the ONLY public listener on the box: TLS termination, hostname
-// routing, wake-blocking (holding a request during a cold wake), rate limiting,
-// and request accounting. The wake-blocking edge logic (routing cache, rate
-// limiter, wake gate, proxy) lives in pkg/gateway and is fully wired here.
+// This daemon predates the Tier A7 split (gatewayd-public + gatewayd-internal,
+// ADR-068). After the split ships, gatewayd-public owns TLS termination +
+// ACME :80/:443 + the httpsec outer wrapper, and gatewayd-internal owns
+// routing + wake + proxy on the unix socket /run/faas/gatewayd-internal.sock.
+// This legacy binary remains in-tree (and on the box) during the migration
+// window (cd-controlplane.yml BINARIES="apid schedd gatewayd …" still installs
+// it) but is not in FAAS_SERVICES / FAAS_RESTART_ORDER. Operators disable the
+// legacy systemd unit once the split pair is healthy.
 //
-// M5: run() builds the production gateway.PGBackend — host→app routing over
-// Postgres (read-only; apid/schedd own the writes) plus schedd over gRPC on
-// /run/faas/schedd.sock (ADR-018) for wakes — and keeps its caches fresh from
-// the instance_changed / app_changed pg_notify channels. TLS via CertMagic
-// (:80/:443) is wired in M8 — when TLSConfig.Disabled=true (default) the
-// daemon serves plain HTTP on :8080; when Disabled=false it binds :443 (TLS)
-// and :80 (ACME mux + :80→:443 redirect).
+// In the split topology the daemon body moves verbatim into
+// cmd/gatewayd-internal/ (PR-A: pure refactor; PR-B: replace the
+// placeholder handler); the legacy binary keeps its current shape so
+// cd-controlplane installs it byte-for-byte until operators retire it.
 //
-// Listeners run inside this daemon:
+// Listeners:
 //
-//	Disabled=true  → public :8080 plain HTTP            (legacy / e2e harness)
-//	Disabled=false → public :443 TLS + :80 ACME/redirect (production)
-//	private        :9090 loopback                       → /healthz /readyz /metrics
+//	public :8080 plain HTTP   (legacy / e2e harness fallback)
+//	private :9090 loopback    /healthz /readyz /metrics
 //
 // All share ctx cancellation so a SIGTERM shuts them down in parallel.
 package main
@@ -135,9 +135,9 @@ func (a *synthAdapter) Invoke(ctx context.Context, appID string, inv state.Invoc
 	return a.invoke(ctx, appID, inv)
 }
 
-// runDeps is the dependency seam for run. Tests inject net.Listen / http.Server
+// prodRunDeps is the dependency seam for run. Tests inject net.Listen / http.Server
 // wrappers so the seam is fully exercised without spawning a real daemon.
-type runDeps struct {
+type prodRunDeps struct {
 	listen  func(network, addr string) (net.Listener, error)
 	newSrv  func(addr string, handler http.Handler) *http.Server
 	backend gateway.Backend
@@ -163,31 +163,13 @@ type runDeps struct {
 	// tests (the wake/routing path doesn't need it); production wires the
 	// schedFlushSink.
 	lastSeen gateway.LastSeenSink
-	// tlsBundle, when non-nil, switches the public listener from plain HTTP
-	// to TLS (certmagic-managed). Production builds this in run() when
-	// cfg.TLS.Disabled=false; tests leave it nil to exercise the legacy
-	// plain-:8080 path.
-	tlsBundle *gateway.TLSBundle
-	// acmeMux, when non-nil, is mounted on the :80 listener alongside the
-	// TLS listener. Production builds this in run() when TLS is enabled;
-	// tests leave it nil.
-	acmeMux http.Handler
 	// metrics is the process-local *gateway.Metrics bundle (Prometheus
 	// collectors owned by gatewayd — separate from pkg/wire/metrics.go
 	// OpsMetrics, which gatewayd does not instantiate). Constructed in run()
-	// before the TLS bundle so NewCertMagicConfig and the cert-expiry
-	// refresher share the same registry with the handler. Tests leave it
-	// nil; the bundle + refresher + handler all accept nil safely.
+	// before the handler is built so the handler + warm-hint consumer +
+	// top-N sampler share the same registry. Tests leave it nil; every
+	// downstream consumer accepts nil safely.
 	metrics *gateway.Metrics
-	// tlsCertExpiryCancel stops the cert-expiry refresher goroutine
-	// (spec §12 + ADR-024 H3). Set in run() when TLS is enabled; called
-	// in the shutdown path after tlsBundle.Close. nil when TLS is
-	// disabled or when the daemon is started in test mode.
-	tlsCertExpiryCancel func()
-	// extraListen is an optional secondary listener (the :80 ACME mux when
-	// TLS is enabled). nil in the legacy path. Tests use it to exercise
-	// the production-style dual-listener setup without binding :80.
-	extraListen func(network, addr string) (net.Listener, error)
 	// controlAddr is the loopback control-plane bind (default
 	// 127.0.0.1:9090). Tests inject a free-port value via "127.0.0.1:0"
 	// + the resolved listener so two tests in the same package don't race
@@ -196,7 +178,7 @@ type runDeps struct {
 	// apidLoopback is the operator-configured upstream URL the apidProxy
 	// forwards to (cfg.APIDLoopback / deploy/digitalocean/config/
 	// gatewayd.toml `apid_loopback`). Empty in tests; run() populates it
-	// from cfg before invoking runWithDeps.
+	// from cfg before invoking prodRunWithDeps.
 	apidLoopback string
 	// writeTimeout is the http.Server.WriteTimeout override (issue #471 /
 	// ADR-047). When 0, the legacy 300 s default (spec §4.1) applies.
@@ -268,8 +250,8 @@ type runDeps struct {
 	scheddRouter *scheddRouter
 }
 
-func defaultDeps() runDeps {
-	return runDeps{
+func prodDefaultDeps() prodRunDeps {
+	return prodRunDeps{
 		listen:      net.Listen,
 		newSrv:      defaultServer,
 		backend:     unwiredBackend{},
@@ -285,11 +267,12 @@ func defaultServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-func main() {
-	wire.Daemon("gatewayd", run)
-}
-
-func run(ctx context.Context, log *slog.Logger) error {
+// prodRun is the production run() body moved verbatim from
+// cmd/gatewayd/main.go. The `prod` prefix avoids colliding with
+// the placeholder's `run` in cmd/gatewayd-internal/main.go (PR-A
+// keeps the placeholder serving TEMPLATE_OK so wait_healthy stays
+// green; PR-B drops the placeholder and renames prodRun → run).
+func prodRun(ctx context.Context, log *slog.Logger) error {
 	pool, err := db.Open(ctx, "")
 	if err != nil {
 		return fmt.Errorf("gatewayd: open db: %w", err)
@@ -314,7 +297,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
 	}
-	deps := defaultDeps()
+	deps := prodDefaultDeps()
 	deps.scheddRouter = newScheddRouter(pgStore, vmmdTLS, nil, log)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
@@ -482,64 +465,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 		},
 	}, log)
 	// Process-local Prometheus registry (spec §12). Constructed here so
-	// every downstream consumer — TLS bundle, cert-expiry refresher,
-	// handler — shares the same registry. The registry is exposed via
+	// every downstream consumer — handler, warm-hint consumer, top-N
+	// sampler — shares the same registry. The registry is exposed via
 	// :9090/metrics by gateway.RunControlServer; the gate/handler pick
-	// it up via deps.metrics in runWithDeps.
+	// it up via deps.metrics in prodRunWithDeps.
+	//
+	// ADR-068 / Tier A7 split: TLS termination moves to gatewayd-public
+	// (certmagic, httpsec, :443/:80 ACME mux). The legacy binary stays
+	// plain HTTP on :8080; PR-A removes the resolved-TLS branch entirely.
 	deps.metrics = gateway.NewMetrics()
 
-	// TLS path: only when the operator opted in via the TOML [tls] table.
-	// The Disabled=true path stays on plain :8080 so the e2e harness keeps
-	// working without a config file (and without bind capability requirements).
-	// Wrap pgStore.DomainByName (which returns (state.CustomDomain, error))
-	// as the gateway.OnDemandLookup shape: any-typed result, with state.ErrNotFound
-	// surfaced as gateway.ErrNotFound so the steady-state denial path stays quiet.
-	allowLookup := func(ctx context.Context, domain string) (any, error) {
-		d, err := pgStore.DomainByName(ctx, domain)
-		if err != nil {
-			if errors.Is(err, state.ErrNotFound) {
-				return nil, gateway.ErrNotFound
-			}
-			return nil, err
-		}
-		return d, nil
-	}
-	//nolint:contextcheck // The closure above forwards ctx to pgStore.DomainByName explicitly; golangci can't trace the call through the OnDemandLookup function-type indirection.
-	resolved := cfg.resolveTLSConfig(gateway.NewPGAllowlist(allowLookup, log))
-	if !resolved.Disabled {
-		tok, err := loadSecretFile(resolved.HetznerDNSAPITokenPath)
-		if err != nil {
-			return fmt.Errorf("gatewayd: Hetzner DNS token: %w", err)
-		}
-		bundle, err := gateway.NewCertMagicConfig(ctx, resolved, tok, log, nil, deps.metrics)
-		if err != nil {
-			return fmt.Errorf("gatewayd: certmagic: %w", err)
-		}
-		deps.tlsBundle = bundle
-		deps.acmeMux = gateway.NewACMEMux(bundle.HTTPChallengeHandler)
-		deps.extraListen = net.Listen
-		// Public listener now binds :443, not :8080.
-		listenAddr = ":443"
-		// ADR-024 H3 — cert-expiry refresher: walks cfg.StorageDir/<...>/...
-		// on a 5-minute ticker and updates gateway_tls_cert_expiry_seconds
-		// with the smallest remaining NotAfter across cached leaf certs.
-		// The cancel closure lands on deps so the shutdown path can stop
-		// the goroutine after tlsBundle.Close (spec §12 panel surfaces
-		// immediately on /metrics; the alert rules live in faas.rules.yml).
-		deps.tlsCertExpiryCancel = gateway.StartCertExpiryRefresher(
-			ctx, resolved.StorageDir, deps.metrics, 5*time.Minute,
-			// wildcardIssuerKey: the certmagic issuer-key path the
-			// DNS-01 solver uses for *.apps.<zone>. Empty string
-			// disables the wildcard classification — every cached
-			// cert is then classified as CertKindOnDemand, which is
-			// the conservative fallback. Production sets this from
-			// TOML alongside WildcardCertDomain so the per-host
-			// gauge labels accurately reflect issuer type.
-			"", log,
-		)
-	}
 	// Forward the operator-configured apid loopback URL through the
-	// test seam so runWithDeps can stay TOML-free (issue #85).
+	// test seam so prodRunWithDeps can stay TOML-free (issue #85).
 	deps.apidLoopback = cfg.APIDLoopback
 	// Issue #98 / ADR-028, plumbed via issue #120: per-node vmmd
 	// client cache. The dial closure routes through pkg/overlay so the
@@ -589,7 +526,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// per-app app.Plan.ResponseWriteTimeout() at request-init time
 	// (http.Server.WriteTimeout is global, so the per-app lift needs
 	// per-request bookkeeping via http.ResponseController — out of
-	// scope here). 0 means "spec default"; runWithDeps fills it in.
+	// scope here). 0 means "spec default"; prodRunWithDeps fills it in.
 	if cfg.ResponseWriteTimeout > 0 {
 		deps.writeTimeout = cfg.ResponseWriteTimeout
 	}
@@ -631,22 +568,22 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// per-node healthyCount as it always did).
 	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log)
 	go deps.warmHints.Run(ctx)
-	return runWithDeps(ctx, log, deps)
+	return prodRunWithDeps(ctx, log, deps)
 }
 
-// runWithDeps is the test-friendly variant. It exercises:
+// prodRunWithDeps is the test-friendly variant. It exercises:
 //
 //   - public listen on listenAddr via deps.listen / deps.newSrv (DI seam)
 //   - control listen on controlAddr via gateway.RunControlServer
 //   - SIGHUP-triggered rate-limit-bucket reset (same behaviour as production)
 //
-// Production calls run → runWithDeps(defaultDeps()); tests inject a custom
+// Production calls run → prodRunWithDeps(prodDefaultDeps()); tests inject a custom
 // deps.listen so they can probe a real socket without binding :8080.
-func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
-	// TLS resolution happens in run() before this is called: if
-	// deps.tlsBundle != nil the public listener binds :443 with certmagic;
-	// otherwise we fall back to the legacy plain :8080 path the e2e harness
-	// uses.
+func prodRunWithDeps(ctx context.Context, log *slog.Logger, deps prodRunDeps) error {
+	// ADR-068 / Tier A7 split: TLS termination moved to gatewayd-public.
+	// The legacy daemon always serves plain HTTP on :8080 (the e2e
+	// harness path); production traffic terminates TLS at gatewayd-public
+	// and proxies to the unix socket bound in cmd/gatewayd-internal/.
 
 	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
 	handler.SetWakeGateHook()
@@ -681,7 +618,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	egressGRPCSrv := egressgrpc.NewServer(egressSink, log)
 	deps.egressGRPC = newEgressGRPCListener(egressGRPCSocket, deps.egressTLS, egressGRPCSrv, log)
 	// Best-effort start, mirroring the synth listener pattern
-	// (runWithDeps internal RPC). If the unix socket can't bind
+	// (prodRunWithDeps internal RPC). If the unix socket can't bind
 	// (e.g. /run/faas doesn't exist on a dev/test box), log + continue
 	// — the public + control listeners are still up, and the
 	// per-instance egress sink continues to accumulate in memory
@@ -911,100 +848,40 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	errc := make(chan error, 4)
 	var servers []*http.Server
 	addSrv := func(s *http.Server) { servers = append(servers, s) }
-	if deps.tlsBundle != nil {
-		// Production: TLS listener on :443 + ACME mux on :80. We deliberately
-		// keep the dashboard / githubd proxy stack unchanged — it sits in
-		// front of the wake/proxy handler on the TLS side and we still want
-		// the gatewayd.Handler to handle app routing.
-		tlsCfg := &tls.Config{
-			GetCertificate: deps.tlsBundle.GetCertificate,
-			// Pin TLS 1.3 inline so gosec/G402 sees the literal value rather
-			// than chasing gateway.MinTLSVersion across packages (v2.4.0's
-			// gosec does not resolve cross-package constants).
-			MinVersion: tls.VersionTLS13,
-		}
-		public := &http.Server{
-			Addr:              listenAddr, // :443 (set by run())
-			Handler:           publicHandler,
-			TLSConfig:         tlsCfg,
-			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       60 * time.Second,
-			// Issue #471 / ADR-047 (PR-A): same write-timeout wiring
-			// as the plain-:8080 path. See deps.writeTimeout for the
-			// precedence (TOML > spec baseline).
-			WriteTimeout: writeTimeoutOrDefault(deps.writeTimeout),
-		}
-		addSrv(public)
-		// When the http.Server has a non-nil TLSConfig, ServeTLS needs an
-		// explicit cert/key. CertMagic handles cert retrieval via GetCertificate
-		// and certmagic's docs recommend serving via net.Listen + Serve() (not
-		// ServeTLS) so the GetCertificate callback is invoked. That is the
-		// path we use here.
-		l, lerr := deps.listen("tcp", listenAddr)
-		if lerr != nil {
-			log.Error("gatewayd TLS listen failed", "addr", listenAddr, "err", lerr)
-			return lerr
-		}
-		go func() {
-			log.Info("gatewayd public listening (TLS)", "addr", listenAddr)
-			if err := public.Serve(tls.NewListener(l, tlsCfg)); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- err
-			}
-		}()
-		// ACME / :80 listener — challenge dispatch + :80 → :443 redirect.
-		const acmeAddr = ":80"
-		acmeServer := &http.Server{
-			Addr:              acmeAddr,
-			Handler:           deps.acmeMux,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		addSrv(acmeServer)
-		listenFn := deps.extraListen
-		if listenFn == nil {
-			listenFn = net.Listen
-		}
-		al, aerr := listenFn("tcp", acmeAddr)
-		if aerr != nil {
-			log.Error("gatewayd ACME listen failed", "addr", acmeAddr, "err", aerr)
-			return aerr
-		}
-		go func() {
-			log.Info("gatewayd ACME listening", "addr", acmeAddr)
-			if err := acmeServer.Serve(al); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				errc <- err
-			}
-		}()
-	} else {
-		// Legacy plain-:8080 path. Existing e2e harness depends on this.
-		srv := deps.newSrv(listenAddr, publicHandler)
-		public := srv
-		public.Addr = listenAddr
-		if public.ReadTimeout == 0 {
-			public.ReadTimeout = 60 * time.Second
-		}
-		if public.WriteTimeout == 0 {
-			// Issue #471 / ADR-047 (PR-A): honour the TOML override
-			// (cfg.ResponseWriteTimeout, propagated via runDeps). 0
-			// means "use the spec §4.1 baseline" — see run() for the
-			// precedence. PR-B lifts the Hobby+ per-plan cap to 900 s
-			// via http.ResponseController and a per-request timeout
-			// (http.Server.WriteTimeout is global, so the per-app
-			// override can never land at this layer).
-			public.WriteTimeout = writeTimeoutOrDefault(deps.writeTimeout)
-		}
-		addSrv(public)
-		l, lerr := deps.listen("tcp", listenAddr)
-		if lerr != nil {
-			log.Error("gatewayd public listen failed", "addr", listenAddr, "err", lerr)
-			return lerr
-		}
-		go func() {
-			log.Info("gatewayd public listening", "addr", listenAddr)
-			if err := public.Serve(l); err != nil && err != http.ErrServerClosed {
-				errc <- err
-			}
-		}()
+	// Legacy plain-:8080 path. Existing e2e harness depends on this.
+	// ADR-068 / Tier A7 split: TLS termination moved to gatewayd-public
+	// (certmagic, httpsec, :443/:80 ACME mux). After PR-A this daemon no
+	// longer builds a *gateway.TLSBundle; PR-B removes the public :8080
+	// listener entirely when the unix-socket handler chain lands in
+	// cmd/gatewayd-internal/.
+	srv := deps.newSrv(listenAddr, publicHandler)
+	public := srv
+	public.Addr = listenAddr
+	if public.ReadTimeout == 0 {
+		public.ReadTimeout = 60 * time.Second
 	}
+	if public.WriteTimeout == 0 {
+		// Issue #471 / ADR-047 (PR-A): honour the TOML override
+		// (cfg.ResponseWriteTimeout, propagated via prodRunDeps). 0
+		// means "use the spec §4.1 baseline" — see run() for the
+		// precedence. PR-B lifts the Hobby+ per-plan cap to 900 s
+		// via http.ResponseController and a per-request timeout
+		// (http.Server.WriteTimeout is global, so the per-app
+		// override can never land at this layer).
+		public.WriteTimeout = writeTimeoutOrDefault(deps.writeTimeout)
+	}
+	addSrv(public)
+	l, lerr := deps.listen("tcp", listenAddr)
+	if lerr != nil {
+		log.Error("gatewayd public listen failed", "addr", listenAddr, "err", lerr)
+		return lerr
+	}
+	go func() {
+		log.Info("gatewayd public listening", "addr", listenAddr)
+		if err := public.Serve(l); err != nil && err != http.ErrServerClosed {
+			errc <- err
+		}
+	}()
 	ctrlAddr := controlAddr
 	if deps.controlAddr != "" {
 		ctrlAddr = deps.controlAddr
@@ -1053,16 +930,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		for _, s := range servers {
 			_ = s.Shutdown(shutdownCtx)
 		}
-		if deps.tlsBundle != nil {
-			_ = deps.tlsBundle.Close()
-		}
-		// ADR-024 H3 — stop the cert-expiry refresher goroutine. stop() is
-		// idempotent: the first call closes the inner `done` channel; later
-		// calls are a no-op via the select-default guard. nil-guarded because
-		// tests + TLS-disabled prod paths never start the refresher.
-		if deps.tlsCertExpiryCancel != nil {
-			deps.tlsCertExpiryCancel()
-		}
+		// ADR-068 / Tier A7 split: tlsBundle.Close + tlsCertExpiryCancel
+		// moved to gatewayd-public's shutdown path (cmd/gatewayd-public/main.go).
 		if deps.synth != nil {
 			//nolint:contextcheck // same shutdown-ctx contract as public.Shutdown above.
 			_ = deps.synth.Stop(shutdownCtx)
@@ -1106,7 +975,7 @@ func envOrGateway(key, fallback string) string {
 // gatewayd public listener binds to (issue #471 / ADR-047 PR-A).
 // The precedence is:
 //
-//  1. cfg.ResponseWriteTimeout (TOML)        — wire via runDeps.writeTimeout
+//  1. cfg.ResponseWriteTimeout (TOML)        — wire via prodRunDeps.writeTimeout
 //  2. api.ResponseWriteTimeoutDefault        — spec §4.1 baseline (300 s)
 //  3. 0 (the go interface default)           — never observed by callers
 //
