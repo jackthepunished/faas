@@ -211,3 +211,6 @@ linters:
       - path: "pkg/scheddgrpc/server_default_ops_test.go"
         linters:
           - staticcheck
+      - path: "cmd/apid/deploy_inputs_test.go"
+        linters:
+          - staticcheck
