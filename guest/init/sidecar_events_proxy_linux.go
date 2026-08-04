@@ -194,6 +194,15 @@ func (p *sidecarEventsProxy) SendRestart(sidecar string, attempt int) error {
 	return p.send(VsockSidecarEventsTypeRestart, body)
 }
 
+// codeql[go/uncontrolled-allocation-size]: the early-return guard at
+// the top of send() rejects any payload whose len(body)+1 exceeds
+// sidecarMaxDatagram (512), so the make() below is provably bounded.
+// CodeQL's taint analyzer follows len(body) into the make() argument
+// via the 1+len(body) arithmetic and flags the make() even though the
+// bound is reached on the line above. The column-1 suppression above
+// the method declaration is the documented escape hatch (memory:
+// codeql-suppression-column1).
+
 // send is the shared vsock-write path. The leading type byte
 // disambiguates the event class on the host; the JSON envelope
 // follows. Datagrams larger than sidecarMaxDatagram are
@@ -204,14 +213,6 @@ func (p *sidecarEventsProxy) send(t byte, body []byte) error {
 	if len(body)+1 > sidecarMaxDatagram {
 		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", len(body)+1, sidecarMaxDatagram)
 	}
-	// codeql[go/uncontrolled-allocation-size]: the early-return
-	// above guarantees len(body)+1 ≤ sidecarMaxDatagram (512), so
-	// the allocation below is provably bounded. CodeQL's taint
-	// analyzer follows len(body) into the make() argument via the
-	// 1+len(body) arithmetic; suppressing the alert here matches
-	// the column-1 suppression pattern (PR-C pre-merge audit,
-	// 2026-08-04).
-	// codeql[go/uncontrolled-allocation-size]
 	buf := make([]byte, 1+len(body))
 	buf[0] = t
 	copy(buf[1:], body)
