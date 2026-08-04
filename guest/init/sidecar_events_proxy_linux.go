@@ -201,15 +201,17 @@ func (p *sidecarEventsProxy) SendRestart(sidecar string, attempt int) error {
 // payloads well under the limit) so a future schema drift is
 // caught loudly rather than silently truncated by the kernel.
 func (p *sidecarEventsProxy) send(t byte, body []byte) error {
-	if len(body)+1 > sidecarMaxDatagram {
-		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", len(body)+1, sidecarMaxDatagram)
+	bodyLen := len(body)
+	if bodyLen+1 > sidecarMaxDatagram {
+		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", bodyLen+1, sidecarMaxDatagram)
 	}
 	// Explicit min() so CodeQL's "uncontrolled-allocation size" rule
-	// sees a bounded expression (1+len(body) is otherwise flagged as
-	// a possible overflow on hostile input). The earlier len() check
-	// already guarantees 1+len(body) ≤ sidecarMaxDatagram; the
-	// min() makes that visible to the analyzer.
-	sz := min(1+len(body), sidecarMaxDatagram)
+	// sees a bounded expression. The earlier if() guarantees
+	// bodyLen+1 ≤ sidecarMaxDatagram; the min() makes that visible
+	// to the analyzer. bodyLen is the bound, not the arithmetic
+	// expression bodyLen+1 (CodeQL's taint flow can't simplify
+	// through the addition).
+	sz := min(bodyLen+1, sidecarMaxDatagram)
 	buf := make([]byte, sz)
 	buf[0] = t
 	copy(buf[1:], body)
