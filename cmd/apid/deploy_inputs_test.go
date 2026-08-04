@@ -742,12 +742,9 @@ func TestScanForStatefulShape_TopLevelDataDir(t *testing.T) {
 		"myproject/data/payments.db": {},
 	})
 	path := writeTarToSpool(t, dir, raw)
-	prob := scanForStatefulShape(path, false)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected rejection, got nil")
-	}
-	if prob.Code != api.CodeStatelessOnlyViolation { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, scanForStatefulShape(path, false))
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
 	}
 	if !strings.Contains(prob.Detail, "data/") {
 		t.Errorf("detail %q does not mention data/", prob.Detail)
@@ -764,12 +761,9 @@ func TestScanForStatefulShape_TopLevelDBDir(t *testing.T) {
 		{Name: "myproject/db/main.sqlite"},
 	}, map[string][]byte{"myproject/db/main.sqlite": {}})
 	path := writeTarToSpool(t, dir, raw)
-	prob := scanForStatefulShape(path, false)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected rejection, got nil")
-	}
-	if prob.Code != api.CodeStatelessOnlyViolation { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, scanForStatefulShape(path, false))
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
 	}
 	if !strings.Contains(prob.Detail, "db/") {
 		t.Errorf("detail %q does not mention db/", prob.Detail)
@@ -790,12 +784,9 @@ func TestScanForStatefulShape_DockerfileVolume(t *testing.T) {
 		"myproject/index.js":   []byte(""),
 	})
 	path := writeTarToSpool(t, dir, raw)
-	prob := scanForStatefulShape(path, false)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected rejection, got nil")
-	}
-	if prob.Code != api.CodeStatelessOnlyViolation { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, scanForStatefulShape(path, false))
+	if prob.Code != api.CodeStatelessOnlyViolation {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeStatelessOnlyViolation)
 	}
 	if !strings.Contains(prob.Detail, "VOLUME") || !strings.Contains(prob.Detail, "/var/lib/myapp") {
 		t.Errorf("detail %q does not mention VOLUME /var/lib/myapp", prob.Detail)
@@ -814,12 +805,9 @@ func TestScanForStatefulShape_DockerfileMkfs(t *testing.T) {
 		"myproject/Dockerfile": []byte("FROM alpine\nRUN mkfs.ext4 /dev/sdb1\n"),
 	})
 	path := writeTarToSpool(t, dir, raw)
-	prob := scanForStatefulShape(path, false)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected rejection, got nil")
-	}
-	if !strings.Contains(prob.Detail, "mkfs") { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("detail %q does not mention mkfs", prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, scanForStatefulShape(path, false))
+	if !strings.Contains(prob.Detail, "mkfs") {
+		t.Errorf("detail %q does not mention mkfs", prob.Detail)
 	}
 }
 
@@ -835,12 +823,9 @@ func TestScanForStatefulShape_DockerfileMountExt4(t *testing.T) {
 		"myproject/Dockerfile": []byte("FROM alpine\nRUN mount -t ext4 /dev/sdb1 /data\n"),
 	})
 	path := writeTarToSpool(t, dir, raw)
-	prob := scanForStatefulShape(path, false)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected rejection, got nil")
-	}
-	if !strings.Contains(prob.Detail, "mkfs") && !strings.Contains(prob.Detail, "mount") { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("detail %q does not mention mkfs/mount", prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, scanForStatefulShape(path, false))
+	if !strings.Contains(prob.Detail, "mkfs") && !strings.Contains(prob.Detail, "mount") {
+		t.Errorf("detail %q does not mention mkfs/mount", prob.Detail)
 	}
 }
 
