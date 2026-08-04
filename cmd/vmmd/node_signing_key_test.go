@@ -80,9 +80,7 @@ func TestLoadNodeSigningKey_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadNodeSigningKey: %v", err)
 	}
-	if got == nil {
-		t.Fatal("returned private key is nil")
-	}
+	got = mustNodeSigningKey(t, got, "returned private key is nil")
 	wantKeyID, err := sched.KeyIDForPublicKey(&priv.PublicKey)
 	if err != nil {
 		t.Fatalf("sched.KeyIDForPublicKey: %v", err)
@@ -344,4 +342,18 @@ func TestLoadNodeSigningKey_OpenFDBindsModeAndBody(t *testing.T) {
 	// pin documented above. Listed here so future readers
 	// know the omission is intentional.
 	t.Skip("open-fd TOCTOU posture is a structural pin, not an observable behaviour")
+}
+
+// mustNodeSigningKey is the SA5011 escape hatch for the
+// loadNodeSigningKey happy-path test: the loader can legitimately
+// return (nil, "", nil) on certain misconfigurations, but we want
+// a real key for assertions. A helper that t.Fatal()s and returns
+// the value lets staticcheck see the value is non-nil at the call
+// site.
+func mustNodeSigningKey(t *testing.T, k *ecdsa.PrivateKey, msg string) *ecdsa.PrivateKey {
+	t.Helper()
+	if k == nil {
+		t.Fatal(msg)
+	}
+	return k
 }

@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -175,9 +176,7 @@ func TestRegisterComputeNodeKey_HappyPath(t *testing.T) {
 	}
 
 	block, _ := pem.Decode([]byte(gotPEM))
-	if block == nil {
-		t.Fatalf("PEM not decodable: %q", gotPEM)
-	}
+	block = mustPEMBlock(t, block, fmt.Sprintf("PEM not decodable: %q", gotPEM))
 	if block.Type != "PUBLIC KEY" {
 		t.Errorf("PEM type = %q, want PUBLIC KEY", block.Type)
 	}
@@ -268,4 +267,17 @@ func TestPublicKeyPEM_NilKey(t *testing.T) {
 	if _, err := publicKeyPEM(nil); err == nil {
 		t.Fatal("publicKeyPEM(nil) succeeded; want error")
 	}
+}
+
+// mustPEMBlock is the SA5011 escape hatch for the node-key
+// registration test: pem.Decode can legitimately return (nil, rest)
+// for malformed input, but we want a real block for assertions.
+// A helper that t.Fatal()s and returns the value lets staticcheck
+// see the value is non-nil at the call site.
+func mustPEMBlock(t *testing.T, b *pem.Block, msg string) *pem.Block {
+	t.Helper()
+	if b == nil {
+		t.Fatal(msg)
+	}
+	return b
 }
