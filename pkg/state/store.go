@@ -1119,6 +1119,17 @@ type Store interface {
 	// successful deploy (an app always has a live snapshot OR a cold-bootable
 	// rootfs — never neither, invariant §6.2-3).
 	LiveDeployment(ctx context.Context, appID string) (Deployment, error)
+	// CountLiveInstancesByDeployment returns the number of instances
+	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
+	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher
+	// (pkg/sched/deployment_counter_watcher.go) consults this query
+	// to detect the "last live instance parked" transition that
+	// resets the per-deployment 100% sampling window. Returns 0
+	// when no instance has ever been booted for the deployment or
+	// when every live instance has already parked. An unknown
+	// deployment_id returns (0, nil) — the SQL planner cannot fail
+	// a count(*) on a WHERE clause with no matching rows.
+	CountLiveInstancesByDeployment(ctx context.Context, deploymentID string) (int, error)
 	LatestSupersededDeployment(ctx context.Context, appID string) (Deployment, error)
 	// ListDeploymentsForApp returns deployments for an app, ordered DESC by
 	// created_at. limit <= 0 means "no row cap" (return every remaining row

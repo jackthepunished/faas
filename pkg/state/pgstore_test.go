@@ -2433,3 +2433,68 @@ func TestPg_GitHubInstallForAccount_OnDeleteCascade(t *testing.T) {
 		t.Errorf("expected ErrNotFound after account delete (CASCADE), got %v", err)
 	}
 }
+
+// TestPg_CountLiveInstancesByDeployment pins the per-deployment
+// live-count contract used by DeploymentCounterWatcher (issue #555
+// PR-6). Counts every instance in {waking, cold_booting, running}
+// for the given deployment_id; instances in PARKED / STOPPED /
+// SNAPSHOTTING are excluded; unknown deployment_ids return 0.
+func TestPg_CountLiveInstancesByDeployment(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, depID := seedLiveDeploy(t, s, ctx, "555")
+
+	nodeID := resolveDefaultLocal(t, ctx, s)
+
+	// 3 waking/cold_booting/running → must be counted.
+	mustCreate := func(state state.State) string {
+		t.Helper()
+		ins, err := s.CreateInstance(ctx, appID, depID, string(state), 256, nodeID, "")
+		if err != nil {
+			t.Fatalf("CreateInstance %s: %v", state, err)
+		}
+		return ins.ID
+	}
+	runningID := mustCreate(state.StateRunning)
+	wakingID := mustCreate(state.StateWaking)
+	coldBootingID := mustCreate(state.StateColdBooting)
+
+	// 1 parked + 1 snapshotting → must NOT be counted.
+	parkedID := mustCreate(state.StateParked)
+	snapshottingID := mustCreate(state.StateSnapshotting)
+
+	// And one for a different deployment — must NOT be counted.
+	_, _, otherDepID := seedLiveDeploy(t, s, ctx, "555-other")
+	otherRunning, err := s.CreateInstance(ctx, appID, otherDepID, string(state.StateRunning), 256, nodeID, "")
+	if err != nil {
+		t.Fatalf("CreateInstance other: %v", err)
+	}
+
+	got, err := s.CountLiveInstancesByDeployment(ctx, depID)
+	if err != nil {
+		t.Fatalf("CountLiveInstancesByDeployment: %v", err)
+	}
+	if got != 3 {
+		t.Errorf("count = %d, want 3 (waking=%s cold_booting=%s running=%s parked=%s snapshotting=%s other=%s)",
+			got, wakingID, coldBootingID, runningID, parkedID, snapshottingID, otherRunning.ID)
+	}
+
+	// Unknown deployment_id → 0, nil (count(*) on empty WHERE is
+	// well-defined in Postgres).
+	gotUnknown, err := s.CountLiveInstancesByDeployment(ctx, "00000000-0000-0000-0000-000000000000")
+	if err != nil {
+		t.Fatalf("unknown deployment_id: %v", err)
+	}
+	if gotUnknown != 0 {
+		t.Errorf("unknown deployment_id count = %d, want 0", gotUnknown)
+	}
+
+	// Empty deployment_id → 0, nil (the SQL parameter is an empty
+	// string; the planner returns count=0 for `WHERE deployment_id = ''`).
+	gotEmpty, err := s.CountLiveInstancesByDeployment(ctx, "")
+	if err != nil {
+		t.Fatalf("empty deployment_id: %v", err)
+	}
+	if gotEmpty != 0 {
+		t.Errorf("empty deployment_id count = %d, want 0", gotEmpty)
+	}
+}

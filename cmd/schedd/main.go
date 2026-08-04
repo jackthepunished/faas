@@ -39,6 +39,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
+	"github.com/onebox-faas/faas/pkg/wire/otelinit"
 	"google.golang.org/grpc"
 )
 
@@ -432,6 +433,34 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	engine.WithOpsMetrics(ops)
 
+	// Issue #555 PR-6 — per-deployment 100% sampling window.
+	//
+	// otelinit.Init wires the OTel SDK (sampler chain:
+	// ParentBased(DeploymentAware(TraceIDRatioBased(rate)))). The
+	// returned handle owns the per-deployment counter that the
+	// scheduler (and the engine's sched.wake span) consult via
+	// the sampler. Shutdown flushes the batch span processor on
+	// drain.
+	//
+	// The watcher (sched.DeploymentCounterWatcher) resets the
+	// counter on the "last live instance parked for this
+	// deployment" transition, observed via the in-process
+	// Platform `wake` topic — so we must also wire a real
+	// Broadcaster into NewPlatform below (replacing the prior
+	// `nil` arg).
+	otelHandle, err := otelinit.Init(ctx, otelinit.Config{
+		Name:    "schedd",
+		Version: wire.Version,
+	}, log)
+	if err != nil {
+		return fmt.Errorf("schedd: otelinit: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = otelHandle.Shutdown(shutdownCtx)
+	}()
+
 	// ADR-053 — slice-3 signature verification. Construct the
 	// in-memory (key_id → *ecdsa.PublicKey) registry, load the
 	// initial snapshot from compute_node_keys (migration 00075),
@@ -505,12 +534,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// wake.boot_started / wake.boot_completed / wake.boot_failed /
 	// wake.park_started / wake.park_completed / wake.stalled
 	// (vmmd / gatewayd / builderd / apid mirror corroborating
-	// observations). nil broadcaster is allowed — the Platform
-	// skips the in-process SSE fan-out and just writes the events
-	// row. Production SSE delivery for the /v1/apps/{slug}/wakes/
-	// {wake_id}/timeline endpoint uses pg_notify (cross-process),
-	// not the in-process Broadcaster.
-	engine.WithEvents(events.NewPlatform("schedd", store, log, ops, nil))
+	// observations).
+	//
+	// Issue #555 PR-6 — wire a real Broadcaster (was nil before)
+	// so the DeploymentCounterWatcher can subscribe in-process.
+	// Cross-process delivery for the /v1/apps/{slug}/wakes/
+	// {wake_id}/timeline endpoint still uses pg_notify; the
+	// Broadcaster is the in-process fast path.
+	bc := events.New()
+	engine.WithEvents(events.NewPlatform("schedd", store, log, ops, bc))
+
+	// Issue #555 PR-6 — start the DeploymentCounterWatcher. The
+	// watcher resets the per-deployment 100% sampling window on
+	// the "last live instance parked" transition. The
+	// LiveInstanceCounter interface is satisfied by
+	// state.PgStore (and MemStore) via CountLiveInstancesByDeployment.
+	counterWatcher := sched.NewDeploymentCounterWatcher(bc, otelHandle.DeploymentCounter, store, log)
+	go func() {
+		if err := counterWatcher.Run(ctx); err != nil {
+			log.Warn("deployment_counter_watcher: run ended", "err", err)
+		}
+	}()
 
 	// Rebuild admission accounting from any instances still live from a prior
 	// run before we start admitting new wakes.

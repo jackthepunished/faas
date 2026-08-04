@@ -3058,6 +3058,27 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 	return scanDeploymentWithRootfs(row)
 }
 
+// CountLiveInstancesByDeployment returns the number of instances in
+// {WAKING, COLD_BOOTING, RUNNING} for the given deployment_id (issue
+// #555 PR-6). The DeploymentCounterWatcher
+// (pkg/sched/deployment_counter_watcher.go) uses this to detect the
+// "last live instance parked" transition. The SQL is a single
+// count(*) against the existing deployment_id column (ADR-072); no
+// new index needed at the deployment_id cardinality we expect.
+//
+// The state strings are lowercase to match the convention in the
+// instances_state_check constraint (migrations/00020_instance_evicting_state.sql)
+// and the SQL writes in MarkInstanceMigrating / ListLiveInstancesOnNode.
+func (s *PgStore) CountLiveInstancesByDeployment(ctx context.Context, deploymentID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		select count(*) from instances
+		where deployment_id = $1
+		  and state in ('waking', 'cold_booting', 'running')
+	`, deploymentID).Scan(&n)
+	return n, err
+}
+
 func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
 		`select `+deploymentSelectColumns+`
