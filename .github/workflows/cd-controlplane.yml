@@ -110,7 +110,7 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             root@${{ env.CP_HOST }} "mkdir -p /opt/faas/bin/deploy-tmp"
           scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            bin/apid bin/schedd bin/gatewayd bin/gatewayd-public \
+            bin/apid bin/schedd bin/gatewayd-public \
             bin/gatewayd-internal bin/imaged bin/meterd \
             bin/githubd bin/vmmd bin/gregale bin/migrate \
             root@${{ env.CP_HOST }}:/opt/faas/bin/deploy-tmp/
@@ -176,11 +176,10 @@ jobs:
             echo "::error::FAAS_SERVICES and FAAS_RESTART_ORDER diverged; update both to keep dependency ordering correct"
             exit 1
           fi
-          # Includes the legacy gatewayd binary during the migration window
-          # (ADR-070 keeps it in-tree). Treat it as a no-op install target on
-          # boxes that have fully migrated to the split pair (below we
-          # `systemctl disable` the legacy unit once the split pair is up).
-          BINARIES="apid schedd gatewayd gatewayd-public gatewayd-internal imaged meterd githubd vmmd gregale migrate"
+          # The legacy gatewayd binary was removed in Tier A7 PR-A
+          # (its source moved into cmd/gatewayd-internal/). PR-B wired
+          # the real handler chain; PR-C removed the legacy install target.
+          BINARIES="apid schedd gatewayd-public gatewayd-internal imaged meterd githubd vmmd gregale migrate"
           # NOT under /opt/faas/bin: survives a failed deploy + nothing globs it.
           ROLLBACK_DIR=/opt/faas/rollback
 

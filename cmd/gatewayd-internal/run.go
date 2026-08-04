@@ -135,9 +135,9 @@ func (a *synthAdapter) Invoke(ctx context.Context, appID string, inv state.Invoc
 	return a.invoke(ctx, appID, inv)
 }
 
-// prodRunDeps is the dependency seam for run. Tests inject net.Listen / http.Server
+// runDeps is the dependency seam for run. Tests inject net.Listen / http.Server
 // wrappers so the seam is fully exercised without spawning a real daemon.
-type prodRunDeps struct {
+type runDeps struct {
 	listen  func(network, addr string) (net.Listener, error)
 	newSrv  func(addr string, handler http.Handler) *http.Server
 	backend gateway.Backend
@@ -178,7 +178,7 @@ type prodRunDeps struct {
 	// apidLoopback is the operator-configured upstream URL the apidProxy
 	// forwards to (cfg.APIDLoopback / deploy/digitalocean/config/
 	// gatewayd.toml `apid_loopback`). Empty in tests; run() populates it
-	// from cfg before invoking prodRunWithDeps.
+	// from cfg before invoking runWithDeps.
 	apidLoopback string
 	// writeTimeout is the http.Server.WriteTimeout override (issue #471 /
 	// ADR-047). When 0, the legacy 300 s default (spec §4.1) applies.
@@ -250,8 +250,8 @@ type prodRunDeps struct {
 	scheddRouter *scheddRouter
 }
 
-func prodDefaultDeps() prodRunDeps {
-	return prodRunDeps{
+func defaultDeps() runDeps {
+	return runDeps{
 		listen:      net.Listen,
 		newSrv:      defaultServer,
 		backend:     unwiredBackend{},
@@ -267,12 +267,12 @@ func defaultServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// prodRun is the production run() body moved verbatim from
+// run is the production run() body moved verbatim from
 // cmd/gatewayd/main.go. The `prod` prefix avoids colliding with
 // the placeholder's `run` in cmd/gatewayd-internal/main.go (PR-A
 // keeps the placeholder serving TEMPLATE_OK so wait_healthy stays
-// green; PR-B drops the placeholder and renames prodRun → run).
-func prodRun(ctx context.Context, log *slog.Logger) error {
+// green; PR-B drops the placeholder and renames run → run).
+func run(ctx context.Context, log *slog.Logger) error {
 	pool, err := db.Open(ctx, "")
 	if err != nil {
 		return fmt.Errorf("gatewayd: open db: %w", err)
@@ -297,7 +297,7 @@ func prodRun(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
 	}
-	deps := prodDefaultDeps()
+	deps := defaultDeps()
 	deps.scheddRouter = newScheddRouter(pgStore, vmmdTLS, nil, log)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
@@ -468,7 +468,7 @@ func prodRun(ctx context.Context, log *slog.Logger) error {
 	// every downstream consumer — handler, warm-hint consumer, top-N
 	// sampler — shares the same registry. The registry is exposed via
 	// :9090/metrics by gateway.RunControlServer; the gate/handler pick
-	// it up via deps.metrics in prodRunWithDeps.
+	// it up via deps.metrics in runWithDeps.
 	//
 	// ADR-068 / Tier A7 split: TLS termination moves to gatewayd-public
 	// (certmagic, httpsec, :443/:80 ACME mux). The legacy binary stays
@@ -476,7 +476,7 @@ func prodRun(ctx context.Context, log *slog.Logger) error {
 	deps.metrics = gateway.NewMetrics()
 
 	// Forward the operator-configured apid loopback URL through the
-	// test seam so prodRunWithDeps can stay TOML-free (issue #85).
+	// test seam so runWithDeps can stay TOML-free (issue #85).
 	deps.apidLoopback = cfg.APIDLoopback
 	// Issue #98 / ADR-028, plumbed via issue #120: per-node vmmd
 	// client cache. The dial closure routes through pkg/overlay so the
@@ -526,7 +526,7 @@ func prodRun(ctx context.Context, log *slog.Logger) error {
 	// per-app app.Plan.ResponseWriteTimeout() at request-init time
 	// (http.Server.WriteTimeout is global, so the per-app lift needs
 	// per-request bookkeeping via http.ResponseController — out of
-	// scope here). 0 means "spec default"; prodRunWithDeps fills it in.
+	// scope here). 0 means "spec default"; runWithDeps fills it in.
 	if cfg.ResponseWriteTimeout > 0 {
 		deps.writeTimeout = cfg.ResponseWriteTimeout
 	}
@@ -568,18 +568,18 @@ func prodRun(ctx context.Context, log *slog.Logger) error {
 	// per-node healthyCount as it always did).
 	deps.warmHints = newWarmHintConsumer(sched, warmHintCache, log)
 	go deps.warmHints.Run(ctx)
-	return prodRunWithDeps(ctx, log, deps)
+	return runWithDeps(ctx, log, deps)
 }
 
-// prodRunWithDeps is the test-friendly variant. It exercises:
+// runWithDeps is the test-friendly variant. It exercises:
 //
 //   - public listen on listenAddr via deps.listen / deps.newSrv (DI seam)
 //   - control listen on controlAddr via gateway.RunControlServer
 //   - SIGHUP-triggered rate-limit-bucket reset (same behaviour as production)
 //
-// Production calls run → prodRunWithDeps(prodDefaultDeps()); tests inject a custom
+// Production calls run → runWithDeps(defaultDeps()); tests inject a custom
 // deps.listen so they can probe a real socket without binding :8080.
-func prodRunWithDeps(ctx context.Context, log *slog.Logger, deps prodRunDeps) error {
+func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ADR-068 / Tier A7 split: TLS termination moved to gatewayd-public.
 	// The legacy daemon always serves plain HTTP on :8080 (the e2e
 	// harness path); production traffic terminates TLS at gatewayd-public
@@ -618,7 +618,7 @@ func prodRunWithDeps(ctx context.Context, log *slog.Logger, deps prodRunDeps) er
 	egressGRPCSrv := egressgrpc.NewServer(egressSink, log)
 	deps.egressGRPC = newEgressGRPCListener(egressGRPCSocket, deps.egressTLS, egressGRPCSrv, log)
 	// Best-effort start, mirroring the synth listener pattern
-	// (prodRunWithDeps internal RPC). If the unix socket can't bind
+	// (runWithDeps internal RPC). If the unix socket can't bind
 	// (e.g. /run/faas doesn't exist on a dev/test box), log + continue
 	// — the public + control listeners are still up, and the
 	// per-instance egress sink continues to accumulate in memory
@@ -862,7 +862,7 @@ func prodRunWithDeps(ctx context.Context, log *slog.Logger, deps prodRunDeps) er
 	}
 	if public.WriteTimeout == 0 {
 		// Issue #471 / ADR-047 (PR-A): honour the TOML override
-		// (cfg.ResponseWriteTimeout, propagated via prodRunDeps). 0
+		// (cfg.ResponseWriteTimeout, propagated via runDeps). 0
 		// means "use the spec §4.1 baseline" — see run() for the
 		// precedence. PR-B lifts the Hobby+ per-plan cap to 900 s
 		// via http.ResponseController and a per-request timeout
@@ -975,7 +975,7 @@ func envOrGateway(key, fallback string) string {
 // gatewayd public listener binds to (issue #471 / ADR-047 PR-A).
 // The precedence is:
 //
-//  1. cfg.ResponseWriteTimeout (TOML)        — wire via prodRunDeps.writeTimeout
+//  1. cfg.ResponseWriteTimeout (TOML)        — wire via runDeps.writeTimeout
 //  2. api.ResponseWriteTimeoutDefault        — spec §4.1 baseline (300 s)
 //  3. 0 (the go interface default)           — never observed by callers
 //

@@ -74,7 +74,7 @@ func TestUnwiredBackendReturnsNotFound(t *testing.T) {
 }
 
 func TestRunWithDeps_ServesAndShutsDown(t *testing.T) {
-	deps := prodDefaultDeps()
+	deps := defaultDeps()
 	deps.backend = &fixedBackend{}
 	deps.newSrv = func(addr string, h http.Handler) *http.Server {
 		return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 5 * time.Second}
@@ -98,7 +98,7 @@ func TestRunWithDeps_ServesAndShutsDown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- prodRunWithDeps(ctx, discardLogger(), deps) }()
+	go func() { done <- runWithDeps(ctx, discardLogger(), deps) }()
 	t.Cleanup(cancel)
 
 	// Wait until the server is accepting.
@@ -127,19 +127,19 @@ func TestRunWithDeps_ServesAndShutsDown(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "Server closed") && !strings.Contains(err.Error(), "use of closed network connection") {
-			t.Errorf("prodRunWithDeps returned %v, want nil or context.Canceled", err)
+			t.Errorf("runWithDeps returned %v, want nil or context.Canceled", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("prodRunWithDeps did not return after ctx cancel")
+		t.Fatal("runWithDeps did not return after ctx cancel")
 	}
 }
 
 func TestRunWithDeps_ListenErrorReturns(t *testing.T) {
-	deps := prodDefaultDeps()
+	deps := defaultDeps()
 	deps.listen = func(_, _ string) (net.Listener, error) {
 		return nil, errors.New("addr in use")
 	}
-	err := prodRunWithDeps(context.Background(), discardLogger(), deps)
+	err := runWithDeps(context.Background(), discardLogger(), deps)
 	if err == nil {
 		t.Fatal("expected listen error to propagate")
 	}
@@ -153,7 +153,7 @@ func TestRunWithDeps_ServeError(t *testing.T) {
 	// on it. The close races with Serve so we observe either an immediate
 	// Serve error or a successful Shutdown — both are acceptable termination
 	// signals.
-	deps := prodDefaultDeps()
+	deps := defaultDeps()
 	deps.backend = &fixedBackend{}
 
 	deps.listen = func(_, _ string) (net.Listener, error) {
@@ -169,7 +169,7 @@ func TestRunWithDeps_ServeError(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- prodRunWithDeps(context.Background(), discardLogger(), deps) }()
+	go func() { done <- runWithDeps(context.Background(), discardLogger(), deps) }()
 
 	select {
 	case err := <-done:
@@ -177,20 +177,20 @@ func TestRunWithDeps_ServeError(t *testing.T) {
 		// the goroutine to exit cleanly. Acceptable: any non-nil OR nil.
 		_ = err
 	case <-time.After(2 * time.Second):
-		t.Fatal("prodRunWithDeps did not exit after listener closed")
+		t.Fatal("runWithDeps did not exit after listener closed")
 	}
 }
 
 func TestDefaultDeps_ReturnExpected(t *testing.T) {
-	d := prodDefaultDeps()
+	d := defaultDeps()
 	if d.listen == nil {
-		t.Error("prodDefaultDeps().listen is nil")
+		t.Error("defaultDeps().listen is nil")
 	}
 	if d.newSrv == nil {
-		t.Error("prodDefaultDeps().newSrv is nil")
+		t.Error("defaultDeps().newSrv is nil")
 	}
 	if d.backend == nil {
-		t.Error("prodDefaultDeps().backend is nil")
+		t.Error("defaultDeps().backend is nil")
 	}
 	if _, ok := d.backend.(unwiredBackend); !ok {
 		t.Errorf("default backend = %T, want unwiredBackend", d.backend)
