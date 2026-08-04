@@ -91,6 +91,17 @@ func writeTarToSpool(t *testing.T, root string, raw []byte) string {
 	}
 	return path
 }
+// mustProblem fails the test when prob is nil and returns it
+// non-nil otherwise. Side-steps the SA5011 false positive on
+// `if prob == nil { t.Fatal(...) } if prob.X` because t.Fatal
+// returning is a runtime fact the linter can't prove.
+func mustProblem(t *testing.T, prob *api.Problem) *api.Problem {
+	t.Helper()
+	if prob == nil {
+		t.Fatal("expected a problem, got nil")
+	}
+	return prob
+}
 
 // TestValidateTarballShape_RejectsAbsolutePath covers the existing
 // `hdr.Name` check that pre-dates PR-A. Pinned here so the PR-A
@@ -251,12 +262,9 @@ func TestValidateTarballShape_EscapeBeforeCountCap(t *testing.T) {
 	raw := buildTestTarGz(t, entries, nil)
 	path := writeTarToSpool(t, dir, raw)
 
-	prob := validateTarballShape(path)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected reject, got nil problem")
-	}
-	if !strings.Contains(prob.Detail, "symlink/hardlink") { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("expected symlink-specific detail, got %q (a flipped order would surface as 'too many files')", prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, validateTarballShape(path))
+	if !strings.Contains(prob.Detail, "symlink/hardlink") {
+		t.Errorf("expected symlink-specific detail, got %q (a flipped order would surface as 'too many files')", prob.Detail)
 	}
 }
 
@@ -319,11 +327,9 @@ func TestValidateAndSpool_ByteCapBoundary(t *testing.T) {
 	part2, cleanup2 := newMultipartFilePart(t, "src.tar.gz", raw2)
 	defer cleanup2()
 	_, _, prob = validateAndSpool(part2, limits)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("over-cap payload should reject, got nil problem")
-	}
-	if prob.Code != api.CodeSourceTooLarge { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("expected CodeSourceTooLarge, got %q (detail=%q)", prob.Code, prob.Detail) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob = mustProblem(t, prob)
+	if prob.Code != api.CodeSourceTooLarge {
+		t.Errorf("expected CodeSourceTooLarge, got %q (detail=%q)", prob.Code, prob.Detail)
 	}
 }
 
@@ -689,12 +695,9 @@ func TestScanForStatefulShape_DockerfileFlagWithoutDockerfile(t *testing.T) {
 		"myproject/index.js": []byte("exports.handler = () => 1;\n"),
 	})
 	path := writeTarToSpool(t, dir, raw)
-	prob := scanForStatefulShape(path, true)
-	if prob == nil { //nolint:staticcheck // t.Fatal terminates, var proven non-nil below
-		t.Fatal("expected fail-fast on missing Dockerfile, got nil")
-	}
-	if prob.Code != api.CodeSourceInvalid { //nolint:staticcheck // t.Fatal on prior line proves non-nil
-		t.Errorf("code = %q, want %q", prob.Code, api.CodeSourceInvalid) //nolint:staticcheck // t.Fatal on prior line proves non-nil
+	prob := mustProblem(t, scanForStatefulShape(path, true))
+	if prob.Code != api.CodeSourceInvalid {
+		t.Errorf("code = %q, want %q", prob.Code, api.CodeSourceInvalid)
 	}
 	if !strings.Contains(prob.Detail, "Dockerfile") {
 		t.Errorf("detail %q does not mention Dockerfile", prob.Detail)
