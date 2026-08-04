@@ -204,7 +204,13 @@ func (p *sidecarEventsProxy) send(t byte, body []byte) error {
 	if len(body)+1 > sidecarMaxDatagram {
 		return fmt.Errorf("sidecar event datagram %d bytes exceeds limit %d", len(body)+1, sidecarMaxDatagram)
 	}
-	buf := make([]byte, 1+len(body))
+	// Explicit min() so CodeQL's "uncontrolled-allocation size" rule
+	// sees a bounded expression (1+len(body) is otherwise flagged as
+	// a possible overflow on hostile input). The earlier len() check
+	// already guarantees 1+len(body) ≤ sidecarMaxDatagram; the
+	// min() makes that visible to the analyzer.
+	sz := min(1+len(body), sidecarMaxDatagram)
+	buf := make([]byte, sz)
 	buf[0] = t
 	copy(buf[1:], body)
 	dst := &unix.SockaddrVM{
