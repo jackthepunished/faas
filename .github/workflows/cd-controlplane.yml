@@ -149,7 +149,6 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             root@${{ env.CP_HOST }} \
             "set -euo pipefail
-               install -m 0644 -o root -g root /etc/tmpfiles.d/faas.conf /etc/tmpfiles.d/faas.conf
                systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf"
           # SCP faas-vmmd.service unit
           UNIT_SRC="deploy/etc/faas-vmmd.service"
