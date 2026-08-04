@@ -139,6 +139,8 @@ export type { Sidecar } from './Sidecar.js';
 export type { Slug } from './Slug.js';
 export type { StorageUsageListResponse } from './StorageUsageListResponse.js';
 export type { StorageUsageResponse } from './StorageUsageResponse.js';
+export type { Trace } from './Trace.js';
+export type { TraceSpan } from './TraceSpan.js';
 export type { TransferOwnershipRequest } from './TransferOwnershipRequest.js';
 export type { TrustedSigner } from './TrustedSigner.js';
 export type { UpdateAlertRuleRequest } from './UpdateAlertRuleRequest.js';

@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { Trace } from '../models/Trace.js';
 import type { WakeTimelineResponse } from '../models/WakeTimelineResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -73,6 +74,49 @@ export class ObservabilityService {
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Retrieve a stored OpenTelemetry trace.
+   * Issue #555. Returns the full span tree for a single trace_id
+   * (32-hex, the same as the request's `wake_id`). The trace is
+   * sourced from the gatewayd-public in-memory ring (24h
+   * retention, 100k default cap). When no OTLP endpoint is set
+   * the ring is the only source — when OTLP is set, the ring
+   * still operates as the customer-facing query layer.
+   *
+   * Authentication: the `X-Faas-Trace-Auth` header must carry
+   * the operator's observer token (env: `FAAS_TRACE_OBSERVER_TOKEN`).
+   * The endpoint is gated even when the dashboard session cookie is
+   * present — tracing is an operator surface, not a customer one.
+   * An empty token disables the endpoint (returns 404).
+   *
+   * @returns Trace The trace tree.
+   * @throws ApiError
+   */
+  public static getTrace({
+    traceId,
+  }: {
+    /**
+     * 32-hex W3C trace_id (or wake_id UUIDv7 hex form).
+     */
+    traceId: string,
+  }): CancelablePromise<Trace> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/traces/{trace_id}',
+      path: {
+        'trace_id': traceId,
+      },
+      errors: {
+        401: `Missing or wrong observer token. The endpoint is operator-
+        gated; the customer-facing dashboard session does not
+        grant access.
+        `,
+        404: `Trace not in the ring (never seen, or evicted by the 24h
+        retention sweep / LRU cap).
         `,
       },
     });
