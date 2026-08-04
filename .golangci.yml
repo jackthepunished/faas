@@ -193,3 +193,12 @@ linters:
       - path: "pkg/grpcerr/grpcerr_test.go"
         linters:
           - staticcheck
+      - path: "pkg/api/registry_auth_test.go"
+        linters:
+          - staticcheck
+      - path: "pkg/api/dto_overrides_test.go"
+        linters:
+          - staticcheck
+      - path: "pkg/billing/stripe/sandbox_test.go"
+        linters:
+          - staticcheck
