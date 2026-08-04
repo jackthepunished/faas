@@ -67,17 +67,32 @@ var scheddSocket = envOrGateway("FAAS_SCHEDD_SOCKET", "/run/faas/schedd.sock")
 // per-test path without needing /run/faas on the host (PR #203).
 var gatewaydInternalSocket = envOrGateway("FAAS_GATEWAY_SYNTH_SOCKET", "/run/faas/gatewayd-internal.sock")
 
+// publicListenOffSentinel is the value of FAAS_GATEWAY_LISTEN that
+// disables the public listener entirely — used by
+// faas-gatewayd-internal.service in production (ADR-068 / ADR-070
+// Tier A7 split), where the public edge is owned by gatewayd-public
+// (which forwards here over the unix socket at
+// /run/faas/gatewayd-internal.sock). Without this opt-out, both
+// daemons try to bind :8080; gatewayd-internal starts first and
+// wins, leaving gatewayd-public crash-looping with "address already
+// in use" (run 31121004495).
+const publicListenOffSentinel = "off"
+
+// defaultPublicListenAddr is the loopback public listener fallback for
+// FAAS_GATEWAY_LISTEN. Production sets FAAS_GATEWAY_LISTEN=off (see
+// publicListenOffSentinel) so this default is dev/e2e only — it MUST
+// match the PublicAddr default in cmd/gatewayd-internal/config.go (the
+// TOML shape). Pulled into a const so goconst doesn't fire on the
+// multi-package usage and so the off-sentinel test fixtures reference
+// the same source of truth.
+const defaultPublicListenAddr = ":8080"
+
 // listenAddr is the public listener (TLS lands here in M8). Overridable via
 // FAAS_GATEWAY_LISTEN so the e2e harness can bind a free port without colliding
-// with a dev daemon on :8080. The sentinel value "off" disables the
-// public listener entirely — used by faas-gatewayd-internal.service in
-// production (ADR-068 / ADR-070 Tier A7 split), where the public edge
-// is owned by gatewayd-public (which forwards here over the unix
-// socket at /run/faas/gatewayd-internal.sock). Without "off", both
-// daemons try to bind :8080; gatewayd-internal starts first and wins,
-// leaving gatewayd-public crash-looping with "address already in use"
-// (run 31121004495).
-var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", ":8080")
+// with a dev daemon on :8080. Set FAAS_GATEWAY_LISTEN to
+// publicListenOffSentinel ("off") to skip the public listener — see
+// the const declaration above for the production rationale.
+var listenAddr = envOrGateway("FAAS_GATEWAY_LISTEN", defaultPublicListenAddr)
 
 // configPath is the on-disk TOML config. Overridable via FAAS_GATEWAYD_CONFIG
 // for non-standard deployments; production uses /etc/faas/gatewayd.toml.
@@ -855,13 +870,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// mux); this daemon no longer builds a *gateway.TLSBundle. The
 	// e2e harness hits this listener over plain HTTP.
 	//
-	// When FAAS_GATEWAY_LISTEN=off, skip the public listener entirely:
-	// the daemon serves only on the unix socket at
-	// /run/faas/gatewayd-internal.sock (forwarded to by gatewayd-public)
-	// and the control plane (controlAddr). This is the production shape
-	// per ADR-068 / Tier A7 split; faas-gatewayd-internal.service ships
-	// with FAAS_GATEWAY_LISTEN=off in Environment=.
-	if listenAddr != "off" {
+	// When FAAS_GATEWAY_LISTEN is the publicListenOffSentinel ("off"),
+	// skip the public listener entirely: the daemon serves only on the
+	// unix socket at /run/faas/gatewayd-internal.sock (forwarded to by
+	// gatewayd-public) and the control plane (controlAddr). This is the
+	// production shape per ADR-068 / Tier A7 split;
+	// faas-gatewayd-internal.service ships with FAAS_GATEWAY_LISTEN=off
+	// in Environment=.
+	if listenAddr != publicListenOffSentinel {
 		srv := deps.newSrv(listenAddr, publicHandler)
 		public := srv
 		public.Addr = listenAddr

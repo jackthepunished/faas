@@ -142,7 +142,7 @@ type TOMLTLSConfig struct {
 // path continues to work for the e2e harness).
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
-		PublicAddr:      ":8080",
+		PublicAddr:      defaultPublicListenAddr,
 		ControlAddr:     "127.0.0.1:9090",
 		APIDLoopback:    "http://127.0.0.1:8081",
 		GithubdLoopback: "http://127.0.0.1:8083",

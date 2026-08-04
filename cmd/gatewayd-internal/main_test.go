@@ -145,22 +145,22 @@ func TestListenAddr_OffSentinelIsHandled(t *testing.T) {
 	t.Cleanup(func() { listenAddr = orig })
 
 	// Default state: a real port.
-	listenAddr = ":8080"
-	if listenAddr == "off" {
+	listenAddr = defaultPublicListenAddr
+	if listenAddr == publicListenOffSentinel {
 		t.Fatal("default listenAddr should NOT be the off sentinel")
 	}
 
 	// Production state: off skips the bind.
-	listenAddr = "off"
-	if listenAddr != "off" {
+	listenAddr = publicListenOffSentinel
+	if listenAddr != publicListenOffSentinel {
 		t.Fatal("off sentinel must round-trip")
 	}
 
-	// envOrGateway contract: empty env returns fallback (":8080" by
-	// default), NOT the off sentinel — so an unset env won't accidentally
+	// envOrGateway contract: empty env returns fallback (defaultPublicListenAddr
+	// by default), NOT the off sentinel — so an unset env won't accidentally
 	// skip the listener in dev or test contexts.
 	t.Setenv("FAAS_GATEWAY_LISTEN", "")
-	if got := envOrGateway("FAAS_GATEWAY_LISTEN", ":8080"); got != ":8080" {
+	if got := envOrGateway("FAAS_GATEWAY_LISTEN", defaultPublicListenAddr); got != defaultPublicListenAddr {
 		t.Errorf("empty env should fall back to default, got %q", got)
 	}
 }

@@ -37,8 +37,8 @@ func TestLoadConfig_DefaultsWhenMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing file should not error: %v", err)
 	}
-	if c.PublicAddr != ":8080" {
-		t.Errorf("default PublicAddr = %q, want :8080", c.PublicAddr)
+	if c.PublicAddr != defaultPublicListenAddr {
+		t.Errorf("default PublicAddr = %q, want %s", c.PublicAddr, defaultPublicListenAddr)
 	}
 	if c.ControlAddr != "127.0.0.1:9090" {
 		t.Errorf("default ControlAddr = %q, want 127.0.0.1:9090", c.ControlAddr)
