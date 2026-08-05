@@ -10555,6 +10555,35 @@ func (s *PgStore) RevokeSession(ctx context.Context, id, accountID string) (bool
 	return tag.RowsAffected() > 0, nil
 }
 
+// UpdateSessionBinding re-stamps sessions.binding_hash on a live
+// row. The IAM-hardening-mega-PR (logical change 5) reissue path
+// (cmd/apid/handlers_mfa.go reissueSessionCookieWithStepUp) calls
+// this so the row's fingerprint tracks the cookie envelope's
+// fingerprint across /confirm + /verify + /recover + /disable.
+//
+// IDOR: the (id, account_id) predicate is the same shape as
+// RevokeSession — a cross-account update returns 0 rows which
+// surfaces as ErrNotFound to the handler. Revoked rows are
+// excluded: a session that the operator (or the auto-revoke
+// branch in middleware.go) already revoked must not be revived
+// by a stale reissue from a stolen cookie that won the race.
+//
+// Empty bindingHash → NULL column (the unix-socket / CLI-auth
+// path has no meaningful fingerprint).
+func (s *PgStore) UpdateSessionBinding(ctx context.Context, id, accountID, bindingHash string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update sessions set binding_hash = nullif($3, '')
+		   where id = $1 and account_id = $2 and revoked_at is null`,
+		id, accountID, bindingHash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *PgStore) ListSessions(ctx context.Context, accountID string) ([]Session, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, issued_at, last_seen_at, revoked_at, `+sessionSelectCols+`

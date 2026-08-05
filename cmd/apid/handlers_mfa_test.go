@@ -501,6 +501,102 @@ func TestMFAVerify_StepsUpPendingCookie(t *testing.T) {
 	}
 }
 
+// TestMFAVerify_ReissuedCookieAndRowBindingHashInLockstep is
+// the regression pin for review finding #2 (PR #653 mega-PR):
+// the reissue path MUST re-stamp sessions.binding_hash before
+// sealing the new cookie envelope. Without the
+// store.UpdateSessionBinding call inside
+// reissueSessionCookieWithStepUp, the cookie carries the
+// fresh (IP, UA-family) fingerprint but the sessions row
+// retains the original mint-time fingerprint; the very next
+// authenticated request hits RequireSessionCookie step 3.5
+// (the stolen-cookie auto-revoke branch at
+// pkg/auth/middleware/middleware.go) and 401s the customer on
+// their own session, with an auth.session.binding_mismatch
+// audit row attributing the lockstep failure to the legitimate
+// owner.
+//
+// Test flow:
+//  1. /enroll + /confirm: mints the enrolled account.
+//  2. mfaIssueWithPending(true): flips the cookie to
+//     mfa_pending=true. The setup-time cookie has no
+//     binding_hash envelope field (mint path used
+//     CreateSession, not CreateSessionWithBinding), so the
+//     sessions row's binding_hash column is also empty.
+//  3. /verify: reissues with mfa_pending=false + a
+//     freshly-computed binding hash (the (IP, UA-family)
+//     fingerprint for this request).
+//  4. Inspect the cookie envelope + the sessions row.
+//     Both MUST carry the SAME binding_hash. If they
+//     disagree the lockstep is broken.
+func TestMFAVerify_ReissuedCookieAndRowBindingHashInLockstep(t *testing.T) {
+	e := setupWithMFA(t, api.PlanPro, false, false)
+	_, secret, _ := e.generateEnrolledAccount(t)
+
+	// Pre-/verify: cookie is mfa_pending=true (so /verify has a
+	// real sealed TOTP secret to check against). The setup-time
+	// mint path used CreateSession (no binding hash), so both
+	// the envelope's binding_hash and the row's binding_hash
+	// column are empty here.
+	e.cookie = e.mfaIssueWithPending(t, true)
+
+	code, err := totp.GenerateCodeCustom(secret, time.Now().UTC(), totp.ValidateOpts{
+		Period: 30, Digits: 6, Algorithm: 0,
+	})
+	if err != nil {
+		t.Fatalf("GenerateCodeCustom: %v", err)
+	}
+	body, err := json.Marshal(api.MFAVerifyRequest{Totp: code})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/account/mfa/verify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(e.cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/verify status %d: %s", rec.Code, rec.Body)
+	}
+
+	var reissuedCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			reissuedCookie = c
+		}
+	}
+	if reissuedCookie == nil {
+		t.Fatalf("/verify did not re-issue cookie")
+	}
+	env, err := e.mgr.Verify(reissuedCookie.Value)
+	if err != nil {
+		t.Fatalf("verify reissued cookie: %v", err)
+	}
+
+	// Look up the row.
+	rows, err := e.store.ListSessions(context.Background(), e.acct.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListSessions: err=%v rows=%d", err, len(rows))
+	}
+	row := rows[0]
+
+	if env.BindingHash == "" {
+		t.Errorf("post-/verify envelope binding_hash is empty; reissue must stamp it")
+	}
+	if row.BindingHash == "" {
+		t.Errorf("post-/verify sessions row binding_hash is empty; " +
+			"reissueSessionCookieWithStepUp must call store.UpdateSessionBinding " +
+			"so the row tracks the cookie envelope (review finding #2)")
+	}
+	if env.BindingHash != row.BindingHash {
+		t.Errorf("binding hash drift (review finding #2):\n"+
+			"  envelope = %q\n"+
+			"  row      = %q\n"+
+			"The next request will trip the stolen-cookie auto-revoke branch on the customer's own session.",
+			env.BindingHash, row.BindingHash)
+	}
+}
+
 // --- /recover + /disable ----------------------------------------------------
 
 // TestMFARecover_ConsumesCodeAndReissuesCookie burns one of

@@ -8373,6 +8373,27 @@ func (m *MemStore) RevokeSession(_ context.Context, id, accountID string) (bool,
 	return true, nil
 }
 
+// UpdateSessionBinding mirrors PgStore.UpdateSessionBinding.
+// IDOR-safe via the (id, account_id) check; missing or
+// cross-account or already-revoked rows return ErrNotFound so
+// the handler maps them to 401 CodeSessionInvalid
+// (byte-identical to a stolen-cookie 401).
+func (m *MemStore) UpdateSessionBinding(_ context.Context, id, accountID, bindingHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok || s.AccountID != accountID || s.RevokedAt != nil {
+		return ErrNotFound
+	}
+	if bindingHash == "" {
+		s.BindingHash = ""
+	} else {
+		s.BindingHash = bindingHash
+	}
+	m.sessions[id] = s
+	return nil
+}
+
 func (m *MemStore) ListSessions(_ context.Context, accountID string) ([]Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

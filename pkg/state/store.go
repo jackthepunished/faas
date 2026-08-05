@@ -700,6 +700,24 @@ type Store interface {
 	// column (the unix-socket / CLI-auth code path has no
 	// meaningful fingerprint).
 	CreateSessionWithBinding(ctx context.Context, id, accountID, issuedIP, issuedUA, bindingHash string) (Session, error)
+	// UpdateSessionBinding re-stamps the sessions.binding_hash
+	// column on an existing live row. Called by
+	// reissueSessionCookieWithStepUp (cmd/apid/handlers_mfa.go)
+	// so the cookie envelope's binding_hash and the sessions
+	// row's binding_hash stay in lockstep across /v1/account/mfa/
+	// {confirm,verify,recover,disable}. The middleware
+	// cross-check (pkg/auth/middleware/middleware.go
+	// RequireSessionCookie step 3.5) compares the two; without
+	// this update the row still carries the original mint's
+	// fingerprint and every post-reissue request trips the
+	// stolen-cookie auto-revoke branch on its own session.
+	//
+	// accountID is the IDOR guard: a cross-account update
+	// returns ErrNotFound (the handler maps to 401
+	// CodeSessionInvalid, byte-identical to a missing row).
+	// Returns ErrNotFound when no live (non-revoked) row
+	// matches the (id, accountID) pair.
+	UpdateSessionBinding(ctx context.Context, id, accountID, bindingHash string) error
 	GetSession(ctx context.Context, id string) (Session, error)
 	RevokeSession(ctx context.Context, id, accountID string) (bool, error)
 	ListSessions(ctx context.Context, accountID string) ([]Session, error)
