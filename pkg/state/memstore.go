@@ -7751,7 +7751,7 @@ func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, 
 
 	if in.AppID != "" {
 		app, ok := m.apps[in.AppID]
-		if !ok || app.Status == "deleted" {
+		if !ok || app.Status == AppDeleted {
 			return AlertRule{}, ErrNotFound
 		}
 		// Per-app count: count every rule that pins this app,

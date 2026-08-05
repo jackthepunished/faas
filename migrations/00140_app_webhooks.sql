@@ -1,5 +1,6 @@
 -- filename: 00140_app_webhooks.sql
 -- +goose Up
+-- +goose StatementBegin
 -- Issue #476 — outbound webhook delivery table + dead-letter queue +
 -- retry policy (ADR-076).
 --

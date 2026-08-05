@@ -1,5 +1,6 @@
 -- filename: 00141_app_webhook_deliveries.sql
 -- +goose Up
+-- +goose StatementBegin
 -- Issue #476 — outbound webhook delivery ledger + dead-letter queue
 -- (ADR-076). One row per (event, target webhook) emission. The
 -- scheduler (cmd/schedd, pkg/webhook/dispatcher) claims due rows in

@@ -48,6 +48,14 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: webhooks
+    description: |
+      Outbound webhook subscriptions (issue #476 / ADR-076). One row
+      per (app, target_url) customer subscription; the dispatcher in
+      schedd POSTs signed payloads to the target with exponential
+      backoff + jitter and DLQs at attempt 7. The deliveries subroute
+      surfaces the per-attempt retry state + a manual retry endpoint
+      that clears status='dead' back to 'pending'.
   - name: alert_rules
     description: |
       Customer-configurable alert rules (issue #396 / ADR-045 PR 3).
@@ -2773,7 +2781,7 @@ paths:
         constant + rotated_at only.
       responses:
         '200':
-          description: Rotation succeeded.
+          description: Webhook secret rotation succeeded.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RotateAppWebhookSecretResponse' }
@@ -2791,9 +2799,11 @@ paths:
       - $ref: '#/components/parameters/Id32'
       - in: query
         name: page_size
+        description: Page size (1..100; default 50).
         schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
       - in: query
         name: page_token
+        description: Opaque cursor from the previous page's next_token.
         schema: { type: string }
     get:
       tags: [webhooks]
@@ -2822,6 +2832,7 @@ paths:
       - in: path
         name: did
         required: true
+        description: Delivery id (32-hex-char UUID).
         schema: { type: string, pattern: '^[0-9a-f]{32}$' }
     post:
       tags: [webhooks]
@@ -7943,6 +7954,11 @@ components:
 
     CreateAppWebhookRequest:
       type: object
+      description: |
+        Subscribe a target URL to events emitted by the app. The
+        webhook_secret is HMAC-SHA256 sealed at rest with the host
+        X25519 recipient (namespace `APP_WEBHOOK`); apid mints a fresh
+        32-byte secret if omitted.
       required: [target_url, webhook_secret]
       properties:
         target_url: { type: string, minLength: 8, maxLength: 2048 }
@@ -7962,6 +7978,10 @@ components:
 
     UpdateAppWebhookRequest:
       type: object
+      description: |
+        Partial update of an existing webhook subscription. Every
+        field is optional — the handler merges the supplied fields
+        onto the current row. omit a field to leave it unchanged.
       properties:
         target_url: { type: string, minLength: 8, maxLength: 2048 }
         webhook_secret: { type: string, minLength: 1, maxLength: 256 }
@@ -7977,6 +7997,11 @@ components:
 
     RotateAppWebhookSecretResponse:
       type: object
+      description: |
+        Response from POST /v1/apps/{slug}/webhooks/{id}/rotate-secret.
+        The plaintext secret is NEVER returned; the masked field is
+        a constant sentinel so the dashboard renders the same shape
+        across all secret-bearing rows (mirrors AlertRule rotate).
       required: [rotated_at, webhook_secret_sealed_masked]
       properties:
         rotated_at: { type: string, format: date-time }
@@ -7987,6 +8012,12 @@ components:
 
     AppWebhookDeliveryResponse:
       type: object
+      description: |
+        One row per (event × target) emission. The dispatcher mutates
+        this row in place as attempts progress; the GET /deliveries
+        endpoint returns this shape per row. attempt=7 + status='dead'
+        is the DLQ state; the customer-facing retry endpoint flips a
+        dead row back to status='pending' for one more shot.
       required: [id, webhook_id, app_id, account_id, event, attempt, status, next_attempt_at, created_at, updated_at]
       properties:
         id: { type: string, pattern: '^[0-9a-f]{32}$' }
@@ -8021,6 +8052,10 @@ components:
 
     AppWebhookDeliveryListResponse:
       type: object
+      description: |
+        Paged deliveries surface for the dashboard's "recent
+        deliveries" pane. page_token is opaque + base64-encoded —
+        treat it as a cursor; do not parse it.
       required: [deliveries]
       properties:
         deliveries:
@@ -8030,6 +8065,10 @@ components:
 
     AppWebhookRetryDeliveryResponse:
       type: object
+      description: |
+        Response from POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry.
+        Mirrors AppWebhookDeliveryResponse; the row in `delivery` is
+        re-emitted with status='pending' and next_attempt_at=now().
       required: [delivery]
       properties:
         delivery: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }

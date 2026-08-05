@@ -661,7 +661,7 @@ func decodePageToken(token string) (time.Time, string, bool) {
 				return time.Time{}, "", false
 			}
 			for _, r := range stripped {
-				if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				if (r < '0' || r > '9') && (r < 'A' || r > 'F') && (r < 'a' || r > 'f') {
 					return time.Time{}, "", false
 				}
 			}

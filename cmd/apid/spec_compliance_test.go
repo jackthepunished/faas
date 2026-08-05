@@ -114,10 +114,10 @@ var dtoExclude = map[string]bool{
 	// pkg/api ↔ pkg/state seam. ListAppWebhookDeliveriesOptions and
 	// RotateAppWebhookSecretRequest are server-side concerns that
 	// never appear in the wire spec.
-	"AppWebhookRow":                     true,
-	"AppWebhookDeliveryRow":             true,
-	"ListAppWebhookDeliveriesOptions":   true,
-	"RotateAppWebhookSecretRequest":     true,
+	"AppWebhookRow":                   true,
+	"AppWebhookDeliveryRow":           true,
+	"ListAppWebhookDeliveriesOptions": true,
+	"RotateAppWebhookSecretRequest":   true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the

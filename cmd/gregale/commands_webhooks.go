@@ -28,6 +28,29 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// webhookClosedVocab is the closed retry-policy vocabulary mirrored
+// from pkg/api.AllowedAppWebhookRetryPolicies. Used for the goconst
+// guard (CI lint) and the local typo check before the round-trip.
+var webhookClosedVocab = []string{"default", "aggressive", "none"}
+
+// webhookDeliveryStatusVocab is the closed delivery-status vocabulary
+// mirrored from the migration's CHECK constraint
+// (migrations/00141_app_webhook_deliveries.sql:69-71). Surfacing a
+// typo locally avoids a 400 round-trip on every `webhooks
+// deliveries` call.
+var webhookDeliveryStatusVocab = []string{"pending", "in_flight", "succeeded", "failed", "dead"}
+
+// strInSlice returns true if v is in the slice. Used for the
+// closed-vocab guards above; mirrors the helper in commands2.go.
+func strInSlice(v string, s []string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 func cmdWebhooks(args []string) int {
 	if len(args) == 0 {
 		PrintUsage(os.Stderr, "usage: gregale webhooks <list|add|update|rm|deliveries|retry> [args]", "webhooks")
@@ -98,10 +121,8 @@ func cmdWebhooksAdd(args []string) int {
 	// the --eviction-priority check in cmdApp (PR #647). Surfaces a
 	// typo locally instead of letting apid return 400 app_webhook_invalid
 	// after the network call.
-	switch *policy {
-	case "default", "aggressive", "none":
-	default:
-		return printErr("Invalid --retry-policy", fmt.Errorf("must be 'default', 'aggressive', or 'none'; got %q", *policy))
+	if !strInSlice(*policy, webhookClosedVocab) {
+		return printErr("Invalid --retry-policy", fmt.Errorf("must be one of %s; got %q", strings.Join(webhookClosedVocab, ", "), *policy))
 	}
 	for _, ev := range events {
 		if !validAppWebhookEvent(ev) {
@@ -146,10 +167,8 @@ func cmdWebhooksUpdate(args []string) int {
 	if *enable && *disable {
 		return printErr("Invalid flags", fmt.Errorf("--enable and --disable are mutually exclusive"))
 	}
-	switch *policy {
-	case "", "default", "aggressive", "none":
-	default:
-		return printErr("Invalid --retry-policy", fmt.Errorf("must be 'default', 'aggressive', or 'none'; got %q", *policy))
+	if *policy != "" && !strInSlice(*policy, webhookClosedVocab) {
+		return printErr("Invalid --retry-policy", fmt.Errorf("must be one of %s; got %q", strings.Join(webhookClosedVocab, ", "), *policy))
 	}
 	client, err := authedClient()
 	if err != nil {
@@ -157,10 +176,12 @@ func cmdWebhooksUpdate(args []string) int {
 	}
 	req := api.UpdateAppWebhookRequest{}
 	if *target != "" {
-		req.TargetURL = &*target
+		t := *target
+		req.TargetURL = &t
 	}
 	if *policy != "" {
-		req.RetryPolicy = &*policy
+		p := *policy
+		req.RetryPolicy = &p
 	}
 	if *enable {
 		t := true
@@ -216,10 +237,8 @@ func cmdWebhookDeliveries(args []string) int {
 		return 1
 	}
 	id := fs.Args()[0]
-	switch *status {
-	case "", "pending", "in_flight", "succeeded", "failed", "dead":
-	default:
-		return printErr("Invalid --status", fmt.Errorf("must be one of pending|in_flight|succeeded|failed|dead; got %q", *status))
+	if *status != "" && !strInSlice(*status, webhookDeliveryStatusVocab) {
+		return printErr("Invalid --status", fmt.Errorf("must be one of %s; got %q", strings.Join(webhookDeliveryStatusVocab, ", "), *status))
 	}
 	if *pageSize < 1 || *pageSize > 100 {
 		return printErr("Invalid --page-size", fmt.Errorf("must be in [1,100]; got %d", *pageSize))

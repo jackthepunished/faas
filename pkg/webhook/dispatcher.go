@@ -167,7 +167,11 @@ func ComputeBackoff(schedule []time.Duration, attempt int) (time.Duration, error
 		// crypto/rand failure is a hard error in FIPS mode but the
 		// runtime path stays alive even if jitter falls back to a
 		// deterministic offset. We pick +0.0 (no jitter) so the
-		// customer at least gets the bare minimum delay.
+		// customer at least gets the bare minimum delay. Returning
+		// the error here would let the caller MarkDead the row
+		// (the scheduleErr branch above DLQs), which is wrong —
+		// the row's attempt is recoverable on the next tick.
+		//nolint:nilerr  // see comment above
 		return base, nil
 	}
 	u := binary.BigEndian.Uint32(buf[:])

@@ -1140,6 +1140,33 @@ const CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
 // the body.
 const CodePlanAlertRuleQuota = "plan_alert_rule_quota"
 
+// PlanQuotaScopeAccount / PlanQuotaScopeApp are the values the
+// *Quota functions receive in their `scope` argument. Mirrors
+// state.CronQuotaScopeAccount / CronQuotaScopeApp and the alert /
+// webhook analogues (state.AlertRuleQuotaScopeAccount etc).
+// Kept here as plain string consts so pkg/api does not import
+// pkg/state (the pkg/api ↔ pkg/state cycle is a load-bearing
+// constraint — memory: pkg-api-cannot-import-pkg-state). The three
+// site-name strings ("this account" / "this app") that drive the
+// goconst rule live below alongside these.
+const (
+	PlanQuotaScopeAccount = "account"
+	PlanQuotaScopeApp     = "app"
+)
+
+// PlanQuotaScopeDisplayName returns the human-readable scope label
+// used in the per-plan-quota 403 body ("this account" / "this app").
+// Exported so handler tests can assert against the same strings
+// without re-declaring the literals.
+func PlanQuotaScopeDisplayName(scope string) string {
+	switch scope {
+	case PlanQuotaScopeAccount:
+		return "this account"
+	default:
+		return "this app"
+	}
+}
+
 // CodePlanWebhooksNotAllowed is the 402 the customer sees when
 // the plan doesn't unlock outbound webhooks at all (Free today).
 // Issue #476 / ADR-076. Mirrors CodePlanAlertRulesNotAllowed.
@@ -1173,12 +1200,7 @@ func ErrPlanCronsNotAllowed(p Plan) *Problem {
 // because the plan DOES unlock crons — the right copy is
 // "delete a cron to add another", not "upgrade to Hobby".
 func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
-	var scopeName string
-	if scope == "account" {
-		scopeName = "this account"
-	} else {
-		scopeName = "this app"
-	}
+	scopeName := PlanQuotaScopeDisplayName(scope)
 	return NewProblem(http.StatusForbidden, CodePlanCronQuota,
 		"Cron limit reached",
 		fmt.Sprintf("%s plan caps crons at %d for %s; you have %d. Delete one to add another.",
@@ -1249,12 +1271,7 @@ func ErrPlanAlertRulesNotAllowed(p Plan) *Problem {
 // alert rules — the right copy is "delete a rule to add another",
 // not "upgrade to Hobby". Mirrors ErrPlanCronQuota.
 func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Problem {
-	var scopeName string
-	if scope == "account" {
-		scopeName = "this account"
-	} else {
-		scopeName = "this app"
-	}
+	scopeName := PlanQuotaScopeDisplayName(scope)
 	return NewProblem(http.StatusForbidden, CodePlanAlertRuleQuota,
 		"Alert rule limit reached",
 		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
@@ -1284,12 +1301,7 @@ func ErrPlanWebhooksNotAllowed(p Plan) *Problem {
 // webhooks — the right copy is "delete a webhook to add another",
 // not "upgrade to Hobby". Mirrors ErrPlanAlertRuleQuota.
 func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem {
-	var scopeName string
-	if scope == "account" {
-		scopeName = "this account"
-	} else {
-		scopeName = "this app"
-	}
+	scopeName := PlanQuotaScopeDisplayName(scope)
 	return NewProblem(http.StatusForbidden, CodePlanWebhookQuota,
 		"Webhook limit reached",
 		fmt.Sprintf("%s plan caps webhooks at %d for %s; you have %d. Delete one to add another.",

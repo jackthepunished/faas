@@ -36,12 +36,12 @@ import (
 
 // TestWebhookE2E_ApidCreateEnqueuesDelivery pins the round-trip:
 //
-//   1. apid handler (MemStore) creates a webhook for an app.
-//   2. schedd-equivalent emission enqueues a delivery row.
-//   3. Dispatcher drains the row, POSTs to the test receiver.
-//   4. Receiver returns 200 → row.status='succeeded'.
-//   5. Receiver's X-Faas-Delivery-Id header is non-empty and stable
-//      across the dispatcher's request building path.
+//  1. apid handler (MemStore) creates a webhook for an app.
+//  2. schedd-equivalent emission enqueues a delivery row.
+//  3. Dispatcher drains the row, POSTs to the test receiver.
+//  4. Receiver returns 200 → row.status='succeeded'.
+//  5. Receiver's X-Faas-Delivery-Id header is non-empty and stable
+//     across the dispatcher's request building path.
 //
 // This is the cross-component tripwire; per-component semantics
 // live in pkg/webhook/dispatcher_test.go and pkg/api/webhooks_test.go.
