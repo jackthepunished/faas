@@ -134,6 +134,19 @@ type UpdateAppRequest struct {
 	// Range [100, 60000] — out-of-range values return 422
 	// invalid_warm_snapshot_min_ms.
 	WarmSnapshotMinMs *int `json:"warm_snapshot_min_ms,omitempty"`
+	// EvictionPriority (issue #475) classifies the app under
+	// cross-account RAM pressure. Values: 'best_effort' (default,
+	// pre-#475 behaviour) or 'reserved' (opt-in protected tier).
+	// The plan gate is enforced in apid — Free PATCH 'reserved'
+	// returns 403 plan_eviction_priority_reserved_not_allowed.
+	// The per-account cap (Plan.ReservedConcurrencyPerAccount)
+	// returns 422 plan_eviction_priority_reserved_quota. nil → keep
+	// current value (or apply the schema default 'best_effort' on
+	// a future create). Flipping between the two values is
+	// always allowed (any plan may go in either direction once
+	// the reserved tier is unlocked) — the cap is over APPS, not
+	// instances, so flipping down always frees a slot.
+	EvictionPriority *string `json:"eviction_priority,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —

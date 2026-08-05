@@ -2700,3 +2700,148 @@ func TestUpdateAppScalingPolicy_TargetValueZeroRoundtrip(t *testing.T) {
 		t.Errorf("ScalingPolicy.Target.Value = %v, want 0", out.ScalingPolicy.Target.Value)
 	}
 }
+
+// TestUpdateApp_EvictionPriority_FreeReservedRejected (issue #475)
+// pins the Free-tier gate: PATCH eviction_priority='reserved' returns
+// 402 plan_eviction_priority_reserved_not_allowed. The plan DOES
+// unlock the 'best_effort' tier (the pre-#475 default), so PATCH
+// 'best_effort' is always allowed on any plan — the test uses that
+// path to confirm the gate is targeted at the reserved value, not
+// at the field as a whole.
+func TestUpdateApp_EvictionPriority_FreeReservedRejected(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-evict-reserved")
+	reserved := string(api.EvictionPriorityReserved)
+	rec := e.do(t, "PATCH", "/v1/apps/free-evict-reserved", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+	assertProblem(t, rec, 402, api.CodePlanEvictionPriorityReservedNotAllowed)
+
+	// best_effort must always be allowed on any plan — the gate
+	// is targeted at the reserved tier, not the field.
+	best := string(api.EvictionPriorityBestEffort)
+	rec2 := e.do(t, "PATCH", "/v1/apps/free-evict-reserved", api.UpdateAppRequest{EvictionPriority: &best}, nil)
+	if rec2.Code != 200 {
+		t.Errorf("Free PATCH best_effort: status %d: %s (must always be allowed)", rec2.Code, rec2.Body)
+	}
+}
+
+// TestUpdateApp_EvictionPriority_HobbyCapEnforced (issue #475) pins
+// the per-account reserved-tier cap. Hobby caps reserved at 1; a
+// 2nd PATCH to 'reserved' on a different app must return 422
+// plan_eviction_priority_reserved_quota with observed=2, limit=1.
+// Counts APPS (not instances) — a single reserved app with 5
+// concurrent instances counts as 1 against the cap.
+func TestUpdateApp_EvictionPriority_HobbyCapEnforced(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-reserved-1")
+	reserved := string(api.EvictionPriorityReserved)
+	// First reserved app: Hobby cap = 1, observed = 1, OK.
+	rec1 := e.do(t, "PATCH", "/v1/apps/hobby-reserved-1", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+	if rec1.Code != 200 {
+		t.Fatalf("first reserved PATCH: status %d: %s", rec1.Code, rec1.Body)
+	}
+	// Second reserved app: cap exhausted, must 422.
+	mustSeedApp(t, e, "hobby-reserved-2")
+	rec2 := e.do(t, "PATCH", "/v1/apps/hobby-reserved-2", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+	assertProblem(t, rec2, 422, api.CodePlanEvictionPriorityReservedQuota)
+}
+
+// TestUpdateApp_EvictionPriority_InvalidValue (issue #475) pins
+// the bounds check. The SQL CHECK apps_eviction_priority_chk is
+// the load-bearing safety net; apid must reject the out-of-range
+// value FIRST so the customer sees a clean 422 validation_failed,
+// not a SQL CHECK violation. Test both 'foo' and an empty string
+// so a future off-by-one fix doesn't silently widen the closed set.
+func TestUpdateApp_EvictionPriority_InvalidValue(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-evict-invalid")
+	foo := "foo"
+	rec := e.do(t, "PATCH", "/v1/apps/pro-evict-invalid", api.UpdateAppRequest{EvictionPriority: &foo}, nil)
+	assertProblem(t, rec, 422, api.CodeValidation)
+}
+
+// TestUpdateApp_EvictionPriority_FlipsDownUnconditional (issue #475)
+// pins the flip-down direction. The per-account cap counts apps in
+// the reserved tier; flipping an existing reserved app to
+// best_effort always succeeds (the cap cannot be exceeded by going
+// down). This is the symmetric assertion to HobbyCapEnforced —
+// even with the cap at its limit, a flip-down PATCH must succeed.
+func TestUpdateApp_EvictionPriority_FlipsDownUnconditional(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-flip-down")
+	reserved := string(api.EvictionPriorityReserved)
+	// Pin at the cap.
+	up := e.do(t, "PATCH", "/v1/apps/hobby-flip-down", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+	if up.Code != 200 {
+		t.Fatalf("seed reserved: status %d: %s", up.Code, up.Body)
+	}
+	// Flip down must succeed even though the cap is at the limit.
+	best := string(api.EvictionPriorityBestEffort)
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-flip-down", api.UpdateAppRequest{EvictionPriority: &best}, nil)
+	if rec.Code != 200 {
+		t.Errorf("flip-down status %d: %s (must always succeed; cap counts reserved apps, not instances)", rec.Code, rec.Body)
+	}
+}
+
+// TestUpdateApp_EvictionPriority_AuditEmitted (issue #475) pins the
+// single-purpose audit row emitted when the per-app eviction tier
+// changes. The app.updated row already carries the old/new snapshot
+// of eviction_priority; this row is a single-purpose,
+// single-keyword-greppable signal so operators can `gregale
+// audit-events --kind-prefix eviction_priority` and see every tier
+// change without parsing the larger app.updated payload. A no-op
+// PATCH (same value) emits nothing.
+func TestUpdateApp_EvictionPriority_AuditEmitted(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-evict-audit")
+	reserved := string(api.EvictionPriorityReserved)
+	// Flip best_effort → reserved must emit a single kind.
+	rec := e.do(t, "PATCH", "/v1/apps/pro-evict-audit", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("first PATCH: status %d: %s", rec.Code, rec.Body)
+	}
+	// Walk the audit-events list endpoint with kind_prefix=app. so
+	// the assertion stays agnostic to the store implementation
+	// (MemStore returns events in append order; pgstore returns
+	// them in id order).
+	listRec := e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=app.", nil, nil)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("list audit-events: status %d: %s", listRec.Code, listRec.Body)
+	}
+	var list api.ListAuditEventsResponse
+	if err := json.Unmarshal(listRec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	seen := 0
+	for _, ev := range list.Events {
+		if ev.Kind != "app.eviction_priority_changed" {
+			continue
+		}
+		seen++
+	}
+	if seen != 1 {
+		t.Errorf("app.eviction_priority_changed audit rows = %d, want 1 (one per actual value change); events=%+v", seen, list.Events)
+	}
+
+	// No-op PATCH (same value) must not emit a second audit row.
+	rec2 := e.do(t, "PATCH", "/v1/apps/pro-evict-audit", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+	if rec2.Code != 200 {
+		t.Fatalf("no-op PATCH: status %d: %s", rec2.Code, rec2.Body)
+	}
+	listRec2 := e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=app.", nil, nil)
+	if listRec2.Code != http.StatusOK {
+		t.Fatalf("list audit-events (post-noop): status %d", listRec2.Code)
+	}
+	var list2 api.ListAuditEventsResponse
+	if err := json.Unmarshal(listRec2.Body.Bytes(), &list2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	seen2 := 0
+	for _, ev := range list2.Events {
+		if ev.Kind == "app.eviction_priority_changed" {
+			seen2++
+		}
+	}
+	if seen2 != 1 {
+		t.Errorf("post-noop audit rows = %d, want 1 (no-op PATCH must not emit); events=%+v", seen2, list2.Events)
+	}
+}

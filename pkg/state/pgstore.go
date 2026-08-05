@@ -2158,6 +2158,25 @@ func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int,
 	return n, err
 }
 
+// CountAppsWithEvictionPriority returns the per-account count of
+// apps whose eviction_priority equals the given tier (issue #475).
+// Counts APPS (not instances) — a single reserved app with 5
+// concurrent instances counts as 1 against the per-account cap
+// (Plan.ReservedConcurrencyPerAccount). Excludes soft-deleted apps
+// (status='deleted') so a recently-deleted reserved app doesn't
+// leak into the cap and reject a subsequent recreate. The
+// `apps_account_idx (account_id, status)` partial composite index
+// keeps this O(N_per_account) — bounded by the acked per-account
+// cap (Hobby 1, Pro 2, Scale 4) so the lock-pending apid path
+// (CreateCronIfUnderQuota pattern) is constant-time in practice.
+func (s *PgStore) CountAppsWithEvictionPriority(ctx context.Context, accountID, priority string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from apps where account_id = $1 and status <> 'deleted' and eviction_priority = $2`,
+		accountID, priority).Scan(&n)
+	return n, err
+}
+
 func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (App, error) {
 	manifestBytes := []byte(nil)
 	if p.Manifest != nil {

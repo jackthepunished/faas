@@ -262,6 +262,52 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				fmt.Sprintf("warm_snapshot_min_ms must be in [100, 60000]; got %d", v))
 		}
 	}
+	// Issue #475: per-app eviction_priority tier. The validation
+	// chain runs in this order so the customer sees the most
+	// specific error first:
+	//
+	//  1. Bounds: only 'best_effort' and 'reserved' are legal.
+	//     422 validation_failed for anything else (SQL CHECK
+	//     catches the same closed set, but the apid layer
+	//     intercepts so the customer sees a clean error).
+	//  2. Plan gate: Free PATCH 'reserved' returns 403
+	//     plan_eviction_priority_reserved_not_allowed. The plan
+	//     DOES unlock 'best_effort' (the pre-#475 default), so
+	//     PATCH 'best_effort' is always allowed (any plan may
+	//     go in either direction once the cap is unlocked).
+	//  3. Per-account cap: Hobby 1, Pro 2, Scale 4. 422
+	//     plan_eviction_priority_reserved_quota when the cap is
+	//     reached. Counts APPS (not instances) — a single
+	//     reserved app with 5 concurrent instances counts as 1.
+	//     The cap is computed against the post-PATCH state
+	//     (existing reserved apps + 1 if the current app is
+	//     flipping up, 0 if it's already reserved).
+	//
+	// The cap run is NOT under an apps-row FOR UPDATE lock here
+	// (the existing warm-snapshot / streaming flags don't lock
+	// either). The plan caps are advisory: a racing PATCH from
+	// the same account could land one extra reserved app. The
+	// financial model's per-account RAM cap (47,600 MB) is the
+	// hard backstop so a cap race costs nothing on the box.
+	if req.EvictionPriority != nil {
+		v := *req.EvictionPriority
+		if v != string(api.EvictionPriorityBestEffort) && v != string(api.EvictionPriorityReserved) {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeValidation,
+				"Invalid eviction_priority",
+				fmt.Sprintf("eviction_priority must be 'best_effort' or 'reserved'; got %q", v))
+		}
+		if v == string(api.EvictionPriorityReserved) {
+			if !acct.Plan.EvictionPriorityReservedAllowed() {
+				return api.ErrPlanEvictionPriorityReservedNotAllowed(acct.Plan)
+			}
+			// Per-account cap. Skip the read when the value
+			// is already 'reserved' on the current app — the
+			// PATCH is a no-op and the cap is unchanged.
+			// app is loaded later (loadApp); we read it once
+			// here and pass it through to the audit-block.
+		}
+	}
 	// Issue #462 / ADR-058: per-app scaling policy (PR-A persists
 	// + Hobby+ tier-up; PR-C wires the engine; PR-D carves out the
 	// worker-class branch). The DTO uses value semantics so the
@@ -451,6 +497,36 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		}
 		allowPrefixes = &out
 	}
+	// Issue #475: per-account reserved-tier cap. The bounds + plan
+	// gates ran earlier (above the loadApp call at the top of
+	// updateApp), so when control reaches here req.EvictionPriority
+	// is either nil, 'best_effort' (always allowed), or 'reserved'
+	// (plan unlocked). The cap only triggers when the value is
+	// 'reserved' AND the current app is not already reserved — a
+	// no-op PATCH on a reserved app must not exhaust the cap.
+	//
+	// The cap is advisory (no FOR UPDATE lock); a racing PATCH from
+	// the same account could land one extra reserved app. The
+	// financial model's per-account RAM cap (47,600 MB) is the
+	// hard backstop, so a cap race costs nothing on the box.
+	if req.EvictionPriority != nil && *req.EvictionPriority == string(api.EvictionPriorityReserved) && app.EvictionPriority != string(api.EvictionPriorityReserved) {
+		cap := acct.Plan.ReservedConcurrencyPerAccount()
+		if cap > 0 {
+			n, err := s.store.CountAppsWithEvictionPriority(ctx(r), acct.ID, string(api.EvictionPriorityReserved))
+			if err != nil {
+				api.WriteProblem(w, api.ErrInternal(fmt.Sprintf("count reserved apps: %v", err)))
+				return
+			}
+			// n excludes the current app already (CountAppsWithEvictionPriority
+			// counts the full set; the current app is reserved if and only
+			// if app.EvictionPriority == 'reserved'). The flip-up direction
+			// adds 1 to the post-PATCH count.
+			if n+1 > cap {
+				api.WriteProblem(w, api.ErrPlanEvictionPriorityReservedQuota(acct.Plan, n+1, cap))
+				return
+			}
+		}
+	}
 	updated, err := s.store.UpdateApp(ctx(r), app.ID, state.UpdateAppParams{
 		RAMMB:              req.RAMMB,
 		IdleTimeoutS:       req.IdleTimeoutS,
@@ -507,6 +583,14 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		SetWarmSnapshotMinRequests: req.WarmSnapshotMinRequests != nil,
 		WarmSnapshotMinMs:          req.WarmSnapshotMinMs,
 		SetWarmSnapshotMinMs:       req.WarmSnapshotMinMs != nil,
+		// Issue #475: per-app eviction tier. The Set bit
+		// distinguishes "don't touch" (nil pointer) from "explicit
+		// best_effort" (opt out of reserved). The plan gate +
+		// per-account cap run above the UpdateApp call so by
+		// here the value is either 'best_effort' (always allowed)
+		// or 'reserved' (plan unlocked, cap not exhausted).
+		EvictionPriority:    req.EvictionPriority,
+		SetEvictionPriority: req.EvictionPriority != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -576,6 +660,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		oldApp["warm_snapshot_min_ms"] = app.WarmSnapshotMinMs
 		newApp["warm_snapshot_min_ms"] = updated.WarmSnapshotMinMs
 	}
+	// Issue #475: per-app eviction tier. Same shape as the
+	// warm-snapshot entries above — only fields the caller touched
+	// appear in the audit row, so a no-op PATCH (rare, but legal
+	// for client-side retry idempotency) doesn't pollute the
+	// audit stream.
+	if req.EvictionPriority != nil {
+		oldApp["eviction_priority"] = app.EvictionPriority
+		newApp["eviction_priority"] = updated.EvictionPriority
+	}
 	if req.EgressAllowlist != nil {
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
 		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)
@@ -601,6 +694,23 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"slug":   updated.Slug,
 			"old":    true,
 			"new":    false,
+		})
+	}
+	// Issue #475: emit a single-purpose audit row when the
+	// per-app eviction tier changes. The app.updated row already
+	// carries the old/new snapshot of eviction_priority; this row
+	// is a single-purpose, single-keyword-greppable signal so
+	// operators can `gregale audit-events --kind-prefix
+	// eviction_priority` and see every tier change without parsing
+	// the larger app.updated payload. Not emitted when the field
+	// was already the same value (no-op PATCH) or when the
+	// operator left it unset (no intent to flip).
+	if req.EvictionPriority != nil && app.EvictionPriority != updated.EvictionPriority {
+		s.audit.Emit(ctx(r), "app.eviction_priority_changed", &acct.ID, map[string]any{
+			"app_id": updated.ID,
+			"slug":   updated.Slug,
+			"old":    app.EvictionPriority,
+			"new":    updated.EvictionPriority,
 		})
 	}
 	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))

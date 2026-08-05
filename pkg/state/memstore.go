@@ -2368,6 +2368,29 @@ func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, 
 	return n, nil
 }
 
+// CountAppsWithEvictionPriority mirrors the pgstore read for the
+// per-account reserved-tier cap (issue #475). Same shape as
+// CountDeployedApps — counts APPS (not instances), excludes soft-deleted
+// apps so the cap tracks the live customer surface.
+func (m *MemStore) CountAppsWithEvictionPriority(_ context.Context, accountID, priority string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, a := range m.apps {
+		if a.AccountID != accountID {
+			continue
+		}
+		if a.Status == AppDeleted {
+			continue
+		}
+		if a.EvictionPriority != priority {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
