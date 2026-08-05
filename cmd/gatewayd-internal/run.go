@@ -39,6 +39,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
@@ -267,6 +268,13 @@ type runDeps struct {
 	// client cache. Wired in run() from newScheddRouter. nil in
 	// tests — the legacy single-sched path stays in effect.
 	scheddRouter *scheddRouter
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
+	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
+	// log, nil) which exits on violation in production. Tests
+	// inject func() error { return nil } to bypass the live
+	// /proc/self/status check (the test runner doesn't carry
+	// the production capset).
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -599,6 +607,24 @@ func run(ctx context.Context, log *slog.Logger) error {
 // Production calls run → runWithDeps(defaultDeps()); tests inject a custom
 // deps.listen so they can probe a real socket without binding :8080.
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. gatewayd-internal is
+	// unprivileged — no Allow, no Deny. The HTTP/1.1 listener,
+	// the gRPC egress sink, the schedd dial, the vmmd dial and
+	// every Postgres read/write in this daemon run inside the
+	// unit's systemd hardening (NoNewPrivileges, ProtectSystem,
+	// PrivateTmp, etc.). Any future cap_ add lands here, not
+	// in the unit file, and the gate stops the daemon on boot
+	// if the new cap isn't bound. The capCheck seam (review
+	// finding M2) lets tests stub the live /proc/self/status
+	// check.
+	capCheck := deps.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
+		return err
+	}
+
 	// ADR-068 / Tier A7 split: TLS termination moved to gatewayd-public.
 	// The legacy daemon always serves plain HTTP on :8080 (the e2e
 	// harness path); production traffic terminates TLS at gatewayd-public

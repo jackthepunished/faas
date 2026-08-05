@@ -37,6 +37,8 @@ const (
 	Vmmd_ForwardHTTPStream_FullMethodName       = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTPStream"
 	Vmmd_MountParentExt4ReadOnly_FullMethodName = "/onebox.faas.vmmd.v1.Vmmd/MountParentExt4ReadOnly"
 	Vmmd_UmountParentExt4_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/UmountParentExt4"
+	Vmmd_MountOverlayParent_FullMethodName      = "/onebox.faas.vmmd.v1.Vmmd/MountOverlayParent"
+	Vmmd_UmountOverlayParent_FullMethodName     = "/onebox.faas.vmmd.v1.Vmmd/UmountOverlayParent"
 	Vmmd_PrepareLiveMigration_FullMethodName    = "/onebox.faas.vmmd.v1.Vmmd/PrepareLiveMigration"
 	Vmmd_AdoptMigratedInstance_FullMethodName   = "/onebox.faas.vmmd.v1.Vmmd/AdoptMigratedInstance"
 	Vmmd_AcknowledgeMigration_FullMethodName    = "/onebox.faas.vmmd.v1.Vmmd/AcknowledgeMigration"
@@ -221,6 +223,44 @@ type VmmdClient interface {
 	// filesystem (defence in depth against a caller that hands back
 	// a path vmmd never issued).
 	UmountParentExt4(ctx context.Context, in *UmountParentExt4Request, opts ...grpc.CallOption) (*UmountParentExt4Response, error)
+	// MountOverlayParent (DEPLOY-1, ADR-075) is the staging-only path
+	// that lets imaged compose the per-runtime base ext4 from a
+	// shared parent via overlayfs. The lowerdir is the parent ext4
+	// mountpoint vmmd issued at MountParentExt4ReadOnly (read-only,
+	// already mounted by vmmd); upperdir + workdir + merged are
+	// absolute host paths staged under /dev/shm/faas-base-staging/
+	// (tmpfs, kernel tmpfile-permitted). vmmd is the only root
+	// component (spec §11) and runs the direct mount(2) syscall on
+	// imaged's behalf. imaged (User=faas-imaged + NoNewPrivileges=yes)
+	// cannot mount — see capdecl policy in pkg/capdecl and the
+	// depguard rule in .golangci.yml that forbids unix.Mount outside
+	// pkg/vmmd/. Returns the merged path on success; the caller
+	// (imaged) applies its delta OCI layers to the upperdir via
+	// rootfs.ApplyLayerGz, then BuildBaseFromStaging(merged) for
+	// mkfs + storage. The merged path is registered in
+	// vmmdmount.Registry so SIGTERM/30-min orphan sweep can release
+	// it. Validation chain:
+	//  1. Any empty path → InvalidArgument.
+	//  2. lowerdir MUST live under /srv/fc/parent/faas-parent-mnt-*
+	//     (vmmdmount.MountRoot) — refuse overlay-mounting an
+	//     unrelated read-only path (defence in depth).
+	//  3. upperdir/workdir MUST live under
+	//     /dev/shm/faas-base-staging/ — refuse overlay-mounting on
+	//     ext4 (the regression that broke every cd-controlplane
+	//     deploy 2026-08-04 → 2026-08-05; kernel rejects ext4 upper
+	//     with "overlayfs: upper fs does not support tmpfile").
+	//  4. mount(2) EROFS/EBUSY/ENOSPC/ENOMEM → Internal with the
+	//     syscall error wrapped — imaged's logs surface the cause.
+	MountOverlayParent(ctx context.Context, in *MountOverlayParentRequest, opts ...grpc.CallOption) (*MountOverlayParentResponse, error)
+	// UmountOverlayParent (DEPLOY-1, ADR-075) releases an overlay
+	// mount vmmd previously returned from MountOverlayParent.
+	// Idempotent on an unknown mountpoint — imaged's
+	// defer-after-error pattern (mkfs errored → umount anyway) is
+	// safe. The merged path is validated to live under
+	// /dev/shm/faas-base-staging/faas-base-*/merged (the staging
+	// root the parent-ref path uses) to refuse unmounting an
+	// unrelated filesystem.
+	UmountOverlayParent(ctx context.Context, in *UmountOverlayParentRequest, opts ...grpc.CallOption) (*UmountOverlayParentResponse, error)
 	// PrepareLiveMigration (Tier A5 / ADR-065) is Phase 1 of the
 	// four-phase cross-node live-instance handoff. Called by the
 	// new owner vmmd's schedd against the DYING vmmd: pauses the
@@ -422,6 +462,26 @@ func (c *vmmdClient) UmountParentExt4(ctx context.Context, in *UmountParentExt4R
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UmountParentExt4Response)
 	err := c.cc.Invoke(ctx, Vmmd_UmountParentExt4_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vmmdClient) MountOverlayParent(ctx context.Context, in *MountOverlayParentRequest, opts ...grpc.CallOption) (*MountOverlayParentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MountOverlayParentResponse)
+	err := c.cc.Invoke(ctx, Vmmd_MountOverlayParent_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vmmdClient) UmountOverlayParent(ctx context.Context, in *UmountOverlayParentRequest, opts ...grpc.CallOption) (*UmountOverlayParentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UmountOverlayParentResponse)
+	err := c.cc.Invoke(ctx, Vmmd_UmountOverlayParent_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -646,6 +706,44 @@ type VmmdServer interface {
 	// filesystem (defence in depth against a caller that hands back
 	// a path vmmd never issued).
 	UmountParentExt4(context.Context, *UmountParentExt4Request) (*UmountParentExt4Response, error)
+	// MountOverlayParent (DEPLOY-1, ADR-075) is the staging-only path
+	// that lets imaged compose the per-runtime base ext4 from a
+	// shared parent via overlayfs. The lowerdir is the parent ext4
+	// mountpoint vmmd issued at MountParentExt4ReadOnly (read-only,
+	// already mounted by vmmd); upperdir + workdir + merged are
+	// absolute host paths staged under /dev/shm/faas-base-staging/
+	// (tmpfs, kernel tmpfile-permitted). vmmd is the only root
+	// component (spec §11) and runs the direct mount(2) syscall on
+	// imaged's behalf. imaged (User=faas-imaged + NoNewPrivileges=yes)
+	// cannot mount — see capdecl policy in pkg/capdecl and the
+	// depguard rule in .golangci.yml that forbids unix.Mount outside
+	// pkg/vmmd/. Returns the merged path on success; the caller
+	// (imaged) applies its delta OCI layers to the upperdir via
+	// rootfs.ApplyLayerGz, then BuildBaseFromStaging(merged) for
+	// mkfs + storage. The merged path is registered in
+	// vmmdmount.Registry so SIGTERM/30-min orphan sweep can release
+	// it. Validation chain:
+	//  1. Any empty path → InvalidArgument.
+	//  2. lowerdir MUST live under /srv/fc/parent/faas-parent-mnt-*
+	//     (vmmdmount.MountRoot) — refuse overlay-mounting an
+	//     unrelated read-only path (defence in depth).
+	//  3. upperdir/workdir MUST live under
+	//     /dev/shm/faas-base-staging/ — refuse overlay-mounting on
+	//     ext4 (the regression that broke every cd-controlplane
+	//     deploy 2026-08-04 → 2026-08-05; kernel rejects ext4 upper
+	//     with "overlayfs: upper fs does not support tmpfile").
+	//  4. mount(2) EROFS/EBUSY/ENOSPC/ENOMEM → Internal with the
+	//     syscall error wrapped — imaged's logs surface the cause.
+	MountOverlayParent(context.Context, *MountOverlayParentRequest) (*MountOverlayParentResponse, error)
+	// UmountOverlayParent (DEPLOY-1, ADR-075) releases an overlay
+	// mount vmmd previously returned from MountOverlayParent.
+	// Idempotent on an unknown mountpoint — imaged's
+	// defer-after-error pattern (mkfs errored → umount anyway) is
+	// safe. The merged path is validated to live under
+	// /dev/shm/faas-base-staging/faas-base-*/merged (the staging
+	// root the parent-ref path uses) to refuse unmounting an
+	// unrelated filesystem.
+	UmountOverlayParent(context.Context, *UmountOverlayParentRequest) (*UmountOverlayParentResponse, error)
 	// PrepareLiveMigration (Tier A5 / ADR-065) is Phase 1 of the
 	// four-phase cross-node live-instance handoff. Called by the
 	// new owner vmmd's schedd against the DYING vmmd: pauses the
@@ -735,6 +833,12 @@ func (UnimplementedVmmdServer) MountParentExt4ReadOnly(context.Context, *MountPa
 }
 func (UnimplementedVmmdServer) UmountParentExt4(context.Context, *UmountParentExt4Request) (*UmountParentExt4Response, error) {
 	return nil, status.Error(codes.Unimplemented, "method UmountParentExt4 not implemented")
+}
+func (UnimplementedVmmdServer) MountOverlayParent(context.Context, *MountOverlayParentRequest) (*MountOverlayParentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MountOverlayParent not implemented")
+}
+func (UnimplementedVmmdServer) UmountOverlayParent(context.Context, *UmountOverlayParentRequest) (*UmountOverlayParentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UmountOverlayParent not implemented")
 }
 func (UnimplementedVmmdServer) PrepareLiveMigration(context.Context, *PrepareLiveMigrationRequest) (*PrepareLiveMigrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareLiveMigration not implemented")
@@ -1021,6 +1125,42 @@ func _Vmmd_UmountParentExt4_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Vmmd_MountOverlayParent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MountOverlayParentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).MountOverlayParent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_MountOverlayParent_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).MountOverlayParent(ctx, req.(*MountOverlayParentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Vmmd_UmountOverlayParent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UmountOverlayParentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VmmdServer).UmountOverlayParent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Vmmd_UmountOverlayParent_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VmmdServer).UmountOverlayParent(ctx, req.(*UmountOverlayParentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Vmmd_PrepareLiveMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PrepareLiveMigrationRequest)
 	if err := dec(in); err != nil {
@@ -1151,6 +1291,14 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UmountParentExt4",
 			Handler:    _Vmmd_UmountParentExt4_Handler,
+		},
+		{
+			MethodName: "MountOverlayParent",
+			Handler:    _Vmmd_MountOverlayParent_Handler,
+		},
+		{
+			MethodName: "UmountOverlayParent",
+			Handler:    _Vmmd_UmountOverlayParent_Handler,
 		},
 		{
 			MethodName: "PrepareLiveMigration",

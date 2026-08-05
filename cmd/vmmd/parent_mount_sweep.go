@@ -49,7 +49,7 @@ func runParentMountSweep(ctx context.Context, reg *vmmdmount.Registry, interval 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			n := reg.SweepOrphans(log)
+			n := reg.SweepOrphans(ctx, log)
 			if n > 0 {
 				log.Info("vmmd: parent-mount orphan sweep", "n", n)
 			}

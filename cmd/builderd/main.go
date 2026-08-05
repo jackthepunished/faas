@@ -26,6 +26,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -46,6 +47,13 @@ type runDeps struct {
 	migrate          func(context.Context, *pgxpool.Pool) error
 	newDriver        func(ctx context.Context, target string, tlsCfg *tls.Config, builderBase, driveDir, exportDir string) (builderdpkg.VM, error)
 	newResidentProbe func(ctx context.Context, url string) builderdpkg.ResidencyProbe
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
+	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
+	// log, nil) which exits on violation in production. Tests
+	// inject func() error { return nil } to bypass the live
+	// /proc/self/status check (the test runner doesn't carry
+	// the production capset).
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -92,6 +100,24 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. builderd is unprivileged —
+	// no Allow, no Deny. The build queue consumer, the vmmd
+	// gRPC dial, the content-addressed cache read/write, and
+	// the Postgres migrations all run inside the unit's
+	// systemd hardening (NoNewPrivileges, ProtectSystem,
+	// PrivateTmp, etc.). The ephemeral builder microVM itself
+	// (firecracker + jailer) is owned by vmmd, not builderd;
+	// vmmd's capsDecl is the gating authority for any cap_ the
+	// VM lifecycle needs. The capCheck seam (review finding
+	// M2) lets tests stub the live /proc/self/status check.
+	capCheck := deps.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
+		return err
+	}
+
 	cfg, err := LoadConfig(deps.configPath)
 	if err != nil {
 		return err

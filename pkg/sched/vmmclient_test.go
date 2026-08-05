@@ -153,6 +153,23 @@ func (f *fakeVMM) UmountParentExt4(_ context.Context, _ string) error {
 	return nil
 }
 
+// MountOverlayParent (ADR-075 / DEPLOY-1) — sched never issues
+// the overlay mount; imaged is the only caller of the gRPC.
+// Returns nil so the vmmdgrpc.VmmdAPI contract is satisfied;
+// any accidental sched-side call surfaces as a no-op success
+// in the bufconn test rig and an empty-mountpoint error on the
+// box.
+func (f *fakeVMM) MountOverlayParent(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) — sched never issues
+// the overlay umount; imaged is the only caller. Returns nil;
+// the vmmd-side handler is idempotent on unknown mountpoints.
+func (f *fakeVMM) UmountOverlayParent(_ context.Context, _ string) error {
+	return nil
+}
+
 // MarkInstanceFrameworkReady (issue #470 / PR #470-FU-B) — the
 // sched-side fakeVMM doesn't drive the warm-capture path; the
 // framework-ready receipt is owned by cmd/vmmd's DGRAM host recv

@@ -842,7 +842,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 		_ = os.Remove(srcPath)
 		return "", err
 	}
-	evicted := m.parentMounts.RegisterOrEvict(mp, storageKey, srcPath)
+	evicted := m.parentMounts.RegisterOrEvict(mp, vmmdmount.MountKindParentExt4, storageKey, srcPath)
 	if evicted != "" {
 		m.log.Warn("vmmd: parent mount cap reached; force-umounted oldest",
 			"evicted_mountpoint", evicted)
@@ -850,7 +850,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 		// already forgot it, so vmmdmount.UmountExt4 will fall
 		// through to the kernel syscall and clean the mountpoint
 		// dir.
-		_ = vmmdmount.UmountExt4(evicted)
+		_ = vmmdmount.UmountExt4(ctx, evicted)
 	}
 	m.log.Info("vmmd: parent mounted", "storage_key", storageKey, "mountpoint", mp)
 	return mp, nil
@@ -861,7 +861,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 // defer-after-error pattern is safe to call blindly. Returns the
 // nil-equivalent (no error) on success AND on a never-issued
 // mountpoint; surfaces a real umount error (e.g. EBUSY) verbatim.
-func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
+func (m *Manager) UmountParentExt4(ctx context.Context, mountpoint string) error {
 	if m.parentMounts == nil {
 		// No registry wired — every call is a no-op. Matches the
 		// default-local unit-test path; production cmd/vmmd wires
@@ -876,7 +876,7 @@ func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
 		// gRPC handler treats nil as success.
 		return nil
 	}
-	if err := vmmdmount.UmountExt4(mountpoint); err != nil {
+	if err := vmmdmount.UmountExt4(ctx, mountpoint); err != nil {
 		return err
 	}
 	m.parentMounts.Forget(mountpoint)
@@ -884,6 +884,87 @@ func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
 		_ = os.Remove(entry.SrcPath)
 	}
 	m.log.Info("vmmd: parent umounted", "mountpoint", mountpoint, "storage_key", entry.StorageKey)
+	return nil
+}
+
+// MountOverlayParent (ADR-075 / DEPLOY-1) mounts an overlayfs
+// with the loopback-mounted parent as lowerdir and the per-staging
+// tmpfs dirs as upperdir+workdir. imaged's parent-ref stage
+// (pkg/imaged/base_stage.go:mountOverlayFn) used to issue this
+// syscall itself with AmbientCapabilities=cap_sys_admin — a
+// silent violation of the CLAUDE.md "vmmd is the only root
+// component" invariant. The syscall now lives here; imaged
+// forwards via gRPC.
+//
+// The Mount call delegates to vmmdmount.MountOverlayParent
+// which validates the path prefixes (lowerdir under /srv/fc/parent/,
+// upper/work/merged under /dev/shm/faas-base-staging/). The
+// Registry tracks the merged path so the 30-minute orphan sweep
+// (SweepOrphans on the parentMounts registry) can clean up
+// after imaged that crashed before its defer fired.
+//
+// On any error the function returns the underlying error so the
+// gRPC handler can lift to a problem document; the staging dirs
+// are NOT cleaned up here — imaged owns upper/work (it created
+// them via MkdirBaseStaging + MkdirTemp) and a vmmd-side
+// cleanup would race with imaged's own defer-after-error.
+func (m *Manager) MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error {
+	if m.parentMounts == nil {
+		return fmt.Errorf("vmmd: parent overlay mount: registry not wired")
+	}
+	if err := vmmdmount.MountOverlayParent(ctx, lowerdir, upperdir, workdir, merged); err != nil {
+		return err
+	}
+	// Track merged in the registry with MountKindOverlayParent
+	// + empty StorageKey/SrcPath (the overlay mount has neither —
+	// it's a vmmd-issued mount over paths imaged chose). The
+	// cap (16) is the same as loopback mounts; imaged should
+	// umount before issuing the next one anyway.
+	//
+	// Review finding B5: pre-B5 the returned mountpoint was
+	// discarded, so when the cap was hit the evicted mount
+	// stayed live on disk — leaking upper/work/merged until
+	// the next sweep tick. Now we honor the eviction by
+	// dispatching through Registry.Umount (which switches on
+	// MountKind and tears down the overlay properly).
+	evicted := m.parentMounts.RegisterOrEvict(merged, vmmdmount.MountKindOverlayParent, "", "")
+	if evicted != "" {
+		m.log.Warn("vmmd: parent overlay mount cap reached; force-umounted oldest",
+			"evicted_mountpoint", evicted)
+		// Registry.Umount dispatches on MountKind (B4), so this
+		// works for either ext4 or overlay evictions. Best-effort
+		// — a failed umount surfaces in the next sweep tick.
+		if _, uerr := m.parentMounts.Umount(ctx, evicted); uerr != nil {
+			m.log.Warn("vmmd: evicted parent overlay umount failed (sweep will retry)",
+				"evicted_mountpoint", evicted, "err", uerr)
+		}
+	}
+	m.log.Info("vmmd: parent overlay mounted",
+		"lowerdir", lowerdir, "upperdir", upperdir,
+		"workdir", workdir, "merged", merged)
+	return nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) releases an overlay
+// mount MountOverlayParent previously issued. Idempotent on
+// unknown mountpoints so imaged's defer-after-error is safe.
+// The merged dir is also rmdir'd by vmmdmount.UmountOverlayParent
+// — the staging tree (upper+work) stays in place because imaged
+// may want to reuse them on the next Mount attempt.
+func (m *Manager) UmountOverlayParent(ctx context.Context, merged string) error {
+	if m.parentMounts == nil {
+		return nil
+	}
+	// Funnel through Registry.Umount (review B4). The Kind
+	// dispatch in there issues UmountOverlayParent (not the
+	// ext4 umount) so the overlay mount is torn down with the
+	// right syscall. Lookup miss → Registry.Umount returns
+	// (false, nil), which is the idempotent defer-after-error
+	// shape imaged's caller depends on.
+	if _, err := m.parentMounts.Umount(ctx, merged); err != nil {
+		return err
+	}
+	m.log.Info("vmmd: parent overlay umounted", "mountpoint", merged)
 	return nil
 }
 

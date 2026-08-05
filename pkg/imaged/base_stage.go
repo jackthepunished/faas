@@ -352,11 +352,11 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	// Build an overlayfs three-dir layout under a fresh staging
 	// root: lowerdir = parent mountpoint (read-only, immutable),
 	// upperdir = fresh empty dir where delta layers will land,
-	// workdir = overlayfs internal scratch. Then mount -t overlay
-	// the merged view at `merged` (sibling of upper). The merged
-	// view IS the child filesystem; ApplyLayerGz on `upper` and
-	// mkfs.ext4 -d `merged` give us the child ext4 with the
-	// parent userland shared on disk.
+	// workdir = overlayfs internal scratch. Then ask vmmd to
+	// mount an overlayfs with merged = staging/merged so the
+	// merged view IS the child filesystem; ApplyLayerGz on
+	// `upper` and mkfs.ext4 -d `merged` give us the child ext4
+	// with the parent userland shared on disk.
 	staging, err := rootfs.MkdirBaseStaging()
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref staging dir: %w", err)
@@ -372,18 +372,23 @@ func (h *Handler) ensureBaseExt4ParentRef(
 		}
 	}
 
-	if err := mountOverlay(ctx, merged, mountpoint, upper, workdir); err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref overlay mount: %w", err)
-	}
+	// Install the umount defer UNCONDITIONALLY before issuing
+	// the mount RPC (review M5). The gRPC reply can be lost
+	// after the kernel mount succeeded; without an unconditional
+	// defer the staging tree leaks and the registry loses
+	// visibility. vmmd's UmountOverlayParent is idempotent on
+	// unknown mountpoints so this defer is safe even when no
+	// mount ever landed.
 	defer func() {
-		// Unmount the overlay (independent of the parent mount,
-		// which the defer-above releases). Idempotent on a
-		// double-umount; the suffix-test in UmountOverlay keeps
-		// it safe.
-		if uerr := umountOverlay(merged); uerr != nil {
+		// Detached ctx so a cancelled staging request still
+		// releases the overlay mount cleanly.
+		if uerr := h.vmmClient.UmountOverlayParent(context.WithoutCancel(ctx), merged); uerr != nil {
 			h.log.Warn("imaged: umount parent overlay failed", "mountpoint", merged, "err", uerr)
 		}
 	}()
+	if err := h.vmmClient.MountOverlayParent(ctx, mountpoint, upper, workdir, merged); err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref overlay mount: %w", err)
+	}
 
 	// Apply the delta layers onto the overlay upper dir. The
 	// modifications land in `upper`, not on the parent mount;
@@ -442,72 +447,34 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	}, nil
 }
 
-// mountOverlay assembles `mount -t overlay overlay -o
-// lowerdir=<parentMount>,upperdir=<upper>,workdir=<workdir>
-// <merged>` via the direct mount(2) syscall so the daemon's
-// ambient CAP_SYS_ADMIN is honored end-to-end. The merged view
-// is the child filesystem ready for `mkfs.ext4 -d <merged>`.
-// Returns the (empty) success path; a non-zero syscall surfaces
-// the kernel error verbatim.
+// mountOverlayFn / umountOverlayFn (the package-level test seams)
+// were removed in DEPLOY-1 (review B2). imaged's parent-ref
+// stage now calls h.vmmClient.MountOverlayParent /
+// .UmountOverlayParent directly, parallel to the existing
+// h.vmmClient.MountParentExt4ReadOnly dispatch. The test seam
+// is now the Handler's WithVMMClient setter; tests wire a
+// fakeVMMClient (vmmclient.go:265) instead of swapping a
+// package var. The pre-DEPLOY-1 closure form layered a
+// defaultVMMClient package global on top of WithVMMClient, but
+// cmd/imaged never wired the global — production silently
+// nil-dereffed. The Handler-scoped form closes that gap
+// without any new global state.
 //
-// Why syscall, not exec /bin/mount: imaged runs as User=faas-imaged
-// with NoNewPrivileges=yes + AmbientCapabilities=cap_sys_admin
-// (deploy/systemd/faas-imaged.service). exec'ing the setuid-root
-// /bin/mount binary under NNP causes mount(8) to fail its libcap
-// check (it doesn't see the caller's ambient cap because the
-// process is now a different uid post-setuid) and the kernel
-// returns the misleading `overlayfs: upper fs does not support
-// tmpfile` / `cannot mount overlay read-only`. Calling
-// unix.Mount(2) directly carries the ambient cap through, which
-// is the whole reason PR-F added AmbientCapabilities=cap_sys_admin
-// to the unit. The syscall lives in mount_overlay_linux.go
-// (build-tag-stripped on non-linux for unit tests on macOS).
-//
-// The test seam (base_stage_test.go) overrides mountOverlayFn
-// with a no-op stub for unit-test portability — the bufconn-style
-// end-to-end coverage lives in pkg/vmmdgrpc and on the EX44 metal
-// path.
-func mountOverlay(ctx context.Context, merged, lowerdir, upperdir, workdir string) error {
-	return mountOverlayFn(ctx, merged, lowerdir, upperdir, workdir)
-}
-
-// mountOverlayFn is the package-level indirection so tests can
-// substitute a no-op (the production mount syscall requires
-// CAP_SYS_ADMIN, which is unavailable in the test environment).
-// Tests MUST restore the production value after the stub run —
-// see base_stage_test.go::withMountStub. The ctx parameter is
-// retained for test-seam parity (was used by the old exec
-// CommandContext wrapper).
-var mountOverlayFn = func(ctx context.Context, merged, lowerdir, upperdir, workdir string) error {
-	_ = ctx
-	if merged == "" || lowerdir == "" || upperdir == "" || workdir == "" {
-		return fmt.Errorf("imaged: mountOverlay: empty path (merged=%q lower=%q upper=%q work=%q)",
-			merged, lowerdir, upperdir, workdir)
-	}
-	return mountOverlaySyscall(merged, lowerdir, upperdir, workdir)
-}
-
-// umountOverlay unmounts the overlay assembled by mountOverlay.
-// Idempotent: EINVAL/ENOENT on a missing mount is absorbed
-// (the caller is in the defer path). The suffix guard (matches
-// `merged`, not the parent mount) keeps the umount scoped to
-// the staging overlay, never the parent.
-func umountOverlay(merged string) error {
-	return umountOverlayFn(merged)
-}
-
-// umountOverlayFn mirrors mountOverlayFn for the teardown
-// path. Tests can stub this to skip the real umount syscall;
-// production behavior is the unlink-then-umount idempotent
-// pattern. Direct unix.Unmount(2) syscall (same justification
-// as mountOverlayFn — survives NoNewPrivileges + setuid binary
-// cap-drop edge cases that bash /bin/umount tripped over).
-var umountOverlayFn = func(merged string) error {
-	if merged == "" {
-		return nil
-	}
-	return umountOverlaySyscall(merged)
-}
+// Why vmmd RPC, not the previous local unix.Mount(2) syscall:
+// before DEPLOY-1, imaged ran with
+// AmbientCapabilities=cap_sys_admin and issued
+// unix.Mount("overlay", ...) itself. That violated the
+// CLAUDE.md invariant "vmmd is the only root component that
+// mounts filesystems" — the unit-file edit was a silent
+// regression caught only when five days of failed cd-controlplane
+// deploys (2026-08-04 → 2026-08-05) traced back to
+// AmbientCapabilities=cap_sys_admin + a host /tmp that turned
+// out to be ext4 (the kernel's overlayfs tmpfile contract
+// rejects ext4 upperdirs with "upper fs does not support
+// tmpfile"). DEPLOY-1 erases that path: imaged now sends a
+// MountOverlayParent gRPC to vmmd, vmmd issues the syscall,
+// and imaged's systemd unit can drop AmbientCapabilities=
+// entirely (ADR-075). imaged no longer needs CAP_SYS_ADMIN.
 
 // openStringReader returns an io.Reader for the supplied string. The
 // helper exists so the digest sidecar Put has a content source without

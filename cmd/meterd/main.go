@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/billing/reconciler"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
@@ -519,6 +520,12 @@ type runDeps struct {
 	// outliving another's Shutdown). Mirrors cmd/schedd/main.go:151-158.
 	// Tests inject a stub that returns a nop server (without binding).
 	metricsListenAndServe func(addr string, h http.Handler) (*http.Server, error)
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
+	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
+	// log, nil) which exits on violation in production. Tests
+	// inject func() error { return nil } to bypass the live
+	// /proc/self/status check.
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -568,6 +575,21 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. meterd is unprivileged —
+	// no Allow, no Deny. The sampler, quota, stripe ticks and
+	// the age-sealed secret reads all run inside the unit's
+	// systemd hardening (NoNewPrivileges, ProtectSystem,
+	// PrivateTmp, etc.). Any future cap_ add lands here, not in
+	// the unit file. The capCheck seam (review finding M2) lets
+	// tests stub the live /proc/self/status check.
+	capCheck := deps.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
+		return err
+	}
+
 	cfg, err := LoadConfig(deps.configPath)
 	if err != nil {
 		return err

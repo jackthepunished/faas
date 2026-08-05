@@ -76,6 +76,40 @@ linters:
             - pkg: github.com/onebox-faas/faas/pkg/netns
               desc: "only vmmd manages host network namespaces (CLAUDE.md ownership)"
 
+        # DEPLOY-1 / ADR-075: pkg/vmmdmount wraps the unix.Mount(2) syscall
+        # for parent-ref overlay mounts. Only vmmd is allowed to do mount
+        # syscalls (CLAUDE.md: "vmmd is the ONLY root component"); imaged,
+        # builderd, and the rest of the fleet route through the vmmd gRPC
+        # service (MountOverlayParent / UmountOverlayParent). The depguard
+        # rule is the compile-time tripwire: any new file that imports
+        # pkg/vmmdmount from a non-vmmd package is a regression of the
+        # Tier A7 PR-K → DEPLOY-1 boundary and gets caught in CI.
+        vmmdmount-vmmd-only:
+          files:
+            - "!**/cmd/vmmd/**"
+            - "!**/pkg/vmmdgrpc/**"
+            - "!**/pkg/vmmdmount/**"
+            - "!**/pkg/fcvm/**"
+          deny:
+            - pkg: github.com/onebox-faas/faas/pkg/vmmdmount
+              desc: "DEPLOY-1 / ADR-075: pkg/vmmdmount (the unix.Mount(2) wrapper) is vmmd-only. Other daemons (imaged, builderd, ...) must route through pkg/vmmdgrpc — see MountOverlayParent RPC. If a new use case needs a mount path that vmmd cannot satisfy, add the RPC method instead of bypassing the boundary."
+
+        # Same boundary, but for the gRPC vmmd client/server package. The
+        # server-side (pkg/vmmdgrpc) is wired by cmd/vmmd. The client
+        # surface is allowed to be imported by daemons that legitimately
+        # talk to vmmd over gRPC (imaged, builderd, schedd, gatewayd) but
+        # NOT by control-plane-only writers (apid, meterd, githubd) and
+        # NOT by the CLI. CI is the tripwire.
+        vmmdgrpc-not-for-control-plane:
+          files:
+            - "**/cmd/apid/**"
+            - "**/cmd/meterd/**"
+            - "**/cmd/githubd/**"
+            - "**/cmd/faas/**"
+          deny:
+            - pkg: github.com/onebox-faas/faas/pkg/vmmdgrpc
+              desc: "DEPLOY-1 / ADR-075: apid / meterd / githubd / faas CLI must not dial vmmd directly (CLAUDE.md ownership: 'vmmd is the ONLY component that touches firecracker/jailer'). Record intent in Postgres and let schedd or imaged react."
+
     # forbidigo: PR #101 closed the symlink-follow attack surface in
     # `faas deploy --tarball` by routing the customer-path open through
     # `openCustomerFile` (commands5.go:380). This rule makes that
@@ -114,6 +148,43 @@ linters:
         - pattern: '^Open$'
           pkg: '^os$'
           msg: "do not call os.Open directly — see the os.Open rule above for the rationale and escape hatch."
+        # DEPLOY-1 / ADR-075: the unix.Mount(2) syscall (golang.org/x/sys/unix)
+        # is the architectural boundary that PR-K and the pre-PR-K code
+        # repeatedly broke. The one legitimate caller is pkg/vmmdmount —
+        # every other site that does mount/umount syscalls must route
+        # through vmmd's MountOverlayParent / UmountOverlayParent gRPC
+        # methods instead. The pkg field constrains the rule to the
+        # golang.org/x/sys/unix package (false-positive-proof against
+        # user-defined Mount methods). Analyze-types makes the match
+        # exact.
+        - pattern: '^Mount$'
+          pkg: '^golang\.org/x/sys/unix$'
+          msg: "DEPLOY-1 / ADR-075: do not call unix.Mount directly. Only pkg/vmmdmount wraps this syscall; call vmmd via pkg/vmmdgrpc instead (MountOverlayParent RPC). pkg/vmmdmount's own MountOverlayParent is the only legitimate caller of unix.Mount."
+        - pattern: '^Unmount$'
+          pkg: '^golang\.org/x/sys/unix$'
+          msg: "DEPLOY-1 / ADR-075: do not call unix.Unmount directly. Use pkg/vmmdmount.UmountOverlayParent from vmmd, or call vmmd via pkg/vmmdgrpc (UmountOverlayParent RPC)."
+        # DEPLOY-1 / ADR-075: the architecture invariant is "vmmd is the
+        # ONLY component that mounts filesystems" — not "vmmd is the only
+        # component that calls unix.Mount(2)". Review of PR #652 (finding
+        # M6) flagged that pkg/vmmdmount/overlay.go was switched from
+        # unix.Mount to exec.Command("mount", ...) to gain cross-platform
+        # portability; the depguard + unix.Mount-forbid above was no
+        # longer sufficient to keep the boundary tight, because exec
+        # invocation has no compile-time import trail. This rule closes
+        # that hole: any os/exec.Command* call whose first non-context
+        # arg is the literal "mount" or "umount" is a regression of the
+        # boundary. Legitimate callers are explicitly allowlisted in
+        # `linters.exclusions.rules` (below) — pkg/fcvm/** is the vmmd
+        # VM owner that handles loopback mounts for the jailer;
+        # pkg/vmmdmount/** owns the parent-ref overlay mount;
+        # pkg/builderd/mount_helpers.go is the pre-PR-K test helper
+        # that PR-K left behind (see comment in that file).
+        #
+        # The pattern matches the literal-string-arg shape that
+        # `exec.Command[Context](ctx?, "mount", ...)`.
+        - pattern: '^Command(Context)?\((ctx\s*context\.\w+\s*,\s*)?"(mount|umount)"'
+          pkg: '^os/exec$'
+          msg: "DEPLOY-1 / ADR-075: do not invoke the `mount`/`umount` binaries outside pkg/vmmdmount and pkg/fcvm (the two vmmd-owned mount owners). If a new daemon needs to mount, route through pkg/vmmdgrpc MountOverlayParent/UmountOverlayParent RPC. If a test fixture needs to mount, put it in pkg/builderd/mount_helpers.go (the existing builderd test helper) or add a //nolint:forbidigo with a documented reason."
 
     # gosec runs against a box where vmmd is root and drives jailer/firecracker
     # and builds guest rootfs images. The rule IDs below are structurally
@@ -180,6 +251,50 @@ linters:
       - path: "cmd/faas/commands5\\.go$"
         linters:
           - gosec(G304) # openCustomerFile is the documented exception
+      # DEPLOY-1 / ADR-075: pkg/capdecl/capbits.go is a kernel-name
+      # data table — every entry is a single literal by design, and
+      # the linter's "string appears 3+ times" heuristic fires on
+      # the map keys (cap_kill, cap_net_admin, cap_sys_module, …)
+      # because the package's tests + the capdecl library code all
+      # reference the same kernel name strings. Promoting each
+      # string to a const is structural noise — the map IS the
+      # canonical list. Keep the goconst exemption scoped tight
+      # to the two production files (capbits.go + capdecl.go)
+      # where the data-table pattern lives; the rest of the
+      # codebase keeps goconst enforcement.
+      - path: "pkg/capdecl/capbits\\.go$"
+        linters:
+          - goconst
+      - path: "pkg/capdecl/capdecl\\.go$"
+        linters:
+          - goconst
+      - path: "pkg/capdecl/runtimecheck/runtimecheck\\.go$"
+        linters:
+          - goconst # the CapBnd/CapEff/CapPrm/CapAmb/Inh field-name strings are kernel-defined literals from /proc/<pid>/status; promoting them to consts is structural noise (the parser IS the consumer).
+      # DEPLOY-1 / ADR-075 (review finding M6): the mount/umount forbidigo
+      # rule above only blocks new call sites; the legitimate owners
+      # stay allowlisted here. Adding a new file outside these three
+      # globs and shelling out to `mount`/`umount` is a regression of
+      # the "vmmd is the only component that mounts filesystems"
+      # invariant and gets caught in CI.
+      #
+      # - pkg/fcvm/** — vmmd's jailer/loopback mount owner (PR-K predates
+      #   the boundary; it stayed untouched).
+      # - pkg/vmmdmount/** — the parent-ref overlay mount owner
+      #   (DEPLOY-1 / ADR-075; pkg/vmmdmount/overlay.go + mount.go).
+      # - pkg/builderd/mount_helpers.go — pre-PR-K test helper left
+      #   behind by the original builderd CreateBuildDrive1 e2e path;
+      #   see the file's header for the rationale and the post-DEPLOY-1
+      #   cleanup plan.
+      - path: "pkg/fcvm/.*\\.go$"
+        linters:
+          - forbidigo # vmmd's loopback mount owner — see comment above
+      - path: "pkg/vmmdmount/.*\\.go$"
+        linters:
+          - forbidigo # the parent-ref overlay mount owner — see comment above
+      - path: "pkg/builderd/mount_helpers\\.go$"
+        linters:
+          - forbidigo # legacy builderd test helper — see file header
       - path: "pkg/wire/metrics_test.go"
         linters:
           - errcheck

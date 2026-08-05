@@ -24,6 +24,7 @@ import (
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -131,6 +132,12 @@ type runDeps struct {
 	// deps (listen, dialVMM, etc.) get a chance to run. nil/empty
 	// means the production envOr fallback fires.
 	signPubPath string
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
+	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
+	// log, nil) which exits on violation in production. Tests
+	// inject func() error { return nil } to bypass the live
+	// /proc/self/status check.
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -222,6 +229,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. schedd's capsDecl is
+	// the empty declaration (no Allow, no Deny) — schedd is
+	// unprivileged. The capCheck seam (review finding M2)
+	// lets tests stub the live /proc/self/status check.
+	capCheck := deps.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
+		return err
+	}
+
 	cfg, err := LoadConfig(deps.configPath)
 	if err != nil {
 		return err

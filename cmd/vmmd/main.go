@@ -31,6 +31,7 @@ import (
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
@@ -272,6 +273,15 @@ type runDeps struct {
 	// without subscribing to pg_notify. Bulk of the watcher's logic
 	// is in egressWatcher.Reload — see cmd/vmmd/egress_watcher.go.
 	egressWatcher *egressWatcher
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam. nil → call
+	// runtimecheck.MustCheckOnBoot(capsDecl, log, nil) which exits
+	// on violation in production. Tests inject func() error { return nil }
+	// to bypass the live /proc/self/status check (the runner lacks
+	// the production capset, and MustCheckOnBoot's os.Exit on
+	// violation would kill the test process). Tests that want to
+	// exercise the violation branch inject a func returning a
+	// non-nil error.
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -315,6 +325,25 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. Validates the live
+	// /proc/self/status against the declared capability set in
+	// cmd/vmmd/caps.go. A misconfigured
+	// AmbientCapabilities / CapabilityBoundingSet pair fails
+	// fast with a *runtimecheck.Violation rather than silently
+	// restart-looping in production (the failure mode that
+	// drove DEPLOY-1). On success the check is silent — every
+	// boot doesn't need a "validated" log line. Tests inject
+	// deps.capCheck to bypass the live capset (the test runner
+	// doesn't carry the production capset, and MustCheckOnBoot
+	// calls os.Exit on violation).
+	capCheck := deps.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
+		return err
+	}
+
 	cfg, err := LoadConfig(deps.configPath)
 	if err != nil {
 		return err
@@ -556,7 +585,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// correct order (no late caller waiting on a mountpoint
 	// while we sweep it).
 	defer func() {
-		if n := parentReg.SweepAll(log); n > 0 {
+		if n := parentReg.SweepAll(ctx, log); n > 0 {
 			log.Info("vmmd: shutdown parent-mount sweep", "n", n)
 		}
 	}()

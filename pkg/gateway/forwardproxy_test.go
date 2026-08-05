@@ -239,6 +239,19 @@ func (f *fakeVmmdClient) FrameworkReady(context.Context, *vmmdpb.FrameworkReadyR
 	return &vmmdpb.FrameworkReadyResponse{}, nil
 }
 
+// MountOverlayParent / UmountOverlayParent (ADR-075 / DEPLOY-1):
+// the forwardproxy handler never issues the overlay mount RPC
+// (imaged owns that), but the vmmdpb.VmmdClient interface
+// demands both methods, so the stub returns success to satisfy
+// the surface. Tests that exercise the actual mount path live
+// in pkg/vmmdgrpc/bufconn_test.go.
+func (f *fakeVmmdClient) MountOverlayParent(context.Context, *vmmdpb.MountOverlayParentRequest, ...grpc.CallOption) (*vmmdpb.MountOverlayParentResponse, error) {
+	return &vmmdpb.MountOverlayParentResponse{}, nil
+}
+func (f *fakeVmmdClient) UmountOverlayParent(context.Context, *vmmdpb.UmountOverlayParentRequest, ...grpc.CallOption) (*vmmdpb.UmountOverlayParentResponse, error) {
+	return &vmmdpb.UmountOverlayParentResponse{}, nil
+}
+
 // fakeNodeLookup is the NodeClientLookup the forwarder reads through.
 // It returns a stable (cli, closer) for any non-empty node id so
 // tests can drive the happy path; ok=false for empty ids so we can

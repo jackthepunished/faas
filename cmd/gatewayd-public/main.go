@@ -51,6 +51,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/httpsec"
@@ -82,6 +83,18 @@ const (
 	defaultPublicControlAddr = "127.0.0.1:9090"
 )
 
+// gatewaydPublicCapCheck is the DEPLOY-1 / ADR-075 capdecl gate
+// seam (review finding M2). It is a package-level var instead of
+// a runDeps field because gatewayd-public has a single-file
+// `run()` body with no DI struct to extend. Production leaves it
+// nil → run() falls back to the live runtimecheck.MustCheckOnBoot
+// call against /proc/self/status. Tests override it (typically
+// with func() error { return nil }) so the test runner's
+// capset doesn't fail the gate. The override is package-scoped,
+// not exported, so cmd/gatewayd-public_test.go can swap it within
+// a t.Cleanup.
+var gatewaydPublicCapCheck func() error
+
 func main() {
 	wire.Daemon("gatewayd-public", run)
 }
@@ -89,6 +102,28 @@ func main() {
 // run is the daemon entry point. It builds the listener stack,
 // wires the readiness probe, and blocks on ctx cancellation.
 func run(ctx context.Context, log *slog.Logger) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. gatewayd-public is
+	// unprivileged — no Allow, no Deny. The plain-HTTP loopback
+	// listener, the httpsec outer wrapper, the unix-socket
+	// reverse-proxy to gatewayd-internal, and the Postgres
+	// readiness ping all run inside the unit's systemd hardening
+	// (NoNewPrivileges, ProtectSystem, PrivateTmp, etc.). Any
+	// future cap_ add lands here, not in the unit file.
+	//
+	// Note (review finding M2): unlike the runDeps-shaped
+	// daemons, gatewayd-public has a single-file `run()` body —
+	// there is no test seam struct to extend. The
+	// capCheck-style override lives in the cmd-level
+	// helper below for tests that want to drive the body
+	// without exercising the live /proc/self/status check.
+	capCheck := gatewaydPublicCapCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
+		return err
+	}
+
 	log.Info("gatewayd-public: starting", "pid", os.Getpid())
 
 	// Postgres — required for the readiness ping (no other PG
