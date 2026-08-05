@@ -275,7 +275,7 @@ func gatherExport(ctx context.Context, s *server, acct state.Account, includeSec
 	}
 	appOut := make([]api.AppResponse, 0, len(apps))
 	for _, a := range apps {
-		appOut = append(appOut, s.appResponse(a))
+		appOut = append(appOut, s.appResponse(a, acct.Plan))
 	}
 
 	// Deployments are read once and shared: buildDeploymentsForExport

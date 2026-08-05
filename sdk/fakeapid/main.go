@@ -56,6 +56,9 @@ func accountLimits() map[string]any {
 // Slug is mutated per-request for CreateApp / GetApp to echo the
 // path or body value. MinInstances, Autoscale* are required to
 // round-trip; EgressAllowlist materialises as [] (not null).
+// ConcurrencyPerVMBound (issue #559) is required by the OpenAPI
+// schema — fakeapid advertises 5 to match the Hobby plan the
+// other endpoints already pin.
 func appResponse(slug string) []byte {
 	return mustJSON(map[string]any{
 		"id":                       "app_01HXYZ",
@@ -63,6 +66,7 @@ func appResponse(slug string) []byte {
 		"type":                     "app",
 		"ram_mb":                   256,
 		"max_concurrency":          2,
+		"concurrency_per_vm":       5,
 		"min_instances":            0,
 		"status":                   "active",
 		"url":                      "https://" + slug + ".example.com",
@@ -186,6 +190,7 @@ func (f *fixture) handler() http.Handler {
 					"type":                     "app",
 					"ram_mb":                   256,
 					"max_concurrency":          2,
+					"concurrency_per_vm":       5,
 					"min_instances":            0,
 					"status":                   "active",
 					"url":                      "https://hello-world.example.com",

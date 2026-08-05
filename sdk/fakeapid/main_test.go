@@ -109,8 +109,9 @@ func TestListApps_OK(t *testing.T) {
 	}
 	app := body[0]
 	for _, k := range []string{
-		"id", "slug", "type", "ram_mb", "max_concurrency", "min_instances",
-		"status", "url", "manifest", "autoscale_target_rps", "autoscale_target_cpu_pct",
+		"id", "slug", "type", "ram_mb", "max_concurrency", "concurrency_per_vm",
+		"min_instances", "status", "url", "manifest",
+		"autoscale_target_rps", "autoscale_target_cpu_pct",
 	} {
 		if _, ok := app[k]; !ok {
 			t.Errorf("missing required AppResponse field %q in app: %+v", k, app)
@@ -145,8 +146,8 @@ func TestCreateApp_OK(t *testing.T) {
 		t.Errorf("slug: got %v, want hello", got["slug"])
 	}
 	for _, k := range []string{
-		"id", "type", "ram_mb", "max_concurrency", "min_instances",
-		"status", "url", "manifest", "egress_allowlist",
+		"id", "type", "ram_mb", "max_concurrency", "concurrency_per_vm",
+		"min_instances", "status", "url", "manifest", "egress_allowlist",
 		"autoscale_target_rps", "autoscale_target_cpu_pct",
 	} {
 		if _, ok := got[k]; !ok {

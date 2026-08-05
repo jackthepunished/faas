@@ -23,7 +23,8 @@ These numbers come from the financial model and are **not negotiable at implemen
 | Disk reserve (OS, kernels, base images, logs) | 60 GB | LVM layout §8 |
 | Snapshot budget | 452 GB | `imaged` GC + quotas |
 | Fleet average snapshot size target | 130 MB | telemetry alert §12; quotas §8 |
-| Plan quotas (deployed / concurrent / MB RAM / GB-h) | Free 1/1/128/5 · Hobby 5/2/256/50 · Pro 25/5/512/250 · Scale 100/20/1024/1500 | `apid` validation, `schedd` admission, `meterd` quotas |
+| Plan quotas (deployed / per-app concurrent / MB RAM / GB-h) | Free 1/1/128/5 · Hobby 5/2/256/50 · Pro 25/5/512/250 · Scale 100/20/1024/1500 | `apid` validation, `schedd` admission, `meterd` quotas |
+| Plan per-VM concurrency bound (`concurrency_per_vm`) | Free 1 · Hobby 5 · Pro 25 · Scale 80 | `apid` validation on `GET /v1/apps/{slug}`; CLI `gregale app <slug> --concurrency`; **listener-level only** — handler-process concurrency is the customer's responsibility (§4.9.1, issue #559) |
 | Expected resident concurrency (planning) | 0.02 / 0.15 / 0.60 / 3.00 | telemetry comparison only |
 | Overage meter | €0.01 per GB-RAM-hour | `meterd` → Stripe |
 | Build cost envelope | builds fit inside control-plane + headroom, never tenant RAM | `builderd` admission §9 |
@@ -229,6 +230,21 @@ Resume path (post-restore, triggered by host signal via vsock): re-seed `/dev/ur
 Contract (identical across languages): handler receives `{method, path, headers, query, body_b64}`; returns `{status, headers, body_b64}` or a plain body. Node: `export default async function handler(req)`. Python: `def handler(request) -> Response | dict | str`.
 Streaming, websockets: not in v1 for functions (fine for Apps — gatewayd proxies them transparently).
 Adding a runtime is a 7-layer procedure (migrations, schema, apid handler whitelist, openapi enums, runner shim, imaged handler surfaces, base Dockerfile + auto-stage wiring) — see ADR-052 for the canonical touch-list. The worked example for `node24` and `python313` is Tier 1 PR 1 + PR 2.
+
+#### 4.9.1 Per-VM concurrency model (issue #559)
+
+The platform advertises a per-VM concurrency bound (the `concurrency_per_vm` field on `GET /v1/apps/{slug}`, mirrored in `pkg/api/limits.go::ConcurrencyPerVMBound`): **Free 1, Hobby 5, Pro 25, Scale 80**. This is an upper bound the *platform* publishes for a single VM and is **distinct from** the per-app instance cap (`max_concurrency`, spec §6.2-1) — a customer's per-app instance cap is the count of live VMs the schedd will admit, not the request fan-out one VM serves.
+
+The runner's HTTP listener (`http.ListenAndServe` on `:8080`) dispatches each accepted connection on its own goroutine, so the bound is reachable at the listener layer for any runner — Go's `net/http` does not serialize. Whether the customer's **handler process** achieves the bound depends on the runtime:
+
+- **Node.js (single-event-loop)** — a Node handler achieves the bound; the event loop serves concurrent requests within one process.
+- **Python asyncio** — an `async def handler` achieves the bound.
+- **Go `net/http`** — a Go handler achieves the bound.
+- **Synchronous subprocess-per-request** (e.g. a Python `read-stdin → write-stdout` script) — does NOT achieve the bound; one subprocess handles one request at a time regardless of the listener's goroutine count.
+
+All five current runners spawn one subprocess per request via `cmd.Run()` in the runner's `invokeHandler`. The platform's `concurrency_per_vm` bound is the listener's goroutine fan-out, not a single process's request queue — so a customer's runner/process choice bounds the effective concurrency below `concurrency_per_vm`, not at it. A future runner that pre-warms a long-lived interpreter pool could close the gap; today's runners do not.
+
+The runner-level concurrency claim is pinned by `guest/runners/internal/runnerparity/concurrency_test.go::TestRunner_HandleIsConcurrent` — 20 parallel GETs against a slow handler complete in ~1× handler-sleep, not 20× (the serialized floor). A regression to single-threaded accept would surface there.
 
 ---
 
@@ -730,6 +746,8 @@ full PR cycle.
 | headroom (inside tenant slice, above admission line) | ≈ 8.4 GB | spike absorption; opportunistic 2nd builder VM may borrow ≤ 2 GB of it only below 60 % tenant residency |
 
 `memory.max` on each slice makes the ledger real: a control-plane leak OOMs the control plane, never tenants — and vice versa.
+
+The per-VM request-concurrency bound (`concurrency_per_vm`, issue #559) is independent of the RAM ledger — a customer's `concurrency_per_vm` ceiling is the platform-advertised listener-level bound (Free 1 / Hobby 5 / Pro 25 / Scale 80), set by plan tier rather than by VM RAM. See §4.9.1 for the runner-level concurrency model.
 
 ---
 

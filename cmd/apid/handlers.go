@@ -28,7 +28,7 @@ func (s *server) listApps(w http.ResponseWriter, r *http.Request, acct state.Acc
 	}
 	out := make([]api.AppResponse, 0, len(apps))
 	for _, a := range apps {
-		out = append(out, s.appResponse(a))
+		out = append(out, s.appResponse(a, acct.Plan))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -79,7 +79,7 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"runtime":         created.Runtime,
 	})
 	s.emitAppCreated(ctx(r), created)
-	writeJSON(w, http.StatusCreated, s.appResponse(created))
+	writeJSON(w, http.StatusCreated, s.appResponse(created, acct.Plan))
 }
 
 // buildApp applies defaults and validates a create request, returning the App to
@@ -250,7 +250,12 @@ func (s *server) loadAppAndPreflight(w http.ResponseWriter, r *http.Request, acc
 	return app, true, api.MustLimitsFor(acct.Plan)
 }
 
-func (s *server) appResponse(a state.App) api.AppResponse {
+// appResponse converts a state.App row into the wire DTO. The plan
+// is threaded through so the DTO can surface plan-derived caps
+// (issue #559: ConcurrencyPerVMBound) without re-looking-up the
+// account store. Mirrors how loadAppAndPreflight (above) threads
+// (state.App, api.Limits) — every caller has acct in scope.
+func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 	// EgressAllowlist is materialised as a non-nil empty slice so
 	// the JSON shape is `[]` (never `null`) regardless of plan /
 	// pre-PATCH state. prefix.String() is the canonical form
@@ -261,6 +266,12 @@ func (s *server) appResponse(a state.App) api.AppResponse {
 	return api.AppResponse{
 		ID: a.ID, Slug: a.Slug, Type: string(a.Type), Runtime: a.Runtime,
 		RAMMB: a.RAMMB, MaxConcurrency: a.MaxConcurrency, IdleTimeoutS: a.IdleTimeoutS,
+		// Issue #559: platform-advertised per-VM concurrency cap
+		// for the customer's plan. Distinct from MaxConcurrency
+		// (the per-app instance cap above). Unknown plans fall
+		// through the accessor to 0 — same fail-closed contract
+		// as MaxMinInstances.
+		ConcurrencyPerVMBound: plan.ConcurrencyPerVMBound(),
 		// ux_spec §6.5: per-app floor the reaper honors when
 		// parking idle instances. Pro/Scale only (apid gates).
 		MinInstances: a.MinInstances,

@@ -17,6 +17,7 @@ export type AppResponse = {
   runtime?: 'node22' | 'python312' | 'go124' | 'go124-alpine' | 'node24' | 'python313';
   ram_mb: number;
   max_concurrency: number;
+  concurrency_per_vm: number;
   idle_timeout_s?: number | null;
   min_instances: number;
   status: string;

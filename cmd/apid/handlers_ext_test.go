@@ -908,6 +908,50 @@ func TestGetApp_UnknownReturns404(t *testing.T) {
 	assertProblem(t, rec, 404, api.CodeNotFound)
 }
 
+// TestGetApp_SurfacesConcurrencyPerVMBound pins the wire shape for
+// the issue #559 / PR #645 addition: every plan's GET /v1/apps/{slug}
+// response must include `concurrency_per_vm` set to the plan's bound.
+// Catches regressions where someone constructs api.AppResponse
+// directly (bypassing appResponse) and forgets the new field — the
+// limits-table accessor is fail-closed (returns 0 on unknown plan),
+// so the assertion is strict equality on the per-plan expected
+// value rather than just "field is present".
+func TestGetApp_SurfacesConcurrencyPerVMBound(t *testing.T) {
+	cases := []struct {
+		plan api.Plan
+		want int
+	}{
+		{api.PlanFree, 1},
+		{api.PlanHobby, 5},
+		{api.PlanPro, 25},
+		{api.PlanScale, 80},
+	}
+	for _, c := range cases {
+		t.Run(string(c.plan), func(t *testing.T) {
+			e := setup(t, c.plan)
+			mustSeedApp(t, e, "cpvm-app")
+			rec := e.do(t, "GET", "/v1/apps/cpvm-app", nil, nil)
+			if rec.Code != 200 {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			var out api.AppResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if out.ConcurrencyPerVMBound != c.want {
+				t.Errorf("concurrency_per_vm = %d, want %d (plan=%s)",
+					out.ConcurrencyPerVMBound, c.want, c.plan)
+			}
+			// Belt-and-suspenders: assert the JSON field is
+			// present in the raw payload — catches any future
+			// DTO `omitempty` tag added in error.
+			if !bytes.Contains(rec.Body.Bytes(), []byte(`"concurrency_per_vm":`)) {
+				t.Errorf("raw JSON missing concurrency_per_vm key:\n%s", rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestUpdateApp_RAMValid covers the happy path: a valid RAM value persists
 // and the response reflects the new value.
 func TestUpdateApp_RAMValid(t *testing.T) {

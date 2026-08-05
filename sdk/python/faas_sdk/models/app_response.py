@@ -31,6 +31,7 @@ class AppResponse:
     type_: AppResponseType
     ram_mb: int
     max_concurrency: int
+    concurrency_per_vm: int
     min_instances: int
     status: str
     url: str
@@ -92,6 +93,8 @@ class AppResponse:
         ram_mb = self.ram_mb
 
         max_concurrency = self.max_concurrency
+
+        concurrency_per_vm = self.concurrency_per_vm
 
         min_instances = self.min_instances
 
@@ -162,6 +165,7 @@ class AppResponse:
                 "type": type_,
                 "ram_mb": ram_mb,
                 "max_concurrency": max_concurrency,
+                "concurrency_per_vm": concurrency_per_vm,
                 "min_instances": min_instances,
                 "status": status,
                 "url": url,
@@ -210,6 +214,8 @@ class AppResponse:
         ram_mb = d.pop("ram_mb")
 
         max_concurrency = d.pop("max_concurrency")
+
+        concurrency_per_vm = d.pop("concurrency_per_vm")
 
         min_instances = d.pop("min_instances")
 
@@ -308,6 +314,7 @@ class AppResponse:
             type_=type_,
             ram_mb=ram_mb,
             max_concurrency=max_concurrency,
+            concurrency_per_vm=concurrency_per_vm,
             min_instances=min_instances,
             status=status,
             url=url,
