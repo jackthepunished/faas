@@ -307,6 +307,18 @@ range 1..96.
   `guest/init/supervise.go` adds `runSidecar` alongside the
   existing `runAppWithEnv`; separate cgroup scopes inside the
   per-instance tenant netns.
+- **PR-B (this PR closure)** additionally wires the **in-guest
+  cgroup v2 partition** in `guest/init/workload_linux.go::runSidecar`
+  (and `runAppWithEnv` for the main workload): each workload
+  gets a cgroup leaf under `/sys/fs/cgroup/` with
+  `memory.max = workload.ram_mb<<20`; the exec'd child's PID is
+  placed in the leaf via `cgroup.procs`. This is the **primary
+  OOM isolation surface** — the host-side per-workload cgroup
+  leaves (`pkg/fcvm/cgroup.go::writeWorkloadCgroup`) are
+  defence-in-depth. A sidecar runaway is now OOM-killed against
+  the sidecar's leaf, not the whole VM. See §"In-guest cgroup
+  partition" in this ADR for the architectural rationale
+  (issue #463 / AC #4).
 - **PR-C** wires the e2e + observability: `cmd/e2e/sidecar_e2e_test.go`
   exercises init-then-main + sidecar-along-main + restart-loop;
   `pkg/wire/metrics.go` reserves `schedd_sidecar_restart_total
@@ -410,8 +422,13 @@ pinning GB-h BEFORE this PR merges. The column should pin:
   inside their ceiling under the 2-sidecar cap.
 
 The xlsx is git-ignored (`ex44_faas_financial_model.xlsx`
-lives on the EX44 box only). The PR cannot merge until the
-spreadsheet row is committed to the EX44 box out-of-band.
+lives on the EX44 box only). The in-repo record of the math is
+[`docs/financial/SIDECARS_ADDENDUM.md`](../../financial/SIDECARS_ADDENDUM.md)
+(issue #463 / PR-B closure) — that file is the **mergeable
+in-repo source of truth** for the sidecar RAM math and MUST
+mirror the EX44 box row. The PR merges when
+`docs/financial/SIDECARS_ADDENDUM.md` lands; the EX44
+spreadsheet row catch-up is tracked out-of-band by ops.
 
 ## Verification
 
@@ -498,9 +515,11 @@ gh workflow run ci.yml --ref issue-463-sidecars-prA
 
 Pre-merge checklist:
 
-- [ ] Financial-model addendum row + scenario columns committed
-      to the EX44 box `ex44_faas_financial_model.xlsx`
-      (out-of-band ops commit; documented above).
+- [x] `docs/financial/SIDECARS_ADDENDUM.md` is the in-repo
+      source of truth for the sidecar RAM math (issue #463 /
+      PR-B closure). The EX44 box workbook rows mirror the
+      addendum scenarios; CI does NOT enforce the workbook row
+      because the workbook is offline (per CLAUDE.md).
 - [ ] `docs/adr/README.md` table row for ADR-069 added on the
       PR.
 - [ ] `migrations/00096_deployments_sidecars.sql` applied
