@@ -893,15 +893,23 @@ type ScanSeverityCounts struct {
 // ScanVulnerability is a single CVE finding on a per-deploy grype
 // scan. The fields mirror the grype JSON shape the apid handler
 // (`cmd/apid/handlers_scan.go`) forwards verbatim — see
-// pkg/imaged.ScanVulnerability for the upstream definition. Paths
-// are intentionally omitted from the wire DTO (PR #651 review
-// finding #54: customers don't need internal grype match paths).
+// pkg/imaged.Vulnerability for the upstream definition.
+//
+// Extension (issue #464 / PR-B acceptance): Paths carries the
+// per-file path list from grype's artifact.locations[].path. The
+// PR-651 review finding #54 ("customers don't need internal
+// grype match paths") was revisited when the dashboard's "Path"
+// column was added; the per-file paths help customers identify
+// which shared library to rebuild or replace. pkg/api's
+// marshalling is `paths,omitempty`, so a no-path CVE stays
+// compact on the wire.
 type ScanVulnerability struct {
-	ID       string `json:"id"`
-	Severity string `json:"severity"` // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
-	Package  string `json:"package"`
-	Version  string `json:"version"`
-	FixedIn  string `json:"fixed_in,omitempty"`
+	ID       string   `json:"id"`
+	Severity string   `json:"severity"` // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+	Package  string   `json:"package"`
+	Version  string   `json:"version"`
+	FixedIn  string   `json:"fixed_in,omitempty"`
+	Paths    []string `json:"paths,omitempty"`
 }
 
 // ScanResult is the wire shape returned by GET

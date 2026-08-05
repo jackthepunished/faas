@@ -311,3 +311,119 @@ func TestRunDeployScan_PathTraversalStampsFailed(t *testing.T) {
 		t.Errorf("Error empty, want the path-traversal reason")
 	}
 }
+
+// TestRunDeployScan_PathsRoundTrip pins the issue #464
+// extension: a *ScanResult carrying Vulnerability.Paths flows
+// through the deploy-complete hook into the deployment row's
+// scan_result jsonb column and round-trips back into a
+// *ScanResult via json.Unmarshal. The seam is the same
+// WithGrypeRun fluent setter used by TestRunDeployScan_StampsComplete;
+// the test asserts the typed payload lands, not just the
+// severity counts.
+//
+// A regression that drops Paths at write time surfaces here
+// as Paths == nil on the readback — the dashboard's Path
+// column would render "—" for every row, masking real
+// file-level data.
+func TestRunDeployScan_PathsRoundTrip(t *testing.T) {
+	store := state.NewMemStore()
+	ctx := context.Background()
+
+	want := &ScanResult{
+		SeverityCounts: SeverityCounts{Critical: 1, High: 1},
+		Vulnerabilities: []Vulnerability{
+			{
+				ID:       "CVE-2024-1234",
+				Severity: "CRITICAL",
+				Package:  "openssl",
+				Version:  "1.1.1k-7",
+				FixedIn:  "1.1.1l-1",
+				Paths: []string{
+					"/usr/lib/x86_64-linux-gnu/libssl.so.1.1",
+					"/usr/lib/x86_64-linux-gnu/libcrypto.so.1.1",
+				},
+			},
+			{
+				ID:       "CVE-2024-5678",
+				Severity: "HIGH",
+				Package:  "libcurl4",
+				// Paths: nil — deb/apt-style CVE match
+				// reports no per-file locations; the round-trip
+				// must preserve nil (the omitempty contract).
+			},
+		},
+	}
+
+	h := &Handler{
+		store:    store,
+		log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		appsRoot: filepath.Join(t.TempDir(), "apps"),
+	}
+	h.WithGrypeRun(func(_ context.Context, _ string) (*ScanResult, error) {
+		return want, nil
+	})
+
+	acct, err := store.CreateAccount(ctx, "alice@example.com", "hobby")
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := store.CreateApp(ctx, state.App{
+		AccountID: acct.ID,
+		Slug:      "paths-test",
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := store.CreateDeployment(ctx, state.Deployment{
+		AppID: app.ID,
+		Kind:  "git",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	h.runDeployScan(ctx, app, dep)
+
+	row, err := store.DeploymentByID(ctx, dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if row.ScanStatus != "complete" {
+		t.Errorf("ScanStatus = %q, want %q", row.ScanStatus, "complete")
+	}
+
+	var got ScanResult
+	if err := json.Unmarshal(row.ScanResult, &got); err != nil {
+		t.Fatalf("unmarshal scan_result: %v", err)
+	}
+	if len(got.Vulnerabilities) != 2 {
+		t.Fatalf("len(Vulnerabilities) = %d, want 2", len(got.Vulnerabilities))
+	}
+
+	v0 := got.Vulnerabilities[0]
+	if v0.ID != "CVE-2024-1234" {
+		t.Errorf("Vulns[0].ID = %q, want CVE-2024-1234", v0.ID)
+	}
+	if len(v0.Paths) != 2 {
+		t.Fatalf("Vulns[0].Paths len = %d, want 2", len(v0.Paths))
+	}
+	if v0.Paths[0] != "/usr/lib/x86_64-linux-gnu/libssl.so.1.1" {
+		t.Errorf("Vulns[0].Paths[0] = %q", v0.Paths[0])
+	}
+	if v0.Paths[1] != "/usr/lib/x86_64-linux-gnu/libcrypto.so.1.1" {
+		t.Errorf("Vulns[0].Paths[1] = %q", v0.Paths[1])
+	}
+
+	// Second vulnerability has no paths: round-trip must
+	// preserve the nil (omitempty-friendly) state.
+	v1 := got.Vulnerabilities[1]
+	if v1.Paths != nil {
+		t.Errorf("Vulns[1].Paths = %v, want nil (no path round-trip)", v1.Paths)
+	}
+
+	// SeverityCounts also round-trips (the existing fields
+	// stay).
+	if got.SeverityCounts.Critical != 1 || got.SeverityCounts.High != 1 {
+		t.Errorf("SeverityCounts = %+v, want CRITICAL=1 HIGH=1", got.SeverityCounts)
+	}
+}

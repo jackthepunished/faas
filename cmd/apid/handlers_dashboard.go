@@ -1221,6 +1221,7 @@ func dashboardScanPayload(s *api.ScanResult) dashboard.ScanPayload {
 			Package:  v.Package,
 			Version:  v.Version,
 			FixedIn:  v.FixedIn,
+			Paths:    v.Paths,
 		})
 	}
 	sc := s.SeverityCounts

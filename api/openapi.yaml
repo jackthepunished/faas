@@ -5621,6 +5621,16 @@ components:
         package:  { type: string, description: "Vulnerable package name (e.g. openssl)." }
         version:  { type: string, description: "Installed package version (e.g. 1.1.1k-7)." }
         fixed_in: { type: [string, "null"], description: "Upstream version the fix landed in. Empty when no fix is available (e.g. disputed CVE) — the dashboard renders 'no fix' for empty." }
+        paths:
+          type: array
+          description: |
+            Per-file paths within the scanned image where the vulnerable
+            package was located (issue #464 / extension). Sourced from
+            grype's `artifact.locations[].path`. Many CVEs match against a
+            package without per-file locations (deb/apt-style CVE matches);
+            empty / null for those rows. The dashboard's "Path" column
+            renders "—" on null.
+          items: { type: string }
 
     Sidecar:
       description: |

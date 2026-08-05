@@ -107,25 +107,27 @@ type SeverityCounts struct {
 }
 
 // Vulnerability is one row in the scan's CVE list
-// (issue #464 / ADR-075, PR-1).
+// (issue #464 / ADR-075, PR-1 + extension).
 //
 // FixedIn is the upstream's "fixed in" version string.
 // Empty when Grype reports no fix is available (e.g. a
 // disputed CVE) — the dashboard renders "no fix" for
 // empty FixedIn.
 //
-// Paths: PER-DESIGN ABSENT. `defaultGrypeRun` (pkg/imaged/
-// grype.go:36-40) only parses `vulnerability.severity` per
-// match — the per-file `artifact.locations` array that
-// Grype emits is dropped at parse time. Promising it on the
-// wire would mislead the dashboard's "top 10" view into
-// rendering an empty list. Persist the slim shape now;
-// surface path-level data behind a follow-up PR that
-// extends `grypeMatch` to capture `artifact.locations`.
+// Paths is the per-file path list for the matched
+// artifact (grype's artifact.locations[].path). Populated
+// by parseGrypeOutput in pkg/imaged/grype.go — the slim
+// per-PR-1 grypeMatch is now extended with the artifact
+// block, and the JSON tag is mirrored byte-identically
+// on pkg/imaged.Vulnerability. Empty when the CVE matches
+// against a package without a specific file path
+// (deb/apt-style CVE matches); the jsonb omitempty drops
+// the field so a no-path row stays compact.
 type Vulnerability struct {
-	ID       string `json:"id"`       // e.g. "CVE-2024-1234"
-	Severity string `json:"severity"` // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
-	Package  string `json:"package"`  // e.g. "openssl"
-	Version  string `json:"version"`  // e.g. "1.1.1k-7"
-	FixedIn  string `json:"fixed_in,omitempty"`
+	ID       string   `json:"id"`                 // e.g. "CVE-2024-1234"
+	Severity string   `json:"severity"`           // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+	Package  string   `json:"package"`            // e.g. "openssl"
+	Version  string   `json:"version"`            // e.g. "1.1.1k-7"
+	FixedIn  string   `json:"fixed_in,omitempty"` // "" when no fix is available
+	Paths    []string `json:"paths,omitempty"`    // file paths within the scanned dir; nil/empty when no path was reported
 }

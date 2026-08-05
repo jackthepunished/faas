@@ -97,7 +97,7 @@
           {{if .Data.Scan.Vulnerabilities}}
             <h3>Vulnerabilities ({{len .Data.Scan.Vulnerabilities}})</h3>
             <table>
-              <thead><tr><th>ID</th><th>Severity</th><th>Package</th><th>Version</th><th>Fixed in</th></tr></thead>
+              <thead><tr><th>ID</th><th>Severity</th><th>Package</th><th>Version</th><th>Fixed in</th><th>Path</th></tr></thead>
               <tbody>
                 {{range .Data.Scan.Vulnerabilities}}
                   <tr>
@@ -113,6 +113,13 @@
                     <td><code>{{.Package}}</code></td>
                     <td><code>{{.Version}}</code></td>
                     <td><code>{{.FixedIn}}</code></td>
+                    <td>
+                      {{if .Paths}}
+                        {{range .Paths}}<code>{{.}}</code> {{end}}
+                      {{else}}
+                        <span style="color:#888;">—</span>
+                      {{end}}
+                    </td>
                   </tr>
                 {{end}}
               </tbody>

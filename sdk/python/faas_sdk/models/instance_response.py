@@ -29,6 +29,7 @@ class InstanceResponse:
     started_at: datetime.datetime | None | Unset = UNSET
     last_request_at: datetime.datetime | None | Unset = UNSET
     parked_at: datetime.datetime | None | Unset = UNSET
+    min_instances_target: int | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,6 +75,12 @@ class InstanceResponse:
         else:
             parked_at = self.parked_at
 
+        min_instances_target: int | None | Unset
+        if isinstance(self.min_instances_target, Unset):
+            min_instances_target = UNSET
+        else:
+            min_instances_target = self.min_instances_target
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -95,6 +102,8 @@ class InstanceResponse:
             field_dict["last_request_at"] = last_request_at
         if parked_at is not UNSET:
             field_dict["parked_at"] = parked_at
+        if min_instances_target is not UNSET:
+            field_dict["min_instances_target"] = min_instances_target
 
         return field_dict
 
@@ -173,6 +182,15 @@ class InstanceResponse:
 
         parked_at = _parse_parked_at(d.pop("parked_at", UNSET))
 
+        def _parse_min_instances_target(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        min_instances_target = _parse_min_instances_target(d.pop("min_instances_target", UNSET))
+
         instance_response = cls(
             id=id,
             app_id=app_id,
@@ -184,6 +202,7 @@ class InstanceResponse:
             started_at=started_at,
             last_request_at=last_request_at,
             parked_at=parked_at,
+            min_instances_target=min_instances_target,
         )
 
         instance_response.additional_properties = d

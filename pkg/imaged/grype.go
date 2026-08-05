@@ -29,14 +29,36 @@ import (
 // grypeMatch is the slim subset of the Grype JSON output we
 // consume. The full schema is documented at
 // https://github.com/anchore/grype/blob/main/schema/json/schema-9.0.json
-// but we only need vulnerability.severity per match to count
-// findings. Future versions of Grype that drop this field will
-// surface as a parse error here — handled by the fail-closed
-// sidecar write (CRITICAL=9999 placeholder) at the call site.
+// (issue #464 / extension): we now decode vulnerability.{id,fix.versions[0]}
+// and artifact.{name,version,locations[].path} in addition to severity,
+// so the typed Vulnerability in the jsonb payload (PR-3 sink) carries
+// the data the dashboard's per-row "Path" column renders. The
+// fail-closed base-ext4 sidecar (writeScanSidecar) only reads
+// vulnerability.severity, so the existing base-factory scan contract
+// is byte-identical — the new fields flow through ScanResult.Vulnerabilities
+// for the per-deploy surface only.
 type grypeMatch struct {
 	Vulnerability struct {
+		ID       string `json:"id"`
 		Severity string `json:"severity"`
+		Fix      struct {
+			Versions []string `json:"versions"`
+		} `json:"fix"`
 	} `json:"vulnerability"`
+	Artifact struct {
+		Name      string          `json:"name"`
+		Version   string          `json:"version"`
+		Locations []grypeLocation `json:"locations"`
+	} `json:"artifact"`
+}
+
+// grypeLocation is one element of artifact.locations — the per-file
+// path within the scanned dir: Grype groups multiple files for the
+// same vuln into one match, so a single CVE can have several paths.
+// Hand-authored fixtures in testdata/ pin this shape (see
+// TestScanResult_ParseGrypeJSON).
+type grypeLocation struct {
+	Path string `json:"path"`
 }
 
 // grypeOutput is the top-level shape of `grype dir:<dir> -o json`.
@@ -92,11 +114,20 @@ func RunGrypeAt(ctx context.Context, bin, dir string) (*ScanResult, error) {
 // PR-2 (issue #464 / ADR-055): the return type changed from
 // `map[string]int` to `*ScanResult`. The SeverityCounts field
 // carries the same per-bucket count the pre-PR-2 map did; the
-// full Vulnerability[] list is added in PR-3 when the per-deploy
-// sink writes the typed payload. This PR preserves the
-// fail-closed base-ext4 sidecar behaviour: the call site at
-// base_stage.go::writeScanSidecar reads the counts off the
-// new struct and writes the same sidecar JSON.
+// full Vulnerability[] list is the typed payload the per-deploy
+// sink (runDeployScan → state.Store.UpsertDeploymentScanResult)
+// writes to deployments.scan_result jsonb.
+//
+// Extension (issue #464 / PR-B acceptance): runGrypeImpl now
+// populates ScanResult.Vulnerabilities with id, package, version,
+// fixed_in, and paths (artifact.locations[].path) per match.
+// The base-ext4 sidecar (writeScanSidecar) reads only
+// SeverityCounts; the new fields flow through ScanResult and
+// are written to the deployment row, never to the sidecar.
+// scanResponse decodes them back into api.Vulnerability — the
+// /scan route and DeploymentResponse.Scan carry the full list;
+// the dashboard's handler-edge cap (cmd/apid/handlers_dashboard.go)
+// truncates to 10 before the template renders.
 func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
 	cmd := exec.CommandContext(ctx, bin, "dir:"+dir, "-o", "json")
 	var stdout, stderr bytes.Buffer
@@ -105,22 +136,78 @@ func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("imaged: grype scan dir %q: %w (stderr=%q)", dir, err, stderr.String())
 	}
+	return parseGrypeOutput(stdout.Bytes(), dir)
+}
+
+// parseGrypeOutput decodes the grype JSON output into a typed
+// *ScanResult. Extracted from runGrypeImpl so unit tests can
+// exercise the parser without a grype subprocess or a real image
+// on disk. The dir argument is only used to format the parse
+// error message — the bytes are the entire grype JSON; the dir
+// does not appear in the result.
+func parseGrypeOutput(raw []byte, dir string) (*ScanResult, error) {
 	var out grypeOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("imaged: grype scan dir %q: parse json: %w", dir, err)
 	}
-	var counts ScanResult
-	for _, m := range out.Matches {
-		counts.bumpSeverity(normalizeGrypeSeverity(m.Vulnerability.Severity))
+	if len(out.Matches) == 0 {
+		// Zero-finding scan: return *ScanResult with no
+		// Vulnerabilities slice. The jsonb omitempty drops
+		// the field entirely; the sidecar still reads the
+		// zero-valued SeverityCounts cleanly.
+		return &ScanResult{}, nil
 	}
-	return &counts, nil
+	res := &ScanResult{Vulnerabilities: make([]Vulnerability, 0, len(out.Matches))}
+	for _, m := range out.Matches {
+		res.bumpSeverity(normalizeGrypeSeverity(m.Vulnerability.Severity))
+		res.Vulnerabilities = append(res.Vulnerabilities, Vulnerability{
+			ID:       m.Vulnerability.ID,
+			Severity: normalizeGrypeSeverity(m.Vulnerability.Severity),
+			Package:  m.Artifact.Name,
+			Version:  m.Artifact.Version,
+			FixedIn:  vulnFixedIn(m.Vulnerability.Fix.Versions),
+			Paths:    vulnPaths(m.Artifact.Locations),
+		})
+	}
+	return res, nil
+}
+
+// vulnFixedIn picks the first fix version Grype reports. Future
+// extension: persist all of fix.versions[] in a follow-up if a CVE
+// carries multiple fixed versions (rare in practice — Grype usually
+// emits one fixed-version string per CVE).
+func vulnFixedIn(versions []string) string {
+	if len(versions) == 0 {
+		return ""
+	}
+	return versions[0]
+}
+
+// vulnPaths flattens artifact.locations[].path into a single slice.
+// Many CVEs are reported against a package without a file path
+// (deb/apt-style CVE matches); the nil/empty case returns nil so the
+// jsonb omitempty drops the field on the wire.
+func vulnPaths(locs []grypeLocation) []string {
+	if len(locs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(locs))
+	for _, l := range locs {
+		if l.Path != "" {
+			out = append(out, l.Path)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // ScanResult is the typed result of one grype run (issue #464 /
-// ADR-055 / PR-2). The pre-PR-2 call sites returned
+// ADR-055 / PR-2 + extension). The pre-PR-2 call sites returned
 // `map[string]int`; the new struct carries the per-bucket count
-// (SeverityCounts) and reserves space for the full
-// Vulnerability list that PR-3's per-deploy sink writes.
+// (SeverityCounts) and the full Vulnerability[] list that
+// runGrypeImpl / parseGrypeOutput populate.
 //
 // The package-level `Severity` constants below are the closed
 // enum Grype normalises to (CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN).
@@ -129,15 +216,29 @@ func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
 // to build the legacy `findings map[string]int` payload — the
 // pre-PR-2 sidecar JSON shape is byte-identical for a given
 // input. The per-deploy surface (PR-3's deploy-complete hook
-// in handler.go::runDeployScan) uses the full struct directly.
+// in handler.go::runDeployScan → state.Store) marshals the
+// full struct into the deployments.scan_result jsonb; the wire
+// DTO (api.ScanResult) decodes both fields back. The dashboard's
+// "top 10 by severity" view is a handler-edge cap (per-extend);
+// the wire keeps the full list.
 //
 // Error carries the grype-runner error message on the
 // scan_status='failed' path (PR-3 retry-exhausted backoff).
 // Empty on success. Marshalled into deployments.scan_result
 // jsonb so the dashboard's "scan failed" chip can render the
 // underlying cause; not surfaced on the success path.
+//
+// Vulnerabilities carries the full CVE list in Grype's natural
+// output order (most-severe-first in the upstream JSON). The
+// `,omitempty` keeps the jsonb compact for zero-finding scans.
 type ScanResult struct {
 	SeverityCounts
+	// Vulnerabilities is the full typed CVE list.
+	// omitempty drops the field for zero-finding scans
+	// (the closed enum [CRITICAL|HIGH|...] lets the
+	// dashboard render an all-zero severity bucket on a
+	// scan with no findings).
+	Vulnerabilities []Vulnerability `json:"vulnerabilities,omitempty"`
 	// Error is the grype-runner error message stamped on the
 	// scan_status='failed' path (PR-3 retry-exhausted backoff).
 	// Empty on success. Marshalled with omitempty so a successful

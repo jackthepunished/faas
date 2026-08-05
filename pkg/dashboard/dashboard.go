@@ -257,13 +257,18 @@ type SeverityBucket struct {
 
 // VulnerabilityRow is one row in the deployment-detail CVE
 // table. Trimmed from pkg/api.Vulnerability to the columns the
-// dashboard renders (id, severity, package, version, fixed_in).
+// dashboard renders (id, severity, package, version, fixed_in,
+// paths). Paths is empty when the scan matched a package
+// without per-file locations — the template renders "—" on the
+// empty case (the existing dashboard convention for blank
+// cells, see FormatAlertError for the truncation precedent).
 type VulnerabilityRow struct {
 	ID       string
 	Severity string
 	Package  string
 	Version  string
 	FixedIn  string
+	Paths    []string
 }
 
 // AlertDetailData is the dashboard-facing payload for the alert-rules

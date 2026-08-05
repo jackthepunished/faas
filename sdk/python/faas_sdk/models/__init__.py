@@ -32,6 +32,7 @@ from .app_metrics_response_range import AppMetricsResponseRange
 from .app_registry_credential_list_response import AppRegistryCredentialListResponse
 from .app_registry_credential_response import AppRegistryCredentialResponse
 from .app_response import AppResponse
+from .app_response_eviction_priority import AppResponseEvictionPriority
 from .app_response_runtime import AppResponseRuntime
 from .app_response_type import AppResponseType
 from .app_secret_export_response import AppSecretExportResponse
@@ -67,6 +68,7 @@ from .create_alert_rule_request_failure_source import CreateAlertRuleRequestFail
 from .create_alert_rule_request_metric import CreateAlertRuleRequestMetric
 from .create_alert_rule_request_window_spec import CreateAlertRuleRequestWindowSpec
 from .create_app_request import CreateAppRequest
+from .create_app_request_eviction_priority import CreateAppRequestEvictionPriority
 from .create_app_request_runtime import CreateAppRequestRuntime
 from .create_app_request_type import CreateAppRequestType
 from .create_cron_request import CreateCronRequest
@@ -205,11 +207,14 @@ from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
 from .scaling_policy import ScalingPolicy
 from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
+from .scan_result import ScanResult
+from .scan_result_status import ScanResultStatus
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
 from .set_grace_window_request import SetGraceWindowRequest
 from .set_password_request import SetPasswordRequest
+from .severity_counts import SeverityCounts
 from .sidecar import Sidecar
 from .sidecar_env import SidecarEnv
 from .sidecar_type import SidecarType
@@ -218,6 +223,10 @@ from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .trace import Trace
+from .trace_span import TraceSpan
+from .trace_span_attributes import TraceSpanAttributes
+from .trace_span_status import TraceSpanStatus
 from .transfer_ownership_request import TransferOwnershipRequest
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
@@ -225,10 +234,17 @@ from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparis
 from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
 from .update_alert_rule_request_window_spec import UpdateAlertRuleRequestWindowSpec
 from .update_app_request import UpdateAppRequest
+from .update_app_request_eviction_priority_type_1 import UpdateAppRequestEvictionPriorityType1
+from .update_app_request_eviction_priority_type_2_type_1 import UpdateAppRequestEvictionPriorityType2Type1
+from .update_app_request_eviction_priority_type_3_type_1 import UpdateAppRequestEvictionPriorityType3Type1
 from .update_cron_request import UpdateCronRequest
+from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
+from .update_deployment_request import UpdateDeploymentRequest
 from .usage_export_response import UsageExportResponse
 from .usage_response import UsageResponse
 from .usage_summary_response import UsageSummaryResponse
+from .vulnerability import Vulnerability
+from .vulnerability_severity import VulnerabilitySeverity
 from .wake_timeline_event import WakeTimelineEvent
 from .wake_timeline_event_data import WakeTimelineEventData
 from .wake_timeline_response import WakeTimelineResponse
@@ -269,6 +285,7 @@ __all__ = (
     "AppRegistryCredentialListResponse",
     "AppRegistryCredentialResponse",
     "AppResponse",
+    "AppResponseEvictionPriority",
     "AppResponseRuntime",
     "AppResponseType",
     "AppSecretExportResponse",
@@ -301,6 +318,7 @@ __all__ = (
     "CreateAlertRuleRequestMetric",
     "CreateAlertRuleRequestWindowSpec",
     "CreateAppRequest",
+    "CreateAppRequestEvictionPriority",
     "CreateAppRequestRuntime",
     "CreateAppRequestType",
     "CreateCronRequest",
@@ -439,11 +457,14 @@ __all__ = (
     "ScalingPolicy",
     "ScalingTarget",
     "ScalingTargetMetric",
+    "ScanResult",
+    "ScanResultStatus",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",
     "SetGraceWindowRequest",
     "SetPasswordRequest",
+    "SeverityCounts",
     "Sidecar",
     "SidecarEnv",
     "SidecarType",
@@ -452,6 +473,10 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "Trace",
+    "TraceSpan",
+    "TraceSpanAttributes",
+    "TraceSpanStatus",
     "TransferOwnershipRequest",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
@@ -459,10 +484,17 @@ __all__ = (
     "UpdateAlertRuleRequestMetric",
     "UpdateAlertRuleRequestWindowSpec",
     "UpdateAppRequest",
+    "UpdateAppRequestEvictionPriorityType1",
+    "UpdateAppRequestEvictionPriorityType2Type1",
+    "UpdateAppRequestEvictionPriorityType3Type1",
     "UpdateCronRequest",
+    "UpdateDeploymentMinInstancesBody",
+    "UpdateDeploymentRequest",
     "UsageExportResponse",
     "UsageResponse",
     "UsageSummaryResponse",
+    "Vulnerability",
+    "VulnerabilitySeverity",
     "WakeTimelineEvent",
     "WakeTimelineEventData",
     "WakeTimelineResponse",

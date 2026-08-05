@@ -6,6 +6,10 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.create_app_request_eviction_priority import (
+    CreateAppRequestEvictionPriority,
+    check_create_app_request_eviction_priority,
+)
 from ..models.create_app_request_runtime import CreateAppRequestRuntime, check_create_app_request_runtime
 from ..models.create_app_request_type import CreateAppRequestType, check_create_app_request_type
 from ..types import UNSET, Unset
@@ -37,6 +41,10 @@ class CreateAppRequest:
     warm_snapshot_min_ms: int | Unset = UNSET
     """Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 /
     ADR-055). Range [100, 60000]. Omitted → apid applies the plan default."""
+    eviction_priority: CreateAppRequestEvictionPriority | Unset = UNSET
+    """Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper
+    behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction. Omitted at create-time → apid
+    applies the schema default 'best_effort'."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +72,10 @@ class CreateAppRequest:
 
         warm_snapshot_min_ms = self.warm_snapshot_min_ms
 
+        eviction_priority: str | Unset = UNSET
+        if not isinstance(self.eviction_priority, Unset):
+            eviction_priority = self.eviction_priority
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -89,6 +101,8 @@ class CreateAppRequest:
             field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
         if warm_snapshot_min_ms is not UNSET:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
+        if eviction_priority is not UNSET:
+            field_dict["eviction_priority"] = eviction_priority
 
         return field_dict
 
@@ -125,6 +139,13 @@ class CreateAppRequest:
 
         warm_snapshot_min_ms = d.pop("warm_snapshot_min_ms", UNSET)
 
+        _eviction_priority = d.pop("eviction_priority", UNSET)
+        eviction_priority: CreateAppRequestEvictionPriority | Unset
+        if isinstance(_eviction_priority, Unset):
+            eviction_priority = UNSET
+        else:
+            eviction_priority = check_create_app_request_eviction_priority(_eviction_priority)
+
         create_app_request = cls(
             slug=slug,
             type_=type_,
@@ -136,6 +157,7 @@ class CreateAppRequest:
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
+            eviction_priority=eviction_priority,
         )
 
         create_app_request.additional_properties = d
