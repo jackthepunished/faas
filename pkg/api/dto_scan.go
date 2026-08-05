@@ -21,7 +21,7 @@ package api
 // Scan.Status (see below).
 
 // ScanResult is the customer-facing wire shape of one
-// deployment's grype scan (issue #464 / ADR-055, PR-1).
+// deployment's grype scan (issue #464 / ADR-075, PR-1).
 // `Status` is the closed enum that mirrors the DB's
 // `deployments.scan_status` column. The `omitempty` rules:
 //
@@ -87,7 +87,7 @@ type ScanResult struct {
 }
 
 // SeverityCounts is the per-severity bucket count of CVEs
-// (issue #464 / ADR-055). The shape mirrors Grype's closed
+// (issue #464 / ADR-075). The shape mirrors Grype's closed
 // vocabulary; the in-repo normalizeGrypeSeverity collapses
 // "Negligible" into LOW so the dashboard's "LOW" bucket
 // absorbs both (the Negligible split is omitted — there is
@@ -107,23 +107,25 @@ type SeverityCounts struct {
 }
 
 // Vulnerability is one row in the scan's CVE list
-// (issue #464 / ADR-055, PR-1).
+// (issue #464 / ADR-075, PR-1).
 //
 // FixedIn is the upstream's "fixed in" version string.
 // Empty when Grype reports no fix is available (e.g. a
 // disputed CVE) — the dashboard renders "no fix" for
 // empty FixedIn.
 //
-// Paths is the list of filesystem paths inside the
-// app-layer squashfs where the vulnerable package was
-// found. Grype's match has a single `artifact.locations`
-// array; we copy it verbatim. Empty when Grype can't
-// pin a file location.
+// Paths: PER-DESIGN ABSENT. `defaultGrypeRun` (pkg/imaged/
+// grype.go:36-40) only parses `vulnerability.severity` per
+// match — the per-file `artifact.locations` array that
+// Grype emits is dropped at parse time. Promising it on the
+// wire would mislead the dashboard's "top 10" view into
+// rendering an empty list. Persist the slim shape now;
+// surface path-level data behind a follow-up PR that
+// extends `grypeMatch` to capture `artifact.locations`.
 type Vulnerability struct {
-	ID       string   `json:"id"`              // e.g. "CVE-2024-1234"
-	Severity string   `json:"severity"`        // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
-	Package  string   `json:"package"`         // e.g. "openssl"
-	Version  string   `json:"version"`         // e.g. "1.1.1k-7"
-	FixedIn  string   `json:"fixed_in,omitempty"`
-	Paths    []string `json:"paths,omitempty"`
+	ID       string `json:"id"`       // e.g. "CVE-2024-1234"
+	Severity string `json:"severity"` // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+	Package  string `json:"package"`  // e.g. "openssl"
+	Version  string `json:"version"`  // e.g. "1.1.1k-7"
+	FixedIn  string `json:"fixed_in,omitempty"`
 }

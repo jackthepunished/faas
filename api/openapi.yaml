@@ -5621,10 +5621,6 @@ components:
         package:  { type: string, description: "Vulnerable package name (e.g. openssl)." }
         version:  { type: string, description: "Installed package version (e.g. 1.1.1k-7)." }
         fixed_in: { type: [string, "null"], description: "Upstream version the fix landed in. Empty when no fix is available (e.g. disputed CVE) — the dashboard renders 'no fix' for empty." }
-        paths:
-          type: array
-          items: { type: string }
-          description: List of filesystem paths inside the app-layer squashfs where the vulnerable package was found. Empty when Grype can't pin a file location.
 
     Sidecar:
       description: |
