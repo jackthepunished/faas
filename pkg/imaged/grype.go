@@ -35,8 +35,13 @@ import (
 // the data the dashboard's per-row "Path" column renders. The
 // fail-closed base-ext4 sidecar (writeScanSidecar) only reads
 // vulnerability.severity, so the existing base-factory scan contract
-// is byte-identical — the new fields flow through ScanResult.Vulnerabilities
-// for the per-deploy surface only.
+// is semantically equivalent for any given input — the new fields
+// flow through ScanResult.Vulnerabilities for the per-deploy
+// surface only. (The legacy sidecar JSON was never byte-identical
+// across runs anyway: writeScanSidecar marshals a map[string]int
+// and Go's map iteration order is randomised; the consumer
+// reads via json.Unmarshal into a map and never inspects key
+// order.)
 type grypeMatch struct {
 	Vulnerability struct {
 		ID       string `json:"id"`
@@ -214,13 +219,14 @@ func vulnPaths(locs []grypeLocation) []string {
 // The base-ext4 sidecar write at base_stage.go::writeScanSidecar
 // reads SeverityCounts.Critical / .High / .Medium / .Low / .Unknown
 // to build the legacy `findings map[string]int` payload — the
-// pre-PR-2 sidecar JSON shape is byte-identical for a given
-// input. The per-deploy surface (PR-3's deploy-complete hook
-// in handler.go::runDeployScan → state.Store) marshals the
-// full struct into the deployments.scan_result jsonb; the wire
-// DTO (api.ScanResult) decodes both fields back. The dashboard's
-// "top 10 by severity" view is a handler-edge cap (per-extend);
-// the wire keeps the full list.
+// pre-PR-2 sidecar JSON shape is semantically equivalent for a
+// given input (same key set + values). The per-deploy surface
+// (PR-3's deploy-complete hook in handler.go::runDeployScan →
+// state.Store) marshals the full struct into the
+// deployments.scan_result jsonb; the wire DTO (api.ScanResult)
+// decodes both fields back. The dashboard's "top 10 by severity"
+// view is a handler-edge cap (per-extend); the wire keeps the
+// full list.
 //
 // Error carries the grype-runner error message on the
 // scan_status='failed' path (PR-3 retry-exhausted backoff).
@@ -271,9 +277,13 @@ func (s *ScanResult) bumpSeverity(severity string) {
 // `map[string]int` shape the legacy base-ext4 scan sidecar
 // expects (consumed by vmmd's bringUpScanCheck at
 // pkg/fcvm/manager.go). The keys are the uppercase closed
-// enum (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN). The map shape
-// stays byte-identical to the pre-PR-2 output for any given
-// input so the sidecar contract is preserved.
+// enum (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN). The map shape is
+// semantically equivalent to the pre-PR-2 output for any given
+// input (same key set + values) so the sidecar contract is
+// preserved; the marshal output is NOT byte-identical across
+// runs because Go's map iteration order is randomised — the
+// consumer reads via json.Unmarshal into a map and never
+// inspects key order.
 func (s *ScanResult) toMap() map[string]int {
 	if s == nil {
 		return nil

@@ -3,17 +3,21 @@ package imaged
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/rootfs"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/storage"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // minimalManifestPuller implements just enough to satisfy oci.ManifestPuller
@@ -1218,4 +1222,126 @@ func TestResolveParentRef_HonorsEnvOverride(t *testing.T) {
 			t.Errorf("got %q, want const passthrough", got)
 		}
 	})
+}
+
+// TestWriteScanSidecar_KeySetStable pins the base-ext4 scan sidecar
+// contract (issue #464 / PR-B acceptance): the sidecar JSON's
+// `findings` map carries the closed-enum keys
+// (CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN) with the values from
+// SeverityCounts. The consumer (vmmd's bringUpScanCheck at
+// pkg/fcvm/manager.go) reads the JSON via json.Unmarshal into a
+// map[string]int and never inspects key order — Go's randomised
+// map iteration means the marshal output is NOT byte-identical
+// across runs, but the key set + values must be stable.
+//
+// A regression that drops a key from toMap() (e.g. removes the
+// Unknown bucket) or renames a Severity* constant surfaces here
+// as a missing-key assertion. The test runs writeScanSidecar
+// twice on independent storage backends so both reads exercise
+// the same write path; the pin is the key SET + per-key value
+// (not byte-equality of the raw bytes).
+func TestWriteScanSidecar_KeySetStable(t *testing.T) {
+	const baseKey = "base/runtime.ext4"
+	const ref = "ghcr.io/onebox-faas/builder-base:latest"
+	const outImage = "/srv/fc/base/runtime.ext4"
+
+	want := &ScanResult{
+		SeverityCounts: SeverityCounts{
+			Critical: 1, High: 2, Medium: 3, Low: 4, Unknown: 5,
+		},
+	}
+
+	// Two independent runs so a future refactor that introduces a
+	// non-deterministic source (e.g. a map seeded from a hash of the
+	// input bytes) cannot mask a key-set regression behind a single
+	// passing run.
+	for _, run := range []string{"run-1", "run-2"} {
+		t.Run(run, func(t *testing.T) {
+			be, err := storage.NewLocalStorageBackend(t.TempDir())
+			if err != nil {
+				t.Fatalf("NewLocalStorageBackend: %v", err)
+			}
+			h := &Handler{
+				log:     silentLogger(),
+				storage: be,
+				grypeRun: func(_ context.Context, _ string) (*ScanResult, error) {
+					return want, nil
+				},
+			}
+
+			if err := h.writeScanSidecar(context.Background(), baseKey, ref, outImage); err != nil {
+				t.Fatalf("writeScanSidecar: %v", err)
+			}
+
+			// Read the sidecar back from storage at the canonical key.
+			rc, err := be.Get(context.Background(), wire.ScanKeyForBaseKey(baseKey))
+			if err != nil {
+				t.Fatalf("Get scan sidecar: %v", err)
+			}
+			defer rc.Close()
+			sidecarBytes, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatalf("read scan sidecar: %v", err)
+			}
+
+			// Unmarshal into the same shape writeScanSidecar marshals
+			// (struct{Image,Findings,ScannedAt}). The findings map is
+			// the load-bearing field for vmmd's bringUpScanCheck.
+			var got struct {
+				Image     string         `json:"image"`
+				Findings  map[string]int `json:"findings"`
+				ScannedAt time.Time      `json:"scanned_at"`
+			}
+			if err := json.Unmarshal(sidecarBytes, &got); err != nil {
+				t.Fatalf("unmarshal sidecar: %v (bytes=%s)", err, string(sidecarBytes))
+			}
+
+			// Image field carries the OCI ref for dashboard
+			// traceability (writeScanSidecar's `image` field is
+			// sourced from `ref`, NOT from outImage — Critical #1
+			// of PR #385).
+			if got.Image != ref {
+				t.Errorf("image = %q, want %q", got.Image, ref)
+			}
+
+			// Closed-enum key set: every Severity* constant must
+			// be present in the marshal output, and ONLY those.
+			wantKeys := map[string]int{
+				SeverityCritical: 1,
+				SeverityHigh:     2,
+				SeverityMedium:   3,
+				SeverityLow:      4,
+				SeverityUnknown:  5,
+			}
+			if len(got.Findings) != len(wantKeys) {
+				t.Errorf("findings has %d keys, want %d (keys=%v)",
+					len(got.Findings), len(wantKeys), keysOf(got.Findings))
+			}
+			for k, wantVal := range wantKeys {
+				if gotVal, ok := got.Findings[k]; !ok {
+					t.Errorf("findings missing key %q (present keys=%v)", k, keysOf(got.Findings))
+				} else if gotVal != wantVal {
+					t.Errorf("findings[%q] = %d, want %d", k, gotVal, wantVal)
+				}
+			}
+			// Also assert the inverse: no extra keys snuck in via a
+			// future refactor (e.g. a typo'd severity constant).
+			for k := range got.Findings {
+				if _, ok := wantKeys[k]; !ok {
+					t.Errorf("findings has unexpected key %q (close-enum violation)", k)
+				}
+			}
+		})
+	}
+}
+
+// keysOf returns the sorted keys of a map[string]int for stable
+// test diagnostics (Go map iteration order is randomised).
+func keysOf(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
