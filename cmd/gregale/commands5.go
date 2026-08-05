@@ -437,7 +437,7 @@ func cmdAppScale(slug string, args []string) int {
 	min := fs.Int("min", 0, "min instances kept warm (Pro/Scale only; 0 = scale to zero)")
 	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
 	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
-	// Issue #470 / PR C / ADR-072: warm-snapshot opt-in flags.
+	// Issue #470 / PR C / ADR-074: warm-snapshot opt-in flags.
 	// Mirror commands2.go:cmdApp so `gregale app <slug> scale --warm-snapshot`
 	// is the canonical ES-2.4 form.
 	warm := fs.Bool("warm-snapshot", false, "enable warm-snapshot tier (Pro/Scale only)")

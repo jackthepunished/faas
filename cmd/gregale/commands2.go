@@ -87,7 +87,7 @@ const (
 // (ux_spec §6.5): N instances stay RUNNING regardless of idle
 // timeout. 0 = scale to zero (default).
 //
-// `--warm-snapshot` / `--no-warm-snapshot` (issue #470 / PR C / ADR-072)
+// `--warm-snapshot` / `--no-warm-snapshot` (issue #470 / PR C / ADR-074)
 // opt the app into the warm tier: Park captures a warm-row snapshot
 // alongside the init row, and the wake path prefers warm → init
 // → cold-boot. `--warm-snapshot-min-requests N` and
@@ -123,7 +123,7 @@ func cmdApp(args []string) int {
 	// --autoscale-target-rps=0).
 	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
 	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
-	// Issue #470 / PR C / ADR-072: warm-snapshot opt-in flags. The
+	// Issue #470 / PR C / ADR-074: warm-snapshot opt-in flags. The
 	// pair is mutually exclusive — passing both is a usage error
 	// rather than a silent last-one-wins. Visit-flag detection lets
 	// the user distinguish "unset" (no patch) from explicit true/false.
@@ -237,7 +237,7 @@ func cmdApp(args []string) int {
 		} else {
 			fmt.Printf("%-30s %s\n", "autoscale target cpu:", "disabled")
 		}
-		// Issue #470 / PR C / ADR-072: warm-snapshot state. Mirror
+		// Issue #470 / PR C / ADR-074: warm-snapshot state. Mirror
 		// the autoscale rendering: enabled/disabled for the toggle,
 		// bare value for the gating thresholds.
 		if a.WarmSnapshotEnabled {

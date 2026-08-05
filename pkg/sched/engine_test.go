@@ -3321,12 +3321,12 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 }
 
 // TestCaptureWarmSnapshot_EmitsAuditPromoted (issue #470 / PR C /
-// ADR-072) pins the success-path audit emit from captureWarmSnapshot
+// ADR-074) pins the success-path audit emit from captureWarmSnapshot
 // Locked. The audit kind is app.warm_snapshot_promoted (subject =
 // &app.AccountID, payload includes app_id, deployment_id, tier
 // and the per-app min_requests/min_ms gates). Walks ListEvents
 // keyed by AccountID UUID — the subject shape mirrors
-// app.updated's account-scoped listing per ADR-072 §3.2.
+// app.updated's account-scoped listing per ADR-074 §3.2.
 func TestCaptureWarmSnapshot_EmitsAuditPromoted(t *testing.T) {
 	store := state.NewMemStore()
 	acct, app, dep := seedApp(t, store, api.PlanPro, 256, 5)
@@ -3384,7 +3384,7 @@ func TestCaptureWarmSnapshot_EmitsAuditPromoted(t *testing.T) {
 }
 
 // TestCaptureWarmSnapshot_EmitsErrorCounter (issue #470 / PR C /
-// ADR-072) pins the failure-path ops counter increment. Mirrors the
+// ADR-074) pins the failure-path ops counter increment. Mirrors the
 // TestCaptureWarmSnapshot_FailureDestroysVM shape but asserts on
 // /metrics rather than audit-events — the failure path cannot
 // reliably emit app.warm_snapshot_disabled (the app is still

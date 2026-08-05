@@ -204,7 +204,7 @@ func (l *Loop) runGCTick(ctx context.Context, now time.Time) {
 	}
 
 	// Step A: per-app per-tier floor. Always runs.
-	// Issue #470 / PR C / ADR-072: replaced
+	// Issue #470 / PR C / ADR-074: replaced
 	// perAppKeepCurrentPrevious with perAppKeepTierFloor so
 	// warm-enabled apps keep 2 warm + 2 init and warm-disabled
 	// apps drop all warm rows + keep 2 init only. The legacy
@@ -301,7 +301,7 @@ func (l *Loop) runFCSweep(ctx context.Context) bool {
 // GC; we log + skip in that case (a remote registry has its own
 // lifecycle).
 //
-// Issue #470 / PR C / ADR-072: the tuple's Tier field drives the
+// Issue #470 / PR C / ADR-074: the tuple's Tier field drives the
 // storage key — warm-tier targets delete WarmSnapMemKey +
 // WarmSnapVMStateKey (under /snap/<dep>/warm/), init-tier targets
 // delete SnapMemKey + SnapVMStateKey (under /snap/<dep>/). The

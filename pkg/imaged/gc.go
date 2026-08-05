@@ -22,7 +22,7 @@ import (
 // and app slug are what the filesystem cleanup needs (snap blobs are
 // keyed on deployment id, drive1 ext4 layers on (slug, deployment id)).
 //
-// Tier (issue #470 / PR C / ADR-072) drives the storage key the
+// Tier (issue #470 / PR C / ADR-074) drives the storage key the
 // filesystem cleanup uses: warm-tier targets delete WarmSnapMemKey +
 // WarmSnapVMStateKey; init-tier targets delete SnapMemKey +
 // SnapVMStateKey. Per-app ext4 is always deleted (it's shared across
@@ -34,7 +34,7 @@ type deleteTarget struct {
 	Tier         string
 }
 
-// perAppKeepTierFloor (issue #470 / PR C / ADR-072) returns the
+// perAppKeepTierFloor (issue #470 / PR C / ADR-074) returns the
 // snapshot IDs that fall outside the per-tier retention window.
 // The function is pure; it does not mutate the input slice.
 //
@@ -174,7 +174,7 @@ func evictOldestFromHeaviestAccount(rows []state.SnapshotForGC) []deleteTarget {
 	}
 	// Per (appID, snap-row): sort OLDEST-first; pick the per-app floor
 	// (keep newest N=2) and from the remainder take the single oldest.
-	// Issue #470 / PR C / ADR-072: warm-enabled apps keep 2 warm + 2
+	// Issue #470 / PR C / ADR-074: warm-enabled apps keep 2 warm + 2
 	// init (4 total) under pressure; warm-disabled keep 2 init only.
 	// The single evicted row is therefore drawn from whatever pool
 	// exceeds its per-tier floor.
@@ -225,7 +225,7 @@ func evictOldestFromHeaviestAccount(rows []state.SnapshotForGC) []deleteTarget {
 	}}
 }
 
-// perAppEvictionCandidates (issue #470 / PR C / ADR-072) ranks the
+// perAppEvictionCandidates (issue #470 / PR C / ADR-074) ranks the
 // snapshots of a single app by eviction eligibility under per-tier
 // floors. Sorted oldest-first so the caller can take candidates[0] for
 // the single-eviction path. The slice carries only rows that are

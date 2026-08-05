@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Warm-snapshot tier ops surface (issue #470 / PR C / ADR-072). Four panels: warm-capture errors per reason, guest-init duration percentiles by app, wake-tier mix, and snapshot-population-by-tier counter. Each panel exists because one of the three audit kinds (promoted/stale/disabled) plus the wake-path tier selection drives a Grafana observable — operators tail the dashboard to see fleet-wide behaviour without grepping audit-events. Bucket set on the guest-init histogram is spec §6.3 verbatim (the 0.3/0.35 pair brackets the 350 ms warm-wake budget).",
+  "description": "Warm-snapshot tier ops surface (issue #470 / PR C / ADR-074). Four panels: warm-capture errors per reason, guest-init duration percentiles by app, wake-tier mix, and snapshot-population-by-tier counter. Each panel exists because one of the three audit kinds (promoted/stale/disabled) plus the wake-path tier selection drives a Grafana observable — operators tail the dashboard to see fleet-wide behaviour without grepping audit-events. Bucket set on the guest-init histogram is spec §6.3 verbatim (the 0.3/0.35 pair brackets the 350 ms warm-wake budget).",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -367,7 +367,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "faas warm snapshot (PR C / ADR-072)",
+  "title": "faas warm snapshot (PR C / ADR-074)",
   "uid": "faas-warm-snapshot-pr-c",
   "version": 1,
   "weekStart": ""

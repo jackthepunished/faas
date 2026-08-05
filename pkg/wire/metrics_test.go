@@ -974,4 +974,3 @@ func TestOpsMetrics_WakeSnapshotTierNilSafe(t *testing.T) {
 		t.Errorf("nil.WakeSnapshotTier = %v, want nil", got)
 	}
 }
-}

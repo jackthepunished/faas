@@ -1,7 +1,7 @@
 package main
 
 // Tests for the app.warm_snapshot_disabled audit emit
-// (issue #470 / PR C / ADR-072 §3.2). The handler writes the row
+// (issue #470 / PR C / ADR-074 §3.2). The handler writes the row
 // only on the true→false flip; tests cover both branches.
 //
 // setup()'s seeded app defaults WarmSnapshotEnabled=false, so to
@@ -38,10 +38,10 @@ func seedWarmEnabledApp(t *testing.T, e testEnv, slug string) {
 }
 
 // TestUpdateApp_WarmSnapshotDisabledEmitsAudit locks the
-// PR C / ADR-072 §3.2 emit: when PATCH warm_snapshot_enabled=false
+// PR C / ADR-074 §3.2 emit: when PATCH warm_snapshot_enabled=false
 // lands on an app that was previously true, the handler writes
 // ONE app.warm_snapshot_disabled row (in addition to the standard
-// app.updated row). Subject = &acct.ID per ADR-072.
+// app.updated row). Subject = &acct.ID per ADR-074.
 func TestUpdateApp_WarmSnapshotDisabledEmitsAudit(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	seedWarmEnabledApp(t, e, "warm-disabled-emit")
@@ -106,7 +106,7 @@ func TestUpdateApp_WarmSnapshotDisabledEmitsAudit(t *testing.T) {
 // branch: PATCH with WarmSnapshotEnabled UNSET (other fields
 // changing) MUST NOT emit app.warm_snapshot_disabled — only the
 // app.updated row lands. This locks the operator-no-intent-to-flip
-// branch from ADR-072 §3.2.
+// branch from ADR-074 §3.2.
 func TestUpdateApp_WarmSnapshotDisabledNoEmit(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	mustSeedApp(t, e, "warm-no-emit")

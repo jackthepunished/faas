@@ -96,7 +96,7 @@ type OpsMetrics struct {
 	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
 	// panel is the §12 warm-capture-error alert's primary signal.
 	warmSnapshotErrors *prometheus.CounterVec
-	// guestInitDuration (issue #470 / PR C / ADR-072) measures the
+	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
 	// by {app, runner} so a Grafana panel can split per runtime. The
@@ -106,7 +106,7 @@ type OpsMetrics struct {
 	// 0.3/0.35 pair is intentional (the 350 ms warm-wake budget needs
 	// tight resolution near 0.35).
 	guestInitDuration *prometheus.HistogramVec
-	// wakeSnapshotTier (issue #470 / PR C / ADR-072) — closed-set
+	// wakeSnapshotTier (issue #470 / PR C / ADR-074) — closed-set
 	// counter for the warm-vs-init-vs-cold-boot choice Engine.usableSnapshotForWake
 	// makes on every wake. Labels ∈ {warm, init, cold_boot_fallback}.
 	// Pre-instantiated at boot so the wake-tier-mix panel has zero
@@ -805,18 +805,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")
-	// Issue #470 / PR C / ADR-072: guest-init duration histogram.
+	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    prefix + "_guest_init_duration_seconds",
-		Help:    "Wall-clock seconds between the vmmd DGRAM recv of the framework-ready signal and the Manager.MarkInstanceFrameworkReady return (issue #470 / PR C / ADR-072). Labelled by {app, runner} — the empty-tuple sentinel is pre-instantiated so dashboards render from boot. Bucket set is spec §6.3 verbatim.",
+		Help:    "Wall-clock seconds between the vmmd DGRAM recv of the framework-ready signal and the Manager.MarkInstanceFrameworkReady return (issue #470 / PR C / ADR-074). Labelled by {app, runner} — the empty-tuple sentinel is pre-instantiated so dashboards render from boot. Bucket set is spec §6.3 verbatim.",
 		Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.35, 0.5, 0.8, 1, 1.5, 3, 5},
 	}, []string{"app", "runner"})
 	guestInitDuration.WithLabelValues("", "")
-	// Issue #470 / PR C / ADR-072: wake tier mix counter.
+	// Issue #470 / PR C / ADR-074: wake tier mix counter.
 	wakeSnapshotTier := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_snapshot_tier_total",
-		Help: "Count of wakes that picked a given snapshot tier (issue #470 / PR C / ADR-072), labelled by tier ∈ {warm, init, cold_boot_fallback}. Pre-instantiated at boot so the wake-tier-mix Grafana panel has zero rows from idle fleet, non-zero as soon as production wakes happen.",
+		Help: "Count of wakes that picked a given snapshot tier (issue #470 / PR C / ADR-074), labelled by tier ∈ {warm, init, cold_boot_fallback}. Pre-instantiated at boot so the wake-tier-mix Grafana panel has zero rows from idle fleet, non-zero as soon as production wakes happen.",
 	}, []string{"tier"})
 	wakeSnapshotTier.WithLabelValues("warm")
 	wakeSnapshotTier.WithLabelValues("init")
@@ -1886,7 +1886,7 @@ func (m *OpsMetrics) WarmSnapshotErrors(reason string) prometheus.Counter {
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram
-// observer for guest-init boot duration (issue #470 / PR C / ADR-072).
+// observer for guest-init boot duration (issue #470 / PR C / ADR-074).
 // The empty-tuple sentinel ("", "") is pre-instantiated at boot so
 // dashboards render from a fresh process. nil-safe — returns nil if
 // m is nil (callers must use Observe with nil-safe wrappers if they
@@ -1899,7 +1899,7 @@ func (m *OpsMetrics) GuestInitDuration(app, runner string) prometheus.Observer {
 }
 
 // WakeSnapshotTier returns the per-tier counter the engine increments
-// on every wake (issue #470 / PR C / ADR-072). The closed set
+// on every wake (issue #470 / PR C / ADR-074). The closed set
 // {warm, init, cold_boot_fallback} is pre-instantiated at boot so the
 // wake-tier-mix Grafana panel has zero rows from idle fleet.
 func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {

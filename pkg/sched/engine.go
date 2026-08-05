@@ -787,7 +787,7 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID string) (WakeResult, e
 }
 
 // AdmitInstanceForDeployment is the floor-trigger entry point that
-// admits a specific deployment (issue #557 closure / ADR-072).
+// admits a specific deployment (issue #557 closure / ADR-074).
 // The signature differs from AdmitInstance by accepting an explicit
 // deploymentID; the floor trigger's per-deployment sweep threads the
 // deployment it wants woke. The wake path's per-request target is
@@ -1027,7 +1027,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// directly. The warm row is still on disk for the customer's
 	// eventual re-upgrade (sticky-on-downgrade, ADR-055 §5).
 	//
-	// Issue #470 / PR C / ADR-072: the third return value is the
+	// Issue #470 / PR C / ADR-074: the third return value is the
 	// chosen tier ∈ {warm, init, cold_boot_fallback}. Increment the
 	// wake-tier-mix counter so the dashboard shows the ratio of warm
 	// restores vs init restores vs cold-boot fallbacks. nil-safe
@@ -3065,12 +3065,12 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 	// violation on (deployment_id, tier) with imaged's row.
 	vmstatePath := SnapDir() + "/" + ins.DeploymentID + "/warm/vmstate"
 	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstatePath, b, state.SnapshotTierWarm)
-	// Issue #470 / PR C / ADR-072: emit app.warm_snapshot_promoted
+	// Issue #470 / PR C / ADR-074: emit app.warm_snapshot_promoted
 	// so operators can grep gregale audit-events --kind-prefix
 	// warm_snapshot to see lifecycle activity. Subject is
 	// &app.AccountID (matches app.updated's account-scoped shape at
 	// handlers_ext.go:569 — diverges from app.characterized's nil
-	// subject deliberately for account-scoped listing per ADR-072
+	// subject deliberately for account-scoped listing per ADR-074
 	// §3.2). MemBytes comes from b; the snap row id is unknown at
 	// this point (imaged's subscriber writes it), so payload
 	// carries the deployment id instead.
@@ -3349,7 +3349,7 @@ func (e *Engine) loadAPIEnv(ctx context.Context, accountID, appID string) []fcvm
 // ∈ {warm, init, cold_boot_fallback}; the caller (the lone
 // usableSnapshotForWake call site in this file) is responsible for
 // incrementing the WakeSnapshotTier counter (issue #470 / PR C /
-// ADR-072). Returning the tier from this function — instead of
+// ADR-074). Returning the tier from this function — instead of
 // calling the metric accessor directly — keeps the function
 // testable without a metric registry.
 func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan string) (state.Snapshot, bool, string) {
@@ -3360,7 +3360,7 @@ func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan s
 		}
 		return snap, true, wakeTierInit
 	}
-	// PR C / ADR-072: prefer warm when available. LatestSnapshot
+	// PR C / ADR-074: prefer warm when available. LatestSnapshot
 	// already ranks warm > init, but checking tier explicitly lets us
 	// distinguish warm-wake from init-wake for the operator metric.
 	warm, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierWarm)
@@ -3398,7 +3398,7 @@ const (
 	StuckSnapshotTimeout StuckReason = "snapshot_timeout"
 )
 
-// Wake-tier label values (issue #470 / PR C / ADR-072). These
+// Wake-tier label values (issue #470 / PR C / ADR-074). These
 // match the pre-instantiated Prometheus counter labels
 // {warm, init, cold_boot_fallback} on
 // {prefix}_wake_snapshot_tier_total. Kept as a typed string const

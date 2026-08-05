@@ -976,14 +976,14 @@ func BenchmarkLoopRunGCTick_FallbackSQLCost(b *testing.B) {
 }
 
 // TestGC_PerAppKeepTierFloor_Enabled2Plus2 (issue #470 / PR C /
-// ADR-072) verifies the warm-enabled app policy: keep the 2
+// ADR-074) verifies the warm-enabled app policy: keep the 2
 // newest warm-tier rows + the 2 newest init-tier rows; everything
 // older in either tier is dropped. 4 warm + 4 init rows seeded →
 // 4 rows dropped, 4 rows retained.
 func TestGC_PerAppKeepTierFloor_Enabled2Plus2(t *testing.T) {
 	store := state.NewMemStore()
 	acct, _ := store.CreateAccount(context.Background(), "warm@x.com", "pro")
-	// Issue #470 / PR C / ADR-072: enable warm-tier retention for
+	// Issue #470 / PR C / ADR-074: enable warm-tier retention for
 	// this app. The MemStore's AppColumnSet has WarmSnapshotEnabled
 	// (verified by PR #525 migrations).
 	app, err := store.CreateApp(context.Background(), state.App{
@@ -1066,7 +1066,7 @@ func TestGC_PerAppKeepTierFloor_Enabled2Plus2(t *testing.T) {
 }
 
 // TestGC_PerAppKeepTierFloor_Disabled2Init (issue #470 / PR C /
-// ADR-072) verifies the warm-disabled policy: keep only the 2
+// ADR-074) verifies the warm-disabled policy: keep only the 2
 // newest init-tier rows; every warm-tier row (which the app is
 // not opted in to) is dropped, plus the older init rows.
 func TestGC_PerAppKeepTierFloor_Disabled2Init(t *testing.T) {
@@ -1142,7 +1142,7 @@ func TestGC_PerAppKeepTierFloor_Disabled2Init(t *testing.T) {
 }
 
 // TestGC_PerAppKeepTierFloor_MixedApps (issue #470 / PR C /
-// ADR-072) verifies that the per-app floor is applied INDEPENDENTLY
+// ADR-074) verifies that the per-app floor is applied INDEPENDENTLY
 // for each app — a warm-enabled app's tier floors do not affect a
 // warm-disabled app in the same tenant.
 func TestGC_PerAppKeepTierFloor_MixedApps(t *testing.T) {
@@ -1227,7 +1227,7 @@ func TestGC_PerAppKeepTierFloor_MixedApps(t *testing.T) {
 }
 
 // TestDeleteSnapshotsAndFiles_TierAwareWarm (issue #470 / PR C /
-// ADR-072) verifies that a warm-tier eviction target's storage
+// ADR-074) verifies that a warm-tier eviction target's storage
 // cleanup uses WarmSnapMemKey + WarmSnapVMStateKey, NOT the init
 // paths — and vice versa for an init target. Drops files at
 // canonical warm-tier keys and asserts init keys remain untouched.

@@ -3,7 +3,7 @@
 Grafana 11 export. Panels cover all 7 of the spec §12 dashboard rows
 that are scorable today; one row remains deferred (rationale below).
 
-## `warm-snapshot.json` (issue #470 / PR C / ADR-072)
+## `warm-snapshot.json` (issue #470 / PR C / ADR-074)
 
 Four-panel dashboard for the warm-snapshot tier ops surface: warm-capture
 errors per reason (`*_warm_snapshot_errors_total{reason}`), guest-init

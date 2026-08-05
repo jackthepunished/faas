@@ -729,7 +729,7 @@ func TestCmdAppScale_ForwardsExplicitFlags(t *testing.T) {
 	}
 }
 
-// --- issue #470 PR C / ADR-072: warm-snapshot opt-in flags -----------------
+// --- issue #470 PR C / ADR-074: warm-snapshot opt-in flags -----------------
 
 // TestCmdAppScale_WarmSnapshotEnabledTrue pins that --warm-snapshot
 // translates to a pointer-to-true on the wire (so apid can distinguish

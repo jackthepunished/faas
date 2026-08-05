@@ -586,7 +586,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"old":    oldApp,
 		"new":    newApp,
 	})
-	// Issue #470 / PR C / ADR-072: emit a second audit row when the
+	// Issue #470 / PR C / ADR-074: emit a second audit row when the
 	// warm-snapshot opt-in flips true → false. The app.updated
 	// row already carries the old/new snapshot of warm_snapshot_
 	// enabled; this row is a single-purpose, single-keyword-
@@ -673,7 +673,7 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct stat
 	writeJSON(w, http.StatusOK, s.deploymentResponse(d))
 }
 
-// updateDeploymentMinInstances (issue #557 closure / ADR-072) is the
+// updateDeploymentMinInstances (issue #557 closure / ADR-074) is the
 // PATCH /v1/deployments/{id} handler. The only mutable field on a
 // deployment post-create is the cold-wake floor (min_instances);
 // image / digest / overrides / sidecars stay immutable (a new
@@ -689,7 +689,7 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct stat
 //   - 400 on a malformed body.
 //
 // Audit: emits a deployment.min_instances_changed row via the
-// existing auditor (kind list frozen by ADR-072 §Decision 6).
+// existing auditor (kind list frozen by ADR-074 §Decision 6).
 func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
 	d, err := s.store.DeploymentByID(ctx(r), id)

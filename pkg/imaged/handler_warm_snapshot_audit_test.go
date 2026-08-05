@@ -1,13 +1,13 @@
 package imaged
 
 // TestMarkFCSnapshotsStale_EmitsAudit (issue #470 / PR C /
-// ADR-072) pins the imaged-side audit emit from
+// ADR-074) pins the imaged-side audit emit from
 // MarkFCSnapshotsStale. When the sweep marks N rows stale and
 // the Handler has an audit, the function emits one
 // app.warm_snapshot_stale row per app that surfaced in the
 // post-mark GC projection — i.e. apps with at least one
 // SURVIVING non-stale row, since ListSnapshotsForGC filters
-// stale=false (the ADR-072 §3.2 caveat: an app whose entire
+// stale=false (the ADR-074 §3.2 caveat: an app whose entire
 // fleet goes stale in one sweep receives no audit row, only
 // the fleet-level counter).
 //

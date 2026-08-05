@@ -478,7 +478,7 @@ func (s *Server) FrameworkReady(ctx context.Context, req *vmmdpb.FrameworkReadyR
 			WithDocs("https://" + wire.DocsHost + "/vmmd#framework_ready")
 		return nil, grpcerr.ToStatus(err)
 	}
-	// Issue #470 / PR C / ADR-072: observe the wall-clock guest-init
+	// Issue #470 / PR C / ADR-074: observe the wall-clock guest-init
 	// duration. The warmup ms surfaced by guest-init is the authoritative
 	// in-guest timer (boot clock from VM start to framework_ready send);
 	// the server-side elapsed is the additional round-trip from DGRAM recv
