@@ -294,7 +294,19 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 			"Invalid request", "malformed JSON body"))
 		return
 	}
-	presented := authcode.HashRecoveryCode(req.Code)
+	// Hash the presented code with the per-process HMAC key.
+	// The HMAC key is loaded at apid boot via cmd/apid/main.go
+	// (FAAS_MFA_RECOVERY_HMAC_KEY / /var/lib/faas/recovery-hmac.key).
+	// If it is missing the boot refuses to start, so this path
+	// can only fail on (a) a programming error — secret unset
+	// at test time without SetHMACSecret — or (b) a runtime
+	// reset, neither of which is reachable in production.
+	presented, err := authcode.HashRecoveryCode(req.Code)
+	if err != nil {
+		s.log.Error("mfa.recover.hash", "err", err.Error())
+		api.WriteProblem(w, api.ErrCapacity("could not hash recovery code"))
+		return
+	}
 	// Step 1 — match without mutating. The split (match → refuse
 	// → consume) lets us reject the last-code burn atomically,
 	// rather than burning first and noticing later (issue #186
@@ -520,7 +532,18 @@ func (s *server) disableByPassword(w http.ResponseWriter, r *http.Request, acct 
 // the customer is about to ClearMFA anyway, so the locked-out
 // terminal state from /recover doesn't apply here.
 func (s *server) disableByRecoveryCode(w http.ResponseWriter, r *http.Request, acct state.Account, presented string) bool {
-	presentedHash := authcode.HashRecoveryCode(presented)
+	presentedHash, err := authcode.HashRecoveryCode(presented)
+	if err != nil {
+		// HMAC secret unset — boot-time apid refuses to start
+		// without one (cmd/apid/main.go::LoadRecoveryHMACKey);
+		// a runtime unset is a programming error. Surface as a
+		// capacity-style 5xx so the dashboard renders a retry
+		// prompt rather than silently letting the customer
+		// through with an unmatched code.
+		s.log.Error("mfa.disable.hash", "err", err.Error())
+		api.WriteProblem(w, api.ErrCapacity("could not hash recovery code"))
+		return false
+	}
 	// `remaining` is discarded on this path: the customer is about
 	// to ClearMFA anyway, so the count of codes left on the row is
 	// irrelevant. The /recover handler is the one that hands the

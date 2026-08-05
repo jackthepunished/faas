@@ -1,8 +1,12 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/base32"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +14,41 @@ import (
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
 )
+
+// recoveryHMACTestSecretOnce installs the recovery-code HMAC key
+// exactly once across the suite; tests that exercise the recovery-
+// code path call ensureRecoveryHMACTestSecret(t) at the top. The
+// shared secret ensures (key, plaintext) → deterministic digest
+// matches what NewRecoveryCodes's mint path produced.
+var recoveryHMACTestSecretOnce sync.Once
+
+// recoveryHMACTestSecretBytes is the deterministic 32-byte test key.
+var recoveryHMACTestSecretBytes = bytes.Repeat([]byte{0x44}, 32)
+
+func ensureRecoveryHMACTestSecret(t *testing.T) {
+	t.Helper()
+	recoveryHMACTestSecretOnce.Do(func() {
+		dup := bytes.Clone(recoveryHMACTestSecretBytes)
+		if err := authcode.SetHMACSecret(dup); err != nil {
+			t.Fatalf("recovery HMAC test secret: %v", err)
+		}
+	})
+}
+
+// TestMain in pkg/auth wraps every test in the suite so that the
+// recovery-HMAC key is set even before any test that forgot to call
+// ensureRecoveryHMACTestSecret. The helper is the explicit seam; the
+// TestMain is the safety net.
+func TestMain(m *testing.M) {
+	recoveryHMACTestSecretOnce.Do(func() {
+		dup := bytes.Clone(recoveryHMACTestSecretBytes)
+		if err := authcode.SetHMACSecret(dup); err != nil {
+			fmt.Fprintln(os.Stderr, "pkg/auth TestMain: SetHMACSecret:", err)
+			os.Exit(2)
+		}
+	})
+	os.Exit(m.Run())
+}
 
 // GenerateSecret returns a 32-char base32 string (160 bits / 5 = 32
 // chars, no padding). The exact length is what otpauth:// consumers
@@ -143,8 +182,15 @@ func TestNewRecoveryCodes_ShapeAndUniqueness(t *testing.T) {
 // accept lowercase. The hash of the uppercase plaintext stored at
 // enrollment must match the hash of the lowercase presented code.
 func TestHashRecoveryCode_CaseInsensitive(t *testing.T) {
-	h1 := authcode.HashRecoveryCode("ABCD2345EF")
-	h2 := authcode.HashRecoveryCode("abcd2345ef")
+	ensureRecoveryHMACTestSecret(t)
+	h1, err := authcode.HashRecoveryCode("ABCD2345EF")
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
+	h2, err := authcode.HashRecoveryCode("abcd2345ef")
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 	if string(h1) != string(h2) {
 		t.Errorf("HashRecoveryCode is case-sensitive: %x vs %x", h1, h2)
 	}
@@ -154,12 +200,16 @@ func TestHashRecoveryCode_CaseInsensitive(t *testing.T) {
 // NewRecoveryCodes: hashing the same plaintext produces the same
 // output. This is the property /v1/account/mfa/recover depends on.
 func TestHashRecoveryCode_MatchesGenerate(t *testing.T) {
+	ensureRecoveryHMACTestSecret(t)
 	plain, hashes, err := authcode.NewRecoveryCodes(4)
 	if err != nil {
 		t.Fatalf("NewRecoveryCodes: %v", err)
 	}
 	for i, p := range plain {
-		got := authcode.HashRecoveryCode(p)
+		got, err := authcode.HashRecoveryCode(p)
+		if err != nil {
+			t.Fatalf("HashRecoveryCode[%d]: %v", i, err)
+		}
 		if string(got) != string(hashes[i]) {
 			t.Errorf("hash[%d] mismatch: %x vs %x", i, got, hashes[i])
 		}

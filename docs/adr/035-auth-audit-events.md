@@ -204,3 +204,17 @@
      INSERT on every failed login creates a DoS amplifier under
      credential-stuffing. v1 emits success only; follow-up PR adds an
      async-batched writer.
+  5. **Bare SHA-256 for MFA recovery-code hashes.** Originally
+     shipped for the IAM-2 surface (issue #186). Rejected as the
+     final form: a 10-char base32 plaintext (50 bits) hashes
+     without keying — a leaked PG blob is rainbow-reversible in
+     O(1) per code. The IAM-hardening mega-PR (logical change 7)
+     upgrades to HMAC-SHA256 keyed by a per-process secret loaded
+     at apid boot. The audit-hmac.key precedent uses Warn-and-
+     continue zero-key fallback; the recovery-hmac.key path is
+     stricter — refusing to start without a real key — because
+     the recovery code is the only fallback when the customer's
+     TOTP device is lost. See `pkg/authcode/hmac.go` for the
+     loader + the `SetHMACSecret` / `HashRecoveryCode`
+     contract; `pkg/auth/hash.go` (the `HashEmail` precedent)
+     is the same pattern with different scope.

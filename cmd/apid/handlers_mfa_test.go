@@ -83,6 +83,12 @@ type mfaTestEnv struct {
 // mfa_required is false.
 func setupWithMFA(t *testing.T, plan api.Plan, mfaRequired, mfaEnrolled bool) mfaTestEnv {
 	t.Helper()
+	// Recovery-code HMAC upgrade: the production loader wires this
+	// at apid boot via loadOrGenerateRecoveryHMACKey; the test
+	// fixture has no boot path, so a sync.Once hooks it once across
+	// the suite. Using a deterministic (test-stable) key pins the
+	// digest against the test's own expectations.
+	ensureRecoveryTestSecret(t)
 	store := state.NewMemStore()
 	acct, err := store.CreateAccount(context.Background(),
 		"mfa@example.com", plan)
@@ -889,7 +895,10 @@ func TestMFARecover_StoreAtomicityOnConcurrentConsume(t *testing.T) {
 		t.Fatalf("setup: recovery code count = %d, want >= 2", len(recovCodes))
 	}
 	code := recovCodes[0]
-	presented := authcode.HashRecoveryCode(code)
+	presented, err := authcode.HashRecoveryCode(code)
+	if err != nil {
+		t.Fatalf("HashRecoveryCode(%q): %v", code, err)
+	}
 
 	type result struct {
 		matched  bool
@@ -992,7 +1001,10 @@ func TestConsumeRecoveryCode_LastFlagSemantics(t *testing.T) {
 		}
 	}
 	lastCode := recovCodes[authcode.RecoveryCodeCount-1]
-	presented := authcode.HashRecoveryCode(lastCode)
+	presented, err := authcode.HashRecoveryCode(lastCode)
+	if err != nil {
+		t.Fatalf("HashRecoveryCode(%q): %v", lastCode, err)
+	}
 
 	// Drive the store primitive directly to bypass the
 	// handler's lastCode refusal: the customer is calling
@@ -1129,4 +1141,41 @@ func mustStepUpCookie(t *testing.T, c *http.Cookie, msg string) *http.Cookie {
 		t.Fatal(msg)
 	}
 	return c
+}
+
+// recoveryTestSecretOnce ensures the per-process recovery HMAC
+// key is configured exactly once for the cmd/apid test suite.
+// HashRecoveryCode is the production entry point that returns
+// (digest, ErrNoHMACKey) when no key is loaded; the package's
+// boot-time loader (cmd/apid/main.go::loadOrGenerateRecoveryHMACKey)
+// fills that gap in production. Tests don't go through run(); so
+// this sync.Once stands in for the loader.
+//
+// The key bytes are deterministic across runs so a flaky test
+// that depends on a specific digest can pin it explicitly with
+// its own SetHMACSecret call (and reset on t.Cleanup).
+var recoveryTestSecretOnce sync.Once
+
+// recoveryTestSecretBytes is the 32-byte deterministic test key.
+// Hex-decoded from a constant so a future test that needs the
+// digest for a specific plaintext can reproduce it offline.
+var recoveryTestSecretBytes = func() []byte {
+	// 32 bytes of 0x42 — irrelevant which exact pattern as long
+	// as it's deterministic. Matches the convention used in
+	// pkg/authcode/recovery_test.go's TestMain.
+	return bytes.Repeat([]byte{0x42}, 32)
+}()
+
+// ensureRecoveryTestSecret installs the test recovery HMAC key
+// exactly once across the suite. Idempotent across test files —
+// tests that import authcode and call HashRecoveryCode share the
+// same global secret.
+func ensureRecoveryTestSecret(t *testing.T) {
+	t.Helper()
+	recoveryTestSecretOnce.Do(func() {
+		dup := bytes.Clone(recoveryTestSecretBytes)
+		if err := authcode.SetHMACSecret(dup); err != nil {
+			t.Fatalf("recovery test secret: %v", err)
+		}
+	})
 }

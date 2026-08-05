@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,32 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/authcode"
 )
+
+// TestMain installs a deterministic recovery-HMAC secret so the
+// authcode.NewRecoveryCodes + authcode.HashRecoveryCode calls in
+// this suite have a key to compute HMAC-SHA256 against. The test
+// path mirrors what pkg/authcode/recovery_test.go's TestMain
+// does in the unit-test surface; the integration surface here
+// uses a fixed 32-byte pattern because the recovery-code tests
+// only need consistency, not a per-run random key. A real
+// operational key is generated + persisted by
+// cmd/apid/main.go::loadOrGenerateRecoveryHMACKey.
+func TestMain(m *testing.M) {
+	// 32 bytes of 0x33 — deterministic across runs; any consistent
+	// non-zero pattern works.
+	secret := bytes.Repeat([]byte{0x33}, 32)
+	dup := bytes.Clone(secret)
+	// Zero the input slice after the copy (SetHMACSecret mutates
+	// the input on success — defence-in-depth with the contract).
+	for i := range secret {
+		secret[i] = 0
+	}
+	if err := authcode.SetHMACSecret(dup); err != nil {
+		fmt.Fprintln(os.Stderr, "pkg/state TestMain: SetHMACSecret:", err)
+		os.Exit(2)
+	}
+	os.Exit(m.Run())
+}
 
 // --- Account / Account.Active ------------------------------------------------
 
@@ -2847,7 +2874,10 @@ func TestConsumeRecoveryCode_HappyPath(t *testing.T) {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 
-	presented := authcode.HashRecoveryCode(plaintexts[3])
+	presented, err := authcode.HashRecoveryCode(plaintexts[3])
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("ConsumeRecoveryCode: %v", err)
@@ -2939,7 +2969,10 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 	// monotonically-decreasing `remaining` count (issue #329
 	// wires `remaining` to the mailer tone bucket).
 	for i := 0; i < authcode.RecoveryCodeCount-1; i++ {
-		presented := authcode.HashRecoveryCode(plaintexts[i])
+		presented, err := authcode.HashRecoveryCode(plaintexts[i])
+		if err != nil {
+			t.Fatalf("HashRecoveryCode[%d]: %v", i, err)
+		}
 		matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 		if err != nil {
 			t.Fatalf("burn %d: %v", i, err)
@@ -2957,7 +2990,10 @@ func TestConsumeRecoveryCode_LastCodeDetected(t *testing.T) {
 	// left" branch only fires via /disable's recovery_code path,
 	// but the store primitive must still report the post-burn
 	// count honestly so the handler can branch correctly.
-	presented := authcode.HashRecoveryCode(plaintexts[authcode.RecoveryCodeCount-1])
+	presented, err := authcode.HashRecoveryCode(plaintexts[authcode.RecoveryCodeCount-1])
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 	matched, lastCode, remaining, err := m.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("last burn: %v", err)
@@ -2992,7 +3028,10 @@ func TestConsumeRecoveryCode_RaceProtectsAgainstDoubleBurn(t *testing.T) {
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
-	presented := authcode.HashRecoveryCode(plaintexts[5])
+	presented, err := authcode.HashRecoveryCode(plaintexts[5])
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 
 	type result struct{ matched, lastCode bool }
 	results := make(chan result, 2)
@@ -3109,7 +3148,10 @@ func TestMatchRecoveryCode_NoMutation(t *testing.T) {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 	// Match the first code.
-	presented := authcode.HashRecoveryCode(plaintexts[0])
+	presented, err := authcode.HashRecoveryCode(plaintexts[0])
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Match: %v", err)
@@ -3154,7 +3196,10 @@ func TestMatchRecoveryCode_LastCodeFlag(t *testing.T) {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
 
-	presented := authcode.HashRecoveryCode(plaintexts[0])
+	presented, err := authcode.HashRecoveryCode(plaintexts[0])
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Match: %v", err)
@@ -3186,7 +3231,10 @@ func TestMatchRecoveryCode_NoMatch(t *testing.T) {
 	if err := m.SetMFASecret(ctx, acct.ID, []byte("sealed"), hashes); err != nil {
 		t.Fatalf("SetMFASecret: %v", err)
 	}
-	presented := authcode.HashRecoveryCode("DEFINITELY-NOT-A-STORED-CODE")
+	presented, err := authcode.HashRecoveryCode("DEFINITELY-NOT-A-STORED-CODE")
+	if err != nil {
+		t.Fatalf("HashRecoveryCode: %v", err)
+	}
 	matched, lastCode, err := m.MatchRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("Match: %v", err)

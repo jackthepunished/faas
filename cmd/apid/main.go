@@ -32,6 +32,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
+	"github.com/onebox-faas/faas/pkg/authcode"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
@@ -705,6 +706,47 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	auth.SetHMACSecret(auditHMACKey, log)
 
+	// Recovery-code HMAC key — closes the SHA-256 rainbow-reversal
+	// threat on a leaked PG blob (logical change 7 of the IAM-hardening
+	// mega-PR, ADR-035 §"Rejected alternatives" #4). The recovery-code
+	// hash column is bytea; the digest algorithm is HMAC-SHA256 keyed
+	// by a per-box secret. The audit-hmac.key path above uses a
+	// Warn-and-continue zero-key fallback because HashEmail joins
+	// can degrade gracefully to "this row's join key is rainbow-
+	// reversible" — there is no service-level outage. The recovery-
+	// code path is different: the recovery code IS the only fallback
+	// when the customer's TOTP device is lost. A zero-key HMAC gives
+	// exactly the same threat surface as bare SHA-256, so refusing
+	// to start is the correct tradeoff — "no service" beats "no
+	// defence" for the recovery fall-back path.
+	//
+	// Loading precedence (mirrors the audit-HMAC loader, with one
+	// difference: there is no precedence 3 zero-key fallback):
+	//   1. FAAS_MFA_RECOVERY_HMAC_KEY env var (hex-encoded 32 bytes).
+	//   2. /var/lib/faas/recovery-hmac.key (0o600) — auto-generated
+	//      on first boot, persists across restarts so newly-stamped
+	//      rows remain stable across boots (otherwise every restart
+	//      would rotate the key and break the entire MFA cohort's
+	//      recovery-code store — every customer would have to re-enroll).
+	//      The path is gated on FAAS_RECOVERY_HMAC_KEY_FILE for tests
+	//      and non-standard state dirs.
+	//   3. FAIL — boot refuses. The audit-hmac.key loader returns nil
+	//      when no key is configured; this loader returns an error
+	//      instead. The error propagates as a top-level run() error and
+	//      systemd brings apid back into the failed-state pattern.
+	recoveryHMACKey, err := loadOrGenerateRecoveryHMACKey(deps.getenv, log)
+	if err != nil {
+		return fmt.Errorf("apid: load or generate recovery HMAC key: %w", err)
+	}
+	if err := authcode.SetHMACSecret(recoveryHMACKey); err != nil {
+		// defence-in-depth: SetHMACSecret returns ErrNoHMACKey if the
+		// loader above somehow handed back an empty slice (e.g. a
+		// future refactor that adds a nil-tolerant branch). The
+		// loader is the canonical gate, but the second check here
+		// closes a foot-gun class of bugs.
+		return fmt.Errorf("apid: set recovery HMAC secret: %w", err)
+	}
+
 	// Optional pre-listen hook (DNS poller in production; nil in tests).
 	if deps.bgBefore != nil {
 		deps.bgBefore(ctx, log, srv)
@@ -976,6 +1018,109 @@ func loadOrGenerateAuditHMACKey(getenv func(string) string, log *slog.Logger) ([
 		return key, nil
 	}
 	log.Info("audit HMAC key generated and persisted", "path", path)
+	return key, nil
+}
+
+// recoveryHMACKeyFile is the on-disk fallback path for the
+// recovery-code HMAC key. The loader writes to this file on first
+// boot when neither the env var nor an existing file is present.
+//
+// 0o600 perms because the file IS a secret: anyone with read
+// access can derive the recovery HMAC key and, combined with a
+// leaked PG blob, can compute hashes offline. Mirrors the host.age
+// identity perms (0o400 read-only; PR #237) and the audit HMAC key
+// file convention.
+const recoveryHMACKeyFile = "/var/lib/faas/recovery-hmac.key"
+
+// recoveryHMACKeyEnvVar is the env var name an operator sets to
+// supply the recovery HMAC key explicitly (hex-encoded 32 bytes).
+// Production uses this — Kubernetes Secret + envFromSecret, or
+// systemd EnvironmentFile=. The file fallback is the dev /
+// single-node convenience.
+const recoveryHMACKeyEnvVar = "FAAS_MFA_RECOVERY_HMAC_KEY"
+
+// recoveryHMACKeyFileEnvVar overrides the default
+// recoveryHMACKeyFile path. Exists so the e2e harness and operators
+// with non-standard state dirs can pin the path; tests use this
+// to redirect to a tmp dir.
+const recoveryHMACKeyFileEnvVar = "FAAS_RECOVERY_HMAC_KEY_FILE"
+
+// loadOrGenerateRecoveryHMACKey returns the per-daemon recovery
+// HMAC key per the precedence documented at the call site. STRICTER
+// than loadOrGenerateAuditHMACKey: returns an error if no key can
+// be loaded — the audit-hmac.key path falls back to a zero-key
+// (with a Warn) because HashEmail can degrade gracefully; recovery
+// codes cannot, so refusing to start is the correct tradeoff.
+//
+// Errors are returned when:
+//   - FAAS_MFA_RECOVERY_HMAC_KEY is set but is not valid hex / wrong
+//     length (hard error; a partial key would silently disable the
+//     rainbow-table defence).
+//   - The fallback file path is set but unreadable / malformed.
+//   - The file does not exist AND /var/lib/faas is writable AND
+//     generation succeeds — the loader persists the key. (This is
+//     the dev-mode first-boot path; failure here is a hard error
+//     rather than a zero-key fallback.)
+//   - The loader reaches the "no key" path: env unset, file
+//     missing, /var/lib/faas missing — the loader returns an
+//     explicit error so the boot fails. Test paths can supply a
+//     writable tmp via FAAS_RECOVERY_HMAC_KEY_FILE.
+func loadOrGenerateRecoveryHMACKey(getenv func(string) string, log *slog.Logger) ([]byte, error) {
+	// Precedence 1: env var (production path).
+	if hexStr := getenv(recoveryHMACKeyEnvVar); hexStr != "" {
+		key, err := hex.DecodeString(hexStr)
+		if err != nil {
+			return nil, fmt.Errorf("decode %s hex: %w", recoveryHMACKeyEnvVar, err)
+		}
+		if len(key) != 32 {
+			return nil, fmt.Errorf("%s must decode to exactly 32 bytes (got %d); use `openssl rand -hex 32` to generate", recoveryHMACKeyEnvVar, len(key))
+		}
+		log.Info("recovery HMAC key loaded from env", "env", recoveryHMACKeyEnvVar)
+		return key, nil
+	}
+
+	// Precedence 2: file path (dev-mode auto-generated; survives
+	// daemon restart so the stored MFA recovery-code hashes remain
+	// stable across boots).
+	path := recoveryHMACKeyFile
+	if override := getenv(recoveryHMACKeyFileEnvVar); override != "" {
+		path = override
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		key, decErr := hex.DecodeString(strings.TrimSpace(string(data)))
+		if decErr != nil {
+			return nil, fmt.Errorf("decode %s hex content: %w", path, decErr)
+		}
+		if len(key) != 32 {
+			return nil, fmt.Errorf("%s content must decode to exactly 32 bytes (got %d); delete the file to regenerate", path, len(key))
+		}
+		log.Info("recovery HMAC key loaded from file", "path", path)
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	// Precedence 3: generate + persist (dev-mode first boot). The
+	// audit-HMAC loader tolerates /var/lib/faas being missing
+	// (test runs as non-root); the recovery-HMAC loader does NOT
+	// — refusing to start is the correct strict-mode behaviour.
+	dir := filepath.Dir(path)
+	if _, statErr := os.Stat(dir); statErr != nil {
+		return nil, fmt.Errorf("stat %s (refusing to start without a recovery HMAC key; set %s, %s, or symlink %s into a writable dir): %w",
+			dir, recoveryHMACKeyEnvVar, recoveryHMACKeyFileEnvVar, recoveryHMACKeyFile, statErr)
+	}
+	key, err := authcode.GenerateRandomKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate recovery HMAC key: %w", err)
+	}
+	encoded := hex.EncodeToString(key)
+	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
+		return nil, fmt.Errorf("persist %s (refusing to start with an in-process-only key — the next restart would force every MFA-enrolled customer to re-enroll): %w",
+			path, err)
+	}
+	log.Info("recovery HMAC key generated and persisted", "path", path)
 	return key, nil
 }
 
