@@ -15,6 +15,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// Free/Hobby rows below omit them intentionally — mirrors the
 		// MinInstancesAllowed row shape.
 		PlanFree: {Plan: PlanFree, DeployedApps: 1, MaxConcurrency: 1, RAMMB: 128, AppLayerMaxMB: 256, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 30, IncludedGBHours: 5, PriceMillicents: 0, RateLimitRPS: 5, RateLimitBurst: 20, EgressMbit: 10, SecretCountMax: 3, SecretValueMaxBytes: 4096, MaxMinInstances: 0,
+			// Issue #559: Free = 1 (single-concurrency plan — one VM
+			// serves one request at a time; mirrors MaxConcurrency).
+			ConcurrencyPerVMBound: 1,
 			// Issue #395 / ADR-045: Free gets 8 keys / 4 KB per value.
 			EnvVarsMax: 8, EnvValueMaxBytes: 4096,
 			// ADR-044: per-plan CPUWeight/CPUQuotaUS/CPUPeriodUS — issue
@@ -60,6 +63,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
 			KeysMax: 3},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
+			// Issue #559: Hobby = 5 (smallest paid tier — one Node
+			// event loop comfortably handles 5 concurrent requests).
+			ConcurrencyPerVMBound: 5,
 			// Issue #472 / ADR-058: Hobby gets 4 trusted publishers — covers the
 			// typical CI rotation surface (GitHub Actions + GitLab + Jenkins +
 			// in-house) without letting one app accumulate an unbounded allowlist.
@@ -116,6 +122,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			KeysMax: 10},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
+			// Issue #559: Pro = 25 (typical SaaS-tier workload
+			// envelope — one Node/Python service handling fan-out).
+			ConcurrencyPerVMBound: 25,
 			// Issue #472 / ADR-058: Pro gets 8 trusted publishers — 2× Hobby for the
 			// larger team rotation surface (multiple repos × multiple CI providers).
 			TrustedSignerCountMax: 8,
@@ -164,6 +173,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
+			// Issue #559: Scale = 80 (matches Cloud Run's
+			// `80 × vCPU` default per the issue body).
+			ConcurrencyPerVMBound: 80,
 			// Issue #472 / ADR-058: Scale gets 16 trusted publishers — 2× Pro for the
 			// enterprise rotation surface (multi-team, multi-cloud, multi-CI).
 			TrustedSignerCountMax: 16,
@@ -355,6 +367,11 @@ func TestPlansAreMonotonic(t *testing.T) {
 			// Issue #189 / IAM-5: per-account API-key quota
 			// (Free=3 → Hobby=10 → Pro=50 → Scale=200).
 			{"KeysMax", lo.KeysMax, hi.KeysMax},
+			// Issue #559: per-VM concurrency bound must grow with
+			// plan (Free=1 → Hobby=5 → Pro=25 → Scale=80). Mirrors
+			// MaxConcurrency's monotonicity because a customer's
+			// concurrency ceiling should never shrink on upgrade.
+			{"ConcurrencyPerVMBound", lo.ConcurrencyPerVMBound, hi.ConcurrencyPerVMBound},
 		}
 		for _, c := range checks {
 			if c.hi < c.lo {
@@ -530,6 +547,44 @@ func TestBillableRAMMBWithSidecars(t *testing.T) {
 				t.Errorf("BillableRAMMBWithSidecars(%d, %v) = %d, want %d", c.planRAM, c.sidecarMBs, got, c.want)
 			}
 		})
+	}
+}
+
+// TestPlanConcurrencyPerVMBound pins the platform-advertised per-VM
+// concurrency bound (issue #559). Free 1, Hobby 5, Pro 25, Scale 80.
+// Distinct from MaxConcurrency (the per-app instance cap, free=1 /
+// hobby=2 / pro=5 / scale=20) — this is per-VM. Surfaced on GET
+// /v1/apps/{slug} as concurrency_per_vm so dashboards + CLI can
+// render the bound without reading limits.go. Unknown plans fail
+// closed (return 0) — same contract as MaxMinInstances.
+func TestPlanConcurrencyPerVMBound(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 1},
+		{PlanHobby, 5},
+		{PlanPro, 25},
+		{PlanScale, 80},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.ConcurrencyPerVMBound(); got != c.want {
+			t.Errorf("%s.ConcurrencyPerVMBound() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestConcurrencyPerVMBoundAccessorMatchesTable pins that the
+// accessor reads the same value the Limits struct holds. Mirrors
+// TestOrgAccessorsMatchTable above — catches regressions where a
+// future contributor edits one side but forgets the other.
+func TestConcurrencyPerVMBoundAccessorMatchesTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.ConcurrencyPerVMBound(), l.ConcurrencyPerVMBound; got != want {
+			t.Errorf("Plan(%s).ConcurrencyPerVMBound() = %d, table = %d", p, got, want)
+		}
 	}
 }
 

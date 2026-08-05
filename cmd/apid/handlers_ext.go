@@ -39,7 +39,7 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request, acct state.Accou
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.appResponse(app))
+	writeJSON(w, http.StatusOK, s.appResponse(app, acct.Plan))
 }
 
 // validateUpdateApp enforces the per-app cold-wake floor rules
@@ -603,7 +603,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"new":    false,
 		})
 	}
-	writeJSON(w, http.StatusOK, s.appResponse(updated))
+	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))
 }
 
 // deleteApp marks the app as deleted (soft delete; PG snapshot GC runs on the
@@ -878,7 +878,7 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if req.NewSlug == oldSlug {
 		// Idempotent no-op: skip the DB round-trip and return the
 		// current app shape so retries don't 4xx.
-		writeJSON(w, http.StatusOK, s.appResponse(app))
+		writeJSON(w, http.StatusOK, s.appResponse(app, acct.Plan))
 		return
 	}
 	updated, err := s.store.RenameApp(ctx(r), acct.ID, oldSlug, req.NewSlug)
@@ -911,7 +911,7 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// both so a future relax of validSlug (or a hostile migration)
 	// cannot smuggle CR/LF into the audit line.
 	s.log.Info("app renamed", "app", updated.ID, "from", logsanitize.Field(oldSlug), "to", logsanitize.Field(req.NewSlug), "account", acct.ID)
-	writeJSON(w, http.StatusOK, s.appResponse(updated))
+	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))
 }
 
 // --- instances -------------------------------------------------------------

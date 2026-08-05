@@ -313,7 +313,19 @@ type AppResponse struct {
 	Runtime        string `json:"runtime,omitempty"`
 	RAMMB          int    `json:"ram_mb"`
 	MaxConcurrency int    `json:"max_concurrency"`
-	IdleTimeoutS   int    `json:"idle_timeout_s,omitempty"`
+	// ConcurrencyPerVMBound (issue #559) is the platform-advertised
+	// per-VM concurrency cap for the customer's plan. Distinct from
+	// MaxConcurrency (the per-app instance cap, spec §6.2-1) — this
+	// is per-VM. Free 1, Hobby 5, Pro 25, Scale 80. Surfaced so
+	// dashboards / CLI can show "what's the bound for one VM on
+	// this plan" without the customer reading limits.go. Concurrency
+	// above 1 is the customer's runner/process responsibility — see
+	// spec §4.9 for the per-runtime concurrency model (Node
+	// single-event-loop, Python asyncio, Go net/http are
+	// concurrency-safe; sync subprocess-per-request handlers are
+	// not).
+	ConcurrencyPerVMBound int `json:"concurrency_per_vm"`
+	IdleTimeoutS          int `json:"idle_timeout_s,omitempty"`
 	// MinInstances is the per-app cold-wake floor (ux_spec §6.5).
 	// 0 => scale to zero; >0 => keep N warm. Pro/Scale only.
 	MinInstances int    `json:"min_instances"`

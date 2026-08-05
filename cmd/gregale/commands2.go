@@ -101,7 +101,7 @@ const (
 // silently drop valid inputs like `--ram 0` or `--idle -1`.
 func cmdApp(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N] [--concurrency]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -131,11 +131,53 @@ func cmdApp(args []string) int {
 	noWarm := fs.Bool("no-warm-snapshot", false, "disable warm-snapshot tier (4th audit kind: app.warm_snapshot_disabled)")
 	warmMinReq := fs.Int("warm-snapshot-min-requests", 0, "warm-snapshot min-request gate (1..100; 0 = use server default)")
 	warmMinMs := fs.Int("warm-snapshot-min-ms", 0, "warm-snapshot min-ms-since-ready gate (100..60000; 0 = use server default)")
+	// Issue #559: --concurrency is a read-only fast path. When set
+	// (with no other flags), the CLI prints just the plan's
+	// per-VM concurrency bound instead of the full app info block.
+	// Skips the UpdateAppRequest branch — purely informational, no
+	// PATCH. This is the CLI surface the issue requested
+	// (`faas apps info --concurrency`); we wire it as a flag on the
+	// existing `gregale app <slug>` command so a customer doesn't
+	// need a second command tree for a one-line query.
+	concurrencyOnly := fs.Bool("concurrency", false, "print only the per-VM concurrency bound for the app's plan (issue #559)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
 	if *warm && *noWarm {
 		return printErr("Invalid flags", fmt.Errorf("--warm-snapshot and --no-warm-snapshot are mutually exclusive"))
+	}
+	// Issue #559: --concurrency fast path. Refuse to mix with
+	// update flags (mixing a read-only query with a write would
+	// surprise the customer) and refuse with --json (the bound
+	// is one integer; --json would be heavier than the text).
+	if *concurrencyOnly {
+		// --concurrency is purely informational. Reject mixing
+		// with any update flag so a customer typing both doesn't
+		// silently PATCH the app.
+		updateFlags := []string{"ram", "max-concurrency", "idle", "min",
+			"autoscale-target-rps", "autoscale-target-cpu-pct",
+			"warm-snapshot", "no-warm-snapshot",
+			"warm-snapshot-min-requests", "warm-snapshot-min-ms"}
+		for _, name := range updateFlags {
+			if explicit := fs.Lookup(name); explicit != nil && explicit.Value.String() != explicit.DefValue {
+				return printErr("Invalid flags",
+					fmt.Errorf("--concurrency cannot be combined with --%s (read-only fast path)", name))
+			}
+		}
+		if jsonOutput {
+			return printErr("Invalid flags",
+				fmt.Errorf("--concurrency is a one-line text output; --json is not meaningful"))
+		}
+		client, err := authedClient()
+		if err != nil {
+			return printErr("Not logged in", err)
+		}
+		a, err := client.GetApp(context.Background(), slug)
+		if err != nil {
+			return printErr("Could not fetch app", err)
+		}
+		fmt.Println(a.ConcurrencyPerVMBound)
+		return 0
 	}
 	client, err := authedClient()
 	if err != nil {
@@ -204,6 +246,18 @@ func cmdApp(args []string) int {
 		fmt.Printf("%-30s %s\n", "url:", a.URL)
 		fmt.Printf("%-30s %d MB\n", "ram:", a.RAMMB)
 		fmt.Printf("%-30s %d\n", "max concurrency:", a.MaxConcurrency)
+		// Issue #559: surface the platform-advertised per-VM
+		// concurrency bound for the app's plan. Distinct from
+		// `max concurrency` above (the per-app instance cap).
+		// 0 is the fail-closed value for an unknown plan — render
+		// as "—" so a customer reading the info block knows the
+		// platform is unable to confirm the bound rather than
+		// that the bound is zero.
+		if a.ConcurrencyPerVMBound == 0 {
+			fmt.Printf("%-30s %s\n", "concurrency per vm:", "—")
+		} else {
+			fmt.Printf("%-30s %d\n", "concurrency per vm:", a.ConcurrencyPerVMBound)
+		}
 		fmt.Printf("%-30s %ds\n", "idle timeout:", a.IdleTimeoutS)
 		// ux_spec §6.5: show the cold-wake floor alongside the
 		// other knobs so the customer sees why an instance is

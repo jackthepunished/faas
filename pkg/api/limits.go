@@ -46,6 +46,23 @@ type Limits struct {
 	AppLayerMaxMB      int // drive1 ext4 cap (spec §4.6)
 	SourceTarballMaxMB int // upload cap; >cap => 413 (spec §4.2)
 
+	// ConcurrencyPerVMBound (issue #559) is the platform-advertised
+	// upper bound on concurrent in-flight requests one VM can handle
+	// at the listener layer. Distinct from MaxConcurrency (the per-app
+	// *instance* cap, spec §6.2-1) — this is per-VM, not per-app.
+	// Concurrency above 1 is the customer's runner/process
+	// responsibility: Node.js (single-event-loop), Python asyncio,
+	// and Go net/http handlers process concurrent requests within
+	// one process; a synchronous subprocess-per-request handler
+	// (e.g. a Python reader-from-stdin script) does not. All five
+	// current runners spawn one subprocess per request via cmd.Run()
+	// (guest/runners/<runtime>/main.go), so the bound is the
+	// listener's goroutine count, not a single process's request
+	// queue. Surfaced on GET /v1/apps/{slug} as concurrency_per_vm
+	// so dashboards + CLI can render the platform's per-VM bound
+	// without reading limits.go. Spec §13 hard-limits table.
+	ConcurrencyPerVMBound int // Free 1, Hobby 5, Pro 25, Scale 80
+
 	// Runtime shape.
 	VCPU         int // firecracker vcpu_count (spec §4.4)
 	IdleTimeoutS int // default idle-reaper timeout (spec §4.3)
@@ -397,6 +414,12 @@ var planLimits = map[Plan]Limits{
 		DeployedApps:   1,
 		MaxConcurrency: 1,
 		RAMMB:          128,
+		// ConcurrencyPerVMBound (issue #559): Free is the
+		// single-concurrency tier — one VM serves one request at a
+		// time. Mirrors MaxConcurrency (= 1) because a Free customer
+		// cannot have more than one VM per app anyway, so the
+		// per-VM and per-app bounds collapse to the same number.
+		ConcurrencyPerVMBound: 1,
 		// AppLayerMaxMB 256 — Free is the lowest cap tier; spec §1 ("App-
 		// layer build ... Free 256 MB") and the limits table both read 256
 		// (PR #241 spec-drift audit, 2026-07-26). This is a no-op
@@ -493,23 +516,30 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotMinMsDefault:       0,
 	},
 	PlanHobby: {
-		Plan:                PlanHobby,
-		DeployedApps:        5,
-		MaxConcurrency:      2,
-		RAMMB:               256,
-		AppLayerMaxMB:       512,
-		SourceTarballMaxMB:  100,
-		VCPU:                2,
-		IdleTimeoutS:        60,
-		IncludedGBHours:     50,
-		PriceMillicents:     900_000, // €9.00
-		RateLimitRPS:        20,
-		RateLimitBurst:      100,
-		EgressMbit:          25,
-		SecretCountMax:      25,
-		SecretValueMaxBytes: 8 * 1024,
-		EnvVarsMax:          32,
-		EnvValueMaxBytes:    8 * 1024,
+		Plan:               PlanHobby,
+		DeployedApps:       5,
+		MaxConcurrency:     2,
+		RAMMB:              256,
+		AppLayerMaxMB:      512,
+		SourceTarballMaxMB: 100,
+		VCPU:               2,
+		IdleTimeoutS:       60,
+		IncludedGBHours:    50,
+		PriceMillicents:    900_000, // €9.00
+		// ConcurrencyPerVMBound (issue #559): Hobby allows up to
+		// 5 concurrent in-flight requests per VM — tracks Cloud
+		// Run's "smallest paid tier" framing while staying inside
+		// Hobby's 256 MB RAM budget (one Node event loop comfortably
+		// handles 5 concurrent requests, a typical Hobby customer's
+		// usage pattern).
+		ConcurrencyPerVMBound: 5,
+		RateLimitRPS:          20,
+		RateLimitBurst:        100,
+		EgressMbit:            25,
+		SecretCountMax:        25,
+		SecretValueMaxBytes:   8 * 1024,
+		EnvVarsMax:            32,
+		EnvValueMaxBytes:      8 * 1024,
 		// TrustedSignerCountMax: Hobby is the lowest paid tier; the
 		// 4-publisher cap covers a hobbyist running a single CI
 		// (GitHub Actions) + a backup CI (Codeberg) + a personal
@@ -613,23 +643,28 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotMinMsDefault:       0,
 	},
 	PlanPro: {
-		Plan:                PlanPro,
-		DeployedApps:        25,
-		MaxConcurrency:      5,
-		RAMMB:               512,
-		AppLayerMaxMB:       1024,
-		SourceTarballMaxMB:  250,
-		VCPU:                2,
-		IdleTimeoutS:        300,
-		IncludedGBHours:     250,
-		PriceMillicents:     2_900_000, // €29.00
-		RateLimitRPS:        100,
-		RateLimitBurst:      500,
-		EgressMbit:          100,
-		SecretCountMax:      50,
-		SecretValueMaxBytes: 16 * 1024,
-		EnvVarsMax:          64,
-		EnvValueMaxBytes:    16 * 1024,
+		Plan:               PlanPro,
+		DeployedApps:       25,
+		MaxConcurrency:     5,
+		RAMMB:              512,
+		AppLayerMaxMB:      1024,
+		SourceTarballMaxMB: 250,
+		VCPU:               2,
+		IdleTimeoutS:       300,
+		IncludedGBHours:    250,
+		PriceMillicents:    2_900_000, // €29.00
+		// ConcurrencyPerVMBound (issue #559): Pro allows up to
+		// 25 concurrent in-flight requests per VM. Matches the
+		// typical SaaS-tier workload envelope (one Node/Python
+		// service handling fan-out from a single client request).
+		ConcurrencyPerVMBound: 25,
+		RateLimitRPS:          100,
+		RateLimitBurst:        500,
+		EgressMbit:            100,
+		SecretCountMax:        50,
+		SecretValueMaxBytes:   16 * 1024,
+		EnvVarsMax:            64,
+		EnvValueMaxBytes:      16 * 1024,
 		// Issue #461: Pro = 5 — multi-region + CI shapes.
 		RegistryCredentialMax: 5,
 		MinInstancesAllowed:   true,
@@ -717,23 +752,30 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotMinMsDefault:       2000,
 	},
 	PlanScale: {
-		Plan:                PlanScale,
-		DeployedApps:        100,
-		MaxConcurrency:      20,
-		RAMMB:               1024,
-		AppLayerMaxMB:       2048,
-		SourceTarballMaxMB:  250,
-		VCPU:                4,
-		IdleTimeoutS:        600,
-		IncludedGBHours:     1500,
-		PriceMillicents:     9_900_000, // €99.00
-		RateLimitRPS:        500,
-		RateLimitBurst:      2000,
-		EgressMbit:          250,
-		SecretCountMax:      100,
-		SecretValueMaxBytes: 32 * 1024,
-		EnvVarsMax:          256,
-		EnvValueMaxBytes:    32 * 1024,
+		Plan:               PlanScale,
+		DeployedApps:       100,
+		MaxConcurrency:     20,
+		RAMMB:              1024,
+		AppLayerMaxMB:      2048,
+		SourceTarballMaxMB: 250,
+		VCPU:               4,
+		IdleTimeoutS:       600,
+		IncludedGBHours:    1500,
+		PriceMillicents:    9_900_000, // €99.00
+		// ConcurrencyPerVMBound (issue #559): Scale = 80 — same
+		// default as Cloud Run's `80 × vCPU` heuristic (the issue
+		// body cites this number directly). 80 concurrent requests
+		// per VM is comfortably reachable at Scale's 1024 MB RAM
+		// for a typical Node.js / Go service; a sync-subprocess
+		// Python customer would saturate before hitting this cap.
+		ConcurrencyPerVMBound: 80,
+		RateLimitRPS:          500,
+		RateLimitBurst:        2000,
+		EgressMbit:            250,
+		SecretCountMax:        100,
+		SecretValueMaxBytes:   32 * 1024,
+		EnvVarsMax:            256,
+		EnvValueMaxBytes:      32 * 1024,
 		// Issue #461: Scale = 20 — broad fan-out for SaaS-scale apps.
 		RegistryCredentialMax: 20,
 		MinInstancesAllowed:   true,
@@ -1686,6 +1728,20 @@ func (p Plan) MaxMinInstances() int {
 		return 0
 	}
 	return l.MaxMinInstances
+}
+
+// ConcurrencyPerVMBound returns the platform-advertised upper
+// bound on concurrent in-flight requests one VM can handle at the
+// listener layer (issue #559). Free 1, Hobby 5, Pro 25, Scale 80.
+// Distinct from MaxConcurrency (the per-app *instance* cap, spec
+// §6.2-1) — this is per-VM. Unknown plans fail closed (return 0) —
+// same contract as MaxMinInstances above.
+func (p Plan) ConcurrencyPerVMBound() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConcurrencyPerVMBound
 }
 
 // LogDeploymentFilterMax returns the per-plan cap on the

@@ -1083,7 +1083,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/AppResponse' }
               example:
-                - {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","ram_mb":256,"max_concurrency":2,"min_instances":0,"status":"active","url":"https://hello-world.example.com","manifest":{"entrypoint":["node","server.js"]},"created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                - {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"min_instances":0,"status":"active","url":"https://hello-world.example.com","manifest":{"entrypoint":["node","server.js"]},"created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
@@ -1097,7 +1097,7 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateAppRequest'
-              example: {"slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"idle_timeout_s":60,"manifest":null}
+              example: {"slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"manifest":null}
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -1107,7 +1107,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimit' }
@@ -1128,7 +1128,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -1151,7 +1151,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimit' }
@@ -1344,7 +1344,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409': { $ref: '#/components/responses/ConflictRename' }
@@ -4787,7 +4787,7 @@ components:
     AppResponse:
       description: "An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, per-app outbound CIDR allowlist (ADR-031 + ADR-032), and reactive scale-up trigger targets (issue #169 / #172)."
       type: object
-      required: [id, slug, type, ram_mb, max_concurrency, min_instances, status, url, manifest, autoscale_target_rps, autoscale_target_cpu_pct]
+      required: [id, slug, type, ram_mb, max_concurrency, concurrency_per_vm, min_instances, status, url, manifest, autoscale_target_rps, autoscale_target_cpu_pct]
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', example: "hello-world" }
@@ -4795,6 +4795,18 @@ components:
         runtime: { type: string, enum: [node22, python312, go124, go124-alpine, node24, python313], description: "Runtime for `type: function` apps. Omit for `type: app` (the default)." }
         ram_mb: { type: integer , example: 256}
         max_concurrency: { type: integer }
+        # Issue #559: platform-advertised per-VM concurrency cap for
+        # the customer's plan. Distinct from max_concurrency (the
+        # per-app instance cap, spec §6.2-1) — this is per-VM. Free
+        # 1, Hobby 5, Pro 25, Scale 80. Concurrency above 1 is the
+        # customer's runner/process responsibility (spec §4.9). The
+        # runner's HTTP listener dispatches each connection on its
+        # own goroutine, so the bound is reachable at the listener
+        # layer for any runner; whether the customer's *handler
+        # process* achieves it depends on the runtime (Node single
+        # event loop, Python asyncio, Go net/http — yes; sync
+        # subprocess-per-request handlers — no).
+        concurrency_per_vm: { type: integer, example: 80 }
         idle_timeout_s: { type: [integer, "null"] }
         min_instances: { type: integer }
         status: { type: string , example: "active"}
