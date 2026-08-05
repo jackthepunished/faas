@@ -36,9 +36,9 @@ type InstanceInfo struct {
 	// reaper doesn't pin a ledger), but the field is here so a
 	// future per-node slice can route through the same arithmetic
 	// without re-reading the deployment row.
-	SidecarMBs   []int
-	LastRequest  time.Time
-	Started      time.Time
+	SidecarMBs  []int
+	LastRequest time.Time
+	Started     time.Time
 	// EvictionPriority (issue #475) is the per-app tier, sourced from
 	// apps.eviction_priority at the loop tick. 'best_effort' (default
 	// for every pre-#475 row) keeps the pre-#475 LRU-by-last_request_at
@@ -52,7 +52,7 @@ type InstanceInfo struct {
 	// reserved instance eventually parks after its idle timeout
 	// (the "idle-still-park" guarantee).
 	EvictionPriority string
-	IdleTimeoutS int // app-configured; 0 => plan default
+	IdleTimeoutS     int // app-configured; 0 => plan default
 	// NodeID is the compute_node the instance lives on
 	// (issue #97 / ADR-025 axis 3). Informational today: the
 	// reaper's selectors (ReapIdle, SelectEvictions) work on the

@@ -490,7 +490,7 @@ var planLimits = map[Plan]Limits{
 		// abuse-floor tier has no reserved-tier entitlement; per-account
 		// cap is 0 so the gate fails closed.
 		EvictionPriorityReservedAllowed: false,
-		ReservedConcurrencyPerAccount:  0,
+		ReservedConcurrencyPerAccount:   0,
 		// IAM-5 (issue #189): Free gets 3 keys — one for the customer's
 		// primary deploy target + one for a staging slot + one for
 		// break-glass. The abuse-vector (scripted key rotation under
@@ -616,7 +616,7 @@ var planLimits = map[Plan]Limits{
 		// resident instance count, so a single reserved app is
 		// comfortable headroom for the tier's economics.
 		EvictionPriorityReservedAllowed: true,
-		ReservedConcurrencyPerAccount:  1,
+		ReservedConcurrencyPerAccount:   1,
 		// IAM-5 (issue #189): Hobby gets 10 keys — 2 per app across
 		// the Hobby app budget (5) keeps every deploy target
 		// (CI / staging / prod / personal / monitoring) with a
@@ -739,7 +739,7 @@ var planLimits = map[Plan]Limits{
 		// ram_mb cap (512 MB), so 2 reserved apps at full concurrency
 		// is ~5.2 GB resident — well inside the 47.6 GB ceiling.
 		EvictionPriorityReservedAllowed: true,
-		ReservedConcurrencyPerAccount:  2,
+		ReservedConcurrencyPerAccount:   2,
 		// IAM-5 (issue #189): Pro gets 50 keys — 2 per app across the
 		// Pro app budget (25) plus a per-team allowance (CI / staging
 		// / prod / personal / monitoring / break-glass).
@@ -862,7 +862,7 @@ var planLimits = map[Plan]Limits{
 		// resident (~18% of the 47.6 GB ceiling) — leaves comfortable
 		// headroom for live wakes.
 		EvictionPriorityReservedAllowed: true,
-		ReservedConcurrencyPerAccount:  4,
+		ReservedConcurrencyPerAccount:   4,
 		// IAM-5 (issue #189): Scale gets 200 keys — 2 per app across
 		// the Scale app budget (100) plus a per-team allowance, with
 		// headroom for the rotating-CI shape of a SaaS-scale customer.

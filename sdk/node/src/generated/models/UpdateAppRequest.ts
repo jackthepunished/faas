@@ -47,5 +47,9 @@ export type UpdateAppRequest = {
    * Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → no change.
    */
   warm_snapshot_min_ms?: number | null;
+  /**
+   * Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction (every best_effort candidate is drained before any reserved is parked). Plan-gated upstream: Free PATCH 'reserved' returns 402 plan_eviction_priority_reserved_not_allowed. Per-account cap (Hobby 1, Pro 2, Scale 4): 422 plan_eviction_priority_reserved_quota when exhausted. Omitted → no change.
+   */
+  eviction_priority?: 'best_effort' | 'reserved';
 };
 
