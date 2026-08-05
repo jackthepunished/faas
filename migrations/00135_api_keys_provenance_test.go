@@ -44,10 +44,20 @@ func TestMigrations_00135_APIKeysProvenance(t *testing.T) {
 	// 1. Column existence + types. information_schema is the
 	//    platform-neutral way; the older pg_catalog views also
 	//    work but column-name filtering is the same shape.
+	//
+	//    table_schema is current_schema(), NOT 'public', because
+	//    pgtest.Open isolates each test into its own per-test
+	//    schema (search_path=<schema>,public). The earlier
+	//    hard-coded 'public' WHERE clause (PR #653 initial cut)
+	//    failed CI because the per-test schema holds the api_keys
+	//    table, not public — pin via current_schema() so the
+	//    same query shape works against any pgtest.Open caller,
+	//    including meterd_quota_e2e_test.go which reuses the
+	//    pattern at migrations/info-schema-scoping-pattern.
 	rows, err := pool.Query(ctx, `
 		SELECT column_name, data_type, is_nullable
 		  FROM information_schema.columns
-		 WHERE table_schema = 'public'
+		 WHERE table_schema = current_schema()
 		   AND table_name   = 'api_keys'
 		   AND column_name IN ('created_ip', 'created_ua', 'parent_key_id')`)
 	if err != nil {
@@ -99,11 +109,19 @@ func TestMigrations_00135_APIKeysProvenance(t *testing.T) {
 	//    action is SET NULL — the audit-evidence property that
 	//    "a hard-deleted predecessor leaves the lineage row
 	//    intact but un-anchored".
+	//
+	//    Note: conrelid must be cast via the per-test schema name
+	//    (NOT 'public.api_keys'::regclass — that hard-coded cast
+	//    failed CI because the per-test schema owns api_keys).
+	//    We use format() to build the qualified identifier from
+	//    current_schema() so the regclass cast resolves the
+	//    right relation regardless of which schema the pool
+	//    targets. format() with %I quotes the identifier safely.
 	var fkAction string
 	err = pool.QueryRow(ctx, `
 		SELECT confdeltype
 		  FROM pg_constraint
-		 WHERE conrelid = 'public.api_keys'::regclass
+		 WHERE conrelid = format('%I.api_keys', current_schema())::regclass
 		   AND contype  = 'f'
 		   AND pg_get_constraintdef(oid) ILIKE '%parent_key_id%'`).Scan(&fkAction)
 	if err != nil {

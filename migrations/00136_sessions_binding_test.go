@@ -38,7 +38,7 @@ func TestMigrations_00136_SessionsBinding(t *testing.T) {
 	rows, err := pool.Query(ctx, `
 		SELECT column_name, data_type, is_nullable
 		  FROM information_schema.columns
-		 WHERE table_schema = 'public'
+		 WHERE table_schema = current_schema()
 		   AND table_name   = 'sessions'
 		   AND column_name  = 'binding_hash'`)
 	if err != nil {

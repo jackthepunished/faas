@@ -51,6 +51,8 @@ package e2etest
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -88,8 +90,20 @@ type Harness struct {
 	VMMDSock          string
 	GatewayURL        string
 	GatewayControlURL string // /metrics + /healthz, loopback only
-	ImagedTmp         string // FAAS_APPS_ROOT
-	BuilderdCfg       string // FAAS_BUILDERD_CONFIG path (issue #57 M6 e2e)
+	// RecoveryHMACKeyHex is a per-test 64-char hex string (32 bytes
+	// when decoded) that the harness injects as FAAS_MFA_RECOVERY_HMAC_KEY
+	// into every daemon's environment. Required because apid's
+	// recovery-hmac loader (cmd/apid/main.go:loadOrGenerateRecoveryHMACKey)
+	// REFUSES to boot without a key — there is no zero-key Warn fallback
+	// like audit-hmac has. Tests that don't read recovery codes still
+	// need a key wired or apid exits at boot with a recoverable-error
+	// log line and the harness's waitTCP() times out. Populated in
+	// Start / StartWithEnv; empty in tests that build their own
+	// harness struct directly (which then must set it themselves or
+	// accept the boot refusal).
+	RecoveryHMACKeyHex string
+	ImagedTmp          string // FAAS_APPS_ROOT
+	BuilderdCfg        string // FAAS_BUILDERD_CONFIG path (issue #57 M6 e2e)
 
 	// Per-daemon state. nil for a daemon not started (e.g. quota test skips
 	// the metal-only daemons).
@@ -140,7 +154,7 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 
-	h := &Harness{T: t, Pool: pool, TmpDir: tmp, BinDir: bin, ImagedTmp: appsRoot, SockDir: sockDir}
+	h := &Harness{T: t, Pool: pool, TmpDir: tmp, BinDir: bin, ImagedTmp: appsRoot, SockDir: sockDir, RecoveryHMACKeyHex: newRecoveryHMACKeyHex(t)}
 	currentHarness = h
 
 	// DB URL — pgtest opened the test pool with search_path=<schema>,public.
@@ -350,7 +364,7 @@ const testDomain = "apps.test.example"
 // per-plan tests that need a tighter target (e.g. meterd_quota_e2e)
 // call pgtest.WaitForMigration with their own N and remain green.
 //
-// Bumped 83 → 86 → 93 → 94 → 102 → 118 → 120 across eleven rebase cycles:
+// Bumped 83 → 86 → 93 → 94 → 102 → 118 → 120 → 134 → 136 across twelve rebase cycles:
 //
 // (issue #461 / ADR-064 — registry_credentials landing on slot 94
 // after PR #529 (Tier A4 cross-node app rebalance, ADR-064) raced
@@ -442,7 +456,22 @@ const testDomain = "apps.test.example"
 //     cross-PR slot gate surfaced the cluster. Whichever of #540/
 //     #651/#653/#654 lands first, the fences resolve themselves
 //     (real schema shadows the fence on the side that merges last).
-const e2eMigrationTarget = 138
+//
+//   - 138 → 140 with PR #653 (IAM hardening mega-PR). The mega-PR
+//     adds slot 00139_api_keys_provenance.sql (logical change 2:
+//     api_keys.created_ip / created_ua / parent_key_id — the SOC2
+//     audit-evidence lineage) and slot 00140_sessions_binding.sql
+//     (logical change 5: sessions.binding_hash for the stolen-cookie
+//     auto-revoke cross-check). Originally landed at 135/136, then
+//     renumbered to 139/140 after PR #647 (issue #475 / ADR-075
+//     eviction priority) merged at slot 138 with reserve_slot
+//     fences at 135/136/137 — the cross-PR slot gate would have
+//     rejected the push otherwise. The three fence files
+//     (00135/00136/00137_reserve_slot.sql) on this branch are
+//     byte-for-byte identical to the fences on main; they hold
+//     the carved-out slots while this branch sits past the
+//     eviction_priority land and get `git rm`'d on merge.
+const e2eMigrationTarget = 140
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
@@ -470,7 +499,7 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 		t.Fatalf("e2etest: mkdir sock dir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-	h := &Harness{T: t, Pool: pool, TmpDir: tmp, BinDir: bin, ImagedTmp: appsRoot, SockDir: sockDir}
+	h := &Harness{T: t, Pool: pool, TmpDir: tmp, BinDir: bin, ImagedTmp: appsRoot, SockDir: sockDir, RecoveryHMACKeyHex: newRecoveryHMACKeyHex(t)}
 	currentHarness = h
 
 	dbURL := os.Getenv("DATABASE_URL")
@@ -696,16 +725,48 @@ func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []strin
 //     the daemon's wire.ListenOrRecreateByName errors on a host without
 //     the `faas` group, which is every CI runner and dev Mac. Production
 //     deploys have the group; the ansible role creates it at bootstrap.
+//   - FAAS_MFA_RECOVERY_HMAC_KEY=<per-test hex> — see Harness
+//     .RecoveryHMACKeyHex. apid refuses to boot without a recovery
+//     HMAC key (cmd/apid/main.go:loadOrGenerateRecoveryHMACKey); the
+//     audit-hmac Warn-and-zero-key fallback that previously let the
+//     e2e harness boot apid with no secrets at all does NOT apply
+//     here. We generate a fresh per-test key so two tests running
+//     in parallel don't share a key (and so a leaked key from one
+//     test's debug output is useless for the next test's recovery
+//     codes). The key is in-memory only — the test never persists
+//     it to disk — so a reboot of the daemon in the middle of the
+//     test is unsupported (matches production "key stable across
+//     boot" semantics only if the operator persists it).
 //   - PATH / HOME inherited so go-built daemons can `exec.LookPath`
 //     helpers (notably firecracker, which schedd warns about but does
 //     not require for the meterd quota gate).
 func testEnvCommon(dbURL string) []string {
-	return []string{
+	env := []string{
 		"DATABASE_URL=" + dbURL,
 		"FAAS_SKIP_SOCKET_GROUP=1",
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 	}
+	if currentHarness != nil && currentHarness.RecoveryHMACKeyHex != "" {
+		env = append(env, "FAAS_MFA_RECOVERY_HMAC_KEY="+currentHarness.RecoveryHMACKeyHex)
+	}
+	return env
+}
+
+// newRecoveryHMACKeyHex returns a fresh 64-char hex string (32 bytes
+// when decoded) suitable for FAAS_MFA_RECOVERY_HMAC_KEY. Per-test
+// uniqueness is the point — see the doc on Harness.RecoveryHMACKeyHex.
+// On the astronomically unlikely chance that crypto/rand fails we
+// Fatalf the test rather than return an empty key (which would let
+// apid refuse-to-start and the harness report a misleading
+// timeout-from-port-not-bound as the boot failure).
+func newRecoveryHMACKeyHex(t *testing.T) string {
+	t.Helper()
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("e2etest: crypto/rand for recovery HMAC key: %v", err)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // writeScheddSignPub generates a fresh ECDSA P-256 keypair (the

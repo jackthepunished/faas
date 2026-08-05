@@ -691,18 +691,18 @@ func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, ac
 // current (IP, UA-family) fingerprint. Two writes land in
 // lockstep before the cookie is sealed:
 //
-//   1. store.UpdateSessionBinding(current.ID, acct.ID, bind)
-//      re-stamps sessions.binding_hash so the row's fingerprint
-//      matches the cookie envelope's. Without this the
-//      middleware cross-check (RequireSessionCookie step 3.5,
-//      pkg/auth/middleware/middleware.go) would compare the
-//      new envelope hash against the row's stale mint-time
-//      hash and trip the auto-revoke branch on the customer's
-//      own post-reissue request.
+//  1. store.UpdateSessionBinding(current.ID, acct.ID, bind)
+//     re-stamps sessions.binding_hash so the row's fingerprint
+//     matches the cookie envelope's. Without this the
+//     middleware cross-check (RequireSessionCookie step 3.5,
+//     pkg/auth/middleware/middleware.go) would compare the
+//     new envelope hash against the row's stale mint-time
+//     hash and trip the auto-revoke branch on the customer's
+//     own post-reissue request.
 //
-//   2. sessions.IssueWithSessionAndBindingHash[AndStepUp]
-//      seals the envelope with the SAME bind value and writes
-//      it as Set-Cookie.
+//  2. sessions.IssueWithSessionAndBindingHash[AndStepUp]
+//     seals the envelope with the SAME bind value and writes
+//     it as Set-Cookie.
 //
 // If step 1 fails (ErrNotFound = row already revoked by an
 // interleaving operator or by the auto-revoke branch itself)

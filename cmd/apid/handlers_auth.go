@@ -42,9 +42,9 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/httpsec"
-	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -247,6 +247,8 @@ func (s *server) sessionAuth(next http.Handler) http.Handler {
 		// is zero for pre-PR-077 cookies (omitempty wire shape);
 		// the gate sees ts.IsZero()==true and emits
 		// reason="missing" + 403, forcing a step-up.
+		//
+		//nolint:contextcheck // pointer-mutation contract (same as withSession/withPrincipal/withMFAPending at middleware.go:530-554): r.Context() must be the inherited ctx; capturing into a local would break observeWrap.
 		r = r.WithContext(authmw.WithStepUp(r.Context(), env.StepUpAt))
 		next.ServeHTTP(w, r)
 	})
