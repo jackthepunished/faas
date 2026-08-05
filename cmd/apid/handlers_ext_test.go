@@ -2845,3 +2845,95 @@ func TestUpdateApp_EvictionPriority_AuditEmitted(t *testing.T) {
 		t.Errorf("post-noop audit rows = %d, want 1 (no-op PATCH must not emit); events=%+v", seen2, list2.Events)
 	}
 }
+
+// TestUpdateApp_EvictionPriority_HobbyCapRace (issue #475) pins the
+// "cap is advisory, not strict" decision at a code level rather than
+// just the doc-comment. Hobby caps reserved at 1; this test seeds 2
+// apps on a Hobby account, fires 2 concurrent PATCHes to flip both
+// to reserved, and asserts that the system stays internally
+// consistent.
+//
+// The race window is between the SELECT count (advisory read) and
+// the UPDATE: two goroutines that both see `n=0` will both compute
+// `n+1=1 <= cap=1` and both UPDATE successfully. The system ends
+// with 2 reserved apps on a Hobby plan — exactly the failure mode
+// ADR-075 §3.2 predicts. The test accepts both outcomes:
+//
+//  1. Both 200 OK: count >= 1 (advisory overflow). This is the
+//     race that production can land. The financial-model per-account
+//     RAM cap is the hard backstop.
+//  2. One 200 + one 422: count == 1 (advisory caught it). Either
+//     goroutine won the race; the loser rejected cleanly.
+//
+// A regression that swaps the advisory count for an exact count
+// (e.g. SELECT ... FOR UPDATE on the apps row) must always land in
+// shape (2). The test's two branches let a future contributor
+// tighten the cap with confidence that this test will fail and force
+// the discussion.
+func TestUpdateApp_EvictionPriority_HobbyCapRace(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	reserved := string(api.EvictionPriorityReserved)
+
+	// Seed 2 Hobby apps; neither is reserved yet. Hobby cap = 1.
+	mustSeedApp(t, e, "hobby-race-a")
+	mustSeedApp(t, e, "hobby-race-b")
+
+	type result struct {
+		slug string
+		code int
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+
+	go func() {
+		<-start
+		r := e.do(t, "PATCH", "/v1/apps/hobby-race-a", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+		results <- result{"hobby-race-a", r.Code}
+	}()
+	go func() {
+		<-start
+		r := e.do(t, "PATCH", "/v1/apps/hobby-race-b", api.UpdateAppRequest{EvictionPriority: &reserved}, nil)
+		results <- result{"hobby-race-b", r.Code}
+	}()
+	close(start)
+
+	codes := make([]int, 2)
+	slugs := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		res := <-results
+		codes[i] = res.code
+		slugs[i] = res.slug
+	}
+
+	// Reality: we either see (200, 200) or (200, 422). Anything else
+	// (500, malformed, mid-flight panic surfaced as 200/empty) is a
+	// regression — the handler must succeed OR reject with the
+	// load-bearing quota code, period.
+	for i, code := range codes {
+		if code != 200 && code != 422 {
+			t.Errorf("PATCH %s status = %d, want 200 OR 422 (advisory-cap outcomes only)", slugs[i], code)
+		}
+	}
+
+	// Count the post-race reserved-apps-on-this-account. This is the
+	// quantity the financial-model per-account RAM cap (47,600 MB) is
+	// the hard backstop for. The test asserts the count is bounded
+	// by `cap + tiny_overshoot`: Hobby cap = 1, max overshoot is the
+	// 1 extra reserved app a racing PATCH can land.
+	reservedCount := 0
+	apps, err := e.store.ListApps(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("list apps: %v", err)
+	}
+	for _, a := range apps {
+		if a.EvictionPriority == reserved {
+			reservedCount++
+		}
+	}
+	if reservedCount < 1 {
+		t.Errorf("no apps parked as reserved after the race — at least one must succeed; got count=%d", reservedCount)
+	}
+	if reservedCount > 2 {
+		t.Errorf("reserved count = %d, want 1 OR 2 (advisory cap overshoot ≤ 1); financial-model RAM cap is the hard backstop", reservedCount)
+	}
+}

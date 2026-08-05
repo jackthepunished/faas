@@ -1786,6 +1786,14 @@ func (m *MemStore) CreateApp(_ context.Context, app App) (App, error) {
 	if app.Status == "" {
 		app.Status = AppActive
 	}
+	// Issue #475: snap empty Go zero to the schema DEFAULT 'best_effort'
+	// so the column reads as a real value right out of CreateApp. The
+	// pgstore snap lives on the SQL path; the memstore snap mirrors it
+	// here so the per-account reserved-tier cap read
+	// (CountAppsWithEvictionPriority) sees the same value the wire
+	// would. Pre-#475 tests that built App{} structs continue to read
+	// 'best_effort' on the round-trip.
+	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
 	m.apps[app.ID] = app
 	return app, nil
 }
@@ -1830,6 +1838,11 @@ func (m *MemStore) CreateAppIfUnderQuota(_ context.Context, app App, limits api.
 	if app.Status == "" {
 		app.Status = AppActive
 	}
+	// Issue #475: same snap-to-default as CreateApp above — the
+	// quota-gated path must round-trip 'best_effort' just like the
+	// unconditional path so the per-account reserved-tier cap reader
+	// sees the same wire value.
+	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
 	m.apps[app.ID] = app
 	return app, nil
 }

@@ -1049,21 +1049,17 @@ func (l *Loop) runReaper(ctx context.Context) {
 // instance id from the carriers built in runReaper. The boolean
 // return is false when the id is not in the snapshot (a benign
 // race: the instance was already parked by an earlier branch in
-// the same tick). The string fallback to 'best_effort' on the
-// empty-string EvictionPriority matches the historical default —
-// a pre-#475 row whose reaper tick lands before the column has
-// been backfilled reports under the best_effort label, which is
-// the same bucket the metric would land in once the migration
-// applies.
+// the same tick). The empty-string snap to 'best_effort' for
+// pre-#475 carriers (whose reaper tick lands before the column has
+// been backfilled) flows through state.EvictionPriorityOrBestEffort
+// so the metric observation matches the same bucket the INSERT
+// path stamps on a fresh row.
 func resolvePriority(snapshot []InstanceInfo, instanceID string) (string, bool) {
 	for _, s := range snapshot {
 		if s.Instance != instanceID {
 			continue
 		}
-		if s.EvictionPriority == "" {
-			return string(api.EvictionPriorityBestEffort), true
-		}
-		return s.EvictionPriority, true
+		return state.EvictionPriorityOrBestEffort(s.EvictionPriority), true
 	}
 	return "", false
 }

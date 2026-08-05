@@ -1339,15 +1339,12 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// amendment for the diff path that depends on this.
 	// Issue #475: eviction_priority is NOT NULL DEFAULT 'best_effort'
 	// (migration 00135). The Go zero-value "" is NOT in the CHECK set
-	// (apps_eviction_priority_chk) — coerce to 'best_effort' so the
-	// pre-#475 create path keeps the schema DEFAULT behaviour bit-for-bit,
-	// the same shape as appType above. apid still applies the per-plan
+	// (apps_eviction_priority_chk) — snap to 'best_effort' via the
+	// shared helper so the pre-#475 create path keeps the schema
+	// DEFAULT behaviour bit-for-bit. apid still applies the per-plan
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
-	evictionPriority := app.EvictionPriority
-	if evictionPriority == "" {
-		evictionPriority = "best_effort"
-	}
+	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		 returning ` + appsSelectColumns
@@ -1482,10 +1479,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// — the Go zero-value "" is NOT in the CHECK set, so the insert
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
-	evictionPriority := app.EvictionPriority
-	if evictionPriority == "" {
-		evictionPriority = "best_effort"
-	}
+	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		 returning ` + appsSelectColumns

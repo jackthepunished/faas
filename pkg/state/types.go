@@ -451,6 +451,31 @@ type App struct {
 	CreatedAt        time.Time
 }
 
+// EvictionPriorityOrBestEffort (issue #475) snaps the empty Go zero
+// to the schema DEFAULT 'best_effort' so the INSERT path never trips
+// the CHECK constraint apps_eviction_priority_chk on a missing column.
+// The schema DEFAULT would catch this on the wire anyway, but calling
+// the snap explicitly preserves the pre-#475 create behaviour
+// bit-for-bit and avoids a 23514 transient visible in pgx error logs.
+//
+// Lives on the state.App type because all three call sites read or
+// write App.EvictionPriority:
+//
+//   - pkg/state/pgstore.go::CreateApp / CreateAppIfUnderQuota stamp
+//     the column at INSERT time.
+//   - pkg/sched/loop.go::resolvePriority stamps the per-instance
+//     carrier at reaper tick (the counter observation depends on the
+//     post-stamp label value, not the pre-stamp Go zero).
+//
+// The helper is intentionally nil-safe on a zero App — passing "" is
+// the only "unset" shape the column has.
+func EvictionPriorityOrBestEffort(p string) string {
+	if p == "" {
+		return string(api.EvictionPriorityBestEffort)
+	}
+	return p
+}
+
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
 // lives inside the snapshot for guest-init.
 type AppManifest struct {
