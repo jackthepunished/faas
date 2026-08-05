@@ -23,7 +23,8 @@ These numbers come from the financial model and are **not negotiable at implemen
 | Disk reserve (OS, kernels, base images, logs) | 60 GB | LVM layout §8 |
 | Snapshot budget | 452 GB | `imaged` GC + quotas |
 | Fleet average snapshot size target | 130 MB | telemetry alert §12; quotas §8 |
-| Plan quotas (deployed / concurrent / MB RAM / GB-h) | Free 1/1/128/5 · Hobby 5/2/256/50 · Pro 25/5/512/250 · Scale 100/20/1024/1500 | `apid` validation, `schedd` admission, `meterd` quotas |
+| Plan quotas (deployed / per-app concurrent / MB RAM / GB-h) | Free 1/1/128/5 · Hobby 5/2/256/50 · Pro 25/5/512/250 · Scale 100/20/1024/1500 | `apid` validation, `schedd` admission, `meterd` quotas |
+| Plan per-VM concurrency bound (`concurrency_per_vm`) | Free 1 · Hobby 5 · Pro 25 · Scale 80 | `apid` validation on `GET /v1/apps/{slug}`; CLI `gregale app <slug> --concurrency`; **listener-level only** — handler-process concurrency is the customer's responsibility (§4.9.1, issue #559) |
 | Expected resident concurrency (planning) | 0.02 / 0.15 / 0.60 / 3.00 | telemetry comparison only |
 | Overage meter | €0.01 per GB-RAM-hour | `meterd` → Stripe |
 | Build cost envelope | builds fit inside control-plane + headroom, never tenant RAM | `builderd` admission §9 |
