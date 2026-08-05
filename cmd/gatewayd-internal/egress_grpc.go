@@ -174,9 +174,22 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 	return nil
 }
 
-// stop tears down the gRPC server + removes the socket file.
-// The returned error is informational; the daemon continues
-// shutdown even on cleanup failures.
+// stop tears down the gRPC server. The socket file is NOT
+// removed here: a stop-time Remove races against the next
+// start()'s os.Remove→net.Listen sequence, and on systemd
+// Restart=on-failure the old daemon's deferred Remove has
+// been observed to fire AFTER the new daemon's net.Listen
+// succeeded, deleting a live dirent that meterd then dials
+// into nothing (cd-controlplane run 31121004495 — meterd
+// OOM-killed from "stream open failed" log-flood because
+// /run/faas/gatewayd-egress.sock kept disappearing).
+//
+// Stale dirents from a crash (where neither Remove nor the
+// graceful-close path ran) are handled by start()'s
+// pre-Remove — that one runs against a known-gone listener
+// and can't race with the next process. This mirrors
+// pkg/gateway/synth.go:SynthServer.Stop, which only calls
+// http.Server.Shutdown and never unlinks.
 //
 // ctx bounds the graceful shutdown window: GracefulStop blocks
 // until in-flight RPCs drain, which can be slow under load; if
@@ -201,9 +214,6 @@ func (l *egressGRPCListener) stop(ctx context.Context) error {
 		// Deadline blew past; force-close so the daemon doesn't
 		// hold the process open. gRPC's Stop returns immediately.
 		l.server.Stop()
-	}
-	if l.socketPath != "" && isUnixSocketPath(l.socketPath) {
-		_ = os.Remove(l.socketPath)
 	}
 	return nil
 }
