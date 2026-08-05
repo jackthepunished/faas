@@ -73,6 +73,9 @@ class UpdateAppRequest:
     drained before any reserved is parked). Plan-gated upstream: Free PATCH 'reserved' returns 402
     plan_eviction_priority_reserved_not_allowed. Per-account cap (Hobby 1, Pro 2, Scale 4): 422
     plan_eviction_priority_reserved_quota when exhausted. Omitted → no change."""
+    require_authn: bool | None | Unset = UNSET
+    """Per-deployment token-gate flag (issue #560). Omitted → no change. PATCH-true on Free/Hobby is rejected with
+    403 plan_require_authn_not_allowed."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -168,6 +171,12 @@ class UpdateAppRequest:
         else:
             eviction_priority = self.eviction_priority
 
+        require_authn: bool | None | Unset
+        if isinstance(self.require_authn, Unset):
+            require_authn = UNSET
+        else:
+            require_authn = self.require_authn
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -199,6 +208,8 @@ class UpdateAppRequest:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
         if eviction_priority is not UNSET:
             field_dict["eviction_priority"] = eviction_priority
+        if require_authn is not UNSET:
+            field_dict["require_authn"] = require_authn
 
         return field_dict
 
@@ -374,6 +385,15 @@ class UpdateAppRequest:
 
         eviction_priority = _parse_eviction_priority(d.pop("eviction_priority", UNSET))
 
+        def _parse_require_authn(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        require_authn = _parse_require_authn(d.pop("require_authn", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -389,6 +409,7 @@ class UpdateAppRequest:
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
             eviction_priority=eviction_priority,
+            require_authn=require_authn,
         )
 
         update_app_request.additional_properties = d

@@ -921,6 +921,104 @@ func TestCmdAppScale_WarmSnapshotShow(t *testing.T) {
 	}
 }
 
+// --- issue #560: per-deployment require-authn opt-in flags -----------------
+//
+// Mirror the warm-snapshot flag tests (TestCmdAppScale_WarmSnapshot*)
+// exactly: --require-authn / --no-require-authn are a symmetric pair
+// that coalesces to a single *bool on the wire; the mutex is a usage
+// error (exit 1), and the no-flag path stays on the info-block print
+// branch. The plan gate (Pro/Scale only) is enforced server-side and
+// exercised by the e2e tests, not here.
+
+// TestCmdAppScale_RequireAuthnTrue pins that --require-authn
+// translates to a pointer-to-true on the wire (so apid can distinguish
+// "unset" from "explicit on"). The on-true path emits the
+// `app.authn_required` audit kind on the apid side (PR/issue #560).
+func TestCmdAppScale_RequireAuthnTrue(t *testing.T) {
+	sink := &multiSink{onScale: func(string, []byte) (int, any) {
+		return http.StatusOK, api.AppResponse{Slug: "jane-api", RequireAuthn: true}
+	}, onAccount: func(string) (int, any) {
+		return http.StatusOK, api.AccountResponse{Plan: "pro"}
+	}}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := cmdAppScale("jane-api", []string{"--require-authn"}); code != 0 {
+		t.Fatalf("cmdAppScale exit = %d, want 0", code)
+	}
+	var req api.UpdateAppRequest
+	if err := json.Unmarshal(sink.lastBody, &req); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if req.RequireAuthn == nil || *req.RequireAuthn != true {
+		t.Errorf("require_authn = %v, want pointer to true", req.RequireAuthn)
+	}
+}
+
+// TestCmdAppScale_RequireAuthnFalse pins --no-require-authn
+// translating to a pointer-to-FALSE (not omitted). This is the path
+// that triggers the `app.authn_disabled` audit kind on the apid side
+// when the previous state was true.
+func TestCmdAppScale_RequireAuthnFalse(t *testing.T) {
+	sink := &multiSink{onScale: func(string, []byte) (int, any) {
+		return http.StatusOK, api.AppResponse{Slug: "jane-api"}
+	}, onAccount: func(string) (int, any) {
+		return http.StatusOK, api.AccountResponse{Plan: "pro"}
+	}}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := cmdAppScale("jane-api", []string{"--no-require-authn"}); code != 0 {
+		t.Fatalf("cmdAppScale exit = %d, want 0", code)
+	}
+	var req api.UpdateAppRequest
+	if err := json.Unmarshal(sink.lastBody, &req); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if req.RequireAuthn == nil || *req.RequireAuthn != false {
+		t.Errorf("require_authn = %v, want pointer to false", req.RequireAuthn)
+	}
+}
+
+// TestCmdAppScale_RequireAuthnMutex pins that passing both
+// --require-authn and --no-require-authn is a usage error (exit 1)
+// rather than a silent last-one-wins.
+func TestCmdAppScale_RequireAuthnMutex(t *testing.T) {
+	requireNoAuth(t)
+	if code := cmdAppScale("hello", []string{"--require-authn", "--no-require-authn"}); code != 1 {
+		t.Errorf("cmdAppScale with both flags = %d, want 1", code)
+	}
+}
+
+// TestCmdAppScale_RequireAuthnUnset pins that an unrelated update
+// (e.g. --ram) leaves require_authn off the wire entirely. The
+// Visit-flag detection must distinguish "unset" from "explicit true"
+// -- a sentinel compare would silently drop a "false" the user
+// explicitly typed.
+func TestCmdAppScale_RequireAuthnUnset(t *testing.T) {
+	sink := &multiSink{onScale: func(string, []byte) (int, any) {
+		return http.StatusOK, api.AppResponse{Slug: "jane-api"}
+	}, onAccount: func(string) (int, any) {
+		return http.StatusOK, api.AccountResponse{Plan: "pro"}
+	}}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := cmdAppScale("jane-api", []string{"--ram", "256"}); code != 0 {
+		t.Fatalf("cmdAppScale exit = %d, want 0", code)
+	}
+	var req api.UpdateAppRequest
+	if err := json.Unmarshal(sink.lastBody, &req); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if req.RequireAuthn != nil {
+		t.Errorf("require_authn = %v, want nil (unrelated update should not touch the field)", req.RequireAuthn)
+	}
+}
+
 func TestCmdAppRename_HappyPath(t *testing.T) {
 	sink := &multiSink{onRename: func(oldSlug string) (int, any, []byte) {
 		if oldSlug != "hello" {

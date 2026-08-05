@@ -1,12 +1,10 @@
 -- filename: 00137_reserve_slot.sql
--- Slot fence: see 00135_reserve_slot.sql's header for the
--- cross-PR slot-cluster rationale (PR #540 webhook-deliveries,
--- PR #651 deploy-scans, PR #653 IAM provenance, PR #654
--- per-deployment authn). PR #654 holds slot 137 for
--- 00137_apps_require_authn.sql on its branch; PR #647 (issue
--- #475 / ADR-075) fences this slot on its branch to keep the
--- embedded set contiguous while eviction_priority lands at 138.
--- ADR-041.
+-- Fence at slot 137 — held by PR #654 to bridge 00136 and 00143
+-- after the cross-PR slot cascade. PR #651's real schema
+-- (deployments_scan_result) holds 137 elsewhere; this fence is
+-- meta — when the collision settles on main, whoever's real
+-- schema lands at 137 shadows this fence via `git rm`. Per
+-- ADR-041 the body is a no-op SELECT 1.
 
 -- +goose Up
 -- +goose StatementBegin

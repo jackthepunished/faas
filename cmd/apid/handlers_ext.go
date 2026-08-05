@@ -244,6 +244,24 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Free and Hobby tiers do not support per-app warm snapshots; upgrade to Pro or higher.")
 		}
 	}
+	// Issue #560: per-app require_authn opt-in. Same plan-gate
+	// shape as the warm-snapshot / streaming gates — Free/Hobby +
+	// true = 403 plan_require_authn_not_allowed. The default
+	// stays false (column default + create-time default), so
+	// every existing customer keeps being public-by-default and
+	// a Free customer's PATCH-true surfaces as the gate error
+	// before any SQL write. Cross-account token scope is
+	// enforced by the gatewayd-internal authz branch, not here
+	// — the PATCH endpoint only checks plan eligibility, not
+	// future request authenticity.
+	if req.RequireAuthn != nil && *req.RequireAuthn {
+		if !acct.Plan.RequireAuthnAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanRequireAuthnNotAllowed,
+				"Per-deployment authentication is not allowed on this plan",
+				"Free and Hobby tiers do not support per-app require_authn; upgrade to Pro or higher.")
+		}
+	}
 	if req.WarmSnapshotMinRequests != nil {
 		v := *req.WarmSnapshotMinRequests
 		if v < 1 || v > 100 {
@@ -591,6 +609,17 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// or 'reserved' (plan unlocked, cap not exhausted).
 		EvictionPriority:    req.EvictionPriority,
 		SetEvictionPriority: req.EvictionPriority != nil,
+		// Issue #560: per-app require_authn opt-in. Set bit
+		// distinguishes "unset" (don't touch) from "explicit
+		// false" (opt out — back to public-by-default). Plan
+		// gate above has already rejected Free/Hobby + true
+		// with 403 plan_require_authn_not_allowed, so the
+		// SQL never sees an illegal value. Free/Hobby
+		// customers may PATCH true → false to opt out on a
+		// Pro-upgraded app; Hobby customers may opt back out
+		// the same way.
+		RequireAuthn:    req.RequireAuthn,
+		SetRequireAuthn: req.RequireAuthn != nil,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
@@ -669,6 +698,18 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		oldApp["eviction_priority"] = app.EvictionPriority
 		newApp["eviction_priority"] = updated.EvictionPriority
 	}
+	// Issue #560: record what the customer altered on the
+	// require_authn flag. Same shape as the warm-snapshot
+	// entries above — only fields the caller touched appear
+	// in the audit. The second-event row
+	// (app.authn_disabled) below handles the true → false
+	// transition as a single-purpose greppable signal, same
+	// shape as app.warm_snapshot_disabled (PR #525 /
+	// ADR-074).
+	if req.RequireAuthn != nil {
+		oldApp["require_authn"] = app.RequireAuthn
+		newApp["require_authn"] = updated.RequireAuthn
+	}
 	if req.EgressAllowlist != nil {
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
 		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)
@@ -711,6 +752,33 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"slug":   updated.Slug,
 			"old":    app.EvictionPriority,
 			"new":    updated.EvictionPriority,
+		})
+	}
+	// Issue #560: emit app.authn_required / app.authn_disabled
+	// on require_authn transitions. Same single-purpose
+	// single-keyword-greppable shape as
+	// app.warm_snapshot_disabled above, so operators can
+	// `gregale audit-events --kind-prefix authn` and see the
+	// full lifecycle. On flips in either direction. The
+	// app.updated row already carries the old/new snapshot
+	// of require_authn; this row is a single-purpose
+	// signal. Not emitted when the field was already in
+	// the target state (no-op transition) or when the
+	// operator left it unset (no intent to flip).
+	switch {
+	case req.RequireAuthn != nil && !app.RequireAuthn && updated.RequireAuthn:
+		s.audit.Emit(ctx(r), "app.authn_required", &acct.ID, map[string]any{
+			"app_id": updated.ID,
+			"slug":   updated.Slug,
+			"old":    false,
+			"new":    true,
+		})
+	case req.RequireAuthn != nil && app.RequireAuthn && !updated.RequireAuthn:
+		s.audit.Emit(ctx(r), "app.authn_disabled", &acct.ID, map[string]any{
+			"app_id": updated.ID,
+			"slug":   updated.Slug,
+			"old":    true,
+			"new":    false,
 		})
 	}
 	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))

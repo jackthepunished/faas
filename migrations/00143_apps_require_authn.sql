@@ -1,0 +1,59 @@
+-- filename: 00143_apps_require_authn.sql
+-- +goose Up
+-- Issue #560 — per-app require_authn flag (Cloud Run analogue:
+-- `--no-allow-unauthenticated`). Adds a single boolean column to
+-- apps; when true, gatewayd-internal demands a valid
+-- Authorization: Bearer <token> header on every routed request
+-- (issue §1, §7 networking gateway auth layer). The default false
+-- preserves the existing customer behaviour — every existing app
+-- stays public-by-default. The plan gate (Pro/Scale only) is
+-- enforced at the apid PATCH validator; this column is the storage.
+--
+-- One column:
+--
+--   require_authn  boolean NOT NULL DEFAULT false
+--
+-- Replay-safe (ADR-041): ADD COLUMN IF NOT EXISTS + constant default.
+-- The column is a single NOT NULL boolean with no rewrite and no
+-- index bloat; a second MigrateUp is a clean no-op.
+--
+-- No CHECK constraint needed: the only valid values are false and
+-- true (boolean NOT NULL), and the plan-gate lives at the apid
+-- layer (cannot be expressed as a row-level CHECK because it
+-- depends on plans.plan — a JOIN that PG CHECK constraints cannot
+-- express). Defence-in-depth: the apid handler rejects Free/Hobby
+-- PATCH-true with 403 plan_require_authn_not_allowed BEFORE the
+-- store layer sees the value.
+--
+-- No partial index on require_authn=true: every per-request wake
+-- path already loads the App row by id (apps_account_idx, apps
+-- slug lookup), so a partial index would not shrink any hot read.
+-- The operator dashboard query "which apps have require_authn on?"
+-- is rare enough to full-scan.
+--
+-- Slot 139 — moved twice during the cross-PR collision cascade:
+-- 00135 → 00137 (PRs #540/647/651/653 all claimed slot 135; PR #653
+-- also claimed 136), then 00137 → 00143 once PR #647 landed fences
+-- at 137 + a real schema at 138 and PR #651 a real schema at 137.
+-- Per ADR-041 + memory cross-pr-slot-gate-races-with-active-pr, the
+-- rule is: pick the lowest slot above the contested range, and
+-- keep the renumber chain in the fence paragraph so a future
+-- rebase reader sees the full timeline. If main catches up on its
+-- own (e.g. #647 lands first, vacating 138/139), drop this whole
+-- paragraph but keep the filename + filename header consistent.
+-- +goose StatementBegin
+ALTER TABLE apps
+    ADD COLUMN IF NOT EXISTS require_authn boolean NOT NULL DEFAULT false;
+-- +goose StatementEnd
+
+-- +goose Down
+-- Reverse: drop the column. A row that had require_authn=true loses
+-- the bit on downgrade; the GET /v1/apps/{slug} response shape omits
+-- require_authn because the column no longer exists, which is the
+-- correct degraded behaviour (same pattern as
+-- migrations/00080_apps_streaming_enabled.sql::Down and
+-- migrations/00109_apps_warm_snapshot.sql::Down).
+-- +goose StatementBegin
+ALTER TABLE apps
+    DROP COLUMN IF EXISTS require_authn;
+-- +goose StatementEnd

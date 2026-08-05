@@ -154,7 +154,16 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             root@${{ env.CP_HOST }} \
             "set -euo pipefail
-               systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf"
+               # systemd-tmpfiles only applies mode/user/group at
+               # CREATION (see deploy/controlplane/tmpfiles.d/faas.conf
+               # for the full rationale). vmmd's RuntimeDirectory=faas
+               # already creates /run/faas as root:root 0755 BEFORE
+               # tmpfiles runs, so the chown below is load-bearing —
+               # without it githubd's bind() fails on every redeploy.
+               systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
+               chown root:faas /run/faas
+               chmod 0775 /run/faas
+               ls -lad /run/faas"
           # SCP faas-vmmd.service unit
           UNIT_SRC="deploy/etc/faas-vmmd.service"
           UNIT_DST="/etc/systemd/system/faas-vmmd.service"
@@ -339,6 +348,12 @@ jobs:
                 sleep 3
               fi
             done
+            # PR-M.1: chown /run/faas after the rollback restart
+            # loop (same rationale as in the main path — vmmd's
+            # RuntimeDirectory=faas resets perms to root:root 0755
+            # on every restart).
+            chown root:faas /run/faas
+            chmod 0775 /run/faas
             if wait_healthy; then
               echo "::warning::rollback succeeded — box is serving the PREVIOUS build"
             else
@@ -550,6 +565,22 @@ jobs:
             exit 1
           fi
 
+          # PR-M.1: chown /run/faas AFTER the restart loop. vmmd's
+          # RuntimeDirectory=faas recreates the dir's per-unit tmpfs on
+          # every restart, resetting perms to root:root 0755 even
+          # though vmmd's ExecStartPre chowns the underlying directory.
+          # The bind-mount (visible to subsequent restarters) inherits
+          # the tmpfs source perms. Running the chown here, after vmmd
+          # has settled and is the SOLE /run/faas owner, makes the
+          # perms stick for the rest of the deploy. The earlier chown
+          # at line 164 (Install systemd service units step) stays —
+          # it covers the install-to-restart window. See
+          # deploy/controlplane/tmpfiles.d/faas.conf for the canonical
+          # rationale.
+          chown root:faas /run/faas
+          chmod 0775 /run/faas
+          ls -lad /run/faas
+
           # Health gate. Probes gatewayd-public (loopback :9090), not apid directly
           # — spec §11 binds apid to loopback-only and gatewayd
           # reverse-proxies /healthz onto apid, so this exercises the full
@@ -608,6 +639,21 @@ jobs:
                 journalctl -u faas-$svc -n 20 --no-pager || true
               fi
             done
+            # PR-M: assert /run/faas ownership is root:faas 0775.
+            # The cd-controlplane + ansible chown step is load-bearing
+            # (see deploy/controlplane/tmpfiles.d/faas.conf for the
+            # rationale) — this is a tripwire so a regression in the
+            # chown step surfaces here instead of as a future
+            # githubd bind-loop in production.
+            RUNDIR_OWNER=$(stat -c '%U:%G' /run/faas)
+            RUNDIR_MODE=$(stat -c '%a' /run/faas)
+            if [[ "${RUNDIR_OWNER}" != "root:faas" || "${RUNDIR_MODE}" != "775" ]]; then
+              echo "::error::/run/faas ownership is ${RUNDIR_OWNER} mode ${RUNDIR_MODE}; expected root:faas 0775 (PR-M regression)"
+              ls -lad /run/faas || true
+              failed=1
+            else
+              echo "✓ /run/faas ownership is root:faas 0775"
+            fi
             exit $failed
           '
 

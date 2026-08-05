@@ -243,6 +243,22 @@ type runDeps struct {
 	// audit is the *pkg/audit.Auditor that emits the auth.mfa_gate_hit
 	// / auth.session.stolen rows. nil in tests.
 	audit *audit.Auditor
+	// requireAuthnAdapter (issue #560) wraps deps.authMw.Authn
+	// to satisfy pkg/gateway's narrow RequireAuthnAuthenticator
+	// interface. nil = authz branch disabled (preserves the
+	// pre-issue public-by-default behaviour for unit tests +
+	// dev boxes). Production wires this after deps.authMw is
+	// constructed; the AppLogsHandler-style carve-out (only
+	// when deps.authMw is non-nil) makes the wiring safe.
+	requireAuthnAdapter *requireAuthnAdapter
+	// requireAuthnAudit is the cmd/gatewayd-scope audit emitter
+	// the per-deployment authz branch uses for the
+	// instances.authn_* rows. nil = audit-disabled (tests).
+	// Distinct from deps.audit (a *pkg/audit.Auditor) because
+	// the gateway's narrow interface wants the
+	// gatewaydAuditor.Emit(ctx, kind, subject, data) shape,
+	// not the apid auditor's wider surface.
+	requireAuthnAudit *gatewaydAuditor
 	// scheddClient is the ScheddClient interface (production: a
 	// single *scheddgrpc.Client from the per-node cache) used by
 	// AppLogsHandler (issue #254 / Move 4 PR-2) and the warm hint
@@ -369,7 +385,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
@@ -581,6 +597,17 @@ func run(ctx context.Context, log *slog.Logger) error {
 		log,
 		deps.apiAuthLimiter,
 	)
+	// Issue #560: per-deployment require_authn (pro/Scale opt-in).
+	// Build the narrow gateway.RequireAuthnAuthenticator
+	// adapter around the production middleware and the
+	// gatewayd-scope audit emitter used by every other gated
+	// path. Both are nil-safe on the pkg/gateway side so a
+	// future operator env-override can disable the chain
+	// without code changes — for now production always wires
+	// them when deps.authMw is non-nil (which it always is
+	// outside unit tests).
+	deps.requireAuthnAdapter = newRequireAuthnAdapter(deps.authMw)
+	deps.requireAuthnAudit = newGatewaydAuditor(deps.pgStore, log)
 	// The scheddClient reference is needed by AppLogsHandler (PR-2).
 	// It outlives `run` because we want the AppLogsHandler to keep a
 	// pointer to the same client; defers Close.
@@ -640,6 +667,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — run()
 	// populates deps.streamingEnabled; tests inject the bit directly.
 	handler.WithStreamingEnabled(deps.streamingEnabled)
+	// Issue #560: per-deployment require_authn. The adapter
+	// + auditor are nil-safe; the pre-issue public-by-default
+	// behaviour is preserved for unit tests + dev boxes that
+	// leave deps.requireAuthnAdapter / deps.requireAuthnAudit
+	// nil. Production wires both unconditionally after
+	// deps.authMw is built in run().
+	handler.WithRequireAuthn(deps.requireAuthnAdapter, deps.requireAuthnAudit)
 	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
 	// producer channel. The sink is shared between Handler.recordEgress
 	// (writer) and egressgrpc.Server (drainer-on-cadence reader).

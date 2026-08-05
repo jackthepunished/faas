@@ -101,7 +101,7 @@ const (
 // silently drop valid inputs like `--ram 0` or `--idle -1`.
 func cmdApp(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N] [--concurrency]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N] [--concurrency] [--require-authn] [--no-require-authn]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -149,11 +149,31 @@ func cmdApp(args []string) int {
 	// and the per-account cap (Hobby 1, Pro 2, Scale 4) are
 	// enforced server-side.
 	evictPriority := fs.String("eviction-priority", "", "per-app eviction tier: 'best_effort' (default) or 'reserved' (Free rejected; Hobby 1, Pro 2, Scale 4 apps per account)")
+	// Issue #560: per-deployment token gate. The flag pair is
+	// mutually exclusive — passing both is a usage error rather than
+	// a silent last-one-wins. Visit-flag detection lets the user
+	// distinguish "unset" (no patch) from explicit true/false, so
+	// `gregale app <slug>` with neither flag still falls through to
+	// the info-block print path. Pro/Scale only — the API rejects
+	// Free/Hobby with 403 plan_require_authn_not_allowed, which
+	// surfaces here as an "Update failed" error with the API's
+	// problem code.
+	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
+	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
 	if *warm && *noWarm {
 		return printErr("Invalid flags", fmt.Errorf("--warm-snapshot and --no-warm-snapshot are mutually exclusive"))
+	}
+	// Issue #560: mutual exclusion check for the require-authn pair.
+	// Mirrors the --warm-snapshot / --no-warm-snapshot guard above —
+	// symmetric flag pairs intentionally use a usage error (not a
+	// silent last-one-wins) so the customer sees the conflict instead
+	// of an unexpected PATCH. The plan gate runs server-side; the
+	// CLI's job is to keep the flag pair consistent.
+	if *requireAuthn && *noRequireAuthn {
+		return printErr("Invalid flags", fmt.Errorf("--require-authn and --no-require-authn are mutually exclusive"))
 	}
 	// Issue #559: --concurrency fast path. Refuse to mix with
 	// update flags (mixing a read-only query with a write would
@@ -256,11 +276,24 @@ func cmdApp(args []string) int {
 		}
 		req.EvictionPriority = &v
 	}
+	// Issue #560: require-authn pair coalesces to a single *bool on
+	// the wire so the apid side sees one canonical field. Each flag
+	// of the pair sets an explicit value; the no-op guard below
+	// checks `req.RequireAuthn == nil` to keep the bare
+	// `gregale app <slug>` invocation on the info-block print path.
+	if explicit["require-authn"] {
+		v := true
+		req.RequireAuthn = &v
+	}
+	if explicit["no-require-authn"] {
+		v := false
+		req.RequireAuthn = &v
+	}
 
 	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
 		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
 		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil &&
-		req.EvictionPriority == nil {
+		req.EvictionPriority == nil && req.RequireAuthn == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -338,6 +371,16 @@ func cmdApp(args []string) int {
 			fmt.Printf("%-30s %s\n", "eviction priority:", "best_effort")
 		} else {
 			fmt.Printf("%-30s %s\n", "eviction priority:", a.EvictionPriority)
+		}
+		// Issue #560: surface the per-app token gate flag so the
+		// customer can verify their PATCH round-tripped without
+		// dropping into --json. Mirrors the warm-snapshot
+		// enabled/disabled rendering above (a single on/off, no
+		// extra gating threshold).
+		if a.RequireAuthn {
+			fmt.Printf("%-30s %s\n", "require authn:", "enabled")
+		} else {
+			fmt.Printf("%-30s %s\n", "require authn:", "disabled")
 		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
@@ -422,8 +465,45 @@ func cmdDeployTarball(args []string) int {
 	yes := fs.Bool("yes", false, "skip the apply confirmation prompt")
 	deployOnly := fs.String("only", "", "comma-separated workload names to apply (triggers one-key provision)")
 	projectSlug := fs.String("project-slug", "", "kebab slug for the project (triggers one-key provision)")
+	// Issue #560: per-deployment require_authn opt-in (Cloud Run
+	// --no-allow-unauthenticated analogue). Same flag pair as
+	// cmdApp / cmdAppScale. Mirrors the --warm-snapshot /
+	// --no-warm-snapshot pattern: positive and explicit-negative
+	// are both opt-in (so customers can flip either way without a
+	// separate set-true / set-false command); the unset value
+	// (no flag) is the global default of false. The plan gate
+	// (Pro/Scale only) is enforced server-side at the apid PATCH
+	// + CreateApp handlers, so Free/Hobby customers get the same
+	// 403 plan_require_authn_not_allowed whether they reach the
+	// gate through `gregale deploy --require-authn` or `gregale
+	// app <slug> --require-authn`.
+	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
+	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+	// Issue #560: flag-pair mutex check (mirrors cmdApp /
+	// cmdAppScale --warm-snapshot/--no-warm-snapshot). Setting
+	// both is unambiguous noise; reject before any side effects.
+	if *requireAuthn && *noRequireAuthn {
+		return printErr("Invalid flags", fmt.Errorf("--require-authn and --no-require-authn are mutually exclusive"))
+	}
+	// fs.Visit distinguishes "unset" from "explicit zero": if the
+	// customer passed either --require-authn or --no-require-authn
+	// (but not both — checked above), we propagate the bool to the
+	// CreateApp call so a fresh deploy can opt in/out at create
+	// time. nil = unset → apid server default (false), so existing
+	// customers see no behaviour change.
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	var requireAuthnPtr *bool
+	switch {
+	case explicit["require-authn"]:
+		v := true
+		requireAuthnPtr = &v
+	case explicit["no-require-authn"]:
+		v := false
+		requireAuthnPtr = &v
 	}
 	slug := *name
 	if slug == "" {
@@ -626,10 +706,28 @@ func cmdDeployTarball(args []string) int {
 		return 0
 	}
 
-	if _, err := client.CreateApp(ctx, api.CreateAppRequest{Slug: slug}); err != nil {
+	if _, err := client.CreateApp(ctx, api.CreateAppRequest{
+		Slug:         slug,
+		RequireAuthn: requireAuthnPtr,
+	}); err != nil {
 		var ae *APIError
 		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
 			return printErr("Could not create app", err)
+		}
+		// Issue #560: the slug already exists (409). The deploy
+		// path used to silently swallow the dup and proceed with
+		// no PATCH; now if the customer passed --require-authn
+		// or --no-require-authn on this deploy, we follow up
+		// with a PATCH to mirror the new flag onto the existing
+		// app — the plan gate (Pro/Scale only) still fires at
+		// the apid PATCH handler, so Free/Hobby customers
+		// flipping --require-authn on an existing app get the
+		// same 403 plan_require_authn_not_allowed as on a fresh
+		// create. The unset case (no flag passed) is a no-op.
+		if requireAuthnPtr != nil {
+			if _, err := client.UpdateApp(ctx, slug, api.UpdateAppRequest{RequireAuthn: requireAuthnPtr}); err != nil {
+				return printErr("Could not update existing app's require_authn", err)
+			}
 		}
 	}
 

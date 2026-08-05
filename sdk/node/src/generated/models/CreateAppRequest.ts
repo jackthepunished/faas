@@ -32,5 +32,9 @@ export type CreateAppRequest = {
    * Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction. Omitted at create-time → apid applies the schema default 'best_effort'.
    */
   eviction_priority?: 'best_effort' | 'reserved';
+  /**
+   * Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false). Pro/Scale only.
+   */
+  require_authn?: boolean;
 };
 

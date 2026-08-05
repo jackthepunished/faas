@@ -444,11 +444,28 @@ func cmdAppScale(slug string, args []string) int {
 	noWarm := fs.Bool("no-warm-snapshot", false, "disable warm-snapshot tier")
 	warmMinReq := fs.Int("warm-snapshot-min-requests", 0, "warm-snapshot min-request gate (1..100; 0 = use server default)")
 	warmMinMs := fs.Int("warm-snapshot-min-ms", 0, "warm-snapshot min-ms-since-ready gate (100..60000; 0 = use server default)")
+	// Issue #560: per-deployment token gate. Mirror commands2.go:cmdApp
+	// so the canonical `gregale app <slug> scale --require-authn` form
+	// keeps parity with the top-level `gregale app <slug> --require-authn`
+	// form. Pro/Scale only — the API rejects Free/Hobby with 403
+	// plan_require_authn_not_allowed, which surfaces as a "Scale failed"
+	// error with the API's problem code.
+	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
+	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *warm && *noWarm {
 		return printErr("Invalid flags", fmt.Errorf("--warm-snapshot and --no-warm-snapshot are mutually exclusive"))
+	}
+	// Issue #560: mutual exclusion check for the require-authn pair.
+	// Mirrors the warm-snapshot guard above — symmetric flag pairs
+	// intentionally use a usage error (not a silent last-one-wins) so
+	// the customer sees the conflict instead of an unexpected PATCH.
+	// The plan gate runs server-side; the CLI's job is to keep the
+	// flag pair consistent.
+	if *requireAuthn && *noRequireAuthn {
+		return printErr("Invalid flags", fmt.Errorf("--require-authn and --no-require-authn are mutually exclusive"))
 	}
 	explicit := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
@@ -493,11 +510,25 @@ func cmdAppScale(slug string, args []string) int {
 		v := *warmMinMs
 		req.WarmSnapshotMinMs = &v
 	}
+	// Issue #560: require-authn pair coalesces to a single *bool on
+	// the wire so the apid side sees one canonical field. Each flag
+	// of the pair sets an explicit value; the no-op guard below
+	// checks `req.RequireAuthn == nil` to keep an unrelated `scale`
+	// invocation (e.g. `--ram`) on the Update path.
+	if explicit["require-authn"] {
+		v := true
+		req.RequireAuthn = &v
+	}
+	if explicit["no-require-authn"] {
+		v := false
+		req.RequireAuthn = &v
+	}
 	if req.RAMMB == nil && req.MaxConcurrency == nil &&
 		req.IdleTimeoutS == nil && req.MinInstances == nil &&
 		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
-		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> scale [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N]", "apps")
+		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil &&
+		req.RequireAuthn == nil {
+		PrintUsage(os.Stderr, "usage: gregale app <slug> scale [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N] [--require-authn] [--no-require-authn]", "apps")
 		return 1
 	}
 	client, err := authedClient()

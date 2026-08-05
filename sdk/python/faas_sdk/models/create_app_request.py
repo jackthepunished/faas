@@ -45,6 +45,9 @@ class CreateAppRequest:
     """Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper
     behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction. Omitted at create-time → apid
     applies the schema default 'best_effort'."""
+    require_authn: bool | Unset = UNSET
+    """Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false).
+    Pro/Scale only."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +79,8 @@ class CreateAppRequest:
         if not isinstance(self.eviction_priority, Unset):
             eviction_priority = self.eviction_priority
 
+        require_authn = self.require_authn
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -103,6 +108,8 @@ class CreateAppRequest:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
         if eviction_priority is not UNSET:
             field_dict["eviction_priority"] = eviction_priority
+        if require_authn is not UNSET:
+            field_dict["require_authn"] = require_authn
 
         return field_dict
 
@@ -146,6 +153,8 @@ class CreateAppRequest:
         else:
             eviction_priority = check_create_app_request_eviction_priority(_eviction_priority)
 
+        require_authn = d.pop("require_authn", UNSET)
+
         create_app_request = cls(
             slug=slug,
             type_=type_,
@@ -158,6 +167,7 @@ class CreateAppRequest:
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
             eviction_priority=eviction_priority,
+            require_authn=require_authn,
         )
 
         create_app_request.additional_properties = d

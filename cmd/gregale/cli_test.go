@@ -1274,3 +1274,155 @@ func TestCmdDeploy_Recovery_PrintsColdWakeSentence(t *testing.T) {
 		}
 	}
 }
+
+// TestCmdDeploy_RequireAuthn_CarryThrough pins that
+// `gregale deploy --image X --require-authn` carries
+// `require_authn: true` on the POST /v1/apps body (issue #560
+// AC #1 — the customer's CLI round-trip should opt in at deploy
+// time so the resulting app returns 401 without a token). Mirrors
+// the cmdApp / cmdAppScale Visit-flag pattern at commands2.go:263
+// and commands5_test.go:927 (TestCmdAppScale_RequireAuthnTrue)
+// but on the deploy path, which is the issue's primary UX entry.
+//
+// The fake server only stubs the routes cmdDeployTarball touches
+// (POST /v1/apps, POST /v1/apps/<slug>/deployments, the SSE logs
+// stream) and asserts the CreateApp body carries the explicit
+// pointer-to-true. A nil pointer (unset) would have left the
+// server default false — that's the "no flag" baseline that TestCmdDeploy_HappyPath
+// covers; this test pins the *flag was passed* path.
+func TestCmdDeploy_RequireAuthn_CarryThrough(t *testing.T) {
+	var gotCreateBody api.CreateAppRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == "POST":
+			if err := json.NewDecoder(r.Body).Decode(&gotCreateBody); err != nil {
+				http.Error(w, "bad json", 400)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(api.AppResponse{ID: "a1", Slug: "authn-app", RequireAuthn: true})
+		case r.URL.Path == "/v1/apps/authn-app/deployments":
+			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{ID: "d1", Status: "pending", AppID: "authn-app"})
+		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := cmdDeployTarball([]string{
+		"--image", "registry.x/app@sha256:abc",
+		"--name", "authn-app",
+		"--require-authn",
+	}); code != 0 {
+		t.Fatalf("cmdDeploy --require-authn exit = %d, want 0", code)
+	}
+	if gotCreateBody.RequireAuthn == nil {
+		t.Fatalf("CreateApp body missing RequireAuthn pointer; want pointer to true")
+	}
+	if *gotCreateBody.RequireAuthn != true {
+		t.Errorf("CreateApp RequireAuthn = %t, want true (deploy --require-authn UX)", *gotCreateBody.RequireAuthn)
+	}
+}
+
+// TestCmdDeploy_RequireAuthn_Mutex pins that --require-authn and
+// --no-require-authn together is a usage error, matching the same
+// mutex at cmdApp / cmdAppScale. Returns exit 1 BEFORE any HTTP
+// call (asserted: server handler panics are not hit, since the
+// server is replaced with a defensive 500 that would clearly
+// fingerprint the regression).
+func TestCmdDeploy_RequireAuthn_Mutex(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("server should not be called when mutex flags trip; got %s %s", r.Method, r.URL.Path)
+		http.Error(w, "no", 500)
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := cmdDeployTarball([]string{
+		"--image", "registry.x/app@sha256:abc",
+		"--name", "mutex-app",
+		"--require-authn",
+		"--no-require-authn",
+	}); code != 1 {
+		t.Errorf("cmdDeploy mutex exit = %d, want 1 (usage error)", code)
+	}
+}
+
+// TestCmdDeploy_RequireAuthn_ExistingAppPATCH pins that when the
+// app already exists (CreateApp returns 409) and the customer
+// passed --require-authn on the deploy, the deploy path PATCHes
+// the existing app to flip the flag. This is the second half of
+// the AC #1 UX: opt-in works whether the slug is new (POST) or
+// already deployed (POST 409 → PATCH). Plan gate (Pro/Scale only)
+// still fires server-side at the apid PATCH validator — the fake
+// server here just stamps the gate as "passed" and the test
+// checks the wire body.
+func TestCmdDeploy_RequireAuthn_ExistingAppPATCH(t *testing.T) {
+	var gotPatchBody api.UpdateAppRequest
+	var sawPatch, sawCreate bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == "POST":
+			sawCreate = true
+			// Project envelope: the actual codebase returns a 409
+			// with a Problem body (api.NewProblem 409). The CLI
+			// turns it into an APIError via errors.As in printErr;
+			// without the right shape the swallow wouldn't fire
+			// and the deploy path would surface "Could not
+			// create app" instead of falling through to the
+			// PATCH branch.
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(409)
+			_ = json.NewEncoder(w).Encode(api.Problem{Status: 409, Code: api.CodeConflict, Title: "Conflict", Detail: "app exists"})
+		case r.URL.Path == "/v1/apps/existing-app" && r.Method == "PATCH":
+			sawPatch = true
+			if err := json.NewDecoder(r.Body).Decode(&gotPatchBody); err != nil {
+				http.Error(w, "bad json", 400)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(api.AppResponse{Slug: "existing-app", RequireAuthn: true})
+		case strings.HasPrefix(r.URL.Path, "/v1/deployments/d1/logs"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			_, _ = fmt.Fprint(w, "event: status\ndata: {\"status\":\"live\"}\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		case r.URL.Path == "/v1/apps/existing-app/deployments":
+			_ = json.NewEncoder(w).Encode(api.DeploymentResponse{ID: "d1", Status: "pending", AppID: "existing-app"})
+		default:
+			http.Error(w, "no", 404)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	if code := cmdDeployTarball([]string{
+		"--image", "registry.x/app@sha256:abc",
+		"--name", "existing-app",
+		"--require-authn",
+	}); code != 0 {
+		t.Fatalf("cmdDeploy existing-app exit = %d, want 0", code)
+	}
+	if !sawCreate {
+		t.Errorf("expected POST /v1/apps (got 409), but server never saw it")
+	}
+	if !sawPatch {
+		t.Errorf("expected PATCH /v1/apps/existing-app after 409 to mirror --require-authn onto existing app; got nothing")
+	}
+	if gotPatchBody.RequireAuthn == nil || *gotPatchBody.RequireAuthn != true {
+		t.Errorf("PATCH body RequireAuthn = %v, want pointer to true", gotPatchBody.RequireAuthn)
+	}
+}

@@ -52,6 +52,18 @@ type App struct {
 	// the App struct keeps the hot path allocation-free
 	// after first sight.
 	Sidecars []AppSidecar
+	// RequireAuthn (issue #560) is the per-deployment
+	// token-gate opt-in. When true, ServeHTTP demands a
+	// valid `Authorization: Bearer <token>` header on every
+	// request to this app; cross-account tokens (the bearer
+	// resolves to a different account than App.AccountID)
+	// receive 403 insufficient_scope. Plumbed through
+	// pgRouter.toApp from the apps row, mirroring
+	// StreamingEnabled above, so ServeHTTP can make the
+	// decision without re-reading the database. Default
+	// false in fakeBackend unit tests (the in-memory
+	// backend doesn't populate the column).
+	RequireAuthn bool
 }
 
 // AppSidecar (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
@@ -64,6 +76,47 @@ type App struct {
 type AppSidecar struct {
 	Name string
 	Port int
+}
+
+// RequireAuthnAuthenticator (issue #560) is the narrow slice of
+// pkg/auth.Middleware.Authenticator the per-deployment authz
+// branch consumes — AuthenticateKey alone, returning
+// (account, key, error). Declaring it locally keeps pkg/gateway
+// free of any import dependency on pkg/auth or pkg/state
+// (cmd/gatewayd wires the *authmw.Middleware, which satisfies
+// this interface through its exported Authn field; the
+// compile-time assertion at the call site pins the contract).
+type RequireAuthnAuthenticator interface {
+	AuthenticateKey(ctx context.Context, hash []byte) (RequireAuthnAccount, RequireAuthnKey, error)
+}
+
+// RequireAuthnAccount is the read-only slice of state.Account the
+// authz branch needs — just the ID, so it can compare against
+// App.AccountID and emit 403 on mismatch. Field name mirrors
+// state.Account.ID so a future drift surfaces as a compile error
+// at the wiring site.
+type RequireAuthnAccount struct {
+	ID string
+}
+
+// RequireAuthnKey is the read-only slice of state.APIKey the
+// authz branch carries for forensic visibility on denied
+// requests (the audit payload's `key_id` field). Field name
+// mirrors state.APIKey.ID so the wiring site catches drift.
+type RequireAuthnKey struct {
+	ID string
+}
+
+// RequireAuthnAuditor is the narrow slice of cmd/gatewayd/audit.go's
+// gatewaydAuditor the per-deployment authz branch uses to emit
+// instances.authn_missing / instances.authn_invalid /
+// instances.authn_scope. Declared locally so pkg/gateway doesn't
+// import cmd/* (avoid a reverse dep) and so tests can inject a
+// counting fake. Best-effort semantics — the authz branch never
+// blocks a deny response on a failed emit (matches the apid
+// auditor's contract at cmd/apid/audit.go:79).
+type RequireAuthnAuditor interface {
+	Emit(ctx context.Context, kind string, subject *string, data map[string]any)
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue
@@ -207,6 +260,23 @@ type Handler struct {
 	// initialise it explicitly. Value semantics avoid the
 	// data-race that lazy init would create under -race.
 	piApps preInstantiateApps
+	// requireAuthnAuthn is the bearer-key verifier the
+	// per-deployment authz branch uses (issue #560). nil =
+	// authz branch disabled (default; matches the pre-issue
+	// behaviour where every app is public-by-default). Production
+	// wires it from pkg/auth.Middleware.Authn so the
+	// authenticate-key path is shared with cmd/apid + the
+	// AppLogsHandler (ADR-046). nil-safe at the call site —
+	// ServeHTTP skips the authz branch when nil, so unit tests
+	// that don't exercise require_authn don't have to wire it.
+	requireAuthnAuthn RequireAuthnAuthenticator
+	// requireAuthnAudit emits the instances.authn_missing /
+	// instances.authn_invalid / instances.authn_scope audit
+	// rows when a gated-app request is denied. nil =
+	// audit-disabled (tests). Production wires the gatewayd
+	// audit emitter so the rows land in the same events table
+	// every other gatewayd-scope row uses (cmd/gatewayd/audit.go).
+	requireAuthnAudit RequireAuthnAuditor
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -320,6 +390,195 @@ func (h *Handler) WithStreamingEnabled(enabled bool) *Handler {
 	h.streamingEnabled = enabled
 	return h
 }
+
+// WithRequireAuthn (issue #560) arms the per-deployment token
+// gate. authn must satisfy RequireAuthnAuthenticator —
+// production passes the *pkg/auth.Middleware from cmd/gatewayd
+// (which exposes its Authn field). audit may be nil (audit-
+// disabled mode); the authz branch still fires but the
+// instances.authn_* rows are dropped. nil authn = the authz
+// branch is silently disabled (matches the pre-issue behaviour
+// where every app is public-by-default) so unit tests that
+// don't exercise require_authn don't have to wire the chain.
+//
+// The setter returns *Handler for fluent chaining (same shape as
+// every other Handler.With*).
+func (h *Handler) WithRequireAuthn(authn RequireAuthnAuthenticator, audit RequireAuthnAuditor) *Handler {
+	h.requireAuthnAuthn = authn
+	h.requireAuthnAudit = audit
+	return h
+}
+
+// enforceRequireAuthn is the per-deployment token-gate
+// (issue #560). Returns true when the request is authorised to
+// proceed (either the routed app has RequireAuthn=false OR the
+// caller presented a valid bearer token belonging to the app's
+// owning account); returns false after writing the deny
+// response and the metrics observation. The boolean keeps the
+// call-site in ServeHTTP at one line (already-extracted from
+// the hot path to stay under the 50-line handler cap, per
+// golangci-lint v2.4.0 handler checks).
+//
+// Deny paths:
+//
+//	401 unauthorized     no Authorization header, or the
+//	                     bearer token doesn't match
+//	                     api.ValidAPIKeyFormat (mirrors the
+//	                     shape pkg/auth.Middleware uses).
+//	401 unauthorized     bearer key is unknown / revoked /
+//	                     expired (the audit row distinguishes
+//	                     the cause — see instances.authn_*
+//	                     below).
+//	403 insufficient_scope  bearer resolves to a valid key,
+//	                     but the key's account_id != the
+//	                     app's account_id. Distinct from
+//	                     401 so the SDK can pivot on the
+//	                     response code instead of having to
+//	                     inspect the body.
+//
+// Audit emission:
+//
+//	instances.authn_missing  401 path, no/garbled header
+//	instances.authn_invalid  401 path, key unknown /
+//	                         revoked / expired
+//	instances.authn_scope    403 path, account mismatch
+//
+// All three audit rows carry app_id + slug + key_id (when
+// known) so an operator dashboard can pivot by app and by
+// caller. The subject pointer is the account ID (the key's
+// owner) for scope, nil for missing/invalid (no principal to
+// stamp). Best-effort — a failed emit never blocks the deny
+// response (matches the gatewaydAuditor.Emit contract).
+func (h *Handler) enforceRequireAuthn(w http.ResponseWriter, r *http.Request, rec *statusRecorder, app App) bool {
+	// Disabled path: not gated, or no auth chain wired.
+	// Both branches preserve the pre-issue "public by default"
+	// behaviour so unit tests + dev boxes don't need to set
+	// up a fake authenticator.
+	if !app.RequireAuthn || h.requireAuthnAuthn == nil {
+		return true
+	}
+	// (1) Bearer extraction — fail-fast at 401 if no token.
+	tok := bearerTokenFromHeader(r.Header.Get("Authorization"))
+	if tok == "" || !api.ValidAPIKeyFormat(tok) {
+		h.emitAuthnAudit(r, app, nil, "instances.authn_missing", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"reason": "missing_or_malformed_bearer",
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "this app requires an API key; present it as `Authorization: Bearer <token>`"))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (2) Verify the key via the shared pkg/auth.Authenticator.
+	// The hash call uses the same api.HashAPIKey helper the
+	// apid middleware uses (defense in depth — keys never
+	// reach the store unhashed).
+	acct, key, err := h.requireAuthnAuthn.AuthenticateKey(r.Context(), api.HashAPIKey(tok))
+	if err != nil {
+		// Distinguish expired/revoked (the store's typed
+		// sentinels) from "unknown key" so the audit row
+		// carries forensic detail. The customer-facing
+		// response stays 401 in both cases — leaking the
+		// distinction would tell an attacker whether a
+		// given key prefix exists.
+		reason := "invalid_bearer"
+		if errors.Is(err, ErrAPIKeyExpired) {
+			reason = "expired"
+		} else if errors.Is(err, ErrAPIKeyRevoked) {
+			reason = "revoked"
+		}
+		h.emitAuthnAudit(r, app, nil, "instances.authn_invalid", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"reason": reason,
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "the presented API key is not valid for this app"))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (3) Cross-account check — a valid key on the wrong
+	// account is 403, not 401. The audit subject is the key's
+	// owning account so the operator can see "who tried".
+	if acct.ID != app.AccountID {
+		h.emitAuthnAudit(r, app, &acct.ID, "instances.authn_scope", map[string]any{
+			"app_id":            app.ID,
+			"slug":              r.Host,
+			"caller_account_id": acct.ID,
+			"app_account_id":    app.AccountID,
+			"key_id":            key.ID,
+		})
+		rec.status = http.StatusForbidden
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
+			"Insufficient scope", "this API key does not belong to the account that owns the app"))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	return true
+}
+
+// emitAuthnAudit is a tiny wrapper around the optional auditor
+// so the three deny branches in enforceRequireAuthn read
+// symmetrically. Nil-safe: tests + dev boxes wire a nil
+// auditor and the row is silently dropped.
+func (h *Handler) emitAuthnAudit(r *http.Request, app App, subject *string, kind string, data map[string]any) {
+	if h.requireAuthnAudit == nil {
+		return
+	}
+	h.requireAuthnAudit.Emit(r.Context(), kind, subject, data)
+}
+
+// bearerTokenFromHeader is the per-deployment authz branch's
+// local copy of pkg/auth.Middleware.bearerToken. Duplicated
+// here (rather than re-exported from pkg/auth) so pkg/gateway
+// keeps its zero-dep-on-pkg/auth posture (the same decoupling
+// the streaming fallback helper has). Matches the same
+// case-insensitive RFC 6750 §2.1 shape.
+//
+// Empty string in → empty string out. A bare "Bearer " with
+// no token is also empty out (the caller treats it as missing).
+func bearerTokenFromHeader(h string) string {
+	const scheme = "bearer "
+	if len(h) < len(scheme) {
+		return ""
+	}
+	if !strings.EqualFold(h[:len(scheme)], scheme) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(scheme):])
+}
+
+// ErrAPIKeyExpired / ErrAPIKeyRevoked are local sentinels for
+// the AuthenticateKey error contract (issue #560). The real
+// errors live in pkg/state (state.ErrAPIKeyExpired /
+// state.ErrAPIKeyRevoked). pkg/gateway can't import pkg/state
+// without dragging in the whole sqlc-generated surface, so we
+// mirror the bare error type here and the production adapter in
+// cmd/gatewayd-internal adapts the real sentinels into these via
+// a thin wrapper (see cmd/gatewayd-internal/require_authn_adapter.go).
+//
+// ServeHTTP compares with errors.Is, which is type-aware, so the
+// string values below are cosmetic — operator-facing audit rows
+// never log these strings, and the gate doesn't string-compare.
+// The values are kept verbatim from state.Err*.Error() so an
+// operator pasting an error message from a log into
+// errors.Is(errAPIKey) matches by mistake rather than by design.
+var (
+	ErrAPIKeyExpired = errAuthnSentinel("api_key_expired")
+	ErrAPIKeyRevoked = errAuthnSentinel("api_key_revoked")
+)
+
+// errAuthnSentinel is a named-error type so errors.Is works
+// against the constant strings above without forcing pkg/gateway
+// to know about state.Err*. The string values are the same codes
+// pkg/state emits; the production adapter in cmd/gatewayd
+// translates via errors.Is on the incoming error.
+type errAuthnSentinel string
+
+func (e errAuthnSentinel) Error() string { return string(e) }
 
 // streamingFallbackLog emits a once-per-process deprecation line for
 // the buffered-fallback path (issue #471 PR-A AC #4). A misconfigured
@@ -623,6 +882,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 			"No such app", fmt.Sprintf("no app is routed to %q", appHost)))
 		h.observe(r, rec.status, "", "", false, Target{})
+		return
+	}
+
+	// Issue #560 / per-deployment require_authn. Runs AFTER
+	// Host→app resolution (so we know which app's
+	// require_authn to consult) and BEFORE the per-account
+	// rate limit / wake gate (so unauthenticated traffic
+	// can't trigger a cold-boot on a token-gated app — the
+	// wake gate's schedd RPC and the meter's first-byte
+	// observability never see traffic from a missing or
+	// invalid bearer). nil-safe: a nil requireAuthnAuthn
+	// (tests + dev boxes that don't wire the chain) is a
+	// pass-through, so the pre-issue behaviour is preserved.
+	if !h.enforceRequireAuthn(w, r, rec, app) {
 		return
 	}
 

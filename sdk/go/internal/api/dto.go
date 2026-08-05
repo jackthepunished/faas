@@ -103,7 +103,23 @@ type AppResponse struct {
 	// concurrency-safe; sync subprocess-per-request handlers are
 	// not).
 	ConcurrencyPerVMBound int `json:"concurrency_per_vm"`
-	IdleTimeoutS          int `json:"idle_timeout_s,omitempty"`
+	// RequireAuthn (issue #560) is the per-deployment token-
+	// gate flag. When true, every incoming request to this
+	// app must carry a valid `Authorization: Bearer <token>`
+	// header whose key belongs to the app's owning account
+	// (cross-account tokens receive 403 insufficient_scope
+	// at gatewayd-internal). Pro/Scale only — Free/Hobby
+	// PATCH-true is rejected with 403
+	// plan_require_authn_not_allowed at apid. Default false
+	// at create-time (preserves the existing
+	// public-by-default behaviour). Surfaced so the dashboard
+	// can render a "Token-gated" badge without a second
+	// round-trip; the SDK's WithToken() helper (client.go:110)
+	// already injects the bearer header on every request,
+	// so a customer calling CreateApp with RequireAuthn=true
+	// on the CLI just needs the token set on the client.
+	RequireAuthn bool `json:"require_authn"`
+	IdleTimeoutS int  `json:"idle_timeout_s,omitempty"`
 	// MinInstances is the per-app cold-wake floor (ux_spec §6.5).
 	// 0 => scale to zero; >0 => keep N warm. Pro/Scale only.
 	MinInstances int    `json:"min_instances"`

@@ -2511,6 +2511,18 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetEvictionPriority {
 		a.EvictionPriority = derefString(p.EvictionPriority)
 	}
+	// Issue #560: per-app require_authn opt-in. Same Set-bit
+	// convention as require_signed / streaming_enabled — the Set
+	// bit distinguishes "don't touch" from "explicit false"
+	// (opt out — back to public-by-default). Apid already gated
+	// the plan (Free/Hobby + true is rejected with 403
+	// plan_require_authn_not_allowed); the store is a plain
+	// column write. The memstore mirrors the pgstore shape so
+	// every test that exercises UpdateApp sees the same
+	// behaviour regardless of backend.
+	if p.SetRequireAuthn {
+		a.RequireAuthn = boolOrFalse(p.RequireAuthn)
+	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
 	// apid handler never sets them (customers don't touch root_dir

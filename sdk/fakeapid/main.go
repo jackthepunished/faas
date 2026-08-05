@@ -58,7 +58,11 @@ func accountLimits() map[string]any {
 // round-trip; EgressAllowlist materialises as [] (not null).
 // ConcurrencyPerVMBound (issue #559) is required by the OpenAPI
 // schema — fakeapid advertises 5 to match the Hobby plan the
-// other endpoints already pin.
+// other endpoints already pin. RequireAuthn (issue #560) is
+// always false in the fake — fakeapid is an internal
+// localhost-only stub that doesn't exercise the per-deployment
+// token gate; production gated-app traffic routes through
+// gatewayd-internal's authz branch (cmd/gatewayd-internal).
 func appResponse(slug string) []byte {
 	return mustJSON(map[string]any{
 		"id":                       "app_01HXYZ",
@@ -74,6 +78,7 @@ func appResponse(slug string) []byte {
 		"egress_allowlist":         []string{},
 		"autoscale_target_rps":     0,
 		"autoscale_target_cpu_pct": 0,
+		"require_authn":            false,
 	})
 }
 
@@ -198,6 +203,7 @@ func (f *fixture) handler() http.Handler {
 					"egress_allowlist":         []string{},
 					"autoscale_target_rps":     0,
 					"autoscale_target_cpu_pct": 0,
+					"require_authn":            false,
 				},
 			}))
 		case http.MethodPost:

@@ -381,6 +381,20 @@ type Limits struct {
 	// override; both the SQL CHECK and the apid handler reject
 	// out-of-range values.
 	WarmSnapshotMinRequestsDefault int
+
+	// RequireAuthn (issue #560) is the plan gate for the per-app
+	// require_authn opt-in. Pro/Scale = true (Cloud Run analogue:
+	// `--no-allow-unauthenticated`); Free/Hobby = false (the
+	// opt-in is gated to paid tiers because every existing app
+	// stays public-by-default — flipping it on is a security
+	// posture change, not a feature toggle). Apid's updateApp
+	// handler rejects Free/Hobby PATCH-true with 403
+	// plan_require_authn_not_allowed; the column default
+	// (migration 00135) is false so no existing customer is
+	// affected. Cross-account tokens (caller's account_id !=
+	// app.account_id) receive 403 from the gatewayd-internal
+	// authz branch, not from this gate.
+	RequireAuthn bool
 	// WarmSnapshotMinMsDefault is the per-app time-since-first-ready
 	// threshold for warm-tier capture, applied at CreateApp when
 	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
@@ -537,6 +551,12 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotEnabled:            false,
 		WarmSnapshotMinRequestsDefault: 0,
 		WarmSnapshotMinMsDefault:       0,
+		// Issue #560: Free is gated off — the opt-in is
+		// a paid-tier feature (Cloud Run's
+		// `--no-allow-unauthenticated` shape). The column
+		// default (false) keeps every existing customer
+		// public-by-default.
+		RequireAuthn: false,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -668,6 +688,12 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotEnabled:            false,
 		WarmSnapshotMinRequestsDefault: 0,
 		WarmSnapshotMinMsDefault:       0,
+		// Issue #560: Hobby is gated off for the same
+		// posture-change shape as Free — flipping a public
+		// app to token-gated is a security decision, not a
+		// feature toggle, and the issue pairs it with
+		// internal-only ingress (Pro+).
+		RequireAuthn: false,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -785,6 +811,12 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotEnabled:            true,
 		WarmSnapshotMinRequestsDefault: 5,
 		WarmSnapshotMinMsDefault:       2000,
+		// Issue #560: Pro is the first tier where the
+		// per-app require_authn opt-in unlocks. Pairs
+		// with internal-only ingress (#5) per the issue's
+		// recommendation. The column default is still
+		// false — the customer must explicitly PATCH true.
+		RequireAuthn: true,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -914,6 +946,11 @@ var planLimits = map[Plan]Limits{
 		WarmSnapshotEnabled:            true,
 		WarmSnapshotMinRequestsDefault: 5,
 		WarmSnapshotMinMsDefault:       2000,
+		// Issue #560: Scale mirrors Pro — the opt-in is
+		// available, but the column default stays false.
+		// Customers on the largest plan who want
+		// token-gating still set it per-deployment.
+		RequireAuthn: true,
 	},
 }
 
@@ -1616,6 +1653,22 @@ func (p Plan) WarmSnapshotAllowed() bool {
 		return false
 	}
 	return l.WarmSnapshotEnabled
+}
+
+// RequireAuthnAllowed reports whether the plan permits a customer to
+// set apps.require_authn=true via PATCH (issue #560). Pro/Scale return
+// true; Free/Hobby return false so apid's updateApp handler surfaces
+// 403 plan_require_authn_not_allowed. The global column default is
+// false, so every existing app keeps being public-by-default regardless
+// of plan — the gate only fires when a Free/Hobby customer tries to
+// opt-in (which is denied). Customers on any plan may PATCH true →
+// false (opt-out per-app).
+func (p Plan) RequireAuthnAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false // fail-closed
+	}
+	return l.RequireAuthn
 }
 
 // WarmSnapshotMinRequestsDefault returns the per-plan default for the
