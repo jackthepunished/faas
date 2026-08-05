@@ -216,6 +216,46 @@ service Vmmd {
   // a path vmmd never issued).
   rpc UmountParentExt4(UmountParentExt4Request) returns (UmountParentExt4Response);
 
+  // MountOverlayParent (DEPLOY-1, ADR-075) is the staging-only path
+  // that lets imaged compose the per-runtime base ext4 from a
+  // shared parent via overlayfs. The lowerdir is the parent ext4
+  // mountpoint vmmd issued at MountParentExt4ReadOnly (read-only,
+  // already mounted by vmmd); upperdir + workdir + merged are
+  // absolute host paths staged under /dev/shm/faas-base-staging/
+  // (tmpfs, kernel tmpfile-permitted). vmmd is the only root
+  // component (spec §11) and runs the direct mount(2) syscall on
+  // imaged's behalf. imaged (User=faas-imaged + NoNewPrivileges=yes)
+  // cannot mount — see capdecl policy in pkg/capdecl and the
+  // depguard rule in .golangci.yml that forbids unix.Mount outside
+  // pkg/vmmd/. Returns the merged path on success; the caller
+  // (imaged) applies its delta OCI layers to the upperdir via
+  // rootfs.ApplyLayerGz, then BuildBaseFromStaging(merged) for
+  // mkfs + storage. The merged path is registered in
+  // vmmdmount.Registry so SIGTERM/30-min orphan sweep can release
+  // it. Validation chain:
+  //  1. Any empty path → InvalidArgument.
+  //  2. lowerdir MUST live under /srv/fc/parent/faas-parent-mnt-*
+  //     (vmmdmount.MountRoot) — refuse overlay-mounting an
+  //     unrelated read-only path (defence in depth).
+  //  3. upperdir/workdir MUST live under
+  //     /dev/shm/faas-base-staging/ — refuse overlay-mounting on
+  //     ext4 (the regression that broke every cd-controlplane
+  //     deploy 2026-08-04 → 2026-08-05; kernel rejects ext4 upper
+  //     with "overlayfs: upper fs does not support tmpfile").
+  //  4. mount(2) EROFS/EBUSY/ENOSPC/ENOMEM → Internal with the
+  //     syscall error wrapped — imaged's logs surface the cause.
+  rpc MountOverlayParent(MountOverlayParentRequest) returns (MountOverlayParentResponse);
+
+  // UmountOverlayParent (DEPLOY-1, ADR-075) releases an overlay
+  // mount vmmd previously returned from MountOverlayParent.
+  // Idempotent on an unknown mountpoint — imaged's
+  // defer-after-error pattern (mkfs errored → umount anyway) is
+  // safe. The merged path is validated to live under
+  // /dev/shm/faas-base-staging/faas-base-*/merged (the staging
+  // root the parent-ref path uses) to refuse unmounting an
+  // unrelated filesystem.
+  rpc UmountOverlayParent(UmountOverlayParentRequest) returns (UmountOverlayParentResponse);
+
   // PrepareLiveMigration (Tier A5 / ADR-065) is Phase 1 of the
   // four-phase cross-node live-instance handoff. Called by the
   // new owner vmmd's schedd against the DYING vmmd: pauses the
@@ -952,6 +992,64 @@ message UmountParentExt4Request {
 // itself — e.g. EBUSY when a child re-stage is still walking
 // the parent).
 message UmountParentExt4Response {}
+
+// MountOverlayParentRequest (DEPLOY-1, ADR-075) is the input to
+// MountOverlayParent. All four paths are absolute host paths.
+//
+// lowerdir: the read-only parent ext4 mountpoint vmmd issued
+// from MountParentExt4ReadOnly. Must live under vmmdmount.MountRoot
+// (/srv/fc/parent/faas-parent-mnt-*/) — defence in depth against
+// overlay-mounting an unrelated read-only path.
+//
+// upperdir: empty fresh directory where the delta OCI layers land.
+// Must live under /dev/shm/faas-base-staging/ — kernel rejects
+// ext4 upper with "overlayfs: upper fs does not support tmpfile".
+// vmmd mkdir's the three subdirs (upper/work/merged) under the
+// staging root if absent.
+//
+// workdir: overlayfs scratch dir, sibling of upperdir. Must be
+// on the same tmpfs as upperdir.
+//
+// merged: the overlayfs merged view dir, sibling of upperdir and
+// workdir. After the mount, the caller (imaged) applies delta
+// layers to upperdir via rootfs.ApplyLayerGz, then calls
+// rootfs.BuildBaseFromStaging(merged, ...) for mkfs + storage.
+// Pass the same absolute path back to UmountOverlayParent to
+// release.
+message MountOverlayParentRequest {
+  string lowerdir = 1;
+  string upperdir = 2;
+  string workdir = 3;
+  string merged = 4;
+}
+
+// MountOverlayParentResponse (DEPLOY-1, ADR-075) is the empty
+// success envelope. The merged path is the same one the caller
+// passed in MountOverlayParentRequest; on success it's an
+// overlayfs mountpoint visible in /proc/mounts. vmmd registers
+// the mount in vmmdmount.Registry so SIGTERM/30-min orphan sweep
+// can release it. On failure vmmd returns a gRPC status:
+// InvalidArgument for empty/foreign paths, Internal for the
+// mount(2) syscall failure (with the kernel error wrapped).
+message MountOverlayParentResponse {}
+
+// UmountOverlayParentRequest (DEPLOY-1, ADR-075) is the input to
+// UmountOverlayParent. merged is the path MountOverlayParent
+// previously returned. Empty → InvalidArgument. Unknown →
+// InvalidArgument (NOT NotFound) so imaged's defer-after-error
+// pattern is safe. The merged path is validated to live under
+// /dev/shm/faas-base-staging/faas-base-*/merged — refuse
+// unmounting an unrelated filesystem.
+message UmountOverlayParentRequest {
+  string merged = 1;
+}
+
+// UmountOverlayParentResponse (DEPLOY-1, ADR-075) is the empty
+// success envelope. On failure vmmd returns a gRPC status:
+// InvalidArgument for an empty/unknown path, Internal for the
+// umount(2) syscall failure itself — e.g. EBUSY when the
+// caller still has the merged view open.
+message UmountOverlayParentResponse {}
 
 // ForwardHTTPStreamRequest (issue #471 PR-B + PR-C) is one frame
 // on the client→server stream. The first frame MUST carry the

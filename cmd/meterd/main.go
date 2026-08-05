@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/billing/reconciler"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
@@ -568,6 +569,16 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. meterd is unprivileged —
+	// no Allow, no Deny. The sampler, quota, stripe ticks and
+	// the age-sealed secret reads all run inside the unit's
+	// systemd hardening (NoNewPrivileges, ProtectSystem,
+	// PrivateTmp, etc.). Any future cap_ add lands here, not in
+	// the unit file.
+	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+		return err
+	}
+
 	cfg, err := LoadConfig(deps.configPath)
 	if err != nil {
 		return err

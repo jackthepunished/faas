@@ -924,14 +924,14 @@ func withMountStub(t *testing.T) {
 	})
 }
 
-// TestMountOverlay_RejectsEmptyPaths pins the contract that
-// mountOverlay returns the empty-path error before touching the
-// kernel syscall. A regression that swapped the early-return
-// shape would push empty paths through to mount(2) and produce
-// a kernel-side ENOENT that would obscure the real reason
-// (test fixture misuse). Lives as a doc-test guarding the
-// PR-K syscall path.
-func TestMountOverlay_RejectsEmptyPaths(t *testing.T) {
+// TestMountOverlayFn_RejectsEmptyPaths pins the contract that
+// mountOverlayFn returns the empty-path error before touching
+// the vmmd RPC. A regression that swapped the early-return
+// shape would push empty paths through to MountOverlayParent
+// and vmmd would surface the gRPC InvalidArgument — obscuring
+// the real reason (test fixture misuse). Lives as a doc-test
+// guarding the DEPLOY-1 vmmd-RPC path.
+func TestMountOverlayFn_RejectsEmptyPaths(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name                                string
@@ -944,36 +944,37 @@ func TestMountOverlay_RejectsEmptyPaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := mountOverlay(ctx, tc.merged, tc.lowerdir, tc.upperdir, tc.workdir)
+			err := mountOverlayFn(ctx, tc.merged, tc.lowerdir, tc.upperdir, tc.workdir)
 			if err == nil {
-				t.Fatalf("mountOverlay(%q,%q,%q,%q) succeeded; want empty-path error",
+				t.Fatalf("mountOverlayFn(%q,%q,%q,%q) succeeded; want empty-path error",
 					tc.merged, tc.lowerdir, tc.upperdir, tc.workdir)
 			}
 			if !strings.Contains(err.Error(), "empty path") {
-				t.Fatalf("mountOverlay error %q; want substring 'empty path'", err)
+				t.Fatalf("mountOverlayFn error %q; want substring 'empty path'", err)
 			}
 		})
 	}
 }
 
-// TestUmountOverlay_EmptyArgIsNoop pins the contract that
-// umountOverlay("") returns nil without calling the kernel.
+// TestUmountOverlayFn_EmptyArgIsNoop pins the contract that
+// umountOverlayFn("") returns nil without calling the kernel.
 // Matches the pre-syscall behavior of the old exec.Command
 // wrapper (which silently no-op'd on empty).
-func TestUmountOverlay_EmptyArgIsNoop(t *testing.T) {
-	if err := umountOverlay(""); err != nil {
-		t.Fatalf("umountOverlay(\"\") = %v; want nil", err)
+func TestUmountOverlayFn_EmptyArgIsNoop(t *testing.T) {
+	if err := umountOverlayFn(""); err != nil {
+		t.Fatalf("umountOverlayFn(\"\") = %v; want nil", err)
 	}
 }
 
-// TestMountOverlayFn_DelegatesToSyscall locks in that the
-// production mountOverlayFn dispatches to mountOverlaySyscall
-// rather than exec'ing /bin/mount (the PR-K fix). We don't
-// actually want to call the syscall here — the harness below
-// substitutes a flag-recording closure that mimics the
-// syscall's contract shape and asserts the closure was hit
-// exactly once with the merged path.
-func TestMountOverlayFn_DelegatesToSyscall(t *testing.T) {
+// TestMountOverlayFn_DelegatesToVMMDRPC locks in that the
+// production mountOverlayFn is the test seam the
+// parentHarness/withMountStub overrides. After DEPLOY-1 the
+// production path goes through h.vmmClient.MountOverlayParent
+// (a gRPC call) — the test seam verifies the seam still
+// captures the call shape so a regression that swaps the
+// function signature trips here rather than at every other
+// parent-ref assertion.
+func TestMountOverlayFn_DelegatesToVMMDRPC(t *testing.T) {
 	orig := mountOverlayFn
 	t.Cleanup(func() { mountOverlayFn = orig })
 
@@ -988,8 +989,8 @@ func TestMountOverlayFn_DelegatesToSyscall(t *testing.T) {
 		return nil
 	}
 
-	if err := mountOverlay(context.Background(), "/p/merged", "/p/lower", "/p/upper", "/p/work"); err != nil {
-		t.Fatalf("mountOverlay: %v", err)
+	if err := mountOverlayFn(context.Background(), "/p/merged", "/p/lower", "/p/upper", "/p/work"); err != nil {
+		t.Fatalf("mountOverlayFn: %v", err)
 	}
 	if called != 1 {
 		t.Fatalf("mountOverlayFn called %d times; want 1", called)

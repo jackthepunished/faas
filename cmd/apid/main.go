@@ -33,6 +33,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/grace"
@@ -200,6 +201,13 @@ func main() {
 }
 
 func run(ctx context.Context, log *slog.Logger) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. apid's capsDecl is
+	// cap_net_bind_service (HTTPS listener). A misconfigured
+	// AmbientCapabilities line fails fast at boot.
+	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+		return err
+	}
+
 	pool, err := db.Open(ctx, "")
 	if err != nil {
 		return fmt.Errorf("apid: open db: %w", err)

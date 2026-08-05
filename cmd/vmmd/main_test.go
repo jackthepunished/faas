@@ -62,6 +62,18 @@ func nopHostKeysDep(t *testing.T) func(string) ([]*age.X25519Identity, error) {
 	}
 }
 
+// nopCapCheck returns a no-op capCheck seam (DEPLOY-1 / ADR-075)
+// for tests that drive runWithDeps. Production wires
+// runtimecheck.MustCheckOnBoot(capsDecl, log, nil) which calls
+// os.Exit(1) on violation — the test runner's process doesn't
+// carry the production capset (cap_sys_admin, cap_net_admin, …)
+// and the exit would kill the test binary mid-run. Every
+// runDeps{} literal that flows into runWithDeps must include
+// this.
+func nopCapCheck() func() error {
+	return func() error { return nil }
+}
+
 // shortDir mirrors the helper in pkg/wire's test (kept private here so this
 // test package doesn't pull in wire's internals). macOS sun_path is ~104.
 func shortDir(t *testing.T) string {
@@ -78,8 +90,15 @@ func shortDir(t *testing.T) string {
 func TestRun_BadConfigPath(t *testing.T) {
 	// LoadConfig treats ENOENT as defaults — to exercise the error branch
 	// we feed it a directory, which fails the read with non-ENOENT.
+	//
+	// capCheck is nopCapCheck() because the test runner doesn't carry
+	// the production capset; runtimecheck.MustCheckOnBoot would
+	// otherwise os.Exit on violation, killing the test process.
 	dir := t.TempDir()
-	deps := runDeps{configPath: dir}
+	deps := runDeps{
+		configPath: dir,
+		capCheck:   nopCapCheck(),
+	}
 	err := runWithDeps(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), deps)
 	if err == nil {
 		t.Fatal("expected error from directory-as-config-path")
@@ -109,6 +128,7 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 		loadHostKey:    load,
 		loadHostKeys:   nopHostKeysDep(t),
 		writeRecipient: write,
+		capCheck:       nopCapCheck(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -146,6 +166,7 @@ func TestRun_ListenFailurePropagates(t *testing.T) {
 		loadHostKey:    load,
 		loadHostKeys:   nopHostKeysDep(t),
 		writeRecipient: write,
+		capCheck:       nopCapCheck(),
 	}
 	err := runWithDeps(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), deps)
 	if err == nil {
@@ -180,6 +201,7 @@ func TestRun_FCDetectFailureIsWarning(t *testing.T) {
 		loadHostKey:    load,
 		loadHostKeys:   nopHostKeysDep(t),
 		writeRecipient: write,
+		capCheck:       nopCapCheck(),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

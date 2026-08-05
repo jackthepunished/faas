@@ -42,14 +42,24 @@ const defaultVMMDialTimeout = 30 * time.Second
 const DefaultVMMSock = "unix:///run/faas/vmmd.sock"
 
 // VMMClientIface is the parent-mount subset of vmmd's gRPC API
-// that imaged depends on (ADR-053). Defining it as an interface
-// here (not the broader vmmdpb.VmmdClient) keeps pkg/imaged's
-// test seam narrow: a fakeVMMClient with these three methods is
-// enough to drive the parent-ref branch in unit tests, no real
-// gRPC dial required.
+// that imaged depends on (ADR-053 + ADR-075). Defining it as an
+// interface here (not the broader vmmdpb.VmmdClient) keeps
+// pkg/imaged's test seam narrow: a fakeVMMClient with these
+// five methods is enough to drive the parent-ref branch in unit
+// tests, no real gRPC dial required.
+//
+// MountOverlayParent / UmountOverlayParent (ADR-075 / DEPLOY-1)
+// replace the unix.Mount(2) syscall that used to live in
+// pkg/imaged/mount_overlay_linux.go under
+// AmbientCapabilities=cap_sys_admin — that path was the silent
+// CLAUDE.md violation that DEPLOY-1 erases. imaged no longer
+// holds cap_sys_admin at all; the systemd unit can drop
+// AmbientCapabilities= entirely.
 type VMMClientIface interface {
 	MountParentExt4ReadOnly(ctx context.Context, storageKey string) (string, error)
 	UmountParentExt4(ctx context.Context, mountpoint string) error
+	MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error
+	UmountOverlayParent(ctx context.Context, merged string) error
 	Close() error
 }
 
@@ -144,6 +154,65 @@ func (c *VMMClient) UmountParentExt4(ctx context.Context, mountpoint string) err
 	return nil
 }
 
+// MountOverlayParent (ADR-075 / DEPLOY-1) asks vmmd to issue the
+// overlayfs mount on behalf of imaged. The syscall used to live
+// in pkg/imaged/mount_overlay_linux.go under
+// AmbientCapabilities=cap_sys_admin — that path is the
+// architectural violation DEPLOY-1 erases. imaged no longer
+// holds cap_sys_admin; the systemd unit can drop the ambient
+// capability entirely.
+//
+// Empty path → error so a misbehaving caller doesn't slip past
+// the gRPC validation chain (vmmd's handler also rejects, but
+// the client-side guard keeps imaged's log clean).
+func (c *VMMClient) MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error {
+	if c == nil {
+		return fmt.Errorf("imaged: vmmclient: nil receiver")
+	}
+	if lowerdir == "" || upperdir == "" || workdir == "" || merged == "" {
+		return fmt.Errorf("imaged: vmmclient: empty overlay path (lower=%q upper=%q work=%q merged=%q)",
+			lowerdir, upperdir, workdir, merged)
+	}
+	cli, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, defaultVMMDialTimeout)
+	defer cancel()
+	if _, err := cli.MountOverlayParent(callCtx, &vmmdpb.MountOverlayParentRequest{
+		Lowerdir: lowerdir,
+		Upperdir: upperdir,
+		Workdir:  workdir,
+		Merged:   merged,
+	}); err != nil {
+		return fmt.Errorf("imaged: vmmclient: mount overlay parent (lower=%q merged=%q): %w",
+			lowerdir, merged, err)
+	}
+	return nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) releases an overlay
+// mount returned from MountOverlayParent. Idempotent: vmmd's
+// handler absorbs ErrUnknownMountpoint so imaged's
+// defer-after-error pattern is safe to call blindly.
+func (c *VMMClient) UmountOverlayParent(ctx context.Context, merged string) error {
+	if c == nil || merged == "" {
+		return nil
+	}
+	cli, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := context.WithTimeout(ctx, defaultVMMDialTimeout)
+	defer cancel()
+	if _, err := cli.UmountOverlayParent(callCtx, &vmmdpb.UmountOverlayParentRequest{
+		Merged: merged,
+	}); err != nil {
+		return fmt.Errorf("imaged: vmmclient: umount overlay parent %q: %w", merged, err)
+	}
+	return nil
+}
+
 // Close releases the underlying gRPC conn. Idempotent. Called
 // from imaged's shutdown path so SIGTERM doesn't leak the dial.
 func (c *VMMClient) Close() error {
@@ -205,6 +274,21 @@ type fakeVMMClient struct {
 	mountHook func(storageKey string) (string, error)
 	// umountHook lets tests inject an error on umount.
 	umountHook func(mountpoint string) error
+	// overlayMounts (ADR-075 / DEPLOY-1) records every
+	// MountOverlayParent invocation with the full path tuple so
+	// the parent-ref tests can assert the RPC was called with
+	// the staging paths imaged chose.
+	overlayMounts []overlayMountRecord
+	// overlayUmounts (ADR-075 / DEPLOY-1) records every
+	// UmountOverlayParent invocation by merged path. Tests
+	// assert the defer-after-error release fires.
+	overlayUmounts []string
+	// mountOverlayHook lets tests inject errors on the overlay
+	// mount path.
+	mountOverlayHook func(lowerdir, upperdir, workdir, merged string) error
+	// umountOverlayHook lets tests inject errors on the overlay
+	// umount path.
+	umountOverlayHook func(merged string) error
 }
 
 func (f *fakeVMMClient) MountParentExt4ReadOnly(_ context.Context, storageKey string) (string, error) {
@@ -223,4 +307,44 @@ func (f *fakeVMMClient) UmountParentExt4(_ context.Context, mountpoint string) e
 	return nil
 }
 
+// MountOverlayParent (ADR-075 / DEPLOY-1) — fakeVMMClient records
+// the overlay mount paths so the parent-ref tests can assert the
+// mount call was made. mountOverlayHook lets tests inject errors
+// (the wire InvalidArgument branch — a foreign path prefix — is
+// NOT exercised here; that branch lives in pkg/vmmdgrpc).
+func (f *fakeVMMClient) MountOverlayParent(_ context.Context, lowerdir, upperdir, workdir, merged string) error {
+	f.overlayMounts = append(f.overlayMounts, overlayMountRecord{
+		Lowerdir: lowerdir,
+		Upperdir: upperdir,
+		Workdir:  workdir,
+		Merged:   merged,
+	})
+	if f.mountOverlayHook != nil {
+		return f.mountOverlayHook(lowerdir, upperdir, workdir, merged)
+	}
+	return nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) — mirrors the Mount
+// path. Records every call so the test can assert the
+// defer-after-error release fires.
+func (f *fakeVMMClient) UmountOverlayParent(_ context.Context, merged string) error {
+	f.overlayUmounts = append(f.overlayUmounts, merged)
+	if f.umountOverlayHook != nil {
+		return f.umountOverlayHook(merged)
+	}
+	return nil
+}
+
 func (f *fakeVMMClient) Close() error { return nil }
+
+// overlayMountRecord captures one MountOverlayParent invocation
+// so tests can assert the four paths were forwarded verbatim.
+// Keeping a struct (vs four parallel slices) lets a future field
+// change land without touching every assert site.
+type overlayMountRecord struct {
+	Lowerdir string
+	Upperdir string
+	Workdir  string
+	Merged   string
+}

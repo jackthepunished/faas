@@ -856,6 +856,81 @@ func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
 	return nil
 }
 
+// MountOverlayParent (ADR-075 / DEPLOY-1) mounts an overlayfs
+// with the loopback-mounted parent as lowerdir and the per-staging
+// tmpfs dirs as upperdir+workdir. imaged's parent-ref stage
+// (pkg/imaged/base_stage.go:mountOverlayFn) used to issue this
+// syscall itself with AmbientCapabilities=cap_sys_admin — a
+// silent violation of the CLAUDE.md "vmmd is the only root
+// component" invariant. The syscall now lives here; imaged
+// forwards via gRPC.
+//
+// The Mount call delegates to vmmdmount.MountOverlayParent
+// which validates the path prefixes (lowerdir under /srv/fc/parent/,
+// upper/work/merged under /dev/shm/faas-base-staging/). The
+// Registry tracks the merged path so the 30-minute orphan sweep
+// (SweepOrphans on the parentMounts registry) can clean up
+// after imaged that crashed before its defer fired.
+//
+// On any error the function returns the underlying error so the
+// gRPC handler can lift to a problem document; the staging dirs
+// are NOT cleaned up here — imaged owns upper/work (it created
+// them via MkdirBaseStaging + MkdirTemp) and a vmmd-side
+// cleanup would race with imaged's own defer-after-error.
+func (m *Manager) MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error {
+	if m.parentMounts == nil {
+		return fmt.Errorf("vmmd: parent overlay mount: registry not wired")
+	}
+	if err := vmmdmount.MountOverlayParent(ctx, lowerdir, upperdir, workdir, merged); err != nil {
+		return err
+	}
+	// Track merged in the registry with empty StorageKey/SrcPath
+	// (the overlay mount has neither — it's a vmmd-issued mount
+	// over paths imaged chose). The cap (16) is the same as
+	// loopback mounts; imaged should umount before issuing the
+	// next one anyway.
+	m.parentMounts.RegisterOrEvict(merged, "", "")
+	m.log.Info("vmmd: parent overlay mounted",
+		"lowerdir", lowerdir, "upperdir", upperdir,
+		"workdir", workdir, "merged", merged)
+	return nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) releases an overlay
+// mount MountOverlayParent previously issued. Idempotent on
+// unknown mountpoints so imaged's defer-after-error is safe.
+// The merged dir is also rmdir'd by vmmdmount.UmountOverlayParent
+// — the staging tree (upper+work) stays in place because imaged
+// may want to reuse them on the next Mount attempt.
+func (m *Manager) UmountOverlayParent(ctx context.Context, merged string) error {
+	if m.parentMounts == nil {
+		return nil
+	}
+	// Look up first so we can forget on success without an
+	// extra acquire. The lookup miss path is the
+	// defer-after-error case.
+	entry, ok := m.parentMounts.Lookup(merged)
+	if !ok {
+		// Idempotent on unknown — imaged's defer may fire after
+		// the gRPC handler already swept the entry. The
+		// underlying syscall is best-effort: if the kernel
+		// still has a mount at `merged` the syscall succeeds;
+		// if not, UmountOverlayParent surfaces
+		// ErrUnknownMountpoint which the gRPC handler absorbs.
+		if err := vmmdmount.UmountOverlayParent(ctx, merged); err != nil &&
+			!errors.Is(err, vmmdmount.ErrUnknownMountpoint) {
+			return err
+		}
+		return nil
+	}
+	if err := vmmdmount.UmountOverlayParent(ctx, merged); err != nil {
+		return err
+	}
+	m.parentMounts.Forget(merged)
+	m.log.Info("vmmd: parent overlay umounted", "mountpoint", merged, "storage_key", entry.StorageKey)
+	return nil
+}
+
 // parentSrcPrefix is the tempdir name pattern for the staged
 // parent-ext4 bytes (StorageBackend.Get → tmp file → loopback
 // source). Mirrored on vmmdmount.ParentMountPrefix by convention

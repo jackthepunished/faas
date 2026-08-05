@@ -172,6 +172,22 @@ func (s *stubVmmdClient) FrameworkReady(context.Context, *vmmdpb.FrameworkReadyR
 	return &vmmdpb.FrameworkReadyResponse{}, nil
 }
 
+// MountOverlayParent (ADR-075 / DEPLOY-1) is the staged-overlay
+// mount RPC imaged uses. The forwardproxy handler never
+// invokes this RPC (it lives in pkg/imaged), but the vmmd gRPC
+// client interface demands the method so the stub satisfies
+// the full surface. Returns an empty success.
+func (s *stubVmmdClient) MountOverlayParent(context.Context, *vmmdpb.MountOverlayParentRequest, ...grpc.CallOption) (*vmmdpb.MountOverlayParentResponse, error) {
+	return &vmmdpb.MountOverlayParentResponse{}, nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) — paired with
+// MountOverlayParent above. forwardproxy never invokes; stub
+// returns success.
+func (s *stubVmmdClient) UmountOverlayParent(context.Context, *vmmdpb.UmountOverlayParentRequest, ...grpc.CallOption) (*vmmdpb.UmountOverlayParentResponse, error) {
+	return &vmmdpb.UmountOverlayParentResponse{}, nil
+}
+
 // stubLookup matches the NodeClientLookup interface; returns the
 // same client for any non-empty id. ok=false on empty (matches the
 // defensive 503 contract).

@@ -26,6 +26,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -92,6 +93,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. builderd is unprivileged —
+	// no Allow, no Deny. The build queue consumer, the vmmd
+	// gRPC dial, the content-addressed cache read/write, and
+	// the Postgres migrations all run inside the unit's
+	// systemd hardening (NoNewPrivileges, ProtectSystem,
+	// PrivateTmp, etc.). The ephemeral builder microVM itself
+	// (firecracker + jailer) is owned by vmmd, not builderd;
+	// vmmd's capsDecl is the gating authority for any cap_ the
+	// VM lifecycle needs.
+	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+		return err
+	}
+
 	cfg, err := LoadConfig(deps.configPath)
 	if err != nil {
 		return err

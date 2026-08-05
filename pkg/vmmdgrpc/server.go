@@ -92,6 +92,22 @@ type VmmdAPI interface {
 	// previously returned. Idempotent on unknown mountpoints so
 	// imaged's defer-after-error pattern is safe.
 	UmountParentExt4(ctx context.Context, mountpoint string) error
+	// MountOverlayParent (ADR-075 / DEPLOY-1) issues an overlayfs
+	// mount on behalf of imaged. lowerdir is a path under
+	// /srv/fc/parent/ that MountParentExt4 returned; upperdir,
+	// workdir, and merged are paths under
+	// /dev/shm/faas-base-staging/. The mount satisfies the
+	// kernel's overlayfs tmpfile contract (host /tmp is ext4
+	// and cannot host the workdir's atomic rename cycle). This
+	// RPC replaces the unix.Mount(2) syscall that used to live
+	// in pkg/imaged under AmbientCapabilities=cap_sys_admin —
+	// the architectural violation DEPLOY-1 erases.
+	MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error
+	// UmountOverlayParent (ADR-075 / DEPLOY-1) releases an
+	// overlay mount MountOverlayParent previously returned.
+	// Idempotent on unknown mountpoints so imaged's
+	// defer-after-error pattern is safe.
+	UmountOverlayParent(ctx context.Context, merged string) error
 	// MarkInstanceFrameworkReady (issue #470 / PR #470-FU-B)
 	// stamps the per-instance `framework_ready_at` clock on the
 	// live Instance, observes the
@@ -899,6 +915,83 @@ func (s *Server) UmountParentExt4(ctx context.Context, req *vmmdpb.UmountParentE
 	}
 	s.ops.Observe(op, time.Since(start), nil)
 	return &vmmdpb.UmountParentExt4Response{}, nil
+}
+
+// MountOverlayParent (ADR-075 / DEPLOY-1) is the staging path
+// imaged uses to compose the per-runtime base ext4 from a shared
+// parent. The handler validates all four paths (any empty path
+// is InvalidArgument) and forwards to vmm.VmmdAPI.MountOverlayParent.
+//
+// The path-prefix validation (lowerdir under /srv/fc/parent/,
+// upper/work/merged under /dev/shm/faas-base-staging/) lives in
+// vmmdmount.MountOverlayParent — the handler's only structural
+// check is "no empty path" so a malformed gRPC request surfaces
+// as a 400 with no vmmd-side mount attempt.
+//
+// Real errors from the syscall surface as Internal; imaged's
+// log surfaces the cause. The ErrInvalidOverlayPath sentinel
+// is lifted to InvalidArgument so a misbehaving imaged can't
+// pass /etc or /var/lib/faas as one of the paths and get a
+// silent mount fail — the gRPC code is the wire signal.
+func (s *Server) MountOverlayParent(ctx context.Context, req *vmmdpb.MountOverlayParentRequest) (*vmmdpb.MountOverlayParentResponse, error) {
+	const op = "MountOverlayParent"
+	start := time.Now()
+	if req.GetLowerdir() == "" || req.GetUpperdir() == "" ||
+		req.GetWorkdir() == "" || req.GetMerged() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing path",
+			"lowerdir, upperdir, workdir, and merged are all required").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#mount-overlay-parent")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	err := s.vmm.MountOverlayParent(ctx,
+		req.GetLowerdir(), req.GetUpperdir(),
+		req.GetWorkdir(), req.GetMerged())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		if errors.Is(err, vmmdmount.ErrInvalidOverlayPath) {
+			p := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+				"overlay path outside allowed prefixes",
+				"lowerdir must be under /srv/fc/parent/; upper/work/merged must be under /dev/shm/faas-base-staging/").
+				WithDocs("https://" + wire.DocsHost + "/vmmd#mount-overlay-parent")
+			s.ops.Observe(op, time.Since(start), p)
+			return nil, grpcerr.ToStatus(p)
+		}
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	return &vmmdpb.MountOverlayParentResponse{}, nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) is the idempotent
+// release path. Empty merged → InvalidArgument; unknown merged
+// → InvalidArgument (NOT NotFound) for the same reason as
+// UmountParentExt4 (imaged's defer-after-error must be safe).
+func (s *Server) UmountOverlayParent(ctx context.Context, req *vmmdpb.UmountOverlayParentRequest) (*vmmdpb.UmountOverlayParentResponse, error) {
+	const op = "UmountOverlayParent"
+	start := time.Now()
+	if req.GetMerged() == "" {
+		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
+			"Missing merged", "merged is required").
+			WithDocs("https://" + wire.DocsHost + "/vmmd#umount-overlay-parent")
+		s.ops.Observe(op, time.Since(start), err)
+		return nil, grpcerr.ToStatus(err)
+	}
+	err := s.vmm.UmountOverlayParent(ctx, req.GetMerged())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		if errors.Is(err, vmmdmount.ErrUnknownMountpoint) {
+			// Idempotent on unknown: imaged's defer-after-error
+			// may call here after a partial Mount or after the
+			// registry has already swept the entry. Lift to a
+			// benign InvalidArgument so the wire response is
+			// observable in imaged's log but not a deployment
+			// blocker.
+			return &vmmdpb.UmountOverlayParentResponse{}, nil
+		}
+		return nil, grpcerr.ToStatus(toProblem(err))
+	}
+	return &vmmdpb.UmountOverlayParentResponse{}, nil
 }
 
 // readSeccompStatus parses /proc/<pid>/status and returns (mode, filterLen, err).

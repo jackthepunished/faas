@@ -51,6 +51,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/httpsec"
@@ -89,6 +90,17 @@ func main() {
 // run is the daemon entry point. It builds the listener stack,
 // wires the readiness probe, and blocks on ctx cancellation.
 func run(ctx context.Context, log *slog.Logger) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. gatewayd-public is
+	// unprivileged — no Allow, no Deny. The plain-HTTP loopback
+	// listener, the httpsec outer wrapper, the unix-socket
+	// reverse-proxy to gatewayd-internal, and the Postgres
+	// readiness ping all run inside the unit's systemd hardening
+	// (NoNewPrivileges, ProtectSystem, PrivateTmp, etc.). Any
+	// future cap_ add lands here, not in the unit file.
+	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+		return err
+	}
+
 	log.Info("gatewayd-public: starting", "pid", os.Getpid())
 
 	// Postgres — required for the readiness ping (no other PG

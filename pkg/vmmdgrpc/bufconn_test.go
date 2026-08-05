@@ -61,6 +61,14 @@ type fakeVMM struct {
 	// umountParentFn (ADR-053) mirrors mountParentFn for the
 	// UmountParentExt4 handler test. nil = success.
 	umountParentFn func(ctx context.Context, mountpoint string) error
+	// mountOverlayFn (ADR-075 / DEPLOY-1) lets the
+	// MountOverlayParent handler test inject errors (the
+	// invalid-prefix case lifts to InvalidArgument; the kernel
+	// syscall case lifts to Internal). nil = success.
+	mountOverlayFn func(ctx context.Context, lowerdir, upperdir, workdir, merged string) error
+	// umountOverlayFn (ADR-075 / DEPLOY-1) mirrors mountOverlayFn
+	// for the UmountOverlayParent handler test. nil = success.
+	umountOverlayFn func(ctx context.Context, merged string) error
 	// frameworkReadyFn (issue #470 / PR #470-FU-B) lets the
 	// FrameworkReady handler test inject errors or override the
 	// (stamped, appID, runtime) return tuple. nil = stamps
@@ -210,6 +218,28 @@ func (f *fakeVMM) MountParentExt4(ctx context.Context, storageKey string) (strin
 func (f *fakeVMM) UmountParentExt4(ctx context.Context, mountpoint string) error {
 	if f.umountParentFn != nil {
 		return f.umountParentFn(ctx, mountpoint)
+	}
+	return nil
+}
+
+// MountOverlayParent (ADR-075 / DEPLOY-1) — wraps the optional
+// hook so the MountOverlayParent handler test can inject
+// errors. nil hook → success. The merged path returned by the
+// hook is what the caller passed (imaged owns the dir; vmmd
+// doesn't materialise one).
+func (f *fakeVMM) MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error {
+	if f.mountOverlayFn != nil {
+		return f.mountOverlayFn(ctx, lowerdir, upperdir, workdir, merged)
+	}
+	return nil
+}
+
+// UmountOverlayParent (ADR-075 / DEPLOY-1) — wraps the optional
+// hook so the UmountOverlayParent handler test can inject
+// errors. nil hook → success.
+func (f *fakeVMM) UmountOverlayParent(ctx context.Context, merged string) error {
+	if f.umountOverlayFn != nil {
+		return f.umountOverlayFn(ctx, merged)
 	}
 	return nil
 }
@@ -951,6 +981,180 @@ func TestUmountParentExt4_PropagatesInternalError(t *testing.T) {
 	}
 	if code := status.Code(err); code != codes.Internal {
 		t.Errorf("code = %v, want Internal", code)
+	}
+}
+
+// TestMountOverlayParent_HappyPath (ADR-075 / DEPLOY-1) pins the
+// success wire shape: a MountOverlayParent request with valid
+// paths lifts through to a MountOverlayParentResponse and the
+// underlying VmmdAPI hook is called with the four paths verbatim.
+func TestMountOverlayParent_HappyPath(t *testing.T) {
+	called := false
+	f := &fakeVMM{
+		mountOverlayFn: func(_ context.Context, lowerdir, upperdir, workdir, merged string) error {
+			called = true
+			if lowerdir != "/srv/fc/parent/faas-parent-mnt-x" {
+				t.Errorf("lowerdir = %q, want %q", lowerdir, "/srv/fc/parent/faas-parent-mnt-x")
+			}
+			if merged != "/dev/shm/faas-base-staging/faas-overlay-mnt/merged" {
+				t.Errorf("merged = %q, want %q", merged, "/dev/shm/faas-base-staging/faas-overlay-mnt/merged")
+			}
+			return nil
+		},
+	}
+	cli, _ := newServer(t, f)
+	_, err := cli.MountOverlayParent(context.Background(), &vmmdpb.MountOverlayParentRequest{
+		Lowerdir: "/srv/fc/parent/faas-parent-mnt-x",
+		Upperdir: "/dev/shm/faas-base-staging/faas-overlay-mnt/upper",
+		Workdir:  "/dev/shm/faas-base-staging/faas-overlay-mnt/work",
+		Merged:   "/dev/shm/faas-base-staging/faas-overlay-mnt/merged",
+	})
+	if err != nil {
+		t.Fatalf("MountOverlayParent happy path: %v", err)
+	}
+	if !called {
+		t.Fatal("VmmdAPI.MountOverlayParent hook was not invoked")
+	}
+}
+
+// TestMountOverlayParent_RejectsEmptyPath (ADR-075 / DEPLOY-1)
+// pins the empty-path InvalidArgument branch. The handler must
+// validate ALL four paths (lowerdir/upperdir/workdir/merged)
+// before any syscall; an empty path is the imaged-side
+// "caller didn't fill the proto field" bug and must surface as
+// 400.
+func TestMountOverlayParent_RejectsEmptyPath(t *testing.T) {
+	tests := []struct {
+		name string
+		req  *vmmdpb.MountOverlayParentRequest
+	}{
+		{"empty_lowerdir", &vmmdpb.MountOverlayParentRequest{
+			Lowerdir: "",
+			Upperdir: "/dev/shm/faas-base-staging/x/upper",
+			Workdir:  "/dev/shm/faas-base-staging/x/work",
+			Merged:   "/dev/shm/faas-base-staging/x/merged",
+		}},
+		{"empty_upperdir", &vmmdpb.MountOverlayParentRequest{
+			Lowerdir: "/srv/fc/parent/x",
+			Upperdir: "",
+			Workdir:  "/dev/shm/faas-base-staging/x/work",
+			Merged:   "/dev/shm/faas-base-staging/x/merged",
+		}},
+		{"empty_workdir", &vmmdpb.MountOverlayParentRequest{
+			Lowerdir: "/srv/fc/parent/x",
+			Upperdir: "/dev/shm/faas-base-staging/x/upper",
+			Workdir:  "",
+			Merged:   "/dev/shm/faas-base-staging/x/merged",
+		}},
+		{"empty_merged", &vmmdpb.MountOverlayParentRequest{
+			Lowerdir: "/srv/fc/parent/x",
+			Upperdir: "/dev/shm/faas-base-staging/x/upper",
+			Workdir:  "/dev/shm/faas-base-staging/x/work",
+			Merged:   "",
+		}},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeVMM{}
+			cli, _ := newServer(t, f)
+			_, err := cli.MountOverlayParent(context.Background(), tc.req)
+			if err == nil {
+				t.Fatalf("MountOverlayParent(%s) = nil, want InvalidArgument", tc.name)
+			}
+			if code := status.Code(err); code != codes.InvalidArgument {
+				t.Errorf("code = %v, want InvalidArgument", code)
+			}
+		})
+	}
+}
+
+// TestMountOverlayParent_SurfacesInvalidPath pins the
+// ErrInvalidOverlayPath → InvalidArgument lift. The vmmdmount
+// helper validates path prefixes; when it rejects, the gRPC
+// handler lifts the sentinel to InvalidArgument so the wire
+// response distinguishes "caller sent bad paths" from "kernel
+// refused to mount".
+func TestMountOverlayParent_SurfacesInvalidPath(t *testing.T) {
+	f := &fakeVMM{
+		mountOverlayFn: func(_ context.Context, _, _, _, _ string) error {
+			return fmt.Errorf("fake vmm: %w", vmmdmount.ErrInvalidOverlayPath)
+		},
+	}
+	cli, _ := newServer(t, f)
+	_, err := cli.MountOverlayParent(context.Background(), &vmmdpb.MountOverlayParentRequest{
+		Lowerdir: "/srv/fc/parent/x",
+		Upperdir: "/tmp/bad/upper",
+		Workdir:  "/tmp/bad/work",
+		Merged:   "/tmp/bad/merged",
+	})
+	if err == nil {
+		t.Fatal("expected InvalidArgument for foreign paths, got nil")
+	}
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", code)
+	}
+}
+
+// TestUmountOverlayParent_HappyPath pins the success wire
+// shape: an UmountOverlayParent call returns an empty response
+// and the underlying VmmdAPI hook is called with the merged
+// path verbatim.
+func TestUmountOverlayParent_HappyPath(t *testing.T) {
+	called := false
+	f := &fakeVMM{
+		umountOverlayFn: func(_ context.Context, merged string) error {
+			called = true
+			if merged != "/dev/shm/faas-base-staging/faas-overlay-mnt/merged" {
+				t.Errorf("merged = %q, want %q", merged, "/dev/shm/faas-base-staging/faas-overlay-mnt/merged")
+			}
+			return nil
+		},
+	}
+	cli, _ := newServer(t, f)
+	_, err := cli.UmountOverlayParent(context.Background(), &vmmdpb.UmountOverlayParentRequest{
+		Merged: "/dev/shm/faas-base-staging/faas-overlay-mnt/merged",
+	})
+	if err != nil {
+		t.Fatalf("UmountOverlayParent happy path: %v", err)
+	}
+	if !called {
+		t.Fatal("VmmdAPI.UmountOverlayParent hook was not invoked")
+	}
+}
+
+// TestUmountOverlayParent_AbsorbsUnknownMountpoint pins the
+// idempotent-defer-after-error behaviour: ErrUnknownMountpoint
+// from the underlying syscall is absorbed (handler returns
+// success) so imaged's defer-after-error pattern is safe.
+func TestUmountOverlayParent_AbsorbsUnknownMountpoint(t *testing.T) {
+	f := &fakeVMM{
+		umountOverlayFn: func(_ context.Context, _ string) error {
+			return vmmdmount.ErrUnknownMountpoint
+		},
+	}
+	cli, _ := newServer(t, f)
+	_, err := cli.UmountOverlayParent(context.Background(), &vmmdpb.UmountOverlayParentRequest{
+		Merged: "/dev/shm/faas-base-staging/never-existed/merged",
+	})
+	if err != nil {
+		t.Fatalf("UmountOverlayParent(unknown): %v; want nil (idempotent)", err)
+	}
+}
+
+// TestUmountOverlayParent_RejectsEmptyMerged pins the empty-path
+// InvalidArgument branch. Same shape as
+// TestUmountParentExt4_RejectsEmptyMountpoint.
+func TestUmountOverlayParent_RejectsEmptyMerged(t *testing.T) {
+	f := &fakeVMM{}
+	cli, _ := newServer(t, f)
+	_, err := cli.UmountOverlayParent(context.Background(),
+		&vmmdpb.UmountOverlayParentRequest{Merged: ""})
+	if err == nil {
+		t.Fatal("expected InvalidArgument for empty merged")
+	}
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", code)
 	}
 }
 

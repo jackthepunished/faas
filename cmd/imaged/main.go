@@ -32,6 +32,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/imaged"
@@ -75,6 +76,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
+	// DEPLOY-1 / ADR-075 capdecl gate. imaged's capsDecl is
+	// the empty declaration (no Allow, no Deny) — imaged is
+	// unprivileged. A future PR that brings back
+	// AmbientCapabilities=cap_sys_admin would trip this check
+	// at boot, not silently at the first mount syscall.
+	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+		return err
+	}
+
 	pool, err := d.openDB(ctx, "")
 	if err != nil {
 		return err
