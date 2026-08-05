@@ -348,6 +348,12 @@ jobs:
                 sleep 3
               fi
             done
+            # PR-M.1: chown /run/faas after the rollback restart
+            # loop (same rationale as in the main path — vmmd's
+            # RuntimeDirectory=faas resets perms to root:root 0755
+            # on every restart).
+            chown root:faas /run/faas
+            chmod 0775 /run/faas
             if wait_healthy; then
               echo "::warning::rollback succeeded — box is serving the PREVIOUS build"
             else
@@ -558,6 +564,22 @@ jobs:
             stat /run/faas/vmmd.sock 2>&1 || true
             exit 1
           fi
+
+          # PR-M.1: chown /run/faas AFTER the restart loop. vmmd's
+          # RuntimeDirectory=faas recreates the dir's per-unit tmpfs on
+          # every restart, resetting perms to root:root 0755 even
+          # though vmmd's ExecStartPre chowns the underlying directory.
+          # The bind-mount (visible to subsequent restarters) inherits
+          # the tmpfs source perms. Running the chown here, after vmmd
+          # has settled and is the SOLE /run/faas owner, makes the
+          # perms stick for the rest of the deploy. The earlier chown
+          # at line 164 (Install systemd service units step) stays —
+          # it covers the install-to-restart window. See
+          # deploy/controlplane/tmpfiles.d/faas.conf for the canonical
+          # rationale.
+          chown root:faas /run/faas
+          chmod 0775 /run/faas
+          ls -lad /run/faas
 
           # Health gate. Probes gatewayd-public (loopback :9090), not apid directly
           # — spec §11 binds apid to loopback-only and gatewayd
