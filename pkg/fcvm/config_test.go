@@ -38,9 +38,9 @@ func TestColdBootConfigTwoDrives(t *testing.T) {
 // AC #6) pins the drive topology for the sidecar Workloads
 // branch of BuildColdBootConfig. The contract:
 //
-//   drive0 = shared read-only base rootfs (DriveBase, IsRootDevice=true)
-//   drive1 = main workload layer (DriveLayerMain, RW, non-root)
-//   drive2..N = sidecar layers (DriveSidecarPrefix+idx, RO, non-root)
+//	drive0 = shared read-only base rootfs (DriveBase, IsRootDevice=true)
+//	drive1 = main workload layer (DriveLayerMain, RW, non-root)
+//	drive2..N = sidecar layers (DriveSidecarPrefix+idx, RO, non-root)
 //
 // where N = len(Workloads). The main drive MUST stay RW (the
 // customer's container writes to /tmp, installs pip packages,
