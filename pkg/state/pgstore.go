@@ -8933,7 +8933,8 @@ var _ = deploymentSelectColumnsQualified
 
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
-	var kind, statusStr, scanStatus string
+	var kind, statusStr string
+	var scanStatus *string
 	var scannedAt *time.Time
 	// Issue #460 / ADR-053: six override columns scanned here so the
 	// SELECT projections in DeploymentByID / LatestDeployment / etc.
@@ -8943,11 +8944,11 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 	//
 	// Issue #464 / ADR-055: scan columns (scan_result jsonb,
 	// scan_status text, scanned_at timestamptz) are scanned here too.
-	// scanned_at is nullable (NULL on pre-feature rows that the
-	// migration backfilled to scan_status='skipped' with NULL
-	// scanned_at — see migrations/00135 backfill clause) so the
-	// destination is *time.Time; pgx scans a NULL into a nil pointer
-	// cleanly.
+	// scan_status is nullable (NULL on pre-PR-#651 rows, before the
+	// backfill passes — and NULL inside the window where the deploy
+	// ships ahead of the scan) so the destination is *string.
+	// scanned_at is also nullable for the same reason; destination
+	// is *time.Time. pgx scans a NULL into a nil pointer cleanly.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -8961,7 +8962,9 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 	}
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
-	d.ScanStatus = scanStatus
+	if scanStatus != nil {
+		d.ScanStatus = *scanStatus
+	}
 	if scannedAt != nil {
 		d.ScannedAt = *scannedAt
 	}
@@ -8978,7 +8981,8 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 // SetDeploymentFailed.
 func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
-	var kind, statusStr, rootfsPath, rootfsKey, scanStatus string
+	var kind, statusStr, rootfsPath, rootfsKey string
+	var scanStatus *string
 	var scannedAt *time.Time
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
@@ -8996,7 +9000,9 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 	d.RootfsKey = rootfsKey
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
-	d.ScanStatus = scanStatus
+	if scanStatus != nil {
+		d.ScanStatus = *scanStatus
+	}
 	if scannedAt != nil {
 		d.ScannedAt = *scannedAt
 	}
@@ -9007,7 +9013,8 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 	var out []Deployment
 	for rows.Next() {
 		d := Deployment{}
-		var kind, statusStr, scanStatus string
+		var kind, statusStr string
+		var scanStatus *string
 		var scannedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
@@ -9022,7 +9029,9 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		}
 		d.Kind = DeploymentKind(kind)
 		d.Status = DeploymentStatus(statusStr)
-		d.ScanStatus = scanStatus
+		if scanStatus != nil {
+			d.ScanStatus = *scanStatus
+		}
 		if scannedAt != nil {
 			d.ScannedAt = *scannedAt
 		}
