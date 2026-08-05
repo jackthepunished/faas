@@ -676,6 +676,61 @@ func TestFlipMFARequiredIfUnenrolled(t *testing.T) {
 			t.Errorf("MFARequired = true after no-op flip on enrolled account")
 		}
 	})
+
+	// already_required_emits_armed_again: the second-chokepoint audit
+	// surface (issue #286 / IAM hardening mega-PR review finding F2).
+	// When a chokepoint fires on an account whose mfa_required is
+	// already true (e.g. webhook redelivery, or two chokepoints hit
+	// in the same session), the helper must still emit a
+	// distinguishable audit row so SOC 2 CC6.2 can prove the
+	// chokepoint fired. Pre-PR the helper returned silently on the
+	// unchanged branch, leaving an audit-log hole.
+	//
+	// Distinct kind from the first-arm "account.mfa_required_enabled"
+	// so a downstream query ("did this account ever re-trip a
+	// chokepoint?") stays simple.
+	t.Run("already_required_emits_armed_again", func(t *testing.T) {
+		e := setupWithMFA(t, api.PlanPro, true, false) // mfa_required=true, not enrolled
+		// Swap in a fresh auditor so we can read rows out of the
+		// in-memory store. The default auditor wired by newServer is
+		// a noopNotifier-flavoured one that goes through the same
+		// MemStore, but rebuilding it explicitly makes the test
+		// self-contained and immune to future wiring drift.
+		e.srv.audit = newAuditor(e.store, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		ctx := context.Background()
+		fresh, _ := e.store.AccountByID(ctx, e.acct.ID)
+		acctID := fresh.ID
+
+		// Chokepoint hit — row is already armed, so the helper must
+		// emit account.mfa_required_armed_again, NOT silently return.
+		e.srv.flipMFARequiredIfUnenrolled(ctx, fresh, "plan_upgrade",
+			map[string]any{"from": "free", "to": "pro"})
+
+		// State didn't change.
+		after, _ := e.store.AccountByID(ctx, acctID)
+		if !after.MFARequired {
+			t.Errorf("MFARequired = false after second-chokepoint hit, want still true")
+		}
+
+		// Audit row landed. ListEvents filters on subject (the acct
+		// id) — confirm exactly one row of the armed-again kind.
+		rows, err := e.store.ListEvents(ctx, acctID, 10)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		var armed int
+		for _, ev := range rows {
+			if ev.Kind == "account.mfa_required_armed_again" {
+				armed++
+			}
+			if ev.Kind == "account.mfa_required_enabled" {
+				t.Errorf("unexpected account.mfa_required_enabled row on already-armed re-hit — the helper should emit armed_again, not enabled")
+			}
+		}
+		if armed != 1 {
+			t.Errorf("account.mfa_required_armed_again count = %d, want 1 (rows seen: %d)", armed, len(rows))
+		}
+	})
 }
 
 // --- burn-out + race tests (issue #186 review findings #13–#17) -------------

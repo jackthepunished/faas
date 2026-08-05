@@ -773,8 +773,19 @@ func (s *server) flipMFARequiredIfUnenrolled(ctx context.Context, acct state.Acc
 	}
 	if !changed {
 		// Row already carried mfa_required=true (a prior chokepoint
-		// ran, or a webhook was redelivered). Suppress the duplicate
-		// audit row.
+		// ran, or a webhook was redelivered). The "silent re-arm"
+		// gap (PR #629 review finding F2): previously suppressed the
+		// audit row entirely, so SOC 2 CC6.2 couldn't prove the
+		// chokepoint fired on a customer whose mfa_required was
+		// already true. Emit a separate audit kind so the row
+		// distinguishes "first arm" from "re-arm on a later
+		// chokepoint hit" — both lines stay in the audit log
+		// without either duplicating.
+		data := map[string]any{"reason": reason}
+		for k, v := range extra {
+			data[k] = v
+		}
+		s.audit.Emit(ctx, "account.mfa_required_armed_again", &acct.ID, data)
 		return
 	}
 	data := map[string]any{"reason": reason}
