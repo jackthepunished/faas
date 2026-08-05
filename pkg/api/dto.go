@@ -2159,6 +2159,34 @@ const (
 	SidecarTypeSidecar SidecarType = "sidecar"
 )
 
+// EvictionPriority is the per-app tier classification (issue #475).
+// 'best_effort' keeps the historical LRU-by-last_request_at reaper
+// behaviour: under cross-account RAM pressure, schedd may park the
+// instance to make room for someone else's bursty workload. 'reserved'
+// still obeys idle / per-account / per-app caps but is protected from
+// cross-account RAM-pressure eviction — every best_effort candidate
+// is drained before any reserved is parked. The category is closed
+// and the values are SQL CHECK (apps_eviction_priority_chk) — adding
+// a third tier is a migration + ADR + handler + reaper sort change,
+// not a config flag. The schema default is 'best_effort' for every
+// pre-#475 row.
+type EvictionPriority string
+
+const (
+	// EvictionPriorityBestEffort is the pre-#475 default tier. The
+	// reaper treats this instance as a fair candidate for
+	// cross-account RAM-pressure eviction; LRU-by-last_request_at
+	// applies unchanged.
+	EvictionPriorityBestEffort EvictionPriority = "best_effort"
+	// EvictionPriorityReserved is the opt-in protected tier
+	// (Plan.EvictionPriorityReservedAllowed; per-account
+	// ReservedConcurrencyPerAccount cap). The reaper still reaps
+	// idle / aggressive paths and the per-account RAM cap still
+	// applies; this tier only protects against the cross-account
+	// RAM-pressure eviction path.
+	EvictionPriorityReserved EvictionPriority = "reserved"
+)
+
 // sidecarNameRe matches RFC 1123 label: lowercase alphanumeric + dash,
 // 1..63 chars, starts with [a-z0-9]. Mirrors the `apps.slug` regex
 // shape so the dashboard and CLI can use the same identifier

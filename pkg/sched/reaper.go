@@ -39,6 +39,19 @@ type InstanceInfo struct {
 	SidecarMBs   []int
 	LastRequest  time.Time
 	Started      time.Time
+	// EvictionPriority (issue #475) is the per-app tier, sourced from
+	// apps.eviction_priority at the loop tick. 'best_effort' (default
+	// for every pre-#475 row) keeps the pre-#475 LRU-by-last_request_at
+	// reaper behaviour bit-for-bit; 'reserved' protects the instance
+	// from cross-account RAM-pressure eviction — every best_effort
+	// candidate is drained before any reserved is parked. The field
+	// is identical across all instances of one app (carrier semantics
+	// — same as MinInstances); schedd loops over the apps snapshot
+	// in the loop tick and stamps the field once per tick. Idle and
+	// aggressive reaping intentionally ignore this field so a parked
+	// reserved instance eventually parks after its idle timeout
+	// (the "idle-still-park" guarantee).
+	EvictionPriority string
 	IdleTimeoutS int // app-configured; 0 => plan default
 	// NodeID is the compute_node the instance lives on
 	// (issue #97 / ADR-025 axis 3). Informational today: the
@@ -347,9 +360,20 @@ func SelectEvictions(residentMB int, now time.Time, instances []InstanceInfo) []
 		cands = append(cands, in)
 	}
 
-	// Order: non-Scale before Scale (Scale evicted last), then oldest last
-	// request first (LRU), then instance id for determinism.
+	// Order (issue #475): best_effort before reserved, then non-Scale
+	// before Scale (Scale evicted last), then oldest last request
+	// first (LRU), then instance id for determinism. The new tier
+	// comparator is the load-bearing one — it is the only path that
+	// can change which instance is parked at a given RAM pressure.
+	// Pre-#475 fixtures have EvictionPriority == "" which falls
+	// through to the !reserved branch on both sides, preserving the
+	// historical LRU behaviour bit-for-bit.
 	sort.Slice(cands, func(a, b int) bool {
+		ar, br := cands[a].EvictionPriority == string(api.EvictionPriorityReserved),
+			cands[b].EvictionPriority == string(api.EvictionPriorityReserved)
+		if ar != br {
+			return !ar // best_effort first
+		}
 		as, bs := cands[a].Plan == api.PlanScale, cands[b].Plan == api.PlanScale
 		if as != bs {
 			return !as // non-Scale first
