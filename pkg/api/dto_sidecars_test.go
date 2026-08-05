@@ -260,18 +260,28 @@ func TestSidecars_Validate_Rejects(t *testing.T) {
 	goodImage2 := "ghcr.io/me/y@sha256:" + strings.Repeat("b", 64)
 	goodImage3 := "ghcr.io/me/z@sha256:" + strings.Repeat("c", 64)
 	cases := []struct {
-		name    string
-		ss      Sidecars
-		wantSub string
+		name     string
+		ss       Sidecars
+		wantSub  string
+		wantCode string // RFC 7807 stable code; "" = don't assert (substring-only rows)
 	}{
 		{
+			// AC #3 (issue #463 / ADR-069 / PR-B): a
+			// 3-element sidecars array exceeds the
+			// SidecarCapMax=2 cap and the DTO gate MUST
+			// surface the literal CodeSidecarCapExceeded
+			// so the SDK can branch on the wire code
+			// (not on prose). The closed enum is
+			// pinned here so a reword in pkg/api/errors.go
+			// fails this test in the same commit.
 			name: "three-sidecars-over-cap",
 			ss: Sidecars{
 				{Name: "a", Image: goodImage, Type: SidecarTypeInit},
 				{Name: "b", Image: goodImage2, Type: SidecarTypeSidecar},
 				{Name: "c", Image: goodImage3, Type: SidecarTypeInit},
 			},
-			wantSub: "Too many sidecars",
+			wantSub:  "Too many sidecars",
+			wantCode: CodeSidecarCapExceeded,
 		},
 		{
 			name: "two-init-duplicate-type",
@@ -324,6 +334,10 @@ func TestSidecars_Validate_Rejects(t *testing.T) {
 			body := p.Title + " " + p.Detail
 			if !strings.Contains(body, tc.wantSub) {
 				t.Errorf("Validate(Rejects[%s]) detail = %q, want substring %q", tc.name, body, tc.wantSub)
+			}
+			if tc.wantCode != "" && p.Code != tc.wantCode {
+				t.Errorf("Validate(Rejects[%s]) code = %q, want %q (RFC 7807 stable code)",
+					tc.name, p.Code, tc.wantCode)
 			}
 		})
 	}
