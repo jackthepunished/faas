@@ -36,6 +36,7 @@ package migrations_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -168,7 +169,7 @@ func TestMigrations_00141_AppWebhookDeliveries_ShapeAndFK(t *testing.T) {
 	}
 
 	// (4) attempt CHECK enforces 0..7. The dispatcher's DLQ ceiling.
-	for _, a := range []int{0, 1, 7} {
+	for _, a := range []int{0, 1, 7, 8} {
 		if _, err := pool.Exec(ctx, `
 			insert into app_webhook_deliveries
 				(webhook_id, app_id, account_id, event, payload, attempt)
@@ -180,32 +181,34 @@ func TestMigrations_00141_AppWebhookDeliveries_ShapeAndFK(t *testing.T) {
 	_, err = pool.Exec(ctx, `
 		insert into app_webhook_deliveries
 			(webhook_id, app_id, account_id, event, payload, attempt)
-		values ($1, $2, $3, 'cron.fired', '{}'::jsonb, 8)
+		values ($1, $2, $3, 'cron.fired', '{}'::jsonb, 9)
 	`, hookID, appID, acctID)
 	if err == nil {
-		t.Errorf("attempt=8 should be rejected by CHECK")
+		t.Errorf("attempt=9 should be rejected by CHECK")
 	} else if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
-		t.Errorf("attempt=8 error = %v, want pgx 23514 (check_violation)", err)
+		t.Errorf("attempt=9 error = %v, want pgx 23514 (check_violation)", err)
 	}
 
 	// (5) partial index app_webhook_deliveries_pending_idx exists on
-	// (status, next_attempt_at) WHERE status IN ('pending','in_flight').
+	// (account_id, next_attempt_at) WHERE status IN ('pending','in_flight').
 	// The dispatcher's claim query depends on this index for O(due
-	// rows) reads. We probe pg_indexes by name rather than by predicate
-	// so a regression that drops the predicate still surfaces here
-	// (the index would still exist as a non-partial B-tree but the
-	// claim query would scan the whole ledger table).
-	var partialIdxCount int
+	// rows) reads AND the round-robin ORDER BY (account_id, next_attempt_at).
+	// We probe pg_indexes.indexdef so a regression that drops the
+	// partial predicate OR reorders the columns trips the test.
+	var partialIdxDef string
 	if err := pool.QueryRow(ctx, `
-		select count(*) from pg_indexes
+		select indexdef from pg_indexes
 		 where schemaname = current_schema()
 		   and tablename = 'app_webhook_deliveries'
 		   and indexname = 'app_webhook_deliveries_pending_idx'
-	`).Scan(&partialIdxCount); err != nil {
+	`).Scan(&partialIdxDef); err != nil {
 		t.Fatalf("pg_indexes probe: %v", err)
 	}
-	if partialIdxCount != 1 {
-		t.Errorf("partial index app_webhook_deliveries_pending_idx: want 1 entry in pg_indexes, got %d", partialIdxCount)
+	if !strings.Contains(partialIdxDef, "WHERE") {
+		t.Errorf("partial index missing WHERE predicate: %q", partialIdxDef)
+	}
+	if !strings.Contains(partialIdxDef, "account_id") {
+		t.Errorf("partial index missing account_id column: %q", partialIdxDef)
 	}
 
 	// (6) FK CASCADE on webhook_id: drop the subscription, drop the

@@ -308,11 +308,16 @@ func (m *MemStore) MarkAppWebhookDeliveryDead(_ context.Context, id string, curr
 	return nil
 }
 
-func (m *MemStore) ResetAppWebhookDeliveryFromDead(_ context.Context, id string, now time.Time) error {
+func (m *MemStore) ResetAppWebhookDeliveryFromDead(_ context.Context, id, webhookID, accountID string, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, ok := m.appWebhookDeliveries[id]
 	if !ok {
+		return ErrNotFound
+	}
+	// SQL-level IDOR guard — mirror the PgStore's
+	// `where id = $1 and webhook_id = $2 and account_id = $3` filter.
+	if d.WebhookID != webhookID || d.AccountID != accountID {
 		return ErrNotFound
 	}
 	if d.Status != AppWebhookDeliveryDead {

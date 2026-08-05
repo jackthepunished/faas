@@ -7998,7 +7998,7 @@ components:
           type: object
           additionalProperties: true
           description: The original event payload (omitted on rows past the first attempt; the customer has already seen it).
-        attempt: { type: integer, minimum: 0, maximum: 7 }
+        attempt: { type: integer, minimum: 0, maximum: 8 }
         status: { type: string, enum: [pending, in_flight, succeeded, failed, dead] }
         last_error: { type: string }
         last_response_code: { type: integer, minimum: 0, maximum: 599 }

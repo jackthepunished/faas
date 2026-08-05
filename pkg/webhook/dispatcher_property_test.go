@@ -19,7 +19,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -84,14 +83,11 @@ func TestDispatcher_Fairness_PerAccountRoundRobin(t *testing.T) {
 	// Drive the cycle synchronously so we can observe after each
 	// tick without an inflight race.
 	var succeededPerAccount [accounts]int
-	var wg sync.WaitGroup
 	for tk := 0; tk < ticks; tk++ {
 		disp.cycle(context.Background())
-		// Wait for inflight to drain: the goroutines call
-		// MarkSucceeded via the store. With 32 cap + 200 receiver,
-		// each tick drains in well under 1s.
-		wg.Wait() // no-op since cycle is synchronous; we just yield below
-		// Give the goroutines a beat to finish marking rows.
+		// cycle() fires goroutines via disp.inflight; sleep long
+		// enough for them to land MarkSucceeded calls on the
+		// MemStore before the per-tick snapshot.
 		time.Sleep(20 * time.Millisecond)
 		for i, acct := range accountIDs {
 			deliveries, _, err := m.ListAppWebhookDeliveries(context.Background(), fmt.Sprintf("app-%d", i), "", 0, "")

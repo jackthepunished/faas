@@ -104,6 +104,15 @@ func validateWebhookURL(rawURL string) *api.Problem {
 	if rawURL == "" {
 		return api.ErrAppWebhookInvalid("target_url is required")
 	}
+	if !strings.HasPrefix(rawURL, "https://") && !strings.HasPrefix(rawURL, "http://") {
+		// Reject javascript:, data:, ftp://, and the entire non-HTTP
+		// family before resolveAndCheckEgress gets a chance. We allow
+		// http:// to keep the e2e loopback receiver viable (the
+		// egress gate permits loopback only when
+		// FAAS_EGRESS_ALLOW_LOOPBACK=1); production customers target
+		// https://.
+		return api.ErrAppWebhookInvalid("target_url must start with http:// or https://")
+	}
 	if len(rawURL) < 8 || len(rawURL) > 2048 {
 		// Bounds match the DB CHECK on app_webhooks_target_url_len_chk
 		// (migrations/00140_app_webhooks.sql:42-46).
@@ -140,7 +149,7 @@ func (s *server) listAppWebhooks(w http.ResponseWriter, r *http.Request, acct st
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAppWebhooksForAccount(ctx(r), acct.ID)
+	rows, err := s.store.ListAppWebhooksForApp(ctx(r), app.ID)
 	if err != nil {
 		s.log.WarnContext(ctx(r), "list app webhooks", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not list webhooks"))
@@ -148,7 +157,11 @@ func (s *server) listAppWebhooks(w http.ResponseWriter, r *http.Request, acct st
 	}
 	out := make([]api.AppWebhookResponse, 0, len(rows))
 	for _, row := range rows {
-		if row.AppID != app.ID {
+		// Defence-in-depth: loadApp already verified app.AccountID,
+		// but the per-app store query could in principle return a
+		// row from another account if the FK index was stale. Reject
+		// such rows silently rather than leak the foreign ID.
+		if row.AccountID != acct.ID {
 			continue
 		}
 		out = append(out, appWebhookResponse(row))
@@ -357,6 +370,10 @@ func (s *server) updateAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 		}
 		sealed, sealErr := secretbox.SealBytes(recipient, appWebhookSecretSealLabel, []byte(*req.WebhookSecret), api.AppWebhookSecretMaxBytes)
 		if sealErr != nil {
+			if prob := api.AsProblem(sealErr); prob != nil {
+				api.WriteProblem(w, prob)
+				return
+			}
 			api.WriteProblem(w, api.ErrCapacity("could not seal webhook secret"))
 			return
 		}
@@ -413,6 +430,7 @@ func (s *server) deleteAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 	s.audit.Emit(ctx(r), "app.webhook_deleted", &acct.ID, map[string]any{
 		"webhook_id": id,
 		"app_id":     app.ID,
+		"target_url": existing.TargetURL,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -454,6 +472,10 @@ func (s *server) rotateAppWebhookSecret(w http.ResponseWriter, r *http.Request, 
 	}
 	sealed, err := secretbox.SealBytes(recipient, appWebhookSecretSealLabel, plaintext, api.AppWebhookSecretMaxBytes)
 	if err != nil {
+		if prob := api.AsProblem(err); prob != nil {
+			api.WriteProblem(w, prob)
+			return
+		}
 		api.WriteProblem(w, api.ErrCapacity("could not seal webhook secret"))
 		return
 	}
@@ -551,7 +573,10 @@ func (s *server) retryAppWebhookDelivery(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	did := r.PathValue("did")
-	if err := s.store.ResetAppWebhookDeliveryFromDead(ctx(r), did, timeNow()); err != nil {
+	// Pass webhookID + accountID so the store's SQL-level IDOR guard
+	// returns ErrNotFound for deliveries that belong to a different
+	// webhook or account (see pkg/state ResetAppWebhookDeliveryFromDead).
+	if err := s.store.ResetAppWebhookDeliveryFromDead(ctx(r), did, id, acct.ID, timeNow()); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "delivery not found")
 			return

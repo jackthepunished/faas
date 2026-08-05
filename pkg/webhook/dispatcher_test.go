@@ -106,8 +106,8 @@ func (r *recordingSleeper) Slept() []time.Duration {
 // TestComputeBackoff_DefaultSchedule pins the default schedule's
 // ±25% jitter envelope: each delay must be within ±25% of the base.
 func TestComputeBackoff_DefaultSchedule(t *testing.T) {
-	for i, base := range DefaultBackoff {
-		got, err := ComputeBackoff(DefaultBackoff, i)
+	for i, base := range defaultBackoff {
+		got, err := ComputeBackoff(defaultBackoff, i)
 		if err != nil {
 			t.Fatalf("attempt %d: %v", i, err)
 		}
@@ -122,8 +122,8 @@ func TestComputeBackoff_DefaultSchedule(t *testing.T) {
 // TestComputeBackoff_AggressiveHalved pins the aggressive schedule
 // as the default schedule divided by 2.
 func TestComputeBackoff_AggressiveHalved(t *testing.T) {
-	for i, base := range AggressiveBackoff {
-		got, err := ComputeBackoff(AggressiveBackoff, i)
+	for i, base := range aggressiveBackoff {
+		got, err := ComputeBackoff(aggressiveBackoff, i)
 		if err != nil {
 			t.Fatalf("attempt %d: %v", i, err)
 		}
@@ -139,15 +139,15 @@ func TestComputeBackoff_AggressiveHalved(t *testing.T) {
 // TestComputeBackoff_Exhausted pins the boundary at
 // len(schedule)+1.
 func TestComputeBackoff_Exhausted(t *testing.T) {
-	_, err := ComputeBackoff(DefaultBackoff, len(DefaultBackoff))
+	_, err := ComputeBackoff(defaultBackoff, len(defaultBackoff))
 	if !errors.Is(err, ErrDeliveryExhausted) {
 		t.Errorf("got err=%v, want ErrDeliveryExhausted", err)
 	}
-	_, err = ComputeBackoff(DefaultBackoff, len(DefaultBackoff)+5)
+	_, err = ComputeBackoff(defaultBackoff, len(defaultBackoff)+5)
 	if !errors.Is(err, ErrDeliveryExhausted) {
 		t.Errorf("got err=%v, want ErrDeliveryExhausted", err)
 	}
-	_, err = ComputeBackoff(DefaultBackoff, -1)
+	_, err = ComputeBackoff(defaultBackoff, -1)
 	if err == nil {
 		t.Errorf("negative attempt: want non-nil err")
 	}
@@ -155,14 +155,27 @@ func TestComputeBackoff_Exhausted(t *testing.T) {
 
 // TestScheduleFor pins the retry-policy → schedule mapping.
 func TestScheduleFor(t *testing.T) {
-	if got := scheduleFor(state.AppWebhookRetryDefault); len(got) != len(DefaultBackoff) {
-		t.Errorf("default schedule: got %d, want %d", len(got), len(DefaultBackoff))
+	d := &Dispatcher{}
+	if got := d.scheduleFor(state.AppWebhookRetryDefault); len(got) != len(defaultBackoff) {
+		t.Errorf("default schedule: got %d, want %d", len(got), len(defaultBackoff))
 	}
-	if got := scheduleFor(state.AppWebhookRetryAggressive); len(got) != len(AggressiveBackoff) {
-		t.Errorf("aggressive schedule: got %d, want %d", len(got), len(AggressiveBackoff))
+	if got := d.scheduleFor(state.AppWebhookRetryAggressive); len(got) != len(aggressiveBackoff) {
+		t.Errorf("aggressive schedule: got %d, want %d", len(got), len(aggressiveBackoff))
 	}
-	if got := scheduleFor(state.AppWebhookRetryNone); len(got) != 0 {
+	if got := d.scheduleFor(state.AppWebhookRetryNone); len(got) != 0 {
 		t.Errorf("none schedule: got %d, want 0", len(got))
+	}
+	// Per-instance override wins.
+	override := map[state.AppWebhookRetryPolicy][]time.Duration{
+		state.AppWebhookRetryDefault: {time.Millisecond},
+	}
+	d.WithBackoffs(override)
+	if got := d.scheduleFor(state.AppWebhookRetryDefault); len(got) != 1 {
+		t.Errorf("override default: got %d, want 1", len(got))
+	}
+	// Absent key in override falls back to DefaultBackoffs.
+	if got := d.scheduleFor(state.AppWebhookRetryAggressive); len(got) != len(aggressiveBackoff) {
+		t.Errorf("override fall-through aggressive: got %d, want %d", len(got), len(aggressiveBackoff))
 	}
 }
 

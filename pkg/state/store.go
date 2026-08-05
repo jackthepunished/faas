@@ -2684,8 +2684,11 @@ type Store interface {
 	// "retry a dead delivery" path. Stamps status='pending',
 	// next_attempt_at=now, attempt=0 (full budget re-armed). Used
 	// by the apid POST /retry handler and the gregale
-	// `webhooks retry` subcommand.
-	ResetAppWebhookDeliveryFromDead(ctx context.Context, id string, now time.Time) error
+	// `webhooks retry` subcommand. The webhookID + accountID
+	// filters are the SQL-level IDOR guard: a caller holding a
+	// delivery id from another customer's webhook gets ErrNotFound,
+	// not silent cross-tenant reset.
+	ResetAppWebhookDeliveryFromDead(ctx context.Context, id, webhookID, accountID string, now time.Time) error
 
 	// ListAppWebhookDeliveries backs GET
 	// /v1/apps/{slug}/webhooks/{id}/deliveries. pageToken is the

@@ -123,6 +123,94 @@ in case any other PR is concurrently claiming 139 or 141. ADR-041
 fence pattern; renumber past reservations at PR creation per
 memory `migration-slot-renumber-at-pr-creation`.
 
+## Consequences
+
+Positive:
+
+- Customers get persistent retries and a DLQ instead of dropped
+  events on a 5xx — the headline win. `app_webhook_deliveries`
+  survives schedd restart because the row is on disk before the
+  dispatcher attempts delivery.
+- Per-account fairness emerges from the claim query — no new
+  state table, no config knob, no operator maintenance.
+- The retry-policy closed set (default | aggressive | none) gives
+  customers three load-bearing presets without the maintenance
+  cost of a free-form retry-policy DSL.
+- Sealed-secret + masked-response shape mirrors the alert-rule
+  precedent, so a single host.age identity covers both surfaces.
+
+Negative / costs:
+
+- One row per delivery means the table grows linearly with the
+  customer's webhook volume. The `succeeded` rows never get GC'd
+  today; a future cron (issue #476 follow-up) should partition by
+  month and detach partitions older than 90 days. The dashboard
+  alert `snapshot_fleet_avg_mb` does NOT cover this table — a
+  new `webhook_deliveries_table_mb` alert is queued for the
+  follow-up.
+- The 5-second tick + 32/tick cap is a deliberate batching
+  trade-off: a single noisy account could push out the per-tick
+  cap, but the ORDER BY round-robin + partial index keeps it
+  bounded. A larger fleet might want a sub-tick cap per account,
+  but at today's fleet size the contract is sufficient.
+- The dispatcher is a schedd-only goroutine today; future
+  multi-schedd deployments (ADR-064 cross-node rebalance) would
+  need a per-node cap-aware partition to avoid a thundering herd
+  on a single busy account. Out of scope for #476.
+- Retry-policy='none' has no auto-retry; customers who flip it
+  on by accident get a DLQ at first failure and must call
+  `webhooks retry` to re-arm. The CLI surfaces the policy name
+  on the `webhooks list` row so the customer can verify.
+- Audit volume: the dispatcher emits one audit row per delivery
+  attempt (`webhook.delivered` / `webhook.failed` / `webhook.dead`)
+  on top of the customer's CRUD audit rows. A busy fleet will
+  see ~32 audit rows/tick × 12 ticks/min = ~384 rows/min from the
+  dispatcher alone. The audit table is sharded by created_at
+  month and the dashboard's `audit_log_volume` panel surfaces a
+  tripwire at 5k rows/min.
+
+## Rejected alternatives
+
+- **Extend `alert_deliveries` to carry outbound webhooks.** Rejected
+  by §3.1: alert delivery is alert-shaped (`alert_rule_id`,
+  `observed_value`, cool-down window); webhook delivery is
+  event-shaped (`event`, `payload`, no cool-down). A union type
+  on the ledger would break the dispatcher's claim query.
+- **Token-bucket fairness (per-account state table).** Rejected:
+  the SQL `ORDER BY account_id, next_attempt_at` round-robin is
+  sufficient at the 32/tick cap. A token bucket adds a state
+  table, a refresh tick, and a config knob for a benefit no
+  current customer reads.
+- **Free-form retry policy DSL.** Rejected: three closed presets
+  cover 100% of observed customer use cases; a DSL would invite
+  unbounded retry budgets and complicate the dispatcher's backoff
+  shape. A new preset is a closed-set extension + ADR, not a
+  parser.
+- **Synchronous dispatch from apid (mirror meterd alerts).**
+  Rejected: synchronous dispatch blocks the apid request thread,
+  has no DLQ, and dies with the apid process. Persistent ledger +
+  schedd dispatcher is the only shape that survives the customer's
+  5xx.
+- **Counter-based rate limiter (e.g. token bucket per webhook).**
+  Rejected: same as token-bucket fairness above. The customer's
+  endpoint is rate-limited by the customer's own ingress; our
+  job is to retry, not police their receive rate.
+- **Wire payload format change.** Rejected: reusing
+  `pkg/webhookout.Signer`'s HMAC-SHA256 over `<unix>.<delivery_id>.<body>`
+  keeps the customer-side verifier stable. The only header rename
+  is `X-Faas-Alert-Id` → `X-Faas-Delivery-Id` (the new stable
+  identifier is the delivery row id, not the alert rule id).
+- **Single `app_webhooks_delivery` table (no separate ledger).**
+  Rejected: subscriptions are small, infrequent writes; deliveries
+  are high-volume, mutable state. A single table would either
+  bloat the subscription scan or fight the partial-index claim
+  query. Two tables, FK CASCADE.
+- **Webhook destination stored as URL string + post-write
+  SSRF probe.** Rejected: post-write probes race DNS-rebinding
+  attacks; the URL must be re-validated on every dispatch
+  (`pkg/oci/egress.go::resolveAndCheckEgress`) — the create-time
+  check is a fast-fail gate, not a security boundary.
+
 ## Out of scope
 
 - Per-webhook custom retry policies beyond the three presets.

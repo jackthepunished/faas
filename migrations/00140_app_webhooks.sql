@@ -23,13 +23,13 @@
 --     handler seals on write and unseals on dispatch; reads return
 --     a masked constant. Closes G2 (gap, §17) — env secrets are
 --     sealed at rest, same as alert_rules.webhook_secret_sealed.
---   - event_filter is a jsonb array of event-name strings
---     (e.g. ['cron.fired','app.scaled']). An empty array means
+--   - event_filter is a text[] array of event-name strings
+--     (e.g. {'cron.fired','app.scaled'}). An empty array means
 --     "all events"; the evaluator on the dispatch side is a single
---     `WHERE $1 = ANY(event_filter)` lookup against the column. A
---     jsonb[] column (not jsonb) keeps the index lookup B-tree-clean
---     without a jsonb_path_ops GIN — see issue #476's "events
---     vocabulary" section in the dispatch commit.
+--     `WHERE $1 = ANY(event_filter)` lookup against the column.
+--     text[] keeps the index lookup B-tree-clean without a
+--     jsonb_path_ops GIN — see issue #476's "events vocabulary"
+--     section in the dispatch commit.
 --   - retry_policy is a closed vocabulary ('default' | 'aggressive'
 --     | 'none'). The dispatcher reads this column when computing
 --     backoff; new policies land as a controller addition first,
@@ -43,7 +43,7 @@ create table if not exists app_webhooks (
     account_id      uuid not null references accounts(id) on delete cascade,
     target_url      text not null,
     secret_sealed   bytea not null,
-    event_filter    jsonb not null default '[]'::jsonb,
+    event_filter    text[] not null default '{}'::text[],
     retry_policy    text not null default 'default',
     enabled         boolean not null default true,
     created_at      timestamptz not null default now(),

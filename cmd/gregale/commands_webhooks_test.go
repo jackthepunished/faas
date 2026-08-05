@@ -89,7 +89,7 @@ func TestCmdWebhooks_Rm_HappyPath(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := cmdWebhooksRm([]string{"demo", webhookTestID}); code != 0 {
+	if code := cmdWebhooksRm([]string{"--app", "demo", webhookTestID}); code != 0 {
 		t.Errorf("rm = %d, want 0", code)
 	}
 	if gotMethod != http.MethodDelete {

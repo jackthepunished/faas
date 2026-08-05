@@ -1224,9 +1224,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		return []*age.X25519Identity{ident}
 	}
+	// Propagate the dispatcher's lifecycle error through loopErr so
+	// a non-context-canceled exit (e.g. a poisoned row) tears down
+	// schedd with the rest of the loop — same posture as loopErr +
+	// the drain goroutine above. A ctx-canceled return is treated as
+	// a clean shutdown and ignored.
+	webhookLoopErr := make(chan error, 1)
 	go func() {
-		if err := webhookDispatcher.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Warn("webhook dispatcher", "err", err)
+		err := webhookDispatcher.Run(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			webhookLoopErr <- err
+		} else {
+			webhookLoopErr <- nil
 		}
 	}()
 
@@ -1239,6 +1248,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	case err := <-loopErr:
 		if err != nil {
+			return err
+		}
+	case err := <-webhookLoopErr:
+		if err != nil {
+			log.Warn("webhook dispatcher exited with error", "err", err)
 			return err
 		}
 	}

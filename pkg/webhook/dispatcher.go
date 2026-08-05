@@ -85,10 +85,9 @@ import (
 // Tunables. Default values match the issue #476 acceptance gates:
 // 32/tick, 5s tick, 10s drain on shutdown.
 const (
-	DefaultTick        = 5 * time.Second
-	DefaultCap         = 32
-	DefaultPerAttempt  = 10 * time.Second
-	DefaultMaxAttempts = 7
+	DefaultTick       = 5 * time.Second
+	DefaultCap        = 32
+	DefaultPerAttempt = 10 * time.Second
 	// DefaultDrainTimeout is the budget for in-flight goroutines to
 	// finish on ctx.Done(). Matches the cmd/schedd/main.go 10s
 	// shutdown pattern; the HTTP graceful stop timeout is 5s and the
@@ -97,10 +96,14 @@ const (
 	DefaultDrainTimeout = 10 * time.Second
 )
 
-// DefaultBackoff is the retry schedule for retry_policy='default'.
+// defaultBackoff is the retry schedule for retry_policy='default'.
 // Mirrors issue #476's "30s, 2m, 10m, 1h, 6h" ladder — 6 retries
-// after the initial attempt = 7 attempts total.
-var DefaultBackoff = []time.Duration{
+// after the initial attempt = 7 attempts total. Lives as a package-
+// level constant (not a struct field) because the schedule is
+// read-only after init — schedd runs one Dispatcher per process,
+// and tests use the WithBackoffs helper to swap the schedules
+// without mutating globals.
+var defaultBackoff = []time.Duration{
 	30 * time.Second,
 	2 * time.Minute,
 	10 * time.Minute,
@@ -108,9 +111,9 @@ var DefaultBackoff = []time.Duration{
 	6 * time.Hour,
 }
 
-// AggressiveBackoff halves each step. Mirrors the alert-side "we
+// aggressiveBackoff halves each step. Mirrors the alert-side "we
 // need this to land fast" shape.
-var AggressiveBackoff = []time.Duration{
+var aggressiveBackoff = []time.Duration{
 	15 * time.Second,
 	1 * time.Minute,
 	5 * time.Minute,
@@ -118,10 +121,19 @@ var AggressiveBackoff = []time.Duration{
 	3 * time.Hour,
 }
 
-// NoBackoff is the empty schedule — the dispatcher marks 'dead'
+// noBackoff is the empty schedule — the dispatcher marks 'dead'
 // immediately on any non-2xx response. retry_policy='none' is the
 // "I'm just testing this endpoint" toggle.
-var NoBackoff = []time.Duration{}
+var noBackoff = []time.Duration{}
+
+// DefaultBackoffs is the read-only schedule map keyed by retry
+// policy. Tests and the cmd/schedd production wiring consult this
+// table; per-instance overrides go via Dispatcher.WithBackoffs.
+var DefaultBackoffs = map[state.AppWebhookRetryPolicy][]time.Duration{
+	state.AppWebhookRetryDefault:    defaultBackoff,
+	state.AppWebhookRetryAggressive: aggressiveBackoff,
+	state.AppWebhookRetryNone:       noBackoff,
+}
 
 // ErrDeliveryExhausted is returned by ComputeBackoff when the
 // supplied attempt is past the schedule's end. The caller
@@ -166,16 +178,19 @@ func ComputeBackoff(schedule []time.Duration, attempt int) (time.Duration, error
 
 // scheduleFor returns the backoff schedule for a retry policy. The
 // "none" policy returns an empty schedule so the first non-2xx
-// response marks the row dead.
-func scheduleFor(p state.AppWebhookRetryPolicy) []time.Duration {
-	switch p {
-	case state.AppWebhookRetryAggressive:
-		return AggressiveBackoff
-	case state.AppWebhookRetryNone:
-		return NoBackoff
-	default: // AppWebhookRetryDefault
-		return DefaultBackoff
+// response marks the row dead. Per-instance overrides installed via
+// Dispatcher.WithBackoffs take precedence over DefaultBackoffs so
+// tests can pin the schedule deterministically.
+func (d *Dispatcher) scheduleFor(p state.AppWebhookRetryPolicy) []time.Duration {
+	if d.Backoffs != nil {
+		if s, ok := d.Backoffs[p]; ok {
+			return s
+		}
 	}
+	if s, ok := DefaultBackoffs[p]; ok {
+		return s
+	}
+	return defaultBackoff
 }
 
 // Dispatcher is the cmd/schedd-side webhook queue drain. One
@@ -206,9 +221,10 @@ type Dispatcher struct {
 	// Cap is the per-tick claim limit. Default 32.
 	Cap int
 
-	// MaxAttempts is the DLQ ceiling. Default 7 (matches the issue
-	// #476 acceptance gate).
-	MaxAttempts int
+	// Backoffs overrides the per-retry-policy schedule. When nil,
+	// the dispatcher consults DefaultBackoffs. Tests install
+	// short schedules here so a 7-attempt path runs in <1s wall.
+	Backoffs map[state.AppWebhookRetryPolicy][]time.Duration
 
 	// HTTPClient is shared across deliveries; nil resolves to
 	// oci.NewEgressHTTPClientAllowLoopback (the SSRF-guarded
@@ -230,16 +246,16 @@ type Dispatcher struct {
 // setters (functional-options pattern, mirrors sched.NewDrain).
 func NewDispatcher(store state.Store, aud *audit.Auditor, log *slog.Logger) *Dispatcher {
 	return &Dispatcher{
-		store:       store,
-		auditor:     aud,
-		log:         log,
-		Sleeper:     time.Sleep,
-		Now:         time.Now,
-		Tick:        DefaultTick,
-		Cap:         DefaultCap,
-		MaxAttempts: DefaultMaxAttempts,
-		PerAttempt:  DefaultPerAttempt,
-		HTTPClient:  nil,
+		store:      store,
+		auditor:    aud,
+		log:        log,
+		Sleeper:    time.Sleep,
+		Now:        time.Now,
+		Tick:       DefaultTick,
+		Cap:        DefaultCap,
+		PerAttempt: DefaultPerAttempt,
+		HTTPClient: nil,
+		Backoffs:   nil, // nil → consult DefaultBackoffs
 	}
 }
 
@@ -252,6 +268,22 @@ func (d *Dispatcher) WithTick(t time.Duration) *Dispatcher {
 // WithCap overrides the per-tick claim limit (tests).
 func (d *Dispatcher) WithCap(c int) *Dispatcher {
 	d.Cap = c
+	return d
+}
+
+// WithBackoffs overrides the per-retry-policy schedule. Each entry
+// in `b` replaces the corresponding DefaultBackoffs entry; absent
+// keys fall back to DefaultBackoffs. Tests use this to pin a
+// short schedule so the 7-attempt DLQ path runs in <1s.
+func (d *Dispatcher) WithBackoffs(b map[state.AppWebhookRetryPolicy][]time.Duration) *Dispatcher {
+	merged := make(map[state.AppWebhookRetryPolicy][]time.Duration, len(DefaultBackoffs)+len(b))
+	for k, v := range DefaultBackoffs {
+		merged[k] = v
+	}
+	for k, v := range b {
+		merged[k] = v
+	}
+	d.Backoffs = merged
 	return d
 }
 
@@ -366,10 +398,17 @@ func (d *Dispatcher) deliverOne(ctx context.Context, row state.AppWebhookDeliver
 	// single host.age identity covers both surfaces.
 	openIdents := d.IdentityLoader()
 	if len(openIdents) == 0 {
-		d.log.Warn("webhook: identity loader returned nil; skipping dispatch",
+		// No identity available → DLQ. Retrying with the same broken
+		// state machine would just cycle the row through 7 attempts
+		// before the operator notices; the operator must rotate
+		// host.age first (then run `webhooks retry`). Mirrors the
+		// pkg/alerts/evaluator.go:404-426 short-circuit.
+		d.log.Warn("webhook: identity loader returned nil; marking dead",
 			"webhook_id", hook.ID, "delivery_id", row.ID)
-		_ = d.store.MarkAppWebhookDeliveryFailed(ctx, row.ID, 0, row.Attempt,
-			"webhook: no age identity available", d.Now().Add(30*time.Second))
+		_ = d.store.MarkAppWebhookDeliveryDead(ctx, row.ID, row.Attempt,
+			"webhook: no age identity available")
+		d.emitAudit(ctx, "webhook.dead", row, hook,
+			fmt.Errorf("no age identity available"), 0)
 		return
 	}
 	ns, plaintext, err := secretbox.OpenBytesMulti(openIdents, hook.SecretSealed)
@@ -432,7 +471,7 @@ func (d *Dispatcher) deliverOne(ctx context.Context, row state.AppWebhookDeliver
 
 	// Failure path. Decide retry vs DLQ via the retry-policy
 	// schedule + the row's current attempt count.
-	schedule := scheduleFor(hook.RetryPolicy)
+	schedule := d.scheduleFor(hook.RetryPolicy)
 	if len(schedule) == 0 {
 		// retry_policy='none' — first failure is terminal.
 		_ = d.store.MarkAppWebhookDeliveryDead(ctx, row.ID, row.Attempt,

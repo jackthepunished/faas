@@ -952,8 +952,9 @@ type ScanResult struct {
 // openapi.yaml kebab-case convention (target_url, event_filter, …)
 // so the embedded copy in pkg/apid/openapi.yaml stays in sync with
 // `make spec-sync`. All secret fields are surfaced as
-// `WebhookSecretSealedMasked` constants; the only call that returns
-// the plaintext is RotateAppWebhookSecretResponse.WebhookSecret.
+// `WebhookSecretSealedMasked: "***"` constants — the plaintext
+// never appears in any response (NOT even on rotate-secret — see
+// ADR-076 §3.7).
 
 // CreateAppWebhookRequest is the body of POST
 // /v1/apps/{slug}/webhooks. The plaintext WebhookSecret is sent
@@ -963,16 +964,21 @@ type CreateAppWebhookRequest struct {
 	WebhookSecret string   `json:"webhook_secret"`
 	EventFilter   []string `json:"event_filter,omitempty"`
 	RetryPolicy   string   `json:"retry_policy,omitempty"`
+	Enabled       *bool    `json:"enabled,omitempty"`
 }
 
 // UpdateAppWebhookRequest is the body of PATCH
 // /v1/apps/{slug}/webhooks/{id}. Pointer fields let the caller
-// distinguish "leave as-is" from "set to empty".
+// distinguish "leave as-is" from "set to empty". Setting
+// WebhookSecret to a non-nil string inlines a secret rotation
+// (the existing secret is overwritten in place; no plaintext
+// is returned).
 type UpdateAppWebhookRequest struct {
-	TargetURL   *string   `json:"target_url,omitempty"`
-	EventFilter *[]string `json:"event_filter,omitempty"`
-	RetryPolicy *string   `json:"retry_policy,omitempty"`
-	Enabled     *bool     `json:"enabled,omitempty"`
+	TargetURL     *string   `json:"target_url,omitempty"`
+	WebhookSecret *string   `json:"webhook_secret,omitempty"`
+	EventFilter   *[]string `json:"event_filter,omitempty"`
+	RetryPolicy   *string   `json:"retry_policy,omitempty"`
+	Enabled       *bool     `json:"enabled,omitempty"`
 }
 
 // AppWebhookResponse is the read shape for a single subscription.
@@ -980,7 +986,8 @@ type UpdateAppWebhookRequest struct {
 // plaintext never appears here.
 type AppWebhookResponse struct {
 	ID                        string    `json:"id"`
-	AppSlug                   string    `json:"app_slug"`
+	AppID                     string    `json:"app_id"`
+	AccountID                 string    `json:"account_id"`
 	TargetURL                 string    `json:"target_url"`
 	WebhookSecretSealedMasked string    `json:"webhook_secret_sealed_masked"`
 	EventFilter               []string  `json:"event_filter"`
@@ -991,11 +998,13 @@ type AppWebhookResponse struct {
 }
 
 // RotateAppWebhookSecretResponse is the body of POST
-// /v1/apps/{slug}/webhooks/{id}/rotate-secret. WebhookSecret is
-// the ONE call site where the plaintext is returned; callers MUST
-// persist it immediately and MUST NOT log it.
+// /v1/apps/{slug}/webhooks/{id}/rotate-secret. The server mints
+// the new plaintext internally and persists it sealed; the wire
+// carries only the masked constant and the rotated_at timestamp.
+// Per ADR-076 §3.7, the plaintext is NEVER returned over the wire
+// — the caller has no way to retrieve it, so it must be fetched
+// out-of-band from the original provisioning flow.
 type RotateAppWebhookSecretResponse struct {
-	WebhookSecret             string    `json:"webhook_secret"`
 	WebhookSecretSealedMasked string    `json:"webhook_secret_sealed_masked"`
 	RotatedAt                 time.Time `json:"rotated_at"`
 }
@@ -1004,6 +1013,8 @@ type RotateAppWebhookSecretResponse struct {
 type AppWebhookDeliveryResponse struct {
 	ID               string     `json:"id"`
 	WebhookID        string     `json:"webhook_id"`
+	AppID            string     `json:"app_id"`
+	AccountID        string     `json:"account_id"`
 	Event            string     `json:"event"`
 	Attempt          int        `json:"attempt"`
 	Status           string     `json:"status"`
@@ -1016,11 +1027,11 @@ type AppWebhookDeliveryResponse struct {
 }
 
 // AppWebhookDeliveryListResponse is the body of GET
-// /v1/apps/{slug}/webhooks/{id}/deliveries. NextPageToken is empty
+// /v1/apps/{slug}/webhooks/{id}/deliveries. NextToken is empty
 // when the listing is exhausted.
 type AppWebhookDeliveryListResponse struct {
-	Deliveries    []AppWebhookDeliveryResponse `json:"deliveries"`
-	NextPageToken string                       `json:"next_page_token,omitempty"`
+	Deliveries []AppWebhookDeliveryResponse `json:"deliveries"`
+	NextToken  string                       `json:"next_token,omitempty"`
 }
 
 // AppWebhookRetryDeliveryResponse is the body of POST

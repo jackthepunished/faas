@@ -54,8 +54,8 @@
 create table if not exists app_webhook_deliveries (
     id                 uuid primary key default gen_random_uuid(),
     webhook_id         uuid not null references app_webhooks(id) on delete cascade,
-    app_id             uuid not null,
-    account_id         uuid not null,
+    app_id             uuid not null references apps(id) on delete cascade,
+    account_id         uuid not null references accounts(id) on delete cascade,
     event              text not null,
     payload            jsonb not null,
     attempt            int  not null default 0,
@@ -76,7 +76,7 @@ create table if not exists app_webhook_deliveries (
         )
     ),
     constraint app_webhook_deliveries_attempt_chk check (
-        attempt between 0 and 7
+        attempt between 0 and 8
     )
 );
 
@@ -84,7 +84,10 @@ create table if not exists app_webhook_deliveries (
 --   - app_webhook_deliveries_pending_idx: PARTIAL index on the
 --     dispatcher's hot path. WHERE status IN ('pending','in_flight')
 --     keeps claimed/succeeded/dead rows out of the claim scan, so
---     the table grows without bloating the hot read. A future
+--     the table grows without bloating the hot read. The key
+--     columns (account_id, next_attempt_at) match the dispatcher's
+--     claim query (ORDER BY account_id, next_attempt_at) so the
+--     round-robin is index-only — no in-memory sort. A future
 --     partition strategy could replace this; today the partial index
 --     is sufficient at expected fleet sizes (≤10k deliveries/day
 --     per spec §12). Mirrors alert_rules_enabled_idx's
@@ -96,7 +99,7 @@ create table if not exists app_webhook_deliveries (
 --     deliveries" pane orientation (mirrors
 --     alert_deliveries_rule_fired_idx).
 create index if not exists app_webhook_deliveries_pending_idx
-    on app_webhook_deliveries (status, next_attempt_at)
+    on app_webhook_deliveries (account_id, next_attempt_at)
     where status in ('pending','in_flight');
 create index if not exists app_webhook_deliveries_account_created_idx
     on app_webhook_deliveries (account_id, created_at desc);

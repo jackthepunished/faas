@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,9 +31,9 @@ import (
 // CreateAppWebhook is the un-capped insert path used by tests.
 // Production callers use CreateAppWebhookIfUnderQuota.
 func (s *PgStore) CreateAppWebhook(ctx context.Context, in AppWebhook) (AppWebhook, error) {
-	filterJSON, err := json.Marshal(in.EventFilter)
-	if err != nil {
-		return AppWebhook{}, fmt.Errorf("state: marshal event_filter: %w", err)
+	filterArr := in.EventFilter
+	if filterArr == nil {
+		filterArr = []string{}
 	}
 	if in.RetryPolicy == "" {
 		in.RetryPolicy = AppWebhookRetryDefault
@@ -41,11 +42,11 @@ func (s *PgStore) CreateAppWebhook(ctx context.Context, in AppWebhook) (AppWebho
 		insert into app_webhooks
 			(app_id, account_id, target_url, secret_sealed,
 			 event_filter, retry_policy, enabled)
-		values ($1, $2, $3, $4, $5::jsonb, $6, $7)
+		values ($1, $2, $3, $4, $5::text[], $6, $7)
 		returning id, app_id, account_id, target_url, secret_sealed,
 		          event_filter, retry_policy, enabled, created_at, updated_at
 	`, in.AppID, in.AccountID, in.TargetURL, in.SecretSealed,
-		string(filterJSON), string(in.RetryPolicy), in.Enabled)
+		filterArr, string(in.RetryPolicy), in.Enabled)
 	w, err := scanAppWebhook(row)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -116,9 +117,9 @@ func (s *PgStore) CreateAppWebhookIfUnderQuota(ctx context.Context, in AppWebhoo
 		}
 	}
 
-	filterJSON, err := json.Marshal(in.EventFilter)
-	if err != nil {
-		return AppWebhook{}, fmt.Errorf("state: marshal event_filter: %w", err)
+	filterArr := in.EventFilter
+	if filterArr == nil {
+		filterArr = []string{}
 	}
 	if in.RetryPolicy == "" {
 		in.RetryPolicy = AppWebhookRetryDefault
@@ -127,11 +128,11 @@ func (s *PgStore) CreateAppWebhookIfUnderQuota(ctx context.Context, in AppWebhoo
 		insert into app_webhooks
 			(app_id, account_id, target_url, secret_sealed,
 			 event_filter, retry_policy, enabled)
-		values ($1, $2, $3, $4, $5::jsonb, $6, $7)
+		values ($1, $2, $3, $4, $5::text[], $6, $7)
 		returning id, app_id, account_id, target_url, secret_sealed,
 		          event_filter, retry_policy, enabled, created_at, updated_at
 	`, in.AppID, in.AccountID, in.TargetURL, in.SecretSealed,
-		string(filterJSON), string(in.RetryPolicy), in.Enabled)
+		filterArr, string(in.RetryPolicy), in.Enabled)
 	w, err := scanAppWebhook(row)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -186,14 +187,14 @@ func (s *PgStore) UpdateAppWebhook(ctx context.Context, id string, p UpdateAppWe
 	if p.WebhookSecretSealed != nil {
 		current.SecretSealed = append([]byte(nil), *p.WebhookSecretSealed...)
 	}
-	filterJSON, err := json.Marshal(current.EventFilter)
-	if err != nil {
-		return AppWebhook{}, fmt.Errorf("state: marshal event_filter: %w", err)
+	filterArr := current.EventFilter
+	if filterArr == nil {
+		filterArr = []string{}
 	}
 	row := s.pool.QueryRow(ctx, `
 		update app_webhooks set
 			target_url = $2,
-			event_filter = $3::jsonb,
+			event_filter = $3::text[],
 			retry_policy = $4,
 			enabled = $5,
 			secret_sealed = $6,
@@ -201,7 +202,7 @@ func (s *PgStore) UpdateAppWebhook(ctx context.Context, id string, p UpdateAppWe
 		where id = $1
 		returning id, app_id, account_id, target_url, secret_sealed,
 		          event_filter, retry_policy, enabled, created_at, updated_at
-	`, id, current.TargetURL, string(filterJSON), string(current.RetryPolicy),
+	`, id, current.TargetURL, filterArr, string(current.RetryPolicy),
 		current.Enabled, current.SecretSealed)
 	w, err := scanAppWebhook(row)
 	if err != nil {
@@ -310,6 +311,9 @@ func (s *PgStore) ClaimDueAppWebhookDeliveries(ctx context.Context, limit int, n
 		 limit $2
 		   for update skip locked
 	`, now, limit)
+	// Index app_webhook_deliveries_pending_idx
+	// (account_id, next_attempt_at) WHERE status IN ('pending','in_flight')
+	// covers both the bounding predicate and the round-robin ORDER BY.
 	if err != nil {
 		return nil, fmt.Errorf("state: claim query: %w", err)
 	}
@@ -424,23 +428,27 @@ func (s *PgStore) MarkAppWebhookDeliveryDead(ctx context.Context, id string, cur
 	return nil
 }
 
-func (s *PgStore) ResetAppWebhookDeliveryFromDead(ctx context.Context, id string, now time.Time) error {
+func (s *PgStore) ResetAppWebhookDeliveryFromDead(ctx context.Context, id, webhookID, accountID string, now time.Time) error {
 	tag, err := s.pool.Exec(ctx, `
 		update app_webhook_deliveries set
 			status = 'pending',
 			attempt = 0,
 			last_error = '',
-			next_attempt_at = $2,
+			next_attempt_at = $4,
 			updated_at = now()
-		where id = $1 and status = 'dead'
-	`, id, now)
+		where id = $1 and webhook_id = $2 and account_id = $3 and status = 'dead'
+	`, id, webhookID, accountID, now)
 	if err != nil {
 		return fmt.Errorf("state: reset from dead: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Either the row doesn't exist OR it's not in 'dead' state.
-		// Distinguish via a follow-up SELECT — matches the
-		// MemStore's ErrConflict semantics for non-dead rows.
+		// Either the row doesn't exist (or belongs to another
+		// account), it's not in 'dead' state, or the delivery
+		// belongs to a different webhook in the same account.
+		// Probe to distinguish — matches the MemStore's ErrConflict
+		// semantics for non-dead rows; rows that exist but don't
+		// match the (webhook_id, account_id) pair return ErrNotFound
+		// to avoid leaking the existence of foreign rows.
 		var n int
 		if err := s.pool.QueryRow(ctx,
 			`select count(*) from app_webhook_deliveries where id = $1`, id,
@@ -542,22 +550,20 @@ type appWebhookScanner interface {
 
 func scanAppWebhook(s appWebhookScanner) (AppWebhook, error) {
 	var (
-		w          AppWebhook
-		filterJSON []byte
-		retry      string
+		w      AppWebhook
+		filter []string
+		retry  string
 	)
 	err := s.Scan(
 		&w.ID, &w.AppID, &w.AccountID, &w.TargetURL, &w.SecretSealed,
-		&filterJSON, &retry, &w.Enabled, &w.CreatedAt, &w.UpdatedAt,
+		&filter, &retry, &w.Enabled, &w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
 		return AppWebhook{}, err
 	}
 	w.RetryPolicy = AppWebhookRetryPolicy(retry)
-	if len(filterJSON) > 0 {
-		if err := json.Unmarshal(filterJSON, &w.EventFilter); err != nil {
-			return AppWebhook{}, fmt.Errorf("state: decode event_filter: %w", err)
-		}
+	if filter != nil {
+		w.EventFilter = filter
 	}
 	if w.EventFilter == nil {
 		w.EventFilter = []string{}
@@ -644,6 +650,21 @@ func decodePageToken(token string) (time.Time, string, bool) {
 				return time.Time{}, "", false
 			}
 			id = token[i+1:]
+			// UUID v4 validation — pgx accepts any text-shaped id
+			// but a malformed UUID would error on the row-comparison
+			// predicate with a noisy pgx error. Reject here so the
+			// caller returns a clean 400. Accepts the 32-hex form
+			// Postgres stores (no dashes) AND the dashed form in
+			// case an old page-token format slips through.
+			stripped := strings.ReplaceAll(id, "-", "")
+			if len(stripped) != 32 {
+				return time.Time{}, "", false
+			}
+			for _, r := range stripped {
+				if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+					return time.Time{}, "", false
+				}
+			}
 			return time.Unix(0, nanos).UTC(), id, true
 		}
 	}

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -83,13 +84,14 @@ func cmdWebhooksAdd(args []string) int {
 	slug := fs.String("app", "", "app slug (required)")
 	target := fs.String("target-url", "", "HTTPS target URL (required)")
 	secret := fs.String("secret", "", "HMAC-SHA256 secret (optional; auto-minted if empty)")
-	event := fs.String("event", "", "event name (repeat for multiple); empty = all events")
+	var events multiFlag
+	fs.Var(&events, "event", "event name (repeat for multiple); empty = all events")
 	policy := fs.String("retry-policy", "default", "retry policy: default|aggressive|none")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if *slug == "" || *target == "" {
-		PrintUsage(os.Stderr, "usage: gregale webhooks add --app <slug> --target-url <url> [--event <evt>] [--retry-policy default|aggressive|none] [--secret <hmac-secret>]", "webhooks")
+		PrintUsage(os.Stderr, "usage: gregale webhooks add --app <slug> --target-url <url> [--event <evt>]... [--retry-policy default|aggressive|none] [--secret <hmac-secret>]", "webhooks")
 		return 1
 	}
 	// Closed-set drift test BEFORE the round-trip — same posture as
@@ -101,20 +103,19 @@ func cmdWebhooksAdd(args []string) int {
 	default:
 		return printErr("Invalid --retry-policy", fmt.Errorf("must be 'default', 'aggressive', or 'none'; got %q", *policy))
 	}
+	for _, ev := range events {
+		if !validAppWebhookEvent(ev) {
+			return printErr("Invalid --event", fmt.Errorf("unknown event %q (allowed: cron.fired, app.deployed, app.scaled, app.parked, app.woken)", ev))
+		}
+	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
 	req := api.CreateAppWebhookRequest{
 		TargetURL:   *target,
-		EventFilter: fs.Args(),
+		EventFilter: events,
 		RetryPolicy: *policy,
-	}
-	// --event reads from the leftover positional args (flag.Args()).
-	// `gregale webhooks add --app foo --target-url X --event cron.fired --event app.deployed`
-	// matches the cron subcommand pattern.
-	if *event != "" {
-		req.EventFilter = append(req.EventFilter, *event)
 	}
 	if *secret != "" {
 		req.WebhookSecret = *secret
@@ -177,16 +178,24 @@ func cmdWebhooksUpdate(args []string) int {
 }
 
 func cmdWebhooksRm(args []string) int {
-	if len(args) != 2 {
+	fs := flag.NewFlagSet("webhooks-rm", flag.ContinueOnError)
+	slug := fs.String("app", "", "app slug (required)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *slug == "" || len(fs.Args()) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale webhooks rm --app <slug> <id>", "webhooks")
 		return 1
 	}
-	slug, id := args[0], args[1]
+	id := fs.Args()[0]
+	if !webhookIDPattern.MatchString(id) {
+		return printErr("Invalid webhook id", fmt.Errorf("must be a 32-hex-char UUID; got %q", id))
+	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	if err := client.DeleteAppWebhook(context.Background(), slug, id); err != nil {
+	if err := client.DeleteAppWebhook(context.Background(), *slug, id); err != nil {
 		return printErr("Delete failed", err)
 	}
 	PrintOK(osStdout, "Removed")
@@ -252,6 +261,9 @@ func cmdWebhookRetry(args []string) int {
 		return 1
 	}
 	webhookID, deliveryID := fs.Args()[0], fs.Args()[1]
+	if !webhookIDPattern.MatchString(webhookID) {
+		return printErr("Invalid webhook id", fmt.Errorf("must be a 32-hex-char UUID; got %q", webhookID))
+	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -260,7 +272,7 @@ func cmdWebhookRetry(args []string) int {
 	if err != nil {
 		return printErr("Retry failed", err)
 	}
-	PrintOK(osStdout, "Queued for retry: delivery=%s status=%s next_attempt_at=%s",
+	PrintOK(os.Stdout, "Queued for retry: delivery=%s status=%s next_attempt_at=%s",
 		out.Delivery.ID, out.Delivery.Status, out.Delivery.NextAttemptAt)
 	return 0
 }
@@ -268,6 +280,24 @@ func cmdWebhookRetry(args []string) int {
 // webhookIDPattern matches the 32-hex shape apid uses for webhook
 // ids. Same convention as deploymentIDPattern / cronIDPattern.
 var webhookIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+
+// validAppWebhookEvents is the closed vocabulary accepted by the
+// --event flag. Mirrors the CHECK constraint at
+// migrations/00141_app_webhook_deliveries.sql:73-77 and the
+// `app_webhook_deliveries_event_chk` test in
+// 00141_app_webhook_deliveries_test.go:148-170.
+var validAppWebhookEvents = map[string]struct{}{
+	"cron.fired":   {},
+	"app.deployed": {},
+	"app.scaled":   {},
+	"app.parked":   {},
+	"app.woken":    {},
+}
+
+func validAppWebhookEvent(s string) bool {
+	_, ok := validAppWebhookEvents[s]
+	return ok
+}
 
 func enabledStr(b bool) string {
 	if b {
@@ -281,4 +311,26 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
+}
+
+// multiFlag is a flag.Value that accumulates repeated occurrences.
+// Mirrors the same pattern in cmd/gregale/commands2.go's flag.Var
+// usage for crons; lets `--event cron.fired --event app.deployed`
+// build a 2-element slice without quoting tricks. Empty values are
+// skipped so callers can omit the flag entirely.
+type multiFlag []string
+
+func (m *multiFlag) String() string {
+	if m == nil {
+		return ""
+	}
+	return strings.Join(*m, ",")
+}
+
+func (m *multiFlag) Set(v string) error {
+	if v == "" {
+		return nil
+	}
+	*m = append(*m, v)
+	return nil
 }
