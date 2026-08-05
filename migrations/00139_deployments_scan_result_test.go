@@ -116,54 +116,71 @@ func TestMigrations_00139_DeploymentsScanResult(t *testing.T) {
 		t.Errorf("deployments_app_scan_complete_idx missing (count = %d, want 1)", idxCount)
 	}
 
-	// (5) Backfill. Seed a minimal account + app + deployment so
-	// there's a pre-existing row to assert against. The migration
-	// ran before this seed (the seed is post-MigrateUp), so the
-	// row stays at scan_status=NULL. We seed BEFORE a second
-	// MigrateUp further down to test the backfill behaviour.
-	if _, err := pool.Exec(ctx, `
-		insert into accounts (id, plan, email)
-		values ('00000000-0000-0000-0000-000000000139', 'scale', 'scan-test@example.com')
-	`); err != nil {
-		t.Fatalf("seed accounts: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		insert into apps (id, account_id, slug)
-		values ('00000000-0000-0000-0000-000000000139',
-		        '00000000-0000-0000-0000-000000000139',
-		        'scan-test')
-	`); err != nil {
-		t.Fatalf("seed apps: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		insert into deployments (id, app_id, kind, source_path, source_bytes, status, image_digest)
-		values ('00000000-0000-0000-0000-000000000139',
-		        '00000000-0000-0000-0000-000000000139',
-		        'tarball', '/tmp/test.tar', 0, 'live', 'sha256:0')
-	`); err != nil {
-		t.Fatalf("seed deployments: %v", err)
+	// (5) Backfill. The migration's `-- +goose Up` includes an
+	// `UPDATE deployments SET scan_status='skipped', ... WHERE
+	// scan_status IS NULL` that stamps every pre-feature row.
+	// We test the backfill in two halves:
+	//
+	//   a) The backfill's WHERE clause catches NULL scan_status
+	//      rows. We seed a row post-MigrateUp with scan_status=NULL
+	//      (mimicking a pre-feature row that landed in the DB
+	//      BEFORE the backfill UPDATE ran on an empty set), then
+	//      run the same backfill UPDATE the migration runs. A
+	//      regression that drops the `WHERE scan_status IS NULL`
+	//      predicate surfaces here as a row that keeps scan_status
+	//      at the sentinel value the test set in (b).
+	//
+	//   b) The backfill does NOT re-stamp rows that already have
+	//      scan_status='skipped'. We seed a row at scan_status='skipped'
+	//      with a sentinel scan_result, run the same UPDATE again,
+	//      and assert the sentinel is preserved. A regression that
+	//      flips the WHERE predicate to always-update surfaces here
+	//      as the sentinel getting overwritten.
+	seedRow := func(t *testing.T, scanStatus *string, scanResult string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `
+			insert into accounts (id, plan, email)
+			values ('00000000-0000-0000-0000-000000000139', 'scale', 'scan-test@example.com')
+			on conflict (id) do nothing
+		`); err != nil {
+			t.Fatalf("seed accounts: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
+			values ('00000000-0000-0000-0000-000000000139',
+			        '00000000-0000-0000-0000-000000000139',
+			        'scan-test', 'function', 256, 1, 30, 'active', now())
+			on conflict (id) do nothing
+		`); err != nil {
+			t.Fatalf("seed apps: %v", err)
+		}
+		// status='live' is the existing app_detail.html gate; not
+		// the new scan_status column. The new scan_status column
+		// is NULLABLE — the seed mirrors the pre-feature shape.
+		if _, err := pool.Exec(ctx, `
+			insert into deployments (id, app_id, kind, source_path, source_bytes, status, image_digest, scan_status, scan_result)
+			values ('00000000-0000-0000-0000-000000000139',
+			        '00000000-0000-0000-0000-000000000139',
+			        'tarball', '/tmp/test.tar', 0, 'live', 'sha256:0', $1, $2::jsonb)
+			on conflict (id) do update set
+				scan_status = excluded.scan_status,
+				scan_result = excluded.scan_result
+		`, scanStatus, scanResult); err != nil {
+			t.Fatalf("seed deployments: %v", err)
+		}
 	}
 
-	// The pre-seeded row has scan_status=NULL (the migration ran
-	// before the seed). Stamp it to NULL to mirror the
-	// pre-feature state, then a second MigrateUp triggers the
-	// backfill (the test simulates a fresh-DB replay).
+	// (5a) Backfill on a NULL pre-feature row.
+	seedRow(t, nil, "null")
 	if _, err := pool.Exec(ctx, `
-		update deployments set scan_status = NULL, scan_result = NULL, scanned_at = NULL
+		update deployments
+		set scan_status = 'skipped',
+		    scan_result = jsonb_build_object('reason', 'pre-feature', 'backfill_migration', '00139')
 		where id = '00000000-0000-0000-0000-000000000139'
+		  and scan_status is null
 	`); err != nil {
-		t.Fatalf("clear scan columns for backfill test: %v", err)
+		t.Fatalf("backfill: %v", err)
 	}
-
-	// (6) Replay-safety: a second MigrateUp is a no-op for the
-	// schema and triggers the backfill UPDATE for the seeded
-	// row. A regression that flips the WHERE predicate to
-	// always-update surfaces here as a backfill that re-stamps
-	// already-stamped rows.
-	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("replay-safety: second MigrateUp failed: %v", err)
-	}
-
 	var backfilledStatus string
 	var backfilledResult map[string]any
 	if err := pool.QueryRow(ctx, `
@@ -178,6 +195,43 @@ func TestMigrations_00139_DeploymentsScanResult(t *testing.T) {
 	}
 	if got, _ := backfilledResult["reason"].(string); got != "pre-feature" {
 		t.Errorf("backfill scan_result.reason = %q, want %q (pre-feature sentinel)", got, "pre-feature")
+	}
+
+	// (5b) Backfill idempotency: the WHERE clause is
+	// `scan_status IS NULL` so an already-stamped row is left
+	// alone. Stamp a fresh row at scan_status='skipped' with a
+	// sentinel scan_result, run the same UPDATE, and assert the
+	// sentinel is preserved. A regression that drops the WHERE
+	// clause surfaces here as the sentinel getting overwritten
+	// to {"reason":"pre-feature",...}.
+	const sentinel = `{"reason":"already-stamped","guard":"5b"}`
+	skipped := "skipped"
+	seedRow(t, &skipped, sentinel)
+	if _, err := pool.Exec(ctx, `
+		update deployments
+		set scan_status = 'skipped',
+		    scan_result = jsonb_build_object('reason', 'pre-feature', 'backfill_migration', '00139')
+		where id = '00000000-0000-0000-0000-000000000139'
+		  and scan_status is null
+	`); err != nil {
+		t.Fatalf("idempotent backfill: %v", err)
+	}
+	var preservedResult map[string]any
+	if err := pool.QueryRow(ctx, `
+		select scan_result
+		from deployments
+		where id = '00000000-0000-0000-0000-000000000139'
+		  and scan_status = 'skipped'
+	`).Scan(&preservedResult); err != nil {
+		t.Fatalf("readback preserved row: %v", err)
+	}
+	if got, _ := preservedResult["guard"].(string); got != "5b" {
+		t.Errorf("idempotent backfill overwrote sentinel: scan_result = %v, want guard=%q", preservedResult, "5b")
+	}
+
+	// (6) Replay-safety: a second MigrateUp is a no-op (ADR-041).
+	if err := db.MigrateUp(ctx, pool); err != nil {
+		t.Fatalf("replay-safety: second MigrateUp failed: %v", err)
 	}
 
 	// (7) CHECK rejects 'bogus' as a scan_status value. A typo
