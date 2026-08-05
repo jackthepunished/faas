@@ -819,7 +819,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 		// already forgot it, so vmmdmount.UmountExt4 will fall
 		// through to the kernel syscall and clean the mountpoint
 		// dir.
-		_ = vmmdmount.UmountExt4(evicted)
+		_ = vmmdmount.UmountExt4(ctx, evicted)
 	}
 	m.log.Info("vmmd: parent mounted", "storage_key", storageKey, "mountpoint", mp)
 	return mp, nil
@@ -830,7 +830,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 // defer-after-error pattern is safe to call blindly. Returns the
 // nil-equivalent (no error) on success AND on a never-issued
 // mountpoint; surfaces a real umount error (e.g. EBUSY) verbatim.
-func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
+func (m *Manager) UmountParentExt4(ctx context.Context, mountpoint string) error {
 	if m.parentMounts == nil {
 		// No registry wired — every call is a no-op. Matches the
 		// default-local unit-test path; production cmd/vmmd wires
@@ -845,7 +845,7 @@ func (m *Manager) UmountParentExt4(_ context.Context, mountpoint string) error {
 		// gRPC handler treats nil as success.
 		return nil
 	}
-	if err := vmmdmount.UmountExt4(mountpoint); err != nil {
+	if err := vmmdmount.UmountExt4(ctx, mountpoint); err != nil {
 		return err
 	}
 	m.parentMounts.Forget(mountpoint)
@@ -903,7 +903,7 @@ func (m *Manager) MountOverlayParent(ctx context.Context, lowerdir, upperdir, wo
 		// Registry.Umount dispatches on MountKind (B4), so this
 		// works for either ext4 or overlay evictions. Best-effort
 		// — a failed umount surfaces in the next sweep tick.
-		if _, uerr := m.parentMounts.Umount(evicted); uerr != nil {
+		if _, uerr := m.parentMounts.Umount(ctx, evicted); uerr != nil {
 			m.log.Warn("vmmd: evicted parent overlay umount failed (sweep will retry)",
 				"evicted_mountpoint", evicted, "err", uerr)
 		}
@@ -930,7 +930,7 @@ func (m *Manager) UmountOverlayParent(ctx context.Context, merged string) error 
 	// right syscall. Lookup miss → Registry.Umount returns
 	// (false, nil), which is the idempotent defer-after-error
 	// shape imaged's caller depends on.
-	if _, err := m.parentMounts.Umount(merged); err != nil {
+	if _, err := m.parentMounts.Umount(ctx, merged); err != nil {
 		return err
 	}
 	m.log.Info("vmmd: parent overlay umounted", "mountpoint", merged)

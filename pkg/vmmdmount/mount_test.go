@@ -5,6 +5,7 @@
 package vmmdmount
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -104,7 +105,7 @@ func TestRegistry_Forget_Idempotent(t *testing.T) {
 // imaged child could register.
 func TestRegistry_SweepOrphans_EmptyNoOp(t *testing.T) {
 	r := NewRegistry(8)
-	if n := r.SweepOrphans(slog.Default()); n != 0 {
+	if n := r.SweepOrphans(context.Background(), slog.Default()); n != 0 {
 		t.Errorf("empty sweep = %d, want 0", n)
 	}
 }
@@ -115,7 +116,7 @@ func TestRegistry_SweepOrphans_EmptyNoOp(t *testing.T) {
 // umounting an unrelated mount would be a security incident.
 func TestUmountExt4_RefusesForeignPath(t *testing.T) {
 	for _, bad := range []string{"/", "/home/foo", "/etc/passwd", "/var/log/faas", "/tmp/faas-parent-mnt-evil"} {
-		err := UmountExt4(bad)
+		err := UmountExt4(context.Background(), bad)
 		if err == nil {
 			t.Errorf("UmountExt4(%q) = nil, want prefix-check error", bad)
 		}
@@ -130,7 +131,7 @@ func TestUmountExt4_RefusesForeignPath(t *testing.T) {
 // InvalidArgument (NOT NotFound — the asymmetry with
 // MountParentExt4ReadOnly's NotFound is load-bearing).
 func TestUmountExt4_EmptyReturnsUnknown(t *testing.T) {
-	err := UmountExt4("")
+	err := UmountExt4(context.Background(), "")
 	if !errors.Is(err, ErrUnknownMountpoint) {
 		t.Errorf("UmountExt4(\"\") = %v, want ErrUnknownMountpoint", err)
 	}
@@ -146,7 +147,7 @@ func TestUmountExt4_EmptyReturnsUnknown(t *testing.T) {
 // gave you this path".
 func TestUmountExt4_NonexistentReturnsUnknown(t *testing.T) {
 	missing := filepath.Join(MountRoot, ParentMountPrefix+"nonexistent-99999")
-	err := UmountExt4(missing)
+	err := UmountExt4(context.Background(), missing)
 	if !errors.Is(err, ErrUnknownMountpoint) {
 		t.Errorf("UmountExt4(%q) = %v, want ErrUnknownMountpoint", missing, err)
 	}
@@ -158,7 +159,7 @@ func TestUmountExt4_NonexistentReturnsUnknown(t *testing.T) {
 // partial Mount failure.
 func TestRegistry_Umount_UnknownIsIdempotent(t *testing.T) {
 	r := NewRegistry(8)
-	found, err := r.Umount(filepath.Join(MountRoot, "mnt-never-issued"))
+	found, err := r.Umount(context.Background(), filepath.Join(MountRoot, "mnt-never-issued"))
 	if err != nil {
 		t.Errorf("Registry.Umount(unknown) = %v, want nil", err)
 	}
@@ -192,7 +193,7 @@ func TestRegistry_Umount_RemovesEntryWithoutSyscall(t *testing.T) {
 	}
 	r.RegisterOrEvict(mp, MountKindParentExt4, "k1", src)
 
-	found, err := r.Umount(mp)
+	found, err := r.Umount(context.Background(), mp)
 	if err != nil {
 		// On non-Linux / unprivileged the umount syscall returns
 		// EINVAL; we don't assert success here, only that the
@@ -325,7 +326,7 @@ func TestRegistry_ConcurrentRegisterUmountSweep_RaceFree(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
 			mp := filepath.Join(MountRoot, ParentMountPrefix+fmt.Sprintf("raceA-%d", i%8))
-			_, _ = r.Umount(mp)
+			_, _ = r.Umount(context.Background(), mp)
 		}
 	}()
 
@@ -337,7 +338,7 @@ func TestRegistry_ConcurrentRegisterUmountSweep_RaceFree(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			_ = r.SweepOrphans(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			_ = r.SweepOrphans(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 			// Tiny yield so the runtime doesn't starve
 			// the writers on a slow CI runner.
 			if i%16 == 0 {

@@ -585,7 +585,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// correct order (no late caller waiting on a mountpoint
 	// while we sweep it).
 	defer func() {
-		if n := parentReg.SweepAll(log); n > 0 {
+		if n := parentReg.SweepAll(ctx, log); n > 0 {
 			log.Info("vmmd: shutdown parent-mount sweep", "n", n)
 		}
 	}()

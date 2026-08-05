@@ -214,7 +214,7 @@ func NewRegistry(cap int) *Registry {
 // `umount` syscall on every entry and only cleaned up SrcPath;
 // MountKindOverlayParent entries had no SrcPath, so the sweep
 // leaked upperdir/workdir staging trees.
-func (r *Registry) Umount(mountpoint string) (found bool, err error) {
+func (r *Registry) Umount(ctx context.Context, mountpoint string) (found bool, err error) {
 	r.mu.Lock()
 	entry, ok := r.entries[mountpoint]
 	if !ok {
@@ -226,7 +226,7 @@ func (r *Registry) Umount(mountpoint string) (found bool, err error) {
 
 	switch entry.Kind {
 	case MountKindParentExt4:
-		if uerr := UmountExt4(mountpoint); uerr != nil {
+		if uerr := UmountExt4(ctx, mountpoint); uerr != nil {
 			// Restore the entry so a retry has a chance — the next
 			// sweep tick (or a future explicit Umount call) will
 			// pick it up. We restore under the lock to keep the map
@@ -255,7 +255,7 @@ func (r *Registry) Umount(mountpoint string) (found bool, err error) {
 		// UmountOverlayParent already handles its own merged-dir
 		// cleanup. If it returns ErrUnknownMountpoint, the
 		// overlay is already gone — entry stays forgotten.
-		if uerr := UmountOverlayParent(context.Background(), mountpoint); uerr != nil {
+		if uerr := UmountOverlayParent(ctx, mountpoint); uerr != nil {
 			if !errors.Is(uerr, ErrUnknownMountpoint) {
 				r.mu.Lock()
 				if _, stillMissing := r.entries[mountpoint]; stillMissing {
@@ -340,7 +340,7 @@ func (r *Registry) Forget(mountpoint string) {
 // are kept in the map so the next sweep tick retries — this
 // matches the deferred Umount path (Registry.Umount itself
 // restores on real umount errors).
-func (r *Registry) SweepOrphans(log *slog.Logger) int {
+func (r *Registry) SweepOrphans(ctx context.Context, log *slog.Logger) int {
 	r.mu.Lock()
 	var stale []string
 	cutoff := time.Now().Add(-ParentMountMaxAge)
@@ -353,7 +353,7 @@ func (r *Registry) SweepOrphans(log *slog.Logger) int {
 
 	swept := 0
 	for _, mp := range stale {
-		found, err := r.Umount(mp)
+		found, err := r.Umount(ctx, mp)
 		if err != nil && log != nil {
 			log.Warn("vmmd: orphan parent umount failed", "mountpoint", mp, "err", err)
 		}
@@ -368,7 +368,7 @@ func (r *Registry) SweepOrphans(log *slog.Logger) int {
 // SIGTERM handler so the box doesn't leave dangling mounts or
 // source files in /srv/fc/parent/. Returns the count swept.
 // Empty registry is a no-op.
-func (r *Registry) SweepAll(log *slog.Logger) int {
+func (r *Registry) SweepAll(ctx context.Context, log *slog.Logger) int {
 	r.mu.Lock()
 	mps := make([]string, 0, len(r.entries))
 	for mp := range r.entries {
@@ -378,7 +378,7 @@ func (r *Registry) SweepAll(log *slog.Logger) int {
 
 	swept := 0
 	for _, mp := range mps {
-		found, err := r.Umount(mp)
+		found, err := r.Umount(ctx, mp)
 		if err != nil && log != nil {
 			log.Warn("vmmd: shutdown parent umount failed", "mountpoint", mp, "err", err)
 		}
@@ -466,7 +466,7 @@ func MkdirSrcTemp() (string, error) {
 // caller can decide whether to surface the gRPC error or absorb it
 // (the gRPC handler absorbs; imaged's defer-after-error relies on
 // this). Real umount errors (EBUSY, EINVAL) are surfaced verbatim.
-func UmountExt4(mountpoint string) error {
+func UmountExt4(ctx context.Context, mountpoint string) error {
 	if mountpoint == "" {
 		return ErrUnknownMountpoint
 	}
@@ -483,7 +483,7 @@ func UmountExt4(mountpoint string) error {
 		}
 		return fmt.Errorf("vmmdmount: umount: stat mountpoint: %w", err)
 	}
-	cmd := exec.Command("umount", mountpoint)
+	cmd := exec.CommandContext(ctx, "umount", mountpoint)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("vmmdmount: umount %s: %w (%s)", mountpoint, err, strings.TrimSpace(string(out)))
 	}
