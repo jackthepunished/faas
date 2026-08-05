@@ -437,6 +437,7 @@ CREATE TABLE public.apps (
     root_dir text DEFAULT ''::text NOT NULL,
     workload_name text DEFAULT ''::text NOT NULL,
     workload_class text DEFAULT 'http'::text NOT NULL,
+    eviction_priority text DEFAULT 'best_effort'::text NOT NULL,
     start_command text,
     streaming_enabled boolean DEFAULT false NOT NULL,
     scaling_policy jsonb DEFAULT '{}'::jsonb NOT NULL,
@@ -455,7 +456,8 @@ CREATE TABLE public.apps (
     CONSTRAINT apps_runtime_check CHECK (((runtime IS NULL) OR (runtime = ANY (ARRAY['node22'::text, 'python312'::text, 'go124'::text, 'go124-alpine'::text, 'node24'::text, 'python313'::text])))),
     CONSTRAINT apps_status_check CHECK ((status = ANY (ARRAY['active'::text, 'evicted_cold'::text, 'deleted'::text]))),
     CONSTRAINT apps_type_check CHECK ((type = ANY (ARRAY['app'::text, 'function'::text]))),
-    CONSTRAINT apps_workload_class_chk CHECK ((workload_class = ANY (ARRAY['http'::text, 'graphql'::text, 'grpc'::text, 'job'::text, 'worker'::text])))
+    CONSTRAINT apps_workload_class_chk CHECK ((workload_class = ANY (ARRAY['http'::text, 'graphql'::text, 'grpc'::text, 'job'::text, 'worker'::text]))),
+    CONSTRAINT apps_eviction_priority_chk CHECK ((eviction_priority = ANY (ARRAY['best_effort'::text, 'reserved'::text])))
 );
 
 
