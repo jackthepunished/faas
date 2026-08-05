@@ -60,8 +60,27 @@ type BaseBuildResult struct {
 // running BuildBaseFromStaging rely on this function's sibling-temp
 // pattern (mirrors publishExt4 / publishBaseExt4). Callers that want
 // automatic cleanup should defer os.RemoveAll on the returned path.
+//
+// Staging root: when FAAS_BASE_STAGING_ROOT is set, the staging dir
+// is created under that root (MkdirAll'd with 0755 so a fresh
+// /dev/shm/faas-base-staging works on a reboot); otherwise the
+// default `os.MkdirTemp("", ...)` is used. The cd-controlplane EX44
+// ships the env var pointing at /dev/shm/faas-base-staging in
+// deploy/systemd/faas-imaged.service — host /tmp is ext4 there and the
+// kernel rejects overlay mounts whose upper fs doesn't support
+// tmpfile with `overlayfs: upper fs does not support tmpfile`
+// (parent-ref overlay mount crash-loop, 2026-08-04 → 2026-08-05;
+// every cd-controlplane deploy failed for 24h). Tests stay portable
+// on macOS dev units by leaving the env var unset.
 func MkdirBaseStaging() (string, error) {
-	return os.MkdirTemp("", "faas-base-*")
+	root := os.Getenv("FAAS_BASE_STAGING_ROOT")
+	if root == "" {
+		return os.MkdirTemp("", "faas-base-*")
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return "", fmt.Errorf("rootfs: staging root %s: %w", root, err)
+	}
+	return os.MkdirTemp(root, "faas-base-*")
 }
 
 // BuildBase assembles a base-image ext4 from the supplied OCI layers.

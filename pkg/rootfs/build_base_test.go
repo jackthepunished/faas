@@ -206,6 +206,90 @@ func TestMkdirBaseStaging_ReturnedDirIsUsable(t *testing.T) {
 	}
 }
 
+// TestMkdirBaseStaging_RespectsFAAS_BASE_STAGING_ROOT — the env var
+// override. Pinning the contract lets the production box (cd-controlplane
+// EX44) point at /dev/shm/faas-base-staging without a code change AND
+// lets the parent-ref staging test stage under t.TempDir() without
+// polluting /dev/shm on macOS dev units.
+func TestMkdirBaseStaging_RespectsFAAS_BASE_STAGING_ROOT(t *testing.T) {
+	override := t.TempDir()
+	t.Setenv("FAAS_BASE_STAGING_ROOT", override)
+
+	d, err := MkdirBaseStaging()
+	if err != nil {
+		t.Fatalf("MkdirBaseStaging: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+
+	rel, err := filepath.Rel(override, d)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	if strings.HasPrefix(rel, "..") {
+		t.Errorf("returned dir %q is not under override root %q (rel=%q)", d, override, rel)
+	}
+	if !strings.HasPrefix(filepath.Base(d), "faas-base-") {
+		t.Errorf("returned dir basename %q does not match faas-base-* pattern", filepath.Base(d))
+	}
+}
+
+// TestMkdirBaseStaging_ParentsRootDir — the env var may point at a
+// path that does not exist yet (e.g. fresh /dev/shm/faas-base-staging
+// after a reboot). MkdirAll with mode 0755 should create the
+// intermediate dirs. Pins the production default behaviour: every
+// boot, the first imaged start creates /dev/shm/faas-base-staging.
+func TestMkdirBaseStaging_ParentsRootDir(t *testing.T) {
+	nested := filepath.Join(t.TempDir(), "fresh", "nested", "staging-root")
+	t.Setenv("FAAS_BASE_STAGING_ROOT", nested)
+
+	d, err := MkdirBaseStaging()
+	if err != nil {
+		t.Fatalf("MkdirBaseStaging: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+
+	info, err := os.Stat(nested)
+	if err != nil {
+		t.Fatalf("stat created root %s: %v", nested, err)
+	}
+	if !info.IsDir() {
+		t.Errorf("%s is not a directory", nested)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("root dir mode = %o, want 0755", perm)
+	}
+}
+
+// TestMkdirBaseStaging_UnitFileSetsDevShm — the load-bearing default
+// for production lives in deploy/systemd/faas-imaged.service, not in
+// code: the unit ships `Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging`
+// so host /tmp (ext4 on cd-controlplane EX44) is bypassed and the
+// kernel's overlayfs upper-tmpfile check is satisfied. Pinning the
+// contract here so a future unit-file edit that drops the env var
+// fails CI loudly instead of silently regressing every deploy.
+func TestMkdirBaseStaging_UnitFileSetsDevShm(t *testing.T) {
+	const unitPath = "../../deploy/systemd/faas-imaged.service"
+	body, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", unitPath, err)
+	}
+	want := "FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging"
+	if !strings.Contains(string(body), want) {
+		t.Errorf("%s does not contain %q\n--- unit file ---\n%s",
+			unitPath, want, string(body))
+	}
+	// Symmetric coverage for the deploy/controlplane copy.
+	const cpUnit = "../../deploy/controlplane/systemd/faas-imaged.service"
+	cpBody, err := os.ReadFile(cpUnit)
+	if err != nil {
+		t.Fatalf("read %s: %v", cpUnit, err)
+	}
+	if !strings.Contains(string(cpBody), want) {
+		t.Errorf("%s does not contain %q\n--- unit file ---\n%s",
+			cpUnit, want, string(cpBody))
+	}
+}
+
 // TestBuildBase_AppliesAllLayers pins the spec-critical difference from
 // Builder.Build: every supplied layer is applied, not just "above base".
 // Three layers in, three sets of files visible in the staging tree before
