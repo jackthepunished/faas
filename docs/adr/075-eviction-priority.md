@@ -125,8 +125,10 @@ audit row (would be far too noisy on a busy box).
 A single-purpose, single-keyword-greppable audit row carries
 `{old, new, app_id, slug}` when the value actually changes. A
 no-op PATCH (same value) emits nothing. Subject is
-`&app.AccountID` (matches `app.updated`'s shape at
-`cmd/apid/handlers_ext.go:629`).
+`&acct.ID` (matches `app.updated`'s shape at
+`cmd/apid/handlers_ext.go:676`); `app.AccountID == acct.ID` is
+the `loadApp` invariant the PATCH handler relies on, so the two
+references are equivalent in this path.
 
 The `gregale audit-events --kind-prefix eviction_priority` filter
 sees every tier change without parsing the larger `app.updated`
