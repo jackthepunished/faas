@@ -33,6 +33,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Cron (spec §4.4 paid-only): Free has no crons at all. Handler
 			// returns 402 ErrPlanCronsNotAllowed before the store is touched.
 			CronLimitPerApp: 0, CronLimitPerAccount: 0,
+			// Issue #475: Free is gated off the reserved eviction tier.
+			// Fail-closed at 0/0 mirrors the cron 0/0 posture above.
+			EvictionPriorityReservedAllowed: false, ReservedConcurrencyPerAccount: 0,
 			// IAM-6 / ADR-061: PR 1 placeholder. Fail-closed at 0/0
 			// until the financial model authorizes values for PR 2.
 			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
@@ -96,6 +99,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: false, ScaleUpTargetCPUAllowed: false,
 			// Cron: Hobby gets 5 per-app and 10 per-account.
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
+			// Issue #475: Hobby gets 1 reserved-tier app.
+			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 1,
 			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
 			// financial model authorizes values.
 			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
@@ -145,6 +150,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Pro gets 20 per-app and 50 per-account.
 			CronLimitPerApp: 20, CronLimitPerAccount: 50,
+			// Issue #475: Pro gets 2 reserved-tier apps.
+			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 2,
 			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
 			// financial model authorizes values.
 			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
@@ -198,6 +205,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			ScaleUpTargetRPSAllowed: true, ScaleUpTargetCPUAllowed: true,
 			// Cron: Scale gets 100 per-app and 500 per-account.
 			CronLimitPerApp: 100, CronLimitPerAccount: 500,
+			// Issue #475: Scale gets 4 reserved-tier apps.
+			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 4,
 			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
 			// financial model authorizes values.
 			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
@@ -356,6 +365,10 @@ func TestPlansAreMonotonic(t *testing.T) {
 			{"EgressMbit", lo.EgressMbit, hi.EgressMbit},
 			{"CronLimitPerApp", lo.CronLimitPerApp, hi.CronLimitPerApp},
 			{"CronLimitPerAccount", lo.CronLimitPerAccount, hi.CronLimitPerAccount},
+			// Issue #475: per-account reserved-tier cap must be
+			// monotonic across plans (Free 0 < Hobby 1 < Pro 2 < Scale 4).
+			// apid's updateApp path reads this directly.
+			{"ReservedConcurrencyPerAccount", lo.ReservedConcurrencyPerAccount, hi.ReservedConcurrencyPerAccount},
 			// Issue #395 / ADR-045: env quota must be monotonic like every
 			// other gate — Free's 8 < Hobby's 32 < Pro's 64 < Scale's 256,
 			// and the per-value byte cap doubles each step.
@@ -756,6 +769,72 @@ func TestPlanKeysMaxAccessorsMatchTable(t *testing.T) {
 		l := MustLimitsFor(p)
 		if got, want := p.KeysMax(), l.KeysMax; got != want {
 			t.Errorf("Plan(%s).KeysMax() = %d, table = %d", p, got, want)
+		}
+	}
+}
+
+// TestPlanEvictionPriorityReservedAllowed pins the per-plan tier gate
+// for the reserved eviction tier (issue #475). Free = false (no
+// reserved apps on the abuse-floor tier); Hobby+ = true. apid's
+// updateApp handler reads this via Plan.EvictionPriorityReservedAllowed()
+// and rejects a `reserved` PATCH on Free with 403
+// plan_eviction_priority_reserved_not_allowed. Unknown plans must fail
+// closed (return false) so a missing plan row never silently unlocks
+// the reserved tier — same contract as WarmSnapshotAllowed above.
+func TestPlanEvictionPriorityReservedAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.EvictionPriorityReservedAllowed(); got != c.want {
+			t.Errorf("%s.EvictionPriorityReservedAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanReservedConcurrencyPerAccount pins the per-account cap on
+// apps with eviction_priority='reserved' (issue #475). Free 0; Hobby 1;
+// Pro 2; Scale 4. apid's updateApp path enforces this under an
+// apps-row FOR UPDATE lock (mirrors CreateCronIfUnderQuota). Unknown
+// plans must fail closed (return 0) — same contract as
+// CronLimitPerAccount above.
+func TestPlanReservedConcurrencyPerAccount(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 1},
+		{PlanPro, 2},
+		{PlanScale, 4},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.ReservedConcurrencyPerAccount(); got != c.want {
+			t.Errorf("%s.ReservedConcurrencyPerAccount() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanEvictionPriorityAccessorsMatchTable pins that the accessors
+// read the same values the Limits struct holds. Catches a regression
+// where a future contributor edits the struct fields but forgets the
+// accessors (or vice versa). Mirrors TestKeysMaxAccessorsMatchTable.
+func TestPlanEvictionPriorityAccessorsMatchTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.EvictionPriorityReservedAllowed(), l.EvictionPriorityReservedAllowed; got != want {
+			t.Errorf("Plan(%s).EvictionPriorityReservedAllowed() = %v, table = %v", p, got, want)
+		}
+		if got, want := p.ReservedConcurrencyPerAccount(), l.ReservedConcurrencyPerAccount; got != want {
+			t.Errorf("Plan(%s).ReservedConcurrencyPerAccount() = %d, table = %d", p, got, want)
 		}
 	}
 }

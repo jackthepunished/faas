@@ -112,6 +112,16 @@ type OpsMetrics struct {
 	// Pre-instantiated at boot so the wake-tier-mix panel has zero
 	// rows from idle fleet, non-zero as soon as production wakes happen.
 	wakeSnapshotTier *prometheus.CounterVec
+	// evictedPriority (issue #475) — closed-set counter for the
+	// per-app eviction tier the reaper parked. Labels:
+	//   priority ∈ {best_effort, reserved}
+	//   reason ∈ {idle, eviction_aggressive, eviction_ram}
+	// Pre-instantiated at boot so the §12 eviction-by-tier panel
+	// has a non-zero series from idle fleet. The closed label set
+	// keeps the TSDB series bounded; the loop increments the
+	// counter after every successful park (idle / aggressive /
+	// RAM-pressure).
+	evictedPriority *prometheus.CounterVec
 	// eventsWriteFail: introduced in commit 4 for the audit-log
 	// emission. A non-zero rate indicates that transitions are
 	// succeeding but the events row isn't being written — the state
@@ -821,6 +831,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	wakeSnapshotTier.WithLabelValues("warm")
 	wakeSnapshotTier.WithLabelValues("init")
 	wakeSnapshotTier.WithLabelValues("cold_boot_fallback")
+	// Issue #475: per-tier eviction counter. Pre-instantiate the
+	// closed set of {priority, reason} tuples so the §12
+	// eviction-by-tier panel has zero rows from idle fleet and
+	// non-zero rows as soon as the reaper parks any instance. The
+	// closed label set keeps the TSDB series bounded; the loop
+	// stamps priority from the InstanceInfo carrier and reason
+	// from the parking branch (ReapIdle / ReapAggressive /
+	// SelectEvictions).
+	evictedPriority := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_evicted_priority_total",
+		Help: "Count of instances the reaper parked, labelled by per-app tier (priority ∈ {best_effort, reserved}) and the reaper branch that parked them (reason ∈ {idle, eviction_aggressive, eviction_ram}). The idle bucket is the per-tier idle-park rate; the eviction_ram bucket is the cross-account RAM-pressure signal — best_effort≫reserved is the success criterion for issue #475.",
+	}, []string{"priority", "reason"})
+	evictedPriority.WithLabelValues("best_effort", "idle")
+	evictedPriority.WithLabelValues("best_effort", "eviction_aggressive")
+	evictedPriority.WithLabelValues("best_effort", "eviction_ram")
+	evictedPriority.WithLabelValues("reserved", "idle")
+	evictedPriority.WithLabelValues("reserved", "eviction_aggressive")
+	evictedPriority.WithLabelValues("reserved", "eviction_ram")
 	rebalanceDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_rebalance_decisions_total",
 		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-064), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
@@ -1784,6 +1812,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		warmSnapshotErrors:                 warmSnapshotErrors,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
+		evictedPriority:                    evictedPriority,
 		eventsWriteFail:                    eventsWriteFail,
 		auditWriteFail:                     auditWriteFail,
 		auditWriteDur:                      auditWriteDur,
@@ -1907,6 +1936,22 @@ func (m *OpsMetrics) WakeSnapshotTier(tier string) prometheus.Counter {
 		return nil
 	}
 	return m.wakeSnapshotTier.WithLabelValues(tier)
+}
+
+// EvictedPriority returns the per-(priority, reason) counter the
+// reaper increments after every successful park (issue #475).
+// priority ∈ {best_effort, reserved} (matches pkg/api/dto.go's
+// EvictionPriority enum); reason ∈ {idle, eviction_aggressive,
+// eviction_ram}. The closed (priority × reason) label set is
+// pre-instantiated at boot so the §12 eviction-by-tier panel has
+// zero rows from idle fleet and non-zero rows as soon as the
+// reaper parks any instance. The helper is nil-safe so a unit test
+// without metrics keeps building.
+func (m *OpsMetrics) EvictedPriority(priority, reason string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.evictedPriority.WithLabelValues(priority, reason)
 }
 
 // RebalanceDecisions returns the per-(outcome) counter the Tier

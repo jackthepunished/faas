@@ -276,6 +276,24 @@ type Limits struct {
 	CronLimitPerApp     int
 	CronLimitPerAccount int
 
+	// EvictionPriorityReservedAllowed (issue #475) gates the per-app
+	// reserved eviction tier. Free = false (no reserved apps on the
+	// abuse-floor tier); Hobby+ = true. apid's updateApp handler
+	// rejects a `reserved` PATCH on Free with 403
+	// plan_eviction_priority_reserved_not_allowed. The field is
+	// always set-able to 'best_effort' (the default); what the plan
+	// gate controls is whether the customer may opt in to the
+	// reserved tier.
+	EvictionPriorityReservedAllowed bool
+	// ReservedConcurrencyPerAccount caps how many apps an account
+	// may park in the reserved tier simultaneously. Free = 0 (gate
+	// off). Hobby = 1, Pro = 2, Scale = 4. Counts APPS (not live
+	// instances) whose eviction_priority column equals 'reserved' — a
+	// single reserved app with 5 concurrent instances counts as 1
+	// against the cap. Enforced in apid's updateApp path under an
+	// apps-row FOR UPDATE lock (mirrors CreateCronIfUnderQuota).
+	ReservedConcurrencyPerAccount int
+
 	// KeysMax (issue #189 / IAM-5) caps the per-account count of
 	// active + grace API keys. Revoked keys are exempt — they
 	// remain in the table for audit lineage but no longer count
@@ -468,6 +486,11 @@ var planLimits = map[Plan]Limits{
 		// value the store still reads.
 		CronLimitPerApp:     0,
 		CronLimitPerAccount: 0,
+		// Issue #475: Free stays off the reserved eviction tier. The
+		// abuse-floor tier has no reserved-tier entitlement; per-account
+		// cap is 0 so the gate fails closed.
+		EvictionPriorityReservedAllowed: false,
+		ReservedConcurrencyPerAccount:   0,
 		// IAM-5 (issue #189): Free gets 3 keys — one for the customer's
 		// primary deploy target + one for a staging slot + one for
 		// break-glass. The abuse-vector (scripted key rotation under
@@ -586,6 +609,14 @@ var planLimits = map[Plan]Limits{
 		// template's tutorials.
 		CronLimitPerApp:     5,
 		CronLimitPerAccount: 10,
+		// Issue #475: Hobby gets 1 reserved-tier app. One healthcheck-
+		// critical service (status page, uptime probe) is the typical
+		// Hobby workload that needs cross-account RAM-pressure
+		// protection; Hobby's MaxConcurrency=2 already bounds the
+		// resident instance count, so a single reserved app is
+		// comfortable headroom for the tier's economics.
+		EvictionPriorityReservedAllowed: true,
+		ReservedConcurrencyPerAccount:   1,
 		// IAM-5 (issue #189): Hobby gets 10 keys — 2 per app across
 		// the Hobby app budget (5) keeps every deploy target
 		// (CI / staging / prod / personal / monitoring) with a
@@ -701,6 +732,14 @@ var planLimits = map[Plan]Limits{
 		// run more apps (25) than Hobby (5).
 		CronLimitPerApp:     20,
 		CronLimitPerAccount: 50,
+		// Issue #475: Pro gets 2 reserved-tier apps. Pro customers
+		// run customer-facing APIs + background workers; the +1 vs
+		// Hobby tracks the +5 Pro app budget. Reserved-tier RAM cost
+		// is still bounded by MaxConcurrency (5) and the per-app
+		// ram_mb cap (512 MB), so 2 reserved apps at full concurrency
+		// is ~5.2 GB resident — well inside the 47.6 GB ceiling.
+		EvictionPriorityReservedAllowed: true,
+		ReservedConcurrencyPerAccount:   2,
 		// IAM-5 (issue #189): Pro gets 50 keys — 2 per app across the
 		// Pro app budget (25) plus a per-team allowance (CI / staging
 		// / prod / personal / monitoring / break-glass).
@@ -816,6 +855,14 @@ var planLimits = map[Plan]Limits{
 		// at the per-app cap, the typical SaaS fan-out.
 		CronLimitPerApp:     100,
 		CronLimitPerAccount: 500,
+		// Issue #475: Scale gets 4 reserved-tier apps. 2× Pro tracks
+		// the doubling in DeployedApps (25 → 100) and the doubling in
+		// MaxConcurrency (5 → 20). At Scale's 1024 MB instance RAM +
+		// 8 MB overhead, 4 reserved apps at MaxConcurrency is ~8.3 GB
+		// resident (~18% of the 47.6 GB ceiling) — leaves comfortable
+		// headroom for live wakes.
+		EvictionPriorityReservedAllowed: true,
+		ReservedConcurrencyPerAccount:   4,
 		// IAM-5 (issue #189): Scale gets 200 keys — 2 per app across
 		// the Scale app budget (100) plus a per-team allowance, with
 		// headroom for the rotating-CI shape of a SaaS-scale customer.
@@ -1653,6 +1700,33 @@ func (p Plan) CronLimitPerAccount() int {
 		return 0
 	}
 	return l.CronLimitPerAccount
+}
+
+// EvictionPriorityReservedAllowed (issue #475) returns true if the plan
+// may opt apps into the reserved eviction tier. Free = false; Hobby+ =
+// true. apid's updateApp handler rejects a `reserved` PATCH on a Free
+// plan with 403 plan_eviction_priority_reserved_not_allowed. The
+// field is always set-able to 'best_effort' (the default) regardless
+// of plan — only the reserved opt-in is gated. Unknown plans fail
+// closed (return false) — same contract as WarmSnapshotAllowed above.
+func (p Plan) EvictionPriorityReservedAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.EvictionPriorityReservedAllowed
+}
+
+// ReservedConcurrencyPerAccount (issue #475) returns the per-account
+// cap on apps with eviction_priority='reserved'. Free 0; Hobby 1; Pro
+// 2; Scale 4. Counts APPS (not live instances). Unknown plans fail
+// closed (return 0) — same contract as CronLimitPerAccount above.
+func (p Plan) ReservedConcurrencyPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ReservedConcurrencyPerAccount
 }
 
 // KeysMax returns the per-account API-key cap for the plan

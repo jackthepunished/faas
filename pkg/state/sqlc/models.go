@@ -120,6 +120,7 @@ type App struct {
 	RootDir                string
 	WorkloadName           string
 	WorkloadClass          string
+	EvictionPriority       string
 	StartCommand           pgtype.Text
 	StreamingEnabled       bool
 	ScalingPolicy          []byte

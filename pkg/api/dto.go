@@ -134,6 +134,19 @@ type UpdateAppRequest struct {
 	// Range [100, 60000] — out-of-range values return 422
 	// invalid_warm_snapshot_min_ms.
 	WarmSnapshotMinMs *int `json:"warm_snapshot_min_ms,omitempty"`
+	// EvictionPriority (issue #475) classifies the app under
+	// cross-account RAM pressure. Values: 'best_effort' (default,
+	// pre-#475 behaviour) or 'reserved' (opt-in protected tier).
+	// The plan gate is enforced in apid — Free PATCH 'reserved'
+	// returns 403 plan_eviction_priority_reserved_not_allowed.
+	// The per-account cap (Plan.ReservedConcurrencyPerAccount)
+	// returns 422 plan_eviction_priority_reserved_quota. nil → keep
+	// current value (or apply the schema default 'best_effort' on
+	// a future create). Flipping between the two values is
+	// always allowed (any plan may go in either direction once
+	// the reserved tier is unlocked) — the cap is over APPS, not
+	// instances, so flipping down always frees a slot.
+	EvictionPriority *string `json:"eviction_priority,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -367,6 +380,15 @@ type AppResponse struct {
 	// dashboards can show "streaming on / off" alongside the
 	// egress-allowlist flag.
 	StreamingEnabled bool `json:"streaming_enabled"`
+	// EvictionPriority (issue #475) is the per-app eviction tier
+	// classification. 'best_effort' (default for every pre-#475
+	// row, applied by the column DEFAULT at migration time) keeps
+	// the historical LRU-by-last_request_at reaper behaviour;
+	// 'reserved' (Hobby+ only, per-account cap enforced) protects
+	// the app from cross-account RAM-pressure eviction. Surfaces
+	// in `gregale app <slug>` text output and the JSON view so
+	// customers can verify their PATCH round-tripped.
+	EvictionPriority string `json:"eviction_priority"`
 	// ScalingPolicy is the per-app autoscaling configuration (issue
 	// #462 / ADR-058). The struct is the wire DTO for the on-disk
 	// jsonb column `apps.scaling_policy`; the in-memory state type
@@ -2157,6 +2179,34 @@ const (
 	// the lifetime of the instance. Common shape is a metrics
 	// scraper exposing /metrics on the tenant netns.
 	SidecarTypeSidecar SidecarType = "sidecar"
+)
+
+// EvictionPriority is the per-app tier classification (issue #475).
+// 'best_effort' keeps the historical LRU-by-last_request_at reaper
+// behaviour: under cross-account RAM pressure, schedd may park the
+// instance to make room for someone else's bursty workload. 'reserved'
+// still obeys idle / per-account / per-app caps but is protected from
+// cross-account RAM-pressure eviction — every best_effort candidate
+// is drained before any reserved is parked. The category is closed
+// and the values are SQL CHECK (apps_eviction_priority_chk) — adding
+// a third tier is a migration + ADR + handler + reaper sort change,
+// not a config flag. The schema default is 'best_effort' for every
+// pre-#475 row.
+type EvictionPriority string
+
+const (
+	// EvictionPriorityBestEffort is the pre-#475 default tier. The
+	// reaper treats this instance as a fair candidate for
+	// cross-account RAM-pressure eviction; LRU-by-last_request_at
+	// applies unchanged.
+	EvictionPriorityBestEffort EvictionPriority = "best_effort"
+	// EvictionPriorityReserved is the opt-in protected tier
+	// (Plan.EvictionPriorityReservedAllowed; per-account
+	// ReservedConcurrencyPerAccount cap). The reaper still reaps
+	// idle / aggressive paths and the per-account RAM cap still
+	// applies; this tier only protects against the cross-account
+	// RAM-pressure eviction path.
+	EvictionPriorityReserved EvictionPriority = "reserved"
 )
 
 // sidecarNameRe matches RFC 1123 label: lowercase alphanumeric + dash,

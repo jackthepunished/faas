@@ -945,6 +945,13 @@ type Store interface {
 	// CountDeployedApps counts apps that occupy a deploy slot (active or
 	// evicted_cold) for quota enforcement (spec §4.2).
 	CountDeployedApps(ctx context.Context, accountID string) (int, error)
+	// CountAppsWithEvictionPriority returns the per-account count of
+	// apps whose eviction_priority equals the given tier (issue #475).
+	// Counts APPS (not instances) — the per-account cap
+	// (Plan.ReservedConcurrencyPerAccount) is over apps. Excludes
+	// soft-deleted apps so a recently-deleted reserved app doesn't
+	// leak into the cap and reject a subsequent recreate.
+	CountAppsWithEvictionPriority(ctx context.Context, accountID, priority string) (int, error)
 	UpdateApp(ctx context.Context, id string, p UpdateAppParams) (App, error)
 	// RenameApp changes an app's slug atomically (issue #63). Returns
 	// ErrNotFound if oldSlug doesn't belong to accountID; ErrConflict if

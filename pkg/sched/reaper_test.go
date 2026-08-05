@@ -681,3 +681,116 @@ func mkAggressiveWithStamp(app, id string, lastSeen time.Duration, open int64, m
 		ScaleInCooldownS: cooldownS,
 	}
 }
+
+// TestSelectEvictions_TierOrdering (issue #475) pins the new
+// comparator precedence: best_effort before reserved, then
+// non-Scale before Scale, then LRU, then instance id. We construct
+// candidates with identical LRU + plan + age so the only tiebreaker
+// is the tier — the test only passes if the new comparator lands
+// at rank 0.
+func TestSelectEvictions_TierOrdering(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-time.Hour)
+	instances := []InstanceInfo{
+		{Instance: "reserved", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityReserved)},
+		{Instance: "best", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityBestEffort)},
+	}
+	got := SelectEvictions(EvictionThresholdMB+1, now, instances)
+	if len(got) != 1 || got[0] != "best" {
+		t.Errorf("tier comparator must pick best_effort first, got %v", got)
+	}
+}
+
+// TestSelectEvictions_ReservedIsLastResort (issue #475) is the
+// success criterion: under RAM pressure the reaper must drain every
+// best_effort candidate before any reserved instance is parked.
+// Construct a mix where best_effort accounts for ~3 GB of RAM and
+// reserved accounts for ~1 GB; pick a target that only fits the
+// best_effort side. The reserved instance must survive.
+func TestSelectEvictions_ReservedIsLastResort(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-time.Hour)
+	instances := []InstanceInfo{
+		{Instance: "best-e", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityBestEffort)},
+		{Instance: "best-w", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityBestEffort)},
+		{Instance: "reserved-only", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityReserved)},
+	}
+	// Just 1 MB over threshold → 1 park total. Must be a best_effort
+	// instance, NOT the reserved one.
+	got := SelectEvictions(EvictionThresholdMB+1, now, instances)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 park, got %v", got)
+	}
+	if got[0] == "reserved-only" {
+		t.Errorf("reserved instance must be parked last; got %v", got)
+	}
+}
+
+// TestSelectEvictions_AllReservedEvictable (issue #475) is the
+// safety net: when the box is fully out of best_effort candidates
+// the reserved pool does fall through to eviction. A reserved app
+// is NOT a Lambda-style provisioned-concurrency pool — it is
+// protected from cross-account RAM pressure until every best_effort
+// candidate is exhausted, then it participates in the same
+// LRU-by-last_request_at ordering as everything else.
+func TestSelectEvictions_AllReservedEvictable(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-time.Hour)
+	instances := []InstanceInfo{
+		{Instance: "reserved-oldest", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old.Add(-time.Hour), Started: old, EvictionPriority: string(api.EvictionPriorityReserved)},
+		{Instance: "reserved-newest", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: now.Add(-time.Minute), Started: old, EvictionPriority: string(api.EvictionPriorityReserved)},
+	}
+	// Big eviction target — both reserved instances must participate.
+	got := SelectEvictions(EvictionThresholdMB+2080, now, instances)
+	if len(got) != 2 {
+		t.Errorf("expected both reserved instances to park when best_effort is exhausted, got %v", got)
+	}
+	if len(got) == 2 && got[0] != "reserved-oldest" {
+		t.Errorf("within reserved tier, LRU must still hold; got %v", got)
+	}
+}
+
+// TestSelectEvictions_EmptyEvictionPriorityFallsThrough (issue #475)
+// pins the pre-#475 behaviour for any pre-existing carrier stamp that
+// has EvictionPriority == "". The sort comparator treats the empty
+// string as !reserved, so the pre-#475 LRU ordering is preserved
+// bit-for-bit. This guards against a regression where the new
+// comparator accidentally promotes "" to the reserved tier.
+func TestSelectEvictions_EmptyEvictionPriorityFallsThrough(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-time.Hour)
+	instances := []InstanceInfo{
+		// No EvictionPriority set — pre-#475 shape.
+		{Instance: "legacy-oldest", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old},
+		// New column explicitly 'reserved'.
+		{Instance: "reserved-new", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityReserved)},
+	}
+	got := SelectEvictions(EvictionThresholdMB+1, now, instances)
+	if len(got) != 1 || got[0] != "legacy-oldest" {
+		t.Errorf("empty EvictionPriority must fall through to best_effort path; got %v", got)
+	}
+}
+
+// TestResolvePriority (issue #475) pins the helper that maps an
+// instance id to its per-app Tier label for the per-tier eviction
+// counter. The boolean return is false when the id is not in the
+// snapshot (a benign race: the instance was already parked by an
+// earlier branch in the same tick). The empty-string fallback
+// coerces to 'best_effort' to match the historical default.
+func TestResolvePriority(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-time.Hour)
+	snapshot := []InstanceInfo{
+		{Instance: "reserved-app", AppID: "a", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old, EvictionPriority: string(api.EvictionPriorityReserved)},
+		{Instance: "legacy-app", AppID: "b", Plan: api.PlanPro, State: state.StateRunning, RAMMB: 512, LastRequest: old, Started: old},
+	}
+	if got, ok := resolvePriority(snapshot, "reserved-app"); !ok || got != "reserved" {
+		t.Errorf("reserved lookup = (%q, %v), want (\"reserved\", true)", got, ok)
+	}
+	if got, ok := resolvePriority(snapshot, "legacy-app"); !ok || got != "best_effort" {
+		t.Errorf("empty-string fallback = (%q, %v), want (\"best_effort\", true)", got, ok)
+	}
+	if got, ok := resolvePriority(snapshot, "missing"); ok || got != "" {
+		t.Errorf("missing id = (%q, %v), want (\"\", false)", got, ok)
+	}
+}

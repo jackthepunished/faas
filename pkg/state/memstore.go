@@ -1786,6 +1786,14 @@ func (m *MemStore) CreateApp(_ context.Context, app App) (App, error) {
 	if app.Status == "" {
 		app.Status = AppActive
 	}
+	// Issue #475: snap empty Go zero to the schema DEFAULT 'best_effort'
+	// so the column reads as a real value right out of CreateApp. The
+	// pgstore snap lives on the SQL path; the memstore snap mirrors it
+	// here so the per-account reserved-tier cap read
+	// (CountAppsWithEvictionPriority) sees the same value the wire
+	// would. Pre-#475 tests that built App{} structs continue to read
+	// 'best_effort' on the round-trip.
+	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
 	m.apps[app.ID] = app
 	return app, nil
 }
@@ -1830,6 +1838,11 @@ func (m *MemStore) CreateAppIfUnderQuota(_ context.Context, app App, limits api.
 	if app.Status == "" {
 		app.Status = AppActive
 	}
+	// Issue #475: same snap-to-default as CreateApp above — the
+	// quota-gated path must round-trip 'best_effort' just like the
+	// unconditional path so the per-account reserved-tier cap reader
+	// sees the same wire value.
+	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
 	m.apps[app.ID] = app
 	return app, nil
 }
@@ -2368,6 +2381,29 @@ func (m *MemStore) CountDeployedApps(_ context.Context, accountID string) (int, 
 	return n, nil
 }
 
+// CountAppsWithEvictionPriority mirrors the pgstore read for the
+// per-account reserved-tier cap (issue #475). Same shape as
+// CountDeployedApps — counts APPS (not instances), excludes soft-deleted
+// apps so the cap tracks the live customer surface.
+func (m *MemStore) CountAppsWithEvictionPriority(_ context.Context, accountID, priority string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, a := range m.apps {
+		if a.AccountID != accountID {
+			continue
+		}
+		if a.Status == AppDeleted {
+			continue
+		}
+		if a.EvictionPriority != priority {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2464,6 +2500,16 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	}
 	if p.SetWarmSnapshotMinMs {
 		a.WarmSnapshotMinMs = intOrZero(p.WarmSnapshotMinMs)
+	}
+	// Issue #475: eviction_priority ('best_effort'|'reserved') follows
+	// the same Set*/optional-pointer pattern as warm_snapshot_*. The
+	// plan gate (Plan.EvictionPriorityReservedAllowed) and the per-account
+	// cap (Plan.ReservedConcurrencyPerAccount) are enforced upstream in
+	// apid; the store is a plain column write. derefString coerces a
+	// nil pointer to "" which is harmless because the CASE guard in
+	// UpdateApp's SQL short-circuits the read on !SetEvictionPriority.
+	if p.SetEvictionPriority {
+		a.EvictionPriority = derefString(p.EvictionPriority)
 	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The

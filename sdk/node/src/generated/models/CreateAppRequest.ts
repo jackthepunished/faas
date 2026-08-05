@@ -28,5 +28,9 @@ export type CreateAppRequest = {
    * Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 / ADR-055). Range [100, 60000]. Omitted → apid applies the plan default.
    */
   warm_snapshot_min_ms?: number;
+  /**
+   * Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction. Omitted at create-time → apid applies the schema default 'best_effort'.
+   */
+  eviction_priority?: 'best_effort' | 'reserved';
 };
 

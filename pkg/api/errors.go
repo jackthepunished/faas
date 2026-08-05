@@ -433,6 +433,27 @@ const (
 	CodeInvalidWarmSnapshotMinRequests = "invalid_warm_snapshot_min_requests"
 	CodeInvalidWarmSnapshotMinMs       = "invalid_warm_snapshot_min_ms"
 
+	// Issue #475 — per-app eviction_priority tier ('best_effort'|'reserved').
+	// 403 plan_eviction_priority_reserved_not_allowed when the customer's
+	// plan does not unlock the reserved tier (Free), so the customer sees
+	// the gate before the SQL CHECK trips on the UPDATE. Same gate shape
+	// as CodePlanStreamingNotAllowed / CodePlanWarmSnapshotNotAllowed;
+	// distinct code so the CLI can render "reserved is a paid feature"
+	// alongside the streaming + warm-snapshot copy without conflating
+	// them in telemetry.
+	CodePlanEvictionPriorityReservedNotAllowed = "plan_eviction_priority_reserved_not_allowed"
+
+	// Issue #475 — per-account reserved-tier quota exhausted. 422 with
+	// this code when the per-plan ReservedConcurrencyPerAccount cap is
+	// reached (Hobby 1, Pro 2, Scale 4). The customer must flip an
+	// existing reserved app to best_effort first; the count is over
+	// APPS (not instances) per the user-confirmed contract — single
+	// reserved app with 5 concurrent instances counts as 1 against the
+	// cap. Distinct code from the plan-gate (403) so a CLI can render
+	// "you've hit your reserved cap" vs "your plan doesn't unlock
+	// reserved" without conflating them.
+	CodePlanEvictionPriorityReservedQuota = "plan_eviction_priority_reserved_quota"
+
 	// Issue #471 PR-B (the meat) — emitted when an active stream
 	// exceeds the per-plan MaxResponseBodyBytes cap (Hobby+: 100 MB;
 	// Free: 25 MB). 413 + this code so the client sees a distinct
@@ -1077,6 +1098,36 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs("https://docs.gregale.dev/plans#crons")
+}
+
+// ErrPlanEvictionPriorityReservedNotAllowed is the 403 apid returns
+// when a Free customer PATCHes eviction_priority='reserved' (issue #475).
+// The plan DOES have a tier — 'best_effort' — that the customer can
+// already use; the upgrade copy is "reserved is a paid feature".
+// 402 PaymentRequired mirrors the streaming / warm-snapshot / cron
+// gate shape so the dashboard renders the same "upgrade to X" CTA.
+func ErrPlanEvictionPriorityReservedNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanEvictionPriorityReservedNotAllowed,
+		"Reserved eviction priority is not available on this plan",
+		fmt.Sprintf("the %s plan does not include the reserved eviction tier; upgrade to Hobby or above to opt in. The 'best_effort' tier is available on every plan.", p)).
+		WithDocs("https://docs.gregale.dev/plans#eviction-priority")
+}
+
+// ErrPlanEvictionPriorityReservedQuota is the 422 apid returns when
+// the per-account ReservedConcurrencyPerAccount cap is exhausted
+// (issue #475). The customer must flip an existing reserved app to
+// best_effort first; the count is over APPS (not instances) per the
+// user-confirmed contract — single reserved app with 5 concurrent
+// instances counts as 1 against the cap. 422 (not 403) because the
+// plan DOES unlock the reserved tier — the right copy is "flip an
+// existing reserved app to best_effort", not "upgrade".
+func ErrPlanEvictionPriorityReservedQuota(p Plan, observed, limit int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodePlanEvictionPriorityReservedQuota,
+		"Reserved eviction priority quota reached",
+		fmt.Sprintf("%s plan caps the reserved eviction tier at %d app(s) per account; you have %d. Flip an existing reserved app to best_effort to add another.",
+			p, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.gregale.dev/plans#eviction-priority")
 }
 
 // ErrAlertRuleInvalid is returned for malformed alert-rule bodies:

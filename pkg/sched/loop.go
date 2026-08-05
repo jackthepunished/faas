@@ -953,6 +953,15 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// + ScalingPolicy.ScaleInCooldownS.
 				LastScaleInAt:    a.LastScaleInAt,
 				ScaleInCooldownS: state.ScalingPolicyOrDefault(a.ScalingPolicy).ScaleInCooldownS,
+				// Issue #475: per-app eviction tier (best_effort
+				// | reserved). Same carrier semantics as
+				// MinInstances — identical across all instances of
+				// one app, sourced from apps.eviction_priority, and
+				// consulted by SelectEvictions' tier comparator.
+				// Default 'best_effort' preserves pre-#475 LRU
+				// behaviour bit-for-bit (the empty-string fallback
+				// in the sort comparator handles pre-PR rows).
+				EvictionPriority: a.EvictionPriority,
 			})
 		}
 	}
@@ -977,6 +986,19 @@ func (l *Loop) runReaper(ctx context.Context) {
 		if err := l.engine.Park(ctx, id); err != nil {
 			l.log.Warn("reaper: idle park", "instance", id, "err", err)
 			continue
+		}
+		// Issue #475: per-tier eviction counter. The idle path is
+		// the per-app floor's friend — both 'best_effort' and
+		// 'reserved' instances get parked after their idle
+		// timeout, so the metric observation is keyed by the
+		// InstanceInfo's EvictionPriority (the empty-string
+		// fallback here would never produce a real label value —
+		// ResolvePriority falls back to 'best_effort' to match the
+		// pre-#475 default).
+		if tier, ok := resolvePriority(snapshot, id); ok {
+			if counter := l.ops.EvictedPriority(tier, "idle"); counter != nil {
+				counter.Inc()
+			}
 		}
 		// O(1) lookup via the hoisted instance→app map.
 		if appID, ok := instanceToApp[id]; ok {
@@ -1005,8 +1027,41 @@ func (l *Loop) runReaper(ctx context.Context) {
 	for _, id := range SelectEvictions(resident, now, snapshot) {
 		if err := l.engine.Evict(ctx, id); err != nil {
 			l.log.Warn("reaper: eviction", "instance", id, "err", err)
+			continue
+		}
+		// Issue #475: per-tier eviction counter. The RAM-pressure
+		// path is the load-bearing observation for #475 — the
+		// success criterion is best_effort≫reserved on
+		// schedd_evicted_priority_total{reason="eviction_ram"}.
+		// A reserved instance showing up here means the box
+		// exhausted every best_effort candidate and had to fall
+		// through to the reserved tier; the alert is on a
+		// non-zero rate over a 5-minute window.
+		if tier, ok := resolvePriority(snapshot, id); ok {
+			if counter := l.ops.EvictedPriority(tier, "eviction_ram"); counter != nil {
+				counter.Inc()
+			}
 		}
 	}
+}
+
+// resolvePriority looks up the per-app EvictionPriority for an
+// instance id from the carriers built in runReaper. The boolean
+// return is false when the id is not in the snapshot (a benign
+// race: the instance was already parked by an earlier branch in
+// the same tick). The empty-string snap to 'best_effort' for
+// pre-#475 carriers (whose reaper tick lands before the column has
+// been backfilled) flows through state.EvictionPriorityOrBestEffort
+// so the metric observation matches the same bucket the INSERT
+// path stamps on a fresh row.
+func resolvePriority(snapshot []InstanceInfo, instanceID string) (string, bool) {
+	for _, s := range snapshot {
+		if s.Instance != instanceID {
+			continue
+		}
+		return state.EvictionPriorityOrBestEffort(s.EvictionPriority), true
+	}
+	return "", false
 }
 
 // runReaperAggressive (issue #171) is the per-tick body of the
@@ -1146,6 +1201,17 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 			if err := l.engine.Park(ctx, id); err != nil {
 				l.log.Warn("reaper: aggressive park", "instance", id, "err", err)
 				continue
+			}
+			// Issue #475: per-tier eviction counter. The
+			// aggressive path is the per-app scale-down arm of
+			// issue #171 — both 'best_effort' and 'reserved'
+			// instances get parked when the rolling-window RPS
+			// signal says the customer is over-provisioned, so
+			// the metric increments once per parked instance.
+			if tier, ok := resolvePriority(snapshot, id); ok {
+				if counter := l.ops.EvictedPriority(tier, "eviction_aggressive"); counter != nil {
+					counter.Inc()
+				}
 			}
 			aggressiveParkOK = true
 		}

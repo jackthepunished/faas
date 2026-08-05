@@ -45,6 +45,17 @@ type UpdateAppRequest struct {
 	// chain policy). The non-/0 contract is enforced by the DB
 	// trigger `apps_egress_allowlist_cidr` (migration 00033).
 	EgressAllowlist *[]string `json:"egress_allowlist,omitempty"`
+	// EvictionPriority (issue #475) is the per-app eviction tier
+	// classification. Values: 'best_effort' (default, pre-#475
+	// behaviour) or 'reserved' (opt-in protected tier). The plan
+	// gate is enforced server-side — Free PATCH 'reserved' returns
+	// 402 plan_eviction_priority_reserved_not_allowed. The
+	// per-account cap (Hobby 1, Pro 2, Scale 4) returns 422
+	// plan_eviction_priority_reserved_quota. nil → keep current
+	// value. Use Client.SetAppEvictionPriority for the common
+	// one-liner; this field is exposed for callers that bundle
+	// eviction_priority into a wider PATCH.
+	EvictionPriority *string `json:"eviction_priority,omitempty"`
 	// AutoscaleTargetRPS is the per-instance RPS target for the
 	// reactive scale-up trigger (issue #169 / #172 / pkg/sched/scaleup).
 	// When measured RPS / live_instance_count exceeds this value,
@@ -126,6 +137,13 @@ type AppResponse struct {
 	// current target. Plan-gated upstream.
 	AutoscaleTargetRPS    int `json:"autoscale_target_rps"`
 	AutoscaleTargetCPUPct int `json:"autoscale_target_cpu_pct"`
+	// EvictionPriority (issue #475) is the per-app eviction tier
+	// classification. 'best_effort' (default for every pre-#475
+	// row, applied by the column DEFAULT at migration time) keeps
+	// the historical LRU-by-last_request_at reaper behaviour;
+	// 'reserved' (Hobby+ only, per-account cap enforced) protects
+	// the app from cross-account RAM-pressure eviction.
+	EvictionPriority string `json:"eviction_priority"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
