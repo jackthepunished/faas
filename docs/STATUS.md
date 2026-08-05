@@ -519,6 +519,62 @@ by leaving `ReapIdle` and `ReapAggressive` unchanged.
 
 ADR-075 / issue #475 / migration 00138.
 
+## M8 — Outbound webhook delivery reliability
+
+- **Schema** — `app_webhooks` (slot 140) + `app_webhook_deliveries`
+  (slot 141). Slot 139 carries a fence reservation matching
+  `00130_reserve_slot.sql` (ADR-041). The deliveries partial index
+  `(status, next_attempt_at) WHERE status IN ('pending','in_flight')`
+  keeps the dispatcher's claim query O(due-rows) rather than
+  O(table). The `(account_id, created_at DESC)` index backs the
+  customer-facing deliveries endpoint without a sort.
+- **State** — `CreateAppWebhookIfUnderQuota` mirrors
+  `CreateCronIfUnderQuota` (apps-row FOR UPDATE + per-account
+  count under tx). `ClaimDueAppWebhookDeliveries` uses a
+  `FOR UPDATE SKIP LOCKED` claim transaction with
+  `ORDER BY account_id, next_attempt_at LIMIT $cap` — per-account
+  fairness emerges from the query, no token bucket needed.
+- **Dispatcher** — `pkg/webhook.Dispatcher` runs as a third
+  goroutine in schedd (alongside the cron drain + scheduler
+  watchdog). 5s tick, 32-row cap, 7-attempt DLQ. Backoff schedule
+  `30s, 2m, 10m, 1h, 6h` with ±25% jitter via `crypto/rand`.
+  Clock injection via `Sleeper` + `Now` struct fields (not package
+  vars) makes the 7.5h DLQ path testable in ≤1s wall. Property test
+  `TestDispatcher_Fairness_PerAccountRoundRobin` (5 accounts × 100
+  rows × 10 ticks) pins the round-robin claim.
+- **Header set** — `X-Faas-Webhook-Signature`,
+  `X-Faas-Webhook-Timestamp`, `X-Faas-Webhook-Attempt`,
+  `X-Faas-Delivery-Id`. The delivery id is stable across retries —
+  customers can dedupe by it. The alert path keeps `X-Faas-Alert-*`
+  unchanged (the `pkg/webhookout.HeaderSet` seam separates the
+  two).
+- **Secret sealing** — `secretbox.SealBytes(recipient, "APP_WEBHOOK",
+  plaintext, 256)` at apid-write time; dispatcher unseals with
+  `secretbox.OpenBytesMulti` against the host age identity. The
+  plaintext is destroyed at function exit and never crosses the
+  wire after the create round-trip — the response carries only
+  `webhook_secret_sealed_masked: "***"`.
+- **API** — 8 endpoints under `/v1/apps/{slug}/webhooks[/...]`:
+  list, create, get, update, delete, rotate-secret,
+  list-deliveries, retry-delivery. Plan-tier gate (`WebhookPerApp
+  == 0` → 402 `plan_webhooks_not_allowed`); quota gate
+  (per-app / per-account → 422 `plan_webhook_quota`). Closed enum
+  drift on `retry_policy` and `event_filter` surfaces as 400
+  `app_webhook_invalid` BEFORE the row is created.
+- **CLI** — `gregale webhooks <list|add|update|rm|deliveries|retry>`
+  (mirrors `gregale crons`). Closed-set drift on `--retry-policy`
+  surfaces locally before the round-trip (same posture as
+  `--eviction-priority` from PR #647).
+- **SDK** — `sdk/go/internal/api` + Node generator regen both
+  carry the new surface; `make sdk-gen` + `sdk-gen-node-twice`
+  pass. Python regen deferred (venv not available locally).
+- **Audit** — `app.webhook_created`, `app.webhook_updated`,
+  `app.webhook_deleted`, `app.webhook_secret_rotated`,
+  `app.webhook_delivery_retried`, plus the dispatcher-emitted
+  `webhook.delivered` / `webhook.failed` / `webhook.dead`.
+
+ADR-076 / issue #476 / migrations 00140 + 00141.
+
 ## What's next
 
 M0 → M8 are the spec-defined milestones (spec §14, lines 444–461).

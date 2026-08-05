@@ -287,8 +287,8 @@ func TestDispatcher_500ThenRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppWebhookDeliveryByID: %v", err)
 	}
-	if gotDel.Status != state.AppWebhookDeliveryFailed {
-		t.Errorf("status: got %s, want failed", gotDel.Status)
+	if gotDel.Status != state.AppWebhookDeliveryPending {
+		t.Errorf("status: got %s, want pending (MarkFailed resets to pending so the claim picks it up next tick)", gotDel.Status)
 	}
 	if !gotDel.NextAttemptAt.After(start) {
 		t.Errorf("next_attempt_at: got %v, want > start %v", gotDel.NextAttemptAt, start)
