@@ -153,14 +153,18 @@ type Handler struct {
 	// audit listing per ADR-074 §3.2.
 	audit *audit.Auditor
 	// grypeRun is the supply-chain scan runner used at base-stage
-	// time to write the Grype scan sidecar (issue #299). Wired
-	// via WithGrypeRun; nil = default to a subprocess invocation
-	// (grype dir:<outImage> -o json) — production default. Tests
-	// inject a stub returning canned findings so the sidecar write
-	// is hermetic and doesn't require Grype on PATH. Fail-closed
+	// time to write the Grype scan sidecar (issue #299 / ADR-055
+	// PR-2). Wired via WithGrypeRun; nil = default to a subprocess
+	// invocation (grype dir:<outImage> -o json) — production default.
+	// Tests inject a stub returning canned findings so the sidecar
+	// write is hermetic and doesn't require Grype on PATH. Fail-closed
 	// at the sidecar-write site (CRITICAL=9999 placeholder) when
-	// the runner returns an error or nil findings.
-	grypeRun func(ctx context.Context, dir string) (map[string]int, error)
+	// the runner returns an error or nil findings. The return type
+	// is *ScanResult (PR-2 refactor) — the pre-PR-2 map[string]int
+	// is the typed struct's SeverityCounts field; the base-ext4
+	// sidecar write at base_stage.go::writeScanSidecar reads the
+	// counts off the struct to build the legacy sidecar JSON.
+	grypeRun func(ctx context.Context, dir string) (*ScanResult, error)
 	// syftRun is the post-build SBOM generator used to populate
 	// build_provenance.sbom_storage_key (issue #299 / ADR-038
 	// Phase 3). Wired via WithSyftRun; nil = default to a
@@ -493,13 +497,13 @@ func (h *Handler) WithAudit(a *audit.Auditor) *Handler {
 }
 
 // WithGrypeRun replaces the default Grype subprocess invocation
-// (issue #299). Default is nil, which falls back to the production
-// runner that shells out to `grype dir:<dir> -o json` and parses
-// the per-severity finding counts. Tests inject a stub returning
-// canned findings so the sidecar write is hermetic. Mirrors the
-// `LayerBuilder` interface injection pattern — same Handler-Builder
-// seam, same With* fluent setter shape.
-func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (map[string]int, error)) *Handler {
+// (issue #299 / ADR-055 PR-2). Default is nil, which falls back
+// to the production runner that shells out to `grype dir:<dir>
+// -o json` and parses the typed ScanResult. Tests inject a stub
+// returning canned findings so the sidecar write is hermetic.
+// Mirrors the `LayerBuilder` interface injection pattern — same
+// Handler-Builder seam, same With* fluent setter shape.
+func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (*ScanResult, error)) *Handler {
 	h.grypeRun = fn
 	return h
 }
@@ -564,13 +568,14 @@ func (h *Handler) CloseVMMClient() error {
 }
 
 // runGrype dispatches to the injected grypeRun or falls back to
-// the default subprocess runner (issue #299). The default shells
-// out to `grype dir:<dir> -o json` and parses the matches[].vulnerability.severity
-// counts into map[string]int. Errors and nil maps are surfaced to
-// the caller (the sidecar-write site fail-closed with a
-// CRITICAL=9999 placeholder). Production wires the default;
-// tests wire a stub via WithGrypeRun.
-func (h *Handler) runGrype(ctx context.Context, dir string) (map[string]int, error) {
+// the default subprocess runner (issue #299 / ADR-055 PR-2).
+// The default shells out to `grype dir:<dir> -o json` and parses
+// the matches[].vulnerability.severity counts into a typed
+// ScanResult. Errors and nil results are surfaced to the caller
+// (the sidecar-write site fail-closed with a CRITICAL=9999
+// placeholder). Production wires the default; tests wire a stub
+// via WithGrypeRun.
+func (h *Handler) runGrype(ctx context.Context, dir string) (*ScanResult, error) {
 	if h.grypeRun != nil {
 		return h.grypeRun(ctx, dir)
 	}

@@ -48,7 +48,7 @@ type grypeOutput struct {
 }
 
 // defaultGrypeRun shells out to the grype CLI and parses the JSON
-// output into per-severity finding counts (issue #299). ctx
+// output into a typed ScanResult (issue #299 / ADR-055 / PR-2). ctx
 // cancellation propagates to the subprocess via exec.CommandContext
 // (same pattern as pkg/fcvm/metrics.go:349's lvs invocation).
 // Returns (nil, err) on a subprocess error or parse failure —
@@ -61,7 +61,7 @@ type grypeOutput struct {
 // at a default-PATH location. A missing grype binary surfaces
 // here as a `exec: "grype": executable file not found in $PATH`
 // error from the subprocess — same fail-closed path.
-func defaultGrypeRun(ctx context.Context, dir string) (map[string]int, error) {
+func defaultGrypeRun(ctx context.Context, dir string) (*ScanResult, error) {
 	return runGrypeImpl(ctx, "grype", dir)
 }
 
@@ -71,7 +71,7 @@ func defaultGrypeRun(ctx context.Context, dir string) (map[string]int, error) {
 // hand a single function value to WithGrypeRun without a closure
 // wrapper. Pinned by TestRunGrype_DelegatesToSubprocess in
 // grype_test.go (run with FAAS_RUN_GRYPE_TESTS=1).
-func RunGrype(ctx context.Context, dir string) (map[string]int, error) {
+func RunGrype(ctx context.Context, dir string) (*ScanResult, error) {
 	return defaultGrypeRun(ctx, dir)
 }
 
@@ -80,7 +80,7 @@ func RunGrype(ctx context.Context, dir string) (map[string]int, error) {
 // cmd/imaged passes that path via FAAS_GRYPE_BIN and the closure
 // inside makeGrypeRunner binds the binary to RunGrypeAt so the
 // subprocess invocation doesn't depend on $PATH resolution.
-func RunGrypeAt(ctx context.Context, bin, dir string) (map[string]int, error) {
+func RunGrypeAt(ctx context.Context, bin, dir string) (*ScanResult, error) {
 	return runGrypeImpl(ctx, bin, dir)
 }
 
@@ -88,7 +88,16 @@ func RunGrypeAt(ctx context.Context, bin, dir string) (map[string]int, error) {
 // path so defaultGrypeRun (PATH lookup, "grype") and RunGrypeAt
 // (operator-supplied absolute path) share the same parse +
 // counting logic; the per-call dispatch is one switch.
-func runGrypeImpl(ctx context.Context, bin, dir string) (map[string]int, error) {
+//
+// PR-2 (issue #464 / ADR-055): the return type changed from
+// `map[string]int` to `*ScanResult`. The SeverityCounts field
+// carries the same per-bucket count the pre-PR-2 map did; the
+// full Vulnerability[] list is added in PR-3 when the per-deploy
+// sink writes the typed payload. This PR preserves the
+// fail-closed base-ext4 sidecar behaviour: the call site at
+// base_stage.go::writeScanSidecar reads the counts off the
+// new struct and writes the same sidecar JSON.
+func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
 	cmd := exec.CommandContext(ctx, bin, "dir:"+dir, "-o", "json")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -100,12 +109,99 @@ func runGrypeImpl(ctx context.Context, bin, dir string) (map[string]int, error) 
 	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
 		return nil, fmt.Errorf("imaged: grype scan dir %q: parse json: %w", dir, err)
 	}
-	counts := map[string]int{}
+	var counts ScanResult
 	for _, m := range out.Matches {
-		counts[normalizeGrypeSeverity(m.Vulnerability.Severity)]++
+		counts.bumpSeverity(normalizeGrypeSeverity(m.Vulnerability.Severity))
 	}
-	return counts, nil
+	return &counts, nil
 }
+
+// ScanResult is the typed result of one grype run (issue #464 /
+// ADR-055 / PR-2). The pre-PR-2 call sites returned
+// `map[string]int`; the new struct carries the per-bucket count
+// (SeverityCounts) and reserves space for the full
+// Vulnerability list that PR-3's per-deploy sink writes.
+//
+// The package-level `Severity` constants below are the closed
+// enum Grype normalises to (CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN).
+// The base-ext4 sidecar write at base_stage.go::writeScanSidecar
+// reads SeverityCounts.Critical / .High / .Medium / .Low / .Unknown
+// to build the legacy `findings map[string]int` payload — the
+// pre-PR-2 sidecar JSON shape is byte-identical for a given
+// input. The per-deploy surface (PR-3's ScanResultSink) uses
+// the full struct directly.
+type ScanResult struct {
+	SeverityCounts
+}
+
+// bumpSeverity increments the per-bucket count for one
+// normalised severity. A future severity (or an empty string
+// from a malformed match) maps to UNKNOWN so the count still
+// records an honest value rather than dropping the row.
+func (s *ScanResult) bumpSeverity(severity string) {
+	switch severity {
+	case SeverityCritical:
+		s.Critical++
+	case SeverityHigh:
+		s.High++
+	case SeverityMedium:
+		s.Medium++
+	case SeverityLow:
+		s.Low++
+	case SeverityUnknown:
+		s.Unknown++
+	default:
+		s.Unknown++
+	}
+}
+
+// toMap projects the typed SeverityCounts back into the
+// `map[string]int` shape the legacy base-ext4 scan sidecar
+// expects (consumed by vmmd's bringUpScanCheck at
+// pkg/fcvm/manager.go). The keys are the uppercase closed
+// enum (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN). The map shape
+// stays byte-identical to the pre-PR-2 output for any given
+// input so the sidecar contract is preserved.
+func (s *ScanResult) toMap() map[string]int {
+	if s == nil {
+		return nil
+	}
+	return map[string]int{
+		SeverityCritical: s.Critical,
+		SeverityHigh:     s.High,
+		SeverityMedium:   s.Medium,
+		SeverityLow:      s.Low,
+		SeverityUnknown:  s.Unknown,
+	}
+}
+
+// SeverityCounts is the per-bucket count of CVEs in Grype's
+// closed vocabulary. Mirrors pkg/api.SeverityCounts (the
+// customer-facing DTO) but lives in imaged to keep the
+// internal type dependency-free. PR-3's sink marshals this
+// struct directly into the deployments.scan_result jsonb
+// column.
+type SeverityCounts struct {
+	Critical int
+	High     int
+	Medium   int
+	Low      int
+	Unknown  int
+}
+
+// Severity closed enum (issue #299 / ADR-055). Grype emits
+// a leading uppercase letter (Critical, High, Medium, Low,
+// Negligible, Unknown); the in-package constant set is
+// upper-case to match the pkg/api closed enum and the
+// existing vmmd scan sidecar. Negligible collapses into LOW
+// (the existing normalizeGrypeSeverity convention).
+const (
+	SeverityCritical = "CRITICAL"
+	SeverityHigh     = "HIGH"
+	SeverityMedium   = "MEDIUM"
+	SeverityLow      = "LOW"
+	SeverityUnknown  = "UNKNOWN"
+)
 
 // normalizeGrypeSeverity upper-cases Grype's severity strings to
 // match the canonical closed set used by vmmd's scan sidecar

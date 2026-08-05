@@ -96,8 +96,8 @@ func newBaseHarness(t *testing.T, mp *minimalManifestPuller, b LayerBuilder) *ba
 		// placeholder, polluting tests that aren't asserting on the scan
 		// sidecar's contents). Tests that DO care about the scan sidecar
 		// override the runner with their own stub.
-		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
-			return map[string]int{}, nil
+		grypeRun: func(_ context.Context, _ string) (*ScanResult, error) {
+			return &ScanResult{}, nil
 		},
 	}
 	return &baseHarness{h: h, be: be}
@@ -173,9 +173,9 @@ func TestEnsureBaseExt4_GrypeCalledWithFilesystemPath(t *testing.T) {
 	const outImage = "/srv/fc/base/runner-builder-amd64.ext4"
 
 	var capturedDir string
-	hs.h.grypeRun = func(_ context.Context, dir string) (map[string]int, error) {
+	hs.h.grypeRun = func(_ context.Context, dir string) (*ScanResult, error) {
 		capturedDir = dir
-		return map[string]int{}, nil
+		return &ScanResult{}, nil
 	}
 
 	if _, err := hs.h.EnsureBaseExt4(context.Background(),
@@ -651,8 +651,8 @@ func TestEnsureBases_FailsLoudOnPullError(t *testing.T) {
 		builder: &fakeBuilder{},
 		log:     silentLogger(),
 		storage: be,
-		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
-			return map[string]int{}, nil
+		grypeRun: func(_ context.Context, _ string) (*ScanResult, error) {
+			return &ScanResult{}, nil
 		},
 	}
 	// ADR-053: legacyRefs — broken puller should fail on the
@@ -677,7 +677,7 @@ func TestEnsureBases_EmptyArchRejected(t *testing.T) {
 		builder:  &fakeBuilder{},
 		log:      silentLogger(),
 		storage:  be,
-		grypeRun: func(_ context.Context, _ string) (map[string]int, error) { return map[string]int{}, nil },
+		grypeRun: func(_ context.Context, _ string) (*ScanResult, error) { return &ScanResult{}, nil },
 	}
 	if _, err := h.EnsureBases(context.Background(), "", legacyRefs(), nil); err == nil {
 		t.Error("empty arch should error")
@@ -695,7 +695,7 @@ func TestEnsureBases_NilRefsIsNoOp(t *testing.T) {
 		builder:  &fakeBuilder{},
 		log:      silentLogger(),
 		storage:  be,
-		grypeRun: func(_ context.Context, _ string) (map[string]int, error) { return map[string]int{}, nil },
+		grypeRun: func(_ context.Context, _ string) (*ScanResult, error) { return &ScanResult{}, nil },
 	}
 	if r, err := h.EnsureBases(context.Background(), "amd64", nil, nil); err != nil || r != nil {
 		t.Errorf("nil refs → (%v, %v), want (nil, nil)", r, err)
@@ -893,8 +893,8 @@ func newParentHarness(t *testing.T) *parentHarness {
 		builder: cb,
 		log:     silentLogger(),
 		storage: be,
-		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
-			return map[string]int{}, nil
+		grypeRun: func(_ context.Context, _ string) (*ScanResult, error) {
+			return &ScanResult{}, nil
 		},
 		vmmClient: fvm,
 	}
@@ -1091,8 +1091,8 @@ func TestEnsureBaseExt4_WithParentRef_RejectsNilVMMClient(t *testing.T) {
 		builder: &callCountingBuilder{},
 		log:     silentLogger(),
 		storage: be,
-		grypeRun: func(_ context.Context, _ string) (map[string]int, error) {
-			return map[string]int{}, nil
+		grypeRun: func(_ context.Context, _ string) (*ScanResult, error) {
+			return &ScanResult{}, nil
 		},
 		// vmmClient intentionally nil
 	}
