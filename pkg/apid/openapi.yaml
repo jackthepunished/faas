@@ -2003,6 +2003,59 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Per-deploy grype CVE scan drill-down (issue #464 / ADR-055) ──────
+  # Surface, don't enforce. The scan lands within seconds of the per-app
+  # layer ext4 build (well under the AC #1 5-min SLA). The route is the
+  # canonical read path; the dashboard deploy detail page and the
+  # `gregale deployment <id> --show-scan` CLI flag both consume this
+  # endpoint. CRITICAL-CVE images deploy successfully (AC #4) — the
+  # scan is observational.
+
+  /v1/deployments/{id}/scan:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getDeploymentScan
+      summary: Get per-deploy grype scan.
+      description: |
+        Returns the per-deploy grype CVE scan payload (issue #464 /
+        ADR-055). The scan runs on the per-app layer ext4 in imaged's
+        deploy-complete path (after `SetDeploymentRootfs`, before the
+        pending→snapshotting transition) and lands on the
+        `deployments` row.
+
+        Status field is the closed enum:
+          - `complete` — full payload (SeverityCounts + Vulnerabilities).
+          - `failed` — payload carries `error` only; SeverityCounts is
+            all-zero, Vulnerabilities is nil. Rendered as the
+            "scan failed" chip on the dashboard.
+          - `skipped` — pre-feature backfill row
+            (migrations/00135 stamps `scan_status='skipped'` on every
+            pre-#464 row). Payload carries the reason sentinel.
+
+        A 404 is returned when:
+          - the deployment row does not exist,
+          - the deployment belongs to a different account (IDOR-safe;
+            no account-existence leak),
+          - no scan has run yet (the deploy is still mid-pipeline or
+            the row predates #464 entirely).
+      responses:
+        '200':
+          description: The typed scan payload. The shape mirrors the `deployments.scan_result` jsonb column (with the Status re-pinned from the authoritative `scan_status` column).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanResult'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Deployment row missing, cross-account probe, or scan has not run yet.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Builds (ADR-038, Tier 3 / issue #197 B3.10-read half) ───────────────
   # The provenance route is the only /v1/builds surface today.
   # deployments.id remains the parent resource; Build:read scope

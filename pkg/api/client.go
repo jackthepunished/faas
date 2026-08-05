@@ -418,6 +418,21 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id, nil, &out)
 }
 
+// GetDeploymentScan returns the per-deploy grype CVE scan
+// payload for one deployment (issue #464 / ADR-055). Returns
+// the typed api.ScanResult envelope (status, severity counts,
+// vulnerabilities, error). The handler returns 404 in three
+// cases — deployment row missing, deployment belongs to a
+// different account (IDOR-safe), or scan hasn't run yet —
+// surfaced via the same ErrNotFound wrapping callers already
+// branch on with errors.Is(err, api.ErrNotFound). Status
+// is the closed enum (complete|failed|skipped); see
+// pkg/api.ScanResult for the full wire shape.
+func (c *Client) GetDeploymentScan(ctx context.Context, id string) (ScanResult, error) {
+	var out ScanResult
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/scan", nil, &out)
+}
+
 // PatchDeployment sets the per-deployment cold-wake floor override
 // (issue #557 closure / ADR-072). MinInstances is the only mutable
 // field on a deployment post-create — image / digest / overrides /

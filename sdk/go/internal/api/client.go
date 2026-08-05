@@ -254,6 +254,21 @@ func (c *Client) GetDeployment(ctx context.Context, id string) (DeploymentRespon
 	return out, c.do(ctx, "GET", "/v1/deployments/"+id, nil, &out)
 }
 
+// GetDeploymentScan returns the per-deploy grype CVE scan
+// payload for one deployment (issue #464 / ADR-055). The
+// handler returns a 404 in three cases — the deployment
+// row doesn't exist, the deployment belongs to a different
+// account (IDOR-safe), or no scan has run yet — and the
+// SDK surfaces all three via the same ErrorCode wrapping
+// `errors.Is(err, api.ErrNotFound)` callers already branch
+// on. The Status field is the closed enum
+// (complete|failed|skipped); see pkg/api.ScanResult for the
+// full wire shape.
+func (c *Client) GetDeploymentScan(ctx context.Context, id string) (ScanResult, error) {
+	var out ScanResult
+	return out, c.do(ctx, "GET", "/v1/deployments/"+id+"/scan", nil, &out)
+}
+
 // DeployMultipart ships a source tarball (with optional runtime +
 // handler) to the multipart deploy endpoint. sourceName is the form
 // filename apid sees in the multipart "source" part; pass the
