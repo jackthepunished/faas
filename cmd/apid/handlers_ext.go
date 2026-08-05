@@ -2228,45 +2228,21 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 			resp.OverrideHealthcheck = &hc
 		}
 	}
-	// Per-deploy grype scan (issue #464 / ADR-055 / PR-3).
+	// Per-deploy grype scan (issue #464 / ADR-075 / PR-3).
 	// Populate DeploymentResponse.Scan from the typed payload
 	// written by imaged's deploy-complete hook (PR-3 commit 2).
 	// The handler-side conversion from the on-disk jsonb shape
 	// (state.Deployment.ScanResult []byte) into the wire DTO
-	// (api.ScanResult) happens here so pkg/state stays
-	// pkg/api-import-free (memory: pkg-api-cannot-import-pkg-state).
+	// (api.ScanResult) happens via s.scanResponse so this
+	// handler and the /scan drill-down route (PR-4) emit
+	// IDENTICAL typed payloads for a given row. The single
+	// source of truth lives in cmd/apid/handlers_scan.go.
 	//
-	// Behavior on each scan_status value:
-	//   - "complete": the typed jsonb decodes into the full
-	//     ScanResult (SeverityCounts + Vulnerabilities[]).
-	//   - "failed": typed jsonb carries {error: "..."}; we
-	//     populate Status+Error only (SeverityCounts all-zero,
-	//     Vulnerabilities nil).
-	//   - "skipped" (pre-feature backfill): jsonb carries
-	//     {reason: "pre-feature"}; Status surfaces as "skipped"
-	//     so the dashboard's "scan skipped" pill renders the
-	//     legacy rows distinctly from a successful scan.
-	//   - "" / NULL (in-flight deploy, scan hasn't run yet):
-	//     scanStatus is empty — resp.Scan stays nil so the
-	//     omitempty DTO tag omits the field. The dashboard
-	//     renders "scan pending" on the absence.
-	if d.ScanStatus != "" {
-		scan := &api.ScanResult{Status: d.ScanStatus}
-		if !d.ScannedAt.IsZero() {
-			scan.ScannedAt = d.ScannedAt.UTC().Format(time.RFC3339)
-		}
-		scan.ImageDigest = d.ImageDigest
-		if len(d.ScanResult) > 0 {
-			if err := json.Unmarshal(d.ScanResult, scan); err != nil {
-				s.log.Warn("apid: decode scan_result", "deployment", d.ID, "err", err)
-			}
-			// Re-pin the Status from the column even if the
-			// jsonb is malformed — the column is the
-			// authoritative state, the jsonb is the payload.
-			scan.Status = d.ScanStatus
-		}
-		resp.Scan = scan
-	}
+	// scanResponse returns nil when the row has no scan_status
+	// (mid-pipeline / pre-#464 row); the Scan field's omitempty
+	// tag then drops the field from the wire response. The
+	// dashboard renders "scan pending" on the absence.
+	resp.Scan = s.scanResponse(d)
 	return resp
 }
 

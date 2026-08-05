@@ -71,7 +71,7 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderAppsList(w, r, log, acct)
 		case len(path) > len("/dashboard/apps/") && path[:len("/dashboard/apps/")] == "/dashboard/apps/":
 			slug := path[len("/dashboard/apps/"):]
-			// Per-deploy drill-down (issue #464 / ADR-055):
+			// Per-deploy drill-down (issue #464 / ADR-075):
 			// /dashboard/apps/{slug}/deployments/{id} renders the
 			// full grype CVE list for one deployment. Falls through
 			// to renderAppDetail if the suffix doesn't match.
@@ -243,7 +243,7 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 			Error:     d.Error,
 		}
-		// Per-deploy grype scan summary (issue #464 / ADR-055).
+		// Per-deploy grype scan summary (issue #464 / ADR-075).
 		// Populate ScanSummary only when the row carries a
 		// scan_status; nil means "scan pending" on the template.
 		// The SeverityCounts read comes from the jsonb column's
@@ -1182,7 +1182,7 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 		Deployment: dashboardDeploymentItem(dep),
 	}
 	if dep.ScanStatus != "" {
-		payload := dashboardScanPayload(scanResponse(dep))
+		payload := dashboardScanPayload(s.scanResponse(dep))
 		data.Scan = &payload
 	}
 
@@ -1203,7 +1203,16 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 // dashboard-local ScanPayload / VulnerabilityRow shapes. The
 // handler is the only thing that crosses the api → dashboard
 // boundary; pkg/dashboard itself never imports pkg/api.
-func dashboardScanPayload(s api.ScanResult) dashboard.ScanPayload {
+//
+// Accepts a pointer so the caller can pass s.scanResponse(d)
+// directly; the helper is only reached on a non-empty
+// scanStatus (the dashboard's "scan pending" pill renders
+// on the absence, not on a 200/empty payload — the same
+// convention as getDeploymentScan).
+func dashboardScanPayload(s *api.ScanResult) dashboard.ScanPayload {
+	if s == nil {
+		return dashboard.ScanPayload{}
+	}
 	vulns := make([]dashboard.VulnerabilityRow, 0, len(s.Vulnerabilities))
 	for _, v := range s.Vulnerabilities {
 		vulns = append(vulns, dashboard.VulnerabilityRow{

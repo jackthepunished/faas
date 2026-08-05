@@ -1,7 +1,7 @@
 package main
 
 // handlers_scan.go — per-deploy grype scan HTTP handler
-// (issue #464 / ADR-055 / PR-4 of the mega-PR).
+// (issue #464 / ADR-075 / PR-4 of the mega-PR).
 //
 // GET /v1/deployments/{id}/scan returns the per-deploy grype
 // scan payload for one deployment. The route is the
@@ -45,7 +45,7 @@ import (
 )
 
 // getDeploymentScan is the GET /v1/deployments/{id}/scan
-// handler (issue #464 / ADR-055 / PR-4). Returns the typed
+// handler (issue #464 / ADR-075 / PR-4). Returns the typed
 // ScanResult on a successful scan, the failed shape on a
 // retry-exhausted scan, the skipped shape on pre-feature
 // backfill rows, or 404 when no scan has run yet (or the
@@ -84,18 +84,32 @@ func (s *server) getDeploymentScan(w http.ResponseWriter, r *http.Request, acct 
 		s.notFound(w, "scan not yet available")
 		return
 	}
-	resp := scanResponse(d)
+	resp := s.scanResponse(d)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// scanResponse builds the wire-shape api.ScanResult from
-// a state.Deployment row. Mirrors deploymentResponse's
-// per-deploy scan branch (handlers_ext.go:2156-2198) so
-// both endpoints return identical typed payloads for a
-// given row. Splitting it out keeps the handler body
-// under 50 lines and gives the CLI/dashboard a single
-// decode target.
-func scanResponse(d state.Deployment) api.ScanResult {
+// scanResponse builds the wire-shape *api.ScanResult from
+// a state.Deployment row. Returns nil when the row has no
+// scan_status (deploy mid-pipeline, pre-#464 row, or the
+// pre-feature backfill wasn't a "skipped" sentinel). The
+// returned pointer is the SINGLE source of truth for the
+// per-deploy scan wire shape — deploymentResponse (PR-3,
+// handlers_ext.go:2121-2159) and getDeploymentScan (PR-4,
+// this file) both go through it, so the two endpoints stay
+// byte-identical for a given row.
+//
+// Decode-failure convention: a corrupt jsonb payload does
+// NOT surface a 500. The handler logs at WARN and the
+// returned ScanResult carries Error = "scan_result decode
+// failed (server logs carry the detail)" so the dashboard
+// renders the same "scan failed" pill it renders for a
+// real scan_status='failed' row. Status is re-pinned from
+// the column because the column is authoritative; the
+// jsonb payload is data only.
+func (s *server) scanResponse(d state.Deployment) *api.ScanResult {
+	if d.ScanStatus == "" {
+		return nil
+	}
 	out := api.ScanResult{Status: d.ScanStatus}
 	if !d.ScannedAt.IsZero() {
 		out.ScannedAt = d.ScannedAt.UTC().Format(time.RFC3339)
@@ -113,10 +127,11 @@ func scanResponse(d state.Deployment) api.ScanResult {
 			out.SeverityCounts = api.SeverityCounts{}
 			out.Vulnerabilities = nil
 			out.Error = "scan_result decode failed (server logs carry the detail)"
+			s.log.Warn("apid: decode scan_result", "deployment", d.ID, "err", err)
 		}
 		// Re-pin Status from the column — the column is
 		// authoritative; the jsonb payload is data only.
 		out.Status = d.ScanStatus
 	}
-	return out
+	return &out
 }
