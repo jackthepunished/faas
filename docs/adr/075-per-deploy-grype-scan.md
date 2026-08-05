@@ -137,3 +137,53 @@ home for the per-deploy scan surface.
 - V-1 (replay): PR-3 commit 1 contains the pre-fix output for
   the `state.Store.UpsertDeploymentScanResult` seam that the
   test 1+2 above now pin against.
+
+## Subsequent amendments
+
+### Top-10 dashboard cap (commit on issue #464 PR-B extension)
+
+The dashboard's deployment detail page now renders the **top 10
+CVEs by severity** with a "View full scan (JSON)" link to
+`GET /v1/deployments/{id}/scan` when the scan had more findings
+than the dashboard width allows — per the AC #3 text
+("dashboard deploy detail page shows severity counts and the top
+10 CVEs by severity, with a link to the full list"). The cap is
+at the **handler edge** (`cmd/apid/handlers_dashboard.go::
+dashboardScanPayload`) — the wire DTO, the `/scan` route, the
+SDK, and the gregale `--show-scan` CLI flag keep the **full**
+list, so customers reaching the API directly don't have to
+reimplement the cap. Sort is stable on severity ordinal
+(CRITICAL=0 → UNKNOWN=4, anything outside the enum sorts last)
+then on ID for ties. The handler populates a new
+`dashboard.ScanPayload.TotalCount` so the template can render
+the "Showing N of M" copy + the link. The cap value
+(`dashboardScanTopN = 10`) is a top-level const at the handler
+edge so a unit test in `handlers_dashboard_test.go::
+TestDashboardScanPayload_TopNCap` can iterate without
+copy-paste; the test pins overflow (15 → cap to 10), the
+no-cap-when-under-N path, zero-finding, and nil-scan.
+
+### `Vulnerability.Paths` populated from `artifact.locations[].path`
+(commit on issue #464 PR-B extension)
+
+The wire `Vulnerability` DTO now carries `paths []string`
+(grype's `artifact.locations[].path`); the issue's example JSON
+explicitly cited this field. PR #651 dropped `Paths` from the
+wire in `b9f44593 fix(scan): drop unused Vulnerability.Paths`
+on review finding #54 ("customers don't need internal grype
+match paths"); the PR-B extension reversed that stance when the
+dashboard's "Path" column was added so customers can identify
+which shared library to rebuild. `pkg/imaged/grype.go::
+parseGrypeOutput` (extracted from `runGrypeImpl` so unit
+tests don't need a grype subprocess) decodes the new fields
+and emits a `pkg/imaged.Vulnerability` slice on
+`ScanResult.Vulnerabilities` (omitempty, so zero-finding scans
+stay compact). The base-ext4 sidecar continues to read only
+`SeverityCounts`; the new fields flow through ScanResult and
+are written to the deployment row, never to the sidecar. The
+SDK regen (`make sdk-gen`) mirrors the new field on
+`sdk/node/Vulnerability.ts` and `sdk/python/
+faas_sdk/models/vulnerability.py`; sdk-go is hand-curated. Open
+follow-up: persist all of `vulnerability.fix.versions[]` as a
+slice if a CVE ever carries multiple fixed versions (grype
+currently emits one fixed-version string per CVE).
