@@ -1337,8 +1337,19 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// workload and merge it with a compose workload of the same
 	// slug on re-apply, tripping apps_slug_key. See ADR-068
 	// amendment for the diff path that depends on this.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19)
+	// Issue #475: eviction_priority is NOT NULL DEFAULT 'best_effort'
+	// (migration 00135). The Go zero-value "" is NOT in the CHECK set
+	// (apps_eviction_priority_chk) — coerce to 'best_effort' so the
+	// pre-#475 create path keeps the schema DEFAULT behaviour bit-for-bit,
+	// the same shape as appType above. apid still applies the per-plan
+	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
+	// explicit 'reserved' values.
+	evictionPriority := app.EvictionPriority
+	if evictionPriority == "" {
+		evictionPriority = "best_effort"
+	}
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1351,7 +1362,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority)
 	return scanApp(row)
 }
 
@@ -1466,8 +1477,17 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// schema DEFAULT '' but written explicitly so the
 	// (RootDir, WorkloadName) tuple round-trips through the diff
 	// path (ADR-068 amendment).
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+	// Issue #475: eviction_priority is NOT NULL DEFAULT 'best_effort'
+	// (migration 00135). Same snap-to-default shape as CreateApp above
+	// — the Go zero-value "" is NOT in the CHECK set, so the insert
+	// path coerces to 'best_effort' to preserve the pre-#475 create
+	// behaviour bit-for-bit.
+	evictionPriority := app.EvictionPriority
+	if evictionPriority == "" {
+		evictionPriority = "best_effort"
+	}
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1479,7 +1499,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2178,7 +2198,8 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   scaling_policy = case when $29 then $30::jsonb else scaling_policy end,
 		   warm_snapshot_enabled = case when $31 then $32 else warm_snapshot_enabled end,
 		   warm_snapshot_min_requests = case when $33 then $34 else warm_snapshot_min_requests end,
-		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end
+		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end,
+		   eviction_priority = case when $37 then $38 else eviction_priority end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2211,7 +2232,8 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetScalingPolicy, scalingPolicyBytes,
 		p.SetWarmSnapshotEnabled, boolOrFalse(p.WarmSnapshotEnabled),
 		p.SetWarmSnapshotMinRequests, intOrZero(p.WarmSnapshotMinRequests),
-		p.SetWarmSnapshotMinMs, intOrZero(p.WarmSnapshotMinMs))
+		p.SetWarmSnapshotMinMs, intOrZero(p.WarmSnapshotMinMs),
+		p.SetEvictionPriority, derefString(p.EvictionPriority))
 	return scanApp(row)
 }
 
@@ -8710,7 +8732,8 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
 		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt,
-		&a.WarmSnapshotEnabled, &a.WarmSnapshotMinRequests, &a.WarmSnapshotMinMs); err != nil {
+		&a.WarmSnapshotEnabled, &a.WarmSnapshotMinRequests, &a.WarmSnapshotMinMs,
+		&a.EvictionPriority); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -8766,7 +8789,8 @@ const appsSelectColumns = `
 	workload_class, coalesce(start_command, ''), streaming_enabled, require_signed,
 	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, ''),
 	reassigned_at, migrated_at,
-	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms`
+	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms,
+	eviction_priority`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

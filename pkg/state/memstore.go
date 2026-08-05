@@ -2465,6 +2465,16 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetWarmSnapshotMinMs {
 		a.WarmSnapshotMinMs = intOrZero(p.WarmSnapshotMinMs)
 	}
+	// Issue #475: eviction_priority ('best_effort'|'reserved') follows
+	// the same Set*/optional-pointer pattern as warm_snapshot_*. The
+	// plan gate (Plan.EvictionPriorityReservedAllowed) and the per-account
+	// cap (Plan.ReservedConcurrencyPerAccount) are enforced upstream in
+	// apid; the store is a plain column write. derefString coerces a
+	// nil pointer to "" which is harmless because the CASE guard in
+	// UpdateApp's SQL short-circuits the read on !SetEvictionPriority.
+	if p.SetEvictionPriority {
+		a.EvictionPriority = derefString(p.EvictionPriority)
+	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
 	// apid handler never sets them (customers don't touch root_dir

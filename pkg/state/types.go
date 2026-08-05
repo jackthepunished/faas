@@ -435,7 +435,20 @@ type App struct {
 	// the 60 s ceiling bounds the per-park latency cost the warm
 	// capture adds to the cold path (R1 in the plan).
 	WarmSnapshotMinMs int
-	CreatedAt         time.Time
+	// EvictionPriority (issue #475) classifies the app under
+	// cross-account RAM pressure (spec §4.3 / §6.2-2). 'best_effort'
+	// (default for every existing app) keeps the pre-#475
+	// LRU-by-last_request_at reaper behaviour bit-for-bit; 'reserved'
+	// still obeys idle / per-account / per-app caps but is protected
+	// from cross-account RAM-pressure eviction — every best_effort
+	// candidate is drained before any reserved is parked. Not
+	// Lambda-style provisioned concurrency: a reserved app does NOT
+	// keep instances resident (ADR-005 — cold boot must always work).
+	// Plan-gated upstream in apid via
+	// api.Plan.EvictionPriorityReservedAllowed(); the column CHECK
+	// (apps_eviction_priority_chk) is the data-integrity backstop.
+	EvictionPriority string
+	CreatedAt        time.Time
 }
 
 // AppManifest is the runner-scaffold payload. Stored as jsonb in Postgres;
@@ -1574,8 +1587,21 @@ type UpdateAppParams struct {
 	// rejects <100).
 	WarmSnapshotMinMs    *int
 	SetWarmSnapshotMinMs bool
-	Status               *AppStatus
-	Manifest             *AppManifest
+	// EvictionPriority (issue #475) classifies the app under
+	// cross-account RAM pressure. SetEvictionPriority distinguishes
+	// "unset" (don't touch) from "explicit best_effort" (opt out of
+	// the reserved tier). apid's updateApp handler validates the
+	// value (must be 'best_effort' or 'reserved'), gates 'reserved'
+	// behind the plan's EvictionPriorityReservedAllowed() flag, and
+	// enforces the per-account cap (Plan.ReservedConcurrencyPerAccount())
+	// under an apps-row FOR UPDATE lock — the same shape as
+	// CreateCronIfUnderQuota. The audit kind
+	// app.eviction_priority_changed is emitted from apid only on an
+	// actual value change (no-op PATCHes are silent).
+	EvictionPriority    *string
+	SetEvictionPriority bool
+	Status              *AppStatus
+	Manifest            *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
