@@ -34,6 +34,99 @@ func TestColdBootConfigTwoDrives(t *testing.T) {
 	}
 }
 
+// TestColdBootConfig_SidecarTopology (issue #463 / ADR-069 / PR-B
+// AC #6) pins the drive topology for the sidecar Workloads
+// branch of BuildColdBootConfig. The contract:
+//
+//   drive0 = shared read-only base rootfs (DriveBase, IsRootDevice=true)
+//   drive1 = main workload layer (DriveLayerMain, RW, non-root)
+//   drive2..N = sidecar layers (DriveSidecarPrefix+idx, RO, non-root)
+//
+// where N = len(Workloads). The main drive MUST stay RW (the
+// customer's container writes to /tmp, installs pip packages,
+// etc.); sidecars MUST be RO (no second writable layer a
+// sidecar could use to escape quota accounting).
+//
+// A regression that flips the IsReadOnly assignment at
+// config.go:218 (e.g. flipping the i!=0 condition, or
+// dropping the Workloads branch) is silent in production —
+// the VM still boots, the snapshot path still works, and the
+// disk-quota accounting drifts in a way the customer notices
+// only at the next bill. The unit test pins the wire shape so
+// the regression shows up at `go test`.
+func TestColdBootConfig_SidecarTopology(t *testing.T) {
+	spec := ColdBootSpec{
+		KernelKey:  "/srv/fc/base/vmlinux-6.1",
+		BaseKey:    "/srv/fc/base/runner-node22.ext4",
+		VcpuCount:  2,
+		MemSizeMiB: 256,
+		Tap:        "tap0",
+		Workloads: []WorkloadSpec{
+			{Name: "main", Type: "main", StorageKey: "/tmp/main.ext4", RamMB: 256, Port: 8080},
+			{Name: "migrator", Type: "init", StorageKey: "/tmp/sc0.ext4", RamMB: 64},
+			{Name: "scraper", Type: "sidecar", StorageKey: "/tmp/sc1.ext4", RamMB: 32, Port: 9090},
+		},
+	}
+	cfg := BuildColdBootConfig(spec, 0)
+	if len(cfg.Drives) != 4 {
+		t.Fatalf("drive count = %d, want 4 (base + main + 2 sidecars)", len(cfg.Drives))
+	}
+	// drive0: shared read-only base rootfs.
+	if d := cfg.Drives[0]; d.DriveID != DriveBase || !d.IsRootDevice || !d.IsReadOnly || d.PathOnHost != spec.BaseKey {
+		t.Errorf("drive0 must be the RO root base, got %+v", d)
+	}
+	// drive1: main workload RW layer.
+	if d := cfg.Drives[1]; d.DriveID != DriveLayerMain || d.IsRootDevice || d.IsReadOnly || d.PathOnHost != "/tmp/main.ext4" {
+		t.Errorf("drive1 must be the main workload RW non-root layer, got %+v", d)
+	}
+	// drive2..N: sidecar RO layers, in spec order with
+	// DriveSidecarPrefix+idx.
+	for i, want := range []struct {
+		id   string
+		path string
+	}{
+		{"layer-sidecar-0", "/tmp/sc0.ext4"},
+		{"layer-sidecar-1", "/tmp/sc1.ext4"},
+	} {
+		d := cfg.Drives[2+i]
+		if d.IsRootDevice || d.IsReadOnly == false {
+			t.Errorf("sidecar drive %d must be RO non-root, got %+v", 2+i, d)
+		}
+		if d.DriveID != want.id {
+			t.Errorf("sidecar drive %d DriveID = %q, want %q", 2+i, d.DriveID, want.id)
+		}
+		if d.PathOnHost != want.path {
+			t.Errorf("sidecar drive %d PathOnHost = %q, want %q", 2+i, d.PathOnHost, want.path)
+		}
+	}
+}
+
+// TestColdBootConfig_OneSidecarTopology pins the drive-count
+// invariant for the 1-sidecar case (PR-B AC #6 secondary
+// sub-test). The drive count MUST be 3 (base + main + 1
+// sidecar); a regression that drops the sidecar loop's drive
+// append would land here as 2 drives, not 3.
+func TestColdBootConfig_OneSidecarTopology(t *testing.T) {
+	spec := ColdBootSpec{
+		KernelKey:  "/srv/fc/base/vmlinux-6.1",
+		BaseKey:    "/srv/fc/base/runner-node22.ext4",
+		VcpuCount:  2,
+		MemSizeMiB: 256,
+		Tap:        "tap0",
+		Workloads: []WorkloadSpec{
+			{Name: "main", Type: "main", StorageKey: "/tmp/main.ext4", RamMB: 256, Port: 8080},
+			{Name: "migrator", Type: "init", StorageKey: "/tmp/sc0.ext4", RamMB: 64},
+		},
+	}
+	cfg := BuildColdBootConfig(spec, 0)
+	if len(cfg.Drives) != 3 {
+		t.Fatalf("drive count = %d, want 3 (base + main + 1 sidecar)", len(cfg.Drives))
+	}
+	if d := cfg.Drives[2]; d.IsReadOnly == false || d.IsRootDevice {
+		t.Errorf("sidecar drive must be RO non-root, got %+v", d)
+	}
+}
+
 func TestColdBootConfigVirtioRngAlwaysOn(t *testing.T) {
 	cfg := BuildColdBootConfig(validColdSpec(), 0)
 	if cfg.Entropy == nil {
