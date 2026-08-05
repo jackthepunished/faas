@@ -42,10 +42,17 @@
 // Per-workload cgroups (host side):
 //   - vmmd creates nested cgroup scopes under the per-instance
 //     scope (writeWorkloadCgroup). These are host-side
-//     defense-in-depth scopes; the in-guest cgroup partition is
-//     a separate concern and is intentionally NOT wired here
-//     because the guest's cgroup namespace is isolated from the
-//     host's cgroup hierarchy.
+//     defense-in-depth scopes.
+//
+// Per-workload cgroups (in-guest, issue #463 / ADR-069 / PR-B
+// AC #4): guest-init mounts cgroup2 at /sys/fs/cgroup (see
+// main_linux.go::mountCgroup2, called between pivotInto and
+// the supervisor's first workload). runSidecar + runAppWithEnv
+// then mkdir a per-workload leaf, write memory.max = spec.
+// RamMB << 20, and after exec.Command.Start writes the child
+// PID into cgroup.procs. Sidecar OOM is scoped to that leaf
+// (cgroup v2 memory controller kills only the offending
+// leaf's processes) — the main workload keeps running.
 
 package main
 
@@ -401,6 +408,22 @@ func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Super
 	argv0, argv := resolveSidecarCommand(spec)
 	cmd := exec.Command(argv0, argv...)
 	cmd.Env = os.Environ()
+	// Issue #463 / ADR-069 / PR-B AC #4: per-workload
+	// in-guest cgroup v2 partition. mkdir + write
+	// memory.max BEFORE Start so the kernel sees the
+	// cap on the very first page fault. The leaf is
+	// derived from (type, name) via cgroupSafeName; an
+	// empty safe name (path separator in the name)
+	// skips the partition — the workload runs under
+	// the parent scope, which still has the host-side
+	// cap.
+	leaf := leafDir(spec.Type, spec.Name)
+	if leaf != "" {
+		if perr := partitionInto(leaf, spec.RamMB); perr != nil {
+			slog.Default().Warn("cgroup partition into leaf failed",
+				"leaf", leaf, "name", spec.Name, "err", perr)
+		}
+	}
 	// Sidecar env can layer on top of the customer's baked
 	// env (imaged wrote the per-sidecar env into the ext4 at
 	// build time). The secrets/apiEnv args from wake are
@@ -430,7 +453,16 @@ func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Super
 	// exits; the supervisor's Run() loop captures the exit
 	// code via trackExit and decides whether to restart.
 	_ = spec.Port
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("run sidecar %s: %w", spec.Name, err)
+	}
+	// Issue #463 / ADR-069 / PR-B AC #4: place the
+	// forked child into the cgroup leaf so the OOM
+	// killer scopes to the leaf (not the workload's
+	// siblings). Race window is benign — see
+	// placeIntoLeaf's doc.
+	placeIntoLeaf(leaf, cmd.Process.Pid, slog.Default())
+	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("run sidecar %s: %w", spec.Name, err)
 	}
 	return nil

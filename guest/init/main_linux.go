@@ -60,6 +60,16 @@ func boot() error {
 		return fmt.Errorf("pivot_root: %w", err)
 	}
 
+	// Issue #463 / ADR-069 / PR-B AC #4: mount cgroup2
+	// inside the guest AFTER pivot_root so the mount lives
+	// on the new root. Tolerant: a guest kernel without
+	// CONFIG_CGROUP_V2=y fails the mount silently and the
+	// per-workload partition is skipped (the host-side
+	// per-instance scope from vmmd is still enforced).
+	if err := mountCgroup2(); err != nil {
+		slog.Default().Warn("cgroup2 mount failed", "err", err)
+	}
+
 	// ADR-022: bind the AF_VSOCK resume listener BEFORE the supervisor starts
 	// the app, so a post-restore dial from vmmd can never race the listener
 	// coming up. We tolerate a bind failure (e.g. AF_VSOCK not compiled into
@@ -251,7 +261,30 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	if sup != nil {
 		sup.TrackCommand(cmd)
 	}
-	if err := cmd.Run(); err != nil {
+	// Issue #463 / ADR-069 / PR-B AC #4: per-workload
+	// in-guest cgroup v2 partition for the main workload.
+	// mkdir + write memory.max BEFORE Start. The main
+	// workload gets a "main-app" leaf so its OOM is
+	// scoped separately from any sidecar's. ram_mb = 0
+	// (legacy single-workload wakes) floors at 1 MiB in
+	// partitionInto. The customer-facing API gate already
+	// enforces plan RAM bounds upstream; this leaf is
+	// defense-in-depth (host-side writePlanCgroup is the
+	// primary cap).
+	mainLeaf := leafDir("main", "app")
+	if mainLeaf != "" {
+		if perr := partitionInto(mainLeaf, 0); perr != nil {
+			slog.Default().Warn("cgroup partition into main leaf failed",
+				"leaf", mainLeaf, "err", perr)
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("run %v: %w", argv, err)
+	}
+	// Place the forked child into the leaf. Same race
+	// posture as runSidecar — see placeIntoLeaf's doc.
+	placeIntoLeaf(mainLeaf, cmd.Process.Pid, slog.Default())
+	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("run %v: %w", argv, err)
 	}
 	return nil
