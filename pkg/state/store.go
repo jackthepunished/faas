@@ -612,6 +612,20 @@ type Store interface {
 	ConsumeLoginToken(ctx context.Context, tokenHash []byte) (string, error)
 	DeleteOldLoginTokens(ctx context.Context, before time.Time) (int64, error)
 
+	// Audit events (IAM-4 / ADR-035, retention ADR-075). The
+	// events table grows ~3-4 GB/year per active-tier customer
+	// through the auth / key / secret / account / stateless
+	// audit namespaces plus the future wake-timeline / sidecar
+	// surfaces. The retention trim is a daily cron (wired by
+	// pkg/eventretention); the Store method is the primitive it
+	// calls. SOC 2 CC6.2 evidence-retention floor is 90 days
+	// (pkg/eventretention.DefaultCutoffDays).
+	//
+	// The (subject, at desc) partial index on the events table
+	// keeps the DELETE bounded by (cutoff × recent rows); the
+	// AppendEvent / ListEvents paths exercise the same shape.
+	DeleteOldEvents(ctx context.Context, before time.Time) (int64, error)
+
 	// Dashboard sessions (IAM-3, issue #187 + #244 merged). One row per
 	// successful dashboard login; the cookie envelope carries the row's
 	// id as `sid`. Bearer API keys never touch this table (the cookie

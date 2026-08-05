@@ -174,8 +174,10 @@
   - **App/Deployment/Cron/Domain audit emissions.** Developer actions,
     not security-relevant; cover in a separate PR if the customer
     audit page ever asks.
-  - **Audit retention policy (§17 G3).** Append-only is the contract;
-    a 90-day trim lives behind a separate ADR.
+  - **Audit retention policy (§17 G3).** Closed by ADR-075
+    (pkg/eventretention, daily 90-day trim). The append-only
+    contract is unchanged — older rows are deleted wholesale,
+    not edited in place.
   - **`actor` enum.** Keep the column text-form; introduce an enum
     only when the dashboard needs to filter by actor.
   - **Per-kind partial index** for `kind`-keyed customer queries

@@ -9499,6 +9499,22 @@ func (s *PgStore) DeleteOldLoginTokens(ctx context.Context, before time.Time) (i
 	return tag.RowsAffected(), nil
 }
 
+// DeleteOldEvents (ADR-075) prunes audit-log events whose `at` is
+// older than the cutoff. Returns the row count. The
+// (subject, at desc) partial index on the events table keeps the
+// WHERE a partial range scan; the per-tick cost is bounded by
+// (cutoff × recent rows added in that window).
+//
+// Used by pkg/eventretention's daily loop; the maintenance floor
+// is 90 days (SOC 2 CC6.2).
+func (s *PgStore) DeleteOldEvents(ctx context.Context, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `delete from events where at < $1`, before)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // SetAccountPassword upserts the Argon2id PHC hash for an account.
 // ON CONFLICT (account_id) DO UPDATE so a password change / set
 // flow replaces the prior hash atomically. The PK on account_id is

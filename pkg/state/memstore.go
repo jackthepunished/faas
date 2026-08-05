@@ -6571,6 +6571,34 @@ func (m *MemStore) DeleteOldLoginTokens(_ context.Context, before time.Time) (in
 	return removed, nil
 }
 
+// DeleteOldEvents (ADR-075) prunes audit-log events whose `at` is
+// older than the cutoff. Mirrors the PgStore shape so tests can
+// drive the in-memory twin of the daily retention loop without
+// spinning up Postgres. Returns the number removed.
+//
+// Allocates a fresh slice rather than reusing the backing array
+// in place — concurrent AppendEvent callers would otherwise see
+// a half-trimmed slice. The cost is one allocation per tick (once
+// per day), so it's not on the hot path.
+//
+// Used by pkg/eventretention's daily loop; the maintenance floor
+// is 90 days (SOC 2 CC6.2).
+func (m *MemStore) DeleteOldEvents(_ context.Context, before time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := make([]Event, 0, len(m.events))
+	var removed int64
+	for _, e := range m.events {
+		if e.At.Before(before) {
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	m.events = kept
+	return removed, nil
+}
+
 // SetAccountPassword upserts the Argon2id PHC hash for an account.
 // One row per account_id — the PK rejects a duplicate INSERT, so a
 // racing concurrent SetAccountPassword against the same account

@@ -35,6 +35,7 @@ import (
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/eventretention"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/grace"
 	"github.com/onebox-faas/faas/pkg/httpsec"
@@ -283,6 +284,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Log:   log,
 		})
 		go func() { _ = loginTokenCleanup.Run(ctx) }()
+		// ADR-075: 90-day audit retention. The events table grows
+		// ~3-4 GB/year/active-tier through the auth / key / secret
+		// / account / stateless audit namespaces plus the future
+		// wake-timeline / sidecar surfaces. The daily loop trims
+		// rows older than eventretention.DefaultCutoffDays (90d,
+		// SOC 2 CC6.2 evidence-retention floor). Mirrors
+		// pkg/logintoken byte-for-byte (same Run / RunOnce pattern,
+		// same first-pass-error defence-in-depth).
+		eventRetentionCleanup := eventretention.New(eventretention.Params{
+			Store: srv.store,
+			Log:   log,
+		})
+		go func() { _ = eventRetentionCleanup.Run(ctx) }()
 		// Issue #300: topNSampler drives the apid_top_tenant_rps
 		// gauge from the rolling per-account count fed by
 		// observeWrap (server.go:observeWrap). 5s tick; runs for
