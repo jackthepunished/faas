@@ -141,6 +141,16 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		if err := ln.start(context.Background()); err != nil {
 			t.Fatalf("cycle %d start: %v", i, err)
 		}
+		// Wait for the socket dirent to appear before dialing.
+		// go's net.Listen returns before the kernel has fully
+		// published the dirent; dial in that micro-window can
+		// ECONNREFUSED with "no such file or directory" on a
+		// cold filesystem (CI runner pool). The test's purpose
+		// is to verify the stop+start CYCLE stays bindable, not
+		// to time the kernel's dirent publish — so wait briefly.
+		if err := waitForSocket(sock, 2*time.Second); err != nil {
+			t.Fatalf("cycle %d wait for socket: %v", i, err)
+		}
 		conn, err := net.DialTimeout("unix", sock, 2*time.Second)
 		if err != nil {
 			t.Fatalf("cycle %d dial after start: %v", i, err)
@@ -151,4 +161,21 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		cancel()
 	}
 	wg.Wait()
+}
+
+// waitForSocket polls for the unix socket dirent to appear, with a
+// deadline. The kernel publishes the dirent asynchronously after
+// net.Listen returns; under CI runner-pool load the publish can
+// lag a few ms past the listen return.
+func waitForSocket(path string, deadline time.Duration) error {
+	timeout := time.Now().Add(deadline)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if time.Now().After(timeout) {
+			return os.ErrNotExist
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
