@@ -787,7 +787,7 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID string) (WakeResult, e
 }
 
 // AdmitInstanceForDeployment is the floor-trigger entry point that
-// admits a specific deployment (issue #557 closure / ADR-072).
+// admits a specific deployment (issue #557 closure / ADR-074).
 // The signature differs from AdmitInstance by accepting an explicit
 // deploymentID; the floor trigger's per-deployment sweep threads the
 // deployment it wants woke. The wake path's per-request target is
@@ -1026,7 +1026,16 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// Free/Hobby account skips the warm tier and reads the init row
 	// directly. The warm row is still on disk for the customer's
 	// eventual re-upgrade (sticky-on-downgrade, ADR-055 §5).
-	snap, haveSnap := e.usableSnapshotForWake(ctx, dep.ID, string(acct.Plan))
+	//
+	// Issue #470 / PR C / ADR-074: the third return value is the
+	// chosen tier ∈ {warm, init, cold_boot_fallback}. Increment the
+	// wake-tier-mix counter so the dashboard shows the ratio of warm
+	// restores vs init restores vs cold-boot fallbacks. nil-safe
+	// accessor (OpsMetrics = nil → no-op).
+	snap, haveSnap, chosenTier := e.usableSnapshotForWake(ctx, dep.ID, string(acct.Plan))
+	if e.ops != nil {
+		e.ops.WakeSnapshotTier(chosenTier).Inc()
+	}
 
 	initState := state.StateColdBooting
 	if haveSnap {
@@ -3056,6 +3065,37 @@ func (e *Engine) captureWarmSnapshotLocked(ctx context.Context, ins state.Instan
 	// violation on (deployment_id, tier) with imaged's row.
 	vmstatePath := SnapDir() + "/" + ins.DeploymentID + "/warm/vmstate"
 	e.emitSnapshotWritten(ctx, ins.DeploymentID, vmstatePath, b, state.SnapshotTierWarm)
+	// Issue #470 / PR C / ADR-074: emit app.warm_snapshot_promoted
+	// so operators can grep gregale audit-events --kind-prefix
+	// warm_snapshot to see lifecycle activity. Subject is
+	// &app.AccountID (matches app.updated's account-scoped shape at
+	// handlers_ext.go:569 — diverges from app.characterized's nil
+	// subject deliberately for account-scoped listing per ADR-074
+	// §3.2). MemBytes comes from b; the snap row id is unknown at
+	// this point (imaged's subscriber writes it), so payload
+	// carries the deployment id instead.
+	if e.audit != nil {
+		// Defensive: the top-of-function nil check at line ~2836
+		// guarantees ins.FrameworkReadyAt is non-nil here, but
+		// future edits could regress that. A nil stamp means the
+		// warm-capture happened but the time-since-first-ready is
+		// unknown — log the omission rather than panic.
+		var readyToParkMs any
+		if ins.FrameworkReadyAt != nil {
+			readyToParkMs = time.Since(*ins.FrameworkReadyAt).Milliseconds()
+		} else {
+			readyToParkMs = nil
+		}
+		e.audit.Emit(ctx, "app.warm_snapshot_promoted", &app.AccountID, map[string]any{
+			"app_id":                     app.ID,
+			"deployment_id":              ins.DeploymentID,
+			"warm_min_requests":          app.WarmSnapshotMinRequests,
+			"warm_min_ms":                app.WarmSnapshotMinMs,
+			"mem_bytes":                  b.MemBytes,
+			"tier":                       state.SnapshotTierWarm,
+			"framework_ready_to_park_ms": readyToParkMs,
+		})
+	}
 	return b, nil
 }
 
@@ -3283,16 +3323,6 @@ func (e *Engine) loadAPIEnv(ctx context.Context, accountID, appID string) []fcvm
 	return out
 }
 
-// usableSnapshot returns the freshest non-stale snapshot for a deployment iff it
-// was made with the running Firecracker version (ADR-005 pinning).
-func (e *Engine) usableSnapshot(ctx context.Context, deploymentID string) (state.Snapshot, bool) {
-	snap, err := e.store.LatestSnapshot(ctx, deploymentID)
-	if err != nil || snap.Stale || snap.FCVersion != e.fcVer {
-		return state.Snapshot{}, false
-	}
-	return snap, true
-}
-
 // usableSnapshotForWake (issue #470 / PR A / ADR-055) is the tier-aware
 // counterpart to usableSnapshot. It honours the plan gate: a Free or
 // Hobby account (WarmSnapshotAllowed() == false) skips the warm-tier
@@ -3314,15 +3344,34 @@ func (e *Engine) usableSnapshot(ctx context.Context, deploymentID string) (state
 // init-tier row instead. The warm row is left on disk for the
 // customer's eventual re-upgrade; the next park the plan allows
 // warm again will pick up where the engine left off.
-func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan string) (state.Snapshot, bool) {
+//
+// The third return value is the chosen tier
+// ∈ {warm, init, cold_boot_fallback}; the caller (the lone
+// usableSnapshotForWake call site in this file) is responsible for
+// incrementing the WakeSnapshotTier counter (issue #470 / PR C /
+// ADR-074). Returning the tier from this function — instead of
+// calling the metric accessor directly — keeps the function
+// testable without a metric registry.
+func (e *Engine) usableSnapshotForWake(ctx context.Context, deploymentID, plan string) (state.Snapshot, bool, string) {
 	if !planAllowsWarm(plan) {
 		snap, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierInit)
 		if err != nil || snap.Stale || snap.FCVersion != e.fcVer {
-			return state.Snapshot{}, false
+			return state.Snapshot{}, false, wakeTierColdBootFallback
 		}
-		return snap, true
+		return snap, true, wakeTierInit
 	}
-	return e.usableSnapshot(ctx, deploymentID)
+	// PR C / ADR-074: prefer warm when available. LatestSnapshot
+	// already ranks warm > init, but checking tier explicitly lets us
+	// distinguish warm-wake from init-wake for the operator metric.
+	warm, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierWarm)
+	if err == nil && !warm.Stale && warm.FCVersion == e.fcVer {
+		return warm, true, wakeTierWarm
+	}
+	snap, err := e.store.LatestSnapshotForTier(ctx, deploymentID, state.SnapshotTierInit)
+	if err != nil || snap.Stale || snap.FCVersion != e.fcVer {
+		return state.Snapshot{}, false, wakeTierColdBootFallback
+	}
+	return snap, true, wakeTierInit
 }
 
 // planAllowsWarm is a thin wrapper that resolves the plan's
@@ -3347,6 +3396,19 @@ const (
 	StuckWakingTimeout   StuckReason = "waking_timeout"
 	StuckColdBootTimeout StuckReason = "cold_boot_timeout"
 	StuckSnapshotTimeout StuckReason = "snapshot_timeout"
+)
+
+// Wake-tier label values (issue #470 / PR C / ADR-074). These
+// match the pre-instantiated Prometheus counter labels
+// {warm, init, cold_boot_fallback} on
+// {prefix}_wake_snapshot_tier_total. Kept as a typed string const
+// set rather than state.SnapshotTier* because the counter label
+// for the cold-boot case is a metric-only concern, not a snapshot
+// row tier.
+const (
+	wakeTierWarm             = "warm"
+	wakeTierInit             = "init"
+	wakeTierColdBootFallback = "cold_boot_fallback"
 )
 
 // expectedStateForReason returns the source state the row must be in

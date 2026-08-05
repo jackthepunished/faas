@@ -85,10 +85,7 @@ func TestClientWake_CapacityLiftsToProblem(t *testing.T) {
 	}
 	// The wire status must lift back to *api.Problem so the gateway maps it to
 	// the right RFC 7807 response (503) without re-classifying strings.
-	prob := api.AsProblem(err)
-	if prob == nil {
-		t.Fatalf("error did not lift to *api.Problem: %v", err)
-	}
+	prob := mustProblem(t, api.AsProblem(err))
 	if prob.Status != 503 {
 		t.Errorf("problem status = %d, want 503", prob.Status)
 	}
@@ -245,10 +242,7 @@ func TestClientAdmitInstance_LiftsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected capacity denial on AdmitInstance")
 	}
-	prob := api.AsProblem(err)
-	if prob == nil {
-		t.Fatalf("AdmitInstance error did not lift to *api.Problem: %v", err)
-	}
+	prob := mustProblem(t, api.AsProblem(err))
 	if prob.Status != 503 {
 		t.Errorf("problem status = %d, want 503", prob.Status)
 	}
@@ -521,4 +515,16 @@ func TestClientStreamAppLogs_ContextCancelUnblocks(t *testing.T) {
 		t.Fatal("Recv did not unblock after cancel; goroutine leak")
 	}
 	close(release)
+}
+
+// mustProblem fails the test when prob is nil and returns it
+// non-nil otherwise. Side-steps the SA5011 false positive on
+// `if prob == nil { t.Fatalf(...) } if prob.X` because the
+// linter cannot prove t.Fatalf never returns.
+func mustProblem(t *testing.T, prob *api.Problem) *api.Problem {
+	t.Helper()
+	if prob == nil {
+		t.Fatal("expected a problem, got nil")
+	}
+	return prob
 }

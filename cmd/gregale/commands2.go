@@ -87,13 +87,21 @@ const (
 // (ux_spec §6.5): N instances stay RUNNING regardless of idle
 // timeout. 0 = scale to zero (default).
 //
+// `--warm-snapshot` / `--no-warm-snapshot` (issue #470 / PR C / ADR-074)
+// opt the app into the warm tier: Park captures a warm-row snapshot
+// alongside the init row, and the wake path prefers warm → init
+// → cold-boot. `--warm-snapshot-min-requests N` and
+// `--warm-snapshot-min-ms N` override the per-app gate thresholds
+// (PR #525 defaults: 5 / 2000). The plan gate is still enforced at
+// the API — Free/Hobby PATCHes return 403 even if the flag is set.
+//
 // UpdateAppRequest uses *int pointers on the wire so callers can distinguish
 // "unset" from "explicit zero." We use fs.Visit to detect which flags the
 // user actually passed — comparing flag values to sentinels (0 / -1) would
 // silently drop valid inputs like `--ram 0` or `--idle -1`.
 func cmdApp(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -115,8 +123,19 @@ func cmdApp(args []string) int {
 	// --autoscale-target-rps=0).
 	rps := fs.Int("autoscale-target-rps", 0, "per-instance RPS target for reactive scale-up (Hobby+/0 = disable)")
 	cpu := fs.Int("autoscale-target-cpu-pct", 0, "per-instance CPU%% target for reactive scale-up (Pro+ only; 1-100; 0 = disable)")
+	// Issue #470 / PR C / ADR-074: warm-snapshot opt-in flags. The
+	// pair is mutually exclusive — passing both is a usage error
+	// rather than a silent last-one-wins. Visit-flag detection lets
+	// the user distinguish "unset" (no patch) from explicit true/false.
+	warm := fs.Bool("warm-snapshot", false, "enable warm-snapshot tier (Pro/Scale only)")
+	noWarm := fs.Bool("no-warm-snapshot", false, "disable warm-snapshot tier (4th audit kind: app.warm_snapshot_disabled)")
+	warmMinReq := fs.Int("warm-snapshot-min-requests", 0, "warm-snapshot min-request gate (1..100; 0 = use server default)")
+	warmMinMs := fs.Int("warm-snapshot-min-ms", 0, "warm-snapshot min-ms-since-ready gate (100..60000; 0 = use server default)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
+	}
+	if *warm && *noWarm {
+		return printErr("Invalid flags", fmt.Errorf("--warm-snapshot and --no-warm-snapshot are mutually exclusive"))
 	}
 	client, err := authedClient()
 	if err != nil {
@@ -152,9 +171,28 @@ func cmdApp(args []string) int {
 		v := *cpu
 		req.AutoscaleTargetCPUPct = &v
 	}
+	// Warm-snapshot fields. The boolean pair coalesces to a single
+	// *bool on the wire so the apid side sees one canonical field.
+	if explicit["warm-snapshot"] {
+		v := true
+		req.WarmSnapshotEnabled = &v
+	}
+	if explicit["no-warm-snapshot"] {
+		v := false
+		req.WarmSnapshotEnabled = &v
+	}
+	if explicit["warm-snapshot-min-requests"] {
+		v := *warmMinReq
+		req.WarmSnapshotMinRequests = &v
+	}
+	if explicit["warm-snapshot-min-ms"] {
+		v := *warmMinMs
+		req.WarmSnapshotMinMs = &v
+	}
 
 	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
-		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil {
+		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
+		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -199,6 +237,16 @@ func cmdApp(args []string) int {
 		} else {
 			fmt.Printf("%-30s %s\n", "autoscale target cpu:", "disabled")
 		}
+		// Issue #470 / PR C / ADR-074: warm-snapshot state. Mirror
+		// the autoscale rendering: enabled/disabled for the toggle,
+		// bare value for the gating thresholds.
+		if a.WarmSnapshotEnabled {
+			fmt.Printf("%-30s %s\n", "warm snapshot:", "enabled")
+		} else {
+			fmt.Printf("%-30s %s\n", "warm snapshot:", "disabled")
+		}
+		fmt.Printf("%-30s %d\n", "warm snapshot min requests:", a.WarmSnapshotMinRequests)
+		fmt.Printf("%-30s %d ms\n", "warm snapshot min ms:", a.WarmSnapshotMinMs)
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
 	}

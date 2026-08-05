@@ -4850,6 +4850,12 @@ func (m *MemStore) ListSnapshotsForGC(_ context.Context) ([]SnapshotForGC, error
 			StorageKey: s.StorageKey,
 			Stale:      s.Stale,
 			CreatedAt:  s.CreatedAt,
+			// Issue #470 / PR C / ADR-072: forward
+			// apps.warm_snapshot_enabled so the per-tier GC
+			// policy can apply the 2+2 floor on warm-tier apps
+			// and the 2-init-only floor on disabled apps. Same
+			// denormalisation pattern as AppSlug above.
+			AppWarmSnapshotEnabled: app.WarmSnapshotEnabled,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

@@ -3,6 +3,16 @@
 Grafana 11 export. Panels cover all 7 of the spec §12 dashboard rows
 that are scorable today; one row remains deferred (rationale below).
 
+## `warm-snapshot.json` (issue #470 / PR C / ADR-074)
+
+Four-panel dashboard for the warm-snapshot tier ops surface: warm-capture
+errors per reason (`*_warm_snapshot_errors_total{reason}`), guest-init
+duration p50/p95 by app (`vmmd_guest_init_duration_seconds_bucket`),
+wake-tier mix stacked (`schedd_wake_snapshot_tier_total{tier}`), and
+snapshot-population-by-tier stat panel. UID `faas-warm-snapshot-pr-c`;
+land via `dashboards/warm-snapshot.json` import after the ansible role
+provisions the fleet dashboard (PR #141, ADR-031).
+
 ## Provisioning (PR #141, ADR-031)
 
 The canonical install path is `deploy/ansible/roles/grafana/`, which

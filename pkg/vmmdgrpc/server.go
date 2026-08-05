@@ -478,6 +478,17 @@ func (s *Server) FrameworkReady(ctx context.Context, req *vmmdpb.FrameworkReadyR
 			WithDocs("https://" + wire.DocsHost + "/vmmd#framework_ready")
 		return nil, grpcerr.ToStatus(err)
 	}
+	// Issue #470 / PR C / ADR-074: observe the wall-clock guest-init
+	// duration. The warmup ms surfaced by guest-init is the authoritative
+	// in-guest timer (boot clock from VM start to framework_ready send);
+	// the server-side elapsed is the additional round-trip from DGRAM recv
+	// to stamp commit. We observe warmup_ms because it's the
+	// operator-facing measurement ("how long did my app take to reach
+	// ready"). Bucket set is spec §6.3 verbatim. s.ops is the canonical
+	// OpsMetrics handle; nil-safe via the accessor.
+	if s.ops != nil {
+		s.ops.GuestInitDuration(appID, runtime).Observe(float64(req.GetWarmupMs()) / 1000.0)
+	}
 	// Surface appID + runtime into the structured log so the
 	// Prometheus exemplar downstream picks them up. We don't
 	// currently ship them on the wire (the response is empty by

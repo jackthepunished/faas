@@ -1080,7 +1080,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		floorTrigger := floor.New(
 			store,
-			store, // deploymentStore — issue #557 closure / ADR-072 (per-deployment walk)
+			store, // deploymentStore — issue #557 closure / ADR-074 (per-deployment walk)
 			schedFloorLedger{ledger: engine.Ledger()},
 			schedFloorEngine{engine: engine},
 			floor.Options{
@@ -1332,7 +1332,7 @@ func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floo
 }
 
 // AdmitInstanceForDeployment implements floor.Engine (issue #557
-// closure / ADR-072 — per-deployment floor wake).
+// closure / ADR-074 — per-deployment floor wake).
 func (s schedFloorEngine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (floor.AdmitResult, error) {
 	r, err := s.engine.AdmitInstanceForDeployment(ctx, appID, deploymentID)
 	if err != nil {
@@ -1376,7 +1376,7 @@ func (s schedFloorLedger) Concurrency(appID string) int {
 }
 
 // ConcurrencyForDeployment implements floor.Ledger (issue #557
-// closure / ADR-072 — per-(app, deployment) live count).
+// closure / ADR-074 — per-(app, deployment) live count).
 func (s schedFloorLedger) ConcurrencyForDeployment(appID, deploymentID string) int {
 	return s.ledger.ConcurrencyForDeployment(appID, deploymentID)
 }

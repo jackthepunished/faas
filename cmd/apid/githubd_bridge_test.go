@@ -47,6 +47,19 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// mustEnqueueBuildResponse is the SA5011 escape hatch for the
+// EnqueueBuild happy-path test: the proto-generated method can
+// legitimately return (nil, nil), but we want a real response. A
+// helper that t.Fatal()s and returns the value lets staticcheck
+// see the value is non-nil at the call site.
+func mustEnqueueBuildResponse(t *testing.T, resp *githubdpb.EnqueueBuildResponse, msg string) *githubdpb.EnqueueBuildResponse {
+	t.Helper()
+	if resp == nil {
+		t.Fatal(msg)
+	}
+	return resp
+}
+
 // --- stubs ------------------------------------------------------------------
 
 // bridgeStubStore satisfies githubdBridgeStore. Per-test fields
@@ -210,9 +223,7 @@ func TestEnqueueBuild_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnqueueBuild: %v", err)
 	}
-	if resp == nil {
-		t.Fatal("response is nil")
-	}
+	resp = mustEnqueueBuildResponse(t, resp, "response is nil")
 	if resp.BuildId != "b-1" {
 		t.Errorf("BuildId = %q, want %q", resp.BuildId, "b-1")
 	}

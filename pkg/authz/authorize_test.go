@@ -160,9 +160,7 @@ func TestRoleMatrix_Exhaustive(t *testing.T) {
 func TestAuthorizeOrgAction_NoPrincipal(t *testing.T) {
 	ctx := context.Background()
 	p := AuthorizeOrgAction(ctx, OrgActionView, nil)
-	if p == nil {
-		t.Fatal("AuthorizeOrgAction: want 500, got nil")
-	}
+	p = mustAuthzProblem(t, p, "AuthorizeOrgAction: want 500, got nil")
 	if p.Status != 500 {
 		t.Errorf("status = %d, want 500", p.Status)
 	}
@@ -186,9 +184,7 @@ func TestAuthorizeOrgAction_NoMembership(t *testing.T) {
 	ctx := WithRequestOnContext(req.Context(), req)
 
 	p := AuthorizeOrgAction(ctx, OrgActionView, nil)
-	if p == nil {
-		t.Fatal("AuthorizeOrgAction: want 403, got nil")
-	}
+	p = mustAuthzProblem(t, p, "AuthorizeOrgAction: want 403, got nil")
 	if p.Status != 403 {
 		t.Errorf("status = %d, want 403", p.Status)
 	}
@@ -336,4 +332,18 @@ func TestAllOrgActions_Complete(t *testing.T) {
 			t.Errorf("AllOrgActions has unknown %s", action)
 		}
 	}
+}
+
+// mustAuthzProblem is the SA5011 escape hatch for the
+// AuthorizeOrgAction tests: AuthorizeOrgAction can legitimately
+// return (nil, nil) on the happy path, but the deny-path tests
+// want a real Problem to assert against. A helper that
+// t.Fatal()s and returns the value lets staticcheck see the value
+// is non-nil at the call site.
+func mustAuthzProblem(t *testing.T, p *api.Problem, msg string) *api.Problem {
+	t.Helper()
+	if p == nil {
+		t.Fatal(msg)
+	}
+	return p
 }

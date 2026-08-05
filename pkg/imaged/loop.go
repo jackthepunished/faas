@@ -203,8 +203,15 @@ func (l *Loop) runGCTick(ctx context.Context, now time.Time) {
 		return
 	}
 
-	// Step A: per-app keep current+previous. Always runs.
-	stale := perAppKeepCurrentPrevious(rows)
+	// Step A: per-app per-tier floor. Always runs.
+	// Issue #470 / PR C / ADR-074: replaced
+	// perAppKeepCurrentPrevious with perAppKeepTierFloor so
+	// warm-enabled apps keep 2 warm + 2 init and warm-disabled
+	// apps drop all warm rows + keep 2 init only. The legacy
+	// function is preserved for the property-test suite
+	// (pkg/imaged/gc_test.go keeps both call sites) and for
+	// pre-#470 fleet replay.
+	stale := perAppKeepTierFloor(rows)
 	if len(stale) > 0 {
 		if err := l.deleteSnapshotsAndFiles(ctx, stale); err != nil {
 			l.log.Warn("imaged: per-app gc", "err", err)
@@ -293,6 +300,17 @@ func (l *Loop) runFCSweep(ctx context.Context) bool {
 // backend without LocalArtifactLister compatibility will need its own
 // GC; we log + skip in that case (a remote registry has its own
 // lifecycle).
+//
+// Issue #470 / PR C / ADR-074: the tuple's Tier field drives the
+// storage key — warm-tier targets delete WarmSnapMemKey +
+// WarmSnapVMStateKey (under /snap/<dep>/warm/), init-tier targets
+// delete SnapMemKey + SnapVMStateKey (under /snap/<dep>/). The
+// per-app ext4 layer (drive1, sched.AppLayerKey) is shared across
+// tiers for a given (app, deployment) pair and is always removed
+// when both tiers' rows have been evicted — but here we delete on
+// every row to keep the layer discard idempotent against partial
+// progress (an init row is always paired with its warm sibling
+// once a deployment is replaced).
 func (l *Loop) deleteSnapshotsAndFiles(ctx context.Context, ts []deleteTarget) error {
 	if len(ts) == 0 {
 		return nil
@@ -312,13 +330,26 @@ func (l *Loop) deleteSnapshotsAndFiles(ctx context.Context, ts []deleteTarget) e
 		return fmt.Errorf("imaged: gc storageFor: %w", err)
 	}
 	for _, t := range ts {
-		// snap blobs: delete both files; the storage backend swallows
-		// missing keys so a transient race with restore is harmless.
-		if err := be.Delete(ctx, state.SnapMemKey(t.DeploymentID)); err != nil {
-			l.log.Warn("imaged: gc remove snap mem", "deployment", t.DeploymentID, "err", err)
+		// snap blobs: pick the keys by tier. The storage backend
+		// swallows missing keys so a transient race with restore
+		// is harmless. The legacy init-only path was the
+		// unconditional default before #470; the tier-aware path
+		// preserves that for init-tier targets and switches to
+		// the warm keys when the row was a warm-tier snapshot.
+		var memKey, vmstateKey string
+		switch t.Tier {
+		case state.SnapshotTierWarm:
+			memKey = state.WarmSnapMemKey(t.DeploymentID)
+			vmstateKey = state.WarmSnapVMStateKey(t.DeploymentID)
+		default:
+			memKey = state.SnapMemKey(t.DeploymentID)
+			vmstateKey = state.SnapVMStateKey(t.DeploymentID)
 		}
-		if err := be.Delete(ctx, state.SnapVMStateKey(t.DeploymentID)); err != nil {
-			l.log.Warn("imaged: gc remove snap vmstate", "deployment", t.DeploymentID, "err", err)
+		if err := be.Delete(ctx, memKey); err != nil {
+			l.log.Warn("imaged: gc remove snap mem", "deployment", t.DeploymentID, "tier", t.Tier, "err", err)
+		}
+		if err := be.Delete(ctx, vmstateKey); err != nil {
+			l.log.Warn("imaged: gc remove snap vmstate", "deployment", t.DeploymentID, "tier", t.Tier, "err", err)
 		}
 		// Per-app ext4 (drive1) — derive the key the same way buildImageLayer
 		// writes it. B1.1 (issue #195): AppSlug is now on SnapshotForGC;

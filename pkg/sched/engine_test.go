@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/sched/recentload"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -3289,7 +3290,7 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
 	// Free plan returns the init row even though a warm row exists.
-	snap, ok := e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanFree))
+	snap, ok, tier := e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanFree))
 	if !ok {
 		t.Fatal("PlanFree: usableSnapshotForWake returned no snap")
 	}
@@ -3299,9 +3300,12 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 	if snap.StorageKey != state.SnapMemKey(dep.ID) {
 		t.Errorf("Free plan: storage_key = %q, want %q", snap.StorageKey, state.SnapMemKey(dep.ID))
 	}
+	if tier != "init" {
+		t.Errorf("Free plan: chosen tier = %q, want init", tier)
+	}
 
 	// Pro plan returns the warm row (warm > init on tie).
-	snap, ok = e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanPro))
+	snap, ok, tier = e.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanPro))
 	if !ok {
 		t.Fatal("PlanPro: usableSnapshotForWake returned no snap")
 	}
@@ -3311,4 +3315,110 @@ func TestUsableSnapshotForWake_PlanGate(t *testing.T) {
 	if snap.StorageKey != state.WarmSnapMemKey(dep.ID) {
 		t.Errorf("Pro plan: storage_key = %q, want %q", snap.StorageKey, state.WarmSnapMemKey(dep.ID))
 	}
+	if tier != "warm" {
+		t.Errorf("Pro plan: chosen tier = %q, want warm", tier)
+	}
 }
+
+// TestCaptureWarmSnapshot_EmitsAuditPromoted (issue #470 / PR C /
+// ADR-074) pins the success-path audit emit from captureWarmSnapshot
+// Locked. The audit kind is app.warm_snapshot_promoted (subject =
+// &app.AccountID, payload includes app_id, deployment_id, tier
+// and the per-app min_requests/min_ms gates). Walks ListEvents
+// keyed by AccountID UUID — the subject shape mirrors
+// app.updated's account-scoped listing per ADR-074 §3.2.
+func TestCaptureWarmSnapshot_EmitsAuditPromoted(t *testing.T) {
+	store := state.NewMemStore()
+	acct, app, dep := seedApp(t, store, api.PlanPro, 256, 5)
+	enableWarmSnapshot(t, store, app.ID)
+
+	vmm := &fakeVMM{}
+	notif := &fakeNotifier{}
+	imaged := &mockImaged{store: store, fcVer: "1.10.0"}
+	e := newEngine(t, store, vmm, notif, "1.10.0")
+	e.WithAudit(audit.New(store, testLog(), nil, "schedd"))
+
+	insID := primeRunPlusFrameworkReady(t, store, vmm, notif, e, app.ID, dep.ID)
+	if err := e.Park(context.Background(), insID); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+	imaged.Drain(notif)
+
+	events, err := store.ListEvents(context.Background(), acct.ID, 100)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var promoted *state.Event
+	for i := range events {
+		if events[i].Kind == "app.warm_snapshot_promoted" {
+			promoted = &events[i]
+			break
+		}
+	}
+	if promoted == nil {
+		t.Fatalf("no app.warm_snapshot_promoted audit row; got events: %+v", events)
+	}
+	if promoted.Actor != "schedd" {
+		t.Errorf("actor = %q, want schedd", promoted.Actor)
+	}
+	if promoted.Subject == nil {
+		t.Fatal("Subject = nil, want &app.AccountID")
+	}
+	if *promoted.Subject != uuid.MustParse(acct.ID) {
+		t.Errorf("subject = %s, want %s (account id)", *promoted.Subject, acct.ID)
+	}
+	// Data is JSON-marshalled — decode and pin the payload shape.
+	var payload map[string]any
+	if err := json.Unmarshal(promoted.Data, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["app_id"] != app.ID {
+		t.Errorf("payload.app_id = %v, want %s", payload["app_id"], app.ID)
+	}
+	if payload["deployment_id"] != dep.ID {
+		t.Errorf("payload.deployment_id = %v, want %s", payload["deployment_id"], dep.ID)
+	}
+	if payload["tier"] != state.SnapshotTierWarm {
+		t.Errorf("payload.tier = %v, want warm", payload["tier"])
+	}
+}
+
+// TestCaptureWarmSnapshot_EmitsErrorCounter (issue #470 / PR C /
+// ADR-074) pins the failure-path ops counter increment. Mirrors the
+// TestCaptureWarmSnapshot_FailureDestroysVM shape but asserts on
+// /metrics rather than audit-events — the failure path cannot
+// reliably emit app.warm_snapshot_disabled (the app is still
+// opted in), only the operator-facing vmm_call counter.
+func TestCaptureWarmSnapshot_EmitsErrorCounter(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 256, 5)
+	enableWarmSnapshot(t, store, app.ID)
+
+	vmm := &fakeVMM{}
+	notif := &fakeNotifier{}
+	e := newEngine(t, store, vmm, notif, "1.10.0")
+	ops := wire.NewOpsMetrics("schedd")
+	e.WithOpsMetrics(ops)
+
+	insID := primeRunPlusFrameworkReady(t, store, vmm, notif, e, app.ID, dep.ID)
+	// Wire the warm-failure path AFTER Prime so the init pause
+	// succeeds; only the warm /snapshot/create blows up.
+	vmm.warmSnapErr = errWarmCaptureFail
+	parkErr := e.Park(context.Background(), insID) // expected to fail-clean
+	if parkErr == nil {
+		t.Fatal("Park: expected warm-capture error, got nil")
+	}
+	_ = dep
+
+	body := getMetricsBody(t, ops)
+	wantLine := `schedd_warm_snapshot_errors_total{reason="vmm_call"} 1`
+	if !strings.Contains(body, wantLine) {
+		t.Errorf("missing metric %q in:\n%s", wantLine, body)
+	}
+}
+
+// errWarmCaptureFail is a sentinel for the fakeVMM warm-snapshot
+// failure path. Pinned here for C.4 tests; production cannot
+// reach it (captureWarmSnapshotLocked's WarmSnapshot returns the
+// real gRPC error).
+var errWarmCaptureFail = errors.New("fake: warm snapshot fail")

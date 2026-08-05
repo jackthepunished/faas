@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // safeLim mirrors the limits the production scan path uses when no plan
@@ -97,9 +99,7 @@ func TestExtractTarGz_RejectsEscapeAndAbsolute(t *testing.T) {
 			t.Fatalf("write tar: %v", err)
 		}
 		_, prob := extractTarGzToDir(path, extractTestSafeLim)
-		if prob == nil {
-			t.Fatal("expected rejection on '../' escape, got nil")
-		}
+		prob = mustExtractProblem(t, prob, "expected rejection on '../' escape, got nil")
 		if !strings.Contains(prob.Detail, "absolute paths or '..' entries are rejected") {
 			t.Errorf("detail %q does not mention escapesArchiveRoot predicate", prob.Detail)
 		}
@@ -151,4 +151,17 @@ func TestPathStaysUnder(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mustExtractProblem is the SA5011 escape hatch for the rejection
+// tests: extractTarGzToDir can legitimately return (dir, nil) for a
+// clean tarball, but these tests want a real Problem to assert
+// against. A helper that t.Fatal()s and returns the value lets
+// staticcheck see the value is non-nil at the call site.
+func mustExtractProblem(t *testing.T, p *api.Problem, msg string) *api.Problem {
+	t.Helper()
+	if p == nil {
+		t.Fatal(msg)
+	}
+	return p
 }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
@@ -144,6 +145,13 @@ type Handler struct {
 	// PullLayers path, plus imaged_oci_pull_duration_seconds
 	// per-pull op{manifest,config,blob,above_base}.
 	ops *wire.OpsMetrics
+	// audit (issue #470 / PR C / ADR-074) is the imaged-side
+	// audit-log seam used to emit app.warm_snapshot_stale from the
+	// MarkFCSnapshotsStale path. Wired via WithAudit; nil opts
+	// out (unit-test parity with cmd/schedd/cmd/apid's audit
+	// seam). Subject shape = &app.AccountID for account-scoped
+	// audit listing per ADR-074 §3.2.
+	audit *audit.Auditor
 	// grypeRun is the supply-chain scan runner used at base-stage
 	// time to write the Grype scan sidecar (issue #299). Wired
 	// via WithGrypeRun; nil = default to a subprocess invocation
@@ -470,6 +478,17 @@ func (h *Handler) WithStorage(s storage.StorageBackend) *Handler {
 // ADR-030) and cmd/apid/server.go's WithOpsMetrics (this PR).
 func (h *Handler) WithOpsMetrics(ops *wire.OpsMetrics) *Handler {
 	h.ops = ops
+	return h
+}
+
+// WithAudit (issue #470 / PR C / ADR-074) attaches the daemon-
+// wide audit seam. cmd/imaged wires the same audit.New(store,
+// log, ops, "imaged") instance Loop uses. nil opts out (no row
+// written; pre-PR-C fixtures keep their existing behaviour).
+// Currently emits app.warm_snapshot_stale from
+// MarkFCSnapshotsStale.
+func (h *Handler) WithAudit(a *audit.Auditor) *Handler {
+	h.audit = a
 	return h
 }
 
@@ -2240,13 +2259,102 @@ func (h *Handler) updateBuildProvenanceSBOM(ctx context.Context, deploymentID, s
 // startup (cmd/imaged/main.go wires it) and never on a timer — a Firecracker
 // upgrade requires the operator to restart imaged, which matches the
 // "snapshots are cache, not truth" framing (ADR-005). Idempotent.
+//
+// Issue #470 / PR C / ADR-074: when n > 0, walk the just-marked-stale
+// rows and emit app.warm_snapshot_stale per affected app. The kind
+// joins with schedd's app.warm_snapshot_promoted and apid's
+// app.warm_snapshot_disabled to give operators a single-grep
+// lifecycle audit trail. Subject = &app.AccountID per ADR-074 §3.2.
+// The walk is best-effort: an audit-write failure here is logged
+// and does NOT roll back the mark-stale (the FC-version truth is
+// what matters; the audit row is observer signal only).
 func (h *Handler) MarkFCSnapshotsStale(ctx context.Context, fcVersion string) (int64, error) {
 	if fcVersion == "" {
 		return 0, errors.New("imaged: MarkFCSnapshotsStale: empty fc version")
+	}
+	// Snapshot per-app non-stale row counts BEFORE the sweep so
+	// emitWarmSnapshotStale can compute per-app "rows flipped" for
+	// each emit. ListSnapshotsForGC filters stale=false; after the
+	// sweep the same query returns only survivors.
+	beforeByApp, err := h.snapshotNonStaleByApp(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("imaged: mark stale by fc: pre-sweep list: %w", err)
 	}
 	n, err := h.store.MarkAllSnapshotsStaleByFCVersion(ctx, fcVersion)
 	if err != nil {
 		return 0, fmt.Errorf("imaged: mark stale by fc: %w", err)
 	}
+	if n > 0 && h.audit != nil {
+		afterByApp, listErr := h.snapshotNonStaleByApp(ctx)
+		if listErr != nil {
+			// Best-effort: log the list failure and still return
+			// n to the caller (the mark-stale itself succeeded).
+			h.log.Warn("imaged: warm_snapshot_stale post-sweep list",
+				"err", listErr)
+		} else {
+			h.emitWarmSnapshotStale(ctx, fcVersion, beforeByApp, afterByApp)
+		}
+	}
 	return n, nil
+}
+
+// snapshotNonStaleByApp returns the {appID: count} of non-stale
+// rows currently in ListSnapshotsForGC. Used to compute per-app
+// delta for the warm_snapshot_stale audit emit. Empty apps are
+// omitted from the map.
+func (h *Handler) snapshotNonStaleByApp(ctx context.Context) (map[string]int64, error) {
+	rows, err := h.store.ListSnapshotsForGC(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(rows))
+	for _, r := range rows {
+		if r.AppID == "" {
+			continue
+		}
+		out[r.AppID]++
+	}
+	return out, nil
+}
+
+// emitWarmSnapshotStale (issue #470 / PR C / ADR-074) emits one
+// app.warm_snapshot_stale audit row per app that had at least
+// one snapshot row transition to stale during the FC-version
+// sweep. stale_count is the per-app count of rows that flipped
+// (NOT the fleet total — operators reading the audit row expect
+// the value to be scoped to the app_id subject).
+//
+// Caveat (ADR-074 §3.2): apps whose ENTIRE fleet went stale in
+// this sweep emit no row because ListSnapshotsForGC filters
+// stale=false. Those apps surface through the fleet-level
+// warm_snapshot_write_failures counter, not per-app audit.
+// Best-effort: an audit-write failure is logged and does NOT
+// roll back the mark-stale (ADR-005 says FC version is the
+// source of truth; the audit row is observer signal only).
+func (h *Handler) emitWarmSnapshotStale(ctx context.Context, fcVersion string, beforeByApp map[string]int64, afterByApp map[string]int64) {
+	for appID, before := range beforeByApp {
+		after, ok := afterByApp[appID]
+		if !ok {
+			// No surviving non-stale rows → all of this app's
+			// rows went stale. The fleet-level counter is the
+			// only signal; per-app audit omitted (caveat).
+			continue
+		}
+		staleThisApp := before - after
+		if staleThisApp <= 0 {
+			continue
+		}
+		app, err := h.store.AppByID(ctx, appID)
+		if err != nil {
+			h.log.Warn("imaged: warm_snapshot_stale app load",
+				"app", appID, "err", err)
+			continue
+		}
+		h.audit.Emit(ctx, "app.warm_snapshot_stale", &app.AccountID, map[string]any{
+			"app_id":      app.ID,
+			"slug":        app.Slug,
+			"fc_version":  fcVersion,
+			"stale_count": staleThisApp,
+		})
+	}
 }
