@@ -1,4 +1,4 @@
--- filename: 00136_deployments_scan_result.sql
+-- filename: 00139_deployments_scan_result.sql
 -- +goose Up
 -- +goose StatementBegin
 
