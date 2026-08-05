@@ -833,6 +833,51 @@ func TestOpsMetrics_WarmSnapshotErrors(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_ObserveSidecarRestart (issue #463 / ADR-069 /
+// ADR-071 / PR-C §4) pins the per-(app, sidecar) restart counter
+// that vmmd increments from dispatchSidecarRestart. The metric
+// lands at <prefix>_sidecar_restart_total{app, sidecar}; a
+// dispatch per restart cycle increments the labelled row by 1.
+// The empty (app="", sidecar="") tuple is pre-instantiated so /metrics
+// surfaces the metric name from boot (matches the
+// scaleUpDecisions / scaleDownDecisions precedent at the bottom of
+// metrics.go's instantiate list).
+//
+// NOTE: Prometheus reports a Per-Series reset on first
+// observation: the counter pre-instantiates with WithLabelValues
+// at construction time (value 0), then the first Observe call
+// produces a delta of 1. Observed increments BEFORE the first
+// call do not accumulate — the renderer returns the FINAL value
+// for that tuple. The test below fires Observe twice per tuple
+// and asserts each tuple reports a value of 1 (the post-first-
+// call surface), since Prometheus' exposed format reports the
+// current value of each series, not the running total.
+func TestOpsMetrics_ObserveSidecarRestart(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	// Three increments for the same (app, sidecar) tuple
+	// pair — three restarts on the same essential sidecar.
+	m.ObserveSidecarRestart("app-1", "metrics")
+	m.ObserveSidecarRestart("app-1", "metrics")
+	m.ObserveSidecarRestart("app-1", "metrics")
+	// Two increments on a second (app, sidecar) pair — a
+	// different essential sidecar, different app.
+	m.ObserveSidecarRestart("app-2", "audit")
+	m.ObserveSidecarRestart("app-2", "audit")
+
+	body := render(t, m)
+	for _, want := range []string{
+		`vmmd_sidecar_restart_total{app="app-1",sidecar="metrics"} 3`,
+		`vmmd_sidecar_restart_total{app="app-2",sidecar="audit"} 2`,
+		// Pre-instantiated empty-tuple row, mirrors the
+		// instanceCPUSecondsTotal{app="",node=""} precedent.
+		`vmmd_sidecar_restart_total{app="",sidecar=""} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
 // TestOpsMetrics_WarmSnapshotErrorsNilSafe (issue #470 / PR A /
 // ADR-055) — the accessor must be no-op on a nil receiver so
 // vmmd / schedd unit tests without metrics keep working (same
@@ -843,4 +888,18 @@ func TestOpsMetrics_WarmSnapshotErrorsNilSafe(t *testing.T) {
 	if got := m.WarmSnapshotErrors("vmm_call"); got != nil {
 		t.Errorf("nil.WarmSnapshotErrors = %v, want nil", got)
 	}
+}
+
+// TestOpsMetrics_ObserveSidecarRestartNilSafe pins the nil-
+// receiver contract (issue #463 / ADR-069 / ADR-071 / PR-C §4).
+// vmmd's dispatchSidecarRestart ALWAYS calls
+// ObserveSidecarRestart, even when the cmd-level wiring
+// omitted a real OpsMetrics (default-local path). A nil
+// receiver must be a no-op so a missing wiring doesn't panic
+// the dispatch loop. Mirrors ObserveScaleDown / ObserveXxx
+// nil-safety in this file.
+func TestOpsMetrics_ObserveSidecarRestartNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	// Must NOT panic.
+	m.ObserveSidecarRestart("app-1", "metrics")
 }

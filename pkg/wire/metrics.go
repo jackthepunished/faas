@@ -468,6 +468,21 @@ type OpsMetrics struct {
 	// intentionally prefers partial snapshots to aborting on a
 	// single bad node.
 	instanceStatsPartialErrors *prometheus.CounterVec
+	// sidecarRestartTotal (issue #463 / ADR-069 / ADR-071 / PR-C
+	// §4): per-(app, sidecar) restart-counter. Sidecar
+	// supervisors (guest/init::Supervisor.OnCrash) fire this
+	// whenever an essential sidecar crash restarts; the host
+	// (cmd/vmmd::dispatchSidecarRestart) increments the
+	// CounterVec via ObserveSidecarRestart. Cardinality is
+	// bounded by apps × SidecarCapMax (max 2) so a worst-case
+	// Scale plan with 100 apps × 2 sidecars = 200 series, well
+	// under Prometheus' "tens of thousands of series per
+	// metric" guideline. The counter is pre-instantiated with
+	// the empty (app, sidecar) tuple so /metrics surfaces zero
+	// at boot; the sidecar_label set is the bounded
+	// {__unknown__, <custom name>} admission per the
+	// accountLabelSet precedent at the bottom of this file.
+	sidecarRestartTotal *prometheus.CounterVec
 	// scaleUpDecisions: per-app scale-up trigger decisions (issue #169 /
 	// #172). Counter labelled by app_id and outcome ∈ {admit,
 	// reject_at_cap, no_signal}. App cardinality is bounded
@@ -1080,6 +1095,22 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_instance_stats_partial_errors_total",
 		Help: "Per-node dial/decode failures during an instancestats poller Tick (issue #170 / PR-A). The poller logs and continues on partial failures; a non-zero rate points at a sick node.",
 	}, []string{"node"})
+	// Issue #463 / ADR-069 / ADR-071 / PR-C §4: per-(app,
+	// sidecar) restart-counter. vmmd increments this on every
+	// dispatchSidecarRestart; schedd is the canonical writer
+	// of the corresponding events table row (SidecarRestart).
+	// The metric is exposed from BOTH daemons so a host-side
+	// observation doesn't depend on a schedd restart. The
+	// metric name ships as `<prefix>_sidecar_restart_total`
+	// (vmmd → "vmmd_sidecar_restart_total"; schedd likewise);
+	// the dashboard sums the two via `sum(rate(...))` so the
+	// daemon-owned increment is invisible to operators. See
+	// ADR-071 for the cardinality bound (apps × SidecarCapMax
+	// ≤ 200 worst-case).
+	sidecarRestartTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_sidecar_restart_total",
+		Help: "Count of sidecar restart cycles, per (app, sidecar) — incremented by vmmd's dispatchSidecarRestart (PR-C §4) on every guest-init Supervisor.OnCrash event for an essential sidecar. Bounded by apps × SidecarCapMax (issue #463 / ADR-069 cap = 2).",
+	}, []string{"app", "sidecar"})
 	// Issue #279 (PR-B, CPU-hour visibility): cumulative
 	// CPU-seconds per (app, node), sourced from the vmmd
 	// cpu_seconds wire field. Sum rollup (cumulative work,
@@ -1321,6 +1352,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		imagedOCIPull, instanceCPUPct, instanceRSSMB, instanceInflightReqs,
 		instanceCPUSecondsTotal,
 		instanceStatsCollectDur, instanceStatsPartialErrors,
+		sidecarRestartTotal,
 		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
 		egressDeny,
 		failedLoginTotal, failedLoginDropped,
@@ -1694,6 +1726,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// outcome rows above. Real per-(app, node) rows are added by
 	// the rollup in ReplaceInstanceStats.
 	instanceCPUSecondsTotal.WithLabelValues("", "")
+	// PR-C §4 (issue #463 / ADR-069 / ADR-071): pre-instantiate
+	// the empty (app, sidecar) row so the help/TYPE surfaces in
+	// /metrics from boot. Real per-(app, sidecar) rows are added
+	// by vmmd's dispatchSidecarRestart via ObserveSidecarRestart.
+	// The empty tuple (bound default: unknown unknown) is the
+	// overflow bucket operators inspect when an unlabeled sidecar
+	// leaks through (should never happen — guest-init always
+	// stamps the sidecar's name).
+	sidecarRestartTotal.WithLabelValues("", "")
 	// issue #301 (ADR-043, per-plan CPU fairness observability):
 	// pre-instantiate the ("other", "other") overflow row so the
 	// dashboard panel selector {app_id!="other"} never sees "no
@@ -1752,6 +1793,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceCPUSecondsTotal:            instanceCPUSecondsTotal,
 		instanceStatsCollectDur:            instanceStatsCollectDur,
 		instanceStatsPartialErrors:         instanceStatsPartialErrors,
+		sidecarRestartTotal:                sidecarRestartTotal,
 		cpuStatsCollectDur:                 cpuStatsCollectDurLocal,
 		scaleUpDecisions:                   scaleUpDecisions,
 		scaleDownDecisions:                 scaleDownDecisions,
@@ -3053,6 +3095,21 @@ func (m *OpsMetrics) IncFloorInstanceAdmitted() {
 		return
 	}
 	m.floorInstancesAdmitted.Inc()
+}
+
+// ObserveSidecarRestart records one sidecar restart cycle
+// (issue #463 / ADR-069 / ADR-071 / PR-C §4). vmmd's
+// dispatchSidecarRestart calls this on every guest-init
+// Supervisor.OnCrash event for an essential sidecar; the
+// counter lands in <daemon>_sidecar_restart_total. Bounded
+// cardinality (apps × SidecarCapMax ≤ 200 worst-case, see
+// ADR-071). Safe on a nil receiver so a vmmd run without
+// metrics keeps working (default-local path).
+func (m *OpsMetrics) ObserveSidecarRestart(app, sidecar string) {
+	if m == nil {
+		return
+	}
+	m.sidecarRestartTotal.WithLabelValues(app, sidecar).Inc()
 }
 
 // ObserveScaleUpAdmitRPS records the per-instance RPS at the moment

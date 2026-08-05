@@ -523,12 +523,23 @@ func (e DeployFailed) Payload() map[string]any {
 // the deploy with failure_class: user_error (AC #1). DurationMs is
 // the wall-clock from supervisor.Run start to terminal exit so
 // operators can see init-side init latency in the wake timeline.
-// WakeID + AppID + InstanceID join back to the canonical
-// schedd-emitted rows so the sidecar's lifecycle is visible in
-// the same timeline as the main wake.
+// AppID + InstanceID join back to the canonical schedd-emitted
+// rows so the sidecar's lifecycle is visible in the same timeline
+// as the main wake.
+//
+// WakeID is intentionally empty on this event class: the sidecar
+// lifecycle is asynchronous to any single schedd-issued wake
+// (init runs once per cold boot; restarts can outlive a wake).
+// The schedd's wakeID is not on the AF_VSOCK DGRAM wire and
+// guest-init has no other source for it. Downstream consumers
+// that need wake-correlation should join on
+// (app_id, instance_id, emit_at) instead. Surfacing a wakeID
+// here would require either an extra envelope byte the
+// orchestrator can't fill or a second-order lookup on the host
+// — neither is justified by today's audit needs.
 type SidecarInitExit struct {
 	EmitAt      time.Time
-	WakeID      string
+	WakeID      string // always "" today; see struct doc
 	AppID       string
 	InstanceID  string
 	SidecarName string
@@ -562,9 +573,13 @@ func (e SidecarInitExit) Payload() map[string]any {
 // (MaxRestarts). PreviousExitCode carries the run's exit code so
 // operators can distinguish OOM (137) from user_error (1) from
 // signal-driven exit (-1).
+//
+// WakeID is intentionally empty on this event class — see
+// SidecarInitExit's struct doc for the same rationale
+// (asynchronous to any single wake, not on the DGRAM wire).
 type SidecarRestart struct {
 	EmitAt           time.Time
-	WakeID           string
+	WakeID           string // always "" today; see struct doc
 	AppID            string
 	InstanceID       string
 	SidecarName      string

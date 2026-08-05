@@ -24,10 +24,18 @@ import (
 // defer recv.Close() compiles on every platform. fd is an
 // atomic.Int32 to mirror the linux type exactly (CRIT-related
 // review feedback on PR #470-FU-B).
+//
+// emitter (issue #463 / ADR-069 / ADR-071 / PR-C) mirrors the
+// linux field so the always-compiled
+// (r).WithSidecarEmitter method (sidecar_events_wire.go) can
+// dereference it on every build. The dispatch in
+// framework_ready_recv.go is linux-only; on non-linux the
+// emitter is set but never consumed.
 type FrameworkReadyReceiver struct {
-	fd  atomic.Int32
-	log *slog.Logger
-	mgr *fcvm.Manager
+	fd      atomic.Int32
+	log     *slog.Logger
+	mgr     *fcvm.Manager
+	emitter SidecarEventEmitter
 }
 
 // Close is a no-op on non-linux platforms.
@@ -36,6 +44,7 @@ func (r *FrameworkReadyReceiver) Close() {
 		_ = r.fd.Load()
 		_ = r.log
 		_ = r.mgr
+		_ = r.emitter
 	}
 }
 

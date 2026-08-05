@@ -39,6 +39,31 @@ type App struct {
 	// apps.node_id was added by migration 00090. Tests that
 	// don't exercise the per-schedd routing path leave it zero.
 	NodeID string
+	// Sidecars (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
+	// the per-deployment sidecar roster mirrored on the app
+	// for the public listener's routing-key split
+	// (<host>--<sidecar>.<suffix>). Empty for a deployment
+	// with no sidecars (the typical pre-PR-B install).
+	// Sourced from the apps row's deployments join at
+	// ResolveHost time; stale at most for the route-cache
+	// TTL (60s, downstream). The per-port forwarder
+	// (Target.Port) uses these to resolve the sidecar port
+	// that the public listener forwards to. Mirroring on
+	// the App struct keeps the hot path allocation-free
+	// after first sight.
+	Sidecars []AppSidecar
+}
+
+// AppSidecar (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
+// the narrow subset of pkg/api.SidecarSpec the public
+// listener's routing-key split uses. The full spec lives
+// in pkg/api (the wire-shape that imaged writes at build
+// time); the gateway only needs Name + Port to drive the
+// `<host>--<name>` → `port` resolution. Keeping the type
+// gateway-local avoids a pkg/api ↔ pkg/gateway cycle.
+type AppSidecar struct {
+	Name string
+	Port int
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue
@@ -568,25 +593,69 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	host := hostname(r.Host)
 
+	// Issue #463 / ADR-069 / ADR-071 / PR-C §5: split the
+	// routing-key hostname into (appHost, sidecarName) via
+	// the `--` separator. The appsSuffix strips first so
+	// the `--` search bounds itself to the bare
+	// app+selector; appHost is the segment back-left of
+	// `--` (re-suffixed), sidecarName is the segment
+	// back-right. A sidecarName="" branch is the legacy
+	// single-app routing — main workload's port. The split
+	// runs BEFORE the appsSuffix check so the suffix gate
+	// sees the appHost (the inner host), not the full
+	// selector hostname.
+	appHost, sidecarName := SplitHostSelectorWithSuffix(host, h.appsSuffix)
 	// Host allowlist suffix check (spec §4.1: *.apps.gregale.dev). Closes the
 	// door on stale DNS records that land on the edge post-TLS by rejecting
 	// anything not matching the configured suffix before the cache is touched.
 	// Set via NewHandlerWithSuffix or WithAppsSuffix; empty suffix disables
 	// the check (the Backend.Lookup table is still authoritative).
-	if h.appsSuffix != "" && !strings.HasSuffix(host, h.appsSuffix) {
+	if h.appsSuffix != "" && !strings.HasSuffix(appHost, h.appsSuffix) {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound,
 			api.CodeNotFound, "No such app",
-			fmt.Sprintf("host %q does not match the configured apps suffix", host)))
+			fmt.Sprintf("host %q does not match the configured apps suffix", appHost)))
 		h.observe(r, rec.status, "", "", false, Target{})
 		return
 	}
 
-	app, ok := h.backend.Lookup(r.Context(), host) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+	app, ok := h.backend.Lookup(r.Context(), appHost) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
 	if !ok {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
-			"No such app", fmt.Sprintf("no app is routed to %q", host)))
+			"No such app", fmt.Sprintf("no app is routed to %q", appHost)))
 		h.observe(r, rec.status, "", "", false, Target{})
 		return
+	}
+
+	// Issue #463 / ADR-069 / ADR-071 / PR-C §5: resolve the
+	// sidecar port when sidecarName != "". A sidecarName
+	// that doesn't match the deployment's sidecar roster
+	// is a 404 — the customer-facing URL `host--sidecar`
+	// only succeeds if the deployment actually declares
+	// that sidecar. The port is stored on a local variable
+	// so the picker's Target.Port assignment later in this
+	// handler sees the sidecar override instead of the
+	// main app's port.
+	if sidecarName != "" {
+		port, sidecarOK := SidecarSelectorForApp(app, sidecarName)
+		if !sidecarOK {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound,
+				api.CodeNotFound, "No such sidecar",
+				fmt.Sprintf("app %q has no sidecar named %q", app.ID, sidecarName)))
+			h.observe(r, rec.status, app.ID, "", false, Target{})
+			return
+		}
+		// Pin the target-port override on the request's
+		// logical port. The forwarder reads Target.Port to
+		// populate ForwardHTTPRequestInit.Port (PR-B); the
+		// picker uses per-port forwarders when present.
+		// We can't override Target.Port on the per-target
+		// cursor (Target.Port is per-instance and the
+		// sidecar-port override applies to ALL instances
+		// of the same deployment), so the forwarder
+		// reads the sidecar-port override from the
+		// request context via a sentinel added below.
+		_ = port
+		r = withSidecarPort(r, port)
 	}
 
 	// Issue #273 / ADR-042 — pre-instantiate the closed (class) set

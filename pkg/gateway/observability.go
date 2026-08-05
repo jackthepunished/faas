@@ -23,6 +23,51 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, requestIDKey{}, id)
 }
 
+// sidecarPortKey (issue #463 / ADR-069 / ADR-071 / PR-C §5)
+// is the context key used to thread a per-request sidecar
+// port override through the gateway handler to the
+// forwarder. The handler stamps the override after
+// SplitHostSelector / SidecarSelectorForApp; the forwarder
+// reads it (via SidecarPortFrom) and prefers it over
+// Target.Port when set. 0 = no override, meaning the
+// forwarder falls back to Target.Port (the main workload's
+// port) — same value as the request not mentioning a
+// sidecar at all.
+type sidecarPortKey struct{}
+
+// WithSidecarPort stamps port on r's context. port=0 is a
+// no-op so callers can short-circuit the unset case.
+func WithSidecarPort(ctx context.Context, port int) context.Context {
+	if port == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, sidecarPortKey{}, port)
+}
+
+// withSidecarPort is the *http.Request convenience wrapper
+// for WithSidecarPort — matches the WithRequestID pattern
+// in this file's surrounding code.
+func withSidecarPort(r *http.Request, port int) *http.Request {
+	if r == nil || port == 0 {
+		return r
+	}
+	return r.WithContext(WithSidecarPort(r.Context(), port))
+}
+
+// SidecarPortFrom returns the sidecar port override on r's
+// context, or 0 if none. The forwarder reads this on every
+// request — the lookup is O(1) (Go's context.Value walks
+// a small slice of typed keys, no map allocation).
+func SidecarPortFrom(r *http.Request) int {
+	if r == nil {
+		return 0
+	}
+	if v, ok := r.Context().Value(sidecarPortKey{}).(int); ok {
+		return v
+	}
+	return 0
+}
+
 // requestIDFrom returns the request id from the request's context, falling
 // back to the x-faas-request-id response header the response side set, and
 // finally to a fresh uuid hex if neither is present.

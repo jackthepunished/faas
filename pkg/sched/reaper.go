@@ -22,11 +22,21 @@ const MinInstanceAge = 30 * time.Second
 
 // InstanceInfo is the snapshot schedd hands the selectors for one instance.
 type InstanceInfo struct {
-	Instance     string
-	AppID        string
-	Plan         api.Plan
-	State        state.State
-	RAMMB        int
+	Instance string
+	AppID    string
+	Plan     api.Plan
+	State    state.State
+	RAMMB    int
+	// SidecarMBs (issue #463 / ADR-070 / PR-C) is the per-sidecar
+	// RAM slice sourced from the deployment's `sidecars jsonb`
+	// column at reaper time. Empty/nil means "no sidecars" and
+	// admissionMB() collapses to the legacy single-arg helper.
+	// The reaper only consults admissionMB() via ReapIdle and
+	// SelectEvictions; today neither path is RAM-cumulative (the
+	// reaper doesn't pin a ledger), but the field is here so a
+	// future per-node slice can route through the same arithmetic
+	// without re-reading the deployment row.
+	SidecarMBs   []int
 	LastRequest  time.Time
 	Started      time.Time
 	IdleTimeoutS int // app-configured; 0 => plan default
@@ -87,7 +97,9 @@ type InstanceInfo struct {
 	ScaleInCooldownS int
 }
 
-func (i InstanceInfo) admissionMB() int { return api.BillableRAMMB(i.RAMMB) }
+func (i InstanceInfo) admissionMB() int {
+	return api.BillableRAMMBWithSidecars(i.RAMMB, i.SidecarMBs)
+}
 
 // EffectiveIdleTimeoutS resolves an app's idle timeout: the plan default unless
 // the app configured one within bounds (floor 10 s, ceiling plan default × 2,

@@ -459,6 +459,89 @@ func TestForwardingReverseProxy_PortZeroDefaultsAtBoundary(t *testing.T) {
 	}
 }
 
+// TestForwardingReverseProxy_SidecarPortOverrideWins pins issue
+// #463 / ADR-069 / ADR-071 / PR-C §5: a per-request sidecar-port
+// override (stamped by the handler when the routing-key resolver
+// picks a sidecar) takes precedence over Target.Port. The handler
+// rides the override on the request context (SidecarPortFrom),
+// because the Target set is shared across all instances of a
+// deployment and the override is per-request, not per-target.
+// A regression that drops the override would silently route
+// /metrics traffic to the main workload's :8080 — the sidecar
+// Prometheus scrape would either hang or hit the wrong service.
+func TestForwardingReverseProxy_SidecarPortOverrideWins(t *testing.T) {
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+			}},
+		},
+	}
+	cli := &fakeVmmdClient{Stream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
+	// Target.Port is the main workload's port (8080); the
+	// handler's sidecar selector overrode it to 9100 via the
+	// request context below.
+	r = r.WithContext(gateway.WithSidecarPort(r.Context(), 9100))
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test", Port: 8080}).ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
+	}
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame")
+	}
+	if got := init.GetPort(); got != 9100 {
+		t.Errorf("ForwardHTTPRequestInit.port = %d, want 9100 (sidecar override beats Target.Port)", got)
+	}
+}
+
+// TestForwardingReverseProxy_NoSidecarOverrideFallsBackToTarget
+// pins the no-routing-key-sidecar branch: when the request has
+// no sidecar-port override on context, the forwarder uses
+// Target.Port verbatim. This is the legacy single-app path — the
+// PR-C §5 routing-key selector sets the override only when the
+// hostname carries a `<host>--<sidecar>` segment.
+func TestForwardingReverseProxy_NoSidecarOverrideFallsBackToTarget(t *testing.T) {
+	stream := &fakeBidiStream{
+		Responses: []*vmmdpb.ForwardHTTPStreamResponse{
+			{Frame: &vmmdpb.ForwardHTTPStreamResponse_Init{
+				Init: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+			}},
+		},
+	}
+	cli := &fakeVmmdClient{Stream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingReverseProxy(lookup, nil)
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("x-faas-stream", "true")
+	r.Header.Set("x-faas-instance", "i-test")
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test", Port: 9090}).ServeHTTP(rec, r)
+
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
+	}
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame")
+	}
+	if got := init.GetPort(); got != 9090 {
+		t.Errorf("ForwardHTTPRequestInit.port = %d, want 9090 (no override → Target.Port wins)", got)
+	}
+}
+
 func TestForwardingReverseProxy_UnknownNodeIs503(t *testing.T) {
 	stream := &fakeBidiStream{}
 	cli := &fakeVmmdClient{Stream: stream}

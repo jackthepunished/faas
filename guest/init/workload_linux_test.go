@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -102,7 +103,7 @@ func TestDiscoverRoster_MalformedFile(t *testing.T) {
 // deployments.sidecars jsonb column.
 func TestNewSupervisorFor_NonEssentialZeroRestarts(t *testing.T) {
 	spec := workloadSpec{Name: "metrics", Type: "sidecar", Essential: false, RamMB: 64}
-	sup := newSupervisorFor(spec, nil, nil, nil)
+	sup := newSupervisorFor(spec, nil, nil, nil, nil)
 	if sup == nil {
 		t.Fatal("newSupervisorFor returned nil")
 	}
@@ -125,7 +126,7 @@ func TestNewSupervisorFor_NonEssentialZeroRestarts(t *testing.T) {
 // crash-loop must NOT silently take down the deploy.
 func TestNewSupervisorFor_EssentialUsesMaxRestarts(t *testing.T) {
 	spec := workloadSpec{Name: "metrics", Type: "sidecar", Essential: true, RamMB: 64}
-	sup := newSupervisorFor(spec, nil, nil, nil)
+	sup := newSupervisorFor(spec, nil, nil, nil, nil)
 	if sup.Max != MaxRestarts {
 		t.Errorf("essential Max = %d, want %d", sup.Max, MaxRestarts)
 	}
@@ -193,7 +194,7 @@ func TestRunWorkloads_CapRejectsThreeSidecars(t *testing.T) {
 			{Name: "audit", Type: "sidecar", Essential: true},
 		},
 	}
-	err := runWorkloads(api.AppManifest{}, roster, nil, nil, nil)
+	err := runWorkloads(api.AppManifest{}, roster, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("runWorkloads with 3 sidecars: got nil, want cap rejection")
 	}
@@ -249,5 +250,84 @@ func TestRunWorkloads_PanicInSidecarIsRecovered(t *testing.T) {
 	}
 	if recovered != "synthetic sidecar panic" {
 		t.Errorf("sidecar panic: recovered = %v, want \"synthetic sidecar panic\"", recovered)
+	}
+}
+
+// TestResolveSidecarCommand (PR-C §6) pins the OCI image-spec
+// precedence for the customer-image override surface:
+//  1. Entrypoint non-empty → exec Entrypoint[0] with
+//     Entrypoint[1:] as argv[0:], Cmd appended as argv[N:].
+//  2. Entrypoint empty + Cmd non-empty → exec Cmd[0] with
+//     Cmd[1:] as argv[1:].
+//  3. Both empty → fall back to /usr/local/bin/start.sh (the
+//     PR-B baked entrypoint).
+//
+// A regression that flips the precedence (e.g. Cmd-wins-over-
+// Entrypoint) would silently override a Dockerfile's ENTRYPOINT
+// with a CMD, which is a documented surprise to the customer
+// and a deployment-time footgun. The test asserts the resolved
+// (argv0, argv) tuple exactly.
+func TestResolveSidecarCommand(t *testing.T) {
+	cases := []struct {
+		name      string
+		spec      workloadSpec
+		wantArgv0 string
+		wantArgv  []string
+	}{
+		{
+			name:      "no overrides → baked start.sh",
+			spec:      workloadSpec{Name: "metrics", Type: "sidecar"},
+			wantArgv0: "/usr/local/bin/start.sh",
+			wantArgv:  nil,
+		},
+		{
+			name: "cmd only",
+			spec: workloadSpec{
+				Name: "metrics", Type: "sidecar",
+				Cmd: []string{"/usr/local/bin/node-exporter", "--web.listen=:9100"},
+			},
+			wantArgv0: "/usr/local/bin/node-exporter",
+			wantArgv:  []string{"--web.listen=:9100"},
+		},
+		{
+			name: "entrypoint only",
+			spec: workloadSpec{
+				Name: "metrics", Type: "sidecar",
+				Entrypoint: []string{"/bin/sh", "-c"},
+			},
+			wantArgv0: "/bin/sh",
+			wantArgv:  []string{"-c"},
+		},
+		{
+			name: "entrypoint + cmd → entrypoint wins, cmd appended",
+			spec: workloadSpec{
+				Name: "metrics", Type: "sidecar",
+				Entrypoint: []string{"/bin/sh", "-c"},
+				Cmd:        []string{"exec node-exporter --web.listen=:9100"},
+			},
+			wantArgv0: "/bin/sh",
+			wantArgv:  []string{"-c", "exec node-exporter --web.listen=:9100"},
+		},
+		{
+			name: "empty entrypoint[0] is invalid — handled by exec, not us",
+			spec: workloadSpec{
+				Name: "metrics", Type: "sidecar",
+				Entrypoint: []string{""},
+				Cmd:        []string{"/bin/true"},
+			},
+			wantArgv0: "",
+			wantArgv:  []string{"/bin/true"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotArgv0, gotArgv := resolveSidecarCommand(c.spec)
+			if gotArgv0 != c.wantArgv0 {
+				t.Errorf("argv0 = %q, want %q", gotArgv0, c.wantArgv0)
+			}
+			if !reflect.DeepEqual(gotArgv, c.wantArgv) {
+				t.Errorf("argv = %v, want %v", gotArgv, c.wantArgv)
+			}
+		})
 	}
 }

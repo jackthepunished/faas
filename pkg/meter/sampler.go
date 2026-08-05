@@ -3,6 +3,7 @@ package meter
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -286,17 +287,43 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 		// so the floor is symmetric with the rows we just
 		// wrote — never over- nor under-counting.
 		liveCount := 0
+		// Issue #463 / ADR-070 / PR-C: pre-load sidecar MBs
+		// once per app (not once per instance) so a 100-instance
+		// fleet is 1 DB read per app, not 100. Missing keys
+		// (deployment_id empty / lookup failed) collapse to
+		// nil = no-sidecar admission form.
+		sidecarByDeploy := make(map[string][]int, len(ins))
+		for _, inst := range ins {
+			if inst.DeploymentID == "" {
+				continue
+			}
+			if _, seen := sidecarByDeploy[inst.DeploymentID]; seen {
+				continue
+			}
+			mbs, err := s.store.DeploymentSidecarRAMs(ctx, inst.DeploymentID)
+			if err != nil {
+				// Fail-closed: under-admit rather than over-admit.
+				// The sampler doesn't own a *slog.Logger today
+				// (matches the existing budget-tier floor's no-log
+				// shape), so the warning rides the slog default.
+				slog.Default().Warn("meter: deployment sidecar RAM lookup failed",
+					"deployment_id", inst.DeploymentID, "err", err)
+				continue
+			}
+			sidecarByDeploy[inst.DeploymentID] = mbs
+		}
 		for _, ins := range ins {
 			if !state.State(ins.State).CountsForRAM() {
 				continue
 			}
+			sidecarMBs := sidecarByDeploy[ins.DeploymentID]
 			row := RolledRow{
 				InstanceID:  ins.ID,
 				AppID:       app.ID,
 				AccountID:   app.AccountID,
 				Minute:      minute,
-				AdmissionMB: api.BillableRAMMB(ins.RAMMB),
-				MBSeconds:   MBSecondsPerMinute(api.BillableRAMMB(ins.RAMMB)),
+				AdmissionMB: api.BillableRAMMBWithSidecars(ins.RAMMB, sidecarMBs),
+				MBSeconds:   MBSecondsPerMinute(api.BillableRAMMBWithSidecars(ins.RAMMB, sidecarMBs)),
 			}
 			// Move 1 (event-driven packaging): set usage_minutes.requests
 			// to the count of invocations the drain drove through this

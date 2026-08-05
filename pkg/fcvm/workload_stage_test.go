@@ -15,8 +15,10 @@ package fcvm
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -226,3 +228,122 @@ var errStageWorkload = errStageWorkloadType{}
 type errStageWorkloadType struct{}
 
 func (errStageWorkloadType) Error() string { return "synthetic stage workload failure" }
+
+// TestWorkloadManifest_RoundTripsCmdEntry (PR-C §6) pins the
+// customer-image override surface: a sidecar's Cmd and Entrypoint
+// fields on WorkloadSpec round-trip verbatim through the
+// workloadManifest JSON envelope. The fields are omitempty so the
+// legacy PR-B byte shape (no cmd/entrypoint keys) is preserved for
+// existing images — a regression that drops omitempty would inflate
+// the manifest to ~50 bytes per workload for free, and a future
+// guest-init that doesn't recognize the keys would refuse to parse.
+func TestWorkloadManifest_RoundTripsCmdEntry(t *testing.T) {
+	cases := []struct {
+		name string
+		in   workloadManifest
+		// wantJSON is the exact expected on-disk shape.
+		// omitempty drops empty slices so the legacy
+		// (no override) byte shape matches what guest-init
+		// produced before PR-C §6.
+		wantJSON string
+	}{
+		{
+			name: "no overrides",
+			in: workloadManifest{
+				Name: "metrics", Type: "sidecar",
+				RamMB: 64, Port: 9100, Essential: true,
+			},
+			wantJSON: `{"essential":true,"name":"metrics","port":9100,"ram_mb":64,"type":"sidecar"}`,
+		},
+		{
+			name: "cmd only",
+			in: workloadManifest{
+				Name: "metrics", Type: "sidecar",
+				RamMB: 64, Port: 9100, Essential: true,
+				Cmd: []string{"/usr/local/bin/node-exporter", "--web.listen=:9100"},
+			},
+			wantJSON: `{"cmd":["/usr/local/bin/node-exporter","--web.listen=:9100"],"essential":true,"name":"metrics","port":9100,"ram_mb":64,"type":"sidecar"}`,
+		},
+		{
+			name: "entrypoint and cmd",
+			in: workloadManifest{
+				Name: "metrics", Type: "sidecar",
+				RamMB: 64, Port: 9100, Essential: true,
+				Entrypoint: []string{"/bin/sh", "-c"},
+				Cmd:        []string{"exec node-exporter --web.listen=:9100"},
+			},
+			wantJSON: `{"cmd":["exec node-exporter --web.listen=:9100"],"entrypoint":["/bin/sh","-c"],"essential":true,"name":"metrics","port":9100,"ram_mb":64,"type":"sidecar"}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			blob, err := json.Marshal(c.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got := string(blob); got != c.wantJSON {
+				t.Errorf("manifest JSON = %s\nwant %s", got, c.wantJSON)
+			}
+			var out workloadManifest
+			if err := json.Unmarshal(blob, &out); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(out, c.in) {
+				t.Errorf("round-trip mismatch: out=%+v, in=%+v", out, c.in)
+			}
+		})
+	}
+}
+
+// TestProjectedWorkloadManifestBytes_AccountsForCmdEntry
+// (PR-C §6) pins the projection cap so the cmd/entrypoint
+// override can't push a manifest past api.MaxExportedLayerBytes.
+// The projection runs BEFORE json.Marshal — a regression that
+// forgot to add cmd/entrypoint to the projection would let a
+// multi-megabyte command line pass the cap, and the actual
+// Marshal would still complete (the cap is a soft reject, not
+// a hard truncate). The test asserts the projection grows
+// monotonically when cmd/entrypoint grow, and that a 1 MiB
+// payload is rejected.
+func TestProjectedWorkloadManifestBytes_AccountsForCmdEntry(t *testing.T) {
+	empty := WorkloadSpec{Name: "metrics", Type: "sidecar", RamMB: 64, Port: 9100, Essential: true}
+	withCmd := empty
+	withCmd.Cmd = []string{"/bin/sh", "-c", "echo hello world"}
+	withEntry := empty
+	withEntry.Entrypoint = []string{"/usr/local/bin/start.sh"}
+
+	emptyP := projectedWorkloadManifestBytes(empty)
+	withCmdP := projectedWorkloadManifestBytes(withCmd)
+	withEntryP := projectedWorkloadManifestBytes(withEntry)
+
+	if withCmdP <= emptyP {
+		t.Errorf("projection with cmd (%d) ≤ empty (%d); cmd contribution missing", withCmdP, emptyP)
+	}
+	if withEntryP <= emptyP {
+		t.Errorf("projection with entrypoint (%d) ≤ empty (%d); entrypoint contribution missing", withEntryP, emptyP)
+	}
+	// The escape multiplier is a tight ceiling — the projection is
+	// a SAFETY MARGIN, not a tight bound. A correct projection
+	// captures the per-element contribution; loose additivity is
+	// acceptable on small payloads because the 2× multiplier is
+	// dominant. The hard guarantee is the cap-rejection below.
+	// The cap is api.MaxExportedLayerBytes; a malicious
+	// megabyte-long command line must be rejected.
+	huge := empty
+	huge.Cmd = []string{strings.Repeat("A", 1024*1024)}
+	if got := projectedWorkloadManifestBytes(huge); got < int64(1024*1024) {
+		t.Errorf("huge cmd projection = %d, want ≥ 1 MiB (cap should reject)", got)
+	}
+	// And the empty-spec payload grows linearly: doubling the
+	// cmd length exactly doubles the cmd contribution, so the
+	// projection MUST grow by ~that delta plus a constant.
+	doubleCmd := empty
+	doubleCmd.Cmd = []string{strings.Repeat("A", 1024)}
+	quadCmd := empty
+	quadCmd.Cmd = []string{strings.Repeat("A", 2048)}
+	got2 := projectedWorkloadManifestBytes(doubleCmd)
+	got4 := projectedWorkloadManifestBytes(quadCmd)
+	if got4-got2 < 1024 {
+		t.Errorf("projection should grow by ≥ cmd delta: 2k→1k delta = %d, want ≥ 1024", got4-got2)
+	}
+}

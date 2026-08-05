@@ -33,6 +33,13 @@ of `BillableRAMMBWithSidecars`, the new
 `schedd_sidecar_restart_total{app,sidecar}` Prometheus counter,
 and per-sidecar gateway portnorm.
 
+> **Note (PR-C 2026-08-04):** the counter is registered as
+> `vmmd_sidecar_restart_total` (vmmd hosts the canonical
+> `dispatchSidecarRestart` today); the `<daemon>_sidecar_restart_total`
+> shape is preserved so a future schedd-side producer can
+> host the same family under its own prefix. See ADR-072
+> §"Decisions 2".
+
 ## Scope (in / out)
 
 **In scope for PR-B:**
@@ -67,7 +74,8 @@ and per-sidecar gateway portnorm.
   `BillableRAMMBWithSidecars`. The helper lives in `pkg/api/limits.go`
   but PR-C is the first consumer.
 - The `schedd_sidecar_restart_total{app,sidecar}` Prometheus
-  counter.
+  counter. (Renamed to `vmmd_sidecar_restart_total` in PR-C
+  §4 — see ADR-072 §"Decisions 2".)
 - Per-sidecar gateway portnorm (today's gateway DNATs :8080 only).
 - Guest-init emit-side wiring for `WakeSidecarInitExit` /
   `WakeSidecarRestart`. The event types + read API ship in PR-B;

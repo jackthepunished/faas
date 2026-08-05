@@ -215,6 +215,16 @@ type InstanceStatsRow struct {
 	// Wire field awaits make proto regen (task A.3a follow-up);
 	// today the field stays at 0 end-to-end.
 	NetRxBytes uint64
+	// SidecarMBs (issue #463 / ADR-070 §Decision 6 / PR-C) is the
+	// per-sidecar RAM slice sourced from the deployment's
+	// `sidecars jsonb` column at Tick time. Empty/nil when the
+	// deployment has no sidecars — the meterd sampler collapses
+	// to the no-sidecar admission shutter via
+	// api.BillableRAMMBWithSidecars. Length is bounded by
+	// api.SidecarCapMax = 2. Mirrors the scheddpb field via the
+	// ListInstanceStats RPC; meterd reads this column from the
+	// Row to compute the per-minute mb_seconds.
+	SidecarMBs []int
 }
 
 // ListInstanceStats returns the per-instance CPU-µs snapshot the
@@ -228,9 +238,14 @@ func (c *Client) ListInstanceStats(ctx context.Context) ([]InstanceStatsRow, err
 	}
 	out := make([]InstanceStatsRow, 0, len(resp.GetRows()))
 	for _, r := range resp.GetRows() {
+		sidecarMBs := make([]int, 0, len(r.GetSidecarRamMbs()))
+		for _, v := range r.GetSidecarRamMbs() {
+			sidecarMBs = append(sidecarMBs, int(v))
+		}
 		out = append(out, InstanceStatsRow{
 			InstanceID:   r.GetInstanceId(),
 			AppID:        r.GetAppId(),
+			SidecarMBs:   sidecarMBs,
 			NodeID:       r.GetNodeId(),
 			CPUUsageUsec: r.GetCpuUsec(),
 			CPUValid:     r.GetCpuValid(),

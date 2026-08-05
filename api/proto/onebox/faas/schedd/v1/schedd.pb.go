@@ -677,8 +677,16 @@ type InstanceStatsRow struct {
 	// skip rows where tx_valid != 0. Addative field per
 	// ADR-016 wire discipline; only meterd's SampleAndRoll reads
 	// it (pkg/meter/sampler.go).
-	NetTxBytes    uint64 `protobuf:"varint,6,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
-	TxValid       uint32 `protobuf:"varint,7,opt,name=tx_valid,json=txValid,proto3" json:"tx_valid,omitempty"`
+	NetTxBytes uint64 `protobuf:"varint,6,opt,name=net_tx_bytes,json=netTxBytes,proto3" json:"net_tx_bytes,omitempty"`
+	TxValid    uint32 `protobuf:"varint,7,opt,name=tx_valid,json=txValid,proto3" json:"tx_valid,omitempty"`
+	// Issue #463 / ADR-070 §Decision 6 / PR-C: per-sidecar RAM
+	// slice sourced from the deployment's `sidecars jsonb` column
+	// at Admit time. Empty/nil when the deployment has no sidecars —
+	// the meterd sampler collapses to the no-sidecar admission
+	// shutter via api.BillableRAMMBWithSidecars. Wire discipline
+	// ADR-016 additive — new field at the end. Card ceiling:
+	// len(sidecar_ram_mbs) ≤ api.SidecarCapMax = 2.
+	SidecarRamMbs []int32 `protobuf:"varint,8,rep,packed,name=sidecar_ram_mbs,json=sidecarRamMbs,proto3" json:"sidecar_ram_mbs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -760,6 +768,13 @@ func (x *InstanceStatsRow) GetTxValid() uint32 {
 		return x.TxValid
 	}
 	return 0
+}
+
+func (x *InstanceStatsRow) GetSidecarRamMbs() []int32 {
+	if x != nil {
+		return x.SidecarRamMbs
+	}
+	return nil
 }
 
 type ListInstanceStatsRequest struct {
@@ -1449,7 +1464,7 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"instanceId\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"&\n" +
 	"\x14ParkInstanceResponse\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok\"\xd8\x01\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"\x80\x02\n" +
 	"\x10InstanceStatsRow\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x15\n" +
@@ -1459,7 +1474,8 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\tcpu_valid\x18\x05 \x01(\rR\bcpuValid\x12 \n" +
 	"\fnet_tx_bytes\x18\x06 \x01(\x04R\n" +
 	"netTxBytes\x12\x19\n" +
-	"\btx_valid\x18\a \x01(\rR\atxValid\"\x1a\n" +
+	"\btx_valid\x18\a \x01(\rR\atxValid\x12&\n" +
+	"\x0fsidecar_ram_mbs\x18\b \x03(\x05R\rsidecarRamMbs\"\x1a\n" +
 	"\x18ListInstanceStatsRequest\"X\n" +
 	"\x19ListInstanceStatsResponse\x12;\n" +
 	"\x04rows\x18\x01 \x03(\v2'.onebox.faas.schedd.v1.InstanceStatsRowR\x04rows\"\xb5\x01\n" +

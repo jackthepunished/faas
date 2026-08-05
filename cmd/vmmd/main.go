@@ -617,6 +617,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		recv = nil
 	}
 	if recv != nil {
+		// PR-C §3,§4 (issue #463 / ADR-069 / ADR-071):
+		// wire the sidecar events emitter onto the
+		// receiver. Production uses
+		// SidecarEventsThroughPlatform which bundles the
+		// canonical pkg/events.Platform (events.NewPlatform
+		// constructed up front by the cmd main loop), the
+		// OpsMetrics incrementer, and the audit-store
+		// shibboleth for init_failed (failure_class:
+		// user_error, AC #1). nil = no-op emitter so a
+		// receiver that came up but the wiring didn't (e.g.
+		// default-local run without a state.Store) keeps
+		// working without audit drift.
+		platform := events.NewPlatform("vmmd", store, log, ops, nil)
+		recv.WithSidecarEmitter(&SidecarEventsThroughPlatform{
+			Platform: platform,
+			Metrics:  ops,
+			Store:    store,
+			Log:      log,
+		})
 		defer recv.Close()
 	}
 	log.Info("vmmd ready", "fc_version", fcVersion, "max_slots", fcvm.MaxSlots,

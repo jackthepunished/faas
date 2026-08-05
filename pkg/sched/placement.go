@@ -82,9 +82,12 @@ type Placement struct {
 //     (the request's vCPU still has to fit, but a node with a
 //     non-zero budget is always accepted).
 //
-// The request's billable RAM is api.BillableRAMMB(r.RAMMB) — the +8 MB
-// overhead (spec §4.7) is part of the per-node headroom check, mirroring
-// the per-instance accounting the ledger enforces.
+// The request's billable RAM is api.BillableRAMMBWithSidecars(r.RAMMB,
+// r.SidecarMBs) — the +8 MB overhead (spec §4.7) is part of the
+// per-node headroom check, mirroring the per-instance accounting the
+// ledger enforces. Sidecar MBs add to the billable shutter (issue #463
+// / ADR-070 §Decision 6); a no-sidecar request collapses to the
+// legacy single-arg form (r.SidecarMBs nil/empty).
 //
 // Sticky-warm affinity (r.PreferredNodeID): when set and the preferred node
 // has headroom, return it directly. When set but the preferred node is
@@ -94,7 +97,7 @@ func ChoosePlacement(nodes []state.ComputeNode, usedMB map[string]int64, usedVCP
 	if r.RAMMB <= 0 {
 		return Placement{}, api.ErrCapacity(fmt.Sprintf("placement: request RAM must be positive (got %d)", r.RAMMB))
 	}
-	billable := int64(api.BillableRAMMB(r.RAMMB))
+	billable := int64(api.BillableRAMMBWithSidecars(r.RAMMB, r.SidecarMBs))
 
 	// First pass: filter to candidates that fit, capture the warm
 	// hint if it fits. We keep this single-pass because N is small

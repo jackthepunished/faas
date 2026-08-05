@@ -89,9 +89,19 @@ type Request struct {
 	// deployment id. Empty is the legacy single-box posture
 	// (test seams + pre-#557 reservations); the per-deployment
 	// concurrency counter is only incremented when this is non-empty.
-	DeploymentID   string
-	Plan           api.Plan
-	RAMMB          int // the app's ram_mb (already validated ≤ plan cap)
+	DeploymentID string
+	Plan         api.Plan
+	RAMMB        int // the app's ram_mb (already validated ≤ plan cap)
+	// SidecarMBs (issue #463 / ADR-070 §Decision 6 / PR-C) is the
+	// per-sidecar RAM slice sourced from the deployment's
+	// `sidecars jsonb` column at Admit time. Each entry adds to the
+	// billable shutter via `api.BillableRAMMBWithSidecars`; the cap
+	// enforcement (SidecarCapMax = 2) happens upstream in apid's
+	// Sidecar.Validate and the schema CHECK on migration 00118, so
+	// the ledger trusts len(SidecarMBs) ≤ 2 and never re-checks it.
+	// Nil or empty = legacy no-sidecar shape; BillableRAMMB
+	// (single-arg form) collapses to the same math in that case.
+	SidecarMBs     []int
 	VCPU           int // vcpus for this instance
 	MaxConcurrency int // the app's configured max (already validated ≤ plan cap)
 	// NodeID is the compute_node chosen by sched.ChoosePlacement at
@@ -126,7 +136,9 @@ type Request struct {
 	VCPUBudget int
 }
 
-func (r Request) admissionMB() int { return api.BillableRAMMB(r.RAMMB) }
+func (r Request) admissionMB() int {
+	return api.BillableRAMMBWithSidecars(r.RAMMB, r.SidecarMBs)
+}
 
 // Admit reserves resources for one new instance, enforcing the
 // per-node RAM headroom guard (spec §4.3 / invariant §6.2-2 re-stated

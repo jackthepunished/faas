@@ -51,6 +51,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -59,6 +60,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -74,12 +76,23 @@ import (
 // Linux (the in-guest PID 1 of every microVM). The vmmd
 // counterpart compiles on every platform but emits identical
 // JSON because the field tags match exactly.
+//
+// JSON field-order pinning: field declarations stay in
+// alphabetical order (mirroring pkg/fcvm.workloadManifest).
+// The two structs are a wire pair — a reorder here MUST land
+// on the vmmd side in the same commit, and the projected-byte
+// budget in pkg/fcvm/vmm.go (projectedWorkloadManifestBytes)
+// must be re-derived. See the comment on
+// pkg/fcvm/vmm.go::workloadManifest for the rationale and the
+// round-trip test that pins the parsed-equivalence contract.
 type workloadSpec struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"` // "main" | "init" | "sidecar"
-	RamMB     int    `json:"ram_mb"`
-	Port      int    `json:"port"`
-	Essential bool   `json:"essential"`
+	Cmd        []string `json:"cmd,omitempty"`
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Essential  bool     `json:"essential"`
+	Name       string   `json:"name"`
+	Port       int      `json:"port"`
+	RamMB      int      `json:"ram_mb"`
+	Type       string   `json:"type"` // "main" | "init" | "sidecar"
 }
 
 // workloadRosterPath is the deployment-level roster location
@@ -154,7 +167,7 @@ func discoverRoster(fsys fs.FS) (workloadRoster, error) {
 // their baked ext4 images at the canonical
 // /usr/local/bin/start.sh (or whatever the customer image
 // provides) — guest-init exec's them verbatim.
-func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, apiEnv map[string]string, log *slog.Logger) error {
+func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, apiEnv map[string]string, log *slog.Logger, sidecarProxy *sidecarEventsProxy) error {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -181,14 +194,57 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		}
 		log.Info("runWorkloads: init sidecar starting",
 			"name", sc.Name, "essential", sc.Essential)
-		sup := newSupervisorFor(sc, secrets, apiEnv, log)
-		if err := sup.Run(); err != nil {
+		// Issue #463 / ADR-069 / ADR-071 / PR-C §3: stamp the
+		// wall-clock start so the sidecar_init_exit envelope
+		// (init_ok / init_failed) carries a meaningful
+		// duration_ms. The start is captured INSIDE the loop
+		// (not above it) so each init sidecar's duration is
+		// per-sidecar, not cumulative across the roster.
+		startedAt := time.Now()
+		sup := newSupervisorFor(sc, secrets, apiEnv, log, sidecarProxy)
+		runErr := sup.Run()
+		elapsedMs := time.Since(startedAt).Milliseconds()
+		// Translate the supervisor's terminal error into the
+		// status the audit needs. The supervisor's Run returns
+		// nil on a clean exit; a non-nil error wraps the
+		// sidecar's exit or restart-budget exhaustion (AC #1's
+		// hard fail). We attempt to surface the underlying
+		// exec.ExitError code for the audit so operators see
+		// the real shell exit rather than the supervisor's
+		// "crash-looped after N restart(s)" wrapper. A non
+		//-ExitError (e.g. supervisor-internal panic-recovered)
+		// falls back to -1 and gets recorded as such.
+		exitCode := 0
+		status := "init_ok"
+		if runErr != nil {
+			status = "init_failed"
+			var ee *exec.ExitError
+			if errors.As(runErr, &ee) {
+				exitCode = ee.ExitCode()
+			} else {
+				exitCode = -1
+			}
+		}
+		// Send the sidecar_init_exit envelope AFTER the
+		// supervisor returns, so the audit captures the
+		// terminal state. A send error is logged + ignored
+		// (the supervisor's terminal state remains the
+		// source of truth for "did the deploy succeed"); we
+		// never silently fail a deploy because the audit
+		// signal didn't make it home.
+		if sendErr := sidecarProxy.SendInitExit(sc.Name, status, exitCode, elapsedMs); sendErr != nil {
+			log.Warn("runWorkloads: sidecar init_exit send failed",
+				"name", sc.Name, "status", status, "err", sendErr)
+		}
+		if runErr != nil {
 			// AC #1: init non-zero exit → user_error.
 			log.Error("runWorkloads: init sidecar failed",
-				"name", sc.Name, "essential", sc.Essential, "err", err)
-			return fmt.Errorf("init sidecar %q failed: %w", sc.Name, err)
+				"name", sc.Name, "essential", sc.Essential,
+				"exit_code", exitCode, "duration_ms", elapsedMs, "err", runErr)
+			return fmt.Errorf("init sidecar %q failed: %w", sc.Name, runErr)
 		}
-		log.Info("runWorkloads: init sidecar ok", "name", sc.Name)
+		log.Info("runWorkloads: init sidecar ok",
+			"name", sc.Name, "duration_ms", elapsedMs)
 	}
 
 	// Step 2: spawn main + type="sidecar" workloads in parallel.
@@ -199,7 +255,7 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		if sc.Type != "sidecar" {
 			continue
 		}
-		supervisors = append(supervisors, newSupervisorFor(sc, secrets, apiEnv, log))
+		supervisors = append(supervisors, newSupervisorFor(sc, secrets, apiEnv, log, sidecarProxy))
 	}
 
 	// ADR-051 Phase 4 (Slice A PR-B / issue #463 / ADR-069):
@@ -280,14 +336,18 @@ func newSupervisorForMain(spec workloadSpec, manifest api.AppManifest, secrets, 
 }
 
 // newSupervisorFor builds a sidecar supervisor
-// (issue #463 / ADR-069 / PR-B). The sidecar's entrypoint is
-// the customer's image default — guest-init exec's the
-// sidecar's baked /usr/local/bin/start.sh (or whatever the
-// image provides). The essential flag drives the restart
-// policy: non-essential = Max=0 (no restart, log-and-
-// continue); essential = Max=MaxRestarts (restart per the
-// platform contract).
-func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log *slog.Logger) *Supervisor {
+// (issue #463 / ADR-069 / PR-B + PR-C §4). The sidecar's
+// entrypoint is the customer's image default — guest-init
+// exec's the sidecar's baked /usr/local/bin/start.sh (or
+// whatever the image provides). The essential flag drives
+// the restart policy: non-essential = Max=0 (no restart,
+// log-and-continue); essential = Max=MaxRestarts (restart
+// per the platform contract). PR-C §4 wires the supervisor's
+// OnCrash hook to call SendRestart on the proxy so vmmd
+// can increment vmmd_sidecar_restart_total{app, sidecar}.
+// A nil sidecarProxy (no-signal contract when bind fails)
+// keeps the OnCrash hook log-only.
+func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log *slog.Logger, sidecarProxy *sidecarEventsProxy) *Supervisor {
 	maxRestarts := MaxRestarts
 	if !spec.Essential {
 		maxRestarts = 0 // non-essential sidecar: log crash, do not restart
@@ -297,6 +357,18 @@ func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log 
 	supRef.OnCrash = func(attempt int, err error) {
 		fmt.Fprintf(os.Stderr, "guest-init: sidecar %s crashed (restart %d/%d): %v\n",
 			spec.Name, attempt, maxRestarts, err)
+		// PR-C §4: ship the sidecar_restart envelope so vmmd
+		// can increment <daemon>_sidecar_restart_total AND
+		// emit events.SidecarRestart. A send error is
+		// best-effort (logged + ignored); the supervisor's
+		// restart policy remains the source of truth for
+		// "did the sidecar actually come back".
+		if sidecarProxy != nil {
+			if sErr := sidecarProxy.SendRestart(spec.Name, attempt); sErr != nil {
+				log.Warn("sidecar restart emit failed",
+					"sidecar", spec.Name, "attempt", attempt, "err", sErr)
+			}
+		}
 	}
 	return supRef
 }
@@ -313,11 +385,21 @@ func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log 
 // the sidecar's entrypoint is /usr/local/bin/start.sh by
 // convention.
 func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Supervisor) error {
-	// The sidecar's cmd is the customer-image default.
-	// PR-C will read this from a per-workload field; today
-	// every sidecar image ships /usr/local/bin/start.sh
-	// (imaged's stamp during buildSidecarLayer).
-	cmd := exec.Command("/usr/local/bin/start.sh")
+	// PR-C §6: the customer-image override surface. The
+	// manifest on the per-drive ext4 carries Cmd/Entrypoint
+	// when the deploy ships a custom entrypoint (e.g. a
+	// Dockerfile that EXPOSE's an alternate binary). The
+	// precedence matches the OCI image-spec:
+	//   - Entrypoint non-empty: exec Entrypoint[0] with
+	//     Entrypoint[1:] as argv[0:].
+	//   - Entrypoint empty + Cmd non-empty: exec Cmd[0]
+	//     with Cmd[1:] as argv[1:].
+	//   - Both empty: fall back to the baked image
+	//     entrypoint (/usr/local/bin/start.sh).
+	// The fallback preserves the PR-B contract for images
+	// that don't set cmd/entrypoint.
+	argv0, argv := resolveSidecarCommand(spec)
+	cmd := exec.Command(argv0, argv...)
 	cmd.Env = os.Environ()
 	// Sidecar env can layer on top of the customer's baked
 	// env (imaged wrote the per-sidecar env into the ext4 at
@@ -352,4 +434,27 @@ func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Super
 		return fmt.Errorf("run sidecar %s: %w", spec.Name, err)
 	}
 	return nil
+}
+
+// resolveSidecarCommand (PR-C §6) is the pure-argv derivation
+// helper that turns a workloadSpec into the (argv0, argv) tuple
+// runSidecar hands to exec.Command. Extracted so the precedence
+// rules (Entrypoint > Cmd > baked start.sh) are testable
+// without a real fork. The fallback path (/usr/local/bin/start.sh)
+// preserves the PR-B contract for images that don't set
+// cmd/entrypoint at deploy time.
+func resolveSidecarCommand(spec workloadSpec) (argv0 string, argv []string) {
+	switch {
+	case len(spec.Entrypoint) > 0:
+		argv0 = spec.Entrypoint[0]
+		argv = append([]string(nil), spec.Entrypoint[1:]...)
+		argv = append(argv, spec.Cmd...)
+	case len(spec.Cmd) > 0:
+		argv0 = spec.Cmd[0]
+		argv = append([]string(nil), spec.Cmd[1:]...)
+	default:
+		argv0 = "/usr/local/bin/start.sh"
+		argv = nil
+	}
+	return argv0, argv
 }
