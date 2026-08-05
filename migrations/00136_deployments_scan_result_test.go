@@ -5,9 +5,9 @@
 //
 //  1. The migration set applies cleanly through 00136.
 //  2. Three columns exist on `deployments`:
-//       * scan_result  jsonb
-//       * scan_status  text NULLABLE
-//       * scanned_at   timestamptz
+//     * scan_result  jsonb
+//     * scan_status  text NULLABLE
+//     * scanned_at   timestamptz
 //     (NULLABLE on all three so the PR-3 sink can land rows
 //     incrementally without breaking the existing INSERT shape.)
 //  3. The CHECK constraint `deployments_scan_status_chk` exists
@@ -57,8 +57,8 @@ func TestMigrations_00136_DeploymentsScanResult(t *testing.T) {
 	// createDeployment) doesn't need to know about the scan
 	// columns to land a row.
 	want := map[string]struct {
-		dataType  string
-		nullable  string
+		dataType string
+		nullable string
 	}{
 		"scan_result": {dataType: "jsonb", nullable: "YES"},
 		"scan_status": {dataType: "text", nullable: "YES"},

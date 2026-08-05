@@ -877,3 +877,46 @@ type InvitationWithTokenResponse struct {
 type InvitationListResponse struct {
 	Invitations []OrgInvitationResponse `json:"invitations"`
 }
+
+// ScanSeverityCounts is the per-severity CVE tally on a per-deploy
+// grype scan (issue #464 / ADR-075). Each counter is the number of
+// findings at that severity level; a deploy with no findings has all
+// five at zero.
+type ScanSeverityCounts struct {
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
+	Unknown  int `json:"unknown"`
+}
+
+// ScanVulnerability is a single CVE finding on a per-deploy grype
+// scan. The fields mirror the grype JSON shape the apid handler
+// (`cmd/apid/handlers_scan.go`) forwards verbatim — see
+// pkg/imaged.ScanVulnerability for the upstream definition. Paths
+// are intentionally omitted from the wire DTO (PR #651 review
+// finding #54: customers don't need internal grype match paths).
+type ScanVulnerability struct {
+	ID       string `json:"id"`
+	Severity string `json:"severity"` // CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+	Package  string `json:"package"`
+	Version  string `json:"version"`
+	FixedIn  string `json:"fixed_in,omitempty"`
+}
+
+// ScanResult is the wire shape returned by GET
+// /v1/deployments/{id}/scan (issue #464 / ADR-075 — per-deploy
+// grype CVE scan surface). The Status field is the closed enum
+// (complete|failed|skipped); see pkg/api.ScanResult for the full
+// shape and `pkg/api/limits.go` for the closed-enum definition.
+// Err is populated only when Status="failed"; grype exit message
+// is the value.
+type ScanResult struct {
+	Status          string              `json:"status"`
+	ScannedAt       string              `json:"scanned_at,omitempty"`
+	ScannerVersion  string              `json:"scanner_version,omitempty"`
+	ImageDigest     string              `json:"image_digest,omitempty"`
+	SeverityCounts  ScanSeverityCounts  `json:"severity_counts"`
+	Vulnerabilities []ScanVulnerability `json:"vulnerabilities"`
+	Err             string              `json:"error,omitempty"`
+}
