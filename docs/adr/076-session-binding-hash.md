@@ -34,7 +34,7 @@ for clarity in operator triage, not for collision resistance
 ## Files
 
 - **New**: `pkg/bindinghash/bindinghash.go` + `_test.go`
-- **New**: `migrations/00142_sessions_binding.sql` + `_test.go`
+- **New**: `migrations/00145_sessions_binding.sql` + `_test.go`
 - **New**: this ADR
 - **Modify**: `pkg/session/manager.go` — Envelope gains `BindingHash string`;
   two `Issue*` helpers (`IssueWithSessionAndBindingHash`,
