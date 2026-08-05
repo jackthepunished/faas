@@ -7782,7 +7782,7 @@ func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, 
 		}
 		if r.AppID != "" {
 			app, ok := m.apps[r.AppID]
-			if !ok || app.Status == "deleted" {
+			if !ok || app.Status == AppDeleted {
 				continue
 			}
 		}

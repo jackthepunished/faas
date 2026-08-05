@@ -66,7 +66,7 @@ func (m *MemStore) CreateAppWebhookIfUnderQuota(_ context.Context, in AppWebhook
 		return AppWebhook{}, ErrNotFound
 	}
 	app, ok := m.apps[in.AppID]
-	if !ok || app.Status == "deleted" {
+	if !ok || app.Status == AppDeleted {
 		return AppWebhook{}, ErrNotFound
 	}
 	appCount := 0
@@ -87,7 +87,7 @@ func (m *MemStore) CreateAppWebhookIfUnderQuota(_ context.Context, in AppWebhook
 		if w.AccountID != in.AccountID {
 			continue
 		}
-		if a, ok := m.apps[w.AppID]; ok && a.Status != "deleted" {
+		if a, ok := m.apps[w.AppID]; ok && a.Status != AppDeleted {
 			accountCount++
 		}
 	}
