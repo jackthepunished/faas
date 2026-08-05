@@ -1,9 +1,9 @@
 //go:build !no_pg
 
-// Migration-apply test for 00144 (issue #464 / ADR-055 —
+// Migration-apply test for 00146 (issue #464 / ADR-055 —
 // per-deploy grype CVE scan surface, PR-1 data plane). Pins:
 //
-//  1. The migration set applies cleanly through 00144.
+//  1. The migration set applies cleanly through 00146.
 //  2. Three columns exist on `deployments`:
 //     * scan_result  jsonb
 //     * scan_status  text NULLABLE
@@ -23,12 +23,13 @@
 //
 // Slot note: 00139 is taken by PR #651 (issue #464 mega-PR)
 // on open branches; PR #653 also claims slot 136 with a real
-// schema. This PR carries 00144 (renumbered from 00135 → 00139
-// → 00144 to dodge the open-PR slot collision gate). Slot 143
-// holds main's apps_require_authn; 140/141/142 are fences for
-// PR #658 webhook claims. This test pins 00144's three-column +
-// CHECK + index + backfill shape; renumber would need filename +
-// test name + apply range bump + UUID literals together.
+// schema. This PR carries 00146 (renumbered from 00135 → 00139
+// → 00144 → 00146 to dodge the open-PR slot collision gate;
+// main's PR #653 mega-PR landed 00144_api_keys_provenance at
+// 144). Slot 145 holds main's sessions_binding. This test pins
+// 00146's three-column + CHECK + index + backfill shape;
+// renumber would need filename + test name + apply range bump +
+// UUID literals together.
 // literals together.
 package migrations_test
 
@@ -40,14 +41,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
+func TestMigrations_00146_DeploymentsScanResult(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00144. A regression that drops a slot
+	// (1) Apply through 00146. A regression that drops a slot
 	// between 1 and 136 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 143)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 145)", err)
 	}
 
 	// (2) Three columns exist with the right types. The pgtest
@@ -141,15 +142,15 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 		t.Helper()
 		if _, err := pool.Exec(ctx, `
 			insert into accounts (id, plan, email)
-			values ('00000000-0000-0000-0000-000000000144', 'scale', 'scan-test@example.com')
+			values ('00000000-0000-0000-0000-000000000146', 'scale', 'scan-test@example.com')
 			on conflict (id) do nothing
 		`); err != nil {
 			t.Fatalf("seed accounts: %v", err)
 		}
 		if _, err := pool.Exec(ctx, `
 			insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-			values ('00000000-0000-0000-0000-000000000144',
-			        '00000000-0000-0000-0000-000000000144',
+			values ('00000000-0000-0000-0000-000000000146',
+			        '00000000-0000-0000-0000-000000000146',
 			        'scan-test', 'function', 256, 1, 30, 'active', now())
 			on conflict (id) do nothing
 		`); err != nil {
@@ -160,8 +161,8 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 		// is NULLABLE — the seed mirrors the pre-feature shape.
 		if _, err := pool.Exec(ctx, `
 			insert into deployments (id, app_id, kind, source_path, source_bytes, status, image_digest, scan_status, scan_result)
-			values ('00000000-0000-0000-0000-000000000144',
-			        '00000000-0000-0000-0000-000000000144',
+			values ('00000000-0000-0000-0000-000000000146',
+			        '00000000-0000-0000-0000-000000000146',
 			        'tarball', '/tmp/test.tar', 0, 'live', 'sha256:0', $1, $2::jsonb)
 			on conflict (id) do update set
 				scan_status = excluded.scan_status,
@@ -176,8 +177,8 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update deployments
 		set scan_status = 'skipped',
-		    scan_result = jsonb_build_object('reason', 'pre-feature', 'backfill_migration', '00144')
-		where id = '00000000-0000-0000-0000-000000000144'
+		    scan_result = jsonb_build_object('reason', 'pre-feature', 'backfill_migration', '00146')
+		where id = '00000000-0000-0000-0000-000000000146'
 		  and scan_status is null
 	`); err != nil {
 		t.Fatalf("backfill: %v", err)
@@ -187,7 +188,7 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		select scan_status, scan_result
 		from deployments
-		where id = '00000000-0000-0000-0000-000000000144'
+		where id = '00000000-0000-0000-0000-000000000146'
 	`).Scan(&backfilledStatus, &backfilledResult); err != nil {
 		t.Fatalf("readback backfilled row: %v", err)
 	}
@@ -211,8 +212,8 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update deployments
 		set scan_status = 'skipped',
-		    scan_result = jsonb_build_object('reason', 'pre-feature', 'backfill_migration', '00144')
-		where id = '00000000-0000-0000-0000-000000000144'
+		    scan_result = jsonb_build_object('reason', 'pre-feature', 'backfill_migration', '00146')
+		where id = '00000000-0000-0000-0000-000000000146'
 		  and scan_status is null
 	`); err != nil {
 		t.Fatalf("idempotent backfill: %v", err)
@@ -221,7 +222,7 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		select scan_result
 		from deployments
-		where id = '00000000-0000-0000-0000-000000000144'
+		where id = '00000000-0000-0000-0000-000000000146'
 		  and scan_status = 'skipped'
 	`).Scan(&preservedResult); err != nil {
 		t.Fatalf("readback preserved row: %v", err)
@@ -240,7 +241,7 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 	// before the dashboard renders the bad value.
 	if _, err := pool.Exec(ctx, `
 		update deployments set scan_status = 'bogus'
-		where id = '00000000-0000-0000-0000-000000000144'
+		where id = '00000000-0000-0000-0000-000000000146'
 	`); err == nil {
 		t.Errorf("update scan_status='bogus': expected CHECK violation, got nil")
 	}
@@ -249,7 +250,7 @@ func TestMigrations_00144_DeploymentsScanResult(t *testing.T) {
 	for _, ok := range []string{"pending", "complete", "failed", "skipped"} {
 		if _, err := pool.Exec(ctx, `
 			update deployments set scan_status = $1
-			where id = '00000000-0000-0000-0000-000000000144'
+			where id = '00000000-0000-0000-0000-000000000146'
 		`, ok); err != nil {
 			t.Errorf("update scan_status=%q: %v (closed-enum should accept)", ok, err)
 		}

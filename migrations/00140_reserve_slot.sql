@@ -1,9 +1,13 @@
 -- filename: 00140_reserve_slot.sql
--- Fence at slot 140 — held by PR #654 to bridge 00139 (own fence)
--- and 00141 (PR #653's fence). PR #653 owns 140 as a fence on its
--- branch; per ADR-041 the bridge fence gets `git rm`'d on whichever
--- side merges second. Body is a no-op `select 1;` so goose applies
--- cleanly and writes a row in goose_db_version.
+-- Slot fence: PR #658 (issue #476 webhook delivery) claims slots
+-- 140 + 141 on its branch (webhook tables + delivery log); this
+-- fence at 140 is the bridge for PR #658's app_webhooks at slot
+-- 140 (it gets `git rm`'d on PR #658's merge) OR — if PR #658
+-- renumbers — bridges whatever PR claims slot 140 next. The
+-- IAM mega-PR (PR #653) originally held the sessions binding-
+-- hash migration at slot 140, then renumbered twice — to 142
+-- after PR #651's open claim, then to 145 after PR #658's open
+-- claim on 141 surfaced. ADR-041.
 
 -- +goose Up
 -- +goose StatementBegin

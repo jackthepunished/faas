@@ -83,6 +83,12 @@ type mfaTestEnv struct {
 // mfa_required is false.
 func setupWithMFA(t *testing.T, plan api.Plan, mfaRequired, mfaEnrolled bool) mfaTestEnv {
 	t.Helper()
+	// Recovery-code HMAC upgrade: the production loader wires this
+	// at apid boot via loadOrGenerateRecoveryHMACKey; the test
+	// fixture has no boot path, so a sync.Once hooks it once across
+	// the suite. Using a deterministic (test-stable) key pins the
+	// digest against the test's own expectations.
+	ensureRecoveryTestSecret(t)
 	store := state.NewMemStore()
 	acct, err := store.CreateAccount(context.Background(),
 		"mfa@example.com", plan)
@@ -495,6 +501,102 @@ func TestMFAVerify_StepsUpPendingCookie(t *testing.T) {
 	}
 }
 
+// TestMFAVerify_ReissuedCookieAndRowBindingHashInLockstep is
+// the regression pin for review finding #2 (PR #653 mega-PR):
+// the reissue path MUST re-stamp sessions.binding_hash before
+// sealing the new cookie envelope. Without the
+// store.UpdateSessionBinding call inside
+// reissueSessionCookieWithStepUp, the cookie carries the
+// fresh (IP, UA-family) fingerprint but the sessions row
+// retains the original mint-time fingerprint; the very next
+// authenticated request hits RequireSessionCookie step 3.5
+// (the stolen-cookie auto-revoke branch at
+// pkg/auth/middleware/middleware.go) and 401s the customer on
+// their own session, with an auth.session.binding_mismatch
+// audit row attributing the lockstep failure to the legitimate
+// owner.
+//
+// Test flow:
+//  1. /enroll + /confirm: mints the enrolled account.
+//  2. mfaIssueWithPending(true): flips the cookie to
+//     mfa_pending=true. The setup-time cookie has no
+//     binding_hash envelope field (mint path used
+//     CreateSession, not CreateSessionWithBinding), so the
+//     sessions row's binding_hash column is also empty.
+//  3. /verify: reissues with mfa_pending=false + a
+//     freshly-computed binding hash (the (IP, UA-family)
+//     fingerprint for this request).
+//  4. Inspect the cookie envelope + the sessions row.
+//     Both MUST carry the SAME binding_hash. If they
+//     disagree the lockstep is broken.
+func TestMFAVerify_ReissuedCookieAndRowBindingHashInLockstep(t *testing.T) {
+	e := setupWithMFA(t, api.PlanPro, false, false)
+	_, secret, _ := e.generateEnrolledAccount(t)
+
+	// Pre-/verify: cookie is mfa_pending=true (so /verify has a
+	// real sealed TOTP secret to check against). The setup-time
+	// mint path used CreateSession (no binding hash), so both
+	// the envelope's binding_hash and the row's binding_hash
+	// column are empty here.
+	e.cookie = e.mfaIssueWithPending(t, true)
+
+	code, err := totp.GenerateCodeCustom(secret, time.Now().UTC(), totp.ValidateOpts{
+		Period: 30, Digits: 6, Algorithm: 0,
+	})
+	if err != nil {
+		t.Fatalf("GenerateCodeCustom: %v", err)
+	}
+	body, err := json.Marshal(api.MFAVerifyRequest{Totp: code})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/account/mfa/verify", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(e.cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/verify status %d: %s", rec.Code, rec.Body)
+	}
+
+	var reissuedCookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie {
+			reissuedCookie = c
+		}
+	}
+	if reissuedCookie == nil {
+		t.Fatalf("/verify did not re-issue cookie")
+	}
+	env, err := e.mgr.Verify(reissuedCookie.Value)
+	if err != nil {
+		t.Fatalf("verify reissued cookie: %v", err)
+	}
+
+	// Look up the row.
+	rows, err := e.store.ListSessions(context.Background(), e.acct.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListSessions: err=%v rows=%d", err, len(rows))
+	}
+	row := rows[0]
+
+	if env.BindingHash == "" {
+		t.Errorf("post-/verify envelope binding_hash is empty; reissue must stamp it")
+	}
+	if row.BindingHash == "" {
+		t.Errorf("post-/verify sessions row binding_hash is empty; " +
+			"reissueSessionCookieWithStepUp must call store.UpdateSessionBinding " +
+			"so the row tracks the cookie envelope (review finding #2)")
+	}
+	if env.BindingHash != row.BindingHash {
+		t.Errorf("binding hash drift (review finding #2):\n"+
+			"  envelope = %q\n"+
+			"  row      = %q\n"+
+			"The next request will trip the stolen-cookie auto-revoke branch on the customer's own session.",
+			env.BindingHash, row.BindingHash)
+	}
+}
+
 // --- /recover + /disable ----------------------------------------------------
 
 // TestMFARecover_ConsumesCodeAndReissuesCookie burns one of
@@ -676,6 +778,61 @@ func TestFlipMFARequiredIfUnenrolled(t *testing.T) {
 			t.Errorf("MFARequired = true after no-op flip on enrolled account")
 		}
 	})
+
+	// already_required_emits_armed_again: the second-chokepoint audit
+	// surface (issue #286 / IAM hardening mega-PR review finding F2).
+	// When a chokepoint fires on an account whose mfa_required is
+	// already true (e.g. webhook redelivery, or two chokepoints hit
+	// in the same session), the helper must still emit a
+	// distinguishable audit row so SOC 2 CC6.2 can prove the
+	// chokepoint fired. Pre-PR the helper returned silently on the
+	// unchanged branch, leaving an audit-log hole.
+	//
+	// Distinct kind from the first-arm "account.mfa_required_enabled"
+	// so a downstream query ("did this account ever re-trip a
+	// chokepoint?") stays simple.
+	t.Run("already_required_emits_armed_again", func(t *testing.T) {
+		e := setupWithMFA(t, api.PlanPro, true, false) // mfa_required=true, not enrolled
+		// Swap in a fresh auditor so we can read rows out of the
+		// in-memory store. The default auditor wired by newServer is
+		// a noopNotifier-flavoured one that goes through the same
+		// MemStore, but rebuilding it explicitly makes the test
+		// self-contained and immune to future wiring drift.
+		e.srv.audit = newAuditor(e.store, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		ctx := context.Background()
+		fresh, _ := e.store.AccountByID(ctx, e.acct.ID)
+		acctID := fresh.ID
+
+		// Chokepoint hit — row is already armed, so the helper must
+		// emit account.mfa_required_armed_again, NOT silently return.
+		e.srv.flipMFARequiredIfUnenrolled(ctx, fresh, "plan_upgrade",
+			map[string]any{"from": "free", "to": "pro"})
+
+		// State didn't change.
+		after, _ := e.store.AccountByID(ctx, acctID)
+		if !after.MFARequired {
+			t.Errorf("MFARequired = false after second-chokepoint hit, want still true")
+		}
+
+		// Audit row landed. ListEvents filters on subject (the acct
+		// id) — confirm exactly one row of the armed-again kind.
+		rows, err := e.store.ListEvents(ctx, acctID, 10)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		var armed int
+		for _, ev := range rows {
+			if ev.Kind == "account.mfa_required_armed_again" {
+				armed++
+			}
+			if ev.Kind == "account.mfa_required_enabled" {
+				t.Errorf("unexpected account.mfa_required_enabled row on already-armed re-hit — the helper should emit armed_again, not enabled")
+			}
+		}
+		if armed != 1 {
+			t.Errorf("account.mfa_required_armed_again count = %d, want 1 (rows seen: %d)", armed, len(rows))
+		}
+	})
 }
 
 // --- burn-out + race tests (issue #186 review findings #13–#17) -------------
@@ -834,7 +991,10 @@ func TestMFARecover_StoreAtomicityOnConcurrentConsume(t *testing.T) {
 		t.Fatalf("setup: recovery code count = %d, want >= 2", len(recovCodes))
 	}
 	code := recovCodes[0]
-	presented := authcode.HashRecoveryCode(code)
+	presented, err := authcode.HashRecoveryCode(code)
+	if err != nil {
+		t.Fatalf("HashRecoveryCode(%q): %v", code, err)
+	}
 
 	type result struct {
 		matched  bool
@@ -937,7 +1097,10 @@ func TestConsumeRecoveryCode_LastFlagSemantics(t *testing.T) {
 		}
 	}
 	lastCode := recovCodes[authcode.RecoveryCodeCount-1]
-	presented := authcode.HashRecoveryCode(lastCode)
+	presented, err := authcode.HashRecoveryCode(lastCode)
+	if err != nil {
+		t.Fatalf("HashRecoveryCode(%q): %v", lastCode, err)
+	}
 
 	// Drive the store primitive directly to bypass the
 	// handler's lastCode refusal: the customer is calling
@@ -1074,4 +1237,41 @@ func mustStepUpCookie(t *testing.T, c *http.Cookie, msg string) *http.Cookie {
 		t.Fatal(msg)
 	}
 	return c
+}
+
+// recoveryTestSecretOnce ensures the per-process recovery HMAC
+// key is configured exactly once for the cmd/apid test suite.
+// HashRecoveryCode is the production entry point that returns
+// (digest, ErrNoHMACKey) when no key is loaded; the package's
+// boot-time loader (cmd/apid/main.go::loadOrGenerateRecoveryHMACKey)
+// fills that gap in production. Tests don't go through run(); so
+// this sync.Once stands in for the loader.
+//
+// The key bytes are deterministic across runs so a flaky test
+// that depends on a specific digest can pin it explicitly with
+// its own SetHMACSecret call (and reset on t.Cleanup).
+var recoveryTestSecretOnce sync.Once
+
+// recoveryTestSecretBytes is the 32-byte deterministic test key.
+// Hex-decoded from a constant so a future test that needs the
+// digest for a specific plaintext can reproduce it offline.
+var recoveryTestSecretBytes = func() []byte {
+	// 32 bytes of 0x42 — irrelevant which exact pattern as long
+	// as it's deterministic. Matches the convention used in
+	// pkg/authcode/recovery_test.go's TestMain.
+	return bytes.Repeat([]byte{0x42}, 32)
+}()
+
+// ensureRecoveryTestSecret installs the test recovery HMAC key
+// exactly once across the suite. Idempotent across test files —
+// tests that import authcode and call HashRecoveryCode share the
+// same global secret.
+func ensureRecoveryTestSecret(t *testing.T) {
+	t.Helper()
+	recoveryTestSecretOnce.Do(func() {
+		dup := bytes.Clone(recoveryTestSecretBytes)
+		if err := authcode.SetHMACSecret(dup); err != nil {
+			t.Fatalf("recovery test secret: %v", err)
+		}
+	})
 }

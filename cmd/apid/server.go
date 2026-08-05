@@ -16,6 +16,7 @@ import (
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/billing"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/httpsec"
@@ -69,6 +70,14 @@ type server struct {
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
 	sessions *session.Manager
+	// bindingKeyFn is the IAM-hardening-mega-PR (ADR-076) secret used
+	// to derive the session binding-hash fingerprint. nil ⇒ binding
+	// is not armed (the unix-socket / cli-auth code path), in which
+	// case pkg/bindinghash.Compute returns "" and the middleware
+	// cross-check is a no-op. Production wires a closure that returns
+	// the same AEAD key bytes the sessions.Manager uses so a stolen
+	// DB blob can't pre-compute binding hashes offline.
+	bindingKeyFn bindinghash.KeyFunc
 	// loginTTL is how long a magic-link stays valid. Default 15m.
 	loginTTL time.Duration
 	// dpaPath is the on-disk path of the DPA template served by
@@ -503,6 +512,7 @@ func newServerWithDeps(
 		mailer:                 mailer,
 		githubd:                githubd,
 		events:                 bcaster,
+		bindingKeyFn:           func() []byte { return sessions.BindingKey() },
 		sessions:               sessions,
 		loginTTL:               loginTTL,
 		dpaPath:                dpaPath,
@@ -526,6 +536,13 @@ func newServerWithDeps(
 			auditorAsAuthAuditor(newAuditor(store, log, nil)),
 			log,
 			apiAuthLimiter,
+			// IAM-hardening-mega-PR (ADR-076): hand the auth
+			// middleware the same 32-byte key bytes the session
+			// AEAD uses so the binding-hash cross-check keys off
+			// the host secret. Closure pulls a fresh copy on each
+			// miss (the AEAD-owned key never escapes session.Manager
+			// past the constructor; we read via Manager.BindingKey).
+			func() []byte { return sessions.BindingKey() },
 		),
 		// Issue #190 / IAM-6 / ADR-061, PR 4: org resolver backs
 		// s.loadOrg (cmd/apid/auth_facade.go). Wraps the same
@@ -630,9 +647,9 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/orgs/{slug}/members", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.inviteOrgMember)))))
 	mux.HandleFunc("PATCH /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.changeOrgMemberRole)))))
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.removeOrgMember)))))
-	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.transferOrgOwnership)))))
+	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.requireStepUp(5*time.Minute)(s.transferOrgOwnership))))))
 	mux.HandleFunc("GET /v1/invitations/{token}", s.authLimited(s.peekInvitation))
-	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.changePlan)))))
+	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.idempotent(s.changePlan))))))
 	// IAM-5 (issue #189): per-account rotation grace-window
 	// override. Admin-only because the rotation primitive is
 	// admin-only (POST /v1/keys/{id}/rotate mirrors the same
@@ -652,7 +669,7 @@ func (s *server) handler() http.Handler {
 	// DELETE /v1/account is admin-only — losing the account is
 	// irreversible.
 	mux.HandleFunc("GET /v1/account/export", s.auth(s.requireScope(api.ScopesReadSurface...)(s.exportAccount)))
-	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.deleteAccount))))
+	mux.HandleFunc("DELETE /v1/account", s.auth(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.idempotent(s.deleteAccount))))))
 	mux.HandleFunc("POST /v1/account/restore", s.auth(s.requireScope(api.ScopesDeployWriteSurface...)(s.restoreAccount)))
 	mux.HandleFunc("GET /v1/account/dpa", s.dpaTemplate)
 
@@ -828,7 +845,7 @@ func (s *server) handler() http.Handler {
 	// scopes — limiting to admin matches the existing key-mint
 	// gate (POST /v1/keys) and avoids a non-admin scope-expanding
 	// via the rotation path.
-	mux.HandleFunc("POST /v1/keys/{id}/rotate", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.rotateKey))))
+	mux.HandleFunc("POST /v1/keys/{id}/rotate", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.rotateKey)))))
 
 	// PR 6 (issue #190 / IAM-6 / ADR-061) — org-scoped API key surface.
 	// Compose s.loadOrg (resolves X-Active-Org / ?org= to a membership)
@@ -839,10 +856,10 @@ func (s *server) handler() http.Handler {
 	// to 404 in the Store layer (IDOR-safe). operationIds match the Go
 	// SDK method names 1:1 so cmd/sdk-coverage compiles cleanly.
 	mux.HandleFunc("GET /v1/orgs/{slug}/keys", s.authLimited(s.loadOrg(s.listOrgAPIKeys)))
-	mux.HandleFunc("POST /v1/orgs/{slug}/keys", s.authLimited(s.loadOrg(s.createOrgAPIKey)))
+	mux.HandleFunc("POST /v1/orgs/{slug}/keys", s.authLimited(s.requireMFA(s.loadOrg(s.requireStepUp(5*time.Minute)(s.createOrgAPIKey)))))
 	mux.HandleFunc("GET /v1/orgs/{slug}/keys/{id}", s.authLimited(s.loadOrg(s.getOrgAPIKey)))
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/keys/{id}", s.authLimited(s.loadOrg(s.revokeOrgAPIKey)))
-	mux.HandleFunc("POST /v1/orgs/{slug}/keys/{id}/rotate", s.authLimited(s.loadOrg(s.rotateOrgAPIKey)))
+	mux.HandleFunc("POST /v1/orgs/{slug}/keys/{id}/rotate", s.authLimited(s.requireMFA(s.loadOrg(s.requireStepUp(5*time.Minute)(s.rotateOrgAPIKey)))))
 
 	// Operator-only billing surface (issue #279). The admin allowlist
 	// is enforced inside the handler (adminAllows), not just at the
@@ -1067,7 +1084,7 @@ func (s *server) handler() http.Handler {
 	// OAuth-only customers. Behind sessionAuth so the call is anchored
 	// to a known account. NOT behind the auth-bucket — the call only
 	// succeeds when the customer already holds a session.
-	mux.Handle("POST /dashboard/account/set-password", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.postSetPassword))))
+	mux.Handle("POST /dashboard/account/set-password", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.postSetPassword)))))
 	mux.Handle("GET /auth/verify", s.dashboardAuthChain(middleware.AuthLimitConfig{
 		// /auth/verify 401s on unknown tokens AND 410s on consumed tokens;
 		// count both so an attacker can't cycle through one-time tokens
@@ -1117,7 +1134,7 @@ func (s *server) handler() http.Handler {
 	// the logged-in account. The handlers reuse scheduleDeletion /
 	// cancelDeletion from handlers_account.go so audit, email, and
 	// notification side-effects match the REST API path bit-for-bit.
-	mux.Handle("POST /dashboard/account/delete", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardDelete))))
+	mux.Handle("POST /dashboard/account/delete", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.dashboardDelete)))))
 	mux.Handle("POST /dashboard/account/restore", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRestore))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download

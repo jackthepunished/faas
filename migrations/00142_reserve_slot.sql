@@ -1,10 +1,8 @@
 -- filename: 00142_reserve_slot.sql
--- Fence at slot 142 — held by PR #654 to bridge 00141 (own fence)
--- and 00143 (per-app require_authn). PR #653 owns 142 as a real
--- schema (sessions_binding); per ADR-041 the real schema shadows
--- this fence on whichever side merges first. Body is a no-op
--- `select 1;` so goose applies cleanly and writes a row in
--- goose_db_version.
+-- Slot fence: bridges PR #658's app_webhook_deliveries at slot
+-- 141 (or whichever slot its webhook_delivery table lands at) and
+-- PR #654's apps_require_authn at slot 143. Whichever side
+-- renumbers first will `git rm` this fence. ADR-041.
 
 -- +goose Up
 -- +goose StatementBegin

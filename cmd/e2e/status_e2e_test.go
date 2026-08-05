@@ -63,7 +63,7 @@ func TestStatus_GET_Returns2xxAndHTML(t *testing.T) {
 	// build-bar markers) is asserted separately at unit level
 	// (cmd/apid/status_test.go). The cross-process fence we
 	// ship is "200 + text/html", not "the full page rendered".
-	addr, _ := startAPIDWithEnv(t, append(envForAPID(poolDSN(pool)),
+	addr, _ := startAPIDWithEnv(t, append(envForAPID(t, poolDSN(pool)),
 		"FAAS_HOST_AGE_RECIPIENT_PATH="+pub,
 		"FAAS_STATUSPAGE_PATH="+filepath.Join(dir, "missing.html"),
 	)...)
@@ -122,7 +122,7 @@ func TestStatus_GETSloJSON_HasSLOFields(t *testing.T) {
 	}
 	// No FAAS_PROMETHEUS_URL => statusCache.promURL is empty =>
 	// every /status/slo.json call gets the degraded fallback.
-	addr, _ := startAPIDWithEnv(t, append(envForAPID(poolDSN(pool)),
+	addr, _ := startAPIDWithEnv(t, append(envForAPID(t, poolDSN(pool)),
 		"FAAS_HOST_AGE_RECIPIENT_PATH="+pub)...)
 
 	client := &http.Client{Timeout: 10 * time.Second}

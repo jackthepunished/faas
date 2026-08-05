@@ -24,11 +24,15 @@
 // table from a leaked blob is computationally infeasible without
 // offline storage of the plaintexts, which never leaves the
 // customer's account.
+//
+// Digest: HMAC-SHA256 keyed by a per-process secret (see hmac.go).
+// The pre-PR path used bare SHA-256 — rainbow-reversible on a
+// leaked blob. The HMAC keying is the load-bearing change for
+// logical change 7 of the IAM-hardening mega-PR.
 package authcode
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
 	"strings"
@@ -42,10 +46,16 @@ import (
 const RecoveryCodeCount = 10
 
 // NewRecoveryCodes returns n plaintext recovery codes (base32, 10
-// chars each, no padding) plus the SHA-256 hashes of the same
+// chars each, no padding) plus the HMAC-SHA256 hashes of the same
 // plaintexts. The plaintexts are returned to the dashboard ONCE
 // (the enroll response); the hashes are what /v1/account/mfa/recover
 // compares against.
+//
+// The hash key is configured at startup via SetHMACSecret —
+// returning an error here if the secret is not configured is
+// intentional. cmd/apid boots with the secret; tests that don't
+// exercise /v1/account/mfa/recover call SetHMACSecret at the top
+// of TestMain or in the test's setup helper.
 func NewRecoveryCodes(n int) (plaintexts []string, hashes [][]byte, err error) {
 	plaintexts = make([]string, n)
 	hashes = make([][]byte, n)
@@ -56,21 +66,10 @@ func NewRecoveryCodes(n int) (plaintexts []string, hashes [][]byte, err error) {
 		}
 		encoded := strings.TrimRight(base32.StdEncoding.EncodeToString(raw), "=")
 		plaintexts[i] = strings.ToUpper(encoded[:10])
-		h := sha256.Sum256([]byte(plaintexts[i]))
-		hashes[i] = h[:]
+		hashes[i], err = HashRecoveryCode(plaintexts[i])
+		if err != nil {
+			return nil, nil, fmt.Errorf("auth/totp: hash: %w", err)
+		}
 	}
 	return plaintexts, hashes, nil
-}
-
-// HashRecoveryCode is the SHA-256 single-shot helper used by
-// /v1/account/mfa/recover to test a presented code against the
-// stored hashes. The caller uppercases the presented code before
-// passing it in — the recovery-code generator above emits
-// uppercase, and case-insensitive matching is the customer's
-// expectation (RFC 6238 doesn't mandate case for the TOTP secret,
-// but the recovery codes are user-typed and so should accept
-// either case).
-func HashRecoveryCode(code string) []byte {
-	h := sha256.Sum256([]byte(strings.ToUpper(code)))
-	return h[:]
 }

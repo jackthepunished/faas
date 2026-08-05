@@ -121,8 +121,12 @@ func extractInputValue(body, field, action string) string {
 // TestDashboardDelete_HappyPath drives a real GET → POST pair. The
 // renderer mints the faas_csrf cookie + delete csrf_token field; the
 // handler verifies and 302s to ?deleted=1.
+//
+// Step-up gated: requires a fresh StepUpAt stamp on the cookie
+// envelope so the requireStepUpHandler(5m) gate passes. See
+// newSteppedUpDashboardServer (handlers_dashboard_test.go).
 func TestDashboardDelete_HappyPath(t *testing.T) {
-	srv, sid := newAuthedDashboardServer(t)
+	srv, sid := newSteppedUpDashboardServer(t)
 	csrfCookie, deleteToken, _ := renderDashboardAccount(t, srv, sid)
 	if deleteToken == "" {
 		t.Fatal("rendered account page is missing the delete csrf_token")
@@ -142,8 +146,13 @@ func TestDashboardDelete_HappyPath(t *testing.T) {
 // cross-site attacker who manages to send a SameSite=Lax cookie
 // (e.g. via a top-level navigation) still cannot forge a sealed
 // envelope without the 32-byte session key.
+//
+// Step-up gated: the cookie must carry a fresh StepUpAt stamp so
+// the gate passes through to the CSRF check we're actually
+// testing here. Without step-up the gate would 403 before
+// VerifyAuthenticated runs.
 func TestDashboardDelete_BadToken(t *testing.T) {
-	srv, sid := newAuthedDashboardServer(t)
+	srv, sid := newSteppedUpDashboardServer(t)
 	csrfCookie, _, _ := renderDashboardAccount(t, srv, sid)
 	rec := dashboardPOST(t, srv, sid, "/dashboard/account/delete",
 		map[string]string{middleware.FormFieldName: "forged-value"},
@@ -158,8 +167,12 @@ func TestDashboardDelete_BadToken(t *testing.T) {
 // (their own browser session doesn't carry it). The handler rejects
 // with 400 because the helper requires both the cookie and the form
 // field, with byte-equal values.
+//
+// Step-up gated: cookie carries a fresh StepUpAt stamp so the
+// request reaches VerifyAuthenticated (which is the layer under
+// test). A pre-PR-077 cookie would 403 at the gate.
 func TestDashboardDelete_RequiresCSRFFromSession(t *testing.T) {
-	srv, sid := newAuthedDashboardServer(t)
+	srv, sid := newSteppedUpDashboardServer(t)
 	_, deleteToken, _ := renderDashboardAccount(t, srv, sid)
 	// POST without the faas_csrf cookie. This simulates a cross-site
 	// attacker who tricks the victim's browser into POSTing the form
@@ -252,8 +265,14 @@ func TestDashboardExport_IncludeSecretsFalse(t *testing.T) {
 // exhaustively tested in pkg/middleware/csrf_test.go; here we just
 // assert that the dashboardDelete handler surfaces the helper's
 // 400 response when called with no body.
+//
+// Step-up gated: the request must reach VerifyAuthenticated
+// (the layer under test) so the cookie carries a fresh
+// StepUpAt stamp. Without step-up the gate 403s before
+// VerifyAuthenticated runs and this test would falsely
+// observe the gate's 403 instead of the CSRF helper's 400.
 func TestDashboardDelete_CSRFHelperBranch(t *testing.T) {
-	srv, sid := newAuthedDashboardServer(t)
+	srv, sid := newSteppedUpDashboardServer(t)
 	// POST with neither faas_csrf cookie nor csrf_token form field —
 	// the helper returns ErrCSRFInvalid; the handler maps that to 400.
 	rec := dashboardPOST(t, srv, sid, "/dashboard/account/delete", map[string]string{})

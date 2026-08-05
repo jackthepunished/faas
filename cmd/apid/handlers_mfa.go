@@ -30,6 +30,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/auth"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/authcode"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	mailpkg "github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -245,12 +246,17 @@ func (s *server) mfaVerify(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"Invalid code", "the TOTP code did not match"))
 		return
 	}
-	if err := s.reissueSessionCookie(w, r, acct, false); err != nil {
+	if err := s.reissueSessionCookieWithStepUp(w, r, acct, false, time.Now()); err != nil {
 		s.log.Error("mfa.verify.reissue_cookie", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not re-issue session cookie"))
 		return
 	}
 	s.audit.Emit(r.Context(), "account.mfa_session_stepped_up", &acct.ID, nil)
+	s.audit.Emit(r.Context(), "auth.step_up_verified", &acct.ID, map[string]any{
+		"path":    r.URL.Path,
+		"method":  r.Method,
+		"ttl_sec": 300, // 5-minute freshness window per ADR-077
+	})
 	writeJSON(w, http.StatusOK, api.MFAVerifyResponse{})
 }
 
@@ -288,7 +294,19 @@ func (s *server) mfaRecover(w http.ResponseWriter, r *http.Request, acct state.A
 			"Invalid request", "malformed JSON body"))
 		return
 	}
-	presented := authcode.HashRecoveryCode(req.Code)
+	// Hash the presented code with the per-process HMAC key.
+	// The HMAC key is loaded at apid boot via cmd/apid/main.go
+	// (FAAS_MFA_RECOVERY_HMAC_KEY / /var/lib/faas/recovery-hmac.key).
+	// If it is missing the boot refuses to start, so this path
+	// can only fail on (a) a programming error — secret unset
+	// at test time without SetHMACSecret — or (b) a runtime
+	// reset, neither of which is reachable in production.
+	presented, err := authcode.HashRecoveryCode(req.Code)
+	if err != nil {
+		s.log.Error("mfa.recover.hash", "err", err.Error())
+		api.WriteProblem(w, api.ErrCapacity("could not hash recovery code"))
+		return
+	}
 	// Step 1 — match without mutating. The split (match → refuse
 	// → consume) lets us reject the last-code burn atomically,
 	// rather than burning first and noticing later (issue #186
@@ -514,7 +532,18 @@ func (s *server) disableByPassword(w http.ResponseWriter, r *http.Request, acct 
 // the customer is about to ClearMFA anyway, so the locked-out
 // terminal state from /recover doesn't apply here.
 func (s *server) disableByRecoveryCode(w http.ResponseWriter, r *http.Request, acct state.Account, presented string) bool {
-	presentedHash := authcode.HashRecoveryCode(presented)
+	presentedHash, err := authcode.HashRecoveryCode(presented)
+	if err != nil {
+		// HMAC secret unset — boot-time apid refuses to start
+		// without one (cmd/apid/main.go::LoadRecoveryHMACKey);
+		// a runtime unset is a programming error. Surface as a
+		// capacity-style 5xx so the dashboard renders a retry
+		// prompt rather than silently letting the customer
+		// through with an unmatched code.
+		s.log.Error("mfa.disable.hash", "err", err.Error())
+		api.WriteProblem(w, api.ErrCapacity("could not hash recovery code"))
+		return false
+	}
 	// `remaining` is discarded on this path: the customer is about
 	// to ClearMFA anyway, so the count of codes left on the row is
 	// irrelevant. The /recover handler is the one that hands the
@@ -646,6 +675,41 @@ func SetMFAIdentities(f func() []*age.X25519Identity) { mfaIdentities = f }
 // 500 + a log line, so the wiring bug surfaces instead of
 // hiding.
 func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool) error {
+	return s.reissueSessionCookieWithStepUp(w, r, acct, mfaPending, time.Time{})
+}
+
+// reissueSessionCookieWithStepUp is the IAM-hardening-mega-PR
+// (logical change 6, ADR-077) entry point. Pass a non-zero
+// stepUpAt to refresh the step-up stamp on the cookie envelope
+// (the /v1/account/mfa/verify success branch sets it to
+// time.Now()); pass time.Time{} to leave it cleared (the
+// enrollment-confirm + recovery + disable branches don't
+// refresh step-up because they don't gate on it themselves).
+//
+// The binding-hash is unconditionally refreshed so the
+// stolen-cookie auto-revoke branch (ADR-076) always sees the
+// current (IP, UA-family) fingerprint. Two writes land in
+// lockstep before the cookie is sealed:
+//
+//  1. store.UpdateSessionBinding(current.ID, acct.ID, bind)
+//     re-stamps sessions.binding_hash so the row's fingerprint
+//     matches the cookie envelope's. Without this the
+//     middleware cross-check (RequireSessionCookie step 3.5,
+//     pkg/auth/middleware/middleware.go) would compare the
+//     new envelope hash against the row's stale mint-time
+//     hash and trip the auto-revoke branch on the customer's
+//     own post-reissue request.
+//
+//  2. sessions.IssueWithSessionAndBindingHash[AndStepUp]
+//     seals the envelope with the SAME bind value and writes
+//     it as Set-Cookie.
+//
+// If step 1 fails (ErrNotFound = row already revoked by an
+// interleaving operator or by the auto-revoke branch itself)
+// we surface the failure so the caller can map to 401
+// CodeSessionInvalid; minting a new envelope over a revoked
+// row would silently re-arm the customer's session.
+func (s *server) reissueSessionCookieWithStepUp(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool, stepUpAt time.Time) error {
 	current, ok := authmw.SessionFromContext(r)
 	if !ok {
 		if s.log != nil {
@@ -654,7 +718,21 @@ func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, ac
 		}
 		return errSessionMissingFromContext
 	}
-	cookie, err := s.sessions.IssueWithSession(current.ID, acct.ID, mfaPending)
+	bind := bindinghash.Compute(clientIPFromRequest(r), bindinghash.UAFamily(r.UserAgent()), s.bindingKeyFn)
+	if err := s.store.UpdateSessionBinding(r.Context(), current.ID, acct.ID, bind); err != nil {
+		if s.log != nil {
+			s.log.Warn("reissueSessionCookie: update binding_hash failed",
+				"path", r.URL.Path, "account", acct.ID, "err", err.Error())
+		}
+		return err
+	}
+	var cookie string
+	var err error
+	if stepUpAt.IsZero() {
+		cookie, err = s.sessions.IssueWithSessionAndBindingHash(current.ID, acct.ID, bind, mfaPending)
+	} else {
+		cookie, err = s.sessions.IssueWithSessionAndBindingHashAndStepUp(current.ID, acct.ID, bind, stepUpAt, mfaPending)
+	}
 	if err != nil {
 		return err
 	}
@@ -773,8 +851,19 @@ func (s *server) flipMFARequiredIfUnenrolled(ctx context.Context, acct state.Acc
 	}
 	if !changed {
 		// Row already carried mfa_required=true (a prior chokepoint
-		// ran, or a webhook was redelivered). Suppress the duplicate
-		// audit row.
+		// ran, or a webhook was redelivered). The "silent re-arm"
+		// gap (PR #629 review finding F2): previously suppressed the
+		// audit row entirely, so SOC 2 CC6.2 couldn't prove the
+		// chokepoint fired on a customer whose mfa_required was
+		// already true. Emit a separate audit kind so the row
+		// distinguishes "first arm" from "re-arm on a later
+		// chokepoint hit" — both lines stay in the audit log
+		// without either duplicating.
+		data := map[string]any{"reason": reason}
+		for k, v := range extra {
+			data[k] = v
+		}
+		s.audit.Emit(ctx, "account.mfa_required_armed_again", &acct.ID, data)
 		return
 	}
 	data := map[string]any{"reason": reason}

@@ -10,6 +10,7 @@ package middleware_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -103,7 +104,20 @@ type fakeLookups struct {
 	getErr     error
 	touchCalls []string
 	touchErr   error
-	mu         sync.Mutex
+	// revokeCalls + revokeErr back the new middleware SessionLookup
+	// method (IAM-hardening-mega-PR logical change 5, ADR-076).
+	// The binding-mismatch branch calls RevokeSession during the
+	// auto-revoke; tests assert the call landed with the expected
+	// (sid, accountID) pair.
+	revokeCalls []revokeCall
+	revokeErr   error
+	mu          sync.Mutex
+}
+
+// revokeCall is the per-call record the binding-mismatch test
+// inspects. Fields match the SessionLookup.RevokeSession signature.
+type revokeCall struct {
+	sid, accountID string
 }
 
 func (l *fakeLookups) GetSession(_ context.Context, sid string) (state.Session, error) {
@@ -119,6 +133,30 @@ func (l *fakeLookups) TouchSessionLastSeen(_ context.Context, sid string) error 
 	defer l.mu.Unlock()
 	l.touchCalls = append(l.touchCalls, sid)
 	return l.touchErr
+}
+func (l *fakeLookups) RevokeSession(_ context.Context, sid, accountID string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.revokeCalls = append(l.revokeCalls, revokeCall{sid: sid, accountID: accountID})
+	if l.revokeErr != nil {
+		return false, l.revokeErr
+	}
+	// Mark the underlying session row revoked. Tests that need the
+	// "revoked row" assertion can read it back via GetSession; we
+	// also keep a parallel counter so tests don't have to dispatch
+	// on the sessBySid map.
+	if l.sessBySid != nil {
+		if row, ok := l.sessBySid[sid]; ok {
+			now := time.Now()
+			row.RevokedAt = &now
+			l.sessBySid[sid] = row
+		}
+	}
+	if l.sess.ID == sid {
+		now := time.Now()
+		l.sess.RevokedAt = &now
+	}
+	return true, nil
 }
 
 type fakeAuditor struct {
@@ -164,7 +202,7 @@ var (
 func newMW(t *testing.T, a *fakeAuthn, sess *fakeSessions, lk *fakeLookups, au *fakeAuditor) *authmw.Middleware {
 	t.Helper()
 	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
-	mw := authmw.New(a, sess, lk, au, slog.Default(), lim)
+	mw := authmw.New(a, sess, lk, au, slog.Default(), lim, nil)
 	return mw
 }
 
@@ -175,7 +213,7 @@ func TestNew_NilAuthenticatorPanics(t *testing.T) {
 		}
 	}()
 	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
-	_ = authmw.New(nil, nil, nil, nil, slog.Default(), lim)
+	_ = authmw.New(nil, nil, nil, nil, slog.Default(), lim, nil)
 }
 
 func TestNew_NilLimiterPanics(t *testing.T) {
@@ -184,7 +222,7 @@ func TestNew_NilLimiterPanics(t *testing.T) {
 			t.Fatalf("expected panic on nil Limiter (RequireLimited cannot share an empty bucket)")
 		}
 	}()
-	_ = authmw.New(newFakeAuthn(), nil, nil, nil, slog.Default(), nil)
+	_ = authmw.New(newFakeAuthn(), nil, nil, nil, slog.Default(), nil, nil)
 }
 
 func mkActiveAccount(id string) state.Account {
@@ -501,6 +539,95 @@ func TestRequireSession_BearerTouchKeyLastUsedDebounce(t *testing.T) {
 	}
 }
 
+// --- RequireStepUp ---------------------------------------------------------
+
+// TestRequireStepUp_ExpiredStamp_403 pins the gate: a step_up_at
+// stamp older than the TTL ⇒ 403 CodeMFARequired + an
+// auth.step_up_required audit row with reason="expired".
+func TestRequireStepUp_ExpiredStamp_403(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/keys/some/rotate", nil, nil)
+	r = r.WithContext(authmw.WithStepUp(r.Context(), time.Now().Add(-10*time.Minute)))
+	h := mw.RequireStepUp(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 1 {
+		t.Errorf("audit rows = %d, want 1 auth.step_up_required", len(rows))
+	} else if data := rows[0].data["reason"]; data != "expired" {
+		t.Errorf("reason = %v, want expired", data)
+	}
+}
+
+// TestRequireStepUp_FreshStamp_Passes pins the happy-path: a
+// step_up_at stamp newer than TTL ⇒ inner handler fires, no
+// audit row.
+func TestRequireStepUp_FreshStamp_Passes(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/keys/some/rotate", nil, nil)
+	r = r.WithContext(authmw.WithStepUp(r.Context(), time.Now().Add(-30*time.Second)))
+	hits := 0
+	h := mw.RequireStepUp(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		hits++
+	})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (fresh step-up should pass)", hits)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 0 {
+		t.Errorf("audit rows = %d, want 0 (fresh stamp)", len(rows))
+	}
+}
+
+// TestRequireStepUp_MissingStamp_403 pins the absent-stamp branch:
+// no WithStepUp has been called on r.Context() ⇒ gate fires with
+// reason="missing" (the bearer principal / pre-PR-077 cookie
+// path; both are documented legacy cookies whose bypass is
+// intentional but the gate still classifies them as "missing"
+// in the audit row).
+func TestRequireStepUp_MissingStamp_403(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/keys/some/rotate", nil, nil)
+	hits := 0
+	h := mw.RequireStepUp(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		hits++
+	})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	// Missing-stamp = bearer-bypass path: pass through. Verify
+	// hits=1 and no audit row.
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (bearer-bypass)", hits)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 0 {
+		t.Errorf("audit rows = %d, want 0 (bearer bypass)", len(rows))
+	}
+}
+
 // --- RequireSession: session-cookie branch -------------------------------
 
 func TestRequireSession_SessionHappyPath(t *testing.T) {
@@ -589,6 +716,140 @@ func TestRequireSession_SessionRevokedEmitsStolenAudit(t *testing.T) {
 	rows := audit.rowsOf("auth.session.stolen")
 	if len(rows) != 1 {
 		t.Errorf("audit rows = %d, want 1 auth.session.stolen", len(rows))
+	}
+}
+
+// TestRequireSession_BindingMismatch_AutoRevokes pins the
+// IAM-hardening-mega-PR (logical change 5, ADR-076) defence
+// against cookie theft: when the envelope's binding_hash
+// (HMAC of (IP, UA-family)) disagrees with the sessions row's
+// binding_hash, RequireSession must (a) call
+// SessionLookup.RevokeSession with the (sid, accountID) of the
+// sealed envelope, (b) emit the auth.session.binding_mismatch
+// audit row carrying both prefix8 values, (c) clear the
+// session cookie, and (d) respond 401 CodeSessionInvalid.
+//
+// The "drift" simulates an attacker who stole a `faas_sid` cookie
+// from one browser at one IP and replayed it from a different
+// browser at a different IP. The defence is the auto-revoke.
+func TestRequireSession_BindingMismatch_AutoRevokes(t *testing.T) {
+	authn := newFakeAuthn()
+	authn.acctByID["acct-1"] = mkActiveAccount("acct-1")
+	audit := &fakeAuditor{}
+	// Envelope stamped at IP A, UA = Chrome.
+	envelopeHash := "aaaabbbbccccddddaaaabbbbccccdddd" // 32 hex
+	envelope := session.Envelope{
+		AccountID:   "acct-1",
+		Sid:         "sid-1",
+		BindingHash: envelopeHash,
+	}
+	sess := &fakeSessions{env: envelope}
+	// Sessions row stamped at IP B, UA = Firefox.
+	rowHash := "11112222333344441111222233334444"
+	lookups := &fakeLookups{
+		sess: state.Session{
+			ID:          "sid-1",
+			AccountID:   "acct-1",
+			BindingHash: rowHash,
+		},
+	}
+
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(
+		authn,
+		sess,
+		lookups,
+		audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		lim,
+		func() []byte { return make([]byte, 32) }, // arbitrary key bytes
+	)
+	hits := 0
+	h := mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) { hits++ })
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", nil, map[string]string{"faas_sid": "valid-cookie"})
+	h(rec, r)
+
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (binding mismatch)", hits)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if len(lookups.revokeCalls) != 1 {
+		t.Fatalf("RevokeSession calls = %d, want 1", len(lookups.revokeCalls))
+	}
+	rc := lookups.revokeCalls[0]
+	if rc.sid != "sid-1" || rc.accountID != "acct-1" {
+		t.Errorf("RevokeSession args = (%q, %q), want (sid-1, acct-1)", rc.sid, rc.accountID)
+	}
+	rows := audit.rowsOf("auth.session.binding_mismatch")
+	if len(rows) != 1 {
+		t.Fatalf("audit rows = %d, want 1 auth.session.binding_mismatch", len(rows))
+	}
+	got := rows[0].data
+	if got["sid"] != "sid-1" {
+		t.Errorf("audit sid = %v, want sid-1", got["sid"])
+	}
+	if got["path"] != "/v1/apps" {
+		t.Errorf("audit path = %v, want /v1/apps", got["path"])
+	}
+	if got["expected_prefix"] != "11112222" {
+		t.Errorf("expected_prefix = %v, want 11112222 (8 chars of rowHash)", got["expected_prefix"])
+	}
+	if got["presented_prefix"] != "aaaabbbb" {
+		t.Errorf("presented_prefix = %v, want aaaabbbb (8 chars of envelopeHash)", got["presented_prefix"])
+	}
+	// Cookie must be cleared.
+	setCookie := rec.Header().Get("Set-Cookie")
+	if !strings.Contains(setCookie, "faas_sid=") || !strings.Contains(setCookie, "Max-Age=0") {
+		t.Errorf("Set-Cookie should clear faas_sid on binding mismatch: %q", setCookie)
+	}
+}
+
+// TestRequireSession_BindingMismatch_NotArmed_NoRevoke pins the
+// "binding not armed" tolerance: when BOTH sides have an empty
+// binding_hash (a pre-PR-076 cookie AND a pre-PR-076 row), the
+// cross-check is a no-op. The test must NOT call RevokeSession
+// (no fingerprint to drift from) and must NOT emit
+// auth.session.binding_mismatch.
+func TestRequireSession_BindingMismatch_NotArmed_NoRevoke(t *testing.T) {
+	authn := newFakeAuthn()
+	authn.acctByID["acct-1"] = mkActiveAccount("acct-1")
+	audit := &fakeAuditor{}
+	sess := &fakeSessions{env: session.Envelope{
+		AccountID:   "acct-1",
+		Sid:         "sid-1",
+		BindingHash: "", // not armed
+	}}
+	lookups := &fakeLookups{sess: state.Session{
+		ID:          "sid-1",
+		AccountID:   "acct-1",
+		BindingHash: "", // not armed
+	}}
+
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, sess, lookups, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+	hits := 0
+	h := mw.RequireSession(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) { hits++ })
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/apps", nil, map[string]string{"faas_sid": "valid-cookie"})
+	h(rec, r)
+
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (binding not armed should pass)", hits)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if len(lookups.revokeCalls) != 0 {
+		t.Errorf("RevokeSession calls = %d, want 0 (binding not armed)", len(lookups.revokeCalls))
+	}
+	if rows := audit.rowsOf("auth.session.binding_mismatch"); len(rows) != 0 {
+		t.Errorf("audit rows = %d, want 0 (binding not armed)", len(rows))
 	}
 }
 

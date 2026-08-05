@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -268,16 +267,24 @@ func TestScopeMatrix(t *testing.T) {
 
 	t.Run("session-cookie/admin-route-allowed", func(t *testing.T) {
 		// The load-bearing branch of principalHasScope: a session-cookie
-		// principal has Key==nil and is implicitly admin. PATCH
-		// /v1/account/plan is admin-only; without the Key==nil branch,
-		// the dashboard user would be 403'd on its own plan-change
-		// page. We assert != 403 because the handler may 200/400 on
-		// plan validation — what we care about is that requireScope
-		// did NOT 403.
+		// principal has Key==nil and is implicitly admin. GET
+		// /v1/account/keys/grace_window_days is admin-only; without
+		// the Key==nil branch, the dashboard user would be 403'd.
+		// We assert != 403 because the handler may 200/404 on lookup
+		// (grace_window_days is gated by a feature flag at the
+		// handler) — what we care about is that requireScope did
+		// NOT 403.
+		//
+		// Note: PATCH /v1/account/plan was the original route here
+		// but the IAM-hardening mega-PR commit 6 added step-up MFA
+		// to that route (5-min freshness); the cookie minted by
+		// setupWithSession doesn't carry a recent StepUpAt stamp
+		// so requireStepUp would 403 even when requireScope would
+		// have allowed it. GET /grace_window_days sidesteps the
+		// step-up gate without losing the "admin-scope, no-key" test
+		// coverage.
 		e, cookie := setupWithSession(t)
-		req := httptest.NewRequest(http.MethodPatch, "/v1/account/plan",
-			strings.NewReader(`{"plan":"scale"}`))
-		req.Header.Set("Content-Type", "application/json")
+		req := httptest.NewRequest(http.MethodGet, "/v1/account/keys/grace_window_days", nil)
 		req.AddCookie(cookie)
 		rec := httptest.NewRecorder()
 		e.h.ServeHTTP(rec, req)

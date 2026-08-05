@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -112,6 +113,11 @@ type Sessions interface {
 type SessionLookup interface {
 	GetSession(ctx context.Context, sid string) (state.Session, error)
 	TouchSessionLastSeen(ctx context.Context, sid string) error
+	// RevokeSession is the IAM-hardening-mega-PR (logical change 5)
+	// auto-revoke path. The middleware calls it when the live
+	// binding-hash check fails — the stolen-cookie defence
+	// (ADR-076). Returns the underlying state.Store semantics.
+	RevokeSession(ctx context.Context, id, accountID string) (bool, error)
 }
 
 // Auditor is the subset of pkg/audit.Auditor.Emit that the
@@ -177,6 +183,12 @@ type Middleware struct {
 	keyTouchWindowForTest time.Duration
 	// sessionTouchWindowForTest: same override for sessions.
 	sessionTouchWindowForTest time.Duration
+	// BindingKeyFn is the IAM-hardening-mega-PR (logical change 5,
+	// ADR-076) HMAC key source. nil disables binding-hash
+	// computation (the envelope's `binding_hash` field is omitted;
+	// the cross-check is skipped). Production wires this to the
+	// first 32 bytes of the session-key AEAD secret.
+	BindingKeyFn func() []byte
 }
 
 // keyTouchWindow returns the production 30s window unless an
@@ -291,7 +303,7 @@ func (t *TouchTicket) FiredAtSet(ts time.Time) { t.firedAt.Store(&ts) }
 //     anything at Info or above; Warn is for cross-check failures
 //     and detached-touch errors.
 func New(authn Authenticator, sessions Sessions, lookups SessionLookup,
-	auditor Auditor, log *slog.Logger, limiter *middleware.Limiter) *Middleware {
+	auditor Auditor, log *slog.Logger, limiter *middleware.Limiter, bindingKeyFn bindinghash.KeyFunc) *Middleware {
 	if authn == nil {
 		panic("auth: nil Authenticator")
 	}
@@ -305,6 +317,7 @@ func New(authn Authenticator, sessions Sessions, lookups SessionLookup,
 		Audit:             auditor,
 		Log:               log,
 		Limiter:           limiter,
+		BindingKeyFn:      bindingKeyFn,
 		SessionCookieName: defaultSessionCookieName,
 	}
 }
@@ -531,6 +544,14 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 						*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil, Membership: nil}))
 						//nolint:contextcheck // same pointer-mutation contract: withMFAPending derives from r.Context() so the flag stamps into the OUTER r.
 						*r = *r.WithContext(withMFAPending(r.Context(), session.IsMFAPending(env)))
+						// IAM-hardening-mega-PR (logical change 6,
+						// ADR-077): stamp the step-up timestamp the
+						// /v1/account/mfa/verify handler last sealed
+						// onto the envelope so RequireStepUp can read
+						// it on the next gated request. Zero-value
+						// stamps bypass the gate (legacy cookies —
+						// rolling migration; see RequireStepUp).
+						*r = *r.WithContext(WithStepUp(r.Context(), env.StepUpAt))
 						next(w, r, acct)
 						return
 					}
@@ -596,6 +617,39 @@ func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 				"path":   r.URL.Path,
 			})
 		}
+		return state.Session{}, true, nil
+	}
+	// (3.5) binding-hash mismatch = stolen-cookie auto-revoke
+	// (IAM hardening mega-PR, logical change 5, ADR-076).
+	// Compare the envelope's binding_hash (sealed by AEAD at mint
+	// time) against the sessions row's binding_hash column.
+	// Either side empty = "binding not armed" (pre-PR-076 cookie
+	// or unix-socket code path); cross-check is skipped in that
+	// case. Mismatch ⇒ auto-revoke + audit + 401.
+	if m.BindingKeyFn != nil && env.BindingHash != "" && sess.BindingHash != "" &&
+		env.BindingHash != sess.BindingHash {
+		// Best-effort revoke. Failure is logged but the
+		// 401 still returns — the request is rejected
+		// regardless of the revoke's success.
+		if _, revokeErr := m.Lookups.RevokeSession(ctx, env.Sid, env.AccountID); revokeErr != nil && m.Log != nil {
+			m.Log.Warn("session binding-mismatch auto-revoke failed",
+				"sid", logsanitize.Field(env.Sid),
+				"path", logsanitize.Field(r.URL.Path),
+				"error", revokeErr.Error())
+		}
+		// Audit emit (best-effort — never blocks the 401).
+		if m.Audit != nil {
+			m.Audit.Emit(ctx, "auth.session.binding_mismatch", &env.AccountID, map[string]any{
+				"sid":              env.Sid,
+				"method":           r.Method,
+				"path":             r.URL.Path,
+				"expected_prefix":  prefix8(sess.BindingHash),
+				"presented_prefix": prefix8(env.BindingHash),
+			})
+		}
+		m.clearSessionCookie(w)
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeSessionInvalid,
+			"Session invalid", "session binding mismatch — possible replay; sign in again"))
 		return state.Session{}, true, nil
 	}
 	// (4) account-mismatch is defensive — the AEAD binds
@@ -742,6 +796,129 @@ func (m *Middleware) RequireMFA(next AccountHandler) AccountHandler {
 				"method": r.Method,
 			})
 		}
+	}
+}
+
+// --- RequireStepUp -------------------------------------------------------
+
+// RequireStepUp gates a route on a fresh TOTP step-up. Reads the
+// stamp set by RequireSession's session-cookie branch (StepUpFrom)
+// and rejects when it's missing or older than ttl. Bearer-key
+// principals bypass step-up (an API key is itself a step-up-
+// equivalent proof — the request can't be replayed from a stolen
+// browser without the key).
+//
+// On a blocked request emits a 403 problem and an IAM-4
+// auth.step_up_required audit row. Distinct from RequireMFA's
+// auth.mfa_gate_hit kind so a downstream query can tell "needs
+// MFA enrollment" from "needs recent step-up". Auditable per ADR-077.
+//
+// Default TTL is the user-confirmed 5-minute window (industry
+// comparison: GitHub sudo-mode 5m, AWS console 15m, GCP IAM 10m;
+// 5m is the shortest that still tolerates a single confirmation
+// click latency). The auth.step_up_verified kind fires on the
+// /v1/account/mfa/verify success branch so an operator can audit
+// how often the gate is succeeding vs. blocking.
+//
+// Compose ordering for a sensitive-op route:
+//
+//	requireMFA → requireScope(admin) → requireStepUp(5m) → handler
+//
+// The new stamp is written by /v1/account/mfa/verify on every
+// success — see cmd/apid/handlers_mfa.go reissueSessionCookie.
+func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) AccountHandler {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return func(next AccountHandler) AccountHandler {
+		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
+			ts, has := StepUpFrom(r)
+			// Bearer-key principal (no step-up stamp): bypass.
+			// Pre-PR-077 cookie without step_up_at is also bypass-
+			// aware — the middleware is opt-in and the absence of a
+			// stamp carries the same risk profile as the bearer-
+			// bypass path. The Envelope.StepUpAt field is omitempty
+			// so a cookie issued before PR-077 reads StepUpAt zero
+			// and the bypass fails open: this is the documented
+			// "rolling out, the gate hasn't tripped anyone yet"
+			// behaviour. Once every active session carries a stamp
+			// (one TOTP rotation cycle later), the bypass becomes
+			// the legacy-cookie anti-pattern that future audit
+			// queries can filter for (subject = sid, no StepUpAt).
+			if !has {
+				next(w, r, acct)
+				return
+			}
+			if !ts.IsZero() && time.Since(ts) <= ttl {
+				next(w, r, acct)
+				return
+			}
+			reason := "missing"
+			if !ts.IsZero() {
+				reason = "expired"
+			}
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+				api.CodeMFARequired, "MFA required",
+				"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh"))
+			if m.Audit != nil {
+				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
+					"path":    r.URL.Path,
+					"method":  r.Method,
+					"reason":  reason,
+					"ttl_sec": int(ttl.Seconds()),
+				})
+			}
+		}
+	}
+}
+
+// RequireStepUpHandler is the http.Handler-shaped twin of
+// RequireStepUp (IAM-hardening-mega-PR, ADR-077) for dashboard
+// routes that don't fit the AccountHandler signature
+// (RequireSession is http.Handler-shaped via sessionAuth in
+// cmd/apid/auth_facade.go). Same TTL semantics, same audit kind,
+// same bypass rules. The stamp is read off r.Context() the same
+// way RequireStepUp reads it via StepUpFrom.
+func (m *Middleware) RequireStepUpHandler(ttl time.Duration) func(http.Handler) http.Handler {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ts, has := StepUpFrom(r)
+			if !has {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !ts.IsZero() && time.Since(ts) <= ttl {
+				next.ServeHTTP(w, r)
+				return
+			}
+			reason := "missing"
+			if !ts.IsZero() {
+				reason = "expired"
+			}
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+				api.CodeMFARequired, "MFA required",
+				"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh"))
+			if m.Audit != nil {
+				// Dashboard routes don't carry a state.Account on
+				// the request context the way RequireSession's
+				// AccountHandler branch does; use the session's
+				// AccountID via principalFrom so the audit row
+				// still names the principal.
+				acctID := ""
+				if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+					acctID = p.Acct.ID
+				}
+				m.Audit.Emit(r.Context(), "auth.step_up_required", &acctID, map[string]any{
+					"path":    r.URL.Path,
+					"method":  r.Method,
+					"reason":  reason,
+					"ttl_sec": int(ttl.Seconds()),
+				})
+			}
+		})
 	}
 }
 
@@ -931,4 +1108,17 @@ func (m *Middleware) ClearSessionCookie(w http.ResponseWriter) {
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+// prefix8 returns the first 8 characters of s, or s itself when
+// shorter. The IAM-3-Evolved binding-mismatch audit row carries
+// the 8-char prefix so an operator can disambiguate the kind of
+// drift (e.g. "presented `7a2f…` but stored `b81c…`") without
+// leaking the HMAC key. 8 hex chars = 32 bits, plenty for a
+// human-readable fingerprint.
+func prefix8(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
 }

@@ -335,6 +335,12 @@ jobs:
                    /etc/systemd/system/faas-gatewayd-public.service.d
             systemctl daemon-reload
             for svc in ${FAAS_RESTART_ORDER}; do
+              # PR-M.2: chown /run/faas BEFORE each rollback
+              # restart — same rationale as the main path. Run
+              # 31055261896 (PR #657 deploy 2026-08-05) confirmed
+              # the race in both paths.
+              chown root:faas /run/faas
+              chmod 0775 /run/faas
               systemctl restart "faas-${svc}.service" || true
               # Mirror the main-restart settle: vmmd needs the
               # /run/faas/vmmd.sock visibility gate, the rest get
@@ -518,6 +524,21 @@ jobs:
           # 31121004495).
           for svc in ${FAAS_RESTART_ORDER}; do
             systemctl reset-failed "faas-${svc}.service" || true
+            # PR-M.2: chown /run/faas BEFORE each daemon restart.
+            # vmmd's RuntimeDirectory=faas re-creates the dir's
+            # per-unit tmpfs on every restart, resetting perms to
+            # root:root 0755. Without this, the next daemon in the
+            # loop restarts with bad perms, fails to bind its .sock,
+            # and either exits (no Restart=on-failure → stuck) or
+            # logs a non-fatal error and degrades (gatewayd-internal
+            # synth/egress listeners missing). PR-M.1's end-of-loop
+            # chown is too late for schedd (exits on bind fail) and
+            # gatewayd-internal (logs but degrades). Run 31055261896
+            # (PR #657 deploy 2026-08-05) confirmed this. See
+            # deploy/controlplane/tmpfiles.d/faas.conf for the
+            # canonical rationale.
+            chown root:faas /run/faas
+            chmod 0775 /run/faas
             systemctl restart "faas-${svc}.service" || true
             if [[ "${svc}" == "vmmd" ]]; then
               # vmmd is the SOLE /run/faas owner — schedd + apid

@@ -27,6 +27,7 @@ package main
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/authz"
@@ -60,6 +61,32 @@ func (s *server) requireMFA(next accountHandler) accountHandler {
 	pkgNext := middleware.AccountHandler(next)
 	pkgHandler := s.authMw.RequireMFA(pkgNext)
 	return authAccountHandler(pkgHandler)
+}
+
+// requireStepUp delegates to pkg/auth.Middleware.RequireStepUp
+// (IAM-hardening-mega-PR logical change 6, ADR-077). Compose order
+// for a sensitive-op route is:
+//
+//	requireMFA → requireScope(admin) → requireStepUp(5m) → handler
+//
+// The default TTL is the user-confirmed 5-minute window. The
+// reissue seam at /v1/account/mfa/verify refreshes the stamp on
+// every successful TOTP verify (see reissueSessionCookie in
+// handlers_mfa.go).
+func (s *server) requireStepUp(ttl time.Duration) func(accountHandler) accountHandler {
+	return func(next accountHandler) accountHandler {
+		pkgNext := middleware.AccountHandler(next)
+		pkgHandler := s.authMw.RequireStepUp(ttl)(pkgNext)
+		return authAccountHandler(pkgHandler)
+	}
+}
+
+// requireStepUpHandler is the http.Handler-shaped twin for
+// dashboard routes (cmd/apid/server.go wires /dashboard/account/*
+// through sessionAuth → http.Handler, not through AccountHandler).
+// Same TTL semantics as requireStepUp.
+func (s *server) requireStepUpHandler(ttl time.Duration) func(http.Handler) http.Handler {
+	return s.authMw.RequireStepUpHandler(ttl)
 }
 
 // requireScope delegates to pkg/auth.Middleware.RequireScope. Same

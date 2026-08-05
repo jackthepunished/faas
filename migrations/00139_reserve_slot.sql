@@ -1,11 +1,13 @@
 -- filename: 00139_reserve_slot.sql
--- Fence at slot 139 — bridge between 00138 (PR #656 apps_eviction_priority)
--- and 00140 (PR #658 webhook claims). PR #656 originally held slot 139
--- with deployments_scan_result; the slot was renumbered to 00144 to
--- dodge the open-PR collision gate (PR #651 / issue #464 mega-PR also
--- claims 139). Per ADR-041 the bridge fence stays as a connector.
--- Body is a no-op `select 1;` so goose applies cleanly and writes a
--- row in goose_db_version.
+-- Slot fence: PR #658 (issue #476 webhook delivery) claims slots
+-- 140 + 141 on its branch (webhook tables + delivery log); this
+-- fence at 139 is the bridge between PR #647's apps_eviction_priority
+-- at 138 and PR #658's app_webhooks at 140. PR #658 will resolve
+-- this fence on its branch's merge via `git rm migrations/00139_reserve_slot.sql`.
+-- The IAM mega-PR (PR #653) originally held the api_keys provenance
+-- migration at slot 139, then renumbered twice — to 141 after
+-- PR #651's open claim surfaced, then to 144 after PR #658's
+-- open claim on 141 surfaced. ADR-041.
 
 -- +goose Up
 -- +goose StatementBegin

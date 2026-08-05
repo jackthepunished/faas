@@ -247,6 +247,25 @@ type APIKey struct {
 	Status        string
 	RevokedAt     *time.Time
 	RotatedFromID *string
+	// CreatedIP is the best-effort client IP at mint time, captured
+	// by clientIPFromRequest on the minting request. NULL for pre-PR
+	// rows and for the unix-socket code path (no meaningful client IP).
+	// Stored as a string (Postgres inet renders to a textual form on
+	// scan) so the handler-side sanitiser is the same as the audit
+	// payload path.
+	CreatedIP string
+	// CreatedUA is the best-effort User-Agent at mint time, captured
+	// from r.UserAgent() and run through logsanitize.Field before
+	// reaching the DB. NULL for pre-PR rows.
+	CreatedUA string
+	// ParentKeyID is the optional FK to the predecessor key. Distinct
+	// from RotatedFromID: RotatedFromID is the rotation-internal
+	// "this key was minted by a rotation" stamp, set by the Store layer
+	// on every rotate. ParentKeyID is the explicit provenance lineage
+	// (e.g. a non-rotation mint that wants to record a parent in a
+	// future PR). ON DELETE SET NULL — a hard-deleted predecessor
+	// leaves the lineage intact but un-anchored.
+	ParentKeyID *string
 }
 
 // App is a deployed application (or function). The Manifest carries the
@@ -1883,6 +1902,15 @@ type Session struct {
 	IssuedAt   time.Time
 	LastSeenAt *time.Time // nil until first authenticated request post-mint
 	RevokedAt  *time.Time // nil == active; non-nil == revoked
+	// BindingHash is the IAM-3-evolved ADR-076 fingerprint
+	// (HMAC-SHA256 of `ip || "\x00" || ua_family`, keyed by the
+	// host's session-key secret). Empty for pre-PR-076 rows and
+	// for the unix-socket / CLI-auth code paths that don't have
+	// a meaningful fingerprint. The RequireSession cookie branch
+	// compares the live request's binding hash against this
+	// value; mismatch ⇒ auto-revoke + audit + 401 (the
+	// stolen-cookie defence).
+	BindingHash string
 }
 
 // AppSecret is one row of customer secrets (spec §11/G2). apid is the only

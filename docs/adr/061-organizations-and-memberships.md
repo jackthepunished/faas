@@ -269,3 +269,26 @@
   becomes load-bearing for that PR's surface (e.g. PR 4 flips
   `spec-check` on; PR 5 flips `sdk-check`; PR 2 flips
   `sqlc-check` and `proto-check`).
+
+## Verification (post-merge, IAM hardening mega-PR)
+
+The matrix and the route table gained two regression-guard tests
+in the IAM hardening mega-PR so a future contributor cannot ship
+a role-permission change without an explicit test edit:
+
+- `pkg/authz/authorize_test.go::TestRoleMatrix_NoOrphanCells`
+  walks every `(action, role)` cell in `allowRoleMatrix` and
+  asserts the canonical `roleMatrixCells` table has a matching
+  row. The original 9-action matrix was missing the PR-6 cells
+  for `OrgActionCreateApiKey` / `OrgActionRevokeApiKey`; this
+  test pins the full 11 × 5 = 55-cell surface. A future PR that
+  adds an action (e.g. `OrgActionManageSSO`) is forced to extend
+  `roleMatrixCells` or this test fails.
+
+- `cmd/apid/server_org_authz_test.go::TestOrgRoutes_GatedByAuthorize`
+  walks every `/v1/orgs/{slug}/*` pattern with a principal that
+  is NOT a member of the seeded org and asserts the response is
+  4xx. Mirrors `TestAllV1Routes_RequireAuthOrLimit` (which guards
+  the authn surface) for the authz surface. Together the two
+  tests cover both halves of spec §11's "every authenticated route
+  must be wrapped" defence.

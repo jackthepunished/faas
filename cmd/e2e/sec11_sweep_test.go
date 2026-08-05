@@ -22,6 +22,8 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"filippo.io/age"
@@ -208,17 +210,53 @@ var vmmdBinary string
 // WITHOUT FAAS_APID_LISTEN (startAPIDWithEnv / startAPIDAndExpectFail
 // allocate the listen addr inside and append it last). Same shape as
 // pkg/e2etest.testEnvCommon (harness.go:498) minus the listen var.
-func envForAPID(dbURL string, extra ...string) []string {
+//
+// The FAAS_MFA_RECOVERY_HMAC_KEY entry is generated fresh per test
+// (matches the testEnvCommon wiring in pkg/e2etest/harness.go) so the
+// apid refuse-to-start policy in cmd/apid/main.go:loadOrGenerateRecoveryHMACKey
+// has a real key to load. The audit-hmac loader still falls back to
+// a zero-key Warn — that path was never gated.
+func envForAPID(t *testing.T, dbURL string, extra ...string) []string {
+	t.Helper()
 	env := []string{
 		"DATABASE_URL=" + dbURL,
 		"FAAS_SKIP_SOCKET_GROUP=1", // harness convention; see harness.go:498
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 		"FAAS_APPS_DOMAIN=apps.test.example",
+		"FAAS_MFA_RECOVERY_HMAC_KEY=" + testRecoveryHMACKeyHex(t),
 	}
 	env = append(env, extra...)
 	return env
 }
+
+// testRecoveryHMACKeyHex returns a fresh 32-byte hex string for the
+// FAAS_MFA_RECOVERY_HMAC_KEY env var. Cached per (t) via t.Cleanup so
+// a single test that boots apid multiple times reuses the same key
+// (avoids surprising the harness with rotating keys across reboots
+// of the same apid in the test body).
+func testRecoveryHMACKeyHex(t *testing.T) string {
+	t.Helper()
+	if v, ok := tRecoverHMAC.Load(t); ok {
+		return v.(string)
+	}
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("e2e: crypto/rand for recovery HMAC: %v", err)
+	}
+	s := hex.EncodeToString(b[:])
+	tRecoverHMAC.Store(t, s)
+	return s
+}
+
+// tRecoverHMAC keys per-testing.T to a fresh 32-byte hex string for
+// FAAS_MFA_RECOVERY_HMAC_KEY. Per-test uniqueness prevents one
+// test's debug-log key from being useful for the next test's
+// recovery codes; the test-private cache lets one test that boots
+// apid multiple times keep a stable key across those reboots (the
+// apid recovery-hmac key is supposed to be stable for the
+// lifetime of the daemon's stored mfa_recovery_codes_hash rows).
+var tRecoverHMAC sync.Map // *testing.T -> string
 
 // startAPIDWithEnv boots apid with extra env and registers a t.Cleanup
 // that SIGTERMs and waits up to 5s before SIGKILL. Returns the listen
@@ -347,7 +385,7 @@ func startVMMDAndExpectFail(t *testing.T, env []string, expectFailWithin time.Du
 
 func TestSec11_AuthLimitPerIP_CrossProcess(t *testing.T) {
 	pool := openSchemaPG(t)
-	addr, _ := startAPIDWithEnv(t, envForAPID(poolDSN(pool))...)
+	addr, _ := startAPIDWithEnv(t, envForAPID(t, poolDSN(pool))...)
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	// Phase 1: same IP, 10× bogus bearer — all 401. 11th — 429.
@@ -417,7 +455,7 @@ func TestSec11_ApiKeyHashedAtRest(t *testing.T) {
 	pool := openSchemaPG(t)
 	// startAPIDWithEnv ensures the apid subprocess is alive so the
 	// read-side test (no listener needed) inherits a working schema.
-	addr, _ := startAPIDWithEnv(t, envForAPID(poolDSN(pool))...)
+	addr, _ := startAPIDWithEnv(t, envForAPID(t, poolDSN(pool))...)
 	_ = addr
 
 	// Seed an account via the harness; we don't need the HTTP loop
@@ -529,7 +567,7 @@ func TestSec11_UnixSocketOnlyDSN(t *testing.T) {
 	if host := cfgHost(poolDSN(pool)); host != "" {
 		t.Skipf("DATABASE_URL host=%q is TCP; unix-socket only is a production-host baseline (EX44)", host)
 	}
-	addr, _ := startAPIDWithEnv(t, envForAPID(poolDSN(pool))...)
+	addr, _ := startAPIDWithEnv(t, envForAPID(t, poolDSN(pool))...)
 	_ = addr
 
 	// Poll pg_stat_activity until apid's pool has registered a session.
@@ -608,7 +646,7 @@ func TestSec11_HostKey0400_Required(t *testing.T) {
 		if err := writeWithPerm(t, pub, []byte(id.Recipient().String()), 0o444); err != nil {
 			t.Fatalf("write pub: %v", err)
 		}
-		addr, _ := startAPIDWithEnv(t, append(envForAPID(poolDSN(pool)),
+		addr, _ := startAPIDWithEnv(t, append(envForAPID(t, poolDSN(pool)),
 			"FAAS_HOST_AGE_RECIPIENT_PATH="+pub)...)
 		// /healthz is a cheap loopback probe — no auth, no DB work.
 		resp, err := http.Get("http://" + addr + "/healthz")
@@ -649,7 +687,7 @@ func TestSec11_HostKey0400_Required(t *testing.T) {
 		if fi.Mode().Perm()&0o020 == 0 {
 			t.Fatalf("test setup failed: file is %04o, writeWithPerm did not preserve group-write bit", fi.Mode().Perm())
 		}
-		out, werr := startAPIDAndExpectFail(t, append(envForAPID(poolDSN(pool)),
+		out, werr := startAPIDAndExpectFail(t, append(envForAPID(t, poolDSN(pool)),
 			"FAAS_HOST_AGE_RECIPIENT_PATH="+pub), 5*time.Second)
 		// werr == nil means apid exited zero (clean), or failed to exit
 		// (kill-and-reap). The helper signals bad-exit via non-nil werr
