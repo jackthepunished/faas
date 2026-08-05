@@ -154,7 +154,16 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             root@${{ env.CP_HOST }} \
             "set -euo pipefail
-               systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf"
+               # systemd-tmpfiles only applies mode/user/group at
+               # CREATION (see deploy/controlplane/tmpfiles.d/faas.conf
+               # for the full rationale). vmmd's RuntimeDirectory=faas
+               # already creates /run/faas as root:root 0755 BEFORE
+               # tmpfiles runs, so the chown below is load-bearing —
+               # without it githubd's bind() fails on every redeploy.
+               systemd-tmpfiles --create /etc/tmpfiles.d/faas.conf
+               chown root:faas /run/faas
+               chmod 0775 /run/faas
+               ls -lad /run/faas"
           # SCP faas-vmmd.service unit
           UNIT_SRC="deploy/etc/faas-vmmd.service"
           UNIT_DST="/etc/systemd/system/faas-vmmd.service"
@@ -608,6 +617,21 @@ jobs:
                 journalctl -u faas-$svc -n 20 --no-pager || true
               fi
             done
+            # PR-M: assert /run/faas ownership is root:faas 0775.
+            # The cd-controlplane + ansible chown step is load-bearing
+            # (see deploy/controlplane/tmpfiles.d/faas.conf for the
+            # rationale) — this is a tripwire so a regression in the
+            # chown step surfaces here instead of as a future
+            # githubd bind-loop in production.
+            RUNDIR_OWNER=$(stat -c '%U:%G' /run/faas)
+            RUNDIR_MODE=$(stat -c '%a' /run/faas)
+            if [[ "${RUNDIR_OWNER}" != "root:faas" || "${RUNDIR_MODE}" != "775" ]]; then
+              echo "::error::/run/faas ownership is ${RUNDIR_OWNER} mode ${RUNDIR_MODE}; expected root:faas 0775 (PR-M regression)"
+              ls -lad /run/faas || true
+              failed=1
+            else
+              echo "✓ /run/faas ownership is root:faas 0775"
+            fi
             exit $failed
           '
 
