@@ -66,14 +66,11 @@ const (
 )
 
 // Sidecar init-exit status closed enum (issue #463 / ADR-069 /
-// PR-C §3). Pinned at package scope so goconst stops flagging
-// the inline literal at parseFrameworkReadyDatagram's validator
-// (the same enum is used by guest-init's send path and the
-// wire types in sidecar_events_emit.go / sidecar_events_wire.go).
-const (
-	sidecarStatusInitOK     = "init_ok"
-	sidecarStatusInitFailed = "init_failed"
-)
+// PR-C §3, PR-B AC #1). The constants live in
+// cmd/vmmd/sidecar_events_emit.go (platform-neutral, no build
+// tag) so the same source compiles on darwin + linux. This
+// file is //go:build linux; the dispatch consumes the
+// constants from the platform-neutral file.
 
 // frameworkReadyMaxDatagram is the upper bound on the DGRAM
 // body the host will accept. The guest-side wire for type=0x01 is

@@ -191,23 +191,19 @@ func placeIntoLeaf(leaf string, pid int, log *slog.Logger) {
 // the new root (mounting before pivot would put the
 // mountpoint on the OLD root, and pivot would hide it).
 //
-// Tolerant: a guest kernel without CONFIG_CGROUP_V2=y
-// (rare; the Firecracker CI kernel has it) fails the
-// mount, the partition is silently skipped, and the
-// workload runs under the parent scope (vmmd's
-// per-instance cap). The host-side per-instance scope
-// (vmmd's writePlanCgroup) is still enforced — the
-// in-guest partition is a defense-in-depth refinement,
-// not the only line of defense.
+// Returns the mount error verbatim. The caller (boot)
+// tolerates a non-nil return (the host-side per-instance
+// scope from vmmd is still enforced even when the in-guest
+// partition is unavailable) and logs the error so a
+// missing CONFIG_CGROUP_V2=y (kernel ENOSYS) is visible in
+// the journalctl logs as a soft warning, not the silent
+// no-op the previous shape produced.
 func mountCgroup2() error {
 	if err := os.MkdirAll(cgroupRoot, 0o755); err != nil {
 		return fmt.Errorf("cgroup2 mkdir: %w", err)
 	}
 	if err := syscall.Mount("cgroup2", cgroupRoot, "cgroup2", 0, ""); err != nil {
-		// Tolerant: log + return nil so a missing
-		// CONFIG_CGROUP_V2=y doesn't break the boot
-		// (the host-side cap is still enforced).
-		return nil
+		return fmt.Errorf("cgroup2 mount %s: %w", cgroupRoot, err)
 	}
 	return nil
 }

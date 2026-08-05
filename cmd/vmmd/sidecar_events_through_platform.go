@@ -152,7 +152,7 @@ func (e *SidecarEventsThroughPlatform) EmitSidecarInitExit(
 	// helper event so the dashboard distinguishes
 	// init_ok (traffic light green) from init_failed
 	// (red + the failure_class shibboleth).
-	if wireEnv.Status == "init_failed" && e.Store != nil {
+	if wireEnv.Status == sidecarStatusInitFailed && e.Store != nil {
 		payload := buildSidecarInitFailedPayload(instanceID, appID, wakeID, wireEnv)
 		if err := e.Store.AppendEvent(ctx,
 			sidecarAuditEventActor,
@@ -173,7 +173,7 @@ func (e *SidecarEventsThroughPlatform) EmitSidecarInitExit(
 	// the secondary observability surface. Empty deploymentID
 	// (legacy wake) is skipped — the audit row is the only
 	// observable signal in that case.
-	if wireEnv.Status == "init_failed" && deploymentID != "" && e.Failer != nil {
+	if wireEnv.Status == sidecarStatusInitFailed && deploymentID != "" && e.Failer != nil {
 		msg := fmt.Sprintf("init sidecar %q exited %d after %dms",
 			wireEnv.Sidecar, wireEnv.ExitCode, wireEnv.DurationMs)
 		if _, err := e.Failer.SetDeploymentFailed(ctx, deploymentID, api.CodeInitSidecarFailed, msg); err != nil && e.Log != nil {

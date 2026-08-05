@@ -84,3 +84,17 @@ func (noopSidecarEventEmitter) EmitSidecarInitExit(context.Context, string, stri
 }
 func (noopSidecarEventEmitter) EmitSidecarRestart(context.Context, string, string, string, sidecarRestartWire) {
 }
+
+// sidecarStatusInitOK and sidecarStatusInitFailed are the
+// closed-enum wire values for the sidecarInitExitWire.Status
+// field (issue #463 / ADR-069 / PR-B AC #1). They live here
+// (no build tag) so the platform-neutral compiler — which
+// the vmmd unit test runs on darwin — can resolve them. The
+// linux-tagged framework_ready_recv.go dispatcher also
+// consumes them. The Status field comment on
+// sidecarInitExitWire enumerates the values; keep them in
+// sync if a new value is added.
+const (
+	sidecarStatusInitOK     = "init_ok"
+	sidecarStatusInitFailed = "init_failed"
+)

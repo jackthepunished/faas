@@ -208,7 +208,7 @@ func TestSidecarInitFailed_FlipsDeploymentRow(t *testing.T) {
 	e := &SidecarEventsThroughPlatform{Failer: fake}
 	e.EmitSidecarInitExit(context.Background(),
 		"inst-1", "app-1", "dep-1", "wake-1",
-		sidecarInitExitWire{Sidecar: "metrics", Status: "init_failed", ExitCode: 1, DurationMs: 80})
+		sidecarInitExitWire{Sidecar: "metrics", Status: sidecarStatusInitFailed, ExitCode: 1, DurationMs: 80})
 	if len(fake.calls) != 1 {
 		t.Fatalf("SetDeploymentFailed call count = %d, want 1", len(fake.calls))
 	}
@@ -234,7 +234,7 @@ func TestSidecarInitOK_DoesNotFlipDeploymentRow(t *testing.T) {
 	e := &SidecarEventsThroughPlatform{Failer: fake}
 	e.EmitSidecarInitExit(context.Background(),
 		"inst-1", "app-1", "dep-1", "wake-1",
-		sidecarInitExitWire{Sidecar: "metrics", Status: "init_ok", ExitCode: 0, DurationMs: 80})
+		sidecarInitExitWire{Sidecar: "metrics", Status: sidecarStatusInitOK, ExitCode: 0, DurationMs: 80})
 	if len(fake.calls) != 0 {
 		t.Fatalf("SetDeploymentFailed call count = %d, want 0 (init_ok must not flip)", len(fake.calls))
 	}
@@ -251,7 +251,7 @@ func TestSidecarInitFailed_EmptyDeploymentIDSkipsFlip(t *testing.T) {
 	e := &SidecarEventsThroughPlatform{Failer: fake}
 	e.EmitSidecarInitExit(context.Background(),
 		"inst-1", "app-1", "" /* legacy: no deployment_id on wire */, "wake-1",
-		sidecarInitExitWire{Sidecar: "metrics", Status: "init_failed", ExitCode: 1, DurationMs: 80})
+		sidecarInitExitWire{Sidecar: "metrics", Status: sidecarStatusInitFailed, ExitCode: 1, DurationMs: 80})
 	if len(fake.calls) != 0 {
 		t.Fatalf("SetDeploymentFailed call count = %d, want 0 (empty deployment_id skips flip)", len(fake.calls))
 	}
@@ -267,7 +267,7 @@ func TestSidecarInitFailed_NilFailerDoesNotPanic(t *testing.T) {
 	e := &SidecarEventsThroughPlatform{} // no Failer
 	e.EmitSidecarInitExit(context.Background(),
 		"inst-1", "app-1", "dep-1", "wake-1",
-		sidecarInitExitWire{Sidecar: "metrics", Status: "init_failed", ExitCode: 1, DurationMs: 80})
+		sidecarInitExitWire{Sidecar: "metrics", Status: sidecarStatusInitFailed, ExitCode: 1, DurationMs: 80})
 	// No assertion needed: the test fails if the call panics.
 }
 
@@ -285,7 +285,7 @@ func TestSidecarInitFailed_FailerErrorLoggedAndDropped(t *testing.T) {
 	// goroutine would otherwise exit on the panic boundary).
 	e.EmitSidecarInitExit(context.Background(),
 		"inst-1", "app-1", "dep-1", "wake-1",
-		sidecarInitExitWire{Sidecar: "metrics", Status: "init_failed", ExitCode: 1, DurationMs: 80})
+		sidecarInitExitWire{Sidecar: "metrics", Status: sidecarStatusInitFailed, ExitCode: 1, DurationMs: 80})
 	if len(fake.calls) != 1 {
 		t.Fatalf("SetDeploymentFailed call count = %d, want 1 (the call must be attempted before logging the error)", len(fake.calls))
 	}
