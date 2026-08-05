@@ -6210,6 +6210,24 @@ func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string)
 	return mbSeconds * 100 / 3600, nil
 }
 
+// UpdateAccountOverageCapCents writes accounts.overage_cap_cents for
+// the given account. Pass nil → delete the map key (NULL round-trip
+// in pgstore); pass *non-nil → store the cents. Issue #561's
+// raiseOverageCap endpoint uses this for the customer self-service
+// "set / clear cap" surface. Mirrors the pgstore UPDATE shape — the
+// (cents=0, ok=true) case is preserved so the workload gate sees
+// "cap = 0" as a refusal trigger, distinct from "no cap" (ok=false).
+func (m *MemStore) UpdateAccountOverageCapCents(_ context.Context, accountID string, cents *int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cents == nil {
+		delete(m.overageCapCents, accountID)
+		return nil
+	}
+	m.overageCapCents[accountID] = *cents
+	return nil
+}
+
 // SetOverageCapCentsForTest is the test-only seam that plants a cap
 // value before the meterd tick runs. Not on the Store interface —
 // production code never needs to write the cap; the column is set by

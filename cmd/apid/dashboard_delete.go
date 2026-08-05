@@ -27,6 +27,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -176,4 +178,62 @@ func acctViewFrom(acct state.Account) *dashboard.AccountView {
 		Email: acct.Email,
 		Plan:  string(acct.Plan),
 	}
+}
+
+// dashboardRaiseOverageCap handles POST /dashboard/raise-overage-cap
+// (issue #561). Mirrors dashboardDelete's CSRF envelope pattern —
+// the rendering path mints the token via IssueForAuthenticated and
+// sets it in the form's hidden csrf_token input; this handler
+// verifies it against the (action="raise_overage_cap", account_id)
+// sealed envelope. The body passes the validation through to the
+// shared raiseOverageCapSvc routine (same code path the v1 API
+// /v1/account/overage-cap POST uses) so the dashboard and the CLI
+// cannot drift.
+//
+// Form fields:
+//
+//	overage_cap_cents  non-negative integer → set the cap to N cents.
+//	                   0 is a valid write and means "no overage allowed".
+//	                   blank → clear the cap (NULL round-trip).
+//
+// The earlier `clear` checkbox was removed because it duplicated the
+// empty-input affordance (review finding #4): a checked box + a typed
+// number silently discarded the number, and a cap=0 ("no overage")
+// was unreachable through the UI. The template documents the cap=0
+// path inline so customers can distinguish NULL (no cap) from 0
+// (no overage allowed).
+func (s *server) dashboardRaiseOverageCap(w http.ResponseWriter, r *http.Request) {
+	acct, ok := AccountFrom(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := middleware.VerifyAuthenticated(s.sessions, r, "raise_overage_cap", acct.ID); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid CSRF token", "please reload the page and try again"))
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad form", err.Error()))
+		return
+	}
+	// Empty input → nil (NULL round-trip, clears the cap). Non-empty
+	// integer → that value. 0 is preserved as a distinct state
+	// ("no overage allowed") via the (cents=0, ok=true) reader shape.
+	raw := strings.TrimSpace(r.FormValue("overage_cap_cents"))
+	var capCents *int64
+	if raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			http.Redirect(w, r, "/dashboard/billing?cap=invalid", http.StatusSeeOther)
+			return
+		}
+		capCents = &n
+	}
+	if _, err := s.raiseOverageCapSvc(r.Context(), acct, capCents); err != nil {
+		http.Redirect(w, r, "/dashboard/billing?cap=error", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/dashboard/billing?cap=updated", http.StatusSeeOther)
 }

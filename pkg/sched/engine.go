@@ -240,6 +240,21 @@ type Engine struct {
 	// missed wiring is a silent no-op rather than a nil-deref panic.
 	warmAffinity *WarmAffinity
 
+	// overage is the spend-cap pause-workload seam (issue #561).
+	// Nil tolerates the gate branch as a no-op (pre-#561 fixtures
+	// keep their existing behaviour); production cmd/schedd wires
+	// `newMemCacheOverageChecker(store, 5*time.Second)` via
+	// WithOverageChecker. The branch fires inside admitGate AFTER
+	// the existing min-floor check — a cap-reached app should not
+	// even be considered for warm-hint recycling (issue #462's
+	// min-floor is a wake-shape concern, the cap is a budget
+	// concern, separated in time so the audit row is unambiguous).
+	overage OverageChecker
+	// (obs, cap) cents ride on the (outcome, obs, cap) tuple
+	// admitGate returns. The earlier field-on-Engine shape was
+	// racy across goroutines hitting the cap-reached branch.
+	// See admitGate's doc for the full rationale.
+
 	// warmBroadcaster is the push-side of sticky-warm affinity
 	// (ADR-025 axis 4). Every RecordWake that actually changes the
 	// (appID → nodeID) entry fans out a WarmHintEvent to every
@@ -393,6 +408,19 @@ func (e *Engine) WithOpsMetrics(ops *wire.OpsMetrics) *Engine {
 // their existing single-box behaviour.
 func (e *Engine) WithWarmAffinity(w *WarmAffinity) *Engine {
 	e.warmAffinity = w
+	return e
+}
+
+// WithOverageChecker attaches the spend-cap pause-workload seam
+// (issue #561). The engine consults the checker inside admitGate
+// AFTER the existing min-floor branch; a cap-reached app refuses new
+// wakes with `*api.Problem{Code: CodeAdmissionRefused}`. nil is
+// tolerated (the branch becomes a no-op, all wakes proceed normally)
+// so legacy fixtures that don't wire the seam keep their existing
+// behaviour. Production cmd/schedd wires
+// `newMemCacheOverageChecker(store, 5*time.Second)`.
+func (e *Engine) WithOverageChecker(c OverageChecker) *Engine {
+	e.overage = c
 	return e
 }
 
@@ -962,7 +990,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// branch stays on CodePlanLimitConcur (429) — no scale-out
 	// was attempted, the customer's request is asking for a wake
 	// that the floor already satisfies.
-	if outcome := e.admitGate(ctx, &app, limits); outcome != wakeAdmit {
+	if outcome, obsCents, capCents := e.admitGate(ctx, &app, limits); outcome != wakeAdmit {
 		release()
 		switch outcome {
 		case wakeRejectAtCap:
@@ -987,6 +1015,26 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			// customer is asking for a wake that the floor already
 			// satisfies. PR-D keeps CodePlanLimitConcur here.
 			return WakeResult{}, api.ErrPlanLimitConcurrency(limits, e.ledger.Concurrency(app.ID))
+		case wakeOverageCapReached:
+			// Issue #561: customer's spend cap is at/over the
+			// configured monthly ceiling. Lift to
+			// CodeAdmissionRefused (HTTP 402; no Retry-After —
+			// the cap is a deliberate budget, not back-pressure).
+			// AdmitInstance path returns AtCapacity=true so the
+			// gateway treats it as a benign no-op when it already
+			// has cached targets — the cap is account-scoped, so
+			// one over-cap app refusing still leaves other
+			// under-cap apps able to admit.
+			//
+			// obsCents + capCents ride via the gate's return
+			// tuple (not Engine state): the lock has been
+			// released, so reading them off the Engine would be
+			// a -race surface against the next goroutine that
+			// hits the gate on the same account.
+			if liftCapacityToResult {
+				return WakeResult{AtCapacity: true}, nil
+			}
+			return WakeResult{}, api.ErrAdmissionRefused(obsCents, capCents)
 		}
 	}
 
@@ -3659,6 +3707,16 @@ const (
 	wakeRejectAtCap
 	wakeCooldownHeld
 	wakeMinFloorAlready
+	// wakeOverageCapReached (issue #561): accounts.overage_cap_cents
+	// is set and the current-month overage cents met/exceeded the
+	// cap. The customer's deliberate budget is blocking us, NOT
+	// the per-app concurrency / cooldown / min-floor shape. Caller
+	// returns `*api.Problem{Code: CodeAdmissionRefused}` (HTTP 402)
+	// from Engine.Wake and WakeResult{AtCapacity: true} from
+	// Engine.AdmitInstance (same shape as wakeRejectAtCap). Lives
+	// AFTER wakeMinFloorAlready in the enum value list because the
+	// scheduler preserves source order for test-pin stability.
+	wakeOverageCapReached
 )
 
 // admitGate (PR-C, issue #462) is the single decision site for
@@ -3694,7 +3752,33 @@ const (
 //     enqueue this wake. Caller short-circuits with no INSERT.
 //     Mostly informational for the dashboard "why didn't this
 //     scale?" pane; PR-D will shape the wire surface.
-func (e *Engine) admitGate(_ context.Context, app *state.App, limits api.Limits) wakeOutcome {
+//
+//   - wakeOverageCapReached (issue #561): accounts.overage_cap_cents
+//     is set and the current-month overage cents already meet or
+//     exceed it. The OverageChecker seam returns OverageReached;
+//     the gate returns via out-params the (obs, cap) cents so the
+//     caller can lift them into `api.ErrAdmissionRefused(obs, cap)`
+//     without re-reading the Engine. Distinct from wakeRejectAtCap
+//     because (a) the trigger is account-scoped not per-app, (b) the
+//     wire surface is CodeAdmissionRefused (HTTP 402 + Retry-After
+//     intentionally omitted — the cap is a deliberate budget, not
+//     back-pressure), and (c) the existing live instances are NOT
+//     auto-parked by the cap alone (that path lives in
+//     pkg/meter/quota.go::EnforceQuota case "stop" and is out of
+//     scope for #561). Caller short-circuits with no INSERT and
+//     emits the audit row overage.cap_reached via the checker's
+//     RecordReached (UTC-day deduped).
+//
+// The signature returns (wakeOutcome, observedCents, capCents) so
+// the overage cents ride on the stack from the gate to the
+// switch in admitAndDispatch. The earlier shape stashed them on
+// Engine fields, which under -race serialised with multiple
+// goroutines hitting the cap-reached branch against the same
+// account (TestProperty_EngineWake_OverageCapReached). The
+// out-params keep the lock-drop invariant documented at
+// engine.go:172-203 (release the per-app lock before reading the
+// cached values).
+func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limits) (wakeOutcome, int64, int64) {
 	concurrency := e.ledger.Concurrency(app.ID)
 	// Mirror admission.go:149-152: apps created via store.CreateApp
 	// without a subsequent UpdateApp leave MaxConcurrency at 0.
@@ -3709,21 +3793,37 @@ func (e *Engine) admitGate(_ context.Context, app *state.App, limits api.Limits)
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "reject_at_cap")
 		}
-		return wakeRejectAtCap
+		return wakeRejectAtCap, 0, 0
 	}
 	if e.isOnScaleOutCooldown(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "cooldown_held")
 		}
-		return wakeCooldownHeld
+		return wakeCooldownHeld, 0, 0
 	}
 	if e.atMinFloorWithNoSignal(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "min_floor_already")
 		}
-		return wakeMinFloorAlready
+		return wakeMinFloorAlready, 0, 0
 	}
-	return wakeAdmit
+	// Issue #561: spend cap pause-workload. Nil check tolerates
+	// legacy fixtures (the branch becomes a no-op).
+	if e.overage != nil {
+		status, observedCents, capCents, _ := e.overage.Check(ctx, app.AccountID)
+		if status == OverageReached {
+			if e.ops != nil {
+				e.ops.ObserveScaleUp(app.ID, "overage_cap_reached")
+			}
+			// Audit row emitted here is intentional — the gate
+			// itself is the only decision site that observes the
+			// refusal, and pkg/sched/loop.go:1249 `reaper_scale_down`
+			// is the precedent for engine-initiated audit writes.
+			e.overage.RecordReached(ctx, app.AccountID, observedCents, capCents)
+			return wakeOverageCapReached, observedCents, capCents
+		}
+	}
+	return wakeAdmit, 0, 0
 }
 
 // isOnScaleOutCooldown (PR-C, issue #462) returns true when

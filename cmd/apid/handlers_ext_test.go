@@ -3130,3 +3130,208 @@ func TestGetApp_SurfacesRequireAuthn(t *testing.T) {
 		})
 	}
 }
+
+// --- raiseOverageCap (issue #561) --------------------------------------------
+//
+// POST /v1/account/overage-cap is the account-self-scoped spend-cap raise
+// endpoint. Body: {"overage_cap_cents": <int|null>}; *int64 so a
+// missing/null field clears the cap (NULL). The service routine
+// raiseOverageCapSvc is the shared code path with the dashboard form.
+
+// TestRaiseOverageCap_Raise confirms the happy path: the cap is
+// stamped to accounts.overage_cap_cents, the audit row
+// overage.cap_changed is emitted, and the response carries the
+// refreshed account view. The audit row's old_cents reflects the
+// pre-update cap (zero in this fixture → the response is the
+// first ever raise).
+func TestRaiseOverageCap_Raise(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/account/overage-cap", map[string]any{
+		"overage_cap_cents": int64(5000),
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Storage: the cap is now 5000.
+	cents, found, err := e.store.GetAccountOverageCapCents(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountOverageCapCents: %v", err)
+	}
+	if !found || cents != 5000 {
+		t.Errorf("cents = %d, found = %v, want 5000/true", cents, found)
+	}
+	// Audit row: overage.cap_changed with the right shape.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var hit *state.Event
+	for i := range rows {
+		if rows[i].Kind == "overage.cap_changed" {
+			hit = &rows[i]
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatalf("overage.cap_changed audit row not found; events: %+v", rows)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(hit.Data, &data); err != nil {
+		t.Fatalf("audit data unmarshal: %v", err)
+	}
+	if data["actor"] != "self" {
+		t.Errorf("audit actor = %v, want \"self\"", data["actor"])
+	}
+	// old_cents is zero on the first raise (the account has no
+	// pre-existing cap; GetAccountOverageCapCents returns (0, false)
+	// and the svc surfaces the 0). JSON-marshalled ints come back
+	// as float64 through encoding/json so compare against that shape.
+	assertCapInt(t, "audit old_cents", data["old_cents"], 0)
+	assertCapInt(t, "audit new_cents", data["new_cents"], 5000)
+}
+
+// TestRaiseOverageCap_Clear confirms the "null clears the cap" path:
+// POSTing {"overage_cap_cents": null} wipes the column to NULL and
+// the audit row's new_cents surfaces as the literal string "null"
+// so the audit reader can distinguish a clear from a 0-set.
+func TestRaiseOverageCap_Clear(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	// Pre-set a cap to make the clear visible.
+	if err := e.store.UpdateAccountOverageCapCents(context.Background(), e.acct.ID, ptrInt64(7500)); err != nil {
+		t.Fatalf("seed cap: %v", err)
+	}
+	rec := e.do(t, "POST", "/v1/account/overage-cap", map[string]any{
+		"overage_cap_cents": nil,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Storage: the cap is now NULL.
+	_, found, err := e.store.GetAccountOverageCapCents(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountOverageCapCents: %v", err)
+	}
+	if found {
+		t.Errorf("found = true, want false (cap cleared to NULL)")
+	}
+	// Audit row: old_cents=7500, new_cents="null".
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var hit *state.Event
+	for i := range rows {
+		if rows[i].Kind == "overage.cap_changed" {
+			hit = &rows[i]
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatalf("overage.cap_changed audit row not found")
+	}
+	var data map[string]any
+	if err := json.Unmarshal(hit.Data, &data); err != nil {
+		t.Fatalf("audit data unmarshal: %v", err)
+	}
+	assertCapInt(t, "audit old_cents", data["old_cents"], 7500)
+	if data["new_cents"] != "null" {
+		t.Errorf("audit new_cents = %v, want \"null\"", data["new_cents"])
+	}
+}
+
+// assertCapInt normalizes the audit-row JSON round-trip for the
+// overage cap. encoding/json marshals int64 → float64, so a
+// direct equality check fails on the unmarshal side. The helper
+// accepts both shapes and pins the test to the expected value.
+func assertCapInt(t *testing.T, label string, got any, want int64) {
+	t.Helper()
+	switch v := got.(type) {
+	case float64:
+		if int64(v) != want {
+			t.Errorf("%s = %v, want %d", label, got, want)
+		}
+	case int64:
+		if v != want {
+			t.Errorf("%s = %v, want %d", label, got, want)
+		}
+	default:
+		t.Errorf("%s = %v (type %T), want %d", label, got, got, want)
+	}
+}
+
+// TestRaiseOverageCap_Invalid confirms the body-validation branch:
+// negative cents are rejected with 400 + CodeValidation, the
+// audit row is NOT emitted (cap was unchanged), and the storage
+// stays untouched.
+func TestRaiseOverageCap_Invalid(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/account/overage-cap", map[string]any{
+		"overage_cap_cents": int64(-100),
+	}, nil)
+	assertProblem(t, rec, 400, api.CodeValidation)
+	// Storage: untouched.
+	_, found, err := e.store.GetAccountOverageCapCents(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountOverageCapCents: %v", err)
+	}
+	if found {
+		t.Errorf("found = true, want false (invalid request must not stamp anything)")
+	}
+	// Audit row: none. ListEvents returns no rows for the account.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	for _, r := range rows {
+		if r.Kind == "overage.cap_changed" {
+			t.Errorf("audit row emitted on invalid request: %+v", r)
+		}
+	}
+}
+
+// TestRaiseOverageCap_BadJSON confirms the body-decoding branch:
+// malformed JSON surfaces as 400 + CodeValidation, the storage
+// stays untouched, and no audit row is emitted.
+func TestRaiseOverageCap_BadJSON(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	req := httptest.NewRequest("POST", "/v1/account/overage-cap", strings.NewReader("{not-json"))
+	req.Header.Set("Authorization", "Bearer "+e.key)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	assertProblem(t, rec, 400, api.CodeValidation)
+	_, found, err := e.store.GetAccountOverageCapCents(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountOverageCapCents: %v", err)
+	}
+	if found {
+		t.Errorf("found = true, want false (bad-JSON request must not stamp anything)")
+	}
+}
+
+// TestRaiseOverageCap_NoAuth confirms the auth boundary: an
+// unauthenticated POST surfaces as 401. The handler is mounted
+// under s.withAuth → no audit row, no storage write.
+func TestRaiseOverageCap_NoAuth(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	body, _ := json.Marshal(map[string]any{"overage_cap_cents": int64(500)})
+	req := httptest.NewRequest("POST", "/v1/account/overage-cap", bytes.NewReader(body))
+	// Note: NO Authorization header.
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Errorf("status = %d, want 401; body = %s", rec.Code, rec.Body)
+	}
+	// Storage: untouched.
+	_, found, err := e.store.GetAccountOverageCapCents(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountOverageCapCents: %v", err)
+	}
+	if found {
+		t.Errorf("found = true, want false (no-auth request must not stamp anything)")
+	}
+}
+
+// ptrInt64 is a small helper for the cap-stamping fixture. The
+// engine_test.go package has ptrInt but the apid test package
+// needs its own (it cannot import a test file from pkg/sched).
+func ptrInt64(v int64) *int64 { return &v }

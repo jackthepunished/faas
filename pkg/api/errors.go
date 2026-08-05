@@ -166,8 +166,22 @@ const (
 	// The Retry-After header is the canonical UX: the constructor
 	// bounds it at 1 second so the wire always emits a non-zero
 	// hint.
-	CodeWaitForWarm  = "wait_for_warm"
-	CodeUnauthorized = "unauthorized"
+	CodeWaitForWarm = "wait_for_warm"
+	// CodeAdmissionRefused marks a wake that schedd refused because
+	// the account's current-month overage cents met/exceeded
+	// accounts.overage_cap_cents (issue #561 / PR-XXX). Distinct
+	// from CodeCapacity (503, transient) and CodePlanLimitConcur
+	// (429, plan-shape per-app cap): the cap is a deliberate customer
+	// budget that requires customer action (raise the cap) — not a
+	// retry. HTTP 402 is consistent with CodePlanFeatureGated,
+	// CodePlanCronsNotAllowed, and CodePlanAlertRulesNotAllowed —
+	// "your account's setting is blocking us"; no Retry-After header.
+	// The Problem's Limit + Observed pointer fields carry
+	// cap_cents + current_overage_cents (via WithLimit at the
+	// builder below) so a script can compute the raise amount
+	// without parsing prose.
+	CodeAdmissionRefused = "admission_refused"
+	CodeUnauthorized     = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
@@ -833,6 +847,14 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodePlanAlertRuleQuota:
 		return http.StatusForbidden
+	// Issue #561 — spend cap pauses workload. 402 mirrors the existing
+	// `CodePlanFeatureGated` / `CodePlanCronsNotAllowed` /
+	// `CodePlanAlertRulesNotAllowed` family: a deliberate account-level
+	// setting that requires customer action (raise the cap), not a
+	// retry. The customer's Stripe-invoice worldview matches 402
+	// (plan-tier and budget-shape refusals all live here).
+	case CodeAdmissionRefused:
+		return http.StatusPaymentRequired
 	// Issue #462 / ADR-058 — scaling policy gate. PR-A History
 	// (2026-07-31): Hobby+ tier-up for max_instances. 403 mirrors
 	// CodePlanMinInstancesNotAllowed.
@@ -973,6 +995,29 @@ func ErrWaitForWarm(cooldownS int, l Limits, observed int) *Problem {
 		WithLimit(int64(cooldownS), int64(observed)).
 		WithDocs("https://docs.gregale.dev/scaling-policy#cooldown").
 		WithHeader("Retry-After", strconv.Itoa(cooldownS))
+}
+
+// ErrAdmissionRefused is the typed Problem builder for the issue #561
+// spend-cap pause-workload path. schedd.Engine.admitGate returns
+// wakeOverageCapReached when accounts.overage_cap_cents is set and
+// meterd's CurrentMonthOverageCents meets/exceeds the cap; the
+// caller lifts to this Problem. The HTTP 402 status travels via
+// StatusForCode (line 826 family: 402 = "your account's setting is
+// blocking us"). observedCents / capCents are exposed as the Problem's
+// Limit (cap) and Observed (overage) pointer fields; a script-side
+// caller can compute "how much to raise" without parsing the
+// human-readable Detail string. No Retry-After: the cap is a
+// deliberate customer budget, not back-pressure; the customer action
+// is to raise or clear the cap, not to retry.
+func ErrAdmissionRefused(observedCents, capCents int64) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodeAdmissionRefused,
+		"Spend cap reached",
+		fmt.Sprintf(
+			"Current-month overage is %d cents; configured cap is %d cents. "+
+				"Raise the cap (POST /v1/account/overage-cap) to resume wake traffic.",
+			observedCents, capCents)).
+		WithLimit(capCents, observedCents).
+		WithDocs("https://docs.gregale.dev/billing#spend-cap")
 }
 
 // ErrInternal is the catch-all 500 envelope for handler-side failures

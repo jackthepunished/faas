@@ -338,3 +338,92 @@ var errTransient = errTransientError("synthetic: cap load failed")
 type errTransientError string
 
 func (e errTransientError) Error() string { return string(e) }
+
+// TestOverageCap_MeterdAdvisory (issue #561) — pins the contract
+// that issue #561 closes only the workload-gate side of the cap
+// semantics, NOT the meterd quota tick. The scheduler refuses new
+// wakes via CodeAdmissionRefused (HTTP 402) when the cap is
+// reached; meterd independently stops pushing overage rows once
+// the cap is reached. The two paths trigger on different
+// conditions (the wake gate consults the cap at wake time, the
+// quota tick consults it at the per-minute tick) and the audit
+// rows they emit are distinct. A regression that pivots one
+// path to the other would surface here as a counter-mismatch.
+//
+// The fixture mirrors TestRunQuotaOnce_OverageCapHonored: a
+// paid account at 120% of its monthly overage ceiling. The
+// meterd tick is expected to skip the overage-row insert AND
+// increment the meterd_billing_cap_exceeded_total counter with
+// the plan label. The scheduler's wake gate is NOT exercised
+// here (a separate test in pkg/sched/overage_test.go covers it).
+func TestOverageCap_MeterdAdvisory(t *testing.T) {
+	t.Parallel()
+	store := state.NewMemStore()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC)
+
+	acct := makeAccount(t, ctx, store, api.PlanHobby)
+	store.SetOverageCapCentsForTest(acct.ID, 1000)
+	// Pin the store's clock seam to the fixture `now` so
+	// CurrentMonthOverageCents's monthStart is derived from the same
+	// anchor AppendUsage uses.
+	store.SetClockForTest(func() time.Time { return now })
+
+	// 1200 cents of derived overage this month. The cap is 1000
+	// cents so the cap-hit branch fires.
+	const targetCents = int64(1200)
+	mbSeconds := targetCents * 3600 / 100 // 43_200_000
+	month := meter.AccountMonthKey(now)
+	row, err := store.UsageByMonth(ctx, acct.ID, month)
+	if err != nil {
+		t.Fatalf("usage: %v", err)
+	}
+	for _, u := range row {
+		mbSeconds -= u.MBSeconds
+	}
+	if mbSeconds > 0 {
+		if err := store.AppendUsage(ctx, acct.ID, "app-1", "inst-1", now.Add(time.Minute), mbSeconds, 0, 0, 0, 0, 0, 0); err != nil {
+			t.Fatalf("append usage: %v", err)
+		}
+	}
+
+	ops := wire.NewOpsMetrics("meter_test_advisory")
+	loop := meter.NewLoop(
+		store,
+		nil, /* cpu — cpu-hour metering not exercised here */
+		&fakeParker{},
+		nil, /* pusher (Provider) — cap test doesn't push usage */
+		&fakeNotifier{},
+		nil, /* mailer */
+		nil, /* dunning */
+		nil, /* residency — cpu-hour metering not exercised here */
+		nil, /* evaluator — cap test doesn't exercise alerts */
+		func() time.Time { return now },
+		discardLog(),
+		func() *meter.Config {
+			cfg := &meter.Config{}
+			cfg.Defaults()
+			return cfg
+		}(),
+		ops,
+	)
+
+	loop.RunQuotaOnce(ctx)
+
+	// The metric prefix is the test registry name from NewOpsMetrics.
+	// The cap-hit increments the counter past zero; the {plan="hobby"}
+	// line must show ≥ 1.
+	body := scrapeBody(t, ops)
+	hitLine := `meter_test_advisory_billing_cap_exceeded_total{plan="hobby"} 1`
+	if !strings.Contains(body, hitLine) {
+		t.Fatalf("counter did not increment past 0; expected line %q:\n%s", hitLine, body)
+	}
+	// The contract this test pins: the cap-exceeded counter is
+	// the existing advisory signal (issue #279), unchanged by
+	// #561. A regression that pivots the counter to "wake
+	// rejections" or removes the metric would surface here.
+	anyLine := "meter_test_advisory_billing_cap_exceeded_total{"
+	if !strings.Contains(body, anyLine) {
+		t.Errorf("cap-exceeded counter series missing entirely\nbody:\n%s", body)
+	}
+}

@@ -473,3 +473,108 @@ func TestProperty_EngineWake_RespectsCooldown(t *testing.T) {
 		t.Errorf("cooldown_held = %d, want %d", n, goroutines)
 	}
 }
+
+// TestProperty_EngineWake_OverageCapReached (issue #561) — the
+// spend-cap pause-workload branch under contention. Pins the
+// contracts that the unit test only covers one-on-one:
+//
+//   - every goroutine returns *api.Problem{Code:
+//     CodeAdmissionRefused} (the customer-facing 402 surface,
+//     errors.go:CodeAdmissionRefused)
+//   - the wake-gate short-circuits BEFORE the ledger or the
+//     instances INSERT, so state.ListInstancesForApp returns 0
+//     rows and the ledger.Concurrency stays at 0
+//   - the per-(app,outcome) counter
+//     schedd_scale_up_decisions_total{outcome=overage_cap_reached}
+//     increments exactly once per goroutine (admitGate runs under
+//     the per-app appMu, so the increments are serialised)
+//   - the OverageChecker.RecordReached audit count is exactly
+//     goroutines for the seeded account (the gate calls
+//     RecordReached the same number of times it returns
+//     wakeOverageCapReached)
+//
+// The OverageChecker is a stubChecker that returns OverageReached
+// for the seeded account and OverageOK for any other account id.
+// This lets a future test that seeds two accounts in one store
+// exercise the per-account routing without colliding with the
+// rest of the suite.
+func TestProperty_EngineWake_OverageCapReached(t *testing.T) {
+	store := state.NewMemStore()
+	acct, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+	ops := wire.NewOpsMetrics("schedd")
+
+	// reachCounter is shared across goroutines via the mockChecker
+	// mutex; reading it after Wait avoids a -race surface.
+	stub := newMockChecker(func(_ context.Context, accountID string) (OverageStatus, int64, int64, error) {
+		if accountID == acct.ID {
+			return OverageReached, 5000, 4000, nil
+		}
+		return OverageOK, 0, 0, nil
+	})
+	// Resolve to *mockChecker so we can read the reached map.
+	mc, ok := stub.(*mockChecker)
+	if !ok {
+		t.Fatalf("newMockChecker did not return *mockChecker; got %T", stub)
+	}
+
+	e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").
+		WithOpsMetrics(ops).
+		WithOverageChecker(stub)
+
+	const goroutines = 6
+	results := make(chan error, goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			_, err := e.Wake(context.Background(), app.ID)
+			results <- err
+		}()
+	}
+
+	denied := 0
+	for i := 0; i < goroutines; i++ {
+		err := <-results
+		if err == nil {
+			t.Errorf("Wake error = nil; want *api.Problem{Code:CodeAdmissionRefused}")
+			continue
+		}
+		var p *api.Problem
+		if errors.As(err, &p) && p.Code == api.CodeAdmissionRefused {
+			denied++
+			continue
+		}
+		t.Errorf("Wake error = %v; want *api.Problem{Code:CodeAdmissionRefused}", err)
+	}
+	if denied != goroutines {
+		t.Errorf("denied = %d, want %d (every wake hits overage_cap_reached)", denied, goroutines)
+	}
+
+	// State assertions: gate-denied wakes leave no instances
+	// footprint. Mirrors the invariants_property_test.go cooldown
+	// pattern but the cap-hit branch is the new evidence site.
+	rows, err := store.ListInstancesForApp(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("ListInstancesForApp: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("len(rows) = %d, want 0 (overage-cap wakes never INSERT)", len(rows))
+	}
+	if got := e.Ledger().Concurrency(app.ID); got != 0 {
+		t.Errorf("ledger.Concurrency(%s) = %d, want 0 (no admit)", app.ID, got)
+	}
+	// Metric counter: one overage_cap_reached emission per goroutine.
+	// admitGate runs under the per-app appMu, so the increments
+	// are serialised; the total is exactly goroutines.
+	if n := readScaleUp(t, ops, app.ID, "overage_cap_reached"); n != goroutines {
+		t.Errorf("overage_cap_reached = %d, want %d", n, goroutines)
+	}
+	// Audit emit counter: the gate calls RecordReached once per
+	// refused wake. UTC-day dedupe is the production checker's
+	// concern (overage_test.go); this stub counts every call so
+	// the wire surface stays bounded to goroutines.
+	mc.reachedMu.Lock()
+	reached := mc.reached[acct.ID]
+	mc.reachedMu.Unlock()
+	if reached != goroutines {
+		t.Errorf("RecordReached count = %d, want %d", reached, goroutines)
+	}
+}

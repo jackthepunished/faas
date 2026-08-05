@@ -564,7 +564,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 		ops := wire.NewOpsMetrics("schedd")
 		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
 		limits := api.MustLimitsFor(api.PlanPro)
-		got := e.admitGate(context.Background(), &app, limits)
+		got, _, _ := e.admitGate(context.Background(), &app, limits)
 		if got != wakeAdmit {
 			t.Errorf("admitGate = %v, want wakeAdmit", got)
 		}
@@ -589,7 +589,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
 		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
 		limits := api.MustLimitsFor(api.PlanPro)
-		got := e.admitGate(context.Background(), &app, limits)
+		got, _, _ := e.admitGate(context.Background(), &app, limits)
 		if got != wakeRejectAtCap {
 			t.Errorf("admitGate = %v, want wakeRejectAtCap", got)
 		}
@@ -616,7 +616,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Fatalf("GetApp: %v", err)
 		}
 		limits := api.MustLimitsFor(api.PlanPro)
-		got := e.admitGate(context.Background(), &reloaded, limits)
+		got, _, _ := e.admitGate(context.Background(), &reloaded, limits)
 		if got != wakeCooldownHeld {
 			t.Errorf("admitGate = %v, want wakeCooldownHeld", got)
 		}
@@ -641,7 +641,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Fatalf("GetApp: %v", err)
 		}
 		limits := api.MustLimitsFor(api.PlanPro)
-		got := e.admitGate(context.Background(), &reloaded, limits)
+		got, _, _ := e.admitGate(context.Background(), &reloaded, limits)
 		if got != wakeMinFloorAlready {
 			t.Errorf("admitGate = %v, want wakeMinFloorAlready", got)
 		}
@@ -666,12 +666,71 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Fatalf("GetApp: %v", err)
 		}
 		limits := api.MustLimitsFor(api.PlanPro)
-		got := e.admitGate(context.Background(), &reloaded, limits)
+		got, _, _ := e.admitGate(context.Background(), &reloaded, limits)
 		if got != wakeAdmit {
 			t.Errorf("admitGate = %v, want wakeAdmit (cold-start bypass)", got)
 		}
 		if n := readScaleUp(t, ops, app.ID, "cooldown_held"); n != 0 {
 			t.Errorf("cooldown_held = %d, want 0 (cold start bypass)", n)
+		}
+	})
+	// overage_cap_reached (issue #561) — the spend-cap pause-workload
+	// branch. The OverageChecker injects OverageReached for the
+	// seeded app's account; admitGate must surface the new
+	// wakeOverageCapReached outcome and bump the closed-set
+	// overage_cap_reached counter. The other counter rows MUST stay
+	// at 0 — a regression that fires the new branch in place of the
+	// legacy outcomes would otherwise pass on the gate return alone.
+	t.Run("overage_cap_reached", func(t *testing.T) {
+		store := state.NewMemStore()
+		acct, app, _ := seedApp(t, store, api.PlanPro, 128, 5)
+		ops := wire.NewOpsMetrics("schedd")
+		// AlwaysOKOverageChecker is the default for the OTHER
+		// engine_test.go cases; here we want a stub that returns
+		// OverageReached so the new branch fires. Captures
+		// observedCents + capCents so we can verify the engine
+		// surfaces them on the gate's (outcome, obs, cap) tuple.
+		var hookObserved, hookCap int64
+		checker := newMockChecker(func(_ context.Context, accountID string) (OverageStatus, int64, int64, error) {
+			if accountID != acct.ID {
+				t.Errorf("Check accountID = %q, want %q", accountID, acct.ID)
+			}
+			hookObserved = 1234
+			hookCap = 1000
+			return OverageReached, hookObserved, hookCap, nil
+		})
+		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").
+			WithOpsMetrics(ops).
+			WithOverageChecker(checker)
+		limits := api.MustLimitsFor(api.PlanPro)
+		got, obs, cap := e.admitGate(context.Background(), &app, limits)
+		if got != wakeOverageCapReached {
+			t.Errorf("admitGate = %v, want wakeOverageCapReached", got)
+		}
+		if n := readScaleUp(t, ops, app.ID, "overage_cap_reached"); n != 1 {
+			t.Errorf("overage_cap_reached = %d, want 1", n)
+		}
+		// The legacy counters must stay at 0 — the OverageReached
+		// branch short-circuits before reject_at_cap /
+		// cooldown_held / min_floor_already.
+		if n := readScaleUp(t, ops, app.ID, "reject_at_cap"); n != 0 {
+			t.Errorf("reject_at_cap = %d, want 0", n)
+		}
+		if n := readScaleUp(t, ops, app.ID, "cooldown_held"); n != 0 {
+			t.Errorf("cooldown_held = %d, want 0", n)
+		}
+		if n := readScaleUp(t, ops, app.ID, "min_floor_already"); n != 0 {
+			t.Errorf("min_floor_already = %d, want 0", n)
+		}
+		// The (obs, cap) tuple is what admitAndDispatch lifts into
+		// the *api.Problem Extensions. A regression that drops the
+		// tuple would surface zeros here and the customer's RFC
+		// 7807 body would lose the precise current state.
+		if obs != hookObserved {
+			t.Errorf("obs = %d, want %d", obs, hookObserved)
+		}
+		if cap != hookCap {
+			t.Errorf("cap = %d, want %d", cap, hookCap)
 		}
 	})
 }
