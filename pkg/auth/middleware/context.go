@@ -13,6 +13,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -194,4 +195,33 @@ func MFAPendingFrom(r *http.Request) (bool, bool) {
 // also performs.
 func WithMFAPending(ctx context.Context, pending bool) context.Context {
 	return withMFAPending(ctx, pending)
+}
+
+// stepUpCtxKey is the typed ctx guard for the IAM-hardening-mega-PR
+// (logical change 6, ADR-077) step-up timestamp. Carry the
+// ISO-8601 stamp the customer's last successful TOTP verify
+// landed on so RequireStepUp can compare against its TTL.
+type stepUpCtxKey struct{}
+
+// WithStepUp decorates the request context with the step-up
+// timestamp read from the cookie envelope. The session-cookie
+// branch of RequireSession stamps this; bearer auth doesn't
+// carry one (an API key is itself a step-up-equivalent proof —
+// the request can't be replayed from a stolen browser without
+// the key).
+func WithStepUp(ctx context.Context, ts time.Time) context.Context {
+	return context.WithValue(ctx, stepUpCtxKey{}, ts)
+}
+
+// StepUpFrom returns the stamp added by WithStepUp. The bool is
+// false when the stamp is absent (bearer auth path, or pre-
+// PR-077 cookie). Exported so tests + future dashboard code can
+// inspect without going through WithStepUp.
+func StepUpFrom(r *http.Request) (time.Time, bool) {
+	v := r.Context().Value(stepUpCtxKey{})
+	if v == nil {
+		return time.Time{}, false
+	}
+	ts, ok := v.(time.Time)
+	return ts, ok
 }

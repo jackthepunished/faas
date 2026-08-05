@@ -246,12 +246,17 @@ func (s *server) mfaVerify(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"Invalid code", "the TOTP code did not match"))
 		return
 	}
-	if err := s.reissueSessionCookie(w, r, acct, false); err != nil {
+	if err := s.reissueSessionCookieWithStepUp(w, r, acct, false, time.Now()); err != nil {
 		s.log.Error("mfa.verify.reissue_cookie", "err", err.Error())
 		api.WriteProblem(w, api.ErrCapacity("could not re-issue session cookie"))
 		return
 	}
 	s.audit.Emit(r.Context(), "account.mfa_session_stepped_up", &acct.ID, nil)
+	s.audit.Emit(r.Context(), "auth.step_up_verified", &acct.ID, map[string]any{
+		"path":    r.URL.Path,
+		"method":  r.Method,
+		"ttl_sec": 300, // 5-minute freshness window per ADR-077
+	})
 	writeJSON(w, http.StatusOK, api.MFAVerifyResponse{})
 }
 
@@ -647,6 +652,21 @@ func SetMFAIdentities(f func() []*age.X25519Identity) { mfaIdentities = f }
 // 500 + a log line, so the wiring bug surfaces instead of
 // hiding.
 func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool) error {
+	return s.reissueSessionCookieWithStepUp(w, r, acct, mfaPending, time.Time{})
+}
+
+// reissueSessionCookieWithStepUp is the IAM-hardening-mega-PR
+// (logical change 6, ADR-077) entry point. Pass a non-zero
+// stepUpAt to refresh the step-up stamp on the cookie envelope
+// (the /v1/account/mfa/verify success branch sets it to
+// time.Now()); pass time.Time{} to leave it cleared (the
+// enrollment-confirm + recovery + disable branches don't
+// refresh step-up because they don't gate on it themselves).
+//
+// The binding-hash is unconditionally refreshed so the
+// stolen-cookie auto-revoke branch (ADR-076) always sees the
+// current (IP, UA-family) fingerprint.
+func (s *server) reissueSessionCookieWithStepUp(w http.ResponseWriter, r *http.Request, acct state.Account, mfaPending bool, stepUpAt time.Time) error {
 	current, ok := authmw.SessionFromContext(r)
 	if !ok {
 		if s.log != nil {
@@ -655,14 +675,14 @@ func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, ac
 		}
 		return errSessionMissingFromContext
 	}
-	// IAM-hardening-mega-PR (ADR-076): refresh the binding
-	// fingerprint on every reissue so the next request through
-	// RequireSession sees the same (IP, UA-family) hash stamped
-	// on both sides of the seal. Re-using the existing session
-	// means the sid stays the same; only the envelope + the row
-	// need to be re-stamped with the current fingerprint.
 	bind := bindinghash.Compute(clientIPFromRequest(r), bindinghash.UAFamily(r.UserAgent()), s.bindingKeyFn)
-	cookie, err := s.sessions.IssueWithSessionAndBindingHash(current.ID, acct.ID, bind, mfaPending)
+	var cookie string
+	var err error
+	if stepUpAt.IsZero() {
+		cookie, err = s.sessions.IssueWithSessionAndBindingHash(current.ID, acct.ID, bind, mfaPending)
+	} else {
+		cookie, err = s.sessions.IssueWithSessionAndBindingHashAndStepUp(current.ID, acct.ID, bind, stepUpAt, mfaPending)
+	}
 	if err != nil {
 		return err
 	}

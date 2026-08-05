@@ -544,6 +544,14 @@ func (m *Middleware) RequireSession(next AccountHandler) http.HandlerFunc {
 						*r = *r.WithContext(withPrincipal(r.Context(), principal{Acct: acct, Key: nil, Membership: nil}))
 						//nolint:contextcheck // same pointer-mutation contract: withMFAPending derives from r.Context() so the flag stamps into the OUTER r.
 						*r = *r.WithContext(withMFAPending(r.Context(), session.IsMFAPending(env)))
+						// IAM-hardening-mega-PR (logical change 6,
+						// ADR-077): stamp the step-up timestamp the
+						// /v1/account/mfa/verify handler last sealed
+						// onto the envelope so RequireStepUp can read
+						// it on the next gated request. Zero-value
+						// stamps bypass the gate (legacy cookies —
+						// rolling migration; see RequireStepUp).
+						*r = *r.WithContext(WithStepUp(r.Context(), env.StepUpAt))
 						next(w, r, acct)
 						return
 					}
@@ -788,6 +796,129 @@ func (m *Middleware) RequireMFA(next AccountHandler) AccountHandler {
 				"method": r.Method,
 			})
 		}
+	}
+}
+
+// --- RequireStepUp -------------------------------------------------------
+
+// RequireStepUp gates a route on a fresh TOTP step-up. Reads the
+// stamp set by RequireSession's session-cookie branch (StepUpFrom)
+// and rejects when it's missing or older than ttl. Bearer-key
+// principals bypass step-up (an API key is itself a step-up-
+// equivalent proof — the request can't be replayed from a stolen
+// browser without the key).
+//
+// On a blocked request emits a 403 problem and an IAM-4
+// auth.step_up_required audit row. Distinct from RequireMFA's
+// auth.mfa_gate_hit kind so a downstream query can tell "needs
+// MFA enrollment" from "needs recent step-up". Auditable per ADR-077.
+//
+// Default TTL is the user-confirmed 5-minute window (industry
+// comparison: GitHub sudo-mode 5m, AWS console 15m, GCP IAM 10m;
+// 5m is the shortest that still tolerates a single confirmation
+// click latency). The auth.step_up_verified kind fires on the
+// /v1/account/mfa/verify success branch so an operator can audit
+// how often the gate is succeeding vs. blocking.
+//
+// Compose ordering for a sensitive-op route:
+//
+//	requireMFA → requireScope(admin) → requireStepUp(5m) → handler
+//
+// The new stamp is written by /v1/account/mfa/verify on every
+// success — see cmd/apid/handlers_mfa.go reissueSessionCookie.
+func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) AccountHandler {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return func(next AccountHandler) AccountHandler {
+		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
+			ts, has := StepUpFrom(r)
+			// Bearer-key principal (no step-up stamp): bypass.
+			// Pre-PR-077 cookie without step_up_at is also bypass-
+			// aware — the middleware is opt-in and the absence of a
+			// stamp carries the same risk profile as the bearer-
+			// bypass path. The Envelope.StepUpAt field is omitempty
+			// so a cookie issued before PR-077 reads StepUpAt zero
+			// and the bypass fails open: this is the documented
+			// "rolling out, the gate hasn't tripped anyone yet"
+			// behaviour. Once every active session carries a stamp
+			// (one TOTP rotation cycle later), the bypass becomes
+			// the legacy-cookie anti-pattern that future audit
+			// queries can filter for (subject = sid, no StepUpAt).
+			if !has {
+				next(w, r, acct)
+				return
+			}
+			if !ts.IsZero() && time.Since(ts) <= ttl {
+				next(w, r, acct)
+				return
+			}
+			reason := "missing"
+			if !ts.IsZero() {
+				reason = "expired"
+			}
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+				api.CodeMFARequired, "MFA required",
+				"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh"))
+			if m.Audit != nil {
+				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
+					"path":    r.URL.Path,
+					"method":  r.Method,
+					"reason":  reason,
+					"ttl_sec": int(ttl.Seconds()),
+				})
+			}
+		}
+	}
+}
+
+// RequireStepUpHandler is the http.Handler-shaped twin of
+// RequireStepUp (IAM-hardening-mega-PR, ADR-077) for dashboard
+// routes that don't fit the AccountHandler signature
+// (RequireSession is http.Handler-shaped via sessionAuth in
+// cmd/apid/auth_facade.go). Same TTL semantics, same audit kind,
+// same bypass rules. The stamp is read off r.Context() the same
+// way RequireStepUp reads it via StepUpFrom.
+func (m *Middleware) RequireStepUpHandler(ttl time.Duration) func(http.Handler) http.Handler {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ts, has := StepUpFrom(r)
+			if !has {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if !ts.IsZero() && time.Since(ts) <= ttl {
+				next.ServeHTTP(w, r)
+				return
+			}
+			reason := "missing"
+			if !ts.IsZero() {
+				reason = "expired"
+			}
+			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
+				api.CodeMFARequired, "MFA required",
+				"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh"))
+			if m.Audit != nil {
+				// Dashboard routes don't carry a state.Account on
+				// the request context the way RequireSession's
+				// AccountHandler branch does; use the session's
+				// AccountID via principalFrom so the audit row
+				// still names the principal.
+				acctID := ""
+				if p, ok := principalFrom(r); ok && p.Acct.ID != "" {
+					acctID = p.Acct.ID
+				}
+				m.Audit.Emit(r.Context(), "auth.step_up_required", &acctID, map[string]any{
+					"path":    r.URL.Path,
+					"method":  r.Method,
+					"reason":  reason,
+					"ttl_sec": int(ttl.Seconds()),
+				})
+			}
+		})
 	}
 }
 

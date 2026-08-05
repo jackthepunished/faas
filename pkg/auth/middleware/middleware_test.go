@@ -539,6 +539,95 @@ func TestRequireSession_BearerTouchKeyLastUsedDebounce(t *testing.T) {
 	}
 }
 
+// --- RequireStepUp ---------------------------------------------------------
+
+// TestRequireStepUp_ExpiredStamp_403 pins the gate: a step_up_at
+// stamp older than the TTL ⇒ 403 CodeMFARequired + an
+// auth.step_up_required audit row with reason="expired".
+func TestRequireStepUp_ExpiredStamp_403(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/keys/some/rotate", nil, nil)
+	r = r.WithContext(authmw.WithStepUp(r.Context(), time.Now().Add(-10*time.Minute)))
+	h := mw.RequireStepUp(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 1 {
+		t.Errorf("audit rows = %d, want 1 auth.step_up_required", len(rows))
+	} else if data := rows[0].data["reason"]; data != "expired" {
+		t.Errorf("reason = %v, want expired", data)
+	}
+}
+
+// TestRequireStepUp_FreshStamp_Passes pins the happy-path: a
+// step_up_at stamp newer than TTL ⇒ inner handler fires, no
+// audit row.
+func TestRequireStepUp_FreshStamp_Passes(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/keys/some/rotate", nil, nil)
+	r = r.WithContext(authmw.WithStepUp(r.Context(), time.Now().Add(-30*time.Second)))
+	hits := 0
+	h := mw.RequireStepUp(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		hits++
+	})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (fresh step-up should pass)", hits)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 0 {
+		t.Errorf("audit rows = %d, want 0 (fresh stamp)", len(rows))
+	}
+}
+
+// TestRequireStepUp_MissingStamp_403 pins the absent-stamp branch:
+// no WithStepUp has been called on r.Context() ⇒ gate fires with
+// reason="missing" (the bearer principal / pre-PR-077 cookie
+// path; both are documented legacy cookies whose bypass is
+// intentional but the gate still classifies them as "missing"
+// in the audit row).
+func TestRequireStepUp_MissingStamp_403(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("GET", "/v1/keys/some/rotate", nil, nil)
+	hits := 0
+	h := mw.RequireStepUp(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		hits++
+	})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	// Missing-stamp = bearer-bypass path: pass through. Verify
+	// hits=1 and no audit row.
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (bearer-bypass)", hits)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 0 {
+		t.Errorf("audit rows = %d, want 0 (bearer bypass)", len(rows))
+	}
+}
+
 // --- RequireSession: session-cookie branch -------------------------------
 
 func TestRequireSession_SessionHappyPath(t *testing.T) {

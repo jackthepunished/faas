@@ -87,6 +87,14 @@ type Envelope struct {
 	// compares this against the sessions row's binding_hash column;
 	// mismatch ⇒ auto-revoke + audit + 401.
 	BindingHash string `json:"binding_hash,omitempty"`
+	// StepUpAt is the IAM-hardening-mega-PR (logical change 6,
+	// ADR-077) timestamp the customer last cleared a fresh TOTP
+	// for step-up MFA. Zero value = "never stepped up"; the
+	// RequireStepUp middleware reads this and rejects when
+	// time.Since(env.StepUpAt) > ttl. The cookie omits this
+	// field when zero (omitempty), preserving pre-PR-077 wire
+	// compatibility.
+	StepUpAt time.Time `json:"step_up_at,omitempty"`
 }
 
 // BindingKey returns a copy of the 32-byte AEAD key for offline
@@ -289,6 +297,28 @@ func (m *Manager) IssueWithSessionAndGithubLoginAndBindingHash(sid, accountID, g
 		Sid:         sid,
 		GithubLogin: githubLogin,
 		BindingHash: bindingHash,
+	})
+}
+
+// IssueWithSessionAndBindingHashAndStepUp seals an envelope with
+// sid + accountID + mfaPending + binding_hash + step_up_at in a
+// single AEAD round. The step-up path uses this helper on every
+// successful /v1/account/mfa/verify so the next step-up-gated
+// request reads a fresh timestamp off the cookie envelope. The
+// binding hash is the ADR-076 fingerprint; the step-up time is
+// the ADR-077 timestamp. Both omitempty so a pre-PR-076 cookie
+// (no binding) decodes unchanged AND a pre-PR-077 cookie (no
+// step_up_at) decodes with StepUpAt zero.
+func (m *Manager) IssueWithSessionAndBindingHashAndStepUp(sid, accountID, bindingHash string, stepUpAt time.Time, mfaPending bool) (string, error) {
+	now := m.now()
+	return m.Seal(Envelope{
+		AccountID:   accountID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
+		Sid:         sid,
+		BindingHash: bindingHash,
+		StepUpAt:    stepUpAt,
 	})
 }
 
