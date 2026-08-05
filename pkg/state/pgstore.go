@@ -8879,7 +8879,8 @@ const deploymentSelectColumns = `
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
 	coalesce(sidecars, '[]'::jsonb),
-	min_instances`
+	min_instances,
+	scan_result, scan_status, scanned_at`
 
 // deploymentSelectColumnsWithRootfs is the variant used by read paths
 // that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
@@ -8901,7 +8902,8 @@ const deploymentSelectColumnsWithRootfs = `
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
 	coalesce(sidecars, '[]'::jsonb),
-	min_instances`
+	min_instances,
+	scan_result, scan_status, scanned_at`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -8931,12 +8933,21 @@ var _ = deploymentSelectColumnsQualified
 
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
-	var kind, statusStr string
+	var kind, statusStr, scanStatus string
+	var scannedAt *time.Time
 	// Issue #460 / ADR-053: six override columns scanned here so the
 	// SELECT projections in DeploymentByID / LatestDeployment / etc.
 	// match. The scan order matches the column order in the SELECT
 	// list — keep them in lockstep or pgx's positional Scan returns
 	// the wrong field into the wrong destination.
+	//
+	// Issue #464 / ADR-055: scan columns (scan_result jsonb,
+	// scan_status text, scanned_at timestamptz) are scanned here too.
+	// scanned_at is nullable (NULL on pre-feature rows that the
+	// migration backfilled to scan_status='skipped' with NULL
+	// scanned_at — see migrations/00135 backfill clause) so the
+	// destination is *time.Time; pgx scans a NULL into a nil pointer
+	// cleanly.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -8944,11 +8955,16 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.Sidecars, &d.MinInstances); err != nil {
+		&d.Sidecars, &d.MinInstances,
+		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
+	d.ScanStatus = scanStatus
+	if scannedAt != nil {
+		d.ScannedAt = *scannedAt
+	}
 	return d, nil
 }
 
@@ -8962,7 +8978,8 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 // SetDeploymentFailed.
 func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
-	var kind, statusStr, rootfsPath, rootfsKey string
+	var kind, statusStr, rootfsPath, rootfsKey, scanStatus string
+	var scannedAt *time.Time
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&rootfsPath, &rootfsKey, &d.RootfsBytes,
@@ -8971,13 +8988,18 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.Sidecars, &d.MinInstances); err != nil {
+		&d.Sidecars, &d.MinInstances,
+		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
 	d.RootfsKey = rootfsKey
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
+	d.ScanStatus = scanStatus
+	if scannedAt != nil {
+		d.ScannedAt = *scannedAt
+	}
 	return d, nil
 }
 
@@ -8985,7 +9007,8 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 	var out []Deployment
 	for rows.Next() {
 		d := Deployment{}
-		var kind, statusStr string
+		var kind, statusStr, scanStatus string
+		var scannedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -8993,11 +9016,16 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 			&d.OverrideEntrypoint, &d.OverrideCmd,
 			&d.OverrideEnv, &d.OverrideEnvSecrets,
 			&d.OverridePort, &d.OverrideHealthcheck,
-			&d.Sidecars, &d.MinInstances); err != nil {
+			&d.Sidecars, &d.MinInstances,
+			&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)
 		d.Status = DeploymentStatus(statusStr)
+		d.ScanStatus = scanStatus
+		if scannedAt != nil {
+			d.ScannedAt = *scannedAt
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()
