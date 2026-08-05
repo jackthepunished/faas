@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Issue #464 / ADR-055 — per-deploy grype CVE scan drill-down page.
+       Renders the full scan payload (SeverityCounts + the full CVE list)
+       read via GET /v1/deployments/{id}/scan. CSP nonce wiring mirrors
+       app_detail.html so the page sits behind the same security policy. -->
+  <title>{{.Title}} — onebox faas</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4" nonce="{{.Nonce}}" defer></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2" nonce="{{.Nonce}}" defer></script>
+  <style nonce="{{.Nonce}}">
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
+    code { font-family: ui-monospace, Menlo, monospace; }
+    h2 { border-top: 1px solid #eee; padding-top: 1rem; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.85rem; }
+    .badge.complete { background: #d1fae5; color: #065f46; }
+    .badge.failed   { background: #fee2e2; color: #991b1b; }
+    .badge.skipped  { background: #f3f4f6; color: #6b7280; }
+    /* Deployment lifecycle pills (state.DeploymentStatus closed enum).
+       Names mirror the API status string verbatim so the template
+       applies the badge class without a mapping helper. */
+    .badge.live         { background: #d1fae5; color: #065f46; }
+    .badge.building     { background: #dbeafe; color: #1e40af; }
+    .badge.imaging      { background: #dbeafe; color: #1e40af; }
+    .badge.snapshotting { background: #ede9fe; color: #5b21b6; }
+    .badge.pending      { background: #f3f4f6; color: #6b7280; }
+    .badge.superseded   { background: #f3f4f6; color: #6b7280; }
+    /* Severity color chips — same palette the §12 dashboard panels use. */
+    .sev-critical { color: #c62828; font-weight: 600; }
+    .sev-high     { color: #e65100; font-weight: 600; }
+    .sev-medium   { color: #f9a825; font-weight: 600; }
+    .sev-low      { color: #1565c0; font-weight: 600; }
+    .sev-unknown  { color: #888; }
+  </style>
+</head>
+<body hx-ext="sse" sse-connect="/v1/events">
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/stateless">Stateless</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    {{if .Data}}
+      <h1>Deployment <code>{{.Data.Deployment.ID}}</code></h1>
+      <p>
+        <a href="/dashboard/apps/{{.Data.App.Slug}}">← Back to {{.Data.App.Slug}}</a>
+      </p>
+      <p>
+        <span class="badge {{.Data.Deployment.Status}}">{{.Data.Deployment.Status}}</span>
+        · Kind: <strong>{{.Data.Deployment.Kind}}</strong>
+        · Created: <code>{{.Data.Deployment.CreatedAt}}</code>
+      </p>
+
+      <h2>Scan</h2>
+      {{if .Data.Scan}}
+        <p>
+          {{if eq .Data.Scan.Status "complete"}}
+            <span class="badge complete">complete</span>
+          {{else if eq .Data.Scan.Status "failed"}}
+            <span class="badge failed">failed</span>
+          {{else if eq .Data.Scan.Status "skipped"}}
+            <span class="badge skipped">skipped</span>
+          {{end}}
+          {{if .Data.Scan.ScannedAt}}at <code>{{.Data.Scan.ScannedAt}}</code>{{end}}
+          {{if .Data.Scan.ImageDigest}} · image <code>{{.Data.Scan.ImageDigest}}</code>{{end}}
+        </p>
+
+        {{if eq .Data.Scan.Status "complete"}}
+          <table>
+            <thead><tr><th>Severity</th><th>Count</th></tr></thead>
+            <tbody>
+              <tr><td class="sev-critical">Critical</td><td>{{.Data.Scan.SeverityCounts.Critical}}</td></tr>
+              <tr><td class="sev-high">High</td><td>{{.Data.Scan.SeverityCounts.High}}</td></tr>
+              <tr><td class="sev-medium">Medium</td><td>{{.Data.Scan.SeverityCounts.Medium}}</td></tr>
+              <tr><td class="sev-low">Low</td><td>{{.Data.Scan.SeverityCounts.Low}}</td></tr>
+              <tr><td class="sev-unknown">Unknown</td><td>{{.Data.Scan.SeverityCounts.Unknown}}</td></tr>
+            </tbody>
+          </table>
+
+          {{if .Data.Scan.Vulnerabilities}}
+            <h3>Vulnerabilities ({{len .Data.Scan.Vulnerabilities}})</h3>
+            <table>
+              <thead><tr><th>ID</th><th>Severity</th><th>Package</th><th>Version</th><th>Fixed in</th></tr></thead>
+              <tbody>
+                {{range .Data.Scan.Vulnerabilities}}
+                  <tr>
+                    <td><code>{{.ID}}</code></td>
+                    <td>
+                      {{if eq .Severity "CRITICAL"}}<span class="sev-critical">{{.Severity}}</span>
+                      {{else if eq .Severity "HIGH"}}<span class="sev-high">{{.Severity}}</span>
+                      {{else if eq .Severity "MEDIUM"}}<span class="sev-medium">{{.Severity}}</span>
+                      {{else if eq .Severity "LOW"}}<span class="sev-low">{{.Severity}}</span>
+                      {{else}}<span class="sev-unknown">{{.Severity}}</span>
+                      {{end}}
+                    </td>
+                    <td><code>{{.Package}}</code></td>
+                    <td><code>{{.Version}}</code></td>
+                    <td><code>{{.FixedIn}}</code></td>
+                  </tr>
+                {{end}}
+              </tbody>
+            </table>
+          {{else}}
+            <p>No vulnerabilities matched.</p>
+          {{end}}
+        {{else if eq .Data.Scan.Status "failed"}}
+          <p>The grype scan failed after the 1-retry backoff. The deploy itself succeeded — CRITICAL-CVE images deploy successfully (ADR-055).</p>
+          {{if .Data.Scan.Error}}
+            <pre style="background:#fee2e2;padding:0.75rem;border-radius:4px;"><code>{{.Data.Scan.Error}}</code></pre>
+          {{end}}
+        {{else if eq .Data.Scan.Status "skipped"}}
+          <p>This deployment predates the per-deploy scan feature (issue #464). The base-ext4 factory scan (issue #299) still ran at build time.</p>
+        {{end}}
+      {{else}}
+        <p>Scan pending — the deploy is still mid-pipeline or the scan hasn't landed yet. The chip on the deploy list updates within seconds of the per-app ext4 build.</p>
+      {{end}}
+    {{end}}
+  </main>
+  <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>
+</body>
+</html>

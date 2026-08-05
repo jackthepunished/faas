@@ -71,6 +71,14 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderAppsList(w, r, log, acct)
 		case len(path) > len("/dashboard/apps/") && path[:len("/dashboard/apps/")] == "/dashboard/apps/":
 			slug := path[len("/dashboard/apps/"):]
+			// Per-deploy drill-down (issue #464 / ADR-055):
+			// /dashboard/apps/{slug}/deployments/{id} renders the
+			// full grype CVE list for one deployment. Falls through
+			// to renderAppDetail if the suffix doesn't match.
+			if dslug, did, ok := parseDeployDetailPath(slug); ok {
+				s.renderDeploymentDetail(w, r, log, acct, dslug, did)
+				return
+			}
 			s.renderAppDetail(w, r, log, acct, slug)
 		case path == "/dashboard/usage":
 			s.renderUsage(w, r, log, acct)
@@ -228,13 +236,40 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	}
 	deps := make([]dashboard.DeploymentItem, 0, len(rows))
 	for _, d := range rows {
-		deps = append(deps, dashboard.DeploymentItem{
+		item := dashboard.DeploymentItem{
 			ID:        d.ID,
 			Status:    string(d.Status),
 			Kind:      string(d.Kind),
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 			Error:     d.Error,
-		})
+		}
+		// Per-deploy grype scan summary (issue #464 / ADR-055).
+		// Populate ScanSummary only when the row carries a
+		// scan_status; nil means "scan pending" on the template.
+		// The SeverityCounts read comes from the jsonb column's
+		// typed payload — the same ScanResult the /scan route
+		// returns — so the list-view chip + the detail page
+		// agree on counts.
+		if d.ScanStatus != "" {
+			sum := &dashboard.ScanSummary{
+				Status: d.ScanStatus,
+			}
+			if !d.ScannedAt.IsZero() {
+				sum.ScannedAt = d.ScannedAt.UTC().Format(time.RFC3339)
+			}
+			if len(d.ScanResult) > 0 {
+				var sr api.ScanResult
+				if err := json.Unmarshal(d.ScanResult, &sr); err == nil {
+					sum.Critical = sr.SeverityCounts.Critical
+					sum.High = sr.SeverityCounts.High
+					sum.Medium = sr.SeverityCounts.Medium
+					sum.Low = sr.SeverityCounts.Low
+					sum.Unknown = sr.SeverityCounts.Unknown
+				}
+			}
+			item.ScanSummary = sum
+		}
+		deps = append(deps, item)
 	}
 	crons, err := s.store.ListCronsForApp(ctx, app.ID)
 	if err != nil {
@@ -1092,5 +1127,121 @@ func (s *server) renderStateless(w http.ResponseWriter, r *http.Request, log *sl
 	}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
+	}
+}
+
+// parseDeployDetailPath splits a /dashboard/apps/{slug}/... suffix
+// into (slug, deployment_id, ok). Returns ok=false when the
+// suffix doesn't match /deployments/{id} — caller falls through
+// to renderAppDetail. The match is prefix-based so the function
+// stays robust to future suffix additions (e.g.
+// /deployments/{id}/logs); today only /deployments/{id} is
+// dispatched.
+func parseDeployDetailPath(rest string) (string, string, bool) {
+	const deploys = "/deployments/"
+	i := strings.Index(rest, deploys)
+	if i < 0 {
+		return "", "", false
+	}
+	slug := rest[:i]
+	id := rest[i+len(deploys):]
+	if slug == "" || id == "" || strings.Contains(id, "/") {
+		return "", "", false
+	}
+	return slug, id, true
+}
+
+// renderDeploymentDetail renders /dashboard/apps/{slug}/deployments/{id}
+// — the per-deploy grype scan drill-down page (issue #464 /
+// ADR-055 / PR-A). Pulls the typed ScanResult directly from the
+// store rather than calling GET /v1/deployments/{id}/scan over
+// loopback — same data, one fewer indirection. IDOR posture is
+// the same AppByID + AccountID check as renderAppDetail (above).
+//
+// On the nil Scan case (deploy is mid-pipeline or predates the
+// feature), the template renders "scan pending". On a non-empty
+// scan_status we project the wire api.ScanResult into the
+// dashboard-local ScanPayload so pkg/dashboard stays free of
+// pkg/api imports (the same isolation rule that drove the
+// AppListItem vs pkg/api.App split).
+func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug, deploymentID string) {
+	ctx := r.Context()
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		http.NotFound(w, r)
+		return
+	}
+	dep, err := s.store.DeploymentByID(ctx, deploymentID)
+	if err != nil || dep.AppID != app.ID {
+		http.NotFound(w, r)
+		return
+	}
+
+	data := dashboard.DeploymentDetailData{
+		App:        dashboard.AppListItem{Slug: app.Slug, ID: app.ID},
+		Deployment: dashboardDeploymentItem(dep),
+	}
+	if dep.ScanStatus != "" {
+		payload := dashboardScanPayload(scanResponse(dep))
+		data.Scan = &payload
+	}
+
+	nonce := httpsec.NonceFromContext(r.Context())
+	page := dashboard.Page{
+		Title:   "Deployment " + dep.ID,
+		Nonce:   nonce,
+		Account: dashboardAccountView(acct, 0),
+		Body:    "deployment_detail",
+		Data:    data,
+	}
+	if err := dashboard.Render(w, log, nonce, page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// dashboardScanPayload projects the wire api.ScanResult into the
+// dashboard-local ScanPayload / VulnerabilityRow shapes. The
+// handler is the only thing that crosses the api → dashboard
+// boundary; pkg/dashboard itself never imports pkg/api.
+func dashboardScanPayload(s api.ScanResult) dashboard.ScanPayload {
+	vulns := make([]dashboard.VulnerabilityRow, 0, len(s.Vulnerabilities))
+	for _, v := range s.Vulnerabilities {
+		vulns = append(vulns, dashboard.VulnerabilityRow{
+			ID:       v.ID,
+			Severity: v.Severity,
+			Package:  v.Package,
+			Version:  v.Version,
+			FixedIn:  v.FixedIn,
+		})
+	}
+	sc := s.SeverityCounts
+	return dashboard.ScanPayload{
+		Status:         s.Status,
+		ScannedAt:      s.ScannedAt,
+		ScannerVersion: s.ScannerVersion,
+		ImageDigest:    s.ImageDigest,
+		SeverityCounts: dashboard.SeverityBucket{
+			Critical: sc.Critical,
+			High:     sc.High,
+			Medium:   sc.Medium,
+			Low:      sc.Low,
+			Unknown:  sc.Unknown,
+		},
+		Vulnerabilities: vulns,
+		Error:           s.Error,
+	}
+}
+
+// dashboardDeploymentItem projects a state.Deployment into the
+// minimal DeploymentItem shape the deployment_detail template
+// needs (ID, Kind, Status, CreatedAt). The full Deployments list
+// uses a richer shape; the detail page only renders a header.
+func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
+	return dashboard.DeploymentItem{
+		ID:        d.ID,
+		Status:    string(d.Status),
+		Kind:      string(d.Kind),
+		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
+		Error:     d.Error,
 	}
 }
