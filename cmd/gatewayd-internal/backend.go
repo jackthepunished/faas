@@ -83,6 +83,10 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 // StreamingEnabled (issue #471 / ADR-047) is plumbed through so ServeHTTP
 // can decide between the buffered and streamed response path without
 // re-reading the apps row from Postgres on every request.
+// RequireAuthn (issue #560) is plumbed through so the routing layer can
+// enforce per-deployment token gating at the edge — a Pro/Scale customer
+// who PATCHes require_authn=true on their app gets the auth check
+// applied to every incoming request, with no store hop on the hot path.
 func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, error) {
 	if app.Status == state.AppDeleted {
 		return gateway.App{}, false, nil
@@ -91,7 +95,7 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 	if err != nil {
 		return gateway.App{}, false, err
 	}
-	return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled}, true, nil
+	return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, RequireAuthn: app.RequireAuthn}, true, nil
 }
 
 // appsSuffix normalizes a bare apps domain ("apps.gregale.dev") into the

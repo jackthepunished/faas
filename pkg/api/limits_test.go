@@ -63,6 +63,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// are defence-in-depth; the WarmSnapshotAllowed() gate
 			// surfaces the 403 to a Free customer PATCHing true.
 			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
+			// Issue #560: Free is gated off for require_authn
+			// — opt-in is a paid-tier feature (Cloud Run's
+			// `--no-allow-unauthenticated` shape).
+			RequireAuthn: false,
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
 			KeysMax: 3},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
@@ -123,6 +127,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// same cost-shape reason as Free — the doubled parked
 			// footprint doesn't fit the €9/month Hobby tier.
 			WarmSnapshotEnabled: false, WarmSnapshotMinRequestsDefault: 0, WarmSnapshotMinMsDefault: 0,
+			// Issue #560: Hobby is gated off for the same
+			// posture-change shape as Free.
+			RequireAuthn: false,
 			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
 			KeysMax: 10},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
@@ -175,6 +182,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// 2000 ms is the sweet spot for the issue's acceptance
 			// (p50 halved vs init-tier).
 			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000,
+			// Issue #560: Pro is the first tier where the
+			// per-app require_authn opt-in unlocks.
+			RequireAuthn: true,
 			// Issue #189 / IAM-5: Pro = 50 keys (2 per app across 25 apps).
 			KeysMax: 50},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
@@ -232,6 +242,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// budget and the wake-p50 win is the largest dollar
 			// lever for SaaS workloads.
 			WarmSnapshotEnabled: true, WarmSnapshotMinRequestsDefault: 5, WarmSnapshotMinMsDefault: 2000,
+			// Issue #560: Scale mirrors Pro — opt-in
+			// available, column default still false.
+			RequireAuthn: true,
 			// Issue #189 / IAM-5: Scale = 200 keys (2 per app across 100 apps).
 			KeysMax: 200},
 	}
@@ -954,6 +967,46 @@ func TestOCIPullTimeoutSeconds(t *testing.T) {
 	}
 	if OCIPullTimeoutSeconds < 10 {
 		t.Errorf("OCIPullTimeoutSeconds = %d must be >= 10s so a slow registry cannot starve the cold-boot latency budget", OCIPullTimeoutSeconds)
+	}
+}
+
+// TestPlanRequireAuthnAllowed pins the per-plan gate that apid's
+// updateApp handler uses for the per-app require_authn field
+// (issue #560). Free/Hobby → false (Cloud Run's
+// `--no-allow-unauthenticated` is a paid-tier feature); Pro/Scale →
+// true. Unknown plans must default to false (fail-closed: a missing
+// plan never silently unlocks a premium feature). Mirrors
+// TestPlanScaleUpTargetRPSAllowed shape — same boolean accessor,
+// same plan row count.
+func TestPlanRequireAuthnAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.RequireAuthnAllowed(); got != c.want {
+			t.Errorf("%s.RequireAuthnAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestRequireAuthnAccessorMatchesTable pins that the accessor reads
+// the same value the Limits struct holds. Mirrors
+// TestOrgAccessorsMatchTable above — catches regressions where a
+// future contributor edits the struct field but forgets the
+// accessor (or vice versa).
+func TestRequireAuthnAccessorMatchesTable(t *testing.T) {
+	for _, p := range Plans {
+		l := MustLimitsFor(p)
+		if got, want := p.RequireAuthnAllowed(), l.RequireAuthn; got != want {
+			t.Errorf("Plan(%s).RequireAuthnAllowed() = %v, table = %v", p, got, want)
+		}
 	}
 }
 

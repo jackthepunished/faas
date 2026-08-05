@@ -1345,8 +1345,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1359,7 +1359,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn)
 	return scanApp(row)
 }
 
@@ -1480,8 +1480,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1493,7 +1493,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2212,7 +2212,8 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   warm_snapshot_enabled = case when $31 then $32 else warm_snapshot_enabled end,
 		   warm_snapshot_min_requests = case when $33 then $34 else warm_snapshot_min_requests end,
 		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end,
-		   eviction_priority = case when $37 then $38 else eviction_priority end
+		   eviction_priority = case when $37 then $38 else eviction_priority end,
+		   require_authn = case when $39 then $40 else require_authn end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2246,7 +2247,22 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetWarmSnapshotEnabled, boolOrFalse(p.WarmSnapshotEnabled),
 		p.SetWarmSnapshotMinRequests, intOrZero(p.WarmSnapshotMinRequests),
 		p.SetWarmSnapshotMinMs, intOrZero(p.WarmSnapshotMinMs),
-		p.SetEvictionPriority, derefString(p.EvictionPriority))
+		// Issue #475: eviction_priority. Plain column write — apid
+		// already validates the value (must be 'best_effort' or
+		// 'reserved'), gates 'reserved' behind the plan, and
+		// enforces the per-account cap. The Set bit distinguishes
+		// "unset" from "explicit best_effort" (opt out of reserved).
+		p.SetEvictionPriority, derefString(p.EvictionPriority),
+		// Issue #560: see the Set*/optional-pointer pattern as
+		// require_signed / streaming_enabled — the Set bit
+		// distinguishes "don't touch" (don't run the SET clause)
+		// from "explicit false" (write false). Plan-gated
+		// upstream: apid returns 403
+		// plan_require_authn_not_allowed on Free/Hobby + true
+		// so the SQL never sees an illegal value. Free customers
+		// may PATCH true → false on a Pro-upgraded app; Hobby
+		// customers may opt back out the same way.
+		p.SetRequireAuthn, boolOrFalse(p.RequireAuthn))
 	return scanApp(row)
 }
 
@@ -8746,7 +8762,13 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.ProjectID, &a.RootDir, &a.WorkloadName, &workloadClassStr, &a.StartCommand,
 		&a.StreamingEnabled, &a.RequireSigned, &scalingPolicyBytes, &a.LastScaleOutAt, &a.LastScaleInAt, &a.NodeID, &a.ReassignedAt, &a.MigratedAt,
 		&a.WarmSnapshotEnabled, &a.WarmSnapshotMinRequests, &a.WarmSnapshotMinMs,
-		&a.EvictionPriority); err != nil {
+		// Issue #475: per-app eviction tier. eviction_priority is
+		// NOT NULL DEFAULT 'best_effort' (migration 00135) so the
+		// query can scan into a plain string without a SQL NULL
+		// helper.
+		&a.EvictionPriority,
+		// Issue #560: per-app require_authn column.
+		&a.RequireAuthn); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -8794,6 +8816,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 //	  workload_name,
 //	  workload_class,
 //	  start_command         — ADR-050 Phase 1 (repo decomposition)
+//	require_authn          — issue #560 (per-deployment
+//	  authentication opt-in; Cloud Run --no-allow-unauthenticated
+//	  analogue). Surfaced on GET /v1/apps/{slug} so dashboards can
+//	  render "auth required on / off" alongside the streaming /
+//	  require_signed pills.
 const appsSelectColumns = `
 	id, account_id, slug, type, coalesce(runtime,''), ram_mb, coalesce(idle_timeout_s,0),
 	max_concurrency, status, manifest, created_at, min_instances, egress_allowlist::text,
@@ -8803,7 +8830,8 @@ const appsSelectColumns = `
 	scaling_policy, last_scale_out_at, last_scale_in_at, coalesce(node_id::text, ''),
 	reassigned_at, migrated_at,
 	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms,
-	eviction_priority`
+	eviction_priority,
+	require_authn`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

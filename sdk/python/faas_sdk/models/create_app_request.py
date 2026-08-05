@@ -37,6 +37,9 @@ class CreateAppRequest:
     warm_snapshot_min_ms: int | Unset = UNSET
     """Optional create-time override for the warm-tier time-since-first-ready threshold, milliseconds (issue #470 /
     ADR-055). Range [100, 60000]. Omitted → apid applies the plan default."""
+    require_authn: bool | Unset = UNSET
+    """Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false).
+    Pro/Scale only."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +67,8 @@ class CreateAppRequest:
 
         warm_snapshot_min_ms = self.warm_snapshot_min_ms
 
+        require_authn = self.require_authn
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -89,6 +94,8 @@ class CreateAppRequest:
             field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
         if warm_snapshot_min_ms is not UNSET:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
+        if require_authn is not UNSET:
+            field_dict["require_authn"] = require_authn
 
         return field_dict
 
@@ -125,6 +132,8 @@ class CreateAppRequest:
 
         warm_snapshot_min_ms = d.pop("warm_snapshot_min_ms", UNSET)
 
+        require_authn = d.pop("require_authn", UNSET)
+
         create_app_request = cls(
             slug=slug,
             type_=type_,
@@ -136,6 +145,7 @@ class CreateAppRequest:
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
+            require_authn=require_authn,
         )
 
         create_app_request.additional_properties = d

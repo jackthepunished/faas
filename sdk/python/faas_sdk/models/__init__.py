@@ -218,6 +218,10 @@ from .storage_usage_response import StorageUsageResponse
 from .stream_app_logs_follow import StreamAppLogsFollow
 from .stream_app_logs_level import StreamAppLogsLevel
 from .stream_deployment_logs_follow import StreamDeploymentLogsFollow
+from .trace import Trace
+from .trace_span import TraceSpan
+from .trace_span_attributes import TraceSpanAttributes
+from .trace_span_status import TraceSpanStatus
 from .transfer_ownership_request import TransferOwnershipRequest
 from .trusted_signer import TrustedSigner
 from .update_alert_rule_request import UpdateAlertRuleRequest
@@ -226,6 +230,8 @@ from .update_alert_rule_request_metric import UpdateAlertRuleRequestMetric
 from .update_alert_rule_request_window_spec import UpdateAlertRuleRequestWindowSpec
 from .update_app_request import UpdateAppRequest
 from .update_cron_request import UpdateCronRequest
+from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
+from .update_deployment_request import UpdateDeploymentRequest
 from .usage_export_response import UsageExportResponse
 from .usage_response import UsageResponse
 from .usage_summary_response import UsageSummaryResponse
@@ -452,6 +458,10 @@ __all__ = (
     "StreamAppLogsFollow",
     "StreamAppLogsLevel",
     "StreamDeploymentLogsFollow",
+    "Trace",
+    "TraceSpan",
+    "TraceSpanAttributes",
+    "TraceSpanStatus",
     "TransferOwnershipRequest",
     "TrustedSigner",
     "UpdateAlertRuleRequest",
@@ -460,6 +470,8 @@ __all__ = (
     "UpdateAlertRuleRequestWindowSpec",
     "UpdateAppRequest",
     "UpdateCronRequest",
+    "UpdateDeploymentMinInstancesBody",
+    "UpdateDeploymentRequest",
     "UsageExportResponse",
     "UsageResponse",
     "UsageSummaryResponse",

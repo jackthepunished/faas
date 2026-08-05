@@ -2937,3 +2937,104 @@ func TestUpdateApp_EvictionPriority_HobbyCapRace(t *testing.T) {
 		t.Errorf("reserved count = %d, want 1 OR 2 (advisory cap overshoot ≤ 1); financial-model RAM cap is the hard backstop", reservedCount)
 	}
 }
+
+// TestUpdateAppRequireAuthn_FreeGate locks the plan-tier gate for
+// the per-deployment require_authn opt-in (issue #560). Free plans
+// cannot set require_authn=true at all — opt-in gating is the
+// internal-only / B2B upsell path (the issue's recommendation
+// "pairs with internal-only"), so it lives on Pro/Scale. The
+// handler must return 403 plan_require_authn_not_allowed, not 422
+// or 200, because the feature is tier-locked (the value the
+// customer typed is irrelevant). Mirrors
+// TestUpdateAppWarmSnapshot_FreeGate directly above.
+func TestUpdateAppRequireAuthn_FreeGate(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	mustSeedApp(t, e, "free-require-authn")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/free-require-authn", api.UpdateAppRequest{RequireAuthn: &tru}, nil)
+	assertProblem(t, rec, 403, api.CodePlanRequireAuthnNotAllowed)
+}
+
+// TestUpdateAppRequireAuthn_HobbyGate is the Hobby branch of the
+// same gate (issue #560). Hobby is gated off for the same
+// pricing-shape reason as Free — per-deployment auth is the
+// Pro/Scale internal-only knob, not a free / hobby tier feature.
+func TestUpdateAppRequireAuthn_HobbyGate(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	mustSeedApp(t, e, "hobby-require-authn")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/hobby-require-authn", api.UpdateAppRequest{RequireAuthn: &tru}, nil)
+	assertProblem(t, rec, 403, api.CodePlanRequireAuthnNotAllowed)
+}
+
+// TestUpdateAppRequireAuthn_ProHappy is the Pro happy path: Pro
+// plans may flip require_authn freely. The value round-trips
+// through UpdateApp → scanApp → appResponse (verified via the
+// GET round-trip below). Mirrors TestUpdateAppWarmSnapshot_ProHappy.
+func TestUpdateAppRequireAuthn_ProHappy(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-require-authn-ok")
+	tru := true
+	rec := e.do(t, "PATCH", "/v1/apps/pro-require-authn-ok", api.UpdateAppRequest{RequireAuthn: &tru}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AppResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !out.RequireAuthn {
+		t.Errorf("RequireAuthn = false, want true (PATCH round-trip)")
+	}
+	// Belt-and-suspenders: the raw JSON must surface
+	// "require_authn":true so a future DTO `omitempty` tag added
+	// in error is caught here, not in production.
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"require_authn":true`)) {
+		t.Errorf("raw JSON missing require_authn:true:\n%s", rec.Body.String())
+	}
+}
+
+// TestGetApp_SurfacesRequireAuthn pins the wire shape for the
+// issue #560 addition: every plan's GET /v1/apps/{slug} response
+// must include `require_authn` set to the DB row's current value.
+// Catches regressions where someone constructs api.AppResponse
+// directly (bypassing appResponse) and forgets the new field —
+// and pins the default-false invariant (issue AC #5:
+// customer-visible default stays false, every existing app
+// unaffected). Mirrors TestGetApp_SurfacesConcurrencyPerVMBound
+// directly above.
+func TestGetApp_SurfacesRequireAuthn(t *testing.T) {
+	cases := []struct {
+		plan api.Plan
+		want bool
+	}{
+		{api.PlanFree, false},
+		{api.PlanHobby, false},
+		{api.PlanPro, false},
+		{api.PlanScale, false},
+	}
+	for _, c := range cases {
+		t.Run(string(c.plan), func(t *testing.T) {
+			e := setup(t, c.plan)
+			mustSeedApp(t, e, "require-authn-app")
+			rec := e.do(t, "GET", "/v1/apps/require-authn-app", nil, nil)
+			if rec.Code != 200 {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			var out api.AppResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if out.RequireAuthn != c.want {
+				t.Errorf("require_authn = %t, want %t (plan=%s)",
+					out.RequireAuthn, c.want, c.plan)
+			}
+			// Belt-and-suspenders: assert the JSON field is
+			// present in the raw payload — catches any future
+			// DTO `omitempty` tag added in error.
+			if !bytes.Contains(rec.Body.Bytes(), []byte(`"require_authn":`)) {
+				t.Errorf("raw JSON missing require_authn key:\n%s", rec.Body.String())
+			}
+		})
+	}
+}

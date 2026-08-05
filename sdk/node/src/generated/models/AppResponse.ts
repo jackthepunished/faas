@@ -71,5 +71,9 @@ export type AppResponse = {
    * Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction.
    */
   eviction_priority?: 'best_effort' | 'reserved';
+  /**
+   * Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby PATCH-true is rejected with 403 plan_require_authn_not_allowed.
+   */
+  require_authn?: boolean;
 };
 
