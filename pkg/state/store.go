@@ -490,6 +490,12 @@ type Store interface {
 	//
 	// Issue #189 / IAM-5.
 	CreateAPIKeyWithExpiry(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+	// CreateAPIKeyWithExpiryAndProvenance is the IAM-hardening-mega-PR
+	// (logical change 2) variant of CreateAPIKeyWithExpiry. Used
+	// when the legacy /v1/keys POST handler falls back to the
+	// account-scoped path (no personal org yet — pre-00127 fixtures).
+	// Optional fields: nil/"" → NULL column.
+	CreateAPIKeyWithExpiryAndProvenance(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error)
 
 	// CountAPIKeys returns the number of non-revoked keys owned
 	// by the account. Used by the create + rotate handlers to
@@ -594,10 +600,24 @@ type Store interface {
 	// subquery — see PgStore implementation). Same graceWindow
 	// semantics, same returned-key ordering.
 	CreateOrgAPIKey(ctx context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+	// CreateOrgAPIKeyWithProvenance is the IAM-hardening-mega-PR
+	// (logical change 2) variant. createdIP / createdUA are
+	// best-effort client IP + User-Agent from the minting request;
+	// parent is the optional FK to a predecessor key (distinct
+	// from the rotation-internal rotated_from_id column).
+	// Optional fields: nil/"" → column is NULL.
+	CreateOrgAPIKeyWithProvenance(ctx context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error)
 	ListOrgAPIKeys(ctx context.Context, orgID string) ([]APIKey, error)
 	GetOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error)
 	RevokeOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error)
 	RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (newKey, oldKey APIKey, err error)
+	// RotateOrgAPIKeyWithProvenance is the IAM-hardening-mega-PR
+	// (logical change 2) variant of RotateOrgAPIKey. createdIP /
+	// createdUA / parent are the provenance columns stamped on the
+	// new key row. The old key's existing rotated_from_id is
+	// unaffected (the rotation-internal stamp is a separate
+	// lineage from the optional parent_key_id).
+	RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration, createdIP, createdUA string, parent *string) (newKey, oldKey APIKey, err error)
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
 	//

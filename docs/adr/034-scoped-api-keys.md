@@ -162,3 +162,20 @@ rev2 closes both gaps. Issue #185 captures the customer-side ask.
    dashboard ("ci-deploy", "laptop"). Coupling authorization to a
    string the customer types at mint time is a typo-driven
    privilege escalation waiting to happen.
+
+- **Provenance + rotation lineage columns (`created_ip`,
+  `created_ua`, `parent_key_id`)** — deployed in
+  `migrations/00135_api_keys_provenance.sql` (IAM hardening
+  mega-PR, logical change 2). All three columns are nullable +
+  advisory (no NOT NULL, no CHECK). The provenance columns let
+  a SOC 2 auditor answer "who minted this key from which IP+UA"
+  without joining through Loki; `parent_key_id` is the explicit
+  FK to the predecessor key (distinct from the rotation-internal
+  `rotated_from_id` column. For rotations both point at the same
+  predecessor). The `key.created` / `api_key.created` /
+  `key.rotated` / `api_key.rotated` audit rows now carry the same
+  `created_ip` / `created_ua` / `parent_key_id` payload so the
+  audit row and the DB row stay in lockstep. The audit payload
+  values are run through `pkg/logsanitize.Field` so the audit
+  trail is storage-rotation-safe (matching the precedent set by
+  `pkg/authcode.HashEmail`, ADR-035 §"Failed-login emission").

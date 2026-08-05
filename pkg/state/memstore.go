@@ -1073,6 +1073,93 @@ func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte
 	return k, nil
 }
 
+// CreateOrgAPIKeyWithProvenance mirrors PgStore. Three optional
+// provenance columns stamp the new row; nil/"" inputs round-trip
+// as the zero value on the struct (mirrors the pgstore NULL shape).
+func (m *MemStore) CreateOrgAPIKeyWithProvenance(_ context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := hex.EncodeToString(hash)
+	if _, dup := m.keyByHash[h]; dup {
+		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	var orgIDField string
+	if orgID != "" {
+		orgIDField = orgID
+	}
+	k := APIKey{
+		ID:          newID(),
+		AccountID:   accountID,
+		OrgID:       orgIDField,
+		Hash:        hash,
+		Label:       label,
+		Scopes:      scopes,
+		CreatedAt:   time.Now(),
+		Status:      string(APIKeyStatusActive),
+		ExpiresAt:   expiresAt,
+		CreatedIP:   createdIP,
+		CreatedUA:   createdUA,
+		ParentKeyID: parent,
+	}
+	m.keys[k.ID] = k
+	m.keyByHash[h] = k
+	return k, nil
+}
+
+// RotateOrgAPIKeyWithProvenance mirrors PgStore. The new row's
+// provenance columns stamp created_ip / created_ua / parent_key_id;
+// the existing rotated_from_id is unchanged.
+func (m *MemStore) RotateOrgAPIKeyWithProvenance(_ context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration, createdIP, createdUA string, parent *string) (APIKey, APIKey, error) {
+	if graceWindow < 0 {
+		graceWindow = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.keys[oldKeyID]
+	if !ok || old.OrgID != orgID {
+		return APIKey{}, APIKey{}, ErrNotFound
+	}
+	if old.Status == string(APIKeyStatusRevoked) {
+		return APIKey{}, APIKey{}, ErrAPIKeyRevoked
+	}
+	if newLabel == "" {
+		newLabel = old.Label
+	}
+	rotatedFrom := old.ID
+	newKey := APIKey{
+		ID:            newID(),
+		AccountID:     old.AccountID,
+		OrgID:         old.OrgID,
+		Hash:          newHash,
+		Label:         newLabel,
+		Scopes:        old.Scopes,
+		CreatedAt:     time.Now(),
+		Status:        string(APIKeyStatusActive),
+		RotatedFromID: &rotatedFrom,
+		CreatedIP:     createdIP,
+		CreatedUA:     createdUA,
+		ParentKeyID:   parent,
+	}
+	m.keys[newKey.ID] = newKey
+	m.keyByHash[hex.EncodeToString(newKey.Hash)] = newKey
+
+	now := time.Now()
+	if graceWindow == 0 {
+		old.Status = string(APIKeyStatusRevoked)
+		old.ExpiresAt = &now
+		if old.RevokedAt == nil {
+			old.RevokedAt = &now
+		}
+	} else {
+		old.Status = string(APIKeyStatusGrace)
+		deadline := now.Add(graceWindow)
+		old.ExpiresAt = &deadline
+	}
+	m.keys[old.ID] = old
+	m.keyByHash[hex.EncodeToString(old.Hash)] = old
+	return newKey, old, nil
+}
+
 func (m *MemStore) DeleteAPIKey(_ context.Context, accountID, keyID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1169,6 +1256,34 @@ func (m *MemStore) CreateAPIKeyWithExpiry(_ context.Context, accountID string, h
 		CreatedAt: time.Now(),
 		Status:    string(APIKeyStatusActive),
 		ExpiresAt: expiresAt,
+	}
+	m.keys[k.ID] = k
+	m.keyByHash[h] = k
+	return k, nil
+}
+
+// CreateAPIKeyWithExpiryAndProvenance mirrors PgStore. Optional
+// provenance columns stamp CreatedIP / CreatedUA / ParentKeyID;
+// nil/"" inputs round-trip as the zero value on the struct.
+func (m *MemStore) CreateAPIKeyWithExpiryAndProvenance(_ context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := hex.EncodeToString(hash)
+	if _, dup := m.keyByHash[h]; dup {
+		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	k := APIKey{
+		ID:          newID(),
+		AccountID:   accountID,
+		Hash:        hash,
+		Label:       label,
+		Scopes:      scopes,
+		CreatedAt:   time.Now(),
+		Status:      string(APIKeyStatusActive),
+		ExpiresAt:   expiresAt,
+		CreatedIP:   createdIP,
+		CreatedUA:   createdUA,
+		ParentKeyID: parent,
 	}
 	m.keys[k.ID] = k
 	m.keyByHash[h] = k
