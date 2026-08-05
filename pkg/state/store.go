@@ -1238,6 +1238,30 @@ type Store interface {
 	// wire and vmmd resolves it via Storage.Get before staging the chroot.
 	SetDeploymentRootfs(ctx context.Context, id, path, key string, bytes int64) error
 
+	// UpsertDeploymentScanResult records the per-deploy grype CVE
+	// scan on the deployment row (issue #464 / ADR-055 / PR-3).
+	// Only apid calls this (the apid-only-writer invariant on
+	// customer-intent tables); imaged reaches it through the
+	// ScanResultSink seam declared in pkg/imaged/scan_sink.go.
+	//
+	// scanResult is the marshalled JSON for the deployments.scan_result
+	// jsonb column (the typed *imaged.ScanResult from the deploy-
+	// complete hook, with SeverityCounts + Vulnerability[] payload).
+	// status is the closed enum value 'complete' or 'failed' (matches
+	// the migrations/00135 CHECK constraint). The row is filtered
+	// by deployment_id at the SQL level — IDOR safety is the caller's
+	// job (the apid-side handler does the AppByID + AccountID check
+	// before invoking), but the row must be scoped to one deployment
+	// so a misrouted call doesn't bleed across accounts.
+	//
+	// Idempotent: a re-delivered deploy notification overwrites the
+	// same row with the same scan_result + scan_status + scanned_at,
+	// not create a second one. Returns ErrNotFound when the
+	// deployment row doesn't exist (the FK CASCADE in migration
+	// 00135 makes this unreachable in practice, but the explicit
+	// error lets a misuse at the call site fail closed).
+	UpsertDeploymentScanResult(ctx context.Context, deploymentID string, scanResult []byte, status string) error
+
 	// Per-workload filesystem handles for sidecars (issue #463 /
 	// ADR-069 / PR-B). The PR-A surface (Deployment.Sidecars
 	// jsonb) stays the contract layer; this is the per-sidecar

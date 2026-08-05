@@ -3071,6 +3071,26 @@ func (m *MemStore) SetDeploymentRootfs(_ context.Context, id, path, key string, 
 	return nil
 }
 
+// UpsertDeploymentScanResult mirrors PgStore.UpsertDeploymentScanResult
+// (issue #464 / ADR-055 / PR-3). Stamps the per-deploy grype scan on
+// the in-memory deployments row. The Deployment struct's scan fields
+// are added in this PR — PR-1 only added them to the sqlc-generated
+// model and the DB, so the in-memory mirror needed its own
+// counterpart.
+func (m *MemStore) UpsertDeploymentScanResult(_ context.Context, id string, scanResult []byte, status string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.ScanResult = append([]byte(nil), scanResult...) // defensive copy
+	d.ScanStatus = status
+	d.ScannedAt = time.Now()
+	m.deployments[id] = d
+	return nil
+}
+
 // SetDeploymentSidecarLayer mirrors PgStore (issue #463 /
 // ADR-069 / PR-B). Upserts on the (deployment_id, sidecar_name)
 // pair — same idempotency contract as the schema CHECK + ON
