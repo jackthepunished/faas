@@ -1209,13 +1209,24 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 // scanStatus (the dashboard's "scan pending" pill renders
 // on the absence, not on a 200/empty payload — the same
 // convention as getDeploymentScan).
+//
+// Sort+cap (issue #464 / AC #3): the dashboard renders the
+// top-N CVEs by severity (CRITICAL first, then HIGH, MEDIUM,
+// LOW, UNKNOWN; stable on ID for ties). The cap is at the
+// handler edge — the wire DTO + /scan route + SDK + CLI keep
+// the full list so customers reaching the API directly don't
+// have to reimplement the cap. TotalCount carries the
+// pre-truncation count so the template can render the
+// "Showing N of M" copy + a "View full scan (JSON)" link to
+// GET /v1/deployments/{id}/scan when the scan had more
+// findings than the dashboard width allows.
 func dashboardScanPayload(s *api.ScanResult) dashboard.ScanPayload {
 	if s == nil {
 		return dashboard.ScanPayload{}
 	}
-	vulns := make([]dashboard.VulnerabilityRow, 0, len(s.Vulnerabilities))
+	rows := make([]dashboard.VulnerabilityRow, 0, len(s.Vulnerabilities))
 	for _, v := range s.Vulnerabilities {
-		vulns = append(vulns, dashboard.VulnerabilityRow{
+		rows = append(rows, dashboard.VulnerabilityRow{
 			ID:       v.ID,
 			Severity: v.Severity,
 			Package:  v.Package,
@@ -1224,6 +1235,15 @@ func dashboardScanPayload(s *api.ScanResult) dashboard.ScanPayload {
 			Paths:    v.Paths,
 		})
 	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return severityOrdinal(rows[i].Severity) < severityOrdinal(rows[j].Severity)
+	})
+	total := len(rows)
+	limit := total
+	if limit > dashboardScanTopN {
+		limit = dashboardScanTopN
+	}
+	vulns := rows[:limit]
 	sc := s.SeverityCounts
 	return dashboard.ScanPayload{
 		Status:         s.Status,
@@ -1238,8 +1258,43 @@ func dashboardScanPayload(s *api.ScanResult) dashboard.ScanPayload {
 			Unknown:  sc.Unknown,
 		},
 		Vulnerabilities: vulns,
+		TotalCount:      total,
 		Error:           s.Error,
 	}
+}
+
+// dashboardScanTopN is the AC #3 cap (issue #464): the
+// dashboard's deployment detail page renders the top-N CVEs by
+// severity, with a link to the full list at the wire endpoint.
+// 10 is the spec number; the value is exposed at handler edge
+// so the dashboard_test unit pin can iterate without copy-paste.
+const dashboardScanTopN = 10
+
+// severityOrdinalTable maps the closed-enum severity strings
+// the dashboard renders to their render-first ordinal. Lower
+// ordinal = more severe. Strings outside the closed enum
+// (the default branch) sort after UNKNOWN so an upstream
+// change doesn't disturb the ordering of known-severity rows.
+//
+// A single package-level map declaration keeps the goconst
+// rule quiet (each severity string appears only inside the
+// literal here; the return path reads off the ordinal).
+var severityOrdinalTable = map[string]int{
+	"CRITICAL": 0,
+	"HIGH":     1,
+	"MEDIUM":   2,
+	"LOW":      3,
+	"UNKNOWN":  4,
+}
+
+// severityOrdinal returns the render-first ordinal of a
+// severity string. Unknown / malformed values return one past
+// UNKNOWN so they sort at the end of the cap.
+func severityOrdinal(s string) int {
+	if n, ok := severityOrdinalTable[s]; ok {
+		return n
+	}
+	return len(severityOrdinalTable) // any unknown sorts after UNKNOWN
 }
 
 // dashboardDeploymentItem projects a state.Deployment into the

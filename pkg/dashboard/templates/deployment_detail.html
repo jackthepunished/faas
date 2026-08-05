@@ -95,7 +95,13 @@
           </table>
 
           {{if .Data.Scan.Vulnerabilities}}
-            <h3>Vulnerabilities ({{len .Data.Scan.Vulnerabilities}})</h3>
+            <h3>Vulnerabilities
+              {{if gt .Data.Scan.TotalCount (len .Data.Scan.Vulnerabilities)}}
+                (showing {{len .Data.Scan.Vulnerabilities}} of {{.Data.Scan.TotalCount}})
+              {{else}}
+                ({{.Data.Scan.TotalCount}})
+              {{end}}
+            </h3>
             <table>
               <thead><tr><th>ID</th><th>Severity</th><th>Package</th><th>Version</th><th>Fixed in</th><th>Path</th></tr></thead>
               <tbody>
@@ -124,6 +130,11 @@
                 {{end}}
               </tbody>
             </table>
+            {{if gt .Data.Scan.TotalCount (len .Data.Scan.Vulnerabilities)}}
+              <p><a href="/v1/deployments/{{.Data.Deployment.ID}}/scan"
+                    target="_blank" rel="noopener">View full scan (JSON) →</a>
+                 — the API returns the complete {{.Data.Scan.TotalCount}} findings.</p>
+            {{end}}
           {{else}}
             <p>No vulnerabilities matched.</p>
           {{end}}

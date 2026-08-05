@@ -228,10 +228,15 @@ type DeploymentDetailData struct {
 // {complete, failed, skipped, pending} — the dashboard reads
 // the same vocabulary pkg/api.ScanResult uses so the chips are
 // uniform across the list view (app_detail.html) and the
-// detail view (deployment_detail.html). Vulnerabilities is
-// sorted CRITICAL → UNKNOWN DESC by the handler (Grype's
-// natural order is most-severe-first but the spec asks for
-// strict ordering).
+// detail view (deployment_detail.html).
+//
+// Vulnerabilities is the dashboard's "top 10" view (handler-edge
+// cap in cmd/apid/handlers_dashboard.go::dashboardScanPayload);
+// TotalCount carries the pre-truncation count so the template
+// can render the AC #3 "Showing N of M" copy + a "View full scan"
+// link to GET /v1/deployments/{id}/scan. TotalCount == len(
+// Vulnerabilities) when the underlying scan had ≤ dashboardScanTopN
+// findings (the common case for small base images).
 type ScanPayload struct {
 	Status          string
 	ScannedAt       string
@@ -239,6 +244,7 @@ type ScanPayload struct {
 	ImageDigest     string
 	SeverityCounts  SeverityBucket
 	Vulnerabilities []VulnerabilityRow
+	TotalCount      int
 	Error           string
 }
 
