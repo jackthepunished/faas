@@ -112,6 +112,15 @@ func cookieDoCSRF(t *testing.T, h http.Handler, cookie *http.Cookie, csrfMgr *se
 // branch accepts a sid-less envelope.
 func setupMW(t *testing.T, plan api.Plan, mfaRequired bool) (http.Handler, state.Account, *session.Manager, string) {
 	t.Helper()
+	// Recovery-code HMAC upgrade: the production loader wires the
+	// per-process secret at apid boot (cmd/apid/main.go::loadOrGenerateRecoveryHMACKey);
+	// the test fixture has no boot path, so the shared sync.Once
+	// helper installs a deterministic test secret once across the
+	// suite. setupMW doesn't itself call authcode, but tests that
+	// compose around it might — installing the secret here means
+	// the suite-level invariant holds regardless of which setup
+	// the caller used.
+	ensureRecoveryTestSecret(t)
 	store := state.NewMemStore()
 	acct, err := store.CreateAccount(context.Background(),
 		"mw@example.com", plan)

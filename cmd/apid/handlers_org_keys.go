@@ -52,6 +52,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -170,7 +171,13 @@ func (s *server) createOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 		t := time.Now().UTC().Add(time.Duration(api.DefaultAPIKeyLifetimeDays) * 24 * time.Hour)
 		expiresAt = &t
 	}
-	k, err := s.store.CreateOrgAPIKey(r.Context(), mem.OrgID, acct.ID, hash, req.Label, scopes, expiresAt)
+	// IAM hardening mega-PR (logical change 2): stamp the
+	// provenance columns on the new row. parent_key_id is nil for
+	// first-mints (the FK is reserved for explicit lineage; rotation
+	// already uses rotated_from_id).
+	bindIP := clientIPFromRequest(r)
+	bindUA := logsanitize.Field(r.UserAgent())
+	k, err := s.store.CreateOrgAPIKeyWithProvenance(r.Context(), mem.OrgID, acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
@@ -178,9 +185,11 @@ func (s *server) createOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"created","org":"`+mem.OrgID+`"}`)
 	s.log.Info("api key created", "key", k.ID, "account", acct.ID, "org", mem.OrgID)
 	auditPayload := map[string]any{
-		"key_id": k.ID,
-		"scopes": scopes,
-		"org_id": k.OrgID,
+		"key_id":     k.ID,
+		"scopes":     scopes,
+		"org_id":     k.OrgID,
+		"created_ip": bindIP,
+		"created_ua": bindUA,
 	}
 	if k.ExpiresAt != nil {
 		auditPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
@@ -333,7 +342,14 @@ func (s *server) rotateOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	id := r.PathValue("id")
-	newKey, oldKey, err := s.store.RotateOrgAPIKey(r.Context(), mem.OrgID, id, hash, req.Label, graceWindow)
+	// IAM hardening mega-PR (logical change 2): stamp the
+	// provenance columns on the new row. parent_key_id is the
+	// explicit FK to the predecessor key — distinct from the
+	// rotation-internal rotated_from_id column, but for
+	// rotations both point to the same predecessor.
+	bindIP := clientIPFromRequest(r)
+	bindUA := logsanitize.Field(r.UserAgent())
+	newKey, oldKey, err := s.store.RotateOrgAPIKeyWithProvenance(r.Context(), mem.OrgID, id, hash, req.Label, graceWindow, bindIP, bindUA, nil)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -354,13 +370,19 @@ func (s *server) rotateOrgAPIKey(w http.ResponseWriter, r *http.Request, acct st
 	// Audit payload mirrors the legacy key.rotated shape plus
 	// org_id. The legacy event does NOT fire on this path (the
 	// canonical /v1/orgs/{slug}/keys surface only emits the new
-	// event).
+	// event). IAM hardening mega-PR (logical change 2): the
+	// provenance columns stamp the new row at the SQL layer; the
+	// audit payload mirrors the same shape so dashboards see both
+	// the DB column and the audit row in lockstep.
 	s.audit.Emit(r.Context(), "api_key.rotated", &acct.ID, map[string]any{
 		"old_key_id":         oldKey.ID,
 		"new_key_id":         newKey.ID,
 		"grace_window_days":  graceWindowDays,
 		"old_key_expires_at": oldKey.ExpiresAt.UTC().Format(time.RFC3339),
 		"org_id":             oldKey.OrgID,
+		"created_ip":         bindIP,
+		"created_ua":         bindUA,
+		"parent_key_id":      oldKey.ID,
 	})
 	s.log.Info("api key rotated",
 		"old_key", oldKey.ID, "new_key", newKey.ID,

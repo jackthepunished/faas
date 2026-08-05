@@ -1423,13 +1423,28 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// legacy CreateAPIKeyWithExpiry so the customer is never
 	// locked out of their own key mint. ErrNotFound is the
 	// expected signal; any other error is a 500.
+	//
+	// IAM hardening mega-PR (logical change 2): stamp the
+	// provenance columns (created_ip, created_ua) on the new row
+	// so a SOC 2 auditor can answer "who minted this key from
+	// which UA" without joining through Loki. parent_key_id is
+	// nil for first-mints (the FK is reserved for an explicit
+	// lineage path; rotation already uses rotated_from_id).
+	bindIP := clientIPFromRequest(r)
+	bindUA := logsanitize.Field(r.UserAgent())
 	org, perr := s.store.OrgByPersonalAccount(ctx(r), acct.ID)
 	var k state.APIKey
 	switch {
 	case perr == nil:
-		k, err = s.store.CreateOrgAPIKey(ctx(r), org.ID, acct.ID, hash, req.Label, scopes, expiresAt)
+		k, err = s.store.CreateOrgAPIKeyWithProvenance(ctx(r), org.ID, acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
 	case errors.Is(perr, state.ErrNotFound):
-		k, err = s.store.CreateAPIKeyWithExpiry(ctx(r), acct.ID, hash, req.Label, scopes, expiresAt)
+		// Legacy fallback path (pre-00127 fixtures). The
+		// 5-arg CreateAPIKeyWithExpiry is the production
+		// handler we have here; the provenance variant
+		// stamps the same audit-relevant columns so the
+		// fallback path is the same shape as the org-bound
+		// path.
+		k, err = s.store.CreateAPIKeyWithExpiryAndProvenance(ctx(r), acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
 	default:
 		api.WriteProblem(w, api.ErrCapacity("could not resolve personal org"))
 		return
@@ -1450,8 +1465,10 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// so PR 5+ dashboards can group by org. PR 9 drops the
 	// legacy event.
 	auditPayload := map[string]any{
-		"key_id": k.ID,
-		"scopes": scopes,
+		"key_id":     k.ID,
+		"scopes":     scopes,
+		"created_ip": bindIP,
+		"created_ua": bindUA,
 	}
 	if k.ExpiresAt != nil {
 		auditPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
@@ -1459,9 +1476,11 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	s.audit.Emit(ctx(r), "key.created", &acct.ID, auditPayload)
 	if perr == nil {
 		newPayload := map[string]any{
-			"key_id": k.ID,
-			"scopes": scopes,
-			"org_id": k.OrgID,
+			"key_id":     k.ID,
+			"scopes":     scopes,
+			"org_id":     k.OrgID,
+			"created_ip": bindIP,
+			"created_ua": bindUA,
 		}
 		if k.ExpiresAt != nil {
 			newPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
@@ -1622,7 +1641,19 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// need to chase a label change. The store layer reads the
 	// old row's label in the transaction; the empty string tells
 	// the store to use the old row's value as-is.
-	newKey, oldKey, err := s.store.RotateOrgAPIKey(ctx(r), oldKey.OrgID, id, hash, "", graceWindow)
+	//
+	// IAM hardening mega-PR (logical change 2): stamp the
+	// provenance columns on the new row. parent_key_id is the
+	// explicit FK to the predecessor key — distinct from the
+	// rotation-internal rotated_from_id column, but for
+	// rotations both point to the same predecessor. This makes
+	// the rotation lineage queryable from two angles: the
+	// fast rotated_from_id index (the rotation-internal stamp)
+	// and the parent_key_id FK (the provenance lineage).
+	bindIP := clientIPFromRequest(r)
+	bindUA := logsanitize.Field(r.UserAgent())
+	parentID := oldKey.ID
+	newKey, oldKey, err := s.store.RotateOrgAPIKeyWithProvenance(ctx(r), oldKey.OrgID, id, hash, "", graceWindow, bindIP, bindUA, &parentID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -1646,6 +1677,9 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"new_key_id":         newKey.ID,
 		"grace_window_days":  graceWindowDays,
 		"old_key_expires_at": oldKey.ExpiresAt.UTC().Format(time.RFC3339),
+		"created_ip":         bindIP,
+		"created_ua":         bindUA,
+		"parent_key_id":      oldKey.ID,
 	}
 	s.audit.Emit(ctx(r), "key.rotated", &acct.ID, auditPayload)
 	// PR 6 dual-emit: the new `api_key.rotated` carries org_id
@@ -1657,6 +1691,9 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"grace_window_days":  graceWindowDays,
 		"old_key_expires_at": oldKey.ExpiresAt.UTC().Format(time.RFC3339),
 		"org_id":             oldKey.OrgID,
+		"created_ip":         bindIP,
+		"created_ua":         bindUA,
+		"parent_key_id":      oldKey.ID,
 	})
 	s.log.Info("key rotated",
 		"old_key", oldKey.ID, "new_key", newKey.ID,

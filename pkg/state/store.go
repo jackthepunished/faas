@@ -490,6 +490,12 @@ type Store interface {
 	//
 	// Issue #189 / IAM-5.
 	CreateAPIKeyWithExpiry(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+	// CreateAPIKeyWithExpiryAndProvenance is the IAM-hardening-mega-PR
+	// (logical change 2) variant of CreateAPIKeyWithExpiry. Used
+	// when the legacy /v1/keys POST handler falls back to the
+	// account-scoped path (no personal org yet — pre-00127 fixtures).
+	// Optional fields: nil/"" → NULL column.
+	CreateAPIKeyWithExpiryAndProvenance(ctx context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error)
 
 	// CountAPIKeys returns the number of non-revoked keys owned
 	// by the account. Used by the create + rotate handlers to
@@ -594,10 +600,24 @@ type Store interface {
 	// subquery — see PgStore implementation). Same graceWindow
 	// semantics, same returned-key ordering.
 	CreateOrgAPIKey(ctx context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time) (APIKey, error)
+	// CreateOrgAPIKeyWithProvenance is the IAM-hardening-mega-PR
+	// (logical change 2) variant. createdIP / createdUA are
+	// best-effort client IP + User-Agent from the minting request;
+	// parent is the optional FK to a predecessor key (distinct
+	// from the rotation-internal rotated_from_id column).
+	// Optional fields: nil/"" → column is NULL.
+	CreateOrgAPIKeyWithProvenance(ctx context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error)
 	ListOrgAPIKeys(ctx context.Context, orgID string) ([]APIKey, error)
 	GetOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error)
 	RevokeOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error)
 	RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration) (newKey, oldKey APIKey, err error)
+	// RotateOrgAPIKeyWithProvenance is the IAM-hardening-mega-PR
+	// (logical change 2) variant of RotateOrgAPIKey. createdIP /
+	// createdUA / parent are the provenance columns stamped on the
+	// new key row. The old key's existing rotated_from_id is
+	// unaffected (the rotation-internal stamp is a separate
+	// lineage from the optional parent_key_id).
+	RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration, createdIP, createdUA string, parent *string) (newKey, oldKey APIKey, err error)
 
 	// Login tokens (M7.5 magic-link, spec §14 + ADR-011).
 	//
@@ -611,6 +631,20 @@ type Store interface {
 	IssueLoginToken(ctx context.Context, tokenHash []byte, accountID string, expiresAt time.Time) error
 	ConsumeLoginToken(ctx context.Context, tokenHash []byte) (string, error)
 	DeleteOldLoginTokens(ctx context.Context, before time.Time) (int64, error)
+
+	// Audit events (IAM-4 / ADR-035, retention ADR-075). The
+	// events table grows ~3-4 GB/year per active-tier customer
+	// through the auth / key / secret / account / stateless
+	// audit namespaces plus the future wake-timeline / sidecar
+	// surfaces. The retention trim is a daily cron (wired by
+	// pkg/eventretention); the Store method is the primitive it
+	// calls. SOC 2 CC6.2 evidence-retention floor is 90 days
+	// (pkg/eventretention.DefaultCutoffDays).
+	//
+	// The (subject, at desc) partial index on the events table
+	// keeps the DELETE bounded by (cutoff × recent rows); the
+	// AppendEvent / ListEvents paths exercise the same shape.
+	DeleteOldEvents(ctx context.Context, before time.Time) (int64, error)
 
 	// Dashboard sessions (IAM-3, issue #187 + #244 merged). One row per
 	// successful dashboard login; the cookie envelope carries the row's
@@ -659,6 +693,31 @@ type Store interface {
 	// are logged but never reject the request. Touch is allowed on
 	// revoked rows (observability-only signal, not authorization).
 	CreateSession(ctx context.Context, id, accountID, issuedIP, issuedUA string) (Session, error)
+	// CreateSessionWithBinding is the IAM-hardening-mega-PR
+	// (logical change 5) variant. The bindingHash parameter is
+	// the HMAC-SHA256 fingerprint of (ip, ua_family) — the same
+	// value the cookie envelope stamps. Empty string → NULL
+	// column (the unix-socket / CLI-auth code path has no
+	// meaningful fingerprint).
+	CreateSessionWithBinding(ctx context.Context, id, accountID, issuedIP, issuedUA, bindingHash string) (Session, error)
+	// UpdateSessionBinding re-stamps the sessions.binding_hash
+	// column on an existing live row. Called by
+	// reissueSessionCookieWithStepUp (cmd/apid/handlers_mfa.go)
+	// so the cookie envelope's binding_hash and the sessions
+	// row's binding_hash stay in lockstep across /v1/account/mfa/
+	// {confirm,verify,recover,disable}. The middleware
+	// cross-check (pkg/auth/middleware/middleware.go
+	// RequireSessionCookie step 3.5) compares the two; without
+	// this update the row still carries the original mint's
+	// fingerprint and every post-reissue request trips the
+	// stolen-cookie auto-revoke branch on its own session.
+	//
+	// accountID is the IDOR guard: a cross-account update
+	// returns ErrNotFound (the handler maps to 401
+	// CodeSessionInvalid, byte-identical to a missing row).
+	// Returns ErrNotFound when no live (non-revoked) row
+	// matches the (id, accountID) pair.
+	UpdateSessionBinding(ctx context.Context, id, accountID, bindingHash string) error
 	GetSession(ctx context.Context, id string) (Session, error)
 	RevokeSession(ctx context.Context, id, accountID string) (bool, error)
 	ListSessions(ctx context.Context, accountID string) ([]Session, error)

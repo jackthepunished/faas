@@ -48,7 +48,11 @@ func TestPg_ConsumeRecoveryCode_RemainingCount(t *testing.T) {
 	}
 
 	// Case 1: burn one of ten. remaining must drop to 9.
-	matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, authcode.HashRecoveryCode(plaintexts[0]))
+	presented, err := authcode.HashRecoveryCode(plaintexts[0])
+	if err != nil {
+		t.Fatalf("HashRecoveryCode[0]: %v", err)
+	}
+	matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, presented)
 	if err != nil {
 		t.Fatalf("ConsumeRecoveryCode: %v", err)
 	}
@@ -63,7 +67,11 @@ func TestPg_ConsumeRecoveryCode_RemainingCount(t *testing.T) {
 	// directly (the /recover handler refuses the last code; the
 	// store contract is allowed to consume it).
 	for i := 1; i < authcode.RecoveryCodeCount; i++ {
-		matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, authcode.HashRecoveryCode(plaintexts[i]))
+		presented, err := authcode.HashRecoveryCode(plaintexts[i])
+		if err != nil {
+			t.Fatalf("HashRecoveryCode[%d]: %v", i, err)
+		}
+		matched, lastCode, remaining, err := s.ConsumeRecoveryCode(ctx, acct.ID, presented)
 		if err != nil {
 			t.Fatalf("burn %d: %v", i, err)
 		}

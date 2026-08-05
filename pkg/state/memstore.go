@@ -1073,6 +1073,93 @@ func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte
 	return k, nil
 }
 
+// CreateOrgAPIKeyWithProvenance mirrors PgStore. Three optional
+// provenance columns stamp the new row; nil/"" inputs round-trip
+// as the zero value on the struct (mirrors the pgstore NULL shape).
+func (m *MemStore) CreateOrgAPIKeyWithProvenance(_ context.Context, orgID, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := hex.EncodeToString(hash)
+	if _, dup := m.keyByHash[h]; dup {
+		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	var orgIDField string
+	if orgID != "" {
+		orgIDField = orgID
+	}
+	k := APIKey{
+		ID:          newID(),
+		AccountID:   accountID,
+		OrgID:       orgIDField,
+		Hash:        hash,
+		Label:       label,
+		Scopes:      scopes,
+		CreatedAt:   time.Now(),
+		Status:      string(APIKeyStatusActive),
+		ExpiresAt:   expiresAt,
+		CreatedIP:   createdIP,
+		CreatedUA:   createdUA,
+		ParentKeyID: parent,
+	}
+	m.keys[k.ID] = k
+	m.keyByHash[h] = k
+	return k, nil
+}
+
+// RotateOrgAPIKeyWithProvenance mirrors PgStore. The new row's
+// provenance columns stamp created_ip / created_ua / parent_key_id;
+// the existing rotated_from_id is unchanged.
+func (m *MemStore) RotateOrgAPIKeyWithProvenance(_ context.Context, orgID, oldKeyID string, newHash []byte, newLabel string, graceWindow time.Duration, createdIP, createdUA string, parent *string) (APIKey, APIKey, error) {
+	if graceWindow < 0 {
+		graceWindow = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.keys[oldKeyID]
+	if !ok || old.OrgID != orgID {
+		return APIKey{}, APIKey{}, ErrNotFound
+	}
+	if old.Status == string(APIKeyStatusRevoked) {
+		return APIKey{}, APIKey{}, ErrAPIKeyRevoked
+	}
+	if newLabel == "" {
+		newLabel = old.Label
+	}
+	rotatedFrom := old.ID
+	newKey := APIKey{
+		ID:            newID(),
+		AccountID:     old.AccountID,
+		OrgID:         old.OrgID,
+		Hash:          newHash,
+		Label:         newLabel,
+		Scopes:        old.Scopes,
+		CreatedAt:     time.Now(),
+		Status:        string(APIKeyStatusActive),
+		RotatedFromID: &rotatedFrom,
+		CreatedIP:     createdIP,
+		CreatedUA:     createdUA,
+		ParentKeyID:   parent,
+	}
+	m.keys[newKey.ID] = newKey
+	m.keyByHash[hex.EncodeToString(newKey.Hash)] = newKey
+
+	now := time.Now()
+	if graceWindow == 0 {
+		old.Status = string(APIKeyStatusRevoked)
+		old.ExpiresAt = &now
+		if old.RevokedAt == nil {
+			old.RevokedAt = &now
+		}
+	} else {
+		old.Status = string(APIKeyStatusGrace)
+		deadline := now.Add(graceWindow)
+		old.ExpiresAt = &deadline
+	}
+	m.keys[old.ID] = old
+	m.keyByHash[hex.EncodeToString(old.Hash)] = old
+	return newKey, old, nil
+}
+
 func (m *MemStore) DeleteAPIKey(_ context.Context, accountID, keyID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1169,6 +1256,34 @@ func (m *MemStore) CreateAPIKeyWithExpiry(_ context.Context, accountID string, h
 		CreatedAt: time.Now(),
 		Status:    string(APIKeyStatusActive),
 		ExpiresAt: expiresAt,
+	}
+	m.keys[k.ID] = k
+	m.keyByHash[h] = k
+	return k, nil
+}
+
+// CreateAPIKeyWithExpiryAndProvenance mirrors PgStore. Optional
+// provenance columns stamp CreatedIP / CreatedUA / ParentKeyID;
+// nil/"" inputs round-trip as the zero value on the struct.
+func (m *MemStore) CreateAPIKeyWithExpiryAndProvenance(_ context.Context, accountID string, hash []byte, label string, scopes []string, expiresAt *time.Time, createdIP, createdUA string, parent *string) (APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h := hex.EncodeToString(hash)
+	if _, dup := m.keyByHash[h]; dup {
+		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	k := APIKey{
+		ID:          newID(),
+		AccountID:   accountID,
+		Hash:        hash,
+		Label:       label,
+		Scopes:      scopes,
+		CreatedAt:   time.Now(),
+		Status:      string(APIKeyStatusActive),
+		ExpiresAt:   expiresAt,
+		CreatedIP:   createdIP,
+		CreatedUA:   createdUA,
+		ParentKeyID: parent,
 	}
 	m.keys[k.ID] = k
 	m.keyByHash[h] = k
@@ -6571,6 +6686,34 @@ func (m *MemStore) DeleteOldLoginTokens(_ context.Context, before time.Time) (in
 	return removed, nil
 }
 
+// DeleteOldEvents (ADR-075) prunes audit-log events whose `at` is
+// older than the cutoff. Mirrors the PgStore shape so tests can
+// drive the in-memory twin of the daily retention loop without
+// spinning up Postgres. Returns the number removed.
+//
+// Allocates a fresh slice rather than reusing the backing array
+// in place — concurrent AppendEvent callers would otherwise see
+// a half-trimmed slice. The cost is one allocation per tick (once
+// per day), so it's not on the hot path.
+//
+// Used by pkg/eventretention's daily loop; the maintenance floor
+// is 90 days (SOC 2 CC6.2).
+func (m *MemStore) DeleteOldEvents(_ context.Context, before time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := make([]Event, 0, len(m.events))
+	var removed int64
+	for _, e := range m.events {
+		if e.At.Before(before) {
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	m.events = kept
+	return removed, nil
+}
+
 // SetAccountPassword upserts the Argon2id PHC hash for an account.
 // One row per account_id — the PK rejects a duplicate INSERT, so a
 // racing concurrent SetAccountPassword against the same account
@@ -8178,6 +8321,32 @@ func (m *MemStore) CreateSession(_ context.Context, id, accountID, issuedIP, iss
 	return s, nil
 }
 
+// CreateSessionWithBinding mirrors PgStore. The bindingHash
+// parameter is the HMAC-SHA256 fingerprint of (ip, ua_family);
+// empty string round-trips as the zero value on the struct
+// (mirrors the pgstore NULL shape).
+func (m *MemStore) CreateSessionWithBinding(_ context.Context, id, accountID, issuedIP, issuedUA, bindingHash string) (Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.sessions[id]; exists {
+		return Session{}, ErrConflict
+	}
+	if _, ok := m.accounts[accountID]; !ok {
+		return Session{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	s := Session{
+		ID:          id,
+		AccountID:   accountID,
+		IssuedIP:    issuedIP,
+		IssuedUA:    issuedUA,
+		IssuedAt:    now,
+		BindingHash: bindingHash,
+	}
+	m.sessions[id] = s
+	return s, nil
+}
+
 func (m *MemStore) GetSession(_ context.Context, id string) (Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -8202,6 +8371,27 @@ func (m *MemStore) RevokeSession(_ context.Context, id, accountID string) (bool,
 	s.RevokedAt = &now
 	m.sessions[id] = s
 	return true, nil
+}
+
+// UpdateSessionBinding mirrors PgStore.UpdateSessionBinding.
+// IDOR-safe via the (id, account_id) check; missing or
+// cross-account or already-revoked rows return ErrNotFound so
+// the handler maps them to 401 CodeSessionInvalid
+// (byte-identical to a stolen-cookie 401).
+func (m *MemStore) UpdateSessionBinding(_ context.Context, id, accountID, bindingHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok || s.AccountID != accountID || s.RevokedAt != nil {
+		return ErrNotFound
+	}
+	if bindingHash == "" {
+		s.BindingHash = ""
+	} else {
+		s.BindingHash = bindingHash
+	}
+	m.sessions[id] = s
+	return nil
 }
 
 func (m *MemStore) ListSessions(_ context.Context, accountID string) ([]Session, error) {

@@ -29,13 +29,16 @@ import (
 //
 // Note: the 32-byte host secret is consumed in NewManager and is
 // zeroed in the caller's slice — it never lives on the Manager's
-// heap. The AEAD wraps a copy inside the standard library's
-// cipher package; that internal copy is the lifetime owner.
+// heap in the caller's slice. The AEAD wraps a copy inside the
+// standard library's cipher package; Manager.bindingKey holds an
+// INDEPENDENT copy used by BindingKey() to power the ADR-076
+// binding-hash HMAC. Both copies are zeroed on Manager.Close.
 type Manager struct {
-	gcm      cipher.AEAD
-	maxAge   time.Duration
-	now      func() time.Time
-	issuedAt time.Time
+	gcm        cipher.AEAD
+	bindingKey []byte // 32-byte AEAD key copy for BindingKey()
+	maxAge     time.Duration
+	now        func() time.Time
+	issuedAt   time.Time
 }
 
 // Envelope is the JSON payload sealed inside the cookie. Adding a
@@ -76,6 +79,50 @@ type Envelope struct {
 	// cookie. omitempty + a pre-IAM-3 envelope means an existing cookie
 	// unmarshals cleanly with Sid == "" (no wire-incompat surprise).
 	Sid string `json:"sid,omitempty"` // IAM-3
+	// BindingHash is the IAM-hardening-mega-PR (logical change 5,
+	// ADR-076) fingerprint of (client IP, UA-family). HMAC-SHA256
+	// keyed by the host's session-key secret; empty when the
+	// unix-socket / CLI-auth code path has no meaningful fingerprint
+	// (cross-check is skipped). The RequireSession cookie branch
+	// compares this against the sessions row's binding_hash column;
+	// mismatch ⇒ auto-revoke + audit + 401.
+	BindingHash string `json:"binding_hash,omitempty"`
+	// StepUpAt is the IAM-hardening-mega-PR (logical change 6,
+	// ADR-077) timestamp the customer last cleared a fresh TOTP
+	// for step-up MFA. Zero value = "never stepped up"; the
+	// RequireStepUp middleware reads this and rejects when
+	// time.Since(env.StepUpAt) > ttl. The cookie omits this
+	// field when zero (omitempty), preserving pre-PR-077 wire
+	// compatibility.
+	StepUpAt time.Time `json:"step_up_at,omitempty"`
+}
+
+// BindingKey returns a copy of the 32-byte AEAD key for offline
+// HMAC use (ADR-076). The Manager retains its own internal copy
+// in the AES cipher block (standard library contract); this method
+// is a separate read-only export that powers pkg/bindinghash.Compute.
+// The returned slice is freshly allocated; callers MAY zero it
+// after use. nil when the Manager is uninitialised.
+//
+// Construction: the key is captured at NewManager time and held
+// in a private field. The Manager's zero-out sweep at
+// construction-time zeroes the CALLER's slice, not the internal
+// copy — the copy is what powers BindingKey after the constructor
+// returns. The cost is one 32-byte allocation per Manager lifetime.
+//
+// Use case: apid's main.go takes the loaded session key, hands it
+// to session.NewManager, then asks for a BindingKey copy that the
+// binding-hash HMAC function uses. The two are intentionally
+// independent so a future operator-tooling code path that wants the
+// AEAD key for offline-cookie-mint can reach the SAME key bytes
+// without re-loading the file.
+func (m *Manager) BindingKey() []byte {
+	if m == nil || m.bindingKey == nil {
+		return nil
+	}
+	out := make([]byte, 32)
+	copy(out, m.bindingKey)
+	return out
 }
 
 // NewManager builds a Manager from a 32-byte key + a session lifetime.
@@ -112,15 +159,24 @@ func NewManager(key []byte, maxAge time.Duration) (*Manager, error) {
 		}
 		return nil, fmt.Errorf("session: gcm: %w", err)
 	}
+	// Capture the binding-key copy BEFORE we wipe the caller's
+	// slice. ADR-076's pkg/bindinghash.Compute needs an independent
+	// 32-byte key it can HMAC with; the AEAD holds its own copy
+	// inside cipher/gcm that we never reach. Re-derive by
+	// keeping a parallel local copy that the caller cannot mutate
+	// after we wipe theirs.
+	bindingCopy := make([]byte, 32)
+	copy(bindingCopy, key)
 	// AEAD ready — the caller's slice is no longer needed.
 	for i := range key {
 		key[i] = 0
 	}
 	return &Manager{
-		gcm:      gcm,
-		maxAge:   maxAge,
-		now:      time.Now,
-		issuedAt: time.Now(),
+		gcm:        gcm,
+		bindingKey: bindingCopy,
+		maxAge:     maxAge,
+		now:        time.Now,
+		issuedAt:   time.Now(),
 	}, nil
 }
 
@@ -217,6 +273,77 @@ func (m *Manager) IssueWithSessionAndGithubLogin(sid, accountID, githubLogin str
 		MfaPending:  mfaPending,
 		Sid:         sid,
 		GithubLogin: githubLogin,
+	})
+}
+
+// IssueWithSessionAndGithubLoginAndBindingHash seals an envelope
+// carrying sid (IAM-3 / ADR-039), accountID, mfaPending (IAM-2),
+// githubLogin (PR-B §11 ownership proof), and the binding-hash
+// fingerprint (ADR-076) in a single AEAD round. The github-login
+// path is the only code path that needs three session-binding
+// fields stamped together (sid + binding_hash + github_login);
+// combining them into one Seal avoids a double-seal round when
+// both fields need to land in the cookie.
+//
+// Empty githubLogin + empty bindingHash are permitted (cross-check
+// skips, omitempty keeps the wire form pre-PR-076-compatible).
+func (m *Manager) IssueWithSessionAndGithubLoginAndBindingHash(sid, accountID, githubLogin, bindingHash string, mfaPending bool) (string, error) {
+	now := m.now()
+	return m.Seal(Envelope{
+		AccountID:   accountID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
+		Sid:         sid,
+		GithubLogin: githubLogin,
+		BindingHash: bindingHash,
+	})
+}
+
+// IssueWithSessionAndBindingHashAndStepUp seals an envelope with
+// sid + accountID + mfaPending + binding_hash + step_up_at in a
+// single AEAD round. The step-up path uses this helper on every
+// successful /v1/account/mfa/verify so the next step-up-gated
+// request reads a fresh timestamp off the cookie envelope. The
+// binding hash is the ADR-076 fingerprint; the step-up time is
+// the ADR-077 timestamp. Both omitempty so a pre-PR-076 cookie
+// (no binding) decodes unchanged AND a pre-PR-077 cookie (no
+// step_up_at) decodes with StepUpAt zero.
+func (m *Manager) IssueWithSessionAndBindingHashAndStepUp(sid, accountID, bindingHash string, stepUpAt time.Time, mfaPending bool) (string, error) {
+	now := m.now()
+	return m.Seal(Envelope{
+		AccountID:   accountID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
+		Sid:         sid,
+		BindingHash: bindingHash,
+		StepUpAt:    stepUpAt,
+	})
+}
+
+// IssueWithSessionAndBindingHash seals an envelope carrying sid (IAM-3),
+// accountID, mfaPending (IAM-2), and the binding-hash fingerprint
+// (ADR-076) in a single AEAD round. The bindingHash is the
+// HMAC-SHA256 fingerprint of (client IP, UA-family) keyed by the
+// host's session-key secret; "" is the documented "binding not armed"
+// marker (the unix-socket / CLI-auth code path). The RequireSession
+// cookie branch compares the envelope's binding_hash against the
+// sessions row's binding_hash column; mismatch ⇒ auto-revoke +
+// audit + 401.
+//
+// All four session-binding fields carry `omitempty` so a pre-PR-076
+// cookie decodes unchanged with BindingHash == "" (the cross-check
+// skips). Wire compatibility is preserved.
+func (m *Manager) IssueWithSessionAndBindingHash(sid, accountID, bindingHash string, mfaPending bool) (string, error) {
+	now := m.now()
+	return m.Seal(Envelope{
+		AccountID:   accountID,
+		IssuedAt:    now,
+		ExpiresAt:   now.Add(m.maxAge),
+		MfaPending:  mfaPending,
+		Sid:         sid,
+		BindingHash: bindingHash,
 	})
 }
 

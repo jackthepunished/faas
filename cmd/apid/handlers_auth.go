@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -233,6 +234,22 @@ func (s *server) sessionAuth(next http.Handler) http.Handler {
 			return
 		}
 		r = r.WithContext(WithAccount(r.Context(), acct))
+		// IAM-hardening-mega-PR (logical change 6, ADR-077 /
+		// review finding #3): stamp env.StepUpAt onto
+		// r.Context() so requireStepUpHandler can read it. The
+		// dashboard mount sessionAuth → requireStepUpHandler(5m)
+		// (server.go set-password / delete-account) was silently
+		// bypassing the gate because sessionAuth never called
+		// WithStepUp — StepUpFrom returned (zero, false), the
+		// `!has` branch at middleware.go:889 forwarded the
+		// request, and the "stolen browser, post-MFA-clear"
+		// threat change 6 exists to close re-opened. env.StepUpAt
+		// is zero for pre-PR-077 cookies (omitempty wire shape);
+		// the gate sees ts.IsZero()==true and emits
+		// reason="missing" + 403, forcing a step-up.
+		//
+		//nolint:contextcheck // pointer-mutation contract (same as withSession/withPrincipal/withMFAPending at middleware.go:530-554): r.Context() must be the inherited ctx; capturing into a local would break observeWrap.
+		r = r.WithContext(authmw.WithStepUp(r.Context(), env.StepUpAt))
 		next.ServeHTTP(w, r)
 	})
 }

@@ -110,5 +110,5 @@ func TestNew_NilAuthnPanics(t *testing.T) {
 			t.Errorf("New(nil, ...) did not panic")
 		}
 	}()
-	New(nil, nil, nil, nil, nil, nil)
+	New(nil, nil, nil, nil, nil, nil, nil)
 }

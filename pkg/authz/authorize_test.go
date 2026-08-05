@@ -70,85 +70,181 @@ func ctxWithPrincipal(t *testing.T, accountID string, role state.OrgRole) contex
 	return WithRequestOnContext(req.Context(), req)
 }
 
+// roleMatrixCells is the canonical (action, role, allowed) table
+// the role matrix tests pin against. Both TestRoleMatrix_Exhaustive
+// (which round-trips each row through expectAllowed) and
+// TestRoleMatrix_NoOrphanCells (which asserts every cell of
+// allowRoleMatrix has a matching row here) consume this slice so
+// the data lives in exactly one place — adding a new OrgAction OR
+// adding a new role row to the matrix forces an explicit edit here,
+// and TestRoleMatrix_NoOrphanCells trips if the edit is forgotten.
+var roleMatrixCells = []struct {
+	action      OrgAction
+	role        state.OrgRole
+	wantAllowed bool
+}{
+	// View — every role can read.
+	{OrgActionView, state.OrgRoleOwner, true},
+	{OrgActionView, state.OrgRoleAdmin, true},
+	{OrgActionView, state.OrgRoleDeveloper, true},
+	{OrgActionView, state.OrgRoleViewer, true},
+	{OrgActionView, state.OrgRoleBilling, true},
+
+	// ManageMembers — owner + admin.
+	{OrgActionManageMembers, state.OrgRoleOwner, true},
+	{OrgActionManageMembers, state.OrgRoleAdmin, true},
+	{OrgActionManageMembers, state.OrgRoleDeveloper, false},
+	{OrgActionManageMembers, state.OrgRoleViewer, false},
+	{OrgActionManageMembers, state.OrgRoleBilling, false},
+
+	// InviteMembers — owner + admin.
+	{OrgActionInviteMembers, state.OrgRoleOwner, true},
+	{OrgActionInviteMembers, state.OrgRoleAdmin, true},
+	{OrgActionInviteMembers, state.OrgRoleDeveloper, false},
+	{OrgActionInviteMembers, state.OrgRoleViewer, false},
+	{OrgActionInviteMembers, state.OrgRoleBilling, false},
+
+	// RemoveMembers — owner-only (per the table comment:
+	// admins cannot remove peers).
+	{OrgActionRemoveMembers, state.OrgRoleOwner, true},
+	{OrgActionRemoveMembers, state.OrgRoleAdmin, false},
+	{OrgActionRemoveMembers, state.OrgRoleDeveloper, false},
+	{OrgActionRemoveMembers, state.OrgRoleViewer, false},
+	{OrgActionRemoveMembers, state.OrgRoleBilling, false},
+
+	// ChangeRole — owner-only.
+	{OrgActionChangeRole, state.OrgRoleOwner, true},
+	{OrgActionChangeRole, state.OrgRoleAdmin, false},
+	{OrgActionChangeRole, state.OrgRoleDeveloper, false},
+	{OrgActionChangeRole, state.OrgRoleViewer, false},
+	{OrgActionChangeRole, state.OrgRoleBilling, false},
+
+	// TransferOwnership — owner-only.
+	{OrgActionTransferOwnership, state.OrgRoleOwner, true},
+	{OrgActionTransferOwnership, state.OrgRoleAdmin, false},
+	{OrgActionTransferOwnership, state.OrgRoleDeveloper, false},
+	{OrgActionTransferOwnership, state.OrgRoleViewer, false},
+	{OrgActionTransferOwnership, state.OrgRoleBilling, false},
+
+	// ManageBilling — owner + billing (the dedicated billing
+	// role exists precisely so the CFO can pay invoices
+	// without being able to change who else is on the org).
+	{OrgActionManageBilling, state.OrgRoleOwner, true},
+	{OrgActionManageBilling, state.OrgRoleAdmin, false},
+	{OrgActionManageBilling, state.OrgRoleDeveloper, false},
+	{OrgActionManageBilling, state.OrgRoleViewer, false},
+	{OrgActionManageBilling, state.OrgRoleBilling, true},
+
+	// ChangePlan — owner-only (plan changes cascade into the
+	// billing surface and the rate-limit admission ceiling).
+	{OrgActionChangePlan, state.OrgRoleOwner, true},
+	{OrgActionChangePlan, state.OrgRoleAdmin, false},
+	{OrgActionChangePlan, state.OrgRoleDeveloper, false},
+	{OrgActionChangePlan, state.OrgRoleViewer, false},
+	{OrgActionChangePlan, state.OrgRoleBilling, false},
+
+	// Delete — owner-only.
+	{OrgActionDelete, state.OrgRoleOwner, true},
+	{OrgActionDelete, state.OrgRoleAdmin, false},
+	{OrgActionDelete, state.OrgRoleDeveloper, false},
+	{OrgActionDelete, state.OrgRoleViewer, false},
+	{OrgActionDelete, state.OrgRoleBilling, false},
+
+	// PR 6 (issue #190 / IAM-6 / ADR-061) — org-bound API key
+	// mint/rotate (OrgActionCreateApiKey). Owner + admin; the
+	// existing precedent for "day-to-day ops, owner-only = invariant
+	// affecting". Developer / viewer / billing intentionally
+	// absent — minting credential material is the most
+	// security-sensitive of the org actions a developer-role caller
+	// could otherwise attempt.
+	{OrgActionCreateApiKey, state.OrgRoleOwner, true},
+	{OrgActionCreateApiKey, state.OrgRoleAdmin, true},
+	{OrgActionCreateApiKey, state.OrgRoleDeveloper, false},
+	{OrgActionCreateApiKey, state.OrgRoleViewer, false},
+	{OrgActionCreateApiKey, state.OrgRoleBilling, false},
+
+	// Revoke mirrors create — same role set, same rationale
+	// (revoking a contractor's key is the same blast radius as
+	// minting one). Locked to owner + admin so an attacker who
+	// somehow got a developer's bearer can't lock the team
+	// out of CI by deleting every active key.
+	{OrgActionRevokeApiKey, state.OrgRoleOwner, true},
+	{OrgActionRevokeApiKey, state.OrgRoleAdmin, true},
+	{OrgActionRevokeApiKey, state.OrgRoleDeveloper, false},
+	{OrgActionRevokeApiKey, state.OrgRoleViewer, false},
+	{OrgActionRevokeApiKey, state.OrgRoleBilling, false},
+}
+
+// roleMatrixCellKey is the (action, role) composite used by the
+// orphan-cell pin. Defined as a struct (not a string) so the compile
+// catches a future rename of OrgAction / OrgRole that would
+// silently desynchronise the key from the matrix.
+type roleMatrixCellKey struct {
+	action OrgAction
+	role   state.OrgRole
+}
+
 // TestRoleMatrix_Exhaustive — pins every (action, role) cell of the
 // matrix to the ADR-061 source-of-truth shape. A future change to
 // the matrix must update this test (or it fails the gate) so the
 // role-permission surface stays reviewable in code.
 func TestRoleMatrix_Exhaustive(t *testing.T) {
-	cases := []struct {
-		action      OrgAction
-		role        state.OrgRole
-		wantAllowed bool
-	}{
-		// View — every role can read.
-		{OrgActionView, state.OrgRoleOwner, true},
-		{OrgActionView, state.OrgRoleAdmin, true},
-		{OrgActionView, state.OrgRoleDeveloper, true},
-		{OrgActionView, state.OrgRoleViewer, true},
-		{OrgActionView, state.OrgRoleBilling, true},
-
-		// ManageMembers — owner + admin.
-		{OrgActionManageMembers, state.OrgRoleOwner, true},
-		{OrgActionManageMembers, state.OrgRoleAdmin, true},
-		{OrgActionManageMembers, state.OrgRoleDeveloper, false},
-		{OrgActionManageMembers, state.OrgRoleViewer, false},
-		{OrgActionManageMembers, state.OrgRoleBilling, false},
-
-		// InviteMembers — owner + admin.
-		{OrgActionInviteMembers, state.OrgRoleOwner, true},
-		{OrgActionInviteMembers, state.OrgRoleAdmin, true},
-		{OrgActionInviteMembers, state.OrgRoleDeveloper, false},
-		{OrgActionInviteMembers, state.OrgRoleViewer, false},
-		{OrgActionInviteMembers, state.OrgRoleBilling, false},
-
-		// RemoveMembers — owner-only (per the table comment:
-		// admins cannot remove peers).
-		{OrgActionRemoveMembers, state.OrgRoleOwner, true},
-		{OrgActionRemoveMembers, state.OrgRoleAdmin, false},
-		{OrgActionRemoveMembers, state.OrgRoleDeveloper, false},
-		{OrgActionRemoveMembers, state.OrgRoleViewer, false},
-		{OrgActionRemoveMembers, state.OrgRoleBilling, false},
-
-		// ChangeRole — owner-only.
-		{OrgActionChangeRole, state.OrgRoleOwner, true},
-		{OrgActionChangeRole, state.OrgRoleAdmin, false},
-		{OrgActionChangeRole, state.OrgRoleDeveloper, false},
-		{OrgActionChangeRole, state.OrgRoleViewer, false},
-		{OrgActionChangeRole, state.OrgRoleBilling, false},
-
-		// TransferOwnership — owner-only.
-		{OrgActionTransferOwnership, state.OrgRoleOwner, true},
-		{OrgActionTransferOwnership, state.OrgRoleAdmin, false},
-		{OrgActionTransferOwnership, state.OrgRoleDeveloper, false},
-		{OrgActionTransferOwnership, state.OrgRoleViewer, false},
-		{OrgActionTransferOwnership, state.OrgRoleBilling, false},
-
-		// ManageBilling — owner + billing (the dedicated billing
-		// role exists precisely so the CFO can pay invoices
-		// without being able to change who else is on the org).
-		{OrgActionManageBilling, state.OrgRoleOwner, true},
-		{OrgActionManageBilling, state.OrgRoleAdmin, false},
-		{OrgActionManageBilling, state.OrgRoleDeveloper, false},
-		{OrgActionManageBilling, state.OrgRoleViewer, false},
-		{OrgActionManageBilling, state.OrgRoleBilling, true},
-
-		// ChangePlan — owner-only (plan changes cascade into the
-		// billing surface and the rate-limit admission ceiling).
-		{OrgActionChangePlan, state.OrgRoleOwner, true},
-		{OrgActionChangePlan, state.OrgRoleAdmin, false},
-		{OrgActionChangePlan, state.OrgRoleDeveloper, false},
-		{OrgActionChangePlan, state.OrgRoleViewer, false},
-		{OrgActionChangePlan, state.OrgRoleBilling, false},
-
-		// Delete — owner-only.
-		{OrgActionDelete, state.OrgRoleOwner, true},
-		{OrgActionDelete, state.OrgRoleAdmin, false},
-		{OrgActionDelete, state.OrgRoleDeveloper, false},
-		{OrgActionDelete, state.OrgRoleViewer, false},
-		{OrgActionDelete, state.OrgRoleBilling, false},
-	}
-	for _, tc := range cases {
+	for _, tc := range roleMatrixCells {
 		expectAllowed(t, tc.action, tc.role, tc.wantAllowed)
+	}
+}
+
+// TestRoleMatrix_NoOrphanCells — walks every (action, role) cell in
+// the live allowRoleMatrix and asserts the canonical roleMatrixCells
+// table has a matching row. This is the structural pin that catches
+// a contributor who adds a row to allowRoleMatrix without also
+// updating roleMatrixCells (or vice-versa): TestRoleMatrix_Exhaustive
+// still passes (it only checks the rows it knows about), but this
+// test fails. The complement — every row in roleMatrixCells has a
+// matching matrix cell — is implicitly asserted by expectAllowed's
+// matrix-allowed check inside TestRoleMatrix_Exhaustive.
+//
+// Pin rationale: the original table covered 9 actions × 5 roles
+// (=45 cells); the PR-6 cells for OrgActionCreateApiKey /
+// OrgActionRevokeApiKey added two more actions, taking the matrix
+// to 11×5 = 55 cells. Without this orphan-cell test, a future PR
+// that adds an action (say, OrgActionManageSSO) could ship with
+// the matrix updated but the test table untouched — and the
+// change would land with the matrix's per-role behaviour entirely
+// unreviewed. The test pins that drift.
+func TestRoleMatrix_NoOrphanCells(t *testing.T) {
+	pinned := map[roleMatrixCellKey]bool{}
+	for _, c := range roleMatrixCells {
+		pinned[roleMatrixCellKey{action: c.action, role: c.role}] = true
+	}
+
+	// Walk the live matrix.
+	for action, roleMap := range allowRoleMatrix {
+		for role := range roleMap {
+			key := roleMatrixCellKey{action: action, role: role}
+			if !pinned[key] {
+				t.Errorf("allowRoleMatrix cell %s × %s is not pinned by roleMatrixCells (add a row to TestRoleMatrix_Exhaustive)", action, role)
+			}
+		}
+	}
+
+	// Also walk the canonical action / role vocabularies so a
+	// contributor who adds an OrgAction OR OrgRole is forced to
+	// touch roleMatrixCells. TestAllOrgActions_Complete already
+	// pins AllOrgActions, but we also want to make sure every
+	// declared action × declared role appears as a row in the
+	// table (even if the cell is "false"). Without this check,
+	// one could declare OrgActionFoo and leave Foo out of the
+	// table because the matrix returns "false" by default for
+	// unknown (action, role) pairs — a fail-closed-but-undocumented
+	// cell.
+	for _, action := range AllOrgActions {
+		for _, role := range AllOrgRoles {
+			key := roleMatrixCellKey{action: action, role: role}
+			if !pinned[key] {
+				t.Errorf("declared %s × %s is not pinned by roleMatrixCells (add a row)", action, role)
+			}
+		}
 	}
 }
 

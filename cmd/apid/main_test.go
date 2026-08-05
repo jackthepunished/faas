@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +22,43 @@ import (
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// withTestHMACFiles overrides FAAS_AUDIT_HMAC_KEY_FILE and
+// FAAS_RECOVERY_HMAC_KEY_FILE for the lifetime of the test so
+// loadOrGenerate{Audit,Recovery}HMACKey auto-mint a fresh key in
+// t.TempDir() rather than refusing to start (production-grade
+// strict-mode for the recovery-hmac.key path; the audit-hmac.key
+// path tolerates a nil but the recovery path does not).
+//
+// The env-var overrides are unset by t.Cleanup. The tmp keys
+// persist for the test's lifetime — both loaders pass them
+// through to their respective SetHMACSecret calls, so the audit
+// + recovery HMAC keys are live for the duration of the test
+// process.
+//
+// Use this from any test that calls runWithDeps directly, since
+// the boot-time loader calls os.Stat on /var/lib/faas and refuses
+// to start if neither the env var nor the file yields a key.
+func withTestHMACFiles(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	auditKey := make([]byte, 32)
+	for i := range auditKey {
+		auditKey[i] = 0xAB
+	}
+	recoveryKey := make([]byte, 32)
+	for i := range recoveryKey {
+		recoveryKey[i] = 0xCD
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audit-hmac.key"), []byte(hex.EncodeToString(auditKey)+"\n"), 0o600); err != nil {
+		t.Fatalf("write audit-hmac.key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "recovery-hmac.key"), []byte(hex.EncodeToString(recoveryKey)+"\n"), 0o600); err != nil {
+		t.Fatalf("write recovery-hmac.key: %v", err)
+	}
+	t.Setenv("FAAS_AUDIT_HMAC_KEY_FILE", filepath.Join(dir, "audit-hmac.key"))
+	t.Setenv("FAAS_RECOVERY_HMAC_KEY_FILE", filepath.Join(dir, "recovery-hmac.key"))
 }
 
 // --- seedDevAccount --------------------------------------------------------
@@ -68,6 +108,7 @@ func TestSeedDevAccount_InvalidToken(t *testing.T) {
 // --- runWithDeps -----------------------------------------------------------
 
 func TestRunWithDeps_ListenErrorReturns(t *testing.T) {
+	withTestHMACFiles(t)
 	deps := defaultDeps()
 	deps.listen = func(_, _ string) (net.Listener, error) {
 		return nil, errors.New("addr in use")
@@ -82,6 +123,7 @@ func TestRunWithDeps_ListenErrorReturns(t *testing.T) {
 }
 
 func TestRunWithDeps_ServesUntilCancel(t *testing.T) {
+	withTestHMACFiles(t)
 	deps := defaultDeps()
 	// Let runWithDeps own the listener (more realistic).
 	var capturedAddr atomic.Value
@@ -100,7 +142,13 @@ func TestRunWithDeps_ServesUntilCancel(t *testing.T) {
 		if k == "FAAS_DEV_TOKEN" {
 			return tok
 		}
-		return ""
+		// Fall through to the real env for the HMAC key files so
+		// withTestHMACFiles picks up the t.Setenv overrides; the
+		// closure above used to swallow them, which broke once
+		// the recovery-hmac loader (commit 7) started refusing to
+		// start without a real key (audit-hmac loader tolerates nil
+		// but the recovery loader does not).
+		return os.Getenv(k)
 	}
 	// Tier A7 PR-D: seedDevAccount no longer mints the key. Seed
 	// one explicitly so the auth path has something to resolve.
@@ -177,6 +225,7 @@ func TestRunWithDeps_ServesUntilCancel(t *testing.T) {
 }
 
 func TestRunWithDeps_SeedFailureReturns(t *testing.T) {
+	withTestHMACFiles(t)
 	deps := defaultDeps()
 	deps.getenv = func(k string) string {
 		if k == "FAAS_DEV_TOKEN" {
@@ -192,6 +241,7 @@ func TestRunWithDeps_SeedFailureReturns(t *testing.T) {
 }
 
 func TestRunWithDeps_ServeError(t *testing.T) {
+	withTestHMACFiles(t)
 	// Closed listener → Serve errors immediately.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -212,6 +262,7 @@ func TestRunWithDeps_ServeError(t *testing.T) {
 }
 
 func TestRunWithDeps_StoreCalledExactlyOnce(t *testing.T) {
+	withTestHMACFiles(t)
 	deps := defaultDeps()
 	var calls atomic.Int32
 	deps.store = func() state.Store {

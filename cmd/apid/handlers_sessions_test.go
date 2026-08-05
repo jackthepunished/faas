@@ -522,7 +522,7 @@ func TestRequireSessionCookie_DefendsAccountMismatch(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/v1/auth/sessions", nil)
-	mw := authmw.New(storeAsAuthenticator(store), mgr, storeAsSessionLookup(store), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), middleware.NewLimiter(middleware.AuthLimitConfig{}))
+	mw := authmw.New(storeAsAuthenticator(store), mgr, storeAsSessionLookup(store), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), middleware.NewLimiter(middleware.AuthLimitConfig{}), nil)
 	_, handled, err := mw.RequireSessionCookie(rec, req, env)
 	if err != nil {
 		t.Fatalf("requireSessionCookie returned err (should be silent handled=true): %v", err)

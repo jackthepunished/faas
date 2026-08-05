@@ -38,6 +38,11 @@
   | `account.plan_changed` | `changePlan` (success branch) | `{from, to}` |
   | `account.deletion_scheduled` | `scheduleDeletion` (REST + dashboard) | `{via: "rest"\|"dashboard"}` |
   | `account.deletion_restored` | `cancelDeletion` (REST + dashboard) | `{via: ...}` |
+| `account.mfa_required_enabled` | `flipMFARequiredIfUnenrolled` (first-arm branch, IAM-2 chokepoints `plan_upgrade` / `card_attached` / `second_deploy`) | `{reason, ...extra}` — first time the row transitions to `mfa_required=true`. |
+| `account.mfa_required_armed_again` | `flipMFARequiredIfUnenrolled` (unchanged branch, IAM hardening mega-PR) | `{reason, ...extra}` — chokepoint fired on an account whose `mfa_required` was already true (webhook redelivery, second chokepoint hit in the same session). Distinct from `enabled` so a downstream query can answer "did this account ever re-trip a chokepoint?" without a join. Closes the silent-re-arm audit gap. |
+| `auth.session.binding_mismatch` | `pkg/auth/middleware/middleware.go` RequireSessionCookie step 3.5 (IAM hardening mega-PR / ADR-076) | `{sid, method, path, expected_prefix (8 chars), presented_prefix (8 chars)}` — the cookie envelope's `binding_hash` disagreed with the sessions row's `binding_hash`; auto-revoke + 401. Both prefixes are first-8-hex of the HMAC-SHA256 fingerprints (32 bits each), enough for an operator to disambiguate the kind of drift (`presented 7a2f… but stored b81c…`) without leaking the HMAC keys. Distinct from `auth.session.stolen` (which fires when the row is already revoked at lookup time). |
+| `auth.step_up_required` | `pkg/auth/middleware/middleware.go` RequireStepUp / RequireStepUpHandler (IAM hardening mega-PR / ADR-077) | `{path, method, reason: "missing"\|"expired", ttl_sec}` — the customer tried a step-up-gated route with a stale (or absent) `step_up_at` cookie stamp. Bearer-key principals don't trip this kind. Distinct from `auth.mfa_gate_hit` (which fires when MFA isn't enrolled at all). |
+| `auth.step_up_verified` | `cmd/apid/handlers_mfa.go` `mfaVerify` (IAM hardening mega-PR / ADR-077) | `{path, method, ttl_sec}` — a step-up stamp was refreshed on a successful `/v1/account/mfa/verify` TOTP check. The counter-paired to `auth.step_up_required` so an operator can answer "how often does the gate succeed vs. block?". |
   | `stateless.advisory` | `cmd/apid/advisory_receiver.go` (vmmd → apid gRPC forward) | `{instance, app_id, count, events: [{path, mask, pid, ts_unix_ms}, ...]}` — Wave 0 PR-C / ADR-047 |
   | `app.security_updated` | `patchAppSecurity` (issue #472 / ADR-058) | `{app_id, slug, old_require, new_require}` — admin toggled `apps.require_signed`. Distinct from generic `app.updated` so the audit-log panel can filter signature-related config changes. |
   | `app.trusted_signer_added` | `upsertTrustedSigner` (issue #472 / ADR-058) | `{app_id, slug, signer_name}` — admin onboarded a cosign trusted publisher. The PEM bytes are never logged (operator-side mirror at `/etc/faas/secrets/trusted-publishers/<name>.pem` is the canonical store). |
@@ -174,8 +179,10 @@
   - **App/Deployment/Cron/Domain audit emissions.** Developer actions,
     not security-relevant; cover in a separate PR if the customer
     audit page ever asks.
-  - **Audit retention policy (§17 G3).** Append-only is the contract;
-    a 90-day trim lives behind a separate ADR.
+  - **Audit retention policy (§17 G3).** Closed by ADR-075
+    (pkg/eventretention, daily 90-day trim). The append-only
+    contract is unchanged — older rows are deleted wholesale,
+    not edited in place.
   - **`actor` enum.** Keep the column text-form; introduce an enum
     only when the dashboard needs to filter by actor.
   - **Per-kind partial index** for `kind`-keyed customer queries
@@ -197,3 +204,17 @@
      INSERT on every failed login creates a DoS amplifier under
      credential-stuffing. v1 emits success only; follow-up PR adds an
      async-batched writer.
+  5. **Bare SHA-256 for MFA recovery-code hashes.** Originally
+     shipped for the IAM-2 surface (issue #186). Rejected as the
+     final form: a 10-char base32 plaintext (50 bits) hashes
+     without keying — a leaked PG blob is rainbow-reversible in
+     O(1) per code. The IAM-hardening mega-PR (logical change 7)
+     upgrades to HMAC-SHA256 keyed by a per-process secret loaded
+     at apid boot. The audit-hmac.key precedent uses Warn-and-
+     continue zero-key fallback; the recovery-hmac.key path is
+     stricter — refusing to start without a real key — because
+     the recovery code is the only fallback when the customer's
+     TOTP device is lost. See `pkg/authcode/hmac.go` for the
+     loader + the `SetHMACSecret` / `HashRecoveryCode`
+     contract; `pkg/auth/hash.go` (the `HashEmail` precedent)
+     is the same pattern with different scope.

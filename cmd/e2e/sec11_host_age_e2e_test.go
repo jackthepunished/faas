@@ -140,7 +140,7 @@ func TestSec11_HostAgeIdentity_LoadCredentialDecouple(t *testing.T) {
 	// e2etest.StartWithEnv wrapper hides the proc buffer; the
 	// syncBuffer lets us read it inline.
 	addr := freeTCPAddr(t)
-	proc := startProc(t, apidBinary, envForAPID(poolDSN(pool),
+	proc := startProc(t, apidBinary, envForAPID(t, poolDSN(pool),
 		"FAAS_APID_LISTEN="+addr,
 		"FAAS_HOST_AGE_IDENTITY_PATH="+credCopyPath,
 	))
@@ -292,7 +292,7 @@ func TestSec11_HostAgeIdentity_OnDiskInsecurePermsFailsFast(t *testing.T) {
 		t.Fatalf("write pub: %v", err)
 	}
 
-	env := envForAPID(poolDSN(pool),
+	env := envForAPID(t, poolDSN(pool),
 		"FAAS_HOST_AGE_IDENTITY_PATH="+onDiskPath,
 		"FAAS_HOST_AGE_RECIPIENT_PATH="+recipientPath,
 	)

@@ -596,6 +596,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 		auditorAsAuthAuditor(deps.audit),
 		log,
 		deps.apiAuthLimiter,
+		// gatewayd-internal has no need for the binding-hash
+		// cross-check (it's a Unix-socket-only daemon in the
+		// ADR-070 split; the cookie branch it serves — public
+		// requests that come back through gatewayd-public — has
+		// already been validated upstream at the public edge).
+		// nil ⇒ the cross-check is a no-op.
+		nil,
 	)
 	// Issue #560: per-deployment require_authn (pro/Scale opt-in).
 	// Build the narrow gateway.RequireAuthnAuthenticator

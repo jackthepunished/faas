@@ -1557,6 +1557,98 @@ func TestCreateKey_HappyPath(t *testing.T) {
 	}
 }
 
+// TestCreateKey_StampsProvenanceColumns: the IAM hardening mega-PR
+// (logical change 2) provenance columns (created_ip, created_ua) land
+// on the new api_keys row. Asserts the new row carries the test
+// harness's IP (RemoteAddr is non-empty in the harness) so a SOC 2
+// auditor can answer "who minted this key from which IP" without
+// joining through Loki. The UA slot is allowed to be empty when the
+// harness doesn't set a User-Agent — the column is nullable by
+// design (unix-socket callers, missing UA), so the test pins the
+// happy-path non-empty IP and the documented empty-UA tolerance.
+func TestCreateKey_StampsProvenanceColumns(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "POST", "/v1/keys", map[string]string{"label": "ci"}, nil)
+	if rec.Code != 201 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	keys, err := e.store.ListAPIKeys(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(keys) < 1 {
+		t.Fatalf("fixture: want >= 1 key, got %d", len(keys))
+	}
+	// Find the freshly minted key by label — the seeded fixture
+	// has label="test" (an admin key); the new key has label="ci".
+	var newKey *state.APIKey
+	for i := range keys {
+		if keys[i].Label == "ci" {
+			newKey = &keys[i]
+			break
+		}
+	}
+	if newKey == nil {
+		t.Fatalf("no key with label=ci found in %d rows", len(keys))
+	}
+	if newKey.CreatedIP == "" {
+		t.Errorf("CreatedIP empty; want test harness address stamp")
+	}
+	// UA is nullable by design — the test harness doesn't set a
+	// User-Agent, so CreatedUA == "" is the expected stamp. The
+	// audit payload encodes the same nullability (the
+	// logsanitize.Field output is "" for empty input).
+	_ = newKey.CreatedUA
+}
+
+// TestRotateKey_StampsProvenanceAndParent: the IAM hardening
+// mega-PR (logical change 2) checks that a rotation stamps
+// created_ip / created_ua on the new row AND parent_key_id
+// points at the predecessor. The legacy rotated_from_id is
+// unchanged.
+func TestRotateKey_StampsProvenanceAndParent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	// Grab the seeded fixture key — the setup wires one admin key
+	// per account, so the list returns exactly one row.
+	keys, err := e.store.ListAPIKeys(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("seed list: %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("seed: want 1 key, got %d", len(keys))
+	}
+	old := keys[0]
+	rec := e.do(t, "POST", "/v1/keys/"+old.ID+"/rotate", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Find the new key by RotatedFromID — the legacy stamp
+	// (and the new parent_key_id FK) both point at the
+	// predecessor.
+	after, err := e.store.ListAPIKeys(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var newKey *state.APIKey
+	for i := range after {
+		if after[i].RotatedFromID != nil && *after[i].RotatedFromID == old.ID {
+			newKey = &after[i]
+			break
+		}
+	}
+	if newKey == nil {
+		t.Fatalf("no new key with rotated_from_id = %s", old.ID)
+	}
+	if newKey.CreatedIP == "" {
+		t.Errorf("rotated key CreatedIP empty; want test harness address stamp")
+	}
+	if newKey.ParentKeyID == nil || *newKey.ParentKeyID != old.ID {
+		t.Errorf("rotated key ParentKeyID = %v, want pointer to %s", newKey.ParentKeyID, old.ID)
+	}
+	// UA is nullable by design (test harness doesn't set UA).
+	_ = newKey.CreatedUA
+}
+
 // TestListKeys_HappyPath: GET /v1/keys returns the seeded key.
 func TestListKeys_HappyPath(t *testing.T) {
 	e := setup(t, api.PlanPro)
