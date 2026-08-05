@@ -10494,7 +10494,8 @@ func (s *PgStore) MarkDunningStep(ctx context.Context, id string, from, to Accou
 
 const sessionSelectCols = `
 	coalesce(host(issued_ip), '') as issued_ip,
-	coalesce(issued_ua, '') as issued_ua`
+	coalesce(issued_ua, '') as issued_ua,
+	coalesce(binding_hash, '') as binding_hash`
 
 func (s *PgStore) CreateSession(ctx context.Context, id, accountID, issuedIP, issuedUA string) (Session, error) {
 	row := s.pool.QueryRow(ctx, `
@@ -10502,6 +10503,23 @@ func (s *PgStore) CreateSession(ctx context.Context, id, accountID, issuedIP, is
 		values ($1, $2, nullif($3, '')::inet, nullif($4, ''))
 		returning id, account_id, issued_at, last_seen_at, revoked_at, `+sessionSelectCols,
 		id, accountID, issuedIP, issuedUA)
+	sess, err := scanSession(row)
+	if err != nil {
+		return Session{}, mapErr(err)
+	}
+	return sess, nil
+}
+
+// CreateSessionWithBinding is the IAM-hardening-mega-PR
+// (logical change 5) variant. The bindingHash parameter is the
+// HMAC-SHA256 fingerprint of (ip, ua_family) — same value the
+// cookie envelope stamps. Empty string → NULL column.
+func (s *PgStore) CreateSessionWithBinding(ctx context.Context, id, accountID, issuedIP, issuedUA, bindingHash string) (Session, error) {
+	row := s.pool.QueryRow(ctx, `
+		insert into sessions (id, account_id, issued_ip, issued_ua, binding_hash)
+		values ($1, $2, nullif($3, '')::inet, nullif($4, ''), nullif($5, ''))
+		returning id, account_id, issued_at, last_seen_at, revoked_at, `+sessionSelectCols,
+		id, accountID, issuedIP, issuedUA, bindingHash)
 	sess, err := scanSession(row)
 	if err != nil {
 		return Session{}, mapErr(err)
@@ -11399,7 +11417,7 @@ type rowScanner interface {
 func scanSession(s rowScanner) (Session, error) {
 	var sess Session
 	var lastSeen, revoked *time.Time
-	if err := s.Scan(&sess.ID, &sess.AccountID, &sess.IssuedAt, &lastSeen, &revoked, &sess.IssuedIP, &sess.IssuedUA); err != nil {
+	if err := s.Scan(&sess.ID, &sess.AccountID, &sess.IssuedAt, &lastSeen, &revoked, &sess.IssuedIP, &sess.IssuedUA, &sess.BindingHash); err != nil {
 		return Session{}, err
 	}
 	sess.LastSeenAt = lastSeen

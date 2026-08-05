@@ -29,6 +29,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -45,11 +46,18 @@ func (s *server) issueDashboardSession(ctx context.Context, r *http.Request, acc
 	sid := uuid.NewString()
 	ip := clientIPFromRequest(r)
 	ua := r.UserAgent()
-	sess, err := s.store.CreateSession(ctx, sid, accountID, ip, ua)
+	// IAM-3-Evolved (ADR-076): compute the binding-hash fingerprint
+	// (HMAC-SHA256 of ip + ua_family). The same value is stored
+	// on the sessions row and sealed into the cookie envelope so
+	// the middleware can compare the two on every authenticated
+	// request — a drifted fingerprint auto-revokes the session
+	// (the stolen-cookie defence).
+	bind := bindinghash.Compute(ip, bindinghash.UAFamily(ua), s.bindingKeyFn)
+	sess, err := s.store.CreateSessionWithBinding(ctx, sid, accountID, ip, ua, bind)
 	if err != nil {
 		return "", state.Session{}, fmt.Errorf("create session row: %w", err)
 	}
-	cookie, err := s.sessions.IssueWithSession(sid, accountID, mfaPending)
+	cookie, err := s.sessions.IssueWithSessionAndBindingHash(sid, accountID, bind, mfaPending)
 	if err != nil {
 		// Cleanup the orphan row. If this fails too, log + audit
 		// so operators can sweep. We still return the original
@@ -89,11 +97,21 @@ func (s *server) issueDashboardSessionWithGithub(ctx context.Context, r *http.Re
 	sid := uuid.NewString()
 	ip := clientIPFromRequest(r)
 	ua := r.UserAgent()
-	sess, err := s.store.CreateSession(ctx, sid, accountID, ip, ua)
+	// IAM-3-Evolved (ADR-076): compute the binding-hash fingerprint
+	// (HMAC-SHA256 of ip + ua_family). Stored on the sessions row
+	// and sealed into the cookie envelope for the stale-fingerprint
+	// auto-revoke defence.
+	bind := bindinghash.Compute(ip, bindinghash.UAFamily(ua), s.bindingKeyFn)
+	sess, err := s.store.CreateSessionWithBinding(ctx, sid, accountID, ip, ua, bind)
 	if err != nil {
 		return "", state.Session{}, fmt.Errorf("create session row: %w", err)
 	}
-	cookie, err := s.sessions.IssueWithSessionAndGithubLogin(sid, accountID, githubLogin, mfaPending)
+	// Re-seal the cookie with the binding-hash field set. The
+	// single-seal contract IssueWithSessionAndGithubLogin has
+	// (no double-seal) is preserved by routing through a manifest
+	// that includes both the github_login and the binding_hash.
+	// We use a new helper that emits both in a single AEAD round.
+	cookie, err := s.sessions.IssueWithSessionAndGithubLoginAndBindingHash(sid, accountID, githubLogin, bind, mfaPending)
 	if err != nil {
 		if rbErr := s.rollbackCreatedSession(ctx, sid, accountID); rbErr != nil {
 			if s.log != nil {

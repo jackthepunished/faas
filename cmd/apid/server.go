@@ -16,6 +16,7 @@ import (
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/authz"
 	"github.com/onebox-faas/faas/pkg/billing"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/httpsec"
@@ -69,6 +70,14 @@ type server struct {
 	// ephemeral manager (so the daemon still boots in dev with no
 	// /etc/faas/secrets/session.key) — see cmd/apid/main.go.
 	sessions *session.Manager
+	// bindingKeyFn is the IAM-hardening-mega-PR (ADR-076) secret used
+	// to derive the session binding-hash fingerprint. nil ⇒ binding
+	// is not armed (the unix-socket / cli-auth code path), in which
+	// case pkg/bindinghash.Compute returns "" and the middleware
+	// cross-check is a no-op. Production wires a closure that returns
+	// the same AEAD key bytes the sessions.Manager uses so a stolen
+	// DB blob can't pre-compute binding hashes offline.
+	bindingKeyFn bindinghash.KeyFunc
 	// loginTTL is how long a magic-link stays valid. Default 15m.
 	loginTTL time.Duration
 	// dpaPath is the on-disk path of the DPA template served by
@@ -503,6 +512,7 @@ func newServerWithDeps(
 		mailer:                 mailer,
 		githubd:                githubd,
 		events:                 bcaster,
+		bindingKeyFn:           func() []byte { return sessions.BindingKey() },
 		sessions:               sessions,
 		loginTTL:               loginTTL,
 		dpaPath:                dpaPath,
@@ -526,6 +536,13 @@ func newServerWithDeps(
 			auditorAsAuthAuditor(newAuditor(store, log, nil)),
 			log,
 			apiAuthLimiter,
+			// IAM-hardening-mega-PR (ADR-076): hand the auth
+			// middleware the same 32-byte key bytes the session
+			// AEAD uses so the binding-hash cross-check keys off
+			// the host secret. Closure pulls a fresh copy on each
+			// miss (the AEAD-owned key never escapes session.Manager
+			// past the constructor; we read via Manager.BindingKey).
+			func() []byte { return sessions.BindingKey() },
 		),
 		// Issue #190 / IAM-6 / ADR-061, PR 4: org resolver backs
 		// s.loadOrg (cmd/apid/auth_facade.go). Wraps the same

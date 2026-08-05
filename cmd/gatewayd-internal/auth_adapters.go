@@ -67,6 +67,15 @@ func (l sessionLookupAdapter) TouchSessionLastSeen(ctx context.Context, sid stri
 	return l.store.TouchSessionLastSeen(ctx, sid)
 }
 
+// RevokeSession bridges Store.RevokeSession (pkg/state) onto the
+// middleware.SessionLookup contract — needed by the IAM-hardening-
+// mega-PR (ADR-076) binding-mismatch auto-revoke branch in
+// pkg/auth/middleware/middleware.go. Forward-only; the actual
+// revocation semantics live on the Store.
+func (l sessionLookupAdapter) RevokeSession(ctx context.Context, sid, accountID string) (bool, error) {
+	return l.store.RevokeSession(ctx, sid, accountID)
+}
+
 // auditorAsAuthAuditor returns middleware.Auditor as a view over
 // a *pkg/audit.Auditor. The middleware.Auditor interface is the
 // minimal one-method subset (`Emit`); the audit package's *Auditor

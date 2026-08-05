@@ -693,6 +693,13 @@ type Store interface {
 	// are logged but never reject the request. Touch is allowed on
 	// revoked rows (observability-only signal, not authorization).
 	CreateSession(ctx context.Context, id, accountID, issuedIP, issuedUA string) (Session, error)
+	// CreateSessionWithBinding is the IAM-hardening-mega-PR
+	// (logical change 5) variant. The bindingHash parameter is
+	// the HMAC-SHA256 fingerprint of (ip, ua_family) — the same
+	// value the cookie envelope stamps. Empty string → NULL
+	// column (the unix-socket / CLI-auth code path has no
+	// meaningful fingerprint).
+	CreateSessionWithBinding(ctx context.Context, id, accountID, issuedIP, issuedUA, bindingHash string) (Session, error)
 	GetSession(ctx context.Context, id string) (Session, error)
 	RevokeSession(ctx context.Context, id, accountID string) (bool, error)
 	ListSessions(ctx context.Context, accountID string) ([]Session, error)

@@ -55,6 +55,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
@@ -112,6 +113,11 @@ type Sessions interface {
 type SessionLookup interface {
 	GetSession(ctx context.Context, sid string) (state.Session, error)
 	TouchSessionLastSeen(ctx context.Context, sid string) error
+	// RevokeSession is the IAM-hardening-mega-PR (logical change 5)
+	// auto-revoke path. The middleware calls it when the live
+	// binding-hash check fails — the stolen-cookie defence
+	// (ADR-076). Returns the underlying state.Store semantics.
+	RevokeSession(ctx context.Context, id, accountID string) (bool, error)
 }
 
 // Auditor is the subset of pkg/audit.Auditor.Emit that the
@@ -177,6 +183,12 @@ type Middleware struct {
 	keyTouchWindowForTest time.Duration
 	// sessionTouchWindowForTest: same override for sessions.
 	sessionTouchWindowForTest time.Duration
+	// BindingKeyFn is the IAM-hardening-mega-PR (logical change 5,
+	// ADR-076) HMAC key source. nil disables binding-hash
+	// computation (the envelope's `binding_hash` field is omitted;
+	// the cross-check is skipped). Production wires this to the
+	// first 32 bytes of the session-key AEAD secret.
+	BindingKeyFn func() []byte
 }
 
 // keyTouchWindow returns the production 30s window unless an
@@ -291,7 +303,7 @@ func (t *TouchTicket) FiredAtSet(ts time.Time) { t.firedAt.Store(&ts) }
 //     anything at Info or above; Warn is for cross-check failures
 //     and detached-touch errors.
 func New(authn Authenticator, sessions Sessions, lookups SessionLookup,
-	auditor Auditor, log *slog.Logger, limiter *middleware.Limiter) *Middleware {
+	auditor Auditor, log *slog.Logger, limiter *middleware.Limiter, bindingKeyFn bindinghash.KeyFunc) *Middleware {
 	if authn == nil {
 		panic("auth: nil Authenticator")
 	}
@@ -305,6 +317,7 @@ func New(authn Authenticator, sessions Sessions, lookups SessionLookup,
 		Audit:             auditor,
 		Log:               log,
 		Limiter:           limiter,
+		BindingKeyFn:      bindingKeyFn,
 		SessionCookieName: defaultSessionCookieName,
 	}
 }
@@ -596,6 +609,39 @@ func (m *Middleware) RequireSessionCookie(w http.ResponseWriter,
 				"path":   r.URL.Path,
 			})
 		}
+		return state.Session{}, true, nil
+	}
+	// (3.5) binding-hash mismatch = stolen-cookie auto-revoke
+	// (IAM hardening mega-PR, logical change 5, ADR-076).
+	// Compare the envelope's binding_hash (sealed by AEAD at mint
+	// time) against the sessions row's binding_hash column.
+	// Either side empty = "binding not armed" (pre-PR-076 cookie
+	// or unix-socket code path); cross-check is skipped in that
+	// case. Mismatch ⇒ auto-revoke + audit + 401.
+	if m.BindingKeyFn != nil && env.BindingHash != "" && sess.BindingHash != "" &&
+		env.BindingHash != sess.BindingHash {
+		// Best-effort revoke. Failure is logged but the
+		// 401 still returns — the request is rejected
+		// regardless of the revoke's success.
+		if _, revokeErr := m.Lookups.RevokeSession(ctx, env.Sid, env.AccountID); revokeErr != nil && m.Log != nil {
+			m.Log.Warn("session binding-mismatch auto-revoke failed",
+				"sid", logsanitize.Field(env.Sid),
+				"path", logsanitize.Field(r.URL.Path),
+				"error", revokeErr.Error())
+		}
+		// Audit emit (best-effort — never blocks the 401).
+		if m.Audit != nil {
+			m.Audit.Emit(ctx, "auth.session.binding_mismatch", &env.AccountID, map[string]any{
+				"sid":              env.Sid,
+				"method":           r.Method,
+				"path":             r.URL.Path,
+				"expected_prefix":  prefix8(sess.BindingHash),
+				"presented_prefix": prefix8(env.BindingHash),
+			})
+		}
+		m.clearSessionCookie(w)
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeSessionInvalid,
+			"Session invalid", "session binding mismatch — possible replay; sign in again"))
 		return state.Session{}, true, nil
 	}
 	// (4) account-mismatch is defensive — the AEAD binds
@@ -931,4 +977,17 @@ func (m *Middleware) ClearSessionCookie(w http.ResponseWriter) {
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+// prefix8 returns the first 8 characters of s, or s itself when
+// shorter. The IAM-3-Evolved binding-mismatch audit row carries
+// the 8-char prefix so an operator can disambiguate the kind of
+// drift (e.g. "presented `7a2f…` but stored `b81c…`") without
+// leaking the HMAC key. 8 hex chars = 32 bits, plenty for a
+// human-readable fingerprint.
+func prefix8(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
 }

@@ -1,0 +1,64 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00136_sessions_binding.sql — IAM hardening mega-PR (logical change 5).
+--
+-- Add a `binding_hash` column to the `sessions` table so the
+-- apid auth middleware can auto-revoke a stolen `faas_sid` cookie
+-- when the live (IP, UA-family) fingerprint drifts from the
+-- value sealed into the envelope at mint time (ADR-076).
+--
+-- Shape:
+--
+--   * binding_hash text — 64-char hex HMAC-SHA256 of
+--     (ip || "\x00" || ua_family) keyed by the first 32 bytes of
+--     /etc/faas/secrets/session.key. Stored alongside the
+--     envelope's binding_hash (also sealed AEAD) so the middleware
+--     can compare the two on every authenticated request.
+--
+-- Why NULLABLE:
+--
+--   * Pre-PR-076 rows have no binding to drift from. The
+--     middleware MUST treat `sess.BindingHash == ""` as
+--     "binding not armed" and skip the cross-check (the cookie
+--     envelope's `binding_hash` field is `omitempty`, so a
+--     pre-PR-076 cookie decodes with `BindingHash == ""` and
+--     the cross-check is a no-op). No backfill is possible — the
+--     secret is the host's session-key, which is not derivable
+--     from the existing session data.
+--   * Fresh mints from the new code path populate the column.
+--     The fallback CreateSession method (used by the pre-PR-076
+--     test handlers that pre-date the binding-hash rollout) stamps
+--     NULL.
+--
+-- Why no FK / no CHECK:
+--
+--   * No FK — the binding hash is a value, not a reference.
+--   * No CHECK — the validation is at the application layer
+--     (bindinghash.Compute returns "" for empty inputs, the
+--     envelope omits the field, the middleware skips the check).
+--     A DB-level CHECK would force a sentinel value for the
+--     unix-socket code path; NULL is the correct "we don't know"
+--     marker.
+--
+-- Why replay-safe (`IF NOT EXISTS`):
+--   * Goose replay-safety contract (ADR-041). A second `goose up`
+--     on the same DB is a no-op instead of a 42710 error.
+--
+-- Slot 136 — chained after 00135_api_keys_provenance. No reservation
+-- fence needed unless a sibling PR claims 136 between PR-creation
+-- and merge (the cross-PR slot gate will fire then and the rename
+-- is mechanical per migration-slot-renumber-at-pr-creation).
+
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS binding_hash text;
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- Reverse: drop the single column. The middleware's cross-check
+-- nil-safe reads it; a downgrade leaves the column gone and the
+-- runtime on the new code falls through to the "binding not armed"
+-- branch (the column is optional). No data loss beyond the binding
+-- fingerprint itself.
+ALTER TABLE sessions DROP COLUMN IF EXISTS binding_hash;
+-- +goose StatementEnd

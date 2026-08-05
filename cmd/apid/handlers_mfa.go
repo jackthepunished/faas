@@ -30,6 +30,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/auth"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/authcode"
+	"github.com/onebox-faas/faas/pkg/bindinghash"
 	mailpkg "github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -654,7 +655,14 @@ func (s *server) reissueSessionCookie(w http.ResponseWriter, r *http.Request, ac
 		}
 		return errSessionMissingFromContext
 	}
-	cookie, err := s.sessions.IssueWithSession(current.ID, acct.ID, mfaPending)
+	// IAM-hardening-mega-PR (ADR-076): refresh the binding
+	// fingerprint on every reissue so the next request through
+	// RequireSession sees the same (IP, UA-family) hash stamped
+	// on both sides of the seal. Re-using the existing session
+	// means the sid stays the same; only the envelope + the row
+	// need to be re-stamped with the current fingerprint.
+	bind := bindinghash.Compute(clientIPFromRequest(r), bindinghash.UAFamily(r.UserAgent()), s.bindingKeyFn)
+	cookie, err := s.sessions.IssueWithSessionAndBindingHash(current.ID, acct.ID, bind, mfaPending)
 	if err != nil {
 		return err
 	}

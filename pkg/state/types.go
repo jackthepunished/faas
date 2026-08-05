@@ -1890,6 +1890,15 @@ type Session struct {
 	IssuedAt   time.Time
 	LastSeenAt *time.Time // nil until first authenticated request post-mint
 	RevokedAt  *time.Time // nil == active; non-nil == revoked
+	// BindingHash is the IAM-3-evolved ADR-076 fingerprint
+	// (HMAC-SHA256 of `ip || "\x00" || ua_family`, keyed by the
+	// host's session-key secret). Empty for pre-PR-076 rows and
+	// for the unix-socket / CLI-auth code paths that don't have
+	// a meaningful fingerprint. The RequireSession cookie branch
+	// compares the live request's binding hash against this
+	// value; mismatch ⇒ auto-revoke + audit + 401 (the
+	// stolen-cookie defence).
+	BindingHash string
 }
 
 // AppSecret is one row of customer secrets (spec §11/G2). apid is the only

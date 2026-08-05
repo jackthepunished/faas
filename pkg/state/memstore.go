@@ -8321,6 +8321,32 @@ func (m *MemStore) CreateSession(_ context.Context, id, accountID, issuedIP, iss
 	return s, nil
 }
 
+// CreateSessionWithBinding mirrors PgStore. The bindingHash
+// parameter is the HMAC-SHA256 fingerprint of (ip, ua_family);
+// empty string round-trips as the zero value on the struct
+// (mirrors the pgstore NULL shape).
+func (m *MemStore) CreateSessionWithBinding(_ context.Context, id, accountID, issuedIP, issuedUA, bindingHash string) (Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.sessions[id]; exists {
+		return Session{}, ErrConflict
+	}
+	if _, ok := m.accounts[accountID]; !ok {
+		return Session{}, ErrNotFound
+	}
+	now := time.Now().UTC()
+	s := Session{
+		ID:          id,
+		AccountID:   accountID,
+		IssuedIP:    issuedIP,
+		IssuedUA:    issuedUA,
+		IssuedAt:    now,
+		BindingHash: bindingHash,
+	}
+	m.sessions[id] = s
+	return s, nil
+}
+
 func (m *MemStore) GetSession(_ context.Context, id string) (Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
