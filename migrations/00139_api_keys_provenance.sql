@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00135_api_keys_provenance.sql — IAM hardening mega-PR (logical change 2).
+-- 00139_api_keys_provenance.sql — IAM hardening mega-PR (logical change 2).
 --
 -- Three advisory columns land on api_keys so SOC 2 audit lineage can
 -- answer "who minted this key from which IP, and which key is its

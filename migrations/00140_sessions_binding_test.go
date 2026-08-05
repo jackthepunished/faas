@@ -8,9 +8,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00136_SessionsBinding pins the IDEMPOTENT ALTER
+// TestMigrations_00140_SessionsBinding pins the IDEMPOTENT ALTER
 // shape and column type of the sessions.binding_hash column landed
-// by 00136_sessions_binding.sql (IAM-hardening-mega-PR logical
+// by 00140_sessions_binding.sql (IAM-hardening-mega-PR logical
 // change 5, ADR-076).
 //
 // What we pin (replay-safety + audit-evidence cost):
@@ -22,12 +22,12 @@ import (
 //     short-circuits).
 //   - The replay guard: re-running the migration after a
 //     successful first run is a no-op (ADD COLUMN IF NOT EXISTS
-//     in 00136).
+//     in 00140).
 //
 // Cross-PR slot reservation note: this test is coupled to the .sql
 // at slot 136. If a sibling PR renumbers, the test file moves with
 // it (per migration-slot-renumber-at-pr-creation).
-func TestMigrations_00136_SessionsBinding(t *testing.T) {
+func TestMigrations_00140_SessionsBinding(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
@@ -46,7 +46,7 @@ func TestMigrations_00136_SessionsBinding(t *testing.T) {
 	}
 	defer rows.Close()
 	if !rows.Next() {
-		t.Fatalf("sessions.binding_hash column missing — migration 00136 not applied")
+		t.Fatalf("sessions.binding_hash column missing — migration 00140 not applied")
 	}
 	var name, dt, nn string
 	if err := rows.Scan(&name, &dt, &nn); err != nil {

@@ -165,7 +165,7 @@ rev2 closes both gaps. Issue #185 captures the customer-side ask.
 
 - **Provenance + rotation lineage columns (`created_ip`,
   `created_ua`, `parent_key_id`)** — deployed in
-  `migrations/00135_api_keys_provenance.sql` (IAM hardening
+  `migrations/00139_api_keys_provenance.sql` (IAM hardening
   mega-PR, logical change 2). All three columns are nullable +
   advisory (no NOT NULL, no CHECK). The provenance columns let
   a SOC 2 auditor answer "who minted this key from which IP+UA"
