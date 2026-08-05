@@ -181,6 +181,14 @@ type runDeps struct {
 	// from env at startup" via mail.SenderFromEnv — same pattern meterd
 	// uses (cmd/meterd/main.go:82-87). Tests inject a stub.
 	mailer mail.Sender
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
+	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
+	// log, nil) which exits on violation in production. Tests
+	// inject func() error { return nil } to bypass the live
+	// /proc/self/status check (the test runner doesn't carry
+	// the production capset, and MustCheckOnBoot calls os.Exit
+	// on violation).
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -203,8 +211,14 @@ func main() {
 func run(ctx context.Context, log *slog.Logger) error {
 	// DEPLOY-1 / ADR-075 capdecl gate. apid's capsDecl is
 	// cap_net_bind_service (HTTPS listener). A misconfigured
-	// AmbientCapabilities line fails fast at boot.
-	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+	// AmbientCapabilities line fails fast at boot. The
+	// capCheck seam lets tests stub the live /proc/self/status
+	// check (review finding M2 — every daemon now has this).
+	capCheck := defaultDeps().capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
 		return err
 	}
 

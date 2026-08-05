@@ -57,6 +57,16 @@ type runDeps struct {
 	lvUsedPct func(ctx context.Context) (float64, error)
 	detectFC  func(ctx context.Context) (string, error)
 	now       func() time.Time
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam. nil →
+	// runtimecheck.MustCheckOnBoot(capsDecl, log, nil) which
+	// exits on violation in production. Tests inject
+	// func() error { return nil } to bypass the live capset
+	// (the runner lacks the production capset, and
+	// MustCheckOnBoot's os.Exit on violation would kill the
+	// test process). Review finding M2: this seam now matches
+	// the vmmd shape — every daemon's runtimecheck boot gate
+	// is overridable for tests.
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -76,12 +86,19 @@ func run(ctx context.Context, log *slog.Logger) error {
 }
 
 func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
-	// DEPLOY-1 / ADR-075 capdecl gate. imaged's capsDecl is
-	// the empty declaration (no Allow, no Deny) — imaged is
-	// unprivileged. A future PR that brings back
+	// DEPLOY-1 / ADR-075 capdecl gate. imaged's capsDecl
+	// asserts no cap_sys_admin in Bnd (review finding M1).
+	// A future PR that brings back
 	// AmbientCapabilities=cap_sys_admin would trip this check
-	// at boot, not silently at the first mount syscall.
-	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+	// at boot, not silently at the first mount syscall. The
+	// capCheck seam lets tests stub out the live /proc/self
+	// status check (the test runner's cap set does not match
+	// the production EX44 cap set).
+	capCheck := d.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
 		return err
 	}
 

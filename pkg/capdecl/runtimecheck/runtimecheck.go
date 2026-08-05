@@ -66,7 +66,21 @@ func Check(decl capdecl.Declaration, opts Options) error {
 		}
 		mask = capdecl.ParseStatus(buf)
 	case opts.PID == 0:
-		mask = readSelfStatus()
+		var rerr error
+		mask, rerr = readSelfStatus()
+		if rerr != nil {
+			// Review finding M3: readSelfStatus MUST surface
+			// errors instead of returning a zero mask that
+			// silently passes every Allow/Deny assertion.
+			// The previous shape failed OPEN: a daemon whose
+			// /proc/self/status couldn't be read (misconfigured
+			// mount namespace, kernel bug, blocked-by-seccomp)
+			// would boot with an empty CapMasks, the Check
+			// would find no Allow caps missing AND no Deny caps
+			// present, and the daemon would proceed with no
+			// signal that introspection failed. Fail closed.
+			return fmt.Errorf("runtimecheck: read self status: %w", rerr)
+		}
 	case opts.PID > 0:
 		//nolint:forbidigo // DEPLOY-1 / ADR-075: /proc/<pid>/status is kernel-controlled, not customer-supplied; the openCustomerFile path is for CLI tarball ingestion, not runtime capability introspection.
 		f, err := os.Open(fmt.Sprintf("/proc/%d/status", opts.PID))
@@ -194,23 +208,40 @@ func (v *Violation) Error() string {
 	return sb.String()
 }
 
-// readSelfStatus reads the current process's /proc/self/status.
-// On non-Linux platforms (macOS dev) the file doesn't exist —
-// the error is swallowed and the returned mask is zero — which
-// makes the runtimecheck test a no-op on darwin. The unit tests
-// exercise Validate() directly with a fixture mask.
-func readSelfStatus() capdecl.CapMasks {
+// readSelfStatus reads the current process's /proc/self/status
+// and parses the cap mask lines. Returns a non-nil error on
+// open/read/parse failure — Check MUST fail closed in that case
+// (review finding M3: the previous shape returned a zero mask on
+// any error, which silently passed every Allow/Deny assertion and
+// let misconfigured daemons boot with no introspection signal).
+//
+// The function is gated to //go:build linux by the package's
+// metal integration test (cmd/<daemon>/runtimecheck_test.go); on
+// macOS dev, callers MUST use Options.StatusReader (a fixture
+// io.Reader) to drive Check. The non-metal dev path never reaches
+// readSelfStatus.
+func readSelfStatus() (capdecl.CapMasks, error) {
 	//nolint:forbidigo // DEPLOY-1 / ADR-075: /proc/self/status is kernel-controlled; the openCustomerFile path is for CLI tarball ingestion, not runtime capability introspection.
 	f, err := os.Open("/proc/self/status")
 	if err != nil {
-		return capdecl.CapMasks{}
+		return capdecl.CapMasks{}, fmt.Errorf("open /proc/self/status: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 	buf, err := io.ReadAll(f)
 	if err != nil {
-		return capdecl.CapMasks{}
+		return capdecl.CapMasks{}, fmt.Errorf("read /proc/self/status: %w", err)
 	}
-	return capdecl.ParseStatus(buf)
+	mask := capdecl.ParseStatus(buf)
+	// A zero mask is plausible for an unprivileged daemon on a
+	// restrictive box (CapBnd=0x0000000000000000 is valid) but
+	// ONLY if we successfully read the file. If the parser
+	// returned zero because it didn't recognise the cap lines,
+	// surface that as a parse error so the boot fails loud
+	// instead of silently passing.
+	if mask == (capdecl.CapMasks{}) {
+		return capdecl.CapMasks{}, errors.New("parse /proc/self/status: no cap lines found (kernel too old or non-Linux)")
+	}
+	return mask, nil
 }
 
 // String is a convenience for log messages. It returns the same

@@ -83,6 +83,18 @@ const (
 	defaultPublicControlAddr = "127.0.0.1:9090"
 )
 
+// gatewaydPublicCapCheck is the DEPLOY-1 / ADR-075 capdecl gate
+// seam (review finding M2). It is a package-level var instead of
+// a runDeps field because gatewayd-public has a single-file
+// `run()` body with no DI struct to extend. Production leaves it
+// nil → run() falls back to the live runtimecheck.MustCheckOnBoot
+// call against /proc/self/status. Tests override it (typically
+// with func() error { return nil }) so the test runner's
+// capset doesn't fail the gate. The override is package-scoped,
+// not exported, so cmd/gatewayd-public_test.go can swap it within
+// a t.Cleanup.
+var gatewaydPublicCapCheck func() error
+
 func main() {
 	wire.Daemon("gatewayd-public", run)
 }
@@ -97,7 +109,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// readiness ping all run inside the unit's systemd hardening
 	// (NoNewPrivileges, ProtectSystem, PrivateTmp, etc.). Any
 	// future cap_ add lands here, not in the unit file.
-	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+	//
+	// Note (review finding M2): unlike the runDeps-shaped
+	// daemons, gatewayd-public has a single-file `run()` body —
+	// there is no test seam struct to extend. The
+	// capCheck-style override lives in the cmd-level
+	// helper below for tests that want to drive the body
+	// without exercising the live /proc/self/status check.
+	capCheck := gatewaydPublicCapCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
 		return err
 	}
 

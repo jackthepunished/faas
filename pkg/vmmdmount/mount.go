@@ -116,10 +116,59 @@ type Registry struct {
 // (in pkg/fcvm) can read SrcPath + StorageKey on Umount to clean
 // up the staged bytes.
 type MountEntry struct {
-	StorageKey string    // the canonical StorageBackend key
-	SrcPath    string    // the staged StorageBackend bytes; deleted on umount
-	MountedAt  time.Time // when MountParentExt4 registered the mount
+	// Kind tells Registry.Umount + SweepOrphans which umount
+	// syscall to dispatch. MountKindParentExt4 (the ADR-053
+	// loopback path) uses `umount` + SrcPath cleanup;
+	// MountKindOverlayParent (DEPLOY-1) uses
+	// UmountOverlayParent which already cleans up its merged
+	// dir. Before MountKind existed (review finding B4) the
+	// sweep umounted every entry as ext4, which (a) silently
+	// succeeded on an overlayfs mount (kernel treats both as
+	// generic mounts) and (b) leaked the upperdir/workdir
+	// staging tree because no SrcPath was registered.
+	Kind MountKind
+	// StorageKey is set for MountKindParentExt4 entries (the
+	// canonical StorageBackend key). Empty for MountKindOverlayParent.
+	StorageKey string
+	// SrcPath is set for MountKindParentExt4 entries (the
+	// staged StorageBackend bytes; deleted on umount). Empty
+	// for MountKindOverlayParent (the upper/work/merged tree
+	// is owned by vmmdmount.UmountOverlayParent).
+	SrcPath string
+	// MountedAt is when the mount was registered.
+	MountedAt time.Time
 }
+
+// MountKind discriminates ext4 loopback mounts (the ADR-053
+// parent-base staging path) from overlay mounts (the DEPLOY-1
+// parent-ref overlay staging path). The Kind is stored on
+// MountEntry so Registry.Umount + SweepOrphans + SweepAll
+// dispatch to the right umount syscall. Without Kind, the
+// registry could not distinguish the two and the sweep would
+// run a generic `umount` on every entry — which silently
+// worked for the kernel (both are mounted filesystems) but
+// leaked upperdir/workdir on the overlay path because no
+// SrcPath was registered to clean up.
+//
+// Adding a new kind requires extending RegisterOrEvict to
+// take a MountKind + UmountFunc (or switch on the kind here
+// in Registry.Umount). The current two kinds cover all
+// mount owners in this box today.
+type MountKind int
+
+const (
+	// MountKindParentExt4 is an `mount -o loop,ro,nodev,nosuid,
+	// noexec` loopback of a StorageBackend-fetched parent-base
+	// ext4 image. SrcPath + StorageKey are set on the entry;
+	// Umount removes the staged source file.
+	MountKindParentExt4 MountKind = iota + 1
+	// MountKindOverlayParent is an `mount -t overlay` parent-ref
+	// overlayfs (lowerdir under /srv/fc/parent/, upperdir +
+	// workdir under /dev/shm/faas-base-staging/). SrcPath +
+	// StorageKey are empty; Umount dispatches to
+	// UmountOverlayParent which rmdir's the merged dir.
+	MountKindOverlayParent
+)
 
 // NewRegistry builds an empty registry. cap is the soft cap on
 // concurrent mounts — when a Mount would exceed it, the oldest
@@ -155,6 +204,16 @@ func NewRegistry(cap int) *Registry {
 // used to race (manager's umount + forget held no lock, so the
 // sweep could umount the same mountpoint first). Now both paths
 // funnel through Umount and the registry stays consistent.
+//
+// Dispatch: MountKind controls which umount syscall runs.
+// MountKindParentExt4 → UmountExt4 + rm SrcPath (the ADR-053
+// loopback path). MountKindOverlayParent → UmountOverlayParent
+// (the DEPLOY-1 parent-ref overlay path; the function already
+// rmdir's the merged dir, so no SrcPath cleanup happens here).
+// Review finding B4: pre-MountKind the registry ran a single
+// `umount` syscall on every entry and only cleaned up SrcPath;
+// MountKindOverlayParent entries had no SrcPath, so the sweep
+// leaked upperdir/workdir staging trees.
 func (r *Registry) Umount(mountpoint string) (found bool, err error) {
 	r.mu.Lock()
 	entry, ok := r.entries[mountpoint]
@@ -165,45 +224,73 @@ func (r *Registry) Umount(mountpoint string) (found bool, err error) {
 	delete(r.entries, mountpoint)
 	r.mu.Unlock()
 
-	if uerr := UmountExt4(mountpoint); uerr != nil {
-		// Restore the entry so a retry has a chance — the next
-		// sweep tick (or a future explicit Umount call) will
-		// pick it up. We restore under the lock to keep the map
-		// consistent with the disk state.
-		if !errors.Is(uerr, ErrUnknownMountpoint) {
-			r.mu.Lock()
-			if _, stillMissing := r.entries[mountpoint]; stillMissing {
-				r.entries[mountpoint] = entry
+	switch entry.Kind {
+	case MountKindParentExt4:
+		if uerr := UmountExt4(mountpoint); uerr != nil {
+			// Restore the entry so a retry has a chance — the next
+			// sweep tick (or a future explicit Umount call) will
+			// pick it up. We restore under the lock to keep the map
+			// consistent with the disk state.
+			if !errors.Is(uerr, ErrUnknownMountpoint) {
+				r.mu.Lock()
+				if _, stillMissing := r.entries[mountpoint]; stillMissing {
+					r.entries[mountpoint] = entry
+				}
+				r.mu.Unlock()
+				return false, uerr
 			}
-			r.mu.Unlock()
-			return false, uerr
+			// ErrUnknownMountpoint means the kernel has nothing at
+			// the path — entry was already forgotten, no restore
+			// needed.
 		}
-		// ErrUnknownMountpoint means the kernel has nothing at
-		// the path — entry was already forgotten, no restore
-		// needed.
-	}
-	if entry.SrcPath != "" {
-		if rerr := os.Remove(entry.SrcPath); rerr != nil && !os.IsNotExist(rerr) {
-			// Source file removal failure is non-fatal — the
-			// next sweep (or a manual umount) will retry. Log
-			// via the returned error so the manager can decide.
-			return true, fmt.Errorf("vmmdmount: registry.Umount: rm src %s: %w", entry.SrcPath, rerr)
+		if entry.SrcPath != "" {
+			if rerr := os.Remove(entry.SrcPath); rerr != nil && !os.IsNotExist(rerr) {
+				// Source file removal failure is non-fatal — the
+				// next sweep (or a manual umount) will retry. Log
+				// via the returned error so the manager can decide.
+				return true, fmt.Errorf("vmmdmount: registry.Umount: rm src %s: %w", entry.SrcPath, rerr)
+			}
 		}
+	case MountKindOverlayParent:
+		// UmountOverlayParent already handles its own merged-dir
+		// cleanup. If it returns ErrUnknownMountpoint, the
+		// overlay is already gone — entry stays forgotten.
+		if uerr := UmountOverlayParent(context.Background(), mountpoint); uerr != nil {
+			if !errors.Is(uerr, ErrUnknownMountpoint) {
+				r.mu.Lock()
+				if _, stillMissing := r.entries[mountpoint]; stillMissing {
+					r.entries[mountpoint] = entry
+				}
+				r.mu.Unlock()
+				return false, uerr
+			}
+		}
+	default:
+		return false, fmt.Errorf("vmmdmount: registry.Umount: unknown MountKind=%d for %q", entry.Kind, mountpoint)
 	}
 	return true, nil
 }
 
-// RegisterOrEvict records (mountpoint, storageKey) under mu, and if
-// the new size exceeds the cap, force-umounts the oldest entry to
-// make room. Returns the evicted mountpoint (empty when no eviction
-// was needed) so the caller can log it.
+// RegisterOrEvict records (mountpoint, kind, storageKey, srcPath)
+// under mu, and if the new size exceeds the cap, force-umounts
+// the oldest entry to make room. Returns the evicted mountpoint
+// (empty when no eviction was needed) so the caller can log it
+// AND honor the eviction by issuing the matching umount syscall
+// (review finding B5: pre-B5 callers discarded the returned
+// mountpoint and the evicted mount stayed live on disk).
 //
 // This is the load-shed path: a misbehaving imaged that never calls
 // UmountParentExt4 cannot grow the map unboundedly because the cap
 // guarantees the oldest entry is dropped on every overflow. A
 // well-behaved imaged never sees the eviction branch because it
 // umounts before the next Mount.
-func (r *Registry) RegisterOrEvict(mountpoint, storageKey, srcPath string) (evicted string) {
+//
+// kind is the MountKind of the entry being registered. StorageKey
+// + srcPath are set ONLY for MountKindParentExt4 (the loopback
+// path that stages StorageBackend bytes); both are empty for
+// MountKindOverlayParent (the merged dir is owned by
+// UmountOverlayParent's rmdir).
+func (r *Registry) RegisterOrEvict(mountpoint string, kind MountKind, storageKey, srcPath string) (evicted string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.entries) >= r.cap {
@@ -221,6 +308,7 @@ func (r *Registry) RegisterOrEvict(mountpoint, storageKey, srcPath string) (evic
 		delete(r.entries, evicted)
 	}
 	r.entries[mountpoint] = MountEntry{
+		Kind:       kind,
 		StorageKey: storageKey,
 		SrcPath:    srcPath,
 		MountedAt:  time.Now(),

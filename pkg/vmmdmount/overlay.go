@@ -1,17 +1,29 @@
-// overlay.go is the vmmd-side mount helper for the parent-ref
-// overlayfs staged under /dev/shm/faas-base-staging (DEPLOY-1 /
-// ADR-075). Before DEPLOY-1 the unix.Mount(2) syscall lived in
+// Package vmmdmount — overlay.go issues the parent-ref
+// overlayfs mount on behalf of imaged (ADR-075 / DEPLOY-1).
+// Before DEPLOY-1 the unix.Mount(2) syscall lived in
 // pkg/imaged/mount_overlay_linux.go under
-// AmbientCapabilities=cap_sys_admin — a silent violation of the
-// CLAUDE.md invariant "vmmd is the only root component that
-// mounts filesystems". The cap_sys_admin ambient cap plus the
-// ext4 upperdir (host /tmp) plus the resulting dmesg
+// AmbientCapabilities=cap_sys_admin — a silent violation of
+// the CLAUDE.md invariant "vmmd is the only root component
+// that mounts filesystems". The cap_sys_admin ambient cap
+// plus the ext4 upperdir (host /tmp) plus the resulting dmesg
 // "upper fs does not support tmpfile" message cascade killed
 // cd-controlplane deploys for five days (2026-08-04 → 2026-08-05,
 // 13 failed deploys). All three of those failures are wired up
 // here: the cap walks through pkg/vmmd, the staging dir walks
 // through FAAS_BASE_STAGING_ROOT, and the overlay walks through
 // the kernel's tmpfile check.
+//
+// The mount is issued via `mount -t overlay` exec (matching
+// MountExt4ReadOnly next door), not unix.Mount(2). The exec
+// approach keeps pkg/vmmdmount portable — the package
+// compiles on macOS / Windows even though the RPC handler is
+// only exercised on a Linux vmmd (cmd/vmmd is gated to
+// //go:build linux in deploy/; on non-Linux the function is
+// exported but never called). The pre-DEPLOY-1 syscall lived
+// on the imaged side under AmbientCapabilities; keeping
+// unix.Mount out of imaged entirely is what enforces the
+// architectural ownership invariant ("vmmd is the only root
+// component that mounts filesystems").
 //
 // MountOverlayParent issues the mount on behalf of imaged. The
 // caller (cmd/vmmd via the gRPC server) is the only component
@@ -23,7 +35,7 @@
 // Validation chain (mirrors the MountExt4ReadOnly gate):
 //  1. lowerdir must be under /srv/fc/parent/ — the loopback
 //     mount vmmd has already issued (the parent-ref layer is
-//     read-only and staged via MountExt4ReadOnly).
+//     read-only and staged via MountParentExt4ReadOnly).
 //  2. upperdir/workdir/merged must be under
 //     /dev/shm/faas-base-staging/ — staging lives on tmpfs so
 //     the kernel's overlayfs tmpfile contract is satisfied
@@ -31,8 +43,8 @@
 //     cycle; this is the original 2026-08-04 dmesg bug).
 //  3. Empty strings → InvalidArgument (imaged's defer-after-
 //     error is safe on these — the handler absorbs them).
-//  4. unix.Mount syscall errors → wrapped Internal so the gRPC
-//     handler can surface a problem document.
+//  4. mount(8) errors → wrapped Internal so the gRPC handler
+//     can surface a problem document.
 package vmmdmount
 
 import (
@@ -43,9 +55,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 // OverlayStagingRoot is the tmpfs root for the overlayfs
@@ -78,9 +87,12 @@ var ErrInvalidOverlayPath = errors.New("vmmdmount: overlay path outside allowed 
 // MountOverlayParent mounts an overlayfs with lowerdir (read-only
 // loopback already issued by vmmd), upperdir+workdir on the host
 // tmpfs, and merged as the combined view. The function issues
-// the unix.Mount(2) syscall directly (no exec.Command("mount"))
-// so a future pkg/vmmdmount test can stub the syscall without
-// fork.
+// `mount -t overlay` via exec (matching MountExt4ReadOnly next
+// door) so pkg/vmmdmount stays host-portable — the package
+// compiles on macOS / Windows even though only the Linux vmmd
+// daemon actually issues the call. Tests stub the exec call via
+// PATH manipulation if they need to fake the syscall (see
+// overlay_test.go).
 //
 // On success returns nil. On any error path the freshly-created
 // merged dir is rmdir'd so a failed mount doesn't leave orphans
@@ -96,6 +108,12 @@ var ErrInvalidOverlayPath = errors.New("vmmdmount: overlay path outside allowed 
 //     by MkdirBaseStaging + os.MkdirTemp).
 //   - All four paths must be absolute; relative paths are
 //     rejected to prevent ../../ escape.
+//   - No symlinks and no `..` segments survive validation
+//     (EvalSymlinks + Abs + re-check against the prefix); a
+//     misbehaving imaged handing the RPC a `/srv/fc/parent/foo`
+//     symlink whose target is `/etc` would otherwise be honoured
+//     by both the prefix test (literal HasPrefix passes) and
+//     the kernel's mount(2) (which follows symlinks).
 func MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged string) error {
 	if lowerdir == "" || upperdir == "" || workdir == "" || merged == "" {
 		return fmt.Errorf("vmmdmount: MountOverlayParent: empty path (lower=%q upper=%q work=%q merged=%q)",
@@ -109,22 +127,19 @@ func MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged
 		return fmt.Errorf("vmmdmount: MountOverlayParent: non-absolute path rejected")
 	}
 
-	// Lowerdir must be under MountRoot (where vmmd loopback
-	// mounts live). A misbehaving imaged can't ask vmmd to
-	// overlay /etc or /var/lib/faas by passing that as lower.
-	if !strings.HasPrefix(lowerdir, filepath.Clean(MountRoot)+string(filepath.Separator)) {
-		return fmt.Errorf("vmmdmount: MountOverlayParent: lowerdir %q not under %s: %w",
-			lowerdir, MountRoot, ErrInvalidOverlayPath)
+	// Evaluate symlinks + collapse `..` segments BEFORE the
+	// prefix check. Combined with the post-Eval abs()-vs-input
+	// compare, this closes the symlink + `..`-escape channel
+	// (review B3): a literal HasPrefix on filepath.Clean is
+	// not enough on its own because (a) `..` survives Clean and
+	// (b) os.Stat + the kernel both follow symlinks.
+	if err := rejectSymlinkOrEscape(lowerdir, filepath.Clean(MountRoot)+string(filepath.Separator), "lowerdir"); err != nil {
+		return err
 	}
-
-	// Upper/work/merged must be under OverlayStagingRoot
-	// (/dev/shm/faas-base-staging). Same logic — refuse to mount
-	// outside the host tmpfs staging tree.
 	stagingPrefix := filepath.Clean(OverlayStagingRoot) + string(filepath.Separator)
 	for _, p := range []string{upperdir, workdir, merged} {
-		if !strings.HasPrefix(p, stagingPrefix) {
-			return fmt.Errorf("vmmdmount: MountOverlayParent: %q not under %s: %w",
-				p, OverlayStagingRoot, ErrInvalidOverlayPath)
+		if err := rejectSymlinkOrEscape(p, stagingPrefix, "upper|work|merged"); err != nil {
+			return err
 		}
 	}
 
@@ -148,42 +163,73 @@ func MountOverlayParent(ctx context.Context, lowerdir, upperdir, workdir, merged
 		return fmt.Errorf("vmmdmount: MountOverlayParent: mkdir merged: %w", err)
 	}
 
-	// The mount itself. unix.Mount's data parameter is an
-	// unsafe.Pointer to a NUL-terminated string. golang.org/x/sys/unix
-	// exposes a higher-level wrapper via MountAt with a string
-	// data; that wrapper handles the cstring conversion for us.
-	// The flag is 0 — overlayfs on tmpfs upperdir doesn't care
-	// about atime semantics for the staging dir.
+	// The mount itself. Uses `mount -t overlay` (not
+	// unix.Mount(2)) for portability — pkg/vmmdmount must
+	// compile on macOS / Windows so the gRPC client stubs in
+	// pkg/imaged can build there, even though only the
+	// Linux vmmd daemon actually issues the call. This
+	// matches MountExt4ReadOnly next door. The exec helper
+	// returns EINVAL-shaped errors with stderr captured; we
+	// wrap so the gRPC handler can surface a problem document.
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerdir, upperdir, workdir)
-	if err := unix.Mount("overlay", merged, 0, unsafeStringPointer(opts)); err != nil {
+	cmd := exec.CommandContext(ctx, "mount", "-t", "overlay", "-o", opts, "overlay", merged)
+	if out, err := cmd.CombinedOutput(); err != nil {
 		// rmdir the merged dir we just created — the mount
 		// failed so the caller can't umount it.
 		_ = os.Remove(merged)
-		return fmt.Errorf("vmmdmount: MountOverlayParent: mount overlay: %w", err)
+		return fmt.Errorf("vmmdmount: MountOverlayParent: mount overlay: %w (%s)",
+			err, strings.TrimSpace(string(out)))
 	}
-	_ = ctx // future: bind to ctx for cancellation parity with MountExt4ReadOnly
 	return nil
 }
 
-// unsafeStringPointer converts a Go string into the unsafe.Pointer
-// golang.org/x/sys/unix.Mount requires for its data parameter.
-// The returned pointer is only valid for the lifetime of the
-// underlying Go string; the mount syscall is synchronous so the
-// string outlives the call. Avoid using this helper anywhere the
-// string escapes the calling goroutine (e.g. async umount — use
-// exec.Command("umount", ...) for that, which we already do).
-func unsafeStringPointer(s string) unsafe.Pointer {
-	//nolint:gosec // DEPLOY-1 / ADR-075: unix.Mount's data param requires unsafe.Pointer; this is the one audited wrapper.
-	if s == "" {
-		return unsafe.Pointer(nil)
+// rejectSymlinkOrEscape evaluates `path` for symlinks + `..`
+// collapses and verifies (a) its real location lives under
+// `mustUnder` and (b) the path the caller handed us was the real
+// location — i.e. the caller did not pass a symlink or a `..`-
+// chained path that resolves to a different directory. Used by
+// MountOverlayParent + UmountOverlayParent so the RPC boundary
+// closes the symlink-follow and dot-dot escape channels
+// (review B3 / M3 path validation).
+//
+// `label` is included in error messages so the failing path is
+// obvious (lowerdir vs upper vs work vs merged).
+func rejectSymlinkOrEscape(path, mustUnder, label string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("vmmdmount: %s: filepath.Abs: %w", label, err)
 	}
-	// unsafe.StringData is the zero-copy accessor for a Go
-	// string's backing bytes. The pointer it returns is
-	// NUL-terminated because Go strings are. The conversion
-	// from *byte to unsafe.Pointer is explicit (no implicit
-	// pointer arithmetic on unsafe.Pointer).
-	//nolint:gosec // DEPLOY-1 / ADR-075: see comment above on unsafeStringPointer.
-	return unsafe.Pointer(unsafe.StringData(s))
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		// ENOENT is fine — the staging tree's `upper`, `work`,
+		// `merged` subdirs may not yet exist on Mount (imaged
+		// creates them after the RPC returns OK). Surface a
+		// typed ErrInvalidOverlayPath only when the reason is
+		// anything other than "missing".
+		if os.IsNotExist(err) {
+			// errorlint (memory: errorlint-non-wrapping-errors-join):
+			// use errors.Join so both ErrInvalidOverlayPath AND
+			// the underlying os.PathError remain reachable via
+			// errors.Is / errors.As — a "%w (extra)" shape only
+			// wraps the first arg and hides the second.
+			return errors.Join(ErrInvalidOverlayPath, fmt.Errorf("vmmdmount: %s: %w", label, err))
+		}
+		return fmt.Errorf("vmmdmount: %s: EvalSymlinks: %w", label, err)
+	}
+	// The kernel will see the resolved path; if the path the
+	// caller handed us differs from resolved, the caller is
+	// asking us to mount through a symlink or a `..` chain —
+	// refuse. (EvalSymlinks collapses `..` segments; an
+	// unchanged returned path means neither was present.)
+	if resolved != abs {
+		return fmt.Errorf("vmmdmount: %s: %q resolves to %q (symlink or dot-dot not allowed): %w",
+			label, path, resolved, ErrInvalidOverlayPath)
+	}
+	if !strings.HasPrefix(resolved, mustUnder) {
+		return fmt.Errorf("vmmdmount: %s: %q not under %s: %w",
+			label, path, mustUnder, ErrInvalidOverlayPath)
+	}
+	return nil
 }
 
 // UmountOverlayParent unmounts a merged directory previously

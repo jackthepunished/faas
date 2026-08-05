@@ -29,18 +29,25 @@ EnvironmentFile=/etc/faas/sealed.env
 # the path is covered by ReadWritePaths below.
 Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging
 
-# imaged → vmmd parent-ref overlay mount (ADR-053) is done locally by
-# imaged via the direct mount(2) syscall (pkg/imaged/mount_overlay_linux.go).
-# User=faas-imaged + NoNewPrivileges=yes would otherwise drop caps under
-# the setuid-root /bin/mount binary (the kernel returns a misleading
-# "upper fs does not support tmpfile" because libmount's cap check
-# fails first). The cap is already in CapabilityBoundingSet (full set,
-# inherited from the default systemd unit); promoting it to
-# AmbientCapabilities lets the non-root user actually USE it without
-# expanding the bounding set. NoNewPrivileges=yes is preserved (caps
-# are ambient at fork time, no setuid binary involved). Scoped to
-# cap_sys_admin only — no other ambient cap is granted.
-AmbientCapabilities=cap_sys_admin
+# imaged → vmmd parent-ref overlay mount (ADR-075 / DEPLOY-1) is now
+# an RPC: pkg/imaged/vmmclient.go calls MountOverlayParent on the
+# vmmdgrpc unix socket, vmmd (the only root component per spec §11
+# + CLAUDE.md) does the mount under cap_sys_admin. imaged no longer
+# needs the cap locally — drop AmbientCapabilities= AND shrink the
+# bounding set so the runtimecheck (cmd/imaged/caps.go) passes with
+# Deny: cap_sys_admin. PR-F added AmbientCapabilities=cap_sys_admin
+# because the original mount_overlay_linux.go syscall lived on the
+# imaged side; DEPLOY-1 erases that path entirely, so the cap is
+# now wrong and the runtimecheck would (correctly) fire on boot if
+# it ever silently re-appeared.
+#
+# The CapabilityBoundingSet below covers everything imaged legitimately
+# needs (no cap_sys_admin): setuid/setgid for the OCI pull user-ns
+# dance, dac_override for the parent staging tree, kill for SIGTERM
+# on the imaged process itself, sys_chroot if builderd ever mounts
+# inside a chroot path (none today but the cap is harmless). sys_admin
+# is the load-bearing omission — that's the architectural boundary.
+CapabilityBoundingSet=cap_chown cap_dac_override cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_net_bind_service cap_sys_chroot
 
 NoNewPrivileges=yes
 ProtectSystem=strict

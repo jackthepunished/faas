@@ -811,7 +811,7 @@ func (m *Manager) MountParentExt4(ctx context.Context, storageKey string) (strin
 		_ = os.Remove(srcPath)
 		return "", err
 	}
-	evicted := m.parentMounts.RegisterOrEvict(mp, storageKey, srcPath)
+	evicted := m.parentMounts.RegisterOrEvict(mp, vmmdmount.MountKindParentExt4, storageKey, srcPath)
 	if evicted != "" {
 		m.log.Warn("vmmd: parent mount cap reached; force-umounted oldest",
 			"evicted_mountpoint", evicted)
@@ -884,12 +884,30 @@ func (m *Manager) MountOverlayParent(ctx context.Context, lowerdir, upperdir, wo
 	if err := vmmdmount.MountOverlayParent(ctx, lowerdir, upperdir, workdir, merged); err != nil {
 		return err
 	}
-	// Track merged in the registry with empty StorageKey/SrcPath
-	// (the overlay mount has neither — it's a vmmd-issued mount
-	// over paths imaged chose). The cap (16) is the same as
-	// loopback mounts; imaged should umount before issuing the
-	// next one anyway.
-	m.parentMounts.RegisterOrEvict(merged, "", "")
+	// Track merged in the registry with MountKindOverlayParent
+	// + empty StorageKey/SrcPath (the overlay mount has neither —
+	// it's a vmmd-issued mount over paths imaged chose). The
+	// cap (16) is the same as loopback mounts; imaged should
+	// umount before issuing the next one anyway.
+	//
+	// Review finding B5: pre-B5 the returned mountpoint was
+	// discarded, so when the cap was hit the evicted mount
+	// stayed live on disk — leaking upper/work/merged until
+	// the next sweep tick. Now we honor the eviction by
+	// dispatching through Registry.Umount (which switches on
+	// MountKind and tears down the overlay properly).
+	evicted := m.parentMounts.RegisterOrEvict(merged, vmmdmount.MountKindOverlayParent, "", "")
+	if evicted != "" {
+		m.log.Warn("vmmd: parent overlay mount cap reached; force-umounted oldest",
+			"evicted_mountpoint", evicted)
+		// Registry.Umount dispatches on MountKind (B4), so this
+		// works for either ext4 or overlay evictions. Best-effort
+		// — a failed umount surfaces in the next sweep tick.
+		if _, uerr := m.parentMounts.Umount(evicted); uerr != nil {
+			m.log.Warn("vmmd: evicted parent overlay umount failed (sweep will retry)",
+				"evicted_mountpoint", evicted, "err", uerr)
+		}
+	}
 	m.log.Info("vmmd: parent overlay mounted",
 		"lowerdir", lowerdir, "upperdir", upperdir,
 		"workdir", workdir, "merged", merged)
@@ -906,28 +924,16 @@ func (m *Manager) UmountOverlayParent(ctx context.Context, merged string) error 
 	if m.parentMounts == nil {
 		return nil
 	}
-	// Look up first so we can forget on success without an
-	// extra acquire. The lookup miss path is the
-	// defer-after-error case.
-	entry, ok := m.parentMounts.Lookup(merged)
-	if !ok {
-		// Idempotent on unknown — imaged's defer may fire after
-		// the gRPC handler already swept the entry. The
-		// underlying syscall is best-effort: if the kernel
-		// still has a mount at `merged` the syscall succeeds;
-		// if not, UmountOverlayParent surfaces
-		// ErrUnknownMountpoint which the gRPC handler absorbs.
-		if err := vmmdmount.UmountOverlayParent(ctx, merged); err != nil &&
-			!errors.Is(err, vmmdmount.ErrUnknownMountpoint) {
-			return err
-		}
-		return nil
-	}
-	if err := vmmdmount.UmountOverlayParent(ctx, merged); err != nil {
+	// Funnel through Registry.Umount (review B4). The Kind
+	// dispatch in there issues UmountOverlayParent (not the
+	// ext4 umount) so the overlay mount is torn down with the
+	// right syscall. Lookup miss → Registry.Umount returns
+	// (false, nil), which is the idempotent defer-after-error
+	// shape imaged's caller depends on.
+	if _, err := m.parentMounts.Umount(merged); err != nil {
 		return err
 	}
-	m.parentMounts.Forget(merged)
-	m.log.Info("vmmd: parent overlay umounted", "mountpoint", merged, "storage_key", entry.StorageKey)
+	m.log.Info("vmmd: parent overlay umounted", "mountpoint", merged)
 	return nil
 }
 

@@ -1,6 +1,21 @@
-// runtimecheck_linux_test.go is the build-tagged live test that
+//go:build metal
+
+// runtimecheck_metal_test.go is the build-tagged live test that
 // exercises Check() against /proc/self/status on the EX44
 // (production) or Lima nested-VM (local M3+ Mac) runners.
+//
+// Review finding M4: this file used to be `runtimecheck_linux_test.go`
+// with a `//go:build linux` tag — but `make test` (which runs on
+// every CI machine including macOS dev boxes) does not pass
+// `-tags=linux`. The old shape compiled on macOS, then tried to
+// open /proc/self/status at runtime, then silently returned a
+// zero mask (M3) so the test "passed" with no real introspection.
+// Pinning `//go:build metal` aligns the file with the metal-only
+// contract (memory: pkg/capdecl/runtimecheck_metal_test.md
+// invariant) and the `//go:build metal` block in pkg/fcvm/leakcheck
+// that has run-time-similar semantics. The non-metal validation
+// logic lives in runtimecheck_test.go (fixture-driven, no
+// /proc/self/status touch).
 //
 // The tests are intentionally narrow: each one constructs a
 // minimal Declaration that the test process (running under
@@ -36,7 +51,10 @@ func TestCheck_LiveProc(t *testing.T) {
 // cap set varies wildly across CI runners.
 func TestCheck_LiveProc_MatchesAllow(t *testing.T) {
 	opts := Options{PID: 0}
-	mask := readSelfStatus()
+	mask, err := readSelfStatus()
+	if err != nil {
+		t.Skipf("readSelfStatus: %v (M3 fail-closed; treat as runner cap absence)", err)
+	}
 	if mask.Bnd == 0 {
 		t.Skip("live /proc/self/status returned empty capBnd; runner does not expose caps")
 	}
@@ -53,7 +71,10 @@ func TestCheck_LiveProc_MatchesAllow(t *testing.T) {
 // "deny cap not present" — which is the success case).
 func TestCheck_LiveProc_DenyPresent(t *testing.T) {
 	opts := Options{PID: 0}
-	mask := readSelfStatus()
+	mask, err := readSelfStatus()
+	if err != nil {
+		t.Skipf("readSelfStatus: %v (M3 fail-closed; treat as runner cap absence)", err)
+	}
 	const bitSysAdmin = uint64(1) << 21
 	if mask.Bnd&bitSysAdmin == 0 {
 		t.Skip("live /proc/self/status does not include cap_sys_admin in capBnd; can't smoke-deny")

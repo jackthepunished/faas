@@ -352,11 +352,11 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	// Build an overlayfs three-dir layout under a fresh staging
 	// root: lowerdir = parent mountpoint (read-only, immutable),
 	// upperdir = fresh empty dir where delta layers will land,
-	// workdir = overlayfs internal scratch. Then mount -t overlay
-	// the merged view at `merged` (sibling of upper). The merged
-	// view IS the child filesystem; ApplyLayerGz on `upper` and
-	// mkfs.ext4 -d `merged` give us the child ext4 with the
-	// parent userland shared on disk.
+	// workdir = overlayfs internal scratch. Then ask vmmd to
+	// mount an overlayfs with merged = staging/merged so the
+	// merged view IS the child filesystem; ApplyLayerGz on
+	// `upper` and mkfs.ext4 -d `merged` give us the child ext4
+	// with the parent userland shared on disk.
 	staging, err := rootfs.MkdirBaseStaging()
 	if err != nil {
 		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref staging dir: %w", err)
@@ -372,19 +372,23 @@ func (h *Handler) ensureBaseExt4ParentRef(
 		}
 	}
 
-	if err := mountOverlayFn(ctx, mountpoint, upper, workdir, merged); err != nil {
-		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref overlay mount: %w", err)
-	}
+	// Install the umount defer UNCONDITIONALLY before issuing
+	// the mount RPC (review M5). The gRPC reply can be lost
+	// after the kernel mount succeeded; without an unconditional
+	// defer the staging tree leaks and the registry loses
+	// visibility. vmmd's UmountOverlayParent is idempotent on
+	// unknown mountpoints so this defer is safe even when no
+	// mount ever landed.
 	defer func() {
-		// Unmount the overlay (independent of the parent mount,
-		// which the defer-above releases). Idempotent on a
-		// double-umount; vmmd's handler absorbs
-		// ErrUnknownMountpoint so this defer is safe even if
-		// the registry has already swept the entry.
-		if uerr := umountOverlayFn(merged); uerr != nil {
+		// Detached ctx so a cancelled staging request still
+		// releases the overlay mount cleanly.
+		if uerr := h.vmmClient.UmountOverlayParent(context.WithoutCancel(ctx), merged); uerr != nil {
 			h.log.Warn("imaged: umount parent overlay failed", "mountpoint", merged, "err", uerr)
 		}
 	}()
+	if err := h.vmmClient.MountOverlayParent(ctx, mountpoint, upper, workdir, merged); err != nil {
+		return BaseStageResult{}, fmt.Errorf("imaged: parent-ref overlay mount: %w", err)
+	}
 
 	// Apply the delta layers onto the overlay upper dir. The
 	// modifications land in `upper`, not on the parent mount;
@@ -443,13 +447,18 @@ func (h *Handler) ensureBaseExt4ParentRef(
 	}, nil
 }
 
-// mountOverlay assembles `mount -t overlay overlay -o
-// lowerdir=<parentMount>,upperdir=<upper>,workdir=<workdir>
-// <merged>` via the direct mount(2) syscall so the daemon's
-// ambient CAP_SYS_ADMIN is honored end-to-end. The merged view
-// is the child filesystem ready for `mkfs.ext4 -d <merged>`.
-// Returns the (empty) success path; a non-zero RPC surfaces
-// the vmmd-mapped error verbatim.
+// mountOverlayFn / umountOverlayFn (the package-level test seams)
+// were removed in DEPLOY-1 (review B2). imaged's parent-ref
+// stage now calls h.vmmClient.MountOverlayParent /
+// .UmountOverlayParent directly, parallel to the existing
+// h.vmmClient.MountParentExt4ReadOnly dispatch. The test seam
+// is now the Handler's WithVMMClient setter; tests wire a
+// fakeVMMClient (vmmclient.go:265) instead of swapping a
+// package var. The pre-DEPLOY-1 closure form layered a
+// defaultVMMClient package global on top of WithVMMClient, but
+// cmd/imaged never wired the global — production silently
+// nil-dereffed. The Handler-scoped form closes that gap
+// without any new global state.
 //
 // Why vmmd RPC, not the previous local unix.Mount(2) syscall:
 // before DEPLOY-1, imaged ran with
@@ -466,72 +475,6 @@ func (h *Handler) ensureBaseExt4ParentRef(
 // MountOverlayParent gRPC to vmmd, vmmd issues the syscall,
 // and imaged's systemd unit can drop AmbientCapabilities=
 // entirely (ADR-075). imaged no longer needs CAP_SYS_ADMIN.
-//
-// The test seam (base_stage_test.go) overrides mountOverlayFn
-// with a no-op stub for unit-test portability — the bufconn-style
-// end-to-end coverage lives in pkg/vmmdgrpc and on the EX44 metal
-// path. production vmmClient is wired by cmd/imaged via
-// WithVMMClient; tests that don't wire a vmmClient must swap
-// mountOverlayFn / umountOverlayFn to no-op stubs OR the
-// production path will surface a "vmmClient is nil" error.
-func mountOverlayFnImpl(ctx context.Context, lowerdir, upperdir, workdir, merged string) error {
-	if lowerdir == "" || upperdir == "" || workdir == "" || merged == "" {
-		return fmt.Errorf("imaged: mountOverlayFn: empty path (lower=%q upper=%q work=%q merged=%q)",
-			lowerdir, upperdir, workdir, merged)
-	}
-	// The vmmClient is set on the Handler via WithVMMClient at
-	// boot time. The closure form below lets the test seam
-	// (withMountStub) swap the function without threading the
-	// Handler through every test.
-	v := currentVMMClient()
-	if v == nil {
-		return fmt.Errorf("imaged: mountOverlayFn: vmmClient is nil (the daemon never wired cmd/imaged::WithVMMClient)")
-	}
-	return v.MountOverlayParent(ctx, lowerdir, upperdir, workdir, merged)
-}
-
-// currentVMMClient is the package-level indirection tests can
-// swap (via withVMMClient) to point mountOverlayFn at a fake
-// client. Production init (cmd/imaged) wires this with the
-// real *VMMClient so the package var resolves to the live
-// gRPC client. nil in tests = "no fake wired" → mountOverlayFn
-// surfaces a clear error instead of nil-dereffing.
-var currentVMMClient = func() VMMClientIface {
-	return defaultVMMClient
-}
-
-// defaultVMMClient is the production *VMMClient wired by
-// cmd/imaged via SetDefaultVMMClient. nil until boot time —
-// that's intentional: imaged's startup wires it BEFORE any
-// staging call can fire (see cmd/imaged/main.go).
-var defaultVMMClient VMMClientIface
-
-// SetDefaultVMMClient is the boot-time hook cmd/imaged calls
-// after WithVMMClient so the package-level currentVMMClient
-// closure returns the live client. Idempotent.
-func SetDefaultVMMClient(c VMMClientIface) {
-	defaultVMMClient = c
-}
-
-// mountOverlayFn is the test seam: production code calls it
-// directly, tests swap it for a no-op via withMountStub. The
-// default value is the production dispatch through
-// currentVMMClient → vmmd RPC.
-var mountOverlayFn = mountOverlayFnImpl
-
-// umountOverlayFn is the test seam for the teardown path.
-// Production behaviour delegates to currentVMMClient's
-// UmountOverlayParent; tests stub this to skip the RPC.
-var umountOverlayFn = func(merged string) error {
-	if merged == "" {
-		return nil
-	}
-	v := currentVMMClient()
-	if v == nil {
-		return nil
-	}
-	return v.UmountOverlayParent(context.Background(), merged)
-}
 
 // openStringReader returns an io.Reader for the supplied string. The
 // helper exists so the digest sidecar Put has a content source without

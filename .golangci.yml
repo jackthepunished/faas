@@ -163,6 +163,28 @@ linters:
         - pattern: '^Unmount$'
           pkg: '^golang\.org/x/sys/unix$'
           msg: "DEPLOY-1 / ADR-075: do not call unix.Unmount directly. Use pkg/vmmdmount.UmountOverlayParent from vmmd, or call vmmd via pkg/vmmdgrpc (UmountOverlayParent RPC)."
+        # DEPLOY-1 / ADR-075: the architecture invariant is "vmmd is the
+        # ONLY component that mounts filesystems" — not "vmmd is the only
+        # component that calls unix.Mount(2)". Review of PR #652 (finding
+        # M6) flagged that pkg/vmmdmount/overlay.go was switched from
+        # unix.Mount to exec.Command("mount", ...) to gain cross-platform
+        # portability; the depguard + unix.Mount-forbid above was no
+        # longer sufficient to keep the boundary tight, because exec
+        # invocation has no compile-time import trail. This rule closes
+        # that hole: any os/exec.Command* call whose first non-context
+        # arg is the literal "mount" or "umount" is a regression of the
+        # boundary. Legitimate callers are explicitly allowlisted in
+        # `linters.exclusions.rules` (below) — pkg/fcvm/** is the vmmd
+        # VM owner that handles loopback mounts for the jailer;
+        # pkg/vmmdmount/** owns the parent-ref overlay mount;
+        # pkg/builderd/mount_helpers.go is the pre-PR-K test helper
+        # that PR-K left behind (see comment in that file).
+        #
+        # The pattern matches the literal-string-arg shape that
+        # `exec.Command[Context](ctx?, "mount", ...)`.
+        - pattern: '^Command(Context)?\((ctx\s*context\.\w+\s*,\s*)?"(mount|umount)"'
+          pkg: '^os/exec$'
+          msg: "DEPLOY-1 / ADR-075: do not invoke the `mount`/`umount` binaries outside pkg/vmmdmount and pkg/fcvm (the two vmmd-owned mount owners). If a new daemon needs to mount, route through pkg/vmmdgrpc MountOverlayParent/UmountOverlayParent RPC. If a test fixture needs to mount, put it in pkg/builderd/mount_helpers.go (the existing builderd test helper) or add a //nolint:forbidigo with a documented reason."
 
     # gosec runs against a box where vmmd is root and drives jailer/firecracker
     # and builds guest rootfs images. The rule IDs below are structurally
@@ -249,6 +271,30 @@ linters:
       - path: "pkg/capdecl/runtimecheck/runtimecheck\\.go$"
         linters:
           - goconst # the CapBnd/CapEff/CapPrm/CapAmb/Inh field-name strings are kernel-defined literals from /proc/<pid>/status; promoting them to consts is structural noise (the parser IS the consumer).
+      # DEPLOY-1 / ADR-075 (review finding M6): the mount/umount forbidigo
+      # rule above only blocks new call sites; the legitimate owners
+      # stay allowlisted here. Adding a new file outside these three
+      # globs and shelling out to `mount`/`umount` is a regression of
+      # the "vmmd is the only component that mounts filesystems"
+      # invariant and gets caught in CI.
+      #
+      # - pkg/fcvm/** — vmmd's jailer/loopback mount owner (PR-K predates
+      #   the boundary; it stayed untouched).
+      # - pkg/vmmdmount/** — the parent-ref overlay mount owner
+      #   (DEPLOY-1 / ADR-075; pkg/vmmdmount/overlay.go + mount.go).
+      # - pkg/builderd/mount_helpers.go — pre-PR-K test helper left
+      #   behind by the original builderd CreateBuildDrive1 e2e path;
+      #   see the file's header for the rationale and the post-DEPLOY-1
+      #   cleanup plan.
+      - path: "pkg/fcvm/.*\\.go$"
+        linters:
+          - forbidigo # vmmd's loopback mount owner — see comment above
+      - path: "pkg/vmmdmount/.*\\.go$"
+        linters:
+          - forbidigo # the parent-ref overlay mount owner — see comment above
+      - path: "pkg/builderd/mount_helpers\\.go$"
+        linters:
+          - forbidigo # legacy builderd test helper — see file header
       - path: "pkg/wire/metrics_test.go"
         linters:
           - errcheck

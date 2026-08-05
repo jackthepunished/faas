@@ -69,8 +69,33 @@ proto: ## (re)generate *.pb.go from .proto (local toolchain: protoc-gen-go, prot
 .PHONY: proto-check
 proto-check: ## Verify checked-in *.pb.go matches what protoc would emit (ignoring toolchain version comments)
 	@$(MAKE) proto-normalize > /tmp/faas-proto-check.out 2>&1 || (cat /tmp/faas-proto-check.out; exit 1)
+	@$(MAKE) proto-versions-check
 	@git diff --exit-code -- $(PROTO_ROOT) || (echo "generated *.pb.go is out of sync with .proto; run 'make proto' and commit the diff"; exit 1)
 	@echo "proto-check: OK"
+
+# proto-versions-check asserts the no-versions invariant post-regen:
+# after `proto-normalize` strips the inner version lines, the
+# `// versions:` block in every *.pb.go must be empty (only the header
+# line itself, immediately followed by `// source: ...`). Pinned by
+# PR #652 review finding M8; without this check a developer who
+# re-runs `make proto` directly (skipping normalize) would commit
+# `protoc-gen-go vX.Y.Z` lines that change with every toolchain bump
+# and trip CI on the next PR. The check is a static assertion on
+# checked-in files only — does NOT touch the toolchain — so it
+# runs anywhere make(1) does.
+.PHONY: proto-versions-check
+proto-versions-check: ## Static gate: no protoc/protoc-gen-go version lines in any *.pb.go (PR #652 M8)
+	@set -e; \
+	  sentinel=$$(mktemp -u); \
+	  trap 'rm -f "$$sentinel"' EXIT; \
+	  find $(PROTO_ROOT) -name '*_grpc.pb.go' -o -name '*.pb.go' | while read f; do \
+	    if grep -EH '^//[[:space:]]+(protoc-gen-go|protoc)[[:space:]]+v[0-9]' "$$f" >/dev/null; then \
+	      echo "proto-versions-check: $$f contains a toolchain version line; run 'make proto-normalize' and commit the result" >&2; \
+	      touch "$$sentinel"; \
+	    fi; \
+	  done; \
+	  if [ -e "$$sentinel" ]; then exit 1; fi; \
+	  echo "proto-versions-check: OK"
 
 # proto runs codegen then strips the toolchain-version comments
 # (// 	protoc-gen-go v..., // 	protoc v...) from every *.pb.go before

@@ -50,6 +50,12 @@ type runDeps struct {
 	readKeyPEM func() ([]byte, error)
 	httpClient func() githubd.HTTPClient
 	now        func() time.Time
+	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
+	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
+	// log, nil) which exits on violation in production. Tests
+	// inject func() error { return nil } to bypass the live
+	// /proc/self/status check.
+	capCheck func() error
 }
 
 func defaultDeps() runDeps {
@@ -78,8 +84,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// writer, and the age-sealed install-token reads all run
 	// inside the unit's systemd hardening (NoNewPrivileges,
 	// ProtectSystem, PrivateTmp, ReadWritePaths=/run/faas).
-	// Any future cap_ add lands here, not in the unit file.
-	if err := runtimecheck.MustCheckOnBoot(capsDecl, log, nil); err != nil {
+	// Any future cap_ add lands here, not in the unit file. The
+	// capCheck seam (review finding M2) lets tests stub the live
+	// /proc/self/status check.
+	capCheck := deps.capCheck
+	if capCheck == nil {
+		capCheck = func() error { return runtimecheck.MustCheckOnBoot(capsDecl, log, nil) }
+	}
+	if err := capCheck(); err != nil {
 		return err
 	}
 
