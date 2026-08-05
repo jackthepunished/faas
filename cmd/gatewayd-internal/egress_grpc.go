@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"google.golang.org/grpc"
@@ -167,6 +168,27 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 		l.log.Info("gatewayd egress: listening", "addr", l.socketPath)
 	}
 	go func() {
+		// INVESTIGATIVE (PR-I): recover() + stack-trace shim around
+		// grpc.Server.Serve. We have observed the egress listener
+		// fd close in-process even though every code path I can
+		// trace (shutdown defer, signal handler, error path) stays
+		// untouched — only this goroutine would see a panic from
+		// inside gRPC's transport. Capturing the stack here is the
+		// proof we need to either find the culprit or rule out
+		// "panic in the serve loop" entirely.
+		//
+		// Remove once the root cause is identified (PR-H diagnosis
+		// follow-up, 2026-08-05; produced by §15 PR-I on github
+		// branch fix/tier-a7-pr-i-egress-recover-shim).
+		defer func() {
+			if r := recover(); r != nil {
+				l.log.Error("gatewayd egress: serve goroutine panicked",
+					"panic", fmt.Sprintf("%v", r),
+					"socket", l.socketPath,
+					"stack", string(debug.Stack()),
+				)
+			}
+		}()
 		if err := l.server.Serve(lis); err != nil {
 			l.log.Warn("gatewayd egress: serve", "err", err)
 		}
