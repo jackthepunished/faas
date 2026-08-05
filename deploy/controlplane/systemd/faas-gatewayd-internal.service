@@ -42,8 +42,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 # Unix-only listener at /run/faas/gatewayd-internal.sock plus the
-# loopback control plane on 127.0.0.1:9091 (FAAS_PUBLIC_CONTROL_ADDR,
-# per pkg/wire/server.go — read by certsync + the readiness probe).
+# loopback control plane on 127.0.0.1:9090 (FAAS_GATEWAY_CONTROL_LISTEN,
+# per cmd/gatewayd-internal/run.go:118 — read by RunControlServer +
+# the readiness probe). gatewayd-public binds its own control plane
+# at 127.0.0.1:9092 (PR-J) so the two daemons don't race on :9090.
 # All forwarding is via the unix socket to the public daemon and
 # gRPC to per-node schedd/vmmd over loopback mTLS. We never dial
 # external IPs from here.

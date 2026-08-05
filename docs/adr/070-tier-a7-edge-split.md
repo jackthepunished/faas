@@ -176,17 +176,21 @@
     `RestrictAddressFamilies=AF_UNIX AF_INET` (revised 2026-08-04
     after the certmagic strip — drop AF_INET6 because the bind is
     loopback v4).
-11. **Listener boundaries.** `gatewayd-public` owns (revised 2026-08-04):
+11. **Listener boundaries.** `gatewayd-public` owns (revised 2026-08-05
+    per PR-J after the :9090 bind-conflict with gatewayd-internal):
     - `127.0.0.1:8080` plain-HTTP listener (TLS terminates at
       Caddy upstream; certmagic + `:80`/`:443` are gone)
-    - `/healthz`, `/readyz`, `/metrics` on loopback `127.0.0.1:9090`
+    - `/healthz`, `/readyz`, `/metrics` on loopback `127.0.0.1:9092`
+      (was `127.0.0.1:9090` until PR-J; moved to break the
+      bind-conflict with gatewayd-internal which owns :9090)
     - `pkg/httpsec` outer wrapper (HSTS / CSP nonce /
       X-Frame-Options / Referrer-Policy / X-Content-Type-Options /
       Permissions-Policy) — note that HSTS is benign over plain
       HTTP (RFC 6797 §8.1)
     `gatewayd-internal` owns:
     - `/run/faas/gatewayd-internal.sock` (HTTP/1.1)
-    - `/healthz`, `/readyz`, `/metrics` on loopback `:9091`
+    - `/healthz`, `/readyz`, `/metrics` on loopback `:9090`
+      (`FAAS_GATEWAY_CONTROL_LISTEN`)
     - the entire `pkg/gateway/handler.go` surface
       (hostname→app, wake gate, rate limit, forwarder)
 
@@ -195,8 +199,9 @@
 | Env var | Default | Purpose |
 |---|---|---|
 | `FAAS_PUBLIC_LISTEN_ADDR` | `127.0.0.1:8080` | `gatewayd-public`'s plain-HTTP listener (loopback; TLS at Caddy upstream). |
+| `FAAS_PUBLIC_CONTROL_ADDR` | `127.0.0.1:9092` | `gatewayd-public`'s control listener (was `:9090` until PR-J — moved to break the bind-conflict with gatewayd-internal which owns `:9090`). |
 | `FAAS_INTERNAL_SOCKET` | `/run/faas/gatewayd-internal.sock` | Unix socket the public daemon dials. |
-| `FAAS_INTERNAL_CONTROL_ADDR` | `127.0.0.1:9091` | `gatewayd-internal`'s control listener. |
+| `FAAS_INTERNAL_CONTROL_ADDR` | `127.0.0.1:9090` | `gatewayd-internal`'s control listener. |
 | `[ratelimit] mode` | `process` | `process` (legacy) or `central` (Postgres-backed counter). |
 | `FAAS_NODE_ID` / `FAAS_NODE_NAME` | (PG lookup) | Legacy override for `compute_nodes` rows when the legacy daemon was bootstrapped off a fresh box. No consumer in `gatewayd-public` after the certmagic strip; the legacy daemon keeps the lookup, the public daemon does not. |
 | `FAAS_HETZNER_DNS_TOKEN_PATH` / `FAAS_CERT_STORAGE_DIR` / `FAAS_APPS_DOMAIN` / `FAAS_ACME_CONTACT_EMAIL` | (deleted) | Were the certmagic DNS-01 surface; deleted in PR #633 alongside the certmagic strip. |
