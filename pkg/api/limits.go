@@ -526,12 +526,8 @@ var planLimits = map[Plan]Limits{
 		IdleTimeoutS:       60,
 		IncludedGBHours:    50,
 		PriceMillicents:    900_000, // €9.00
-		// ConcurrencyPerVMBound (issue #559): Hobby allows up to
-		// 5 concurrent in-flight requests per VM — tracks Cloud
-		// Run's "smallest paid tier" framing while staying inside
-		// Hobby's 256 MB RAM budget (one Node event loop comfortably
-		// handles 5 concurrent requests, a typical Hobby customer's
-		// usage pattern).
+		// ConcurrencyPerVMBound (issue #559): Hobby = 5 — smallest
+		// paid tier, matches Cloud Run's framing. Spec §4.9.1.
 		ConcurrencyPerVMBound: 5,
 		RateLimitRPS:          20,
 		RateLimitBurst:        100,

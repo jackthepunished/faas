@@ -152,17 +152,21 @@ func cmdApp(args []string) int {
 	// is one integer; --json would be heavier than the text).
 	if *concurrencyOnly {
 		// --concurrency is purely informational. Reject mixing
-		// with any update flag so a customer typing both doesn't
-		// silently PATCH the app.
-		updateFlags := []string{"ram", "max-concurrency", "idle", "min",
-			"autoscale-target-rps", "autoscale-target-cpu-pct",
-			"warm-snapshot", "no-warm-snapshot",
-			"warm-snapshot-min-requests", "warm-snapshot-min-ms"}
-		for _, name := range updateFlags {
-			if explicit := fs.Lookup(name); explicit != nil && explicit.Value.String() != explicit.DefValue {
-				return printErr("Invalid flags",
-					fmt.Errorf("--concurrency cannot be combined with --%s (read-only fast path)", name))
+		// with any other flag — fs.Visit only fires for
+		// explicitly-passed flags, and we reject every flag
+		// except `--concurrency` itself. Inverted-positive-list:
+		// any future write flag added to this command will be
+		// rejected here automatically, without a manual
+		// allow-list to keep in sync.
+		var conflict string
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name != "concurrency" && conflict == "" {
+				conflict = f.Name
 			}
+		})
+		if conflict != "" {
+			return printErr("Invalid flags",
+				fmt.Errorf("--concurrency cannot be combined with --%s (read-only fast path)", conflict))
 		}
 		if jsonOutput {
 			return printErr("Invalid flags",
