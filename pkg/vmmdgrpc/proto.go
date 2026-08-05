@@ -5,6 +5,7 @@
 package vmmdgrpc
 
 import (
+	"context"
 	"net/netip"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
@@ -15,9 +16,28 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+// deploymentIDFromContext (issue #463 / ADR-069 / PR-B AC #1) lifts
+// the per-deployment UUID schedd stamped onto the inbound gRPC MD
+// via wire.WithCorrelationOutgoing(x-faas-deployment-id) at the
+// schedd engine's bootCtx seam (pkg/sched/engine.go:1379). Returns ""
+// for legacy callers that don't stamp the MD (pre-PR-B schedd
+// versions); the Instance.DeploymentID is left empty and the
+// sidecar-init-failed dispatch skips the deploy-row flip on "".
+// ctx must be the inbound server-side ctx (the value passed to the
+// vmmdgrpc handler that owns the toWakeRequest / toColdBootRequest
+// call). The reader tolerates nil ctx — it returns "" — so future
+// callers (e.g. metal tests) can call the converters directly.
+func deploymentIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	corr, _ := wire.CorrelationFromIncoming(ctx)
+	return corr.DeploymentID
+}
+
 // toWakeRequest flattens CreateFromSnapshotRequest into an fcvm.WakeRequest.
 // The caller resolves (app) here; vmmd stores none of it (ADR-014).
-func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, error) {
+func toWakeRequest(ctx context.Context, req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, error) {
 	if req.GetInstance() == "" {
 		return fcvm.WakeRequest{}, api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing instance", "instance is required").
@@ -31,7 +51,13 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 	}
 	snap := req.GetSnapshot()
 	wr := fcvm.WakeRequest{
-		Instance:         req.GetInstance(),
+		Instance: req.GetInstance(),
+		// issue #463 / ADR-069 / PR-B AC #1 — pull the deployment_id
+		// schedd stamped onto the inbound gRPC MD so the vsock DGRAM
+		// sidecar-init-failed dispatch can flip the deployments row
+		// back to status='failed' on init exit. Empty for legacy
+		// callers; the dispatch skips the flip on "".
+		DeploymentID:     deploymentIDFromContext(ctx),
 		BaseKey:          app.GetBaseKey(),
 		LayerKey:         app.GetLayerKey(),
 		VcpuCount:        int(app.GetVcpuCount()),
@@ -130,7 +156,7 @@ func toWakeRequest(req *vmmdpb.CreateFromSnapshotRequest) (fcvm.WakeRequest, err
 
 // toColdBootRequest flattens CreateColdBootRequest into an fcvm.WakeRequest
 // with no snapshot. Same validations as toWakeRequest minus snapshot.
-func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, error) {
+func toColdBootRequest(ctx context.Context, req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, error) {
 	if req.GetInstance() == "" {
 		return fcvm.WakeRequest{}, api.NewProblem(int(codes.InvalidArgument),
 			api.CodeValidation, "Missing instance", "instance is required").
@@ -143,7 +169,14 @@ func toColdBootRequest(req *vmmdpb.CreateColdBootRequest) (fcvm.WakeRequest, err
 			WithDocs("https://" + wire.DocsHost + "/vmmd#appspec")
 	}
 	return fcvm.WakeRequest{
-		Instance:         req.GetInstance(),
+		Instance: req.GetInstance(),
+		// issue #463 / ADR-069 / PR-B AC #1 — see toWakeRequest's
+		// comment. Cold-boot mirrors the deployment_id resolution
+		// so deploy's first boot (which is the cold-boot path,
+		// per spec §9.6) starts with the deployments row stamped
+		// onto the live Instance, ready for the sidecar-init-failed
+		// dispatch to flip on init exit.
+		DeploymentID:     deploymentIDFromContext(ctx),
 		BaseKey:          app.GetBaseKey(),
 		LayerKey:         app.GetLayerKey(),
 		VcpuCount:        int(app.GetVcpuCount()),

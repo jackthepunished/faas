@@ -688,6 +688,16 @@ func reqWithHealthcheck(id, path string) ColdBootRequest {
 	return r
 }
 
+// reqWithDeploymentID mirrors req() but stamps a deployment_id on
+// the WakeRequest (issue #463 / ADR-069 / PR-B AC #1). Used by the
+// deployment-id-propagation test that exercises ColdBoot →
+// WakeRequest → Instance.DeploymentID.
+func reqWithDeploymentID(id, depID string) ColdBootRequest {
+	r := req(id)
+	r.DeploymentID = depID
+	return r
+}
+
 func newTestManager(run Runner, vmm VMM) *Manager {
 	return NewManager(run, vmm, Paths{Kernel: "/srv/fc/base/vmlinux-6.1"}, testFCVersion, nil, nil)
 }
@@ -778,6 +788,35 @@ func TestColdBootSuccessStampsInstanceHealthcheckPath(t *testing.T) {
 	}
 	if inst.HealthcheckPath != "/healthz" {
 		t.Errorf("Instance.HealthcheckPath = %q, want %q (inst=%+v)", inst.HealthcheckPath, "/healthz", inst)
+	}
+	if m.LiveCount() != 1 {
+		t.Errorf("LiveCount = %d, want 1 (the live map should hold the stamped instance)", m.LiveCount())
+	}
+}
+
+// TestColdBootSuccessStampsInstanceDeploymentID pins issue #463 /
+// ADR-069 / PR-B AC #1: when ColdBootRequest carries a deployment_id,
+// the live Instance must carry it so the vsock DGRAM
+// sidecar-init-failed dispatch (cmd/vmmd/framework_ready_recv.go)
+// can flip the deployments row back to status='failed' on init
+// exit without a separate apid pg_notify bridge. Mirror of the
+// PR-C port / PR-D healthcheck propagation tests.
+//
+// A regression that drops the propagation breaks the AC #1
+// end-to-end contract: the dispatch resolves the deployment_id from
+// the live Instance, and a missing stamp leaves "" — the dispatch
+// silently no-ops, the deploy row stays in its current status, and
+// the customer's "deploy failed" UI shows nothing.
+func TestColdBootSuccessStampsInstanceDeploymentID(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm)
+
+	inst, err := m.ColdBoot(context.Background(), reqWithDeploymentID("i1", "dep-1"))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	if inst.DeploymentID != "dep-1" {
+		t.Errorf("Instance.DeploymentID = %q, want %q (inst=%+v)", inst.DeploymentID, "dep-1", inst)
 	}
 	if m.LiveCount() != 1 {
 		t.Errorf("LiveCount = %d, want 1 (the live map should hold the stamped instance)", m.LiveCount())
@@ -1143,6 +1182,68 @@ func TestParkUnknownInstanceReturnsError(t *testing.T) {
 	_, err := m.Park(context.Background(), "ghost", SnapshotSpec{})
 	if err == nil {
 		t.Fatal("expected error parking unknown instance")
+	}
+	if !strings.Contains(err.Error(), "not live") {
+		t.Errorf("error %q missing 'not live'", err.Error())
+	}
+}
+
+// TestInstanceDeploymentIDAndAppID_KnownInstanceReturnsBoth pins the
+// helper added for issue #463 / ADR-069 / PR-B AC #1: the sidecar-
+// init-failed dispatch in vmmd resolves both IDs in a single
+// lock-held read so a Park racing the DGRAM recv returns a
+// consistent pair. The legacy InstanceAppID helper would require
+// two lock acquisitions; the new helper collapses both into one.
+func TestInstanceDeploymentIDAndAppID_KnownInstanceReturnsBoth(t *testing.T) {
+	m := newTestManager(&fakeRunner{}, &fakeVMM{})
+	m.live["inst-x"] = &Instance{
+		AppID:        "app-x",
+		DeploymentID: "dep-x",
+	}
+	depID, appID, err := m.InstanceDeploymentIDAndAppID("inst-x")
+	if err != nil {
+		t.Fatalf("InstanceDeploymentIDAndAppID: %v", err)
+	}
+	if depID != "dep-x" {
+		t.Errorf("deployment_id: got %q, want %q", depID, "dep-x")
+	}
+	if appID != "app-x" {
+		t.Errorf("app_id: got %q, want %q", appID, "app-x")
+	}
+}
+
+// TestInstanceDeploymentIDAndAppID_EmptyDeploymentIDForLegacy
+// pins the empty-deployment-id outcome for pre-PR-B callers. The
+// dispatch path tolerates "" by skipping the deploy-row flip on
+// init_failed — the audit row still lands so the dispatch is
+// observable.
+func TestInstanceDeploymentIDAndAppID_EmptyDeploymentIDForLegacy(t *testing.T) {
+	m := newTestManager(&fakeRunner{}, &fakeVMM{})
+	m.live["inst-y"] = &Instance{
+		AppID:        "app-y",
+		DeploymentID: "",
+	}
+	depID, appID, err := m.InstanceDeploymentIDAndAppID("inst-y")
+	if err != nil {
+		t.Fatalf("InstanceDeploymentIDAndAppID: %v", err)
+	}
+	if depID != "" {
+		t.Errorf("deployment_id: got %q, want empty (legacy)", depID)
+	}
+	if appID != "app-y" {
+		t.Errorf("app_id: got %q, want %q", appID, "app-y")
+	}
+}
+
+// TestInstanceDeploymentIDAndAppID_UnknownReturnsError pins the
+// missing-instance branch: the helper must surface a "not live"
+// error so the dispatch path can log + drop the DGRAM instead of
+// silently no-op'ing (which would mask a real Park race).
+func TestInstanceDeploymentIDAndAppID_UnknownReturnsError(t *testing.T) {
+	m := newTestManager(&fakeRunner{}, &fakeVMM{})
+	_, _, err := m.InstanceDeploymentIDAndAppID("ghost")
+	if err == nil {
+		t.Fatal("expected error on unknown instance")
 	}
 	if !strings.Contains(err.Error(), "not live") {
 		t.Errorf("error %q missing 'not live'", err.Error())

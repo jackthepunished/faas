@@ -5,6 +5,7 @@
 package vmmdgrpc
 
 import (
+	"context"
 	"net/netip"
 	"testing"
 
@@ -45,7 +46,7 @@ func TestToWakeRequest_Happy(t *testing.T) {
 			StorageKey:        "snap/inst-1/mem",
 		},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -77,7 +78,7 @@ func TestToWakeRequest_NoSnapshot(t *testing.T) {
 		Instance: "inst-1",
 		App:      &vmmdpb.AppSpec{BaseKey: "/b"},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -97,7 +98,7 @@ func TestToWakeRequest_EmptySnapshotStorageKey(t *testing.T) {
 		App:      &vmmdpb.AppSpec{BaseKey: "/b"},
 		Snapshot: &vmmdpb.SnapshotRef{StorageKey: ""},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -123,7 +124,7 @@ func TestToWakeRequest_RemoteVmstateShape(t *testing.T) {
 			StorageKey:        "snap/inst-1/mem",
 		},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -143,14 +144,14 @@ func TestToWakeRequest_RemoteVmstateShape(t *testing.T) {
 
 func TestToWakeRequest_MissingInstance(t *testing.T) {
 	req := &vmmdpb.CreateFromSnapshotRequest{App: &vmmdpb.AppSpec{}}
-	if _, err := toWakeRequest(req); err == nil {
+	if _, err := toWakeRequest(context.Background(), req); err == nil {
 		t.Error("missing instance must error")
 	}
 }
 
 func TestToWakeRequest_MissingApp(t *testing.T) {
 	req := &vmmdpb.CreateFromSnapshotRequest{Instance: "i"}
-	if _, err := toWakeRequest(req); err == nil {
+	if _, err := toWakeRequest(context.Background(), req); err == nil {
 		t.Error("missing app must error")
 	}
 }
@@ -160,7 +161,7 @@ func TestToColdBootRequest_Happy(t *testing.T) {
 		Instance: "inst-2",
 		App:      &vmmdpb.AppSpec{BaseKey: "/b", LayerKey: "/l", VcpuCount: 4, MemSizeMib: 512},
 	}
-	wr, err := toColdBootRequest(req)
+	wr, err := toColdBootRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toColdBootRequest: %v", err)
 	}
@@ -174,14 +175,14 @@ func TestToColdBootRequest_Happy(t *testing.T) {
 
 func TestToColdBootRequest_MissingInstance(t *testing.T) {
 	req := &vmmdpb.CreateColdBootRequest{App: &vmmdpb.AppSpec{}}
-	if _, err := toColdBootRequest(req); err == nil {
+	if _, err := toColdBootRequest(context.Background(), req); err == nil {
 		t.Error("missing instance must error")
 	}
 }
 
 func TestToColdBootRequest_MissingApp(t *testing.T) {
 	req := &vmmdpb.CreateColdBootRequest{Instance: "i"}
-	if _, err := toColdBootRequest(req); err == nil {
+	if _, err := toColdBootRequest(context.Background(), req); err == nil {
 		t.Error("missing app must error")
 	}
 }
@@ -255,7 +256,7 @@ func TestToWakeRequest_ForwardsSealedEnv(t *testing.T) {
 		},
 		Snapshot: &vmmdpb.SnapshotRef{StorageKey: "snap/inst-1/mem"},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -277,7 +278,7 @@ func TestToColdBootRequest_ForwardsSealedEnv(t *testing.T) {
 			},
 		},
 	}
-	wr, err := toColdBootRequest(req)
+	wr, err := toColdBootRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toColdBootRequest: %v", err)
 	}
@@ -308,7 +309,7 @@ func TestToWakeRequest_ForwardsPort(t *testing.T) {
 				App:      &vmmdpb.AppSpec{BaseKey: "/b", Port: tt.port},
 				Snapshot: &vmmdpb.SnapshotRef{StorageKey: "snap/inst-1/mem"},
 			}
-			wr, err := toWakeRequest(req)
+			wr, err := toWakeRequest(context.Background(), req)
 			if err != nil {
 				t.Fatalf("toWakeRequest: %v", err)
 			}
@@ -339,7 +340,7 @@ func TestToColdBootRequest_ForwardsPort(t *testing.T) {
 				Instance: "inst-2",
 				App:      &vmmdpb.AppSpec{BaseKey: "/b", Port: tt.port},
 			}
-			wr, err := toColdBootRequest(req)
+			wr, err := toColdBootRequest(context.Background(), req)
 			if err != nil {
 				t.Fatalf("toColdBootRequest: %v", err)
 			}
@@ -373,7 +374,7 @@ func TestToWakeRequest_ForwardsHealthcheckPath(t *testing.T) {
 				App:      &vmmdpb.AppSpec{BaseKey: "/b", HealthcheckPath: tt.path},
 				Snapshot: &vmmdpb.SnapshotRef{StorageKey: "snap/inst-1/mem"},
 			}
-			wr, err := toWakeRequest(req)
+			wr, err := toWakeRequest(context.Background(), req)
 			if err != nil {
 				t.Fatalf("toWakeRequest: %v", err)
 			}
@@ -405,7 +406,7 @@ func TestToColdBootRequest_ForwardsHealthcheckPath(t *testing.T) {
 				Instance: "inst-2",
 				App:      &vmmdpb.AppSpec{BaseKey: "/b", HealthcheckPath: tt.path},
 			}
-			wr, err := toColdBootRequest(req)
+			wr, err := toColdBootRequest(context.Background(), req)
 			if err != nil {
 				t.Fatalf("toColdBootRequest: %v", err)
 			}
@@ -497,7 +498,7 @@ func TestToWakeRequest_WithSidecars(t *testing.T) {
 			},
 		},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -521,7 +522,7 @@ func TestToWakeRequest_NoSidecars(t *testing.T) {
 		Instance: "inst-0",
 		App:      &vmmdpb.AppSpec{BaseKey: "/b", LayerKey: "/l"},
 	}
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toWakeRequest: %v", err)
 	}
@@ -546,7 +547,7 @@ func TestToColdBootRequest_WithSidecars(t *testing.T) {
 			},
 		},
 	}
-	wr, err := toColdBootRequest(req)
+	wr, err := toColdBootRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("toColdBootRequest: %v", err)
 	}

@@ -66,14 +66,11 @@ const (
 )
 
 // Sidecar init-exit status closed enum (issue #463 / ADR-069 /
-// PR-C §3). Pinned at package scope so goconst stops flagging
-// the inline literal at parseFrameworkReadyDatagram's validator
-// (the same enum is used by guest-init's send path and the
-// wire types in sidecar_events_emit.go / sidecar_events_wire.go).
-const (
-	sidecarStatusInitOK     = "init_ok"
-	sidecarStatusInitFailed = "init_failed"
-)
+// PR-C §3, PR-B AC #1). The constants live in
+// cmd/vmmd/sidecar_events_emit.go (platform-neutral, no build
+// tag) so the same source compiles on darwin + linux. This
+// file is //go:build linux; the dispatch consumes the
+// constants from the platform-neutral file.
 
 // frameworkReadyMaxDatagram is the upper bound on the DGRAM
 // body the host will accept. The guest-side wire for type=0x01 is
@@ -259,22 +256,29 @@ func (r *FrameworkReadyReceiver) dispatchFrameworkReady(instance string, warmupM
 
 // dispatchSidecarInitExit (issue #463 / ADR-069 / ADR-071 /
 // PR-C §3): the type=0x02 dispatch path. Resolves the
-// (instance → appID) join via Manager and forwards the wire
-// envelope to the sidecar-event emitter. A failed lookup
-// (the instance parked between the guest's send and our
-// recv) is logged at Debug, not Warn — the audit is
-// best-effort.
+// (instance → appID, deploymentID) join via Manager and
+// forwards the wire envelope to the sidecar-event emitter.
+// A failed lookup (the instance parked between the guest's
+// send and our recv) is logged at Debug, not Warn — the
+// audit is best-effort.
+//
+// PR-B AC #1: deploymentID is resolved via the new
+// InstanceDeploymentIDAndAppID helper (single lock-held
+// read so a Park racing the DGRAM recv returns a consistent
+// pair). Empty deploymentID (legacy pre-PR-B wake) is
+// tolerated — the emitter skips the deploy-row flip on "",
+// but the audit row still lands.
 func (r *FrameworkReadyReceiver) dispatchSidecarInitExit(instance string, wire sidecarInitExitWire) {
 	if wire.Status != sidecarStatusInitOK && wire.Status != sidecarStatusInitFailed {
 		r.log.Warn("sidecar_init_exit unknown status", "instance", instance, "status", wire.Status)
 		return
 	}
-	appID, perr := r.mgr.InstanceAppID(instance)
+	depID, appID, perr := r.mgr.InstanceDeploymentIDAndAppID(instance)
 	if perr != nil {
 		r.log.Debug("sidecar_init_exit unknown instance", "instance", instance, "err", perr)
 		return
 	}
-	r.emitter.EmitSidecarInitExit(r.ctx, instance, appID, "" /* wakeID not on wire — see pkg/events.SidecarInitExit's struct doc */, wire)
+	r.emitter.EmitSidecarInitExit(r.ctx, instance, appID, depID, "" /* wakeID not on wire — see pkg/events.SidecarInitExit's struct doc */, wire)
 	if wire.Status == sidecarStatusInitFailed {
 		// AC #1 surface: a failed init is a hard fail, and
 		// the operator-visible audit must show
@@ -282,7 +286,8 @@ func (r *FrameworkReadyReceiver) dispatchSidecarInitExit(instance string, wire s
 		// on (deployment_id, sidecar) so the deployments UI
 		// can group init-side failures across the fleet.
 		r.log.Error("sidecar_init_exit init_failed (AC #1)",
-			"instance", instance, "app_id", appID, "sidecar", wire.Sidecar,
+			"instance", instance, "app_id", appID, "deployment_id", depID,
+			"sidecar", wire.Sidecar,
 			"exit_code", wire.ExitCode, "duration_ms", wire.DurationMs)
 	}
 }

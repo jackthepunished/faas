@@ -147,9 +147,13 @@ func writeMemoryMax(instance string, planMB int) error {
 // firecracker process and to track per-workload memory events
 // (memory.failcnt, memory.events) for triage. The AC #4 "sidecar
 // OOM doesn't kill main" guarantee is primarily enforced inside
-// the guest by guest-init's per-workload cgroup partition; the
-// host-side leaf is a second line of defense that matters when
-// the host-side firecracker process itself runs away.
+// the guest by guest-init's per-workload cgroup partition
+// (guest/init/cgroup_partition_linux.go — wires mountCgroup2,
+// partitionInto, placeIntoLeaf, and the per-workload
+// memory.max + cgroup.procs writes; see also
+// docs/adr/069-sidecar-containers-init-metrics-hard-cap-2.md).
+// The host-side leaf is a second line of defense that matters
+// when the host-side firecracker process itself runs away.
 //
 // workloadName is the leaf directory name (e.g. "main",
 // "metrics", "logger"); we don't allow "/" or ".." in the name

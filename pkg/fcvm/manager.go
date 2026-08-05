@@ -233,6 +233,17 @@ type Instance struct {
 	// schedd-owned app identity.
 	AppID string
 
+	// DeploymentID (issue #463 / ADR-069 / PR-B AC #1) is the
+	// deployments.id UUID the instance was woken for. Captured at
+	// Wake time from WakeRequest.DeploymentID so the vsock DGRAM
+	// sidecar-init-failed dispatch path can flip the deployments
+	// row to status='failed' with the literal CodeInitSidecarFailed
+	// via state.Store.SetDeploymentFailed — no pg_notify bridge,
+	// no apid round-trip. Empty on legacy single-workload wakes
+	// (pre-PR-B callers don't carry a deployment_id on the wire);
+	// the dispatch path is tolerant of "" and skips the flip.
+	DeploymentID string
+
 	// AllowlistHandleV4 / V6 are the nft handles of the
 	// per-netns allowlist accept rules captured at Wake time (or
 	// at the previous successful UpdateEgressAllowlist). Used by
@@ -720,6 +731,26 @@ func (m *Manager) InstanceAppID(instance string) (string, error) {
 	return inst.AppID, nil
 }
 
+// InstanceDeploymentIDAndAppID (issue #463 / ADR-069 / PR-B AC #1)
+// resolves both the deployment_id and app_id under a single
+// lock-held read so a Park racing a vsock DGRAM recv returns a
+// consistent pair (the alternative — two separate Lock/Unlock
+// sequences — opens a window where Park has cleared the live map
+// between reads and the second call returns "not live" while the
+// first returned a stale id). Empty deployment_id is a legitimate
+// outcome for legacy single-workload wakes (pre-PR-B callers don't
+// carry it on the wire); the sidecar-init-failed dispatch skips
+// the deploy-row flip on "" but still emits the audit row.
+func (m *Manager) InstanceDeploymentIDAndAppID(instance string) (deploymentID, appID string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.live[instance]
+	if !ok {
+		return "", "", fmt.Errorf("fcvm: InstanceDeploymentIDAndAppID %s: not live", instance)
+	}
+	return inst.DeploymentID, inst.AppID, nil
+}
+
 // ForwardStatelessAdvisory is the public Manager seam that turns
 // one guest-init fanotify batch into one apid audit row. The vsock
 // DGRAM receiver in cmd/vmmd calls this with the parsed batch.
@@ -942,8 +973,9 @@ func (m *Manager) stageAPIEnv(instance string, jsonBlob []byte) error {
 // *Path fields used, so single-box behaviour is preserved. Field
 // names changed from *Path → *Key to match the new semantics.
 type WakeRequest struct {
-	Instance string
-	AppID    string // apps.id UUID; PR-B UpdateEgressAllowlist walks live by AppID
+	Instance     string
+	AppID        string // apps.id UUID; PR-B UpdateEgressAllowlist walks live by AppID
+	DeploymentID string // deployments.id UUID; PR-B AC #1 stamps onto Instance so the vsock DGRAM sidecar-init-failed path can flip the deploy row (issue #463 / ADR-069)
 	// AccountID is the apps row's owning account id (issue #301,
 	// ADR-044). Threads onto the wire so vmmd can label the
 	// vmmd_cpu_throttle_seconds_total{account_id, app_id} counter
@@ -1133,6 +1165,14 @@ type ColdBootRequest struct {
 	// the contract. Same symmetry rationale as Port /
 	// HealthcheckPath / EgressAllowlist above.
 	Sidecars []WorkloadSpec
+	// DeploymentID (issue #463 / ADR-069 / PR-B AC #1) is the
+	// deployments.id UUID forwarded verbatim to WakeRequest.DeploymentID.
+	// Mirrors the WakeRequest field's contract: empty = legacy
+	// single-workload wake that doesn't carry a deployment_id on
+	// the wire, and the sidecar-init-failed dispatch skips the
+	// deploy-row flip on "". Same symmetry rationale as Port /
+	// HealthcheckPath above.
+	DeploymentID string
 }
 
 // ColdBoot boots an instance from rootfs with no snapshot. It is Wake with a nil
@@ -1161,6 +1201,12 @@ func (m *Manager) ColdBoot(ctx context.Context, req ColdBootRequest) (*Instance,
 		// per-workload drive + cgroup + manifest stage. Empty
 		// = legacy single-workload path.
 		Sidecars: req.Sidecars,
+		// Issue #463 / ADR-069 / PR-B AC #1: forward the
+		// deployment_id so Wake stamps it onto the live Instance
+		// and the vsock DGRAM sidecar-init-failed dispatch can
+		// flip the deployments row back to status='failed'.
+		// Empty = legacy wake, dispatch no-ops.
+		DeploymentID: req.DeploymentID,
 	})
 }
 
@@ -1440,7 +1486,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			"port_norm_mode", report.PortNormalizationMode)
 	}
 
-	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime}
+	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, DeploymentID: req.DeploymentID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime}
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and
