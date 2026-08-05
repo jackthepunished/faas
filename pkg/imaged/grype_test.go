@@ -37,7 +37,9 @@ package imaged
 // "—" for every row.
 
 import (
+	"bytes"
 	_ "embed"
+	"encoding/json"
 	"testing"
 )
 
@@ -235,10 +237,20 @@ func TestScanResult_ParseGrypeJSON(t *testing.T) {
 
 // TestParseGrypeOutput_EmptyMatches pins the zero-finding
 // contract: a `matches: []` payload returns
-// (*ScanResult{}, nil) with Vulnerabilities == nil so the
-// jsonb omitempty drops the field on the wire and the
-// dashboard renders "No vulnerabilities matched." instead of
-// an empty table with an empty header.
+// (*ScanResult{Vulnerabilities: []Vulnerability{}}, nil)
+// — the Vulnerabilities slice MUST be non-nil but zero-
+// length so the wire JSON emits "vulnerabilities":[] (not
+// "vulnerabilities":null). The OpenAPI schema at
+// api/openapi.yaml:5590 declares the array type without
+// nullable: true; a strict OpenAPI 3.1 client validator
+// rejects null. The marshal-output sub-assertion below
+// pins the wire contract — a regression that returns
+// (*ScanResult{}, nil) (Vulnerabilities == nil) would emit
+// "vulnerabilities":null and fail the marshal check.
+//
+// The dashboard's "No vulnerabilities matched." copy still
+// renders cleanly because Go templates treat both nil and
+// 0-length slices as falsy.
 func TestParseGrypeOutput_EmptyMatches(t *testing.T) {
 	res, err := parseGrypeOutput([]byte(grypeEmptyMatchesJSON), "/srv/fc/jail/empty/rootfs")
 	if err != nil {
@@ -247,11 +259,29 @@ func TestParseGrypeOutput_EmptyMatches(t *testing.T) {
 	if res == nil {
 		t.Fatal("parseGrypeOutput returned nil without error")
 	}
-	if res.Vulnerabilities != nil {
-		t.Errorf("Vulnerabilities = %v, want nil (zero-finding → omitempty)", res.Vulnerabilities)
+	if res.Vulnerabilities == nil {
+		t.Error("Vulnerabilities = nil; want []Vulnerability{} (non-nil empty slice — wire must emit \"vulnerabilities\":[] not null)")
+	}
+	if len(res.Vulnerabilities) != 0 {
+		t.Errorf("len(Vulnerabilities) = %d, want 0", len(res.Vulnerabilities))
 	}
 	if res.SeverityCounts != (SeverityCounts{}) {
 		t.Errorf("SeverityCounts = %+v, want zero value", res.SeverityCounts)
+	}
+
+	// Wire-contract pin: marshal the result and assert the
+	// JSON contains "vulnerabilities":[] (NOT null). This is
+	// the load-bearing assertion — the OpenAPI schema and
+	// strict 3.1 client validators depend on it.
+	blob, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal ScanResult: %v", err)
+	}
+	if !bytes.Contains(blob, []byte(`"vulnerabilities":[]`)) {
+		t.Errorf("wire JSON missing \"vulnerabilities\":[]; got: %s", string(blob))
+	}
+	if bytes.Contains(blob, []byte(`"vulnerabilities":null`)) {
+		t.Errorf("wire JSON emitted \"vulnerabilities\":null (must be [] for OpenAPI 3.1 strict clients); got: %s", string(blob))
 	}
 }
 

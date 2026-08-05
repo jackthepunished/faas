@@ -78,6 +78,15 @@ type ScanResult struct {
 	// upstream JSON). The dashboard's "top 10" view
 	// sorts+truncates this client-side. The /scan route
 	// returns the full list.
+	//
+	// ALWAYS present (no omitempty). For a zero-finding
+	// scan the slice is empty but non-nil so the wire
+	// JSON emits "vulnerabilities":[] (never null). The
+	// OpenAPI schema at api/openapi.yaml:5590 declares
+	// the array type without nullable: true; a strict
+	// OpenAPI 3.1 client validator rejects null. PR #656
+	// review finding #1 closed this gap by initialising
+	// the slice in parseGrypeOutput.
 	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
 	// Error is the grype runner's last error message on a
 	// failed scan (Status = "failed"). Empty on every

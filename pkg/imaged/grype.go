@@ -156,11 +156,16 @@ func parseGrypeOutput(raw []byte, dir string) (*ScanResult, error) {
 		return nil, fmt.Errorf("imaged: grype scan dir %q: parse json: %w", dir, err)
 	}
 	if len(out.Matches) == 0 {
-		// Zero-finding scan: return *ScanResult with no
-		// Vulnerabilities slice. The jsonb omitempty drops
-		// the field entirely; the sidecar still reads the
-		// zero-valued SeverityCounts cleanly.
-		return &ScanResult{}, nil
+		// Zero-finding scan: return *ScanResult with an
+		// empty (NOT nil) Vulnerabilities slice so the
+		// wire JSON emits "vulnerabilities":[] (not
+		// null). The OpenAPI schema at
+		// api/openapi.yaml:5590 declares the array type
+		// without nullable: true; a strict OpenAPI 3.1
+		// client validator rejects null. The base-ext4
+		// sidecar (writeScanSidecar) reads only
+		// SeverityCounts which is zero-valued either way.
+		return &ScanResult{Vulnerabilities: []Vulnerability{}}, nil
 	}
 	res := &ScanResult{Vulnerabilities: make([]Vulnerability, 0, len(out.Matches))}
 	for _, m := range out.Matches {
@@ -235,16 +240,24 @@ func vulnPaths(locs []grypeLocation) []string {
 // underlying cause; not surfaced on the success path.
 //
 // Vulnerabilities carries the full CVE list in Grype's natural
-// output order (most-severe-first in the upstream JSON). The
-// `,omitempty` keeps the jsonb compact for zero-finding scans.
+// output order (most-severe-first in the upstream JSON).
+// ALWAYS present on the wire (no omitempty) — parseGrypeOutput
+// initialises the slice to []Vulnerability{} for zero-finding
+// scans so the marshal output is "vulnerabilities":[] (not
+// null). The OpenAPI schema at api/openapi.yaml:5590 declares
+// the array type without nullable: true; a strict OpenAPI 3.1
+// client validator rejects null. Empty-slice vs nil is the
+// distinction the wire contract relies on.
 type ScanResult struct {
 	SeverityCounts
-	// Vulnerabilities is the full typed CVE list.
-	// omitempty drops the field for zero-finding scans
-	// (the closed enum [CRITICAL|HIGH|...] lets the
-	// dashboard render an all-zero severity bucket on a
-	// scan with no findings).
-	Vulnerabilities []Vulnerability `json:"vulnerabilities,omitempty"`
+	// Vulnerabilities is the full typed CVE list, ALWAYS
+	// present (no omitempty). For a zero-finding scan
+	// (len(out.Matches) == 0 in parseGrypeOutput) the
+	// slice is []Vulnerability{} so the wire JSON
+	// emits "vulnerabilities":[] — never null. See
+	// api/openapi.yaml:5590 (no nullable: true) and the
+	// TestParseGrypeOutput_EmptyMatches pin.
+	Vulnerabilities []Vulnerability `json:"vulnerabilities"`
 	// Error is the grype-runner error message stamped on the
 	// scan_status='failed' path (PR-3 retry-exhausted backoff).
 	// Empty on success. Marshalled with omitempty so a successful
