@@ -5222,6 +5222,11 @@ components:
           type: integer
           minimum: 0
           description: "Per-deployment cold-wake floor override (issue #557 closure / ADR-072). 0 = inherit from parent app (default); positive value is the deployment's own floor. Effective per-instance floor = max(app.EffectiveMinInstances(), d.EffectiveMinInstances()). Validated against the parent app's plan MaxMinInstances cap on PATCH."
+        scan:
+          oneOf:
+            - $ref: '#/components/schemas/ScanResult'
+            - type: 'null'
+          description: "Per-deploy grype CVE scan surface (issue #464 / ADR-055). nil on pre-feature rows (the migration backfilled scan_status='skipped' + scan_result={reason: 'pre-feature'} on those; the apid read path returns nil so the dashboard / CLI see a clean absence — the /scan route surfaces the 'skipped' sentinel for those rows). Non-nil for post-feature rows in any of the {pending, complete, failed, skipped} states. The customer can deploy a CRITICAL-CVE image; the dashboard shows it; that is the contract (no enforcement at the deploy gate)."
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
@@ -5495,6 +5500,78 @@ components:
         interval_s: { type: integer, minimum: 0, description: "Probe interval in seconds; 0 = use image default." }
         timeout_s:  { type: integer, minimum: 0, description: "Probe timeout in seconds; 0 = use image default." }
         retries:    { type: integer, minimum: 0, description: "Consecutive failures before the instance is considered unhealthy; 0 = use image default." }
+
+    ScanResult:
+      description: |
+        Per-deploy grype CVE scan result (issue #464 / ADR-055). Surfaced on
+        GET /v1/deployments/{id} (additive DeploymentResponse.Scan field) and
+        on GET /v1/deployments/{id}/scan (the dedicated drill-down route).
+        The dashboard renders the severity counts and the top 10 CVEs;
+        `gregale deployment <id> --show-scan` prints the full payload.
+        Surface, never enforce — an image with CRITICAL CVEs deploys
+        successfully; the dashboard shows it; that is the contract.
+      type: object
+      required: [status, severity_counts, vulnerabilities]
+      properties:
+        status:
+          type: string
+          enum: [pending, complete, failed, skipped]
+          description: |
+            Closed enum mirroring the deployments.scan_status column.
+            `pending` = grype run started, not finished yet;
+            `complete` = grype run finished, scan carries the findings;
+            `failed` = grype run errored after the 1-retry backoff, scan carries the last error in `error`;
+            `skipped` = pre-feature row (the migration backfilled this on every row that predates 00135).
+        scanned_at:
+          type: [string, "null"]
+          format: date-time
+          description: Wall clock the grype run completed (RFC 3339 UTC). Empty when status != "complete". Distinct from deployments.created_at — the deploy ships before the scan lands (AC #1: scan within 5 min of status: live, not at the same instant).
+        scanner_version:
+          type: [string, "null"]
+          description: Grype binary version that produced the scan (e.g. "grype 0.78.0"). Captured once at imaged startup via `grype version` and stamped on every ScanResult payload.
+        image_digest:
+          type: [string, "null"]
+          description: OCI image digest at the time of the scan. Sourced from deployments.image_digest, not re-inspected. Empty on the pre-feature backfill (status = "skipped" with no image to stamp).
+        severity_counts:
+          $ref: '#/components/schemas/SeverityCounts'
+        vulnerabilities:
+          type: array
+          items: { $ref: '#/components/schemas/Vulnerability' }
+          description: Full CVE list, ordered by Grype's natural output (most-severe-first). The dashboard's "top 10" view sorts+truncates client-side. The /scan route returns the full list.
+        error:
+          type: [string, "null"]
+          description: Grype runner's last error message on a failed scan (status = "failed"). Empty on every other status. The PR-3 sink captures the message after the 1-retry backoff is exhausted.
+
+    SeverityCounts:
+      description: |
+        Per-bucket count of CVEs in Grype's closed vocabulary
+        (CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN). Negligible collapses into LOW
+        (matches the existing pkg/imaged.grype.go::normalizeGrypeSeverity
+        convention). All fields present without omitempty so the JSON shape
+        is uniform — the dashboard reads counts without nil checks.
+      type: object
+      required: [critical, high, medium, low, unknown]
+      properties:
+        critical: { type: integer, minimum: 0 }
+        high:     { type: integer, minimum: 0 }
+        medium:   { type: integer, minimum: 0 }
+        low:      { type: integer, minimum: 0 }
+        unknown:  { type: integer, minimum: 0 }
+
+    Vulnerability:
+      description: One row in the scan's CVE list.
+      type: object
+      required: [id, severity, package, version]
+      properties:
+        id:       { type: string, description: "CVE id (e.g. CVE-2024-1234)." }
+        severity: { type: string, enum: [CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN] }
+        package:  { type: string, description: "Vulnerable package name (e.g. openssl)." }
+        version:  { type: string, description: "Installed package version (e.g. 1.1.1k-7)." }
+        fixed_in: { type: [string, "null"], description: "Upstream version the fix landed in. Empty when no fix is available (e.g. disputed CVE) — the dashboard renders 'no fix' for empty." }
+        paths:
+          type: array
+          items: { type: string }
+          description: List of filesystem paths inside the app-layer squashfs where the vulnerable package was found. Empty when Grype can't pin a file location.
 
     Sidecar:
       description: |
