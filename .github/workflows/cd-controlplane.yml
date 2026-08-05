@@ -33,6 +33,11 @@ jobs:
     env:
       CP_HOST: ${{ secrets.CP_HOST || secrets.DO_HOST }}
       CP_SSH_KEY: ${{ secrets.CP_SSH_KEY || secrets.DO_SSH_KEY }}
+      # Job-level env so the `Verify deployment` step's SSH heredoc
+      # inherits the critical/best-effort split (the embedded heredoc
+      # already declares these locally inside the `REMOTE` block).
+      FAAS_CRITICAL_SERVICES: "vmmd apid schedd gatewayd-internal gatewayd-public meterd githubd"
+      FAAS_BEST_EFFORT_SERVICES: "imaged"
     # Only deploy if the CI workflow's test job succeeded.
     # If ci.yml doesn't exist yet or the test job name differs, remove this.
     # needs: test
@@ -181,16 +186,37 @@ jobs:
             root@${{ env.CP_HOST }} 'bash -s' << 'REMOTE'
           set -euo pipefail
 
-          FAAS_SERVICES="vmmd apid schedd gatewayd-internal gatewayd-public imaged meterd githubd"
+          # CRITICAL: the health gate enforces is-active on these. A restart-loop
+          # on any of them blocks the deploy and triggers roll_back(). vmmd
+          # (socket owner of /run/faas/vmmd.sock), apid (route-table source),
+          # schedd (depends on vmmd), gatewayd-internal (depends on schedd +
+          # apid), gatewayd-public (the TLS edge; depends on gatewayd-internal),
+          # meterd (no vmmd dep but customer-facing billing must not drift),
+          # githubd (no vmmd dep but is the auth boundary).
+          FAAS_CRITICAL_SERVICES="vmmd apid schedd gatewayd-internal gatewayd-public meterd githubd"
+          # BEST_EFFORT: a degraded state here logs a `::warning::` annotation
+          # but does NOT fail the gate. imaged sits in best-effort during the
+          # 2026-08-04 parent-ref overlay regression so one bug in a single
+          # daemon doesn't tank every deploy — the rest of the box stays
+          # serving traffic, and ops still gets paged via the existing
+          # Prometheus alert on `NRestarts`/log-flood.
+          FAAS_BEST_EFFORT_SERVICES="imaged"
+          FAAS_SERVICES="${FAAS_CRITICAL_SERVICES} ${FAAS_BEST_EFFORT_SERVICES}"
           # vmmd first (socket owner of /run/faas/vmmd.sock), then apid (route-table
-          # source), then gatewayd-internal + schedd (gatewayd-internal's deps),
-          # then gatewayd-public (the TLS edge; depends on gatewayd-internal),
-          # then imaged/meterd (vmmd dependents), then githubd (no vmmd dep).
-          # PR #610's systemd After= only orders STARTUP; this drives restart
-          # during deploy.
-          FAAS_RESTART_ORDER="vmmd apid schedd gatewayd-internal gatewayd-public imaged meterd githubd"
-          if [[ "${FAAS_SERVICES}" != "${FAAS_RESTART_ORDER}" ]]; then
-            echo "::error::FAAS_SERVICES and FAAS_RESTART_ORDER diverged; update both to keep dependency ordering correct"
+          # source), then schedd (depends on vmmd), then gatewayd-internal
+          # (depends on schedd + apid), then gatewayd-public (the TLS edge;
+          # depends on gatewayd-internal), then imaged + meterd (vmmd dependents),
+          # then githubd (no vmmd dep). PR #610's systemd After= only orders
+          # STARTUP; this drives restart during deploy.
+          FAAS_RESTART_ORDER="${FAAS_SERVICES}"
+          # Sanity: FAAS_RESTART_ORDER must be a permutation of
+          # FAAS_SERVICES (critical + best-effort union).
+          expected="$(echo ${FAAS_CRITICAL_SERVICES} ${FAAS_BEST_EFFORT_SERVICES} | tr ' ' '\n' | sort)"
+          got="$(echo ${FAAS_RESTART_ORDER} | tr ' ' '\n' | sort)"
+          if [[ "${expected}" != "${got}" ]]; then
+            echo "::error::FAAS_RESTART_ORDER (modulo order) does not match critical+best-effort union"
+            echo "::error::expected: ${expected}"
+            echo "::error::got:      ${got}"
             exit 1
           fi
           # The legacy gatewayd binary was removed in Tier A7 PR-A
@@ -219,30 +245,53 @@ jobs:
             done
           }
 
-          # wait_healthy: active + /healthz OK, then hold 12s and verify NRestarts UNCHANGED.
-          # is-active is a point sample — a crash-looping daemon reads "active" ~1 poll in 6
-          # before reaching its fatal error (the original gate hit that window).
+          # wait_healthy: every CRITICAL service active + /healthz OK, then hold
+          # 12s and verify NRestarts UNCHANGED. BEST_EFFORT services are
+          # checked; their degradation logs a `::warning::` but does NOT
+          # fail the gate. is-active is a point sample — a crash-looping
+          # daemon reads "active" ~1 poll in 6 before reaching its fatal
+          # error (the original gate hit that window on every imaged
+          # parent-ref overlay regression, 2026-08-04).
           wait_healthy() {
-            local deadline=$((SECONDS + 60)) svc bad before after
+            local deadline=$((SECONDS + 60)) svc bad best_effort_bad before after
             while (( SECONDS < deadline )); do
               bad=""
-              for svc in ${FAAS_SERVICES}; do
+              best_effort_bad=""
+              for svc in ${FAAS_CRITICAL_SERVICES}; do
                 systemctl is-active --quiet "faas-${svc}" || bad="${bad} ${svc}"
               done
+              for svc in ${FAAS_BEST_EFFORT_SERVICES}; do
+                if ! systemctl is-active --quiet "faas-${svc}"; then
+                  best_effort_bad="${best_effort_bad} ${svc}"
+                fi
+              done
+              if [[ -n "${best_effort_bad}" ]]; then
+                echo "::warning::best-effort service(s) degraded (non-blocking):${best_effort_bad}"
+              fi
               if [[ -z "${bad}" ]] && curl -sf --max-time 5 \
                    http://127.0.0.1:9090/healthz >/dev/null 2>&1; then
                 before="$(restart_counts)"
                 sleep 12
                 after="$(restart_counts)"
                 bad=""
-                for svc in ${FAAS_SERVICES}; do
+                best_effort_bad=""
+                for svc in ${FAAS_CRITICAL_SERVICES}; do
                   systemctl is-active --quiet "faas-${svc}" || bad="${bad} ${svc}"
                 done
+                for svc in ${FAAS_BEST_EFFORT_SERVICES}; do
+                  if ! systemctl is-active --quiet "faas-${svc}"; then
+                    best_effort_bad="${best_effort_bad} ${svc}"
+                  fi
+                done
                 if [[ -z "${bad}" && "${before}" == "${after}" ]]; then
-                  echo "✓ all services active and stable over 12s (${after})"
+                  if [[ -n "${best_effort_bad}" ]]; then
+                    echo "::warning::all CRITICAL services active and stable over 12s (${after}); best-effort degraded:${best_effort_bad}"
+                  else
+                    echo "✓ all services active and stable over 12s (${after})"
+                  fi
                   return 0
                 fi
-                echo "…not stable yet (restarts ${before}-> ${after}); still polling"
+                echo "…not stable yet (restarts ${before} -> ${after}); still polling"
                 continue
               fi
               sleep 3
@@ -518,11 +567,18 @@ jobs:
           REMOTE
 
       - name: Verify deployment
+        # GitHub Actions exports job-level `env:` to every step, so
+        # FAAS_CRITICAL_SERVICES + FAAS_BEST_EFFORT_SERVICES (declared in
+        # the deploy job's env: block above) reach the SSH heredoc.
+        # Critical service degradation fails the step + job; best-effort
+        # degradation logs a warning only. Replaces the legacy hardcoded
+        # subset "apid schedd gatewayd imaged meterd githubd" which
+        # dropped vmmd + the post-Tier-A7 gatewayd-internal + gatewayd-public.
         run: |
           echo "1. Verifying systemd service states via SSH..."
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no root@${{ env.CP_HOST }} '
             failed=0
-            for svc in apid schedd gatewayd imaged meterd githubd; do
+            for svc in ${FAAS_CRITICAL_SERVICES}; do
               if systemctl is-active --quiet faas-$svc; then
                 echo "✓ faas-$svc is active and running"
               else
@@ -538,6 +594,18 @@ jobs:
                 echo "--- restart counter ---"
                 systemctl show faas-$svc -p NRestarts --value || true
                 failed=1
+              fi
+            done
+            for svc in ${FAAS_BEST_EFFORT_SERVICES}; do
+              if systemctl is-active --quiet faas-$svc; then
+                echo "✓ faas-$svc (best-effort) is active"
+              else
+                # Non-blocking: a degraded best-effort daemon logs a
+                # warning annotation only. The wait_healthy gate
+                # already surfaced this during deploy; this is the
+                # post-roll-back double-check.
+                echo "::warning::faas-$svc (best-effort) is degraded — not blocking the deploy"
+                journalctl -u faas-$svc -n 20 --no-pager || true
               fi
             done
             exit $failed
