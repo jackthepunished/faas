@@ -10,7 +10,11 @@ Wants=faas-cp.slice faas-apid.service faas-gatewayd-internal.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gatewayd-public
+# Tier A7 / PR-D (2026-08-04): cd-controlplane.yml's "Install binaries"
+# step writes binaries to /opt/faas/bin/. The legacy
+# /usr/local/bin/gatewayd-public path was the pre-PR-D ship path;
+# this unit aligns with the rest of the deploy tree.
+ExecStart=/opt/faas/bin/gatewayd-public
 Restart=on-failure
 RestartSec=2s
 
@@ -21,6 +25,23 @@ MemoryMax=512M
 # (api.gregale.dev). No low-port bind, no TLS termination in this
 # daemon — CAP_NET_BIND_SERVICE is therefore unused.
 AmbientCapabilities=
+
+# Control listener (PR-J / 2026-08-05). The default control_addr
+# (127.0.0.1:9090) is the SAME port gatewayd-internal binds for its
+# control plane. Both daemons were launched with that default
+# (gatewayd-public ran without --config; gatewayd-internal's
+# /etc/faas/gatewayd-internal.toml was never shipped by
+# cd-controlplane.yml). They fought for :9090 every restart cycle,
+# the loser dying with `bind: address already in use` and taking the
+# egress listener fd with it via the stop() defer — meterd then
+# log-flooded from the missing /run/faas/gatewayd-egress.sock and
+# OOM-killed (run 31121004495, run 30987332162 post-#639).
+#
+# Pick a port the rest of the platform doesn't claim: apid control is
+# :9101, schedd control is :9091, prometheus-node-exporter is :9100,
+# prometheus is :9095, leaving :9092 free for gatewayd-public's
+# control. Read by cmd/gatewayd-public/main.go:154 (envOr("FAAS_PUBLIC_CONTROL_ADDR")).
+Environment=FAAS_PUBLIC_CONTROL_ADDR=127.0.0.1:9092
 
 # Hardening baseline — gatewayd-public is NOT root; runs as faas:faas.
 User=faas
