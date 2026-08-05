@@ -365,6 +365,16 @@ const (
 	CodeSidecarInvalidRamMB     = "sidecar_invalid_ram_mb"
 	CodeSidecarNotAllowedOnPlan = "sidecar_not_allowed_on_plan"
 
+	// CodeInitSidecarFailed (issue #463 / ADR-069 / PR-B AC #1) is
+	// the RFC 7807 stable code vmmd stamps onto a deployments row
+	// when an `init` sidecar exec returns a non-zero exit before
+	// framework-ready. Distinct from the DTO-side validation codes
+	// above because this is a runtime failure (the customer shape
+	// was fine; the workload itself failed). Surfaced via
+	// state.Store.SetDeploymentFailed(error_code = CodeInitSidecarFailed)
+	// so the SDK can branch on the literal code, not on prose.
+	CodeInitSidecarFailed = "init_sidecar_failed"
+
 	// Move 1 event-shaped surfaces (spec §4.4, §4.9). The CLI exit-code
 	// table treats them as 403/422/402; surfacing the codes separately
 	// lets the dashboard render a "move to Scale to lift the cap"

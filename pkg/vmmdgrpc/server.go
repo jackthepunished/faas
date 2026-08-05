@@ -295,7 +295,7 @@ func (s *Server) Register(g *grpc.Server) {
 func (s *Server) CreateFromSnapshot(ctx context.Context, req *vmmdpb.CreateFromSnapshotRequest) (*vmmdpb.WakeResponse, error) {
 	const op = "CreateFromSnapshot"
 	start := time.Now()
-	wr, err := toWakeRequest(req)
+	wr, err := toWakeRequest(ctx, req)
 	if err != nil {
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(toProblem(err))
@@ -320,7 +320,7 @@ func (s *Server) CreateFromSnapshot(ctx context.Context, req *vmmdpb.CreateFromS
 func (s *Server) CreateColdBoot(ctx context.Context, req *vmmdpb.CreateColdBootRequest) (*vmmdpb.WakeResponse, error) {
 	const op = "CreateColdBoot"
 	start := time.Now()
-	wr, err := toColdBootRequest(req)
+	wr, err := toColdBootRequest(ctx, req)
 	if err != nil {
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(toProblem(err))
