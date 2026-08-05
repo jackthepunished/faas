@@ -137,6 +137,13 @@ type AppResponse struct {
 	// current target. Plan-gated upstream.
 	AutoscaleTargetRPS    int `json:"autoscale_target_rps"`
 	AutoscaleTargetCPUPct int `json:"autoscale_target_cpu_pct"`
+	// EvictionPriority (issue #475) is the per-app eviction tier
+	// classification. 'best_effort' (default for every pre-#475
+	// row, applied by the column DEFAULT at migration time) keeps
+	// the historical LRU-by-last_request_at reaper behaviour;
+	// 'reserved' (Hobby+ only, per-account cap enforced) protects
+	// the app from cross-account RAM-pressure eviction.
+	EvictionPriority string `json:"eviction_priority"`
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart

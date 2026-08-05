@@ -140,6 +140,15 @@ func cmdApp(args []string) int {
 	// existing `gregale app <slug>` command so a customer doesn't
 	// need a second command tree for a one-line query.
 	concurrencyOnly := fs.Bool("concurrency", false, "print only the per-VM concurrency bound for the app's plan (issue #559)")
+	// Issue #475: per-app eviction tier. The CLI uses a single
+	// string flag rather than the warm-snapshot's boolean pair
+	// because the closed enum has only two values
+	// ('best_effort' | 'reserved'); a --eviction-priority=reserved
+	// flip-down to 'best_effort' is just `...=best_effort` with no
+	// separate opt-out flag. The plan gate (Free + reserved = 402)
+	// and the per-account cap (Hobby 1, Pro 2, Scale 4) are
+	// enforced server-side.
+	evictPriority := fs.String("eviction-priority", "", "per-app eviction tier: 'best_effort' (default) or 'reserved' (Free rejected; Hobby 1, Pro 2, Scale 4 apps per account)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -235,10 +244,23 @@ func cmdApp(args []string) int {
 		v := *warmMinMs
 		req.WarmSnapshotMinMs = &v
 	}
+	// Issue #475: per-app eviction tier. The CLI uses a single
+	// string flag — the closed enum is 'best_effort' | 'reserved'
+	// (and any other value gets a clean 422 from the apid bounds
+	// check). We validate the value locally too so a CLI typo
+	// surfaces as a usage error before the round-trip.
+	if explicit["eviction-priority"] {
+		v := *evictPriority
+		if v != "best_effort" && v != "reserved" {
+			return printErr("Invalid --eviction-priority", fmt.Errorf("must be 'best_effort' or 'reserved'; got %q", v))
+		}
+		req.EvictionPriority = &v
+	}
 
 	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
 		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
-		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil {
+		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil &&
+		req.EvictionPriority == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)
@@ -305,6 +327,18 @@ func cmdApp(args []string) int {
 		}
 		fmt.Printf("%-30s %d\n", "warm snapshot min requests:", a.WarmSnapshotMinRequests)
 		fmt.Printf("%-30s %d ms\n", "warm snapshot min ms:", a.WarmSnapshotMinMs)
+		// Issue #475: surface the per-app eviction tier so the
+		// customer can verify their PATCH round-tripped. The
+		// empty-string fallback matches the historical default
+		// ('best_effort') for pre-#475 rows — the column was
+		// added with a NOT NULL DEFAULT 'best_effort', so any
+		// pre-PR row will surface as 'best_effort' after the
+		// migration applies.
+		if a.EvictionPriority == "" {
+			fmt.Printf("%-30s %s\n", "eviction priority:", "best_effort")
+		} else {
+			fmt.Printf("%-30s %s\n", "eviction priority:", a.EvictionPriority)
+		}
 		fmt.Printf("%-30s %s\n", "status:", a.Status)
 		return 0
 	}

@@ -478,6 +478,46 @@ catching malformed PromQL or dangling matchers at PR time.
 
 Post-M8 = private beta (founding doc M2–M3 hand-held phase).
 
+### Post-M8 — per-app reserved eviction tier (issue #475). ✅ (this PR)
+
+Customer-facing opt-in to a reserved tier that protects an app
+from cross-account RAM-pressure eviction. Closed 6-tuple counter
+set pre-instantiated at boot; idle-still-park guarantee enforced
+by leaving `ReapIdle` and `ReapAggressive` unchanged.
+
+- **Schema** — `apps.eviction_priority` text NOT NULL DEFAULT
+  'best_effort' + `apps_eviction_priority_chk` CHECK
+  (migration 00135; replay-safe via ADD COLUMN IF NOT EXISTS +
+  DO-block `pg_catalog.pg_constraint` guard). Pre-#475 rows stay
+  on the historical LRU path bit-for-bit.
+- **Plan tier** — `Plan.EvictionPriorityReservedAllowed` (Free = false,
+  Hobby / Pro / Scale = true) + `Plan.ReservedConcurrencyPerAccount`
+  (Hobby 1, Pro 2, Scale 4). The cap counts APPS, not instances
+  (issue #475 binding interpretation).
+- **Reaper** — `SelectEvictions` sort comparator prepends a tier
+  early-out (best_effort before reserved) so cross-account RAM
+  pressure parks every best_effort candidate before any reserved.
+  `ReapIdle` and `ReapAggressive` are intentionally unchanged.
+- **Counter** — `schedd_evicted_priority_total{priority, reason}`
+  (priority ∈ {best_effort, reserved}, reason ∈ {idle,
+  eviction_aggressive, eviction_ram}). Pre-instantiated so the
+  §12 panel has zero rows from idle fleet.
+- **apid PATCH** — `PATCH /v1/apps/{slug}` accepts
+  `eviction_priority`. 402 `plan_eviction_priority_reserved_not_allowed`
+  on Free; 422 `plan_eviction_priority_reserved_quota` when the
+  per-account cap is exhausted. 422 `validation_failed` for any
+  value other than the closed set. Audit kind
+  `app.eviction_priority_changed` (subject `&acct.ID`) emitted
+  from apid only on actual value change.
+- **SDK** — `sdk/go::Client.SetAppEvictionPriority(ctx, slug,
+  priority)` thin one-liner + `UpdateAppRequest.EvictionPriority
+  *string` for bundled PATCH payloads.
+- **CLI** — `gregale app <slug> --eviction-priority=best_effort|reserved`
+  (Free rejected server-side). Text output surfaces the current
+  tier alongside the other per-app knobs.
+
+ADR-075 / issue #475 / migration 00135.
+
 ## What's next
 
 M0 → M8 are the spec-defined milestones (spec §14, lines 444–461).

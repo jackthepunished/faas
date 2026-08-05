@@ -380,6 +380,15 @@ type AppResponse struct {
 	// dashboards can show "streaming on / off" alongside the
 	// egress-allowlist flag.
 	StreamingEnabled bool `json:"streaming_enabled"`
+	// EvictionPriority (issue #475) is the per-app eviction tier
+	// classification. 'best_effort' (default for every pre-#475
+	// row, applied by the column DEFAULT at migration time) keeps
+	// the historical LRU-by-last_request_at reaper behaviour;
+	// 'reserved' (Hobby+ only, per-account cap enforced) protects
+	// the app from cross-account RAM-pressure eviction. Surfaces
+	// in `gregale app <slug>` text output and the JSON view so
+	// customers can verify their PATCH round-tripped.
+	EvictionPriority string `json:"eviction_priority"`
 	// ScalingPolicy is the per-app autoscaling configuration (issue
 	// #462 / ADR-058). The struct is the wire DTO for the on-disk
 	// jsonb column `apps.scaling_policy`; the in-memory state type
