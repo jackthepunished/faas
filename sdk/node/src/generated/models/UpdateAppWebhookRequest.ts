@@ -2,6 +2,12 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+/**
+ * Partial update of an existing webhook subscription. Every
+ * field is optional — the handler merges the supplied fields
+ * onto the current row. omit a field to leave it unchanged.
+ *
+ */
 export type UpdateAppWebhookRequest = {
   target_url?: string;
   webhook_secret?: string;

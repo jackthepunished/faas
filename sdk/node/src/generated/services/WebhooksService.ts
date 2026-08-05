@@ -217,7 +217,7 @@ export class WebhooksService {
    * returned in the response — the body carries the masked
    * constant + rotated_at only.
    *
-   * @returns RotateAppWebhookSecretResponse Rotation succeeded.
+   * @returns RotateAppWebhookSecretResponse Webhook secret rotation succeeded.
    * @throws ApiError
    */
   public static rotateAppWebhookSecret({
@@ -275,7 +275,13 @@ export class WebhooksService {
      * 32-hex-char opaque ID (NOT canonical UUID).
      */
     id: string,
+    /**
+     * Page size (1..100; default 50).
+     */
     pageSize?: number,
+    /**
+     * Opaque cursor from the previous page's next_token.
+     */
     pageToken?: string,
   }): CancelablePromise<AppWebhookDeliveryListResponse> {
     return __request(OpenAPI, {
@@ -323,6 +329,9 @@ export class WebhooksService {
      * 32-hex-char opaque ID (NOT canonical UUID).
      */
     id: string,
+    /**
+     * Delivery id (32-hex-char UUID).
+     */
     did: string,
   }): CancelablePromise<AppWebhookRetryDeliveryResponse> {
     return __request(OpenAPI, {

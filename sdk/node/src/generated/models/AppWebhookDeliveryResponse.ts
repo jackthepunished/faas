@@ -2,6 +2,14 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+/**
+ * One row per (event × target) emission. The dispatcher mutates
+ * this row in place as attempts progress; the GET /deliveries
+ * endpoint returns this shape per row. attempt=7 + status='dead'
+ * is the DLQ state; the customer-facing retry endpoint flips a
+ * dead row back to status='pending' for one more shot.
+ *
+ */
 export type AppWebhookDeliveryResponse = {
   id: string;
   webhook_id: string;
