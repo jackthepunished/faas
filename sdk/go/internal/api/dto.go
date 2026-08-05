@@ -944,3 +944,95 @@ type ScanResult struct {
 	Vulnerabilities []ScanVulnerability `json:"vulnerabilities"`
 	Err             string              `json:"error,omitempty"`
 }
+
+// --- Webhook delivery (issue #476 / ADR-076) -----------------------------
+// --- Webhook delivery (issue #476 / ADR-076) -----------------------------
+//
+// Wire shape mirrors pkg/api/webhooks.go. Field names follow the
+// openapi.yaml kebab-case convention (target_url, event_filter, …)
+// so the embedded copy in pkg/apid/openapi.yaml stays in sync with
+// `make spec-sync`. All secret fields are surfaced as
+// `WebhookSecretSealedMasked` constants; the only call that returns
+// the plaintext is RotateAppWebhookSecretResponse.WebhookSecret.
+
+// CreateAppWebhookRequest is the body of POST
+// /v1/apps/{slug}/webhooks. The plaintext WebhookSecret is sent
+// over the wire and is NEVER echoed in any other response.
+type CreateAppWebhookRequest struct {
+	TargetURL     string   `json:"target_url"`
+	WebhookSecret string   `json:"webhook_secret"`
+	EventFilter   []string `json:"event_filter,omitempty"`
+	RetryPolicy   string   `json:"retry_policy,omitempty"`
+}
+
+// UpdateAppWebhookRequest is the body of PATCH
+// /v1/apps/{slug}/webhooks/{id}. Pointer fields let the caller
+// distinguish "leave as-is" from "set to empty".
+type UpdateAppWebhookRequest struct {
+	TargetURL   *string   `json:"target_url,omitempty"`
+	EventFilter *[]string `json:"event_filter,omitempty"`
+	RetryPolicy *string   `json:"retry_policy,omitempty"`
+	Enabled     *bool     `json:"enabled,omitempty"`
+}
+
+// AppWebhookResponse is the read shape for a single subscription.
+// WebhookSecretSealedMasked is always the literal "***"; the
+// plaintext never appears here.
+type AppWebhookResponse struct {
+	ID                        string    `json:"id"`
+	AppSlug                   string    `json:"app_slug"`
+	TargetURL                 string    `json:"target_url"`
+	WebhookSecretSealedMasked string    `json:"webhook_secret_sealed_masked"`
+	EventFilter               []string  `json:"event_filter"`
+	RetryPolicy               string    `json:"retry_policy"`
+	Enabled                   bool      `json:"enabled"`
+	CreatedAt                 time.Time `json:"created_at"`
+	UpdatedAt                 time.Time `json:"updated_at"`
+}
+
+// RotateAppWebhookSecretResponse is the body of POST
+// /v1/apps/{slug}/webhooks/{id}/rotate-secret. WebhookSecret is
+// the ONE call site where the plaintext is returned; callers MUST
+// persist it immediately and MUST NOT log it.
+type RotateAppWebhookSecretResponse struct {
+	WebhookSecret             string    `json:"webhook_secret"`
+	WebhookSecretSealedMasked string    `json:"webhook_secret_sealed_masked"`
+	RotatedAt                 time.Time `json:"rotated_at"`
+}
+
+// AppWebhookDeliveryResponse is one row of the delivery ledger.
+type AppWebhookDeliveryResponse struct {
+	ID               string     `json:"id"`
+	WebhookID        string     `json:"webhook_id"`
+	Event            string     `json:"event"`
+	Attempt          int        `json:"attempt"`
+	Status           string     `json:"status"`
+	LastError        string     `json:"last_error,omitempty"`
+	LastResponseCode int        `json:"last_response_code"`
+	NextAttemptAt    time.Time  `json:"next_attempt_at"`
+	DeliveredAt      *time.Time `json:"delivered_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+// AppWebhookDeliveryListResponse is the body of GET
+// /v1/apps/{slug}/webhooks/{id}/deliveries. NextPageToken is empty
+// when the listing is exhausted.
+type AppWebhookDeliveryListResponse struct {
+	Deliveries    []AppWebhookDeliveryResponse `json:"deliveries"`
+	NextPageToken string                       `json:"next_page_token,omitempty"`
+}
+
+// AppWebhookRetryDeliveryResponse is the body of POST
+// /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry.
+type AppWebhookRetryDeliveryResponse struct {
+	Delivery AppWebhookDeliveryResponse `json:"delivery"`
+}
+
+// ListAppWebhookDeliveriesOptions are the query knobs for
+// Client.ListAppWebhookDeliveries.
+type ListAppWebhookDeliveriesOptions struct {
+	Status    string
+	PageSize  int
+	PageToken string
+}

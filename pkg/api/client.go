@@ -1641,3 +1641,85 @@ func (c *Client) PeekInvitation(ctx context.Context, token string) (OrgInvitatio
 	var out OrgInvitationResponse
 	return out, c.do(ctx, "GET", "/v1/invitations/"+token, nil, &out)
 }
+
+// --- Webhook delivery (issue #476 / ADR-076) -----------------------------
+//
+// Outbound webhook subscription + delivery ledger. Mirrors the
+// pkg/api/webhooks.go DTO definitions and the eight apid routes
+// under /v1/apps/{slug}/webhooks[/...]. Same posture as the
+// crons surface: `Client` is a thin HTTP wrapper; the wire DTOs
+// are exported types in this package.
+
+// ListAppWebhooks returns the per-app webhook subscriptions.
+func (c *Client) ListAppWebhooks(ctx context.Context, slug string) ([]AppWebhookResponse, error) {
+	var out []AppWebhookResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/webhooks", nil, &out)
+}
+
+// CreateAppWebhook subscribes a target URL to events on the app.
+// The plaintext WebhookSecret is sent over the wire; the response
+// carries only the masked constant `***` for WebhookSecretSealedMasked.
+func (c *Client) CreateAppWebhook(ctx context.Context, slug string, req CreateAppWebhookRequest) (AppWebhookResponse, error) {
+	var out AppWebhookResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks", req, &out)
+}
+
+// GetAppWebhook returns a single subscription by id.
+func (c *Client) GetAppWebhook(ctx context.Context, slug, id string) (AppWebhookResponse, error) {
+	var out AppWebhookResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/webhooks/"+id, nil, &out)
+}
+
+// UpdateAppWebhook PATCHes the target_url / event_filter /
+// retry_policy / enabled triple. Pointer fields let callers
+// distinguish "leave as-is" from "set to empty / nil".
+func (c *Client) UpdateAppWebhook(ctx context.Context, slug, id string, req UpdateAppWebhookRequest) (AppWebhookResponse, error) {
+	var out AppWebhookResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/webhooks/"+id, req, &out)
+}
+
+// DeleteAppWebhook removes the subscription. Pending deliveries
+// remain in the ledger but no new ones will be enqueued after
+// delete; existing rows drain per their next_attempt_at.
+func (c *Client) DeleteAppWebhook(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/webhooks/"+id, nil, nil)
+}
+
+// RotateAppWebhookSecret asks the server to mint a fresh sealed
+// secret. The new plaintext is returned ONCE in the response
+// (RotateAppWebhookSecretResponse.WebhookSecret); callers MUST
+// persist it immediately and MUST NOT log it.
+func (c *Client) RotateAppWebhookSecret(ctx context.Context, slug, id string) (RotateAppWebhookSecretResponse, error) {
+	var out RotateAppWebhookSecretResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks/"+id+"/rotate-secret", nil, &out)
+}
+
+// ListAppWebhookDeliveries paginates the per-subscription delivery
+// ledger. Status is one of pending|in_flight|succeeded|failed|dead
+// or empty (all statuses). PageSize caps the response (1..100).
+func (c *Client) ListAppWebhookDeliveries(ctx context.Context, slug, id string, opts ListAppWebhookDeliveriesOptions) (AppWebhookDeliveryListResponse, error) {
+	var out AppWebhookDeliveryListResponse
+	path := "/v1/apps/" + slug + "/webhooks/" + id + "/deliveries"
+	if opts.Status != "" || opts.PageSize > 0 || opts.PageToken != "" {
+		q := url.Values{}
+		if opts.Status != "" {
+			q.Set("status", opts.Status)
+		}
+		if opts.PageSize > 0 {
+			q.Set("page_size", strconv.Itoa(opts.PageSize))
+		}
+		if opts.PageToken != "" {
+			q.Set("page_token", opts.PageToken)
+		}
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// RetryAppWebhookDelivery moves a `dead` row back to `pending` and
+// resets next_attempt_at to now(). Returns the refreshed delivery
+// row so callers can show "queued for attempt N+1 at HH:MM:SS".
+func (c *Client) RetryAppWebhookDelivery(ctx context.Context, slug, id, deliveryID string) (AppWebhookRetryDeliveryResponse, error) {
+	var out AppWebhookRetryDeliveryResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks/"+id+"/deliveries/"+deliveryID+"/retry", nil, &out)
+}

@@ -7908,6 +7908,133 @@ components:
           type: object
           additionalProperties: { type: string }
 
+    # ─── Outbound webhooks (issue #476 / ADR-076) ──────────────────────────────
+    AppWebhookResponse:
+      description: |
+        An outbound webhook subscription. Carries the masked HMAC secret;
+        the sealed ciphertext is server-side only.
+      type: object
+      required: [id, app_id, account_id, target_url, webhook_secret_sealed_masked, event_filter, retry_policy, enabled, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        app_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        account_id: { type: string, format: uuid }
+        target_url: { type: string, minLength: 8, maxLength: 2048 }
+        webhook_secret_sealed_masked: { type: string, enum: ["***"] }
+        event_filter:
+          type: array
+          items: { type: string }
+          maxItems: 32
+        retry_policy: { type: string, enum: [default, aggressive, none] }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      example:
+        id: "0123456789abcdef0123456789abcdef"
+        app_id: "fedcba9876543210fedcba9876543210"
+        account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
+        target_url: "https://example.com/hook"
+        webhook_secret_sealed_masked: "***"
+        event_filter: ["cron.fired", "app.created"]
+        retry_policy: "default"
+        enabled: true
+        created_at: "2026-08-06T10:00:00Z"
+        updated_at: "2026-08-06T10:00:00Z"
+
+    CreateAppWebhookRequest:
+      type: object
+      required: [target_url, webhook_secret]
+      properties:
+        target_url: { type: string, minLength: 8, maxLength: 2048 }
+        webhook_secret: { type: string, minLength: 1, maxLength: 256 }
+        event_filter:
+          type: array
+          items: { type: string, enum: ["cron.fired", "app.created", "app.deleted", "build.succeeded", "build.failed"] }
+          maxItems: 32
+        retry_policy: { type: string, enum: [default, aggressive, none], default: default }
+        enabled: { type: boolean, default: true }
+      example:
+        target_url: "https://example.com/hook"
+        webhook_secret: "shh"
+        event_filter: ["cron.fired", "app.created"]
+        retry_policy: "default"
+        enabled: true
+
+    UpdateAppWebhookRequest:
+      type: object
+      properties:
+        target_url: { type: string, minLength: 8, maxLength: 2048 }
+        webhook_secret: { type: string, minLength: 1, maxLength: 256 }
+        event_filter:
+          type: array
+          items: { type: string, enum: ["cron.fired", "app.created", "app.deleted", "build.succeeded", "build.failed"] }
+          maxItems: 32
+        retry_policy: { type: string, enum: [default, aggressive, none] }
+        enabled: { type: boolean }
+      example:
+        target_url: "https://example.com/hook2"
+        enabled: true
+
+    RotateAppWebhookSecretResponse:
+      type: object
+      required: [rotated_at, webhook_secret_sealed_masked]
+      properties:
+        rotated_at: { type: string, format: date-time }
+        webhook_secret_sealed_masked: { type: string, enum: ["***"] }
+      example:
+        rotated_at: "2026-08-06T12:00:00Z"
+        webhook_secret_sealed_masked: "***"
+
+    AppWebhookDeliveryResponse:
+      type: object
+      required: [id, webhook_id, app_id, account_id, event, attempt, status, next_attempt_at, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        webhook_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        app_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        account_id: { type: string, format: uuid }
+        event: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+          description: The original event payload (omitted on rows past the first attempt; the customer has already seen it).
+        attempt: { type: integer, minimum: 0, maximum: 7 }
+        status: { type: string, enum: [pending, in_flight, succeeded, failed, dead] }
+        last_error: { type: string }
+        last_response_code: { type: integer, minimum: 0, maximum: 599 }
+        next_attempt_at: { type: string, format: date-time }
+        delivered_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      example:
+        id: "0123456789abcdef0123456789abcdef"
+        webhook_id: "fedcba9876543210fedcba9876543210"
+        app_id: "8b1f5e5d273e5a18ae0058fceba4fe6c"
+        account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
+        event: "cron.fired"
+        payload: {"cron_name": "nightly-rollup"}
+        attempt: 0
+        status: "pending"
+        next_attempt_at: "2026-08-06T10:00:00Z"
+        created_at: "2026-08-06T10:00:00Z"
+        updated_at: "2026-08-06T10:00:00Z"
+
+    AppWebhookDeliveryListResponse:
+      type: object
+      required: [deliveries]
+      properties:
+        deliveries:
+          type: array
+          items: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
+        next_token: { type: string, description: "Cursor for the next page; empty/absent when the page is the last." }
+
+    AppWebhookRetryDeliveryResponse:
+      type: object
+      required: [delivery]
+      properties:
+        delivery: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
+
+
   responses:
 
     Unauthorized:
@@ -8179,132 +8306,6 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
         text/plain:
           schema: { $ref: '#/components/schemas/RateLimitPlain' }
-
-    # ─── Outbound webhooks (issue #476 / ADR-076) ──────────────────────────────
-    AppWebhookResponse:
-      description: |
-        An outbound webhook subscription. Carries the masked HMAC secret;
-        the sealed ciphertext is server-side only.
-      type: object
-      required: [id, app_id, account_id, target_url, webhook_secret_sealed_masked, event_filter, retry_policy, enabled, created_at, updated_at]
-      properties:
-        id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        app_id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        account_id: { type: string, format: uuid }
-        target_url: { type: string, minLength: 8, maxLength: 2048 }
-        webhook_secret_sealed_masked: { type: string, enum: ["***"] }
-        event_filter:
-          type: array
-          items: { type: string }
-          maxItems: 32
-        retry_policy: { type: string, enum: [default, aggressive, none] }
-        enabled: { type: boolean }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-      example:
-        id: "0123456789abcdef0123456789abcdef"
-        app_id: "fedcba9876543210fedcba9876543210"
-        account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
-        target_url: "https://example.com/hook"
-        webhook_secret_sealed_masked: "***"
-        event_filter: ["cron.fired", "app.created"]
-        retry_policy: "default"
-        enabled: true
-        created_at: "2026-08-06T10:00:00Z"
-        updated_at: "2026-08-06T10:00:00Z"
-
-    CreateAppWebhookRequest:
-      type: object
-      required: [target_url, webhook_secret]
-      properties:
-        target_url: { type: string, minLength: 8, maxLength: 2048 }
-        webhook_secret: { type: string, minLength: 1, maxLength: 256 }
-        event_filter:
-          type: array
-          items: { type: string, enum: ["cron.fired", "app.created", "app.deleted", "build.succeeded", "build.failed"] }
-          maxItems: 32
-        retry_policy: { type: string, enum: [default, aggressive, none], default: default }
-        enabled: { type: boolean, default: true }
-      example:
-        target_url: "https://example.com/hook"
-        webhook_secret: "shh"
-        event_filter: ["cron.fired", "app.created"]
-        retry_policy: "default"
-        enabled: true
-
-    UpdateAppWebhookRequest:
-      type: object
-      properties:
-        target_url: { type: string, minLength: 8, maxLength: 2048 }
-        webhook_secret: { type: string, minLength: 1, maxLength: 256 }
-        event_filter:
-          type: array
-          items: { type: string, enum: ["cron.fired", "app.created", "app.deleted", "build.succeeded", "build.failed"] }
-          maxItems: 32
-        retry_policy: { type: string, enum: [default, aggressive, none] }
-        enabled: { type: boolean }
-      example:
-        target_url: "https://example.com/hook2"
-        enabled: true
-
-    RotateAppWebhookSecretResponse:
-      type: object
-      required: [rotated_at, webhook_secret_sealed_masked]
-      properties:
-        rotated_at: { type: string, format: date-time }
-        webhook_secret_sealed_masked: { type: string, enum: ["***"] }
-      example:
-        rotated_at: "2026-08-06T12:00:00Z"
-        webhook_secret_sealed_masked: "***"
-
-    AppWebhookDeliveryResponse:
-      type: object
-      required: [id, webhook_id, app_id, account_id, event, attempt, status, next_attempt_at, created_at, updated_at]
-      properties:
-        id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        webhook_id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        app_id: { type: string, pattern: '^[0-9a-f]{32}$' }
-        account_id: { type: string, format: uuid }
-        event: { type: string }
-        payload:
-          type: object
-          additionalProperties: true
-          description: The original event payload (omitted on rows past the first attempt; the customer has already seen it).
-        attempt: { type: integer, minimum: 0, maximum: 7 }
-        status: { type: string, enum: [pending, in_flight, succeeded, failed, dead] }
-        last_error: { type: string }
-        last_response_code: { type: integer, minimum: 0, maximum: 599 }
-        next_attempt_at: { type: string, format: date-time }
-        delivered_at: { type: string, format: date-time }
-        created_at: { type: string, format: date-time }
-        updated_at: { type: string, format: date-time }
-      example:
-        id: "0123456789abcdef0123456789abcdef"
-        webhook_id: "fedcba9876543210fedcba9876543210"
-        app_id: "8b1f5e5d273e5a18ae0058fceba4fe6c"
-        account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
-        event: "cron.fired"
-        payload: {"cron_name": "nightly-rollup"}
-        attempt: 0
-        status: "pending"
-        next_attempt_at: "2026-08-06T10:00:00Z"
-        created_at: "2026-08-06T10:00:00Z"
-        updated_at: "2026-08-06T10:00:00Z"
-
-    AppWebhookDeliveryListResponse:
-      type: object
-      required: [deliveries]
-      properties:
-        deliveries:
-          type: array
-          items: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
-        next_token: { type: string, description: "Cursor for the next page; empty/absent when the page is the last." }
-
-    AppWebhookRetryDeliveryResponse:
-      type: object
-      required: [delivery]
-      properties:
-        delivery: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
 
     # ─── Outbound-webhook problem responses ────────────────────────────────────
     AppWebhookInvalid:

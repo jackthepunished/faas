@@ -227,6 +227,26 @@ func AppWebhookDeliveryResponseFromRow(r AppWebhookDeliveryRow) AppWebhookDelive
 	return resp
 }
 
+// RotateAppWebhookSecretResponse is the body of POST
+// /v1/apps/{slug}/webhooks/{id}/rotate-secret. The plaintext is
+// server-minted and dropped; only the masked constant + rotation
+// timestamp cross the wire.
+type RotateAppWebhookSecretResponse struct {
+	RotatedAt                 string `json:"rotated_at"`
+	WebhookSecretSealedMasked string `json:"webhook_secret_sealed_masked"`
+}
+
+// ListAppWebhookDeliveriesOptions are the query knobs for
+// Client.ListAppWebhookDeliveries. Status is one of
+// pending|in_flight|succeeded|failed|dead or empty for all. PageSize
+// caps the response (1..100). PageToken is the opaque cursor from
+// the previous page.
+type ListAppWebhookDeliveriesOptions struct {
+	Status    string
+	PageSize  int
+	PageToken string
+}
+
 // AppWebhookDeliveryListResponse wraps the deliveries slice with a
 // cursor-shaped page token (mirrors ListCronRunsResponse shape).
 type AppWebhookDeliveryListResponse struct {

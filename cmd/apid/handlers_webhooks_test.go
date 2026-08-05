@@ -187,14 +187,14 @@ func TestRotateAppWebhookSecret_HappyPath(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	var out map[string]any
+	var out api.RotateAppWebhookSecretResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if out["webhook_secret_sealed_masked"] != api.AppWebhookSecretMasked {
-		t.Errorf("masked: got %v, want %q", out["webhook_secret_sealed_masked"], api.AppWebhookSecretMasked)
+	if out.WebhookSecretSealedMasked != api.AppWebhookSecretMasked {
+		t.Errorf("masked: got %q, want %q", out.WebhookSecretSealedMasked, api.AppWebhookSecretMasked)
 	}
-	if out["rotated_at"] == nil {
+	if out.RotatedAt == "" {
 		t.Errorf("rotated_at missing from response")
 	}
 }

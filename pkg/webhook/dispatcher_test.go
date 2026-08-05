@@ -531,9 +531,12 @@ func TestDispatcher_DrainTimeout(t *testing.T) {
 // dispatcher must emit X-Faas-Webhook-* headers (not X-Faas-Alert-*)
 // for app webhook deliveries.
 func TestDispatch_HeaderShape(t *testing.T) {
+	var mu sync.Mutex
 	var gotSig, gotID, gotTS, gotAtt string
 	var bodyBytes []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		gotSig = r.Header.Get("X-Faas-Webhook-Signature")
 		gotID = r.Header.Get("X-Faas-Delivery-Id")
 		gotTS = r.Header.Get("X-Faas-Webhook-Timestamp")
@@ -574,11 +577,16 @@ func TestDispatch_HeaderShape(t *testing.T) {
 
 	// Wait for inflight to drain.
 	for i := 0; i < 50; i++ {
-		if gotSig != "" {
+		mu.Lock()
+		s := gotSig
+		mu.Unlock()
+		if s != "" {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if gotSig == "" {
 		t.Fatal("no X-Faas-Webhook-Signature header received")
 	}

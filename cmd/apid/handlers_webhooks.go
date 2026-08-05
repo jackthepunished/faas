@@ -473,9 +473,9 @@ func (s *server) rotateAppWebhookSecret(w http.ResponseWriter, r *http.Request, 
 		"rotated_at": row.UpdatedAt,
 	})
 	_ = plaintext // never logged; the plaintext is destroyed at function exit
-	writeJSON(w, http.StatusOK, map[string]any{
-		"rotated_at":                   api.FormatAlertTime(row.UpdatedAt),
-		"webhook_secret_sealed_masked": api.AppWebhookSecretMasked,
+	writeJSON(w, http.StatusOK, api.RotateAppWebhookSecretResponse{
+		RotatedAt:                 api.FormatAlertTime(row.UpdatedAt),
+		WebhookSecretSealedMasked: api.AppWebhookSecretMasked,
 	})
 }
 
