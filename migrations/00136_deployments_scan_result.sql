@@ -96,7 +96,7 @@ END $$;
 -- scan_status IS NULL (the 5-min window where the deploy ships
 -- ahead of the scan) are excluded.
 CREATE INDEX IF NOT EXISTS deployments_app_scan_complete_idx
-    ON public.deployments USING btree (app_id, scanned_at DESC)
+    ON deployments USING btree (app_id, scanned_at DESC)
     WHERE scan_status = 'complete';
 
 -- Replay-safe backfill (ADR-041). Pre-feature rows get the
@@ -105,7 +105,7 @@ CREATE INDEX IF NOT EXISTS deployments_app_scan_complete_idx
 -- NULL predicate makes a second MigrateUp a no-op (the rows
 -- stamped by the first pass have scan_status='skipped' and
 -- are skipped by the predicate on the second pass).
-UPDATE public.deployments
+UPDATE deployments
    SET scan_status = 'skipped',
        scan_result = jsonb_build_object(
            'reason', 'pre-feature',
@@ -121,9 +121,9 @@ UPDATE public.deployments
 -- exists for local-dev replays where a developer rolled back the
 -- migration before a fresh `make bootstrap` re-applied it. The
 -- production path never runs this.
-DROP INDEX IF EXISTS public.deployments_app_scan_complete_idx;
-ALTER TABLE public.deployments DROP CONSTRAINT IF EXISTS deployments_scan_status_chk;
-ALTER TABLE public.deployments
+DROP INDEX IF EXISTS deployments_app_scan_complete_idx;
+ALTER TABLE deployments DROP CONSTRAINT IF EXISTS deployments_scan_status_chk;
+ALTER TABLE deployments
     DROP COLUMN IF EXISTS scanned_at,
     DROP COLUMN IF EXISTS scan_status,
     DROP COLUMN IF EXISTS scan_result;
