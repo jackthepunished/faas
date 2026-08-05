@@ -1,4 +1,4 @@
--- filename: 00135_apps_eviction_priority.sql
+-- filename: 00138_apps_eviction_priority.sql
 -- +goose Up
 -- Issue #475 — per-app eviction_priority ('best_effort'|'reserved').
 -- Default 'best_effort' preserves the pre-#475 LRU-by-last_request_at

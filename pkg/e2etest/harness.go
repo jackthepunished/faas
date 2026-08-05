@@ -430,7 +430,19 @@ const testDomain = "apps.test.example"
 //     collision detector excludes the reservations. Slot 134 (issue
 //     #190 / ADR-061 / PR-6) flips api_keys.org_id to NOT NULL after
 //     the personal-org backfill.
-const e2eMigrationTarget = 135
+//
+//     Slot 138 (issue #475 / ADR-075) adds apps.eviction_priority
+//     (text NOT NULL DEFAULT 'best_effort', CHECK
+//     apps_eviction_priority_chk) so the schedd reaper can tier
+//     apps between cross-account RAM-pressure eviction. Slot 135
+//     is held open by a fence on this branch because four sibling
+//     PRs (#540 webhook-deliveries, #651 deploy-scans, #653 IAM
+//     provenance, #654 per-deployment authn) all touched slot 135
+//     in their first commits; this PR renumbered 135→138 after the
+//     cross-PR slot gate surfaced the cluster. Whichever of #540/
+//     #651/#653/#654 lands first, the fences resolve themselves
+//     (real schema shadows the fence on the side that merges last).
+const e2eMigrationTarget = 138
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

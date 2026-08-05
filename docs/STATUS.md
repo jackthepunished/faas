@@ -487,7 +487,7 @@ by leaving `ReapIdle` and `ReapAggressive` unchanged.
 
 - **Schema** — `apps.eviction_priority` text NOT NULL DEFAULT
   'best_effort' + `apps_eviction_priority_chk` CHECK
-  (migration 00135; replay-safe via ADD COLUMN IF NOT EXISTS +
+  (migration 00138; replay-safe via ADD COLUMN IF NOT EXISTS +
   DO-block `pg_catalog.pg_constraint` guard). Pre-#475 rows stay
   on the historical LRU path bit-for-bit.
 - **Plan tier** — `Plan.EvictionPriorityReservedAllowed` (Free = false,
@@ -516,7 +516,7 @@ by leaving `ReapIdle` and `ReapAggressive` unchanged.
   (Free rejected server-side). Text output surfaces the current
   tier alongside the other per-app knobs.
 
-ADR-075 / issue #475 / migration 00135.
+ADR-075 / issue #475 / migration 00138.
 
 ## What's next
 

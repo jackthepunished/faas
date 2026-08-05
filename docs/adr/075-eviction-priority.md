@@ -197,8 +197,8 @@ make a separate round-trip.
 
 | Concern | Path |
 |---|---|
-| Migration | `migrations/00135_apps_eviction_priority.sql` |
-| Migration test | `migrations/00135_apps_eviction_priority_test.go` |
+| Migration | `migrations/00138_apps_eviction_priority.sql` |
+| Migration test | `migrations/00138_apps_eviction_priority_test.go` |
 | Limits + plan rows | `pkg/api/limits.go` |
 | Accessor tests | `pkg/api/limits_test.go` |
 | App state | `pkg/state/types.go` |

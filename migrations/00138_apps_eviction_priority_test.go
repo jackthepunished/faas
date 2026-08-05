@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00135 (issue #475 — eviction_priority).
+// Migration-apply test for 00138 (issue #475 — eviction_priority).
 // Pins the new column + CHECK constraint + default + replay-safety
 // contract.
 //
 // Pins:
 //
-//  1. The migration set applies cleanly through 00135.
+//  1. The migration set applies cleanly through 00138.
 //  2. The column is NOT NULL with default 'best_effort' (pre-#475 rows
 //     stay on the historical LRU path bit-for-bit; the per-plan default
 //     is applied at apid create-time, not by the column default).
@@ -42,17 +42,17 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
+func TestMigrations_00138_AppsEvictionPriority(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000135`,
-	// `...000235`) so a reader scanning the test fixtures can pin each
+	// Seed UUIDs carry the slot number in the last group (`...000138`,
+	// `...000238`) so a reader scanning the test fixtures can pin each
 	// row to this migration without grepping the file name. The literal
 	// slot value MUST stay in sync with the filename; renumber per
-	// `migrations/README.md` if a sibling PR grabs 00135 first.
+	// `migrations/README.md` if a sibling PR grabs 00138 first.
 
-	// (1) Apply through 00135. A regression that drops a slot between
+	// (1) Apply through 00138. A regression that drops a slot between
 	// 1 and 135 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 135)", err)
@@ -62,7 +62,7 @@ func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
 	// reruns so the seed is idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000135',
+		values ('00000000-0000-0000-0000-000000000138',
 		        'eviction-priority-test@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -70,8 +70,8 @@ func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000235',
-		        '00000000-0000-0000-0000-000000000135',
+		values ('00000000-0000-0000-0000-000000000238',
+		        '00000000-0000-0000-0000-000000000138',
 		        'eviction-priority-test-app', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -86,7 +86,7 @@ func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
 	var got string
 	if err := pool.QueryRow(ctx, `
 		select eviction_priority
-		  from apps where id = '00000000-0000-0000-0000-000000000235'
+		  from apps where id = '00000000-0000-0000-0000-000000000238'
 	`).Scan(&got); err != nil {
 		t.Fatalf("read default eviction_priority: %v", err)
 	}
@@ -100,14 +100,14 @@ func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		update apps
 		   set eviction_priority = 'reserved'
-		 where id = '00000000-0000-0000-0000-000000000235'
+		 where id = '00000000-0000-0000-0000-000000000238'
 	`); err != nil {
 		t.Fatalf("update eviction_priority: %v", err)
 	}
 	var got2 string
 	if err := pool.QueryRow(ctx, `
 		select eviction_priority
-		  from apps where id = '00000000-0000-0000-0000-000000000235'
+		  from apps where id = '00000000-0000-0000-0000-000000000238'
 	`).Scan(&got2); err != nil {
 		t.Fatalf("read opted-in eviction_priority: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
 	// migration 00086.
 	_, err := pool.Exec(ctx, `
 		update apps set eviction_priority = 'foo'
-		 where id = '00000000-0000-0000-0000-000000000235'
+		 where id = '00000000-0000-0000-0000-000000000238'
 	`)
 	var pgErr *pgconn.PgError
 	if err == nil {
@@ -135,8 +135,8 @@ func TestMigrations_00135_AppsEvictionPriority(t *testing.T) {
 	// apps_workload_class NOT NULL.
 	_, err = pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, status, created_at, eviction_priority)
-		values ('00000000-0000-0000-0000-000000000335',
-		        '00000000-0000-0000-0000-000000000135',
+		values ('00000000-0000-0000-0000-000000000338',
+		        '00000000-0000-0000-0000-000000000138',
 		        'eviction-priority-null-app', 'function', 256, 1, 'active', now(), NULL)
 	`)
 	if err == nil {
