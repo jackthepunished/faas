@@ -128,10 +128,21 @@ func runGrypeImpl(ctx context.Context, bin, dir string) (*ScanResult, error) {
 // reads SeverityCounts.Critical / .High / .Medium / .Low / .Unknown
 // to build the legacy `findings map[string]int` payload — the
 // pre-PR-2 sidecar JSON shape is byte-identical for a given
-// input. The per-deploy surface (PR-3's ScanResultSink) uses
-// the full struct directly.
+// input. The per-deploy surface (PR-3's deploy-complete hook
+// in handler.go::runDeployScan) uses the full struct directly.
+//
+// Error carries the grype-runner error message on the
+// scan_status='failed' path (PR-3 retry-exhausted backoff).
+// Empty on success. Marshalled into deployments.scan_result
+// jsonb so the dashboard's "scan failed" chip can render the
+// underlying cause; not surfaced on the success path.
 type ScanResult struct {
 	SeverityCounts
+	// Error is the grype-runner error message stamped on the
+	// scan_status='failed' path (PR-3 retry-exhausted backoff).
+	// Empty on success. Marshalled with omitempty so a successful
+	// scan's jsonb payload doesn't carry the field.
+	Error string `json:"error,omitempty"`
 }
 
 // bumpSeverity increments the per-bucket count for one

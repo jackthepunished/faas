@@ -582,6 +582,79 @@ func (h *Handler) runGrype(ctx context.Context, dir string) (*ScanResult, error)
 	return defaultGrypeRun(ctx, dir)
 }
 
+// runDeployScan runs the per-deploy grype scan and stamps the
+// result on the deployment row (issue #464 / ADR-055 / PR-3).
+// The scan reads the per-app layer ext4 (appsRoot/<slug>/<depID>.ext4)
+// and writes scan_result + scan_status + scanned_at via
+// state.Store.UpsertDeploymentScanResult. The method is
+// best-effort — both the grype runner error path and the SQL
+// write error path log at WARN and return so the deploy's
+// snapshotting transition fires regardless (AC #4: CRITICAL-CVE
+// images deploy successfully; AC #1: scan lands within 5 min
+// via this hook, well under the SLA).
+//
+// Runs synchronously in the deploy-complete path (post
+// SetDeploymentRootfs, pre snapshotting transition). Grype's
+// ~1-3s per-layer cost is acceptable here because the build
+// path already spends seconds-to-minutes in
+// aboveBaseLayers + the snapshot prime; the scan is one more
+// step in a pipeline that's already gated by build cold-boot.
+//
+// On a retry-exhausted grype failure, status='failed' is
+// stamped with the error in scan_result's Error field. The
+// dashboard renders a "scan failed" chip; the deploy itself
+// is unaffected.
+//
+// Marshal contract: *ScanResult + Error field are plain Go
+// types (ints, string) so json.Marshal can't fail at runtime.
+// A future field that breaks this invariant (e.g. a chan)
+// surfaces as an immediate panic in tests.
+func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.Deployment) {
+	if h.store == nil || h.log == nil {
+		// Defensive: tests that build a Handler without wiring
+		// store/log skip the scan entirely (no row to write, no
+		// log channel). Production wires both at line 87+195
+		// of cmd/imaged/main.go, so the nil branches are
+		// unreachable in prod.
+		return
+	}
+	ext4Path := h.appsRootPath(app.Slug, dep.ID)
+	result, err := h.runGrype(ctx, ext4Path)
+	if err != nil {
+		// Fail the scan, not the deploy. Log the grype error
+		// so the operator sees the underlying cause.
+		h.log.Warn("imaged: per-deploy grype scan failed",
+			"deployment", dep.ID, "app", app.Slug, "err", err)
+		failedResult := &ScanResult{Error: err.Error()}
+		b, mErr := json.Marshal(failedResult)
+		if mErr != nil {
+			h.log.Warn("imaged: marshal failed scan result",
+				"deployment", dep.ID, "err", mErr)
+			return
+		}
+		if writeErr := h.store.UpsertDeploymentScanResult(ctx, dep.ID, b, "failed"); writeErr != nil {
+			h.log.Warn("imaged: stamp scan_status=failed",
+				"deployment", dep.ID, "err", writeErr)
+		}
+		return
+	}
+	b, mErr := json.Marshal(result)
+	if mErr != nil {
+		h.log.Warn("imaged: marshal scan result",
+			"deployment", dep.ID, "err", mErr)
+		return
+	}
+	if err := h.store.UpsertDeploymentScanResult(ctx, dep.ID, b, "complete"); err != nil {
+		h.log.Warn("imaged: stamp scan_status=complete",
+			"deployment", dep.ID, "err", err)
+		return
+	}
+	h.log.Info("imaged: per-deploy scan stamped",
+		"deployment", dep.ID, "app", app.Slug,
+		"critical", result.Critical, "high", result.High,
+		"medium", result.Medium, "low", result.Low, "unknown", result.Unknown)
+}
+
 // storageFor returns the wired StorageBackend, building a default
 // per-appsRoot LocalStorageBackend on first use. The lazy-default keeps
 // existing callers — every test that never calls WithStorage — running
@@ -826,6 +899,20 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 			return err
 		}
 	}
+
+	// Per-deploy grype scan (issue #464 / ADR-055 / PR-3).
+	// Runs AFTER the per-app ext4 layer is built + published
+	// (buildImageLayer/buildFunctionLayer both stamped
+	// SetDeploymentRootfs above) and BEFORE the
+	// pending→snapshotting transition. The scan is
+	// best-effort observability — a grype runner error or
+	// SQL write failure is logged at WARN and dropped; the
+	// deploy's snapshotting transition still fires so the
+	// customer contract (AC #4: CRITICAL-CVE images deploy
+	// successfully) holds. The scan lands on the deployment
+	// row within seconds of the layer publish (well inside
+	// the 5-min SLA from AC #1).
+	h.runDeployScan(ctx, app, dep)
 
 	if err := h.transition(ctx, dep.ID, state.DeploySnapshotting, ""); err != nil {
 		return err
