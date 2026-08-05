@@ -618,6 +618,7 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 		// unreachable in prod.
 		return
 	}
+	start := time.Now()
 	ext4Path := h.appsRootPath(app.Slug, dep.ID)
 	result, err := h.runGrype(ctx, ext4Path)
 	if err != nil {
@@ -636,6 +637,13 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 			h.log.Warn("imaged: stamp scan_status=failed",
 				"deployment", dep.ID, "err", writeErr)
 		}
+		// ADR-055: surface the failure as a metric increment so
+		// the §12 dashboard panel can render a 5-min red rate.
+		// Duration histogram is observed on the failed branch too
+		// — the 5-min SLA bucket catches stuck scans even when
+		// the grype runner returns quickly.
+		h.ops.ObserveDeployScanDuration(app.Slug, "failed", time.Since(start))
+		h.ops.ObserveDeployScanTotal(app.Slug, "failed")
 		return
 	}
 	b, mErr := json.Marshal(result)
@@ -648,6 +656,20 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 		h.log.Warn("imaged: stamp scan_status=complete",
 			"deployment", dep.ID, "err", err)
 		return
+	}
+	// ADR-055: stamped-clean. Record wall-clock duration +
+	// per-severity counts so the §12 dashboard panel can graph
+	// the fleet-deploy scan latency over a 5-min window.
+	h.ops.ObserveDeployScanDuration(app.Slug, "complete", time.Since(start))
+	h.ops.ObserveDeployScanTotal(app.Slug, "complete")
+	for sev, n := range map[string]int{
+		"CRITICAL": result.Critical,
+		"HIGH":     result.High,
+		"MEDIUM":   result.Medium,
+		"LOW":      result.Low,
+		"UNKNOWN":  result.Unknown,
+	} {
+		h.ops.ObserveDeployScanVulns(app.Slug, sev, n)
 	}
 	h.log.Info("imaged: per-deploy scan stamped",
 		"deployment", dep.ID, "app", app.Slug,

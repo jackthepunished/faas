@@ -151,13 +151,13 @@ type DeploymentItem struct {
 // no CVE list — the list view would overflow with a 200-row
 // CVE list per deployment).
 type ScanSummary struct {
-	Status   string // complete|failed|skipped
+	Status    string // complete|failed|skipped
 	ScannedAt string // RFC 3339 UTC; empty when not scanned
-	Critical int
-	High     int
-	Medium   int
-	Low      int
-	Unknown  int
+	Critical  int
+	High      int
+	Medium    int
+	Low       int
+	Unknown   int
 }
 
 // CronItem is one row on the app detail page's crons tab.

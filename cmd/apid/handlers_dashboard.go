@@ -1178,7 +1178,7 @@ func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, 
 	}
 
 	data := dashboard.DeploymentDetailData{
-		App:        dashboard.AppListItem{Slug: app.Slug, ID: app.ID},
+		App:        dashboard.AppListItem{Slug: app.Slug},
 		Deployment: dashboardDeploymentItem(dep),
 	}
 	if dep.ScanStatus != "" {

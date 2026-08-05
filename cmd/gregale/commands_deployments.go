@@ -180,8 +180,8 @@ func cmdDeployment(args []string) int {
 			return jsonOut(writeJSON(d))
 		}
 		type deploymentWithScan struct {
-			Deployment any      `json:"deployment"`
-			Scan       any      `json:"scan"`
+			Deployment any `json:"deployment"`
+			Scan       any `json:"scan"`
 		}
 		return jsonOut(writeJSON(deploymentWithScan{Deployment: d, Scan: sc}))
 	}
