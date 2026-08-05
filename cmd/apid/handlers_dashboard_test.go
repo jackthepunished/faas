@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -25,7 +26,29 @@ import (
 // Tests that intentionally probe the unauthenticated surface
 // (TestDashboardHandler_LoginPage + TestDashboardHandler_RecoversFromPanic
 // use the raw chain) call newServer() directly.
+//
+// The pre-PR-077 cookie carries env.StepUpAt = time.Time{} (the
+// envelope's omitempty wire form means a cookie minted without
+// the step-up variant never carries the field). After the
+// IAM-hardening-mega-PR (logical change 6, ADR-077) lands, the
+// dashboard's requireStepUpHandler gate reads env.StepUpAt via
+// StepUpFrom(r); a pre-PR cookie trips reason="missing" and 403s.
+// Tests that drive step-up-gated routes (set-password, delete,
+// restore) must use newSteppedUpDashboardServer instead, which
+// re-issues the cookie via IssueWithSessionAndBindingHashAndStepUp
+// with StepUpAt = time.Now().
 func newAuthedDashboardServer(t *testing.T) (http.Handler, *http.Cookie) {
+	t.Helper()
+	h, cookie, _, _ := newAuthedDashboardServerFull(t)
+	return h, cookie
+}
+
+// newAuthedDashboardServerFull returns the handler, the authed
+// faas_sid cookie, the underlying MemStore, and the session.Manager
+// so tests that need to re-issue the cookie (e.g. to add a step-up
+// stamp, or to bind a sessions row to a new IP+UA) can do so without
+// re-seeding the account.
+func newAuthedDashboardServerFull(t *testing.T) (http.Handler, *http.Cookie, *state.MemStore, *session.Manager) {
 	t.Helper()
 	store := state.NewMemStore()
 	acct, err := store.CreateAccount(t.Context(), "alice@example.com", "free")
@@ -42,7 +65,37 @@ func newAuthedDashboardServer(t *testing.T) (http.Handler, *http.Cookie) {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, "")
-	return srv.handler(), &http.Cookie{Name: sessionCookie, Value: cookie}
+	return srv.handler(), &http.Cookie{Name: sessionCookie, Value: cookie}, store, mgr
+}
+
+// newSteppedUpDashboardServer re-issues the authed cookie with
+// StepUpAt = time.Now() so the dashboard's requireStepUpHandler
+// gate passes. Also creates a sessions row so
+// IssueWithSessionAndBindingHashAndStepUp has a real sid to bind.
+// Returns the same (handler, cookie) shape as newAuthedDashboardServer
+// so the existing test bodies drop in unchanged.
+func newSteppedUpDashboardServer(t *testing.T) (http.Handler, *http.Cookie) {
+	t.Helper()
+	h, _, store, mgr := newAuthedDashboardServerFull(t)
+	// Find the just-issued account's only row.
+	accts, err := store.AccountByEmail(t.Context(), "alice@example.com")
+	if err != nil {
+		t.Fatalf("AccountByEmail: %v", err)
+	}
+	// IssueWithSessionAndBindingHashAndStepUp requires a real
+	// sid + accountID + binding hash. Create the session row
+	// first; the binding hash is empty (unix-socket / no-UA
+	// path) so the cross-check at RequireSessionCookie step 3.5
+	// is a no-op.
+	sid := "stepped-up-sid"
+	if _, err := store.CreateSession(t.Context(), sid, accts.ID, "192.0.2.10", "stepped-up-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	cookie, err := mgr.IssueWithSessionAndBindingHashAndStepUp(sid, accts.ID, "", time.Now(), false)
+	if err != nil {
+		t.Fatalf("issue stepped-up cookie: %v", err)
+	}
+	return h, &http.Cookie{Name: sessionCookie, Value: cookie}
 }
 
 // TestDashboardHandler_RendersIndex confirms an authenticated
@@ -468,5 +521,46 @@ func TestDashboardAccountView_NegativeCountClampedToZero(t *testing.T) {
 	v := dashboardAccountView(state.Account{ID: "a1", Email: "x@example.com", Plan: "pro"}, -5)
 	if v.AppCount != 0 {
 		t.Errorf("AppCount = %d, want 0 (negative clamped)", v.AppCount)
+	}
+}
+
+// TestSessionAuth_StampsStepUpOnRequestContext is the regression
+// pin for review finding #3 (PR #653 mega-PR, ADR-077):
+// sessionAuth (cmd/apid/handlers_auth.go) MUST stamp env.StepUpAt
+// onto r.Context() so the dashboard's requireStepUpHandler(5m)
+// gate can read it via StepUpFrom(r). Without this stamp the gate
+// sees has=false at pkg/auth/middleware/middleware.go:889 and
+// silently bypasses step-up on POST /dashboard/account/{delete,
+// set-password} — the same "stolen browser, post-MFA-clear"
+// threat change 6 exists to close.
+//
+// Drives the full auth chain: render /dashboard/account to mint a
+// fresh faas_csrf cookie + delete csrf_token (per
+// dashboard_delete_test.go's renderDashboardAccount helper), then
+// POSTs the delete form. A pre-PR-077 cookie (env.StepUpAt zero,
+// which is what newAuthedDashboardServer's mgr.Issue emits) MUST
+// trip the gate with reason="missing" → 403 CodeMFARequired.
+//
+// Without the WithStepUp call in sessionAuth the gate's `!has`
+// bypass branch would forward the request — a 302 success that
+// lets the attacker delete the account.
+func TestSessionAuth_StampsStepUpOnRequestContext(t *testing.T) {
+	srv, sid := newAuthedDashboardServer(t)
+	csrfCookie, deleteToken, _ := renderDashboardAccount(t, srv, sid)
+	if deleteToken == "" {
+		t.Fatal("rendered account page is missing the delete csrf_token")
+	}
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/account/delete",
+		strings.NewReader("csrf_token="+deleteToken))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(sid)
+	r.AddCookie(&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: csrfCookie})
+	srv.ServeHTTP(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("pre-PR cookie on /dashboard/account/delete: code = %d, want 403 (step-up gate)\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), api.CodeMFARequired) {
+		t.Errorf("body missing code %q; got %s", api.CodeMFARequired, rec.Body.String())
 	}
 }

@@ -822,9 +822,22 @@ func TestAuditEvents_DashboardDeleteEmitsEventWithViaDashboard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session manager: %v", err)
 	}
-	sid, err := mgr.Issue(acct.ID)
+	// Step-up gated: dashboardDelete sits behind
+	// sessionAuth → requireStepUpHandler(5m). The cookie
+	// must carry a fresh StepUpAt stamp so the gate passes
+	// through to scheduleDeletion (which emits the audit
+	// row this test asserts on). IssueWithSessionAndBindingHashAndStepUp
+	// requires a sessions row first; the empty binding hash
+	// is fine because there's no (IP, UA) cross-check at
+	// this endpoint (only the dashboard delete path, which
+	// is unix-socket-shaped at the test layer).
+	stepSid := "del-stepup-sid"
+	if _, err := store.CreateSession(t.Context(), stepSid, acct.ID, "", ""); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	sid, err := mgr.IssueWithSessionAndBindingHashAndStepUp(stepSid, acct.ID, "", time.Now(), false)
 	if err != nil {
-		t.Fatalf("issue session: %v", err)
+		t.Fatalf("issue stepped-up session: %v", err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "",
