@@ -6,6 +6,7 @@ import type { BuildProvenanceResponse } from '../models/BuildProvenanceResponse.
 import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.js';
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
+import type { ScanResult } from '../models/ScanResult.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -269,6 +270,57 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Get per-deploy grype scan.
+   * Returns the per-deploy grype CVE scan payload (issue #464 /
+   * ADR-055). The scan runs on the per-app layer ext4 in imaged's
+   * deploy-complete path (after `SetDeploymentRootfs`, before the
+   * pending→snapshotting transition) and lands on the
+   * `deployments` row.
+   *
+   * Status field is the closed enum:
+   * - `complete` — full payload (SeverityCounts + Vulnerabilities).
+   * - `failed` — payload carries `error` only; SeverityCounts is
+   * all-zero, Vulnerabilities is nil. Rendered as the
+   * "scan failed" chip on the dashboard.
+   * - `skipped` — pre-feature backfill row
+   * (migrations/00135 stamps `scan_status='skipped'` on every
+   * pre-#464 row). Payload carries the reason sentinel.
+   *
+   * A 404 is returned when:
+   * - the deployment row does not exist,
+   * - the deployment belongs to a different account (IDOR-safe;
+   * no account-existence leak),
+   * - no scan has run yet (the deploy is still mid-pipeline or
+   * the row predates #464 entirely).
+   *
+   * @returns ScanResult The typed scan payload. The shape mirrors the `deployments.scan_result` jsonb column (with the Status re-pinned from the authoritative `scan_status` column).
+   * @throws ApiError
+   */
+  public static getDeploymentScan({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<ScanResult> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/deployments/{id}/scan',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `Deployment row missing, cross-account probe, or scan has not run yet.`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
