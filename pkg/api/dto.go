@@ -37,6 +37,18 @@ type CreateAppRequest struct {
 	// plan_warm_snapshot_not_allowed. Explicit false on Pro/Scale =
 	// opt out (an app the customer knows will run cold every time).
 	WarmSnapshotEnabled *bool `json:"warm_snapshot_enabled,omitempty"`
+	// RequireAuthn (issue #560) opts the brand-new app into
+	// per-deployment authentication. When true, gatewayd-internal
+	// demands a valid Authorization: Bearer <token> header on every
+	// routed request (the token must belong to the app's owning
+	// account — cross-account tokens receive 403). nil → false
+	// (default — public-by-default, no customer breakage). Explicit
+	// true on Free/Hobby = rejected by apid with 403
+	// plan_require_authn_not_allowed (the per-plan gate). Pointer
+	// distinguishes "don't touch" (nil) from "explicit false" (opt
+	// out at create time, e.g. for a staging app on a Pro account
+	// that wants the buffered public path).
+	RequireAuthn *bool `json:"require_authn,omitempty"`
 	// WarmSnapshotMinRequests overrides the per-app request-count
 	// threshold for warm-tier capture at creation time. nil → plan
 	// default (5 on Pro/Scale; 0 on Free/Hobby). Range [1, 100].
@@ -123,6 +135,17 @@ type UpdateAppRequest struct {
 	// a Free/Hobby app they later upgrade, or off for a Pro app
 	// they know runs cold every time.
 	WarmSnapshotEnabled *bool `json:"warm_snapshot_enabled,omitempty"`
+	// RequireAuthn (issue #560) toggles per-deployment authentication
+	// on an existing app. Pointer distinguishes "don't touch"
+	// (nil) from "explicit false" (opt out — back to the public
+	// path). Plan-gated upstream: Free/Hobby + true returns 403
+	// plan_require_authn_not_allowed. The default (false) applies
+	// to brand-new apps at CreateApp time regardless of plan, so
+	// every existing customer stays public-by-default. Token
+	// scope is enforced by gatewayd-internal's authz branch, not
+	// here: a valid token from a different account receives 403
+	// at the gateway, not at the PATCH endpoint.
+	RequireAuthn *bool `json:"require_authn,omitempty"`
 	// WarmSnapshotMinRequests overrides the per-app request-count
 	// threshold for warm-tier capture. nil → keep current value
 	// (or apply the plan default on a future create). Range
@@ -437,6 +460,17 @@ type AppResponse struct {
 	// PATCH. Surfaced so dashboards can show "warm snapshot on /
 	// off" alongside the streaming + require_signed pills.
 	WarmSnapshotEnabled bool `json:"warm_snapshot_enabled"`
+	// RequireAuthn (issue #560) reflects the per-deployment
+	// authentication flag. False by default on every plan (the
+	// column default + the per-plan default — the gate only
+	// fires when a Free/Hobby customer tries to PATCH true,
+	// which is denied). When true on a Pro/Scale app,
+	// gatewayd-internal demands a valid bearer token on every
+	// request (the token must belong to the app's owning
+	// account — cross-account tokens receive 403). Surfaced so
+	// dashboards can show the "auth required" pill alongside
+	// streaming / warm-snapshot / require_signed.
+	RequireAuthn bool `json:"require_authn"`
 	// WarmSnapshotMinRequests / WarmSnapshotMinMs surface the
 	// per-app capture thresholds. Range [1, 100] and [100, 60000]
 	// respectively; out-of-range PATCH values are rejected at

@@ -112,6 +112,7 @@ func TestListApps_OK(t *testing.T) {
 		"id", "slug", "type", "ram_mb", "max_concurrency", "concurrency_per_vm",
 		"min_instances", "status", "url", "manifest",
 		"autoscale_target_rps", "autoscale_target_cpu_pct",
+		"require_authn",
 	} {
 		if _, ok := app[k]; !ok {
 			t.Errorf("missing required AppResponse field %q in app: %+v", k, app)
@@ -149,6 +150,7 @@ func TestCreateApp_OK(t *testing.T) {
 		"id", "type", "ram_mb", "max_concurrency", "concurrency_per_vm",
 		"min_instances", "status", "url", "manifest", "egress_allowlist",
 		"autoscale_target_rps", "autoscale_target_cpu_pct",
+		"require_authn",
 	} {
 		if _, ok := got[k]; !ok {
 			t.Errorf("missing required AppResponse field %q in response: %+v", k, got)

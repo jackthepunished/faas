@@ -1083,7 +1083,7 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/AppResponse' }
               example:
-                - {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"min_instances":0,"status":"active","url":"https://hello-world.example.com","manifest":{"entrypoint":["node","server.js"]},"created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                - {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"min_instances":0,"status":"active","url":"https://hello-world.example.com","manifest":{"entrypoint":["node","server.js"]},"created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z","require_authn":false}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
     post:
@@ -1097,7 +1097,7 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateAppRequest'
-              example: {"slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"manifest":null}
+              example: {"slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"manifest":null,"require_authn":false}
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -1107,7 +1107,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z","require_authn":false}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimit' }
@@ -1128,7 +1128,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z","require_authn":false}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -1151,7 +1151,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z","require_authn":false}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/PlanLimit' }
@@ -1344,7 +1344,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppResponse'
-                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z"}
+                example: {"id":"0123456789abcdef0123456789abcdef","slug":"hello-world","type":"app","runtime":"","ram_mb":256,"max_concurrency":2,"concurrency_per_vm":5,"idle_timeout_s":60,"min_instances":0,"state":"running","last_deployment_id":"0123456789abcdef0123456789abcdef","created_at":"2026-07-01T08:00:00Z","updated_at":"2026-07-23T11:25:00Z","require_authn":false}
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '409': { $ref: '#/components/responses/ConflictRename' }
@@ -4936,6 +4936,22 @@ components:
           type: string
           enum: [best_effort, reserved]
           example: best_effort
+        # Issue #560: per-deployment token-gate opt-in. When
+        # true, gatewayd-internal requires every incoming
+        # request to this app to carry a valid
+        # `Authorization: Bearer <token>` header whose key
+        # belongs to the app's owning account (cross-account
+        # tokens receive 403 insufficient_scope). Default
+        # false at create-time (preserves the existing
+        # public-by-default behaviour). Plan-gated: PATCH-true
+        # on Free/Hobby is rejected with 403
+        # plan_require_authn_not_allowed; only Pro/Scale can
+        # opt in. The flag never auto-flips, so every existing
+        # customer is unaffected.
+        require_authn:
+          description: "Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby PATCH-true is rejected with 403 plan_require_authn_not_allowed."
+          type: boolean
+          example: false
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -4984,6 +5000,16 @@ components:
           type: string
           enum: [best_effort, reserved]
           example: best_effort
+        # Issue #560: optional at create-time. Omitted →
+        # apid applies the plan default (false — every
+        # existing customer keeps the public-by-default
+        # behaviour). Set true on Pro/Scale to gate the
+        # deployment behind a bearer-token check at the
+        # gatewayd-internal routing layer.
+        require_authn:
+          description: "Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false). Pro/Scale only."
+          type: boolean
+          example: false
 
     UpdateAppRequest:
       description: "Partial update — every field is optional; omitted fields are unchanged."
@@ -5098,6 +5124,18 @@ components:
           type: [string, "null"]
           enum: [best_effort, reserved, null]
           example: best_effort
+        # Issue #560: per-deployment token-gate opt-in.
+        # Partial-update nullable boolean — omitted → no change;
+        # non-null → atomic overwrite. Plan gate runs first
+        # (403 plan_require_authn_not_allowed) so a Free/Hobby
+        # PATCHing true surfaces the gate. Pro/Scale flow
+        # through. The toggle is reversible: PATCH-true emits
+        # app.authn_required; PATCH-false emits
+        # app.authn_disabled.
+        require_authn:
+          description: "Per-deployment token-gate flag (issue #560). Omitted → no change. PATCH-true on Free/Hobby is rejected with 403 plan_require_authn_not_allowed."
+          type: [boolean, "null"]
+          example: false
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."

@@ -423,6 +423,23 @@ const (
 	// the streaming + allowlist copy without conflating them.
 	CodePlanWarmSnapshotNotAllowed = "plan_warm_snapshot_not_allowed"
 
+	// Issue #560: per-deployment require_authn opt-in (Cloud Run
+	// analogue: `--no-allow-unauthenticated`). Pro/Scale opt in by
+	// default; Free/Hobby reject PATCH-true with 403
+	// plan_require_authn_not_allowed so customers see the gate
+	// before any column write. Same shape as
+	// CodePlanStreamingNotAllowed / warm-snapshot: a single
+	// plan-locked feature with a distinct code so the CLI can
+	// render "auth-required is a paid feature" alongside the
+	// streaming + warm-snapshot copy without conflating them in
+	// telemetry. The gatewayd-internal 401/403 audit events
+	// (`instances.authn_missing` / `invalid` / `scope`) carry
+	// separate kinds and are emitted by the per-deployment
+	// authz branch in pkg/gateway/handler.go::Handler.enforceRequireAuthn
+	// (kind constants live next to the call sites) — the plan
+	// gate and the request gate are distinct failure modes.
+	CodePlanRequireAuthnNotAllowed = "plan_require_authn_not_allowed"
+
 	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
 	// values from a PATCH (warm_snapshot_min_requests outside [1,
 	// 100] or warm_snapshot_min_ms outside [100, 60000]). 422 with

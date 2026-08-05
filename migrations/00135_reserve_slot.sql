@@ -1,24 +1,18 @@
 -- filename: 00135_reserve_slot.sql
--- Slot fence: four sibling PRs (#540 webhook-deliveries, #651
--- deploy-scans, #653 IAM provenance, #654 per-deployment authn)
--- all touched slot 135 in their first commits; the cross-PR
--- slot gate surfaced the cluster, and this fence holds the
--- embedded set contiguous on this branch while eviction_priority
--- lives at slot 138. PR #647 (issue #475 / ADR-075) renumbered
--- 135→138 to land past the cluster.
+-- Fence at slot 135 — held by PR #654 so the migration set stays
+-- contiguous 1..N where N = 139 (after PR #654's renumber
+-- cascade 00135 → 00137 → 00143). PR #654 wanted slot 135
+-- originally, but four sibling PRs (#540, #647, #651, #653) also
+-- claimed 135 in the same week, so per ADR-041 + memory
+-- cross-pr-slot-gate-races-with-active-pr the real schema
+-- renumbered twice. Slot 135 becomes a fence to bridge 00134
+-- (api_keys_org_bound) and the cascading renumber chain.
+-- Whichever sibling PR's real schema lands at 135 first must
+-- `git rm migrations/00135_reserve_slot.sql` on merge.
 --
 -- ADR-041 (migration slot reservation convention): the fence body
--- is a no-op `select 1;` inside goose's StatementBegin/End
--- markers so goose applies it cleanly and writes a row in
--- goose_db_version. A later PR that wants slot 135 for a real
--- schema shadows this fence; the same PR drops this file via
--- `git rm` so the carved-out slot lands cleanly on main.
--- Multiple fences at the same slot from different PRs (this
--- branch's 00135_reserve_slot.sql + #651's + #654's) all use the
--- same StatementBegin/End shape so whichever side merges last
--- resolves to the same no-op content; if any two bodies differ,
--- the cross-PR slot-collision gate flags them with the same
--- overlap that originally surfaced this branch's renumber.
+-- is a no-op `select 1;` inside goose's StatementBegin/End markers
+-- so goose applies it cleanly and writes a row in goose_db_version.
 
 -- +goose Up
 -- +goose StatementBegin

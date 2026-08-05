@@ -79,6 +79,10 @@ class AppResponse:
     warm_snapshot_min_ms: int | Unset = UNSET
     """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
     [100, 60000]."""
+    require_authn: bool | Unset = UNSET
+    """Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer
+    <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby
+    PATCH-true is rejected with 403 plan_require_authn_not_allowed."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -156,6 +160,8 @@ class AppResponse:
 
         warm_snapshot_min_ms = self.warm_snapshot_min_ms
 
+        require_authn = self.require_authn
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -196,6 +202,8 @@ class AppResponse:
             field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
         if warm_snapshot_min_ms is not UNSET:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
+        if require_authn is not UNSET:
+            field_dict["require_authn"] = require_authn
 
         return field_dict
 
@@ -308,6 +316,8 @@ class AppResponse:
 
         warm_snapshot_min_ms = d.pop("warm_snapshot_min_ms", UNSET)
 
+        require_authn = d.pop("require_authn", UNSET)
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -332,6 +342,7 @@ class AppResponse:
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
+            require_authn=require_authn,
         )
 
         app_response.additional_properties = d

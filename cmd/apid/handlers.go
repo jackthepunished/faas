@@ -132,6 +132,22 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if req.WarmSnapshotEnabled != nil {
 		warmEnabled = *req.WarmSnapshotEnabled
 	}
+	// Issue #560: per-app require_authn opt-in. The global default
+	// is always false — every existing customer stays
+	// public-by-default (issue AC #5, the load-bearing
+	// no-breakage invariant). The plan gate (Pro/Scale only)
+	// fires at the PATCH handler, not at Create time: a Free
+	// customer's CreateApp call with require_authn=true gets a
+	// 403 plan_require_authn_not_allowed via the standard
+	// plan-gate shape, but CreateApp without that pointer = no
+	// payload drift, no customer-visible gate at creation.
+	// The per-request override on Pro/Scale lets a customer opt
+	// out at create time (e.g. a Pro customer's brand-new
+	// staging app that wants the public path).
+	requireAuthn := false
+	if req.RequireAuthn != nil {
+		requireAuthn = *req.RequireAuthn
+	}
 	// Apply the per-app threshold defaults from the plan; an
 	// explicit override on the request wins. Out-of-range values
 	// were already rejected at the JSON-decode layer
@@ -151,6 +167,13 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
 		StreamingEnabled:    streaming,
 		WarmSnapshotEnabled: warmEnabled,
+		// Issue #560: see the plan-default block above. Default
+		// false; the per-plan gate (RequireAuthnAllowed) is
+		// consulted only when an existing app is PATCHed true,
+		// not at Create time. State layer is the canonical source
+		// (apps.require_authn column); the DTO surfaces the same
+		// value.
+		RequireAuthn: requireAuthn,
 		// Coerce to the plan minimums when the request asked for a
 		// warm config but the plan says warm-snapshot is off: the
 		// store ignores them anyway (the cold-boot path doesn't
@@ -295,6 +318,13 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// dashboards can show "streaming on / off" alongside the
 		// egress-allowlist flag.
 		StreamingEnabled: a.StreamingEnabled,
+		// Issue #560: per-app require_authn flag. Surfaced so
+		// dashboards can show "auth required on / off" alongside
+		// the streaming + require_signed pills, and so a customer
+		// can verify their PATCH landed without a second
+		// round-trip. The token-scope enforcement (cross-account
+		// 403) lives in gatewayd-internal, not here.
+		RequireAuthn: a.RequireAuthn,
 		// Issue #462 / ADR-058 / PR-A: per-app scaling policy. nil
 		// = legacy row (projected from min_instances / max_concurrency
 		// by the read path). Non-nil = customer-authored policy.

@@ -421,6 +421,18 @@ type App struct {
 	// plan-gated default lives in pkg/api/limits.go
 	// (WarmSnapshotDefault).
 	WarmSnapshotEnabled bool
+	// RequireAuthn (issue #560) toggles per-deployment
+	// authentication. When true, gatewayd-internal demands a valid
+	// Authorization: Bearer <token> header on every routed request;
+	// the token must belong to the app's owning account
+	// (cross-account tokens receive 403). Default false: every
+	// pre-existing app stays public-by-default. Plan-gated at
+	// PATCH time (Pro/Scale only — Free/Hobby get 403
+	// plan_require_authn_not_allowed); the per-plan default is
+	// always false (the column default + the create-time default
+	// keep every new app public). Operators may PATCH true → false
+	// on any plan to opt out per-app.
+	RequireAuthn bool
 	// WarmSnapshotMinRequests is the minimum successful request
 	// count before schedd promotes a warm-tier capture. Range
 	// [1, 100], default 5. Lowering this shortens the time to
@@ -1625,8 +1637,18 @@ type UpdateAppParams struct {
 	// actual value change (no-op PATCHes are silent).
 	EvictionPriority    *string
 	SetEvictionPriority bool
-	Status              *AppStatus
-	Manifest            *AppManifest
+	// RequireAuthn (issue #560) toggles per-deployment
+	// authentication on an existing app. SetRequireAuthn
+	// distinguishes "unset" (don't touch the column) from
+	// "explicit false" (opt out — back to public-by-default).
+	// Plan-gated upstream: apid returns 403
+	// plan_require_authn_not_allowed when the customer's plan is
+	// Free or Hobby AND the value would be true. Customers on any
+	// plan may PATCH true → false to opt out per-app.
+	RequireAuthn    *bool
+	SetRequireAuthn bool
+	Status          *AppStatus
+	Manifest        *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated

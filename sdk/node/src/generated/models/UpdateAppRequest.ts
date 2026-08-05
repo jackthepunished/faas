@@ -51,5 +51,9 @@ export type UpdateAppRequest = {
    * Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction (every best_effort candidate is drained before any reserved is parked). Plan-gated upstream: Free PATCH 'reserved' returns 402 plan_eviction_priority_reserved_not_allowed. Per-account cap (Hobby 1, Pro 2, Scale 4): 422 plan_eviction_priority_reserved_quota when exhausted. Omitted → no change.
    */
   eviction_priority?: 'best_effort' | 'reserved';
+  /**
+   * Per-deployment token-gate flag (issue #560). Omitted → no change. PATCH-true on Free/Hobby is rejected with 403 plan_require_authn_not_allowed.
+   */
+  require_authn?: boolean | null;
 };
 
