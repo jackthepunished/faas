@@ -672,6 +672,21 @@ func (c *Client) SetSecret(ctx context.Context, slug, key, value string) error {
 	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/secrets/"+key,
 		PutAppSecretRequest{Value: value}, nil)
 }
+
+// SetAppEvictionPriority (issue #475) PATCHes the per-app eviction
+// tier on the PATCH /v1/apps/{slug} endpoint. The priority argument
+// is the closed enum 'best_effort' or 'reserved' (mirrors
+// api.EvictionPriority in pkg/api/dto.go). The plan gate (Free +
+// reserved) and the per-account cap (Plan.ReservedConcurrencyPerAccount)
+// are enforced server-side; this helper is a thin one-liner so
+// customer code never builds the UpdateAppRequest struct directly
+// for the eviction-tier field. The response body is the updated
+// AppResponse (matches SetSecret's no-return convention — the caller
+// can GET the app if they need the post-PATCH projection).
+func (c *Client) SetAppEvictionPriority(ctx context.Context, slug, priority string) error {
+	return c.do(ctx, "PATCH", "/v1/apps/"+slug,
+		UpdateAppRequest{EvictionPriority: &priority}, nil)
+}
 func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
 }
