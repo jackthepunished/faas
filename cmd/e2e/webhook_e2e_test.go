@@ -208,9 +208,13 @@ func TestWebhookE2E_DLQAfterSevenFailures(t *testing.T) {
 	}
 	// Override the backoff schedule itself so the dispatcher's
 	// internal delay is always 0 — the row is re-claimable on the
-	// next tick regardless of attempt count.
-	webhook.DefaultBackoff = []time.Duration{0, 0, 0, 0, 0, 0, 0}
-	defer func() { webhook.DefaultBackoff = []time.Duration{30 * time.Second, 2 * time.Minute, 10 * time.Minute, 1 * time.Hour, 6 * time.Hour} }()
+	// next tick regardless of attempt count. WithBackoffs is per-
+	// instance, so the test isolates from package defaults without
+	// mutating a shared var.
+	disp.WithBackoffs(map[state.AppWebhookRetryPolicy][]time.Duration{
+		state.AppWebhookRetryDefault:    {0, 0, 0, 0, 0, 0, 0},
+		state.AppWebhookRetryAggressive: {0, 0, 0, 0, 0, 0, 0},
+	})
 	disp.IdentityLoader = func() []*age.X25519Identity {
 		return []*age.X25519Identity{ident}
 	}
