@@ -1095,6 +1095,147 @@ func (e *AlertRuleQuotaError) Error() string {
 	return fmt.Sprintf("state: alert rule quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
 }
 
+// ----------------------------------------------------------------------------
+// Outbound webhook delivery (issue #476 / ADR-076)
+//
+// AppWebhook is the per-app subscription; AppWebhookDelivery is the
+// persistent ledger row drained by cmd/schedd's
+// pkg/webhook.Dispatcher. The wire format, signing scheme, and
+// per-account fairness algorithm live on the dispatcher side; the
+// Store only owns the durable shape.
+//
+// Why a parallel outbound surface (not alert_deliveries):
+//   - alert_deliveries is alert-shaped (rule_id, observed_value,
+//     idempotency_key keyed on (rule_id, cooldown_bucket)) — its
+//     dispatch is synchronous inside meterd and lives for one
+//     cool-down window.
+//   - app_webhook_deliveries is event-shaped (event name, arbitrary
+//     payload, attempt ladder up to 7) — its dispatch is asynchronous
+//     inside schedd and lives until the customer POSTs
+//     /retry or deletes the subscription.
+// Co-locating them would force a union type and break both
+// dispatcher's hot-path claim queries. ADR-076 documents this split.
+// ----------------------------------------------------------------------------
+
+// AppWebhookEvent is the closed vocabulary on app_webhooks.event_filter.
+// An empty filter ([]) means "all events"; non-empty filters accept
+// events whose name appears in the array. The vocabulary must stay
+// in sync with app_webhook_deliveries.event CHECK in migration 00141.
+type AppWebhookEvent string
+
+const (
+	AppWebhookEventCronFired   AppWebhookEvent = "cron.fired"
+	AppWebhookEventAppDeployed AppWebhookEvent = "app.deployed"
+	AppWebhookEventAppScaled   AppWebhookEvent = "app.scaled"
+	AppWebhookEventAppParked   AppWebhookEvent = "app.parked"
+	AppWebhookEventAppWoken    AppWebhookEvent = "app.woken"
+)
+
+// AppWebhookRetryPolicy names the backoff schedule. The dispatcher
+// reads this column at claim time and computes next_attempt_at
+// against the matching schedule.
+//
+//   - default:    30s, 2m, 10m, 1h, 6h (5 retries → 7 attempts max)
+//   - aggressive: half of each default step
+//   - none:       no retries — first 5xx/408/429 lands the row in
+//     status='dead' immediately
+type AppWebhookRetryPolicy string
+
+const (
+	AppWebhookRetryDefault    AppWebhookRetryPolicy = "default"
+	AppWebhookRetryAggressive AppWebhookRetryPolicy = "aggressive"
+	AppWebhookRetryNone       AppWebhookRetryPolicy = "none"
+)
+
+// AppWebhookDeliveryStatus is the dispatcher's state machine on
+// app_webhook_deliveries. The closed set matches the migration 00141
+// status CHECK; new states land as a controller addition first.
+type AppWebhookDeliveryStatus string
+
+const (
+	AppWebhookDeliveryPending   AppWebhookDeliveryStatus = "pending"
+	AppWebhookDeliveryInFlight  AppWebhookDeliveryStatus = "in_flight"
+	AppWebhookDeliverySucceeded AppWebhookDeliveryStatus = "succeeded"
+	AppWebhookDeliveryFailed    AppWebhookDeliveryStatus = "failed"
+	AppWebhookDeliveryDead      AppWebhookDeliveryStatus = "dead"
+)
+
+// UpdateAppWebhookParams carries the optional fields of
+// UpdateAppWebhook. Same pointer-to-pointer pattern as
+// UpdateAlertRuleParams (types.go:951-976): nil means "don't touch";
+// the pointer distinguishes "leave alone" from "set to false / ” /
+// 0". WebhookSecretSealed non-nil replaces the sealed secret.
+type UpdateAppWebhookParams struct {
+	TargetURL           *string
+	EventFilter         *[]string // nil = don't touch; non-nil replaces
+	RetryPolicy         *AppWebhookRetryPolicy
+	Enabled             *bool
+	WebhookSecretSealed *[]byte // nil = don't reseal; non-nil replaces
+}
+
+// AppWebhook is one per-app subscription row (issue #476 /
+// ADR-076). The webhook secret is at-rest sealed
+// (SecretSealed, age/X25519 via pkg/secretbox) and is never surfaced
+// on a read — the apid response carries a masked constant.
+type AppWebhook struct {
+	ID           string
+	AppID        string
+	AccountID    string
+	TargetURL    string
+	SecretSealed []byte // age/X25519 ciphertext; never logged
+	EventFilter  []string
+	RetryPolicy  AppWebhookRetryPolicy
+	Enabled      bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// AppWebhookDelivery is one (event × target) ledger row. The
+// dispatcher mutates the row in place on every attempt until
+// status='succeeded' or status='dead'. Payload is the wire body the
+// customer receives; the dispatcher signs with HMAC-SHA256 over
+// "<unix>.<delivery_id>.<body>" using the unsealed secret.
+type AppWebhookDelivery struct {
+	ID               string
+	WebhookID        string
+	AppID            string
+	AccountID        string
+	Event            AppWebhookEvent
+	Payload          json.RawMessage
+	Attempt          int // 0..7
+	Status           AppWebhookDeliveryStatus
+	LastError        string
+	LastResponseCode int // 0 when the attempt never reached the wire
+	NextAttemptAt    time.Time
+	DeliveredAt      *time.Time // nil until status=succeeded
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// AppWebhookQuotaError is returned by CreateAppWebhookIfUnderQuota
+// when either cap (per-app or per-account) is reached. Mirrors
+// AlertRuleQuotaError at types.go:1030-1053.
+type AppWebhookQuotaError struct {
+	Scope    AppWebhookQuotaScope
+	Limit    int
+	Observed int
+}
+
+// AppWebhookQuotaScope names the cap that
+// CreateAppWebhookIfUnderQuota tripped on. A subscription always
+// counts toward the per-account cap and its owning app's per-app
+// cap (no NULL-app_id shape, unlike alert rules).
+type AppWebhookQuotaScope string
+
+const (
+	AppWebhookQuotaScopeApp     AppWebhookQuotaScope = "app"
+	AppWebhookQuotaScopeAccount AppWebhookQuotaScope = "account"
+)
+
+func (e *AppWebhookQuotaError) Error() string {
+	return fmt.Sprintf("state: app webhook quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
 // Is allows errors.Is(err, ErrAlertRuleQuotaExceeded) to match any
 // *AlertRuleQuotaError. Mirrors CronQuotaError's Is() contract.
 func (e *AlertRuleQuotaError) Is(target error) bool {
