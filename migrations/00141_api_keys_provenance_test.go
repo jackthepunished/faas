@@ -10,9 +10,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00139_APIKeysProvenance pins the IDEMPOTENT ALTER
+// TestMigrations_00141_APIKeysProvenance pins the IDEMPOTENT ALTER
 // shape and the column types of the api_keys provenance columns
-// landed by 00139_api_keys_provenance.sql.
+// landed by 00141_api_keys_provenance.sql.
 //
 // What we pin (replay-safety + audit-evidence cost):
 //   - Column types match the APIKey struct (CreatedIP is INET —
@@ -24,12 +24,12 @@ import (
 //     the predecessor leaves the new row's parent_key_id NULL
 //     (ON DELETE SET NULL).
 //   - The replay guard: re-running the migration after a successful
-//     first run is a no-op (ADD COLUMN IF NOT EXISTS in 00139).
+//     first run is a no-op (ADD COLUMN IF NOT EXISTS in 00141).
 //
 // Cross-PR slot reservation note: this test is coupled to the .sql
 // at slot 135. If a sibling PR renumbers, the test file moves with
 // it (per migration-slot-renumber-at-pr-creation).
-func TestMigrations_00139_APIKeysProvenance(t *testing.T) {
+func TestMigrations_00141_APIKeysProvenance(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t) // t.Skip-friendly on missing DATABASE_URL
 
@@ -92,7 +92,7 @@ func TestMigrations_00139_APIKeysProvenance(t *testing.T) {
 	for col, want := range want {
 		g, ok := got[col]
 		if !ok {
-			t.Errorf("api_keys.%s column missing — migration 00139 not applied", col)
+			t.Errorf("api_keys.%s column missing — migration 00141 not applied", col)
 			continue
 		}
 		if g.dt != want.dt {
@@ -131,7 +131,7 @@ func TestMigrations_00139_APIKeysProvenance(t *testing.T) {
 		// when this test runs on a database that's a couple of
 		// migrations behind.
 		if strings.Contains(err.Error(), "no rows") {
-			t.Skipf("parent_key_id FK not present — migration 00139 not applied yet: %v", err)
+			t.Skipf("parent_key_id FK not present — migration 00141 not applied yet: %v", err)
 		}
 		t.Fatalf("query FK: %v", err)
 	}

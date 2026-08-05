@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00140_sessions_binding.sql — IAM hardening mega-PR (logical change 5).
+-- 00142_sessions_binding.sql — IAM hardening mega-PR (logical change 5).
 --
 -- Add a `binding_hash` column to the `sessions` table so the
 -- apid auth middleware can auto-revoke a stolen `faas_sid` cookie

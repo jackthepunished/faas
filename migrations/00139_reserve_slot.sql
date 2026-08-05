@@ -1,11 +1,14 @@
 -- filename: 00139_reserve_slot.sql
--- Fence at slot 139 — held by PR #654 to bridge 00138 (PR #647
--- apps_eviction_priority) and 00143 (per-app require_authn). PR
--- #651 (issue #464 mega-PR) also claimed slot 139 with a real
--- schema; per ADR-041 the bridge fence gets `git rm`'d on whichever
--- side merges second — whoever's real schema lands at 139 first
--- shadows this fence. Body is a no-op `select 1;` so goose applies
--- cleanly and writes a row in goose_db_version.
+-- Slot fence: see 00135_reserve_slot.sql's header for the
+-- cross-PR slot-cluster rationale (PR #540 webhook-deliveries,
+-- PR #651 deploy-scans, PR #653 IAM provenance, PR #654
+-- per-deployment authn). The IAM mega-PR (PR #653) originally
+-- landed the api_keys provenance migration at slot 139, then
+-- renumbered a second time to 141 after the cross-PR slot gate
+-- surfaced that open PRs #651 and #654 both also claim 139.
+-- PR #651 will resolve this fence on its branch's merge;
+-- PR #654 will resolve the same fence from its side.
+-- ADR-041.
 
 -- +goose Up
 -- +goose StatementBegin

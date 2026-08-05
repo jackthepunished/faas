@@ -457,21 +457,25 @@ const testDomain = "apps.test.example"
 //     #651/#653/#654 lands first, the fences resolve themselves
 //     (real schema shadows the fence on the side that merges last).
 //
-//   - 138 → 140 with PR #653 (IAM hardening mega-PR). The mega-PR
-//     adds slot 00139_api_keys_provenance.sql (logical change 2:
+//   - 138 → 142 with PR #653 (IAM hardening mega-PR). The mega-PR
+//     adds slot 00141_api_keys_provenance.sql (logical change 2:
 //     api_keys.created_ip / created_ua / parent_key_id — the SOC2
-//     audit-evidence lineage) and slot 00140_sessions_binding.sql
+//     audit-evidence lineage) and slot 00142_sessions_binding.sql
 //     (logical change 5: sessions.binding_hash for the stolen-cookie
 //     auto-revoke cross-check). Originally landed at 135/136, then
 //     renumbered to 139/140 after PR #647 (issue #475 / ADR-075
 //     eviction priority) merged at slot 138 with reserve_slot
-//     fences at 135/136/137 — the cross-PR slot gate would have
-//     rejected the push otherwise. The three fence files
-//     (00135/00136/00137_reserve_slot.sql) on this branch are
-//     byte-for-byte identical to the fences on main; they hold
-//     the carved-out slots while this branch sits past the
-//     eviction_priority land and get `git rm`'d on merge.
-const e2eMigrationTarget = 140
+//     fences at 135/136/137, then renumbered a second time to
+//     141/142 after the cross-PR slot gate surfaced that open
+//     PRs #651 (deploy-scans) and #654 (per-deployment authn) also
+//     claimed slot 139. The four fence files
+//     (00135/00136/00137/00139_reserve_slot.sql) on this branch are
+//     byte-for-byte identical to the fences on main (139 is a new
+//     fence added in this cycle to fill the slot vacated by the
+//     second renumber). They hold the carved-out slots while this
+//     branch sits past the eviction_priority land and get
+//     `git rm`'d on merge.
+const e2eMigrationTarget = 142
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_
