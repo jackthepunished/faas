@@ -30,10 +30,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -46,6 +49,7 @@ type SidecarEventsThroughPlatform struct {
 	Platform *events.Platform
 	Metrics  *wire.OpsMetrics
 	Store    sidecarAuditStore // deployments-side audit row
+	Failer   deploymentFailer  // PR-B AC #1: deployment-row flip on init_failed
 	Log      *slog.Logger
 	Now      func() time.Time
 }
@@ -60,6 +64,27 @@ type SidecarEventsThroughPlatform struct {
 // precedent in pkg/events/platform.go).
 type sidecarAuditStore interface {
 	AppendEvent(ctx context.Context, actor, kind string, subject *string, payload []byte) error
+}
+
+// deploymentFailer (issue #463 / ADR-069 / PR-B AC #1) is
+// the narrowed subset of state.Store the production emitter
+// needs to flip the deployments row to status='failed' on a
+// non-zero init sidecar exit. The id is the deployments.id
+// UUID resolved from the live Instance at dispatch time
+// (Manager.InstanceDeploymentIDAndAppID); the code is the
+// RFC 7807 stable code (api.CodeInitSidecarFailed); the
+// message is a customer-facing reason string formatted from
+// the wire envelope (sidecar name + exit code + duration).
+//
+// Defined as a one-method interface so the cmd/vmmd unit
+// test substitutes a fake without spinning up a Postgres
+// connection. The state.Store interface is compatible with
+// this shape (it carries SetDeploymentFailed at
+// pkg/state/store.go:1197 — added by ADR-021 for the
+// pre-build hook; PR-B AC #1 reuses the same primitive
+// for the init sidecar exit path).
+type deploymentFailer interface {
+	SetDeploymentFailed(ctx context.Context, id, code, message string) (state.Deployment, error)
 }
 
 // sidecarFailureClassUserError is the AC #1 shibboleth for a
@@ -91,8 +116,17 @@ const sidecarAuditEventActor = "vmmd"
 // log here. The struct fields are derived from the wire
 // envelope + the (instance, appID) passed in by the
 // dispatcher (cmd/vmmd::dispatchSidecarInitExit).
+//
+// deploymentID (PR-B AC #1) is the deployments.id UUID the
+// instance was woken for. On init_failed + non-empty
+// deploymentID + non-nil Failer, the deployments row is
+// flipped to status='failed' with error_code =
+// api.CodeInitSidecarFailed. Empty deploymentID (legacy
+// pre-PR-B wake that didn't carry the id on the wire) is
+// tolerated — the audit row still lands so the dispatch is
+// observable, but the deploy row stays untouched.
 func (e *SidecarEventsThroughPlatform) EmitSidecarInitExit(
-	ctx context.Context, instanceID, appID, wakeID string, wireEnv sidecarInitExitWire,
+	ctx context.Context, instanceID, appID, deploymentID, wakeID string, wireEnv sidecarInitExitWire,
 ) {
 	if e == nil {
 		return
@@ -128,6 +162,24 @@ func (e *SidecarEventsThroughPlatform) EmitSidecarInitExit(
 		); err != nil && e.Log != nil {
 			e.Log.Warn("sidecar.init_failed audit write failed",
 				"instance", instanceID, "sidecar", wireEnv.Sidecar, "err", err)
+		}
+	}
+	// PR-B AC #1 (deploy-row flip): on init_failed with a
+	// non-empty deployment_id, call SetDeploymentFailed so
+	// the customer-visible deploy row reflects the failure
+	// within the same hot-loop dispatch (no pg_notify bridge,
+	// no apid round-trip). Best-effort: a SetDeploymentFailed
+	// failure is logged + dropped — the audit row above is
+	// the secondary observability surface. Empty deploymentID
+	// (legacy wake) is skipped — the audit row is the only
+	// observable signal in that case.
+	if wireEnv.Status == "init_failed" && deploymentID != "" && e.Failer != nil {
+		msg := fmt.Sprintf("init sidecar %q exited %d after %dms",
+			wireEnv.Sidecar, wireEnv.ExitCode, wireEnv.DurationMs)
+		if _, err := e.Failer.SetDeploymentFailed(ctx, deploymentID, api.CodeInitSidecarFailed, msg); err != nil && e.Log != nil {
+			e.Log.Warn("sidecar.init_failed deployment-row flip failed",
+				"instance", instanceID, "deployment_id", deploymentID,
+				"sidecar", wireEnv.Sidecar, "err", err)
 		}
 	}
 }

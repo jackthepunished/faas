@@ -634,7 +634,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			Platform: platform,
 			Metrics:  ops,
 			Store:    store,
-			Log:      log,
+			// PR-B AC #1 (issue #463 / ADR-069): wire the
+			// state.Store as the deploymentFailer so a
+			// non-zero init sidecar exit flips the
+			// deployments row to status='failed' with
+			// error_code = api.CodeInitSidecarFailed at the
+			// dispatch site (no pg_notify bridge). The store
+			// satisfies the narrowed deploymentFailer
+			// interface via SetDeploymentFailed
+			// (pkg/state/store.go:1197, ADR-021).
+			Failer: store,
+			Log:    log,
 		})
 		defer recv.Close()
 	}

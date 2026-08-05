@@ -58,8 +58,17 @@ type sidecarRestartWire struct {
 // the audit destination; tests wire an in-memory fake so the
 // dispatch path is unit-testable without spinning up a real
 // state.Store or a Prometheus registry.
+//
+// EmitSidecarInitExit carries deploymentID (issue #463 /
+// ADR-069 / PR-B AC #1) so the production emitter can flip
+// the deployments row to status='failed' on init_failed
+// without crossing a process boundary (vmmd owns the
+// per-instance live map, so the deployment_id is resolvable
+// at the dispatch site in O(1) — no pg_notify bridge). Empty
+// deployment_id is tolerated: a legacy wake without a
+// deployment_id on the wire leaves the deploy row untouched.
 type SidecarEventEmitter interface {
-	EmitSidecarInitExit(ctx context.Context, instanceID, appID, wakeID string, wire sidecarInitExitWire)
+	EmitSidecarInitExit(ctx context.Context, instanceID, appID, deploymentID, wakeID string, wire sidecarInitExitWire)
 	EmitSidecarRestart(ctx context.Context, instanceID, appID, wakeID string, wire sidecarRestartWire)
 }
 
@@ -71,7 +80,7 @@ type SidecarEventEmitter interface {
 // (pkg/events.Platform's contract).
 type noopSidecarEventEmitter struct{}
 
-func (noopSidecarEventEmitter) EmitSidecarInitExit(context.Context, string, string, string, sidecarInitExitWire) {
+func (noopSidecarEventEmitter) EmitSidecarInitExit(context.Context, string, string, string, string, sidecarInitExitWire) {
 }
 func (noopSidecarEventEmitter) EmitSidecarRestart(context.Context, string, string, string, sidecarRestartWire) {
 }
