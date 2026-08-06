@@ -33,6 +33,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -41,6 +42,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // InternalDialer is the seam the public daemon wires to reach a
@@ -97,16 +100,29 @@ type InternalReverseProxy struct {
 // production values (10 s dial timeout, 30 s response header
 // timeout, slog.Default()).
 //
+// useH2C switches the upstream transport to H2C (HTTP/2 cleartext)
+// for the in-process unix-socket hop. Issue #675: default is true so
+// the Tier A7 production path negotiates H2 end-to-end with the
+// gatewayd-internal h2c.NewHandler wrapper. Set to false to fall
+// back to the legacy HTTP/1.1 transport (e.g. for rollback via the
+// FAAS_INTERNAL_H2C env knob in cmd/gatewayd-public/main.go).
+//
 // The returned proxy is safe for concurrent use on the public
 // listener hot path.
-func NewInternalReverseProxy(dialer InternalDialer, target *url.URL, log *slog.Logger) *InternalReverseProxy {
+func NewInternalReverseProxy(dialer InternalDialer, target *url.URL, log *slog.Logger, useH2C bool) *InternalReverseProxy {
 	if log == nil {
 		log = slog.Default()
+	}
+	var transport http.RoundTripper
+	if useH2C {
+		transport = newInternalProxyH2CTransport(dialer)
+	} else {
+		transport = newInternalProxyTransport(dialer)
 	}
 	return &InternalReverseProxy{
 		Dialer:      dialer,
 		Target:      target,
-		Transport:   newInternalProxyTransport(dialer),
+		Transport:   transport,
 		Logger:      log,
 		DialTimeout: 10 * time.Second,
 	}
@@ -135,8 +151,53 @@ func newInternalProxyTransport(dialer InternalDialer) *http.Transport {
 		ResponseHeaderTimeout: 30 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		// Disable HTTP/2 — the unix-socket hop is HTTP/1.1 only.
+		// Issue #675: this is the legacy HTTP/1.1 path; for the
+		// production Tier A7 hop use newInternalProxyH2CTransport
+		// instead. Kept here so the legacy e2e harness path (which
+		// expects HTTP/1.1) keeps working without any knob.
 		ForceAttemptHTTP2: false,
 	}
+}
+
+// newInternalProxyH2CTransport returns an http2.Transport that
+// dials the unix socket via the supplied InternalDialer. H2C
+// (HTTP/2 cleartext) is the only way to negotiate HTTP/2 over the
+// plaintext unix socket — the stdlib http.Transport refuses to do
+// H2 without TLS even when ForceAttemptHTTP2 is true.
+//
+// The server side of this hop (gatewayd-internal) wraps its handler
+// with h2c.NewHandler in cmd/gatewayd-internal/run.go so the
+// negotiation is symmetric. Together they carry H2 frames in both
+// directions on the same in-process socket that used to be HTTP/1.1.
+//
+// Streaming responses (app.StreamingEnabled=true) keep working
+// because the customer handler writes its own chunked framing
+// downstream of this hop — h2c is transparent to the streaming
+// path. The handler-to-guest leg stays HTTP/1.1 plaintext per the
+// issue #675 decision to keep streaming on HTTP/1.1.
+//
+// Connection lifetime mirrors the HTTP/1.1 transport above so an
+// operator toggling between the two transports via FAAS_INTERNAL_H2C
+// doesn't see different idle-conn behaviour. ReadIdleTimeout +
+// PingTimeout are H2-specific keepalive parameters that have no
+// HTTP/1.1 equivalent.
+func newInternalProxyH2CTransport(dialer InternalDialer) http.RoundTripper {
+	t := &http2.Transport{
+		// AllowHTTP is the load-bearing flag — without it http2
+		// refuses to dial plain HTTP and falls back to TLS-or-error.
+		AllowHTTP: true,
+		// DialTLS is the seam the http2 library uses to acquire a
+		// net.Conn. We ignore network/addr/cfg and route everything
+		// through the unix-socket InternalDialer. The context
+		// passed here is the request context (caller's deadline);
+		// we propagate it to the dialer so cancellation works.
+		DialTLS: func(_ string, _ string, _ *tls.Config) (net.Conn, error) {
+			return dialer.DialContext(context.Background(), "")
+		},
+		ReadIdleTimeout: 30 * time.Second,
+		PingTimeout:     15 * time.Second,
+	}
+	return t
 }
 
 // ServeHTTP implements http.Handler. It rewrites the inbound

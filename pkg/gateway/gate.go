@@ -12,6 +12,13 @@ import (
 // ONE wake and all wait on it (single-flight per app), up to a cap; past the cap,
 // or past the TTL, the caller returns 503 + Retry-After. This coalescing is what
 // makes a burst to a parked app cost one restore, not N.
+//
+// Issue #675 / H2C multiplexing: WakeGate keys on appID alone (not on the
+// connection), so N concurrent H2 streams on one unix-socket connection
+// still coalesce into a single wake. The transport is irrelevant to the
+// gate — HTTP/1.1, HTTP/2 cleartext, or in-process goroutines all hit
+// the same single-flight map. Operators upgrading the public→internal
+// hop to H2C (issue #675) do not lose coalescing semantics.
 type WakeGate struct {
 	mu       sync.Mutex
 	inflight map[string]*wakeCall

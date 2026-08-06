@@ -51,6 +51,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // scheddSocket is schedd's gRPC unix socket (ADR-018). Phase 2 /
@@ -932,6 +934,47 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	errc := make(chan error, 4)
 	var servers []*http.Server
 	addSrv := func(s *http.Server) { servers = append(servers, s) }
+
+	// Issue #675: build the unified mux that the unix-socket server
+	// (`deps.synth`) serves. The mux routes:
+	//   /v1/synthesize           → synth handler (existing, M7)
+	//   /v1/invocations:dispatch → synth handler (existing, Move 1)
+	//   /healthz                 → synth handler
+	//   everything else          → customer publicHandler (NEW — issue #675)
+	//
+	// Production (FAAS_GATEWAY_LISTEN=off) routes ALL customer traffic
+	// through this mux via gatewayd-public's reverse proxy. The legacy
+	// :8080 TCP listener below (when not off) keeps publicHandler
+	// directly — but in prod the TCP path is unused.
+	if deps.synth != nil {
+		unifiedMux := http.NewServeMux()
+		// Customer traffic — anything not matched by the synth
+		// prefixes falls through to publicHandler. Register the
+		// catch-all FIRST so the more-specific patterns below win
+		// (http.ServeMux longest-prefix match).
+		unifiedMux.Handle("/", publicHandler)
+		// Pull the synth mux out of the SynthServer via a small
+		// accessor; the server exposes SetHandler so the caller
+		// owns the unified mux. The synth mux itself carries
+		// the three routes registered in NewSynthServer.
+		unifiedMux.Handle("/v1/synthesize", deps.synth.Mux())
+		unifiedMux.Handle("/v1/invocations:dispatch", deps.synth.Mux())
+		unifiedMux.Handle("/healthz", deps.synth.Mux())
+		// Wrap with h2c so the in-process unix-socket hop negotiates
+		// H2C prior knowledge (no TLS). The customer publicHandler
+		// speaks HTTP/1.1 downstream, but the gatewayd-public ← →
+		// gatewayd-internal hop now carries H2 frames.
+		//
+		// Streaming responses (app.StreamingEnabled=true) still go
+		// through the existing HTTP/1.1 chunked path inside the
+		// handler — h2c.NewHandler is transparent to streaming
+		// because the handler writes chunked on its own writer.
+		h2cHandler := h2c.NewHandler(unifiedMux, &http2.Server{})
+		deps.synth.SetHandler(h2cHandler)
+	}
+	// addSrv is the closure for the public :8080 + control listeners
+	// below; declared above so the unified-mux block above can run
+	// before the public-listener gate without depending on it.
 	// Plain-:8080 path. ADR-068 / Tier A7 split: TLS termination
 	// moved to gatewayd-public (certmagic, httpsec, :443/:80 ACME
 	// mux); this daemon no longer builds a *gateway.TLSBundle. The

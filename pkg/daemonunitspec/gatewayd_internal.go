@@ -7,6 +7,13 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 // a public port; it listens on a unix socket inside the box. The public
 // edge daemon (gatewayd-public) forwards every inbound request to it.
 //
+// Issue #675 / Tier A7 unified mux: the unix socket now serves BOTH the
+// synth routes (schedd → /v1/synthesize, /v1/invocations:dispatch, /healthz)
+// AND the customer publicHandler (gatewayd-public → customer traffic).
+// Both ride h2c.NewHandler so the public→internal hop negotiates HTTP/2
+// cleartext (the outer Caddy + TLS hop terminates H2; the in-box socket
+// hop is plaintext, hence H2C rather than H2).
+//
 // Wipe-comments-load-bearing rationale:
 //
 //   - FAAS_GATEWAY_LISTEN=off is REQUIRED to skip the public listener.
