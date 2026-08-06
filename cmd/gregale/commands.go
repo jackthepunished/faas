@@ -273,8 +273,8 @@ func cmdApps() int {
 	// require_authn + public_auth_mode state in human-readable
 	// form. The "since YYYY-MM-DD" suffix renders only when
 	// auth_default_flipped_at is non-null — pre-flip apps
-	// that have been grand-fathered by migration 00155.
-	_, _ = fmt.Fprintln(osStdout, fmt.Sprintf("%-24s %-10s %-32s %s", "SLUG", "STATUS", "URL", "AUTH"))
+	// that have been grand-fathered by migration 00156.
+	_, _ = fmt.Fprintf(osStdout, "%-24s %-10s %-32s %s\n", "SLUG", "STATUS", "URL", "AUTH")
 	for _, a := range apps {
 		_, _ = fmt.Fprintf(osStdout, "%-24s %-10s %-32s %s\n", a.Slug, a.Status, a.URL, formatAppAuth(a))
 	}
@@ -290,7 +290,7 @@ func cmdApps() int {
 //   "AUTH: required + basic"   — bearer-mode chain + basic creds set.
 //
 // Suffix renders "since YYYY-MM-DD" only when auth_default_flipped_at
-// is non-null (pre-flip apps grand-fathered by migration 00155).
+// is non-null (pre-flip apps grand-fathered by migration 00156).
 // Falls back to UTC date-only when the time zone or wall time is
 // degenerate — dashboard surfaces the same field with full RFC 3339.
 func formatAppAuth(a api.AppResponse) string {
