@@ -172,8 +172,12 @@ func TestBridge_UsageError(t *testing.T) {
 		if err == nil {
 			t.Errorf("argv=%v: expected exit error, got %q", argv, string(out))
 		}
-		// Bridge exits 2 on usage errors.
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() != 2 {
+		// Bridge exits 2 on usage errors. errors.As walks the
+		// wrap chain so a future call site that adds context via
+		// fmt.Errorf("%w: ...", err) still classifies correctly
+		// (errorlint lint rule).
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() != 2 {
 			t.Errorf("argv=%v: exit code %d, want 2", argv, exitErr.ExitCode())
 		}
 	}
@@ -213,7 +217,9 @@ func TestBridge_DialRefused(t *testing.T) {
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
-		if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 3 {
+		// errors.As walks the wrap chain (errorlint lint rule).
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
 			t.Errorf("bridge exit: %v, want exit code 3", err)
 		}
 	case <-time.After(5 * time.Second):
