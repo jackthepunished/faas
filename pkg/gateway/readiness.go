@@ -315,10 +315,13 @@ func NewPGPingSignal(ctx context.Context, pool pinger, every time.Duration) (*Re
 			}
 		}
 	}()
+	var stopOnce sync.Once
 	stopper := func() {
-		close(stop)
-		<-done
-		s.Set(false, "pg ping stopped")
+		stopOnce.Do(func() {
+			close(stop)
+			<-done
+			s.Set(false, "pg ping stopped")
+		})
 	}
 	return s, stopper
 }

@@ -35,7 +35,7 @@ func UnitGatewaydPublic() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/gatewayd-public`,
+		ExecStart:  `/opt/faas/current/bin/gatewayd-public`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 

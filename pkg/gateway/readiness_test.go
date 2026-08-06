@@ -187,6 +187,14 @@ func TestNewPGPingSignal_StopFlipsNotReady(t *testing.T) {
 	}
 }
 
+func TestNewPGPingSignal_StopIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, stop := NewPGPingSignal(ctx, &stubPinger{}, 50*time.Millisecond)
+	stop()
+	stop()
+}
+
 // TestNewStalenessSignal_FreshTouchReady verifies the touch path
 // keeps the signal ready while touches are recent.
 func TestNewStalenessSignal_FreshTouchReady(t *testing.T) {

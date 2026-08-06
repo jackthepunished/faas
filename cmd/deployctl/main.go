@@ -10,6 +10,9 @@
 //	check [dirs...]      regenerate to a tempdir, assert byte equality
 //	                     against the committed files; exit 1 on drift
 //	diff [dirs...]        like check, but prints the result to stdout
+//	bundle-create <root> <release-id> <commit-sha> <target>
+//	                      write and verify an immutable release manifest
+//	bundle-check <root>   verify the manifest and every release file
 //
 // Invocation sites:
 //
@@ -20,13 +23,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/daemonunitspec"
+	"github.com/onebox-faas/faas/pkg/deploycontroller"
+	"github.com/onebox-faas/faas/pkg/releasebundle"
 )
 
 func main() {
@@ -50,6 +57,21 @@ func main() {
 	case "diff":
 		if err := runCheck(args, false); err != nil {
 			fmt.Fprintln(os.Stderr, "deployctl diff:", err)
+			os.Exit(1)
+		}
+	case "bundle-create":
+		if err := runBundleCreate(args); err != nil {
+			fmt.Fprintln(os.Stderr, "deployctl bundle-create:", err)
+			os.Exit(1)
+		}
+	case "bundle-check":
+		if err := runBundleCheck(args); err != nil {
+			fmt.Fprintln(os.Stderr, "deployctl bundle-check:", err)
+			os.Exit(1)
+		}
+	case "deploy":
+		if err := runDeploy(args); err != nil {
+			fmt.Fprintln(os.Stderr, "deployctl deploy:", err)
 			os.Exit(1)
 		}
 	default:
@@ -151,6 +173,55 @@ func targetDirs() []string {
 		dirs[i] = t.dir
 	}
 	return dirs
+}
+
+func runBundleCreate(args []string) error {
+	if len(args) != 4 {
+		return fmt.Errorf("usage: deployctl bundle-create <root> <release-id> <commit-sha> <target>")
+	}
+	manifest, err := releasebundle.Build(args[0], args[1], args[2], args[3], time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if err := releasebundle.Write(args[0], manifest); err != nil {
+		return err
+	}
+	if err := releasebundle.Verify(args[0], manifest); err != nil {
+		return err
+	}
+	fmt.Printf("release bundle %s verified (%d files)\n", manifest.ReleaseID, len(manifest.Files))
+	return nil
+}
+
+func runBundleCheck(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: deployctl bundle-check <root>")
+	}
+	manifest, err := releasebundle.Read(args[0])
+	if err != nil {
+		return err
+	}
+	if err := releasebundle.Verify(args[0], manifest); err != nil {
+		return err
+	}
+	fmt.Printf("release bundle %s verified (%d files)\n", manifest.ReleaseID, len(manifest.Files))
+	return nil
+}
+
+func runDeploy(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: deployctl deploy <release-id>")
+	}
+	runtime := defaultHostRuntime()
+	controller, err := deploycontroller.New(deploycontroller.Config{
+		ReleasesRoot: "/opt/faas/releases",
+		CurrentPath:  "/opt/faas/current",
+		LockPath:     "/run/lock/faas-deploy.lock",
+	}, runtime)
+	if err != nil {
+		return err
+	}
+	return controller.Deploy(context.Background(), args[0])
 }
 
 // generateTo is the core: write unit files + slice + JSON to named

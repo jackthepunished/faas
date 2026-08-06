@@ -30,7 +30,7 @@ func UnitGatewaydInternal() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/gatewayd-internal --config /etc/faas/gatewayd-internal.toml`,
+		ExecStart:  `/opt/faas/current/bin/gatewayd-internal --config /etc/faas/gatewayd-internal.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 

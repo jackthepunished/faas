@@ -26,7 +26,7 @@ func UnitMeterd() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas-meterd",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/meterd --config /etc/faas/meterd.toml`,
+		ExecStart:  `/opt/faas/current/bin/meterd --config /etc/faas/meterd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 

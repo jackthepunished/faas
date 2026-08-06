@@ -38,7 +38,7 @@ func UnitGithubd() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/githubd --config /etc/faas/githubd.toml`,
+		ExecStart:  `/opt/faas/current/bin/githubd --config /etc/faas/githubd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 

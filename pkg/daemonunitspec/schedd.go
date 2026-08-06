@@ -27,7 +27,7 @@ func UnitSchedd() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas-schedd",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/schedd --config /etc/faas/schedd.toml`,
+		ExecStart:  `/opt/faas/current/bin/schedd --config /etc/faas/schedd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
