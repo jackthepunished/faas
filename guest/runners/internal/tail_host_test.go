@@ -142,12 +142,14 @@ func TestTailHost_RegisterHonorsTailCapMax(t *testing.T) {
 	}
 }
 
-// TestTailHost_DrainRespectsMaxWait pin the upper bound on a
-// pathological taskFn — the drain must NOT block past waitUntil +
-// TailWriteTimeout. Mirrors the snapshotAndPark 5s watchdog on
-// schedd: the runner's tail host is the inner timeout, the
-// schedd's watchdog is the outer timeout. Both must fire.
-func TestTailHost_DrainRespectsMaxWait(t *testing.T) {
+// TestTailHost_DrainSafetyNetTimeoutFires pins the safety-net
+// timeout (the ctx.Done() branch in Drain) on a pathological
+// taskFn that ignores ctx.Done() — the drain must NOT block past
+// waitUntil + TailWriteTimeout. This is the *outer* drain bound
+// (vs. the per-task context.WithTimeout bound in runTask). The
+// runner's drain respects both; the schedd's 5s snapshotAndPark
+// watchdog is the *park* bound, not the *drain* bound.
+func TestTailHost_DrainSafetyNetTimeoutFires(t *testing.T) {
 	const waitUntilSec = 1
 	// 350ms slack = TailWriteTimeout (250ms) + 100ms CI jitter.
 	const slackBound = 350 * time.Millisecond

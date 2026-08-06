@@ -75,7 +75,11 @@ process.stdin.on('end', () => {
 // FakeNodeScriptWithTail is the Node counterpart of
 // FakeGoScriptWithTail. Writes a JSONL entry to envelope.TailPipePath
 // before returning the response envelope, so the runner's
-// drainTailHost reads the pipe after invokeHandler returns.
+// drainTailHost reads the pipe after invokeHandler returns. The
+// response envelope also echoes the tail_pipe_path and
+// wait_until_sec it saw in the input envelope — the per-runtime
+// parity test (RunWaitUntilEnvelopeRoundTrip) asserts the
+// runner threaded the env var correctly into the envelope.
 func FakeNodeScriptWithTail() FakeHandler {
 	return FakeHandler{
 		Script: `#!/usr/bin/env node
@@ -89,7 +93,12 @@ process.stdin.on('end', () => {
   }
   const out = {
     status: 200,
-    headers: { "X-Echo-Method": env.method, "X-Echo-Path": env.path },
+    headers: {
+      "X-Echo-Method": env.method,
+      "X-Echo-Path": env.path,
+      "X-Echo-TailPipe": env.tail_pipe_path || "",
+      "X-Echo-WaitUntilSec": String(env.wait_until_sec || 0),
+    },
     body_b64: Buffer.from("echo:" + env.path).toString("base64")
   };
   process.stdout.write(JSON.stringify(out));
@@ -121,7 +130,11 @@ sys.stdout.write(json.dumps(out))
 
 // FakePyScriptWithTail writes a JSONL entry to envelope.TailPipePath
 // before returning the response envelope. The runner's
-// drainTailHost reads the pipe after invokeHandler returns.
+// drainTailHost reads the pipe after invokeHandler returns. The
+// response envelope also echoes the tail_pipe_path and
+// wait_until_sec it saw in the input envelope — the per-runtime
+// parity test (RunWaitUntilEnvelopeRoundTrip) asserts the
+// runner threaded the env var correctly into the envelope.
 func FakePyScriptWithTail() FakeHandler {
 	return FakeHandler{
 		Script: `#!/usr/bin/env python3
@@ -132,7 +145,12 @@ if env.get("tail_pipe_path"):
         f.write(json.dumps({"id": "task-tail-1", "wait": False}) + "\n")
 out = {
     "status": 200,
-    "headers": {"X-Echo-Method": env["method"], "X-Echo-Path": env["path"]},
+    "headers": {
+        "X-Echo-Method": env["method"],
+        "X-Echo-Path": env["path"],
+        "X-Echo-TailPipe": env.get("tail_pipe_path", ""),
+        "X-Echo-WaitUntilSec": str(env.get("wait_until_sec", 0)),
+    },
     "body_b64": base64.b64encode(("echo:" + env["path"]).encode()).decode(),
 }
 sys.stdout.write(json.dumps(out))
@@ -168,19 +186,25 @@ printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_
 // drain end-to-end (the emit fails because the proxy isn't
 // running in unit tests, but the runner's drain doesn't gate on
 // the emit — TailErrors stays empty on the happy path).
+//
+// The response also echoes the tail_pipe_path and wait_until_sec
+// it saw in the input envelope (the per-runtime parity test
+// asserts the runner threaded the env var correctly into the
+// envelope — issue #667 review item #12).
 func FakeGoScriptWithTail() FakeHandler {
 	return FakeHandler{
 		Script: `#!/bin/sh
 read -r env
 method=$(printf '%s' "$env" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
 path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
-# tail_pipe_path from the envelope (issue #667 / ADR-078).
+# tail_pipe_path + wait_until_sec from the envelope (issue #667 / ADR-078).
 tail_pipe=$(printf '%s' "$env" | sed -n 's/.*"tail_pipe_path":"\([^"]*\)".*/\1/p')
+wait_until_sec=$(printf '%s' "$env" | sed -n 's/.*"wait_until_sec":\([0-9][0-9]*\).*/\1/p')
 if [ -n "$tail_pipe" ]; then
   printf '{"id":"task-tail-1","wait":false}\n' >> "$tail_pipe"
 fi
-printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_b64":"%s"}' \
-  "$method" "$path" "$(printf '%s' "echo:$path" | base64)"
+printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s","X-Echo-TailPipe":"%s","X-Echo-WaitUntilSec":"%s"},"body_b64":"%s"}' \
+  "$method" "$path" "$tail_pipe" "$wait_until_sec" "$(printf '%s' "echo:$path" | base64)"
 `,
 		Filename:    "handler",
 		Interpreter: nil,
@@ -444,6 +468,19 @@ func RunWaitUntilEnvelopeRoundTrip(t *testing.T, fake FakeHandler, handler func(
 	}
 	if got := resp.Header.Get("X-Echo-Path"); got != "/hello" {
 		t.Errorf("X-Echo-Path = %q, want /hello", got)
+	}
+	// Pin the env-var → envelope round-trip: the FakeHandler's
+	// JSON output echoes back the tail_pipe_path it observed.
+	// If the runner forgot to thread the env var into the
+	// envelope (issue #667 review item #12), this assertion
+	// catches the drift. The handler subprocess reads its
+	// envelope from stdin and writes the tail_pipe_path value
+	// into the X-Echo-TailPipe response header.
+	if got := resp.Header.Get("X-Echo-TailPipe"); got != pipePath {
+		t.Errorf("X-Echo-TailPipe = %q, want %q (envelope.TailPipePath must equal the FAAS_TAIL_PIPE_PATH the runner was started with)", got, pipePath)
+	}
+	if got := resp.Header.Get("X-Echo-WaitUntilSec"); got != "30" {
+		t.Errorf("X-Echo-WaitUntilSec = %q, want 30 (envelope.WaitUntilSec must thread the per-task ceiling)", got)
 	}
 	body := new(bytes.Buffer)
 	if _, err := io.Copy(body, resp.Body); err != nil {

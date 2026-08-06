@@ -100,14 +100,17 @@ func TestParity_AllRuntimesHonorWaitUntil(t *testing.T) {
 			t.Errorf("%s: tail_host_integration.go does not define drainTailHost", runnerDir)
 			missingEnv = true
 		}
-		// 4. tail_host_integration.go imports internal.NewTailHost
-		// (the runner-agnostic TailHost type).
-		if !strings.Contains(integration, "internal.NewTailHost") {
-			t.Errorf("%s: tail_host_integration.go does not call internal.NewTailHost", runnerDir)
-			missingEnv = true
-		}
-		if !strings.Contains(integration, "internal.ReadPipe") {
-			t.Errorf("%s: tail_host_integration.go does not call internal.ReadPipe", runnerDir)
+		// 4. tail_host_integration.go imports internal (the
+		// runner-agnostic helpers). Acceptance: either the
+		// shim call internal.NewTailHost + internal.ReadPipe
+		// directly (the v1 shape) OR call internal.DrainForResponse
+		// (the v2 helper that encapsulates both — preferred for
+		// new code; issue #667 review item #11 deduplication).
+		usesDrainForResponse := strings.Contains(integration, "internal.DrainForResponse")
+		usesNewTailHost := strings.Contains(integration, "internal.NewTailHost")
+		usesReadPipe := strings.Contains(integration, "internal.ReadPipe")
+		if !usesDrainForResponse && (!usesNewTailHost || !usesReadPipe) {
+			t.Errorf("%s: tail_host_integration.go must call internal.DrainForResponse OR (internal.NewTailHost + internal.ReadPipe)", runnerDir)
 			missingEnv = true
 		}
 

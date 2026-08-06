@@ -356,12 +356,14 @@ returns immediately on an empty pipe, the response runs through.
 
 ### Runner-side tail host (`guest/runners/internal/tail_host.go`)
 
-Exported `TailHost` type. Constructor `NewTailHost(runtime, pipePath, waitUntilSec, tailCapMax int)` returns a `*TailHost`. Public surface:
+Exported `TailHost` type. Constructor `NewTailHost(runtime, pipePath string, waitUntilSec int, tailCapMax int)` returns a `*TailHost`. Public surface:
 
 - `RegisterCount() int` — number of registered tasks (capped at `TailCapMax`).
 - `Failures() []string` — `"timeout:task-N"` / `"error:task-N"` reasons captured during the drain (appended to `response.TailErrors`).
-- `Register(name string) error` — reads one JSONL line from the pipe, spawns a goroutine under `context.WithTimeout`, captures the terminal outcome. Returns `ErrTailCapReached` if the cap is hit.
-- `Drain() int` — blocks until every spawned goroutine reaches a terminal state. Returns the number of tasks that completed within the budget.
+- `Register(taskID string, taskFn func(ctx context.Context)) bool` — spawns one per-task goroutine under `context.WithTimeout(ctx, waitUntil)`. Returns `false` if the cap has been reached (caller drops the registration and bumps the wire counter `pkg/wire/metrics.TailCapReached`).
+- `Drain()` (no return) — blocks until every spawned goroutine reaches a terminal state. Bounded by `waitUntil + TailWriteTimeout` via a context-cancelled `WaitGroup.Wait`; the inner goroutine exits on safety-net-timeout so the runner doesn't leak goroutines on hung drains (the previous `time.After` shape leaked the inner goroutine on every hung drain — issue #667 follow-up review item).
+
+Helper `ReadPipe(pipePath string, onLine func(TailLine)) error` reads the JSONL pipe line-by-line (uses `json.Decoder` + a `bytes.TrimRight` fallback for the malformed-line case). Malformed lines are logged at `os.Stderr` so the customer's waitUntil shim is debuggable in production. A missing pipe is silently treated as "no tasks" (the 99% case for handlers that don't use waitUntil).
 
 Wire emit to the tail-events proxy uses the same shape as the existing
 framework_ready proxy: 250 ms dial + 250 ms write deadlines, errors

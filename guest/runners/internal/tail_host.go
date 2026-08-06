@@ -35,6 +35,7 @@ package internal
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -195,6 +196,19 @@ func (h *TailHost) Register(taskID string, taskFn func(ctx context.Context)) boo
 // the ceiling + slack. The snapshotAndPark watchdog on the host
 // side is the outer bound.
 func (h *TailHost) Drain() {
+	// ctx-cancelled wg.Wait so the inner goroutine can exit when
+	// the safety-net timeout fires — the previous version leaked
+	// the goroutine on every hung drain (the goroutine was parked
+	// on wg.Wait() forever, slowly accumulating across requests).
+	//
+	// The waitUntil ceiling here is the per-task one (e.g. 60s for
+	// Scale, 5s for Free). The runner's drain can therefore exceed
+	// the host's 5s snapshotAndPark watchdog for Scale-plan
+	// requests — the host's watchdog is the *park* bound, not the
+	// *drain* bound. The mismatch is documented in ADR-078
+	// §"Amendment — runner-side tail host" (issue #667 follow-up).
+	ctx, cancel := context.WithTimeout(context.Background(), h.waitUntil+TailWriteTimeout)
+	defer cancel()
 	done := make(chan struct{})
 	go func() {
 		h.wg.Wait()
@@ -203,10 +217,13 @@ func (h *TailHost) Drain() {
 	select {
 	case <-done:
 		return
-	case <-time.After(h.waitUntil + TailWriteTimeout):
+	case <-ctx.Done():
 		// Hung drain — the outer bound is the snapshotAndPark
-		// 5s watchdog on the host. We log to stderr so the
-		// runner's existing log scrape surfaces the hang.
+		// 5s watchdog on the host for the *park* side. We log to
+		// stderr so the runner's existing log scrape surfaces
+		// the hang. The inner goroutine will exit on its own
+		// once the wg unblocks (the per-task timeouts in
+		// runTask fire even if the drain returned early).
 		fmt.Fprintf(os.Stderr, "tail_host: drain timeout after %s; %d tails may be lost\n",
 			h.waitUntil+TailWriteTimeout, h.RegisterCount())
 	}
@@ -236,24 +253,45 @@ func (h *TailHost) runTask(taskID string, taskFn func(ctx context.Context)) {
 	defer cancel()
 
 	start := time.Now()
-	// outcome is the load-bearing field. The default is Failed
-	// (the catch-all for a panicking taskFn); the two branches
-	// below either upgrade it to Timeout or downgrade to
-	// Completed. The deferred emit reads the final value.
-	outcome := TailOutcomeFailed
+	// Outcome precedence is centralized in the defer so a panic
+	// that fires AFTER the per-task timeout can't override the
+	// Timeout outcome. The defaults are Completed (the customer's
+	// promise returned normally); the two branches below either
+	// downgrade to Failed (panic) or to Timeout (deadline
+	// expiry). Order: Timeout > Failed > Completed.
+	outcome := TailOutcomeCompleted
 	var failureReason string
 	defer func() {
-		elapsedMs := time.Since(start).Milliseconds()
-		// taskFn panic recovery — the defer fires LAST in
-		// panic order, so a panic in taskFn unwinds here
-		// with outcome still = Failed and failureReason
-		// unset (we set it on the recovery path below).
+		// recover() first — a panic in taskFn catches here.
 		if r := recover(); r != nil {
 			outcome = TailOutcomeFailed
 			failureReason = fmt.Sprintf("error:%s", taskID)
 		}
+		// Then the deadline check — if the per-task ceiling
+		// fired (regardless of whether taskFn returned normally
+		// via <-ctx.Done() or panicked), Timeout wins. This is
+		// the precedence load-bearing piece: a panic that
+		// happens after DeadlineExceeded is still a Timeout.
+		if ctx.Err() == context.DeadlineExceeded {
+			outcome = TailOutcomeTimeout
+			failureReason = fmt.Sprintf("timeout:%s", taskID)
+		}
+		elapsedMs := time.Since(start).Milliseconds()
 		if failureReason != "" {
 			h.recordFailure(failureReason)
+		}
+		// Sanity guard: outcome must be in the closed set
+		// {Completed, Failed, Timeout}. A future contributor
+		// who adds a new outcome (e.g. forced_at_park) and
+		// forgets to widen the proxy's closed-set check would
+		// silently lose the tail_event here — the proxy would
+		// reply "err outcome_out_of_range\n" and the runner's
+		// emit would log a Warn. Fail loud at the boundary
+		// instead so the regression is caught at the call site.
+		if outcome < TailOutcomeCompleted || outcome > TailOutcomeTimeout {
+			fmt.Fprintf(os.Stderr, "tail_host: outcome 0x%02x outside closed set {1,2,3} for %s — proxy would reject, dropping tail_event\n",
+				outcome, taskID)
+			return
 		}
 		if err := h.emit(outcome, elapsedMs); err != nil {
 			fmt.Fprintf(os.Stderr, "tail_host: emit 0x%02x for %s failed: %v\n", outcome, taskID, err)
@@ -261,18 +299,6 @@ func (h *TailHost) runTask(taskID string, taskFn func(ctx context.Context)) {
 	}()
 
 	taskFn(ctx)
-
-	// If ctx.Err() == DeadlineExceeded, the per-task ceiling fired.
-	// The customer's promise hung past the runner's per-task wall
-	// clock. The hang taskFn may have just returned (via <-ctx.Done()
-	// in the hang-blocking variant) — that's expected, the cancel
-	// call in defer-cancel triggers the return.
-	if ctx.Err() == context.DeadlineExceeded {
-		outcome = TailOutcomeTimeout
-		failureReason = fmt.Sprintf("timeout:%s", taskID)
-		return
-	}
-	outcome = TailOutcomeCompleted
 }
 
 // recordFailure appends one entry to h.failures under the mu.
@@ -281,6 +307,79 @@ func (h *TailHost) recordFailure(reason string) {
 	h.failures = append(h.failures, reason)
 	h.mu.Unlock()
 }
+
+// DrainForResponse is the runner-side entry point that the
+// per-runner drainTailHost shims call. It encapsulates the
+// 5x near-identical logic that used to live in each runner's
+// tail_host_integration.go: feature-gate on WaitUntilSec/TailPipePath,
+// build a TailHost, ReadPipe the JSONL, register each line as a
+// no-op taskFn (the customer's promise is on the customer's side —
+// the runner only enforces the per-task ceiling and emits the
+// 0x04 DGRAM), drain, and append failures to the response's
+// TailErrors slice.
+//
+// The runner shim shrinks to a one-liner:
+//
+//	func drainTailHost(env envelope, resp *response) {
+//	    internal.DrainForResponse("go124", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+//	}
+//
+// tailCapMax is sourced from pkg/api.TailCapMax by the caller —
+// this helper is layered above the per-plan quota so it stays
+// runnable in hermetic tests without importing pkg/api.
+//
+// Pre-conditions:
+//   - waitUntilSec > 0 (else no-op — feature disabled on this
+//     request; matches the Vercel Edge / Cloudflare pre-tail
+//     behavior cited in ADR-078 §"Rules")
+//   - tailPipePath != "" (else no-op — no customer registrations)
+//
+// The pipe read failure path is silent (the runner keeps draining
+// on a partial read). The per-task failure path appends
+// "timeout:task-N" / "error:task-N" entries to *tailErrors.
+func DrainForResponse(runtime string, waitUntilSec int, tailPipePath string, tailErrors *[]string) {
+	if waitUntilSec <= 0 || tailPipePath == "" {
+		return
+	}
+	host := NewTailHost(runtime, tailPipePath, waitUntilSec, TailCapDefault)
+	// TailCapDefault is the structural ceiling used in the
+	// runner shims. Test code that needs a different cap can
+	// call NewTailHost directly.
+	_ = ReadPipe(tailPipePath, func(line TailLine) {
+		taskFn := func(_ context.Context) {
+			// No-op: the customer's promise is on the
+			// customer's side. The runner's only job is
+			// to enforce the per-task ceiling and emit
+			// the 0x04 DGRAM. A bounded sleep is
+			// unnecessary — the tail host's
+			// context.WithTimeout in runTask is the
+			// safety net.
+		}
+		if !host.Register(line.ID, taskFn) {
+			// TailCapMax reached — the runner drops the
+			// registration. The wire counter
+			// (pkg/wire/metrics.TailCapReached) is the
+			// operator-visible alarm; the runner also
+			// logs to stderr so the per-task failure is
+			// debuggable.
+			*tailErrors = append(*tailErrors, "dropped:tail_cap_reached:"+line.ID)
+		}
+	})
+	host.Drain()
+	if failures := host.Failures(); len(failures) > 0 {
+		*tailErrors = append(*tailErrors, failures...)
+	}
+}
+
+// TailCapDefault is the structural ceiling on concurrent
+// in-flight tails per request. Mirrors pkg/api.TailCapMax (16,
+// pinned in pkg/api/limits.go). Defined here so DrainForResponse
+// has a sensible default without importing pkg/api — the runner
+// shims that DO need the per-plan quota import
+// pkg/api.TailCapMax directly. The two constants are pinned
+// to match by the parity test (issue #667 follow-up review
+// item #11).
+const TailCapDefault = 16
 
 // emit writes one line to the tail-events proxy, framing the
 // 16-byte DGRAM on the guest-init side. Mirrors
@@ -327,6 +426,19 @@ func (h *TailHost) emit(outcome byte, elapsedMs int64) error {
 // Errors reading the pipe are logged at Warn — a missing pipe
 // means the customer never called waitUntil, which is the
 // expected 99% case. The runner keeps draining.
+//
+// Malformed JSONL lines are logged at Warn so the customer's
+// waitUntil shim is debuggable in production. The line is
+// silently dropped (the runner keeps draining on a partial read) —
+// the operator-visible signal is the stderr log line, which the
+// runner's existing log scrape picks up.
+//
+// Implementation note: a buffered bufio.Reader scan tolerates
+// a final line without a trailing newline (the previous byte-
+// strip impl would corrupt `{"id":"t-1"}` → `{"id":"t-1` by
+// dropping the trailing `}`). json.Decoder was tried but it
+// aborts the stream on the first malformed line, which loses
+// all subsequent valid lines.
 func ReadPipe(pipePath string, onLine func(line TailLine)) error {
 	if pipePath == "" {
 		return nil
@@ -344,8 +456,14 @@ func ReadPipe(pipePath string, onLine func(line TailLine)) error {
 	for {
 		raw, err := r.ReadBytes('\n')
 		if len(raw) > 0 {
+			// TrimRight strips the trailing newline (and any
+			// CR before it) without corrupting a final line
+			// that lacks a newline.
+			trimmed := bytes.TrimRight(raw, "\r\n")
 			var line TailLine
-			if jerr := json.Unmarshal(raw[:len(raw)-1], &line); jerr == nil && line.ID != "" {
+			if jerr := json.Unmarshal(trimmed, &line); jerr != nil {
+				fmt.Fprintf(os.Stderr, "tail_host: malformed line dropped: %v\n", jerr)
+			} else if line.ID != "" {
 				onLine(line)
 			}
 		}
