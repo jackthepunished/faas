@@ -42,6 +42,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -220,13 +221,11 @@ func readResponseHead(r *bufio.Reader) (head, body []byte, err error) {
 }
 
 // indexDoubleLF returns the index of the first "\n\n" in b,
-// or -1 if not present. bytes.Index handles the byte-exact
-// search and is allocation-free.
+// or -1 if not present. bytes.Index uses Boyer–Moore under the
+// hood for short needles (the runtime picks SIMD when available)
+// so this is faster than a hand-rolled scan, particularly on
+// large head buffers where the loop would otherwise touch every
+// byte.
 func indexDoubleLF(b []byte) int {
-	for i := 0; i < len(b)-1; i++ {
-		if b[i] == '\n' && b[i+1] == '\n' {
-			return i
-		}
-	}
-	return -1
+	return bytes.Index(b, []byte("\n\n"))
 }
