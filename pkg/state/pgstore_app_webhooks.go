@@ -551,7 +551,7 @@ type appWebhookScanner interface {
 func scanAppWebhook(s appWebhookScanner) (AppWebhook, error) {
 	var (
 		w      AppWebhook
-		filter []byte
+		filter []string
 		retry  string
 	)
 	err := s.Scan(
@@ -562,11 +562,7 @@ func scanAppWebhook(s appWebhookScanner) (AppWebhook, error) {
 		return AppWebhook{}, err
 	}
 	w.RetryPolicy = AppWebhookRetryPolicy(retry)
-	if len(filter) > 0 {
-		if err := json.Unmarshal(filter, &w.EventFilter); err != nil {
-			return AppWebhook{}, fmt.Errorf("state: scan app_webhook event_filter: %w", err)
-		}
-	}
+	w.EventFilter = filter
 	if w.EventFilter == nil {
 		w.EventFilter = []string{}
 	}
