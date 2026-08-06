@@ -11600,6 +11600,44 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 	return out, rows.Err()
 }
 
+// ListOrgInvitationsForOrgPage is the cursor-paginated variant of
+// ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
+// invitation's id (UUID); the SQL filter `id::text < $3` partitions
+// rows by id and the ORDER BY tiebreaks with id so the cursor walk
+// is well-defined when two rows share a created_at timestamp.
+//
+// limit is clamped to [1, 100]; out-of-range resolves to 25. The
+// before="" case is the first page (no filter). No JOIN: invitations
+// are org-scoped directly (org_id NOT NULL FK) so the org_id
+// predicate is the only filter the SQL needs.
+func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string, limit int, before string) ([]OrgInvitation, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, org_id, email::text, role, token_hash, invited_by_account_id,
+		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
+		  from org_invitations
+		 where org_id = $1
+		   and ($3 = '' or id::text < $3)
+		 order by created_at desc, id::text desc
+		 limit $2
+	`, orgID, limit, before)
+	if err != nil {
+		return nil, fmt.Errorf("state: list org invitations paged: %w", err)
+	}
+	defer rows.Close()
+	out := make([]OrgInvitation, 0, limit)
+	for rows.Next() {
+		inv, err := scanOrgInvitation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
 // CountPendingOrgInvitations returns the number of invitation rows
 // with consumed_at IS NULL AND revoked_at IS NULL AND expires_at >
 // now() for the given org. The filter lives at the SQL layer; the

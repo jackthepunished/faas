@@ -342,8 +342,13 @@ type InvitationWithTokenResponse struct {
 type OrgInvitationWithToken = InvitationWithTokenResponse
 
 // ListInvitationsResponse wraps GET /v1/orgs/{slug}/invitations.
+// NextBefore is the cursor for the next page (matches the
+// pagination contract at pkg/api/paging.go — empty means "no more
+// pages"). Cursor is the last row's ID, fed back as ?before=<id>
+// on the next request.
 type InvitationListResponse struct {
 	Invitations []OrgInvitationResponse `json:"invitations"`
+	NextBefore  string                  `json:"next_before,omitempty"`
 }
 
 // ListInvitationsResponse is the historic name; renamed to

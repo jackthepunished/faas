@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -60,6 +61,31 @@ func seedInvitationForPrincipal(t *testing.T, store *state.MemStore, org *state.
 		t.Fatalf("CreateOrgInvitation: %v", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(plaintext), sum[:]
+}
+
+// seedInvitationNonce is the nonce-aware twin of
+// seedInvitationForPrincipal for tests that need multiple pending
+// invitations on the same org (the underlying UNIQUE on token_hash
+// rejects identical tokens; nonce XORs into byte 0 so each call
+// generates a distinct hash).
+func seedInvitationNonce(t *testing.T, store *state.MemStore, org *state.Org, ownerID, email string, role state.OrgRole, nonce byte) {
+	t.Helper()
+	plaintext := make([]byte, 32)
+	for i := range plaintext {
+		plaintext[i] = byte(i + 1)
+	}
+	plaintext[0] = nonce
+	sum := sha256.Sum256(plaintext)
+	if _, err := store.CreateOrgInvitation(context.Background(), state.OrgInvitation{
+		OrgID:              org.ID,
+		Email:              email,
+		Role:               role,
+		TokenHash:          sum[:],
+		ExpiresAt:          time.Now().Add(time.Hour),
+		InvitedByAccountID: &ownerID,
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
 }
 
 // seedSharedOrgWithOwner creates a shared org on the given plan and
@@ -728,4 +754,251 @@ func setupWithSessionForTest(t *testing.T) (testEnv, *session.Manager, *http.Coo
 func eventDump(rows []state.Event) string {
 	b, _ := json.Marshal(rows)
 	return string(b)
+}
+
+// TestListOrgInvitations_HappyPath (PR 8) —
+// GET /v1/orgs/{slug}/invitations returns the seeded invitations
+// in created_at desc order with the org slug + derived status
+// (pending/consumed/revoked/expired) on each row.
+//
+// Pins:
+//   - response carries every invitation (no filtering by state)
+//   - status is "pending" for unconsumed rows
+//   - org_invitation.viewed audit row fires per render
+//   - next_before is empty when the row count is < limit
+func TestListOrgInvitations_HappyPath(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-happy", "List PR8 Happy", api.PlanPro)
+	// 3 pending invitations (distinct nonces to satisfy the
+	// UNIQUE on token_hash).
+	for i, role := range []state.OrgRole{state.OrgRoleAdmin, state.OrgRoleDeveloper, state.OrgRoleBilling} {
+		seedInvitationNonce(t, e.store, &org, e.acct.ID,
+			fmt.Sprintf("list-pr8-%d@acme.test", i), role, byte(i+1))
+	}
+
+	rec := e.do(t, http.MethodGet, "/v1/orgs/list-pr8-happy/invitations", nil,
+		map[string]string{"X-Active-Org": "list-pr8-happy"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                     `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	if len(body.Invitations) != 3 {
+		t.Fatalf("Invitations len = %d, want 3", len(body.Invitations))
+	}
+	for i, row := range body.Invitations {
+		if row.OrgSlug != "list-pr8-happy" {
+			t.Errorf("Invitations[%d].OrgSlug = %q, want list-pr8-happy", i, row.OrgSlug)
+		}
+		if row.Status != "pending" {
+			t.Errorf("Invitations[%d].Status = %q, want pending", i, row.Status)
+		}
+		if row.Email == "" {
+			t.Errorf("Invitations[%d].Email empty", i)
+		}
+		if row.Role == "" {
+			t.Errorf("Invitations[%d].Role empty", i)
+		}
+	}
+	// 3 rows < default limit 25 → no next_before.
+	if body.NextBefore != "" {
+		t.Errorf("NextBefore = %q, want empty (row_count < limit)", body.NextBefore)
+	}
+	// Audit row fires.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	ev := findEventByKind(rows, "org.invitation.viewed")
+	if ev == nil {
+		t.Fatalf("no org.invitation.viewed row; rows=%s", eventDump(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("Data not JSON: %v", err)
+	}
+	if data["org_id"] != org.ID {
+		t.Errorf("data.org_id = %v, want %s", data["org_id"], org.ID)
+	}
+	if data["row_count"] != float64(3) {
+		t.Errorf("data.row_count = %v, want 3", data["row_count"])
+	}
+	if data["had_next_page"] != false {
+		t.Errorf("data.had_next_page = %v, want false", data["had_next_page"])
+	}
+}
+
+// TestListOrgInvitations_NonMemberIs404 (PR 8) — access control:
+// a caller who is not a member of the active org gets 404 (the
+// loadOrg middleware's IDOR-safe contract; mirrors every other
+// org-scoped route).
+func TestListOrgInvitations_NonMemberIs404(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-idem", "List PR8 IDem", api.PlanPro)
+	// Seed an invitation as the owner so the org has rows, but
+	// then create a fresh account that's NOT a member and try to
+	// list.
+	if _, err := e.store.CreateOrgInvitation(context.Background(), state.OrgInvitation{
+		OrgID: org.ID, Email: "list-pr8-idem@acme.test", Role: state.OrgRoleDeveloper,
+		TokenHash: []byte("x"), ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
+	outside, err := e.store.CreateAccount(context.Background(),
+		"list-pr8-outside@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	outsideKey, outsideHash, err := api.GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	if _, err := e.store.CreateAPIKey(context.Background(), outside.ID, outsideHash,
+		"non-member", api.ScopesAdminOnly); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	outsideEnv := testEnv{h: e.h, s: e.s, store: e.store, key: outsideKey, acct: outside, ops: e.ops}
+	rec := outsideEnv.do(t, http.MethodGet, "/v1/orgs/list-pr8-idem/invitations", nil,
+		map[string]string{"X-Active-Org": "list-pr8-idem"})
+	// Non-member gets 403 (the authz layer surfaces "you don't
+	// belong here" distinctly from the 404 the loadOrg path
+	// would return for an unknown slug). The list endpoint
+	// deliberately differentiates "you're not a member" from
+	// "the org doesn't exist" via the 403/404 split — matching
+	// the same posture every other org-scoped route uses (e.g.
+	// GET /v1/orgs/{slug}/members).
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-member list: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if problem.Code != "org_role_forbidden" {
+		t.Errorf("problem.code = %q, want org_role_forbidden", problem.Code)
+	}
+}
+
+// TestListOrgInvitations_CursorPagination (PR 8) — drive the
+// cursor: limit=2 + 4 seeded invitations → 2 pages of 2 each.
+// Pin: the second-page request includes ?before=<id-from-page-1>
+// and returns the next 2 rows, with next_before empty on the
+// final page.
+func TestListOrgInvitations_CursorPagination(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-cursor", "List PR8 Cursor", api.PlanPro)
+	for i := 0; i < 4; i++ {
+		seedInvitationNonce(t, e.store, &org, e.acct.ID,
+			fmt.Sprintf("cursor-pr8-%d@acme.test", i), state.OrgRoleDeveloper, byte(i+10))
+		// 1ms sleep between seeds so the four created_at
+		// timestamps are distinct (the cursor walk is
+		// (created_at desc, id desc); without distinct
+		// timestamps the cursor walk degrades to a pure
+		// id-only order, which is fine but the assertion
+		// is more meaningful with distinct times).
+		time.Sleep(time.Millisecond)
+	}
+	// Page 1.
+	rec := e.do(t, http.MethodGet, "/v1/orgs/list-pr8-cursor/invitations?limit=2", nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page1: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p1 struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                     `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p1); err != nil {
+		t.Fatalf("Unmarshal p1: %v", err)
+	}
+	if len(p1.Invitations) != 2 {
+		t.Fatalf("page1 len = %d, want 2", len(p1.Invitations))
+	}
+	if p1.NextBefore == "" {
+		t.Fatalf("page1 next_before empty; should carry the cursor id")
+	}
+	// Page 2.
+	rec = e.do(t, http.MethodGet,
+		"/v1/orgs/list-pr8-cursor/invitations?limit=2&before="+p1.NextBefore, nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page2: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p2 struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                     `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p2); err != nil {
+		t.Fatalf("Unmarshal p2: %v", err)
+	}
+	if len(p2.Invitations) != 2 {
+		t.Fatalf("page2 len = %d, want 2", len(p2.Invitations))
+	}
+	// The handler's cursor-emit heuristic is the same one
+	// pkg/api's pagination uses (handlers_account_scoped.go:75):
+	// "if the page is full, emit a cursor; the client treats the
+	// next 0-row page as terminal". With 4 rows + limit=2, page
+	// 2 has 2 rows AND a non-empty NextBefore (the heuristic
+	// fires); the client walker must follow the cursor to a 3rd
+	// request that returns 0 rows + empty NextBefore.
+	rec = e.do(t, http.MethodGet,
+		"/v1/orgs/list-pr8-cursor/invitations?limit=2&before="+p2.NextBefore, nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page3: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p3 struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                     `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p3); err != nil {
+		t.Fatalf("Unmarshal p3: %v", err)
+	}
+	if len(p3.Invitations) != 0 {
+		t.Errorf("page3 len = %d, want 0 (terminal page)", len(p3.Invitations))
+	}
+	if p3.NextBefore != "" {
+		t.Errorf("page3 next_before = %q, want empty (terminal)", p3.NextBefore)
+	}
+	// No row overlap between pages.
+	seen := map[string]bool{}
+	for _, r := range p1.Invitations {
+		seen[r.ID] = true
+	}
+	for _, r := range p2.Invitations {
+		if seen[r.ID] {
+			t.Errorf("row %s appears on both pages", r.ID)
+		}
+	}
+}
+
+// TestListOrgInvitations_BadLimit (PR 8) — limit out of range
+// returns 400 with CodeValidation (issue #393 strict-mode
+// pagination contract).
+func TestListOrgInvitations_BadLimit(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-bad", "List PR8 Bad", api.PlanPro)
+	_ = org
+
+	rec := e.do(t, http.MethodGet, "/v1/orgs/list-pr8-bad/invitations?limit=999", nil,
+		map[string]string{"X-Active-Org": "list-pr8-bad"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad limit: code=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if problem.Code != "validation_failed" {
+		t.Errorf("problem.code = %q, want validation_failed", problem.Code)
+	}
 }

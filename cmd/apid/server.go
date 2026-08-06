@@ -665,6 +665,8 @@ func (s *server) handler() http.Handler {
 	// bypass tolerance at middleware.go:836-847.
 	mux.HandleFunc("POST /v1/invitations/{token}/accept", s.authLimited(s.requireMFA(s.requireStepUp(5*time.Minute)(s.acceptInvitation))))
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/invitations/{token}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.revokeInvitation)))))
+	// PR-8 §2: list invitations surface (cursor-paginated, every role).
+	mux.HandleFunc("GET /v1/orgs/{slug}/invitations", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.listOrgInvitations)))))
 	mux.HandleFunc("GET /v1/orgs/{slug}/seat_usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.getOrgSeatUsage)))))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.idempotent(s.changePlan))))))
 	// Issue #561 — spend cap pause-workload. Account-self-scoped

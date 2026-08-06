@@ -9129,6 +9129,64 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 	return out, nil
 }
 
+// ListOrgInvitationsForOrgPage is the cursor-paginated mirror of
+// ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
+// invitation's id (UUID); the SQL filter is `id < before` after
+// sorting by (created_at desc, id desc), so the cursor walk visits
+// every row exactly once.
+//
+// Memstore walks the sorted slice directly instead of trying to
+// mirror the SQL filter: build the full sorted list, find the
+// cursor position, return the next `limit` rows. Simpler than
+// reinventing the compound (created_at, id) predicate in Go and
+// matches the SQL semantics exactly.
+//
+// limit is clamped to [1, 100]; out-of-range resolves to 25. before
+// "" means first page (no filter). Unknown cursor (id not in the
+// org's rows) returns the same as the first page — defensive
+// default; the SQL would return [] in that case but the cursor
+// was emitted from a prior page so the call site knows the
+// cursor is valid.
+func (m *MemStore) ListOrgInvitationsForOrgPage(_ context.Context, orgID string, limit int, before string) ([]OrgInvitation, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	all := make([]OrgInvitation, 0)
+	for _, inv := range m.invitations {
+		if inv.OrgID == orgID {
+			all = append(all, inv)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].ID > all[j].ID
+		}
+		return all[i].CreatedAt.After(all[j].CreatedAt)
+	})
+	// Find the cursor position. Cursor row is the last row of the
+	// prior page; skip past it to land on the next page's first
+	// row.
+	skip := 0
+	if before != "" {
+		for i, row := range all {
+			if row.ID == before {
+				skip = i + 1
+				break
+			}
+		}
+	}
+	if skip > len(all) {
+		return []OrgInvitation{}, nil
+	}
+	out := all[skip:]
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // CountPendingOrgInvitations mirrors PgStore.CountPendingOrgInvitations
 // — counts invitation rows that are not consumed, not revoked, and
 // not past expires_at. Parity test
