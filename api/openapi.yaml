@@ -5294,7 +5294,7 @@ components:
         # mutate. Dashboards render the "AUTH: <mode>"
         # annotation with the "since YYYY-MM-DD" suffix only
         # when this is non-null.
-        auth_default_flipped_at: { type: string, format: date-time, nullable: true }
+        auth_default_flipped_at: { type: [string, "null"], format: date-time }
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
