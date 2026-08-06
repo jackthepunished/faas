@@ -335,8 +335,17 @@ func TestAcceptInvitation_GateFiresBeforeEmit(t *testing.T) {
 	}
 
 	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
-	if rec.Code == http.StatusOK {
-		t.Fatalf("accept after revoke: code=200, expected 410; body=%s", rec.Body.String())
+	if rec.Code != http.StatusGone {
+		t.Fatalf("accept after revoke: code=%d, want 410; body=%s", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal problem: %v", err)
+	}
+	if problem.Code != "org_invitation_invalid" {
+		t.Errorf("problem.code = %q, want org_invitation_invalid", problem.Code)
 	}
 
 	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
@@ -375,8 +384,8 @@ func TestAcceptInvitation_OverCapDoesNotEmit(t *testing.T) {
 
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
-	if rec.Code == http.StatusOK {
-		t.Fatalf("accept over-cap: code=200, expected 403; body=%s", rec.Body.String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("accept over-cap: code=%d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
 
 	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)

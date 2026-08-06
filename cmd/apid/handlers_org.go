@@ -336,8 +336,12 @@ func (s *server) getOrgSeatUsage(w http.ResponseWriter, r *http.Request, _ state
 	if !ok {
 		return
 	}
-	org, ok := s.rehydrateOrg(r.Context(), w, mem)
-	if !ok {
+	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"OrgByID failed",
+			"try again; if the problem persists, contact support"))
 		return
 	}
 	used, err := s.store.CountActiveOrgMembers(r.Context(), org.ID)
