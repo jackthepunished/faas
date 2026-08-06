@@ -846,9 +846,9 @@ type OrgInvitationItem struct {
 // fetches members + invitations via the store directly (apid is
 // the dashboard's data layer — no reverse-call needed because
 // the dashboard and apid share the process per ADR-011 §"Surface
-// partition"). SeatUsed + SeatLimit ride along so the dashboard
-// can render the "plan's seat cap" panel without a second
-// dashboard view.
+// partition"). The seat chip lives on the embedded OrgListItem
+// (PR-8 review — duplicating SeatUsed/SeatLimit at the top level
+// created two sources of truth for the same value).
 //
 // Error is a non-empty string when one of the three lookups
 // failed non-fatally (the page still renders whatever rows came
@@ -860,8 +860,6 @@ type OrgDetailData struct {
 	Org         OrgListItem
 	Members     []OrgMemberItem
 	Invitations []OrgInvitationItem
-	SeatUsed    int
-	SeatLimit   int
 	CallersRole string
 	Error       string
 }

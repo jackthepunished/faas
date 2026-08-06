@@ -570,8 +570,8 @@ func TestRender_OrgsPage(t *testing.T) {
 	// List, populated.
 	rec := httptest.NewRecorder()
 	listPage := dashboard.Page{
-		Title: "Organizations",
-		Body:  "orgs",
+		Title:   "Organizations",
+		Body:    "orgs",
 		Account: acct,
 		Data: dashboard.OrgListData{
 			Orgs: []dashboard.OrgListItem{
@@ -606,10 +606,10 @@ func TestRender_OrgsPage(t *testing.T) {
 	// List, empty.
 	rec2 := httptest.NewRecorder()
 	if err := dashboard.Render(rec2, log, "", dashboard.Page{
-		Title: "Organizations",
-		Body:  "orgs",
+		Title:   "Organizations",
+		Body:    "orgs",
 		Account: acct,
-		Data:  dashboard.OrgListData{Orgs: nil},
+		Data:    dashboard.OrgListData{Orgs: nil},
 	}); err != nil {
 		t.Fatalf("render orgs list empty: %v", err)
 	}
@@ -623,14 +623,12 @@ func TestRender_OrgsPage(t *testing.T) {
 	// table's accessibility affordance.
 	rec3 := httptest.NewRecorder()
 	detailPage := dashboard.Page{
-		Title: "Acme Co",
-		Body:  "org_detail",
+		Title:   "Acme Co",
+		Body:    "org_detail",
 		Account: acct,
 		Data: dashboard.OrgDetailData{
 			Org:         dashboard.OrgListItem{Slug: "acme", Name: "Acme Co", Plan: "scale", Role: "owner", SeatUsed: 2, SeatLimit: 200},
 			CallersRole: "owner",
-			SeatUsed:    2,
-			SeatLimit:   200,
 			Members: []dashboard.OrgMemberItem{
 				{AccountID: "a1", Email: "ops@acme.test", Role: "owner", JoinedAt: "2026-01-04"},
 				{AccountID: "a2", Email: "eng@acme.test", Role: "admin", JoinedAt: "2026-02-09"},

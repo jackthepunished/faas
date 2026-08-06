@@ -9131,22 +9131,34 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 
 // ListOrgInvitationsForOrgPage is the cursor-paginated mirror of
 // ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
-// invitation's id (UUID); the SQL filter is `id < before` after
-// sorting by (created_at desc, id desc), so the cursor walk visits
-// every row exactly once.
+// invitation's id (UUID); Memstore walks the sorted slice
+// directly: build the full sorted list, find the cursor row,
+// return the next `limit` rows. The position-based walk is
+// correct for Memstore's random-hex id generation (random hex
+// is uncorrelated with created_at, so a strict-less id
+// predicate would mismatch PgStore's `id::text < $3` ordering
+// and produce wrong page boundaries when two consecutive seeds
+// have distinct created_at).
 //
-// Memstore walks the sorted slice directly instead of trying to
-// mirror the SQL filter: build the full sorted list, find the
-// cursor position, return the next `limit` rows. Simpler than
-// reinventing the compound (created_at, id) predicate in Go and
-// matches the SQL semantics exactly.
+// PR-9 swap (issue #190 follow-up): both backends should switch
+// to a compound (created_at, id) cursor so the SQL `id::text <
+// $3` predicate stays strictly correct under random UUID ids.
+// Today's wire cursor is the row id only — sufficient for the
+// Memstore walk, but PgStore's `id::text < $3` can skip a
+// later-seeded row whose id is lexically larger but the cursor
+// is at its predecessor. The two backends' guarantees diverge
+// here; the unit-level test (handlers_org_invitations_test.go
+// ::TestListOrgInvitations_CursorPagination) pins the Memstore
+// semantics. PR-9 changes the wire cursor shape; this doc-comment
+// is the v1 footnote.
 //
-// limit is clamped to [1, 100]; out-of-range resolves to 25. before
-// "" means first page (no filter). Unknown cursor (id not in the
-// org's rows) returns the same as the first page — defensive
-// default; the SQL would return [] in that case but the cursor
-// was emitted from a prior page so the call site knows the
-// cursor is valid.
+// limit is clamped to [1, 100]; out-of-range resolves to 25.
+// before "" means first page (no filter). Unknown cursor (id not
+// in the org's rows) returns the same as the first page —
+// defensive default; the customer emitted the cursor from a
+// prior page so the call site knows the cursor is valid, and
+// a stale cursor after a revoke just re-fetches the top of the
+// org's queue.
 func (m *MemStore) ListOrgInvitationsForOrgPage(_ context.Context, orgID string, limit int, before string) ([]OrgInvitation, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25

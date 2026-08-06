@@ -107,11 +107,14 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// documentation copy mirrored from pkg/imaged and
 			// guest-init; see dashboard.go for the rationale.
 			s.renderStateless(w, r, log, acct)
-		case path == "/dashboard/orgs":
+		case path == "/dashboard/orgs" || path == "/dashboard/orgs/":
 			// PR-8 §3: org landing — every org the signed-in
 			// account is a member of. Read-only; the
 			// create-org/promote-personal forms land with PR-9's
-			// per-seat cut-over.
+			// per-seat cut-over. Both "/dashboard/orgs" and
+			// "/dashboard/orgs/" serve the same page (same
+			// posture as /dashboard/ handling; PR-8 review
+			// found trailing-slash 404 otherwise).
 			s.renderOrgsList(w, r, log, acct)
 		case len(path) > len("/dashboard/orgs/") &&
 			path[:len("/dashboard/orgs/")] == "/dashboard/orgs/":
@@ -119,8 +122,13 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// Same per-page router pattern as /dashboard/apps/{slug}:
 			// one level of sub-routing lives in the slug suffix so a
 			// follow-up PR can add /dashboard/orgs/{slug}/billing or
-			// /dashboard/orgs/{slug}/audit without rewriting the
-			// dispatcher.
+			// /dashboard/orgs/{slug}/audit. Note for follow-up
+			// owners: when those subpages land, mirror the
+			// parseDeployDetailPath helper in the apps dispatcher
+			// (cmd/apid/handlers_dashboard.go:1213) — add
+			// parseOrgDetailSubpath(slug) for "/audit", "/billing",
+			// etc., BEFORE passing the slug to OrgBySlug. PR-9
+			// / PR-10 / PR-13 expect this seam.
 			s.renderOrgDetail(w, r, log, acct, slug)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
@@ -1364,8 +1372,6 @@ func (s *server) renderOrgDetail(w http.ResponseWriter, r *http.Request, log *sl
 		Org:         dashboardOrgItem(r.Context(), log, s.store, org, callerRole),
 		CallersRole: string(callerRole),
 	}
-	data.SeatUsed = data.Org.SeatUsed
-	data.SeatLimit = data.Org.SeatLimit
 
 	// Members (best-effort — log + continue on failure).
 	members, err := s.store.ListOrgMembers(r.Context(), org.ID)

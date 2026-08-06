@@ -48,7 +48,7 @@
         Plan: <strong>{{$d.Org.Plan}}</strong>.
         Your role: <strong>{{$d.CallersRole}}</strong>.
         {{- if not $d.Org.Personal}}
-          Seats: <strong>{{$d.SeatUsed}}</strong> / <strong>{{$d.SeatLimit}}</strong>.
+          Seats: <strong>{{$d.Org.SeatUsed}}</strong> / <strong>{{$d.Org.SeatLimit}}</strong>.
         {{- end}}
       </p>
 

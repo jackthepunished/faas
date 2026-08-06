@@ -783,7 +783,7 @@ func TestListOrgInvitations_HappyPath(t *testing.T) {
 	}
 	var body struct {
 		Invitations []api.OrgInvitationResponse `json:"invitations"`
-		NextBefore  string                     `json:"next_before"`
+		NextBefore  string                      `json:"next_before"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("Unmarshal: %v (body=%s)", err, rec.Body.String())
@@ -913,7 +913,7 @@ func TestListOrgInvitations_CursorPagination(t *testing.T) {
 	}
 	var p1 struct {
 		Invitations []api.OrgInvitationResponse `json:"invitations"`
-		NextBefore  string                     `json:"next_before"`
+		NextBefore  string                      `json:"next_before"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &p1); err != nil {
 		t.Fatalf("Unmarshal p1: %v", err)
@@ -933,7 +933,7 @@ func TestListOrgInvitations_CursorPagination(t *testing.T) {
 	}
 	var p2 struct {
 		Invitations []api.OrgInvitationResponse `json:"invitations"`
-		NextBefore  string                     `json:"next_before"`
+		NextBefore  string                      `json:"next_before"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &p2); err != nil {
 		t.Fatalf("Unmarshal p2: %v", err)
@@ -956,7 +956,7 @@ func TestListOrgInvitations_CursorPagination(t *testing.T) {
 	}
 	var p3 struct {
 		Invitations []api.OrgInvitationResponse `json:"invitations"`
-		NextBefore  string                     `json:"next_before"`
+		NextBefore  string                      `json:"next_before"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &p3); err != nil {
 		t.Fatalf("Unmarshal p3: %v", err)
