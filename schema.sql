@@ -16,20 +16,6 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Name: public; Type: SCHEMA; Schema: -; Owner: -
---
-
--- *not* creating schema, since initdb creates it
-
-
---
--- Name: SCHEMA public; Type: COMMENT; Schema: -; Owner: -
---
-
-COMMENT ON SCHEMA public IS '';
-
-
---
 -- Name: citext; Type: EXTENSION; Schema: -; Owner: -
 --
 
@@ -120,6 +106,45 @@ begin
     perform pg_notify('compute_node_changed', payload::text);
     return new;
 end;
+$$;
+
+
+--
+-- Name: deployment_sidecar_layers_cap_check(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.deployment_sidecar_layers_cap_check() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    current_count integer;
+BEGIN
+    -- NEW-row predicate on UPDATE; existing-row count on INSERT.
+    -- Same query works for both because NEW carries the row's
+    -- deployment_id whether we're inserting a fresh row or
+    -- rewriting an existing one.
+    -- `current_count` is the number of rows for this deployment_id
+    -- ALREADY in the table at the time of this trigger call. We
+    -- reject the operation when the row count would exceed
+    -- SidecarCapMax (=2). Because the trigger fires BEFORE the
+    -- row is written, the post-insert count is current_count + 1
+    -- (INSERT) or unchanged (UPDATE that doesn't move the row to
+    -- a different deployment). We compare against the post-write
+    -- ceiling: if the existing count is already at or above
+    -- SidecarCapMax, refuse — that is, current_count >= 2 is a
+    -- hard reject, since adding another row would push us to 3.
+    SELECT count(*) INTO current_count
+        FROM deployment_sidecar_layers
+        WHERE deployment_id = NEW.deployment_id;
+
+    IF current_count >= 2 THEN
+        RAISE EXCEPTION 'deployment_sidecar_layers: deployment % exceeds the 2-row cap (existing=%, new would make 3)',
+            NEW.deployment_id, current_count
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NEW;
+END;
 $$;
 
 
@@ -278,6 +303,8 @@ CREATE TABLE public.accounts (
     mfa_recovery_codes_hash bytea[],
     mfa_required boolean DEFAULT false NOT NULL,
     overage_cap_cents bigint,
+    key_grace_window_days integer,
+    CONSTRAINT accounts_key_grace_window_days_check CHECK (((key_grace_window_days IS NULL) OR (key_grace_window_days >= 0))),
     CONSTRAINT accounts_mfa_enrolled_shape_chk CHECK (((mfa_enrolled_at IS NULL) OR ((mfa_secret_encrypted IS NOT NULL) AND ((mfa_recovery_codes_hash IS NULL) OR (array_length(mfa_recovery_codes_hash, 1) >= 0))))),
     CONSTRAINT accounts_overage_cap_cents_chk CHECK (((overage_cap_cents IS NULL) OR (overage_cap_cents >= 0))),
     CONSTRAINT accounts_plan_check CHECK ((plan = ANY (ARRAY['free'::text, 'hobby'::text, 'pro'::text, 'scale'::text]))),
@@ -354,8 +381,16 @@ CREATE TABLE public.api_keys (
     last_used_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     scopes text[] DEFAULT '{admin}'::text[] NOT NULL,
-    org_id uuid,
-    CONSTRAINT api_keys_scopes_vocab_chk CHECK (((scopes <@ ARRAY['admin'::text, 'deploy:write'::text, 'secrets:read'::text, 'secrets:write'::text, 'usage:read'::text, 'apps:read'::text, 'env:read'::text, 'env:write'::text]) AND (cardinality(scopes) > 0)))
+    org_id uuid NOT NULL,
+    expires_at timestamp with time zone,
+    status text DEFAULT 'active'::text NOT NULL,
+    revoked_at timestamp with time zone,
+    rotated_from_id uuid,
+    created_ip inet,
+    created_ua text,
+    parent_key_id uuid,
+    CONSTRAINT api_keys_scopes_vocab_chk CHECK (((scopes <@ ARRAY['admin'::text, 'deploy:write'::text, 'secrets:read'::text, 'secrets:write'::text, 'usage:read'::text, 'apps:read'::text, 'env:read'::text, 'env:write'::text]) AND (cardinality(scopes) > 0))),
+    CONSTRAINT api_keys_status_check CHECK ((status = ANY (ARRAY['active'::text, 'grace'::text, 'revoked'::text])))
 );
 
 
@@ -372,6 +407,26 @@ CREATE TABLE public.app_envs (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     org_id uuid,
     CONSTRAINT app_envs_key_shape CHECK (((key ~ '^[A-Z][A-Z0-9_]*$'::text) AND (length(key) <= 128)))
+);
+
+
+--
+-- Name: app_registry_credentials; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_registry_credentials (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    registry text NOT NULL,
+    username text NOT NULL,
+    password_encrypted bytea NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    CONSTRAINT app_registry_credentials_password_chk CHECK ((length(password_encrypted) > 0)),
+    CONSTRAINT app_registry_credentials_registry_chk CHECK (((length(registry) > 0) AND (length(registry) <= 253))),
+    CONSTRAINT app_registry_credentials_username_chk CHECK (((length(username) > 0) AND (length(username) <= 256)))
 );
 
 
@@ -437,27 +492,39 @@ CREATE TABLE public.apps (
     root_dir text DEFAULT ''::text NOT NULL,
     workload_name text DEFAULT ''::text NOT NULL,
     workload_class text DEFAULT 'http'::text NOT NULL,
-    eviction_priority text DEFAULT 'best_effort'::text NOT NULL,
     start_command text,
     streaming_enabled boolean DEFAULT false NOT NULL,
     scaling_policy jsonb DEFAULT '{}'::jsonb NOT NULL,
     last_scale_out_at timestamp with time zone,
     last_scale_in_at timestamp with time zone,
     require_signed boolean DEFAULT false NOT NULL,
+    node_id uuid,
+    reassigned_at timestamp with time zone,
     org_id uuid,
+    migrated_at timestamp with time zone,
+    warm_snapshot_enabled boolean DEFAULT false NOT NULL,
+    warm_snapshot_min_requests integer DEFAULT 5 NOT NULL,
+    warm_snapshot_min_ms integer DEFAULT 2000 NOT NULL,
+    eviction_priority text DEFAULT 'best_effort'::text NOT NULL,
+    require_authn boolean DEFAULT false NOT NULL,
     CONSTRAINT apps_autoscale_target_cpu_pct_range CHECK (((autoscale_target_cpu_pct IS NULL) OR ((autoscale_target_cpu_pct >= 0) AND (autoscale_target_cpu_pct <= 100)))),
     CONSTRAINT apps_autoscale_target_rps_nonneg CHECK (((autoscale_target_rps IS NULL) OR (autoscale_target_rps >= 0))),
+    CONSTRAINT apps_eviction_priority_chk CHECK ((eviction_priority = ANY (ARRAY['best_effort'::text, 'reserved'::text]))),
     CONSTRAINT apps_idle_timeout_s_check CHECK (((idle_timeout_s IS NULL) OR (idle_timeout_s >= 10))),
     CONSTRAINT apps_last_scale_in_at_le_now_chk CHECK (((last_scale_in_at IS NULL) OR (last_scale_in_at <= now()))),
     CONSTRAINT apps_last_scale_out_at_le_now_chk CHECK (((last_scale_out_at IS NULL) OR (last_scale_out_at <= now()))),
     CONSTRAINT apps_max_concurrency_check CHECK ((max_concurrency >= 1)),
+    CONSTRAINT apps_migrated_at_chk CHECK (((migrated_at IS NULL) OR (migrated_at <= (now() + '00:01:00'::interval)))),
     CONSTRAINT apps_min_instances_check CHECK ((min_instances >= 0)),
+    CONSTRAINT apps_node_id_nonempty_chk CHECK ((node_id <> '00000000-0000-0000-0000-000000000000'::uuid)),
     CONSTRAINT apps_ram_mb_check CHECK ((ram_mb > 0)),
+    CONSTRAINT apps_reassigned_at_chk CHECK (((reassigned_at IS NULL) OR (reassigned_at <= (now() + '00:01:00'::interval)))),
     CONSTRAINT apps_runtime_check CHECK (((runtime IS NULL) OR (runtime = ANY (ARRAY['node22'::text, 'python312'::text, 'go124'::text, 'go124-alpine'::text, 'node24'::text, 'python313'::text])))),
     CONSTRAINT apps_status_check CHECK ((status = ANY (ARRAY['active'::text, 'evicted_cold'::text, 'deleted'::text]))),
     CONSTRAINT apps_type_check CHECK ((type = ANY (ARRAY['app'::text, 'function'::text]))),
-    CONSTRAINT apps_workload_class_chk CHECK ((workload_class = ANY (ARRAY['http'::text, 'graphql'::text, 'grpc'::text, 'job'::text, 'worker'::text]))),
-    CONSTRAINT apps_eviction_priority_chk CHECK ((eviction_priority = ANY (ARRAY['best_effort'::text, 'reserved'::text])))
+    CONSTRAINT apps_warm_snapshot_min_ms_check CHECK (((warm_snapshot_min_ms >= 100) AND (warm_snapshot_min_ms <= 60000))),
+    CONSTRAINT apps_warm_snapshot_min_requests_check CHECK (((warm_snapshot_min_requests >= 1) AND (warm_snapshot_min_requests <= 100))),
+    CONSTRAINT apps_workload_class_chk CHECK ((workload_class = ANY (ARRAY['http'::text, 'graphql'::text, 'grpc'::text, 'job'::text, 'worker'::text])))
 );
 
 
@@ -626,10 +693,12 @@ CREATE TABLE public.compute_nodes (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     region text,
     zone text,
+    schedd_target_url text,
     vcpu_budget integer DEFAULT 160 NOT NULL,
     CONSTRAINT compute_nodes_admission_ceiling_mb_check CHECK ((admission_ceiling_mb > 0)),
     CONSTRAINT compute_nodes_max_concurrency_check CHECK ((max_concurrency > 0)),
     CONSTRAINT compute_nodes_mem_mb_check CHECK ((mem_mb > 0)),
+    CONSTRAINT compute_nodes_schedd_target_url_scheme_chk CHECK (((schedd_target_url IS NULL) OR (schedd_target_url ~ '^(unix|tcp)://'::text))),
     CONSTRAINT compute_nodes_target_url_check CHECK ((target_url ~ '^(unix|tcp|dns)://'::text)),
     CONSTRAINT compute_nodes_vcpu_budget_check CHECK ((vcpu_budget > 0)),
     CONSTRAINT compute_nodes_vpcpus_check CHECK ((vpcpus > 0))
@@ -730,6 +799,22 @@ ALTER SEQUENCE public.deployment_logs_seq_seq OWNED BY public.deployment_logs.se
 
 
 --
+-- Name: deployment_sidecar_layers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.deployment_sidecar_layers (
+    deployment_id uuid NOT NULL,
+    sidecar_name text NOT NULL,
+    storage_key text NOT NULL,
+    bytes bigint NOT NULL,
+    content_digest text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT deployment_sidecar_layers_bytes_check CHECK ((bytes >= 0))
+);
+
+
+--
 -- Name: deployments; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -758,12 +843,16 @@ CREATE TABLE public.deployments (
     override_env_secrets jsonb,
     override_port integer,
     override_healthcheck jsonb,
+    sidecars jsonb DEFAULT '[]'::jsonb NOT NULL,
+    min_instances integer DEFAULT 0 NOT NULL,
     scan_result jsonb,
     scan_status text,
     scanned_at timestamp with time zone,
     CONSTRAINT deployments_commit_sha_shape_chk CHECK (((commit_sha IS NULL) OR (((char_length(commit_sha) >= 7) AND (char_length(commit_sha) <= 64)) AND (commit_sha ~ '^[0-9a-f]+$'::text)))),
     CONSTRAINT deployments_kind_check CHECK ((kind = ANY (ARRAY['image'::text, 'tarball'::text, 'dockerfile'::text, 'github'::text]))),
-    CONSTRAINT deployments_scan_status_chk CHECK ((scan_status IS NULL) OR (scan_status = ANY (ARRAY['pending'::text, 'complete'::text, 'failed'::text, 'skipped'::text]))),
+    CONSTRAINT deployments_min_instances_chk CHECK (((min_instances >= 0) AND (min_instances <= 100))),
+    CONSTRAINT deployments_scan_status_chk CHECK (((scan_status IS NULL) OR (scan_status = ANY (ARRAY['pending'::text, 'complete'::text, 'failed'::text, 'skipped'::text])))),
+    CONSTRAINT deployments_sidecars_cap_chk CHECK ((jsonb_array_length(sidecars) <= 2)),
     CONSTRAINT deployments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'building'::text, 'imaging'::text, 'snapshotting'::text, 'live'::text, 'failed'::text, 'superseded'::text])))
 );
 
@@ -901,15 +990,12 @@ CREATE TABLE public.instances (
     node_id uuid NOT NULL,
     wake_id uuid DEFAULT gen_random_uuid() NOT NULL,
     org_id uuid,
-    -- Issue #470 / PR #470-FU-B: per-instance stamp of the
-    -- guest-init framework_ready DGRAM receipt. Mirrors the
-    -- 00112_instances_framework_ready_at.sql migration. Read
-    -- by the engine's captureWarmSnapshot (PR #470-FU-A) to
-    -- know when to issue a warm-tier PauseAndSnapshot. NULL
-    -- = no signal landed yet (engine falls through to init
-    -- tier capture).
+    migrated_from_node_id uuid,
+    migrated_at timestamp with time zone,
+    lease_token text,
     framework_ready_at timestamp with time zone,
-    CONSTRAINT instances_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'parked'::text, 'waking'::text, 'cold_booting'::text, 'running'::text, 'snapshotting'::text, 'stopped'::text, 'failed'::text, 'evicting_account_deleting'::text])))
+    CONSTRAINT instances_migrated_at_chk CHECK (((migrated_at IS NULL) OR (migrated_at <= (now() + '00:01:00'::interval)))),
+    CONSTRAINT instances_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'parked'::text, 'waking'::text, 'cold_booting'::text, 'running'::text, 'snapshotting'::text, 'migrating'::text, 'stopped'::text, 'failed'::text, 'evicting_account_deleting'::text])))
 );
 
 
@@ -1097,6 +1183,22 @@ CREATE TABLE public.paddle_overage_dedupe (
 
 
 --
+-- Name: pg_ratelimit_counters; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.pg_ratelimit_counters (
+    scope text NOT NULL,
+    subject_id uuid NOT NULL,
+    plan text NOT NULL,
+    tokens bigint NOT NULL,
+    last_refill timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT pg_ratelimit_counters_plan_check CHECK ((plan = ANY (ARRAY['free'::text, 'hobby'::text, 'pro'::text, 'scale'::text]))),
+    CONSTRAINT pg_ratelimit_counters_scope_check CHECK ((scope = ANY (ARRAY['app'::text, 'account'::text]))),
+    CONSTRAINT pg_ratelimit_counters_tokens_check CHECK ((tokens >= 0))
+);
+
+
+--
 -- Name: projects; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1139,7 +1241,8 @@ CREATE TABLE public.sessions (
     issued_ua text,
     issued_at timestamp with time zone DEFAULT now() NOT NULL,
     last_seen_at timestamp with time zone,
-    revoked_at timestamp with time zone
+    revoked_at timestamp with time zone,
+    binding_hash text
 );
 
 
@@ -1190,7 +1293,9 @@ CREATE TABLE public.snapshots (
     disk_bytes bigint NOT NULL,
     stale boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    storage_key text DEFAULT ''::text NOT NULL
+    storage_key text DEFAULT ''::text NOT NULL,
+    tier text DEFAULT 'init'::text NOT NULL,
+    CONSTRAINT snapshots_tier_check CHECK ((tier = ANY (ARRAY['init'::text, 'warm'::text])))
 );
 
 
@@ -1344,6 +1449,31 @@ CREATE VIEW public.usage_monthly AS
 
 
 --
+-- Name: warm_hint; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.warm_hint (
+    app_id uuid NOT NULL,
+    node_id uuid NOT NULL,
+    written_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT warm_hint_written_at_chk CHECK ((written_at <= (now() + '00:01:00'::interval)))
+);
+
+
+--
+-- Name: webhook_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.webhook_deliveries (
+    provider text NOT NULL,
+    delivery_id text NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT webhook_deliveries_provider_check CHECK ((provider = ANY (ARRAY['github'::text, 'stripe'::text, 'paddle'::text])))
+);
+
+
+--
 -- Name: compute_node_heartbeats id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -1435,6 +1565,22 @@ ALTER TABLE ONLY public.api_keys
 
 ALTER TABLE ONLY public.app_envs
     ADD CONSTRAINT app_envs_pkey PRIMARY KEY (app_id, key);
+
+
+--
+-- Name: app_registry_credentials app_registry_credentials_app_registry_uq; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_registry_credentials
+    ADD CONSTRAINT app_registry_credentials_app_registry_uq UNIQUE (app_id, registry);
+
+
+--
+-- Name: app_registry_credentials app_registry_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_registry_credentials
+    ADD CONSTRAINT app_registry_credentials_pkey PRIMARY KEY (id);
 
 
 --
@@ -1582,6 +1728,14 @@ ALTER TABLE ONLY public.deployment_logs
 
 
 --
+-- Name: deployment_sidecar_layers deployment_sidecar_layers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deployment_sidecar_layers
+    ADD CONSTRAINT deployment_sidecar_layers_pkey PRIMARY KEY (deployment_id, sidecar_name);
+
+
+--
 -- Name: deployments deployments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1726,6 +1880,14 @@ ALTER TABLE ONLY public.paddle_overage_dedupe
 
 
 --
+-- Name: pg_ratelimit_counters pg_ratelimit_counters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.pg_ratelimit_counters
+    ADD CONSTRAINT pg_ratelimit_counters_pkey PRIMARY KEY (scope, subject_id, plan);
+
+
+--
 -- Name: projects projects_account_slug_uniq; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1787,6 +1949,22 @@ ALTER TABLE ONLY public.usage_daily
 
 ALTER TABLE ONLY public.usage_minutes
     ADD CONSTRAINT usage_minutes_pkey PRIMARY KEY (instance_id, minute);
+
+
+--
+-- Name: warm_hint warm_hint_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.warm_hint
+    ADD CONSTRAINT warm_hint_pkey PRIMARY KEY (app_id);
+
+
+--
+-- Name: webhook_deliveries webhook_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.webhook_deliveries
+    ADD CONSTRAINT webhook_deliveries_pkey PRIMARY KEY (provider, delivery_id);
 
 
 --
@@ -1860,10 +2038,31 @@ CREATE INDEX api_keys_account_idx ON public.api_keys USING btree (account_id);
 
 
 --
+-- Name: api_keys_account_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX api_keys_account_status_idx ON public.api_keys USING btree (account_id, status);
+
+
+--
+-- Name: api_keys_active_grace_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX api_keys_active_grace_idx ON public.api_keys USING btree (account_id) WHERE (status = ANY (ARRAY['active'::text, 'grace'::text]));
+
+
+--
 -- Name: api_keys_org_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX api_keys_org_id_idx ON public.api_keys USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: api_keys_rotated_from_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX api_keys_rotated_from_idx ON public.api_keys USING btree (rotated_from_id) WHERE (rotated_from_id IS NOT NULL);
 
 
 --
@@ -1885,6 +2084,13 @@ CREATE INDEX app_envs_app_idx ON public.app_envs USING btree (app_id);
 --
 
 CREATE INDEX app_envs_org_id_idx ON public.app_envs USING btree (org_id) WHERE (org_id IS NOT NULL);
+
+
+--
+-- Name: app_registry_credentials_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_registry_credentials_account_idx ON public.app_registry_credentials USING btree (account_id);
 
 
 --
@@ -1951,6 +2157,20 @@ CREATE INDEX apps_github_install_repo_branch_idx ON public.apps USING btree (git
 
 
 --
+-- Name: apps_node_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX apps_node_id_idx ON public.apps USING btree (node_id);
+
+
+--
+-- Name: apps_node_id_status_partial_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX apps_node_id_status_partial_idx ON public.apps USING btree (node_id, status) WHERE ((node_id IS NOT NULL) AND (status = ANY (ARRAY['active'::text, 'evicted_cold'::text])));
+
+
+--
 -- Name: apps_org_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -1962,6 +2182,13 @@ CREATE INDEX apps_org_id_idx ON public.apps USING btree (org_id) WHERE (org_id I
 --
 
 CREATE UNIQUE INDEX apps_project_workload_uniq ON public.apps USING btree (project_id, workload_name) WHERE (project_id IS NOT NULL);
+
+
+--
+-- Name: apps_reassigned_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX apps_reassigned_at_idx ON public.apps USING btree (reassigned_at) WHERE (reassigned_at IS NOT NULL);
 
 
 --
@@ -2091,17 +2318,17 @@ CREATE INDEX deployment_logs_seq_idx ON public.deployment_logs USING btree (depl
 
 
 --
+-- Name: deployment_sidecar_layers_storage_key_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX deployment_sidecar_layers_storage_key_idx ON public.deployment_sidecar_layers USING btree (storage_key);
+
+
+--
 -- Name: deployments_app_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX deployments_app_idx ON public.deployments USING btree (app_id, created_at DESC);
-
-
---
--- Name: deployments_failed_error_code_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX deployments_failed_error_code_idx ON public.deployments USING btree (error_code) WHERE (status = 'failed'::text);
 
 
 --
@@ -2112,6 +2339,13 @@ CREATE INDEX deployments_app_scan_complete_idx ON public.deployments USING btree
 
 
 --
+-- Name: deployments_failed_error_code_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX deployments_failed_error_code_idx ON public.deployments USING btree (error_code) WHERE (status = 'failed'::text);
+
+
+--
 -- Name: events_actor_account_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2119,10 +2353,24 @@ CREATE INDEX events_actor_account_idx ON public.events USING btree (actor_accoun
 
 
 --
+-- Name: events_sidecar_name_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX events_sidecar_name_idx ON public.events USING btree (((data ->> 'sidecar_name'::text))) WHERE (kind = ANY (ARRAY['wake.sidecar_init_exit'::text, 'wake.sidecar_restart'::text]));
+
+
+--
 -- Name: events_subject_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX events_subject_idx ON public.events USING btree (subject, at DESC);
+
+
+--
+-- Name: events_wake_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX events_wake_id_idx ON public.events USING btree (((data ->> 'wake_id'::text))) WHERE ((data ->> 'wake_id'::text) IS NOT NULL);
 
 
 --
@@ -2154,10 +2402,24 @@ CREATE INDEX github_installations_org_id_idx ON public.github_installations USIN
 
 
 --
+-- Name: instances_app_deployment_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX instances_app_deployment_idx ON public.instances USING btree (app_id, deployment_id) WHERE (state = ANY (ARRAY['RUNNING'::text, 'WAKING'::text, 'COLD_BOOTING'::text]));
+
+
+--
 -- Name: instances_app_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX instances_app_idx ON public.instances USING btree (app_id, state);
+
+
+--
+-- Name: instances_migrated_from_node_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX instances_migrated_from_node_id_idx ON public.instances USING btree (migrated_from_node_id) WHERE (migrated_from_node_id IS NOT NULL);
 
 
 --
@@ -2329,6 +2591,13 @@ CREATE INDEX paddle_overage_dedupe_pending_idx ON public.paddle_overage_dedupe U
 
 
 --
+-- Name: pg_ratelimit_counters_subject_id_app_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX pg_ratelimit_counters_subject_id_app_idx ON public.pg_ratelimit_counters USING btree (subject_id) WHERE (scope = 'app'::text);
+
+
+--
 -- Name: projects_install_repo_uniq; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2382,6 +2651,13 @@ CREATE INDEX snapshot_storage_daily_account_day_idx ON public.snapshot_storage_d
 --
 
 CREATE INDEX snapshots_deployment_idx ON public.snapshots USING btree (deployment_id);
+
+
+--
+-- Name: snapshots_deployment_tier_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX snapshots_deployment_tier_key ON public.snapshots USING btree (deployment_id, tier) WHERE (stale = false);
 
 
 --
@@ -2448,6 +2724,20 @@ CREATE INDEX usage_minutes_org_id_idx ON public.usage_minutes USING btree (org_i
 
 
 --
+-- Name: warm_hint_node_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX warm_hint_node_id_idx ON public.warm_hint USING btree (node_id);
+
+
+--
+-- Name: webhook_deliveries_expires_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX webhook_deliveries_expires_idx ON public.webhook_deliveries USING btree (expires_at);
+
+
+--
 -- Name: apps apps_egress_allowlist_cidr; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -2466,6 +2756,13 @@ CREATE TRIGGER compute_node_changed_trg AFTER INSERT OR UPDATE ON public.compute
 --
 
 CREATE TRIGGER compute_node_keys_changed_trg AFTER INSERT OR DELETE OR UPDATE ON public.compute_node_keys FOR EACH STATEMENT EXECUTE FUNCTION public.compute_node_keys_notify();
+
+
+--
+-- Name: deployment_sidecar_layers deployment_sidecar_layers_cap_trg; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER deployment_sidecar_layers_cap_trg BEFORE INSERT OR UPDATE ON public.deployment_sidecar_layers FOR EACH ROW EXECUTE FUNCTION public.deployment_sidecar_layers_cap_check();
 
 
 --
@@ -2569,6 +2866,22 @@ ALTER TABLE ONLY public.api_keys
 
 
 --
+-- Name: api_keys api_keys_parent_key_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.api_keys
+    ADD CONSTRAINT api_keys_parent_key_id_fkey FOREIGN KEY (parent_key_id) REFERENCES public.api_keys(id) ON DELETE SET NULL;
+
+
+--
+-- Name: api_keys api_keys_rotated_from_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.api_keys
+    ADD CONSTRAINT api_keys_rotated_from_id_fkey FOREIGN KEY (rotated_from_id) REFERENCES public.api_keys(id);
+
+
+--
 -- Name: app_envs app_envs_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2582,6 +2895,22 @@ ALTER TABLE ONLY public.app_envs
 
 ALTER TABLE ONLY public.app_envs
     ADD CONSTRAINT app_envs_org_id_fkey FOREIGN KEY (org_id) REFERENCES public.orgs(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: app_registry_credentials app_registry_credentials_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_registry_credentials
+    ADD CONSTRAINT app_registry_credentials_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_registry_credentials app_registry_credentials_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_registry_credentials
+    ADD CONSTRAINT app_registry_credentials_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
 
 
 --
@@ -2622,6 +2951,14 @@ ALTER TABLE ONLY public.apps
 
 ALTER TABLE ONLY public.apps
     ADD CONSTRAINT apps_github_install_account_id_fkey FOREIGN KEY (github_install_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+
+--
+-- Name: apps apps_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.apps
+    ADD CONSTRAINT apps_node_id_fkey FOREIGN KEY (node_id) REFERENCES public.compute_nodes(id) ON DELETE RESTRICT;
 
 
 --
@@ -2753,6 +3090,14 @@ ALTER TABLE ONLY public.deployment_logs
 
 
 --
+-- Name: deployment_sidecar_layers deployment_sidecar_layers_deployment_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.deployment_sidecar_layers
+    ADD CONSTRAINT deployment_sidecar_layers_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES public.deployments(id) ON DELETE CASCADE;
+
+
+--
 -- Name: deployments deployments_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2814,6 +3159,14 @@ ALTER TABLE ONLY public.instances
 
 ALTER TABLE ONLY public.instances
     ADD CONSTRAINT instances_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES public.deployments(id);
+
+
+--
+-- Name: instances instances_migrated_from_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.instances
+    ADD CONSTRAINT instances_migrated_from_node_id_fkey FOREIGN KEY (migrated_from_node_id) REFERENCES public.compute_nodes(id) ON DELETE SET NULL;
 
 
 --

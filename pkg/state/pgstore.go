@@ -450,9 +450,13 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 // The SELECT runs FOR SHARE so a concurrent /disable's
 // ConsumeRecoveryCode (which takes FOR UPDATE) blocks until we
 // commit, serialising the refuse vs the disable race correctly.
-// A short read tx is enough — we never write.
+// A short read tx is enough — we never write. NOTE: the tx must NOT
+// be opened READ ONLY — PostgreSQL rejects `SELECT ... FOR SHARE`
+// inside a read-only transaction (SQLSTATE 25006), which would make
+// every MatchRecoveryCode call fail at runtime. The FOR SHARE lock
+// itself is the concurrency control; the method never issues a write.
 func (s *PgStore) MatchRecoveryCode(ctx context.Context, id string, presented []byte) (bool, bool, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, false, fmt.Errorf("state: mfa match tx: %w", err)
 	}
@@ -1759,10 +1763,10 @@ func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]I
 // owns; without this filter every schedd would fire every cron and
 // the duplicate-dispatch hazard would corrupt the
 // cron_fired_audit row. The apps_node_id_idx covers the JOIN.
-// Projection matches scanCrons: id, app_id, schedule, path, enabled
-// (5 columns — the crons table is intentionally narrow).
+// Projection matches scanCrons: id, app_id, schedule, path, enabled,
+// created_at (6 columns).
 func (s *PgStore) ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]Cron, error) {
-	sel := `select c.id, c.app_id, c.schedule, c.path, c.enabled
+	sel := `select c.id, c.app_id, c.schedule, c.path, c.enabled, c.created_at
 		   from crons c
 		   join apps a on a.id = c.app_id
 		  where a.node_id = $1`
@@ -4232,7 +4236,7 @@ func (s *PgStore) ClaimNextQueuedBuildWithFairness(ctx context.Context, fairness
 		    where b.status = 'queued'
 		 ),
 		 fresh_candidates as (
-		   select id from queued_with_account
+		   select id, enqueued_at from queued_with_account
 		    where account_id not in (select account_id from skipped)
 		 ),
 		 has_fresh as (
@@ -4240,10 +4244,10 @@ func (s *PgStore) ClaimNextQueuedBuildWithFairness(ctx context.Context, fairness
 		 ),
 		 target as (
 		   -- prefer fresh; if none, fall back to ALL queued (starvation guard)
-		   select id from fresh_candidates
+		   select id, enqueued_at from fresh_candidates
 		    where (select yes from has_fresh)
 		   union all
-		   select id from queued_with_account
+		   select id, enqueued_at from queued_with_account
 		    where not (select yes from has_fresh)
 		    order by enqueued_at
 		    limit 1
@@ -5586,13 +5590,29 @@ func (s *PgStore) ListInvocationsForAccount(ctx context.Context, accountID strin
 	// (one to fetch the cursor row, one to scan). Per-account page
 	// counts are small (single customer scale) so the planner picks the
 	// existing PK + sort anyway.
-	rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
-		from invocations
-		where account_id = $1
-		  and ($2::text = '' or created_at < (
-		      select created_at from invocations where id = $2 and account_id = $1))
-		order by created_at desc, id desc
-		limit $3`, accountID, before, limit)
+	//
+	// The empty-cursor case must NOT reference the subquery at all —
+	// PostgreSQL type-checks the entire statement, so `id = $2` with a
+	// text parameter against a uuid column raises 42883 (uuid = text)
+	// even when the `$2 = ''` short-circuit would skip it at runtime.
+	// Branch on the cursor in Go instead.
+	var rows pgx.Rows
+	var err error
+	if before == "" {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where account_id = $1
+			order by created_at desc, id desc
+			limit $2`, accountID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where account_id = $1
+			  and created_at < (
+			      select created_at from invocations where id = $2 and account_id = $1)
+			order by created_at desc, id desc
+			limit $3`, accountID, before, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -7044,7 +7064,8 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 func (s *PgStore) ListComputeNodes(ctx context.Context, includeInactive bool) ([]ComputeNode, error) {
 	q := `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
+		       region, zone, schedd_target_url
 		  from compute_nodes
 	`
 	if !includeInactive {
@@ -9382,7 +9403,7 @@ func scanCrons(rows pgx.Rows) ([]Cron, error) {
 	var out []Cron
 	for rows.Next() {
 		c := Cron{}
-		if err := rows.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled); err != nil {
+		if err := rows.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
