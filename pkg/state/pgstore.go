@@ -1519,8 +1519,14 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+	// Issue #695 / ADR-080: public_auth_mode is included in the column
+	// list so the App struct's value is written verbatim. Pre-#695 the
+	// schema default ('open') shadowed any value the caller passed,
+	// which broke the per-plan default path on Pro/Scale (default
+	// 'bearer' was overwritten back to 'open' on insert). Same shape
+	// for both CreateApp and CreateAppIfUnderQuota below.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1531,9 +1537,19 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if statusValue == "" {
 		statusValue = AppActive
 	}
+	// Coerce an empty PublicAuthMode to AppPublicAuthModeOpen so the
+	// NOT NULL CHECK (public_auth_mode IN ('open','bearer','basic'))
+	// is satisfied. Mirrors the Type=="" / Status=="" floor above;
+	// apid always stamps the per-plan default before reaching this
+	// path, so the floor is a last-line defence for internal callers
+	// that build an App by hand.
+	publicAuthMode := app.PublicAuthMode
+	if publicAuthMode == "" {
+		publicAuthMode = AppPublicAuthModeOpen
+	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode)
 	return scanApp(row)
 }
 
@@ -1654,8 +1670,12 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+	// Issue #695 / ADR-080: public_auth_mode is in the column list so
+	// the App struct's value is written verbatim (same rationale as
+	// CreateApp above — schema default 'open' would otherwise shadow
+	// the per-plan default).
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1665,9 +1685,16 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	if statusValue == "" {
 		statusValue = AppActive
 	}
+	// Coerce an empty PublicAuthMode to AppPublicAuthModeOpen so the
+	// NOT NULL CHECK is satisfied (mirrors CreateApp above). Apid
+	// always stamps the per-plan default before reaching this path.
+	publicAuthMode := app.PublicAuthMode
+	if publicAuthMode == "" {
+		publicAuthMode = AppPublicAuthModeOpen
+	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
