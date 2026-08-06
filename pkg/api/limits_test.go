@@ -952,6 +952,62 @@ func TestPlanPublicAuthBasicAllowed(t *testing.T) {
 	}
 }
 
+// TestPlanRequireAuthnDefault pins the per-plan CREATE-TIME default for
+// apps.require_authn (issue #695 / ADR-080). Per-plan truth table:
+// Free=false, Hobby=true, Pro=true, Scale=true. apid's buildApp path
+// reads Plan.RequireAuthnDefault() when the POST body omitted the field
+// and stamps the result onto apps.require_authn. The migration 00155
+// grandfather marks every pre-flip row with auth_default_flipped_at so
+// no customer sees a behaviour change at the migration moment — this
+// accessor only affects post-flip CreateApp calls. Unknown plans must
+// fail closed (return false) — same contract as RequireAuthnAllowed
+// above; the fail-closed path lands on the schema column default.
+func TestPlanRequireAuthnDefault(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.RequireAuthnDefault(); got != c.want {
+			t.Errorf("%s.RequireAuthnDefault() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthModeDefault pins the per-plan CREATE-TIME default
+// for apps.public_auth_mode (issue #695 / ADR-080). Closed enum:
+// "open" / "bearer" / "basic". Per-plan truth table: Free="open",
+// Hobby="open" (no bearer scope on Hobby), Pro="bearer", Scale="bearer".
+// Hobby unlocks the require_authn gate but not the bearer scope —
+// defaulting to "bearer" without an unlocked scope would strand the
+// customer. apid's buildApp path reads Plan.PublicAuthModeDefault()
+// when the POST body omitted the field. Unknown plans must fail closed
+// (return "open") — same fail-closed contract as the bearer / basic
+// gate tests above.
+func TestPlanPublicAuthModeDefault(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want string
+	}{
+		{PlanFree, AppPublicAuthModeOpen},
+		{PlanHobby, AppPublicAuthModeOpen},
+		{PlanPro, AppPublicAuthModeBearer},
+		{PlanScale, AppPublicAuthModeBearer},
+		{Plan("unknown"), AppPublicAuthModeOpen},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthModeDefault(); got != c.want {
+			t.Errorf("%s.PublicAuthModeDefault() = %q, want %q", c.plan, got, c.want)
+		}
+	}
+}
+
 // TestPlanReservedConcurrencyPerAccount pins the per-account cap on
 // apps with eviction_priority='reserved' (issue #475). Free 0; Hobby 1;
 // Pro 2; Scale 4. apid's updateApp path enforces this under an

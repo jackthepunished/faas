@@ -473,6 +473,19 @@ type App struct {
 	// db.NotifyKeyChanged invalidation) so the secretbox
 	// hot-path doesn't run on every request.
 	PublicAuthBasicSealed []byte
+	// AuthDefaultFlippedAt (issue #695 / ADR-080) is the
+	// grandfather marker for the apps-auth-default flip. Stamped
+	// on every pre-flip app by migration 00155 so the dashboard
+	// banner query + `faas apps list` annotation can render the
+	// "since YYYY-MM-DD" suffix on grandfathered rows. NULL on
+	// apps created AFTER the migration (no grandfather needed;
+	// the default is already applied at create-time via
+	// plan.RequireAuthnDefault() + plan.PublicAuthModeDefault()
+	// in apid's buildApp path). Read-only at the wire surface —
+	// the PATCH path never writes this column. A future
+	// contributor adding a PATCH path that writes it must refuse
+	// the field with 422 unprocessable_entity per ADR-080 §9.
+	AuthDefaultFlippedAt *time.Time
 	// WarmSnapshotMinRequests is the minimum successful request
 	// count before schedd promotes a warm-tier capture. Range
 	// [1, 100], default 5. Lowering this shortens the time to

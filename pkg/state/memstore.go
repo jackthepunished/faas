@@ -1976,6 +1976,12 @@ func (m *MemStore) CreateAppIfUnderQuota(_ context.Context, app App, limits api.
 	// unconditional path so the per-account reserved-tier cap reader
 	// sees the same wire value.
 	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
+	// Issue #695 / ADR-080: see CreateApp — same defence-in-depth
+	// snap for the public_auth mode. require_authn is bool (zero
+	// is the schema default), so no snap is needed there.
+	if app.PublicAuthMode == "" {
+		app.PublicAuthMode = api.AppPublicAuthModeOpen
+	}
 	m.apps[app.ID] = app
 	return app, nil
 }

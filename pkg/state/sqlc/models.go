@@ -143,6 +143,14 @@ type App struct {
 	WarmSnapshotMinMs       int32
 	EvictionPriority        string
 	RequireAuthn            bool
+	// AuthDefaultFlippedAt (issue #695 / ADR-080) is the
+	// grandfather marker; nullable so pre-flip-aware reads can
+	// distinguish "row was created before the migration" (NOT
+	// NULL after the backfill) from "row was created after the
+	// migration" (NULL — no grandfather needed). Mirrors the
+	// nullable shape of the pgstore scan path; see
+	// pkg/state/types.go::App.AuthDefaultFlippedAt.
+	AuthDefaultFlippedAt    pgtype.Timestamptz
 }
 
 type AppEnv struct {

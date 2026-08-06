@@ -9181,7 +9181,14 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// bytea (NULL when mode='open'|'bearer'), scanned
 		// into a *[]byte to keep the SQL NULL → Go nil
 		// convention explicit.
-		&a.PublicAuthMode, &a.PublicAuthBasicSealed); err != nil {
+		&a.PublicAuthMode, &a.PublicAuthBasicSealed,
+		// Issue #695 / ADR-080: grand-father marker. Nullable
+		// timestamptz scanned into *time.Time (pgx handles the
+		// SQL NULL → Go nil conversion natively — same shape
+		// as ReassignedAt / MigratedAt above). NOT NULL after
+		// migration 00155 backfills; NULL on apps created
+		// post-flip (no grandfather needed).
+		&a.AuthDefaultFlippedAt); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -9246,7 +9253,11 @@ const appsSelectColumns = `
 	eviction_priority,
 	require_authn,
 	-- Issue #477 / ADR-079: per-app public_auth
-	public_auth_mode, public_auth_basic`
+	public_auth_mode, public_auth_basic,
+	-- Issue #695 / ADR-080: grand-father marker. Set by
+	-- migration 00155 on every pre-flip row; reads null on
+	-- apps created post-flip.
+	auth_default_flipped_at`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

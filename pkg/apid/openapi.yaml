@@ -5286,6 +5286,15 @@ components:
         # (see ADR-077 §Decision "re-redaction invariant").
         public_auth:
           $ref: '#/components/schemas/PublicAuthStatus'
+        # Issue #695 / ADR-080: grand-father marker for the
+        # apps-auth-default flip. Set on apps that pre-date the
+        # flip (migration 00155 stamped every pre-flip row at
+        # migration time); null on apps created after the
+        # flip. Read-only — the PATCH side has no field to
+        # mutate. Dashboards render the "AUTH: <mode>"
+        # annotation with the "since YYYY-MM-DD" suffix only
+        # when this is non-null.
+        auth_default_flipped_at: { type: string, format: date-time, nullable: true }
 
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
@@ -5334,12 +5343,17 @@ components:
           type: string
           enum: [best_effort, reserved]
           example: best_effort
-        # Issue #560: optional at create-time. Omitted →
-        # apid applies the plan default (false — every
-        # existing customer keeps the public-by-default
-        # behaviour). Set true on Pro/Scale to gate the
-        # deployment behind a bearer-token check at the
-        # gatewayd-internal routing layer.
+        # Issue #560 + issue #695 / ADR-080: optional at
+        # create-time. Omitted → apid applies the per-plan
+        # default (Free=false, Hobby=true, Pro=true, Scale=true).
+        # Migration 00155 grand-fathered every pre-flip app so
+        # existing customers see no behaviour change. Set
+        # false on Hobby/Pro/Scale to opt out at create time
+        # (e.g. a brand-new staging app that wants the public
+        # path); set true on Pro/Scale is gated (Free/Hobby
+        # PATCH-true is rejected with 403
+        # plan_require_authn_not_allowed — though Hobby now
+        # ships true by default).
         require_authn:
           description: "Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false). Pro/Scale only."
           type: boolean
