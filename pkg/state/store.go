@@ -2595,9 +2595,18 @@ type Store interface {
 
 	// CountActiveOrgMembers returns the number of memberships with
 	// removed_at IS NULL for the given org. Filtered at the SQL
-	// layer so the count does not scan every row into Go. Used by
-	// apid's enforceMemberCap (Plan.OrgMembersMax) and by the
-	// store-side defence-in-depth check inside consumeOrgInvitation.
+	// layer so the count does not scan every row into Go. Used by:
+	//   - the store-side cap-in-tx check inside consumeOrgInvitation
+	//     (the load-bearing gate — Plan.OrgMembersMax)
+	//   - GET /v1/orgs/{slug}/seat_usage for the visibility-only
+	//     wire shape (IAM-6 / ADR-061 PR 7)
+	//
+	// IAM-6 / ADR-061 PR 7 note: the earlier comment claiming
+	// "apid's enforceMemberCap gates the handler path" is stale.
+	// That helper is intentionally unwired
+	// (cmd/apid/org_handler_helpers.go) and the future direct-add
+	// route (PR-11 follow-up) is what would call it.
+	//
 	// Returns 0 when the org has no rows.
 	CountActiveOrgMembers(ctx context.Context, orgID string) (int, error)
 

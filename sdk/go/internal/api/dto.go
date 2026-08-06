@@ -921,6 +921,20 @@ type InvitationListResponse struct {
 	Invitations []OrgInvitationResponse `json:"invitations"`
 }
 
+// SeatUsageResponse is the body of GET
+// /v1/orgs/{slug}/seat_usage. Visibility-only — PR 9 ships the
+// per-seat pricing cut-over per ADR-061 §"Out of scope". `limit`
+// returns 0 for the free plan (the fail-closed accessor shape
+// the dashboard renders as "personal org only").
+type SeatUsageResponse struct {
+	Used  int    `json:"used"`
+	Limit int    `json:"limit"`
+	Plan  string `json:"plan"`
+}
+
+// ChangeMemberRoleRequest is the body of PATCH
+// /v1/orgs/{slug}/members/{user_id}. Role cannot be `owner`.
+
 // ScanSeverityCounts is the per-severity CVE tally on a per-deploy
 // grype scan (issue #464 / ADR-075). Each counter is the number of
 // findings at that severity level; a deploy with no findings has all

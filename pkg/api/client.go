@@ -1635,11 +1635,39 @@ func (c *Client) TransferOrgOwnership(ctx context.Context, slug string, req Tran
 // PeekInvitation is a read-only lookup that returns the invitation
 // metadata (email, role, org slug, expires_at) without consuming
 // the token. Used by the dashboard to render "you've been invited
-// to Acme Inc. as developer" before the invitee accepts. The accept
-// flow lands in PR 8.
+// to Acme Inc. as developer" before the invitee accepts.
 func (c *Client) PeekInvitation(ctx context.Context, token string) (OrgInvitationResponse, error) {
 	var out OrgInvitationResponse
 	return out, c.do(ctx, "GET", "/v1/invitations/"+token, nil, &out)
+}
+
+// AcceptInvitation consumes the token via Store.ConsumeOrgInvitation
+// (the load-bearing cap-in-tx check lives there) and inserts the
+// bearer as a new active member. Two audit rows fire post-mutation:
+// `org.invitation.accepted` and `org.member.added`. Returns 410
+// (`org_invitation_invalid`) on unknown / consumed / revoked /
+// expired tokens; 409 (`org_already_member`) if the bearer is
+// already a member; 403 (`org_member_cap_exceeded`) at the plan cap.
+func (c *Client) AcceptInvitation(ctx context.Context, token string) (OrgMemberResponse, error) {
+	var out OrgMemberResponse
+	return out, c.do(ctx, "POST", "/v1/invitations/"+token+"/accept", nil, &out)
+}
+
+// RevokeInvitation stamps revoked_at on a still-pending invitation.
+// Owner + admin only (org.invite_members, symmetric with
+// InviteOrgMember). Emits `org.invitation.revoked` with an 8-char
+// token-hash prefix (never the full hash).
+func (c *Client) RevokeInvitation(ctx context.Context, slug, token string) error {
+	return c.do(ctx, "DELETE", "/v1/orgs/"+slug+"/invitations/"+token, nil, nil)
+}
+
+// GetOrgSeatUsage returns {used, limit, plan} for the active org.
+// `limit` is the plan cap (OrgMembersMax). Free / unknown plans
+// return 0 (the fail-closed accessor). Visibility-only — PR 9 ships
+// the per-seat pricing cut-over.
+func (c *Client) GetOrgSeatUsage(ctx context.Context, slug string) (SeatUsageResponse, error) {
+	var out SeatUsageResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/"+slug+"/seat_usage", nil, &out)
 }
 
 // --- Webhook delivery (issue #476 / ADR-076) -----------------------------

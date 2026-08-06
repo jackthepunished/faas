@@ -150,6 +150,7 @@ export type { RotateOrgAPIKeyResponse } from './models/RotateOrgAPIKeyResponse.j
 export type { ScalingPolicy } from './models/ScalingPolicy.js';
 export type { ScalingTarget } from './models/ScalingTarget.js';
 export type { ScanResult } from './models/ScanResult.js';
+export type { SeatUsageResponse } from './models/SeatUsageResponse.js';
 export type { SecretKey } from './models/SecretKey.js';
 export type { SessionInfo } from './models/SessionInfo.js';
 export type { SessionListResponse } from './models/SessionListResponse.js';
