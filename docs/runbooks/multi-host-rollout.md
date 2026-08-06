@@ -200,6 +200,12 @@ masquerade_cidr: 10.101.0.0/16
 ssh gregale-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap'
 ```
 
+> **Note:** the `/opt/onebox-faas` filesystem path is the bootstrap
+> layout from `deploy/scripts/bootstrap.sh` (filesystem layout is
+> code-side, not part of the docs rebrand). A follow-up code-identity
+> pass renames the path to match the host `gregale` user; until then
+> the path is stable across all bootstrap invocations.
+
 The bootstrap role provisions the daemon fleet + applies the
 `overlay` role (Tailscale + Wireguard stub) + renders
 `/etc/nftables.conf` from the host_vars above. Per-daemon stat

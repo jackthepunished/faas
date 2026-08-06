@@ -2,9 +2,10 @@
 
 Scale-to-zero FaaS on Firecracker microVMs, deployable on any bare-metal x86_64
 control-plane node. Customer apps park as snapshots on disk and wake on request
-in <350 ms. Gregale runs one box today; the architecture targets a multi-host
-control plane (see `docs/scale_out_and_workload_classes.md` and the Tier A
-ADRs). The original EX44 cluster is one such deployment — not a hard requirement.
+in <350 ms. Gregale runs a single control-plane node today; the architecture
+targets a multi-host control plane (see `docs/scale_out_and_workload_classes.md`
+and the Tier A ADRs). The original Hetzner EX44 is one such deployment — not a
+hard requirement.
 
 ## Source of truth (in order)
 
@@ -29,7 +30,7 @@ make metal-lima     # run the metal tests locally on an M3+ Mac via Lima nested 
 Go ≥ 1.23. One binary per `cmd/` dir. If a change touches VM lifecycle, run
 `test-metal` and `leakcheck` before calling it done.
 
-### Developing the metal side on a Mac (no EX44 needed)
+### Developing the metal side on a Mac (no bare-metal x86_64 host needed)
 
 Firecracker needs `/dev/kvm`, which macOS doesn't provide — but on **Apple
 Silicon M3+ / macOS 15+** you can run the `//go:build metal` tests locally through
