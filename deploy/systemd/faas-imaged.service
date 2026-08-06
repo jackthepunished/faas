@@ -26,7 +26,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-ReadWritePaths=/srv/fc/snap /srv/fc/base /srv/fc/base-staging /srv/fc/sigs /var/log/faas /var/spool/faas /dev/shm/faas-base-staging
+ReadWritePaths=/srv/fc/snap /srv/fc/base /srv/fc/base-staging /srv/fc/scans /srv/fc/sigs /var/log/faas /var/spool/faas /dev/shm/faas-base-staging
 
 [Install]
 WantedBy=multi-user.target

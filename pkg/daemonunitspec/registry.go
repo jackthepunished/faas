@@ -53,7 +53,7 @@ func ActivationOrder() []string {
 // and the order the workflow actually restarts the services in.
 var Registry = []Entry{
 	{Name: "vmmd", Unit: UnitVmmd, Critical: true, Lifecycle: Lifecycle{Probe: ProbeUnix, ProbeTarget: "/run/faas/vmmd.sock"}},
-	{Name: "apid", Unit: UnitApid, Critical: true, Lifecycle: Lifecycle{Probe: ProbeTCP, ProbeTarget: "127.0.0.1:8081"}},
+	{Name: "apid", Unit: UnitApid, Critical: true, Lifecycle: Lifecycle{Probe: ProbeSystemd}},
 	{Name: "schedd", Unit: UnitSchedd, Critical: true, Lifecycle: Lifecycle{After: []string{"vmmd"}, Probe: ProbeUnix, ProbeTarget: "/run/faas/schedd.sock"}},
 	{Name: "gatewayd-internal", Unit: UnitGatewaydInternal, Critical: true, Lifecycle: Lifecycle{After: []string{"schedd", "apid"}, Probe: ProbeTCP, ProbeTarget: "127.0.0.1:9090"}},
 	{Name: "gatewayd-public", Unit: UnitGatewaydPublic, Critical: true, Lifecycle: Lifecycle{After: []string{"gatewayd-internal"}, Probe: ProbeTCP, ProbeTarget: "127.0.0.1:8080"}},
