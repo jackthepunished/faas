@@ -154,7 +154,7 @@ func TestPg_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 
 	// 3 → 2 → 1 → 0.
 	for want := int32(2); want >= 0; want-- {
-		if err := store.DecrementInstanceTailCount(ctx, insID); err != nil {
+		if err := store.DecrementInstanceTailCount(ctx, insID, 1); err != nil {
 			t.Fatalf("decrement: %v", err)
 		}
 		got, err := store.InstanceByID(ctx, insID)
@@ -167,7 +167,7 @@ func TestPg_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	}
 
 	// Stray decrement at 0 — must floor, not underflow.
-	if err := store.DecrementInstanceTailCount(ctx, insID); err != nil {
+	if err := store.DecrementInstanceTailCount(ctx, insID, 1); err != nil {
 		t.Fatalf("stray decrement: %v", err)
 	}
 	got, _ := store.InstanceByID(ctx, insID)
@@ -227,7 +227,7 @@ func TestPg_BumpDecrement_MissingRowReturnsErrNotFound(t *testing.T) {
 	if _, err := store.BumpInstanceTailCount(ctx, missing, 1); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("BumpInstanceTailCount on missing = %v, want state.ErrNotFound", err)
 	}
-	if err := store.DecrementInstanceTailCount(ctx, missing); !errors.Is(err, state.ErrNotFound) {
+	if err := store.DecrementInstanceTailCount(ctx, missing, 1); !errors.Is(err, state.ErrNotFound) {
 		t.Errorf("DecrementInstanceTailCount on missing = %v, want state.ErrNotFound", err)
 	}
 }

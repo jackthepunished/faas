@@ -360,6 +360,22 @@ func TestTailEventWire_Shape(t *testing.T) {
 			if wire[1] != tc.outcome {
 				t.Errorf("wire[1] outcome = 0x%02x, want 0x%02x", wire[1], tc.outcome)
 			}
+			// Reserved bytes 2..8 MUST be zero (pinned by
+			// ADR-078 §"Wire format" — those 6 bytes are
+			// reserved for a future wire-incompatible-free
+			// upgrade path; the encoder MUST write zeros
+			// even if it has dynamic state at those offsets,
+			// otherwise a future decoder that reads the
+			// reserved bytes sees garbage and rejects the
+			// envelope). The issue is silent because the
+			// current decoder ignores the reserved bytes —
+			// the regression would only surface when a
+			// future ADR repurposes the field.
+			for i := 2; i < 8; i++ {
+				if wire[i] != 0 {
+					t.Errorf("wire[%d] reserved byte = 0x%02x, want 0x00 (encoder must zero-pad the reserved region — see ADR-078 §\"Wire format\")", i, wire[i])
+				}
+			}
 			// Round-trip through the host-side decoder.
 			gotOutcome, gotElapsed, err := parseTailEventWire(wire)
 			if err != nil {

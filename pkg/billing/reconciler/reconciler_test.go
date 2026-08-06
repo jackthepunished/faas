@@ -69,7 +69,7 @@ func seedMemStore(t *testing.T, label string, plan api.Plan, mbSeconds int64) (*
 		context.Background(),
 		id, "app1", "inst1",
 		time.Now().UTC().Truncate(time.Hour).Add(-30*time.Minute),
-		mbSeconds, 0, 0, 0, 0, 0, 0); err != nil {
+		mbSeconds, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("AppendUsage: %v", err)
 	}
 	return store, id

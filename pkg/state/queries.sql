@@ -249,19 +249,28 @@ limit $3;
 -- (M7 hardening, PR feat/m7-beta-hardening): a redelivered
 -- minute is a no-op for the billing-floor columns so a meterd
 -- restart / network blip / two meterd instances cannot inflate
--- billing. cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on
--- the same conflict key — the schedd / meterd accumulators can
--- each call AppendUsage many times within the same minute; the
--- columns are the sum of all per-tick deltas.
---   cpu_usec     — issue #279 / PR-B / ADR-039
---   tx_bytes     — ADR-046 (gateway HTTP response body bytes)
---   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
-insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+-- billing. cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes,
+-- cold_boot_count, and tail_seconds are ADDITIVE on the same
+-- conflict key — the schedd / meterd accumulators can each call
+-- AppendUsage many times within the same minute; the columns are
+-- the sum of all per-tick deltas.
+--   cpu_usec         — issue #279 / PR-B / ADR-039
+--   tx_bytes         — ADR-046 (gateway HTTP response body bytes)
+--   net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
+--   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
+--   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
+--   tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock seconds
+--                      draining waitUntil tasks; INFORMATIONAL ONLY — pinned
+--                      by pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
+insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 on conflict (instance_id, minute) do update
-   set cpu_usec     = usage_minutes.cpu_usec     + EXCLUDED.cpu_usec,
-       tx_bytes     = usage_minutes.tx_bytes     + EXCLUDED.tx_bytes,
-       net_tx_bytes = usage_minutes.net_tx_bytes + EXCLUDED.net_tx_bytes;
+   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
+       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
+       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
+       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
+       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count,
+       tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds;
 
 -- name: UsageByMonth :many
 select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes
@@ -287,6 +296,46 @@ from instances where app_id = $1 order by started_at desc;
 
 -- name: UpdateInstanceState :exec
 update instances set state = $2 where id = $1;
+
+-- name: BumpInstanceTailCount :one
+-- issue #667 / ADR-078 — atomically apply delta to the instance's
+-- `tail_count` column and return the post-update value. The
+-- GREATEST(…, 0) floor mirrors DecrementInstanceTailCount's safety
+-- property: a stale receipt from a guest that just parked cannot
+-- underflow the counter, and the 5s watchdog in snapshotAndPark
+-- force-parks regardless. RETURNING tail_count lets the caller
+-- (vmmd's MarkInstanceTailTerminal) learn the new value without a
+-- follow-up SELECT. Returns ErrNotFound when the instance row is
+-- missing (pgx.ErrNoRows maps to state.ErrNotFound in pgstore).
+update instances
+   set tail_count = GREATEST(tail_count + $2, 0)
+ where id = $1
+returning tail_count;
+
+-- name: DecrementInstanceTailCount :exec
+-- issue #667 / ADR-078 — canonical "tail task reached terminal" path.
+-- Equivalent to BumpInstanceTailCount(ctx, id, -n) but kept as a
+-- separate method because every decrement site is a terminal event
+-- receipt, and the explicit name makes the call sites self-
+-- documenting. n is the number of tail tasks to decrement by (1 for
+-- the steady-state path, the full unfinished-tail count for the
+-- snapshotAndPark watchdog). The GREATEST(…, 0) floor is a
+-- defence-in-depth guard against races where a receipt lands after
+-- the runner exited cleanly: the counter floors at 0 rather than
+-- underflowing, which would permanently stall the schedd reaper's
+-- tail_count > 0 early-out. Returns ErrNotFound when the instance
+-- row is missing.
+update instances
+   set tail_count = GREATEST(tail_count - $2, 0)
+ where id = $1;
+
+-- name: GetInstanceTailCount :one
+-- issue #667 / ADR-078 — read-only probe for the snapshotAndPark
+-- 5s watchdog's poll loop. Single SELECT … FROM instances WHERE
+-- id = $1; the column is on the hot path so the row is already in
+-- shared_buffers under normal load. Returns ErrNotFound when the
+-- instance row is missing.
+select tail_count from instances where id = $1;
 
 -- name: CreateBuild :one
 insert into builds (id, deployment_id, kind, source_bytes, status, log_path)

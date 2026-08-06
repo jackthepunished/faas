@@ -1835,15 +1835,25 @@ type Store interface {
 	BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error)
 	// DecrementInstanceTailCount is the canonical "tail task
 	// reached terminal" path (issue #667 / ADR-078). Equivalent
-	// to BumpInstanceTailCount(ctx, id, -1) but with an extra
+	// to BumpInstanceTailCount(ctx, id, -n) but with an extra
 	// safety floor at 0 (UPDATE … SET tail_count = GREATEST(
 	// tail_count - $2, 0)) so a stale receipt from a guest that
-	// just parked cannot underflow the counter. Used by vmmd's
-	// MarkInstanceTailTerminal; PR 4 also calls it from the
-	// snapshotAndPark watchdog when the 5s drain window elapses
-	// with unfinished tails.
+	// just parked cannot underflow the counter. n is the number of
+	// tail tasks to decrement by (1 for the steady-state path, the
+	// full unfinished-tail count for the snapshotAndPark watchdog).
+	// Used by vmmd's MarkInstanceTailTerminal; PR 4 also calls it
+	// from the snapshotAndPark watchdog when the 5s drain window
+	// elapses with unfinished tails.
 	// Returns ErrNotFound when the instance row is missing.
-	DecrementInstanceTailCount(ctx context.Context, id string) error
+	DecrementInstanceTailCount(ctx context.Context, id string, n int32) error
+	// GetInstanceTailCount returns the current value of the
+	// instance's `tail_count` column (issue #667 / ADR-078). Used by
+	// the snapshotAndPark watchdog to poll for drain completion.
+	// Returns ErrNotFound when the instance row is missing.
+	// Implementations may issue a single SELECT … FROM instances
+	// WHERE id = $1; the column is on the hot path so the row is
+	// already in shared_buffers under normal load.
+	GetInstanceTailCount(ctx context.Context, id string) (int32, error)
 	// ListInstancesByStatesOlderThan is the §6.1 watchdog's lookup.
 	// Returns rows currently in any of the given states whose
 	// "age timestamp" is strictly older than threshold. The age
@@ -2106,22 +2116,31 @@ type Store interface {
 	// AppendUsage is idempotent on (instance_id, minute): the first
 	// write of mb_seconds / requests wins, a redelivered minute is
 	// a no-op for those columns. cpu_usec, tx_bytes, net_tx_bytes,
-	// net_rx_bytes, and cold_boot_count are ADDITIVE on
+	// net_rx_bytes, cold_boot_count, and tail_seconds are ADDITIVE on
 	// (instance_id, minute): the schedd / meterd accumulators can
 	// call AppendUsage many times within the same minute; the
 	// columns are the sum of all per-tick deltas. The additive
 	// merge is documented at migrations/00055_usage_minutes_cpu.sql
 	// (cpu_usec), migrations/00065_usage_minutes_egress.sql
-	// (tx_bytes, net_tx_bytes, ADR-046), and
+	// (tx_bytes, net_tx_bytes, ADR-046),
 	// migrations/00067_extend_metering_telemetry.sql (net_rx_bytes,
-	// cold_boot_count, ADR-048).
+	// cold_boot_count, ADR-048), and
+	// migrations/00151_wait_until_tail.sql (tail_seconds, issue #667 /
+	// ADR-078).
+	//
+	// tail_seconds is the per-minute wall-clock seconds the instance
+	// spent draining waitUntil tasks. It is INFORMATIONAL ONLY —
+	// tail_seconds does NOT enter Math.GBHours, Provider.PushUsageRecord,
+	// or any Stripe/Paddle payload. The permanent guard test
+	// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds
+	// pins this invariant; a follow-up ADR would have to remove it.
 	//
 	// builder_seconds / builder_kind are NOT accepted here — they
 	// are written via AppendBuilderUsage (keyed by build_id) because
 	// the per-build billing grain differs from the per-instance
 	// usage_minutes grain and mixing them would lose the
 	// build-id idempotency that webhook redelivery requires.
-	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error
+	AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32, tailSeconds int64) error
 	// AppendBuilderUsage writes one builder-time usage row per
 	// terminal build (succeeded or failed — the box burned cycles
 	// either way; informational only per ADR-048 §4). Idempotent

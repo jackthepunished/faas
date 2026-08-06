@@ -1673,6 +1673,12 @@ type DailyUsage struct {
 	NetRxBytes     int64
 	ColdBootCount  int64
 	BuilderSeconds int64
+	// TailSeconds (issue #667 / ADR-078) is the per-day wall-clock
+	// seconds this instance spent draining waitUntil tasks.
+	// INFORMATIONAL ONLY — does not enter billing. Pinned by
+	// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
+	// Source: rollup.go::rollupSQL SUM(tail_seconds).
+	TailSeconds int64
 }
 
 // StorageUsage is the per-(account, app, day) row read by

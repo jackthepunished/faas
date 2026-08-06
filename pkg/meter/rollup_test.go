@@ -159,7 +159,7 @@ func TestRollupSQL_OverwriteSemantics(t *testing.T) {
 	checkCols := []string{
 		"mb_seconds", "requests", "cpu_usec", "tx_bytes",
 		"net_tx_bytes", "net_rx_bytes", "cold_boots",
-		"builder_seconds",
+		"builder_seconds", "tail_seconds",
 	}
 	for _, c := range checkCols {
 		// Restrict the assertion to the UPDATE SET clause so we don't

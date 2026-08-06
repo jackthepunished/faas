@@ -104,6 +104,31 @@ func chmodSocket(path string, mode os.FileMode) error {
 	}
 }
 
+// waitForSocketPath blocks until os.Stat on the unix-socket path
+// succeeds, retrying while ENOENT. Mirrors the chmodSocket retry
+// shape — the production code at start() net.Listen's, then
+// immediately chmods (chmodSocket retries on ENOENT) AND waits
+// here so any caller that immediately dials sees a stable surface.
+// The same 500ms budget is used so the worst-case startup latency
+// stays bounded.
+func waitForSocketPath(path string, deadline time.Duration) error {
+	end := time.Now().Add(deadline)
+	var lastErr error
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(end) {
+			return lastErr
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // newEgressGRPCListener constructs (but does not start) the
 // gRPC listener. target is the bind target (unix:///path or
 // tcp://host:port for multi-box). tlsCfg is the server-side
@@ -176,9 +201,19 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 			return fmt.Errorf("gatewayd egress: listen %s: %w", l.socketPath, err)
 		}
 		// The kernel publishes the dirent asynchronously after
-		// net.Listen returns. Under tmpfs load (CI runner pool),
-		// the publish can lag a few ms past the listen return —
-		// the next syscall (chmod) sees ENOENT. Retry briefly.
+		// net.Listen returns. Under tmpfs load (CI runner pool,
+		// observed in TestEgressStopStopStart_RepeatedCycle at
+		// cycle 2 of a 16-cycle restart loop), the publish can
+		// lag tens of ms past the listen return — any caller
+		// that immediately dials or chmods hits ENOENT. Wait
+		// until the dirent is visible so callers see a stable
+		// surface. The subsequent chmodSocket call also retries
+		// on ENOENT, but waiting here shortens the failure mode
+		// for callers that don't retry.
+		if err := waitForSocketPath(l.socketPath, 500*time.Millisecond); err != nil {
+			_ = lis.Close()
+			return fmt.Errorf("gatewayd egress: wait for socket dirent: %w", err)
+		}
 		if err := chmodSocket(l.socketPath, egressGRPCSocketMode); err != nil {
 			_ = lis.Close()
 			return fmt.Errorf("gatewayd egress: chmod: %w", err)

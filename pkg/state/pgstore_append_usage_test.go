@@ -25,12 +25,12 @@ func TestPg_AppendUsage_IdempotentSameMinute(t *testing.T) {
 	minute := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 
 	// First write — wins.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 0, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	// Redelivered minute — a no-op. Different mb_seconds / requests must
 	// NOT overwrite the first write.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 0, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("redelivered append: %v", err)
 	}
 
@@ -70,10 +70,10 @@ func TestPg_AppendUsage_AccumulatesAcrossMinutes(t *testing.T) {
 	m0 := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 	m1 := m0.Add(time.Minute)
 
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m0, 15_840, 1, 0, 0, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m0, 15_840, 1, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append m0: %v", err)
 	}
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m1, 15_840, 2, 0, 0, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, m1, 15_840, 2, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append m1: %v", err)
 	}
 
@@ -116,12 +116,12 @@ func TestPg_AppendUsage_AddsCpuUsecOnConflict(t *testing.T) {
 	minute := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 
 	// First write: billing-floor + 5_000_000 µs of CPU work.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 5_000_000, 0, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 5_000_000, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	// Second write: same minute, different billing-floor (must be
 	// discarded), additive CPU delta (10_000_000 µs).
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 10_000_000, 0, 0, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 10_000_000, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("second append: %v", err)
 	}
 
@@ -178,11 +178,11 @@ func TestPg_AppendUsage_AddsTxBytesAndNetTxBytesOnConflict(t *testing.T) {
 	// net_tx_bytes=4_000_000 (vmmd netstats). Both are interface
 	// bytes; the units are identical on the wire so a straight
 	// additive merge is correct.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 1_000_000, 4_000_000, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 1_000_000, 4_000_000, 0, 0, 0); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
 	// Second write: same minute, additional tx_bytes + net_tx_bytes.
-	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 2_500_000, 8_000_000, 0, 0); err != nil {
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 2_500_000, 8_000_000, 0, 0, 0); err != nil {
 		t.Fatalf("second append: %v", err)
 	}
 
@@ -245,11 +245,66 @@ func TestPg_AppendUsage_NoUniqueViolationReturned(t *testing.T) {
 
 	// 50 same-minute writes — every one must succeed and not surface ErrConflict.
 	for i := 0; i < 50; i++ {
-		if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 7_680, 1, 0, 0, 0, 0, 0); err != nil {
+		if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 7_680, 1, 0, 0, 0, 0, 0, 0); err != nil {
 			if errors.Is(err, state.ErrConflict) {
 				t.Fatalf("call %d returned ErrConflict: %v", i, err)
 			}
 			t.Fatalf("call %d returned error: %v", i, err)
 		}
+	}
+}
+
+// TestPg_AppendUsage_AddsTailSecondsOnConflict pins the additive-merge
+// contract for the tail_seconds column (issue #667 / ADR-078). Mirrors
+// TestPg_AppendUsage_AddsCpuUsecOnConflict: two writes for the same
+// (instance_id, minute) ADD their tail_seconds values while still
+// leaving mb_seconds and requests as first-write-wins. The Sampler
+// fires ~240 times per minute (250 ms cadence), and the per-tick
+// tail_seconds delta is small (a few seconds per tail that drains
+// during the tick), so the same (instance_id, minute) row is rewritten
+// many times within the minute — the merge must be additive for
+// tail_seconds, not idempotent.
+//
+// The read-back path queries usage_minutes directly because the
+// Store.UsageByHour aggregate intentionally does not project
+// tail_seconds (the Usage struct carries only the billing-relevant
+// columns; tail_seconds is per-day-grain via UsageDaily/DailyUsage,
+// not per-hour). tail_seconds is pinned informationally only —
+// billing has no dependency on it, so the additive merge is purely
+// a metric-fidelity concern; a regression to first-write-wins would
+// drop >99% of the cumulative number (240 ticks coalesced to the
+// first) and the §12 tail-watchdog panel would mis-report.
+func TestPg_AppendUsage_AddsTailSecondsOnConflict(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+	acctID, appID, depID := seedLiveDeploy(t, s, ctx)
+	ins, err := s.CreateInstance(ctx, appID, depID, string(state.StateRunning), 512, resolveDefaultLocal(t, ctx, s), "")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	minute := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+
+	// First write: 30 tail-seconds (one tail at 30s, or three tails
+	// at 10s each — the column is the sum of per-tick deltas).
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 30_720, 1, 0, 0, 0, 0, 0, 30); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	// Second write: same minute, different billing-floor (must be
+	// discarded), additive tail_seconds delta (45 tail-seconds).
+	if err := s.AppendUsage(ctx, acctID, appID, ins.ID, minute, 99_999, 99, 0, 0, 0, 0, 0, 45); err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+
+	// Read tail_seconds directly from the usage_minutes row — the
+	// Store.UsageByHour aggregate intentionally does not project
+	// tail_seconds (it's per-day-grain via DailyUsage, not per-hour).
+	var tailSeconds int64
+	if err := pool.QueryRow(ctx,
+		`select tail_seconds from usage_minutes where instance_id = $1 and minute = $2`,
+		ins.ID, minute,
+	).Scan(&tailSeconds); err != nil {
+		t.Fatalf("read tail_seconds: %v", err)
+	}
+	if tailSeconds != 75 {
+		t.Errorf("tail_seconds = %d, want 75 (30 + 45 additive merge)", tailSeconds)
 	}
 }

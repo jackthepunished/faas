@@ -85,6 +85,14 @@ const (
 	// wake_id. Payload: {wake_id, app_id, instance_id, node_id,
 	// reason, at}.
 	WakeStalled = "wake.stalled"
+	// WakeTailFailed (issue #667 / ADR-078, PR 4) — a waitUntil
+	// task was unable to drain before the runtime ceiling. The
+	// reason is the closed enum: "timeout" (per-plan TailTimeoutS
+	// exceeded), "handler_error" (the task threw or rejected),
+	// "forced_at_park" (the snapshotAndPark 5s watchdog fired
+	// while the runner was still draining). Payload: {wake_id,
+	// app_id, instance_id, reason, at}.
+	WakeTailFailed = "wake.tail_failed"
 	// InstanceLivenessFailed — vmmd poll goroutine declared the
 	// VM wedged after N consecutive liveness-probe failures
 	// (issue #554 / ADR-078). The state-machine transition is
@@ -478,6 +486,36 @@ func (e Stalled) Payload() map[string]any {
 		"app_id":      e.AppID,
 		"instance_id": e.InstanceID,
 		"node_id":     e.NodeID,
+		"reason":      e.Reason,
+	}
+}
+
+// TailFailed (issue #667 / ADR-078) — a waitUntil task reached a
+// terminal that was NOT a clean completion. Reason is the closed
+// enum: "timeout" (per-plan TailTimeoutS exceeded), "handler_error"
+// (the task threw or rejected), "forced_at_park" (the
+// snapshotAndPark 5s watchdog fired while the runner was still
+// draining). One row per unfinished tail on the watchdog path
+// so an operator can count exactly how many tasks were lost.
+// WakeID is empty on the watchdog path (the snapshotAndPark
+// ins.WakeID is the most recent boot's wake; for the watch-
+// dog row we keep the schema identical to a runner-emitted
+// TailFailed so the timeline endpoint renders both with the
+// same code path).
+type TailFailed struct {
+	EmitAt     time.Time
+	AppID      string
+	InstanceID string
+	Reason     string
+}
+
+func (e TailFailed) Kind() string     { return WakeTailFailed }
+func (e TailFailed) At() time.Time    { return e.EmitAt }
+func (e TailFailed) Subject() *string { return nil }
+func (e TailFailed) Payload() map[string]any {
+	return map[string]any{
+		"app_id":      e.AppID,
+		"instance_id": e.InstanceID,
 		"reason":      e.Reason,
 	}
 }

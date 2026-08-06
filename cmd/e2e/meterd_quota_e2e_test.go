@@ -105,7 +105,7 @@ func TestQuotaBreach_ParkInstanceWithinOneTick(t *testing.T) {
 	// 6 GB-h * 1024 MB/GB * 3600 s/h = 22_118_400 mb_seconds.
 	mbSecOverQuota := int64(float64(api.PlanFree.PlanIncludedGBHours()+1) * 1024 * 3600)
 	minute := meter.AccountMonthKey(time.Now().UTC()).AddDate(0, 0, 1) // 1st of current month + 1d
-	if err := store.AppendUsage(ctx, acct.ID, app.ID, ins.ID, minute, mbSecOverQuota, 1, 0, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, app.ID, ins.ID, minute, mbSecOverQuota, 1, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("AppendUsage: %v", err)
 	}
 

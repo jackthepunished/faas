@@ -20,14 +20,14 @@ func TestMemStoreCoverageUsageByAccount(t *testing.T) {
 	// Rows with distinct (instance, minute) keys aggregate by (app,
 	// month). Same (instance, minute) would be first-write-wins for
 	// mb_seconds/requests — use different instances.
-	if err := m.AppendUsage(ctx, account.ID, app.ID, "inst-1", minute, 100, 2, 5, 6, 7, 8, 1); err != nil {
+	if err := m.AppendUsage(ctx, account.ID, app.ID, "inst-1", minute, 100, 2, 5, 6, 7, 8, 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.AppendUsage(ctx, account.ID, app.ID, "inst-2", minute, 50, 1, 10, 11, 12, 13, 0); err != nil {
+	if err := m.AppendUsage(ctx, account.ID, app.ID, "inst-2", minute, 50, 1, 10, 11, 12, 13, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	otherMonth := time.Date(2026, 6, 26, 10, 0, 0, 0, time.UTC)
-	if err := m.AppendUsage(ctx, account.ID, app.ID, "inst-1", otherMonth, 999, 9, 0, 0, 0, 0, 0); err != nil {
+	if err := m.AppendUsage(ctx, account.ID, app.ID, "inst-1", otherMonth, 999, 9, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	// Full scan → 2 buckets.

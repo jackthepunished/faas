@@ -420,6 +420,14 @@ type usageMinute struct {
 	// transition counts; a redelivered tick within the same
 	// minute is a no-op).
 	ColdBootCount int32
+	// TailSeconds (issue #667 / ADR-078) is the per-minute wall-clock
+	// seconds this instance spent draining waitUntil tasks. Source:
+	// vmmd pkg/fcvm.Manager.ReadAndResetTailSeconds, sampled by
+	// meterd Sampler. INFORMATIONAL ONLY — does NOT enter billing.
+	// Additive on conflict (instance_id, minute) — mirrors the
+	// cpu_usec / tx_bytes shape. Pinned by
+	// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
+	TailSeconds int64
 }
 
 // builderUsageRow is the per-build grain (ADR-048 §4) backing
@@ -4810,22 +4818,42 @@ func (m *MemStore) BumpInstanceTailCount(_ context.Context, id string, delta int
 }
 
 // DecrementInstanceTailCount mirrors pgstore.DecrementInstanceTailCount
-// (issue #667 / ADR-078). Single-step decrement with the 0-floor
-// guard. Kept as a separate method (vs the BumpInstanceTailCount
-// form) for symmetry with the pgstore API and to make every
-// decrement site self-documenting at the call site.
-func (m *MemStore) DecrementInstanceTailCount(_ context.Context, id string) error {
+// (issue #667 / ADR-078). Decrement by n with the 0-floor guard.
+// Kept as a separate method (vs the BumpInstanceTailCount form)
+// for symmetry with the pgstore API and to make every decrement
+// site self-documenting at the call site. The snapshotAndPark
+// watchdog (PR 4) calls this with n = the unfinished-tail count
+// to floor the counter when the watchdog fires.
+func (m *MemStore) DecrementInstanceTailCount(_ context.Context, id string, n int32) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ins, ok := m.instances[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if ins.TailCount > 0 {
-		ins.TailCount--
+	if n <= 0 {
+		return nil
+	}
+	if int64(ins.TailCount) <= int64(n) {
+		ins.TailCount = 0
+	} else {
+		ins.TailCount -= int(n)
 	}
 	m.instances[id] = ins
 	return nil
+}
+
+// GetInstanceTailCount mirrors pgstore.GetInstanceTailCount
+// (issue #667 / ADR-078). Used by the snapshotAndPark watchdog to
+// poll for drain completion.
+func (m *MemStore) GetInstanceTailCount(_ context.Context, id string) (int32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	return int32(ins.TailCount), nil
 }
 
 // ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
@@ -5781,7 +5809,7 @@ func (m *MemStore) ListEventsBySidecar(_ context.Context, sidecarName string, si
 // migrations/00055_usage_minutes_cpu.sql, and
 // migrations/00065_usage_minutes_egress.sql for the production
 // rationale.
-func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
+func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32, tailSeconds int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := minute.UTC().Truncate(time.Minute)
@@ -5790,9 +5818,11 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 			// Idempotent for mb_seconds / requests (first write wins,
 			// so a restart-driven redelivery cannot inflate billing).
 			// cpu_usec / tx_bytes / net_tx_bytes / net_rx_bytes /
-			// cold_boot_count are additive: the schedd / meterd
-			// accumulators can call AppendUsage many times per
-			// minute, and we sum the deltas.
+			// cold_boot_count / tail_seconds are additive: the schedd
+			// / meterd accumulators can call AppendUsage many times
+			// per minute, and we sum the deltas. tail_seconds is
+			// informational only — does not enter billing; pinned by
+			// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
 			if m.usage[i].MBSeconds == 0 && m.usage[i].Requests == 0 {
 				m.usage[i].MBSeconds = mbSeconds
 				m.usage[i].Requests = requests
@@ -5802,6 +5832,7 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 			m.usage[i].NetTxBytes += netTxBytes
 			m.usage[i].NetRxBytes += netRxBytes
 			m.usage[i].ColdBootCount += coldBootCount
+			m.usage[i].TailSeconds += tailSeconds
 			m.recomputeMonthLocked(accountID, appID, key)
 			return nil
 		}
@@ -5811,6 +5842,7 @@ func (m *MemStore) AppendUsage(_ context.Context, accountID, appID, instanceID s
 		Minute: key, MBSeconds: mbSeconds, Requests: requests,
 		CPUUsec: cpuUsec, TXBytes: txBytes, NetTxBytes: netTxBytes,
 		NetRxBytes: netRxBytes, ColdBootCount: coldBootCount,
+		TailSeconds: tailSeconds,
 	})
 	m.recomputeMonthLocked(accountID, appID, key)
 	return nil

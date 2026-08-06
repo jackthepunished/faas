@@ -82,6 +82,83 @@ func TestReapIdleSkipsInstanceWithOpenConns(t *testing.T) {
 	}
 }
 
+// TestReapIdleSkipsInstanceWithTailCount pins issue #667 / ADR-078
+// §"Reaper gate": an instance with active waitUntil tasks
+// (TailCount > 0) is alive — the runner is in the tail-host drain
+// phase, not idle — so ReapIdle must skip it the same way it skips
+// OpenConns > 0. The wake is parked only when the runner drains
+// (TailCount returns to 0) or the 5s snapshotAndPark watchdog
+// fires. Mirrors TestReapIdleSkipsInstanceWithOpenConns.
+func TestReapIdleSkipsInstanceWithTailCount(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		// Issue #667 / ADR-078: stale AppID with active tail tasks
+		// is NOT idle — the runner is draining.
+		{Instance: "tail-stale", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), TailCount: 3},
+		// No regression: still reaped when no tail + stale.
+		{Instance: "idle", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour)},
+		// Active + tails: not reaped.
+		{Instance: "tail-fresh", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Second), TailCount: 1},
+		// Tails but no LastRequest stamp: still not reaped (the
+		// runner is alive regardless of HTTP activity).
+		{Instance: "tail-zero-last", Plan: api.PlanHobby, State: state.StateRunning,
+			TailCount: 2},
+		// Active + no tail: not reaped.
+		{Instance: "fresh", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Second)},
+	}
+	got := ReapIdle(now, instances)
+	if !equalSet(got, []string{"idle"}) {
+		t.Errorf("ReapIdle = %v, want [idle] only", got)
+	}
+}
+
+// TestReapAggressiveSkipsInstanceWithTailCount pins the same
+// gate for the aggressive reaper (issue #667 / ADR-078). The
+// aggressive reaper evicts instances under RAM pressure regardless
+// of MinInstanceAge, but still honors the activity gates
+// (WorkloadClass, OpenConns, TailCount). Without this gate, a
+// Scale-app RPS burst could evict a wake whose runner is still
+// draining waitUntil tasks — the customer loses the side effects
+// of those tasks (email send, log flush, etc.) silently.
+func TestReapAggressiveSkipsInstanceWithTailCount(t *testing.T) {
+	now := time.Now()
+	instances := []InstanceInfo{
+		// Stale + has tails: must NOT enter the candidate set.
+		{Instance: "tail-stale", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour), TailCount: 3},
+		// Fresh + has tails: must NOT enter the candidate set.
+		{Instance: "tail-fresh", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Second), TailCount: 1},
+		// Stale, no tails: candidate.
+		{Instance: "idle", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Hour)},
+		// Fresh, no tails: candidate.
+		{Instance: "fresh", AppID: "app1", Plan: api.PlanPro, State: state.StateRunning,
+			LastRequest: now.Add(-time.Second)},
+	}
+	// The aggressive reaper evicts the LRU end of the candidate set
+	// up to running - (desired+1). With desired=0, limit=1, that
+	// picks the top 3 of the candidates. The test asserts the
+	// load-bearing property: tail-stale and tail-fresh are NEVER
+	// in the result regardless of how many total slots the
+	// aggressive reaper decides to fill. The bare presence of `idle`
+	// in the result is incidental — what matters is the absence of
+	// the two tail-bearing instances.
+	const testAppID = "app1"
+	desiredByApp := map[string]int{testAppID: 0}
+	got := ReapAggressive(now, instances, desiredByApp)
+	if containsString(got, "tail-stale") {
+		t.Errorf("ReapAggressive picked tail-stale (TailCount=3, stale); the tail-count gate is not honored; got %v", got)
+	}
+	if containsString(got, "tail-fresh") {
+		t.Errorf("ReapAggressive picked tail-fresh (TailCount=1, fresh); the tail-count gate is not honored; got %v", got)
+	}
+}
+
 func TestSelectEvictionsBelowThresholdNoop(t *testing.T) {
 	got := SelectEvictions(EvictionThresholdMB, time.Now(), []InstanceInfo{
 		{Instance: "x", Plan: api.PlanPro, State: state.StateRunning},
@@ -153,6 +230,19 @@ func equalSet(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// containsString returns true if x is present in s. Used by the
+// tail-count / OpenConns reaper-gate tests where the assertion is
+// "the gated instance is NOT in the result" — we don't need an
+// exact-result equality, just membership.
+func containsString(s []string, x string) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
 }
 
 // TestReapIdleRespectsMinInstancesFloor pins ux_spec §6.5: when an

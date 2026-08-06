@@ -221,6 +221,52 @@ Two operator-side addenda on top of the §4.7 quota ladder:
 - **`accounts.overage_cap_cents`** (nullable `bigint`, optional per-account ceiling; zero is a valid cap) is read by `meterd`'s quota tick once per account per cycle. The tick computes the current-month derived overage (`SUM(usage_minutes.mb_seconds) since date_trunc('month', now()) at UTC`) and skips the overage-row insert when `month_cents >= cap_cents`. The Free hard-stop / paid warning ladder is unchanged — the cap is layered on top of in-budget usage. Per-hit increments of `meterd_billing_cap_exceeded_total{plan=…}` (cardinality 4) provide the alert signal. **Race scope**: meterd is the sole writer to `usage_minutes` today (spec §6.1), so the cap check + overage-row insert is serialised by the single-writer invariant. A future meterd-replica deploy would need a per-account `SELECT … FOR UPDATE` on `accounts` around the cap check + insert decision — that locking is the obvious follow-up; until then, the worst-case is one minute's overage-row insertion past the cap.
 - **Stripe refund seam**: `billing.Provider.Refund(ctx, chargeID, amountCents)` is on the interface; Stripe's `Refund` calls forward the request's `Idempotency-Key` via a context key so a 24-h retry returns the same `re_…` id. Paddle's stub returns `ErrNotImplemented`. Webhook mapping: `charge.refunded` → `billing.EventRefundProcessed`, with `amount_refunded/10` populated on `Event.AmountCents` (Stripe millicents → integer cents) and emits a `refund.processed` audit row (target = customer account id; operator identity rides in `data["actor"]`).
 
+#### 4.7.2 Post-response tail metering (issue #667 / ADR-078 — informational only)
+
+The `ctx.waitUntil(promise)` primitive (§4.9.2, ADR-078) lets a
+handler register background work that runs AFTER the response
+flushes. The wake stays `StateRunning` for the duration of the
+tail drain, metered via the existing `mb_seconds` mechanism. The
+**tail drain itself** is metered as `tail_seconds` — and is
+**informational only**. This sub-section pins the load-bearing
+invariant up front: `tail_seconds` does NOT enter
+`Math.GBHours`, `Provider.PushUsageRecord`, or any billing path.
+
+- **Schema:** `usage_minutes.tail_seconds bigint NOT NULL DEFAULT 0`
+  (migration `00151_wait_until_tail.sql`). Additive merge via the
+  extended `state.Store.AppendUsage` signature — the new
+  `tailSeconds int64` parameter follows the same shape as
+  `cpu_usec` / `tx_bytes` / `net_tx_bytes` (first-write-wins for
+  the billable columns, additive for the sampled columns).
+- **Source:** `pkg/fcvm.Manager.ReadAndResetTailSeconds` reads the
+  per-instance accumulator atomically each `SampleAndRoll` tick
+  (the swap-and-reset shape is identical to `ReadAndResetEgress`
+  on the same struct). The accum is fed by
+  `Manager.MarkInstanceTailTerminal`, which converts the 0x04
+  DGRAM's `elapsed_ms` to seconds and adds it to the running
+  per-instance total.
+- **Pusher:** `pkg/meter/pusher.go::PushHour` reads
+  `state.Usage.MBSeconds` only and forwards the integer to
+  `Provider.PushUsageRecord(ctx, acct, hour, mbSeconds)`. The
+  pusher does NOT inspect `TailSeconds`. The permanent guard test
+  `pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds`
+  pins this contract — removing it requires removing ADR-078
+  §"Tail is informational" (a new ADR).
+- **Dashboards:** the §12 tail-watchdog panel reads
+  `vmmd_guest_tail_seconds{plan, runtime, outcome}` (60 series),
+  `vmmd_guest_tail_failed_total{plan, reason}` (16 series), and
+  `vmmd_tail_cap_reached_total{plan}` (4 series) — all closed-set
+  labels pre-instantiated at boot. The customer-facing billing
+  dashboard is unchanged: `tail_seconds` is not displayed in the
+  customer's invoice, and the financial model (`§1` of the
+  spreadsheet) does not include it as a line item.
+- **Reversing the invariant** is a deliberate, ADR-bounded
+  decision. Any change that adds `tail_seconds` to the billing
+  pipeline MUST remove the guard test, update ADR-078 §"Tail is
+  informational", and update the financial model. The shape of
+  those three touch-points together is the load-bearing piece —
+  removing any one of them in isolation fails CI.
+
 ### 4.8 `guest-init` — PID 1 inside every microVM
 
 Tiny static Go binary (< 5 MB), injected by imaged.
@@ -251,6 +297,63 @@ The runner's HTTP listener (`http.ListenAndServe` on `:8080`) dispatches each ac
 All five current runners spawn one subprocess per request via `cmd.Run()` in the runner's `invokeHandler`. The platform's `concurrency_per_vm` bound is the listener's goroutine fan-out, not a single process's request queue — so a customer's runner/process choice bounds the effective concurrency below `concurrency_per_vm`, not at it. A future runner that pre-warms a long-lived interpreter pool could close the gap; today's runners do not.
 
 The runner-level concurrency claim is pinned by `guest/runners/internal/runnerparity/concurrency_test.go::TestRunner_HandleIsConcurrent` — 20 parallel GETs against a slow handler complete in ~1× handler-sleep, not 20× (the serialized floor). A regression to single-threaded accept would surface there.
+
+#### 4.9.2 Post-response tail primitive — `ctx.waitUntil(promise)` (issue #667 / ADR-078)
+
+The handler may register background work that runs AFTER the
+response has flushed to the gateway. The wake stays
+`StateRunning` (and therefore metered via the existing
+`mb_seconds` mechanism) until every registered task completes or
+a per-plan timeout fires. Mirrors Cloudflare Workers'
+[`ctx.waitUntil`](https://developers.cloudflare.com/workers/runtime-apis/context/#waituntil),
+Vercel Edge's `waitUntil`, and AWS Lambda's `lambda.runtimeContext
+.waitUntil` — the single most-asked-for primitive on the function
+surface.
+
+- **Envelope extension:** `{wait_until_sec int, tail_pipe_path string}`
+  on the request envelope (every runner reads it; default 0/empty
+  = no tail). The handler subprocess appends one JSONL line per
+  `waitUntil(promise)` registration to `tail_pipe_path`; the
+  runner's tail host reads the pipe and starts a `sync.WaitGroup`
+  of per-task `context.WithTimeout(wait_until_sec)` goroutines.
+- **Per-plan timeout matrix (`pkg/api/limits.go`):** Free 5 s,
+  Hobby 15 s, Pro 30 s, Scale 60 s (`TailTimeoutS`). The
+  `Plan.TailTimeoutSeconds()` accessor clamps non-zero values to
+  the structural floor (`TailTimeoutFloorSeconds = 5`).
+- **Structural cap:** `TailCapMax = 16` (uniform across plans,
+  hard-coded). The per-plan `ConcurrentTailsPerInstance` controls
+  how aggressive the cap is across concurrent requests: Free 4,
+  Hobby 16, Pro 64, Scale 256. A customer hitting
+  `ConcurrentTailsPerInstance + 1` increments
+  `vmmd_tail_cap_reached_total{plan=…}` (cardinality 4).
+- **Wire (runner → guest-init):** 16-byte DGRAM on vsock port
+  1027 lead byte `0x04` — `[type 0x04][outcome uint8][reserved 6B
+  zero][elapsed_ms BE uint64]`. Outcome ∈ `{1 completed, 2 failed,
+  3 timeout}`. Instance identity resolved from the DGRAM peer CID
+  on the guest-init receiver, NOT carried in the wire.
+- **Host fan-in:** guest-init forwards verbatim to vmmd on port
+  1026 via the existing `SendStatelessAdvisory` path
+  (`pkg/fcvm/manager.go:183`). vmmd hands the DGRAM to schedd via
+  `Manager.MarkInstanceTailTerminal(ctx, instanceID, outcome,
+  elapsedMs)` which decrements `instances.tail_count` and stamps
+  `usage_minutes.tail_seconds += (elapsed_ms + 999) / 1000`.
+- **Reaper gate (issue #667 / ADR-078 §"Reaper gate"):** an
+  instance with `tail_count > 0` is NOT idle-eligible and NOT
+  aggressive-eligible (mirrors the G7 `OpenConns > 0` precedent in
+  `pkg/sched/reaper.go`). RAM-pressure evictions
+  (`SelectEvictions`) are unchanged per the same precedent —
+  tearing down a tailing instance is fine, the 5 s watchdog in
+  `snapshotAndPark` is the safety valve.
+- **Park watchdog:** `ParkTailDrainTimeoutSeconds = 5` in
+  `pkg/sched/engine.go::snapshotAndPark`. On watchdog fire,
+  force-park with audit reason `tail_count_force_park` and emit
+  `wake.tail_failed{reason=forced_at_park}` for any unfinished
+  tails.
+- **Billing:** the tail drain itself is metered as
+  `usage_minutes.tail_seconds` — **informational only** (see
+  §4.7.2). Customers pay exactly the plan RAM × resident-seconds
+  the synchronous request envelope covered; tail drains are a
+  free operational primitive.
 
 ---
 

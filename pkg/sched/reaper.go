@@ -70,6 +70,16 @@ type InstanceInfo struct {
 	// pressure is a separate axis and tearing down connections is fine
 	// there.
 	OpenConns int64
+	// TailCount is the in-flight waitUntil(promise) task count for this
+	// instance (issue #667, ADR-078). A wake with active tail tasks
+	// stays RUNNING — the runner is alive and the tasks are draining
+	// in-process — so the reaper treates TailCount > 0 as activity
+	// regardless of LastRequest staleness. Mirrors the OpenConns > 0
+	// gate in both ReapIdle and ReapAggressive; SelectEvictions is
+	// unchanged (RAM pressure tears down regardless — the 5 s watchdog
+	// in snapshotAndPark is the safety valve). Populated from
+	// state.Instance.TailCount in loop.go's runReaper.
+	TailCount int
 	// MinInstances is the per-app cold-wake floor (ux_spec §6.5). Zero
 	// keeps today's scale-to-zero behaviour; >0 means the reaper must
 	// keep at least this many RUNNING instances alive regardless of
@@ -201,6 +211,16 @@ func ReapIdle(now time.Time, instances []InstanceInfo) []string {
 		if in.OpenConns > 0 {
 			continue
 		}
+		// Issue #667 / ADR-078: an instance with active waitUntil
+		// tasks is alive (the runner is in the tail-host drain phase,
+		// not idle). Mirrors the OpenConns gate so the reaper never
+		// parks a wake that has unfinished tail work — the 5 s
+		// watchdog in snapshotAndPark is the upper bound on how long
+		// the drain can hold, but in practice tasks complete within
+		// the per-plan TailTimeoutS ceiling (5…60 s).
+		if in.TailCount > 0 {
+			continue
+		}
 		timeout := time.Duration(EffectiveIdleTimeoutS(in.Plan, in.IdleTimeoutS)) * time.Second
 		if now.Sub(in.LastRequest) > timeout {
 			g.cands = append(g.cands, in)
@@ -303,6 +323,12 @@ func ReapAggressive(now time.Time, snapshot []InstanceInfo, desiredByApp map[str
 		// candidate set — the floor of the burst that holds the
 		// flow is sacred.
 		if in.OpenConns > 0 {
+			continue
+		}
+		// Issue #667 / ADR-078: an instance with active waitUntil
+		// tasks is alive. Same gate as ReapIdle — never enter an
+		// active tail drain into the aggressive candidate set.
+		if in.TailCount > 0 {
 			continue
 		}
 		if now.Sub(in.Started) < MinInstanceAge {

@@ -230,38 +230,50 @@ func (q *Queries) AppendEvent(ctx context.Context, db DBTX, arg AppendEventParam
 }
 
 const appendUsage = `-- name: AppendUsage :exec
-insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 on conflict (instance_id, minute) do update
-   set cpu_usec     = usage_minutes.cpu_usec     + EXCLUDED.cpu_usec,
-       tx_bytes     = usage_minutes.tx_bytes     + EXCLUDED.tx_bytes,
-       net_tx_bytes = usage_minutes.net_tx_bytes + EXCLUDED.net_tx_bytes
+   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
+       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
+       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
+       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
+       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count,
+       tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds
 `
 
 type AppendUsageParams struct {
-	AccountID  pgtype.UUID
-	AppID      pgtype.UUID
-	InstanceID pgtype.UUID
-	Minute     pgtype.Timestamptz
-	MbSeconds  int64
-	Requests   int32
-	CpuUsec    int64
-	TxBytes    int64
-	NetTxBytes int64
+	AccountID     pgtype.UUID
+	AppID         pgtype.UUID
+	InstanceID    pgtype.UUID
+	Minute        pgtype.Timestamptz
+	MbSeconds     int64
+	Requests      int32
+	CpuUsec       int64
+	TxBytes       int64
+	NetTxBytes    int64
+	NetRxBytes    int64
+	ColdBootCount int32
+	TailSeconds   int64
 }
 
 // Idempotent on (instance_id, minute) for mb_seconds / requests
 // (M7 hardening, PR feat/m7-beta-hardening): a redelivered
 // minute is a no-op for the billing-floor columns so a meterd
 // restart / network blip / two meterd instances cannot inflate
-// billing. cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on
-// the same conflict key — the schedd / meterd accumulators can
-// each call AppendUsage many times within the same minute; the
-// columns are the sum of all per-tick deltas.
+// billing. cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes,
+// cold_boot_count, and tail_seconds are ADDITIVE on the same
+// conflict key — the schedd / meterd accumulators can each call
+// AppendUsage many times within the same minute; the columns are
+// the sum of all per-tick deltas.
 //
-//	cpu_usec     — issue #279 / PR-B / ADR-039
-//	tx_bytes     — ADR-046 (gateway HTTP response body bytes)
-//	net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
+//	cpu_usec         — issue #279 / PR-B / ADR-039
+//	tx_bytes         — ADR-046 (gateway HTTP response body bytes)
+//	net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
+//	net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
+//	cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
+//	tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock seconds
+//	                   draining waitUntil tasks; INFORMATIONAL ONLY — pinned
+//	                   by pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
 func (q *Queries) AppendUsage(ctx context.Context, db DBTX, arg AppendUsageParams) error {
 	_, err := db.Exec(ctx, appendUsage,
 		arg.AccountID,
@@ -273,6 +285,9 @@ func (q *Queries) AppendUsage(ctx context.Context, db DBTX, arg AppendUsageParam
 		arg.CpuUsec,
 		arg.TxBytes,
 		arg.NetTxBytes,
+		arg.NetRxBytes,
+		arg.ColdBootCount,
+		arg.TailSeconds,
 	)
 	return err
 }
@@ -321,6 +336,34 @@ func (q *Queries) BuildByID(ctx context.Context, db DBTX, id pgtype.UUID) (Build
 		&i.EnqueuedAt,
 	)
 	return i, err
+}
+
+const bumpInstanceTailCount = `-- name: BumpInstanceTailCount :one
+update instances
+   set tail_count = GREATEST(tail_count + $2, 0)
+ where id = $1
+returning tail_count
+`
+
+type BumpInstanceTailCountParams struct {
+	ID        pgtype.UUID
+	TailCount int32
+}
+
+// issue #667 / ADR-078 — atomically apply delta to the instance's
+// `tail_count` column and return the post-update value. The
+// GREATEST(…, 0) floor mirrors DecrementInstanceTailCount's safety
+// property: a stale receipt from a guest that just parked cannot
+// underflow the counter, and the 5s watchdog in snapshotAndPark
+// force-parks regardless. RETURNING tail_count lets the caller
+// (vmmd's MarkInstanceTailTerminal) learn the new value without a
+// follow-up SELECT. Returns ErrNotFound when the instance row is
+// missing (pgx.ErrNoRows maps to state.ErrNotFound in pgstore).
+func (q *Queries) BumpInstanceTailCount(ctx context.Context, db DBTX, arg BumpInstanceTailCountParams) (int32, error) {
+	row := db.QueryRow(ctx, bumpInstanceTailCount, arg.ID, arg.TailCount)
+	var tail_count int32
+	err := row.Scan(&tail_count)
+	return tail_count, err
 }
 
 const countDeployedApps = `-- name: CountDeployedApps :one
@@ -863,6 +906,34 @@ func (q *Queries) CronByID(ctx context.Context, db DBTX, id pgtype.UUID) (CronBy
 	return i, err
 }
 
+const decrementInstanceTailCount = `-- name: DecrementInstanceTailCount :exec
+update instances
+   set tail_count = GREATEST(tail_count - $2, 0)
+ where id = $1
+`
+
+type DecrementInstanceTailCountParams struct {
+	ID        pgtype.UUID
+	TailCount int32
+}
+
+// issue #667 / ADR-078 — canonical "tail task reached terminal" path.
+// Equivalent to BumpInstanceTailCount(ctx, id, -n) but kept as a
+// separate method because every decrement site is a terminal event
+// receipt, and the explicit name makes the call sites self-
+// documenting. n is the number of tail tasks to decrement by (1 for
+// the steady-state path, the full unfinished-tail count for the
+// snapshotAndPark watchdog). The GREATEST(…, 0) floor is a
+// defence-in-depth guard against races where a receipt lands after
+// the runner exited cleanly: the counter floors at 0 rather than
+// underflowing, which would permanently stall the schedd reaper's
+// tail_count > 0 early-out. Returns ErrNotFound when the instance
+// row is missing.
+func (q *Queries) DecrementInstanceTailCount(ctx context.Context, db DBTX, arg DecrementInstanceTailCountParams) error {
+	_, err := db.Exec(ctx, decrementInstanceTailCount, arg.ID, arg.TailCount)
+	return err
+}
+
 const deleteAPIKey = `-- name: DeleteAPIKey :exec
 delete from api_keys where id = $1 and account_id = $2
 `
@@ -1028,6 +1099,22 @@ func (q *Queries) ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt p
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getInstanceTailCount = `-- name: GetInstanceTailCount :one
+select tail_count from instances where id = $1
+`
+
+// issue #667 / ADR-078 — read-only probe for the snapshotAndPark
+// 5s watchdog's poll loop. Single SELECT … FROM instances WHERE
+// id = $1; the column is on the hot path so the row is already in
+// shared_buffers under normal load. Returns ErrNotFound when the
+// instance row is missing.
+func (q *Queries) GetInstanceTailCount(ctx context.Context, db DBTX, id pgtype.UUID) (int32, error) {
+	row := db.QueryRow(ctx, getInstanceTailCount, id)
+	var tail_count int32
+	err := row.Scan(&tail_count)
+	return tail_count, err
 }
 
 const getSession = `-- name: GetSession :one

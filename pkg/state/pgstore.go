@@ -6309,6 +6309,15 @@ func (s *PgStore) ClearInstanceFrameworkReadyAt(ctx context.Context, id string) 
 // receipt raced a Park / Destroy and the row is gone). The
 // vmmd receipt path logs a Debug and drops — same convention
 // as the framework_ready / sidecar-event DGRAM receipts.
+//
+// SQL mirrors the sqlc source in queries.sql::BumpInstanceTailCount;
+// `make sqlc-check` enforces lockstep between the raw SQL below
+// and the generated sqlc method. The Store interface uses `string`
+// for the instance id (matching the rest of the public surface)
+// while the sqlc-generated method takes `pgtype.UUID` — the bridge
+// is omitted here to keep pgstore's parameter shape consistent
+// with the existing inline-SQL precedent for `UpdateInstanceState`
+// and `AppendComputeNodeHeartbeat`.
 func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error) {
 	var post int32
 	row := s.pool.QueryRow(ctx,
@@ -6328,11 +6337,11 @@ func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta in
 
 // DecrementInstanceTailCount is the canonical "tail task reached
 // terminal" path (issue #667 / ADR-078). Equivalent to
-// BumpInstanceTailCount(ctx, id, -1) — kept as a separate method
+// BumpInstanceTailCount(ctx, id, -n) — kept as a separate method
 // because every decrement site is a terminal event receipt, and
 // the explicit name makes the call sites self-documenting.
 //
-// GREATEST(tail_count - 1, 0) is the safety floor: a stale
+// GREATEST(tail_count - n, 0) is the safety floor: a stale
 // decrement on a counter at 0 leaves it at 0 rather than
 // underflowing. Without the floor, a burst of decrements after
 // the runner exited cleanly would push the counter negative and
@@ -6342,12 +6351,16 @@ func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta in
 // defence-in-depth guard, not the load-bearing piece.
 //
 // Returns ErrNotFound when the instance row is missing.
-func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string) error {
+//
+// SQL mirrors the sqlc source in queries.sql::DecrementInstanceTailCount;
+// `make sqlc-check` enforces lockstep. See the BumpInstanceTailCount
+// comment for the rationale on the `string` vs `pgtype.UUID` bridge.
+func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string, n int32) error {
 	tag, err := s.pool.Exec(ctx,
 		`update instances
-		    set tail_count = GREATEST(tail_count - 1, 0)
+		    set tail_count = GREATEST(tail_count - $2, 0)
 		  where id = $1`,
-		id)
+		id, n)
 	if err != nil {
 		return err
 	}
@@ -6355,6 +6368,30 @@ func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string) err
 		return ErrNotFound
 	}
 	return nil
+}
+
+// GetInstanceTailCount returns the instance's current tail_count
+// (issue #667 / ADR-078). Used by the snapshotAndPark watchdog to
+// poll for drain completion. Single SELECT … FROM instances WHERE
+// id = $1 — the column is on the hot path so the row is already
+// in shared_buffers under normal load; pgx returns the column as
+// int32 per the migration's ADD COLUMN type.
+// Returns ErrNotFound when the instance row is missing.
+//
+// SQL mirrors the sqlc source in queries.sql::GetInstanceTailCount;
+// `make sqlc-check` enforces lockstep. See the BumpInstanceTailCount
+// comment for the rationale on the `string` vs `pgtype.UUID` bridge.
+func (s *PgStore) GetInstanceTailCount(ctx context.Context, id string) (int32, error) {
+	var n int32
+	err := s.pool.QueryRow(ctx,
+		`select tail_count from instances where id = $1`, id).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
 }
 
 // ListInstancesByStatesOlderThan is the watchdog's lookup (spec §6.1).
@@ -7338,7 +7375,7 @@ func (s *PgStore) ListEventsBySidecar(ctx context.Context, sidecarName string, s
 
 // --- usage -------------------------------------------------------------------
 
-func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
+func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32, tailSeconds int64) error {
 	// Idempotent on (instance_id, minute) for mb_seconds / requests
 	// (mirrors the sqlc source in queries.sql::AppendUsage — make
 	// sqlc-check verifies these stay in lockstep). The first write
@@ -7347,16 +7384,17 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	// instances cannot inflate billing. M7 hardening, PR
 	// feat/m7-beta-hardening.
 	//
-	// cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, and
-	// cold_boot_count are ADDITIVE on the same conflict key: the
+	// cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count,
+	// and tail_seconds are ADDITIVE on the same conflict key: the
 	// schedd / meterd accumulators (pkg/sched/instancestats/poller.go
 	// for cpu; the vmmd netstats.Cache + gateway statusRecorder fed
 	// by the meterd sampler's egress adapters for tx_bytes /
 	// net_tx_bytes; the new ingress Tx cache for net_rx_bytes; the
-	// new LastWakeMethod propagation for cold_boot_count) can each
-	// call AppendUsage many times within the same minute. We add
-	// EXCLUDED.<col> to the existing row so the columns are the sum
-	// of all per-tick deltas. The pusher (meter → billing)
+	// new LastWakeMethod propagation for cold_boot_count; the new
+	// Manager.ReadAndResetTailSeconds seam for tail_seconds) can
+	// each call AppendUsage many times within the same minute. We
+	// add EXCLUDED.<col> to the existing row so the columns are the
+	// sum of all per-tick deltas. The pusher (meter → billing)
 	// deduplicates on a coarser window before pushing, so the
 	// additive merge is safe end-to-end.
 	//
@@ -7365,16 +7403,22 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	//   net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
 	//   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
 	//   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
+	//   tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock
+	//                      seconds draining waitUntil tasks;
+	//                      INFORMATIONAL ONLY — does not enter billing;
+	//                      pinned by
+	//                      pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
 	_, err := s.pool.Exec(ctx,
-		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		 on conflict (instance_id, minute) do update
 		   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
 		       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
 		       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
 		       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
-		       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count`,
-		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes, coldBootCount)
+		       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count,
+		       tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds`,
+		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes, coldBootCount, tailSeconds)
 	return err
 }
 
@@ -8211,7 +8255,8 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 
 // UsageDaily returns the per-(account, app, day) rollup rows that the
 // meterd rollup loop (pkg/meter/rollup.go) populated into the
-// usage_daily table (ADR-048 §5, migration 00067). day is a UTC
+// usage_daily table (ADR-048 §5, migration 00067; tail_seconds
+// added by issue #667 / ADR-078 / migration 00151). day is a UTC
 // midnight timestamp; only the date portion is used in the predicate
 // so a caller that already normalised to midnight does not have to
 // truncate again.
@@ -8225,7 +8270,7 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 	rows, err := s.pool.Query(ctx,
 		`select app_id, day, mb_seconds, requests, cpu_usec,
 		        tx_bytes, net_tx_bytes, net_rx_bytes,
-		        cold_boot_count, builder_seconds
+		        cold_boot_count, builder_seconds, tail_seconds
 		   from usage_daily
 		  where account_id = $1
 		    and day = ($2::timestamptz AT TIME ZONE 'UTC')::date
@@ -8238,7 +8283,7 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 	var out []DailyUsage
 	for rows.Next() {
 		u := DailyUsage{AccountID: accountID}
-		if err := rows.Scan(&u.AppID, &u.Day, &u.MBSeconds, &u.Requests, &u.CPUUsec, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount, &u.BuilderSeconds); err != nil {
+		if err := rows.Scan(&u.AppID, &u.Day, &u.MBSeconds, &u.Requests, &u.CPUUsec, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount, &u.BuilderSeconds, &u.TailSeconds); err != nil {
 			return nil, err
 		}
 		out = append(out, u)

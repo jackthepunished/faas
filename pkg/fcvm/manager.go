@@ -353,6 +353,18 @@ type Instance struct {
 	// so the Manager is the single owner of the in-memory
 	// copy.
 	TailCount int
+	// tailSecondsAccum (issue #667 / ADR-078) is the in-memory
+	// accumulator of wall-clock seconds spent draining waitUntil
+	// tasks since the previous Sampler tick. Each call to
+	// MarkInstanceTailTerminal adds `ceil(elapsedMs / 1000)` to
+	// this field; the meterd Sampler reads + atomically resets
+	// it via ReadAndResetTailSeconds once per minute so the
+	// per-instance tail_seconds is written to usage_minutes
+	// (informational only — does NOT enter billing; pinned by
+	// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds).
+	// Reset to 0 on every Wake. Mirrors pkg/state/types.go
+	// where it lives on DailyUsage after the meterd rollup.
+	tailSecondsAccum int64
 }
 
 // Manager tracks live instances and serialises nothing on the hot path beyond a
@@ -1141,6 +1153,16 @@ func (m *Manager) MarkInstanceTailTerminal(ctx context.Context, instance string,
 	if inst.TailCount > 0 {
 		inst.TailCount--
 	}
+	// Accumulate wall-clock seconds into the per-instance
+	// tailSecondsAccum. The Sampler reads + atomically resets
+	// this once per minute (ReadAndResetTailSeconds). Ceiling
+	// division so sub-second tasks are not silently dropped:
+	// a 1 ms task is 1 second, a 1000 ms task is 1 second, a
+	// 1001 ms task is 2 seconds. tail_seconds is informational
+	// only; an over-count is safe (it does not enter billing).
+	if elapsedMs > 0 {
+		inst.tailSecondsAccum += (elapsedMs + 999) / 1000
+	}
 	appID = inst.AppID
 	m.mu.Unlock()
 	// Mirror to SQL so schedd's reaper (PR 4) sees the same
@@ -1157,8 +1179,37 @@ func (m *Manager) MarkInstanceTailTerminal(ctx context.Context, instance string,
 		}
 	}
 	_ = outcome
-	_ = elapsedMs
 	return true, appID, nil
+}
+
+// ReadAndResetTailSeconds (issue #667 / ADR-078) atomically
+// returns the per-instance accumulated wall-clock seconds spent
+// draining waitUntil tasks since the previous Sampler tick, then
+// resets the accumulator to 0 so the next tick observes only the
+// deltas. The atomic swap-and-reset is the safety property: if a
+// tail terminal lands between the Sampler's Read and Reset, the
+// delta is rolled into the NEXT minute (the terminal will fire
+// another MarkInstanceTailTerminal that adds to the reset field).
+//
+// Returns (0, false) when the instance is unknown — the caller
+// (meterd Sampler) treats that as "no live instance, skip the
+// row". A stale receipt after Park is a normal event during
+// instance churn; the tailSecondsAccum on the dead instance is
+// GC'd by the Manager when the entry is dropped from m.live.
+//
+// The mutex is held only across the swap-and-reset (the SQL
+// AppendUsage call is unlocked to avoid blocking concurrent
+// receipts on the same instance).
+func (m *Manager) ReadAndResetTailSeconds(instance string) (int64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.live[instance]
+	if !ok {
+		return 0, false
+	}
+	v := inst.tailSecondsAccum
+	inst.tailSecondsAccum = 0
+	return v, true
 }
 
 // InstanceByCID (issue #470 / PR #470-FU-B) returns the instance
@@ -2058,6 +2109,11 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	}
 
 	inst := &Instance{Lease: lease, Net: nc, Method: method, AppID: req.AppID, DeploymentID: req.DeploymentID, Plan: req.Plan, Port: req.Port, HealthcheckPath: req.HealthcheckPath, WorkloadNames: workloadNamesFor(req.Sidecars), Characterization: report, Runtime: req.Runtime}
+	// tailSecondsAccum (issue #667 / ADR-078) starts at 0 on
+	// every Wake; MarkInstanceTailTerminal accumulates into it
+	// and the meterd Sampler reads+resets via
+	// ReadAndResetTailSeconds once per minute. Zero is the
+	// implicit default for an int64 field.
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and

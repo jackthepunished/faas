@@ -90,6 +90,30 @@ type EgressSource interface {
 	EgressBytes(instanceID string) (txBytes, netTxBytes uint64, ok bool)
 }
 
+// TailSecondsSource (issue #667 / ADR-078) is the per-instance
+// tail-seconds reader the sampler uses to populate
+// usage_minutes.tail_seconds. The reader is backed by vmmd
+// pkg/fcvm.Manager.ReadAndResetTailSeconds, which atomically
+// returns and resets the per-instance wall-clock seconds spent
+// draining waitUntil tasks since the previous tick. Production
+// wires a tailSource closure that calls into the live Manager
+// (cmd/meterd owns the seam). nil is OK — the sampler writes 0
+// for the column (the test-harness convention matching CPUSource
+// / EgressSource). tail_seconds is INFORMATIONAL ONLY — it does
+// NOT enter billing; pinned by
+// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
+type TailSecondsSource interface {
+	// ReadAndResetTailSeconds returns the per-instance accumulated
+	// wall-clock seconds spent draining waitUntil tasks since the
+	// previous tick, plus a "found" boolean. false means the
+	// reader has no row for this instance (gone, never woken,
+	// or already parked). The reader is expected to ATOMICALLY
+	// reset the accumulator after reading so subsequent ticks
+	// observe only fresh deltas — see Manager.ReadAndResetTailSeconds
+	// for the canonical swap-and-reset contract.
+	ReadAndResetTailSeconds(instanceID string) (seconds int64, ok bool)
+}
+
 // Sampler writes one minute of billable usage per live instance. It walks
 // every app on the box (one-box scale; schedd's ListAllApps is the canonical
 // source) and lists its instances; for each one in a state that counts
@@ -126,7 +150,13 @@ type Sampler struct {
 	// (ADR-046, step 8). nil is OK — the sampler writes 0
 	// for both egress columns; the test-harness convention.
 	egress EgressSource
-	now    func() time.Time // injectable for tests
+	// tail (issue #667 / ADR-078) is the per-instance tail-seconds
+	// reader that backs usage_minutes.tail_seconds. nil is OK — the
+	// sampler writes 0; the test-harness convention matching
+	// cpu / egress. Production wires a closure into vmmd's
+	// pkg/fcvm.Manager.ReadAndResetTailSeconds.
+	tail TailSecondsSource
+	now  func() time.Time // injectable for tests
 
 	// cpuBaselineMu guards the per-(instance, minute) baseline the
 	// sampler uses to compute the per-minute CPU delta. The map is
@@ -186,6 +216,21 @@ func NewSamplerWithEgress(store state.Store, cpu CPUSource, egress EgressSource,
 	return &Sampler{store: store, cpu: cpu, egress: egress, now: now}
 }
 
+// NewSamplerWithTail is the issue #667 / ADR-078 wiring: store +
+// cpu + egress + tail + now. cmd/meterd passes a TailSecondsSource
+// closure backed by pkg/fcvm.Manager.ReadAndResetTailSeconds. now
+// defaults to time.Now if nil. cpu / egress / tail may all be nil —
+// the sampler writes 0 for the respective column; the test-harness
+// convention. The legacy NewSampler and NewSamplerWithEgress are
+// kept for callers that have not yet been migrated to the 5-arg
+// form.
+func NewSamplerWithTail(store state.Store, cpu CPUSource, egress EgressSource, tail TailSecondsSource, now func() time.Time) *Sampler {
+	if now == nil {
+		now = time.Now
+	}
+	return &Sampler{store: store, cpu: cpu, egress: egress, tail: tail, now: now}
+}
+
 // RolledRow is one (instance, minute) billable line. Returned alongside any
 // error so callers (the test surface, telemetry) can observe what was
 // billed without re-reading the store.
@@ -235,6 +280,15 @@ type RolledRow struct {
 	// wired or the instance is in WAKE_RESTORE steady-
 	// state for the whole minute.
 	ColdBootCount int32
+	// TailSeconds (issue #667 / ADR-078) is the per-minute
+	// wall-clock seconds the instance spent draining waitUntil
+	// tasks. Source: vmmd pkg/fcvm.Manager.ReadAndResetTailSeconds,
+	// sampled once per minute. INFORMATIONAL ONLY — does NOT
+	// enter billing; pinned by
+	// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
+	// Rolled up to usage_daily.tail_seconds via the meterd rollup
+	// cron. Zero when no source is wired (test stubs).
+	TailSeconds int64
 	// SyntheticFloor (ADR-060, issue #515) marks a row
 	// generated to satisfy the per-app min_instances GB-h
 	// floor. True when the row's mb_seconds is NOT backed
@@ -358,7 +412,17 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 			// new columns (the additive-merge contract makes this
 			// safe — a redelivered AppendUsage with 0/0 is a no-op
 			// for the columns, matching the established pattern).
-			if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, ins.ID, minute, row.MBSeconds, int64(requests), row.CPUUsec, row.TXBytes, row.NetTxBytes, row.NetRxBytes, int32(row.ColdBootCount)); err != nil {
+			//
+			// Issue #667 / ADR-078: tail_seconds is sourced from the
+			// vmmd Manager's per-instance accumulator; nil
+			// TailSecondsSource (the legacy test-harness path)
+			// writes 0 (the additive-merge contract makes a
+			// redelivered AppendUsage with 0 safe — same shape as
+			// the cpu_usec / tx_bytes nil-source handling).
+			if tailSec, ok := s.tailSecondsFor(ins.ID); ok {
+				row.TailSeconds = tailSec
+			}
+			if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, ins.ID, minute, row.MBSeconds, int64(requests), row.CPUUsec, row.TXBytes, row.NetTxBytes, row.NetRxBytes, int32(row.ColdBootCount), row.TailSeconds); err != nil {
 				return out, err
 			}
 			out = append(out, row)
@@ -433,9 +497,12 @@ func (s *Sampler) SampleAndRoll(ctx context.Context) ([]RolledRow, error) {
 				instanceID := FloorInstanceID(app.ID, i).String()
 				// Additive columns are zero (cpu_usec, tx_bytes,
 				// net_tx_bytes, net_rx_bytes, cold_boot_count,
-				// requests) — matches the "instance just parked, no
-				// traffic yet" shape. Only mb_seconds is non-zero.
-				if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, instanceID, minute, mb, 0, 0, 0, 0, 0, 0); err != nil {
+				// tail_seconds, requests) — matches the "instance
+				// just parked, no traffic yet" shape. Only
+				// mb_seconds is non-zero. Synthetic floors do not
+				// have live instances draining waitUntil tasks, so
+				// tail_seconds is 0 by construction.
+				if err := s.store.AppendUsage(ctx, app.AccountID, app.ID, instanceID, minute, mb, 0, 0, 0, 0, 0, 0, 0); err != nil {
 					return out, err
 				}
 				out = append(out, RolledRow{
@@ -536,4 +603,26 @@ func (s *Sampler) egressBytes(instanceID string) (uint64, uint64, bool) {
 		return 0, 0, false
 	}
 	return s.egress.EgressBytes(instanceID)
+}
+
+// tailSecondsFor returns the per-instance accumulated waitUntil
+// wall-clock seconds for the current minute and atomically resets
+// the accumulator on the vmmd side (via TailSecondsSource.ReadAndResetTailSeconds),
+// so the same window cannot be reported twice across two minutes
+// even if the Sampler runs an extra tick. Mirrors the egressBytes
+// shape: returns (0, false) when s.tail is nil (the legacy PR-1
+// test-harness path) or when the instance has no live tail
+// accumulator (just parked, never had a tail, or already drained).
+// Issue #667 / ADR-078: tail_seconds is informational only — see
+// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
+// Never use this value as a billing input.
+func (s *Sampler) tailSecondsFor(instanceID string) (int64, bool) {
+	if s.tail == nil {
+		return 0, false
+	}
+	v, ok := s.tail.ReadAndResetTailSeconds(instanceID)
+	if !ok {
+		return 0, false
+	}
+	return v, true
 }
