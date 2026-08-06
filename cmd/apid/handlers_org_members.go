@@ -124,14 +124,14 @@ func (s *server) inviteOrgMember(w http.ResponseWriter, r *http.Request, acct st
 	if !s.enforcePendingInvitationCap(r.Context(), w, org) {
 		return
 	}
-	// Pre-flight member-cap check (defence-in-depth back-stop for
-	// the store-side check inside ConsumeOrgInvitation). Refusing
-	// at the invite step saves a token mint + the customer-visible
-	// "invitation sent, then accept failed" round-trip. Free + un-
-	// known plans fail closed at the `active >= limit` guard.
-	if !s.enforceMemberCap(r.Context(), w, org) {
-		return
-	}
+	// Note: enforceMemberCap is NOT called here. Pending invitations
+	// are not members — checking the member cap on the invite path
+	// would block invites above `active == limit`, contradicting the
+	// plan shape (members + pending invitations are two distinct
+	// caps). The store-side `consumeOrgInvitation` guard remains
+	// the load-bearing back-stop for accepts past the member cap;
+	// the wire flow refuses at accept time with the same 403 code
+	// the customer expects from "I tried to add and was over".
 	token, tokenHash, mintErr := s.mintOrgInvitationToken(w)
 	if mintErr {
 		return
