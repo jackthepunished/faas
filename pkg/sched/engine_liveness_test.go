@@ -20,6 +20,7 @@ package sched
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +138,54 @@ func TestLiveness_NilReceiverSafe(t *testing.T) {
 	inst := runningInstance(t, store, app, dep, vmm, engine)
 	if err := engine.DestroyForLivenessFailure(context.Background(), inst.ID, "liveness_n_consecutive"); err != nil {
 		t.Fatalf("DestroyForLivenessFailure: %v (nil-window must be safe)", err)
+	}
+}
+
+// TestLiveness_ParkDeployment_RejectsStrayReason pins the
+// closed-set guard added to Engine.ParkDeployment. A stray
+// reason (one not in {liveness_exhausted, lifecycle_park,
+// admin_park}) must surface as a hard error — the
+// deployments.parked_reason CHECK constraint would reject it
+// at the SQL layer, and the silent warn-log in
+// SetDeploymentParked's caller path would mask the bug. The
+// guard moves the failure to the API boundary so a future
+// stray-reason caller is caught in dev, not in prod.
+//
+// This is the dev-time contract for the closed-set
+// vocabulary; the migration 00155 test pins the schema-layer
+// CHECK shape.
+func TestLiveness_ParkDeployment_RejectsStrayReason(t *testing.T) {
+	store := state.NewMemStore()
+	_, _, dep := seedApp(t, store, api.PlanPro, 512, 5)
+	engine := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+
+	err := engine.ParkDeployment(context.Background(), dep.ID, "totally_not_a_park_reason")
+	if err == nil {
+		t.Fatal("ParkDeployment: stray reason returned nil, want error (closed-set guard)")
+	}
+	if !strings.Contains(err.Error(), "invalid reason") {
+		t.Errorf("err = %q, want substring %q", err.Error(), "invalid reason")
+	}
+
+	// Verify the parent app was NOT flipped to evicted_cold
+	// (the guard fires before the UpdateApp call).
+	app, err := store.AppByID(context.Background(), dep.AppID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if string(app.Status) == "evicted_cold" {
+		t.Errorf("app.Status = %q after stray-reason park; guard must short-circuit before UpdateApp", app.Status)
+	}
+
+	// Verify the per-deployment parked_reason column stays
+	// NULL (SetDeploymentParked is called AFTER the guard
+	// would have rejected; the guard fires first).
+	post, err := store.DeploymentByID(context.Background(), dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if post.ParkedReason != "" {
+		t.Errorf("deployment.ParkedReason = %q after stray-reason park, want empty", post.ParkedReason)
 	}
 }
 

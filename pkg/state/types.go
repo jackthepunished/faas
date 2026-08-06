@@ -75,6 +75,47 @@ const (
 	DeploySuperseded   DeploymentStatus = "superseded"
 )
 
+// ParkReason is the closed-set label on deployments.parked_reason
+// (issue #554 / ADR-079 follow-up, migration 00155). The schema
+// CHECK constraint deployments_parked_reason_check enforces the
+// same vocabulary at the storage layer; this Go type exists so
+// callers (engine.ParkDeployment, future admin parkApp handler)
+// fail fast at the API boundary instead of surfacing a Postgres
+// 23514 at runtime via a silent warn-log.
+type ParkReason string
+
+const (
+	// ParkReasonLivenessExhausted is stamped when the liveness
+	// window trips (issue #554 / ADR-079) — the only path that
+	// emits today. The audit row is the durable source of
+	// truth; this is the per-deployment column projection.
+	ParkReasonLivenessExhausted ParkReason = "liveness_exhausted"
+	// ParkReasonLifecyclePark is stamped by the admin
+	// parkApp handler (cmd/apid/handlers_ext.go) when an
+	// operator stops traffic on a deployment outside the
+	// liveness window. Reserved vocabulary — wire lands in a
+	// follow-up if observed.
+	ParkReasonLifecyclePark ParkReason = "lifecycle_park"
+	// ParkReasonAdminPark is reserved for an operator-driven
+	// compliance-hold path. Not wired yet; the schema CHECK
+	// accepts it so a future handler can stamp it without a
+	// migration.
+	ParkReasonAdminPark ParkReason = "admin_park"
+)
+
+// IsValidParkReason reports whether r is one of the closed-set
+// ParkReason constants. Cheap — used by Engine.ParkDeployment
+// and any future writer to fail fast on a stray value before
+// the SQL UPDATE surfaces a 23514.
+func (r ParkReason) IsValid() bool {
+	switch r {
+	case ParkReasonLivenessExhausted, ParkReasonLifecyclePark, ParkReasonAdminPark:
+		return true
+	default:
+		return false
+	}
+}
+
 // BuildStatus tracks the build row's lifecycle (spec §9).
 type BuildStatus string
 

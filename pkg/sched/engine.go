@@ -3877,6 +3877,18 @@ func (e *Engine) ParkDeployment(ctx context.Context, deploymentID, reason string
 	if deploymentID == "" {
 		return fmt.Errorf("sched: ParkDeployment: empty deploymentID")
 	}
+	// Closed-set guard (issue #554 follow-up): the
+	// deployments.parked_reason CHECK constraint accepts only
+	// {liveness_exhausted, lifecycle_park, admin_park}. A stray
+	// value would surface as a Postgres 23514 at the SQL layer
+	// and be silently warn-logged by SetDeploymentParked's
+	// caller — operators would see an evicted_cold app with no
+	// parked_reason on the wire. Fail fast here so the bug
+	// surfaces during dev, not in prod.
+	pr := state.ParkReason(reason)
+	if !pr.IsValid() {
+		return fmt.Errorf("sched: ParkDeployment: deployment %s: invalid reason %q (want one of liveness_exhausted, lifecycle_park, admin_park)", deploymentID, reason)
+	}
 	// Resolve the parent app so we can flip apps.status. The
 	// state store is the single source of truth for the
 	// deployment → app mapping.
