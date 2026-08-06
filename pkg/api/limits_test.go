@@ -76,6 +76,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// — opt-in is a paid-tier feature (Cloud Run's
 			// `--no-allow-unauthenticated` shape).
 			RequireAuthn: false,
+			// Issue #695 / ADR-080: Free stays public-by-default.
+			// 'open' is the canonical mode for non-token-gated apps;
+			// require_authn=true would be meaningless on Free because
+			// bearer/basic are both gated off at this tier.
+			RequireAuthnDefault: false, PublicAuthModeDefault: "open",
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
 			KeysMax: 3,
 			// Issue #667 / ADR-078: tail primitive on with floor timeout.
@@ -152,6 +157,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Hobby is gated off for the same
 			// posture-change shape as Free.
 			RequireAuthn: false,
+			// Issue #695 / ADR-080: Hobby unlocks the token gate but
+			// bearer is still gated off (see PublicAuthBearerAllowed
+			// above) — the default opens the require_authn=true
+			// surface but stays on the 'open' mode so customers have
+			// a working PATCH escape hatch without us stranding them
+			// on a default they can't realise. PublicAuthModeDefault
+			// flips to 'bearer' in a follow-up if Hobby is opened up.
+			RequireAuthnDefault: true, PublicAuthModeDefault: "open",
 			// Issue #554 / ADR-078: Hobby unlocks liveness — the
 			// first paid tier gets the Cloud Run-parity primitive.
 			// 5s period / 3 consecutive / 60s cooldown / 3 in 300s.
@@ -222,6 +235,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Pro is the first tier where the
 			// per-app require_authn opt-in unlocks.
 			RequireAuthn: true,
+			// Issue #695 / ADR-080: Pro is the first tier where
+			// the new-app default flips to authenticated. Both
+			// 'bearer' and basic are unlocked here, so the mode
+			// can be the secure-by-default 'bearer' shape.
+			RequireAuthnDefault: true, PublicAuthModeDefault: "bearer",
 			// Issue #554 / ADR-078: Pro inherits the same liveness
 			// defaults as Hobby (5s / 3 / 60s / 3 in 300s). Pro is
 			// the unlock point for `GRPCLivenessAllowed()` once v2
@@ -296,6 +314,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Scale mirrors Pro — opt-in
 			// available, column default still false.
 			RequireAuthn: true,
+			// Issue #695 / ADR-080: Scale mirrors Pro — secure-by-default
+			// at the new-app stamp. Both bearer and basic are unlocked
+			// here, so the mode can stay 'bearer'.
+			RequireAuthnDefault: true, PublicAuthModeDefault: "bearer",
 			// Issue #554 / ADR-078: Scale mirrors Pro — same
 			// 5s / 3 / 60s / 3 in 300s defaults. The
 			// per-deployment override column on deployments is the

@@ -114,11 +114,19 @@ func mustSeedDeployment(t *testing.T, e testEnv, slug string) state.Deployment {
 // slug (default active status). Returns the app ID for later assertions.
 func mustSeedApp(t *testing.T, e testEnv, slug string) string {
 	t.Helper()
+	// Issue #695 / ADR-080: stamp the per-plan defaults the same way
+	// cmd/apid/handlers.go::buildApp would stamp them at create-time.
+	// Without this, every seeded app reads require_authn=false /
+	// public_auth_mode='' regardless of plan, and any test that
+	// asserts the plan default tripwire fails.
+	plan := e.acct.Plan
 	app, err := e.store.CreateApp(context.Background(), state.App{
-		AccountID: e.acct.ID,
-		Slug:      slug,
-		Type:      state.AppTypeApp,
-		Status:    state.AppActive,
+		AccountID:      e.acct.ID,
+		Slug:           slug,
+		Type:           state.AppTypeApp,
+		Status:         state.AppActive,
+		RequireAuthn:   plan.RequireAuthnDefault(),
+		PublicAuthMode: plan.PublicAuthModeDefault(),
 	})
 	if err != nil {
 		t.Fatalf("seed app %s: %v", slug, err)
@@ -3087,23 +3095,24 @@ func TestUpdateAppRequireAuthn_ProHappy(t *testing.T) {
 }
 
 // TestGetApp_SurfacesRequireAuthn pins the wire shape for the
-// issue #560 addition: every plan's GET /v1/apps/{slug} response
-// must include `require_authn` set to the DB row's current value.
+// issue #560 + issue #695 / ADR-080 truth: every plan's GET
+// /v1/apps/{slug} response must include `require_authn` set to
+// the per-plan default for the freshly created app. The per-plan
+// truth table (Free=false, Hobby=true, Pro=true, Scale=true) was
+// the G15 follow-up — the migration 00155 grand-father protects
+// every pre-flip app, so this test only covers post-flip creates.
 // Catches regressions where someone constructs api.AppResponse
-// directly (bypassing appResponse) and forgets the new field —
-// and pins the default-false invariant (issue AC #5:
-// customer-visible default stays false, every existing app
-// unaffected). Mirrors TestGetApp_SurfacesConcurrencyPerVMBound
-// directly above.
+// directly (bypassing appResponse) and forgets the new field.
+// Mirrors TestGetApp_SurfacesConcurrencyPerVMBound directly above.
 func TestGetApp_SurfacesRequireAuthn(t *testing.T) {
 	cases := []struct {
 		plan api.Plan
 		want bool
 	}{
 		{api.PlanFree, false},
-		{api.PlanHobby, false},
-		{api.PlanPro, false},
-		{api.PlanScale, false},
+		{api.PlanHobby, true},
+		{api.PlanPro, true},
+		{api.PlanScale, true},
 	}
 	for _, c := range cases {
 		t.Run(string(c.plan), func(t *testing.T) {

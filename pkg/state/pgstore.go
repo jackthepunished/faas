@@ -2347,6 +2347,30 @@ func (s *PgStore) CountAppsWithEvictionPriority(ctx context.Context, accountID, 
 	return n, err
 }
 
+// CountAuthDefaultFlippedApps (issue #695 / ADR-080) returns the
+// per-account count of apps stamped by the apps-auth-default
+// grand-father migration. Migration 00155 sets
+// auth_default_flipped_at on every pre-flip row; this query reads
+// back the live pre-flip count so the apid dashboard banner can
+// turn itself off when the customer has PATCHed every pre-flip app
+// back to public. Excludes soft-deleted apps so the banner tracks
+// the customer's actual surface. The apps_account_idx (account_id,
+// status) composite index keeps this O(N_per_account) — bounded by
+// the per-account app cap (Free 1, Hobby 5, Pro 25, Scale 100), so
+// the dashboard request stays constant-time in practice.
+//
+// The auth_default_flipped_at IS NOT NULL predicate picks up only
+// grand-fathered rows; a fresh post-flip create never has a stamp,
+// so a brand-new customer with no pre-flip apps reads 0 and the
+// banner is silent.
+func (s *PgStore) CountAuthDefaultFlippedApps(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from apps where account_id = $1 and status <> 'deleted' and auth_default_flipped_at is not null`,
+		accountID).Scan(&n)
+	return n, err
+}
+
 func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (App, error) {
 	manifestBytes := []byte(nil)
 	if p.Manifest != nil {

@@ -95,6 +95,10 @@
         <p class="flash" style="background:#fffbe6;border:1px solid #f0c000;padding:0.5rem 0.75rem;margin:1rem 0;border-radius:4px;">{{.Data.FlashSurface}}</p>
       {{end}}
 
+      {{if .Data.ActionRequiredSurface}}
+        <p class="action-required flash" style="background:#fffbe6;border:1px solid #f0c000;padding:0.5rem 0.75rem;margin:1rem 0;border-radius:4px;">{{.Data.ActionRequiredSurface}}</p>
+      {{end}}
+
       {{if or .Data.ShowDelete .Data.ShowRestore}}
         <h2>Danger zone</h2>
         <section class="danger-zone">

@@ -894,6 +894,26 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 	case "1":
 		data.FlashSurface = "Account restored. Welcome back."
 	}
+	// Issue #695 / ADR-080: per-account apps-auth-default
+	// grand-father banner. Renders when the account has at
+	// least one pre-flip app (auth_default_flipped_at IS NOT
+	// NULL on a live row). The banner copy points at the
+	// universal opt-out CLI; the count-zero path is the
+	// natural off-switch — no dismissal cookie required.
+	//
+	// The query is fault-tolerant: a transient store error
+	// leaves the banner empty (no banner) rather than 500ing
+	// the dashboard load. The migration-stamp column is
+	// monotonic and the customer can always force a refresh
+	// by re-loading the page.
+	if n, err := s.store.CountAuthDefaultFlippedApps(r.Context(), acct.ID); err == nil && n > 0 {
+		data.ActionRequiredSurface = fmt.Sprintf(
+			"On 2026-08-06 the default for newly-created apps changed to require authentication. "+
+				"Your existing %d app(s) were not affected and continue to serve anonymous traffic. "+
+				"New apps now require \"Authorization: Bearer <token>\" by default; "+
+				"run \"gregale app <slug> --no-require-authn --public-auth=open\" to opt out any pre-flip app.",
+			n)
+	}
 	page := dashboard.Page{Title: "Account", Body: "account", Account: dashboardAccountView(view, appCount), Data: data}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)

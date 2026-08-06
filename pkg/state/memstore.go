@@ -2543,6 +2543,30 @@ func (m *MemStore) CountAppsWithEvictionPriority(_ context.Context, accountID, p
 	return n, nil
 }
 
+// CountAuthDefaultFlippedApps (issue #695 / ADR-080) mirrors the
+// pgstore implementation — counts live (non-deleted) apps with
+// auth_default_flipped_at != nil per account. See the pgstore
+// counterpart for the load-bearing semantics; the dashboard
+// banner turns itself off when the count reaches zero.
+func (m *MemStore) CountAuthDefaultFlippedApps(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, a := range m.apps {
+		if a.AccountID != accountID {
+			continue
+		}
+		if a.Status == AppDeleted {
+			continue
+		}
+		if a.AuthDefaultFlippedAt == nil {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

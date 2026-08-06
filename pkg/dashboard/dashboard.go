@@ -567,6 +567,16 @@ type AccountData struct {
 	// Kept here (not Page.Flash) so the danger-zone partial stays a
 	// self-contained block the layout file can render unconditionally.
 	FlashSurface string
+	// ActionRequiredSurface (issue #695 / ADR-080) holds the
+	// one-time per-account banner that surfaces after the
+	// apps-auth-default flip. Populated by the apid
+	// dashboard handler when the account has at least one
+	// pre-flip app (auth_default_flipped_at IS NOT NULL AND
+	// the customer hasn't PATCHed every pre-flip app back
+	// to the public open path). Empty string = no banner; no
+	// dismissal cookie — count-zero is the natural off-switch.
+	// Renders on account.html beneath the FlashSurface block.
+	ActionRequiredSurface string
 }
 
 // AuthCapabilitiesView is the dashboard-facing slice of

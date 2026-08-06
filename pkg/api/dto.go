@@ -37,17 +37,20 @@ type CreateAppRequest struct {
 	// plan_warm_snapshot_not_allowed. Explicit false on Pro/Scale =
 	// opt out (an app the customer knows will run cold every time).
 	WarmSnapshotEnabled *bool `json:"warm_snapshot_enabled,omitempty"`
-	// RequireAuthn (issue #560) opts the brand-new app into
+	// RequireAuthn (issue #560 / issue #695) opts the brand-new app into
 	// per-deployment authentication. When true, gatewayd-internal
 	// demands a valid Authorization: Bearer <token> header on every
 	// routed request (the token must belong to the app's owning
-	// account — cross-account tokens receive 403). nil → false
-	// (default — public-by-default, no customer breakage). Explicit
-	// true on Free/Hobby = rejected by apid with 403
+	// account — cross-account tokens receive 403). nil → apid applies
+	// the per-plan default (issue #695 / ADR-080): Free=false/"open",
+	// Hobby=true/"open", Pro=true/"bearer", Scale=true/"bearer".
+	// Explicit true on Free = rejected by apid with 403
 	// plan_require_authn_not_allowed (the per-plan gate). Pointer
-	// distinguishes "don't touch" (nil) from "explicit false" (opt
-	// out at create time, e.g. for a staging app on a Pro account
-	// that wants the buffered public path).
+	// distinguishes "use the plan default" (nil) from "explicit false"
+	// (opt out at create time, e.g. for a Hobby staging app that wants
+	// the buffered public path) or "explicit true" (force-on for a
+	// Free customer who is about to migrate to Hobby and wants to test
+	// the path ahead of plan upgrade).
 	RequireAuthn *bool `json:"require_authn,omitempty"`
 	// WarmSnapshotMinRequests overrides the per-app request-count
 	// threshold for warm-tier capture at creation time. nil → plan
