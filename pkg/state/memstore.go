@@ -4754,6 +4754,55 @@ func (m *MemStore) ClearInstanceFrameworkReadyAt(_ context.Context, id string) e
 	return nil
 }
 
+// BumpInstanceTailCount mirrors pgstore.BumpInstanceTailCount
+// (issue #667 / ADR-078). Applies the signed delta to the
+// in-memory instance's TailCount under the existing instance
+// mutex so a concurrent receipt cannot lose increments, and
+// floors at 0 to mirror the SQL GREATEST(…, 0) guard. Returns
+// the post-update value so the caller (vmmd's
+// MarkInstanceTailTerminal) does not need a second read.
+//
+// The MemStore holds the only canonical copy of the in-memory
+// tail count; the live Instance struct on pkg/fcvm.Manager is
+// NOT the source of truth for tail — the runner-side WaitGroup
+// is. This method is the platform-side mirror of the runner's
+// in-process counter; schedd's reaper (PR 4) reads
+// Instance.TailCount via GetInstance to gate the park path.
+func (m *MemStore) BumpInstanceTailCount(_ context.Context, id string, delta int32) (int32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	post := ins.TailCount + int(delta)
+	if post < 0 {
+		post = 0
+	}
+	ins.TailCount = post
+	m.instances[id] = ins
+	return int32(post), nil
+}
+
+// DecrementInstanceTailCount mirrors pgstore.DecrementInstanceTailCount
+// (issue #667 / ADR-078). Single-step decrement with the 0-floor
+// guard. Kept as a separate method (vs the BumpInstanceTailCount
+// form) for symmetry with the pgstore API and to make every
+// decrement site self-documenting at the call site.
+func (m *MemStore) DecrementInstanceTailCount(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if ins.TailCount > 0 {
+		ins.TailCount--
+	}
+	m.instances[id] = ins
+	return nil
+}
+
 // ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
 // lookup (PR #74). Mirrors ListInstancesByStatesOlderThan but reads
 // terminal_at instead of the state-aware started_at/parked_at pair.

@@ -1818,6 +1818,32 @@ type Store interface {
 	// Nullable-on-disk semantics mean the column is always
 	// NULL-or-timestamp; there is no separate "delete" notion.
 	ClearInstanceFrameworkReadyAt(ctx context.Context, id string) error
+	// BumpInstanceTailCount atomically adds delta to the instance's
+	// `tail_count` column and returns the post-update value (issue
+	// #667 / ADR-078). Used by vmmd's MarkInstanceTailTerminal
+	// receipt path when a runner increments / decrements the
+	// in-flight tail task counter. delta is signed: positive on
+	// waitUntil registration, negative on terminal completion.
+	// Replay-safe: the SQL UPDATE is `SET tail_count =
+	// tail_count + $2` (atomic at the row level), so concurrent
+	// receipts cannot lose increments. Floor at 0 — a stray
+	// decrement on a counter at 0 leaves it at 0 rather than
+	// underflowing (a stale receipt from a parked instance is the
+	// expected source of such drift; the snapshotAndPark 5s
+	// watchdog (PR 4) force-parks anyway).
+	// Returns ErrNotFound when the instance row is missing.
+	BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error)
+	// DecrementInstanceTailCount is the canonical "tail task
+	// reached terminal" path (issue #667 / ADR-078). Equivalent
+	// to BumpInstanceTailCount(ctx, id, -1) but with an extra
+	// safety floor at 0 (UPDATE … SET tail_count = GREATEST(
+	// tail_count - $2, 0)) so a stale receipt from a guest that
+	// just parked cannot underflow the counter. Used by vmmd's
+	// MarkInstanceTailTerminal; PR 4 also calls it from the
+	// snapshotAndPark watchdog when the 5s drain window elapses
+	// with unfinished tails.
+	// Returns ErrNotFound when the instance row is missing.
+	DecrementInstanceTailCount(ctx context.Context, id string) error
 	// ListInstancesByStatesOlderThan is the §6.1 watchdog's lookup.
 	// Returns rows currently in any of the given states whose
 	// "age timestamp" is strictly older than threshold. The age

@@ -532,7 +532,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// to the local FrameworkReadyStamper interface (we
 		// don't want the Manager to depend on the full
 		// pkg/state surface).
-		WithFrameworkReadyStamper(stamperFromStore(store, log))
+		WithFrameworkReadyStamper(stamperFromStore(store, log)).
+		// Issue #667 / ADR-078: same adapter also implements
+		// the TailTerminalStamper interface so the type=0x04
+		// tail_event DGRAM receipt path mirrors the
+		// in-memory TailCount decrement to the SQL column.
+		// Single storeStamper receiver satisfies both
+		// interfaces — the two receipt paths share one
+		// SQL-persistence seam.
+		WithTailTerminalStamper(stamperFromStore(store, log))
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
 	// read Grype scan sidecars at boot time. Mirrors the VMM's

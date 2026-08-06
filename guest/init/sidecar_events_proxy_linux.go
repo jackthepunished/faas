@@ -58,6 +58,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -82,6 +83,54 @@ const VsockSidecarEventsTypeInitExit byte = 0x02
 // VsockSidecarEventsTypeRestart is the discriminator byte for the
 // restart-counter envelope.
 const VsockSidecarEventsTypeRestart byte = 0x03
+
+// VsockTailEventType (issue #667 / ADR-078) is the discriminator
+// byte for the waitUntil(post-response tail) terminal-event
+// envelope. Same DGRAM port 1027 channel as the framework_ready /
+// sidecar_init_exit / sidecar_restart events; the host's recv
+// loop (cmd/vmmd/framework_ready_recv.go) dispatches on the
+// leading type byte. The 1-byte outcome + 8-byte elapsed_ms BE
+// payload follows the type byte.
+//
+// Wire layout (16 bytes total, fixed-size):
+//
+//	[1B type=0x04][1B outcome][6B reserved][8B elapsed_ms BE uint64]
+//
+// Reserved bytes stay 0x00 in PR 3 — the host resolves instance
+// identity from the DGRAM peer CID (same join the framework_ready
+// / sidecar paths use). The reserved space gives a follow-up PR
+// a wire-incompatible-free upgrade path (e.g. an explicit
+// instance_id if the peer CID join ever needs to be relaxed for
+// a future deployment topology).
+const VsockTailEventType byte = 0x04
+
+// tailEventMaxDatagram is the upper bound on the tail-event
+// body the guest-init proxy will emit. 16 bytes is the
+// fixed-size envelope (1+1+6+8); the host reads up to
+// frameworkReadyMaxDatagram=1024 for ALL types so this is
+// well within budget.
+const tailEventMaxDatagram = 16
+
+// tailEventOutcomeCompleted mirrors pkg/fcvm.TailOutcomeCompleted.
+// Duplicated here because guest/init cannot import pkg/fcvm
+// (the two packages are built into separate binaries at
+// different stages of the boot chain). A drift between the
+// two closed sets is a wire-incompatible bug — the
+// sidecar_events_proxy_linux_test.go pins the numeric
+// equality between this byte and the host's parseFWReadyKindTail
+// decoder.
+//
+// Reason: same as VsockFrameworkReadyPort in
+// framework_ready_proxy_linux.go — guest/init and pkg/fcvm
+// cannot share compile-time symbols. The numeric values are
+// pinned at both ends by parse/emit unit tests so a drift
+// surfaces as a failing test rather than a silent wire
+// mismatch.
+const (
+	tailEventOutcomeCompleted byte = 0x01
+	tailEventOutcomeFailed    byte = 0x02
+	tailEventOutcomeTimeout   byte = 0x03
+)
 
 // sidecarInitExitEnvelope is the JSON payload the proxy sends
 // for type=0x02. The field tags mirror the json wire exactly —
@@ -192,6 +241,62 @@ func (p *sidecarEventsProxy) SendRestart(sidecar string, attempt int) error {
 		return fmt.Errorf("sidecar restart marshal: %w", err)
 	}
 	return p.send(VsockSidecarEventsTypeRestart, body)
+}
+
+// SendTailEvent (issue #667 / ADR-078) ships one waitUntil
+// terminal-event envelope to the host. Called from the runner's
+// tail host once per waitUntil(promise) task that reaches a
+// terminal state (completed / failed / timeout). The runner's
+// per-task context.WithTimeout enforces the per-plan timeout
+// (Free 5s / Hobby 15s / Pro 30s / Scale 60s) so this is the
+// only place a TailOutcomeTimeout byte is emitted.
+//
+// Wire layout (16 bytes, fixed-size):
+//
+//	[1B type=0x04][1B outcome][6B reserved][8B elapsed_ms BE uint64]
+//
+// Reserved bytes are 0x00 in PR 3 — the host resolves
+// instance identity from the DGRAM peer CID. elapsedMs is
+// the wall-clock duration from waitUntil registration to
+// terminal (in milliseconds); the host reads it for the
+// telemetry histogram (PR 5). A send error is logged at the
+// caller's Warn (the runner-side log shim — see
+// guest/runners/internal/runnerparity) and the runner keeps
+// draining — a lost receipt is bounded by the 5s
+// snapshotAndPark watchdog.
+func (p *sidecarEventsProxy) SendTailEvent(outcome byte, elapsedMs int64) error {
+	if p == nil {
+		return nil
+	}
+	return p.sendTail(outcome, elapsedMs)
+}
+
+// sendTail is the fixed-size-encode variant of send(); the
+// 16-byte layout doesn't need json.Marshal. Mirrors the size
+// cap pattern (early-return on > tailEventMaxDatagram) so
+// the make() allocation is bounded by a compile-time constant.
+func (p *sidecarEventsProxy) sendTail(outcome byte, elapsedMs int64) error {
+	// Closed-set outcome guard — anything outside the 3-byte
+	// enum is a wiring bug; surface loud rather than silently
+	// shipping garbage to the host.
+	switch outcome {
+	case tailEventOutcomeCompleted, tailEventOutcomeFailed, tailEventOutcomeTimeout:
+	default:
+		return fmt.Errorf("tail event outcome byte 0x%02x outside closed set {completed, failed, timeout}", outcome)
+	}
+	buf := make([]byte, tailEventMaxDatagram)
+	buf[0] = VsockTailEventType
+	buf[1] = outcome
+	// buf[2:8] reserved, already zero from make().
+	binary.BigEndian.PutUint64(buf[8:16], uint64(elapsedMs))
+	dst := &unix.SockaddrVM{
+		CID:  unix.VMADDR_CID_HOST,
+		Port: VsockSidecarEventsPort,
+	}
+	if _, err := unix.SendmsgN(p.fd, buf, nil, dst, 0); err != nil {
+		return fmt.Errorf("tail event vsock send: %w", err)
+	}
+	return nil
 }
 
 // codeql[go/allocation-size-overflow] false-positive: send()'s early-return guard rejects any payload whose len(body)+1 exceeds sidecarMaxDatagram (512); the make() below allocates a fixed-size scratch buffer and slices it, so the taint can't reach the make() size argument at all.

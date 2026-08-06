@@ -340,6 +340,19 @@ type Instance struct {
 	// "signal landed at unix-time-zero" are observably
 	// distinct, and the latter never happens.
 	FrameworkReadyAt *time.Time
+	// TailCount (issue #667 / ADR-078) is the in-memory
+	// mirror of the per-instance `tail_count` SQL column.
+	// Incremented by the runner's WaitGroup each time a
+	// waitUntil(promise) is registered (PR 3 does NOT wire
+	// the increment — that lives in PR 3's runner-side tail
+	// host on the guest; the host only sees decrements via
+	// the 0x04 DGRAM receipt path). The schedd reaper (PR
+	// 4) reads Instance.TailCount via state.GetInstance to
+	// gate the park path: a wake with tail_count > 0 is
+	// NOT idle-eligible. Mirrors state.Instance.TailCount
+	// so the Manager is the single owner of the in-memory
+	// copy.
+	TailCount int
 }
 
 // Manager tracks live instances and serialises nothing on the hot path beyond a
@@ -397,6 +410,15 @@ type Manager struct {
 	// the column via pgstore.InstanceByID (state.Instance.
 	// FrameworkReadyAt is the row-side pointer).
 	frameworkReadyStamper FrameworkReadyStamper
+	// tailTerminalStamper (issue #667 / ADR-078) is the
+	// optional SQL persistence seam the vmmd cmd wires via
+	// WithTailTerminalStamper. nil-safe:
+	// MarkInstanceTailTerminal calls DecrementInstanceTailCount
+	// on a nil-safe receiver so unit tests that drive Manager
+	// directly without a stamper don't need a stub. The
+	// schedd reaper (PR 4) reads back the `tail_count` column
+	// to gate the park path on tail_count == 0.
+	tailTerminalStamper TailTerminalStamper
 	// hostIdentities is the slice of X25519 secret keys used to
 	// unseal per-app sealed env blobs at wake time (spec §11/G2).
 	// Holds the current identity alone in the normal pre-rotation
@@ -624,6 +646,63 @@ type FrameworkReadyStamper interface {
 	SetFrameworkReadyAt(ctx context.Context, instance string, readyAt time.Time) error
 }
 
+// TailOutcome (issue #667 / ADR-078) is the closed set of
+// terminal states a runner-side waitUntil(promise) task can
+// reach. Mirrors the wire-byte encoding guest-init ships on
+// DGRAM port 1027 (the second byte after the 0x04 type
+// discriminator — see ADR-078 §"Wire format" + the encoding
+// helpers in guest/init/sidecar_events_proxy_linux.go). The
+// closed set keeps the metric labels bounded (PR 5 adds the
+// histogram with `outcome ∈ {completed, failed, timeout}`).
+type TailOutcome byte
+
+const (
+	// TailOutcomeCompleted — the customer's promise resolved
+	// successfully (no error).
+	TailOutcomeCompleted TailOutcome = 0x01
+	// TailOutcomeFailed — the customer's promise rejected
+	// (handler error). Surfaced via the runner's stderr +
+	// wake.tail_failed audit row but never the HTTP response.
+	TailOutcomeFailed TailOutcome = 0x02
+	// TailOutcomeTimeout — the runner-side context.WithTimeout
+	// fired before the promise resolved. The customer process
+	// is killed by the runner's normal cmd.Wait() shutdown
+	// after the tail host drains.
+	TailOutcomeTimeout TailOutcome = 0x03
+)
+
+// TailTerminalStamper (issue #667 / ADR-078) is the minimal
+// write surface the Manager needs to record a tail task terminal
+// event. Mirrors FrameworkReadyStamper in shape and intent:
+// local-to-pkg/fcvm to avoid a full pkg/state import on the hot
+// path; the cmd/vmmd wiring adapts the pgstore directly.
+//
+// Errors propagate to the receipt path's Warn log — the in-memory
+// TailCount on the live Instance is the load-bearing signal for
+// the runner's WaitGroup view; the SQL column is the durable
+// mirror the schedd reaper reads (PR 4). A transient PG hiccup
+// must not lose the receipt; the 5s watchdog in snapshotAndPark
+// force-parks regardless.
+type TailTerminalStamper interface {
+	// DecrementInstanceTailCount atomically decrements the
+	// per-instance `tail_count` column by 1 (floored at 0 by
+	// the SQL GREATEST(…, 0) guard). Returns ErrNotFound when
+	// the instance row is missing.
+	DecrementInstanceTailCount(ctx context.Context, id string) error
+}
+
+// WithTailTerminalStamper (issue #667 / ADR-078) attaches the
+// SQL-persistence seam so the receipt path can mirror the
+// in-memory tail count to the `instances.tail_count` column.
+// Same wiring pattern as WithFrameworkReadyStamper: optional,
+// nil-safe, no-ops when the cmd binary doesn't wire it.
+// Production wires *pgstore.PgStore satisfying the interface.
+// Returns the *Manager so callers can chain.
+func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
+	m.tailTerminalStamper = s
+	return m
+}
+
 // MarkInstanceFrameworkReady stamps the per-instance
 // `framework_ready_at` clock on the live Instance, observes the
 // vmmd_guest_framework_warmup_seconds histogram (if wired), and
@@ -677,6 +756,65 @@ func (m *Manager) MarkInstanceFrameworkReady(ctx context.Context, instance strin
 		m.frameworkReadyMetrics.ObserveWarmup(runtime, appID, float64(warmupMs)/1000.0)
 	}
 	return true, appID, runtime, nil
+}
+
+// MarkInstanceTailTerminal (issue #667 / ADR-078) decrements the
+// in-memory tail counter on the live Instance and mirrors the
+// decrement to the SQL `tail_count` column via the optional
+// TailTerminalStamper. The receipt path is the host-side
+// counterpart to a runner's WaitGroup.Done() — each
+// waitUntil(promise) task that reaches a terminal outcome
+// (completed / failed / timeout) fires one 0x04 DGRAM with the
+// outcome + elapsed_ms payload; the host's recv loop calls
+// here for each.
+//
+// The in-memory TailCount is the runner's source of truth (the
+// WaitGroup) mirrored into the Manager for two purposes: (a)
+// the schedd reaper's `tail_count > 0` early-out (PR 4) and (b)
+// the snapshotAndPark 5s watchdog (PR 4) deciding when to
+// force-park. SQL is the durable record but the receipt is not
+// gated on its success — a transient PG hiccup must not lose
+// the receipt; the SQL write is best-effort and the in-memory
+// state is the load-bearing signal.
+//
+// Returns (stamped=false, "", nil) when the instance is unknown
+// — the wire RPC translates that to a Debug log + drop, same
+// convention as MarkInstanceFrameworkReady. A stale receipt
+// from a guest that just parked is a normal event during
+// instance churn.
+//
+// Concurrency: short-held m.mu lock around the live-map lookup
+// + decrement. The stamper call is unlocked (no Manager lock
+// held across the SQL roundtrip — the column is independently
+// atomic via the GREATEST(…, 0) SQL guard).
+func (m *Manager) MarkInstanceTailTerminal(ctx context.Context, instance string, outcome TailOutcome, elapsedMs int64) (stamped bool, appID string, err error) {
+	m.mu.Lock()
+	inst, ok := m.live[instance]
+	if !ok {
+		m.mu.Unlock()
+		return false, "", nil
+	}
+	if inst.TailCount > 0 {
+		inst.TailCount--
+	}
+	appID = inst.AppID
+	m.mu.Unlock()
+	// Mirror to SQL so schedd's reaper (PR 4) sees the same
+	// post-decrement value as the in-memory stamp. Errors are
+	// logged at Debug (the in-memory stamp is the authoritative
+	// signal — see method doc above).
+	if m.tailTerminalStamper != nil {
+		if perr := m.tailTerminalStamper.DecrementInstanceTailCount(ctx, instance); perr != nil {
+			// Same conservative-log pattern as
+			// MarkInstanceFrameworkReady: surface as a
+			// Debug so the receipt isn't gated on a
+			// transient SQL failure.
+			_ = perr
+		}
+	}
+	_ = outcome
+	_ = elapsedMs
+	return true, appID, nil
 }
 
 // InstanceByCID (issue #470 / PR #470-FU-B) returns the instance

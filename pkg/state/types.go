@@ -1320,6 +1320,21 @@ type Instance struct {
 	// (no CHECK constraint in migration 00112). Pre-existing rows
 	// are backfilled with the migration's DEFAULT NULL.
 	FrameworkReadyAt *time.Time
+	// TailCount is the in-flight waitUntil(promise) task count
+	// for this instance (issue #667 / ADR-078). Incremented by
+	// the runner each time ctx.waitUntil(promise) is called and
+	// decremented when the task reaches a terminal outcome
+	// (completed / failed / timeout). Persisted in the `tail_count`
+	// column added by migrations/00149_wait_until_tail.sql and
+	// mirrored here so schedd's reaper can read it without a
+	// second SQL hop. The schedd reaper treats instances with
+	// tail_count > 0 as NOT idle-eligible — the wake stays in
+	// RUNNING until the runner drains its tail tasks or the
+	// snapshotAndPark 5s watchdog fires (PR 4 wires that gate).
+	// Tail count is a column, not a state; the state machine is
+	// untouched. NOT NULL DEFAULT 0 enforced by migration 00149;
+	// pre-existing rows are backfilled to 0 on apply.
+	TailCount int
 }
 
 // ComputeNode is one vmmd host in the fleet (issue #97 / ADR-025 axis

@@ -6222,6 +6222,74 @@ func (s *PgStore) ClearInstanceFrameworkReadyAt(ctx context.Context, id string) 
 	return nil
 }
 
+// BumpInstanceTailCount atomically applies delta to the instance's
+// `tail_count` column and returns the post-update value (issue #667
+// / ADR-078). The arithmetic happens in SQL so concurrent receipts
+// (a runner firing several terminal events in quick succession)
+// cannot lose increments. The GREATEST(…, 0) floor mirrors
+// DecrementInstanceTailCount's safety property — a stale receipt
+// from a guest that just parked cannot underflow the counter, and
+// snapshotAndPark's 5s watchdog force-parks regardless.
+//
+// Uses RETURNING tail_count so the caller (vmmd's
+// MarkInstanceTailTerminal) learns the new value without a
+// follow-up SELECT. The post-update value is what the runner's
+// WaitGroup view of the world now matches — schedd's reaper
+// decision in PR 4 reads the same value from
+// Instance.TailCount.
+//
+// Returns ErrNotFound when the instance row is missing (the
+// receipt raced a Park / Destroy and the row is gone). The
+// vmmd receipt path logs a Debug and drops — same convention
+// as the framework_ready / sidecar-event DGRAM receipts.
+func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error) {
+	var post int32
+	row := s.pool.QueryRow(ctx,
+		`update instances
+		    set tail_count = GREATEST(tail_count + $2, 0)
+		  where id = $1
+		returning tail_count`,
+		id, delta)
+	if err := row.Scan(&post); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return post, nil
+}
+
+// DecrementInstanceTailCount is the canonical "tail task reached
+// terminal" path (issue #667 / ADR-078). Equivalent to
+// BumpInstanceTailCount(ctx, id, -1) — kept as a separate method
+// because every decrement site is a terminal event receipt, and
+// the explicit name makes the call sites self-documenting.
+//
+// GREATEST(tail_count - 1, 0) is the safety floor: a stale
+// decrement on a counter at 0 leaves it at 0 rather than
+// underflowing. Without the floor, a burst of decrements after
+// the runner exited cleanly would push the counter negative and
+// the schedd reaper's `tail_count > 0` early-out would
+// permanently stall the wake. The 5s watchdog in
+// snapshotAndPark force-parks regardless; the floor is a
+// defence-in-depth guard, not the load-bearing piece.
+//
+// Returns ErrNotFound when the instance row is missing.
+func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set tail_count = GREATEST(tail_count - 1, 0)
+		  where id = $1`,
+		id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListInstancesByStatesOlderThan is the watchdog's lookup (spec §6.1).
 // Filters on state ∈ states and a state-aware "age" column:
 // started_at for WAKING / COLD_BOOTING (stamped on creation by the

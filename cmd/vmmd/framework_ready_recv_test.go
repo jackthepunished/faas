@@ -55,17 +55,16 @@ func TestParseFrameworkReadyDatagram(t *testing.T) {
 			want: want{err: true, errSub: "empty body"},
 		},
 		{
-			name: "unknown type byte",
-			// 0x04 is the next free discriminator byte
-			// after the PR-C §3 sidecar event classes
-			// (0x01 framework_ready, 0x02 init_exit,
-			// 0x03 restart). The parser must reject
-			// anything outside the closed set with the
-			// "unknown msg sub-type" sentinel — a future
-			// event class picks the next free byte and
-			// adds a new dispatch arm in lockstep.
-			body: []byte{0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 'n'},
-			want: want{err: true, errSub: "unknown msg sub-type 0x04"},
+			name: "unknown type byte (future 0x05 placeholder)",
+			// 0x05 is the next free discriminator byte
+			// after the tail-event class (0x04, issue #667
+			// / ADR-078). The parser must reject anything
+			// outside the closed set with the "unknown msg
+			// sub-type" sentinel — a future event class
+			// picks the next free byte and adds a new
+			// dispatch arm in lockstep.
+			body: []byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 'n'},
+			want: want{err: true, errSub: "unknown msg sub-type 0x05"},
 		},
 		{
 			name: "type-only, no warmup, no runtime",
