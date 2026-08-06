@@ -58,8 +58,8 @@ import (
 // assert on the in-memory tail_count decrement via the Manager
 // and on the stamper's counter as the durable-mirror check.
 type tailMetalStamper struct {
-	mu      sync.Mutex
-	byInst  map[string]int
+	mu     sync.Mutex
+	byInst map[string]int
 }
 
 func newTailMetalStamper() *tailMetalStamper {

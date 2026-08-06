@@ -946,7 +946,7 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// Sourced from instances.tail_count (PR #671 schema);
 				// the reaper gate keeps RUNNING instances alive while
 				// the runner's tail host drains them.
-				TailCount:    ins.TailCount,
+				TailCount: ins.TailCount,
 				// ADR-051 PR-D: workload class drives the
 				// reaper-exempt carve-out. Workers skip
 				// ReapIdle + ReapAggressive; RAM pressure
