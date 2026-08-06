@@ -1330,7 +1330,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// traffic from a missing or invalid public_auth
 	// credential). nil-safe: open / unset modes pass
 	// through (the pre-#477 default is preserved).
-	if !h.enforcePublicAuth(w, r, rec, app) {
+	if !h.enforcePublicAuth(w, r, rec, app) { //nolint:contextcheck // request ctx is the canonical inbound ctx; the helper uses r.Context() internally so passing ctx separately would shadow it.
 		return
 	}
 
