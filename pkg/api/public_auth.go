@@ -52,7 +52,7 @@ const AppPublicAuthBasicPassMaxBytes = 256
 // equal at compile time so a future contributor adding
 // a fourth mode updates both halves in one change.
 // The closed-set matches apps_public_auth_mode_chk in
-// migrations/00151_apps_public_auth.sql; a future addition
+// migrations/00153_apps_public_auth.sql; a future addition
 // to the wire surface must add a row to that CHECK AND
 // extend this constant block AND the state-layer mirror.
 const (

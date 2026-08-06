@@ -1,4 +1,4 @@
--- filename: 00151_apps_public_auth.sql
+-- filename: 00153_apps_public_auth.sql
 -- +goose Up
 -- Issue #477 / ADR-079 — per-app public-URL auth mode
 -- ('open'|'bearer'|'basic') + sealed credential blob for the

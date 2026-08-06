@@ -1941,7 +1941,7 @@ type AppPublicAuthUpdate struct {
 // Canonical public-auth mode strings for the state
 // layer (issue #477 / ADR-079). Values must stay in sync
 // with the apps_public_auth_mode_chk CHECK constraint in
-// migrations/00151_apps_public_auth.sql AND with the
+// migrations/00153_apps_public_auth.sql AND with the
 // pkg/gateway's package-local copies. The three layers
 // (sqlc / state / gateway) all share the same vocabulary;
 // if a fourth is ever added, mirror the constant here.

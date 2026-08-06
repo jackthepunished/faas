@@ -1,10 +1,10 @@
 //go:build !no_pg
 
-// Migration-apply test for 00151 (per-app public_auth mode +
+// Migration-apply test for 00153 (per-app public_auth mode +
 // sealed credential blob, issue #477 / ADR-079). Pins the new
 // columns:
 //
-//  1. The migration set applies cleanly through 00151.
+//  1. The migration set applies cleanly through 00153.
 //  2. public_auth_mode accepts the canonical text shape and
 //     round-trips.
 //  3. Default is 'open' (regression check — pre-PR rows stay
@@ -16,14 +16,14 @@
 //     guard makes a second MigrateUp no-op (ADR-041).
 //
 // Slot note: HEAD was at 00148 (overage cap gate index) at PR
-// creation time. 00149 is fenced by PR #673 (issue #554 liveness
-// probe) and is also touched by PR #540 (webhook deliveries).
-// 00150 is PR #673's real migration. 00151 is the lowest
-// uncontested slot. The migration is slot-agnostic — only the
-// filename and the test function name carry the literal slot.
-// If a sibling PR grabs 00151 first, renumber per
-// `migrations/README.md` and update this test's filename + the
-// ApplyUp range below.
+// creation time. 00149 is PR #540 (webhook deliveries). 00150 is
+// PR #673's bridge fence (issue #554 liveness probe). 00151 is
+// PR #671 (wait_until_tail). 00152 is PR #673 (overage cap gate
+// index). 00153 is the lowest uncontested slot at rebase time.
+// The migration is slot-agnostic — only the filename and the
+// test function name carry the literal slot. If a sibling PR
+// grabs 00153 first, renumber per `migrations/README.md` and
+// update this test's filename + the ApplyUp range below.
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -37,20 +37,20 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00151_AppsPublicAuth(t *testing.T) {
+func TestMigrations_00153_AppsPublicAuth(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// Seed UUIDs carry the slot number in the last group (`...000151`,
+	// Seed UUIDs carry the slot number in the last group (`...000153`,
 	// `...000237`) so a reader scanning the test fixtures can pin each
 	// row to this migration without grepping the file name. The literal
 	// slot value MUST stay in sync with the filename; renumber per
-	// `migrations/README.md` if a sibling PR grabs 00151 first.
+	// `migrations/README.md` if a sibling PR grabs 00153 first.
 
-	// (1) Apply through 00151. A regression that drops a slot between
-	// 1 and 150 surfaces here before the per-assertion pins.
+	// (1) Apply through 00153. A regression that drops a slot between
+	// 1 and 152 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 151)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 153)", err)
 	}
 
 	// (2) Seed an account + app. The literal UUIDs are fixed across
@@ -60,7 +60,7 @@ func TestMigrations_00151_AppsPublicAuth(t *testing.T) {
 	// migration test.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000151',
+		values ('00000000-0000-0000-0000-000000000153',
 		        'public-auth-test@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -69,7 +69,7 @@ func TestMigrations_00151_AppsPublicAuth(t *testing.T) {
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
 		values ('00000000-0000-0000-0000-000000000237',
-		        '00000000-0000-0000-0000-000000000151',
+		        '00000000-0000-0000-0000-000000000153',
 		        'public-auth-test-app', 'function', 512, 5, 300, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {

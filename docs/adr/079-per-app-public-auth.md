@@ -233,7 +233,7 @@ queue Q3) — the substring check is the seed.
 
 ### Code paths
 
-- `migrations/00151_apps_public_auth.sql` + `_test.go`
+- `migrations/00153_apps_public_auth.sql` + `_test.go`
   pin the schema (replay safety, down-up, CHECK
   rejection of unknown values).
 - `pkg/api/public_auth.go` pins the constants
