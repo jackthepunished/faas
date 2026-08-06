@@ -179,9 +179,9 @@ jobs:
                # key files. Drift-repair: chown to faas-apid:faas and
                # chmod 0600 (no-op when already correct).
                for key in /var/lib/faas/audit-hmac.key /var/lib/faas/recovery-hmac.key; do
-                 if [[ -e "${key}" ]]; then
-                   chown faas-apid:faas "${key}"
-                   chmod 0600 "${key}"
+                 if [[ -e "\${key}" ]]; then
+                   chown faas-apid:faas "\${key}"
+                   chmod 0600 "\${key}"
                  fi
                done
                ls -la /var/lib/faas/*.key 2>/dev/null || true"
@@ -212,26 +212,19 @@ jobs:
 
       - name: Install binaries, run migrations & restart services
         run: |
+          set -euo pipefail
+          FAAS_CRITICAL_SERVICES="$(jq -r '.critical | join(" ")' deploy/etc/daemons.json)"
+          FAAS_BEST_EFFORT_SERVICES="$(jq -r '.best_effort | join(" ")' deploy/etc/daemons.json)"
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-            root@${{ env.CP_HOST }} 'bash -s' << 'REMOTE'
+            root@${{ env.CP_HOST }} \
+            "FAAS_CRITICAL_SERVICES='${FAAS_CRITICAL_SERVICES}' FAAS_BEST_EFFORT_SERVICES='${FAAS_BEST_EFFORT_SERVICES}' bash -s" << 'REMOTE'
           set -euo pipefail
 
           # CRITICAL: the health gate enforces is-active on these. A restart-loop
           # CRITICAL: any service that fails healthcheck after restart
-          # blocks the deploy and triggers roll_back(). Sourced from
-          # deploy/etc/daemons.json (DEPLOY-2 / ADR-078) so the list
-          # stays in sync with pkg/daemonunitspec/registry.go. Edit the
-          # registry + run `make generate` to add or remove a daemon;
-          # do NOT hand-edit this list.
-          FAAS_CRITICAL_SERVICES="$(jq -r '.critical | join(" ")' deploy/etc/daemons.json)"
-          # BEST_EFFORT: a degraded state here logs a `::warning::` annotation
-          # but does NOT fail the gate. imaged sits in best-effort during the
-          # 2026-08-04 parent-ref overlay regression so one bug in a single
-          # daemon doesn't tank every deploy — the rest of the box stays
-          # serving traffic, and ops still gets paged via the existing
-          # Prometheus alert on `NRestarts`/log-flood. Same daemons.json
-          # source as critical[].
-          FAAS_BEST_EFFORT_SERVICES="$(jq -r '.best_effort | join(" ")' deploy/etc/daemons.json)"
+          # blocks the deploy and triggers roll_back(). These lists are generated
+          # from deploy/etc/daemons.json on the Actions runner and passed in as
+          # environment values; the host does not need a source checkout.
           FAAS_SERVICES="${FAAS_CRITICAL_SERVICES} ${FAAS_BEST_EFFORT_SERVICES}"
           # vmmd first (socket owner of /run/faas/vmmd.sock), then apid (route-table
           # source), then schedd (depends on vmmd), then gatewayd-internal
