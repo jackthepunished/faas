@@ -47,7 +47,7 @@ func UnitApid() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas-apid",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/apid --config /etc/faas/apid.toml`,
+		ExecStart:  `/opt/faas/current/bin/apid --config /etc/faas/apid.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 

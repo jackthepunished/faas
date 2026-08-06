@@ -40,7 +40,7 @@ func UnitVmmd() daemonunit.Unit {
 
 		Type: "simple",
 		// No User=/Group=: vmmd is root by design.
-		ExecStart: `/opt/faas/bin/vmmd --config /etc/faas/vmmd.toml`,
+		ExecStart: `/opt/faas/current/bin/vmmd --config /etc/faas/vmmd.toml`,
 		ExecStartPre: []string{
 			`/usr/bin/chown root:faas /run/faas`,
 			`/usr/bin/chmod 0775 /run/faas`,

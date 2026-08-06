@@ -53,7 +53,10 @@ func migratedPool(t *testing.T) *pgxpool.Pool {
 }
 
 func TestRun_BadConfigPath(t *testing.T) {
-	deps := runDeps{configPath: t.TempDir()} // a directory fails the non-ENOENT read
+	deps := runDeps{
+		configPath: t.TempDir(), // a directory fails the non-ENOENT read
+		capCheck:   func() error { return nil },
+	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); err == nil {
 		t.Fatal("expected error from directory-as-config-path")
 	}
@@ -63,6 +66,7 @@ func TestRun_OpenDBFailurePropagates(t *testing.T) {
 	wantErr := errors.New("db down")
 	deps := runDeps{
 		configPath: filepath.Join(t.TempDir(), "absent.toml"), // ENOENT => defaults
+		capCheck:   func() error { return nil },
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return nil, wantErr },
 	}
 	if err := runWithDeps(context.Background(), discardLog(), deps); !errors.Is(err, wantErr) {
@@ -91,6 +95,7 @@ vmmd_tls_cert_path = "/some/cert"
 	}
 	deps := runDeps{
 		configPath: cfgPath,
+		capCheck:   func() error { return nil },
 		openDB:     func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:    func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:   func(context.Context) (string, error) { return "1.10.0", nil },
@@ -106,6 +111,7 @@ func TestRun_ListenFailurePropagates(t *testing.T) {
 	wantErr := errors.New("listen broken")
 	deps := runDeps{
 		configPath:  filepath.Join(t.TempDir(), "absent.toml"),
+		capCheck:    func() error { return nil },
 		openDB:      func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:     func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:    func(context.Context) (string, error) { return "1.10.0", nil },
@@ -187,6 +193,7 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 	}
 	deps := runDeps{
 		configPath:  cfgPath,
+		capCheck:    func() error { return nil },
 		openDB:      func(context.Context, string) (*pgxpool.Pool, error) { return pool, nil },
 		migrate:     func(context.Context, *pgxpool.Pool) error { return nil },
 		detectFC:    func(context.Context) (string, error) { return "1.10.0", nil },

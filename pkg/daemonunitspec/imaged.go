@@ -39,7 +39,7 @@ func UnitImaged() daemonunit.Unit {
 		Type:       "simple",
 		User:       "faas-imaged",
 		Group:      "faas",
-		ExecStart:  `/opt/faas/bin/imaged --config /etc/faas/imaged.toml`,
+		ExecStart:  `/opt/faas/current/bin/imaged --config /etc/faas/imaged.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
