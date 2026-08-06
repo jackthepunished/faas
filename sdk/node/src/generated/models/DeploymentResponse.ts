@@ -63,7 +63,7 @@ export type DeploymentResponse = {
    */
   scan?: (ScanResult | null);
   /**
-   * Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00155). Closed-set vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked deployments — surfaced as no field on the wire via omitempty.
+   * Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00157). Closed-set vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked deployments — surfaced as no field on the wire via omitempty.
    */
   parked_reason?: 'liveness_exhausted' | 'lifecycle_park' | 'admin_park';
   /**
