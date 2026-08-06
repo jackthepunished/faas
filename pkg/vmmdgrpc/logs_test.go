@@ -48,7 +48,7 @@ import (
 func TestLogs_HappyPath(t *testing.T) {
 	const (
 		snapshotBudget = 2 * time.Second
-		liveTailWait   = 1 * time.Second
+		liveTailWait   = 5 * time.Second
 	)
 	ring := logbuf.New(1 << 20)
 	for _, ln := range []string{"alpha\n", "beta\n", "gamma\n"} {

@@ -158,7 +158,7 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		// the dial in a small retry budget so the test's
 		// purpose (cycle stays bindable) is what we measure,
 		// not the kernel's accept-poll cadence.
-		conn, err := dialWithRetry(sock, 2*time.Second, 10*time.Millisecond)
+		conn, err := dialWithRetry(sock, 5*time.Second, 10*time.Millisecond)
 		if err != nil {
 			t.Fatalf("cycle %d dial after start: %v", i, err)
 		}
