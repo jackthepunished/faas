@@ -217,20 +217,21 @@ jobs:
           set -euo pipefail
 
           # CRITICAL: the health gate enforces is-active on these. A restart-loop
-          # on any of them blocks the deploy and triggers roll_back(). vmmd
-          # (socket owner of /run/faas/vmmd.sock), apid (route-table source),
-          # schedd (depends on vmmd), gatewayd-internal (depends on schedd +
-          # apid), gatewayd-public (the TLS edge; depends on gatewayd-internal),
-          # meterd (no vmmd dep but customer-facing billing must not drift),
-          # githubd (no vmmd dep but is the auth boundary).
-          FAAS_CRITICAL_SERVICES="vmmd apid schedd gatewayd-internal gatewayd-public meterd githubd"
+          # CRITICAL: any service that fails healthcheck after restart
+          # blocks the deploy and triggers roll_back(). Sourced from
+          # deploy/etc/daemons.json (DEPLOY-2 / ADR-078) so the list
+          # stays in sync with pkg/daemonunitspec/registry.go. Edit the
+          # registry + run `make generate` to add or remove a daemon;
+          # do NOT hand-edit this list.
+          FAAS_CRITICAL_SERVICES="$(jq -r '.critical | join(" ")' deploy/etc/daemons.json)"
           # BEST_EFFORT: a degraded state here logs a `::warning::` annotation
           # but does NOT fail the gate. imaged sits in best-effort during the
           # 2026-08-04 parent-ref overlay regression so one bug in a single
           # daemon doesn't tank every deploy — the rest of the box stays
           # serving traffic, and ops still gets paged via the existing
-          # Prometheus alert on `NRestarts`/log-flood.
-          FAAS_BEST_EFFORT_SERVICES="imaged"
+          # Prometheus alert on `NRestarts`/log-flood. Same daemons.json
+          # source as critical[].
+          FAAS_BEST_EFFORT_SERVICES="$(jq -r '.best_effort | join(" ")' deploy/etc/daemons.json)"
           FAAS_SERVICES="${FAAS_CRITICAL_SERVICES} ${FAAS_BEST_EFFORT_SERVICES}"
           # vmmd first (socket owner of /run/faas/vmmd.sock), then apid (route-table
           # source), then schedd (depends on vmmd), then gatewayd-internal

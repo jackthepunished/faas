@@ -1,0 +1,14 @@
+{
+  "critical": [
+    "apid",
+    "gatewayd-internal",
+    "gatewayd-public",
+    "githubd",
+    "meterd",
+    "schedd",
+    "vmmd"
+  ],
+  "best_effort": [
+    "imaged"
+  ]
+}

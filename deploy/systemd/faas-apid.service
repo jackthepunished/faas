@@ -8,77 +8,20 @@ Wants=faas-cp.slice
 Type=simple
 User=faas-apid
 Group=faas
-# Binary is shipped by cd-controlplane.yml "Install binaries"
-# step (line 278: `install -m 0755 ... /opt/faas/bin/<bin>`).
 ExecStart=/opt/faas/bin/apid --config /etc/faas/apid.toml
 Restart=on-failure
 RestartSec=2s
-
-# apid lives inside the control-plane budget (spec §13 line 431). The 256M
-# ceiling covers Postgres connection + JSON marshalling bursts; the cp.slice
-# itself enforces the 6 GB total.
 Slice=faas-cp.slice
 MemoryMax=256M
-
-# apid binds ONLY loopback (127.0.0.1:8081) — gatewayd is the only public
-# listener (spec §11 single-public-listener invariant). The cap is left in
-# place because apid's tests boot a dev listener on :80 on some Macs and
-# we want the prod unit to survive that dev cycle unchanged.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-# DATABASE_URL carries the Postgres DSN; secrets live in /etc/faas/sealed.env
-# (gap G2 — sealed at rest, dec only by systemd EnvironmentFile).
-# Sign-in OAuth envs (issue #419 / ADR-046) — GOOGLE_CLIENT_ID +
-# GOOGLE_CLIENT_SECRET, GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET,
-# and the optional GOOGLE_REDIRECT_URI / GITHUB_REDIRECT_URI
-# overrides — also live in sealed.env. Half-set pairs cause apid
-# to refuse to boot; both-unset disables the provider (the consent
-# route returns 503 oauth_provider_unavailable and the dashboard
-# hides the button). See deploy/controlplane/README.md#oauth-sign-in-optional.
 EnvironmentFile=/etc/faas/sealed.env
-
-# Session signing key (security review A4). LoadCredential surfaces
-# /etc/faas/secrets/session.key inside the unit's credentials dir;
-# Environment reads it back into FAAS_SESSION_KEY so apid's existing
-# os.Getenv("FAAS_SESSION_KEY") loader path is unchanged. This keeps
-# the key out of /etc/faas/sealed.env — every other control-plane
-# daemon reads sealed.env but does NOT read this credential, so the
-# 32-byte key never enters their environment.
-LoadCredential=faas_session_key:/etc/faas/secrets/session.key
 Environment=FAAS_SESSION_KEY=%d/faas_session_key
-# Host age identity (IAM-2 / issue #186). apid reads the private
-# half of the host X25519 key to unseal TOTP secrets during
-# /verify + /confirm + /recover + /disable. The on-disk file is
-# /etc/faas/secrets/host.age, mode 0400 root:root (spec §11, per
-# pkg/secretbox/hostkey.go:138 GenerateAndSaveHostKey); apid does
-# NOT open the on-disk file directly — systemd copies it into the
-# unit's credential dir (owned by faas-apid:faas) under the
-# %d/faas_host_age_identity path. Without this env var the MFA
-# handlers 503 CodeCapacity and every mfa_pending session locks
-# the customer out indefinitely.
-LoadCredential=faas_host_age_identity:/etc/faas/secrets/host.age
-# Rotation overlap (issue #316 / ADR-057): when the operator runs
-# `gregale host-age rotate --commit`, the previous host.age is
-# atomically renamed to host.age.previous. apid loads BOTH
-# identities via secretbox.LoadHostKeys(dir) so MFA envelopes
-# sealed under either key unseal during the 30-day overlap window.
-# This second LoadCredential= is the unit-file side of that
-# decouple: systemd copies host.age.previous into the unit's
-# credential dir as a sibling of the current credential. systemd
-# does NOT auto-create the file — it just materialises what's on
-# disk — so this is a no-op pre-rotation.
-LoadCredential=faas_host_age_identity_previous:-/etc/faas/secrets/host.age.previous
 Environment=FAAS_HOST_AGE_IDENTITY_PATH=%d/faas_host_age_identity
-
-# Wave 0 PR-C / ADR-047: stateless-advisory gRPC listener (vmmd
-# dials /run/faas/apid.sock to forward guest-init fanotify
-# batches). Empty disables — explicitly set here so the
-# runtime default isn't relied on; the ansible provisioner
-# creates /run/faas mode 0750 group `faas` and the apid unit
-# owns the socket at 0660.
 Environment=FAAS_APID_ADVISORY_SOCK=/run/faas/apid.sock
-
-# Hardening baseline.
+Environment=FAAS_STATUSPAGE_PATH=/etc/faas/statuspage/index.html
+LoadCredential=faas_session_key:/etc/faas/secrets/session.key
+LoadCredential=faas_host_age_identity:/etc/faas/secrets/host.age
+LoadCredential=faas_host_age_identity_previous:-/etc/faas/secrets/host.age.previous
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

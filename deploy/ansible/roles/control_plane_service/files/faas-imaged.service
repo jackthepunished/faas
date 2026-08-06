@@ -1,43 +1,21 @@
 [Unit]
 Description=onebox-faas imaged — image/snapshot orchestrator (spec §4.6, ADR-003, ADR-005)
 Documentation=https://docs.gregale.dev/ops/imaged
-After=network.target postgresql.service faas-vmmd.service faas-cp.slice
-Wants=faas-vmmd.service faas-cp.slice
-Requires=postgresql.service
+After=network.target faas-cp.slice faas-vmmd.service
+Wants=faas-cp.slice faas-vmmd.service
 
 [Service]
 Type=simple
 User=faas-imaged
 Group=faas
-# Binary is shipped by the ansible bootstrap step (this role's
-# `tasks/main.yml` invokes `install -m 0755 ... /opt/faas/bin/<bin>`
-# from the builder tarball; cd-controlplane.yml line 278 does the
-# same on the cd path).
 ExecStart=/opt/faas/bin/imaged --config /etc/faas/imaged.toml
 Restart=on-failure
 RestartSec=2s
-
-# imaged owns OCI pulls + app-layer ext4 build (mkfs.ext4 -d inside the
-# shared exec runner, ADR-003). 1 GB is enough for image-decompression
-# spikes; cp.slice enforces the 6 GB total.
 Slice=faas-cp.slice
 MemoryMax=1G
-
+CapabilityBoundingSet=cap_chown cap_dac_override cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_net_bind_service cap_sys_chroot
 EnvironmentFile=/etc/faas/sealed.env
-
-# imaged → vmmd parent-ref overlay mount (ADR-053) is done locally by
-# imaged via exec.Command("mount", "-t", "overlay", …). The child mount
-# process inherits imaged's caps; with User=faas-imaged + no ambient
-# caps, CapEff=0 in the child and mount(8) returns "must be superuser
-# to use mount" (run 31121004495 + ongoing crash-loops). The cap is
-# already in CapabilityBoundingSet (full set, inherited from the
-# default systemd unit); promoting it to AmbientCapabilities lets the
-# non-root user actually USE it without expanding the bounding set.
-# NoNewPrivileges=yes is preserved (caps are ambient at fork time, no
-# setuid binary involved). Scoped to cap_sys_admin only — no other
-# ambient cap is granted.
-AmbientCapabilities=cap_sys_admin
-
+Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -46,29 +24,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ReadOnlyPaths=/etc/faas
-# ProtectSystem=strict makes everything read-only except these. imaged writes:
-#   /srv/fc        — the FAAS_STORAGE_ROOT parent; the subdirs (snap/,
-#                    base/, sigs/, layers/, kernel/) live under it.
-#                    Whitelisting /srv/fc/ itself is the belt-and-braces
-#                    against any code path that creates a file at the root
-#                    (a regression of this exact shape crash-looped imaged
-#                    on the EX44 in 2026-07-31, runs 30626694333 +
-#                    30650464753 — the storage: local Put's atomic-rename
-#                    temp landed at /srv/fc/<tmp> under ProtectSystem=strict
-#                    + ReadWritePaths on the subdirs only; EROFS). Each
-#                    subdir remains individually whitelisted so the path
-#                    granularity stays auditable.
-#   /srv/fc/snap   — snapshots
-#   /srv/fc/base   — base ext4 images (staged at startup, EnsureBaseExt4)
-#   /srv/fc/sigs   — ADR-038 build attestations, written as sigs/<key>.sig
-#                    under FAAS_STORAGE_ROOT by the cosign signer
-#   /var/log/faas  — slog handler
-#   /var/spool/faas — staging scratch
-# A path missing here does not fail at startup — it fails later, mid-build,
-# as "mkdir /srv/fc/<dir>: read-only file system", which reads like a disk
-# fault rather than a unit-file gap. /srv/fc/sigs was missed when ADR-038
-# landed and crash-looped imaged on the DO box.
-ReadWritePaths=/srv/fc /srv/fc/snap /srv/fc/base /srv/fc/sigs /srv/fc/layers /srv/fc/kernel /var/log/faas /var/spool/faas
+ReadWritePaths=/srv/fc/snap /srv/fc/base /srv/fc/sigs /var/log/faas /var/spool/faas /dev/shm/faas-base-staging
 
 [Install]
 WantedBy=multi-user.target

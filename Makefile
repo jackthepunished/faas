@@ -109,6 +109,24 @@ proto-normalize: proto
 	    "$$f" && rm -f "$$f.bak"; \
 	done
 
+# DEPLOY-2 (issue #649 / ADR-078): pkg/daemonunit + pkg/daemonunitspec
+# generate the systemd unit files for the 8 production daemons +
+# faas-cp.slice + deploy/etc/daemons.json. The CI gate runs
+# `make generate-check` on every PR; modifications to
+# pkg/daemonunitspec/<daemon>.go require running `make generate`
+# locally and committing the regenerated trees.
+.PHONY: generate
+generate: ## (re)generate systemd unit files + daemons.json from pkg/daemonunitspec (ADR-078)
+	$(GO) run ./cmd/deployctl/ generate
+
+.PHONY: generate-check
+generate-check: ## CI gate: assert generated == committed for the 3 deploy trees + daemons.json
+	$(GO) run ./cmd/deployctl/ check
+
+.PHONY: generate-diff
+generate-diff: ## Print drift between generated and committed (no exit 1)
+	$(GO) run ./cmd/deployctl/ diff
+
 .PHONY: test
 test: ## Unit tests — must pass on any machine, no KVM needed.
 	# -timeout=18m: ./cmd/e2e under -race walks pkg/e2etest.buildApid
