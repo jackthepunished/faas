@@ -68,7 +68,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// `--no-allow-unauthenticated` shape).
 			RequireAuthn: false,
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
-			KeysMax: 3},
+			KeysMax: 3,
+			// Issue #667 / ADR-078: tail primitive on with floor timeout.
+			TailEnabled: true, TailTimeoutS: 5, TailCapMax: 16, ConcurrentTailsPerInstance: 4},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -131,7 +133,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// posture-change shape as Free.
 			RequireAuthn: false,
 			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
-			KeysMax: 10},
+			KeysMax: 10,
+			// Issue #667 / ADR-078: tail primitive on at 15 s.
+			TailEnabled: true, TailTimeoutS: 15, TailCapMax: 16, ConcurrentTailsPerInstance: 16},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -186,7 +190,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// per-app require_authn opt-in unlocks.
 			RequireAuthn: true,
 			// Issue #189 / IAM-5: Pro = 50 keys (2 per app across 25 apps).
-			KeysMax: 50},
+			KeysMax: 50,
+			// Issue #667 / ADR-078: tail primitive on at 30 s.
+			TailEnabled: true, TailTimeoutS: 30, TailCapMax: 16, ConcurrentTailsPerInstance: 64},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -246,7 +252,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// available, column default still false.
 			RequireAuthn: true,
 			// Issue #189 / IAM-5: Scale = 200 keys (2 per app across 100 apps).
-			KeysMax: 200},
+			KeysMax: 200,
+			// Issue #667 / ADR-078: tail primitive on at 60 s.
+			TailEnabled: true, TailTimeoutS: 60, TailCapMax: 16, ConcurrentTailsPerInstance: 256},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -951,6 +959,145 @@ func TestPlanStreaming(t *testing.T) {
 	for _, c := range rwCases {
 		if got := c.plan.ResponseWriteTimeout(); got != c.want {
 			t.Errorf("%s.ResponseWriteTimeout() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanTail pins the per-plan matrix for the waitUntil
+// post-response tail primitive (issue #667 / ADR-078). Every plan
+// unlocks the primitive (TailEnabled = true), with the per-plan
+// TailTimeoutS / TailCapMax / ConcurrentTailsPerInstance values
+// pinned verbatim from the issue's "Rules" section:
+//
+//   Free   5s  / 16 cap / 4 concurrent
+//   Hobby 15s  / 16 cap / 16 concurrent
+//   Pro   30s  / 16 cap / 64 concurrent
+//   Scale 60s  / 16 cap / 256 concurrent
+//
+// The structural TailCapMax = 16 is a single source of truth — the
+// accessor returns the constant regardless of the field value, so
+// the cap is enforced even if a future plan row accidentally drops
+// it. TailTimeoutSeconds clamps up to TailTimeoutFloorSeconds (5 s)
+// for any plan whose row is unset / below the floor; this guarantees
+// the reaper's park-watchdog can never be shorter than the per-plan
+// timeout. Unknown plans fail closed on the boolean + integer
+// accessors (return false / 0) but fall back to the floor on
+// TailTimeoutSeconds.
+func TestPlanTail(t *testing.T) {
+	enabledCases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, true},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		// Unknown plans fail closed (return false) — same contract
+		// as StreamingEnabled / WarmSnapshotEnabled / RequireAuthn.
+		{Plan("unknown"), false},
+	}
+	for _, c := range enabledCases {
+		if got := c.plan.TailEnabled(); got != c.want {
+			t.Errorf("%s.TailEnabled() = %v, want %v", c.plan, got, c.want)
+		}
+		if got := c.plan.TailAllowed(); got != c.want {
+			t.Errorf("%s.TailAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+
+	timeoutCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 5},
+		{PlanHobby, 15},
+		{PlanPro, 30},
+		{PlanScale, 60},
+		// Unknown plans fall back to the floor — the
+		// ParkTailDrainTimeoutSeconds (5 s) watchdog must always
+		// be able to drain a tail mid-task.
+		{Plan("unknown"), TailTimeoutFloorSeconds},
+	}
+	for _, c := range timeoutCases {
+		if got := c.plan.TailTimeoutSeconds(); got != c.want {
+			t.Errorf("%s.TailTimeoutSeconds() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	// TailCapMax is structural — the accessor returns the constant
+	// regardless of the plan row's field. Pin every plan to 16
+	// (the issue's single source of truth).
+	capMaxCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, TailCapMax},
+		{PlanHobby, TailCapMax},
+		{PlanPro, TailCapMax},
+		{PlanScale, TailCapMax},
+		{Plan("unknown"), TailCapMax},
+	}
+	for _, c := range capMaxCases {
+		if got := c.plan.TailCapMax(); got != c.want {
+			t.Errorf("%s.TailCapMax() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	concurrentCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 4},
+		{PlanHobby, 16},
+		{PlanPro, 64},
+		{PlanScale, 256},
+		// Unknown plans fail closed (return 0) — same contract
+		// as the boolean accessors above.
+		{Plan("unknown"), 0},
+	}
+	for _, c := range concurrentCases {
+		if got := c.plan.ConcurrentTailsPerInstance(); got != c.want {
+			t.Errorf("%s.ConcurrentTailsPerInstance() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	// Pin the structural constants themselves so a future refactor
+	// cannot silently move them.
+	if TailCapMax != 16 {
+		t.Errorf("TailCapMax = %d, want 16 (issue #667 single source of truth)", TailCapMax)
+	}
+	if TailTimeoutFloorSeconds != 5 {
+		t.Errorf("TailTimeoutFloorSeconds = %d, want 5 (matches ParkTailDrainTimeoutSeconds)", TailTimeoutFloorSeconds)
+	}
+	if ParkTailDrainTimeoutSeconds != TailTimeoutFloorSeconds {
+		t.Errorf("ParkTailDrainTimeoutSeconds = %d, must equal TailTimeoutFloorSeconds (%d) so the watchdog is never shorter than the shortest per-plan timeout",
+			ParkTailDrainTimeoutSeconds, TailTimeoutFloorSeconds)
+	}
+}
+
+// TestPlanTailTimeoutClamp pins the clamp-up behaviour on
+// TailTimeoutSeconds (issue #667 / ADR-078 §"Why the host ships
+// entropy" parallel): a buggy planLimits entry that drops below
+// the floor is clamped up by Plan.TailTimeoutSeconds() so the
+// reaper's 5 s park-watchdog always has at least a chance to drain
+// the tail before force-park. The accessor is the only entry point
+// used by schedd / apid / runner, so the clamp is the load-bearing
+// invariant — a regression here would let a runaway tail hold a
+// wake open past the watchdog ceiling.
+func TestPlanTailTimeoutClamp(t *testing.T) {
+	// Confirm the floor is non-zero (otherwise the clamp is a no-op
+	// and the watchdog contract breaks).
+	if TailTimeoutFloorSeconds <= 0 {
+		t.Fatalf("TailTimeoutFloorSeconds = %d, must be > 0 so the watchdog always has drain headroom", TailTimeoutFloorSeconds)
+	}
+
+	// All four known plans must return >= the floor (the per-plan
+	// values 5/15/30/60 are all strictly >= the 5 s floor, but the
+	// clamp guards against future regressions).
+	for _, p := range Plans {
+		if got := p.TailTimeoutSeconds(); got < TailTimeoutFloorSeconds {
+			t.Errorf("%s.TailTimeoutSeconds() = %d, must be >= TailTimeoutFloorSeconds (%d)",
+				p, got, TailTimeoutFloorSeconds)
 		}
 	}
 }
