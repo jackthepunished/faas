@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -398,7 +399,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// coverage pass can wrap pgxpool.Acquire errors in a
 		// way that breaks errors.Is unwrapping; the ctx.Err()
 		// side is the canonical "did the caller cancel" signal.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil || strings.Contains(err.Error(), context.Canceled.Error()) {
 			return nil
 		}
 		return fmt.Errorf("schedd: router refresh subscribe: %w", err)

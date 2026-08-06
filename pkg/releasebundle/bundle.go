@@ -110,7 +110,7 @@ func Write(root string, manifest Manifest) error {
 		return fmt.Errorf("releasebundle: create manifest temp: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := tmp.Chmod(0o644); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("releasebundle: chmod manifest temp: %w", err)

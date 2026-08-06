@@ -45,7 +45,7 @@ func (c *Controller) Deploy(ctx context.Context, releaseID string) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	releaseRoot := filepath.Join(c.config.ReleasesRoot, releaseID)
 	manifest, err := releasebundle.Read(releaseRoot)
@@ -94,22 +94,22 @@ func (c *Controller) rollback(ctx context.Context, releaseID, previous string, c
 	}
 	previousManifest, err := releasebundle.Read(previous)
 	if err != nil {
-		return fmt.Errorf("deploycontroller: release %q failed; read rollback release: %v: %w", releaseID, err, cause)
+		return fmt.Errorf("deploycontroller: release %q failed; read rollback release: %w: %w", releaseID, err, cause)
 	}
 	if err := releasebundle.Verify(previous, previousManifest); err != nil {
-		return fmt.Errorf("deploycontroller: release %q failed; verify rollback release: %v: %w", releaseID, err, cause)
+		return fmt.Errorf("deploycontroller: release %q failed; verify rollback release: %w: %w", releaseID, err, cause)
 	}
 	if err := c.runtime.Activate(ctx, previous); err != nil {
-		return fmt.Errorf("deploycontroller: release %q failed; activate rollback: %v: %w", releaseID, err, cause)
+		return fmt.Errorf("deploycontroller: release %q failed; activate rollback: %w: %w", releaseID, err, cause)
 	}
 	if err := activatePointer(c.config.CurrentPath, previous); err != nil {
-		return fmt.Errorf("deploycontroller: release %q failed; publish rollback: %v: %w", releaseID, err, cause)
+		return fmt.Errorf("deploycontroller: release %q failed; publish rollback: %w: %w", releaseID, err, cause)
 	}
 	if err := c.runtime.Restart(ctx, previousManifest); err != nil {
-		return fmt.Errorf("deploycontroller: release %q failed; restart rollback: %v: %w", releaseID, err, cause)
+		return fmt.Errorf("deploycontroller: release %q failed; restart rollback: %w: %w", releaseID, err, cause)
 	}
 	if err := c.runtime.Healthy(ctx, previousManifest); err != nil {
-		return fmt.Errorf("deploycontroller: release %q failed; rollback unhealthy: %v: %w", releaseID, err, cause)
+		return fmt.Errorf("deploycontroller: release %q failed; rollback unhealthy: %w: %w", releaseID, err, cause)
 	}
 	return fmt.Errorf("deploycontroller: release %q rolled back: %w", releaseID, cause)
 }
@@ -145,7 +145,7 @@ func activatePointer(path, releaseRoot string) error {
 		return fmt.Errorf("create pointer temp: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := tmp.Close(); err != nil {
 		return err
 	}

@@ -251,7 +251,7 @@ func installAtomic(source, destination string, mode fs.FileMode) error {
 		return err
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := tmp.Chmod(mode.Perm()); err != nil {
 		_ = tmp.Close()
 		return err
