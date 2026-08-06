@@ -290,6 +290,16 @@ func TestOrgMembersLimits_DerivedFromLadder(t *testing.T) {
 		PlanPro:   {members: 50, pending: 25},
 		PlanScale: {members: 200, pending: 100},
 	}
+	// Surface unannounced plans: a future contributor who adds a fifth
+	// plan row to api.Plans without also filling `want` here must hit a
+	// red test, not silently inherit the zero-value {0, 0} Free
+	// posture. The map-keyed assertion below already catches missing
+	// rows when iterating, but this explicit count check makes the
+	// tripwire loud.
+	if len(want) != len(Plans) {
+		t.Fatalf("derived ladder test out of sync: want %d plans, api.Plans has %d — update both lists together",
+			len(want), len(Plans))
+	}
 	for _, p := range Plans {
 		t.Run(string(p), func(t *testing.T) {
 			w := want[p]

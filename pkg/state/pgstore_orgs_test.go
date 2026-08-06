@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -865,5 +866,96 @@ func TestPgStore_CountActiveOrgMembers_RemovedFiltered(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("CountActiveOrgMembers = %d, want 2 (owner + kept, gone filtered)", n)
+	}
+}
+
+// TestPgStore_AddOrgMember_ConcurrentCap is the tripwire for the
+// cap check's race-safety (IAM-6 / ADR-061 PR 2). Hobby's cap is
+// 10; we fire 15 parallel AddOrgMember calls on a fresh org and
+// assert that exactly 10 succeed and exactly 5 fail with
+// ErrOrgMemberCapExceeded. A future regression that drops the
+// tx-scoped count (or relies on the partial unique index alone)
+// will surface here as `>10` successes.
+//
+// The test only exercises the cap check's isolation, not the
+// insert path's uniqueness — distinct account ids are pre-seeded
+// so the unique constraint never trips. The first add (active > 0
+// carve-out) is the alice-equivalent owner seed; the cap check
+// trips from the 11th caller onward.
+func TestPgStore_AddOrgMember_ConcurrentCap(t *testing.T) {
+	s := newPgStore(t)
+	pool := s.pool
+	ctx := context.Background()
+
+	const (
+		cap       = 10
+		callers   = cap + 5 // over-cap requests that must fail
+		planLabel = "hobby"
+	)
+
+	// Seed the org + plan + (cap+5) accounts.
+	o, err := s.CreateOrg(ctx, newTestOrg("cap-race"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `update orgs set plan = $1 where id = $2`, planLabel, o.ID); err != nil {
+		t.Fatalf("update plan: %v", err)
+	}
+	ids := make([]string, callers)
+	for i := 0; i < callers; i++ {
+		ids[i] = fmt.Sprintf("00000000-0000-0000-0000-%012x", 0xcd0000+i)
+	}
+	pgStoreSeedAccounts(t, ctx, pool, ids...)
+
+	// Fire all AddOrgMember calls in parallel. Each gets its own
+	// derived context so a slow caller can't block the others;
+	// t.Cleanup cancels all on test exit.
+	results := make([]error, callers)
+	start := make(chan struct{})
+	cleanup := make([]context.CancelFunc, callers)
+	for i := range ids {
+		cc, cancel := context.WithCancel(ctx)
+		cleanup[i] = cancel
+		go func(i int) {
+			<-start
+			results[i] = s.AddOrgMember(cc, o.ID, ids[i], OrgRoleDeveloper, nil)
+		}(i)
+	}
+	close(start) // release all goroutines simultaneously
+	for _, cancel := range cleanup {
+		cancel()
+	}
+
+	var success, capExceeded, other int
+	for _, err := range results {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrOrgMemberCapExceeded):
+			capExceeded++
+		default:
+			other++
+			t.Errorf("unexpected error: %v", err)
+		}
+	}
+	if other > 0 {
+		t.Fatalf("%d callers returned non-cap errors; concurrent insert is unsafe", other)
+	}
+	if success != cap {
+		t.Errorf("successes = %d, want %d (concurrent-cap race: cap is non-atomic)", success, cap)
+	}
+	if capExceeded != callers-cap {
+		t.Errorf("cap-exceeded = %d, want %d", capExceeded, callers-cap)
+	}
+
+	// Sanity: the store-side count agrees with the test's
+	// observation. If a regression returns the right error count
+	// but somehow doubled the inserts, this trips.
+	n, err := s.CountActiveOrgMembers(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("CountActiveOrgMembers: %v", err)
+	}
+	if n != cap {
+		t.Errorf("active members = %d, want %d (inserts raced past the cap)", n, cap)
 	}
 }

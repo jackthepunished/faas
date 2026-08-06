@@ -883,24 +883,30 @@ func TestE2E_OrgLifecycle_ListOrgsForCaller_PersonalSlugPin(t *testing.T) {
 
 // TestE2E_OrgLifecycle_MemberCap is the wire-level tripwire for the
 // per-plan OrgMembersMax + OrgPendingInvitationsMax caps populated in
-// PR 2 (issue #190 / IAM-6 / ADR-061). The Hobby ladder pins 10
-// members + 5 pending invitations (limits_test.go is the source of
-// truth — if those values ever change this test must change with
-// them). The store-side cap check inside ConsumeOrgInvitation
-// (pkg/state/pgstore.go:11436) is the load-bearing invariant —
-// the handler-side enforceMemberCap is the symmetric back-stop.
+// PR 2 (issue #190 / IAM-6 / ADR-061). The ladder — Free 0/0,
+// Hobby 10/5, Pro 50/25, Scale 200/100 — is the source of truth
+// in `pkg/api/limits.go` (regression-pinned by
+// TestOrgMembersLimits_DerivedFromLadder); if those values ever
+// change, the table below must change with them. The store-side
+// cap check inside ConsumeOrgInvitation (pkg/state/pgstore.go) is
+// the load-bearing invariant — the handler-side enforceMemberCap is
+// the symmetric back-stop.
 //
-// Three assertions:
+// Five assertions per plan:
 //  1. Filling the member cap via invite-accept succeeds exactly
 //     `limit` times; the limit+1 accept fails inside the tx.
 //  2. Soft-removing one member drops the active count back under
 //     the cap; a subsequent accept succeeds.
 //  3. Issuing `OrgPendingInvitationsMax` pending invitations
 //     succeeds; the next POST /v1/orgs/{slug}/members returns 403
-//     org_invitation_cap_exceeded with the closed wire shape.
+//     org_invitation_cap_exceeded with the closed wire shape
+//     (limit + observed fields populated).
 //
-// Asserts skip if Postgres is unavailable (pgtest.Open returns nil)
-// so unit-only CI hosts don't fail.
+// Skipped if Postgres is unavailable (pgtest.Open returns nil) so
+// unit-only CI hosts don't fail. Each plan runs as its own subtest
+// against a fresh alice account + fresh org slug to keep the
+// fixtures isolated — sharing one alice would trip the partial
+// unique index on (org_id, account_id).
 func TestE2E_OrgLifecycle_MemberCap(t *testing.T) {
 	pool := pgtest.Open(t)
 	if pool == nil {
@@ -911,179 +917,202 @@ func TestE2E_OrgLifecycle_MemberCap(t *testing.T) {
 	}
 	h := e2etest.Start(t, pool, e2etest.APID)
 	ctx := context.Background()
-
-	aliceKey := h.SeedAccount(ctx, api.PlanHobby, "pr5-cap")
 	store := state.NewPgStore(pool)
 
-	const (
-		orgSlug         = "cap-test"
-		hobbyMembersMax = 10
-		hobbyInvitesMax = 5
-		// extraMembers = members beyond alice (the owner). alice is
-		// already one active membership, so the cap lets us add
-		// (limit - 1) more.
-		extraMembers = hobbyMembersMax - 1
-	)
-
-	// 1. Create the shared org as alice. createSharedOrg stamps
-	// the org with PlanFree by default — we then patch the plan
-	// to Hobby via the Store so the cap is 10 (Free would be 0
-	// and refuse every subsequent add).
-	raw, status := doReq(t, h, aliceKey, http.MethodPost, "/v1/orgs",
-		api.CreateOrgRequest{Slug: orgSlug, Name: "Cap Test"})
-	if status != http.StatusCreated {
-		t.Fatalf("create org: %d %s", status, raw)
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(raw, &created); err != nil {
-		t.Fatalf("decode create: %v (body=%s)", err, raw)
-	}
-	orgID := created.ID
-	if err := store.UpdateOrgPlan(ctx, orgID, api.PlanHobby); err != nil {
-		t.Fatalf("UpdateOrgPlan hobby: %v", err)
-	}
-
-	// 2. Fill the cap. PR 5 hasn't shipped the POST /v1/invitations
-	// /{token}/accept endpoint yet, so we drive the accept side
-	// through the Store — same code path the future wire handler
-	// will use, so the store-side cap check is the one under test.
-	//
-	// seedAcceptor inserts a fresh account row (the schema's
-	// accounts.id FK on org_memberships) and returns the seeded
-	// id + email so each ConsumeOrgInvitation call has its own
-	// unique target.
-	seedAcceptor := func(t *testing.T, i int) (state.Account, error) {
+	// limitsFor must be readable here without an org fixture — the
+	// plan policy is global, so asking for Hobby/Pro/Scale caps
+	// before creating any org is fine.
+	mustLimits := func(t *testing.T, plan api.Plan) (members, pending int) {
 		t.Helper()
-		id := fmt.Sprintf("00000000-0000-0000-0000-%012x", i)
-		email := fmt.Sprintf("cap-%d@x.com", i)
-		if _, err := pool.Exec(ctx,
-			"insert into accounts (id, email, plan, created_at) values ($1::uuid, $2, 'free', now()) on conflict do nothing",
-			id, email); err != nil {
-			return state.Account{}, fmt.Errorf("seed acceptor %d: %w", i, err)
+		l, ok := api.LimitsFor(plan)
+		if !ok {
+			t.Fatalf("api.LimitsFor(%s) missing — limits_test.go out of sync", plan)
 		}
-		return state.Account{ID: id, Email: email}, nil
-	}
-	mintInvitation := func(t *testing.T, suffix string, email string) []byte {
-		t.Helper()
-		plaintext := make([]byte, 32)
-		if _, err := rand.Read(plaintext); err != nil {
-			t.Fatalf("rand.Read: %v", err)
-		}
-		// Mangle the last byte with the suffix index so distinct
-		// suffixes never collide on (org_id, token_hash) — the
-		// token_hash column is UNIQUE per row.
-		plaintext[len(plaintext)-1] = byte(suffix[0])
-		hash := sha256.Sum256(plaintext)
-		if _, err := store.CreateOrgInvitation(ctx, state.OrgInvitation{
-			OrgID:     orgID,
-			Email:     email,
-			Role:      state.OrgRoleDeveloper,
-			TokenHash: hash[:],
-			ExpiresAt: time.Now().Add(time.Hour),
-		}); err != nil {
-			t.Fatalf("CreateOrgInvitation %s: %v", suffix, err)
-		}
-		return hash[:]
+		return l.OrgMembersMax, l.OrgPendingInvitationsMax
 	}
 
-	for i := 0; i < extraMembers; i++ {
-		acct, err := seedAcceptor(t, i+1) //nolint:gosec // test-only fixture offset
-		if err != nil {
-			t.Fatalf("seed acceptor: %v", err)
-		}
-		tokenHash := mintInvitation(t, fmt.Sprintf("m%d", i), acct.Email) //nolint:gosec // test-only fixture suffix
-		if _, _, err := store.ConsumeOrgInvitation(ctx, tokenHash, acct); err != nil {
-			t.Fatalf("ConsumeOrgInvitation %d (under cap): %v", i, err)
-		}
-	}
-	// Assert active count = limit (alice + extraMembers).
-	active, err := store.CountActiveOrgMembers(ctx, orgID)
-	if err != nil {
-		t.Fatalf("CountActiveOrgMembers: %v", err)
-	}
-	if active != hobbyMembersMax {
-		t.Fatalf("active members = %d, want %d", active, hobbyMembersMax)
-	}
+	plans := []api.Plan{api.PlanHobby, api.PlanPro, api.PlanScale}
+	for _, plan := range plans {
+		t.Run(string(plan), func(t *testing.T) {
+			membersMax, invitesMax := mustLimits(t, plan)
+			orgSlug := fmt.Sprintf("cap-%s", plan)
+			aliceLabel := fmt.Sprintf("pr5-cap-%s", plan)
+			aliceKey := h.SeedAccount(ctx, plan, aliceLabel)
 
-	// 3. limit+1th accept must trip the cap inside the tx.
-	overAcct, err := seedAcceptor(t, extraMembers+1) //nolint:gosec // test-only fixture offset
-	if err != nil {
-		t.Fatalf("seed over-cap acceptor: %v", err)
-	}
-	overHash := mintInvitation(t, "over", overAcct.Email)
-	if _, _, err := store.ConsumeOrgInvitation(ctx, overHash, overAcct); !errors.Is(err, state.ErrOrgMemberCapExceeded) {
-		t.Fatalf("over-cap ConsumeOrgInvitation: err = %v, want ErrOrgMemberCapExceeded", err)
-	}
-	// Confirm the over-cap invite did NOT add a membership row.
-	row, err := store.OrgMemberByAccount(ctx, orgID, overAcct.ID)
-	if err == nil {
-		t.Errorf("over-cap invite still produced membership row (role=%q)", row.Role)
-	} else if !errors.Is(err, state.ErrNotFound) {
-		t.Errorf("OrgMemberByAccount over-cap: err = %v, want ErrNotFound", err)
-	}
+			// 1. Create the shared org as alice. createSharedOrg
+			// stamps the org with PlanFree by default — patch the
+			// plan via the Store so the cap is the populated value
+			// (Free would be 0 and refuse every subsequent add).
+			// nolint:contextcheck // doReq uses context.Background() internally; threading ctx through the shared helper would touch 19 e2e files.
+			raw, status := doReq(t, h, aliceKey, http.MethodPost, "/v1/orgs",
+				api.CreateOrgRequest{Slug: orgSlug, Name: "Cap Test"})
+			if status != http.StatusCreated {
+				t.Fatalf("create org: %d %s", status, raw)
+			}
+			var created struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal(raw, &created); err != nil {
+				t.Fatalf("decode create: %v (body=%s)", err, raw)
+			}
+			orgID := created.ID
+			if err := store.UpdateOrgPlan(ctx, orgID, plan); err != nil {
+				t.Fatalf("UpdateOrgPlan %s: %v", plan, err)
+			}
 
-	// 4. Remove one of the loop's acceptors (index 1, the first
-	// non-alice member), then re-attempt the cap-blocked accept —
-	// should succeed because active dropped to (limit - 1).
-	firstID := fmt.Sprintf("00000000-0000-0000-0000-%012x", 1)
-	if err := store.RemoveOrgMember(ctx, orgID, firstID); err != nil {
-		t.Fatalf("RemoveOrgMember: %v", err)
-	}
-	if _, _, err := store.ConsumeOrgInvitation(ctx, overHash, overAcct); err != nil {
-		t.Fatalf("post-remove ConsumeOrgInvitation: %v", err)
-	}
-	active, err = store.CountActiveOrgMembers(ctx, orgID)
-	if err != nil {
-		t.Fatalf("CountActiveOrgMembers (post-remove): %v", err)
-	}
-	if active != hobbyMembersMax {
-		t.Errorf("active after re-add = %d, want %d", active, hobbyMembersMax)
-	}
+			// 2. Fill the cap. PR 5 hasn't shipped the POST
+			// /v1/invitations/{token}/accept endpoint yet, so we
+			// drive the accept side through the Store — same code
+			// path the future wire handler will use, so the
+			// store-side cap check is the one under test.
+			//
+			// seedAcceptor inserts a fresh account row (the
+			// schema's accounts.id FK on org_memberships) and
+			// returns the seeded id + email so each
+			// ConsumeOrgInvitation call has its own unique target.
+			// The id's high bytes are derived from the plan + index
+			// so a single e2e run (Pro=50 + Scale=100 = 150
+			// acceptors) doesn't collide on the (org_id, account_id)
+			// partial unique.
+			seedAcceptor := func(t *testing.T, i int) state.Account {
+				t.Helper()
+				planOffset := map[api.Plan]int{
+					api.PlanHobby: 0x000000000000,
+					api.PlanPro:   0x100000000000,
+					api.PlanScale: 0x200000000000,
+				}[plan]
+				id := fmt.Sprintf("00000000-0000-0000-%06x-%012x", planOffset>>24, i)
+				email := fmt.Sprintf("cap-%s-%d@x.com", plan, i)
+				if _, err := pool.Exec(ctx,
+					"insert into accounts (id, email, plan, created_at) values ($1::uuid, $2, 'free', now()) on conflict do nothing",
+					id, email); err != nil {
+					t.Fatalf("seed acceptor %d: %v", i, err)
+				}
+				return state.Account{ID: id, Email: email}
+			}
+			mintInvitation := func(t *testing.T, idx int, email string) []byte {
+				t.Helper()
+				plaintext := make([]byte, 32)
+				if _, err := rand.Read(plaintext); err != nil {
+					t.Fatalf("rand.Read: %v", err)
+				}
+				// Stamp a per-index discriminator into the last
+				// byte so distinct fixtures never collide on
+				// (org_id, token_hash) — the token_hash column is
+				// UNIQUE per row. Wrapping at 256 is fine because
+				// the cap fill loop is at most 199 (Scale - 1).
+				plaintext[len(plaintext)-1] = byte(idx)
+				hash := sha256.Sum256(plaintext)
+				if _, err := store.CreateOrgInvitation(ctx, state.OrgInvitation{
+					OrgID:     orgID,
+					Email:     email,
+					Role:      state.OrgRoleDeveloper,
+					TokenHash: hash[:],
+					ExpiresAt: time.Now().Add(time.Hour),
+				}); err != nil {
+					t.Fatalf("CreateOrgInvitation %d: %v", idx, err)
+				}
+				return hash[:]
+			}
 
-	// 5. Pending-invitation cap is enforced on POST /v1/orgs/{slug}
-	// /members via enforcePendingInvitationCap. The cap is 5 on
-	// Hobby; mint 5 pending invitations, then assert the 6th is
-	// rejected with the typed 403 wire shape.
-	for i := 0; i < hobbyInvitesMax; i++ {
-		body := api.InviteMemberRequest{
-			Email: fmt.Sprintf("inv-%d@x.com", i),
-			Role:  string(state.OrgRoleViewer),
-		}
-		raw, status := doReq(t, h, aliceKey, http.MethodPost,
-			"/v1/orgs/"+orgSlug+"/members", body,
-			map[string]string{"X-Active-Org": orgSlug})
-		if status != http.StatusCreated {
-			t.Fatalf("invite %d: %d %s", i, status, raw)
-		}
-	}
-	overBody := api.InviteMemberRequest{
-		Email: "inv-over@x.com",
-		Role:  string(state.OrgRoleViewer),
-	}
-	raw, status = doReq(t, h, aliceKey, http.MethodPost,
-		"/v1/orgs/"+orgSlug+"/members", overBody,
-		map[string]string{"X-Active-Org": orgSlug})
-	if status != http.StatusForbidden {
-		t.Fatalf("over-invitation cap: status = %d, want 403 (body=%s)", status, raw)
-	}
-	var prob struct {
-		Code     string `json:"code"`
-		Detail   string `json:"detail"`
-		Limit    int    `json:"limit"`
-		Observed int    `json:"observed"`
-	}
-	if err := json.Unmarshal(raw, &prob); err != nil {
-		t.Fatalf("decode problem: %v", err)
-	}
-	if prob.Code != "org_invitation_cap_exceeded" {
-		t.Errorf("problem code = %q, want org_invitation_cap_exceeded", prob.Code)
-	}
-	if prob.Limit != hobbyInvitesMax {
-		t.Errorf("problem limit = %d, want %d", prob.Limit, hobbyInvitesMax)
-	}
-	if prob.Observed != hobbyInvitesMax {
-		t.Errorf("problem observed = %d, want %d", prob.Observed, hobbyInvitesMax)
+			extraMembers := membersMax - 1 // alice is the first owner
+			for i := 0; i < extraMembers; i++ {
+				acct := seedAcceptor(t, i+1)
+				tokenHash := mintInvitation(t, i, acct.Email)
+				if _, _, err := store.ConsumeOrgInvitation(ctx, tokenHash, acct); err != nil {
+					t.Fatalf("ConsumeOrgInvitation %d (under cap): %v", i, err)
+				}
+			}
+			// Assert active count = limit (alice + extraMembers).
+			active, err := store.CountActiveOrgMembers(ctx, orgID)
+			if err != nil {
+				t.Fatalf("CountActiveOrgMembers: %v", err)
+			}
+			if active != membersMax {
+				t.Fatalf("active members = %d, want %d", active, membersMax)
+			}
+
+			// 3. limit+1th accept must trip the cap inside the tx.
+			overAcct := seedAcceptor(t, extraMembers+1)
+			overHash := mintInvitation(t, extraMembers+1, overAcct.Email)
+			if _, _, err := store.ConsumeOrgInvitation(ctx, overHash, overAcct); !errors.Is(err, state.ErrOrgMemberCapExceeded) {
+				t.Fatalf("over-cap ConsumeOrgInvitation: err = %v, want ErrOrgMemberCapExceeded", err)
+			}
+			// Confirm the over-cap invite did NOT add a membership row.
+			if _, err := store.OrgMemberByAccount(ctx, orgID, overAcct.ID); !errors.Is(err, state.ErrNotFound) {
+				t.Errorf("OrgMemberByAccount over-cap: err = %v, want ErrNotFound", err)
+			}
+
+			// 4. Remove one of the loop's acceptors (index 1, the
+			// first non-alice member), then re-attempt the cap-
+			// blocked accept — should succeed because active
+			// dropped to (limit - 1).
+			planOffset := map[api.Plan]int{
+				api.PlanHobby: 0x000000000000,
+				api.PlanPro:   0x100000000000,
+				api.PlanScale: 0x200000000000,
+			}[plan]
+			firstID := fmt.Sprintf("00000000-0000-0000-%06x-%012x", planOffset>>24, 1)
+			if err := store.RemoveOrgMember(ctx, orgID, firstID); err != nil {
+				t.Fatalf("RemoveOrgMember: %v", err)
+			}
+			if _, _, err := store.ConsumeOrgInvitation(ctx, overHash, overAcct); err != nil {
+				t.Fatalf("post-remove ConsumeOrgInvitation: %v", err)
+			}
+			active, err = store.CountActiveOrgMembers(ctx, orgID)
+			if err != nil {
+				t.Fatalf("CountActiveOrgMembers (post-remove): %v", err)
+			}
+			if active != membersMax {
+				t.Errorf("active after re-add = %d, want %d", active, membersMax)
+			}
+
+			// 5. Pending-invitation cap is enforced on POST
+			// /v1/orgs/{slug}/members via
+			// enforcePendingInvitationCap. Mint `invitesMax`
+			// pending invitations, then assert the next one is
+			// rejected with the typed 403 wire shape.
+			for i := 0; i < invitesMax; i++ {
+				body := api.InviteMemberRequest{
+					Email: fmt.Sprintf("inv-%s-%d@x.com", plan, i),
+					Role:  string(state.OrgRoleViewer),
+				}
+				// nolint:contextcheck // doReq uses context.Background() internally; threading ctx through the shared helper would touch 19 e2e files.
+				raw, status := doReq(t, h, aliceKey, http.MethodPost,
+					"/v1/orgs/"+orgSlug+"/members", body,
+					map[string]string{"X-Active-Org": orgSlug})
+				if status != http.StatusCreated {
+					t.Fatalf("invite %d: %d %s", i, status, raw)
+				}
+			}
+			overBody := api.InviteMemberRequest{
+				Email: fmt.Sprintf("inv-%s-over@x.com", plan),
+				Role:  string(state.OrgRoleViewer),
+			}
+			// nolint:contextcheck // doReq uses context.Background() internally; threading ctx through the shared helper would touch 19 e2e files.
+			raw, status = doReq(t, h, aliceKey, http.MethodPost,
+				"/v1/orgs/"+orgSlug+"/members", overBody,
+				map[string]string{"X-Active-Org": orgSlug})
+			if status != http.StatusForbidden {
+				t.Fatalf("over-invitation cap: status = %d, want 403 (body=%s)", status, raw)
+			}
+			var prob struct {
+				Code     string `json:"code"`
+				Limit    int    `json:"limit"`
+				Observed int    `json:"observed"`
+			}
+			if err := json.Unmarshal(raw, &prob); err != nil {
+				t.Fatalf("decode problem: %v", err)
+			}
+			if prob.Code != "org_invitation_cap_exceeded" {
+				t.Errorf("problem code = %q, want org_invitation_cap_exceeded", prob.Code)
+			}
+			if prob.Limit != invitesMax {
+				t.Errorf("problem limit = %d, want %d", prob.Limit, invitesMax)
+			}
+			if prob.Observed != invitesMax {
+				t.Errorf("problem observed = %d, want %d", prob.Observed, invitesMax)
+			}
+		})
 	}
 }

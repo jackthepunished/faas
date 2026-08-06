@@ -133,6 +133,14 @@ func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.Response
 // allows the new member; on exceed, writes the 403 Problem and
 // returns false. On Store failure, writes a 500 Problem and
 // returns false.
+//
+// Trade-off: the helper does NOT early-return on `limit <= 0` (the
+// pre-PR shape). It always reads CountActiveOrgMembers, which costs
+// one extra SQL query per invite on Free-tier requests even though
+// the cap will always refuse. We deliberately accept that cost to
+// keep the helper's behaviour uniform with enforcePendingInvitationCap
+// (and to make a future populated Free cap — unlikely, but possible —
+// a one-line constant change rather than a helper refactor).
 func (s *server) enforceMemberCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
 	limit := org.Plan.OrgMembersMax()
 	active, err := s.store.CountActiveOrgMembers(ctx, org.ID)
