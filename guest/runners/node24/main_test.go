@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/onebox-faas/faas/guest/runners/internal"
 	"github.com/onebox-faas/faas/guest/runners/internal/runnerparity"
 )
 
@@ -14,7 +15,12 @@ import (
 // actual `node` on PATH; the helper skips when missing.
 func TestHandle_RoundTrip(t *testing.T) {
 	fake := runnerparity.FakeNodeScript()
-	runnerparity.RunRoundTrip(t, fake, handle)
+	// PR 3 (issue #667 follow-up): wrap handle() with 0/empty
+	// tail-primitive args (feature disabled in the round-trip
+	// smoke test).
+	runnerparity.RunRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, _ int, _ string) {
+		handle(w, r, handlerPath, signal, 0, "")
+	})
 }
 
 // TestHeaderMap_LowercasesHTTP: §4.9 envelope uses lowercase header

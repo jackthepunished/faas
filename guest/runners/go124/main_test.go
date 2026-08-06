@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/base64"
 	"flag"
+	"net/http"
 	"testing"
 
+	"github.com/onebox-faas/faas/guest/runners/internal"
 	"github.com/onebox-faas/faas/guest/runners/internal/runnerparity"
 )
 
@@ -14,7 +16,15 @@ import (
 // and the helper never skips this test.
 func TestHandle_RoundTrip(t *testing.T) {
 	fake := runnerparity.FakeGoScript()
-	runnerparity.RunRoundTrip(t, fake, handle)
+	// PR 3 (issue #667 follow-up): the runner's `handle` signature
+	// grew tailWaitSec + tailPipePath args. Wrap handle() with the
+	// 6-arg signature the runnerparity.RunRoundTrip helper expects
+	// — 0/empty args = feature disabled (the existing fake scripts
+	// don't write to the tail pipe, so the round-trip smoke test
+	// is unchanged).
+	runnerparity.RunRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, _ int, _ string) {
+		handle(w, r, handlerPath, signal, 0, "")
+	})
 }
 
 // TestEnvelopeRoundTrip sanity-checks the JSON tags line up with §4.9,

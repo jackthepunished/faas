@@ -143,7 +143,29 @@ func (f FakeHandler) WriteMaterialize(t *testing.T) string {
 // path AND a RunnerSignal so the runner's per-package `handle`
 // signature (added an issue #470 / PR #470-FU-B fourth arg) stays
 // unchanged — production visibility of `handle` is preserved.
-func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal)) {
+// RunRoundTrip wires up an httptest.Server that delegates / to handler,
+// fires GET /hello?x=1, and asserts: status=200, X-Echo-Method=="GET",
+// X-Echo-Path=="/hello", body contains "echo:/hello". When
+// fake.Interpreter == []string{"node"}, the helper also asserts
+// Content-Type == "application/octet-stream" — node22's runtime
+// override (guest/runners/node22/main.go:102). All other runtimes
+// skip the Content-Type check; the python312/go124 runners pass through
+// the handler's Content-Type verbatim.
+//
+// The handler closure is invoked with the materialized handler script
+// path AND a RunnerSignal so the runner's per-package `handle`
+// signature (added an issue #470 / PR #470-FU-B fourth arg) stays
+// unchanged — production visibility of `handle` is preserved.
+//
+// PR 3 (issue #667 follow-up): the runner's `handle` signature
+// grew two new args (tailWaitSec, tailPipePath). The helper's
+// signature deliberately keeps the 4-arg shape so the 5
+// round-trip smoke tests don't need to know about the tail
+// primitive — the wrapper in each runner's main_test.go
+// bridges the signature change with 0/empty defaults (feature
+// disabled). See guest/runners/go124/main_test.go for the
+// pattern.
+func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal, int, string)) {
 	t.Helper()
 	script := fake.WriteMaterialize(t)
 
@@ -158,7 +180,7 @@ func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWrit
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handler(w, r, script, signal)
+		handler(w, r, script, signal, 0, "")
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

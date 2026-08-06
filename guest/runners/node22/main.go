@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/onebox-faas/faas/guest/runners/internal"
@@ -63,6 +64,11 @@ type envelope struct {
 	// tail (the handler's __faas_tail.js shim no-ops the waitUntil
 	// global, so legacy customer code keeps working). Per-request
 	// path under /tmp/faas-tail-<random>.jsonl (PR 3).
+	//
+	// PR 3 (issue #667 follow-up): the runner-side tail host is
+	// wired in tail_host_integration.go::drainTailHost. The drain
+	// runs after invokeHandler returns and before the response
+	// envelope is written.
 	TailPipePath string `json:"tail_pipe_path,omitempty"`
 }
 
@@ -95,6 +101,13 @@ func main() {
 		log.Fatalf("node22 runner: handler not found at %s: %v", *handlerPath, err)
 	}
 
+	// Issue #667 / ADR-078 (PR 3): per-request tail primitive
+	// knobs (FAAS_TAIL_WAIT_SEC = per-task ceiling, FAAS_TAIL_PIPE_PATH
+	// = JSONL pipe). Empty values = feature disabled. See
+	// tail_host_integration.go.
+	tailWaitSec := envIntDefault("FAAS_TAIL_WAIT_SEC", 0)
+	tailPipePath := os.Getenv("FAAS_TAIL_PIPE_PATH")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -107,7 +120,7 @@ func main() {
 	// after the handler's response envelope is parsed.
 	signal := internal.NewRunnerSignal("node22", time.Now())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handle(w, r, *handlerPath, signal)
+		handle(w, r, *handlerPath, signal, tailWaitSec, tailPipePath)
 	})
 
 	// Issue #460 / ADR-053 (PR-C): PORT env var carries the
@@ -136,15 +149,17 @@ func main() {
 // the first non-5xx response — 5xx is "framework still warming
 // up", not "ready to capture"). The RunnerSignal's sync.Once
 // collapses parallel calls into one.
-func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal) {
+func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	env := envelope{
-		Method:  r.Method,
-		Path:    r.URL.Path,
-		Headers: headerMap(r.Header),
-		Query:   r.URL.RawQuery,
-		BodyB64: base64.StdEncoding.EncodeToString(body),
+		Method:       r.Method,
+		Path:         r.URL.Path,
+		Headers:      headerMap(r.Header),
+		Query:        r.URL.RawQuery,
+		BodyB64:      base64.StdEncoding.EncodeToString(body),
+		WaitUntilSec: tailWaitSec,
+		TailPipePath: tailPipePath,
 	}
 
 	resp, err := invokeHandler(r.Context(), handlerPath, env)
@@ -153,6 +168,13 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *
 		http.Error(w, "handler error", http.StatusInternalServerError)
 		return
 	}
+	// Issue #667 / ADR-078 (PR 3): drain the tail pipe before
+	// writing the response. The customer's __faas_tail.js shim
+	// has already appended JSONL lines to env.TailPipePath
+	// during the handler's invocation window; the drain runs
+	// AFTER invokeHandler returns and BEFORE the response
+	// envelope is written to the wire.
+	drainTailHost(env, &resp)
 	for k, v := range resp.Headers {
 		w.Header().Set(k, v)
 	}
@@ -216,4 +238,21 @@ func headerMap(h http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// envIntDefault reads an env var as an int; returns fallback if
+// unset or malformed. Used for the per-plan tail primitive knobs
+// (FAAS_TAIL_WAIT_SEC). A malformed value falls back to 0
+// (feature disabled), which is the safe default per issue #667
+// / ADR-078.
+func envIntDefault(name string, fallback int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }

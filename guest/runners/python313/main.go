@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/onebox-faas/faas/guest/runners/internal"
@@ -68,6 +69,13 @@ func main() {
 		log.Fatalf("python313 runner: handler not found at %s: %v", *handlerPath, err)
 	}
 
+	// Issue #667 / ADR-078 (PR 3): per-request tail primitive
+	// knobs (FAAS_TAIL_WAIT_SEC = per-task ceiling, FAAS_TAIL_PIPE_PATH
+	// = JSONL pipe). Empty values = feature disabled. See
+	// tail_host_integration.go.
+	tailWaitSec := envIntDefault("FAAS_TAIL_WAIT_SEC", 0)
+	tailPipePath := os.Getenv("FAAS_TAIL_PIPE_PATH")
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -76,7 +84,7 @@ func main() {
 	// per wake when the runner's first non-5xx response lands.
 	signal := internal.NewRunnerSignal("python313", time.Now())
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handle(w, r, *handlerPath, signal)
+		handle(w, r, *handlerPath, signal, tailWaitSec, tailPipePath)
 	})
 
 	// Issue #460 / ADR-053 (PR-C): PORT env var carries the
@@ -94,15 +102,17 @@ func main() {
 	}
 }
 
-func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal) {
+func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
 	body, _ := io.ReadAll(r.Body)
 	_ = r.Body.Close()
 	env := envelope{
-		Method:  r.Method,
-		Path:    r.URL.Path,
-		Headers: headerMap(r.Header),
-		Query:   r.URL.RawQuery,
-		BodyB64: base64.StdEncoding.EncodeToString(body),
+		Method:       r.Method,
+		Path:         r.URL.Path,
+		Headers:      headerMap(r.Header),
+		Query:        r.URL.RawQuery,
+		BodyB64:      base64.StdEncoding.EncodeToString(body),
+		WaitUntilSec: tailWaitSec,
+		TailPipePath: tailPipePath,
 	}
 
 	resp, err := invokeHandler(r.Context(), handlerPath, env)
@@ -111,6 +121,9 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *
 		http.Error(w, "handler error", http.StatusInternalServerError)
 		return
 	}
+	// Issue #667 / ADR-078 (PR 3): drain the tail pipe before
+	// writing the response.
+	drainTailHost(env, &resp)
 	for k, v := range resp.Headers {
 		w.Header().Set(k, v)
 	}
@@ -168,4 +181,21 @@ func headerMap(h http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// envIntDefault reads an env var as an int; returns fallback if
+// unset or malformed. Used for the per-plan tail primitive knobs
+// (FAAS_TAIL_WAIT_SEC). A malformed value falls back to 0
+// (feature disabled), which is the safe default per issue #667
+// / ADR-078.
+func envIntDefault(name string, fallback int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }
