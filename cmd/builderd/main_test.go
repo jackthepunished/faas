@@ -68,6 +68,12 @@ func TestDefaultDeps_UsesEnvOverride(t *testing.T) {
 func TestRun_BadConfigPath(t *testing.T) {
 	deps := runDeps{
 		configPath: t.TempDir(), // a directory; not a regular file
+		// runWithDeps calls capCheck() before LoadConfig; the
+		// default is runtimecheck.MustCheckOnBoot which calls
+		// os.Exit(1) on any capdecl violation, killing the test
+		// binary before this assertion can fail with the expected
+		// config-path error. Stub the gate so we reach LoadConfig.
+		capCheck: func() error { return nil },
 	}
 	err := runWithDeps(context.Background(), discardLog(), deps)
 	if err == nil {
