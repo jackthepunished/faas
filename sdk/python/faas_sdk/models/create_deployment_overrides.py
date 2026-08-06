@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.create_deployment_overrides_env import CreateDeploymentOverridesEnv
     from ..models.create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
     from ..models.deployment_healthcheck import DeploymentHealthcheck
+    from ..models.deployment_liveness_probe import DeploymentLivenessProbe
 
 
 T = TypeVar("T", bound="CreateDeploymentOverrides")
@@ -52,10 +53,25 @@ class CreateDeploymentOverrides:
     """Listen port; 0 = absent / fall back to image default (today 8080)."""
     healthcheck: DeploymentHealthcheck | None | Unset = UNSET
     """Readiness-probe shape. Persisted today; the HTTP probe variant ships in a follow-up ADR."""
+    liveness_probe: DeploymentLivenessProbe | None | Unset = UNSET
+    """Liveness-probe override (issue #554 / ADR-078). The host (cmd/vmmd)
+    polls the guest's vsock 1028 STREAM on every `interval_s`; after
+    `consecutive_failures` consecutive non-2xx (or timeout / conn-refused)
+    responses, the VM is destroyed and schedd cold-boots it from rootfs
+    (per ADR-005 — never snapshot-restore). 3 restarts in 300 s
+    park the deployment.
+
+    Per-plan gates (issue #554): Free is locked out (Plan.LivenessAllowed()
+    returns false; the apid handler rejects with
+    `plan_liveness_probe_not_allowed` BEFORE the DB is touched); Hobby,
+    Pro, Scale inherit the 5 s / 3 consecutive / 60 s cooldown / 3 in 300 s
+    defaults. v1 is HTTP-only; gRPC health checks are deferred to v2.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
+        from ..models.deployment_liveness_probe import DeploymentLivenessProbe
 
         entrypoint: list[str] | Unset = UNSET
         if not isinstance(self.entrypoint, Unset):
@@ -83,6 +99,14 @@ class CreateDeploymentOverrides:
         else:
             healthcheck = self.healthcheck
 
+        liveness_probe: dict[str, Any] | None | Unset
+        if isinstance(self.liveness_probe, Unset):
+            liveness_probe = UNSET
+        elif isinstance(self.liveness_probe, DeploymentLivenessProbe):
+            liveness_probe = self.liveness_probe.to_dict()
+        else:
+            liveness_probe = self.liveness_probe
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -98,6 +122,8 @@ class CreateDeploymentOverrides:
             field_dict["port"] = port
         if healthcheck is not UNSET:
             field_dict["healthcheck"] = healthcheck
+        if liveness_probe is not UNSET:
+            field_dict["liveness_probe"] = liveness_probe
 
         return field_dict
 
@@ -106,6 +132,7 @@ class CreateDeploymentOverrides:
         from ..models.create_deployment_overrides_env import CreateDeploymentOverridesEnv
         from ..models.create_deployment_overrides_env_secrets import CreateDeploymentOverridesEnvSecrets
         from ..models.deployment_healthcheck import DeploymentHealthcheck
+        from ..models.deployment_liveness_probe import DeploymentLivenessProbe
 
         d = dict(src_dict)
         entrypoint = cast(list[str], d.pop("entrypoint", UNSET))
@@ -145,6 +172,23 @@ class CreateDeploymentOverrides:
 
         healthcheck = _parse_healthcheck(d.pop("healthcheck", UNSET))
 
+        def _parse_liveness_probe(data: object) -> DeploymentLivenessProbe | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                liveness_probe_type_0 = DeploymentLivenessProbe.from_dict(data)
+
+                return liveness_probe_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(DeploymentLivenessProbe | None | Unset, data)
+
+        liveness_probe = _parse_liveness_probe(d.pop("liveness_probe", UNSET))
+
         create_deployment_overrides = cls(
             entrypoint=entrypoint,
             cmd=cmd,
@@ -152,6 +196,7 @@ class CreateDeploymentOverrides:
             env_secrets=env_secrets,
             port=port,
             healthcheck=healthcheck,
+            liveness_probe=liveness_probe,
         )
 
         create_deployment_overrides.additional_properties = d

@@ -592,6 +592,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	bc := events.New()
 	engine.WithEvents(events.NewPlatform("schedd", store, log, ops, bc))
 
+	// Issue #554 / ADR-078 — per-deployment liveness-restart
+	// sliding window. The Engine calls RecordRestart on every
+	// DestroyForLivenessFailure; on the Nth restart in the
+	// window the same call flips the parent app to evicted_cold
+	// (audit kind instances.parked_liveness_exhausted). The
+	// Loop shares the same pointer via WithLivenessWindow so
+	// future periodic cleanup has the same ring the engine
+	// already writes to.
+	livenessWindow := sched.NewLivenessWindow(
+		time.Duration(api.DefaultLivenessWindowSeconds)*time.Second,
+		api.DefaultLivenessMaxRestarts,
+	)
+	engine.WithLivenessWindow(livenessWindow)
+
 	// Issue #555 PR-6 — start the DeploymentCounterWatcher. The
 	// watcher resets the per-deployment 100% sampling window on
 	// the "last live instance parked" transition. The
@@ -1008,7 +1022,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// disables in-place. cfg.ReaperAggressiveParkCap=0 → default
 		// (sched.MaxParksPerTickPerApp = 8).
 		WithReaperAggressive(cfg.ReaperAggressive).
-		WithReaperParkCap(cfg.ReaperAggressiveParkCap)
+		WithReaperParkCap(cfg.ReaperAggressiveParkCap).
+		// Issue #554 / ADR-078: same LivenessWindow pointer as
+		// Engine.WithLivenessWindow above (constructed earlier in
+		// main). The loop doesn't tick the window — the Engine
+		// calls RecordRestart synchronously inside
+		// DestroyForLivenessFailure — but cmd/schedd wiring both
+		// surfaces the integration point in one place.
+		WithLivenessWindow(livenessWindow)
 
 	// ADR-067: Tier A6 migrating-instance watchdog — self-heals
 	// rows stuck in state='migrating' after a new-owner vmmd dies

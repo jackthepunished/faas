@@ -80,6 +80,19 @@ func boot() error {
 		slog.Default().Warn("vsock resume listener unavailable", "err", err)
 	}
 
+	// Issue #554 / ADR-078: bind the liveness probe listener on
+	// vsock 1028 STREAM alongside the resume hook. Same direction
+	// (host→guest), same wire envelope (4B msg-type + 4B body-len
+	// + JSON body), different port. Like the resume hook we
+	// tolerate a bind failure (e.g. AF_VSOCK not compiled into
+	// the guest kernel) on cold boot — a working VM without
+	// liveness still cold-boots; vmmd's poll goroutine will then
+	// fail dial and the host's per-instance liveness receiver
+	// logs at Debug, falling back to the §13 idle reaper.
+	if err := listenLivenessHook(slog.Default()); err != nil {
+		slog.Default().Warn("vsock liveness listener unavailable", "err", err)
+	}
+
 	// Wave 0 PR-C / ADR-047: stateless-runtime advisory. FAN_CLASS_NOTIF
 	// on a closed set of state-shaped paths; debounced batches shipped
 	// over AF_VSOCK DGRAM (port=1025, msg_type=2) to the host. Returns

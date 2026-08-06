@@ -178,6 +178,15 @@ type Engine struct {
 	// after NewEngine; tests stay span-less.
 	tracer oteltrace.Tracer
 
+	// livenessWindow is the per-deployment sliding-window
+	// restart counter (issue #554 / ADR-078). DestroyForLivenessFailure
+	// calls RecordRestart; on the Nth restart in the window the
+	// same call flips the parent app to evicted_cold and emits the
+	// instances.parked_liveness_exhausted audit row. nil is safe
+	// (the window check is skipped; production cmd/schedd wires a
+	// real tracker via WithLivenessWindow).
+	livenessWindow *LivenessWindow
+
 	// rebalanceCooldownSeconds is the Tier A4 (ADR-064) cooldown
 	// between two successful reassignments of the same app. Default
 	// api.RebalanceCooldownSeconds = 60s; overridable via
@@ -550,6 +559,21 @@ func (e *Engine) WithOwnerNodeID(nodeID string) *Engine {
 		return e
 	}
 	e.ownerNodeID = nodeID
+	return e
+}
+
+// WithLivenessWindow attaches the per-deployment restart counter
+// (issue #554 / ADR-078). DestroyForLivenessFailure calls
+// RecordRestart on every destroy; on the Nth restart in the
+// window the same call flips the parent app to evicted_cold and
+// emits the instances.parked_liveness_exhausted audit row. nil
+// is safe — the window check is skipped. Production cmd/schedd
+// wires sched.NewLivenessWindow(window, maxN) at construction.
+func (e *Engine) WithLivenessWindow(w *LivenessWindow) *Engine {
+	if e == nil {
+		return e
+	}
+	e.livenessWindow = w
 	return e
 }
 
@@ -3659,6 +3683,236 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 	e.transitionWithKind(ctx, instanceID, appID, terminal, "watchdog_timeout", string(reason))
 	if e.ops != nil {
 		e.ops.WatchdogKills(string(reason), string(terminal)).Inc()
+	}
+	return nil
+}
+
+// DestroyForLivenessFailure is the liveness-probe-triggered destroy
+// path (issue #554 / ADR-078). The vmmd poll goroutine calls
+// Manager.ReportLivenessFailed (pkg/fcvm/manager.go) when the
+// consecutive-failure counter reaches the per-plan N (default 3);
+// the vmmd relay drains into this method. The method is the
+// mirror of KillStuck — same destroy + transition + audit shape —
+// with two liveness-specific invariants:
+//
+//  1. MarkSnapshotStale is called eagerly on the instance's
+//     snap_id BEFORE the destroy commits, so the next Wake
+//     cold-boots from rootfs per ADR-005 ("snapshot of a wedged
+//     VM is a wedged VM"). Without this, the cold-boot path
+//     would silently restore the wedged snapshot and the
+//     customer-facing outage persists.
+//
+//  2. TouchInstancesLastSeen is called on the destroyed instance
+//     so the new cold-boot instance's idle budget restarts on a
+//     fresh slate (issue #554 §implementation notes, user-confirmed
+//     choice: "Yes — reset on restart"). The destroyed instance's
+//     reaper grace is irrelevant because the VM is gone; the
+//     new instance's first-request timestamp is the source of
+//     truth for the §13 idle reaper.
+//
+// `reason` is the wire-side string from the vmmd poll goroutine
+// (closed set {liveness_n_consecutive, liveness_timeout,
+// liveness_conn_refused, liveness_conn_err, liveness_non_200}).
+// Audit-kind discriminator is `liveness_failed` (the state-machine
+// event); `reason` lands in the audit row's data JSON so the
+// dashboard can group by outcome class.
+func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error {
+	// Two reads: a fresh InstanceByID for the app_id +
+	// deployment_id, then a re-read under the lock to confirm
+	// state hasn't moved. Both reads are best-effort — a missing
+	// row means a Park / Destroy race already cleaned up; we
+	// return nil so the vmmd poll goroutine doesn't accumulate
+	// retries.
+	fresh, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		e.ledger.Release(instanceID)
+		return nil
+	}
+	appID := fresh.AppID
+	deploymentID := fresh.DeploymentID
+
+	// Acquire the app lock so a parallel Wake / Park for the
+	// same app observes a consistent state. The lock is the
+	// same one WatchdogKills takes; the comment there about
+	// releasing early on a Park race is mirrored here.
+	release := e.lockApp(appID)
+	defer release()
+
+	// Re-read under the lock for the state-machine check.
+	freshLocked, err := e.store.InstanceByID(ctx, instanceID)
+	if err != nil {
+		e.ledger.Release(instanceID)
+		return nil
+	}
+	if state.State(freshLocked.State) != state.StateRunning {
+		// Race: a Park / Wake / prior watchdog already moved
+		// the row. Mirror the KillStuck shape — release the
+		// reservation in case it leaked, but don't second-guess
+		// the state machine.
+		e.ledger.Release(instanceID)
+		return nil
+	}
+
+	// Eagerly mark the deployment's latest snapshot stale so the
+	// next Wake cold-boots. This is the load-bearing invariant
+	// per ADR-005 — a wedged snapshot is never restored. We
+	// resolve the snap via LatestSnapshotForTier because the
+	// Instance row doesn't carry the snap_id directly;
+	// useableSnapshotForWake will return false on the next Wake
+	// after the stale flag flips, forcing a cold boot. Both
+	// warm and init tiers are flipped so the next Wake on either
+	// plan tier (Free/Hobby cold-boot only; Pro/Scale picks
+	// warm first) sees the stale flag.
+	for _, tier := range []string{state.SnapshotTierWarm, state.SnapshotTierInit} {
+		snap, terr := e.store.LatestSnapshotForTier(ctx, deploymentID, tier)
+		if terr != nil || snap.ID == "" {
+			continue
+		}
+		if err := e.store.MarkSnapshotStale(ctx, snap.ID); err != nil {
+			e.log.Warn("liveness: mark snapshot stale", "instance", instanceID, "snap_id", snap.ID, "tier", tier, "err", err)
+		}
+	}
+
+	// Reset the idle timer on the destroyed instance so the
+	// replacement cold-boot instance's idle budget starts fresh
+	// (issue #554 §implementation notes, user-confirmed: "Yes —
+	// reset on restart"). TouchInstancesLastSeen takes a batch;
+	// a 1-element batch is the API shape the existing
+	// pgstore-side wrapper supports.
+	now := time.Now().UTC()
+	if _, terr := e.store.TouchInstancesLastSeen(ctx, []state.InstanceTouch{
+		{InstanceID: instanceID, LastRequest: now},
+	}); terr != nil {
+		e.log.Warn("liveness: touch instances last seen", "instance", instanceID, "err", terr)
+	}
+
+	// Free the ledger reservation before the destroy so a
+	// parallel Wake for the same app can admit a new instance
+	// immediately. Mirrors KillStuck's ordering.
+	e.ledger.Release(instanceID)
+
+	// Best-effort destroy with the 5s ceiling. A wedged
+	// Firecracker cannot pin the goroutine past the deadline —
+	// the destroy times out and the liveness_resume hook on
+	// the next cold-boot instance takes over.
+	if err := e.timedDestroy(ctx, freshLocked.NodeID, instanceID, 5*time.Second); err != nil {
+		e.log.Warn("liveness: destroy failed (best-effort)", "instance", instanceID, "reason", reason, "err", err)
+	}
+
+	// Audit row + metric. The audit kind is
+	// `instances.liveness_failed` so the customer's
+	// `GET /v1/audit-events?kind_prefix=instances.liveness_*`
+	// filter surfaces it; the data JSON carries the
+	// reason + fail-count snapshot for the operator.
+	if e.events != nil {
+		e.events.Emit(ctx, events.LivenessFailed{
+			EmitAt:       now,
+			InstanceID:   instanceID,
+			AppID:        appID,
+			DeploymentID: deploymentID,
+			Reason:       reason,
+		})
+	}
+
+	// RUNNING → STOPPED with the liveness_failed kind. The
+	// reason field lands in the audit row's data JSON.
+	// transitionWithKind (engine.go:3597-3648) is the existing
+	// helper — pass `"liveness_failed"` as the kind and the
+	// reason as the cause.
+	e.transitionWithKind(ctx, instanceID, appID, state.StateStopped, "liveness_failed", reason)
+
+	// Counter emission. The (app, deployment) label set is
+	// bounded by the plan's deployed_apps × deployments size
+	// (Hobby: 5 apps, Pro: 25 apps, Scale: 100 apps). Empty
+	// tuples are collapsed to "unknown" inside the metrics
+	// accessor.
+	if e.ops != nil {
+		e.ops.LivenessRestarts(appID, deploymentID).Inc()
+	}
+
+	// Sliding-window check: N restarts in the window parks the
+	// parent app so further traffic is rejected at the wake gate.
+	// shouldPark=true flips apps.status='evicted_cold' + emits
+	// the instances.parked_liveness_exhausted audit row. Best-effort:
+	// the destroy above is the source of truth; a window miss
+	// just means the next liveness failure repaints the same
+	// state. nil window → no check (test-only opt-out).
+	if e.livenessWindow != nil {
+		if shouldPark, _ := e.livenessWindow.RecordRestart(deploymentID, now); shouldPark {
+			if err := e.ParkDeployment(ctx, deploymentID, "liveness_exhausted"); err != nil {
+				e.log.Warn("liveness: park deployment failed", "deployment", deploymentID, "err", err)
+			}
+		}
+	}
+	return nil
+}
+
+// ParkDeployment is the liveness-window-exhausted stop path
+// (issue #554 / ADR-078). It flips the parent app's status to
+// `evicted_cold` (the only non-active, non-deleted app.status
+// value the apps.status CHECK allows), so subsequent Wakes are
+// rejected at the wake gate. It also emits the
+// `instances.parked_liveness_exhausted` audit row with the
+// deployment id as the subject so operators can grep
+// `kind_prefix=instances.parked_liveness_*`.
+//
+// The method is idempotent: a re-call on an already-evicted_cold
+// app is a no-op (UpdateApp returns the unchanged row). The
+// audit row is emitted on every call so a customer who triggers
+// the gate twice (e.g. across schedd restarts that lose the
+// in-memory window) gets a row per event; the
+// kind_prefix=instances.parked_liveness_exhausted filter still
+// surfaces the latest.
+//
+// `reason` is a closed-set label, today only "liveness_exhausted";
+// future stop-the-traffic paths (e.g. spec §17 retention) may
+// reuse this method. We do NOT carve a `deployments.parked_reason
+// text` column in this PR (slot 150 reserved but not migrated);
+// the audit row carries the reason in data JSON.
+func (e *Engine) ParkDeployment(ctx context.Context, deploymentID, reason string) error {
+	if deploymentID == "" {
+		return fmt.Errorf("sched: ParkDeployment: empty deploymentID")
+	}
+	// Resolve the parent app so we can flip apps.status. The
+	// state store is the single source of truth for the
+	// deployment → app mapping.
+	dep, err := e.store.DeploymentByID(ctx, deploymentID)
+	if err != nil {
+		return fmt.Errorf("sched: ParkDeployment: deployment %s: %w", deploymentID, err)
+	}
+	appID := dep.AppID
+	evicted := state.AppStatus("evicted_cold")
+	if _, err := e.store.UpdateApp(ctx, appID, state.UpdateAppParams{
+		Status: &evicted,
+	}); err != nil {
+		return fmt.Errorf("sched: ParkDeployment: update app %s status=evicted_cold: %w", appID, err)
+	}
+	// Emit the audit row + events event. Subject = deploymentID
+	// (not appID) so the dashboard's "this deployment's history"
+	// filter surfaces it; the data JSON carries the appID for
+	// the cross-cutting ops view.
+	data, err := json.Marshal(map[string]any{
+		"app":           appID,
+		"deployment":    deploymentID,
+		"reason":        reason,
+		"now":           time.Now().UTC().Format(time.RFC3339Nano),
+		"window_recent": e.livenessWindow.recent(deploymentID, time.Now()),
+	})
+	if err != nil {
+		e.log.Warn("liveness: marshal parked audit", "err", err)
+	} else {
+		subject := deploymentID
+		if err := e.store.AppendEvent(ctx, "schedd", "instances.parked_liveness_exhausted", &subject, data); err != nil {
+			e.log.Warn("liveness: parked audit write failed", "deployment", deploymentID, "err", err)
+		}
+	}
+	if e.events != nil {
+		e.events.Emit(ctx, events.ParkedLivenessExhausted{
+			EmitAt:       time.Now().UTC(),
+			AppID:        appID,
+			DeploymentID: deploymentID,
+			ParkedReason: reason,
+		})
 	}
 	return nil
 }

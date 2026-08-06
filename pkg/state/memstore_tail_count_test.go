@@ -59,7 +59,7 @@ func TestMemStore_BumpInstanceTailCount_AddsAndReturnsPostValue(t *testing.T) {
 	m := newMemStoreForTest()
 	ins := seedTailCountInstanceRow(t, m)
 
-	// Fresh row starts at 0 (DEFAULT 0 from migration 00149).
+	// Fresh row starts at 0 (DEFAULT 0 from migration 00151).
 	got, err := m.InstanceByID(ctx, ins.ID)
 	if err != nil {
 		t.Fatalf("read fresh: %v", err)

@@ -775,6 +775,17 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
+	// OverrideLivenessProbe is the per-deployment liveness-probe
+	// override JSON (issue #554 / ADR-078). Mirrors
+	// OverrideHealthcheck — coalesce(override_liveness_probe,
+	// '{}'::jsonb) on the read side; nullable jsonb column
+	// (migrations/00154_deployment_liveness_probe.sql). The
+	// cmd/vmmd liveness_recv goroutine consumes the resolved
+	// struct (cmd/vmmd/liveness_recv.go::livenessProbeConfig) at
+	// every BringUp. Per-plan defaults (Hobby/Pro/Scale → 5s /
+	// 3 / 60s) are applied on the apid read path when this
+	// column is empty.
+	OverrideLivenessProbe json.RawMessage `json:"override_liveness_probe,omitempty"`
 	// Sidecars (issue #463 / ADR-068). Up to 2 stateless sidecars
 	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
 	// `deployments.sidecars` column (migration 00095). Field is
@@ -1466,14 +1477,14 @@ type Instance struct {
 	// the runner each time ctx.waitUntil(promise) is called and
 	// decremented when the task reaches a terminal outcome
 	// (completed / failed / timeout). Persisted in the `tail_count`
-	// column added by migrations/00149_wait_until_tail.sql and
+	// column added by migrations/00151_wait_until_tail.sql and
 	// mirrored here so schedd's reaper can read it without a
 	// second SQL hop. The schedd reaper treats instances with
 	// tail_count > 0 as NOT idle-eligible — the wake stays in
 	// RUNNING until the runner drains its tail tasks or the
 	// snapshotAndPark 5s watchdog fires (PR 4 wires that gate).
 	// Tail count is a column, not a state; the state machine is
-	// untouched. NOT NULL DEFAULT 0 enforced by migration 00149;
+	// untouched. NOT NULL DEFAULT 0 enforced by migration 00151;
 	// pre-existing rows are backfilled to 0 on apply.
 	TailCount int
 }

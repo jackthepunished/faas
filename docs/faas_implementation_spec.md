@@ -514,12 +514,28 @@ Both rows are observational — the actual state changes (Stripe `Refund`, `acco
                  RUNNING ◄──── readiness ──── COLD_BOOTING (fallback, marks snapshot stale)
                     │
      idle timeout / eviction / deploy superseded
+     liveness probe N consecutive failures (issue #554)
                     ▼
                SNAPSHOTTING ──► PARKED
                     │ snapshot fail (disk?)
                     ▼
                  STOPPED (cold; next wake = COLD_BOOTING)     FAILED (crash-loop ≥3: park + notify)
 ```
+
+**Liveness probe (issue #554 / ADR-079):** the `RUNNING →
+STOPPED (reason='liveness_failed')` edge is added by the
+issue #554 path. `cmd/vmmd` polls the guest via vsock 1028
+STREAM (host→guest); on N consecutive non-2xx (or timeout /
+conn-refused) responses `Engine.DestroyForLivenessFailure`
+fires. The destroy eagerly marks the deployment's latest
+snapshot stale so the next Wake cold-boots from rootfs per
+ADR-005 — a wedged snapshot is never restored. After 3
+restarts in 300 s the parent app flips to
+`apps.status='evicted_cold'` (`Engine.ParkDeployment` with
+audit kind `instances.parked_liveness_exhausted`). Per-plan
+defaults: Hobby/Pro/Scale → period 5 s, consecutive 3,
+cooldown 60 s, max restarts 3 in window 300 s. Free is gated
+off (LivenessAllowed() returns false).
 
 Timers: WAKING ≤ 5 s then fallback to cold boot; COLD_BOOTING ≤ 30 s then FAILED; SNAPSHOTTING ≤ 20 s then STOPPED. Every transition is an `events` row.
 
@@ -564,6 +580,7 @@ This subsection is the cross-reference page for the three v1.1 ADRs. Steady-stat
 | `pkg/gateway.TargetSet` admits an instance whose `NodeID == ""` (regression guard) | `targetSet.Add` returns error; pgbackend tests cover | Refused at the atomic update; gatewayd logs the rejection | ADR-028 v1.1, §6.2 |
 | WakeResponse wire shape reverts (someone re-adds `.addr`) | `pkg/scheddgrpc` proto compile fails; `grep -rn "\.addr" pkg/ cmd/` sweep | Proto compilation is the regression gate; pre-#199 clients fail at unmarshal | ADR-025 v1.1, ADR-028 v1.1, issue #168 |
 | `migration 00024` `default-local` `47600` literal backfilled changed | Admission ceiling would change | Anti-goal: do not touch the literal. Re-backfill requires a new ADR | ADR-025 v1.1 |
+| VM wedged (busy-loop / leaked FD / deadlocked runner), liveness probe fails N consecutive | `RUNNING → STOPPED` | 3 consecutive non-2xx / timeout / conn-refused on vsock 1028 STREAM → `Engine.DestroyForLivenessFailure` eagerly marks snapshot stale → next Wake cold-boots (per ADR-005). 3 destroys in 300 s → `Engine.ParkDeployment` flips parent app to `apps.status='evicted_cold'` + audit kind `instances.parked_liveness_exhausted`. Idle timer resets on destroy. | ADR-079, issue #554 |
 
 **Operator runbook pointers:**
 

@@ -107,6 +107,7 @@ from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
 from .deployment_healthcheck import DeploymentHealthcheck
 from .deployment_list_response import DeploymentListResponse
+from .deployment_liveness_probe import DeploymentLivenessProbe
 from .deployment_response import DeploymentResponse
 from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .gdpr_audit_export_response import GdprAuditExportResponse
@@ -376,6 +377,7 @@ __all__ = (
     "DeleteAccountSessionBody",
     "DeploymentHealthcheck",
     "DeploymentListResponse",
+    "DeploymentLivenessProbe",
     "DeploymentResponse",
     "DeploymentResponseOverrideEnvSecretRefs",
     "GdprAuditExportResponse",

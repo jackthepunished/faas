@@ -173,6 +173,18 @@ type SchedAPI interface {
 	// schedd always returns a non-nil registry; tests
 	// pass nil to bypass verification.
 	NodeKeyRegistry() *sched.NodeKeyRegistry
+
+	// DestroyForLivenessFailure (issue #554 / ADR-078)
+	// is the vmmd-triggered destroy path. The vmmd
+	// poll goroutine calls this RPC when the
+	// consecutive-failure counter reaches the per-plan
+	// N (default 3). The handler returns nil on a
+	// non-RUNNING instance (state-machine guard
+	// returns nil rather than a gRPC error so a
+	// re-report doesn't trip the error path). The
+	// typed error path surfaces real failures
+	// (db hitches, missing rows).
+	DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error
 }
 
 // StatsReader is the per-instance snapshot the schedd's
@@ -378,6 +390,68 @@ func (s *Server) ParkInstance(ctx context.Context, req *scheddpb.ParkInstanceReq
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &scheddpb.ParkInstanceResponse{Ok: true}, nil
+}
+
+// ReportLivenessFailed (issue #554 / ADR-078) is the vmmd
+// poll-goroutine's drain into the sched state machine. vmmd's
+// per-instance loop increments a consecutive-failure counter
+// against the guest-init vsock 1028 STREAM listener; once the
+// counter reaches the per-plan N (default 3), vmmd fires this
+// RPC. Schedd's response drives the lazy snapshot-stale mark
+// (ADR-005), the per-app restart-window counter
+// (LivenessWindow — see pkg/sched/liveness_window.go), and
+// eventually an Engine.Park path if the window fires the
+// park threshold (3 restarts / 300 s).
+//
+// The reason field is the closed set the vmmd run-time
+// classifies into the relay:
+//
+//   - liveness_timeout       — read deadline fired
+//   - liveness_conn_refused  — guest-init listener not up
+//   - liveness_conn_err      — wire-shape or syscall failure
+//   - liveness_non_200       — guest-init returned a non-2xx
+//   - liveness_n_consecutive — the catch-all "counter reached N"
+//
+// Anything outside the closed set is still accepted by the
+// schedd side (the reason string flows verbatim into the
+// audit-log emit) so a future classification drift in vmmd
+// doesn't trip the handler with an InvalidArgument. The
+// closure of the set is enforced on the vmmd side, not here.
+//
+// Idempotent (mirrors ParkInstance): if the instance is no
+// longer RUNNING (already parked by the idle reaper, mid-restore
+// after the previous restart) the engine returns nil and the
+// RPC replies with Ok=true. The vmmd loop has already exited
+// on its end so re-reports are benign.
+//
+// Wire error mapping:
+//
+//   - codes.OK + Ok=true on success or no-op
+//   - codes.NotFound when the instance_id doesn't resolve
+//     (state.ErrNotFound from the engine)
+//   - codes.Unauthenticated / codes.PermissionDenied if the
+//     ownership guard rejects (defence-in-depth; vmmd always
+//     dials the schedd on the same node)
+//   - codes.Internal for any other engine failure (db hitches,
+//     pg_notify backlog, etc.)
+//
+// Additive per ADR-016: the new RPC + new messages append at
+// the end of the proto file.
+func (s *Server) ReportLivenessFailed(ctx context.Context, req *scheddpb.LivenessFailedReport) (*scheddpb.LivenessFailedAck, error) {
+	const op = "ReportLivenessFailed"
+	if _, err := authorizeInstance(ctx, s.owner, s.resolver, req.GetInstanceId()); err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	err := s.engine.DestroyForLivenessFailure(ctx, req.GetInstanceId(), req.GetReason())
+	s.ops.Observe(op, time.Since(start), err)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return &scheddpb.LivenessFailedAck{Ok: true}, nil
 }
 
 // StreamAppLogs (issue #254 / Move 4, issue #517 / PR-B

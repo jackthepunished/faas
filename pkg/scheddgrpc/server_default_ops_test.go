@@ -46,6 +46,11 @@ func (noopEngine) CapacitySink() CapacitySink {
 }
 func (noopEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
 
+// DestroyForLivenessFailure (issue #554 / ADR-078) — stub to
+// satisfy the SchedAPI interface; the white-box nil-ops test
+// doesn't exercise the handler body.
+func (noopEngine) DestroyForLivenessFailure(context.Context, string, string) error { return nil }
+
 // TestServerNew_NilOpsUsesDefault confirms the
 // "ops == nil → wire.NewOpsMetrics(\"schedd\")" fallback
 // (server.go:62-64). The constructor must not panic on nil ops

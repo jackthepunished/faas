@@ -932,6 +932,60 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	errc := make(chan error, 4)
 	var servers []*http.Server
 	addSrv := func(s *http.Server) { servers = append(servers, s) }
+
+	// Issue #675: build the unified mux that the unix-socket server
+	// (`deps.synth`) serves. The mux routes:
+	//   /v1/synthesize           → synth handler (existing, M7)
+	//   /v1/invocations:dispatch → synth handler (existing, Move 1)
+	//   /healthz                 → synth handler
+	//   everything else          → customer publicHandler (NEW — issue #675)
+	//
+	// Production (FAAS_GATEWAY_LISTEN=off) routes ALL customer traffic
+	// through this mux via gatewayd-public's reverse proxy. The legacy
+	// :8080 TCP listener below (when not off) keeps publicHandler
+	// directly — but in prod the TCP path is unused.
+	if deps.synth != nil {
+		unifiedMux := http.NewServeMux()
+		// LOAD-BEARING ORDER: register Handle("/", publicHandler) FIRST,
+		// then the more-specific synth routes AFTER. Go's
+		// http.ServeMux uses longest-prefix matching, NOT
+		// registration order — the catch-all written first does
+		// NOT shadow the more-specific patterns written after.
+		// Re-ordering this block "for readability" still works
+		// in Go, but readers expect registration order to match
+		// routing order and may "fix" it in a way that does NOT
+		// work (e.g. moving the catch-all last while keeping
+		// longest-prefix semantics). DO NOT change the order
+		// without also updating the unified-mux test in
+		// pkg/gateway/synth_test.go (TestSynthServer_UnifiedMux_RoutesPathsCorrectly).
+		unifiedMux.Handle("/", publicHandler)
+		// Pull the synth mux out of the SynthServer via a small
+		// accessor; the server exposes SetHandler so the caller
+		// owns the unified mux. The synth mux itself carries
+		// the three routes registered in NewSynthServer.
+		unifiedMux.Handle("/v1/synthesize", deps.synth.Mux())
+		unifiedMux.Handle("/v1/invocations:dispatch", deps.synth.Mux())
+		unifiedMux.Handle("/healthz", deps.synth.Mux())
+		// Wrap with h2c so the in-process unix-socket hop negotiates
+		// H2C prior knowledge (no TLS). The customer publicHandler
+		// speaks HTTP/1.1 downstream, but the gatewayd-public ← →
+		// gatewayd-internal hop now carries H2 frames.
+		//
+		// Streaming responses (app.StreamingEnabled=true) still go
+		// through the existing HTTP/1.1 chunked path inside the
+		// handler — H2C is transparent to streaming because the
+		// handler writes chunked on its own writer.
+		//
+		// Go 1.24+: the SynthServer's http.Server has Protocols set
+		// to {HTTP/1.1, UnencryptedHTTP2} (see NewSynthServer), so
+		// H2C is negotiated natively on the listener. No wrapper
+		// needed — the deprecated golang.org/x/net/http2/h2c package
+		// is gone.
+		deps.synth.SetHandler(unifiedMux)
+	}
+	// addSrv is the closure for the public :8080 + control listeners
+	// below; declared above so the unified-mux block above can run
+	// before the public-listener gate without depending on it.
 	// Plain-:8080 path. ADR-068 / Tier A7 split: TLS termination
 	// moved to gatewayd-public (certmagic, httpsec, :443/:80 ACME
 	// mux); this daemon no longer builds a *gateway.TLSBundle. The

@@ -107,6 +107,11 @@ func (c *capturingEngine) CapacitySink() scheddgrpc.CapacitySink {
 // registry.
 func (c *capturingEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
 
+// DestroyForLivenessFailure (issue #554 / ADR-078) — stub
+// satisfies the SchedAPI interface; the capacity tests don't
+// exercise the ReportLivenessFailed RPC path.
+func (c *capturingEngine) DestroyForLivenessFailure(_ context.Context, _, _ string) error { return nil }
+
 // TestReportCapacity_RoundTrip drives two reports through the
 // wire and asserts the handler applies them to the table via
 // the SchedAPI.CapacitySink seam. The seam is the only surface

@@ -67,6 +67,7 @@ export type { DelayedTaskRequest } from './models/DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './models/DelayedTaskResponse.js';
 export type { DeploymentHealthcheck } from './models/DeploymentHealthcheck.js';
 export type { DeploymentListResponse } from './models/DeploymentListResponse.js';
+export type { DeploymentLivenessProbe } from './models/DeploymentLivenessProbe.js';
 export type { DeploymentResponse } from './models/DeploymentResponse.js';
 export type { GdprAuditExportResponse } from './models/GdprAuditExportResponse.js';
 export type { GraceWindowResponse } from './models/GraceWindowResponse.js';

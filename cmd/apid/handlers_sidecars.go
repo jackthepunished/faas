@@ -212,6 +212,20 @@ func validateOverrides(req *api.CreateDeploymentRequest, limits api.Limits) (*ap
 	if req.Overrides == nil {
 		return nil, nil
 	}
+	// Issue #554 / ADR-078: per-plan liveness gate. Free is
+	// plan-locked off (LivenessAllowed() returns false); the
+	// handler rejects with 403 plan_liveness_probe_not_allowed
+	// BEFORE the override is persisted. Same gate shape as
+	// streaming / warm-snapshot / require_authn (see
+	// validatePatchApp or its sibling in handlers_ext.go). The
+	// gate uses the same per-plan limits struct that the
+	// override's own Validate consults.
+	if req.Overrides.LivenessProbe != nil && limits.LivenessPeriodSeconds == 0 {
+		return nil, api.NewProblem(http.StatusForbidden,
+			api.CodePlanLivenessProbeNotAllowed,
+			"Liveness probes are not allowed on this plan",
+			"Free tier does not support per-deployment liveness probes; upgrade to Hobby or higher.")
+	}
 	if p := req.Overrides.Validate(limits); p != nil {
 		return nil, p
 	}
@@ -264,6 +278,19 @@ func applyOverridesToDeployment(dep *state.Deployment, o *api.CreateDeploymentOv
 	if o.Healthcheck != nil {
 		if b, err := json.Marshal(o.Healthcheck); err == nil {
 			dep.OverrideHealthcheck = b
+		}
+	}
+	// Liveness probe override (issue #554 / ADR-078). Persist
+	// the JSONB body so cmd/vmmd's liveness_recv goroutine can
+	// pick it up at every BringUp via the resolved struct
+	// (cmd/vmmd/liveness_recv.go::livenessProbeConfig). The
+	// per-plan gate (Plan.LivenessAllowed() == false for Free)
+	// is enforced in the create handler BEFORE this helper is
+	// called, so the only filter that can land here is the
+	// per-deployment override object itself.
+	if o.LivenessProbe != nil {
+		if b, err := json.Marshal(o.LivenessProbe); err == nil {
+			dep.OverrideLivenessProbe = b
 		}
 	}
 }

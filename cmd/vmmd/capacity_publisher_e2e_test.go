@@ -125,6 +125,13 @@ func (f *fakeSinkSchedAPI) NodeKeyRegistry() *sched.NodeKeyRegistry {
 	return nil
 }
 
+// DestroyForLivenessFailure (issue #554 / ADR-078) — stub
+// satisfies the SchedAPI interface; the capacity e2e tests
+// never exercise the ReportLivenessFailed RPC path.
+func (f *fakeSinkSchedAPI) DestroyForLivenessFailure(context.Context, string, string) error {
+	return nil
+}
+
 // bufconnStreamer is a capacityStreamer backed by a bufconn
 // dialer. Construct one with newBufconnStreamer(t) inside a
 // test and pass it to runCapacityPublishWithStreamer.

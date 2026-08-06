@@ -571,6 +571,20 @@ type CreateDeploymentOverrides struct {
 	// TimeoutS / Retries are stored + validated here but remain
 	// dormant until a v2 contract lands them on the wire.
 	Healthcheck *DeploymentHealthcheck `json:"healthcheck,omitempty"`
+	// LivenessProbe is the optional liveness probe override
+	// (issue #554 / ADR-078). Per-deployment override wins over
+	// the parent app's per-plan defaults (Hobby/Pro/Scale → 5s /
+	// 3 consecutive / 60s cooldown / 3 in 300s). Free is gated
+	// off entirely (Plan.LivenessAllowed() returns false; the
+	// apid handler rejects the create with
+	// CodePlanLivenessProbeNotAllowed before the DB is touched).
+	// Cooldown / MaxRestarts / WindowSeconds are polymorphic per
+	// the per-plan defaults but v1 does NOT expose them as
+	// per-deployment knobs — only interval / timeout / consecutive.
+	// Three strikes in 300s drives the park path
+	// (Engine.ParkDeployment) regardless of per-deployment probe
+	// tuning.
+	LivenessProbe *DeploymentLivenessProbe `json:"liveness_probe,omitempty"`
 }
 
 // DeploymentHealthcheck is the readiness-probe shape on the
@@ -582,6 +596,50 @@ type DeploymentHealthcheck struct {
 	IntervalS int    `json:"interval_s,omitempty"`
 	TimeoutS  int    `json:"timeout_s,omitempty"`
 	Retries   int    `json:"retries,omitempty"`
+}
+
+// DeploymentLivenessProbe is the liveness-probe shape on the
+// override object (issue #554 / ADR-078). The probe is the
+// Cloud-Run-parity primitive that asks "is the VM still responding?"
+// after N consecutive failures the host (cmd/vmmd) destroys the VM
+// and schedd cold-boots it from rootfs (per ADR-005 — never
+// snapshot-restore). Defaults: path is required (must start with "/");
+// the period / timeout / consecutive fields are 0 = inherit from
+// the parent app's per-plan defaults (Hobby/Pro/Scale → 5s / 3 / 60s).
+// The window + max_restarts knobs are the park-on-exhaustion gate
+// (engine.ParkDeployment on the 3rd restart in 300s).
+//
+// Note: the readiness probe (`DeploymentHealthcheck` above) and the
+// liveness probe are intentionally separate surfaces. Readiness is
+// "accept traffic?" — the app opens the readiness port AFTER its
+// migration is complete. Liveness is "still alive?" — a failed
+// liveness probe means the VM is wedged (busy-loop, leaked fd,
+// deadlocked runner) and must be destroyed and cold-booted. A
+// passing readiness but failing liveness is the canonical "wake succeeded,
+// then the runtime died" failure mode that the customer-facing
+// primitive on this shape is designed to catch.
+type DeploymentLivenessProbe struct {
+	// Path is the HTTP path the guest-init hits on the runner's
+	// :8080 (issue #554 §4: reuses the existing `:8080/healthz`
+	// surface, no runner changes). Required (must start with "/").
+	Path string `json:"path"`
+	// IntervalS is the per-plan poll cadence. 0 = inherit from
+	// the parent app's per-plan default (Hobby/Pro/Scale → 5s).
+	// Clamped to [MinLivenessPeriodSeconds=1, MaxLivenessPeriodSeconds=60]
+	// by Validate. V1 is HTTP-only; GRPCLivenessAllowed() returns
+	// false across all plans (follow-up when v2 lands).
+	IntervalS int `json:"interval_s,omitempty"`
+	// TimeoutS is the per-probe HTTP timeout. 0 = inherit from
+	// the runner-default 2s (VsockLivenessTimeoutMs). Clamped to
+	// [1, 5]. A timeout is treated identically to a non-2xx
+	// response by the failure counter.
+	TimeoutS int `json:"timeout_s,omitempty"`
+	// ConsecutiveFailures is the N at which DestroyForLivenessFailure
+	// fires. 0 = inherit from the per-plan default (3). Clamped to
+	// [1, 10]. The counter is reset to 0 on the first 2xx and
+	// survives an intermittent 5xx across the consecutive window
+	// (AC #2 — flaky app does NOT oscillate).
+	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
 }
 
 // SecretRefPrefix is the wire prefix on env_secrets values that flags the
@@ -711,6 +769,63 @@ func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
 		}
 	}
 
+	// liveness_probe (issue #554 / ADR-078): path must start with "/";
+	// interval_s ∈ [MinLivenessPeriodSeconds, MaxLivenessPeriodSeconds]
+	// when explicit; timeout_s ∈ [1, 5]; consecutive_failures ∈ [1, 10].
+	// 0 = inherit from the per-plan default (the per-plan accessor
+	// LivenessPeriodSeconds() / etc. handle the inheritance). The
+	// handler gate (Plan.LivenessAllowed() → false on Free) is the
+	// upstream check; this Validate only enforces the per-field
+	// shape, NOT the per-plan gate.
+	if o.LivenessProbe != nil {
+		if !strings.HasPrefix(o.LivenessProbe.Path, "/") {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.path must start with %q; got %q.",
+					"/", o.LivenessProbe.Path))
+		}
+		// IntervalS = 0 means "inherit per-plan default" — only
+		// reject values that are explicitly out of range. The
+		// downstream Dormant → Active transition (PR-B's runtime
+		// half) reads the per-plan default via Plan.LivenessPeriodSeconds()
+		// when this is 0.
+		if o.LivenessProbe.IntervalS < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.interval_s must be >= 0 (0 = inherit); got %d.", o.LivenessProbe.IntervalS))
+		}
+		if o.LivenessProbe.IntervalS > MaxLivenessPeriodSeconds {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.interval_s must be <= %d; got %d.",
+					MaxLivenessPeriodSeconds, o.LivenessProbe.IntervalS))
+		}
+		if o.LivenessProbe.TimeoutS < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.timeout_s must be >= 0 (0 = inherit 2s); got %d.", o.LivenessProbe.TimeoutS))
+		}
+		// TimeoutS ceiling is 5s (the upper bound of the wire-side
+		// VsockLivenessTimeoutMs area; a 5s timeout is the longest
+		// "still responsive" probe that doesn't burn the period
+		// budget on a single check).
+		if o.LivenessProbe.TimeoutS > 5 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.timeout_s must be <= 5; got %d.", o.LivenessProbe.TimeoutS))
+		}
+		if o.LivenessProbe.ConsecutiveFailures < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.consecutive_failures must be >= 0 (0 = inherit); got %d.", o.LivenessProbe.ConsecutiveFailures))
+		}
+		if o.LivenessProbe.ConsecutiveFailures > 10 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.consecutive_failures must be <= 10; got %d.", o.LivenessProbe.ConsecutiveFailures))
+		}
+	}
+
 	return nil
 }
 
@@ -792,6 +907,13 @@ type DeploymentResponse struct {
 	// OverrideHealthcheck is the readiness-probe override
 	// verbatim. Persisted; the actual HTTP probe is a follow-up.
 	OverrideHealthcheck *DeploymentHealthcheck `json:"override_healthcheck,omitempty"`
+	// OverrideLivenessProbe is the liveness-probe override
+	// verbatim (issue #554 / ADR-078). nil when the deployment
+	// used the per-plan default (Hobby/Pro/Scale → 5s / 3
+	// consecutive / 60s cooldown). Echoed on GET
+	// /v1/apps/{slug}/deployments/{id} so the customer can audit
+	// which probe the host is running against the VM.
+	OverrideLivenessProbe *DeploymentLivenessProbe `json:"override_liveness_probe,omitempty"`
 	// MinInstances is the per-deployment cold-wake floor override
 	// (issue #557 closure / ADR-072). 0 = "inherit from parent
 	// app" (the post-migration default); a positive value is the

@@ -96,6 +96,16 @@ type OpsMetrics struct {
 	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
 	// panel is the §12 warm-capture-error alert's primary signal.
 	warmSnapshotErrors *prometheus.CounterVec
+	// livenessRestarts (issue #554 / ADR-078) is the per-(app,
+	// deployment) counter the Engine.DestroyForLivenessFailure path
+	// increments on every liveness-driven destroy. The dashboard
+	// panel "liveness: restarts by deployment (5m)" queries this
+	// counter; the liveness_exhausted park alert
+	// (instances.parked_liveness_exhausted audit kind) is the
+	// operator-facing signal. Labels are bounded by the per-app
+	// deployment count (≤ 20 for Scale, ≤ 1 for Hobby), so the
+	// cardinality stays safe.
+	livenessRestarts *prometheus.CounterVec
 	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
@@ -886,6 +896,20 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")
+	// Issue #554 / ADR-078: liveness restarts counter. Labelled by
+	// (app, deployment) — the bounded per-deployment set keeps the
+	// TSDB cardinality safe (Scale: ≤ 20 deployment per app; Hobby:
+	// ≤ 5; Free: 0). The dashboard panel "liveness: restarts by
+	// deployment (5m)" queries this; the liveness_exhausted park
+	// alert (instances.parked_liveness_exhausted audit kind) is
+	// the operator-facing signal. The (other, other) overflow row
+	// is pre-instantiated so the dashboard panel selector
+	// {deployment!="other"} never sees "no data" from boot.
+	livenessRestarts := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_liveness_restarts_total",
+		Help: "Count of liveness-driven destroy+cold-boot cycles (issue #554 / ADR-078), labelled by (app, deployment). The dashboard panel 'liveness: restarts by deployment (5m)' queries this; the liveness_exhausted park alert (instances.parked_liveness_exhausted audit kind) is the operator-facing signal. Per-deployment cardinality is bounded by the plan's deployed_apps cap (Hobby: 5, Pro: 25, Scale: 100 apps × ~2 deployments/app).",
+	}, []string{"app", "deployment"})
+	livenessRestarts.WithLabelValues("other", "other")
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -1494,7 +1518,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -1950,6 +1974,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
 		warmSnapshotErrors:                 warmSnapshotErrors,
+		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
 		guestTailSeconds:                   guestTailSeconds,
@@ -2037,6 +2062,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 // CounterVec is shared with other label tuples.
 func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter {
 	return m.watchdogKills.WithLabelValues(fromState, toState)
+}
+
+// LivenessRestarts returns the per-(app, deployment) counter the
+// Engine.DestroyForLivenessFailure path increments on every
+// liveness-driven destroy (issue #554 / ADR-078). The dashboard
+// panel "liveness: restarts by deployment (5m)" queries this; the
+// liveness_exhausted park alert (instances.parked_liveness_exhausted
+// audit kind) is the operator-facing signal. The returned Counter
+// is safe to retain — Prometheus's WithLabelValues is internally
+// cached. nil-receiver guard mirrors the WatchdogKills /
+// WarmSnapshotErrors pattern so unit tests without metrics keep
+// working.
+func (m *OpsMetrics) LivenessRestarts(app, deployment string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	if app == "" {
+		app = labelUnknown
+	}
+	if deployment == "" {
+		deployment = labelUnknown
+	}
+	return m.livenessRestarts.WithLabelValues(app, deployment)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier
@@ -3750,6 +3798,15 @@ const maxIPLabelValues = 10_000
 // otherIPLabel).
 const anonymousIPLabel = "anonymous"
 
+// labelUnknown is the closed-set sentinel for "label collapsed because
+// the source string was empty / unparseable" on the Prometheus
+// collectors in this file. The liveness_restarts counter uses it for
+// empty app / deployment labels, and the IP-admission switch path
+// uses it for the `case "", "unknown"` branch. Pinning the value
+// here keeps goconst at 0 occurrences (golangci-lint v2.4.0 fires on
+// repeated string literals ≥ 3×).
+const labelUnknown = "unknown"
+
 // otherIPLabel is the reserved IP for traffic whose IP exceeded the
 // admission cap. Same contract as otherAccountLabel — operators must
 // check the daemon slog for the original IP when an IP lands here;
@@ -3936,7 +3993,7 @@ func newIPLabelSet(capacity int) *ipLabelSet {
 // OpsMetrics in NewOpsMetrics and held as a pointer field.
 func (s *ipLabelSet) admit(ip string) string {
 	switch ip {
-	case "", "unknown":
+	case "", labelUnknown:
 		// ClientIP returns "unknown" for an unparseable
 		// RemoteAddr; collapse to anonymousIPLabel so the operator
 		// can distinguish "we couldn't resolve the source IP"
