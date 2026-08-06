@@ -65,10 +65,10 @@ SELECT 'migration',
          'from_public_auth_mode_default', 'open',
          'to_public_auth_mode_default',   'bearer',
          'plan_overrides', jsonb_build_object(
-           'free',  jsonb_build_object('require_authn', to_jsonb(false),  'public_auth_mode', to_jsonb('open')),
-           'hobby', jsonb_build_object('require_authn', to_jsonb(true),   'public_auth_mode', to_jsonb('open')),
-           'pro',   jsonb_build_object('require_authn', to_jsonb(true),   'public_auth_mode', to_jsonb('bearer')),
-           'scale', jsonb_build_object('require_authn', to_jsonb(true),   'public_auth_mode', to_jsonb('bearer'))
+           'free',  jsonb_build_object('require_authn', to_jsonb(false::bool),  'public_auth_mode', to_jsonb('open'::text)),
+           'hobby', jsonb_build_object('require_authn', to_jsonb(true::bool),   'public_auth_mode', to_jsonb('open'::text)),
+           'pro',   jsonb_build_object('require_authn', to_jsonb(true::bool),   'public_auth_mode', to_jsonb('bearer'::text)),
+           'scale', jsonb_build_object('require_authn', to_jsonb(true::bool),   'public_auth_mode', to_jsonb('bearer'::text))
          )
        )
  WHERE NOT EXISTS (
