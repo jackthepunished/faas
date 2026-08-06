@@ -36,6 +36,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #475: Free is gated off the reserved eviction tier.
 			// Fail-closed at 0/0 mirrors the cron 0/0 posture above.
 			EvictionPriorityReservedAllowed: false, ReservedConcurrencyPerAccount: 0,
+			// Issue #477 / ADR-077: Free stays on the no-signup-friction
+			// path — public-by-default. Bearer + basic both gated off.
+			// The 'open' mode is always available regardless of plan.
+			PublicAuthBearerAllowed: false, PublicAuthBasicAllowed: false,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Free stays 0/0 by
 			// plan policy — the abuse-floor tier cannot host shared
 			// orgs. Mirrors CronLimitPerApp posture. Financial model
@@ -112,6 +116,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
 			// Issue #475: Hobby gets 1 reserved-tier app.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 1,
+			// Issue #477 / ADR-077: Hobby unlocks bearer (admin
+			// endpoints + private webhook receivers) but basic stays
+			// gated off — the Hobby customer shape doesn't typically
+			// need sealed-credential storage cost.
+			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: false,
 			// ADR-045 (#396): Hobby gets 3 per-app and 10 per-account.
 			AlertRuleLimitPerApp: 3, AlertRuleLimitPerAccount: 10,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
@@ -174,6 +183,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 20, CronLimitPerAccount: 50,
 			// Issue #475: Pro gets 2 reserved-tier apps.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 2,
+			// Issue #477 / ADR-077: Pro unlocks both bearer + basic.
+			// Basic is the right shape for Pro's typical webhook-
+			// receiver / admin-endpoint use cases.
+			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: true,
 			// ADR-045 (#396): Pro gets 10 per-app and 30 per-account.
 			AlertRuleLimitPerApp: 10, AlertRuleLimitPerAccount: 30,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
@@ -239,6 +252,8 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 100, CronLimitPerAccount: 500,
 			// Issue #475: Scale gets 4 reserved-tier apps.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 4,
+			// Issue #477 / ADR-077: Scale unlocks both bearer + basic.
+			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: true,
 			// ADR-045 (#396): Scale gets 25 per-app and 100 per-account.
 			AlertRuleLimitPerApp: 25, AlertRuleLimitPerAccount: 100,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
@@ -863,6 +878,61 @@ func TestPlanEvictionPriorityReservedAllowed(t *testing.T) {
 	for _, c := range cases {
 		if got := c.plan.EvictionPriorityReservedAllowed(); got != c.want {
 			t.Errorf("%s.EvictionPriorityReservedAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthBearerAllowed pins the per-plan tier gate for
+// public_auth_mode='bearer' (issue #477 / ADR-077). Free = false
+// (Free apps stay public-by-default — no-signup friction); Hobby+ =
+// true. apid's updateApp handler reads this via
+// Plan.PublicAuthBearerAllowed() and rejects a 'bearer' PATCH on Free
+// with 402 plan_public_auth_bearer_not_allowed. The 'open' mode is
+// always available regardless of plan — only the bearer opt-in is
+// gated. Unknown plans must fail closed (return false) so a missing
+// plan row never silently unlocks the bearer mode.
+func TestPlanPublicAuthBearerAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthBearerAllowed(); got != c.want {
+			t.Errorf("%s.PublicAuthBearerAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthBasicAllowed pins the per-plan tier gate for
+// public_auth_mode='basic' (issue #477 / ADR-077). Free + Hobby =
+// false (basic adds sealed-credential storage cost the lower tiers
+// don't need; bearer covers the Hobby admin-endpoint use case);
+// Pro+ = true. apid's updateApp handler reads this via
+// Plan.PublicAuthBasicAllowed() and rejects a 'basic' PATCH on
+// Free/Hobby with 402 plan_public_auth_basic_not_allowed. The
+// 'open' mode is always available regardless of plan. Unknown
+// plans must fail closed (return false) — same contract as the
+// bearer test above.
+func TestPlanPublicAuthBasicAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthBasicAllowed(); got != c.want {
+			t.Errorf("%s.PublicAuthBasicAllowed() = %v, want %v", c.plan, got, c.want)
 		}
 	}
 }
