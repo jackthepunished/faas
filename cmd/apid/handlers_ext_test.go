@@ -3234,8 +3234,8 @@ func TestRaiseOverageCap_Clear(t *testing.T) {
 		t.Fatalf("audit data unmarshal: %v", err)
 	}
 	assertCapInt(t, "audit old_cents", data["old_cents"], 7500)
-	if data["new_cents"] != "null" {
-		t.Errorf("audit new_cents = %v, want \"null\"", data["new_cents"])
+	if data["new_cents"] != auditOverageCapNullSentinel {
+		t.Errorf("audit new_cents = %v, want %q", data["new_cents"], auditOverageCapNullSentinel)
 	}
 }
 

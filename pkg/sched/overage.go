@@ -25,7 +25,6 @@ package sched
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sync"
 	"time"
 
@@ -298,10 +297,6 @@ func (alwaysOKOverageChecker) Invalidate(string)                                
 // exclude the overage branch from Engine.admitGate outcomes. Returned
 // by value so each test can capture it without sharing state.
 func AlwaysOKOverageChecker() OverageChecker { return alwaysOKOverageChecker{} }
-
-// errStoreOverage is the sentinel returned by an injected mock store
-// when the test wants to pin the fail-open behaviour.
-var errStoreOverage = errors.New("overage: synthetic store error")
 
 // newMockChecker lets a test inject a custom Check + RecordReached +
 // Invalidate triple. Used by TestOverageChecker_*.

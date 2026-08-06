@@ -344,6 +344,18 @@ func (c *Client) ChangePlan(ctx context.Context, plan string) (AccountResponse, 
 		map[string]string{"plan": plan}, &out)
 }
 
+// RaiseOverageCap sets the account's monthly overage cap (issue #561).
+// Pass a non-negative int64 to set the cap (0 = "no overage allowed");
+// pass nil to clear the cap (NULL round-trip). The server returns the
+// updated account state. Caps are enforced by schedd: once the
+// current-month overage meets/exceeds the cap, new wakes are refused
+// with CodeAdmissionRefused (HTTP 402).
+func (c *Client) RaiseOverageCap(ctx context.Context, overageCapCents *int64) (AccountResponse, error) {
+	body := map[string]any{"overage_cap_cents": overageCapCents}
+	var out AccountResponse
+	return out, c.do(ctx, "POST", "/v1/account/overage-cap", body, &out)
+}
+
 // GetStatusSLO fetches the public SLO snapshot.
 func (c *Client) GetStatusSLO(ctx context.Context) (StatusPage, error) {
 	var out StatusPage

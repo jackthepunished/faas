@@ -331,10 +331,10 @@ func TestListApps_Empty(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	// Empty list, not null — must be `[]` not `null`.
-	if got := strings.TrimSpace(rec.Body.String()); got != "[]" && got != "null" {
+	if got := strings.TrimSpace(rec.Body.String()); got != "[]" && got != jsonNullBody {
 		// Some go versions emit "[]" for empty slices, some emit nothing; both are acceptable.
 		// We only fail if a non-empty body is returned.
-		if got != "" && got != "[]" && got != "null" {
+		if got != "" && got != "[]" && got != jsonNullBody {
 			t.Errorf("body = %q, want [] or null", got)
 		}
 	}

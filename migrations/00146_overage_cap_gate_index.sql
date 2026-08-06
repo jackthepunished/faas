@@ -9,16 +9,11 @@
 --
 -- No schema change required: accounts.overage_cap_cents already
 -- exists from migrations/00054_account_credits.sql (issue #279
--- storage layer) with the CHECK constraint pinning
--- `overage_cap_cents IS NULL OR overage_cap_cents >= 0`. The
--- enforcement layer lives in pkg/sched (Engine.admitGate), pkg/api
--- (CodeAdmissionRefused), and cmd/apid (raiseOverageCap + dashboard
--- form); this migration file is just the slot fence so the migration
--- set stays contiguous 1..N per ADR-041.
---
--- Per ADR-041 (migration slot reservation convention): the fence body
--- is a no-op `SELECT 1;` inside goose's StatementBegin/End markers
--- so goose applies it cleanly and writes a row in goose_db_version.
+-- storage layer). The enforcement layer lives in pkg/sched
+-- (Engine.admitGate), pkg/api (CodeAdmissionRefused), and cmd/apid
+-- (raiseOverageCap + dashboard form); this migration file is just
+-- the slot fence so the migration set stays contiguous 1..N per
+-- ADR-041.
 
 -- +goose Up
 -- +goose StatementBegin

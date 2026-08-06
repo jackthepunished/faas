@@ -1968,7 +1968,7 @@ func (s *server) raiseOverageCapSvc(ctx context.Context, acct state.Account, cen
 	}
 	var newCents any
 	if cents == nil {
-		newCents = "null"
+		newCents = auditOverageCapNullSentinel
 	} else {
 		newCents = *cents
 	}

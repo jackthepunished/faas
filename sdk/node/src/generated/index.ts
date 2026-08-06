@@ -130,6 +130,7 @@ export type { QueueSendRequest } from './models/QueueSendRequest.js';
 export type { QueueSendResponse } from './models/QueueSendResponse.js';
 export type { QueueStateResponse } from './models/QueueStateResponse.js';
 export type { QuotaBlock } from './models/QuotaBlock.js';
+export type { RaiseOverageCapRequest } from './models/RaiseOverageCapRequest.js';
 export type { RateLimitPlain } from './models/RateLimitPlain.js';
 export type { RenameAppRequest } from './models/RenameAppRequest.js';
 export type { RepoResponse } from './models/RepoResponse.js';
