@@ -28,7 +28,8 @@ func (s *server) listApps(w http.ResponseWriter, r *http.Request, acct state.Acc
 	}
 	out := make([]api.AppResponse, 0, len(apps))
 	for _, a := range apps {
-		out = append(out, s.appResponse(a, acct.Plan))
+		resp := s.appResponse(a, acct.Plan)
+		out = append(out, s.withParkedDeploymentRef(r.Context(), resp, a))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -79,7 +80,8 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"runtime":         created.Runtime,
 	})
 	s.emitAppCreated(ctx(r), created)
-	writeJSON(w, http.StatusCreated, s.appResponse(created, acct.Plan))
+	resp := s.appResponse(created, acct.Plan)
+	writeJSON(w, http.StatusCreated, s.withParkedDeploymentRef(r.Context(), resp, created))
 }
 
 // buildApp applies defaults and validates a create request, returning the App to
@@ -410,6 +412,32 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		WarmSnapshotMinRequests: a.WarmSnapshotMinRequests,
 		WarmSnapshotMinMs:       a.WarmSnapshotMinMs,
 	}
+}
+
+// withParkedDeploymentRef (issue #554 / ADR-079 follow-up, AC #3
+// wire) attaches the latest parked deployment reference to an
+// AppResponse. Returns the same struct (with ParkedDeployment
+// populated) on success; on a store error the ParkedDeployment
+// field stays nil and the error is logged at warn — the apid
+// surface still renders the rest of the app, just without the
+// parked-deployment reference. The closed-set reason
+// (liveness_exhausted | lifecycle_park | admin_park) is enforced
+// at the schema layer (migration 00155), so this helper never
+// needs to validate.
+func (s *server) withParkedDeploymentRef(ctx context.Context, resp api.AppResponse, app state.App) api.AppResponse {
+	d, err := s.store.LatestParkedDeploymentForApp(ctx, app.ID)
+	if err != nil {
+		if !errors.Is(err, state.ErrNotFound) {
+			s.log.Warn("apid: parked deployment ref lookup", "app", app.ID, "err", err)
+		}
+		return resp
+	}
+	resp.ParkedDeployment = &api.ParkedDeploymentRef{
+		ID:           d.ID,
+		ParkedReason: d.ParkedReason,
+		ParkedAt:     d.ParkedAt,
+	}
+	return resp
 }
 
 // statePolicyToDTO converts the state-layer `*state.ScalingPolicy`

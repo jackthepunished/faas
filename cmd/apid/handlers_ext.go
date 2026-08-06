@@ -50,7 +50,8 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request, acct state.Accou
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.appResponse(app, acct.Plan))
+	resp := s.appResponse(app, acct.Plan)
+	writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, app))
 }
 
 // validateUpdateApp enforces the per-app cold-wake floor rules
@@ -959,7 +960,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"has_basic_creds": req.PublicAuth.Mode == api.AppPublicAuthModeBasic,
 		})
 	}
-	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))
+	resp := s.appResponse(updated, acct.Plan)
+	writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, updated))
 }
 
 // deleteApp marks the app as deleted (soft delete; PG snapshot GC runs on the
@@ -1234,7 +1236,8 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if req.NewSlug == oldSlug {
 		// Idempotent no-op: skip the DB round-trip and return the
 		// current app shape so retries don't 4xx.
-		writeJSON(w, http.StatusOK, s.appResponse(app, acct.Plan))
+		resp := s.appResponse(app, acct.Plan)
+		writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, app))
 		return
 	}
 	updated, err := s.store.RenameApp(ctx(r), acct.ID, oldSlug, req.NewSlug)
@@ -1267,7 +1270,8 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// both so a future relax of validSlug (or a hostile migration)
 	// cannot smuggle CR/LF into the audit line.
 	s.log.Info("app renamed", "app", updated.ID, "from", logsanitize.Field(oldSlug), "to", logsanitize.Field(req.NewSlug), "account", acct.ID)
-	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))
+	resp := s.appResponse(updated, acct.Plan)
+	writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, updated))
 }
 
 // --- instances -------------------------------------------------------------
@@ -2612,6 +2616,14 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	// tag then drops the field from the wire response. The
 	// dashboard renders "scan pending" on the absence.
 	resp.Scan = s.scanResponse(d)
+	// Issue #554 / ADR-079 follow-up (AC #3 wire): surface the
+	// per-deployment parked_reason + parked_at columns from
+	// migration 00155. omitempty on the DTO handles the "never
+	// parked" branch — the field is absent on the wire for the
+	// vast majority of deployments. The closed-set vocabulary
+	// is enforced at the schema layer.
+	resp.ParkedReason = d.ParkedReason
+	resp.ParkedAt = d.ParkedAt
 	return resp
 }
 
