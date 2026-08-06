@@ -2648,6 +2648,21 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetRequireAuthn {
 		a.RequireAuthn = boolOrFalse(p.RequireAuthn)
 	}
+	// Issue #477 / ADR-077: per-app public_auth
+	// (open|bearer|basic). Memstore mirrors the on-disk shape —
+	// PublicAuthMode is the column-equivalent text + the
+	// PublicAuthBasicSealed byte slice is the secretbox blob
+	// (encrypted by the apid seal step before persistence).
+	// A PATCH mode='open' or mode='bearer' clears the
+	// sealed blob so a stale secretbox row from a previous
+	// mode='basic' PATCH never reaches a fresh request.
+	// SetPublicAuth distinguishes "unset" from
+	// "explicit set"; when Set is true the store overwrites
+	// the column-shaped fields verbatim.
+	if p.SetPublicAuth && p.PublicAuth != nil {
+		a.PublicAuthMode = p.PublicAuth.Mode
+		a.PublicAuthBasicSealed = append([]byte(nil), p.PublicAuth.Sealed...)
+	}
 	// Phase 5 repo decomposition (ADR-050 §3): pkg/reconcile uses
 	// these to stamp a fresh workload identity on a changed app. The
 	// apid handler never sets them (customers don't touch root_dir

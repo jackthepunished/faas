@@ -1880,8 +1880,8 @@ type UpdateAppParams struct {
 	// only reads ciphertext.
 	PublicAuth    *AppPublicAuthUpdate
 	SetPublicAuth bool
-	Status          *AppStatus
-	Manifest        *AppManifest
+	Status        *AppStatus
+	Manifest      *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
