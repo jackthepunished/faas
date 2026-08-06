@@ -110,7 +110,11 @@ func TestDeployHealthcheckMetal(t *testing.T) {
 	// set doesn't collide with the wake-latency test's `hello` or
 	// with PR-C's `portfix-*`.
 	slug := "healthzfix-" + randHexSuffix()
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != 201 {
+	// Issue #695 / ADR-080: post-flip Pro defaults require_authn=true
+	// + public_auth_mode=bearer. This test probes the routed URL
+	// anonymously (doGetWithHost below), so we opt out at create-time.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != 201 {
 		t.Fatalf("create app %q: status=%d", slug, got)
 	}
 	appID := mustGetAppID(t, h, key, slug)

@@ -141,16 +141,24 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// customers are unaffected because migration 00155
 	// grand-fathered every pre-flip row with
 	// auth_default_flipped_at and did NOT flip their
-	// require_authn / public_auth_mode values. The plan gate
-	// for an explicit PATCH-true still fires at the PATCH
-	// handler (issue #560 + ADR-079), not at Create time — a
-	// Free customer's CreateApp call with require_authn=true
-	// still gets 403 plan_require_authn_not_allowed via the
-	// standard plan-gate shape. The per-request override on
-	// Pro/Scale lets a customer opt out at create time (e.g.
-	// a Pro customer's brand-new staging app that wants the
-	// public path), and a Hobby customer can PATCH-false
-	// immediately after creation to keep the public path.
+	// require_authn / public_auth_mode values.
+	//
+	// Plan-gate at create-time: a Free/Hobby customer who POSTs
+	// require_authn=true gets 403 plan_require_authn_not_allowed
+	// BEFORE the App is built — same shape as the PATCH-time
+	// gate (handlers_ext.go:268). Without this gate a Free
+	// customer's create request would silently land as true
+	// (bypassing the Free-tier contract that RequireAuthnAllowed
+	// is supposed to enforce). Hobby unlocks the gate as a
+	// default but NOT as an opt-in: a Hobby customer can keep
+	// the default true on creation but cannot escalate back to
+	// true once they PATCH-false (the PATCH-time gate blocks it).
+	if req.RequireAuthn != nil && *req.RequireAuthn && !acct.Plan.RequireAuthnAllowed() {
+		return state.App{}, api.NewProblem(http.StatusForbidden,
+			api.CodePlanRequireAuthnNotAllowed,
+			"Per-app authentication is not allowed on this plan",
+			"Free and Hobby tiers do not support per-app require_authn; upgrade to Pro or higher.")
+	}
 	requireAuthn := acct.Plan.RequireAuthnDefault()
 	if req.RequireAuthn != nil {
 		requireAuthn = *req.RequireAuthn
@@ -185,12 +193,14 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 		// Issue #560 + issue #695 / ADR-080: see the
 		// plan-default block above. Default is per-plan
 		// (Plan.RequireAuthnDefault + Plan.PublicAuthModeDefault);
-		// the per-plan gate (RequireAuthnAllowed +
-		// PublicAuthBearerAllowed) is consulted only when an
-		// existing app is PATCHed, not at Create time. State
-		// layer is the canonical source (apps.require_authn +
-		// apps.public_auth_mode columns); the DTO surfaces
-		// the same values.
+		// the per-plan RequireAuthnAllowed gate is enforced
+		// at create-time too (see the rejection branch above)
+		// AND at PATCH-time (handlers_ext.go:268) so a Free
+		// customer's escalation surfaces as 403
+		// plan_require_authn_not_allowed before any SQL
+		// write. State layer is the canonical source
+		// (apps.require_authn + apps.public_auth_mode columns);
+		// the DTO surfaces the same values.
 		RequireAuthn:   requireAuthn,
 		PublicAuthMode: publicAuthMode,
 		// Coerce to the plan minimums when the request asked for a

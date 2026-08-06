@@ -159,7 +159,7 @@ func (s *Service) applyActions(
 	// Tx is the apid path, not the reconcile path).
 	newApps := make([]state.App, 0, len(creates))
 	for _, c := range creates {
-		app := workloadToDraftApp(project, c.Workload, c.StartCommand)
+		app := workloadToDraftApp(project, c.Workload, c.StartCommand, acct.Plan)
 		newApps = append(newApps, app)
 	}
 	added := make([]state.App, 0, len(newApps))
@@ -260,7 +260,14 @@ func (s *Service) applyRemove(
 // normalisation must land in BOTH paths at the same time, with
 // a slug migration. The store stamps id, created_at, status, and
 // backfills project_id on insert.
-func workloadToDraftApp(project state.Project, w reposcan.Workload, startCmd string) state.App {
+//
+// plan is the owning account's plan — used to stamp the per-plan
+// default for require_authn + public_auth_mode (issue #695 / ADR-080).
+// Without this stamp the project-sync path bypasses apid's buildApp
+// and a Pro customer gets a public-by-default app via `faas project
+// sync` while direct POST /v1/apps on the same plan returns
+// bearer-by-default — same plan, two different defaults.
+func workloadToDraftApp(project state.Project, w reposcan.Workload, startCmd string, plan api.Plan) state.App {
 	class := state.WorkloadClass(string(w.Class))
 	if class == "" {
 		class = state.WorkloadClassHTTP
@@ -271,13 +278,15 @@ func workloadToDraftApp(project state.Project, w reposcan.Workload, startCmd str
 		class = state.WorkloadClassHTTP
 	}
 	return state.App{
-		AccountID:     project.AccountID,
-		ProjectID:     project.ID,
-		Slug:          w.Name,
-		RootDir:       w.RootDir,
-		WorkloadName:  w.Name,
-		WorkloadClass: class,
-		StartCommand:  startCmd,
+		AccountID:      project.AccountID,
+		ProjectID:      project.ID,
+		Slug:           w.Name,
+		RootDir:        w.RootDir,
+		WorkloadName:   w.Name,
+		WorkloadClass:  class,
+		StartCommand:   startCmd,
+		RequireAuthn:   plan.RequireAuthnDefault(),
+		PublicAuthMode: plan.PublicAuthModeDefault(),
 	}
 }
 

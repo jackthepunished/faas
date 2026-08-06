@@ -96,7 +96,11 @@ func TestDeployOverridePortMetal(t *testing.T) {
 	// instance (if cleanup lost the harness) doesn't shadow the
 	// pickup order.
 	slug := "portfix-" + randHexSuffix()
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != 201 {
+	// Issue #695 / ADR-080: post-flip Pro defaults require_authn=true
+	// + public_auth_mode=bearer. The doGetWithHost probes below hit
+	// the routed URL anonymously — opt out at create-time.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != 201 {
 		t.Fatalf("create app %q: status=%d", slug, got)
 	}
 	appID := mustGetAppID(t, h, key, slug)

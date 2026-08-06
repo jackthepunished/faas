@@ -285,19 +285,37 @@ func cmdApps() int {
 // the `gregale app list` table. Prefix matches the customer's
 // observable auth state:
 //
-//	"AUTH: open"               — public, anonymous traffic allowed.
-//	"AUTH: required"           — require_authn=true (bearer or open).
-//	"AUTH: required + basic"   — bearer-mode chain + basic creds set.
+//	"AUTH: open"               — public, anonymous traffic allowed
+//	                              (require_authn=false).
+//	"AUTH: required"           — require_authn=true + public_auth_mode='open'.
+//	                              Gateway demands a Bearer token but
+//	                              accepts any — the bare pre-#477
+//	                              chain (kept for Hobby compat).
+//	"AUTH: bearer"             — require_authn=true + public_auth_mode='bearer'.
+//	                              Pro/Scale default post-#695; gateway
+//	                              validates the Bearer token against
+//	                              the per-account API key table.
+//	"AUTH: required + basic"   — require_authn=true + public_auth_mode='basic'
+//	                              + a sealed basic-cred pair is set
+//	                              (HasBasicCreds).
+//
+// The mode-aware branch is required: a Hobby bearer-shaped fixture
+// (require_authn=true, public_auth_mode='open') and a Pro fresh
+// default (require_authn=true, public_auth_mode='bearer') used to
+// both print "AUTH: required" — the review caught the missing
+// distinction. The order of cases matters: HasBasicCreds wins over
+// Mode (a basic-mode app with no creds is misconfigured and the
+// operator-facing surface still calls it out as basic).
 //
 // Suffix renders "since YYYY-MM-DD" only when auth_default_flipped_at
 // is non-null (pre-flip apps grand-fathered by migration 00156).
-// Falls back to UTC date-only when the time zone or wall time is
-// degenerate — dashboard surfaces the same field with full RFC 3339.
 func formatAppAuth(a api.AppResponse) string {
 	var prefix string
 	switch {
-	case a.RequireAuthn && a.PublicAuth.HasBasicCreds:
+	case a.RequireAuthn && a.PublicAuth.Mode == api.AppPublicAuthModeBasic && a.PublicAuth.HasBasicCreds:
 		prefix = "AUTH: required + basic"
+	case a.RequireAuthn && a.PublicAuth.Mode == api.AppPublicAuthModeBearer:
+		prefix = "AUTH: bearer"
 	case a.RequireAuthn:
 		prefix = "AUTH: required"
 	default:

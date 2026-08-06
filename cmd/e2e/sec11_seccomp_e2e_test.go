@@ -129,7 +129,11 @@ func TestSec11_SeccompFilterEnforced_CrossProcess(t *testing.T) {
 	img, ref := e2etest.HelloImageAboveBase("library/hello", helloBody)
 	ref = registry.AddImage("library/hello", img)
 
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: "m8-seccomp", Type: "app"}); got != http.StatusCreated {
+	// Issue #695 / ADR-080: post-flip Hobby defaults require_authn=true.
+	// The doGetWithHost probes below hit the routed URL anonymously —
+	// opt out at create-time.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: "m8-seccomp", Type: "app", RequireAuthn: &falsy}); got != http.StatusCreated {
 		t.Fatalf("create app: status=%d", got)
 	}
 	appID := mustGetAppID(t, h, key, "m8-seccomp")

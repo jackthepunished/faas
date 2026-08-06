@@ -2398,6 +2398,28 @@ func (s *PgStore) CountAuthDefaultFlippedApps(ctx context.Context, accountID str
 	return n, err
 }
 
+// AuthDefaultFlippedAt (issue #695 / ADR-080) reads the
+// `apps.auth_default_global_flipped` event's `at` timestamp. The
+// migration emits exactly one of these rows on apply (guarded by
+// `WHERE NOT EXISTS`); a replay produces no additional row, so the
+// MIN/MAX query always returns the original migration time. Returns
+// the zero time when no such event has been recorded yet (the apid
+// caller falls back to a "Recently" copy rather than blocking the
+// banner on a successful store read).
+func (s *PgStore) AuthDefaultFlippedAt(ctx context.Context) (time.Time, error) {
+	var t *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select min(at) from events where kind = 'apps.auth_default_global_flipped'`,
+	).Scan(&t)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if t == nil {
+		return time.Time{}, nil
+	}
+	return *t, nil
+}
+
 func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (App, error) {
 	manifestBytes := []byte(nil)
 	if p.Manifest != nil {
@@ -2449,7 +2471,16 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   -- (mode='open' with stale sealed blob from a prior
 		   -- mode='basic' PATCH) clears the blob atomically.
 		   public_auth_mode   = case when $41 then $42::text  else public_auth_mode   end,
-		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end
+		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end,
+			   -- Issue #695 / ADR-080: grand-father marker. Cleared
+			   -- when the customer makes a deliberate PATCH choice
+			   -- on a grandfathered app (ClearAuthDefaultFlippedAt
+			   -- flag set by apid when SetRequireAuthn OR
+			   -- SetPublicAuth is true). The dashboard banner
+			   -- counts apps.auth_default_flipped_at IS NOT NULL
+			   -- per account; clearing the stamp brings the count
+			   -- toward zero and stops the banner from re-rendering.
+			   auth_default_flipped_at = case when $44 then NULL else auth_default_flipped_at end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2507,7 +2538,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// p.PublicAuth with Sealed=nil in that case).
 		p.SetPublicAuth,
 		derefString(ptrOrEmpty(p.PublicAuth)),
-		nilOrBytes(p.PublicAuth))
+		nilOrBytes(p.PublicAuth),
+		// Issue #695 / ADR-080: grand-father clear path. apid sets
+		// this when the customer PATCHed require_authn or public_auth,
+		// which is the deliberate-choice signal the dashboard banner
+		// looks for. No-op for new post-flip apps (column is already
+		// NULL). A no-touch PATCH (RAM_MB-only, etc.) leaves the
+		// stamp alone so the banner keeps re-rendering.
+		p.ClearAuthDefaultFlippedAt)
 	return scanApp(row)
 }
 
