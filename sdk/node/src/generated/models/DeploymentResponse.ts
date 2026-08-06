@@ -62,5 +62,13 @@ export type DeploymentResponse = {
    * Per-deploy grype CVE scan surface (issue #464 / ADR-055). nil on pre-feature rows (the migration backfilled scan_status='skipped' + scan_result={reason: 'pre-feature'} on those; the apid read path returns nil so the dashboard / CLI see a clean absence — the /scan route surfaces the 'skipped' sentinel for those rows). Non-nil for post-feature rows in any of the {pending, complete, failed, skipped} states. The customer can deploy a CRITICAL-CVE image; the dashboard shows it; that is the contract (no enforcement at the deploy gate).
    */
   scan?: (ScanResult | null);
+  /**
+   * Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00155). Closed-set vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked deployments — surfaced as no field on the wire via omitempty.
+   */
+  parked_reason?: 'liveness_exhausted' | 'lifecycle_park' | 'admin_park';
+  /**
+   * Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for never-parked deployments.
+   */
+  parked_at?: string | null;
 };
 
