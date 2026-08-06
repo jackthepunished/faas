@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00146 (issue #561 — spend cap pauses
+// Migration-apply test for 00152 (issue #561 — spend cap pauses
 // workload). The migration is a no-op slot fence per ADR-041; this
 // test pins:
 //
@@ -9,14 +9,13 @@
 //     (NULL-or-non-negative CHECK still in place from #279).
 //  3. Replay-safety: a second MigrateUp is a no-op.
 //
-// Slot note: 00145 (sessions_binding, PR #658) is the highest real
-// schema on origin/main after PR #658's renumber cascade. 00144 is
-// api_keys_provenance. 00135-00142 are PR #654's renumber fences.
-// 00143 is apps_require_authn (PR #654). Slot 146 is the first open
-// number after that cascade. The fence may be `git rm`-shadowed by
-// a parallel PR's real schema landing at 146 first — see ADR-041
-// and the memory cross-pr-slot-gate-races-with-active-pr for the
-// merge order.
+// Slot note: 00151 (wait_until_tail) is the highest real
+// migration on origin/main after the latest merge cascade. 00148 is
+// reserved by main and 00149 is owned by webhook_deliveries; 00150
+// is another reservation. Slot 152 is the first open number after
+// those merged entries. The fence may be renumbered again if another
+// migration claims 152 before this PR merges; follow ADR-041 and the
+// migration slot-gate workflow.
 package migrations_test
 
 import (
@@ -27,7 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00146_OverageCapGateIndex(t *testing.T) {
+func TestMigrations_00152_OverageCapGateIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
