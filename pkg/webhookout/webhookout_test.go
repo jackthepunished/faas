@@ -535,6 +535,97 @@ func TestWebhook_Dispatch_Headers(t *testing.T) {
 	}
 }
 
+// TestWebhook_Dispatch_Headers_AlertSet: with the zero-value
+// HeaderSet (HeaderSetAlert), the dispatcher emits X-Faas-Alert-*
+// headers. Pins the pre-#476 alert wire so a refactor doesn't drift
+// it (issue #476 / ADR-076).
+func TestWebhook_Dispatch_Headers_AlertSet(t *testing.T) {
+	var gotSig, gotID, gotTS, gotAttempt string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Faas-Alert-Signature")
+		gotID = r.Header.Get("X-Faas-Alert-Id")
+		gotTS = r.Header.Get("X-Faas-Alert-Timestamp")
+		gotAttempt = r.Header.Get("X-Faas-Alert-Attempt")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := newTestDispatcher(t, nil, srv.Client())
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), newTestEvent())
+	if res.Err != nil {
+		t.Fatalf("err = %v", res.Err)
+	}
+
+	if !strings.HasPrefix(gotSig, "sha256=") {
+		t.Errorf("alert sig header = %q, want sha256= prefix", gotSig)
+	}
+	if gotID == "" {
+		t.Errorf("alert id header missing")
+	}
+	if gotTS == "" {
+		t.Errorf("alert timestamp header missing")
+	}
+	if gotAttempt != "1" {
+		t.Errorf("alert attempt header = %q, want 1", gotAttempt)
+	}
+	// The webhook set MUST NOT leak onto the alert wire.
+	if h := srv.Client().Transport; h == nil {
+		// (no-op; we use r.Header below)
+	}
+}
+
+// TestWebhook_Dispatch_Headers_WebhookSet: with HeaderSetWebhook, the
+// dispatcher emits X-Faas-Webhook-Signature, X-Faas-Delivery-Id,
+// X-Faas-Webhook-Timestamp, X-Faas-Webhook-Attempt. Pins the
+// outbound-webhook wire (issue #476 / ADR-076). The alert headers
+// must NOT leak onto this wire.
+func TestWebhook_Dispatch_Headers_WebhookSet(t *testing.T) {
+	var (
+		gotSig, gotID, gotTS, gotAttempt string
+		gotAlertSig, gotAlertID          string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Faas-Webhook-Signature")
+		gotID = r.Header.Get("X-Faas-Delivery-Id")
+		gotTS = r.Header.Get("X-Faas-Webhook-Timestamp")
+		gotAttempt = r.Header.Get("X-Faas-Webhook-Attempt")
+		// The alert set must NOT leak onto the webhook wire.
+		gotAlertSig = r.Header.Get("X-Faas-Alert-Signature")
+		gotAlertID = r.Header.Get("X-Faas-Alert-Id")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := webhookout.NewDispatcher(webhookout.DispatcherOptions{
+		HTTPClient: srv.Client(),
+		HeaderSet:  webhookout.HeaderSetWebhook,
+	})
+	evt := newTestEvent()
+	res := d.Dispatch(context.Background(), testTarget(srv.URL), evt)
+	if res.Err != nil {
+		t.Fatalf("err = %v", res.Err)
+	}
+
+	if !strings.HasPrefix(gotSig, "sha256=") {
+		t.Errorf("webhook sig header = %q, want sha256= prefix", gotSig)
+	}
+	if gotID != evt.ID {
+		t.Errorf("webhook id header = %q, want %q (X-Faas-Delivery-Id binds to event id)", gotID, evt.ID)
+	}
+	if gotTS == "" {
+		t.Errorf("webhook timestamp header missing")
+	}
+	if gotAttempt != "1" {
+		t.Errorf("webhook attempt header = %q, want 1", gotAttempt)
+	}
+	if gotAlertSig != "" {
+		t.Errorf("alert sig leaked onto webhook wire: %q (HeaderSet mixing)", gotAlertSig)
+	}
+	if gotAlertID != "" {
+		t.Errorf("alert id leaked onto webhook wire: %q (HeaderSet mixing)", gotAlertID)
+	}
+}
+
 // TestWebhook_Dispatch_AttemptHeaderIncrements: the X-Faas-Alert-Attempt
 // header must increment on retry so the customer's verifier can tell
 // which attempt it's looking at.

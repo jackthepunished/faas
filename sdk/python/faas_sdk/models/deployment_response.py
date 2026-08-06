@@ -12,7 +12,6 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.deployment_healthcheck import DeploymentHealthcheck
     from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
-    from ..models.scan_result import ScanResult
 
 
 T = TypeVar("T", bound="DeploymentResponse")
@@ -61,17 +60,10 @@ class DeploymentResponse:
     (default); positive value is the deployment's own floor. Effective per-instance floor =
     max(app.EffectiveMinInstances(), d.EffectiveMinInstances()). Validated against the parent app's plan
     MaxMinInstances cap on PATCH."""
-    scan: None | ScanResult | Unset = UNSET
-    """Per-deploy grype CVE scan surface (issue #464 / ADR-055). nil on pre-feature rows (the migration backfilled
-    scan_status='skipped' + scan_result={reason: 'pre-feature'} on those; the apid read path returns nil so the
-    dashboard / CLI see a clean absence — the /scan route surfaces the 'skipped' sentinel for those rows). Non-nil
-    for post-feature rows in any of the {pending, complete, failed, skipped} states. The customer can deploy a
-    CRITICAL-CVE image; the dashboard shows it; that is the contract (no enforcement at the deploy gate)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
-        from ..models.scan_result import ScanResult
 
         id = self.id
 
@@ -137,14 +129,6 @@ class DeploymentResponse:
 
         min_instances = self.min_instances
 
-        scan: dict[str, Any] | None | Unset
-        if isinstance(self.scan, Unset):
-            scan = UNSET
-        elif isinstance(self.scan, ScanResult):
-            scan = self.scan.to_dict()
-        else:
-            scan = self.scan
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -181,8 +165,6 @@ class DeploymentResponse:
             field_dict["override_healthcheck"] = override_healthcheck
         if min_instances is not UNSET:
             field_dict["min_instances"] = min_instances
-        if scan is not UNSET:
-            field_dict["scan"] = scan
 
         return field_dict
 
@@ -190,7 +172,6 @@ class DeploymentResponse:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
         from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
-        from ..models.scan_result import ScanResult
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -270,23 +251,6 @@ class DeploymentResponse:
 
         min_instances = d.pop("min_instances", UNSET)
 
-        def _parse_scan(data: object) -> None | ScanResult | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                scan_type_0 = ScanResult.from_dict(data)
-
-                return scan_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(None | ScanResult | Unset, data)
-
-        scan = _parse_scan(d.pop("scan", UNSET))
-
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -306,7 +270,6 @@ class DeploymentResponse:
             override_port=override_port,
             override_healthcheck=override_healthcheck,
             min_instances=min_instances,
-            scan=scan,
         )
 
         deployment_response.additional_properties = d

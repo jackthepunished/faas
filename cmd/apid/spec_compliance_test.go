@@ -41,6 +41,7 @@ const (
 	wakeTLFile    = "wake_timeline.go" // issue #517 PR-C / ADR-064
 	orgsFile      = "orgs.go"          // issue #190 / IAM-6 / ADR-061 PR 5
 	scanFile      = "dto_scan.go"      // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
+	webhooksFile  = "webhooks.go"      // issue #476 / ADR-076
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -106,6 +107,17 @@ var dtoExclude = map[string]bool{
 	"OrgRow":           true,
 	"OrgMemberRow":     true,
 	"OrgInvitationRow": true,
+	// Issue #476 / ADR-076 — internal conversion structs (state row
+	// → wire DTO) and server-minted options / request bodies. The
+	// wire DTOs are AppWebhookResponse / AppWebhookDeliveryResponse
+	// etc.; the *Row types are the typed counterparts at the
+	// pkg/api ↔ pkg/state seam. ListAppWebhookDeliveriesOptions and
+	// RotateAppWebhookSecretRequest are server-side concerns that
+	// never appear in the wire spec.
+	"AppWebhookRow":                   true,
+	"AppWebhookDeliveryRow":           true,
+	"ListAppWebhookDeliveriesOptions": true,
+	"RotateAppWebhookSecretRequest":   true,
 }
 
 // codeExclude lists Code* constants that are intentionally not in the
@@ -531,6 +543,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", wakeTLFile),
 		filepath.Join(root, "pkg", "api", orgsFile),
 		filepath.Join(root, "pkg", "api", scanFile),
+		filepath.Join(root, "pkg", "api", webhooksFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

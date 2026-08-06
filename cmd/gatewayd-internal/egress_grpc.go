@@ -77,6 +77,33 @@ type egressGRPCListener struct {
 	log        *slog.Logger
 }
 
+// chmodSocket applies mode to a unix-socket path, retrying briefly
+// when the path is briefly unresolvable. The kernel publishes the
+// dirent asynchronously after net.Listen returns; under tmpfs load
+// (CI runner pool, observed cycle 13 of a 16-cycle restart loop) the
+// publish can lag tens of ms past the listen return, so the next
+// syscall sees ENOENT. Retry up to 500ms before failing the start —
+// production callers always reach start() during boot when the
+// listener has never existed, so a single ENOENT is expected; the
+// 16-cycle CI test surfaced the long tail.
+func chmodSocket(path string, mode os.FileMode) error {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var lastErr error
+	for {
+		if err := os.Chmod(path, mode); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // newEgressGRPCListener constructs (but does not start) the
 // gRPC listener. target is the bind target (unix:///path or
 // tcp://host:port for multi-box). tlsCfg is the server-side
@@ -148,7 +175,11 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("gatewayd egress: listen %s: %w", l.socketPath, err)
 		}
-		if err := os.Chmod(l.socketPath, egressGRPCSocketMode); err != nil {
+		// The kernel publishes the dirent asynchronously after
+		// net.Listen returns. Under tmpfs load (CI runner pool),
+		// the publish can lag a few ms past the listen return —
+		// the next syscall (chmod) sees ENOENT. Retry briefly.
+		if err := chmodSocket(l.socketPath, egressGRPCSocketMode); err != nil {
 			_ = lis.Close()
 			return fmt.Errorf("gatewayd egress: chmod: %w", err)
 		}

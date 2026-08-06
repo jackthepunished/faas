@@ -345,6 +345,20 @@ type Limits struct {
 	// read in pkg/state.CreateAlertRuleIfUnderQuota.
 	AlertRuleLimitPerAccount int
 
+	// WebhookPerApp caps how many outbound webhook subscriptions a
+	// single app may register (issue #476 / ADR-076). The plan gate
+	// is enforced in pkg/state.CreateAppWebhookIfUnderQuota under an
+	// apps-row FOR UPDATE lock — same TOCTOU-defence pattern as
+	// CreateCronIfUnderQuota. The cap defends against a noisy
+	// customer pinning every event to a single target.
+	WebhookPerApp int
+	// WebhookPerAccount caps the total outbound webhook subscriptions
+	// an account may hold across every app. Independent of
+	// WebhookPerApp — the per-account cap defends against the
+	// N-apps-times-cap-per-app bypass. Both enforced in
+	// pkg/state.CreateAppWebhookIfUnderQuota.
+	WebhookPerAccount int
+
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
 	// (ADR-031, tier-2 of the network roadmap). Free + Hobby keep
 	// allowlist opt-out because the abuse-desk use case is a
@@ -570,6 +584,11 @@ var planLimits = map[Plan]Limits{
 		// — the value is informational here for fail-closed accessors.
 		AlertRuleLimitPerApp:     0,
 		AlertRuleLimitPerAccount: 0,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Free has no webhooks — the handler returns 402
+		// CodePlanWebhooksNotAllowed before the store is touched.
+		WebhookPerApp:     0,
+		WebhookPerAccount: 0,
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
@@ -720,6 +739,10 @@ var planLimits = map[Plan]Limits{
 		// account-wide rules.
 		AlertRuleLimitPerApp:     3,
 		AlertRuleLimitPerAccount: 10,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
+		WebhookPerApp:     3,
+		WebhookPerAccount: 10,
 		// Per-account rate limit (ADR-040): Hobby gets 200/min — ~10× the
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
@@ -855,6 +878,10 @@ var planLimits = map[Plan]Limits{
 		// Pro app budget (25 apps vs Hobby's 5).
 		AlertRuleLimitPerApp:     10,
 		AlertRuleLimitPerAccount: 30,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
+		WebhookPerApp:     10,
+		WebhookPerAccount: 30,
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
@@ -997,6 +1024,10 @@ var planLimits = map[Plan]Limits{
 		// the per-account figure absorbs the fan-out.
 		AlertRuleLimitPerApp:     25,
 		AlertRuleLimitPerAccount: 100,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
+		WebhookPerApp:     25,
+		WebhookPerAccount: 100,
 		// Per-account rate limit (ADR-040): Scale gets 5000/min — ~10× the
 		// Scale per-app rps (500). The fleet-summed alert at 100/min/5m
 		// (FaasPerAccountRateLimitSpike) triggers well before any single
@@ -2031,6 +2062,31 @@ func (p Plan) AlertRuleLimitPerAccount() int {
 		return 0
 	}
 	return l.AlertRuleLimitPerAccount
+}
+
+// WebhookPerApp returns the per-app outbound-webhook subscription cap
+// for the plan (issue #476 / ADR-076). 0 for Free (the handler
+// returns 402 CodePlanWebhooksNotAllowed before the store is touched);
+// positive for Hobby/Pro/Scale. Same fail-closed contract as
+// AlertRuleLimitPerApp.
+func (p Plan) WebhookPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WebhookPerApp
+}
+
+// WebhookPerAccount returns the per-account outbound-webhook
+// subscription cap. Independent of WebhookPerApp — same
+// N-apps-times-cap-per-app defence. Same fail-closed contract as
+// AlertRuleLimitPerAccount.
+func (p Plan) WebhookPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WebhookPerAccount
 }
 
 // TrustedSignerCountMax returns the per-app cosign trusted-publisher

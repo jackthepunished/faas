@@ -114,6 +114,14 @@ type MemStore struct {
 	// row (mirrors the UNIQUE-index floor in Postgres).
 	alertRules      map[string]AlertRule
 	alertDeliveries map[string]AlertDelivery
+	// appWebhooks + appWebhookDeliveries back the issue #476
+	// outbound webhook subscription + ledger surface. Keyed by
+	// webhookID / deliveryID. The unique (app_id, target_url)
+	// invariant is enforced at insert time. MemStore holds no
+	// concurrency control beyond m.mu — the dispatcher's claim
+	// query is a single goroutine today.
+	appWebhooks          map[string]AppWebhook
+	appWebhookDeliveries map[string]AppWebhookDelivery
 	// alertClaimKeys tracks the (ruleID, idempotency_key) → claimTime
 	// pair so MemStore mirrors the Postgres UNIQUE(idempotency_key)
 	// + last_fired_at dedupe behaviour. Two claims with the SAME
@@ -451,20 +459,22 @@ func NewMemStore() *MemStore {
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
-		buildProvenance:  map[string]BuildProvenance{},
-		domains:          map[string]CustomDomain{},
-		crons:            map[string]Cron{},
-		alertRules:       map[string]AlertRule{},
-		alertDeliveries:  map[string]AlertDelivery{},
-		alertClaimKeys:   map[string]time.Time{},
-		invocations:      map[string]Invocation{},
-		instances:        map[string]Instance{},
-		loginTokens:      map[string]LoginToken{},
-		cliAuthCodes:     map[string]CliAuthCode{},
-		accountPasswords: map[string]AccountPassword{},
-		oauthLinks:       map[string]OAuthLink{},
-		deploymentLogs:   map[string][]LogEntry{},
-		deploymentSeq:    map[string]int64{},
+		buildProvenance:      map[string]BuildProvenance{},
+		domains:              map[string]CustomDomain{},
+		crons:                map[string]Cron{},
+		alertRules:           map[string]AlertRule{},
+		alertDeliveries:      map[string]AlertDelivery{},
+		appWebhooks:          map[string]AppWebhook{},
+		appWebhookDeliveries: map[string]AppWebhookDelivery{},
+		alertClaimKeys:       map[string]time.Time{},
+		invocations:          map[string]Invocation{},
+		instances:            map[string]Instance{},
+		loginTokens:          map[string]LoginToken{},
+		cliAuthCodes:         map[string]CliAuthCode{},
+		accountPasswords:     map[string]AccountPassword{},
+		oauthLinks:           map[string]OAuthLink{},
+		deploymentLogs:       map[string][]LogEntry{},
+		deploymentSeq:        map[string]int64{},
 		// Issue #463 / ADR-069 / PR-B — per-workload filesystem
 		// handles (mirrors migration 00119's PK + ON CONFLICT
 		// semantics).
@@ -7790,7 +7800,7 @@ func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, 
 
 	if in.AppID != "" {
 		app, ok := m.apps[in.AppID]
-		if !ok || app.Status == "deleted" {
+		if !ok || app.Status == AppDeleted {
 			return AlertRule{}, ErrNotFound
 		}
 		// Per-app count: count every rule that pins this app,
@@ -7821,7 +7831,7 @@ func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, 
 		}
 		if r.AppID != "" {
 			app, ok := m.apps[r.AppID]
-			if !ok || app.Status == "deleted" {
+			if !ok || app.Status == AppDeleted {
 				continue
 			}
 		}

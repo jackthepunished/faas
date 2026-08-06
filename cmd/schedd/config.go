@@ -77,6 +77,15 @@ type Config struct {
 	// a unix socket.
 	OwnerUser string `toml:"owner_user"`
 
+	// HostAgeIdentityPath is the path to the age X25519 identity
+	// schedd uses to open sealed webhook secrets (issue #476 /
+	// ADR-076). When non-empty, the dispatcher unseals the row's
+	// SecretSealed with this identity before signing the HMAC. When
+	// empty, the dispatcher falls back to pkg/secretbox.DefaultHostKeyPath
+	// (the same path githubd + apid use). Mirrors cmd/meterd/main.go:939
+	// where this pattern first landed.
+	HostAgeIdentityPath string `toml:"host_age_identity_path"`
+
 	// MetricsAddr is the optional bind address for /metrics. Empty disables it.
 	MetricsAddr string `toml:"metrics_addr"`
 

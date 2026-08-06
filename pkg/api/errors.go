@@ -728,7 +728,7 @@ func StatusForCode(code string) int {
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeSourceInvalid, CodeBuildUndetected, CodeValidation, CodeCronInvalid,
-		CodeAlertRuleInvalid, CodeHandlerMissing, CodeImageRequired:
+		CodeAlertRuleInvalid, CodeAppWebhookInvalid, CodeHandlerMissing, CodeImageRequired:
 		return http.StatusBadRequest
 	case CodeCapacity, CodeBuildOOM, CodeBuildTimeout, CodeOAuthProviderUnavailable, CodeWaitForWarm:
 		return http.StatusServiceUnavailable
@@ -855,6 +855,15 @@ func StatusForCode(code string) int {
 	// (plan-tier and budget-shape refusals all live here).
 	case CodeAdmissionRefused:
 		return http.StatusPaymentRequired
+	// Issue #476 / ADR-076 — webhook subscription gate + per-plan
+	// per-app/per-account webhook quota. Webhooks are Hobby+; the
+	// Free plan gets a 402 mirroring the existing Cron/AlertRules
+	// 402 family. Quota overage (Hobby cap=5/acct, Pro cap=100/acct,
+	// Scale cap=500/acct) is a 403 like the existing cron quota.
+	case CodePlanWebhooksNotAllowed:
+		return http.StatusPaymentRequired
+	case CodePlanWebhookQuota:
+		return http.StatusForbidden
 	// Issue #462 / ADR-058 — scaling policy gate. PR-A History
 	// (2026-07-31): Hobby+ tier-up for max_instances. 403 mirrors
 	// CodePlanMinInstancesNotAllowed.
@@ -1131,6 +1140,49 @@ const CodePlanAlertRulesNotAllowed = "plan_alert_rules_not_allowed"
 // the body.
 const CodePlanAlertRuleQuota = "plan_alert_rule_quota"
 
+// PlanQuotaScopeAccount / PlanQuotaScopeApp are the values the
+// *Quota functions receive in their `scope` argument. Mirrors
+// state.CronQuotaScopeAccount / CronQuotaScopeApp and the alert /
+// webhook analogues (state.AlertRuleQuotaScopeAccount etc).
+// Kept here as plain string consts so pkg/api does not import
+// pkg/state (the pkg/api ↔ pkg/state cycle is a load-bearing
+// constraint — memory: pkg-api-cannot-import-pkg-state). The three
+// site-name strings ("this account" / "this app") that drive the
+// goconst rule live below alongside these.
+const (
+	PlanQuotaScopeAccount = "account"
+	PlanQuotaScopeApp     = "app"
+)
+
+// PlanQuotaScopeDisplayName returns the human-readable scope label
+// used in the per-plan-quota 403 body ("this account" / "this app").
+// Exported so handler tests can assert against the same strings
+// without re-declaring the literals.
+func PlanQuotaScopeDisplayName(scope string) string {
+	switch scope {
+	case PlanQuotaScopeAccount:
+		return "this account"
+	default:
+		return "this app"
+	}
+}
+
+// CodePlanWebhooksNotAllowed is the 402 the customer sees when
+// the plan doesn't unlock outbound webhooks at all (Free today).
+// Issue #476 / ADR-076. Mirrors CodePlanAlertRulesNotAllowed.
+const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
+
+// CodePlanWebhookQuota is the 403 the customer sees when the plan
+// DOES unlock webhooks but the per-app or per-account cap was
+// reached. Distinct from CodePlanWebhooksNotAllowed so the CLI
+// can branch on upsell-vs-delete copy without parsing the body.
+const CodePlanWebhookQuota = "plan_webhook_quota"
+
+// CodeAppWebhookInvalid is the 400 the customer sees for any
+// malformed webhook body — missing target_url, invalid retry_policy,
+// out-of-vocabulary event, oversize webhook_secret, etc.
+const CodeAppWebhookInvalid = "app_webhook_invalid"
+
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
 // when the customer's plan has CronLimitPerApp == 0 (Free today).
 // Fires BEFORE the store is touched so a Free customer gets a clean
@@ -1148,12 +1200,7 @@ func ErrPlanCronsNotAllowed(p Plan) *Problem {
 // because the plan DOES unlock crons — the right copy is
 // "delete a cron to add another", not "upgrade to Hobby".
 func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
-	var scopeName string
-	if scope == "account" {
-		scopeName = "this account"
-	} else {
-		scopeName = "this app"
-	}
+	scopeName := PlanQuotaScopeDisplayName(scope)
 	return NewProblem(http.StatusForbidden, CodePlanCronQuota,
 		"Cron limit reached",
 		fmt.Sprintf("%s plan caps crons at %d for %s; you have %d. Delete one to add another.",
@@ -1224,18 +1271,51 @@ func ErrPlanAlertRulesNotAllowed(p Plan) *Problem {
 // alert rules — the right copy is "delete a rule to add another",
 // not "upgrade to Hobby". Mirrors ErrPlanCronQuota.
 func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Problem {
-	var scopeName string
-	if scope == "account" {
-		scopeName = "this account"
-	} else {
-		scopeName = "this app"
-	}
+	scopeName := PlanQuotaScopeDisplayName(scope)
 	return NewProblem(http.StatusForbidden, CodePlanAlertRuleQuota,
 		"Alert rule limit reached",
 		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs("https://docs.gregale.dev/plans#alerts")
+}
+
+// ErrPlanWebhooksNotAllowed is returned by apid's createAppWebhook
+// / listAppWebhooks handlers when the customer's plan has
+// WebhookPerApp == 0 (Free today). Fires BEFORE loadApp so a Free
+// customer posting to a non-existent slug gets a clean 402 instead
+// of a 404 (and the reverse — a Free customer on a real slug gets
+// 402, not a 404 masquerading as plan-gating). PR review finding F4
+// mirrored from createAlertRule.
+func ErrPlanWebhooksNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanWebhooksNotAllowed,
+		"Outbound webhooks unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include outbound webhooks; upgrade to Hobby or above to subscribe.", p)).
+		WithDocs("https://docs.gregale.dev/plans#webhooks")
+}
+
+// ErrPlanWebhookQuota is returned when
+// CreateAppWebhookIfUnderQuota surfaces a *state.AppWebhookQuotaError.
+// Scope "app" or "account" tells the handler which cap fired so the
+// body can name it. 403 (not 402) because the plan DOES unlock
+// webhooks — the right copy is "delete a webhook to add another",
+// not "upgrade to Hobby". Mirrors ErrPlanAlertRuleQuota.
+func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem {
+	scopeName := PlanQuotaScopeDisplayName(scope)
+	return NewProblem(http.StatusForbidden, CodePlanWebhookQuota,
+		"Webhook limit reached",
+		fmt.Sprintf("%s plan caps webhooks at %d for %s; you have %d. Delete one to add another.",
+			plan, limit, scopeName, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs("https://docs.gregale.dev/plans#webhooks")
+}
+
+// ErrAppWebhookInvalid is returned for malformed webhook bodies:
+// missing target_url, invalid retry_policy, out-of-vocabulary event,
+// oversize webhook_secret, etc. Mirrors ErrAlertRuleInvalid.
+func ErrAppWebhookInvalid(reason string) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAppWebhookInvalid,
+		"Invalid webhook", reason)
 }
 
 // ErrHandlerMissing is returned when a function source upload doesn't
