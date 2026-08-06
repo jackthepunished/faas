@@ -319,6 +319,9 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/orgs/{slug}/members/{user_id}": "RemoveOrgMember",
 	"POST /v1/orgs/{slug}/transfer_ownership":  "TransferOrgOwnership",
 	"GET /v1/invitations/{token}":              "PeekInvitation",
+	"POST /v1/invitations/{token}/accept":      "AcceptInvitation",
+	"DELETE /v1/orgs/{slug}/invitations/{token}": "RevokeInvitation",
+	"GET /v1/orgs/{slug}/seat_usage":           "GetOrgSeatUsage",
 
 	// PR 6 (issue #190 / IAM-6 / ADR-061) — org-scoped API key
 	// surface. The auto-derivation would produce

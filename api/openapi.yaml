@@ -4550,7 +4550,7 @@ paths:
         description: |
           Plaintext or base64url-encoded invitation token (same
           shape as the GET /v1/invitations/{token} parameter).
-        schema: { type: string, description: "Plaintext or base64url-encoded invitation token." }
+        schema: { type: string }
     post:
       tags: [orgs]
       operationId: acceptInvitation
@@ -4599,9 +4599,11 @@ paths:
         in: path
         required: true
         description: |
-          Plaintext or base64url-encoded invitation token (same
-          shape as the GET /v1/invitations/{token} parameter).
-        schema: { type: string, description: "Plaintext or base64url-encoded invitation token." }
+          Plaintext or base64url-encoded invitation token. The URL
+          is org-scoped here (vs the no-org-scoped peek at
+          `GET /v1/invitations/{token}`), so admin/owner gate fires
+          before the consume path resolves the hash.
+        schema: { type: string }
     delete:
       tags: [orgs]
       operationId: revokeInvitation

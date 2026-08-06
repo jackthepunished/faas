@@ -4136,12 +4136,13 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
-  # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5) ──────────────────
+  # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
   # active-org hint is accepted via X-Active-Org / ?org= on every
-  # org-scoped route; PR 8 owns POST /v1/invitations/{token}/accept
-  # (the SSO + GDPR bundle).
+  # org-scoped route. PR 7 added accept/revoke on the invitation
+  # surface and the seat-usage visibility endpoint; PR 8 (SSO +
+  # GDPR bundle) layers step-up on accept + adds the list endpoint.
   /v1/orgs:
     get:
       tags: [orgs]
@@ -4351,9 +4352,10 @@ paths:
         Mints a 32-byte plaintext token, hashes it via SHA-256 for
         storage, and returns the plaintext ONCE in the response.
         The token expires after 14 days; admins can revoke earlier
-        via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-        the accept surface). Role cannot be `owner`; transfer-
-        ownership is the only path to owner.
+        via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+        the accept surface too — see
+        `POST /v1/invitations/{token}/accept`). Role cannot be
+        `owner`; transfer-ownership is the only path to owner.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -4527,7 +4529,8 @@ paths:
         (email, role, org slug, expires_at) without consuming the
         token. Used by the dashboard to render "you've been invited
         to Acme Inc. as developer" without forcing the invitee
-        to accept yet. The accept flow lands in PR 8.
+        to accept yet. PR 7 added the accept surface at
+        `POST /v1/invitations/{token}/accept`.
       responses:
         '200':
           description: The pending invitation.
@@ -4537,6 +4540,127 @@ paths:
         '410':
           description: 'code: org_invitation_invalid | org_invitation_expired | org_invitation_invalid (already consumed/revoked)'
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/invitations/{token}/accept:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        description: |
+          Plaintext or base64url-encoded invitation token (same
+          shape as the GET /v1/invitations/{token} parameter).
+        schema: { type: string }
+    post:
+      tags: [orgs]
+      operationId: acceptInvitation
+      summary: Accept an invitation token (consume + add as member).
+      description: |
+        Consumes the invitation via `Store.ConsumeOrgInvitation` —
+        the load-bearing tx stamps `consumed_at`, inserts the active
+        membership, and reads the live member cap (PR 2 cap-in-tx
+        back-stop; documents at `pkg/state/memstore.go`). Two audit
+        rows fire post-mutation per ADR-035: `org.invitation.accepted`
+        (invitation-side record) and `org.member.added` (member-side
+        record). The bearer must have a valid session or API key but
+        no `X-Active-Org` — the invitation IS how they get one. PR 8
+        adds step-up at accept time.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The new membership row.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgMemberResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — the org is at the member cap. Stable
+            code `org_member_cap_exceeded`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '409':
+          description: |
+            `409 Conflict` — the bearer is already an active member
+            of the target org. The wire detail carries the
+            caller's current role. Stable code `org_already_member`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '410':
+          description: |
+            `410 Gone` — the token is unknown, already consumed,
+            already revoked, or expired. Stable codes
+            `org_invitation_invalid` | `org_invitation_expired`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/invitations/{token}:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - name: token
+        in: path
+        required: true
+        description: |
+          Plaintext or base64url-encoded invitation token. The URL
+          is org-scoped here (vs the no-org-scoped peek at
+          `GET /v1/invitations/{token}`), so admin/owner gate fires
+          before the consume path resolves the hash.
+        schema: { type: string }
+    delete:
+      tags: [orgs]
+      operationId: revokeInvitation
+      summary: Revoke a pending invitation.
+      description: |
+        Stamps `revoked_at` on a still-pending invitation via
+        `Store.RevokeOrgInvitation`. Owner + admin only
+        (`org.invite_members`, symmetric with the create-invite
+        path). Already-consumed / already-revoked / unknown tokens
+        collapse to a single `org_invitation_invalid` 410 (don't
+        leak which row state was reached). Emits
+        `org.invitation.revoked` with an 8-char token-hash prefix
+        (never the full hash) for dashboard correlation.
+      responses:
+        '204':
+          description: Revoked.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller lacks `org.invite_members`.
+            Stable code `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: |
+            `410 Gone` — the token is unknown, already consumed,
+            or already revoked. Stable code `org_invitation_invalid`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/seat_usage:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    get:
+      tags: [orgs]
+      operationId: getOrgSeatUsage
+      summary: Seat usage visibility for the active org.
+      description: |
+        Returns `{used, limit, plan}` from `Store.CountActiveOrgMembers`
+        (the same row the cap-in-tx inside `ConsumeOrgInvitation`
+        reads). `limit` comes from `org.Plan.OrgMembersMax()` — the
+        `free` plan returns `0` to render "personal org only" in the
+        dashboard rather than "0 of 0 used". Visibility-only; PR 9
+        ships the per-seat pricing cut-over per ADR-061 §"Out of
+        scope". Every role may read (gated by `org.view`).
+      responses:
+        '200':
+          description: The seat usage.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/SeatUsageResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller lacks `org.view`. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
@@ -7903,6 +8027,33 @@ components:
         members:
           type: array
           items: { $ref: '#/components/schemas/OrgMemberResponse' }
+
+    SeatUsageResponse:
+      description: |
+        GET /v1/orgs/{slug}/seat_usage response. Visibility-only —
+        PR 9 ships the per-seat pricing cut-over per ADR-061
+        §"Out of scope". `used` counts active members only (the
+        store's `CountActiveOrgMembers` filters `removed_at IS
+        NULL`). `limit` comes from `org.Plan.OrgMembersMax()` —
+        the `free` plan returns `0` so the dashboard can render
+        "personal org only" instead of "0 of 0 used".
+      type: object
+      required: [used, limit, plan]
+      properties:
+        used:
+          type: integer
+          minimum: 0
+          description: Active member count.
+        limit:
+          type: integer
+          minimum: 0
+          description: |
+            Plan cap on active members (`Plan.OrgMembersMax()`).
+            Returns `0` for the `free` plan — the fail-closed
+            accessor shape.
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
 
     ChangeMemberRoleRequest:
       description: |
