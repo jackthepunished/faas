@@ -170,7 +170,7 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 		// legacy hardcoded "image" diverged from Kind for tarball /
 		// dockerfile deploys and produced misleading split-by-source
 		// dashboards.
-		_, err := apidsource.Enqueue(ctx(r), s.store, s.notif, apidsource.EnqueueParams{
+		_, err := apidsource.Enqueue(r.Context(), s.store, s.notif, apidsource.EnqueueParams{
 			AppID:       app.ID,
 			Kind:        kind,
 			SourcePath:  sourcePath,
@@ -193,12 +193,12 @@ func (s *server) createDeploymentMultipart(w http.ResponseWriter, r *http.Reques
 		// behaviour-equivalent to the pre-refactor
 		// "post-CreateDeployment, pre-CreateBuild" site — see
 		// handlers_mfa.go:790-797.
-		s.maybeFlipMFAOnDeploy(ctx(r), acct)
+		s.maybeFlipMFAOnDeploy(r.Context(), acct)
 		// Look up the durable deployment row to build the wire
 		// response. LatestDeployment returns the row we just
 		// inserted (state.Store.CreateDeployment is its own tx
 		// and the row is committed before Enqueue returns).
-		d, err := s.store.LatestDeployment(ctx(r), app.ID)
+		d, err := s.store.LatestDeployment(r.Context(), app.ID)
 		if err != nil {
 			api.WriteProblem(w, api.ErrCapacity("could not read deployment"))
 			return

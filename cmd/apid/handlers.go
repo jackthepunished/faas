@@ -17,11 +17,11 @@ import (
 )
 
 func (s *server) whoami(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	writeJSON(w, http.StatusOK, s.accountResponse(ctx(r), acct, r))
+	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), acct, r))
 }
 
 func (s *server) listApps(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	apps, err := s.store.ListApps(ctx(r), acct.ID)
+	apps, err := s.store.ListApps(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list apps"))
 		return
@@ -55,7 +55,7 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// parent accounts row; MemStore: m.mu). This closes the TOCTOU the
 	// previous CountDeployedApps + CreateApp pair exposed on Free/Hobby
 	// accounts under concurrency (spec §4.2).
-	created, err := s.store.CreateAppIfUnderQuota(ctx(r), app, limits)
+	created, err := s.store.CreateAppIfUnderQuota(r.Context(), app, limits)
 	if err != nil {
 		var qe *state.QuotaError
 		switch {
@@ -71,7 +71,7 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 	s.log.Info("app created", "app", created.ID, "slug", logsanitize.Field(created.Slug), "account", acct.ID)
-	s.audit.Emit(ctx(r), "app.created", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.created", &acct.ID, map[string]any{
 		"app_id":          created.ID,
 		"slug":            created.Slug,
 		"type":            string(created.Type),
@@ -79,7 +79,7 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"max_concurrency": created.MaxConcurrency,
 		"runtime":         created.Runtime,
 	})
-	s.emitAppCreated(ctx(r), created)
+	s.emitAppCreated(r.Context(), created)
 	resp := s.appResponse(created, acct.Plan)
 	writeJSON(w, http.StatusCreated, s.withParkedDeploymentRef(r.Context(), resp, created))
 }
@@ -261,7 +261,7 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// Pre-CreateDeployment validation gates (#472 / #460 / #463).
 	// Gate order matters (signature → override → sidecar); each
 	// helper short-circuits only on its own failure.
-	if p := enforceSignatureGate(ctx(r), s, acct, app, &req); p != nil {
+	if p := enforceSignatureGate(r.Context(), s, acct, app, &req); p != nil {
 		api.WriteProblem(w, p)
 		return
 	}
@@ -277,13 +277,13 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// PR-B: prior-deployment supersede is in store.CreateDeployment's tx;
 	// we read prev BEFORE the call so the supersede-notify can carry
 	// its id (LatestDeployment returns the post-supersede row).
-	prev, _ := s.store.LatestDeployment(ctx(r), app.ID)
+	prev, _ := s.store.LatestDeployment(r.Context(), app.ID)
 	dep, sErr := buildDeploymentForInsert(app, &req, overrides, limits)
 	if sErr != nil {
 		api.WriteProblem(w, sErr)
 		return
 	}
-	d, err := s.store.CreateDeployment(ctx(r), dep)
+	d, err := s.store.CreateDeployment(r.Context(), dep)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not create deployment"))
 		return
@@ -291,8 +291,8 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 	// IAM-2 2nd-deploy chokepoint: arm mfa_required when this is the
 	// customer's 2nd live deployment. Post-CreateDeployment notify +
 	// audit + log fan-out is in notifyAndAuditDeployment.
-	s.maybeFlipMFAOnDeploy(ctx(r), acct)
-	notifyAndAuditDeployment(ctx(r), s, acct, app, d, prev, &req)
+	s.maybeFlipMFAOnDeploy(r.Context(), acct)
+	notifyAndAuditDeployment(r.Context(), s, acct, app, d, prev, &req)
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d))
 }
 
@@ -308,7 +308,7 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 // multipart-source-tarball cap and the override / sidecar
 // validators.
 func (s *server) loadAppAndPreflight(w http.ResponseWriter, r *http.Request, acct state.Account) (state.App, bool, api.Limits) {
-	app, err := s.store.AppBySlug(ctx(r), r.PathValue("slug"))
+	app, err := s.store.AppBySlug(r.Context(), r.PathValue("slug"))
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such app")
 		return state.App{}, false, api.Limits{}

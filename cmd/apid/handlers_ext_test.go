@@ -3367,11 +3367,16 @@ type parkedRefStore struct {
 	err error
 }
 
-func (p *parkedRefStore) LatestParkedDeploymentForApp(_ context.Context, _ string) (state.Deployment, error) {
+func (p *parkedRefStore) LatestParkedDeploymentForApp(ctx context.Context, appID string) (state.Deployment, error) {
 	if p.err != nil {
 		return state.Deployment{}, p.err
 	}
-	return p.MemStore.LatestParkedDeploymentForApp(context.Background(), "")
+	// err is nil → fall through to the embedded memstore.
+	// Forward the inherited ctx so contextcheck sees a
+	// context-propagating call chain (passing a fresh
+	// context.Background() would trip the rule on test
+	// surfaces).
+	return p.MemStore.LatestParkedDeploymentForApp(ctx, appID)
 }
 
 // TestWithParkedDeploymentRef_HealthyAppBranch pins the
