@@ -9,9 +9,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00150_WaitUntilTail pins the IDEMPOTENT ALTER shape
+// TestMigrations_00151_WaitUntilTail pins the IDEMPOTENT ALTER shape
 // and the column types of the tail-count + tail-seconds columns
-// landed by 00150_wait_until_tail.sql (issue #667 / ADR-078).
+// landed by 00151_wait_until_tail.sql (issue #667 / ADR-078).
 //
 // What we pin (replay-safety + audit-evidence cost):
 //   - Column types match the per-table shape used by the runner
@@ -38,7 +38,7 @@ import (
 // Cross-PR slot reservation note: this test is coupled to the .sql
 // at slot 149. If a sibling PR renumbers, the test file moves with
 // it (per migration-slot-renumber-at-pr-creation, ADR-041).
-func TestMigrations_00150_WaitUntilTail(t *testing.T) {
+func TestMigrations_00151_WaitUntilTail(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t) // t.Skip-friendly on missing DATABASE_URL
 
@@ -82,7 +82,7 @@ func TestMigrations_00150_WaitUntilTail(t *testing.T) {
 				   AND column_name  = $2`,
 				table, col).Scan(&dt, &nn)
 			if err != nil {
-				t.Errorf("%s.%s column missing — migration 00150 not applied: %v", table, col, err)
+				t.Errorf("%s.%s column missing — migration 00151 not applied: %v", table, col, err)
 				continue
 			}
 			if dt != spec.dt {
@@ -100,7 +100,7 @@ func TestMigrations_00150_WaitUntilTail(t *testing.T) {
 	//    test catches it before the operator's `goose up` on a
 	//    partially-migrated DB fails with 42710.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Errorf("replay of migration 00150 should be a no-op, got: %v", err)
+		t.Errorf("replay of migration 00151 should be a no-op, got: %v", err)
 	}
 
 	// silence the unused-import lint for `migrations` if all the
