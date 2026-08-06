@@ -107,9 +107,21 @@ func TestE2E_InvitationAcceptAndRevokeRoundtrip(t *testing.T) {
 	ctx := context.Background()
 	key := h.SeedAccount(ctx, api.PlanPro, "pr7-rtrip")
 	store := state.NewPgStore(h.Pool)
-	personal, err := store.OrgByPersonalAccount(ctx, mustAccountIDForSeed(t, h, api.PlanPro, "pr7-rtrip"))
-	if err != nil {
-		t.Fatalf("OrgByPersonalAccount: %v", err)
+
+	// Personal orgs are immutable per ADR-061 §3.2 (no
+	// membership changes). Create a shared Pro org for the
+	// invite/revoke roundtrip.
+	createRaw, createStatus := doReq(t, h, key, http.MethodPost, "/v1/orgs",
+		api.CreateOrgRequest{Slug: "pr7-rtrip-org", Name: "PR7 Roundtrip"})
+	if createStatus != http.StatusCreated {
+		t.Fatalf("create shared org: %d %s", createStatus, createRaw)
+	}
+	var shared api.OrgResponse
+	if err := json.Unmarshal(createRaw, &shared); err != nil {
+		t.Fatalf("decode shared: %v", err)
+	}
+	if err := store.UpdateOrgPlan(ctx, shared.ID, api.PlanPro); err != nil {
+		t.Fatalf("UpdateOrgPlan: %v", err)
 	}
 
 	// Create the invitation via the wire. Email is a non-seeded
@@ -117,9 +129,9 @@ func TestE2E_InvitationAcceptAndRevokeRoundtrip(t *testing.T) {
 	// would refuse a self-accept; revoke doesn't care about the
 	// email — it just stamps revoked_at.
 	mintRaw, mintStatus := doReq(t, h, key, http.MethodPost,
-		"/v1/orgs/"+personal.Slug+"/members",
+		"/v1/orgs/"+shared.Slug+"/members",
 		api.InviteMemberRequest{Email: "rtrip-dev@acme.test", Role: "developer"},
-		map[string]string{"X-Active-Org": personal.Slug})
+		map[string]string{"X-Active-Org": shared.Slug})
 	if mintStatus != http.StatusCreated {
 		t.Fatalf("mint: %d %s", mintStatus, mintRaw)
 	}
@@ -136,15 +148,15 @@ func TestE2E_InvitationAcceptAndRevokeRoundtrip(t *testing.T) {
 
 	// Revoke via the wire. Should 204 + emit org.invitation.revoked.
 	revRaw, revStatus := doReq(t, h, key, http.MethodDelete,
-		"/v1/orgs/"+personal.Slug+"/invitations/"+minted.Token,
+		"/v1/orgs/"+shared.Slug+"/invitations/"+minted.Token,
 		nil,
-		map[string]string{"X-Active-Org": personal.Slug})
+		map[string]string{"X-Active-Org": shared.Slug})
 	if revStatus != http.StatusNoContent {
 		t.Fatalf("revoke: %d %s", revStatus, revRaw)
 	}
 
 	// State seam: the row's revoked_at is now non-nil.
-	invRow := findOrgInvitationByEmail(t, h, personal.ID, "rtrip-dev@acme.test")
+	invRow := findOrgInvitationByEmail(t, h, shared.ID, "rtrip-dev@acme.test")
 	if invRow.RevokedAt == nil {
 		t.Errorf("RevokedAt is nil after revoke; want non-nil")
 	}
@@ -176,8 +188,8 @@ func TestE2E_InvitationAcceptAndRevokeRoundtrip(t *testing.T) {
 	if err := json.Unmarshal(revokeEvent.Data, &data); err != nil {
 		t.Fatalf("Unmarshal event.Data: %v", err)
 	}
-	if data["org_id"] != personal.ID {
-		t.Errorf("data.org_id = %v, want %s", data["org_id"], personal.ID)
+	if data["org_id"] != shared.ID {
+		t.Errorf("data.org_id = %v, want %s", data["org_id"], shared.ID)
 	}
 	prefix, _ := data["token_hash_prefix"].(string)
 	if len(prefix) != 8 {
