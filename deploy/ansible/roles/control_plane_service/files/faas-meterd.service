@@ -1,29 +1,18 @@
 [Unit]
-Description=onebox-faas meterd — metering, billing, and quota enforcement (spec §4.7)
-Documentation=https://docs.gregale.dev/ops/meterd
-After=network.target faas-cp.slice
-Wants=faas-cp.slice
+Description=onebox-faas meterd — metering and billing
+After=network.target postgresql.service faas-schedd.service faas-cp.slice
+Wants=faas-cp.slice faas-schedd.service
 
 [Service]
 Type=simple
 User=faas-meterd
 Group=faas
-# Binary is shipped by the ansible bootstrap step (this role's
-# `tasks/main.yml` invokes `install -m 0755 ... /opt/faas/bin/<bin>`
-# from the builder tarball; cd-controlplane.yml line 278 does the
-# same on the cd path).
 ExecStart=/opt/faas/bin/meterd --config /etc/faas/meterd.toml
 Restart=on-failure
 RestartSec=2s
-
-# meterd has no inbound gRPC; it dials schedd over a unix socket and
-# PG over TCP. 192M covers the LISTEN goroutine + the rolling usage
-# buffers for the hourly Stripe push (ADR-019).
 Slice=faas-cp.slice
-MemoryMax=192M
-
+MemoryMax=256M
 EnvironmentFile=/etc/faas/sealed.env
-
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
