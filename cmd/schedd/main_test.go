@@ -204,7 +204,12 @@ func TestRun_DrainsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runWithDeps(ctx, discardLog(), deps) }()
-	time.Sleep(50 * time.Millisecond)
+	// Give run() enough time to reach the DB subscribe loop before
+	// cancel. 50 ms was too tight on busy CI runners: the listener
+	// acquisition raced the cancel and surfaced as
+	// "SubscribeWithReconnect ... context canceled" instead of a clean
+	// nil drain. 200 ms is still far under the 3 s watchdog below.
+	time.Sleep(200 * time.Millisecond)
 	cancel()
 
 	select {
@@ -297,11 +302,9 @@ func (stubVMM) CancelLiveMigration(context.Context, string, string, string) erro
 	return nil
 }
 
-// FrameworkReady (issue #470 / PR #470-FU-B) is the vmmd-side
-// receipt of the guest-init "framework ready" DGRAM. The schedd
-// wiring tests don't drive the DGRAM path (the vmmd→vmmd flow
-// is exercised in pkg/vmmdgrpc/bufconn_test.go) so the stub
-// returns nil to satisfy the closed VMM interface.
+// FrameworkReady (issue #470) — wiring tests don't drive the
+// guest-init framework-ready DGRAM path; the vmmdgrpc handler tests
+// do. Returns nil so the VMM contract is satisfied.
 func (stubVMM) FrameworkReady(context.Context, string, int64) error {
 	return nil
 }
