@@ -16,6 +16,7 @@ MemoryMax=1G
 CapabilityBoundingSet=cap_chown cap_dac_override cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_net_bind_service cap_sys_chroot
 EnvironmentFile=/etc/faas/sealed.env
 Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging
+Environment=FAAS_BASE_TMP_ROOT=/srv/fc/base
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

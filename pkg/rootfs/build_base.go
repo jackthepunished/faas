@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/onebox-faas/faas/pkg/storage"
 )
@@ -193,13 +192,15 @@ func (b *Builder) publishBaseExt4(ctx context.Context, in BaseBuildInput, stagin
 		return nil
 	}
 	// mkfs's -d flag populates the new image from `staging`; the output file
-	// must therefore live OUTSIDE that tree, otherwise mkfs tries to copy
-	// its own (growing) output back into itself and runs out of blocks
-	// with "Could not allocate block in ext2 filesystem while populating".
-	// Matches publishExt4's sibling-temp pattern in build.go (the base path
-	// was the only place that still put the temp file inside the source
-	// tree; pre-mirror, docker.io 429s masked it because mkfs never ran).
-	tmp, err := os.CreateTemp(filepath.Dir(staging), "faas-base-mkfs-*.ext4")
+	// must therefore live outside that tree and its tmpfs staging budget.
+	tmpRoot := os.Getenv("FAAS_BASE_TMP_ROOT")
+	if tmpRoot == "" {
+		tmpRoot = os.TempDir()
+	}
+	if err := os.MkdirAll(tmpRoot, 0o755); err != nil {
+		return fmt.Errorf("rootfs: create base tmp root: %w", err)
+	}
+	tmp, err := os.CreateTemp(tmpRoot, "faas-base-mkfs-*.ext4")
 	if err != nil {
 		return fmt.Errorf("rootfs: create base tmp ext4: %w", err)
 	}
