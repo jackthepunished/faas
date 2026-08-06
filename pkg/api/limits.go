@@ -1332,6 +1332,20 @@ const (
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
 
+	// Raw-bridge (issue #676 / ADR-080) inbound cap. The raw-bytes
+	// bridge carries Upgrade / WebSocket / long-poll traffic from
+	// gatewayd-internal into the guest's netns TCP socket. The cap
+	// is per-request (the inbound body of one Upgrade handshake),
+	// not per-session — Upgrade sessions are long-lived and
+	// bytes-in is metered separately at the Prometheus layer. The
+	// init frame's max_request_bytes is clamped DOWN to this value
+	// on the vmmd side (callers cannot grow the cap; a Free-plan
+	// gatewayd cannot ask for math.MaxInt64 and disable the cap).
+	// Mirrors ForwardStreamMaxBodyBytes in pkg/vmmdgrpc (100 MiB on
+	// the same Hobby+ plans) so an LLM-style upgrade stream has
+	// the same headroom.
+	RawStreamMaxRequestBytes int64 = 100 * 1024 * 1024
+
 	// Post-response tail (issue #667 / ADR-078).
 	//
 	// TailCapMax is a structural constant applied uniformly across

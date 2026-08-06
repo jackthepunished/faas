@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -233,4 +234,51 @@ func buildBridgeForTest(out string) error {
 	cmd := exec.Command("go", "build", "-o", out, srcDir)
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// TestIsCleanConnClose pins the bridge's exit-0 classification
+// (issue #676 review fix): a guest-side close of the conn while
+// the bridge is mid-body-write produces io.ErrClosedPipe /
+// "use of closed network connection" / "broken pipe" — all of
+// which isCleanConnClose must classify as clean (exit 0 path).
+// A real write error (timeout, EPERM, etc.) must NOT be
+// classified as clean so the bridge surfaces exit 4.
+//
+// The classification is purely string + errors.Is based;
+// string.Contains catches the net pkg's "use of closed network
+// connection" because that error is not exported.
+func TestIsCleanConnClose(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, true},
+		{"io_eof", io.EOF, true},
+		{"wrapped_eof", io.EOF, true},
+		{"err_closed_pipe", io.ErrClosedPipe, true},
+		{"use_of_closed_network_connection", errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: use of closed network connection"), true},
+		{"broken_pipe", errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: broken pipe"), true},
+		{"real_write_error", errors.New("write tcp 127.0.0.1:1->127.0.0.1:2: i/o timeout"), false},
+		{"unexpected_string", errors.New("some other failure"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCleanConnClose(tc.err); got != tc.want {
+				t.Errorf("isCleanConnClose(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsCleanConnClose_WrappedClosedPipe pins that the bridge
+// sees through fmt.Errorf("%w: ...", io.ErrClosedPipe) — errors.Is
+// unwraps the chain, so the helper classifies the wrapped error
+// as clean even when the caller adds context. Mirrors the real
+// net pkg pattern where conn.Write errors carry
+// io.ErrClosedPipe inside an *net.OpError wrapper.
+func TestIsCleanConnClose_WrappedClosedPipe(t *testing.T) {
+	wrapped := fmt.Errorf("bridge write: %w", io.ErrClosedPipe)
+	if !isCleanConnClose(wrapped) {
+		t.Errorf("wrapped io.ErrClosedPipe should classify as clean")
+	}
 }

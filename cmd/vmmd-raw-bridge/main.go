@@ -49,6 +49,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -158,9 +159,18 @@ func main() {
 
 	// The guest closed the connection. Drain the write goroutine
 	// (which has been copying stdin to conn and now sees
-	// io.ErrClosedPipe or similar). Exit 0 — the bridge's job
-	// is done.
-	<-writeErrCh
+	// io.ErrClosedPipe / "use of closed network connection").
+	// Classify the result: a clean close is the normal termination
+	// path; anything else means the guest hung up mid-request-body
+	// and we lost bytes — surface as exit 4 so vmmd reports an
+	// Internal to the gateway instead of a silent OK on a
+	// truncated body. (issue #676 review fix; the prior
+	// discard-the-error path returned 0 even when half the
+	// request body never reached the guest.)
+	if err := <-writeErrCh; err != nil && !isCleanConnClose(err) {
+		fmt.Fprintf(os.Stderr, "write body: %v\n", err)
+		os.Exit(4)
+	}
 }
 
 // readResponseHead reads from r until it sees "\n\n" (the
@@ -228,4 +238,36 @@ func readResponseHead(r *bufio.Reader) (head, body []byte, err error) {
 // byte.
 func indexDoubleLF(b []byte) int {
 	return bytes.Index(b, []byte("\n\n"))
+}
+
+// isCleanConnClose reports whether err is the canonical
+// "connection closed by peer / closed locally" signal — the
+// expected terminal state when the guest finishes its response
+// and the bridge's write goroutine drains its remaining stdin
+// bytes. The bridge exit-0 path must classify these as success;
+// any other error (EPIPE on the kernel side, write timeout,
+// context cancellation surfacing through the conn) means the
+// guest hung up mid-request-body and bytes were lost — the
+// bridge must surface exit 4 so vmmd's
+// rawBridgeFinish maps to Internal rather than the gateway
+// seeing OK on a truncated body.
+//
+// Recognised clean-close errors:
+//   - io.EOF (no bytes written / clean half-close)
+//   - io.ErrClosedPipe (we closed the conn before the goroutine
+//     observed the close — happens during the success path's
+//     defer conn.Close)
+//   - "use of closed network connection" (the conn was closed
+//     before io.Copy returned; same root cause as ErrClosedPipe
+//     but a different string from net pkg internals)
+//   - "broken pipe" (EPIPE on Linux — peer closed its read side
+//     while we were still writing; rare but legal during
+//     long-poll body writes)
+func isCleanConnClose(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "broken pipe")
 }
