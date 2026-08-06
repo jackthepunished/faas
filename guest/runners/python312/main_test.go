@@ -41,6 +41,16 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}, []byte("hi"))
 }
 
+// TestHandle_WaitUntilEnvelopeRoundTrip (issue #667 / ADR-078 PR 3) is
+// the per-runtime counterpart to the hermetic
+// TestParity_AllRuntimesHonorWaitUntil file-walk.
+func TestHandle_WaitUntilEnvelopeRoundTrip(t *testing.T) {
+	fake := runnerparity.FakePyScriptWithTail()
+	runnerparity.RunWaitUntilEnvelopeRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
+		handle(w, r, handlerPath, signal, tailWaitSec, tailPipePath)
+	})
+}
+
 // TestPythonRunnerHandlerDefault pins the default --handler value. The
 // path must be `/app/handler.py` to match what imaged.handleDeployment
 // writes into AppManifest.Entrypoint for runtime=python312 function

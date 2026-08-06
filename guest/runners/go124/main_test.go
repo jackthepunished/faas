@@ -45,6 +45,21 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}, []byte("hi"))
 }
 
+// TestHandle_WaitUntilEnvelopeRoundTrip (issue #667 / ADR-078 PR 3) is
+// the per-runtime counterpart to the hermetic
+// TestParity_AllRuntimesHonorWaitUntil file-walk. A fake handler
+// writes a JSONL line to the tail pipe before returning; the
+// runner's drainTailHost reads the pipe after invokeHandler returns.
+// The response envelope stays intact (status=200, body unchanged).
+// The 0x04 DGRAM emit fails in unit tests (the proxy isn't running)
+// — that's expected; the runner keeps draining.
+func TestHandle_WaitUntilEnvelopeRoundTrip(t *testing.T) {
+	fake := runnerparity.FakeGoScriptWithTail()
+	runnerparity.RunWaitUntilEnvelopeRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
+		handle(w, r, handlerPath, signal, tailWaitSec, tailPipePath)
+	})
+}
+
 // TestGoRunnerHandlerDefault pins the default --handler value. The
 // path must be `/app/handler` (no extension) to match what
 // imaged.handleDeployment writes into AppManifest.Entrypoint for

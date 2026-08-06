@@ -216,18 +216,44 @@ func (h *TailHost) Drain() {
 // it appends a failure entry to h.failures (only on err/timeout)
 // and emits a 0x04 DGRAM via the tail-events proxy. Errors from
 // the proxy are logged at Warn; the runner keeps draining.
+//
+// Outcome precedence (most-specific first):
+//
+//  1. Timeout — ctx.Err() == DeadlineExceeded. The customer's
+//     promise hung past the per-task ceiling. Recorded as a
+//     "timeout:task-N" failure on resp.TailErrors.
+//  2. Failed — the taskFn panicked. The defer-recover above
+//     trips this branch. Recorded as an "error:task-N" failure.
+//  3. Completed — the taskFn returned normally AND the per-task
+//     ceiling hasn't fired. No failure recorded; the 0x04
+//     DGRAM is emitted with outcome=Completed.
+//
+// The deferred emit runs once per task on whatever outcome was
+// finalized; the failure record is exactly one entry per terminal
+// task (the highest-priority outcome wins).
 func (h *TailHost) runTask(taskID string, taskFn func(ctx context.Context)) {
 	ctx, cancel := context.WithTimeout(context.Background(), h.waitUntil)
 	defer cancel()
 
 	start := time.Now()
-	panicked := true
+	// outcome is the load-bearing field. The default is Failed
+	// (the catch-all for a panicking taskFn); the two branches
+	// below either upgrade it to Timeout or downgrade to
+	// Completed. The deferred emit reads the final value.
 	outcome := TailOutcomeFailed
+	var failureReason string
 	defer func() {
 		elapsedMs := time.Since(start).Milliseconds()
-		if panicked {
+		// taskFn panic recovery — the defer fires LAST in
+		// panic order, so a panic in taskFn unwinds here
+		// with outcome still = Failed and failureReason
+		// unset (we set it on the recovery path below).
+		if r := recover(); r != nil {
 			outcome = TailOutcomeFailed
-			h.recordFailure(fmt.Sprintf("error:%s", taskID))
+			failureReason = fmt.Sprintf("error:%s", taskID)
+		}
+		if failureReason != "" {
+			h.recordFailure(failureReason)
 		}
 		if err := h.emit(outcome, elapsedMs); err != nil {
 			fmt.Fprintf(os.Stderr, "tail_host: emit 0x%02x for %s failed: %v\n", outcome, taskID, err)
@@ -237,18 +263,16 @@ func (h *TailHost) runTask(taskID string, taskFn func(ctx context.Context)) {
 	taskFn(ctx)
 
 	// If ctx.Err() == DeadlineExceeded, the per-task ceiling fired.
-	// We can't tell from inside the goroutine whether taskFn honored
-	// the cancellation — but if it's still running, the deferred
-	// cancel will let it return on its own (the customer's promise
-	// is expected to check ctx.Done()). We mark the outcome based
-	// on whether the deadline elapsed.
+	// The customer's promise hung past the runner's per-task wall
+	// clock. The hang taskFn may have just returned (via <-ctx.Done()
+	// in the hang-blocking variant) — that's expected, the cancel
+	// call in defer-cancel triggers the return.
 	if ctx.Err() == context.DeadlineExceeded {
 		outcome = TailOutcomeTimeout
-		h.recordFailure(fmt.Sprintf("timeout:%s", taskID))
+		failureReason = fmt.Sprintf("timeout:%s", taskID)
 		return
 	}
 	outcome = TailOutcomeCompleted
-	panicked = false
 }
 
 // recordFailure appends one entry to h.failures under the mu.

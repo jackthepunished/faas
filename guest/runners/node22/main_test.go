@@ -57,6 +57,18 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}, []byte("hi"))
 }
 
+// TestHandle_WaitUntilEnvelopeRoundTrip (issue #667 / ADR-078 PR 3) is
+// the per-runtime counterpart to the hermetic
+// TestParity_AllRuntimesHonorWaitUntil file-walk. A fake handler
+// writes a JSONL line to the tail pipe before returning; the
+// runner's drainTailHost reads the pipe after invokeHandler returns.
+func TestHandle_WaitUntilEnvelopeRoundTrip(t *testing.T) {
+	fake := runnerparity.FakeNodeScriptWithTail()
+	runnerparity.RunWaitUntilEnvelopeRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
+		handle(w, r, handlerPath, signal, tailWaitSec, tailPipePath)
+	})
+}
+
 // TestNodeRunnerHandlerDefault pins the default --handler value. The
 // path must be `/app/node22.js` to match what imaged.handleDeployment
 // writes into AppManifest.Entrypoint for runtime=node22 function
