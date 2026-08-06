@@ -1,7 +1,7 @@
 # `gregale.dev` gatewayd cut-over runbook
 
 One-time operator procedure for minting the production wildcard cert
-`*.gregale.dev` on the EX44 via DNS-01 against the Hetzner DNS API, and
+`*.gregale.dev` on a reference control-plane node via DNS-01 against the Hetzner DNS API, and
 for replacing the placeholder `apps.example.com` configuration the box
 has been running with since M0. Follow the pre-flight checks, then the
 numbered procedure; the validation matrix at the bottom proves the
@@ -51,10 +51,10 @@ deploy/scripts/hetzner-zone-setup.sh \
   --zone gregale.dev \
   --apps-domain apps.gregale.dev \
   --edge-host edge.gregale.dev \
-  --host-ip "$EX44_PUBLIC_IP"
+  --host-ip "$REFERENCE_NODE_PUBLIC_IP"
 ```
 
-This creates the Hetzner zone, the `A apps.gregale.dev -> EX44` record
+This creates the Hetzner zone, the `A apps.gregale.dev -> reference node` record
 that the wildcard cert rides on, and the `CNAME edge.gregale.dev ->
 apps.gregale.dev` record that customer custom-domains point at
 (per spec §11).
@@ -159,7 +159,7 @@ systemctl restart faas-gatewayd
 ```
 
 The smoke test from step 5 still works on `:8080` if you tunnel the
-EX44 port over SSH, but no customer traffic — the public listener
+reference-node port over SSH, but no customer traffic — the public listener
 on `:443` is off, so customers see a connection refused until you
 flip back.
 

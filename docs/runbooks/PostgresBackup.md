@@ -5,7 +5,7 @@ the M8 restore drill (deploy/scripts/faas-m8-restore-drill.sh)
 left open — the drill proves a local restore works, but a host
 loss wipes both `/var/lib/pgsql/data/` AND `/var/lib/pgsql/archive/`
 AND `/var/lib/pgsql/basebackup/`. The Storage Box is the
-S3-of-one-box replacement the spec explicitly forbids.
+S3-of-single-node replacement the spec explicitly forbids.
 
 ## Context
 

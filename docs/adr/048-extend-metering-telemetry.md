@@ -164,7 +164,7 @@ Per the audit: 4 × `bigint` + 1 × `integer` + 1 × `text` per
 on top of the `cpu_usec` + egress cost. The `usage_daily` table grows
 at one row per `(account, app, day)` — bounded by `n_accounts ×
 n_apps × n_days`; at 1k accounts × 5 apps × 365 days = 1.8M rows/year,
-~250 MB/year. Both fit comfortably on the EX44 NVMe.
+~250 MB/year. Both fit comfortably on the reference node NVMe.
 
 ## Consequences
 

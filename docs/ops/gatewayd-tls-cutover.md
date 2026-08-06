@@ -1,6 +1,6 @@
 # gatewayd TLS cut-over runbook
 
-Step-by-step operator procedure for flipping the EX44 from plain `:8080`
+Step-by-step operator procedure for flipping a reference node from plain `:8080`
 (`[tls].disabled = true`) to TLS on `:443` + ACME on `:80` (`disabled =
 false`). Followed by the validation matrix that proves the cut-over is
 real, not just the daemon started.

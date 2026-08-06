@@ -1,7 +1,10 @@
-# CLAUDE.md — agent guide for the one-box FaaS platform
+# CLAUDE.md — agent guide for the Gregale platform
 
-Scale-to-zero FaaS on Firecracker microVMs, one Hetzner EX44, solo-operated.
-Customer apps park as snapshots on disk and wake on request in <350 ms.
+Scale-to-zero FaaS on Firecracker microVMs, deployable on any bare-metal x86_64
+control-plane node. Customer apps park as snapshots on disk and wake on request
+in <350 ms. Gregale runs one box today; the architecture targets a multi-host
+control plane (see `docs/scale_out_and_workload_classes.md` and the Tier A
+ADRs). The original EX44 cluster is one such deployment — not a hard requirement.
 
 ## Source of truth (in order)
 
@@ -15,7 +18,7 @@ silently "improve" the architecture — several designs below look simplifiable 
 ## Commands
 
 ```
-make bootstrap      # idempotent host setup (ansible) — only on a dev EX44
+make bootstrap      # idempotent host setup (ansible) — control-plane node setup
 make test           # unit tests, must pass on any machine, no KVM needed
 make test-metal     # integration tests tagged //go:build metal — needs KVM + root
 make leakcheck      # asserts zero leaked netns/TAPs/jail uids/cgroups after tests
@@ -38,18 +41,19 @@ setup + caveats: [`deploy/lima/README.md`](deploy/lima/README.md).
 This is the **default local loop** for anything touching `pkg/fcvm`, `pkg/netns`,
 `vmmd`, or `builderd`'s builder microVMs — write the metal code behind the build
 tag, iterate with `make metal-lima`, and you never touch the box until final
-sign-off. **Caveat (do not forget):** the guest is **arm64**, the production EX44
-is **x86_64**. This validates the arch-agnostic VM lifecycle logic and the
-Firecracker boot path — it does NOT produce production x86_64 snapshots or
-exercise the pinned x86_64 kernel. **The EX44 remains the source of truth for the
-§14 metal acceptance gates**; a green `make metal-lima` is necessary, not
-sufficient. On an older Mac (pre-M3) nested virt isn't granted; fall back to the
-EX44 or a cloud KVM box.
+sign-off. **Caveat (do not forget):** the Lima guest is **arm64**, the
+production control-plane nodes are **x86_64**. This validates the arch-agnostic
+VM lifecycle logic and the Firecracker boot path — it does NOT produce
+production x86_64 snapshots or exercise the pinned x86_64 kernel. **A bare-metal
+x86_64 control-plane node remains the source of truth for the §14 metal
+acceptance gates**; a green `make metal-lima` is necessary, not sufficient. On
+an older Mac (pre-M3) nested virt isn't granted; fall back to another bare-metal
+x86_64 box or a cloud KVM host.
 
 ## Repo map
 
 ```
-cmd/{apid,gatewayd,gatewayd-public,gatewayd-internal,schedd,vmmd,builderd,imaged,meterd,faas}   daemons + CLI (Go)
+cmd/{apid,gatewayd,gatewayd-public,gatewayd-internal,schedd,vmmd,builderd,imaged,meterd,gregale}   daemons + CLI (Go)
 pkg/{api,state,fcvm,netns,oci,rootfs,meter,stripex,wire,apid}   shared libs
 pkg/api/limits.go     EVERY plan quota/limit lives in this one table — never inline a limit
 guest/init            static Go PID1 inside every microVM
@@ -65,14 +69,14 @@ docs/adr/
 - `schedd` is the ONLY writer to `instances` and owner of the state machine (§6).
 - `apid` is the ONLY writer to customer-intent tables (apps, deployments, domains).
 - `vmmd` is the ONLY component that touches firecracker/jailer, and the only root one.
-- `gatewayd-public` is the ONLY public listener on the box (TLS-only edge;
+- `gatewayd-public` is the ONLY public listener on a node (TLS-only edge;
   introduced by the Tier A7 split, ADR-070). `gatewayd-internal` is the
-  routing + wake + proxy daemon that listens on a unix socket inside
-  the box and is reached only by `gatewayd-public`. The legacy
-  `gatewayd` daemon stays in-tree during the migration window. Cross-box
-  HA is achieved by having N boxes each with one `gatewayd-public` in
+  routing + wake + proxy daemon that listens on a unix socket on the
+  node and is reached only by `gatewayd-public`. The legacy
+  `gatewayd` daemon stays in-tree during the migration window. Cross-node
+  HA is achieved by having N nodes each with one `gatewayd-public` in
   front of their local `gatewayd-internal` set — NOT by having multiple
-  public listeners on one box.
+  public listeners on one node.
 - Components talk via Postgres rows + `pg_notify`, or gRPC on unix sockets in /run/faas/.
   Never add a direct call that bypasses an owner (e.g. apid must not call vmmd).
 

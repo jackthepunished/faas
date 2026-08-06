@@ -25,7 +25,7 @@
      `UsageByHour`, `UsageByMonth`, and `CurrentMonthOverageCents` queries
      are all heap scans today (`pkg/state/pgstore.go:4596`, `:5310`,
      `:5281`). At the audit's measured minute-row cardinality (≈ 5 M rows
-     per month on the EX44 fleet), `/v1/usage?month=2026-07` is a ~400 ms
+     per month on the reference fleet), `/v1/usage?month=2026-07` is a ~400 ms
      query; with index it is < 5 ms.
   3. **No snapshot / app-layer storage metering.** `snapshots.mem_bytes`
      and `snapshots.disk_bytes` exist (`pkg/state/pgstore.go:3929`) but
@@ -133,7 +133,7 @@ backfill insert are deferred to a follow-up PR (B.5 alternative).
   reconciliation tick, not a meterd crash. Prom rule compensates.
 - Retention cron is a `DELETE` (B.4.c, not B.4.a declarative
   partitioning). Vacuum cost on `usage_minutes` after a 13-month
-  retention tick is non-trivial on the EX44 (~5 minutes wall-clock
+  retention tick is non-trivial on the reference node (~5 minutes wall-clock
   measured in pre-prod). Deferred to a follow-up PR with the
   partitioning migration once weekly DELETE behaviour is measured.
 - Synthetic-row scaffold logs gaps but does NOT emit a backfill row.

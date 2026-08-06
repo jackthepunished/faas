@@ -1,4 +1,4 @@
-# SDKs (one-box FaaS)
+# SDKs
 
 Three first-class SDKs are published from this repo:
 

@@ -1,6 +1,6 @@
 # deploy/ — host provisioning and runtime config
 
-Bootstraps a fresh Hetzner EX44 to one-box FaaS-ready in one command:
+Bootstraps a fresh bare-metal x86_64 control-plane node to Gregale-ready in one command:
 
 ```
 make bootstrap          # `ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml`
@@ -15,7 +15,7 @@ make build              # compile every daemon
 make test               # cross-platform unit tests
 ```
 
-- `ansible/` — idempotent EX44 bootstrap (`make bootstrap`): LVM layout
+- `ansible/` — idempotent control-plane bootstrap (`make bootstrap`): LVM layout
   (§8), systemd slices (§13), nftables (§7), cgroups v2 verify
   (ADR-008). 8 roles, ordered:
   `cgroups_v2 → grub → lvm → xfs → firecracker → systemd_slices →
@@ -28,7 +28,7 @@ make test               # cross-platform unit tests
   via the `nftables` ansible role.
 - `scripts/` — ops helpers (`leakcheck.sh` for the shell-side check,
   restore drill planned for M8).
-- `controlplane/` — standalone Control Plane deploy path (GCP, DO, Hetzner Cloud, etc.):
+- `controlplane/` — standalone Control Plane deploy path (any KVM-capable cloud: GCP, DigitalOcean, Hetzner Cloud, etc.):
   bootstrap.sh for first-time host setup, deploy.sh for re-runs, and `sealed.env.example`
   for the operator-supplied env file. See [`controlplane/README.md`](controlplane/README.md)
   for the OAuth sign-in env vars (issue #419 / ADR-046).

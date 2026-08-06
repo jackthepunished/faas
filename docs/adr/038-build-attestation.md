@@ -112,7 +112,7 @@ already has.
   at build time (spec §4.9). Filled from the `FunctionRunnerPath`
   resolved in cmd/imaged. Empty for non-function deploys.
 - `builder_node_id` — the builder microVM's compute_node name
-  (default "default-local" on the one-box). Filled from
+  (default "default-local" on the single-node). Filled from
   `BuilderNodeID` config; cmd/builderd wires the value at boot.
 - `started_at` / `finished_at` — copied from the `builds` row's
   matching columns.
@@ -144,7 +144,7 @@ Positive:
 
 Negative:
 - One new table + one new partial index
-  (`build_provenance_build_id_idx`). On a one-box the row count
+  (`build_provenance_build_id_idx`). On a single node the row count
   is bounded by `builds` lifetime (≤10⁵ rows at the §17 retention
   horizon). The index cost is negligible.
 - A failed provenance INSERT logs at WARN and surfaces as 404 on
@@ -209,7 +209,7 @@ Compatibility:
     first lets the `O_WRONLY|O_CREATE` path take over without
     touching the inode permissions.
 - **Phase 4** (proposed): KMS-backed signing via cosign's
-  `--key` flag. ADR-039 to land when the EX44 picks up a KMS
+  `--key` flag. ADR-039 to land when the reference node picks up a KMS
   endpoint; `FAAS_SIGN_KEY_KMS_URI` env var will switch the
   signer impl.
 - **Provenance dashboard panel** — `provenance_writes_total{code}`

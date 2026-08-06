@@ -26,7 +26,7 @@ scale beyond 2 concurrent instances, even if their disk + memory
 budget supports 5. Pro / Scale customers over-provision their
 budget to ride out bursty traffic.
 
-Per `ex44_faas_financial_model.xlsx`, the Hobby tier (5 / 2 /
+Per the financial model spreadsheet, the Hobby tier (5 / 2 /
 256 / 50) is the break-even ceiling for the platform's smallest
 paid customer. The Free-to-Hobby break-even window is 1 GB-h vs
 50 GB-h (PR-A's Hobby tier-up). The customer-facing scaling policy
@@ -144,7 +144,7 @@ distinguish 429 from 503 on the gRPC side.
 | Cooldown remaining ≤ 0 in the dust after the halt | `Retry-After: 1` (the helper bounds at 1; RFC 7231 §7.1.3). |
 | `LastScaleOutAt == nil` race during a concurrent wake | Cold-start bypass on the consult side (NULL → no cooldown). Safe direction. |
 | `cooldownSRemaining` called twice between two cooldowns | The second call sees new `LastScaleOutAt` and recomputes (no caching). |
-| Clock skew between schedd and Postgres (chrony on EX44) | Bounded: helper bounds at 1; a skew-induced 0 never emits `Retry-After: 0`. |
+| Clock skew between schedd and Postgres (chrony on the reference node) | Bounded: helper bounds at 1; a skew-induced 0 never emits `Retry-After: 0`. |
 | `wakeMinFloorAlready` branch fires on a stamp-cooldown gap | Stays on `CodePlanLimitConcur` (429). Distinct from cooldown_held. |
 | `Concurrency > 0` discriminator removed by accident | Every request-driven wake hits cooldown; customer's "scale on demand" use case breaks. Caught by `TestAdmitGate_Outcomes/cold_start_bypass_cooldown`. |
 | `codeToGRPC` table drops CodeWaitForWarm | Inverse lift emits 500 (default). Caught by `TestStatusForCode_WaitForWarm`. |

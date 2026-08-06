@@ -18,7 +18,7 @@ provisions the fleet dashboard (PR #141, ADR-031).
 The canonical install path is `deploy/ansible/roles/grafana/`, which
 apt-installs Grafana OSS, SHA-256-pins the binary, provisions the
 Prometheus datasource + this JSON from disk, and binds the management
-bridge on `10.0.0.1:3000`. Run `make bootstrap` against the EX44 to
+bridge on `10.0.0.1:3000`. Run `make bootstrap` against a reference node to
 provision; the dashboard lands at
 `/d/faas-fleet-m8/faas-fleet-m8-12`.
 
@@ -34,8 +34,9 @@ For a hand-import path (developer laptop, external Grafana instance):
 
 The dashboard reads from the local Prometheus installed by
 `deploy/ansible/roles/prometheus`. The scrape config there
-(`prometheus.yml.j2`) targets every faas daemon + node_exporter on
-the bridge IP. No remote source — the dashboard is single-box.
+(`prometheus.yml.j2`) targets every Gregale daemon + node_exporter on
+the bridge IP. No remote source — the dashboard is single-node today (Tier A
+will move to a federated scrape per ADR-031).
 
 ## Panels
 

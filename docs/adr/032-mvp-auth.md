@@ -147,7 +147,7 @@ verify against `pkg/auth.DummyPHC` (a real Argon2id hash of a
 known placeholder string). The cost is identical between
 "unbound email", "wrong password", and "no password row" — the
 three failure modes cannot be distinguished by request timing.
-The 64MiB × 1 verify is ~50ms on the EX44; under the §11
+The 64MiB × 1 verify is ~50ms on the reference node; under the §11
 10/min/IP bucket the worst case is 10 × 50ms = 500ms/sec/core
 of CPU, well under the 6 GB control-plane slice.
 

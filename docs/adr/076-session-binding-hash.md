@@ -179,7 +179,7 @@ the same cookie after we revoked it").
 ## Verification
 
 - `make test` + `make lint`
-- Manual smoke (EX44): `/login` from one (IP, UA-family),
+- Manual smoke (reference control-plane node): `/login` from one (IP, UA-family),
   replay from a different UA → expect 401 + a new
   `auth.session.binding_mismatch` audit row in
   `GET /v1/audit-events`. Cross-check that

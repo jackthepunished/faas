@@ -31,15 +31,15 @@ ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml --check --d
                        # dry run, great for PR review
 ```
 
-## Do NOT run this on a non-EX44
+## Do NOT run this on a non-bare-metal host without reading this section
 
 The XFS `prjquota` requirement and the LVM `lv-system`/`lv-fc`
-naming come from Hetzner's `installimage` recipe (`ex44_faas_financial_model.xlsx`
-ties the snapshot budget to the 2×512 GB RAID-1). On other hosts the
-`lvm` and `xfs` roles will `fail` with explicit remediation steps —
-that's intentional.
+naming come from the reference host's `installimage` recipe (the
+financial model ties the snapshot budget to a 2×512 GB RAID-1 layout).
+On hosts without compatible storage the `lvm` and `xfs` roles will
+`fail` with explicit remediation steps — that's intentional.
 
-## After the EX44 hosts the executor
+## After the reference node hosts the executor
 
 Wire `self-hosted, kvm` label to the runner and the existing
 `.github/workflows/ci.yml` `metal` job flips on automatically — its

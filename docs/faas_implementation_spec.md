@@ -1,7 +1,9 @@
-# One-Box FaaS — Implementation Whitepaper
+# Gregale — Implementation Whitepaper
 
 **Version 1.0 · July 2026 · Confidential, internal**
-**Audience:** engineers and coding agents building the platform. This document is the buildable spec; treat it as the source of truth for architecture decisions. Business rationale lives in the founding whitepaper (`faas_founding_whitepaper.pdf`); financial numbers live in `ex44_faas_financial_model.xlsx`. Where this document and the spreadsheet disagree on a business number, the spreadsheet wins.
+**Audience:** engineers and coding agents building the platform. This document is the buildable spec; treat it as the source of truth for architecture decisions. Business rationale lives in the founding whitepaper (`faas_founding_whitepaper.pdf`); financial numbers live in the financial model spreadsheet. Where this document and the spreadsheet disagree on a business number, the spreadsheet wins.
+
+Gregale deploys on any bare-metal x86_64 host with `/dev/kvm`, ≥64 GB RAM, NVMe storage, and a 1 Gbit uplink. The reference deployment today is a single physical node (originally a Hetzner EX44: i5-13500 / 64 GB DDR4 / 2×512 GB NVMe RAID-1) — those values populate §1's host sizing row. The architecture itself targets multi-host scale-out (see §2 and `docs/scale_out_and_workload_classes.md`); the EX44 row is a reference, not a hard requirement.
 
 **How to use this document (agents):** every component in §4 is independently implementable against the interfaces defined here. Milestones in §14 are ordered and each has executable acceptance criteria — do not start milestone N+1 before N's criteria pass. Record any deviation from this spec as a new ADR in §3's format.
 
@@ -13,7 +15,7 @@ These numbers come from the financial model and are **not negotiable at implemen
 
 | Constraint | Value | Enforced by |
 |---|---|---|
-| Host: Hetzner EX44 | i5-13500 (20 threads), 64 GB DDR4, 2×512 GB NVMe RAID-1, 1 Gbit | — |
+| Reference host (Hetzner EX44 — sizing template, not a requirement) | i5-13500 (20 threads), 64 GB DDR4, 2×512 GB NVMe RAID-1, 1 Gbit | — |
 | Host OS RAM reserve | 2 GB | budget table §13 |
 | Control-plane RAM reserve | 6 GB | budget table §13, systemd slices |
 | Tenant RAM budget | 56 GB | `schedd` admission |
@@ -36,30 +38,30 @@ These numbers come from the financial model and are **not negotiable at implemen
 
 ## 2. Architecture overview
 
-One physical host runs everything. Every box below is a systemd unit; every arrow is either HTTP over localhost, gRPC over a unix socket, or a Postgres row.
+One control-plane node runs everything today; the architecture below extends to N nodes (Tier A, §2.1). Every box is a systemd unit; every arrow is either HTTP over localhost, gRPC over a unix socket, or a Postgres row.
 
 ```
-                        ┌───────────────────────────────── EX44 ─────────────────────────────────┐
-                        │                                                                        │
-  client ── TLS ──►  gatewayd ──── route lookup (cache→PG) ────┐                                 │
-  *.apps.gregale.dev         │                                      │                                 │
-  custom domains        │ wake needed?                         ▼                                 │
-                        ├────────► schedd ─────────► vmmd ── jailer ── firecracker ── microVM    │
-                        │           │  admission,     │        (one process per running VM)      │
-                        │           │  reaper,        │                                          │
-                        │           │  eviction       │  netns + TAP per instance (§7)           │
-                        │           ▼                 ▼                                          │
-                        │        postgres ◄──── snapshot/restore on NVMe (§8)                    │
-                        │           ▲                                                            │
-   deploy (API/CLI) ──► apid ───────┤                                                            │
-                        │           │                                                            │
-                        └─► builderd ── ephemeral builder microVM (Railpack/BuildKit inside)     │
-                                    │                                                            │
-                                 imaged ── OCI ➜ ext4 rootfs + guest-init ➜ boot ➜ snapshot      │
-                                    │                                                            │
-                        meterd ── 1 s samples ➜ minute rows ➜ GB-h ➜ Stripe usage records        │
-                        └────────────────────────────────────────────────────────────────────────┘
-   off-box: object storage (build cache, cold snapshots, backups) · Storage Box (PG WAL + nightly) · Stripe · DNS
+                        ┌────────────────────── control-plane node (today: Hetzner EX44) ─────────────────────┐
+                        │                                                                              │
+  client ── TLS ──►  gatewayd ──── route lookup (cache→PG) ────┐                                       │
+  *.apps.gregale.dev         │                                      │                                       │
+  custom domains        │ wake needed?                         ▼                                       │
+                        ├────────► schedd ─────────► vmmd ── jailer ── firecracker ── microVM          │
+                        │           │  admission,     │        (one process per running VM)            │
+                        │           │  reaper,        │                                                  │
+                        │           │  eviction       │  netns + TAP per instance (§7)                   │
+                        │           ▼                 ▼                                                  │
+                        │        postgres ◄──── snapshot/restore on NVMe (§8)                            │
+                        │           ▲                                                                  │
+   deploy (API/CLI) ──► apid ───────┤                                                                  │
+                        │           │                                                                  │
+                        └─► builderd ── ephemeral builder microVM (Railpack/BuildKit inside)           │
+                                    │                                                                  │
+                                 imaged ── OCI ➜ ext4 rootfs + guest-init ➜ boot ➜ snapshot            │
+                                    │                                                                  │
+                        meterd ── 1 s samples ➜ minute rows ➜ GB-h ➜ Stripe usage records              │
+                        └──────────────────────────────────────────────────────────────────────────────┘
+   off-node: object storage (build cache, cold snapshots, backups) · off-host PG WAL destination · Stripe · DNS
 ```
 
 **Request path (hot):** TLS → `gatewayd` → routing cache hit → proxy to instance IP:8080 → response. Budget: < 2 ms added latency.
@@ -79,11 +81,11 @@ Format for future ADRs: `ADR-NNN · title · status · decision · consequences`
 | ADR | Decision | Why | Rejected alternatives |
 |---|---|---|---|
 | 001 | Control plane in **Go**, monorepo, static binaries | firecracker-go-sdk is first-party and actively maintained (Go ≥ 1.23); single-binary deploys; agents generate/test Go well | Rust (slower iteration, no first-party SDK), Node/Python (RAM cost on a budgeted box) |
-| 002 | **Builds on the EX44** (option B), governed | Founder decision; €0 extra; one machine | Off-box builder VM (revisit at Gate B if build queue p95 > 60 s) |
+| 002 | **Builds on the control-plane nodes** (option B), governed | Founder decision; €0 extra; reuse existing capacity | Off-host builder VM (revisit at Gate B if build queue p95 > 60 s) |
 | 003 | **Builds run inside ephemeral builder microVMs**, not host containers | Untrusted `npm install` gets the same VM-grade isolation as untrusted runtime code; RAM cap is the VM boundary (exact, unbreachable); reuses vmmd primitives; kills rootless-runc attack surface on the host | Rootless BuildKit directly on host (weaker isolation, cgroup escapes are kernel bugs away), host docker (unacceptable) |
 | 004 | Zero-config engine: **Railpack** (BuildKit-based, Go); **Dockerfile** escape hatch; **pre-built OCI** accepted | Railpack is Nixpacks' successor (Nixpacks in maintenance mode), produces far smaller images — directly protects the 130 MB fleet snapshot target | Nixpacks (larger images), CNB Buildpacks (multi-GB builder images don't fit our RAM/disk budget) |
 | 005 | Park/wake via **Firecracker snapshot–restore**, file-backed memory; **cold boot from rootfs must always work** as fallback | Restore ≈ 150–300 ms with app already warm; snapshots are version-coupled to Firecracker, so they are cache, not truth | Cold boot always (1–3 s wakes), CRIU (fragile), keeping VMs resident (destroys the economics) |
-| 006 | **Postgres 16** single node, one database, `sqlc`-generated queries | One state store for routes, apps, builds, usage; WAL-shipped to Storage Box | SQLite (concurrent writers: meterd + apid + schedd), etcd (nothing to consense on one box) |
+| 006 | **Postgres 16** single primary + streaming replicas (future), one database, `sqlc`-generated queries | One state store for routes, apps, builds, usage; WAL-shipped off-host | SQLite (concurrent writers: meterd + apid + schedd), etcd (nothing to consense on a single node) |
 | 007 | Edge: **gatewayd is our own Go binary** using CertMagic; wildcard `*.apps.gregale.dev` via DNS-01; custom domains via on-demand HTTP-01 | Wake-blocking (hold request during restore) is core product logic — we own it; CertMagic is Caddy's battle-tested TLS core as a library | Stock Caddy/Traefik + sidecar wake logic (two hops, split brain), nginx+lua (unmaintainable) |
 | 008 | Host: **Ubuntu 24.04 LTS, cgroups v2 only**, KVM, systemd slices | Firecracker snapshot restore documented slow on cgroups v1; v2 is mandatory | Debian (fine too — pick one and stop) |
 | 009 | Per-instance **network namespace with identical inner TAP** (`tap0`, guest 10.0.0.2/30) | Snapshots bake device topology + guest IP; identical-netns trick lets one snapshot restore as N concurrent instances; host side NATs per-instance | Per-instance IP baked in snapshot (breaks concurrency > 1), vsock-only (no inbound HTTP) |
@@ -100,7 +102,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 **Owns:** TLS termination, routing, wake-blocking, request accounting, per-tenant rate limits.
 
 - Listeners: `:443` (HTTPS, HTTP/1.1 + h2), `:80` (redirect + ACME HTTP-01).
-- TLS: CertMagic. Wildcard cert for `*.apps.gregale.dev` via DNS-01 (Hetzner DNS API token). Custom domains (Pro+): on-demand HTTP-01 with an allowlist check against `custom_domains` table before issuance (prevents cert-mint abuse).
+- TLS: CertMagic. Wildcard cert for `*.apps.gregale.dev` via DNS-01 (provider-pluggable; the reference deploy uses Hetzner DNS). Custom domains (Pro+): on-demand HTTP-01 with an allowlist check against `custom_domains` table before issuance (prevents cert-mint abuse).
 - Routing: hostname → `app_id` via in-memory cache (LRU, 10k entries) backed by Postgres `LISTEN app_routes_changed`. Cache miss = one indexed PG lookup.
 - Wake-blocking: if app has no `RUNNING` instance, enqueue request (per-app queue, cap 512 requests / 30 s TTL, then `503 + Retry-After`), call `schedd.EnsureInstance(app_id)`, stream queued requests once readiness passes.
 - **Fan-out across `max_concurrency` (issue #168):** the routing cache is a per-app set of `Target{NodeID, InstanceID, WakeID}` (size ≤ plan's effective `max_concurrency`), picked via atomic round-robin so the hot path is allocation-free. `Backend.Admit(ctx, app_id, max_concurrency)` is the scale-out admission primitive; it atomically checks `HealthyCount < max_concurrency` before the gRPC round-trip so concurrent callers cannot collectively over-admit past the cap. At-capacity refusals surface as a typed `atCapacity=true` result (no gRPC status); the gateway treats them as a benign no-op when it already has ≥1 cached target. On every proxied request the handler stamps `x-faas-instance` with the picked `InstanceID`, overwriting any inbound header (trust model). Per-instance `last_request_at` is keyed by `instance_id` directly — the addr→instance resolver hop is gone.
@@ -113,7 +115,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
   - **Streaming path (Hobby+ only, ADR-047):** 100 MB body cap; 900 s response deadline. The `gatewayd` handler takes the streaming path iff `FAAS_GATEWAY_STREAMING` is set (operator opt-in) AND the app's `streaming_enabled` flag is true AND the inbound request did not opt out via `Accept: application/json`. The handler wraps `w` with a per-flush `onFlush` callback (`statusRecorder.doFlush`) that attributes egress bytes (per-instance, per-minute) on every `Write`+`Flush` boundary, plus a residual capture on `finalFlush`. The cap is enforced by `pkg/gateway.capWriter`; on cap-exceeded the gateway emits a 413 `streaming_not_available` problem+json (RFC 7807) instead of stdlib's 502.
   - **Per-request opt-out:** `Accept: application/json` flips a single request to the buffered path. The customer's per-app flag stays unchanged so flipping the flag on later is a config change, not a per-request decision.
   - **Plan gate:** `apid` rejects `streaming_enabled=true` on Free apps with `CodePlanStreamingNotAllowed` (per pkg/api/errors.go) at deploy time. The runtime fallback log `streamingFallbackLog` fires only when `!streaming && plan == Free && SSE` — the operator-toggled `FAAS_GATEWAY_STREAMING` is the operator-side lever, not a per-app misconfiguration.
-- **Multi-node forwarding (ADR-028 + ADR-047):** When schedd has placed an instance on a remote compute_node, gatewayd dials the per-node vmmd over the overlay (Tailscale or Wireguard; see §10 below) and bridges the HTTP bytes via vmmd's bidi `ForwardHTTPStream` RPC. The cache layer is `NodeClientCache`: one `*grpc.ClientConn` per `compute_node.id`, evicted on every `compute_node_changed` pg_notify. Hop-by-hop headers (RFC 7230 §6.1) are stripped before the bridge. The streaming envelope is 100 MB body / 900 s response deadline (the per-plan caps in §4.1 apply on the gateway side via `capWriter`; the vmmd bridge runs the streaming cap uniformly). The default-local node (one-box dev) skips the bridge and uses the existing direct reverse-proxy path. The legacy unary `ForwardHTTP` RPC was removed in PR-D — `ForwardHTTPStream` is the only bridge today.
+- **Multi-node forwarding (ADR-028 + ADR-047):** When schedd has placed an instance on a remote compute_node, gatewayd dials the per-node vmmd over the overlay (Tailscale or Wireguard; see §10 below) and bridges the HTTP bytes via vmmd's bidi `ForwardHTTPStream` RPC. The cache layer is `NodeClientCache`: one `*grpc.ClientConn` per `compute_node.id`, evicted on every `compute_node_changed` pg_notify. Hop-by-hop headers (RFC 7230 §6.1) are stripped before the bridge. The streaming envelope is 100 MB body / 900 s response deadline (the per-plan caps in §4.1 apply on the gateway side via `capWriter`; the vmmd bridge runs the streaming cap uniformly). The local-node path (default single-node deploy) skips the bridge and uses the existing direct reverse-proxy path. The legacy unary `ForwardHTTP` RPC was removed in PR-D — `ForwardHTTPStream` is the only bridge today.
 - Emits: `gateway_requests_total{app,code}`, `gateway_wake_latency_seconds` (histogram), `gateway_queue_depth`, `gateway_response_bytes_total{app,plan}` (per-flush delta + residual capture), `gateway_stream_flushes_total{app,plan}` (per-`doFlush` increment), `gateway_stream_active{app,plan}` (gauge — Inc on `setupStreamingWriter`, Dec on handler defer; buffered-path requests never touch the gauge). See §12 for the dashboard table.
 
 #### 4.1.1 Platform path reservations
@@ -166,7 +168,7 @@ gatewayd is the **only public listener on the box**; before falling through to t
 - **Eviction (RAM pressure > 80 % of the 85 % target):** park instances LRU by last request; never evict an instance younger than 30 s; Scale plan evicted last.
 - **Free-tier disk reaper:** free apps with zero requests for 14 days → snapshot + rootfs moved to object storage, state `EVICTED_COLD` (redeploy = one click, re-flatten from stored image). This is the founding doc's ceiling-protection policy (§9.7 there).
 - **Cron:** `crons` table; fire = synthetic `POST` through gatewayd (so metering/limits apply identically). Per-app and per-account caps are enforced in `apid`'s `createCron` under an apps `FOR UPDATE` row lock (mirrors `CreateAppIfUnderQuota`); Free plan is gated to 402 `plan_crons_not_allowed` because the per-app cap is 0. See `pkg/api/limits.go::CronLimitPerApp` / `CronLimitPerAccount`.
-- Single process, single writer to `instances` — no distributed locking on one box. Multi-node later = shard apps by node, one schedd per node, `apid` routes writes (interface kept narrow deliberately: `EnsureInstance`, `Park`, `Evict`).
+- Single process, single writer to `instances` per node — no distributed locking required. Multi-node today: each node has its own schedd writing the rows it owns; `apid` routes writes (interface kept narrow deliberately: `EnsureInstance`, `Park`, `Evict`).
 - Autoscale target tiering (RPS Pro+, CPU Pro+, plan Hobby→Pro re-tier applied 2026-07-28) — see [ADR-037 §Reconciliation note + §Amendment](adr/037-reactive-scaleup-trigger.md).
 
 ### 4.4 `vmmd` — microVM supervisor
@@ -471,7 +473,7 @@ This subsection is the cross-reference page for the three v1.1 ADRs. Steady-stat
 - Public: gatewayd binds :80/:443 on the host IP. Nothing else listens publicly. SSH on a non-standard port, key-only, fail2ban.
 - Per instance: netns `fc-{instance}`; inside it `tap0` ↔ firecracker; guest always `10.0.0.2/30`, host side `10.0.0.1` (ADR-009 — identical inner world so any snapshot restores anywhere). A veth pair `ve-{instance}` bridges the netns to `br-tenants`; the veth's host address `10.100.x.y/16` is the instance's routable identity; nftables DNATs `host_ip:ephemeral → 10.0.0.2:8080` within the netns.
 - **Cross-box overlay (ADR-028):** gatewayd reaches remote vmmd hosts via a Tailscale (default) or Wireguard (operator) overlay. The dial leg is plain TCP through the overlay interface (Tailscale: `tailscale0`; Wireguard: operator-named). vmmd's gRPC server binds the overlay port (default 50051) and refuses to serve the public listener. Operators provision via `deploy/ansible/roles/overlay/`. Authkey / peer list management is operator-owned; the role consumes vaulted secrets and renders systemd units.
-- Egress (tenant): default-allow TCP 80/443/53 + UDP 53; **deny 25, 465, 587** (spam = Hetzner abuse desk = existential, founding doc R6); deny RFC1918 + link-local + metadata ranges (no lateral movement into the control plane); per-instance conntrack cap 4,096; egress bandwidth per plan via `tc`: 10 / 25 / 100 / 250 Mbit.
+- Egress (tenant): default-allow TCP 80/443/53 + UDP 53; **deny 25, 465, 587** (spam = hosting abuse desk = existential, founding doc R6); deny RFC1918 + link-local + metadata ranges (no lateral movement into the control plane); per-instance conntrack cap 4,096; egress bandwidth per plan via `tc`: 10 / 25 / 100 / 250 Mbit.
 - **Per-instance egress metering (ADR-046, telemetry seam only):** vmmd samples the kernel byte counter at `/sys/class/net/<vethHost>/statistics/rx_bytes` for every RUNNING instance (root-side `vethHost`, since customer egress traverses `tap0 → vethPeer → vethHost` and lands as RX on the host side); cumulative readings are converted to regression-safe deltas in `pkg/fcvm/netstats.Cache` and exposed through `vmmd.Stats` → `schedd.ListInstanceStats` → `meterd.Sampler.SampleAndRoll`. The gateway additionally records HTTP response body bytes via `pkg/gateway/handler.go:statusRecorder.Bytes`. Both accumulate additively in `usage_minutes.tx_bytes` (gateway) and `usage_minutes.net_tx_bytes` (vmmd). **No billing change:** Stripe/Paddle push shapes remain `gb_ram_hour`; per-plan shaping is unchanged.
 - **Per-app egress IP allowlist (ADR-031 + ADR-033, M8 tier-2):** operators may pin `apps.egress_allowlist cidr[]` on a v4 or v6 CIDR list (Pro ≤16 entries combined, Scale ≤64 combined; Free/Hobby gate). Empty list = current default-allow behaviour preserved. Non-empty list emits one rule per non-empty family inside the per-netns forward chains — `iifname "tap0" ip daddr { v4 CIDRs… } accept` on `ip faas forward` and/or `iifname "tap0" ip6 daddr { v6 CIDRs… } accept` on `ip6 faas forward` — each placed **after** its chain's lateral-movement deny + SMTP drops so deny > allow on overlap and **before** the chain's default policy so unlisted destinations drop. Live instances keep their old ruleset until the next wake (same contract as `RAMMB` / `MaxConcurrency`). Non-`/0` contract held by the DB trigger `apps_egress_allowlist_cidr` (migration 00033); the apid + vmmd wire layers are defence-in-depth.
 - Egress (builder VMs): allow 443/80/53 to package registries only via a squid allowlist in v1.1; v1 = same as tenant policy. Deny everything inbound always.
@@ -660,7 +662,7 @@ sum by (route) (rate(apid_request_total{account_id="<uuid>"}[5m]))
 
 The `account_id="__other__"` series is the bounded overflow bucket — drill-down on this means the customer is past the 10 000 admission cap, and the operator must check the daemon slog for the original id (issue #278).
 
-**SLOs (public, on the status page):** API availability 99.5 % monthly; wake p95 < 1 s; build success (non-`user_error`) 99 %. Error budgets, not promises — one box (until Gate A) is stated honestly on the status page.
+**SLOs (public, on the status page):** API availability 99.5 % monthly; wake p95 < 1 s; build success (non-`user_error`) 99 %. Error budgets, not promises — single-node deployments (until Gate A) are stated honestly on the status page.
 
 Logs: journald → Loki free tier; tenant app stdout/stderr ring-buffered per instance (10 MB), surfaced via `GET /v1/apps/{app}/logs` (tail + follow).
 
@@ -756,7 +758,7 @@ The per-VM request-concurrency bound (`concurrency_per_vm`, issue #559) is indep
 
 ## 14. Delivery plan (for agents; sequential, each gate = passing acceptance tests)
 
-Conventions for all milestones: Go ≥ 1.23; integration tests that need KVM are tagged `//go:build metal` and run on the dev EX44 (or any nested-KVM runner) via `make test-metal`; unit tests must pass with `make test` on any machine.
+Conventions for all milestones: Go ≥ 1.23; integration tests that need KVM are tagged `//go:build metal` and run on a bare-metal x86_64 control-plane node (or any nested-KVM runner) via `make test-metal`; unit tests must pass with `make test` on any machine.
 
 | M | Scope | Acceptance (executable) |
 |---|---|---|
@@ -894,7 +896,7 @@ Firecracker snapshot support and versioning: github.com/firecracker-microvm/fire
 
 ## Appendix D — Validation plan (how this document earns certainty)
 
-Every row is an experiment with a pre-committed pass threshold. Run V1–V5 on a single rented EX44 (**total budget: one month's rent**) before M1 work begins; failures change plan quotas and §1 constraints, so they are cheapest to absorb now. Results get recorded next to the row; a failed threshold triggers an ADR, not a shrug.
+Every row is an experiment with a pre-committed pass threshold. Run V1–V5 on a single rented bare-metal x86_64 host (**total budget: one month's rent**) before M1 work begins; failures change plan quotas and §1 constraints, so they are cheapest to absorb now. Results get recorded next to the row; a failed threshold triggers an ADR, not a shrug.
 
 | # | Assumption at risk | Experiment | Pass threshold | When |
 |---|---|---|---|---|
@@ -907,7 +909,7 @@ Every row is an experiment with a pre-committed pass threshold. Run V1–V5 on a
 | V7 | Resident concurrency 0.02/0.15/0.6/3 (C-grade) | Beta cohort telemetry (`resident GB per customer`, §12) | Within 1.5× of plan by 20 customers | beta |
 | V8 | 5 % churn, 55/40/5 mix, 4 free riders (C-grade) | Cohort curves from first 90 days; monthly sheet re-run with observed values | Documented monthly; sheet updated | beta+ |
 | V9 | Payment path & fees (2.9 % + €0.30) | Confirm Stripe availability for the incorporation country; else price MoR alternative into the sheet | Fee delta reflected in model before launch | pre-incorporation |
-| V10 | Server quote €44 + €39 | Re-quote EX44 at order time (post-June-2026 price adjustment) | Within §9.9 sensitivity range (€39–50) | at order |
+| V10 | Server quote €44 + €39 | Re-quote a comparable bare-metal x86_64 host at order time (post-June-2026 price adjustment) | Within §9.9 sensitivity range (€39–50) | at order |
 
 Standing rules: (1) no number graduates from "assumption" to "fact" without a row here; (2) the §6.2 invariants are enforced as property-based tests, not prose; (3) each ADR gets one adversarial review pass before acceptance.
 

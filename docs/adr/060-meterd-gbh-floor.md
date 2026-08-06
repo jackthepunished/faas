@@ -121,7 +121,7 @@ defense-in-depth — the floor branch is reachable only when
 | Sampler panic / context cancel mid-emit | Live loop is fail-fast; if it errors, the floor block does not run. A single minute of "no floor" is preferable to "floor without live rows" (visible as a usage spike). |
 | `FloorNamespace` bumped (rotation) | Every existing floor row's identity changes; `AppendUsage` second-writes fail to idempotently match. Pinned by a doc comment + the namespace-version suffix. Future rotation requires new namespace + migration. |
 | Synthetic UUID collision against real instance UUIDs | Real IDs are UUID v4 under `uuid.NewString()`; floor IDs are UUID v5 under `onebox-faas/meterd/floor/v1`. The SHA-1 inputs are disjoint, so the resulting UUIDs cannot collide. Pinned by `TestFloorInstanceID_PassesPgStoreAppendUsage`. |
-| Clock skew between schedd and meterd (chrony on EX44) | Floor is unconditional on the minute key (`MinuteKey(s.now())`); skew does not affect the floor math. |
+| Clock skew between schedd and meterd (chrony on the reference node) | Floor is unconditional on the minute key (`MinuteKey(s.now())`); skew does not affect the floor math. |
 | `Loop.runTicks` errors after `SampleAndRoll` returns rows | Floor emit runs AFTER `runSampleOnce` returns; emit happens only on a successful sampler tick. Failure path is unchanged. |
 | `appPlan(appID)` lookup misses an app that was deleted between `ListAllApps` and the loop closure | Lookup returns `""` (empty plan). Counter emits with `plan=""`. Pinned by the `appPlan` helper treating a missing app as `""` rather than panicking. |
 
@@ -293,7 +293,7 @@ defense-in-depth — the floor branch is reachable only when
 ## Financial-model addendum (PREREQUISITE)
 
 Per CLAUDE.md ("financial model is source of truth"), the
-`ex44_faas_financial_model.xlsx` Hobby break-even row needs a
+financial model spreadsheet's Hobby break-even row needs a
 `min_instances: 1` scenario column BEFORE this PR merges. The
 column should pin:
 
@@ -312,7 +312,7 @@ column should pin:
 The addendum is informational (the math is integer and exact);
 no implementation change depends on it. But CLAUDE.md is
 load-bearing — the PR cannot merge until the spreadsheet row
-is committed to the EX44 box.
+is committed to the reference node.
 
 ## Verification
 

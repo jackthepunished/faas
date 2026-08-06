@@ -1,12 +1,17 @@
-# Scale-out & Workload Classes — future implementation plan
+# Scale-out & Workload Classes
+
+Gregale's forward plan: how the platform scales past a single bare-metal x86_64
+control-plane node, and how a long-running **services** tier (Fargate/ECS-shaped)
+can coexist with the **functions** tier (Lambda-shaped) on the same substrate.
 
 - **Status:** planning doc (not a decision record). The choices below are *leans*,
   not accepted ADRs. Each one becomes a numbered ADR in [`adr/`](adr/) at the
-  milestone/gate that forces it. Nothing here changes v1 (M0–M8); v1 stays
-  strictly one-box (spec §14).
-- **Scope:** how the platform grows past a single Hetzner EX44, and how a
-  long-running **services** tier (Fargate/ECS-shaped) can coexist with the
-  **functions** tier (Lambda-shaped) on the same substrate.
+  milestone/gate that forces it. Tier A work has landed incrementally as
+  ADRs 062–067 (per-node schedd, snapshot de-localization, cross-node live
+  migration, migrating-instance watchdog) plus 070 (edge split); this doc
+  tracks the *forward* plan after those.
+- **Scope:** how the platform scales past a single control-plane node, and how
+  the services tier coexists with functions on a multi-node substrate.
 - **Source of truth:** this doc must never contradict
   [`faas_implementation_spec.md`](faas_implementation_spec.md) or the financial
   model. Where it proposes something new, it names the ADR that will decide it.
@@ -15,9 +20,10 @@
 
 They are the same decision viewed twice. The whole "which tenant type gets the
 RAM" tension (functions want burst headroom free; services want to pin a floor)
-**only exists because it is one box.** Go multi-box and the contention becomes a
-placement policy — you dedicate nodes. So the workload-class question and the
-scale-out question resolve together, and sequencing one fixes the other.
+**only exists because of the single-node RAM partition.** Go multi-node and
+the contention becomes a placement policy — you dedicate nodes. So the
+workload-class question and the scale-out question resolve together, and
+sequencing one fixes the other.
 
 ## What does NOT change (survives every phase)
 
@@ -42,15 +48,15 @@ services tier are built *around* them, never through them:
 | D2 | **Horizontal = shard apps by node, one `schedd` per node, `apid` routes writes**, plus a new **placement scheduler**. | Spec line 131 already designed the `schedd` interface (`EnsureInstance`/`Park`/`Evict`) narrow for exactly this. | Gate A |
 | D3 | **Two "watch-it walls": local snapshot storage and unix-socket transport.** Keep them thin; they are the first things rebuilt at scale-out. | Both are same-host-only assumptions. Everything else already scales out cleanly. | Gate A (folds into D2) |
 | D4 | **One platform, two workload classes** (`function`, `service`) — not two platforms. ~80% of the substrate (`vmmd`, `imaged`, `pkg/oci`/`rootfs`, gateway, admission ledger) is shared. | The schema already carries `AppType{app,function}` (`pkg/state/types.go`). Building two engines would duplicate the hardened core. | services milestone (post-M8) |
-| D5 | **Services tier ships only after multi-box.** On one box it must fight functions for one RAM budget; on N boxes it is a placement policy. | Removes the zero-sum RAM fight entirely; makes the tier's unit economics tractable. | post Gate A |
+| D5 | **Services tier ships only after multi-node.** On a single node it must fight functions for one RAM budget; on N nodes it is a placement policy. | Removes the zero-sum RAM fight entirely; makes the tier's unit economics tractable. | post Gate A |
 | D6 | **The snapshot moat is functions-only.** Services cold-boot/restore per replica; price them accordingly. | N-instances-from-one-snapshot depends on the identical inner network world (ADR-009), which a multi-replica, addressable service gives up. | services milestone |
 
-## What actually changes going one-box → multi-box
+## What actually changes going single-node → multi-node
 
-Grounded in today's wiring. Left column is a same-host assumption; right column
-is the multi-host replacement (all Gate A, per D2/D3):
+Grounded in today's wiring. Left column is a same-node assumption; right column
+is the multi-node replacement (all Gate A, per D2/D3):
 
-| Today (one box) | Multi-box needs |
+| Today (single node) | Multi-node needs |
 |---|---|
 | gRPC over unix sockets in `/run/faas/` (vmmd/schedd) | TCP behind mTLS — the re-eval trigger already noted in ADR-013/015/018 |
 | Snapshots on local `/srv/fc` | wake-on-node-B needs node-A's snapshot → **sticky placement** (route an app to its warm node) or shared/replicated snapshot store. Cold-boot fallback (ADR-005) is the safety net that makes this non-fatal. |
@@ -86,18 +92,19 @@ watch-it walls (D3) thin — don't pour extra concrete around local snapshot pat
 or assume unix-socket locality in new code beyond what vmmd/schedd already do.
 
 **Phase 1 — first customers (vertical).**
-Move to a bigger dedicated box when RAM/CPU pressure appears. Config + ledger
-ceiling change, no architecture change. Ceiling is real: the biggest box Hetzner
-rents, and — the actual forcing function — **one box is one failure domain**
-(every customer dies together). Blast radius, not RAM, is what ends Phase 1.
+Move to a bigger dedicated control-plane node when RAM/CPU pressure appears.
+Config + ledger ceiling change, no architecture change. Ceiling is real: the
+biggest node any provider rents, and — the actual forcing function — **a
+single node is one failure domain** (every customer dies together). Blast
+radius, not RAM, is what ends Phase 1.
 
 **Phase 2 — Gate A (horizontal + HA).**
-Matches spec: M8 ships the "2nd box active-passive" runbook; Gate A is the
-FSN+HEL regional pair (§16). Build order:
-1. De-local snapshots (sticky placement first; shared store only if needed).
-2. Sockets → mTLS TCP (ADR-013/015/018 re-eval triggers).
-3. Per-node `schedd`, apps sharded by node, `apid` routes writes.
-4. The **placement scheduler** (new component; "which node admits this VM").
+Tier A work is shipping incrementally today. Build order:
+1. De-local snapshots (sticky placement first; shared store only if needed)
+   — ADR-063.
+2. Sockets → mTLS TCP (ADR-013/015/018 re-eval triggers) — ADR-052.
+3. Per-node `schedd`, apps sharded by node, `apid` routes writes — ADR-062.
+4. Cross-node live migration — ADR-066.
 Write ADRs D2/D3 here.
 
 **Phase 3 — services / Fargate workload class (post Gate A).**
@@ -121,8 +128,8 @@ spreadsheet decision first, code second.
 
 - **Any workload that can't park** (long-lived connections, WebSocket/streaming
   — itself a §16 open question) is an early signal the `service` class is needed
-  before Gate A; if so, D5's "multi-box first" ordering must be revisited, and
-  the one-box RAM partition designed explicitly.
+  before Gate A; if so, D5's "multi-node first" ordering must be revisited, and
+  the single-node RAM partition designed explicitly.
 - **A customer needs an arbitrary OCI image** (not built FROM our base): trips the
   two-drive `FROM`-base constraint (`pkg/oci/image.go`). Requires content-addressed
   base sharing — a separate ADR, orthogonal to this plan.

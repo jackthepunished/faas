@@ -251,7 +251,7 @@ and per-sidecar gateway portnorm.
 ## Verification
 
 - `make test` — green across `pkg/`, `cmd/`, `guest/`.
-- `make test-metal` (EX44 only) — gates TestMetalSidecarBoot +
+- `make test-metal` (reference control-plane node only) — gates TestMetalSidecarBoot +
   TestMetalSidecarPortReachable + TestMetalTwoSidecarsColdBoot.
 - `make leakcheck` — child-first cgroup scope removal pattern
   keeps the per-instance scope clean after Destroy.

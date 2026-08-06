@@ -180,7 +180,7 @@ inside vmmd, not socat.
 - Tailscale ACLs — operators own their tailnet ACLs.
 - WireGuard mesh configuration automation — operators manage
   peer lists via Ansible vault.
-- vmmd-as-both-gatewayd-and-vmmd on one box — collapsed topology
+- vmmd-as-both-gatewayd-and-vmmd on one node — collapsed topology
   is fine (default-local still works); no special-case code.
 
 ## Reference call sites

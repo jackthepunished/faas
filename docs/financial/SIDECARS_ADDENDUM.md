@@ -1,10 +1,10 @@
 # Financial-model addendum: sidecar RAM math (issue #463 / ADR-069)
 
 **Status (issue #463 / ADR-069 §"Financial-model addendum"):** in-repo
-record of the `ex44_faas_financial_model.xlsx` scenario columns for
-sidecar deployments. The xlsx is offline (lives on the EX44 box
+record of the financial model spreadsheet's scenario columns for
+sidecar deployments. The xlsx is offline (lives on the reference node
 only, git-ignored per CLAUDE.md), so this file is the canonical
-**in-repo** source of truth until the corresponding EX44 box row is
+**in-repo** source of truth until the corresponding spreadsheet row is
 patched. The two records MUST agree.
 
 ## Billable-RAM formula
@@ -63,7 +63,7 @@ sidecar usage; Pro customers exceed their 250 GB-h ceiling under
 any sidecar usage; Scale customers fit their 1500 GB-h ceiling
 under the 2-sidecar cap.
 
-## Verifications (sheet rows, EX44 only — must mirror this table)
+## Verifications (sheet rows, reference node only — must mirror this table)
 
 1. Hobby 50 GB-h included ceiling is exceeded under any
    sidecar usage (1-init row at ~221 GB-h ≫ 50 GB-h).
@@ -99,11 +99,10 @@ persisted `deployments.sidecars` jsonb; today the billed value is
 re-derived from the deployment row at meter time
 (`pkg/meter/sampler.go`).
 
-## Operationally what needs to happen on the EX44 box
+## Operationally what needs to happen on the reference node
 
-The spreadsheet row lives in
-`ex44_faas_financial_model.xlsx` on the EX44 box. The row must
-contain, at minimum:
+The spreadsheet row lives in the financial model spreadsheet on the reference node.
+The row must contain, at minimum:
 
 - A `per_instance_billable_mb` column with the per-plan ×
   per-sidecar-count matrix above.
@@ -114,15 +113,15 @@ contain, at minimum:
 
 CI does NOT enforce the workbook row because the workbook is
 offline (per CLAUDE.md "the spreadsheet is absent from the
-repo"). The reviewer checks during PR review that the EX44
+repo"). The reviewer checks during PR review that the reference-node
 operator has committed a matching row before merge.
 
 ## Why a doc, not the xlsx
 
-CLAUDE.md: *"ex44_faas_financial_model.xlsx — business numbers.
+CLAUDE.md: *"the financial model spreadsheet — business numbers.
 Never contradict it in code or docs."* Code that materially
 changes billable math (issue #463 PR-A added
 `BillableRAMMBWithSidecars`) MUST have an in-repo record, in
 the same direction as the spreadsheet. This file IS that
-record. The PR is mergeable when this file lands; the EX44
+record. The PR is mergeable when this file lands; the
 spreadsheet row catch-up is tracked out-of-band.

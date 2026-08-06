@@ -94,7 +94,7 @@ registered as a `*prometheus.CounterVec`; the four `plan` rows
 never reports "no data" on an idle box. The `__other__` sentinel
 is the bounded-admission overflow bucket — if the `accountLabelSet`
 admission primitive (issue #278) ever overflows on a customer
-count exceeding the one-box cap, the daemon collapses the new id
+count exceeding the single-node cap, the daemon collapses the new id
 to `__other__` rather than minting a fresh label. The metric
 matches the `gateway_tls_on_demand_denied_total{reason}` precedent
 at `pkg/gateway/metrics.go:144-146` (ADR-024 H3, PR #345).
@@ -141,7 +141,7 @@ Companion runbook: `docs/runbooks/FaasPerAccountRateLimitSpike.md`.
 ### Account-id cardinality
 
 O(10 000 × 4) = 40 000 series max, bounded by the current
-one-box account cap (~10k) plus 4 pre-instantiated `plan` rows.
+single-node account cap (~10k) plus 4 pre-instantiated `plan` rows.
 The alert and runbook document the cardinality audit path; if
 customer count crosses 10k, the cap is lifted in lockstep with
 the existing `accountLabelSet` admission primitive (issue #278).

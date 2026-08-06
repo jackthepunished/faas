@@ -1,6 +1,6 @@
 # Trace propagation — `TRACEPARENT` for your handler
 
-The one-box FaaS platform stamps every incoming request with a W3C
+Gregale stamps every incoming request with a W3C
 [`traceparent`](https://www.w3.org/TR/trace-context/) header and
 forwards it to your function in the `TRACEPARENT` environment
 variable (issue #555 layer 4). You can opt into OpenTelemetry
@@ -14,7 +14,7 @@ This page is the operator's quick-start; the spec contract is in
 ## What the platform gives you
 
 - **Header name (HTTP)**: `traceparent` — the standard W3C name.
-  The one-box gateway already accepts and forwards it.
+  The Gregale edge gateway already accepts and forwards it.
 - **Env var (runner)**: `TRACEPARENT` — same value, set on every
   request to your handler. Format is
   `00-<trace_id 32 hex>-<span_id 16 hex>-<flags 2 hex>`, e.g.

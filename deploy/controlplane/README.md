@@ -1,6 +1,6 @@
 # Deploy FaaS Control Plane (Standalone Host)
 
-Deploys the non-KVM parts of the platform on a standalone Cloud VM (GCP, DigitalOcean, Hetzner Cloud, etc.) for development, testing, and staging. `vmmd` and `builderd` are **not deployed** (no `/dev/kvm` on standard non-nested VMs) — VM lifecycle operations return errors, which is expected.
+Deploys the non-KVM parts of the platform on a standalone Cloud VM (GCP, DigitalOcean, Hetzner Cloud, etc.) for development, testing, and staging. `vmmd` and `builderd` are **not deployed** (no `/dev/kvm` on standard non-nested VMs) — VM lifecycle operations return errors, which is expected. Some Gregale features (TLS DNS-01, Hetzner DNS zone updates) reference specific providers and need configuration changes when run elsewhere.
 
 ## What runs
 
@@ -187,7 +187,7 @@ sudo -u postgres psql faas
 - **Builds** — builderd is not deployed (needs vmmd for builder VMs)
 - **Snapshot/restore latency** — no Firecracker on DO
 
-These require a KVM-capable host (Hetzner Cloud CCX or the production EX44).
+These require a KVM-capable host (a Hetzner Cloud CCX instance, a bare-metal x86_64 server, or a similar KVM-enabled provider).
 
 ## Production / TLS
 

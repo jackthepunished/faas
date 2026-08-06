@@ -21,7 +21,7 @@
 
 ## Why
 
-Today, a one-box FaaS customer deploys exactly one workload per
+Today, a Gregale customer deploys exactly one workload per
 app: a single OCI image running as PID 1 inside a Firecracker
 microVM. There is no surface for the two adjacent stateless
 patterns every customer hits sooner or later:
@@ -35,7 +35,7 @@ patterns every customer hits sooner or later:
 2. **Metrics scraper as sidecar.** A customer wiring Prometheus
    today must bake the scraper into the main image (so they can
    expose `/metrics` on the same socket) or run a sidecar
-   container on a separate host (which doesn't fit the one-box
+   container on a separate host (which doesn't fit the single-node
    model). The right shape is "run this image alongside the main
    workload, share the netns, separate the cgroup for OOM
    isolation".
@@ -399,7 +399,7 @@ range 1..96.
 ## Financial-model addendum (PREREQUISITE)
 
 Per CLAUDE.md ("financial model is source of truth"), the
-`ex44_faas_financial_model.xlsx` Hobby / Pro / Scale break-even
+financial model spreadsheet's Hobby / Pro / Scale break-even
 rows need a `sidecars: 1` (and `sidecars: 2`) scenario column
 pinning GB-h BEFORE this PR merges. The column should pin:
 
@@ -421,13 +421,12 @@ pinning GB-h BEFORE this PR merges. The column should pin:
   1500 GB-h included ceiling. Verifies Scale customers fit
   inside their ceiling under the 2-sidecar cap.
 
-The xlsx is git-ignored (`ex44_faas_financial_model.xlsx`
-lives on the EX44 box only). The in-repo record of the math is
+The xlsx is git-ignored (lives on the reference node only). The in-repo record of the math is
 [`docs/financial/SIDECARS_ADDENDUM.md`](../../financial/SIDECARS_ADDENDUM.md)
 (issue #463 / PR-B closure) — that file is the **mergeable
 in-repo source of truth** for the sidecar RAM math and MUST
-mirror the EX44 box row. The PR merges when
-`docs/financial/SIDECARS_ADDENDUM.md` lands; the EX44
+mirror the spreadsheet row. The PR merges when
+`docs/financial/SIDECARS_ADDENDUM.md` lands; the
 spreadsheet row catch-up is tracked out-of-band by ops.
 
 ## Verification
@@ -517,7 +516,7 @@ Pre-merge checklist:
 
 - [x] `docs/financial/SIDECARS_ADDENDUM.md` is the in-repo
       source of truth for the sidecar RAM math (issue #463 /
-      PR-B closure). The EX44 box workbook rows mirror the
+      PR-B closure). The reference-node workbook rows mirror the
       addendum scenarios; CI does NOT enforce the workbook row
       because the workbook is offline (per CLAUDE.md).
 - [ ] `docs/adr/README.md` table row for ADR-069 added on the

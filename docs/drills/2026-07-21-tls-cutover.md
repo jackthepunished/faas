@@ -2,8 +2,8 @@
 
 > ⚠️ **PENDING — operator execution required.** This drill template
 > was scaffolded as part of the gatewayd Tier-1 PR
-> (`worktree-tier1-gatewayd-fix`, Finding 5) but the actual EX44 run
-> has not happened yet. The §14 milestone gate is the EX44 execution,
+> (`worktree-tier1-gatewayd-fix`, Finding 5) but the actual reference-node run
+> has not happened yet. The §14 milestone gate is the reference-node execution,
 > not this document — issue #252 stays open until the row population
 > below is filled in by an operator against a live box. Do NOT mark
 > the issue closed from a code-only PR.
@@ -20,7 +20,7 @@
 |---|---|
 | Date (UTC) | 2026-07-21T__:__:__Z |
 | Operator | <name> |
-| Box | <EX44 id / public IP> |
+| Box | <reference-node id / public IP> |
 | Wildcard domain | `*.apps.<zone>` (e.g. `*.apps.gregale.dev`) |
 | Cert issuer | Let's Encrypt (prod) |
 | Cert `notBefore` | <ISO-8601> |
@@ -60,7 +60,7 @@ $ sudo bash deploy/scripts/hetzner-zone-setup.sh \
       --zone example.com \
       --apps-domain apps.gregale.dev \
       --edge-host edge.gregale.dev \
-      --host-ip <EX44_IP>
+      --host-ip <REFERENCE_NODE_IP>
 
 <paste the full script output here; expect three lines:
    A     apps.gregale.dev  -> <IP>

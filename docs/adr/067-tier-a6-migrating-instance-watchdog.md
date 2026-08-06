@@ -261,7 +261,7 @@ DDL.
 
 - `make test` — full unit suite (the watchdog is unit-only).
 - `make test-metal` — exercise the schedd ↔ vmmd path on
-  Lima / EX44.
+  Lima / reference control-plane node.
 - `make leakcheck` — zero leaked netns/TAPs/cgroups.
 - `make lint` — `go tool golangci-lint run`; the new file
   must pass `gofmt` (the repo-wide gate, per ci.yml).
@@ -269,7 +269,7 @@ DDL.
 - `make proto-check` — expected: no proto change; passes
   unchanged.
 
-End-to-end manual smoke (Lima or EX44):
+End-to-end manual smoke (Lima or a reference control-plane node):
 1. `make bootstrap && make run` with one schedd, one app,
    wake once.
 2. Suspend the new-owner vmmd (kill -STOP the firecracker

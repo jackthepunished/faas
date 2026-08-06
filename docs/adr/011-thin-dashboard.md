@@ -13,7 +13,7 @@
   - A slice of dashboard work lands at M7.5 instead of post-M8 (UX spec §12 milestone table).
 - **Rejected alternatives:**
   - **Keep CLI-only at launch, defer dashboard to M8.** Rejected: breaks §5 connect-repo UX and strands the git-deploy funnel the founder chose.
-  - **Ship a SPA (React / Vue).** Rejected: adds a node build chain to a one-box platform, blows the 6 GB control-plane slice (spec §13), and increases the dashboard's attack surface (XSS via SPA hydration) — server-rendered HTML has a much smaller trust boundary.
+  - **Ship a SPA (React / Vue).** Rejected: adds a node build chain to a control-plane platform, blows the 6 GB control-plane slice (spec §13), and increases the dashboard's attack surface (XSS via SPA hydration) — server-rendered HTML has a much smaller trust boundary.
   - **Static dashboard on a CDN with apid holding the OAuth state.** Rejected: the OAuth callback needs server state (state cookie, code-exchange) — putting the dashboard outside the server's reach re-introduces the SPA's deployment friction for zero gain.
   - **Expose apid on a second public listener.** Rejected: violates the §11 "single public listener" invariant. gatewayd already has CertMagic + the canonical request-ID injection + rate-limit observability — splitting the public surface doubles the §11 attack surface.
 

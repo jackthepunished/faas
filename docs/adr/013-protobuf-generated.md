@@ -13,7 +13,7 @@
 - **Rejected alternatives:**
   - **Hand-written protobuf via the runtime API.** Lighter footprint (no codegen step), but spec-aligned (gRPC on day one) and any daemon that needs gRPC later (builderd maybe) reuses the toolchain. Re-evaluation trigger: never — the generated version is the spec call.
   - **Plain JSON over HTTP or JSON-RPC over a unix socket.** Cheaper to ship but spec §4.4 line 138 explicitly says gRPC; deviation requires a new ADR and we don't want one per mailbox rider.
-  - **Buf Schema Registry (BSR) + remote package pin.** Premature for a one-box platform; nobody outside the team is going to import our proto. Pinned to local repo for v1.
+  - **Buf Schema Registry (BSR) + remote package pin.** Premature for a single-node platform; nobody outside the team is going to import our proto. Pinned to local repo for v1.
 
 ## Re-evaluation triggers
 

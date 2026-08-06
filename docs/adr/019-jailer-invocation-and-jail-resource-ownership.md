@@ -81,7 +81,7 @@
     threads the lease uid/gid. drive1 is a per-instance **copy**, so a Scale-plan
     2 GB layer costs a 2 GB copy per live instance — acceptable for M0/M1; a
     reflink/CoW fast path is a later optimization, not a correctness change.
-  - The EX44 remains the source of truth for the §14 M0 gate: a green
+  - A bare-metal x86_64 control-plane node remains the source of truth for the §14 M0 gate: a green
     `make metal-lima` (arm64 nested KVM) validates the lifecycle and boot path
     but not the pinned x86_64 kernel/snapshots (CLAUDE.md). This ADR's ownership
     model is proven by unit tests (`stageReadOnly`/`stageWritable` inode +

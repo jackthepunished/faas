@@ -30,7 +30,7 @@ write-once per box lifetime.
 Three conditions made this acceptable-for-now but a
 Tier-1-blocker for production multi-host:
 
-1. The bootstrap sequence on the EX44 generates the key
+1. The bootstrap sequence on the reference node generates the key
    exactly once (vmmd's first-boot path), and the file lived at
    a stable path forever. Replacing it was an undocumented
    manual operation that would have bricked every customer's

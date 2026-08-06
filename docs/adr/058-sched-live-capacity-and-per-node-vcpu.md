@@ -199,7 +199,7 @@ Integration:
   `PUT /v1/compute-nodes/{id}` (post-API) or directly in
   `compute_nodes`. The financial model §1's 8× CPUOvercommit ratio
   (160 vCPU from 20 physical cores) is the recommended starting point
-  for an EX44.
+  for a reference control-plane node.
 - A `vcpu_budget=0` row is rejected by the CHECK constraint at the DB
   layer; a `Request.VCPUBudget=0` falls back to `api.VCPUSlots` at the
   ledger layer (defensive net for un-registered nodes / test seams).

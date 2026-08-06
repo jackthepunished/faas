@@ -369,12 +369,12 @@ typo doesn't silently fall back to the api.* default.
 - `make test` — full unit suite must pass.
 - `make test-metal` (or `make metal-lima` on Apple
   Silicon) — exercises the schedd↔vmmd four-phase
-  path on Lima nested KVM or the EX44.
+  path on Lima nested KVM or a reference control-plane node.
 - `make leakcheck` — zero leaked netns/TAPs/cgroups.
 - `make lint` — golangci-lint clean.
 - `make spec-check` — vacuum + AST parity + git clean.
 
-End-to-end manual smoke (Lima or EX44):
+End-to-end manual smoke (Lima or a reference control-plane node):
 
 1. Bootstrap a two-node fleet (FSN-1 + FSN-2) per
    `docs/runbooks/multi-box.md`.

@@ -9,7 +9,7 @@
      `pg_notify('build_queued', {build, deployment, app, kind})` immediately
      after `CreateBuild` (PR-A). `cmd/builderd/main.go` subscribes via
      `db.SubscribeWithReconnect` and dispatches each notification to
-     `b.ProcessOne(ctx, buildID)`. Round-trip on the EX44 is ≈ 200 ms.
+     `b.ProcessOne(ctx, buildID)`. Round-trip on the reference node is ≈ 200 ms.
 
   2. **Durability net (new).** `cmd/builderd/main.go` runs a
      `workerLoop` goroutine that ticks every
@@ -110,13 +110,13 @@
   - **`pg_cron` extension + `cron.schedule('claim-build-worker',
     'SELECT … FROM claim_next_queued_build()', '* * * * *')`.**
     Closed-form durable, no Go worker, but pg_cron is **not
-    installed** on the EX44 Postgres (no migration, no
+    installed** on the reference-node Postgres (no migration, no
     `shared_preload_libraries`, no ansible role entry). Adopting it
     would mean a `postgresql-contrib` apt-install + a Postgres
     `restart` (which in turn requires a tenant-`paused` maintenance
     window per the §13 ops playbook) + a new migration that loads
     the extension. The operator-cost / durability benefit ratio
-    doesn't justify it for a beta one-box. The SQL shape (`SELECT
+    doesn't justify it for a beta single-node deploy. The SQL shape (`SELECT
     … FOR UPDATE SKIP LOCKED`) is identical to what the new
     in-process worker uses, so a future migration to pg_cron is a
     straight swap.
@@ -141,7 +141,7 @@
 
   - **Always-on worker without LISTEN.** Drops the fast path, costs
     ≈ 2 s of build latency on every deploy for no durability
-    benefit — Postgres `NOTIFY` round-trip on the EX44 is ≈ 200 ms.
+    benefit — Postgres `NOTIFY` round-trip on the reference node is ≈ 200 ms.
     The two-layer model keeps the warm path warm and the cold path
     durable.
 
@@ -164,10 +164,10 @@
   - **Multi-builderd horizontal scale.** `SKIP LOCKED` makes
     concurrent pollers safe at the SQL layer, but the
     `1 + 1 opportunistic` slot budget is per-process. Two
-    `faas-builderd` processes on the EX44 would exceed the budget.
-    Not a one-box concern; revisit if the cluster grows past
+    `faas-builderd` processes on the reference node would exceed the budget.
+    Not a single-node concern; revisit if the cluster grows past
     one control plane.
-  - **Promotion to pg_cron.** If the EX44 ever grows pg_cron, the
+  - **Promotion to pg_cron.** If the reference node ever grows pg_cron, the
     in-process worker can be deleted and the `SELECT` promoted to a
     `cron.schedule` call. The CAS SQL is the same in both places.
 

@@ -7,7 +7,7 @@ Accepted — 2026-07-29. Closes #419.
 ## Context
 
 Issue #419 is tier-1 ship-blocking: `GET /v1/auth/google` and
-`GET /v1/auth/github` return `500 *_oauth_misconfigured` on the EX44
+`GET /v1/auth/github` return `500 *_oauth_misconfigured` on the reference node
 production box because `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` /
 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` are unset in
 `/etc/faas/sealed.env` and apid never validates them at startup.

@@ -243,7 +243,7 @@ writes); only the gateway→vmmd leg is bidi gRPC.
   chunked-encoding loop and `read -t N` are bash-portable
   (busybox includes both). The Lima arm64 guest uses bash
   already (PR-A used the same script shape for the unary path);
-  the EX44 x86_64 guest also uses bash. No new runtime
+  the reference x86_64 guest also uses bash. No new runtime
   dependency.
 - **R6. PR-C vmmd config drift.** The per-node vmmd client cache
   (`pkg/gateway/forwardproxy.go::NodeClientCache`) is reused
@@ -310,7 +310,7 @@ The four PR-D-territory questions resolved in the PR-D commit:
   `cmd/e2e/streaming_metal_test.go` with the four-plan
   matrix: Free 1 MB → 413 streaming_not_available; Hobby /
   Pro / Scale 1 MB → 200. The full 100 MB stress is left to
-  the EX44 metal acceptance (the per-test 1 MB payload
+  the reference-node metal acceptance (the per-test 1 MB payload
   exercises the apid-side gate cleanly; the metal test
   verifies the platform's wiring under real Firecracker).
 

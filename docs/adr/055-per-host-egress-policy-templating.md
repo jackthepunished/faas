@@ -13,8 +13,8 @@
 
 ## Why
 
-The EX44 default-local node ships with `eth0` and a `10.100.0.0/16`
-tenant bridge. A Hetzner compute node on a different NIC name
+The reference default-local node ships with `eth0` and a `10.100.0.0/16`
+tenant bridge. A compute node on a different NIC name
 (typically `ens5` or `enp0s3`) cannot use the existing
 `deploy/ansible/roles/nftables/files/policy_nftables.conf` artifact
 — the file hard-codes `iifname "br-tenants" oifname "eth0" accept`

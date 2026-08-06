@@ -21,14 +21,14 @@
 Today the M8 restore drill (`deploy/scripts/faas-m8-restore-drill.sh`)
 proves a local-disk round-trip works. It does NOT protect against a
 host loss: a wiped `/var/lib/pgsql/data/` + `/var/lib/pgsql/archive/`
-+ `/var/lib/pgsql/basebackup/` (the spec's "S3 of one box" scenario)
++ `/var/lib/pgsql/basebackup/` (the spec's "S3 of one node" scenario)
 is unrecoverable. Spec §14 M8 row is explicit on the off-host half:
 > backup drill (PG + one app back serving on a clean VM < 30 min,
 > documented as executed)
 
 Tier 1 Phases 1-5 (PRs #445, #457, #468, #469) closed the
 data-plane + wire mTLS gap. The remaining hole for production-tier
-multi-box is the database: a wire-bound cluster that can't recover
+multi-node is the database: a wire-bound cluster that can't recover
 its control-plane state on a CP-host loss is not production-grade.
 
 The user's three approved choices close the gap:
@@ -53,7 +53,7 @@ The user's three approved choices close the gap:
 - **Multi-region replication** — `gate-a.md` runbook is the
   authoritative spec for active-passive. Postgres on a single
   Storage Box is the first step; multi-region is M9.
-- **Hetzner-managed Postgres** — spec says "Postgres on the box";
+- **Hetzner-managed Postgres** — spec says "Postgres on the node";
   managed Postgres is a different architecture.
 - **Per-customer WAL envelope encryption** — the entire archive
   is sealed at rest by the Storage Box's SFTP/SSH channel + the
