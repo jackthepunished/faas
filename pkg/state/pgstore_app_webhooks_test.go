@@ -149,9 +149,9 @@ func TestPgStore_CreateAppWebhookIfUnderQuota_PerAppCap(t *testing.T) {
 }
 
 // TestPgStore_CreateAppWebhookIfUnderQuota_PerAccountCap fills one
-// account to its per-account webhook limit and asserts the next
-// insert returns *state.AppWebhookQuotaError with Scope=Account.
-// Pins the per-account FOR UPDATE predicate.
+// account to its per-account webhook limit across two apps, then
+// asserts the next insert returns *state.AppWebhookQuotaError
+// with Scope=Account. Pins the per-account FOR UPDATE predicate.
 func TestPgStore_CreateAppWebhookIfUnderQuota_PerAccountCap(t *testing.T) {
 	s, ctx := pgStore(t)
 	limits := api.MustLimitsFor(api.PlanPro)
@@ -172,13 +172,19 @@ func TestPgStore_CreateAppWebhookIfUnderQuota_PerAccountCap(t *testing.T) {
 		t.Fatalf("CreateApp B: %v", err)
 	}
 
-	for i := 0; i < limits.WebhookPerAccount; i++ {
-		w := pgSampleWebhook(acct, appA.ID)
-		if _, err := s.CreateAppWebhookIfUnderQuota(ctx, w, limits); err != nil {
+	// Stop one short of the per-account cap. With Pro=30, seed 29:
+	// the next insert fills the per-account cap (whatever app it
+	// lands on) and the one after must hit the per-account gate.
+	fillCount := limits.WebhookPerAccount - 1
+	apps := []string{appA.ID, appB.ID}
+	for i := 0; i < fillCount; i++ {
+		appID := apps[i%len(apps)]
+		if _, err := s.CreateAppWebhookIfUnderQuota(ctx, pgSampleWebhook(acct, appID), limits); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
-	_, err = s.CreateAppWebhookIfUnderQuota(ctx, pgSampleWebhook(acct, appB.ID), limits)
+	// Per-account cap should now reject the next insert.
+	_, err = s.CreateAppWebhookIfUnderQuota(ctx, pgSampleWebhook(acct, appA.ID), limits)
 	var qerr *state.AppWebhookQuotaError
 	if !errors.As(err, &qerr) || qerr.Scope != state.AppWebhookQuotaScopeAccount {
 		t.Errorf("expected AppWebhookQuotaError(Scope=Account); got %v", err)
