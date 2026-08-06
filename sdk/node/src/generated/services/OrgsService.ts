@@ -6,6 +6,7 @@ import type { APIKeyResponse } from '../models/APIKeyResponse.js';
 import type { ChangeMemberRoleRequest } from '../models/ChangeMemberRoleRequest.js';
 import type { CreateOrgAPIKeyRequest } from '../models/CreateOrgAPIKeyRequest.js';
 import type { CreateOrgRequest } from '../models/CreateOrgRequest.js';
+import type { InvitationListResponse } from '../models/InvitationListResponse.js';
 import type { InvitationWithTokenResponse } from '../models/InvitationWithTokenResponse.js';
 import type { InviteMemberRequest } from '../models/InviteMemberRequest.js';
 import type { ListOrgAPIKeysResponse } from '../models/ListOrgAPIKeysResponse.js';
@@ -929,6 +930,74 @@ export class OrgsService {
         401: `code: unauthorized`,
         403: `\`403 Forbidden\` — caller lacks \`org.view\`. Stable code
         \`org_role_forbidden\`.
+        `,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List org invitations (every state).
+   * Cursor-paginated list of every invitation minted on the
+   * org — pending, consumed, revoked, expired — in
+   * `created_at DESC` order (id tiebreak). Cursor is the
+   * last row's `id`; `?before=<id>` partitions the next
+   * page. Default limit 25, max 100 (per the strict-mode
+   * pagination contract at issue #393). Every role may
+   * read (gated by `org.view`, the same access model as
+   * GET /v1/orgs/{slug}/members). PR-8 ships the surface
+   * so the dashboard can render a "Pending invitations"
+   * table next to the "Members" table. Each render emits
+   * one `org.invitation.viewed` audit row (success-only,
+   * per ADR-035).
+   *
+   * @returns InvitationListResponse The page of invitations.
+   * @throws ApiError
+   */
+  public static listOrgInvitations({
+    slug,
+    before,
+    limit = 25,
+  }: {
+    /**
+     * Org slug. Lowercase letters, digits, hyphens; must start
+     * and end with alnum. 3..32 chars. Mirrors `OrgSlugPattern`
+     * in `pkg/api/errors.go` exactly so the spec drift gate
+     * (`make spec-check`) stays green.
+     *
+     */
+    slug: string,
+    /**
+     * Cursor — the `id` of the last row from the prior page.
+     * Omit on the first page.
+     *
+     */
+    before?: string,
+    /**
+     * Max invitations to return per page. Silently capped at 100.
+     */
+    limit?: number,
+  }): CancelablePromise<InvitationListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/orgs/{slug}/invitations',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'before': before,
+        'limit': limit,
+      },
+      errors: {
+        400: `\`400 Bad Request\` — \`?limit=\` is malformed, < 1, or
+        > 100. Stable code \`validation_failed\`.
+        `,
+        401: `code: unauthorized`,
+        403: `\`403 Forbidden\` — caller is not a member of the
+        active org. Stable code \`org_role_forbidden\`.
         `,
         404: `code: not_found`,
         429: `429. Two response shapes:

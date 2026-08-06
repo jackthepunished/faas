@@ -41,6 +41,24 @@ Sensitive-op routes mounted in `cmd/apid/server.go:642,650-657,
 | `POST /dashboard/account/set-password` | `dashboardChain → sessionAuth → postSetPassword` | `dashboardChain → sessionAuth → requireStepUpHandler(5m) → postSetPassword` |
 | `POST /dashboard/account/delete` | `dashboardChain → sessionAuth → dashboardDelete` | `dashboardChain → sessionAuth → requireStepUpHandler(5m) → dashboardDelete` |
 
+### Routes added after PR-077
+
+These routes were deferred from PR-077 and re-evaluated in PR-8
+(issue #190 close-out). The threat model is identical: a leaked
+plaintext (token) in the invitee's hand should not be sufficient to
+mint a membership into the target org without a fresh TOTP on the
+invitee's own session.
+
+| Route | Pre-PR-8 chain | PR-8 chain |
+|---|---|---|
+| `POST /v1/invitations/{token}/accept` | `authLimited → acceptInvitation` | `authLimited → requireMFA → requireStepUp(5m) → acceptInvitation` |
+
+PR-8 also introduces `api.CodeStepUpRequired = "step_up_required"`
+(distinct from `api.CodeMFARequired = "mfa_required"`) so the
+dashboard can render "re-enter your authenticator code" copy
+distinctly from "enable MFA to continue". The audit kinds remain
+separate (`auth.mfa_gate_hit` vs `auth.step_up_required`).
+
 The `POST /v1/orgs/{slug}/keys` and `…/keys/{id}/rotate` route
 re-wirings also close the **missing `requireMFA`** regression
 the Phase 1 audit flagged as the highest-blast-radius gap (a

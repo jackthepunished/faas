@@ -321,7 +321,15 @@ var methodRouteMap = map[string]string{
 	"GET /v1/invitations/{token}":                "PeekInvitation",
 	"POST /v1/invitations/{token}/accept":        "AcceptInvitation",
 	"DELETE /v1/orgs/{slug}/invitations/{token}": "RevokeInvitation",
-	"GET /v1/orgs/{slug}/seat_usage":             "GetOrgSeatUsage",
+	// PR-8 §2 — cursor-paginated list of every invitation minted on
+	// the org (pending/consumed/revoked/expired). Auto-derivation
+	// yields "GetOrgsSlugInvitations" which reads as a singleton
+	// fetch; the explicit map entry pins the List<Collection> verb
+	// the §2 surface uses. (ListOrgInvitationsAll is the cursor
+	// walker — it has no spec route, so sdk-coverage logs it as
+	// "warn" and the gate stays green.)
+	"GET /v1/orgs/{slug}/invitations": "ListOrgInvitations",
+	"GET /v1/orgs/{slug}/seat_usage":  "GetOrgSeatUsage",
 
 	// PR 6 (issue #190 / IAM-6 / ADR-061) — org-scoped API key
 	// surface. The auto-derivation would produce

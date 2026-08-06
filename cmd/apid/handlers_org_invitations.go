@@ -166,10 +166,13 @@ func (s *server) transferOrgOwnership(w http.ResponseWriter, r *http.Request, ac
 // enforceMemberCap.
 //
 // Mounted at POST /v1/invitations/{token}/accept. Auth chain is
-// s.authLimited (the bearer / session must be present) but no
-// s.loadOrg — the invitee has no X-Active-Org yet (the invitation
-// IS how they get one). PR 8 (SSO + GDPR bundle) reconsiders
-// step-up on accept.
+// s.authLimited → s.requireMFA → s.requireStepUp(5m) (the
+// 5-minute TTL + audit kind come from pkg/auth.Middleware
+// .RequireStepUp at middleware.go:802-873; PR-8 wires the chain,
+// ADR-077 documents the rationale). No s.loadOrg — the invitee
+// has no X-Active-Org yet (the invitation IS how they get one).
+// Bearer-key principals skip the step-up gate (an API key is
+// step-up-equivalent proof).
 func (s *server) acceptInvitation(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	token := r.PathValue("token")
 	if token == "" {
@@ -293,4 +296,74 @@ func (s *server) revokeInvitation(w http.ResponseWriter, r *http.Request, acct s
 		"token_hash_prefix": base64.RawURLEncoding.EncodeToString(hash[:])[:8],
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// listOrgInvitations renders the org-scoped invitation list at
+// GET /v1/orgs/{slug}/invitations. Cursor-paginated via
+// ?before=<id>&limit=<n> (default 25, max 100 — matches the
+// pattern at handlers_account_scoped.go:54-82). Every role can
+// view (authz.OrgActionView); the same authz gate as
+// listOrgMembers so the dashboard's "Members" + "Pending
+// invitations" tables share the access model.
+//
+// Mounted at GET /v1/orgs/{slug}/invitations. PR-8 closes the
+// dashboard-render gap from PR-5 (the store method existed but
+// the handler never shipped). Emits one org.invitation.viewed
+// audit row per render — cheap (per-render, not per-row) and
+// documents "an admin looked at the pending invites" for the
+// compliance audit (ADR-035 §"Kind taxonomy" is success-only;
+// this row fires only when the page returns 200).
+func (s *server) listOrgInvitations(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if !s.requireOrgAction(w, r, authz.OrgActionView) {
+		return
+	}
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
+		return
+	}
+	prob, limit := api.ParseLimit(r.URL.Query().Get("limit"), 25, 100, "invitations")
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+	before := r.URL.Query().Get("before")
+	rows, err := s.store.ListOrgInvitationsForOrgPage(r.Context(), mem.OrgID, limit, before)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"ListOrgInvitationsForOrgPage failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	// Resolve the org slug for the translator. The store joins
+	// org_invitations.org_id → orgs.id, but mem.OrgMembership
+	// doesn't carry the slug (PR-5 left it off; the LoadOrg
+	// middleware resolves it from the X-Active-Org header). One
+	// extra round-trip per render is fine for the dashboard's
+	// "Pending invitations" panel (small N).
+	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"OrgByID failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	now := time.Now()
+	out := api.InvitationListResponse{
+		Invitations: make([]api.OrgInvitationResponse, 0, len(rows)),
+	}
+	for _, inv := range rows {
+		out.Invitations = append(out.Invitations,
+			api.OrgInvitationResponseFromRow(invitationToRow(inv, org.Slug, now)))
+	}
+	if len(rows) == limit && len(rows) > 0 {
+		out.NextBefore = rows[len(rows)-1].ID
+	}
+	s.audit.Emit(r.Context(), "org.invitation.viewed", &acct.ID, map[string]any{
+		"org_id":        mem.OrgID,
+		"row_count":     len(out.Invitations),
+		"had_next_page": out.NextBefore != "",
+	})
+	writeJSON(w, http.StatusOK, out)
 }

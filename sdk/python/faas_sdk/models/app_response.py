@@ -14,6 +14,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.app_manifest import AppManifest
+    from ..models.public_auth_status import PublicAuthStatus
     from ..models.scaling_policy import ScalingPolicy
 
 
@@ -87,6 +88,11 @@ class AppResponse:
     """Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer
     <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby
     PATCH-true is rejected with 403 plan_require_authn_not_allowed."""
+    public_auth: PublicAuthStatus | Unset = UNSET
+    """Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents
+    without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision
+    're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when
+    mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -170,6 +176,10 @@ class AppResponse:
 
         require_authn = self.require_authn
 
+        public_auth: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.public_auth, Unset):
+            public_auth = self.public_auth.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -214,12 +224,15 @@ class AppResponse:
             field_dict["eviction_priority"] = eviction_priority
         if require_authn is not UNSET:
             field_dict["require_authn"] = require_authn
+        if public_auth is not UNSET:
+            field_dict["public_auth"] = public_auth
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.app_manifest import AppManifest
+        from ..models.public_auth_status import PublicAuthStatus
         from ..models.scaling_policy import ScalingPolicy
 
         d = dict(src_dict)
@@ -335,6 +348,13 @@ class AppResponse:
 
         require_authn = d.pop("require_authn", UNSET)
 
+        _public_auth = d.pop("public_auth", UNSET)
+        public_auth: PublicAuthStatus | Unset
+        if isinstance(_public_auth, Unset):
+            public_auth = UNSET
+        else:
+            public_auth = PublicAuthStatus.from_dict(_public_auth)
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -361,6 +381,7 @@ class AppResponse:
             warm_snapshot_min_ms=warm_snapshot_min_ms,
             eviction_priority=eviction_priority,
             require_authn=require_authn,
+            public_auth=public_auth,
         )
 
         app_response.additional_properties = d

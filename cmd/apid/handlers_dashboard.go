@@ -14,7 +14,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -105,6 +107,29 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			// documentation copy mirrored from pkg/imaged and
 			// guest-init; see dashboard.go for the rationale.
 			s.renderStateless(w, r, log, acct)
+		case path == "/dashboard/orgs" || path == "/dashboard/orgs/":
+			// PR-8 §3: org landing — every org the signed-in
+			// account is a member of. Read-only; the
+			// create-org/promote-personal forms land with PR-9's
+			// per-seat cut-over. Both "/dashboard/orgs" and
+			// "/dashboard/orgs/" serve the same page (same
+			// posture as /dashboard/ handling; PR-8 review
+			// found trailing-slash 404 otherwise).
+			s.renderOrgsList(w, r, log, acct)
+		case len(path) > len("/dashboard/orgs/") &&
+			path[:len("/dashboard/orgs/")] == "/dashboard/orgs/":
+			slug := path[len("/dashboard/orgs/"):]
+			// Same per-page router pattern as /dashboard/apps/{slug}:
+			// one level of sub-routing lives in the slug suffix so a
+			// follow-up PR can add /dashboard/orgs/{slug}/billing or
+			// /dashboard/orgs/{slug}/audit. Note for follow-up
+			// owners: when those subpages land, mirror the
+			// parseDeployDetailPath helper in the apps dispatcher
+			// (cmd/apid/handlers_dashboard.go:1213) — add
+			// parseOrgDetailSubpath(slug) for "/audit", "/billing",
+			// etc., BEFORE passing the slug to OrgBySlug. PR-9
+			// / PR-10 / PR-13 expect this seam.
+			s.renderOrgDetail(w, r, log, acct, slug)
 		case path == dashboardAccountPath:
 			s.renderAccount(w, r, log, acct)
 		default:
@@ -1182,6 +1207,230 @@ func (s *server) renderStateless(w http.ResponseWriter, r *http.Request, log *sl
 			StatelessDenylist:     dashboard.StatelessDenylist,
 			ClosedPaths:           dashboard.StatelessClosedPaths,
 		},
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// dashboardOrgItem is the shared projection used by
+// renderOrgsList + renderOrgDetail. Both build the same per-org
+// row from a state.Org + the caller's role on it; one helper
+// keeps the projection in lockstep with the templates. SeatUsed
+// is sourced from CountActiveOrgMembers; SeatLimit is sourced
+// from the org plan (Plan.OrgMembersMax) and is 0 for personal
+// orgs (the dashboard renders that as "personal org").
+//
+// Best-effort: a non-fatal failure to read seat counts falls
+// back to a (0, 0) row so the listing still renders; the
+// dashboard log line carries the err.
+func dashboardOrgItem(ctx context.Context, log *slog.Logger, store state.Store, org state.Org, callerRole state.OrgRole) dashboard.OrgListItem {
+	item := dashboard.OrgListItem{
+		Slug:     org.Slug,
+		Name:     org.Name,
+		Plan:     string(org.Plan),
+		Role:     string(callerRole),
+		Personal: org.Personal,
+	}
+	if org.Personal {
+		return item // SeatUsed/SeatLimit stay zero on personal orgs
+	}
+	used, err := store.CountActiveOrgMembers(ctx, org.ID)
+	if err != nil {
+		log.Warn("dashboardOrgItem: CountActiveOrgMembers",
+			"org_id", org.ID, "slug", org.Slug, "err", err)
+	} else {
+		item.SeatUsed = used
+	}
+	item.SeatLimit = org.Plan.OrgMembersMax()
+	return item
+}
+
+// resolveCallerRole returns the signed-in caller's role on the
+// given org. Returns ErrNotFound when the caller's account has
+// no active membership — handlers translate that to a 404 after
+// the row check so the dashboard exposes the same IDOR posture
+// as the public GET /v1/orgs/{slug} surfaces. Removed-membership
+// rows are treated the same as "no membership" so a removed
+// caller cannot peer at the org via a stale row.
+func resolveCallerRole(ctx context.Context, store state.Store, orgID, accountID string) (state.OrgRole, error) {
+	mem, err := store.OrgMemberByAccount(ctx, orgID, accountID)
+	if err != nil {
+		return "", err
+	}
+	if mem.RemovedAt != nil {
+		return "", state.ErrNotFound
+	}
+	return mem.Role, nil
+}
+
+// dashboardMembershipProjection converts state.OrgMembership →
+// dashboard.OrgMemberItem, joining state.AccountByID to surface
+// the email (never the bare account ID). The Account-by-ID
+// lookup is best-effort: a deleted-account race surfaces as
+// "(deleted account)" + the original Role, preserving the
+// "who was in the org historically" view that the audit table
+// still requires.
+func dashboardMembershipProjection(ctx context.Context, store state.Store, mem state.OrgMembership) dashboard.OrgMemberItem {
+	item := dashboard.OrgMemberItem{
+		AccountID: mem.AccountID,
+		Role:      string(mem.Role),
+		JoinedAt:  mem.JoinedAt.UTC().Format("2006-01-02"),
+	}
+	if acct, err := store.AccountByID(ctx, mem.AccountID); err == nil {
+		item.Email = acct.Email
+	} else {
+		item.Email = "(deleted account)"
+	}
+	return item
+}
+
+// renderOrgsList renders /dashboard/orgs — every org the
+// signed-in account is an active member of. Source data is
+// Store.ListOrgsForAccount (PR-5 store method) joined with
+// Store.OrgMemberByAccount per row to surface the caller's
+// role on each org. Personal orgs surface with the muted
+// "(personal)" tag and zero seat count; the rest show
+// <used>/<limit> so the customer can spot cap pressure without
+// leaving the dashboard.
+func (s *server) renderOrgsList(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account) {
+	orgs, err := s.store.ListOrgsForAccount(r.Context(), acct.ID)
+	if err != nil {
+		log.Error("dashboard renderOrgsList: ListOrgsForAccount",
+			"account_id", acct.ID, "err", err)
+		renderProblem(w, log, err)
+		return
+	}
+	items := make([]dashboard.OrgListItem, 0, len(orgs))
+	for _, org := range orgs {
+		role, err := resolveCallerRole(r.Context(), s.store, org.ID, acct.ID)
+		if err != nil {
+			// Skip rows where the caller's membership is
+			// removed (race vs RemoveOrgMember); a stale row
+			// shouldn't render in the dashboard listing.
+			continue
+		}
+		items = append(items, dashboardOrgItem(r.Context(), log, s.store, org, role))
+	}
+	// Sort: personal first (so the "your personal org" affordance
+	// is at the top), then alphabetical by slug. Stable so
+	// personal orgs without a slug sort consistently with the
+	// deterministic PersonalOrgSlug derivation.
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Personal != items[j].Personal {
+			return items[i].Personal // personal first
+		}
+		return items[i].Slug < items[j].Slug
+	})
+	page := dashboard.Page{
+		Title:   "Organizations",
+		Body:    "orgs",
+		Account: dashboardAccountView(acct, 0),
+		Data:    dashboard.OrgListData{Orgs: items},
+	}
+	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// renderOrgDetail renders /dashboard/orgs/{slug} — the org's
+// seat count + members + invitations. The slug is resolved via
+// Store.OrgBySlug (case-insensitive per the orgs_slug_lower_uniq
+// CHECK). A non-member renders the standard 404, mirroring the
+// IDOR posture of every other /v1/orgs/{slug} surface. The
+// page is read-only in PR-8: invite/revoke forms land with the
+// reverse-call infrastructure in a follow-up PR (per the
+// "Revoke affordance" deferred comment in dashboard.go).
+func (s *server) renderOrgDetail(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug string) {
+	org, err := s.store.OrgBySlug(r.Context(), slug)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		log.Error("dashboard renderOrgDetail: OrgBySlug",
+			"slug", slug, "err", err)
+		renderProblem(w, log, err)
+		return
+	}
+	callerRole, err := resolveCallerRole(r.Context(), s.store, org.ID, acct.ID)
+	if err != nil {
+		// ErrNotFound from resolveCallerRole means the caller is
+		// not an active member — surface 404, not 403, so the
+		// dashboard preserves the org-scoped IDOR posture (don't
+		// reveal that a slug exists unless the caller belongs to it).
+		if errors.Is(err, state.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		log.Error("dashboard renderOrgDetail: resolveCallerRole",
+			"org_id", org.ID, "account_id", acct.ID, "err", err)
+		renderProblem(w, log, err)
+		return
+	}
+	data := dashboard.OrgDetailData{
+		Org:         dashboardOrgItem(r.Context(), log, s.store, org, callerRole),
+		CallersRole: string(callerRole),
+	}
+
+	// Members (best-effort — log + continue on failure).
+	members, err := s.store.ListOrgMembers(r.Context(), org.ID)
+	if err != nil {
+		log.Warn("dashboard renderOrgDetail: ListOrgMembers",
+			"org_id", org.ID, "err", err)
+		data.Error = "members: " + err.Error()
+	} else {
+		items := make([]dashboard.OrgMemberItem, 0, len(members))
+		for _, m := range members {
+			if m.RemovedAt != nil {
+				continue
+			}
+			items = append(items, dashboardMembershipProjection(r.Context(), s.store, m))
+		}
+		data.Members = items
+	}
+
+	// Invitations: cap at the first page (25 rows) — the full
+	// page-walk is a follow-up after the dashboard reverse-call
+	// exists. PR-8 ships the table surface so the dashboard
+	// can render "you have N pending invites" via the
+	// Store.CountPendingOrgInvitations side-channel.
+	invitations, err := s.store.ListOrgInvitationsForOrgPage(r.Context(), org.ID, 25, "")
+	if err != nil {
+		log.Warn("dashboard renderOrgDetail: ListOrgInvitationsForOrgPage",
+			"org_id", org.ID, "err", err)
+		if data.Error == "" {
+			data.Error = "invitations: " + err.Error()
+		} else {
+			data.Error += "; invitations: " + err.Error()
+		}
+	} else {
+		now := time.Now()
+		items := make([]dashboard.OrgInvitationItem, 0, len(invitations))
+		for _, inv := range invitations {
+			status := api.DeriveOrgInvitationStatus(inv.ConsumedAt, inv.RevokedAt, inv.ExpiresAt, now)
+			prefix := ""
+			if len(inv.TokenHash) >= 4 {
+				prefix = base64.RawURLEncoding.EncodeToString(inv.TokenHash)[:8]
+			}
+			items = append(items, dashboard.OrgInvitationItem{
+				ID:          inv.ID,
+				Email:       inv.Email,
+				Role:        string(inv.Role),
+				Status:      status,
+				CreatedAt:   inv.CreatedAt.UTC().Format("2006-01-02 15:04 MST"),
+				ExpiresAt:   inv.ExpiresAt.UTC().Format("2006-01-02 15:04 MST"),
+				TokenPrefix: prefix,
+			})
+		}
+		data.Invitations = items
+	}
+
+	page := dashboard.Page{
+		Title:   org.Name,
+		Body:    "org_detail",
+		Account: dashboardAccountView(acct, 0),
+		Data:    data,
 	}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)

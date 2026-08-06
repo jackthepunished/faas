@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} — onebox faas</title>
+  <style nonce="{{.Nonce}}">
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
+    code { font-family: ui-monospace, Menlo, monospace; }
+    .muted { color: #888; }
+    form.inline { display: inline; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/orgs">Organizations</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    <h1>Organizations</h1>
+    <p>Orgs you belong to. Click through to manage members, view pending invitations, or change seat limits.</p>
+    {{if .Data}}
+      {{$d := .Data}}
+      {{if $d.Orgs}}
+        <table>
+          <thead>
+            <tr>
+              <th>Slug</th>
+              <th>Name</th>
+              <th>Plan</th>
+              <th>Your role</th>
+              <th>Seats</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {{range $d.Orgs}}
+              <tr>
+                <td><code>{{.Slug}}</code>{{if .Personal}} <span class="muted">(personal)</span>{{end}}</td>
+                <td>{{.Name}}</td>
+                <td>{{.Plan}}</td>
+                <td>{{.Role}}</td>
+                <td>
+                  {{- if .Personal -}}
+                    personal
+                  {{- else if eq .SeatLimit 0 -}}
+                    &mdash;
+                  {{- else -}}
+                    {{.SeatUsed}} / {{.SeatLimit}}
+                  {{- end -}}
+                </td>
+                <td><a href="/dashboard/orgs/{{.Slug}}">Manage</a></td>
+              </tr>
+            {{end}}
+          </tbody>
+        </table>
+      {{else}}
+        <p class="muted">You don't belong to any organization yet. Sign in via an invitation link or contact support.</p>
+      {{end}}
+    {{end}}
+    <p class="muted">Read-only in PR-8; create / promote-personal forms land in PR-9 alongside per-seat billing.</p>
+  </main>
+  <footer><a href="/dashboard/">Overview</a> · <a href="/dashboard/account">Account</a></footer>
+</body>
+</html>

@@ -766,3 +766,100 @@ type StatelessData struct {
 	StatelessDenylist     []StatelessDenylistEntry
 	ClosedPaths           []StatelessClosedPath
 }
+
+// OrgListItem is one row on /dashboard/orgs — every org the
+// signed-in account is a member of (mirrors GET /v1/orgs/me via
+// state.Store.ListOrgsForAccount). Role is the caller's role on
+// the org; SeatCount is the live member count surfaced via
+// CountActiveOrgMembers so the customer can size the "upgrade"
+// nudge without leaving the page. Personal orgs surface with a
+// muted "(personal)" tag and skip the seat count (ADR-061 §C —
+// personal orgs have a deterministic 1-of-1 membership set).
+//
+// PR-8 scope: read-only. The "New organization" form (which
+// would issue a personal→shared promote + slug rename) lands in
+// PR-9 alongside the per-seat billing cut-over (plan §"Out of
+// scope"); PR-8 ships the table so the customer can navigate to
+// an existing org first.
+type OrgListItem struct {
+	Slug      string
+	Name      string
+	Plan      string
+	Role      string
+	Personal  bool
+	SeatUsed  int
+	SeatLimit int // 0 when the org plan returns "personal org only"
+}
+
+// OrgListData is the /dashboard/orgs payload. Orgs already
+// filtered to "active + caller has a non-removed membership" by
+// the handler; the template is a pure renderer.
+type OrgListData struct {
+	Orgs []OrgListItem
+}
+
+// OrgMemberItem is one row on the org detail page's "Members"
+// table. Joined with state.Account so the dashboard renders
+// account.Email (never the bare account ID, which would be
+// unreadable). The join is best-effort: when AccountByID returns
+// ErrNotFound (race vs DeleteAccount cascade), the row renders
+// Email="(deleted account)" + Role preserved — the audit table
+// still ties to AccountID via the underlying state row, so the
+// compliance pivot stays intact even when the membership row
+// outlives the account row.
+type OrgMemberItem struct {
+	AccountID string
+	Email     string
+	Role      string
+	JoinedAt  string
+}
+
+// OrgInvitationItem is one row on the org detail page's
+// "Pending invitations" table (ADR-035 §"Kind taxonomy" — also
+// covers consumed/revoked/expired rows; the Status column
+// disambiguates). TokenPrefix is the 8-char hash prefix (same
+// "copy token_id for support ticket" affordance already on
+// revoke audit rows; never the full hash, never the plaintext).
+// Status vocabulary matches api.OrgInvitationStatus so the
+// table mirrors the public /v1/orgs/{slug}/invitations surface
+// without a translate layer.
+//
+// PR-8 ships the read-only table; the "Revoke" column header is
+// rendered but the form is left blank — wiring the form needs
+// /dashboard CSRF + a dashboard→apid reverse-call that PR-8
+// doesn't introduce (the api-Org-061 §"Dashboard reverse-call"
+// seam is held for a follow-up PR). The customer's two
+// workarounds until then: (a) `faas orgs invitations revoke`
+// CLI, (b) re-issue a new invite after revoking the old one
+// via the public API.
+type OrgInvitationItem struct {
+	ID          string
+	Email       string
+	Role        string
+	Status      string
+	CreatedAt   string
+	ExpiresAt   string
+	TokenPrefix string
+}
+
+// OrgDetailData is the /dashboard/orgs/{slug} payload. The page
+// fetches members + invitations via the store directly (apid is
+// the dashboard's data layer — no reverse-call needed because
+// the dashboard and apid share the process per ADR-011 §"Surface
+// partition"). The seat chip lives on the embedded OrgListItem
+// (PR-8 review — duplicating SeatUsed/SeatLimit at the top level
+// created two sources of truth for the same value).
+//
+// Error is a non-empty string when one of the three lookups
+// failed non-fatally (the page still renders whatever rows came
+// back, with the error surfaced above the table as a banner).
+// The full nil-out path is for the truly catastrophic case where
+// the org row itself is missing — the handler short-circuits to
+// 404 then.
+type OrgDetailData struct {
+	Org         OrgListItem
+	Members     []OrgMemberItem
+	Invitations []OrgInvitationItem
+	CallersRole string
+	Error       string
+}

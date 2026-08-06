@@ -8,5 +8,14 @@ import type { OrgInvitationResponse } from './OrgInvitationResponse.js';
  */
 export type InvitationListResponse = {
   invitations: Array<OrgInvitationResponse>;
+  /**
+   * Opaque cursor — set to the `id` of the last row on this
+   * page when there's a next page. Pass back as `?before=`
+   * to fetch it. Matches the same cursor shape as
+   * MemberListResponse / AppListResponse so the SDK can
+   * share one walker.
+   *
+   */
+  next_before?: string;
 };
 

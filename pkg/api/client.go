@@ -1661,6 +1661,59 @@ func (c *Client) RevokeInvitation(ctx context.Context, slug, token string) error
 	return c.do(ctx, "DELETE", "/v1/orgs/"+slug+"/invitations/"+token, nil, nil)
 }
 
+// ListOrgInvitationsAll walks the next_before cursor on
+// GET /v1/orgs/{slug}/invitations until the server returns an
+// empty cursor, returning every invitation in created_at DESC
+// order. Useful for the dashboard "Pending invitations" panel
+// that wants the full list without forcing the customer to wire
+// a loop.
+//
+// The server caps each page at 100 rows (handled by
+// ListOrgInvitations); this method requests max page size when
+// walking. Cancelling ctx stops the walk at the next page
+// boundary — the current page's rows are returned up to the
+// cancellation point.
+func (c *Client) ListOrgInvitationsAll(ctx context.Context, slug string) ([]OrgInvitationResponse, error) {
+	var out []OrgInvitationResponse
+	cursor := ""
+	for {
+		page, err := c.ListOrgInvitations(ctx, slug, cursor, 100)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, page.Invitations...)
+		if page.NextBefore == "" {
+			return out, nil
+		}
+		cursor = page.NextBefore
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+	}
+}
+
+// ListOrgInvitations returns a single page of invitations for the
+// given org slug, cursor-paginated via ?before=<id>&limit=<n>
+// (default 25, max 100). Every role on the org can read (the
+// authz gate is OrgActionView, same as GET /v1/orgs/{slug}/members).
+// Emits one `org.invitation.viewed` audit row per render.
+func (c *Client) ListOrgInvitations(ctx context.Context, slug, before string, limit int) (InvitationListResponse, error) {
+	var out InvitationListResponse
+	path := "/v1/orgs/" + slug + "/invitations"
+	if before != "" || limit > 0 {
+		path += "?"
+		sep := ""
+		if before != "" {
+			path += "before=" + before
+			sep = "&"
+		}
+		if limit > 0 {
+			path += sep + "limit=" + strconv.Itoa(limit)
+		}
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // GetOrgSeatUsage returns {used, limit, plan} for the active org.
 // `limit` is the plan cap (OrgMembersMax). Free / unknown plans
 // return 0 (the fail-closed accessor). Visibility-only — PR 9 ships

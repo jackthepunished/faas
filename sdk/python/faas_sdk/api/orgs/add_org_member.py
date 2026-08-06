@@ -99,9 +99,10 @@ def sync_detailed(
      Mints a 32-byte plaintext token, hashes it via SHA-256 for
     storage, and returns the plaintext ONCE in the response.
     The token expires after 14 days; admins can revoke earlier
-    via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-    the accept surface). Role cannot be `owner`; transfer-
-    ownership is the only path to owner.
+    via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+    the accept surface too — see
+    `POST /v1/invitations/{token}/accept`). Role cannot be
+    `owner`; transfer-ownership is the only path to owner.
 
     Args:
         slug (str):
@@ -144,9 +145,10 @@ def sync(
      Mints a 32-byte plaintext token, hashes it via SHA-256 for
     storage, and returns the plaintext ONCE in the response.
     The token expires after 14 days; admins can revoke earlier
-    via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-    the accept surface). Role cannot be `owner`; transfer-
-    ownership is the only path to owner.
+    via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+    the accept surface too — see
+    `POST /v1/invitations/{token}/accept`). Role cannot be
+    `owner`; transfer-ownership is the only path to owner.
 
     Args:
         slug (str):
@@ -184,9 +186,10 @@ async def asyncio_detailed(
      Mints a 32-byte plaintext token, hashes it via SHA-256 for
     storage, and returns the plaintext ONCE in the response.
     The token expires after 14 days; admins can revoke earlier
-    via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-    the accept surface). Role cannot be `owner`; transfer-
-    ownership is the only path to owner.
+    via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+    the accept surface too — see
+    `POST /v1/invitations/{token}/accept`). Role cannot be
+    `owner`; transfer-ownership is the only path to owner.
 
     Args:
         slug (str):
@@ -227,9 +230,10 @@ async def asyncio(
      Mints a 32-byte plaintext token, hashes it via SHA-256 for
     storage, and returns the plaintext ONCE in the response.
     The token expires after 14 days; admins can revoke earlier
-    via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-    the accept surface). Role cannot be `owner`; transfer-
-    ownership is the only path to owner.
+    via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+    the accept surface too — see
+    `POST /v1/invitations/{token}/accept`). Role cannot be
+    `owner`; transfer-ownership is the only path to owner.
 
     Args:
         slug (str):

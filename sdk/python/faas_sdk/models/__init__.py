@@ -194,6 +194,10 @@ from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllB
 from .problem import Problem
 from .project_apply_request import ProjectApplyRequest
 from .project_scan_request import ProjectScanRequest
+from .public_auth_block import PublicAuthBlock
+from .public_auth_block_mode import PublicAuthBlockMode
+from .public_auth_status import PublicAuthStatus
+from .public_auth_status_mode import PublicAuthStatusMode
 from .put_app_env_request import PutAppEnvRequest
 from .put_app_registry_credential_request import PutAppRegistryCredentialRequest
 from .put_app_secret_request import PutAppSecretRequest
@@ -226,6 +230,8 @@ from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
 from .scan_result import ScanResult
 from .scan_result_status import ScanResultStatus
+from .seat_usage_response import SeatUsageResponse
+from .seat_usage_response_plan import SeatUsageResponsePlan
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -464,6 +470,10 @@ __all__ = (
     "Problem",
     "ProjectApplyRequest",
     "ProjectScanRequest",
+    "PublicAuthBlock",
+    "PublicAuthBlockMode",
+    "PublicAuthStatus",
+    "PublicAuthStatusMode",
     "PutAppEnvRequest",
     "PutAppRegistryCredentialRequest",
     "PutAppSecretRequest",
@@ -494,6 +504,8 @@ __all__ = (
     "ScalingTargetMetric",
     "ScanResult",
     "ScanResultStatus",
+    "SeatUsageResponse",
+    "SeatUsageResponsePlan",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",

@@ -2646,6 +2646,22 @@ type Store interface {
 	// caller.
 	ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([]OrgInvitation, error)
 
+	// ListOrgInvitationsForOrgPage is the cursor-paginated variant
+	// of ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is
+	// the invitation's id (UUID); the SQL filter `id < $before`
+	// partitions rows by id and the handler emits
+	// `out[len-1].ID` as the next cursor, so the walk visits every
+	// row exactly once regardless of insertion order.
+	//
+	// limit is clamped to [1, 100] inside the implementation;
+	// out-of-range values resolve to 25 (the documented default).
+	// The order is (created_at DESC, id DESC) — id is the
+	// tiebreaker so the cursor walk is well-defined when two rows
+	// share a created_at timestamp (concurrent mint from the same
+	// admin). Returned slice may be shorter than limit on the
+	// final page; an empty slice means "no more rows".
+	ListOrgInvitationsForOrgPage(ctx context.Context, orgID string, limit int, before string) ([]OrgInvitation, error)
+
 	// CountPendingOrgInvitations returns the number of invitation
 	// rows with consumed_at IS NULL AND revoked_at IS NULL AND
 	// expires_at > now() for the given org. Filtered at the SQL

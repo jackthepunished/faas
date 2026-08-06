@@ -9129,6 +9129,76 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 	return out, nil
 }
 
+// ListOrgInvitationsForOrgPage is the cursor-paginated mirror of
+// ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
+// invitation's id (UUID); Memstore walks the sorted slice
+// directly: build the full sorted list, find the cursor row,
+// return the next `limit` rows. The position-based walk is
+// correct for Memstore's random-hex id generation (random hex
+// is uncorrelated with created_at, so a strict-less id
+// predicate would mismatch PgStore's `id::text < $3` ordering
+// and produce wrong page boundaries when two consecutive seeds
+// have distinct created_at).
+//
+// PR-9 swap (issue #190 follow-up): both backends should switch
+// to a compound (created_at, id) cursor so the SQL `id::text <
+// $3` predicate stays strictly correct under random UUID ids.
+// Today's wire cursor is the row id only — sufficient for the
+// Memstore walk, but PgStore's `id::text < $3` can skip a
+// later-seeded row whose id is lexically larger but the cursor
+// is at its predecessor. The two backends' guarantees diverge
+// here; the unit-level test (handlers_org_invitations_test.go
+// ::TestListOrgInvitations_CursorPagination) pins the Memstore
+// semantics. PR-9 changes the wire cursor shape; this doc-comment
+// is the v1 footnote.
+//
+// limit is clamped to [1, 100]; out-of-range resolves to 25.
+// before "" means first page (no filter). Unknown cursor (id not
+// in the org's rows) returns the same as the first page —
+// defensive default; the customer emitted the cursor from a
+// prior page so the call site knows the cursor is valid, and
+// a stale cursor after a revoke just re-fetches the top of the
+// org's queue.
+func (m *MemStore) ListOrgInvitationsForOrgPage(_ context.Context, orgID string, limit int, before string) ([]OrgInvitation, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	all := make([]OrgInvitation, 0)
+	for _, inv := range m.invitations {
+		if inv.OrgID == orgID {
+			all = append(all, inv)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].ID > all[j].ID
+		}
+		return all[i].CreatedAt.After(all[j].CreatedAt)
+	})
+	// Find the cursor position. Cursor row is the last row of the
+	// prior page; skip past it to land on the next page's first
+	// row.
+	skip := 0
+	if before != "" {
+		for i, row := range all {
+			if row.ID == before {
+				skip = i + 1
+				break
+			}
+		}
+	}
+	if skip > len(all) {
+		return []OrgInvitation{}, nil
+	}
+	out := all[skip:]
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // CountPendingOrgInvitations mirrors PgStore.CountPendingOrgInvitations
 // — counts invitation rows that are not consumed, not revoked, and
 // not past expires_at. Parity test

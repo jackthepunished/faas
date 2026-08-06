@@ -20,13 +20,20 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // seedInvitationForPrincipal creates a pending invitation for the
@@ -54,6 +61,31 @@ func seedInvitationForPrincipal(t *testing.T, store *state.MemStore, org *state.
 		t.Fatalf("CreateOrgInvitation: %v", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(plaintext), sum[:]
+}
+
+// seedInvitationNonce is the nonce-aware twin of
+// seedInvitationForPrincipal for tests that need multiple pending
+// invitations on the same org (the underlying UNIQUE on token_hash
+// rejects identical tokens; nonce XORs into byte 0 so each call
+// generates a distinct hash).
+func seedInvitationNonce(t *testing.T, store *state.MemStore, org *state.Org, ownerID, email string, role state.OrgRole, nonce byte) {
+	t.Helper()
+	plaintext := make([]byte, 32)
+	for i := range plaintext {
+		plaintext[i] = byte(i + 1)
+	}
+	plaintext[0] = nonce
+	sum := sha256.Sum256(plaintext)
+	if _, err := store.CreateOrgInvitation(context.Background(), state.OrgInvitation{
+		OrgID:              org.ID,
+		Email:              email,
+		Role:               role,
+		TokenHash:          sum[:],
+		ExpiresAt:          time.Now().Add(time.Hour),
+		InvitedByAccountID: &ownerID,
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
 }
 
 // seedSharedOrgWithOwner creates a shared org on the given plan and
@@ -493,10 +525,480 @@ func TestSeatUsage_FreePlanReturnsZero(t *testing.T) {
 	}
 }
 
+// TestAcceptInvitation_RequiresStepUp (PR 8) — pin the step-up
+// gate on POST /v1/invitations/{token}/accept. ADR-077 closed the
+// same threat model for the other 8 sensitive routes; PR-8 adds
+// accept-invitation to that list. The gate trips BEFORE the
+// store-side ConsumeOrgInvitation so a leaked plaintext token
+// cannot mint a membership without a fresh TOTP on the bearer's
+// session.
+//
+// Subtests:
+//  1. cookie + missing step-up stamp  → 403 + auth.step_up_required audit row
+//     (pre-PR-077 cookies fall into the "missing" bucket per the
+//     bypass tolerance at middleware.go:836-847; PR-8's gate is
+//     opt-in to the row, so the missing branch is the regression
+//     net for "the audit row fires when the stamp is missing".)
+//  2. cookie + expired step-up stamp  → 403 + reason="expired"
+//  3. cookie + fresh step-up stamp    → 200 (happy path)
+//
+// Bearer-key principals skip the gate (an API key is step-up-
+// equivalent proof). The existing PR-7 tests at line 109 / 151
+// already cover the bearer-bypass path; PR-8 doesn't re-pin it.
+func TestAcceptInvitation_RequiresStepUp(t *testing.T) {
+	ensureRecoveryTestSecret(t)
+
+	// --- Subtest 1: cookie with no step-up stamp → 403 -----------------
+	t.Run("missing_step_up_returns_403", func(t *testing.T) {
+		e, _, cookie := setupWithSessionForTest(t)
+		// setupWithSession issues via IssueWithSession which has
+		// no StepUpAt — the cookie decodes with StepUpAt zero,
+		// which RequireStepUp classifies as "missing" (the pre-
+		// PR-077 legacy branch). Per the bypass tolerance the
+		// gate DOES fire (with reason=missing) on legacy cookies
+		// once the route is wired to require step-up; the
+		// missing-bypass is documented for stamps NEVER seen,
+		// not for "stamp once then reissue without one". A fresh
+		// issuance via IssueWithSession has no stamp at all, so
+		// the audit row fires.
+		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-miss", "Acme PR8 Step-up Missing", api.PlanPro)
+		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("missing step-up: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+		}
+		var problem struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+			t.Fatalf("Unmarshal problem: %v", err)
+		}
+		// PR-8 fix: the gate now uses CodeStepUpRequired (distinct
+		// from CodeMFARequired) so the dashboard can render
+		// "re-enter your authenticator code" copy distinctly
+		// from "enable MFA to continue".
+		if problem.Code != api.CodeStepUpRequired {
+			t.Errorf("problem.code = %q, want %q", problem.Code, api.CodeStepUpRequired)
+		}
+		// Audit row lands with reason=missing.
+		rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		ev := findEventByKind(rows, "auth.step_up_required")
+		if ev == nil {
+			t.Fatalf("no auth.step_up_required row; rows=%s", eventDump(rows))
+		}
+		var data map[string]any
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("Data not JSON: %v", err)
+		}
+		if data["path"] != "/v1/invitations/"+wireToken+"/accept" {
+			t.Errorf("path = %v, want %s", data["path"], "/v1/invitations/"+wireToken+"/accept")
+		}
+		if data["method"] != http.MethodPost {
+			t.Errorf("method = %v, want POST", data["method"])
+		}
+		if data["reason"] != "missing" {
+			t.Errorf("reason = %v, want missing", data["reason"])
+		}
+		if data["ttl_sec"] != float64(300) {
+			t.Errorf("ttl_sec = %v, want 300 (5-minute TTL)", data["ttl_sec"])
+		}
+	})
+
+	// --- Subtest 2: cookie with EXPIRED step-up stamp → 403 -------------
+	t.Run("expired_step_up_returns_403", func(t *testing.T) {
+		e, mgr, cookie := setupWithSessionForTest(t)
+		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-exp", "Acme PR8 Step-up Expired", api.PlanPro)
+		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+		// Issue a fresh cookie with a stamp older than the TTL
+		// (10 minutes ago vs 5-minute TTL).
+		staleCookie := reissueCookieWithStepUp(t, cookie, mgr, time.Now().Add(-10*time.Minute))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+		req.AddCookie(staleCookie)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expired step-up: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+		}
+		rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		ev := findEventByKind(rows, "auth.step_up_required")
+		if ev == nil {
+			t.Fatalf("no auth.step_up_required row; rows=%s", eventDump(rows))
+		}
+		var data map[string]any
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("Data not JSON: %v", err)
+		}
+		if data["reason"] != "expired" {
+			t.Errorf("reason = %v, want expired", data["reason"])
+		}
+	})
+
+	// --- Subtest 3: cookie with FRESH step-up stamp → 200 ---------------
+	t.Run("fresh_step_up_passes", func(t *testing.T) {
+		e, mgr, cookie := setupWithSessionForTest(t)
+		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-fresh", "Acme PR8 Step-up Fresh", api.PlanPro)
+		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+		// Issue a fresh cookie with a stamp 30 seconds old (well
+		// within the 5-minute TTL).
+		freshCookie := reissueCookieWithStepUp(t, cookie, mgr, time.Now().Add(-30*time.Second))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+		req.AddCookie(freshCookie)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("fresh step-up: code=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		// No auth.step_up_required audit row fires on the happy path.
+		rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		if ev := findEventByKind(rows, "auth.step_up_required"); ev != nil {
+			t.Errorf("unexpected auth.step_up_required on fresh-stamp happy path: %s", eventDump(rows))
+		}
+		// The two accept-side audit rows DO fire on the happy path.
+		if findEventByKind(rows, "org.invitation.accepted") == nil {
+			t.Errorf("org.invitation.accepted missing on fresh-stamp happy path")
+		}
+		if findEventByKind(rows, "org.member.added") == nil {
+			t.Errorf("org.member.added missing on fresh-stamp happy path")
+		}
+	})
+}
+
+// reissueCookieWithStepUp unseals the source cookie via the
+// supplied session manager, swaps the StepUpAt stamp to the
+// requested time, and re-seals. Mirrors the
+// reissueSessionCookieWithStepUp call site at handlers_mfa.go:712
+// without going through /v1/account/mfa/verify.
+//
+// Tests use this to construct "expired stamp" / "fresh stamp"
+// cookies for the PR-8 step-up gate assertions. The source cookie's
+// sid + account + binding hash are preserved so the IAM-3 sid
+// cross-check at requireSessionCookie still passes.
+//
+// The manager is supplied explicitly (not derived from a global)
+// because NewEphemeralManager generates a fresh random key per
+// call — a separate manager can't Open a cookie minted by another
+// manager in the same test. setupWithSessionForTest (below) wires
+// the manager into the testEnv so the test + helper share keys.
+func reissueCookieWithStepUp(t *testing.T, source *http.Cookie, mgr *session.Manager, stepUpAt time.Time) *http.Cookie {
+	t.Helper()
+	env, err := mgr.Verify(source.Value)
+	if err != nil {
+		t.Fatalf("session.Verify: %v", err)
+	}
+	token, err := mgr.IssueWithSessionAndBindingHashAndStepUp(
+		env.Sid, env.AccountID, env.BindingHash, stepUpAt, env.MfaPending)
+	if err != nil {
+		t.Fatalf("IssueWithSessionAndBindingHashAndStepUp: %v", err)
+	}
+	return &http.Cookie{Name: source.Name, Value: token}
+}
+
+// setupWithSessionForTest is the manager-aware twin of
+// setupWithSession (handlers_scopes_test.go:56): it builds the
+// server with the same deps and returns the session.Manager so
+// reissueCookieWithStepUp can unseal + reseal cookies minted by
+// the same key. The base setupWithSession deliberately drops the
+// manager pointer to keep its signature minimal; PR-8 needs it.
+func setupWithSessionForTest(t *testing.T) (testEnv, *session.Manager, *http.Cookie) {
+	t.Helper()
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(context.Background(),
+		"session-cookie-pr8@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), sid, acct.ID,
+		"192.0.2.30", "session-pr8-test-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	token, err := mgr.IssueWithSession(sid, acct.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := wire.NewOpsMetrics("apid_session_pr8_test")
+	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
+	return testEnv{h: srv.handler(), store: store, key: "", acct: acct, ops: ops},
+		mgr, &http.Cookie{Name: sessionCookie, Value: token}
+}
+
 // eventDump renders the rows slice as JSON for inclusion in a
 // t.Fatal message. Mirrors the SA5011 escape hatch used in the
 // other audit-emit tests.
 func eventDump(rows []state.Event) string {
 	b, _ := json.Marshal(rows)
 	return string(b)
+}
+
+// TestListOrgInvitations_HappyPath (PR 8) —
+// GET /v1/orgs/{slug}/invitations returns the seeded invitations
+// in created_at desc order with the org slug + derived status
+// (pending/consumed/revoked/expired) on each row.
+//
+// Pins:
+//   - response carries every invitation (no filtering by state)
+//   - status is "pending" for unconsumed rows
+//   - org_invitation.viewed audit row fires per render
+//   - next_before is empty when the row count is < limit
+func TestListOrgInvitations_HappyPath(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-happy", "List PR8 Happy", api.PlanPro)
+	// 3 pending invitations (distinct nonces to satisfy the
+	// UNIQUE on token_hash).
+	for i, role := range []state.OrgRole{state.OrgRoleAdmin, state.OrgRoleDeveloper, state.OrgRoleBilling} {
+		seedInvitationNonce(t, e.store, &org, e.acct.ID,
+			fmt.Sprintf("list-pr8-%d@acme.test", i), role, byte(i+1))
+	}
+
+	rec := e.do(t, http.MethodGet, "/v1/orgs/list-pr8-happy/invitations", nil,
+		map[string]string{"X-Active-Org": "list-pr8-happy"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                      `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	if len(body.Invitations) != 3 {
+		t.Fatalf("Invitations len = %d, want 3", len(body.Invitations))
+	}
+	for i, row := range body.Invitations {
+		if row.OrgSlug != "list-pr8-happy" {
+			t.Errorf("Invitations[%d].OrgSlug = %q, want list-pr8-happy", i, row.OrgSlug)
+		}
+		if row.Status != "pending" {
+			t.Errorf("Invitations[%d].Status = %q, want pending", i, row.Status)
+		}
+		if row.Email == "" {
+			t.Errorf("Invitations[%d].Email empty", i)
+		}
+		if row.Role == "" {
+			t.Errorf("Invitations[%d].Role empty", i)
+		}
+	}
+	// 3 rows < default limit 25 → no next_before.
+	if body.NextBefore != "" {
+		t.Errorf("NextBefore = %q, want empty (row_count < limit)", body.NextBefore)
+	}
+	// Audit row fires.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	ev := findEventByKind(rows, "org.invitation.viewed")
+	if ev == nil {
+		t.Fatalf("no org.invitation.viewed row; rows=%s", eventDump(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("Data not JSON: %v", err)
+	}
+	if data["org_id"] != org.ID {
+		t.Errorf("data.org_id = %v, want %s", data["org_id"], org.ID)
+	}
+	if data["row_count"] != float64(3) {
+		t.Errorf("data.row_count = %v, want 3", data["row_count"])
+	}
+	if data["had_next_page"] != false {
+		t.Errorf("data.had_next_page = %v, want false", data["had_next_page"])
+	}
+}
+
+// TestListOrgInvitations_NonMemberIs404 (PR 8) — access control:
+// a caller who is not a member of the active org gets 404 (the
+// loadOrg middleware's IDOR-safe contract; mirrors every other
+// org-scoped route).
+func TestListOrgInvitations_NonMemberIs404(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-idem", "List PR8 IDem", api.PlanPro)
+	// Seed an invitation as the owner so the org has rows, but
+	// then create a fresh account that's NOT a member and try to
+	// list.
+	if _, err := e.store.CreateOrgInvitation(context.Background(), state.OrgInvitation{
+		OrgID: org.ID, Email: "list-pr8-idem@acme.test", Role: state.OrgRoleDeveloper,
+		TokenHash: []byte("x"), ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
+	outside, err := e.store.CreateAccount(context.Background(),
+		"list-pr8-outside@example.com", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	outsideKey, outsideHash, err := api.GenerateAPIKey()
+	if err != nil {
+		t.Fatalf("GenerateAPIKey: %v", err)
+	}
+	if _, err := e.store.CreateAPIKey(context.Background(), outside.ID, outsideHash,
+		"non-member", api.ScopesAdminOnly); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	outsideEnv := testEnv{h: e.h, s: e.s, store: e.store, key: outsideKey, acct: outside, ops: e.ops}
+	rec := outsideEnv.do(t, http.MethodGet, "/v1/orgs/list-pr8-idem/invitations", nil,
+		map[string]string{"X-Active-Org": "list-pr8-idem"})
+	// Non-member gets 403 (the authz layer surfaces "you don't
+	// belong here" distinctly from the 404 the loadOrg path
+	// would return for an unknown slug). The list endpoint
+	// deliberately differentiates "you're not a member" from
+	// "the org doesn't exist" via the 403/404 split — matching
+	// the same posture every other org-scoped route uses (e.g.
+	// GET /v1/orgs/{slug}/members).
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-member list: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if problem.Code != "org_role_forbidden" {
+		t.Errorf("problem.code = %q, want org_role_forbidden", problem.Code)
+	}
+}
+
+// TestListOrgInvitations_CursorPagination (PR 8) — drive the
+// cursor: limit=2 + 4 seeded invitations → 2 pages of 2 each.
+// Pin: the second-page request includes ?before=<id-from-page-1>
+// and returns the next 2 rows, with next_before empty on the
+// final page.
+func TestListOrgInvitations_CursorPagination(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-cursor", "List PR8 Cursor", api.PlanPro)
+	for i := 0; i < 4; i++ {
+		seedInvitationNonce(t, e.store, &org, e.acct.ID,
+			fmt.Sprintf("cursor-pr8-%d@acme.test", i), state.OrgRoleDeveloper, byte(i+10))
+		// 1ms sleep between seeds so the four created_at
+		// timestamps are distinct (the cursor walk is
+		// (created_at desc, id desc); without distinct
+		// timestamps the cursor walk degrades to a pure
+		// id-only order, which is fine but the assertion
+		// is more meaningful with distinct times).
+		time.Sleep(time.Millisecond)
+	}
+	// Page 1.
+	rec := e.do(t, http.MethodGet, "/v1/orgs/list-pr8-cursor/invitations?limit=2", nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page1: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p1 struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                      `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p1); err != nil {
+		t.Fatalf("Unmarshal p1: %v", err)
+	}
+	if len(p1.Invitations) != 2 {
+		t.Fatalf("page1 len = %d, want 2", len(p1.Invitations))
+	}
+	if p1.NextBefore == "" {
+		t.Fatalf("page1 next_before empty; should carry the cursor id")
+	}
+	// Page 2.
+	rec = e.do(t, http.MethodGet,
+		"/v1/orgs/list-pr8-cursor/invitations?limit=2&before="+p1.NextBefore, nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page2: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p2 struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                      `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p2); err != nil {
+		t.Fatalf("Unmarshal p2: %v", err)
+	}
+	if len(p2.Invitations) != 2 {
+		t.Fatalf("page2 len = %d, want 2", len(p2.Invitations))
+	}
+	// The handler's cursor-emit heuristic is the same one
+	// pkg/api's pagination uses (handlers_account_scoped.go:75):
+	// "if the page is full, emit a cursor; the client treats the
+	// next 0-row page as terminal". With 4 rows + limit=2, page
+	// 2 has 2 rows AND a non-empty NextBefore (the heuristic
+	// fires); the client walker must follow the cursor to a 3rd
+	// request that returns 0 rows + empty NextBefore.
+	rec = e.do(t, http.MethodGet,
+		"/v1/orgs/list-pr8-cursor/invitations?limit=2&before="+p2.NextBefore, nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("page3: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p3 struct {
+		Invitations []api.OrgInvitationResponse `json:"invitations"`
+		NextBefore  string                      `json:"next_before"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &p3); err != nil {
+		t.Fatalf("Unmarshal p3: %v", err)
+	}
+	if len(p3.Invitations) != 0 {
+		t.Errorf("page3 len = %d, want 0 (terminal page)", len(p3.Invitations))
+	}
+	if p3.NextBefore != "" {
+		t.Errorf("page3 next_before = %q, want empty (terminal)", p3.NextBefore)
+	}
+	// No row overlap between pages.
+	seen := map[string]bool{}
+	for _, r := range p1.Invitations {
+		seen[r.ID] = true
+	}
+	for _, r := range p2.Invitations {
+		if seen[r.ID] {
+			t.Errorf("row %s appears on both pages", r.ID)
+		}
+	}
+}
+
+// TestListOrgInvitations_BadLimit (PR 8) — limit out of range
+// returns 400 with CodeValidation (issue #393 strict-mode
+// pagination contract).
+func TestListOrgInvitations_BadLimit(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "list-pr8-bad", "List PR8 Bad", api.PlanPro)
+	_ = org
+
+	rec := e.do(t, http.MethodGet, "/v1/orgs/list-pr8-bad/invitations?limit=999", nil,
+		map[string]string{"X-Active-Org": "list-pr8-bad"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad limit: code=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if problem.Code != "validation_failed" {
+		t.Errorf("problem.code = %q, want validation_failed", problem.Code)
+	}
 }

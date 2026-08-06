@@ -4663,6 +4663,55 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/orgs/{slug}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - in: query
+        name: before
+        schema: { type: string }
+        description: |
+          Cursor — the `id` of the last row from the prior page.
+          Omit on the first page.
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        description: "Max invitations to return per page. Silently capped at 100."
+    get:
+      tags: [orgs]
+      operationId: listOrgInvitations
+      summary: List org invitations (every state).
+      description: |
+        Cursor-paginated list of every invitation minted on the
+        org — pending, consumed, revoked, expired — in
+        `created_at DESC` order (id tiebreak). Cursor is the
+        last row's `id`; `?before=<id>` partitions the next
+        page. Default limit 25, max 100 (per the strict-mode
+        pagination contract at issue #393). Every role may
+        read (gated by `org.view`, the same access model as
+        GET /v1/orgs/{slug}/members). PR-8 ships the surface
+        so the dashboard can render a "Pending invitations"
+        table next to the "Members" table. Each render emits
+        one `org.invitation.viewed` audit row (success-only,
+        per ADR-035).
+      responses:
+        '200':
+          description: The page of invitations.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/InvitationListResponse' } }
+        '400':
+          description: |
+            `400 Bad Request` — `?limit=` is malformed, < 1, or
+            > 100. Stable code `validation_failed`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller is not a member of the
+            active org. Stable code `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
   # `apid` embeds api/openapi.yaml at build time and serves the same bytes
   # customers see in the repo. The /json variant re-emits the spec in JSON
@@ -8146,6 +8195,14 @@ components:
         invitations:
           type: array
           items: { $ref: '#/components/schemas/OrgInvitationResponse' }
+        next_before:
+          description: |
+            Opaque cursor — set to the `id` of the last row on this
+            page when there's a next page. Pass back as `?before=`
+            to fetch it. Matches the same cursor shape as
+            MemberListResponse / AppListResponse so the SDK can
+            share one walker.
+          type: string
 
     TransferOwnershipRequest:
       description: |
