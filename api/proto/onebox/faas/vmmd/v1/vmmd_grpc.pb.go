@@ -35,6 +35,7 @@ const (
 	Vmmd_SeccompStatus_FullMethodName           = "/onebox.faas.vmmd.v1.Vmmd/SeccompStatus"
 	Vmmd_Logs_FullMethodName                    = "/onebox.faas.vmmd.v1.Vmmd/Logs"
 	Vmmd_ForwardHTTPStream_FullMethodName       = "/onebox.faas.vmmd.v1.Vmmd/ForwardHTTPStream"
+	Vmmd_ForwardRawStream_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/ForwardRawStream"
 	Vmmd_MountParentExt4ReadOnly_FullMethodName = "/onebox.faas.vmmd.v1.Vmmd/MountParentExt4ReadOnly"
 	Vmmd_UmountParentExt4_FullMethodName        = "/onebox.faas.vmmd.v1.Vmmd/UmountParentExt4"
 	Vmmd_MountOverlayParent_FullMethodName      = "/onebox.faas.vmmd.v1.Vmmd/MountOverlayParent"
@@ -184,6 +185,34 @@ type VmmdClient interface {
 	// PR-D state. The repetition kept the comments shipped without
 	// surgery on the surrounding service-doc layout.
 	ForwardHTTPStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse], error)
+	// ForwardRawStream (issue #676 / ADR-080) is the raw-bytes bridge
+	// for Upgrade (WebSocket / h2c / MQTT-over-WS / long-poll) traffic.
+	// The legacy ForwardHTTPStream strips Upgrade + Connection as
+	// hop-by-hop headers and the shell-script bridge hard-codes
+	// Transfer-Encoding: chunked + a Host rewrite — both destroy the
+	// raw bytes an Upgrade handshake needs. ForwardRawStream carries
+	// the customer's verbatim HTTP request bytes (status line + headers
+	// + body) into the guest's netns TCP socket and reads back the
+	// raw response — no HTTP parsing, no chunked framing, no header
+	// rewriting. The gateway detects Upgrade requests and routes them
+	// here; plain HTTP / SSE / chunked stays on ForwardHTTPStream.
+	// Wire shape:
+	//
+	//	client → server: 1× ForwardRawRequestInit (instance, port, max
+	//	  request bytes), then N× body_chunk bytes that the bridge
+	//	  writes verbatim to the guest TCP socket. Half-close = EOF.
+	//	server → client: 1× ForwardRawResponseInit (status + headers
+	//	  + error message), then N× body_chunk bytes that the bridge
+	//	  read off the guest TCP socket. Server half-closes when the
+	//	  guest closes the connection.
+	//
+	// The bridge that owns the guest TCP socket is the new
+	// vmmd-raw-bridge Go binary (cmd/vmmd-raw-bridge/), spawned by
+	// vmmd under the stream context. Errors map to Unavailable (guest
+	// dial refused), NotFound (unknown instance), InvalidArgument
+	// (missing init), Internal (nsenter / bridge crash). The legacy
+	// ForwardHTTPStream is unaffected.
+	ForwardRawStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ForwardRawRequest, ForwardRawResponse], error)
 	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
 	// lets imaged compose the per-runtime base ext4 from a shared
 	// debian:12-slim parent. imaged is not root (User=faas-imaged +
@@ -448,6 +477,19 @@ func (c *vmmdClient) ForwardHTTPStream(ctx context.Context, opts ...grpc.CallOpt
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Vmmd_ForwardHTTPStreamClient = grpc.BidiStreamingClient[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]
 
+func (c *vmmdClient) ForwardRawStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ForwardRawRequest, ForwardRawResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Vmmd_ServiceDesc.Streams[2], Vmmd_ForwardRawStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ForwardRawRequest, ForwardRawResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Vmmd_ForwardRawStreamClient = grpc.BidiStreamingClient[ForwardRawRequest, ForwardRawResponse]
+
 func (c *vmmdClient) MountParentExt4ReadOnly(ctx context.Context, in *MountParentExt4ReadOnlyRequest, opts ...grpc.CallOption) (*MountParentExt4ReadOnlyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MountParentExt4ReadOnlyResponse)
@@ -667,6 +709,34 @@ type VmmdServer interface {
 	// PR-D state. The repetition kept the comments shipped without
 	// surgery on the surrounding service-doc layout.
 	ForwardHTTPStream(grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]) error
+	// ForwardRawStream (issue #676 / ADR-080) is the raw-bytes bridge
+	// for Upgrade (WebSocket / h2c / MQTT-over-WS / long-poll) traffic.
+	// The legacy ForwardHTTPStream strips Upgrade + Connection as
+	// hop-by-hop headers and the shell-script bridge hard-codes
+	// Transfer-Encoding: chunked + a Host rewrite — both destroy the
+	// raw bytes an Upgrade handshake needs. ForwardRawStream carries
+	// the customer's verbatim HTTP request bytes (status line + headers
+	// + body) into the guest's netns TCP socket and reads back the
+	// raw response — no HTTP parsing, no chunked framing, no header
+	// rewriting. The gateway detects Upgrade requests and routes them
+	// here; plain HTTP / SSE / chunked stays on ForwardHTTPStream.
+	// Wire shape:
+	//
+	//	client → server: 1× ForwardRawRequestInit (instance, port, max
+	//	  request bytes), then N× body_chunk bytes that the bridge
+	//	  writes verbatim to the guest TCP socket. Half-close = EOF.
+	//	server → client: 1× ForwardRawResponseInit (status + headers
+	//	  + error message), then N× body_chunk bytes that the bridge
+	//	  read off the guest TCP socket. Server half-closes when the
+	//	  guest closes the connection.
+	//
+	// The bridge that owns the guest TCP socket is the new
+	// vmmd-raw-bridge Go binary (cmd/vmmd-raw-bridge/), spawned by
+	// vmmd under the stream context. Errors map to Unavailable (guest
+	// dial refused), NotFound (unknown instance), InvalidArgument
+	// (missing init), Internal (nsenter / bridge crash). The legacy
+	// ForwardHTTPStream is unaffected.
+	ForwardRawStream(grpc.BidiStreamingServer[ForwardRawRequest, ForwardRawResponse]) error
 	// MountParentExt4ReadOnly (ADR-053) is the staging-only path that
 	// lets imaged compose the per-runtime base ext4 from a shared
 	// debian:12-slim parent. imaged is not root (User=faas-imaged +
@@ -827,6 +897,9 @@ func (UnimplementedVmmdServer) Logs(*LogsRequest, grpc.ServerStreamingServer[Log
 }
 func (UnimplementedVmmdServer) ForwardHTTPStream(grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]) error {
 	return status.Error(codes.Unimplemented, "method ForwardHTTPStream not implemented")
+}
+func (UnimplementedVmmdServer) ForwardRawStream(grpc.BidiStreamingServer[ForwardRawRequest, ForwardRawResponse]) error {
+	return status.Error(codes.Unimplemented, "method ForwardRawStream not implemented")
 }
 func (UnimplementedVmmdServer) MountParentExt4ReadOnly(context.Context, *MountParentExt4ReadOnlyRequest) (*MountParentExt4ReadOnlyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MountParentExt4ReadOnly not implemented")
@@ -1089,6 +1162,13 @@ func _Vmmd_ForwardHTTPStream_Handler(srv interface{}, stream grpc.ServerStream) 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Vmmd_ForwardHTTPStreamServer = grpc.BidiStreamingServer[ForwardHTTPStreamRequest, ForwardHTTPStreamResponse]
 
+func _Vmmd_ForwardRawStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(VmmdServer).ForwardRawStream(&grpc.GenericServerStream[ForwardRawRequest, ForwardRawResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Vmmd_ForwardRawStreamServer = grpc.BidiStreamingServer[ForwardRawRequest, ForwardRawResponse]
+
 func _Vmmd_MountParentExt4ReadOnly_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(MountParentExt4ReadOnlyRequest)
 	if err := dec(in); err != nil {
@@ -1326,6 +1406,12 @@ var Vmmd_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ForwardHTTPStream",
 			Handler:       _Vmmd_ForwardHTTPStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "ForwardRawStream",
+			Handler:       _Vmmd_ForwardRawStream_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},
