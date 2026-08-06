@@ -124,6 +124,14 @@ func (s *server) inviteOrgMember(w http.ResponseWriter, r *http.Request, acct st
 	if !s.enforcePendingInvitationCap(r.Context(), w, org) {
 		return
 	}
+	// Pre-flight member-cap check (defence-in-depth back-stop for
+	// the store-side check inside ConsumeOrgInvitation). Refusing
+	// at the invite step saves a token mint + the customer-visible
+	// "invitation sent, then accept failed" round-trip. Free + un-
+	// known plans fail closed at the `active >= limit` guard.
+	if !s.enforceMemberCap(r.Context(), w, org) {
+		return
+	}
 	token, tokenHash, mintErr := s.mintOrgInvitationToken(w)
 	if mintErr {
 		return
@@ -332,29 +340,4 @@ func containsOrgDirectPatchRole(role string) bool {
 		}
 	}
 	return false
-}
-
-// countPendingOrgInvitations returns the number of pending rows
-// for the org (consumed_at == nil && revoked_at == nil &&
-// expires_at > now). The store doesn't have a single-purpose
-// counter, so the handler reads ListOrgInvitationsForOrg and
-// filters at the boundary — same posture as the member-list's
-// RemovedAt filter.
-func (s *server) countPendingOrgInvitations(ctx context.Context, orgID string) (int, error) {
-	rows, err := s.store.ListOrgInvitationsForOrg(ctx, orgID)
-	if err != nil {
-		return 0, err
-	}
-	now := time.Now()
-	pending := 0
-	for _, inv := range rows {
-		if inv.ConsumedAt != nil || inv.RevokedAt != nil {
-			continue
-		}
-		if !inv.ExpiresAt.IsZero() && now.After(inv.ExpiresAt) {
-			continue
-		}
-		pending++
-	}
-	return pending, nil
 }

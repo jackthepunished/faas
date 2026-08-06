@@ -10916,7 +10916,11 @@ func scanOrg(r rowScanner) (Org, error) {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on duplicate
 // PK, ErrOrgLastOwner when adding a second active owner would trip the
-// partial unique, ErrNotFound when the org row is missing.
+// partial unique, ErrNotFound when the org row is missing,
+// ErrOrgMemberCapExceeded when the org's active-member count has
+// reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2 — the
+// defence-in-depth back-stop; consumeOrgInvitation runs the same
+// check, and cmd/apid's enforceMemberCap gates the handler path).
 func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -10930,6 +10934,35 @@ func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, rol
 	}
 	if !orgExists {
 		return ErrNotFound
+	}
+
+	// IAM-6 / ADR-061 PR 2 cap check: count active members inside
+	// the same tx the insert runs in so a concurrent caller cannot
+	// race past the cap. Personal orgs are immutable and never reach
+	// here — the handler path gates on `Personal` before
+	// AddOrgMember — so the plan here is always the org's own plan.
+	//
+	// Free + unknown plans read 0 (plan-policy fail-closed — abuse-
+	// floor tier cannot host shared orgs). The first add to a brand-
+	// new org is always allowed (the initial owner seed) — only
+	// subsequent adds enforce `active >= limit`. This matches the
+	// handler path (cmd/apid/handlers_org.go::createSharedOrg) which
+	// always seeds the first owner.
+	var planSlug string
+	if err := tx.QueryRow(ctx, `select plan::text from orgs where id = $1`, orgID).Scan(&planSlug); err != nil {
+		return fmt.Errorf("state: add org member plan probe: %w", err)
+	}
+	limits, _ := api.LimitsFor(api.Plan(planSlug))
+	limit := limits.OrgMembersMax
+	var active int
+	if err := tx.QueryRow(ctx, `
+		select count(*) from org_memberships
+		 where org_id = $1 and removed_at is null
+	`, orgID).Scan(&active); err != nil {
+		return fmt.Errorf("state: add org member count: %w", err)
+	}
+	if active > 0 && active >= limit {
+		return ErrOrgMemberCapExceeded
 	}
 
 	var inv *string
@@ -11201,6 +11234,24 @@ func (s *PgStore) ListOrgMembers(ctx context.Context, orgID string) ([]OrgMember
 	return out, rows.Err()
 }
 
+// CountActiveOrgMembers returns the number of memberships with
+// removed_at IS NULL for the given org. The filter lives at the SQL
+// layer so the count does not scan every row into Go; the partial
+// unique index `org_memberships_account_idx WHERE removed_at IS NULL`
+// (migration 00099_orgs_memberships_invitations.sql) keeps the scan
+// cheap on the typical Hobby/Pro/Scale team-size org.
+func (s *PgStore) CountActiveOrgMembers(ctx context.Context, orgID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		select count(*) from org_memberships
+		 where org_id = $1 and removed_at is null
+	`, orgID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("state: count active org members: %w", err)
+	}
+	return n, nil
+}
+
 // OrgMemberByAccount returns the single (org, account) row.
 func (s *PgStore) OrgMemberByAccount(ctx context.Context, orgID, accountID string) (OrgMembership, error) {
 	row := s.pool.QueryRow(ctx, `
@@ -11314,6 +11365,27 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 		out = append(out, inv)
 	}
 	return out, rows.Err()
+}
+
+// CountPendingOrgInvitations returns the number of invitation rows
+// with consumed_at IS NULL AND revoked_at IS NULL AND expires_at >
+// now() for the given org. The filter lives at the SQL layer; the
+// `now` is computed server-side via `now() at time zone 'utc'` so
+// the SQL matches the in-Go `time.Now()` semantics used elsewhere in
+// the org surface.
+func (s *PgStore) CountPendingOrgInvitations(ctx context.Context, orgID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		select count(*) from org_invitations
+		 where org_id = $1
+		   and consumed_at is null
+		   and revoked_at is null
+		   and (expires_at is null or expires_at > now() at time zone 'utc')
+	`, orgID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("state: count pending org invitations: %w", err)
+	}
+	return n, nil
 }
 
 // ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every

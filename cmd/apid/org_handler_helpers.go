@@ -121,23 +121,47 @@ func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.Response
 	return org, true
 }
 
+// enforceMemberCap applies the per-plan OrgMembersMax limit on the
+// direct-add path (ADR-061 / IAM-6 PR 2). Free + unknown plans have
+// OrgMembersMax == 0 by plan policy — the abuse-floor tier cannot
+// host shared orgs, mirroring CronLimitPerApp and
+// EvictionPriorityReservedAllowed. A non-personal Free org never
+// reaches here in practice (the personal-org path is immutable and
+// the createSharedOrg handler defaults to Free with limit=0), but
+// the fail-closed `active >= limit` guard also catches a future
+// route that bypasses those gates. Returns true when the cap
+// allows the new member; on exceed, writes the 403 Problem and
+// returns false. On Store failure, writes a 500 Problem and
+// returns false.
+func (s *server) enforceMemberCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
+	limit := org.Plan.OrgMembersMax()
+	active, err := s.store.CountActiveOrgMembers(ctx, org.ID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity, "CountActiveOrgMembers failed",
+			"try again; if the problem persists, contact support"))
+		return false
+	}
+	if active >= limit {
+		api.WriteProblem(w, api.ErrOrgMemberCapExceeded(limit, active))
+		return false
+	}
+	return true
+}
+
 // enforcePendingInvitationCap applies the per-plan
-// OrgPendingInvitationsMax limit. Plan.OrgPendingInvitationsMax()
-// is 0 until the financial model populates it, so the > 0 guard
-// keeps the limit closed-off in PR 5; once the model lands the
-// branch opens without a handler-shape change. Returns true when
-// the cap allows the new invitation; on exceed, writes the 403
+// OrgPendingInvitationsMax limit. Same fail-closed shape as
+// enforceMemberCap: Free + unknown plans read 0/0 and the
+// `pending >= limit` guard catches them. Returns true when the
+// cap allows the new invitation; on exceed, writes the 403
 // Problem and returns false. On Store failure, writes a 500
 // Problem and returns false.
 func (s *server) enforcePendingInvitationCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
 	limit := org.Plan.OrgPendingInvitationsMax()
-	if limit <= 0 {
-		return true
-	}
-	pending, err := s.countPendingOrgInvitations(ctx, org.ID)
+	pending, err := s.store.CountPendingOrgInvitations(ctx, org.ID)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity, "ListOrgInvitationsForOrg failed",
+			api.CodeCapacity, "CountPendingOrgInvitations failed",
 			"try again; if the problem persists, contact support"))
 		return false
 	}

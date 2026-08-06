@@ -8723,11 +8723,14 @@ func (m *MemStore) SoftDeleteOrg(_ context.Context, id string) error {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on
 // duplicate (org_id, account_id), ErrOrgLastOwner when the partial
-// unique would trip, and ErrNotFound on missing parent.
+// unique would trip, ErrOrgMemberCapExceeded when the org's active
+// members have reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2),
+// and ErrNotFound on missing parent.
 func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.orgs[orgID]; !ok {
+	org, ok := m.orgs[orgID]
+	if !ok {
 		return ErrNotFound
 	}
 	k := orgAccountKey{OrgID: orgID, AccountID: accountID}
@@ -8740,6 +8743,28 @@ func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role
 				return ErrOrgLastOwner
 			}
 		}
+	}
+	// IAM-6 / ADR-061 PR 2 cap check: counts under m.mu so concurrent
+	// callers cannot race past the cap. Mirrors PgStore.AddOrgMember's
+	// tx-scoped counter. Personal orgs are immutable and never reach
+	// here; the plan here is always the org's own plan.
+	//
+	// Free + unknown plans read 0 (plan-policy fail-closed — abuse-
+	// floor tier cannot host shared orgs). The first add to a brand-
+	// new org is always allowed (the initial owner seed) — only
+	// subsequent adds enforce `active >= limit`. This matches the
+	// handler path (cmd/apid/handlers_org.go::createSharedOrg) which
+	// always seeds the first owner.
+	limits, _ := api.LimitsFor(org.Plan)
+	limit := limits.OrgMembersMax
+	active := 0
+	for _, existing := range m.memberships {
+		if existing.OrgID == orgID && existing.RemovedAt == nil {
+			active++
+		}
+	}
+	if active > 0 && active >= limit {
+		return ErrOrgMemberCapExceeded
 	}
 	now := time.Now().UTC()
 	m.memberships[k] = OrgMembership{
@@ -8844,6 +8869,21 @@ func (m *MemStore) ListOrgMembers(_ context.Context, orgID string) ([]OrgMembers
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].JoinedAt.Before(out[j].JoinedAt) })
 	return out, nil
+}
+
+// CountActiveOrgMembers mirrors PgStore.CountActiveOrgMembers — counts
+// memberships with RemovedAt == nil for the given org. Parity test
+// `TestOrgMembersCountParity_PgMemstore` pins the agreement.
+func (m *MemStore) CountActiveOrgMembers(_ context.Context, orgID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, mem := range m.memberships {
+		if mem.OrgID == orgID && mem.RemovedAt == nil {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // OrgMemberByAccount looks up the (org, account) row.
@@ -8960,6 +9000,31 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
+}
+
+// CountPendingOrgInvitations mirrors PgStore.CountPendingOrgInvitations
+// — counts invitation rows that are not consumed, not revoked, and
+// not past expires_at. Parity test
+// `TestOrgPendingInvitationsCountParity_PgMemstore` pins the
+// agreement.
+func (m *MemStore) CountPendingOrgInvitations(_ context.Context, orgID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, inv := range m.invitations {
+		if inv.OrgID != orgID {
+			continue
+		}
+		if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+			continue
+		}
+		if !inv.ExpiresAt.IsZero() && now.After(inv.ExpiresAt) {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every

@@ -170,6 +170,11 @@ func TestMemStore_AddOrgMember_ExactlyOneOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
+	// Hobby plan (OrgMembersMax=10) so the second-add test isn't
+	// blocked by Free's fail-closed 0/0 cap.
+	if err := m.UpdateOrgPlan(ctx, org.ID, api.PlanHobby); err != nil {
+		t.Fatalf("plan update: %v", err)
+	}
 
 	if err := m.AddOrgMember(ctx, org.ID, memstoreOrgTestAccountID, OrgRoleOwner, nil); err != nil {
 		t.Fatalf("first owner: %v", err)
@@ -198,6 +203,11 @@ func TestMemStore_RemoveOrgMember_LastOwnerGuard(t *testing.T) {
 	org, err := m.CreateOrg(ctx, newTestOrg("rm-test"))
 	if err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	// Hobby plan (OrgMembersMax=10) so the second-add seed isn't
+	// blocked by Free's fail-closed 0/0 cap.
+	if err := m.UpdateOrgPlan(ctx, org.ID, api.PlanHobby); err != nil {
+		t.Fatalf("plan update: %v", err)
 	}
 	if err := m.AddOrgMember(ctx, org.ID, memstoreOrgTestAccountID, OrgRoleOwner, nil); err != nil {
 		t.Fatalf("seed owner: %v", err)
@@ -229,6 +239,11 @@ func TestMemStore_UpdateOrgMemberRole_LastOwnerGuard(t *testing.T) {
 	org, err := m.CreateOrg(ctx, newTestOrg("role-test"))
 	if err != nil {
 		t.Fatalf("create org: %v", err)
+	}
+	// Hobby plan (OrgMembersMax=10) so the second-add seed isn't
+	// blocked by Free's fail-closed 0/0 cap.
+	if err := m.UpdateOrgPlan(ctx, org.ID, api.PlanHobby); err != nil {
+		t.Fatalf("plan update: %v", err)
 	}
 	if err := m.AddOrgMember(ctx, org.ID, memstoreOrgTestAccountID, OrgRoleOwner, nil); err != nil {
 		t.Fatalf("seed owner: %v", err)
@@ -535,5 +550,164 @@ func TestMemStore_CreateAccountWithPersonalOrg_SlugDeterministic(t *testing.T) {
 	want := PersonalOrgSlug(res.Account.ID)
 	if res.PersonalOrg.Slug != want {
 		t.Errorf("slug = %q, want %q", res.PersonalOrg.Slug, want)
+	}
+}
+
+// TestMemStore_AddOrgMember_MemberCapExceeded is the parity twin of
+// TestPgStore_AddOrgMember_MemberCapExceeded (IAM-6 / ADR-061 PR-2).
+// Pins that the in-memory store enforces Plan.OrgMembersMax() under
+// m.mu so a concurrent caller cannot race past the cap. Hobby = 10.
+func TestMemStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	o, err := m.CreateOrg(ctx, Org{
+		Slug: "cap-mem", Name: "Cap Mem", Plan: api.PlanHobby, Status: OrgStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	ownerID := "00000000-0000-0000-0000-00000000da01"
+	devIDs := make([]string, 9)
+	for i := range devIDs {
+		devIDs[i] = "00000000-0000-0000-0000-00000000da" + string(rune('2'+i))
+	}
+
+	if err := m.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("owner (1/10): %v", err)
+	}
+	for i, id := range devIDs {
+		if err := m.AddOrgMember(ctx, o.ID, id, OrgRoleDeveloper, nil); err != nil {
+			t.Fatalf("dev %d (%d/10): %v", i, i+2, err)
+		}
+	}
+	n, err := m.CountActiveOrgMembers(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 10 {
+		t.Fatalf("CountActiveOrgMembers = %d, want 10", n)
+	}
+	eleventh := "00000000-0000-0000-0000-00000000da0b"
+	if err := m.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Errorf("11th add: err = %v, want ErrOrgMemberCapExceeded", err)
+	}
+	if err := m.RemoveOrgMember(ctx, o.ID, devIDs[0]); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := m.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); err != nil {
+		t.Errorf("post-remove add: err = %v, want nil", err)
+	}
+}
+
+// TestMemStore_AddOrgMember_MemberCap_FreeIsClosed pins Free's
+// 0/0 fail-closed posture at the store layer — abuse-floor tier
+// cannot host a second member.
+func TestMemStore_AddOrgMember_MemberCap_FreeIsClosed(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	o, err := m.CreateOrg(ctx, newTestOrg("cap-free-mem"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	owner := "00000000-0000-0000-0000-00000000db01"
+	second := "00000000-0000-0000-0000-00000000db02"
+	if err := m.AddOrgMember(ctx, o.ID, owner, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	if err := m.AddOrgMember(ctx, o.ID, second, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Errorf("Free 2nd add: err = %v, want ErrOrgMemberCapExceeded", err)
+	}
+}
+
+// TestMemStore_CountActiveOrgMembers_RemovedFiltered pins that the
+// in-memory counter ignores soft-deleted memberships (mirrors the
+// partial unique index on the SQL side). Hobby plan (OrgMembersMax=10)
+// is used so the test can add 3 members without tripping the cap.
+func TestMemStore_CountActiveOrgMembers_RemovedFiltered(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	o, err := m.CreateOrg(ctx, Org{
+		Slug: "count-mem", Name: "Count Mem", Plan: api.PlanHobby, Status: OrgStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	owner := "00000000-0000-0000-0000-00000000dc01"
+	kept := "00000000-0000-0000-0000-00000000dc02"
+	gone := "00000000-0000-0000-0000-00000000dc03"
+	for _, id := range []string{owner, kept, gone} {
+		var role OrgRole
+		switch id {
+		case owner:
+			role = OrgRoleOwner
+		default:
+			role = OrgRoleDeveloper
+		}
+		if err := m.AddOrgMember(ctx, o.ID, id, role, nil); err != nil {
+			t.Fatalf("add %s: %v", id, err)
+		}
+	}
+	if err := m.RemoveOrgMember(ctx, o.ID, gone); err != nil {
+		t.Fatalf("remove gone: %v", err)
+	}
+	n, err := m.CountActiveOrgMembers(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("CountActiveOrgMembers = %d, want 2 (owner + kept, gone filtered)", n)
+	}
+}
+
+// TestMemStore_CountPendingOrgInvitations_FiltersExpired pins that
+// the pending-invitation counter ignores consumed / revoked /
+// expired rows. Mirrors the SQL filter inside
+// CountPendingOrgInvitations (PgStore twin).
+func TestMemStore_CountPendingOrgInvitations_FiltersExpired(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	o, err := m.CreateOrg(ctx, newTestOrg("inv-mem"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	hash := func(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }
+	now := timeNow()
+
+	// Pending row.
+	if _, err := m.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID: o.ID, Email: "a@x", Role: OrgRoleDeveloper, TokenHash: hash("a"),
+		ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("create pending: %v", err)
+	}
+	// Already-consumed row.
+	if _, err := m.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID: o.ID, Email: "b@x", Role: OrgRoleDeveloper, TokenHash: hash("b"),
+		ExpiresAt: now.Add(time.Hour), ConsumedAt: &now,
+	}); err != nil {
+		t.Fatalf("create consumed: %v", err)
+	}
+	// Revoked row.
+	if _, err := m.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID: o.ID, Email: "c@x", Role: OrgRoleDeveloper, TokenHash: hash("c"),
+		ExpiresAt: now.Add(time.Hour), RevokedAt: &now,
+	}); err != nil {
+		t.Fatalf("create revoked: %v", err)
+	}
+	// Expired row (past).
+	if _, err := m.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID: o.ID, Email: "d@x", Role: OrgRoleDeveloper, TokenHash: hash("d"),
+		ExpiresAt: now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("create expired: %v", err)
+	}
+
+	n, err := m.CountPendingOrgInvitations(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("CountPendingOrgInvitations = %d, want 1 (only the pending row)", n)
 	}
 }

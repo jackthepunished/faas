@@ -725,3 +725,145 @@ func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
 		t.Errorf("post-failure member role = %q, want developer", row.Role)
 	}
 }
+
+// TestPgStore_AddOrgMember_MemberCapExceeded pins the IAM-6 / ADR-061
+// PR-2 defence-in-depth back-stop (issue #190): when an org's active
+// members reach Plan.OrgMembersMax(), AddOrgMember must return
+// ErrOrgMemberCapExceeded (counted inside the same tx as the insert,
+// so a concurrent caller cannot race past the cap). Free stays 0/0
+// by plan policy — this test uses Hobby (10) to exercise the
+// populated branch; Free's fail-closed posture is pinned by
+// TestPlanLimitsMatchSpec + TestOrgMembersLimits_DerivedFromLadder.
+func TestPgStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
+	s := newPgStore(t)
+	pool := s.pool
+	ctx := context.Background()
+
+	// Seed the org as Hobby so OrgMembersMax() returns 10 (the
+	// derived PR-2 value); CreateOrg stamps Plan=Free so we
+	// override it after the row lands.
+	o, err := s.CreateOrg(ctx, newTestOrg("cap-pg"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `update orgs set plan = 'hobby' where id = $1`, o.ID); err != nil {
+		t.Fatalf("update plan: %v", err)
+	}
+	o.Plan = api.PlanHobby
+
+	// Owner (active count = 1) + 9 developers (active count = 10).
+	ownerID := "00000000-0000-0000-0000-00000000ca01"
+	devIDs := make([]string, 9)
+	for i := range devIDs {
+		devIDs[i] = "00000000-0000-0000-0000-00000000ca" + string(rune('2'+i))
+	}
+	pgStoreSeedAccounts(t, ctx, pool, append([]string{ownerID}, devIDs...)...)
+
+	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("add owner (1/10): %v", err)
+	}
+	for i, id := range devIDs {
+		if err := s.AddOrgMember(ctx, o.ID, id, OrgRoleDeveloper, nil); err != nil {
+			t.Fatalf("add dev %d (%d/10): %v", i, i+2, err)
+		}
+	}
+
+	// Sanity: CountActiveOrgMembers returns 10.
+	n, err := s.CountActiveOrgMembers(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("CountActiveOrgMembers: %v", err)
+	}
+	if n != 10 {
+		t.Fatalf("CountActiveOrgMembers = %d, want 10", n)
+	}
+
+	// 11th add must refuse — the org is at cap.
+	eleventh := "00000000-0000-0000-0000-00000000ca0b"
+	pgStoreSeedAccounts(t, ctx, pool, eleventh)
+	if err := s.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Errorf("11th add: err = %v, want ErrOrgMemberCapExceeded", err)
+	}
+
+	// Removing one member frees a seat; the next add must succeed.
+	removed := devIDs[0]
+	if err := s.RemoveOrgMember(ctx, o.ID, removed); err != nil {
+		t.Fatalf("RemoveOrgMember: %v", err)
+	}
+	if err := s.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); err != nil {
+		t.Errorf("post-remove add: err = %v, want nil", err)
+	}
+}
+
+// TestPgStore_AddOrgMember_MemberCap_FreeIsClosed pins that Free's
+// 0/0 fail-closed posture blocks membership adds on the abuse-floor
+// tier. Personal orgs are immutable and never reach AddOrgMember;
+// this test uses a regular (non-personal) Free org to confirm the
+// cap check itself is the blocker (not the personal-org path).
+func TestPgStore_AddOrgMember_MemberCap_FreeIsClosed(t *testing.T) {
+	s := newPgStore(t)
+	pool := s.pool
+	ctx := context.Background()
+
+	o, err := s.CreateOrg(ctx, newTestOrg("cap-free-pg"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	// Default plan is Free; no override needed.
+	ownerID := "00000000-0000-0000-0000-00000000cb01"
+	pgStoreSeedAccounts(t, ctx, pool, ownerID)
+
+	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("owner seed: %v", err)
+	}
+	// Second member on Free must refuse — OrgMembersMax == 0.
+	second := "00000000-0000-0000-0000-00000000cb02"
+	pgStoreSeedAccounts(t, ctx, pool, second)
+	if err := s.AddOrgMember(ctx, o.ID, second, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Errorf("Free 2nd add: err = %v, want ErrOrgMemberCapExceeded", err)
+	}
+}
+
+// TestPgStore_CountActiveOrgMembers_RemovedFiltered pins that the
+// count ignores removed (soft-deleted) memberships. Mirrors the
+// partial-unique-index predicate on org_memberships_account_idx.
+// Hobby plan (OrgMembersMax=10) is used so the test can add 3
+// members without tripping the PR-2 cap check.
+func TestPgStore_CountActiveOrgMembers_RemovedFiltered(t *testing.T) {
+	s := newPgStore(t)
+	pool := s.pool
+	ctx := context.Background()
+
+	o, err := s.CreateOrg(ctx, newTestOrg("count-pg"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `update orgs set plan = 'hobby' where id = $1`, o.ID); err != nil {
+		t.Fatalf("update plan: %v", err)
+	}
+	o.Plan = api.PlanHobby
+
+	ownerID := "00000000-0000-0000-0000-00000000cc01"
+	keptID := "00000000-0000-0000-0000-00000000cc02"
+	goneID := "00000000-0000-0000-0000-00000000cc03"
+	pgStoreSeedAccounts(t, ctx, pool, ownerID, keptID, goneID)
+
+	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("owner: %v", err)
+	}
+	if err := s.AddOrgMember(ctx, o.ID, keptID, OrgRoleDeveloper, nil); err != nil {
+		t.Fatalf("kept: %v", err)
+	}
+	if err := s.AddOrgMember(ctx, o.ID, goneID, OrgRoleDeveloper, nil); err != nil {
+		t.Fatalf("gone: %v", err)
+	}
+	if err := s.RemoveOrgMember(ctx, o.ID, goneID); err != nil {
+		t.Fatalf("remove gone: %v", err)
+	}
+	n, err := s.CountActiveOrgMembers(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("CountActiveOrgMembers = %d, want 2 (owner + kept, gone filtered)", n)
+	}
+}

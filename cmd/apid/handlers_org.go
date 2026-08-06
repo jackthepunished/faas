@@ -92,8 +92,23 @@ func (s *server) createSharedOrg(w http.ResponseWriter, r *http.Request, acct st
 		}
 		return
 	}
+	// Note (IAM-6 / ADR-061 PR 2): we deliberately do NOT call
+	// enforceMemberCap here — the initial-owner seed is the
+	// first active membership on a brand-new org, and Free's
+	// fail-closed 0/0 cap would refuse it. The cap is a
+	// per-add gate for subsequent members; the personal-org
+	// path (which is immutable and never reaches this handler)
+	// is unaffected. The store-side cap check inside AddOrgMember
+	// is the defence-in-depth back-stop — it also reads
+	// 0/0 for Free but only trips when active >= limit, so
+	// the initial seed (active=0) passes cleanly.
 	invitedBy := acct.ID
 	if err := s.store.AddOrgMember(r.Context(), newOrg.ID, acct.ID, state.OrgRoleOwner, &invitedBy); err != nil {
+		if errors.Is(err, state.ErrOrgMemberCapExceeded) {
+			limit := newOrg.Plan.OrgMembersMax()
+			api.WriteProblem(w, api.ErrOrgMemberCapExceeded(limit, limit))
+			return
+		}
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity, "AddOrgMember (initial owner) failed",
 			"the org row was created but the owner membership failed to seed; contact support"))
