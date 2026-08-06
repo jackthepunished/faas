@@ -50,6 +50,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// metricLabelUnknown is the canonical "label collapsed because the source
+// string was empty" sentinel used across this package's Prometheus
+// collectors (warmup histogram + liveness histogram/gauge). Closed-set
+// labels stay bounded — every {} occurrence has to map to one of these
+// constants to keep goconst happy (golangci-lint v2.4.0 fires on
+// repeated string literals ≥ 3×).
+const metricLabelUnknown = "unknown"
+
 // SnapshotStat is the minimum surface area the dashboard needs. schedd's
 // `snapshots` table row gives us MemBytes + DiskBytes + a Path; we
 // compute the parked footprint as MemBytes+VMStateBytes+disk (the sum
@@ -203,12 +211,115 @@ func (m *FrameworkReadyMetrics) ObserveWarmup(runtime, app string, seconds float
 		return
 	}
 	if runtime == "" {
-		runtime = "unknown"
+		runtime = metricLabelUnknown
 	}
 	if app == "" {
-		app = "unknown"
+		app = metricLabelUnknown
 	}
 	m.warmup.WithLabelValues(runtime, app).Observe(seconds)
+}
+
+// LivenessMetrics owns the vmmd_guest_liveness_* Prometheus collectors
+// (issue #554 / ADR-078). Two collectors on a single per-daemon
+// registry:
+//
+//   - vmmd_guest_liveness_probe_seconds{outcome}: histogram of the
+//     wall-clock duration for one probe (host dial + JSON RTT). Outcomes
+//     are the closed set {ok, non_200, timeout, conn_refused, conn_err}
+//     — the same five classes the host's failure counter tracks.
+//   - vmmd_guest_liveness_consecutive_failures{instance}: per-instance
+//     gauge of the current consecutive-failure count. Resets to 0 on
+//     a 2xx response; ticks up on every non-2xx. The
+//     {instance} label is the per-wake instances.id and is intentionally
+//     high cardinality — like the FrameworkReadyMetrics.app label,
+//     callers SHOULD use the pkg/wire.OtherLabelSet admission primitive
+//     if exporting to a shared Prometheus, but the per-vmmd dedicated
+//     registry pattern (this struct) keeps it safe.
+//
+// Nil-safe — Manager.ObserveLivenessProbe / SetLivenessConsecutiveFailures
+// call into the histograms with a nil-check so unit tests that don't
+// wire metrics don't need a stub.
+type LivenessMetrics struct {
+	reg           *prometheus.Registry
+	probe         *prometheus.HistogramVec
+	consecutiveGF *prometheus.GaugeVec
+}
+
+// NewLivenessMetrics registers the two vmmd_guest_liveness_*
+// collectors on a fresh per-daemon registry. Pass the returned struct
+// to fcvm.NewManager.WithLivenessMetrics (the writer) AND to the
+// http mux (the reader). Calling ObserveProbe / SetConsecutiveFailures
+// on a nil receiver is a safe no-op.
+func NewLivenessMetrics() *LivenessMetrics {
+	reg := prometheus.NewRegistry()
+	m := &LivenessMetrics{
+		reg: reg,
+		probe: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "vmmd_guest_liveness_probe_seconds",
+			Help: "Wall-clock duration for one liveness probe (host dial + JSON RTT) per outcome (issue #554 / ADR-078). Closed outcome set {ok, non_200, timeout, conn_refused, conn_err}.",
+			// Probe budget: 5s default period, 2s default timeout.
+			// 0.001-0.005 captures the healthy 2xx RTT; 0.2-2.0
+			// captures the timeout region; 5+ captures the
+			// "host can't even dial" signature.
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1, 2, 5},
+		}, []string{"outcome"}),
+		consecutiveGF: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "vmmd_guest_liveness_consecutive_failures",
+			Help: "Current consecutive-failure count per instance (issue #554 / ADR-078). Resets to 0 on a 2xx response; ticks up on every non-2xx (timeout, conn_refused, non_200). When the count reaches the per-plan ConsecutiveFailures (default 3), vmmd calls LivenessFailed → schedd DestroyForLivenessFailure.",
+		}, []string{"instance"}),
+	}
+	reg.MustRegister(m.probe)
+	reg.MustRegister(m.consecutiveGF)
+	return m
+}
+
+// Registry exposes the underlying registry — vmmd's mux mounts this
+// alongside the OpsMetrics + FrameworkReadyMetrics registries via
+// promhttp.HandlerFor.
+func (m *LivenessMetrics) Registry() *prometheus.Registry { return m.reg }
+
+// Handler returns an http.Handler serving the liveness collectors.
+func (m *LivenessMetrics) Handler() http.Handler {
+	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{Registry: m.reg})
+}
+
+// ObserveProbe records one probe's wall-clock duration. Safe on a nil
+// receiver. Empty outcome is collapsed to "unknown" so the histogram
+// stays queryable even for a wire-shape regression that lands an
+// out-of-set outcome string.
+func (m *LivenessMetrics) ObserveProbe(outcome string, seconds float64) {
+	if m == nil {
+		return
+	}
+	if outcome == "" {
+		outcome = metricLabelUnknown
+	}
+	m.probe.WithLabelValues(outcome).Observe(seconds)
+}
+
+// SetConsecutiveFailures records the current consecutive-failure count
+// for an instance. Safe on a nil receiver. Empty instance is
+// collapsed to "unknown" so the gauge stays queryable even for a
+// regression that loses the per-instance join.
+func (m *LivenessMetrics) SetConsecutiveFailures(instance string, count int) {
+	if m == nil {
+		return
+	}
+	if instance == "" {
+		instance = metricLabelUnknown
+	}
+	m.consecutiveGF.WithLabelValues(instance).Set(float64(count))
+}
+
+// DeleteConsecutiveFailures drops the per-instance gauge entry. Called
+// on instance teardown so the high-cardinality {instance} label set
+// doesn't accumulate dead instances (the same hygiene pattern as
+// pkg/fcvm/manager.go::cidToID). Safe on a nil receiver.
+func (m *LivenessMetrics) DeleteConsecutiveFailures(instance string) {
+	if m == nil {
+		return
+	}
+	m.consecutiveGF.DeleteLabelValues(instance)
 }
 
 // DashboardGauges is the wire handle schedd mounts at /metrics. Use

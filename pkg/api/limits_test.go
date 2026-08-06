@@ -143,6 +143,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Hobby is gated off for the same
 			// posture-change shape as Free.
 			RequireAuthn: false,
+			// Issue #554 / ADR-078: Hobby unlocks liveness — the
+			// first paid tier gets the Cloud Run-parity primitive.
+			// 5s period / 3 consecutive / 60s cooldown / 3 in 300s.
+			LivenessPeriodSeconds: 5, LivenessConsecutiveFailures: 3, LivenessCooldownSeconds: 60, LivenessMaxRestarts: 3, LivenessWindowSeconds: 300,
 			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
 			KeysMax: 10,
 			// Issue #667 / ADR-078: tail primitive on at 15 s.
@@ -205,6 +209,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Pro is the first tier where the
 			// per-app require_authn opt-in unlocks.
 			RequireAuthn: true,
+			// Issue #554 / ADR-078: Pro inherits the same liveness
+			// defaults as Hobby (5s / 3 / 60s / 3 in 300s). Pro is
+			// the unlock point for `GRPCLivenessAllowed()` once v2
+			// lands; v1 returns false across all plans.
+			LivenessPeriodSeconds: 5, LivenessConsecutiveFailures: 3, LivenessCooldownSeconds: 60, LivenessMaxRestarts: 3, LivenessWindowSeconds: 300,
 			// Issue #189 / IAM-5: Pro = 50 keys (2 per app across 25 apps).
 			KeysMax: 50,
 			// Issue #667 / ADR-078: tail primitive on at 30 s.
@@ -272,6 +281,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Scale mirrors Pro — opt-in
 			// available, column default still false.
 			RequireAuthn: true,
+			// Issue #554 / ADR-078: Scale mirrors Pro — same
+			// 5s / 3 / 60s / 3 in 300s defaults. The
+			// per-deployment override column on deployments is the
+			// surface a High-traffic Scale customer uses to
+			// lengthen the window without a code change.
+			LivenessPeriodSeconds: 5, LivenessConsecutiveFailures: 3, LivenessCooldownSeconds: 60, LivenessMaxRestarts: 3, LivenessWindowSeconds: 300,
 			// Issue #189 / IAM-5: Scale = 200 keys (2 per app across 100 apps).
 			KeysMax: 200,
 			// Issue #667 / ADR-078: tail primitive on at 60 s.
@@ -1200,6 +1215,180 @@ func TestRequireAuthnAccessorMatchesTable(t *testing.T) {
 		l := MustLimitsFor(p)
 		if got, want := p.RequireAuthnAllowed(), l.RequireAuthn; got != want {
 			t.Errorf("Plan(%s).RequireAuthnAllowed() = %v, table = %v", p, got, want)
+		}
+	}
+}
+
+// TestPlanLiveness pins the per-plan liveness probe defaults
+// (issue #554 / ADR-078). Free stays off (the §13 M7 free-stop
+// path already handles abuse-floor work; LivenessAllowed() mirrors
+// the MinInstancesAllowed/RequireAuthnAllowed false-on-Free
+// contract). Hobby first unlocks the primitive at 5 s period / 3
+// consecutive / 60 s cooldown / 3 in 300 s — every paid tier
+// inherits the same defaults. Unknown plans fail closed (every
+// accessor returns 0/false) — same contract as
+// TestPlanRequireAuthnAllowed above.
+func TestPlanLiveness(t *testing.T) {
+	allowedCases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range allowedCases {
+		if got := c.plan.LivenessAllowed(); got != c.want {
+			t.Errorf("%s.LivenessAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+
+	periodCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 5},
+		{PlanPro, 5},
+		{PlanScale, 5},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range periodCases {
+		if got := c.plan.LivenessPeriodSeconds(); got != c.want {
+			t.Errorf("%s.LivenessPeriodSeconds() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	consCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 3},
+		{PlanPro, 3},
+		{PlanScale, 3},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range consCases {
+		if got := c.plan.LivenessConsecutiveFailures(); got != c.want {
+			t.Errorf("%s.LivenessConsecutiveFailures() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	cooldownCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 60},
+		{PlanPro, 60},
+		{PlanScale, 60},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cooldownCases {
+		if got := c.plan.LivenessCooldownSeconds(); got != c.want {
+			t.Errorf("%s.LivenessCooldownSeconds() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	maxCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 3},
+		{PlanPro, 3},
+		{PlanScale, 3},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range maxCases {
+		if got := c.plan.LivenessMaxRestarts(); got != c.want {
+			t.Errorf("%s.LivenessMaxRestarts() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	windowCases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 300},
+		{PlanPro, 300},
+		{PlanScale, 300},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range windowCases {
+		if got := c.plan.LivenessWindowSeconds(); got != c.want {
+			t.Errorf("%s.LivenessWindowSeconds() = %d, want %d", c.plan, got, c.want)
+		}
+	}
+
+	// GRPCLivenessAllowed is hard-wired to false across the board
+	// in v1 (issue #554 / ADR-078 §"gRPC liveness"); the accessor
+	// exists so v2 can flip it without a DTO/SDK change.
+	for _, p := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale, Plan("unknown")} {
+		if p.GRPCLivenessAllowed() {
+			t.Errorf("%s.GRPCLivenessAllowed() = true, want false (v1 is HTTP-only; v2 PR will flip this without a DTO change)", p)
+		}
+	}
+}
+
+// TestLivenessConfigConstants pins the §13 mirror constants —
+// every consumer (cmd/vmmd poll goroutine, pkg/sched liveness
+// window, Dashboard help text) reads these. The clamp floors and
+// ceilings are the second-line defence: a customer that PATCHes
+// 0s period or 9999 consecutive in `OverrideLivenessProbe` is
+// rejected by Limits.X validation in the apid handler (TODO:
+// follow-up; v1 still surfaces the constants to the OpenAPI
+// schema's min/max).
+func TestLivenessConfigConstants(t *testing.T) {
+	if DefaultLivenessPeriodSeconds != 5 {
+		t.Errorf("DefaultLivenessPeriodSeconds = %d, want 5", DefaultLivenessPeriodSeconds)
+	}
+	if DefaultLivenessConsecutiveFailures != 3 {
+		t.Errorf("DefaultLivenessConsecutiveFailures = %d, want 3", DefaultLivenessConsecutiveFailures)
+	}
+	if DefaultLivenessCooldownSeconds != 60 {
+		t.Errorf("DefaultLivenessCooldownSeconds = %d, want 60", DefaultLivenessCooldownSeconds)
+	}
+	if DefaultLivenessMaxRestarts != 3 {
+		t.Errorf("DefaultLivenessMaxRestarts = %d, want 3", DefaultLivenessMaxRestarts)
+	}
+	if DefaultLivenessWindowSeconds != 300 {
+		t.Errorf("DefaultLivenessWindowSeconds = %d, want 300", DefaultLivenessWindowSeconds)
+	}
+	if MinLivenessPeriodSeconds != 1 {
+		t.Errorf("MinLivenessPeriodSeconds = %d, want 1", MinLivenessPeriodSeconds)
+	}
+	if MaxLivenessPeriodSeconds != 60 {
+		t.Errorf("MaxLivenessPeriodSeconds = %d, want 60", MaxLivenessPeriodSeconds)
+	}
+}
+
+// TestPlanLivenessAccessorsMatchTable pins that the accessors read
+// the same value the Limits struct holds (mirrors
+// TestOrgAccessorsMatchTable above). Catches a regression where a
+// future contributor edits the struct field but forgets the accessor
+// (or vice versa).
+func TestPlanLivenessAccessorsMatchTable(t *testing.T) {
+	for _, p := range []Plan{PlanFree, PlanHobby, PlanPro, PlanScale} {
+		l := MustLimitsFor(p)
+		if got, want := p.LivenessPeriodSeconds(), l.LivenessPeriodSeconds; got != want {
+			t.Errorf("Plan(%s).LivenessPeriodSeconds() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.LivenessConsecutiveFailures(), l.LivenessConsecutiveFailures; got != want {
+			t.Errorf("Plan(%s).LivenessConsecutiveFailures() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.LivenessCooldownSeconds(), l.LivenessCooldownSeconds; got != want {
+			t.Errorf("Plan(%s).LivenessCooldownSeconds() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.LivenessMaxRestarts(), l.LivenessMaxRestarts; got != want {
+			t.Errorf("Plan(%s).LivenessMaxRestarts() = %d, table = %d", p, got, want)
+		}
+		if got, want := p.LivenessWindowSeconds(), l.LivenessWindowSeconds; got != want {
+			t.Errorf("Plan(%s).LivenessWindowSeconds() = %d, table = %d", p, got, want)
 		}
 	}
 }

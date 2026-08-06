@@ -117,7 +117,16 @@ func TestEgressStart_DialAfterRebind(t *testing.T) {
 	// dirent that the old daemon's deferred Remove then deletes;
 	// this dial would fail. With the fix, the new daemon owns
 	// the dirent for its full lifetime.
-	conn, err = net.DialTimeout("unix", sock, 2*time.Second)
+	//
+	// Same flake guard as RepeatedCycle below: the kernel publishes
+	// the dirent asynchronously after net.Listen returns, and under
+	// CI runner-pool load the publish can lag. Wait for the dirent
+	// before dialing, then retry the dial over a 2s budget so the
+	// gRPC server's Serve goroutine has time to accept.
+	if err := waitForSocket(sock, 2*time.Second); err != nil {
+		t.Fatalf("wait for socket after second start: %v", err)
+	}
+	conn, err = dialWithRetry(sock, 2*time.Second, 10*time.Millisecond)
 	if err != nil {
 		t.Fatalf("dial after second start: %v", err)
 	}

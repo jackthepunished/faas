@@ -28,14 +28,15 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Schedd_Wake_FullMethodName              = "/onebox.faas.schedd.v1.Schedd/Wake"
-	Schedd_AdmitInstance_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/AdmitInstance"
-	Schedd_ReportActivity_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
-	Schedd_ParkInstance_FullMethodName      = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
-	Schedd_ListInstanceStats_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
-	Schedd_StreamAppLogs_FullMethodName     = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
-	Schedd_StreamWarmHints_FullMethodName   = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
-	Schedd_ReportCapacity_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ReportCapacity"
+	Schedd_Wake_FullMethodName                 = "/onebox.faas.schedd.v1.Schedd/Wake"
+	Schedd_AdmitInstance_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/AdmitInstance"
+	Schedd_ReportActivity_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/ReportActivity"
+	Schedd_ParkInstance_FullMethodName         = "/onebox.faas.schedd.v1.Schedd/ParkInstance"
+	Schedd_ListInstanceStats_FullMethodName    = "/onebox.faas.schedd.v1.Schedd/ListInstanceStats"
+	Schedd_StreamAppLogs_FullMethodName        = "/onebox.faas.schedd.v1.Schedd/StreamAppLogs"
+	Schedd_StreamWarmHints_FullMethodName      = "/onebox.faas.schedd.v1.Schedd/StreamWarmHints"
+	Schedd_ReportCapacity_FullMethodName       = "/onebox.faas.schedd.v1.Schedd/ReportCapacity"
+	Schedd_ReportLivenessFailed_FullMethodName = "/onebox.faas.schedd.v1.Schedd/ReportLivenessFailed"
 )
 
 // ScheddClient is the client API for Schedd service.
@@ -200,6 +201,28 @@ type ScheddClient interface {
 	// Additive per ADR-016: new RPC + new messages append at the end;
 	// existing field tags are untouched.
 	ReportCapacity(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[CapacityReport, ReportCapacityAck], error)
+	// ReportLivenessFailed (issue #554 / ADR-078) is the vmmd-side
+	// push of a per-instance liveness-probe N-consecutive-failure
+	// (or timeout / conn-refused) detection. vmmd's poll goroutine
+	// dials this RPC whenever the consecutive-failure counter
+	// reaches the per-plan N (default 3); schedd's
+	// Engine.DestroyForLivenessFailure consumes the report,
+	// eagerly marks the deployment's snapshot stale (ADR-005),
+	// resets the idle timer, and parks the parent app after 3
+	// restarts in 300 s. Idempotent on the wire: re-reporting the
+	// same instance id is a no-op on the schedd side because the
+	// state-machine guards against destroying a non-RUNNING
+	// instance.
+	//
+	// Reason is the closed set {timeout, conn_refused, conn_err,
+	// non_200, n_consecutive} — the same closed set the
+	// vmmd_guest_liveness_probe_seconds histogram emits. The
+	// schedd Engine stamps the reason into the audit row's
+	// data JSON.
+	//
+	// Additive per ADR-016: new RPC + new messages append at the
+	// end; existing field tags are untouched.
+	ReportLivenessFailed(ctx context.Context, in *LivenessFailedReport, opts ...grpc.CallOption) (*LivenessFailedAck, error)
 }
 
 type scheddClient struct {
@@ -310,6 +333,16 @@ func (c *scheddClient) ReportCapacity(ctx context.Context, opts ...grpc.CallOpti
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Schedd_ReportCapacityClient = grpc.ClientStreamingClient[CapacityReport, ReportCapacityAck]
+
+func (c *scheddClient) ReportLivenessFailed(ctx context.Context, in *LivenessFailedReport, opts ...grpc.CallOption) (*LivenessFailedAck, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LivenessFailedAck)
+	err := c.cc.Invoke(ctx, Schedd_ReportLivenessFailed_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 // ScheddServer is the server API for Schedd service.
 // All implementations must embed UnimplementedScheddServer
@@ -473,6 +506,28 @@ type ScheddServer interface {
 	// Additive per ADR-016: new RPC + new messages append at the end;
 	// existing field tags are untouched.
 	ReportCapacity(grpc.ClientStreamingServer[CapacityReport, ReportCapacityAck]) error
+	// ReportLivenessFailed (issue #554 / ADR-078) is the vmmd-side
+	// push of a per-instance liveness-probe N-consecutive-failure
+	// (or timeout / conn-refused) detection. vmmd's poll goroutine
+	// dials this RPC whenever the consecutive-failure counter
+	// reaches the per-plan N (default 3); schedd's
+	// Engine.DestroyForLivenessFailure consumes the report,
+	// eagerly marks the deployment's snapshot stale (ADR-005),
+	// resets the idle timer, and parks the parent app after 3
+	// restarts in 300 s. Idempotent on the wire: re-reporting the
+	// same instance id is a no-op on the schedd side because the
+	// state-machine guards against destroying a non-RUNNING
+	// instance.
+	//
+	// Reason is the closed set {timeout, conn_refused, conn_err,
+	// non_200, n_consecutive} — the same closed set the
+	// vmmd_guest_liveness_probe_seconds histogram emits. The
+	// schedd Engine stamps the reason into the audit row's
+	// data JSON.
+	//
+	// Additive per ADR-016: new RPC + new messages append at the
+	// end; existing field tags are untouched.
+	ReportLivenessFailed(context.Context, *LivenessFailedReport) (*LivenessFailedAck, error)
 	mustEmbedUnimplementedScheddServer()
 }
 
@@ -506,6 +561,9 @@ func (UnimplementedScheddServer) StreamWarmHints(*StreamWarmHintsRequest, grpc.S
 }
 func (UnimplementedScheddServer) ReportCapacity(grpc.ClientStreamingServer[CapacityReport, ReportCapacityAck]) error {
 	return status.Error(codes.Unimplemented, "method ReportCapacity not implemented")
+}
+func (UnimplementedScheddServer) ReportLivenessFailed(context.Context, *LivenessFailedReport) (*LivenessFailedAck, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportLivenessFailed not implemented")
 }
 func (UnimplementedScheddServer) mustEmbedUnimplementedScheddServer() {}
 func (UnimplementedScheddServer) testEmbeddedByValue()                {}
@@ -647,6 +705,24 @@ func _Schedd_ReportCapacity_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Schedd_ReportCapacityServer = grpc.ClientStreamingServer[CapacityReport, ReportCapacityAck]
 
+func _Schedd_ReportLivenessFailed_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LivenessFailedReport)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ScheddServer).ReportLivenessFailed(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Schedd_ReportLivenessFailed_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ScheddServer).ReportLivenessFailed(ctx, req.(*LivenessFailedReport))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Schedd_ServiceDesc is the grpc.ServiceDesc for Schedd service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -673,6 +749,10 @@ var Schedd_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListInstanceStats",
 			Handler:    _Schedd_ListInstanceStats_Handler,
+		},
+		{
+			MethodName: "ReportLivenessFailed",
+			Handler:    _Schedd_ReportLivenessFailed_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

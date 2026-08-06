@@ -1,19 +1,14 @@
 -- filename: 00150_reserve_slot.sql
--- Bridge fence at slot 150 — fills the gap between PR #540's
--- 00149_webhook_deliveries / PR #673's 00150_deployment_liveness_probe
--- and PR #671's 00151_wait_until_tail (issue #667 / ADR-078).
+-- Slot 150 — bridge fence for issue #554 / PR #673 after the
+-- rebase onto main (PRs #540 / #671 / #682 consumed slots 149 /
+-- 151 / 152). The liveness-probe migration was renumbered to 154
+-- (see migrations/00154_deployment_liveness_probe.sql); this
+-- fence holds slot 150 until a follow-up PR claims it.
 --
--- Three open PRs (540, 673, 671) all landed on the same chain of
--- adjacent slots at the same time. The cross-PR slot gate
--- (scripts/ci/check_migration_slots.sh) caught 540↔671 at slot 149
--- and 673↔671 at slot 150; PR 671 renumbers to 151. The 149 fence
--- (00149_reserve_slot.sql) holds slot 149 until one of PR 540 or
--- PR 673 lands, and this 150 fence holds slot 150 until PR 673
--- lands. ADR-041 reservation pattern.
---
--- The fence is deleted by whichever PR first lands at slot 150 (PR
--- #673's liveness-probe migration). The 149 fence goes away when PR
--- #540 lands. Either order keeps the chain contiguous.
+-- ADR-041 reservation pattern: the fence body is a no-op
+-- `SELECT 1;` so goose applies it cleanly and writes a row in
+-- goose_db_version. The fence is deleted by whichever PR first
+-- lands at slot 150; do NOT back-fill this fence.
 
 -- +goose Up
 -- +goose StatementBegin

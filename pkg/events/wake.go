@@ -85,6 +85,39 @@ const (
 	// wake_id. Payload: {wake_id, app_id, instance_id, node_id,
 	// reason, at}.
 	WakeStalled = "wake.stalled"
+	// InstanceLivenessFailed — vmmd poll goroutine declared the
+	// VM wedged after N consecutive liveness-probe failures
+	// (issue #554 / ADR-078). The state-machine transition is
+	// RUNNING → STOPPED with reason='liveness_failed'; the
+	// destruction happens on schedd (the only writer to
+	// instances). Payload: {instance_id, app_id, deployment_id,
+	// reason}.
+	//
+	// The closed reason set mirrors the vmmd poll goroutine's
+	// histogram outcome labels:
+	//
+	//   liveness_n_consecutive  — counter reached per-plan N
+	//   liveness_timeout        — guest-init HTTP probe timed out
+	//   liveness_conn_refused   — guest-init's listener not ready
+	//   liveness_conn_err       — wire-shape or syscall error
+	//   liveness_non_200        — probe returned 4xx/5xx
+	InstanceLivenessFailed = "instances.liveness_failed"
+	// InstanceLivenessRestarted — convenience audit row mirroring
+	// the LivenessFailed one with a friendlier kind for the
+	// customer-facing timeline. Emitted by the same code path as
+	// InstanceLivenessFailed but with the explicit "restarted"
+	// wording so the dashboard's "liveness: restart count (5m)"
+	// panel can filter on instances.liveness_restarted without
+	// also picking up the conn_err / timeout noise.
+	InstanceLivenessRestarted = "instances.liveness_restarted"
+	// InstanceParkedLivenessExhausted — the per-deployment
+	// sliding window in pkg/sched/liveness_window.go reached 3
+	// restarts in 300s; Engine.ParkDeployment parked the
+	// deployment with reason='liveness_exhausted'. Mirrors
+	// instances.parked_min_instances_released (issue #557 / ADR-072)
+	// for the floor-release park path. Payload: {app_id, deployment_id,
+	// parked_reason}.
+	InstanceParkedLivenessExhausted = "instances.parked_liveness_exhausted"
 	// WakeBuildSucceeded — builderd finished a build (ADR-030).
 	// Payload: {app_id, deployment_id, image_digest, duration_ms}.
 	WakeBuildSucceeded = "wake.build_succeeded"
@@ -446,6 +479,88 @@ func (e Stalled) Payload() map[string]any {
 		"instance_id": e.InstanceID,
 		"node_id":     e.NodeID,
 		"reason":      e.Reason,
+	}
+}
+
+// LivenessFailed — vmmd poll goroutine declared the VM wedged
+// (issue #554 / ADR-078). The state machine transition is
+// RUNNING → STOPPED with reason='liveness_failed' and the
+// Engine.DestroyForLivenessFailure path is the emitter. The
+// payload is the closed (instance_id, app_id, deployment_id)
+// tuple + the reason classifier so the dashboard's
+// "liveness: failure cause (5m)" panel can group by
+// {timeout, conn_refused, conn_err, non_200, n_consecutive}.
+type LivenessFailed struct {
+	EmitAt       time.Time
+	InstanceID   string
+	AppID        string
+	DeploymentID string
+	Reason       string
+}
+
+func (e LivenessFailed) Kind() string     { return InstanceLivenessFailed }
+func (e LivenessFailed) At() time.Time    { return e.EmitAt }
+func (e LivenessFailed) Subject() *string { return nil }
+func (e LivenessFailed) Payload() map[string]any {
+	return map[string]any{
+		"instance_id":   e.InstanceID,
+		"app_id":        e.AppID,
+		"deployment_id": e.DeploymentID,
+		"reason":        e.Reason,
+	}
+}
+
+// LivenessRestarted — convenience audit row emitted by the
+// DestroyForLivenessFailure path on the same transition. The
+// "restarted" wording is friendlier for the customer-facing
+// timeline; the dash panels can filter on
+// `kind_prefix=instances.liveness_restarted` to surface the
+// explicit "this VM was killed because the liveness probe failed"
+// notice without also picking up the wire-shape noise from
+// LivenessFailed.
+type LivenessRestarted struct {
+	EmitAt       time.Time
+	InstanceID   string
+	AppID        string
+	DeploymentID string
+	Reason       string
+}
+
+func (e LivenessRestarted) Kind() string     { return InstanceLivenessRestarted }
+func (e LivenessRestarted) At() time.Time    { return e.EmitAt }
+func (e LivenessRestarted) Subject() *string { return nil }
+func (e LivenessRestarted) Payload() map[string]any {
+	return map[string]any{
+		"instance_id":   e.InstanceID,
+		"app_id":        e.AppID,
+		"deployment_id": e.DeploymentID,
+		"reason":        e.Reason,
+	}
+}
+
+// ParkedLivenessExhausted — the per-deployment sliding window
+// in pkg/sched/liveness_window.go reached 3 restarts in 300s; the
+// Engine.ParkDeployment path parked the deployment with
+// reason='liveness_exhausted'. Mirrors the
+// MinInstancesReleased shape but emits under the
+// instances.parked_liveness_exhausted kind so the
+// `?kind_prefix=instances.parked_*` filter on
+// GET /v1/audit-events surfaces it.
+type ParkedLivenessExhausted struct {
+	EmitAt       time.Time
+	AppID        string
+	DeploymentID string
+	ParkedReason string
+}
+
+func (e ParkedLivenessExhausted) Kind() string     { return InstanceParkedLivenessExhausted }
+func (e ParkedLivenessExhausted) At() time.Time    { return e.EmitAt }
+func (e ParkedLivenessExhausted) Subject() *string { return nil }
+func (e ParkedLivenessExhausted) Payload() map[string]any {
+	return map[string]any{
+		"app_id":        e.AppID,
+		"deployment_id": e.DeploymentID,
+		"parked_reason": e.ParkedReason,
 	}
 }
 

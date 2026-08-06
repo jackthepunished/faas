@@ -54,6 +54,7 @@ type Loop struct {
 	targets           *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
 	floor             *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
 	recentLoad        *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	livenessWindow    *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
 	reaperAggressive  bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
 	reaperParkCap     int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 }
@@ -271,6 +272,22 @@ func (l *Loop) WithReaperAggressive(enabled bool) *Loop {
 // sudden-scale-down storm.
 func (l *Loop) WithReaperParkCap(cap int) *Loop {
 	l.reaperParkCap = cap
+	return l
+}
+
+// WithLivenessWindow attaches the per-deployment liveness-restart
+// tracker (issue #554 / ADR-078). The Engine calls
+// LivenessWindow.RecordRestart synchronously on every
+// DestroyForLivenessFailure; the trigger here is a no-tick seam —
+// the in-memory ring is its own bookkeeping. The Loop wires the
+// window so cmd/schedd can construct it once and share the same
+// pointer between Engine.WithLivenessWindow and Loop.WithLivenessWindow.
+// Nil opts out (Engine.WithLivenessWindow not called either;
+// DestroyForLivenessFailure skips the ParkDeployment step). Production
+// wires sched.NewLivenessWindow(api.DefaultLivenessWindowSeconds,
+// api.DefaultLivenessMaxRestarts).
+func (l *Loop) WithLivenessWindow(w *LivenessWindow) *Loop {
+	l.livenessWindow = w
 	return l
 }
 
