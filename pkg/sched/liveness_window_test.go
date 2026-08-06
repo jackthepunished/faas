@@ -116,8 +116,8 @@ func TestLivenessWindow_NilSafe(t *testing.T) {
 	if shouldPark || count != 0 {
 		t.Errorf("nil receiver: shouldPark=%v count=%d, want false/0", shouldPark, count)
 	}
-	if n := w.Recent("dep-x", time.Now()); n != 0 {
-		t.Errorf("nil receiver: Recent=%d, want 0", n)
+	if n := w.recent("dep-x", time.Now()); n != 0 {
+		t.Errorf("nil receiver: recent=%d, want 0", n)
 	}
 	w.Forget("dep-x") // must not panic
 }
@@ -158,8 +158,8 @@ func TestLivenessWindow_ConcurrentSafe(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := w.Recent("dep-1", time.Now()); got != 50 {
-		t.Errorf("concurrent RecordRestart: Recent=%d, want 50", got)
+	if got := w.recent("dep-1", time.Now()); got != 50 {
+		t.Errorf("concurrent RecordRestart: recent=%d, want 50", got)
 	}
 }
 

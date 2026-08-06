@@ -4,10 +4,10 @@
 // (issue #554 / ADR-078). These tests pin the AC #2 surface
 // (flaky app does NOT oscillate) directly:
 //
-//   * A 200/200/500/200/200/500 sequence resets the
+//   - A 200/200/500/200/200/500 sequence resets the
 //     consecutive-failure counter on the first 2xx, so the
 //     destroy never fires.
-//   * A back-to-back 500/500/500/500 sequence reaches the
+//   - A back-to-back 500/500/500/500 sequence reaches the
 //     ConsecutiveFailures threshold (3) on the third 500 and
 //     triggers the relay exactly once.
 //
@@ -19,12 +19,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
@@ -108,13 +106,13 @@ func TestLivenessRecv_CounterSurvivesIntermittentSuccess(t *testing.T) {
 		livenessOutcomeOK,
 		livenessOutcomeNon200,
 	}
-	loop.probeFn = func(_ context.Context, _ int) (string, int) {
+	loop.probeFn = func(_ context.Context, _ int) string {
 		if len(outcomes) == 0 {
-			return livenessOutcomeOK, 200
+			return livenessOutcomeOK
 		}
 		out := outcomes[0]
 		outcomes = outcomes[1:]
-		return out, 500
+		return out
 	}
 	for i := 0; i < 6; i++ {
 		loop.runOne(context.Background(), 2000)
@@ -128,8 +126,8 @@ func TestLivenessRecv_CounterSurvivesIntermittentSuccess(t *testing.T) {
 // row of non_200 → relay fires exactly once.
 func TestLivenessRecv_ThreeConsecFires(t *testing.T) {
 	loop, sink, _ := newTestLoop(t, "inst-2", 3)
-	loop.probeFn = func(_ context.Context, _ int) (string, int) {
-		return livenessOutcomeNon200, 500
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
 	}
 	for i := 0; i < 3; i++ {
 		loop.runOne(context.Background(), 2000)
@@ -152,8 +150,8 @@ func TestLivenessRecv_ThreeConsecFires(t *testing.T) {
 // the relay.
 func TestLivenessRecv_TimeoutCountedClassifies(t *testing.T) {
 	loop, sink, _ := newTestLoop(t, "inst-3", 2)
-	loop.probeFn = func(_ context.Context, _ int) (string, int) {
-		return livenessOutcomeTimeout, 0
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeTimeout
 	}
 	loop.runOne(context.Background(), 2000)
 	loop.runOne(context.Background(), 2000)
@@ -168,8 +166,8 @@ func TestLivenessRecv_TimeoutCountedClassifies(t *testing.T) {
 // side protects against noise.
 func TestLivenessRecv_ConnRefusedCounted(t *testing.T) {
 	loop, sink, _ := newTestLoop(t, "inst-4", 2)
-	loop.probeFn = func(_ context.Context, _ int) (string, int) {
-		return livenessOutcomeConnRefused, 0
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeConnRefused
 	}
 	loop.runOne(context.Background(), 2000)
 	loop.runOne(context.Background(), 2000)
@@ -178,12 +176,11 @@ func TestLivenessRecv_ConnRefusedCounted(t *testing.T) {
 	}
 }
 
-// errDiscard is a sentinel used by the WithLivenessSink fallback
-// tests to prove the seam rejects a nil relay. Tests that
-// exercise this path will fail because the manager's helper
-// should never accept nil.
-var errDiscard = errors.New("discarded: not used")
+// errDiscard removed (F9): the WithLivenessSink path lives in
+// pkg/fcvm and is exercised by the manager_test there; this
+// file no longer needs a sentinel.
 
-// keep time.Time referenced so the test compiles even if the
-// production struct grows new fields.
-var _ = time.Time{}
+// keep-time removed (F9): the test no longer references time.Time
+// directly (the runOne signature is just (ctx, timeoutMs)); the
+// liveness-window test at pkg/sched/liveness_window_test.go
+// owns the time-driven paths.

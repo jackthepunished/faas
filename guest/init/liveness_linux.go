@@ -31,10 +31,11 @@
 //     doesn't frame-collide with the next probe on a hot VM.
 //
 // Reuse: the runner's `:8080` health endpoint is the canonical liveness
-// target. Issue #554 §4 explicitly chose ":" this to avoid a runner
-// shim change — the runners already bind :8080 and register /healthz
-// ahead of the user's HTTP handler so the probe targets the runtime
-// surface, not the customer's app.
+// target. Issue #554 §4 explicitly chose the runner's existing
+// `:8080/healthz` endpoint to avoid a runner shim change — the runners
+// already bind :8080 and register /healthz ahead of the user's HTTP
+// handler so the probe targets the runtime surface, not the customer's
+// app.
 package main
 
 import (
@@ -62,10 +63,16 @@ const (
 	// cmd/vmmd/liveness_recv.go and the spec §6.4 ADR-078 table.
 	VsockLivenessPort = 1028
 	// VsockLivenessMsgProbe is the wire-format discriminator the
-	// guest accepts on inbound connections. 10 = probe (chosen
-	// outside the FRAMEWORK_READY_LIVENESS_PROBE range to avoid
-	// collision with the existing characterization
-	// vmm.go::VsockCharacterizationMsgReport envelope).
+	// guest accepts on inbound connections. 10 = probe.
+	//
+	// No collision risk with the existing framework-ready envelope
+	// (VsockFrameworkReadyPort = 1027 DGRAM, single-byte
+	// discriminator 0x01/0x02/0x03) — the two envelopes live on
+	// different ports (1028 STREAM vs 1027 DGRAM) AND use different
+	// framings (length-prefixed big-endian vs single-byte). The
+	// probe discriminator is also distinct from the resume-hook
+	// envelope discriminator (vmm.go::VsockCharacterizationMsgReport)
+	// which is on a separate port and uses a JSON body.
 	VsockLivenessMsgProbe uint32 = 10
 	// VsockLivenessMsgAck is the wire-format discriminator the
 	// guest writes back on the response. 11 = ack.

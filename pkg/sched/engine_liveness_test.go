@@ -142,7 +142,7 @@ func TestLiveness_NilReceiverSafe(t *testing.T) {
 // LivenessWindow + a real memstore UpdateApp call.
 func TestLiveness_3In5MinParksDeployment(t *testing.T) {
 	store := state.NewMemStore()
-	acct, app, dep := seedApp(t, store, api.PlanPro, 512, 5)
+	_, app, dep := seedApp(t, store, api.PlanPro, 512, 5)
 	vmm := &fakeVMM{}
 	ops := wire.NewOpsMetrics("schedd")
 	window := NewLivenessWindow(5*time.Minute, 3)
@@ -165,8 +165,6 @@ func TestLiveness_3In5MinParksDeployment(t *testing.T) {
 	if string(final.Status) != "evicted_cold" {
 		t.Errorf("app.Status = %q, want %q (AC #3: park after 3 restarts in window)", final.Status, "evicted_cold")
 	}
-	// acct reference kept to ensure the test reads it as expected.
-	_ = acct
 }
 
 // TestLiveness_RaceIgnoresAlreadyParked pins that two
@@ -207,8 +205,8 @@ func TestLiveness_RaceIgnoresAlreadyParked(t *testing.T) {
 		t.Errorf("counter incremented %v times on parallel destroy, want <= 1", got)
 	}
 	// The window ring has exactly one entry.
-	if recent := window.Recent(dep.ID, time.Now()); recent > 1 {
-		t.Errorf("window.Recent = %d, want <= 1", recent)
+	if recent := window.recent(dep.ID, time.Now()); recent > 1 {
+		t.Errorf("window.recent = %d, want <= 1", recent)
 	}
 }
 

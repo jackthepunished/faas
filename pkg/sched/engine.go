@@ -3803,7 +3803,7 @@ func (e *Engine) ParkDeployment(ctx context.Context, deploymentID, reason string
 		"deployment":    deploymentID,
 		"reason":        reason,
 		"now":           time.Now().UTC().Format(time.RFC3339Nano),
-		"window_recent": e.livenessWindow.Recent(deploymentID, time.Now()),
+		"window_recent": e.livenessWindow.recent(deploymentID, time.Now()),
 	})
 	if err != nil {
 		e.log.Warn("liveness: marshal parked audit", "err", err)

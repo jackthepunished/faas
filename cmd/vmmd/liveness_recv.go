@@ -35,7 +35,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -67,36 +66,20 @@ type livenessResponseBody struct {
 // poll goroutine tracks in the vmmd_guest_liveness_probe_seconds
 // histogram. Each value is the Prometheus label suffix.
 const (
-	livenessOutcomeOK         = "ok"
-	livenessOutcomeNon200     = "non_200"
-	livenessOutcomeTimeout    = "timeout"
+	livenessOutcomeOK          = "ok"
+	livenessOutcomeNon200      = "non_200"
+	livenessOutcomeTimeout     = "timeout"
 	livenessOutcomeConnRefused = "conn_refused"
-	livenessOutcomeConnErr    = "conn_err"
+	livenessOutcomeConnErr     = "conn_err"
 )
 
-// livenessProbeConfig is the per-instance configuration the
-// schedd-side produces (issue #554 / ADR-078). Path is the runner's
-// HTTP path (must start with "/"); Period / ConsecutiveFailures /
-// CooldownSeconds are the per-deployment overrides that fall back
-// to the per-plan defaults (Hobby/Pro/Scale → 5s / 3 / 60s).
-//
-// The schedd resolver reads the deployment row's
-// `override_liveness_probe` JSONB and merges with the parent app's
-// plan defaults before producing this struct. cmd/vmmd wires the
-// resolved struct via WithLivenessProbes at manager construction.
-type livenessProbeConfig struct {
-	Path                string
-	PeriodSeconds       int
-	ConsecutiveFailures int
-	CooldownSeconds     int
-	// IdleResetOnDestroy is the user-confirmed choice (issue #554
-	// §Implementation notes): the per-instance idle timer should
-	// reset on liveness-destroy so the reaper grace restarts on
-	// the cold-boot instance, not on the wedged one. Surfaced as
-	// a boolean here so the schedd side can encode the policy
-	// without us hard-coding it on the vmmd side.
-	IdleResetOnDestroy bool
-}
+// livenessProbeConfig aliases the pkg/fcvm.LivenessProbeConfig struct
+// (issue #554 / ADR-078). The cmd-side per-instance loop reads the
+// same fields the Manager already populates from the per-deployment
+// override + per-plan defaults merge. Type alias keeps existing
+// references (livenessProbeLoop.cfg, run() cfg.PeriodSeconds, etc.)
+// unchanged.
+type livenessProbeConfig = fcvm.LivenessProbeConfig
 
 // livenessProbeLoop is the per-instance poll goroutine. The
 // Manager owns a map[*livenessProbeLoop]cancelFunc so a Park /
@@ -109,14 +92,14 @@ type livenessProbeLoop struct {
 	mgr       *fcvm.Manager
 	log       *slog.Logger
 	cancel    context.CancelFunc
-	count     int  // current consecutive-failure count
+	count     int // current consecutive-failure count
 	lastReset time.Time
 	// probeFn is the test seam: production code uses dialAndProbe
 	// (real AF_VSOCK), tests inject a stub that returns the
 	// closed-set outcome string ("ok", "non_200", "timeout",
 	// "conn_refused", "conn_err"). Default = nil → runOne uses
 	// the real dialAndProbe.
-	probeFn func(ctx context.Context, timeoutMs int) (string, int)
+	probeFn func(ctx context.Context, timeoutMs int) string
 }
 
 // runLivenessProbeLoop is the entry point. Blocks until ctx is
@@ -158,18 +141,17 @@ func (l *livenessProbeLoop) run(ctx context.Context) {
 	}
 }
 
-// runOne executes one probe. The 4-class outcome is folded into the
+// runOne executes one probe. The closed-set outcome is folded into the
 // consecutive-failure counter + the vmmd_guest_liveness_probe_seconds
 // histogram. The 5s deadline is tighter than the period so a stuck
 // probe doesn't compound (the next tick is honoured regardless).
 func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 	start := time.Now()
 	var outcome string
-	var status int
 	if l.probeFn != nil {
-		outcome, status = l.probeFn(ctx, timeoutMs)
+		outcome = l.probeFn(ctx, timeoutMs)
 	} else {
-		outcome, status = l.dialAndProbe(ctx, timeoutMs)
+		outcome = l.dialAndProbe(ctx, timeoutMs)
 	}
 	elapsed := time.Since(start).Seconds()
 	l.mgr.ObserveLivenessProbe(outcome, elapsed)
@@ -190,16 +172,7 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 			// Mirror the reason the run-time classifies
 			// into the relay so the schedd side audit
 			// event names the cluster correctly.
-			reason := "liveness_n_consecutive"
-			if outcome == livenessOutcomeTimeout {
-				reason = "liveness_timeout"
-			} else if outcome == livenessOutcomeConnRefused {
-				reason = "liveness_conn_refused"
-			} else if outcome == livenessOutcomeConnErr {
-				reason = "liveness_conn_err"
-			} else if outcome == livenessOutcomeNon200 {
-				reason = "liveness_non_200"
-			}
+			reason := classifyLivenessOutcome(outcome)
 			l.mgr.ReportLivenessFailed(ctx, l.instance, reason)
 			// Exit the loop — schedd's Engine.DestroyForLivenessFailure
 			// will Park / destroy the instance, and the
@@ -208,7 +181,26 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 			return
 		}
 	}
-	_ = status
+}
+
+// classifyLivenessOutcome maps a closed-set probe outcome into
+// the matching wire reason. Extracted from runOne so the
+// switch is the single source of truth (a new outcome class
+// adds one case + one livenessOutcomeXxx const, no risk of
+// the chained-if refactor pattern dropping a branch).
+func classifyLivenessOutcome(outcome string) string {
+	switch outcome {
+	case livenessOutcomeTimeout:
+		return "liveness_timeout"
+	case livenessOutcomeConnRefused:
+		return "liveness_conn_refused"
+	case livenessOutcomeConnErr:
+		return "liveness_conn_err"
+	case livenessOutcomeNon200:
+		return "liveness_non_200"
+	default:
+		return "liveness_n_consecutive"
+	}
 }
 
 // livenessProbeDialTimeout is the absolute cap on the dial+read.
@@ -217,12 +209,13 @@ const livenessProbeDialTimeout = 5 * time.Second
 
 // dialAndProbe opens an AF_VSOCK STREAM connection to the per-VM
 // CID on VsockLivenessHostPort, ships the probe body, and returns
-// the (outcome, status) pair. The classification mirrors the four
-// classes the guest-init reports — see guest/init/liveness_linux.go.
-func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) (string, int) {
+// the closed-set outcome string. The classification mirrors the
+// four classes the guest-init reports — see
+// guest/init/liveness_linux.go.
+func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) string {
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	defer func() { _ = unix.Close(fd) }()
 	dialCtx, cancel := context.WithTimeout(ctx, livenessProbeDialTimeout)
@@ -239,9 +232,9 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) (st
 	}()
 	select {
 	case <-ctx.Done():
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	case <-dialCtx.Done():
-		return livenessOutcomeConnRefused, 0
+		return livenessOutcomeConnRefused
 	case err := <-connectDone:
 		if err != nil {
 			// ECONNREFUSED is the expected signal when the
@@ -250,7 +243,7 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) (st
 			// increments — the CooldownSeconds gate in the
 			// schedd-side window protects against a cold
 			// boot noise signature.
-			return livenessOutcomeConnRefused, 0
+			return livenessOutcomeConnRefused
 		}
 	}
 	body, err := json.Marshal(livenessRequestBody{
@@ -258,16 +251,16 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) (st
 		TimeoutMs: timeoutMs,
 	})
 	if err != nil {
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	var hdr [8]byte
 	binary.BigEndian.PutUint32(hdr[:4], 10) // guest.VsockLivenessMsgProbe
 	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(body)))
 	if err := writeAll(fd, hdr[:]); err != nil {
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	if err := writeAll(fd, body); err != nil {
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	// Read the response envelope. Deadline is the same
 	// livenessProbeDialTimeout cap; we use a deadline-tracked
@@ -276,45 +269,45 @@ func (l *livenessProbeLoop) dialAndProbe(ctx context.Context, timeoutMs int) (st
 	// timeout surface.
 	var respHdr [8]byte
 	if err := readAll(fd, respHdr[:], livenessProbeDialTimeout); err != nil {
-		return livenessOutcomeTimeout, 0
+		return livenessOutcomeTimeout
 	}
 	mt := binary.BigEndian.Uint32(respHdr[:4])
 	if mt != 11 {
 		// guest.VsockLivenessMsgAck — wire-shape regression
 		// if it doesn't match.
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	bodyLen := binary.BigEndian.Uint32(respHdr[4:8])
 	if bodyLen == 0 || bodyLen > 4096 {
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	respBody := make([]byte, bodyLen)
 	if err := readAll(fd, respBody, livenessProbeDialTimeout); err != nil {
-		return livenessOutcomeTimeout, 0
+		return livenessOutcomeTimeout
 	}
 	var resp livenessResponseBody
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return livenessOutcomeConnErr, 0
+		return livenessOutcomeConnErr
 	}
 	if resp.Err != "" {
 		// The guest-init itself classified the failure —
-		// fold the wire-side reason into the 4-class outcome
-		// so the histogram stays the source of truth.
+		// fold the wire-side reason into the closed-set
+		// outcome so the histogram stays the source of truth.
 		switch resp.Err {
 		case "timeout":
-			return livenessOutcomeTimeout, resp.Status
+			return livenessOutcomeTimeout
 		case "conn_refused":
-			return livenessOutcomeConnRefused, resp.Status
+			return livenessOutcomeConnRefused
 		case "runner_not_ready":
-			return livenessOutcomeConnRefused, resp.Status
+			return livenessOutcomeConnRefused
 		default:
-			return livenessOutcomeConnErr, resp.Status
+			return livenessOutcomeConnErr
 		}
 	}
 	if resp.Status >= 200 && resp.Status < 300 {
-		return livenessOutcomeOK, resp.Status
+		return livenessOutcomeOK
 	}
-	return livenessOutcomeNon200, resp.Status
+	return livenessOutcomeNon200
 }
 
 // writeAll is the unix-style write-loop helper. Mirrors the
@@ -341,88 +334,75 @@ func writeAll(fd int, b []byte) error {
 }
 
 // readAll is the unix-style read-loop helper. The deadline is
-// wall-clock; we honour ctx cancellation in addition so a
-// parent-ctx cancel pre-empts the deadline.
-func readAll(fd int, b []byte, deadline time.Duration) error {
-	ch := make(chan error, 1)
-	go func() {
-		for len(b) > 0 {
-			n, err := unix.Read(fd, b)
-			if n > 0 {
-				b = b[n:]
-			}
-			if err != nil {
-				if err == unix.EINTR {
-					continue
-				}
-				ch <- err
-				return
-			}
-			if n == 0 {
-				ch <- fmt.Errorf("vsock read: 0 bytes (EOF)")
-				return
-			}
-		}
-		ch <- nil
-	}()
-	select {
-	case err := <-ch:
-		return err
-	case <-time.After(deadline):
-		return fmt.Errorf("vsock read deadline %s", deadline)
-	}
-}
-
-// livenessRegistry maps an instance id to the cancelFunc that
-// stops its probe loop. The Manager owns one of these per daemon
-// (lifetime = vmmd process). The Park path cancels the entry so
-// the loop exits on the next ctx.Done — within one tick, not at
-// the next probe.
+// enforced via SO_RCVTIMEO (setsockopt) so the kernel returns
+// EAGAIN on its own without a watcher goroutine. We honour
+// ctx cancellation on the EINTR path so a parent-ctx cancel
+// pre-empts the deadline.
 //
-// goroutine-safe: the Park path can call cancel() while the
-// runOne is blocked in dialAndProbe; the loop's ctx.Done
-// plumbs the cancellation through.
-type livenessRegistry struct {
-	mu      sync.Mutex
-	loops   map[string]context.CancelFunc
+// Mirrors the guest-init's setSockTimeout helper at
+// guest/init/characterize_linux.go:572 — the AF_VSOCK stack has
+// no Go-side deadline primitive, so we go through the kernel.
+// A setsockopt failure is tolerated (the helper is best-effort);
+// on failure the read becomes unbounded and the caller
+// (dialAndProbe) leans on its outer deadline.
+func readAll(fd int, b []byte, deadline time.Duration) error {
+	tv := unix.Timeval{
+		Sec:  int64(deadline / time.Second),
+		Usec: int64(deadline%time.Second) / 1000,
+	}
+	_ = unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
+	for len(b) > 0 {
+		n, err := unix.Read(fd, b)
+		if n > 0 {
+			b = b[n:]
+		}
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			// EAGAIN/EWOULDBLOCK = the SO_RCVTIMEO deadline
+			// fired without a frame arriving. Surface as a
+			// wrapped timeout so the caller can fold it into
+			// the liveness_timeout outcome.
+			if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+				return fmt.Errorf("vsock read deadline %s", deadline)
+			}
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("vsock read: 0 bytes (EOF)")
+		}
+	}
+	return nil
 }
 
-// newLivenessRegistry constructs an empty registry.
-func newLivenessRegistry() *livenessRegistry {
-	return &livenessRegistry{loops: make(map[string]context.CancelFunc)}
-}
-
-// startLivenessLoop spins up a new probe loop for the instance.
-// The context is the parent vmmd ctx; the loop inherits it via
-// WithCancel so the cmd-level shutdown kills the loop in addition
-// to the per-instance Park.
-func (r *livenessRegistry) start(ctx context.Context, parent context.Context, loop *livenessProbeLoop) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, exists := r.loops[loop.instance]; exists {
-		// Defensive: a re-registration for the same
-		// instance (e.g. a BringUp racing a Park) cancels
-		// the prior loop. The schedd side guarantees the
-		// instance id is unique per live tile.
-		r.loops[loop.instance]()
+// startLivenessLoopHelper is the cmd-level goroutine launcher
+// (issue #554 / ADR-078 / PR review fix). Builds the per-instance
+// livenessProbeLoop, spawns its run goroutine, and returns the
+// cancel func the Manager registers with the livenessRegistry
+// (pkg/fcvm.LivenessRegistry). Called from Manager.startLivenessLoop
+// via the LivenessProbeStarter closure the cmd/vmmd main loop wires
+// via WithLivenessProbeStarter.
+//
+// The helper holds the parent vmmd ctx + the *fcvm.Manager (the
+// metrics + sink access surface). The loop's child context is
+// derived from the parent so a Park cancel or a vmmd shutdown
+// drains the loop within one tick.
+//
+// Mirrors the production-only start() helper that lived inline in
+// livenessRegistry prior to the PR-review refactor that moved the
+// registry into pkg/fcvm.
+func startLivenessLoopHelper(parent context.Context, mgr *fcvm.Manager, log *slog.Logger, instance string, slot int, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
+	loop := &livenessProbeLoop{
+		instance: instance,
+		cfg:      cfg,
+		cid:      fcvm.GuestVsockCID(slot),
+		mgr:      mgr,
+		log:      log,
 	}
 	loopCtx, cancel := context.WithCancel(parent)
-	loop.cancel = cancel
-	r.loops[loop.instance] = cancel
 	go func() {
 		loop.run(loopCtx)
-		r.mu.Lock()
-		delete(r.loops, loop.instance)
-		r.mu.Unlock()
 	}()
-}
-
-// cancelLoop stops the loop for the instance. Idempotent.
-func (r *livenessRegistry) cancelLoop(instance string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cancel, ok := r.loops[instance]; ok {
-		cancel()
-		delete(r.loops, instance)
-	}
+	return cancel
 }

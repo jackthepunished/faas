@@ -97,11 +97,13 @@ func (w *LivenessWindow) Forget(deploymentID string) {
 	delete(w.restarts, deploymentID)
 }
 
-// Recent returns the recent restart count for `deploymentID`.
-// Test-only seam so pkg/sched/engine_liveness_test.go can assert
-// the ring without poking at private state. NOT used in
-// production.
-func (w *LivenessWindow) Recent(deploymentID string, now time.Time) int {
+// recent returns the recent restart count for `deploymentID`.
+// Test-only seam (F11: unexported) so pkg/sched/engine_liveness_test.go
+// can assert the ring without poking at private state. NOT
+// used in production; production callers should use the
+// Engine-level helpers (e.g. Engine.DestroyForLivenessFailure)
+// which read the count internally.
+func (w *LivenessWindow) recent(deploymentID string, now time.Time) int {
 	if w == nil || w.window <= 0 {
 		return 0
 	}

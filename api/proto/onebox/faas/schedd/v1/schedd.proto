@@ -183,6 +183,48 @@ service Schedd {
   // Additive per ADR-016: new RPC + new messages append at the end;
   // existing field tags are untouched.
   rpc ReportCapacity(stream CapacityReport) returns (ReportCapacityAck);
+
+  // ReportLivenessFailed (issue #554 / ADR-078) is the vmmd-side
+  // push of a per-instance liveness-probe N-consecutive-failure
+  // (or timeout / conn-refused) detection. vmmd's poll goroutine
+  // dials this RPC whenever the consecutive-failure counter
+  // reaches the per-plan N (default 3); schedd's
+  // Engine.DestroyForLivenessFailure consumes the report,
+  // eagerly marks the deployment's snapshot stale (ADR-005),
+  // resets the idle timer, and parks the parent app after 3
+  // restarts in 300 s. Idempotent on the wire: re-reporting the
+  // same instance id is a no-op on the schedd side because the
+  // state-machine guards against destroying a non-RUNNING
+  // instance.
+  //
+  // Reason is the closed set {timeout, conn_refused, conn_err,
+  // non_200, n_consecutive} — the same closed set the
+  // vmmd_guest_liveness_probe_seconds histogram emits. The
+  // schedd Engine stamps the reason into the audit row's
+  // data JSON.
+  //
+  // Additive per ADR-016: new RPC + new messages append at the
+  // end; existing field tags are untouched.
+  rpc ReportLivenessFailed(LivenessFailedReport) returns (LivenessFailedAck);
+}
+
+message LivenessFailedReport {
+  // instance_id is the live Instance id vmmd observed the
+  // liveness probe failures on. The schedd engine resolves the
+  // parent app + deployment id before destroying.
+  string instance_id = 1;
+  // reason is the closed-set classifier from the vmmd poll
+  // goroutine: timeout / conn_refused / conn_err / non_200 /
+  // n_consecutive. Lands in the audit row's data JSON.
+  string reason = 2;
+}
+
+message LivenessFailedAck {
+  // ok is true when the schedd engine accepted the report (a
+  // non-RUNNING instance is also "ok" — the state-machine
+  // guard makes the destroy a no-op rather than an error so
+  // a re-report doesn't trip the gRPC error path).
+  bool ok = 1;
 }
 
 message WakeRequest {

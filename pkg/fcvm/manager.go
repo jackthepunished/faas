@@ -436,13 +436,43 @@ type Manager struct {
 	// function the vmmd cmd wires via WithLivenessSink. The
 	// poll goroutine calls it whenever the consecutive-failure
 	// counter reaches the per-plan N (default 3). The relay is
-	// how the vmmd side PLUMBS the failure to schedd's
+	// how vmmd plumbs the failure to schedd's
 	// Engine.DestroyForLivenessFailure — schedd is the only
 	// writer to instances (spec §6), so the destroy path
 	// MUST live on the schedd side. nil-safe: the poll
 	// goroutine guards on nil so a missing wire (a unit
 	// test that doesn't construct a relay) is a no-op.
+	//
+	// The relay is invoked from a per-instance poll goroutine
+	// whose lifecycle is owned by livenessRegistry (see below)
+	// and started by Manager.bringUp / cancelled by Manager.Park
+	// — same shape as the framework_ready DGRAM listener.
 	livenessRelay LivenessFailedSink
+	// livenessRegistry (issue #554 / ADR-078 / PR review fix)
+	// is the per-instance poll goroutine registry the cmd/vmmd
+	// main loop wires via WithLivenessProbes. The Manager owns
+	// the lifecycle (start on BringUp success, cancel on Park
+	// or Destroy) so the per-VM goroutine count tracks the live
+	// instance count. nil-safe: a Manager constructed without
+	// the registry (a unit test, or a default-local vmmd run)
+	// skips the start/cancel calls entirely.
+	livenessRegistry *LivenessRegistry
+	// livenessDefaultCfg is the per-plan Hobby/Pro/Scale default
+	// (api.Plan.LivenessPeriodSeconds / LivenessConsecutiveFailures /
+	// LivenessCooldownSeconds) the cmd/vmmd main loop resolves at
+	// construction and hands to WithLivenessProbes. Consumed by
+	// startLivenessLoop as the fallback when the WakeRequest omits
+	// a per-deployment override.
+	livenessDefaultCfg LivenessProbeConfig
+	// livenessStarter is the cmd-level helper the cmd/vmmd main
+	// loop attaches via WithLivenessProbeStarter. Builds the
+	// per-instance goroutine (vsock dial + JSON envelope) and
+	// returns its cancel func; the Manager calls it from
+	// startLivenessLoop and registers the cancel via
+	// livenessRegistry. nil = loop body not wired (cmd default-
+	// local vmmd run, or a unit test); startLivenessLoop logs
+	// Warn and returns.
+	livenessStarter LivenessProbeStarter
 	// hostIdentities is the slice of X25519 secret keys used to
 	// unseal per-app sealed env blobs at wake time (spec §11/G2).
 	// Holds the current identity alone in the normal pre-rotation
@@ -741,6 +771,32 @@ func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
 // audit event's data JSON.
 type LivenessFailedSink func(ctx context.Context, instanceID, reason string)
 
+// LivenessProbeStarter (issue #554 / ADR-078) is the cmd-level
+// goroutine-launcher the cmd/vmmd main loop attaches via
+// WithLivenessProbeStarter. Manager.startLivenessLoop calls it with
+// the resolved per-instance config + vsock CID; the starter builds
+// the loop body (vsock dial, JSON envelope, classification) and
+// returns the cancel func the Manager registers with the
+// livenessRegistry. A nil return is treated as "loop not started"
+// so a unit test that doesn't wire the starter is a no-op rather
+// than a panic.
+//
+// The signature takes the parent ctx (cmd vmmd lifecycle), the
+// instance id, the lease slot for the per-VM vsock CID, and the
+// resolved cfg. Returns the cancel func (or nil).
+type LivenessProbeStarter func(ctx context.Context, instance string, slot int, cfg LivenessProbeConfig) context.CancelFunc
+
+// WithLivenessProbeStarter attaches the cmd-level loop launcher
+// (issue #554 / ADR-078). Same nil-safe + chaining pattern as the
+// other Manager wire options. cmd/vmmd main wires the closure
+// that builds the liveness_recv.livenessProbeLoop and spawns its
+// run goroutine; Manager.startLivenessLoop calls the closure and
+// registers the returned cancel func with the livenessRegistry.
+func (m *Manager) WithLivenessProbeStarter(starter LivenessProbeStarter) *Manager {
+	m.livenessStarter = starter
+	return m
+}
+
 // WithLivenessMetrics attaches the Prometheus collector pair
 // (issue #554 / ADR-078). Same nil-safe + chaining pattern as
 // WithFrameworkReady: optional, no-ops when the cmd binary doesn't
@@ -793,6 +849,202 @@ func (m *Manager) ReportLivenessFailed(ctx context.Context, instanceID, reason s
 		return
 	}
 	m.livenessRelay(ctx, instanceID, reason)
+}
+
+// LivenessProbeConfig is the per-instance configuration the schedd-side
+// resolves from the deployment row's `override_liveness_probe` JSONB
+// (cmd/apid/handlers_sidecars.go) merged with the parent app's plan
+// defaults (issue #554 / ADR-078). The cmd/vmmd main loop constructs
+// a copy of this struct per Wake and hands it to the LivenessRegistry
+// alongside the per-VM CID + instance id.
+//
+// PeriodSeconds == 0 disables the probe for that instance (Free plan,
+// or a per-deployment override that explicitly turns it off). The
+// cmd/vmmd liveness_recv.run entry point short-circuits on
+// cfg.PeriodSeconds <= 0.
+//
+// IdleResetOnDestroy is the user-confirmed choice (issue #554
+// §Implementation notes): schedd's Engine.DestroyForLivenessFailure
+// resets the per-instance idle timer on the destroyed row, so the
+// reaper grace restarts on the cold-boot instance, not the wedged one.
+// Surfaced as a boolean here so the schedd side encodes the policy
+// without vmmd hard-coding it.
+type LivenessProbeConfig struct {
+	Path                string
+	PeriodSeconds       int
+	ConsecutiveFailures int
+	CooldownSeconds     int
+	IdleResetOnDestroy  bool
+}
+
+// LivenessRegistry owns the per-instance liveness-probe poll
+// goroutines (issue #554 / ADR-078). One loop per instance, keyed
+// by instance id; the Manager's bringUp / Park call sites own
+// the lifecycle (start on Wake success, cancel on Park or Destroy).
+// The registry itself is data-only — the cmd/vmmd main loop
+// constructs one and passes it to Manager.WithLivenessProbes.
+//
+// The registry's design mirrors pkg/fcvm.cidToID's per-instance
+// reverse index for the framework_ready DGRAM receipt path: the
+// data structure is in pkg/fcvm because it's referenced from
+// Manager methods, but the goroutine bodies live in cmd/vmmd
+// because they bind cmd-level concerns (vsock dial, JSON wire
+// envelope, metrics access via the Manager).
+//
+// goroutine-safe: mu guards the loops map. cancelLoop is idempotent
+// — repeated calls on the same instance id are a no-op so a Park
+// racing a Destroy can't panic.
+type LivenessRegistry struct {
+	mu    sync.Mutex
+	loops map[string]context.CancelFunc
+}
+
+// NewLivenessRegistry constructs an empty registry. cmd/vmmd main
+// calls this once at startup; tests can construct one ad-hoc.
+func NewLivenessRegistry() *LivenessRegistry {
+	return &LivenessRegistry{loops: make(map[string]context.CancelFunc)}
+}
+
+// StartProbeLoop registers cancelFn for instance and returns. The
+// cmd/vmmd liveness_recv.start helper calls this to record the
+// cancel func the per-instance loop reads on shutdown. Returning the
+// cancel func from StartProbeLoop keeps the registry as the single
+// source of truth for the cancel path; the cmd helper builds the
+// loop goroutine outside the registry.
+//
+// Defensive: a re-registration for the same instance (e.g. a BringUp
+// racing a Park) cancels the prior loop before installing the new
+// one. Schedd guarantees the instance id is unique per live tile, so
+// the only way to see a duplicate is a wire race; cancelling the prior
+// loop is the safe choice.
+func (r *LivenessRegistry) StartProbeLoop(instance string, cancelFn context.CancelFunc) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if prev, ok := r.loops[instance]; ok {
+		prev()
+	}
+	r.loops[instance] = cancelFn
+}
+
+// CancelProbeLoop stops the loop for the instance. Idempotent.
+// Manager.Park calls this right after DeleteLivenessConsecutiveFailures
+// so the gauge deletion and the goroutine cancel happen in the same
+// critical section.
+func (r *LivenessRegistry) CancelProbeLoop(instance string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cancel, ok := r.loops[instance]; ok {
+		cancel()
+		delete(r.loops, instance)
+	}
+}
+
+// WithLivenessProbes attaches the per-instance poll goroutine
+// registry (issue #554 / ADR-078 / PR review fix). cmd/vmmd main
+// calls this at Manager construction:
+//
+//	mgr.WithLivenessProbes(fcvm.NewLivenessRegistry(), defaultCfg)
+//
+// where defaultCfg is the per-plan Hobby/Pro/Scale default merged
+// into a per-deployment override by Manager.startLivenessLoop. nil
+// opts out (Manager constructed without a registry skips the
+// per-instance start/cancel calls; the cmd default-local vmmd that
+// doesn't wire the registry stays a no-op for AC #1 purposes).
+//
+// The defaultCfg argument is consumed by startLivenessLoop as the
+// fallback when the WakeRequest omits LivenessProbe (the legacy /
+// pre-PR-D deployments). cmd/vmmd resolves the actual Hobby/Pro/Scale
+// defaults via api.Plan.LivenessPeriodSeconds() /
+// LivenessConsecutiveFailures() at construction time so the Manager
+// is plan-tier-agnostic.
+//
+// Returns the *Manager so callers can chain.
+func (m *Manager) WithLivenessProbes(reg *LivenessRegistry, defaultCfg LivenessProbeConfig) *Manager {
+	m.livenessRegistry = reg
+	m.livenessDefaultCfg = defaultCfg
+	return m
+}
+
+// startLivenessLoop launches the per-instance probe goroutine after
+// a successful Wake (issue #554 / ADR-078). Called from the Wake
+// success path with the live Instance's lease slot (for the vsock
+// CID). No-op when:
+//   - m.livenessRegistry is nil (unit tests, default-local vmmd)
+//   - the resolved cfg.PeriodSeconds <= 0 (Free plan, or
+//     override=off)
+//
+// The cmd/vmmd liveness_recv.start helper builds the loop body and
+// invokes r.StartProbeLoop to register the cancel func. We don't
+// construct the loop here because the loop body binds cmd-level
+// types (slog, vsock, wire envelope).
+func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot int, override json.RawMessage) {
+	if m.livenessRegistry == nil {
+		return
+	}
+	cfg := m.livenessDefaultCfg
+	// Per-deployment override (api.DeploymentLivenessProbe) merges
+	// over the plan defaults. Same fail-soft shape as
+	// healthcheckPathFromDep (engine.go:3360): a malformed override
+	// is logged Warn and the loop proceeds with the plan defaults
+	// — the apid validator already enforced the shape at INSERT
+	// time, so a tampered column would need a direct DB write
+	// behind the spec's role separation.
+	if len(override) > 0 {
+		var ov api.DeploymentLivenessProbe
+		if err := json.Unmarshal(override, &ov); err != nil {
+			m.log.Warn("liveness: malformed override, using plan defaults",
+				"instance", instance, "err", err)
+		} else {
+			if ov.Path != "" {
+				cfg.Path = ov.Path
+			}
+			if ov.IntervalS > 0 {
+				cfg.PeriodSeconds = ov.IntervalS
+			}
+			if ov.ConsecutiveFailures > 0 {
+				cfg.ConsecutiveFailures = ov.ConsecutiveFailures
+			}
+		}
+	}
+	if cfg.PeriodSeconds <= 0 {
+		return
+	}
+	m.log.Debug("liveness: starting probe loop",
+		"instance", instance, "slot", slot,
+		"period_s", cfg.PeriodSeconds,
+		"consecutive", cfg.ConsecutiveFailures)
+	// The actual goroutine spawn + vsock dial logic lives in
+	// cmd/vmmd/liveness_recv.go (cmd-level binding). We hand the
+	// cmd helper a closure that knows how to launch the loop and
+	// return its cancel func; the cmd wires that helper via
+	// WithLivenessProbeStarter.
+	if m.livenessStarter == nil {
+		m.log.Warn("liveness: registry wired but no starter; loop will not run",
+			"instance", instance)
+		return
+	}
+	cancelFn := m.livenessStarter(ctx, instance, slot, cfg)
+	if cancelFn != nil {
+		m.livenessRegistry.StartProbeLoop(instance, cancelFn)
+	}
+}
+
+// cancelLivenessLoop is the Park / Destroy teardown call (issue
+// #554 / ADR-078). Manager.Park calls this right after
+// DeleteLivenessConsecutiveFailures so the gauge deletion and the
+// goroutine cancel happen in lock-step. No-op when the registry is
+// nil (a Manager constructed without WithLivenessProbes).
+func (m *Manager) cancelLivenessLoop(instance string) {
+	if m.livenessRegistry == nil {
+		return
+	}
+	m.livenessRegistry.CancelProbeLoop(instance)
 }
 
 // MarkInstanceFrameworkReady stamps the per-instance
@@ -1333,6 +1585,14 @@ type WakeRequest struct {
 	// readers can resolve LiveFor(instance).HealthcheckPath without a
 	// second request lookup.
 	HealthcheckPath string
+	// LivenessProbe (issue #554 / ADR-078) is the per-deployment
+	// override JSON (api.DeploymentLivenessProbe). The engine resolves
+	// this from deployments.override_liveness_probe at Wake time and
+	// threads it into vmmd via this field. Empty = "use plan defaults";
+	// a malformed value is logged Warn by startLivenessLoop and the
+	// plan defaults are used (fail-soft, matching the HealthcheckPath
+	// pattern at engine.go:3360).
+	LivenessProbe json.RawMessage
 	// Runtime (issue #470 / PR #470-FU-B) is the runtime id
 	// ("node22", "python312", etc.) the app was woken for. Stored
 	// on the live Instance so the framework-ready receipt handler
@@ -1832,6 +2092,13 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	m.mu.Unlock()
 	m.log.Info("wake ok", "instance", req.Instance, "method", method.String(),
 		"uid", lease.UID, "host_ip", lease.HostIP.String())
+	// Issue #554 / ADR-078 / PR review fix: start the per-instance
+	// liveness probe loop after the live map insert so the cmd/vmmd
+	// helper can read Lease.Slot via the same instance id. No-op
+	// when the registry isn't wired (unit tests, default-local vmmd).
+	// Uses the parent ctx so the loop exits cleanly when schedd
+	// cancels the wake request.
+	m.startLivenessLoop(ctx, req.Instance, lease.Slot, req.LivenessProbe)
 	return inst, nil
 }
 
@@ -2050,6 +2317,12 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	// forever. The poll goroutine reading the gauge sees a
 	// DeleteLabelValues call as a clean "not tracked" state.
 	m.DeleteLivenessConsecutiveFailures(instance)
+	// Cancel the per-instance probe loop (issue #554 / ADR-078 /
+	// PR review fix). Idempotent; no-op when the registry is nil.
+	// Runs after the gauge delete so a Park racing a Wake's
+	// startLivenessLoop sees a coherent state (cancel after the
+	// loop has registered).
+	m.cancelLivenessLoop(instance)
 	m.cleanup(ctx, inst.Lease, inst.Net, inst.WorkloadNames)
 	m.log.Info("parked", "instance", instance, "mem_bytes", info.MemBytes)
 	return info, nil
