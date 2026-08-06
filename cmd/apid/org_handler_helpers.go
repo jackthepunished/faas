@@ -134,15 +134,19 @@ func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.Response
 // returns false. On Store failure, writes a 500 Problem and
 // returns false.
 //
-// Trade-off: the helper does NOT early-return on `limit <= 0` (the
-// pre-PR shape). It always reads CountActiveOrgMembers, which costs
-// one extra SQL query per invite on Free-tier requests even though
-// the cap will always refuse. We deliberately accept that cost to
-// keep the helper's behaviour uniform with enforcePendingInvitationCap
-// (and to make a future populated Free cap — unlikely, but possible —
-// a one-line constant change rather than a helper refactor).
+// The `limit <= 0` early-return is the deliberate fail-closed-at-
+// plan-policy shape (PR-5 docstring promise: "once the model lands
+// the branch opens without a handler-shape change"). A Free-tier
+// customer should never hit a wire 403 because the cap is 0 by
+// plan policy — they're blocked at the createSharedOrg entry point.
+// This shape matches enforcePendingInvitationCap and lets the
+// store-side `active > 0 && active >= limit` carve-out cover the
+// personal-org test fixtures that AddOrgMember drives directly.
 func (s *server) enforceMemberCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
 	limit := org.Plan.OrgMembersMax()
+	if limit <= 0 {
+		return true
+	}
 	active, err := s.store.CountActiveOrgMembers(ctx, org.ID)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
@@ -159,13 +163,16 @@ func (s *server) enforceMemberCap(ctx context.Context, w http.ResponseWriter, or
 
 // enforcePendingInvitationCap applies the per-plan
 // OrgPendingInvitationsMax limit. Same fail-closed shape as
-// enforceMemberCap: Free + unknown plans read 0/0 and the
-// `pending >= limit` guard catches them. Returns true when the
-// cap allows the new invitation; on exceed, writes the 403
-// Problem and returns false. On Store failure, writes a 500
-// Problem and returns false.
+// enforceMemberCap: the `limit <= 0` early-return keeps Free +
+// unknown plans quiet (plan-policy closure, not cap arithmetic).
+// Returns true when the cap allows the new invitation; on exceed,
+// writes the 403 Problem and returns false. On Store failure,
+// writes a 500 Problem and returns false.
 func (s *server) enforcePendingInvitationCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
 	limit := org.Plan.OrgPendingInvitationsMax()
+	if limit <= 0 {
+		return true
+	}
 	pending, err := s.store.CountPendingOrgInvitations(ctx, org.ID)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,

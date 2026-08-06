@@ -753,10 +753,14 @@ func TestPgStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
 	o.Plan = api.PlanHobby
 
 	// Owner (active count = 1) + 9 developers (active count = 10).
-	ownerID := "00000000-0000-0000-0000-00000000ca01"
+	// UUID last-segment padding is 12 hex digits (RFC 4122); the ca/cb/
+	// cc prefixes keep these seeds well clear of the PR-1 suite (00d*)
+	// so the per-test accounts table rows don't collide on the (id)
+	// PK across the file.
+	ownerID := "00000000-0000-0000-0000-000000ca0001"
 	devIDs := make([]string, 9)
 	for i := range devIDs {
-		devIDs[i] = "00000000-0000-0000-0000-00000000ca" + string(rune('2'+i))
+		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000ca%04x", 0x0002+i)
 	}
 	pgStoreSeedAccounts(t, ctx, pool, append([]string{ownerID}, devIDs...)...)
 
@@ -779,7 +783,7 @@ func TestPgStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
 	}
 
 	// 11th add must refuse — the org is at cap.
-	eleventh := "00000000-0000-0000-0000-00000000ca0b"
+	eleventh := "00000000-0000-0000-0000-000000ca000b"
 	pgStoreSeedAccounts(t, ctx, pool, eleventh)
 	if err := s.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
 		t.Errorf("11th add: err = %v, want ErrOrgMemberCapExceeded", err)
@@ -810,14 +814,14 @@ func TestPgStore_AddOrgMember_MemberCap_FreeIsClosed(t *testing.T) {
 		t.Fatalf("create org: %v", err)
 	}
 	// Default plan is Free; no override needed.
-	ownerID := "00000000-0000-0000-0000-00000000cb01"
+	ownerID := "00000000-0000-0000-0000-000000cb0001"
 	pgStoreSeedAccounts(t, ctx, pool, ownerID)
 
 	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
 		t.Fatalf("owner seed: %v", err)
 	}
 	// Second member on Free must refuse — OrgMembersMax == 0.
-	second := "00000000-0000-0000-0000-00000000cb02"
+	second := "00000000-0000-0000-0000-000000cb0002"
 	pgStoreSeedAccounts(t, ctx, pool, second)
 	if err := s.AddOrgMember(ctx, o.ID, second, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
 		t.Errorf("Free 2nd add: err = %v, want ErrOrgMemberCapExceeded", err)
@@ -843,9 +847,9 @@ func TestPgStore_CountActiveOrgMembers_RemovedFiltered(t *testing.T) {
 	}
 	o.Plan = api.PlanHobby
 
-	ownerID := "00000000-0000-0000-0000-00000000cc01"
-	keptID := "00000000-0000-0000-0000-00000000cc02"
-	goneID := "00000000-0000-0000-0000-00000000cc03"
+	ownerID := "00000000-0000-0000-0000-000000cc0001"
+	keptID := "00000000-0000-0000-0000-000000cc0002"
+	goneID := "00000000-0000-0000-0000-000000cc0003"
 	pgStoreSeedAccounts(t, ctx, pool, ownerID, keptID, goneID)
 
 	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {

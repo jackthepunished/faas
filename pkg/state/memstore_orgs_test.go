@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -567,10 +568,10 @@ func TestMemStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
-	ownerID := "00000000-0000-0000-0000-00000000da01"
+	ownerID := "00000000-0000-0000-0000-000000da0001"
 	devIDs := make([]string, 9)
 	for i := range devIDs {
-		devIDs[i] = "00000000-0000-0000-0000-00000000da" + string(rune('2'+i))
+		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000da%04x", 0x0002+i)
 	}
 
 	if err := m.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
@@ -588,7 +589,7 @@ func TestMemStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
 	if n != 10 {
 		t.Fatalf("CountActiveOrgMembers = %d, want 10", n)
 	}
-	eleventh := "00000000-0000-0000-0000-00000000da0b"
+	eleventh := "00000000-0000-0000-0000-000000da000b"
 	if err := m.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
 		t.Errorf("11th add: err = %v, want ErrOrgMemberCapExceeded", err)
 	}
@@ -610,8 +611,8 @@ func TestMemStore_AddOrgMember_MemberCap_FreeIsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
-	owner := "00000000-0000-0000-0000-00000000db01"
-	second := "00000000-0000-0000-0000-00000000db02"
+	owner := "00000000-0000-0000-0000-000000db0001"
+	second := "00000000-0000-0000-0000-000000db0002"
 	if err := m.AddOrgMember(ctx, o.ID, owner, OrgRoleOwner, nil); err != nil {
 		t.Fatalf("owner: %v", err)
 	}
@@ -633,9 +634,9 @@ func TestMemStore_CountActiveOrgMembers_RemovedFiltered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
-	owner := "00000000-0000-0000-0000-00000000dc01"
-	kept := "00000000-0000-0000-0000-00000000dc02"
-	gone := "00000000-0000-0000-0000-00000000dc03"
+	owner := "00000000-0000-0000-0000-000000dc0001"
+	kept := "00000000-0000-0000-0000-000000dc0002"
+	gone := "00000000-0000-0000-0000-000000dc0003"
 	for _, id := range []string{owner, kept, gone} {
 		var role OrgRole
 		switch id {
