@@ -127,10 +127,10 @@ func TestAppsSuffix(t *testing.T) {
 // fakeInvalidator records EvictInstance / FlushRoutes /
 // InvalidatePublicAuth calls (issue #477 / ADR-079).
 type fakeInvalidator struct {
-	mu              sync.Mutex
-	evicted         map[string]string // instance_id -> app_id
-	flushCnt        int
-	publicAuthCnt   int
+	mu            sync.Mutex
+	evicted       map[string]string // instance_id -> app_id
+	flushCnt      int
+	publicAuthCnt int
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {

@@ -44,9 +44,9 @@ import (
 // zero-dep posture enforceRequireAuthn has on
 // pkg/auth.Middleware).
 type PublicAuthCache struct {
-	ttl time.Duration
-	now func() time.Time // injectable for tests
-	mu  sync.RWMutex
+	ttl  time.Duration
+	now  func() time.Time // injectable for tests
+	mu   sync.RWMutex
 	data map[publicAuthCacheKey]publicAuthCacheEntry
 }
 

@@ -2,7 +2,7 @@
 //
 // Pins the public-auth branch behaviour end-to-end through
 // ServeHTTP for every mode (open, bearer, basic), the
-// regression pins (mode='' or mode='open' doesn't fire the
+// regression pins (mode=” or mode='open' doesn't fire the
 // branch; bearer mode re-uses the require_authn chain), the
 // cache hit/miss semantics, and the audit-kind surface.
 // Mirrors pkg/gateway/require_authn_test.go so an operator
@@ -126,7 +126,7 @@ func publicAuthReqFor(t *testing.T, authHeader string) *http.Request {
 
 // TestPublicAuth_OpenMode_AllowsAnonymous pins the
 // regression: mode='open' is the pre-#477 default and must
-// pass through anonymous traffic. mode='' (a fakeBackend
+// pass through anonymous traffic. mode=” (a fakeBackend
 // that didn't populate the column) is also open.
 func TestPublicAuth_OpenMode_AllowsAnonymous(t *testing.T) {
 	t.Parallel()

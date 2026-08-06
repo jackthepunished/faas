@@ -145,8 +145,8 @@ type AppResponse struct {
 	// ADR-079 §Decision "re-redaction invariant"). To
 	// rotate credentials, the customer PATCHes a fresh
 	// public_auth block.
-	PublicAuth *PublicAuthStatus `json:"public_auth,omitempty"`
-	IdleTimeoutS int  `json:"idle_timeout_s,omitempty"`
+	PublicAuth   *PublicAuthStatus `json:"public_auth,omitempty"`
+	IdleTimeoutS int               `json:"idle_timeout_s,omitempty"`
 	// MinInstances is the per-app cold-wake floor (ux_spec §6.5).
 	// 0 => scale to zero; >0 => keep N warm. Pro/Scale only.
 	MinInstances int    `json:"min_instances"`
