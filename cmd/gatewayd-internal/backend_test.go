@@ -124,11 +124,13 @@ func TestAppsSuffix(t *testing.T) {
 	}
 }
 
-// fakeInvalidator records EvictInstance / FlushRoutes calls.
+// fakeInvalidator records EvictInstance / FlushRoutes /
+// InvalidatePublicAuth calls (issue #477 / ADR-077).
 type fakeInvalidator struct {
-	mu       sync.Mutex
-	evicted  map[string]string // instance_id -> app_id
-	flushCnt int
+	mu              sync.Mutex
+	evicted         map[string]string // instance_id -> app_id
+	flushCnt        int
+	publicAuthCnt   int
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -142,6 +144,11 @@ func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
 func (f *fakeInvalidator) FlushRoutes() {
 	f.mu.Lock()
 	f.flushCnt++
+	f.mu.Unlock()
+}
+func (f *fakeInvalidator) InvalidatePublicAuth() {
+	f.mu.Lock()
+	f.publicAuthCnt++
 	f.mu.Unlock()
 }
 

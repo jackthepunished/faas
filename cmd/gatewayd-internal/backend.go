@@ -87,6 +87,13 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 // enforce per-deployment token gating at the edge — a Pro/Scale customer
 // who PATCHes require_authn=true on their app gets the auth check
 // applied to every incoming request, with no store hop on the hot path.
+// PublicAuth (issue #477 / ADR-077) is plumbed through so ServeHTTP can
+// enforce per-app public-URL auth (open|bearer|basic) at the edge — a
+// Hobby+ customer who PATCHes public_auth_mode='bearer' or 'basic' on
+// their app gets the credential check applied to every incoming request.
+// The secretbox-sealed BasicSealed blob is carried on gateway.App so
+// the gatewayd basic-auth path can unseal it at boot (and cache the
+// unsealed form for 60s + db.NotifyKeyChanged invalidation).
 func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, error) {
 	if app.Status == state.AppDeleted {
 		return gateway.App{}, false, nil
@@ -95,7 +102,17 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 	if err != nil {
 		return gateway.App{}, false, err
 	}
-	return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, RequireAuthn: app.RequireAuthn}, true, nil
+	return gateway.App{
+		ID:               app.ID,
+		AccountID:        acct.ID,
+		Plan:             acct.Plan,
+		StreamingEnabled: app.StreamingEnabled,
+		RequireAuthn:     app.RequireAuthn,
+		PublicAuth: gateway.PublicAuthConfig{
+			Mode:        app.PublicAuthMode,
+			BasicSealed: app.PublicAuthBasicSealed,
+		},
+	}, true, nil
 }
 
 // appsSuffix normalizes a bare apps domain ("apps.gregale.dev") into the
@@ -120,9 +137,18 @@ func appsSuffix(domain string) string {
 // emitInstanceChanged), and the gateway uses that to drop exactly one
 // entry from the per-app targetSet. EvictTarget (legacy wholesale drop) is
 // kept on the interface as a fallback when the payload is malformed.
+//
+// Issue #477 / ADR-077 added InvalidatePublicAuth: the per-app basic-auth
+// unsealed-credential cache in gateway.PublicAuthCache. A key_changed
+// notification triggers InvalidatePublicAuth; the cache maps
+// (appID, sealed-hash) → entry without a per-entry key-tag, so a key
+// rotation drops the whole cache. Operators who rotate a key on a busy
+// account pay at most one cache rebuild across all public-auth-locked
+// apps (acceptable because key rotations are rare).
 type invalidator interface {
 	EvictInstance(appID, instanceID string)
 	FlushRoutes()
+	InvalidatePublicAuth()
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -136,7 +162,13 @@ type invalidator interface {
 // across pg restarts. The single log-and-return on initial-acquire failure
 // remains — boot-time DB outage is a different signal.
 func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator, log *slog.Logger) {
-	channels := []string{db.NotifyInstanceChanged, db.NotifyAppChanged, db.NotifyDomainChanged}
+	// Issue #477 / ADR-077: append NotifyKeyChanged so a key
+	// rotation triggers InvalidatePublicAuth on the
+	// basic-auth unsealed-credential cache. The cache maps
+	// (appID, sealed-hash) → entry without a per-entry key-tag,
+	// so a key rotation drops the whole cache (see
+	// PublicAuthCache.InvalidateAll).
+	channels := []string{db.NotifyInstanceChanged, db.NotifyAppChanged, db.NotifyDomainChanged, db.NotifyKeyChanged}
 	notif, err := db.SubscribeWithReconnect(ctx, pool, channels, log)
 	if err != nil {
 		log.Error("gatewayd: subscribe invalidations", "err", err)
@@ -205,5 +237,26 @@ func handleInvalidation(inv invalidator, n db.Notification, log *slog.Logger) {
 		}
 	case db.NotifyAppChanged, db.NotifyDomainChanged:
 		inv.FlushRoutes()
+	case db.NotifyKeyChanged:
+		// Issue #477 / ADR-077. A key rotation across the
+		// platform could change which api_keys resolve
+		// against which apps for both the require_authn
+		// (issue #560) and public_auth bearer (issue #477)
+		// gates. The auth chain itself reads through Postgres
+		// on every request, so the auth-side effect of a
+		// key rotation is bounded by the auth chain's own
+		// cache (pkg/auth's connection-pool TTL). The
+		// public-auth cache (basic-auth unsealed creds,
+		// 60s TTL) needs an explicit invalidation because
+		// it doesn't read through Postgres on the hot
+		// path. The payload (key_id) is intentionally
+		// dropped: the cache maps (appID, sealed-hash) →
+		// entry without a per-entry key-tag, so a key
+		// rotation drops the whole cache. Operators who
+		// rotate a key on a busy account pay at most one
+		// cache rebuild across all public-auth-locked
+		// apps (acceptable because key rotations are
+		// rare; the next request re-unseals cleanly).
+		inv.InvalidatePublicAuth()
 	}
 }

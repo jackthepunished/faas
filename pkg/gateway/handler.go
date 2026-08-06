@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -64,7 +66,54 @@ type App struct {
 	// false in fakeBackend unit tests (the in-memory
 	// backend doesn't populate the column).
 	RequireAuthn bool
+	// PublicAuth (issue #477 / ADR-077) is the per-app
+	// public-URL auth mode (open|bearer|basic). When
+	// mode='open' (the pre-#477 default), ServeHTTP
+	// pass-throughs anonymous traffic. When mode='bearer',
+	// ServeHTTP demands an Authorization: Bearer header
+	// (re-using the require_authn key chain, same
+	// apps:read scope on the app's owning account).
+	// When mode='basic', ServeHTTP demands an
+	// Authorization: Basic header and constant-time-
+	// compares the unsealed creds (BasicSealed from the
+	// apps row, sealed under the APP_BASIC_AUTH
+	// secretbox namespace). Plumbed through pgRouter.toApp
+	// from the apps row; default zero value (Mode="" →
+	// treated as "open" by enforcePublicAuth) preserves
+	// the pre-#477 customer behaviour in fakeBackend unit
+	// tests.
+	PublicAuth PublicAuthConfig
 }
+
+// PublicAuthConfig (issue #477 / ADR-077) is the per-app
+// public-URL auth mode bundle plumbed onto App. Mode is the
+// canonical text from apps.public_auth_mode CHECK enum
+// ('open'|'bearer'|'basic'); empty Mode is treated as 'open'
+// by enforcePublicAuth so a fakeBackend unit test that
+// doesn't populate the column keeps working. BasicSealed is
+// the secretbox-sealed bytea from apps.public_auth_basic,
+// only set when Mode='basic' (nil for open/bearer). The
+// unsealed shape is {username_env, password_env} env-var
+// reference names; the plaintext credentials live in
+// app_secrets (ADR-045) and are loopback-mounted at boot.
+//
+// The mode check is done with a direct string compare on the
+// constants below — no separate enum type, mirroring the
+// eviction_priority / streaming / require_authn column
+// shape.
+type PublicAuthConfig struct {
+	Mode        string
+	BasicSealed []byte
+}
+
+// Canonical public-auth mode strings (issue #477). Values
+// must stay in sync with the apps_public_auth_mode_chk
+// CHECK constraint in migrations/00151_apps_public_auth.sql.
+const (
+	publicAuthModeOpen   = "open"
+	publicAuthModeBearer = "bearer"
+	publicAuthModeBasic  = "basic"
+)
 
 // AppSidecar (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
 // the narrow subset of pkg/api.SidecarSpec the public
@@ -117,6 +166,21 @@ type RequireAuthnKey struct {
 // auditor's contract at cmd/apid/audit.go:79).
 type RequireAuthnAuditor interface {
 	Emit(ctx context.Context, kind string, subject *string, data map[string]any)
+}
+
+// PublicAuthUnsealer (issue #477 / ADR-077) turns a
+// secretbox-sealed APP_BASIC_AUTH blob into the {username,
+// password} pair the request Authorization header carries.
+// Declared locally (mirroring RequireAuthnAuthenticator's
+// shape) so pkg/gateway stays free of any import dependency on
+// pkg/secretbox or pkg/auth; the production wiring in
+// cmd/gatewayd-internal closes over secretbox.OpenMulti on the
+// loaded host identities. Returns an error when the blob is
+// tampered or the namespace tag doesn't match — the caller
+// treats both as a credential mismatch (401) so a brute-forcer
+// can't tell the difference.
+type PublicAuthUnsealer interface {
+	UnsealBasicAuth(ctx context.Context, sealed []byte) (username, password string, err error)
 }
 
 // Target is one routable instance in the gateway's per-app cache (issue
@@ -277,6 +341,25 @@ type Handler struct {
 	// audit emitter so the rows land in the same events table
 	// every other gatewayd-scope row uses (cmd/gatewayd/audit.go).
 	requireAuthnAudit RequireAuthnAuditor
+	// publicAuthCache is the unsealed basic-auth credential
+	// cache (issue #477 / ADR-077). Nil = no caching; the
+	// basic-auth path falls back to per-request unsealing
+	// (slower but safe; used by unit tests that don't want to
+	// thread a cache through the constructor). Production
+	// wires it from cmd/gatewayd-internal/main.go so the
+	// 60s TTL + per-key invalidation through
+	// db.NotifyKeyChanged both apply. The cache itself lives
+	// in pkg/gateway/public_auth_cache.go.
+	publicAuthCache *PublicAuthCache
+	// publicAuthUnsealer turns an APP_BASIC_AUTH secretbox
+	// sealed blob into the username/password pair the
+	// request header carries. nil = unseal disabled (unit
+	// tests + dev boxes that don't have the host.age loaded);
+	// mode='basic' returns 500 if hit. Production wires the
+	// same secretbox.MultiOpen path the apid uses
+	// (cmd/gatewayd-internal/main.go → secretbox.MultiOpen
+	// → publicAuthUnsealer closure).
+	publicAuthUnsealer PublicAuthUnsealer
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -406,6 +489,22 @@ func (h *Handler) WithStreamingEnabled(enabled bool) *Handler {
 func (h *Handler) WithRequireAuthn(authn RequireAuthnAuthenticator, audit RequireAuthnAuditor) *Handler {
 	h.requireAuthnAuthn = authn
 	h.requireAuthnAudit = audit
+	return h
+}
+
+// WithPublicAuth (issue #477 / ADR-077) arms the per-app
+// public-URL auth gate. cache may be nil (no caching; the
+// basic-auth path unseals per-request, slower but correct).
+// unsealer may be nil (the basic-auth path returns 500 on
+// miss; open/bearer modes are unaffected). Both fields are
+// nil-safe at the call site — enforcePublicAuth short-
+// circuits when either is nil AND mode='basic', and the
+// open/bearer branches don't touch either. The setter
+// returns *Handler for fluent chaining (same shape as every
+// other Handler.With*).
+func (h *Handler) WithPublicAuth(cache *PublicAuthCache, unsealer PublicAuthUnsealer) *Handler {
+	h.publicAuthCache = cache
+	h.publicAuthUnsealer = unsealer
 	return h
 }
 
@@ -549,6 +648,326 @@ func bearerTokenFromHeader(h string) string {
 		return ""
 	}
 	return strings.TrimSpace(h[len(scheme):])
+}
+
+// enforcePublicAuth (issue #477 / ADR-077) is the per-app
+// public-URL auth gate. Returns true when the request is
+// authorised to proceed (either the routed app has
+// mode='open' OR the caller presented valid credentials
+// for the active mode); returns false after writing the
+// deny response and the metrics observation. The boolean
+// keeps the call-site in ServeHTTP at one line (mirrors
+// enforceRequireAuthn's shape).
+//
+// Modes:
+//
+//	open    pass-through, no audit (preserves pre-#477
+//	        behaviour so every existing app stays
+//	        public-by-default; the apid PATCH layer is
+//	        the plan gate — Free-plan apps never reach
+//	        here with mode='bearer' or 'basic').
+//	bearer  re-uses the require_authn chain
+//	        (h.requireAuthnAuthn.AuthenticateKey); the
+//	        bearer resolves to a different account than
+//	        App.AccountID receive 403 insufficient_scope.
+//	basic   verifies Basic <base64(user:pass)> against
+//	        the unsealed credential cached in
+//	        PublicAuthCache (60s TTL + per-key invalidation
+//	        on db.NotifyKeyChanged); on miss the cache
+//	        calls PublicAuthUnsealer.UnsealBasicAuth on the
+//	        secretbox-sealed BasicSealed blob.
+//
+// Deny paths:
+//
+//	401 unauthorized     no Authorization header for the
+//	                     active mode, or the credential is
+//	                     malformed / unknown / revoked.
+//	                     Carries the WWW-Authenticate
+//	                     response header per RFC 6750 §3
+//	                     (bearer) / RFC 7617 §4 (basic) so
+//	                     the client knows which credential
+//	                     to present next.
+//	403 forbidden        mode='bearer', key resolves to a
+//	                     valid principal but on the wrong
+//	                     account (mirrors
+//	                     enforceRequireAuthn's 403 path;
+//	                     never fires for mode='basic' since
+//	                     basic creds are app-scoped, not
+//	                     account-scoped).
+//
+// Audit emission:
+//
+//	instances.public_auth_missing   401 path, no/garbled
+//	                                header on a gated app.
+//	instances.public_auth_invalid   401 path, credential
+//	                                rejected (mode='bearer'
+//	                                unknown/expired/revoked;
+//	                                mode='basic' wrong
+//	                                password).
+//	instances.public_auth_scope     403 path, mode='bearer'
+//	                                cross-account key.
+//
+// All three audit rows carry app_id + slug + (mode =
+// 'bearer'|'basic') + (mode='bearer' → key_id when known).
+// The subject pointer is the account ID for scope, nil for
+// missing/invalid (no principal to stamp). Best-effort — a
+// failed emit never blocks the deny response (matches
+// emitAuthnAudit's contract).
+func (h *Handler) enforcePublicAuth(w http.ResponseWriter, r *http.Request, rec *statusRecorder, app App) bool {
+	// Open (or unknown) → pass-through. Unknown / empty Mode
+	// is treated as 'open' so the pre-#477 customer behaviour
+	// is preserved (a fakeBackend unit test that doesn't
+	// populate PublicAuthMode gets the same path as a real
+	// open-mode app). No audit row is emitted — open traffic
+	// is the default; only denials are interesting.
+	mode := app.PublicAuth.Mode
+	if mode == "" || mode == publicAuthModeOpen {
+		return true
+	}
+	switch mode {
+	case publicAuthModeBearer:
+		return h.enforcePublicAuthBearer(w, r, rec, app)
+	case publicAuthModeBasic:
+		return h.enforcePublicAuthBasic(w, r, rec, app)
+	default:
+		// Defensive: an unrecognised mode should be impossible
+		// thanks to apps_public_auth_mode_chk, but if a
+		// legacy row from before #477 lands with mode='weird'
+		// we pass-through rather than 500 — the gate stays
+		// fail-open on data drift and the apid PATCH layer
+		// continues to be the source of truth for plan
+		// gating. A single warn line per process keeps
+		// the diagnostic surface small.
+		h.warnUnknownPublicAuthMode(mode)
+		return true
+	}
+}
+
+// enforcePublicAuthBearer is the bearer-mode branch of
+// enforcePublicAuth. Mirrors the (1)/(2)/(3) deny structure
+// of enforceRequireAuthn so an operator reading the two side
+// by side sees parallel paths. nil-safe: a nil
+// h.requireAuthnAuthn (the pre-#560 default; tests + dev
+// boxes that don't wire the chain) → 500 rather than
+// pass-through, because a customer who flipped mode='bearer'
+// expects the gate to fire and a silent pass-through would
+// be a security regression.
+func (h *Handler) enforcePublicAuthBearer(w http.ResponseWriter, r *http.Request, rec *statusRecorder, app App) bool {
+	if h.requireAuthnAuthn == nil {
+		rec.status = http.StatusInternalServerError
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal,
+			"Auth chain not wired",
+			"this app requires bearer auth but the auth chain is not configured"))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (1) Bearer extraction — fail-fast at 401 if no token.
+	tok := bearerTokenFromHeader(r.Header.Get("Authorization"))
+	if tok == "" || !api.ValidAPIKeyFormat(tok) {
+		h.emitAuthnAudit(r, app, nil, "instances.public_auth_missing", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"mode":   publicAuthModeBearer,
+			"reason": "missing_or_malformed_bearer",
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "this app requires an API key; present it as `Authorization: Bearer <token>`").
+			WithHeader("WWW-Authenticate", `Bearer realm="apps"`))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (2) Verify the key via the shared require_authn chain
+	// (same api.HashAPIKey helper; defense in depth — keys
+	// never reach the store unhashed).
+	acct, key, err := h.requireAuthnAuthn.AuthenticateKey(r.Context(), api.HashAPIKey(tok))
+	if err != nil {
+		reason := "invalid_bearer"
+		if errors.Is(err, ErrAPIKeyExpired) {
+			reason = "expired"
+		} else if errors.Is(err, ErrAPIKeyRevoked) {
+			reason = "revoked"
+		}
+		h.emitAuthnAudit(r, app, nil, "instances.public_auth_invalid", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"mode":   publicAuthModeBearer,
+			"reason": reason,
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "the presented API key is not valid for this app").
+			WithHeader("WWW-Authenticate", `Bearer realm="apps"`))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (3) Cross-account check — a valid key on the wrong
+	// account is 403, not 401. Distinct from
+	// enforceRequireAuthn so the SDK can pivot on the
+	// response code instead of inspecting the body, but the
+	// audit kind differs (public_auth_scope vs authn_scope)
+	// so the per-gate dashboards stay separate.
+	if acct.ID != app.AccountID {
+		h.emitAuthnAudit(r, app, &acct.ID, "instances.public_auth_scope", map[string]any{
+			"app_id":            app.ID,
+			"slug":              r.Host,
+			"mode":              publicAuthModeBearer,
+			"caller_account_id": acct.ID,
+			"app_account_id":    app.AccountID,
+			"key_id":            key.ID,
+		})
+		rec.status = http.StatusForbidden
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
+			"Insufficient scope", "this API key does not belong to the account that owns the app"))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	return true
+}
+
+// enforcePublicAuthBasic is the basic-mode branch of
+// enforcePublicAuth. Reads the Basic <base64(user:pass)>
+// header, looks up the unsealed credential in
+// PublicAuthCache (which calls PublicAuthUnsealer on miss
+// and caches the result for 60s + per-key invalidation),
+// and constant-time-compares the presented password
+// against the unsealed one. Same constant-time posture as
+// every other credential compare in the platform
+// (api.HashAPIKey / cmd/apid webhook signing).
+func (h *Handler) enforcePublicAuthBasic(w http.ResponseWriter, r *http.Request, rec *statusRecorder, app App) bool {
+	if h.publicAuthCache == nil || h.publicAuthUnsealer == nil {
+		rec.status = http.StatusInternalServerError
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal,
+			"Auth chain not wired",
+			"this app requires basic auth but the credential cache is not configured"))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (1) Basic extraction — fail-fast at 401 if no header.
+	user, pass, ok := basicCredsFromHeader(r.Header.Get("Authorization"))
+	if !ok {
+		h.emitAuthnAudit(r, app, nil, "instances.public_auth_missing", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"mode":   publicAuthModeBasic,
+			"reason": "missing_or_malformed_basic",
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "this app requires basic auth; present it as `Authorization: Basic <base64(user:pass)>`").
+			WithHeader("WWW-Authenticate", `Basic realm="apps"`))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (2) Look up the unsealed credential via the cache (60s
+	// TTL + per-key invalidation). A cache miss invokes
+	// PublicAuthUnsealer.UnsealBasicAuth on the
+	// secretbox-sealed BasicSealed blob stored on the apps
+	// row.
+	expectedUser, expectedPass, ok := h.publicAuthCache.Get(app.ID, app.PublicAuth.BasicSealed, func() (string, string, bool) {
+		u, p, err := h.publicAuthUnsealer.UnsealBasicAuth(r.Context(), app.PublicAuth.BasicSealed)
+		if err != nil {
+			return "", "", false
+		}
+		return u, p, true
+	})
+	if !ok {
+		// Unseal failure is treated as a credential mismatch
+		// (401) so a brute-forcer can't tell the difference
+		// between "no creds configured" and "wrong creds".
+		h.emitAuthnAudit(r, app, nil, "instances.public_auth_invalid", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"mode":   publicAuthModeBasic,
+			"reason": "credential_unavailable",
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "the presented credentials are not valid for this app").
+			WithHeader("WWW-Authenticate", `Basic realm="apps"`))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	// (3) Constant-time compare. Both sides are base64-
+	// decoded; we re-encode back to bytes for the compare so
+	// the function stays allocation-light. Length-mismatch
+	// short-circuits to 0 before the compare so an attacker
+	// who knows the password length can't probe via timing.
+	if subtle.ConstantTimeCompare([]byte(user), []byte(expectedUser)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) != 1 {
+		h.emitAuthnAudit(r, app, nil, "instances.public_auth_invalid", map[string]any{
+			"app_id": app.ID,
+			"slug":   r.Host,
+			"mode":   publicAuthModeBasic,
+			"reason": "wrong_credentials",
+		})
+		rec.status = http.StatusUnauthorized
+		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+			"Unauthorized", "the presented credentials are not valid for this app").
+			WithHeader("WWW-Authenticate", `Basic realm="apps"`))
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return false
+	}
+	return true
+}
+
+// basicCredsFromHeader parses an `Authorization: Basic
+// <base64(user:pass)>` header per RFC 7617 §2. Returns
+// ok=false on any malformed input (no scheme, non-base64,
+// missing colon, empty username OR password). The username
+// is everything before the FIRST colon; passwords may
+// contain colons (RFC 7617 §2 explicitly permits them), so
+// strings.SplitN(2) is the right primitive. Empty string
+// out → empty string out (mirrors bearerTokenFromHeader).
+func basicCredsFromHeader(h string) (username, password string, ok bool) {
+	const scheme = "basic "
+	if len(h) < len(scheme) {
+		return "", "", false
+	}
+	if !strings.EqualFold(h[:len(scheme)], scheme) {
+		return "", "", false
+	}
+	raw := h[len(scheme):]
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return "", "", false
+	}
+	user, pass, found := strings.Cut(string(decoded), ":")
+	if !found {
+		return "", "", false
+	}
+	if user == "" || pass == "" {
+		return "", "", false
+	}
+	return user, pass, true
+}
+
+// unknownPublicAuthModeWarned is the process-wide trip flag
+// for warnUnknownPublicAuthMode (issue #477). An unrecognised
+// mode should be impossible thanks to the CHECK constraint;
+// the warning is genuinely a code-path bug (or a rebase
+// race that left an old row behind) and one log line per
+// mode is enough to surface it.
+var unknownPublicAuthModeWarned sync.Map // map[string]struct{}
+
+// warnUnknownPublicAuthMode logs a warning the first time
+// enforcePublicAuth sees an unrecognised PublicAuth.Mode.
+// Subsequent occurrences are silent (per-mode dedup, not
+// per-process, so two distinct legacy modes each surface
+// once). The atomic map is process-scoped, not per-Handler,
+// because the warning is genuinely a code-path bug.
+func (h *Handler) warnUnknownPublicAuthMode(mode string) {
+	if _, seen := unknownPublicAuthModeWarned.LoadOrStore(mode, struct{}{}); seen {
+		return
+	}
+	if h.log != nil {
+		h.log.Warn("gateway: unknown PublicAuth.Mode; passing through as open",
+			"mode", mode, "note", "apps_public_auth_mode_chk should reject this; check migration 00151")
+	}
 }
 
 // ErrAPIKeyExpired / ErrAPIKeyRevoked are local sentinels for
@@ -896,6 +1315,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (tests + dev boxes that don't wire the chain) is a
 	// pass-through, so the pre-issue behaviour is preserved.
 	if !h.enforceRequireAuthn(w, r, rec, app) {
+		return
+	}
+
+	// Issue #477 / ADR-077 / per-app public_auth gate.
+	// Runs AFTER enforceRequireAuthn (so the require_authn
+	// gate fires first when both are active on the same app,
+	// keeping the 401 ordering deterministic for
+	// "this app wants both gates" customers) and BEFORE
+	// sidecar port resolve / account limiter / wake gate
+	// (so unauthenticated traffic can't trigger a cold-boot
+	// on a token-gated app — the wake gate's schedd RPC
+	// and the meter's first-byte observability never see
+	// traffic from a missing or invalid public_auth
+	// credential). nil-safe: open / unset modes pass
+	// through (the pre-#477 default is preserved).
+	if !h.enforcePublicAuth(w, r, rec, app) {
 		return
 	}
 
