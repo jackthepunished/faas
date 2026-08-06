@@ -72,7 +72,15 @@ type BaseBuildResult struct {
 // every cd-controlplane deploy failed for 24h). Tests stay portable
 // on macOS dev units by leaving the env var unset.
 func MkdirBaseStaging() (string, error) {
-	root := os.Getenv("FAAS_BASE_STAGING_ROOT")
+	return mkdirBaseTemp("FAAS_BASE_STAGING_ROOT")
+}
+
+func MkdirBaseExtraction() (string, error) {
+	return mkdirBaseTemp("FAAS_BASE_EXTRACT_ROOT")
+}
+
+func mkdirBaseTemp(envKey string) (string, error) {
+	root := os.Getenv(envKey)
 	if root == "" {
 		return os.MkdirTemp("", "faas-base-*")
 	}
@@ -103,7 +111,7 @@ func (b *Builder) BuildBase(ctx context.Context, in BaseBuildInput) (BaseBuildRe
 		return BaseBuildResult{}, fmt.Errorf("rootfs: BuildBase: no layers")
 	}
 
-	staging, err := MkdirBaseStaging()
+	staging, err := MkdirBaseExtraction()
 	if err != nil {
 		return BaseBuildResult{}, fmt.Errorf("rootfs: staging dir: %w", err)
 	}

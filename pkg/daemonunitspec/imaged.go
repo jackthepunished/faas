@@ -65,6 +65,7 @@ func UnitImaged() daemonunit.Unit {
 		EnvironmentFile: "/etc/faas/sealed.env",
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_BASE_STAGING_ROOT", Value: "/dev/shm/faas-base-staging"},
+			{Key: "FAAS_BASE_EXTRACT_ROOT", Value: "/srv/fc/base-staging"},
 			{Key: "FAAS_BASE_TMP_ROOT", Value: "/srv/fc/base"},
 		},
 
@@ -78,7 +79,7 @@ func UnitImaged() daemonunit.Unit {
 
 		ReadOnlyPaths: []string{"/etc/faas"},
 		ReadWritePaths: []string{
-			"/srv/fc/snap", "/srv/fc/base", "/srv/fc/sigs",
+			"/srv/fc/snap", "/srv/fc/base", "/srv/fc/base-staging", "/srv/fc/sigs",
 			"/var/log/faas", "/var/spool/faas",
 			"/dev/shm/faas-base-staging",
 		},
