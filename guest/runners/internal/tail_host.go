@@ -103,16 +103,16 @@ const (
 // reaches a terminal state. The 5s snapshotAndPark watchdog on
 // the host side is the upper bound if the drain hangs.
 type TailHost struct {
-	runtime     string
-	pipePath    string
-	waitUntil   time.Duration
-	tailCapMax  int
+	runtime    string
+	pipePath   string
+	waitUntil  time.Duration
+	tailCapMax int
 
 	mu         sync.Mutex
-	registered int          // total tails registered (bounded by tailCapMax)
-	failures   []string     // drained into resp.TailErrors on Wait()
+	registered int      // total tails registered (bounded by tailCapMax)
+	failures   []string // drained into resp.TailErrors on Wait()
 
-	wg         sync.WaitGroup
+	wg sync.WaitGroup
 }
 
 // NewTailHost returns a fresh drain. runtime is the runner id
