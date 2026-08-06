@@ -121,53 +121,29 @@ func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.Response
 	return org, true
 }
 
-// enforceMemberCap applies the per-plan OrgMembersMax limit on the
-// direct-add path (ADR-061 / IAM-6 PR 2). Free + unknown plans have
-// OrgMembersMax == 0 by plan policy — the abuse-floor tier cannot
-// host shared orgs, mirroring CronLimitPerApp and
-// EvictionPriorityReservedAllowed. A non-personal Free org never
-// reaches here in practice (the personal-org path is immutable and
-// the createSharedOrg handler defaults to Free with limit=0), but
-// the fail-closed `active >= limit` guard also catches a future
-// route that bypasses those gates. Returns true when the cap
-// allows the new member; on exceed, writes the 403 Problem and
-// returns false. On Store failure, writes a 500 Problem and
-// returns false.
-//
-// The `limit <= 0` early-return is the deliberate fail-closed-at-
-// plan-policy shape (PR-5 docstring promise: "once the model lands
-// the branch opens without a handler-shape change"). A Free-tier
-// customer should never hit a wire 403 because the cap is 0 by
-// plan policy — they're blocked at the createSharedOrg entry point.
-// This shape matches enforcePendingInvitationCap and lets the
-// store-side `active > 0 && active >= limit` carve-out cover the
-// personal-org test fixtures that AddOrgMember drives directly.
-func (s *server) enforceMemberCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
-	limit := org.Plan.OrgMembersMax()
-	if limit <= 0 {
-		return true
-	}
-	active, err := s.store.CountActiveOrgMembers(ctx, org.ID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity, "CountActiveOrgMembers failed",
-			"try again; if the problem persists, contact support"))
-		return false
-	}
-	if active >= limit {
-		api.WriteProblem(w, api.ErrOrgMemberCapExceeded(limit, active))
-		return false
-	}
-	return true
-}
+// enforceMemberCap is the wire-side mirror of the store-side cap
+// check inside ConsumeOrgInvitation. It applies the per-plan
+// OrgMembersMax limit on a future direct-add (no-invite) route.
+// Free + unknown plans have OrgMembersMax == 0 by plan policy —
+// the abuse-floor tier cannot host shared orgs. The helper lands
+// here in this PR (the populated constants per plan are the
+// prerequisite) but is left intentionally unwired: today the only
+// store-side paths that insert memberships are (1) AddOrgMember as
+// the initial-owner seed at org creation — the store carves this
+// out — and (2) ConsumeOrgInvitation on invitation accept — the
+// store enforces the cap in-tx. A future direct-add route only
+// needs to call `s.enforceMemberCap(...)` (read as a TODO on
+// `cmd/apid/handlers_org_members.go`), the helper shape is final.
 
 // enforcePendingInvitationCap applies the per-plan
-// OrgPendingInvitationsMax limit. Same fail-closed shape as
-// enforceMemberCap: the `limit <= 0` early-return keeps Free +
-// unknown plans quiet (plan-policy closure, not cap arithmetic).
-// Returns true when the cap allows the new invitation; on exceed,
-// writes the 403 Problem and returns false. On Store failure,
-// writes a 500 Problem and returns false.
+// OrgPendingInvitationsMax limit on POST /v1/orgs/{slug}/members.
+// Free + unknown plans have OrgPendingInvitationsMax == 0 by plan
+// policy — the abuse-floor tier cannot host shared orgs. The
+// `limit <= 0` early-return keeps Free + unknown plans quiet
+// (plan-policy closure, not cap arithmetic). Returns true when the
+// cap allows the new invitation; on exceed, writes the 403 Problem
+// and returns false. On Store failure, writes a 500 Problem and
+// returns false.
 func (s *server) enforcePendingInvitationCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
 	limit := org.Plan.OrgPendingInvitationsMax()
 	if limit <= 0 {
