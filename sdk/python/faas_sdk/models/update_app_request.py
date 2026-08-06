@@ -21,6 +21,7 @@ from ..models.update_app_request_eviction_priority_type_3_type_1 import (
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.public_auth_block import PublicAuthBlock
     from ..models.scaling_policy import ScalingPolicy
 
 
@@ -76,9 +77,14 @@ class UpdateAppRequest:
     require_authn: bool | None | Unset = UNSET
     """Per-deployment token-gate flag (issue #560). Omitted → no change. PATCH-true on Free/Hobby is rejected with
     403 plan_require_authn_not_allowed."""
+    public_auth: None | PublicAuthBlock | Unset = UNSET
+    """Per-app public-URL auth configuration (issue #477 / ADR-077). Omitted → no change. When present, mode is the
+    closed enum {open, bearer, basic}; basic_user + basic_pass are required when mode='basic' and the apid seal step
+    encrypts them under the APP_BASIC_AUTH secretbox namespace before persistence."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.public_auth_block import PublicAuthBlock
         from ..models.scaling_policy import ScalingPolicy
 
         ram_mb: int | None | Unset
@@ -177,6 +183,14 @@ class UpdateAppRequest:
         else:
             require_authn = self.require_authn
 
+        public_auth: dict[str, Any] | None | Unset
+        if isinstance(self.public_auth, Unset):
+            public_auth = UNSET
+        elif isinstance(self.public_auth, PublicAuthBlock):
+            public_auth = self.public_auth.to_dict()
+        else:
+            public_auth = self.public_auth
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -210,11 +224,14 @@ class UpdateAppRequest:
             field_dict["eviction_priority"] = eviction_priority
         if require_authn is not UNSET:
             field_dict["require_authn"] = require_authn
+        if public_auth is not UNSET:
+            field_dict["public_auth"] = public_auth
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.public_auth_block import PublicAuthBlock
         from ..models.scaling_policy import ScalingPolicy
 
         d = dict(src_dict)
@@ -394,6 +411,23 @@ class UpdateAppRequest:
 
         require_authn = _parse_require_authn(d.pop("require_authn", UNSET))
 
+        def _parse_public_auth(data: object) -> None | PublicAuthBlock | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                public_auth_type_1 = PublicAuthBlock.from_dict(data)
+
+                return public_auth_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | PublicAuthBlock | Unset, data)
+
+        public_auth = _parse_public_auth(d.pop("public_auth", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -410,6 +444,7 @@ class UpdateAppRequest:
             warm_snapshot_min_ms=warm_snapshot_min_ms,
             eviction_priority=eviction_priority,
             require_authn=require_authn,
+            public_auth=public_auth,
         )
 
         update_app_request.additional_properties = d

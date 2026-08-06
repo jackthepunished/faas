@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.org_invitation_response import OrgInvitationResponse
 
@@ -18,6 +20,13 @@ class InvitationListResponse:
     """GET /v1/orgs/{slug}/invitations response. Sorted by created_at DESC."""
 
     invitations: list[OrgInvitationResponse]
+    next_before: str | Unset = UNSET
+    """Opaque cursor — set to the `id` of the last row on this
+    page when there's a next page. Pass back as `?before=`
+    to fetch it. Matches the same cursor shape as
+    MemberListResponse / AppListResponse so the SDK can
+    share one walker.
+    """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -26,6 +35,8 @@ class InvitationListResponse:
             invitations_item = invitations_item_data.to_dict()
             invitations.append(invitations_item)
 
+        next_before = self.next_before
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -33,6 +44,8 @@ class InvitationListResponse:
                 "invitations": invitations,
             }
         )
+        if next_before is not UNSET:
+            field_dict["next_before"] = next_before
 
         return field_dict
 
@@ -48,8 +61,11 @@ class InvitationListResponse:
 
             invitations.append(invitations_item)
 
+        next_before = d.pop("next_before", UNSET)
+
         invitation_list_response = cls(
             invitations=invitations,
+            next_before=next_before,
         )
 
         invitation_list_response.additional_properties = d
