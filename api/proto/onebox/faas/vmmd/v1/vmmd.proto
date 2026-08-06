@@ -175,6 +175,33 @@ service Vmmd {
   // surgery on the surrounding service-doc layout.
   rpc ForwardHTTPStream(stream ForwardHTTPStreamRequest) returns (stream ForwardHTTPStreamResponse);
 
+  // ForwardRawStream (issue #676 / ADR-080) is the raw-bytes bridge
+  // for Upgrade (WebSocket / h2c / MQTT-over-WS / long-poll) traffic.
+  // The legacy ForwardHTTPStream strips Upgrade + Connection as
+  // hop-by-hop headers and the shell-script bridge hard-codes
+  // Transfer-Encoding: chunked + a Host rewrite — both destroy the
+  // raw bytes an Upgrade handshake needs. ForwardRawStream carries
+  // the customer's verbatim HTTP request bytes (status line + headers
+  // + body) into the guest's netns TCP socket and reads back the
+  // raw response — no HTTP parsing, no chunked framing, no header
+  // rewriting. The gateway detects Upgrade requests and routes them
+  // here; plain HTTP / SSE / chunked stays on ForwardHTTPStream.
+  // Wire shape:
+  //   client → server: 1× ForwardRawRequestInit (instance, port, max
+  //     request bytes), then N× body_chunk bytes that the bridge
+  //     writes verbatim to the guest TCP socket. Half-close = EOF.
+  //   server → client: 1× ForwardRawResponseInit (status + headers
+  //     + error message), then N× body_chunk bytes that the bridge
+  //     read off the guest TCP socket. Server half-closes when the
+  //     guest closes the connection.
+  // The bridge that owns the guest TCP socket is the new
+  // vmmd-raw-bridge Go binary (cmd/vmmd-raw-bridge/), spawned by
+  // vmmd under the stream context. Errors map to Unavailable (guest
+  // dial refused), NotFound (unknown instance), InvalidArgument
+  // (missing init), Internal (nsenter / bridge crash). The legacy
+  // ForwardHTTPStream is unaffected.
+  rpc ForwardRawStream(stream ForwardRawRequest) returns (stream ForwardRawResponse);
+
   // MountParentExt4ReadOnly (ADR-053) is the staging-only path that
   // lets imaged compose the per-runtime base ext4 from a shared
   // debian:12-slim parent. imaged is not root (User=faas-imaged +
@@ -1254,4 +1281,70 @@ message CancelLiveMigrationRequest {
 message CancelLiveMigrationResponse {
   // Empty struct reserved for future fields. Same shape as
   // AcknowledgeMigrationResponse.
+}
+
+// ForwardRawRequestInit (issue #676 / ADR-080) is the first frame
+// of ForwardRawRequest. It carries the addressable destination
+// (instance + port) and the per-connection inbound byte cap. No
+// method, request_uri, or headers — the bridge is bytes, so HTTP
+// framing stays on the wire inside the first bytes the caller
+// sends. The init frame is the only place `max_request_bytes` is
+// honoured; subsequent frames are pure body bytes piped into the
+// guest TCP socket verbatim.
+message ForwardRawRequestInit {
+  // The compute_node-relative instance id (instances.id, scoped
+  // to a node). vmmd resolves the netns from this. Empty →
+  // InvalidArgument.
+  string instance = 1;
+  // Port (ADR-053, PR-C) is the guest-side TCP port the
+  // vmmd-raw-bridge should dial. Defaults to netns.AppPort (8080)
+  // when zero — legacy gateway clients keep working. Additive per
+  // ADR-016.
+  uint32 port = 2;
+  // max_request_bytes caps the cumulative client→guest bytes
+  // vmmd will accept before closing the bridge. Past the cap the
+  // bridge stops reading from the gRPC stream and the guest sees
+  // a clean half-close. Defaults to 100 MiB (matches
+  // ForwardStreamMaxBodyBytes) when zero.
+  int64 max_request_bytes = 3;
+}
+
+// ForwardRawRequest (issue #676 / ADR-080) is one frame on the
+// client→server stream. The first frame MUST carry the `init`
+// field with the destination envelope; subsequent frames carry
+// raw request body bytes in `body_chunk`. Half-close on the
+// client side signals end-of-body. Header order is preserved
+// exactly as the caller wrote it; vmmd does not deduplicate.
+message ForwardRawRequest {
+  oneof frame {
+    ForwardRawRequestInit init = 1;
+    bytes body_chunk = 2;
+  }
+}
+
+// ForwardRawResponseInit (issue #676 / ADR-080) is the first
+// frame of ForwardRawResponse. Status is the upstream HTTP status
+// code (typically 101 for WebSocket); headers are the upstream
+// response headers in the order the guest wrote them. Error is
+// the gRPC-status-equivalent message (empty on success); non-empty
+// means the server is signalling a failure before the body even
+// started (e.g. guest dial refused, nsenter failed).
+message ForwardRawResponseInit {
+  int32 status = 1;
+  repeated Header headers = 2;
+  // Non-empty on failure: e.g. "could not dial guest: timeout".
+  string error = 3;
+}
+
+// ForwardRawResponse (issue #676 / ADR-080) is one frame on the
+// server→client stream. The first frame carries the response init
+// envelope (status + headers + termination_kind). Subsequent
+// frames carry raw response body bytes that the bridge read off
+// the guest TCP socket. The server half-closes the stream when
+// the guest closes the connection.
+message ForwardRawResponse {
+  oneof frame {
+    ForwardRawResponseInit init = 1;
+    bytes body_chunk = 2;
+  }
 }

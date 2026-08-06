@@ -42,6 +42,7 @@ package vmmdgrpc
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -49,11 +50,14 @@ import (
 	"net/http/httputil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -415,6 +419,498 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		return streamErr
 	}
 	return nil
+}
+
+// ForwardRawStreamMaxRequestBytes is the default inbound cap on the
+// raw-bytes bridge (issue #676 / ADR-080). The value lives in
+// pkg/api (api.RawStreamMaxRequestBytes) per CLAUDE.md "every
+// plan quota/limit lives in this one table — never inline a
+// limit"; this re-export keeps the vmmdgrpc test surface stable
+// (pkg/api has no // +build metal counterpart) and documents the
+// intent for the test reader. The init frame's max_request_bytes
+// is clamped DOWN to api.RawStreamMaxRequestBytes in
+// rawBridgeBodyLoop — callers can ask for less, never more.
+const ForwardRawStreamMaxRequestBytes = api.RawStreamMaxRequestBytes
+
+// vmmdRawBridgePath is the install path of the cmd/vmmd-raw-bridge
+// Go binary. Mirrors the deployment convention of vmmd itself
+// (/opt/faas/current/bin/vmmd-raw-bridge). MUST be an absolute
+// path: vmmd is the only root component on the host (CLAUDE.md)
+// and the bridge reads the customer's raw request bytes from
+// stdin — a $PATH-relative "vmmd-raw-bridge" lookup would let an
+// attacker who can write to any PATH directory plant a malicious
+// binary that exfiltrates auth headers. Tests that need to run
+// the bridge without the production install override via
+// FAAS_VMMD_RAW_BRIDGE_PATH (env var, absolute path only).
+const vmmdRawBridgePath = "/opt/faas/current/bin/vmmd-raw-bridge"
+
+// rawBridgePathEnv is the env-var name that lets the test suite
+// (and any future operator override) point at an alternate
+// install path without rebuilding. The handler rejects
+// non-absolute overrides to keep the privilege-escalation
+// invariant — there is no PATH search regardless of how the
+// override is supplied.
+const rawBridgePathEnv = "FAAS_VMMD_RAW_BRIDGE_PATH"
+
+// resolveRawBridgePath returns the absolute path to the
+// vmmd-raw-bridge binary that rawBridgeSpawn will exec. The
+// resolution order is:
+//
+//  1. FAAS_VMMD_RAW_BRIDGE_PATH env var, if set and absolute
+//  2. The hard-coded production path
+//
+// Anything else (relative override, missing binary) returns a
+// stable error rather than falling back to a $PATH lookup — the
+// legacy shell bridge avoided the same surface by inlining the
+// script via `sh -c` (string content is not unlinkable), and the
+// Go bridge must hold the same invariant.
+func resolveRawBridgePath() (string, error) {
+	if override := os.Getenv(rawBridgePathEnv); override != "" {
+		if !filepath.IsAbs(override) {
+			return "", fmt.Errorf("raw bridge override %s=%q must be an absolute path", rawBridgePathEnv, override)
+		}
+		return override, nil
+	}
+	return vmmdRawBridgePath, nil
+}
+
+// ForwardRawStream (issue #676 / ADR-080) is the raw-bytes bridge
+// for Upgrade (WebSocket / h2c / MQTT-over-WS / long-poll) traffic.
+// The legacy ForwardHTTPStream strips Upgrade + Connection as
+// hop-by-hop headers and the shell-script bridge hard-codes
+// Transfer-Encoding: chunked + a Host rewrite — both destroy the
+// raw bytes an Upgrade handshake needs. ForwardRawStream carries
+// the customer's verbatim HTTP request bytes (status line + headers
+// + body) into the guest's netns TCP socket and reads back the
+// raw response — no HTTP parsing, no chunked framing, no header
+// rewriting by vmmd.
+//
+// Wire shape (mirrors ForwardHTTPStream):
+//
+//	client → server: 1× ForwardRawRequestInit (instance, port, max
+//	                 request bytes), then N× body_chunk bytes that
+//	                 the bridge writes verbatim to the guest TCP
+//	                 socket. Half-close = EOF.
+//	server → client: 1× ForwardRawResponseInit (status + headers
+//	                 + error message), then N× body_chunk bytes
+//	                 that the bridge read off the guest TCP
+//	                 socket. Server half-closes when the guest
+//	                 closes the connection.
+//
+// The bridge that owns the guest TCP socket is the new
+// vmmd-raw-bridge Go binary (cmd/vmmd-raw-bridge/), spawned by
+// vmmd under the stream context via `ip netns exec <netns>
+// vmmd-raw-bridge <ip> <port>`. The Go binary replaces the bash
+// /dev/tcp pattern with explicit Go netns entry + net.Dial + a
+// framing protocol that sends the HTTP response head first
+// (status line + headers + blank line) and then raw body bytes —
+// parseBridgeOutput consumes the head the same way the existing
+// shell bridge does. The bridge spawn is identical in shape to
+// the existing ForwardHTTPStream handler (cmd + os.Pipe + exec),
+// so the cancellation, body-goroutine, and endActivity plumbing
+// are line-for-line the same and stripped nothing from the
+// existing RPC.
+//
+// Errors map the same way as ForwardHTTPStream: NotFound for
+// unknown instance, Internal for nsenter / bridge crash,
+// Unavailable for guest dial refused. The raw RPC is the
+// durable Upgrade path; the legacy ForwardHTTPStream is the
+// durable plain-HTTP path. Both RPCs coexist per ADR-016.
+func (s *Server) ForwardRawStream(stream grpc.BidiStreamingServer[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse]) error {
+	const op = "ForwardRawStream"
+	start := time.Now()
+	defer func() { s.ops.Observe(op, time.Since(start), nil) }()
+
+	// Receive the init frame and resolve the netns + dial port
+	// (single-frame rule, same contract as ForwardHTTPStream at
+	// line 110-124).
+	init, err := stream.Recv()
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "expected init frame: %v", err)
+	}
+	reqInit := init.GetInit()
+	if reqInit == nil {
+		return status.Error(codes.InvalidArgument, "first frame must be ForwardRawRequestInit")
+	}
+	if reqInit.GetInstance() == "" {
+		return status.Error(codes.InvalidArgument, "instance is required")
+	}
+
+	// Per-instance concurrency accounting (mirrors ForwardHTTPStream).
+	s.beginActivity(reqInit.GetInstance())
+	defer s.endActivity(reqInit.GetInstance())
+
+	netnsName, ok := s.vmm.NetnsFor(reqInit.GetInstance())
+	if !ok {
+		return status.Errorf(codes.NotFound, "instance %q not live", reqInit.GetInstance())
+	}
+	dialPort := reqInit.GetPort()
+	if dialPort == 0 {
+		dialPort = uint32(netns.AppPort)
+	}
+
+	// Spawn the bridge, wire the body-copy goroutine, then run
+	// the head read + body pump. Each step is its own helper so
+	// the handler stays under the CLAUDE.md 50-line cap and the
+	// individual concerns (process lifecycle, streaming, error
+	// mapping) are testable in isolation.
+	cmd, stdinR, stdinW, stdoutR, stderr, err := rawBridgeSpawn(stream.Context(), netnsName, dialPort)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stdinR.Close() }()
+	defer func() { _ = stdinW.Close() }()
+	defer func() { _ = stdoutR.Close() }()
+
+	bodyErrCh, bodyWG := rawBridgeBodyLoop(stream, stdinW, reqInit.GetMaxRequestBytes())
+
+	headReader := bufio.NewReader(stdoutR)
+	parsed, headErr := rawBridgeReadHead(headReader, stderr.String())
+	if headErr != nil {
+		// Send the init frame with Error populated so callers
+		// reading init.error (per vmmd.proto:1325-1337) detect
+		// the failure on the wire, then return the gRPC error
+		// so the standard status mechanism also fires. The init
+		// status field carries 502 because the body never
+		// started (matches the proto's "before the body even
+		// started" framing — see vmmd.proto:1335-1336).
+		sendErr := stream.Send(&vmmdpb.ForwardRawResponse{
+			Frame: &vmmdpb.ForwardRawResponse_Init{
+				Init: &vmmdpb.ForwardRawResponseInit{
+					Status: 502,
+					Error:  headErr.Error(),
+				},
+			},
+		})
+		// Wait for the body goroutine to actually exit (not
+		// just probe the channel — a still-blocked goroutine
+		// would have us read the zero value and silently drop
+		// the error). rawBridgeFinish handles the cmd.Wait +
+		// WaitGroup coordination.
+		_ = rawBridgeFinish(cmd, bodyErrCh, bodyWG, stream.Context(), stderr.String())
+		if sendErr != nil {
+			return status.Errorf(codes.Internal,
+				"raw bridge head failed (%v) AND init send failed: %v", headErr, sendErr)
+		}
+		return headErr
+	}
+	if err := stream.Send(&vmmdpb.ForwardRawResponse{
+		Frame: &vmmdpb.ForwardRawResponse_Init{
+			Init: &vmmdpb.ForwardRawResponseInit{
+				Status:  parsed.Status,
+				Headers: parsed.Headers,
+			},
+		},
+	}); err != nil {
+		_ = rawBridgeFinish(cmd, bodyErrCh, bodyWG, stream.Context(), stderr.String())
+		return status.Errorf(codes.Internal, "raw bridge init send: %v", err)
+	}
+
+	if err := rawBridgePumpBody(stream, headReader, parsed.Body); err != nil {
+		_ = rawBridgeFinish(cmd, bodyErrCh, bodyWG, stream.Context(), stderr.String())
+		return err
+	}
+	return rawBridgeFinish(cmd, bodyErrCh, bodyWG, stream.Context(), stderr.String())
+}
+
+// rawBridgeSpawn resolves the vmmd-raw-bridge binary path, opens
+// the stdio pipes, and starts the bridge under `ip netns exec`.
+// Returns the running *exec.Cmd + the pipe ends + the stderr
+// capture buffer. Callers own stdinR/stdoutR (close on exit) and
+// stdinW (closed by the body-loop goroutine on its own exit).
+//
+// Bridge path resolution: production uses
+// /opt/faas/current/bin/vmmd-raw-bridge (resolveRawBridgePath);
+// tests override via FAAS_VMMD_RAW_BRIDGE_PATH. The function
+// pre-validates the path is absolute and the binary exists so
+// the legacy shell bridge's `sh -c <inline-script>` TOCTOU-free
+// property is preserved — the resolved file is opened by
+// execve(2) before the kernel unlinks its inode can race us.
+func rawBridgeSpawn(ctx context.Context, netnsName string, dialPort uint32) (*exec.Cmd, *os.File, *os.File, *os.File, *bytes.Buffer, error) {
+	bridgePath, err := resolveRawBridgePath()
+	if err != nil {
+		return nil, nil, nil, nil, nil, status.Errorf(codes.FailedPrecondition, "raw bridge path: %v", err)
+	}
+	if _, statErr := os.Stat(bridgePath); statErr != nil {
+		return nil, nil, nil, nil, nil, status.Errorf(codes.FailedPrecondition,
+			"raw bridge binary missing at %s (override via %s): %v",
+			bridgePath, rawBridgePathEnv, statErr)
+	}
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		return nil, nil, nil, nil, nil, status.Errorf(codes.Internal, "pipe: %v", err)
+	}
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		return nil, nil, nil, nil, nil, status.Errorf(codes.Internal, "stdout pipe: %v", err)
+	}
+
+	cmd := exec.CommandContext(ctx, "ip", "netns", "exec", netnsName,
+		bridgePath, netns.GuestIP, strconv.FormatUint(uint64(dialPort), 10))
+	cmd.Stdin = stdinR
+	cmd.Stdout = stdoutW
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return nil, nil, nil, nil, nil, status.Errorf(codes.Unavailable, "raw bridge start: %v", err)
+	}
+	// The bridge owns the write end of stdout; we own the read end.
+	// Closing stdoutW after cmd.Wait ensures the pipe reader sees EOF.
+	defer func() { _ = stdoutW.Close() }()
+	return cmd, stdinR, stdinW, stdoutR, &stderr, nil
+}
+
+// rawBridgeBodyLoop copies inbound body_chunks → bridge stdin.
+// The goroutine owns stdinW (closes it on exit — the EOF signal
+// that lets the bridge's stdin read loop return). The byte
+// counter enforces maxBody; past the cap the goroutine stops
+// reading and surfaces ResourceExhausted via the returned
+// channel.
+//
+// The caller's maxRequestBytes is clamped DOWN to
+// api.RawStreamMaxRequestBytes — the vmmd side is authoritative
+// on the cap. A caller that sets max_request_bytes to
+// math.MaxInt64 still gets the 100 MiB ceiling, so the
+// pkg/api/limits.go invariant ("never inline a limit; the table
+// is the source of truth") survives a misconfigured gatewayd.
+//
+// Returns the body-error channel AND a *sync.WaitGroup that
+// signals when the goroutine has actually exited. rawBridgeFinish
+// MUST wait on the WaitGroup (not just probe the channel): a
+// client disconnect mid-response leaves the goroutine blocked
+// in stream.Recv() until the stream context cancels — probing
+// the channel while it is still blocked reads the zero value
+// (nil) and surfaces OK for a truncated response. The
+// combination WaitGroup + stream.Context() makes the disconnect
+// detection deterministic.
+func rawBridgeBodyLoop(stream grpc.BidiStreamingServer[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], stdinW *os.File, maxRequestBytes int64) (chan error, *sync.WaitGroup) {
+	maxBody := api.RawStreamMaxRequestBytes
+	if maxRequestBytes > 0 && maxRequestBytes < maxBody {
+		maxBody = maxRequestBytes
+	}
+	bodyErrCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { _ = stdinW.Close() }()
+		var written int64
+		for {
+			f, err := stream.Recv()
+			if errors.Is(err, io.EOF) {
+				bodyErrCh <- nil
+				return
+			}
+			if err != nil {
+				bodyErrCh <- err
+				return
+			}
+			chunk := f.GetBodyChunk()
+			if len(chunk) == 0 {
+				continue
+			}
+			if written+int64(len(chunk)) > maxBody {
+				bodyErrCh <- status.Errorf(codes.ResourceExhausted,
+					"raw bridge request body exceeded %d bytes", maxBody)
+				return
+			}
+			if _, err := stdinW.Write(chunk); err != nil {
+				bodyErrCh <- err
+				return
+			}
+			written += int64(len(chunk))
+		}
+	}()
+	return bodyErrCh, &wg
+}
+
+// rawBridgeReadHead reads the response head from the bridge's
+// stdout, parses it via parseBridgeOutput, and returns the
+// status + headers + initial body buffer for the caller to ship
+// in the ForwardRawResponseInit frame.
+//
+// On failure the returned error carries an informational
+// message; the caller is responsible for sending the
+// ForwardRawResponseInit frame with Error populated (so PR-2
+// gateway code that reads init.error != ” works) and for
+// draining bodyErrCh + cmd.Wait. Body-goroutine drain is the
+// caller's job because the caller decides whether to attempt
+// the Error-frame send first (the proto's "before the body even
+// started" failure signal).
+func rawBridgeReadHead(r *bufio.Reader, stderr string) (*parsedBridgeResponse, error) {
+	head, err := readUntilBlankLine(r)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "raw bridge head read: %v (stderr=%q)", err, stderr)
+	}
+	parsed, err := parseBridgeOutput(head)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "raw bridge head parse: %v", err)
+	}
+	return parsed, nil
+}
+
+// rawBridgePumpBody streams the guest's response body to the
+// client. The first body buffer (parsed.Body) arrives inside
+// the head read; subsequent bytes are read from the same
+// bufio.Reader (which the bridge is feeding in 8 KiB-friendly
+// chunks). The 8 KiB chunk is hoisted out of the loop so the
+// hot path doesn't allocate per iteration.
+//
+// On any send error the function drains the body goroutine and
+// surfaces Internal — the bidi stream is already half-closed by
+// the guest at that point.
+func rawBridgePumpBody(stream grpc.BidiStreamingServer[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], r *bufio.Reader, initialBody []byte) error {
+	const respChunkSize = 8 * 1024
+	if len(initialBody) > 0 {
+		if err := stream.Send(&vmmdpb.ForwardRawResponse{
+			Frame: &vmmdpb.ForwardRawResponse_BodyChunk{
+				BodyChunk: append([]byte(nil), initialBody...),
+			},
+		}); err != nil {
+			return status.Errorf(codes.Internal, "raw bridge body send: %v", err)
+		}
+	}
+	buf := make([]byte, respChunkSize)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			if err := stream.Send(&vmmdpb.ForwardRawResponse{
+				Frame: &vmmdpb.ForwardRawResponse_BodyChunk{
+					BodyChunk: append([]byte(nil), buf[:n]...),
+				},
+			}); err != nil {
+				return status.Errorf(codes.Internal, "raw bridge body send: %v", err)
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			return nil
+		}
+		if rerr != nil {
+			return status.Errorf(codes.Internal, "raw bridge body read: %v", rerr)
+		}
+	}
+}
+
+// rawBridgeFinish waits on the bridge process AND the body
+// goroutine, then maps the combined result to a gRPC error.
+//
+// Coordination contract (issue #676 review fix): the body
+// goroutine can be blocked in stream.Recv() when the bridge
+// exits — probing bodyErrCh at that moment reads the zero
+// value (nil) from the buffered channel and the handler
+// returns OK on a truncated response. The fix is to wait on
+// the WaitGroup so the goroutine has actually exited, and
+// fall back to the stream context if the wait would block
+// indefinitely (the goroutine's stream.Recv will unblock when
+// the client disconnects, but only after the gRPC server
+// processes the RST_STREAM — for a hung gateway we cap the
+// wait at stream.Context().Done() and derive the body error
+// from the context cancellation).
+//
+// cmd.Wait is load-bearing — without it the child becomes a
+// zombie and the captured stderr is unavailable when the
+// bridge crashes. ResourceExhausted from the body-loop's
+// cap-enforcement branch is the customer-facing signal; any
+// other body error is Internal. A clean EOF on both sides
+// returns nil.
+func rawBridgeFinish(cmd *exec.Cmd, bodyErrCh <-chan error, bodyWG *sync.WaitGroup, streamCtx context.Context, stderr string) error {
+	waitErr := cmd.Wait()
+
+	// Wait for the body goroutine to actually exit. If it
+	// doesn't exit within the stream-context deadline, the
+	// client disconnect path is the cause — surface the
+	// context error so the gateway sees Canceled instead of
+	// OK on a truncated response.
+	var bodyErr error
+	doneCh := make(chan struct{})
+	go func() { bodyWG.Wait(); close(doneCh) }()
+	select {
+	case <-doneCh:
+		// Goroutine exited; drain the buffered error if any.
+		select {
+		case bodyErr = <-bodyErrCh:
+		default:
+		}
+	case <-streamCtx.Done():
+		// Client disconnected (or stream context cancelled
+		// for any other reason). Surface as Canceled so the
+		// gateway knows the response was truncated. The
+		// goroutine will exit when stream.Recv() unblocks
+		// from the context cancellation — but we don't wait
+		// for it; the handler is returning now and the
+		// goroutine will be cleaned up by the gRPC server's
+		// stream teardown.
+		bodyErr = status.Errorf(codes.Canceled, "raw bridge body: client disconnected before request body complete: %v", streamCtx.Err())
+	}
+
+	if bodyErr != nil {
+		if st, ok := status.FromError(bodyErr); ok && st.Code() == codes.ResourceExhausted {
+			return bodyErr
+		}
+		if st, ok := status.FromError(bodyErr); ok && st.Code() == codes.Canceled {
+			return bodyErr
+		}
+		// Bridge crash (non-zero exit) — surface stderr so the
+		// gateway can log the bridge's last words.
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) || errors.As(bodyErr, &exitErr) {
+			return status.Errorf(codes.Internal, "raw bridge body: %v wait=%v (stderr=%q)", bodyErr, waitErr, stderr)
+		}
+	}
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			return status.Errorf(codes.Internal, "raw bridge exited: %v (stderr=%q)", exitErr, stderr)
+		}
+	}
+	return nil
+}
+
+// readUntilBlankLine reads from r until it sees the HTTP/1.1
+// head terminator ("\n\n") or EOF. Returns the head bytes WITH
+// each line's trailing "\n" intact (parseBridgeOutput's
+// contract — see the legacy ForwardHTTPStream head-read at
+// line 294-313) and the terminator line itself dropped. The
+// body bytes that arrived inside the same read as the head
+// remain on the bufio.Reader for the body loop below.
+//
+// Mirrors the legacy pattern: line-by-line ReadString('\n')
+// + a 64 KiB cap. The cap is the load-bearing piece: a
+// malicious or buggy guest that never sends the terminator
+// must not OOM the server. In practice HTTP/1.1 heads are
+// <8 KiB; 64 KiB is the same budget ForwardHTTPStream uses.
+//
+// Returns the partial bytes + io.EOF when the bridge closes the
+// stream mid-head — the caller decides whether the partial
+// bytes are a valid head (they almost never are) and surfaces
+// a Unavailable to the gateway.
+func readUntilBlankLine(r *bufio.Reader) ([]byte, error) {
+	const headCap = 64 * 1024
+	var out []byte
+	for {
+		line, err := r.ReadString('\n')
+		out = append(out, line...)
+		if line == "\n" {
+			// terminator line — return everything before it.
+			return out[:len(out)-1], nil
+		}
+		if len(out) > headCap {
+			return nil, fmt.Errorf("bridge head exceeds %d bytes", headCap)
+		}
+		if errors.Is(err, io.EOF) {
+			return out, io.EOF
+		}
+		if err != nil {
+			return out, err
+		}
+	}
 }
 
 // buildStreamingBridgeScript (issue #471 PR-B + PR-C / ADR-047)

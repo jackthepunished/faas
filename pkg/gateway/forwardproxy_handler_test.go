@@ -71,6 +71,17 @@ func (s *stubVmmdClient) ForwardHTTPStream(ctx context.Context, _ ...grpc.CallOp
 	return stream, nil
 }
 
+// ForwardRawStream is the PR-3 stub for the Upgrade-traffic
+// bridge. PR-1 only adds the wire contract + the vmmd-side
+// handler; the gateway-side forwarder that opens this stream
+// ships in PR-3 (per docs/adr/080 / issue #676 plan). For now
+// the stub returns Unimplemented so a code path that
+// accidentally reaches it surfaces as a clear error instead of
+// a silent zero-value stream.
+func (s *stubVmmdClient) ForwardRawStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], error) {
+	return nil, status.Error(codes.Unimplemented, "ForwardRawStream stub: PR-3 ships the gateway forwarder")
+}
+
 func (s *stubVmmdClient) CreateFromSnapshot(context.Context, *vmmdpb.CreateFromSnapshotRequest, ...grpc.CallOption) (*vmmdpb.WakeResponse, error) {
 	panic("CreateFromSnapshot: not stubbed in handler integration test")
 }
