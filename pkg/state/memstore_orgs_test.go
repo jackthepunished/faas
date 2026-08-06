@@ -553,6 +553,7 @@ func TestMemStore_CreateAccountWithPersonalOrg_SlugDeterministic(t *testing.T) {
 		t.Errorf("slug = %q, want %q", res.PersonalOrg.Slug, want)
 	}
 }
+
 // TestMemStore_CountActiveOrgMembers_RemovedFiltered pins that the
 // in-memory counter ignores soft-deleted memberships (mirrors the
 // partial unique index on the SQL side). Hobby plan (OrgMembersMax=10)
@@ -644,6 +645,7 @@ func TestMemStore_CountPendingOrgInvitations_FiltersExpired(t *testing.T) {
 		t.Errorf("CountPendingOrgInvitations = %d, want 1 (only the pending row)", n)
 	}
 }
+
 // TestMemStore_ConsumeOrgInvitation_MemberCap is the in-memory
 // parity twin of TestPgStore_ConsumeOrgInvitation_MemberCap (IAM-6
 // / ADR-061 PR-2). Pins that the memstore cap check refuses an

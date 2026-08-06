@@ -10937,19 +10937,19 @@ func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, rol
 	}
 
 	// Defence-in-depth note (IAM-6 / ADR-061 PR 2):
-// AddOrgMember does NOT enforce the OrgMembersMax cap here. The
-// cap is enforced at two layers instead:
-//   1. Wire helper `cmd/apid::enforceMemberCap` (handler prelude)
-//   2. Store `consumeOrgInvitation` (the only consumer path that
-//      inserts a membership from outside the org)
-// Both run before the insert lands. A direct `AddOrgMember` call
-// (e.g. the owner-seed path in `cmd/apid::createSharedOrg` and the
-// owner-takeover path in `transferOrgOwnership`) is internal — it
-// always adds exactly one row at a time, with a pre-checked role
-// from the caller, so a third cap layer would only add a redundant
-// SQL count + the test-fixture friction of pre-promoting Free orgs
-// to Hobby. The single-owner partial unique index (`org_memberships_one_owner_idx`)
-// is the authoritative "one owner per non-personal org" guard.
+	// AddOrgMember does NOT enforce the OrgMembersMax cap here. The
+	// cap is enforced at two layers instead:
+	//   1. Wire helper `cmd/apid::enforceMemberCap` (handler prelude)
+	//   2. Store `consumeOrgInvitation` (the only consumer path that
+	//      inserts a membership from outside the org)
+	// Both run before the insert lands. A direct `AddOrgMember` call
+	// (e.g. the owner-seed path in `cmd/apid::createSharedOrg` and the
+	// owner-takeover path in `transferOrgOwnership`) is internal — it
+	// always adds exactly one row at a time, with a pre-checked role
+	// from the caller, so a third cap layer would only add a redundant
+	// SQL count + the test-fixture friction of pre-promoting Free orgs
+	// to Hobby. The single-owner partial unique index (`org_memberships_one_owner_idx`)
+	// is the authoritative "one owner per non-personal org" guard.
 
 	var inv *string
 	if invitedBy != nil {

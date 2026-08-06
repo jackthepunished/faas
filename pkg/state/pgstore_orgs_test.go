@@ -727,6 +727,7 @@ func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
 		t.Errorf("post-failure member role = %q, want developer", row.Role)
 	}
 }
+
 // TestPgStore_ConsumeOrgInvitation_MemberCap pins the IAM-6 / ADR-061
 // PR-2 cap check on the load-bearing insert path. Hobby's
 // OrgMembersMax == 10; an invitation accept that would push active

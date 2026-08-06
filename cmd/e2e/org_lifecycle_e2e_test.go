@@ -976,12 +976,18 @@ func TestE2E_OrgLifecycle_MemberCap(t *testing.T) {
 			// partial unique.
 			seedAcceptor := func(t *testing.T, i int) state.Account {
 				t.Helper()
-				planOffset := map[api.Plan]int{
-					api.PlanHobby: 0x000000000000,
-					api.PlanPro:   0x100000000000,
-					api.PlanScale: 0x200000000000,
+				// Plan-distinct third-segment nibble (4 hex chars
+				// per RFC 4122 8-4-4-4-12 layout) so Hobby + Pro +
+				// Scale acceptors don't collide on the
+				// (org_id, account_id) partial unique. The 12-char
+				// last group stays i-driven so a single plan's
+				// (cap-1) acceptors fit.
+				planNibble := map[api.Plan]int{
+					api.PlanHobby: 0x0,
+					api.PlanPro:   0x1,
+					api.PlanScale: 0x2,
 				}[plan]
-				id := fmt.Sprintf("00000000-0000-0000-%06x-%012x", planOffset>>24, i)
+				id := fmt.Sprintf("00000000-0000-0000-%04x-%012x", planNibble, i)
 				email := fmt.Sprintf("cap-%s-%d@x.com", plan, i)
 				if _, err := pool.Exec(ctx,
 					"insert into accounts (id, email, plan, created_at) values ($1::uuid, $2, 'free', now()) on conflict do nothing",
@@ -1047,12 +1053,12 @@ func TestE2E_OrgLifecycle_MemberCap(t *testing.T) {
 			// first non-alice member), then re-attempt the cap-
 			// blocked accept — should succeed because active
 			// dropped to (limit - 1).
-			planOffset := map[api.Plan]int{
-				api.PlanHobby: 0x000000000000,
-				api.PlanPro:   0x100000000000,
-				api.PlanScale: 0x200000000000,
+			planNibble2 := map[api.Plan]int{
+				api.PlanHobby: 0x0,
+				api.PlanPro:   0x1,
+				api.PlanScale: 0x2,
 			}[plan]
-			firstID := fmt.Sprintf("00000000-0000-0000-%06x-%012x", planOffset>>24, 1)
+			firstID := fmt.Sprintf("00000000-0000-0000-%04x-%012x", planNibble2, 1)
 			if err := store.RemoveOrgMember(ctx, orgID, firstID); err != nil {
 				t.Fatalf("RemoveOrgMember: %v", err)
 			}
