@@ -721,3 +721,205 @@ func TestSessionAuth_StampsStepUpOnRequestContext(t *testing.T) {
 		t.Errorf("body missing code %q; got %s", api.CodeMFARequired, rec.Body.String())
 	}
 }
+
+// --- raiseOverageCap dashboard (issue #561) ----------------------------------
+//
+// POST /dashboard/raise-overage-cap is the dashboard mirror of the
+// v1 API endpoint. The CSRF envelope is the same one Issue pattern
+// (CookieNameAuthenticated sidecar + csrf_token field, both bound
+// to action="raise_overage_cap" by middleware.IssueForAuthenticated).
+// The renderBilling helper mints the pair on GET, so the test
+// drives a real GET → POST pair to mirror the customer's
+// browser-side flow.
+
+// renderDashboardBilling GETs /dashboard/billing with the session
+// cookie and returns the rendered form's csrf_token value + the
+// matching faas_csrf sidecar cookie. Mirrors renderDashboardAccount
+// (dashboard_delete_test.go:57) but reaches the billing route
+// because the raise-cap form lives on /dashboard/billing, not
+// /dashboard/account.
+func renderDashboardBilling(t *testing.T, h http.Handler, sid *http.Cookie) (csrfCookie, raiseToken string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/billing", nil)
+	req.AddCookie(sid)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard/billing: status = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == middleware.CookieNameAuthenticated {
+			csrfCookie = c.Value
+		}
+	}
+	if csrfCookie == "" {
+		t.Fatalf("GET /dashboard/billing: missing %s cookie in Set-Cookie: %v",
+			middleware.CookieNameAuthenticated, rec.Header().Get("Set-Cookie"))
+	}
+	raiseToken = extractInputValue(rec.Body.String(), "csrf_token", "/dashboard/raise-overage-cap")
+	if raiseToken == "" {
+		t.Fatalf("GET /dashboard/billing: missing raise-cap csrf_token form field\nbody = %s", rec.Body.String())
+	}
+	return csrfCookie, raiseToken
+}
+
+// TestDashboardBilling_RendersOverageCap confirms the billing page
+// renders the spend-cap section + the raise-cap form. The test
+// seeds a non-zero cap so it can pin the configured-cap row's
+// value (the "no cap" branch is covered by the unset fixture in
+// TestDashboardRaiseOverageCap_PostsForm). The render must include
+// the CSRF token AND the form's POST action so the next request
+// lands on the right handler.
+func TestDashboardBilling_RendersOverageCap(t *testing.T) {
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(t.Context(), "billing-cap@example.com", "pro")
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if err := store.UpdateAccountOverageCapCents(t.Context(), acct.ID, ptrInt64(2500)); err != nil {
+		t.Fatalf("seed cap: %v", err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatalf("session manager: %v", err)
+	}
+	sid, err := mgr.Issue(acct.ID)
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"gregale.dev", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil,
+		15*60_000_000_000, "").handler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/billing", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sid})
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200\nbody = %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		// Spend-cap section header.
+		"Spend cap",
+		// Configured-cap row.
+		"2500 cents / month",
+		// Form's POST action.
+		`action="/dashboard/raise-overage-cap"`,
+		// CSRF token field.
+		`name="csrf_token"`,
+		// Number input — the only field besides csrf_token.
+		`name="overage_cap_cents"`,
+		// Helper text explains the cap=0 path (review finding #4).
+		"Set 0 to allow no overage at all",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	// The `clear` checkbox was removed (review finding #4); an
+	// accidental re-introduction would surface here.
+	if strings.Contains(body, `name="clear"`) {
+		t.Errorf("body still contains `name=\"clear\"` checkbox; review finding #4 wants this removed\nbody:\n%s", body)
+	}
+}
+
+// TestDashboardRaiseOverageCap_PostsForm drives a real GET → POST
+// pair against the dashboard billing page. The renderer mints the
+// faas_csrf cookie + raise-cap csrf_token field; the POST verifies
+// the envelope and 302s to /dashboard/billing?cap=updated. The
+// pivot is the new account's overage_cap_cents column: it must
+// reflect the form value (2500) after the redirect.
+//
+// Step-up gated: requires a fresh StepUpAt stamp on the cookie
+// envelope so the requireStepUpHandler(5m) gate passes (review
+// finding #10 — the route matches dashboardDelete's threat model).
+func TestDashboardRaiseOverageCap_PostsForm(t *testing.T) {
+	// newAuthedDashboardServerFull wires the real session.Manager +
+	// MemStore AND seeds the alice@example.com account — we reuse
+	// that account so the session.Issue path has a valid row.
+	srv, _, store, mgr := newAuthedDashboardServerFull(t)
+	accts, err := store.AccountByEmail(t.Context(), "alice@example.com")
+	if err != nil {
+		t.Fatalf("AccountByEmail: %v", err)
+	}
+	sid := "raised-cap-sid"
+	if _, err := store.CreateSession(t.Context(), sid, accts.ID, "192.0.2.10", "raised-cap-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	steppedCookie, err := mgr.IssueWithSessionAndBindingHashAndStepUp(sid, accts.ID, "", time.Now(), false)
+	if err != nil {
+		t.Fatalf("issue stepped-up cookie: %v", err)
+	}
+	sessionCookieVal := &http.Cookie{Name: sessionCookie, Value: steppedCookie}
+
+	csrfCookie, raiseToken := renderDashboardBilling(t, srv, sessionCookieVal)
+	if raiseToken == "" {
+		t.Fatal("rendered billing page is missing the raise-cap csrf_token")
+	}
+	rec := dashboardPOST(t, srv, sessionCookieVal,
+		"/dashboard/raise-overage-cap",
+		map[string]string{
+			middleware.FormFieldName: raiseToken,
+			"overage_cap_cents":      "2500",
+		},
+		&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: csrfCookie})
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "cap=updated") {
+		t.Errorf("Location = %q, want cap=updated", loc)
+	}
+	// Storage: cap is now 2500.
+	cents, found, err := store.GetAccountOverageCapCents(t.Context(), accts.ID)
+	if err != nil {
+		t.Fatalf("GetAccountOverageCapCents: %v", err)
+	}
+	if !found || cents != 2500 {
+		t.Errorf("cents = %d, found = %v, want 2500/true", cents, found)
+	}
+	// Audit row: overage.cap_changed emitted by the shared svc.
+	rows, err := store.ListEvents(t.Context(), accts.ID, 50)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var hit *state.Event
+	for i := range rows {
+		if rows[i].Kind == "overage.cap_changed" {
+			hit = &rows[i]
+			break
+		}
+	}
+	if hit == nil {
+		t.Fatalf("overage.cap_changed audit row not found; events: %+v", rows)
+	}
+}
+
+// TestDashboardRaiseOverageCap_RejectsPreStepUpCookie pins the
+// step-up gate (review finding #10). A cookie with env.StepUpAt =
+// zero (the pre-PR-#653 envelope, what newAuthedDashboardServer's
+// mgr.Issue emits) must 403 at the requireStepUpHandler gate
+// before the CSRF check runs. Mirrors TestSessionAuth_StampsStepUpOnRequestContext
+// for this route.
+//
+// We piggyback on newAuthedDashboardServer's alice@example.com
+// account (the helper seeds it for us) — the route under test
+// requires the same login envelope, and the step-up gate fires
+// regardless of which account is involved.
+func TestDashboardRaiseOverageCap_RejectsPreStepUpCookie(t *testing.T) {
+	srv, sid := newAuthedDashboardServer(t)
+	csrfCookie, raiseToken := renderDashboardBilling(t, srv, sid)
+	if raiseToken == "" {
+		t.Fatal("rendered billing page is missing the raise-cap csrf_token")
+	}
+	rec := dashboardPOST(t, srv, sid,
+		"/dashboard/raise-overage-cap",
+		map[string]string{
+			middleware.FormFieldName: raiseToken,
+			"overage_cap_cents":      "2500",
+		},
+		&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: csrfCookie})
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("pre-step-up cookie on /dashboard/raise-overage-cap: code = %d, want 403 (step-up gate)\nbody = %s", rec.Code, rec.Body.String())
+	}
+}

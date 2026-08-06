@@ -6,6 +6,7 @@ import type { AccountDeletionResponse } from '../models/AccountDeletionResponse.
 import type { AccountExportResponse } from '../models/AccountExportResponse.js';
 import type { AccountResponse } from '../models/AccountResponse.js';
 import type { ChangePlanRequest } from '../models/ChangePlanRequest.js';
+import type { RaiseOverageCapRequest } from '../models/RaiseOverageCapRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -138,6 +139,55 @@ export class AccountService {
       errors: {
         401: `code: unauthorized`,
         409: `code: account_deletion_confirm_required | account_deletion_pending | account_not_restorable`,
+      },
+    });
+  }
+  /**
+   * Set or clear the account's spend cap (issue
+   * Sets accounts.overage_cap_cents in integer cents. Body shape:
+   *
+   * {"overage_cap_cents": <int|null>}
+   *
+   * Pass `null` (or omit the field) to clear the cap (NULL).
+   * Pass 0 to set "no overage allowed." Passing a positive integer
+   * sets the monthly ceiling. The migration CHECK constraint at
+   * `migrations/00054_account_credits.sql` pins
+   * `overage_cap_cents IS NULL OR overage_cap_cents >= 0`; a
+   * negative value is rejected at the apid validator before the
+   * store ever sees it, returning 400 `validation_failed`.
+   *
+   * Once current-month overage meets/exceeds the cap, schedd refuses
+   * new wakes with `code: admission_refused` (HTTP 402). The cap is
+   * account-self-scoped (no admin scope required) and the response
+   * is the post-update account state. Audit row
+   * `overage.cap_changed` is emitted on every successful call.
+   *
+   * @returns AccountResponse The updated account.
+   * @throws ApiError
+   */
+  public static raiseOverageCap({
+    requestBody,
+    idempotencyKey,
+  }: {
+    requestBody: RaiseOverageCapRequest,
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<AccountResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/account/overage-cap',
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
       },
     });
   }

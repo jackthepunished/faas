@@ -73,6 +73,7 @@ var routeExclude = map[string]bool{
 	"POST /dashboard/account/restore":         true, // HTML form
 	"GET /dashboard/account/export":           true, // session-auth twin of /v1/account/export
 	"GET /dashboard/account/dpa":              true, // session-auth twin of DPA
+	"POST /dashboard/raise-overage-cap":       true, // HTML form (issue #561)
 	"POST /v1/cli-auth/code":                  true, // CLI device-code mint
 	"POST /v1/cli-auth/exchange":              true, // CLI device-code exchange
 	"GET /cli-auth":                           true, // dashboard claim form
@@ -120,11 +121,12 @@ var codeExclude = map[string]bool{
 // Either inline anonymous structs in handlers, or pure-documentation shapes
 // (error envelopes that don't directly mirror a Go type).
 var schemaSpecOnly = map[string]bool{
-	"ChangePlanRequest": true, // inline {Plan string} in cmd/apid/handlers_ext.go
-	"CreateKeyRequest":  true, // inline {Label string} in cmd/apid/handlers_ext.go
-	"RateLimitPlain":    true, // documentation-only shape for the authlimiter 429
-	"Trace":             true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
-	"TraceSpan":         true, // issue #555: subtree of Trace; gateway-internal type
+	"ChangePlanRequest":      true, // inline {Plan string} in cmd/apid/handlers_ext.go
+	"CreateKeyRequest":       true, // inline {Label string} in cmd/apid/handlers_ext.go
+	"RateLimitPlain":         true, // documentation-only shape for the authlimiter 429
+	"Trace":                  true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
+	"TraceSpan":              true, // issue #555: subtree of Trace; gateway-internal type
+	"RaiseOverageCapRequest": true, // issue #561: inline {OverageCapCents *int64} in cmd/apid/handlers_ext.go
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.

@@ -42,6 +42,27 @@ import (
 // pre-PR shaped.
 const auditActor = "apid"
 
+// auditOverageCapNullSentinel is the literal string the overage-cap
+// audit row writes for `new_cents` when the caller clears the cap
+// (NULL round-trip). The audit row is a JSON-encoded blob; a true
+// JSON null would round-trip cleanly, but the field could also be
+// a not-yet-set int64=0 — using a non-JSON string sentinel lets the
+// audit reader distinguish "cleared" from "set to 0" without a
+// separate discriminator column. The matching test in
+// handlers_ext_test.go::TestRaiseOverageCap_Clear asserts this
+// sentinel. The const lifts the goconst threshold (the string
+// was duplicated in handlers_ext.go + the test).
+const auditOverageCapNullSentinel = "null"
+
+// jsonNullBody is the literal "null" body that some Go versions
+// emit for an empty list response (encoding/json writes `null` for
+// a nil slice, `[]` for an empty but non-nil one). The empty-list
+// test in server_test.go::TestListApps_Empty accepts either shape
+// so the assertion holds across Go versions. Distinct from
+// auditOverageCapNullSentinel — the JSON-body "null" is Go's
+// runtime output, the audit-row "null" is an opaque string.
+const jsonNullBody = "null"
+
 // KindAuthLoginFailed is the events.kind value written for every
 // failed login attempt on the dashboard auth surface (issue #286,
 // SOC 2 CC7.2). The discriminator in the data payload is fixed —

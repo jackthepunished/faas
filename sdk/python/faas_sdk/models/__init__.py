@@ -198,6 +198,7 @@ from .queue_send_response import QueueSendResponse
 from .queue_state_response import QueueStateResponse
 from .queue_state_response_plan import QueueStateResponsePlan
 from .quota_block import QuotaBlock
+from .raise_overage_cap_request import RaiseOverageCapRequest
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
@@ -448,6 +449,7 @@ __all__ = (
     "QueueStateResponse",
     "QueueStateResponsePlan",
     "QuotaBlock",
+    "RaiseOverageCapRequest",
     "RenameAppRequest",
     "RepoResponse",
     "RotateAlertRuleSecretResponse",

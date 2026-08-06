@@ -7577,6 +7577,26 @@ func (s *PgStore) GetAccountOverageCapCents(ctx context.Context, accountID strin
 	return *cents, true, nil
 }
 
+// UpdateAccountOverageCapCents writes accounts.overage_cap_cents for
+// the given account. Pass nil → SQL NULL (no cap). Pass *non-nil →
+// the integer cents; 0 is preserved as "no overage allowed" and
+// distinguished from NULL by the reader's (cents, ok) return shape.
+//
+// Hand-written UPDATE (no sqlc) — mirrors the GetAccountOverageCapCents
+// pattern at line 7356 and the UpdateAccountPlan sibling at line 302.
+// Issue #561's raiseOverageCap endpoint calls this for the customer
+// self-service "raise / clear cap" surface. The migration CHECK at
+// accounts/00049 pins `overage_cap_cents IS NULL OR overage_cap_cents
+// >= 0`; this layer does not re-validate. pgx maps a *int64 nil to
+// SQL NULL via its standard type codec; an empty-string or sentinel
+// compare is unnecessary.
+func (s *PgStore) UpdateAccountOverageCapCents(ctx context.Context, accountID string, cents *int64) error {
+	_, err := s.pool.Exec(ctx,
+		`update accounts set overage_cap_cents = $2 where id = $1`,
+		accountID, cents)
+	return err
+}
+
 // ListActiveCreditsForConsumption returns the account's active credit
 // rows ordered FIFO (created_at ASC) for the consumption reducer
 // (issue #279 PR-C). Mirrors the (cents_remaining > 0) ∧ (expires_at

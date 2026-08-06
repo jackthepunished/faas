@@ -650,6 +650,15 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.requireStepUp(5*time.Minute)(s.transferOrgOwnership))))))
 	mux.HandleFunc("GET /v1/invitations/{token}", s.authLimited(s.peekInvitation))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.idempotent(s.changePlan))))))
+	// Issue #561 — spend cap pause-workload. Account-self-scoped
+	// (mirror restoreAccount: any authenticated principal on the
+	// account may set / clear the cap). MFA gate is intentional —
+	// a hostile actor with a stolen API key should not be able to
+	// silently disable the cap. idempotent() wrap matches rotateKey
+	// and changePlan — the OpenAPI spec advertises Idempotency-Key
+	// and a retry without one would emit two overage.cap_changed
+	// audit rows for the same logical operation (review finding #9).
+	mux.HandleFunc("POST /v1/account/overage-cap", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.raiseOverageCap)))))
 	// IAM-5 (issue #189): per-account rotation grace-window
 	// override. Admin-only because the rotation primitive is
 	// admin-only (POST /v1/keys/{id}/rotate mirrors the same
@@ -1136,6 +1145,13 @@ func (s *server) handler() http.Handler {
 	// notification side-effects match the REST API path bit-for-bit.
 	mux.Handle("POST /dashboard/account/delete", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.dashboardDelete)))))
 	mux.Handle("POST /dashboard/account/restore", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.dashboardRestore))))
+	// Issue #561 — spend cap self-service form. Same CSRF-envelope
+	// envelope shape as dashboardDelete (see cmd/apid/dashboard_delete.go).
+	// Step-up gate matches dashboardDelete: a hostile actor with a
+	// stolen post-MFA-clear browser session (PR #653 threat change 6,
+	// ADR-077) cannot silently disable the customer's cap. The 5-minute
+	// TTL is the standard sensitive-op window (review finding #10).
+	mux.Handle("POST /dashboard/raise-overage-cap", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.dashboardRaiseOverageCap)))))
 	// GET /dashboard/account/export is the session-authenticated twin
 	// of the REST /v1/account/export. The dashboard template's "Download
 	// JSON export" link points here because the REST endpoint requires

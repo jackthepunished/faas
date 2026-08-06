@@ -374,6 +374,30 @@ func TestStatusForCode_WaitForWarm(t *testing.T) {
 	}
 }
 
+// TestStatusForCode_CodeAdmissionRefused (issue #561) — pins the
+// spend-cap pause-workload HTTP status mapping. The per-cap
+// rejection lifts to HTTP 402 Payment Required, NOT 429 (that's
+// rate-limit) and NOT 503 (the backend is healthy; the customer
+// turned the bucket off). The StatusForCode reverse mapping is
+// what the gRPC boundary consults (grpcerr.FromStatus) so a
+// regression here would silently demote the 402 to 429 / 500 on
+// the customer-facing wire.
+func TestStatusForCode_CodeAdmissionRefused(t *testing.T) {
+	if got := StatusForCode(CodeAdmissionRefused); got != http.StatusPaymentRequired {
+		t.Errorf("StatusForCode(CodeAdmissionRefused) = %d, want %d", got, http.StatusPaymentRequired)
+	}
+	// Cross-check: ErrAdmissionRefused carries the same Status on
+	// the *Problem it constructs. A regression that drifts the
+	// builder away from StatusForCode would surface here.
+	p := ErrAdmissionRefused(123, 100)
+	if p.Status != http.StatusPaymentRequired {
+		t.Errorf("ErrAdmissionRefused.Status = %d, want %d", p.Status, http.StatusPaymentRequired)
+	}
+	if p.Code != CodeAdmissionRefused {
+		t.Errorf("ErrAdmissionRefused.Code = %q, want %q", p.Code, CodeAdmissionRefused)
+	}
+}
+
 // --- ValidateAppConfig (dto.go) ---------------------------------------------
 
 func TestValidateAppConfig(t *testing.T) {

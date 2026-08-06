@@ -1319,6 +1319,56 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/ConcurrencyLimit' }
         '503': { $ref: '#/components/responses/CapacityUnavailable' }
+        # Issue #561 — spend cap pause-workload. schedd returns
+        # `code: admission_refused` (HTTP 402) when the account's
+        # current-month overage meets/exceeds
+        # accounts.overage_cap_cents. The customer can resume by
+        # raising the cap via POST /v1/account/overage-cap. Detail
+        # + Limit / Observed fields carry the precise cents state
+        # so scripts can compute "how much to raise" without
+        # parsing prose.
+        '402': { $ref: '#/components/responses/AdmissionRefused' }
+
+  /v1/account/overage-cap:
+    post:
+      tags: [account]
+      operationId: raiseOverageCap
+      summary: Set or clear the account's spend cap (issue #561).
+      description: |
+        Sets accounts.overage_cap_cents in integer cents. Body shape:
+
+            {"overage_cap_cents": <int|null>}
+
+        Pass `null` (or omit the field) to clear the cap (NULL).
+        Pass 0 to set "no overage allowed." Passing a positive integer
+        sets the monthly ceiling. The migration CHECK constraint at
+        `migrations/00054_account_credits.sql` pins
+        `overage_cap_cents IS NULL OR overage_cap_cents >= 0`; a
+        negative value is rejected at the apid validator before the
+        store ever sees it, returning 400 `validation_failed`.
+
+        Once current-month overage meets/exceeds the cap, schedd refuses
+        new wakes with `code: admission_refused` (HTTP 402). The cap is
+        account-self-scoped (no admin scope required) and the response
+        is the post-update account state. Audit row
+        `overage.cap_changed` is emitted on every successful call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RaiseOverageCapRequest' }
+            example: {"overage_cap_cents": 10000}
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The updated account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountResponse' }
+              example: {"id":"0123456789abcdef0123456789abcdef","email":"alice@example.com","plan":"pro","status":"active"}
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /v1/apps/{slug}/rename:
     parameters:
@@ -5197,6 +5247,25 @@ components:
       properties:
         new_slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', minLength: 3, maxLength: 40, example: "hello-world-v2" }
 
+    RaiseOverageCapRequest:
+      description: |
+        Spend-cap payload (issue #561). *int64 so a missing/null
+        field round-trips as NULL (no cap). 0 is a valid write and
+        means "no overage allowed". Negative values are rejected at
+        the validator before reaching the store (the migration CHECK
+        at accounts/00049 is the storage-layer enforcement).
+      type: object
+      required: [overage_cap_cents]
+      properties:
+        overage_cap_cents:
+          oneOf:
+            - type: integer
+              minimum: 0
+              description: "Set the monthly ceiling to N cents. 0 = no overage allowed."
+            - type: 'null'
+              description: "Clear the cap (NULL on the column)."
+          description: "Cents-per-month ceiling, or null to clear."
+
     ScalingPolicy:
       description: "Per-app autoscaling configuration (issue #462 / ADR-058). Mirrors the on-disk jsonb column `apps.scaling_policy`. Empty values map to the engine default (the apid gate is load-bearing for the floor / ceiling, not the encoder). PR-A persists the DTO; PR-C wires the engine; PR-D carves out the worker-class branch."
       type: object
@@ -7652,6 +7721,12 @@ components:
 
     PaymentRequired:
       description: 'code: billing_past_due — account is suspended; pay invoice to resume.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    AdmissionRefused:
+      description: 'code: admission_refused — the account''s spend cap (accounts.overage_cap_cents) is met/exceeded by the current-month overage. Schedd refuses new wakes until the customer raises or clears the cap via POST /v1/account/overage-cap. The Limit / Observed fields carry the cap and current overage in integer cents so a script can compute "how much to raise" without parsing prose. No Retry-After: the cap is a deliberate customer budget, not back-pressure.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

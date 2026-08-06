@@ -49,6 +49,40 @@
       </table>
       <p><a href="/dashboard/usage">Detailed usage</a> for the per-app breakdown.</p>
 
+      <h2>Spend cap</h2>
+      <p>Set a monthly ceiling on overage spending. Workload wakes are refused (HTTP 402) once the cap is reached; raise or clear the cap to resume.</p>
+      <table>
+        <tr>
+          <th>Configured cap</th>
+          <td>
+            {{if .Data.OverageCapCents}}
+              {{.Data.OverageCapCents}} cents / month
+            {{else}}
+              no cap
+            {{end}}
+          </td>
+        </tr>
+        <tr>
+          <th>Current-month overage</th>
+          <td>{{.Data.OverageUsedCents}} cents</td>
+        </tr>
+        {{if .Data.OverageCapCents}}
+        <tr>
+          <th>Over the cap?</th>
+          <td>{{printf "%.0f" .Data.OverageUsedThisMBCap}}%</td>
+        </tr>
+        {{end}}
+      </table>
+
+      <form method="POST" action="/dashboard/raise-overage-cap" style="margin-top:1rem">
+        <input type="hidden" name="csrf_token" value="{{.Data.RaiseCapConfirmToken}}">
+        <input type="number" name="overage_cap_cents" min="0" inputmode="numeric" placeholder="cents / month (leave blank = clear)">
+        <button type="submit" style="margin-left:0.5rem">Save cap</button>
+        <p style="margin-top:0.25rem; font-size:0.85em; color:#666">
+          Set 0 to allow no overage at all. Leave the field blank to clear the cap (no ceiling).
+        </p>
+      </form>
+
       {{if .Data.HasPaidPlan}}
         <h2>Manage billing</h2>
         {{if .Data.PortalURL}}

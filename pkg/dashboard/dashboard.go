@@ -441,6 +441,26 @@ type BillingData struct {
 	// Stripe billing portal link; empty for free accounts.
 	HasPaidPlan bool
 	PortalURL   string
+
+	// Issue #561 — spend cap pause-workload. *int64 so the template
+	// can distinguish "no cap" (nil pointer) from "cap is 0 cents"
+	// (no overage allowed) and "cap is N cents" (a positive monthly
+	// ceiling). The handler reads accounts.overage_cap_cents via
+	// state.Store.GetAccountOverageCapCents; the form on the
+	// billing page POSTs back to /dashboard/raise-overage-cap (see
+	// the apid dashboard handler).
+	OverageCapCents      *int64
+	OverageUsedCents     int64   // current-month overage; informational, used to compute the % bar
+	OverageUsedThisMBCap float64 // ratio over cap (or 0 if no cap) for the inline progress meter
+
+	// RaiseCapConfirmToken is the issue #561 CSRF envelope — minted
+	// alongside DeleteConfirmToken / RestoreConfirmToken by
+	// renderBilling via middleware.IssueForAuthenticated, so the
+	// /dashboard/raise-overage-cap POST verifies the (action=
+	// "raise_overage_cap", account_id) sealed envelope before any
+	// state change. Same shape as the dashboard delete/restore
+	// forms.
+	RaiseCapConfirmToken string
 }
 
 // PricingData is the /dashboard/pricing page payload (issue #259).

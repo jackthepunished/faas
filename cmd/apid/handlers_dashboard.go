@@ -573,13 +573,37 @@ func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog
 
 	hasPaidPlan := acct.StripeSubscriptionItem != "" || acct.Plan != api.PlanFree
 
+	// Issue #561 — spend cap (issue #279 storage, #561 enforcement).
+	// Read the cap (nullable) and the current-month overage cents so
+	// the billing page can render the % bar and the inline Raise-cap
+	// form. Failure is non-fatal: render with no cap (NULL) so the
+	// page still loads on a transient PG blip.
+	capCents, capOK, capErr := s.store.GetAccountOverageCapCents(ctx, acct.ID)
+	if capErr != nil {
+		log.Warn("dashboard renderBilling: get overage cap", "account_id", acct.ID, "err", capErr)
+	}
+	var capPtr *int64
+	if capOK {
+		v := capCents
+		capPtr = &v
+	}
+	overageCents, obsErr := s.store.CurrentMonthOverageCents(ctx, acct.ID)
+	if obsErr != nil {
+		log.Warn("dashboard renderBilling: current month overage", "account_id", acct.ID, "err", obsErr)
+		overageCents = 0
+	}
+	var overageRatio float64
+	if capOK && capCents > 0 && overageCents > 0 {
+		overageRatio = float64(overageCents) / float64(capCents) * 100
+	}
+
 	view, _ := AccountFrom(ctx)
 	appCount, err := s.store.CountDeployedApps(ctx, acct.ID)
 	if err != nil {
 		log.Warn("dashboard renderBilling: count deployed apps", "account_id", acct.ID, "err", err)
 		appCount = 0
 	}
-	page := dashboard.Page{Title: "Billing", Body: "billing", Account: dashboardAccountView(view, appCount), Data: dashboard.BillingData{
+	data := dashboard.BillingData{
 		Plan:                      string(acct.Plan),
 		RAMMB:                     limits.RAMMB,
 		Included:                  int64(limits.IncludedGBHours),
@@ -596,7 +620,41 @@ func (s *server) renderBilling(w http.ResponseWriter, r *http.Request, log *slog
 		LastInvoiceCurrency:       lastInvCcy,
 		HasPaidPlan:               hasPaidPlan,
 		PortalURL:                 s.billingPortalURLFor(acct),
-	}}
+		OverageCapCents:           capPtr,
+		OverageUsedCents:          overageCents,
+		OverageUsedThisMBCap:      overageRatio,
+	}
+
+	// Issue #561 CSRF envelope for the raise-cap form. Mirrors the
+	// renderAccount pattern at line 792 (delete + restore tokens). The
+	// unused-on-this-page cookie is harmless (10 min TTL) and the
+	// uniform shape ("dashboard always issues the action's CSRF
+	// token at GET time") lets the dashboard helper in pkg/middleware
+	// stay simple. Failure is non-fatal at the log line; the page
+	// still renders without the form so the customer sees the existing
+	// cap value.
+	//
+	// STAMPED ON data BEFORE the page is built so the embedded
+	// copy inside page.Data observes the token. Setting the token
+	// after the page construction would mutate the local `data`
+	// only and leave the form's hidden input empty (the test
+	// TestDashboardRaiseOverageCap_PostsForm catches that exact
+	// regression).
+	if raiseTok, err := middleware.IssueForAuthenticated(s.sessions, "raise_overage_cap", acct.ID); err == nil {
+		data.RaiseCapConfirmToken = raiseTok
+		http.SetCookie(w, &http.Cookie{
+			Name:     middleware.CookieNameAuthenticated,
+			Value:    raiseTok,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   s.domain != "",
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int(middleware.DefaultCSRFTTL.Seconds()),
+		})
+	} else {
+		log.Warn("dashboard renderBilling: csrf issue raise_overage_cap", "account_id", acct.ID, "err", err)
+	}
+	page := dashboard.Page{Title: "Billing", Body: "billing", Account: dashboardAccountView(view, appCount), Data: data}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
 	}

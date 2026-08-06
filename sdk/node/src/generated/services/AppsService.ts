@@ -268,6 +268,7 @@ export class AppsService {
       },
       errors: {
         401: `code: unauthorized`,
+        402: `code: admission_refused — the account's spend cap (accounts.overage_cap_cents) is met/exceeded by the current-month overage. Schedd refuses new wakes until the customer raises or clears the cap via POST /v1/account/overage-cap. The Limit / Observed fields carry the cap and current overage in integer cents so a script can compute "how much to raise" without parsing prose. No Retry-After: the cap is a deliberate customer budget, not back-pressure.`,
         404: `code: not_found`,
         429: `code: plan_limit_concurrency`,
         503: `code: capacity_unavailable — no host headroom (alerting; should be near-impossible).`,

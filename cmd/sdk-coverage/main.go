@@ -133,6 +133,7 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/account/plan":                   "ChangePlan",
 	"GET /v1/account":                          "Whoami",
 	"POST /v1/account/restore":                 "RestoreAccount",
+	"POST /v1/account/overage-cap":             "RaiseOverageCap", // issue #561 spend cap
 	"GET /v1/apps/{slug}/logs":                 "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":            "StreamDeploymentLogs",
 	"GET /v1/deployments/{id}/scan":            "GetDeploymentScan", // issue #464 / ADR-055; per-deploy grype CVE drill-down

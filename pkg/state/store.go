@@ -2165,6 +2165,15 @@ type Store interface {
 	ListAccountCredits(ctx context.Context, accountID string, onlyActive bool) ([]AccountCredit, error)
 	CreateCreditLedgerEntry(ctx context.Context, e CreditLedgerEntry) error
 	GetAccountOverageCapCents(ctx context.Context, accountID string) (int64, bool, error)
+	// UpdateAccountOverageCapCents sets accounts.overage_cap_cents to
+	// the given value. Pass nil to clear the cap (NULL) — issue #561's
+	// raiseOverageCap endpoint uses this to round-trip a customer
+	// intent of "no cap." The migration CHECK constraint already
+	// enforces >= 0; this layer does not re-validate. A cap value of
+	// 0 is a valid write and means "no overage allowed" — the
+	// distinguishability from "no cap" (nil) lives in the (cents,
+	// ok=false) vs (cents=0, ok=true) return shape of the reader.
+	UpdateAccountOverageCapCents(ctx context.Context, accountID string, cents *int64) error
 	// LoadAllOverageCapCents returns every (account_id, cap) tuple in
 	// one round-trip. meterd's quota tick walks all accounts every
 	// minute and would otherwise issue N single-row reads; the bulk

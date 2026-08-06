@@ -553,6 +553,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	log.Info("schedd: build attestation verifier ready", "pub", signPubPath)
 	engine.WithVerifier(verifier)
+	// Issue #561 — wire the spend-cap pause-workload seam. Engine
+	// consults the checker inside admitGate AFTER the existing
+	// min-floor branch; a cap-reached app refuses new wakes with
+	// `*api.Problem{Code: CodeAdmissionRefused}`. 5 s TTL — the
+	// customer raised the cap via POST /v1/account/overage-cap; the
+	// next wake after a raise should succeed within seconds, not
+	// minutes. Worst-case overadmission window: one extra wake per
+	// customer per 5 s, bounded by the meterd quota tick (per-minute)
+	// for sustained over-the-cap traffic.
+	engine.WithOverageChecker(sched.NewMemCacheOverageChecker(store, 5*time.Second))
+
 	// ADR-051 PR-D review finding #6: app.characterized audit row
 	// emission on the cold-boot wake path. Shares the same
 	// `audit.New(store, log, ops, "schedd")` instance Loop.WithAudit

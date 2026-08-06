@@ -1904,6 +1904,82 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 	})
 }
 
+// --- spend cap raise (issue #561) --------------------------------------------
+
+// raiseOverageCap implements POST /v1/account/overage-cap. Body:
+// {"overage_cap_cents": <int|null>}; *int64 so a missing/null field
+// clears the cap (NULL). Account-self-scoped (the bearer key's
+// account; PATs and session cookies both reach here via withAuth).
+// No per-plan allowlist — Free/Pro/Scale customers may set the cap;
+// Free's effective cap=0 was a defensive default from #279 PR-A and
+// raising to a positive value is harmless (the workload gate then
+// refuses at that ceiling). Returns 200 + a fresh account view.
+//
+// The service routine raiseOverageCapSvc is the shared code path
+// also called by the dashboard /dashboard/raise-overage-cap form so
+// the two surfaces stay in lock-step (validation + storage + audit
+// row are identical).
+func (s *server) raiseOverageCap(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	var req struct {
+		OverageCapCents *int64 `json:"overage_cap_cents"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Bad request", err.Error()))
+		return
+	}
+	if req.OverageCapCents != nil && *req.OverageCapCents < 0 {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"overage_cap_cents must be >= 0 or null", "negative values are rejected"))
+		return
+	}
+	updated, err := s.raiseOverageCapSvc(r.Context(), acct, req.OverageCapCents)
+	if err != nil {
+		// PG write failure on a state mutation is a 500 (CodeInternal),
+		// NOT a 503 ErrCapacity (which is reserved for schedd-side
+		// admission back-pressure and would misroute alerts on the
+		// gateway_* capacity dashboards). Review finding #1.
+		api.WriteProblem(w, api.ErrInternal("could not update overage cap"))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.AccountResponse{
+		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
+	})
+}
+
+// raiseOverageCapSvc is the shared validation-free mutation body used
+// by both the v1 API endpoint (raiseOverageCap) and the dashboard
+// form handler (handlers_dashboard.go). The cents argument is
+// validated at the call site — this routine only stamps the row +
+// emits the audit row. Returns the refreshed account view so the
+// caller can render the post-update state without a second round-trip.
+func (s *server) raiseOverageCapSvc(ctx context.Context, acct state.Account, cents *int64) (state.Account, error) {
+	// Read old value for the audit row's "old_cents" field. If the
+	// existing row is missing (test fixture or freshly-minted), the
+	// old value reads back as (0, false) and we surface the actor as
+	// "self" — the shape stays consistent for the audit reader.
+	oldCents, _, _ := s.store.GetAccountOverageCapCents(ctx, acct.ID)
+	if err := s.store.UpdateAccountOverageCapCents(ctx, acct.ID, cents); err != nil {
+		return acct, err
+	}
+	updated, err := s.store.AccountByID(ctx, acct.ID)
+	if err != nil {
+		return acct, err
+	}
+	var newCents any
+	if cents == nil {
+		newCents = auditOverageCapNullSentinel
+	} else {
+		newCents = *cents
+	}
+	s.audit.Emit(ctx, "overage.cap_changed", &acct.ID, map[string]any{
+		"old_cents": oldCents,
+		"new_cents": newCents,
+		"actor":     "self",
+	})
+	return updated, nil
+}
+
 // stripeWebhook accepts signed Stripe events. M7 enforces the v1 HMAC
 // against s.stripeWebhookSecret (empty secret = verify disabled, dev
 // only). It handles:
