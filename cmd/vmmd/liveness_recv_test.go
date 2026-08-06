@@ -61,14 +61,26 @@ func newTestLoop(t *testing.T, instanceID string, consec int) (*livenessProbeLoo
 	sink := &recordingSink{}
 	mgr := fcvm.NewManager(nil, nil, fcvm.Paths{}, "1.10.0", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	// Attach the sink via the WithLivenessSink helper. The
-	// post-F1 Manager signature returns *Manager (chainable);
-	// the test interface must match that exact return type for
-	// the type assertion to succeed.
+	// post-F1 Manager signature returns *Manager (chainable)
+	// and accepts the named LivenessFailedSink parameter type —
+	// the test interface must declare the *named* parameter type
+	// (not a bare func(...) form) for Go's interface satisfaction
+	// to allow the type assertion. Passing a bare `func(...)`
+	// here fails at runtime with "does not expose WithLivenessSink
+	// — test seam missing" even though the underlying call
+	// signature is identical — Go's interface assignability
+	// checks parameter-type identity for named types.
 	type sinkSetter interface {
-		WithLivenessSink(func(ctx context.Context, instance, reason string)) *fcvm.Manager
+		WithLivenessSink(fcvm.LivenessFailedSink) *fcvm.Manager
 	}
 	if ss, ok := any(mgr).(sinkSetter); ok {
-		ss.WithLivenessSink(sink.Record)
+		// Explicit conversion: sink.Record is a method value with
+		// the bare func type `func(ctx context.Context, instance,
+		// reason string)`. Production declares the parameter as
+		// the named `LivenessFailedSink` alias. Identical shape,
+		// distinct types at the type-system layer — must convert
+		// to satisfy the interface call.
+		ss.WithLivenessSink(fcvm.LivenessFailedSink(sink.Record))
 	} else {
 		t.Fatalf("fcvm.Manager does not expose WithLivenessSink — test seam missing")
 	}
