@@ -30,7 +30,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //   - vmmd has CAP_NET_BIND_SERVICE so it can bind the /metrics low
 //     TCP port if MetricsAddr is set in TOML.
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitVmmd() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas vmmd — microVM supervisor (the only root component, spec §4.4)",

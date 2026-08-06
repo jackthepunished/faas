@@ -17,7 +17,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     it inherits the bind-mount from vmmd's declaration via
 //     ReadWritePaths=/run/faas.
 //
-// See ADR-077 for the migration that wiped this from the unit body.
+// See ADR-078 for the migration that wiped this from the unit body.
 func UnitSchedd() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description: "onebox-faas schedd — scheduler + lifecycle owner",

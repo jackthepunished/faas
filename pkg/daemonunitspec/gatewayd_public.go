@@ -24,7 +24,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     (AF_UNIX) + accepts Caddy's reverse-proxy on 127.0.0.1:8080 (AF_INET).
 //     AF_INET6 dropped because the bind is loopback v4.
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitGatewaydPublic() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas gatewayd-public — plain-HTTP edge (Tier A7 split, ADR-070; TLS terminates at Caddy upstream)",

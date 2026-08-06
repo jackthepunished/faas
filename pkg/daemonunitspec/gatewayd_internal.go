@@ -19,7 +19,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     (AF_UNIX). AF_INET6 is allowed so the internal dial doesn't fail
 //     on v6-only networks (defense in depth; we never connect OUT to v6).
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitGatewaydInternal() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas gatewayd-internal — routing + wake + proxy (Tier A7 split, ADR-070)",

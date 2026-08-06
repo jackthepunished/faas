@@ -28,7 +28,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     /dev/shm/faas-base-staging + logs/spool. /srv/fc/sigs was missed
 //     when ADR-038 landed and crash-looped imaged on the DO box.
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitImaged() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas imaged — image/snapshot orchestrator (spec §4.6, ADR-003, ADR-005)",

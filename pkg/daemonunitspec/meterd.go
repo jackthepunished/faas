@@ -16,7 +16,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     a `Requires=postgresql.service` directive. (Spec §11 single-public-
 //     listener invariant; CLAUDE.md component ownership.)
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitMeterd() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description: "onebox-faas meterd — metering and billing",

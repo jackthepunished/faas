@@ -10,7 +10,7 @@
 // (deploy/{controlplane,systemd/,ansible/roles/control_plane_service/files/}).
 // Generating from one Go-rendered artifact — the same shape as the egress
 // ruleset at pkg/netns/policy.go — keeps the three trees byte-identical.
-// See ADR-077 for the design + the wipe-comments migration.
+// See ADR-078 for the design + the wipe-comments migration.
 package daemonunit
 
 import (
@@ -118,7 +118,7 @@ type Unit struct {
 	// Filesystem
 	ReadOnlyPaths        []string
 	ReadWritePaths       []string
-	RuntimeDirectory     string // "faas" only on vmmd (SOLE invariant; see ADR-077)
+	RuntimeDirectory     string // "faas" only on vmmd (SOLE invariant; see ADR-078)
 	RuntimeDirectoryMode string
 
 	// [Install]
@@ -143,7 +143,7 @@ func BoolPtr(b bool) *bool { return &b }
 // ReadWritePaths →\n → RuntimeDirectory → RuntimeDirectoryMode → [Install]).
 //
 // Render() never comments. The wiped rationale moves to godoc on
-// UnitXxx() in pkg/daemonunitspec + ADR-077.
+// UnitXxx() in pkg/daemonunitspec + ADR-078.
 func (u Unit) Render() []byte {
 	var buf bytes.Buffer
 	buf.WriteString("[Unit]\n")
@@ -227,7 +227,7 @@ func (u Unit) Render() []byte {
 		} else {
 			// false for vmmd + schedd — explicitly emit so the
 			// wiped-comment rationale (vmmd SOLE-RuntimeDirectory
-			// see ADR-077) stops being load-bearing in the unit
+			// see ADR-078) stops being load-bearing in the unit
 			// file body.
 			buf.WriteString("PrivateTmp=no\n")
 		}
@@ -521,14 +521,19 @@ func parseLoadCred(s string) (LoadCred, error) {
 
 // parseYes normalises a "yes" / "no" / "true" / "false" / "on" / "off"
 // directive value into a bool. systemd accepts all of those; we accept
-// the same set for tolerance. Anything else returns false (which would
-// round-trip as NO-protect, not YES-protect — fine for the strict
-// hardening gates we use).
+// the same set for tolerance.
+//
+// LOAD-BEARING DEFAULT: any token outside the canonical set returns
+// false (case-insensitive). This is intentional — the generator emits
+// known literals, but a hand-edited unit file containing an unrecognised
+// token (e.g. "enabled", capitalised variants, a typo) is treated as
+// "off". Tightening to a parse error would be safer but would also
+// break tolerance for variants systemd itself accepts; the explicit
+// default keeps decode+round-trip stable for our 8 spec'd daemons.
 func parseYes(s string) bool {
 	switch strings.ToLower(s) {
-	// systemddoc:ORGANIZATION=safe-defaulter MANUAL: case list is the
-	// canonical systemd boolean spellings (yes/true/on/1 vs no/false/off/0);
-	// not application literals.
+	// Canonical systemd boolean spellings (yes/true/on/1); not
+	// application literals.
 	case "yes", "true", "on", "1": //nolint:goconst
 		return true
 	default:
@@ -547,6 +552,14 @@ func parseYes(s string) bool {
 // don't want to flag that as a "drift" in CI. Env / LoadCredential
 // matches by KEY regardless of order (two LoadCredential= lines in
 // different order are equivalent).
+//
+// DUPLICATE COLLAPSE: because the slice-shaped fields are compared as
+// sets, a duplicate entry (the same value listed twice in one Unit)
+// silently collapses in the diff. Today our 8 specs never emit
+// duplicates and `daemonunit-check` is byte-exact so the gate still
+// catches them at the bytes layer — but if `daemonunit-check` ever
+// loosens to a semantic check, callers should pre-validate spec slices
+// for duplicates before round-tripping through Diff.
 func Diff(a, b Unit) []string {
 	var out []string
 	add := func(section, key, av, bv string) {

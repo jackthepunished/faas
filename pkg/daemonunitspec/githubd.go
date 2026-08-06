@@ -28,7 +28,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //   - ReadWritePaths=/var/lib/faas: githubd writes /var/lib/faas
 //     attribution hmac key + the github-bot pool credentials.
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitGithubd() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description: "onebox-faas githubd — GitHub App integration",

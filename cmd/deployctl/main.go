@@ -19,12 +19,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/onebox-faas/faas/pkg/daemonunitspec"
 )
@@ -60,19 +60,25 @@ func main() {
 
 // target describes one place daemon unit files get emitted to.
 type target struct {
-	dir   string
-	label string
-	skip  map[string]bool // daemon names to skip for this target
+	dir  string
+	skip map[string]bool // daemon names to skip for this target
 }
 
+// cpcpIndex is the slot of the cp-cp target inside defaultTargets.
+// The deploy workflow installs cp-cp on the EX44 box; cp-sys is the
+// legacy + dev-VM tree; cp-ans is the ansible control_plane_service
+// role drop-in. cp-cp is index 0 by convention — it ships the most
+// daemons (all 8) plus faas-cp.slice, and `make generate` walks the
+// slice in order so it emits first.
+const cpcpIndex = 0
+
 // defaultTargets — the three trees systemd unit files live in across
-// the platform. `cp-cp` is what the deploy workflow installs on the
-// EX44 box; `cp-sys` is the legacy tree + dev VMs; `cp-ans` is the
-// ansible `control_plane_service` role drop-in.
+// the platform. Index 0 is cp-cp (see cpcpIndex); index 1 is the
+// legacy tree + dev VMs; index 2 is the ansible role drop-in.
 var defaultTargets = []target{
-	{dir: "deploy/controlplane/systemd", label: "cp-cp (controlplane/systemd)"},
-	{dir: "deploy/systemd", label: "cp-sys (legacy/dev)", skip: legacySkips()},
-	{dir: "deploy/ansible/roles/control_plane_service/files", label: "cp-ans (ansible role)", skip: ansibleRoleSkips()},
+	{dir: "deploy/controlplane/systemd"},
+	{dir: "deploy/systemd", skip: legacySkips()},
+	{dir: "deploy/ansible/roles/control_plane_service/files", skip: ansibleRoleSkips()},
 }
 
 // ansibleRoleSkips: the ansible control_plane_service role only ships
@@ -102,16 +108,13 @@ func legacySkips() map[string]bool {
 // drives which daemons the generator writes; it's the source-dir's
 // identity, not the destination's.
 func targetFor(p string) target {
-	switch filepath.Clean(p) {
-	case filepath.Clean(defaultTargets[0].dir):
-		return defaultTargets[0]
-	case filepath.Clean(defaultTargets[1].dir):
-		return defaultTargets[1]
-	case filepath.Clean(defaultTargets[2].dir):
-		return defaultTargets[2]
-	default:
-		return target{dir: p}
+	cleaned := filepath.Clean(p)
+	for _, t := range defaultTargets {
+		if filepath.Clean(t.dir) == cleaned {
+			return t
+		}
 	}
+	return target{dir: p}
 }
 
 // targetsFor returns the target spec for each dir in `dirs`, in order.
@@ -130,7 +133,7 @@ func targetsFor(dirs []string) []target {
 // target structs (rather than dir path strings) survives the runCheck
 // remap where `d` is `tmp/tree-0` and t.dir is the source-dir string.
 func isCPCP(t target) bool {
-	return filepath.Clean(t.dir) == filepath.Clean(defaultTargets[0].dir)
+	return filepath.Clean(t.dir) == filepath.Clean(defaultTargets[cpcpIndex].dir)
 }
 
 // runGenerate writes units + daemons.json to the named target dirs.
@@ -143,7 +146,11 @@ func runGenerate(args []string) error {
 }
 
 func targetDirs() []string {
-	return []string{defaultTargets[0].dir, defaultTargets[1].dir, defaultTargets[2].dir}
+	dirs := make([]string, len(defaultTargets))
+	for i, t := range defaultTargets {
+		dirs[i] = t.dir
+	}
+	return dirs
 }
 
 // generateTo is the core: write unit files + slice + JSON to named
@@ -300,9 +307,11 @@ func runCheck(args []string, quiet bool) error {
 //
 //   - `~` drifted: generated file's bytes differ from committed ⇒ FAIL
 //   - `+` only in regenerated: generated file missing from committed ⇒ FAIL
-//   - `-` only in committed: committed file not generated ⇒ NOT a failure
-//     (legacy artefacts like faas-gatewayd.service, README.md,
-//     pg-basebackup-*, *.toml.example, faas.conf are preserved)
+//   - `-` only in committed: committed file not generated ⇒ NOT a failure.
+//     Legacy artefacts (faas-gatewayd.service, README.md, pg-basebackup-*,
+//     *.toml.example, faas.conf) are preserved on purpose — removing them
+//     is a separate ops change, not a generator regression. Preserved
+//     artefacts do NOT trip the gate.
 //
 // Reports the names that drift; `quiet` controls print/no-print.
 func compareTrees(committed, regenerated string, quiet bool) error {
@@ -392,18 +401,5 @@ func readFiles(root string) (map[string][]byte, error) {
 }
 
 func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return bytes.Equal(a, b)
 }
-
-// keep strings import used (target.label strings used in non-Printf paths
-// when callers want a label). We reference strings here so future
-// expansion of target.label doesn't trip "imported and not used".
-var _ = strings.HasPrefix

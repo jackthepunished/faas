@@ -36,7 +36,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //   - ReadWritePaths includes /var/lib/faas (audit HMAC keys + API key
 //     store; PR-M.3 landed this), /var/log/faas, /var/spool/faas.
 //
-// See ADR-077 for the migration that wiped these from the unit body.
+// See ADR-078 for the migration that wiped these from the unit body.
 func UnitApid() daemonunit.Unit {
 	return daemonunit.Unit{
 		Description:   "onebox-faas apid — public control-plane API (spec §4.1)",
