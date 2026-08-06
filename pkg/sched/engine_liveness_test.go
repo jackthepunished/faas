@@ -152,7 +152,7 @@ func TestLiveness_NilReceiverSafe(t *testing.T) {
 // stray-reason caller is caught in dev, not in prod.
 //
 // This is the dev-time contract for the closed-set
-// vocabulary; the migration 00155 test pins the schema-layer
+// vocabulary; the migration 00157 test pins the schema-layer
 // CHECK shape.
 func TestLiveness_ParkDeployment_RejectsStrayReason(t *testing.T) {
 	store := state.NewMemStore()
@@ -192,7 +192,7 @@ func TestLiveness_ParkDeployment_RejectsStrayReason(t *testing.T) {
 // TestLiveness_3In5MinParksDeploymentAndPersistsReason (AC #3) —
 // three destroys in the window parks the parent app AND stamps
 // the per-deployment parked_reason + parked_at columns (issue
-// #554 follow-up / migration 00155). Uses the live LivenessWindow
+// #554 follow-up / migration 00157). Uses the live LivenessWindow
 // + a real memstore UpdateApp call.
 func TestLiveness_3In5MinParksDeploymentAndPersistsReason(t *testing.T) {
 	store := state.NewMemStore()

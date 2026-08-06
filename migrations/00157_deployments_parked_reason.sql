@@ -18,9 +18,10 @@
 --                          (e.g. compliance hold); not wired yet.
 --
 -- additive + nullable: existing rows land with NULL parked_reason, NULL
--- parked_at. Per ADR-041 (slot discipline), this slot is 155 — a free
+-- parked_at. Per ADR-041 (slot discipline), this slot is 157 — a free
 -- slot at the time of authoring; pre-flight
--- `git ls-tree origin/main migrations/ | grep '^155'` was empty.
+-- `git ls-tree origin/main migrations/ | grep '^157'` was empty. Renumbered
+-- from 155 after PR #698 fenced slot 155 and claimed 156.
 ALTER TABLE deployments
   ADD COLUMN IF NOT EXISTS parked_reason text;
 ALTER TABLE deployments

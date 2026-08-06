@@ -3868,7 +3868,7 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 // future stop-the-traffic paths (e.g. spec §17 retention) may
 // reuse this method. AC #3 follow-up (issue #554 / ADR-079): the
 // per-deployment `deployments.parked_reason` + `parked_at` columns
-// from migration 00155 are stamped here BEFORE the apps.status
+// from migration 00157 are stamped here BEFORE the apps.status
 // flip so a re-stamp on a schedd crash loop does not re-paint
 // the timestamp (SetDeploymentParked is idempotent — see
 // pkg/state/pgstore.go). The audit row remains the durable

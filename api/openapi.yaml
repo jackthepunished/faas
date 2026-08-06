@@ -5871,7 +5871,7 @@ components:
     # ─── Deployments ──────────────────────────────────────────────────────
 
     ParkedDeploymentRef:
-      description: "Reference to a deployment that was parked (issue #554 / ADR-079 follow-up). Returned in AppResponse.parked_deployment when the app has at least one parked deployment. The `parked_reason` field is closed-set (liveness_exhausted | lifecycle_park | admin_park) — enforced at the schema layer via the deployments_parked_reason_check constraint from migration 00155."
+      description: "Reference to a deployment that was parked (issue #554 / ADR-079 follow-up). Returned in AppResponse.parked_deployment when the app has at least one parked deployment. The `parked_reason` field is closed-set (liveness_exhausted | lifecycle_park | admin_park) — enforced at the schema layer via the deployments_parked_reason_check constraint from migration 00157."
       type: object
       required: [id, parked_reason, parked_at]
       properties:
@@ -5940,7 +5940,7 @@ components:
         parked_reason:
           type: [string, "null"]
           enum: [null, liveness_exhausted, lifecycle_park, admin_park]
-          description: "Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00155). Closed-set vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked deployments — surfaced as no field on the wire via omitempty."
+          description: "Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00157). Closed-set vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked deployments — surfaced as no field on the wire via omitempty."
         parked_at:
           type: [string, "null"]
           format: date-time

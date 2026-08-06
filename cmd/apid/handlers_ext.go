@@ -2618,7 +2618,7 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	resp.Scan = s.scanResponse(d)
 	// Issue #554 / ADR-079 follow-up (AC #3 wire): surface the
 	// per-deployment parked_reason + parked_at columns from
-	// migration 00155. omitempty on the DTO handles the "never
+	// migration 00157. omitempty on the DTO handles the "never
 	// parked" branch — the field is absent on the wire for the
 	// vast majority of deployments. The closed-set vocabulary
 	// is enforced at the schema layer.

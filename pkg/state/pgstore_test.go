@@ -806,7 +806,7 @@ func TestPg_SetDeploymentFailed_UnknownReturnsErrNotFound(t *testing.T) {
 
 // TestPg_SetDeploymentParked_RoundTrip (issue #554 / ADR-079 /
 // AC #3) pins the per-deployment parked_reason + parked_at columns
-// from migration 00155. The engine's ParkDeployment is the single
+// from migration 00157. The engine's ParkDeployment is the single
 // writer; this test pins the read-back path so a future column
 // rename or NULL-default drift surfaces in pg-shard-2 instead of
 // on the apid GET /v1/apps/{slug} wire.
