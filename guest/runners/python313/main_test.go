@@ -16,16 +16,21 @@ func TestHandle_RoundTrip(t *testing.T) {
 	runnerparity.RunRoundTrip(t, fake, handle)
 }
 
-// TestEnvelopeRoundTrip sanity-checks the JSON tags line up with §4.9.
-// Body delegated to runnerparity.AssertEnvelopeJSONTags so all four
-// runners pin the same tag set.
+// TestEnvelopeRoundTrip sanity-checks the JSON tags line up with §4.9,
+// extended with the waitUntil envelope fields (issue #667 / ADR-078).
+// Body delegated to runnerparity.AssertEnvelopeJSONTags so all five
+// runners pin the same tag set. The WaitUntilSec + TailPipePath fields
+// are the waitUntil primitive surface; a typo here would silently break
+// the runner's tail host in PR 3, so the assertion is load-bearing.
 func TestEnvelopeRoundTrip(t *testing.T) {
 	runnerparity.AssertEnvelopeJSONTags(t, envelope{
-		Method:  "POST",
-		Path:    "/foo",
-		Headers: map[string]string{"X": "y"},
-		Query:   "a=1",
-		BodyB64: base64.StdEncoding.EncodeToString([]byte("hi")),
+		Method:       "POST",
+		Path:         "/foo",
+		Headers:      map[string]string{"X": "y"},
+		Query:        "a=1",
+		BodyB64:      base64.StdEncoding.EncodeToString([]byte("hi")),
+		WaitUntilSec: 30,
+		TailPipePath: "/tmp/faas-tail-xyz.jsonl",
 	}, []byte("hi"))
 }
 

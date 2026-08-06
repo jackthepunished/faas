@@ -227,6 +227,17 @@ func AssertEnvelopeJSONTags(t *testing.T, env any, wantBody []byte) {
 	if !bytes.Contains(b, []byte(`"path":"`)) {
 		t.Errorf("path tag missing: %s", b)
 	}
+	// Issue #667 / ADR-078: pin the waitUntil envelope field tags.
+	// A typo (e.g. `json:"wait_until"`) would break the runner's
+	// tail host silently — the field would marshal as 0 and the
+	// handler's waitUntil calls would no-op. This pin is the only
+	// compile-time signal for the wire spelling.
+	if !bytes.Contains(b, []byte(`"wait_until_sec":`)) {
+		t.Errorf("wait_until_sec tag missing: %s", b)
+	}
+	if !bytes.Contains(b, []byte(`"tail_pipe_path":"`)) {
+		t.Errorf("tail_pipe_path tag missing or empty: %s", b)
+	}
 	// Decode round-trip: pull the body_b64 string out of the marshaled
 	// JSON (the helper is reflection-free) and decode via StdEncoding.
 	// A StdEncoding ↔ URLEncoding swap on the encoding side would
