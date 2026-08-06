@@ -1265,19 +1265,21 @@ func resolveCallerRole(ctx context.Context, store state.Store, orgID, accountID 
 }
 
 // dashboardMembershipProjection converts state.OrgMembership →
-// dashboard.OrgMemberItem, joining state.AccountByID to surface
-// the email (never the bare account ID). The Account-by-ID
-// lookup is best-effort: a deleted-account race surfaces as
-// "(deleted account)" + the original Role, preserving the
-// "who was in the org historically" view that the audit table
-// still requires.
-func dashboardMembershipProjection(ctx context.Context, store state.Store, mem state.OrgMembership) dashboard.OrgMemberItem {
+// dashboard.OrgMemberItem, joining a pre-fetched account map (one
+// batch fetch per render — see AccountsByIDs at the renderOrgDetail
+// call site) to surface the email (never the bare account ID).
+// Map-absence is best-effort: a deleted-account race surfaces as
+// "(deleted account)" + the original Role, preserving the "who
+// was in the org historically" view that the audit table still
+// requires. The deleted-account contract is unchanged from the
+// previous per-row AccountByID path.
+func dashboardMembershipProjection(mem state.OrgMembership, accts map[string]state.Account) dashboard.OrgMemberItem {
 	item := dashboard.OrgMemberItem{
 		AccountID: mem.AccountID,
 		Role:      string(mem.Role),
 		JoinedAt:  mem.JoinedAt.UTC().Format("2006-01-02"),
 	}
-	if acct, err := store.AccountByID(ctx, mem.AccountID); err == nil {
+	if acct, ok := accts[mem.AccountID]; ok {
 		item.Email = acct.Email
 	} else {
 		item.Email = "(deleted account)"
@@ -1380,12 +1382,37 @@ func (s *server) renderOrgDetail(w http.ResponseWriter, r *http.Request, log *sl
 			"org_id", org.ID, "err", err)
 		data.Error = "members: " + err.Error()
 	} else {
+		// PR-9 §1: pre-collect every active member's account ID
+		// into a unique slice; one batch fetch replaces N
+		// per-row AccountByID calls. The deleted-account race is
+		// preserved by map-absence in the batch helper (same
+		// contract as the per-row AccountByID path).
+		active := make([]string, 0, len(members))
+		for _, m := range members {
+			if m.RemovedAt != nil {
+				continue
+			}
+			active = append(active, m.AccountID)
+		}
+		accts := map[string]state.Account{}
+		if len(active) > 0 {
+			fetched, err := s.store.AccountsByIDs(r.Context(), active)
+			if err != nil {
+				log.Warn("dashboard renderOrgDetail: AccountsByIDs",
+					"org_id", org.ID, "err", err)
+				// Best-effort: fall through with the empty map
+				// we already initialised. The projection treats
+				// missing accounts as "(deleted account)".
+			} else {
+				accts = fetched
+			}
+		}
 		items := make([]dashboard.OrgMemberItem, 0, len(members))
 		for _, m := range members {
 			if m.RemovedAt != nil {
 				continue
 			}
-			items = append(items, dashboardMembershipProjection(r.Context(), s.store, m))
+			items = append(items, dashboardMembershipProjection(m, accts))
 		}
 		data.Members = items
 	}

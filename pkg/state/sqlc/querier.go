@@ -17,6 +17,7 @@ type Querier interface {
 	AccountByEmail(ctx context.Context, db DBTX, email interface{}) (AccountByEmailRow, error)
 	AccountByID(ctx context.Context, db DBTX, id pgtype.UUID) (AccountByIDRow, error)
 	AccountByKeyHash(ctx context.Context, db DBTX, keySha256 []byte) (AccountByKeyHashRow, error)
+	AccountsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) ([]AccountsByIDsRow, error)
 	AppByID(ctx context.Context, db DBTX, id pgtype.UUID) (AppByIDRow, error)
 	AppBySlug(ctx context.Context, db DBTX, slug string) (AppBySlugRow, error)
 	AppendEvent(ctx context.Context, db DBTX, arg AppendEventParams) error

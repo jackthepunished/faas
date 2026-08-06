@@ -28,6 +28,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cursor"
 )
 
 // PgStore implements Store against Postgres. It holds a connection pool and
@@ -150,6 +151,43 @@ func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = $1`, id)
 	return scanAccount(row)
+}
+
+// AccountsByIDs is the batch equivalent of AccountByID — one round-
+// trip replaces N per-row lookups. Returns a map keyed by account
+// ID; missing IDs are absent (not an error). The map-absence
+// contract mirrors AccountByID's per-row missing case so the
+// dashboard render can keep the "(deleted account)" fallback.
+//
+// Wide projection intentionally matches AccountByID/AccountByEmail/
+// AccountByKeyHash so mfa_* / deletion_requested_at / past_due_at
+// are present and the requireMFA chokepoint sees post-enrollment
+// state (see scanAccountCols doc-comment at pkg/state/pgstore.go).
+//
+// PR-9 §1: closes the N+1 fan-out in
+// cmd/apid/handlers_dashboard.go's renderOrgDetail member loop.
+func (s *PgStore) AccountsByIDs(ctx context.Context, ids []string) (map[string]Account, error) {
+	out := make(map[string]Account, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = any($1::uuid[])`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("state: accounts by IDs: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a, err := scanAccountCols(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("state: accounts by IDs: row: %w", err)
+		}
+		out[a.ID] = a
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: accounts by IDs: rows: %w", err)
+	}
+	return out, nil
 }
 
 func (s *PgStore) AccountByEmail(ctx context.Context, email string) (Account, error) {
@@ -11601,10 +11639,18 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 }
 
 // ListOrgInvitationsForOrgPage is the cursor-paginated variant of
-// ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
-// invitation's id (UUID); the SQL filter `id::text < $3` partitions
-// rows by id and the ORDER BY tiebreaks with id so the cursor walk
-// is well-defined when two rows share a created_at timestamp.
+// ListOrgInvitationsForOrg (PR-8 acceptance; PR-9 cursor upgrade).
+//
+// PR-9: the v1 cursor was the bare invitation id (UUID). The SQL
+// predicate `id::text < $cursor` against an ORDER BY (created_at
+// DESC, id DESC) is unsound under random UUIDs — two rows can have
+// an inverted id::text comparison relative to the actual created_at
+// ordering (the v1 limitation is documented at the memstore mirror).
+// PR-9 replaces the v1 cursor with a compound (created_at, id)
+// key encoded by pkg/cursor. The SQL filter switches to a tuple
+// predicate on the (created_at, id::text) row, partitioned by
+// the decoded cursor. When `before` is empty (first page) the
+// filter is elided via the $5 flag.
 //
 // limit is clamped to [1, 100]; out-of-range resolves to 25. The
 // before="" case is the first page (no filter). No JOIN: invitations
@@ -11614,15 +11660,46 @@ func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string
 	if limit <= 0 || limit > 100 {
 		limit = 25
 	}
+	// PR-9: parse the compound cursor. Empty is the first-page
+	// sentinel; malformed input returns state.ErrInvalidCursor so
+	// the handler can surface a 400 validation_failed (the v1
+	// cursor silently returned 0 rows on malformed input, which
+	// made broken clients silently fall behind — DO NOT regress).
+	var (
+		cursorTS  time.Time
+		cursorID  string
+		hasCursor bool
+	)
+	if before != "" {
+		k, err := cursor.Decode(before)
+		if err != nil {
+			// Return the sentinel plus the cursor decode error so
+			// errors.Is(err, ErrInvalidCursor) works for the
+			// handler's 400-mapping while the log keeps the
+			// cursor-package body. errors.Join is the canonical
+			// multi-error wrap (Go 1.20+).
+			return nil, errors.Join(ErrInvalidCursor, err)
+		}
+		cursorTS = k.CreatedAt
+		cursorID = k.ID
+		hasCursor = true
+	}
+	// Tie the cursor predicates to the empty-case flag so the
+	// planner can short-circuit the first-page query without a
+	// NULL-aware anchor CTE.
+	emptyFlag := ""
+	if hasCursor {
+		emptyFlag = "x"
+	}
 	rows, err := s.pool.Query(ctx, `
 		select id, org_id, email::text, role, token_hash, invited_by_account_id,
 		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
 		  from org_invitations
 		 where org_id = $1
-		   and ($3 = '' or id::text < $3)
+		   and ($5 = '' or (created_at, id::text) < ($3::timestamptz, $4))
 		 order by created_at desc, id::text desc
 		 limit $2
-	`, orgID, limit, before)
+	`, orgID, limit, cursorTS, cursorID, emptyFlag)
 	if err != nil {
 		return nil, fmt.Errorf("state: list org invitations paged: %w", err)
 	}

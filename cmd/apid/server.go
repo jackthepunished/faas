@@ -654,16 +654,17 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.removeOrgMember)))))
 	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.requireStepUp(5*time.Minute)(s.transferOrgOwnership))))))
 	mux.HandleFunc("GET /v1/invitations/{token}", s.authLimited(s.peekInvitation))
-	// PR-8: accept-invitation now sits behind requireStepUp (5m).
+	// PR-8 + PR-9 §4: accept-invitation sits behind requireStepUpStrict
+	// (5m). PR-9 flips the bearer-key branch from "bypass" to
+	// "reject" — a leaked invitation token alone is sufficient to
+	// grant org membership, so the bearer path is no longer
+	// step-up-equivalent. The cookie path keeps its original
+	// reject-on-missing-stamp behavior. The other 8 requireStepUp
+	// mounts (server.go:655, 671, 700, 892, ...) keep the v1
+	// bypass until each route's threat model is re-audited.
 	// Compose order mirrors POST /v1/orgs/{slug}/transfer_ownership
-	// (server.go:655): authLimited → requireMFA → requireStepUp.
-	// Without step-up, a bearer who leaked an invitation token could
-	// mint themselves into the target org with no fresh TOTP — the
-	// threat model ADR-077 closed for the other 8 sensitive routes.
-	// Bearer-key principals skip the gate (an API key is step-up-
-	// equivalent proof); pre-PR-077 cookies fail open per the
-	// bypass tolerance at middleware.go:836-847.
-	mux.HandleFunc("POST /v1/invitations/{token}/accept", s.authLimited(s.requireMFA(s.requireStepUp(5*time.Minute)(s.acceptInvitation))))
+	// (server.go:655): authLimited → requireMFA → requireStepUpStrict.
+	mux.HandleFunc("POST /v1/invitations/{token}/accept", s.authLimited(s.requireMFA(s.requireStepUpStrict(5*time.Minute)(s.acceptInvitation))))
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/invitations/{token}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.revokeInvitation)))))
 	// PR-8 §2: list invitations surface (cursor-paginated, every role).
 	mux.HandleFunc("GET /v1/orgs/{slug}/invitations", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.listOrgInvitations)))))

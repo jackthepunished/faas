@@ -7,6 +7,10 @@ returning id, email, plan, status, coalesce(provider_customer_id, ''), created_a
 select id, email, plan, status, coalesce(provider_customer_id, ''), created_at
 from accounts where id = $1;
 
+-- name: AccountsByIDs :many
+select id, email, plan, status, coalesce(provider_customer_id, ''), coalesce(stripe_subscription_item, ''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
+from accounts where id = any($1::uuid[]);
+
 -- name: AccountByEmail :one
 select id, email, plan, status, coalesce(provider_customer_id, ''), created_at
 from accounts where email = $1;

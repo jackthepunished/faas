@@ -4670,8 +4670,13 @@ paths:
         name: before
         schema: { type: string }
         description: |
-          Cursor — the `id` of the last row from the prior page.
-          Omit on the first page.
+          Opaque cursor for the row immediately preceding the
+          next page. Base64-url encoding of a JSON object
+          `{"created_at":"...","id":"..."}` (the compound key,
+          encoded by the server in `next_before`). Pass the
+          prior response's `next_before` unchanged. Omit on
+          the first page. Malformed cursors return 400 with
+          the stable code `invalid_cursor` (PR-9).
       - name: limit
         in: query
         schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
@@ -4683,16 +4688,18 @@ paths:
       description: |
         Cursor-paginated list of every invitation minted on the
         org — pending, consumed, revoked, expired — in
-        `created_at DESC` order (id tiebreak). Cursor is the
-        last row's `id`; `?before=<id>` partitions the next
-        page. Default limit 25, max 100 (per the strict-mode
-        pagination contract at issue #393). Every role may
-        read (gated by `org.view`, the same access model as
-        GET /v1/orgs/{slug}/members). PR-8 ships the surface
-        so the dashboard can render a "Pending invitations"
-        table next to the "Members" table. Each render emits
-        one `org.invitation.viewed` audit row (success-only,
-        per ADR-035).
+        `created_at DESC` order (id tiebreak). The cursor is a
+        opaque (base64-url-of-JSON) compound key `(created_at,
+        id)`; `?before=<cursor>` partitions the next page so
+        the row at the boundary is visited exactly once even
+        under random UUIDs (PR-9 cursor upgrade). Default limit
+        25, max 100 (per the strict-mode pagination contract at
+        issue #393). Every role may read (gated by `org.view`,
+        the same access model as GET /v1/orgs/{slug}/members).
+        PR-8 ships the surface so the dashboard can render a
+        "Pending invitations" table next to the "Members"
+        table. Each render emits one `org.invitation.viewed`
+        audit row (success-only, per ADR-035).
       responses:
         '200':
           description: The page of invitations.
@@ -8197,11 +8204,14 @@ components:
           items: { $ref: '#/components/schemas/OrgInvitationResponse' }
         next_before:
           description: |
-            Opaque cursor — set to the `id` of the last row on this
-            page when there's a next page. Pass back as `?before=`
-            to fetch it. Matches the same cursor shape as
-            MemberListResponse / AppListResponse so the SDK can
-            share one walker.
+            Opaque cursor — set to the **base64-url-of-JSON** of
+            the last row's compound `(created_at, id)` key when
+            there's a next page. Pass back as `?before=` to
+            fetch it. PR-9 changes the encoding from the v1
+            bare-id cursor to the compound key so the
+            `created_at DESC, id DESC` order is preserved
+            exactly under random UUIDs. The wire shape is
+            opaque; clients MUST pass the value back unchanged.
           type: string
 
     TransferOwnershipRequest:

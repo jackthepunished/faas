@@ -2500,3 +2500,79 @@ func TestPg_CountLiveInstancesByDeployment(t *testing.T) {
 		t.Errorf("empty deployment_id: expected error from UUID type cast, got nil")
 	}
 }
+
+// TestPg_AccountsByIDs exercises the batch helper that closes
+// the N+1 fan-out in the dashboard org-detail render (PR-9 §1).
+// Mirrors the per-row AccountByID contract: missing IDs are
+// absent from the returned map (NOT errors), and the empty-slice
+// short-circuit returns an empty map without issuing a query.
+//
+// PR-9 §1: every AccountByID read in the project uses the wide
+// mfa_*/deletion_requested_at/past_due_at projection so the
+// requireMFA chokepoint sees post-enrollment state. We assert
+// the batched projection likewise carries mfa_required so a
+// regression that drops the field is caught here.
+func TestPg_AccountsByIDs(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	// Empty input → empty map, no error.
+	got, err := s.AccountsByIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("AccountsByIDs(nil) err = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(AccountsByIDs(nil)) = %d, want 0", len(got))
+	}
+
+	// Seed three accounts on three plans.
+	plans := []api.Plan{api.PlanFree, api.PlanHobby, api.PlanPro}
+	want := make([]state.Account, 0, len(plans))
+	for i, p := range plans {
+		a, err := s.CreateAccount(ctx, fmt.Sprintf("u%d@example.com", i), p)
+		if err != nil {
+			t.Fatalf("CreateAccount[%d]: %v", i, err)
+		}
+		want = append(want, a)
+	}
+
+	// Two present + one UUID-shaped-but-absent → map has 2 entries.
+	missing := uuid.NewString()
+	got, err = s.AccountsByIDs(ctx, []string{want[0].ID, want[1].ID, missing})
+	if err != nil {
+		t.Fatalf("AccountsByIDs: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(got) = %d, want 2", len(got))
+	}
+	for _, w := range want[:2] {
+		g, ok := got[w.ID]
+		if !ok {
+			t.Errorf("missing entry for ID %q", w.ID)
+			continue
+		}
+		if g.Email != w.Email {
+			t.Errorf("got[%s].Email = %q, want %q", w.ID, g.Email, w.Email)
+		}
+		if g.Plan != w.Plan {
+			t.Errorf("got[%s].Plan = %q, want %q", w.ID, g.Plan, w.Plan)
+		}
+		// mfa_required is NOT NULL with default false; the wide
+		// projection must carry it through so requireMFA sees
+		// post-enrollment state.
+		if g.MFARequired != false {
+			t.Errorf("got[%s].MFARequired = %v, want false", w.ID, g.MFARequired)
+		}
+	}
+	if _, ok := got[missing]; ok {
+		t.Errorf("missing ID %q should not appear in map", missing)
+	}
+
+	// Duplicate IDs in the request → only one entry per unique ID.
+	got, err = s.AccountsByIDs(ctx, []string{want[0].ID, want[0].ID, want[2].ID})
+	if err != nil {
+		t.Fatalf("AccountsByIDs dup: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(got) = %d, want 2 (unique IDs)", len(got))
+	}
+}

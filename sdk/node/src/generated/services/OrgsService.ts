@@ -943,16 +943,18 @@ export class OrgsService {
    * List org invitations (every state).
    * Cursor-paginated list of every invitation minted on the
    * org — pending, consumed, revoked, expired — in
-   * `created_at DESC` order (id tiebreak). Cursor is the
-   * last row's `id`; `?before=<id>` partitions the next
-   * page. Default limit 25, max 100 (per the strict-mode
-   * pagination contract at issue #393). Every role may
-   * read (gated by `org.view`, the same access model as
-   * GET /v1/orgs/{slug}/members). PR-8 ships the surface
-   * so the dashboard can render a "Pending invitations"
-   * table next to the "Members" table. Each render emits
-   * one `org.invitation.viewed` audit row (success-only,
-   * per ADR-035).
+   * `created_at DESC` order (id tiebreak). The cursor is a
+   * opaque (base64-url-of-JSON) compound key `(created_at,
+   * id)`; `?before=<cursor>` partitions the next page so
+   * the row at the boundary is visited exactly once even
+   * under random UUIDs (PR-9 cursor upgrade). Default limit
+   * 25, max 100 (per the strict-mode pagination contract at
+   * issue #393). Every role may read (gated by `org.view`,
+   * the same access model as GET /v1/orgs/{slug}/members).
+   * PR-8 ships the surface so the dashboard can render a
+   * "Pending invitations" table next to the "Members"
+   * table. Each render emits one `org.invitation.viewed`
+   * audit row (success-only, per ADR-035).
    *
    * @returns InvitationListResponse The page of invitations.
    * @throws ApiError
@@ -971,8 +973,13 @@ export class OrgsService {
      */
     slug: string,
     /**
-     * Cursor — the `id` of the last row from the prior page.
-     * Omit on the first page.
+     * Opaque cursor for the row immediately preceding the
+     * next page. Base64-url encoding of a JSON object
+     * `{"created_at":"...","id":"..."}` (the compound key,
+     * encoded by the server in `next_before`). Pass the
+     * prior response's `next_before` unchanged. Omit on
+     * the first page. Malformed cursors return 400 with
+     * the stable code `invalid_cursor` (PR-9).
      *
      */
     before?: string,

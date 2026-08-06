@@ -31,6 +31,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/authz"
+	"github.com/onebox-faas/faas/pkg/cursor"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -300,7 +301,7 @@ func (s *server) revokeInvitation(w http.ResponseWriter, r *http.Request, acct s
 
 // listOrgInvitations renders the org-scoped invitation list at
 // GET /v1/orgs/{slug}/invitations. Cursor-paginated via
-// ?before=<id>&limit=<n> (default 25, max 100 — matches the
+// ?before=<cursor>&limit=<n> (default 25, max 100 — matches the
 // pattern at handlers_account_scoped.go:54-82). Every role can
 // view (authz.OrgActionView); the same authz gate as
 // listOrgMembers so the dashboard's "Members" + "Pending
@@ -313,6 +314,14 @@ func (s *server) revokeInvitation(w http.ResponseWriter, r *http.Request, acct s
 // documents "an admin looked at the pending invites" for the
 // compliance audit (ADR-035 §"Kind taxonomy" is success-only;
 // this row fires only when the page returns 200).
+//
+// PR-9: the wire cursor is now a compound (created_at, id)
+// key encoded by pkg/cursor (base64url(JSON)). The store
+// decodes internally; the handler emits the compound cursor
+// from the last row's (created_at, id) and maps
+// state.ErrInvalidCursor to a 400 validation_failed with the
+// stable code `invalid_cursor` (the v1 cursor silently returned
+// 0 rows on malformed input — DO NOT regress).
 func (s *server) listOrgInvitations(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if !s.requireOrgAction(w, r, authz.OrgActionView) {
 		return
@@ -329,6 +338,13 @@ func (s *server) listOrgInvitations(w http.ResponseWriter, r *http.Request, acct
 	before := r.URL.Query().Get("before")
 	rows, err := s.store.ListOrgInvitationsForOrgPage(r.Context(), mem.OrgID, limit, before)
 	if err != nil {
+		if errors.Is(err, state.ErrInvalidCursor) {
+			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest,
+				"invalid_cursor",
+				"Invalid cursor",
+				"the `before` query parameter is not a valid cursor; pass `next_before` from the prior response unchanged, or omit it for the first page"))
+			return
+		}
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity,
 			"ListOrgInvitationsForOrgPage failed",
@@ -357,8 +373,17 @@ func (s *server) listOrgInvitations(w http.ResponseWriter, r *http.Request, acct
 		out.Invitations = append(out.Invitations,
 			api.OrgInvitationResponseFromRow(invitationToRow(inv, org.Slug, now)))
 	}
+	// PR-9: emit the compound cursor (created_at, id) of the last
+	// row. The page is "full" when limit rows were returned AND
+	// at least one row exists — both conditions match the v1
+	// gate len(rows) == limit && len(rows) > 0 so the next-page
+	// termination semantics are unchanged.
 	if len(rows) == limit && len(rows) > 0 {
-		out.NextBefore = rows[len(rows)-1].ID
+		last := rows[len(rows)-1]
+		out.NextBefore = cursor.Encode(cursor.Key{
+			CreatedAt: last.CreatedAt,
+			ID:        last.ID,
+		})
 	}
 	s.audit.Emit(r.Context(), "org.invitation.viewed", &acct.ID, map[string]any{
 		"org_id":        mem.OrgID,
