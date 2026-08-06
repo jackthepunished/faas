@@ -147,14 +147,14 @@ There is no dual-write phase to roll back; no partial-state window to close. The
 ## Verification
 
 ### Migration tests
-- `make migration-test` — apply `00155` against an empty pg instance and verify the schema + replay safety + audit row emission.
+- `make migration-test` — apply `00156` against an empty pg instance and verify the schema + replay safety + audit row emission.
 - `make migration-test REPLAY=1` — re-apply; verify `auth_default_flipped_at` is NOT re-stamped (idempotent — predicate is `WHERE auth_default_flipped_at IS NULL`).
-- Down-migration probe — `00155` down drops the column cleanly. Forward-only contraction per ADR-041 / migration `00099` precedent.
+- Down-migration probe — `00156` down drops the column cleanly. Forward-only contraction per ADR-041 / migration `00099` precedent.
 
 ### Unit tests (CI pins — most important to get right)
-- **`migrations/00143_apps_require_authn_test.go`** — historical assertion (`defaultVal == false`) stays. The post-flip default pin moves to `00155`.
-- **`migrations/00153_apps_public_auth_test.go`** — historical assertion (`defaultMode == "open"`) stays. The post-flip default pin moves to `00155`.
-- **`migrations/00155_apps_auth_default_flip_test.go`** — pins the post-flip default for both columns on a fresh DB.
+- **`migrations/00143_apps_require_authn_test.go`** — historical assertion (`defaultVal == false`) stays. The post-flip default pin moves to `00156`.
+- **`migrations/00153_apps_public_auth_test.go`** — historical assertion (`defaultMode == "open"`) stays. The post-flip default pin moves to `00156`.
+- **`migrations/00156_apps_auth_default_flip_test.go`** — pins the post-flip default for both columns on a fresh DB.
 - **`pkg/state/pgstore_test.go`** — `TestPg_CreateAppIfUnderQuota_WritesRequireAuthnDefault` + `TestPg_CreateAppIfUnderQuota_WritesPublicAuthModeDefault` mirror the existing `TestPg_CreateAppIfUnderQuota_WritesStreamingEnabled`.
 - **`tests/state/create_app_default_test.go`** — issue #695 AC #5 tripwire. Fails the merge if the default reverts to `false` / `"open"`.
 - **`cmd/apid/handlers_ext_test.go::TestGetApp_SurfacesRequireAuthn`** — updated per-plan expectations (Hobby/Pro/Scale → `true`, Free → `false`).
@@ -182,6 +182,6 @@ There is no dual-write phase to roll back; no partial-state window to close. The
 
 ## Notes for the implementer
 
-- The migration slot is **00155** (current HEAD is `00154_deployment_liveness_probe.sql`). If a sibling PR is mid-review when this lands, reserve slot 00156 with a fence file per the `migrations/00100_reserve_slot.sql` pattern.
+- The migration slot is **00156**. Slot 155 was held by PR #697 (`feat/issue-554-liveness-followup`, owned `00155_deployments_parked_reason.sql`); this branch renumbered from 00155 to 00156 to avoid a goose "duplicate version 155" collision when both PRs land, and added a no-op `00155_reserve_slot.sql` fence (per ADR-041 / `migrations/00100_reserve_slot.sql` precedent). The fence must be `git rm`-ed once PR #697 merges.
 - The ADR number **080** is free (the three `079-*.md` files share the same number — see ADR-079 / ADR-079-per-app-public-auth / ADR-079-liveness-probe-restart-wedged-vm for the precedent of overlapping numbers; the repo's file naming is forgiving on this point).
 - The `Limits.RequireAuthnDefault` field on Free is the only field with `false`. A test that iterates plans asserting "at least one default is true" is the right shape; iterating and asserting "all defaults are true" would over-constrain.

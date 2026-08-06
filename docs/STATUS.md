@@ -641,7 +641,7 @@ default with `--allow-unauthenticated` opening a route; this flip
 makes Gregale match that posture for newly-created apps.
 
 - **Schema** — `apps.auth_default_flipped_at timestamptz NULL`
-  (migration 00155, slot 154→155). Nullable so the migration is
+  (migration 00156, slot 155→156). Nullable so the migration is
   forward-only contraction (down-migration drops the column).
 - **Grandfather mechanism** — migration stamps every pre-flip
   row at flip-time (`UPDATE apps SET auth_default_flipped_at =
@@ -682,7 +682,7 @@ makes Gregale match that posture for newly-created apps.
   via `RequireAuthn: &falsy` because their anonymous probes
   aren't testing the authn surface.
 
-ADR-080 / issue #695 / migration 00155.
+ADR-080 / issue #695 / migration 00156.
 
 ## What's next
 
@@ -754,7 +754,7 @@ sometimes implied they were closed; they aren't.
 
 - **#695** — Flip `apps.require_authn` global default to `true`
   (Cloud Run `--no-allow-unauthenticated` parity). Migration
-  `00155` landed with a grand-father stamp on every pre-flip
+  `00156` landed with a grand-father stamp on every pre-flip
   row + one batch audit row; new apps stamp the per-plan default
   via `api.Plan.RequireAuthnDefault()` /
   `api.Plan.PublicAuthModeDefault()` at `apid::buildApp` time.

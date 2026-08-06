@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply test for 00155 (issue #695 / ADR-080 — flip the
+// Migration-apply test for 00156 (issue #695 / ADR-080 — flip the
 // global default for apps auth from public-by-default to
 // authenticated-by-default + grand-father existing customers).
 //
@@ -35,11 +35,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00155_AppsAuthDefaultFlip(t *testing.T) {
+func TestMigrations_00156_AppsAuthDefaultFlip(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00155. A regression that drops a slot between
+	// (1) Apply through 00156. A regression that drops a slot between
 	// 1 and 154 surfaces here before the per-assertion pins.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 154)", err)
@@ -72,7 +72,7 @@ func TestMigrations_00155_AppsAuthDefaultFlip(t *testing.T) {
 	// this test insertion to verify the UPDATE path explicitly.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000001551',
+		values ('00000000-0000-0000-0000-000000001561',
 		        'auth-default-flip-a@example.com', 'pro', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -80,7 +80,7 @@ func TestMigrations_00155_AppsAuthDefaultFlip(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000001552',
+		values ('00000000-0000-0000-0000-000000001562',
 		        'auth-default-flip-b@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -88,11 +88,11 @@ func TestMigrations_00155_AppsAuthDefaultFlip(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, require_authn, public_auth_mode, created_at)
-		values ('00000000-0000-0000-0000-000000001553',
-		        '00000000-0000-0000-0000-000000001551',
+		values ('00000000-0000-0000-0000-000000001563',
+		        '00000000-0000-0000-0000-000000001561',
 		        'auth-default-flip-a-app', 'function', 512, 5, 300, 'active', false, 'open', now()),
-		       ('00000000-0000-0000-0000-000000001554',
-		        '00000000-0000-0000-0000-000000001552',
+		       ('00000000-0000-0000-0000-000000001564',
+		        '00000000-0000-0000-0000-000000001562',
 		        'auth-default-flip-b-app', 'function', 256, 2, 60, 'active', false, 'open', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -214,8 +214,8 @@ func TestMigrations_00155_AppsAuthDefaultFlip(t *testing.T) {
 	}
 	state := make(map[string]appState)
 	for _, id := range []string{
-		"00000000-0000-0000-0000-000000001553",
-		"00000000-0000-0000-0000-000000001554",
+		"00000000-0000-0000-0000-000000001563",
+		"00000000-0000-0000-0000-000000001564",
 	} {
 		var s appState
 		if err := pool.QueryRow(ctx, `
@@ -254,12 +254,12 @@ func TestMigrations_00155_AppsAuthDefaultFlip(t *testing.T) {
 	}
 	// Verify stamps unchanged by re-reading one fixture row.
 	var stampBefore, stampAfter string
-	row = pool.QueryRow(ctx, `select auth_default_flipped_at from apps where id = '00000000-0000-0000-0000-000000001553'`)
+	row = pool.QueryRow(ctx, `select auth_default_flipped_at from apps where id = '00000000-0000-0000-0000-000000001563'`)
 	if err := row.Scan(&stampBefore); err != nil {
 		t.Fatalf("replay-safety: read stamp before: %v", err)
 	}
 	// ApplyUp already happened — read again to compare.
-	row = pool.QueryRow(ctx, `select auth_default_flipped_at from apps where id = '00000000-0000-0000-0000-000000001553'`)
+	row = pool.QueryRow(ctx, `select auth_default_flipped_at from apps where id = '00000000-0000-0000-0000-000000001563'`)
 	if err := row.Scan(&stampAfter); err != nil {
 		t.Fatalf("replay-safety: read stamp after: %v", err)
 	}

@@ -1,4 +1,4 @@
--- filename: 00155_apps_auth_default_flip.sql
+-- filename: 00156_apps_auth_default_flip.sql
 -- +goose Up
 -- Issue #695 / ADR-080 — flip the global default for apps auth from
 -- public-by-default to authenticated-by-default. Closes spec §17 G15
