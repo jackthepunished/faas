@@ -26,6 +26,7 @@ type Account struct {
 	MfaRecoveryCodesHash   [][]byte
 	MfaRequired            bool
 	OverageCapCents        pgtype.Int8
+	KeyGraceWindowDays     pgtype.Int4
 }
 
 type AccountCredit struct {
@@ -82,14 +83,21 @@ type AlertRule struct {
 }
 
 type ApiKey struct {
-	ID         pgtype.UUID
-	AccountID  pgtype.UUID
-	KeySha256  []byte
-	Label      pgtype.Text
-	LastUsedAt pgtype.Timestamptz
-	CreatedAt  pgtype.Timestamptz
-	Scopes     []string
-	OrgID      pgtype.UUID
+	ID            pgtype.UUID
+	AccountID     pgtype.UUID
+	KeySha256     []byte
+	Label         pgtype.Text
+	LastUsedAt    pgtype.Timestamptz
+	CreatedAt     pgtype.Timestamptz
+	Scopes        []string
+	OrgID         pgtype.UUID
+	ExpiresAt     pgtype.Timestamptz
+	Status        string
+	RevokedAt     pgtype.Timestamptz
+	RotatedFromID pgtype.UUID
+	CreatedIp     *netip.Addr
+	CreatedUa     pgtype.Text
+	ParentKeyID   pgtype.UUID
 }
 
 type App struct {
@@ -112,22 +120,29 @@ type App struct {
 	// Per-instance RPS target. When live_request_count / live_instance_count exceeds this, schedd admits another instance (up to plan max_concurrency). Hobby/Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app).
 	AutoscaleTargetRps pgtype.Int4
 	// Per-instance CPU% target (1..100). Pro/Scale only (plan gate). 0 / NULL = disabled (the trigger skips the app). CPU target is unbounded above 100 inside the DB; the apid handler enforces [1, 100] via 422.
-	AutoscaleTargetCpuPct  pgtype.Int4
-	GithubInstallBindingID pgtype.Text
-	GithubInstallAccountID pgtype.UUID
-	GithubInstallLinkedAt  pgtype.Timestamptz
-	ProjectID              pgtype.UUID
-	RootDir                string
-	WorkloadName           string
-	WorkloadClass          string
-	EvictionPriority       string
-	StartCommand           pgtype.Text
-	StreamingEnabled       bool
-	ScalingPolicy          []byte
-	LastScaleOutAt         pgtype.Timestamptz
-	LastScaleInAt          pgtype.Timestamptz
-	RequireSigned          bool
-	OrgID                  pgtype.UUID
+	AutoscaleTargetCpuPct   pgtype.Int4
+	GithubInstallBindingID  pgtype.Text
+	GithubInstallAccountID  pgtype.UUID
+	GithubInstallLinkedAt   pgtype.Timestamptz
+	ProjectID               pgtype.UUID
+	RootDir                 string
+	WorkloadName            string
+	WorkloadClass           string
+	StartCommand            pgtype.Text
+	StreamingEnabled        bool
+	ScalingPolicy           []byte
+	LastScaleOutAt          pgtype.Timestamptz
+	LastScaleInAt           pgtype.Timestamptz
+	RequireSigned           bool
+	NodeID                  pgtype.UUID
+	ReassignedAt            pgtype.Timestamptz
+	OrgID                   pgtype.UUID
+	MigratedAt              pgtype.Timestamptz
+	WarmSnapshotEnabled     bool
+	WarmSnapshotMinRequests int32
+	WarmSnapshotMinMs       int32
+	EvictionPriority        string
+	RequireAuthn            bool
 }
 
 type AppEnv struct {
@@ -138,6 +153,18 @@ type AppEnv struct {
 	CreatedAt pgtype.Timestamptz
 	UpdatedAt pgtype.Timestamptz
 	OrgID     pgtype.UUID
+}
+
+type AppRegistryCredential struct {
+	ID                pgtype.UUID
+	AccountID         pgtype.UUID
+	AppID             pgtype.UUID
+	Registry          string
+	Username          string
+	PasswordEncrypted []byte
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	LastUsedAt        pgtype.Timestamptz
 }
 
 type AppSecret struct {
@@ -224,8 +251,9 @@ type ComputeNode struct {
 	// Locality label for the chooser tie-break (pkg/sched/placement.go). Free-form text; nullable so pre-00072 rows accept the schema. The seeded default-local row is backfilled to 'local'. ADR-025.
 	Region pgtype.Text
 	// Finer locality inside region. Currently informational; nullable. ADR-025.
-	Zone       pgtype.Text
-	VcpuBudget int32
+	Zone            pgtype.Text
+	ScheddTargetUrl pgtype.Text
+	VcpuBudget      int32
 }
 
 type ComputeNodeHeartbeat struct {
@@ -299,6 +327,8 @@ type Deployment struct {
 	OverrideEnvSecrets  []byte
 	OverridePort        pgtype.Int4
 	OverrideHealthcheck []byte
+	Sidecars            []byte
+	MinInstances        int32
 	ScanResult          []byte
 	ScanStatus          pgtype.Text
 	ScannedAt           pgtype.Timestamptz
@@ -310,6 +340,16 @@ type DeploymentLog struct {
 	Stream       string
 	Line         string
 	WrittenAt    pgtype.Timestamptz
+}
+
+type DeploymentSidecarLayer struct {
+	DeploymentID  pgtype.UUID
+	SidecarName   string
+	StorageKey    string
+	Bytes         int64
+	ContentDigest string
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
 }
 
 type EgressPolicy struct {
@@ -366,22 +406,26 @@ type IdempotencyKey struct {
 }
 
 type Instance struct {
-	ID               pgtype.UUID
-	AppID            pgtype.UUID
-	DeploymentID     pgtype.UUID
-	State            string
-	Netns            pgtype.Text
-	GuestUid         pgtype.Int4
-	HostIp           *netip.Addr
-	RamMb            int32
-	StartedAt        pgtype.Timestamptz
-	LastRequestAt    pgtype.Timestamptz
-	ParkedAt         pgtype.Timestamptz
-	TerminalAt       pgtype.Timestamptz
-	NodeID           pgtype.UUID
-	WakeID           pgtype.UUID
-	OrgID            pgtype.UUID
-	FrameworkReadyAt pgtype.Timestamptz
+	ID                 pgtype.UUID
+	AppID              pgtype.UUID
+	DeploymentID       pgtype.UUID
+	State              string
+	Netns              pgtype.Text
+	GuestUid           pgtype.Int4
+	HostIp             *netip.Addr
+	RamMb              int32
+	StartedAt          pgtype.Timestamptz
+	LastRequestAt      pgtype.Timestamptz
+	ParkedAt           pgtype.Timestamptz
+	TerminalAt         pgtype.Timestamptz
+	NodeID             pgtype.UUID
+	WakeID             pgtype.UUID
+	OrgID              pgtype.UUID
+	MigratedFromNodeID pgtype.UUID
+	MigratedAt         pgtype.Timestamptz
+	LeaseToken         pgtype.Text
+	FrameworkReadyAt   pgtype.Timestamptz
+	TailCount          int32
 }
 
 type Invocation struct {
@@ -502,6 +546,14 @@ type PaddleOverageDedupe struct {
 	OrgID       pgtype.UUID
 }
 
+type PgRatelimitCounter struct {
+	Scope      string
+	SubjectID  pgtype.UUID
+	Plan       string
+	Tokens     int64
+	LastRefill pgtype.Timestamptz
+}
+
 type Project struct {
 	ID               pgtype.UUID
 	AccountID        pgtype.UUID
@@ -523,13 +575,14 @@ type RecentBuildClaim struct {
 }
 
 type Session struct {
-	ID         pgtype.UUID
-	AccountID  pgtype.UUID
-	IssuedIp   *netip.Addr
-	IssuedUa   pgtype.Text
-	IssuedAt   pgtype.Timestamptz
-	LastSeenAt pgtype.Timestamptz
-	RevokedAt  pgtype.Timestamptz
+	ID          pgtype.UUID
+	AccountID   pgtype.UUID
+	IssuedIp    *netip.Addr
+	IssuedUa    pgtype.Text
+	IssuedAt    pgtype.Timestamptz
+	LastSeenAt  pgtype.Timestamptz
+	RevokedAt   pgtype.Timestamptz
+	BindingHash pgtype.Text
 }
 
 type Snapshot struct {
@@ -541,6 +594,7 @@ type Snapshot struct {
 	Stale        bool
 	CreatedAt    pgtype.Timestamptz
 	StorageKey   string
+	Tier         string
 }
 
 // Per-(account, app, day) byte totals from snapshots.mem_bytes + disk_bytes + overlay staging. Source: pkg/meter/storage.go cron tick. ADR-049 §B.3. Informational only — not billed today; the future "Pro plan 1 GB included" PR consumes this surface.
@@ -577,8 +631,9 @@ type UsageDaily struct {
 	ColdBootCount  int64
 	BuilderSeconds int64
 	// Timestamp the meterd cron last wrote this row. Stamped on every ON CONFLICT update so a stuck cron is visible in /v1/usage/daily metadata.
-	RolledUpAt pgtype.Timestamptz
-	OrgID      pgtype.UUID
+	RolledUpAt  pgtype.Timestamptz
+	OrgID       pgtype.UUID
+	TailSeconds int64
 }
 
 type UsageMinute struct {
@@ -603,6 +658,7 @@ type UsageMinute struct {
 	// Build kind parallel to builds.kind (railpack / dockerfile / tarball); 'none' for non-build rows. ADR-048. Informational — not billed.
 	BuilderKind string
 	OrgID       pgtype.UUID
+	TailSeconds int64
 }
 
 type UsageMonthly struct {
@@ -617,4 +673,10 @@ type UsageMonthly struct {
 	NetRxBytes     int64
 	ColdBootCount  int64
 	BuilderSeconds int64
+}
+
+type WarmHint struct {
+	AppID     pgtype.UUID
+	NodeID    pgtype.UUID
+	WrittenAt pgtype.Timestamptz
 }

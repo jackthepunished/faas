@@ -6244,6 +6244,15 @@ func (s *PgStore) ClearInstanceFrameworkReadyAt(ctx context.Context, id string) 
 // receipt raced a Park / Destroy and the row is gone). The
 // vmmd receipt path logs a Debug and drops — same convention
 // as the framework_ready / sidecar-event DGRAM receipts.
+//
+// SQL mirrors the sqlc source in queries.sql::BumpInstanceTailCount;
+// `make sqlc-check` enforces lockstep between the raw SQL below
+// and the generated sqlc method. The Store interface uses `string`
+// for the instance id (matching the rest of the public surface)
+// while the sqlc-generated method takes `pgtype.UUID` — the bridge
+// is omitted here to keep pgstore's parameter shape consistent
+// with the existing inline-SQL precedent for `UpdateInstanceState`
+// and `AppendComputeNodeHeartbeat`.
 func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error) {
 	var post int32
 	row := s.pool.QueryRow(ctx,
@@ -6277,6 +6286,10 @@ func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta in
 // defence-in-depth guard, not the load-bearing piece.
 //
 // Returns ErrNotFound when the instance row is missing.
+//
+// SQL mirrors the sqlc source in queries.sql::DecrementInstanceTailCount;
+// `make sqlc-check` enforces lockstep. See the BumpInstanceTailCount
+// comment for the rationale on the `string` vs `pgtype.UUID` bridge.
 func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string, n int32) error {
 	tag, err := s.pool.Exec(ctx,
 		`update instances
@@ -6299,6 +6312,10 @@ func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string, n i
 // in shared_buffers under normal load; pgx returns the column as
 // int32 per the migration's ADD COLUMN type.
 // Returns ErrNotFound when the instance row is missing.
+//
+// SQL mirrors the sqlc source in queries.sql::GetInstanceTailCount;
+// `make sqlc-check` enforces lockstep. See the BumpInstanceTailCount
+// comment for the rationale on the `string` vs `pgtype.UUID` bridge.
 func (s *PgStore) GetInstanceTailCount(ctx context.Context, id string) (int32, error) {
 	var n int32
 	err := s.pool.QueryRow(ctx,

@@ -2917,7 +2917,6 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 	// truth. Polling at 200 ms keeps the read load on PG bounded
 	// even at fleet scale (60 nodes × 16 instances × 5 Hz = 4 800
 	// SELECT/s of TAIL_COUNT — negligible next to the meterd cron).
-	var watchdogCancelled bool
 	if ins.TailCount > 0 {
 		deadline := time.Now().Add(time.Duration(api.ParkTailDrainTimeoutSeconds) * time.Second)
 		for {
@@ -2925,17 +2924,34 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 				return ctx.Err()
 			}
 			if time.Now().After(deadline) {
-				// Watchdog fired. Log the stall so an operator can
-				// correlate with the runner's tail-host log lines.
+				// Watchdog fired. Re-read the live tail_count from
+				// the store rather than relying on the in-memory
+				// ins.TailCount snapshot taken at function entry:
+				// a fresh tail registered between the entry read
+				// and the deadline (e.g. a second request arri­ved
+				// while we polled) MUST be counted, otherwise those
+				// tasks are silently lost when the runner exits
+				// after the watchdog force-parks. The fresh read
+				// also covers the symmetrical case where terminal
+				// receipts drained the counter past the stale
+				// snapshot — we emit exactly the live unfinished
+				// count and decrement by exactly that much.
+				liveCount, liveErr := e.store.GetInstanceTailCount(ctx, ins.ID)
+				n := int64(ins.TailCount)
+				if liveErr == nil && liveCount > 0 {
+					n = int64(liveCount)
+				}
+				// Log the stall so an operator can correlate with
+				// the runner's tail-host log lines.
 				e.log.Warn("snapshotAndPark: tail drain watchdog fired",
 					"instance", ins.ID,
 					"ins_tail_count", ins.TailCount,
+					"live_tail_count", n,
 					"watchdog_seconds", api.ParkTailDrainTimeoutSeconds)
 				// Emit one forced-at-park audit row per unfinished tail
 				// (best-effort: bails out on context cancel). The event
 				// warehouse dedupes on (instance_id, wake_id, kind) so a
 				// late DGRAM that lands after the row is harmless.
-				n := int64(ins.TailCount)
 				for i := int64(0); i < n; i++ {
 					if e.events != nil {
 						e.events.Emit(ctx, events.TailFailed{
@@ -2963,7 +2979,6 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 				e.log.Warn("snapshotAndPark: tail count read",
 					"instance", ins.ID, "err", err)
 			} else if cur == 0 {
-				watchdogCancelled = true
 				break
 			}
 			// Sleep 200 ms. Select on the context as well so a
@@ -2975,7 +2990,6 @@ func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error 
 			}
 		}
 	}
-	_ = watchdogCancelled // reserved for future metric instrumentation
 	// vmstate is a small JSON the FC socket writes to during pause; we
 	// give it a host path under the snap dir (the local driver maps the
 	// storage_key back to this exact location on the next restore, so

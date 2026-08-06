@@ -35,12 +35,21 @@ type Querier interface {
 	//   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
 	//   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
 	//   tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock seconds
-	//                      draining waitUntil tasks; INFORMATIONAL ONLY —
-	//                      pinned by
-	//                      pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
+	//                      draining waitUntil tasks; INFORMATIONAL ONLY — pinned
+	//                      by pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
 	AppendUsage(ctx context.Context, db DBTX, arg AppendUsageParams) error
 	BuildByDeployment(ctx context.Context, db DBTX, deploymentID pgtype.UUID) (Build, error)
 	BuildByID(ctx context.Context, db DBTX, id pgtype.UUID) (Build, error)
+	// issue #667 / ADR-078 — atomically apply delta to the instance's
+	// `tail_count` column and return the post-update value. The
+	// GREATEST(…, 0) floor mirrors DecrementInstanceTailCount's safety
+	// property: a stale receipt from a guest that just parked cannot
+	// underflow the counter, and the 5s watchdog in snapshotAndPark
+	// force-parks regardless. RETURNING tail_count lets the caller
+	// (vmmd's MarkInstanceTailTerminal) learn the new value without a
+	// follow-up SELECT. Returns ErrNotFound when the instance row is
+	// missing (pgx.ErrNoRows maps to state.ErrNotFound in pgstore).
+	BumpInstanceTailCount(ctx context.Context, db DBTX, arg BumpInstanceTailCountParams) (int32, error)
 	CountDeployedApps(ctx context.Context, db DBTX, accountID pgtype.UUID) (int64, error)
 	// scopes is $4 (text[]). The handler is responsible for validating the
 	// scope vocabulary; the store does not. See ADR-034 rev2.
@@ -68,6 +77,19 @@ type Querier interface {
 	// unparseable" — surfaced as "" on read by coalesce(host(...))).
 	CreateSession(ctx context.Context, db DBTX, arg CreateSessionParams) (CreateSessionRow, error)
 	CronByID(ctx context.Context, db DBTX, id pgtype.UUID) (CronByIDRow, error)
+	// issue #667 / ADR-078 — canonical "tail task reached terminal" path.
+	// Equivalent to BumpInstanceTailCount(ctx, id, -n) but kept as a
+	// separate method because every decrement site is a terminal event
+	// receipt, and the explicit name makes the call sites self-
+	// documenting. n is the number of tail tasks to decrement by (1 for
+	// the steady-state path, the full unfinished-tail count for the
+	// snapshotAndPark watchdog). The GREATEST(…, 0) floor is a
+	// defence-in-depth guard against races where a receipt lands after
+	// the runner exited cleanly: the counter floors at 0 rather than
+	// underflowing, which would permanently stall the schedd reaper's
+	// tail_count > 0 early-out. Returns ErrNotFound when the instance
+	// row is missing.
+	DecrementInstanceTailCount(ctx context.Context, db DBTX, arg DecrementInstanceTailCountParams) error
 	DeleteAPIKey(ctx context.Context, db DBTX, arg DeleteAPIKeyParams) error
 	// IAM-1 (ADR-034 rev2): delete a key and return the row in one
 	// statement so the handler can emit `key.deleted` audit with the
@@ -79,6 +101,12 @@ type Querier interface {
 	DeploymentByID(ctx context.Context, db DBTX, id pgtype.UUID) (DeploymentByIDRow, error)
 	DomainByName(ctx context.Context, db DBTX, domain interface{}) (DomainByNameRow, error)
 	ExpireOrgInvitations(ctx context.Context, db DBTX, expiresAt pgtype.Timestamptz) (int64, error)
+	// issue #667 / ADR-078 — read-only probe for the snapshotAndPark
+	// 5s watchdog's poll loop. Single SELECT … FROM instances WHERE
+	// id = $1; the column is on the hot path so the row is already in
+	// shared_buffers under normal load. Returns ErrNotFound when the
+	// instance row is missing.
+	GetInstanceTailCount(ctx context.Context, db DBTX, id pgtype.UUID) (int32, error)
 	// Primary-key lookup; called on every authenticated dashboard request.
 	// sql.ErrNoRows from pgx maps to state.ErrNotFound in pgstore.
 	GetSession(ctx context.Context, db DBTX, id pgtype.UUID) (GetSessionRow, error)

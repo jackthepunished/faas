@@ -144,8 +144,8 @@ rollup table `usage_daily` mirrors the column additively.
 `pkg/meter/pusher.go::PushHour` is **unchanged**. `tail_seconds` does not
 enter `Math.GBHours`, `Provider.PushUsageRecord`, `providerOpsFor`, or any
 Stripe/Paddle payload shape. A permanent guard test
-`pkg/meter/pusher_test.go::TestPushHour_ExcludesTailSeconds` pins this —
-a follow-up ADR would have to remove it.
+`pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds` pins
+this — a follow-up ADR would have to remove it.
 
 ### Metrics (`pkg/wire/metrics.go`)
 

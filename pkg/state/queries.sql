@@ -297,6 +297,46 @@ from instances where app_id = $1 order by started_at desc;
 -- name: UpdateInstanceState :exec
 update instances set state = $2 where id = $1;
 
+-- name: BumpInstanceTailCount :one
+-- issue #667 / ADR-078 — atomically apply delta to the instance's
+-- `tail_count` column and return the post-update value. The
+-- GREATEST(…, 0) floor mirrors DecrementInstanceTailCount's safety
+-- property: a stale receipt from a guest that just parked cannot
+-- underflow the counter, and the 5s watchdog in snapshotAndPark
+-- force-parks regardless. RETURNING tail_count lets the caller
+-- (vmmd's MarkInstanceTailTerminal) learn the new value without a
+-- follow-up SELECT. Returns ErrNotFound when the instance row is
+-- missing (pgx.ErrNoRows maps to state.ErrNotFound in pgstore).
+update instances
+   set tail_count = GREATEST(tail_count + $2, 0)
+ where id = $1
+returning tail_count;
+
+-- name: DecrementInstanceTailCount :exec
+-- issue #667 / ADR-078 — canonical "tail task reached terminal" path.
+-- Equivalent to BumpInstanceTailCount(ctx, id, -n) but kept as a
+-- separate method because every decrement site is a terminal event
+-- receipt, and the explicit name makes the call sites self-
+-- documenting. n is the number of tail tasks to decrement by (1 for
+-- the steady-state path, the full unfinished-tail count for the
+-- snapshotAndPark watchdog). The GREATEST(…, 0) floor is a
+-- defence-in-depth guard against races where a receipt lands after
+-- the runner exited cleanly: the counter floors at 0 rather than
+-- underflowing, which would permanently stall the schedd reaper's
+-- tail_count > 0 early-out. Returns ErrNotFound when the instance
+-- row is missing.
+update instances
+   set tail_count = GREATEST(tail_count - $2, 0)
+ where id = $1;
+
+-- name: GetInstanceTailCount :one
+-- issue #667 / ADR-078 — read-only probe for the snapshotAndPark
+-- 5s watchdog's poll loop. Single SELECT … FROM instances WHERE
+-- id = $1; the column is on the hot path so the row is already in
+-- shared_buffers under normal load. Returns ErrNotFound when the
+-- instance row is missing.
+select tail_count from instances where id = $1;
+
 -- name: CreateBuild :one
 insert into builds (id, deployment_id, kind, source_bytes, status, log_path)
 values (gen_random_uuid(), $1, $2, $3, 'queued', $4)

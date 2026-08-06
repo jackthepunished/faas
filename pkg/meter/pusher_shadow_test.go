@@ -3,6 +3,7 @@ package meter_test
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -824,6 +825,43 @@ func TestPushHour_ExcludesTailSeconds(t *testing.T) {
 	t.Parallel()
 	s := state.NewMemStore()
 	ctx := context.Background()
+
+	// Compile-time pin 1: the billing.Provider.PushUsageRecord signature
+	// must remain (ctx, acct, hour, mbSeconds). A future PR that adds
+	// a `tailSeconds int64` parameter to PushUsageRecord (mirroring
+	// the AppendUsage tail_seconds column) would break this pin and
+	// force a deliberate change to the test file. ADR-078 §"Tail is
+	// informational" is the load-bearing invariant; a follow-up ADR
+	// would have to remove this.
+	//
+	// The pattern is a function-type alias pinned to the method's
+	// signature via a typed assignment. If PushUsageRecord's
+	// signature drifts (parameter added / removed / retyped), the
+	// compiler rejects the assignment below because the function
+	// type no longer matches. We use a recordingStripe-conforming
+	// cast that does not invoke the method at runtime — the conformance
+	// is enforced at the type-system level only.
+	type pushUsageRecordSignature func(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error
+	var _ pushUsageRecordSignature = (*recordingStripe)(nil).PushUsageRecord
+
+	// Compile-time pin 2: the recordedCall struct must have exactly
+	// three fields (AccountID, Hour, MBSeconds). A future PR that
+	// adds a `TailSeconds int64` field (mirroring DailyUsage.TailSeconds)
+	// would either fire the reflection assertion below or break the
+	// struct literal at recordingStripe.PushUsageRecord. We use
+	// `reflect` here so the check is mechanical, not a happy-path
+	// reading.
+	recShape := &recordedCall{}
+	rt := reflect.TypeOf(*recShape)
+	if rt.NumField() != 3 {
+		t.Fatalf("recordedCall has %d fields, want exactly 3 (AccountID, Hour, MBSeconds); a future PR that added TailSeconds would break the load-bearing contract that tail_seconds is informational only — see ADR-078 §\"Tail is informational\"", rt.NumField())
+	}
+	want := map[string]bool{"AccountID": true, "Hour": true, "MBSeconds": true}
+	for i := 0; i < rt.NumField(); i++ {
+		if !want[rt.Field(i).Name] {
+			t.Errorf("recordedCall.%s = unexpected field; want fields are exactly AccountID, Hour, MBSeconds", rt.Field(i).Name)
+		}
+	}
 
 	t0 := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
 	now := t0

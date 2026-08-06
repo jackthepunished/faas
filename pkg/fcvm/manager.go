@@ -1761,9 +1761,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// every Wake; MarkInstanceTailTerminal accumulates into it
 	// and the meterd Sampler reads+resets via
 	// ReadAndResetTailSeconds once per minute. Zero is the
-	// implicit default for an int64 field; explicit init is
-	// documentation.
-	_ = inst.tailSecondsAccum
+	// implicit default for an int64 field.
 	// Capture the allowlist rule handles for the in-place patch
 	// (PR-B, UpdateEgressAllowlist). The kernel assigns a handle
 	// to every `nft add rule`; we re-list the chain with `-a` and
