@@ -452,6 +452,27 @@ type App struct {
 	// keep every new app public). Operators may PATCH true → false
 	// on any plan to opt out per-app.
 	RequireAuthn bool
+	// PublicAuthMode (issue #477 / ADR-079) is the per-app
+	// public-URL auth mode ('open'|'bearer'|'basic'). When
+	// 'open' (the default — every pre-existing app stays
+	// public-by-default), gatewayd-internal pass-throughs
+	// anonymous traffic. When 'bearer', gatewayd-internal
+	// demands an Authorization: Bearer header (re-using the
+	// require_authn key chain). When 'basic', gatewayd-internal
+	// demands an Authorization: Basic header and verifies
+	// against the secretbox-sealed PublicAuthBasicSealed
+	// blob. Plan-gated at PATCH time (open=all, bearer=Hobby+,
+	// basic=Pro+); the per-plan default is always 'open'.
+	PublicAuthMode string
+	// PublicAuthBasicSealed (issue #477 / ADR-079) is the
+	// secretbox-sealed APP_BASIC_AUTH blob carrying the
+	// {username, password} pair the basic-auth path verifies
+	// against. Nil/empty for open/bearer modes; set ONLY when
+	// PublicAuthMode='basic'. Gatewayd-internal unseals it
+	// at boot (and caches the unsealed form for 60s +
+	// db.NotifyKeyChanged invalidation) so the secretbox
+	// hot-path doesn't run on every request.
+	PublicAuthBasicSealed []byte
 	// WarmSnapshotMinRequests is the minimum successful request
 	// count before schedd promotes a warm-tier capture. Range
 	// [1, 100], default 5. Lowering this shortens the time to
@@ -1845,8 +1866,33 @@ type UpdateAppParams struct {
 	// plan may PATCH true → false to opt out per-app.
 	RequireAuthn    *bool
 	SetRequireAuthn bool
-	Status          *AppStatus
-	Manifest        *AppManifest
+	// PublicAuth (issue #477 / ADR-079) is the per-app
+	// public-URL auth block on the PATCH request. Three
+	// shapes:
+	//   - nil (the default): leave the apps row's
+	//     public_auth_mode + public_auth_basic columns
+	//     alone.
+	//   - non-nil with Mode="open": explicit opt-out back
+	//     to public-by-default; the sealed blob is cleared
+	//     so a stale secretbox row never reaches a fresh
+	//     request.
+	//   - non-nil with Mode="bearer": bearer auth gate
+	//     flips on; cleared blob.
+	//   - non-nil with Mode="basic": basic auth gate
+	//     flips on; sealed blob is populated from
+	//     Username/Password (or, in v1, env-var reference
+	//     names per the issue body).
+	// SetPublicAuth distinguishes "unset" (don't touch the
+	// columns) from "explicit {open,bearer,basic}" the same
+	// way SetRequireAuthn does. The apid PATCH validator
+	// enforces the plan gate (open=all, bearer=Hobby+,
+	// basic=Pro+) and the canonical mode enum; the secretbox
+	// seal happens at PATCH time so the gatewayd hot path
+	// only reads ciphertext.
+	PublicAuth    *AppPublicAuthUpdate
+	SetPublicAuth bool
+	Status        *AppStatus
+	Manifest      *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
@@ -1876,6 +1922,45 @@ type UpdateAppParams struct {
 	ScalingPolicy    *ScalingPolicy
 	SetScalingPolicy bool
 }
+
+// AppPublicAuthUpdate (issue #477 / ADR-079) is the
+// per-app public-URL auth block carried on UpdateAppParams
+// + the apid PATCH /v1/apps/{slug} handler. The store
+// layer turns Mode + Sealed into the column pair
+// (public_auth_mode, public_auth_basic); the seal happens
+// at PATCH time (in the apid handler) so the on-row bytes
+// are always ciphertext and the store layer never sees
+// plaintext.
+//
+// Mode is the canonical 'open'|'bearer'|'basic' string
+// (must match apps_public_auth_mode_chk). Username +
+// Password are only meaningful when Mode='basic'; they
+// carry the plaintext the apid seal step encodes under
+// the APP_BASIC_AUTH secretbox namespace. For Mode='open'
+// or 'bearer', the apid handler ignores them (and clears
+// any existing sealed blob — Sealed is left nil).
+// Sealed carries the ciphertext the apid wrote; nil for
+// mode='open'|'bearer' (the store will NULL the column)
+// and non-nil for mode='basic' (the store will write it).
+type AppPublicAuthUpdate struct {
+	Mode     string
+	Username string
+	Password string
+	Sealed   []byte
+}
+
+// Canonical public-auth mode strings for the state
+// layer (issue #477 / ADR-079). Values must stay in sync
+// with the apps_public_auth_mode_chk CHECK constraint in
+// migrations/00153_apps_public_auth.sql AND with the
+// pkg/gateway's package-local copies. The three layers
+// (sqlc / state / gateway) all share the same vocabulary;
+// if a fourth is ever added, mirror the constant here.
+const (
+	AppPublicAuthModeOpen   = "open"
+	AppPublicAuthModeBearer = "bearer"
+	AppPublicAuthModeBasic  = "basic"
+)
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).
 //

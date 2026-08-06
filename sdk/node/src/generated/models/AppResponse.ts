@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AppManifest } from './AppManifest.js';
+import type { PublicAuthStatus } from './PublicAuthStatus.js';
 import type { ScalingPolicy } from './ScalingPolicy.js';
 /**
  * An app: slug, type, runtime (for functions), RAM/cpu/idle-timeout config, current state, last-deploy pointer, per-app outbound CIDR allowlist (ADR-031 + ADR-032), and reactive scale-up trigger targets (issue #169 / #172).
@@ -75,5 +76,6 @@ export type AppResponse = {
    * Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby PATCH-true is rejected with 403 plan_require_authn_not_allowed.
    */
   require_authn?: boolean;
+  public_auth?: PublicAuthStatus;
 };
 

@@ -2389,7 +2389,16 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   warm_snapshot_min_requests = case when $33 then $34 else warm_snapshot_min_requests end,
 		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end,
 		   eviction_priority = case when $37 then $38 else eviction_priority end,
-		   require_authn = case when $39 then $40 else require_authn end
+		   require_authn = case when $39 then $40 else require_authn end,
+		   -- Issue #477 / ADR-079: per-app public_auth. The mode
+		   -- column is the canonical per-app config; the
+		   -- basic-sealed blob is the secretbox-encrypted
+		   -- credential pair (mode='basic' only). The two
+		   -- columns are SET together so a partial PATCH
+		   -- (mode='open' with stale sealed blob from a prior
+		   -- mode='basic' PATCH) clears the blob atomically.
+		   public_auth_mode   = case when $41 then $42::text  else public_auth_mode   end,
+		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2438,8 +2447,42 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// so the SQL never sees an illegal value. Free customers
 		// may PATCH true → false on a Pro-upgraded app; Hobby
 		// customers may opt back out the same way.
-		p.SetRequireAuthn, boolOrFalse(p.RequireAuthn))
+		p.SetRequireAuthn, boolOrFalse(p.RequireAuthn),
+		// Issue #477 / ADR-079: public_auth block. The Set bit
+		// gates BOTH columns via the same CASE so a stale
+		// sealed blob from a prior mode='basic' PATCH is
+		// cleared when the customer PATCHes mode='open' or
+		// mode='bearer' (the apid handler always passes
+		// p.PublicAuth with Sealed=nil in that case).
+		p.SetPublicAuth,
+		derefString(ptrOrEmpty(p.PublicAuth)),
+		nilOrBytes(p.PublicAuth))
 	return scanApp(row)
+}
+
+// nilOrBytes returns p.PublicAuth.Sealed when SetPublicAuth is
+// true (the apid seal step produced a non-nil blob for
+// mode='basic'; apid passes nil Sealed for mode='open'/'bearer'
+// so the same CASE writes NULL atomically). The pgx driver
+// maps a nil []byte to SQL NULL, which is exactly what
+// public_auth_basic expects when no creds are stored.
+func nilOrBytes(p *AppPublicAuthUpdate) []byte {
+	if p == nil {
+		return nil
+	}
+	return p.Sealed
+}
+
+// ptrOrEmpty returns a pointer to p.PublicAuth.Mode when
+// SetPublicAuth is true (so derefString sees the canonical
+// value), or nil otherwise. The CASE guards the read site
+// so a nil pointer is harmless.
+func ptrOrEmpty(p *AppPublicAuthUpdate) *string {
+	if p == nil {
+		return nil
+	}
+	s := p.Mode
+	return &s
 }
 
 // derefString returns the dereferenced value of a *string, or "" if
@@ -9085,7 +9128,15 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// helper.
 		&a.EvictionPriority,
 		// Issue #560: per-app require_authn column.
-		&a.RequireAuthn); err != nil {
+		&a.RequireAuthn,
+		// Issue #477 / ADR-079: per-app public_auth. Both
+		// columns land positionally after require_authn. The
+		// mode column is NOT NULL DEFAULT 'open' so a plain
+		// *string scan is safe; the basic blob is nullable
+		// bytea (NULL when mode='open'|'bearer'), scanned
+		// into a *[]byte to keep the SQL NULL → Go nil
+		// convention explicit.
+		&a.PublicAuthMode, &a.PublicAuthBasicSealed); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -9148,7 +9199,9 @@ const appsSelectColumns = `
 	reassigned_at, migrated_at,
 	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms,
 	eviction_priority,
-	require_authn`
+	require_authn,
+	-- Issue #477 / ADR-079: per-app public_auth
+	public_auth_mode, public_auth_basic`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

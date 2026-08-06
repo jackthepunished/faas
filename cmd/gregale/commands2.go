@@ -101,7 +101,7 @@ const (
 // silently drop valid inputs like `--ram 0` or `--idle -1`.
 func cmdApp(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N] [--concurrency] [--require-authn] [--no-require-authn]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [--ram N] [--max-concurrency N] [--idle SEC] [--min N] [--autoscale-target-rps N] [--autoscale-target-cpu-pct N] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests N] [--warm-snapshot-min-ms N] [--concurrency] [--require-authn] [--no-require-authn] [--public-auth MODE] [--basic-user USER --basic-pass PASS]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -160,6 +160,25 @@ func cmdApp(args []string) int {
 	// problem code.
 	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
 	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
+	// Issue #477 / ADR-079: per-app public-URL auth mode.
+	// The CLI uses a single string flag (open|bearer|basic)
+	// plus optional --basic-user / --basic-pass plaintext
+	// args for mode='basic'. The apid seal step encrypts
+	// them under the APP_BASIC_AUTH secretbox namespace
+	// before persistence. The CLI never sees the sealed
+	// blob — the customer supplies plaintext at PATCH
+	// time. Basic auth lands as basic_user + basic_pass
+	// in the JSON body (the apid side handles the seal).
+	//
+	// Plan-gate (server-side, surfaces as an
+	// "Update failed" error with the API's problem
+	// code): Free PATCH 'bearer' = 402
+	// plan_public_auth_bearer_not_allowed; Free/Hobby
+	// PATCH 'basic' = 402
+	// plan_public_auth_basic_not_allowed.
+	publicAuth := fs.String("public-auth", "", "per-app public-URL auth: 'open' (default), 'bearer' (Hobby+), or 'basic' (Pro+; pair with --basic-user + --basic-pass)")
+	basicUser := fs.String("basic-user", "", "basic-auth username (RFC 7617 §2); required when --public-auth=basic")
+	basicPass := fs.String("basic-pass", "", "basic-auth password (RFC 7617 §2); required when --public-auth=basic")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -289,11 +308,43 @@ func cmdApp(args []string) int {
 		v := false
 		req.RequireAuthn = &v
 	}
+	// Issue #477 / ADR-079: public-auth block. The CLI
+	// validates the mode locally (so a typo surfaces
+	// before the round-trip) and forwards the
+	// basic_user + basic_pass as plaintext — the apid
+	// seal step encrypts them under the APP_BASIC_AUTH
+	// secretbox namespace before persistence. The
+	// CLI never sees the sealed blob.
+	if explicit["public-auth"] {
+		v := *publicAuth
+		switch v {
+		case api.AppPublicAuthModeOpen, api.AppPublicAuthModeBearer, api.AppPublicAuthModeBasic:
+		default:
+			return printErr("Invalid --public-auth",
+				fmt.Errorf("must be 'open', 'bearer', or 'basic'; got %q", v))
+		}
+		block := &api.PublicAuthBlock{Mode: v}
+		if v == api.AppPublicAuthModeBasic {
+			bu := strings.TrimSpace(*basicUser)
+			bp := strings.TrimSpace(*basicPass)
+			if bu == "" {
+				return printErr("Invalid --basic-user",
+					fmt.Errorf("--basic-user is required when --public-auth=basic"))
+			}
+			if bp == "" {
+				return printErr("Invalid --basic-pass",
+					fmt.Errorf("--basic-pass is required when --public-auth=basic"))
+			}
+			block.BasicUser = bu
+			block.BasicPass = bp
+		}
+		req.PublicAuth = block
+	}
 
 	if req.RAMMB == nil && req.MaxConcurrency == nil && req.IdleTimeoutS == nil && req.MinInstances == nil &&
 		req.AutoscaleTargetRPS == nil && req.AutoscaleTargetCPUPct == nil &&
 		req.WarmSnapshotEnabled == nil && req.WarmSnapshotMinRequests == nil && req.WarmSnapshotMinMs == nil &&
-		req.EvictionPriority == nil && req.RequireAuthn == nil {
+		req.EvictionPriority == nil && req.RequireAuthn == nil && req.PublicAuth == nil {
 		a, err := client.GetApp(ctx, slug)
 		if err != nil {
 			return printErr("Could not fetch app", err)

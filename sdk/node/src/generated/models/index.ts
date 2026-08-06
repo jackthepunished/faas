@@ -116,6 +116,8 @@ export type { PlanWorkload } from './PlanWorkload.js';
 export type { Problem } from './Problem.js';
 export type { ProjectApplyRequest } from './ProjectApplyRequest.js';
 export type { ProjectScanRequest } from './ProjectScanRequest.js';
+export type { PublicAuthBlock } from './PublicAuthBlock.js';
+export type { PublicAuthStatus } from './PublicAuthStatus.js';
 export type { PutAppEnvRequest } from './PutAppEnvRequest.js';
 export type { PutAppRegistryCredentialRequest } from './PutAppRegistryCredentialRequest.js';
 export type { PutAppSecretRequest } from './PutAppSecretRequest.js';

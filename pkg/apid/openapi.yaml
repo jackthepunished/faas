@@ -5276,6 +5276,17 @@ components:
           type: boolean
           example: false
 
+        # Issue #477 / ADR-077: per-app public-URL auth
+        # configuration. Mirrors the read-side
+        # PublicAuthStatus shape — `has_basic_creds` is true
+        # iff the row carries a sealed APP_BASIC_AUTH blob
+        # (mode='basic' with credentials). The plaintext
+        # username/password are NEVER echoed; the apid
+        # redaction posture is a load-bearing invariant
+        # (see ADR-077 §Decision "re-redaction invariant").
+        public_auth:
+          $ref: '#/components/schemas/PublicAuthStatus'
+
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
       type: object
@@ -5460,6 +5471,31 @@ components:
           type: [boolean, "null"]
           example: false
 
+        # Issue #477 / ADR-077: per-app public-URL auth
+        # configuration. Omitted → no change. When present,
+        # mode is the closed enum {open, bearer, basic}.
+        # Plan gates run after closed-enum validation:
+        # Free PATCH 'bearer' returns 402
+        # plan_public_auth_bearer_not_allowed; Free/Hobby
+        # PATCH 'basic' returns 402
+        # plan_public_auth_basic_not_allowed. When
+        # mode='basic', basic_user + basic_pass are required
+        # and MUST be plaintext at PATCH time (the apid seal
+        # step encrypts them under the APP_BASIC_AUTH
+        # secretbox namespace before persistence). For
+        # mode='open'/'bearer', the sealed blob is cleared
+        # so a stale secretbox row from a previous PATCH
+        # doesn't reach a fresh request. Audit: emits
+        # app.public_auth_changed on mode flips and a
+        # single-purpose `has_basic_creds: bool` flag in
+        # the payload (re-redaction invariant — plaintext
+        # is NEVER recorded).
+        public_auth:
+          description: "Per-app public-URL auth configuration (issue #477 / ADR-077). Omitted → no change. When present, mode is the closed enum {open, bearer, basic}; basic_user + basic_pass are required when mode='basic' and the apid seal step encrypts them under the APP_BASIC_AUTH secretbox namespace before persistence."
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/PublicAuthBlock'
+
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
       type: object
@@ -5518,6 +5554,46 @@ components:
           minimum: 5
           maximum: 86400
           example: 60
+
+    PublicAuthBlock:
+      description: "Per-app public-URL auth write shape (issue #477 / ADR-077). Sent on PATCH /v1/apps/{slug}; apid seals the basic_user + basic_pass into a single APP_BASIC_AUTH secretbox blob before persistence. The plaintext is never echoed on read (see PublicAuthStatus)."
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          description: "Auth mode (closed set). 'open' is the pre-#477 default (every request passes). 'bearer' requires Authorization: Bearer (Hobby+; 402 on Free). 'basic' requires HTTP Basic auth with sealed credentials (Pro+; 402 on Free/Hobby). Unknown values → 422 invalid_public_auth_mode."
+          type: string
+          enum: [open, bearer, basic]
+          example: basic
+        basic_user:
+          description: "Basic-auth username (RFC 7617 §2). Plaintext at PATCH time; sealed into apps.public_auth_basic under the APP_BASIC_AUTH secretbox namespace. Required when mode='basic'; ignored otherwise. Range [1, 128] bytes after TrimSpace."
+          type: string
+          minLength: 1
+          maxLength: 128
+          example: editor
+        basic_pass:
+          description: "Basic-auth password (RFC 7617 §2). Plaintext at PATCH time; sealed alongside basic_user under the APP_BASIC_AUTH secretbox namespace. Required when mode='basic'; ignored otherwise. Range [1, 256] bytes."
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 256
+          example: hunter2
+
+    PublicAuthStatus:
+      description: "Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision 're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."
+      type: object
+      required: [mode, has_basic_creds]
+      properties:
+        mode:
+          description: "Active auth mode. One of 'open', 'bearer', 'basic'. Matches apps.public_auth_mode on disk; a PATCH 'open' cleared any prior sealed blob so a stale secretbox row never reaches a fresh request."
+          type: string
+          enum: [open, bearer, basic]
+          example: basic
+        has_basic_creds:
+          description: "True iff the row carries a non-null apps.public_auth_basic blob (i.e. mode='basic' with credentials). A mode='basic' row without creds would 401 every request — has_basic_creds is the operator-greppable signal that the seal succeeded."
+          type: boolean
+          example: true
 
     ScalingTarget:
       description: "(metric, value) pair the engine watches for the scale-up trigger. The metric surface is closed; the unset state (null) is the legacy 'engine falls back to autoscale_target_rps' path."

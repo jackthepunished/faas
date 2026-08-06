@@ -194,6 +194,84 @@ func TestCmdAppMinInstances_HobbyRejects(t *testing.T) {
 	}
 }
 
+// TestCmdAppPublicAuth_ParsesAndForwards wires the --public-auth
+// flag (issue #477 / ADR-079). Three sub-cases pin the
+// customer-facing surface:
+//
+//  1. Unknown mode -> CLI-side typo rejection (no round-trip).
+//  2. mode='basic' without --basic-user -> CLI-side missing-creds
+//     rejection (no round-trip).
+//  3. mode='basic' with creds -> wire shape carries the
+//     PublicAuthBlock exactly as the apid handler expects
+//     (mode + basic_user + basic_pass as plaintext — the apid
+//     seal step handles APP_BASIC_AUTH encryption server-side).
+//
+// The third case asserts the wire shape so a future contributor
+// adding a flag-by-flag emit doesn't accidentally drop basic_user
+// or basic_pass from the JSON body.
+func TestCmdAppPublicAuth_ParsesAndForwards(t *testing.T) {
+	t.Run("unknown_mode_rejected_locally", func(t *testing.T) {
+		called := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_test_x")
+		if code := cmdApp([]string{constSlug, "--public-auth", "weird"}); code == 0 {
+			t.Fatalf("cmdApp --public-auth=weird should reject locally; round-trip happened = %v", called)
+		}
+	})
+	t.Run("basic_mode_requires_user", func(t *testing.T) {
+		called := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_test_x")
+		if code := cmdApp([]string{constSlug, "--public-auth", "basic", "--basic-pass", "x"}); code == 0 {
+			t.Fatalf("cmdApp --public-auth=basic without --basic-user should reject; round-trip = %v", called)
+		}
+	})
+	t.Run("basic_mode_forwards_block", func(t *testing.T) {
+		var seen *api.UpdateAppRequest
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPatch {
+				var body api.UpdateAppRequest
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				seen = &body
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"slug":"hello","public_auth":{"mode":"basic","has_basic_creds":true}}`)
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_test_x")
+		if code := cmdApp([]string{constSlug,
+			"--public-auth", "basic",
+			"--basic-user", "editor",
+			"--basic-pass", "hunter2",
+		}); code != 0 {
+			t.Fatalf("cmdApp --public-auth=basic + creds exit = %d; want 0", code)
+		}
+		if seen == nil || seen.PublicAuth == nil {
+			t.Fatalf("cmdApp did not send PublicAuth block; got %+v", seen)
+		}
+		if seen.PublicAuth.Mode != api.AppPublicAuthModeBasic {
+			t.Fatalf("PublicAuth.Mode = %q; want %q", seen.PublicAuth.Mode, api.AppPublicAuthModeBasic)
+		}
+		if seen.PublicAuth.BasicUser != "editor" {
+			t.Fatalf("PublicAuth.BasicUser = %q; want %q", seen.PublicAuth.BasicUser, "editor")
+		}
+		if seen.PublicAuth.BasicPass != "hunter2" {
+			t.Fatalf("PublicAuth.BasicPass = %q; want %q", seen.PublicAuth.BasicPass, "hunter2")
+		}
+	})
+}
+
 // itoaForCli is a tiny local helper for the Hobby-rejects test so the
 // file doesn't depend on strconv (matches the apid test's itoa style).
 func itoaForCli(n int) string {

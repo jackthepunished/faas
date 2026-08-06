@@ -274,6 +274,14 @@ type PGBackend struct {
 	// startup phase after it has resolved fleet posture from the
 	// compute_nodes table.
 	legacySingleBox bool
+
+	// publicAuthCache is the unsealed basic-auth credential
+	// cache (issue #477 / ADR-079). nil = no caching; the
+	// basic-auth path falls back to per-request unsealing
+	// (slower but safe). Production wires it from
+	// cmd/gatewayd-internal so the 60s TTL + per-key
+	// invalidation through db.NotifyKeyChanged both apply.
+	publicAuthCache *PublicAuthCache
 }
 
 // AppResolverFunc is the typed alias for WithAppResolver. Mirrors
@@ -550,6 +558,32 @@ func (b *PGBackend) FlushRoutes() {
 	b.appsMu.Lock()
 	b.apps = map[string]App{}
 	b.appsMu.Unlock()
+}
+
+// InvalidatePublicAuth (issue #477 / ADR-079) drops every
+// entry in the per-app basic-auth unsealed-credential cache.
+// gatewayd calls this on a db.NotifyKeyChanged notification
+// (cmd/gatewayd-internal/backend.go) so a key rotation
+// re-unseals on the next request. nil-safe: an unwired
+// cache is a no-op.
+func (b *PGBackend) InvalidatePublicAuth() {
+	if b.publicAuthCache == nil {
+		return
+	}
+	b.publicAuthCache.InvalidateAll()
+}
+
+// WithPublicAuthCache (issue #477 / ADR-079) arms the
+// unsealed basic-auth credential cache. nil = no caching
+// (the basic-auth path unseals per-request — slower but
+// correct; tests prefer this). Production wires the
+// gateway.NewPublicAuthCache() constructed in
+// cmd/gatewayd-internal/main.go so the 60s TTL applies.
+// The setter returns *PGBackend for fluent chaining
+// (same shape as every other PGBackend.With*).
+func (b *PGBackend) WithPublicAuthCache(cache *PublicAuthCache) *PGBackend {
+	b.publicAuthCache = cache
+	return b
 }
 
 func (b *PGBackend) getApp(appID string) (App, bool) {
