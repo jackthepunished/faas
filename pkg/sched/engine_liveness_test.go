@@ -1,13 +1,13 @@
 // Engine-level tests for the liveness-probe restart path
 // (issue #554 / ADR-078). These tests pin the AC surface:
 //
-//   * AC #1 — wedged app replaced within the budget: not pinned
+//   - AC #1 — wedged app replaced within the budget: not pinned
 //     here (covered by metal test); we pin the lighter invariants.
 //
-//   * AC #4 — snapshots are NEVER restored after a liveness
+//   - AC #4 — snapshots are NEVER restored after a liveness
 //     failure: pinned via TestLiveness_StaleSnapOnDestroy.
 //
-//   * AC #6 — `liveness_restarts_total{app, deployment}` metric
+//   - AC #6 — `liveness_restarts_total{app, deployment}` metric
 //     emitted: pinned via TestLiveness_RestartCounterIncrement.
 //
 // The Engine has many moving parts (Wake/Park/Transition/

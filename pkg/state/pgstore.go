@@ -9452,7 +9452,7 @@ func scanInstances(rows pgx.Rows) ([]Instance, error) {
 // distinction survives the Scan trip (pgx returns untyped nil for NULL
 // TIMESTAMPTZ, which is exactly the marker we want to keep on the struct).
 //
-// tail_count is the 15th column (issue #667 / ADR-078, migration 00149).
+// tail_count is the 15th column (issue #667 / ADR-078, migration 00151).
 // NOT NULL DEFAULT 0 — every pre-#667 row reads as 0 (the column
 // default fills pre-migration rows), which is the correct "no active
 // tails" value schedd's reaper gate (PR 4) decisions are keyed on.
@@ -9492,7 +9492,7 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 // scanInstanceCols that also lifts framework_ready_at (PR #543 /
 // migration 00120), migrated_from_node_id, migrated_at, and
 // lease_token (Tier A5 / migration 00097, ADR-066), and
-// tail_count (issue #667 / ADR-078, migration 00149). Used by
+// tail_count (issue #667 / ADR-078, migration 00151). Used by
 // ListLiveInstancesOnNode and ListExpiredMigrations — the rest
 // of the codebase reads 15-column instances rows and doesn't
 // need the migration lineage. Column order matches the SELECTs
@@ -9559,7 +9559,7 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 // column (PR #470-FU-B migration 00112); for the retention sweep it's
 // always NULL (terminal rows pre-date the warm-capture path) but the
 // column is part of the row shape so we scan it for shape parity.
-// tail_count is the 15th column (issue #667 / ADR-078, migration 00149);
+// tail_count is the 15th column (issue #667 / ADR-078, migration 00151);
 // for the retention sweep it's always 0 (terminal rows have no active
 // tails) but the column is part of the row shape so we scan it for
 // shape parity.
@@ -9570,7 +9570,7 @@ func scanInstancesWithTerminal(rows pgx.Rows) ([]Instance, error) {
 		var started, lastReq, parked, frameworkReady, terminal *time.Time
 		// Column order matches ListInstancesInTerminalStatesOlderThan's
 		// SELECT (now 16 columns after migration 00028 added wake_id,
-		// 00112 added framework_ready_at, 00149 added tail_count,
+		// 00112 added framework_ready_at, 00151 added tail_count,
 		// before terminal_at).
 		if err := rows.Scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
 			&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID, &frameworkReady, &ins.TailCount, &terminal); err != nil {

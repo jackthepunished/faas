@@ -827,7 +827,7 @@ var planLimits = map[Plan]Limits{
 		// feature toggle, and the issue pairs it with
 		// internal-only ingress (Pro+).
 		RequireAuthn: false,
-// Tail primitive (issue #667 / ADR-078): Hobby unlocks
+		// Tail primitive (issue #667 / ADR-078): Hobby unlocks
 		// the 15 s timeout + 16 per-instance concurrent tails.
 		// Matches the issue's "send a confirmation email"
 		// latency budget comfortably; over-cap attempts emit

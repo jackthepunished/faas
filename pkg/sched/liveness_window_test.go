@@ -2,9 +2,9 @@
 // (issue #554 / ADR-078). These tests pin the AC #2 + #3 surface
 // directly:
 //
-//   * AC #2 — flaky app does NOT oscillate: a successful 200
+//   - AC #2 — flaky app does NOT oscillate: a successful 200
 //     resets the counter even after consecutive failures.
-//   * AC #3 — 3 restarts in 5 min parks the deployment:
+//   - AC #3 — 3 restarts in 5 min parks the deployment:
 //     RecordRestart returns shouldPark=true on the 3rd entry
 //     inside the window.
 //

@@ -1,16 +1,16 @@
 //go:build !no_pg
 
-// Migration-apply test for 00149 (issue #554 — Liveness probe: restart a
+// Migration-apply test for 00153 (issue #554 — Liveness probe: restart a
 // wedged VM, ADR-078). The migration is a no-op slot fence per ADR-041;
 // this test pins:
 //
-//  1. The migration set applies cleanly through 00149.
+//  1. The migration set applies cleanly through 00153.
 //  2. instances.framework_ready_at (PR #543 / issue #470-FU-B) is
 //     unchanged by the fence.
 //  3. Replay-safety: a second MigrateUp is a no-op.
 //
 // Slot note: 00148 (overage_cap_gate_index, issue #561 fence) is the
-// highest committed slot on the local branch before 00149; 00147 is
+// highest committed slot on the local branch before 00153; 00147 is
 // deployments_scan_result (issue #464 / ADR-055); 00146 is a
 // reserve_slot; 00145 is sessions_binding (PR #658). Slot 149 is the
 // first open number.
@@ -28,7 +28,7 @@ func TestMigrations_00149_LivenessProbeReserveSlot(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00149. A regression that drops a slot
+	// (1) Apply through 00153. A regression that drops a slot
 	// between 1 and 148 surfaces here before the structural pin.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 148)", err)

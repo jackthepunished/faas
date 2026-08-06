@@ -1,19 +1,19 @@
 //go:build !no_pg
 
-// Migration-apply test for 00150 (issue #554 / ADR-078 follow-up —
+// Migration-apply test for 00154 (issue #554 / ADR-078 follow-up —
 // per-deployment liveness-probe override jsonb column). The
 // migration is additive + nullable + coalesce-defaults to NULL,
 // matching the existing override_healthcheck shape
 // (migrations/00079_deployment_overrides.sql). This test pins:
 //
-//  1. The migration set applies cleanly through 00150.
+//  1. The migration set applies cleanly through 00154.
 //  2. deployments.override_liveness_probe is a jsonb column on
 //     the table (NOT NULL is the default for jsonb on this
 //     schema; INSERT with no value coalesces to NULL on the
 //     read side).
 //  3. Replay-safety: a second MigrateUp is a no-op.
 //
-// Slot note: 00149 is the issue #554 slot fence
+// Slot note: 00153 is the issue #554 slot fence
 // (migrations/00149_reserve_slot.sql); 00150 is the first
 // follow-up column claimed from the fence's "if a follow-up
 // lands deployments.parked_reason text" note. We did NOT land
@@ -36,7 +36,7 @@ func TestMigrations_00150_DeploymentLivenessProbe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00150. A regression that drops a slot
+	// (1) Apply through 00154. A regression that drops a slot
 	// between 1 and 149 surfaces here before the structural pin.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 149)", err)

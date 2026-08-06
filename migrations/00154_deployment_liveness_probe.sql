@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
--- filename: 00150_deployment_liveness_probe.sql
+-- filename: 00154_deployment_liveness_probe.sql
 -- Slot 150 — issue #554 / ADR-078 follow-up: the per-deployment
 -- liveness-probe override column on `deployments`. The fence at
 -- slot 149 (migrations/00149_reserve_slot.sql) reserved this slot

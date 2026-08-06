@@ -2454,7 +2454,7 @@ func TestMarkInstanceFrameworkReady_UnknownInstance(t *testing.T) {
 // map.
 //
 // Mirrors the new field on state.Instance.TailCount (migration
-// 00149). The TailTerminalStamper is wired to a fakeTailStamper
+// 00151). The TailTerminalStamper is wired to a fakeTailStamper
 // that records every call so the test asserts the SQL seam is
 // hit on the receipt path.
 func TestMarkInstanceTailTerminal(t *testing.T) {

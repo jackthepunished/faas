@@ -22,10 +22,10 @@ import (
 // drives a different runner-shaped HTTP response and asserts
 // runLivenessProbe returns the right (status, err) pair:
 //
-//   ok          → runner returned 2xx, err = ""           (counter resets)
-//   non_200     → runner returned 5xx, err = ""           (counter ++)
-//   timeout     → runner hung > timeout_ms, err="timeout" (counter ++)
-//   conn_refused → no listener on :8080, err="conn_refused" (counter ++)
+//	ok          → runner returned 2xx, err = ""           (counter resets)
+//	non_200     → runner returned 5xx, err = ""           (counter ++)
+//	timeout     → runner hung > timeout_ms, err="timeout" (counter ++)
+//	conn_refused → no listener on :8080, err="conn_refused" (counter ++)
 //
 // The metal test (cmd/vmmd/liveness_metal_test.go) exercises the
 // AF_VSOCK write/read end-to-end against a busy-loop rootfs. This

@@ -3713,11 +3713,11 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 	// reason + fail-count snapshot for the operator.
 	if e.events != nil {
 		e.events.Emit(ctx, events.LivenessFailed{
-			EmitAt:      now,
-			InstanceID:  instanceID,
-			AppID:       appID,
+			EmitAt:       now,
+			InstanceID:   instanceID,
+			AppID:        appID,
 			DeploymentID: deploymentID,
-			Reason:      reason,
+			Reason:       reason,
 		})
 	}
 

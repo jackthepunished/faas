@@ -316,8 +316,8 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 					Path: "healthz",
 				},
 			},
-			wantStatus:  http.StatusBadRequest,
-			wantInBody:  `liveness_probe.path must start with "/"`,
+			wantStatus: http.StatusBadRequest,
+			wantInBody: `liveness_probe.path must start with "/"`,
 		},
 		{
 			name: "liveness-probe-negative-interval",
@@ -370,7 +370,7 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 			name: "liveness-probe-negative-consecutive",
 			overrides: &CreateDeploymentOverrides{
 				LivenessProbe: &DeploymentLivenessProbe{
-					Path:              "/healthz",
+					Path:                "/healthz",
 					ConsecutiveFailures: -1,
 				},
 			},
@@ -381,7 +381,7 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 			name: "liveness-probe-consecutive-above-ceiling",
 			overrides: &CreateDeploymentOverrides{
 				LivenessProbe: &DeploymentLivenessProbe{
-					Path:              "/healthz",
+					Path:                "/healthz",
 					ConsecutiveFailures: 11,
 				},
 			},
