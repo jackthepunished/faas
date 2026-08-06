@@ -23,10 +23,10 @@ func UnitMeterd() daemonunit.Unit {
 		After:       []string{"network.target", "postgresql.service", "faas-schedd.service", "faas-cp.slice"},
 		Wants:       []string{"faas-cp.slice", "faas-schedd.service"},
 
-		Type: "simple",
-		User: "faas-meterd",
-		Group: "faas",
-		ExecStart: `/opt/faas/bin/meterd --config /etc/faas/meterd.toml`,
+		Type:       "simple",
+		User:       "faas-meterd",
+		Group:      "faas",
+		ExecStart:  `/opt/faas/bin/meterd --config /etc/faas/meterd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
@@ -35,13 +35,13 @@ func UnitMeterd() daemonunit.Unit {
 
 		EnvironmentFile: "/etc/faas/sealed.env",
 
-		NoNewPrivileges:        true,
-		ProtectSystem:          "strict",
-		ProtectHome:            true,
-		PrivateTmp:             daemonunit.BoolPtr(true),
-		ProtectKernelTunables:  true,
-		ProtectKernelModules:   true,
-		ProtectControlGroups:   true,
+		NoNewPrivileges:       true,
+		ProtectSystem:         "strict",
+		ProtectHome:           true,
+		PrivateTmp:            daemonunit.BoolPtr(true),
+		ProtectKernelTunables: true,
+		ProtectKernelModules:  true,
+		ProtectControlGroups:  true,
 
 		ReadOnlyPaths:  []string{"/etc/faas"},
 		ReadWritePaths: []string{"/var/log/faas"},

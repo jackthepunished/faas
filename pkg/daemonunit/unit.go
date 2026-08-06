@@ -100,7 +100,7 @@ type Unit struct {
 	NoNewPrivileges         bool
 	ProtectSystem           string // "strict" for every faas daemon today
 	ProtectHome             bool
-	PrivateTmp              *bool  // nil ⇒ omit; &true ⇒ yes; &false ⇒ no (vmmd + schedd)
+	PrivateTmp              *bool // nil ⇒ omit; &true ⇒ yes; &false ⇒ no (vmmd + schedd)
 	PrivateDevices          bool
 	ProtectKernelTunables   bool
 	ProtectKernelModules    bool
@@ -526,7 +526,10 @@ func parseLoadCred(s string) (LoadCred, error) {
 // hardening gates we use).
 func parseYes(s string) bool {
 	switch strings.ToLower(s) {
-	case "yes", "true", "on", "1":
+	// systemddoc:ORGANIZATION=safe-defaulter MANUAL: case list is the
+	// canonical systemd boolean spellings (yes/true/on/1 vs no/false/off/0);
+	// not application literals.
+	case "yes", "true", "on", "1": //nolint:goconst
 		return true
 	default:
 		return false

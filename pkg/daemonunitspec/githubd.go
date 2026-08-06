@@ -24,6 +24,7 @@ import "github.com/onebox-faas/faas/pkg/daemonunit"
 //     (apid's /githubd proxy) dials. Without /run/faas in
 //     ReadWritePaths, githubd fails to bind the socket with EACCES
 //     (PR-E landed this).
+//
 //   - ReadWritePaths=/var/lib/faas: githubd writes /var/lib/faas
 //     attribution hmac key + the github-bot pool credentials.
 //
@@ -34,10 +35,10 @@ func UnitGithubd() daemonunit.Unit {
 		After:       []string{"network.target", "postgresql.service", "faas-cp.slice"},
 		Wants:       []string{"faas-cp.slice"},
 
-		Type: "simple",
-		User: "faas",
-		Group: "faas",
-		ExecStart: `/opt/faas/bin/githubd --config /etc/faas/githubd.toml`,
+		Type:       "simple",
+		User:       "faas",
+		Group:      "faas",
+		ExecStart:  `/opt/faas/bin/githubd --config /etc/faas/githubd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
@@ -52,13 +53,13 @@ func UnitGithubd() daemonunit.Unit {
 			{Name: "faas_host_age_identity", Path: "/etc/faas/secrets/host.age"},
 		},
 
-		NoNewPrivileges:        true,
-		ProtectSystem:          "strict",
-		ProtectHome:            true,
-		PrivateTmp:             daemonunit.BoolPtr(true),
-		ProtectKernelTunables:  true,
-		ProtectKernelModules:   true,
-		ProtectControlGroups:   true,
+		NoNewPrivileges:       true,
+		ProtectSystem:         "strict",
+		ProtectHome:           true,
+		PrivateTmp:            daemonunit.BoolPtr(true),
+		ProtectKernelTunables: true,
+		ProtectKernelModules:  true,
+		ProtectControlGroups:  true,
 
 		ReadOnlyPaths:  []string{"/etc/faas"},
 		ReadWritePaths: []string{"/var/log/faas", "/var/lib/faas", "/run/faas"},

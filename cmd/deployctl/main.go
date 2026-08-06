@@ -238,7 +238,13 @@ func runCheck(args []string, quiet bool) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() {
+		// Best-effort cleanup; on Windows the RemoveAll can race with
+		// lingering read handles from filepath.Walk, but the OS
+		// eventually reaps the dir. Failure here is non-fatal — the
+		// tmp dir name is uniq and the OS clears /tmp on reboot.
+		_ = os.RemoveAll(tmp)
+	}()
 
 	// Resolve skip-sets BEFORE remapping to tmpdirs — the source-dir
 	// identity is what drives which daemons each tree ships, and the

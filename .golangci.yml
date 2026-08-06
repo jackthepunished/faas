@@ -271,6 +271,32 @@ linters:
       - path: "pkg/capdecl/runtimecheck/runtimecheck\\.go$"
         linters:
           - goconst # the CapBnd/CapEff/CapPrm/CapAmb/Inh field-name strings are kernel-defined literals from /proc/<pid>/status; promoting them to consts is structural noise (the parser IS the consumer).
+      # DEPLOY-2 / ADR-078: pkg/daemonunitspec/<daemon>.go files are
+      # systemd unit data tables — each daemon declares the same
+      # directives (Type=simple, Restart=on-failure, MemoryMax=256M,
+      # ProtectSystem=strict, "faas"/"faas-cp.slice"/"multi-user.target",
+      # etc.) because systemd has one schema and we ship one
+      # canonical variant per daemon. Promoting each literal to a
+      # const would invert the structure (the data table is the
+      # load-bearing thing) and add a layer of indirection that
+      # obscures what the unit actually ships. Pattern mirrors the
+      # pkg/capdecl/capbits.go exemption above (data-table rationale).
+      - path: "pkg/daemonunitspec/.+\\.go$"
+        linters:
+          - goconst
+      # cmd/deployctl/main.go: gosec G703 (path-traversal via taint)
+      # and G122 (filepath.Walk TOCTOU) fire on os.WriteFile /
+      # os.Stat / filepath.Walk calls. Every path here is either a
+      # compile-time constant (defaultTargets[0..2].dir,
+      # "deploy/etc/daemons.json") or a tempfile under os.MkdirTemp
+      # (runCheck's regenerated tree). There is no untrusted-input
+      # path source in this binary — deployctl is invoked by `make`
+      # in CI, not from a network listener. The lint blanket on
+      # `pkg/...` (G304 blanket above) is the precedent; this is the
+      # cmd/ analog.
+      - path: "cmd/deployctl/main\\.go$"
+        linters:
+          - gosec
       # DEPLOY-1 / ADR-075 (review finding M6): the mount/umount forbidigo
       # rule above only blocks new call sites; the legitimate owners
       # stay allowlisted here. Adding a new file outside these three

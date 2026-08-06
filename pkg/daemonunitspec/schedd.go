@@ -24,10 +24,10 @@ func UnitSchedd() daemonunit.Unit {
 		After:       []string{"network.target", "faas-cp.slice"},
 		Wants:       []string{"faas-cp.slice"},
 
-		Type: "simple",
-		User: "faas-schedd",
-		Group: "faas",
-		ExecStart: `/opt/faas/bin/schedd --config /etc/faas/schedd.toml`,
+		Type:       "simple",
+		User:       "faas-schedd",
+		Group:      "faas",
+		ExecStart:  `/opt/faas/bin/schedd --config /etc/faas/schedd.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 

@@ -36,10 +36,10 @@ func UnitImaged() daemonunit.Unit {
 		After:         []string{"network.target", "faas-cp.slice", "faas-vmmd.service"},
 		Wants:         []string{"faas-cp.slice", "faas-vmmd.service"},
 
-		Type: "simple",
-		User: "faas-imaged",
-		Group: "faas",
-		ExecStart: `/opt/faas/bin/imaged --config /etc/faas/imaged.toml`,
+		Type:       "simple",
+		User:       "faas-imaged",
+		Group:      "faas",
+		ExecStart:  `/opt/faas/bin/imaged --config /etc/faas/imaged.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
 
@@ -67,13 +67,13 @@ func UnitImaged() daemonunit.Unit {
 			{Key: "FAAS_BASE_STAGING_ROOT", Value: "/dev/shm/faas-base-staging"},
 		},
 
-		NoNewPrivileges:        true,
-		ProtectSystem:          "strict",
-		ProtectHome:            true,
-		PrivateTmp:             daemonunit.BoolPtr(true),
-		ProtectKernelTunables:  true,
-		ProtectKernelModules:   true,
-		ProtectControlGroups:   true,
+		NoNewPrivileges:       true,
+		ProtectSystem:         "strict",
+		ProtectHome:           true,
+		PrivateTmp:            daemonunit.BoolPtr(true),
+		ProtectKernelTunables: true,
+		ProtectKernelModules:  true,
+		ProtectControlGroups:  true,
 
 		ReadOnlyPaths: []string{"/etc/faas"},
 		ReadWritePaths: []string{

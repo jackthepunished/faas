@@ -36,7 +36,7 @@ func TestRender_BasicSectionOrder(t *testing.T) {
 // LoadCred renders `name:-path` (the missing-file-tolerant form).
 func TestRender_LoadCredentialOptionalFlag(t *testing.T) {
 	u := Unit{
-		Type: "simple",
+		Type:      "simple",
 		ExecStart: "/bin/true",
 		LoadCredential: []LoadCred{
 			{Name: "faas_session_key", Path: "/etc/faas/secrets/session.key"},
@@ -58,7 +58,7 @@ func TestRender_LoadCredentialOptionalFlag(t *testing.T) {
 // time with the unit's credential dir).
 func TestRender_PercentDSubstitution(t *testing.T) {
 	u := Unit{
-		Type: "simple",
+		Type:      "simple",
 		ExecStart: "/bin/true",
 		Environment: []KV{
 			{Key: "FAAS_SESSION_KEY", Value: "%d/faas_session_key"},
@@ -110,9 +110,13 @@ func TestRender_PrivateTmpTripleState(t *testing.T) {
 
 // TestRender_CapabilityBoundingSetSemantics pins down three cases:
 // (1) nil            ⇒ omit directive (legacy behaviour for daemons
-//     that don't care, e.g. vmmd which inherits systemd's default)
+//
+//	that don't care, e.g. vmmd which inherits systemd's default)
+//
 // (2) [] (empty slice) ⇒ emit `CapabilityBoundingSet=` (empty body —
-//     systemd locks the unit to no caps)
+//
+//	systemd locks the unit to no caps)
+//
 // (3) non-empty       ⇒ emit cap list.
 func TestRender_CapabilityBoundingSetSemantics(t *testing.T) {
 	t.Run("nil-omits", func(t *testing.T) {
@@ -156,7 +160,7 @@ func TestRender_AmbientCapabilitiesOmittedByDefault(t *testing.T) {
 // (systemd rule: pre-commands must come first).
 func TestRender_ExecStartPreOrdering(t *testing.T) {
 	u := Unit{
-		Type:     "simple",
+		Type:      "simple",
 		ExecStart: "/opt/faas/bin/vmmd",
 		ExecStartPre: []string{
 			"/usr/bin/chown root:faas /run/faas",
@@ -177,9 +181,9 @@ func TestRender_ExecStartPreOrdering(t *testing.T) {
 // reads as a logical grouping).
 func TestRender_RuntimeDirectoryPair(t *testing.T) {
 	u := Unit{
-		Type:                "simple",
-		ExecStart:           "/bin/true",
-		RuntimeDirectory:    "faas",
+		Type:                 "simple",
+		ExecStart:            "/bin/true",
+		RuntimeDirectory:     "faas",
 		RuntimeDirectoryMode: "0775",
 	}
 	got := string(u.Render())
@@ -206,19 +210,19 @@ func TestRender_RestrictAddressFamiliesAsList(t *testing.T) {
 // TestDecode_RoundTripBasic asserts Decode parses back what Render emits.
 func TestDecode_RoundTripBasic(t *testing.T) {
 	u := Unit{
-		Description:   "test unit",
-		Documentation: "https://docs.example.com",
-		After:         []string{"network.target"},
-		Wants:         []string{"faas-cp.slice"},
-		Type:          "simple",
-		User:          "faas-apid",
-		Group:         "faas",
-		ExecStart:     "/opt/faas/bin/apid",
-		ExecStartPre:  []string{"/usr/bin/chmod 0660 /run/faas/apid.sock"},
-		Restart:       "on-failure",
-		RestartSec:    "2s",
-		Slice:         "faas-cp.slice",
-		MemoryMax:     "256M",
+		Description:           "test unit",
+		Documentation:         "https://docs.example.com",
+		After:                 []string{"network.target"},
+		Wants:                 []string{"faas-cp.slice"},
+		Type:                  "simple",
+		User:                  "faas-apid",
+		Group:                 "faas",
+		ExecStart:             "/opt/faas/bin/apid",
+		ExecStartPre:          []string{"/usr/bin/chmod 0660 /run/faas/apid.sock"},
+		Restart:               "on-failure",
+		RestartSec:            "2s",
+		Slice:                 "faas-cp.slice",
+		MemoryMax:             "256M",
 		CapabilityBoundingSet: []string{},
 		Environment: []KV{
 			{Key: "FAAS_HOST_AGE_IDENTITY_PATH", Value: "%d/faas_host_age_identity"},
@@ -229,16 +233,16 @@ func TestDecode_RoundTripBasic(t *testing.T) {
 			{Name: "faas_host_age_identity", Path: "/etc/faas/secrets/host.age"},
 			{Name: "faas_host_age_identity_previous", Path: "/etc/faas/secrets/host.age.previous", Optional: true},
 		},
-		NoNewPrivileges:        true,
-		ProtectSystem:          "strict",
-		ProtectHome:            true,
-		PrivateTmp:             BoolPtr(true),
-		ProtectKernelTunables:  true,
-		ProtectKernelModules:   true,
-		ProtectControlGroups:   true,
-		ReadOnlyPaths:          []string{"/etc/faas"},
-		ReadWritePaths:         []string{"/var/lib/faas", "/var/log/faas", "/var/spool/faas"},
-		WantedBy:               "multi-user.target",
+		NoNewPrivileges:       true,
+		ProtectSystem:         "strict",
+		ProtectHome:           true,
+		PrivateTmp:            BoolPtr(true),
+		ProtectKernelTunables: true,
+		ProtectKernelModules:  true,
+		ProtectControlGroups:  true,
+		ReadOnlyPaths:         []string{"/etc/faas"},
+		ReadWritePaths:        []string{"/var/lib/faas", "/var/log/faas", "/var/spool/faas"},
+		WantedBy:              "multi-user.target",
 	}
 	rendered := u.Render()
 	parsed, err := Decode(rendered)
@@ -277,20 +281,20 @@ func TestDecode_RoundTripBasic(t *testing.T) {
 // a diff. The Cap list is matched by SET, not by order.
 func TestDiff_OrderInsensitive(t *testing.T) {
 	a := Unit{
-		After: []string{"network.target", "faas-cp.slice"},
-		Wants: []string{"faas-cp.slice", "faas-apid.service"},
-		Type:  "simple",
-		ExecStart: "/bin/true",
+		After:                   []string{"network.target", "faas-cp.slice"},
+		Wants:                   []string{"faas-cp.slice", "faas-apid.service"},
+		Type:                    "simple",
+		ExecStart:               "/bin/true",
 		RestrictAddressFamilies: []string{"AF_UNIX", "AF_INET"},
-		CapabilityBoundingSet:    []string{"cap_a", "cap_b"},
+		CapabilityBoundingSet:   []string{"cap_a", "cap_b"},
 	}
 	b := Unit{
-		After: []string{"faas-cp.slice", "network.target"},       // reordered
-		Wants: []string{"faas-apid.service", "faas-cp.slice"},   // reordered
-		Type:  "simple",
-		ExecStart: "/bin/true",
+		After:                   []string{"faas-cp.slice", "network.target"},    // reordered
+		Wants:                   []string{"faas-apid.service", "faas-cp.slice"}, // reordered
+		Type:                    "simple",
+		ExecStart:               "/bin/true",
 		RestrictAddressFamilies: []string{"AF_INET", "AF_UNIX"}, // reordered
-		CapabilityBoundingSet:    []string{"cap_b", "cap_a"},    // reordered
+		CapabilityBoundingSet:   []string{"cap_b", "cap_a"},     // reordered
 	}
 	got := Diff(a, b)
 	if len(got) != 0 {
