@@ -57,7 +57,7 @@ func TestInternalReverseProxy_StripsHopByHopHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 	dialer := &stubDialer{server: upstream}
-	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	req := httptest.NewRequest(http.MethodGet, "/hello", nil)
 	req.Header.Set("Connection", "close")
 	req.Header.Set("Upgrade", "websocket")
@@ -94,7 +94,7 @@ func TestInternalReverseProxy_StripsResponseHopByHop(t *testing.T) {
 	}))
 	defer upstream.Close()
 	dialer := &stubDialer{server: upstream}
-	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
 	if got := rr.Header().Get("Connection"); got != "" {
@@ -118,7 +118,7 @@ func TestInternalReverseProxy_StripsAndRebuildsXFF(t *testing.T) {
 	}))
 	defer upstream.Close()
 	dialer := &stubDialer{server: upstream}
-	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "10.0.0.5:12345"
 	// Forged XFF — must be stripped, not forwarded.
@@ -143,7 +143,7 @@ func TestInternalReverseProxy_SetsXForwardedProtoHTTPS(t *testing.T) {
 	}))
 	defer upstream.Close()
 	dialer := &stubDialer{server: upstream}
-	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "10.0.0.5:12345"
 	req.TLS = &tls.ConnectionState{} // simulate the public TLS terminator
@@ -159,7 +159,7 @@ func TestInternalReverseProxy_SetsXForwardedProtoHTTPS(t *testing.T) {
 // distinguish "internal tier down" from "this daemon is broken".
 func TestInternalReverseProxy_DialFailure_502BadGateway(t *testing.T) {
 	dialer := &stubDialer{dialErr: io.EOF} // a representative "dial failed"
-	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, req)
@@ -181,7 +181,7 @@ func TestInternalReverseProxy_UpstreamError_StatusPropagated(t *testing.T) {
 	}))
 	defer upstream.Close()
 	dialer := &stubDialer{server: upstream}
-	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default())
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, req)
