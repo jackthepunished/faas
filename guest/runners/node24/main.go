@@ -139,7 +139,7 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *
 	// Issue #667 / ADR-078 (PR 3): drain the tail pipe before
 	// writing the response (the customer's __faas_tail.js shim
 	// has already appended JSONL lines to env.TailPipePath).
-	drainTailHost(env, &resp)
+	drainTailHost(r.Context(), env, &resp)
 	for k, v := range resp.Headers {
 		w.Header().Set(k, v)
 	}

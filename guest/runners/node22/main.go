@@ -174,7 +174,7 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *
 	// during the handler's invocation window; the drain runs
 	// AFTER invokeHandler returns and BEFORE the response
 	// envelope is written to the wire.
-	drainTailHost(env, &resp)
+	drainTailHost(r.Context(), env, &resp)
 	for k, v := range resp.Headers {
 		w.Header().Set(k, v)
 	}

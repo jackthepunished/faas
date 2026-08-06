@@ -5,8 +5,12 @@
 // reference.
 package main
 
-import "github.com/onebox-faas/faas/guest/runners/internal"
+import (
+	"context"
 
-func drainTailHost(env envelope, resp *response) {
-	internal.DrainForResponse("python313", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+	"github.com/onebox-faas/faas/guest/runners/internal"
+)
+
+func drainTailHost(ctx context.Context, env envelope, resp *response) {
+	internal.DrainForResponse(ctx, "python313", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
 }

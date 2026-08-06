@@ -72,7 +72,7 @@ func TestTailHost_PathologicalTailKilledAtCeiling(t *testing.T) {
 	}
 
 	start := time.Now()
-	host.Register(taskID, hangFn)
+	host.Register(context.Background(), taskID, hangFn)
 	host.Drain()
 	elapsed := time.Since(start)
 
@@ -129,12 +129,12 @@ func TestTailHost_RegisterHonorsTailCapMax(t *testing.T) {
 	host := NewTailHost("go124-test", "", 10, cap)
 	for i := 0; i < cap; i++ {
 		taskID := fmt.Sprintf("task-%d", i)
-		if !host.Register(taskID, func(_ context.Context) {}) {
+		if !host.Register(context.Background(), taskID, func(_ context.Context) {}) {
 			t.Fatalf("register %d/%d returned false; want true", i+1, cap)
 		}
 	}
 	// The cap-th+1 registration must be rejected.
-	if host.Register("task-overflow", func(_ context.Context) {}) {
+	if host.Register(context.Background(), "task-overflow", func(_ context.Context) {}) {
 		t.Fatal("register over cap returned true; want false (TailCapMax enforced)")
 	}
 	if got := host.RegisterCount(); got != cap {
@@ -161,7 +161,7 @@ func TestTailHost_DrainSafetyNetTimeoutFires(t *testing.T) {
 		// is the safety net if it doesn't.
 		time.Sleep(10 * time.Second)
 	}
-	host.Register("task-1", hangFn)
+	host.Register(context.Background(), "task-1", hangFn)
 	start := time.Now()
 	host.Drain()
 	elapsed := time.Since(start)

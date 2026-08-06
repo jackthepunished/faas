@@ -159,7 +159,7 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *
 	// tail_seconds window therefore ends before the response
 	// is read; the snapshotAndPark 5s watchdog on schedd is
 	// the upper bound if the drain hangs.
-	drainTailHost(env, &resp)
+	drainTailHost(r.Context(), env, &resp)
 	for k, v := range resp.Headers {
 		w.Header().Set(k, v)
 	}

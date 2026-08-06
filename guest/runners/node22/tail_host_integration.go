@@ -9,9 +9,9 @@
 //	handle()
 //	  invokeHandler(ctx, handlerPath, env)  // node <script>
 //	  → on success:
-//	      drainTailHost(env, &resp)         // THIS file
+//	      drainTailHost(r.Context(), env, &resp)  // THIS file
 //	      write response envelope to wire
-//	      signal.SignalReady(...)           // framework_ready DGRAM
+//	      signal.SignalReady(...)                 // framework_ready DGRAM
 //
 // Node22-specific: the customer-side waitUntil integration is
 // exposed via __faas_tail.js (preregistered in the runtime image),
@@ -31,8 +31,12 @@
 // shims by issue #667 review item #11).
 package main
 
-import "github.com/onebox-faas/faas/guest/runners/internal"
+import (
+	"context"
 
-func drainTailHost(env envelope, resp *response) {
-	internal.DrainForResponse("node22", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+	"github.com/onebox-faas/faas/guest/runners/internal"
+)
+
+func drainTailHost(ctx context.Context, env envelope, resp *response) {
+	internal.DrainForResponse(ctx, "node22", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
 }

@@ -8,8 +8,12 @@
 // doc comment; the node22 runner is the canonical reference.
 package main
 
-import "github.com/onebox-faas/faas/guest/runners/internal"
+import (
+	"context"
 
-func drainTailHost(env envelope, resp *response) {
-	internal.DrainForResponse("node24", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+	"github.com/onebox-faas/faas/guest/runners/internal"
+)
+
+func drainTailHost(ctx context.Context, env envelope, resp *response) {
+	internal.DrainForResponse(ctx, "node24", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
 }

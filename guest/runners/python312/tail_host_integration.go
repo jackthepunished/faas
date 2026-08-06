@@ -8,8 +8,12 @@
 // doc comment; the python312 runner is structurally identical.
 package main
 
-import "github.com/onebox-faas/faas/guest/runners/internal"
+import (
+	"context"
 
-func drainTailHost(env envelope, resp *response) {
-	internal.DrainForResponse("python312", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+	"github.com/onebox-faas/faas/guest/runners/internal"
+)
+
+func drainTailHost(ctx context.Context, env envelope, resp *response) {
+	internal.DrainForResponse(ctx, "python312", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
 }

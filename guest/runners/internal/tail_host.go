@@ -43,6 +43,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -161,12 +162,19 @@ func (h *TailHost) RegisterCount() int {
 // runner cancels the embedded context and emits a 0x04 timeout
 // DGRAM.
 //
+// ctx is the runner's per-request context (the HTTP handler's
+// r.Context()). It's threaded into the tail-task goroutine so
+// the runner can cancel in-flight tails on client disconnect or
+// server shutdown — the per-task context.WithTimeout ceiling in
+// runTask is the load-bearing wall-clock bound; ctx is a soft
+// cancellation hook.
+//
 // taskID is the customer's shim-assigned id (informational —
 // echoed into TailErrors on timeout). taskFn is the goroutine
 // body; the runner passes a closure that invokes the customer's
 // promise. The closure receives a context that is cancelled at
 // the waitUntil ceiling — the customer's promise must honor it.
-func (h *TailHost) Register(taskID string, taskFn func(ctx context.Context)) bool {
+func (h *TailHost) Register(ctx context.Context, taskID string, taskFn func(ctx context.Context)) bool {
 	h.mu.Lock()
 	if h.tailCapMax > 0 && h.registered >= h.tailCapMax {
 		h.mu.Unlock()
@@ -178,7 +186,7 @@ func (h *TailHost) Register(taskID string, taskFn func(ctx context.Context)) boo
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
-		h.runTask(taskID, taskFn)
+		h.runTask(ctx, taskID, taskFn)
 	}()
 	return true
 }
@@ -248,8 +256,18 @@ func (h *TailHost) Drain() {
 // The deferred emit runs once per task on whatever outcome was
 // finalized; the failure record is exactly one entry per terminal
 // task (the highest-priority outcome wins).
-func (h *TailHost) runTask(taskID string, taskFn func(ctx context.Context)) {
-	ctx, cancel := context.WithTimeout(context.Background(), h.waitUntil)
+func (h *TailHost) runTask(parentCtx context.Context, taskID string, taskFn func(ctx context.Context)) {
+	// The per-task ceiling is the load-bearing wall-clock bound
+	// (Free 5s / Hobby 15s / Pro 30s / Scale 60s, per-plan). The
+	// parentCtx (the runner's per-request ctx) is a soft
+	// cancellation hook: if the HTTP client disconnects or the
+	// runner is shutting down, parentCtx.Err() propagates through
+	// the derived ctx and the taskFn observes it. The precedence
+	// "Timeout > Failed > Completed" in the defer below is
+	// unchanged — parentCtx cancellation is treated as a failed
+	// task (the customer's promise never resolved), which the
+	// runner surfaces via the "error:task-N" entry on resp.TailErrors.
+	ctx, cancel := context.WithTimeout(parentCtx, h.waitUntil)
 	defer cancel()
 
 	start := time.Now()
@@ -320,13 +338,19 @@ func (h *TailHost) recordFailure(reason string) {
 //
 // The runner shim shrinks to a one-liner:
 //
-//	func drainTailHost(env envelope, resp *response) {
-//	    internal.DrainForResponse("go124", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+//	func drainTailHost(ctx context.Context, env envelope, resp *response) {
+//	    internal.DrainForResponse(ctx, "go124", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
 //	}
 //
 // tailCapMax is sourced from pkg/api.TailCapMax by the caller —
 // this helper is layered above the per-plan quota so it stays
 // runnable in hermetic tests without importing pkg/api.
+//
+// ctx is the runner's per-request context (the HTTP handler's
+// r.Context()). Threaded into each tail-task's goroutine so
+// client-disconnect / server-shutdown cancels in-flight tails.
+// The per-task context.WithTimeout in runTask is the wall-clock
+// bound; ctx is the cancellation hook.
 //
 // Pre-conditions:
 //   - waitUntilSec > 0 (else no-op — feature disabled on this
@@ -337,7 +361,7 @@ func (h *TailHost) recordFailure(reason string) {
 // The pipe read failure path is silent (the runner keeps draining
 // on a partial read). The per-task failure path appends
 // "timeout:task-N" / "error:task-N" entries to *tailErrors.
-func DrainForResponse(runtime string, waitUntilSec int, tailPipePath string, tailErrors *[]string) {
+func DrainForResponse(ctx context.Context, runtime string, waitUntilSec int, tailPipePath string, tailErrors *[]string) {
 	if waitUntilSec <= 0 || tailPipePath == "" {
 		return
 	}
@@ -355,7 +379,7 @@ func DrainForResponse(runtime string, waitUntilSec int, tailPipePath string, tai
 			// context.WithTimeout in runTask is the
 			// safety net.
 		}
-		if !host.Register(line.ID, taskFn) {
+		if !host.Register(ctx, line.ID, taskFn) {
 			// TailCapMax reached — the runner drops the
 			// registration. The wire counter
 			// (pkg/wire/metrics.TailCapReached) is the
@@ -439,11 +463,24 @@ func (h *TailHost) emit(outcome byte, elapsedMs int64) error {
 // dropping the trailing `}`). json.Decoder was tried but it
 // aborts the stream on the first malformed line, which loses
 // all subsequent valid lines.
+//
+// pipePath is stamped by imaged into FAAS_TAIL_PIPE_PATH at wake
+// time as `/tmp/faas-tail-<random>.jsonl` (a tmpfs path inside the
+// guest VM). The runner process is inside the guest's app UID —
+// the customer wrote to the pipe through the same FD namespace.
+// We open with O_NOFOLLOW so a tampered pipe (a symlink at the
+// stamped path) trips ELOOP instead of leaking the runner into a
+// directory the customer controls. This is the guest-VM analog
+// of the cmd/faas openCustomerFile Lstat guard: vetted-id
+// derivation is "path came from FAAS_TAIL_PIPE_PATH env, env came
+// from runner's own getenv, runner is inside the VM boundary";
+// O_NOFOLLOW is the residual "don't follow symlinks at the
+// stamped path" defense.
 func ReadPipe(pipePath string, onLine func(line TailLine)) error {
 	if pipePath == "" {
 		return nil
 	}
-	f, err := os.Open(pipePath)
+	f, err := os.OpenFile(pipePath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil

@@ -123,7 +123,7 @@ func handle(w http.ResponseWriter, r *http.Request, handlerPath string, signal *
 	}
 	// Issue #667 / ADR-078 (PR 3): drain the tail pipe before
 	// writing the response.
-	drainTailHost(env, &resp)
+	drainTailHost(r.Context(), env, &resp)
 	for k, v := range resp.Headers {
 		w.Header().Set(k, v)
 	}

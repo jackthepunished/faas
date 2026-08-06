@@ -9,9 +9,9 @@
 //	handle()
 //	  invokeHandler(ctx, handlerPath, env)  // customer subprocess
 //	  → on success:
-//	      drainTailHost(env, &resp)         // THIS file
+//	      drainTailHost(r.Context(), env, &resp)  // THIS file
 //	      write response envelope to wire
-//	      signal.SignalReady(...)           // framework_ready DGRAM
+//	      signal.SignalReady(...)                 // framework_ready DGRAM
 //
 // The drain runs BEFORE the response envelope is written and BEFORE
 // the framework_ready signal fires. The ordering matters because:
@@ -33,8 +33,12 @@
 // shims by issue #667 review item #11).
 package main
 
-import "github.com/onebox-faas/faas/guest/runners/internal"
+import (
+	"context"
 
-func drainTailHost(env envelope, resp *response) {
-	internal.DrainForResponse("go124", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
+	"github.com/onebox-faas/faas/guest/runners/internal"
+)
+
+func drainTailHost(ctx context.Context, env envelope, resp *response) {
+	internal.DrainForResponse(ctx, "go124", env.WaitUntilSec, env.TailPipePath, &resp.TailErrors)
 }
