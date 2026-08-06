@@ -429,6 +429,14 @@ func (s *PgStore) MarkAppWebhookDeliveryDead(ctx context.Context, id string, cur
 }
 
 func (s *PgStore) ResetAppWebhookDeliveryFromDead(ctx context.Context, id, webhookID, accountID string, now time.Time) error {
+	// IDOR-safe: only return success when the row matches
+	// (id, webhook_id, account_id, status='dead'). A row whose
+	// account_id or webhook_id differs from the caller's is
+	// indistinguishable from a missing row to the caller —
+	// we don't leak existence of foreign rows. The probe
+	// below only distinguishes "wrong status" (ErrConflict,
+	// since the caller must be the owner — they had to look
+	// it up to find the id) from "no such row" (ErrNotFound).
 	tag, err := s.pool.Exec(ctx, `
 		update app_webhook_deliveries set
 			status = 'pending',
@@ -442,20 +450,20 @@ func (s *PgStore) ResetAppWebhookDeliveryFromDead(ctx context.Context, id, webho
 		return fmt.Errorf("state: reset from dead: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Either the row doesn't exist (or belongs to another
-		// account), it's not in 'dead' state, or the delivery
-		// belongs to a different webhook in the same account.
-		// Probe to distinguish — matches the MemStore's ErrConflict
-		// semantics for non-dead rows; rows that exist but don't
-		// match the (webhook_id, account_id) pair return ErrNotFound
-		// to avoid leaking the existence of foreign rows.
-		var n int
+		// Probe ownership first. If the row exists AND its
+		// (webhook_id, account_id) match the caller but status
+		// is not 'dead' → ErrConflict (caller owns it; wrong
+		// state). If ownership mismatches OR the row doesn't
+		// exist → ErrNotFound (no leak).
+		var ownedByCaller bool
 		if err := s.pool.QueryRow(ctx,
-			`select count(*) from app_webhook_deliveries where id = $1`, id,
-		).Scan(&n); err != nil {
+			`select exists(select 1 from app_webhook_deliveries
+			   where id = $1 and webhook_id = $2 and account_id = $3)`,
+			id, webhookID, accountID,
+		).Scan(&ownedByCaller); err != nil {
 			return fmt.Errorf("state: probe delivery: %w", err)
 		}
-		if n == 0 {
+		if !ownedByCaller {
 			return ErrNotFound
 		}
 		return ErrConflict
