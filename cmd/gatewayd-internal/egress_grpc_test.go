@@ -151,7 +151,14 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		if err := waitForSocket(sock, 2*time.Second); err != nil {
 			t.Fatalf("cycle %d wait for socket: %v", i, err)
 		}
-		conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+		// The dirent's appearance precedes the gRPC server's
+		// Serve goroutine accepting. On a busy CI runner the
+		// gap can exceed DialTimeout's first probe — net.Dial
+		// errors eagerly on ECONNREFUSED without retrying. Wrap
+		// the dial in a small retry budget so the test's
+		// purpose (cycle stays bindable) is what we measure,
+		// not the kernel's accept-poll cadence.
+		conn, err := dialWithRetry(sock, 2*time.Second, 10*time.Millisecond)
 		if err != nil {
 			t.Fatalf("cycle %d dial after start: %v", i, err)
 		}
@@ -177,5 +184,28 @@ func waitForSocket(path string, deadline time.Duration) error {
 			return os.ErrNotExist
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// dialWithRetry retries net.DialTimeout until either a connection is
+// established or the deadline elapses. The dial itself errors
+// eagerly on ECONNREFUSED without retrying; on a CI runner under
+// load the gRPC server's Serve goroutine may not have accepted yet
+// even after the socket dirent has appeared, so the first probe is
+// essentially free. The retry budget (default 2s, 10ms backoff) is
+// generous enough to soak the longest observed CI pause (cycle 4
+// in run 31080218226 finished in 0.00s — the dial failed on the
+// first probe) without slowing the happy path.
+func dialWithRetry(path string, deadline, backoff time.Duration) (net.Conn, error) {
+	timeout := time.Now().Add(deadline)
+	for {
+		conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+		if err == nil {
+			return conn, nil
+		}
+		if time.Now().After(timeout) {
+			return nil, err
+		}
+		time.Sleep(backoff)
 	}
 }
