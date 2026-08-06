@@ -44,6 +44,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -144,10 +145,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// Reverse-proxy to gatewayd-internal over the unix socket.
 	internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
 	internalURL := &url.URL{Scheme: "http", Host: "gatewayd-internal"}
+	// Issue #675: FAAS_INTERNAL_H2C toggles H2C (HTTP/2 cleartext) on
+	// the public→internal hop. Default true so the Tier A7 production
+	// path negotiates H2 end-to-end. Set to "false" / "0" / "no" to
+	// fall back to the legacy HTTP/1.1 transport (operational escape
+	// hatch if a regression shows up — no redeploy needed beyond a
+	// daemon restart).
+	h2cEnabled := envBoolOr("FAAS_INTERNAL_H2C", true)
 	proxy := gateway.NewInternalReverseProxy(
 		gateway.NewUnixSocketDialer(internalSocket),
 		internalURL,
 		log,
+		h2cEnabled,
 	)
 	// Issue #555 PR-3: mount otelhttp.NewTransport so the outbound
 	// request to gatewayd-internal carries the same trace context
@@ -370,4 +379,25 @@ func envOr(envKey, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBoolOr parses common true/false spellings for an env knob.
+// Unset (or empty) returns def. Accepts "1"/"true"/"yes"/"on" as true
+// and "0"/"false"/"no"/"off" as false (case-insensitive); an
+// unrecognised value returns def and emits a one-shot warn (the
+// FAAS_LOG_LEVEL precedent — never refuse to start on log/config
+// misconfiguration).
+func envBoolOr(envKey string, def bool) bool {
+	v := os.Getenv(envKey)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }

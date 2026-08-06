@@ -32,9 +32,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"filippo.io/age"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/audit"
@@ -48,6 +51,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -240,6 +244,14 @@ type runDeps struct {
 	// daemons are independent processes so the AEAD keys are loaded
 	// separately per daemon. nil in tests.
 	sessions *session.Manager
+	// hostKeyDir (issue #477 / ADR-079) is the directory
+	// secretbox.LoadHostKeys reads from to build the
+	// multi-identity rotation-overlap slice for the basic-auth
+	// unseal path. Empty = unseal disabled (unit tests + dev
+	// boxes that don't have host.age loaded). Resolved from
+	// FAAS_HOST_KEY_PATH (the same convention cmd/meterd +
+	// cmd/vmmd use); production points at /etc/faas/keys.
+	hostKeyDir string
 	// audit is the *pkg/audit.Auditor that emits the auth.mfa_gate_hit
 	// / auth.session.stolen rows. nil in tests.
 	audit *audit.Auditor
@@ -259,6 +271,22 @@ type runDeps struct {
 	// gatewaydAuditor.Emit(ctx, kind, subject, data) shape,
 	// not the apid auditor's wider surface.
 	requireAuthnAudit *gatewaydAuditor
+	// publicAuthCache (issue #477 / ADR-079) is the unsealed
+	// basic-auth credential cache shared between the Handler
+	// (enforcePublicAuthBasic reads through it) and the
+	// PGBackend (InvalidatePublicAuth drops it on
+	// db.NotifyKeyChanged). nil = no caching; the basic-auth
+	// path unseals per-request. Production wires a single
+	// gateway.NewPublicAuthCache() constructed in run().
+	publicAuthCache *gateway.PublicAuthCache
+	// publicAuthUnsealer (issue #477 / ADR-079) is the
+	// gateway.PublicAuthUnsealer the basic-auth branch uses
+	// to convert the secretbox-sealed BasicSealed blob into
+	// the {username, password} pair. nil = unseal disabled
+	// (unit tests + dev boxes that don't load host.age);
+	// mode='basic' returns 500 if hit. Production wires
+	// the secretbox.OpenMulti closure below.
+	publicAuthUnsealer gateway.PublicAuthUnsealer
 	// scheddClient is the ScheddClient interface (production: a
 	// single *scheddgrpc.Client from the per-node cache) used by
 	// AppLogsHandler (issue #254 / Move 4 PR-2) and the warm hint
@@ -341,6 +369,32 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
 	}
 	deps := defaultDeps()
+	// Issue #477 / ADR-079: resolve the host key directory the
+	// secretbox unsealer reads from. Mirrors the FAAS_HOST_KEY_PATH
+	// convention cmd/vmmd + cmd/meterd use (same env var so an
+	// operator who rotates host.age on one daemon doesn't have to
+	// update a separate knob on every other daemon). Empty →
+	// basic-auth unseal disabled (mode='basic' returns 500);
+	// open + bearer modes don't touch it.
+	//
+	// **filepath.Dir convention (foot-gun warning):** the env
+	// var points at a FILE (the host.age key), but the unsealer
+	// reads a DIRECTORY (LoadHostKeys walks the dir for the
+	// rotation-overlap pair). The filepath.Dir() call below
+	// strips the file component. Operators MUST set this to a
+	// concrete file path (e.g. /etc/faas/keys/host.age), NOT
+	// a directory path (/etc/faas/keys/) — the difference is
+	// silent because filepath.Dir accepts both. If the
+	// convention ever changes, this is the line to revisit:
+	// either rename the env var to FAAS_HOST_KEY_DIR (the
+	// natural name) and migrate the daemons, or add an
+	// explicit "must be a file path, not a directory" check
+	// here. For now the convention is documented in the
+	// deploy/lima/faas-metal.yaml smoke tests and the
+	// README's hostKey section.
+	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
+		deps.hostKeyDir = filepath.Dir(hp)
+	}
 	deps.scheddRouter = newScheddRouter(pgStore, vmmdTLS, nil, log)
 	go deps.scheddRouter.WatchNodeChanges(ctx, pool, nil)
 	// Single-stream fallback: dial the legacy schedd socket once for
@@ -385,7 +439,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, Plan: acct.Plan, StreamingEnabled: app.StreamingEnabled, NodeID: app.NodeID, RequireAuthn: app.RequireAuthn, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed}}, true, nil
 		}).
 		WithClientForApp(func(ctx context.Context, app gateway.App) (gateway.Scheduler, bool, error) {
 			full, err := pgStore.AppByID(ctx, app.ID)
@@ -397,7 +451,8 @@ func run(ctx context.Context, log *slog.Logger) error {
 				return nil, false, err
 			}
 			return cli, true, nil
-		})
+		}).
+		WithPublicAuthCache(deps.publicAuthCache)
 
 	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
 	// active fleet. Single-box posture (only default-local active)
@@ -615,6 +670,30 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// outside unit tests).
 	deps.requireAuthnAdapter = newRequireAuthnAdapter(deps.authMw)
 	deps.requireAuthnAudit = newGatewaydAuditor(deps.pgStore, log)
+	// Issue #477 / ADR-079: build the unsealed basic-auth
+	// credential cache + the secretbox unsealer closure.
+	// The cache is shared between the Handler (read path)
+	// and the PGBackend (invalidation path on
+	// db.NotifyKeyChanged). The unsealer closes over the
+	// loaded host identities (the same secretbox.OpenMulti
+	// path cmd/apid uses) so the gateway hot path doesn't
+	// import pkg/secretbox directly. hostKeyDir follows
+	// the FAAS_HOST_KEY_PATH convention (mirrors
+	// cmd/meterd/main.go:983) — the same identities slice
+	// the apid + meterd daemons load.
+	deps.publicAuthCache = gateway.NewPublicAuthCache()
+	if deps.hostKeyDir != "" {
+		if identities, loadErr := secretbox.LoadHostKeys(deps.hostKeyDir); loadErr != nil {
+			log.Warn("gatewayd-internal: LoadHostKeys (rotation overlap) failed; basic-auth will be unseal-disabled until next boot",
+				"dir", deps.hostKeyDir, "err", loadErr.Error())
+		} else {
+			loader := func() []*age.X25519Identity { return identities }
+			deps.publicAuthUnsealer = newPublicAuthUnsealer(loader)
+			if len(identities) > 1 {
+				log.Info("gatewayd-internal: rotation overlap active — basic-auth unseals across current + previous host.age")
+			}
+		}
+	}
 	// The scheddClient reference is needed by AppLogsHandler (PR-2).
 	// It outlives `run` because we want the AppLogsHandler to keep a
 	// pointer to the same client; defers Close.
@@ -681,6 +760,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil. Production wires both unconditionally after
 	// deps.authMw is built in run().
 	handler.WithRequireAuthn(deps.requireAuthnAdapter, deps.requireAuthnAudit)
+	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
+	// The 60s cache lives on the Handler (production wires
+	// deps.publicAuthCache below); the secretbox unseal goes
+	// through deps.publicAuthUnsealer, which closes over the
+	// loaded host identities (the same secretbox.OpenMulti path
+	// cmd/apid uses). nil-safe: tests + dev boxes that don't
+	// wire either pass through the per-request unseal path.
+	handler.WithPublicAuth(deps.publicAuthCache, deps.publicAuthUnsealer)
 	// ADR-046 PR-2: per-instance egress ring buffer + the gRPC
 	// producer channel. The sink is shared between Handler.recordEgress
 	// (writer) and egressgrpc.Server (drainer-on-cadence reader).
@@ -932,6 +1019,60 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	errc := make(chan error, 4)
 	var servers []*http.Server
 	addSrv := func(s *http.Server) { servers = append(servers, s) }
+
+	// Issue #675: build the unified mux that the unix-socket server
+	// (`deps.synth`) serves. The mux routes:
+	//   /v1/synthesize           → synth handler (existing, M7)
+	//   /v1/invocations:dispatch → synth handler (existing, Move 1)
+	//   /healthz                 → synth handler
+	//   everything else          → customer publicHandler (NEW — issue #675)
+	//
+	// Production (FAAS_GATEWAY_LISTEN=off) routes ALL customer traffic
+	// through this mux via gatewayd-public's reverse proxy. The legacy
+	// :8080 TCP listener below (when not off) keeps publicHandler
+	// directly — but in prod the TCP path is unused.
+	if deps.synth != nil {
+		unifiedMux := http.NewServeMux()
+		// LOAD-BEARING ORDER: register Handle("/", publicHandler) FIRST,
+		// then the more-specific synth routes AFTER. Go's
+		// http.ServeMux uses longest-prefix matching, NOT
+		// registration order — the catch-all written first does
+		// NOT shadow the more-specific patterns written after.
+		// Re-ordering this block "for readability" still works
+		// in Go, but readers expect registration order to match
+		// routing order and may "fix" it in a way that does NOT
+		// work (e.g. moving the catch-all last while keeping
+		// longest-prefix semantics). DO NOT change the order
+		// without also updating the unified-mux test in
+		// pkg/gateway/synth_test.go (TestSynthServer_UnifiedMux_RoutesPathsCorrectly).
+		unifiedMux.Handle("/", publicHandler)
+		// Pull the synth mux out of the SynthServer via a small
+		// accessor; the server exposes SetHandler so the caller
+		// owns the unified mux. The synth mux itself carries
+		// the three routes registered in NewSynthServer.
+		unifiedMux.Handle("/v1/synthesize", deps.synth.Mux())
+		unifiedMux.Handle("/v1/invocations:dispatch", deps.synth.Mux())
+		unifiedMux.Handle("/healthz", deps.synth.Mux())
+		// Wrap with h2c so the in-process unix-socket hop negotiates
+		// H2C prior knowledge (no TLS). The customer publicHandler
+		// speaks HTTP/1.1 downstream, but the gatewayd-public ← →
+		// gatewayd-internal hop now carries H2 frames.
+		//
+		// Streaming responses (app.StreamingEnabled=true) still go
+		// through the existing HTTP/1.1 chunked path inside the
+		// handler — H2C is transparent to streaming because the
+		// handler writes chunked on its own writer.
+		//
+		// Go 1.24+: the SynthServer's http.Server has Protocols set
+		// to {HTTP/1.1, UnencryptedHTTP2} (see NewSynthServer), so
+		// H2C is negotiated natively on the listener. No wrapper
+		// needed — the deprecated golang.org/x/net/http2/h2c package
+		// is gone.
+		deps.synth.SetHandler(unifiedMux)
+	}
+	// addSrv is the closure for the public :8080 + control listeners
+	// below; declared above so the unified-mux block above can run
+	// before the public-listener gate without depending on it.
 	// Plain-:8080 path. ADR-068 / Tier A7 split: TLS termination
 	// moved to gatewayd-public (certmagic, httpsec, :443/:80 ACME
 	// mux); this daemon no longer builds a *gateway.TLSBundle. The

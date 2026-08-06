@@ -4136,12 +4136,13 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
-  # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5) ──────────────────
+  # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
   # active-org hint is accepted via X-Active-Org / ?org= on every
-  # org-scoped route; PR 8 owns POST /v1/invitations/{token}/accept
-  # (the SSO + GDPR bundle).
+  # org-scoped route. PR 7 added accept/revoke on the invitation
+  # surface and the seat-usage visibility endpoint; PR 8 (SSO +
+  # GDPR bundle) layers step-up on accept + adds the list endpoint.
   /v1/orgs:
     get:
       tags: [orgs]
@@ -4351,9 +4352,10 @@ paths:
         Mints a 32-byte plaintext token, hashes it via SHA-256 for
         storage, and returns the plaintext ONCE in the response.
         The token expires after 14 days; admins can revoke earlier
-        via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-        the accept surface). Role cannot be `owner`; transfer-
-        ownership is the only path to owner.
+        via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+        the accept surface too — see
+        `POST /v1/invitations/{token}/accept`). Role cannot be
+        `owner`; transfer-ownership is the only path to owner.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -4527,7 +4529,8 @@ paths:
         (email, role, org slug, expires_at) without consuming the
         token. Used by the dashboard to render "you've been invited
         to Acme Inc. as developer" without forcing the invitee
-        to accept yet. The accept flow lands in PR 8.
+        to accept yet. PR 7 added the accept surface at
+        `POST /v1/invitations/{token}/accept`.
       responses:
         '200':
           description: The pending invitation.
@@ -4537,6 +4540,127 @@ paths:
         '410':
           description: 'code: org_invitation_invalid | org_invitation_expired | org_invitation_invalid (already consumed/revoked)'
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/invitations/{token}/accept:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        description: |
+          Plaintext or base64url-encoded invitation token (same
+          shape as the GET /v1/invitations/{token} parameter).
+        schema: { type: string }
+    post:
+      tags: [orgs]
+      operationId: acceptInvitation
+      summary: Accept an invitation token (consume + add as member).
+      description: |
+        Consumes the invitation via `Store.ConsumeOrgInvitation` —
+        the load-bearing tx stamps `consumed_at`, inserts the active
+        membership, and reads the live member cap (PR 2 cap-in-tx
+        back-stop; documents at `pkg/state/memstore.go`). Two audit
+        rows fire post-mutation per ADR-035: `org.invitation.accepted`
+        (invitation-side record) and `org.member.added` (member-side
+        record). The bearer must have a valid session or API key but
+        no `X-Active-Org` — the invitation IS how they get one. PR 8
+        adds step-up at accept time.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The new membership row.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/OrgMemberResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — the org is at the member cap. Stable
+            code `org_member_cap_exceeded`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '409':
+          description: |
+            `409 Conflict` — the bearer is already an active member
+            of the target org. The wire detail carries the
+            caller's current role. Stable code `org_already_member`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '410':
+          description: |
+            `410 Gone` — the token is unknown, already consumed,
+            already revoked, or expired. Stable codes
+            `org_invitation_invalid` | `org_invitation_expired`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/invitations/{token}:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+      - name: token
+        in: path
+        required: true
+        description: |
+          Plaintext or base64url-encoded invitation token. The URL
+          is org-scoped here (vs the no-org-scoped peek at
+          `GET /v1/invitations/{token}`), so admin/owner gate fires
+          before the consume path resolves the hash.
+        schema: { type: string }
+    delete:
+      tags: [orgs]
+      operationId: revokeInvitation
+      summary: Revoke a pending invitation.
+      description: |
+        Stamps `revoked_at` on a still-pending invitation via
+        `Store.RevokeOrgInvitation`. Owner + admin only
+        (`org.invite_members`, symmetric with the create-invite
+        path). Already-consumed / already-revoked / unknown tokens
+        collapse to a single `org_invitation_invalid` 410 (don't
+        leak which row state was reached). Emits
+        `org.invitation.revoked` with an 8-char token-hash prefix
+        (never the full hash) for dashboard correlation.
+      responses:
+        '204':
+          description: Revoked.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller lacks `org.invite_members`.
+            Stable code `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: |
+            `410 Gone` — the token is unknown, already consumed,
+            or already revoked. Stable code `org_invitation_invalid`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/orgs/{slug}/seat_usage:
+    parameters:
+      - $ref: '#/components/parameters/OrgSlug'
+    get:
+      tags: [orgs]
+      operationId: getOrgSeatUsage
+      summary: Seat usage visibility for the active org.
+      description: |
+        Returns `{used, limit, plan}` from `Store.CountActiveOrgMembers`
+        (the same row the cap-in-tx inside `ConsumeOrgInvitation`
+        reads). `limit` comes from `org.Plan.OrgMembersMax()` — the
+        `free` plan returns `0` to render "personal org only" in the
+        dashboard rather than "0 of 0 used". Visibility-only; PR 9
+        ships the per-seat pricing cut-over per ADR-061 §"Out of
+        scope". Every role may read (gated by `org.view`).
+      responses:
+        '200':
+          description: The seat usage.
+          content:
+            application/json: { schema: { $ref: '#/components/schemas/SeatUsageResponse' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — caller lacks `org.view`. Stable code
+            `org_role_forbidden`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Spec hosting (anonymous, public by design) ───────────────────────────
@@ -5276,6 +5400,17 @@ components:
           type: boolean
           example: false
 
+        # Issue #477 / ADR-077: per-app public-URL auth
+        # configuration. Mirrors the read-side
+        # PublicAuthStatus shape — `has_basic_creds` is true
+        # iff the row carries a sealed APP_BASIC_AUTH blob
+        # (mode='basic' with credentials). The plaintext
+        # username/password are NEVER echoed; the apid
+        # redaction posture is a load-bearing invariant
+        # (see ADR-077 §Decision "re-redaction invariant").
+        public_auth:
+          $ref: '#/components/schemas/PublicAuthStatus'
+
     CreateAppRequest:
       description: "App creation payload: slug, type (app|function), runtime (only for function), RAM MB, max concurrency, idle timeout, and optional manifest."
       type: object
@@ -5460,6 +5595,31 @@ components:
           type: [boolean, "null"]
           example: false
 
+        # Issue #477 / ADR-077: per-app public-URL auth
+        # configuration. Omitted → no change. When present,
+        # mode is the closed enum {open, bearer, basic}.
+        # Plan gates run after closed-enum validation:
+        # Free PATCH 'bearer' returns 402
+        # plan_public_auth_bearer_not_allowed; Free/Hobby
+        # PATCH 'basic' returns 402
+        # plan_public_auth_basic_not_allowed. When
+        # mode='basic', basic_user + basic_pass are required
+        # and MUST be plaintext at PATCH time (the apid seal
+        # step encrypts them under the APP_BASIC_AUTH
+        # secretbox namespace before persistence). For
+        # mode='open'/'bearer', the sealed blob is cleared
+        # so a stale secretbox row from a previous PATCH
+        # doesn't reach a fresh request. Audit: emits
+        # app.public_auth_changed on mode flips and a
+        # single-purpose `has_basic_creds: bool` flag in
+        # the payload (re-redaction invariant — plaintext
+        # is NEVER recorded).
+        public_auth:
+          description: "Per-app public-URL auth configuration (issue #477 / ADR-077). Omitted → no change. When present, mode is the closed enum {open, bearer, basic}; basic_user + basic_pass are required when mode='basic' and the apid seal step encrypts them under the APP_BASIC_AUTH secretbox namespace before persistence."
+          oneOf:
+            - type: "null"
+            - $ref: '#/components/schemas/PublicAuthBlock'
+
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
       type: object
@@ -5518,6 +5678,46 @@ components:
           minimum: 5
           maximum: 86400
           example: 60
+
+    PublicAuthBlock:
+      description: "Per-app public-URL auth write shape (issue #477 / ADR-077). Sent on PATCH /v1/apps/{slug}; apid seals the basic_user + basic_pass into a single APP_BASIC_AUTH secretbox blob before persistence. The plaintext is never echoed on read (see PublicAuthStatus)."
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          description: "Auth mode (closed set). 'open' is the pre-#477 default (every request passes). 'bearer' requires Authorization: Bearer (Hobby+; 402 on Free). 'basic' requires HTTP Basic auth with sealed credentials (Pro+; 402 on Free/Hobby). Unknown values → 422 invalid_public_auth_mode."
+          type: string
+          enum: [open, bearer, basic]
+          example: basic
+        basic_user:
+          description: "Basic-auth username (RFC 7617 §2). Plaintext at PATCH time; sealed into apps.public_auth_basic under the APP_BASIC_AUTH secretbox namespace. Required when mode='basic'; ignored otherwise. Range [1, 128] bytes after TrimSpace."
+          type: string
+          minLength: 1
+          maxLength: 128
+          example: editor
+        basic_pass:
+          description: "Basic-auth password (RFC 7617 §2). Plaintext at PATCH time; sealed alongside basic_user under the APP_BASIC_AUTH secretbox namespace. Required when mode='basic'; ignored otherwise. Range [1, 256] bytes."
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 256
+          example: hunter2
+
+    PublicAuthStatus:
+      description: "Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision 're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."
+      type: object
+      required: [mode, has_basic_creds]
+      properties:
+        mode:
+          description: "Active auth mode. One of 'open', 'bearer', 'basic'. Matches apps.public_auth_mode on disk; a PATCH 'open' cleared any prior sealed blob so a stale secretbox row never reaches a fresh request."
+          type: string
+          enum: [open, bearer, basic]
+          example: basic
+        has_basic_creds:
+          description: "True iff the row carries a non-null apps.public_auth_basic blob (i.e. mode='basic' with credentials). A mode='basic' row without creds would 401 every request — has_basic_creds is the operator-greppable signal that the seal succeeded."
+          type: boolean
+          example: true
 
     ScalingTarget:
       description: "(metric, value) pair the engine watches for the scale-up trigger. The metric surface is closed; the unset state (null) is the legacy 'engine falls back to autoscale_target_rps' path."
@@ -5598,6 +5798,11 @@ components:
             - $ref: '#/components/schemas/DeploymentHealthcheck'
             - type: 'null'
           description: "Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a bare TCP accept."
+        override_liveness_probe:
+          oneOf:
+            - $ref: '#/components/schemas/DeploymentLivenessProbe'
+            - type: 'null'
+          description: "Liveness-probe override echoed verbatim (issue #554 / ADR-078). nil when the deployment used the per-plan default (Hobby/Pro/Scale → 5s / 3 consecutive / 60s cooldown). Echoed on GET /v1/apps/{slug}/deployments/{id} so the customer can audit which probe the host (cmd/vmmd) is running against the VM."
         min_instances:
           type: integer
           minimum: 0
@@ -5861,6 +6066,23 @@ components:
             - $ref: '#/components/schemas/DeploymentHealthcheck'
             - type: 'null'
           description: "Readiness-probe shape. Persisted today; the HTTP probe variant ships in a follow-up ADR."
+        liveness_probe:
+          oneOf:
+            - $ref: '#/components/schemas/DeploymentLivenessProbe'
+            - type: 'null'
+          description: |
+            Liveness-probe override (issue #554 / ADR-078). The host (cmd/vmmd)
+            polls the guest's vsock 1028 STREAM on every `interval_s`; after
+            `consecutive_failures` consecutive non-2xx (or timeout / conn-refused)
+            responses, the VM is destroyed and schedd cold-boots it from rootfs
+            (per ADR-005 — never snapshot-restore). 3 restarts in 300 s
+            park the deployment.
+
+            Per-plan gates (issue #554): Free is locked out (Plan.LivenessAllowed()
+            returns false; the apid handler rejects with
+            `plan_liveness_probe_not_allowed` BEFORE the DB is touched); Hobby,
+            Pro, Scale inherit the 5 s / 3 consecutive / 60 s cooldown / 3 in 300 s
+            defaults. v1 is HTTP-only; gRPC health checks are deferred to v2.
 
     DeploymentHealthcheck:
       description: |
@@ -5880,6 +6102,39 @@ components:
         interval_s: { type: integer, minimum: 0, description: "Probe interval in seconds; 0 = use image default." }
         timeout_s:  { type: integer, minimum: 0, description: "Probe timeout in seconds; 0 = use image default." }
         retries:    { type: integer, minimum: 0, description: "Consecutive failures before the instance is considered unhealthy; 0 = use image default." }
+
+    DeploymentLivenessProbe:
+      description: |
+        Liveness-probe shape on the deploy-time override object (issue #554 / ADR-078).
+        The probe is the Cloud-Run-parity primitive that asks "is the VM still
+        responding?" — a wedged guest (busy-loop, leaked fd, deadlocked runner)
+        sits resident billing RAM-hours while serving 5xx until the §13 idle
+        reaper eventually fires. The liveness probe replaces that wait with the
+        short, customer-visible path: 3 consecutive failures → destroy →
+        cold-boot from rootfs (per ADR-005 — never snapshot-restore).
+
+        Distinct from `DeploymentHealthcheck`: readiness is "accept traffic?",
+        liveness is "still alive?". A passing readiness but failing liveness
+        is the canonical "wake succeeded, then the runtime died" failure mode
+        that this primitive is designed to catch.
+
+        Validation rules (enforced in `pkg/api/dto.go::CreateDeploymentOverrides.Validate`):
+        - `path` must start with `/`.
+        - `interval_s` ∈ [0, 60] (0 = inherit per-plan default; Hobby/Pro/Scale → 5 s).
+        - `timeout_s` ∈ [0, 5] (0 = inherit 2 s).
+        - `consecutive_failures` ∈ [0, 10] (0 = inherit per-plan default; Hobby/Pro/Scale → 3).
+
+        Per-deployment overrides of `interval_s` / `timeout_s` / `consecutive_failures`
+        are clamped to the bounds above. The counter resets to 0 on the first 2xx
+        and survives an intermittent 5xx across the consecutive window (AC #2:
+        flaky app does NOT oscillate).
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, pattern: '^/', description: "Path the probe requests from the guest; must start with `/` (e.g. `/healthz`). Reuses the runner's existing `:8080` listener — no runner changes (issue #554 §4)." }
+        interval_s: { type: integer, minimum: 0, maximum: 60, description: "Per-plan poll cadence in seconds; 0 = inherit per-plan default (Hobby/Pro/Scale → 5 s). Clamped to [MinLivenessPeriodSeconds=1, MaxLivenessPeriodSeconds=60]." }
+        timeout_s:  { type: integer, minimum: 0, maximum: 5, description: "Per-probe HTTP timeout in seconds; 0 = inherit 2 s default (VsockLivenessTimeoutMs). A timeout is treated identically to a non-2xx response by the failure counter." }
+        consecutive_failures: { type: integer, minimum: 0, maximum: 10, description: "N at which DestroyForLivenessFailure fires; 0 = inherit per-plan default (Hobby/Pro/Scale → 3). The counter is reset to 0 on the first 2xx and survives an intermittent 5xx across the consecutive window (AC #2 — flaky app does NOT oscillate)." }
 
     ScanResult:
       description: |
@@ -7772,6 +8027,33 @@ components:
         members:
           type: array
           items: { $ref: '#/components/schemas/OrgMemberResponse' }
+
+    SeatUsageResponse:
+      description: |
+        GET /v1/orgs/{slug}/seat_usage response. Visibility-only —
+        PR 9 ships the per-seat pricing cut-over per ADR-061
+        §"Out of scope". `used` counts active members only (the
+        store's `CountActiveOrgMembers` filters `removed_at IS
+        NULL`). `limit` comes from `org.Plan.OrgMembersMax()` —
+        the `free` plan returns `0` so the dashboard can render
+        "personal org only" instead of "0 of 0 used".
+      type: object
+      required: [used, limit, plan]
+      properties:
+        used:
+          type: integer
+          minimum: 0
+          description: Active member count.
+        limit:
+          type: integer
+          minimum: 0
+          description: |
+            Plan cap on active members (`Plan.OrgMembersMax()`).
+            Returns `0` for the `free` plan — the fail-closed
+            accessor shape.
+        plan:
+          type: string
+          enum: [free, hobby, pro, scale]
 
     ChangeMemberRoleRequest:
       description: |

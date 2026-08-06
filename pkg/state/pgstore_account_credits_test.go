@@ -277,7 +277,7 @@ func TestPgStoreCurrentMonthOverageCents_Formula(t *testing.T) {
 	const wantCents = int64(1200)
 	mbSeconds := wantCents * 3600 / 100
 	now := time.Now().UTC()
-	if err := store.AppendUsage(ctx, acct.ID, appID, instID, now, mbSeconds, 0, 0, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, now, mbSeconds, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	got, err := store.CurrentMonthOverageCents(ctx, acct.ID)
@@ -299,7 +299,7 @@ func TestPgStoreCurrentMonthOverageCents_PreviousMonthExcluded(t *testing.T) {
 	instID := uuid.NewString()
 	now := time.Now().UTC()
 	prevMonth := time.Date(now.Year(), now.Month()-1, 15, 12, 0, 0, 0, time.UTC)
-	if err := store.AppendUsage(ctx, acct.ID, appID, instID, prevMonth, 3_600_000, 0, 0, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, prevMonth, 3_600_000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	got, err := store.CurrentMonthOverageCents(ctx, acct.ID)
@@ -447,23 +447,23 @@ func TestPgStoreUsageByMonth_NonUTC(t *testing.T) {
 	//   2027-01-01T00:30:00Z (= 2027-01-01T03:30 Istanbul)
 	//   2027-01-15T12:00:00Z (= 2027-01-15T15:00 Istanbul)
 	if err := store.AppendUsage(ctx, acct.ID, appA, instA,
-		time.Date(2026, 12, 15, 0, 0, 0, 0, time.UTC), 1000, 0, 0, 0, 0, 0, 0); err != nil {
+		time.Date(2026, 12, 15, 0, 0, 0, 0, time.UTC), 1000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append a1: %v", err)
 	}
 	if err := store.AppendUsage(ctx, acct.ID, appA, instA,
-		time.Date(2026, 12, 31, 23, 30, 0, 0, time.UTC), 2000, 0, 0, 0, 0, 0, 0); err != nil {
+		time.Date(2026, 12, 31, 23, 30, 0, 0, time.UTC), 2000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append a2: %v", err)
 	}
 	if err := store.AppendUsage(ctx, acct.ID, appA, instA,
-		time.Date(2026, 12, 1, 0, 30, 0, 0, time.UTC), 4000, 0, 0, 0, 0, 0, 0); err != nil {
+		time.Date(2026, 12, 1, 0, 30, 0, 0, time.UTC), 4000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append a3: %v", err)
 	}
 	if err := store.AppendUsage(ctx, acct.ID, appB, instB,
-		time.Date(2027, 1, 1, 0, 30, 0, 0, time.UTC), 8000, 0, 0, 0, 0, 0, 0); err != nil {
+		time.Date(2027, 1, 1, 0, 30, 0, 0, time.UTC), 8000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append b1: %v", err)
 	}
 	if err := store.AppendUsage(ctx, acct.ID, appB, instB,
-		time.Date(2027, 1, 15, 12, 0, 0, 0, time.UTC), 16_000, 0, 0, 0, 0, 0, 0); err != nil {
+		time.Date(2027, 1, 15, 12, 0, 0, 0, time.UTC), 16_000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append b2: %v", err)
 	}
 
@@ -547,13 +547,13 @@ func TestPgStoreCurrentMonthOverageCents_NonUTC(t *testing.T) {
 	firstHour := thisMonthStart
 	secondHour := thisMonthStart.Add(time.Hour)
 	prevMonthLate := thisMonthStart.Add(-time.Hour)
-	if err := store.AppendUsage(ctx, acct.ID, appID, instID, firstHour, 3_600_000, 0, 0, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, firstHour, 3_600_000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append firstHour: %v", err)
 	}
-	if err := store.AppendUsage(ctx, acct.ID, appID, instID, secondHour, 7_200_000, 0, 0, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, secondHour, 7_200_000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append secondHour: %v", err)
 	}
-	if err := store.AppendUsage(ctx, acct.ID, appID, instID, prevMonthLate, 9_000_000, 0, 0, 0, 0, 0, 0); err != nil {
+	if err := store.AppendUsage(ctx, acct.ID, appID, instID, prevMonthLate, 9_000_000, 0, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("append prevMonthLate: %v", err)
 	}
 

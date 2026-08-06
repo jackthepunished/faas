@@ -1,0 +1,502 @@
+// Whitebox tests for the accept / revoke invitation handlers and
+// the seat-usage visibility endpoint (IAM-6 / ADR-061, PR 7).
+//
+// Coverage:
+//   - org.member.added + org.invitation.accepted on successful accept
+//   - org.invitation.revoked on successful revoke
+//   - audit-kind rename pins (org.member.{removed,role_changed} dotted
+//     form; the legacy id-style strings must NOT be re-emitted)
+//   - gate-before-emit guards (over-cap, after-revoke, cross-owner)
+//   - seat-usage wire shape (Hobby happy path + Free fail-closed at 0)
+//
+// Pattern mirrors cmd/apid/handlers_audit_test.go:1016 — drive a
+// handler via e.do, fetch events via ListEvents, find by kind via
+// findEventByKind, assert via mustAuditEvent + payload unmarshal.
+
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/state"
+)
+
+// seedInvitationForPrincipal creates a pending invitation for the
+// supplied principal account at the given org/role. The plaintext
+// token is the SHA-256-input the store will hash; the returned
+// wireToken is the base64url-encoded form that goes into the URL
+// path. The store enforces email-match inside ConsumeOrgInvitation
+// — the seed MUST use the accepting account's email or the accept
+// path returns ErrOrgInvitationInvalid.
+func seedInvitationForPrincipal(t *testing.T, store *state.MemStore, org *state.Org, ownerID, acceptingEmail string, role state.OrgRole) (wireToken string, hash []byte) {
+	t.Helper()
+	plaintext := make([]byte, 32)
+	for i := range plaintext {
+		plaintext[i] = byte(i + 1)
+	}
+	sum := sha256.Sum256(plaintext)
+	if _, err := store.CreateOrgInvitation(context.Background(), state.OrgInvitation{
+		OrgID:              org.ID,
+		Email:              acceptingEmail,
+		Role:               role,
+		TokenHash:          sum[:],
+		ExpiresAt:          time.Now().Add(time.Hour),
+		InvitedByAccountID: &ownerID,
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(plaintext), sum[:]
+}
+
+// seedSharedOrgWithOwner creates a shared org on the given plan and
+// adds the testEnv's principal as owner. Returns the org so the test
+// can drive routes under /v1/orgs/{slug}/...
+func seedSharedOrgWithOwner(t *testing.T, e testEnv, slug, name string, plan api.Plan) state.Org {
+	t.Helper()
+	ctx := context.Background()
+	org, err := e.store.CreateOrg(ctx, state.Org{
+		Slug: slug, Name: name, Plan: plan,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	if err := e.store.AddOrgMember(ctx, org.ID, e.acct.ID, state.OrgRoleOwner, nil); err != nil {
+		t.Fatalf("AddOrgMember owner: %v", err)
+	}
+	return org
+}
+
+// seedSharedOrgWithAdminOwner creates a shared org owned by an
+// OUTSIDE owner (admin-only) so the testEnv principal can be
+// invited as a member without tripping the store's already-member
+// gate inside ConsumeOrgInvitation. Used by the accept-path tests
+// where the bearer (e.acct) IS the invitee.
+func seedSharedOrgWithOutsideOwner(t *testing.T, e testEnv, slug, name string, plan api.Plan) state.Org {
+	t.Helper()
+	ctx := context.Background()
+	org, err := e.store.CreateOrg(ctx, state.Org{
+		Slug: slug, Name: name, Plan: plan,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	other, err := e.store.CreateAccount(ctx, "outside-owner-"+slug+"@acme.test", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount outside owner: %v", err)
+	}
+	if err := e.store.AddOrgMember(ctx, org.ID, other.ID, state.OrgRoleOwner, nil); err != nil {
+		t.Fatalf("AddOrgMember outside owner: %v", err)
+	}
+	return org
+}
+
+// TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent (PR 7) drives
+// the invite → accept roundtrip end-to-end and asserts
+// org.member.added lands with the expected payload. Happy path.
+//
+// The bearer (e.acct) IS the invitee — the accept handler uses
+// the bearer principal as `acceptingAccount`. The org must NOT
+// have e.acct as an owner already (otherwise the store fires
+// ErrOrgAlreadyMember on the email-match branch).
+func TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr7-add", "Acme PR7 Add", api.PlanPro)
+
+	// Seed an invitation whose email matches the accepting
+	// principal (pro@example.com from setup). The store's
+	// email-match gate inside ConsumeOrgInvitation refuses any
+	// mismatch with ErrOrgInvitationInvalid.
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST accept: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := mustAuditEvent(t, findEventByKind(rows, "org.member.added"),
+		"no org.member.added row; rows="+eventDump(rows))
+	if found.Subject == nil || found.Subject.String() != uuidStringOf(e.acct.ID) {
+		t.Errorf("Subject = %v, want %s", found.Subject, uuidStringOf(e.acct.ID))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["org_id"] != org.ID {
+		t.Errorf("data.org_id = %v, want %s", data["org_id"], org.ID)
+	}
+	if data["role"] != string(state.OrgRoleDeveloper) {
+		t.Errorf("data.role = %v, want %s", data["role"], state.OrgRoleDeveloper)
+	}
+	if data["email"] != e.acct.Email {
+		t.Errorf("data.email = %v, want %s", data["email"], e.acct.Email)
+	}
+}
+
+// TestAuditEvents_OrgInvitationAcceptedEmitsEvent (PR 7) — the
+// invitation-side mirror of TestAuditEvents_OrgMemberAddedOnAccept.
+// Both kinds fire from the same accept call site.
+func TestAuditEvents_OrgInvitationAcceptedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr7-acc", "Acme PR7 Acc", api.PlanPro)
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST accept: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	found := mustAuditEvent(t, findEventByKind(rows, "org.invitation.accepted"),
+		"no org.invitation.accepted row; rows="+eventDump(rows))
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("Data not valid JSON: %v", err)
+	}
+	if data["org_id"] != org.ID {
+		t.Errorf("data.org_id = %v, want %s", data["org_id"], org.ID)
+	}
+	if data["invitation"] == nil || data["invitation"] == "" {
+		t.Errorf("data.invitation = %v, want non-empty invitation id", data["invitation"])
+	}
+}
+
+// TestAuditEvents_OrgInvitationRevokedEmitsEvent (PR 7) drives
+// DELETE /v1/orgs/{slug}/invitations/{token} via the org owner and
+// asserts org.invitation.revoked lands with token_hash_prefix of
+// exactly 8 chars (the security posture — never log the full hash).
+func TestAuditEvents_OrgInvitationRevokedEmitsEvent(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "acme-pr7-rev", "Acme PR7 Rev", api.PlanPro)
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, "rev-target@acme.test", state.OrgRoleDeveloper)
+
+	rec := e.do(t, http.MethodDelete, "/v1/orgs/"+org.Slug+"/invitations/"+wireToken, nil, map[string]string{
+		"X-Active-Org": org.Slug,
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE invite: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	ev := mustAuditEvent(t, findEventByKind(rows, "org.invitation.revoked"),
+		"no org.invitation.revoked row; rows="+eventDump(rows))
+	if ev.Subject == nil || ev.Subject.String() != uuidStringOf(e.acct.ID) {
+		t.Errorf("Subject = %v, want %s", ev.Subject, uuidStringOf(e.acct.ID))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("Unmarshal Data: %v", err)
+	}
+	if data["org_id"] != org.ID {
+		t.Errorf("data.org_id = %v, want %s", data["org_id"], org.ID)
+	}
+	prefix, _ := data["token_hash_prefix"].(string)
+	if len(prefix) != 8 {
+		t.Errorf("data.token_hash_prefix = %q (len %d), want 8 chars (security: never log full hash)", prefix, len(prefix))
+	}
+}
+
+// TestAuditEvents_OrgMemberRoleChangedEmitsDottedKind (PR 7) pins
+// the rename. PATCH /v1/orgs/{slug}/members/{user_id} must emit
+// org.member.role_changed (dotted), NEVER the legacy
+// org.member_role_changed.
+func TestAuditEvents_OrgMemberRoleChangedEmitsDottedKind(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "acme-pr7-role", "Acme PR7 Role", api.PlanPro)
+	dev, err := e.store.CreateAccount(context.Background(), "role-dev@acme.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount dev: %v", err)
+	}
+	if err := e.store.AddOrgMember(context.Background(), org.ID, dev.ID, state.OrgRoleDeveloper, nil); err != nil {
+		t.Fatalf("AddOrgMember dev: %v", err)
+	}
+	rec := e.do(t, http.MethodPatch, "/v1/orgs/"+org.Slug+"/members/"+dev.ID,
+		api.ChangeRoleRequest{Role: string(state.OrgRoleAdmin)},
+		map[string]string{"X-Active-Org": org.Slug})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH role: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if findEventByKind(rows, "org.member_role_changed") != nil {
+		t.Errorf("legacy id-style kind org.member_role_changed was emitted; PR 7 must drop it")
+	}
+	mustAuditEvent(t, findEventByKind(rows, "org.member.role_changed"),
+		"no org.member.role_changed (dotted) row; rows="+eventDump(rows))
+}
+
+// TestAuditEvents_OrgMemberRemovedEmitsDottedKind (PR 7) — same
+// posture for the remove path.
+func TestAuditEvents_OrgMemberRemovedEmitsDottedKind(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "acme-pr7-rm", "Acme PR7 Rm", api.PlanPro)
+	dev, err := e.store.CreateAccount(context.Background(), "rm-dev@acme.test", api.PlanFree)
+	if err != nil {
+		t.Fatalf("CreateAccount dev: %v", err)
+	}
+	if err := e.store.AddOrgMember(context.Background(), org.ID, dev.ID, state.OrgRoleDeveloper, nil); err != nil {
+		t.Fatalf("AddOrgMember dev: %v", err)
+	}
+	rec := e.do(t, http.MethodDelete, "/v1/orgs/"+org.Slug+"/members/"+dev.ID, nil, map[string]string{
+		"X-Active-Org": org.Slug,
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE member: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if findEventByKind(rows, "org.member_removed") != nil {
+		t.Errorf("legacy id-style kind org.member_removed was emitted; PR 7 must drop it")
+	}
+	mustAuditEvent(t, findEventByKind(rows, "org.member.removed"),
+		"no org.member.removed (dotted) row; rows="+eventDump(rows))
+}
+
+// TestAcceptInvitation_AlreadyMemberSurfacesExistingRole (PR 7) —
+// when the bearer accepts an invitation for an email they're
+// ALREADY a member of, the store returns ErrOrgAlreadyMember with
+// a zero OrgMembership. The handler must look up the existing role
+// via OrgMemberByAccount so the wire message ships the actual role
+// (e.g. "developer") rather than the sentinel's empty string.
+//
+// Seeding shape: e.acct is the OWNER of the org (seedSharedOrgWithOwner),
+// so we mint an invitation for e.acct's email — the accept path
+// hits the already-member branch in the store.
+func TestAcceptInvitation_AlreadyMemberSurfacesExistingRole(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "acme-pr7-already", "Acme PR7 Already", api.PlanPro)
+
+	// Mint an invitation whose email matches e.acct (the owner).
+	// ConsumeOrgInvitation refuses unknown emails; the email-match
+	// gate passes, then the already-active-membership check fires.
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("already-member accept: code=%d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var problem struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal problem: %v", err)
+	}
+	if problem.Code != "org_already_member" {
+		t.Errorf("problem.code = %q, want org_already_member", problem.Code)
+	}
+	// The fix lands the OWNER role string in the detail — proving
+	// OrgMemberByAccount ran and the handler used its return
+	// value, not the zero-string sentinel-bearing error path.
+	wantSubstr := `"owner"`
+	if !strings.Contains(problem.Detail, wantSubstr) {
+		t.Errorf("problem.detail = %q, want it to contain %s", problem.Detail, wantSubstr)
+	}
+}
+
+// TestAcceptInvitation_GateFiresBeforeEmit (PR 7) — accepting an
+// already-revoked token must surface ErrOrgInvitationInvalid (410)
+// and emit NEITHER org.member.added NOR org.invitation.accepted.
+// The store-side consume is the load-bearing check; the handler
+// surfaces the sentinel before the audit emit at handlers_org_invitations.go:191.
+func TestAcceptInvitation_GateFiresBeforeEmit(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOwner(t, e, "acme-pr7-rev2", "Acme PR7 Rev2", api.PlanPro)
+	wireToken, hash := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+	// Pre-revoke the invitation so the consume tx fires the
+	// already-revoked branch. RevokeOrgInvitation takes the SHA-256
+	// hash (NOT the plaintext) — see memstore.go:8977.
+	if err := e.store.RevokeOrgInvitation(context.Background(), hash, e.acct.ID); err != nil {
+		t.Fatalf("pre-revoke: %v", err)
+	}
+
+	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("accept after revoke: code=%d, want 410; body=%s", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal problem: %v", err)
+	}
+	if problem.Code != "org_invitation_invalid" {
+		t.Errorf("problem.code = %q, want org_invitation_invalid", problem.Code)
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if findEventByKind(rows, "org.member.added") != nil {
+		t.Errorf("org.member.added emitted on revoked-token accept; gate failed")
+	}
+	if findEventByKind(rows, "org.invitation.accepted") != nil {
+		t.Errorf("org.invitation.accepted emitted on revoked-token accept; gate failed")
+	}
+}
+
+// TestAcceptInvitation_OverCapDoesNotEmit (PR 7) — pins the store-
+// side cap-in-tx back-stop. Hobby plan caps members at 10; with 10
+// members already on the org, one more accept attempt must surface
+// ErrOrgMemberCapExceeded (403) and emit neither kind.
+func TestAcceptInvitation_OverCapDoesNotEmit(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	org := seedSharedOrgWithOwner(t, e, "hobby-pr7-cap", "Hobby PR7 Cap", api.PlanHobby)
+
+	// Fill to Hobby's OrgMembersMax=10 (1 owner + 9 dev). The owner
+	// seed uses AddOrgMember which has no cap check, so the cap is
+	// only enforced inside ConsumeOrgInvitation.
+	for i := 0; i < 9; i++ {
+		fillAcct, err := e.store.CreateAccount(context.Background(),
+			"cap-"+string(rune('a'+i))+"@hobby.test", api.PlanFree)
+		if err != nil {
+			t.Fatalf("CreateAccount cap-fill %d: %v", i, err)
+		}
+		if err := e.store.AddOrgMember(context.Background(), org.ID, fillAcct.ID, state.OrgRoleDeveloper, nil); err != nil {
+			t.Fatalf("AddOrgMember cap-fill %d: %v", i, err)
+		}
+	}
+
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("accept over-cap: code=%d, want 403; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if findEventByKind(rows, "org.member.added") != nil {
+		t.Errorf("org.member.added emitted on over-cap accept; store-side cap-in-tx failed")
+	}
+	if findEventByKind(rows, "org.invitation.accepted") != nil {
+		t.Errorf("org.invitation.accepted emitted on over-cap accept; store-side cap-in-tx failed")
+	}
+}
+
+// TestRevokeInvitation_NonMemberDoesNotEmit (PR 7) — a principal
+// that is NOT a member of the seeded org must hit the LoadOrg
+// gate (403 org_role_forbidden) and never reach the audit emit.
+// The harness's principal (e.acct) is the only bearer this test
+// can drive, so we seed an org they're NOT a member of. The
+// CrossOwner angle is also covered indirectly by the route table
+// test TestOrgRoutes_GatedByAuthorize (server_org_authz_test.go:100)
+// which walks every /v1/orgs/{slug}/* pattern and confirms 4xx on
+// no-membership.
+func TestRevokeInvitation_NonMemberDoesNotEmit(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	// Seed an org WITHOUT adding e.acct as a member. LoadOrg's
+	// membership lookup must trip 403 before the handler body runs.
+	org, err := e.store.CreateOrg(context.Background(), state.Org{
+		Slug: "foreign-pr7", Name: "Foreign PR7", Plan: api.PlanPro,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrg: %v", err)
+	}
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, "other-owner-id", "someone@foreign.test", state.OrgRoleDeveloper)
+
+	rec := e.do(t, http.MethodDelete, "/v1/orgs/"+org.Slug+"/invitations/"+wireToken, nil, map[string]string{
+		"X-Active-Org": org.Slug,
+	})
+	if rec.Code < 400 {
+		t.Fatalf("DELETE invite (non-member): code=%d, want 4xx; body=%s", rec.Code, rec.Body.String())
+	}
+
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if findEventByKind(rows, "org.invitation.revoked") != nil {
+		t.Errorf("org.invitation.revoked emitted for non-member; LoadOrg gate failed")
+	}
+}
+
+// TestSeatUsage_HappyPath (PR 7) — GET /v1/orgs/{slug}/seat_usage
+// returns {used=1, limit=10, plan="hobby"} for a single-owner shared
+// org on Hobby.
+func TestSeatUsage_HappyPath(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	org := seedSharedOrgWithOwner(t, e, "hobby-pr7-usage", "Hobby PR7 Usage", api.PlanHobby)
+
+	rec := e.do(t, http.MethodGet, "/v1/orgs/"+org.Slug+"/seat_usage", nil, map[string]string{
+		"X-Active-Org": org.Slug,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET seat_usage: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body api.SeatUsageResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	if body.Used != 1 {
+		t.Errorf("Used = %d, want 1", body.Used)
+	}
+	if body.Limit != 10 {
+		t.Errorf("Limit = %d, want 10 (Hobby OrgMembersMax)", body.Limit)
+	}
+	if body.Plan != string(api.PlanHobby) {
+		t.Errorf("Plan = %q, want %q", body.Plan, api.PlanHobby)
+	}
+}
+
+// TestSeatUsage_FreePlanReturnsZero (PR 7) — Free plan returns
+// limit=0 (fail-closed accessor); the dashboard renders "personal
+// org only" instead of "0 of 0 used".
+func TestSeatUsage_FreePlanReturnsZero(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	org := seedSharedOrgWithOwner(t, e, "free-pr7-usage", "Free PR7 Usage", api.PlanFree)
+
+	rec := e.do(t, http.MethodGet, "/v1/orgs/"+org.Slug+"/seat_usage", nil, map[string]string{
+		"X-Active-Org": org.Slug,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET seat_usage: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body api.SeatUsageResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("Unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	if body.Limit != 0 {
+		t.Errorf("Limit = %d, want 0 (Free fail-closed)", body.Limit)
+	}
+	if body.Plan != string(api.PlanFree) {
+		t.Errorf("Plan = %q, want %q", body.Plan, api.PlanFree)
+	}
+	if body.Used != 1 {
+		t.Errorf("Used = %d, want 1 (the owner)", body.Used)
+	}
+}
+
+// eventDump renders the rows slice as JSON for inclusion in a
+// t.Fatal message. Mirrors the SA5011 escape hatch used in the
+// other audit-emit tests.
+func eventDump(rows []state.Event) string {
+	b, _ := json.Marshal(rows)
+	return string(b)
+}

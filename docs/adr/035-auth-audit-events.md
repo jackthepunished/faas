@@ -50,11 +50,31 @@
   | `app.signed_image_accepted` | imaged `verifyImageSignature` (issue #472 / ADR-058) | `{app_id, slug, deployment_id, signer_name, digest}` — deploy passed signature check. Emitted via `pg_notify('audit_event')` from imaged so apid is the single-source writer to the events table. |
   | `app.signature_missing` | imaged `verifyImageSignature` (issue #472 / ADR-058) | `{app_id, slug, deployment_id, ref, digest}` — registry had no `.sig` blob. Fail-closed: deployment marked FAILED with `failure_reason="signature_missing"`. |
   | `app.signature_invalid` | imaged `verifyImageSignature` (issue #472 / ADR-058) | `{app_id, slug, deployment_id, ref, digest}` — sig exists but no trusted publisher matched. Fail-closed: deployment marked FAILED with `failure_reason="signature_invalid"`. |
+  | `org.created` | `createSharedOrg` (IAM-6 / ADR-061, PR 5) | `{org_id, slug, name}` — first owner seeded on a fresh shared org. Personal-org backfill emits no row (system action; the personal-org row is immutable and pre-dates the audit log). |
+  | `org.updated` | `patchOrg` (PR 5) | `{org_id, name: bool, plan: bool}` — flag-only payload so the dashboard shows "name changed" / "plan changed" without leaking the values themselves. |
+  | `org.deleted` | `softDeleteOrg` (PR 5 + PR 8) | `{org_id, slug, soft: true}` — soft flag set on the row; hard-delete lands in PR 8 (GDPR bundle). |
+  | `org.ownership_transferred` | `transferOrgOwnership` (PR 5) | `{org_id, from_account, to_account}` — the only path to owner role. The demoted previous owner is included as `from_account`. |
+  | `org.member.added` | `acceptInvitation` (PR 7) | `{org_id, email, role, invitation}` — the membership-side record on a successful invitation accept. Companion to `org.invitation.accepted` (the invitation-side record). |
+  | `org.member.removed` | `removeOrgMember` (PR 5; renamed in PR 7) | `{org_id, account_id, role}` — admin/owner removed a member. PR 5 originally emitted the id-style `org.member_removed` (the only outlier in the otherwise-dotted vocabulary); PR 7 stops emitting that string. Pre-PR-7 rows remain queryable by their literal value; the dashboard's `strings.HasPrefix(e.Kind, "org.member.")` filter cleanly separates the two. |
+  | `org.member.role_changed` | `changeOrgMemberRole` (PR 5; renamed in PR 7) | `{org_id, account_id, from_role, to_role}` — admin promoted/demoted a member. PR 5 originally emitted the id-style `org.member_role_changed`; PR 7 stops emitting that string (same posture as `org.member.removed`). |
+  | `org.invitation.created` | `inviteOrgMember` (PR 5) | `{org_id, email, role, invitation}` — invitation minted. The plaintext token is NEVER logged (same posture as `secret.set`; the plaintext lives only on the wire at create time). |
+  | `org.invitation.accepted` | `acceptInvitation` (PR 7) | `{org_id, email, role, invitation}` — invitation-side mirror of `org.member.added`. Both kinds fire from the same successful accept call site (ADR-035 best-effort contract). |
+  | `org.invitation.revoked` | `revokeInvitation` (PR 7) | `{org_id, token_hash_prefix (8 chars)}` — owner/admin revoked a pending invitation. The token's full SHA-256 hash is NEVER logged; the 8-char prefix is enough for the dashboard to link the revoke row back to the create row but can't be pivoted to the token if the audit table is ever exfiltrated. Mirrors `secretbox` SealBytes namespace posture at pkg/webhook. |
 
-  All `auth.*`, `key.*`, `secret.*`, `account.*`, and `stateless.*` values are namespaced
-  with a dot prefix; schedd's existing kinds (`state_transition`,
-  `wake_boot_error`, `park_snapshot_error`, `watchdog_timeout`) are
-  bare names. Grep verifies no overlap.
+  All `auth.*`, `key.*`, `secret.*`, `account.*`, `stateless.*`, and
+  `org.*` values are namespaced with a dot prefix; schedd's existing
+  kinds (`state_transition`, `wake_boot_error`, `park_snapshot_error`,
+  `watchdog_timeout`) are bare names. Grep verifies no overlap.
+
+  **Additive rename policy (PR 7):** when a kind's spelling changes
+  (e.g. `org.member_removed` → `org.member.removed`), the new code path
+  emits ONLY the dotted form going forward. Pre-PR-7 rows in the
+  `events` table remain queryable by their literal string. The
+  dashboard's `strings.HasPrefix(e.Kind, "org.member.")` filter
+  collapses pre- and post-PR-7 rows for the dotted sub-namespace; the
+  `org.member_*` (id-style) prefix is a separate match. No migration
+  is needed because `events.kind` is free-form text and no row's
+  literal value changes — only the emitted strings change.
 
 - **Consequences:**
 

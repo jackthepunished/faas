@@ -44,6 +44,11 @@ type fakeEngine struct {
 	// no-op (returns nil immediately, so the server's
 	// SendAndClose path is the only completion signal).
 	capacitySinkFn func(scheddgrpc.CapacitySink) error
+	// destroyFn (issue #554 / ADR-078) drives the
+	// ReportLivenessFailed handler tests. Default nil = nil
+	// (idempotent no-op, mirroring the production engine's
+	// behaviour for a non-RUNNING instance).
+	destroyFn func(ctx context.Context, instanceID, reason string) error
 }
 
 func (f *fakeEngine) Wake(ctx context.Context, appID string) (sched.WakeResult, error) {
@@ -124,6 +129,18 @@ func (f *fakeEngine) CapacitySink() scheddgrpc.CapacitySink {
 // Tests that exercise the strict-mode path inject a populated
 // registry via a wrapper (see capacity_test.go).
 func (f *fakeEngine) NodeKeyRegistry() *sched.NodeKeyRegistry { return nil }
+
+// DestroyForLivenessFailure (issue #554 / ADR-078) — the default
+// fake returns nil (idempotent no-op, mirroring the production
+// engine's behaviour for a non-RUNNING instance). Tests that
+// exercise the failure classification wire
+// (liveness_failed_test.go) inject a custom destroyFn.
+func (f *fakeEngine) DestroyForLivenessFailure(ctx context.Context, instanceID, reason string) error {
+	if f.destroyFn != nil {
+		return f.destroyFn(ctx, instanceID, reason)
+	}
+	return nil
+}
 
 func newServer(t *testing.T, eng scheddgrpc.SchedAPI) scheddpb.ScheddClient {
 	t.Helper()

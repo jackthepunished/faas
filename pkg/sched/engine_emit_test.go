@@ -163,3 +163,99 @@ func TestEnginePark_EmitsStartedCompleted(t *testing.T) {
 		t.Errorf("kinds missing wake.park_completed: got %v", got)
 	}
 }
+
+// TestEnginePark_TailDrainWatchdogSucceedsWhenCounterDrains pins
+// the snapshotAndPark watchdog (issue #667 / ADR-078 §"Reaper gate"
+// / §"Park gate"): when an instance has TailCount > 0 at Park
+// entry, the watchdog polls for ParkTailDrainTimeoutSeconds and
+// force-parks only if the counter does not drop to 0. This test
+// exercises the success path: the runner's tail host drains all
+// tasks mid-poll, the watchdog sees 0, and the park proceeds
+// without emitting any wake.tail_failed events.
+//
+// The deadline path (5s of unfinished tails → force-park +
+// wake.tail_failed{reason=forced_at_park}) is exercised by
+// pkg/fcvm/tail_metal_test.go::TestMetal_TailEndToEnd; the unit
+// test here pins the fast-path because spinning the deadline
+// would cost 5s per call. The load-bearing invariant under test
+// is "the watchdog does NOT force-park when the runner drains
+// in time" — a regression here would break every customer wake
+// that uses waitUntil.
+func TestEnginePark_TailDrainWatchdogSucceedsWhenCounterDrains(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	notif := &fakeNotifier{}
+	e := wakeEngineWithEvents(t, store, vmm, notif)
+	res, err := e.Wake(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+
+	// Bump tail_count to 3 (simulating three in-flight waitUntil
+	// tasks). The watchdog in snapshotAndPark must wait until
+	// GetInstanceTailCount returns 0 before proceeding.
+	const initialTails = int32(3)
+	if _, err := store.BumpInstanceTailCount(context.Background(), res.InstanceID, initialTails); err != nil {
+		t.Fatalf("seed BumpInstanceTailCount: %v", err)
+	}
+	post, err := store.GetInstanceTailCount(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("GetInstanceTailCount: %v", err)
+	}
+	if post != initialTails {
+		t.Fatalf("post-bump tail_count = %d, want %d", post, initialTails)
+	}
+
+	// Simulate the runner's tail host draining all three tasks
+	// mid-poll. Use a goroutine that fires AFTER the Park call
+	// has entered the watchdog loop; the 200ms poll interval in
+	// snapshotAndPark gives the drain a generous window.
+	go func() {
+		// 50ms is enough to land mid-poll but well under the
+		// 5s deadline — the test fails fast if the watchdog is
+		// broken (no waiting for the deadline).
+		time.Sleep(50 * time.Millisecond)
+		_ = store.DecrementInstanceTailCount(context.Background(), res.InstanceID, initialTails)
+	}()
+
+	if err := e.Park(context.Background(), res.InstanceID); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+
+	// Assertion 1: the post-Park tail_count is 0 (the watchdog
+	// saw the drain and the racy SQL decrement by the dummy
+	// goroutine did not bump the post-park state). MemStore's
+	// AppendUsage / DecrementInstanceTailCount is idempotent.
+	post, err = store.GetInstanceTailCount(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("post-Park GetInstanceTailCount: %v", err)
+	}
+	if post != 0 {
+		t.Errorf("post-Park tail_count = %d, want 0 (drain + decrement should leave 0)", post)
+	}
+
+	// Assertion 2: NO wake.tail_failed events were emitted
+	// (the runner drained successfully). The watchdog's
+	// forced_at_park audit row is the load-bearing indicator
+	// of a stuck drain — its absence confirms the success
+	// path.
+	rows := eventsForInstance(t, store, res.WakeID)
+	got := kindsOf(rows)
+	if contains(got, "wake.tail_failed") {
+		t.Errorf("kinds contained wake.tail_failed but the runner drained in time; got %v", got)
+	}
+
+	// Assertion 3: the instance terminated cleanly (park
+	// succeeded, state is STOPPED). Without the watchdog's
+	// success path, the park would either hang for 5s and
+	// force-park (emitting wake.tail_failed) or fail with a
+	// hung-snapshot error.
+	ins, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if ins.State != string(state.StateParked) {
+		t.Errorf("post-Park state = %q, want parked", ins.State)
+	}
+}

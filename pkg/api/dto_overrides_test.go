@@ -308,6 +308,106 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 				},
 			},
 		},
+		// Issue #554 / ADR-078: liveness_probe validation.
+		{
+			name: "liveness-probe-path-must-start-with-slash",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path: "healthz",
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: `liveness_probe.path must start with "/"`,
+		},
+		{
+			name: "liveness-probe-negative-interval",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					IntervalS: -1,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.interval_s must be >= 0 (0 = inherit); got -1",
+		},
+		{
+			name: "liveness-probe-interval-above-ceiling",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					IntervalS: 61,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			// "61" is the value the test passes; the message
+			// names both the ceiling and the observed value so a
+			// customer can fix the override without reading the spec.
+			wantInBody: "liveness_probe.interval_s must be <= 60; got 61",
+		},
+		{
+			name: "liveness-probe-negative-timeout",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:     "/healthz",
+					TimeoutS: -1,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.timeout_s must be >= 0 (0 = inherit 2s); got -1",
+		},
+		{
+			name: "liveness-probe-timeout-above-ceiling",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:     "/healthz",
+					TimeoutS: 6,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.timeout_s must be <= 5; got 6",
+		},
+		{
+			name: "liveness-probe-negative-consecutive",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:                "/healthz",
+					ConsecutiveFailures: -1,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.consecutive_failures must be >= 0 (0 = inherit); got -1",
+		},
+		{
+			name: "liveness-probe-consecutive-above-ceiling",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:                "/healthz",
+					ConsecutiveFailures: 11,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.consecutive_failures must be <= 10; got 11",
+		},
+		{
+			name: "liveness-probe-minimal-path-only",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path: "/healthz",
+					// interval/timeout/consecutive default to 0 → inherit
+					// per-plan defaults (Hobby/Pro/Scale → 5 / 3 / 60s).
+				},
+			},
+		},
+		{
+			name: "liveness-probe-interval-at-ceiling",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					IntervalS: MaxLivenessPeriodSeconds,
+				},
+			},
+			// 60 must be accepted (the ceiling is inclusive).
+		},
 	}
 
 	for _, tc := range cases {

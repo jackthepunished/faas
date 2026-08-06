@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.deployment_healthcheck import DeploymentHealthcheck
+    from ..models.deployment_liveness_probe import DeploymentLivenessProbe
     from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 
 
@@ -55,6 +56,10 @@ class DeploymentResponse:
     override_healthcheck: DeploymentHealthcheck | None | Unset = UNSET
     """Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a
     bare TCP accept."""
+    override_liveness_probe: DeploymentLivenessProbe | None | Unset = UNSET
+    """Liveness-probe override echoed verbatim (issue #554 / ADR-078). nil when the deployment used the per-plan
+    default (Hobby/Pro/Scale → 5s / 3 consecutive / 60s cooldown). Echoed on GET /v1/apps/{slug}/deployments/{id} so
+    the customer can audit which probe the host (cmd/vmmd) is running against the VM."""
     min_instances: int | Unset = UNSET
     """Per-deployment cold-wake floor override (issue #557 closure / ADR-072). 0 = inherit from parent app
     (default); positive value is the deployment's own floor. Effective per-instance floor =
@@ -64,6 +69,7 @@ class DeploymentResponse:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
+        from ..models.deployment_liveness_probe import DeploymentLivenessProbe
 
         id = self.id
 
@@ -127,6 +133,14 @@ class DeploymentResponse:
         else:
             override_healthcheck = self.override_healthcheck
 
+        override_liveness_probe: dict[str, Any] | None | Unset
+        if isinstance(self.override_liveness_probe, Unset):
+            override_liveness_probe = UNSET
+        elif isinstance(self.override_liveness_probe, DeploymentLivenessProbe):
+            override_liveness_probe = self.override_liveness_probe.to_dict()
+        else:
+            override_liveness_probe = self.override_liveness_probe
+
         min_instances = self.min_instances
 
         field_dict: dict[str, Any] = {}
@@ -163,6 +177,8 @@ class DeploymentResponse:
             field_dict["override_port"] = override_port
         if override_healthcheck is not UNSET:
             field_dict["override_healthcheck"] = override_healthcheck
+        if override_liveness_probe is not UNSET:
+            field_dict["override_liveness_probe"] = override_liveness_probe
         if min_instances is not UNSET:
             field_dict["min_instances"] = min_instances
 
@@ -171,6 +187,7 @@ class DeploymentResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.deployment_healthcheck import DeploymentHealthcheck
+        from ..models.deployment_liveness_probe import DeploymentLivenessProbe
         from ..models.deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 
         d = dict(src_dict)
@@ -249,6 +266,23 @@ class DeploymentResponse:
 
         override_healthcheck = _parse_override_healthcheck(d.pop("override_healthcheck", UNSET))
 
+        def _parse_override_liveness_probe(data: object) -> DeploymentLivenessProbe | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                override_liveness_probe_type_0 = DeploymentLivenessProbe.from_dict(data)
+
+                return override_liveness_probe_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(DeploymentLivenessProbe | None | Unset, data)
+
+        override_liveness_probe = _parse_override_liveness_probe(d.pop("override_liveness_probe", UNSET))
+
         min_instances = d.pop("min_instances", UNSET)
 
         deployment_response = cls(
@@ -269,6 +303,7 @@ class DeploymentResponse:
             override_env_secret_refs=override_env_secret_refs,
             override_port=override_port,
             override_healthcheck=override_healthcheck,
+            override_liveness_probe=override_liveness_probe,
             min_instances=min_instances,
         )
 

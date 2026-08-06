@@ -2389,7 +2389,16 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   warm_snapshot_min_requests = case when $33 then $34 else warm_snapshot_min_requests end,
 		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end,
 		   eviction_priority = case when $37 then $38 else eviction_priority end,
-		   require_authn = case when $39 then $40 else require_authn end
+		   require_authn = case when $39 then $40 else require_authn end,
+		   -- Issue #477 / ADR-079: per-app public_auth. The mode
+		   -- column is the canonical per-app config; the
+		   -- basic-sealed blob is the secretbox-encrypted
+		   -- credential pair (mode='basic' only). The two
+		   -- columns are SET together so a partial PATCH
+		   -- (mode='open' with stale sealed blob from a prior
+		   -- mode='basic' PATCH) clears the blob atomically.
+		   public_auth_mode   = case when $41 then $42::text  else public_auth_mode   end,
+		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2438,8 +2447,42 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// so the SQL never sees an illegal value. Free customers
 		// may PATCH true → false on a Pro-upgraded app; Hobby
 		// customers may opt back out the same way.
-		p.SetRequireAuthn, boolOrFalse(p.RequireAuthn))
+		p.SetRequireAuthn, boolOrFalse(p.RequireAuthn),
+		// Issue #477 / ADR-079: public_auth block. The Set bit
+		// gates BOTH columns via the same CASE so a stale
+		// sealed blob from a prior mode='basic' PATCH is
+		// cleared when the customer PATCHes mode='open' or
+		// mode='bearer' (the apid handler always passes
+		// p.PublicAuth with Sealed=nil in that case).
+		p.SetPublicAuth,
+		derefString(ptrOrEmpty(p.PublicAuth)),
+		nilOrBytes(p.PublicAuth))
 	return scanApp(row)
+}
+
+// nilOrBytes returns p.PublicAuth.Sealed when SetPublicAuth is
+// true (the apid seal step produced a non-nil blob for
+// mode='basic'; apid passes nil Sealed for mode='open'/'bearer'
+// so the same CASE writes NULL atomically). The pgx driver
+// maps a nil []byte to SQL NULL, which is exactly what
+// public_auth_basic expects when no creds are stored.
+func nilOrBytes(p *AppPublicAuthUpdate) []byte {
+	if p == nil {
+		return nil
+	}
+	return p.Sealed
+}
+
+// ptrOrEmpty returns a pointer to p.PublicAuth.Mode when
+// SetPublicAuth is true (so derefString sees the canonical
+// value), or nil otherwise. The CASE guards the read site
+// so a nil pointer is harmless.
+func ptrOrEmpty(p *AppPublicAuthUpdate) *string {
+	if p == nil {
+		return nil
+	}
+	s := p.Mode
+	return &s
 }
 
 // derefString returns the dereferenced value of a *string, or "" if
@@ -3489,10 +3532,11 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	row := tx.QueryRow(ctx,
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
+		                          override_liveness_probe,
 		                          sidecars,
 		                          status,
 		                          min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18)
 		 returning `+deploymentSelectColumns,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3500,6 +3544,7 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		d.OverrideEntrypoint, d.OverrideCmd,
 		nullJSONRaw(d.OverrideEnv), nullJSONRaw(d.OverrideEnvSecrets),
 		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck),
+		nullJSONRaw(d.OverrideLivenessProbe),
 		notNullEmptyJSONRaw(d.Sidecars),
 		d.MinInstances)
 	created, err := scanDeployment(row)
@@ -6264,6 +6309,15 @@ func (s *PgStore) ClearInstanceFrameworkReadyAt(ctx context.Context, id string) 
 // receipt raced a Park / Destroy and the row is gone). The
 // vmmd receipt path logs a Debug and drops — same convention
 // as the framework_ready / sidecar-event DGRAM receipts.
+//
+// SQL mirrors the sqlc source in queries.sql::BumpInstanceTailCount;
+// `make sqlc-check` enforces lockstep between the raw SQL below
+// and the generated sqlc method. The Store interface uses `string`
+// for the instance id (matching the rest of the public surface)
+// while the sqlc-generated method takes `pgtype.UUID` — the bridge
+// is omitted here to keep pgstore's parameter shape consistent
+// with the existing inline-SQL precedent for `UpdateInstanceState`
+// and `AppendComputeNodeHeartbeat`.
 func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error) {
 	var post int32
 	row := s.pool.QueryRow(ctx,
@@ -6283,11 +6337,11 @@ func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta in
 
 // DecrementInstanceTailCount is the canonical "tail task reached
 // terminal" path (issue #667 / ADR-078). Equivalent to
-// BumpInstanceTailCount(ctx, id, -1) — kept as a separate method
+// BumpInstanceTailCount(ctx, id, -n) — kept as a separate method
 // because every decrement site is a terminal event receipt, and
 // the explicit name makes the call sites self-documenting.
 //
-// GREATEST(tail_count - 1, 0) is the safety floor: a stale
+// GREATEST(tail_count - n, 0) is the safety floor: a stale
 // decrement on a counter at 0 leaves it at 0 rather than
 // underflowing. Without the floor, a burst of decrements after
 // the runner exited cleanly would push the counter negative and
@@ -6297,12 +6351,16 @@ func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta in
 // defence-in-depth guard, not the load-bearing piece.
 //
 // Returns ErrNotFound when the instance row is missing.
-func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string) error {
+//
+// SQL mirrors the sqlc source in queries.sql::DecrementInstanceTailCount;
+// `make sqlc-check` enforces lockstep. See the BumpInstanceTailCount
+// comment for the rationale on the `string` vs `pgtype.UUID` bridge.
+func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string, n int32) error {
 	tag, err := s.pool.Exec(ctx,
 		`update instances
-		    set tail_count = GREATEST(tail_count - 1, 0)
+		    set tail_count = GREATEST(tail_count - $2, 0)
 		  where id = $1`,
-		id)
+		id, n)
 	if err != nil {
 		return err
 	}
@@ -6310,6 +6368,30 @@ func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string) err
 		return ErrNotFound
 	}
 	return nil
+}
+
+// GetInstanceTailCount returns the instance's current tail_count
+// (issue #667 / ADR-078). Used by the snapshotAndPark watchdog to
+// poll for drain completion. Single SELECT … FROM instances WHERE
+// id = $1 — the column is on the hot path so the row is already
+// in shared_buffers under normal load; pgx returns the column as
+// int32 per the migration's ADD COLUMN type.
+// Returns ErrNotFound when the instance row is missing.
+//
+// SQL mirrors the sqlc source in queries.sql::GetInstanceTailCount;
+// `make sqlc-check` enforces lockstep. See the BumpInstanceTailCount
+// comment for the rationale on the `string` vs `pgtype.UUID` bridge.
+func (s *PgStore) GetInstanceTailCount(ctx context.Context, id string) (int32, error) {
+	var n int32
+	err := s.pool.QueryRow(ctx,
+		`select tail_count from instances where id = $1`, id).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
 }
 
 // ListInstancesByStatesOlderThan is the watchdog's lookup (spec §6.1).
@@ -7293,7 +7375,7 @@ func (s *PgStore) ListEventsBySidecar(ctx context.Context, sidecarName string, s
 
 // --- usage -------------------------------------------------------------------
 
-func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32) error {
+func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID string, minute time.Time, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes int64, coldBootCount int32, tailSeconds int64) error {
 	// Idempotent on (instance_id, minute) for mb_seconds / requests
 	// (mirrors the sqlc source in queries.sql::AppendUsage — make
 	// sqlc-check verifies these stay in lockstep). The first write
@@ -7302,16 +7384,17 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	// instances cannot inflate billing. M7 hardening, PR
 	// feat/m7-beta-hardening.
 	//
-	// cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, and
-	// cold_boot_count are ADDITIVE on the same conflict key: the
+	// cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count,
+	// and tail_seconds are ADDITIVE on the same conflict key: the
 	// schedd / meterd accumulators (pkg/sched/instancestats/poller.go
 	// for cpu; the vmmd netstats.Cache + gateway statusRecorder fed
 	// by the meterd sampler's egress adapters for tx_bytes /
 	// net_tx_bytes; the new ingress Tx cache for net_rx_bytes; the
-	// new LastWakeMethod propagation for cold_boot_count) can each
-	// call AppendUsage many times within the same minute. We add
-	// EXCLUDED.<col> to the existing row so the columns are the sum
-	// of all per-tick deltas. The pusher (meter → billing)
+	// new LastWakeMethod propagation for cold_boot_count; the new
+	// Manager.ReadAndResetTailSeconds seam for tail_seconds) can
+	// each call AppendUsage many times within the same minute. We
+	// add EXCLUDED.<col> to the existing row so the columns are the
+	// sum of all per-tick deltas. The pusher (meter → billing)
 	// deduplicates on a coarser window before pushing, so the
 	// additive merge is safe end-to-end.
 	//
@@ -7320,16 +7403,22 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 	//   net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
 	//   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
 	//   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
+	//   tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock
+	//                      seconds draining waitUntil tasks;
+	//                      INFORMATIONAL ONLY — does not enter billing;
+	//                      pinned by
+	//                      pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
 	_, err := s.pool.Exec(ctx,
-		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		 on conflict (instance_id, minute) do update
 		   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
 		       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
 		       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
 		       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
-		       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count`,
-		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes, coldBootCount)
+		       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count,
+		       tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds`,
+		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes, coldBootCount, tailSeconds)
 	return err
 }
 
@@ -8166,7 +8255,8 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 
 // UsageDaily returns the per-(account, app, day) rollup rows that the
 // meterd rollup loop (pkg/meter/rollup.go) populated into the
-// usage_daily table (ADR-048 §5, migration 00067). day is a UTC
+// usage_daily table (ADR-048 §5, migration 00067; tail_seconds
+// added by issue #667 / ADR-078 / migration 00151). day is a UTC
 // midnight timestamp; only the date portion is used in the predicate
 // so a caller that already normalised to midnight does not have to
 // truncate again.
@@ -8180,7 +8270,7 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 	rows, err := s.pool.Query(ctx,
 		`select app_id, day, mb_seconds, requests, cpu_usec,
 		        tx_bytes, net_tx_bytes, net_rx_bytes,
-		        cold_boot_count, builder_seconds
+		        cold_boot_count, builder_seconds, tail_seconds
 		   from usage_daily
 		  where account_id = $1
 		    and day = ($2::timestamptz AT TIME ZONE 'UTC')::date
@@ -8193,7 +8283,7 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 	var out []DailyUsage
 	for rows.Next() {
 		u := DailyUsage{AccountID: accountID}
-		if err := rows.Scan(&u.AppID, &u.Day, &u.MBSeconds, &u.Requests, &u.CPUUsec, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount, &u.BuilderSeconds); err != nil {
+		if err := rows.Scan(&u.AppID, &u.Day, &u.MBSeconds, &u.Requests, &u.CPUUsec, &u.TXBytes, &u.NetTxBytes, &u.NetRxBytes, &u.ColdBootCount, &u.BuilderSeconds, &u.TailSeconds); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -9083,7 +9173,15 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// helper.
 		&a.EvictionPriority,
 		// Issue #560: per-app require_authn column.
-		&a.RequireAuthn); err != nil {
+		&a.RequireAuthn,
+		// Issue #477 / ADR-079: per-app public_auth. Both
+		// columns land positionally after require_authn. The
+		// mode column is NOT NULL DEFAULT 'open' so a plain
+		// *string scan is safe; the basic blob is nullable
+		// bytea (NULL when mode='open'|'bearer'), scanned
+		// into a *[]byte to keep the SQL NULL → Go nil
+		// convention explicit.
+		&a.PublicAuthMode, &a.PublicAuthBasicSealed); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -9146,7 +9244,9 @@ const appsSelectColumns = `
 	reassigned_at, migrated_at,
 	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms,
 	eviction_priority,
-	require_authn`
+	require_authn,
+	-- Issue #477 / ADR-079: per-app public_auth
+	public_auth_mode, public_auth_basic`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -9187,6 +9287,7 @@ const deploymentSelectColumns = `
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
+	override_liveness_probe,
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at`
@@ -9210,6 +9311,7 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
+	override_liveness_probe,
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at`
@@ -9265,6 +9367,7 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
+		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
@@ -9301,6 +9404,7 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
+		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
@@ -9325,6 +9429,14 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		var kind, statusStr string
 		var scanStatus *string
 		var scannedAt *time.Time
+		// Mirrors scanDeployment: keep the override_liveness_probe
+		// scan destination aligned with the SELECT projection in
+		// deploymentSelectColumns / WithRootfs — adding a new column
+		// there without adding it here triggers pgx's "number of
+		// field descriptions must equal number of destinations"
+		// runtime error on every ListDeploymentsForApp / Account
+		// read path. Caught by the pg-shard-2 unit suite
+		// (TestPg_CreateDeployment_*).
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -9332,6 +9444,7 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 			&d.OverrideEntrypoint, &d.OverrideCmd,
 			&d.OverrideEnv, &d.OverrideEnvSecrets,
 			&d.OverridePort, &d.OverrideHealthcheck,
+			&d.OverrideLivenessProbe,
 			&d.Sidecars, &d.MinInstances,
 			&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 			return nil, err
@@ -9446,7 +9559,7 @@ func scanInstances(rows pgx.Rows) ([]Instance, error) {
 // distinction survives the Scan trip (pgx returns untyped nil for NULL
 // TIMESTAMPTZ, which is exactly the marker we want to keep on the struct).
 //
-// tail_count is the 15th column (issue #667 / ADR-078, migration 00149).
+// tail_count is the 15th column (issue #667 / ADR-078, migration 00151).
 // NOT NULL DEFAULT 0 — every pre-#667 row reads as 0 (the column
 // default fills pre-migration rows), which is the correct "no active
 // tails" value schedd's reaper gate (PR 4) decisions are keyed on.
@@ -9486,7 +9599,7 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 // scanInstanceCols that also lifts framework_ready_at (PR #543 /
 // migration 00120), migrated_from_node_id, migrated_at, and
 // lease_token (Tier A5 / migration 00097, ADR-066), and
-// tail_count (issue #667 / ADR-078, migration 00149). Used by
+// tail_count (issue #667 / ADR-078, migration 00151). Used by
 // ListLiveInstancesOnNode and ListExpiredMigrations — the rest
 // of the codebase reads 15-column instances rows and doesn't
 // need the migration lineage. Column order matches the SELECTs
@@ -9553,7 +9666,7 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 // column (PR #470-FU-B migration 00112); for the retention sweep it's
 // always NULL (terminal rows pre-date the warm-capture path) but the
 // column is part of the row shape so we scan it for shape parity.
-// tail_count is the 15th column (issue #667 / ADR-078, migration 00149);
+// tail_count is the 15th column (issue #667 / ADR-078, migration 00151);
 // for the retention sweep it's always 0 (terminal rows have no active
 // tails) but the column is part of the row shape so we scan it for
 // shape parity.
@@ -9564,7 +9677,7 @@ func scanInstancesWithTerminal(rows pgx.Rows) ([]Instance, error) {
 		var started, lastReq, parked, frameworkReady, terminal *time.Time
 		// Column order matches ListInstancesInTerminalStatesOlderThan's
 		// SELECT (now 16 columns after migration 00028 added wake_id,
-		// 00112 added framework_ready_at, 00149 added tail_count,
+		// 00112 added framework_ready_at, 00151 added tail_count,
 		// before terminal_at).
 		if err := rows.Scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
 			&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID, &frameworkReady, &ins.TailCount, &terminal); err != nil {
@@ -11042,11 +11155,19 @@ func scanOrg(r rowScanner) (Org, error) {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on duplicate
 // PK, ErrOrgLastOwner when adding a second active owner would trip the
-// partial unique, ErrNotFound when the org row is missing,
-// ErrOrgMemberCapExceeded when the org's active-member count has
-// reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2 — the
-// defence-in-depth back-stop; consumeOrgInvitation runs the same
-// check, and cmd/apid's enforceMemberCap gates the handler path).
+// partial unique, ErrNotFound when the org row is missing.
+//
+// IAM-6 / ADR-061 PR 7 note: this method does NOT enforce
+// Plan.OrgMembersMax. The cap is only enforced inside
+// ConsumeOrgInvitation's tx (the load-bearing gate). The
+// initial-owner seed at org creation bypasses the cap by design —
+// the brand-new org has active=0, so the cap is non-binding — and
+// every subsequent membership insert flows through the consume
+// path which holds the lock + the count check. The earlier
+// comment claiming "cmd/apid's enforceMemberCap gates the handler
+// path" is stale; that helper is intentionally unwired
+// (cmd/apid/org_handler_helpers.go) and the future direct-add
+// route (PR-11 follow-up) is what would call it.
 func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

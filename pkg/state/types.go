@@ -452,6 +452,27 @@ type App struct {
 	// keep every new app public). Operators may PATCH true → false
 	// on any plan to opt out per-app.
 	RequireAuthn bool
+	// PublicAuthMode (issue #477 / ADR-079) is the per-app
+	// public-URL auth mode ('open'|'bearer'|'basic'). When
+	// 'open' (the default — every pre-existing app stays
+	// public-by-default), gatewayd-internal pass-throughs
+	// anonymous traffic. When 'bearer', gatewayd-internal
+	// demands an Authorization: Bearer header (re-using the
+	// require_authn key chain). When 'basic', gatewayd-internal
+	// demands an Authorization: Basic header and verifies
+	// against the secretbox-sealed PublicAuthBasicSealed
+	// blob. Plan-gated at PATCH time (open=all, bearer=Hobby+,
+	// basic=Pro+); the per-plan default is always 'open'.
+	PublicAuthMode string
+	// PublicAuthBasicSealed (issue #477 / ADR-079) is the
+	// secretbox-sealed APP_BASIC_AUTH blob carrying the
+	// {username, password} pair the basic-auth path verifies
+	// against. Nil/empty for open/bearer modes; set ONLY when
+	// PublicAuthMode='basic'. Gatewayd-internal unseals it
+	// at boot (and caches the unsealed form for 60s +
+	// db.NotifyKeyChanged invalidation) so the secretbox
+	// hot-path doesn't run on every request.
+	PublicAuthBasicSealed []byte
 	// WarmSnapshotMinRequests is the minimum successful request
 	// count before schedd promotes a warm-tier capture. Range
 	// [1, 100], default 5. Lowering this shortens the time to
@@ -775,6 +796,17 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
+	// OverrideLivenessProbe is the per-deployment liveness-probe
+	// override JSON (issue #554 / ADR-078). Mirrors
+	// OverrideHealthcheck — coalesce(override_liveness_probe,
+	// '{}'::jsonb) on the read side; nullable jsonb column
+	// (migrations/00154_deployment_liveness_probe.sql). The
+	// cmd/vmmd liveness_recv goroutine consumes the resolved
+	// struct (cmd/vmmd/liveness_recv.go::livenessProbeConfig) at
+	// every BringUp. Per-plan defaults (Hobby/Pro/Scale → 5s /
+	// 3 / 60s) are applied on the apid read path when this
+	// column is empty.
+	OverrideLivenessProbe json.RawMessage `json:"override_liveness_probe,omitempty"`
 	// Sidecars (issue #463 / ADR-068). Up to 2 stateless sidecars
 	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
 	// `deployments.sidecars` column (migration 00095). Field is
@@ -1466,14 +1498,14 @@ type Instance struct {
 	// the runner each time ctx.waitUntil(promise) is called and
 	// decremented when the task reaches a terminal outcome
 	// (completed / failed / timeout). Persisted in the `tail_count`
-	// column added by migrations/00149_wait_until_tail.sql and
+	// column added by migrations/00151_wait_until_tail.sql and
 	// mirrored here so schedd's reaper can read it without a
 	// second SQL hop. The schedd reaper treats instances with
 	// tail_count > 0 as NOT idle-eligible — the wake stays in
 	// RUNNING until the runner drains its tail tasks or the
 	// snapshotAndPark 5s watchdog fires (PR 4 wires that gate).
 	// Tail count is a column, not a state; the state machine is
-	// untouched. NOT NULL DEFAULT 0 enforced by migration 00149;
+	// untouched. NOT NULL DEFAULT 0 enforced by migration 00151;
 	// pre-existing rows are backfilled to 0 on apply.
 	TailCount int
 }
@@ -1641,6 +1673,12 @@ type DailyUsage struct {
 	NetRxBytes     int64
 	ColdBootCount  int64
 	BuilderSeconds int64
+	// TailSeconds (issue #667 / ADR-078) is the per-day wall-clock
+	// seconds this instance spent draining waitUntil tasks.
+	// INFORMATIONAL ONLY — does not enter billing. Pinned by
+	// pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds.
+	// Source: rollup.go::rollupSQL SUM(tail_seconds).
+	TailSeconds int64
 }
 
 // StorageUsage is the per-(account, app, day) row read by
@@ -1834,8 +1872,33 @@ type UpdateAppParams struct {
 	// plan may PATCH true → false to opt out per-app.
 	RequireAuthn    *bool
 	SetRequireAuthn bool
-	Status          *AppStatus
-	Manifest        *AppManifest
+	// PublicAuth (issue #477 / ADR-079) is the per-app
+	// public-URL auth block on the PATCH request. Three
+	// shapes:
+	//   - nil (the default): leave the apps row's
+	//     public_auth_mode + public_auth_basic columns
+	//     alone.
+	//   - non-nil with Mode="open": explicit opt-out back
+	//     to public-by-default; the sealed blob is cleared
+	//     so a stale secretbox row never reaches a fresh
+	//     request.
+	//   - non-nil with Mode="bearer": bearer auth gate
+	//     flips on; cleared blob.
+	//   - non-nil with Mode="basic": basic auth gate
+	//     flips on; sealed blob is populated from
+	//     Username/Password (or, in v1, env-var reference
+	//     names per the issue body).
+	// SetPublicAuth distinguishes "unset" (don't touch the
+	// columns) from "explicit {open,bearer,basic}" the same
+	// way SetRequireAuthn does. The apid PATCH validator
+	// enforces the plan gate (open=all, bearer=Hobby+,
+	// basic=Pro+) and the canonical mode enum; the secretbox
+	// seal happens at PATCH time so the gatewayd hot path
+	// only reads ciphertext.
+	PublicAuth    *AppPublicAuthUpdate
+	SetPublicAuth bool
+	Status        *AppStatus
+	Manifest      *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated
@@ -1865,6 +1928,45 @@ type UpdateAppParams struct {
 	ScalingPolicy    *ScalingPolicy
 	SetScalingPolicy bool
 }
+
+// AppPublicAuthUpdate (issue #477 / ADR-079) is the
+// per-app public-URL auth block carried on UpdateAppParams
+// + the apid PATCH /v1/apps/{slug} handler. The store
+// layer turns Mode + Sealed into the column pair
+// (public_auth_mode, public_auth_basic); the seal happens
+// at PATCH time (in the apid handler) so the on-row bytes
+// are always ciphertext and the store layer never sees
+// plaintext.
+//
+// Mode is the canonical 'open'|'bearer'|'basic' string
+// (must match apps_public_auth_mode_chk). Username +
+// Password are only meaningful when Mode='basic'; they
+// carry the plaintext the apid seal step encodes under
+// the APP_BASIC_AUTH secretbox namespace. For Mode='open'
+// or 'bearer', the apid handler ignores them (and clears
+// any existing sealed blob — Sealed is left nil).
+// Sealed carries the ciphertext the apid wrote; nil for
+// mode='open'|'bearer' (the store will NULL the column)
+// and non-nil for mode='basic' (the store will write it).
+type AppPublicAuthUpdate struct {
+	Mode     string
+	Username string
+	Password string
+	Sealed   []byte
+}
+
+// Canonical public-auth mode strings for the state
+// layer (issue #477 / ADR-079). Values must stay in sync
+// with the apps_public_auth_mode_chk CHECK constraint in
+// migrations/00153_apps_public_auth.sql AND with the
+// pkg/gateway's package-local copies. The three layers
+// (sqlc / state / gateway) all share the same vocabulary;
+// if a fourth is ever added, mirror the constant here.
+const (
+	AppPublicAuthModeOpen   = "open"
+	AppPublicAuthModeBearer = "bearer"
+	AppPublicAuthModeBasic  = "basic"
+)
 
 // Snapshot is one restoreable microVM state (spec §4.6, ADR-005).
 //

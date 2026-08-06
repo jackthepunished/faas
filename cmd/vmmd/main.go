@@ -30,7 +30,9 @@ import (
 
 	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
+	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -187,6 +189,17 @@ func loadNodeSigningKey() (*ecdsa.PrivateKey, string, error) {
 }
 
 const metricsPath = "/metrics"
+
+// ReportLivenessFailedCtxTimeout caps the vmmd→schedd
+// drain for the liveness-failed RPC (issue #554 / ADR-078).
+// 3 s matches the gRPC client default but is a separate,
+// named constant so a future ops review can lift the cap if
+// the schedd-side state-machine guard grows. The dial + RPC
+// are both bounded by this; a wedged schedd surfaces as a
+// log warning, the vmmd loop exits cleanly on its end, and
+// the next probe will re-trigger if the guest is still
+// wedged.
+const ReportLivenessFailedCtxTimeout = 3 * time.Second
 
 func main() {
 	wire.Daemon("vmmd", run)
@@ -548,6 +561,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// tail_event DGRAM receipt path mirrors the
 		// in-memory TailCount decrement to the SQL column.
 		WithTailTerminalStamper(tailStamper)
+	// Issue #554 / ADR-078 / PR review fix: wire the per-instance
+	// liveness probe registry + starter so the Manager's bringUp /
+	// Park hooks actually launch + cancel the probe loops. The
+	// defaultCfg carries the per-plan Hobby/Pro/Scale defaults
+	// (5 s period, 3 consecutive, 60 s cooldown) merged into
+	// per-deployment overrides at Wake time. The starter closure
+	// builds the cmd-side loop body via startLivenessLoopHelper
+	// (cmd/vmmd/liveness_recv.go). sink is wired below after
+	// scheddTarget is known.
+	mgr.WithLivenessProbes(
+		fcvm.NewLivenessRegistry(),
+		fcvm.LivenessProbeConfig{
+			Path:                "/healthz",
+			PeriodSeconds:       api.DefaultLivenessPeriodSeconds,
+			ConsecutiveFailures: api.DefaultLivenessConsecutiveFailures,
+			CooldownSeconds:     api.DefaultLivenessCooldownSeconds,
+			IdleResetOnDestroy:  true,
+		},
+	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
+		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, cfg)
+	})
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
 	// read Grype scan sidecars at boot time. Mirrors the VMM's
@@ -888,6 +922,62 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, nodeKey, nodeKeyID, log)
 		}
 		log.Info("vmmd: capacity publisher wired", "node_id", nodeID, "target", deps.scheddTarget, "interval", interval.String())
+	}
+
+	// Issue #554 / ADR-078 / PR-review fix F2: vmmd → schedd
+	// drain for the liveness-probe failure path. The per-instance
+	// poll goroutine (cmd/vmmd/liveness_recv.go::livenessProbeLoop)
+	// invokes Manager.ReportLivenessFailed once the
+	// consecutive-failure counter reaches the per-plan N. The
+	// relay dials schedd over the same gRPC channel the capacity
+	// publisher uses (deps.scheddTarget + deps.scheddClientTLS),
+	// calls scheddpb.ReportLivenessFailed, and ignores the
+	// returned ack — schedd's Engine.DestroyForLivenessFailure
+	// is the source of truth for the state transition, and the
+	// vmmd-side loop has already exited on its end.
+	//
+	// Why a fresh dial per call: the failure is rare (default
+	// 3 consecutive misses, with the plan's liveness cooldown
+	// keeping the per-app rate well under one-per-second), so
+	// the connection-pool cost is negligible vs. the complexity
+	// of maintaining a long-lived stream on a fire-and-forget
+	// path. The dial is bounded by ReportLivenessFailedCtxTimeout
+	// so a wedged schedd doesn't bleed back into the poll
+	// goroutine.
+	//
+	// Skipping on the single-box default-local path
+	// (deps.scheddTarget == ""): the liveness probe loop is
+	// still wired and will increment its counter, but the relay
+	// is a no-op. The single-box dev loop has no schedd to
+	// drain into; the operator runs the test on a multi-node
+	// fleet to exercise the full path. Mirrors the capacity
+	// publisher's gating above.
+	if deps.scheddTarget != "" {
+		mgr.WithLivenessSink(func(ctx context.Context, instanceID, reason string) {
+			dialCtx, cancel := context.WithTimeout(ctx, ReportLivenessFailedCtxTimeout)
+			defer cancel()
+			conn, err := wire.DialContext(dialCtx, deps.scheddTarget, deps.scheddClientTLS)
+			if err != nil {
+				log.Warn("vmmd: liveness-failed dial failed; engine will not be notified",
+					"instance_id", instanceID, "reason", reason, "err", err)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			cli := scheddpb.NewScheddClient(conn)
+			if _, err := cli.ReportLivenessFailed(dialCtx, &scheddpb.LivenessFailedReport{
+				InstanceId: instanceID,
+				Reason:     reason,
+			}); err != nil {
+				log.Warn("vmmd: ReportLivenessFailed RPC failed",
+					"instance_id", instanceID, "reason", reason, "err", err)
+				return
+			}
+			log.Info("vmmd: liveness-failure drained to schedd",
+				"instance_id", instanceID, "reason", reason)
+		})
+		log.Info("vmmd: liveness-failed relay wired",
+			"target", deps.scheddTarget,
+			"timeout", ReportLivenessFailedCtxTimeout.String())
 	}
 
 	// ADR-055 / Tier 1 Phase 4: the per-host egress policy watcher.

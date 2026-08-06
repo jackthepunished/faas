@@ -39,6 +39,14 @@ type SynthDispatcher interface {
 // auth (ADR-015) — only schedd is in the `faas` group, so the socket
 // IS the auth.
 //
+// Issue #675: in the Tier A7 production shape (`FAAS_GATEWAY_LISTEN=off`)
+// the customer publicHandler also rides this socket — gatewayd-public
+// forwards every inbound request here, and the mux routes synth paths
+// to the synth handlers and everything else to publicHandler. The
+// unified mux is built by the caller after SetHandler is invoked
+// (the publicHandler depends on apid + handler wiring that isn't
+// ready when synth is constructed at boot).
+//
 // The Move 1 follow-up split /v1/synthesize and /v1/invocations:dispatch
 // into two routes (rather than one body-discriminated POST) so the
 // dispatcher-surface widening above stays load-bearing: a future Move
@@ -48,39 +56,86 @@ type SynthServer struct {
 	dispatcher SynthDispatcher
 	log        *slog.Logger
 	srv        *http.Server
+	mux        *http.ServeMux
 	calls      atomic.Int64
 }
 
-// NewSynthServer wires the listener. socketPath is the unix-domain
-// path (e.g. /run/faas/gatewayd-internal.sock). dispatcher is the
-// gateway's wake/proxy path.
+// NewSynthServer wires the unix-socket listener on socketPath with the
+// synth dispatcher. The internal http.ServeMux is constructed here with
+// the three synth routes registered; callers that want to also serve
+// customer traffic on the same socket call SetHandler with a wrapping
+// mux that includes the customer publicHandler (issue #675).
+//
+// ReadHeaderTimeout pins the Slowloris attack surface (gosec G112).
+// The unix socket is DAC-gated (ADR-015), but we set the timeout
+// anyway — defense in depth + uniform config.
+//
+// Issue #675 / H2C: the server enables unencrypted HTTP/2 (H2C) on the
+// listener via srv.Protocols.SetUnencryptedHTTP2(true). This is the
+// Go 1.24+ replacement for the deprecated golang.org/x/net/http2/h2c
+// package — the stdlib now negotiates H2C + HTTP/1.1 on the same
+// listener with no wrapper. The customer publicHandler still speaks
+// HTTP/1.1 downstream; H2C is contained to the public→internal hop.
 func NewSynthServer(socketPath string, dispatcher SynthDispatcher, log *slog.Logger) *SynthServer {
 	if log == nil {
 		log = slog.Default()
 	}
-	mux := http.NewServeMux()
 	s := &SynthServer{socketPath: socketPath, dispatcher: dispatcher, log: log}
-	mux.HandleFunc("/v1/synthesize", s.handleSynthesize)
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc("/v1/synthesize", s.handleSynthesize)
 	// Move 1: schedd's drain posts here for event-shaped invocations
 	// (async_invoke / queue / delayed_task / cron). The response is
 	// the post-dispatch Invocation row (state + result envelope),
 	// which schedd's drain stores via Store.CompleteInvocation.
-	mux.HandleFunc("/v1/invocations:dispatch", s.handleInvocationDispatch)
-	mux.HandleFunc("/healthz", s.handleHealthz)
-	// ReadHeaderTimeout pins the Slowloris attack surface (gosec G112).
-	// The unix socket is DAC-gated (ADR-015), but we set the timeout
-	// anyway — defense in depth + uniform config.
+	s.mux.HandleFunc("/v1/invocations:dispatch", s.handleInvocationDispatch)
+	s.mux.HandleFunc("/healthz", s.handleHealthz)
 	s.srv = &http.Server{
-		Handler:           mux,
+		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// Enable H2C + HTTP/1.1 on this listener (issue #675). SetHTTP1
+	// is true by default but we set it explicitly so the intent is
+	// unambiguous for future readers. SetUnencryptedHTTP2 opts in to
+	// the in-process H2 prior-knowledge negotiation; the deprecated
+	// x/net/http2/h2c wrapper is no longer needed.
+	s.srv.Protocols = new(http.Protocols)
+	s.srv.Protocols.SetHTTP1(true)
+	s.srv.Protocols.SetUnencryptedHTTP2(true)
 	return s
+}
+
+// SetHandler replaces the http.Server's handler with `h`. Used by the
+// Tier A7 unified mux path (issue #675) — runWithDeps builds the
+// unified mux (synth routes mounted as a sub-mux + customer
+// publicHandler at the catch-all) and hands it here before Start.
+// Must be called before Start; calling after Start has no effect on
+// the already-serving server.
+func (s *SynthServer) SetHandler(h http.Handler) {
+	s.srv.Handler = h
+}
+
+// Mux returns the synth-only http.ServeMux registered in NewSynthServer.
+// Used by the Tier A7 unified-mux builder (issue #675) to mount the
+// three synth routes (`/v1/synthesize`, `/v1/invocations:dispatch`,
+// `/healthz`) as sub-handlers on the unified mux. Returns nil if the
+// server was constructed via the legacy fallback path.
+func (s *SynthServer) Mux() *http.ServeMux {
+	return s.mux
 }
 
 // Start binds the unix socket and starts serving. Returns when the
 // listener is ready; subsequent Serve blocks until the server stops.
 // Caller is responsible for the goroutine.
+//
+// Issue #675: the http.Server.Handler is whatever was passed to
+// NewSynthServer (or the synth-only fallback mux if nil was passed).
+// The unified mux carrying both the synth routes AND the customer
+// publicHandler is built by runWithDeps after both deps exist; the
+// caller hands the fully-built mux to NewSynthServer before Start.
 func (s *SynthServer) Start() error {
+	if s.srv == nil {
+		return fmt.Errorf("gateway synth: server not configured (call NewSynthServer first)")
+	}
 	// Remove any stale socket from a previous run (server crashed, etc).
 	// The platform treats the socket as owned by this process; recreate
 	// is safer than failing on EADDRINUSE.

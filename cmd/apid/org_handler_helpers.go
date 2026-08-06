@@ -104,6 +104,13 @@ func (s *server) rehydrateOrg(ctx context.Context, w http.ResponseWriter, mem *s
 // Problem and returns zero value + false. Other Store failures
 // write a 500 Problem. Used by inviteOrgMember + softDeleteOrg +
 // patchOrg + transferOrgOwnership.
+//
+// PR-7 cross-reference: the same personal-org gate re-engages
+// automatically on the convert-to-personal path described in
+// ADR-061 §"Personal-org downgrade (PR-7 design, code deferred to
+// PR-9)". Once a shared org has been converted (its `personal`
+// flag flipped to true), this helper refuses any subsequent PATCH
+// — no new code needed.
 func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.ResponseWriter, mem *state.OrgMembership) (state.Org, bool) {
 	org, err := s.store.OrgByID(ctx, mem.OrgID)
 	if err != nil {
@@ -134,6 +141,13 @@ func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.Response
 // store enforces the cap in-tx. A future direct-add route only
 // needs to call `s.enforceMemberCap(...)` (read as a TODO on
 // `cmd/apid/handlers_org_members.go`), the helper shape is final.
+//
+// PR-7 follow-up: this helper stays dead until PR-11 ships the
+// direct-add route (filed as a follow-up issue). The accept path
+// PR-7 added (`POST /v1/invitations/{token}/accept`) does NOT
+// call enforceMemberCap because the store-side cap check inside
+// ConsumeOrgInvitation is the load-bearing back-stop — see
+// handlers_org_invitations.go:166-167.
 
 // enforcePendingInvitationCap applies the per-plan
 // OrgPendingInvitationsMax limit on POST /v1/orgs/{slug}/members.

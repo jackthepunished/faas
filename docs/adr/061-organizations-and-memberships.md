@@ -217,6 +217,82 @@
   - Cross-org aggregate enterprise billing or consolidated invoices
     above a single org.
 
+- **Personal-org downgrade (PR-7 design, code deferred to PR-9):**
+
+  A customer on a paid shared org may want to dissolve the shared
+  org back to their personal org on downgrade (issue #190 §"team-
+  sale path"). The shape is settled at PR-7; the wire endpoint
+  lands in PR-9 alongside the per-seat billing cut-over because
+  both need dual-write cycles on the Stripe subscription-item
+  quantities (the inverse of the personal-org backfill in PR 3).
+
+  Four-step shape, gated by `authz.OrgActionTransferOwnership` so
+  only the current owner can dissolve:
+
+  1. **Transfer ownership.** If the owner wants to keep one
+     collaborator on the personal org, transfer to that account
+     first via `POST /v1/orgs/{slug}/transfer_ownership`. Otherwise
+     proceed to step 2 — the dissolving owner becomes the personal-
+     org member (they always were).
+  2. **Remove non-owner members.** `DELETE /v1/orgs/{slug}/
+     members/{user_id}` for every admin/developer/viewer/billing
+     member. Owner-only (PR-4 role matrix). The cap-in-tx back-stop
+     inside `RemoveOrgMember` is the load-bearing check — refusing
+     a removal that would leave zero members surfaces as
+     `org_last_owner` (409), which is the next step's tripwire.
+  3. **Convert the shared org to a personal org.**
+     `POST /v1/orgs/{slug}/convert_to_personal` (PR-9 wire). The
+     handler:
+     - Verifies the caller is the only remaining active member
+       (single-owner + zero other roles). Surfaces 409
+       `org_member_cap_exceeded` with the offending role if not.
+     - Stamps `orgs.personal = true` + flips the slug to the
+       caller's personal-org slug (already enforced by the PR-3
+       backfill — no rename conflict).
+     - Migrates any org-scoped API keys (PR-6) to account-scoped
+       by clearing `org_id` (the keys stay live; the account's
+       personal org is the new scope).
+     - Migrates any Stripe subscription-item quantities to the
+       account's personal-org plan (PR-9 cut-over).
+     - Emits `org.converted_to_personal` (new audit kind, dotted
+       convention per ADR-035).
+  4. **Re-engage personal-org immutability.** `loadMutableOrgByMembership`
+     (already in place from PR-5 at
+     `cmd/apid/org_handler_helpers.go:101-122`) refuses any
+     `PATCH /v1/orgs/{slug}` whose slug resolves to a personal
+     org — same posture as the per-add gate. No new code needed;
+     the immutability guard re-engages automatically because the
+     row's `personal` flag is now true.
+
+  **Why PR-9 and not PR-7:** PR-9 ships the per-seat pricing
+  cut-over (PR-7's `seat_usage` endpoint is visibility-only — no
+  billing change). The convert endpoint mutates Stripe
+  subscription-item quantities, which only PR-9 has the dual-write
+  scaffolding for. PR-7 lands the design + the audit-kind contract
+  + the `cmd/apid/org_handler_helpers.go` cross-reference so a
+  future contributor reading the helpers knows where the design
+  lives.
+
+  **Failure modes the convert handler must guard:**
+
+  - Conversion with multiple members → 409 `org_member_cap_exceeded`
+    ("the personal org caps at 1 active member; remove members
+    first").
+  - Conversion with pending invitations → 409
+    `org_invitation_cap_exceeded` ("revoke pending invitations
+    first"). Mirrors the per-add gate at PR-2.
+  - Conversion with non-zero metered usage in the current period
+    → 409 `org_conversion_window_active` (PR-9 introduces the
+    invoice-cut posture: a metered period in flight cannot be
+    folded into the personal-org subscription mid-stream).
+
+  **Open follow-ups (filed as separate issues):** PR-9 implements
+  the wire endpoint + the Stripe cut-over; PR-10 ships
+  `ListEventsByOrg(ctx, orgID, limit)` for the dashboard's "this
+  org's activity" tab so `org.converted_to_personal` shows up in
+  the timeline (the partial jsonb index
+  `migrations/00NNN_events_org_id_idx.sql` lands with PR-10).
+
 - **Compatibility notes:**
 
   - All existing APIs continue to work during the dual window. Flat

@@ -1,0 +1,49 @@
+/* generated using openapi-typescript-codegen -- do not edit */
+/* istanbul ignore file */
+/* tslint:disable */
+/* eslint-disable */
+/**
+ * Liveness-probe shape on the deploy-time override object (issue #554 / ADR-078).
+ * The probe is the Cloud-Run-parity primitive that asks "is the VM still
+ * responding?" — a wedged guest (busy-loop, leaked fd, deadlocked runner)
+ * sits resident billing RAM-hours while serving 5xx until the §13 idle
+ * reaper eventually fires. The liveness probe replaces that wait with the
+ * short, customer-visible path: 3 consecutive failures → destroy →
+ * cold-boot from rootfs (per ADR-005 — never snapshot-restore).
+ *
+ * Distinct from `DeploymentHealthcheck`: readiness is "accept traffic?",
+ * liveness is "still alive?". A passing readiness but failing liveness
+ * is the canonical "wake succeeded, then the runtime died" failure mode
+ * that this primitive is designed to catch.
+ *
+ * Validation rules (enforced in `pkg/api/dto.go::CreateDeploymentOverrides.Validate`):
+ * - `path` must start with `/`.
+ * - `interval_s` ∈ [0, 60] (0 = inherit per-plan default; Hobby/Pro/Scale → 5 s).
+ * - `timeout_s` ∈ [0, 5] (0 = inherit 2 s).
+ * - `consecutive_failures` ∈ [0, 10] (0 = inherit per-plan default; Hobby/Pro/Scale → 3).
+ *
+ * Per-deployment overrides of `interval_s` / `timeout_s` / `consecutive_failures`
+ * are clamped to the bounds above. The counter resets to 0 on the first 2xx
+ * and survives an intermittent 5xx across the consecutive window (AC #2:
+ * flaky app does NOT oscillate).
+ *
+ */
+export type DeploymentLivenessProbe = {
+  /**
+   * Path the probe requests from the guest; must start with `/` (e.g. `/healthz`). Reuses the runner's existing `:8080` listener — no runner changes (issue #554 §4).
+   */
+  path: string;
+  /**
+   * Per-plan poll cadence in seconds; 0 = inherit per-plan default (Hobby/Pro/Scale → 5 s). Clamped to [MinLivenessPeriodSeconds=1, MaxLivenessPeriodSeconds=60].
+   */
+  interval_s?: number;
+  /**
+   * Per-probe HTTP timeout in seconds; 0 = inherit 2 s default (VsockLivenessTimeoutMs). A timeout is treated identically to a non-2xx response by the failure counter.
+   */
+  timeout_s?: number;
+  /**
+   * N at which DestroyForLivenessFailure fires; 0 = inherit per-plan default (Hobby/Pro/Scale → 3). The counter is reset to 0 on the first 2xx and survives an intermittent 5xx across the consecutive window (AC #2 — flaky app does NOT oscillate).
+   */
+  consecutive_failures?: number;
+};
+

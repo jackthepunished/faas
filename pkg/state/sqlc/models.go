@@ -186,6 +186,36 @@ type AppTrustedSigner struct {
 	AddedByAccountID pgtype.UUID
 }
 
+type AppWebhook struct {
+	ID           pgtype.UUID
+	AppID        pgtype.UUID
+	AccountID    pgtype.UUID
+	TargetUrl    string
+	SecretSealed []byte
+	EventFilter  []string
+	RetryPolicy  string
+	Enabled      bool
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+}
+
+type AppWebhookDelivery struct {
+	ID               pgtype.UUID
+	WebhookID        pgtype.UUID
+	AppID            pgtype.UUID
+	AccountID        pgtype.UUID
+	Event            string
+	Payload          []byte
+	Attempt          int32
+	Status           string
+	LastError        pgtype.Text
+	LastResponseCode pgtype.Int4
+	NextAttemptAt    pgtype.Timestamptz
+	DeliveredAt      pgtype.Timestamptz
+	CreatedAt        pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
+}
+
 type Build struct {
 	ID           pgtype.UUID
 	DeploymentID pgtype.UUID
@@ -425,6 +455,7 @@ type Instance struct {
 	MigratedAt         pgtype.Timestamptz
 	LeaseToken         pgtype.Text
 	FrameworkReadyAt   pgtype.Timestamptz
+	TailCount          int32
 }
 
 type Invocation struct {
@@ -630,8 +661,9 @@ type UsageDaily struct {
 	ColdBootCount  int64
 	BuilderSeconds int64
 	// Timestamp the meterd cron last wrote this row. Stamped on every ON CONFLICT update so a stuck cron is visible in /v1/usage/daily metadata.
-	RolledUpAt pgtype.Timestamptz
-	OrgID      pgtype.UUID
+	RolledUpAt  pgtype.Timestamptz
+	OrgID       pgtype.UUID
+	TailSeconds int64
 }
 
 type UsageMinute struct {
@@ -656,6 +688,7 @@ type UsageMinute struct {
 	// Build kind parallel to builds.kind (railpack / dockerfile / tarball); 'none' for non-build rows. ADR-048. Informational — not billed.
 	BuilderKind string
 	OrgID       pgtype.UUID
+	TailSeconds int64
 }
 
 type UsageMonthly struct {

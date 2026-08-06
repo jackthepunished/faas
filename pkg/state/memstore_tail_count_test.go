@@ -59,7 +59,7 @@ func TestMemStore_BumpInstanceTailCount_AddsAndReturnsPostValue(t *testing.T) {
 	m := newMemStoreForTest()
 	ins := seedTailCountInstanceRow(t, m)
 
-	// Fresh row starts at 0 (DEFAULT 0 from migration 00149).
+	// Fresh row starts at 0 (DEFAULT 0 from migration 00151).
 	got, err := m.InstanceByID(ctx, ins.ID)
 	if err != nil {
 		t.Fatalf("read fresh: %v", err)
@@ -113,7 +113,7 @@ func TestMemStore_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	}
 
 	// Decrement to 2.
-	if err := m.DecrementInstanceTailCount(ctx, ins.ID); err != nil {
+	if err := m.DecrementInstanceTailCount(ctx, ins.ID, 1); err != nil {
 		t.Fatalf("decrement: %v", err)
 	}
 	got, _ := m.InstanceByID(ctx, ins.ID)
@@ -122,7 +122,7 @@ func TestMemStore_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	}
 
 	// Decrement to 1.
-	if err := m.DecrementInstanceTailCount(ctx, ins.ID); err != nil {
+	if err := m.DecrementInstanceTailCount(ctx, ins.ID, 1); err != nil {
 		t.Fatalf("decrement: %v", err)
 	}
 	got, _ = m.InstanceByID(ctx, ins.ID)
@@ -131,7 +131,7 @@ func TestMemStore_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	}
 
 	// Drain to 0.
-	if err := m.DecrementInstanceTailCount(ctx, ins.ID); err != nil {
+	if err := m.DecrementInstanceTailCount(ctx, ins.ID, 1); err != nil {
 		t.Fatalf("decrement: %v", err)
 	}
 	got, _ = m.InstanceByID(ctx, ins.ID)
@@ -143,7 +143,7 @@ func TestMemStore_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	// underflow. A stale receipt from a parked instance is the
 	// expected source of such drift; the snapshotAndPark 5s
 	// watchdog force-parks regardless.
-	if err := m.DecrementInstanceTailCount(ctx, ins.ID); err != nil {
+	if err := m.DecrementInstanceTailCount(ctx, ins.ID, 1); err != nil {
 		t.Fatalf("stray decrement: %v", err)
 	}
 	got, _ = m.InstanceByID(ctx, ins.ID)
@@ -187,7 +187,7 @@ func TestMemStore_BumpDecrement_MissingRowReturnsErrNotFound(t *testing.T) {
 	if _, err := m.BumpInstanceTailCount(ctx, missing, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("BumpInstanceTailCount on missing = %v, want ErrNotFound", err)
 	}
-	if err := m.DecrementInstanceTailCount(ctx, missing); !errors.Is(err, ErrNotFound) {
+	if err := m.DecrementInstanceTailCount(ctx, missing, 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("DecrementInstanceTailCount on missing = %v, want ErrNotFound", err)
 	}
 }

@@ -37,21 +37,26 @@ alter table instances
 --    shape from migrations 00055_usage_minutes_cpu.sql and
 --    00067_extend_metering_telemetry.sql). Sampler writes via the new
 --    tailSeconds parameter on AppendUsage; rollup propagates to
---    usage_daily on the next SummarizeUsage tick.
+--    usage_daily on the next RollupOnce tick.
 --
 --    IMPORTANT (ADR-078 §"Tail is informational"): tail_seconds does
 --    NOT enter Math.GBHours, Provider.PushUsageRecord, providerOpsFor,
 --    or any Stripe/Paddle payload shape. The billable math is
 --    unchanged. A permanent guard test
---    pkg/meter/pusher_test.go::TestPushHour_ExcludesTailSeconds pins
---    this — a follow-up ADR would have to remove it.
+--    pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds
+--    pins this — a follow-up ADR would have to remove it.
 alter table usage_minutes
   add column if not exists tail_seconds bigint not null default 0;
 
 -- Mirror on the rollup table usage_daily so the daily panel can show
--- tail latency without joining back to usage_minutes. Additive merge
--- via SummarizeUsage's INSERT … ON CONFLICT additive-merge clause.
--- See pkg/meter/rollup.go::SummarizeUsage for the rollup wiring.
+-- tail latency without joining back to usage_minutes. The rollup
+-- OVERWRITES tail_seconds on conflict (col = EXCLUDED.col) — the
+-- day-grain is a point-in-time snapshot of the cumulative
+-- SUM(tail_seconds) over the day window, so re-aggregation on the
+-- next cron tick converges to the same value. Additive merge would
+-- multiply by the tick count (~288× at 5-min cadence). Pinned by
+-- pkg/meter/rollup_test.go::TestRollupSQL_OverwriteSemantics.
+-- See pkg/meter/rollup.go::RollupOnce / RollupLoop for the wiring.
 alter table usage_daily
   add column if not exists tail_seconds bigint not null default 0;
 

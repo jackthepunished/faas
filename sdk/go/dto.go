@@ -105,4 +105,17 @@ type (
 	BuildDone      = api.BuildDone
 	BuildFramework = api.BuildFramework
 	AppManifest    = api.AppManifest
+
+	// Issue #477 / ADR-079: per-app public-URL auth. Both
+	// the write-block (PublicAuthBlock, embedded on
+	// UpdateAppRequest) and the read-side status
+	// (PublicAuthStatus, embedded on AppResponse) are
+	// re-exported so a caller can read the resolved mode +
+	// has_basic_creds bool off AppResponse without going
+	// through the internal package. The alias preserves
+	// identity (a faas.PublicAuthStatus IS an
+	// api.PublicAuthStatus), so the explanatory godoc on
+	// internal/api.PublicAuthStatus renders correctly.
+	PublicAuthBlock  = api.PublicAuthBlock
+	PublicAuthStatus = api.PublicAuthStatus
 )

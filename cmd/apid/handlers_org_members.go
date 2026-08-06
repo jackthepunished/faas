@@ -248,7 +248,7 @@ func (s *server) changeOrgMemberRole(w http.ResponseWriter, r *http.Request, acc
 		}
 		return
 	}
-	s.audit.Emit(r.Context(), "org.member_role_changed", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "org.member.role_changed", &acct.ID, map[string]any{
 		"org_id":         mem.OrgID,
 		"target_account": targetID,
 		"new_role":       string(role),
@@ -310,7 +310,7 @@ func (s *server) removeOrgMember(w http.ResponseWriter, r *http.Request, acct st
 		}
 		return
 	}
-	s.audit.Emit(r.Context(), "org.member_removed", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "org.member.removed", &acct.ID, map[string]any{
 		"org_id":         mem.OrgID,
 		"target_account": targetID,
 	})

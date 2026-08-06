@@ -44,7 +44,7 @@ import (
 // satisfies this for both PgStore and the in-memory test store.
 type stateStamper interface {
 	SetInstanceFrameworkReadyAt(ctx context.Context, id string, readyAt time.Time) error
-	DecrementInstanceTailCount(ctx context.Context, id string) error
+	DecrementInstanceTailCount(ctx context.Context, id string, n int32) error
 }
 
 // stamperFromStore adapts the State methods to the local
@@ -97,7 +97,12 @@ func (p *storeStamper) SetFrameworkReadyAt(ctx context.Context, instance string,
 // the receipt; the snapshotAndPark 5s watchdog force-parks
 // regardless.
 func (p *storeStamper) DecrementInstanceTailCount(ctx context.Context, instance string) error {
-	if err := p.store.DecrementInstanceTailCount(ctx, instance); err != nil {
+	// The TailTerminalStamper interface is the per-receipt (single-step)
+	// layer; the watchdog's bulk decrement (n = unfinished count) is
+	// issued directly from pkg/sched/engine.snapshotAndPark against
+	// state.Store, not through this adapter. So this entry point
+	// always passes 1.
+	if err := p.store.DecrementInstanceTailCount(ctx, instance, 1); err != nil {
 		p.log.Warn("vmmd: tail_terminal stamper persist",
 			"instance", instance, "err", err)
 		return err

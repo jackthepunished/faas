@@ -73,6 +73,22 @@ type UpdateAppRequest struct {
 	// CPU path). Pro/Scale only; Free/Hobby return 403 CodePlanScaleUpNotAllowed.
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
+	// PublicAuth (issue #477 / ADR-079) is the per-app
+	// public-URL auth configuration write shape. nil →
+	// leave the column untouched (the apid path's
+	// SetPublicAuth=false semantics). When present, Mode
+	// is the closed enum {open, bearer, basic}; BasicUser
+	// + BasicPass are PLAINTEXT at PATCH time — the apid
+	// seal step encrypts them under the APP_BASIC_AUTH
+	// secretbox namespace before persistence. Both
+	// fields are required iff Mode='basic'. Plan-gated
+	// upstream: Free + bearer/basic = 402
+	// plan_public_auth_*_not_allowed (Free/Hobby + basic =
+	// 402; Hobby + bearer = ok). Use
+	// Client.SetAppPublicAuth for the common one-liner;
+	// this field is exposed for callers that bundle
+	// public_auth into a wider PATCH.
+	PublicAuth *PublicAuthBlock `json:"public_auth,omitempty"`
 }
 
 // RenameAppRequest is the body of POST /v1/apps/{slug}/rename (issue #63).
@@ -119,7 +135,18 @@ type AppResponse struct {
 	// so a customer calling CreateApp with RequireAuthn=true
 	// on the CLI just needs the token set on the client.
 	RequireAuthn bool `json:"require_authn"`
-	IdleTimeoutS int  `json:"idle_timeout_s,omitempty"`
+	// PublicAuth (issue #477 / ADR-079) is the per-app
+	// public-URL auth configuration. Mode is the closed
+	// enum {open, bearer, basic}; HasBasicCreds is true
+	// iff the row carries a sealed APP_BASIC_AUTH blob.
+	// The plaintext basic_user / basic_pass are NEVER
+	// returned on this surface — the apid redaction
+	// posture is a load-bearing invariant (see
+	// ADR-079 §Decision "re-redaction invariant"). To
+	// rotate credentials, the customer PATCHes a fresh
+	// public_auth block.
+	PublicAuth   *PublicAuthStatus `json:"public_auth,omitempty"`
+	IdleTimeoutS int               `json:"idle_timeout_s,omitempty"`
 	// MinInstances is the per-app cold-wake floor (ux_spec §6.5).
 	// 0 => scale to zero; >0 => keep N warm. Pro/Scale only.
 	MinInstances int    `json:"min_instances"`
@@ -893,6 +920,20 @@ type InvitationWithTokenResponse struct {
 type InvitationListResponse struct {
 	Invitations []OrgInvitationResponse `json:"invitations"`
 }
+
+// SeatUsageResponse is the body of GET
+// /v1/orgs/{slug}/seat_usage. Visibility-only — PR 9 ships the
+// per-seat pricing cut-over per ADR-061 §"Out of scope". `limit`
+// returns 0 for the free plan (the fail-closed accessor shape
+// the dashboard renders as "personal org only").
+type SeatUsageResponse struct {
+	Used  int    `json:"used"`
+	Limit int    `json:"limit"`
+	Plan  string `json:"plan"`
+}
+
+// ChangeMemberRoleRequest is the body of PATCH
+// /v1/orgs/{slug}/members/{user_id}. Role cannot be `owner`.
 
 // ScanSeverityCounts is the per-severity CVE tally on a per-deploy
 // grype scan (issue #464 / ADR-075). Each counter is the number of

@@ -454,6 +454,18 @@ const (
 	// gate and the request gate are distinct failure modes.
 	CodePlanRequireAuthnNotAllowed = "plan_require_authn_not_allowed"
 
+	// Issue #477 / ADR-079 — public-URL auth mode gate. Free apps
+	// stay on the no-signup-friction path (open-only); Hobby unlocks
+	// 'bearer'; Pro+ unlocks both 'bearer' and 'basic'. 402 mirrors
+	// the streaming / warm-snapshot / eviction-priority / crons /
+	// alert-rules / webhooks gate family — a deliberate plan-tier
+	// choice that requires customer action (upgrade), not a retry.
+	// Distinct codes per mode so the CLI can render "bearer is
+	// Hobby+" vs "basic is Pro+" alongside the existing 402-family
+	// copy without conflating them in telemetry.
+	CodePlanPublicAuthBearerNotAllowed = "plan_public_auth_bearer_not_allowed"
+	CodePlanPublicAuthBasicNotAllowed  = "plan_public_auth_basic_not_allowed"
+
 	// Issue #470 / ADR-055: out-of-range warm-snapshot threshold
 	// values from a PATCH (warm_snapshot_min_requests outside [1,
 	// 100] or warm_snapshot_min_ms outside [100, 60000]). 422 with
@@ -540,6 +552,15 @@ const (
 	CodeInvalidMaxInstances                        = "invalid_max_instances"
 	CodeInvalidCooldown                            = "invalid_cooldown"
 	CodeScalingTargetIncompatibleWithWorkloadClass = "scaling_target_incompatible_with_workload_class"
+
+	// Issue #554 / ADR-078: liveness probe plan gate. The 403
+	// surfaces on a Free-customer request that includes
+	// `overrides.liveness_probe`; apid reads
+	// Plan.LivenessAllowed() and short-circuits BEFORE the DB is
+	// touched. Mirrors the CodePlanRequireAuthnNotAllowed /
+	// CodePlanMinInstancesNotAllowed shape so the CLI renders the
+	// same "your plan does not unlock X" template.
+	CodePlanLivenessProbeNotAllowed = "plan_liveness_probe_not_allowed"
 
 	// Account self-service (spec §17 G6, ADR-021). The
 	// "confirm_required" code is returned when a DELETE arrives without
@@ -868,6 +889,12 @@ func StatusForCode(code string) int {
 	// (2026-07-31): Hobby+ tier-up for max_instances. 403 mirrors
 	// CodePlanMinInstancesNotAllowed.
 	case CodePlanMaxInstancesNotAllowed:
+		return http.StatusForbidden
+	// Issue #554 / ADR-078: liveness probe plan gate. 403 mirrors
+	// CodePlanMaxInstancesNotAllowed / CodePlanEgressAllowlistNotAllowed
+	// so the CLI's "your plan does not unlock X" template renders
+	// uniformly.
+	case CodePlanLivenessProbeNotAllowed:
 		return http.StatusForbidden
 	case CodeInvalidMaxInstances, CodeInvalidCooldown,
 		CodeScalingTargetIncompatibleWithWorkloadClass:
@@ -1220,6 +1247,37 @@ func ErrPlanEvictionPriorityReservedNotAllowed(p Plan) *Problem {
 		"Reserved eviction priority is not available on this plan",
 		fmt.Sprintf("the %s plan does not include the reserved eviction tier; upgrade to Hobby or above to opt in. The 'best_effort' tier is available on every plan.", p)).
 		WithDocs("https://docs.gregale.dev/plans#eviction-priority")
+}
+
+// ErrPlanPublicAuthBearerNotAllowed is the 402 apid returns when a
+// Free customer PATCHes public_auth_mode='bearer' (issue #477 /
+// ADR-079). The plan DOES have a tier — 'open' — that the customer
+// can already use; the upgrade copy is "bearer is a paid feature".
+// 402 PaymentRequired mirrors the streaming / warm-snapshot /
+// eviction-priority / cron / alert-rules / webhooks gate family so
+// the dashboard renders the same "upgrade to X" CTA. Distinct code
+// from ErrPlanPublicAuthBasicNotAllowed below so the CLI + telemetry
+// can pivot on the mode without parsing the message body.
+func ErrPlanPublicAuthBearerNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanPublicAuthBearerNotAllowed,
+		"Bearer public-URL auth is not available on this plan",
+		fmt.Sprintf("the %s plan does not include bearer-mode public auth; upgrade to Hobby or above to opt in. The 'open' mode is available on every plan.", p)).
+		WithDocs("https://docs.gregale.dev/plans#public-auth")
+}
+
+// ErrPlanPublicAuthBasicNotAllowed is the 402 apid returns when a
+// Free/Hobby customer PATCHes public_auth_mode='basic' (issue #477 /
+// ADR-079). The plan DOES have tiers — 'open' (every plan) and
+// 'bearer' (Hobby+) — that the customer can already use; the upgrade
+// copy is "basic is Pro+". 402 PaymentRequired mirrors the existing
+// 402 gate family. Distinct code from
+// ErrPlanPublicAuthBearerNotAllowed above so the CLI + telemetry can
+// pivot on the mode.
+func ErrPlanPublicAuthBasicNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanPublicAuthBasicNotAllowed,
+		"Basic public-URL auth is not available on this plan",
+		fmt.Sprintf("the %s plan does not include basic-mode public auth; upgrade to Pro or above to opt in. The 'open' and 'bearer' modes are available on lower plans.", p)).
+		WithDocs("https://docs.gregale.dev/plans#public-auth")
 }
 
 // ErrPlanEvictionPriorityReservedQuota is the 422 apid returns when
@@ -1799,6 +1857,22 @@ func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
 		"Plan doesn't allow an egress allowlist",
 		fmt.Sprintf("the %s plan cannot pin an egress IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
 		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+}
+
+// ErrPlanLivenessProbeNotAllowed (issue #554 / ADR-078) is returned when a
+// Free account tries to pin a per-deployment liveness probe override. The
+// gate is the same shape as ErrPlanEgressAllowlistNotAllowed /
+// ErrPlanMinInstancesNotAllowed: Free's Plan.LivenessAllowed() returns
+// false; the apid createDeployment handler short-circuits with this 403
+// BEFORE the DB is touched. Hobby/Pro/Scale inherit the 5s / 3 / 60s / 3 in
+// 300s defaults and accept the override. The plan is named in the body so
+// a CLI prompt can render "upgrade to Hobby to unlock liveness" without a
+// second lookup.
+func ErrPlanLivenessProbeNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLivenessProbeNotAllowed,
+		"Plan doesn't allow a liveness probe",
+		fmt.Sprintf("the %s plan cannot pin a liveness probe; upgrade to Hobby or above to unlock the Cloud-Run-parity primitive.", p)).
+		WithDocs("https://docs.gregale.dev/deploy-overrides#liveness-probe")
 }
 
 // ErrEgressAllowlistTooLong (ADR-031) is returned when the PATCH carries more
