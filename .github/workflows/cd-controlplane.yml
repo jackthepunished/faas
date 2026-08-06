@@ -15,9 +15,7 @@
 name: cd-controlplane
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:  # manual trigger for debugging
+  workflow_dispatch:  # manual trigger for deliberate deployment
 
 concurrency:
   group: cd-cp-${{ github.ref }}
