@@ -285,9 +285,9 @@ func cmdApps() int {
 // the `gregale app list` table. Prefix matches the customer's
 // observable auth state:
 //
-//   "AUTH: open"               — public, anonymous traffic allowed.
-//   "AUTH: required"           — require_authn=true (bearer or open).
-//   "AUTH: required + basic"   — bearer-mode chain + basic creds set.
+//	"AUTH: open"               — public, anonymous traffic allowed.
+//	"AUTH: required"           — require_authn=true (bearer or open).
+//	"AUTH: required + basic"   — bearer-mode chain + basic creds set.
 //
 // Suffix renders "since YYYY-MM-DD" only when auth_default_flipped_at
 // is non-null (pre-flip apps grand-fathered by migration 00156).

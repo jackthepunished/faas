@@ -153,12 +153,12 @@ func TestMigrations_00156_AppsAuthDefaultFlip(t *testing.T) {
 		t.Errorf("audit row actor_account_id = %v, want NULL (migration-emitted, no actor account)", *actorAccountID)
 	}
 	var parsed struct {
-		MigratedCount              int64            `json:"migrated_count"`
-		FromRequireAuthnDefault    bool             `json:"from_require_authn_default"`
-		ToRequireAuthnDefault      bool             `json:"to_require_authn_default"`
-		FromPublicAuthModeDefault  string           `json:"from_public_auth_mode_default"`
-		ToPublicAuthModeDefault    string           `json:"to_public_auth_mode_default"`
-		PlanOverrides              map[string]struct {
+		MigratedCount             int64  `json:"migrated_count"`
+		FromRequireAuthnDefault   bool   `json:"from_require_authn_default"`
+		ToRequireAuthnDefault     bool   `json:"to_require_authn_default"`
+		FromPublicAuthModeDefault string `json:"from_public_auth_mode_default"`
+		ToPublicAuthModeDefault   string `json:"to_public_auth_mode_default"`
+		PlanOverrides             map[string]struct {
 			RequireAuthn   bool   `json:"require_authn"`
 			PublicAuthMode string `json:"public_auth_mode"`
 		} `json:"plan_overrides"`

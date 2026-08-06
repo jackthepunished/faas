@@ -653,8 +653,8 @@ var planLimits = map[Plan]Limits{
 		// token gate isn't unlocked on Free (RequireAuthn=false above);
 		// matching the default literal avoids customers creating a
 		// Free app and immediately seeing 401 from the gateway.
-		RequireAuthnDefault:    false,
-		PublicAuthModeDefault:  "open",
+		RequireAuthnDefault:   false,
+		PublicAuthModeDefault: "open",
 		// IAM-5 (issue #189): Free gets 3 keys — one for the customer's
 		// primary deploy target + one for a staging slot + one for
 		// break-glass. The abuse-vector (scripted key rotation under
@@ -830,8 +830,8 @@ var planLimits = map[Plan]Limits{
 		// a Hobby customer with mode='bearer' default would have no
 		// way to authenticate). Customers who want the bearer
 		// experience upgrade to Pro.
-		RequireAuthnDefault:    true,
-		PublicAuthModeDefault:  "open",
+		RequireAuthnDefault:   true,
+		PublicAuthModeDefault: "open",
 		// IAM-5 (issue #189): Hobby gets 10 keys — 2 per app across
 		// the Hobby app budget (5) keeps every deploy target
 		// (CI / staging / prod / personal / monitoring) with a
@@ -1004,8 +1004,8 @@ var planLimits = map[Plan]Limits{
 		// above). Default new apps to (true, "bearer") so the customer
 		// inherits secure-by-default. The opt-out path --no-require-authn
 		// --public-auth=open is universal across all plans and gates.
-		RequireAuthnDefault:    true,
-		PublicAuthModeDefault:  "bearer",
+		RequireAuthnDefault:   true,
+		PublicAuthModeDefault: "bearer",
 		// IAM-5 (issue #189): Pro gets 50 keys — 2 per app across the
 		// Pro app budget (25) plus a per-team allowance (CI / staging
 		// / prod / personal / monitoring / break-glass).
@@ -1173,8 +1173,8 @@ var planLimits = map[Plan]Limits{
 		// secure-by-default literal (true, "bearer") applies. A future
 		// tier between Pro and Scale that unlocks mTLS would move
 		// the literal here as part of the same PR.
-		RequireAuthnDefault:    true,
-		PublicAuthModeDefault:  "bearer",
+		RequireAuthnDefault:   true,
+		PublicAuthModeDefault: "bearer",
 		// IAM-5 (issue #189): Scale gets 200 keys — 2 per app across
 		// the Scale app budget (100) plus a per-team allowance, with
 		// headroom for the rotating-CI shape of a SaaS-scale customer.
