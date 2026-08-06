@@ -60,6 +60,18 @@ func (f *fakeVmmdClient) ForwardHTTPStream(_ context.Context, _ ...grpc.CallOpti
 	return f.Stream, nil
 }
 
+// ForwardRawStream (issue #676 / ADR-080) is the raw-bytes
+// bridge for Upgrade traffic (WebSocket / h2c / MQTT-over-WS /
+// long-poll). The PR-3 gateway forwarder opens this stream when
+// it detects Connection: Upgrade + Upgrade: <token>; until then
+// no gateway code path reaches it, so the stub panics with a
+// distinctive message so an accidentally-wired test surfaces
+// the mistake immediately rather than silently round-tripping
+// through the legacy ForwardHTTPStream path.
+func (f *fakeVmmdClient) ForwardRawStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], error) {
+	panic("ForwardRawStream: not stubbed (PR-3 ships the gateway forwarder — set fakeVmmdClient.RawStream)")
+}
+
 // All other RPCs panic — the forwarder only calls ForwardHTTPStream.
 func (f *fakeVmmdClient) CreateFromSnapshot(context.Context, *vmmdpb.CreateFromSnapshotRequest, ...grpc.CallOption) (*vmmdpb.WakeResponse, error) {
 	panic("CreateFromSnapshot: not stubbed")
