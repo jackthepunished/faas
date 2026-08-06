@@ -418,7 +418,7 @@ type parseFWReadyMsg struct {
 	// closed enum byte (1=completed, 2=failed, 3=timeout);
 	// ElapsedMs is the wall-clock duration from waitUntil
 	// registration to terminal in milliseconds.
-	Tail      parseFWReadyTailWire
+	Tail parseFWReadyTailWire
 }
 
 // parseFWReadyTailWire is the type=0x04 body view (issue #667 /

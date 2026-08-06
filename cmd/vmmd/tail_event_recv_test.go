@@ -182,19 +182,19 @@ func TestTailEventOutcome_ClosedSet(t *testing.T) {
 	// guest/init (sidecar_events_proxy_linux.go) must agree
 	// on the numeric values. Pin all three.
 	type tuple struct {
-		name     string
+		name      string
 		completed byte
 		failed    byte
 		timeout   byte
 	}
 	cmd := tuple{
-		name:     "cmd/vmmd",
+		name:      "cmd/vmmd",
 		completed: tailEventOutcomeCompleted,
 		failed:    tailEventOutcomeFailed,
 		timeout:   tailEventOutcomeTimeout,
 	}
 	fcvm_ := tuple{
-		name:     "pkg/fcvm",
+		name:      "pkg/fcvm",
 		completed: byte(fcvm.TailOutcomeCompleted),
 		failed:    byte(fcvm.TailOutcomeFailed),
 		timeout:   byte(fcvm.TailOutcomeTimeout),

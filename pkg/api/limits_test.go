@@ -969,10 +969,10 @@ func TestPlanStreaming(t *testing.T) {
 // TailTimeoutS / TailCapMax / ConcurrentTailsPerInstance values
 // pinned verbatim from the issue's "Rules" section:
 //
-//   Free   5s  / 16 cap / 4 concurrent
-//   Hobby 15s  / 16 cap / 16 concurrent
-//   Pro   30s  / 16 cap / 64 concurrent
-//   Scale 60s  / 16 cap / 256 concurrent
+//	Free   5s  / 16 cap / 4 concurrent
+//	Hobby 15s  / 16 cap / 16 concurrent
+//	Pro   30s  / 16 cap / 64 concurrent
+//	Scale 60s  / 16 cap / 256 concurrent
 //
 // The structural TailCapMax = 16 is a single source of truth — the
 // accessor returns the constant regardless of the field value, so

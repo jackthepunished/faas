@@ -611,10 +611,10 @@ var planLimits = map[Plan]Limits{
 		// pathological tail on Free is killed by the 5 s watchdog in
 		// snapshotAndPark before it can hold a wake past the G7 idle
 		// window.
-		TailEnabled:                  true,
-		TailTimeoutS:                 TailTimeoutFloorSeconds,
-		TailCapMax:                   TailCapMax,
-		ConcurrentTailsPerInstance:   4,
+		TailEnabled:                true,
+		TailTimeoutS:               TailTimeoutFloorSeconds,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 4,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -757,10 +757,10 @@ var planLimits = map[Plan]Limits{
 		// Matches the issue's "send a confirmation email"
 		// latency budget comfortably; over-cap attempts emit
 		// the tailCapReached metric and log the failure.
-		TailEnabled:                  true,
-		TailTimeoutS:                 15,
-		TailCapMax:                   TailCapMax,
-		ConcurrentTailsPerInstance:   16,
+		TailEnabled:                true,
+		TailTimeoutS:               15,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 16,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -889,10 +889,10 @@ var planLimits = map[Plan]Limits{
 		// Matches the issue's per-plan matrix value; covers
 		// SaaS workloads where the webhook fan-out can take
 		// 20–25 s under realistic network conditions.
-		TailEnabled:                  true,
-		TailTimeoutS:                 30,
-		TailCapMax:                   TailCapMax,
-		ConcurrentTailsPerInstance:   64,
+		TailEnabled:                true,
+		TailTimeoutS:               30,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 64,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1034,10 +1034,10 @@ var planLimits = map[Plan]Limits{
 		// would let a runaway tail hold a wake past the G7 idle
 		// window and is rejected by the runtime AdvisoryFloor
 		// check.
-		TailEnabled:                  true,
-		TailTimeoutS:                 60,
-		TailCapMax:                   TailCapMax,
-		ConcurrentTailsPerInstance:   256,
+		TailEnabled:                true,
+		TailTimeoutS:               60,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 256,
 	},
 }
 
