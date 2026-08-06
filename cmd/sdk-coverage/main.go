@@ -183,8 +183,8 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/webhooks/{id}/rotate-secret":          "RotateAppWebhookSecret",
 	"GET /v1/apps/{slug}/webhooks/{id}/deliveries":              "ListAppWebhookDeliveries",
 	"POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry": "RetryAppWebhookDelivery",
-	"GET /v1/keys":                                   "ListKeys",
-	"POST /v1/keys":                                  "CreateKey",
+	"GET /v1/keys":  "ListKeys",
+	"POST /v1/keys": "CreateKey",
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and
