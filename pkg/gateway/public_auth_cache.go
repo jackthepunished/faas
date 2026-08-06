@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// PublicAuthCache (issue #477 / ADR-077) caches the
+// PublicAuthCache (issue #477 / ADR-079) caches the
 // unsealed basic-auth credential per app so the hot path
 // doesn't invoke the secretbox unseal on every request.
 // Three properties matter:
@@ -189,7 +189,7 @@ func (c *PublicAuthCache) InvalidateByApp(appID string) {
 // rotations are rare and the next request re-unseals
 // cleanly.
 //
-// TODO(ADR-077 follow-up): per-entry key-tag would let us
+// TODO(ADR-079 follow-up): per-entry key-tag would let us
 // drop only the affected entries. Held until a real
 // workload signals thrash; the simpler "drop all on key
 // rotation" path is correct, just less surgical.

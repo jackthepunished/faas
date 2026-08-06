@@ -2,7 +2,7 @@ package main
 
 // handlers_public_auth_test.go — PATCH /v1/apps/{slug}
 // integration tests for the public-auth surface
-// (issue #477 / ADR-077). Pins the four load-bearing
+// (issue #477 / ADR-079). Pins the four load-bearing
 // invariants the apid layer guarantees:
 //
 //   1. Closed-enum validation runs FIRST so a Free
@@ -111,6 +111,16 @@ func TestPublicAuthPatch_BearerPlanGate(t *testing.T) {
 			t.Fatalf("app.PublicAuthMode = %q after rejected PATCH; want default open",
 				got.PublicAuthMode)
 		}
+		// No audit row on rejection. The redaction invariant
+		// requires that plaintext NEVER appears on the audit
+		// stream — a rejected PATCH (402/422) must not emit
+		// app.public_auth_changed either, since a future
+		// contributor adding a "log even on rejection" code
+		// path could accidentally double-write the rejected
+		// request's payload (mode='bearer' on Free would
+		// land has_basic_creds=false but the row itself
+		// carries no business value for a rejected PATCH).
+		assertNoAuditRow(t, e, "app.public_auth_changed")
 	})
 	t.Run("hobby_returns_200", func(t *testing.T) {
 		e := setup(t, api.PlanHobby)
@@ -236,7 +246,7 @@ func TestPublicAuthPatch_OpenClearsBasicSealed(t *testing.T) {
 }
 
 // TestPublicAuthPatch_AuditEmitsWithRedaction pins the
-// re-redaction invariant (ADR-077 §Decision). Every mode
+// re-redaction invariant (ADR-079 §Decision). Every mode
 // flip MUST emit an app.public_auth_changed row carrying
 //   - app_id, slug
 //   - old, new (mode strings only)
@@ -341,6 +351,14 @@ func TestPublicAuthPatch_ClosedEnumFirst(t *testing.T) {
 		!strings.Contains(rec.Body.String(), "public_auth.mode") {
 		t.Fatalf("422 body missing closed-enum error: %s", rec.Body.String())
 	}
+	// No audit row on closed-enum rejection. The 422 path
+	// is pre-SQL (the validator short-circuits before the
+	// seal step), so no business value is gained from
+	// recording it — and a future contributor adding
+	// "audit on rejection" would have to confirm the
+	// payload shape carries no plaintext (ADR-079 §Decision
+	// "re-redaction invariant").
+	assertNoAuditRow(t, e, "app.public_auth_changed")
 }
 
 // TestPublicAuthPatch_BasicRequiresCreds pins the basic-cred
@@ -370,9 +388,33 @@ func TestPublicAuthPatch_BasicRequiresCreds(t *testing.T) {
 	if row.PublicAuthMode != "" && row.PublicAuthMode != api.AppPublicAuthModeOpen {
 		t.Fatalf("PublicAuthMode after rejected PATCH = %q; want default", row.PublicAuthMode)
 	}
+	// No audit row on basic-requires-creds rejection. Same
+	// rationale as the closed-enum test above.
+	assertNoAuditRow(t, e, "app.public_auth_changed")
 }
 
 // compile-time assertion: state.App has the public_auth
 // fields the seam depends on (a future field rename trips
 // the linter instead of a runtime nil).
 var _ state.App
+
+// assertNoAuditRow is the negative-side pin for the
+// redaction invariant (ADR-079 §Decision). A rejected
+// PATCH — 402 plan gate, 422 closed-enum, 422 basic-
+// requires-creds — must NOT emit an app.public_auth_changed
+// row. The audit redaction posture is a load-bearing
+// invariant: a future contributor adding "audit on
+// rejection" code would have to confirm the payload
+// carries no plaintext (the closed-enum test would
+// currently emit mode='weird' — questionable audit
+// value). Asserting NO row pins the cleaner posture.
+func assertNoAuditRow(t *testing.T, e testEnv, kind string) {
+	t.Helper()
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if found := findEventByKind(rows, kind); found != nil {
+		t.Fatalf("unexpected %s audit row on rejected PATCH: data=%s", kind, string(found.Data))
+	}
+}

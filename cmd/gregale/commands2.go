@@ -160,7 +160,7 @@ func cmdApp(args []string) int {
 	// problem code.
 	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
 	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
-	// Issue #477 / ADR-077: per-app public-URL auth mode.
+	// Issue #477 / ADR-079: per-app public-URL auth mode.
 	// The CLI uses a single string flag (open|bearer|basic)
 	// plus optional --basic-user / --basic-pass plaintext
 	// args for mode='basic'. The apid seal step encrypts
@@ -308,7 +308,7 @@ func cmdApp(args []string) int {
 		v := false
 		req.RequireAuthn = &v
 	}
-	// Issue #477 / ADR-077: public-auth block. The CLI
+	// Issue #477 / ADR-079: public-auth block. The CLI
 	// validates the mode locally (so a typo surfaces
 	// before the round-trip) and forwards the
 	// basic_user + basic_pass as plaintext — the apid

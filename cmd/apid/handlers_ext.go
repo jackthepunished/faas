@@ -337,7 +337,7 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			// here and pass it through to the audit-block.
 		}
 	}
-	// Issue #477 / ADR-077: per-app public_auth (open|bearer|basic).
+	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// Plan-gated upstream: apid returns 402
 	// plan_public_auth_{bearer,basic}_not_allowed when the
 	// customer's plan lacks the gate. The bearer path
@@ -584,7 +584,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		}
 	}
 
-	// Issue #477 / ADR-077: seal the basic-auth creds (if
+	// Issue #477 / ADR-079: seal the basic-auth creds (if
 	// the operator PATCHed mode='basic'). The seal happens
 	// here, BEFORE the UpdateAppParams construction, so
 	// the on-wire UpdateAppParams.PublicAuth.BasicSealed
@@ -692,7 +692,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// the same way.
 		RequireAuthn:    req.RequireAuthn,
 		SetRequireAuthn: req.RequireAuthn != nil,
-		// Issue #477 / ADR-077: per-app public_auth
+		// Issue #477 / ADR-079: per-app public_auth
 		// (open|bearer|basic). Set bit distinguishes "unset"
 		// (don't touch) from explicit mode flip. The sealed
 		// blob is always ciphertext (the seal ran above for
@@ -811,7 +811,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		oldApp["require_authn"] = app.RequireAuthn
 		newApp["require_authn"] = updated.RequireAuthn
 	}
-	// Issue #477 / ADR-077: record the public_auth mode
+	// Issue #477 / ADR-079: record the public_auth mode
 	// flip. Only the mode (not the credentials) is mirrored
 	// to the audit row — `has_basic_creds: bool` would
 	// double up the second-event row below, so the
@@ -892,7 +892,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"new":    false,
 		})
 	}
-	// Issue #477 / ADR-077: emit app.public_auth_changed on mode
+	// Issue #477 / ADR-079: emit app.public_auth_changed on mode
 	// transitions. Same single-purpose, single-keyword-greppable
 	// shape as app.eviction_priority_changed above so operators
 	// can `gregale audit-events --kind-prefix public_auth` and
@@ -901,7 +901,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// target state (no-op transition) or when the operator left
 	// it unset (no intent to flip).
 	//
-	// Redaction posture (load-bearing — see ADR-077 §Decision
+	// Redaction posture (load-bearing — see ADR-079 §Decision
 	// "re-redaction invariant"): the payload carries mode only
 	// (open|bearer|basic) and a `has_basic_creds` bool flag.
 	// Plaintext username / password / sealed blob are NEVER

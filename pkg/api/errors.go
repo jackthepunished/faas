@@ -454,7 +454,7 @@ const (
 	// gate and the request gate are distinct failure modes.
 	CodePlanRequireAuthnNotAllowed = "plan_require_authn_not_allowed"
 
-	// Issue #477 / ADR-077 — public-URL auth mode gate. Free apps
+	// Issue #477 / ADR-079 — public-URL auth mode gate. Free apps
 	// stay on the no-signup-friction path (open-only); Hobby unlocks
 	// 'bearer'; Pro+ unlocks both 'bearer' and 'basic'. 402 mirrors
 	// the streaming / warm-snapshot / eviction-priority / crons /
@@ -1236,7 +1236,7 @@ func ErrPlanEvictionPriorityReservedNotAllowed(p Plan) *Problem {
 
 // ErrPlanPublicAuthBearerNotAllowed is the 402 apid returns when a
 // Free customer PATCHes public_auth_mode='bearer' (issue #477 /
-// ADR-077). The plan DOES have a tier — 'open' — that the customer
+// ADR-079). The plan DOES have a tier — 'open' — that the customer
 // can already use; the upgrade copy is "bearer is a paid feature".
 // 402 PaymentRequired mirrors the streaming / warm-snapshot /
 // eviction-priority / cron / alert-rules / webhooks gate family so
@@ -1252,7 +1252,7 @@ func ErrPlanPublicAuthBearerNotAllowed(p Plan) *Problem {
 
 // ErrPlanPublicAuthBasicNotAllowed is the 402 apid returns when a
 // Free/Hobby customer PATCHes public_auth_mode='basic' (issue #477 /
-// ADR-077). The plan DOES have tiers — 'open' (every plan) and
+// ADR-079). The plan DOES have tiers — 'open' (every plan) and
 // 'bearer' (Hobby+) — that the customer can already use; the upgrade
 // copy is "basic is Pro+". 402 PaymentRequired mirrors the existing
 // 402 gate family. Distinct code from

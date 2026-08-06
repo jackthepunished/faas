@@ -36,7 +36,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #475: Free is gated off the reserved eviction tier.
 			// Fail-closed at 0/0 mirrors the cron 0/0 posture above.
 			EvictionPriorityReservedAllowed: false, ReservedConcurrencyPerAccount: 0,
-			// Issue #477 / ADR-077: Free stays on the no-signup-friction
+			// Issue #477 / ADR-079: Free stays on the no-signup-friction
 			// path — public-by-default. Bearer + basic both gated off.
 			// The 'open' mode is always available regardless of plan.
 			PublicAuthBearerAllowed: false, PublicAuthBasicAllowed: false,
@@ -116,7 +116,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
 			// Issue #475: Hobby gets 1 reserved-tier app.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 1,
-			// Issue #477 / ADR-077: Hobby unlocks bearer (admin
+			// Issue #477 / ADR-079: Hobby unlocks bearer (admin
 			// endpoints + private webhook receivers) but basic stays
 			// gated off — the Hobby customer shape doesn't typically
 			// need sealed-credential storage cost.
@@ -183,7 +183,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 20, CronLimitPerAccount: 50,
 			// Issue #475: Pro gets 2 reserved-tier apps.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 2,
-			// Issue #477 / ADR-077: Pro unlocks both bearer + basic.
+			// Issue #477 / ADR-079: Pro unlocks both bearer + basic.
 			// Basic is the right shape for Pro's typical webhook-
 			// receiver / admin-endpoint use cases.
 			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: true,
@@ -252,7 +252,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 100, CronLimitPerAccount: 500,
 			// Issue #475: Scale gets 4 reserved-tier apps.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 4,
-			// Issue #477 / ADR-077: Scale unlocks both bearer + basic.
+			// Issue #477 / ADR-079: Scale unlocks both bearer + basic.
 			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: true,
 			// ADR-045 (#396): Scale gets 25 per-app and 100 per-account.
 			AlertRuleLimitPerApp: 25, AlertRuleLimitPerAccount: 100,
@@ -883,7 +883,7 @@ func TestPlanEvictionPriorityReservedAllowed(t *testing.T) {
 }
 
 // TestPlanPublicAuthBearerAllowed pins the per-plan tier gate for
-// public_auth_mode='bearer' (issue #477 / ADR-077). Free = false
+// public_auth_mode='bearer' (issue #477 / ADR-079). Free = false
 // (Free apps stay public-by-default — no-signup friction); Hobby+ =
 // true. apid's updateApp handler reads this via
 // Plan.PublicAuthBearerAllowed() and rejects a 'bearer' PATCH on Free
@@ -910,7 +910,7 @@ func TestPlanPublicAuthBearerAllowed(t *testing.T) {
 }
 
 // TestPlanPublicAuthBasicAllowed pins the per-plan tier gate for
-// public_auth_mode='basic' (issue #477 / ADR-077). Free + Hobby =
+// public_auth_mode='basic' (issue #477 / ADR-079). Free + Hobby =
 // false (basic adds sealed-credential storage cost the lower tiers
 // don't need; bearer covers the Hobby admin-endpoint use case);
 // Pro+ = true. apid's updateApp handler reads this via

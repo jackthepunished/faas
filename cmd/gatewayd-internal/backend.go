@@ -87,7 +87,7 @@ func (r pgRouter) slugFor(host string) (string, bool) {
 // enforce per-deployment token gating at the edge — a Pro/Scale customer
 // who PATCHes require_authn=true on their app gets the auth check
 // applied to every incoming request, with no store hop on the hot path.
-// PublicAuth (issue #477 / ADR-077) is plumbed through so ServeHTTP can
+// PublicAuth (issue #477 / ADR-079) is plumbed through so ServeHTTP can
 // enforce per-app public-URL auth (open|bearer|basic) at the edge — a
 // Hobby+ customer who PATCHes public_auth_mode='bearer' or 'basic' on
 // their app gets the credential check applied to every incoming request.
@@ -138,7 +138,7 @@ func appsSuffix(domain string) string {
 // entry from the per-app targetSet. EvictTarget (legacy wholesale drop) is
 // kept on the interface as a fallback when the payload is malformed.
 //
-// Issue #477 / ADR-077 added InvalidatePublicAuth: the per-app basic-auth
+// Issue #477 / ADR-079 added InvalidatePublicAuth: the per-app basic-auth
 // unsealed-credential cache in gateway.PublicAuthCache. A key_changed
 // notification triggers InvalidatePublicAuth; the cache maps
 // (appID, sealed-hash) → entry without a per-entry key-tag, so a key
@@ -162,7 +162,7 @@ type invalidator interface {
 // across pg restarts. The single log-and-return on initial-acquire failure
 // remains — boot-time DB outage is a different signal.
 func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator, log *slog.Logger) {
-	// Issue #477 / ADR-077: append NotifyKeyChanged so a key
+	// Issue #477 / ADR-079: append NotifyKeyChanged so a key
 	// rotation triggers InvalidatePublicAuth on the
 	// basic-auth unsealed-credential cache. The cache maps
 	// (appID, sealed-hash) → entry without a per-entry key-tag,
@@ -238,7 +238,7 @@ func handleInvalidation(inv invalidator, n db.Notification, log *slog.Logger) {
 	case db.NotifyAppChanged, db.NotifyDomainChanged:
 		inv.FlushRoutes()
 	case db.NotifyKeyChanged:
-		// Issue #477 / ADR-077. A key rotation across the
+		// Issue #477 / ADR-079. A key rotation across the
 		// platform could change which api_keys resolve
 		// against which apps for both the require_authn
 		// (issue #560) and public_auth bearer (issue #477)

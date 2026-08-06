@@ -1,7 +1,7 @@
 //go:build !no_pg
 
 // Migration-apply test for 00151 (per-app public_auth mode +
-// sealed credential blob, issue #477 / ADR-077). Pins the new
+// sealed credential blob, issue #477 / ADR-079). Pins the new
 // columns:
 //
 //  1. The migration set applies cleanly through 00151.

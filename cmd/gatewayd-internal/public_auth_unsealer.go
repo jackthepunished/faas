@@ -1,7 +1,7 @@
 // public_auth_unsealer bridges pkg/secretbox's identity
 // loader to the narrow pkg/gateway.PublicAuthUnsealer
 // interface the basic-auth branch consumes (issue #477 /
-// ADR-077).
+// ADR-079).
 //
 // Why a bridge instead of calling secretbox.OpenBytes
 // directly from the gateway hot path: pkg/gateway
@@ -47,7 +47,7 @@ import (
 )
 
 // publicAuthNamespace is the secretbox namespace the apid
-// seal step writes under (issue #477 / ADR-077). The
+// seal step writes under (issue #477 / ADR-079). The
 // prefix-on-blob layout means OpenBytesMulti returns this
 // string back; the adapter checks it matches as a defense
 // against a future seal-side namespace drift (a

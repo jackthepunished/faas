@@ -1,4 +1,4 @@
-// Per-app public_auth tests (issue #477 / ADR-077).
+// Per-app public_auth tests (issue #477 / ADR-079).
 //
 // Pins the public-auth branch behaviour end-to-end through
 // ServeHTTP for every mode (open, bearer, basic), the

@@ -452,7 +452,7 @@ type App struct {
 	// keep every new app public). Operators may PATCH true → false
 	// on any plan to opt out per-app.
 	RequireAuthn bool
-	// PublicAuthMode (issue #477 / ADR-077) is the per-app
+	// PublicAuthMode (issue #477 / ADR-079) is the per-app
 	// public-URL auth mode ('open'|'bearer'|'basic'). When
 	// 'open' (the default — every pre-existing app stays
 	// public-by-default), gatewayd-internal pass-throughs
@@ -464,7 +464,7 @@ type App struct {
 	// blob. Plan-gated at PATCH time (open=all, bearer=Hobby+,
 	// basic=Pro+); the per-plan default is always 'open'.
 	PublicAuthMode string
-	// PublicAuthBasicSealed (issue #477 / ADR-077) is the
+	// PublicAuthBasicSealed (issue #477 / ADR-079) is the
 	// secretbox-sealed APP_BASIC_AUTH blob carrying the
 	// {username, password} pair the basic-auth path verifies
 	// against. Nil/empty for open/bearer modes; set ONLY when
@@ -1855,7 +1855,7 @@ type UpdateAppParams struct {
 	// plan may PATCH true → false to opt out per-app.
 	RequireAuthn    *bool
 	SetRequireAuthn bool
-	// PublicAuth (issue #477 / ADR-077) is the per-app
+	// PublicAuth (issue #477 / ADR-079) is the per-app
 	// public-URL auth block on the PATCH request. Three
 	// shapes:
 	//   - nil (the default): leave the apps row's
@@ -1912,7 +1912,7 @@ type UpdateAppParams struct {
 	SetScalingPolicy bool
 }
 
-// AppPublicAuthUpdate (issue #477 / ADR-077) is the
+// AppPublicAuthUpdate (issue #477 / ADR-079) is the
 // per-app public-URL auth block carried on UpdateAppParams
 // + the apid PATCH /v1/apps/{slug} handler. The store
 // layer turns Mode + Sealed into the column pair
@@ -1939,7 +1939,7 @@ type AppPublicAuthUpdate struct {
 }
 
 // Canonical public-auth mode strings for the state
-// layer (issue #477 / ADR-077). Values must stay in sync
+// layer (issue #477 / ADR-079). Values must stay in sync
 // with the apps_public_auth_mode_chk CHECK constraint in
 // migrations/00151_apps_public_auth.sql AND with the
 // pkg/gateway's package-local copies. The three layers

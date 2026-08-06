@@ -2648,7 +2648,7 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetRequireAuthn {
 		a.RequireAuthn = boolOrFalse(p.RequireAuthn)
 	}
-	// Issue #477 / ADR-077: per-app public_auth
+	// Issue #477 / ADR-079: per-app public_auth
 	// (open|bearer|basic). Memstore mirrors the on-disk shape —
 	// PublicAuthMode is the column-equivalent text + the
 	// PublicAuthBasicSealed byte slice is the secretbox blob

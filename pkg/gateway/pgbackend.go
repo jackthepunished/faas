@@ -276,7 +276,7 @@ type PGBackend struct {
 	legacySingleBox bool
 
 	// publicAuthCache is the unsealed basic-auth credential
-	// cache (issue #477 / ADR-077). nil = no caching; the
+	// cache (issue #477 / ADR-079). nil = no caching; the
 	// basic-auth path falls back to per-request unsealing
 	// (slower but safe). Production wires it from
 	// cmd/gatewayd-internal so the 60s TTL + per-key
@@ -560,7 +560,7 @@ func (b *PGBackend) FlushRoutes() {
 	b.appsMu.Unlock()
 }
 
-// InvalidatePublicAuth (issue #477 / ADR-077) drops every
+// InvalidatePublicAuth (issue #477 / ADR-079) drops every
 // entry in the per-app basic-auth unsealed-credential cache.
 // gatewayd calls this on a db.NotifyKeyChanged notification
 // (cmd/gatewayd-internal/backend.go) so a key rotation
@@ -573,7 +573,7 @@ func (b *PGBackend) InvalidatePublicAuth() {
 	b.publicAuthCache.InvalidateAll()
 }
 
-// WithPublicAuthCache (issue #477 / ADR-077) arms the
+// WithPublicAuthCache (issue #477 / ADR-079) arms the
 // unsealed basic-auth credential cache. nil = no caching
 // (the basic-auth path unseals per-request — slower but
 // correct; tests prefer this). Production wires the

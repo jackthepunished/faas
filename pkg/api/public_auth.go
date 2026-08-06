@@ -1,5 +1,5 @@
 // public_auth.go — per-app public-URL auth mode constants
-// (issue #477 / ADR-077). Lives in pkg/api (not
+// (issue #477 / ADR-079). Lives in pkg/api (not
 // pkg/api/webhooks.go or pkg/api/alerts.go) because the
 // DTO shape and the seal-boundary cap are distinct from
 // both webhook secrets and alert-rule secrets.
@@ -16,13 +16,15 @@ package api
 
 // AppPublicAuthBasicMaxBytes bounds the plaintext payload
 // the apid seal step accepts on PATCH mode='basic'.
-// 384 = 128 (basic_user) + 1 (\n) + 256 (basic_pass) —
-// the per-field bounds the PublicAuthBlock.Validate
-// method enforces. Generous for pasted values from
-// secret managers, rejects megabyte uploads. Mirrors
+// 385 = 128 (basic_user) + 1 (\n) + 256 (basic_pass) —
+// the on-blob layout from cmd/apid/handlers_ext.go
+// builds the plaintext as "<user>\n<pass>". The
+// per-field bounds the PublicAuthBlock.Validate method
+// enforces. Generous for pasted values from secret
+// managers, rejects megabyte uploads. Mirrors
 // AppWebhookSecretMaxBytes' posture (256) and the alert
 // cap (AlertRuleWebhookSecretMaxBytes = 256).
-const AppPublicAuthBasicMaxBytes = 384
+const AppPublicAuthBasicMaxBytes = 385
 
 // AppPublicAuthBasicUserMaxBytes bounds the basic_user
 // field on PATCH mode='basic'. 128 matches the
@@ -38,14 +40,21 @@ const AppPublicAuthBasicUserMaxBytes = 128
 // otherwise trigger.
 const AppPublicAuthBasicPassMaxBytes = 256
 
-// Per-app public-auth mode enum (issue #477 / ADR-077).
-// Lives in pkg/api so every layer — DTO, validator, plan
-// gate, gatewayd-internal middleware, CLI — agrees on the
-// closed set without a separate constants package. The
-// closed-set matches apps_public_auth_mode_chk in
+// Per-app public-auth mode enum (issue #477 / ADR-079).
+// Canonical strings live here in pkg/api. The state
+// package has a parallel set (state.AppPublicAuthMode*)
+// that MUST stay byte-for-byte in sync — the pgstore
+// SQL uses the state-layer values directly while the
+// validator + plan gate + CLI use the api-layer values,
+// and a drift surfaces as a runtime SQL CHECK
+// constraint failure on a PATCH the API accepted.
+// pkg/api/public_auth_test.go pins the two surfaces
+// equal at compile time so a future contributor adding
+// a fourth mode updates both halves in one change.
+// The closed-set matches apps_public_auth_mode_chk in
 // migrations/00151_apps_public_auth.sql; a future addition
 // to the wire surface must add a row to that CHECK AND
-// extend this constant block.
+// extend this constant block AND the state-layer mirror.
 const (
 	// AppPublicAuthModeOpen is the pre-#477 default. The
 	// app's public hostname serves anonymous traffic;

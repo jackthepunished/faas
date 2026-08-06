@@ -244,7 +244,7 @@ type runDeps struct {
 	// daemons are independent processes so the AEAD keys are loaded
 	// separately per daemon. nil in tests.
 	sessions *session.Manager
-	// hostKeyDir (issue #477 / ADR-077) is the directory
+	// hostKeyDir (issue #477 / ADR-079) is the directory
 	// secretbox.LoadHostKeys reads from to build the
 	// multi-identity rotation-overlap slice for the basic-auth
 	// unseal path. Empty = unseal disabled (unit tests + dev
@@ -271,7 +271,7 @@ type runDeps struct {
 	// gatewaydAuditor.Emit(ctx, kind, subject, data) shape,
 	// not the apid auditor's wider surface.
 	requireAuthnAudit *gatewaydAuditor
-	// publicAuthCache (issue #477 / ADR-077) is the unsealed
+	// publicAuthCache (issue #477 / ADR-079) is the unsealed
 	// basic-auth credential cache shared between the Handler
 	// (enforcePublicAuthBasic reads through it) and the
 	// PGBackend (InvalidatePublicAuth drops it on
@@ -279,7 +279,7 @@ type runDeps struct {
 	// path unseals per-request. Production wires a single
 	// gateway.NewPublicAuthCache() constructed in run().
 	publicAuthCache *gateway.PublicAuthCache
-	// publicAuthUnsealer (issue #477 / ADR-077) is the
+	// publicAuthUnsealer (issue #477 / ADR-079) is the
 	// gateway.PublicAuthUnsealer the basic-auth branch uses
 	// to convert the secretbox-sealed BasicSealed blob into
 	// the {username, password} pair. nil = unseal disabled
@@ -369,13 +369,29 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("gatewayd: load vmmd TLS: %w", err)
 	}
 	deps := defaultDeps()
-	// Issue #477 / ADR-077: resolve the host key directory the
+	// Issue #477 / ADR-079: resolve the host key directory the
 	// secretbox unsealer reads from. Mirrors the FAAS_HOST_KEY_PATH
 	// convention cmd/vmmd + cmd/meterd use (same env var so an
 	// operator who rotates host.age on one daemon doesn't have to
 	// update a separate knob on every other daemon). Empty →
 	// basic-auth unseal disabled (mode='basic' returns 500);
 	// open + bearer modes don't touch it.
+	//
+	// **filepath.Dir convention (foot-gun warning):** the env
+	// var points at a FILE (the host.age key), but the unsealer
+	// reads a DIRECTORY (LoadHostKeys walks the dir for the
+	// rotation-overlap pair). The filepath.Dir() call below
+	// strips the file component. Operators MUST set this to a
+	// concrete file path (e.g. /etc/faas/keys/host.age), NOT
+	// a directory path (/etc/faas/keys/) — the difference is
+	// silent because filepath.Dir accepts both. If the
+	// convention ever changes, this is the line to revisit:
+	// either rename the env var to FAAS_HOST_KEY_DIR (the
+	// natural name) and migrate the daemons, or add an
+	// explicit "must be a file path, not a directory" check
+	// here. For now the convention is documented in the
+	// deploy/lima/faas-metal.yaml smoke tests and the
+	// README's hostKey section.
 	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
 		deps.hostKeyDir = filepath.Dir(hp)
 	}
@@ -654,7 +670,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// outside unit tests).
 	deps.requireAuthnAdapter = newRequireAuthnAdapter(deps.authMw)
 	deps.requireAuthnAudit = newGatewaydAuditor(deps.pgStore, log)
-	// Issue #477 / ADR-077: build the unsealed basic-auth
+	// Issue #477 / ADR-079: build the unsealed basic-auth
 	// credential cache + the secretbox unsealer closure.
 	// The cache is shared between the Handler (read path)
 	// and the PGBackend (invalidation path on
@@ -744,7 +760,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil. Production wires both unconditionally after
 	// deps.authMw is built in run().
 	handler.WithRequireAuthn(deps.requireAuthnAdapter, deps.requireAuthnAudit)
-	// Issue #477 / ADR-077: per-app public_auth (open|bearer|basic).
+	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// The 60s cache lives on the Handler (production wires
 	// deps.publicAuthCache below); the secretbox unseal goes
 	// through deps.publicAuthUnsealer, which closes over the

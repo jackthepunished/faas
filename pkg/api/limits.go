@@ -294,7 +294,7 @@ type Limits struct {
 	// apps-row FOR UPDATE lock (mirrors CreateCronIfUnderQuota).
 	ReservedConcurrencyPerAccount int
 
-	// PublicAuthBearerAllowed (issue #477 / ADR-077) gates whether
+	// PublicAuthBearerAllowed (issue #477 / ADR-079) gates whether
 	// the plan may opt apps into public_auth_mode='bearer'. Free =
 	// false (Free apps stay public-by-default — no-signup friction);
 	// Hobby+ = true. Enforced at the apid PATCH validator with 402
@@ -302,7 +302,7 @@ type Limits struct {
 	// allowed regardless of plan (default), and the 'basic' mode is
 	// gated by PublicAuthBasicAllowed below.
 	PublicAuthBearerAllowed bool
-	// PublicAuthBasicAllowed (issue #477 / ADR-077) gates whether
+	// PublicAuthBasicAllowed (issue #477 / ADR-079) gates whether
 	// the plan may opt apps into public_auth_mode='basic'. Free +
 	// Hobby = false (basic adds a sealed-credential storage cost
 	// and the Hobby customer shape doesn't typically need HTTP Basic
@@ -583,7 +583,7 @@ var planLimits = map[Plan]Limits{
 		// cap is 0 so the gate fails closed.
 		EvictionPriorityReservedAllowed: false,
 		ReservedConcurrencyPerAccount:   0,
-		// Issue #477 / ADR-077: Free stays on the no-signup-friction
+		// Issue #477 / ADR-079: Free stays on the no-signup-friction
 		// path — public-by-default, no bearer/basic opt-in. The 'open'
 		// default mode is always available regardless of plan, so
 		// existing Free apps keep working with no migration work.
@@ -741,7 +741,7 @@ var planLimits = map[Plan]Limits{
 		// comfortable headroom for the tier's economics.
 		EvictionPriorityReservedAllowed: true,
 		ReservedConcurrencyPerAccount:   1,
-		// Issue #477 / ADR-077: Hobby unlocks bearer (API-key-protected
+		// Issue #477 / ADR-079: Hobby unlocks bearer (API-key-protected
 		// private webhook receivers, dashboard admin endpoints) but
 		// basic stays gated — basic adds sealed-credential storage cost
 		// the Hobby customer shape doesn't typically need. The
@@ -893,7 +893,7 @@ var planLimits = map[Plan]Limits{
 		// is ~5.2 GB resident — well inside the 47.6 GB ceiling.
 		EvictionPriorityReservedAllowed: true,
 		ReservedConcurrencyPerAccount:   2,
-		// Issue #477 / ADR-077: Pro unlocks both bearer and basic. Basic
+		// Issue #477 / ADR-079: Pro unlocks both bearer and basic. Basic
 		// is the right shape for Pro's typical webhook-receiver /
 		// admin-endpoint use cases where HTTP Basic is the customer's
 		// existing primitive. Sealed-credential storage cost is
@@ -1045,7 +1045,7 @@ var planLimits = map[Plan]Limits{
 		// headroom for live wakes.
 		EvictionPriorityReservedAllowed: true,
 		ReservedConcurrencyPerAccount:   4,
-		// Issue #477 / ADR-077: Scale unlocks both bearer and basic —
+		// Issue #477 / ADR-079: Scale unlocks both bearer and basic —
 		// the SaaS-scale customer shape has rotating-CI keys and
 		// per-environment admin endpoints that benefit from both
 		// auth modes.
@@ -2054,7 +2054,7 @@ func (p Plan) EvictionPriorityReservedAllowed() bool {
 	return l.EvictionPriorityReservedAllowed
 }
 
-// PublicAuthBearerAllowed (issue #477 / ADR-077) returns true if the
+// PublicAuthBearerAllowed (issue #477 / ADR-079) returns true if the
 // plan may opt apps into public_auth_mode='bearer'. Free = false
 // (Free apps stay public-by-default — no-signup friction); Hobby+ =
 // true. apid's updateApp handler rejects a 'bearer' PATCH on a Free
@@ -2070,7 +2070,7 @@ func (p Plan) PublicAuthBearerAllowed() bool {
 	return l.PublicAuthBearerAllowed
 }
 
-// PublicAuthBasicAllowed (issue #477 / ADR-077) returns true if the
+// PublicAuthBasicAllowed (issue #477 / ADR-079) returns true if the
 // plan may opt apps into public_auth_mode='basic'. Free + Hobby =
 // false (basic adds sealed-credential storage cost the lower tiers
 // don't need; bearer covers the Hobby admin-endpoint use case);

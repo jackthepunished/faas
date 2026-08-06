@@ -146,7 +146,7 @@ type UpdateAppRequest struct {
 	// here: a valid token from a different account receives 403
 	// at the gateway, not at the PATCH endpoint.
 	RequireAuthn *bool `json:"require_authn,omitempty"`
-	// PublicAuth (issue #477 / ADR-077) toggles per-app
+	// PublicAuth (issue #477 / ADR-079) toggles per-app
 	// public-URL auth (open|bearer|basic). nil = don't
 	// touch the column (pre-#477 behaviour preserved).
 	// Non-nil with the SetPublicAuth bit set replaces the
@@ -489,7 +489,7 @@ type AppResponse struct {
 	// dashboards can show the "auth required" pill alongside
 	// streaming / warm-snapshot / require_signed.
 	RequireAuthn bool `json:"require_authn"`
-	// PublicAuth (issue #477 / ADR-077) reflects the
+	// PublicAuth (issue #477 / ADR-079) reflects the
 	// per-app public-URL auth mode. Three shapes:
 	//   {mode:"open"}    — pre-#477 default; every existing
 	//                      app stays public-by-default.
@@ -516,7 +516,7 @@ type AppResponse struct {
 	WarmSnapshotMinMs       int `json:"warm_snapshot_min_ms"`
 }
 
-// PublicAuthBlock (issue #477 / ADR-077) is the per-app
+// PublicAuthBlock (issue #477 / ADR-079) is the per-app
 // public-URL auth configuration on a PATCH body. Mode is
 // the canonical 'open'|'bearer'|'basic' string (must match
 // apps_public_auth_mode_chk). BasicUser + BasicPass are
@@ -576,7 +576,7 @@ func (b *PublicAuthBlock) Validate() *Problem {
 	return nil
 }
 
-// PublicAuthStatus (issue #477 / ADR-077) is the
+// PublicAuthStatus (issue #477 / ADR-079) is the
 // read-only per-app public-URL auth surface on
 // AppResponse. Mode mirrors the apps.public_auth_mode
 // column; HasBasicCreds is true iff the row has a

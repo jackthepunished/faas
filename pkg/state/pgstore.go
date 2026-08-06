@@ -2390,7 +2390,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   warm_snapshot_min_ms = case when $35 then $36 else warm_snapshot_min_ms end,
 		   eviction_priority = case when $37 then $38 else eviction_priority end,
 		   require_authn = case when $39 then $40 else require_authn end,
-		   -- Issue #477 / ADR-077: per-app public_auth. The mode
+		   -- Issue #477 / ADR-079: per-app public_auth. The mode
 		   -- column is the canonical per-app config; the
 		   -- basic-sealed blob is the secretbox-encrypted
 		   -- credential pair (mode='basic' only). The two
@@ -2448,7 +2448,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// may PATCH true → false on a Pro-upgraded app; Hobby
 		// customers may opt back out the same way.
 		p.SetRequireAuthn, boolOrFalse(p.RequireAuthn),
-		// Issue #477 / ADR-077: public_auth block. The Set bit
+		// Issue #477 / ADR-079: public_auth block. The Set bit
 		// gates BOTH columns via the same CASE so a stale
 		// sealed blob from a prior mode='basic' PATCH is
 		// cleared when the customer PATCHes mode='open' or
@@ -9127,7 +9127,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		&a.EvictionPriority,
 		// Issue #560: per-app require_authn column.
 		&a.RequireAuthn,
-		// Issue #477 / ADR-077: per-app public_auth. Both
+		// Issue #477 / ADR-079: per-app public_auth. Both
 		// columns land positionally after require_authn. The
 		// mode column is NOT NULL DEFAULT 'open' so a plain
 		// *string scan is safe; the basic blob is nullable
@@ -9198,7 +9198,7 @@ const appsSelectColumns = `
 	warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms,
 	eviction_priority,
 	require_authn,
-	-- Issue #477 / ADR-077: per-app public_auth
+	-- Issue #477 / ADR-079: per-app public_auth
 	public_auth_mode, public_auth_basic`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string

@@ -66,7 +66,7 @@ type App struct {
 	// false in fakeBackend unit tests (the in-memory
 	// backend doesn't populate the column).
 	RequireAuthn bool
-	// PublicAuth (issue #477 / ADR-077) is the per-app
+	// PublicAuth (issue #477 / ADR-079) is the per-app
 	// public-URL auth mode (open|bearer|basic). When
 	// mode='open' (the pre-#477 default), ServeHTTP
 	// pass-throughs anonymous traffic. When mode='bearer',
@@ -85,7 +85,7 @@ type App struct {
 	PublicAuth PublicAuthConfig
 }
 
-// PublicAuthConfig (issue #477 / ADR-077) is the per-app
+// PublicAuthConfig (issue #477 / ADR-079) is the per-app
 // public-URL auth mode bundle plumbed onto App. Mode is the
 // canonical text from apps.public_auth_mode CHECK enum
 // ('open'|'bearer'|'basic'); empty Mode is treated as 'open'
@@ -168,7 +168,7 @@ type RequireAuthnAuditor interface {
 	Emit(ctx context.Context, kind string, subject *string, data map[string]any)
 }
 
-// PublicAuthUnsealer (issue #477 / ADR-077) turns a
+// PublicAuthUnsealer (issue #477 / ADR-079) turns a
 // secretbox-sealed APP_BASIC_AUTH blob into the {username,
 // password} pair the request Authorization header carries.
 // Declared locally (mirroring RequireAuthnAuthenticator's
@@ -179,6 +179,22 @@ type RequireAuthnAuditor interface {
 // tampered or the namespace tag doesn't match — the caller
 // treats both as a credential mismatch (401) so a brute-forcer
 // can't tell the difference.
+//
+// **ctx contract (load-bearing):** the ctx parameter is the
+// per-request inbound ctx (the basic-auth branch passes
+// r.Context()). The implementation MUST be ctx-clean:
+// no I/O, no blocking syscalls, no host.age reload on
+// disk. The hot path is a single in-memory secretbox
+// OpenMulti call on the loaded identities slice (the
+// identities are loaded once at boot and held via the
+// closure; the rotation-overlap window is bounded by the
+// 30-day rotated-pair eviction). A future contributor
+// adding an I/O step (e.g. fetching host.age from disk
+// on a slow drive) MUST NOT block on a client-cancelled
+// ctx — they should use a fresh, long-lived ctx for any
+// internal I/O. The ctx parameter is reserved for
+// future-proofing the contract shape, not for
+// transactionalism.
 type PublicAuthUnsealer interface {
 	UnsealBasicAuth(ctx context.Context, sealed []byte) (username, password string, err error)
 }
@@ -342,7 +358,7 @@ type Handler struct {
 	// every other gatewayd-scope row uses (cmd/gatewayd/audit.go).
 	requireAuthnAudit RequireAuthnAuditor
 	// publicAuthCache is the unsealed basic-auth credential
-	// cache (issue #477 / ADR-077). Nil = no caching; the
+	// cache (issue #477 / ADR-079). Nil = no caching; the
 	// basic-auth path falls back to per-request unsealing
 	// (slower but safe; used by unit tests that don't want to
 	// thread a cache through the constructor). Production
@@ -492,7 +508,7 @@ func (h *Handler) WithRequireAuthn(authn RequireAuthnAuthenticator, audit Requir
 	return h
 }
 
-// WithPublicAuth (issue #477 / ADR-077) arms the per-app
+// WithPublicAuth (issue #477 / ADR-079) arms the per-app
 // public-URL auth gate. cache may be nil (no caching; the
 // basic-auth path unseals per-request, slower but correct).
 // unsealer may be nil (the basic-auth path returns 500 on
@@ -650,7 +666,7 @@ func bearerTokenFromHeader(h string) string {
 	return strings.TrimSpace(h[len(scheme):])
 }
 
-// enforcePublicAuth (issue #477 / ADR-077) is the per-app
+// enforcePublicAuth (issue #477 / ADR-079) is the per-app
 // public-URL auth gate. Returns true when the request is
 // authorised to proceed (either the routed app has
 // mode='open' OR the caller presented valid credentials
@@ -730,14 +746,19 @@ func (h *Handler) enforcePublicAuth(w http.ResponseWriter, r *http.Request, rec 
 	case publicAuthModeBasic:
 		return h.enforcePublicAuthBasic(w, r, rec, app)
 	default:
-		// Defensive: an unrecognised mode should be impossible
-		// thanks to apps_public_auth_mode_chk, but if a
-		// legacy row from before #477 lands with mode='weird'
-		// we pass-through rather than 500 — the gate stays
-		// fail-open on data drift and the apid PATCH layer
-		// continues to be the source of truth for plan
-		// gating. A single warn line per process keeps
-		// the diagnostic surface small.
+		// Fail-open on unknown mode (ADR-079 §Consequences).
+		// Distinct from the two adjacent nil-check branches
+		// (requireAuthnAuthn == nil, publicAuthUnsealer == nil)
+		// which fail-closed (500) — those are deploy-failure
+		// signals ("the daemon isn't wired"), while an unknown
+		// mode is a data-event signal ("a row landed with a
+		// value the schema doesn't recognize"). The SQL CHECK
+		// constraint apps_public_auth_mode_chk is the canonical
+		// data-integrity backstop; a row that bypassed it is a
+		// code-path bug we want to surface, not a deploy failure
+		// we want to amplify. The per-mode warn-then-dedup keeps
+		// the diagnostic surface bounded (one log line per
+		// distinct mode value across the process lifetime).
 		h.warnUnknownPublicAuthMode(mode)
 		return true
 	}
@@ -1318,7 +1339,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Issue #477 / ADR-077 / per-app public_auth gate.
+	// Issue #477 / ADR-079 / per-app public_auth gate.
 	// Runs AFTER enforceRequireAuthn (so the require_authn
 	// gate fires first when both are active on the same app,
 	// keeping the 401 ordering deterministic for

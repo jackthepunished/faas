@@ -1,6 +1,6 @@
 //go:build !no_pg_test
 
-// public_auth_e2e_test.go — issue #477 / ADR-077
+// public_auth_e2e_test.go — issue #477 / ADR-079
 // state-layer end-to-end tripwire. Pins the cross-backend
 // shape parity the per-app public-URL auth surface
 // requires:
@@ -222,6 +222,61 @@ func TestPublicAuthE2E_StateSeam_NoOpGuard(t *testing.T) {
 	}
 	if string(row.PublicAuthBasicSealed) != blobBytes {
 		t.Fatalf("PublicAuthBasicSealed after no-op = %q; want %q (Set=false means no touch)",
+			string(row.PublicAuthBasicSealed), blobBytes)
+	}
+}
+
+// TestPublicAuthE2E_StateSeam_SetTrueNilPointer pins the
+// "programming error" case for the Set-bit convention
+// (issue #477 / ADR-079). SetPublicAuth=true with
+// PublicAuth=nil is a programming error (no caller in the
+// apid path produces this shape) — the memstore guard
+// `if p.SetPublicAuth && p.PublicAuth != nil` collapses
+// it to a silent no-op so the pre-existing blob stays
+// intact. A future contributor adding a guarded branch
+// to handle the nil-pointer case MUST NOT silently clear
+// the blob. The explicit assertion here pins that
+// posture against a future contributor who, in good
+// faith, treats nil as "explicit clear" (the more
+// natural read of the Set-bit convention).
+func TestPublicAuthE2E_StateSeam_SetTrueNilPointer(t *testing.T) {
+	st := state.NewMemStore()
+	acct, _ := st.CreateAccount(context.Background(),
+		"e2e-pa-setnil@example.com", api.PlanPro)
+	app, _ := st.CreateApp(context.Background(), state.App{
+		AccountID: acct.ID, Slug: "pa-setnil", Type: state.AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 5,
+	})
+	const blobBytes = "preserve-me-too"
+	if _, err := st.UpdateApp(context.Background(), app.ID,
+		state.UpdateAppParams{
+			PublicAuth: &state.AppPublicAuthUpdate{
+				Mode:   api.AppPublicAuthModeBasic,
+				Sealed: []byte(blobBytes),
+			},
+			SetPublicAuth: true,
+		}); err != nil {
+		t.Fatalf("seed UpdateApp: %v", err)
+	}
+	// Programming-error shape: SetPublicAuth=true but
+	// PublicAuth=nil. The memstore guard treats this as a
+	// no-op (the apid path never produces this shape).
+	if _, err := st.UpdateApp(context.Background(), app.ID,
+		state.UpdateAppParams{
+			PublicAuth:    nil,
+			SetPublicAuth: true,
+		}); err != nil {
+		t.Fatalf("programming-error UpdateApp: %v", err)
+	}
+	row, err := st.AppByID(context.Background(), app.ID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if row.PublicAuthMode != api.AppPublicAuthModeBasic {
+		t.Fatalf("PublicAuthMode after Set=true+nil = %q; want basic (preserved)", row.PublicAuthMode)
+	}
+	if string(row.PublicAuthBasicSealed) != blobBytes {
+		t.Fatalf("PublicAuthBasicSealed after Set=true+nil = %q; want %q (preserved)",
 			string(row.PublicAuthBasicSealed), blobBytes)
 	}
 }

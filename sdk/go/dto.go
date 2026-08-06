@@ -106,13 +106,16 @@ type (
 	BuildFramework = api.BuildFramework
 	AppManifest    = api.AppManifest
 
-	// Issue #477 / ADR-079: per-app public-URL auth. The
-	// subset mirrors the hand-curated surface — the
-	// public Go SDK only re-exports the write-block
-	// shape; the read-side is reached through the same
-	// AppResponse type with the public_auth optional
-	// field embedded by the vendored api.AppResponse
-	// type at internal/api/dto.go (added by the next
-	// mirror push).
-	PublicAuthBlock = api.PublicAuthBlock
+	// Issue #477 / ADR-079: per-app public-URL auth. Both
+	// the write-block (PublicAuthBlock, embedded on
+	// UpdateAppRequest) and the read-side status
+	// (PublicAuthStatus, embedded on AppResponse) are
+	// re-exported so a caller can read the resolved mode +
+	// has_basic_creds bool off AppResponse without going
+	// through the internal package. The alias preserves
+	// identity (a faas.PublicAuthStatus IS an
+	// api.PublicAuthStatus), so the explanatory godoc on
+	// internal/api.PublicAuthStatus renders correctly.
+	PublicAuthBlock  = api.PublicAuthBlock
+	PublicAuthStatus = api.PublicAuthStatus
 )

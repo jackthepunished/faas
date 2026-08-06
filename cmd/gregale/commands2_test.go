@@ -195,7 +195,7 @@ func TestCmdAppMinInstances_HobbyRejects(t *testing.T) {
 }
 
 // TestCmdAppPublicAuth_ParsesAndForwards wires the --public-auth
-// flag (issue #477 / ADR-077). Three sub-cases pin the
+// flag (issue #477 / ADR-079). Three sub-cases pin the
 // customer-facing surface:
 //
 //  1. Unknown mode -> CLI-side typo rejection (no round-trip).

@@ -1,6 +1,6 @@
 -- filename: 00151_apps_public_auth.sql
 -- +goose Up
--- Issue #477 / ADR-077 — per-app public-URL auth mode
+-- Issue #477 / ADR-079 — per-app public-URL auth mode
 -- ('open'|'bearer'|'basic') + sealed credential blob for the
 -- basic-auth path. Adds two columns to apps; when mode='bearer'
 -- or 'basic', gatewayd-internal demands the matching Authorization

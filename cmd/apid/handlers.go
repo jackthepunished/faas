@@ -325,7 +325,7 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// round-trip. The token-scope enforcement (cross-account
 		// 403) lives in gatewayd-internal, not here.
 		RequireAuthn: a.RequireAuthn,
-		// Issue #477 / ADR-077: per-app public-URL auth.
+		// Issue #477 / ADR-079: per-app public-URL auth.
 		// Surfaced so dashboards can show "public auth: open /
 		// bearer / basic" alongside the require_authn pill and
 		// so a customer can verify their PATCH landed without
