@@ -654,7 +654,16 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.removeOrgMember)))))
 	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.requireStepUp(5*time.Minute)(s.transferOrgOwnership))))))
 	mux.HandleFunc("GET /v1/invitations/{token}", s.authLimited(s.peekInvitation))
-	mux.HandleFunc("POST /v1/invitations/{token}/accept", s.authLimited(s.acceptInvitation))
+	// PR-8: accept-invitation now sits behind requireStepUp (5m).
+	// Compose order mirrors POST /v1/orgs/{slug}/transfer_ownership
+	// (server.go:655): authLimited → requireMFA → requireStepUp.
+	// Without step-up, a bearer who leaked an invitation token could
+	// mint themselves into the target org with no fresh TOTP — the
+	// threat model ADR-077 closed for the other 8 sensitive routes.
+	// Bearer-key principals skip the gate (an API key is step-up-
+	// equivalent proof); pre-PR-077 cookies fail open per the
+	// bypass tolerance at middleware.go:836-847.
+	mux.HandleFunc("POST /v1/invitations/{token}/accept", s.authLimited(s.requireMFA(s.requireStepUp(5*time.Minute)(s.acceptInvitation))))
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/invitations/{token}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.revokeInvitation)))))
 	mux.HandleFunc("GET /v1/orgs/{slug}/seat_usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.getOrgSeatUsage)))))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.idempotent(s.changePlan))))))

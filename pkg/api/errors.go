@@ -203,6 +203,16 @@ const (
 	// the dashboard can pivot the message from "your key is wrong"
 	// to "complete enrollment or step-up to continue".
 	CodeMFARequired = "mfa_required"
+	// CodeStepUpRequired is returned by RequireStepUp (ADR-077 +
+	// PR-8 acceptance) when a session-cookie principal's
+	// Envelope.StepUpAt stamp is missing or older than the route's
+	// configured TTL. Distinct from CodeMFARequired so the dashboard
+	// can pivot the message from "enable MFA to continue" (the
+	// enrollment path) to "re-enter your authenticator code"
+	// (the step-up path). The audit kind "auth.step_up_required"
+	// (with reason: "missing"|"expired", ttl_sec) is the load-
+	// bearing security signal; the wire code is the UX affordance.
+	CodeStepUpRequired = "step_up_required"
 	// CodeMFAInvalidCode is returned when /confirm, /verify, or
 	// /recover validate a presented TOTP code / recovery code and
 	// the comparison fails. The audit Emit fires regardless.
@@ -1065,6 +1075,19 @@ func ErrAdmissionRefused(observedCents, capCents int64) *Problem {
 func ErrInternal(detail string) *Problem {
 	return NewProblem(http.StatusInternalServerError, CodeInternal,
 		"Internal Error", detail)
+}
+
+// ErrStepUpRequired is returned by RequireStepUp (ADR-077 +
+// PR-8 acceptance) when the Envelope.StepUpAt stamp is missing or
+// stale. The 403 carries CodeStepUpRequired (not CodeMFARequired)
+// so the dashboard can render "re-enter your authenticator code"
+// copy instead of "enable MFA to continue". The audit kind
+// "auth.step_up_required" with reason: "missing"|"expired" is the
+// load-bearing security signal; this helper is the UX affordance.
+func ErrStepUpRequired() *Problem {
+	return NewProblem(http.StatusForbidden, CodeStepUpRequired,
+		"Step-up required",
+		"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh")
 }
 
 // ErrBillingNotImplemented is returned by an apid handler that

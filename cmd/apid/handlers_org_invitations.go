@@ -166,10 +166,13 @@ func (s *server) transferOrgOwnership(w http.ResponseWriter, r *http.Request, ac
 // enforceMemberCap.
 //
 // Mounted at POST /v1/invitations/{token}/accept. Auth chain is
-// s.authLimited (the bearer / session must be present) but no
-// s.loadOrg — the invitee has no X-Active-Org yet (the invitation
-// IS how they get one). PR 8 (SSO + GDPR bundle) reconsiders
-// step-up on accept.
+// s.authLimited → s.requireMFA → s.requireStepUp(5m) (the
+// 5-minute TTL + audit kind come from pkg/auth.Middleware
+// .RequireStepUp at middleware.go:802-873; PR-8 wires the chain,
+// ADR-077 documents the rationale). No s.loadOrg — the invitee
+// has no X-Active-Org yet (the invitation IS how they get one).
+// Bearer-key principals skip the step-up gate (an API key is
+// step-up-equivalent proof).
 func (s *server) acceptInvitation(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	token := r.PathValue("token")
 	if token == "" {

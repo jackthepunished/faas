@@ -857,9 +857,7 @@ func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) Accou
 			if !ts.IsZero() {
 				reason = "expired"
 			}
-			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
-				api.CodeMFARequired, "MFA required",
-				"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh"))
+			api.WriteProblem(w, api.ErrStepUpRequired())
 			if m.Audit != nil {
 				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
 					"path":    r.URL.Path,
@@ -898,9 +896,7 @@ func (m *Middleware) RequireStepUpHandler(ttl time.Duration) func(http.Handler) 
 			if !ts.IsZero() {
 				reason = "expired"
 			}
-			api.WriteProblem(w, api.NewProblem(http.StatusForbidden,
-				api.CodeMFARequired, "MFA required",
-				"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh"))
+			api.WriteProblem(w, api.ErrStepUpRequired())
 			if m.Audit != nil {
 				// Dashboard routes don't carry a state.Account on
 				// the request context the way RequireSession's

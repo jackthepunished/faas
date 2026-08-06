@@ -20,13 +20,19 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // seedInvitationForPrincipal creates a pending invitation for the
@@ -491,6 +497,229 @@ func TestSeatUsage_FreePlanReturnsZero(t *testing.T) {
 	if body.Used != 1 {
 		t.Errorf("Used = %d, want 1 (the owner)", body.Used)
 	}
+}
+
+// TestAcceptInvitation_RequiresStepUp (PR 8) — pin the step-up
+// gate on POST /v1/invitations/{token}/accept. ADR-077 closed the
+// same threat model for the other 8 sensitive routes; PR-8 adds
+// accept-invitation to that list. The gate trips BEFORE the
+// store-side ConsumeOrgInvitation so a leaked plaintext token
+// cannot mint a membership without a fresh TOTP on the bearer's
+// session.
+//
+// Subtests:
+//  1. cookie + missing step-up stamp  → 403 + auth.step_up_required audit row
+//     (pre-PR-077 cookies fall into the "missing" bucket per the
+//     bypass tolerance at middleware.go:836-847; PR-8's gate is
+//     opt-in to the row, so the missing branch is the regression
+//     net for "the audit row fires when the stamp is missing".)
+//  2. cookie + expired step-up stamp  → 403 + reason="expired"
+//  3. cookie + fresh step-up stamp    → 200 (happy path)
+//
+// Bearer-key principals skip the gate (an API key is step-up-
+// equivalent proof). The existing PR-7 tests at line 109 / 151
+// already cover the bearer-bypass path; PR-8 doesn't re-pin it.
+func TestAcceptInvitation_RequiresStepUp(t *testing.T) {
+	ensureRecoveryTestSecret(t)
+
+	// --- Subtest 1: cookie with no step-up stamp → 403 -----------------
+	t.Run("missing_step_up_returns_403", func(t *testing.T) {
+		e, _, cookie := setupWithSessionForTest(t)
+		// setupWithSession issues via IssueWithSession which has
+		// no StepUpAt — the cookie decodes with StepUpAt zero,
+		// which RequireStepUp classifies as "missing" (the pre-
+		// PR-077 legacy branch). Per the bypass tolerance the
+		// gate DOES fire (with reason=missing) on legacy cookies
+		// once the route is wired to require step-up; the
+		// missing-bypass is documented for stamps NEVER seen,
+		// not for "stamp once then reissue without one". A fresh
+		// issuance via IssueWithSession has no stamp at all, so
+		// the audit row fires.
+		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-miss", "Acme PR8 Step-up Missing", api.PlanPro)
+		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("missing step-up: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+		}
+		var problem struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+			t.Fatalf("Unmarshal problem: %v", err)
+		}
+		// PR-8 fix: the gate now uses CodeStepUpRequired (distinct
+		// from CodeMFARequired) so the dashboard can render
+		// "re-enter your authenticator code" copy distinctly
+		// from "enable MFA to continue".
+		if problem.Code != api.CodeStepUpRequired {
+			t.Errorf("problem.code = %q, want %q", problem.Code, api.CodeStepUpRequired)
+		}
+		// Audit row lands with reason=missing.
+		rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		ev := findEventByKind(rows, "auth.step_up_required")
+		if ev == nil {
+			t.Fatalf("no auth.step_up_required row; rows=%s", eventDump(rows))
+		}
+		var data map[string]any
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("Data not JSON: %v", err)
+		}
+		if data["path"] != "/v1/invitations/"+wireToken+"/accept" {
+			t.Errorf("path = %v, want %s", data["path"], "/v1/invitations/"+wireToken+"/accept")
+		}
+		if data["method"] != "POST" {
+			t.Errorf("method = %v, want POST", data["method"])
+		}
+		if data["reason"] != "missing" {
+			t.Errorf("reason = %v, want missing", data["reason"])
+		}
+		if data["ttl_sec"] != float64(300) {
+			t.Errorf("ttl_sec = %v, want 300 (5-minute TTL)", data["ttl_sec"])
+		}
+	})
+
+	// --- Subtest 2: cookie with EXPIRED step-up stamp → 403 -------------
+	t.Run("expired_step_up_returns_403", func(t *testing.T) {
+		e, mgr, cookie := setupWithSessionForTest(t)
+		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-exp", "Acme PR8 Step-up Expired", api.PlanPro)
+		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+		// Issue a fresh cookie with a stamp older than the TTL
+		// (10 minutes ago vs 5-minute TTL).
+		staleCookie := reissueCookieWithStepUp(t, cookie, mgr, time.Now().Add(-10*time.Minute))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+		req.AddCookie(staleCookie)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("expired step-up: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+		}
+		rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		ev := findEventByKind(rows, "auth.step_up_required")
+		if ev == nil {
+			t.Fatalf("no auth.step_up_required row; rows=%s", eventDump(rows))
+		}
+		var data map[string]any
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("Data not JSON: %v", err)
+		}
+		if data["reason"] != "expired" {
+			t.Errorf("reason = %v, want expired", data["reason"])
+		}
+	})
+
+	// --- Subtest 3: cookie with FRESH step-up stamp → 200 ---------------
+	t.Run("fresh_step_up_passes", func(t *testing.T) {
+		e, mgr, cookie := setupWithSessionForTest(t)
+		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-fresh", "Acme PR8 Step-up Fresh", api.PlanPro)
+		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+		// Issue a fresh cookie with a stamp 30 seconds old (well
+		// within the 5-minute TTL).
+		freshCookie := reissueCookieWithStepUp(t, cookie, mgr, time.Now().Add(-30*time.Second))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+		req.AddCookie(freshCookie)
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("fresh step-up: code=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		// No auth.step_up_required audit row fires on the happy path.
+		rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+		if err != nil {
+			t.Fatalf("ListEvents: %v", err)
+		}
+		if ev := findEventByKind(rows, "auth.step_up_required"); ev != nil {
+			t.Errorf("unexpected auth.step_up_required on fresh-stamp happy path: %s", eventDump(rows))
+		}
+		// The two accept-side audit rows DO fire on the happy path.
+		if findEventByKind(rows, "org.invitation.accepted") == nil {
+			t.Errorf("org.invitation.accepted missing on fresh-stamp happy path")
+		}
+		if findEventByKind(rows, "org.member.added") == nil {
+			t.Errorf("org.member.added missing on fresh-stamp happy path")
+		}
+	})
+}
+
+// reissueCookieWithStepUp unseals the source cookie via the
+// supplied session manager, swaps the StepUpAt stamp to the
+// requested time, and re-seals. Mirrors the
+// reissueSessionCookieWithStepUp call site at handlers_mfa.go:712
+// without going through /v1/account/mfa/verify.
+//
+// Tests use this to construct "expired stamp" / "fresh stamp"
+// cookies for the PR-8 step-up gate assertions. The source cookie's
+// sid + account + binding hash are preserved so the IAM-3 sid
+// cross-check at requireSessionCookie still passes.
+//
+// The manager is supplied explicitly (not derived from a global)
+// because NewEphemeralManager generates a fresh random key per
+// call — a separate manager can't Open a cookie minted by another
+// manager in the same test. setupWithSessionForTest (below) wires
+// the manager into the testEnv so the test + helper share keys.
+func reissueCookieWithStepUp(t *testing.T, source *http.Cookie, mgr *session.Manager, stepUpAt time.Time) *http.Cookie {
+	t.Helper()
+	env, err := mgr.Verify(source.Value)
+	if err != nil {
+		t.Fatalf("session.Verify: %v", err)
+	}
+	token, err := mgr.IssueWithSessionAndBindingHashAndStepUp(
+		env.Sid, env.AccountID, env.BindingHash, stepUpAt, env.MfaPending)
+	if err != nil {
+		t.Fatalf("IssueWithSessionAndBindingHashAndStepUp: %v", err)
+	}
+	return &http.Cookie{Name: source.Name, Value: token}
+}
+
+// setupWithSessionForTest is the manager-aware twin of
+// setupWithSession (handlers_scopes_test.go:56): it builds the
+// server with the same deps and returns the session.Manager so
+// reissueCookieWithStepUp can unseal + reseal cookies minted by
+// the same key. The base setupWithSession deliberately drops the
+// manager pointer to keep its signature minimal; PR-8 needs it.
+func setupWithSessionForTest(t *testing.T) (testEnv, *session.Manager, *http.Cookie) {
+	t.Helper()
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(context.Background(),
+		"session-cookie-pr8@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), sid, acct.ID,
+		"192.0.2.30", "session-pr8-test-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	token, err := mgr.IssueWithSession(sid, acct.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := wire.NewOpsMetrics("apid_session_pr8_test")
+	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
+	return testEnv{h: srv.handler(), store: store, key: "", acct: acct, ops: ops},
+		mgr, &http.Cookie{Name: sessionCookie, Value: token}
 }
 
 // eventDump renders the rows slice as JSON for inclusion in a
