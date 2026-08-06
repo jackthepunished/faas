@@ -4672,7 +4672,10 @@ paths:
         description: |
           Cursor — the `id` of the last row from the prior page.
           Omit on the first page.
-      - $ref: '#/components/parameters/PageLimit'
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        description: "Max rows to return. Silently capped at 100."
     get:
       tags: [orgs]
       operationId: listOrgInvitations

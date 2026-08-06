@@ -601,7 +601,7 @@ func TestAcceptInvitation_RequiresStepUp(t *testing.T) {
 		if data["path"] != "/v1/invitations/"+wireToken+"/accept" {
 			t.Errorf("path = %v, want %s", data["path"], "/v1/invitations/"+wireToken+"/accept")
 		}
-		if data["method"] != "POST" {
+		if data["method"] != http.MethodPost {
 			t.Errorf("method = %v, want POST", data["method"])
 		}
 		if data["reason"] != "missing" {
