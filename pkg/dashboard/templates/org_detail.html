@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} — onebox faas</title>
+  <style nonce="{{.Nonce}}">
+    :root { color-scheme: light dark; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 0 1.5rem; max-width: 920px; margin-inline: auto; }
+    header { display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid #ddd; }
+    nav a { margin-right: 1rem; text-decoration: none; }
+    main { padding: 1rem 0; }
+    footer { color: #888; font-size: 0.85rem; padding: 2rem 0; border-top: 1px solid #ddd; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
+    code { font-family: ui-monospace, Menlo, monospace; }
+    .muted { color: #888; }
+    .badge { display: inline-block; padding: 0 0.5rem; border-radius: 0.5rem; background: #eee; font-size: 0.8rem; }
+    .badge-personal { background: #eef; }
+    .badge-pending { background: #ffe7c2; }
+    .badge-consumed { background: #dfd; }
+    .badge-revoked { background: #fdd; }
+    .badge-expired { background: #eee; }
+    .banner { padding: 0.6rem 0.8rem; border: 1px solid #c33; background: #fee; margin: 0.5rem 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>onebox faas</strong>
+    <nav>
+      <a href="/dashboard/">Overview</a>
+      <a href="/dashboard/apps">Apps</a>
+      <a href="/dashboard/orgs">Organizations</a>
+      <a href="/dashboard/usage">Usage</a>
+      <a href="/dashboard/billing">Billing</a>
+      <a href="/dashboard/pricing">Pricing</a>
+      <a href="/dashboard/invoices">Invoices</a>
+      <a href="/dashboard/account">Account</a>
+    </nav>
+  </header>
+  <main>
+    {{if .Data}}
+      {{$d := .Data}}
+      <h1>{{$d.Org.Name}} <code>{{$d.Org.Slug}}</code>
+        {{- if $d.Org.Personal}} <span class="badge badge-personal">personal</span>{{end}}
+      </h1>
+      <p>
+        Plan: <strong>{{$d.Org.Plan}}</strong>.
+        Your role: <strong>{{$d.CallersRole}}</strong>.
+        {{- if not $d.Org.Personal}}
+          Seats: <strong>{{$d.SeatUsed}}</strong> / <strong>{{$d.SeatLimit}}</strong>.
+        {{- end}}
+      </p>
+
+      {{if $d.Error}}
+        <div class="banner">
+          Some sections failed to load: <code>{{$d.Error}}</code>
+        </div>
+      {{end}}
+
+      <h2>Members</h2>
+      {{if $d.Members}}
+        <table>
+          <thead>
+            <tr><th>Email</th><th>Role</th><th>Joined</th></tr>
+          </thead>
+          <tbody>
+            {{range $d.Members}}
+              <tr>
+                <td>{{.Email}}</td>
+                <td>{{.Role}}</td>
+                <td>{{.JoinedAt}}</td>
+              </tr>
+            {{end}}
+          </tbody>
+        </table>
+      {{else}}
+        <p class="muted">No active members.</p>
+      {{end}}
+
+      <h2>Invitations</h2>
+      <p class="muted">First 25 rows. State for everyone: pending, consumed, revoked, expired. The revoke form is deferred to a follow-up PR (needs the dashboard → apid reverse-call seam).</p>
+      {{if $d.Invitations}}
+        <table>
+          <thead>
+            <tr><th>Email</th><th>Role</th><th>Status</th><th>Created</th><th>Expires</th><th>Token&nbsp;prefix</th></tr>
+          </thead>
+          <tbody>
+            {{range $d.Invitations}}
+              <tr>
+                <td>{{.Email}}</td>
+                <td>{{.Role}}</td>
+                <td>
+                  <span class="badge badge-{{.Status}}">{{.Status}}</span>
+                </td>
+                <td>{{.CreatedAt}}</td>
+                <td>{{.ExpiresAt}}</td>
+                <td><code>{{.TokenPrefix}}</code></td>
+              </tr>
+            {{end}}
+          </tbody>
+        </table>
+      {{else}}
+        <p class="muted">No invitations yet. Use the CLI (<code>faas orgs invite {{$d.Org.Slug}} &lt;email&gt;</code>) or the API (<code>POST /v1/orgs/{{$d.Org.Slug}}/members</code>) to create one.</p>
+      {{end}}
+
+      {{if eq $d.CallersRole "owner"}}
+        <p class="muted">As an owner you can transfer ownership via <code>POST /v1/orgs/{{$d.Org.Slug}}/transfer_ownership</code>. SSO settings (when enabled) will appear here in a later PR.</p>
+      {{end}}
+    {{end}}
+  </main>
+  <footer><a href="/dashboard/orgs">All organizations</a> · <a href="/dashboard/account">Account</a></footer>
+</body>
+</html>

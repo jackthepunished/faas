@@ -555,3 +555,122 @@ func TestRender_Billing_PaidPortalUnset(t *testing.T) {
 		t.Errorf("body should NOT contain the portal link button when URL is empty\n--- body ---\n%s", body)
 	}
 }
+
+// TestRender_OrgsPage pins the orgs list + detail templates
+// (PR-8 §3). The list surfaces every org the signed-in account
+// belongs to with seat counts; the detail renders members + a
+// pending-invitations table. Both shapes are owned by the
+// dashboard handlers — this is the template-parse + shape gate.
+func TestRender_OrgsPage(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	acct := &dashboard.AccountView{
+		ID: "a1", Email: "ops@acme.test", Plan: "scale", AppCount: 3,
+	}
+
+	// List, populated.
+	rec := httptest.NewRecorder()
+	listPage := dashboard.Page{
+		Title: "Organizations",
+		Body:  "orgs",
+		Account: acct,
+		Data: dashboard.OrgListData{
+			Orgs: []dashboard.OrgListItem{
+				{Slug: "u-acme1234abcd", Name: "Personal", Plan: "free", Role: "owner", Personal: true},
+				{Slug: "acme", Name: "Acme Co", Plan: "scale", Role: "owner", SeatUsed: 4, SeatLimit: 200},
+				{Slug: "staging", Name: "Acme Staging", Plan: "hobby", Role: "admin", SeatUsed: 10, SeatLimit: 10},
+			},
+		},
+	}
+	if err := dashboard.Render(rec, log, "", listPage); err != nil {
+		t.Fatalf("render orgs list: %v", err)
+	}
+	listBody := rec.Body.String()
+	for _, want := range []string{
+		// Personal-first sort + muted tag.
+		"u-acme1234abcd",
+		"(personal)",
+		// Shared orgs with the seat-count chip.
+		"acme",
+		"4 / 200",
+		"staging",
+		"10 / 10",
+		// Manage affordance + nav.
+		`href="/dashboard/orgs/acme"`,
+		`href="/dashboard/orgs"`,
+	} {
+		if !strings.Contains(listBody, want) {
+			t.Errorf("list body missing %q\n--- body ---\n%s", want, listBody)
+		}
+	}
+
+	// List, empty.
+	rec2 := httptest.NewRecorder()
+	if err := dashboard.Render(rec2, log, "", dashboard.Page{
+		Title: "Organizations",
+		Body:  "orgs",
+		Account: acct,
+		Data:  dashboard.OrgListData{Orgs: nil},
+	}); err != nil {
+		t.Fatalf("render orgs list empty: %v", err)
+	}
+	if !strings.Contains(rec2.Body.String(), "You don't belong to any organization yet") {
+		t.Errorf("empty-state copy missing\n--- body ---\n%s", rec2.Body.String())
+	}
+
+	// Detail: shared org with 2 members + 3 invitations (one of
+	// each non-personal status). The token prefix surfaces the
+	// 8-char hash drop; the role-badge wording is part of the
+	// table's accessibility affordance.
+	rec3 := httptest.NewRecorder()
+	detailPage := dashboard.Page{
+		Title: "Acme Co",
+		Body:  "org_detail",
+		Account: acct,
+		Data: dashboard.OrgDetailData{
+			Org:         dashboard.OrgListItem{Slug: "acme", Name: "Acme Co", Plan: "scale", Role: "owner", SeatUsed: 2, SeatLimit: 200},
+			CallersRole: "owner",
+			SeatUsed:    2,
+			SeatLimit:   200,
+			Members: []dashboard.OrgMemberItem{
+				{AccountID: "a1", Email: "ops@acme.test", Role: "owner", JoinedAt: "2026-01-04"},
+				{AccountID: "a2", Email: "eng@acme.test", Role: "admin", JoinedAt: "2026-02-09"},
+			},
+			Invitations: []dashboard.OrgInvitationItem{
+				{Email: "alice@acme.test", Role: "developer", Status: "pending", CreatedAt: "2026-07-01 12:00 UTC", ExpiresAt: "2026-07-08 12:00 UTC", TokenPrefix: "abcd1234"},
+				{Email: "bob@acme.test", Role: "developer", Status: "consumed", TokenPrefix: "efgh5678"},
+				{Email: "carol@acme.test", Role: "developer", Status: "revoked", TokenPrefix: "ijkl9012"},
+			},
+		},
+	}
+	if err := dashboard.Render(rec3, log, "", detailPage); err != nil {
+		t.Fatalf("render org detail: %v", err)
+	}
+	detailBody := rec3.Body.String()
+	for _, want := range []string{
+		// Plan + role + seat chip.
+		"<strong>scale</strong>",
+		"Your role: <strong>owner</strong>",
+		"<strong>2</strong> / <strong>200</strong>",
+		// Members table.
+		"ops@acme.test",
+		"eng@acme.test",
+		// Invitations table — each rendered status badge appears.
+		`badge badge-pending`,
+		`badge badge-consumed`,
+		`badge badge-revoked`,
+		`>pending<`,
+		`>consumed<`,
+		`>revoked<`,
+		// Token prefix survives the 8-char clip; full hash does
+		// not appear.
+		"<code>abcd1234</code>",
+		// Owner-only nudge surfaces only when CallersRole == owner.
+		"transfer_ownership",
+		// Back link.
+		`href="/dashboard/orgs"`,
+	} {
+		if !strings.Contains(detailBody, want) {
+			t.Errorf("detail body missing %q\n--- body ---\n%s", want, detailBody)
+		}
+	}
+}

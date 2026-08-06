@@ -696,7 +696,12 @@ func TestSeverityOrdinal(t *testing.T) {
 // dashboard_delete_test.go's renderDashboardAccount helper), then
 // POSTs the delete form. A pre-PR-077 cookie (env.StepUpAt zero,
 // which is what newAuthedDashboardServer's mgr.Issue emits) MUST
-// trip the gate with reason="missing" → 403 CodeMFARequired.
+// trip the gate with reason="missing" → 403 CodeStepUpRequired.
+// (PR-8 §1 split the step-up gate's wire code from the
+// requireMFA gate; requireMFA still returns CodeMFARequired,
+// requireStepUp returns CodeStepUpRequired — same TwoFactorGate
+// property but distinguishable in the dashboard's failure
+// banner. See docs/adr/077-step-up-mfa.md §"Routes".)
 //
 // Without the WithStepUp call in sessionAuth the gate's `!has`
 // bypass branch would forward the request — a 302 success that
@@ -717,8 +722,8 @@ func TestSessionAuth_StampsStepUpOnRequestContext(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("pre-PR cookie on /dashboard/account/delete: code = %d, want 403 (step-up gate)\nbody = %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), api.CodeMFARequired) {
-		t.Errorf("body missing code %q; got %s", api.CodeMFARequired, rec.Body.String())
+	if !strings.Contains(rec.Body.String(), api.CodeStepUpRequired) {
+		t.Errorf("body missing code %q; got %s", api.CodeStepUpRequired, rec.Body.String())
 	}
 }
 
