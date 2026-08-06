@@ -11155,11 +11155,19 @@ func scanOrg(r rowScanner) (Org, error) {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on duplicate
 // PK, ErrOrgLastOwner when adding a second active owner would trip the
-// partial unique, ErrNotFound when the org row is missing,
-// ErrOrgMemberCapExceeded when the org's active-member count has
-// reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2 — the
-// defence-in-depth back-stop; consumeOrgInvitation runs the same
-// check, and cmd/apid's enforceMemberCap gates the handler path).
+// partial unique, ErrNotFound when the org row is missing.
+//
+// IAM-6 / ADR-061 PR 7 note: this method does NOT enforce
+// Plan.OrgMembersMax. The cap is only enforced inside
+// ConsumeOrgInvitation's tx (the load-bearing gate). The
+// initial-owner seed at org creation bypasses the cap by design —
+// the brand-new org has active=0, so the cap is non-binding — and
+// every subsequent membership insert flows through the consume
+// path which holds the lock + the count check. The earlier
+// comment claiming "cmd/apid's enforceMemberCap gates the handler
+// path" is stale; that helper is intentionally unwired
+// (cmd/apid/org_handler_helpers.go) and the future direct-add
+// route (PR-11 follow-up) is what would call it.
 func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

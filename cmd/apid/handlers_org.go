@@ -315,3 +315,41 @@ func (s *server) softDeleteOrg(w http.ResponseWriter, r *http.Request, acct stat
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// getOrgSeatUsage returns {used, limit, plan} for the active org.
+// Used comes from Store.CountActiveOrgMembers (the same row the
+// cap-in-tx inside ConsumeOrgInvitation reads). Limit comes from
+// org.Plan.OrgMembersMax() — Free + unknown plans return 0 to match
+// the fail-closed accessor. Visibility-only (no billing / meterd
+// change); PR-9 ships the pricing cut-over per ADR-061 §"Out of
+// scope".
+//
+// Mounted at GET /v1/orgs/{slug}/seat_usage. Gated by
+// authz.OrgActionView (every role). The dashboard consumes the
+// response directly; no further round-trip to GET /v1/orgs/{slug}
+// is needed.
+func (s *server) getOrgSeatUsage(w http.ResponseWriter, r *http.Request, _ state.Account) {
+	if !s.requireOrgAction(w, r, authz.OrgActionView) {
+		return
+	}
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
+		return
+	}
+	org, ok := s.rehydrateOrg(r.Context(), w, mem)
+	if !ok {
+		return
+	}
+	used, err := s.store.CountActiveOrgMembers(r.Context(), org.ID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity, "CountActiveOrgMembers failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.SeatUsageResponse{
+		Used:  used,
+		Limit: org.Plan.OrgMembersMax(),
+		Plan:  string(org.Plan),
+	})
+}
