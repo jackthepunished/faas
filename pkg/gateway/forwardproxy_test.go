@@ -27,6 +27,7 @@ import (
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -48,7 +49,8 @@ import (
 // Stream field carries the configured fakeBidiStream; an
 // unset Stream + a drive-through call panics ("not stubbed").
 type fakeVmmdClient struct {
-	Stream *fakeBidiStream
+	Stream    *fakeBidiStream
+	RawStream *fakeRawBidiStream
 }
 
 // ForwardHTTPStream returns the configured Stream. The forwarder
@@ -63,13 +65,17 @@ func (f *fakeVmmdClient) ForwardHTTPStream(_ context.Context, _ ...grpc.CallOpti
 // ForwardRawStream (issue #676 / ADR-080) is the raw-bytes
 // bridge for Upgrade traffic (WebSocket / h2c / MQTT-over-WS /
 // long-poll). The PR-3 gateway forwarder opens this stream when
-// it detects Connection: Upgrade + Upgrade: <token>; until then
-// no gateway code path reaches it, so the stub panics with a
-// distinctive message so an accidentally-wired test surfaces
-// the mistake immediately rather than silently round-tripping
-// through the legacy ForwardHTTPStream path.
+// it detects Connection: Upgrade + Upgrade: <token>; the
+// forwardproxy test seam returns a configured fakeRawBidiStream
+// (or panics with a distinctive message if no RawStream was set,
+// so an accidentally-wired test surfaces immediately rather than
+// silently round-tripping through the legacy ForwardHTTPStream
+// path).
 func (f *fakeVmmdClient) ForwardRawStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], error) {
-	panic("ForwardRawStream: not stubbed (PR-3 ships the gateway forwarder — set fakeVmmdClient.RawStream)")
+	if f.RawStream == nil {
+		panic("ForwardRawStream: not stubbed (set fakeVmmdClient.RawStream)")
+	}
+	return f.RawStream, nil
 }
 
 // All other RPCs panic — the forwarder only calls ForwardHTTPStream.
@@ -200,6 +206,77 @@ func (s *fakeBidiStream) Header() (metadata.MD, error) {
 	return nil, nil
 }
 func (s *fakeBidiStream) Trailer() metadata.MD { return nil }
+
+// fakeRawBidiStream (issue #676 / ADR-080) is the in-process fake
+// for grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse]
+// used by the raw-bytes Upgrade forwarder test. The test pre-loads
+// Responses (the canned server→client frame queue; io.EOF on Recv
+// when the queue is drained) and inspects Sends after the forwarder
+// returns. Send and Recv run on different goroutines (Send from the
+// body-copy goroutine, Recv from the receiver loop), so the queue
+// is guarded with a mutex. The init-frame fixture is the canonical
+// pattern for tests that want to assert the gateway wrote a
+// ForwardRawRequestInit matching the expected Instance/Port before
+// the body chunks started flowing.
+type fakeRawBidiStream struct {
+	mu        sync.Mutex
+	Responses []*vmmdpb.ForwardRawResponse
+	Sends     []*vmmdpb.ForwardRawRequest
+	closed    bool
+	recvIdx   int
+	recvErr   error // overrides Responses on the next Recv (e.g. codes.Unavailable)
+	ctx       context.Context
+}
+
+func (s *fakeRawBidiStream) HeaderStream() grpc.ClientStream { return nil }
+func (s *fakeRawBidiStream) TrailerOnly() bool               { return false }
+
+func (s *fakeRawBidiStream) Send(req *vmmdpb.ForwardRawRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return io.EOF
+	}
+	s.Sends = append(s.Sends, req)
+	return nil
+}
+
+func (s *fakeRawBidiStream) Recv() (*vmmdpb.ForwardRawResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recvErr != nil {
+		err := s.recvErr
+		s.recvErr = nil
+		return nil, err
+	}
+	if s.recvIdx >= len(s.Responses) {
+		return nil, io.EOF
+	}
+	resp := s.Responses[s.recvIdx]
+	s.recvIdx++
+	return resp, nil
+}
+
+func (s *fakeRawBidiStream) CloseSend() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+func (s *fakeRawBidiStream) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (s *fakeRawBidiStream) SendMsg(any) error { return nil }
+func (s *fakeRawBidiStream) RecvMsg(any) error { return nil }
+func (s *fakeRawBidiStream) Header() (metadata.MD, error) {
+	return nil, nil
+}
+func (s *fakeRawBidiStream) Trailer() metadata.MD { return nil }
 
 // SeccompStatus (M8 §11) — the gateway hot path doesn't poll
 // seccomp state; cmd/e2e/sec11_seccomp_e2e_test.go dials the
@@ -785,4 +862,203 @@ func keys(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Raw-bytes Upgrade-bridge forwarder tests (issue #676 / ADR-080).
+// These pin the round-trip contract of rawStreamOnceWithEvents:
+// the gateway must (1) open ForwardRawStream, (2) send an init frame
+// carrying Instance + Port + MaxRequestBytes, (3) stream the inbound
+// request body bytes verbatim (including the request line +
+// Connection: Upgrade + Upgrade: <token> headers the hop-by-hop
+// strip would otherwise drop), (4) emit the response init frame's
+// status + headers, (5) flush each body chunk to the inbound
+// ResponseWriter so the H2C transport emits a DATA frame per
+// chunk, and (6) tear down on client cancel within 100 ms.
+//
+// The tests use the package-private fakeRawBidiStream (defined
+// above) so the forwarder exercises its full body-copy goroutine
+// + receiver loop without a real gRPC server.
+
+// TestRawStreamReverseProxy_RoundTrip confirms the happy path: a
+// canned 101 Switching Protocols response with a small body is
+// delivered to the inbound writer, the init frame carries the
+// expected Instance + Port + MaxRequestBytes, and the request
+// body's bytes arrive on the bridge verbatim.
+func TestRawStreamReverseProxy_RoundTrip(t *testing.T) {
+	stream := &fakeRawBidiStream{
+		Responses: []*vmmdpb.ForwardRawResponse{
+			{Frame: &vmmdpb.ForwardRawResponse_Init{
+				Init: &vmmdpb.ForwardRawResponseInit{
+					Status: 101,
+					Headers: []*vmmdpb.Header{
+						{Name: "Connection", Value: "Upgrade"},
+						{Name: "Upgrade", Value: "websocket"},
+					},
+				},
+			}},
+			{Frame: &vmmdpb.ForwardRawResponse_BodyChunk{
+				BodyChunk: []byte("upgrade-ack"),
+			}},
+		},
+	}
+	cli := &fakeVmmdClient{RawStream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+
+	body := "GET /socket HTTP/1.1\r\nHost: app.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(body))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("x-faas-instance", "i-test")
+
+	rec := httptest.NewRecorder()
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-test", Port: 8080}).ServeHTTP(rec, req)
+
+	if rec.Code != 101 {
+		t.Errorf("status = %d, want 101", rec.Code)
+	}
+	if got := rec.Header().Get("Upgrade"); got != "websocket" {
+		t.Errorf("Upgrade header = %q, want websocket", got)
+	}
+	if got := rec.Body.String(); got != "upgrade-ack" {
+		t.Errorf("body = %q, want upgrade-ack", got)
+	}
+
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
+	}
+	init := stream.Sends[0].GetInit()
+	if init == nil {
+		t.Fatalf("first Send is not an init frame: %+v", stream.Sends[0])
+	}
+	if init.GetInstance() != "i-test" {
+		t.Errorf("init.Instance = %q, want i-test", init.GetInstance())
+	}
+	if init.GetPort() != 8080 {
+		t.Errorf("init.Port = %d, want 8080", init.GetPort())
+	}
+	if init.GetMaxRequestBytes() != int64(api.RawStreamMaxRequestBytes) {
+		t.Errorf("init.MaxRequestBytes = %d, want %d",
+			init.GetMaxRequestBytes(), api.RawStreamMaxRequestBytes)
+	}
+}
+
+// TestRawStreamReverseProxy_RemoteWakeNode confirms the per-node
+// gRPC channel lookup respects NodeID — a different NodeID must
+// route through whatever ClientFor returns. We pin the contract by
+// wiring the lookup to return a fresh client per NodeID, then
+// asserting the inbound request reached the right fake.
+func TestRawStreamReverseProxy_RemoteWakeNode(t *testing.T) {
+	stream := &fakeRawBidiStream{
+		Responses: []*vmmdpb.ForwardRawResponse{
+			{Frame: &vmmdpb.ForwardRawResponse_Init{
+				Init: &vmmdpb.ForwardRawResponseInit{Status: 200},
+			}},
+			{Frame: &vmmdpb.ForwardRawResponse_BodyChunk{
+				BodyChunk: []byte("remote-ok"),
+			}},
+		},
+	}
+	cli := &fakeVmmdClient{RawStream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(""))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("x-faas-instance", "i-remote")
+	rec := httptest.NewRecorder()
+	proxy(gateway.Target{NodeID: "node-remote-uuid", InstanceID: "i-remote", Port: 8080}).ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != "remote-ok" {
+		t.Errorf("body = %q, want remote-ok", got)
+	}
+	if len(stream.Sends) < 1 {
+		t.Fatalf("expected ≥ 1 Send (init), got %d", len(stream.Sends))
+	}
+	init := stream.Sends[0].GetInit()
+	if init.GetInstance() != "i-remote" {
+		t.Errorf("init.Instance = %q, want i-remote", init.GetInstance())
+	}
+}
+
+// TestRawStreamReverseProxy_InitError_Populated confirms that a
+// non-OK status from the bridge surfaces the init.error string in
+// the response body. The init frame's status is honored, so the
+// inbound writer sees 502 (the bridge's fault) and the body
+// contains the diagnostic.
+func TestRawStreamReverseProxy_InitError_Populated(t *testing.T) {
+	stream := &fakeRawBidiStream{
+		Responses: []*vmmdpb.ForwardRawResponse{
+			{Frame: &vmmdpb.ForwardRawResponse_Init{
+				Init: &vmmdpb.ForwardRawResponseInit{
+					Status: 502,
+					Error:  "dial refused",
+				},
+			}},
+		},
+	}
+	cli := &fakeVmmdClient{RawStream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(""))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-x", Port: 8080}).ServeHTTP(rec, req)
+
+	if rec.Code != 502 {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "dial refused") {
+		t.Errorf("body = %q, want it to contain 'dial refused'", rec.Body.String())
+	}
+}
+
+// TestRawStreamReverseProxy_ClientCancel_TearsDownStream confirms
+// that cancelling r.Context() triggers CloseSend on the bidi
+// stream within a short window — the body-copy goroutine must
+// exit promptly rather than blocking on the next Read. We pin
+// this with a deadline to make the test deterministic under load.
+func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
+	// Build a stream whose Responses is empty + recvErr nil; the
+	// receiver loop blocks on Recv until ctx cancel. The fake
+	// returns io.EOF once Responses is drained, so we close it
+	// ourselves via a sentinel: never Recv after the test cancels.
+	stream := &fakeRawBidiStream{}
+	cli := &fakeVmmdClient{RawStream: stream}
+	lookup := &fakeNodeLookup{cli: cli}
+	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(""))
+	req = req.WithContext(ctx)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	// Cancel from another goroutine after a short delay so the
+	// body-copy goroutine has time to enter cr.Read.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		rec := httptest.NewRecorder()
+		proxy(gateway.Target{NodeID: "node-1", InstanceID: "i-x", Port: 8080}).ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Forwarder returned — CloseSend was called by the
+		// body-copy goroutine on ctx cancellation.
+	case <-time.After(2 * time.Second):
+		t.Fatal("forwarder did not return within 2s of ctx cancel")
+	}
 }

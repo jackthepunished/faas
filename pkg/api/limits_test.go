@@ -62,6 +62,12 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (25 MiB) and ResponseWriteTimeoutSeconds (300 s) are the
 			// pre-#471 spec §4.1 caps PR-A inherits.
 			StreamingEnabled: false, MaxResponseBodyBytes: 26_214_400, ResponseWriteTimeoutSeconds: 300,
+			// Issue #676 / ADR-080: Free is the abuse-floor tier — a
+			// long-lived WS would pin a wake past the 30 s Free idle
+			// timeout. Default off; apid PATCH rejects with 403
+			// plan_websocket_not_allowed (mirrors Free's
+			// StreamingEnabled=false envelope above).
+			WebSocketEnabled: false,
 			// Issue #461 / ADR-062: Free has no private-registry
 			// credential surface (handler returns 403
 			// plan_registry_credentials_not_allowed).
@@ -140,6 +146,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (100 MiB / 900 s) — the first paid tier. PR-A wires
 			// the flag + accessor; PR-B activates the Flusher path.
 			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
+			// Issue #676 / ADR-080: Hobby unlocks the raw-bytes
+			// Upgrade bridge — many agent / LLM SDKs speak WS over a
+			// thin HTTP boundary, and Hobby is the tier where those
+			// workloads land first.
+			WebSocketEnabled: true,
 			// Issue #517 / PR-B: Hobby unlocks the `?deployment=`
 			// filter for the typical one-staging-deployment workload.
 			LogDeploymentFilterMax: 1,
@@ -207,6 +218,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// envelope as Hobby. The cap is the same; the per-app
 			// streaming path is gatewayd-edged, not per-tier.
 			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
+			// Issue #676 / ADR-080: Pro unlocks the raw-bytes
+			// Upgrade bridge for the same reason as Hobby — production
+			// workloads at this tier run agent / WS-backed services.
+			WebSocketEnabled: true,
 			// Issue #517 / PR-B: Pro gets 10 — covers the typical
 			// multi-staging fan-out (prod + 3-5 staging + a few
 			// preview slots) without monopolising the schedd's
@@ -282,6 +297,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// tiers — the spec's paid-only unlock is the boolean, not
 			// the byte/time ceiling.
 			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
+			// Issue #676 / ADR-080: Scale unlocks the raw-bytes
+			// Upgrade bridge — production WS-backed services sit at
+			// this tier.
+			WebSocketEnabled: true,
 			// Issue #517 / PR-B: Scale gets 50 — 5× Pro, tracks the
 			// larger app budget (100 vs 25) and multi-region staging
 			// fan-out SaaS-scale customers typically run.
@@ -1521,5 +1540,59 @@ func TestLogRingBufferBytes(t *testing.T) {
 	if LogRingBufferBytes > saneUpperBound {
 		t.Errorf("LogRingBufferBytes = %d, want <= %d (1 MiB sanity upper bound; per-guest ring buffer must not silently bloat memory)",
 			LogRingBufferBytes, saneUpperBound)
+	}
+}
+
+// TestPlanWebSocketEnabled pins the per-plan gate for the raw-bytes
+// Upgrade bridge (issue #676 / ADR-080). Free stays off (abuse-floor
+// tier — a long-lived WS would pin a wake past wake_idle_timeout);
+// Hobby/Pro/Scale opt in. The fail-closed contract means an unknown
+// plan reads as false (the same shape as MinInstancesAllowed /
+// EgressAllowlistAllowed).
+//
+// Both WebSocketEnabled (the create-time default) and
+// WebSocketResponseAllowed (the PATCH-time gate) read the same
+// per-plan Limits.WebSocketEnabled bit — same shape as the
+// StreamingEnabled pair in 00080_apps_streaming_enabled / limits.go
+// (the create-time default and the PATCH-time gate both read
+// l.StreamingEnabled so a Free app cannot opt in even when an admin
+// backfills the column). Mirrors TestPlanSidecarAllowed above.
+func TestPlanWebSocketEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		plan   Plan
+		want   bool
+		reason string
+	}{
+		{PlanFree, false, "Free is the abuse-floor tier; long-lived WS would pin a wake past wake_idle_timeout"},
+		{PlanHobby, true, "Hobby is the first paid tier; LLM/agent SDKs speak WS over HTTP"},
+		{PlanPro, true, "Pro is the first tier where production workloads sit"},
+		{PlanScale, true, "Scale is the tier where production WS-backed services run"},
+	} {
+		t.Run(string(tc.plan), func(t *testing.T) {
+			if got := tc.plan.WebSocketEnabled(); got != tc.want {
+				t.Errorf("%s.WebSocketEnabled() = %v, want %v (%s)",
+					tc.plan, got, tc.want, tc.reason)
+			}
+			if got := tc.plan.WebSocketResponseAllowed(); got != tc.want {
+				t.Errorf("%s.WebSocketResponseAllowed() = %v, want %v (PATCH gate mirrors the default)",
+					tc.plan, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPlanWebSocketEnabled_UnknownFailsClosed pins the fail-closed
+// contract for an unknown plan (same shape as the per-plan gate
+// accessors above). A typo in apid's buildApp (e.g. Plan("freee"))
+// must not silently enable the raw-bytes bridge; the worst case is
+// the customer accidentally gets an open Upgrade on a plan that
+// doesn't allow it, which would let a long-lived WS run unmetered.
+func TestPlanWebSocketEnabled_UnknownFailsClosed(t *testing.T) {
+	const unknown = Plan("nonexistent")
+	if got := unknown.WebSocketEnabled(); got {
+		t.Errorf("Plan(nonexistent).WebSocketEnabled() = true, want false (fail-closed)")
+	}
+	if got := unknown.WebSocketResponseAllowed(); got {
+		t.Errorf("Plan(nonexistent).WebSocketResponseAllowed() = true, want false (fail-closed)")
 	}
 }

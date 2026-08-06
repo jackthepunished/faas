@@ -57,6 +57,17 @@ type CreateAppRequest struct {
 	// threshold for warm-tier capture at creation time. nil → plan
 	// default (2000 on Pro/Scale; 0 on Free/Hobby). Range [100, 60000].
 	WarmSnapshotMinMs *int `json:"warm_snapshot_min_ms,omitempty"`
+	// WebSocketEnabled (issue #676 / ADR-080) opts the brand-new
+	// app into the raw-bytes Upgrade bridge (WebSocket / h2c /
+	// MQTT-over-WS / long-poll). nil → plan default (Free off;
+	// Hobby/Pro/Scale on). Explicit true on Free = rejected by
+	// apid with 403 plan_websocket_not_allowed. Explicit false
+	// on Hobby/Pro/Scale = opt out (a synchronous JSON API that
+	// does not want long-poll connections pinning a wake past
+	// wake_idle_timeout). The default-on shape mirrors the
+	// streaming pattern from issue #471 — same fail-closed
+	// contract, same Plan.WebSocketEnabled() accessor.
+	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -112,6 +123,19 @@ type UpdateAppRequest struct {
 	// that wants Content-Length). Pointer distinguishes "don't
 	// touch" (nil) from "explicit false" (*bool=false).
 	StreamingEnabled *bool `json:"streaming_enabled,omitempty"`
+	// WebSocketEnabled (issue #676 / ADR-080) toggles the per-app
+	// raw-bytes Upgrade bridge. When true (or unset on a plan
+	// where the default is true), gatewayd-internal detects
+	// Connection: Upgrade + Upgrade: <token> on inbound requests
+	// and routes them via ForwardRawStream to the guest netns TCP
+	// socket. When false, the upgrade detector returns 501 with
+	// x-faas-error-reason: websocket_not_on_plan. Plan-gated
+	// upstream: Free returns 403 plan_websocket_not_allowed when
+	// a customer attempts PATCH true. Hobby/Pro/Scale may PATCH
+	// true → false to opt out (e.g. a synchronous JSON API that
+	// does not want long-poll pinning). Pointer distinguishes
+	// "don't touch" (nil) from "explicit false" (*bool=false).
+	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys on
 	// a valid cosign signature from a trusted publisher (mirrors AWS
 	// Lambda's Code Signing for Lambda). When true, imaged verifies
@@ -421,6 +445,14 @@ type AppResponse struct {
 	// dashboards can show "streaming on / off" alongside the
 	// egress-allowlist flag.
 	StreamingEnabled bool `json:"streaming_enabled"`
+	// WebSocketEnabled (issue #676 / ADR-080) reflects the per-app
+	// raw-bytes Upgrade bridge flag stored on the apps row. False
+	// on Free (the plan default and the only legal state — apid
+	// rejects PATCH true with 403 plan_websocket_not_allowed).
+	// True on Hobby/Pro/Scale by default unless the customer
+	// explicitly opted out via PATCH. Surfaced so dashboards can
+	// show "websocket on / off" alongside the streaming pill.
+	WebSocketEnabled bool `json:"websocket_enabled"`
 	// EvictionPriority (issue #475) is the per-app eviction tier
 	// classification. 'best_effort' (default for every pre-#475
 	// row, applied by the column DEFAULT at migration time) keeps
