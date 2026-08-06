@@ -1718,9 +1718,6 @@ func (s *server) notFound(w http.ResponseWriter, what string) {
 	api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Not found", what))
 }
 
-// ctx is a tiny helper to keep handler signatures clean.
-func ctx(r *http.Request) context.Context { return r.Context() }
-
 // loadApp resolves a slug to an account-scoped App, collapsing cross-account
 // lookups to 404 per the handler convention. Returns the resolved app or
 // writes the error and returns false.

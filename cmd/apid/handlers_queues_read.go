@@ -42,7 +42,7 @@ func (s *server) queueState(w http.ResponseWriter, r *http.Request, acct state.A
 		return
 	}
 	limits := api.MustLimitsFor(acct.Plan)
-	stats, err := s.store.QueueState(ctx(r), app.ID)
+	stats, err := s.store.QueueState(r.Context(), app.ID)
 	if err != nil {
 		slog.Default().Error("queue state read failed", "app_id", app.ID, "err", err)
 		api.WriteProblem(w, api.ErrInternal("queue state"))
@@ -87,7 +87,7 @@ func (s *server) queuePeek(w http.ResponseWriter, r *http.Request, acct state.Ac
 		}
 	}
 	before := r.URL.Query().Get("before")
-	rows, err := s.store.QueuePeek(ctx(r), app.ID, limit, before)
+	rows, err := s.store.QueuePeek(r.Context(), app.ID, limit, before)
 	if err != nil {
 		slog.Default().Error("queue peek read failed", "app_id", app.ID, "err", err)
 		api.WriteProblem(w, api.ErrInternal("queue peek"))
@@ -124,7 +124,7 @@ func (s *server) queueDeadLetter(w http.ResponseWriter, r *http.Request, acct st
 		}
 	}
 	before := r.URL.Query().Get("before")
-	rows, err := s.store.QueueDeadLetter(ctx(r), app.ID, limit, before)
+	rows, err := s.store.QueueDeadLetter(r.Context(), app.ID, limit, before)
 	if err != nil {
 		slog.Default().Error("queue dead-letter read failed", "app_id", app.ID, "err", err)
 		api.WriteProblem(w, api.ErrInternal("queue dead_letter"))

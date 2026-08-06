@@ -76,7 +76,7 @@ func (s *server) listTrustedSigners(w http.ResponseWriter, r *http.Request, acct
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAppTrustedSigners(ctx(r), acct.ID, app.ID)
+	rows, err := s.store.ListAppTrustedSigners(r.Context(), acct.ID, app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list trusted signers"))
 		return
@@ -132,11 +132,11 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	limits := api.MustLimitsFor(acct.Plan)
-	if prob := s.checkTrustedSignerQuota(ctx(r), acct, app, name, limits); prob != nil {
+	if prob := s.checkTrustedSignerQuota(r.Context(), acct, app, name, limits); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
-	_, rotated, err := s.store.UpsertAppTrustedSigner(ctx(r), acct.ID, app.ID, name, pubKey, acct.ID)
+	_, rotated, err := s.store.UpsertAppTrustedSigner(r.Context(), acct.ID, app.ID, name, pubKey, acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not persist trusted signer"))
 		return
@@ -146,7 +146,7 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 	// fire-and-forget shape mirrors the other Notify* call sites in
 	// handlers_env.go / handlers_secrets.go.
 	if s.notif != nil {
-		_ = s.notif.Notify(ctx(r), "trusted_signer_changed",
+		_ = s.notif.Notify(r.Context(), "trusted_signer_changed",
 			fmt.Sprintf(`{"kind":"upserted","app_id":"%s","signer":"%s"}`, app.ID, name))
 	}
 	s.log.Info("trusted signer upserted",
@@ -165,7 +165,7 @@ func (s *server) upsertTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 	if rotated {
 		kind = "app.trusted_signer_rotated"
 	}
-	s.audit.Emit(ctx(r), kind, &app.ID, map[string]any{
+	s.audit.Emit(r.Context(), kind, &app.ID, map[string]any{
 		"app_id":    app.ID,
 		"signer":    name,
 		"key_bytes": len(pubKey),
@@ -231,7 +231,7 @@ func (s *server) deleteTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteAppTrustedSigner(ctx(r), acct.ID, app.ID, name); err != nil {
+	if err := s.store.DeleteAppTrustedSigner(r.Context(), acct.ID, app.ID, name); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.ErrTrustedSignerNotFound(name))
 			return
@@ -240,7 +240,7 @@ func (s *server) deleteTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 		return
 	}
 	if s.notif != nil {
-		_ = s.notif.Notify(ctx(r), "trusted_signer_changed",
+		_ = s.notif.Notify(r.Context(), "trusted_signer_changed",
 			fmt.Sprintf(`{"kind":"deleted","app_id":"%s","signer":"%s"}`, app.ID, name))
 	}
 	s.log.Info("trusted signer deleted",
@@ -248,7 +248,7 @@ func (s *server) deleteTrustedSigner(w http.ResponseWriter, r *http.Request, acc
 		"signer", name,
 		"account", acct.ID,
 	)
-	s.audit.Emit(ctx(r), "app.trusted_signer_removed", &app.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.trusted_signer_removed", &app.ID, map[string]any{
 		"app_id": app.ID,
 		"signer": name,
 	})

@@ -83,7 +83,7 @@ func (s *server) invokeAppAsync(w http.ResponseWriter, r *http.Request, acct sta
 	if req.Path == "" {
 		req.Path = "/"
 	}
-	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:     app.ID,
 		AccountID: acct.ID,
 		Source:    state.InvocationAsyncInvoke,
@@ -133,7 +133,7 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if acct.Plan == api.PlanFree {
 		timeout = 5 * time.Second
 	}
-	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:     app.ID,
 		AccountID: acct.ID,
 		Source:    state.InvocationAsyncInvoke, // sync reuses the async source; the long-poll is what makes it sync
@@ -147,7 +147,7 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrCapacity("enqueue sync invoke"))
 		return
 	}
-	payload, err := s.notif.WaitFor(ctx(r), db.NotifyInvocationDone,
+	payload, err := s.notif.WaitFor(r.Context(), db.NotifyInvocationDone,
 		func(p string) bool {
 			// Canonical match — parse the JSON and compare by id, not
 			// by substring. A 32-char id suffix can otherwise match
@@ -167,7 +167,7 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	}
 	// Pull the post-state row. Drain stamps InstanceID + Result
 	// before emitting invocation_done.
-	final, ferr := s.store.InvocationByID(ctx(r), inv.ID)
+	final, ferr := s.store.InvocationByID(r.Context(), inv.ID)
 	if ferr != nil {
 		api.WriteProblem(w, api.ErrInvocationNotFound(inv.ID))
 		return
@@ -198,7 +198,7 @@ func (s *server) queueSend(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrPlanFeatureGated("queues", acct.Plan))
 		return
 	}
-	n, err := s.store.CountPendingInvocations(ctx(r), app.ID, state.InvocationQueue)
+	n, err := s.store.CountPendingInvocations(r.Context(), app.ID, state.InvocationQueue)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("count queue"))
 		return
@@ -211,7 +211,7 @@ func (s *server) queueSend(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
 		return
 	}
-	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:     app.ID,
 		AccountID: acct.ID,
 		Source:    state.InvocationQueue,
@@ -239,7 +239,7 @@ func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state
 		return
 	}
 	const timeout = 30 * time.Second
-	payload, err := s.notif.WaitFor(ctx(r), db.NotifyInvocationDone,
+	payload, err := s.notif.WaitFor(r.Context(), db.NotifyInvocationDone,
 		func(p string) bool {
 			// Canonical match on app_id — substring tests would let a
 			// 32-char id tail collide with an unrelated id (review
@@ -257,7 +257,7 @@ func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state
 		return
 	}
 	invID := extractInvocationID(payload)
-	inv, ferr := s.store.InvocationByID(ctx(r), invID)
+	inv, ferr := s.store.InvocationByID(r.Context(), invID)
 	if ferr != nil || inv.AccountID != acct.ID || inv.AppID != app.ID {
 		// Don't leak ownership — the predicate matches on app_id, but
 		// cross-account reads must surface 404, not 200 with a foreign
@@ -281,7 +281,7 @@ func (s *server) queueReceive(w http.ResponseWriter, r *http.Request, acct state
 // Idempotent: a re-ack is a 204.
 func (s *server) queueAck(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	inv, err := s.store.InvocationByID(ctx(r), id)
+	inv, err := s.store.InvocationByID(r.Context(), id)
 	if err != nil || inv.AccountID != acct.ID {
 		api.WriteProblem(w, api.ErrInvocationNotFound(id))
 		return
@@ -345,7 +345,7 @@ func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct 
 		api.WriteProblem(w, api.ErrPlanFeatureGated("delayed_tasks", acct.Plan))
 		return
 	}
-	n, err := s.store.CountPendingInvocations(ctx(r), app.ID, state.InvocationDelayedTask)
+	n, err := s.store.CountPendingInvocations(r.Context(), app.ID, state.InvocationDelayedTask)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("count delayed tasks"))
 		return
@@ -364,7 +364,7 @@ func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct 
 		return
 	}
 	sched := req.ScheduledAt.UTC()
-	inv, err := s.store.EnqueueInvocation(ctx(r), state.Invocation{
+	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:       app.ID,
 		AccountID:   acct.ID,
 		Source:      state.InvocationDelayedTask,
@@ -387,7 +387,7 @@ func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct 
 // surfaces here.
 func (s *server) delayedTaskGet(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	inv, err := s.store.InvocationByID(ctx(r), id)
+	inv, err := s.store.InvocationByID(r.Context(), id)
 	if err != nil || inv.AccountID != acct.ID || inv.Source != state.InvocationDelayedTask {
 		api.WriteProblem(w, api.ErrInvocationNotFound(id))
 		return
@@ -405,12 +405,12 @@ func (s *server) delayedTaskGet(w http.ResponseWriter, r *http.Request, acct sta
 // an error).
 func (s *server) delayedTaskCancel(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	inv, err := s.store.InvocationByID(ctx(r), id)
+	inv, err := s.store.InvocationByID(r.Context(), id)
 	if err != nil || inv.AccountID != acct.ID || inv.Source != state.InvocationDelayedTask {
 		api.WriteProblem(w, api.ErrInvocationNotFound(id))
 		return
 	}
-	if err := s.store.CancelInvocation(ctx(r), id); err != nil {
+	if err := s.store.CancelInvocation(r.Context(), id); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.ErrInvocationNotFound(id))
 			return
@@ -443,7 +443,7 @@ func (s *server) listInvocations(w http.ResponseWriter, r *http.Request, acct st
 		}
 	}
 	before := r.URL.Query().Get("before")
-	rows, err := s.store.ListInvocationsForAccount(ctx(r), acct.ID, limit, before)
+	rows, err := s.store.ListInvocationsForAccount(r.Context(), acct.ID, limit, before)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("list invocations"))
 		return
@@ -467,7 +467,7 @@ type invocationListResponse struct {
 // never sees another tenant's id.
 func (s *server) getInvocation(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	inv, err := s.store.InvocationByID(ctx(r), id)
+	inv, err := s.store.InvocationByID(r.Context(), id)
 	if err != nil || inv.AccountID != acct.ID {
 		api.WriteProblem(w, api.ErrInvocationNotFound(id))
 		return

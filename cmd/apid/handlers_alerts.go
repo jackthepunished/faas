@@ -102,7 +102,7 @@ func (s *server) listAlertRules(w http.ResponseWriter, r *http.Request, acct sta
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAlertRulesForAccount(ctx(r), acct.ID)
+	rows, err := s.store.ListAlertRulesForAccount(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list alert rules"))
 		return
@@ -170,7 +170,7 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, prob)
 		return
 	}
-	if prob := resolveAndCheckEgress(ctx(r), req.WebhookURL); prob != nil {
+	if prob := resolveAndCheckEgress(r.Context(), req.WebhookURL); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -188,7 +188,7 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrCapacity("could not seal webhook secret"))
 		return
 	}
-	row, err := s.store.CreateAlertRuleIfUnderQuota(ctx(r), state.AlertRule{
+	row, err := s.store.CreateAlertRuleIfUnderQuota(r.Context(), state.AlertRule{
 		AccountID:           acct.ID,
 		AppID:               app.ID,
 		Name:                req.Name,
@@ -235,7 +235,7 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 	// secret or its sealed ciphertext — both would leak the same
 	// material (the sealed value is decryptable by anyone with the
 	// host key) and only the masked constant is safe.
-	s.audit.Emit(ctx(r), "alert_rule.created", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "alert_rule.created", &acct.ID, map[string]any{
 		"rule_id":          row.ID,
 		"app_id":           row.AppID,
 		"name":             row.Name,
@@ -259,7 +259,7 @@ func (s *server) createAlertRule(w http.ResponseWriter, r *http.Request, acct st
 // foreign account's rule by id. Mirrors handlers_ext.go:789.
 func (s *server) getAlertRule(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	row, err := s.store.AlertRuleByID(ctx(r), id)
+	row, err := s.store.AlertRuleByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such alert rule")
 		return
@@ -272,7 +272,7 @@ func (s *server) getAlertRule(w http.ResponseWriter, r *http.Request, acct state
 	// Account-wide rules (AppID == "") skip this — they don't have
 	// an app to verify against.
 	if row.AppID != "" {
-		app, err := s.store.AppByID(ctx(r), row.AppID)
+		app, err := s.store.AppByID(r.Context(), row.AppID)
 		if err != nil || app.AccountID != acct.ID {
 			s.notFound(w, "no such alert rule")
 			return
@@ -300,7 +300,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	id := r.PathValue("id")
-	row, err := s.store.AlertRuleByID(ctx(r), id)
+	row, err := s.store.AlertRuleByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such alert rule")
 		return
@@ -310,7 +310,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	if row.AppID != "" {
-		app, err := s.store.AppByID(ctx(r), row.AppID)
+		app, err := s.store.AppByID(r.Context(), row.AppID)
 		if err != nil || app.AccountID != acct.ID {
 			s.notFound(w, "no such alert rule")
 			return
@@ -344,7 +344,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 	}
 	// Optional URL re-guard.
 	if req.WebhookURL != nil {
-		if prob := resolveAndCheckEgress(ctx(r), *req.WebhookURL); prob != nil {
+		if prob := resolveAndCheckEgress(r.Context(), *req.WebhookURL); prob != nil {
 			api.WriteProblem(w, prob)
 			return
 		}
@@ -368,7 +368,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		}
 		sealedPtr = &sealed
 	}
-	updated, err := s.store.UpdateAlertRule(ctx(r), id, state.UpdateAlertRuleParams{
+	updated, err := s.store.UpdateAlertRule(r.Context(), id, state.UpdateAlertRuleParams{
 		Name:                req.Name,
 		Enabled:             req.Enabled,
 		Metric:              ptrAlertMetric(req.Metric),
@@ -438,7 +438,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		oldMap["cooldown_minutes"] = row.CooldownMinutes
 		newMap["cooldown_minutes"] = updated.CooldownMinutes
 	}
-	s.audit.Emit(ctx(r), "alert_rule.updated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "alert_rule.updated", &acct.ID, map[string]any{
 		"rule_id": updated.ID,
 		"app_id":  updated.AppID,
 		"old":     oldMap,
@@ -456,7 +456,7 @@ func (s *server) updateAlertRule(w http.ResponseWriter, r *http.Request, acct st
 // audit row would be empty.
 func (s *server) deleteAlertRule(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	row, err := s.store.AlertRuleByID(ctx(r), id)
+	row, err := s.store.AlertRuleByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such alert rule")
 		return
@@ -466,13 +466,13 @@ func (s *server) deleteAlertRule(w http.ResponseWriter, r *http.Request, acct st
 		return
 	}
 	if row.AppID != "" {
-		app, err := s.store.AppByID(ctx(r), row.AppID)
+		app, err := s.store.AppByID(r.Context(), row.AppID)
 		if err != nil || app.AccountID != acct.ID {
 			s.notFound(w, "no such alert rule")
 			return
 		}
 	}
-	if err := s.store.DeleteAlertRule(ctx(r), id); err != nil {
+	if err := s.store.DeleteAlertRule(r.Context(), id); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such alert rule")
 			return
@@ -488,7 +488,7 @@ func (s *server) deleteAlertRule(w http.ResponseWriter, r *http.Request, acct st
 	// IAM-4 (ADR-035): record the rule deletion. Pair of
 	// .created + .deleted, matching the cron family at
 	// handlers_ext.go:855.
-	s.audit.Emit(ctx(r), "alert_rule.deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "alert_rule.deleted", &acct.ID, map[string]any{
 		"rule_id": id,
 		"app_id":  row.AppID,
 		"name":    row.Name,
@@ -512,7 +512,7 @@ func (s *server) deleteAlertRule(w http.ResponseWriter, r *http.Request, acct st
 // base64-encodes to 44 bytes which is comfortably under.
 func (s *server) rotateAlertRuleSecret(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	row, err := s.store.AlertRuleByID(ctx(r), id)
+	row, err := s.store.AlertRuleByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such alert rule")
 		return
@@ -522,7 +522,7 @@ func (s *server) rotateAlertRuleSecret(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	if row.AppID != "" {
-		app, err := s.store.AppByID(ctx(r), row.AppID)
+		app, err := s.store.AppByID(r.Context(), row.AppID)
 		if err != nil || app.AccountID != acct.ID {
 			s.notFound(w, "no such alert rule")
 			return
@@ -547,7 +547,7 @@ func (s *server) rotateAlertRuleSecret(w http.ResponseWriter, r *http.Request, a
 		api.WriteProblem(w, api.ErrCapacity("could not seal webhook secret"))
 		return
 	}
-	if _, err := s.store.UpdateAlertRule(ctx(r), id, state.UpdateAlertRuleParams{
+	if _, err := s.store.UpdateAlertRule(r.Context(), id, state.UpdateAlertRuleParams{
 		WebhookSecretSealed: &sealed,
 	}); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
@@ -571,7 +571,7 @@ func (s *server) rotateAlertRuleSecret(w http.ResponseWriter, r *http.Request, a
 	// key). PR review finding F11: audit row now carries the
 	// timestamp so the dashboard can render "last rotated 6h ago"
 	// without a separate query.
-	s.audit.Emit(ctx(r), "alert_rule.secret_rotated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "alert_rule.secret_rotated", &acct.ID, map[string]any{
 		"rule_id":    id,
 		"app_id":     row.AppID,
 		"rotated_at": now.Format(time.RFC3339),

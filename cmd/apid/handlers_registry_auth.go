@@ -107,7 +107,7 @@ func (s *server) listRegistryCredentials(w http.ResponseWriter, r *http.Request,
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAppRegistryCredentials(ctx(r), acct.ID, app.ID)
+	rows, err := s.store.ListAppRegistryCredentials(r.Context(), acct.ID, app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list registry credentials"))
 		return
@@ -163,11 +163,11 @@ func (s *server) setRegistryCredential(w http.ResponseWriter, r *http.Request, a
 		api.WriteProblem(w, api.ErrPlanRegistryCredentialsNotAllowed(acct.Plan))
 		return
 	}
-	if prob := s.checkRegistryCredentialQuota(ctx(r), acct, app, host, limits); prob != nil {
+	if prob := s.checkRegistryCredentialQuota(r.Context(), acct, app, host, limits); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
-	if prob := s.sealAndPersistRegistryCredential(ctx(r), acct, app, host, req.Username, req.Password); prob != nil {
+	if prob := s.sealAndPersistRegistryCredential(r.Context(), acct, app, host, req.Username, req.Password); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -184,14 +184,14 @@ func (s *server) setRegistryCredential(w http.ResponseWriter, r *http.Request, a
 	// IAM-4 (ADR-035): record the credential set. NEVER carry
 	// the plaintext password in the audit row — same posture as
 	// the secrets handler.
-	s.audit.Emit(ctx(r), "registry_credential.set", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "registry_credential.set", &acct.ID, map[string]any{
 		"app_id":   app.ID,
 		"registry": host,
 		"username": req.Username,
 	})
 	// Read back the stored row to surface the canonical
 	// timestamps (server-side clock). Password NEVER echoed.
-	row, err := s.store.GetAppRegistryCredential(ctx(r), acct.ID, app.ID, host)
+	row, err := s.store.GetAppRegistryCredential(r.Context(), acct.ID, app.ID, host)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not read back credential"))
 		return
@@ -277,7 +277,7 @@ func (s *server) deleteRegistryCredential(w http.ResponseWriter, r *http.Request
 		api.WriteProblem(w, api.ErrInvalidRegistryHost(errors.New("registry query parameter is required")))
 		return
 	}
-	if err := s.store.DeleteAppRegistryCredential(ctx(r), acct.ID, app.ID, host); err != nil {
+	if err := s.store.DeleteAppRegistryCredential(r.Context(), acct.ID, app.ID, host); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.ErrRegistryCredentialNotFound(host))
 			return
@@ -292,7 +292,7 @@ func (s *server) deleteRegistryCredential(w http.ResponseWriter, r *http.Request
 	)
 	// IAM-4 (ADR-035): record the credential delete. No
 	// password / ciphertext in the audit row.
-	s.audit.Emit(ctx(r), "registry_credential.deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "registry_credential.deleted", &acct.ID, map[string]any{
 		"app_id":   app.ID,
 		"registry": host,
 	})

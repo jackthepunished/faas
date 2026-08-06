@@ -80,7 +80,7 @@ func (s *server) patchAppSecurity(w http.ResponseWriter, r *http.Request, acct s
 		writeJSON(w, http.StatusOK, api.AppSecurityResponse{RequireSigned: app.RequireSigned})
 		return
 	}
-	updated, err := s.store.UpdateApp(ctx(r), app.ID, state.UpdateAppParams{
+	updated, err := s.store.UpdateApp(r.Context(), app.ID, state.UpdateAppParams{
 		RequireSigned:    req.RequireSigned,
 		SetRequireSigned: true,
 	})
@@ -93,14 +93,14 @@ func (s *server) patchAppSecurity(w http.ResponseWriter, r *http.Request, acct s
 	// flipping the flag takes effect on the NEXT deploy (no
 	// in-flight deploy re-evaluates). Same posture as the other
 	// app-config toggles.
-	_ = s.notif.Notify(ctx(r), "app_changed", fmt.Sprintf(
+	_ = s.notif.Notify(r.Context(), "app_changed", fmt.Sprintf(
 		`{"kind":"security","app_id":"%s","require_signed":%t}`, app.ID, updated.RequireSigned))
 	// Audit — IAM-4 (issue #291) shape: record what the admin
 	// altered, old vs new. The `app.security_updated` kind is the
 	// distinct taxonomy entry so the audit-log panel can filter
 	// signature-related config changes separately from generic
 	// app.updated.
-	s.audit.Emit(ctx(r), "app.security_updated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.security_updated", &acct.ID, map[string]any{
 		"app_id":      updated.ID,
 		"slug":        updated.Slug,
 		"old_require": app.RequireSigned,
