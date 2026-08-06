@@ -157,8 +157,12 @@ func TestPgStore_CreateAppWebhookIfUnderQuota_PerAppCap(t *testing.T) {
 // Hobby plan: WebhookPerApp=3, WebhookPerAccount=10. The per-app
 // cap of 3 < 10 per-account, so we need at least ⌈10/3⌉ = 4 apps
 // to reach per-account=10 without per-app=3 firing first. The
-// 10th insert (WebhookPerAccount - 1 = 9 below) fills the cap;
-// the 11th must hit the per-account gate with Scope=Account.
+// quota gate is `count >= limit` (off-by-zero): filling to exactly
+// `WebhookPerAccount` leaves count=10 at the next check, which
+// trips the gate. Round-robin of 10 inserts over 4 apps gives
+// 3,3,2,2 — every app stays at or below its per-app cap of 3.
+// The 11th insert targets an app with headroom (≤2) so per-app
+// can't fire; the per-account gate must trip with Scope=Account.
 func TestPgStore_CreateAppWebhookIfUnderQuota_PerAccountCap(t *testing.T) {
 	s, ctx := pgStore(t)
 	limits := api.MustLimitsFor(api.PlanHobby)
@@ -176,12 +180,9 @@ func TestPgStore_CreateAppWebhookIfUnderQuota_PerAccountCap(t *testing.T) {
 		appIDs = append(appIDs, a.ID)
 	}
 
-	// Distribute (WebhookPerAccount - 1) inserts round-robin so
-	// no single app hits its per-app cap of 3 before we reach the
-	// per-account cap of 10. ⌈10/3⌉ = 4 apps → 9 inserts → 3,3,2,1
-	// or 3,2,2,2 across the four apps (any distribution under
-	// per-app cap is fine). Round-robin gives 9/4 → 3,2,2,2.
-	for i := 0; i < limits.WebhookPerAccount-1; i++ {
+	// Fill to exactly the per-account cap. Round-robin 10/4 → 3,3,2,2
+	// across the four apps — every app stays ≤ its per-app cap of 3.
+	for i := 0; i < limits.WebhookPerAccount; i++ {
 		appID := appIDs[i%len(appIDs)]
 		if _, err := s.CreateAppWebhookIfUnderQuota(ctx, pgSampleWebhook(acct, appID), limits); err != nil {
 			t.Fatalf("insert %d (app %s): %v", i, appID, err)
