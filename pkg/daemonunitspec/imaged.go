@@ -65,6 +65,7 @@ func UnitImaged() daemonunit.Unit {
 		EnvironmentFile: "/etc/faas/sealed.env",
 		Environment: []daemonunit.KV{
 			{Key: "FAAS_BASE_STAGING_ROOT", Value: "/dev/shm/faas-base-staging"},
+			{Key: "FAAS_BASE_TMP_ROOT", Value: "/srv/fc/base"},
 		},
 
 		NoNewPrivileges:       true,
