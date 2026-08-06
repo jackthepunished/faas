@@ -60,13 +60,12 @@ func newTestLoop(t *testing.T, instanceID string, consec int) (*livenessProbeLoo
 	t.Helper()
 	sink := &recordingSink{}
 	mgr := fcvm.NewManager(nil, nil, fcvm.Paths{}, "1.10.0", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-	// Attach the sink via the WithLivenessSink helper if it
-	// exists; otherwise we plumb directly into the field.
-	// Both paths exist for safety: the WithLivenessSink helper
-	// is the public surface; direct field assignment is the
-	// fallback used in older test wiring.
+	// Attach the sink via the WithLivenessSink helper. The
+	// post-F1 Manager signature returns *Manager (chainable);
+	// the test interface must match that exact return type for
+	// the type assertion to succeed.
 	type sinkSetter interface {
-		WithLivenessSink(func(ctx context.Context, instance, reason string))
+		WithLivenessSink(func(ctx context.Context, instance, reason string)) *fcvm.Manager
 	}
 	if ss, ok := any(mgr).(sinkSetter); ok {
 		ss.WithLivenessSink(sink.Record)

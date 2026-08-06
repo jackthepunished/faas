@@ -1985,10 +1985,10 @@ func (m *OpsMetrics) LivenessRestarts(app, deployment string) prometheus.Counter
 		return nil
 	}
 	if app == "" {
-		app = "unknown"
+		app = labelUnknown
 	}
 	if deployment == "" {
-		deployment = "unknown"
+		deployment = labelUnknown
 	}
 	return m.livenessRestarts.WithLabelValues(app, deployment)
 }
@@ -3653,6 +3653,15 @@ const maxIPLabelValues = 10_000
 // otherIPLabel).
 const anonymousIPLabel = "anonymous"
 
+// labelUnknown is the closed-set sentinel for "label collapsed because
+// the source string was empty / unparseable" on the Prometheus
+// collectors in this file. The liveness_restarts counter uses it for
+// empty app / deployment labels, and the IP-admission switch path
+// uses it for the `case "", "unknown"` branch. Pinning the value
+// here keeps goconst at 0 occurrences (golangci-lint v2.4.0 fires on
+// repeated string literals ≥ 3×).
+const labelUnknown = "unknown"
+
 // otherIPLabel is the reserved IP for traffic whose IP exceeded the
 // admission cap. Same contract as otherAccountLabel — operators must
 // check the daemon slog for the original IP when an IP lands here;
@@ -3839,7 +3848,7 @@ func newIPLabelSet(capacity int) *ipLabelSet {
 // OpsMetrics in NewOpsMetrics and held as a pointer field.
 func (s *ipLabelSet) admit(ip string) string {
 	switch ip {
-	case "", "unknown":
+	case "", labelUnknown:
 		// ClientIP returns "unknown" for an unparseable
 		// RemoteAddr; collapse to anonymousIPLabel so the operator
 		// can distinguish "we couldn't resolve the source IP"

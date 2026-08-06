@@ -50,6 +50,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// metricLabelUnknown is the canonical "label collapsed because the source
+// string was empty" sentinel used across this package's Prometheus
+// collectors (warmup histogram + liveness histogram/gauge). Closed-set
+// labels stay bounded — every {} occurrence has to map to one of these
+// constants to keep goconst happy (golangci-lint v2.4.0 fires on
+// repeated string literals ≥ 3×).
+const metricLabelUnknown = "unknown"
+
 // SnapshotStat is the minimum surface area the dashboard needs. schedd's
 // `snapshots` table row gives us MemBytes + DiskBytes + a Path; we
 // compute the parked footprint as MemBytes+VMStateBytes+disk (the sum
@@ -203,10 +211,10 @@ func (m *FrameworkReadyMetrics) ObserveWarmup(runtime, app string, seconds float
 		return
 	}
 	if runtime == "" {
-		runtime = "unknown"
+		runtime = metricLabelUnknown
 	}
 	if app == "" {
-		app = "unknown"
+		app = metricLabelUnknown
 	}
 	m.warmup.WithLabelValues(runtime, app).Observe(seconds)
 }
@@ -284,7 +292,7 @@ func (m *LivenessMetrics) ObserveProbe(outcome string, seconds float64) {
 		return
 	}
 	if outcome == "" {
-		outcome = "unknown"
+		outcome = metricLabelUnknown
 	}
 	m.probe.WithLabelValues(outcome).Observe(seconds)
 }
@@ -298,7 +306,7 @@ func (m *LivenessMetrics) SetConsecutiveFailures(instance string, count int) {
 		return
 	}
 	if instance == "" {
-		instance = "unknown"
+		instance = metricLabelUnknown
 	}
 	m.consecutiveGF.WithLabelValues(instance).Set(float64(count))
 }

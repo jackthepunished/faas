@@ -9331,6 +9331,14 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		var kind, statusStr string
 		var scanStatus *string
 		var scannedAt *time.Time
+		// Mirrors scanDeployment: keep the override_liveness_probe
+		// scan destination aligned with the SELECT projection in
+		// deploymentSelectColumns / WithRootfs — adding a new column
+		// there without adding it here triggers pgx's "number of
+		// field descriptions must equal number of destinations"
+		// runtime error on every ListDeploymentsForApp / Account
+		// read path. Caught by the pg-shard-2 unit suite
+		// (TestPg_CreateDeployment_*).
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -9338,6 +9346,7 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 			&d.OverrideEntrypoint, &d.OverrideCmd,
 			&d.OverrideEnv, &d.OverrideEnvSecrets,
 			&d.OverridePort, &d.OverrideHealthcheck,
+			&d.OverrideLivenessProbe,
 			&d.Sidecars, &d.MinInstances,
 			&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 			return nil, err
