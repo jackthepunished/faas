@@ -2548,6 +2548,14 @@ type Store interface {
 	// filters removed rows at the API boundary.
 	ListOrgMembers(ctx context.Context, orgID string) ([]OrgMembership, error)
 
+	// CountActiveOrgMembers returns the number of memberships with
+	// removed_at IS NULL for the given org. Filtered at the SQL
+	// layer so the count does not scan every row into Go. Used by
+	// apid's enforceMemberCap (Plan.OrgMembersMax) and by the
+	// store-side defence-in-depth check inside consumeOrgInvitation.
+	// Returns 0 when the org has no rows.
+	CountActiveOrgMembers(ctx context.Context, orgID string) (int, error)
+
 	// OrgMemberByAccount returns the (org_id, account_id) row.
 	// Returns ErrNotFound when no membership exists.
 	OrgMemberByAccount(ctx context.Context, orgID, accountID string) (OrgMembership, error)
@@ -2583,6 +2591,14 @@ type Store interface {
 	// invitation-cleanup loop filters pending + expired at the
 	// caller.
 	ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([]OrgInvitation, error)
+
+	// CountPendingOrgInvitations returns the number of invitation
+	// rows with consumed_at IS NULL AND revoked_at IS NULL AND
+	// expires_at > now() for the given org. Filtered at the SQL
+	// layer so the count does not scan every row into Go. Used by
+	// apid's enforcePendingInvitationCap (Plan.OrgPendingInvitationsMax).
+	// Returns 0 when the org has no rows.
+	CountPendingOrgInvitations(ctx context.Context, orgID string) (int, error)
 
 	// ExpireOrgInvitations is the cleanup-tick method (modelled on
 	// the login-token cleanup loop) that stamps revoked_at on every

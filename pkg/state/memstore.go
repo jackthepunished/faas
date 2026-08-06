@@ -8741,11 +8741,16 @@ func (m *MemStore) SoftDeleteOrg(_ context.Context, id string) error {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on
 // duplicate (org_id, account_id), ErrOrgLastOwner when the partial
-// unique would trip, and ErrNotFound on missing parent.
+// unique would trip, and ErrNotFound on missing parent. The
+// OrgMembersMax cap is enforced at consumeOrgInvitation (the only
+// external-insert path) and at the wire helper
+// `cmd/apid::enforceMemberCap`, NOT here — see pkg/state/pgstore.go
+// ::AddOrgMember for the rationale.
 func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.orgs[orgID]; !ok {
+	_, ok := m.orgs[orgID]
+	if !ok {
 		return ErrNotFound
 	}
 	k := orgAccountKey{OrgID: orgID, AccountID: accountID}
@@ -8864,6 +8869,21 @@ func (m *MemStore) ListOrgMembers(_ context.Context, orgID string) ([]OrgMembers
 	return out, nil
 }
 
+// CountActiveOrgMembers mirrors PgStore.CountActiveOrgMembers — counts
+// memberships with RemovedAt == nil for the given org. Parity test
+// `TestOrgMembersCountParity_PgMemstore` pins the agreement.
+func (m *MemStore) CountActiveOrgMembers(_ context.Context, orgID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, mem := range m.memberships {
+		if mem.OrgID == orgID && mem.RemovedAt == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // OrgMemberByAccount looks up the (org, account) row.
 func (m *MemStore) OrgMemberByAccount(_ context.Context, orgID, accountID string) (OrgMembership, error) {
 	m.mu.Lock()
@@ -8925,6 +8945,29 @@ func (m *MemStore) ConsumeOrgInvitation(_ context.Context, hash []byte, acceptin
 	if !strings.EqualFold(inv.Email, acceptingAccount.Email) {
 		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
 	}
+	// IAM-6 / ADR-061 PR 2 cap check (load-bearing). Mirrors
+	// PgStore.ConsumeOrgInvitation. Free + unknown plans read 0
+	// (plan-policy fail-closed) so the `limit > 0` early-return keeps
+	// them quiet — the abuse-floor tier cannot host shared orgs in
+	// the first place, so reaching here is already a customer-flow
+	// fault, not a cap-arithmetic decision.
+	org, ok := m.orgs[inv.OrgID]
+	if !ok {
+		return OrgMembership{}, OrgInvitation{}, ErrNotFound
+	}
+	limits, _ := api.LimitsFor(org.Plan)
+	limit := limits.OrgMembersMax
+	if limit > 0 {
+		active := 0
+		for _, existing := range m.memberships {
+			if existing.OrgID == inv.OrgID && existing.RemovedAt == nil {
+				active++
+			}
+		}
+		if active >= limit {
+			return OrgMembership{}, OrgInvitation{}, ErrOrgMemberCapExceeded
+		}
+	}
 	// Insert membership; surface ErrOrgAlreadyMember if a parallel
 	// accept beat us.
 	k := orgAccountKey{OrgID: inv.OrgID, AccountID: acceptingAccount.ID}
@@ -8978,6 +9021,31 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
+}
+
+// CountPendingOrgInvitations mirrors PgStore.CountPendingOrgInvitations
+// — counts invitation rows that are not consumed, not revoked, and
+// not past expires_at. Parity test
+// `TestOrgPendingInvitationsCountParity_PgMemstore` pins the
+// agreement.
+func (m *MemStore) CountPendingOrgInvitations(_ context.Context, orgID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, inv := range m.invitations {
+		if inv.OrgID != orgID {
+			continue
+		}
+		if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+			continue
+		}
+		if !inv.ExpiresAt.IsZero() && now.After(inv.ExpiresAt) {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every

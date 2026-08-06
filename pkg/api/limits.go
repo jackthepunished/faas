@@ -510,10 +510,13 @@ var planLimits = map[Plan]Limits{
 		// break-glass. The abuse-vector (scripted key rotation under
 		// 1-concurrency) is bounded by the per-account rate limit.
 		KeysMax: 3,
-		// IAM-6 / ADR-061: org membership is plan-gated until the
-		// financial model authorizes a per-plan value. Free reads
-		// 0/0 so the membership gate refuses before the store is
-		// touched, mirroring the cron fail-closed shape.
+		// IAM-6 / ADR-061 PR-2 (issue #190): Free is the abuse-floor
+		// tier and cannot host shared orgs — 0/0 stays by plan
+		// policy, mirroring CronLimitPerApp and
+		// EvictionPriorityReservedAllowed on Free. Personal orgs are
+		// unaffected (they never read these caps). The financial
+		// model is authoritative; reconciliation is a follow-up if
+		// the workbook diverges from this fail-closed value.
 		OrgMembersMax:            0,
 		OrgPendingInvitationsMax: 0,
 		// Alert rules (issue #396 / ADR-045): Free stays at 0/0.
@@ -642,12 +645,15 @@ var planLimits = map[Plan]Limits{
 		// (CI / staging / prod / personal / monitoring) with a
 		// dedicated key.
 		KeysMax: 10,
-		// IAM-6 / ADR-061: org caps land in PR 2 once the financial
-		// model authorizes them. PR 1 ships 0/0 so the fail-closed
-		// gate refuses across every plan until the values are
-		// sourced — see limits_test.go::TestOrgMembersLimits_ZeroUntilAuthorised.
-		OrgMembersMax:            0,
-		OrgPendingInvitationsMax: 0,
+		// IAM-6 / ADR-061 PR-2 (issue #190): Hobby gets 10 members /
+		// 5 pending invitations — tracks the KeysMax ratio (IAM-5
+		// shapes team headroom as 2× the per-account app budget).
+		// Pending invitations stay at 1/2 of members because the
+		// default invitation TTL is short (7d) and the typical Hobby
+		// customer issues a handful at a time. Financial model is
+		// authoritative — derived value, reconciliation follow-up.
+		OrgMembersMax:            10,
+		OrgPendingInvitationsMax: 5,
 		// Alert rules (issue #396): Hobby gets 3 per-app and 10
 		// per-account — a Hobby customer with 2 apps + 1 account-wide
 		// rule lands inside both caps. The per-account floor tracks the
@@ -770,10 +776,13 @@ var planLimits = map[Plan]Limits{
 		// Pro app budget (25) plus a per-team allowance (CI / staging
 		// / prod / personal / monitoring / break-glass).
 		KeysMax: 50,
-		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
-		// per-plan values from the financial model.
-		OrgMembersMax:            0,
-		OrgPendingInvitationsMax: 0,
+		// IAM-6 / ADR-061 PR-2 (issue #190): Pro gets 50 members /
+		// 25 pending invitations — tracks KeysMax (50) one-to-one so
+		// every team member can hold a key for their own deploy
+		// target. Financial model is authoritative — derived value,
+		// reconciliation follow-up.
+		OrgMembersMax:            50,
+		OrgPendingInvitationsMax: 25,
 		// Alert rules (issue #396): Pro gets 10 per-app and 30
 		// per-account. ~2× the Hobby per-account budget tracks the
 		// Pro app budget (25 apps vs Hobby's 5).
@@ -899,10 +908,13 @@ var planLimits = map[Plan]Limits{
 		// the Scale app budget (100) plus a per-team allowance, with
 		// headroom for the rotating-CI shape of a SaaS-scale customer.
 		KeysMax: 200,
-		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
-		// per-plan values from the financial model.
-		OrgMembersMax:            0,
-		OrgPendingInvitationsMax: 0,
+		// IAM-6 / ADR-061 PR-2 (issue #190): Scale gets 200 members
+		// / 100 pending invitations — tracks KeysMax (200) so a
+		// SaaS-scale customer can run the typical multi-team +
+		// rotating-CI shape. Financial model is authoritative —
+		// derived value, reconciliation follow-up.
+		OrgMembersMax:            200,
+		OrgPendingInvitationsMax: 100,
 		// Alert rules (issue #396): Scale gets 25 per-app and 100
 		// per-account — 2.5× Pro's per-app (10→25) and ~3× the
 		// per-account (30→100). Scale's app budget is 4× Pro's, so
