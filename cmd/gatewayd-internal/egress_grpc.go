@@ -80,11 +80,14 @@ type egressGRPCListener struct {
 // chmodSocket applies mode to a unix-socket path, retrying briefly
 // when the path is briefly unresolvable. The kernel publishes the
 // dirent asynchronously after net.Listen returns; under tmpfs load
-// (CI runner pool) the publish can lag a few ms past the listen
-// return, so the next syscall sees ENOENT. Retry up to 50ms before
-// failing the start.
+// (CI runner pool, observed cycle 13 of a 16-cycle restart loop) the
+// publish can lag tens of ms past the listen return, so the next
+// syscall sees ENOENT. Retry up to 500ms before failing the start —
+// production callers always reach start() during boot when the
+// listener has never existed, so a single ENOENT is expected; the
+// 16-cycle CI test surfaced the long tail.
 func chmodSocket(path string, mode os.FileMode) error {
-	deadline := time.Now().Add(50 * time.Millisecond)
+	deadline := time.Now().Add(500 * time.Millisecond)
 	var lastErr error
 	for {
 		if err := os.Chmod(path, mode); err == nil {
@@ -97,7 +100,7 @@ func chmodSocket(path string, mode os.FileMode) error {
 		if time.Now().After(deadline) {
 			return lastErr
 		}
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
