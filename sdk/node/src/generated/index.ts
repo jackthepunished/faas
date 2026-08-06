@@ -121,6 +121,8 @@ export type { PlanWorkload } from './models/PlanWorkload.js';
 export type { Problem } from './models/Problem.js';
 export type { ProjectApplyRequest } from './models/ProjectApplyRequest.js';
 export type { ProjectScanRequest } from './models/ProjectScanRequest.js';
+export type { PublicAuthBlock } from './models/PublicAuthBlock.js';
+export type { PublicAuthStatus } from './models/PublicAuthStatus.js';
 export type { PutAppEnvRequest } from './models/PutAppEnvRequest.js';
 export type { PutAppRegistryCredentialRequest } from './models/PutAppRegistryCredentialRequest.js';
 export type { PutAppSecretRequest } from './models/PutAppSecretRequest.js';

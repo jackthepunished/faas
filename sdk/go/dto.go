@@ -105,4 +105,14 @@ type (
 	BuildDone      = api.BuildDone
 	BuildFramework = api.BuildFramework
 	AppManifest    = api.AppManifest
+
+	// Issue #477 / ADR-079: per-app public-URL auth. The
+	// subset mirrors the hand-curated surface — the
+	// public Go SDK only re-exports the write-block
+	// shape; the read-side is reached through the same
+	// AppResponse type with the public_auth optional
+	// field embedded by the vendored api.AppResponse
+	// type at internal/api/dto.go (added by the next
+	// mirror push).
+	PublicAuthBlock = api.PublicAuthBlock
 )

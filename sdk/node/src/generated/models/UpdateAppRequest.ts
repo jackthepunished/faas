@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { PublicAuthBlock } from './PublicAuthBlock.js';
 import type { ScalingPolicy } from './ScalingPolicy.js';
 /**
  * Partial update — every field is optional; omitted fields are unchanged.
@@ -55,5 +56,9 @@ export type UpdateAppRequest = {
    * Per-deployment token-gate flag (issue #560). Omitted → no change. PATCH-true on Free/Hobby is rejected with 403 plan_require_authn_not_allowed.
    */
   require_authn?: boolean | null;
+  /**
+   * Per-app public-URL auth configuration (issue #477 / ADR-077). Omitted → no change. When present, mode is the closed enum {open, bearer, basic}; basic_user + basic_pass are required when mode='basic' and the apid seal step encrypts them under the APP_BASIC_AUTH secretbox namespace before persistence.
+   */
+  public_auth?: (null | PublicAuthBlock);
 };
 
