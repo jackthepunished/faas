@@ -3446,6 +3446,52 @@ func (m *MemStore) SetDeploymentFailed(_ context.Context, id, code, message stri
 	return d, nil
 }
 
+// SetDeploymentParked stamps the per-deployment parked_reason +
+// parked_at columns (issue #554 / ADR-079 follow-up). Idempotent:
+// a second call on an already-parked deployment is a no-op — the
+// closed-set reason and parked_at are set once. Same contract as
+// PgStore.SetDeploymentParked. Returns ErrNotFound when the
+// deployment id is absent.
+func (m *MemStore) SetDeploymentParked(_ context.Context, id, reason string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.deployments[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if d.ParkedReason != "" {
+		return nil // idempotent — already parked
+	}
+	d.ParkedReason = reason
+	d.ParkedAt = &at
+	m.deployments[id] = d
+	return nil
+}
+
+// LatestParkedDeploymentForApp returns the most recently parked
+// deployment for an app, or ErrNotFound if none. Single-pass scan
+// under m.mu; deployment counts are O(deploy rate × app lifetime)
+// bounded by spec §4.2, so a linear scan stays cheap.
+func (m *MemStore) LatestParkedDeploymentForApp(_ context.Context, appID string) (Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var latest Deployment
+	found := false
+	for _, d := range m.deployments {
+		if d.AppID != appID || d.ParkedReason == "" {
+			continue
+		}
+		if !found || (d.ParkedAt != nil && (latest.ParkedAt == nil || d.ParkedAt.After(*latest.ParkedAt))) {
+			latest = d
+			found = true
+		}
+	}
+	if !found {
+		return Deployment{}, ErrNotFound
+	}
+	return latest, nil
+}
+
 // --- Builds -----------------------------------------------------------------
 
 func (m *MemStore) CreateBuild(_ context.Context, deploymentID string, kind DeploymentKind, sourceBytes int64, logPath string) (Build, error) {

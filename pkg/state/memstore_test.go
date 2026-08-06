@@ -890,6 +890,62 @@ func TestCreateDeploymentPreservesCallerFields(t *testing.T) {
 	}
 }
 
+// TestMemStore_SetDeploymentParked_Idempotent (issue #554 /
+// ADR-079 / AC #3) is the memstore mirror of
+// TestPg_SetDeploymentParked_Idempotent. The memstore mutex hides
+// the schedd-restart race that motivates the idempotency
+// contract, but the explicit "second call leaves parked_at
+// unchanged" assertion is the load-bearing contract — a
+// regression would surface as the apid
+// GET /v1/apps/{slug}.parked_deployment timestamp drifting on
+// every schedd restart.
+func TestMemStore_SetDeploymentParked_Idempotent(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "park-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "park-mem"})
+	dep, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:p"})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	first := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	if err := m.SetDeploymentParked(ctx, dep.ID, "liveness_exhausted", first); err != nil {
+		t.Fatalf("SetDeploymentParked (first): %v", err)
+	}
+
+	// Second call 1h later with a different reason — reason stays
+	// pinned to the first park (the closed-set audit reason is set
+	// once and never repainted), parked_at must NOT drift.
+	if err := m.SetDeploymentParked(ctx, dep.ID, "lifecycle_park", first.Add(time.Hour)); err != nil {
+		t.Fatalf("SetDeploymentParked (second): %v", err)
+	}
+	got, err := m.LatestParkedDeploymentForApp(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("LatestParkedDeploymentForApp: %v", err)
+	}
+	if got.ParkedReason != "liveness_exhausted" {
+		t.Errorf("parked_reason = %q, want %q (second park leaked reason)", got.ParkedReason, "liveness_exhausted")
+	}
+	if got.ParkedAt == nil || !got.ParkedAt.Equal(first) {
+		t.Errorf("parked_at = %v, want %v (second park leaked timestamp)", got.ParkedAt, first)
+	}
+}
+
+// TestMemStore_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound
+// is the load-bearing "app is healthy" branch on the apid
+// surface. The handler maps ErrNotFound → nil ParkedDeploymentRef
+// (no field on the wire).
+func TestMemStore_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "nopark-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "nopark-mem"})
+	_, err := m.LatestParkedDeploymentForApp(ctx, app.ID)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("no park err = %v, want ErrNotFound", err)
+	}
+}
+
 func TestLatestDeploymentNotFound(t *testing.T) {
 	m := NewMemStore()
 	if _, err := m.LatestDeployment(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {

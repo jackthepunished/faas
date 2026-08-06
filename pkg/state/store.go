@@ -860,6 +860,24 @@ type Store interface {
 	// belt-and-suspenders bound. Returns the fresh row so the
 	// handler can build the response without a second round-trip.
 	UpdateDeploymentMinInstances(ctx context.Context, id string, min int) (Deployment, error)
+	// SetDeploymentParked stamps the per-deployment parked_reason +
+	// parked_at columns introduced by migration 00155 (issue #554 /
+	// ADR-079 follow-up). Idempotent: re-parking an already-parked
+	// deployment is a no-op (the parked_at timestamp is set once).
+	// The closed-set vocabulary is enforced at the schema layer via
+	// the deployments_parked_reason_check constraint — callers
+	// passing a non-literal are rejected with the standard CHECK
+	// violation. Returns ErrNotFound when the deployment id is
+	// unknown so callers can disambiguate "parked" from "absent".
+	SetDeploymentParked(ctx context.Context, id, reason string, at time.Time) error
+	// LatestParkedDeploymentForApp returns the most recently parked
+	// deployment for an app, or ErrNotFound if none. Powers the
+	// apid GET /v1/apps/{slug}.parked_deployment reference (AC #3
+	// wire). The match is `parked_reason is not null order by
+	// parked_at desc limit 1`; superseded deployments still match
+	// since their parked_reason/parked_at are not cleared on
+	// supersede.
+	LatestParkedDeploymentForApp(ctx context.Context, appID string) (Deployment, error)
 	// ListInstancesByNodeID returns every instance whose owning app's
 	// owner_node matches nodeID. Same Phase 2 / Gate A contract; the
 	// reaper's parked-instance timer + the watchdog's kill-stuck path

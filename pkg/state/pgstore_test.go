@@ -804,6 +804,140 @@ func TestPg_SetDeploymentFailed_UnknownReturnsErrNotFound(t *testing.T) {
 	}
 }
 
+// TestPg_SetDeploymentParked_RoundTrip (issue #554 / ADR-079 /
+// AC #3) pins the per-deployment parked_reason + parked_at columns
+// from migration 00155. The engine's ParkDeployment is the single
+// writer; this test pins the read-back path so a future column
+// rename or NULL-default drift surfaces in pg-shard-2 instead of
+// on the apid GET /v1/apps/{slug} wire.
+func TestPg_SetDeploymentParked_RoundTrip(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, _, depID := seedLiveDeploy(t, s, ctx)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	if err := s.SetDeploymentParked(ctx, depID, "liveness_exhausted", now); err != nil {
+		t.Fatalf("SetDeploymentParked: %v", err)
+	}
+
+	// Read-back via the canonical customer-facing path. The
+	// DeploymentByID read uses deploymentSelectColumns + the
+	// scanDeploymentInto destination list — the load-bearing
+	// invariant is that the column lands in both.
+	d, err := s.DeploymentByID(ctx, depID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if d.ParkedReason != "liveness_exhausted" {
+		t.Errorf("parked_reason = %q, want %q", d.ParkedReason, "liveness_exhausted")
+	}
+	if d.ParkedAt == nil {
+		t.Fatalf("parked_at = nil, want timestamp")
+	}
+	if !d.ParkedAt.Equal(now) {
+		t.Errorf("parked_at = %s, want %s (round-trip drift)", d.ParkedAt, now)
+	}
+}
+
+// TestPg_SetDeploymentParked_Idempotent pins the schedd-restart
+// contract: a second park on an already-parked deployment must
+// NOT repaint parked_at. The audit row (engine.go:3812
+// "instances.parked_liveness_exhausted") is the durable source of
+// truth; SetDeploymentParked just pins the column. A re-stamp
+// during a schedd crash loop would obscure the actual park time
+// on the apid surface.
+func TestPg_SetDeploymentParked_Idempotent(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, _, depID := seedLiveDeploy(t, s, ctx)
+	first := time.Now().UTC().Truncate(time.Microsecond)
+	if err := s.SetDeploymentParked(ctx, depID, "liveness_exhausted", first); err != nil {
+		t.Fatalf("SetDeploymentParked (first): %v", err)
+	}
+	// Second call 1h later — must NOT repaint.
+	if err := s.SetDeploymentParked(ctx, depID, "lifecycle_park", first.Add(time.Hour)); err != nil {
+		t.Fatalf("SetDeploymentParked (second): %v", err)
+	}
+	d, err := s.DeploymentByID(ctx, depID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if d.ParkedReason != "liveness_exhausted" {
+		t.Errorf("parked_reason = %q, want %q (second park leaked reason)", d.ParkedReason, "liveness_exhausted")
+	}
+	if d.ParkedAt == nil || !d.ParkedAt.Equal(first) {
+		t.Errorf("parked_at = %v, want %s (second park leaked timestamp)", d.ParkedAt, first)
+	}
+}
+
+// TestPg_SetDeploymentParked_UnknownReturnsErrNotFound guards
+// the not-found branch — callers must not silently no-op when a
+// stale deployment id is passed. Same pattern as
+// TestPg_SetDeploymentFailed_UnknownReturnsErrNotFound above.
+func TestPg_SetDeploymentParked_UnknownReturnsErrNotFound(t *testing.T) {
+	s, ctx := pgStore(t)
+	err := s.SetDeploymentParked(ctx, "00000000-0000-0000-0000-000000000000", "liveness_exhausted", time.Now())
+	if !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("unknown id err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPg_LatestParkedDeploymentForApp picks the most-recently-
+// parked deployment for an app. AC #3 wire: powers the apid
+// GET /v1/apps/{slug}.parked_deployment reference shape.
+func TestPg_LatestParkedDeploymentForApp(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, depOlder := seedLiveDeploy(t, s, ctx)
+
+	// Park the seed deployment first.
+	older := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	if err := s.SetDeploymentParked(ctx, depOlder, "liveness_exhausted", older); err != nil {
+		t.Fatalf("SetDeploymentParked (older): %v", err)
+	}
+
+	// Spin a second deployment for the same app. CreateDeployment
+	// supersedes the prior 'live' row, so depOlder lands in
+	// status='superseded' but parked_reason/parked_at stay set.
+	// apps.status stays 'active' so the second CreateDeployment
+	// succeeds.
+	newer := time.Now().UTC().Truncate(time.Microsecond)
+	depNewer, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID: appID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:def", Status: state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment(newer): %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, depNewer.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive(newer): %v", err)
+	}
+	if err := s.SetDeploymentParked(ctx, depNewer.ID, "liveness_exhausted", newer); err != nil {
+		t.Fatalf("SetDeploymentParked (newer): %v", err)
+	}
+
+	got, err := s.LatestParkedDeploymentForApp(ctx, appID)
+	if err != nil {
+		t.Fatalf("LatestParkedDeploymentForApp: %v", err)
+	}
+	if got.ID != depNewer.ID {
+		t.Errorf("latest.ID = %s, want %s (newer)", got.ID, depNewer.ID)
+	}
+	if got.ParkedReason != "liveness_exhausted" {
+		t.Errorf("latest.parked_reason = %q, want %q", got.ParkedReason, "liveness_exhausted")
+	}
+}
+
+// TestPg_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound is
+// the load-bearing "app is healthy" branch on the apid surface.
+// LatestParkedDeploymentForApp returns ErrNotFound; the apid
+// handler maps that to a nil ParkedDeploymentRef (no field on
+// the wire).
+func TestPg_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, _ := seedLiveDeploy(t, s, ctx)
+	_, err := s.LatestParkedDeploymentForApp(ctx, appID)
+	if !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("no park err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestPg_CreateAppIfUnderQuota_Concurrent is the real-Postgres mirror
 // of cmd/apid/handlers_quota_test.go::TestCreateApp_ConcurrentQuotaEnforcement_MemStore.
 // Fires N goroutines at CreateAppIfUnderQuota on a Free account

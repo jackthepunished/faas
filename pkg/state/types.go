@@ -866,6 +866,16 @@ type Deployment struct {
 	ScanResult []byte    `json:"scan_result,omitempty"`
 	ScanStatus string    `json:"scan_status,omitempty"`
 	ScannedAt  time.Time `json:"scanned_at,omitempty"`
+
+	// Parking reason + timestamp (issue #554 / ADR-079 follow-up).
+	// pkg/sched.Engine.ParkDeployment sets these before flipping
+	// apps.status to `evicted_cold`; the apid GET /v1/apps/{slug}
+	// surface renders them as the `parked_deployment: { id,
+	// parked_reason, parked_at }` reference. closed-set vocabulary
+	// is enforced at the schema layer via the
+	// deployments_parked_reason_check constraint (migration 00155).
+	ParkedReason string     `json:"parked_reason,omitempty"`
+	ParkedAt     *time.Time `json:"parked_at,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem
