@@ -1741,7 +1741,7 @@ func (s *PgStore) ListAppsByNodeID(ctx context.Context, nodeID string) ([]App, e
 // last_request_at, parked_at, node_id, wake_id).
 func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]Instance, error) {
 	sel := `select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
 		   from instances i
 		   join apps a on a.id = i.app_id
 		  where a.node_id = $1`
@@ -2008,7 +2008,8 @@ func (s *PgStore) ListLiveInstancesOnNode(ctx context.Context, nodeID string, ma
 	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
 	               i.started_at, i.last_request_at, i.parked_at,
 	               coalesce(i.node_id::text, ''), i.wake_id, i.framework_ready_at,
-	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
+	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, ''),
+	               i.tail_count
 	          from instances i
 	         where i.state = 'running'` +
 		nodeClause + `
@@ -2209,7 +2210,8 @@ func (s *PgStore) ListExpiredMigrations(ctx context.Context, maxPerTick int) ([]
 	               coalesce(i.guest_uid,0), coalesce(host(i.host_ip),''), i.ram_mb,
 	               i.started_at, i.last_request_at, i.parked_at,
 	               coalesce(i.node_id::text, ''), i.wake_id, i.framework_ready_at,
-	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, '')
+	               i.migrated_from_node_id::text, i.migrated_at, coalesce(i.lease_token, ''),
+	               i.tail_count
 	          from instances i
 	         where i.state = 'migrating'
 	           and i.lease_token is not null
@@ -5964,7 +5966,7 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 		`insert into instances (app_id, deployment_id, state, ram_mb, node_id, wake_id, started_at)
 		 values ($1, $2, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else $6::uuid end, now())
 		 returning id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at`,
+		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count`,
 		appID, deploymentID, state, ramMB, nodeID, wakeID)
 	return scanInstance(row)
 }
@@ -5972,7 +5974,7 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 func (s *PgStore) InstanceByID(ctx context.Context, id string) (Instance, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count
 		 from instances where id = $1`, id)
 	return scanInstance(row)
 }
@@ -5980,7 +5982,7 @@ func (s *PgStore) InstanceByID(ctx context.Context, id string) (Instance, error)
 func (s *PgStore) ListInstancesForApp(ctx context.Context, appID string) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count
 		 from instances where app_id = $1 order by started_at desc`, appID)
 	if err != nil {
 		return nil, err
@@ -6004,7 +6006,7 @@ func (s *PgStore) ListLatestInstancesForApp(ctx context.Context, appID string, l
 	}
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count
 		 from instances where app_id = $1 order by started_at desc limit $2`, appID, limit)
 	if err != nil {
 		return nil, err
@@ -6022,7 +6024,7 @@ func (s *PgStore) ListLatestInstancesForApp(ctx context.Context, appID string, l
 func (s *PgStore) ListAllInstances(ctx context.Context) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count
 		 from instances
 		 where state in ('running','waking','cold_booting','snapshotting')
 		 order by started_at desc`)
@@ -6042,7 +6044,7 @@ func (s *PgStore) ListAllInstances(ctx context.Context) ([]Instance, error) {
 func (s *PgStore) ListInstancesForAccount(ctx context.Context, accountID string) ([]Instance, error) {
 	rows, err := s.pool.Query(ctx,
 		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
@@ -6082,7 +6084,7 @@ func (s *PgStore) ListInstancesForAccountPaged(ctx context.Context, accountID st
 	}
 	rows, err := s.pool.Query(ctx,
 		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
@@ -6115,7 +6117,7 @@ func (s *PgStore) ListLatestInstancePerApp(ctx context.Context, accountID string
 	rows, err := s.pool.Query(ctx,
 		`select distinct on (i.app_id)
 		        i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
-		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
 		 from instances i
 		 join apps a on a.id = i.app_id
 		 where a.account_id = $1
@@ -6222,6 +6224,74 @@ func (s *PgStore) ClearInstanceFrameworkReadyAt(ctx context.Context, id string) 
 	return nil
 }
 
+// BumpInstanceTailCount atomically applies delta to the instance's
+// `tail_count` column and returns the post-update value (issue #667
+// / ADR-078). The arithmetic happens in SQL so concurrent receipts
+// (a runner firing several terminal events in quick succession)
+// cannot lose increments. The GREATEST(…, 0) floor mirrors
+// DecrementInstanceTailCount's safety property — a stale receipt
+// from a guest that just parked cannot underflow the counter, and
+// snapshotAndPark's 5s watchdog force-parks regardless.
+//
+// Uses RETURNING tail_count so the caller (vmmd's
+// MarkInstanceTailTerminal) learns the new value without a
+// follow-up SELECT. The post-update value is what the runner's
+// WaitGroup view of the world now matches — schedd's reaper
+// decision in PR 4 reads the same value from
+// Instance.TailCount.
+//
+// Returns ErrNotFound when the instance row is missing (the
+// receipt raced a Park / Destroy and the row is gone). The
+// vmmd receipt path logs a Debug and drops — same convention
+// as the framework_ready / sidecar-event DGRAM receipts.
+func (s *PgStore) BumpInstanceTailCount(ctx context.Context, id string, delta int32) (int32, error) {
+	var post int32
+	row := s.pool.QueryRow(ctx,
+		`update instances
+		    set tail_count = GREATEST(tail_count + $2, 0)
+		  where id = $1
+		returning tail_count`,
+		id, delta)
+	if err := row.Scan(&post); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return post, nil
+}
+
+// DecrementInstanceTailCount is the canonical "tail task reached
+// terminal" path (issue #667 / ADR-078). Equivalent to
+// BumpInstanceTailCount(ctx, id, -1) — kept as a separate method
+// because every decrement site is a terminal event receipt, and
+// the explicit name makes the call sites self-documenting.
+//
+// GREATEST(tail_count - 1, 0) is the safety floor: a stale
+// decrement on a counter at 0 leaves it at 0 rather than
+// underflowing. Without the floor, a burst of decrements after
+// the runner exited cleanly would push the counter negative and
+// the schedd reaper's `tail_count > 0` early-out would
+// permanently stall the wake. The 5s watchdog in
+// snapshotAndPark force-parks regardless; the floor is a
+// defence-in-depth guard, not the load-bearing piece.
+//
+// Returns ErrNotFound when the instance row is missing.
+func (s *PgStore) DecrementInstanceTailCount(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set tail_count = GREATEST(tail_count - 1, 0)
+		  where id = $1`,
+		id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListInstancesByStatesOlderThan is the watchdog's lookup (spec §6.1).
 // Filters on state ∈ states and a state-aware "age" column:
 // started_at for WAKING / COLD_BOOTING (stamped on creation by the
@@ -6243,7 +6313,7 @@ func (s *PgStore) ListInstancesByStatesOlderThan(ctx context.Context, states []S
 	}
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count
 		 from instances
 		 where state = any($1)
 		   and case when state = 'snapshotting' then parked_at else started_at end < $2`,
@@ -6269,7 +6339,7 @@ func (s *PgStore) ListInstancesInTerminalStatesOlderThan(ctx context.Context, st
 	}
 	rows, err := s.pool.Query(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, terminal_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count, terminal_at
 		 from instances
 		 where state = any($1)
 		   and terminal_at is not null
@@ -6313,7 +6383,7 @@ func (s *PgStore) SetInstanceRuntime(ctx context.Context, id, netns, hostIP stri
 func (s *PgStore) RunningInstanceForApp(ctx context.Context, appID string) (Instance, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, app_id, deployment_id, state, coalesce(netns,''), coalesce(guest_uid,0),
-		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at
+		        coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count
 		 from instances where app_id = $1 and state = 'running'
 		 order by started_at desc nulls last limit 1`, appID)
 	return scanInstance(row)
@@ -9354,6 +9424,14 @@ func scanInstances(rows pgx.Rows) ([]Instance, error) {
 // plans never opt in. Scanned into a *time.Time so the nil/zero-value
 // distinction survives the Scan trip (pgx returns untyped nil for NULL
 // TIMESTAMPTZ, which is exactly the marker we want to keep on the struct).
+//
+// tail_count is the 15th column (issue #667 / ADR-078, migration 00149).
+// NOT NULL DEFAULT 0 — every pre-#667 row reads as 0 (the column
+// default fills pre-migration rows), which is the correct "no active
+// tails" value schedd's reaper gate (PR 4) decisions are keyed on.
+// Scanned into a plain int (no *int) because the column is NOT NULL
+// across the entire schema lifetime — a *int would silently mask a
+// future regression that re-allows NULL.
 func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	ins := Instance{}
 	var started, lastReq, parked, frameworkReady *time.Time
@@ -9364,7 +9442,7 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	// from silently swallowing wake_id into an unrelated field.
 	if err := scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
 		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID,
-		&frameworkReady); err != nil {
+		&frameworkReady, &ins.TailCount); err != nil {
 		return Instance{}, err
 	}
 	if started != nil {
@@ -9383,12 +9461,13 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 	return ins, nil
 }
 
-// scanInstanceColsWithMigration is the 17-column variant of
+// scanInstanceColsWithMigration is the 18-column variant of
 // scanInstanceCols that also lifts framework_ready_at (PR #543 /
 // migration 00120), migrated_from_node_id, migrated_at, and
-// lease_token (Tier A5 / migration 00097, ADR-066). Used by
+// lease_token (Tier A5 / migration 00097, ADR-066), and
+// tail_count (issue #667 / ADR-078, migration 00149). Used by
 // ListLiveInstancesOnNode and ListExpiredMigrations — the rest
-// of the codebase reads 13-column instances rows and doesn't
+// of the codebase reads 15-column instances rows and doesn't
 // need the migration lineage. Column order matches the SELECTs
 // in those two functions; keep them in lock-step.
 // migrated_from_node_id is nullable forever (a fresh instance
@@ -9399,7 +9478,8 @@ func scanInstanceCols(scan func(...any) error) (Instance, error) {
 // nullable on every pre-warm-capture row — for migrating
 // instances it is always NULL (the warm-capture path predates
 // migration), but the column is part of the row shape so we
-// scan it for shape parity.
+// scan it for shape parity. tail_count is NOT NULL DEFAULT 0
+// and scans into a plain int.
 //
 // Single-call scan: pgx rejects a 17-column SELECT with a 13-dest
 // scan followed by a 4-dest scan — the row surface is one
@@ -9415,7 +9495,7 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 	var leaseStr *string
 	if err := scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
 		&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID,
-		&frameworkReady, &migFromStr, &migAtTime, &leaseStr); err != nil {
+		&frameworkReady, &migFromStr, &migAtTime, &leaseStr, &ins.TailCount); err != nil {
 		return Instance{}, err
 	}
 	if started != nil {
@@ -9439,10 +9519,10 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 	return ins, nil
 }
 
-// scanInstancesWithTerminal is the 14-column variant of scanInstanceCols
+// scanInstancesWithTerminal is the 15-column variant of scanInstanceCols
 // that also lifts terminal_at (PR #74) and node_id (issue #97). Used only
 // by ListInstancesInTerminalStatesOlderThan — the rest of the codebase
-// reads 13-column instances rows (incl. node_id) and doesn't need
+// reads 14-column instances rows (incl. node_id) and doesn't need
 // terminal_at, so threading it into scanInstanceCols would force every
 // SELECT to expose it for no reason. node_id is included here so the
 // retention sweep's row carries the same node info as a live row — the
@@ -9452,16 +9532,21 @@ func scanInstanceColsWithMigration(scan func(...any) error) (Instance, error) {
 // column (PR #470-FU-B migration 00112); for the retention sweep it's
 // always NULL (terminal rows pre-date the warm-capture path) but the
 // column is part of the row shape so we scan it for shape parity.
+// tail_count is the 15th column (issue #667 / ADR-078, migration 00149);
+// for the retention sweep it's always 0 (terminal rows have no active
+// tails) but the column is part of the row shape so we scan it for
+// shape parity.
 func scanInstancesWithTerminal(rows pgx.Rows) ([]Instance, error) {
 	var out []Instance
 	for rows.Next() {
 		ins := Instance{}
 		var started, lastReq, parked, frameworkReady, terminal *time.Time
 		// Column order matches ListInstancesInTerminalStatesOlderThan's
-		// SELECT (now 15 columns after migration 00028 added wake_id,
-		// 00112 added framework_ready_at, before terminal_at).
+		// SELECT (now 16 columns after migration 00028 added wake_id,
+		// 00112 added framework_ready_at, 00149 added tail_count,
+		// before terminal_at).
 		if err := rows.Scan(&ins.ID, &ins.AppID, &ins.DeploymentID, &ins.State, &ins.Netns, &ins.GuestUID,
-			&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID, &frameworkReady, &terminal); err != nil {
+			&ins.HostIP, &ins.RAMMB, &started, &lastReq, &parked, &ins.NodeID, &ins.WakeID, &frameworkReady, &ins.TailCount, &terminal); err != nil {
 			return nil, err
 		}
 		if started != nil {

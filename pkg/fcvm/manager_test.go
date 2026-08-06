@@ -2443,6 +2443,176 @@ func TestMarkInstanceFrameworkReady_UnknownInstance(t *testing.T) {
 	}
 }
 
+// TestMarkInstanceTailTerminal (issue #667 / ADR-078) pins the
+// host-side decrement path that backs the type=0x04 tail_event
+// DGRAM receipt. Mirrors TestMarkInstanceFrameworkReady's
+// shape: cold-boot an instance, stamp TailCount via the
+// live-map patch (the runner-side WaitGroup is the canonical
+// owner of the counter; this test patches the in-memory mirror
+// to simulate the runner's pre-decrement state), call
+// MarkInstanceTailTerminal, observe the decrement in the live
+// map.
+//
+// Mirrors the new field on state.Instance.TailCount (migration
+// 00149). The TailTerminalStamper is wired to a fakeTailStamper
+// that records every call so the test asserts the SQL seam is
+// hit on the receipt path.
+func TestMarkInstanceTailTerminal(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	stamper := &fakeTailStamper{}
+	m := newTestManager(run, vmm).WithTailTerminalStamper(stamper)
+
+	inst, err := m.ColdBoot(context.Background(), req("i-tail"))
+	if err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	// Seed: simulate the runner having 2 in-flight tail tasks.
+	m.mu.Lock()
+	m.live["i-tail"].AppID = "app-tail-test"
+	m.live["i-tail"].TailCount = 2
+	m.mu.Unlock()
+
+	// Receipt: a tail task reached terminal (completed).
+	stamped, appID, err := m.MarkInstanceTailTerminal(
+		context.Background(), "i-tail", TailOutcomeCompleted, 1500)
+	if err != nil {
+		t.Fatalf("MarkInstanceTailTerminal: %v", err)
+	}
+	if !stamped {
+		t.Fatal("stamped = false, want true")
+	}
+	if appID != "app-tail-test" {
+		t.Errorf("appID = %q, want app-tail-test", appID)
+	}
+
+	// In-memory TailCount decremented.
+	m.mu.Lock()
+	got := m.live["i-tail"].TailCount
+	m.mu.Unlock()
+	if got != 1 {
+		t.Errorf("TailCount = %d, want 1 (decrement from 2)", got)
+	}
+
+	// Stamper was hit once.
+	if len(stamper.calls) != 1 {
+		t.Errorf("stamper calls = %d, want 1", len(stamper.calls))
+	}
+	if len(stamper.calls) >= 1 && stamper.calls[0] != "i-tail" {
+		t.Errorf("stamper calls[0] = %q, want i-tail", stamper.calls[0])
+	}
+
+	_ = inst // silence unused
+}
+
+// TestMarkInstanceTailTerminal_FloorsAtZero pins the in-memory
+// floor (the SQL GREATEST(…, 0) guard has its own test in
+// memstore_tail_count_test.go). A stray decrement on a
+// counter at 0 must leave the in-memory mirror at 0; the
+// snapshotAndPark 5s watchdog force-parks regardless (PR 4).
+func TestMarkInstanceTailTerminal_FloorsAtZero(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	stamper := &fakeTailStamper{}
+	m := newTestManager(run, vmm).WithTailTerminalStamper(stamper)
+
+	if _, err := m.ColdBoot(context.Background(), req("i-tail-floor")); err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	// Counter starts at 0 (cold-boot doesn't seed it). Three
+	// stray receipts — each must leave the counter at 0.
+	for i := 0; i < 3; i++ {
+		stamped, _, err := m.MarkInstanceTailTerminal(
+			context.Background(), "i-tail-floor", TailOutcomeTimeout, 5000)
+		if err != nil {
+			t.Fatalf("receipt %d: %v", i, err)
+		}
+		if !stamped {
+			t.Errorf("receipt %d: stamped=false, want true", i)
+		}
+	}
+	m.mu.Lock()
+	got := m.live["i-tail-floor"].TailCount
+	m.mu.Unlock()
+	if got != 0 {
+		t.Errorf("TailCount = %d, want 0 (floor)", got)
+	}
+}
+
+// TestMarkInstanceTailTerminal_UnknownInstance asserts the
+// receipt of a DGRAM for an instance that has already been
+// torn down (a stale receipt racing the wake-park cycle)
+// returns (false, "", nil) — the host's dispatchTailEvent
+// translates that to a Debug log + drop, same convention as
+// MarkInstanceFrameworkReady.
+func TestMarkInstanceTailTerminal_UnknownInstance(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	stamper := &fakeTailStamper{}
+	m := newTestManager(run, vmm).WithTailTerminalStamper(stamper)
+
+	stamped, appID, err := m.MarkInstanceTailTerminal(
+		context.Background(), "i-tail-missing", TailOutcomeCompleted, 100)
+	if err != nil {
+		t.Fatalf("MarkInstanceTailTerminal: %v", err)
+	}
+	if stamped {
+		t.Error("stamped = true, want false (unknown instance)")
+	}
+	if appID != "" {
+		t.Errorf("appID = %q, want empty on unknown", appID)
+	}
+	if len(stamper.calls) != 0 {
+		t.Errorf("stamper calls = %d, want 0 (no live instance)", len(stamper.calls))
+	}
+}
+
+// TestMarkInstanceTailTerminal_NilStamperDoesNotPanic asserts
+// the nil-safe receipt path: a Manager constructed without
+// WithTailTerminalStamper must not panic when a 0x04 DGRAM
+// arrives. Mirrors the same nil-safe pattern as
+// MarkInstanceFrameworkReady / FrameworkReadyMetrics.
+func TestMarkInstanceTailTerminal_NilStamperDoesNotPanic(t *testing.T) {
+	run, vmm := &fakeRunner{}, &fakeVMM{}
+	m := newTestManager(run, vmm) // no WithTailTerminalStamper
+
+	if _, err := m.ColdBoot(context.Background(), req("i-tail-nilstamp")); err != nil {
+		t.Fatalf("cold boot: %v", err)
+	}
+	m.mu.Lock()
+	m.live["i-tail-nilstamp"].TailCount = 1
+	m.mu.Unlock()
+
+	stamped, _, err := m.MarkInstanceTailTerminal(
+		context.Background(), "i-tail-nilstamp", TailOutcomeFailed, 200)
+	if err != nil {
+		t.Fatalf("MarkInstanceTailTerminal: %v", err)
+	}
+	if !stamped {
+		t.Error("stamped = false, want true (in-memory mirror still decrements)")
+	}
+	m.mu.Lock()
+	got := m.live["i-tail-nilstamp"].TailCount
+	m.mu.Unlock()
+	if got != 0 {
+		t.Errorf("TailCount = %d, want 0 (in-memory mirror decrement)", got)
+	}
+}
+
+// fakeTailStamper is the TailTerminalStamper test double. It
+// records every DecrementInstanceTailCount call so the test
+// can assert the SQL seam was hit (or not) on the receipt
+// path. Mirrors the recording pattern in framework_ready's
+// test helpers.
+type fakeTailStamper struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *fakeTailStamper) DecrementInstanceTailCount(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, id)
+	return nil
+}
+
 // TestInstanceByCID (issue #470 / PR #470-FU-B) is the
 // reverse lookup the host's DGRAM recv loop uses to map
 // a peer AF_VSOCK CID back to the live Instance id.

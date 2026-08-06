@@ -16,13 +16,18 @@
 //	[1B type=0x01][optional 4B BE uint32 warmup_ms][NUL][runtime]
 //	[1B type=0x02][json envelope: sidecar_init_exit]
 //	[1B type=0x03][json envelope: sidecar_restart]
+//	[1B type=0x04][1B outcome][6B reserved][8B elapsed_ms BE uint64]
 //
 // The host strips the NUL-terminated runtime and uses the
 // preceding 4 bytes (if present) as the warmup_ms duration for
 // type=0x01; for type=0x02/0x03 the remainder of the body is a
-// small UTF-8 JSON envelope. Type outside the closed set {0x01,
-// 0x02, 0x03} is dropped with a Warn (forward-compatible with
-// future event classes).
+// small UTF-8 JSON envelope. type=0x04 (issue #667 / ADR-078)
+// is the waitUntil(post-response tail) terminal-event channel:
+// a 16-byte fixed-size envelope with the per-task outcome
+// (completed / failed / timeout) and elapsed_ms in
+// milliseconds. Type outside the closed set {0x01, 0x02, 0x03,
+// 0x04} is dropped with a Warn (forward-compatible with future
+// event classes).
 //
 // Concurrency: one goroutine reads the DGRAM fd. Each receipt
 // is parsed and dispatched to the Manager synchronously. A
@@ -63,6 +68,16 @@ const (
 	VsockFrameworkReadyHostTypeReady    byte = 0x01
 	VsockFrameworkReadyHostTypeInitExit byte = 0x02
 	VsockFrameworkReadyHostTypeRestart  byte = 0x03
+	// VsockFrameworkReadyHostTypeTail (issue #667 / ADR-078)
+	// is the discriminator byte for the waitUntil(post-response
+	// tail) terminal-event envelope. Same DGRAM port 1027
+	// channel as framework_ready / sidecar events; the
+	// guest-init proxy (guest/init/sidecar_events_proxy_linux.go)
+	// emits a 16-byte fixed-size body following the type byte.
+	// The host resolves instance identity from the DGRAM peer
+	// CID (same join the other three types use); the
+	// elapsed_ms payload feeds the telemetry histogram (PR 5).
+	VsockFrameworkReadyHostTypeTail byte = 0x04
 )
 
 // Sidecar init-exit status closed enum (issue #463 / ADR-069 /
@@ -227,6 +242,8 @@ func (r *FrameworkReadyReceiver) loop() {
 			r.dispatchSidecarInitExit(instance, msg.InitExit)
 		case parseFWReadyKindRestart:
 			r.dispatchSidecarRestart(instance, msg.Restart)
+		case parseFWReadyKindTail:
+			r.dispatchTailEvent(instance, msg.Tail)
 		}
 	}
 }
@@ -309,11 +326,55 @@ func (r *FrameworkReadyReceiver) dispatchSidecarRestart(instance string, wire si
 	r.emitter.EmitSidecarRestart(r.ctx, instance, appID, "" /* wakeID not on wire — see pkg/events.SidecarRestart's struct doc */, wire)
 }
 
+// dispatchTailEvent (issue #667 / ADR-078): the type=0x04
+// dispatch path. Decrements the in-memory TailCount via the
+// Manager's MarkInstanceTailTerminal + mirrors the decrement to
+// the SQL `tail_count` column (via the Manager's optional
+// TailTerminalStamper). The elapsed_ms payload is currently
+// read-but-not-acted-on — PR 5 wires the
+// guest_tail_seconds histogram to observe it. A closed-set
+// outcome guard surfaces unknown bytes at Warn (a runner
+// emitting an unknown outcome is a wire-incompatible bug).
+func (r *FrameworkReadyReceiver) dispatchTailEvent(instance string, wire parseFWReadyTailWire) {
+	// Closed-set guard. An unknown outcome byte means the
+	// guest-init proxy shipped a wire-incompatible value —
+	// the closed-set constant in
+	// guest/init/sidecar_events_proxy_linux.go is the
+	// source of truth; if a new outcome is added there,
+	// the union here and the byte set in pkg/fcvm must
+	// move together.
+	var outcome fcvm.TailOutcome
+	switch wire.Outcome {
+	case tailEventOutcomeCompleted:
+		outcome = fcvm.TailOutcomeCompleted
+	case tailEventOutcomeFailed:
+		outcome = fcvm.TailOutcomeFailed
+	case tailEventOutcomeTimeout:
+		outcome = fcvm.TailOutcomeTimeout
+	default:
+		r.log.Warn("tail_event unknown outcome",
+			"instance", instance, "outcome", wire.Outcome)
+		return
+	}
+	stamped, appID, merr := r.mgr.MarkInstanceTailTerminal(r.ctx, instance, outcome, wire.ElapsedMs)
+	if merr != nil {
+		r.log.Warn("tail_event manager call", "err", merr)
+		return
+	}
+	if !stamped {
+		r.log.Debug("tail_event manager found no live instance",
+			"instance", instance)
+		return
+	}
+	_ = appID
+}
+
 // parseFWKind is the discriminator for
 // parseFrameworkReadyDatagram (issue #463 / ADR-069 /
-// ADR-071 / PR-C). Closed set: OK for type=0x01, InitExit
-// for type=0x02, Restart for type=0x03. A future type=0x04
-// adds its own enum value here.
+// ADR-071 / PR-C, extended for tail events in issue #667 /
+// ADR-078). Closed set: OK for type=0x01, InitExit for
+// type=0x02, Restart for type=0x03, Tail for type=0x04. A
+// future type=0x05 adds its own enum value here.
 type parseFWKind uint8
 
 const (
@@ -321,13 +382,30 @@ const (
 	parseFWReadyKindOK
 	parseFWReadyKindInitExit
 	parseFWReadyKindRestart
+	// parseFWReadyKindTail (issue #667 / ADR-078) — the
+	// waitUntil terminal-event receipt (type=0x04).
+	parseFWReadyKindTail
+)
+
+// tailEventOutcome (issue #667 / ADR-078) mirrors the
+// guest-init wire byte for the per-task outcome. Duplicated
+// from pkg/fcvm.TailOutcomeClosed set because cmd/vmmd does
+// not import pkg/fcvm (cmd/vmmd IS the consumer; it imports
+// the Manager but the Manager only exposes the typed
+// TailOutcome from the package boundary — keeping the byte
+// value here too is the wire-correctness guard the
+// parseFWReadyMsg.Tail decoder relies on).
+const (
+	tailEventOutcomeCompleted byte = 0x01
+	tailEventOutcomeFailed    byte = 0x02
+	tailEventOutcomeTimeout   byte = 0x03
 )
 
 // parseFWReadyMsg is the typed return of
 // parseFrameworkReadyDatagram. Type=0x01 fills WarmupMs +
-// Kind; type=0x02/0x03 fill the matching envelope. The
-// instance id is NOT on the wire — the host resolves it from
-// the DGRAM peer CID.
+// Kind; type=0x02/0x03 fill the matching envelope; type=0x04
+// fills the Tail outcome + elapsed_ms. The instance id is NOT
+// on the wire — the host resolves it from the DGRAM peer CID.
 type parseFWReadyMsg struct {
 	Kind     parseFWKind
 	WarmupMs int64
@@ -335,6 +413,22 @@ type parseFWReadyMsg struct {
 	Runtime  string
 	InitExit sidecarInitExitWire
 	Restart  sidecarRestartWire
+	// Tail (issue #667 / ADR-078) carries the per-task
+	// outcome + elapsed_ms for type=0x04 only. Outcome is the
+	// closed enum byte (1=completed, 2=failed, 3=timeout);
+	// ElapsedMs is the wall-clock duration from waitUntil
+	// registration to terminal in milliseconds.
+	Tail parseFWReadyTailWire
+}
+
+// parseFWReadyTailWire is the type=0x04 body view (issue #667 /
+// ADR-078). The wire is fixed-size: [1B type][1B outcome][6B
+// reserved][8B BE uint64 elapsed_ms]; the type byte is
+// stripped by parseFrameworkReadyDatagram before this struct
+// is populated.
+type parseFWReadyTailWire struct {
+	Outcome   byte
+	ElapsedMs int64
 }
 
 // TypeLabel returns a human-readable label of the discriminated
@@ -347,6 +441,8 @@ func (m parseFWReadyMsg) TypeLabel() string {
 		return fmt.Sprintf("sidecar_init_exit(0x%02x)", VsockFrameworkReadyHostTypeInitExit)
 	case parseFWReadyKindRestart:
 		return fmt.Sprintf("sidecar_restart(0x%02x)", VsockFrameworkReadyHostTypeRestart)
+	case parseFWReadyKindTail:
+		return fmt.Sprintf("tail_event(0x%02x)", VsockFrameworkReadyHostTypeTail)
 	default:
 		return "unknown"
 	}
@@ -355,8 +451,9 @@ func (m parseFWReadyMsg) TypeLabel() string {
 // parseFrameworkReadyDatagram parses one DGRAM body into the
 // typed parseFWReadyMsg union. Closed type set: 0x01
 // (framework_ready), 0x02 (sidecar_init_exit), 0x03
-// (sidecar_restart). The instance id is NOT on the wire — the
-// host resolves it from the DGRAM peer CID instead.
+// (sidecar_restart), 0x04 (tail_event, issue #667 / ADR-078).
+// The instance id is NOT on the wire — the host resolves it
+// from the DGRAM peer CID instead.
 func parseFrameworkReadyDatagram(b []byte) (parseFWReadyMsg, error) {
 	var msg parseFWReadyMsg
 	if len(b) == 0 {
@@ -393,6 +490,32 @@ func parseFrameworkReadyDatagram(b []byte) (parseFWReadyMsg, error) {
 		msg.Kind = parseFWReadyKindRestart
 		if err := json.Unmarshal(rest, &msg.Restart); err != nil {
 			return msg, fmt.Errorf("sidecar_restart: %w", err)
+		}
+	case VsockFrameworkReadyHostTypeTail:
+		// Issue #667 / ADR-078: waitUntil terminal-event
+		// envelope. Wire layout after the type byte is
+		// fixed-size:
+		//   [1B outcome][6B reserved][8B BE uint64 elapsed_ms]
+		// Total: 15 bytes of payload. The reserved 6 bytes
+		// stay 0x00 in PR 3 — reserved for a future
+		// wire-level instance_id (the host currently
+		// resolves instance identity via the DGRAM peer CID).
+		// Short-read tolerance: any missing trailing bytes
+		// surface as 0 (the runner-side emit guarantees the
+		// full 15 bytes — a short read means the kernel
+		// truncated the DGRAM, which is logged at Debug and
+		// dropped via the loop's existing per-DGRAM error
+		// handling).
+		msg.Kind = parseFWReadyKindTail
+		if len(rest) < 1 {
+			return msg, fmt.Errorf("tail_event: missing outcome byte")
+		}
+		msg.Tail.Outcome = rest[0]
+		// rest[1:7] reserved — intentionally not read; we
+		// don't widen the struct to a slice of 6 bytes
+		// just to discard it.
+		if len(rest) >= 15 {
+			msg.Tail.ElapsedMs = int64(binary.BigEndian.Uint64(rest[7:15]))
 		}
 	default:
 		return msg, fmt.Errorf("unknown msg sub-type 0x%02x", b[0])

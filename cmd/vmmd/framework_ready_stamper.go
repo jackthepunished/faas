@@ -1,12 +1,18 @@
 //go:build !ignore
 
-// framework_ready_stamper.go (issue #470 / PR #470-FU-B) is the
-// cmd/vmmd ↔ pkg/fcvm adapter that bridges the local
-// FrameworkReadyStamper interface to the State.Store.SetInstanceFrameworkReadyAt
-// method. The adapter exists because the Manager shouldn't depend
+// framework_ready_stamper.go (issue #470 / PR #470-FU-B, extended
+// for tail events in issue #667 / ADR-078) is the cmd/vmmd ↔
+// pkg/fcvm adapter that bridges the local FrameworkReadyStamper +
+// TailTerminalStamper interfaces to the State.Store methods.
+//
+// Two interfaces, one adapter: a single storeStamper satisfies
+// both the FrameworkReadyStamper and TailTerminalStamper
+// contracts so the Manager's two receipt paths (the framework_ready
+// DGRAM + the tail_event DGRAM) share the same SQL-persistence
+// seam. The adapter exists because the Manager shouldn't depend
 // on pkg/state (a wider import surface than the receipt path needs);
-// the State surface is wider than FrameworkReadyStamper's one-method
-// contract, so a direct assignment would loosen the interface.
+// the State surface is wider than the two one-method interfaces
+// combined, so a direct assignment would loosen the interface.
 //
 // We accept the abstract state.Store (not the concrete *state.PgStore)
 // so the vmmd main loop can wire the stamper whether store is the
@@ -28,24 +34,31 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
 // stateStamper is the local interface the adapter needs. We
-// can't widen fcvm.FrameworkReadyStamper (that would couple the
-// Manager to pkg/state), so the adapter declares the minimum
-// surface it consumes. state.Store satisfies this for both
-// PgStore and the in-memory test store.
+// can't widen fcvm.FrameworkReadyStamper / TailTerminalStamper
+// (that would couple the Manager to pkg/state), so the adapter
+// declares the minimum surface it consumes. state.Store
+// satisfies this for both PgStore and the in-memory test store.
 type stateStamper interface {
 	SetInstanceFrameworkReadyAt(ctx context.Context, id string, readyAt time.Time) error
+	DecrementInstanceTailCount(ctx context.Context, id string) error
 }
 
-// stamperFromStore adapts the State.SetInstanceFrameworkReadyAt
-// method to the local fcvm.FrameworkReadyStamper interface. The
-// log is non-nil in production; nil falls back to slog.Default
-// so the adapter is safe to call from tests.
-func stamperFromStore(s state.Store, log *slog.Logger) fcvm.FrameworkReadyStamper {
+// stamperFromStore adapts the State methods to the local
+// fcvm.FrameworkReadyStamper + fcvm.TailTerminalStamper
+// interfaces. The returned value satisfies BOTH interfaces
+// (single storeStamper receiver implements both SetFrameworkReadyAt
+// and DecrementInstanceTailCount). The log is non-nil in
+// production; nil falls back to slog.Default so the adapter
+// is safe to call from tests.
+//
+// Returns a *storeStamper (not an interface) so the caller can
+// pass the same instance to both WithFrameworkReadyStamper and
+// WithTailTerminalStamper without two adapter allocations.
+func stamperFromStore(s state.Store, log *slog.Logger) *storeStamper {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -69,6 +82,23 @@ type storeStamper struct {
 func (p *storeStamper) SetFrameworkReadyAt(ctx context.Context, instance string, readyAt time.Time) error {
 	if err := p.store.SetInstanceFrameworkReadyAt(ctx, instance, readyAt); err != nil {
 		p.log.Warn("vmmd: framework_ready stamper persist",
+			"instance", instance, "err", err)
+		return err
+	}
+	return nil
+}
+
+// DecrementInstanceTailCount (issue #667 / ADR-078) forwards
+// to the store. Mirrors SetFrameworkReadyAt's error policy:
+// log Warn, do not return — the in-memory stamp on the live
+// Instance is the runner's source of truth (the WaitGroup
+// view); the SQL column is the durable mirror the schedd
+// reaper reads (PR 4). A transient PG hiccup must not lose
+// the receipt; the snapshotAndPark 5s watchdog force-parks
+// regardless.
+func (p *storeStamper) DecrementInstanceTailCount(ctx context.Context, instance string) error {
+	if err := p.store.DecrementInstanceTailCount(ctx, instance); err != nil {
+		p.log.Warn("vmmd: tail_terminal stamper persist",
 			"instance", instance, "err", err)
 		return err
 	}

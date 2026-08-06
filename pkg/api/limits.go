@@ -429,6 +429,52 @@ type Limits struct {
 	// the per-flush deadline is enforced via http.ResponseController.
 	// 0 means "fall back to api.ResponseWriteTimeoutDefault".
 	ResponseWriteTimeoutSeconds int
+
+	// TailEnabled (issue #667 / ADR-078) is the per-plan toggle for
+	// the waitUntil(post-response tail) primitive. Free defaults ON
+	// at the 5 s floor (spec §13 hard-limits table; the primitive
+	// is the most-asked-for addition to the function surface, so we
+	// ship it on every tier with a tight ceiling). The plan-level
+	// default is applied at CreateApp time via buildApp so a
+	// brand-new app on any plan is tail-ready without an extra
+	// PATCH round-trip; an existing app may still disable the
+	// primitive per-app via PATCH (gated by TailAllowed).
+	TailEnabled bool
+
+	// TailTimeoutS is the per-task wall-clock ceiling for a single
+	// waitUntil(promise) registration (issue #667 §"Rules"). The
+	// runner enforces this via context.WithTimeout(WaitUntilSec) per
+	// task; on expiry, the task is cancelled and a
+	// wake.tail_failed{reason=timeout} event is emitted. Plan
+	// values: Free 5 s, Hobby 15 s, Pro 30 s, Scale 60 s — the
+	// Pro value matches the issue's spec; Scale's 60 s ceiling is
+	// the longest "send a confirmation email" latency budget that
+	// still fits the reaper's G7 idle window. 0 means "feature
+	// disabled" — a missing plan row fails closed rather than
+	// silently inheriting a paid tier's relaxed ceiling.
+	TailTimeoutS int
+
+	// TailCapMax is the per-request structural cap on in-flight
+	// waitUntil(promise) registrations (issue #667 §"Implementation
+	// sketch"). Applied uniformly across plans — the issue pins
+	// this as a structural constant in pkg/api/limits.go, not a
+	// per-plan matrix. The runner enforces it before any
+	// BumpInstanceTailCount call; over-cap attempts emit the
+	// tailCapReached metric and log a wake.tail_failed{reason=cap_reached}.
+	// See Plan.TailCapMax() below — the accessor returns the
+	// structural value, NOT the field, so a missing plan row still
+	// gets the cap.
+	TailCapMax int
+
+	// ConcurrentTailsPerInstance is the per-plan cap on in-flight
+	// waitUntil(promise) registrations across all in-flight requests
+	// for one instance (issue #667 §"Rules"). Distinct from
+	// TailCapMax (per-request) — this is per-instance, not per-call.
+	// Plan values: Free 4, Hobby 16, Pro 64, Scale 256 — designed
+	// so a Pro customer's tail load can comfortably outpace their
+	// MaxConcurrency=5 wake fleet, and a Scale customer's can
+	// outpace MaxConcurrency=20. 0 means "feature disabled".
+	ConcurrentTailsPerInstance int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -560,6 +606,18 @@ var planLimits = map[Plan]Limits{
 		// default (false) keeps every existing customer
 		// public-by-default.
 		RequireAuthn: false,
+		// Tail primitive (issue #667 / ADR-078): Free enables with
+		// the floor timeout (5 s) and the floor concurrency cap (4).
+		// Customers on Free get the primitive, just tightly bounded —
+		// the structural TailCapMax = 16 still applies, but the
+		// per-instance concurrency is the binding constraint. A
+		// pathological tail on Free is killed by the 5 s watchdog in
+		// snapshotAndPark before it can hold a wake past the G7 idle
+		// window.
+		TailEnabled:                true,
+		TailTimeoutS:               TailTimeoutFloorSeconds,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 4,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -700,6 +758,15 @@ var planLimits = map[Plan]Limits{
 		// feature toggle, and the issue pairs it with
 		// internal-only ingress (Pro+).
 		RequireAuthn: false,
+		// Tail primitive (issue #667 / ADR-078): Hobby unlocks
+		// the 15 s timeout + 16 per-instance concurrent tails.
+		// Matches the issue's "send a confirmation email"
+		// latency budget comfortably; over-cap attempts emit
+		// the tailCapReached metric and log the failure.
+		TailEnabled:                true,
+		TailTimeoutS:               15,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 16,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -826,6 +893,15 @@ var planLimits = map[Plan]Limits{
 		// recommendation. The column default is still
 		// false — the customer must explicitly PATCH true.
 		RequireAuthn: true,
+		// Tail primitive (issue #667 / ADR-078): Pro unlocks
+		// the 30 s timeout + 64 per-instance concurrent tails.
+		// Matches the issue's per-plan matrix value; covers
+		// SaaS workloads where the webhook fan-out can take
+		// 20–25 s under realistic network conditions.
+		TailEnabled:                true,
+		TailTimeoutS:               30,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 64,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -963,6 +1039,17 @@ var planLimits = map[Plan]Limits{
 		// Customers on the largest plan who want
 		// token-gating still set it per-deployment.
 		RequireAuthn: true,
+		// Tail primitive (issue #667 / ADR-078): Scale unlocks
+		// the 60 s timeout + 256 per-instance concurrent tails —
+		// the ceiling per the issue's per-plan matrix. The 60 s
+		// timeout is the longest the issue pins; longer timeouts
+		// would let a runaway tail hold a wake past the G7 idle
+		// window and is rejected by the runtime AdvisoryFloor
+		// check.
+		TailEnabled:                true,
+		TailTimeoutS:               60,
+		TailCapMax:                 TailCapMax,
+		ConcurrentTailsPerInstance: 256,
 	},
 }
 
@@ -1127,6 +1214,39 @@ const (
 	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
+
+	// Post-response tail (issue #667 / ADR-078).
+	//
+	// TailCapMax is a structural constant applied uniformly across
+	// plans — the issue pins TailCapMax = 16 as a single source of
+	// truth, not a per-plan matrix. The runner enforces it before any
+	// BumpInstanceTailCount call so a customer cannot exceed the
+	// structural cap even if a plan row's TailCapMax field is unset
+	// or zero. The accessor Plan.TailCapMax() returns this constant
+	// regardless of the field's value, matching the issue's
+	// "structural constant in pkg/api/limits.go" framing.
+	TailCapMax = 16
+
+	// TailTimeoutFloorSeconds is the minimum wall-clock ceiling for
+	// any plan that enables the waitUntil primitive. The per-plan
+	// matrix values (Free 5 s / Hobby 15 s / Pro 30 s / Scale 60 s)
+	// are all >= this floor; a buggy planLimits entry that drops
+	// below the floor is clamped up by Plan.TailTimeoutSeconds()
+	// so the reaper's 5 s park-watchdog always has at least a chance
+	// to drain the tail before force-park (the watchdog is
+	// ParkTailDrainTimeoutSeconds below).
+	TailTimeoutFloorSeconds = 5
+
+	// ParkTailDrainTimeoutSeconds is the watchdog ceiling for
+	// snapshotAndPark when an instance's tail_count > 0 at park time
+	// (ADR-078 §"Park gate"). The engine waits up to this many seconds
+	// for the runner to drain its in-process tail host before
+	// force-parking and emitting wake.tail_failed{reason=forced_at_park}
+	// for any unfinished tails. Set to TailTimeoutFloorSeconds so the
+	// watchdog can never be shorter than the shortest per-plan tail
+	// timeout — otherwise the watchdog would fire mid-task and the
+	// graceful-drain contract would be a lie.
+	ParkTailDrainTimeoutSeconds = 5
 
 	// OCI puller (spec §17 G1, ADR-021). Per-pull HTTP timeout for the
 	// registry client. cmd/imaged passes this to oci.WithTimeout; the
@@ -1739,6 +1859,83 @@ func (p Plan) ResponseWriteTimeout() time.Duration {
 		return time.Duration(ResponseWriteTimeoutDefault) * time.Second
 	}
 	return time.Duration(l.ResponseWriteTimeoutSeconds) * time.Second
+}
+
+// TailEnabled reports whether the plan defaults the per-app
+// apps.tail_enabled column to true (issue #667 / ADR-078). Every
+// plan (Free/Hobby/Pro/Scale) ships with tail_enabled=true by default;
+// the per-plan TailTimeoutS + ConcurrentTailsPerInstance bounds make
+// the primitive safe on the abuse-floor tier. The plan-level default
+// is applied at CreateApp time via buildApp so a brand-new app on
+// any plan is tail-ready without an extra PATCH round-trip; an
+// existing app may still disable the primitive per-app via PATCH
+// (gated by TailAllowed). Unknown plans fail closed (return false) —
+// same contract as StreamingEnabled above.
+func (p Plan) TailEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.TailEnabled
+}
+
+// TailAllowed reports whether the plan permits a customer to set
+// apps.tail_enabled=true via PATCH. All four plans return true; the
+// gate exists for symmetry with StreamingResponseAllowed so a future
+// abuse-floor plan can be gated out cleanly without breaking
+// dependents. Unknown plans fail closed (return false).
+func (p Plan) TailAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.TailEnabled
+}
+
+// TailTimeoutSeconds returns the per-task wall-clock ceiling in
+// seconds for this plan, clamped up to TailTimeoutFloorSeconds (5 s)
+// when the plan row's field is unset, non-positive, or below the
+// floor (issue #667 / ADR-078). The clamp guarantees the reaper's
+// 5 s park-watchdog (ParkTailDrainTimeoutSeconds) can never be
+// shorter than the per-plan tail timeout — otherwise the watchdog
+// would fire mid-task and the graceful-drain contract would be a
+// lie. Unknown plans fall back to the floor (5 s). Per-plan values:
+// Free 5 s, Hobby 15 s, Pro 30 s, Scale 60 s.
+func (p Plan) TailTimeoutSeconds() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return TailTimeoutFloorSeconds
+	}
+	if l.TailTimeoutS < TailTimeoutFloorSeconds {
+		return TailTimeoutFloorSeconds
+	}
+	return l.TailTimeoutS
+}
+
+// TailCapMax returns the structural per-request cap on in-flight
+// waitUntil(promise) registrations. The issue pins this as a
+// single source of truth (TailCapMax = 16), NOT a per-plan matrix —
+// the accessor returns the structural constant regardless of the
+// plan row's field, matching the issue's "structural constant in
+// pkg/api/limits.go" framing. The runner enforces this before any
+// BumpInstanceTailCount call; over-cap attempts emit the
+// tailCapReached metric and log wake.tail_failed{reason=cap_reached}.
+func (p Plan) TailCapMax() int {
+	return TailCapMax
+}
+
+// ConcurrentTailsPerInstance returns the per-plan cap on in-flight
+// tails across all in-flight requests for one instance (issue #667).
+// Distinct from TailCapMax (per-request); this is per-instance, not
+// per-call. The runner enforces it locally with a mutex before any
+// BumpInstanceTailCount call. Per-plan values: Free 4, Hobby 16,
+// Pro 64, Scale 256. Unknown plans fail closed (return 0).
+func (p Plan) ConcurrentTailsPerInstance() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.ConcurrentTailsPerInstance
 }
 
 // CronLimitPerApp returns the per-app cron cap for the plan (spec §4.4).

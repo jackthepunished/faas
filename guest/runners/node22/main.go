@@ -35,20 +35,53 @@ import (
 	"github.com/onebox-faas/faas/guest/runners/internal"
 )
 
-// envelope matches the §4.9 request contract verbatim.
+// envelope matches the §4.9 request contract verbatim, extended with
+// the waitUntil(post-response tail) primitive fields (issue #667 /
+// ADR-078). Default 0/empty = no tail (backwards-compatible —
+// pre-#667 handlers ignore the new fields, post-#667 handlers read
+// them to drive ctx.waitUntil(promise)). The runner's tail host is
+// the WaitGroup + per-task context.WithTimeout wired in PR 3 once
+// guest-init lights up the 0x04 DGRAM path; PR 2 ships the envelope
+// shape change only.
 type envelope struct {
 	Method  string            `json:"method"`
 	Path    string            `json:"path"`
 	Headers map[string]string `json:"headers"`
 	Query   string            `json:"query"`
 	BodyB64 string            `json:"body_b64"`
+	// WaitUntilSec is the per-task wall-clock ceiling for any
+	// waitUntil(promise) the handler registers via the tail pipe
+	// (issue #667 §"Rules"). 0 = feature disabled on this request;
+	// the runner's tail host short-circuits to "no tail" and the
+	// handler's waitUntil calls are silently dropped (matching
+	// Vercel Edge / Cloudflare's pre-tail behaviour). Per-plan
+	// value stamped by imaged at build time via BuildEnvWithSecrets
+	// (PR 3).
+	WaitUntilSec int `json:"wait_until_sec"`
+	// TailPipePath is the JSONL pipe the handler appends one line
+	// per waitUntil(promise) registration to. Empty string = no
+	// tail (the handler's __faas_tail.js shim no-ops the waitUntil
+	// global, so legacy customer code keeps working). Per-request
+	// path under /tmp/faas-tail-<random>.jsonl (PR 3).
+	TailPipePath string `json:"tail_pipe_path,omitempty"`
 }
 
-// response is the §4.9 response contract.
+// response is the §4.9 response contract, extended with optional
+// tail failure metadata (issue #667 / ADR-078). TailErrors is
+// debug-only — surfaced to the customer via the runner's stderr +
+// the schedd's wake.tail_failed audit row, but never to the
+// HTTP response body (the issue forbids response rewrites). Empty
+// slice = no tail or all tasks completed cleanly.
 type response struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	BodyB64 string            `json:"body_b64"`
+	// TailErrors is the per-task failure list (timeouts,
+	// handler-thrown errors, post-MaxBytes). The shape is a
+	// JSON array of strings; omitted from the wire when empty
+	// to keep the response envelope identical to pre-#667 for
+	// handlers that do not use waitUntil.
+	TailErrors []string `json:"tail_errors,omitempty"`
 }
 
 func main() {

@@ -517,6 +517,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// JailerVMM construction. Hoisted from the listener block
 	// below; same single-registry pattern as every other daemon.
 	ops := wire.NewOpsMetrics("vmmd")
+	// Issue #667 / ADR-078: single storeStamper adapter satisfies
+	// BOTH the FrameworkReadyStamper interface (PR #470-FU-B) and
+	// the TailTerminalStamper interface (PR 3 of this issue) — the
+	// two receipt paths share one SQL-persistence seam so the
+	// framework_ready DGRAM and the type=0x04 tail_event DGRAM
+	// route to the same adapter, the same store, the same error
+	// policy. stamperFromStore returns *storeStamper precisely so
+	// the With*Stamper chain shares one receiver rather than
+	// allocating two equivalent adapters.
+	tailStamper := stamperFromStore(store, log)
 	mgr := fcvm.NewManager(
 		wire.ExecRunner{},
 		fcvm.NewJailerVMM(fcvm.JailChrootBase, 30*time.Second).WithStorage(storageBackend),
@@ -532,7 +542,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// to the local FrameworkReadyStamper interface (we
 		// don't want the Manager to depend on the full
 		// pkg/state surface).
-		WithFrameworkReadyStamper(stamperFromStore(store, log))
+		WithFrameworkReadyStamper(tailStamper).
+		// Issue #667 / ADR-078: same adapter also implements
+		// the TailTerminalStamper interface so the type=0x04
+		// tail_event DGRAM receipt path mirrors the
+		// in-memory TailCount decrement to the SQL column.
+		WithTailTerminalStamper(tailStamper)
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
 	// read Grype scan sidecars at boot time. Mirrors the VMM's

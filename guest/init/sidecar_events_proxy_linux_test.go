@@ -32,6 +32,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -168,6 +169,30 @@ func TestSidecarEventsTypeConstants(t *testing.T) {
 	if VsockSidecarEventsTypeInitExit == 0x01 || VsockSidecarEventsTypeRestart == 0x01 {
 		t.Errorf("sidecar events types collide with framework_ready type=0x01")
 	}
+	// Issue #667 / ADR-078: tail-event type=0x04 lives on
+	// the same port. Must NOT collide with 0x01/0x02/0x03.
+	if VsockTailEventType != 0x04 {
+		t.Errorf("VsockTailEventType = 0x%02x; want 0x04", VsockTailEventType)
+	}
+	if VsockTailEventType == VsockSidecarEventsTypeInitExit ||
+		VsockTailEventType == VsockSidecarEventsTypeRestart ||
+		VsockTailEventType == 0x01 {
+		t.Errorf("tail event type 0x%02x collides with existing event classes", VsockTailEventType)
+	}
+	// The closed-set outcome bytes (1=completed, 2=failed,
+	// 3=timeout) must agree with pkg/fcvm.TailOutcome* and
+	// cmd/vmmd::tailEventOutcome*. The numeric values are
+	// pinned here as the source of truth on the guest-init
+	// side.
+	if tailEventOutcomeCompleted != 0x01 {
+		t.Errorf("tailEventOutcomeCompleted = 0x%02x; want 0x01", tailEventOutcomeCompleted)
+	}
+	if tailEventOutcomeFailed != 0x02 {
+		t.Errorf("tailEventOutcomeFailed = 0x%02x; want 0x02", tailEventOutcomeFailed)
+	}
+	if tailEventOutcomeTimeout != 0x03 {
+		t.Errorf("tailEventOutcomeTimeout = 0x%02x; want 0x03", tailEventOutcomeTimeout)
+	}
 }
 
 // TestInitSidecarEmitsFailureClassUserError_Envelope pins
@@ -257,4 +282,156 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// buildTailEventWire constructs the 16-byte fixed-size wire
+// body for type=0x04 (issue #667 / ADR-078). Mirrors
+// sidecarEventsProxy.sendTail exactly so the test exercises
+// the same shape the production code emits:
+//
+//	[1B type=0x04][1B outcome][6B reserved][8B BE uint64 elapsed_ms]
+//
+// Centralised so each test reads as a small picture of the
+// wire rather than a placeholder soup.
+func buildTailEventWire(outcome byte, elapsedMs int64) []byte {
+	buf := make([]byte, tailEventMaxDatagram)
+	buf[0] = VsockTailEventType
+	buf[1] = outcome
+	// buf[2:8] reserved, already zero from make().
+	binary.BigEndian.PutUint64(buf[8:16], uint64(elapsedMs))
+	return buf
+}
+
+// parseTailEventWire is the test-local reverse of the wire
+// format — mirrors cmd/vmmd/framework_ready_recv.go's
+// parseFWReadyKindTail arm exactly. We can't import the
+// linux-only framework_ready_recv.go from a test that runs on
+// darwin (the test binary won't link), so the host parser is
+// duplicated here for the wire-shape assertion. The
+// duplication is narrow by design — the layout is 16 bytes
+// of fixed-size fields, not a JSON envelope.
+func parseTailEventWire(b []byte) (outcome byte, elapsedMs int64, err error) {
+	if len(b) < 1 {
+		return 0, 0, fmt.Errorf("empty body")
+	}
+	if b[0] != VsockTailEventType {
+		return 0, 0, fmt.Errorf("unknown msg sub-type 0x%02x", b[0])
+	}
+	if len(b) < 2 {
+		return 0, 0, fmt.Errorf("tail_event: missing outcome byte")
+	}
+	outcome = b[1]
+	if len(b) >= 16 {
+		elapsedMs = int64(binary.BigEndian.Uint64(b[8:16]))
+	}
+	return outcome, elapsedMs, nil
+}
+
+// TestTailEventWire_Shape pins the 16-byte fixed-size wire
+// format for type=0x04 (issue #667 / ADR-078). Three closed
+// outcome bytes × representative elapsed_ms values (0 for
+// instantaneous tasks; 30s for the Pro plan cap; 60s for the
+// Scale plan cap). The host's parseFWReadyKindTail arm must
+// produce the same outcome + elapsed_ms round-trip.
+func TestTailEventWire_Shape(t *testing.T) {
+	cases := []struct {
+		name      string
+		outcome   byte
+		elapsedMs int64
+	}{
+		{"completed (outcome=1, elapsed=0ms)", tailEventOutcomeCompleted, 0},
+		{"completed (outcome=1, elapsed=3500ms)", tailEventOutcomeCompleted, 3500},
+		{"failed (outcome=2, elapsed=42ms)", tailEventOutcomeFailed, 42},
+		{"timeout (outcome=3, elapsed=30000ms=Pro cap)", tailEventOutcomeTimeout, 30000},
+		{"timeout (outcome=3, elapsed=60000ms=Scale cap)", tailEventOutcomeTimeout, 60000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := buildTailEventWire(tc.outcome, tc.elapsedMs)
+			if len(wire) != tailEventMaxDatagram {
+				t.Fatalf("wire length = %d, want %d", len(wire), tailEventMaxDatagram)
+			}
+			// Type byte MUST be 0x04 — drift from this
+			// value is a wire-incompatible bug.
+			if wire[0] != 0x04 {
+				t.Errorf("wire[0] type byte = 0x%02x, want 0x04", wire[0])
+			}
+			// Outcome byte MUST match the closed-set value.
+			if wire[1] != tc.outcome {
+				t.Errorf("wire[1] outcome = 0x%02x, want 0x%02x", wire[1], tc.outcome)
+			}
+			// Round-trip through the host-side decoder.
+			gotOutcome, gotElapsed, err := parseTailEventWire(wire)
+			if err != nil {
+				t.Fatalf("host parse failed: %v", err)
+			}
+			if gotOutcome != tc.outcome {
+				t.Errorf("parsed outcome = 0x%02x, want 0x%02x", gotOutcome, tc.outcome)
+			}
+			if gotElapsed != tc.elapsedMs {
+				t.Errorf("parsed elapsed_ms = %d, want %d", gotElapsed, tc.elapsedMs)
+			}
+		})
+	}
+}
+
+// TestTailEventWire_ShortReadTolerance pins the short-read
+// behaviour (issue #667 / ADR-078). The host's parse must:
+//   - reject a body that has only the type byte (missing
+//     outcome byte)
+//   - accept a body that has type + outcome + reserved but no
+//     elapsed_ms — the elapsed_ms defaults to 0 (the host's
+//     design comment in parseFrameworkReadyDatagram's tail
+//     arm spells this out).
+//
+// These cases mirror the host's parse-side test
+// (cmd/vmmd/tail_event_recv_test.go::TestParseFrameworkReadyDatagram_TailEvent)
+// so a future drift in short-read handling surfaces as a
+// failing test on both ends.
+func TestTailEventWire_ShortReadTolerance(t *testing.T) {
+	// type-only, missing outcome byte — must error.
+	short := []byte{VsockTailEventType}
+	if _, _, err := parseTailEventWire(short); err == nil {
+		t.Errorf("parseTailEventWire(type-only) = nil err; want error")
+	}
+	// type + outcome + reserved, no elapsed_ms — must
+	// succeed with elapsed_ms = 0.
+	noElapsed := []byte{
+		VsockTailEventType, tailEventOutcomeCompleted,
+		0, 0, 0, 0, 0, 0, // 6 reserved
+	}
+	out, elapsed, err := parseTailEventWire(noElapsed)
+	if err != nil {
+		t.Fatalf("parseTailEventWire(no elapsed_ms) = %v; want nil", err)
+	}
+	if out != tailEventOutcomeCompleted {
+		t.Errorf("outcome = 0x%02x, want 0x%02x", out, tailEventOutcomeCompleted)
+	}
+	if elapsed != 0 {
+		t.Errorf("elapsed_ms = %d, want 0 (short-read default)", elapsed)
+	}
+}
+
+// TestTailEventWire_ClosedSetOutcomeBytes pins the closed-set
+// outcome values on the guest-init side. Mirrors the host's
+// test in cmd/vmmd/tail_event_recv_test.go::TestTailEventOutcome_ClosedSet.
+// Both tests must agree on the numeric values; a drift here
+// surfaces as a cross-file test failure on the next PR that
+// tries to align the wire format.
+func TestTailEventWire_ClosedSetOutcomeBytes(t *testing.T) {
+	if tailEventOutcomeCompleted == 0 ||
+		tailEventOutcomeCompleted == tailEventOutcomeFailed ||
+		tailEventOutcomeCompleted == tailEventOutcomeTimeout {
+		t.Errorf("completed byte 0x%02x collides with closed-set siblings", tailEventOutcomeCompleted)
+	}
+	if tailEventOutcomeFailed == 0 ||
+		tailEventOutcomeFailed == tailEventOutcomeCompleted ||
+		tailEventOutcomeFailed == tailEventOutcomeTimeout {
+		t.Errorf("failed byte 0x%02x collides with closed-set siblings", tailEventOutcomeFailed)
+	}
+	if tailEventOutcomeTimeout == 0 ||
+		tailEventOutcomeTimeout == tailEventOutcomeCompleted ||
+		tailEventOutcomeTimeout == tailEventOutcomeFailed {
+		t.Errorf("timeout byte 0x%02x collides with closed-set siblings", tailEventOutcomeTimeout)
+	}
 }

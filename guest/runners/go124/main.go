@@ -37,12 +37,23 @@ type envelope struct {
 	Headers map[string]string `json:"headers"`
 	Query   string            `json:"query"`
 	BodyB64 string            `json:"body_b64"`
+	// WaitUntilSec + TailPipePath are the waitUntil(post-response
+	// tail) primitive fields (issue #667 / ADR-078). Default 0/empty
+	// = no tail — backwards-compatible with pre-#667 handlers. The
+	// tail host wiring lives in PR 3; PR 2 ships the envelope shape
+	// only so the JSON-tag parity test can pin the wire spelling.
+	WaitUntilSec int    `json:"wait_until_sec"`
+	TailPipePath string `json:"tail_pipe_path,omitempty"`
 }
 
 type response struct {
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	BodyB64 string            `json:"body_b64"`
+	// TailErrors is the per-task failure list (issue #667).
+	// Debug-only — surfaced via runner stderr + schedd audit rows,
+	// never via the HTTP response body.
+	TailErrors []string `json:"tail_errors,omitempty"`
 }
 
 func main() {
