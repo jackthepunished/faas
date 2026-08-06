@@ -69,6 +69,13 @@ type SynthServer struct {
 // ReadHeaderTimeout pins the Slowloris attack surface (gosec G112).
 // The unix socket is DAC-gated (ADR-015), but we set the timeout
 // anyway — defense in depth + uniform config.
+//
+// Issue #675 / H2C: the server enables unencrypted HTTP/2 (H2C) on the
+// listener via srv.Protocols.SetUnencryptedHTTP2(true). This is the
+// Go 1.24+ replacement for the deprecated golang.org/x/net/http2/h2c
+// package — the stdlib now negotiates H2C + HTTP/1.1 on the same
+// listener with no wrapper. The customer publicHandler still speaks
+// HTTP/1.1 downstream; H2C is contained to the public→internal hop.
 func NewSynthServer(socketPath string, dispatcher SynthDispatcher, log *slog.Logger) *SynthServer {
 	if log == nil {
 		log = slog.Default()
@@ -86,6 +93,14 @@ func NewSynthServer(socketPath string, dispatcher SynthDispatcher, log *slog.Log
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// Enable H2C + HTTP/1.1 on this listener (issue #675). SetHTTP1
+	// is true by default but we set it explicitly so the intent is
+	// unambiguous for future readers. SetUnencryptedHTTP2 opts in to
+	// the in-process H2 prior-knowledge negotiation; the deprecated
+	// x/net/http2/h2c wrapper is no longer needed.
+	s.srv.Protocols = new(http.Protocols)
+	s.srv.Protocols.SetHTTP1(true)
+	s.srv.Protocols.SetUnencryptedHTTP2(true)
 	return s
 }
 

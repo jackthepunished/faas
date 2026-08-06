@@ -165,14 +165,15 @@ func newInternalProxyTransport(dialer InternalDialer) *http.Transport {
 // plaintext unix socket — the stdlib http.Transport refuses to do
 // H2 without TLS even when ForceAttemptHTTP2 is true.
 //
-// The server side of this hop (gatewayd-internal) wraps its handler
-// with h2c.NewHandler in cmd/gatewayd-internal/run.go so the
-// negotiation is symmetric. Together they carry H2 frames in both
-// directions on the same in-process socket that used to be HTTP/1.1.
+// The server side of this hop (gatewayd-internal) sets
+// srv.Protocols.SetUnencryptedHTTP2(true) in cmd/gatewayd-internal/run.go
+// so the negotiation is symmetric. Together they carry H2 frames in
+// both directions on the same in-process socket that used to be
+// HTTP/1.1.
 //
 // Streaming responses (app.StreamingEnabled=true) keep working
 // because the customer handler writes its own chunked framing
-// downstream of this hop — h2c is transparent to the streaming
+// downstream of this hop — H2C is transparent to the streaming
 // path. The handler-to-guest leg stays HTTP/1.1 plaintext per the
 // issue #675 decision to keep streaming on HTTP/1.1.
 //
@@ -188,11 +189,13 @@ func newInternalProxyH2CTransport(dialer InternalDialer) http.RoundTripper {
 		AllowHTTP: true,
 		// DialTLS is the seam the http2 library uses to acquire a
 		// net.Conn. We ignore network/addr/cfg and route everything
-		// through the unix-socket InternalDialer. The context
-		// passed here is the request context (caller's deadline);
-		// we propagate it to the dialer so cancellation works.
-		DialTLS: func(_ string, _ string, _ *tls.Config) (net.Conn, error) {
-			return dialer.DialContext(context.Background(), "")
+		// through the unix-socket InternalDialer. The context passed
+		// here is the request context (caller's deadline) — we
+		// propagate it to the dialer so cancellation works. Without
+		// this contextcheck flagged the closure (golangci-lint v2.4
+		// contextcheck rule).
+		DialTLSContext: func(ctx context.Context, _ string, _ string, _ *tls.Config) (net.Conn, error) {
+			return dialer.DialContext(ctx, "")
 		},
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,

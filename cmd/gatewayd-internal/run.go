@@ -51,8 +51,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 // scheddSocket is schedd's gRPC unix socket (ADR-018). Phase 2 /
@@ -967,10 +965,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		//
 		// Streaming responses (app.StreamingEnabled=true) still go
 		// through the existing HTTP/1.1 chunked path inside the
-		// handler — h2c.NewHandler is transparent to streaming
-		// because the handler writes chunked on its own writer.
-		h2cHandler := h2c.NewHandler(unifiedMux, &http2.Server{})
-		deps.synth.SetHandler(h2cHandler)
+		// handler — H2C is transparent to streaming because the
+		// handler writes chunked on its own writer.
+		//
+		// Go 1.24+: the SynthServer's http.Server has Protocols set
+		// to {HTTP/1.1, UnencryptedHTTP2} (see NewSynthServer), so
+		// H2C is negotiated natively on the listener. No wrapper
+		// needed — the deprecated golang.org/x/net/http2/h2c package
+		// is gone.
+		deps.synth.SetHandler(unifiedMux)
 	}
 	// addSrv is the closure for the public :8080 + control listeners
 	// below; declared above so the unified-mux block above can run

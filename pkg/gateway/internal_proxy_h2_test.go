@@ -12,17 +12,13 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 // TestInternalProxy_NegotiatesH2C pins the issue #675 contract:
 // when useH2C is true, the proxy negotiates HTTP/2 prior knowledge
-// against an h2c.NewHandler-wrapped backend. Asserts the response
-// protocol observed by the client side is HTTP/2.0 (r.Proto == "HTTP/2.0"
-// on the inbound server-side request, resp.ProtoMajor == 2 on the
-// outbound client response).
+// against an H2C-capable backend (Go 1.24+ Protocols.SetUnencryptedHTTP2).
+// Asserts the response protocol observed by the client side is HTTP/2.0
+// (r.Proto == "HTTP/2.0" on the inbound server-side request).
 func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 	var (
 		mu        sync.Mutex
@@ -40,10 +36,13 @@ func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
 	})
-	// h2c.NewHandler wraps the backend with HTTP/2 cleartext prior
-	// knowledge negotiation. Listen on a TCP loopback port so the
-	// client transport can dial it.
-	srv := &http.Server{Handler: h2c.NewHandler(backend, &http2.Server{})}
+	// Go 1.24+: enable H2C + HTTP/1.1 on the same listener via
+	// srv.Protocols. This replaces the deprecated
+	// golang.org/x/net/http2/h2c wrapper.
+	srv := &http.Server{Handler: backend}
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetUnencryptedHTTP2(true)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
