@@ -108,11 +108,27 @@ type PublicAuthConfig struct {
 
 // Canonical public-auth mode strings (issue #477). Values
 // must stay in sync with the apps_public_auth_mode_chk
-// CHECK constraint in migrations/00151_apps_public_auth.sql.
+// CHECK constraint in migrations/00153_apps_public_auth.sql.
 const (
 	publicAuthModeOpen   = "open"
 	publicAuthModeBearer = "bearer"
 	publicAuthModeBasic  = "basic"
+)
+
+// Authn-failure reason taxonomy (issue #560 + issue #477).
+// The strings land on the `reason` field of the audit row
+// emitted by enforceRequireAuthn and enforcePublicAuth,
+// and feed the dashboard handler-edge severity cap. Two
+// callers (the require_authn gate and the public_auth gate)
+// share the same set so a pivot by reason in the audit
+// log works across both gates. Extracted as constants so
+// goconst's "3+ occurrences" lint rule is satisfied AND
+// so a drift between the two call sites surfaces at
+// compile time.
+const (
+	authnReasonInvalidBearer = "invalid_bearer"
+	authnReasonExpired       = "expired"
+	authnReasonRevoked       = "revoked"
 )
 
 // AppSidecar (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
@@ -598,11 +614,11 @@ func (h *Handler) enforceRequireAuthn(w http.ResponseWriter, r *http.Request, re
 		// response stays 401 in both cases — leaking the
 		// distinction would tell an attacker whether a
 		// given key prefix exists.
-		reason := "invalid_bearer"
+		reason := authnReasonInvalidBearer
 		if errors.Is(err, ErrAPIKeyExpired) {
-			reason = "expired"
+			reason = authnReasonExpired
 		} else if errors.Is(err, ErrAPIKeyRevoked) {
-			reason = "revoked"
+			reason = authnReasonRevoked
 		}
 		h.emitAuthnAudit(r, app, nil, "instances.authn_invalid", map[string]any{
 			"app_id": app.ID,
@@ -803,11 +819,11 @@ func (h *Handler) enforcePublicAuthBearer(w http.ResponseWriter, r *http.Request
 	// never reach the store unhashed).
 	acct, key, err := h.requireAuthnAuthn.AuthenticateKey(r.Context(), api.HashAPIKey(tok))
 	if err != nil {
-		reason := "invalid_bearer"
+		reason := authnReasonInvalidBearer
 		if errors.Is(err, ErrAPIKeyExpired) {
-			reason = "expired"
+			reason = authnReasonExpired
 		} else if errors.Is(err, ErrAPIKeyRevoked) {
-			reason = "revoked"
+			reason = authnReasonRevoked
 		}
 		h.emitAuthnAudit(r, app, nil, "instances.public_auth_invalid", map[string]any{
 			"app_id": app.ID,
