@@ -117,6 +117,23 @@ func boot() error {
 		slog.Default().Warn("framework_ready proxy unavailable", "err", err)
 	}
 
+	// Issue #667 / ADR-078 (consolidated follow-up PR): the
+	// tail-events unix-socket proxy. The proxy at
+	// /run/guest-init/tail-events.sock is the runner-facing entry
+	// point for waitUntil(promise) terminal events — the runner's
+	// tail host (guest/runners/internal/tail_host.go) connects to
+	// it with one line ("<outcome_byte> <elapsed_ms>") and the
+	// proxy frames the 16-byte vsock DGRAM (port 1027, msg_type
+	// 0x04) payload and forwards to the host. The proxy must
+	// start BEFORE the supervisor starts the runners so the first
+	// tail terminal can't race the proxy coming up. Soft-fail:
+	// bind errors log at Warn and the platform contract is "no
+	// telemetry" not "won't boot" — the snapshotAndPark 5s
+	// watchdog on schedd handles a missing tail receipt.
+	if err := startTailEventsProxy(slog.Default()); err != nil {
+		slog.Default().Warn("tail_events proxy unavailable", "err", err)
+	}
+
 	// Issue #463 / ADR-069 / ADR-071 / PR-C §3,§4: the sidecar
 	// events proxy. Outbound-only vsock DGRAM on the same port
 	// (1027) as framework_ready; the leading type byte

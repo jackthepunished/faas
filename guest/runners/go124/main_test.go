@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/base64"
 	"flag"
+	"net/http"
 	"testing"
 
+	"github.com/onebox-faas/faas/guest/runners/internal"
 	"github.com/onebox-faas/faas/guest/runners/internal/runnerparity"
 )
 
@@ -14,7 +16,15 @@ import (
 // and the helper never skips this test.
 func TestHandle_RoundTrip(t *testing.T) {
 	fake := runnerparity.FakeGoScript()
-	runnerparity.RunRoundTrip(t, fake, handle)
+	// PR 3 (issue #667 follow-up): the runner's `handle` signature
+	// grew tailWaitSec + tailPipePath args. Wrap handle() with the
+	// 6-arg signature the runnerparity.RunRoundTrip helper expects
+	// — 0/empty args = feature disabled (the existing fake scripts
+	// don't write to the tail pipe, so the round-trip smoke test
+	// is unchanged).
+	runnerparity.RunRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, _ int, _ string) {
+		handle(w, r, handlerPath, signal, 0, "")
+	})
 }
 
 // TestEnvelopeRoundTrip sanity-checks the JSON tags line up with §4.9,
@@ -33,6 +43,21 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 		WaitUntilSec: 30,
 		TailPipePath: "/tmp/faas-tail-xyz.jsonl",
 	}, []byte("hi"))
+}
+
+// TestHandle_WaitUntilEnvelopeRoundTrip (issue #667 / ADR-078 PR 3) is
+// the per-runtime counterpart to the hermetic
+// TestParity_AllRuntimesHonorWaitUntil file-walk. A fake handler
+// writes a JSONL line to the tail pipe before returning; the
+// runner's drainTailHost reads the pipe after invokeHandler returns.
+// The response envelope stays intact (status=200, body unchanged).
+// The 0x04 DGRAM emit fails in unit tests (the proxy isn't running)
+// — that's expected; the runner keeps draining.
+func TestHandle_WaitUntilEnvelopeRoundTrip(t *testing.T) {
+	fake := runnerparity.FakeGoScriptWithTail()
+	runnerparity.RunWaitUntilEnvelopeRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
+		handle(w, r, handlerPath, signal, tailWaitSec, tailPipePath)
+	})
 }
 
 // TestGoRunnerHandlerDefault pins the default --handler value. The

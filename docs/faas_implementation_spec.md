@@ -232,6 +232,24 @@ tail drain, metered via the existing `mb_seconds` mechanism. The
 invariant up front: `tail_seconds` does NOT enter
 `Math.GBHours`, `Provider.PushUsageRecord`, or any billing path.
 
+**Runner-side tail host (issue #667 follow-up, ADR-078 amendment).**
+The runner process (long-lived HTTP host inside the VM, parent of
+the handler subprocess) reads the JSONL pipe at
+`envelope.TailPipePath`, spawns a `sync.WaitGroup` of per-task
+goroutines each wrapped in
+`context.WithTimeout(env.WaitUntilSec * time.Second)`, and on each
+terminal outcome (completed / failed / timeout / panicked) writes
+a line to the unix-domain proxy at
+`/run/guest-init/tail-events.sock`. The proxy frames the 16-byte
+0x04 DGRAM and ships it via vsock to `VMADDR_CID_HOST:1027`.
+The response envelope is written to stdout AFTER the tail host's
+`Drain()` returns — `signal.SignalReady(...)` fires after the tail
+drain (not on the first non-5xx response as the original ADR
+described; see ADR-078 §"Amendment — framework_ready timing").
+The 5 s `snapshotAndPark` watchdog is the hard ceiling: if the
+tail host hangs for any reason, the park gate fires
+`tail_failed{reason=forced_at_park}` and force-parks the wake.
+
 - **Schema:** `usage_minutes.tail_seconds bigint NOT NULL DEFAULT 0`
   (migration `00151_wait_until_tail.sql`). Additive merge via the
   extended `state.Store.AppendUsage` signature — the new
