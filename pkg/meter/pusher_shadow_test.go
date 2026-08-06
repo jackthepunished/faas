@@ -779,3 +779,123 @@ func TestPushHour_Shadow24h_Paddle(t *testing.T) {
 		t.Fatalf("Paddle shadow sum = %d mb_sec, want %d (exact integer)", total, wantTotal)
 	}
 }
+
+// TestPushHour_ExcludesTailSeconds (issue #667 / ADR-078) is the
+// load-bearing permanent guard: the per-instance waitUntil tail
+// counter accumulates wall-clock seconds a wake spends draining
+// `waitUntil(promise)` tasks AFTER its HTTP response has flushed.
+// ADR-078 §"Decisions" #4 pins this metric as INFORMATIONAL ONLY —
+// it MUST NOT enter Math.GBHours, Provider.PushUsageRecord, or any
+// other billing path. The customership is predictable: customers
+// pay exactly the plan RAM × resident-seconds that the synchronous
+// request envelope covered; tail drains are a free operational
+// primitive (a Cloudflare Workers / Vercel Edge / AWS Lambda
+// parity feature).
+//
+// If a future PR reverses this invariant — e.g. by adding a
+// `tailSeconds` parameter to billing.Provider.PushUsageRecord, or
+// by adding tail_seconds to Math.GBHours, or by introducing a
+// TailOverageProvider — this test fires. Removing it requires
+// removing the ADR-078 §"Tail is informational" decision (i.e.
+// a new ADR), so the only way to land an inverted-billing change
+// is to also argue the case in writing. That is the load-bearing
+// shape: the test, not the docs, is the spec.
+//
+// The assertion is two-level on purpose:
+//  1. The pusher still attempts the SDK call. A non-zero tail_seconds
+//     on the usage_minutes row must not poison the push path into
+//     skipping the (acct, hour) tuple. This pins the "informational
+//     only" wording: the column coexists with mb_seconds without
+//     affecting the skip semantics at pusher.go:150 (mbSec <= 0 skip).
+//  2. The SDK sees exactly the billable (acct, hour, mb_seconds)
+//     triple — the recorded MBSeconds equals the hand-computed
+//     plan-RAM × resident-seconds figure with zero contamination
+//     from the tail_seconds accumulator.
+//
+// Why this is a "permanent guard" rather than a one-shot regression
+// test: it lives next to TestPushHour_Shadow24h (the §14 M7
+// acceptance) and uses the same rec + pusher + synthetic dataset
+// wiring, but its assertion is forward-looking — the assertion
+// shape ("TailSeconds MUST NOT reach the SDK call") is the
+// contractual shape, not a specific number. A future refactor of
+// the pusher that surfaces tail_seconds to billing will fail this
+// test regardless of how the new billing field is named.
+func TestPushHour_ExcludesTailSeconds(t *testing.T) {
+	t.Parallel()
+	s := state.NewMemStore()
+	ctx := context.Background()
+
+	t0 := time.Date(2026, 7, 17, 13, 0, 0, 0, time.UTC)
+	now := t0
+	clock := func() time.Time { return now }
+
+	acct := makeAccount(t, ctx, s, api.PlanHobby)
+	app := newApp(t, ctx, s, acct.ID)
+	ins := makeLiveInstance(t, ctx, s, app.ID, acct.ID, 256)
+
+	// Sample one hour so usage_minutes has 60 rows for this instance.
+	// Each row carries the canonical billable (api.BillableRAMMB(256) *
+	// 60) mb_seconds AND a non-zero tail_seconds (the runner's tail
+	// host observed the instance draining waitUntil tasks in the
+	// background). The synthetic dataset deliberately saturates both
+	// axes — a 30-second tail per minute, scaled by 60 minutes, is
+	// 1,800 tail_seconds. If the pusher were to forward that figure
+	// into the SDK call it would show up in the recorded MBSeconds.
+	const nonZeroTailSecondsPerMinute int64 = 30
+	for i := 0; i < 60; i++ {
+		// Stamp the per-minute row with a non-zero tail_seconds. The
+		// sampler reads from a TailSecondsSource closure (cmd/meterd
+		// wires pkg/fcvm.Manager.ReadAndResetTailSeconds). For this
+		// unit test we go around the sampler and stamp directly:
+		// the contract we are pinning is the pusher's read path, not
+		// the sampler's write path (covered by sampler_tail_test.go).
+		if err := s.AppendUsage(ctx, acct.ID, app.ID, ins.ID,
+			now, int64(api.BillableRAMMB(256))*60, 1,
+			0, 0, 0, 0, 0, nonZeroTailSecondsPerMinute,
+		); err != nil {
+			t.Fatalf("sample %d AppendUsage: %v", i, err)
+		}
+		now = now.Add(time.Minute)
+	}
+	// Pin now = T0+1h so HourWindow = [T0, T0+1h).
+	now = t0.Add(time.Hour)
+
+	rec := &recordingStripe{}
+	pusher := meter.NewPusher(s, rec, discardLog(), clock, nil)
+	pushed, err := pusher.PushHour(ctx)
+	if err != nil {
+		t.Fatalf("PushHour: %v", err)
+	}
+	// Assertion 1: the push still happens — tail_seconds is not a
+	// skip-axis. A non-zero tail must not poison the skip path at
+	// pusher.go:150 (mbSec <= 0 skip).
+	if pushed != 1 {
+		t.Errorf("pushed = %d, want 1 (tail_seconds is informational — must not skip push)", pushed)
+	}
+
+	calls := rec.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("recorded calls = %d, want 1", len(calls))
+	}
+	// Assertion 2: the SDK saw exactly the billable figure.
+	// Plan-RAM-resident-seconds = api.BillableRAMMB(256) * 60 * 60
+	// (256 MB Hobby, 60 minutes resident). 1,800 tail_seconds is a
+	// red herring — the SDK call must NOT include it. If a future
+	// PR adds tail_seconds to the SDK call, this assertion is the
+	// load-bearing pin that fires.
+	wantMB := int64(api.BillableRAMMB(256)) * 60 * 60
+	if calls[0].MBSeconds != wantMB {
+		t.Errorf("PushUsageRecord MBSeconds = %d, want %d (tail_seconds MUST NOT contaminate the SDK call)",
+			calls[0].MBSeconds, wantMB)
+	}
+	// Assertion 3: the (acct, hour) tuple is the canonical one —
+	// not a synthesised "tail-only" call that would be a billing
+	// bypass.
+	if calls[0].AccountID != acct.ID {
+		t.Errorf("PushUsageRecord AccountID = %q, want %q", calls[0].AccountID, acct.ID)
+	}
+	if !calls[0].Hour.Equal(t0) {
+		t.Errorf("PushUsageRecord Hour = %s, want %s (HourWindow[T0+1h).start = T0)",
+			calls[0].Hour.UTC().Format(time.RFC3339), t0.UTC().Format(time.RFC3339))
+	}
+}

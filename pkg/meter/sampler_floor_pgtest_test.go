@@ -99,12 +99,12 @@ func TestPg_FloorInstanceID_PassesAppendUsage(t *testing.T) {
 
 	// First write — wins.
 	if err := s.AppendUsage(ctx, acctID, appID, floorID, minute,
-		hobbyBillablePerMinute, 1, 0, 0, 0, 0, 0); err != nil {
+		hobbyBillablePerMinute, 1, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("first AppendUsage floorID: %v (non-UUID would surface here as 22P02)", err)
 	}
 	// Redelivered minute — no-op on mb_seconds (first-wins).
 	if err := s.AppendUsage(ctx, acctID, appID, floorID, minute,
-		99_999, 99, 0, 0, 0, 0, 0); err != nil {
+		99_999, 99, 0, 0, 0, 0, 0, 0); err != nil {
 		t.Fatalf("redelivered AppendUsage floorID: %v", err)
 	}
 
@@ -147,7 +147,7 @@ func TestPg_FloorInstanceID_RejectsLiteralString(t *testing.T) {
 	minute := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 
 	err := s.AppendUsage(ctx, acctID, appID, bogusID, minute,
-		15_840, 1, 0, 0, 0, 0, 0)
+		15_840, 1, 0, 0, 0, 0, 0, 0)
 	if err == nil {
 		t.Fatalf("AppendUsage(%q) succeeded; want 22P02 invalid_text_representation", bogusID)
 	}

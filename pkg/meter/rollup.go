@@ -30,6 +30,13 @@
 // populated by this rollup. builder_seconds are written to a
 // separate grain (`builder_usage`, migration 00068) and rolled up
 // in a follow-up PR; the column stays at 0 today.
+//
+// NOTE — `usage_daily.tail_seconds` (issue #667, ADR-078) IS
+// populated by this rollup. It's the per-day SUM of
+// `usage_minutes.tail_seconds` — also INFORMATIONAL ONLY. The same
+// "no Provider push" rule that pins tail_seconds below the billing
+// boundary (see pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
+// applies at the daily grain too.
 package meter
 
 import (
@@ -61,7 +68,7 @@ INSERT INTO public.usage_daily (
     account_id, app_id, day,
     mb_seconds, requests, cpu_usec, tx_bytes,
     net_tx_bytes, net_rx_bytes, cold_boots, builder_seconds,
-    rolled_up_at
+    tail_seconds, rolled_up_at
 )
 SELECT
     account_id, app_id,
@@ -69,6 +76,7 @@ SELECT
     SUM(mb_seconds), SUM(requests), SUM(cpu_usec), SUM(tx_bytes),
     SUM(net_tx_bytes), SUM(net_rx_bytes), SUM(cold_boot_count),
     SUM(CASE WHEN builder_kind <> 'none' THEN builder_seconds ELSE 0 END),
+    SUM(tail_seconds),
     now()
 FROM public.usage_minutes
 WHERE minute >= $1 AND minute < $2
@@ -82,6 +90,7 @@ ON CONFLICT (account_id, app_id, day) DO UPDATE SET
     net_rx_bytes    = EXCLUDED.net_rx_bytes,
     cold_boots      = EXCLUDED.cold_boots,
     builder_seconds = EXCLUDED.builder_seconds,
+    tail_seconds    = EXCLUDED.tail_seconds,
     rolled_up_at    = EXCLUDED.rolled_up_at
 `
 

@@ -24,13 +24,20 @@ type Querier interface {
 	// (M7 hardening, PR feat/m7-beta-hardening): a redelivered
 	// minute is a no-op for the billing-floor columns so a meterd
 	// restart / network blip / two meterd instances cannot inflate
-	// billing. cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on
-	// the same conflict key — the schedd / meterd accumulators can
-	// each call AppendUsage many times within the same minute; the
-	// columns are the sum of all per-tick deltas.
-	//   cpu_usec     — issue #279 / PR-B / ADR-039
-	//   tx_bytes     — ADR-046 (gateway HTTP response body bytes)
-	//   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
+	// billing. cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes,
+	// cold_boot_count, and tail_seconds are ADDITIVE on the same
+	// conflict key — the schedd / meterd accumulators can each call
+	// AppendUsage many times within the same minute; the columns are
+	// the sum of all per-tick deltas.
+	//   cpu_usec         — issue #279 / PR-B / ADR-039
+	//   tx_bytes         — ADR-046 (gateway HTTP response body bytes)
+	//   net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
+	//   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
+	//   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
+	//   tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock seconds
+	//                      draining waitUntil tasks; INFORMATIONAL ONLY —
+	//                      pinned by
+	//                      pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
 	AppendUsage(ctx context.Context, db DBTX, arg AppendUsageParams) error
 	BuildByDeployment(ctx context.Context, db DBTX, deploymentID pgtype.UUID) (Build, error)
 	BuildByID(ctx context.Context, db DBTX, id pgtype.UUID) (Build, error)

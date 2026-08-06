@@ -101,6 +101,7 @@ func TestInvoiceShadow24h_Sandbox(t *testing.T) {
 			0,
 			0,
 			0,
+			0, // tail_seconds (issue #667 / ADR-078; informational only)
 		); err != nil {
 			t.Fatalf("AppendUsage minute %d: %v", i, err)
 		}

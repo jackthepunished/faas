@@ -52,15 +52,24 @@ wake, on the first non-5xx response, and is not retriggered by the tail.
 
 ### Wire (runner → guest-init, vsock DGRAM port 1027 lead byte `0x04`)
 
+Fixed-size 16-byte envelope:
+
 | Byte offset | Field | Notes |
 |---|---|---|
 | 0 | 0x04 | type discriminator (joins 0x01 framework_ready, 0x02 sidecar_init_exit, 0x03 sidecar_restart) |
 | 1 | uint8 outcome | `1=completed`, `2=failed`, `3=timeout` |
-| 2..13 | instance_id[12] | first 12 bytes of the instance UUID |
-| 14..21 | elapsed_ms uint64 BE | wall-clock from registration to terminal |
+| 2..7 | reserved | 6 bytes zero-padded; gives a wire-incompatible-free upgrade path (a future ADR can repurpose the reserved bytes for an additional discriminator, sequence id, or compressed instance hash without breaking existing runners) |
+| 8..15 | elapsed_ms uint64 BE | wall-clock from waitUntil registration to terminal (the runner's per-task timer) |
+
+The instance identity is resolved from the DGRAM peer CID (vsock context id) on the guest-init receiver, not from the wire. Each wake has its own vsock context with a stable CID for its lifetime; reusing it as the instance handle keeps the envelope a flat 16 bytes and avoids dragging a 16-byte UUID across the wire on every terminal.
 
 guest-init's `framework_ready_proxy_linux.go` multiplexer gains a new
-`0x04` branch that calls `handleTailEvent(outcome, instanceID, elapsedMS)`.
+`0x04` branch that calls `handleTailEvent(outcome, elapsedMS)`. The
+instance is resolved from the peer CID inside `handleTailEvent` (see
+the "Wire" preamble above for why), so it does NOT appear in the
+helper signature — a reviewer diffing this file should NOT re-add
+it: the wire is 16 bytes by design and the resolver lives in
+guest-init's per-context table.
 vmmd's `SendStatelessAdvisory` path stamps the metric
 `schedd_tail_count` and bumps the per-instance `instances.tail_count`
 column via `state.Store.DecrementInstanceTailCount` /
@@ -92,9 +101,9 @@ fires, the engine force-parks with a `wake.tail_drained_at_park` audit row
 and emits `wake.tail_failed{reason=forced_at_park}` for any unfinished
 tails.
 
-### Migration (slot 00149)
+### Migration (slot 00151 — slot walked past 00149 / 00150 reservations)
 
-`migrations/00149_wait_until_tail.sql` adds two replay-safe columns:
+`migrations/00151_wait_until_tail.sql` adds two replay-safe columns:
 
 - `instances.tail_count integer NOT NULL DEFAULT 0` — the in-flight tail
   task counter, bumped by the runner on every `waitUntil` registration,
@@ -104,7 +113,7 @@ tails.
   minute. Additive merge via `AppendUsage` (mirrors
   `cpu_usec` / `tx_bytes` shape from migrations 00055 / 00067).
 
-Companion test `00149_wait_until_tail_test.go` pins replay safety +
+Companion test `00151_wait_until_tail_test.go` pins replay safety +
 column types + the non-negative floor on `DecrementInstanceTailCount`.
 
 ### Limits (`pkg/api/limits.go`)
@@ -164,19 +173,25 @@ watchdog).
 **New:**
 
 - `docs/adr/078-wait-until-post-response-tail.md` — this ADR
-- `migrations/00149_wait_until_tail.sql` + `_test.go` — the schema migration
+- `migrations/00151_wait_until_tail.sql` + `_test.go` — the schema migration
   + companion replay-safety test
 - `guest/runners/internal/runnerparity/tail_test.go` — `waitUntil`
   semantics parity test (table-driven over all 5 runners)
-- `guest/init/tail_events_proxy_linux.go` + `tail_events_proxy_linux_test.go`
-  — the 0x04 DGRAM dispatch helper
 - `pkg/fcvm/tail_metal_test.go` — end-to-end metal acceptance
   (`//go:build metal`)
 
 **Modify:**
 
 - `guest/init/framework_ready_proxy_linux.go` — new `0x04` dispatch branch
-- `guest/init/sidecar_events_proxy_linux.go` — document `0x04` in type list
+  in the multiplexer (calls `handleTailEvent(outcome, elapsedMS)` with
+  instance resolved from peer CID — see "Wire" above)
+- `guest/init/sidecar_events_proxy_linux.go` — extends the existing
+  sidecar-events helper signatures to take the new `tail_event` lead
+  byte (`0x04`); the impl went here, NOT into a separate
+  `tail_events_proxy_linux.go` (deliberate — keeps the lead-byte
+  discriminator table co-located with the existing 0x01/0x02/0x03
+  branches; a reviewer diffing this file should NOT split it into a
+  fourth file).
 - `guest/runners/{node22,node24,python312,python313,go124}/main.go` —
   envelope + response struct extension + in-process tail host + per-runtime
   `__faas_tail.{js,py}` shim for the handler subprocess
@@ -248,7 +263,7 @@ make test PKG=./pkg/meter/...
 make test PKG=./pkg/state/...
 make test PKG=./pkg/api/...      # pins the new TailTimeoutS / TailCapMax / ConcurrentTailsPerInstance matrix
 make test PKG=./pkg/wire/...     # pins the metric cardinality bounds
-make test PKG=./migrations/...   # 00149_wait_until_tail_test.go
+make test PKG=./migrations/...   # 00151_wait_until_tail_test.go
 make lint
 ```
 

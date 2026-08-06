@@ -2897,6 +2897,85 @@ func (e *Engine) vmstateStorageKeyFor(nodeID, depID string) string {
 // walks RUNNING → SNAPSHOTTING → PARKED, writing the snapshot blob via vmmd and
 // emitting snapshot_written for imaged to record the row.
 func (e *Engine) snapshotAndPark(ctx context.Context, ins state.Instance) error {
+	// Issue #667 / ADR-078 — waitUntil drain watchdog. If the instance
+	// has active waitUntil tasks (ins.TailCount > 0), the runner is
+	// still draining them in-process after the response was flushed.
+	// The reaper gate (pkg/sched/reaper.go) keeps the reaper from
+	// picking this instance up while TailCount > 0, but a hard park
+	// caller (eviction, manual park, ParkNow) can still land here.
+	// We give the runner ParkTailDrainTimeoutSeconds (5 s — equal to
+	// the Free plan's TailTimeoutS floor so the watchdog is always
+	// shorter than the longest per-plan timeout) to drain the tail
+	// before the watchdog force-parks. On the watchdog path we emit
+	// `wake.tail_failed{reason=forced_at_park}` per unfinished tail
+	// and an audit row keyed by "tail_count_force_park" so an
+	// operator can spot a host-side drain stall.
+	//
+	// We poll the SQL tail_count via the store interface rather than
+	// a channel because vmmd is the canonical owner of the per-task
+	// 0x04 DGRAM fan-in and the SQL tail_count is the cross-host
+	// truth. Polling at 200 ms keeps the read load on PG bounded
+	// even at fleet scale (60 nodes × 16 instances × 5 Hz = 4 800
+	// SELECT/s of TAIL_COUNT — negligible next to the meterd cron).
+	var watchdogCancelled bool
+	if ins.TailCount > 0 {
+		deadline := time.Now().Add(time.Duration(api.ParkTailDrainTimeoutSeconds) * time.Second)
+		for {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if time.Now().After(deadline) {
+				// Watchdog fired. Log the stall so an operator can
+				// correlate with the runner's tail-host log lines.
+				e.log.Warn("snapshotAndPark: tail drain watchdog fired",
+					"instance", ins.ID,
+					"ins_tail_count", ins.TailCount,
+					"watchdog_seconds", api.ParkTailDrainTimeoutSeconds)
+				// Emit one forced-at-park audit row per unfinished tail
+				// (best-effort: bails out on context cancel). The event
+				// warehouse dedupes on (instance_id, wake_id, kind) so a
+				// late DGRAM that lands after the row is harmless.
+				n := int64(ins.TailCount)
+				for i := int64(0); i < n; i++ {
+					if e.events != nil {
+						e.events.Emit(ctx, events.TailFailed{
+							EmitAt:     time.Now().UTC(),
+							AppID:      ins.AppID,
+							InstanceID: ins.ID,
+							Reason:     "forced_at_park",
+						})
+					}
+				}
+				// Floor tail_count at 0 before transitioning so the
+				// wake.row + the next meterd tick are consistent.
+				_ = e.store.DecrementInstanceTailCount(ctx, ins.ID, int32(n))
+				break
+			}
+			// Read the fresh tail_count from the store. The pgstore
+			// implementation is a single SELECT … FROM instances
+			// WHERE id = $1 — no row lock, no contention with the
+			// vmmd BumpInstanceTailCount path.
+			cur, err := e.store.GetInstanceTailCount(ctx, ins.ID)
+			if err != nil {
+				// Best-effort: a transient store error means we
+				// cannot make the "drained" decision, so we let
+				// the watchdog decide on the next loop.
+				e.log.Warn("snapshotAndPark: tail count read",
+					"instance", ins.ID, "err", err)
+			} else if cur == 0 {
+				watchdogCancelled = true
+				break
+			}
+			// Sleep 200 ms. Select on the context as well so a
+			// caller-cancel propagates promptly.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
+	_ = watchdogCancelled // reserved for future metric instrumentation
 	// vmstate is a small JSON the FC socket writes to during pause; we
 	// give it a host path under the snap dir (the local driver maps the
 	// storage_key back to this exact location on the next restore, so

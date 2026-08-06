@@ -8,6 +8,7 @@ package wire_test
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -972,5 +973,129 @@ func TestOpsMetrics_WakeSnapshotTierNilSafe(t *testing.T) {
 	var m *wire.OpsMetrics
 	if got := m.WakeSnapshotTier("warm"); got != nil {
 		t.Errorf("nil.WakeSnapshotTier = %v, want nil", got)
+	}
+}
+
+// TestOpsMetrics_GuestTailSeconds_PreInstantiated (issue #667 /
+// ADR-078) pins the closed-set (plan × runtime × outcome)
+// Cartesian pre-instantiated at boot. The 60-series budget is
+// the load-bearing cardinality promise for §12's tail-latency
+// panel: every (plan, runtime, outcome) combination must
+// appear in the registry after NewOpsMetrics() even if no tail
+// has fired yet. If a future PR drops a runtime / outcome
+// literal, the corresponding rows stop appearing and this test
+// fires.
+func TestOpsMetrics_GuestTailSeconds_PreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	runtimes := []string{"node22", "node24", "python312", "python313", "go124"}
+	outcomes := []string{"completed", "failed", "timeout"}
+	plans := []string{"free", "hobby", "pro", "scale"}
+
+	// Observe a single sample on every (plan, runtime, outcome) so
+	// the render() helper picks up the 60 series. The values are
+	// arbitrary — the test is about presence, not magnitude.
+	for _, plan := range plans {
+		for _, runtime := range runtimes {
+			for _, outcome := range outcomes {
+				m.GuestTailSeconds(plan, runtime, outcome).Observe(0.42)
+			}
+		}
+	}
+
+	body := render(t, m)
+	seen := 0
+	for _, plan := range plans {
+		for _, runtime := range runtimes {
+			for _, outcome := range outcomes {
+				// Prometheus emits label pairs in alphabetical order,
+				// so the on-the-wire tuple is {outcome, plan, runtime,
+				// le="..."} — pin a representative bucket.
+				want := fmt.Sprintf(
+					`vmmd_guest_tail_seconds_bucket{outcome=%q,plan=%q,runtime=%q,le="0.05"}`,
+					outcome, plan, runtime,
+				)
+				if strings.Contains(body, want) {
+					seen++
+				}
+			}
+		}
+	}
+	if seen != 60 {
+		t.Errorf("GuestTailSeconds Cartesian saw %d series, want 60 (4 plans × 5 runtimes × 3 outcomes)", seen)
+	}
+}
+
+// TestOpsMetrics_GuestTailFailedTotal_PreInstantiated (issue #667
+// / ADR-078) pins the closed-set (plan × reason) Cartesian.
+// 4 plans × 4 reasons = 16 series. The same cardinality
+// invariant as the histogram test — if a reason literal is
+// dropped, the panel loses its rows.
+func TestOpsMetrics_GuestTailFailedTotal_PreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	reasons := []string{"timeout", "handler_error", "forced_at_park", "unknown"}
+	plans := []string{"free", "hobby", "pro", "scale"}
+
+	for _, plan := range plans {
+		for _, reason := range reasons {
+			m.GuestTailFailedTotal(plan, reason).Inc()
+		}
+	}
+
+	body := render(t, m)
+	seen := 0
+	for _, plan := range plans {
+		for _, reason := range reasons {
+			want := fmt.Sprintf(
+				`vmmd_guest_tail_failed_total{plan=%q,reason=%q} 1`,
+				plan, reason,
+			)
+			if strings.Contains(body, want) {
+				seen++
+			}
+		}
+	}
+	if seen != 16 {
+		t.Errorf("GuestTailFailedTotal Cartesian saw %d series, want 16 (4 plans × 4 reasons)", seen)
+	}
+}
+
+// TestOpsMetrics_TailCapReached_PreInstantiated (issue #667 /
+// ADR-078) pins the per-plan cap-pressure counter. 4 series
+// total — the cap-pressure panel needs every plan visible at
+// boot to distinguish "no cap pressure" (zero rows) from "no
+// data" (missing rows).
+func TestOpsMetrics_TailCapReached_PreInstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("vmmd")
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		m.TailCapReached(plan).Inc()
+	}
+
+	body := render(t, m)
+	seen := 0
+	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
+		want := fmt.Sprintf(`vmmd_tail_cap_reached_total{plan=%q} 1`, plan)
+		if strings.Contains(body, want) {
+			seen++
+		}
+	}
+	if seen != 4 {
+		t.Errorf("TailCapReached saw %d series, want 4 (one per plan)", seen)
+	}
+}
+
+// TestOpsMetrics_GuestTail_NilSafe (issue #667 / ADR-078) —
+// mirrors the WakeSnapshotTier nil-safe pin. Every new tail
+// accessor must be nil-safe on receiver; otherwise unit tests
+// without metrics stop building.
+func TestOpsMetrics_GuestTail_NilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	if got := m.GuestTailSeconds("pro", "node22", "completed"); got != nil {
+		t.Errorf("nil.GuestTailSeconds = %v, want nil", got)
+	}
+	if got := m.GuestTailFailedTotal("pro", "timeout"); got != nil {
+		t.Errorf("nil.GuestTailFailedTotal = %v, want nil", got)
+	}
+	if got := m.TailCapReached("pro"); got != nil {
+		t.Errorf("nil.TailCapReached = %v, want nil", got)
 	}
 }

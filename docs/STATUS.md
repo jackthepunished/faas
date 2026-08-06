@@ -241,7 +241,66 @@ three flows: signed `transaction.paid` on past_due → active within
 5 s; signed `transaction.payment_failed` on active → past_due
 within 5 s; bad HMAC → 400 with `validation_failed` problem.
 
-## M7.5 — extracted Next.js dashboard + githubd. ✅
+## M7.5 — waitUntil post-response tail primitive (issue #667). ✅
+
+`ctx.waitUntil(promise)` lands as a first-class guest-init
+primitive, gated on ADR-078. PRs 1+2+3 of the issue ship as
+PR #671 (commit `add1105f`); PRs 4+5+6 ship as one consolidated
+PR covering the wire-up: schedd reaper gate, `AppendUsage
+tailSeconds`, meter sampler/rollup, the three new `pkg/wire`
+metrics, the permanent `TestPushHour_ExcludesTailSeconds` guard
+test, the docs fixes below, and the metal acceptance test.
+
+- **Wire:** 16-byte DGRAM on vsock port 1027 lead byte `0x04`
+  (`[type][outcome][reserved 6B][elapsed_ms BE uint64]`); instance
+  resolved from peer CID — the runner↔guest-init seam is the
+  in-process WaitGroup + per-task `context.WithTimeout` draining a
+  `tail_pipe_path` JSONL file the handler subprocess appends to.
+  Reuses the existing 0x01/0x02/0x03 discriminator + port 1026
+  host receiver. No new port, no new CID, no new gRPC RPC.
+- **Reaper/park gates:** `ReapIdle` and `ReapAggressive` skip
+  instances with `tail_count > 0` (mirrors the G7 OpenConns gate);
+  `snapshotAndPark` installs a 5 s watchdog
+  (`ParkTailDrainTimeoutSeconds = 5`) before snapshotting, and
+  force-parks with a `wake.tail_failed{reason=forced_at_park}` audit
+  row on watchdog fire.
+- **Migration 00151:** `instances.tail_count integer NOT NULL
+  DEFAULT 0` + `usage_minutes.tail_seconds bigint NOT NULL
+  DEFAULT 0`. Replay-safe. Companion test
+  `00151_wait_until_tail_test.go` pins the column types + the
+  non-negative floor on `DecrementInstanceTailCount`.
+- **Limits matrix (already in main from PR #671):**
+  Free 5 / 16 / 4, Hobby 15 / 16 / 16, Pro 30 / 16 / 64,
+  Scale 60 / 16 / 256 (TailTimeoutS / TailCapMax /
+  ConcurrentTailsPerInstance). `TailCapMax = 16` is structural
+  (the issue's hard ceiling); the per-plan
+  `ConcurrentTailsPerInstance` controls how aggressive the cap is
+  across concurrent requests.
+- **Metrics (issue #667 / ADR-078):**
+  `vmmd_guest_tail_seconds{plan, runtime, outcome}` (60 series),
+  `vmmd_guest_tail_failed_total{plan, reason}` (16 series),
+  `vmmd_tail_cap_reached_total{plan}` (4 series). All closed-set
+  labels pre-instantiated at boot — the §12 tail-watchdog panel
+  has zero rows from idle fleet and non-zero as soon as the first
+  tail fires. Cardinality pinned by
+  `pkg/wire/metrics_test.go::TestOpsMetrics_GuestTailSeconds_PreInstantiated`
+  + siblings.
+- **Informational only — load-bearing invariant:** `tail_seconds`
+  MUST NOT enter `Math.GBHours`, `Provider.PushUsageRecord`, or
+  any billing path. The permanent guard test
+  `pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds`
+  pins this — removing it requires removing ADR-078 §"Tail is
+  informational" (a new ADR). The financial model and the
+  customer-facing bill shape are unchanged.
+- **Acceptance gate:** `pkg/fcvm/tail_metal_test.go` (//go:build
+  metal) exercises the full path — handler returns, runner drains
+  the tail, schedd park path observes the post-drain `tail_count
+  == 0`, snapshot taken. Run with `make metal-lima RUN_ARGS='-run
+  TestMetal_TailEndToEnd'`. `TestPushHour_ExcludesTailSeconds` and
+  the cardinality tests run on every `go test` invocation and are
+  the load-bearing pre-metal pre-merge checks.
+
+## M7.6 — extracted Next.js dashboard + githubd. ✅
 
 The frontend was extracted to the dedicated `faas-frontend`
 repository by PR #160 (commit `42814d6` deleted `website/`). The

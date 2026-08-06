@@ -112,6 +112,51 @@ type OpsMetrics struct {
 	// Pre-instantiated at boot so the wake-tier-mix panel has zero
 	// rows from idle fleet, non-zero as soon as production wakes happen.
 	wakeSnapshotTier *prometheus.CounterVec
+	// guestTailSeconds (issue #667 / ADR-078) — histogram of the
+	// per-tail-task wall-clock duration from registration (a
+	// waitUntil(promise) call inside the handler) to terminal
+	// (completed / failed / timeout). Labels {plan, runtime,
+	// outcome}:
+	//   plan     ∈ api.Plans (Free/Hobby/Pro/Scale) — see limits.go
+	//   runtime  ∈ {node22, node24, python312, python313, go124}
+	//             (the 5 runtime images, hard-coded; references
+	//             ADR-052 — closed set, never adds a sixth runtime
+	//             without bumping this list)
+	//   outcome  ∈ {completed, failed, timeout}
+	//             (the 3 closed-set bytes a runner emits in the 0x04
+	//             DGRAM envelope; "failed" includes handler_error
+	//             AND forced_at_park — the per-plan breakdown is on
+	//             guestTailFailedTotal below)
+	// 4 plans × 5 runtimes × 3 outcomes = 60 series. Buckets
+	// {0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 180, 600}: the 60s
+	// bucket matches the Scale plan's TailTimeoutS ceiling; the 180s
+	// bucket catches a runaway tail (3× the longest plan ceiling) so
+	// an operator can spot a runner that's reverted to the pre-#667
+	// behaviour; the 600s bucket matches buildDur's ceiling — a
+	// tail that survives 10 minutes is a wire-incompatible bug
+	// worth observing, not silently dropping into +Inf. Pre-
+	// instantiated at boot so the §12 tail-watchdog panel has a
+	// non-zero series from idle fleet.
+	guestTailSeconds *prometheus.HistogramVec
+	// guestTailFailedTotal (issue #667 / ADR-078) — counter for
+	// per-tail-task failures. Distinct from guestTailSeconds'
+	// outcome=failed label because the runner emits a single failed
+	// byte regardless of the underlying cause, and the operator
+	// wants to know WHY the task failed. Labels {plan, reason}:
+	//   plan    ∈ api.Plans
+	//   reason  ∈ {timeout, handler_error, forced_at_park, unknown}
+	//            (closed set; "unknown" captures the catch-all where
+	//            the runner emitted a non-closed outcome byte — a
+	//            wire-incompatible bug worth surfacing)
+	// 4 plans × 4 reasons = 16 series. Pre-instantiated at boot.
+	guestTailFailedTotal *prometheus.CounterVec
+	// tailCapReached (issue #667 / ADR-078) — counter the runner
+	// increments when a customer tries to register the
+	// (ConcurrentTailsPerInstance + 1)-th tail. Labels {plan} only
+	// because the per-instance cap is the plan-matrix axis, not the
+	// per-request TailCapMax (which is structural = 16). 4 series.
+	// Pre-instantiated at boot.
+	tailCapReached *prometheus.CounterVec
 	// evictedPriority (issue #475) — closed-set counter for the
 	// per-app eviction tier the reaper parked. Labels:
 	//   priority ∈ {best_effort, reserved}
@@ -857,6 +902,27 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	wakeSnapshotTier.WithLabelValues("warm")
 	wakeSnapshotTier.WithLabelValues("init")
 	wakeSnapshotTier.WithLabelValues("cold_boot_fallback")
+	// Issue #667 / ADR-078: waitUntil tail histograms + counters.
+	// Pre-instantiated at boot so the §12 tail-watchdog panel has
+	// zero rows from idle fleet and non-zero as soon as production
+	// tails fire. The hostname / runtime / outcome label sets are
+	// closed (sourced from api.Plans + ADR-052 + the 0x04 envelope).
+	// Buckets rationale is in the OpsMetrics field doc comment.
+	guestTailSeconds := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_guest_tail_seconds",
+		Help: "Wall-clock seconds a waitUntil(promise) task ran from registration to terminal (issue #667 / ADR-078). Labelled by {plan, runtime, outcome} — plan ∈ api.Plans, runtime ∈ {node22, node24, python312, python313, go124}, outcome ∈ {completed, failed, timeout}. 60 series total. Buckets sized for the Free→Scale TailTimeoutS matrix (5…60s) plus a 180s bucket for a runaway tail and a 600s bucket matching buildDur's ceiling.",
+		Buckets: []float64{
+			0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 180, 600,
+		},
+	}, []string{"plan", "runtime", "outcome"})
+	guestTailFailedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_guest_tail_failed_total",
+		Help: "Count of waitUntil(promise) tasks that reached a non-clean terminal (issue #667 / ADR-078). Labelled by {plan, reason} — plan ∈ api.Plans, reason ∈ {timeout, handler_error, forced_at_park, unknown}. 16 series total.",
+	}, []string{"plan", "reason"})
+	tailCapReached := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_tail_cap_reached_total",
+		Help: "Count of times a customer tried to register the (ConcurrentTailsPerInstance + 1)-th in-flight waitUntil task (issue #667 / ADR-078). Labelled by {plan} only — the per-instance cap is the plan-matrix axis. 4 series total.",
+	}, []string{"plan"})
 	// Issue #475: per-tier eviction counter. Pre-instantiate the
 	// closed set of {priority, reason} tuples so the §12
 	// eviction-by-tier panel has zero rows from idle fleet and
@@ -1428,7 +1494,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, guestInitDuration, wakeSnapshotTier, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -1702,6 +1768,31 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			wakePhaseDur.WithLabelValues(phase, result)
 		}
 	}
+	// Issue #667 / ADR-078: pre-instantiate the (plan × runtime ×
+	// outcome) cartesian for guestTailSeconds, the (plan × reason)
+	// cartesian for guestTailFailedTotal, and the plan set for
+	// tailCapReached. All three are closed sets; runtime is the
+	// ADR-052 hard-coded list of 5 images (bumping this list is
+	// the load-bearing step when a new runtime is added). An idle
+	// box with no waitUntil traffic would otherwise render the
+	// §12 tail-watchdog panels as "no data" until the first tail
+	// fires. 60 + 16 + 4 = 80 series; the cardinality test pins
+	// the bound.
+	for _, plan := range api.Plans {
+		for _, runtime := range []string{
+			"node22", "node24", "python312", "python313", "go124",
+		} {
+			for _, outcome := range []string{"completed", "failed", "timeout"} {
+				guestTailSeconds.WithLabelValues(string(plan), runtime, outcome)
+			}
+		}
+		for _, reason := range []string{
+			"timeout", "handler_error", "forced_at_park", "unknown",
+		} {
+			guestTailFailedTotal.WithLabelValues(string(plan), reason)
+		}
+		tailCapReached.WithLabelValues(string(plan))
+	}
 	// Pre-instantiate every label in the closed result set so the
 	// histogram's HELP/TYPE and zero-valued buckets surface in
 	// `/metrics` from the moment the daemon boots — even before the
@@ -1861,6 +1952,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		warmSnapshotErrors:                 warmSnapshotErrors,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
+		guestTailSeconds:                   guestTailSeconds,
+		guestTailFailedTotal:               guestTailFailedTotal,
+		tailCapReached:                     tailCapReached,
 		evictedPriority:                    evictedPriority,
 		eventsWriteFail:                    eventsWriteFail,
 		auditWriteFail:                     auditWriteFail,
@@ -2004,6 +2098,57 @@ func (m *OpsMetrics) EvictedPriority(priority, reason string) prometheus.Counter
 		return nil
 	}
 	return m.evictedPriority.WithLabelValues(priority, reason)
+}
+
+// GuestTailSeconds returns the per-(plan, runtime, outcome)
+// histogram the runner's tail host observes once per terminal
+// tail event (issue #667 / ADR-078). plan ∈ api.Plans (4),
+// runtime ∈ {node22, node24, python312, python313, go124} (5;
+// hard-coded per ADR-052), outcome ∈ {completed, failed,
+// timeout} (3). All three axes are closed sets; the Cartesian
+// is pre-instantiated at boot so the registry never sees an
+// unknown label and the §12 tail-latency panel has zero rows
+// from idle fleet and non-zero rows as soon as a tail drains.
+// The returned Observer is safe to retain; nil-safe on receiver
+// so a unit test without metrics keeps building.
+func (m *OpsMetrics) GuestTailSeconds(plan, runtime, outcome string) prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.guestTailSeconds.WithLabelValues(plan, runtime, outcome)
+}
+
+// GuestTailFailedTotal returns the per-(plan, reason) counter
+// the runner's tail host (and the schedd watchdog at park)
+// increments once per failed tail event (issue #667 /
+// ADR-078). plan ∈ api.Plans (4), reason ∈ {timeout,
+// handler_error, forced_at_park, unknown} (4; hard-coded).
+// The closed (plan × reason) set is pre-instantiated at boot
+// so the §12 tail-failure panel has zero rows from idle fleet
+// and non-zero rows as soon as any tail fails. The returned
+// Counter is safe to retain; nil-safe on receiver so a unit
+// test without metrics keeps building.
+func (m *OpsMetrics) GuestTailFailedTotal(plan, reason string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.guestTailFailedTotal.WithLabelValues(plan, reason)
+}
+
+// TailCapReached returns the per-(plan) counter the runner
+// increments when a customer tries to register the
+// (ConcurrentTailsPerInstance + 1)-th tail (issue #667 /
+// ADR-078). plan ∈ api.Plans (4; pre-instantiated). The §12
+// cap-pressure panel keys off this series — non-zero values
+// mean the customer is bumping into the per-instance cap and
+// should consider raising the plan. The returned Counter is
+// safe to retain; nil-safe on receiver so a unit test without
+// metrics keeps building.
+func (m *OpsMetrics) TailCapReached(plan string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.tailCapReached.WithLabelValues(plan)
 }
 
 // RebalanceDecisions returns the per-(outcome) counter the Tier

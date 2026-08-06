@@ -249,19 +249,28 @@ limit $3;
 -- (M7 hardening, PR feat/m7-beta-hardening): a redelivered
 -- minute is a no-op for the billing-floor columns so a meterd
 -- restart / network blip / two meterd instances cannot inflate
--- billing. cpu_usec, tx_bytes, and net_tx_bytes are ADDITIVE on
--- the same conflict key — the schedd / meterd accumulators can
--- each call AppendUsage many times within the same minute; the
--- columns are the sum of all per-tick deltas.
---   cpu_usec     — issue #279 / PR-B / ADR-039
---   tx_bytes     — ADR-046 (gateway HTTP response body bytes)
---   net_tx_bytes — ADR-046 (root-side vethHost.rx_bytes delta)
-insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes)
-values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+-- billing. cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes,
+-- cold_boot_count, and tail_seconds are ADDITIVE on the same
+-- conflict key — the schedd / meterd accumulators can each call
+-- AppendUsage many times within the same minute; the columns are
+-- the sum of all per-tick deltas.
+--   cpu_usec         — issue #279 / PR-B / ADR-039
+--   tx_bytes         — ADR-046 (gateway HTTP response body bytes)
+--   net_tx_bytes     — ADR-046 (root-side vethHost.rx_bytes delta)
+--   net_rx_bytes     — ADR-048 (root-side vethHost.tx_bytes delta; ingress)
+--   cold_boot_count  — ADR-048 (WAKE_RESTORE→WAKE_COLD_BOOT transitions)
+--   tail_seconds     — issue #667 / ADR-078 (per-minute wall-clock seconds
+--                      draining waitUntil tasks; INFORMATIONAL ONLY — pinned
+--                      by pkg/meter/pusher_shadow_test.go::TestPushHour_ExcludesTailSeconds)
+insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
+values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 on conflict (instance_id, minute) do update
-   set cpu_usec     = usage_minutes.cpu_usec     + EXCLUDED.cpu_usec,
-       tx_bytes     = usage_minutes.tx_bytes     + EXCLUDED.tx_bytes,
-       net_tx_bytes = usage_minutes.net_tx_bytes + EXCLUDED.net_tx_bytes;
+   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
+       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
+       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
+       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
+       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count,
+       tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds;
 
 -- name: UsageByMonth :many
 select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes
