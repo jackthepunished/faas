@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -521,6 +522,162 @@ func TestDashboardAccountView_NegativeCountClampedToZero(t *testing.T) {
 	v := dashboardAccountView(state.Account{ID: "a1", Email: "x@example.com", Plan: "pro"}, -5)
 	if v.AppCount != 0 {
 		t.Errorf("AppCount = %d, want 0 (negative clamped)", v.AppCount)
+	}
+}
+
+// TestDashboardScanPayload_TopNCap pins the AC #3 dashboard cap
+// (issue #464 / extension). The full list flows in via the
+// wire DTO; the handler-edge cap is dashboardScanTopN = 10.
+// Three behaviours are pinned:
+//
+//  1. Capacity overflow: a scan with 15 findings renders the
+//     top 10 sorted CRITICAL → UNKNOWN (stable on ID for ties),
+//     and TotalCount == 15.
+//
+//  2. Capacity unused: a scan with 5 findings renders the full
+//     5, and TotalCount == 5 (no truncation copy).
+//
+//  3. Zero findings: a scan with 0 vulnerabilities renders an
+//     empty slice with TotalCount == 0 (the template branch on
+//     .Vulnerabilities falsey fires the "No vulnerabilities
+//     matched." copy).
+//
+// Regression catches: an unstable sort that puts HIGH before
+// CRITICAL (the stable-sort tie-break), a missing TotalCount that
+// would hide the "Showing N of M" template branch, and an
+// unconditional cap that drops rows on a scan with < 10 findings.
+func TestDashboardScanPayload_TopNCap(t *testing.T) {
+	mkRow := func(id, sev string) api.Vulnerability {
+		return api.Vulnerability{
+			ID:       id,
+			Severity: sev,
+			Package:  "p",
+			Version:  "v",
+			FixedIn:  "",
+		}
+	}
+
+	t.Run("overflow-capped-at-10-sorted-by-severity", func(t *testing.T) {
+		// 15 rows: 5×CRITICAL with stable-sort tie IDs (we
+		// want the test to be deterministic), 4×HIGH, 3×MEDIUM,
+		// 2×LOW, 1×UNKNOWN. The handler must return only 10
+		// rows: all 5 CRITICAL + all 4 HIGH + first MEDIUM;
+		// TotalCount == 15.
+		//
+		// Severity strings are pulled from severityOrdinalTable
+		// in N-to-0 ordinal order (CRITICAL first, UNKNOWN
+		// last) so the test doesn't reintroduce goconst
+		// duplicate-string violations.
+		counts := []int{5, 4, 3, 2, 1} // CRITICAL..UNKNOWN
+		var vs []api.Vulnerability
+		idx := 0
+		for sev, ord := range severityOrdinalTable {
+			c := counts[ord]
+			for i := 0; i < c; i++ {
+				vs = append(vs, mkRow(fmt.Sprintf("%s-%02d", sev, i), sev))
+			}
+			idx++
+		}
+
+		out := dashboardScanPayload(&api.ScanResult{
+			Status:          "complete",
+			Vulnerabilities: vs,
+		})
+		if len(out.Vulnerabilities) != 10 {
+			t.Fatalf("len(Vulnerabilities) = %d, want 10 (cap)", len(out.Vulnerabilities))
+		}
+		if out.TotalCount != 15 {
+			t.Errorf("TotalCount = %d, want 15 (pre-truncation)", out.TotalCount)
+		}
+		// Walk the same order: first N rows = CRITICAL
+		// (5), next = HIGH (4), 10th = first MEDIUM.
+		want := []struct {
+			count int
+		}{
+			{5}, // 5 CRITICAL
+			{4}, // 4 HIGH
+			{1}, // 1 MEDIUM (truncated from 3)
+		}
+		off := 0
+		for ord := 0; ord < len(want) && off < len(out.Vulnerabilities); ord++ {
+			var sev string
+			for s, o := range severityOrdinalTable {
+				if o == ord {
+					sev = s
+					break
+				}
+			}
+			for i := 0; i < want[ord].count && off < len(out.Vulnerabilities); i++ {
+				if out.Vulnerabilities[off].Severity != sev {
+					t.Errorf("Vulns[%d].Severity = %q, want %s", off, out.Vulnerabilities[off].Severity, sev)
+				}
+				off++
+			}
+		}
+	})
+
+	t.Run("no-cap-when-under-N", func(t *testing.T) {
+		var vs []api.Vulnerability
+		for i := 0; i < 5; i++ {
+			vs = append(vs, mkRow(fmt.Sprintf("ROW-%02d", i), "HIGH"))
+		}
+		out := dashboardScanPayload(&api.ScanResult{
+			Status:          "complete",
+			Vulnerabilities: vs,
+		})
+		if len(out.Vulnerabilities) != 5 {
+			t.Errorf("len(Vulnerabilities) = %d, want 5 (no cap when under N)", len(out.Vulnerabilities))
+		}
+		if out.TotalCount != 5 {
+			t.Errorf("TotalCount = %d, want 5 (==len when under cap)", out.TotalCount)
+		}
+	})
+
+	t.Run("zero-findings-empty-payload", func(t *testing.T) {
+		out := dashboardScanPayload(&api.ScanResult{
+			Status:          "complete",
+			Vulnerabilities: nil,
+		})
+		if len(out.Vulnerabilities) != 0 {
+			t.Errorf("len(Vulnerabilities) = %d, want 0", len(out.Vulnerabilities))
+		}
+		if out.TotalCount != 0 {
+			t.Errorf("TotalCount = %d, want 0", out.TotalCount)
+		}
+	})
+
+	t.Run("nil-scan-returns-zero-ScanPayload", func(t *testing.T) {
+		out := dashboardScanPayload(nil)
+		if out.TotalCount != 0 {
+			t.Errorf("TotalCount = %d, want 0 for nil scan", out.TotalCount)
+		}
+		if len(out.Vulnerabilities) != 0 {
+			t.Errorf("len(Vulnerabilities) = %d, want 0 for nil scan", len(out.Vulnerabilities))
+		}
+	})
+}
+
+// TestSeverityOrdinal pins the order the dashboard's stable sort
+// uses for the top-N cap. A regression that changes the ordinal
+// (e.g. swapping HIGH/MEDIUM) surfaces here as a sort-order test
+// failure on TestDashboardScanPayload_TopNCap.
+//
+// Iterates over the package-level severityOrdinalTable directly
+// so the test doesn't reintroduce the goconst trip on
+// duplicate literal strings.
+func TestSeverityOrdinal(t *testing.T) {
+	for sev, want := range severityOrdinalTable {
+		if got := severityOrdinal(sev); got != want {
+			t.Errorf("severityOrdinal(%q) = %d, want %d", sev, got, want)
+		}
+	}
+	// Unknown / empty values sort one past the last known
+	// severity.
+	if got := severityOrdinal(""); got != len(severityOrdinalTable) {
+		t.Errorf("severityOrdinal(\"\") = %d, want %d (past last known)", got, len(severityOrdinalTable))
+	}
+	if got := severityOrdinal("bogus"); got != len(severityOrdinalTable) {
+		t.Errorf("severityOrdinal(\"bogus\") = %d, want %d (past last known)", got, len(severityOrdinalTable))
 	}
 }
 

@@ -2333,6 +2333,21 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 			resp.OverrideHealthcheck = &hc
 		}
 	}
+	// Per-deploy grype scan (issue #464 / ADR-075 / PR-3).
+	// Populate DeploymentResponse.Scan from the typed payload
+	// written by imaged's deploy-complete hook (PR-3 commit 2).
+	// The handler-side conversion from the on-disk jsonb shape
+	// (state.Deployment.ScanResult []byte) into the wire DTO
+	// (api.ScanResult) happens via s.scanResponse so this
+	// handler and the /scan drill-down route (PR-4) emit
+	// IDENTICAL typed payloads for a given row. The single
+	// source of truth lives in cmd/apid/handlers_scan.go.
+	//
+	// scanResponse returns nil when the row has no scan_status
+	// (mid-pipeline / pre-#464 row); the Scan field's omitempty
+	// tag then drops the field from the wire response. The
+	// dashboard renders "scan pending" on the absence.
+	resp.Scan = s.scanResponse(d)
 	return resp
 }
 

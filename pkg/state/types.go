@@ -799,6 +799,18 @@ type Deployment struct {
 	// does NOT carry the plan context, so the helper is just
 	// min(0, MinInstances)→0 + raw value.
 	MinInstances int `json:"min_instances,omitempty"`
+	// Scan columns (issue #464 / ADR-055 / PR-3). Per-deploy grype
+	// scan result, status, and scanned_at. Mirror the deployments
+	// table columns added by migrations/00135. The pgstore reads
+	// these as raw bytes via SQL (ScanResult []byte, ScanStatus
+	// string, ScannedAt time.Time) — the apid-side decoder turns
+	// ScanResult bytes into the typed *api.ScanResult at the
+	// handler boundary. The memstore mirror keeps the in-memory
+	// shape aligned with PgStore so unit tests that exercise the
+	// write path don't need Postgres.
+	ScanResult []byte    `json:"scan_result,omitempty"`
+	ScanStatus string    `json:"scan_status,omitempty"`
+	ScannedAt  time.Time `json:"scanned_at,omitempty"`
 }
 
 // DeploymentSidecarLayer is one sidecar's per-workload filesystem

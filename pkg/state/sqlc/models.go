@@ -299,6 +299,9 @@ type Deployment struct {
 	OverrideEnvSecrets  []byte
 	OverridePort        pgtype.Int4
 	OverrideHealthcheck []byte
+	ScanResult          []byte
+	ScanStatus          pgtype.Text
+	ScannedAt           pgtype.Timestamptz
 }
 
 type DeploymentLog struct {

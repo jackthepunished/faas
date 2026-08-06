@@ -27,6 +27,21 @@
     .badge.sleeping { background: #e5e7eb; color: #374151; }
     .badge.waking   { background: #dbeafe; color: #1e40af; }
     .badge.dim      { background: #f3f4f6; color: #6b7280; }
+    /* Severity color chips — palette is mirrored verbatim from
+       pkg/dashboard/templates/deployment_detail.html so the
+       list view (app_detail.html) and the detail view
+       (deployment_detail.html) render the same severity with
+       the same color. PR #656 review finding #2: the previous
+       inline styles (color:#c62828, etc.) on this template
+       drifted from the detail view's .sev-* classes and
+       customers saw two different reds for the same severity
+       in adjacent views. Any future palette change should
+       update both templates in lockstep. */
+    .sev-critical { color: #c62828; font-weight: 600; }
+    .sev-high     { color: #e65100; font-weight: 600; }
+    .sev-medium   { color: #f9a825; font-weight: 600; }
+    .sev-low      { color: #1565c0; font-weight: 600; }
+    .sev-unknown  { color: #888; }
   </style>
 </head>
 <body hx-ext="sse" sse-connect="/v1/events">
@@ -70,13 +85,36 @@
       <h2>Recent deployments</h2>
       {{if .Data.Deployments}}
         <table>
-          <thead><tr><th>Created</th><th>Kind</th><th>Status</th><th>Error</th><th>Action</th></tr></thead>
+          <thead><tr><th>Created</th><th>Kind</th><th>Status</th><th>Scan</th><th>Error</th><th>Action</th></tr></thead>
           <tbody>
             {{range .Data.Deployments}}
               <tr>
                 <td>{{.CreatedAt}}</td>
                 <td>{{.Kind}}</td>
                 <td>{{.Status}}</td>
+                <td>
+                  {{if .ScanSummary}}
+                    {{/* Issue #464 / ADR-055: per-deploy grype scan chip.
+                         Counts render inline; the chip links to the
+                         deployment detail page for the full CVE list. */}}
+                    <a href="/dashboard/apps/{{$.Data.App.Slug}}/deployments/{{.ID}}" title="scan {{.ScanSummary.Status}} at {{.ScanSummary.ScannedAt}}">
+                      {{if eq .ScanSummary.Status "complete"}}
+                        <span class="sev-critical">{{.ScanSummary.Critical}}C</span>
+                        <span class="sev-high">{{.ScanSummary.High}}H</span>
+                        <span class="sev-medium">{{.ScanSummary.Medium}}M</span>
+                        <span class="sev-low">{{.ScanSummary.Low}}L</span>
+                      {{else if eq .ScanSummary.Status "failed"}}
+                        <span class="sev-critical">scan failed</span>
+                      {{else if eq .ScanSummary.Status "skipped"}}
+                        <span style="color:#888">scan skipped</span>
+                      {{else}}
+                        <span style="color:#888">{{.ScanSummary.Status}}</span>
+                      {{end}}
+                    </a>
+                  {{else}}
+                    <span style="color:#888">scan pending</span>
+                  {{end}}
+                </td>
                 <td><code>{{.Error}}</code></td>
                 <td>
                   <form method="POST" action="/dashboard/apps/{{$.Data.App.Slug}}/rollback" style="display:inline">

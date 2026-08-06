@@ -665,6 +665,32 @@ type OpsMetrics struct {
 	// single-registry pattern — memory note wire/OpsMetrics —
 	// demands the field be present on the shared struct).
 	provenanceWrites *prometheus.CounterVec
+	// deployScanDuration: issue #464 / ADR-055 — per-deploy (not
+	// per-base) grype scan histogram. Measured from
+	// runDeployScan entry to either the SUCCESS sink write or
+	// the FAILED sink write (after the 1-retry backoff). Buckets
+	// cover the 5-min SLA (AC #1) — a deploy that lands in the
+	// top bucket is a SLO miss and the dashboard's "scan overdue"
+	// chip will surface it (ADR-055 §3).
+	deployScanDuration *prometheus.HistogramVec
+	// deployScanTotal: scanned-deploy counter, labelled by
+	// result ∈ {complete, failed, skipped}. The complete/failed
+	// labels increment once per scan after the 1-retry backoff;
+	// skipped comes from the pre-feature backfill (issue #464
+	// migration 00135) plus a defensive increment on the per-app
+	// grype toggle (imaged builds where scan is disabled by
+	// feature flag). The counter is the read side for the §12
+	// dashboard scan panel — sum(rate(deployScanTotal[5m])) by
+	// (result) over a 1 h window.
+	deployScanTotal *prometheus.CounterVec
+	// deployScanVulns: per-deploy CVE counter, labelled by
+	// severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN}. Counts
+	// each finding once per deploy scan (matching the
+	// imageScanVulns semantics but on a per-deploy key). The
+	// CRITICAL row is the per-deploy equivalent of the vmmd
+	// admission gate's read side — increment-without-action,
+	// surfaced-not-enforced (ADR-055 §2).
+	deployScanVulns *prometheus.CounterVec
 	// imageScanVulns: issue #299 / supply-chain scan observability.
 	// Counter labelled by image (the OCI ref of the staged base
 	// ext4, e.g. "ghcr.io/onebox-faas/builder-base:latest" or
@@ -1477,6 +1503,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Per-image Grype finding counts, labelled by image (the OCI ref of the staged base ext4) and severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} (issue #299). The CRITICAL count is the vmmd admission gate's read side — a non-zero rate means vmmd refused to bring up an instance whose staged ext4 had a CRITICAL finding. The counter is incremented once per Grype scan at imaged base-stage time.",
 	}, []string{"image", "severity"})
 	commonCollectors = append(commonCollectors, imageScanVulns)
+	// ADR-055: per-deploy grype scan metrics. Labelled by
+	// severity (the Grype closed set) — the same vocabulary
+	// imageScanVulns uses, so anyone familiar with the base-ext4
+	// scan dashboards can read the per-deploy dashboards.
+	// deployScanDuration uses the conventional latency buckets
+	// (1s..600s) plus an explicit 300s SLA bucket so the SLO
+	// burn is visible in a single Prom query.
+	deployScanDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_deploy_scan_duration_seconds",
+		Help:    "Per-deploy grype scan wall-clock duration in seconds (issue #464 / ADR-055). Measured from runDeployScan entry to the final sink write (complete or failed after the 1-retry backoff). The 300s SLO bucket makes the 5-min SLA burn visible without further PromQL.",
+		Buckets: []float64{1, 5, 10, 30, 60, 120, 180, 240, 300, 420, 600},
+	}, []string{"app"})
+	commonCollectors = append(commonCollectors, deployScanDuration)
+	deployScanTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_deploy_scan_total",
+		Help: "Per-deploy grype scan outcomes, labelled by result ∈ {complete, failed, skipped} (issue #464 / ADR-055). One increment per deploy after the 1-retry backoff; skipped comes from the pre-feature backfill or a feature-flag-off imaged build.",
+	}, []string{"app", "result"})
+	commonCollectors = append(commonCollectors, deployScanTotal)
+	deployScanVulns := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_deploy_scan_vulns_total",
+		Help: "Per-deploy grype CVE finding counts, labelled by severity ∈ {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN} (issue #464 / ADR-055). Mirrors the existing base-ext4 _trivy_image_vulns_total semantic but on the per-deploy key. The CRITICAL row is the per-deploy equivalent of the vmmd admission gate's read side.",
+	}, []string{"app", "severity"})
+	commonCollectors = append(commonCollectors, deployScanVulns)
 	// ADR-066 / Tier A5: live-instance migration decision counter.
 	// Labelled by outcome ∈ {migrated, conflict, no_headroom,
 	// no_eligibility, lease_expired, peer_failure}. The migrated
@@ -1869,6 +1918,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ociEgressDeny:                      ociEgressDeny,
 		provenanceWrites:                   provenanceWrites,
 		imageScanVulns:                     imageScanVulns,
+		deployScanDuration:                 deployScanDuration,
+		deployScanTotal:                    deployScanTotal,
+		deployScanVulns:                    deployScanVulns,
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
@@ -2768,6 +2820,48 @@ func (m *OpsMetrics) ObserveImageScanVuln(image, severity string, count int) {
 		return
 	}
 	m.imageScanVulns.WithLabelValues(image, severity).Add(float64(count))
+}
+
+// ObserveDeployScanDuration records one per-deploy grype scan's
+// wall-clock duration in <daemon>_deploy_scan_duration_seconds{app}
+// (issue #464 / ADR-055). Result is the closed set
+// {complete, failed} — skipped scans never run the histogram (the
+// scan didn't happen, so duration is meaningless). Safe on a nil
+// receiver so the imaged deploy-complete hook doesn't need a
+// nil-check at the top of the hot path.
+func (m *OpsMetrics) ObserveDeployScanDuration(app, result string, dur time.Duration) {
+	if m == nil {
+		return
+	}
+	m.deployScanDuration.WithLabelValues(app).Observe(dur.Seconds())
+}
+
+// ObserveDeployScanTotal records one per-deploy scan outcome in
+// <daemon>_deploy_scan_total{app, result} (issue #464 / ADR-055).
+// Result is the closed set {complete, failed, skipped} — the same
+// vocabulary the deployments.scan_status column uses, so a
+// `count by (result) (rate(deployScanTotal[5m]))` query mirrors
+// the SQL `SELECT scan_status, count(*) FROM deployments WHERE
+// scanned_at > ... GROUP BY scan_status` view. Safe on a nil
+// receiver.
+func (m *OpsMetrics) ObserveDeployScanTotal(app, result string) {
+	if m == nil {
+		return
+	}
+	m.deployScanTotal.WithLabelValues(app, result).Inc()
+}
+
+// ObserveDeployScanVulns records one per-deploy scan's per-severity
+// CVE count in <daemon>_deploy_scan_vulns_total{app, severity}
+// (issue #464 / ADR-055). Severity is the Grype closed set
+// {CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN}. The CRITICAL row is the
+// per-deploy equivalent of the vmmd admission gate's read side —
+// surfaced-not-enforced (ADR-055 §2). Safe on a nil receiver.
+func (m *OpsMetrics) ObserveDeployScanVulns(app, severity string, count int) {
+	if m == nil {
+		return
+	}
+	m.deployScanVulns.WithLabelValues(app, severity).Add(float64(count))
 }
 
 // ObserveBuildDuration records one build's wall-clock duration in the

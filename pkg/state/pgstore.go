@@ -3785,6 +3785,40 @@ func (s *PgStore) SetDeploymentRootfs(ctx context.Context, id, path, key string,
 	return nil
 }
 
+// UpsertDeploymentScanResult records the per-deploy grype CVE
+// scan on the deployment row (issue #464 / ADR-055 / PR-3).
+// The whole row's scan columns are overwritten — scan_result +
+// scan_status + scanned_at — so a re-imaged rebuild's new
+// scan replaces the prior scan in place. scanned_at is stamped
+// at the SQL layer (now()) so the value is the server clock,
+// not whatever the imaged client thinks it is (clock drift
+// between imaged and apid is the typical cause of "scan older
+// than the deploy" surprises on the dashboard).
+//
+// status MUST be 'complete' or 'failed' — the CHECK constraint
+// deployments_scan_status_chk rejects any other value. The
+// imaged-side call site (cmd/apid/scan_sink.go) is the only
+// producer; the closed enum is enforced by the sink adapter
+// before this function is reached.
+//
+// Returns ErrNotFound when the deployment row doesn't exist.
+// In practice the FK CASCADE on deployments makes this
+// unreachable; the explicit error mirrors SetDeploymentSidecarLayer.
+func (s *PgStore) UpsertDeploymentScanResult(ctx context.Context, deploymentID string, scanResult []byte, status string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set scan_result = $2, scan_status = $3, scanned_at = now()
+		  where id = $1`,
+		deploymentID, scanResult, nullString(status))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SetDeploymentSidecarLayer is the per-workload filesystem handle
 // for sidecars (issue #463 / ADR-069 / PR-B). Upserts one row
 // keyed by (deployment_id, sidecar_name). The whole row is
@@ -9043,7 +9077,8 @@ const deploymentSelectColumns = `
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
 	coalesce(sidecars, '[]'::jsonb),
-	min_instances`
+	min_instances,
+	scan_result, scan_status, scanned_at`
 
 // deploymentSelectColumnsWithRootfs is the variant used by read paths
 // that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
@@ -9065,7 +9100,8 @@ const deploymentSelectColumnsWithRootfs = `
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
 	coalesce(sidecars, '[]'::jsonb),
-	min_instances`
+	min_instances,
+	scan_result, scan_status, scanned_at`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -9096,11 +9132,21 @@ var _ = deploymentSelectColumnsQualified
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
 	var kind, statusStr string
+	var scanStatus *string
+	var scannedAt *time.Time
 	// Issue #460 / ADR-053: six override columns scanned here so the
 	// SELECT projections in DeploymentByID / LatestDeployment / etc.
 	// match. The scan order matches the column order in the SELECT
 	// list — keep them in lockstep or pgx's positional Scan returns
 	// the wrong field into the wrong destination.
+	//
+	// Issue #464 / ADR-055: scan columns (scan_result jsonb,
+	// scan_status text, scanned_at timestamptz) are scanned here too.
+	// scan_status is nullable (NULL on pre-PR-#651 rows, before the
+	// backfill passes — and NULL inside the window where the deploy
+	// ships ahead of the scan) so the destination is *string.
+	// scanned_at is also nullable for the same reason; destination
+	// is *time.Time. pgx scans a NULL into a nil pointer cleanly.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -9108,11 +9154,18 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.Sidecars, &d.MinInstances); err != nil {
+		&d.Sidecars, &d.MinInstances,
+		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
+	if scanStatus != nil {
+		d.ScanStatus = *scanStatus
+	}
+	if scannedAt != nil {
+		d.ScannedAt = *scannedAt
+	}
 	return d, nil
 }
 
@@ -9127,6 +9180,8 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
 	var kind, statusStr, rootfsPath, rootfsKey string
+	var scanStatus *string
+	var scannedAt *time.Time
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		&rootfsPath, &rootfsKey, &d.RootfsBytes,
@@ -9135,13 +9190,20 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.Sidecars, &d.MinInstances); err != nil {
+		&d.Sidecars, &d.MinInstances,
+		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
 	}
 	d.RootfsPath = rootfsPath
 	d.RootfsKey = rootfsKey
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
+	if scanStatus != nil {
+		d.ScanStatus = *scanStatus
+	}
+	if scannedAt != nil {
+		d.ScannedAt = *scannedAt
+	}
 	return d, nil
 }
 
@@ -9150,6 +9212,8 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 	for rows.Next() {
 		d := Deployment{}
 		var kind, statusStr string
+		var scanStatus *string
+		var scannedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
@@ -9157,11 +9221,18 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 			&d.OverrideEntrypoint, &d.OverrideCmd,
 			&d.OverrideEnv, &d.OverrideEnvSecrets,
 			&d.OverridePort, &d.OverrideHealthcheck,
-			&d.Sidecars, &d.MinInstances); err != nil {
+			&d.Sidecars, &d.MinInstances,
+			&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 			return nil, err
 		}
 		d.Kind = DeploymentKind(kind)
 		d.Status = DeploymentStatus(statusStr)
+		if scanStatus != nil {
+			d.ScanStatus = *scanStatus
+		}
+		if scannedAt != nil {
+			d.ScannedAt = *scannedAt
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()

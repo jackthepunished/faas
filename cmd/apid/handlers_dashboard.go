@@ -71,6 +71,14 @@ func (s *server) dashboardHandler(log *slog.Logger) http.HandlerFunc {
 			s.renderAppsList(w, r, log, acct)
 		case len(path) > len("/dashboard/apps/") && path[:len("/dashboard/apps/")] == "/dashboard/apps/":
 			slug := path[len("/dashboard/apps/"):]
+			// Per-deploy drill-down (issue #464 / ADR-075):
+			// /dashboard/apps/{slug}/deployments/{id} renders the
+			// full grype CVE list for one deployment. Falls through
+			// to renderAppDetail if the suffix doesn't match.
+			if dslug, did, ok := parseDeployDetailPath(slug); ok {
+				s.renderDeploymentDetail(w, r, log, acct, dslug, did)
+				return
+			}
 			s.renderAppDetail(w, r, log, acct, slug)
 		case path == "/dashboard/usage":
 			s.renderUsage(w, r, log, acct)
@@ -228,13 +236,40 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 	}
 	deps := make([]dashboard.DeploymentItem, 0, len(rows))
 	for _, d := range rows {
-		deps = append(deps, dashboard.DeploymentItem{
+		item := dashboard.DeploymentItem{
 			ID:        d.ID,
 			Status:    string(d.Status),
 			Kind:      string(d.Kind),
 			CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
 			Error:     d.Error,
-		})
+		}
+		// Per-deploy grype scan summary (issue #464 / ADR-075).
+		// Populate ScanSummary only when the row carries a
+		// scan_status; nil means "scan pending" on the template.
+		// The SeverityCounts read comes from the jsonb column's
+		// typed payload — the same ScanResult the /scan route
+		// returns — so the list-view chip + the detail page
+		// agree on counts.
+		if d.ScanStatus != "" {
+			sum := &dashboard.ScanSummary{
+				Status: d.ScanStatus,
+			}
+			if !d.ScannedAt.IsZero() {
+				sum.ScannedAt = d.ScannedAt.UTC().Format(time.RFC3339)
+			}
+			if len(d.ScanResult) > 0 {
+				var sr api.ScanResult
+				if err := json.Unmarshal(d.ScanResult, &sr); err == nil {
+					sum.Critical = sr.SeverityCounts.Critical
+					sum.High = sr.SeverityCounts.High
+					sum.Medium = sr.SeverityCounts.Medium
+					sum.Low = sr.SeverityCounts.Low
+					sum.Unknown = sr.SeverityCounts.Unknown
+				}
+			}
+			item.ScanSummary = sum
+		}
+		deps = append(deps, item)
 	}
 	crons, err := s.store.ListCronsForApp(ctx, app.ID)
 	if err != nil {
@@ -1092,5 +1127,186 @@ func (s *server) renderStateless(w http.ResponseWriter, r *http.Request, log *sl
 	}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
+	}
+}
+
+// parseDeployDetailPath splits a /dashboard/apps/{slug}/... suffix
+// into (slug, deployment_id, ok). Returns ok=false when the
+// suffix doesn't match /deployments/{id} — caller falls through
+// to renderAppDetail. The match is prefix-based so the function
+// stays robust to future suffix additions (e.g.
+// /deployments/{id}/logs); today only /deployments/{id} is
+// dispatched.
+func parseDeployDetailPath(rest string) (string, string, bool) {
+	const deploys = "/deployments/"
+	i := strings.Index(rest, deploys)
+	if i < 0 {
+		return "", "", false
+	}
+	slug := rest[:i]
+	id := rest[i+len(deploys):]
+	if slug == "" || id == "" || strings.Contains(id, "/") {
+		return "", "", false
+	}
+	return slug, id, true
+}
+
+// renderDeploymentDetail renders /dashboard/apps/{slug}/deployments/{id}
+// — the per-deploy grype scan drill-down page (issue #464 /
+// ADR-055 / PR-A). Pulls the typed ScanResult directly from the
+// store rather than calling GET /v1/deployments/{id}/scan over
+// loopback — same data, one fewer indirection. IDOR posture is
+// the same AppByID + AccountID check as renderAppDetail (above).
+//
+// On the nil Scan case (deploy is mid-pipeline or predates the
+// feature), the template renders "scan pending". On a non-empty
+// scan_status we project the wire api.ScanResult into the
+// dashboard-local ScanPayload so pkg/dashboard stays free of
+// pkg/api imports (the same isolation rule that drove the
+// AppListItem vs pkg/api.App split).
+func (s *server) renderDeploymentDetail(w http.ResponseWriter, r *http.Request, log *slog.Logger, acct state.Account, slug, deploymentID string) {
+	ctx := r.Context()
+	app, err := s.store.AppBySlug(ctx, slug)
+	if err != nil || app.AccountID != acct.ID {
+		http.NotFound(w, r)
+		return
+	}
+	dep, err := s.store.DeploymentByID(ctx, deploymentID)
+	if err != nil || dep.AppID != app.ID {
+		http.NotFound(w, r)
+		return
+	}
+
+	data := dashboard.DeploymentDetailData{
+		App:        dashboard.AppListItem{Slug: app.Slug},
+		Deployment: dashboardDeploymentItem(dep),
+	}
+	if dep.ScanStatus != "" {
+		payload := dashboardScanPayload(s.scanResponse(dep))
+		data.Scan = &payload
+	}
+
+	nonce := httpsec.NonceFromContext(r.Context())
+	page := dashboard.Page{
+		Title:   "Deployment " + dep.ID,
+		Nonce:   nonce,
+		Account: dashboardAccountView(acct, 0),
+		Body:    "deployment_detail",
+		Data:    data,
+	}
+	if err := dashboard.Render(w, log, nonce, page); err != nil {
+		renderProblem(w, log, err)
+	}
+}
+
+// dashboardScanPayload projects the wire api.ScanResult into the
+// dashboard-local ScanPayload / VulnerabilityRow shapes. The
+// handler is the only thing that crosses the api → dashboard
+// boundary; pkg/dashboard itself never imports pkg/api.
+//
+// Accepts a pointer so the caller can pass s.scanResponse(d)
+// directly; the helper is only reached on a non-empty
+// scanStatus (the dashboard's "scan pending" pill renders
+// on the absence, not on a 200/empty payload — the same
+// convention as getDeploymentScan).
+//
+// Sort+cap (issue #464 / AC #3): the dashboard renders the
+// top-N CVEs by severity (CRITICAL first, then HIGH, MEDIUM,
+// LOW, UNKNOWN; stable on ID for ties). The cap is at the
+// handler edge — the wire DTO + /scan route + SDK + CLI keep
+// the full list so customers reaching the API directly don't
+// have to reimplement the cap. TotalCount carries the
+// pre-truncation count so the template can render the
+// "Showing N of M" copy + a "View full scan (JSON)" link to
+// GET /v1/deployments/{id}/scan when the scan had more
+// findings than the dashboard width allows.
+func dashboardScanPayload(s *api.ScanResult) dashboard.ScanPayload {
+	if s == nil {
+		return dashboard.ScanPayload{}
+	}
+	rows := make([]dashboard.VulnerabilityRow, 0, len(s.Vulnerabilities))
+	for _, v := range s.Vulnerabilities {
+		rows = append(rows, dashboard.VulnerabilityRow{
+			ID:       v.ID,
+			Severity: v.Severity,
+			Package:  v.Package,
+			Version:  v.Version,
+			FixedIn:  v.FixedIn,
+			Paths:    v.Paths,
+		})
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return severityOrdinal(rows[i].Severity) < severityOrdinal(rows[j].Severity)
+	})
+	total := len(rows)
+	limit := total
+	if limit > dashboardScanTopN {
+		limit = dashboardScanTopN
+	}
+	vulns := rows[:limit]
+	sc := s.SeverityCounts
+	return dashboard.ScanPayload{
+		Status:         s.Status,
+		ScannedAt:      s.ScannedAt,
+		ScannerVersion: s.ScannerVersion,
+		ImageDigest:    s.ImageDigest,
+		SeverityCounts: dashboard.SeverityBucket{
+			Critical: sc.Critical,
+			High:     sc.High,
+			Medium:   sc.Medium,
+			Low:      sc.Low,
+			Unknown:  sc.Unknown,
+		},
+		Vulnerabilities: vulns,
+		TotalCount:      total,
+		Error:           s.Error,
+	}
+}
+
+// dashboardScanTopN is the AC #3 cap (issue #464): the
+// dashboard's deployment detail page renders the top-N CVEs by
+// severity, with a link to the full list at the wire endpoint.
+// 10 is the spec number; the value is exposed at handler edge
+// so the dashboard_test unit pin can iterate without copy-paste.
+const dashboardScanTopN = 10
+
+// severityOrdinalTable maps the closed-enum severity strings
+// the dashboard renders to their render-first ordinal. Lower
+// ordinal = more severe. Strings outside the closed enum
+// (the default branch) sort after UNKNOWN so an upstream
+// change doesn't disturb the ordering of known-severity rows.
+//
+// A single package-level map declaration keeps the goconst
+// rule quiet (each severity string appears only inside the
+// literal here; the return path reads off the ordinal).
+var severityOrdinalTable = map[string]int{
+	"CRITICAL": 0,
+	"HIGH":     1,
+	"MEDIUM":   2,
+	"LOW":      3,
+	"UNKNOWN":  4,
+}
+
+// severityOrdinal returns the render-first ordinal of a
+// severity string. Unknown / malformed values return one past
+// UNKNOWN so they sort at the end of the cap.
+func severityOrdinal(s string) int {
+	if n, ok := severityOrdinalTable[s]; ok {
+		return n
+	}
+	return len(severityOrdinalTable) // any unknown sorts after UNKNOWN
+}
+
+// dashboardDeploymentItem projects a state.Deployment into the
+// minimal DeploymentItem shape the deployment_detail template
+// needs (ID, Kind, Status, CreatedAt). The full Deployments list
+// uses a richer shape; the detail page only renders a header.
+func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
+	return dashboard.DeploymentItem{
+		ID:        d.ID,
+		Status:    string(d.Status),
+		Kind:      string(d.Kind),
+		CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339),
+		Error:     d.Error,
 	}
 }

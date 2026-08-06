@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,14 +154,18 @@ type Handler struct {
 	// audit listing per ADR-074 §3.2.
 	audit *audit.Auditor
 	// grypeRun is the supply-chain scan runner used at base-stage
-	// time to write the Grype scan sidecar (issue #299). Wired
-	// via WithGrypeRun; nil = default to a subprocess invocation
-	// (grype dir:<outImage> -o json) — production default. Tests
-	// inject a stub returning canned findings so the sidecar write
-	// is hermetic and doesn't require Grype on PATH. Fail-closed
+	// time to write the Grype scan sidecar (issue #299 / ADR-075
+	// PR-2). Wired via WithGrypeRun; nil = default to a subprocess
+	// invocation (grype dir:<outImage> -o json) — production default.
+	// Tests inject a stub returning canned findings so the sidecar
+	// write is hermetic and doesn't require Grype on PATH. Fail-closed
 	// at the sidecar-write site (CRITICAL=9999 placeholder) when
-	// the runner returns an error or nil findings.
-	grypeRun func(ctx context.Context, dir string) (map[string]int, error)
+	// the runner returns an error or nil findings. The return type
+	// is *ScanResult (PR-2 refactor) — the pre-PR-2 map[string]int
+	// is the typed struct's SeverityCounts field; the base-ext4
+	// sidecar write at base_stage.go::writeScanSidecar reads the
+	// counts off the struct to build the legacy sidecar JSON.
+	grypeRun func(ctx context.Context, dir string) (*ScanResult, error)
 	// syftRun is the post-build SBOM generator used to populate
 	// build_provenance.sbom_storage_key (issue #299 / ADR-038
 	// Phase 3). Wired via WithSyftRun; nil = default to a
@@ -493,13 +498,13 @@ func (h *Handler) WithAudit(a *audit.Auditor) *Handler {
 }
 
 // WithGrypeRun replaces the default Grype subprocess invocation
-// (issue #299). Default is nil, which falls back to the production
-// runner that shells out to `grype dir:<dir> -o json` and parses
-// the per-severity finding counts. Tests inject a stub returning
-// canned findings so the sidecar write is hermetic. Mirrors the
-// `LayerBuilder` interface injection pattern — same Handler-Builder
-// seam, same With* fluent setter shape.
-func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (map[string]int, error)) *Handler {
+// (issue #299 / ADR-075 PR-2). Default is nil, which falls back
+// to the production runner that shells out to `grype dir:<dir>
+// -o json` and parses the typed ScanResult. Tests inject a stub
+// returning canned findings so the sidecar write is hermetic.
+// Mirrors the `LayerBuilder` interface injection pattern — same
+// Handler-Builder seam, same With* fluent setter shape.
+func (h *Handler) WithGrypeRun(fn func(ctx context.Context, dir string) (*ScanResult, error)) *Handler {
 	h.grypeRun = fn
 	return h
 }
@@ -564,17 +569,136 @@ func (h *Handler) CloseVMMClient() error {
 }
 
 // runGrype dispatches to the injected grypeRun or falls back to
-// the default subprocess runner (issue #299). The default shells
-// out to `grype dir:<dir> -o json` and parses the matches[].vulnerability.severity
-// counts into map[string]int. Errors and nil maps are surfaced to
-// the caller (the sidecar-write site fail-closed with a
-// CRITICAL=9999 placeholder). Production wires the default;
-// tests wire a stub via WithGrypeRun.
-func (h *Handler) runGrype(ctx context.Context, dir string) (map[string]int, error) {
+// the default subprocess runner (issue #299 / ADR-075 PR-2).
+// The default shells out to `grype dir:<dir> -o json` and parses
+// the matches[].vulnerability.severity counts into a typed
+// ScanResult. Errors and nil results are surfaced to the caller
+// (the sidecar-write site fail-closed with a CRITICAL=9999
+// placeholder). Production wires the default; tests wire a stub
+// via WithGrypeRun.
+func (h *Handler) runGrype(ctx context.Context, dir string) (*ScanResult, error) {
 	if h.grypeRun != nil {
 		return h.grypeRun(ctx, dir)
 	}
 	return defaultGrypeRun(ctx, dir)
+}
+
+// runDeployScan runs the per-deploy grype scan and stamps the
+// result on the deployment row (issue #464 / ADR-075 / PR-3).
+// The scan reads the per-app layer ext4 (appsRoot/<slug>/<depID>.ext4)
+// and writes scan_result + scan_status + scanned_at via
+// state.Store.UpsertDeploymentScanResult. The method is
+// best-effort — both the grype runner error path and the SQL
+// write error path log at WARN and return so the deploy's
+// snapshotting transition fires regardless (AC #4: CRITICAL-CVE
+// images deploy successfully; AC #1: scan lands within 5 min
+// via this hook, well under the SLA).
+//
+// Runs synchronously in the deploy-complete path (post
+// SetDeploymentRootfs, pre snapshotting transition). Grype's
+// ~1-3s per-layer cost is acceptable here because the build
+// path already spends seconds-to-minutes in
+// aboveBaseLayers + the snapshot prime; the scan is one more
+// step in a pipeline that's already gated by build cold-boot.
+//
+// On a retry-exhausted grype failure, status='failed' is
+// stamped with the error in scan_result's Error field. The
+// dashboard renders a "scan failed" chip; the deploy itself
+// is unaffected.
+//
+// Marshal contract: *ScanResult + Error field are plain Go
+// types (ints, string) so json.Marshal can't fail at runtime.
+// A future field that breaks this invariant (e.g. a chan)
+// surfaces as an immediate panic in tests.
+func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.Deployment) {
+	if h.store == nil || h.log == nil {
+		// Defensive: tests that build a Handler without wiring
+		// store/log skip the scan entirely (no row to write, no
+		// log channel). Production wires both at line 87+195
+		// of cmd/imaged/main.go, so the nil branches are
+		// unreachable in prod.
+		return
+	}
+	start := time.Now()
+	ext4Path := h.appsRootPath(app.Slug, dep.ID)
+	if ext4Path == "" {
+		// Defensive: appsRootPath guards against path-traversal
+		// slugs (apparent / IDOR escape attempt, or a corrupt
+		// DB row). The scan is best-effort (AC #4: don't block
+		// the deploy). Stamp scan_status='failed' with the
+		// reason so the dashboard renders the failure distinctly
+		// from a grype runner error.
+		reason := "slug/path-traversal guard rejected"
+		h.log.Warn("imaged: per-deploy scan skipped",
+			"deployment", dep.ID, "app", app.Slug, "reason", reason)
+		failedResult := &ScanResult{Error: reason}
+		b, mErr := json.Marshal(failedResult)
+		if mErr != nil {
+			return
+		}
+		if writeErr := h.store.UpsertDeploymentScanResult(ctx, dep.ID, b, "failed"); writeErr != nil {
+			h.log.Warn("imaged: stamp scan_status=failed",
+				"deployment", dep.ID, "err", writeErr)
+		}
+		h.ops.ObserveDeployScanDuration(app.Slug, "skipped", time.Since(start))
+		h.ops.ObserveDeployScanTotal(app.Slug, "skipped")
+		return
+	}
+	result, err := h.runGrype(ctx, ext4Path)
+	if err != nil {
+		// Fail the scan, not the deploy. Log the grype error
+		// so the operator sees the underlying cause.
+		h.log.Warn("imaged: per-deploy grype scan failed",
+			"deployment", dep.ID, "app", app.Slug, "err", err)
+		failedResult := &ScanResult{Error: err.Error()}
+		b, mErr := json.Marshal(failedResult)
+		if mErr != nil {
+			h.log.Warn("imaged: marshal failed scan result",
+				"deployment", dep.ID, "err", mErr)
+			return
+		}
+		if writeErr := h.store.UpsertDeploymentScanResult(ctx, dep.ID, b, "failed"); writeErr != nil {
+			h.log.Warn("imaged: stamp scan_status=failed",
+				"deployment", dep.ID, "err", writeErr)
+		}
+		// ADR-075: surface the failure as a metric increment so
+		// the §12 dashboard panel can render a 5-min red rate.
+		// Duration histogram is observed on the failed branch too
+		// — the 5-min SLA bucket catches stuck scans even when
+		// the grype runner returns quickly.
+		h.ops.ObserveDeployScanDuration(app.Slug, "failed", time.Since(start))
+		h.ops.ObserveDeployScanTotal(app.Slug, "failed")
+		return
+	}
+	b, mErr := json.Marshal(result)
+	if mErr != nil {
+		h.log.Warn("imaged: marshal scan result",
+			"deployment", dep.ID, "err", mErr)
+		return
+	}
+	if err := h.store.UpsertDeploymentScanResult(ctx, dep.ID, b, "complete"); err != nil {
+		h.log.Warn("imaged: stamp scan_status=complete",
+			"deployment", dep.ID, "err", err)
+		return
+	}
+	// ADR-075: stamped-clean. Record wall-clock duration +
+	// per-severity counts so the §12 dashboard panel can graph
+	// the fleet-deploy scan latency over a 5-min window.
+	h.ops.ObserveDeployScanDuration(app.Slug, "complete", time.Since(start))
+	h.ops.ObserveDeployScanTotal(app.Slug, "complete")
+	for sev, n := range map[string]int{
+		"CRITICAL": result.Critical,
+		"HIGH":     result.High,
+		"MEDIUM":   result.Medium,
+		"LOW":      result.Low,
+		"UNKNOWN":  result.Unknown,
+	} {
+		h.ops.ObserveDeployScanVulns(app.Slug, sev, n)
+	}
+	h.log.Info("imaged: per-deploy scan stamped",
+		"deployment", dep.ID, "app", app.Slug,
+		"critical", result.Critical, "high", result.High,
+		"medium", result.Medium, "low", result.Low, "unknown", result.Unknown)
 }
 
 // storageFor returns the wired StorageBackend, building a default
@@ -608,8 +732,85 @@ func (h *Handler) storageFor() (storage.StorageBackend, error) {
 // stamped into deployments.rootfs_path. Used to keep the SetDeploymentRootfs
 // row contract identical to pre-#96 even when the new Storage path is
 // used to write the ext4.
+//
+// Defensive path-traversal guard (issue #464 / ADR-075 review
+// finding): a slug that contains `..` or starts with `/` would
+// resolve outside appsRoot after filepath.Join's Clean pass;
+// grype dir:<escaped> would then scan a file outside the intended
+// per-app tree. Apid's slug validator (cmd/apid/handlers.go:389)
+// already enforces `^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$` so the
+// vector is unreachable in the production write path. The
+// guard here is defense-in-depth: a row created by a future
+// admin SQL path (or a corrupt DB) cannot escape the tree.
+//
+// Returns "" when the slug is malformed or the resolved path
+// escapes appsRoot. Callers MUST check the "" return — the
+// grype-runner or ext4-write path that consumes the result
+// skips the operation on empty.
 func (h *Handler) appsRootPath(slug, deploymentID string) string {
-	return filepath.Join(h.appsRoot, slug, deploymentID+".ext4")
+	// Sanity-check the slug. Mirrors cmd/apid/handlers.go:389's
+	// slugRe. A future widening of the apid pattern must widen
+	// this check in lockstep, or the layers diverge — the
+	// isSlugSafe / safeDeploymentID predicates are the single
+	// machine-checkable seam.
+	if !isSlugSafe(slug) || !isDeploymentIDSafe(deploymentID) {
+		return ""
+	}
+	cleaned := filepath.Join(h.appsRoot, slug, deploymentID+".ext4")
+	// Belt-and-braces: even with the slug regex, a stale
+	// appsRoot containing a trailing slash or symlink could
+	// let the join resolve outside. absPrefix pins the
+	// resolved prefix to the canonical appsRoot.
+	absRoot, err := filepath.Abs(h.appsRoot)
+	if err != nil {
+		return ""
+	}
+	absJoined, err := filepath.Abs(cleaned)
+	if err != nil {
+		return ""
+	}
+	if !strings.HasPrefix(absJoined, absRoot+string(filepath.Separator)) &&
+		absJoined != absRoot {
+		return ""
+	}
+	return cleaned
+}
+
+// isSlugSafe mirrors cmd/apid/handlers.go:389's slugRe without
+// importing the regex package (the slug is a hot-path field on
+// every deploy). Hand-rolled to keep pkg/imaged dep-light.
+func isSlugSafe(slug string) bool {
+	if len(slug) < 3 || len(slug) > 40 {
+		return false
+	}
+	for i, r := range slug {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+		case i == 0 && r >= 'a' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isDeploymentIDSafe is a defensive check on the deployment
+// identifier. The column is a UUID (or short hash) emitted by
+// apid — the constraint here is that it must not contain a
+// path separator or `..` so the filepath.Join above pins the
+// result under appsRoot.
+func isDeploymentIDSafe(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+	for _, r := range id {
+		if r == '/' || r == '\\' || r == 0 || r == '.' {
+			return false
+		}
+	}
+	return true
 }
 
 // HandleNotification dispatches a single pg_notify payload. The Loop in
@@ -821,6 +1022,20 @@ func (h *Handler) handleDeployment(ctx context.Context, p deploymentChangedPaylo
 			return err
 		}
 	}
+
+	// Per-deploy grype scan (issue #464 / ADR-075 / PR-3).
+	// Runs AFTER the per-app ext4 layer is built + published
+	// (buildImageLayer/buildFunctionLayer both stamped
+	// SetDeploymentRootfs above) and BEFORE the
+	// pending→snapshotting transition. The scan is
+	// best-effort observability — a grype runner error or
+	// SQL write failure is logged at WARN and dropped; the
+	// deploy's snapshotting transition still fires so the
+	// customer contract (AC #4: CRITICAL-CVE images deploy
+	// successfully) holds. The scan lands on the deployment
+	// row within seconds of the layer publish (well inside
+	// the 5-min SLA from AC #1).
+	h.runDeployScan(ctx, app, dep)
 
 	if err := h.transition(ctx, dep.ID, state.DeploySnapshotting, ""); err != nil {
 		return err

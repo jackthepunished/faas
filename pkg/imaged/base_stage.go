@@ -532,9 +532,11 @@ func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage s
 		// could distinguish "CRITICAL known-bad" from "no scan
 		// at all" via the Findings field — for now, both collapse
 		// to "refuse to boot".
-		findings = map[string]int{
-			"CRITICAL": 9999, "HIGH": 9999, "MEDIUM": 9999,
-			"LOW": 9999, "UNKNOWN": 0,
+		findings = &ScanResult{
+			SeverityCounts: SeverityCounts{
+				Critical: 9999, High: 9999, Medium: 9999,
+				Low: 9999, Unknown: 0,
+			},
 		}
 	}
 	scanBlob, err := json.Marshal(struct {
@@ -543,7 +545,7 @@ func (h *Handler) writeScanSidecar(ctx context.Context, baseKey, ref, outImage s
 		ScannedAt time.Time      `json:"scanned_at"`
 	}{
 		Image:     ref,
-		Findings:  findings,
+		Findings:  findings.toMap(),
 		ScannedAt: time.Now().UTC(),
 	})
 	if err != nil {

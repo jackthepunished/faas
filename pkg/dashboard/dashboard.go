@@ -132,6 +132,32 @@ type DeploymentItem struct {
 	Kind      string
 	CreatedAt string
 	Error     string
+	// ScanSummary is the per-deploy grype scan chip rendered
+	// in the deploy list (issue #464 / ADR-055). Nil when no
+	// scan has run yet (the deploy is mid-pipeline or predates
+	// #464 entirely) — the template renders "scan pending"
+	// on the nil. Non-nil carries the Status string
+	// (complete|failed|skipped) plus the severity counts;
+	// the dashboard's deploy detail page (deployment_detail.html)
+	// is the drill-down surface for the full CVE list.
+	ScanSummary *ScanSummary
+}
+
+// ScanSummary is the per-deploy grype scan summary
+// (issue #464 / ADR-055). The full typed payload lives on
+// the deployments row (state.Deployment.ScanResult +
+// ScanStatus + ScannedAt); this struct is the dashboard's
+// trimmed projection for the deploy list view (counts only,
+// no CVE list — the list view would overflow with a 200-row
+// CVE list per deployment).
+type ScanSummary struct {
+	Status    string // complete|failed|skipped
+	ScannedAt string // RFC 3339 UTC; empty when not scanned
+	Critical  int
+	High      int
+	Medium    int
+	Low       int
+	Unknown   int
 }
 
 // CronItem is one row on the app detail page's crons tab.
@@ -171,6 +197,84 @@ type AppDetailData struct {
 	// section as a warning); an empty slice renders the empty-state
 	// line. RecentDeliveries per rule is capped at 5 by the handler.
 	Alerts *AlertDetailData
+}
+
+// DeploymentDetailData is the dashboard-facing payload for
+// /dashboard/apps/{slug}/deployments/{id} — the per-deploy grype
+// scan drill-down page (issue #464 / ADR-055 / PR-A). The shape
+// mixes the dashboard's existing DeploymentItem (the header line:
+// id, kind, status, created_at) with an optional Scan pointer
+// projected from state.Deployment by the handler. nil Scan means
+// the deploy is mid-pipeline (status: live but the scan hasn't
+// landed yet) — the template renders "scan pending" on the nil;
+// non-nil Scan carries the full typed payload (severity counts,
+// CVE list, error string on failed).
+//
+// We redefine the scan payload here (rather than importing
+// pkg/api.ScanResult) so pkg/dashboard stays free of api-package
+// imports — the same package-isolation rule that drove
+// AppListItem vs pkg/api's app-shaped DTO. The handler
+// (cmd/apid/handlers_dashboard.go::renderDeploymentDetail) is
+// the only thing that materialises this struct from the wire
+// types.
+type DeploymentDetailData struct {
+	App        AppListItem
+	Deployment DeploymentItem
+	Scan       *ScanPayload
+}
+
+// ScanPayload is the dashboard-local mirror of the per-deploy
+// grype scan payload. Status is the closed enum
+// {complete, failed, skipped, pending} — the dashboard reads
+// the same vocabulary pkg/api.ScanResult uses so the chips are
+// uniform across the list view (app_detail.html) and the
+// detail view (deployment_detail.html).
+//
+// Vulnerabilities is the dashboard's "top 10" view (handler-edge
+// cap in cmd/apid/handlers_dashboard.go::dashboardScanPayload);
+// TotalCount carries the pre-truncation count so the template
+// can render the AC #3 "Showing N of M" copy + a "View full scan"
+// link to GET /v1/deployments/{id}/scan. TotalCount == len(
+// Vulnerabilities) when the underlying scan had ≤ dashboardScanTopN
+// findings (the common case for small base images).
+type ScanPayload struct {
+	Status          string
+	ScannedAt       string
+	ScannerVersion  string
+	ImageDigest     string
+	SeverityCounts  SeverityBucket
+	Vulnerabilities []VulnerabilityRow
+	TotalCount      int
+	Error           string
+}
+
+// SeverityBucket mirrors the CRITICAL|HIGH|MEDIUM|LOW|UNKNOWN
+// buckets the dashboard reads off the deploy list chips too.
+// Kept as a flat struct (not a map) so go's html/template can
+// render `.Data.Scan.SeverityCounts.Critical` directly without
+// a map lookup.
+type SeverityBucket struct {
+	Critical int
+	High     int
+	Medium   int
+	Low      int
+	Unknown  int
+}
+
+// VulnerabilityRow is one row in the deployment-detail CVE
+// table. Trimmed from pkg/api.Vulnerability to the columns the
+// dashboard renders (id, severity, package, version, fixed_in,
+// paths). Paths is empty when the scan matched a package
+// without per-file locations — the template renders "—" on the
+// empty case (the existing dashboard convention for blank
+// cells, see FormatAlertError for the truncation precedent).
+type VulnerabilityRow struct {
+	ID       string
+	Severity string
+	Package  string
+	Version  string
+	FixedIn  string
+	Paths    []string
 }
 
 // AlertDetailData is the dashboard-facing payload for the alert-rules

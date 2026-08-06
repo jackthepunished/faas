@@ -798,6 +798,15 @@ type DeploymentResponse struct {
 	// deployment's own floor. Effective per-instance floor =
 	// max(app.EffectiveMinInstances(), d.EffectiveMinInstances()).
 	MinInstances int `json:"min_instances"`
+	// Scan is the per-deploy grype CVE scan surface (issue #464
+	// / ADR-055, PR-1). nil for pre-feature rows (the migration
+	// backfilled scan_status='skipped' + scan_result={reason:
+	// 'pre-feature'} on those, but the apid read path returns
+	// nil so the dashboard / CLI see a clean absence — the
+	// /scan route surfaces the 'skipped' sentinel for those
+	// rows). Always non-nil for post-feature rows in any of
+	// the {pending, complete, failed, skipped} states.
+	Scan *ScanResult `json:"scan,omitempty"`
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}

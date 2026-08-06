@@ -491,16 +491,19 @@ func ociPullTimeout() time.Duration {
 }
 
 // makeGrypeRunner wires an explicit Grype subprocess runner bound
-// to the operator-supplied binary path (issue #299). The default
-// empty string means "use PATH lookup", matching the production
-// behaviour pkg/imaged/grype.go's defaultGrypeRun implements
-// natively; cmd/imaged calls WithGrypeRun regardless so the
-// supply-chain gate at pkg/fcvm/manager.go::bringUpScanCheck
-// reports the real install location rather than a nil-stub
-// placeholder. The closure shape mirrors defaultGrypeRun — see
-// that function for the JSON parse contract.
-func makeGrypeRunner(bin string) func(ctx context.Context, dir string) (map[string]int, error) {
-	return func(ctx context.Context, dir string) (map[string]int, error) {
+// to the operator-supplied binary path (issue #299 / ADR-055
+// PR-2). The default empty string means "use PATH lookup",
+// matching the production behaviour pkg/imaged/grype.go's
+// defaultGrypeRun implements natively; cmd/imaged calls
+// WithGrypeRun regardless so the supply-chain gate at
+// pkg/fcvm/manager.go::bringUpScanCheck reports the real install
+// location rather than a nil-stub placeholder. The closure
+// shape mirrors defaultGrypeRun — see that function for the
+// JSON parse contract. The PR-2 refactor changed the return
+// type from map[string]int to *imaged.ScanResult; the
+// underlying subprocess invocation is unchanged.
+func makeGrypeRunner(bin string) func(ctx context.Context, dir string) (*imaged.ScanResult, error) {
+	return func(ctx context.Context, dir string) (*imaged.ScanResult, error) {
 		if bin != "" {
 			return imaged.RunGrypeAt(ctx, bin, dir)
 		}

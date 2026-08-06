@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.app_response_eviction_priority import AppResponseEvictionPriority, check_app_response_eviction_priority
 from ..models.app_response_runtime import AppResponseRuntime, check_app_response_runtime
 from ..models.app_response_type import AppResponseType, check_app_response_type
 from ..types import UNSET, Unset
@@ -79,6 +80,9 @@ class AppResponse:
     warm_snapshot_min_ms: int | Unset = UNSET
     """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
     [100, 60000]."""
+    eviction_priority: AppResponseEvictionPriority | Unset = UNSET
+    """Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper
+    behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction."""
     require_authn: bool | Unset = UNSET
     """Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer
     <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby
@@ -160,6 +164,10 @@ class AppResponse:
 
         warm_snapshot_min_ms = self.warm_snapshot_min_ms
 
+        eviction_priority: str | Unset = UNSET
+        if not isinstance(self.eviction_priority, Unset):
+            eviction_priority = self.eviction_priority
+
         require_authn = self.require_authn
 
         field_dict: dict[str, Any] = {}
@@ -202,6 +210,8 @@ class AppResponse:
             field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
         if warm_snapshot_min_ms is not UNSET:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
+        if eviction_priority is not UNSET:
+            field_dict["eviction_priority"] = eviction_priority
         if require_authn is not UNSET:
             field_dict["require_authn"] = require_authn
 
@@ -316,6 +326,13 @@ class AppResponse:
 
         warm_snapshot_min_ms = d.pop("warm_snapshot_min_ms", UNSET)
 
+        _eviction_priority = d.pop("eviction_priority", UNSET)
+        eviction_priority: AppResponseEvictionPriority | Unset
+        if isinstance(_eviction_priority, Unset):
+            eviction_priority = UNSET
+        else:
+            eviction_priority = check_app_response_eviction_priority(_eviction_priority)
+
         require_authn = d.pop("require_authn", UNSET)
 
         app_response = cls(
@@ -342,6 +359,7 @@ class AppResponse:
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
+            eviction_priority=eviction_priority,
             require_authn=require_authn,
         )
 

@@ -133,17 +133,30 @@ func cmdDeploymentsAll(ctx context.Context, client *api.Client) int {
 	return 0
 }
 
-// cmdDeployment implements `gregale deployment <id>` (GET /v1/deployments/{id}).
-// Mirrors the read branch of cmdApp (commands2.go:69) — single positional
-// id, JSON single record, human multi-line detail block.
+// cmdDeployment implements `gregale deployment <id> [--show-scan]`
+// (GET /v1/deployments/{id}, plus GET /v1/deployments/{id}/scan
+// when --show-scan is set). Mirrors the read branch of cmdApp
+// (commands2.go:69) — single positional id, JSON single record,
+// human multi-line detail block.
+//
+// --show-scan is a flag (not a separate `gregale scan <id>`
+// subcommand) because `gregale scan` is already taken by the
+// Phase 3 repo-decomposition dry-run surface at
+// cmd/gregale/commands_decompose.go:49. The flag-vs-subcommand
+// split is the smallest-mess resolution of the name collision.
 func cmdDeployment(args []string) int {
-	if len(args) != 1 {
-		PrintUsage(os.Stderr, "usage: gregale deployment <id>", "deployment")
+	fs := flag.NewFlagSet("deployment", flag.ContinueOnError)
+	showScan := fs.Bool("show-scan", false, "fetch + print the per-deploy grype scan payload (GET /v1/deployments/{id}/scan)")
+	if err := fs.Parse(args); err != nil {
 		return 1
 	}
-	id := args[0]
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan]", "deployment")
+		return 1
+	}
+	id := fs.Arg(0)
 	if !deploymentIDPattern.MatchString(id) {
-		PrintUsage(os.Stderr, "usage: gregale deployment <id>   (id is 32 hex chars)", "deployment")
+		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan]   (id is 32 hex chars)", "deployment")
 		return 1
 	}
 	client, err := authedClient()
@@ -155,7 +168,22 @@ func cmdDeployment(args []string) int {
 		return printErr("Could not fetch deployment", err)
 	}
 	if jsonOutput {
-		return jsonOut(writeJSON(d))
+		if !*showScan {
+			return jsonOut(writeJSON(d))
+		}
+		sc, scanErr := client.GetDeploymentScan(context.Background(), id)
+		if scanErr != nil {
+			// Non-fatal in JSON mode: return the deployment as-is so
+			// an operator script never silently drops the payload.
+			// The CLI exit code still carries the error.
+			_ = scanErr
+			return jsonOut(writeJSON(d))
+		}
+		type deploymentWithScan struct {
+			Deployment any `json:"deployment"`
+			Scan       any `json:"scan"`
+		}
+		return jsonOut(writeJSON(deploymentWithScan{Deployment: d, Scan: sc}))
 	}
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "id:", d.ID)
 	_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "app_id:", d.AppID)
@@ -171,6 +199,33 @@ func cmdDeployment(args []string) int {
 	}
 	if d.ErrorCode != "" {
 		_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "error_code:", d.ErrorCode)
+	}
+	if *showScan {
+		sc, scanErr := client.GetDeploymentScan(context.Background(), id)
+		if scanErr != nil {
+			_, _ = fmt.Fprintf(osStdout, "%-14s (scan unavailable: %v)\n", "scan:", scanErr)
+		} else {
+			_, _ = fmt.Fprintf(osStdout, "\n%-14s %s\n", "scan_status:", sc.Status)
+			if sc.ScannedAt != "" {
+				_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "scanned_at:", sc.ScannedAt)
+			}
+			if sc.ScannerVersion != "" {
+				_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "scanner_version:", sc.ScannerVersion)
+			}
+			if sc.ImageDigest != "" {
+				_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "image_digest:", sc.ImageDigest)
+			}
+			_, _ = fmt.Fprintf(osStdout, "%-14s C=%d H=%d M=%d L=%d U=%d\n", "severity_counts:", sc.SeverityCounts.Critical, sc.SeverityCounts.High, sc.SeverityCounts.Medium, sc.SeverityCounts.Low, sc.SeverityCounts.Unknown)
+			if sc.Error != "" {
+				_, _ = fmt.Fprintf(osStdout, "%-14s %s\n", "scan_error:", sc.Error)
+			}
+			if len(sc.Vulnerabilities) > 0 {
+				_, _ = fmt.Fprintf(osStdout, "%-14s %d\n", "vulnerabilities:", len(sc.Vulnerabilities))
+				for _, v := range sc.Vulnerabilities {
+					_, _ = fmt.Fprintf(osStdout, "  - %s [%s] %s %s (fixed in %s)\n", v.ID, v.Severity, v.Package, v.Version, v.FixedIn)
+				}
+			}
+		}
 	}
 	return 0
 }

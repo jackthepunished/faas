@@ -6,6 +6,18 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.update_app_request_eviction_priority_type_1 import (
+    UpdateAppRequestEvictionPriorityType1,
+    check_update_app_request_eviction_priority_type_1,
+)
+from ..models.update_app_request_eviction_priority_type_2_type_1 import (
+    UpdateAppRequestEvictionPriorityType2Type1,
+    check_update_app_request_eviction_priority_type_2_type_1,
+)
+from ..models.update_app_request_eviction_priority_type_3_type_1 import (
+    UpdateAppRequestEvictionPriorityType3Type1,
+    check_update_app_request_eviction_priority_type_3_type_1,
+)
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -49,6 +61,18 @@ class UpdateAppRequest:
     warm_snapshot_min_ms: int | None | Unset = UNSET
     """Per-app time-since-first-ready threshold for warm-tier capture, milliseconds (issue #470 / ADR-055). Range
     [100, 60000]. Omitted → no change."""
+    eviction_priority: (
+        None
+        | Unset
+        | UpdateAppRequestEvictionPriorityType1
+        | UpdateAppRequestEvictionPriorityType2Type1
+        | UpdateAppRequestEvictionPriorityType3Type1
+    ) = UNSET
+    """Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper
+    behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction (every best_effort candidate is
+    drained before any reserved is parked). Plan-gated upstream: Free PATCH 'reserved' returns 402
+    plan_eviction_priority_reserved_not_allowed. Per-account cap (Hobby 1, Pro 2, Scale 4): 422
+    plan_eviction_priority_reserved_quota when exhausted. Omitted → no change."""
     require_authn: bool | None | Unset = UNSET
     """Per-deployment token-gate flag (issue #560). Omitted → no change. PATCH-true on Free/Hobby is rejected with
     403 plan_require_authn_not_allowed."""
@@ -135,6 +159,18 @@ class UpdateAppRequest:
         else:
             warm_snapshot_min_ms = self.warm_snapshot_min_ms
 
+        eviction_priority: None | str | Unset
+        if isinstance(self.eviction_priority, Unset):
+            eviction_priority = UNSET
+        elif isinstance(self.eviction_priority, str):
+            eviction_priority = self.eviction_priority
+        elif isinstance(self.eviction_priority, str):
+            eviction_priority = self.eviction_priority
+        elif isinstance(self.eviction_priority, str):
+            eviction_priority = self.eviction_priority
+        else:
+            eviction_priority = self.eviction_priority
+
         require_authn: bool | None | Unset
         if isinstance(self.require_authn, Unset):
             require_authn = UNSET
@@ -170,6 +206,8 @@ class UpdateAppRequest:
             field_dict["warm_snapshot_min_requests"] = warm_snapshot_min_requests
         if warm_snapshot_min_ms is not UNSET:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
+        if eviction_priority is not UNSET:
+            field_dict["eviction_priority"] = eviction_priority
         if require_authn is not UNSET:
             field_dict["require_authn"] = require_authn
 
@@ -299,6 +337,54 @@ class UpdateAppRequest:
 
         warm_snapshot_min_ms = _parse_warm_snapshot_min_ms(d.pop("warm_snapshot_min_ms", UNSET))
 
+        def _parse_eviction_priority(
+            data: object,
+        ) -> (
+            None
+            | Unset
+            | UpdateAppRequestEvictionPriorityType1
+            | UpdateAppRequestEvictionPriorityType2Type1
+            | UpdateAppRequestEvictionPriorityType3Type1
+        ):
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                eviction_priority_type_1 = check_update_app_request_eviction_priority_type_1(data)
+
+                return eviction_priority_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                eviction_priority_type_2_type_1 = check_update_app_request_eviction_priority_type_2_type_1(data)
+
+                return eviction_priority_type_2_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                eviction_priority_type_3_type_1 = check_update_app_request_eviction_priority_type_3_type_1(data)
+
+                return eviction_priority_type_3_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                None
+                | Unset
+                | UpdateAppRequestEvictionPriorityType1
+                | UpdateAppRequestEvictionPriorityType2Type1
+                | UpdateAppRequestEvictionPriorityType3Type1,
+                data,
+            )
+
+        eviction_priority = _parse_eviction_priority(d.pop("eviction_priority", UNSET))
+
         def _parse_require_authn(data: object) -> bool | None | Unset:
             if data is None:
                 return data
@@ -322,6 +408,7 @@ class UpdateAppRequest:
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
+            eviction_priority=eviction_priority,
             require_authn=require_authn,
         )
 

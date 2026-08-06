@@ -758,8 +758,12 @@ CREATE TABLE public.deployments (
     override_env_secrets jsonb,
     override_port integer,
     override_healthcheck jsonb,
+    scan_result jsonb,
+    scan_status text,
+    scanned_at timestamp with time zone,
     CONSTRAINT deployments_commit_sha_shape_chk CHECK (((commit_sha IS NULL) OR (((char_length(commit_sha) >= 7) AND (char_length(commit_sha) <= 64)) AND (commit_sha ~ '^[0-9a-f]+$'::text)))),
     CONSTRAINT deployments_kind_check CHECK ((kind = ANY (ARRAY['image'::text, 'tarball'::text, 'dockerfile'::text, 'github'::text]))),
+    CONSTRAINT deployments_scan_status_chk CHECK ((scan_status IS NULL) OR (scan_status = ANY (ARRAY['pending'::text, 'complete'::text, 'failed'::text, 'skipped'::text]))),
     CONSTRAINT deployments_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'building'::text, 'imaging'::text, 'snapshotting'::text, 'live'::text, 'failed'::text, 'superseded'::text])))
 );
 
@@ -2098,6 +2102,13 @@ CREATE INDEX deployments_app_idx ON public.deployments USING btree (app_id, crea
 --
 
 CREATE INDEX deployments_failed_error_code_idx ON public.deployments USING btree (error_code) WHERE (status = 'failed'::text);
+
+
+--
+-- Name: deployments_app_scan_complete_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX deployments_app_scan_complete_idx ON public.deployments USING btree (app_id, scanned_at DESC) WHERE (scan_status = 'complete'::text);
 
 
 --

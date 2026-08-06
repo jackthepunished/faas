@@ -139,12 +139,14 @@ export type { RotateOrgAPIKeyRequest } from './models/RotateOrgAPIKeyRequest.js'
 export type { RotateOrgAPIKeyResponse } from './models/RotateOrgAPIKeyResponse.js';
 export type { ScalingPolicy } from './models/ScalingPolicy.js';
 export type { ScalingTarget } from './models/ScalingTarget.js';
+export type { ScanResult } from './models/ScanResult.js';
 export type { SecretKey } from './models/SecretKey.js';
 export type { SessionInfo } from './models/SessionInfo.js';
 export type { SessionListResponse } from './models/SessionListResponse.js';
 export type { SessionsRevokeAllResponse } from './models/SessionsRevokeAllResponse.js';
 export type { SetGraceWindowRequest } from './models/SetGraceWindowRequest.js';
 export type { SetPasswordRequest } from './models/SetPasswordRequest.js';
+export type { SeverityCounts } from './models/SeverityCounts.js';
 export type { Sidecar } from './models/Sidecar.js';
 export type { Slug } from './models/Slug.js';
 export type { StorageUsageListResponse } from './models/StorageUsageListResponse.js';
@@ -160,6 +162,7 @@ export type { UpdateDeploymentRequest } from './models/UpdateDeploymentRequest.j
 export type { UsageExportResponse } from './models/UsageExportResponse.js';
 export type { UsageResponse } from './models/UsageResponse.js';
 export type { UsageSummaryResponse } from './models/UsageSummaryResponse.js';
+export type { Vulnerability } from './models/Vulnerability.js';
 export type { WakeTimelineEvent } from './models/WakeTimelineEvent.js';
 export type { WakeTimelineResponse } from './models/WakeTimelineResponse.js';
 
