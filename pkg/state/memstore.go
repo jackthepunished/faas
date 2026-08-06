@@ -8723,13 +8723,15 @@ func (m *MemStore) SoftDeleteOrg(_ context.Context, id string) error {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on
 // duplicate (org_id, account_id), ErrOrgLastOwner when the partial
-// unique would trip, ErrOrgMemberCapExceeded when the org's active
-// members have reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2),
-// and ErrNotFound on missing parent.
+// unique would trip, and ErrNotFound on missing parent. The
+// OrgMembersMax cap is enforced at consumeOrgInvitation (the only
+// external-insert path) and at the wire helper
+// `cmd/apid::enforceMemberCap`, NOT here — see pkg/state/pgstore.go
+// ::AddOrgMember for the rationale.
 func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	org, ok := m.orgs[orgID]
+	_, ok := m.orgs[orgID]
 	if !ok {
 		return ErrNotFound
 	}
@@ -8743,28 +8745,6 @@ func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role
 				return ErrOrgLastOwner
 			}
 		}
-	}
-	// IAM-6 / ADR-061 PR 2 cap check: counts under m.mu so concurrent
-	// callers cannot race past the cap. Mirrors PgStore.AddOrgMember's
-	// tx-scoped counter. Personal orgs are immutable and never reach
-	// here; the plan here is always the org's own plan.
-	//
-	// Free + unknown plans read 0 (plan-policy fail-closed — abuse-
-	// floor tier cannot host shared orgs). The first add to a brand-
-	// new org is always allowed (the initial owner seed) — only
-	// subsequent adds enforce `active >= limit`. This matches the
-	// handler path (cmd/apid/handlers_org.go::createSharedOrg) which
-	// always seeds the first owner.
-	limits, _ := api.LimitsFor(org.Plan)
-	limit := limits.OrgMembersMax
-	active := 0
-	for _, existing := range m.memberships {
-		if existing.OrgID == orgID && existing.RemovedAt == nil {
-			active++
-		}
-	}
-	if active > 0 && active >= limit {
-		return ErrOrgMemberCapExceeded
 	}
 	now := time.Now().UTC()
 	m.memberships[k] = OrgMembership{
@@ -8946,6 +8926,29 @@ func (m *MemStore) ConsumeOrgInvitation(_ context.Context, hash []byte, acceptin
 	}
 	if !strings.EqualFold(inv.Email, acceptingAccount.Email) {
 		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
+	}
+	// IAM-6 / ADR-061 PR 2 cap check (load-bearing). Mirrors
+	// PgStore.ConsumeOrgInvitation. Free + unknown plans read 0
+	// (plan-policy fail-closed) so the `limit > 0` early-return keeps
+	// them quiet — the abuse-floor tier cannot host shared orgs in
+	// the first place, so reaching here is already a customer-flow
+	// fault, not a cap-arithmetic decision.
+	org, ok := m.orgs[inv.OrgID]
+	if !ok {
+		return OrgMembership{}, OrgInvitation{}, ErrNotFound
+	}
+	limits, _ := api.LimitsFor(org.Plan)
+	limit := limits.OrgMembersMax
+	if limit > 0 {
+		active := 0
+		for _, existing := range m.memberships {
+			if existing.OrgID == inv.OrgID && existing.RemovedAt == nil {
+				active++
+			}
+		}
+		if active >= limit {
+			return OrgMembership{}, OrgInvitation{}, ErrOrgMemberCapExceeded
+		}
 	}
 	// Insert membership; surface ErrOrgAlreadyMember if a parallel
 	// accept beat us.

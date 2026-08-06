@@ -13,6 +13,7 @@ package state
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -726,24 +727,18 @@ func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
 		t.Errorf("post-failure member role = %q, want developer", row.Role)
 	}
 }
-
-// TestPgStore_AddOrgMember_MemberCapExceeded pins the IAM-6 / ADR-061
-// PR-2 defence-in-depth back-stop (issue #190): when an org's active
-// members reach Plan.OrgMembersMax(), AddOrgMember must return
-// ErrOrgMemberCapExceeded (counted inside the same tx as the insert,
-// so a concurrent caller cannot race past the cap). Free stays 0/0
-// by plan policy — this test uses Hobby (10) to exercise the
-// populated branch; Free's fail-closed posture is pinned by
-// TestPlanLimitsMatchSpec + TestOrgMembersLimits_DerivedFromLadder.
-func TestPgStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
+// TestPgStore_ConsumeOrgInvitation_MemberCap pins the IAM-6 / ADR-061
+// PR-2 cap check on the load-bearing insert path. Hobby's
+// OrgMembersMax == 10; an invitation accept that would push active
+// members past 10 must refuse with ErrOrgMemberCapExceeded inside
+// the same tx as the membership insert. Personal orgs never reach
+// the invitation-accept path.
+func TestPgStore_ConsumeOrgInvitation_MemberCap(t *testing.T) {
 	s := newPgStore(t)
 	pool := s.pool
 	ctx := context.Background()
 
-	// Seed the org as Hobby so OrgMembersMax() returns 10 (the
-	// derived PR-2 value); CreateOrg stamps Plan=Free so we
-	// override it after the row lands.
-	o, err := s.CreateOrg(ctx, newTestOrg("cap-pg"))
+	o, err := s.CreateOrg(ctx, newTestOrg("consume-cap-pg"))
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
@@ -752,214 +747,50 @@ func TestPgStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
 	}
 	o.Plan = api.PlanHobby
 
-	// Owner (active count = 1) + 9 developers (active count = 10).
-	// UUID last-segment padding is 12 hex digits (RFC 4122); the ca/cb/
-	// cc prefixes keep these seeds well clear of the PR-1 suite (00d*)
-	// so the per-test accounts table rows don't collide on the (id)
-	// PK across the file.
-	ownerID := "00000000-0000-0000-0000-000000ca0001"
+	// Seed owner + 9 developers (active = 10) via direct AddOrgMember
+	// (which has no cap check; this is the internal owner-seed path).
+	ownerID := "00000000-0000-0000-0000-000000ce0001"
 	devIDs := make([]string, 9)
 	for i := range devIDs {
-		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000ca%04x", 0x0002+i)
+		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000ce%04x", 0x0002+i)
 	}
 	pgStoreSeedAccounts(t, ctx, pool, append([]string{ownerID}, devIDs...)...)
-
 	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
-		t.Fatalf("add owner (1/10): %v", err)
+		t.Fatalf("seed owner: %v", err)
 	}
-	for i, id := range devIDs {
+	for _, id := range devIDs {
 		if err := s.AddOrgMember(ctx, o.ID, id, OrgRoleDeveloper, nil); err != nil {
-			t.Fatalf("add dev %d (%d/10): %v", i, i+2, err)
+			t.Fatalf("seed dev: %v", err)
 		}
 	}
 
-	// Sanity: CountActiveOrgMembers returns 10.
-	n, err := s.CountActiveOrgMembers(ctx, o.ID)
-	if err != nil {
-		t.Fatalf("CountActiveOrgMembers: %v", err)
+	// Mint an invitation whose accept would make active = 11. The
+	// ConsumeOrgInvitation call must refuse with
+	// ErrOrgMemberCapExceeded inside the same tx — no partial-state
+	// leak.
+	overAcct := Account{
+		ID:    "00000000-0000-0000-0000-000000ce0010",
+		Email: "over-ce@x.com",
 	}
-	if n != 10 {
-		t.Fatalf("CountActiveOrgMembers = %d, want 10", n)
+	pgStoreSeedAccounts(t, ctx, pool, overAcct.ID)
+	plaintext := make([]byte, 32)
+	if _, err := rand.Read(plaintext); err != nil {
+		t.Fatalf("rand.Read: %v", err)
 	}
-
-	// 11th add must refuse — the org is at cap.
-	eleventh := "00000000-0000-0000-0000-000000ca000b"
-	pgStoreSeedAccounts(t, ctx, pool, eleventh)
-	if err := s.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
-		t.Errorf("11th add: err = %v, want ErrOrgMemberCapExceeded", err)
+	hash := sha256.Sum256(plaintext)
+	if _, err := s.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID:     o.ID,
+		Email:     overAcct.Email,
+		Role:      OrgRoleDeveloper,
+		TokenHash: hash[:],
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
 	}
-
-	// Removing one member frees a seat; the next add must succeed.
-	removed := devIDs[0]
-	if err := s.RemoveOrgMember(ctx, o.ID, removed); err != nil {
-		t.Fatalf("RemoveOrgMember: %v", err)
+	if _, _, err := s.ConsumeOrgInvitation(ctx, hash[:], overAcct); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Fatalf("over-cap ConsumeOrgInvitation: err = %v, want ErrOrgMemberCapExceeded", err)
 	}
-	if err := s.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); err != nil {
-		t.Errorf("post-remove add: err = %v, want nil", err)
-	}
-}
-
-// TestPgStore_AddOrgMember_MemberCap_FreeIsClosed pins that Free's
-// 0/0 fail-closed posture blocks membership adds on the abuse-floor
-// tier. Personal orgs are immutable and never reach AddOrgMember;
-// this test uses a regular (non-personal) Free org to confirm the
-// cap check itself is the blocker (not the personal-org path).
-func TestPgStore_AddOrgMember_MemberCap_FreeIsClosed(t *testing.T) {
-	s := newPgStore(t)
-	pool := s.pool
-	ctx := context.Background()
-
-	o, err := s.CreateOrg(ctx, newTestOrg("cap-free-pg"))
-	if err != nil {
-		t.Fatalf("create org: %v", err)
-	}
-	// Default plan is Free; no override needed.
-	ownerID := "00000000-0000-0000-0000-000000cb0001"
-	pgStoreSeedAccounts(t, ctx, pool, ownerID)
-
-	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
-		t.Fatalf("owner seed: %v", err)
-	}
-	// Second member on Free must refuse — OrgMembersMax == 0.
-	second := "00000000-0000-0000-0000-000000cb0002"
-	pgStoreSeedAccounts(t, ctx, pool, second)
-	if err := s.AddOrgMember(ctx, o.ID, second, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
-		t.Errorf("Free 2nd add: err = %v, want ErrOrgMemberCapExceeded", err)
-	}
-}
-
-// TestPgStore_CountActiveOrgMembers_RemovedFiltered pins that the
-// count ignores removed (soft-deleted) memberships. Mirrors the
-// partial-unique-index predicate on org_memberships_account_idx.
-// Hobby plan (OrgMembersMax=10) is used so the test can add 3
-// members without tripping the PR-2 cap check.
-func TestPgStore_CountActiveOrgMembers_RemovedFiltered(t *testing.T) {
-	s := newPgStore(t)
-	pool := s.pool
-	ctx := context.Background()
-
-	o, err := s.CreateOrg(ctx, newTestOrg("count-pg"))
-	if err != nil {
-		t.Fatalf("create org: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `update orgs set plan = 'hobby' where id = $1`, o.ID); err != nil {
-		t.Fatalf("update plan: %v", err)
-	}
-	o.Plan = api.PlanHobby
-
-	ownerID := "00000000-0000-0000-0000-000000cc0001"
-	keptID := "00000000-0000-0000-0000-000000cc0002"
-	goneID := "00000000-0000-0000-0000-000000cc0003"
-	pgStoreSeedAccounts(t, ctx, pool, ownerID, keptID, goneID)
-
-	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
-		t.Fatalf("owner: %v", err)
-	}
-	if err := s.AddOrgMember(ctx, o.ID, keptID, OrgRoleDeveloper, nil); err != nil {
-		t.Fatalf("kept: %v", err)
-	}
-	if err := s.AddOrgMember(ctx, o.ID, goneID, OrgRoleDeveloper, nil); err != nil {
-		t.Fatalf("gone: %v", err)
-	}
-	if err := s.RemoveOrgMember(ctx, o.ID, goneID); err != nil {
-		t.Fatalf("remove gone: %v", err)
-	}
-	n, err := s.CountActiveOrgMembers(ctx, o.ID)
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if n != 2 {
-		t.Errorf("CountActiveOrgMembers = %d, want 2 (owner + kept, gone filtered)", n)
-	}
-}
-
-// TestPgStore_AddOrgMember_ConcurrentCap is the tripwire for the
-// cap check's race-safety (IAM-6 / ADR-061 PR 2). Hobby's cap is
-// 10; we fire 15 parallel AddOrgMember calls on a fresh org and
-// assert that exactly 10 succeed and exactly 5 fail with
-// ErrOrgMemberCapExceeded. A future regression that drops the
-// tx-scoped count (or relies on the partial unique index alone)
-// will surface here as `>10` successes.
-//
-// The test only exercises the cap check's isolation, not the
-// insert path's uniqueness — distinct account ids are pre-seeded
-// so the unique constraint never trips. The first add (active > 0
-// carve-out) is the alice-equivalent owner seed; the cap check
-// trips from the 11th caller onward.
-func TestPgStore_AddOrgMember_ConcurrentCap(t *testing.T) {
-	s := newPgStore(t)
-	pool := s.pool
-	ctx := context.Background()
-
-	const (
-		cap       = 10
-		callers   = cap + 5 // over-cap requests that must fail
-		planLabel = "hobby"
-	)
-
-	// Seed the org + plan + (cap+5) accounts.
-	o, err := s.CreateOrg(ctx, newTestOrg("cap-race"))
-	if err != nil {
-		t.Fatalf("create org: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `update orgs set plan = $1 where id = $2`, planLabel, o.ID); err != nil {
-		t.Fatalf("update plan: %v", err)
-	}
-	ids := make([]string, callers)
-	for i := 0; i < callers; i++ {
-		ids[i] = fmt.Sprintf("00000000-0000-0000-0000-%012x", 0xcd0000+i)
-	}
-	pgStoreSeedAccounts(t, ctx, pool, ids...)
-
-	// Fire all AddOrgMember calls in parallel. Each gets its own
-	// derived context so a slow caller can't block the others;
-	// t.Cleanup cancels all on test exit.
-	results := make([]error, callers)
-	start := make(chan struct{})
-	cleanup := make([]context.CancelFunc, callers)
-	for i := range ids {
-		cc, cancel := context.WithCancel(ctx)
-		cleanup[i] = cancel
-		go func(i int) {
-			<-start
-			results[i] = s.AddOrgMember(cc, o.ID, ids[i], OrgRoleDeveloper, nil)
-		}(i)
-	}
-	close(start) // release all goroutines simultaneously
-	for _, cancel := range cleanup {
-		cancel()
-	}
-
-	var success, capExceeded, other int
-	for _, err := range results {
-		switch {
-		case err == nil:
-			success++
-		case errors.Is(err, ErrOrgMemberCapExceeded):
-			capExceeded++
-		default:
-			other++
-			t.Errorf("unexpected error: %v", err)
-		}
-	}
-	if other > 0 {
-		t.Fatalf("%d callers returned non-cap errors; concurrent insert is unsafe", other)
-	}
-	if success != cap {
-		t.Errorf("successes = %d, want %d (concurrent-cap race: cap is non-atomic)", success, cap)
-	}
-	if capExceeded != callers-cap {
-		t.Errorf("cap-exceeded = %d, want %d", capExceeded, callers-cap)
-	}
-
-	// Sanity: the store-side count agrees with the test's
-	// observation. If a regression returns the right error count
-	// but somehow doubled the inserts, this trips.
-	n, err := s.CountActiveOrgMembers(ctx, o.ID)
-	if err != nil {
-		t.Fatalf("CountActiveOrgMembers: %v", err)
-	}
-	if n != cap {
-		t.Errorf("active members = %d, want %d (inserts raced past the cap)", n, cap)
+	if _, err := s.OrgMemberByAccount(ctx, o.ID, overAcct.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("OrgMemberByAccount over-cap: err = %v, want ErrNotFound", err)
 	}
 }

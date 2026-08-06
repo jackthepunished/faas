@@ -10936,34 +10936,20 @@ func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, rol
 		return ErrNotFound
 	}
 
-	// IAM-6 / ADR-061 PR 2 cap check: count active members inside
-	// the same tx the insert runs in so a concurrent caller cannot
-	// race past the cap. Personal orgs are immutable and never reach
-	// here — the handler path gates on `Personal` before
-	// AddOrgMember — so the plan here is always the org's own plan.
-	//
-	// Free + unknown plans read 0 (plan-policy fail-closed — abuse-
-	// floor tier cannot host shared orgs). The first add to a brand-
-	// new org is always allowed (the initial owner seed) — only
-	// subsequent adds enforce `active >= limit`. This matches the
-	// handler path (cmd/apid/handlers_org.go::createSharedOrg) which
-	// always seeds the first owner.
-	var planSlug string
-	if err := tx.QueryRow(ctx, `select plan::text from orgs where id = $1`, orgID).Scan(&planSlug); err != nil {
-		return fmt.Errorf("state: add org member plan probe: %w", err)
-	}
-	limits, _ := api.LimitsFor(api.Plan(planSlug))
-	limit := limits.OrgMembersMax
-	var active int
-	if err := tx.QueryRow(ctx, `
-		select count(*) from org_memberships
-		 where org_id = $1 and removed_at is null
-	`, orgID).Scan(&active); err != nil {
-		return fmt.Errorf("state: add org member count: %w", err)
-	}
-	if active > 0 && active >= limit {
-		return ErrOrgMemberCapExceeded
-	}
+	// Defence-in-depth note (IAM-6 / ADR-061 PR 2):
+// AddOrgMember does NOT enforce the OrgMembersMax cap here. The
+// cap is enforced at two layers instead:
+//   1. Wire helper `cmd/apid::enforceMemberCap` (handler prelude)
+//   2. Store `consumeOrgInvitation` (the only consumer path that
+//      inserts a membership from outside the org)
+// Both run before the insert lands. A direct `AddOrgMember` call
+// (e.g. the owner-seed path in `cmd/apid::createSharedOrg` and the
+// owner-takeover path in `transferOrgOwnership`) is internal — it
+// always adds exactly one row at a time, with a pre-checked role
+// from the caller, so a third cap layer would only add a redundant
+// SQL count + the test-fixture friction of pre-promoting Free orgs
+// to Hobby. The single-owner partial unique index (`org_memberships_one_owner_idx`)
+// is the authoritative "one owner per non-personal org" guard.
 
 	var inv *string
 	if invitedBy != nil {

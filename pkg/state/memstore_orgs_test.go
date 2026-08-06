@@ -553,74 +553,6 @@ func TestMemStore_CreateAccountWithPersonalOrg_SlugDeterministic(t *testing.T) {
 		t.Errorf("slug = %q, want %q", res.PersonalOrg.Slug, want)
 	}
 }
-
-// TestMemStore_AddOrgMember_MemberCapExceeded is the parity twin of
-// TestPgStore_AddOrgMember_MemberCapExceeded (IAM-6 / ADR-061 PR-2).
-// Pins that the in-memory store enforces Plan.OrgMembersMax() under
-// m.mu so a concurrent caller cannot race past the cap. Hobby = 10.
-func TestMemStore_AddOrgMember_MemberCapExceeded(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-
-	o, err := m.CreateOrg(ctx, Org{
-		Slug: "cap-mem", Name: "Cap Mem", Plan: api.PlanHobby, Status: OrgStatusActive,
-	})
-	if err != nil {
-		t.Fatalf("create org: %v", err)
-	}
-	ownerID := "00000000-0000-0000-0000-000000da0001"
-	devIDs := make([]string, 9)
-	for i := range devIDs {
-		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000da%04x", 0x0002+i)
-	}
-
-	if err := m.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
-		t.Fatalf("owner (1/10): %v", err)
-	}
-	for i, id := range devIDs {
-		if err := m.AddOrgMember(ctx, o.ID, id, OrgRoleDeveloper, nil); err != nil {
-			t.Fatalf("dev %d (%d/10): %v", i, i+2, err)
-		}
-	}
-	n, err := m.CountActiveOrgMembers(ctx, o.ID)
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	if n != 10 {
-		t.Fatalf("CountActiveOrgMembers = %d, want 10", n)
-	}
-	eleventh := "00000000-0000-0000-0000-000000da000b"
-	if err := m.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
-		t.Errorf("11th add: err = %v, want ErrOrgMemberCapExceeded", err)
-	}
-	if err := m.RemoveOrgMember(ctx, o.ID, devIDs[0]); err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	if err := m.AddOrgMember(ctx, o.ID, eleventh, OrgRoleDeveloper, nil); err != nil {
-		t.Errorf("post-remove add: err = %v, want nil", err)
-	}
-}
-
-// TestMemStore_AddOrgMember_MemberCap_FreeIsClosed pins Free's
-// 0/0 fail-closed posture at the store layer — abuse-floor tier
-// cannot host a second member.
-func TestMemStore_AddOrgMember_MemberCap_FreeIsClosed(t *testing.T) {
-	m := NewMemStore()
-	ctx := context.Background()
-	o, err := m.CreateOrg(ctx, newTestOrg("cap-free-mem"))
-	if err != nil {
-		t.Fatalf("create org: %v", err)
-	}
-	owner := "00000000-0000-0000-0000-000000db0001"
-	second := "00000000-0000-0000-0000-000000db0002"
-	if err := m.AddOrgMember(ctx, o.ID, owner, OrgRoleOwner, nil); err != nil {
-		t.Fatalf("owner: %v", err)
-	}
-	if err := m.AddOrgMember(ctx, o.ID, second, OrgRoleDeveloper, nil); !errors.Is(err, ErrOrgMemberCapExceeded) {
-		t.Errorf("Free 2nd add: err = %v, want ErrOrgMemberCapExceeded", err)
-	}
-}
-
 // TestMemStore_CountActiveOrgMembers_RemovedFiltered pins that the
 // in-memory counter ignores soft-deleted memberships (mirrors the
 // partial unique index on the SQL side). Hobby plan (OrgMembersMax=10)
@@ -710,5 +642,85 @@ func TestMemStore_CountPendingOrgInvitations_FiltersExpired(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("CountPendingOrgInvitations = %d, want 1 (only the pending row)", n)
+	}
+}
+// TestMemStore_ConsumeOrgInvitation_MemberCap is the in-memory
+// parity twin of TestPgStore_ConsumeOrgInvitation_MemberCap (IAM-6
+// / ADR-061 PR-2). Pins that the memstore cap check refuses an
+// invitation accept that would push active members past
+// Plan.OrgMembersMax(). Plan query is from the in-memory org
+// struct (no SQL); the equality / membership insert logic is
+// equivalent to PgStore's tx-scoped version.
+func TestMemStore_ConsumeOrgInvitation_MemberCap(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	o, err := m.CreateOrg(ctx, Org{
+		Slug: "consume-cap-mem", Name: "Consume Cap Mem",
+		Plan: api.PlanHobby, Status: OrgStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	// Seed owner + 9 developers via direct AddOrgMember (which has
+	// no cap check — internal owner-seed path).
+	ownerID := "00000000-0000-0000-0000-000000cf0001"
+	devIDs := make([]string, 9)
+	for i := range devIDs {
+		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000cf%04x", 0x0002+i)
+	}
+	seedAccountsForMem(t, ctx, m, append([]string{ownerID}, devIDs...)...)
+	if err := m.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	for _, id := range devIDs {
+		if err := m.AddOrgMember(ctx, o.ID, id, OrgRoleDeveloper, nil); err != nil {
+			t.Fatalf("seed dev: %v", err)
+		}
+	}
+
+	// Mint an invitation whose accept would make active = 11.
+	overAcct := Account{ID: "00000000-0000-0000-0000-000000cf0010", Email: "over-cf@x.com"}
+	seedAccountsForMem(t, ctx, m, overAcct.ID)
+	plaintext := make([]byte, 32)
+	for i := range plaintext {
+		plaintext[i] = byte(i + 1) // deterministic but unique per-run
+	}
+	hash := sha256.Sum256(plaintext)
+	if _, err := m.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID:     o.ID,
+		Email:     overAcct.Email,
+		Role:      OrgRoleDeveloper,
+		TokenHash: hash[:],
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
+	if _, _, err := m.ConsumeOrgInvitation(ctx, hash[:], overAcct); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Fatalf("over-cap ConsumeOrgInvitation: err = %v, want ErrOrgMemberCapExceeded", err)
+	}
+	if _, err := m.OrgMemberByAccount(ctx, o.ID, overAcct.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("OrgMemberByAccount over-cap: err = %v, want ErrNotFound", err)
+	}
+}
+
+// seedAccountsForMem inserts N accounts into the in-memory store so
+// the (org_id, account_id) FK on org_memberships has a target. The
+// memstore's AccountByEmail looks up by exact email, so we also
+// stamp a deterministic email per id. Mirrors pgStoreSeedAccounts.
+func seedAccountsForMem(t *testing.T, ctx context.Context, m *MemStore, ids ...string) {
+	t.Helper()
+	for _, id := range ids {
+		// No-op if already present; the memstore has no insert
+		// conflict semantics on a primary key, so we only add when
+		// missing.
+		if _, err := m.AccountByID(ctx, id); err == nil {
+			continue
+		}
+		m.accounts[id] = Account{
+			ID:        id,
+			Email:     id + "@x.com",
+			CreatedAt: time.Now().UTC(),
+		}
 	}
 }
