@@ -1,3 +1,5 @@
+-- +goose Up
+-- +goose StatementBegin
 -- filename: 00150_deployment_liveness_probe.sql
 -- Slot 150 — issue #554 / ADR-078 follow-up: the per-deployment
 -- liveness-probe override column on `deployments`. The fence at
@@ -23,11 +25,6 @@
 -- (scanDeployment) uses coalesce(override_liveness_probe, '{}'::jsonb)
 -- on the SELECT side, identical to override_healthcheck.
 
-ALTER TABLE deployments
-  ADD COLUMN IF NOT EXISTS override_liveness_probe jsonb;
-
--- +goose Up
--- +goose StatementBegin
 ALTER TABLE deployments
   ADD COLUMN IF NOT EXISTS override_liveness_probe jsonb;
 -- +goose StatementEnd

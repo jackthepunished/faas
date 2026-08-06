@@ -86,14 +86,12 @@ type livenessProbeConfig = fcvm.LivenessProbeConfig
 // Destroy race can stop the loop without waiting for the next
 // tick.
 type livenessProbeLoop struct {
-	instance  string
-	cfg       livenessProbeConfig
-	cid       uint32
-	mgr       *fcvm.Manager
-	log       *slog.Logger
-	cancel    context.CancelFunc
-	count     int // current consecutive-failure count
-	lastReset time.Time
+	instance string
+	cfg      livenessProbeConfig
+	cid      uint32
+	mgr      *fcvm.Manager
+	log      *slog.Logger
+	count    int // current consecutive-failure count
 	// probeFn is the test seam: production code uses dialAndProbe
 	// (real AF_VSOCK), tests inject a stub that returns the
 	// closed-set outcome string ("ok", "non_200", "timeout",

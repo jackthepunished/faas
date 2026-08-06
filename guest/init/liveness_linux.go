@@ -41,6 +41,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -279,7 +280,8 @@ func runLivenessProbe(path string, timeoutMs int) (int, string) {
 		// string match for the conn-refused shape (which
 		// Go exposes as a network error without a typed
 		// sentinel). Anything else is conn_err.
-		if e, ok := err.(net.Error); ok && e.Timeout() {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			return 0, "timeout"
 		}
 		if strings.Contains(err.Error(), "connection refused") {
@@ -287,7 +289,7 @@ func runLivenessProbe(path string, timeoutMs int) (int, string) {
 		}
 		return 0, "conn_err"
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Drain + discard the body so the connection can be reused.
 	// The runner's /healthz returns < 100 B; the cap is the
 	// io.DiscardMax.
