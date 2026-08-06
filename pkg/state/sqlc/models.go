@@ -186,6 +186,36 @@ type AppTrustedSigner struct {
 	AddedByAccountID pgtype.UUID
 }
 
+type AppWebhook struct {
+	ID           pgtype.UUID
+	AppID        pgtype.UUID
+	AccountID    pgtype.UUID
+	TargetUrl    string
+	SecretSealed []byte
+	EventFilter  []string
+	RetryPolicy  string
+	Enabled      bool
+	CreatedAt    pgtype.Timestamptz
+	UpdatedAt    pgtype.Timestamptz
+}
+
+type AppWebhookDelivery struct {
+	ID               pgtype.UUID
+	WebhookID        pgtype.UUID
+	AppID            pgtype.UUID
+	AccountID        pgtype.UUID
+	Event            string
+	Payload          []byte
+	Attempt          int32
+	Status           string
+	LastError        pgtype.Text
+	LastResponseCode pgtype.Int4
+	NextAttemptAt    pgtype.Timestamptz
+	DeliveredAt      pgtype.Timestamptz
+	CreatedAt        pgtype.Timestamptz
+	UpdatedAt        pgtype.Timestamptz
+}
+
 type Build struct {
 	ID           pgtype.UUID
 	DeploymentID pgtype.UUID
@@ -679,4 +709,11 @@ type WarmHint struct {
 	AppID     pgtype.UUID
 	NodeID    pgtype.UUID
 	WrittenAt pgtype.Timestamptz
+}
+
+type WebhookDelivery struct {
+	Provider   string
+	DeliveryID string
+	ReceivedAt pgtype.Timestamptz
+	ExpiresAt  pgtype.Timestamptz
 }

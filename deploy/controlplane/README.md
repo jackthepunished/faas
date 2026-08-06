@@ -117,13 +117,19 @@ Now every push to `main` that passes CI will auto-deploy to the Droplet.
 
 ## Manual redeploy
 
-If you prefer not to use GitHub Actions CD, SSH into the Droplet and run:
+Manual deployment uses the same immutable release controller as GitHub Actions:
 
 ```bash
-sudo bash /opt/faas/src/deploy/digitalocean/deploy.sh
+sudo bash /opt/faas/src/deploy/controlplane/deploy.sh <release-id>
 ```
 
-This pulls latest source, rebuilds, migrates, and restarts.
+The release must already exist under `/opt/faas/releases/<release-id>/` and pass
+manifest verification. The controller acquires the host deployment lock, runs
+preflight and migrations, activates the release atomically, waits for readiness,
+and rolls back to the previous verified release on failure.
+
+The host no longer builds from `/opt/faas/src`; CI and manual operations use the
+same release artifact and activation path.
 
 ## OAuth sign-in (optional)
 

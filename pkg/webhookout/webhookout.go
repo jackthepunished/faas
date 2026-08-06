@@ -71,13 +71,69 @@ var (
 	ErrBodyTooLarge = errors.New("webhookout: response body exceeds 32 KiB")
 )
 
-// Header names. Centralised so the dispatcher's signer and a future
-// customer-side verifier share one definition.
+// HeaderSet picks which header names the dispatcher emits. Two sets
+// coexist so the alert wire (PR #396 / ADR-045, customer verifiers
+// shipped) stays stable while the new outbound webhook surface
+// (issue #476 / ADR-076) emits a parallel set.
+//
+// The signing scheme is identical (HMAC-SHA256 over
+// "<unix>.<delivery_id>.<body>"); only the wire header names change.
+type HeaderSet int
+
 const (
-	HeaderSignature = "X-Faas-Alert-Signature"
-	HeaderID        = "X-Faas-Alert-Id"
-	HeaderTimestamp = "X-Faas-Alert-Timestamp"
-	HeaderAttempt   = "X-Faas-Alert-Attempt"
+	// HeaderSetAlert emits X-Faas-Alert-Signature,
+	// X-Faas-Alert-Id, X-Faas-Alert-Timestamp, X-Faas-Alert-Attempt.
+	// The historical alert-delivery wire (PR #396). Customers'
+	// verifiers pin on these names; do NOT rename.
+	HeaderSetAlert HeaderSet = iota
+
+	// HeaderSetWebhook emits X-Faas-Webhook-Signature,
+	// X-Faas-Delivery-Id, X-Faas-Webhook-Timestamp,
+	// X-Faas-Webhook-Attempt. The new outbound webhook delivery wire
+	// (issue #476 / ADR-076). Distinct from the alert set so a
+	// customer's verifier can key dashboards off which surface fired
+	// the POST without parsing the body.
+	HeaderSetWebhook
+)
+
+// headerNames returns the (signature, id, timestamp, attempt) tuple
+// for the chosen HeaderSet. The dispatcher calls this once per
+// request to keep the request path branch-free at the http.Header
+// set level.
+func (h HeaderSet) headerNames() (signature, id, timestamp, attempt string) {
+	switch h {
+	case HeaderSetWebhook:
+		return "X-Faas-Webhook-Signature",
+			"X-Faas-Delivery-Id",
+			"X-Faas-Webhook-Timestamp",
+			"X-Faas-Webhook-Attempt"
+	default: // HeaderSetAlert (zero value)
+		return "X-Faas-Alert-Signature",
+			"X-Faas-Alert-Id",
+			"X-Faas-Alert-Timestamp",
+			"X-Faas-Alert-Attempt"
+	}
+}
+
+// Legacy alert header constants. Kept as exported package consts so
+// existing customer-side verifiers and the e2e tests at
+// cmd/e2e/meterd_alerts_e2e_test.go (which assert these names) keep
+// working. New code should use HeaderSetAlert / HeaderSetWebhook
+// through DispatcherOptions.
+const (
+	HeaderAlertSignature = "X-Faas-Alert-Signature"
+	HeaderAlertID        = "X-Faas-Alert-Id"
+	HeaderAlertTimestamp = "X-Faas-Alert-Timestamp"
+	HeaderAlertAttempt   = "X-Faas-Alert-Attempt"
+
+	// Deprecated aliases preserved for pre-#476 callers. Resolve to
+	// the same wire names as HeaderAlert* (the alert header set is
+	// the historical default). New callers should switch to
+	// HeaderAlert* (or HeaderSet* via DispatcherOptions).
+	HeaderSignature = HeaderAlertSignature
+	HeaderID        = HeaderAlertID
+	HeaderTimestamp = HeaderAlertTimestamp
+	HeaderAttempt   = HeaderAlertAttempt
 )
 
 // Default policy. Lifted out of the DispatcherOptions zero-check so
@@ -196,6 +252,12 @@ type Result struct {
 // SSRF guard is on by default. Sleeper is injectable so tests don't
 // wait real backoff; nil resolves to time.Sleep. Logger is optional;
 // nil resolves to slog.Default().
+//
+// HeaderSet picks which header names the dispatcher emits on every
+// POST. Zero value is HeaderSetAlert (preserves the pre-#476 alert
+// wire). Issue #476's outbound webhook dispatcher sets this to
+// HeaderSetWebhook so customer verifiers can key dashboards on the
+// new prefix.
 type DispatcherOptions struct {
 	MaxAttempts int
 	BaseBackoff time.Duration
@@ -203,6 +265,7 @@ type DispatcherOptions struct {
 	HTTPClient  *http.Client
 	Sleeper     func(d time.Duration)
 	Logger      *slog.Logger
+	HeaderSet   HeaderSet
 }
 
 // Dispatcher is the per-rule outbound webhook poster. PR 3 wires one
@@ -216,6 +279,14 @@ type DispatcherOptions struct {
 // Dispatcher per delivery stream (or serialise at the caller).
 type Dispatcher struct {
 	opts DispatcherOptions
+	// headerNames is the (signature, id, timestamp, attempt) tuple
+	// resolved once at construction so the per-attempt hot path
+	// doesn't branch. Setting HeaderSet on DispatcherOptions after
+	// NewDispatcher has no effect.
+	headerSig     string
+	headerID      string
+	headerTime    string
+	headerAttempt string
 }
 
 // NewDispatcher returns a Dispatcher. opts is documented above. The
@@ -268,7 +339,14 @@ func NewDispatcher(opts DispatcherOptions) *Dispatcher {
 	if !callerHTTPClient {
 		opts.HTTPClient.Timeout = opts.PerAttempt
 	}
-	return &Dispatcher{opts: opts}
+	sig, id, ts, att := opts.HeaderSet.headerNames()
+	return &Dispatcher{
+		opts:          opts,
+		headerSig:     sig,
+		headerID:      id,
+		headerTime:    ts,
+		headerAttempt: att,
+	}
 }
 
 // Dispatch posts evt to target with retry+backoff. See Result for
@@ -365,10 +443,10 @@ func (d *Dispatcher) attempt(ctx context.Context, url, sig string, unix int64, d
 		return Result{StatusCode: 0, Err: fmt.Errorf("webhookout: build request: %w", err), BodyPrefix: nil}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(HeaderSignature, "sha256="+sig)
-	req.Header.Set(HeaderID, deliveryID)
-	req.Header.Set(HeaderTimestamp, fmt.Sprintf("%d", unix))
-	req.Header.Set(HeaderAttempt, fmt.Sprintf("%d", attempt))
+	req.Header.Set(d.headerSig, "sha256="+sig)
+	req.Header.Set(d.headerID, deliveryID)
+	req.Header.Set(d.headerTime, fmt.Sprintf("%d", unix))
+	req.Header.Set(d.headerAttempt, fmt.Sprintf("%d", attempt))
 
 	resp, err := d.opts.HTTPClient.Do(req)
 	if err != nil {

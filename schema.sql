@@ -463,6 +463,51 @@ CREATE TABLE public.app_trusted_signers (
 
 
 --
+-- Name: app_webhook_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_webhook_deliveries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    webhook_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    event text NOT NULL,
+    payload jsonb NOT NULL,
+    attempt integer DEFAULT 0 NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    last_error text,
+    last_response_code integer,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    delivered_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT app_webhook_deliveries_attempt_chk CHECK (((attempt >= 0) AND (attempt <= 8))),
+    CONSTRAINT app_webhook_deliveries_event_chk CHECK ((event = ANY (ARRAY['cron.fired'::text, 'app.deployed'::text, 'app.scaled'::text, 'app.parked'::text, 'app.woken'::text]))),
+    CONSTRAINT app_webhook_deliveries_status_chk CHECK ((status = ANY (ARRAY['pending'::text, 'in_flight'::text, 'succeeded'::text, 'failed'::text, 'dead'::text])))
+);
+
+
+--
+-- Name: app_webhooks; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_webhooks (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    app_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    target_url text NOT NULL,
+    secret_sealed bytea NOT NULL,
+    event_filter text[] DEFAULT '{}'::text[] NOT NULL,
+    retry_policy text DEFAULT 'default'::text NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT app_webhooks_retry_policy_chk CHECK ((retry_policy = ANY (ARRAY['default'::text, 'aggressive'::text, 'none'::text]))),
+    CONSTRAINT app_webhooks_target_url_len_chk CHECK (((char_length(target_url) >= 8) AND (char_length(target_url) <= 2048)))
+);
+
+
+--
 -- Name: apps; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1464,6 +1509,19 @@ CREATE TABLE public.warm_hint (
 
 
 --
+-- Name: webhook_deliveries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.webhook_deliveries (
+    provider text NOT NULL,
+    delivery_id text NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT webhook_deliveries_provider_check CHECK ((provider = ANY (ARRAY['github'::text, 'stripe'::text, 'paddle'::text])))
+);
+
+
+--
 -- Name: compute_node_heartbeats id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -1587,6 +1645,22 @@ ALTER TABLE ONLY public.app_secrets
 
 ALTER TABLE ONLY public.app_trusted_signers
     ADD CONSTRAINT app_trusted_signers_pkey PRIMARY KEY (app_id, signer_name);
+
+
+--
+-- Name: app_webhook_deliveries app_webhook_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_deliveries
+    ADD CONSTRAINT app_webhook_deliveries_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: app_webhooks app_webhooks_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhooks
+    ADD CONSTRAINT app_webhooks_pkey PRIMARY KEY (id);
 
 
 --
@@ -1950,6 +2024,14 @@ ALTER TABLE ONLY public.warm_hint
 
 
 --
+-- Name: webhook_deliveries webhook_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.webhook_deliveries
+    ADD CONSTRAINT webhook_deliveries_pkey PRIMARY KEY (provider, delivery_id);
+
+
+--
 -- Name: account_credits_account_active_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2101,6 +2183,34 @@ CREATE INDEX app_secrets_org_id_idx ON public.app_secrets USING btree (org_id) W
 --
 
 CREATE INDEX app_trusted_signers_app_idx ON public.app_trusted_signers USING btree (app_id);
+
+
+--
+-- Name: app_webhook_deliveries_account_created_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_webhook_deliveries_account_created_idx ON public.app_webhook_deliveries USING btree (account_id, created_at DESC);
+
+
+--
+-- Name: app_webhook_deliveries_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_webhook_deliveries_pending_idx ON public.app_webhook_deliveries USING btree (account_id, next_attempt_at) WHERE (status = ANY (ARRAY['pending'::text, 'in_flight'::text]));
+
+
+--
+-- Name: app_webhooks_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_webhooks_account_idx ON public.app_webhooks USING btree (account_id);
+
+
+--
+-- Name: app_webhooks_app_target_uniq; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX app_webhooks_app_target_uniq ON public.app_webhooks USING btree (app_id, target_url);
 
 
 --
@@ -2713,6 +2823,13 @@ CREATE INDEX warm_hint_node_id_idx ON public.warm_hint USING btree (node_id);
 
 
 --
+-- Name: webhook_deliveries_expires_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX webhook_deliveries_expires_idx ON public.webhook_deliveries USING btree (expires_at);
+
+
+--
 -- Name: apps apps_egress_allowlist_cidr; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -2910,6 +3027,46 @@ ALTER TABLE ONLY public.app_secrets
 
 ALTER TABLE ONLY public.app_trusted_signers
     ADD CONSTRAINT app_trusted_signers_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_webhook_deliveries app_webhook_deliveries_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_deliveries
+    ADD CONSTRAINT app_webhook_deliveries_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_webhook_deliveries app_webhook_deliveries_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_deliveries
+    ADD CONSTRAINT app_webhook_deliveries_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_webhook_deliveries app_webhook_deliveries_webhook_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_deliveries
+    ADD CONSTRAINT app_webhook_deliveries_webhook_id_fkey FOREIGN KEY (webhook_id) REFERENCES public.app_webhooks(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_webhooks app_webhooks_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhooks
+    ADD CONSTRAINT app_webhooks_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_webhooks app_webhooks_app_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhooks
+    ADD CONSTRAINT app_webhooks_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE;
 
 
 --

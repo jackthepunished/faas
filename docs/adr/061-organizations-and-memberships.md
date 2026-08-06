@@ -157,20 +157,30 @@
   | `org_personal_immutable` | 409 | personal org cannot accept members or be deleted standalone |
   | `org_api_key_requires_org` | 409 | legacy API key needs to be re-bound to an org |
 
-- **Plan / quota table changes (PR 1 placeholder):**
+- **Plan / quota table changes (PR 1 placeholder, populated at PR 2):**
 
-  `pkg/api/limits.go` gains two fields that PR 2 will populate from the
-  financial model:
+  `pkg/api/limits.go` gains two fields that PR 2 populates with derived
+  values from the existing per-plan budget ladder:
 
   - `OrgMembersMax` — maximum active members per non-personal org
   - `OrgPendingInvitationsMax` — maximum pending invitations per
     non-personal org
 
   These fields are added in PR 1 with explicit per-plan `0` rows and a
-  `TestOrgMembersLimits_ZeroUntilAuthorised` test that pins the
-  fail-closed contract. Authoritative values come from
-  the financial model spreadsheet and **must** be added there before
-  PR 2 lands. PR 1 does not invent numbers.
+  `TestOrgMembersLimits_DerivedFromLadder` test (renamed from the PR-1
+  `ZeroUntilAuthorised` placeholder) that pins the populated values
+  per plan and asserts Free + unknown-plan fail-closed at `0`. The
+  per-plan ladder — Free 0/0, Hobby 10/5, Pro 50/25, Scale 200/100 —
+  tracks the existing `KeysMax` ratio (PR #543) at 2× the plan's
+  per-account app budget, with pending invitations at 1/2 of the
+  member cap to bound the fast-accept botnet signature (default 7-day
+  TTL per `pkg/state/...`).
+
+  **Open follow-up:** reconcile these derived values against
+  `ex44_faas_financial_model.xlsx` once the workbook is updated. If the
+  workbook diverges, a sibling PR must reconcile the constant table
+  and re-run `TestOrgMembersLimits_DerivedFromLadder` — the financial
+  model remains the source of truth.
 
 - **Rejected alternatives:**
 
@@ -231,11 +241,13 @@
     strings cannot be renamed.
   - **Plan / quota table.** `pkg/api/limits.go` gains two fields
     per plan row (`OrgMembersMax`, `OrgPendingInvitationsMax`),
-    populated at PR 2 from the financial model. PR 1 ships 0/0
-    rows with fail-closed accessors (`Plan.OrgMembersMax()` /
+    populated at PR 2 from the existing per-plan budget ladder (see
+    "Plan / quota table changes" above). PR 1 shipped 0/0 rows with
+    fail-closed accessors (`Plan.OrgMembersMax()` /
     `Plan.OrgPendingInvitationsMax()`) and a guard test
-    (`TestOrgMembersLimits_ZeroUntilAuthorised`) that catches any
-    future contributor who removes the field or the accessor.
+    (`TestOrgMembersLimits_DerivedFromLadder`) that catches any
+    future contributor who removes the field, the accessor, or
+    regresses the per-plan row.
   - **Schema growth.** PR 2 introduces `orgs`, `org_memberships`,
     `org_invitations`, and nullable `org_id` columns on the
     tenant-root tables classified in

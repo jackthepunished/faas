@@ -36,12 +36,17 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #475: Free is gated off the reserved eviction tier.
 			// Fail-closed at 0/0 mirrors the cron 0/0 posture above.
 			EvictionPriorityReservedAllowed: false, ReservedConcurrencyPerAccount: 0,
-			// IAM-6 / ADR-061: PR 1 placeholder. Fail-closed at 0/0
-			// until the financial model authorizes values for PR 2.
+			// IAM-6 / ADR-061 PR-2 (issue #190): Free stays 0/0 by
+			// plan policy — the abuse-floor tier cannot host shared
+			// orgs. Mirrors CronLimitPerApp posture. Financial model
+			// is authoritative; reconciliation follow-up.
 			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): alert rules — Free gated to 402, so the limits
 			// surface is 0/0 to fail-closed by default.
 			AlertRuleLimitPerApp: 0, AlertRuleLimitPerAccount: 0,
+			// ADR-076 (#476): outbound webhooks — Free gated to 402
+			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
+			WebhookPerApp: 0, WebhookPerAccount: 0,
 			// ADR-040: Free gets 50/min — covers the 1-concurrency plan's
 			// traffic envelope with a 50× burst ceiling.
 			RateLimitPerAccountRPM: 50,
@@ -107,11 +112,17 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 5, CronLimitPerAccount: 10,
 			// Issue #475: Hobby gets 1 reserved-tier app.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 1,
-			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
-			// financial model authorizes values.
-			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): Hobby gets 3 per-app and 10 per-account.
 			AlertRuleLimitPerApp: 3, AlertRuleLimitPerAccount: 10,
+			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
+			// (10) one-to-one. Pending invitations = members/2
+			// because the default 7d TTL keeps the live set small.
+			// Financial model is authoritative — derived value,
+			// reconciliation follow-up.
+			OrgMembersMax: 10, OrgPendingInvitationsMax: 5,
+			// ADR-076 (#476): Hobby gets 3 per-app and 10 per-account
+			// — mirrors the alert-rule ratio.
+			WebhookPerApp: 3, WebhookPerAccount: 10,
 			// ADR-040: Hobby gets 200/min — ~10× the per-app rps (20),
 			// so the per-app limit trips first on a single hot app and
 			// the account limit catches the cross-app botnet signature.
@@ -163,11 +174,16 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 20, CronLimitPerAccount: 50,
 			// Issue #475: Pro gets 2 reserved-tier apps.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 2,
-			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
-			// financial model authorizes values.
-			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): Pro gets 10 per-app and 30 per-account.
 			AlertRuleLimitPerApp: 10, AlertRuleLimitPerAccount: 30,
+			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
+			// (50) one-to-one — every team member can hold a key
+			// for their own deploy target. Financial model is
+			// authoritative — derived value, reconciliation follow-up.
+			OrgMembersMax: 50, OrgPendingInvitationsMax: 25,
+			// ADR-076 (#476): Pro gets 10 per-app and 30 per-account
+			// — mirrors the alert-rule ratio.
+			WebhookPerApp: 10, WebhookPerAccount: 30,
 			// ADR-040: Pro gets 1000/min — ~10× the per-app rps (100).
 			RateLimitPerAccountRPM: 1000,
 			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
@@ -223,11 +239,16 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			CronLimitPerApp: 100, CronLimitPerAccount: 500,
 			// Issue #475: Scale gets 4 reserved-tier apps.
 			EvictionPriorityReservedAllowed: true, ReservedConcurrencyPerAccount: 4,
-			// IAM-6 / ADR-061: PR 1 placeholder — 0/0 until the
-			// financial model authorizes values.
-			OrgMembersMax: 0, OrgPendingInvitationsMax: 0,
 			// ADR-045 (#396): Scale gets 25 per-app and 100 per-account.
 			AlertRuleLimitPerApp: 25, AlertRuleLimitPerAccount: 100,
+			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
+			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
+			// Financial model is authoritative — derived value,
+			// reconciliation follow-up.
+			OrgMembersMax: 200, OrgPendingInvitationsMax: 100,
+			// ADR-076 (#476): Scale gets 25 per-app and 100 per-account
+			// — mirrors the alert-rule ratio.
+			WebhookPerApp: 25, WebhookPerAccount: 100,
 			// ADR-040: Scale gets 5000/min — ~10× the per-app rps (500).
 			// The fleet-summed alert at 100/min/5m (FaasPerAccountRateLimitSpike)
 			// triggers well before any single paid customer's bucket fills.
@@ -264,30 +285,56 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 	}
 }
 
-// TestOrgMembersLimits_ZeroUntilAuthorised pins the fail-closed
-// contract for the IAM-6 / ADR-061 org caps (issue #190, PR 1).
-// The handler gates membership creation on Plan.OrgMembersMax()
-// and the store reads the same value as a defence-in-depth
-// back-stop. Until the financial model authorizes per-plan values,
-// every plan must read 0/0 — a missing row must NEVER silently
-// inherit a permissive cap. PR 2 will populate actual values
-// alongside the schema work; this test catches a regression where
-// the field is left at Go's default zero (which happens to be 0)
-// and the accessor is omitted (no reader = silent allow).
-func TestOrgMembersLimits_ZeroUntilAuthorised(t *testing.T) {
+// TestOrgMembersLimits_DerivedFromLadder pins the IAM-6 / ADR-061
+// PR-2 contract (issue #190). The handler gates membership creation
+// on Plan.OrgMembersMax() and the store reads the same value as a
+// defence-in-depth back-stop inside consumeOrgInvitation.
+//
+// Per-plan values (Free 0/0, Hobby 10/5, Pro 50/25, Scale 200/100)
+// are derived from the existing per-plan budget ladder: members
+// track KeysMax one-to-one, pending invitations track members/2
+// (default 7d invitation TTL keeps the live set small). Free stays
+// at 0/0 by plan policy — the abuse-floor tier cannot host shared
+// orgs, mirroring the CronLimitPerApp posture.
+//
+// IMPORTANT: ex44_faas_financial_model.xlsx is the authoritative
+// source (CLAUDE.md). If the workbook diverges from these derived
+// values, a follow-up PR reconciles — this test must be updated in
+// the same PR that changes the workbook. The unknown-plan branch
+// keeps failing closed (return 0) so a future contributor cannot
+// silently widen a missing-row accessor's behaviour.
+func TestOrgMembersLimits_DerivedFromLadder(t *testing.T) {
+	want := map[Plan]struct{ members, pending int }{
+		PlanFree:  {members: 0, pending: 0}, // abuse-floor: no shared orgs
+		PlanHobby: {members: 10, pending: 5},
+		PlanPro:   {members: 50, pending: 25},
+		PlanScale: {members: 200, pending: 100},
+	}
+	// Surface unannounced plans: a future contributor who adds a fifth
+	// plan row to api.Plans without also filling `want` here must hit a
+	// red test, not silently inherit the zero-value {0, 0} Free
+	// posture. The map-keyed assertion below already catches missing
+	// rows when iterating, but this explicit count check makes the
+	// tripwire loud.
+	if len(want) != len(Plans) {
+		t.Fatalf("derived ladder test out of sync: want %d plans, api.Plans has %d — update both lists together",
+			len(want), len(Plans))
+	}
 	for _, p := range Plans {
 		t.Run(string(p), func(t *testing.T) {
-			if got := p.OrgMembersMax(); got != 0 {
-				t.Errorf("Plan(%s).OrgMembersMax() = %d, want 0 (fail-closed until financial model authorises)", p, got)
+			w := want[p]
+			if got := p.OrgMembersMax(); got != w.members {
+				t.Errorf("Plan(%s).OrgMembersMax() = %d, want %d (derived ladder; reconcile against ex44_faas_financial_model.xlsx)", p, got, w.members)
 			}
-			if got := p.OrgPendingInvitationsMax(); got != 0 {
-				t.Errorf("Plan(%s).OrgPendingInvitationsMax() = %d, want 0 (fail-closed until financial model authorises)", p, got)
+			if got := p.OrgPendingInvitationsMax(); got != w.pending {
+				t.Errorf("Plan(%s).OrgPendingInvitationsMax() = %d, want %d (derived ladder; reconcile against ex44_faas_financial_model.xlsx)", p, got, w.pending)
 			}
 		})
 	}
 
-	// Unknown plan must also fail closed (return 0). Mirrors the
-	// CronLimitPerApp / AlertRuleLimitPerApp contract.
+	// Unknown plan must fail closed (return 0). Mirrors the
+	// CronLimitPerApp / AlertRuleLimitPerApp contract — a missing
+	// row must NEVER silently inherit a permissive cap.
 	if got := Plan("enterprise").OrgMembersMax(); got != 0 {
 		t.Errorf("Plan(unknown).OrgMembersMax() = %d, want 0 (fail-closed)", got)
 	}

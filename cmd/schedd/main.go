@@ -18,8 +18,10 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"filippo.io/age"
 	"github.com/jackc/pgx/v5/pgxpool"
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
@@ -37,8 +39,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/sched/scaleup"
 	"github.com/onebox-faas/faas/pkg/sched/targets"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
+	"github.com/onebox-faas/faas/pkg/webhook"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"github.com/onebox-faas/faas/pkg/wire/otelinit"
 	"google.golang.org/grpc"
@@ -398,7 +402,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// coverage pass can wrap pgxpool.Acquire errors in a
 		// way that breaks errors.Is unwrapping; the ctx.Err()
 		// side is the canonical "did the caller cancel" signal.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil || strings.Contains(err.Error(), context.Canceled.Error()) {
 			return nil
 		}
 		return fmt.Errorf("schedd: router refresh subscribe: %w", err)
@@ -1197,6 +1201,45 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	}
 
+	// Issue #476 / ADR-076: outbound webhook delivery dispatcher.
+	// Drains app_webhook_deliveries on a 5s tick with FOR UPDATE SKIP
+	// LOCKED claim (per-account round-robin) + retry-with-backoff +
+	// DLQ-at-7. Shares the schedulerAuditor so the audit rows carry
+	// actor="schedd". The IdentityLoader is the same FAAS_HOST_AGE
+	// path the alert evaluator uses (pkg/alerts/evaluator.go:380-395).
+	//
+	// The dispatcher is a sibling goroutine, not an HTTP server, so
+	// it gets the full DefaultDrainTimeout (10s) to flush in-flight
+	// POSTs on SIGTERM. The HTTP graceful-stop 5s budget above
+	// applies to gsrv + httpSrv only — they do not gate the
+	// dispatcher's drain.
+	webhookDispatcher := webhook.NewDispatcher(store, schedulerAuditor, log)
+	webhookDispatcher.IdentityLoader = func() []*age.X25519Identity {
+		path := cfg.HostAgeIdentityPath
+		if path == "" {
+			path = secretbox.DefaultHostKeyPath
+		}
+		ident, err := secretbox.LoadHostKey(path)
+		if err != nil || ident == nil {
+			return nil
+		}
+		return []*age.X25519Identity{ident}
+	}
+	// Propagate the dispatcher's lifecycle error through loopErr so
+	// a non-context-canceled exit (e.g. a poisoned row) tears down
+	// schedd with the rest of the loop — same posture as loopErr +
+	// the drain goroutine above. A ctx-canceled return is treated as
+	// a clean shutdown and ignored.
+	webhookLoopErr := make(chan error, 1)
+	go func() {
+		err := webhookDispatcher.Run(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			webhookLoopErr <- err
+		} else {
+			webhookLoopErr <- nil
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		log.Info("draining")
@@ -1206,6 +1249,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	case err := <-loopErr:
 		if err != nil {
+			return err
+		}
+	case err := <-webhookLoopErr:
+		if err != nil {
+			log.Warn("webhook dispatcher exited with error", "err", err)
 			return err
 		}
 	}

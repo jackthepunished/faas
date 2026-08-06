@@ -183,6 +183,13 @@ func run(args []string) int {
 		return cmdDomains(args[1:])
 	case "crons":
 		return cmdCrons(args[1:])
+	case "webhooks":
+		// Issue #476 / ADR-076 — outbound webhook subscriptions
+		// and delivery ledger. Mirrors the crons surface (list /
+		// add / update / rm + deliveries / retry). Routes through
+		// authedClient() the same way crons does; the dispatcher
+		// itself lives in schedd (pkg/webhook/dispatcher.go).
+		return cmdWebhooks(args[1:])
 	case "keys":
 		return cmdKeys(args[1:])
 	case dispatchSignKeys:

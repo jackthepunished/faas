@@ -345,6 +345,20 @@ type Limits struct {
 	// read in pkg/state.CreateAlertRuleIfUnderQuota.
 	AlertRuleLimitPerAccount int
 
+	// WebhookPerApp caps how many outbound webhook subscriptions a
+	// single app may register (issue #476 / ADR-076). The plan gate
+	// is enforced in pkg/state.CreateAppWebhookIfUnderQuota under an
+	// apps-row FOR UPDATE lock — same TOCTOU-defence pattern as
+	// CreateCronIfUnderQuota. The cap defends against a noisy
+	// customer pinning every event to a single target.
+	WebhookPerApp int
+	// WebhookPerAccount caps the total outbound webhook subscriptions
+	// an account may hold across every app. Independent of
+	// WebhookPerApp — the per-account cap defends against the
+	// N-apps-times-cap-per-app bypass. Both enforced in
+	// pkg/state.CreateAppWebhookIfUnderQuota.
+	WebhookPerAccount int
+
 	// EgressAllowlistAllowed toggles the per-app outbound IP allowlist
 	// (ADR-031, tier-2 of the network roadmap). Free + Hobby keep
 	// allowlist opt-out because the abuse-desk use case is a
@@ -556,10 +570,13 @@ var planLimits = map[Plan]Limits{
 		// break-glass. The abuse-vector (scripted key rotation under
 		// 1-concurrency) is bounded by the per-account rate limit.
 		KeysMax: 3,
-		// IAM-6 / ADR-061: org membership is plan-gated until the
-		// financial model authorizes a per-plan value. Free reads
-		// 0/0 so the membership gate refuses before the store is
-		// touched, mirroring the cron fail-closed shape.
+		// IAM-6 / ADR-061 PR-2 (issue #190): Free is the abuse-floor
+		// tier and cannot host shared orgs — 0/0 stays by plan
+		// policy, mirroring CronLimitPerApp and
+		// EvictionPriorityReservedAllowed on Free. Personal orgs are
+		// unaffected (they never read these caps). The financial
+		// model is authoritative; reconciliation is a follow-up if
+		// the workbook diverges from this fail-closed value.
 		OrgMembersMax:            0,
 		OrgPendingInvitationsMax: 0,
 		// Alert rules (issue #396 / ADR-045): Free stays at 0/0.
@@ -567,6 +584,11 @@ var planLimits = map[Plan]Limits{
 		// — the value is informational here for fail-closed accessors.
 		AlertRuleLimitPerApp:     0,
 		AlertRuleLimitPerAccount: 0,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Free has no webhooks — the handler returns 402
+		// CodePlanWebhooksNotAllowed before the store is touched.
+		WebhookPerApp:     0,
+		WebhookPerAccount: 0,
 		// Per-account rate limit (ADR-040): Free gets 50/min — enough for
 		// the 1-concurrency plan's traffic envelope.
 		RateLimitPerAccountRPM: 50,
@@ -700,12 +722,15 @@ var planLimits = map[Plan]Limits{
 		// (CI / staging / prod / personal / monitoring) with a
 		// dedicated key.
 		KeysMax: 10,
-		// IAM-6 / ADR-061: org caps land in PR 2 once the financial
-		// model authorizes them. PR 1 ships 0/0 so the fail-closed
-		// gate refuses across every plan until the values are
-		// sourced — see limits_test.go::TestOrgMembersLimits_ZeroUntilAuthorised.
-		OrgMembersMax:            0,
-		OrgPendingInvitationsMax: 0,
+		// IAM-6 / ADR-061 PR-2 (issue #190): Hobby gets 10 members /
+		// 5 pending invitations — tracks the KeysMax ratio (IAM-5
+		// shapes team headroom as 2× the per-account app budget).
+		// Pending invitations stay at 1/2 of members because the
+		// default invitation TTL is short (7d) and the typical Hobby
+		// customer issues a handful at a time. Financial model is
+		// authoritative — derived value, reconciliation follow-up.
+		OrgMembersMax:            10,
+		OrgPendingInvitationsMax: 5,
 		// Alert rules (issue #396): Hobby gets 3 per-app and 10
 		// per-account — a Hobby customer with 2 apps + 1 account-wide
 		// rule lands inside both caps. The per-account floor tracks the
@@ -714,6 +739,10 @@ var planLimits = map[Plan]Limits{
 		// account-wide rules.
 		AlertRuleLimitPerApp:     3,
 		AlertRuleLimitPerAccount: 10,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
+		WebhookPerApp:     3,
+		WebhookPerAccount: 10,
 		// Per-account rate limit (ADR-040): Hobby gets 200/min — ~10× the
 		// Hobby per-app rps (20) so per-app trips first on a single hot
 		// app, and the account limit catches the cross-app botnet.
@@ -837,15 +866,22 @@ var planLimits = map[Plan]Limits{
 		// Pro app budget (25) plus a per-team allowance (CI / staging
 		// / prod / personal / monitoring / break-glass).
 		KeysMax: 50,
-		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
-		// per-plan values from the financial model.
-		OrgMembersMax:            0,
-		OrgPendingInvitationsMax: 0,
+		// IAM-6 / ADR-061 PR-2 (issue #190): Pro gets 50 members /
+		// 25 pending invitations — tracks KeysMax (50) one-to-one so
+		// every team member can hold a key for their own deploy
+		// target. Financial model is authoritative — derived value,
+		// reconciliation follow-up.
+		OrgMembersMax:            50,
+		OrgPendingInvitationsMax: 25,
 		// Alert rules (issue #396): Pro gets 10 per-app and 30
 		// per-account. ~2× the Hobby per-account budget tracks the
 		// Pro app budget (25 apps vs Hobby's 5).
 		AlertRuleLimitPerApp:     10,
 		AlertRuleLimitPerAccount: 30,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
+		WebhookPerApp:     10,
+		WebhookPerAccount: 30,
 		// Per-account rate limit (ADR-040): Pro gets 1000/min — ~10× the
 		// Pro per-app rps (100), same rationale as Hobby.
 		RateLimitPerAccountRPM: 1000,
@@ -975,16 +1011,23 @@ var planLimits = map[Plan]Limits{
 		// the Scale app budget (100) plus a per-team allowance, with
 		// headroom for the rotating-CI shape of a SaaS-scale customer.
 		KeysMax: 200,
-		// IAM-6 / ADR-061: PR 1 placeholder. PR 2 populates actual
-		// per-plan values from the financial model.
-		OrgMembersMax:            0,
-		OrgPendingInvitationsMax: 0,
+		// IAM-6 / ADR-061 PR-2 (issue #190): Scale gets 200 members
+		// / 100 pending invitations — tracks KeysMax (200) so a
+		// SaaS-scale customer can run the typical multi-team +
+		// rotating-CI shape. Financial model is authoritative —
+		// derived value, reconciliation follow-up.
+		OrgMembersMax:            200,
+		OrgPendingInvitationsMax: 100,
 		// Alert rules (issue #396): Scale gets 25 per-app and 100
 		// per-account — 2.5× Pro's per-app (10→25) and ~3× the
 		// per-account (30→100). Scale's app budget is 4× Pro's, so
 		// the per-account figure absorbs the fan-out.
 		AlertRuleLimitPerApp:     25,
 		AlertRuleLimitPerAccount: 100,
+		// Outbound webhook subscription caps (issue #476 / ADR-076).
+		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
+		WebhookPerApp:     25,
+		WebhookPerAccount: 100,
 		// Per-account rate limit (ADR-040): Scale gets 5000/min — ~10× the
 		// Scale per-app rps (500). The fleet-summed alert at 100/min/5m
 		// (FaasPerAccountRateLimitSpike) triggers well before any single
@@ -2019,6 +2062,31 @@ func (p Plan) AlertRuleLimitPerAccount() int {
 		return 0
 	}
 	return l.AlertRuleLimitPerAccount
+}
+
+// WebhookPerApp returns the per-app outbound-webhook subscription cap
+// for the plan (issue #476 / ADR-076). 0 for Free (the handler
+// returns 402 CodePlanWebhooksNotAllowed before the store is touched);
+// positive for Hobby/Pro/Scale. Same fail-closed contract as
+// AlertRuleLimitPerApp.
+func (p Plan) WebhookPerApp() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WebhookPerApp
+}
+
+// WebhookPerAccount returns the per-account outbound-webhook
+// subscription cap. Independent of WebhookPerApp — same
+// N-apps-times-cap-per-app defence. Same fail-closed contract as
+// AlertRuleLimitPerAccount.
+func (p Plan) WebhookPerAccount() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.WebhookPerAccount
 }
 
 // TrustedSignerCountMax returns the per-app cosign trusted-publisher

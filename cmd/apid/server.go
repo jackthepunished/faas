@@ -811,6 +811,22 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAlertRule))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAlertRuleSecret))))
 
+	// Outbound webhooks (issue #476 / ADR-076). CRUD surface under
+	// /v1/apps/{slug}/webhooks mirrors /v1/apps/{slug}/alerts: same
+	// plan-tier gate (Free → 402 plan_webhooks_not_allowed), same
+	// idempotent + authLimited wrapper, same secretbox.SealBytes
+	// + masked-constant response shape. Two extra endpoints:
+	// GET /deliveries (visibility) and POST /deliveries/{did}/retry
+	// (manual DLQ escape hatch — issue #476 acceptance gate 4).
+	mux.HandleFunc("GET /v1/apps/{slug}/webhooks", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAppWebhooks))))
+	mux.HandleFunc("POST /v1/apps/{slug}/webhooks", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createAppWebhook)))))
+	mux.HandleFunc("GET /v1/apps/{slug}/webhooks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAppWebhook))))
+	mux.HandleFunc("PATCH /v1/apps/{slug}/webhooks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateAppWebhook))))
+	mux.HandleFunc("DELETE /v1/apps/{slug}/webhooks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAppWebhook))))
+	mux.HandleFunc("POST /v1/apps/{slug}/webhooks/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAppWebhookSecret))))
+	mux.HandleFunc("GET /v1/apps/{slug}/webhooks/{id}/deliveries", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAppWebhookDeliveries))))
+	mux.HandleFunc("POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.retryAppWebhookDelivery))))
+
 	// Move 2: event-driven surface (handlers_invocations.go).
 	// Charged routes take idempotent so retries are safe; the long-poll
 	// ones take authLimited (no idempotent — a network jitter on a

@@ -48,6 +48,14 @@ tags:
     description: Custom domain bindings.
   - name: crons
     description: Scheduled synthetic POSTs.
+  - name: webhooks
+    description: |
+      Outbound webhook subscriptions (issue #476 / ADR-076). One row
+      per (app, target_url) customer subscription; the dispatcher in
+      schedd POSTs signed payloads to the target with exponential
+      backoff + jitter and DLQs at attempt 7. The deliveries subroute
+      surfaces the per-attempt retry state + a manual retry endpoint
+      that clears status='dead' back to 'pending'.
   - name: alert_rules
     description: |
       Customer-configurable alert rules (issue #396 / ADR-045 PR 3).
@@ -2632,6 +2640,218 @@ paths:
                 webhook_secret_sealed_masked: "***"
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Outbound webhooks (issue #476 / ADR-076) ──────────────────────────────
+  # Customer-facing CRUD + deliveries surface for outbound webhook
+  # subscriptions. The dispatcher lives in cmd/schedd (issue #476
+  # PR cluster commit 4); the apid surface is the customer-facing
+  # CRUD + audit + manual-retry seam. Secrets are sealed at write
+  # time (pgx/secretbox) and never returned in plaintext — the
+  # response shape carries the masked constant.
+  /v1/apps/{slug}/webhooks:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [webhooks]
+      operationId: listAppWebhooks
+      summary: List outbound webhook subscriptions for this app.
+      responses:
+        '200':
+          description: The webhooks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AppWebhookResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [webhooks]
+      operationId: createAppWebhook
+      summary: Create a new outbound webhook subscription.
+      description: |
+        target_url is SSRF-guarded at write time (loopback / RFC1918
+        / link-local / metadata IPs are rejected unless
+        FAAS_EGRESS_ALLOW_LOOPBACK=1). webhook_secret arrives in
+        the body, is sealed with secretbox.SealBytes under the
+        APP_WEBHOOK namespace, and is NEVER returned in plaintext
+        — the response shape carries the masked constant. event_filter
+        is an optional allowlist; empty subscribes to every event in
+        the closed vocabulary.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateAppWebhookRequest' }
+            example:
+              target_url: "https://example.com/hook"
+              webhook_secret: "shh"
+              event_filter: ["cron.fired", "app.created"]
+              retry_policy: "default"
+              enabled: true
+      responses:
+        '201':
+          description: Webhook created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppWebhookResponse' }
+        '400': { $ref: '#/components/responses/AppWebhookInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '403': { $ref: '#/components/responses/PlanWebhookQuota' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/AppWebhookInvalid' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/webhooks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [webhooks]
+      operationId: getAppWebhook
+      summary: Fetch one webhook subscription by id.
+      responses:
+        '200':
+          description: The webhook.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppWebhookResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [webhooks]
+      operationId: updateAppWebhook
+      summary: Partial-update a webhook subscription.
+      description: |
+        Every field is optional. To rotate the secret in place, send
+        `webhook_secret` (the handler seals it; the response carries
+        the masked constant). To rotate via the dedicated endpoint,
+        use POST /webhooks/{id}/rotate-secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateAppWebhookRequest' }
+            example: {"target_url":"https://example.com/hook2","enabled":true}
+      responses:
+        '200':
+          description: The updated webhook.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppWebhookResponse' }
+        '400': { $ref: '#/components/responses/AppWebhookInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [webhooks]
+      operationId: deleteAppWebhook
+      summary: Delete a webhook subscription.
+      description: |
+        Cascades into app_webhook_deliveries via FK CASCADE — the
+        customer can no longer read the delivery history once the
+        subscription is gone. Mirrors the alert-rule DELETE shape.
+      responses:
+        '204': { description: No body. The webhook was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/webhooks/{id}/rotate-secret:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+    post:
+      tags: [webhooks]
+      operationId: rotateAppWebhookSecret
+      summary: Server-mint a new webhook HMAC secret.
+      description: |
+        Server-mints a 32-byte secret, seals it, and overwrites the
+        row's sealed ciphertext in place. The plaintext is NEVER
+        returned in the response — the body carries the masked
+        constant + rotated_at only.
+      responses:
+        '200':
+          description: Webhook secret rotation succeeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RotateAppWebhookSecretResponse' }
+              example:
+                rotated_at: "2026-08-06T12:00:00Z"
+                webhook_secret_sealed_masked: "***"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/webhooks/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+      - in: query
+        name: page_size
+        description: Page size (1..100; default 50).
+        schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      - in: query
+        name: page_token
+        description: Opaque cursor from the previous page's next_token.
+        schema: { type: string }
+    get:
+      tags: [webhooks]
+      operationId: listAppWebhookDeliveries
+      summary: List recent deliveries for this webhook.
+      description: |
+        Cursor-paginated; most-recent-first. The delivery status
+        follows the closed vocabulary `pending | in_flight |
+        succeeded | failed | dead`. Dead rows can be re-armed with
+        POST /webhooks/{id}/deliveries/{did}/retry.
+      responses:
+        '200':
+          description: The deliveries page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppWebhookDeliveryListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/Id32'
+      - in: path
+        name: did
+        required: true
+        description: Delivery id (32-hex-char UUID).
+        schema: { type: string, pattern: '^[0-9a-f]{32}$' }
+    post:
+      tags: [webhooks]
+      operationId: retryAppWebhookDelivery
+      summary: Re-arm a dead delivery.
+      description: |
+        Resets the row to `pending` with attempt=0 +
+        next_attempt_at=now() so the dispatcher picks it up at the
+        next tick. Only valid on rows with status='dead'; returns
+        400 app_webhook_invalid otherwise.
+      responses:
+        '200':
+          description: The re-armed delivery.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppWebhookRetryDeliveryResponse' }
+        '400': { $ref: '#/components/responses/AppWebhookInvalid' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanWebhooksNotAllowed' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -7699,6 +7919,161 @@ components:
           type: object
           additionalProperties: { type: string }
 
+    # ─── Outbound webhooks (issue #476 / ADR-076) ──────────────────────────────
+    AppWebhookResponse:
+      description: |
+        An outbound webhook subscription. Carries the masked HMAC secret;
+        the sealed ciphertext is server-side only.
+      type: object
+      required: [id, app_id, account_id, target_url, webhook_secret_sealed_masked, event_filter, retry_policy, enabled, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        app_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        account_id: { type: string, format: uuid }
+        target_url: { type: string, minLength: 8, maxLength: 2048 }
+        webhook_secret_sealed_masked: { type: string, enum: ["***"] }
+        event_filter:
+          type: array
+          items: { type: string }
+          maxItems: 32
+        retry_policy: { type: string, enum: [default, aggressive, none] }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      example:
+        id: "0123456789abcdef0123456789abcdef"
+        app_id: "fedcba9876543210fedcba9876543210"
+        account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
+        target_url: "https://example.com/hook"
+        webhook_secret_sealed_masked: "***"
+        event_filter: ["cron.fired", "app.created"]
+        retry_policy: "default"
+        enabled: true
+        created_at: "2026-08-06T10:00:00Z"
+        updated_at: "2026-08-06T10:00:00Z"
+
+    CreateAppWebhookRequest:
+      type: object
+      description: |
+        Subscribe a target URL to events emitted by the app. The
+        webhook_secret is HMAC-SHA256 sealed at rest with the host
+        X25519 recipient (namespace `APP_WEBHOOK`); apid mints a fresh
+        32-byte secret if omitted.
+      required: [target_url, webhook_secret]
+      properties:
+        target_url: { type: string, minLength: 8, maxLength: 2048 }
+        webhook_secret: { type: string, minLength: 1, maxLength: 256 }
+        event_filter:
+          type: array
+          items: { type: string, enum: ["cron.fired", "app.created", "app.deleted", "build.succeeded", "build.failed"] }
+          maxItems: 32
+        retry_policy: { type: string, enum: [default, aggressive, none], default: default }
+        enabled: { type: boolean, default: true }
+      example:
+        target_url: "https://example.com/hook"
+        webhook_secret: "shh"
+        event_filter: ["cron.fired", "app.created"]
+        retry_policy: "default"
+        enabled: true
+
+    UpdateAppWebhookRequest:
+      type: object
+      description: |
+        Partial update of an existing webhook subscription. Every
+        field is optional — the handler merges the supplied fields
+        onto the current row. omit a field to leave it unchanged.
+      properties:
+        target_url: { type: string, minLength: 8, maxLength: 2048 }
+        webhook_secret: { type: string, minLength: 1, maxLength: 256 }
+        event_filter:
+          type: array
+          items: { type: string, enum: ["cron.fired", "app.created", "app.deleted", "build.succeeded", "build.failed"] }
+          maxItems: 32
+        retry_policy: { type: string, enum: [default, aggressive, none] }
+        enabled: { type: boolean }
+      example:
+        target_url: "https://example.com/hook2"
+        enabled: true
+
+    RotateAppWebhookSecretResponse:
+      type: object
+      description: |
+        Response from POST /v1/apps/{slug}/webhooks/{id}/rotate-secret.
+        The plaintext secret is NEVER returned; the masked field is
+        a constant sentinel so the dashboard renders the same shape
+        across all secret-bearing rows (mirrors AlertRule rotate).
+      required: [rotated_at, webhook_secret_sealed_masked]
+      properties:
+        rotated_at: { type: string, format: date-time }
+        webhook_secret_sealed_masked: { type: string, enum: ["***"] }
+      example:
+        rotated_at: "2026-08-06T12:00:00Z"
+        webhook_secret_sealed_masked: "***"
+
+    AppWebhookDeliveryResponse:
+      type: object
+      description: |
+        One row per (event × target) emission. The dispatcher mutates
+        this row in place as attempts progress; the GET /deliveries
+        endpoint returns this shape per row. attempt=7 + status='dead'
+        is the DLQ state; the customer-facing retry endpoint flips a
+        dead row back to status='pending' for one more shot.
+      required: [id, webhook_id, app_id, account_id, event, attempt, status, next_attempt_at, created_at, updated_at]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        webhook_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        app_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        account_id: { type: string, format: uuid }
+        event: { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+          description: The original event payload (omitted on rows past the first attempt; the customer has already seen it).
+        attempt: { type: integer, minimum: 0, maximum: 8 }
+        status: { type: string, enum: [pending, in_flight, succeeded, failed, dead] }
+        last_error: { type: string }
+        last_response_code: { type: integer, minimum: 0, maximum: 599 }
+        next_attempt_at: { type: string, format: date-time }
+        delivered_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      example:
+        id: "0123456789abcdef0123456789abcdef"
+        webhook_id: "fedcba9876543210fedcba9876543210"
+        app_id: "8b1f5e5d273e5a18ae0058fceba4fe6c"
+        account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
+        event: "cron.fired"
+        payload: {"cron_name": "nightly-rollup"}
+        attempt: 0
+        status: "pending"
+        next_attempt_at: "2026-08-06T10:00:00Z"
+        created_at: "2026-08-06T10:00:00Z"
+        updated_at: "2026-08-06T10:00:00Z"
+
+    AppWebhookDeliveryListResponse:
+      type: object
+      description: |
+        Paged deliveries surface for the dashboard's "recent
+        deliveries" pane. page_token is opaque + base64-encoded —
+        treat it as a cursor; do not parse it.
+      required: [deliveries]
+      properties:
+        deliveries:
+          type: array
+          items: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
+        next_token: { type: string, description: "Cursor for the next page; empty/absent when the page is the last." }
+
+    AppWebhookRetryDeliveryResponse:
+      type: object
+      description: |
+        Response from POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry.
+        Mirrors AppWebhookDeliveryResponse; the row in `delivery` is
+        re-emitted with status='pending' and next_attempt_at=now().
+      required: [delivery]
+      properties:
+        delivery: { $ref: '#/components/schemas/AppWebhookDeliveryResponse' }
+
+
   responses:
 
     Unauthorized:
@@ -7970,3 +8345,22 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
         text/plain:
           schema: { $ref: '#/components/schemas/RateLimitPlain' }
+
+    # ─── Outbound-webhook problem responses ────────────────────────────────────
+    AppWebhookInvalid:
+      description: 'code: app_webhook_invalid — malformed webhook body (missing target_url, invalid retry_policy, out-of-vocabulary event, oversize secret, etc.) or invalid state transition (e.g. retry on a non-dead row).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanWebhooksNotAllowed:
+      description: 'code: plan_webhooks_not_allowed — the plan does not include outbound webhooks (Free today).'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanWebhookQuota:
+      description: 'code: plan_webhook_quota — per-app or per-account webhook limit reached.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

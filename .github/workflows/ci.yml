@@ -932,6 +932,28 @@ jobs:
         # and short-circuits before the `go install` fallback.
         run: make sqlc-check
 
+  daemonunit-check:
+    # DEPLOY-2 / ADR-078 / issue #649: regen-and-diff gate on
+    # pkg/daemonunitspec. Asserts that the systemd unit files in the
+    # three deploy trees (cp-cp, cp-sys, cp-ans) + daemons.json are
+    # byte-equal to what `make generate` would emit from the current
+    # spec files. Pattern matches proto-check / sqlc-check / egress-
+    # check (regenerate-to-tmpdir + git diff --exit-code). PR authors
+    # who edit a UnitXxx() must run `make generate` locally and
+    # commit the regenerated trees.
+    name: daemonunit-check (generated drift)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: generate-check
+        run: make generate-check
+
   e2e-shard1:
     name: e2e (shard 1 — 18 tests)
     runs-on: ubuntu-latest

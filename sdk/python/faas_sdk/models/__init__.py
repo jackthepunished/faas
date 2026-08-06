@@ -41,6 +41,14 @@ from .app_secret_response import AppSecretResponse
 from .app_security_request import AppSecurityRequest
 from .app_security_response import AppSecurityResponse
 from .app_trusted_signer_list_response import AppTrustedSignerListResponse
+from .app_webhook_delivery_list_response import AppWebhookDeliveryListResponse
+from .app_webhook_delivery_response import AppWebhookDeliveryResponse
+from .app_webhook_delivery_response_payload import AppWebhookDeliveryResponsePayload
+from .app_webhook_delivery_response_status import AppWebhookDeliveryResponseStatus
+from .app_webhook_response import AppWebhookResponse
+from .app_webhook_response_retry_policy import AppWebhookResponseRetryPolicy
+from .app_webhook_response_webhook_secret_sealed_masked import AppWebhookResponseWebhookSecretSealedMasked
+from .app_webhook_retry_delivery_response import AppWebhookRetryDeliveryResponse
 from .applied_build import AppliedBuild
 from .apply_response import ApplyResponse
 from .apply_response_apps_item import ApplyResponseAppsItem
@@ -71,6 +79,9 @@ from .create_app_request import CreateAppRequest
 from .create_app_request_eviction_priority import CreateAppRequestEvictionPriority
 from .create_app_request_runtime import CreateAppRequestRuntime
 from .create_app_request_type import CreateAppRequestType
+from .create_app_webhook_request import CreateAppWebhookRequest
+from .create_app_webhook_request_event_filter_item import CreateAppWebhookRequestEventFilterItem
+from .create_app_webhook_request_retry_policy import CreateAppWebhookRequestRetryPolicy
 from .create_cron_request import CreateCronRequest
 from .create_custom_domain_request import CreateCustomDomainRequest
 from .create_deployment_files_body import CreateDeploymentFilesBody
@@ -202,6 +213,10 @@ from .raise_overage_cap_request import RaiseOverageCapRequest
 from .rename_app_request import RenameAppRequest
 from .repo_response import RepoResponse
 from .rotate_alert_rule_secret_response import RotateAlertRuleSecretResponse
+from .rotate_app_webhook_secret_response import RotateAppWebhookSecretResponse
+from .rotate_app_webhook_secret_response_webhook_secret_sealed_masked import (
+    RotateAppWebhookSecretResponseWebhookSecretSealedMasked,
+)
 from .rotate_key_response import RotateKeyResponse
 from .rotate_org_api_key_request import RotateOrgAPIKeyRequest
 from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
@@ -238,6 +253,9 @@ from .update_app_request import UpdateAppRequest
 from .update_app_request_eviction_priority_type_1 import UpdateAppRequestEvictionPriorityType1
 from .update_app_request_eviction_priority_type_2_type_1 import UpdateAppRequestEvictionPriorityType2Type1
 from .update_app_request_eviction_priority_type_3_type_1 import UpdateAppRequestEvictionPriorityType3Type1
+from .update_app_webhook_request import UpdateAppWebhookRequest
+from .update_app_webhook_request_event_filter_item import UpdateAppWebhookRequestEventFilterItem
+from .update_app_webhook_request_retry_policy import UpdateAppWebhookRequestRetryPolicy
 from .update_cron_request import UpdateCronRequest
 from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
 from .update_deployment_request import UpdateDeploymentRequest
@@ -298,6 +316,14 @@ __all__ = (
     "AppsMetricsResponseAppsType0",
     "AppsMetricsResponseRange",
     "AppTrustedSignerListResponse",
+    "AppWebhookDeliveryListResponse",
+    "AppWebhookDeliveryResponse",
+    "AppWebhookDeliveryResponsePayload",
+    "AppWebhookDeliveryResponseStatus",
+    "AppWebhookResponse",
+    "AppWebhookResponseRetryPolicy",
+    "AppWebhookResponseWebhookSecretSealedMasked",
+    "AppWebhookRetryDeliveryResponse",
     "AsyncInvokeResponse",
     "AuditEventResponse",
     "AuditEventResponseData",
@@ -322,6 +348,9 @@ __all__ = (
     "CreateAppRequestEvictionPriority",
     "CreateAppRequestRuntime",
     "CreateAppRequestType",
+    "CreateAppWebhookRequest",
+    "CreateAppWebhookRequestEventFilterItem",
+    "CreateAppWebhookRequestRetryPolicy",
     "CreateCronRequest",
     "CreateCustomDomainRequest",
     "CreateDeploymentFilesBody",
@@ -453,6 +482,8 @@ __all__ = (
     "RenameAppRequest",
     "RepoResponse",
     "RotateAlertRuleSecretResponse",
+    "RotateAppWebhookSecretResponse",
+    "RotateAppWebhookSecretResponseWebhookSecretSealedMasked",
     "RotateKeyResponse",
     "RotateOrgAPIKeyRequest",
     "RotateOrgAPIKeyResponse",
@@ -489,6 +520,9 @@ __all__ = (
     "UpdateAppRequestEvictionPriorityType1",
     "UpdateAppRequestEvictionPriorityType2Type1",
     "UpdateAppRequestEvictionPriorityType3Type1",
+    "UpdateAppWebhookRequest",
+    "UpdateAppWebhookRequestEventFilterItem",
+    "UpdateAppWebhookRequestRetryPolicy",
     "UpdateCronRequest",
     "UpdateDeploymentMinInstancesBody",
     "UpdateDeploymentRequest",

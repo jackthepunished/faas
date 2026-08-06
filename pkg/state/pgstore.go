@@ -450,9 +450,13 @@ func (s *PgStore) ConsumeRecoveryCode(ctx context.Context, id string, presented 
 // The SELECT runs FOR SHARE so a concurrent /disable's
 // ConsumeRecoveryCode (which takes FOR UPDATE) blocks until we
 // commit, serialising the refuse vs the disable race correctly.
-// A short read tx is enough — we never write.
+// A short read tx is enough — we never write. NOTE: the tx must NOT
+// be opened READ ONLY — PostgreSQL rejects `SELECT ... FOR SHARE`
+// inside a read-only transaction (SQLSTATE 25006), which would make
+// every MatchRecoveryCode call fail at runtime. The FOR SHARE lock
+// itself is the concurrency control; the method never issues a write.
 func (s *PgStore) MatchRecoveryCode(ctx context.Context, id string, presented []byte) (bool, bool, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, false, fmt.Errorf("state: mfa match tx: %w", err)
 	}
@@ -1759,10 +1763,10 @@ func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]I
 // owns; without this filter every schedd would fire every cron and
 // the duplicate-dispatch hazard would corrupt the
 // cron_fired_audit row. The apps_node_id_idx covers the JOIN.
-// Projection matches scanCrons: id, app_id, schedule, path, enabled
-// (5 columns — the crons table is intentionally narrow).
+// Projection matches scanCrons: id, app_id, schedule, path, enabled,
+// created_at (6 columns).
 func (s *PgStore) ListOwnedCronsByNodeID(ctx context.Context, nodeID string) ([]Cron, error) {
-	sel := `select c.id, c.app_id, c.schedule, c.path, c.enabled
+	sel := `select c.id, c.app_id, c.schedule, c.path, c.enabled, c.created_at
 		   from crons c
 		   join apps a on a.id = c.app_id
 		  where a.node_id = $1`
@@ -4232,7 +4236,7 @@ func (s *PgStore) ClaimNextQueuedBuildWithFairness(ctx context.Context, fairness
 		    where b.status = 'queued'
 		 ),
 		 fresh_candidates as (
-		   select id from queued_with_account
+		   select id, enqueued_at from queued_with_account
 		    where account_id not in (select account_id from skipped)
 		 ),
 		 has_fresh as (
@@ -4240,10 +4244,10 @@ func (s *PgStore) ClaimNextQueuedBuildWithFairness(ctx context.Context, fairness
 		 ),
 		 target as (
 		   -- prefer fresh; if none, fall back to ALL queued (starvation guard)
-		   select id from fresh_candidates
+		   select id, enqueued_at from fresh_candidates
 		    where (select yes from has_fresh)
 		   union all
-		   select id from queued_with_account
+		   select id, enqueued_at from queued_with_account
 		    where not (select yes from has_fresh)
 		    order by enqueued_at
 		    limit 1
@@ -5586,13 +5590,29 @@ func (s *PgStore) ListInvocationsForAccount(ctx context.Context, accountID strin
 	// (one to fetch the cursor row, one to scan). Per-account page
 	// counts are small (single customer scale) so the planner picks the
 	// existing PK + sort anyway.
-	rows, err := s.pool.Query(ctx, `select `+invocationSelectCols+`
-		from invocations
-		where account_id = $1
-		  and ($2::text = '' or created_at < (
-		      select created_at from invocations where id = $2 and account_id = $1))
-		order by created_at desc, id desc
-		limit $3`, accountID, before, limit)
+	//
+	// The empty-cursor case must NOT reference the subquery at all —
+	// PostgreSQL type-checks the entire statement, so `id = $2` with a
+	// text parameter against a uuid column raises 42883 (uuid = text)
+	// even when the `$2 = ''` short-circuit would skip it at runtime.
+	// Branch on the cursor in Go instead.
+	var rows pgx.Rows
+	var err error
+	if before == "" {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where account_id = $1
+			order by created_at desc, id desc
+			limit $2`, accountID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where account_id = $1
+			  and created_at < (
+			      select created_at from invocations where id = $2 and account_id = $1)
+			order by created_at desc, id desc
+			limit $3`, accountID, before, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -7081,7 +7101,8 @@ func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bo
 func (s *PgStore) ListComputeNodes(ctx context.Context, includeInactive bool) ([]ComputeNode, error) {
 	q := `
 		select id, name, target_url, vpcpus, mem_mb, max_concurrency,
-		       admission_ceiling_mb, active, last_heartbeat_at, created_at
+		       admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
+		       region, zone, schedd_target_url
 		  from compute_nodes
 	`
 	if !includeInactive {
@@ -9427,7 +9448,7 @@ func scanCrons(rows pgx.Rows) ([]Cron, error) {
 	var out []Cron
 	for rows.Next() {
 		c := Cron{}
-		if err := rows.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled); err != nil {
+		if err := rows.Scan(&c.ID, &c.AppID, &c.Schedule, &c.Path, &c.Enabled, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -11066,7 +11087,11 @@ func scanOrg(r rowScanner) (Org, error) {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on duplicate
 // PK, ErrOrgLastOwner when adding a second active owner would trip the
-// partial unique, ErrNotFound when the org row is missing.
+// partial unique, ErrNotFound when the org row is missing,
+// ErrOrgMemberCapExceeded when the org's active-member count has
+// reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2 — the
+// defence-in-depth back-stop; consumeOrgInvitation runs the same
+// check, and cmd/apid's enforceMemberCap gates the handler path).
 func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -11081,6 +11106,21 @@ func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, rol
 	if !orgExists {
 		return ErrNotFound
 	}
+
+	// Defence-in-depth note (IAM-6 / ADR-061 PR 2):
+	// AddOrgMember does NOT enforce the OrgMembersMax cap here. The
+	// cap is enforced at two layers instead:
+	//   1. Wire helper `cmd/apid::enforceMemberCap` (handler prelude)
+	//   2. Store `consumeOrgInvitation` (the only consumer path that
+	//      inserts a membership from outside the org)
+	// Both run before the insert lands. A direct `AddOrgMember` call
+	// (e.g. the owner-seed path in `cmd/apid::createSharedOrg` and the
+	// owner-takeover path in `transferOrgOwnership`) is internal — it
+	// always adds exactly one row at a time, with a pre-checked role
+	// from the caller, so a third cap layer would only add a redundant
+	// SQL count + the test-fixture friction of pre-promoting Free orgs
+	// to Hobby. The single-owner partial unique index (`org_memberships_one_owner_idx`)
+	// is the authoritative "one owner per non-personal org" guard.
 
 	var inv *string
 	if invitedBy != nil {
@@ -11351,6 +11391,24 @@ func (s *PgStore) ListOrgMembers(ctx context.Context, orgID string) ([]OrgMember
 	return out, rows.Err()
 }
 
+// CountActiveOrgMembers returns the number of memberships with
+// removed_at IS NULL for the given org. The filter lives at the SQL
+// layer so the count does not scan every row into Go; the partial
+// unique index `org_memberships_account_idx WHERE removed_at IS NULL`
+// (migration 00099_orgs_memberships_invitations.sql) keeps the scan
+// cheap on the typical Hobby/Pro/Scale team-size org.
+func (s *PgStore) CountActiveOrgMembers(ctx context.Context, orgID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		select count(*) from org_memberships
+		 where org_id = $1 and removed_at is null
+	`, orgID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("state: count active org members: %w", err)
+	}
+	return n, nil
+}
+
 // OrgMemberByAccount returns the single (org, account) row.
 func (s *PgStore) OrgMemberByAccount(ctx context.Context, orgID, accountID string) (OrgMembership, error) {
 	row := s.pool.QueryRow(ctx, `
@@ -11464,6 +11522,27 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 		out = append(out, inv)
 	}
 	return out, rows.Err()
+}
+
+// CountPendingOrgInvitations returns the number of invitation rows
+// with consumed_at IS NULL AND revoked_at IS NULL AND expires_at >
+// now() for the given org. The filter lives at the SQL layer; the
+// `now` is computed server-side via `now() at time zone 'utc'` so
+// the SQL matches the in-Go `time.Now()` semantics used elsewhere in
+// the org surface.
+func (s *PgStore) CountPendingOrgInvitations(ctx context.Context, orgID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		select count(*) from org_invitations
+		 where org_id = $1
+		   and consumed_at is null
+		   and revoked_at is null
+		   and (expires_at is null or expires_at > now() at time zone 'utc')
+	`, orgID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("state: count pending org invitations: %w", err)
+	}
+	return n, nil
 }
 
 // ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every

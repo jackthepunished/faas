@@ -17,6 +17,10 @@ import (
 // is published via the Storage backend under StorageKey. Mirrors
 // TestBuildProducesSizedLayer's style on the new key-aware API.
 func TestBuildBase_HappyPath(t *testing.T) {
+	stagingRoot := t.TempDir()
+	tmpRoot := t.TempDir()
+	t.Setenv("FAAS_BASE_STAGING_ROOT", stagingRoot)
+	t.Setenv("FAAS_BASE_TMP_ROOT", tmpRoot)
 	be := newTestStorage(t)
 	run := &mkfsFakeRunner{fill: []byte("FAKE-BASE-EXT4")}
 	b := NewBuilder(run)
@@ -45,6 +49,21 @@ func TestBuildBase_HappyPath(t *testing.T) {
 	}
 	if !containsString(run.argv, "-d") {
 		t.Errorf("argv %v must use -d (mkfs with source dir, no mount needed)", run.argv)
+	}
+	foundTmp := false
+	for _, arg := range run.argv {
+		if !strings.HasSuffix(arg, ".ext4") {
+			continue
+		}
+		if strings.HasPrefix(arg, stagingRoot) {
+			t.Fatalf("base ext4 temp path created under staging root: %q", arg)
+		}
+		if strings.HasPrefix(arg, tmpRoot) {
+			foundTmp = true
+		}
+	}
+	if !foundTmp {
+		t.Errorf("mkfs argv %v does not use configured base temp root %q", run.argv, tmpRoot)
 	}
 	// The legacy OutImage path is NOT used; the Storage backend must
 	// hold the published ext4 at the requested key.

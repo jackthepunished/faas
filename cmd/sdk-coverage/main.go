@@ -168,8 +168,23 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/alerts/{id}":              "UpdateAlertRule",
 	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
 	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
-	"GET /v1/keys":                                   "ListKeys",
-	"POST /v1/keys":                                  "CreateKey",
+
+	// Issue #476 / ADR-076 — outbound webhook subscriptions. Same
+	// pattern as alerts: the SDK names the methods after the resource
+	// noun (AppWebhook / AppWebhookDelivery) rather than the path
+	// placeholder concatenation, and the rotate-secret + retry
+	// routes need explicit pinning to drop the literal hyphen that
+	// the auto-derivation would preserve.
+	"GET /v1/apps/{slug}/webhooks":                              "ListAppWebhooks",
+	"POST /v1/apps/{slug}/webhooks":                             "CreateAppWebhook",
+	"GET /v1/apps/{slug}/webhooks/{id}":                         "GetAppWebhook",
+	"PATCH /v1/apps/{slug}/webhooks/{id}":                       "UpdateAppWebhook",
+	"DELETE /v1/apps/{slug}/webhooks/{id}":                      "DeleteAppWebhook",
+	"POST /v1/apps/{slug}/webhooks/{id}/rotate-secret":          "RotateAppWebhookSecret",
+	"GET /v1/apps/{slug}/webhooks/{id}/deliveries":              "ListAppWebhookDeliveries",
+	"POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry": "RetryAppWebhookDelivery",
+	"GET /v1/keys":  "ListKeys",
+	"POST /v1/keys": "CreateKey",
 	// Move 2 routes — the auto-derivation produces names with literal
 	// hyphens (e.g. "DeleteDelayed-tasksId") because the spec path uses
 	// the k8s-style hyphen; the explicit map below drops the hyphen and

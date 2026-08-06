@@ -2,13 +2,12 @@
 Description=onebox-faas meterd — metering and billing
 After=network.target postgresql.service faas-schedd.service faas-cp.slice
 Wants=faas-cp.slice faas-schedd.service
-Requires=postgresql.service
 
 [Service]
 Type=simple
 User=faas-meterd
 Group=faas
-ExecStart=/opt/faas/bin/meterd --config /etc/faas/meterd.toml
+ExecStart=/opt/faas/current/bin/meterd --config /etc/faas/meterd.toml
 Restart=on-failure
 RestartSec=2s
 Slice=faas-cp.slice

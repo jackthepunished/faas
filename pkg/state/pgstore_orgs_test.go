@@ -13,8 +13,10 @@ package state
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -723,5 +725,73 @@ func TestPgStore_TransferOrgOwnership_AllBranches(t *testing.T) {
 	}
 	if row.Role != OrgRoleDeveloper {
 		t.Errorf("post-failure member role = %q, want developer", row.Role)
+	}
+}
+
+// TestPgStore_ConsumeOrgInvitation_MemberCap pins the IAM-6 / ADR-061
+// PR-2 cap check on the load-bearing insert path. Hobby's
+// OrgMembersMax == 10; an invitation accept that would push active
+// members past 10 must refuse with ErrOrgMemberCapExceeded inside
+// the same tx as the membership insert. Personal orgs never reach
+// the invitation-accept path.
+func TestPgStore_ConsumeOrgInvitation_MemberCap(t *testing.T) {
+	s := newPgStore(t)
+	pool := s.pool
+	ctx := context.Background()
+
+	o, err := s.CreateOrg(ctx, newTestOrg("consume-cap-pg"))
+	if err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `update orgs set plan = 'hobby' where id = $1`, o.ID); err != nil {
+		t.Fatalf("update plan: %v", err)
+	}
+	o.Plan = api.PlanHobby
+
+	// Seed owner + 9 developers (active = 10) via direct AddOrgMember
+	// (which has no cap check; this is the internal owner-seed path).
+	ownerID := "00000000-0000-0000-0000-000000ce0001"
+	devIDs := make([]string, 9)
+	for i := range devIDs {
+		devIDs[i] = fmt.Sprintf("00000000-0000-0000-0000-000000ce%04x", 0x0002+i)
+	}
+	pgStoreSeedAccounts(t, ctx, pool, append([]string{ownerID}, devIDs...)...)
+	if err := s.AddOrgMember(ctx, o.ID, ownerID, OrgRoleOwner, nil); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	for _, id := range devIDs {
+		if err := s.AddOrgMember(ctx, o.ID, id, OrgRoleDeveloper, nil); err != nil {
+			t.Fatalf("seed dev: %v", err)
+		}
+	}
+
+	// Mint an invitation whose accept would make active = 11. The
+	// ConsumeOrgInvitation call must refuse with
+	// ErrOrgMemberCapExceeded inside the same tx — no partial-state
+	// leak.
+	overAcct := Account{
+		ID:    "00000000-0000-0000-0000-000000ce0010",
+		Email: "over-ce@x.com",
+	}
+	pgStoreSeedAccounts(t, ctx, pool, overAcct.ID)
+	plaintext := make([]byte, 32)
+	if _, err := rand.Read(plaintext); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	hash := sha256.Sum256(plaintext)
+	if _, err := s.CreateOrgInvitation(ctx, OrgInvitation{
+		OrgID:     o.ID,
+		Email:     overAcct.Email,
+		Role:      OrgRoleDeveloper,
+		TokenHash: hash[:],
+		ExpiresAt: time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("CreateOrgInvitation: %v", err)
+	}
+	if _, _, err := s.ConsumeOrgInvitation(ctx, hash[:], overAcct); !errors.Is(err, ErrOrgMemberCapExceeded) {
+		t.Fatalf("over-cap ConsumeOrgInvitation: err = %v, want ErrOrgMemberCapExceeded", err)
+	}
+	if _, err := s.OrgMemberByAccount(ctx, o.ID, overAcct.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("OrgMemberByAccount over-cap: err = %v, want ErrNotFound", err)
 	}
 }

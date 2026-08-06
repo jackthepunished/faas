@@ -114,6 +114,14 @@ type MemStore struct {
 	// row (mirrors the UNIQUE-index floor in Postgres).
 	alertRules      map[string]AlertRule
 	alertDeliveries map[string]AlertDelivery
+	// appWebhooks + appWebhookDeliveries back the issue #476
+	// outbound webhook subscription + ledger surface. Keyed by
+	// webhookID / deliveryID. The unique (app_id, target_url)
+	// invariant is enforced at insert time. MemStore holds no
+	// concurrency control beyond m.mu — the dispatcher's claim
+	// query is a single goroutine today.
+	appWebhooks          map[string]AppWebhook
+	appWebhookDeliveries map[string]AppWebhookDelivery
 	// alertClaimKeys tracks the (ruleID, idempotency_key) → claimTime
 	// pair so MemStore mirrors the Postgres UNIQUE(idempotency_key)
 	// + last_fired_at dedupe behaviour. Two claims with the SAME
@@ -459,20 +467,22 @@ func NewMemStore() *MemStore {
 		// buildProvenance is the ADR-038 "what ran?" map keyed by
 		// build_id (mirrors the build_provenance.build_id UNIQUE).
 		// Starts empty; CreateBuildProvenance fills it.
-		buildProvenance:  map[string]BuildProvenance{},
-		domains:          map[string]CustomDomain{},
-		crons:            map[string]Cron{},
-		alertRules:       map[string]AlertRule{},
-		alertDeliveries:  map[string]AlertDelivery{},
-		alertClaimKeys:   map[string]time.Time{},
-		invocations:      map[string]Invocation{},
-		instances:        map[string]Instance{},
-		loginTokens:      map[string]LoginToken{},
-		cliAuthCodes:     map[string]CliAuthCode{},
-		accountPasswords: map[string]AccountPassword{},
-		oauthLinks:       map[string]OAuthLink{},
-		deploymentLogs:   map[string][]LogEntry{},
-		deploymentSeq:    map[string]int64{},
+		buildProvenance:      map[string]BuildProvenance{},
+		domains:              map[string]CustomDomain{},
+		crons:                map[string]Cron{},
+		alertRules:           map[string]AlertRule{},
+		alertDeliveries:      map[string]AlertDelivery{},
+		appWebhooks:          map[string]AppWebhook{},
+		appWebhookDeliveries: map[string]AppWebhookDelivery{},
+		alertClaimKeys:       map[string]time.Time{},
+		invocations:          map[string]Invocation{},
+		instances:            map[string]Instance{},
+		loginTokens:          map[string]LoginToken{},
+		cliAuthCodes:         map[string]CliAuthCode{},
+		accountPasswords:     map[string]AccountPassword{},
+		oauthLinks:           map[string]OAuthLink{},
+		deploymentLogs:       map[string][]LogEntry{},
+		deploymentSeq:        map[string]int64{},
 		// Issue #463 / ADR-069 / PR-B — per-workload filesystem
 		// handles (mirrors migration 00119's PK + ON CONFLICT
 		// semantics).
@@ -7822,7 +7832,7 @@ func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, 
 
 	if in.AppID != "" {
 		app, ok := m.apps[in.AppID]
-		if !ok || app.Status == "deleted" {
+		if !ok || app.Status == AppDeleted {
 			return AlertRule{}, ErrNotFound
 		}
 		// Per-app count: count every rule that pins this app,
@@ -7853,7 +7863,7 @@ func (m *MemStore) CreateAlertRuleIfUnderQuota(_ context.Context, in AlertRule, 
 		}
 		if r.AppID != "" {
 			app, ok := m.apps[r.AppID]
-			if !ok || app.Status == "deleted" {
+			if !ok || app.Status == AppDeleted {
 				continue
 			}
 		}
@@ -8822,11 +8832,16 @@ func (m *MemStore) SoftDeleteOrg(_ context.Context, id string) error {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on
 // duplicate (org_id, account_id), ErrOrgLastOwner when the partial
-// unique would trip, and ErrNotFound on missing parent.
+// unique would trip, and ErrNotFound on missing parent. The
+// OrgMembersMax cap is enforced at consumeOrgInvitation (the only
+// external-insert path) and at the wire helper
+// `cmd/apid::enforceMemberCap`, NOT here — see pkg/state/pgstore.go
+// ::AddOrgMember for the rationale.
 func (m *MemStore) AddOrgMember(_ context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.orgs[orgID]; !ok {
+	_, ok := m.orgs[orgID]
+	if !ok {
 		return ErrNotFound
 	}
 	k := orgAccountKey{OrgID: orgID, AccountID: accountID}
@@ -8945,6 +8960,21 @@ func (m *MemStore) ListOrgMembers(_ context.Context, orgID string) ([]OrgMembers
 	return out, nil
 }
 
+// CountActiveOrgMembers mirrors PgStore.CountActiveOrgMembers — counts
+// memberships with RemovedAt == nil for the given org. Parity test
+// `TestOrgMembersCountParity_PgMemstore` pins the agreement.
+func (m *MemStore) CountActiveOrgMembers(_ context.Context, orgID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, mem := range m.memberships {
+		if mem.OrgID == orgID && mem.RemovedAt == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // OrgMemberByAccount looks up the (org, account) row.
 func (m *MemStore) OrgMemberByAccount(_ context.Context, orgID, accountID string) (OrgMembership, error) {
 	m.mu.Lock()
@@ -9006,6 +9036,29 @@ func (m *MemStore) ConsumeOrgInvitation(_ context.Context, hash []byte, acceptin
 	if !strings.EqualFold(inv.Email, acceptingAccount.Email) {
 		return OrgMembership{}, OrgInvitation{}, ErrOrgInvitationInvalid
 	}
+	// IAM-6 / ADR-061 PR 2 cap check (load-bearing). Mirrors
+	// PgStore.ConsumeOrgInvitation. Free + unknown plans read 0
+	// (plan-policy fail-closed) so the `limit > 0` early-return keeps
+	// them quiet — the abuse-floor tier cannot host shared orgs in
+	// the first place, so reaching here is already a customer-flow
+	// fault, not a cap-arithmetic decision.
+	org, ok := m.orgs[inv.OrgID]
+	if !ok {
+		return OrgMembership{}, OrgInvitation{}, ErrNotFound
+	}
+	limits, _ := api.LimitsFor(org.Plan)
+	limit := limits.OrgMembersMax
+	if limit > 0 {
+		active := 0
+		for _, existing := range m.memberships {
+			if existing.OrgID == inv.OrgID && existing.RemovedAt == nil {
+				active++
+			}
+		}
+		if active >= limit {
+			return OrgMembership{}, OrgInvitation{}, ErrOrgMemberCapExceeded
+		}
+	}
 	// Insert membership; surface ErrOrgAlreadyMember if a parallel
 	// accept beat us.
 	k := orgAccountKey{OrgID: inv.OrgID, AccountID: acceptingAccount.ID}
@@ -9059,6 +9112,31 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
+}
+
+// CountPendingOrgInvitations mirrors PgStore.CountPendingOrgInvitations
+// — counts invitation rows that are not consumed, not revoked, and
+// not past expires_at. Parity test
+// `TestOrgPendingInvitationsCountParity_PgMemstore` pins the
+// agreement.
+func (m *MemStore) CountPendingOrgInvitations(_ context.Context, orgID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, inv := range m.invitations {
+		if inv.OrgID != orgID {
+			continue
+		}
+		if inv.ConsumedAt != nil || inv.RevokedAt != nil {
+			continue
+		}
+		if !inv.ExpiresAt.IsZero() && now.After(inv.ExpiresAt) {
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // ExpireOrgInvitations is the cleanup tick — stamps revoked_at on every

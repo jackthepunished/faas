@@ -121,23 +121,38 @@ func (s *server) loadMutableOrgByMembership(ctx context.Context, w http.Response
 	return org, true
 }
 
+// enforceMemberCap is the wire-side mirror of the store-side cap
+// check inside ConsumeOrgInvitation. It applies the per-plan
+// OrgMembersMax limit on a future direct-add (no-invite) route.
+// Free + unknown plans have OrgMembersMax == 0 by plan policy —
+// the abuse-floor tier cannot host shared orgs. The helper lands
+// here in this PR (the populated constants per plan are the
+// prerequisite) but is left intentionally unwired: today the only
+// store-side paths that insert memberships are (1) AddOrgMember as
+// the initial-owner seed at org creation — the store carves this
+// out — and (2) ConsumeOrgInvitation on invitation accept — the
+// store enforces the cap in-tx. A future direct-add route only
+// needs to call `s.enforceMemberCap(...)` (read as a TODO on
+// `cmd/apid/handlers_org_members.go`), the helper shape is final.
+
 // enforcePendingInvitationCap applies the per-plan
-// OrgPendingInvitationsMax limit. Plan.OrgPendingInvitationsMax()
-// is 0 until the financial model populates it, so the > 0 guard
-// keeps the limit closed-off in PR 5; once the model lands the
-// branch opens without a handler-shape change. Returns true when
-// the cap allows the new invitation; on exceed, writes the 403
-// Problem and returns false. On Store failure, writes a 500
-// Problem and returns false.
+// OrgPendingInvitationsMax limit on POST /v1/orgs/{slug}/members.
+// Free + unknown plans have OrgPendingInvitationsMax == 0 by plan
+// policy — the abuse-floor tier cannot host shared orgs. The
+// `limit <= 0` early-return keeps Free + unknown plans quiet
+// (plan-policy closure, not cap arithmetic). Returns true when the
+// cap allows the new invitation; on exceed, writes the 403 Problem
+// and returns false. On Store failure, writes a 500 Problem and
+// returns false.
 func (s *server) enforcePendingInvitationCap(ctx context.Context, w http.ResponseWriter, org state.Org) bool {
 	limit := org.Plan.OrgPendingInvitationsMax()
 	if limit <= 0 {
 		return true
 	}
-	pending, err := s.countPendingOrgInvitations(ctx, org.ID)
+	pending, err := s.store.CountPendingOrgInvitations(ctx, org.ID)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
-			api.CodeCapacity, "ListOrgInvitationsForOrg failed",
+			api.CodeCapacity, "CountPendingOrgInvitations failed",
 			"try again; if the problem persists, contact support"))
 		return false
 	}

@@ -196,10 +196,14 @@ cd "${FAAS_SRC}"
 make build
 mkdir -p "${FAAS_BIN}"
 find bin -maxdepth 1 -type f -exec install -m 0755 {} "${FAAS_BIN}/" \;
-# Also build the migrate tool
+# Also build the migrate tool and the host-side deployment controller.
 go build -o bin/migrate ./cmd/migrate
-install -m 0755 bin/migrate "${FAAS_BIN}/"
-ok "Binaries in ${FAAS_BIN}"
+go build -o bin/deployctl ./cmd/deployctl
+install -m 0755 bin/migrate bin/deployctl "${FAAS_BIN}/"
+# Initial bootstrap keeps the legacy bin directory as the first release. Future
+# releases atomically replace /opt/faas/current with a versioned release path.
+ln -sfn "${FAAS_ROOT}" "${FAAS_ROOT}/current"
+ok "Binaries in ${FAAS_BIN}; current release pointer initialized"
 
 # ─── 9. Drop configs ─────────────────────────────────────────────────────────
 step "Installing configs"

@@ -2593,6 +2593,14 @@ type Store interface {
 	// filters removed rows at the API boundary.
 	ListOrgMembers(ctx context.Context, orgID string) ([]OrgMembership, error)
 
+	// CountActiveOrgMembers returns the number of memberships with
+	// removed_at IS NULL for the given org. Filtered at the SQL
+	// layer so the count does not scan every row into Go. Used by
+	// apid's enforceMemberCap (Plan.OrgMembersMax) and by the
+	// store-side defence-in-depth check inside consumeOrgInvitation.
+	// Returns 0 when the org has no rows.
+	CountActiveOrgMembers(ctx context.Context, orgID string) (int, error)
+
 	// OrgMemberByAccount returns the (org_id, account_id) row.
 	// Returns ErrNotFound when no membership exists.
 	OrgMemberByAccount(ctx context.Context, orgID, accountID string) (OrgMembership, error)
@@ -2629,9 +2637,112 @@ type Store interface {
 	// caller.
 	ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([]OrgInvitation, error)
 
+	// CountPendingOrgInvitations returns the number of invitation
+	// rows with consumed_at IS NULL AND revoked_at IS NULL AND
+	// expires_at > now() for the given org. Filtered at the SQL
+	// layer so the count does not scan every row into Go. Used by
+	// apid's enforcePendingInvitationCap (Plan.OrgPendingInvitationsMax).
+	// Returns 0 when the org has no rows.
+	CountPendingOrgInvitations(ctx context.Context, orgID string) (int, error)
+
 	// ExpireOrgInvitations is the cleanup-tick method (modelled on
 	// the login-token cleanup loop) that stamps revoked_at on every
 	// pending + past-expires_at row in one UPDATE. Returns the count
 	// of rows transitioned so the caller can log a metric.
 	ExpireOrgInvitations(ctx context.Context, now time.Time) (int64, error)
+
+	// ----------------------------------------------------------------------------
+	// Outbound webhook delivery (issue #476 / ADR-076)
+	//
+	// AppWebhook CRUD lives behind the same per-account / per-app quota
+	// gate as AlertRule (mirrors CreateAlertRuleIfUnderQuota at
+	// store.go:1422-1432). The dispatcher's claim/mark methods live
+	// alongside the CRUD so the dispatcher can compose a tick without
+	// touching the apid-side surface.
+	// ----------------------------------------------------------------------------
+
+	// CreateAppWebhook is the un-capped insert path used by tests. The
+	// customer-facing handler always calls CreateAppWebhookIfUnderQuota.
+	CreateAppWebhook(ctx context.Context, w AppWebhook) (AppWebhook, error)
+	// CreateAppWebhookIfUnderQuota inserts a webhook iff the per-app
+	// and per-account caps (limits.WebhookPerApp /
+	// WebhookPerAccount) are not yet reached. The account cap is
+	// checked under an accounts-row FOR UPDATE lock; the per-app cap
+	// is checked under an apps-row FOR UPDATE lock — same TOCTOU-
+	// defence pattern as CreateCronIfUnderQuota (store.go:1385-1396).
+	// Returns:
+	//   - (AppWebhook{}, *AppWebhookQuotaError) when either cap trips
+	//   - (AppWebhook{}, ErrNotFound) when the app row is missing
+	//   - (AppWebhook{}, ErrConflict) on a duplicate (app_id, target_url)
+	CreateAppWebhookIfUnderQuota(ctx context.Context, w AppWebhook, limits api.Limits) (AppWebhook, error)
+	AppWebhookByID(ctx context.Context, id string) (AppWebhook, error)
+	// UpdateAppWebhook mutates the optional fields of a webhook row.
+	// See UpdateAppWebhookParams at types.go for the pointer-to-
+	// pointer contract (nil = don't touch).
+	UpdateAppWebhook(ctx context.Context, id string, params UpdateAppWebhookParams) (AppWebhook, error)
+	DeleteAppWebhook(ctx context.Context, id string) error
+	ListAppWebhooksForApp(ctx context.Context, appID string) ([]AppWebhook, error)
+	// ListAppWebhooksForAccount backs the per-account GET endpoint
+	// and the operator's "all webhooks for an account" view.
+	ListAppWebhooksForAccount(ctx context.Context, accountID string) ([]AppWebhook, error)
+
+	// RecordAppWebhookDelivery is the apid-side enqueue. Called by
+	// the event emitters (cron dispatcher, app lifecycle handlers)
+	// once per (event, target webhook) emission. The dispatcher's
+	// claim query picks the row up at next_attempt_at <= now().
+	RecordAppWebhookDelivery(ctx context.Context, d AppWebhookDelivery) (AppWebhookDelivery, error)
+
+	// ClaimDueAppWebhookDeliveries is the dispatcher's tick entry.
+	// In a single transaction it:
+	//   1. Locks up to `limit` rows whose status IN
+	//      ('pending','in_flight') AND next_attempt_at <= `now`,
+	//      ORDER BY account_id, next_attempt_at (per-account round-
+	//      robin emerges from the ORDER BY).
+	//   2. Transitions status='pending' → 'in_flight' for the locked
+	//      rows. 'in_flight' rows that were already past
+	//      next_attempt_at (orphaned by a dispatcher restart) are
+	//      re-claimed and re-tried — see MarkAppWebhookDeliveryFailed
+	//      for the crash-recovery reasoning.
+	//   3. Returns the locked rows for the caller to process.
+	// The transaction commits before the dispatcher starts the HTTP
+	// work; status='in_flight' is the post-commit visible state.
+	ClaimDueAppWebhookDeliveries(ctx context.Context, limit int, now time.Time) ([]AppWebhookDelivery, error)
+	// MarkAppWebhookDeliverySucceeded stamps status='succeeded',
+	// delivered_at=deliveredAt, last_response_code=responseCode,
+	// attempt=currentAttempt+1 (the successful attempt count). The
+	// dispatcher calls this on a 2xx response.
+	MarkAppWebhookDeliverySucceeded(ctx context.Context, id string, responseCode int, currentAttempt int, deliveredAt time.Time) error
+	// MarkAppWebhookDeliveryFailed stamps status='failed',
+	// next_attempt_at=nextAttemptAt, attempt=currentAttempt+1,
+	// last_error=errMsg, last_response_code=responseCode. The
+	// dispatcher calls this on a retryable error (5xx/408/429/
+	// network) when the next attempt is within the budget.
+	MarkAppWebhookDeliveryFailed(ctx context.Context, id string, responseCode int, currentAttempt int, errMsg string, nextAttemptAt time.Time) error
+	// MarkAppWebhookDeliveryDead stamps status='dead' with the
+	// supplied errMsg. The dispatcher calls this on:
+	//   - attempt >= 7 (budget exhausted)
+	//   - terminal 4xx (non-408/429)
+	// Once dead, the row stays dead until the customer POSTs
+	// /deliveries/{id}/retry.
+	MarkAppWebhookDeliveryDead(ctx context.Context, id string, currentAttempt int, errMsg string) error
+	// ResetAppWebhookDeliveryFromDead is the customer-facing
+	// "retry a dead delivery" path. Stamps status='pending',
+	// next_attempt_at=now, attempt=0 (full budget re-armed). Used
+	// by the apid POST /retry handler and the gregale
+	// `webhooks retry` subcommand. The webhookID + accountID
+	// filters are the SQL-level IDOR guard: a caller holding a
+	// delivery id from another customer's webhook gets ErrNotFound,
+	// not silent cross-tenant reset.
+	ResetAppWebhookDeliveryFromDead(ctx context.Context, id, webhookID, accountID string, now time.Time) error
+
+	// ListAppWebhookDeliveries backs GET
+	// /v1/apps/{slug}/webhooks/{id}/deliveries. pageToken is the
+	// opaque cursor returned by the previous call ("" = first page).
+	// The result is ordered by created_at DESC (most recent first)
+	// — the dashboard's "recent deliveries" pane orientation.
+	ListAppWebhookDeliveries(ctx context.Context, appID, webhookID string, pageSize int, pageToken string) ([]AppWebhookDelivery, string, error)
+	// AppWebhookDeliveryByID backs the per-delivery retry path (POST
+	// /deliveries/{id}/retry) and the dispatcher-side audit
+	// emission that needs to read the row's account_id + app_id.
+	AppWebhookDeliveryByID(ctx context.Context, id string) (AppWebhookDelivery, error)
 }
