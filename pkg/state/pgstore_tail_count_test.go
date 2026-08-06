@@ -93,6 +93,13 @@ func TestPg_BumpInstanceTailCount_AddsAndReturnsPostValue(t *testing.T) {
 	_, _, insID := seedTailCountInstancePg(t, pool)
 	store := state.NewPgStore(pool)
 
+	// Reset the column absolutely so the test is deterministic
+	// regardless of which other tests in this package ran first
+	// against the same per-test isolated schema.
+	if _, err := pool.Exec(ctx, `update instances set tail_count = 0 where id = $1`, insID); err != nil {
+		t.Fatalf("reset tail_count: %v", err)
+	}
+
 	post, err := store.BumpInstanceTailCount(ctx, insID, 1)
 	if err != nil {
 		t.Fatalf("bump +1: %v", err)
@@ -134,7 +141,13 @@ func TestPg_DecrementInstanceTailCount_DecrementsAndFloors(t *testing.T) {
 	_, _, insID := seedTailCountInstancePg(t, pool)
 	store := state.NewPgStore(pool)
 
-	// Seed at 3.
+	// Seed at exactly 3 — reset the column absolutely first so this
+	// test is deterministic regardless of which other tests ran
+	// against the same isolated schema (the schema is per-test but
+	// tests in the same package share the cluster).
+	if _, err := pool.Exec(ctx, `update instances set tail_count = 0 where id = $1`, insID); err != nil {
+		t.Fatalf("reset tail_count: %v", err)
+	}
 	if _, err := store.BumpInstanceTailCount(ctx, insID, 3); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -176,6 +189,12 @@ func TestPg_BumpInstanceTailCount_NegativeDeltaFloorsAtZero(t *testing.T) {
 	}
 	_, _, insID := seedTailCountInstancePg(t, pool)
 	store := state.NewPgStore(pool)
+
+	// Reset to 0 absolutely — same determinism rationale as the
+	// additive tests above.
+	if _, err := pool.Exec(ctx, `update instances set tail_count = 0 where id = $1`, insID); err != nil {
+		t.Fatalf("reset tail_count: %v", err)
+	}
 
 	post, err := store.BumpInstanceTailCount(ctx, insID, -5)
 	if err != nil {
