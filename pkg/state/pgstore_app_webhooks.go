@@ -551,7 +551,7 @@ type appWebhookScanner interface {
 func scanAppWebhook(s appWebhookScanner) (AppWebhook, error) {
 	var (
 		w      AppWebhook
-		filter []string
+		filter []byte
 		retry  string
 	)
 	err := s.Scan(
@@ -562,8 +562,10 @@ func scanAppWebhook(s appWebhookScanner) (AppWebhook, error) {
 		return AppWebhook{}, err
 	}
 	w.RetryPolicy = AppWebhookRetryPolicy(retry)
-	if filter != nil {
-		w.EventFilter = filter
+	if len(filter) > 0 {
+		if err := json.Unmarshal(filter, &w.EventFilter); err != nil {
+			return AppWebhook{}, fmt.Errorf("state: scan app_webhook event_filter: %w", err)
+		}
 	}
 	if w.EventFilter == nil {
 		w.EventFilter = []string{}
@@ -588,14 +590,16 @@ func scanAppWebhooks(rows pgx.Rows) ([]AppWebhook, error) {
 
 func scanAppWebhookDelivery(s appWebhookScanner) (AppWebhookDelivery, error) {
 	var (
-		d       AppWebhookDelivery
-		payload []byte
-		status  string
-		event   string
+		d          AppWebhookDelivery
+		payload    []byte
+		status     string
+		event      string
+		lastErr    *string
+		lastRespCo *int32
 	)
 	err := s.Scan(
 		&d.ID, &d.WebhookID, &d.AppID, &d.AccountID, &event, &payload,
-		&d.Attempt, &status, &d.LastError, &d.LastResponseCode,
+		&d.Attempt, &status, &lastErr, &lastRespCo,
 		&d.NextAttemptAt, &d.DeliveredAt, &d.CreatedAt, &d.UpdatedAt,
 	)
 	if err != nil {
@@ -604,6 +608,12 @@ func scanAppWebhookDelivery(s appWebhookScanner) (AppWebhookDelivery, error) {
 	d.Event = AppWebhookEvent(event)
 	d.Status = AppWebhookDeliveryStatus(status)
 	d.Payload = json.RawMessage(payload)
+	if lastErr != nil {
+		d.LastError = *lastErr
+	}
+	if lastRespCo != nil {
+		d.LastResponseCode = int(*lastRespCo)
+	}
 	return d, nil
 }
 
