@@ -50,7 +50,7 @@ If the Hetzner token is the cause, rotate it:
 
 1. Generate a new token in the Hetzner Cloud Console.
 2. Drop the sealed token at `cfg.HetznerDNSAPITokenPath` (re-run
-   `faas secrets seal` on the EX44; the LoadCredential call is
+   `faas secrets seal` on the reference node; the LoadCredential call is
    what gatewayd reads).
 3. `systemctl restart faas-gatewayd` (the H4 file-watch reload is
    the open follow-up; until then, a restart is the rotation step).

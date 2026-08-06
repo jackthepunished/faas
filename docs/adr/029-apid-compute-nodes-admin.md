@@ -15,7 +15,7 @@ the only writer was schedd (the watchdog) or vmmd (self-
 registration); an operator adding a new box to a fleet had to
 `INSERT` SQL by hand.
 
-That works for one box but breaks down at fleet scale: a typo in
+That works for one node but breaks down at fleet scale: a typo in
 `target_url` is a 503 from the customer's first request, not a
 loud-fail at registration time. The slice needs an HTTP surface so
 operators can pre-register a box (catch typos before vmmd boots),

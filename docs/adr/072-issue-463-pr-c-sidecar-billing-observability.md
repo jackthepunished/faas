@@ -200,7 +200,7 @@ Why busybox httpd and not a real malloc-helper workload?
   memory pressure.
 - The ALC / Dockerfile-based fixture would add a new build
   chain (imaged + OCI image-shipping) for a single test,
-  and the busybox path is portable across the EX44's
+  and the busybox path is portable across the reference node's
   x86_64 and the Lima arm64 guest.
 
 ## Files changed
@@ -345,9 +345,9 @@ Why busybox httpd and not a real malloc-helper workload?
    Acceptable: 8 bytes × `max_concurrency(plan)` per app per
    minute.
 3. **OOM gate repeatability.** The busybox httpd + sparse
-   fixture path is portable across the EX44's x86_64 and the
+   fixture path is portable across the reference node's x86_64 and the
    Lima arm64 guest. The §14 metal acceptance gates still run
-   on the EX44 for the production x86_64 snapshot.
+   on the reference node for the production x86_64 snapshot.
 4. **Restart counter cardinality.** Bounded by
    `SidecarCapMax × apps`. Today's max is 2 × 100 = 200
    series worst-case (Scale plan overage). Below Prometheus's

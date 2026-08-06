@@ -33,7 +33,7 @@ file-watch reload is a follow-up.
 
 1. Generate a new token in the Hetzner Cloud Console. Label it
    `gatewayd-prod-YYYY-MM-DD` so the rotation history is auditable.
-2. Install it on the EX44:
+2. Install it on the reference node:
 
    ```sh
    sudo install -m 0440 -o root -g faas /dev/stdin \

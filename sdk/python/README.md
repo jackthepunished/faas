@@ -1,5 +1,5 @@
-# faas_sdk
-A client library for accessing one-box FaaS REST API
+# gregale_sdk
+A client library for accessing the Gregale REST API
 
 ## Usage
 First, create a client:

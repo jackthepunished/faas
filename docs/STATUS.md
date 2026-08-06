@@ -10,7 +10,8 @@ for context.
 
 Repo tree, build/test/lint tooling, CI, `pkg/api` limits table,
 8-role ansible bootstrap, hello-boot acceptance test. `make bootstrap`
-gates it on a fresh EX44.
+gates it on a fresh bare-metal x86_64 control-plane node (reference deploy:
+the original Hetzner EX44).
 
 ## M1 — vmmd core. ✅
 
@@ -30,8 +31,8 @@ boot verified metal-side (`cmd/e2e/deploy_wake_metal_test.go`).
 
 **Fixture follow-up:** the body/trim mismatch originally flagged in PR #55
 was resolved by PRs #151, #159, #135; `deploy_wake_metal_test.go` is now
-exercised by the M8 netns + egress test path. EX44 / Lima sign-off on the
-§14 metal acceptance gate is tracked under [What's next](#whats-next).
+exercised by the M8 netns + egress test path. Reference-node + Lima sign-off
+on the §14 metal acceptance gate is tracked under [What's next](#whats-next).
 
 ## M3 — snapshots + wake. ✅
 
@@ -62,7 +63,7 @@ one cold-boot priming cycle, and the G2 sealed-secrets path
 
 **Fixture follow-up:** the body/trim mismatch flagged in PR #55
 was resolved by PRs #151, #159, #135 (same fixture exercised by
-the M8 netns + egress path). EX44 / Lima sign-off on the §14
+the M8 netns + egress path). Reference-node + Lima sign-off on the §14
 metal acceptance gate is tracked under [What's next](#whats-next).
 
 **Beta ship-blockers landed** — PR #136 (`PR-A`, ship-blockers
@@ -146,7 +147,7 @@ of falling through to Railpack-auto.
 `apid → pg_notify('build_queued') → builderd → vmmd → firecracker
 → in-VM Railpack/buildctl → OCI image.tar → imaged →
 deployments.Live` across three fixture paths (Node, Python,
-Dockerfile). EX44 sign-off remains the §14 source of truth per
+Dockerfile). Reference-node sign-off remains the §14 source of truth per
 CLAUDE.md.
 
 ## M7 — metering, billing, functions, cron. 🚧
@@ -277,7 +278,7 @@ spinner) and PR #51 (the closeout batch):
 - **§11 cgroup fence verified** — #33 `memory.max = plan + 8 MB`
   after bringUp; unit tests in `pkg/fcvm/cgroup_test.go` green;
   metal test in `pkg/fcvm/manager_metal_test.go::TestMetalMemoryMaxFenceEnforced`
-  runs on EX44 (`make test-metal`) and Lima (`make metal-lima`),
+  runs on a reference control-plane node (`make test-metal`) and Lima (`make metal-lima`),
   not on a bare dev box.
 - **§12 SLO dashboard pipeline** — `fcvm_snapshot_fleet_avg_bytes`,
   `fcvm_snapshot_fleet_p95_bytes`, `fcvm_resident_ram_pct`,
@@ -302,7 +303,7 @@ spinner) and PR #51 (the closeout batch):
   [M8 — alert pipeline](#m8--alert-pipeline--this-pr) below.
 - **§14 restore drill wired** —
   `deploy/scripts/faas-m8-restore-drill.sh` plus WAL-archiving
-  knobs in the postgres ansible role. A timed EX44 run (PG + one
+  knobs in the postgres ansible role. A timed reference-node run (PG + one
   app back serving < 30 min) is the next action; the dated record
   file `docs/drills/2026-07-20-restore-drill.md` is the template.
 - **`leakcheck.sh` glob fix** matches the v1.7 jailer `--id`
@@ -546,7 +547,7 @@ explicitly open issues that the doc otherwise implies are closed.
   landed across `pkg/gateway/tls*.go`, `dns01_hetzner.go`,
   `allowlist.go`, `acme.go`, `cmd/gatewayd/{main,config,secrets}.go`,
   the systemd unit, and the ansible role; `caddyserver/certmagic`
-  v0.25.4 is pinned in `go.mod:14`. PR #87 closed the EX44 cut-over
+  v0.25.4 is pinned in `go.mod:14`. PR #87 closed the reference-node cut-over
   + the structured acceptance tests; ADR-024 declared H3 (TLS
   observability — cert-expiry gauge + on-demand-denial counter) and
   H4 (file-watch secret reload) as known follow-ups. H3 closes in
@@ -562,7 +563,7 @@ explicitly open issues that the doc otherwise implies are closed.
   `make metal-lima RUN_ARGS='-run TestDeployWakeMetal'`.
 - **Documented timed restore drill** — §14 M8: PG + one app back
   serving on a clean VM < 30 min, recorded as executed. Run
-  `deploy/scripts/faas-m8-restore-drill.sh` on the EX44 and fill
+  `deploy/scripts/faas-m8-restore-drill.sh` on a reference node and fill
   in `docs/drills/2026-07-20-restore-drill.md` (template present).
 - **Status page + SLO dashboard** — public SLOs from spec §12
   (API 99.5 % monthly, wake p95 < 1 s, build success ≥ 99 %).
@@ -570,16 +571,16 @@ explicitly open issues that the doc otherwise implies are closed.
   `apid /status/slo.json`) in via PR #51; Grafana provisioning +
   D1–D5 threshold fixes + M1/M2 panels via PR #156 (ADR-031).
   Operator verification (Grafana panels render non-zero data, SLO
-  JSON returns denominators) is the EX44 follow-up.
+  JSON returns denominators) is the reference-node follow-up.
 - **§11 checklist item-by-item sign-off** (cgroups v2 only,
   `unprivileged_userns_clone=0`, auditd, unattended-upgrades,
   etc.). The IPv6 egress item (ADR-023) is now in via PR #51;
-  remaining items are operator verification on the EX44.
-- **Gate-A runbook** — 2nd-box active-passive (founding doc R3).
+  remaining items are operator verification on a reference node.
+- **Gate-A runbook** — 2nd-node active-passive (founding doc R3).
 - **M2 / M5 §14 metal gate sign-off** — the body/trim fixture
   mismatch flagged in PR #55 is resolved at the code level
   (PRs #151, #159, #135). The remaining item is a clean-checkout
-  `make metal-lima` run on EX44 / Lima recording the gate green.
+  `make metal-lima` run on reference node / Lima recording the gate green.
 
 ### Open security & infrastructure issues
 

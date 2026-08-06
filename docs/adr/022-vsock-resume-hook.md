@@ -199,7 +199,7 @@ violation nacks the dial — never injects. Fail-closed.
 **Verification (Lima arm64):** `TestMetalTwoRestoresDistinctUUID`
 PASS 3/3 (~60 s each) with distinct entropy head8 prefixes
 (`dac06018…`, `69c3d5c0…`, `1fd831f5…`, `49c92028…`, `3a34c386…`,
-`ad9e2026…`) and unique UUIDs. EX44 (x86_64) remains the §14 source
+`ad9e2026…`) and unique UUIDs. A reference x86_64 control-plane node remains the §14 source
 of truth and is a separate sign-off.
 
 ## Post-pivot /dev, /proc, /sys remount (guest-init)

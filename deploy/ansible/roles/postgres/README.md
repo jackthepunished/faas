@@ -50,7 +50,7 @@ by the drill script.
 
 The hardening tasks use `register: <name>` + `failed_when: false` so
 the role converges on hosts without `/etc/postgresql/15/main/` (CI /
-chroot bootstrap) without halting. On a real EX44 the handlers in
+chroot bootstrap) without halting. On a real control-plane node the handlers in
 `handlers/main.yml` issue the restart + reload via systemd.
 
 ## Carve-outs
@@ -61,7 +61,7 @@ chroot bootstrap) without halting. On a real EX44 the handlers in
   without the collection — the role has an explicit `psql` fallback.
 - `listen_addresses=''` is **destructive**: any client currently
   connected via TCP will drop. Spec §11 forbids TCP listeners; on a
-  fresh EX44 this is a no-op.
+  fresh node this is a no-op.
 
 ## Refs
 

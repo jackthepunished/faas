@@ -201,7 +201,7 @@ explicitly records the deviation.
 ## Open follow-ups (not blocking)
 
 - **Per-app / per-region labels**: not in scope. Per-app would
-  multiply series by the app count; per-region is a one-box
+  multiply series by the app count; per-region is a single-node
   platform so it doesn't apply.
 - **Postgres-side anomaly detection**: out of scope — the
   `usage_monthly` view is a billing rollup, not a traffic counter.

@@ -148,7 +148,7 @@ operators can identify legacy cookies in production.
 ## Verification
 
 - `make test`, `make lint`
-- **Manual smoke on EX44**: full step-up sweep — rotate key,
+- **Manual smoke on a reference control-plane node**: full step-up sweep — rotate key,
   change plan, delete account (and cancel via `/account/restore`),
   transfer org ownership, mint + rotate org key, set-password,
   dashboard delete. Each 403s without fresh TOTP, then succeeds

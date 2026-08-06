@@ -123,7 +123,7 @@ already lives there.
 drive1 is owned by root after imaged has provisioned it. vmmd is the
 only root component on the box (per ADR-019). The plaintext value is
 held in vmmd's process memory for the duration of one loopback mount
-(≤10 ms on observed EX44). It is never logged, never returned over
+(≤10 ms observed on the reference node). It is never logged, never returned over
 RPC, never written outside the chroot.
 
 ### D5. Snapshot semantics — explicit acceptance
@@ -222,5 +222,5 @@ tracked below.
   response.
 - `make metal-lima` — the M3/M5 path still green (no regression in
   `app.json` semantics; drive1 layout unchanged from imaged's POV).
-- Manual smoke (EX44 only): `faas secrets set --app hello KEY=VALUE`
+- Manual smoke (reference node only): `faas secrets set --app hello KEY=VALUE`
   then curl the app and `printenv KEY` shows the value.

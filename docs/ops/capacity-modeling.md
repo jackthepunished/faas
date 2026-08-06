@@ -2,7 +2,7 @@
 
 Issue #297 acceptance item 2. Anchors the per-node ceiling semantics
 that schedd's `NodeLedger` enforces (spec §6.2-2 re-stated per-node),
-then walks the measured numbers from the EX44 staging box and the
+then walks the measured numbers from the reference staging node and the
 linearisation assumptions for 1k / 10k customers across multiple
 compute nodes.
 
@@ -37,9 +37,9 @@ budget) but doesn't isolate per-node vCPU; that's a Tier 2
 follow-up.
 
 **The financial model reads `Σ(node.AdmissionCeilingMB)`, not the
-global 47,600 MB cap.** A reviewer reading `ex44_faas_financial_model.xlsx`
+global 47,600 MB cap.** A reviewer reading the financial model spreadsheet
 and this doc together must see the same numbers; if they see 47,600 MB
-on a multi-host fleet, that's a bug.
+on a multi-node fleet, that's a bug.
 
 ## §2 Hard limits (source of truth: `pkg/api/limits.go`)
 
@@ -55,7 +55,7 @@ The per-app plan maxima (Free / Hobby / Pro / Scale) live in
 `pkg/api/limits.go` and are referenced by the property test
 universe in `pkg/sched/ledger_property_test.go:37-42`.
 
-## §3 Headline numbers — measured on the EX44 staging box
+## §3 Headline numbers — measured on the reference staging node
 
 > **⚠️ The numbers below are placeholders pending measurement.** This
 > doc was drafted before the measurement runs that issue #297
@@ -126,7 +126,7 @@ default-local ceiling:
 
 | Boxes | Cluster ceiling | Use case (projected)                              |
 |-------|-----------------|--------------------------------------------------|
-| 1     | 47,600 MB       | Single-box, current EX44 (default-local)         |
+| 1     | 47,600 MB       | Single-node, reference host (default-local)        |
 | 2     | 95,200 MB       | First cut-over (Phase D runbook, staging only)   |
 | 4     | 190,400 MB      | Capacity for ~5k customers (linear, projected)   |
 | 10    | 476,000 MB      | Capacity for ~10k customers (linear, projected)  |
@@ -236,5 +236,5 @@ The acceptance checklist for issue #297 acceptance item 2:
   specific content lives here.
 - `docs/faas_implementation_spec.md` §6.4 — failure-mode
   catalogue (PR #450).
-- `ex44_faas_financial_model.xlsx` — the revenue model. Read §1
+- The financial model spreadsheet — the revenue model. Read §1
   first if the numbers look off.

@@ -6,7 +6,7 @@ runbook covers switching a deployment between the two without code
 changes, migrations, or per-handler branching.
 
 The decision that a deployment uses Paddle at all is operator-side —
-`ex44_faas_financial_model.xlsx` keeps Stripe as the production
+the financial model spreadsheet keeps Stripe as the production
 reference for fee math; Paddle is the secondary surface for customers
 whose card issuers don't process USD-denominated Stripe charges.
 
@@ -108,7 +108,7 @@ owner `root:faas`), sealed at rest per gap G2 (spec §17). Rotation
 procedure:
 
 1. Generate the new key/secret in the Paddle dashboard.
-2. Install on the EX44 with `install -m 0440 -o root -g faas`.
+2. Install on the reference node with `install -m 0440 -o root -g faas`.
 3. `systemctl restart faas-apid faas-meterd` — both daemons read the
    env vars at boot; mid-flight rotation requires a process restart.
 

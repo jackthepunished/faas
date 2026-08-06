@@ -17,7 +17,7 @@
 - **Rejected alternatives:** (1) ON DELETE CASCADE migration —
   schema-shape change for one feature; deferred. (2) Hard delete on
   DELETE /v1/account — too destructive; lost data is unrecoverable
-  in a one-box backup model. (3) Storing the DPA in the database —
+  in a single-node backup model. (3) Storing the DPA in the database —
   plaintext template lives in the repo so it can be PR-reviewed.
 
 ## Decisions
@@ -124,7 +124,7 @@
   user, customer-success-assisted offboarding) has no recourse.
   Dashboard form is the only universally-available path.
 - **Hard delete on DELETE** — destructive without recourse.
-  Lost data is unrecoverable in the one-box backup model.
+  Lost data is unrecoverable in the single-node backup model.
 - **Meterd-owned grace timer** — meterd owns quotas + billing;
   coupling the deletion timer to the billing loop creates a
   shared failure domain where a billing-side incident blocks

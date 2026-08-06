@@ -117,7 +117,7 @@
    and warm-hint resolution. No new pg_notify channel; pure local
    pubsub.
 5. **Centralized rate limit (opt-in).** Today's per-process token
-   bucket (`pkg/gateway/ratelimit.go`) is correct for one-box. After
+   bucket (`pkg/gateway/ratelimit.go`) is correct for single-node. After
    the split, sticky-by-warm-node routing does NOT pin a single
    replica, so per-process buckets see a fraction of customer
    traffic and the limit leaks. The fix is opt-in via
@@ -352,13 +352,13 @@ never inline a limit per CLAUDE.md).
 
 - `make test` — full unit suite, must pass with `-race`.
 - `make test-metal` — exercise the legacy + split daemons on
-  Lima / EX44 (the legacy daemon stays in-tree during the
+  Lima / a reference control-plane node (the legacy daemon stays in-tree during the
   migration window).
 - `make leakcheck` — zero leaked netns/TAPs/cgroups.
 - `make lint` — `golangci-lint` + repo-wide `gofmt -l` gate.
 - `make spec-check` — vacuum + AST parity + git clean.
 - `make migrations-check` — embedded set stays contiguous 1..118.
-- Manual smoke (Lima / EX44), revised 2026-08-04:
+- Manual smoke (Lima / reference control-plane node), revised 2026-08-04:
   1. `make bootstrap && make run` with one `gatewayd-public` +
      one `gatewayd-internal`.
   2. `curl -s http://127.0.0.1:9090/readyz` → 200 after PG ping
@@ -424,7 +424,7 @@ follows the existing post-#533-merge renumber-reset pattern.
   replica ≠ old bucket = broken invariant.
 - **Centralized rate limit in Redis.** Rejected — new dependency,
   out of scope. The Postgres-backed counter has the right
-  latency characteristics (P50 0.8 ms, P99 3.2 ms on EX44 per
+  latency characteristics (P50 0.8 ms, P99 3.2 ms on the reference node per
   ADR-040 follow-up bench).
 - **Single combined `gatewayd-public` + `gatewayd-internal`
   process that switches mode via env.** Rejected — the two

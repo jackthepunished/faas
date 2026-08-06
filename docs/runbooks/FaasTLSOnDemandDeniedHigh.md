@@ -57,7 +57,7 @@ If the count is dominated by a single SNI, it could be:
   correct response. The alert confirms the spec §11 invariant
   holds.
 - **A misconfigured upstream load balancer** in front of the
-  EX44: an LB sending default SNI to :443 will trigger the deny
+  reference node: an LB sending default SNI to :443 will trigger the deny
   on every request. Fix: pin the LB to forward the SNI correctly,
   or add the LB's SNI to the allowlist.
 

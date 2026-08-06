@@ -1,6 +1,6 @@
 # gregale/skd-node
 
-> Node 22 SDK for the one-box FaaS platform. Generated from
+> Node 22 SDK for the Gregale platform. Generated from
 > [`api/openapi.yaml`](../../api/openapi.yaml), wrapped in a hand-written
 > façade that ships retry, RFC 7807 error sentinels, idempotency, and SSE.
 

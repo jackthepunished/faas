@@ -5,7 +5,7 @@ The platform's metal code (firecracker/jailer VM lifecycle) is gated behind
 **Apple Silicon M3 or later running macOS 15+**, Lima's `vz` backend can grant
 **nested virtualization**, so an arm64 Linux guest gets its own `/dev/kvm` and
 runs **aarch64 Firecracker**. That gives a local `make test-metal` loop without
-the Hetzner EX44.
+a production bare-metal x86_64 host.
 
 ## Quick start
 
@@ -84,10 +84,10 @@ placeholders), which surfaced a chain of latent bugs — most now fixed:
 
 **M0 and V6 boot end-to-end here.** Remember the arch caveat below: this is the
 arm64 nested-KVM guest, so a green run validates the VM lifecycle and boot path —
-the **EX44 stays the source of truth for the §14 acceptance gates** on the
-pinned x86_64 kernel (CLAUDE.md).
+a **bare-metal x86_64 control-plane node remains the source of truth for the
+§14 acceptance gates** on the pinned x86_64 kernel (CLAUDE.md).
 
-Two **arm64-Lima shims** live in `run-metal.sh` (never needed on the x86_64 EX44):
+Two **arm64-Lima shims** live in `run-metal.sh` (never needed on the x86_64 reference node):
 the `br-tenants` bridge (host-prep the box does via ansible) and a CPU-cache
 sysfs shim (jailer reads cache sizes the arm64 nested guest doesn't expose).
 
@@ -120,14 +120,14 @@ in the test output.
 
 ## Caveats — read before trusting a result
 
-- **Arch:** the guest is **arm64**; the production EX44 is **x86_64**. This
+- **Arch:** the guest is **arm64**; production control-plane nodes are **x86_64**. This
   validates the arch-agnostic lifecycle logic and the Firecracker boot path. It
   does **not** produce production x86_64 snapshots or exercise the pinned
-  x86_64 kernel. **The EX44 remains the source of truth for the metal
-  acceptance gates (spec §14).**
+  x86_64 kernel. **A bare-metal x86_64 control-plane node remains the source of truth for
+  the metal acceptance gates (spec §14).**
 - **Supply chain:** firecracker + kernel are fetched here **without** the pinned
   SHA-256 discipline the ansible `firecracker` role enforces on the box. Fine
-  for a throwaway dev VM; never do this on the EX44.
+  for a throwaway dev VM; never do this on a production node.
 - **Nested virt requires M3+ / macOS 15+.** Older chips or macOS won't grant
-  `/dev/kvm`; the provisioner's probe reports this and you fall back to the EX44
-  or a cloud KVM box.
+  `/dev/kvm`; the provisioner's probe reports this and you fall back to another
+  bare-metal x86_64 box or a cloud KVM host.

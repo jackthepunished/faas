@@ -4,7 +4,7 @@
 - **Date:** 2026-07-24
 - **Supersedes:** none
 - **Related:** ADR-025 (provider-pluggable billing layer), §14 M7 acceptance,
-  ex44_faas_financial_model.xlsx (operator standing decision — Stripe
+  the financial model spreadsheet (operator standing decision — Stripe
   pricing remains the production reference).
 
 ## Context
@@ -16,7 +16,7 @@ Paddle (opt-in via `FAAS_BILLING_PROVIDER=paddle`) with a single env-var
 selector, no per-handler branching, and bit-for-bit identical dunning
 state machine + customer-facing email flows.
 
-The operator's standing decision (per `ex44_faas_financial_model.xlsx`
+The operator's standing decision (per the financial model spreadsheet
 review) is to keep Stripe as the production default. Paddle is a
 secondary surface for customers whose card issuers won't process
 USD-denominated Stripe charges (the operator's home country is one of

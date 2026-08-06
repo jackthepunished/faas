@@ -3,8 +3,8 @@
 Issue #297 acceptance item 4. Operator procedure for adding a second
 compute node to the fleet (the cut-over from single-host to
 multi-host). This is the v1 reference for the multi-host topology —
-the moment we go from one box (a single `default-local` row in
-`compute_nodes`) to two boxes where each carries its own admission
+the moment we go from one node (a single `default-local` row in
+`compute_nodes`) to two nodes where each carries its own admission
 ceiling, its own capacity reports, and its own share of the cluster
 vCPU budget.
 
@@ -50,7 +50,7 @@ horizontal-scale variant, not active-passive).
 >   `policy_nftables.conf` is now a Jinja2 template
 >   (`policy_nftables.conf.j2`) that substitutes
 >   `{{ public_iface }}` and `{{ masquerade_cidr }}` at the
->   two substitution sites. A Hetzner compute node on
+>   two substitution sites. A reference compute node on
 >   `ens5` sets `host_vars[fsn-2].public_iface: ens5` and
 >   the rendered `/etc/nftables.conf` carries that value
 >   through the forward-chain allow and postrouting
@@ -97,15 +97,15 @@ horizontal-scale variant, not active-passive).
 
 ## Topology
 
-Two physical boxes at one Hetzner FSN + HEL pair (per spec §14
-"Regional expansion"). Wire identity:
+Two physical nodes (per spec §14
+"Regional expansion" — a FSN + HEL pair is one possible topology). Wire identity:
 
 | Role                | Hostname       | `compute_nodes.name` | `target_url` (vmmd)                   | `schedd_target_url` (schedd)               |
 |---------------------|----------------|----------------------|---------------------------------------|-------------------------------------------|
-| Control plane + 1st compute | `faas-fsn-1` | `default-local`      | `unix:///run/faas/vmmd.sock` (legacy) | `unix:///run/faas/schedd.sock` (backfill) |
-| 2nd compute (new)   | `faas-fsn-2`   | `fsn-2`              | `tcp://vmmd-2.faas:50051` (mTLS)      | `tcp://schedd-2.faas:7100` (mTLS)         |
+| Control plane + 1st compute | `gregale-fsn-1` | `default-local`      | `unix:///run/faas/vmmd.sock` (legacy) | `unix:///run/faas/schedd.sock` (backfill) |
+| 2nd compute (new)   | `gregale-fsn-2`   | `fsn-2`              | `tcp://vmmd-2.faas:50051` (mTLS)      | `tcp://schedd-2.faas:7100` (mTLS)         |
 
-Both boxes share the same Postgres. The new box runs the full
+Both nodes share the same Postgres. The new node runs the full
 daemon fleet (apid, schedd, vmmd, imaged, meterd, gatewayd,
 builderd) — no "control plane on one box, compute on another"
 split until Gate-B. The control plane is on `fsn-1`; the new
@@ -167,8 +167,8 @@ Add `host_vars/faas-fsn-2.yml` with the per-node overrides:
 # Per-host egress policy (ADR-055, Tier 1 Phase 4). public_iface is
 # substituted into the Jinja2 template
 # deploy/ansible/roles/nftables/files/policy_nftables.conf.j2 at the
-# forward-chain allow and the postrouting MASQUERADE. A Hetzner
-# compute node on a different NIC name (e.g. ens5) overrides here;
+# forward-chain allow and the postrouting MASQUERADE. A compute node on a
+# different NIC name (e.g. ens5) overrides here;
 # the rendered /etc/nftables.conf carries the new value through
 # both substitution sites (pkg/netns.HostPolicy.Render() is the
 # Go source of truth; `make egress-render-cross-check` byte-compares
@@ -197,8 +197,14 @@ masquerade_cidr: 10.101.0.0/16
 ### 2. `make bootstrap` on the new node
 
 ```sh
-ssh faas-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap'
+ssh gregale-fsn-2 'cd /opt/onebox-faas && git pull && sudo make bootstrap'
 ```
+
+> **Note:** the `/opt/onebox-faas` filesystem path is the bootstrap
+> layout from `deploy/scripts/bootstrap.sh` (filesystem layout is
+> code-side, not part of the docs rebrand). A follow-up code-identity
+> pass renames the path to match the host `gregale` user; until then
+> the path is stable across all bootstrap invocations.
 
 The bootstrap role provisions the daemon fleet + applies the
 `overlay` role (Tailscale + Wireguard stub) + renders

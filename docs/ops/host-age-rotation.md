@@ -27,7 +27,7 @@ matters when:
    Tier-0 event, but rotation is still the recovery step).
 2. **Key age / policy.** Some compliance frameworks (SOC2 CC6.1,
    PCI-DSS 3.6.4) bound the on-disk age of cryptographic material.
-   The one-box FaaS doesn't have a scheduled cadence, but if a
+   Gregale doesn't have a scheduled cadence, but if a
    future audit demands one, this is the procedure.
 3. **Forward secrecy hygiene.** Even without compromise, rotating
    every N years caps the blast radius of any latent read event

@@ -7,7 +7,7 @@
   `instance_id` — and the in-memory `instancestats.Reader` is the
   only public seam future scale policy code (PR-B / #171 / #169)
   is allowed to read from. Wire cardinality is bounded by
-  `(#apps × #compute_nodes)`, which is `O(100s)` on the one-box and
+  `(#apps × #compute_nodes)`, which is `O(100s)` on the single-node and
   `O(1000s)` on a small cluster — well under the Prometheus label
   cardinality ceiling ADR-031's egress allowlist set. The reader
   carries the per-instance rows because that's where future
@@ -38,7 +38,7 @@
     duration), `schedd_instance_stats_partial_errors_total{node}`
     (counter for per-node dial failures).
   - Wire cardinality is bounded by `(#apps × #compute_nodes)`.
-    With the one-box fleet of 100 apps on 1 node that's
+    With the single-node fleet of 100 apps on 1 node that's
     `O(100s)`; on a multi-node cluster with 1000 apps on 5 nodes
     that's `O(5000)` — comfortably under Prometheus's soft cap.
   - The Reader carries the per-instance rows in deterministic

@@ -1,7 +1,7 @@
 # `gregale.dev` gatewayd cut-over runbook
 
 One-time operator procedure for minting the production wildcard cert
-`*.gregale.dev` on the EX44 via DNS-01 against the Hetzner DNS API, and
+`*.gregale.dev` on a reference control-plane node via DNS-01 against the Hetzner DNS API, and
 for replacing the placeholder `apps.example.com` configuration the box
 has been running with since M0. Follow the pre-flight checks, then the
 numbered procedure; the validation matrix at the bottom proves the
@@ -51,10 +51,10 @@ deploy/scripts/hetzner-zone-setup.sh \
   --zone gregale.dev \
   --apps-domain apps.gregale.dev \
   --edge-host edge.gregale.dev \
-  --host-ip "$EX44_PUBLIC_IP"
+  --host-ip "$REFERENCE_NODE_PUBLIC_IP"
 ```
 
-This creates the Hetzner zone, the `A apps.gregale.dev -> EX44` record
+This creates the Hetzner zone, the `A apps.gregale.dev -> reference node` record
 that the wildcard cert rides on, and the `CNAME edge.gregale.dev ->
 apps.gregale.dev` record that customer custom-domains point at
 (per spec §11).
@@ -141,6 +141,15 @@ curl -vI https://shop.acme.com/
 dig TXT _acme-challenge.apps.gregale.dev @dns.hetzner.com +short
 # expect: one TXT record carrying the ACME token, present during the
 #         renewal window, gone after. Proves the Hetzner solver wired.
+
+# Note: the `@dns.hetzner.com` literal is Hetzner-specific. Spec §4
+# ADR-007 lists the DNS provider as "provider-pluggable; the reference
+# deploy uses Hetzner DNS" — substitute your provider's authoritative
+# resolver (e.g. Route 53, Cloudflare, Gandi) when running this runbook
+# against a non-Hetzner deploy. The TXT record itself will resolve
+# globally via the NS delegation set up in step 1; the per-provider
+# resolver is just a faster probe for the `_acme-challenge` row that
+# the CertMagic solver just wrote.
 ```
 
 ### 6. Rollback
@@ -159,7 +168,7 @@ systemctl restart faas-gatewayd
 ```
 
 The smoke test from step 5 still works on `:8080` if you tunnel the
-EX44 port over SSH, but no customer traffic — the public listener
+reference-node port over SSH, but no customer traffic — the public listener
 on `:443` is off, so customers see a connection refused until you
 flip back.
 
@@ -174,16 +183,20 @@ flip back.
 | App routing via wildcard       | `<slug>.apps.gregale.dev` resolves and serves a wake       | deploy a test app, `curl https://<slug>.apps.gregale.dev/` |
 | Custom-domain HTTP-01 mint     | cert mints for the verified domain only                   | `gregale domains add` + `journalctl -u faas-gatewayd` |
 | Status page served             | `https://apps.gregale.dev/status` returns the HTML        | `curl -fsS https://apps.gregale.dev/status`  |
-| Alert rules scrape cert expiry | `faas_tls_cert_expiry_seconds{host="*.gregale.dev"} > 30d` | Prometheus `/api/v1/query?query=faas_tls_cert_expiry_seconds` |
+| Alert rules scrape cert expiry | `gateway_tls_cert_expiry_by_host_seconds{hostname="*.gregale.dev",kind="wildcard"} > 30d` | Prometheus `/api/v1/query?query=gateway_tls_cert_expiry_by_host_seconds` |
 
-Note: the `faas_tls_*` metric family is intentionally not renamed in
-this PR. The Prometheus scrape config and existing alert rules
-(`gatewayd-tls-cutover.md` §4) key off these names, and renaming
-would orphan dashboards + page rules on merge. The metric surfaces
-the cert host as a label, so the data is already keyed by
-`*.gregale.dev` — only the metric *name* stays as `faas_*` for
-backwards compatibility. A separate ops-decomposition PR can rename
-the family once alerts and Grafana panels are migrated.
+Note: the runtime metric is `gateway_tls_cert_expiry_seconds` (aggregate
+gauge) and `gateway_tls_cert_expiry_by_host_seconds` (per-host gauge
+from `pkg/gateway/hostname_label_set.go`), both defined in
+`pkg/gateway/metrics.go:397` and `:414`. The cert host surfaces as a
+`hostname` label, so the data is already keyed by `*.gregale.dev` —
+only the metric *name* starts with `gateway_` rather than `faas_`.
+The Gregale rename pass intentionally does not touch this family in
+the same PR; renaming would orphan dashboards + page rules that key
+off `gateway_tls_*` (see `docs/adr/024-certmagic-cutover.md` §H3 and
+the per-metric assertion in `pkg/gateway/metrics_test.go:339`). A
+follow-up ops-decomposition PR can re-key the alert rules + Grafana
+panels to a fully `gregale_` prefix once the rename is non-disruptive.
 
 If any check fails, the cut-over is not complete — do not announce
 the new domain to customers until the matrix is green.

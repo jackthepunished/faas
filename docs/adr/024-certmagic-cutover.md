@@ -16,17 +16,17 @@
   CertMagic plumbing (`pkg/gateway/tls*.go`, `dns01_hetzner.go`,
   `allowlist.go`, `acme.go`, `cmd/gatewayd/{main,config,secrets}.go`, the
   systemd unit, the ansible role). No in-house TLS layer is added. The
-  EX44 production flip is operator-side only — `Disabled=true → false`
+  reference-node production flip is operator-side only — `Disabled=true → false`
   in `/etc/faas/gatewayd.toml` plus the Hetzner DNS zone bootstrap
   described in `docs/ops/gatewayd-tls-cutover.md`.
-- **Why:** Spec §4.1 makes gatewayd the only public listener on the box
+- **Why:** Spec §4.1 makes gatewayd the only public listener on the node
   and the only path that terminates TLS for customer traffic. Spec §11
   ship-blocking requires (a) wildcard `*.apps.gregale.dev` via DNS-01 against
   a zone the operator controls and (b) on-demand HTTP-01 certs for
   customer custom_domains gated by the `custom_domains` allowlist so an
   attacker who reaches `:80` cannot mint a cert for an unrelated
   hostname. The plumbing has been merged across multiple M8 PRs but the
-  EX44 still runs `[tls].disabled = true` (plain `:8080`) — the flip is
+  reference node still runs `[tls].disabled = true` (plain `:8080`) — the flip is
   the load-bearing closure of the §11 checklist for gatewayd TLS.
   CertMagic is Caddy's battle-tested core as a library; owning our own
   wake-blocking edge (ADR-007 inline in spec §3) means owning our own TLS
@@ -121,7 +121,7 @@
     fine on plain `:8080`. Rejected: spec §11 ship-blocking includes
     the cert-mint abuse vector (which the unit suite now closes) and
     the §4.1 single-public-listener invariant assumes TLS is on the
-    box, not deferred indefinitely. The EX44's networking posture
+    node, not deferred indefinitely. The reference-node's networking posture
     without TLS is a customer-trust regression.
 
 ## H3 closed — 2026-07-26

@@ -169,7 +169,7 @@
   These fields are added in PR 1 with explicit per-plan `0` rows and a
   `TestOrgMembersLimits_ZeroUntilAuthorised` test that pins the
   fail-closed contract. Authoritative values come from
-  `ex44_faas_financial_model.xlsx` and **must** be added there before
+  the financial model spreadsheet and **must** be added there before
   PR 2 lands. PR 1 does not invent numbers.
 
 - **Rejected alternatives:**

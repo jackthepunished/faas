@@ -7,7 +7,7 @@
   - `pkg/meter/residency.go` + `meterd_resident_gb_per_customer{plan}` gauge — emits the §12 "Resident GB per paying customer" panel (spec line 417) that the dashboard deferred until now.
 
 - **Why:** Three reasons, in order of weight:
-  1. **One-box architectural commitment.** CLAUDE.md §11 + §Component ownership put every operational component on the EX44. A third-party account on a managed service breaks that commitment, introduces a credential surface the rest of the role set doesn't have, and creates a billing surface that the financial model doesn't account for.
+  1. **Single-node architectural commitment.** CLAUDE.md §11 + §Component ownership put every operational component on the control-plane node. A third-party account on a managed service breaks that commitment, introduces a credential surface the rest of the role set doesn't have, and creates a billing surface that the financial model doesn't account for.
   2. **Unifies with Alertmanager.** PR #140 closed the §12 alert-rules + Alertmanager + degraded-flag loop. Spec line 410 named Grafana as the alert-notification path, but the only notification path in the repo is Alertmanager. Adding a Grafana-only notification path would duplicate routes and create two sources of truth.
   3. **Supplants a deferred dashboard row.** `deploy/grafana/faas-fleet.json` and `deploy/grafana/README.md` already deferred the §12 line 417 "Resident GB per paying customer" row until "meterd emits a per-customer timeseries". The new `meterd_resident_gb_per_customer` gauge closes that gap; the alert rule (`FaasResidentGbPerCustomerHigh`) follows.
 - **Consequences:**
@@ -17,7 +17,7 @@
   - **Dashboard JSON corrected.** PR #141 fixes five threshold drifts against spec §12 in `deploy/grafana/faas-fleet.json` (D1 resident RAM 70/90 → 80/92, D2 wake latency red 0.8 → 1.5 with p50-specific override, D3 snapshot p95 clears thresholds, D4 cold-boot fallback ratio + percentunit, D5 build success gauge ordering) and adds M1 (API availability stat) + M2 (resident GB per paying customer stat) panels.
   - **Status page footer.** `deploy/statuspage/index.html:113-116` gains a "Grafana dashboard (operator)" link to the management-bridge bind so the operator can find the dashboard without grepping inventory.
 - **Rejected alternatives:**
-  - **Grafana Cloud free tier (no change).** Third-party account, third-party credential surface, third-party billing — three new failure modes for a one-box architectural commitment. Rejected.
+  - **Grafana Cloud free tier (no change).** Third-party account, third-party credential surface, third-party billing — three new failure modes for a single-node architectural commitment. Rejected.
   - **Commercial Grafana (paid tier).** Same architectural objection plus a recurring cost the financial model doesn't budget. Rejected.
   - **No dashboard surface at all (skip the §14 M8 gate).** Spec §12 mandates a Grafana-shaped SLO surface; the alertmanager+alert rules path covers notification but not visualisation. M8 acceptance ("SLO dashboard live") would never close. Rejected.
   - **Keep the deferred "resident GB per paying customer" row deferred.** Would leave a §12 row uncovered indefinitely. Rejected because the meterd residency tick is straightforward (one PG aggregate per minute) and the alert rule is one stanza of PromQL.

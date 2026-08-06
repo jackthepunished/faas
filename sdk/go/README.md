@@ -1,10 +1,10 @@
-# faas-go — onebox FaaS Go SDK
+# gregale-go — Gregale Go SDK
 
 > **PR 3 of issue #266** — the public Go SDK surface. The module is
 > still internal to the monorepo and consumed only by the daemon's
 > own tests; **publishing to the Go module proxy is gated on PR 13**.
 
-This is the public import path for the onebox FaaS platform:
+This is the public import path for the Gregale platform:
 
 ```go
 import faas "github.com/poyrazK/faas-go"

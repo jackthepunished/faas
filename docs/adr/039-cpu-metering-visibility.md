@@ -22,8 +22,7 @@
 
   The user's explicit constraint is "see the metrics now, leave
   billing for later". Billing itself is spec §4.7 (plan RAM + 8 MB
-  × wall seconds) and the financial model in
-  `ex44_faas_financial_model.xlsx` — neither is touched. The new
+  × wall seconds) and the financial model in the spreadsheet — neither is touched. The new
   data is **observational only**; the field is documented as such
   in `api/openapi.yaml` and in the apid handler comments.
 
@@ -137,7 +136,7 @@ the reaper's `recentload` mirror turns into a 5 × 1 s RPS
   money constant.
 - **No** change to `pkg/api/limits.go` (no new quota; no CPU-based
   admission).
-- **No** change to `ex44_faas_financial_model.xlsx`.
+- **No** change to the financial model spreadsheet.
 - **No** change to `pkg/sched/admission.go` (CPU-based admission is
   G9 / ADR-037 follow-up, separate PR).
 - **No** per-instance dashboard surfacing (M9 work).
@@ -177,7 +176,7 @@ files. This PR makes zero moves in that direction.
   `cmd/{schedd,meterd}/main.go` (wire the seams).
 - **Unchanged** (explicit non-goals): `pkg/billing/provider.go`,
   `pkg/meter/pusher.go`, `pkg/sched/admission.go`, `pkg/api/limits.go`,
-  `ex44_faas_financial_model.xlsx`.
+  the financial model spreadsheet.
 
 ## Consequences
 
@@ -223,7 +222,7 @@ files. This PR makes zero moves in that direction.
   rate cache against a real cgroup v2 mount.
 - `make leakcheck` — no leaked netns / TAPs / cgroup leaves
   (the `Forget` on teardown is exercised).
-- Operator spot-check on EX44:
+- Operator spot-check on a reference node:
   ```bash
   curl -s http://localhost:9100/metrics | grep schedd_instance_cpu
   # expect: schedd_instance_cpu_pct{app="",node=""} 0   (pre-instantiated)

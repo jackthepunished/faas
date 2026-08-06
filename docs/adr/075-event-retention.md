@@ -66,7 +66,7 @@ that bullet is now removed.
 `make test` (covers `pkg/eventretention`, `pkg/state/memstore`,
 `pkg/state/pgstore` via the integration suite), `make lint`.
 No metal re-run needed (no VM-lifecycle code touched). On the
-EX44 the loop's first daily pass can be observed by setting the
+the reference node the loop's first daily pass can be observed by setting the
 interval to `1m` and watching `apid_audit_events_deleted_total`
 (when the counter lands — out of scope for this PR, the count
 is log-only for now).
