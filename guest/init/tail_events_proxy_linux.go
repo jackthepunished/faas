@@ -99,22 +99,18 @@ const TailEventsProxyDir = "/run/guest-init"
 // build time.
 const TailEventsProxyMode = 0o660
 
-// tailEventMaxDatagram is the upper bound on the tail-event
-// wire shape. 16 bytes — matches the fixed-size encode used by
-// sidecar_events_proxy_linux.go::sendTail. The size is a
-// compile-time constant so the make() in the encode path is
-// bounded by a literal.
-const tailEventMaxDatagram = 16
-
-// tailEventOutcomeCompleted mirrors pkg/fcvm.TailOutcomeCompleted
-// AND guest/runners/internal/tail_host.go::TailOutcomeCompleted.
-// Keep all three in sync — a drift here produces a silent
-// "failed" byte in the host's histogram.
-const (
-	tailEventOutcomeCompleted byte = 1
-	tailEventOutcomeFailed    byte = 2
-	tailEventOutcomeTimeout   byte = 3
-)
+// The tail-event wire shape reuses the constants already
+// defined in sidecar_events_proxy_linux.go:
+//
+//   - tailEventMaxDatagram = 16 (the bounded encode size)
+//   - tailEventOutcomeCompleted / Failed / Timeout (the
+//     closed-set of 0x04 outcome bytes, mirroring
+//     pkg/fcvm.TailOutcome* and
+//     guest/runners/internal/tail_host.go::TailOutcome*)
+//
+// All three definitions live in one place (sidecar_events_proxy_linux.go)
+// so a drift produces a compile-time error in guest/init rather
+// than a silent "wrong byte on the wire" in production.
 
 // startTailEventsProxy brings up the unix-socket listener and
 // the vsock DGRAM sender (one shared outbound socket, same
