@@ -146,6 +146,24 @@ type UpdateAppRequest struct {
 	// here: a valid token from a different account receives 403
 	// at the gateway, not at the PATCH endpoint.
 	RequireAuthn *bool `json:"require_authn,omitempty"`
+	// PublicAuth (issue #477 / ADR-077) toggles per-app
+	// public-URL auth (open|bearer|basic). nil = don't
+	// touch the column (pre-#477 behaviour preserved).
+	// Non-nil with the SetPublicAuth bit set replaces the
+	// apps row's public_auth_mode + public_auth_basic
+	// columns atomically. Plan-gated upstream:
+	// bearer=Hobby+, basic=Pro+; the apid validator
+	// returns 402 plan_public_auth_{bearer,basic}_not_allowed
+	// when the customer's plan lacks the gate. On the
+	// 'open' / 'bearer' shapes, the BasicUser/BasicPass
+	// fields are ignored and any existing sealed blob is
+	// cleared; on 'basic' the apid seal step writes a new
+	// secretbox-sealed APP_BASIC_AUTH blob carrying
+	// {basic_user, basic_pass} and gatewayd-internal
+	// unseals at boot (60s cache + db.NotifyKeyChanged
+	// invalidation on the hot path).
+	PublicAuth    *PublicAuthBlock `json:"public_auth,omitempty"`
+	SetPublicAuth bool             `json:"-"`
 	// WarmSnapshotMinRequests overrides the per-app request-count
 	// threshold for warm-tier capture. nil → keep current value
 	// (or apply the plan default on a future create). Range
@@ -471,12 +489,105 @@ type AppResponse struct {
 	// dashboards can show the "auth required" pill alongside
 	// streaming / warm-snapshot / require_signed.
 	RequireAuthn bool `json:"require_authn"`
+	// PublicAuth (issue #477 / ADR-077) reflects the
+	// per-app public-URL auth mode. Three shapes:
+	//   {mode:"open"}    — pre-#477 default; every existing
+	//                      app stays public-by-default.
+	//   {mode:"bearer"}  — gatewayd-internal demands an
+	//                      Authorization: Bearer header
+	//                      (re-uses the require_authn chain).
+	//                      Available Hobby+ only.
+	//   {mode:"basic"}   — gatewayd-internal demands an
+	//                      Authorization: Basic header and
+	//                      verifies against the sealed
+	//                      APP_BASIC_AUTH blob. Available
+	//                      Pro+ only. HasBasicCreds is true
+	//                      on the response so dashboards
+	//                      know whether creds are currently
+	//                      configured (the plaintext is
+	//                      NEVER echoed — it lives in
+	//                      app_secrets, ADR-045).
+	PublicAuth PublicAuthStatus `json:"public_auth"`
 	// WarmSnapshotMinRequests / WarmSnapshotMinMs surface the
 	// per-app capture thresholds. Range [1, 100] and [100, 60000]
 	// respectively; out-of-range PATCH values are rejected at
 	// the apid handler before they reach the store.
 	WarmSnapshotMinRequests int `json:"warm_snapshot_min_requests"`
 	WarmSnapshotMinMs       int `json:"warm_snapshot_min_ms"`
+}
+
+// PublicAuthBlock (issue #477 / ADR-077) is the per-app
+// public-URL auth configuration on a PATCH body. Mode is
+// the canonical 'open'|'bearer'|'basic' string (must match
+// apps_public_auth_mode_chk). BasicUser + BasicPass are
+// only meaningful when Mode='basic'; the apid PATCH
+// handler seals them under the APP_BASIC_AUTH secretbox
+// namespace and stores the ciphertext in
+// apps.public_auth_basic. For Mode='open' or 'bearer' the
+// apid handler ignores them (and clears any existing
+// sealed blob so a stale secretbox row never reaches a
+// fresh request). The wire-shape reflects what the
+// customer PATCHes; the on-disk shape is the
+// public_auth_mode + public_auth_basic columns plus the
+// secretbox seal at PATCH time.
+type PublicAuthBlock struct {
+	// Mode is the canonical 'open'|'bearer'|'basic'
+	// string. apid rejects unknown values with 422
+	// invalid_public_auth_mode.
+	Mode string `json:"mode"`
+	// BasicUser is the basic-auth username (plaintext at
+	// PATCH time; sealed before persist). Required when
+	// Mode='basic'; ignored otherwise. Range
+	// [1, 128] bytes after TrimSpace.
+	BasicUser string `json:"basic_user,omitempty"`
+	// BasicPass is the basic-auth password (plaintext at
+	// PATCH time; sealed before persist). Required when
+	// Mode='basic'; ignored otherwise. Range
+	// [1, 256] bytes.
+	BasicPass string `json:"basic_pass,omitempty"`
+}
+
+// Validate enforces the canonical PublicAuthBlock shape:
+// Mode is a closed enum; BasicUser + BasicPass are
+// required iff Mode='basic'. Returns a 422-mapped
+// *Problem on any malformed shape. nil in → nil out
+// (the caller treats nil as "don't touch the column").
+func (b *PublicAuthBlock) Validate() *Problem {
+	if b == nil {
+		return nil
+	}
+	switch b.Mode {
+	case AppPublicAuthModeOpen, AppPublicAuthModeBearer, AppPublicAuthModeBasic:
+	default:
+		return NewProblem(422, CodeValidation, "Invalid public_auth.mode",
+			fmt.Sprintf("public_auth.mode must be 'open', 'bearer', or 'basic'; got %q", b.Mode))
+	}
+	if b.Mode != AppPublicAuthModeBasic {
+		return nil
+	}
+	if u := strings.TrimSpace(b.BasicUser); u == "" || len(u) > AppPublicAuthBasicUserMaxBytes {
+		return NewProblem(422, CodeValidation, "Invalid public_auth.basic_user",
+			fmt.Sprintf("public_auth.basic_user must be 1..%d bytes when mode='basic'", AppPublicAuthBasicUserMaxBytes))
+	}
+	if p := strings.TrimSpace(b.BasicPass); p == "" || len(p) > AppPublicAuthBasicPassMaxBytes {
+		return NewProblem(422, CodeValidation, "Invalid public_auth.basic_pass",
+			fmt.Sprintf("public_auth.basic_pass must be 1..%d bytes when mode='basic'", AppPublicAuthBasicPassMaxBytes))
+	}
+	return nil
+}
+
+// PublicAuthStatus (issue #477 / ADR-077) is the
+// read-only per-app public-URL auth surface on
+// AppResponse. Mode mirrors the apps.public_auth_mode
+// column; HasBasicCreds is true iff the row has a
+// non-null public_auth_basic blob (a mode='basic' app
+// without creds would still 401 every request). The
+// plaintext username/password is NEVER echoed — it lives
+// in app_secrets (ADR-045) and is loopback-mounted to
+// drive1 at boot.
+type PublicAuthStatus struct {
+	Mode          string `json:"mode"`
+	HasBasicCreds bool   `json:"has_basic_creds"`
 }
 
 // Sidecars is the array shape on `CreateDeploymentRequest.Sidecars`

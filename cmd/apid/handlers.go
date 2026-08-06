@@ -325,6 +325,16 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// round-trip. The token-scope enforcement (cross-account
 		// 403) lives in gatewayd-internal, not here.
 		RequireAuthn: a.RequireAuthn,
+		// Issue #477 / ADR-077: per-app public-URL auth.
+		// Surfaced so dashboards can show "public auth: open /
+		// bearer / basic" alongside the require_authn pill and
+		// so a customer can verify their PATCH landed without
+		// a second round-trip. The plaintext creds NEVER
+		// appear here — they live in app_secrets (ADR-045).
+		PublicAuth: api.PublicAuthStatus{
+			Mode:          a.PublicAuthMode,
+			HasBasicCreds: len(a.PublicAuthBasicSealed) > 0,
+		},
 		// Issue #462 / ADR-058 / PR-A: per-app scaling policy. nil
 		// = legacy row (projected from min_instances / max_concurrency
 		// by the read path). Non-nil = customer-authored policy.

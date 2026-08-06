@@ -1,0 +1,69 @@
+// public_auth.go — per-app public-URL auth mode constants
+// (issue #477 / ADR-077). Lives in pkg/api (not
+// pkg/api/webhooks.go or pkg/api/alerts.go) because the
+// DTO shape and the seal-boundary cap are distinct from
+// both webhook secrets and alert-rule secrets.
+//
+// The constants here are intentionally tiny — pkg/api
+// never holds any sealed-bytes shape, only the validation
+// cap. The seal namespace + secretbox layer live in
+// cmd/apid/handlers_ext.go (write side) and
+// cmd/gatewayd-internal/public_auth_unsealer.go (read
+// side). Keep this file dependency-free so it can be
+// imported from any layer without a cycle.
+
+package api
+
+// AppPublicAuthBasicMaxBytes bounds the plaintext payload
+// the apid seal step accepts on PATCH mode='basic'.
+// 384 = 128 (basic_user) + 1 (\n) + 256 (basic_pass) —
+// the per-field bounds the PublicAuthBlock.Validate
+// method enforces. Generous for pasted values from
+// secret managers, rejects megabyte uploads. Mirrors
+// AppWebhookSecretMaxBytes' posture (256) and the alert
+// cap (AlertRuleWebhookSecretMaxBytes = 256).
+const AppPublicAuthBasicMaxBytes = 384
+
+// AppPublicAuthBasicUserMaxBytes bounds the basic_user
+// field on PATCH mode='basic'. 128 matches the
+// application-secrets key length cap and the typical
+// RFC 7617 username convention. Anything larger is almost
+// certainly a paste error.
+const AppPublicAuthBasicUserMaxBytes = 128
+
+// AppPublicAuthBasicPassMaxBytes bounds the basic_pass
+// field on PATCH mode='basic'. 256 matches
+// AppWebhookSecretMaxBytes and rejects the megabyte
+// payload a botched secret-manager export would
+// otherwise trigger.
+const AppPublicAuthBasicPassMaxBytes = 256
+
+// Per-app public-auth mode enum (issue #477 / ADR-077).
+// Lives in pkg/api so every layer — DTO, validator, plan
+// gate, gatewayd-internal middleware, CLI — agrees on the
+// closed set without a separate constants package. The
+// closed-set matches apps_public_auth_mode_chk in
+// migrations/00151_apps_public_auth.sql; a future addition
+// to the wire surface must add a row to that CHECK AND
+// extend this constant block.
+const (
+	// AppPublicAuthModeOpen is the pre-#477 default. The
+	// app's public hostname serves anonymous traffic;
+	// no Authorization header is consulted. Always
+	// allowed on any plan.
+	AppPublicAuthModeOpen = "open"
+	// AppPublicAuthModeBearer requires a valid `Authorization: Bearer <fp_live_...>`
+	// key with apps:read scope on the app's owning
+	// account. Plan-gated to Hobby+. The
+	// cross-account / cross-app authz check lives in
+	// pkg/gateway/handler.go::enforcePublicAuth.
+	AppPublicAuthModeBearer = "bearer"
+	// AppPublicAuthModeBasic requires HTTP Basic auth
+	// (RFC 7617 §2) with credentials sealed at PATCH
+	// time under secretbox namespace
+	// "APP_BASIC_AUTH" (cmd/apid/handlers_ext.go).
+	// Plan-gated to Pro+. The gatewayd-internal
+	// unseals the blob at boot via
+	// cmd/gatewayd-internal/public_auth_unsealer.go.
+	AppPublicAuthModeBasic = "basic"
+)

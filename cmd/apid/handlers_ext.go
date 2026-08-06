@@ -27,9 +27,20 @@ import (
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 )
+
+// publicAuthBasicSealNamespace is the secretbox namespace tag
+// apid stamps onto PATCH mode='basic' ciphertext, mirroring
+// `appWebhookSecretSealLabel = "APP_WEBHOOK"` from
+// handlers_webhooks.go:44. The partner string lives in
+// cmd/gatewayd-internal/public_auth_unsealer.go; a future drift
+// surfaces as a fail-closed decryption at gatewayd boot (the
+// unsealer rejects any sealed blob whose namespace tag doesn't
+// match — see pkg/secretbox.SealBytes SetNamespaces contract).
+const publicAuthBasicSealNamespace = "APP_BASIC_AUTH"
 
 // --- apps CRUD --------------------------------------------------------------
 
@@ -326,6 +337,33 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 			// here and pass it through to the audit-block.
 		}
 	}
+	// Issue #477 / ADR-077: per-app public_auth (open|bearer|basic).
+	// Plan-gated upstream: apid returns 402
+	// plan_public_auth_{bearer,basic}_not_allowed when the
+	// customer's plan lacks the gate. The bearer path
+	// re-uses the require_authn chain (apps:read scope on
+	// the app's owning account) so the gate is Hobby+;
+	// basic adds a secretbox seal + per-app unseal and is
+	// Pro+. 'open' is always allowed (the pre-#477 default).
+	// Validation runs FIRST (closed-enum + length bounds)
+	// so a Free customer who tries PATCH mode='weird' gets
+	// a 422 invalid_public_auth_mode rather than a
+	// confusing 402 plan_public_auth_bearer_not_allowed.
+	if req.PublicAuth != nil {
+		if prob := req.PublicAuth.Validate(); prob != nil {
+			return prob
+		}
+		switch req.PublicAuth.Mode {
+		case api.AppPublicAuthModeBearer:
+			if !acct.Plan.PublicAuthBearerAllowed() {
+				return api.ErrPlanPublicAuthBearerNotAllowed(acct.Plan)
+			}
+		case api.AppPublicAuthModeBasic:
+			if !acct.Plan.PublicAuthBasicAllowed() {
+				return api.ErrPlanPublicAuthBasicNotAllowed(acct.Plan)
+			}
+		}
+	}
 	// Issue #462 / ADR-058: per-app scaling policy (PR-A persists
 	// + Hobby+ tier-up; PR-C wires the engine; PR-D carves out the
 	// worker-class branch). The DTO uses value semantics so the
@@ -545,7 +583,41 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			}
 		}
 	}
-	updated, err := s.store.UpdateApp(ctx(r), app.ID, state.UpdateAppParams{
+
+	// Issue #477 / ADR-077: seal the basic-auth creds (if
+	// the operator PATCHed mode='basic'). The seal happens
+	// here, BEFORE the UpdateAppParams construction, so
+	// the on-wire UpdateAppParams.PublicAuth.BasicSealed
+	// is always ciphertext (the store layer never sees
+	// plaintext). For mode='open' / 'bearer', the sealed
+	// blob is cleared (nil) so a stale secretbox row from
+	// a previous PATCH doesn't reach a fresh request.
+	var publicAuthSealed []byte
+	if req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeBasic {
+		recipient := setSecretRecipient()
+		if recipient == nil {
+			api.WriteProblem(w, api.ErrCapacity("host age recipient not loaded — refusing to seal public_auth credentials"))
+			return
+		}
+		// Plaintext shape: "<basic_user>\n<basic_pass>" —
+		// newline-delimited so neither field can contain
+		// the other. The unsealer at
+		// cmd/gatewayd-internal/public_auth_unsealer.go
+		// splits on the first newline and treats both
+		// halves as required.
+		plaintext := []byte(req.PublicAuth.BasicUser + "\n" + req.PublicAuth.BasicPass)
+		sealed, err := secretbox.SealBytes(recipient, publicAuthBasicSealNamespace, plaintext, api.AppPublicAuthBasicMaxBytes)
+		if err != nil {
+			if prob := api.AsProblem(err); prob != nil {
+				api.WriteProblem(w, prob)
+				return
+			}
+			api.WriteProblem(w, api.ErrCapacity("could not seal public_auth credentials"))
+			return
+		}
+		publicAuthSealed = sealed
+	}
+	params := state.UpdateAppParams{
 		RAMMB:              req.RAMMB,
 		IdleTimeoutS:       req.IdleTimeoutS,
 		SetIdleTimeout:     req.IdleTimeoutS != nil,
@@ -620,7 +692,36 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// the same way.
 		RequireAuthn:    req.RequireAuthn,
 		SetRequireAuthn: req.RequireAuthn != nil,
-	})
+		// Issue #477 / ADR-077: per-app public_auth
+		// (open|bearer|basic). Set bit distinguishes "unset"
+		// (don't touch) from explicit mode flip. The sealed
+		// blob is always ciphertext (the seal ran above for
+		// mode='basic'; nil for mode='open'/'bearer' so a
+		// stale secretbox row from a previous PATCH doesn't
+		// leak creds). The plan gate ran above; the store
+		// is a plain column write. The block builds the
+		// AppPublicAuthUpdate *only* when req.PublicAuth is
+		// non-nil; passing nil in the else case keeps the
+		// SQL write a no-op (SetPublicAuth=false) so a
+		// partial-PATCH (e.g. only flips RAM_MB) never
+		// touches the public_auth column.
+		SetPublicAuth: req.PublicAuth != nil,
+	}
+	if req.PublicAuth != nil {
+		// params.PublicAuth is unset when req.PublicAuth is
+		// nil — the store reads SetPublicAuth below to skip
+		// the column write. When the customer DID send a
+		// public_auth block, build the AppPublicAuthUpdate
+		// struct (mode + plaintext username/password that
+		// the seal step buffered into publicAuthSealed).
+		params.PublicAuth = &state.AppPublicAuthUpdate{
+			Mode:     req.PublicAuth.Mode,
+			Username: req.PublicAuth.BasicUser,
+			Password: req.PublicAuth.BasicPass,
+			Sealed:   publicAuthSealed,
+		}
+	}
+	updated, err := s.store.UpdateApp(ctx(r), app.ID, params)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
 		return
@@ -710,6 +811,16 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		oldApp["require_authn"] = app.RequireAuthn
 		newApp["require_authn"] = updated.RequireAuthn
 	}
+	// Issue #477 / ADR-077: record the public_auth mode
+	// flip. Only the mode (not the credentials) is mirrored
+	// to the audit row — `has_basic_creds: bool` would
+	// double up the second-event row below, so the
+	// structured entry here is mode-only. The plaintext /
+	// sealed blob is NEVER recorded (re-redaction invariant).
+	if req.PublicAuth != nil {
+		oldApp["public_auth"] = app.PublicAuthMode
+		newApp["public_auth"] = updated.PublicAuthMode
+	}
 	if req.EgressAllowlist != nil {
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
 		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)
@@ -779,6 +890,33 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"slug":   updated.Slug,
 			"old":    true,
 			"new":    false,
+		})
+	}
+	// Issue #477 / ADR-077: emit app.public_auth_changed on mode
+	// transitions. Same single-purpose, single-keyword-greppable
+	// shape as app.eviction_priority_changed above so operators
+	// can `gregale audit-events --kind-prefix public_auth` and
+	// see every mode flip without parsing the larger app.updated
+	// payload. NOT emitted when the field was already in the
+	// target state (no-op transition) or when the operator left
+	// it unset (no intent to flip).
+	//
+	// Redaction posture (load-bearing — see ADR-077 §Decision
+	// "re-redaction invariant"): the payload carries mode only
+	// (open|bearer|basic) and a `has_basic_creds` bool flag.
+	// Plaintext username / password / sealed blob are NEVER
+	// recorded anywhere on the audit stream — neither this row
+	// nor any future contributor adding logging in the
+	// gatewayd-side path. has_basic_creds answers "did the
+	// customer rotate credentials on this PATCH?" without
+	// revealing the value.
+	if req.PublicAuth != nil && app.PublicAuthMode != updated.PublicAuthMode {
+		s.audit.Emit(ctx(r), "app.public_auth_changed", &acct.ID, map[string]any{
+			"app_id":          updated.ID,
+			"slug":            updated.Slug,
+			"old":             app.PublicAuthMode,
+			"new":             updated.PublicAuthMode,
+			"has_basic_creds": req.PublicAuth.Mode == api.AppPublicAuthModeBasic,
 		})
 	}
 	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))

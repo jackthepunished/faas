@@ -1915,10 +1915,11 @@ type UpdateAppParams struct {
 // AppPublicAuthUpdate (issue #477 / ADR-077) is the
 // per-app public-URL auth block carried on UpdateAppParams
 // + the apid PATCH /v1/apps/{slug} handler. The store
-// layer turns Mode + Username + Password into the column
-// pair (public_auth_mode, public_auth_basic); the seal
-// happens at PATCH time so the on-row bytes are always
-// ciphertext.
+// layer turns Mode + Sealed into the column pair
+// (public_auth_mode, public_auth_basic); the seal happens
+// at PATCH time (in the apid handler) so the on-row bytes
+// are always ciphertext and the store layer never sees
+// plaintext.
 //
 // Mode is the canonical 'open'|'bearer'|'basic' string
 // (must match apps_public_auth_mode_chk). Username +
@@ -1926,11 +1927,15 @@ type UpdateAppParams struct {
 // carry the plaintext the apid seal step encodes under
 // the APP_BASIC_AUTH secretbox namespace. For Mode='open'
 // or 'bearer', the apid handler ignores them (and clears
-// any existing sealed blob).
+// any existing sealed blob — Sealed is left nil).
+// Sealed carries the ciphertext the apid wrote; nil for
+// mode='open'|'bearer' (the store will NULL the column)
+// and non-nil for mode='basic' (the store will write it).
 type AppPublicAuthUpdate struct {
 	Mode     string
 	Username string
 	Password string
+	Sealed   []byte
 }
 
 // Canonical public-auth mode strings for the state
