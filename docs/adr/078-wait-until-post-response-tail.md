@@ -280,3 +280,153 @@ Reference-node sign-off (per CLAUDE.md, necessary not sufficient):
 ```bash
 make test-metal
 ```
+
+## Amendment (issue #667 follow-up, PR feat/issue-667-followup)
+
+The original PR shipped the envelope shape (§"Wire runner → handler")
+and the host-side receipt handler (`pkg/fcvm.MarkInstanceTailTerminal`)
+but **deferred the runner-side tail host** to this follow-up. The
+deferral was load-bearing: the agent audit confirmed that none of the
+five runner `main.go` files (`guest/runners/{go124,node22,node24,python312,python313}/main.go`)
+actually invoked a tail host on the response path. ADR-078 §"Wire
+runner → handler" described the primitive; the primitive was not
+implemented. This amendment documents the wire shape that **actually
+runs end-to-end** and the three new acceptance-checkboxes (#6/#7/#8)
+that close the issue.
+
+### Wire shape that runs end-to-end
+
+The runner process (the long-lived HTTP host inside the VM, parent
+of the handler subprocess) cannot reach vsock directly — it is
+unprivileged inside the VM. The path is:
+
+```
+handler subprocess
+  │  writes a JSONL line per waitUntil(registration) to envelope.TailPipePath
+  ▼
+runner process (sync.WaitGroup of per-task goroutines, each wrapped in
+                context.WithTimeout(env.WaitUntilSec * time.Second))
+  │  on terminal (completed / failed / timeout / panicked): writes
+  │  one line "outcome_byte elapsed_ms\n" to /run/guest-init/tail-events.sock
+  ▼
+guest-init tail_events_proxy_linux.go (unix-domain stream, mode 0o660)
+  │  frames the 16-byte 0x04 DGRAM and ships it via
+  │  unix.SendmsgN to VMADDR_CID_HOST:VsockFrameworkReadyPort (1027)
+  ▼
+vmmd framework_ready_recv.go::dispatchTailEvent (already shipped)
+  │  → Manager.MarkInstanceTailTerminal
+  │  → pkg/state.Store.DecrementInstanceTailCount
+  │  → TailSecondsAccumulator (informational)
+  ▼
+schedd reaper / snapshotAndPark reflect the new tail_count
+```
+
+Key choice: a **separate unix-domain proxy** at
+`/run/guest-init/tail-events.sock` (mode 0o660). ADR-078 §"Wire runner
+→ guest-init" originally proposed extending the existing
+`framework_ready_proxy_linux.go` multiplexer; in practice this
+follow-up moved the tail-event proxy to its own file
+(`guest/init/tail_events_proxy_linux.go`) for the same reason the
+sidecar-events proxy lives in its own file: a unix-domain DGRAM socket
+per payload type keeps the dispatch shape (one parse per file) and
+the dial path (one AF_UNIX SOCK_DGRAM per runner) symmetrical. The
+framework_ready multiplexer's `0x04` branch was kept as a *forwarding*
+target inside the existing socket — the runner emits to the new
+proxy, which then internally re-emits to the existing 0x04 branch.
+Wire contract from the runner's perspective is unchanged.
+
+### Behavior change: framework_ready timing
+
+ADR-078 §"Wire runner → handler" stated that the response envelope is
+written to stdout once the tail drains OR times out, and that
+`signal.SignalReady(...)` continues to fire on the first non-5xx
+response. **Corrected by this amendment:** `signal.SignalReady(...)`
+fires **after** the tail host's `Drain()` returns (the WaitGroup
+call), not on the first non-5xx response. This is the change that
+makes the reaper gate (ADR-078 §"Reaper gate") load-bearing: a wake
+with active tails must not signal ready until the tails have
+drained, otherwise the gateway would consider the wake eligible for
+the next request before the tail host is done. The 5 s watchdog in
+`snapshotAndPark` (`ParkTailDrainTimeoutSeconds`) is the hard ceiling
+— if the tail host hangs for any reason, the park gate fires
+`tail_failed{reason=forced_at_park}` and force-parks the wake.
+
+The non-tail path (no `waitUntil` calls) is unchanged: `Drain()`
+returns immediately on an empty pipe, the response runs through.
+
+### Runner-side tail host (`guest/runners/internal/tail_host.go`)
+
+Exported `TailHost` type. Constructor `NewTailHost(runtime, pipePath, waitUntilSec, tailCapMax int)` returns a `*TailHost`. Public surface:
+
+- `RegisterCount() int` — number of registered tasks (capped at `TailCapMax`).
+- `Failures() []string` — `"timeout:task-N"` / `"error:task-N"` reasons captured during the drain (appended to `response.TailErrors`).
+- `Register(name string) error` — reads one JSONL line from the pipe, spawns a goroutine under `context.WithTimeout`, captures the terminal outcome. Returns `ErrTailCapReached` if the cap is hit.
+- `Drain() int` — blocks until every spawned goroutine reaches a terminal state. Returns the number of tasks that completed within the budget.
+
+Wire emit to the tail-events proxy uses the same shape as the existing
+framework_ready proxy: 250 ms dial + 250 ms write deadlines, errors
+logged at `slog.Warn` (no propagation to the handler response). The
+runner process never blocks the handler response on a slow proxy
+write.
+
+### Reused primitives
+
+| Need | Existing primitive | File |
+|---|---|---|
+| Fire-and-forget one-shot signal from runner to guest-init | `internal.RunnerSignal.SignalReady()` | `guest/runners/internal/framework_ready.go` |
+| Unix-domain proxy to bridge runner → vsock | the new `tail_events_proxy_linux.go` (mirrors `framework_ready_proxy_linux.go`) | `guest/init/tail_events_proxy_linux.go` |
+| 16-byte 0x04 DGRAM encode | `sendTail()` | `guest/init/sidecar_events_proxy_linux.go` |
+| Host-side 0x04 DGRAM dispatch | `dispatchTailEvent` | `cmd/vmmd/framework_ready_recv.go` |
+| `TailOutcome` enum | `pkg/fcvm.TailOutcomeCompleted/Failed/Timeout` | `pkg/fcvm/manager.go` |
+| `TailCapMax` structural cap | `pkg/api.Limits.TailCapMax` | `pkg/api/limits.go` |
+| Per-plan `WaitUntilSec` ceiling | `Plan.TailTimeoutSeconds()` | `pkg/api/limits.go` |
+| Per-instance tail accumulator | `Manager.ReadAndResetTailSeconds` | `pkg/fcvm/manager.go` |
+| 5 s park watchdog | `engine.snapshotAndPark` | `pkg/sched/engine.go` |
+
+### Acceptance-checkboxes #6, #7, #8 (this follow-up)
+
+- **#6 — pathological tail killed at the ceiling.** Exercised by
+  `guest/runners/internal/tail_host_test.go::TestTailHost_PathologicalTailKilledAtCeiling`
+  (6 unit tests pinning the TailHost surface) and the per-runtime
+  `TestHandle_WaitUntilEnvelopeRoundTrip` family. The load-bearing
+  assertion: a handler that registers a 10 s tail and immediately
+  returns is killed at the 1 s `WaitUntilSec` ceiling, and the
+  runner's `response.TailErrors` carries a `"timeout:task-N"` entry
+  — proving the per-task `context.WithTimeout` is the thing that
+  fires, not the 30 s handler-subprocess timeout.
+- **#7 — cross-runtime parity.** Pinned by
+  `guest/runners/internal/runnerparity/tail_host_pin_test.go::TestParity_AllRuntimesHonorWaitUntil`
+  (file-walk: every `guest/runners/<runtime>/main.go` reads
+  `FAAS_TAIL_WAIT_SEC` + `FAAS_TAIL_PIPE_PATH` and calls
+  `drainTailHost`; every `tail_host_integration.go` imports
+  `internal.NewTailHost` + `internal.ReadPipe`). Plus 5 per-runtime
+  `TestHandle_WaitUntilEnvelopeRoundTrip` tests driving a fake
+  handler that writes JSONL to the pipe.
+- **#8 — metal end-to-end.** Pinned by
+  `pkg/fcvm/tail_metal_linux_test.go` (file renamed from
+  `tail_metal_test.go` to scope the `unix.SOCK_CLOEXEC` /
+  `unix.AF_VSOCK` symbols to Linux). The test boots a real
+  Firecracker microVM, fires a REAL 0x04 DGRAM via vsock from the
+  test process to `VMADDR_CID_HOST:1027`, and asserts the wire
+  encoding (16 bytes, type=0x04, outcome, 6 reserved zeros, 8
+  elapsed_ms BE uint64) is exactly what
+  `cmd/vmmd::dispatchTailEvent` parses. The host-side stamper +
+  `ReadAndResetTailSeconds` paths are exercised by the sibling
+  `TestMetal_TailEndToEnd` (already shipped in the original PR).
+
+### Files added in this follow-up
+
+- `guest/runners/internal/tail_host.go` — TailHost type, Drain, WaitGroup
+- `guest/runners/internal/tail_host_test.go` — 6 unit tests (checkbox #6 core)
+- `guest/runners/internal/runnerparity/tail_host_pin_test.go` — file-walk parity test (checkbox #7)
+- `guest/runners/{go124,node22,node24,python312,python313}/tail_host_integration.go` — 5 per-runtime drainTailHost helpers
+- `guest/init/tail_events_proxy_linux.go` — unix-domain proxy bridging runner → vsock
+- `pkg/fcvm/tail_metal_linux_test.go::TestMetal_TailFullEndToEnd` — checkbox #8 wire-format gate
+
+### Out of scope (kept here to prevent drift)
+
+- Async / durable task queue — explicit per issue #667 ("separate issue").
+- Thin durable-execution wrapper over crons — explicit per issue.
+- Persistent storage — explicit per issue (rejected — breaks the niche).
+- Custom guest-init knobs beyond `waitUntil` — explicit per issue.
+- Per-customer tail budget / quota enforcement — explicit per issue ("deferred to a future PR"). The per-instance cap is the only ceiling today.
