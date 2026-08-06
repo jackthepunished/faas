@@ -946,6 +946,56 @@ func TestMemStore_LatestParkedDeploymentForApp_NoParkReturnsErrNotFound(t *testi
 	}
 }
 
+// TestMemStore_LatestParkedDeploymentForApp_SupersededKeepsParking
+// mirrors the pgstore-side TestPg_LatestParkedDeploymentForApp_SupersededKeepsParking.
+// A parked + superseded deployment row stays parked (parked_reason
+// / parked_at are NOT cleared on supersede) so the apid surface
+// surfaces "this deployment was parked" even after a customer
+// redeploys. See pkg/state/pgstore.go::LatestParkedDeploymentForApp
+// docstring for the rationale.
+func TestMemStore_LatestParkedDeploymentForApp_SupersededKeepsParking(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateAccount(ctx, "supersede-mem@x.com", api.PlanHobby)
+	app, _ := m.CreateApp(ctx, App{AccountID: acc.ID, Slug: "supersede-mem"})
+
+	// First deployment: live, then parked.
+	depParked, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:parked", Status: DeployPending})
+	if err != nil {
+		t.Fatalf("CreateDeployment(parked): %v", err)
+	}
+	if err := m.MarkDeploymentLive(ctx, depParked.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive(parked): %v", err)
+	}
+	parkStamp := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	if err := m.SetDeploymentParked(ctx, depParked.ID, "liveness_exhausted", parkStamp); err != nil {
+		t.Fatalf("SetDeploymentParked: %v", err)
+	}
+
+	// Second deployment: supersedes depParked, never parked.
+	depNewer, err := m.CreateDeployment(ctx, Deployment{AppID: app.ID, ImageDigest: "sha256:newer", Status: DeployPending})
+	if err != nil {
+		t.Fatalf("CreateDeployment(newer): %v", err)
+	}
+	if err := m.MarkDeploymentLive(ctx, depNewer.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive(newer): %v", err)
+	}
+
+	got, err := m.LatestParkedDeploymentForApp(ctx, app.ID)
+	if err != nil {
+		t.Fatalf("LatestParkedDeploymentForApp: %v", err)
+	}
+	if got.ID != depParked.ID {
+		t.Errorf("latest.ID = %s, want %s (parked + superseded, not the newer live)", got.ID, depParked.ID)
+	}
+	if got.ParkedReason != "liveness_exhausted" {
+		t.Errorf("latest.ParkedReason = %q, want liveness_exhausted", got.ParkedReason)
+	}
+	if got.ParkedAt == nil || !got.ParkedAt.Equal(parkStamp) {
+		t.Errorf("latest.ParkedAt = %v, want %v", got.ParkedAt, parkStamp)
+	}
+}
+
 func TestLatestDeploymentNotFound(t *testing.T) {
 	m := NewMemStore()
 	if _, err := m.LatestDeployment(context.Background(), "nope"); !errors.Is(err, ErrNotFound) {
