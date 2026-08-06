@@ -946,10 +946,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// directly — but in prod the TCP path is unused.
 	if deps.synth != nil {
 		unifiedMux := http.NewServeMux()
-		// Customer traffic — anything not matched by the synth
-		// prefixes falls through to publicHandler. Register the
-		// catch-all FIRST so the more-specific patterns below win
-		// (http.ServeMux longest-prefix match).
+		// LOAD-BEARING ORDER: register Handle("/", publicHandler) FIRST,
+		// then the more-specific synth routes AFTER. Go's
+		// http.ServeMux uses longest-prefix matching, NOT
+		// registration order — the catch-all written first does
+		// NOT shadow the more-specific patterns written after.
+		// Re-ordering this block "for readability" still works
+		// in Go, but readers expect registration order to match
+		// routing order and may "fix" it in a way that does NOT
+		// work (e.g. moving the catch-all last while keeping
+		// longest-prefix semantics). DO NOT change the order
+		// without also updating the unified-mux test in
+		// pkg/gateway/synth_test.go (TestSynthServer_UnifiedMux_RoutesPathsCorrectly).
 		unifiedMux.Handle("/", publicHandler)
 		// Pull the synth mux out of the SynthServer via a small
 		// accessor; the server exposes SetHandler so the caller

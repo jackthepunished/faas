@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,8 +19,7 @@ import (
 // TestInternalProxy_NegotiatesH2C pins the issue #675 contract:
 // when useH2C is true, the proxy negotiates HTTP/2 prior knowledge
 // against an H2C-capable backend (Go 1.24+ Protocols.SetUnencryptedHTTP2).
-// Asserts the response protocol observed by the client side is HTTP/2.0
-// (r.Proto == "HTTP/2.0" on the inbound server-side request).
+// Asserts r.Proto == "HTTP/2.0" on the inbound server-side request.
 func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 	var (
 		mu        sync.Mutex
@@ -36,9 +37,6 @@ func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
 	})
-	// Go 1.24+: enable H2C + HTTP/1.1 on the same listener via
-	// srv.Protocols. This replaces the deprecated
-	// golang.org/x/net/http2/h2c wrapper.
 	srv := &http.Server{Handler: backend}
 	srv.Protocols = new(http.Protocols)
 	srv.Protocols.SetHTTP1(true)
@@ -55,10 +53,6 @@ func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	// Build an InternalReverseProxy whose dialer returns a real
-	// net.Conn pointing at the loopback listener. http2.Transport
-	// calls DialTLS synchronously during RoundTrip, so we don't need
-	// a background goroutine to accept — the call is on the hot path.
 	dialer := &loopbackDialer{addr: ln.Addr().String()}
 	target := &url.URL{Scheme: "http", Host: "internal"}
 	proxy := NewInternalReverseProxy(dialer, target, slog.Default(), true)
@@ -77,12 +71,12 @@ func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 		t.Fatalf("body: %q", string(body))
 	}
 	if resp.Header.Get("X-Backend") != "h2c" {
-		t.Fatalf("missing X-Backend header — proxy did not reach backend through H2C transport")
+		t.Fatalf("missing X-Backend header")
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if gotProto != "HTTP/2.0" {
-		t.Fatalf("backend saw r.Proto=%q; want \"HTTP/2.0\"", gotProto)
+		t.Fatalf("backend saw r.Proto=%q; want HTTP/2.0", gotProto)
 	}
 	if gotMethod != http.MethodGet {
 		t.Fatalf("backend saw method=%q; want GET", gotMethod)
@@ -92,14 +86,81 @@ func TestInternalProxy_NegotiatesH2C(t *testing.T) {
 	}
 }
 
+// TestInternalProxy_NegotiatesH2C_OverUnixSocket is the production-wire
+// version. The TCP-loopback variant does not exercise unix-socket-specific
+// behaviour that the production /run/faas/gatewayd-internal.sock depends
+// on. This test uses NewUnixSocketDialer (the production dialer shape
+// from cmd/gatewayd-public/main.go) against a temp /tmp/foo.sock mirroring
+// the production path.
+func TestInternalProxy_NegotiatesH2C_OverUnixSocket(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		gotProto string
+		gotPath  string
+	)
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotProto = r.Proto
+		gotPath = r.URL.Path
+		mu.Unlock()
+		w.Header().Set("X-Backend", "h2c-unix")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	})
+	srv := &http.Server{Handler: backend}
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetUnencryptedHTTP2(true)
+
+	sock := "/tmp/" + strings.ReplaceAll(t.Name(), "/", "_") + ".sock"
+	_ = os.Remove(sock)
+	ul, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", sock, err)
+	}
+	defer func() {
+		_ = ul.Close()
+		_ = os.Remove(sock)
+	}()
+	go func() { _ = srv.Serve(ul) }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	dialer := NewUnixSocketDialer(sock)
+	target := &url.URL{Scheme: "http", Host: "gatewayd-internal"}
+	proxy := NewInternalReverseProxy(dialer, target, slog.Default(), true)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/apps/coolapp", nil)
+	proxy.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d (body=%q)", resp.StatusCode, rec.Body.String())
+	}
+	if resp.Header.Get("X-Backend") != "h2c-unix" {
+		t.Fatalf("missing X-Backend header -- proxy did not reach backend through H2C transport over unix socket")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotProto != "HTTP/2.0" {
+		t.Fatalf("backend saw r.Proto=%q; want HTTP/2.0 -- H2C did not negotiate over the unix socket", gotProto)
+	}
+	if gotPath != "/v1/apps/coolapp" {
+		t.Fatalf("backend saw path=%q; want /v1/apps/coolapp", gotPath)
+	}
+}
+
 // TestInternalProxy_HTTP11Fallback asserts that when useH2C is false,
 // the proxy uses the legacy HTTP/1.1 transport against an H1-only
 // backend. Acts as a regression guard for the FAAS_INTERNAL_H2C=false
 // rollback path.
 func TestInternalProxy_HTTP11Fallback(t *testing.T) {
 	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Refuse H2 by writing a non-h2 response — the legacy
-		// transport must negotiate H1 and succeed.
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "h1")
 	})
@@ -125,8 +186,76 @@ func TestInternalProxy_HTTP11Fallback(t *testing.T) {
 	}
 }
 
-// loopbackDialer dials a TCP loopback address using the stdlib
-// dialer. Used by the H2C and H1-fallback tests.
+// TestInternalProxy_H2CMultiplexesConcurrentStreams pins the H2C
+// multiplex behaviour: N concurrent requests against one proxy-dialer
+// combo must each reach the backend (H2 does not accidentally serialise
+// them on one connection). The full WakeGate coalescing guarantee is
+// exercised at the Handler layer by
+// TestConcurrentColdRequestsCoalesceToOneWake in
+// pkg/gateway/handler_test.go:412; this test is the proxy-level
+// companion confirming H2C does not starve under N concurrent requests.
+//
+// Asserting wakeCount == N proves the transport multiplexed N concurrent
+// RoundTrip calls. If H2C were serialising (or the dialer were
+// serialising), wakeCount would be 1.
+func TestInternalProxy_H2CMultiplexesConcurrentStreams(t *testing.T) {
+	var wakeCount atomic.Int32
+	dispatcher := func(w http.ResponseWriter, r *http.Request) {
+		wakeCount.Add(1)
+		// Hold the wake long enough that siblings have time to
+		// attempt concurrent in-flight requests. Not a load-bearing
+		// check on its own -- only the wakeCount == N assertion is.
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}
+
+	backend := &http.Server{Handler: http.HandlerFunc(dispatcher)}
+	backend.Protocols = new(http.Protocols)
+	backend.Protocols.SetHTTP1(true)
+	backend.Protocols.SetUnencryptedHTTP2(true)
+
+	sock := "/tmp/" + strings.ReplaceAll(t.Name(), "/", "_") + ".sock"
+	_ = os.Remove(sock)
+	ul, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", sock, err)
+	}
+	defer func() {
+		_ = ul.Close()
+		_ = os.Remove(sock)
+	}()
+	go func() { _ = backend.Serve(ul) }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = backend.Shutdown(ctx)
+	}()
+
+	proxy := NewInternalReverseProxy(
+		NewUnixSocketDialer(sock),
+		&url.URL{Scheme: "http", Host: "gatewayd-internal"},
+		slog.Default(),
+		true, // useH2C
+	)
+
+	const N = 20
+	var wg sync.WaitGroup
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/v1/synthesize", nil)
+			proxy.ServeHTTP(rec, req)
+		}()
+	}
+	wg.Wait()
+
+	if got := wakeCount.Load(); got != int32(N) {
+		t.Fatalf("backend saw %d wake calls; want %d -- H2C did not multiplex concurrent requests on the unix socket", got, N)
+	}
+}
+
 type loopbackDialer struct{ addr string }
 
 func (d *loopbackDialer) DialContext(ctx context.Context, _ string) (net.Conn, error) {
