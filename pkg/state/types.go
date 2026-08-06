@@ -775,6 +775,17 @@ type Deployment struct {
 	OverrideEnvSecrets  json.RawMessage `json:"override_env_secrets,omitempty"`
 	OverridePort        int             `json:"override_port,omitempty"`
 	OverrideHealthcheck json.RawMessage `json:"override_healthcheck,omitempty"`
+	// OverrideLivenessProbe is the per-deployment liveness-probe
+	// override JSON (issue #554 / ADR-078). Mirrors
+	// OverrideHealthcheck — coalesce(override_liveness_probe,
+	// '{}'::jsonb) on the read side; nullable jsonb column
+	// (migrations/00150_deployment_liveness_probe.sql). The
+	// cmd/vmmd liveness_recv goroutine consumes the resolved
+	// struct (cmd/vmmd/liveness_recv.go::livenessProbeConfig) at
+	// every BringUp. Per-plan defaults (Hobby/Pro/Scale → 5s /
+	// 3 / 60s) are applied on the apid read path when this
+	// column is empty.
+	OverrideLivenessProbe json.RawMessage `json:"override_liveness_probe,omitempty"`
 	// Sidecars (issue #463 / ADR-068). Up to 2 stateless sidecars
 	// (1 init + 1 sidecar) per app. Persisted as jsonb on the
 	// `deployments.sidecars` column (migration 00095). Field is

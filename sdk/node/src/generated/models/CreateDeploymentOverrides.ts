@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';
+import type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
 /**
  * Fargate-shaped deploy-time override object on `POST /v1/apps/{slug}/deployments`
  * (issue #460 / ADR-053). Field list is FROZEN — six fields, no more. Any extra
@@ -48,5 +49,21 @@ export type CreateDeploymentOverrides = {
    * Readiness-probe shape. Persisted today; the HTTP probe variant ships in a follow-up ADR.
    */
   healthcheck?: (DeploymentHealthcheck | null);
+  /**
+   * Liveness-probe override (issue #554 / ADR-078). The host (cmd/vmmd)
+   * polls the guest's vsock 1028 STREAM on every `interval_s`; after
+   * `consecutive_failures` consecutive non-2xx (or timeout / conn-refused)
+   * responses, the VM is destroyed and schedd cold-boots it from rootfs
+   * (per ADR-005 — never snapshot-restore). 3 restarts in 300 s
+   * park the deployment.
+   *
+   * Per-plan gates (issue #554): Free is locked out (Plan.LivenessAllowed()
+   * returns false; the apid handler rejects with
+   * `plan_liveness_probe_not_allowed` BEFORE the DB is touched); Hobby,
+   * Pro, Scale inherit the 5 s / 3 consecutive / 60 s cooldown / 3 in 300 s
+   * defaults. v1 is HTTP-only; gRPC health checks are deferred to v2.
+   *
+   */
+  liveness_probe?: (DeploymentLivenessProbe | null);
 };
 

@@ -489,6 +489,44 @@ type Limits struct {
 	// MaxConcurrency=5 wake fleet, and a Scale customer's can
 	// outpace MaxConcurrency=20. 0 means "feature disabled".
 	ConcurrentTailsPerInstance int
+
+	// LivenessPeriodSeconds (issue #554 / ADR-078) is the per-VM
+	// liveness-probe interval (vmmd polls the guest every N seconds
+	// via the new VsockLivenessPort=1028 STREAM channel). 0 means
+	// "liveness is disabled for this plan" (Free defaults here). For
+	// Hobby+ the field carries the plan's default probe period
+	// (5 s across Hobby/Pro/Scale). Clamped to
+	// [MinLivenessPeriodSeconds, MaxLivenessPeriodSeconds] at the
+	// create-deployment handler. The probe survives a busy-loop
+	// runner because it goes via the in-guest HTTP :8080 channel,
+	// not via tap0 DNAT, so a wedged customer code can't drown the
+	// probe in its own back-pressure.
+	LivenessPeriodSeconds int
+	// LivenessConsecutiveFailures (issue #554 / ADR-078) is N — the
+	// number of consecutive failed probes that triggers
+	// Engine.DestroyForLivenessFailure. After the destroy, the next
+	// wake cold-boots (MarkSnapshotStale is called eagerly) and the
+	// idle timer resets (TouchInstancesLastSeen). Default 3 across
+	// Hobby/Pro/Scale (Free = 0 / disabled). Clamped to
+	// [1, 10] at create-deployment.
+	LivenessConsecutiveFailures int
+	// LivenessCooldownSeconds (issue #554 / ADR-078) is the minimum
+	// spacing between liveness-driven destroys on the same instance.
+	// vmmd's poll goroutine refuses to fire onFail within this
+	// window so a transient network blip doesn't cascade into a
+	// tight restart loop. Default 60 s. Floor 10 s, ceiling 600 s.
+	LivenessCooldownSeconds int
+	// LivenessMaxRestarts (issue #554 / ADR-078) is the cap on the
+	// number of liveness-driven restarts the system will tolerate
+	// within LivenessWindowSeconds before parking the deployment
+	// with parked_reason='liveness_exhausted'. Default 3. Clamped
+	// to [1, 10].
+	LivenessMaxRestarts int
+	// LivenessWindowSeconds (issue #554 / ADR-078) is the sliding
+	// window in which LivenessMaxRestarts restarts trigger the
+	// deployment-park branch. Default 300 s (5 min). Floor 60 s,
+	// ceiling 3600 s.
+	LivenessWindowSeconds int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -637,6 +675,14 @@ var planLimits = map[Plan]Limits{
 		TailTimeoutS:               TailTimeoutFloorSeconds,
 		TailCapMax:                 TailCapMax,
 		ConcurrentTailsPerInstance: 4,
+		// Liveness (issue #554 / ADR-078): Free is gated off — a
+		// wedged Free VM is already bounded by the §13 M7
+		// free-stop path at 5 GB-h, so the liveness probe adds no
+		// safety on the abuse-floor tier. The zero-valued fields
+		// (Period=0, Consecutive=0, Cooldown=0, MaxRestarts=0,
+		// Window=0) cause `Plan.LivenessAllowed()` to return false
+		// via the fail-closed default — see §Comment at
+		// LivenessPeriodSeconds.
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -781,7 +827,7 @@ var planLimits = map[Plan]Limits{
 		// feature toggle, and the issue pairs it with
 		// internal-only ingress (Pro+).
 		RequireAuthn: false,
-		// Tail primitive (issue #667 / ADR-078): Hobby unlocks
+// Tail primitive (issue #667 / ADR-078): Hobby unlocks
 		// the 15 s timeout + 16 per-instance concurrent tails.
 		// Matches the issue's "send a confirmation email"
 		// latency budget comfortably; over-cap attempts emit
@@ -790,6 +836,21 @@ var planLimits = map[Plan]Limits{
 		TailTimeoutS:               15,
 		TailCapMax:                 TailCapMax,
 		ConcurrentTailsPerInstance: 16,
+		// Liveness (issue #554 / ADR-078): Hobby unlocks at the
+		// first paid tier. Default §13 values: 5 s probe period,
+		// 3 consecutive failures, 60 s cooldown, 3 restarts in 300 s
+		// window before the deployment is parked. The customer can
+		// tighten these per-deployment via DeploymentLivenessProbe
+		// (clamped to [1, 60] / [1, 10] / [10, 600] / [1, 10] /
+		// [60, 3600] respectively), but Hobby's plan defaults are
+		// the conservative Cloud Run parity baseline — the same
+		// `liveness_period × N + cold_boot_budget` envelope that
+		// matches the issue AC #1 of ≤ 5 × N + 30 s.
+		LivenessPeriodSeconds:       DefaultLivenessPeriodSeconds,
+		LivenessConsecutiveFailures: DefaultLivenessConsecutiveFailures,
+		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
+		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
+		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -929,6 +990,17 @@ var planLimits = map[Plan]Limits{
 		TailTimeoutS:               30,
 		TailCapMax:                 TailCapMax,
 		ConcurrentTailsPerInstance: 64,
+		// Liveness (issue #554 / ADR-078): same defaults as Hobby —
+		// the §13 baseline is plan-tier-independent (5 s / 3 /
+		// 60 s / 3 / 300 s). The Pro tier is the unlock point for
+		// the gRPC liveness flavor (Plan.GRPCLivenessAllowed,
+		// v1 returns false because the runner shim only speaks
+		// HTTP — see ADR-078 §Rejected alternatives).
+		LivenessPeriodSeconds:       DefaultLivenessPeriodSeconds,
+		LivenessConsecutiveFailures: DefaultLivenessConsecutiveFailures,
+		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
+		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
+		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1081,6 +1153,20 @@ var planLimits = map[Plan]Limits{
 		TailTimeoutS:               60,
 		TailCapMax:                 TailCapMax,
 		ConcurrentTailsPerInstance: 256,
+		// Liveness (issue #554 / ADR-078): Scale inherits the
+		// same defaults as Pro (5s / 3 consecutive / 60s cooldown
+		// / 3 in 300s). The per-deployment sliding window is the
+		// source of truth for the park-on-exhaustion path; the
+		// in-memory tracker (pkg/sched/liveness_window.go) caps
+		// operational cost and the per-deployment override column
+		// (deployments.override_liveness_probe) lets a High-traffic
+		// Scale customer lengthen the window without a code change.
+		// Same v1 = HTTP-only caveat as Pro: gRPC health is deferred.
+		LivenessPeriodSeconds:       DefaultLivenessPeriodSeconds,
+		LivenessConsecutiveFailures: DefaultLivenessConsecutiveFailures,
+		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
+		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
+		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
 	},
 }
 
@@ -1293,6 +1379,69 @@ const (
 	// no higher than plan default × this multiplier.
 	IdleTimeoutFloorSeconds = 10
 	IdleTimeoutMaxMultiple  = 2
+
+	// Liveness probe (issue #554 / ADR-078). The host (cmd/vmmd) polls
+	// the guest's vsock 1028 STREAM on every Period; after N
+	// consecutive non-2xx (or timeout/conn-refused) responses the
+	// guest-init hasn't ACKed, vmmd destroys the VM and schedd
+	// cold-boots it from rootfs per ADR-005 (no snapshot restore).
+	// 3 restarts within a sliding Window trigger ParkDeployment
+	// with reason='liveness_exhausted' (pkg/sched/liveness_window.go).
+	//
+	// Sizing rationale:
+	//   PeriodSeconds       — 5 s base. Below the §13 idle reaper's
+	//                         30 s floor on Free, so a Hobby+ app is
+	//                         noticed and replaced before it could
+	//                         survive on idle alone. High enough that
+	//                         a busy HTTP workload on a healthy VM
+	//                         doesn't burn vsock CPU.
+	//   ConsecutiveFailures — 3. Below the wire-level transient
+	//                         burst length (4-5 with vsock retries
+	//                         in pkg/fcvm/vmm.go:2019-2119) so a
+	//                         flake doesn't trigger a destroy, but
+	//                         well below the customer-visible
+	//                         "still 5xx" budget of ~15 s.
+	//   CooldownSeconds     — 60 s. The minimum gap between two
+	//                         destroys on the same instance so a
+	//                         cold-boot + first probe doesn't
+	//                         immediately re-destroy if the previous
+	//                         failure was a network condition that's
+	//                         slower to clear than the FC restart.
+	//   MaxRestarts         — 3. Three strikes inside the window.
+	//   WindowSeconds       — 300 s. Per the issue's acceptance #3,
+	//                         "3 restarts in 5 min" — picked because
+	//                         it's the longest a customer will
+	//                         tolerate before they want their
+	//                         service dead, not parked.
+	//
+	// Clamps (Limits.X validation in §13 mirror table):
+	//   Period      ∈ [1, 60]   — sub-second probes burn vsock CPU
+	//                              (each guest-init ack takes ≥2 ms
+	//                              through the framed proto); >60 s
+	//                              exceeds the customer-visible 5xx
+	//                              budget.
+	//   Consecutive ∈ [1, 10]   — 1 = hair-trigger shutdown on every
+	//                              transient; 10 = effectively off.
+	//   Cooldown    ∈ [10, 600] — <10 s on a hot loop; >10 min hides
+	//                              a genuinely broken VM.
+	//   MaxRestarts ∈ [1, 10]   — single restarts in window invalid
+	//                              the "park" semantics; >10 = no
+	//                              customer clarifies the cap.
+	//   Window      ∈ [60, 3600] — <60 s collapses the window into
+	//                              a single tick; >1 h loses the
+	//                              "5 min" AC verbatim.
+	//
+	// gRPC liveness (Pro+) is deferred to v2 — the v1 path is HTTP
+	// only, mirroring the existing readiness probe on `healthcheck_path`.
+	// Plan.GRPCLivenessAllowed() returns false in v1 and exists in
+	// the API surface so v2 can flip it without a DTO change.
+	DefaultLivenessPeriodSeconds       = 5
+	DefaultLivenessConsecutiveFailures = 3
+	DefaultLivenessCooldownSeconds     = 60
+	DefaultLivenessMaxRestarts         = 3
+	DefaultLivenessWindowSeconds       = 300
+	MinLivenessPeriodSeconds           = 1
+	MaxLivenessPeriodSeconds           = 60
 
 	// Autoscale (issue #169 / §17 G8). ScaleUpDecisionIntervalSeconds
 	// is the trigger's tick rate — 1 s balances "admit the Nth
@@ -1754,6 +1903,107 @@ func (p Plan) EgressAllowlistMaxSize() int {
 		return 0
 	}
 	return l.EgressAllowlistMaxSize
+}
+
+// LivenessAllowed (issue #554 / ADR-078) reports whether the plan
+// may opt-in to per-deployment liveness probes. Free stays off —
+// the §13 M7 free-stop budget already handles abuse-floor paths,
+// and Hobby/Pro/Scale need parity with Cloud Run's primitive.
+// apid's createDeployment handler gates `OverrideLivenessProbe`
+// on this; the CLI surfaces the rejection with
+// CodePlanLivenessProbeNotAllowed. Unknown plans fail closed
+// (return false) — same contract as MinInstancesAllowed /
+// EgressAllowlistAllowed above. The bool is the trigger; the
+// numerical fields below are the HOW. Note that the per-Plan
+// period / consecutive / cooldown / max restarts / window are
+// the DEFAULTS the customer inherits; an explicit
+// `OverrideLivenessProbe` on the deployment overrides every
+// one of them per-deployment (issue #554 §"Per-deployment overrides").
+func (p Plan) LivenessAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.LivenessPeriodSeconds > 0
+}
+
+// LivenessPeriodSeconds returns the per-plan default poll cadence
+// for the liveness probe (issue #554). 0 for Free — coupled to
+// LivenessAllowed() above; if the customer is on a plan where
+// LivenessAllowed() is false, this returns 0 and the apid handler
+// rejects BEFORE reading the value. Unknown plans fail closed to 0
+// so a missing plan row never silently starts polling.
+func (p Plan) LivenessPeriodSeconds() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LivenessPeriodSeconds
+}
+
+// LivenessConsecutiveFailures returns the per-plan default N: the
+// number of consecutive non-2xx (or timeout / conn-refused)
+// responses before the probe declares the VM wedged and triggers
+// DestroyForLivenessFailure. See the §13 mirror comment block above
+// for the sizing rationale (3 = healthy transient budget).
+func (p Plan) LivenessConsecutiveFailures() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LivenessConsecutiveFailures
+}
+
+// LivenessCooldownSeconds returns the per-plan default cooldown
+// between two destroys on the SAME instance. vmmd's liveness receiver
+// skips a destroy if the last restart was within this window —
+// protects against a cold-boot + first probe immediately
+// re-destroying if the previous failure was a network condition that
+// didn't clear by the time FC restarted. See §13 mirror constant.
+func (p Plan) LivenessCooldownSeconds() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LivenessCooldownSeconds
+}
+
+// LivenessMaxRestarts returns the per-plan default N: the maximum
+// number of restarts allowed in one LivenessWindowSeconds before
+// the deployment is parked with reason='liveness_exhausted'. The
+// default 3 is the issue AC #3 ceiling.
+func (p Plan) LivenessMaxRestarts() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LivenessMaxRestarts
+}
+
+// LivenessWindowSeconds returns the per-plan default sliding window
+// the LivenessMaxRestarts counter is summed over. The tracker
+// (pkg/sched/liveness_window.go) trims timestamps older than
+// now - window off the per-deployment counter on every
+// RecordRestart call. Default 300 s = 5 min per issue AC #3.
+func (p Plan) LivenessWindowSeconds() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LivenessWindowSeconds
+}
+
+// GRPCLivenessAllowed (issue #554 / ADR-078 §"gRPC liveness") reports
+// whether the plan may opt-in to gRPC health-check probes (the
+// gRPC ServiceConfig.health_check protocol). v1 returns false across
+// the board — the existing readiness probe on `healthcheck_path` is
+// HTTP-only and vmmd's liveness receiver dials vsock 1028 STREAM
+// which the runner exposes over HTTP GET semantics. The accessor
+// exists in the API surface so a v2 PR can flip it without a
+// DTO/SDK change. Pro + Scale are the unlock point when v2 lands
+// (mirrors the GRPCAllowed gate). Free + Hobby stay off.
+func (p Plan) GRPCLivenessAllowed() bool {
+	return false
 }
 
 // StreamingEnabled reports whether the plan defaults the per-app

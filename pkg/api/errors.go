@@ -541,6 +541,15 @@ const (
 	CodeInvalidCooldown                            = "invalid_cooldown"
 	CodeScalingTargetIncompatibleWithWorkloadClass = "scaling_target_incompatible_with_workload_class"
 
+	// Issue #554 / ADR-078: liveness probe plan gate. The 403
+	// surfaces on a Free-customer request that includes
+	// `overrides.liveness_probe`; apid reads
+	// Plan.LivenessAllowed() and short-circuits BEFORE the DB is
+	// touched. Mirrors the CodePlanRequireAuthnNotAllowed /
+	// CodePlanMinInstancesNotAllowed shape so the CLI renders the
+	// same "your plan does not unlock X" template.
+	CodePlanLivenessProbeNotAllowed = "plan_liveness_probe_not_allowed"
+
 	// Account self-service (spec §17 G6, ADR-021). The
 	// "confirm_required" code is returned when a DELETE arrives without
 	// the confirmation header so a stale CLI prompt can't silently wipe
@@ -868,6 +877,12 @@ func StatusForCode(code string) int {
 	// (2026-07-31): Hobby+ tier-up for max_instances. 403 mirrors
 	// CodePlanMinInstancesNotAllowed.
 	case CodePlanMaxInstancesNotAllowed:
+		return http.StatusForbidden
+	// Issue #554 / ADR-078: liveness probe plan gate. 403 mirrors
+	// CodePlanMaxInstancesNotAllowed / CodePlanEgressAllowlistNotAllowed
+	// so the CLI's "your plan does not unlock X" template renders
+	// uniformly.
+	case CodePlanLivenessProbeNotAllowed:
 		return http.StatusForbidden
 	case CodeInvalidMaxInstances, CodeInvalidCooldown,
 		CodeScalingTargetIncompatibleWithWorkloadClass:
@@ -1799,6 +1814,22 @@ func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
 		"Plan doesn't allow an egress allowlist",
 		fmt.Sprintf("the %s plan cannot pin an egress IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
 		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+}
+
+// ErrPlanLivenessProbeNotAllowed (issue #554 / ADR-078) is returned when a
+// Free account tries to pin a per-deployment liveness probe override. The
+// gate is the same shape as ErrPlanEgressAllowlistNotAllowed /
+// ErrPlanMinInstancesNotAllowed: Free's Plan.LivenessAllowed() returns
+// false; the apid createDeployment handler short-circuits with this 403
+// BEFORE the DB is touched. Hobby/Pro/Scale inherit the 5s / 3 / 60s / 3 in
+// 300s defaults and accept the override. The plan is named in the body so
+// a CLI prompt can render "upgrade to Hobby to unlock liveness" without a
+// second lookup.
+func ErrPlanLivenessProbeNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLivenessProbeNotAllowed,
+		"Plan doesn't allow a liveness probe",
+		fmt.Sprintf("the %s plan cannot pin a liveness probe; upgrade to Hobby or above to unlock the Cloud-Run-parity primitive.", p)).
+		WithDocs("https://docs.gregale.dev/deploy-overrides#liveness-probe")
 }
 
 // ErrEgressAllowlistTooLong (ADR-031) is returned when the PATCH carries more

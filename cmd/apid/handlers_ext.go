@@ -2409,6 +2409,16 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 			resp.OverrideHealthcheck = &hc
 		}
 	}
+	// Liveness probe override (issue #554 / ADR-078). The
+	// per-deployment override; cmd/vmmd's liveness_recv goroutine
+	// picks this up at every BringUp via the resolved struct
+	// (cmd/vmmd/liveness_recv.go::livenessProbeConfig).
+	if len(d.OverrideLivenessProbe) > 0 {
+		var lp api.DeploymentLivenessProbe
+		if err := json.Unmarshal(d.OverrideLivenessProbe, &lp); err == nil {
+			resp.OverrideLivenessProbe = &lp
+		}
+	}
 	// Per-deploy grype scan (issue #464 / ADR-075 / PR-3).
 	// Populate DeploymentResponse.Scan from the typed payload
 	// written by imaged's deploy-complete hook (PR-3 commit 2).

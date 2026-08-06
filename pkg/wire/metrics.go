@@ -96,6 +96,16 @@ type OpsMetrics struct {
 	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
 	// panel is the §12 warm-capture-error alert's primary signal.
 	warmSnapshotErrors *prometheus.CounterVec
+	// livenessRestarts (issue #554 / ADR-078) is the per-(app,
+	// deployment) counter the Engine.DestroyForLivenessFailure path
+	// increments on every liveness-driven destroy. The dashboard
+	// panel "liveness: restarts by deployment (5m)" queries this
+	// counter; the liveness_exhausted park alert
+	// (instances.parked_liveness_exhausted audit kind) is the
+	// operator-facing signal. Labels are bounded by the per-app
+	// deployment count (≤ 20 for Scale, ≤ 1 for Hobby), so the
+	// cardinality stays safe.
+	livenessRestarts *prometheus.CounterVec
 	// guestInitDuration (issue #470 / PR C / ADR-074) measures the
 	// wall-clock time between the vmmd DGRAM recv of the framework-ready
 	// signal and the Manager.MarkInstanceFrameworkReady return. Labelled
@@ -841,6 +851,20 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")
+	// Issue #554 / ADR-078: liveness restarts counter. Labelled by
+	// (app, deployment) — the bounded per-deployment set keeps the
+	// TSDB cardinality safe (Scale: ≤ 20 deployment per app; Hobby:
+	// ≤ 5; Free: 0). The dashboard panel "liveness: restarts by
+	// deployment (5m)" queries this; the liveness_exhausted park
+	// alert (instances.parked_liveness_exhausted audit kind) is
+	// the operator-facing signal. The (other, other) overflow row
+	// is pre-instantiated so the dashboard panel selector
+	// {deployment!="other"} never sees "no data" from boot.
+	livenessRestarts := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_liveness_restarts_total",
+		Help: "Count of liveness-driven destroy+cold-boot cycles (issue #554 / ADR-078), labelled by (app, deployment). The dashboard panel 'liveness: restarts by deployment (5m)' queries this; the liveness_exhausted park alert (instances.parked_liveness_exhausted audit kind) is the operator-facing signal. Per-deployment cardinality is bounded by the plan's deployed_apps cap (Hobby: 5, Pro: 25, Scale: 100 apps × ~2 deployments/app).",
+	}, []string{"app", "deployment"})
+	livenessRestarts.WithLabelValues("other", "other")
 	// Issue #470 / PR C / ADR-074: guest-init duration histogram.
 	// Buckets are spec §6.3 verbatim — see OpsMetrics field doc above.
 	guestInitDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -1428,7 +1452,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, guestInitDuration, wakeSnapshotTier, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, eventsWriteFail, auditWriteFail,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -1859,6 +1883,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
 		warmSnapshotErrors:                 warmSnapshotErrors,
+		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
 		evictedPriority:                    evictedPriority,
@@ -1943,6 +1968,29 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 // CounterVec is shared with other label tuples.
 func (m *OpsMetrics) WatchdogKills(fromState, toState string) prometheus.Counter {
 	return m.watchdogKills.WithLabelValues(fromState, toState)
+}
+
+// LivenessRestarts returns the per-(app, deployment) counter the
+// Engine.DestroyForLivenessFailure path increments on every
+// liveness-driven destroy (issue #554 / ADR-078). The dashboard
+// panel "liveness: restarts by deployment (5m)" queries this; the
+// liveness_exhausted park alert (instances.parked_liveness_exhausted
+// audit kind) is the operator-facing signal. The returned Counter
+// is safe to retain — Prometheus's WithLabelValues is internally
+// cached. nil-receiver guard mirrors the WatchdogKills /
+// WarmSnapshotErrors pattern so unit tests without metrics keep
+// working.
+func (m *OpsMetrics) LivenessRestarts(app, deployment string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	if app == "" {
+		app = "unknown"
+	}
+	if deployment == "" {
+		deployment = "unknown"
+	}
+	return m.livenessRestarts.WithLabelValues(app, deployment)
 }
 
 // WarmSnapshotErrors returns the per-reason counter the warm-tier

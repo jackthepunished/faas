@@ -419,6 +419,30 @@ type Manager struct {
 	// schedd reaper (PR 4) reads back the `tail_count` column
 	// to gate the park path on tail_count == 0.
 	tailTerminalStamper TailTerminalStamper
+	// livenessMetrics (issue #554 / ADR-078) is the optional
+	// Prometheus collector pair the vmmd cmd wires via
+	// WithLivenessMetrics. nil-safe:
+	// livenessRecorder.ObserveProbe / SetConsecutiveFailures
+	// guard on nil so unit tests that construct a Manager
+	// without metrics don't need a stub. The two collectors
+	// (vmmd_guest_liveness_probe_seconds histogram,
+	// vmmd_guest_liveness_consecutive_failures per-instance
+	// gauge) are the load-bearing observability surface: the
+	// dashboard's "liveness probe: success / failure" panel
+	// queries the histogram, the "live consecutive-failure
+	// distribution" panel queries the gauge.
+	livenessMetrics *LivenessMetrics
+	// livenessRelay (issue #554 / ADR-078) is the optional
+	// function the vmmd cmd wires via WithLivenessSink. The
+	// poll goroutine calls it whenever the consecutive-failure
+	// counter reaches the per-plan N (default 3). The relay is
+	// how the vmmd side PLUMBS the failure to schedd's
+	// Engine.DestroyForLivenessFailure — schedd is the only
+	// writer to instances (spec §6), so the destroy path
+	// MUST live on the schedd side. nil-safe: the poll
+	// goroutine guards on nil so a missing wire (a unit
+	// test that doesn't construct a relay) is a no-op.
+	livenessRelay LivenessFailedSink
 	// hostIdentities is the slice of X25519 secret keys used to
 	// unseal per-app sealed env blobs at wake time (spec §11/G2).
 	// Holds the current identity alone in the normal pre-rotation
@@ -701,6 +725,74 @@ type TailTerminalStamper interface {
 func (m *Manager) WithTailTerminalStamper(s TailTerminalStamper) *Manager {
 	m.tailTerminalStamper = s
 	return m
+}
+
+// LivenessFailedSink is the function signature the vmmd poll goroutine
+// invokes when the consecutive-failure counter reaches the per-plan N
+// (issue #554 / ADR-078). The relay is the boundary between vmmd
+// (host-side poll goroutine) and schedd (state machine owner). schedd
+// constructs the closure at daemon startup and passes it via
+// Manager.WithLivenessSink; the vmmd poll goroutine calls it directly.
+//
+// Reason is a stable short string from the closed set {timeout,
+// conn_refused, conn_err, non_200} — the same closed set the
+// vmmd_guest_liveness_probe_seconds histogram emits. The schedd
+// Engine.DestroyForLivenessFailure uses the reason to populate the
+// audit event's data JSON.
+type LivenessFailedSink func(ctx context.Context, instanceID, reason string)
+
+// WithLivenessMetrics attaches the Prometheus collector pair
+// (issue #554 / ADR-078). Same nil-safe + chaining pattern as
+// WithFrameworkReady: optional, no-ops when the cmd binary doesn't
+// wire it. Returns the *Manager so callers can chain.
+func (m *Manager) WithLivenessMetrics(lm *LivenessMetrics) *Manager {
+	m.livenessMetrics = lm
+	return m
+}
+
+// WithLivenessSink attaches the relay the vmmd poll goroutine calls
+// when a consecutive-failure counter reaches the per-plan N
+// (issue #554 / ADR-078). nil-safe: the poll goroutine guards on nil
+// so a missing wire (unit tests, default-local vmmd) is a no-op.
+// Returns the *Manager so callers can chain.
+func (m *Manager) WithLivenessSink(relay LivenessFailedSink) *Manager {
+	m.livenessRelay = relay
+	return m
+}
+
+// ObserveLivenessProbe records one probe's wall-clock duration with
+// the given outcome class. Safe on a nil receiver (the underlying
+// livenessMetrics is nil-safe). Empty outcome is collapsed to
+// "unknown" inside the metrics struct.
+func (m *Manager) ObserveLivenessProbe(outcome string, seconds float64) {
+	m.livenessMetrics.ObserveProbe(outcome, seconds)
+}
+
+// SetLivenessConsecutiveFailures records the current consecutive-failure
+// count for an instance. Safe on a nil receiver.
+func (m *Manager) SetLivenessConsecutiveFailures(instance string, count int) {
+	m.livenessMetrics.SetConsecutiveFailures(instance, count)
+}
+
+// DeleteLivenessConsecutiveFailures drops the per-instance gauge entry.
+// Called on instance teardown so the high-cardinality {instance} label
+// set doesn't accumulate dead instances. Safe on a nil receiver.
+func (m *Manager) DeleteLivenessConsecutiveFailures(instance string) {
+	m.livenessMetrics.DeleteConsecutiveFailures(instance)
+}
+
+// ReportLivenessFailed (issue #554 / ADR-078) is the vmmd-side
+// invocation of the LivenessFailedSink. Called by the per-instance
+// poll goroutine once the consecutive-failure counter reaches the
+// per-plan N. Schedd is the consumer (Engine.DestroyForLivenessFailure);
+// vmmd never touches the DB. Safe on a nil relay — the missing-wire
+// path is a no-op so a unit test that doesn't construct a relay
+// doesn't have to stub one.
+func (m *Manager) ReportLivenessFailed(ctx context.Context, instanceID, reason string) {
+	if m.livenessRelay == nil {
+		return
+	}
+	m.livenessRelay(ctx, instanceID, reason)
 }
 
 // MarkInstanceFrameworkReady stamps the per-instance
@@ -1952,6 +2044,12 @@ func (m *Manager) Park(ctx context.Context, instance string, spec SnapshotSpec) 
 	// whose Lease.Slot was just freed.
 	delete(m.cidToID, GuestVsockCID(inst.Lease.Slot))
 	m.mu.Unlock()
+	// Drop the per-instance liveness gauge entry (issue #554 /
+	// ADR-078). The gauge's {instance} label is high cardinality —
+	// a parked instance's row should not stay in the registry
+	// forever. The poll goroutine reading the gauge sees a
+	// DeleteLabelValues call as a clean "not tracked" state.
+	m.DeleteLivenessConsecutiveFailures(instance)
 	m.cleanup(ctx, inst.Lease, inst.Net, inst.WorkloadNames)
 	m.log.Info("parked", "instance", instance, "mem_bytes", info.MemBytes)
 	return info, nil

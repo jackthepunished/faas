@@ -3489,10 +3489,11 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	row := tx.QueryRow(ctx,
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
+		                          override_liveness_probe,
 		                          sidecars,
 		                          status,
 		                          min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18)
 		 returning `+deploymentSelectColumns,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3500,6 +3501,7 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		d.OverrideEntrypoint, d.OverrideCmd,
 		nullJSONRaw(d.OverrideEnv), nullJSONRaw(d.OverrideEnvSecrets),
 		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck),
+		nullJSONRaw(d.OverrideLivenessProbe),
 		notNullEmptyJSONRaw(d.Sidecars),
 		d.MinInstances)
 	created, err := scanDeployment(row)
@@ -9187,6 +9189,7 @@ const deploymentSelectColumns = `
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
+	override_liveness_probe,
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at`
@@ -9210,6 +9213,7 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(override_cmd, ARRAY[]::text[]),
 	override_env, override_env_secrets,
 	coalesce(override_port, 0), override_healthcheck,
+	override_liveness_probe,
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at`
@@ -9265,6 +9269,7 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
+		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)
@@ -9301,6 +9306,7 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 		&d.OverrideEntrypoint, &d.OverrideCmd,
 		&d.OverrideEnv, &d.OverrideEnvSecrets,
 		&d.OverridePort, &d.OverrideHealthcheck,
+		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
 		return Deployment{}, mapErr(err)

@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { DeploymentHealthcheck } from './DeploymentHealthcheck.js';
+import type { DeploymentLivenessProbe } from './DeploymentLivenessProbe.js';
 import type { ScanResult } from './ScanResult.js';
 /**
  * One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps. The optional `has_overrides` and `override_*` fields are the persisted echo of the create-time overrides object (issue #460 / ADR-053); they round-trip via `GET /v1/apps/{slug}/deployments/{id}` so a customer can audit what their last deploy pinned. Env values are NEVER echoed — only the keys (`override_env_keys`); env_secrets refs ARE echoed because the ref shape is non-secret by design.
@@ -49,6 +50,10 @@ export type DeploymentResponse = {
    * Readiness-probe override. Persisted verbatim; the actual HTTP probe is a follow-up — today waitReady stays a bare TCP accept.
    */
   override_healthcheck?: (DeploymentHealthcheck | null);
+  /**
+   * Liveness-probe override echoed verbatim (issue #554 / ADR-078). nil when the deployment used the per-plan default (Hobby/Pro/Scale → 5s / 3 consecutive / 60s cooldown). Echoed on GET /v1/apps/{slug}/deployments/{id} so the customer can audit which probe the host (cmd/vmmd) is running against the VM.
+   */
+  override_liveness_probe?: (DeploymentLivenessProbe | null);
   /**
    * Per-deployment cold-wake floor override (issue #557 closure / ADR-072). 0 = inherit from parent app (default); positive value is the deployment's own floor. Effective per-instance floor = max(app.EffectiveMinInstances(), d.EffectiveMinInstances()). Validated against the parent app's plan MaxMinInstances cap on PATCH.
    */
