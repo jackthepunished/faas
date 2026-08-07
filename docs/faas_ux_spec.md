@@ -136,6 +136,7 @@ faas status                                                   platform status pa
 - **Symbols:** `✓` done, `✗` failed, `→` in progress, `!` warning. One line each. No emoji.
 - **Exit codes:** 0 ok; 1 user error (bad args, quota); 2 auth; 3 platform/infra; documented so CI can branch.
 - **`--help` is a real doc.** Every command: one-line summary, args, 2–3 realistic examples, the relevant docs URL. Help never assumes you read another command's help first.
+- **Shell completion + man pages ship in the binary** (ADR-083). `gregale completion {bash|zsh|fish|powershell}` emits the per-shell script; `gregale man [command]` emits roff for `man -l -`. The CLI is the source of truth — no checked-in `contrib/completion/` or `docs/man/`. Install paths are documented in [`docs/cli-setup.md`](cli-setup.md).
 - **Idempotency-Key** set automatically on every mutating call (implementation spec §4.2) so a retried `faas deploy` never double-charges or double-creates.
 
 ### 3.3 Error copy standard (CLI)
