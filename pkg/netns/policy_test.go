@@ -414,6 +414,53 @@ func TestHostPolicyMasqueradeChainIsAppended(t *testing.T) {
 	}
 }
 
+// TestHostPolicyMasqueradeChainAppendsV6Sibling locks the IPv6
+// counterpart to TestHostPolicyMasqueradeChainIsAppended. When
+// MasqueradeCIDR6 is set, the postrouting chain emits an `ip6 saddr
+// <CIDR6> oifname <iface> masquerade` sibling immediately after the
+// v4 rule. Without it, v6 tenant traffic falls through `policy accept`
+// on the host postrouting chain and reaches the public internet
+// under the tenant's link-local source — a return-routability black
+// hole analogous to the v4 omission. DefaultHostPolicy has an empty
+// MasqueradeCIDR6, so the negative half of this test asserts the
+// default render is byte-identical to a v4-only render (no extra
+// ip6 line). The positive half populates MasqueradeCIDR6 and asserts
+// the sibling rule lands on the postrouting chain.
+func TestHostPolicyMasqueradeChainAppendsV6Sibling(t *testing.T) {
+	// Default render: empty MasqueradeCIDR6 → no v6 sibling.
+	defOut := DefaultHostPolicy.Render()
+	defPost := extractChain(t, defOut, "postrouting")
+	if strings.Contains(defPost, "ip6 saddr ") {
+		t.Errorf("default render must NOT emit an ip6 masquerade when MasqueradeCIDR6 is empty; chain:\n%s", defPost)
+	}
+
+	// Populated: v6 sibling on the next line, with the same oifname.
+	p := DefaultHostPolicy
+	p.MasqueradeCIDR6 = "fd00:faas::/64"
+	out := p.Render()
+	post := extractChain(t, out, "postrouting")
+	want := fmt.Sprintf("ip6 saddr %s oifname %q masquerade",
+		p.MasqueradeCIDR6, p.PublicIface)
+	if !strings.Contains(post, want) {
+		t.Errorf("postrouting chain missing v6 sibling rule %q; chain:\n%s", want, post)
+	}
+
+	// Source-scope check on the v6 line — same shape as the v4
+	// defense-in-depth. A future regression to a bare `oifname "..."
+	// masquerade` would masquerade every outbound v6 packet, not
+	// just tenant traffic, and break the vmmd/IPv6 path.
+	var bareV6 []string
+	for _, ln := range strings.Split(post, "\n") {
+		if strings.Contains(ln, "masquerade") && strings.Contains(ln, "ip6 ") && !strings.Contains(ln, "ip6 saddr ") {
+			bareV6 = append(bareV6, ln)
+		}
+	}
+	if len(bareV6) > 0 {
+		t.Errorf("v6 masquerade line must source-scope via `ip6 saddr`; bare lines: %q\nchain:\n%s",
+			bareV6, post)
+	}
+}
+
 // TestHostPolicyPostroutingIsLastChain locks the topology: the
 // postrouting nat chain MUST come after input, forward, AND output.
 // nftables evaluates chains in declaration order inside a table; the
