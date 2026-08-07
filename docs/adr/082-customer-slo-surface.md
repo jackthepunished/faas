@@ -203,6 +203,102 @@ sibling; no slug for the account-scope one).
 6. Dashboard: navigate to `/dashboard/apps/my-app` — the SLO card
    renders beneath the existing metrics panel.
 
+## Dashboard render (dashboard follow-up PR)
+
+The follow-up PR closes the remaining acceptance item from
+issue #696 — the dashboard card. The card renders on the
+per-app page (`/dashboard/apps/{slug}`) and the per-account
+page (`/dashboard/account`) with the same nine fields and
+the same "degraded:" contract the API surface ships.
+
+### Window selector
+
+- The 1h / 24h / 7d selector is rendered as a `<nav>` beside
+  the card title. Tabs are static `<a>` links that round-trip
+  the `?window=` query-string. The page reloads on tab click
+  (no JS); the existing dashboard's pagination precedent uses
+  the same shape.
+- The handler reads `?window=` via `resolveSLOWindow` (cmd/apid
+  /handlers_dashboard_slo.go). Invalid values fall back to the
+  default (`24h`) rather than 400 — a typo in the URL doesn't
+  500 the dashboard render.
+
+### Sparkline source
+
+- The time-bucketed series comes from Prometheus's
+  `query_range` endpoint via `pkg/promql.Client.QueryRange`
+  (added in this follow-up PR). `pkg/appmetrics.FetchRange`
+  issues one query per metric (latency p50 / p95 / p99,
+  error rate, cold-boot rate) and projects the result onto
+  `pkg/appmetrics.SparklinePoint`.
+- Bucket count: 60 for 1h (1m step), 96 for 24h (15m step),
+  168 for 7d (1h step). The 168-bucket 7d is the binding
+  budget against Prometheus's 15d retention.
+- The PromQL strings are identical to the scalar `fetchAppSLO`
+  / `fetchAccountSLO` (cmd/apid/handlers_slo.go). The headline
+  number and the sparkline end-of-window value are computed
+  over the same data — the stickier dashboard bug is
+  "p95 = 87ms" but a sparkline that ends at 142ms because the
+  two queries used different range vectors.
+
+### Inline SVG (no JS dependency)
+
+- The renderer is `pkg/dashboard/views/render.go`'s
+  `RenderLatencySparkline` / `RenderErrorRateSparkline` /
+  `RenderColdBootRateSparkline`. Pure Go; no JS bundler, no
+  htmx hook. The template embeds the pre-rendered HTML.
+- The latency triple is a 3-line chart (p50/p95/p99 in three
+  shades of the accent colour). The error rate / cold-boot
+  rate rows are filled-area charts over the same x-axis.
+- Accessibility: every SVG emits `role="img"` and an
+  `aria-label` describing the trend ("rising" / "falling" /
+  "flat" / "no data"). The trend is computed off the p95
+  sub-series for the latency chart and off the only series
+  for the area charts.
+
+### Cardinality budget
+
+- 3 PromQL query_range calls per dashboard page render
+  (one per metric per page). At the dashboard render rate
+  (login + manual refresh) this is 60-90 calls/min on a
+  one-box — well within the 15d Prometheus retention.
+- The per-app row badge on the apps list adds 1 query_range
+  per app, batched at 25 apps max
+  (`dashboardSLOAppsListBadgeCap`). Beyond the cap the badge
+  silently degrades to "—" — the per-app SLO panel is always
+  reachable via the row's link.
+- **No new metric labels, no new metrics, no new SQL aggregates
+  on the read path.** Same data the API surface shipped.
+
+### Package-isolation rule
+
+- `pkg/dashboard/views` is the new typed view package
+  (mirrors the existing `DashboardDetailData` package-isolation
+  pattern). It holds the dashboard-facing mirror of
+  `api.AppSLOResponse` / `api.AccountSLOResponse` so
+  `pkg/dashboard` stays free of `pkg/api` imports.
+- The handler (cmd/apid/handlers_dashboard_slo.go) projects
+  the wire shape into the view shape. The template is a pure
+  renderer.
+
+### Auth chain — same as the API surface
+
+- The dashboard card inherits the existing auth on
+  `renderAppDetail` / `renderAccount` — both routes serve the
+  dashboard cookie (CSRF + session). The wire shape behind
+  the card is the same `/v1/apps/{slug}/slo` /
+  `/v1/account/slo` payload the public API serves.
+- **No new auth path needed.** The per-app / per-account
+  asymmetry documented in §"Auth chain" carries over
+  automatically.
+
+### Status
+
+- ADR-082 status remains `accepted`. The dashboard render
+  decisions are appended here rather than in a new ADR
+  because they are scoped to the same customer-facing SLO
+  surface.
+
 ## Open / deferred items
 
 1. **Per-window comparison (today vs. last_week)** — deferred. The
@@ -222,9 +318,13 @@ sibling; no slug for the account-scope one).
    no billable units, so the SLO field is zeroed for shape parity.
    The Free customer sees the latency/error/cold-boot SLO; the
    billing fields say "N/A" in the UI.
-5. **Dashboard SLO card polish** — the first PR here delivers the
-   API surface; the dashboard card can ship lean and be iterated on.
-   Block-level layout is the minimum.
+5. **Dashboard SLO card** — shipped in the dashboard follow-up PR
+   (the same branch series that landed this ADR). See §"Dashboard
+   render" below for the rendering decisions. The card renders all
+   9 fields from the wire shape plus a 3-line latency sparkline,
+   filled-area error-rate / cold-boot-rate sparklines, and a
+   1h / 24h / 7d window selector that round-trips the URL
+   query-string.
 6. **Threshold breach alerts** — a future feature. The SLO surface
    is the read substrate; the alert evaluator (issue #396 / ADR-045
    PR 4) is the consumer that turns breaches into pages.

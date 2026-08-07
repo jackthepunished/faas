@@ -205,6 +205,65 @@
         </section>
       {{end}}
 
+      <!-- Issue #696 / ADR-082 dashboard follow-up PR. Per-app SLO
+           panel. nil = Prometheus not configured (skip the section
+           entirely); non-nil with Source != "prometheus" = degraded
+           (render the empty-state badge); non-nil with
+           RequestsTotal == 0 AND InstanceHours == 0 = the "no data"
+           empty-state. The window-selector nav round-trips the
+           ?window= query string so the URL is shareable. -->
+      {{if .Data.SLOApp}}
+        <section aria-label="SLO">
+          <h2>SLO
+            <small style="font-weight:normal;color:#888">(last {{.Data.SLOApp.Window}})</small>
+            <nav aria-label="SLO window" style="display:inline-block;margin-left:0.5em">
+              <a href="?window=1h" {{if eq .Data.SLODuration.Window "1h"}}class="badge"{{else}}style="color:#888"{{end}}>1h</a>
+              <a href="?window=24h" {{if eq .Data.SLODuration.Window "24h"}}class="badge"{{else}}style="color:#888"{{end}}>24h</a>
+              <a href="?window=7d" {{if eq .Data.SLODuration.Window "7d"}}class="badge"{{else}}style="color:#888"{{end}}>7d</a>
+            </nav>
+            {{if eq .Data.SLOApp.Source "prometheus"}}{{else}}
+              <span class="badge dim" title="{{.Data.SLOApp.Source}}">degraded</span>
+            {{end}}
+          </h2>
+          {{if and (eq .Data.SLOApp.RequestsTotal 0) (eq .Data.SLOApp.InstanceHours 0.0)}}
+            <p>No traffic in the last {{.Data.SLOApp.Window}}. The SLO panel populates once your app receives requests.</p>
+          {{else}}
+            <p>
+              Latency is end-to-end, 2xx class only. Error rate is the share of
+              [45]xx responses. Cold-boot rate is the share of requests that
+              triggered a cold-boot wake. Quota usage is informational.
+            </p>
+            <table>
+              <thead><tr><th></th><th>Value</th><th>Trend</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>Latency p50 / p95 / p99</td>
+                  <td>{{printf "%.1f" .Data.SLOApp.RequestDuration.P50MS}} / {{printf "%.1f" .Data.SLOApp.RequestDuration.P95MS}} / {{printf "%.1f" .Data.SLOApp.RequestDuration.P99MS}} ms</td>
+                  <td>{{.Data.SLOApp.LatencySparklineHTML}}</td>
+                </tr>
+                <tr>
+                  <td>Error rate</td>
+                  <td>{{printf "%.2f" .Data.SLOApp.ErrorRatePct}}%</td>
+                  <td>{{.Data.SLOApp.ErrorSparklineHTML}}</td>
+                </tr>
+                <tr>
+                  <td>Cold-boot rate</td>
+                  <td>{{printf "%.2f" .Data.SLOApp.ColdBootRatePct}}%</td>
+                  <td>{{.Data.SLOApp.ColdBootSparklineHTML}}</td>
+                </tr>
+              </tbody>
+            </table>
+            <dl>
+              <dt>Requests</dt><dd>{{.Data.SLOApp.RequestsTotal}}</dd>
+              <dt>Throttled</dt><dd>{{.Data.SLOApp.ThrottledTotal}}</dd>
+              <dt>Wake queue p95 <small style="color:#888">(fleet)</small></dt><dd>{{printf "%.1f" .Data.SLOApp.WakeQueueP95MS}} ms</dd>
+              <dt>Instance hours</dt><dd>{{printf "%.3f" .Data.SLOApp.InstanceHours}}</dd>
+              <dt>GB hours</dt><dd>{{printf "%.4f" .Data.SLOApp.GBHours}}</dd>
+            </dl>
+          {{end}}
+        </section>
+      {{end}}
+
       <h2>Crons</h2>
       {{if .Data.Crons}}
         <table>
