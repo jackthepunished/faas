@@ -254,6 +254,14 @@ var methodRouteMap = map[string]string{
 	"GET /v1/secrets":      "GetSecrets",
 	"GET /v1/apps/metrics": "GetAppsMetrics",
 
+	// Issue #696 / ADR-082 — customer-facing SLO surface.
+	// Closed-set windowed panel (1h | 24h | 7d) — distinct from
+	// the /metrics entry above which is the 5m dashboard panel.
+	// Per-app pattern mirrors GetAppMetrics; account-scoped
+	// mirrors GetAccountUsage (the usage account-scoped family).
+	"GET /v1/apps/{slug}/slo": "GetAppSLO",
+	"GET /v1/account/slo":     "GetAccountSLO",
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the
 	// SDK named these methods deliberately after the user-facing action

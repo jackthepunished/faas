@@ -238,6 +238,63 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/account/slo:
+    get:
+      tags: [account]
+      operationId: getAccountSLO
+      summary: Account-wide SLO rollup (issue #696 / ADR-082).
+      description: |
+        Flat scalar SLO rollup for the authenticated account. The
+        same wire shape as the per-app endpoint without the
+        `app_id` / `app_slug` fields — the rollup is sum-based
+        across every app the account owns. `instance_hours` and
+        `gb_hours` are summed from `usage_minutes` over the
+        window; the per-app equivalent is the explicit
+        `/v1/apps/{slug}/slo` endpoint.
+
+        `window` is the same closed vocabulary as the per-app
+        endpoint: `1h` | `24h` (default) | `7d`. Auth chain:
+        `usage:read` scope + MFA.
+
+        On Prometheus failure the endpoint returns 200 with
+        zeroed fields and `source: "degraded: <reason>"`. When
+        Postgres is down but the PromQL pass succeeded, only
+        `instance_hours` / `gb_hours` are zeroed and `source` is
+        `"degraded: postgres unavailable"`.
+      parameters:
+        - name: window
+          in: query
+          schema:
+            type: string
+            enum: [1h, 24h, 7d]
+            default: 24h
+          description: SLO window. Default `24h`.
+      responses:
+        '200':
+          description: The account-wide SLO rollup.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountSLOResponse'
+              example:
+                window: "24h"
+                source: "prometheus"
+                as_of: "2026-08-07T15:30:00Z"
+                request_duration:
+                  p50_ms: 22.1
+                  p95_ms: 91.0
+                  p99_ms: 410.0
+                error_rate_pct: 0.55
+                cold_boot_rate_pct: 4.20
+                instance_hours: 12.0
+                gb_hours: 3.0
+                wake_queue_p95_ms: 14.0
+                requests_total: 12000
+                throttled_total: 23
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/account/export:
     get:
       tags: [account]
@@ -1222,6 +1279,73 @@ paths:
                 error_rate_pct: 0.7
                 cold_start_pct: 8.5
                 wake_p95_ms: 380.2
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/slo:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [apps]
+      operationId: getAppSLO
+      summary: Per-app customer-facing SLO panel (issue #696 / ADR-082).
+      description: |
+        Closed-set windowed SLO panel for one app — the
+        customer-facing equivalent of AWS CloudWatch
+        per-function / GCP Cloud Run per-service. Distinct from
+        `GET /v1/apps/{slug}/metrics` (issue #273 / ADR-042) which
+        is the 5m-window dashboard panel. The /slo surface is the
+        "yesterday's SLO" / "this week's SLO" summary, with the
+        customer-facing SLO signals co-located with the
+        billing-derivable `instance_hours` / `gb_hours` fields.
+
+        The `window` parameter is a closed vocabulary, a strict
+        subset of the /metrics range vocabulary:
+
+          `1h` | `24h` (default) | `7d`
+
+        `wake_queue_p95_ms` is the FLEET p95
+        (`gateway_wake_queue_wait_seconds` is unlabeled). On
+        Prometheus failure the endpoint returns 200 with zeroed
+        fields and `source: "degraded: <reason>"`, matching the
+        public status page contract. When Postgres is down but
+        the PromQL pass succeeded, only `instance_hours` /
+        `gb_hours` are zeroed and `source` is
+        `"degraded: postgres unavailable"`.
+      parameters:
+        - name: window
+          in: query
+          schema:
+            type: string
+            enum: [1h, 24h, 7d]
+            default: 24h
+          description: SLO window. Default `24h`.
+      responses:
+        '200':
+          description: The SLO panel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppSLOResponse'
+              example:
+                app_id: "0123456789abcdef0123456789abcdef"
+                app_slug: "my-app"
+                window: "24h"
+                source: "prometheus"
+                as_of: "2026-08-07T15:30:00Z"
+                request_duration:
+                  p50_ms: 14.2
+                  p95_ms: 87.0
+                  p99_ms: 312.5
+                error_rate_pct: 0.41
+                cold_boot_rate_pct: 3.10
+                instance_hours: 0.0
+                gb_hours: 0.0
+                wake_queue_p95_ms: 12.0
+                requests_total: 4321
+                throttled_total: 0
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -7417,6 +7541,94 @@ components:
           additionalProperties: { $ref: '#/components/schemas/AppMetricsResponse' }
           x-since: "2026-07"
           x-issue: "393"
+
+    SLODuration:
+      description: |
+        Shared latency sub-shape used by `AppSLOResponse` and
+        `AccountSLOResponse`. Three percentiles over the SLO
+        window (2xx class only); NaN/Inf from `histogram_quantile`
+        on an empty window is coerced to 0 by the handler.
+      type: object
+      required: [p50_ms, p95_ms, p99_ms]
+      properties:
+        p50_ms: { type: number, description: "p50 latency in milliseconds." }
+        p95_ms: { type: number, description: "p95 latency in milliseconds." }
+        p99_ms: { type: number, description: "p99 latency in milliseconds." }
+      x-since: "2026-08"
+      x-issue: "696"
+
+    AppSLOResponse:
+      description: |
+        Per-app SLO panel returned by `GET /v1/apps/{slug}/slo?window=`
+        (issue #696 / ADR-082). Distinct from `AppMetricsResponse`
+        (issue #273 / ADR-042): the SLO surface is a fixed-window
+        (1h/24h/7d) summary of the customer-facing SLO signals,
+        not a 5m slice for the dashboard. The fields overlap only
+        on latency percentiles, error rate, and cold-boot rate — the
+        remaining fields (`wake_queue_p95_ms`, `throttled_total`,
+        `instance_hours`, `gb_hours`) are net-new per the issue.
+
+        On Prometheus failure the endpoint returns 200 with
+        zeroed fields and `source: "degraded: <reason>"`. When
+        Postgres is down but the PromQL pass succeeded, only
+        `instance_hours` / `gb_hours` are zeroed and `source` is
+        `"degraded: postgres unavailable"`.
+      type: object
+      required: [app_id, app_slug, window, source, as_of, request_duration, error_rate_pct, cold_boot_rate_pct, instance_hours, gb_hours, wake_queue_p95_ms, requests_total, throttled_total]
+      properties:
+        app_id: { type: string, format: uuid }
+        app_slug: { type: string }
+        window:
+          type: string
+          enum: [1h, 24h, 7d]
+          description: "Echoed SLO window, e.g. `24h`."
+        source:
+          type: string
+          description: '"prometheus" on success; "degraded: <reason>" otherwise.'
+        as_of: { type: string, format: date-time, description: "RFC3339Nano UTC stamp at which the SLO panel was assembled." }
+        request_duration: { $ref: '#/components/schemas/SLODuration' }
+        error_rate_pct: { type: number, description: "Share of [45]xx requests in the window." }
+        cold_boot_rate_pct: { type: number, description: "Share of requests that triggered a cold boot." }
+        instance_hours: { type: number, description: "Sum of instance × minute / 60 over the window (from `usage_minutes`)." }
+        gb_hours: { type: number, description: "Sum of mb_seconds / 3600 / 1024 over the window (from `usage_minutes`)." }
+        wake_queue_p95_ms:
+          type: number
+          description: "FLEET wake-queue p95 (`gateway_wake_queue_wait_seconds` is unlabeled)."
+        requests_total: { type: integer, format: int64 }
+        throttled_total: { type: integer, format: int64, description: "Per-app rate-limit count over the window." }
+      x-since: "2026-08"
+      x-issue: "696"
+
+    AccountSLOResponse:
+      description: |
+        Flat account-wide SLO rollup returned by
+        `GET /v1/account/slo?window=` (issue #696 / ADR-082).
+        Mirrors `AppSLOResponse` field-for-field except for
+        `app_id` / `app_slug` (the rollup is account-wide). The
+        fields are scalar sums/rates across the account; per-app
+        drill-down is served by the existing `/v1/apps/metrics`
+        endpoint.
+
+        `source` follows the same `"degraded: <reason>"` contract
+        as the per-app endpoint.
+      type: object
+      required: [window, source, as_of, request_duration, error_rate_pct, cold_boot_rate_pct, instance_hours, gb_hours, wake_queue_p95_ms, requests_total, throttled_total]
+      properties:
+        window:
+          type: string
+          enum: [1h, 24h, 7d]
+        source: { type: string, description: '"prometheus" on success; "degraded: <reason>" otherwise.' }
+        as_of: { type: string, format: date-time }
+        request_duration: { $ref: '#/components/schemas/SLODuration' }
+        error_rate_pct: { type: number }
+        cold_boot_rate_pct: { type: number }
+        instance_hours: { type: number, description: "Sum across all apps for the account." }
+        gb_hours: { type: number, description: "Sum across all apps for the account." }
+        wake_queue_p95_ms: { type: number }
+        requests_total: { type: integer, format: int64 }
+        throttled_total: { type: integer, format: int64 }
+      x-since: "2026-08"
+      x-issue: "696"
 
     UsageSummaryResponse:
       description: "Account-level monthly roll-up: included GB-hours, used, overage math, remaining balance, and informational used_cpu_hours (issue #279 / PR-B). The CPU dimension is observable but not yet billed; the GB-hours fields drive the overage math."
