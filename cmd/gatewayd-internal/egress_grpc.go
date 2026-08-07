@@ -73,6 +73,7 @@ type egressGRPCListener struct {
 	socketPath string
 	server     *grpc.Server
 	listener   net.Listener
+	serveDone  chan struct{}
 	sink       *egresssink.EgressSink
 	log        *slog.Logger
 }
@@ -241,7 +242,9 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 		l.listener = lis
 		l.log.Info("gatewayd egress: listening", "addr", l.socketPath)
 	}
+	l.serveDone = make(chan struct{})
 	go func() {
+		defer close(l.serveDone)
 		if err := l.server.Serve(lis); err != nil {
 			l.log.Warn("gatewayd egress: serve", "err", err)
 		}
@@ -289,6 +292,9 @@ func (l *egressGRPCListener) stop(ctx context.Context) error {
 		// Deadline blew past; force-close so the daemon doesn't
 		// hold the process open. gRPC's Stop returns immediately.
 		l.server.Stop()
+	}
+	if l.serveDone != nil {
+		<-l.serveDone
 	}
 	return nil
 }
