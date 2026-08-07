@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	scheddpb "github.com/onebox-faas/faas/api/proto/onebox/faas/schedd/v1"
@@ -529,6 +530,29 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	}
 	sinceWrittenAt := req.GetSinceWrittenAt().AsTime()
 	deploymentID := req.GetDeploymentId()
+	// Parse the customer-supplied level/grep filters once per
+	// RPC (issue #309 / tier-2 DX). Pre-#309 the gateway parsed
+	// these and discarded them with `_ = level; _ = grep`; the
+	// additive proto fields (StreamAppLogsRequest.level/grep,
+	// ADR-016) carry them from gatewayd → schedd and we apply
+	// them at the per-instance fan-out so a single regex
+	// compile / level matcher covers all instances. Both empty
+	// = NoFilter; the gateway already validated the regex and
+	// the level enum at parse time, so a Compile failure here
+	// would only fire under a buggy direct RPC client. We log
+	// + reject rather than silently dropping the request.
+	filter, err := ParseLogFilter(req.GetLevel(), req.GetGrep())
+	if err != nil {
+		// InvalidArgument is the right code: the level/grep
+		// values are caller-supplied, and the gateway already
+		// validates them at parse time (apislogs.ValidateLogFilters).
+		// Reaching this branch means a buggy direct-RPC client
+		// (tests, future SDKs) — surface the error so the
+		// operator can see it in the gRPC trace rather than
+		// silently dropping the request.
+		sendErr = status.Error(codes.InvalidArgument, err.Error())
+		return sendErr
+	}
 	// sink is the per-frame callback that writes one
 	// StreamAppLogsResponse onto the caller's gRPC stream. We
 	// synchronise on stream.Context() so a cancelled caller
@@ -543,6 +567,43 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	sink := func(f sched.LogFrame) error {
 		if stream.Context().Err() != nil {
 			return stream.Context().Err()
+		}
+		// Filter (issue #309 / tier-2 DX). Apply BEFORE building
+		// the proto response so a filtered line costs us only
+		// the MatchLine check, not the proto marshal + Send.
+		// Gap frames always pass through — the gap signal is
+		// sequencing metadata the customer must see regardless
+		// of grep/level (a dropped gap would hide a stall from
+		// the customer's session, defeating the issue #254
+		// "show me when logs stopped" guarantee). The counter
+		// increments only on line-frame drops so the dashboard
+		// panel surfaces a real rate.
+		if !f.IsGap && !filter.NoFilter() && !filter.MatchLine(f.Line) {
+			// MatchLine already returned false — the line
+			// failed at least one active filter. Recompute
+			// the per-filter result inline so the counter
+			// credits the actually-failing filter (a line
+			// that passes the level floor but fails the
+			// grep substring is a grep drop, not a level
+			// drop). When BOTH filters reject the line we
+			// attribute it to filter_level — customers tend
+			// to set --level first as the broad noise filter
+			// and add --grep to narrow further, so a line
+			// that fails both is most often "below the floor
+			// and would have been dropped anyway"; the
+			// operator looking at the rate can read the
+			// `apid_logs_dropped_total` panel by reason.
+			grepOK := filter.Grep == "" || strings.Contains(strings.ToLower(f.Line), strings.ToLower(filter.Grep))
+			levelOK := filter.Level == nil || filter.Level.Match(f.Line)
+			switch {
+			case !grepOK && !levelOK:
+				s.ops.IncLogDropped("filter_level")
+			case !grepOK:
+				s.ops.IncLogDropped("filter_grep")
+			default:
+				s.ops.IncLogDropped("filter_level")
+			}
+			return nil
 		}
 		if f.IsGap {
 			resp := &scheddpb.StreamAppLogsResponse{

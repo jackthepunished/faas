@@ -155,6 +155,26 @@ func RenderAppLogGap(w http.ResponseWriter, flusher http.Flusher, f scheddgrpc.L
 	ops.ObserveLogEmitted(appID)
 }
 
+// MaxGrepPatternBytes caps the customer-supplied --grep regex
+// length (issue #309 / tier-2 DX, peer review of PR #728).
+// Two concerns:
+//   - Compile cost: regexp.Compile is O(pattern length) but the
+//     compiler allocates intermediate NFA states that grow with
+//     pattern complexity, not just length. A 100KB pattern can
+//     pressure the vmmd heap on every wake.
+//   - Execution cost: Go's regexp engine is RE2-flavoured (no
+//     catastrophic backtracking in the worst case), but a
+//     pattern like `(a|a)*` can still match linearly against
+//     a long input line. The line length is capped by
+//     logbuf.MaxPartialLineBytes (1 MiB) on the producer side,
+//     so the matcher can't be pushed past that.
+//
+// 256 bytes is generous for any reasonable log filter
+// ("timeout|deadline", "request_id=[a-f0-9]+", etc.) while
+// foreclosing the pathological case. The CLI's --grep is
+// typically 8-32 bytes; 256 leaves headroom for power users.
+const MaxGrepPatternBytes = 256
+
 // ValidateLogFilters enforces the issue #309 filter contract on
 // the `--level`, `--grep`, `--since`, and `--deployment` query
 // params. ok=false on rejection; the handler must then emit the
@@ -182,9 +202,17 @@ func ValidateLogFilters(r *http.Request) (level string, grep string, sinceWritte
 	// --grep: reject embedded newlines so Move 4's substring
 	// matcher can never match across log line boundaries (same
 	// log-injection precedent as `CodeQL go/log-injection
-	// sanitisers`).
-	if g := q.Get("grep"); strings.ContainsAny(g, "\n\r") {
-		return "", "", time.Time{}, "", "invalid_grep", false
+	// sanitisers`). ALSO reject patterns longer than
+	// MaxGrepPatternBytes to foreclose the regex-DoS surface
+	// (peer review of PR #728): a pathological pattern can
+	// pressure the vmmd heap during Compile + MatchString.
+	if g := q.Get("grep"); g != "" {
+		if strings.ContainsAny(g, "\n\r") {
+			return "", "", time.Time{}, "", "invalid_grep", false
+		}
+		if len(g) > MaxGrepPatternBytes {
+			return "", "", time.Time{}, "", "invalid_grep", false
+		}
 	}
 	// --since (issue #517 / PR-B, AC3): RFC3339 lower bound on
 	// log written_at. Empty = no time bound. Malformed = reject

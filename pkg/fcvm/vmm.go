@@ -65,6 +65,15 @@ type JailerVMM struct {
 	// to the ring's writer; closed in Kill/DestroyWithExport so the byte
 	// budget is released when the instance is gone (invariant §6.2-4).
 	rings map[string]*logbuf.Ring
+	// slowSubscriber (issue #309 / tier-2 DX) is the per-VMM
+	// callback installed at every ring that registerRing
+	// creates. Nil = no callback wired; registerRing skips the
+	// SetSlowSubscriberCallback call entirely. Production
+	// wires it from cmd/vmmd/main.go to a closure that calls
+	// (*wire.OpsMetrics).IncLogDropped("slow_subscriber") via
+	// WithSlowSubscriberCallback. The field is read under
+	// v.mu inside registerRing so a swap is safe at runtime.
+	slowSubscriber func()
 	// materialisedTmp tracks tmp files materializeFromStorage created for
 	// each instance so Kill/DestroyWithExport can Remove them on teardown.
 	// Without this, the tmp files (in /tmp) outlive the chroot and leak
@@ -139,8 +148,45 @@ func (v *JailerVMM) registerRing(instance string) *logbuf.Ring {
 		_ = old.Close()
 	}
 	r := logbuf.New(0) // 0 -> logbuf.DefaultMaxBytes (10 MiB)
+	// Install the per-VMM slow-subscriber callback (issue
+	// #309 / tier-2 DX). The callback fires once per Write
+	// that hit at least one full subscriber channel — the
+	// counter semantics that map to the
+	// apid_logs_dropped_total{reason="slow_subscriber"}
+	// increment the dashboard queries. nil-safe: tests that
+	// construct a JailerVMM without WithSlowSubscriberCallback
+	// see the original behaviour (no callback wired, no
+	// metric increment).
+	if v.slowSubscriber != nil {
+		r.SetSlowSubscriberCallback(v.slowSubscriber)
+	}
 	v.rings[instance] = r
 	return r
+}
+
+// WithSlowSubscriberCallback installs (or replaces, when cb is
+// non-nil) the per-ring slow-subscriber callback every future
+// registerRing call will wire (issue #309 / tier-2 DX). The
+// callback fires once per ring Write whose Publish loop hit a
+// full subscriber channel. Returns the receiver so the
+// constructor call site reads as a fluent chain, matching the
+// WithStorage precedent.
+//
+// The callback is captured by closure at install time; the
+// typical wiring is:
+//
+//	jailer := fcvm.NewJailerVMM(...).WithStorage(...).
+//	    WithSlowSubscriberCallback(func() {
+//	        ops.IncLogDropped("slow_subscriber")
+//	    })
+//
+// Passing nil uninstalls (subsequent rings get no callback) —
+// useful for tests that swap the metric sink.
+func (v *JailerVMM) WithSlowSubscriberCallback(cb func()) *JailerVMM {
+	v.mu.Lock()
+	v.slowSubscriber = cb
+	v.mu.Unlock()
+	return v
 }
 
 // unregisterRing closes the ring and removes it from the map. Idempotent

@@ -53,10 +53,18 @@ type LogStream interface {
 // per-deployment soft scoping; empty = fan out to every live
 // instance for the app.
 //
+// level + grep (issue #309 / tier-2 DX) are the customer-facing
+// --level / --grep filters. Both empty = no filter; the schedd
+// applies them at the per-instance fan-out and increments
+// apid_logs_dropped_total{reason="filter_level" or "filter_grep"}
+// on drop. Empty values are skipped on the wire (proto3 omits
+// the field when zero) so pre-issue-#309 schedd builds keep
+// accepting the call unchanged (ADR-016 additive).
+//
 // Returned errors pass through unchanged. The caller owns error
 // mapping; this method never lifts gRPC statuses to *api.Problem
 // because the SSE renderer needs the raw code.
-func (c *Client) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) (LogStream, error) {
+func (c *Client) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, level string, grep string) (LogStream, error) {
 	req := &scheddpb.StreamAppLogsRequest{
 		AppId:    appID,
 		SinceSeq: sinceSeq,
@@ -66,6 +74,12 @@ func (c *Client) StreamAppLogs(ctx context.Context, appID string, sinceSeq int64
 	}
 	if deploymentID != "" {
 		req.DeploymentId = deploymentID
+	}
+	if level != "" {
+		req.Level = level
+	}
+	if grep != "" {
+		req.Grep = grep
 	}
 	stream, err := c.cli.StreamAppLogs(ctx, req)
 	if err != nil {
