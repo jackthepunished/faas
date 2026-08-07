@@ -253,6 +253,16 @@ func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 			if name == "vendor" || name == "node_modules" || name == ".git" {
 				return filepath.SkipDir
 			}
+			// Skip Claude Code's local worktree checkouts under
+			// .claude/worktrees/. These are sibling worktrees of stale
+			// feature branches parked by Claude Code; they live next
+			// to the repo root and contain copies of pkg/, cmd/, etc.
+			// that would falsely trip the literal scan. The directory
+			// itself is untracked (see .gitignore), so CI never sees
+			// it — the skip is purely for local-dev ergonomics.
+			if strings.Contains(path, string(filepath.Separator)+".claude"+string(filepath.Separator)+"worktrees"+string(filepath.Separator)) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
@@ -445,6 +455,13 @@ func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
 		if d.IsDir() {
 			name := d.Name()
 			if name == "vendor" || name == "node_modules" || name == ".git" {
+				return filepath.SkipDir
+			}
+			// Skip Claude Code's local worktree checkouts under
+			// .claude/worktrees/. See the matching skip in
+			// TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire for
+			// the rationale (untracked, local-dev-only).
+			if strings.Contains(path, string(filepath.Separator)+".claude"+string(filepath.Separator)+"worktrees"+string(filepath.Separator)) {
 				return filepath.SkipDir
 			}
 			return nil
