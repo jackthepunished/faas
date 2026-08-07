@@ -202,12 +202,18 @@ func TestHandleInvalidation_LifecycleStatesDoNotEvict(t *testing.T) {
 	}
 }
 
-// TestHandleInvalidation_TerminalStatesEvict (issue #168) verifies the
-// companion to the lifecycle test: terminal-ish states (stopped, failed,
-// parked, snapshotting) DO evict so the next request re-admits on a
-// different node / wakes fresh.
+// TestHandleInvalidation_TerminalStatesEvict (issue #168 + Tier A5 /
+// ADR-066) verifies the companion to the lifecycle test: terminal-ish
+// states (stopped, failed, parked, snapshotting, migrating) DO evict so
+// the next request re-admits on a different node / wakes fresh.
+//
+// Tier A5: state='migrating' is the cross-node live-instance handoff
+// state (Phase 2 of the four-phase commit at pkg/sched/migration_handoff.go).
+// Evicting on this state prevents the picker from routing traffic to a
+// node whose VM is mid-Park-then-destroy — the next request must
+// re-admit which lands on the destination's wake path.
 func TestHandleInvalidation_TerminalStatesEvict(t *testing.T) {
-	for _, state := range []string{"stopped", "failed", "parked", "snapshotting"} {
+	for _, state := range []string{"stopped", "failed", "parked", "snapshotting", "migrating"} {
 		f := &fakeInvalidator{}
 		log := testLogger()
 		payload := `{"instance_id":"i-term","app_id":"app-9","state":"` + state + `"}`

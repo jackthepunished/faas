@@ -2203,6 +2203,30 @@ func (e *Engine) admissionCeilingForOwn(ctx context.Context) int {
 	return n.AdmissionCeilingMB
 }
 
+// resolveNodeCeiling returns (ceilingMB, vcpuBudget) for a nodeID
+// via store.ComputeNodeByID. Used by MigrationHarness to thread
+// the destination's per-node admission limits into the Phase 3
+// ledger reservation — without this, NodeLedger.Admit falls back
+// to the global api.RAMAdmissionCeilingMB / api.VCPUSlots and a
+// heterogeneous fleet with one smaller destination gets
+// over-admitted (violating invariant §6.2-2).
+//
+// Errors fall through to (0, 0) which the ledger treats as the
+// legacy single-box fallback (safe for an un-registered node or a
+// transient store error; the migration proceeds at the global
+// ceiling — slightly less safe but never silently wrong). Called
+// with e.mu NOT held; ComputeNodeByID is read-only.
+func (e *Engine) resolveNodeCeiling(ctx context.Context, nodeID string) (int, int, error) {
+	if nodeID == "" {
+		return 0, 0, nil
+	}
+	n, err := e.store.ComputeNodeByID(ctx, nodeID)
+	if err != nil {
+		return 0, 0, err
+	}
+	return n.AdmissionCeilingMB, n.VCPUBudget, nil
+}
+
 // BuildAppSpecForMigration (Tier A5 / ADR-066) rebuilds the
 // AppSpec shape vmmd needs to restore a migrated VM from the
 // local app + deployment view. The lookup walks: instance → app
@@ -2349,8 +2373,9 @@ func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (i
 		liveInstances = liveInstances[:maxPerTick]
 	}
 
-	harness := NewMigrationHarness(e.store, e.vmm, e.ops, e.log,
-		e.ownerNodeID, e.BuildAppSpecForMigration)
+	harness := NewMigrationHarness(ctx, e.store, e.vmm, e.ops, e.log,
+		e.ownerNodeID, e.BuildAppSpecForMigration, e.ledger,
+		e.resolveNodeCeiling)
 	harness.SetMaxPerTick(maxPerTick)
 	leaseSeconds := api.MigrateLiveLeaseSeconds
 	if e.migrateLiveLeaseSeconds > 0 {

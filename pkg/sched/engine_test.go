@@ -50,11 +50,12 @@ type fakeVMM struct {
 	// same Park. nil = warm capture succeeds.
 	warmSnapErr error
 	destroyErr  error
-	pingErr     error // PR #114: injectable Ping failure for heartbeat tests
-	prepareErr  error // Tier A5: injectable PrepareLiveMigration error
-	adoptErr    error // Tier A5: injectable AdoptMigratedInstance error
-	ackErr      error // Tier A5: injectable AcknowledgeMigration error
-	cancelErr   error // Tier A5: injectable CancelLiveMigration error
+	pingErr     error                   // PR #114: injectable Ping failure for heartbeat tests
+	prepareErr  error                   // Tier A5: injectable PrepareLiveMigration error
+	adoptErr    error                   // Tier A5: injectable AdoptMigratedInstance error
+	ackErr      error                   // Tier A5: injectable AcknowledgeMigration error
+	cancelErr   error                   // Tier A5: injectable CancelLiveMigration error
+	adoptHook   func(instanceID string) // Tier A5: runs after a successful AdoptMigratedInstance; tests use it to mutate the store row so a downstream Phase 4 commit returns ErrConflict (verifying the Phase 4 release-on-failure path)
 	// lastSnapRef records the SnapshotRef CreateFromSnapshot was
 	// invoked with on its most recent call. F-2 review finding —
 	// Wake's storage_key plumbing deserves a test pin; storing the
@@ -309,6 +310,12 @@ func (f *fakeVMM) AdoptMigratedInstance(ctx context.Context, _, instanceID strin
 		return LiveMigrationAdopt{}, f.adoptErr
 	}
 	f.adopts++
+	hook := f.adoptHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(instanceID)
+	}
+	f.mu.Lock()
 	return LiveMigrationAdopt{
 		HostIP:   "10.100.0.2",
 		Netns:    "fc-" + instanceID,

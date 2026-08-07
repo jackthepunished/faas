@@ -226,6 +226,13 @@ metal-lima-m5: ## Run the M5 §14 deploy-to-park cold-boot acceptance on Lima (s
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env RUN_TARGET=./cmd/e2e/ ./deploy/lima/run-metal.sh -run 'TestDeployWakeMetal/deploy-then-parked'
 
+.PHONY: metal-lima-2node
+metal-lima-2node: ## Tier A5 / ADR-066: two-node Lima fleet for the cross-node live-instance migration acceptance (§14 M9)
+	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || limactl start deploy/lima/faas-metal-2node-b.yaml --tty=false
+	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a ./deploy/lima/run-metal.sh
+	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b ./deploy/lima/run-metal.sh
+
 .PHONY: lint
 lint: egress-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift gate
 	@$(GO) tool golangci-lint run

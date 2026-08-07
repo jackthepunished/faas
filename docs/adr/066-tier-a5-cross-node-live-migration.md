@@ -1,6 +1,6 @@
 # ADR-066 — Tier A5: cross-node live-instance migration
 
-Status: **Proposed** (PR open)
+Status: **Accepted** (revised 2026-08-07)
 
 Date: 2026-08-02
 
@@ -399,3 +399,65 @@ End-to-end manual smoke (Lima or a reference control-plane node):
    `curl https://<app>.fsn-2.example.com/`.
    The response should arrive within ~350 ms of the
    `UPDATE compute_nodes` (cold-boot from snapshot).
+
+## Acceptance (2026-08-07)
+
+The four gaps that blocked acceptance are closed in the
+PR that flips this ADR from `Proposed` to `Accepted`:
+
+1. **Cross-node snapshot read** — verified via the
+   regression test that the existing ADR-054
+   `OCIRegistryStorageBackend` + `LocalCacheBackend`
+   path delivers snapshot blobs from source node's
+   `Put` to destination node's `Get`. The cache is
+   default-on for `oci` mode (ADR-054 acceptance PR),
+   so the destination's first pull populates the local
+   cache and subsequent migrations hit the warm path.
+   No streaming Put/Get variant is needed (a future
+   v1.1 optimisation, out of scope).
+
+2. **Destination-side slot reservation** —
+   `pkg/sched/admission.go::NodeLedger.Request` gains
+   a `Kind` field (`KindWake | KindMigration`).
+   `KindMigration` reserves per-node RAM + vCPU
+   (invariant §6.2-2 re-stated per-node) but skips
+   per-app concurrency (invariant §6.2-1) so a
+   customer with 1 instance at `MaxConcurrency=1`
+   doesn't see a transient cap during the failover
+   window. Wired into
+   `pkg/sched/migration_handoff.go` at Phase 3 of the
+   four-phase commit, BEFORE the wire call so a flood
+   of inbound migrations cannot over-admit a
+   destination. Rolled back on Phase 3 wire failure;
+   persisted on Phase 4 success (the instance is now
+   RUNNING on the destination).
+
+3. **Gateway `state='migrating'` visibility** —
+   `cmd/gatewayd/backend.go::handleInvalidation`
+   treats `state='migrating'` as terminal-ish for
+   routing purposes, alongside the existing
+   `stopped | failed | parked | snapshotting`
+   eviction set. The picker no longer routes traffic
+   to a node mid-handoff; the next request re-admits
+   which lands on the destination's wake path.
+
+4. **Acceptance gates** — §14 M9 milestone row added
+   to `docs/faas_implementation_spec.md` with the
+   executable acceptance tests; new "Tier A5 gate"
+   section in `docs/runbooks/multi-host-rollout.md`;
+   two-node Lima fleet target (`make metal-lima-2node`)
+   added so the §14 M9 gate is runnable on Apple
+   Silicon M3+ without bare-metal x86_64.
+
+### Cross-references
+
+- §14 M9 row: `docs/faas_implementation_spec.md:914`
+  (after M8).
+- Runbook Tier A5 gate section:
+  `docs/runbooks/multi-host-rollout.md`.
+- ADR-054 (storage prerequisite):
+  `docs/adr/054-oci-registry-storage-end-to-end.md`.
+- ADR-067 (Tier A6 watchdog, ships alongside):
+  `docs/adr/067-tier-a6-migrating-instance-watchdog.md`.
+- Issue #95 slice 5 — the multi-box slice this ADR
+  closes.

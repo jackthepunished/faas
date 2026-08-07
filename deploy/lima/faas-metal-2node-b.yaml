@@ -1,0 +1,129 @@
+# faas-metal-2node-b — second guest for the Tier A5 two-node fleet.
+#
+# WHY: ADR-066 (cross-node live-instance migration, Tier A5, §14 M9)
+# requires a two-node fleet to exercise the full four-phase commit
+# end-to-end on a developer Mac. The single-node faas-metal.yaml
+# (spec §14 acceptance source of truth on x86_64) is insufficient
+# because the migration path requires two distinct schedd nodes
+# dialing each other's vmmd. This file is a thin companion to
+# faas-metal.yaml that provisions a second guest ("faas-metal-2b")
+# alongside the first, sharing host-side Postgres via the Lima
+# default network.
+#
+# Usage:
+#   limactl start deploy/lima/faas-metal.yaml        # node-a
+#   limactl start deploy/lima/faas-metal-2node-b.yaml # node-b
+#   # In each guest, point FAAS_NODE_NAME at its own name so the
+#   # schedd registers as a distinct compute_node. The two guests
+#   # share the same /run/postgresql socket on their respective
+#   # VMs (each runs its own postgres); cross-node traffic goes
+#   # over the Lima default network at 192.168.5.0/24. The
+#   # integration test walks the Tier A5 runbook procedure
+#   # (docs/runbooks/multi-host-rollout.md §"Tier A5 gate").
+#
+# CAVEAT: same as faas-metal.yaml — arm64 Lima guests, NOT
+# production x86_64. The bare-metal x86_64 control-plane node
+# remains the source of truth for §14 M9.
+
+vmType: vz
+arch: aarch64
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+
+mounts:
+  - location: "~"
+    writable: true
+
+probes:
+  - description: "nested KVM present (/dev/kvm)"
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 60s bash -c "until test -e /dev/kvm; do sleep 2; done"; then
+        echo >&2 "/dev/kvm never appeared — nested virtualization was not granted."
+        exit 1
+      fi
+    hint: |
+      /dev/kvm is missing. Requires Apple Silicon M3+ / macOS 15+.
+
+# Minimal provisioner — defers heavy staging (Firecracker, rootfs,
+# builder-base) to the existing faas-metal guest's image-cache so the
+# two-node fleet doesn't double the Lima first-boot time. We do the
+# bare minimum: same dpkg-lock-tolerant apt set, same per-daemon
+# service accounts, same /srv/fc tree ownership, postgres up.
+#
+# Why minimal: the §14 M9 acceptance is the four-phase handoff's
+# correctness, not the second guest's provisioning parity. A future
+# PR may unify the two provisioner bodies; for now the divergence
+# is documented and intentional.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      apt_wait() {
+        local deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+              && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+            return 0
+          fi
+          sleep 1
+        done
+        echo "apt_wait: dpkg lock still held after 60s" >&2
+        return 1
+      }
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt_wait
+      apt-get update -y
+      apt_wait
+      apt-get install -y --no-install-recommends \
+        build-essential e2fsprogs iproute2 iptables nftables git curl ca-certificates \
+        busybox-static jq postgresql
+
+      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+        if ! id -u "$u" >/dev/null 2>&1; then
+          useradd -r -M -s /usr/sbin/nologin "$u"
+        fi
+      done
+      groupadd -f faas || true
+      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+        usermod -aG faas "$u" 2>/dev/null || true
+      done
+      install -d -m 0755 -o root -g root /etc/faas
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/base
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/jail
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/snap
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/layers
+
+      install -d -m 0755 -o postgres -g postgres /var/run/postgresql
+      ln -sfn /var/run/postgresql /run/postgresql
+      cat >/etc/postgresql/16/main/pg_hba.conf <<EOF
+      local all all trust
+      host all all 127.0.0.1/32 trust
+      host all all ::1/128 trust
+      EOF
+      pg_ctlcluster 16 main start || true
+      sleep 1
+      pg_ctlcluster 16 main reload || true
+      sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='faas'" \
+        | grep -q 1 || sudo -u postgres psql -c "CREATE ROLE faas LOGIN SUPERUSER"
+      sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='faas'" \
+        | grep -q 1 || sudo -u postgres createdb faas
+      sudo -u postgres psql -c "GRANT ALL ON DATABASE faas TO faas" || true
+
+      # Default user / kvm group — same dance as faas-metal.yaml.
+      groupadd -f kvm || true
+      DEFAULT_USER="$(getent passwd | awk -F: '$3>=500 && $3<65000 && $7 ~ /(bash|zsh|sh)$/ {print $1; exit}')"
+      DEFAULT_USER="${DEFAULT_USER:-poyrazk}"
+      DEFAULT_USER="${DEFAULT_USER:-ubuntu}"
+      usermod -aG kvm "${DEFAULT_USER}" || true
