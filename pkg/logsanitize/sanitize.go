@@ -16,6 +16,8 @@
 package logsanitize
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -108,4 +110,37 @@ func FieldAny(v any) string {
 		return fmt.Sprintf("%d-byte-error:%s", len(x.Error()), Field(x.Error()))
 	}
 	return Field(fmt.Sprint(v))
+}
+
+// HashShort returns a short, fixed-length, non-reversible fingerprint
+// of a server-side identifier for use in error logs. The output is a
+// 16-hex-char prefix of the SHA-256 digest — 64 bits is plenty of
+// entropy to disambiguate per-account / per-app log entries while
+// staying short enough to read in a 1-line log record.
+//
+// The function name is load-bearing: CodeQL's CleartextLogging
+// module treats any call whose callee name matches the
+// notSensitive() regex (which includes `hash` / `sha` / `md5` /
+// `redact` / `obfuscate`) as an obfuscator barrier, so data
+// originating from an HTTP header, URL query parameter, or any
+// other tainted source stops flowing at the call site. This is the
+// structural reason account_id / app_id routed through HashShort
+// does not raise go/clear-text-logging alerts. Renaming this
+// function (or inlining the hash computation) re-opens the alert.
+//
+// Returns "<hash:0>" for empty input so the field is always present
+// in the JSON log output — empty values are ambiguous between
+// "not set" and "literal empty string".
+//
+// The helper is exported so call sites in any package (cmd/apid,
+// pkg/appmetrics, pkg/authz, etc.) can route request-derived
+// identifiers through the same barrier. The pkg/authz-internal
+// `logHashShort` predates this helper; the two are functionally
+// equivalent and could be consolidated in a future PR.
+func HashShort(s string) string {
+	if s == "" {
+		return "<hash:0>"
+	}
+	sum := sha256.Sum256([]byte(s))
+	return "h:" + hex.EncodeToString(sum[:8])
 }

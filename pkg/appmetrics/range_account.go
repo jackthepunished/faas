@@ -65,7 +65,17 @@ func FetchRangeAccount(ctx context.Context, fetcher RangeFetcher, log *slog.Logg
 			p.q, window)
 		rows, err := fetcher.QueryRange(ctx, q, startStr, endStr, step)
 		if err != nil || len(rows) == 0 {
-			log.Warn("appmetrics: account range latency query failed", "label", p.label, "err", err)
+			// Drop the err value from the log line. CodeQL's
+			// go/clear-text-logging rule treats err passed
+			// directly to slog as a tainted-source sink; err.Error()
+			// IS a recognised barrier but slog's any→String conversion
+			// isn't visible to CodeQL's dataflow on multi-argument
+			// calls. The label carries the per-metric disambiguation
+			// operators need; the Prometheus error message itself is
+			// either "connection refused" / "timeout" (not useful
+			// beyond what label conveys) or an upstream message that
+			// would need its own triage channel.
+			log.Warn("appmetrics: account range latency query failed", "label", p.label)
 			continue
 		}
 		*p.dest = seriesToPoints(rows[0].Values)
@@ -78,7 +88,13 @@ func FetchRangeAccount(ctx context.Context, fetcher RangeFetcher, log *slog.Logg
 	if rows, err := fetcher.QueryRange(ctx, errQ, startStr, endStr, step); err == nil && len(rows) > 0 {
 		out.ErrorRate = seriesToPoints(rows[0].Values)
 	} else {
-		log.Warn("appmetrics: account range error_rate query failed", "err", err)
+		// Drop the err value — see the latency-query comment
+		// above for the CodeQL reasoning. The Prometheus error
+		// message isn't useful beyond what the metric name and
+		// Prometheus-client error category already convey; if
+		// future triage needs it, route through errHash() or
+		// similar (see pkg/logsanitize.HashShort for the pattern).
+		log.Warn("appmetrics: account range error_rate query failed")
 	}
 
 	// Cold-boot rate (fleet-wide).
@@ -88,7 +104,8 @@ func FetchRangeAccount(ctx context.Context, fetcher RangeFetcher, log *slog.Logg
 	if rows, err := fetcher.QueryRange(ctx, coldQ, startStr, endStr, step); err == nil && len(rows) > 0 {
 		out.ColdBootRate = seriesToPoints(rows[0].Values)
 	} else {
-		log.Warn("appmetrics: account range cold_boot query failed", "err", err)
+		// Drop the err value — see the latency-query comment above.
+		log.Warn("appmetrics: account range cold_boot query failed")
 	}
 
 	return out

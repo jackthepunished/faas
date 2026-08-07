@@ -175,3 +175,58 @@ func TestItoa(t *testing.T) {
 		})
 	}
 }
+
+// TestHashShort pins the four contracts that load-bearing
+// callers rely on:
+//
+//  1. Empty input → "<hash:0>" so the JSON log field is always
+//     present (empty values are ambiguous between "not set" and
+//     "literal empty string").
+//  2. Output format is "h:" + 16 hex chars (= 64 bits of SHA-256).
+//  3. Determinism — same input always yields the same hash (so
+//     log-grep correlation works across processes).
+//  4. Collision resistance — distinct inputs produce distinct
+//     outputs with overwhelming probability (16 hex chars = 64
+//     bits; the test pins three pairs that exercise the prefix
+//     boundary).
+//
+// The function name itself is load-bearing for CodeQL
+// (CleartextLogging.qll::isBarrier rule 3, notSensitive()
+// regex matches `hash`). Renaming this function or inlining the
+// computation re-opens the go/clear-text-logging alert — see
+// pkg/logsanitize.HashShort's doc.
+func TestHashShort(t *testing.T) {
+	if got := HashShort(""); got != "<hash:0>" {
+		t.Errorf("HashShort(\"\") = %q, want %q", got, "<hash:0>")
+	}
+	// (2) format.
+	for _, in := range []string{"a", "abc", "abcdef1234567890"} {
+		got := HashShort(in)
+		if len(got) != len("h:")+16 {
+			t.Errorf("HashShort(%q) length = %d, want %d (got %q)", in, len(got), len("h:")+16, got)
+		}
+		if !strings.HasPrefix(got, "h:") {
+			t.Errorf("HashShort(%q) = %q, missing h: prefix", in, got)
+		}
+		for _, c := range got[2:] {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				t.Errorf("HashShort(%q) = %q, non-lowercase-hex in tail", in, got)
+			}
+		}
+	}
+	// (3) determinism.
+	if a, b := HashShort("app-uuid-123"), HashShort("app-uuid-123"); a != b {
+		t.Errorf("HashShort is non-deterministic: %q vs %q", a, b)
+	}
+	// (4) distinct inputs → distinct outputs.
+	pairs := []struct{ a, b string }{
+		{"app-a", "app-b"},
+		{"acct-1", "acct-2"},
+		{"abc", "abd"}, // single-bit boundary
+	}
+	for _, p := range pairs {
+		if x, y := HashShort(p.a), HashShort(p.b); x == y {
+			t.Errorf("HashShort collision: %q == %q (%q)", x, y, p)
+		}
+	}
+}

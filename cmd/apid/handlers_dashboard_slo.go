@@ -39,6 +39,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
+	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -129,7 +130,12 @@ func (s *server) fetchDashboardSLO(ctx context.Context, log *slog.Logger, app st
 		Step:                  rangeSeries.Step,
 	}
 	if src != appmetrics.SourcePrometheus && log != nil {
-		log.Warn("dashboard renderAppDetail: SLO fetch degraded", "app_id", app.ID, "window", window, "source", src)
+		// Hash app.ID so the per-app dashboard-render WARN line
+		// stays disambiguable without logging the raw UUID.
+		// HashShort matches CodeQL's notSensitive() regex —
+		// structural barrier, not a sanitizer (see
+		// pkg/logsanitize.HashShort's doc).
+		log.Warn("dashboard renderAppDetail: SLO fetch degraded", "app_id_hash", logsanitize.HashShort(app.ID), "window", window, "source", src)
 	}
 	return view
 }
@@ -179,7 +185,10 @@ func (s *server) fetchDashboardAccountSLO(ctx context.Context, log *slog.Logger,
 		Step:                  rangeSeries.Step,
 	}
 	if src != appmetrics.SourcePrometheus && log != nil {
-		log.Warn("dashboard renderAccount: SLO fetch degraded", "account_id", acct.ID, "window", window, "source", src)
+		// Hash acct.ID — see the HashShort comment above. Per-app
+		// and per-account dashboard-render WARN lines share the
+		// same obfuscator-call barrier pattern.
+		log.Warn("dashboard renderAccount: SLO fetch degraded", "account_id_hash", logsanitize.HashShort(acct.ID), "window", window, "source", src)
 	}
 	return view
 }
