@@ -1519,7 +1519,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-// Issue #695 / ADR-080: public_auth_mode is included in the column
+	// Issue #695 / ADR-080: public_auth_mode is included in the column
 	// list so the App struct's value is written verbatim. Pre-#695 the
 	// schema default ('open') shadowed any value the caller passed,
 	// which broke the per-plan default path on Pro/Scale (default
@@ -1553,7 +1553,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
 	return scanApp(row)
 }
 
@@ -1674,7 +1674,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-// Issue #695 / ADR-080: public_auth_mode is in the column list so
+	// Issue #695 / ADR-080: public_auth_mode is in the column list so
 	// the App struct's value is written verbatim (same rationale as
 	// CreateApp above — schema default 'open' would otherwise shadow
 	// the per-plan default).
@@ -1700,7 +1700,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2551,7 +2551,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetPublicAuth,
 		derefString(ptrOrEmpty(p.PublicAuth)),
 		nilOrBytes(p.PublicAuth),
-// Issue #695 / ADR-080: grand-father clear path. apid sets
+		// Issue #695 / ADR-080: grand-father clear path. apid sets
 		// this when the customer PATCHed require_authn or public_auth,
 		// which is the deliberate-choice signal the dashboard banner
 		// looks for. No-op for new post-flip apps (column is already
@@ -9286,7 +9286,7 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// into a *[]byte to keep the SQL NULL → Go nil
 		// convention explicit.
 		&a.PublicAuthMode, &a.PublicAuthBasicSealed,
-// Issue #695 / ADR-080: grand-father marker. Nullable
+		// Issue #695 / ADR-080: grand-father marker. Nullable
 		// timestamptz scanned into *time.Time (pgx handles the
 		// SQL NULL → Go nil conversion natively — same shape
 		// as ReassignedAt / MigratedAt above). NOT NULL after
