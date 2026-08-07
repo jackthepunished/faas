@@ -9658,7 +9658,18 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 
 func scanDeployment(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
-	if err := scanDeploymentInto(&d, row, nil, nil, nil); err != nil {
+	// Use local scratch vars for the rootfs triple so the call
+	// passes NON-NIL *string / *int64 destinations to row.Scan.
+	// pgx v5 panics with "invalid memory address or nil pointer
+	// dereference" when a typed-nil pointer is passed as a Scan
+	// destination (the unified 32-column helper unifies this path
+	// with scanDeploymentWithRootfs; previously scanDeployment had
+	// its own 29-column projection that skipped the rootfs columns
+	// entirely). The scratch values are discarded — callers don't
+	// see rootfs fields on the Deployment struct.
+	var rootfsPath, rootfsKey string
+	var rootfsBytes int64
+	if err := scanDeploymentInto(&d, row, &rootfsPath, &rootfsKey, &rootfsBytes); err != nil {
 		return Deployment{}, err
 	}
 	return d, nil
@@ -9685,10 +9696,14 @@ func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 
 func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 	var out []Deployment
+	// Local scratch vars for the rootfs triple — pgx v5 panics on
+	// typed-nil Scan destinations. The values are discarded.
+	var rootfsPath, rootfsKey string
+	var rootfsBytes int64
 	for rows.Next() {
 		d := Deployment{}
-		// Mirrors scanDeployment: keep the override_liveness_probe
-		// scan destination aligned with the SELECT projection in
+		// Mirrors scanDeployment: keep the column scan destination
+		// list aligned with the SELECT projection in
 		// deploymentSelectColumnsWithRootfs — adding a new column
 		// there without adding it here triggers pgx's "number of
 		// field descriptions must equal number of destinations"
@@ -9698,7 +9713,7 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 		// scanDeploymentInto helper makes drift impossible —
 		// changing one SELECT projection forces a single helper
 		// update.
-		if err := scanDeploymentInto(&d, rows, nil, nil, nil); err != nil {
+		if err := scanDeploymentInto(&d, rows, &rootfsPath, &rootfsKey, &rootfsBytes); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
