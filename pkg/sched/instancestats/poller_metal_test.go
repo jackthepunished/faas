@@ -111,7 +111,7 @@ func TestMetalStats_CgroupStatsReadsRealKernelFiles(t *testing.T) {
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, cpuUsage, rss)
 	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join("/sys/fs/cgroup", "faas-tenant.slice", instance)) })
 
-	sample, ok := reader.Sample(instance)
+	sample, ok := reader.Sample(instance, "")
 	if !ok {
 		t.Fatal("cgroupstats.Reader.Sample returned ok=false on a freshly written cgroup tree — reader cannot parse the kernel's cpu.stat format")
 	}
