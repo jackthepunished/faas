@@ -1120,10 +1120,10 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 	// a failure is logged but does not roll back the store write.
 	if s.audit != nil {
 		s.audit.Emit(r.Context(), "deployment.min_instances_changed", &acct.ID, map[string]any{
-			"app":         app.ID,
-			"deployment":  updated.ID,
+			"app":           app.ID,
+			"deployment":    updated.ID,
 			"min_instances": v,
-			"prev":        prev,
+			"prev":          prev,
 		})
 	}
 	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))

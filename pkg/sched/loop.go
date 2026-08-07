@@ -976,10 +976,10 @@ func (l *Loop) runReaper(ctx context.Context) {
 				}
 			}
 			snapshot = append(snapshot, InstanceInfo{
-				Instance:     ins.ID,
-				AppID:        ins.AppID,
-				Plan:         plan,
-				State:        state.State(ins.State),
+				Instance: ins.ID,
+				AppID:    ins.AppID,
+				Plan:     plan,
+				State:    state.State(ins.State),
 				// ADR-072: carrier for the post-snapshot
 				// app-wide max floor enrichment. Empty on legacy
 				// rows that pre-date the per-deployment column.

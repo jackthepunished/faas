@@ -734,7 +734,7 @@ func TestRunReaperMirrorsDeploymentFloor(t *testing.T) {
 	touches := make([]state.InstanceTouch, 0, len(rows))
 	for _, r := range rows {
 		touches = append(touches, state.InstanceTouch{
-			InstanceID: r.ID,
+			InstanceID:  r.ID,
 			LastRequest: time.Now().Add(-2 * time.Hour),
 		})
 	}
@@ -792,7 +792,7 @@ func TestRunReaperFloorDropEmitsAuditRelocated(t *testing.T) {
 	touches := make([]state.InstanceTouch, 0, len(rows))
 	for _, r := range rows {
 		touches = append(touches, state.InstanceTouch{
-			InstanceID: r.ID,
+			InstanceID:  r.ID,
 			LastRequest: time.Now().Add(-2 * time.Hour),
 		})
 	}

@@ -6265,7 +6265,7 @@ components:
         and survives an intermittent 5xx across the consecutive window (AC #2:
         flaky app does NOT oscillate). The cooldown gate short-circuits the
         counter when a probe fires inside the previous destroy's window so the
-        cold-boot replacement instance has time to settle.
+        cold-boot replacement instance has a grace period to settle.
       type: object
       required: [path]
       properties:

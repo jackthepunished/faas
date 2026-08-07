@@ -536,9 +536,9 @@ type fakeDeploymentStore struct {
 	deps []state.Deployment
 	apps map[string]state.App
 
-	listAllErr  error
+	listAllErr   error
 	listByNIDErr error
-	appByIDErr  map[string]error // keyed by app id; nil = success
+	appByIDErr   map[string]error // keyed by app id; nil = success
 
 	listAllCalls  bool
 	listByIDCalls int
@@ -597,10 +597,10 @@ func (s *fakeDeploymentStore) ConcurrencyForDeployment(_ context.Context, appID,
 // trigger's AppByID lookup finds the right row.
 func floorDeployment(id, appID string, minInstances int) state.Deployment {
 	return state.Deployment{
-		ID:          id,
-		AppID:       appID,
-		Kind:        state.DeploymentKindImage,
-		Status:      state.DeployLive,
+		ID:           id,
+		AppID:        appID,
+		Kind:         state.DeploymentKindImage,
+		Status:       state.DeployLive,
 		MinInstances: minInstances,
 	}
 }
@@ -626,8 +626,8 @@ func withDeploymentStore(t *testing.T, appStore AppStore, depStore DeploymentSto
 func TestTickPerDeployment_MaxOfAppAndDeploymentFloor(t *testing.T) {
 	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
 	ledger := &fakeLedger{
-		conc:    map[string]int{"app1": 0},
-		depConc: map[string]int{"app1\x00d1": 0},
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
 		headroom: 47_600,
 	}
 	engine := &fakeEngine{}
@@ -680,8 +680,8 @@ func TestTickPerDeployment_MaxOfAppAndDeploymentFloor(t *testing.T) {
 func TestTickPerDeployment_InheritsAppFloor(t *testing.T) {
 	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
 	ledger := &fakeLedger{
-		conc:    map[string]int{"app1": 0},
-		depConc: map[string]int{"app1\x00d1": 0},
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
 		headroom: 47_600,
 	}
 	engine := &fakeEngine{}
@@ -716,8 +716,8 @@ func TestTickPerDeployment_InheritsAppFloor(t *testing.T) {
 func TestTickPerDeployment_DualEmitsBothAuditKinds(t *testing.T) {
 	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
 	ledger := &fakeLedger{
-		conc:    map[string]int{"app1": 0},
-		depConc: map[string]int{"app1\x00d1": 0},
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
 		headroom: 47_600,
 	}
 	engine := &fakeEngine{results: map[string]AdmitResult{"app1|d1": {InstanceID: "iid-abc"}}}
@@ -770,8 +770,8 @@ func TestTickPerDeployment_DualEmitsBothAuditKinds(t *testing.T) {
 func TestTickPerDeployment_FreePlanDisabled(t *testing.T) {
 	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanFree, 0)}}
 	ledger := &fakeLedger{
-		conc:    map[string]int{"app1": 0},
-		depConc: map[string]int{"app1\x00d1": 0},
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
 		headroom: 47_600,
 	}
 	engine := &fakeEngine{}
@@ -833,8 +833,8 @@ func TestTickPerDeployment_AppByIDErrorObservesError(t *testing.T) {
 func TestTickPerDeployment_FloorMetSkips(t *testing.T) {
 	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
 	ledger := &fakeLedger{
-		conc:    map[string]int{"app1": 3},
-		depConc: map[string]int{"app1\x00d1": 3},
+		conc:     map[string]int{"app1": 3},
+		depConc:  map[string]int{"app1\x00d1": 3},
 		headroom: 47_600,
 	}
 	engine := &fakeEngine{}
@@ -862,8 +862,8 @@ func TestTickPerDeployment_FloorMetSkips(t *testing.T) {
 func TestTickPerDeployment_OwnerNodeIDRoutesToListDeploymentsByNodeID(t *testing.T) {
 	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
 	ledger := &fakeLedger{
-		conc:    map[string]int{"app1": 0},
-		depConc: map[string]int{"app1\x00d1": 0},
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
 		headroom: 47_600,
 	}
 	engine := &fakeEngine{}
