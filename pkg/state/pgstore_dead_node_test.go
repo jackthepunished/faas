@@ -44,12 +44,24 @@ import (
 // per-account RAM admission ceiling a future migration might add.
 func pgTestComputeNode(t *testing.T, ctx context.Context, s *state.PgStore, active bool, age time.Duration) string {
 	t.Helper()
+	// Every field below is mandatory against the pgstore schema.
+	// MemStore accepts the zero-value struct happily (no
+	// target_url CHECK, no admission_ceiling CHECK, no vcpu_budget
+	// CHECK), so the MemStore-side test in
+	// pkg/sched/deadnode_reconciler_test.go has been getting away
+	// with `Name: ..., Active: ..., MemMB: 8192, MaxConcurrency: 16`
+	// — the pgstore parity test needs every NOT NULL column the
+	// constraints key off. Mirrors
+	// pkg/state/pgstore_coverage2_test.go:94.
 	n, err := s.CreateComputeNode(ctx, state.ComputeNode{
 		Name:               "dnr-" + uuid.NewString(),
+		TargetURL:          "unix:///run/faas/vmmd.sock",
 		Active:             active,
 		MemMB:              8192,
 		MaxConcurrency:     16,
 		AdmissionCeilingMB: 256,
+		VPCPUs:             4,
+		VCPUBudget:         160,
 	})
 	if err != nil {
 		t.Fatalf("CreateComputeNode: %v", err)
