@@ -293,8 +293,8 @@ func TestCmdTrafficSet_BasicFlow(t *testing.T) {
 		gotBody = string(body)
 		w.Header().Set("Content-Type", "application/json")
 		writeJSONTest(w, api.DeploymentResponse{
-			ID:            wantDepID,
-			AppID:         "app-id",
+			ID:             wantDepID,
+			AppID:          "app-id",
 			TrafficPercent: wantPercent,
 		})
 	}))
