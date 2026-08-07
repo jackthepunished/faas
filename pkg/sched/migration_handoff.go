@@ -382,11 +382,11 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 	// the instance is now RUNNING on the destination and counts
 	// toward its ledger normally.
 	if err := h.ledger.Admit(Request{
-		Instance:    instanceID,
-		RAMMB:       int(appSpec.MemSizeMiB),
-		VCPU:        int(appSpec.VCPUCount),
-		Kind:        KindMigration,
-		NodeID:      h.newOwnerNodeID,
+		Instance:      instanceID,
+		RAMMB:         int(appSpec.MemSizeMiB),
+		VCPU:          int(appSpec.VCPUCount),
+		Kind:          KindMigration,
+		NodeID:        h.newOwnerNodeID,
 		NodeCeilingMB: h.destinationCeilingMB,
 		VCPUBudget:    h.destinationVCPUBudget,
 		// AppID + Plan left zero-valued: KindMigration skips
