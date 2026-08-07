@@ -1963,9 +1963,9 @@ func mapFailureMessage(err string) string {
 	case "user_error":
 		return "Build failed — see log above for the failing command."
 	case "oom":
-		return "Build ran out of memory (2 GB limit). Try fewer/smaller dependencies, or upgrade for a larger build. Docs: https://docs.gregale.example/build/limits#memory"
+		return "Build ran out of memory (2 GB limit). Try fewer/smaller dependencies, or upgrade for a larger build. Docs: https://docs.gregale.dev/build/limits#memory"
 	case "timeout":
-		return "Build exceeded 10 min. Docs: https://docs.gregale.example/build/limits#timeout"
+		return "Build exceeded 10 min. Docs: https://docs.gregale.dev/build/limits#timeout"
 	case "infra":
 		return "Our build system hiccuped — we've been alerted and requeued your build automatically."
 	}

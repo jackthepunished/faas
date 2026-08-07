@@ -1021,3 +1021,54 @@ func TestCmdLogs_GrepSinceLevel(t *testing.T) {
 		}
 	})
 }
+
+// TestMapFailureMessage_BuildLimitsDocsLinks pins the docs URLs
+// emitted in the build-failure copy (mapFailureMessage's oom and
+// timeout branches) to the live docs host. Issue #420 / PR-A:
+// the original literals pointed at docs.gregale.example (RFC 2606
+// reserved TLD) — a missed rename from PR #458. This test pins the
+// post-fix shape so the placeholder can't drift back. We assert via
+// strings.Contains (not exact match) because the surrounding copy
+// may churn; what matters is the host + path. The third case
+// pins the negative — `user_error` should NOT leak the reserved
+// TLD or any docs URL at all.
+func TestMapFailureMessage_BuildLimitsDocsLinks(t *testing.T) {
+	cases := []struct {
+		name       string
+		errClass   string
+		wantSubstr string // empty string = "must NOT contain the reserved TLD"
+	}{
+		{
+			name:       "oom",
+			errClass:   "oom",
+			wantSubstr: "https://docs.gregale.dev/build/limits#memory",
+		},
+		{
+			name:       "timeout",
+			errClass:   "timeout",
+			wantSubstr: "https://docs.gregale.dev/build/limits#timeout",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mapFailureMessage(tc.errClass)
+			if !strings.Contains(got, tc.wantSubstr) {
+				t.Fatalf("mapFailureMessage(%q) = %q; want substring %q", tc.errClass, got, tc.wantSubstr)
+			}
+			// Negative: never the RFC 2606 reserved TLD.
+			if strings.Contains(got, "https://docs.gregale.example") {
+				t.Fatalf("mapFailureMessage(%q) leaked the reserved TLD docs.gregale.example: %q", tc.errClass, got)
+			}
+		})
+	}
+
+	// Negative: the `user_error` branch has no docs link at all.
+	// Pin so a future copy change can't reintroduce one pointing
+	// at the reserved TLD.
+	t.Run("user_error_no_docs_link", func(t *testing.T) {
+		got := mapFailureMessage("user_error")
+		if strings.Contains(got, "https://docs.gregale.example") {
+			t.Fatalf("mapFailureMessage(user_error) leaked the reserved TLD docs.gregale.example: %q", got)
+		}
+	})
+}
