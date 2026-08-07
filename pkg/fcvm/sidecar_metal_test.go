@@ -199,7 +199,7 @@ func TestMetalSidecarBoot(t *testing.T) {
 	// handshake already did this once; the second probe here
 	// is the AC #1 surface — the boot path must end at a
 	// running supervisor, not a crash-looped one).
-	inst, ok := m.liveInstances[instance]
+	inst, ok := m.LiveInstances()[instance]
 	if !ok {
 		t.Fatalf("instance %q not in live map", instance)
 	}

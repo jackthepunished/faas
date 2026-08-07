@@ -2498,6 +2498,29 @@ func (m *Manager) LiveCount() int {
 	return len(m.live)
 }
 
+// LiveInstances returns a snapshot copy of the Manager's live map,
+// keyed by instance name. The returned map is a fresh copy taken
+// under m.mu, so concurrent Destroy / Wake updates do not race the
+// caller's iteration. Used by metal tests (issue #554 / ADR-069
+// follow-up: pkg/fcvm/sidecar_metal_test.go) that need to look up a
+// just-ColdBooted instance by name from outside the Manager's hot
+// path; production code should prefer the targeted accessors
+// (InstanceByCID, InstanceAppID, InstanceDeploymentIDAndAppID).
+//
+// Returns nil when no instances are live.
+func (m *Manager) LiveInstances() map[string]*Instance {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.live) == 0 {
+		return nil
+	}
+	out := make(map[string]*Instance, len(m.live))
+	for id, inst := range m.live {
+		out[id] = inst
+	}
+	return out
+}
+
 // SnapshotLive returns a copy of the (instanceID, vethHost) map
 // for every live instance. The vmmd network_poller (ADR-046)
 // uses this to read the kernel byte counter for each instance

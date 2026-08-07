@@ -144,10 +144,10 @@ func TestCpuFairnessMetal(t *testing.T) {
 	}
 	deps := make([]deployment, 0, cpuFairnessQuietCount+cpuFairnessHotCount)
 	for i := 0; i < cpuFairnessQuietCount; i++ {
-		deps = append(deps, deployApp(t, h, registry, key, "quiet-"+itoa(i), false))
+		deps = append(deps, deployApp(t, h, registry, key, "quiet-"+itoaLocal(i), false))
 	}
 	for i := 0; i < cpuFairnessHotCount; i++ {
-		deps = append(deps, deployApp(t, h, registry, key, "hot-"+itoa(i), true))
+		deps = append(deps, deployApp(t, h, registry, key, "hot-"+itoaLocal(i), true))
 	}
 	defer h.DumpLogs(t)
 
@@ -367,9 +367,12 @@ func percentile(durs []time.Duration, p float64) time.Duration {
 	return cp[idx]
 }
 
-// itoa is a tiny helper that avoids pulling in strconv just for the
-// loop counter — keeps the test file's import list short.
-func itoa(i int) string {
+// itoaLocal is a tiny helper that avoids pulling in strconv just for
+// the loop counter — keeps the test file's import list short.
+// Renamed from 'itoa' to avoid colliding with the same-named helper
+// in apply_project_quota_e2e_test.go when this file is compiled under
+// -tags metal (cmd/e2e_test).
+func itoaLocal(i int) string {
 	if i == 0 {
 		return "0"
 	}
