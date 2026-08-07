@@ -262,19 +262,26 @@ func cmdDeploymentGet(args []string) int {
 // Local --min >= 0 gate runs before authedClient() so a CLI typo costs
 // zero latency (mirrors validateAlertClosedSets, commands_alerts.go:172).
 func cmdDeploymentSetMinInstances(args []string) int {
+	// splitArgsForFlags: Go's flag.Parse halts at the first non-flag
+	// positional, so `gregale deployment set-min-instances <id> --min 5`
+	// would silently drop --min 5 and send min_instances:0 to the
+	// server (resetting the cold-wake floor). The reorder helper
+	// pulls --min to the front so the parser sees it. Mirrors
+	// cmdDelayedTaskAdd (commands_delayed_task.go:118).
+	flags, pos := splitArgsForFlags(args)
 	fs := flag.NewFlagSet("deployment set-min-instances", flag.ContinueOnError)
 	min := fs.Int("min", 0, "min_instances floor (>= 0; 0 inherits the parent app floor)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale deployment set-min-instances <id> --min N", "deployment")
 		return 1
 	}
 	if *min < 0 {
 		return printErr("Invalid --min", fmt.Errorf("--min must be >= 0; got %d", *min))
 	}
-	id := fs.Arg(0)
+	id := pos[0]
 	if !deploymentIDPattern.MatchString(id) {
 		PrintUsage(os.Stderr, "usage: gregale deployment set-min-instances <id> --min N   (id is 32 hex chars)", "deployment")
 		return 1

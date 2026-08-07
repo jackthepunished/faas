@@ -263,6 +263,53 @@ func TestTierD_OrgsUpdate_NoFieldsExitsOne(t *testing.T) {
 	}
 }
 
+// TestTierD_DeploymentSetMinInstances_FlagAfterPositional pins the
+// splitArgsForFlags fix (code-review finding #1): the documented usage
+// is `gregale deployment set-min-instances <id> --min N`, so the
+// flag-after-positional order MUST work. Without splitArgsForFlags
+// Go's flag.Parse silently drops --min and the server gets
+// min_instances:0 — silently resetting the cold-wake floor.
+func TestTierD_DeploymentSetMinInstances_FlagAfterPositional(t *testing.T) {
+	resetJSONOut(t)
+	body := `{"id":"0123456789abcdef0123456789abcdef","min_instances":5}`
+	f := authedFakeAPI(t, body, http.StatusOK)
+	if code := cmdDeploymentSetMinInstances([]string{
+		"0123456789abcdef0123456789abcdef", "--min", "5",
+	}); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if f.sawMethod != "PATCH" || f.sawPath != "/v1/deployments/0123456789abcdef0123456789abcdef" {
+		t.Errorf("route = %s %s, want PATCH /v1/deployments/<id>", f.sawMethod, f.sawPath)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(f.sawBody, &got); err != nil {
+		t.Fatalf("decode body: %v; raw=%s", err, string(f.sawBody))
+	}
+	if got["min_instances"] != float64(5) {
+		t.Fatalf("min_instances = %v, want 5 (silent flag-drop would yield 0)", got["min_instances"])
+	}
+}
+
+// TestTierD_WakeTimeline_FlagAfterPositional pins the same
+// splitArgsForFlags fix for the wake-timeline leaf: documented usage
+// is `gregale wake-timeline <slug> <wake-id> [--limit N]`, so the
+// flag-after-positional order MUST be honored. Without
+// splitArgsForFlags the limit/since/all flags after the two
+// positionals are silently dropped.
+func TestTierD_WakeTimeline_FlagAfterPositional(t *testing.T) {
+	resetJSONOut(t)
+	body := `{"wake_id":"w-1","app_id":"a-1","events":[],"limit":5}`
+	f := authedFakeAPI(t, body, http.StatusOK)
+	if code := cmdWakeTimeline([]string{
+		"demo", "w-1", "--limit", "5",
+	}); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if f.sawMethod != "GET" || f.sawPath != "/v1/apps/demo/wakes/w-1/timeline" {
+		t.Errorf("route = %s %s, want GET /v1/apps/demo/wakes/w-1/timeline", f.sawMethod, f.sawPath)
+	}
+}
+
 // TestTierD_OrgsUpdate_NameOnlyDoesNotResendPlan pins the
 // pointer-shape fix: a name-only update must NOT carry plan in the
 // body. Same regression class as Tier C's cmdAlertUpdate pin.

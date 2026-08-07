@@ -51,14 +51,22 @@ const wakeTimelineMaxLimit = 1000
 // Mirrors cmdInvocationsGet (single positional read with optional
 // flags) + cmdDeploymentsAll (cursor walker).
 func cmdWakeTimeline(args []string) int {
+	// splitArgsForFlags: Go's flag.Parse halts at the first non-flag
+	// positional, so `gregale wake-timeline <slug> <wake-id> --limit 100`
+	// would silently drop --limit/--since/--all and use the default
+	// page size + single-page mode. The reorder helper pulls flags to
+	// the front so the parser sees them. Mirrors cmdDelayedTaskAdd
+	// (commands_delayed_task.go:118) + cmdAppSecurity
+	// (commands_app_security.go:42).
+	flags, pos := splitArgsForFlags(args)
 	fs := flag.NewFlagSet("wake-timeline", flag.ContinueOnError)
 	since := fs.String("since", "", "RFC3339 timestamp; rows with `at >= since` returned (cursor when paging)")
 	limit := fs.Int("limit", wakeTimelineDefaultLimit, "page size (1..1000)")
 	all := fs.Bool("all", false, "walk every page via next_cursor / since (ignores --limit for the call count)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 2 {
+	if len(pos) != 2 {
 		PrintUsage(os.Stderr, "usage: gregale wake-timeline <slug> <wake-id> [--since RFC3339] [--limit N] [--all]", "wake-timeline")
 		return 1
 	}
@@ -70,8 +78,8 @@ func cmdWakeTimeline(args []string) int {
 			return printErr("Invalid --since", fmt.Errorf("--since must be RFC 3339; got %q (%w)", *since, err))
 		}
 	}
-	slug := fs.Arg(0)
-	wakeID := fs.Arg(1)
+	slug := pos[0]
+	wakeID := pos[1]
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)

@@ -80,7 +80,13 @@ func cmdDelayedTask(args []string) int {
 // splitArgsForFlags, commands5.go:1010). Empty payload is valid
 // (handler accepts zero-body deferred tasks).
 func cmdDelayedTaskAdd(args []string) int {
-	flags, pos := splitArgsForFlags(args)
+	// splitArgsForFlags: Go's flag.Parse halts at the first non-flag
+	// positional, so `gregale delayed-task add demo --scheduled-at
+	// 2030-01-01T00:00:00Z --payload J` would silently drop --scheduled-at
+	// and --payload. The reorder helper pulls flags to the front so the
+	// parser sees them. Mirrors cmdAppSecurity (commands_app_security.go:42)
+	// + cmdWakeTimeline (commands_wake_timeline.go:54).
+	flags, _ := splitArgsForFlags(args)
 	fs := flag.NewFlagSet("delayed-task add", flag.ContinueOnError)
 	app := fs.String("app", "", "app slug (required)")
 	scheduledAt := fs.String("scheduled-at", "", "RFC3339 dispatch time (required; must be in the future)")
@@ -90,14 +96,6 @@ func cmdDelayedTaskAdd(args []string) int {
 	}
 	if !validateDelayedTaskAddFlags(app, scheduledAt) {
 		return 1
-	}
-	// pos holds any non-flag tail (the split helper guarantees it's
-	// pure positionals); if the operator typed `delayed-task add
-	// hello-world` we treat that as the slug fallback. Real
-	// positionals are unused in this leaf but tolerated for symmetry
-	// with the other dispatchers.
-	if *app == "" && len(pos) >= 1 {
-		*app = pos[0]
 	}
 	body, err := resolvePayload(*payload)
 	if err != nil {
@@ -128,7 +126,7 @@ func cmdDelayedTaskAdd(args []string) int {
 	return 0
 }
 
-// cmdDelayedTaskGet implements `gregayed-task get <id>` (account-scoped
+// cmdDelayedTaskGet implements `gregale delayed-task get <id>` (account-scoped
 // GET /v1/delayed-tasks/{id}). Single positional id, --json returns
 // the response, human mode prints id + scheduled_at + state.
 func cmdDelayedTaskGet(args []string) int {
