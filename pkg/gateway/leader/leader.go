@@ -2,13 +2,19 @@
 // `gatewayd-public` for the Tier A8 active-passive HA topology
 // (ADR-083, §14 M8 row "Gate-A runbook (2nd box active-passive)").
 //
-// The election is **pure** — given the same `[]ComputeNode` slice
-// it returns the same `Leader`. The package holds no state of its
-// own; every state transition (drain, DNS handoff, gauge flip)
-// lives in `cmd/gatewayd-public`. The store is the existing
-// `pkg/state` surface that already powers `pkg/sched/placement.go`
-// (no new SQL — the `idx_compute_nodes_active` partial index
-// covers the read path).
+// The election core is **pure with respect to the input slice**:
+// given the same `[]ComputeNode` slice and the same `now` value,
+// `ElectLeaderFromNodes` returns the same `{Name, NodeID}`
+// pair. The `Elected` timestamp is wall-clock metadata stamped
+// separately (review finding #1 — `ElectLeader` calls
+// `time.Now().UTC()`; the previous docstring claimed the
+// election was fully pure, which is true for the identity
+// surface but not for the timestamp). The package holds no
+// state of its own; every state transition (drain, DNS handoff,
+// gauge flip) lives in `cmd/gatewayd-public`. The store is the
+// existing `pkg/state` surface that already powers
+// `pkg/sched/placement.go` (no new SQL — the
+// `idx_compute_nodes_active` partial index covers the read path).
 //
 // # Algorithm
 //
@@ -52,7 +58,9 @@ type Leader struct {
 	// placement surfaces that key on UUID.
 	NodeID string
 	// Elected is the wall-clock time at which this election was
-	// committed. Zero on no-winner.
+	// committed (stamped by ElectLeader via time.Now().UTC();
+	// tests pass a fixed time to ElectLeaderFromNodes for
+	// determinism). Zero on no-winner.
 	Elected time.Time
 }
 
@@ -73,9 +81,12 @@ type LeaderStore interface {
 	ListActiveComputeNodes(ctx context.Context) ([]ComputeNode, error)
 }
 
-// ElectLeader returns the lex-min active node. Pure function;
-// given the same store contents it returns the same Leader. The
-// store is consulted once per call.
+// ElectLeader returns the lex-min active node. The
+// {Name, NodeID} pair is pure given the store contents; the
+// Elected timestamp is stamped via time.Now().UTC() so two
+// back-to-back calls with an unchanged store still produce
+// monotonically-advancing Elected values (review finding #1).
+// The store is consulted once per call.
 //
 // Returns:
 //   - (Leader{}, nil) on empty filtered input (no active peer).
@@ -100,7 +111,8 @@ func ElectLeader(ctx context.Context, store LeaderStore) (Leader, error) {
 // store surface.
 //
 // now is the wall-clock time the election was committed (passed
-// in for deterministic tests).
+// in for deterministic tests). With the same `nodes` and `now`
+// this function is fully pure.
 func ElectLeaderFromNodes(nodes []ComputeNode, now time.Time) Leader {
 	active := make([]ComputeNode, 0, len(nodes))
 	for _, n := range nodes {

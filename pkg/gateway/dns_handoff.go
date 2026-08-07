@@ -45,6 +45,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -115,12 +116,30 @@ func (noopInFlight) Count() int { return 0 }
 type Outcome string
 
 const (
-	OutcomeDNSFlipped       Outcome = "dns_flipped"
-	OutcomeDNSStale         Outcome = "dns_stale"
-	OutcomePeerUnreachable  Outcome = "peer_unreachable"
-	OutcomeManualDrain      Outcome = "manual_drain"
-	OutcomeNoLeader         Outcome = "peer_unreachable" // alias — see ADR-083 §Failure modes
-	OutcomeAlreadyDraining  Outcome = "dns_flipped"      // not a distinct label; folded into flipped
+	// OutcomeDNSFlipped — drain completed; DNS A record removed;
+	// new leader's UpsertRecord fires within the next election.
+	OutcomeDNSFlipped Outcome = "dns_flipped"
+	// OutcomeDNSStale — drain completed but
+	// dns.DeleteRecord returned an error after 5 retries
+	// (Hetzner 5xx) OR the manual provider returned
+	// errManualDNSRequiresOperator (operator has not yet
+	// flipped DNS by hand). The operator falls through to
+	// the manual DNS flip command in
+	// docs/runbooks/active-passive-ha.md. The tripwire for
+	// "DNS flipped" was NEVER bumped in the manual path
+	// (review finding #14 — the manual provider now returns
+	// a sentinel error instead of nil).
+	OutcomeDNSStale Outcome = "dns_stale"
+	// OutcomePeerUnreachable — leader election returned a
+	// zero-value Leader (no active peer) OR
+	// HADNSRecordStaleSeconds elapsed with InFlight > 0.
+	// The alert rule `FaasNoActivePeer` fires.
+	OutcomePeerUnreachable Outcome = "peer_unreachable"
+	// OutcomeManualDrain — operator-initiated drain via the
+	// runbook's manual command. Not currently emitted by
+	// Run(); reserved for a future v1.1 that wires the
+	// runbook escalation into the orchestrator.
+	OutcomeManualDrain Outcome = "manual_drain"
 )
 
 // Run executes the drain protocol when called by the leader.
@@ -133,15 +152,17 @@ const (
 //
 // Side effects on success:
 //
-//   - StandbyState → 3 (draining) for at most
-//     HADNSRecordStaleSeconds.
+//   - StandbyState → wire.StandbyStateDraining (3) for at
+//     most HADNSRecordStaleSeconds.
 //   - dns.DeleteRecord(self.Name) called once.
-//   - activePassiveFailoversTotal{outcome=OutComeDNSFlipped}
+//   - activePassiveFailoversTotal{outcome=OutcomeDNSFlipped}
 //     incremented.
 //
 // Side effects on failure paths:
 //
-//   - dns_stale: dns.DeleteRecord failed after 5 retries.
+//   - dns_stale: dns.DeleteRecord failed after 5 retries OR
+//     the manual provider returned
+//     errManualDNSRequiresOperator (review finding #14).
 //   - peer_unreachable: leader.ElectLeader returned Leader{}
 //     (no active peer), or HADNSRecordStaleSeconds budget
 //     elapsed with InFlight > 0.
@@ -165,21 +186,26 @@ func (d *DNSHandoff) Run(ctx context.Context) Outcome {
 		return d.drainNoMetrics(ctx, deadline)
 	}
 
-	// Step 1: StandbyState → draining.
-	d.Metrics.SetStandbyState(3) // StandbyStateDraining
+	// Step 1: StandbyState → draining (review finding #9:
+	// typed constant, not the raw int 3).
+	d.Metrics.SetStandbyState(wire.StandbyStateDraining)
 
 	// Step 2: Wait for in-flight to drain, bounded.
 	inFlight := d.inFlight()
 	if err := d.waitInFlightZero(ctx, deadline, inFlight); err != nil {
-		d.Metrics.SetStandbyState(2) // back to warm — manual drain path
+		d.Metrics.SetStandbyState(wire.StandbyStateWarm) // back to warm — manual drain path
 		d.Metrics.ActivePassiveFailovers(string(OutcomePeerUnreachable)).Inc()
 		return OutcomePeerUnreachable
 	}
 
-	// Step 3: dns.DeleteRecord with retry.
-	if err := d.deleteRecordWithRetry(ctx, deadline); err != nil {
-		d.Metrics.ActivePassiveFailovers(string(OutcomeDNSStale)).Inc()
-		return OutcomeDNSStale
+	// Step 3: dns.DeleteRecord with retry. The retry loop
+	// distinguishes transient errors (retry) from the
+	// manual-provider sentinel (no retry — operator has to
+	// act; review finding #14).
+	outcome, err := d.deleteRecordWithRetry(ctx, deadline)
+	if err != nil {
+		d.Metrics.ActivePassiveFailovers(string(outcome)).Inc()
+		return outcome
 	}
 
 	// Step 4: success — bump dns_flipped.
@@ -194,8 +220,9 @@ func (d *DNSHandoff) drainNoMetrics(ctx context.Context, deadline time.Time) Out
 	if err := d.waitInFlightZero(ctx, deadline, inFlight); err != nil {
 		return OutcomePeerUnreachable
 	}
-	if err := d.deleteRecordWithRetry(ctx, deadline); err != nil {
-		return OutcomeDNSStale
+	outcome, err := d.deleteRecordWithRetry(ctx, deadline)
+	if err != nil {
+		return outcome
 	}
 	return OutcomeDNSFlipped
 }
@@ -228,9 +255,24 @@ func (d *DNSHandoff) waitInFlightZero(ctx context.Context, deadline time.Time, i
 // deleteRecordWithRetry calls DNSProvider.DeleteRecord with
 // exponential backoff (1s → 2s → 4s → 8s → 16s, capped at
 // deadline). 5 retries total.
-func (d *DNSHandoff) deleteRecordWithRetry(ctx context.Context, deadline time.Time) error {
+//
+// Returns:
+//
+//   - (OutcomeDNSFlipped, nil) on success.
+//   - (OutcomeDNSStale, err) on retry exhaustion.
+//   - (OutcomeDNSStale, errManualDNSRequiresOperator) on the
+//     manual provider path (review finding #14 — the manual
+//     provider never returns nil; retry is a no-op).
+//
+// The backoff sleep is bounded by the deadline: a single
+// retry never sleeps past the run's deadline (review finding
+// #2 — without the race, the worst-case 5 retries would
+// sleep 1+2+4+8+16 = 31s on top of the 5 RPCs, blowing past
+// the 30s HADNSRecordStaleSeconds budget by ~46s of wall-
+// clock and blocking the operator's drain).
+func (d *DNSHandoff) deleteRecordWithRetry(ctx context.Context, deadline time.Time) (Outcome, error) {
 	if d.DNSProvider == nil {
-		return fmt.Errorf("drain: nil DNSProvider")
+		return OutcomeDNSStale, fmt.Errorf("drain: nil DNSProvider")
 	}
 	backoff := time.Second
 	var lastErr error
@@ -239,14 +281,32 @@ func (d *DNSHandoff) deleteRecordWithRetry(ctx context.Context, deadline time.Ti
 		// when the deadline has already passed — a partial
 		// drain is better than no drain.
 		if attempt > 0 && d.now().After(deadline) {
-			return fmt.Errorf("drain: deadline elapsed after %d attempts: %w", attempt, lastErr)
+			return OutcomeDNSStale, fmt.Errorf("drain: deadline elapsed after %d attempts: %w", attempt, lastErr)
 		}
 		if err := d.DNSProvider.DeleteRecord(ctx, d.NodeName); err != nil {
 			lastErr = err
+			// Review finding #14: the manual provider's
+			// sentinel error is non-retryable — the
+			// operator has to act, no point in 5 more
+			// curls. Surface dns_stale immediately.
+			if errors.Is(err, errManualDNSRequiresOperator) {
+				return OutcomeDNSStale, err
+			}
+			// Sleep bounded by the deadline: race the
+			// backoff against the deadline so a slow
+			// retry doesn't block the operator.
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return OutcomeDNSStale, fmt.Errorf("drain: deadline elapsed after %d attempts: %w", attempt+1, lastErr)
+			}
+			sleep := backoff
+			if sleep > remaining {
+				sleep = remaining
+			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
+				return OutcomeDNSStale, ctx.Err()
+			case <-time.After(sleep):
 			}
 			backoff *= 2
 			if backoff > 30*time.Second {
@@ -254,9 +314,9 @@ func (d *DNSHandoff) deleteRecordWithRetry(ctx context.Context, deadline time.Ti
 			}
 			continue
 		}
-		return nil
+		return OutcomeDNSFlipped, nil
 	}
-	return fmt.Errorf("drain: DeleteRecord failed after 5 retries: %w", lastErr)
+	return OutcomeDNSStale, fmt.Errorf("drain: DeleteRecord failed after 5 retries: %w", lastErr)
 }
 
 func (d *DNSHandoff) inFlight() InFlightCounter {

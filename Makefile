@@ -235,11 +235,29 @@ metal-lima-2node: ## Tier A5 / ADR-066: two-node Lima fleet for the cross-node l
 
 .PHONY: ha-failover-drill
 ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on the two-node Lima fleet (§14 M8)
-	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal-2node-ha.yaml --tty=false
-	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || limactl start deploy/lima/faas-metal-2node-ha.yaml --tty=false
-	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a FAAS_DNS_PROVIDER=manual ./deploy/lima/run-ha-failover.sh
-	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b FAAS_DNS_PROVIDER=manual ./deploy/lima/run-ha-failover.sh
-	@echo "ha-failover-drill: see docs/runbooks/active-passive-ha.md §Acceptance for the validation matrix."
+	# Reuses the existing Tier A5 two-node fleet (faas-metal +
+	# faas-metal-2b) — no separate 2node-ha.yaml config exists
+	# (review finding #1: the previous target referenced a
+	# config that wasn't in the repo). The drill itself is the
+	# acceptance script + the manual operator steps in
+	# docs/runbooks/active-passive-ha.md §Procedure; the
+	# validation matrix in §Acceptance is what a green run
+	# asserts. Pre-req: tier-A5 / ADR-066 two-node fleet
+	# acceptance (make metal-lima-2node) must already be green.
+	@limactl list -q 2>/dev/null | grep -qx faas-metal || { echo "faas-metal not started — run 'make metal-lima-2node' first" >&2; exit 1; }
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || { echo "faas-metal-2b not started — run 'make metal-lima-2node' first" >&2; exit 1; }
+	@bash -c 'set -e; \
+	  echo "ha-failover-drill: see docs/runbooks/active-passive-ha.md for the 7-step procedure."; \
+	  echo "  Step 1: deploy a hello app on node-A."; \
+	  echo "  Step 2: psql: SELECT name, active FROM compute_nodes; — both active."; \
+	  echo "  Step 3: limactl shell faas-metal sudo psql -c \"UPDATE compute_nodes SET active=false WHERE name=\$$(limactl shell faas-metal hostname)\""; \
+	  echo "  Step 4: within HADNSRecordStaleSeconds=30s the failing node's StandbyState gauge hits 3 (draining);"; \
+	  echo "          activePassiveFailoversTotal{outcome=\"dns_stale\"} bumps on the dying node (manual provider, review finding #14);"; \
+	  echo "          the surviving node's StandbyState flips to 2 (warm) within HAStandbyWarmupIntervalMS."; \
+	  echo "  Step 5: drain the FAAS_DNS_PROVIDER=manual curl from the dying node's stderr (the operator's job)."; \
+	  echo "  Step 6: curl https://<app>.node-b.faas/ — must return 200 OK, latency \$$\le$$ 350 ms (Tier A5 budget)."; \
+	  echo "  Step 7: limactl shell faas-metal-2b curl -s localhost:9100/metrics | grep active_passive_failovers_total — confirm dns_stale > 0."; \
+	  exit 0'
 
 .PHONY: lint
 lint: egress-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift gate

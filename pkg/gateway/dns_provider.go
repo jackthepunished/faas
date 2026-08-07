@@ -83,6 +83,14 @@ type DNSProviderConfig struct {
 	// manual provider ignores it. Empty string → production
 	// default (https://dns.hetzner.com/api/v1).
 	APIURL string
+	// ProviderURL is the human-facing UI/API URL the manual
+	// provider prints in the operator-facing `curl`. Empty
+	// string → production default (the Hetzner DNS console,
+	// https://dns.hetzner.com). A staging operator on Route53
+	// would set ProviderURL="https://console.aws.amazon.com/route53"
+	// (review finding #5 — the previous hard-coded Hetzner URL
+	// made the manual path useless for any non-Hetzner provider).
+	ProviderURL string
 	// Stderr is the io.Writer the manual provider prints to.
 	// nil → os.Stderr (production default).
 	Stderr interface{ Write([]byte) (int, error) }

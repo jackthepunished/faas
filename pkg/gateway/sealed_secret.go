@@ -3,9 +3,11 @@
 // avoid the cycle (pkg/secretbox imports pkg/wire which
 // pkg/gateway also imports). Instead, cmd/gatewayd-public
 // wires OpenBytesDNSProvider at startup. The shim defaults to
-// returning an error — a fresh binary panics loudly with a
-// helpful message rather than silently no-op'ing the DNS
-// handoff.
+// returning errSecretBoxUnconfigured so a fresh binary that
+// forgot to wire the unseal helper fails loudly at the FIRST
+// DNS handoff attempt — not silently no-op'ing (review
+// finding #6 corrected the previous docstring which claimed
+// the shim "panics"; it returns an error).
 //
 // Precedent: pkg/webhook/secretbox_adapter.go (ADR-076).
 package gateway
@@ -38,4 +40,13 @@ var OpenBytesDNSProvider = func(sealed []byte) ([]byte, error) {
 // wiring code in cmd/gatewayd-public can swap one without
 // touching the other (a future v1.1 may route the DNS_PROVIDER
 // unseal through a different namespace).
+//
+// REVIEW NOTE (finding #7, second review): this is a value
+// bind, not a reference bind. If a future test reassigns
+// `OpenBytesDNSProvider = ...`, `secretboxOpenDNSProvider`
+// here keeps the original default-returning closure. The
+// production wiring in cmd/gatewayd-public/main.go reassigns
+// BOTH at startup to avoid the trap, but the indirection
+// stays in place so swapping one without the other is a
+// obvious-by-grep mistake rather than a silent no-op.
 var secretboxOpenDNSProvider = OpenBytesDNSProvider

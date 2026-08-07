@@ -15,11 +15,19 @@
 // the per-app cache), so it lives in pkg/gateway and is wired
 // in cmd/gatewayd-public/standby_warmup.go (PR-B).
 //
-// # Pre-instantiation
+// # Throughput
 //
-// The interval is HAStandbyWarmupIntervalMS (default 500 ms);
-// a real fleet with 1000 apps fires 2000 probes/s which is
-// cheap (in-process HEAD writes; no goroutine spawn per probe).
+// tick() runs a worker pool sized to
+// min(len(slugs), runtime.GOMAXPROCS(0)) (review finding #6 —
+// the previous sequential loop took ~500s per tick on a
+// 1000-app fleet, blowing past the HAStandbyWarmupIntervalMS
+// interval itself and starving the standby cache). The
+// realistic sustained rate is len(slugs) * (1000 /
+// ProbeTimeout) probes/s — i.e. ~2000 probes/s on a 1000-app
+// fleet at ProbeTimeout=500ms, but NOT the "2000 probes/s"
+// the previous docstring claimed. Each probe is independent
+// (no shared state), so the pool scales linearly with
+// GOMAXPROCS.
 //
 // # Failure modes
 //
@@ -36,6 +44,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
@@ -114,7 +123,9 @@ func (e *warmupError) Error() string { return "warmup: " + e.msg }
 // pulled from a small SQLite/JSON mirror of the apps table —
 // out of scope for PR-A; PR-B wires the actual data source).
 // Interval is HAStandbyWarmupIntervalMS; ProbeTimeout is
-// HAStandupProbeTimeoutMS (per-probe).
+// HAFailoverProbeTimeoutMS (per-probe) — review finding #11
+// fixed the previous typo HAStandupProbeTimeoutMS, which
+// referenced a symbol that did not exist.
 //
 // The loop returns nil on ctx cancel. Errors from individual
 // probes are swallowed (logged + counted) — never returned.
@@ -131,8 +142,13 @@ type WarmupLoop struct {
 	// shrinking/growing slice across calls (apps added/removed
 	// between ticks).
 	Slugs func() []string
+	// MaxWorkers overrides the worker-pool size (default
+	// runtime.GOMAXPROCS(0)). Tests use a small value to
+	// exercise the pool's synchronisation; production never
+	// sets this.
+	MaxWorkers int
 
-	mu       sync.Mutex
+	mu        sync.Mutex
 	cancelled bool
 }
 
@@ -156,6 +172,9 @@ func (w *WarmupLoop) Run(ctx context.Context) error {
 	if w.OnError == nil {
 		w.OnError = func(string, error) {}
 	}
+	if w.MaxWorkers <= 0 {
+		w.MaxWorkers = runtime.GOMAXPROCS(0)
+	}
 	t := time.NewTicker(w.Interval)
 	defer t.Stop()
 	// Probe immediately on Run so the warm-up path doesn't
@@ -171,19 +190,52 @@ func (w *WarmupLoop) Run(ctx context.Context) error {
 	}
 }
 
-// tick probes every known app once. Probe failures are
-// swallowed (logged + OnError). The loop never fails the whole
-// tick because of a single probe.
+// tick probes every known app once via a worker pool sized
+// to min(len(slugs), MaxWorkers). Probe failures are
+// swallowed (logged + OnError). The loop never fails the
+// whole tick because of a single probe.
+//
+// Review finding #6 (severe): the previous sequential loop
+// took ~500s per tick on a 1000-app fleet (1000 × 500ms
+// probe timeout), blowing past the 500ms HAStandbyWarmupIntervalMS
+// interval and starving the standby cache. The
+// `FaasStandbyStateWarmingTooLong` alert would fire on every
+// box within 60s of boot. The pool path keeps the per-tick
+// wall-clock bounded at len(slugs) / MaxWorkers × ProbeTimeout.
 func (w *WarmupLoop) tick(ctx context.Context) {
-	for _, slug := range w.Slugs() {
-		if ctx.Err() != nil {
-			return
-		}
-		probeCtx, cancel := context.WithTimeout(ctx, w.ProbeTimeout)
-		err := w.Prober.Probe(probeCtx, slug)
-		cancel()
-		if err != nil {
-			w.OnError(slug, err)
-		}
+	slugs := w.Slugs()
+	if len(slugs) == 0 {
+		return
 	}
+	workers := w.MaxWorkers
+	if workers > len(slugs) {
+		workers = len(slugs)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan string, len(slugs))
+	for _, s := range slugs {
+		jobs <- s
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for slug := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				probeCtx, cancel := context.WithTimeout(ctx, w.ProbeTimeout)
+				err := w.Prober.Probe(probeCtx, slug)
+				cancel()
+				if err != nil {
+					w.OnError(slug, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

@@ -333,8 +333,8 @@ type OpsMetrics struct {
 	// alertEvaluatorEnabledValue above. Lock contention is non-
 	// issue: the gauge is stamped at boot, on
 	// compute_node_changed, and on drain start — not per-tick.
-	standbyStateMu     sync.Mutex
-	standbyStateValue  int
+	standbyStateMu    sync.Mutex
+	standbyStateValue int
 	// activePassiveFailoversTotal — Tier A8 / ADR-083
 	// active-passive HA fail-over observability. Counter labelled
 	// by outcome ∈ {dns_flipped, dns_stale, peer_unreachable,
@@ -3717,6 +3717,40 @@ func (m *OpsMetrics) ObserveOAuthDisabled(provider string) {
 	switch provider {
 	case "google", "github":
 		m.oauthDisabledTotal.WithLabelValues(provider).Inc()
+	}
+}
+
+// StandbyStateWarming / StandbyStateWarm / StandbyStateDraining
+// are the typed vocabulary the standbyState gauge accepts
+// (review finding #8). Numeric literals {1,2,3} live ONLY in
+// this const block; callers (dns_handoff.go, cmd/gatewayd-public
+// boot path) MUST use the constants so a future renumbering is
+// a single edit. The dns_handoff.go Run() body previously
+// stamped raw ints with inline comments — easy to drift out of
+// sync with the gauge Help text and the alert rule's
+// threshold. The un-exported companion label
+// `FaasStandbyStateWarmingTooLong` queries this gauge and
+// fires when it holds at StandbyStateWarming for > 60s on an
+// active node.
+const (
+	StandbyStateWarming  = 1
+	StandbyStateWarm     = 2
+	StandbyStateDraining = 3
+)
+
+// StandbyStateFromString is a small helper for tests that
+// want to assert the gauge value without importing the
+// constant directly; not used in production.
+func StandbyStateFromString(s string) int {
+	switch s {
+	case "warming":
+		return StandbyStateWarming
+	case "warm":
+		return StandbyStateWarm
+	case "draining":
+		return StandbyStateDraining
+	default:
+		return 0
 	}
 }
 

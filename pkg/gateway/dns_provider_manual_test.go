@@ -10,6 +10,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -43,8 +44,13 @@ func TestManualDNSProvider_UpsertRecordPrintsCurl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManualDNSProvider: %v", err)
 	}
-	if err := p.UpsertRecord(context.Background(), "faas-node-a.example.com", "10.0.0.1"); err != nil {
-		t.Fatalf("UpsertRecord: %v", err)
+	// Review finding #14: the manual path returns
+	// errManualDNSRequiresOperator (NOT nil) so the
+	// orchestrator never bumps `dns_flipped` when DNS
+	// was not actually flipped.
+	err = p.UpsertRecord(context.Background(), "faas-node-a.example.com", "10.0.0.1")
+	if !errors.Is(err, errManualDNSRequiresOperator) {
+		t.Fatalf("UpsertRecord err = %v, want errManualDNSRequiresOperator", err)
 	}
 	out := cap.String()
 	// Must mention the record name + value so the operator can
@@ -75,8 +81,9 @@ func TestManualDNSProvider_DeleteRecordPrintsCurl(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManualDNSProvider: %v", err)
 	}
-	if err := p.DeleteRecord(context.Background(), "faas-node-a.example.com"); err != nil {
-		t.Fatalf("DeleteRecord: %v", err)
+	err = p.DeleteRecord(context.Background(), "faas-node-a.example.com")
+	if !errors.Is(err, errManualDNSRequiresOperator) {
+		t.Fatalf("DeleteRecord err = %v, want errManualDNSRequiresOperator", err)
 	}
 	out := cap.String()
 	if !strings.Contains(out, "DELETE") {
@@ -87,6 +94,49 @@ func TestManualDNSProvider_DeleteRecordPrintsCurl(t *testing.T) {
 	}
 	if !strings.Contains(out, "example.com") {
 		t.Errorf("stderr missing zone:\n%s", out)
+	}
+}
+
+// Review finding #5: ProviderURL overrides the hardcoded
+// Hetzner base so a Route53 / Cloudflare / etc. operator can
+// copy-paste a curl that hits their actual provider. Without
+// it, the manual path was useless for any non-Hetzner
+// staging cluster.
+func TestManualDNSProvider_ProviderURLOverride(t *testing.T) {
+	cap := &captureStderr{}
+	p, err := NewManualDNSProvider(DNSProviderConfig{
+		Zone:        "example.com",
+		ProviderURL: "https://console.aws.amazon.com/route53",
+		Stderr:      cap,
+	})
+	if err != nil {
+		t.Fatalf("NewManualDNSProvider: %v", err)
+	}
+	if err := p.UpsertRecord(context.Background(), "faas-node-a.example.com", "10.0.0.1"); err == nil {
+		t.Errorf("UpsertRecord must return sentinel error")
+	}
+	out := cap.String()
+	if strings.Contains(out, "hetzner.com") {
+		t.Errorf("stderr still hard-codes hetzner.com despite ProviderURL override:\n%s", out)
+	}
+	if !strings.Contains(out, "console.aws.amazon.com/route53") {
+		t.Errorf("stderr missing ProviderURL override:\n%s", out)
+	}
+}
+
+// Review finding #14: the manual provider MUST NOT return nil
+// from UpsertRecord/DeleteRecord. The orchestrator relies on
+// a non-nil error to bump dns_stale instead of dns_flipped.
+func TestManualDNSProvider_NeverReturnsNilOnSuccess(t *testing.T) {
+	p, err := NewManualDNSProvider(DNSProviderConfig{Zone: "example.com"})
+	if err != nil {
+		t.Fatalf("NewManualDNSProvider: %v", err)
+	}
+	if err := p.UpsertRecord(context.Background(), "faas-node-a.example.com", "10.0.0.1"); err == nil {
+		t.Errorf("UpsertRecord returned nil — orchestrator would bump dns_flipped without flipping DNS")
+	}
+	if err := p.DeleteRecord(context.Background(), "faas-node-a.example.com"); err == nil {
+		t.Errorf("DeleteRecord returned nil — orchestrator would bump dns_flipped without flipping DNS")
 	}
 }
 
@@ -160,8 +210,8 @@ func TestManualDNSProvider_ConcurrentWritesDoNotInterleave(t *testing.T) {
 func TestNewDNSProvider_DispatchTable(t *testing.T) {
 	cap := &captureStderr{}
 	cfg := DNSProviderConfig{
-		Zone:       "example.com",
-		Stderr:     cap,
+		Zone:        "example.com",
+		Stderr:      cap,
 		SealedToken: []byte("dummy-token-not-unsealed-for-manual"),
 	}
 
