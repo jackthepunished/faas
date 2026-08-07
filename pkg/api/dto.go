@@ -2853,3 +2853,42 @@ func (ss Sidecars) Validate(limits Limits) *Problem {
 	}
 	return nil
 }
+
+// --- per-account egress allowlist extra (issue #679 / PR-B / ADR-082) ---
+
+// MaxAccountEgressAllowlistExtra is the admin-set ceiling on the
+// per-account additive budget on top of the plan's
+// apps.egress_allowlist cap (issue #679 / PR-B / ADR-082). Flat
+// 1024 — comfortably above the largest realistic override a Pro
+// or Scale account needs (Pro 16 + 1008 = 1024 max, Scale 64 +
+// 960 = 1024 max). The cap is intentional: a single account's
+// effective allowlist approaching 1024 entries is a customer-
+// abuse signal (a misconfigured SDK would round-trip the entire
+// internet into the per-app set). Operators wanting more should
+// use the operator-bundle (PR-A / ADR-081) which is a separate
+// additive axis that doesn't consume per-account slot.
+const MaxAccountEgressAllowlistExtra = 1024
+
+// SetAccountEgressAllowlistExtraRequest is the body of
+// PATCH /v1/account/egress_allowlist_extra (issue #679 / PR-B /
+// ADR-082). Extra is the per-account additive budget on top of
+// the plan cap. Extra < 0 is rejected at the apid gate with
+// ErrAccountEgressAllowlistExtraOutOfRange; Extra > 1024 is the
+// admin-set ceiling (MaxAccountEgressAllowlistExtra). Extra ==
+// 0 clears the override (the plan cap is authoritative again).
+type SetAccountEgressAllowlistExtraRequest struct {
+	Extra int `json:"extra"`
+}
+
+// AccountEgressAllowlistExtraResponse is the body of GET
+// /v1/account/egress_allowlist_extra (issue #679 / PR-B /
+// ADR-082). Extra is the per-account additive budget; PlanCap
+// is the plan-only cap (Pro 16 / Scale 64 / Free,Hobby 0); the
+// effective cap is PlanCap + Extra. MaxExtra is the admin-set
+// ceiling (1024) so the dashboard can render the range slider
+// without a second round-trip.
+type AccountEgressAllowlistExtraResponse struct {
+	Extra    int `json:"extra"`
+	PlanCap  int `json:"plan_cap"`
+	MaxExtra int `json:"max_extra"`
+}

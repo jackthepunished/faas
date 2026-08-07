@@ -406,6 +406,78 @@ func (s *server) setGraceWindow(w http.ResponseWriter, r *http.Request, acct sta
 	})
 }
 
+// getAccountEgressAllowlistExtra returns the per-account additive
+// budget on top of the plan's apps.egress_allowlist cap (issue #679
+// / PR-B / ADR-082). The endpoint is admin-only — the override is
+// meaningless for a non-admin caller (the customer-facing validator
+// reads the field, the admin endpoint is the only place it's
+// written). The PlanCap field is unconditionally populated so the
+// dashboard can render the "Override: N / Plan cap: 16" pair
+// without a second round-trip.
+//
+// Auth: admin scope (ScopesAdminOnly); middleware already
+// short-circuits non-admin callers.
+func (s *server) getAccountEgressAllowlistExtra(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	extra, err := s.store.GetAccountEgressAllowlistExtra(r.Context(), acct.ID)
+	if err != nil && !errors.Is(err, state.ErrNotFound) {
+		api.WriteProblem(w, api.ErrCapacity("could not read egress allowlist extra"))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.AccountEgressAllowlistExtraResponse{
+		Extra:    extra,
+		PlanCap:  acct.Plan.EgressAllowlistMaxSize(),
+		MaxExtra: api.MaxAccountEgressAllowlistExtra,
+	})
+}
+
+// setAccountEgressAllowlistExtra writes the per-account additive
+// budget (issue #679 / PR-B / ADR-082). The body is
+// {extra: 0|positive|null-bound}; negative values are rejected with
+// 400 (api.ErrAccountEgressAllowlistExtraOutOfRange) and emit no
+// audit row. Values > api.MaxAccountEgressAllowlistExtra (1024) are
+// rejected with the same 400 — the cap is intentional, see the
+// comment on api.MaxAccountEgressAllowlistExtra. Extra == 0 clears
+// the override (the plan cap is authoritative again).
+//
+// Auth: admin scope (ScopesAdminOnly).
+//
+// Audit: account.egress_allowlist_extra_set carries both old and
+// new values so the dashboard can render the toggle history. The
+// audit row is the only place the OLD value is observable — once
+// the PATCH lands, the next read is the new value.
+func (s *server) setAccountEgressAllowlistExtra(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	var req api.SetAccountEgressAllowlistExtraRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+			"Invalid body", err.Error()))
+		return
+	}
+	if req.Extra < 0 || req.Extra > api.MaxAccountEgressAllowlistExtra {
+		api.WriteProblem(w, api.ErrAccountEgressAllowlistExtraOutOfRange(req.Extra, api.MaxAccountEgressAllowlistExtra))
+		return
+	}
+
+	// Read the prior value for the audit row. Best-effort —
+	// ErrNotFound is acceptable (a fresh account has no override
+	// yet, the field defaults to 0).
+	oldExtra, _ := s.store.GetAccountEgressAllowlistExtra(r.Context(), acct.ID) // best-effort
+	if err := s.store.SetAccountEgressAllowlistExtra(r.Context(), acct.ID, req.Extra); err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not write egress allowlist extra"))
+		return
+	}
+	s.audit.Emit(r.Context(), "account.egress_allowlist_extra_set", &acct.ID, map[string]any{
+		"old_extra": oldExtra,
+		"new_extra": req.Extra,
+		"plan_cap":  acct.Plan.EgressAllowlistMaxSize(),
+		"max_extra": api.MaxAccountEgressAllowlistExtra,
+	})
+	writeJSON(w, http.StatusOK, api.AccountEgressAllowlistExtraResponse{
+		Extra:    req.Extra,
+		PlanCap:  acct.Plan.EgressAllowlistMaxSize(),
+		MaxExtra: api.MaxAccountEgressAllowlistExtra,
+	})
+}
+
 // --- per-resource list helpers (each ≤50 LoC, exported for tests) -------
 
 // buildDeploymentsForExport shapes pre-fetched deployment rows into

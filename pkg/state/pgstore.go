@@ -107,7 +107,7 @@ func (s *PgStore) CreateAccountWithPersonalOrg(ctx context.Context, params Creat
 		           coalesce(stripe_subscription_item,''), created_at,
 		           deletion_requested_at, last_quota_warning_at, past_due_at,
 		           mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash,
-		           mfa_required`,
+		           mfa_required, egress_allowlist_extra`,
 		params.Email, string(params.Plan)).Scan)
 	if err != nil {
 		return CreateAccountWithPersonalOrgResult{}, mapErr(err)
@@ -149,7 +149,7 @@ func (s *PgStore) CreateAccountWithPersonalOrg(ctx context.Context, params Creat
 
 func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = $1`, id)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra from accounts where id = $1`, id)
 	return scanAccount(row)
 }
 
@@ -172,7 +172,7 @@ func (s *PgStore) AccountsByIDs(ctx context.Context, ids []string) (map[string]A
 		return out, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = any($1::uuid[])`, ids)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra from accounts where id = any($1::uuid[])`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("state: accounts by IDs: %w", err)
 	}
@@ -192,13 +192,13 @@ func (s *PgStore) AccountsByIDs(ctx context.Context, ids []string) (map[string]A
 
 func (s *PgStore) AccountByEmail(ctx context.Context, email string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where email = $1`, email)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra from accounts where email = $1`, email)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at, a.mfa_enrolled_at, a.mfa_secret_encrypted, a.mfa_recovery_codes_hash, a.mfa_required
+		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at, a.mfa_enrolled_at, a.mfa_secret_encrypted, a.mfa_recovery_codes_hash, a.mfa_required, a.egress_allowlist_extra
 		 from accounts a join api_keys k on k.account_id = a.id where k.key_sha256 = $1`, hash)
 	return scanAccount(row)
 }
@@ -684,7 +684,7 @@ func Sha256Equal(a, b []byte) bool {
 // map.
 func (s *PgStore) AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra
 		 from accounts where provider_customer_id = $1`,
 		stripeCustomerID)
 	return scanAccount(row)
@@ -720,7 +720,7 @@ func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerI
 // tick + hourly Stripe push; bounded by the customer count on the box.
 func (s *PgStore) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra
 		 from accounts order by created_at`)
 	if err != nil {
 		return nil, err
@@ -752,12 +752,20 @@ func scanAccounts(rows pgx.Rows) ([]Account, error) {
 // (CreateAccount, AccountByID/Email/KeyHash/ProviderCustomerID, and
 // ListAllAccounts) so the chokepoints + requireMFA middleware always
 // see the post-enrollment state — Review Finding #1 fix.
+//
+// egress_allowlist_extra (issue #679 / PR-B / ADR-082) is the
+// per-account additive budget on top of the plan's
+// apps.egress_allowlist cap. NOT NULL DEFAULT 0, so the scan
+// uses an int (no *int): the column is never NULL. The
+// validator at cmd/apid/handlers_ext.go:104 reads this value
+// off the loaded Account; the apid admin handler is the only
+// writer.
 func scanAccountCols(scan func(...any) error) (Account, error) {
 	a := Account{}
 	var planStr, statusStr string
 	var deletionAt, lastWarnAt, pastDueAt *time.Time
 	var mfaEnrolledAt *time.Time
-	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt, &mfaEnrolledAt, &a.MFASecretEncrypted, &a.MFARecoveryCodesHash, &a.MFARequired); err != nil {
+	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt, &mfaEnrolledAt, &a.MFASecretEncrypted, &a.MFARecoveryCodesHash, &a.MFARequired, &a.EgressAllowlistExtra); err != nil {
 		return Account{}, err
 	}
 	a.Plan = api.Plan(planStr)
@@ -1142,6 +1150,42 @@ func (s *PgStore) GetAccountKeyGraceWindow(ctx context.Context, accountID string
 func (s *PgStore) SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error {
 	_, err := s.pool.Exec(ctx,
 		`update accounts set key_grace_window_days = $1 where id = $2`, days, accountID)
+	return err
+}
+
+// GetAccountEgressAllowlistExtra returns the per-account
+// additive budget on top of the plan's apps.egress_allowlist
+// cap (issue #679 / PR-B / ADR-082). 0 = no override; the plan
+// cap is authoritative. The validator at
+// cmd/apid/handlers_ext.go:104 adds this value to the plan cap
+// before the >-maxSize check. The DB CHECK constraint
+// (egress_allowlist_extra >= 0) defends against wire-bypasses
+// that skip the apid gate.
+func (s *PgStore) GetAccountEgressAllowlistExtra(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select egress_allowlist_extra from accounts where id = $1`, accountID).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
+// SetAccountEgressAllowlistExtra sets the per-account additive
+// budget. n == 0 falls through to the plan cap. The audit
+// `account.egress_allowlist_extra_set` event is emitted by the
+// handler, not the store. The DB CHECK constraint
+// (egress_allowlist_extra >= 0) is the wire-bypass backstop;
+// the apid handler enforces the + 1024 ceiling before the
+// call lands here.
+//
+// Issue #679 / PR-B / ADR-082.
+func (s *PgStore) SetAccountEgressAllowlistExtra(ctx context.Context, accountID string, n int) error {
+	_, err := s.pool.Exec(ctx,
+		`update accounts set egress_allowlist_extra = $1 where id = $2`, n, accountID)
 	return err
 }
 

@@ -1447,6 +1447,38 @@ func (m *MemStore) SetAccountKeyGraceWindow(_ context.Context, accountID string,
 	return nil
 }
 
+// GetAccountEgressAllowlistExtra mirrors PgStore. 0 = no override;
+// the plan cap is authoritative. The validator at
+// cmd/apid/handlers_ext.go:104 adds this to the plan cap before
+// the >-maxSize check on the per-app EgressAllowlist patch.
+//
+// Issue #679 / PR-B / ADR-082.
+func (m *MemStore) GetAccountEgressAllowlistExtra(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[accountID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	return a.EgressAllowlistExtra, nil
+}
+
+// SetAccountEgressAllowlistExtra mirrors PgStore. n == 0 clears
+// the override (the plan cap is authoritative again).
+//
+// Issue #679 / PR-B / ADR-082.
+func (m *MemStore) SetAccountEgressAllowlistExtra(_ context.Context, accountID string, n int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[accountID]
+	if !ok {
+		return ErrNotFound
+	}
+	a.EgressAllowlistExtra = n
+	m.accounts[accountID] = a
+	return nil
+}
+
 // --- Org-bound API keys (issue #190 / IAM-6, PR 6) ------------------------
 //
 // Same shape as the legacy per-account API key methods, but filtered by

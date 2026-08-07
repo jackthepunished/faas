@@ -134,6 +134,14 @@ var methodRouteMap = map[string]string{
 	"GET /v1/account":                          "Whoami",
 	"POST /v1/account/restore":                 "RestoreAccount",
 	"POST /v1/account/overage-cap":             "RaiseOverageCap", // issue #561 spend cap
+	// Issue #679 / PR-B / ADR-082 — per-account additive budget on
+	// top of the plan's apps.egress_allowlist cap. The auto-derivation
+	// would concat "Account" + "Egress_allowlist_extra" (the literal
+	// underscore survives title-case), so the explicit map drops the
+	// underscore and aligns with the SDK's Get*EgressAllowlistExtra
+	// method names.
+	"GET /v1/account/egress_allowlist_extra":   "GetEgressAllowlistExtra",
+	"PATCH /v1/account/egress_allowlist_extra": "SetEgressAllowlistExtra",
 	"GET /v1/apps/{slug}/logs":                 "StreamAppLogs",
 	"GET /v1/deployments/{id}/logs":            "StreamDeploymentLogs",
 	"GET /v1/deployments/{id}/scan":            "GetDeploymentScan", // issue #464 / ADR-055; per-deploy grype CVE drill-down

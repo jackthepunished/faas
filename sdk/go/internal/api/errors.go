@@ -196,6 +196,13 @@ const (
 	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
 	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
 
+	// Issue #679 / PR-B / ADR-082 — per-account additive budget on
+	// top of the plan's apps.egress_allowlist cap. Out-of-range
+	// PATCH (negative or > the global MaxAccountEgressAllowlistExtra
+	// ceiling) reports this code so the CLI can render the
+	// "max_extra=1024" hint without parsing the problem detail.
+	CodeAccountEgressAllowlistExtraOutOfRange = "account_egress_allowlist_extra_out_of_range"
+
 	// Issue #169 / #172 — per-app reactive scale-up targets. Same gate
 	// shape as MinInstances: a single plan-locked feature with two
 	// failure modes that warrant distinct codes so the CLI can render
@@ -626,6 +633,19 @@ func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 		"Invalid egress allowlist entry",
 		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
 		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+}
+
+// ErrAccountEgressAllowlistExtraOutOfRange (issue #679 / PR-B /
+// ADR-082) is a 400 for PATCH /v1/account/egress_allowlist_extra
+// values outside [0, MaxAccountEgressAllowlistExtra]. The
+// MaxAccountEgressAllowlistExtra value is the same global ceiling
+// the server enforces (flat 1024 — see pkg/api/dto.go).
+func ErrAccountEgressAllowlistExtraOutOfRange(got, maxExtra int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAccountEgressAllowlistExtraOutOfRange,
+		"egress_allowlist_extra out of range",
+		fmt.Sprintf("extra=%d is outside [0, %d]; clear with extra=0 to fall back to the plan cap.", got, maxExtra)).
+		WithLimit(int64(maxExtra), int64(got)).
+		WithDocs("https://docs.gregale.dev/account#egress-allowlist-extra")
 }
 
 // ErrValidation is a 400 fallback for malformed request bodies. Used by

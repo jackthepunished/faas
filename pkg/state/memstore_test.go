@@ -4689,3 +4689,97 @@ func TestMem_AppBySlug_AuthDefaultFlippedAt(t *testing.T) {
 		t.Errorf("post-flip create auth_default_flipped_at = %v, want nil (only migration 00155 stamps the column)", fetched.AuthDefaultFlippedAt)
 	}
 }
+
+// --- PR-B (issue #679 / ADR-082) per-account extra cap store ---------------
+//
+// The store is the read/write boundary for the per-account
+// additive budget. The validator consults the in-memory copy
+// via `acct.EgressAllowlistExtra` (no extra round-trip); the
+// admin endpoints hit the store directly. The tests below pin
+// the three branches: default (0), round-trip, and clear-by-zero.
+// The PgStore mirror is covered by the migration test
+// (TestMigrations_00156_AccountsEgressAllowlistExtra) which
+// seeds the column, PATCH-es via the store, and reads it back.
+
+// TestMemStore_EgressAllowlistExtra_DefaultIsZero: a fresh
+// account reads back 0 — the additive budget defaults to the
+// plan cap (no override). The default must hold even before
+// any admin PATCH has landed.
+func TestMemStore_EgressAllowlistExtra_DefaultIsZero(t *testing.T) {
+	m := NewMemStore()
+	acct, err := m.CreateAccount(context.Background(), "fresh@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	got, err := m.GetAccountEgressAllowlistExtra(context.Background(), acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountEgressAllowlistExtra: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("default extra = %d, want 0", got)
+	}
+}
+
+// TestMemStore_EgressAllowlistExtra_RoundTrip: an admin-set
+// value is read back through both the direct Get helper and the
+// scanned Account projection. The two paths must return the same
+// value (the validator reads via the projection, the admin
+// endpoint reads via the helper).
+func TestMemStore_EgressAllowlistExtra_RoundTrip(t *testing.T) {
+	m := NewMemStore()
+	acct, err := m.CreateAccount(context.Background(), "roundtrip@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	if err := m.SetAccountEgressAllowlistExtra(context.Background(), acct.ID, 8); err != nil {
+		t.Fatalf("SetAccountEgressAllowlistExtra: %v", err)
+	}
+	got, err := m.GetAccountEgressAllowlistExtra(context.Background(), acct.ID)
+	if err != nil {
+		t.Fatalf("GetAccountEgressAllowlistExtra: %v", err)
+	}
+	if got != 8 {
+		t.Errorf("Get extra = %d, want 8", got)
+	}
+	dbAcct, err := m.AccountByID(context.Background(), acct.ID)
+	if err != nil {
+		t.Fatalf("AccountByID: %v", err)
+	}
+	if dbAcct.EgressAllowlistExtra != 8 {
+		t.Errorf("Account.EgressAllowlistExtra = %d, want 8 (scan projection must match)", dbAcct.EgressAllowlistExtra)
+	}
+}
+
+// TestMemStore_EgressAllowlistExtra_ClearByZero: PATCH extra=0
+// clears the override — the round-trip endpoint must produce
+// the same 0 as the default. Otherwise a "clear" PATCH would
+// leave a phantom non-zero override on the account.
+func TestMemStore_EgressAllowlistExtra_ClearByZero(t *testing.T) {
+	m := NewMemStore()
+	acct, err := m.CreateAccount(context.Background(), "clear@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	if err := m.SetAccountEgressAllowlistExtra(context.Background(), acct.ID, 16); err != nil {
+		t.Fatalf("seed extra=16: %v", err)
+	}
+	if err := m.SetAccountEgressAllowlistExtra(context.Background(), acct.ID, 0); err != nil {
+		t.Fatalf("clear-by-zero: %v", err)
+	}
+	got, _ := m.GetAccountEgressAllowlistExtra(context.Background(), acct.ID)
+	if got != 0 {
+		t.Errorf("after clear-by-zero, extra = %d, want 0", got)
+	}
+}
+
+// TestMemStore_EgressAllowlistExtra_UnknownAccountIsNotFound: a
+// store miss surfaces state.ErrNotFound so the admin handler can
+// downgrade gracefully (the GET path treats ErrNotFound as
+// "default 0"). The PgStore mirrors this via pgx.ErrNoRows.
+func TestMemStore_EgressAllowlistExtra_UnknownAccountIsNotFound(t *testing.T) {
+	m := NewMemStore()
+	_, err := m.GetAccountEgressAllowlistExtra(context.Background(), "nonexistent")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetAccountEgressAllowlistExtra missing acct: err = %v, want ErrNotFound", err)
+	}
+}

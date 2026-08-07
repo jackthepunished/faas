@@ -428,6 +428,14 @@ const (
 	CodePlanEgressAllowlistNotAllowed = "plan_egress_allowlist_not_allowed"
 	CodeEgressAllowlistTooLong        = "egress_allowlist_too_long"
 
+	// Issue #679 / PR-B / ADR-082 — per-account egress allowlist
+	// additive budget. Distinct code from CodeEgressAllowlistTooLong
+	// so the CLI can render the "your admin override is too big,
+	// talk to support" message separately from the "you hit the
+	// plan cap" message. The DB CHECK constraint (>= 0) is the
+	// wire-bypass backstop; the apid gate is the soft cap.
+	CodeAccountEgressAllowlistExtraOutOfRange = "account_egress_allowlist_extra_out_of_range"
+
 	// Issue #471 — per-app streaming responses. Same gate shape as
 	// EgressAllowlist: a single plan-locked feature with a 403 code
 	// when the PATCH asks for a capability the plan does not unlock.
@@ -1921,6 +1929,23 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		fmt.Sprintf("egress_allowlist has %d entries; plan caps it at %d.", got, maxSize)).
 		WithLimit(int64(maxSize), int64(got)).
 		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+}
+
+// ErrAccountEgressAllowlistExtraOutOfRange (issue #679 / PR-B /
+// ADR-082) is the 400 returned by PATCH
+// /v1/account/egress_allowlist_extra when the value is < 0 or
+// > api.MaxAccountEgressAllowlistExtra. Negative values are also
+// rejected at the DB CHECK layer (postgres 23514), but exposing
+// the cap at the API lets the operator-side CLI render the
+// exact upper bound without a follow-up call. The limit +
+// observed pair rides on the Problem so the dashboard can pivot
+// from the error message to the cap slider.
+func ErrAccountEgressAllowlistExtraOutOfRange(got, maxExtra int) *Problem {
+	return NewProblem(http.StatusBadRequest, CodeAccountEgressAllowlistExtraOutOfRange,
+		"Account egress allowlist extra out of range",
+		fmt.Sprintf("egress_allowlist_extra=%d; max is %d.", got, maxExtra)).
+		WithLimit(int64(maxExtra), int64(got)).
+		WithDocs("https://docs.gregale.dev/account#egress-allowlist-extra")
 }
 
 // ErrInvalidEgressAllowlist (ADR-031 + ADR-032) is a 400 for
