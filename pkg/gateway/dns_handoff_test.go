@@ -11,7 +11,18 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/gateway/leader"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// newTestOpsMetrics constructs a fresh OpsMetrics on a private
+// registry so the terminal-state assertions don't pollute the
+// global registry and don't bleed across tests. The prefix is
+// arbitrary but unique per package so a parallel test that
+// constructs a second registry doesn't collide.
+func newTestOpsMetrics(t *testing.T) *wire.OpsMetrics {
+	t.Helper()
+	return wire.NewOpsMetrics("faas_test_" + t.Name())
+}
 
 // fakeDNSProvider records calls. err is returned by every
 // call; nil → success on every call.
@@ -43,8 +54,8 @@ func newFakeInFlight(start int) *fakeInFlight {
 	return &fakeInFlight{mu: make(chan struct{}, 1), count: start}
 }
 
-func (f *fakeInFlight) Count() int   { return f.count }
-func (f *fakeInFlight) Dec()         { f.count-- }
+func (f *fakeInFlight) Count() int { return f.count }
+func (f *fakeInFlight) Dec()       { f.count-- }
 
 // Test happy path: in-flight drains to 0, DNS succeeds, outcome
 // is dns_flipped.
@@ -167,9 +178,9 @@ func TestDNSHandoff_ConcurrentRunsSerialized(t *testing.T) {
 func TestDNSHandoff_NilLeaderStore(t *testing.T) {
 	p := &fakeDNSProvider{}
 	d := &DNSHandoff{
-		NodeName:     "node-a",
-		LeaderStore:  nil,
-		DNSProvider:  p,
+		NodeName:    "node-a",
+		LeaderStore: nil,
+		DNSProvider: p,
 	}
 	out := d.Run(context.Background())
 	if out != OutcomeDNSFlipped {
@@ -206,6 +217,84 @@ func TestHADNSRecordStaleSeconds_Default(t *testing.T) {
 // on its own field.
 func TestDNSHandoff_LeaderStoreFieldAcceptsLeaderPackage(t *testing.T) {
 	var _ leader.LeaderStore = (*fakeStoreForDNS)(nil)
+}
+
+// Code-review fix #1: terminal StandbyState transitions. The
+// gauge MUST leave Draining (3) on every Run() exit —
+// FaasStandbyStateDrainingTooLong cannot fire while the gauge
+// holds at 3 forever. Three terminal cases:
+//   - dns_flipped → Drained (4). Box is safe to shut down.
+//   - dns_stale → Failed (5). Terminal failure; operator
+//     intervention per the runbook's escalation section.
+//   - peer_unreachable → Warm (2). Box still functional, no
+//     DNS change happened; bounce back so the next
+//     pg_notify attempt can re-enter.
+func TestDNSHandoff_TerminalStates(t *testing.T) {
+	shortBudget := 100 * time.Millisecond
+	clock := time.Unix(0, 0)
+	advanceClock := func() time.Time {
+		clock = clock.Add(200 * time.Millisecond)
+		return clock
+	}
+
+	t.Run("dns_flipped_transitions_to_Drained", func(t *testing.T) {
+		m := newTestOpsMetrics(t)
+		p := &fakeDNSProvider{}
+		d := &DNSHandoff{
+			NodeName:    "node-a",
+			DNSProvider: p,
+			InFlight:    newFakeInFlight(0),
+			Metrics:     m,
+			Now:         func() time.Time { return clock },
+			Budget:      &shortBudget,
+		}
+		// Drive Run through the success path.
+		if out := d.Run(context.Background()); out != OutcomeDNSFlipped {
+			t.Fatalf("Run = %q, want %q", out, OutcomeDNSFlipped)
+		}
+		if got := m.StandbyState(); got != wire.StandbyStateDrained {
+			t.Errorf("StandbyState = %d, want %d (Drained)", got, wire.StandbyStateDrained)
+		}
+	})
+
+	t.Run("dns_stale_transitions_to_Failed", func(t *testing.T) {
+		m := newTestOpsMetrics(t)
+		p := &fakeDNSProvider{err: errors.New("hetzner 503")}
+		d := &DNSHandoff{
+			NodeName:    "node-a",
+			DNSProvider: p,
+			InFlight:    newFakeInFlight(0),
+			Metrics:     m,
+			Now:         advanceClock, // past budget on first call
+			Budget:      &shortBudget,
+		}
+		if out := d.Run(context.Background()); out != OutcomeDNSStale {
+			t.Fatalf("Run = %q, want %q", out, OutcomeDNSStale)
+		}
+		if got := m.StandbyState(); got != wire.StandbyStateFailed {
+			t.Errorf("StandbyState = %d, want %d (Failed)", got, wire.StandbyStateFailed)
+		}
+	})
+
+	t.Run("peer_unreachable_bounces_back_to_Warm", func(t *testing.T) {
+		m := newTestOpsMetrics(t)
+		p := &fakeDNSProvider{}  // DNS would succeed; in-flight is the blocker
+		fl := newFakeInFlight(1) // stuck at 1
+		d := &DNSHandoff{
+			NodeName:    "node-a",
+			DNSProvider: p,
+			InFlight:    fl,
+			Metrics:     m,
+			Now:         advanceClock,
+			Budget:      &shortBudget,
+		}
+		if out := d.Run(context.Background()); out != OutcomePeerUnreachable {
+			t.Fatalf("Run = %q, want %q", out, OutcomePeerUnreachable)
+		}
+		if got := m.StandbyState(); got != wire.StandbyStateWarm {
+			t.Errorf("StandbyState = %d, want %d (Warm)", got, wire.StandbyStateWarm)
+		}
+	})
 }
 
 // fakeStoreForDNS mirrors the leader package's fakeStore so

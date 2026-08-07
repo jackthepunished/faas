@@ -99,7 +99,7 @@ func (h *httpWarmupProber) Probe(ctx context.Context, appSlug string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return errWarmupNon2xx
 	}
@@ -147,9 +147,6 @@ type WarmupLoop struct {
 	// exercise the pool's synchronisation; production never
 	// sets this.
 	MaxWorkers int
-
-	mu        sync.Mutex
-	cancelled bool
 }
 
 // Run blocks until ctx is cancelled, probing each app on each

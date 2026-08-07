@@ -193,7 +193,12 @@ func (d *DNSHandoff) Run(ctx context.Context) Outcome {
 	// Step 2: Wait for in-flight to drain, bounded.
 	inFlight := d.inFlight()
 	if err := d.waitInFlightZero(ctx, deadline, inFlight); err != nil {
-		d.Metrics.SetStandbyState(wire.StandbyStateWarm) // back to warm — manual drain path
+		// Review finding #1 (code-review medium): the gauge MUST
+		// leave Draining on timeout, otherwise
+		// FaasStandbyStateDrainingTooLong cannot fire. The box is
+		// still functional (no DNS change happened) — bounce back
+		// to Warm so the next pg_notify attempt can re-enter.
+		d.Metrics.SetStandbyState(wire.StandbyStateWarm)
 		d.Metrics.ActivePassiveFailovers(string(OutcomePeerUnreachable)).Inc()
 		return OutcomePeerUnreachable
 	}
@@ -204,11 +209,20 @@ func (d *DNSHandoff) Run(ctx context.Context) Outcome {
 	// act; review finding #14).
 	outcome, err := d.deleteRecordWithRetry(ctx, deadline)
 	if err != nil {
+		// dns_stale: 5 retries exhausted OR manual-provider
+		// sentinel. Terminal failure — the gauge sticks at Failed
+		// (5) until operator intervention per the runbook's
+		// escalation section. Do NOT bounce back to Warm; that
+		// would hide the failure from FaasStandbyStateDrainingTooLong.
+		d.Metrics.SetStandbyState(wire.StandbyStateFailed)
 		d.Metrics.ActivePassiveFailovers(string(outcome)).Inc()
 		return outcome
 	}
 
-	// Step 4: success — bump dns_flipped.
+	// Step 4: success — terminal success state. The box is safe
+	// to shut down; the gauge lands at Drained (4) and stays
+	// there for the rest of the process lifetime.
+	d.Metrics.SetStandbyState(wire.StandbyStateDrained)
 	d.Metrics.ActivePassiveFailovers(string(OutcomeDNSFlipped)).Inc()
 	return OutcomeDNSFlipped
 }

@@ -9,14 +9,22 @@
 // api.HADNSRecordStaleSeconds). Two implementations ship in
 // tier A8:
 //
-//   - Hetzner DNS — the first-class implementation. Same Hetzner
-//     DNS API the existing pkg/gateway/dns01_hetzner.go uses for
-//     the ACME DNS-01 solver; differs only in the record type
-//     (A/AAAA vs TXT) and the zone/record-name surface.
+//   - Cloudflare DNS — the first-class implementation. Caddy
+//   - Cloudflare already terminates TLS for the same hostname
+//     upstream of gatewayd-public, so the leader-election
+//     A-record naturally lands on the same zone Cloudflare
+//     serves — no separate DNS-01 plumbing required.
 //   - manual — operator-managed fallback. Prints the required
 //     `curl` to stderr so a staging operator can flip DNS by
 //     hand. Same pattern as FAAS_STORAGE_CACHE_SERVE_STALE
 //     (ADR-054 acceptance PR).
+//
+// Round 1 shipped a HetznerRecordProvider sibling to
+// pkg/gateway/dns01_hetzner.go (the legacy ACME DNS-01 solver).
+// Round 2 deletes it — production runs Cloudflare + Caddy, and
+// the Hetzner plumbing was dead weight (see ADR-083 §3
+// follow-up revision). The legacy ACME DNS-01 path stays until
+// the ADR-024 PR-C sweep.
 //
 // The package holds no state of its own; every call goes through
 // the interface so the dns_handoff orchestrator in
@@ -64,32 +72,36 @@ type DNSProvider interface {
 // DNSProviderConfig is the constructor input. The provider
 // choice is gated on env `FAAS_DNS_PROVIDER`:
 //
-//	"hetzner"  → NewHetznerDNSProvider (default if unset on
-//	             production clusters)
-//	"manual"   → NewManualDNSProvider (default if unset on
-//	             staging / single-box dev)
+//	"cloudflare" → NewCloudflareRecordProvider (default if
+//	               unset on production clusters)
+//	"manual"     → NewManualDNSProvider (default if unset on
+//	               staging / single-box dev)
 //	anything else → error at boot; the operator must pick.
 type DNSProviderConfig struct {
-	// Zone is the DNS zone name (e.g. "example.com"). Hetzner
-	// resolves Zone → ZoneID internally; the manual provider
-	// prints it in the `curl` it emits.
+	// Zone is the DNS zone name (e.g. "example.com"). Cloudflare
+	// resolves Zone → ZoneID internally (cached on the
+	// receiver); the manual provider prints the lookup
+	// instructions in the `curl` it emits.
 	Zone string
-	// SealedToken is the Hetzner DNS API token sealed via
+	// SealedToken is the Cloudflare API token sealed via
 	// pkg/secretbox.SealBytes(namespace="DNS_PROVIDER"). The
-	// Hetzner provider OpenBytes it; the manual provider
+	// Cloudflare provider OpenBytes it; the manual provider
 	// ignores it (no token needed).
 	SealedToken []byte
-	// APIURL overrides the Hetzner DNS API base for tests. The
+	// APIURL overrides the Cloudflare API base for tests. The
 	// manual provider ignores it. Empty string → production
-	// default (https://dns.hetzner.com/api/v1).
+	// default (https://api.cloudflare.com/client/v4).
 	APIURL string
 	// ProviderURL is the human-facing UI/API URL the manual
 	// provider prints in the operator-facing `curl`. Empty
-	// string → production default (the Hetzner DNS console,
-	// https://dns.hetzner.com). A staging operator on Route53
-	// would set ProviderURL="https://console.aws.amazon.com/route53"
-	// (review finding #5 — the previous hard-coded Hetzner URL
-	// made the manual path useless for any non-Hetzner provider).
+	// string → production default (Cloudflare API base,
+	// https://api.cloudflare.com/client/v4). A staging operator
+	// on Route53 would set
+	// ProviderURL="https://console.aws.amazon.com/route53"
+	// (review finding #5 round 1 — the previous hard-coded
+	// Hetzner URL made the manual path useless for any
+	// non-Hetzner provider; round 2 switched the default to
+	// Cloudflare).
 	ProviderURL string
 	// Stderr is the io.Writer the manual provider prints to.
 	// nil → os.Stderr (production default).
@@ -100,4 +112,4 @@ type DNSProviderConfig struct {
 // FAAS_DNS_PROVIDER is unset or unrecognised. The operator
 // must pick one — the runbook's pre-flight section covers
 // this.
-var errDNSProviderUnknown = fmt.Errorf("dns provider: FAAS_DNS_PROVIDER must be one of {hetzner, manual}")
+var errDNSProviderUnknown = fmt.Errorf("dns provider: FAAS_DNS_PROVIDER must be one of {cloudflare, manual}")

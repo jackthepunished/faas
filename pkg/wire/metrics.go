@@ -1728,9 +1728,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// gauge (deploy/ansible/roles/prometheus/files/ha_failover.rules.yml).
 	standbyState := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_standby_state",
-		Help: "Current standby state for this gatewayd-public (Tier A8 / ADR-083 / §14 M8). 1=warming (boot warm-up incomplete), 2=warm (active or standby-warm), 3=draining (operator-initiated drain in flight, in-flight requests bounded by HADNSRecordStaleSeconds). The FaasStandbyStateWarmingTooLong alert fires when this gauge holds at 1 for > 60s on a node where compute_nodes.active=true. Unlabelled — single-box per-node state.",
+		Help: "Current standby state for this gatewayd-public (Tier A8 / ADR-083 / §14 M8). 1=warming (boot warm-up incomplete), 2=warm (active or standby-warm), 3=draining (operator-initiated drain in flight, in-flight requests bounded by HADNSRecordStaleSeconds), 4=drained (terminal success — DNS flipped, in-flight reached zero, box is safe to shut down), 5=failed (terminal failure — DNS provider exhausted retries OR peer_unreachable stuck; operator intervention required). The FaasStandbyStateWarmingTooLong alert fires when this gauge holds at 1 for > 60s on a node where compute_nodes.active=true. Unlabelled — single-box per-node state.",
 	})
-	standbyState.Set(1) // StandbyStateWarming
+	standbyState.Set(StandbyStateWarming)
 	commonCollectors = append(commonCollectors, standbyState)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
@@ -2149,7 +2149,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		migratingReconcileDecisions:        migratingReconcileDecisions,
 		activePassiveFailoversTotal:        activePassiveFailoversTotal,
 		standbyState:                       standbyState,
-		standbyStateValue:                  1, // StandbyStateWarming — mirrors the gauge.Set(1) above
+		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		storageCacheStaleFallback:          storageCacheStaleFallback,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
@@ -2352,10 +2352,48 @@ func (m *OpsMetrics) ActivePassiveFailovers(outcome string) prometheus.Counter {
 	return m.activePassiveFailoversTotal.WithLabelValues(outcome)
 }
 
+// StandbyState enum (ADR-083 / Tier A8 / §14 M8). Closed vocabulary
+// the §12 Prometheus rules and docs/runbooks/active-passive-ha.md
+// escalate against. The terminal values (Drained / Failed) are the
+// audit's fix #1: without them the gauge sticks at Draining and the
+// runbook-implied `FaasStandbyStateDrainingTooLong` alert cannot
+// fire. Use the named constants instead of raw ints everywhere in
+// the active-passive HA path.
+const (
+	// StandbyStateWarming is the boot value; set at
+	// metrics.NewOpsMetrics time and held until the WarmupLoop's
+	// first tick completes. FaasStandbyStateWarmingTooLong fires
+	// if the gauge holds at 1 for > 60s on a node where
+	// compute_nodes.active=true.
+	StandbyStateWarming = 1
+	// StandbyStateWarm is the steady state on both the active and
+	// the standby-warm box. The standby holds at 2 forever; the
+	// active transitions 2→3 on drain.
+	StandbyStateWarm = 2
+	// StandbyStateDraining is the in-flight drain. Held until the
+	// orchestrator either succeeds (→Drained) or exhausts retries
+	// (→Failed). FaasStandbyStateDrainingTooLong fires if the
+	// gauge holds at 3 for > HADNSRecordStaleSeconds + backoff
+	// slack.
+	StandbyStateDraining = 3
+	// StandbyStateDrained is the terminal success state — DNS
+	// flipped, in-flight reached zero inside the budget, the box
+	// is safe to shut down. This is the value the manual drain
+	// path waits for before SIGKILLing the listener.
+	StandbyStateDrained = 4
+	// StandbyStateFailed is the terminal failure state — DNS
+	// provider exhausted retries OR pg_notify peer_unreachable
+	// stuck inside the budget. The box stays in the fleet as a
+	// standby-only contributor (the orchestrator does NOT retry
+	// on its own — operator intervention is required per the
+	// runbook's escalation section).
+	StandbyStateFailed = 5
+)
+
 // SetStandbyState stamps the enum gauge to the current StandbyState.
 // Called from cmd/gatewayd-public on every active-passive HA state
-// transition (boot→warming→warm→draining→drained). Unlabelled; the
-// gauge is the per-node state signal — fan-out is by Prometheus
+// transition (boot→warming→warm→draining→drained|failed). Unlabelled;
+// the gauge is the per-node state signal — fan-out is by Prometheus
 // scrape target. The `FaasStandbyStateWarmingTooLong` alert queries
 // this gauge; the runbook's escalation section covers the
 // investigation path (DNS provider, store connectivity, peer
@@ -3717,40 +3755,6 @@ func (m *OpsMetrics) ObserveOAuthDisabled(provider string) {
 	switch provider {
 	case "google", "github":
 		m.oauthDisabledTotal.WithLabelValues(provider).Inc()
-	}
-}
-
-// StandbyStateWarming / StandbyStateWarm / StandbyStateDraining
-// are the typed vocabulary the standbyState gauge accepts
-// (review finding #8). Numeric literals {1,2,3} live ONLY in
-// this const block; callers (dns_handoff.go, cmd/gatewayd-public
-// boot path) MUST use the constants so a future renumbering is
-// a single edit. The dns_handoff.go Run() body previously
-// stamped raw ints with inline comments — easy to drift out of
-// sync with the gauge Help text and the alert rule's
-// threshold. The un-exported companion label
-// `FaasStandbyStateWarmingTooLong` queries this gauge and
-// fires when it holds at StandbyStateWarming for > 60s on an
-// active node.
-const (
-	StandbyStateWarming  = 1
-	StandbyStateWarm     = 2
-	StandbyStateDraining = 3
-)
-
-// StandbyStateFromString is a small helper for tests that
-// want to assert the gauge value without importing the
-// constant directly; not used in production.
-func StandbyStateFromString(s string) int {
-	switch s {
-	case "warming":
-		return StandbyStateWarming
-	case "warm":
-		return StandbyStateWarm
-	case "draining":
-		return StandbyStateDraining
-	default:
-		return 0
 	}
 }
 

@@ -5,11 +5,15 @@
 // wires OpenBytesDNSProvider at startup. The shim defaults to
 // returning errSecretBoxUnconfigured so a fresh binary that
 // forgot to wire the unseal helper fails loudly at the FIRST
-// DNS handoff attempt — not silently no-op'ing (review
-// finding #6 corrected the previous docstring which claimed
-// the shim "panics"; it returns an error).
+// DNS handoff attempt — not silently no-op'ing.
 //
-// Precedent: pkg/webhook/secretbox_adapter.go (ADR-076).
+// Real precedent: cmd/gatewayd-internal/public_auth_unsealer.go
+// (an interface-shaped unsealer that loads host.age identities
+// at boot and calls secretbox.OpenBytesMulti). The DNS provider
+// uses the var-shaped seam because pkg/gateway must not import
+// pkg/secretbox (cycle) AND the call site in main.go runs
+// before DI structs are wired; the package-level var lets the
+// reassignment happen at the top of run() with no helper.
 package gateway
 
 import (
@@ -20,9 +24,9 @@ import (
 // errSecretBoxUnconfigured is the default OpenBytesDNSProvider
 // value — returns an error so cmd/gatewayd-public's startup
 // log surfaces "dns_provider_unconfigured" if the wiring was
-// forgotten. The Hetzner DNS provider returns this error from
-// its constructor; the orchestrator never gets a half-wired
-// provider.
+// forgotten. The Cloudflare DNS provider returns this error
+// from its constructor; the orchestrator never gets a
+// half-wired provider.
 var errSecretBoxUnconfigured = errors.New("pkg/gateway: OpenBytesDNSProvider not configured — wire cmd/gatewayd-public/main.go at startup")
 
 // OpenBytesDNSProvider is the namespace-sealed unseal helper
@@ -31,22 +35,22 @@ var errSecretBoxUnconfigured = errors.New("pkg/gateway: OpenBytesDNSProvider not
 // webhook APP_WEBHOOK namespace (ADR-076) and the registry
 // REGISTRY_AUTH namespace (ADR-062) so a leaked blob from one
 // surface cannot decrypt another.
+//
+// Signature: (sealed []byte) ([]byte, error). The Cloudflare
+// provider round-trips through openDNSProviderToken which
+// discards the namespace tag returned by secretbox.OpenBytesMulti
+// (we've already routed by namespace at the wire level — the
+// unseal call only fires for DNS_PROVIDER blobs).
 var OpenBytesDNSProvider = func(sealed []byte) ([]byte, error) {
 	return nil, fmt.Errorf("%w (sealed=%d bytes)", errSecretBoxUnconfigured, len(sealed))
 }
 
-// secretboxOpenDNSProvider is the internal alias used by the
-// Hetzner provider. Same shape — kept as a separate name so the
-// wiring code in cmd/gatewayd-public can swap one without
-// touching the other (a future v1.1 may route the DNS_PROVIDER
-// unseal through a different namespace).
-//
-// REVIEW NOTE (finding #7, second review): this is a value
-// bind, not a reference bind. If a future test reassigns
-// `OpenBytesDNSProvider = ...`, `secretboxOpenDNSProvider`
-// here keeps the original default-returning closure. The
-// production wiring in cmd/gatewayd-public/main.go reassigns
-// BOTH at startup to avoid the trap, but the indirection
-// stays in place so swapping one without the other is a
-// obvious-by-grep mistake rather than a silent no-op.
-var secretboxOpenDNSProvider = OpenBytesDNSProvider
+// openDNSProviderToken is the var-shaped seam the DNS provider
+// constructors call. By default it round-trips through
+// OpenBytesDNSProvider (the externally-reassignable var). Tests
+// reassign openDNSProviderToken directly to inject a fake
+// unseal helper without touching the package-level var (the
+// value-bind trap noted in this file's previous revision).
+var openDNSProviderToken = func(sealed []byte) ([]byte, error) {
+	return OpenBytesDNSProvider(sealed)
+}
