@@ -45,8 +45,14 @@ import (
 // ring filter; zero = no time bound. deploymentID (AC3) scopes
 // the per-instance goroutine fan-out to one deployment; empty =
 // all live instances.
+//
+// level + grep (issue #309 / tier-2 DX) are the customer-facing
+// --level / --grep filter values; both empty = no filter. The
+// gateway already validated the level enum + grep regex at
+// parse time (apislogs.ValidateLogFilters), so this method
+// receives pre-validated strings and forwards them verbatim.
 type logStreamer interface {
-	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) (scheddgrpc.LogStream, error)
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, level string, grep string) (scheddgrpc.LogStream, error)
 }
 
 // logStreamerResolver is the per-app dial factory the
@@ -181,12 +187,10 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 		}
 	}
 	sinceSeq := apislogs.ParseInt64Query(r, "since_seq", 0)
-	_ = level
-	_ = grep
 
 	apislogs.StartSSE(w)
 	flusher, _ := w.(http.Flusher)
-	h.serveAppLogs(r.Context(), w, flusher, app.ID, sinceSeq, sinceWrittenAt, deploymentID)
+	h.serveAppLogs(r.Context(), w, flusher, app.ID, sinceSeq, sinceWrittenAt, deploymentID, level, grep)
 }
 
 // serveAppLogs is the receive-pump body. Mirrors the legacy
@@ -197,7 +201,10 @@ func (h *AppLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct sta
 // load-test seam — the 9 whitebox tests in this package drive
 // serveAppLogs directly with a stub stream without standing up
 // the auth + LoadApp chain.
-func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) {
+//
+// level + grep (issue #309 / tier-2 DX) are forwarded to
+// schedd as-is; both empty = no filter at the schedd sink.
+func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, level string, grep string) {
 	// Phase 2 / Gate A: resolve the owner schedd for appID via
 	// the per-node router. The fallback path (legacy single
 	// schedd) is gone — the router covers the single-box
@@ -207,7 +214,7 @@ func (h *AppLogsHandler) serveAppLogs(ctx_ context.Context, w http.ResponseWrite
 		apislogs.RenderAppLogsError(w, flusher, err)
 		return
 	}
-	stream, err := sched.StreamAppLogs(ctx_, appID, sinceSeq, sinceWrittenAt, deploymentID)
+	stream, err := sched.StreamAppLogs(ctx_, appID, sinceSeq, sinceWrittenAt, deploymentID, level, grep)
 	if err != nil {
 		// codes.Unimplemented from the stub → "schedd not wired
 		// (dev mode)"; codes.NotFound from a real schedd → "no

@@ -257,3 +257,277 @@ func TestStreamAppLogs_GapForwardedOverSchedd(t *testing.T) {
 		t.Errorf("line = %q, want %q", got, "first after gap")
 	}
 }
+
+// TestStreamAppLogs_FilterLevelDropsAndCounts (issue #309 /
+// tier-2 DX): when the proto request carries a level floor,
+// line frames that don't satisfy the heuristic floor are
+// dropped at the schedd sink, and the per-reason counter
+// apid_logs_dropped_total{reason="filter_level"} increments
+// once per drop. Pass-through line frames still arrive at the
+// caller.
+//
+// The test stands up a sibling helper to newServer so the
+// wire.OpsMetrics can be inspected for the drop counter. The
+// fakeEngine emits a mix of (info, warn, error, plain) lines
+// and the caller asserts only warn+error arrive AND the
+// filter_level counter has the expected delta.
+func TestStreamAppLogs_FilterLevelDropsAndCounts(t *testing.T) {
+	cl, metrics := newServerWithMetrics(t, &fakeEngine{
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
+			lines := []sched.LogFrame{
+				{InstanceID: "inst-A", Seq: 1, Stream: "stdout", Line: "[INFO] startup ok"},
+				{InstanceID: "inst-A", Seq: 2, Stream: "stdout", Line: "[WARN] retrying"},
+				{InstanceID: "inst-A", Seq: 3, Stream: "stdout", Line: "[ERROR] db unreachable"},
+				{InstanceID: "inst-A", Seq: 4, Stream: "stdout", Line: "plain stdout line"},
+			}
+			for _, f := range lines {
+				if err := sink(f); err != nil {
+					return err
+				}
+			}
+			<-ctx.Done()
+			return nil
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := cl.StreamAppLogs(ctx, &scheddpb.StreamAppLogsRequest{
+		AppId: "app-1",
+		Level: "warn",
+	})
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	// Expect only warn + error lines through (info and plain are
+	// below the warn floor).
+	wantLines := []string{"[WARN] retrying", "[ERROR] db unreachable"}
+	for i, want := range wantLines {
+		resp, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("Recv[%d]: %v", i, err)
+		}
+		if got := resp.GetLine(); got != want {
+			t.Errorf("frame[%d].Line = %q, want %q", i, got, want)
+		}
+	}
+	// One more Recv should block (no more frames), then cancel
+	// unblocks the engine. After cancel the stream returns EOF.
+	cancel()
+	if _, err := stream.Recv(); err == nil {
+		t.Errorf("Recv after cancel: expected EOF, got nil")
+	}
+
+	// Counter assertions: info + plain were dropped → 2 increments
+	// on filter_level. The other reasons stay at zero.
+	for _, c := range []struct {
+		reason string
+		want   float64
+	}{
+		{"filter_level", 2},
+		{"filter_grep", 0},
+		{"slow_subscriber", 0},
+	} {
+		got := readCounter(t, metrics, "schedd_test_logs_dropped_total", c.reason)
+		if got != c.want {
+			t.Errorf("schedd_test_logs_dropped_total{reason=%q} = %v, want %v", c.reason, got, c.want)
+		}
+	}
+}
+
+// TestStreamAppLogs_FilterGrepDropsAndCounts (issue #309 /
+// tier-2 DX): when the proto request carries a grep regex,
+// line frames that don't match are dropped at the schedd
+// sink and apid_logs_dropped_total{reason="filter_grep"}
+// increments once per drop. Mirrors the level test shape;
+// keeps the per-reason counter coverage split so a future
+// regression that confuses the two reasons trips both tests.
+func TestStreamAppLogs_FilterGrepDropsAndCounts(t *testing.T) {
+	cl, metrics := newServerWithMetrics(t, &fakeEngine{
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
+			lines := []sched.LogFrame{
+				{InstanceID: "inst-A", Seq: 1, Stream: "stdout", Line: "[INFO] startup ok"},
+				{InstanceID: "inst-A", Seq: 2, Stream: "stdout", Line: "[ERROR] timeout exceeded"},
+				{InstanceID: "inst-A", Seq: 3, Stream: "stdout", Line: "another timeout here"},
+				{InstanceID: "inst-A", Seq: 4, Stream: "stdout", Line: "no match"},
+			}
+			for _, f := range lines {
+				if err := sink(f); err != nil {
+					return err
+				}
+			}
+			<-ctx.Done()
+			return nil
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := cl.StreamAppLogs(ctx, &scheddpb.StreamAppLogsRequest{
+		AppId: "app-1",
+		Grep:  "timeout",
+	})
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	wantLines := []string{"[ERROR] timeout exceeded", "another timeout here"}
+	for i, want := range wantLines {
+		resp, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("Recv[%d]: %v", i, err)
+		}
+		if got := resp.GetLine(); got != want {
+			t.Errorf("frame[%d].Line = %q, want %q", i, got, want)
+		}
+	}
+	cancel()
+	if _, err := stream.Recv(); err == nil {
+		t.Errorf("Recv after cancel: expected EOF, got nil")
+	}
+	for _, c := range []struct {
+		reason string
+		want   float64
+	}{
+		{"filter_grep", 2},
+		{"filter_level", 0},
+		{"slow_subscriber", 0},
+	} {
+		got := readCounter(t, metrics, "schedd_test_logs_dropped_total", c.reason)
+		if got != c.want {
+			t.Errorf("schedd_test_logs_dropped_total{reason=%q} = %v, want %v", c.reason, got, c.want)
+		}
+	}
+}
+
+// TestStreamAppLogs_GapBypassesFilter (issue #254 / Move 4,
+// issue #309 / tier-2 DX interaction): a gap frame is
+// sequencing metadata the customer must see regardless of
+// grep/level — a dropped gap would hide a stall from the
+// customer's session. The test confirms the filter sink
+// branches on IsGap before MatchLine so gap frames pass
+// through even when the customer's filter would drop them.
+func TestStreamAppLogs_GapBypassesFilter(t *testing.T) {
+	headAt := time.Date(2026, 8, 1, 13, 0, 0, 0, time.UTC)
+	cl, metrics := newServerWithMetrics(t, &fakeEngine{
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
+			if err := sink(sched.LogFrame{
+				InstanceID:     "inst-A",
+				IsGap:          true,
+				GapToWrittenAt: headAt,
+				GapReason:      "seq_below_retained",
+			}); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return nil
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// A level=error filter would drop "[INFO]"-only lines; the
+	// gap frame still arrives because IsGap=true.
+	stream, err := cl.StreamAppLogs(ctx, &scheddpb.StreamAppLogsRequest{
+		AppId: "app-1",
+		Level: "error",
+	})
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if !resp.GetIsGap() {
+		t.Errorf("expected gap frame, got line frame")
+	}
+	if resp.GetGapReason() != "seq_below_retained" {
+		t.Errorf("gap reason = %q, want seq_below_retained", resp.GetGapReason())
+	}
+	cancel()
+	// No drops — the gap frame bypassed the filter, so the
+	// counter sits at zero.
+	if got := readCounter(t, metrics, "schedd_test_logs_dropped_total", "filter_level"); got != 0 {
+		t.Errorf("filter_level counter = %v, want 0 (gap frames bypass filter)", got)
+	}
+}
+
+// TestStreamAppLogs_DualFilterAttribution (issue #309 / tier-2
+// DX, PR #728 code-review finding #1): when both --level and
+// --grep are active, the drop counter must credit the
+// actually-failing filter, not unconditionally attribute the
+// drop to --level. A line that satisfies the level floor but
+// fails the grep regex is a grep drop; a line that satisfies
+// the grep regex but falls below the level floor is a level
+// drop. The earlier implementation mis-attributed to
+// filter_level in both cases, which broke operator triage on
+// the §12 panel.
+//
+// Pins three attribution cases:
+//  1. passes level, fails grep → filter_grep increments
+//  2. fails level, passes grep → filter_level increments
+//  3. fails both → filter_level increments (tiebreaker; the
+//     line would have been dropped by the broad noise filter
+//     anyway, and customers tend to set --level first and add
+//     --grep to narrow further).
+func TestStreamAppLogs_DualFilterAttribution(t *testing.T) {
+	cl, metrics := newServerWithMetrics(t, &fakeEngine{
+		streamLogFn: func(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, sink scheddgrpc.LogFrameSink) error {
+			// (1) passes --level=warn, fails --grep=timeout
+			if err := sink(sched.LogFrame{InstanceID: "inst-A", Seq: 1, Stream: "stdout", Line: "[ERROR] db connection OK"}); err != nil {
+				return err
+			}
+			// (2) fails --level=warn, passes --grep=timeout
+			if err := sink(sched.LogFrame{InstanceID: "inst-A", Seq: 2, Stream: "stdout", Line: "[INFO] timeout scheduled"}); err != nil {
+				return err
+			}
+			// (3) fails both (below warn floor AND no timeout)
+			if err := sink(sched.LogFrame{InstanceID: "inst-A", Seq: 3, Stream: "stdout", Line: "[INFO] something else"}); err != nil {
+				return err
+			}
+			// Pass-through: passes both.
+			if err := sink(sched.LogFrame{InstanceID: "inst-A", Seq: 4, Stream: "stdout", Line: "[ERROR] timeout exceeded"}); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return nil
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := cl.StreamAppLogs(ctx, &scheddpb.StreamAppLogsRequest{
+		AppId: "app-1",
+		Level: "warn",
+		Grep:  "timeout",
+	})
+	if err != nil {
+		t.Fatalf("StreamAppLogs: %v", err)
+	}
+	// Only frame #4 passes both filters.
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if got := resp.GetLine(); got != "[ERROR] timeout exceeded" {
+		t.Errorf("frame.Line = %q, want %q", got, "[ERROR] timeout exceeded")
+	}
+	cancel()
+	if _, err := stream.Recv(); err == nil {
+		t.Errorf("Recv after cancel: expected EOF, got nil")
+	}
+
+	// Counter assertions:
+	//   filter_grep  = 1 (frame #1: passes level, fails grep)
+	//   filter_level = 2 (frames #2 and #3: fail level;
+	//                              case (3) tiebreaker is level)
+	for _, c := range []struct {
+		reason string
+		want   float64
+	}{
+		{"filter_grep", 1},
+		{"filter_level", 2},
+		{"slow_subscriber", 0},
+	} {
+		got := readCounter(t, metrics, "schedd_test_logs_dropped_total", c.reason)
+		if got != c.want {
+			t.Errorf("schedd_test_logs_dropped_total{reason=%q} = %v, want %v (PR #728 finding #1)", c.reason, got, c.want)
+		}
+	}
+}

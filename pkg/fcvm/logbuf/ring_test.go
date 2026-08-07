@@ -329,6 +329,43 @@ func TestRing_Empty(t *testing.T) {
 	}
 }
 
+// TestRing_OversizedLineRejected pins the contract that a single
+// line whose payload exceeds maxBytes is dropped at commitLocked
+// time rather than admitted and silently inflating totalBytes past
+// the configured budget (peer review of PR #728). The pre-fix
+// evict-until-size=0 loop could not compensate for a single line
+// larger than maxBytes — the eviction drains the ring but the
+// subsequent insert still pushes totalBytes over the cap.
+func TestRing_OversizedLineRejected(t *testing.T) {
+	const ringBytes = 64
+	r := New(ringBytes)
+	// Line payload is 2x ringBytes — strictly larger than the
+	// budget. commitLocked must reject it.
+	huge := make([]byte, ringBytes*2)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	huge = append(huge, '\n')
+	if _, err := r.Write("stdout", huge); err != nil {
+		t.Fatalf("Write oversized: %v", err)
+	}
+	// Ring must be empty — the line was rejected, not stored.
+	if got := r.Snapshot(1); len(got) != 0 {
+		t.Errorf("Snapshot(1) after oversized Write = %d lines, want 0 (rejected)", len(got))
+	}
+	if r.totalBytes != 0 {
+		t.Errorf("totalBytes after oversized Write = %d, want 0", r.totalBytes)
+	}
+
+	// Sanity check: a normal line under the cap still works.
+	if _, err := r.Write("stdout", []byte("ok\n")); err != nil {
+		t.Fatalf("Write normal: %v", err)
+	}
+	if got := r.Snapshot(1); len(got) != 1 || got[0].Line != "ok" {
+		t.Errorf("Snapshot(1) after normal Write = %v, want one line \"ok\"", got)
+	}
+}
+
 // TestRing_SnapshotTailFromNow pins the "sinceSeq <= 0 = tail from
 // now" contract (issue #254 Move 4 wire shape: the apid handler
 // passes since_seq=0 as the default "open from now" and the SDK
@@ -407,4 +444,171 @@ func TestRing_CloseRaceWithWrite(t *testing.T) {
 		}()
 		wg.Wait()
 	}
+}
+
+// TestRing_SlowSubscriberCallbackFires (issue #309 / tier-2 DX):
+// when a subscriber's buffered channel is full, the Publish loop
+// in commitLocked drops the line AND fires the
+// onSlowSubscriber callback exactly once per dropped LINE (NOT
+// once per Write). A multi-line Write whose bytes all land on a
+// full subscriber channel therefore fires the callback N times,
+// where N is the number of newline-terminated lines in the Write.
+// This is intentional: the apid_logs_dropped_total{reason="slow_subscriber"}
+// counter is meant to scale with log throughput (lines/sec), not
+// with Write event count, so the dashboard panel reflects a real
+// drop rate.
+//
+// The callback is the seam pkg/wire's IncLogDropped("slow_subscriber")
+// uses — this test pins the load-bearing contract.
+//
+// Pins four behaviours in one go:
+//  1. A nil callback (the default) means a drop is silent
+//     (matches pre-#309 behaviour, no test regression).
+//  2. A wired callback fires exactly once per dropped line when
+//     the only subscriber's buffer is full.
+//  3. A wired callback fires exactly once per dropped line even
+//     when MULTIPLE subscribers' channels are full (per-line
+//     semantics: one full subscriber channel for a given line
+//     is enough to drop it; the counter increments once).
+//  4. A multi-line Write with a full subscriber channel fires
+//     the callback once per line, NOT once per Write.
+func TestRing_SlowSubscriberCallbackFires(t *testing.T) {
+	t.Run("NilCallbackSilentDrop", func(t *testing.T) {
+		r := New(1 << 20)
+		ch, cancel := r.Subscribe()
+		defer cancel()
+		// Fill the channel (buffered 64). After this loop the
+		// subscriber's channel is full.
+		buf := make([]byte, 0, 64*4)
+		for i := 0; i < 64; i++ {
+			buf = append(buf, "x\n"...)
+		}
+		if _, err := r.Write("stdout", buf); err != nil {
+			t.Fatalf("Write fill: %v", err)
+		}
+		// Next Write lands with a full subscriber channel. No
+		// callback wired — the drop is silent (no panic, no
+		// counter).
+		if _, err := r.Write("stdout", []byte("dropped\n")); err != nil {
+			t.Fatalf("Write drop: %v", err)
+		}
+		// Drain to keep the test from leaking goroutines.
+		for i := 0; i < 64; i++ {
+			<-ch
+		}
+	})
+
+	t.Run("CallbackFiresOncePerDroppedLine", func(t *testing.T) {
+		r := New(1 << 20)
+		ch, cancel := r.Subscribe()
+		defer cancel()
+		var drops int
+		r.SetSlowSubscriberCallback(func() { drops++ })
+
+		// Fill the subscriber channel so subsequent Writes
+		// hit the slow-subscriber default-branch.
+		buf := make([]byte, 0, 64*4)
+		for i := 0; i < 64; i++ {
+			buf = append(buf, "x\n"...)
+		}
+		if _, err := r.Write("stdout", buf); err != nil {
+			t.Fatalf("Write fill: %v", err)
+		}
+
+		// Three Writes while the subscriber is full — each
+		// Write carries one newline-terminated line, so the
+		// callback fires exactly three times (per-line
+		// semantics).
+		for i := 0; i < 3; i++ {
+			if _, err := r.Write("stdout", []byte("dropped\n")); err != nil {
+				t.Fatalf("Write drop[%d]: %v", i, err)
+			}
+		}
+		if drops != 3 {
+			t.Errorf("callback fired %d times, want 3", drops)
+		}
+
+		// Drain to keep the test from leaking goroutines.
+		for i := 0; i < 64; i++ {
+			<-ch
+		}
+	})
+
+	t.Run("MultipleFullSubscribersOneIncrementPerLine", func(t *testing.T) {
+		r := New(1 << 20)
+		ch1, cancel1 := r.Subscribe()
+		defer cancel1()
+		ch2, cancel2 := r.Subscribe()
+		defer cancel2()
+
+		var drops int
+		r.SetSlowSubscriberCallback(func() { drops++ })
+
+		// Fill BOTH subscribers' buffers (buffered 64 each).
+		buf := make([]byte, 0, 64*4)
+		for i := 0; i < 64; i++ {
+			buf = append(buf, "x\n"...)
+		}
+		if _, err := r.Write("stdout", buf); err != nil {
+			t.Fatalf("Write fill: %v", err)
+		}
+
+		// One more Write lands with BOTH subscribers full —
+		// the callback MUST fire exactly once for that single
+		// dropped line (per-line semantics), not twice (one
+		// per full subscriber).
+		if _, err := r.Write("stdout", []byte("dropped\n")); err != nil {
+			t.Fatalf("Write drop: %v", err)
+		}
+		if drops != 1 {
+			t.Errorf("callback fired %d times, want 1 (per-line semantics)", drops)
+		}
+
+		// Drain to keep the test from leaking goroutines.
+		for i := 0; i < 64; i++ {
+			<-ch1
+			<-ch2
+		}
+	})
+
+	t.Run("MultiLineWriteMultipleIncrements", func(t *testing.T) {
+		// A single Write carrying N newline-terminated lines
+		// against a full subscriber channel must fire the
+		// callback N times — once per dropped line, NOT
+		// once per Write. This is the load-bearing case the
+		// peer review of PR #728 pinned: pre-fix the code
+		// matched the "once per Write" doc claim only because
+		// every prior test used single-line Writes; a
+		// multi-line Write would have surprised operators by
+		// undercounting the dashboard rate.
+		r := New(1 << 20)
+		ch, cancel := r.Subscribe()
+		defer cancel()
+		var drops int
+		r.SetSlowSubscriberCallback(func() { drops++ })
+
+		// Fill the subscriber channel.
+		buf := make([]byte, 0, 64*4)
+		for i := 0; i < 64; i++ {
+			buf = append(buf, "x\n"...)
+		}
+		if _, err := r.Write("stdout", buf); err != nil {
+			t.Fatalf("Write fill: %v", err)
+		}
+
+		// Single Write carrying 5 newline-terminated lines.
+		// Expect exactly 5 callback fires.
+		multi := []byte("a\nb\nc\nd\ne\n")
+		if _, err := r.Write("stdout", multi); err != nil {
+			t.Fatalf("Write multi-line: %v", err)
+		}
+		if drops != 5 {
+			t.Errorf("callback fired %d times for a 5-line Write, want 5 (per-line semantics)", drops)
+		}
+
+		// Drain to keep the test from leaking goroutines.
+		for i := 0; i < 64; i++ {
+			<-ch
+		}
+	})
 }

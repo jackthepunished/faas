@@ -162,6 +162,76 @@ func newServer(t *testing.T, eng scheddgrpc.SchedAPI) scheddpb.ScheddClient {
 	return scheddpb.NewScheddClient(conn)
 }
 
+// newServerWithMetrics is the filter-counter sibling to
+// newServer (issue #309 / tier-2 DX). The drop-counter
+// whitebox tests (TestStreamAppLogs_FilterLevelDropsAndCounts
+// and friends) need to scrape the per-reason
+// apid_logs_dropped_total counter off the same *wire.OpsMetrics
+// the schedd server increments — the helper returns both. Same
+// prefix ("schedd_test") as newServer so the counter series
+// surface in /metrics with the same names.
+func newServerWithMetrics(t *testing.T, eng scheddgrpc.SchedAPI) (scheddpb.ScheddClient, *wire.OpsMetrics) {
+	t.Helper()
+	metrics := wire.NewOpsMetrics("schedd_test")
+	srv := grpc.NewServer()
+	scheddgrpc.New(eng, metrics, nil).Register(srv)
+
+	lis := bufconn.Listen(1024 * 1024)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() { srv.Stop(); _ = lis.Close() })
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
+	)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return scheddpb.NewScheddClient(conn), metrics
+}
+
+// readCounter scrapes the per-reason <prefix>_logs_dropped_total
+// counter for the given reason label. Used by the filter-counter
+// whitebox tests to verify the schedd sink increments
+// apid_logs_dropped_total{reason} on each drop.
+//
+// The metric is gathered from the daemon's /metrics registry
+// (prometheus.Registry.Gather) and the matching metric family is
+// searched for the {reason="..."} label. Returns 0 if the series
+// was never incremented (the counter is pre-instantiated at
+// boot, so the family always surfaces — the value is what
+// changes).
+func readCounter(t *testing.T, m *wire.OpsMetrics, metricName string, reason string) float64 {
+	t.Helper()
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Registry.Gather: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != metricName {
+			continue
+		}
+		for _, met := range fam.GetMetric() {
+			matched := false
+			for _, lbl := range met.GetLabel() {
+				if lbl.GetName() == "reason" && lbl.GetValue() == reason {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				return met.GetCounter().GetValue()
+			}
+		}
+	}
+	// Series not found — pre-instantiation guarantees it
+	// exists, so this only fires if a future regression drops
+	// the closed-set pre-instantiation loop. Surface that.
+	t.Fatalf("metric %s{reason=%q} not found in registry", metricName, reason)
+	return 0
+}
+
 func TestWake_Success(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
 		wakeFn: func(context.Context, string) (sched.WakeResult, error) {

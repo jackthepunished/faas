@@ -622,6 +622,28 @@ type OpsMetrics struct {
 	// cardinality stays well inside Prometheus' "tens of thousands
 	// of series per metric" guideline.
 	apidLogsEmittedTotal *prometheus.CounterVec
+	// apidLogsDroppedTotal (issue #309 / tier-2 DX): per-reason
+	// drop counter for log frames the platform filtered or the
+	// ring dropped. Closed `reason` label set
+	// {slow_subscriber, filter_grep, filter_level} — the three
+	// drop sites:
+	//   - slow_subscriber: pkg/fcvm/logbuf/ring.go::Write default
+	//     branch when the ring is full (the LogSink consumer is
+	//     behind; ring.Write drops the line and returns
+	//     ErrRingFull).
+	//   - filter_grep: schedd server's StreamAppLogs sink
+	//     callback dropped the line because it did not match the
+	//     customer-supplied --grep regex (issue #309).
+	//   - filter_level: same site dropped the line because the
+	//     heuristic --level matcher classified it below the floor.
+	// 3 closed-set series; pre-instantiated so /metrics surfaces
+	// zero from boot. Single-registry: registered on every
+	// daemon; only vmmd (slow_subscriber) and schedd (filter_*)
+	// increment via IncLogDropped. The metric name mirrors the
+	// docs comment at pkg/fcvm/logbuf/ring.go:181,230 that
+	// pre-dates this counter — the wire-side field formalises
+	// what was previously a TODO marker.
+	apidLogsDroppedTotal *prometheus.CounterVec
 	// oauthDisabledTotal: issue #419 / ADR-046. Sign-in OAuth
 	// disabled-redirect counter. Labelled by provider ∈
 	// {google, github} — the closed set pkg/auth.SignInConfig
@@ -1403,6 +1425,36 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_logs_emitted_total",
 		Help: "Per-app SSE log frames emitted to clients (issue #254, Move 4). One Increment per `event: log` frame written to the SSE response body in cmd/apid/handlers_ext.go::writeAppLogEvent. The series is registered on every daemon so the struct is a single-registry; only apid's production path increments. Use this rate with apid_ops_total{op=\"app_logs\"} to break out per-app log throughput — that op label is already on every streamAppLogs handler entry.",
 	}, []string{"app"})
+	// apid_logs_dropped_total (issue #309 / tier-2 DX). Single
+	// CounterVec labelled by reason ∈
+	// {slow_subscriber, filter_grep, filter_level} — the three
+	// drop sites the platform introduces. The `app` label is
+	// intentionally absent: a customer asking "why are my logs
+	// not coming through?" doesn't need per-app series (the
+	// appid is recoverable from the logs-emitted side) and
+	// per-app series would multiply cardinality by the per-plan
+	// app quota (Hobby=5 / Pro=25 / Scale=100). Pre-instantiated
+	// below so /metrics surfaces zero from boot. Single-registry:
+	// registered on every daemon — only schedd and vmmd
+	// increment via IncLogDropped; other daemons sit at zero.
+	apidLogsDroppedTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_logs_dropped_total",
+		Help: "Log frames the platform dropped or filtered, labelled by reason ∈ {slow_subscriber, filter_grep, filter_level} (issue #309 / tier-2 DX). slow_subscriber increments in pkg/fcvm/logbuf/ring.go::Write when the ring is full; filter_grep and filter_level increment in pkg/scheddgrpc/server.go::StreamAppLogs when the customer's --grep regex or --level floor doesn't match. The metric name matches the existing comments at pkg/fcvm/logbuf/ring.go:181,230 so the wire field formalises what was previously a TODO marker.",
+	}, []string{"reason"})
+	// Pre-instantiate the closed (reason) label set so the
+	// dashboard panel `rate(apid_logs_dropped_total[5m])`
+	// surfaces a non-zero series the moment the first drop
+	// fires. The label set is the three drop sites documented
+	// in the field comment on apidLogsDroppedTotal: the ring-
+	// full path, the --grep filter path, and the --level filter
+	// path. Adding a new drop reason requires extending both
+	// this loop and the closed-set guard in IncLogDropped
+	// (pkg/wire/metrics.go) — the switch in IncLogDropped is
+	// the load-bearing guard that prevents accidentally
+	// creating a new series.
+	for _, reason := range []string{"slow_subscriber", "filter_grep", "filter_level"} {
+		apidLogsDroppedTotal.WithLabelValues(reason)
+	}
 	// egressSourceErrors: per-instance sysfs read failures
 	// (ADR-046, step 7). The network poller in cmd/vmmd reads
 	// /sys/class/net/<vethHost>/statistics/rx_bytes for every
@@ -1535,6 +1587,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		failedLoginAuditWriteFailures,
 		topTenantRPS,
 		apidLogsEmittedTotal,
+		apidLogsDroppedTotal,
 		oauthDisabledTotal,
 		advisoryBatchesEmittedTotal,
 		apidStatelessAdvisoryEventsTotal,
@@ -2045,6 +2098,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		migratingReconcileDecisions:        migratingReconcileDecisions,
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
+		apidLogsDroppedTotal:               apidLogsDroppedTotal,
 		egressSourceErrors:                 egressSourceErrors,
 		oauthDisabledTotal:                 oauthDisabledTotal,
 		advisoryBatchesEmittedTotal:        advisoryBatchesEmittedTotal,
@@ -3529,6 +3583,35 @@ func (m *OpsMetrics) ObserveLogEmitted(app string) {
 		return
 	}
 	m.apidLogsEmittedTotal.WithLabelValues(app).Inc()
+}
+
+// IncLogDropped increments apid_logs_dropped_total{reason} for
+// the three closed-set drop sites (issue #309 / tier-2 DX):
+//
+//   - "slow_subscriber" — pkg/fcvm/logbuf/ring.go::Write's
+//     default branch fires when the ring is full (the LogSink
+//     consumer is behind). Incrementing here is the operator's
+//     "logs are being silently dropped at the source" signal.
+//   - "filter_grep" — schedd's StreamAppLogs sink callback
+//     dropped the line because it didn't match the
+//     customer-supplied --grep regex. The counter is the
+//     customer's first signal that their filter is too narrow.
+//   - "filter_level" — same site dropped the line because the
+//     heuristic --level matcher classified it below the floor.
+//     A persistently high rate means the customer is filtering
+//     out their own info logs and may want to relax the floor.
+//
+// Unknown reason values are silently dropped (the CounterVec
+// has no matching label) — callers MUST map to the closed set
+// above. Safe on a nil receiver for parity with ObserveLogEmitted.
+func (m *OpsMetrics) IncLogDropped(reason string) {
+	if m == nil {
+		return
+	}
+	switch reason {
+	case "slow_subscriber", "filter_grep", "filter_level":
+		m.apidLogsDroppedTotal.WithLabelValues(reason).Inc()
+	}
 }
 
 // ObserveOAuthDisabled increments apid_oauth_disabled_total{provider}

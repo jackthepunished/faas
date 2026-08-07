@@ -23,6 +23,26 @@ import (
 // in the §6.2.2 tenant RAM budget, large enough to hold ~5k-50k lines).
 const DefaultMaxBytes = 10 << 20
 
+// MaxPartialLineBytes caps the partial-line tail Write buffers
+// while it waits for a trailing '\n'. The tail is OUTSIDE the
+// ring's byte budget (DefaultMaxBytes) because the ring only
+// charges committed lines against its cap — a guest that emits
+// bytes without ever sending a '\n' could otherwise grow the
+// tail unbounded until vmmd OOMs (issue #309 / tier-2 DX, peer
+// review of PR #728).
+//
+// 1 MiB is well below the 10 MiB ring cap (so a single Write
+// burst cannot consume the entire ring budget in a partial line)
+// and big enough for any plausible log line — the longest
+// realistic log message is <64 KiB (a stack trace or a
+// multi-KiB JSON request body). A guest that exceeds the cap
+// is misbehaving; the ring drops the partial bytes and starts
+// fresh on the next Write. The drop is silent at the line
+// level — the slog path (caller's responsibility, see vmmd)
+// surfaces the warning so an operator can identify the
+// offending app.
+const MaxPartialLineBytes = 1 << 20
+
 // Line is one completed stdout/stderr line with a monotonic sequence number
 // assigned at ring intake. Concretely a single Write call may carry zero, one,
 // or many Lines depending on how many '\n' bytes it contained; partial lines
@@ -64,6 +84,32 @@ type Ring struct {
 	tail       []byte // partial-line buffer for Write's bytes without a '\n'
 	subs       []chan Line
 
+	// onSlowSubscriber (issue #309 / tier-2 DX) is invoked once
+	// per dropped LINE (i.e. once per commitLocked call where
+	// at least one subscriber's channel was full). A single
+	// multi-line Write can therefore fire the callback many
+	// times — that is intentional: the
+	// apid_logs_dropped_total{reason="slow_subscriber"} counter
+	// is meant to scale with log throughput, so an operator
+	// looking at the dashboard sees a real drop rate rather
+	// than a flat count of Write events. Nil = no callback
+	// wired (the default in tests); production wires it to a
+	// closure that calls
+	// (*wire.OpsMetrics).IncLogDropped("slow_subscriber"). The
+	// callback is read under r.mu, so the caller can swap it
+	// out at runtime by calling SetSlowSubscriberCallback under
+	// its own external synchronisation. Reading nil is fine —
+	// the slow-drop branch skips the call.
+	//
+	// Why a callback and not a direct pkg/wire import: this
+	// package is a leaf — pkg/fcvm owns the only consumer and
+	// pkg/wire is several hops up. Importing pkg/wire from
+	// logbuf would invert the dep direction (pkg/wire already
+	// imports nothing from pkg/fcvm). The callback indirection
+	// keeps the leaf clean and lets tests exercise the drop
+	// path without spinning up a Prometheus registry.
+	onSlowSubscriber func()
+
 	closed bool
 }
 
@@ -76,6 +122,30 @@ func New(maxBytes int) *Ring {
 	return &Ring{
 		maxBytes: maxBytes,
 	}
+}
+
+// SetSlowSubscriberCallback installs (or removes, when nil) the
+// per-drop callback the commitLocked Publish loop invokes when
+// a subscriber's channel is full (issue #309 / tier-2 DX). The
+// callback fires once per dropped line — exactly what the
+// apid_logs_dropped_total{reason="slow_subscriber"} counter
+// needs. Wire from a constructor closure that adapts the
+// per-ring instance to the vmmd-wide wire.OpsMetrics, e.g.:
+//
+//	ring := logbuf.New(0)
+//	ring.SetSlowSubscriberCallback(func() {
+//	    metrics.IncLogDropped("slow_subscriber")
+//	})
+//
+// The callback is read under r.mu; the caller does NOT need to
+// hold a lock when installing — the mu acquire inside the read
+// site provides the necessary synchronisation. Calling this
+// after the ring has begun receiving writes is safe; the new
+// callback takes effect on the next commit.
+func (r *Ring) SetSlowSubscriberCallback(cb func()) {
+	r.mu.Lock()
+	r.onSlowSubscriber = cb
+	r.mu.Unlock()
 }
 
 // Write consumes a chunk of firecracker stdout/stderr bytes, splitting on
@@ -112,6 +182,25 @@ func (r *Ring) Write(stream string, p []byte) (int, error) {
 	if r.tail == nil {
 		r.tail = make([]byte, 0, len(p))
 	}
+	// Partial-line DoS guard (issue #309 / tier-2 DX, peer review
+	// of PR #728): without this cap, a guest that never sends a
+	// '\n' grows r.tail unbounded. Drop the partial bytes and
+	// start fresh — the next Write's leading bytes are the new
+	// partial-line beginning. We do NOT return an error (the
+	// io.Copy contract wants len(p), nil on success) and we do
+	// NOT increment apid_logs_dropped_total (this is a ring
+	// integrity event, not a customer log filtering event;
+	// vmmd logs the warning at the call site).
+	if len(r.tail)+len(p) > MaxPartialLineBytes {
+		r.tail = r.tail[:0]
+		if len(p) > MaxPartialLineBytes {
+			// Single Write alone exceeds the cap. Keep the
+			// tail empty and treat the bytes as dropped;
+			// the next Write starts a fresh partial.
+			r.mu.Unlock()
+			return len(p), nil
+		}
+	}
 	r.tail = append(r.tail, p...)
 	// Pull every complete line off the tail into committed Lines.
 	for {
@@ -129,7 +218,25 @@ func (r *Ring) Write(stream string, p []byte) (int, error) {
 
 // commitLocked appends one completed line to the ring, evicting the oldest
 // line(s) if totalBytes would exceed the budget. Caller holds r.mu.
+//
+// A line longer than r.maxBytes is REJECTED outright: evicting the entire
+// retained slice would not bring totalBytes below the budget (a single
+// pathological line can be larger than 10 MiB of accumulated history), and
+// admitting the line would silently inflate totalBytes past the configured
+// cap. The drop is silent at the line level — vmmd logs the warning at the
+// call site so an operator can identify the offending app. This closes the
+// "tenant-controlled output bypasses the per-instance memory bound" hole
+// the peer review of PR #728 surfaced (the size > 0 evict loop in the
+// original commit could not compensate for a single line > maxBytes).
 func (r *Ring) commitLocked(stream, line string, now time.Time) {
+	if len(line) > r.maxBytes {
+		// Pathological: a single line larger than the entire ring
+		// budget. Don't accept it; the call site (vmmd) logs at
+		// warn level so the operator sees it. We do NOT increment
+		// apid_logs_dropped_total — this is a ring-integrity
+		// event, not a customer log filtering event.
+		return
+	}
 	r.nextSeq++
 	ln := Line{
 		Seq:       r.nextSeq,
@@ -173,14 +280,33 @@ func (r *Ring) commitLocked(stream, line string, now time.Time) {
 	// to release it before sending so a slow subscriber cannot stall a
 	// producer that's still consuming firecracker stdout.
 	subs := r.subs
+	dropped := false
 	for _, ch := range subs {
 		select {
 		case ch <- ln:
 		default:
-			// Slow consumer — drop. The drop counter is surfaced
-			// at the apid layer via apid_logs_dropped_total so the
-			// §12 panel reflects the per-instance slow-consumer rate.
+			// Slow consumer — drop. The drop counter is
+			// surfaced at the apid layer via
+			// apid_logs_dropped_total so the §12 panel
+			// reflects the per-instance slow-consumer
+			// rate (issue #309 / tier-2 DX) — the
+			// onSlowSubscriber callback is the
+			// load-bearing wire hook; nil-safe for tests
+			// that don't wire metrics. The local flag
+			// (not a counter) records "any channel was
+			// full this Write" — the callback fires once
+			// per Write regardless of how many
+			// subscribers were slow, so the counter rate
+			// scales with Write events, not with
+			// subscriber count (see the
+			// TestRing_SlowSubscriberCallbackFires /
+			// MultipleFullSubscribersOneIncrement
+			// subtest in ring_test.go).
+			dropped = true
 		}
+	}
+	if dropped && r.onSlowSubscriber != nil {
+		r.onSlowSubscriber()
 	}
 }
 
