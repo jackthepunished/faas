@@ -121,6 +121,9 @@ func (r hostRuntime) Restart(ctx context.Context, _ releasebundle.Manifest) erro
 		if err := runCommand(ctx, "systemctl", "reset-failed", "faas-"+service+".service"); err != nil {
 			return err
 		}
+		if err := r.ensureRunFaasOwnership(ctx); err != nil {
+			return err
+		}
 		if err := runCommand(ctx, "systemctl", "restart", "faas-"+service+".service"); err != nil {
 			return err
 		}
@@ -129,6 +132,20 @@ func (r hostRuntime) Restart(ctx context.Context, _ releasebundle.Manifest) erro
 		}
 	}
 	return nil
+}
+
+// ensureRunFaasOwnership pins /run/faas to root:faas 0775 before each
+// service restart. The directory is owned by faas-vmmd's systemd
+// RuntimeDirectory=faas, which re-creates it as root:root 0755 on every
+// vmmd start (before ExecStartPre runs) and would otherwise leave the
+// other daemons (schedd, apid, ...) unable to bind their sockets after
+// a restart that recycles vmmd. Mirrors the cd-controlplane pre-restart
+// chown (PR-M.2) that closes the same race during the workflow deploy.
+func (r hostRuntime) ensureRunFaasOwnership(ctx context.Context) error {
+	if err := runCommand(ctx, "chown", "root:faas", "/run/faas"); err != nil {
+		return err
+	}
+	return runCommand(ctx, "chmod", "0775", "/run/faas")
 }
 
 func (r hostRuntime) Healthy(ctx context.Context, _ releasebundle.Manifest) error {
