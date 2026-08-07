@@ -397,7 +397,7 @@ const (
 	// non-default traffic_percent on a deployment. Mirrors
 	// CodePlanMinInstancesNotAllowed so the CLI renders the same
 	// "your plan doesn't allow this — upgrade" shape. The
-	// migration (00159) column default is 100, so customers
+	// migration (00160) column default is 100, so customers
 	// who never opt-in see no behavioural change; the gate
 	// only fires when a customer explicitly opts in to a
 	// non-100 traffic_percent on create or PATCH-traffic.
@@ -415,7 +415,7 @@ const (
 	// (Conflict) for the defensive backstop: post-write
 	// Σ(traffic_percent WHERE status='live') != 100. In
 	// practice this is unreachable — the schema CHECK
-	// (00159) gates the per-row range and the
+	// (00160) gates the per-row range and the
 	// UpdateDeploymentTraffic transaction zeroes siblings
 	// before stamping the target. The state layer asserts
 	// the invariant explicitly and lifts to this code if
@@ -1808,7 +1808,7 @@ func ErrPlanTrafficSplitNotAllowed(p Plan) *Problem {
 
 // ErrInvalidTrafficPercent (issue #556) is returned when the
 // requested traffic_percent is outside [0, 100] (the schema CHECK
-// in migration 00159 is the second-line defence; this surfaces
+// in migration 00160 is the second-line defence; this surfaces
 // before that check, the API gate fires first). 422 mirrors the
 // ErrInvalidMinInstances shape at line 1688 (plan-gate-first vs
 // shape-second; this is shape, so 422 not 403).

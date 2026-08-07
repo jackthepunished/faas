@@ -1,4 +1,4 @@
--- filename: 00159_deployments_traffic_percent.sql
+-- filename: 00160_deployments_traffic_percent.sql
 -- +goose Up
 -- +goose StatementBegin
 -- issue #556 / traffic splitting across deployments (PR-A: schema +

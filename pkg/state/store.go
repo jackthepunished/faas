@@ -16,7 +16,7 @@ var ErrNotFound = errors.New("state: not found")
 // ErrInvalidTrafficPercent is returned by UpdateDeploymentTraffic
 // (and the create-deployment range-check backstop) when the
 // requested traffic_percent falls outside [0, 100]. The CHECK
-// constraint on deployments.traffic_percent (migration 00159) is
+// constraint on deployments.traffic_percent (migration 00160) is
 // the schema-layer guard; this sentinel surfaces the same range
 // violation when the store is the one running the backstop
 // (UpdateDeploymentTraffic holds the FOR UPDATE lock — the handler
@@ -1373,7 +1373,7 @@ type Store interface {
 	// UpdateDeploymentTraffic stamps the per-deployment traffic-split
 	// weight (issue #556 PR-A). newPercent must be in [0, 100]; the
 	// store layer validates this in addition to the schema CHECK
-	// constraint (migration 00159). PR-A semantics: zero every
+	// constraint (migration 00160). PR-A semantics: zero every
 	// sibling live row (Σ = 100 by construction); PR-C may upgrade
 	// to proportional redistribution. Returns the refreshed row or
 	// ErrInvalidTrafficPercent / ErrTrafficPercentSumInvalid on

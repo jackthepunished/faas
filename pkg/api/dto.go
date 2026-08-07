@@ -1184,7 +1184,7 @@ type DeploymentResponse struct {
 	// pre-feature row, the handler defaults to 100 on create, and
 	// the supersede step inside CreateDeployment's transaction
 	// stamps 0 on the prior row so Σ=100 trivially for the
-	// one-live-deployment case. See migration 00159 and
+	// one-live-deployment case. See migration 00160 and
 	// pkg/state.UpdateDeploymentTraffic for the rebalance
 	// semantics.
 	TrafficPercent int `json:"traffic_percent"`

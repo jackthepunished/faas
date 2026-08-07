@@ -3992,7 +3992,7 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 //
 // Range-checking newPercent here is a backstop — the handler
 // validates [0, 100] and emits ErrInvalidTrafficPercent (422) on
-// the request path. The CHECK constraint (migration 00159) is the
+// the request path. The CHECK constraint (migration 00160) is the
 // third layer; any out-of-range value reaching this method trips a
 // 23514 SQLSTATE.
 func (s *PgStore) UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error) {

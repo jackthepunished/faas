@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00159 (deployments.traffic_percent +
+// Migration-apply test for 00160 (deployments.traffic_percent +
 // CHECK constraint). Pins the load-bearing contract from issue
 // #556 (traffic splitting across deployments, PR-A: schema +
 // validation + wire surface; picker mutation is PR-B).
 //
-//  1. The migration set applies cleanly through 00159.
+//  1. The migration set applies cleanly through 00160.
 //  2. The new column lands on deployments with the expected type
 //     and NOT NULL DEFAULT 100 shape (existing rows stay valid).
 //  3. The CHECK constraint accepts the documented [0, 100] range
@@ -29,13 +29,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00159_DeploymentTrafficPercent(t *testing.T) {
+func TestMigrations_00160_DeploymentTrafficPercent(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00159 should land last.
+	// (1) Run the full migration set. 00160 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 158 and 159)", err)
+		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 159 and 160)", err)
 	}
 
 	// (2) Column shape. Scoped to current_schema() per
@@ -85,15 +85,15 @@ func TestMigrations_00159_DeploymentTrafficPercent(t *testing.T) {
 	// (mirrors the 00147 test's pattern at lines 144-159).
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, plan, email)
-		values ('00000000-0000-0000-0000-000000000159', 'scale', 'traffic-test@example.com')
+		values ('00000000-0000-0000-0000-000000000160', 'scale', 'traffic-test@example.com')
 		on conflict (id) do nothing
 	`); err != nil {
 		t.Fatalf("seed accounts: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, type, ram_mb, max_concurrency, idle_timeout_s, status, created_at)
-		values ('00000000-0000-0000-0000-000000000159',
-		        '00000000-0000-0000-0000-000000000159',
+		values ('00000000-0000-0000-0000-000000000160',
+		        '00000000-0000-0000-0000-000000000160',
 		        'traffic-test', 'function', 256, 1, 30, 'active', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -101,7 +101,7 @@ func TestMigrations_00159_DeploymentTrafficPercent(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into deployments (app_id, image_digest, status, traffic_percent)
-		values ('00000000-0000-0000-0000-000000000159',
+		values ('00000000-0000-0000-0000-000000000160',
 		        'sha256:' || repeat('a', 64),
 		        'building',
 		        101)`); err == nil {
@@ -125,7 +125,7 @@ func TestMigrations_00159_DeploymentTrafficPercent(t *testing.T) {
 		digest := "sha256:" + strings.Repeat(string(rune('a'+i)), 64)
 		if _, err := pool.Exec(ctx, `
 			insert into deployments (app_id, image_digest, status, traffic_percent)
-			values ('00000000-0000-0000-0000-000000000159',
+			values ('00000000-0000-0000-0000-000000000160',
 			        $1,
 			        'building',
 			        $2)`, digest, v); err != nil {
