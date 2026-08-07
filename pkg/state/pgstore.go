@@ -9647,6 +9647,9 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	if rootfsKey != nil {
 		d.RootfsKey = *rootfsKey
 	}
+	if rootfsBytes != nil {
+		d.RootfsBytes = *rootfsBytes
+	}
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
 	if scanStatus != nil {
