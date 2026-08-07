@@ -139,9 +139,9 @@ func renderPoints(points []appmetrics.SparklinePoint, width, height int, color s
 		x := float64(padLeft) + step*float64(i)
 		y := float64(padTop) + innerH*(1-(p.Value-minY)/(maxY-minY))
 		if i == 0 {
-			b.WriteString(fmt.Sprintf("%.2f,%.2f", x, y))
+			fmt.Fprintf(&b, "%.2f,%.2f", x, y)
 		} else {
-			b.WriteString(fmt.Sprintf(" %.2f,%.2f", x, y))
+			fmt.Fprintf(&b, " %.2f,%.2f", x, y)
 		}
 	}
 	return fmt.Sprintf(`<polyline fill="none" stroke=%q stroke-width="1.25" stroke-linejoin="round" points="%s"/>`, color, b.String())
@@ -258,9 +258,9 @@ func RenderLatencySparkline(s LatencySparklineView, width, height int) template.
 	// future change accepts a wider input.
 	aria := escapeAttr(label)
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&b,
 		`<svg viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label=%q preserveAspectRatio="none">`,
-		width, height, width, height, aria))
+		width, height, width, height, aria)
 	if line := renderPoints(s.P50, width, height, latencyP50); line != "" {
 		b.WriteString(line)
 	}
@@ -271,6 +271,11 @@ func RenderLatencySparkline(s LatencySparklineView, width, height int) template.
 		b.WriteString(line)
 	}
 	b.WriteString(`</svg>`)
+	//nolint:gosec // G203: b.String() is a fixed-shape SVG built from
+	// floats + ints (sparkline points) + escaped aria-label + compile-time
+	// colour constants. No user-supplied string flows through — see
+	// package docstring. The template.HTML cast is load-bearing: it
+	// sidesteps html/template escaping for the pre-rendered SVG.
 	return template.HTML(b.String())
 }
 
@@ -293,9 +298,9 @@ func RenderAreaSparkline(points []appmetrics.SparklinePoint, width, height int, 
 	label := trendLabel(points)
 	aria := escapeAttr(label)
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf(
+	fmt.Fprintf(&b,
 		`<svg viewBox="0 0 %d %d" width="%d" height="%d" role="img" aria-label=%q preserveAspectRatio="none">`,
-		width, height, width, height, aria))
+		width, height, width, height, aria)
 	b.WriteString(renderArea(points, width, height, color, opacity))
 	// The line on top of the fill is a 1px stroke from the
 	// same colour so the trend is visible at small sizes.
@@ -303,6 +308,11 @@ func RenderAreaSparkline(points []appmetrics.SparklinePoint, width, height int, 
 		b.WriteString(line)
 	}
 	b.WriteString(`</svg>`)
+	//nolint:gosec // G203: b.String() is a fixed-shape SVG built from
+	// floats + ints (sparkline points) + escaped aria-label + compile-time
+	// colour constants. No user-supplied string flows through — see
+	// package docstring. The template.HTML cast is load-bearing: it
+	// sidesteps html/template escaping for the pre-rendered SVG.
 	return template.HTML(b.String())
 }
 
