@@ -123,17 +123,63 @@ before signing up.
 
 ## 7. Sub-processors
 
-The current sub-processor list is maintained at
-https://docs.gregale.dev/dpa/subprocessors and includes the categories:
+The current sub-processor list is published at
+https://docs.gregale.dev/dpa/subprocessors for advance notification
+of additions and replacements (30-day notice, see paragraph below);
+the executed sub-processor set for any signed DPA is the list
+enumerated in this section at the time of signature, and the
+notification URL is the channel by which Processor signals
+upcoming changes.
 
 - **Postgres hosting** (database): single-tenant managed Postgres
   with encryption at rest + TLS in transit. Daily encrypted
   snapshots retained 30 days.
 - **Stripe** (billing): processes card data under its own PCI-DSS
-  attestation; Processor never sees card numbers.
+  attestation; Processor never sees card numbers. Stripe is the
+  default billing provider (`FAAS_BILLING_PROVIDER` empty or
+  `=stripe`); Paddle is the opt-in alternative, see below.
+- **Paddle** (alternative billing processor, opt-in): the billing
+  provider switch (`FAAS_BILLING_PROVIDER=paddle`, ADR-025) selects
+  Paddle for the customer instead of Stripe. Paddle receives the
+  same billing data Stripe does (customer email + plan tier +
+  metered usage). Paddle Billing has no usage-summary endpoint,
+  so `ReconcileUsage` and `Refund` return `ErrNotImplemented` for
+  Paddle accounts (issue #279); the §10 (breach notification) and
+  §11 (data return on termination) obligations bind Processor
+  regardless of the billing provider in use.
 - **Resend / Postmark** (transactional email): receives recipient
   address + subject + body. Email bodies contain no end-user
-  personal data — they target the account holder only.
+  personal data — they target the account holder only. Today the
+  platform default is `log` (writes to slog; no third-party
+  processing of customer email). Production wires
+  `FAAS_MAIL_TRANSPORT=resend` or `=postmark` to send real email.
+- **Hetzner Storage Box** (off-host encrypted backups): the Postgres
+  backup cron (`deploy/ansible/roles/postgres_backup/tasks/main.yml`)
+  pushes an encrypted pg_dump to the customer's storage box via
+  rclone. Backups are encrypted with the operator's host X25519
+  age recipient (the key sealed at `/etc/faas/secrets/host.age`,
+  ADR-020) **before** transit; the storage box sees ciphertext
+  only. The customer's own storage box is the Processor-side
+  target; Processor holds the decryption key but does not access
+  backup contents absent a Controller-initiated restore request.
+- **Google** (OAuth identity provider): account holders who choose
+  Google login exchange the OAuth subject (`sub`) and a verified
+  email address — and the optional profile name and avatar URL —
+  at `POST /v1/auth/google/callback`. No contact list, no Drive,
+  no repo list. Scopes are `openid email profile`.
+- **GitHub** (OAuth identity provider): account holders who choose
+  GitHub login exchange the GitHub user-id, the primary verified
+  email address, and the login handle — and the optional name and
+  avatar URL — at `POST /v1/auth/github/callback`. No repo list,
+  no contact list, no org list. Scopes are `read:user user:email`.
+- **GitHub Checks API + install-token exchange** (outbound from
+  githubd): the `githubd` daemon is the only outbound caller to
+  `api.github.com`. The outbound traffic carries SHA-only commit
+  metadata (Checks) and OAuth install-token exchange — no
+  customer PII. Inbound webhook reception at
+  `POST /webhooks/github` is HMAC-SHA-256 verified
+  (`X-Hub-Signature-256`, constant-time compare) before any
+  payload is consumed.
 
 Processor shall notify Controller at least 30 days before adding a
 new sub-processor. Controller may object on reasonable
