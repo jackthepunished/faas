@@ -1136,13 +1136,9 @@ func (b *blockingReader) exited() bool {
 // fakeRawBidiStream — the production code's bidi stream variable
 // is this wrapper directly (cli.ForwardRawStream returns
 // f.RawStream), so Send/CloseSend must live on the wrapper, not
-// delegate to an inner. Sends are tracked for forensics (the
-// test asserts closeSendCalled; Send bookkeeping is unused here).
+// delegate to an inner.
 type blockingRawBidiStream struct {
 	ctx           context.Context
-	mu            sync.Mutex
-	sends         []*vmmdpb.ForwardRawRequest
-	closed        bool
 	closeSendFlag atomic.Bool
 	recvExitFlag  atomic.Bool
 }
@@ -1155,21 +1151,10 @@ func (s *blockingRawBidiStream) recvExited() bool {
 	return s.recvExitFlag.Load()
 }
 
-func (s *blockingRawBidiStream) sentCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.sends)
-}
-
-// Wrap the inner fake's methods so Recv blocks on ctx and CloseSend
-// signals the test.
 func (s *blockingRawBidiStream) HeaderStream() grpc.ClientStream { return nil }
 func (s *blockingRawBidiStream) TrailerOnly() bool               { return false }
 
-func (s *blockingRawBidiStream) Send(req *vmmdpb.ForwardRawRequest) error {
-	s.mu.Lock()
-	s.sends = append(s.sends, req)
-	s.mu.Unlock()
+func (s *blockingRawBidiStream) Send(_ *vmmdpb.ForwardRawRequest) error {
 	return nil
 }
 
@@ -1185,9 +1170,6 @@ func (s *blockingRawBidiStream) Recv() (*vmmdpb.ForwardRawResponse, error) {
 
 func (s *blockingRawBidiStream) CloseSend() error {
 	s.closeSendFlag.Store(true)
-	s.mu.Lock()
-	s.closed = true
-	s.mu.Unlock()
 	return nil
 }
 
