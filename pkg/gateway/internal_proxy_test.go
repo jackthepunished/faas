@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -24,6 +26,13 @@ type stubDialer struct {
 	server *httptest.Server
 	// dialErr overrides the dial return when non-nil.
 	dialErr error
+	// dialBlock, when non-nil, makes DialContext wait on the channel
+	// (or the supplied ctx's Done) before returning. Used by
+	// TestInternalReverseProxy_DialTimeout_ScopeOnlyDial (issue
+	// #687) to exercise the dial-timeout scope: the dial blocks
+	// forever; the transport-level dial timeout must abort the dial
+	// without affecting RoundTrip.
+	dialBlock chan struct{}
 }
 
 func (d *stubDialer) DialContext(ctx context.Context, target string) (net.Conn, error) {
@@ -32,6 +41,16 @@ func (d *stubDialer) DialContext(ctx context.Context, target string) (net.Conn, 
 	d.mu.Unlock()
 	if d.dialErr != nil {
 		return nil, d.dialErr
+	}
+	if d.dialBlock != nil {
+		// Wait for ctx to cancel (the transport's dial-timeout
+		// wraps the caller's ctx with WithTimeout) OR for the
+		// test to close the channel (success path).
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-d.dialBlock:
+		}
 	}
 	return net.Dial("tcp", d.server.Listener.Addr().String())
 }
@@ -364,5 +383,246 @@ func TestInternalReverseProxy_StripsCaseInsensitiveUpgrade(t *testing.T) {
 	}
 	if gotUpgrade != "websocket" {
 		t.Errorf("Upgrade header = %q, want websocket (preserved)", gotUpgrade)
+	}
+}
+
+// flushingRecorder is an io.Writer that counts Flush() calls so
+// TestCopyResponseBody_FlushesPerChunk can pin the per-Write
+// flush contract introduced by the issue #687 fix. It
+// implements http.Flusher so the type assertion in
+// copyResponseBody succeeds.
+//
+// flushes is read by the test after the copy completes; Write
+// is delegated to an internal bytes.Buffer so the test can also
+// assert the bytes that were written.
+type flushingRecorder struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	flushes int
+}
+
+func (f *flushingRecorder) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buf.Write(p)
+}
+
+func (f *flushingRecorder) Flush() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flushes++
+}
+
+func (f *flushingRecorder) flushCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.flushes
+}
+
+func (f *flushingRecorder) bytes() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buf.String()
+}
+
+// chunkedReader is an io.ReadCloser that emits N chunks of
+// `size` bytes with a configurable gap between. The cancel
+// goroutine can Close() it to unblock a pending Read mid-copy.
+type chunkedReader struct {
+	mu       sync.Mutex
+	chunks   int
+	size     int
+	gap      time.Duration
+	closed   bool
+	cancelRd chan struct{}
+}
+
+func newChunkedReader(chunks, size int, gap time.Duration) *chunkedReader {
+	return &chunkedReader{
+		chunks:   chunks,
+		size:     size,
+		gap:      gap,
+		cancelRd: make(chan struct{}),
+	}
+}
+
+func (c *chunkedReader) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return 0, io.ErrClosedPipe
+	}
+	if c.chunks <= 0 {
+		return 0, io.EOF
+	}
+	c.chunks--
+	if c.gap > 0 {
+		time.Sleep(c.gap)
+	}
+	for i := 0; i < c.size && i < len(p); i++ {
+		p[i] = 'x'
+	}
+	return c.size, nil
+}
+
+func (c *chunkedReader) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.closed = true
+		close(c.cancelRd)
+	}
+	return nil
+}
+
+// TestCopyResponseBody_FlushesPerChunk pins the issue #687
+// per-Write Flush contract: an http.Flusher dst sees one
+// Flush() call per non-empty Read, so SSE / chunked-JSON
+// customers see flushes at chunk boundaries (not at the 32 KiB
+// io.Copy buffer boundary that the pre-fix shape used).
+func TestCopyResponseBody_FlushesPerChunk(t *testing.T) {
+	rec := &flushingRecorder{}
+	src := io.NopCloser(io.Reader(newChunkedReader(3, 1024, 0)))
+	n, err := copyResponseBody(context.Background(), rec, src)
+	if err != nil {
+		t.Fatalf("copyResponseBody err = %v, want nil", err)
+	}
+	if n != 3*1024 {
+		t.Errorf("bytes copied = %d, want 3072", n)
+	}
+	if got := rec.flushCount(); got < 3 {
+		t.Errorf("Flush count = %d, want >= 3 (one per chunk)", got)
+	}
+	if got := rec.bytes(); len(got) != 3*1024 {
+		t.Errorf("dst bytes = %d, want 3072", len(got))
+	}
+}
+
+// TestCopyResponseBody_CancelReleasesStreamWindow pins the
+// issue #687 goroutine-leak fix: when ctx cancels mid-stream,
+// copyResponseBody closes src (so the upstream unix socket sees
+// the FIN and the H2C stream window is released) AND waits for
+// the goroutine to exit before returning, so the no-leak
+// assertion is deterministic.
+//
+// Pre-fix: function returned ctx.Err() immediately, leaving the
+// io.Copy goroutine alive reading from src until EOF. Under H2C
+// one unix-socket connection carries many multiplexed streams;
+// a stuck reader holds the connection's stream window open.
+func TestCopyResponseBody_CancelReleasesStreamWindow(t *testing.T) {
+	rec := &flushingRecorder{}
+	src := newChunkedReader(100000, 1024, 10*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		n   int64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := copyResponseBody(ctx, rec, src)
+		done <- result{n, err}
+	}()
+
+	// Let one or two chunks land, then cancel.
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", r.err)
+		}
+		// The cancel arm returns (0, ctx.Err()) — bytes-written-
+		// so-far is not meaningful to the caller once the stream
+		// has been cut. The load-bearing assertion is that
+		// copyResponseBody returned within 2 s AND src was
+		// closed (the no-leak contract).
+		if r.n < 0 || r.n >= 100*1024 {
+			t.Errorf("n = %d, want 0..<%d (cancel must return promptly)", r.n, 100*1024)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("copyResponseBody did not return within 2s of ctx cancel")
+	}
+
+	src.mu.Lock()
+	closed := src.closed
+	src.mu.Unlock()
+	if !closed {
+		t.Error("src was not closed on ctx cancel — H2C stream window leak regressed")
+	}
+}
+
+// TestInternalReverseProxy_DialTimeout_ScopeOnlyDial pins the
+// issue #687 DialTimeout-scope fix: the dial step is bounded by
+// p.DialTimeout (50 ms in this test), but RoundTrip runs on the
+// inbound request context. A dial that blocks forever must
+// abort at the dial-timeout deadline; the proxy must NOT wait
+// for any longer RoundTrip-level timeout.
+//
+// Pre-fix: ctx was wrapped with WithTimeout(p.DialTimeout)
+// before RoundTrip, so the dial timeout applied to the entire
+// upstream read — including the body copy. Post-fix: the dial
+// timeout applies only inside DialContext; RoundTrip has the
+// inbound deadline.
+func TestInternalReverseProxy_DialTimeout_ScopeOnlyDial(t *testing.T) {
+	dialer := &stubDialer{dialBlock: make(chan struct{})}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
+	p.DialTimeout = 50 * time.Millisecond
+	p.Transport = p.buildTransport(dialer, false)
+
+	start := time.Now()
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/hello", nil))
+	elapsed := time.Since(start)
+
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("elapsed = %v, want < 500ms (dial should abort at ~50ms)", elapsed)
+	}
+	if rr.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 (dial failed)", rr.Code)
+	}
+}
+
+// TestInternalReverseProxy_LongStreaming_NotCutByDialTimeout
+// pins the negative case of the DialTimeout-scope fix: even
+// though the dial timeout is short (50 ms), the body copy must
+// run on the inbound request context — so a long-running
+// streaming response from a cold-wake app reaches the customer
+// in full.
+//
+// Pre-fix: ctx was wrapped with WithTimeout(p.DialTimeout) at
+// the ServeHTTP entry, so a 50 ms dial timeout cut a 60-second
+// streaming response at 50 ms. Post-fix: the dial timeout
+// scopes only the dial step.
+func TestInternalReverseProxy_LongStreaming_NotCutByDialTimeout(t *testing.T) {
+	const totalChunks = 200
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < totalChunks; i++ {
+			_, _ = w.Write(make([]byte, 1024))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	dialer := &stubDialer{server: upstream}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
+	p.DialTimeout = 50 * time.Millisecond
+	p.Transport = p.buildTransport(dialer, false)
+
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/stream", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (long body should not be cut by DialTimeout)", rr.Code)
+	}
+	if got := rr.Body.Len(); got != totalChunks*1024 {
+		t.Errorf("body bytes = %d, want %d (full streaming response must reach customer)", got, totalChunks*1024)
 	}
 }
