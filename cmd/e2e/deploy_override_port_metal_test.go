@@ -116,7 +116,7 @@ func TestDeployOverridePortMetal(t *testing.T) {
 	raw, status := postMultipartDeploymentWithOverrides(t, h, key, slug, src, false, &api.CreateDeploymentOverrides{
 		Port: 9090,
 		Env:  map[string]string{"PORT": "9090"},
-	})
+	}, "")
 	if status != http.StatusAccepted {
 		t.Fatalf("create deployment: status=%d body=%s", status, raw)
 	}

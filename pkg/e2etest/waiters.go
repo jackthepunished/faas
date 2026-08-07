@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -187,4 +188,103 @@ func WaitForBuildStatus(ctx context.Context, t T, pool *pgxpool.Pool, buildID st
 type T interface {
 	Helper()
 	Fatalf(format string, args ...any)
+	Logf(format string, args ...any)
+}
+
+// WaitForWakeMethod polls the events table (via
+// state.PgStore.ListEventsByWakeID) until a wake.boot_completed event tied
+// to wakeID is observed whose decoded payload's `method` field equals want,
+// or the deadline fires.
+//
+// Why boot_completed (not boot_started): schedd emits boot_started with the
+// PLANNED method (`"restore"` if a usable snapshot exists, `"cold_boot"`
+// otherwise — pkg/sched/engine.go:1430-1699), then re-emits boot_completed
+// with the AUTHORITATIVE method after vmmd's bringUp returns. A planned
+// restore that fails in vmmd falls back to cold boot and the boot_completed
+// event correctly reports `"cold_boot"`. That's the whole point of the
+// stale-snapshot fallback subtest in DEPLOY-PROV-1 issue #735 /
+// cmd/e2e/source_deploy_wake_metal_test.go.
+//
+// want must be one of "restore" or "cold_boot" (the closed set
+// pkg/fcvm/snapshot.go's WakeMethod.String() emits). Any other value is
+// treated as a test bug and surfaced via the returned error.
+//
+// Returns the matched event so the caller can read WakeID / InstanceID for
+// logging context on assertion failure. On deadline, returns the last
+// observed boot_completed event (if any) and an error describing the
+// observed vs want methods.
+func WaitForWakeMethod(ctx context.Context, t T, pool *pgxpool.Pool, wakeID, want string, deadline time.Duration) (state.Event, error) {
+	t.Helper()
+	// Closed-set validation per the doc comment: any value other than
+	// "restore" / "cold_boot" is a test bug and would otherwise silently
+	// poll until timeout. Reject early so the failure surfaces at the
+	// call site with a precise message.
+	switch want {
+	case "restore", "cold_boot":
+	default:
+		return state.Event{}, fmt.Errorf("WaitForWakeMethod: invalid want=%q; must be one of {restore, cold_boot}", want)
+	}
+	// Derive a query timeout from deadline so a blocked ListEventsByWakeID
+	// call (e.g., DB stuck on a slow connection) cannot outlive the
+	// deadline and stall the loop indefinitely. Use 90% of deadline so
+	// the per-tick select still gets a chance to observe ctx.Done()
+	// first.
+	queryCtx, queryCancel := context.WithTimeout(ctx, time.Duration(float64(deadline)*0.9))
+	defer queryCancel()
+	store := state.NewPgStore(pool)
+	end := time.Now().Add(deadline)
+	poll := time.NewTicker(200 * time.Millisecond)
+	defer poll.Stop()
+	var last state.Event
+	for {
+		evs, err := store.ListEventsByWakeID(queryCtx, wakeID, time.Time{}, 100)
+		if err != nil {
+			return last, fmt.Errorf("list events by wake_id %s: %w", wakeID, err)
+		}
+		for _, ev := range evs {
+			if ev.Kind != events.WakeBootCompleted {
+				continue
+			}
+			last = ev
+			var payload struct {
+				Method string `json:"method"`
+			}
+			if err := json.Unmarshal(ev.Data, &payload); err != nil {
+				return last, fmt.Errorf("decode wake.boot_completed data for wake_id %s: %w (raw=%s)", wakeID, err, string(ev.Data))
+			}
+			if payload.Method == want {
+				return ev, nil
+			}
+			// Wrong method — keep polling only if the deadline allows it;
+			// the fall-back case means schedd may emit a second
+			// boot_completed after the first restore attempt fails, so a
+			// single "cold_boot" then "restore" sequence is also valid.
+			// Surface the mismatch but don't return early on the first
+			// mismatch; the deadline will catch a stuck wrong-method wake.
+			t.Logf("WaitForWakeMethod: wake_id=%s boot_completed method=%q (want %q); continuing", wakeID, payload.Method, want)
+		}
+		if !time.Now().Before(end) {
+			if last.Data != nil {
+				return last, fmt.Errorf("deadline %s reached before wake_id %s method=%s (last observed boot_completed method=%s)", deadline, wakeID, want, lastMethodFromRaw(last.Data))
+			}
+			return last, fmt.Errorf("deadline %s reached before any wake.boot_completed event for wake_id %s", deadline, wakeID)
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-poll.C:
+		}
+	}
+}
+
+// lastMethodFromRaw is a tiny helper that pulls the `method` field out of
+// an already-decoded boot_completed payload for the failure-log message.
+// Kept separate from the unmarshal inside the loop so the failure path
+// doesn't repeat a json.Unmarshal that's already been done.
+func lastMethodFromRaw(raw json.RawMessage) string {
+	var p struct {
+		Method string `json:"method"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	return p.Method
 }
