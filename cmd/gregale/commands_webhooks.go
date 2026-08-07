@@ -54,7 +54,7 @@ func strInSlice(v string, s []string) bool {
 
 func cmdWebhooks(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale webhooks <list|add|update|rm|deliveries|retry|rotate-secret> [args]", "webhooks")
+		PrintUsage(os.Stderr, "usage: gregale webhooks <list|add|info|update|rm|deliveries|retry|rotate-secret> [args]", "webhooks")
 		return 1
 	}
 	switch args[0] {
@@ -62,6 +62,13 @@ func cmdWebhooks(args []string) int {
 		return cmdWebhooksList(args[1:])
 	case subAdd:
 		return cmdWebhooksAdd(args[1:])
+	case "info":
+		// Tier C audit gap: GET /v1/apps/{slug}/webhooks/{id}
+		// returns the single webhook row (AppWebhookResponse).
+		// Surfaces the masked sealed-secret sentinel — the
+		// plaintext is never returned to the customer
+		// (pkg/api/webhooks.go:230-233).
+		return cmdWebhookInfo(args[1:])
 	case subUpdate:
 		return cmdWebhooksUpdate(args[1:])
 	case subRm:
@@ -269,6 +276,47 @@ func cmdWebhookDeliveries(args []string) int {
 	if out.NextToken != "" {
 		fmt.Fprintf(os.Stderr, "next page: --page-token %s\n", out.NextToken)
 	}
+	return 0
+}
+
+// cmdWebhookInfo fetches GET /v1/apps/{slug}/webhooks/{id} and
+// renders the row. The plaintext secret is NEVER returned by the
+// server (pkg/api/webhooks.go:230-233) — only the masked
+// WebhookSecretSealedMasked sentinel is shown.
+func cmdWebhookInfo(args []string) int {
+	fs := flag.NewFlagSet("webhooks-info", flag.ContinueOnError)
+	slug := fs.String("app", "", "app slug (required)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *slug == "" || fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale webhooks info --app <slug> <webhook-id>", "webhooks")
+		return 1
+	}
+	id := fs.Arg(0)
+	if !webhookIDPattern.MatchString(id) {
+		return printErr("Invalid webhook id", fmt.Errorf("must be a 32-hex-char UUID; got %q", id))
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	w, err := client.GetAppWebhook(context.Background(), *slug, id)
+	if err != nil {
+		return printErr("Fetch failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(w))
+	}
+	fmt.Printf("id:         %s\n", w.ID)
+	fmt.Printf("app_id:     %s\n", w.AppID)
+	fmt.Printf("target_url: %s\n", w.TargetURL)
+	fmt.Printf("secret:     %s (plaintext never returned)\n", w.WebhookSecretSealedMasked)
+	fmt.Printf("events:     %s\n", strings.Join(w.EventFilter, ","))
+	fmt.Printf("retry:      %s\n", w.RetryPolicy)
+	fmt.Printf("enabled:    %t\n", w.Enabled)
+	fmt.Printf("created_at: %s\n", w.CreatedAt)
+	fmt.Printf("updated_at: %s\n", w.UpdatedAt)
 	return 0
 }
 

@@ -15,6 +15,10 @@
 // `--json` follows the global jsonOutput convention (json_flag.go):
 // NDJSON for slices, indented JSON for scalars. The DTO is
 // AppMetricsResponse (pkg/api/dto.go:1087); no client-side reshaping.
+//
+// Tier C extension: --account flips to GET /v1/apps/metrics (the
+// account-wide rollup, issue #393) and renders the per-slug map.
+// --account is mutually exclusive with the positional <slug>.
 package main
 
 import (
@@ -31,32 +35,50 @@ import (
 // metricsCmdUsage is the top-of-failure-line shown for `gregale metrics`
 // errors. Mirrors PrintUsage's docs URL convention (output.go:144) so
 // the line carries the stable docs site pointer.
-const metricsCmdUsage = "usage: gregale metrics <slug> [--range 5m]"
+const metricsCmdUsage = "usage: gregale metrics <slug> [--range 5m] | --account [--range 5m]"
 
 // metricsCmdDocsTopic is the docs topic slug appended to docsURLBase
 // when PrintUsage emits the trailing "Docs:" row. Keeps the CLI's
 // help line stable across command additions.
 const metricsCmdDocsTopic = "metrics"
 
-// cmdMetrics implements `gregale metrics <slug> [--range 5m]`. Mirrors
-// the read shape of cmdDeployment (commands_deployments.go:139) —
-// single positional slug + a few flags, JSON single record, human
-// multi-line detail block.
+// cmdMetrics implements `gregale metrics <slug> [--range 5m]` and
+// `gregale metrics --account [--range 5m]`. Mirrors the read shape
+// of cmdDeployment (commands_deployments.go:139) — single positional
+// slug + a few flags, JSON single record, human multi-line detail
+// block. --account (Tier C) hits the account-wide rollup endpoint
+// instead and renders one labelled block per app.
 func cmdMetrics(args []string) int {
 	fs := flag.NewFlagSet("metrics", flag.ContinueOnError)
 	rng := fs.String("range", "5m", "time window (5m, 15m, 1h, 6h, 24h)")
+	account := fs.Bool("account", false, "account-wide rollup (GET /v1/apps/metrics) — mutually exclusive with <slug>")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if *account && fs.NArg() != 0 {
 		PrintUsage(os.Stderr, metricsCmdUsage, metricsCmdDocsTopic)
 		return 1
 	}
-	slug := fs.Arg(0)
+	if !*account && fs.NArg() != 1 {
+		PrintUsage(os.Stderr, metricsCmdUsage, metricsCmdDocsTopic)
+		return 1
+	}
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
+	if *account {
+		m, err := client.GetAppsMetrics(context.Background(), *rng)
+		if err != nil {
+			return printErr("Could not fetch metrics", err)
+		}
+		if jsonOutput {
+			return jsonOut(writeJSON(m))
+		}
+		renderAppsMetrics(osStdout, m)
+		return 0
+	}
+	slug := fs.Arg(0)
 	m, err := client.GetAppMetrics(context.Background(), slug, *rng)
 	if err != nil {
 		return printErr("Could not fetch metrics", err)
@@ -94,5 +116,56 @@ func renderAppMetrics(w io.Writer, m api.AppMetricsResponse) {
 	_, _ = fmt.Fprintf(w, "Cold boot:  %.2f%%\n", m.ColdStartPct)
 	if m.WakeP95MS > 0 {
 		_, _ = fmt.Fprintf(w, "Wake p95:   %.0fms (fleet-wide)\n", m.WakeP95MS)
+	}
+}
+
+// renderAppsMetrics writes the human-mode labelled block for an
+// account-wide AppsMetricsResponse (issue #393). One range/as_of/
+// source header, then one App: <slug> block per row in the Apps
+// map. Sort order follows the dashboard's table view — alphabetical
+// by slug — so terminal output is stable across calls.
+//
+// When Source is degraded we render the warning once at the top so
+// every zero the operator sees below is interpreted correctly
+// (Prometheus isn't reachable, not a customer app bug).
+func renderAppsMetrics(w io.Writer, m api.AppsMetricsResponse) {
+	if m.Source != "" && m.Source != appmetrics.SourcePrometheus {
+		_, _ = fmt.Fprintf(w, "Note: source=%s (values below are zero — Prometheus is unavailable)\n", m.Source)
+	}
+	_, _ = fmt.Fprintf(w, "Range:      %s\n", m.Range)
+	if m.AsOf != "" {
+		_, _ = fmt.Fprintf(w, "As of:      %s\n", m.AsOf)
+	}
+	if m.Source != "" {
+		_, _ = fmt.Fprintf(w, "Source:     %s\n", m.Source)
+	}
+	if len(m.Apps) == 0 {
+		_, _ = fmt.Fprintln(w, "(no apps with metrics in window)")
+		return
+	}
+	slugs := make([]string, 0, len(m.Apps))
+	for s := range m.Apps {
+		slugs = append(slugs, s)
+	}
+	sortStrings(slugs)
+	for _, s := range slugs {
+		row := m.Apps[s]
+		_, _ = fmt.Fprintf(w, "\nApp:        %s\n", s)
+		_, _ = fmt.Fprintf(w, "  Requests:   %d\n", row.RequestCount)
+		_, _ = fmt.Fprintf(w, "  Latency:    p50=%.1fms p95=%.1fms p99=%.1fms\n", row.LatencyP50MS, row.LatencyP95MS, row.LatencyP99MS)
+		_, _ = fmt.Fprintf(w, "  Error rate: %.2f%%\n", row.ErrorRatePct)
+		_, _ = fmt.Fprintf(w, "  Cold boot:  %.2f%%\n", row.ColdStartPct)
+	}
+}
+
+// sortStrings is a tiny helper to keep renderAppsMetrics deterministic
+// without pulling sort into the import block for one call site.
+// The slice is small (per-app count for one account) — insertion-sort
+// is fine and keeps the file self-contained.
+func sortStrings(xs []string) {
+	for i := 1; i < len(xs); i++ {
+		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
+			xs[j-1], xs[j] = xs[j], xs[j-1]
+		}
 	}
 }
