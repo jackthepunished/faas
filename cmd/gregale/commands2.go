@@ -30,6 +30,12 @@ const (
 	subUpdate  = "update"
 	subRm      = "rm"
 	subSummary = "summary"
+	// subLogsTail is the inner-subcommand name for `gregale logs
+	// tail <slug>` (issue #315 / tier-2 DX). Lifted from the
+	// inline literal at commands2.go:1719 + main.go:252 so goconst
+	// stops flagging the three occurrences (two source +
+	// PrintUsage doc line).
+	subLogsTail = "tail"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -1716,7 +1722,7 @@ func validateRepoSlug(s string) error {
 // (e.g. `logs list` for batch tail of all app's deployments) without
 // a wire-format break.
 func cmdLogs(args []string) int {
-	if len(args) > 0 && args[0] == "tail" {
+	if len(args) > 0 && args[0] == subLogsTail {
 		return cmdLogsTail(args[1:])
 	}
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)

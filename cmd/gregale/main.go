@@ -48,6 +48,7 @@ Commands:
   env          Pull/push .env <-> sealed secrets (--app <slug>)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
+  invocation   Get one invocation by id (--json) or re-issue a failed one (--replay)
   invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
   invoices     List issued invoices
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
@@ -263,6 +264,13 @@ func run(args []string) int {
 		// Same data shape the dashboard panel renders, in the
 		// terminal where the rest of the debugging happens.
 		return cmdMetrics(args[1:])
+	case "invocation":
+		// Issue #315 (tier-2 DX): CLI twin for GET
+		// /v1/invocations/{id} (read) + POST
+		// /v1/invocations/{id}/replay. Surfaces the same
+		// labelled-block shape as `gregale metrics` so the
+		// post-incident muscle memory is one shape.
+		return cmdInvocation(args[1:])
 	case "slo":
 		// Move 2 PR-A: CLI twin for GET /v1/apps/{slug}/slo
 		// (issue #696 / ADR-082). Closed-set windowed SLO

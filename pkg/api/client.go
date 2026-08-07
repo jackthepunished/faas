@@ -953,6 +953,22 @@ func (c *Client) GetInvocation(ctx context.Context, id string) (Invocation, erro
 	return out, c.do(ctx, "GET", "/v1/invocations/"+id, nil, &out)
 }
 
+// ReplayInvocation re-issues a failed invocation. The server
+// enqueues a fresh async invocation carrying the original payload,
+// headers, method, and path; returns 202 + AsyncInvokeResponse on
+// success and 409 if the original is not in a replayable state (the
+// handler's allow-list is {failed, dead_letter} — see
+// cmd/apid/handlers_invocations.go::replayInvocation for the source
+// of truth, issue #315 tier-2 DX).
+//
+// Account-scoped: a customer can't replay another tenant's
+// invocation; the server surfaces ErrInvocationNotFound in that
+// case (same IDOR-safe path as GetInvocation).
+func (c *Client) ReplayInvocation(ctx context.Context, id string) (AsyncInvokeResponse, error) {
+	var out AsyncInvokeResponse
+	return out, c.do(ctx, "POST", "/v1/invocations/"+id+"/replay", nil, &out)
+}
+
 // API keys.
 //
 // CreateKey accepts an explicit scopes slice. Pass nil to preserve the

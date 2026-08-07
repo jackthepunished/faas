@@ -25,6 +25,13 @@ import (
 
 // --- decodeJSONLimit --------------------------------------------------------
 
+// defaultInvokeMethod is the fallback method for async / sync
+// invoke requests that omit the body's method field. Lifted to a
+// constant so goconst stops flagging the repeated literal across
+// the three handlers that default it (issue #315 / tier-2 DX
+// added the third occurrence in replayInvocation).
+const defaultInvokeMethod = "POST"
+
 // decodeJSONLimit is a MaxBytesReader-wrapped variant of decodeJSON.
 // The plan's MaxSourceBytesPerInvocation caps each event-driven payload
 // (Hobby 64 KB, Pro 256 KB, Scale 1 MB); anything larger is a 413, not
@@ -78,7 +85,7 @@ func (s *server) invokeAppAsync(w http.ResponseWriter, r *http.Request, acct sta
 		return
 	}
 	if req.Method == "" {
-		req.Method = "POST"
+		req.Method = defaultInvokeMethod
 	}
 	if req.Path == "" {
 		req.Path = "/"
@@ -124,7 +131,7 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 	if req.Method == "" {
-		req.Method = "POST"
+		req.Method = defaultInvokeMethod
 	}
 	if req.Path == "" {
 		req.Path = "/"
@@ -473,4 +480,60 @@ func (s *server) getInvocation(w http.ResponseWriter, r *http.Request, acct stat
 		return
 	}
 	writeJSON(w, http.StatusOK, inv)
+}
+
+// replayInvocation re-issues a failed or dead_letter invocation
+// against the original's app + instance (issue #315 / tier-2 DX).
+// The replayed row is a fresh async invocation: Source='replay'
+// (stamped via the new migration 00159), the original payload +
+// headers + method + path are carried verbatim, and the customer
+// polls the new id via /v1/invocations/{newID}.
+//
+// The state allow-list is {failed, dead_letter}. Anything else
+// (pending, dispatching, completed, cancelled) returns 409
+// ErrInvocationNotReplayable — re-running a successful invocation
+// is a customer bug, not a flow we want to enable by accident.
+//
+// Account-scoped: cross-tenant access returns 404 (same IDOR-safe
+// path as getInvocation). Replay carries the customer's auth
+// context; the original's AccountID is never reused — we always
+// stamp acct.ID on the new row.
+func (s *server) replayInvocation(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	orig, err := s.store.InvocationByID(r.Context(), id)
+	if err != nil || orig.AccountID != acct.ID {
+		// Same 404 path as getInvocation — IDOR-safe. Don't
+		// surface 403 on a cross-tenant attempt; that would
+		// leak the existence of the row.
+		api.WriteProblem(w, api.ErrInvocationNotFound(id))
+		return
+	}
+	if orig.State != state.InvocationFailed && orig.State != state.InvocationDeadLetter {
+		api.WriteProblem(w, api.ErrInvocationNotReplayable(string(orig.State)))
+		return
+	}
+	// Re-issue the original against the same app; DueAt is "now"
+	// (the customer is replaying interactively, not on a schedule).
+	// Attempts is reset to 0 — the drain increments it on the new
+	// lifecycle. LeaseExpiresAt / ReceivedAt / CompletedAt / Result /
+	// LastError / AckURL are nil on a fresh INSERT; the drain
+	// populates them as the row flows through dispatch.
+	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
+		AppID:     orig.AppID,
+		AccountID: acct.ID,
+		Source:    state.InvocationReplay,
+		Method:    orig.Method,
+		Path:      orig.Path,
+		Payload:   orig.Payload,
+		Headers:   orig.Headers,
+		DueAt:     time.Now().UTC(),
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("enqueue replay invocation"))
+		return
+	}
+	writeJSON(w, http.StatusAccepted, api.AsyncInvokeResponse{
+		ID:        inv.ID,
+		StatusURL: "/v1/invocations/" + inv.ID,
+	})
 }
