@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -40,7 +41,7 @@ import (
 // namespacing across all three surfaces.
 func cmdOrgs(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale orgs <list|create|info|rm|members|invitations|keys|transfer-ownership|seat-usage> [args]", "orgs")
+		PrintUsage(os.Stderr, "usage: gregale orgs <list|create|info|update|rm|members|invitations|keys|transfer-ownership|seat-usage> [args]", "orgs")
 		return 1
 	}
 	switch args[0] {
@@ -50,6 +51,8 @@ func cmdOrgs(args []string) int {
 		return cmdOrgsCreate(args[1:])
 	case subInfo:
 		return cmdOrgsInfo(args[1:])
+	case subUpdate:
+		return cmdOrgsUpdate(args[1:])
 	case subRm:
 		return cmdOrgsRm(args[1:])
 	case "members":
@@ -850,4 +853,99 @@ func cmdOrgsInvitationsListAll(args []string) int {
 		fmt.Printf("%-36s %-30s %-12s %-10s %s\n", inv.ID, inv.Email, inv.Role, inv.Status, inv.ExpiresAt)
 	}
 	return 0
+}
+
+// cmdOrgsUpdate implements `gregale orgs update --org <slug>
+// [--name <text>] [--plan <free|hobby|pro|scale>]` (PATCH /v1/orgs/{slug},
+// issue #190 / ADR-061).
+//
+// Mirrors cmdAlertUpdate (commands_alerts.go:245): pointer-everything
+// request so the wire body carries only the fields the operator
+// actually set. fs.Visit would help for *bool, but Name/Plan are
+// pointer strings — the empty-string sentinel is already enough to
+// distinguish "omit" from "set to empty" because an org name is
+// required (handlers_orgs.go:rename_validate) so --name "" would
+// always fail closed at the handler anyway.
+//
+// Authz: name write requires OrgActionManageBilling (owner + billing
+// roles); plan change requires OrgActionChangePlan (owner only).
+// The server is the source of truth — the CLI never tries to model
+// role-gated branching locally.
+//
+// Output: --json emits the full OrgResponse; human mode prints a
+// one-line confirmation echoing only the fields the operator sent
+// (the server returns the post-patch state for both, but echoing
+// the input keeps the result visible without re-reading).
+func cmdOrgsUpdate(args []string) int {
+	fs := flag.NewFlagSet("orgs update", flag.ContinueOnError)
+	slug := fs.String("org", "", "org slug (required, OrgSlugPattern)")
+	name := fs.String("name", "", "new display name (1..120 chars; non-empty)")
+	plan := fs.String("plan", "", "new plan (free|hobby|pro|scale)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if !validateOrgsUpdateFlags(slug, name, plan) {
+		return 1
+	}
+	req := api.PatchOrgRequest{}
+	if *name != "" {
+		s := *name
+		req.Name = &s
+	}
+	if *plan != "" {
+		p := *plan
+		req.Plan = &p
+	}
+	if req.Name == nil && req.Plan == nil {
+		PrintUsage(os.Stderr, "usage: gregale orgs update --org <slug> [--name <text>] [--plan <free|hobby|pro|scale>]", "orgs")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.PatchOrg(context.Background(), *slug, req)
+	if err != nil {
+		return printErr("Update failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	PrintOK(osStdout, "Org %s updated.", resp.Slug)
+	if req.Name != nil {
+		_, _ = fmt.Fprintf(osStdout, "  name:  %s\n", *req.Name)
+	}
+	if req.Plan != nil {
+		_, _ = fmt.Fprintf(osStdout, "  plan:  %s\n", *req.Plan)
+	}
+	return 0
+}
+
+// validateOrgsUpdateFlags enforces the per-field presence + closed
+// gates. Returns true on success; otherwise fires printErr with the
+// matching error and returns false. Extracted to keep cmdOrgsUpdate
+// under the 50-line handler cap (CLAUDE.md).
+//
+// Order matters: --org required (covers the no-flag "what am I
+// updating?" case), then --name / --plan are independently optional.
+// The Plan.Valid gate runs against api.Plans (pkg/api/limits.go:34)
+// so a typo costs zero latency.
+func validateOrgsUpdateFlags(slug, name, plan *string) bool {
+	if *slug == "" {
+		PrintUsage(os.Stderr, "usage: gregale orgs update --org <slug> [--name <text>] [--plan <free|hobby|pro|scale>]", "orgs")
+		return false
+	}
+	if !regexp.MustCompile(api.OrgSlugPattern).MatchString(*slug) {
+		printErr("Invalid --org", fmt.Errorf("must match OrgSlugPattern (lowercase, dashes, 3..32 chars); got %q", *slug))
+		return false
+	}
+	if *name != "" && (len(*name) > 120) {
+		printErr("Invalid --name", fmt.Errorf("--name length %d exceeds 120", len(*name)))
+		return false
+	}
+	if *plan != "" && !api.Plan(*plan).Valid() {
+		printErr("Invalid --plan", fmt.Errorf("must be one of free|hobby|pro|scale; got %q", *plan))
+		return false
+	}
+	return true
 }

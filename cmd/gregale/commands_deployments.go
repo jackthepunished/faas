@@ -133,7 +133,23 @@ func cmdDeploymentsAll(ctx context.Context, client *api.Client) int {
 	return 0
 }
 
-// cmdDeployment implements `gregale deployment <id> [--show-scan]`
+// cmdDeployment dispatches `gregale deployment <verb> ...` to either
+// the legacy singular GET (`gregale deployment <id> [--show-scan]`) or
+// the Tier D mutator `gregale deployment set-min-instances <id> --min N`.
+// The 3-word verb shape mirrors cmdWebhookRotateSecret (commands_webhooks.go:361).
+func cmdDeployment(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale deployment <id> [--show-scan] | gregale deployment set-min-instances <id> --min N", "deployment")
+		return 1
+	}
+	switch args[0] {
+	case "set-min-instances":
+		return cmdDeploymentSetMinInstances(args[1:])
+	}
+	return cmdDeploymentGet(args)
+}
+
+// cmdDeploymentGet implements `gregale deployment <id> [--show-scan]`
 // (GET /v1/deployments/{id}, plus GET /v1/deployments/{id}/scan
 // when --show-scan is set). Mirrors the read branch of cmdApp
 // (commands2.go:69) — single positional id, JSON single record,
@@ -144,7 +160,7 @@ func cmdDeploymentsAll(ctx context.Context, client *api.Client) int {
 // Phase 3 repo-decomposition dry-run surface at
 // cmd/gregale/commands_decompose.go:49. The flag-vs-subcommand
 // split is the smallest-mess resolution of the name collision.
-func cmdDeployment(args []string) int {
+func cmdDeploymentGet(args []string) int {
 	fs := flag.NewFlagSet("deployment", flag.ContinueOnError)
 	showScan := fs.Bool("show-scan", false, "fetch + print the per-deploy grype scan payload (GET /v1/deployments/{id}/scan)")
 	if err := fs.Parse(args); err != nil {
@@ -227,5 +243,54 @@ func cmdDeployment(args []string) int {
 			}
 		}
 	}
+	return 0
+}
+
+// cmdDeploymentSetMinInstances implements `gregale deployment
+// set-min-instances <id> --min N` (PATCH /v1/deployments/{id}, issue #557,
+// ADR-072 — per-deployment cold-wake floor override).
+//
+// --min N sets min_instances on the deployment. The server treats
+// min_instances=0 as "inherit parent app floor" (per
+// pkg/api/client.go:417-419 — the SDK emits {"min_instances":0} verbatim,
+// and handlers_ext.go:1051-1093 validates against acct.Plan.MaxMinInstances).
+//
+// The 3-word verb shape mirrors cmdWebhookRotateSecret
+// (commands_webhooks.go:361) — grep-friendly and matches the kebab-case
+// surface in api/openapi.yaml.
+//
+// Local --min >= 0 gate runs before authedClient() so a CLI typo costs
+// zero latency (mirrors validateAlertClosedSets, commands_alerts.go:172).
+func cmdDeploymentSetMinInstances(args []string) int {
+	fs := flag.NewFlagSet("deployment set-min-instances", flag.ContinueOnError)
+	min := fs.Int("min", 0, "min_instances floor (>= 0; 0 inherits the parent app floor)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale deployment set-min-instances <id> --min N", "deployment")
+		return 1
+	}
+	if *min < 0 {
+		return printErr("Invalid --min", fmt.Errorf("--min must be >= 0; got %d", *min))
+	}
+	id := fs.Arg(0)
+	if !deploymentIDPattern.MatchString(id) {
+		PrintUsage(os.Stderr, "usage: gregale deployment set-min-instances <id> --min N   (id is 32 hex chars)", "deployment")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	d, err := client.PatchDeployment(context.Background(), id, api.UpdateDeploymentRequest{MinInstances: min})
+	if err != nil {
+		return printErr("Update failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(d))
+	}
+	PrintOK(osStdout, "Deployment %s updated.", d.ID)
+	_, _ = fmt.Fprintf(osStdout, "  min_instances: %d\n", d.MinInstances)
 	return 0
 }
