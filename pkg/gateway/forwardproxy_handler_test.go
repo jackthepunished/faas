@@ -39,6 +39,7 @@ import (
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -459,16 +460,21 @@ func TestServeHTTP_NonUpgradeHeader_TakesProxyByNode(t *testing.T) {
 }
 
 // TestServeHTTP_FreePlan_WebSocketNotAllowed confirms that an app
-// with WebSocketEnabled=false on a Free plan (or any plan where
-// the customer opted out) falls through to proxyByNode — the raw
-// path's three-input gate (isUpgradeRequest && WebSocketEnabled
-// && rawByNode != nil) requires ALL three to fire. The proxyByNode
-// handler here is a control point: it returns 502 because the
-// upgrade headers were never stripped (the raw path was bypassed),
-// which is the same shape a customer would see if they sent an
-// upgrade request to a non-WS-enabled app today. The test pins the
-// "no raw path" contract; the apid plan gate prevents a Free app
-// from getting WebSocketEnabled=true in the first place.
+// with WebSocketEnabled=false (Free plan OR a Hobby+ customer who
+// PATCHed the flag off) short-circuits to a deterministic 501 +
+// x-faas-error-reason: websocket_not_on_plan (issue #707 / PR-3
+// review finding). The previous fall-through to proxyByNode
+// stripped Connection + Upgrade as hop-by-hop (RFC 7230 §6.1) and
+// returned 502 from the upstream — a confusing customer-facing
+// failure that retried the WS handshake in an infinite loop. The
+// 501 path names the cause; the WS client backs off cleanly.
+//
+// Neither rawByNode nor proxyByNode is invoked — the short-circuit
+// sits BETWEEN the upgrade detector and both forwarding paths. The
+// apid plan gate prevents a Free customer from getting
+// WebSocketEnabled=true in the first place (pkg/api/errors.go:471
+// CodePlanWebSocketNotAllowed), but a Hobby+ opt-out still lands
+// here.
 func TestServeHTTP_FreePlan_WebSocketNotAllowed(t *testing.T) {
 	var rawCalls, proxyCalls int
 	b := &fakeBackend{
@@ -501,8 +507,60 @@ func TestServeHTTP_FreePlan_WebSocketNotAllowed(t *testing.T) {
 	if rawCalls != 0 {
 		t.Errorf("rawByNode invoked on Free+disabled app, want 0")
 	}
-	if proxyCalls != 1 {
-		t.Errorf("proxyByNode invoked %d times, want 1", proxyCalls)
+	if proxyCalls != 0 {
+		t.Errorf("proxyByNode invoked %d times, want 0 (issue #707: short-circuit, no fall-through)", proxyCalls)
+	}
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", rec.Code)
+	}
+	if got := rec.Header().Get("x-faas-error-reason"); got != "websocket_not_on_plan" {
+		t.Errorf("x-faas-error-reason = %q, want websocket_not_on_plan", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", got)
+	}
+}
+
+// TestServeHTTP_RawForwarderNotWired_WebSocketNotAllowed pins the
+// second trigger path of issue #707: WebSocketEnabled=true on the
+// app, but h.rawByNode is nil (test fixture, OR the future
+// FAAS_GATEWAY_RAW_STREAM_ENABLED=false follow-up). The customer
+// sees the same deterministic 501 + x-faas-error-reason:
+// websocket_not_on_plan so a WS client backs off cleanly. The
+// detail string distinguishes the two causes ("This deployment
+// has the WebSocket / Upgrade-traffic raw-bytes bridge disabled")
+// for ops log forensics.
+func TestServeHTTP_RawForwarderNotWired_WebSocketNotAllowed(t *testing.T) {
+	b := &fakeBackend{
+		app: App{
+			ID: "app-2", Plan: api.PlanHobby, WebSocketEnabled: true,
+		},
+		host: "app.example.com", upstream: "node-uuid-1", running: true,
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	// NOTE: no WithRawForwarding call — h.rawByNode stays nil.
+	h.WithForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Errorf("proxyByNode invoked on upgrade request, want 0 (issue #707: short-circuit, no fall-through)")
+			w.WriteHeader(http.StatusBadGateway)
+		})
+	})
+
+	req := httptest.NewRequest("GET", "/socket", nil)
+	req.Host = "app.example.com"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", rec.Code)
+	}
+	if got := rec.Header().Get("x-faas-error-reason"); got != "websocket_not_on_plan" {
+		t.Errorf("x-faas-error-reason = %q, want websocket_not_on_plan", got)
+	}
+	if !strings.Contains(rec.Body.String(), "deployment has the WebSocket") {
+		t.Errorf("body = %q, want substring \"deployment has the WebSocket\" (forwarderMissing detail)", rec.Body.String())
 	}
 }
 
@@ -559,6 +617,63 @@ func TestServeHTTP_WebSocketEnabled_DispatchesToRawStream(t *testing.T) {
 	}
 	if rec.Code != http.StatusSwitchingProtocols {
 		t.Errorf("status=%d, want 101", rec.Code)
+	}
+}
+
+// TestServeHTTP_UpgradeRequest_SkipsStreamingWrap pins issue #708
+// (PR-3 review finding): an upgrade request on a Hobby+ plan app
+// with StreamingEnabled=true (plan default) MUST NOT install the
+// streaming wrap (setupStreamingWriter). The wrap's capWriter
+// enforces plan.MaxResponseBodyBytes (100 MiB for Hobby+); on a
+// long-lived WS session that streams >100 MiB cumulative response
+// bytes, capWriter fires onCap mid-WS-frame and breaks the WS
+// protocol. The assertion below reaches into the metrics registry
+// to confirm streamFlushes / streamActive were not incremented
+// for an upgrade request — meaning the wrap was never installed
+// and capWriter never ran.
+func TestServeHTTP_UpgradeRequest_SkipsStreamingWrap(t *testing.T) {
+	cli := &stubVmmdClient{
+		rawResp: &vmmdpb.ForwardRawResponseInit{Status: 101},
+		rawBody: []byte("handshake-complete"),
+	}
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", Plan: api.PlanHobby,
+			StreamingEnabled: true, WebSocketEnabled: true,
+		},
+		host: "app.example.com", upstream: "node-uuid-1", running: true,
+	}
+	m := NewMetrics()
+	h := NewHandlerWith(b, m, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.WithStreamingEnabled(true) // operator-level streaming on
+	h.WithForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+	h.WithRawForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rawStreamForwarder(t, cli, w, r)
+		})
+	})
+
+	req := httptest.NewRequest("GET", "/socket", nil)
+	req.Host = "app.example.com"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSwitchingProtocols {
+		t.Errorf("status=%d, want 101", rec.Code)
+	}
+	// streamFlushes is incremented by setupStreamingWriter's
+	// per-flush onFlush hook. An upgrade request must NOT have
+	// taken that path — the hook runs only on the streaming
+	// wrap, which is gated off for isUpgradeRequest(r) at
+	// handler.go:~1614 (issue #708).
+	if got := testutil.CollectAndCount(m.streamFlushes, "gateway_stream_flushes_total"); got != 0 {
+		t.Errorf("gateway_stream_flushes_total count = %d, want 0 (issue #708: streaming wrap must NOT install on upgrade requests)", got)
 	}
 }
 

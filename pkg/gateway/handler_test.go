@@ -749,6 +749,46 @@ func TestHandlerObserveRequestDuration(t *testing.T) {
 	}
 }
 
+// TestStatusClassBucket pins the §12 dashboard label mapping. The
+// closed 5-set (1xx/2xx/3xx/4xx/5xx) keeps the histogram bounded
+// per app×plan label combo — issue #709 adds the 1xx arm so a
+// successful WebSocket / h2c handshake (101 Switching Protocols)
+// does NOT inflate the errors panel.
+func TestStatusClassBucket(t *testing.T) {
+	cases := map[int]string{
+		// 1xx — informational (issue #709; was "5xx" before).
+		100: "1xx", // Continue
+		101: "1xx", // Switching Protocols (WS / h2c handshake)
+		102: "1xx", // Processing
+		103: "1xx", // Early Hints
+		// 2xx — success.
+		200: "2xx",
+		201: "2xx",
+		204: "2xx",
+		299: "2xx",
+		// 3xx — redirect.
+		301: "3xx",
+		302: "3xx",
+		304: "3xx",
+		399: "3xx",
+		// 4xx — client error.
+		400: "4xx",
+		404: "4xx",
+		429: "4xx",
+		499: "4xx",
+		// 5xx — server error.
+		500: "5xx",
+		502: "5xx",
+		503: "5xx",
+		599: "5xx",
+	}
+	for status, want := range cases {
+		if got := statusClassBucket(status); got != want {
+			t.Errorf("statusClassBucket(%d) = %q, want %q", status, got, want)
+		}
+	}
+}
+
 // histogramCountFromBody scrapes the metrics endpoint and parses the
 // `_count` line whose labels match labelNeedle. Returns 0 when no
 // matching line is found. Used by tests that need a per-label-tuple

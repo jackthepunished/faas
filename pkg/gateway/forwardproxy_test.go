@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,8 +50,13 @@ import (
 // Stream field carries the configured fakeBidiStream; an
 // unset Stream + a drive-through call panics ("not stubbed").
 type fakeVmmdClient struct {
-	Stream    *fakeBidiStream
-	RawStream *fakeRawBidiStream
+	Stream *fakeBidiStream
+	// RawStream is the bidi-streaming client the forwarder
+	// sees. Typed as the gRPC interface (not the concrete
+	// fake) so issue #710's blockingRawBidiStream can plug
+	// in without changing the field shape. The fakeRawBidiStream
+	// implements the same interface.
+	RawStream grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse]
 }
 
 // ForwardHTTPStream returns the configured Stream. The forwarder
@@ -1022,26 +1028,51 @@ func TestRawStreamReverseProxy_InitError_Populated(t *testing.T) {
 // TestRawStreamReverseProxy_ClientCancel_TearsDownStream confirms
 // that cancelling r.Context() triggers CloseSend on the bidi
 // stream within a short window — the body-copy goroutine must
-// exit promptly rather than blocking on the next Read. We pin
-// this with a deadline to make the test deterministic under load.
+// exit promptly rather than blocking on the next Read, AND the
+// receiver loop must exit promptly rather than blocking on the
+// next Recv. We pin both with a deadline to make the test
+// deterministic under load.
+//
+// Issue #710 (PR-3 review finding): the previous version of this
+// test used an empty body + an empty Responses slice, which
+// caused the body goroutine to hit EOF immediately and the
+// receiver loop to hit EOF immediately. The cancel goroutine
+// that fires at 20ms was irrelevant — the test passed for the
+// wrong reason, and the load-bearing ctxReader cancellation
+// path (forwardproxy.go:555-556, the #471 review F3 fix) was
+// never exercised. This rewrite uses a blocking body reader
+// AND a stream whose Recv blocks on ctx.Done(), so both
+// goroutines are parked in their blocking calls when the
+// cancel fires.
 func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
-	// Build a stream whose Responses is empty + recvErr nil; the
-	// receiver loop blocks on Recv until ctx cancel. The fake
-	// returns io.EOF once Responses is drained, so we close it
-	// ourselves via a sentinel: never Recv after the test cancels.
-	stream := &fakeRawBidiStream{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// blockingBody returns 0 bytes from Read until ctx cancels.
+	// The body goroutine parks inside cr.Read (the ctxReader
+	// wrapper at forwardproxy.go:555-556) until the cancel
+	// propagates from r.Context().
+	body := &blockingReader{ctx: ctx}
+
+	// blockingStream blocks Recv on ctx.Done(); the receiver
+	// loop is parked inside stream.Recv until the cancel
+	// propagates from stream.Context(). The blocking wrapper
+	// IS the stream the production code receives — cli returns
+	// it directly (ForwardRawStream returns f.RawStream), so
+	// CloseSend and Recv both hit our wrapper, not the inner
+	// fake.
+	stream := &blockingRawBidiStream{ctx: ctx}
 	cli := &fakeVmmdClient{RawStream: stream}
 	lookup := &fakeNodeLookup{cli: cli}
 	proxy := gateway.ForwardingRawReverseProxy(lookup, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(http.MethodGet, "/socket", strings.NewReader(""))
+	req := httptest.NewRequest(http.MethodGet, "/socket", body)
 	req = req.WithContext(ctx)
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "websocket")
 
 	// Cancel from another goroutine after a short delay so the
-	// body-copy goroutine has time to enter cr.Read.
+	// body-copy goroutine has time to enter cr.Read AND the
+	// receiver loop has time to enter Recv.
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		cancel()
@@ -1056,9 +1087,96 @@ func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
 
 	select {
 	case <-done:
-		// Forwarder returned — CloseSend was called by the
-		// body-copy goroutine on ctx cancellation.
+		// Forwarder returned — both goroutines exited and
+		// CloseSend was called by the body-copy goroutine
+		// on ctx cancellation.
 	case <-time.After(2 * time.Second):
-		t.Fatal("forwarder did not return within 2s of ctx cancel")
+		t.Fatal("forwarder did not return within 2s of ctx cancel — ctxReader / Recv cancellation paths regressed")
+	}
+
+	if !stream.closeSendCalled() {
+		t.Errorf("CloseSend not called on ctx cancel — bidi stream teardown regressed")
+	}
+	if !stream.recvExited() {
+		t.Errorf("Recv did not exit on ctx cancel — receiver loop teardown regressed")
+	}
+	if !body.exited() {
+		t.Errorf("blocking body did not exit on ctx cancel — ctxReader cancellation path regressed")
 	}
 }
+
+// blockingReader is an io.Reader that parks inside Read until the
+// supplied ctx is cancelled. Used by
+// TestRawStreamReverseProxy_ClientCancel_TearsDownStream to verify
+// the ctxReader cancellation path at
+// pkg/gateway/forwardproxy.go:555-556 (issue #471 review F3 fix).
+type blockingReader struct {
+	ctx       context.Context
+	hasExited atomic.Bool
+}
+
+func (b *blockingReader) Read(_ []byte) (int, error) {
+	// Park until ctx cancels. ctxReader wraps this Read
+	// with r.Context() so the cancel propagates; the
+	// test asserts this Read returns within 2 s of
+	// cancel.
+	<-b.ctx.Done()
+	b.hasExited.Store(true)
+	return 0, b.ctx.Err()
+}
+
+func (b *blockingReader) exited() bool {
+	return b.hasExited.Load()
+}
+
+// blockingRawBidiStream implements grpc.BidiStreamingClient and
+// parks inside Recv until ctx cancels. Issue #710.
+//
+// Unlike the RoundTrip tests, this fake does NOT wrap
+// fakeRawBidiStream — the production code's bidi stream variable
+// is this wrapper directly (cli.ForwardRawStream returns
+// f.RawStream), so Send/CloseSend must live on the wrapper, not
+// delegate to an inner.
+type blockingRawBidiStream struct {
+	ctx           context.Context
+	closeSendFlag atomic.Bool
+	recvExitFlag  atomic.Bool
+}
+
+func (s *blockingRawBidiStream) closeSendCalled() bool {
+	return s.closeSendFlag.Load()
+}
+
+func (s *blockingRawBidiStream) recvExited() bool {
+	return s.recvExitFlag.Load()
+}
+
+func (s *blockingRawBidiStream) HeaderStream() grpc.ClientStream { return nil }
+func (s *blockingRawBidiStream) TrailerOnly() bool               { return false }
+
+func (s *blockingRawBidiStream) Send(_ *vmmdpb.ForwardRawRequest) error {
+	return nil
+}
+
+func (s *blockingRawBidiStream) Recv() (*vmmdpb.ForwardRawResponse, error) {
+	// Park until ctx cancels, then return io.EOF so the
+	// receiver loop breaks cleanly (the body goroutine is
+	// the one that triggers CloseSend on cancel; this Recv
+	// just needs to return without blocking forever).
+	<-s.ctx.Done()
+	s.recvExitFlag.Store(true)
+	return nil, io.EOF
+}
+
+func (s *blockingRawBidiStream) CloseSend() error {
+	s.closeSendFlag.Store(true)
+	return nil
+}
+
+func (s *blockingRawBidiStream) Context() context.Context { return s.ctx }
+func (s *blockingRawBidiStream) SendMsg(any) error        { return nil }
+func (s *blockingRawBidiStream) RecvMsg(any) error        { return nil }
+func (s *blockingRawBidiStream) Header() (metadata.MD, error) {
+	return nil, nil
+}
+func (s *blockingRawBidiStream) Trailer() metadata.MD { return nil }
