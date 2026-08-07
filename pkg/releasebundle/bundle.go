@@ -176,15 +176,22 @@ func Verify(root string, manifest Manifest) error {
 			return fmt.Errorf("releasebundle: %s sha256 %s, want %s", file.Path, hash, file.SHA256)
 		}
 	}
+	walkRoot := root
+	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		walkRoot, err = filepath.EvalSymlinks(root)
+		if err != nil {
+			return fmt.Errorf("releasebundle: resolve root symlink: %w", err)
+		}
+	}
 	var unexpected []string
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	err := filepath.WalkDir(walkRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if entry.IsDir() {
 			return nil
 		}
-		rel, err := filepath.Rel(root, path)
+		rel, err := filepath.Rel(walkRoot, path)
 		if err != nil {
 			return err
 		}
