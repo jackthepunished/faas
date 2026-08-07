@@ -10,6 +10,14 @@ import (
 	"github.com/onebox-faas/faas/guest/runners/internal/runnerparity"
 )
 
+// init installs the in-process framework-ready dial hook so the
+// runner's per-handler SignalReady doesn't burn 250ms on a real
+// unix-socket dial to /run/guest-init/framework-ready.sock (which
+// doesn't exist on a Mac/Linux test box). See
+// guest/runners/internal/framework_ready_testhook.go for the
+// rationale; the hook is reverted before the process exits.
+func init() { internal.InstallTestProxyDialHook() }
+
 // TestHandle_RoundTrip spins a stub handler with the same JSON contract
 // the runner expects. The runner's spawn-the-binary path needs an
 // actual `node` on PATH; the helper skips when missing.

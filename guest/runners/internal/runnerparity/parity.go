@@ -530,11 +530,19 @@ func RunWaitUntilEnvelopeRoundTrip(t *testing.T, fake FakeHandler, handler func(
 // The stdout envelope is byte-identical to FakeGoScript's, so a caller
 // can assert BOTH halves of the issue #254 contract in one round trip:
 // stderr escapes to the host, and stdout still decodes cleanly.
+//
+// stderrLine is base64-encoded in Go and decoded inside the script
+// (printf | base64 -d) so the marker is never interpreted as shell
+// syntax. Today every caller passes a static ASCII marker, but the
+// helper is public — any future caller passing a marker containing
+// `"`, `$`, or backticks would otherwise produce a malformed fake
+// (or, with `$(...)`, execute test-host commands).
 func FakeScriptWritingStderr(stderrLine string) FakeHandler {
+	enc := base64.StdEncoding.EncodeToString([]byte(stderrLine))
 	return FakeHandler{
 		Script: `#!/bin/sh
 read -r env
-printf '%s\n' "` + stderrLine + `" >&2
+printf '%s\n' "$(printf '%s' '` + enc + `' | base64 -d)" >&2
 method=$(printf '%s' "$env" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
 path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
 printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_b64":"%s"}' \
@@ -548,14 +556,22 @@ printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_
 // FakeNodeScriptWritingStderr is the Node counterpart of
 // FakeScriptWritingStderr: writes one line to stderr via
 // console.error, then emits the §4.9 envelope on stdout.
+//
+// stderrLine is base64-encoded in Go and decoded inside the script
+// (Buffer.from(..., 'base64').toString()), so the marker is never
+// interpreted as JavaScript syntax. Backticks in the marker would
+// otherwise enable template-literal interpolation (`${process.exit(1)}`);
+// double quotes would let a marker break out of the source string.
+// The base64 round trip makes the script safe for any UTF-8 marker.
 func FakeNodeScriptWritingStderr(stderrLine string) FakeHandler {
+	enc := base64.StdEncoding.EncodeToString([]byte(stderrLine))
 	return FakeHandler{
 		Script: `#!/usr/bin/env node
 let buf = '';
 process.stdin.on('data', (c) => { buf += c; });
 process.stdin.on('end', () => {
   const env = JSON.parse(buf);
-  console.error(` + "`" + stderrLine + "`" + `);
+  console.error(Buffer.from('` + enc + `', 'base64').toString());
   const out = {
     status: 200,
     headers: { "X-Echo-Method": env.method, "X-Echo-Path": env.path },
@@ -571,12 +587,20 @@ process.stdin.on('end', () => {
 // FakePyScriptWritingStderr is the Python counterpart of
 // FakeScriptWritingStderr: writes one line to sys.stderr, then
 // emits the §4.9 envelope on stdout.
+//
+// stderrLine is base64-encoded in Go and decoded inside the script
+// (base64.b64decode), so the marker is never interpreted as Python
+// source. A marker containing `") or __import__("os").system(...)`
+// would otherwise break out of the literal and execute test-host
+// commands; the base64 round trip makes the script safe for any
+// UTF-8 marker.
 func FakePyScriptWritingStderr(stderrLine string) FakeHandler {
+	enc := base64.StdEncoding.EncodeToString([]byte(stderrLine))
 	return FakeHandler{
 		Script: `#!/usr/bin/env python3
 import sys, json, base64
 env = json.loads(sys.stdin.read())
-print("` + stderrLine + `", file=sys.stderr)
+print(base64.b64decode('` + enc + `').decode(), file=sys.stderr)
 out = {
     "status": 200,
     "headers": {"X-Echo-Method": env["method"], "X-Echo-Path": env["path"]},
@@ -625,6 +649,8 @@ func RunStderrReachesHost(t *testing.T, fake FakeHandler, wantLine string, handl
 	os.Stderr = w
 	// Drain concurrently: a handler that writes more than the pipe
 	// buffer (64 KiB on Linux/macOS) would deadlock on a lazy read.
+	// The drain goroutine reads until EOF, which is generated when
+	// we close w below.
 	type readResult struct {
 		out []byte
 		err error
@@ -635,12 +661,19 @@ func RunStderrReachesHost(t *testing.T, fake FakeHandler, wantLine string, handl
 		_, cErr := io.Copy(&buf, r)
 		done <- readResult{out: buf.Bytes(), err: cErr}
 	}()
-	// Restore before any assertion so a t.Fatalf below still reports
-	// to the real stderr rather than into the pipe.
-	restore := func() {
-		os.Stderr = orig
-		_ = w.Close()
-	}
+	// restoreStderr reverts os.Stderr to the captured original so any
+	// t.Fatalf / t.Errorf below reports to the real stderr rather than
+	// into the captured pipe. Deferred so a panic in httptest.NewServer,
+	// http.Get, or anything between mutation and the success-path close
+	// still unwinds the process-global — otherwise the next test in
+	// the same `go test` run inherits a leaked pipe write end.
+	//
+	// It does NOT close w: closing w must happen AFTER the handler's
+	// subprocess has finished writing, otherwise the drain goroutine
+	// returns early on EOF and we miss bytes. The close is paired
+	// with the drain's <-done receive below.
+	restoreStderr := func() { os.Stderr = orig }
+	defer restoreStderr()
 
 	signal := internal.NewRunnerSignal("parity-stderr", time.Now())
 	mux := http.NewServeMux()
@@ -648,22 +681,24 @@ func RunStderrReachesHost(t *testing.T, fake FakeHandler, wantLine string, handl
 		handler(rw, req, script, signal, 0, "")
 	})
 	srv := httptest.NewServer(mux)
+	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/hello?x=1")
 	if err != nil {
-		srv.Close()
-		restore()
 		t.Fatalf("get: %v", err)
 	}
 	body := new(bytes.Buffer)
 	_, copyErr := io.Copy(body, resp.Body)
 	_ = resp.Body.Close()
-	srv.Close()
-	restore()
 	if copyErr != nil {
 		t.Fatalf("read body: %v", copyErr)
 	}
 
+	// Close the pipe write end so the drain goroutine's io.Copy sees
+	// EOF and exits. Safe: the handler's subprocess has already
+	// returned (we just read its response body), so no further writes
+	// are coming through os.Stderr.
+	_ = w.Close()
 	got := <-done
 	if got.err != nil {
 		t.Fatalf("drain captured stderr: %v", got.err)
