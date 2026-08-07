@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00157 (deployments.parked_reason +
+// Migration-apply test for 00156 (deployments.parked_reason +
 // deployments.parked_at + closed-set CHECK constraint).
 // Pins the load-bearing contract from issue #554 / ADR-079
 // follow-up (AC #3 + AC #5 surface):
 //
-//  1. The migration set applies cleanly through 00157.
+//  1. The migration set applies cleanly through 00156.
 //  2. The new columns land on deployments with the expected types
 //     and the nullable shape (existing rows stay valid).
 //  3. The closed-set CHECK constraint accepts the documented reason
@@ -29,14 +29,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigrations_00157_DeploymentParkedReason is the per-migration
+// TestMigrations_00156_DeploymentParkedReason is the per-migration
 // pin for the parked_reason + parked_at columns introduced in
-// 00157 (issue #554 follow-up).
-func TestMigrations_00157_DeploymentParkedReason(t *testing.T) {
+// 00156 (issue #554 follow-up).
+func TestMigrations_00156_DeploymentParkedReason(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Run the full migration set. 00157 should land last.
+	// (1) Run the full migration set. 00156 should land last.
 	if err := db.MigrateUp(ctx, pool); err != nil {
 		t.Fatalf("db.MigrateUp: %v (PR follow-up failure mode: missing migration slot between 156 and 157)", err)
 	}

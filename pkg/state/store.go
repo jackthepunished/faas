@@ -861,7 +861,7 @@ type Store interface {
 	// handler can build the response without a second round-trip.
 	UpdateDeploymentMinInstances(ctx context.Context, id string, min int) (Deployment, error)
 	// SetDeploymentParked stamps the per-deployment parked_reason +
-	// parked_at columns introduced by migration 00157 (issue #554 /
+	// parked_at columns introduced by migration 00156 (issue #554 /
 	// ADR-079 follow-up). Idempotent: re-parking an already-parked
 	// deployment is a no-op (the parked_at timestamp is set once).
 	// The closed-set vocabulary is enforced at the schema layer via

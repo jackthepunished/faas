@@ -422,7 +422,7 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 // surface still renders the rest of the app, just without the
 // parked-deployment reference. The closed-set reason
 // (liveness_exhausted | lifecycle_park | admin_park) is enforced
-// at the schema layer (migration 00157), so this helper never
+// at the schema layer (migration 00156), so this helper never
 // needs to validate.
 func (s *server) withParkedDeploymentRef(ctx context.Context, resp api.AppResponse, app state.App) api.AppResponse {
 	d, err := s.store.LatestParkedDeploymentForApp(ctx, app.ID)

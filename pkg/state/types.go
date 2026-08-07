@@ -76,7 +76,7 @@ const (
 )
 
 // ParkReason is the closed-set label on deployments.parked_reason
-// (issue #554 / ADR-079 follow-up, migration 00157). The schema
+// (issue #554 / ADR-079 follow-up, migration 00156). The schema
 // CHECK constraint deployments_parked_reason_check enforces the
 // same vocabulary at the storage layer; this Go type exists so
 // callers (engine.ParkDeployment, future admin parkApp handler)
@@ -914,7 +914,7 @@ type Deployment struct {
 	// surface renders them as the `parked_deployment: { id,
 	// parked_reason, parked_at }` reference. closed-set vocabulary
 	// is enforced at the schema layer via the
-	// deployments_parked_reason_check constraint (migration 00157).
+	// deployments_parked_reason_check constraint (migration 00156).
 	ParkedReason string     `json:"parked_reason,omitempty"`
 	ParkedAt     *time.Time `json:"parked_at,omitempty"`
 }
