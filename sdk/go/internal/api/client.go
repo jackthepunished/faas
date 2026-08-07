@@ -47,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -65,6 +66,11 @@ import (
 // before calling.
 type Client struct {
 	baseURL string
+	// token is guarded by tokenMu so long-lived daemons can rotate
+	// the bearer via SetToken without racing concurrent request
+	// builders. RWMutex because reads dominate writes — every
+	// outbound request reads; rotation is rare.
+	tokenMu sync.RWMutex
 	token   string
 
 	http       *http.Client // 30s default — used for every JSON call
@@ -107,7 +113,30 @@ func (c *Client) BaseURL() string { return c.baseURL }
 // secret; do NOT log it, surface it in errors, or persist it. SDK
 // callers that need to forward the token to other surfaces should
 // copy it into a local variable scoped to the request.
-func (c *Client) Token() string { return c.token }
+//
+// Safe for concurrent use; takes c.tokenMu read-lock.
+func (c *Client) Token() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.token
+}
+
+// SetToken rotates the bearer token used for subsequent requests
+// without reconstructing the Client. Useful for long-lived daemons
+// that mint short-lived session tokens via the SDK (issue #560 /
+// ADR-080 follow-up: faas.WithToken now wires through to this).
+// An empty token suppresses the Authorization header on subsequent
+// requests (useful for falling back to the anonymous device-code
+// flow mid-session).
+//
+// Safe for concurrent use; takes c.tokenMu write-lock. In-flight
+// requests built before SetToken continues to use the prior token;
+// new requests see the new token.
+func (c *Client) SetToken(token string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	c.token = token
+}
 
 // uploadHTTP returns the upload client or falls back to the default.
 func (c *Client) uploadHTTP() *http.Client {
@@ -115,6 +144,19 @@ func (c *Client) uploadHTTP() *http.Client {
 		return c.deployHTTP
 	}
 	return c.http
+}
+
+// addAuthHeader sets Authorization: Bearer <token> on req when the
+// Client holds a non-empty token. Reads c.tokenMu so it sees the
+// latest value set by SetToken (issue #560 / ADR-080 follow-up:
+// rotation without Client reconstruction).
+func (c *Client) addAuthHeader(req *http.Request) {
+	c.tokenMu.RLock()
+	token := c.token
+	c.tokenMu.RUnlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 // do executes an HTTP request against c.baseURL+path with the SDK's
@@ -134,9 +176,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if err != nil {
 		return err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	// UX §3.2 / impl §4.2: every mutating call carries Idempotency-Key
 	// so a retried deploy/park/wake/rollback/etc. never double-charges
 	// or double-creates. We never override an explicit key the caller
@@ -215,9 +255,7 @@ func (c *Client) DeleteAccount(ctx context.Context, idempotencyKey string) (Acco
 	if err != nil {
 		return AccountDeletionResponse{}, err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	req.Header.Set("Idempotency-Key", idempotencyKey)
 	var out AccountDeletionResponse
 	return out, c.doReq(c.http, req, &out)
@@ -298,9 +336,7 @@ func (c *Client) DeployMultipart(ctx context.Context, slug string, source io.Rea
 	if err != nil {
 		return DeploymentResponse{}, err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	// DeployMultipart bypasses Client.do (multipart Content-Type wins
 	// over the JSON default) and routes through the longer-timeout

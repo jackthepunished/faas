@@ -145,9 +145,7 @@ func (c *Client) stream(ctx context.Context, path string) (io.ReadCloser, error)
 	if err != nil {
 		return nil, err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := c.sseClient().Do(req)
 	if err != nil {
