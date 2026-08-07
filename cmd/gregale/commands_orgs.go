@@ -59,6 +59,12 @@ func cmdOrgs(args []string) int {
 		return cmdOrgsTransferOwnership(args[1:])
 	case "seat-usage":
 		return cmdOrgsSeatUsage(args[1:])
+	case "me":
+		// Tier B audit gap: GET /v1/orgs/me reports the caller's
+		// current active-org hint (per the X-Active-Org header). CI
+		// scripts that switch orgs need to introspect which org
+		// they're currently scoped to.
+		return cmdOrgsMe(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale orgs: unknown subcommand %q\n", args[0])
 		return 1
@@ -537,5 +543,45 @@ func cmdInvitationsAccept(args []string) int {
 		return jsonOut(writeJSON(m))
 	}
 	PrintOK(osStdout, "Joined %s as %s", m.AccountID, m.Role)
+	return 0
+}
+
+// cmdOrgsMe fetches GET /v1/orgs/me (Tier B audit gap, IAM-6
+// follow-up). Returns the caller's currently-active org plus their
+// role on it, or {org:null} when no X-Active-Org hint was sent (the
+// caller is operating in the account scope). CI scripts that switch
+// orgs need this to introspect which org they're currently scoped
+// to without re-parsing env vars.
+//
+// Auth: self, no admin scope required.
+func cmdOrgsMe(args []string) int {
+	fs := flag.NewFlagSet("orgs me", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: gregale orgs me", "orgs")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.GetMyOrg(context.Background())
+	if err != nil {
+		return printErr("Could not fetch active org", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if resp.Org == nil {
+		PrintOK(osStdout, "No active org (account scope).")
+		return 0
+	}
+	fmt.Printf("slug:  %s\n", resp.Org.Slug)
+	fmt.Printf("name:  %s\n", resp.Org.Name)
+	fmt.Printf("role:  %s\n", resp.Org.Role)
+	fmt.Printf("plan:  %s\n", resp.Org.Plan)
+	fmt.Printf("status: %s\n", resp.Org.Status)
 	return 0
 }

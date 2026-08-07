@@ -76,6 +76,17 @@ var routeExclude = map[string]bool{
 	"GET /auth/reset":              true, // HTML form render (browser-only)
 	"POST /logout":                 true, // dashboard form post (browser-only); SDK's Logout wraps the same handler as a convenience
 
+	// PR #722 review (cookie-only routes CLI rejects). The /v1/auth/sessions
+	// handlers read sessionFrom(r), which is cookie-only per
+	// pkg/auth/middleware/context.go:141; the SDK cannot model a
+	// bearer-key caller and the dashboard is the supported surface.
+	// /v1/auth/capabilities is mounted behind sessionAuth at
+	// server.go:1085 — same exclusion.
+	"GET /v1/auth/sessions":             true, // sessionFrom cookie-only; PR #722 dropped
+	"DELETE /v1/auth/sessions/{id}":     true, // same + CSRF cookie required
+	"POST /v1/auth/sessions/revoke_all": true, // same — fails 401 on bearer-key
+	"GET /v1/auth/capabilities":         true, // sessionAuth at server.go:1085
+
 	// GitHub install bind picker (PR-B). Browser-only: the dashboard's
 	// bind flow drives these via the JS island in the app-detail page
 	// using the session cookie established by /v1/auth/github. The
@@ -102,6 +113,8 @@ var sdkMethodExclude = map[string]bool{
 	"ExchangeCliAuthCode": true, // anonymous device-code poll; route excluded above
 	"GetStatusSLO":        true, // public status; route excluded above
 	"Logout":              true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
+	"GetAccountDPA":       true, // public markdown; route excluded above (also reachable from /security)
+	"GetMyOrg":            true, // GET /v1/orgs/me was added in PR #722 before the OpenAPI spec tracked it; track both in lockstep on the next spec pass
 }
 
 // methodRouteMap pins the routes whose natural SDK verb doesn't
@@ -275,13 +288,17 @@ var methodRouteMap = map[string]string{
 
 	// IAM-3 (ADR-039) dashboard session surface. The auto-derivation
 	// strips /v1/ and title-cases each segment, so POST /v1/auth/logout
-	// becomes "PostAuthLogout". The SDK named these methods after
-	// the account-scoped noun (Post*Account*) to mirror the
-	// Get/Post/Patch/Delete pattern used elsewhere; pin them.
-	"POST /v1/auth/logout":              "PostAccountLogout",
-	"GET /v1/auth/sessions":             "GetAccountSessions",
-	"DELETE /v1/auth/sessions/{id}":     "DeleteAccountSession",
-	"POST /v1/auth/sessions/revoke_all": "PostAccountSessionsRevokeAll",
+	// becomes "PostAuthLogout". The SDK named this method after the
+	// account-scoped noun (Post*Account*) to mirror the
+	// Get/Post/Patch/Delete pattern used elsewhere; pin it.
+	//
+	// GET /v1/auth/sessions, DELETE /v1/auth/sessions/{id}, and
+	// POST /v1/auth/sessions/revoke_all are intentionally not
+	// exposed: those handlers read sessionFrom(r), which is
+	// cookie-only (pkg/auth/middleware/context.go:141), so they
+	// reject bearer-key callers with 401. Same reasoning drops
+	// GET /v1/auth/capabilities (sessionAuth at server.go:1085).
+	"POST /v1/auth/logout": "PostAccountLogout",
 
 	// Issue #472 / ADR-054 — cosign signature-enforcement surface. The
 	// auto-derivation would produce names with literal underscores

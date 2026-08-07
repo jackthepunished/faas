@@ -26,7 +26,7 @@ import (
 // cmdAccount dispatches `gregale account <subcommand>`.
 func cmdAccount(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale account {export|delete|restore|status|slo}", "account")
+		PrintUsage(os.Stderr, "usage: gregale account {export|delete|restore|status|dpa|slo}", "account")
 		return 1
 	}
 	switch args[0] {
@@ -38,6 +38,13 @@ func cmdAccount(args []string) int {
 		return cmdAccountRestore(args[1:])
 	case statusLiteral:
 		return cmdAccountStatus(args[1:])
+	case "dpa":
+		// Tier B audit gap: the Data-Processing-Addendum text (spec
+		// §17 G6) is published at GET /v1/account/dpa (markdown;
+		// no auth — the URL is also reachable from /security). The
+		// CLI surfaces the same body so operators can `curl`-equiv
+		// from a CI box or pin the response in a contract test.
+		return cmdAccountDPA(args[1:])
 	case "slo":
 		// Move 2 PR-A: CLI twin for GET /v1/account/slo
 		// (issue #696 / ADR-082). Account-wide SLO rollup.
@@ -149,6 +156,52 @@ func cmdAccountStatus(args []string) int {
 	fmt.Printf("apps:    %d\n", acct.AppCount)
 	if acct.Status == "deleted_pending" {
 		fmt.Printf("\naccount scheduled for deletion — run `gregale account restore` to cancel.\n")
+	}
+	return 0
+}
+
+// cmdAccountDPA fetches the platform's Data-Processing-Addendum
+// text (spec §17 G6 / ADR-018) from GET /v1/account/dpa. The route
+// is unauth-friendly on the server (it's also reachable from
+// /security); the CLI uses `NewClient(apiBase(), loadToken())`
+// directly — NOT authedClient() — because a freshly-installed box
+// must be able to read the DPA before logging in. The token is
+// harmless if it's set (the server ignores it on this route) and the
+// SDK tolerates an empty token without failing client-side.
+//
+// Default output is stdout (markdown). `-o FILE` writes to disk —
+// operators pin the response in CI contract tests so a server-side
+// edit to the DPA shows up as a PR diff. The body is small (~3 KB)
+// so there's no streaming story here; one buffer write.
+func cmdAccountDPA(args []string) int {
+	fs := flag.NewFlagSet("account dpa", flag.ContinueOnError)
+	out := fs.String("o", "", "output file (default: stdout)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: gregale account dpa [-o FILE]", "account")
+		return 1
+	}
+	// DPA route is unauth-friendly on the server (it's also reachable
+	// from /security). Pass the stored token if present (no-op server
+	// side) but never require it — `gregale account dpa` works on a
+	// freshly-installed box before login.
+	client := NewClient(apiBase(), loadToken())
+	body, err := client.GetAccountDPA(context.Background())
+	if err != nil {
+		return printErr("DPA fetch failed", err)
+	}
+	if *out != "" {
+		if err := os.WriteFile(*out, body, 0o644); err != nil {
+			return printErr("Write failed", err)
+		}
+		abs, _ := filepath.Abs(*out)
+		PrintOK(osStdout, "Wrote %d bytes of DPA text to %s", len(body), abs)
+		return 0
+	}
+	if _, err := osStdout.Write(body); err != nil {
+		return printErr("Write failed", err)
 	}
 	return 0
 }

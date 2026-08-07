@@ -362,36 +362,13 @@ func (c *Client) PostAccountLogout(ctx context.Context) error {
 	return c.do(ctx, "POST", "/v1/auth/logout", struct{}{}, nil)
 }
 
-// GetAuthCapabilities returns the per-provider sign-in OAuth enabled
-// flag for the calling host (issue #419 / ADR-046). The endpoint is
-// session-cookie-authed and intended for the dashboard's /login
-// surface; SDK callers (e.g. a CLI sub-command that wants to know
-// whether to render the OAuth button on a custom page) reuse it.
-//
-// The route is mounted behind dashboardChain(sessionAuth(...)) but
-// not behind dashboardAuthChain, so the SDK client does not need a
-// bearer token — the underlying cookie session is what authenticates
-// the request. Callers that pre-mint a token via the device-code CLI
-// flow can also use it; the bearer branch of s.auth sees the same
-// account.
-func (c *Client) GetAuthCapabilities(ctx context.Context) (AuthCapabilities, error) {
-	var out AuthCapabilities
-	return out, c.do(ctx, "GET", "/v1/auth/capabilities", nil, &out)
-}
-
-func (c *Client) GetAccountSessions(ctx context.Context) (SessionListResponse, error) {
-	var out SessionListResponse
-	return out, c.do(ctx, "GET", "/v1/auth/sessions", nil, &out)
-}
-
-func (c *Client) DeleteAccountSession(ctx context.Context, id string) error {
-	return c.do(ctx, "DELETE", "/v1/auth/sessions/"+id, SessionsRevokeRequest{}, nil)
-}
-
-func (c *Client) PostAccountSessionsRevokeAll(ctx context.Context) (SessionsRevokeAllResponse, error) {
-	var out SessionsRevokeAllResponse
-	return out, c.do(ctx, "POST", "/v1/auth/sessions/revoke_all", struct{}{}, &out)
-}
+// Session + auth-capabilities routes are session-cookie-only endpoints
+// (server.go:1085 mounts /v1/auth/capabilities behind sessionAuth; the
+// three /v1/auth/sessions handlers at handlers_sessions.go:99/134/174
+// read `sessionFrom(r)`, which pkg/auth/middleware/context.go:141
+// documents as cookie-only — bearer-key calls return ok=false and the
+// handlers reject with 401). The SDK therefore does not expose them;
+// they remain dashboard-only until a CLI-friendly auth surface ships.
 
 // ListApps returns the account's apps.
 func (c *Client) ListApps(ctx context.Context) ([]AppResponse, error) {
@@ -1831,4 +1808,27 @@ func (c *Client) ListAppWebhookDeliveries(ctx context.Context, slug, id string, 
 func (c *Client) RetryAppWebhookDelivery(ctx context.Context, slug, id, deliveryID string) (AppWebhookRetryDeliveryResponse, error) {
 	var out AppWebhookRetryDeliveryResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks/"+id+"/deliveries/"+deliveryID+"/retry", nil, &out)
+}
+
+// --- /v1/account/dpa (spec §17 G6) ----------------------------------------
+//
+// DPA = Data Processing Addendum. Public, no-auth endpoint that
+// returns the GDPR DPA template as text/markdown (cmd/apid/handlers_account.go:231).
+// Customers pipe the body into their vendor-onboarding automation.
+//
+// c.do unmarshals JSON; doBytes returns the raw response so the
+// caller gets the markdown verbatim.
+func (c *Client) GetAccountDPA(ctx context.Context) ([]byte, error) {
+	var out []byte
+	return out, c.doBytes(ctx, "GET", "/v1/account/dpa", nil, &out)
+}
+
+// --- /v1/orgs/me (IAM-6 / ADR-061) ----------------------------------------
+//
+// Returns the caller's currently-active org + membership role, or
+// {"org": null} when neither X-Active-Org nor ?org= was supplied
+// (cmd/apid/handlers_org_me.go:59). Drives `gregale orgs me`.
+func (c *Client) GetMyOrg(ctx context.Context) (OrgMeResponse, error) {
+	var out OrgMeResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/me", nil, &out)
 }
