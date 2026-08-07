@@ -1585,6 +1585,13 @@ const (
 	DefaultLivenessCooldownSeconds     = 60
 	DefaultLivenessMaxRestarts         = 3
 	DefaultLivenessWindowSeconds       = 300
+	// MinLivenessCooldownSeconds / MaxLivenessCooldownSeconds
+	// bound the per-deployment CooldownS override (issue #554 /
+	// ADR-078). The window must be wide enough that a noisy
+	// cold-boot doesn't get torn down (≥10s) and narrow enough
+	// that a wedged app doesn't sit in grace forever (≤600s).
+	MinLivenessCooldownSeconds = 10
+	MaxLivenessCooldownSeconds = 600
 	// ColdBootBudgetSeconds (issue #554 / ADR-079 follow-up, AC
 	// #1) is the wall-clock budget the §14 metal acceptance
 	// gate evaluates against when validating the liveness

@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/fcvm"
 )
@@ -195,3 +196,80 @@ func TestLivenessRecv_ConnRefusedCounted(t *testing.T) {
 // directly (the runOne signature is just (ctx, timeoutMs)); the
 // liveness-window test at pkg/sched/liveness_window_test.go
 // owns the time-driven paths.
+
+// TestLivenessRecv_CooldownGateShortCircuits (issue #554 closure /
+// ADR-078) pins the cooldown gate at runOne: a probe failure that
+// falls inside cfg.CooldownSeconds of the previous
+// LastLivenessDestroyAt stamp must NOT increment the counter and
+// must NOT fire the relay. The customer-visible scenario is "I
+// just had a wedged VM torn down, the cold-boot replacement is
+// still warming up — don't tear it down too". Pre-#554 this
+// scenario was unreliable: the first 3 probe failures (typically
+// conn_refused during the guest-init listener bring-up) would
+// fire DestroyForLivenessFailure on a perfectly healthy cold-boot
+// instance. The gate bypasses cleanly when CooldownSeconds == 0
+// (Free plan / legacy callers) or LastLivenessDestroyAt is zero
+// (no prior destroy recorded).
+func TestLivenessRecv_CooldownGateShortCircuits(t *testing.T) {
+	loop, sink, mgr := newTestLoop(t, "inst-cd", 3)
+	// Register the instance so Manager.LastLivenessDestroyAt
+	// returns a non-zero value.
+	mgr.RegisterInstanceForTest("inst-cd")
+	// Stamp a destroy 5 seconds in the past. cfg.CooldownSeconds=60
+	// (set by newTestLoop), so a probe now falls well within the
+	// window.
+	mgr.SetLastLivenessDestroyAtForTest("inst-cd", time.Now().Add(-5*time.Second))
+
+	// All three probes are non_200, but the gate must short-circuit.
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
+	}
+	for i := 0; i < 3; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 0 {
+		t.Errorf("sink.count = %d, want 0 (cooldown gate must short-circuit fires within 60s)", sink.count())
+	}
+}
+
+// TestLivenessRecv_CooldownGateExpires confirms the bypass: a
+// destroy that's older than cfg.CooldownSeconds does NOT
+// short-circuit. Without the bypass a customer's deployment
+// would be parked forever once the first destroy happened.
+func TestLivenessRecv_CooldownGateExpires(t *testing.T) {
+	loop, sink, mgr := newTestLoop(t, "inst-cd-2", 3)
+	mgr.RegisterInstanceForTest("inst-cd-2")
+	// Stamp a destroy 120 seconds in the past. CooldownSeconds=60,
+	// so we're well outside the window.
+	mgr.SetLastLivenessDestroyAtForTest("inst-cd-2", time.Now().Add(-120*time.Second))
+
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
+	}
+	for i := 0; i < 3; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 1 {
+		t.Errorf("sink.count = %d, want 1 (cooldown expired, 3 consec must fire)", sink.count())
+	}
+}
+
+// TestLivenessRecv_CooldownGateZeroCooldownBypasses confirms the
+// legacy / Free-plan path: CooldownSeconds=0 means "no cooldown
+// gate" — pre-#554 behaviour. The destroy stamp is ignored.
+func TestLivenessRecv_CooldownGateZeroCooldownBypasses(t *testing.T) {
+	loop, sink, mgr := newTestLoop(t, "inst-cd-3", 2)
+	loop.cfg.CooldownSeconds = 0 // legacy / Free
+	mgr.RegisterInstanceForTest("inst-cd-3")
+	mgr.SetLastLivenessDestroyAtForTest("inst-cd-3", time.Now().Add(-1*time.Second))
+
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
+	}
+	for i := 0; i < 2; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 1 {
+		t.Errorf("sink.count = %d, want 1 (CooldownSeconds=0 bypasses the gate)", sink.count())
+	}
+}

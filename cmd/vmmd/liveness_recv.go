@@ -98,6 +98,11 @@ type livenessProbeLoop struct {
 	// "conn_refused", "conn_err"). Default = nil → runOne uses
 	// the real dialAndProbe.
 	probeFn func(ctx context.Context, timeoutMs int) string
+	// nowFn is the clock seam (issue #554 closure / ADR-078
+	// cooldown gate). Production = time.Now; tests inject a
+	// frozen clock so the cooldown window can be exercised
+	// deterministically without real-time sleeps.
+	nowFn func() time.Time
 }
 
 // runLivenessProbeLoop is the entry point. Blocks until ctx is
@@ -153,6 +158,34 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 	}
 	elapsed := time.Since(start).Seconds()
 	l.mgr.ObserveLivenessProbe(outcome, elapsed)
+
+	// Cooldown gate (issue #554 closure / ADR-078). After a
+	// successful liveness destroy the cold-boot replacement
+	// instance has a grace window: probes that fail within
+	// cfg.CooldownSeconds of the previous destroy are
+	// short-circuited — we increment nothing, fire nothing,
+	// and let the cold-boot instance settle. The gate
+	// bypasses on cfg.CooldownSeconds <= 0 (Free plan / legacy
+	// callers). Reading via Manager.LastLivenessDestroyAt keeps
+	// the loop goroutine out of m.mu on the hot path; the
+	// Manager stamps under its own lock.
+	nowFn := l.nowFn
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	if l.cfg.CooldownSeconds > 0 {
+		if last := l.mgr.LastLivenessDestroyAt(l.instance); !last.IsZero() {
+			cooldown := time.Duration(l.cfg.CooldownSeconds) * time.Second
+			if nowFn().Sub(last) < cooldown {
+				l.log.Debug("liveness: cooldown window",
+					"instance", l.instance,
+					"since_destroy_s", int(nowFn().Sub(last).Seconds()),
+					"cooldown_s", l.cfg.CooldownSeconds)
+				return
+			}
+		}
+	}
+
 	switch outcome {
 	case livenessOutcomeOK:
 		// Reset on the first 2xx (AC #2 — intermittent failures
