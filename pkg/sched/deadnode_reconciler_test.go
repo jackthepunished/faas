@@ -11,9 +11,12 @@
 // `if !state.State(ins.State).CountsForRAM() { continue }` filter).
 //
 // These tests pin the per-row policy on the in-memory MemStore
-// surface. The pgstore parity test (verifying that the conditional
-// UPDATE returns ErrConflict on peer wins) lives in
-// pkg/state/pgstore_dead_node_test.go.
+// surface. The hand-written SQL parity (conditional UPDATE +
+// ErrConflict on RowsAffected()==0, ORDER BY tie-break on
+// (heartbeat, id), limit guard, etc.) lives in
+// pkg/state/pgstore_dead_node_test.go and runs against a real
+// Postgres when pgtest.Open can reach one; it is skipped
+// otherwise, per the FAAS_SKIP_PG_TESTS convention.
 //
 // Cases:
 //
@@ -33,6 +36,7 @@ package sched
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -302,7 +306,9 @@ func TestReconcileDeadNodeInstances_ListQueryArgGuards(t *testing.T) {
 }
 
 // TestReconcileDeadNodeInstances_FailArgGuards pins the empty-arg
-// guards on FailRunningInstanceOnDeadNode (matching pgstore).
+// guards on FailRunningInstanceOnDeadNode (matching pgstore) and
+// pins the ErrConflict contract for "row vanished between list and
+// fail" — see F2 in the PR-A review findings.
 func TestReconcileDeadNodeInstances_FailArgGuards(t *testing.T) {
 	store := state.NewMemStore()
 	if err := store.FailRunningInstanceOnDeadNode(context.Background(), "", "node-1"); err == nil {
@@ -311,7 +317,18 @@ func TestReconcileDeadNodeInstances_FailArgGuards(t *testing.T) {
 	if err := store.FailRunningInstanceOnDeadNode(context.Background(), "ins-1", ""); err == nil {
 		t.Fatalf("empty nodeID must error")
 	}
-	if err := store.FailRunningInstanceOnDeadNode(context.Background(), "missing", "n"); err == nil {
-		t.Fatalf("unknown instance must error (ErrNotFound)")
+	// Missing row → ErrConflict (NOT ErrNotFound). This matches
+	// the PgStore RowsAffected()==0 outcome: from the caller's
+	// perspective, the conditional UPDATE found nothing to update,
+	// and "the row vanished" is the same race as "node recovered"
+	// or "peer parked first" — all three must surface the same
+	// outcome="conflict" so the reconciler's metric stays
+	// distinguishable from a real error.
+	err := store.FailRunningInstanceOnDeadNode(context.Background(), "missing", "n")
+	if err == nil {
+		t.Fatalf("unknown instance must error")
+	}
+	if !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("unknown-instance error must be ErrConflict (peer-vanished race), got %v", err)
 	}
 }

@@ -2587,7 +2587,16 @@ func (m *MemStore) ListRunningInstancesOnDeadNodes(_ context.Context, threshold 
 
 // FailRunningInstanceOnDeadNode mirrors the PgStore conditional
 // UPDATE: the transition only lands when the row is still RUNNING and
-// still owned by the node the caller observed as dead.
+// still owned by the node the caller observed as dead. A row that
+// has vanished between the input-set query and this call returns
+// ErrConflict — the same outcome PgStore surfaces via
+// RowsAffected()==0. The reconciler's caller treats ErrConflict as
+// a peer-wins no-op, so a transient GC (retention sweep, manual
+// operator delete, future multi-host park path) is counted the same
+// way as "node recovered" rather than as outcome=error. ErrNotFound
+// is reserved for explicit precondition violations (the caller
+// passed an instanceID the store has never heard of) — that signal
+// is too loud to use as a silent "the row disappeared" handler.
 func (m *MemStore) FailRunningInstanceOnDeadNode(_ context.Context, instanceID, nodeID string) error {
 	if instanceID == "" {
 		return fmt.Errorf("state: fail running instance on dead node: empty instanceID")
@@ -2599,7 +2608,7 @@ func (m *MemStore) FailRunningInstanceOnDeadNode(_ context.Context, instanceID, 
 	defer m.mu.Unlock()
 	ins, ok := m.instances[instanceID]
 	if !ok {
-		return ErrNotFound
+		return ErrConflict
 	}
 	if ins.State != string(StateRunning) || ins.NodeID != nodeID {
 		return ErrConflict

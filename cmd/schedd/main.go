@@ -828,11 +828,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// Stale-RUNNING billing-leak self-healer (issue: dead vmmd
 	// leaves instances RUNNING in PG → meterd bills for VMs that
-	// no longer exist). Staleness override only — the tick cadence
-	// is owned by sched.NewDeadNodeReconciler below, mirroring
-	// how MigratingWatchdogTickLimit + Interval are split between
-	// the engine setter and the loop builder. Same fail-fast
-	// contract as the migrating-watchdog envs above.
+	// no longer exist). Same fail-fast contract as the
+	// migrating-watchdog envs above: a typo in either override
+	// must not silently fall back to the api.* default. The
+	// staleness env routes through the engine setter
+	// (WithDeadNodeReconcilerStalenessSeconds) because the
+	// reconciler reads it at tick time — operator tweaks don't
+	// require a schedd restart. The interval env patches cfg
+	// directly because the loop builder owns the ticker; the env
+	// is the highest-precedence source so it overrides TOML
+	// without redeploy.
 	if v := os.Getenv("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS"); v != "" {
 		n, parseErr := strconv.Atoi(v)
 		if parseErr != nil || n <= 0 {
@@ -841,6 +846,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS: %s", v)
 		}
 		engine.WithDeadNodeReconcilerStalenessSeconds(n)
+	}
+	if v := os.Getenv("FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS: %s", v)
+		}
+		cfg.DeadNodeReconcilerIntervalSeconds = n
 	}
 
 	// Tier A4 / ADR-064: rebalancer subscriber. Watches

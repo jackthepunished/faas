@@ -6722,7 +6722,13 @@ func (s *PgStore) ListRunningInstancesOnDeadNodes(ctx context.Context, threshold
 		 join compute_nodes n on n.id = i.node_id
 		 where i.state = 'running'
 		   and (n.active = false or n.last_heartbeat_at < $1)
-		 order by n.last_heartbeat_at asc
+		 -- Tie-break on instance id so a capped query is
+		 -- deterministic when many rows share the same heartbeat
+		 -- timestamp (MemStore's ListRunningInstancesOnDeadNodes
+		 -- does the same). Without this, a multi-host fleet where
+		 -- N>cap rows die at once can leave different rows waiting
+		 -- an extra tick between runs of identical input.
+		 order by n.last_heartbeat_at asc, i.id asc
 		 limit $2`,
 		threshold, limit)
 	if err != nil {
