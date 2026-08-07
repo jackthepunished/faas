@@ -547,8 +547,15 @@ func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, in
 	return nil
 }
 
+// Capabilities returns the Stripe-shaped set the meter pusher loop
+// observes in production for the surfaces this stub actually
+// implements. The metered usage + sandbox surfaces are exercised
+// by the shadow test; Refund is intentionally omitted from the
+// capability bitmask because the stub's Refund() returns
+// ErrNotImplemented (the real *stripe.Client implements Refund —
+// the stub is intentionally minimal).
 func (r *meterRec) Capabilities() billing.CapabilitySet {
-	return billing.CapabilitySet(billing.CapRefund | billing.CapUsageMetered | billing.CapSandbox)
+	return billing.CapabilitySet(billing.CapUsageMetered | billing.CapSandbox)
 }
 
 func (r *meterRec) Calls() int {

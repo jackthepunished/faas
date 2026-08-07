@@ -366,7 +366,7 @@ func (c *Client) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Ti
 
 // Capabilities returns the Stripe provider's supported optional
 // surfaces (see pkg/billing/provider.go CapabilitySet). The set is
-// derived from the implementation's actual behaviour — PinHostedCheckout
+// derived from the implementation's actual behaviour — CapHostedCheckout
 // is intentionally absent because Stripe's CreateUpgradeTransaction
 // returns ("", "", nil) and the apid handler falls back to
 // FAAS_BILLING_PORTAL_URL instead. CapUsageReconcile is absent because
