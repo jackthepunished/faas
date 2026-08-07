@@ -80,7 +80,7 @@ func TestCmdAuditEvents_Verbose_ExpandedColumns(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := cmdAuditEvents([]string{"--kind-prefix", "stateless.advisory", "--verbose"}); code != 0 {
+	if code := cmdAuditEvents([]string{"list", "--kind-prefix", "stateless.advisory", "--verbose"}); code != 0 {
 		t.Fatalf("audit-events --verbose = %d, want 0", code)
 	}
 	out := stop()
@@ -118,7 +118,7 @@ func TestCmdAuditEvents_Verbose_NonStatelessFallsBack(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := cmdAuditEvents([]string{"--verbose"}); code != 0 {
+	if code := cmdAuditEvents([]string{"list", "--verbose"}); code != 0 {
 		t.Fatalf("audit-events --verbose (non-stateless row) = %d, want 0", code)
 	}
 	out := stop()
@@ -153,7 +153,7 @@ func TestCmdAuditEvents_DefaultShapeUnchanged(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := cmdAuditEvents(nil); code != 0 {
+	if code := cmdAuditEvents([]string{"list"}); code != 0 {
 		t.Fatalf("audit-events default = %d, want 0", code)
 	}
 	out := stop()

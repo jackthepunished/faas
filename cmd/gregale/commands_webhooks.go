@@ -1,6 +1,6 @@
 package main
 
-// `gregale webhooks <list|add|update|rm|deliveries|retry> ...`
+// `gregale webhooks <list|add|update|rm|deliveries|retry|rotate-secret> ...`
 // (issue #476 / ADR-076). Mirrors the crons dispatcher at
 // commands2.go::cmdCrons but is split into its own file because the
 // surface has more subcommands (six vs four) and the retry-policy
@@ -10,12 +10,13 @@ package main
 // column widths match what `gregale crons list` already produces.
 //
 // Subcommand vocab mirrors the api/openapi.yaml kebab-case:
-//   list    GET /v1/apps/{slug}/webhooks
-//   add     POST /v1/apps/{slug}/webhooks
-//   update  PATCH /v1/apps/{slug}/webhooks/{id}
-//   rm      DELETE /v1/apps/{slug}/webhooks/{id}
-//   deliveries GET /v1/apps/{slug}/webhooks/{id}/deliveries
-//   retry   POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry
+//   list          GET    /v1/apps/{slug}/webhooks
+//   add           POST   /v1/apps/{slug}/webhooks
+//   update        PATCH  /v1/apps/{slug}/webhooks/{id}
+//   rm            DELETE /v1/apps/{slug}/webhooks/{id}
+//   deliveries    GET    /v1/apps/{slug}/webhooks/{id}/deliveries
+//   retry         POST   /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry
+//   rotate-secret POST   /v1/apps/{slug}/webhooks/{id}/rotate-secret
 
 import (
 	"context"
@@ -53,7 +54,7 @@ func strInSlice(v string, s []string) bool {
 
 func cmdWebhooks(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale webhooks <list|add|update|rm|deliveries|retry> [args]", "webhooks")
+		PrintUsage(os.Stderr, "usage: gregale webhooks <list|add|update|rm|deliveries|retry|rotate-secret> [args]", "webhooks")
 		return 1
 	}
 	switch args[0] {
@@ -69,6 +70,8 @@ func cmdWebhooks(args []string) int {
 		return cmdWebhookDeliveries(args[1:])
 	case "retry":
 		return cmdWebhookRetry(args[1:])
+	case "rotate-secret":
+		return cmdWebhookRotateSecret(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown webhooks subcommand %q\n", args[0])
 	return 1
@@ -291,8 +294,46 @@ func cmdWebhookRetry(args []string) int {
 	if err != nil {
 		return printErr("Retry failed", err)
 	}
-	PrintOK(os.Stdout, "Queued for retry: delivery=%s status=%s next_attempt_at=%s",
+	PrintOK(osStdout, "Queued for retry: delivery=%s status=%s next_attempt_at=%s",
 		out.Delivery.ID, out.Delivery.Status, out.Delivery.NextAttemptAt)
+	return 0
+}
+
+// cmdWebhookRotateSecret mints a fresh sealed secret for the webhook.
+// The server response carries only the rotated_at timestamp and the
+// masked constant (***) — the plaintext is server-minted and dropped
+// (pkg/api/webhooks.go:230-233). The legacy CLI success message
+// claimed a "one-shot reveal flow" existed; there is no such endpoint
+// (the spec intentionally keeps the plaintext server-side only, so a
+// leakage log can never read it back). The CLI therefore only
+// confirms the rotation succeeded and surfaces the masked sentinel —
+// the operator must provision the new secret in the webhook receiver
+// via an out-of-band channel (read it from the receiver's logs, or
+// rotate-to-known-via the receiver's own tooling).
+func cmdWebhookRotateSecret(args []string) int {
+	fs := flag.NewFlagSet("webhooks-rotate-secret", flag.ContinueOnError)
+	slug := fs.String("app", "", "app slug (required)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *slug == "" || len(fs.Args()) != 1 {
+		PrintUsage(os.Stderr, "usage: gregale webhooks rotate-secret --app <slug> <webhook-id>", "webhooks")
+		return 1
+	}
+	id := fs.Args()[0]
+	if !webhookIDPattern.MatchString(id) {
+		return printErr("Invalid webhook id", fmt.Errorf("must be a 32-hex-char UUID; got %q", id))
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	out, err := client.RotateAppWebhookSecret(context.Background(), *slug, id)
+	if err != nil {
+		return printErr("Rotate failed", err)
+	}
+	PrintOK(osStdout, "Webhook %s secret rotated at %s (sealed=%s). Plaintext is server-minted and not retrievable; provision the new secret in the webhook receiver out-of-band.",
+		id, out.RotatedAt, out.WebhookSecretSealedMasked)
 	return 0
 }
 

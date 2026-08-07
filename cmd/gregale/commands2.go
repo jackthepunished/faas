@@ -1132,7 +1132,7 @@ func cmdCronsUpdate(args []string) int {
 // cmdKeys: list/add/rm. Adding returns the plaintext token once (spec §2.2).
 func cmdKeys(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale keys <list|add|rm> [args]", "keys")
+		PrintUsage(os.Stderr, "usage: gregale keys <list|add|rm|rotate|grace-window> [args]", "keys")
 		return 1
 	}
 	switch args[0] {
@@ -1181,9 +1181,106 @@ func cmdKeys(args []string) int {
 		}
 		PrintOK(osStdout, "Removed")
 		return 0
+	case "rotate":
+		return cmdKeysRotate(args[1:])
+	case "grace-window":
+		return cmdKeysGraceWindow(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown keys subcommand %q\n", args[0])
 	return 1
+}
+
+// cmdKeysRotate issues POST /v1/keys/{id}/rotate. The new plaintext
+// is returned ONCE (same posture as add); the old key remains
+// usable until old_key_expires_at — the dashboard default grace is
+// 7 days (api.DefaultAPIKeyGraceWindowDays), overridable via
+// `gregale keys grace-window`.
+func cmdKeysRotate(args []string) int {
+	fs := flag.NewFlagSet("keys rotate", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale keys rotate <key-id>", "keys")
+		return 1
+	}
+	id := fs.Arg(0)
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.RotateKey(context.Background(), id)
+	if err != nil {
+		return printErr("Rotate failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	PrintOK(osStdout, "Rotated key. New plaintext (shown ONCE):\n  %s", resp.KeyPlaintext)
+	PrintProgress(osStdout, "  new id:        %s", resp.Key.ID)
+	PrintProgress(osStdout, "  old key id:    %s", resp.OldKeyID)
+	PrintProgress(osStdout, "  old key grace: %s", resp.OldKeyExpiresAt)
+	return 0
+}
+
+// cmdKeysGraceWindow reads or updates the per-account API-key
+// rotation grace window (issue #189 / IAM-5). With no arg, prints
+// the current override + plan default. `--reset` clears the
+// override (falls back to the plan default).
+func cmdKeysGraceWindow(args []string) int {
+	fs := flag.NewFlagSet("keys grace-window", flag.ContinueOnError)
+	reset := fs.Bool("reset", false, "clear the per-account override (fall back to plan default)")
+	days := fs.Int("days", -1, "new grace window in days (>=0)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		PrintUsage(os.Stderr, "usage: gregale keys grace-window [--reset | --days N]", "keys")
+		return 1
+	}
+	if *reset && *days >= 0 {
+		return printErr("Invalid flags", fmt.Errorf("--reset and --days are mutually exclusive"))
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	if *days >= 0 {
+		d := *days
+		resp, err := client.SetGraceWindow(context.Background(), &d)
+		if err != nil {
+			return printErr("Set grace-window failed", err)
+		}
+		if jsonOutput {
+			return jsonOut(writeJSON(resp))
+		}
+		PrintOK(osStdout, "Grace window set to %d days (plan default: %d).", *resp.Days, resp.PlanDefault)
+		return 0
+	}
+	if *reset {
+		resp, err := client.SetGraceWindow(context.Background(), nil)
+		if err != nil {
+			return printErr("Reset grace-window failed", err)
+		}
+		if jsonOutput {
+			return jsonOut(writeJSON(resp))
+		}
+		PrintOK(osStdout, "Grace window cleared (plan default: %d days).", resp.PlanDefault)
+		return 0
+	}
+	resp, err := client.GetGraceWindow(context.Background())
+	if err != nil {
+		return printErr("Get grace-window failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if resp.Days == nil {
+		PrintOK(osStdout, "Grace window: plan default (%d days)", resp.PlanDefault)
+	} else {
+		PrintOK(osStdout, "Grace window: %d days (plan default: %d)", *resp.Days, resp.PlanDefault)
+	}
+	return 0
 }
 
 // cmdUsage: dispatcher for `gregale usage [summary]`.

@@ -267,13 +267,17 @@ var methodRouteMap = map[string]string{
 
 	// IAM-3 (ADR-039) dashboard session surface. The auto-derivation
 	// strips /v1/ and title-cases each segment, so POST /v1/auth/logout
-	// becomes "PostAuthLogout". The SDK named these methods after
-	// the account-scoped noun (Post*Account*) to mirror the
-	// Get/Post/Patch/Delete pattern used elsewhere; pin them.
-	"POST /v1/auth/logout":              "PostAccountLogout",
-	"GET /v1/auth/sessions":             "GetAccountSessions",
-	"DELETE /v1/auth/sessions/{id}":     "DeleteAccountSession",
-	"POST /v1/auth/sessions/revoke_all": "PostAccountSessionsRevokeAll",
+	// becomes "PostAuthLogout". The SDK named this method after the
+	// account-scoped noun (Post*Account*) to mirror the
+	// Get/Post/Patch/Delete pattern used elsewhere; pin it.
+	//
+	// GET /v1/auth/sessions, DELETE /v1/auth/sessions/{id}, and
+	// POST /v1/auth/sessions/revoke_all are intentionally not
+	// exposed: those handlers read sessionFrom(r), which is
+	// cookie-only (pkg/auth/middleware/context.go:141), so they
+	// reject bearer-key callers with 401. Same reasoning drops
+	// GET /v1/auth/capabilities (sessionAuth at server.go:1085).
+	"POST /v1/auth/logout": "PostAccountLogout",
 
 	// Issue #472 / ADR-054 — cosign signature-enforcement surface. The
 	// auto-derivation would produce names with literal underscores

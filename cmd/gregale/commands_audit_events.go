@@ -1,5 +1,6 @@
-// commands_audit_events.go — `gregale audit-events` operator/customer CLI
-// surface (Wave 0 PR-C / ADR-047). Wraps GET /v1/audit-events.
+// commands_audit_events.go — `gregale audit-events <list|get>`
+// operator/customer CLI surface (Wave 0 PR-C / ADR-047). Wraps
+// GET /v1/audit-events and GET /v1/audit-events/{id}.
 //
 // Default shape is the customer-friendly one: lists the caller's
 // own audit events, newest-first, capped at 50 (server-side bound;
@@ -10,6 +11,11 @@
 // query param so an operator can see subject=NULL rows (the
 // defensive case where the app row was deleted between wake and the
 // advisory emit).
+//
+// `audit-events get <id>` (Tier B audit gap) fetches one row —
+// operator post-mortem needs to inspect a single event by id, which
+// the listing can't trivially answer (the listing is sorted newest-
+// first but a deeply old row is the interesting one).
 //
 // --verbose (Move 1 PR-A) switches the human-mode renderer to a
 // 5-column expanded view: instance | count | paths | sample_pid |
@@ -38,12 +44,41 @@ import (
 	"time"
 )
 
-// cmdAuditEvents implements `gregale audit-events [--kind-prefix P]
-// [--app-id <uuid>] [--since RFC3339] [--limit N]
+// cmdAuditEvents dispatches `gregale audit-events <list|get>`. The
+// help-block path surfaces singular lookup so post-mortem scripts can
+// stop scanning the list page.
+//
+// Back-compat shim (PR #722 code review): the pre-#722 leaf accepted
+// bare flags (`gregale audit-events --kind-prefix X --limit N`). The
+// dispatcher refactor required `list` as the first positional, which
+// broke every script that called the leaf the old way. If the first
+// token looks like a flag, forward to cmdAuditEventsList transparently
+// so old scripts keep working. The pattern mirrors cmdUsage's
+// forwarder (commands2.go:1304).
+func cmdAuditEvents(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale audit-events <list|get <id>>", "audit-events")
+		return 1
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return cmdAuditEventsList(args)
+	}
+	switch args[0] {
+	case subList:
+		return cmdAuditEventsList(args[1:])
+	case "get":
+		return cmdAuditEventsGet(args[1:])
+	}
+	fmt.Fprintf(os.Stderr, "unknown audit-events subcommand %q\n", args[0])
+	return 1
+}
+
+// cmdAuditEventsList implements `gregale audit-events list
+// [--kind-prefix P] [--app-id <uuid>] [--since RFC3339] [--limit N]
 // [--include-anonymous] [--verbose]`. Returns 0 on success, 2 on
 // operator error (bad flags), 1 on transport / 5xx.
-func cmdAuditEvents(args []string) int {
-	fs := flag.NewFlagSet("audit-events", flag.ContinueOnError)
+func cmdAuditEventsList(args []string) int {
+	fs := flag.NewFlagSet("audit-events list", flag.ContinueOnError)
 	kindPrefix := fs.String("kind-prefix", "", "filter by `kind` prefix (e.g. stateless.advisory)")
 	appID := fs.String("app-id", "", "filter to one app's events (matches data.app_id)")
 	since := fs.String("since", "", "RFC 3339 lower bound on `at`")
@@ -54,7 +89,7 @@ func cmdAuditEvents(args []string) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: gregale audit-events [--kind-prefix P] [--app-id <uuid>] [--since RFC3339] [--limit N] [--include-anonymous] [--verbose]")
+		fmt.Fprintln(os.Stderr, "usage: gregale audit-events list [--kind-prefix P] [--app-id <uuid>] [--since RFC3339] [--limit N] [--include-anonymous] [--verbose]")
 		return 2
 	}
 	if *since != "" {
@@ -87,6 +122,41 @@ func cmdAuditEvents(args []string) int {
 			continue
 		}
 		fmt.Printf("%s\t%s\t%s\t%s\n", e.At, e.Actor, e.Kind, subject)
+	}
+	return 0
+}
+
+// cmdAuditEventsGet fetches one audit event by id. Operator post-
+// mortem needs this — the list is newest-first capped at 100, so a
+// deeply old row is unreachable via scrolling.
+func cmdAuditEventsGet(args []string) int {
+	fs := flag.NewFlagSet("audit-events get", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale audit-events get <id>", "audit-events")
+		return 1
+	}
+	id := fs.Arg(0)
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.GetAuditEvent(context.Background(), id)
+	if err != nil {
+		return printErr("Could not fetch audit event", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	fmt.Printf("id:       %s\n", resp.ID)
+	fmt.Printf("at:       %s\n", resp.At)
+	fmt.Printf("actor:    %s\n", resp.Actor)
+	fmt.Printf("kind:     %s\n", resp.Kind)
+	fmt.Printf("subject:  %s\n", resp.Subject)
+	if len(resp.Data) > 0 {
+		fmt.Printf("data:     %s\n", string(resp.Data))
 	}
 	return 0
 }

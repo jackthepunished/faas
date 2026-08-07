@@ -18,8 +18,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 
@@ -36,13 +38,16 @@ import (
 // the account uuid + cents positionals.
 func cmdAdmin(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: gregale admin <credit>")
+		fmt.Fprintln(os.Stderr, "usage: gregale admin <credit|consume-credits>")
 		fmt.Fprintln(os.Stderr, "  gregale admin credit --reason <text> <account_uuid> <cents>")
+		fmt.Fprintln(os.Stderr, "  gregale admin consume-credits <invoice-id>")
 		return 2
 	}
 	switch args[0] {
 	case "credit":
 		return cmdAdminCredit(args[1:])
+	case "consume-credits":
+		return cmdAdminConsumeCredits(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown admin subcommand %q\n", args[0])
 		return 2
@@ -116,5 +121,64 @@ func cmdAdminCredit(args []string) int {
 		resp.ID, cents, resp.CentsRemaining, resp.AccountID)
 	_, _ = fmt.Fprintf(osStdout, "  reason:    %s\n", resp.Reason)
 	_, _ = fmt.Fprintf(osStdout, "  created:   %s\n", resp.CreatedAt.Format("2006-01-02T15:04:05Z07:00"))
+	return 0
+}
+
+// cmdAdminConsumeCredits drains an invoice's prepaid credits via
+// POST /v1/invoices/{id}/consume-credits (Tier B audit gap; the
+// dashboard has the same operation, the CLI did not). Operator
+// flow: an invoice was issued against a credit balance; once the
+// customer pays the invoice, the operator flips the credits from
+// "reserved for this invoice" to "consumed" so the audit log
+// reflects the actual cash settlement.
+//
+// Auth model: same as cmdAdminCredit — admin-scoped key + email
+// allowlist + MFA. Idempotency-Key is auto-minted by the SDK when
+// none is supplied, so a flaky-network retry is safe (the server
+// returns the same response for 24 h).
+//
+// Pre-flight scope check: the SDK does not expose the active key's
+// scopes client-side (bearer tokens are opaque, not JWT, and the
+// /v1/account response deliberately omits the scope field so a stolen
+// token read can't enumerate them). The leaf therefore cannot fail
+// closed before the round-trip — a non-admin key will hit 403 via
+// the server's requireScope(ScopesAdminOnly) gate, and printErr
+// renders the resulting APIError so the operator sees the precise
+// failure mode. A future server-side endpoint that returns the
+// active key's scopes (issue #TBD) would let this leaf short-circuit
+// without a network round-trip; for now the 403 round-trip is the
+// authoritative answer.
+func cmdAdminConsumeCredits(args []string) int {
+	fs := flag.NewFlagSet("admin consume-credits", flag.ContinueOnError)
+	idem := fs.String("idempotency-key", "", "Idempotency-Key (optional; SDK mints one if empty)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: gregale admin consume-credits [--idempotency-key K] <invoice-id>")
+		return 2
+	}
+	invoiceID := fs.Arg(0)
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.ConsumeInvoiceCredits(context.Background(), invoiceID, *idem)
+	if err != nil {
+		// Render the 403 with a hint that scopes are the likely cause —
+		// the server's Problem title is "Forbidden" and the detail
+		// names the missing scope, but a customer typing the command
+		// for the first time benefits from the breadcrumb.
+		var ae *APIError
+		if errors.As(err, &ae) && ae.Problem.Status == http.StatusForbidden {
+			return printErr("Consume-credits failed (likely missing admin scope on the active API key — use `gregale keys ls` to check, or rotate to an admin-scoped key)",
+				err)
+		}
+		return printErr("Consume-credits failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	PrintOK(osStdout, "Consumed credits on invoice %s: %d cents consumed (%d remaining).", resp.InvoiceID, resp.ConsumedCents, resp.RemainingCreditsCents)
 	return 0
 }

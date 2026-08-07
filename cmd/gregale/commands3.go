@@ -40,7 +40,7 @@ var (
 
 func cmdSecrets(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale secrets <list|set|unset> --app <slug> [args]", "secrets")
+		PrintUsage(os.Stderr, "usage: gregale secrets <list|set|unset|list-all> --app <slug> [args]", "secrets")
 		return 1
 	}
 	switch args[0] {
@@ -50,6 +50,8 @@ func cmdSecrets(args []string) int {
 		return secretsSet(args[1:])
 	case "unset":
 		return secretsUnset(args[1:])
+	case "list-all":
+		return secretsListAll(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown secrets subcommand %q\n", args[0])
 	return 1
@@ -263,5 +265,49 @@ func secretsUnset(args []string) int {
 		return printErr("Unset failed", err)
 	}
 	PrintOK(osStdout, "%s unset", key)
+	return 0
+}
+
+// --- list-all (account-wide) ----------------------------------------------
+//
+// secretsListAll walks GET /v1/secrets (account-wide; per-app sealed
+// envelopes). Operator compliance flow needs a flat row stream across
+// every app — they cannot get this view without iterating apps
+// themselves and stitching the per-app responses together.
+//
+// The wire shape carries ONLY the sealed ciphertext (no plaintext),
+// so this leaf is safe for log + JSON output. Pagination via the
+// (slug, key) cursor — same convention as /v1/invoices.
+func secretsListAll(args []string) int {
+	fs := flag.NewFlagSet("secrets list-all", flag.ContinueOnError)
+	before := fs.String("before", "", "pagination cursor from a previous call's next_before (slug|key)")
+	limit := fs.Int("limit", 100, "page size (1..200; server caps at 200)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *limit < 1 || *limit > 200 {
+		return printErr("Invalid --limit", fmt.Errorf("must be in [1,200]; got %d", *limit))
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.GetSecrets(context.Background(), *before, *limit)
+	if err != nil {
+		return printErr("List-all failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if len(resp.Secrets) == 0 {
+		_, _ = fmt.Fprintln(osStdout, "(no secrets)")
+		return 0
+	}
+	for _, s := range resp.Secrets {
+		fmt.Printf("%-32s %-32s %s\n", s.AppSlug, s.Key, s.UpdatedAt)
+	}
+	if resp.NextBefore != "" {
+		fmt.Fprintf(os.Stderr, "next page: --before %s\n", resp.NextBefore)
+	}
 	return 0
 }

@@ -28,8 +28,9 @@ Usage:
   gregale <command> [flags]
 
 Commands:
+  account      Manage the local account (account export|delete|restore|status|dpa)
   admin        Operator-only billing ops (admin credit --reason <text> <uuid> <cents>)
-  audit-events Audit-log query (--kind-prefix X --include-anonymous)
+  audit-events Audit-log query (audit-events list|get <id>)
   apps         List your apps
   apps ls      Alias for 'gregale apps'
   apps -q      Delete an app
@@ -49,14 +50,15 @@ Commands:
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
   invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
   invoices     List issued invoices
-  keys         Manage API keys
+  keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
   logs         Tail app or deployment logs (--follow)
   metrics      Per-app request / latency / cold-boot metrics (gregale metrics <slug> [--range 5m])
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
-  orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|transfer-ownership|seat-usage|invitations ...)
+  orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|transfer-ownership|seat-usage|invitations ...|me)
+  overage-cap  Set / clear the account's overage cap (--clear | <cents>)
   park         Park an app cold (kill all live instances)
   pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
   plan         Change plan (free|hobby|pro|scale)
@@ -64,7 +66,7 @@ Commands:
   queue        Inspect the wake-queue depth
   rollback     Re-promote the previous deployment
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
-  secrets      Manage env secrets on an app (--app <slug>)
+  secrets      Manage env secrets (secrets list|set|unset|list-all)
   sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
@@ -73,7 +75,7 @@ Commands:
   usage summary  Account-wide usage roll-up (gregale usage summary [--month YYYY-MM])
   version      Print the CLI version
   wake         Wake a parked app (pulls out of snapshot)
-  webhooks     Manage outbound webhooks (webhooks list|add|update|rm|deliveries|retry)
+  webhooks     Manage outbound webhooks (webhooks list|add|update|rm|deliveries|retry|rotate-secret)
   whoami       Show the authenticated account
 
 Run 'gregale <command> --help' for command details.
@@ -252,7 +254,8 @@ func run(args []string) int {
 		// /v1/audit-events surface. Default scope = caller's own
 		// account; --kind-prefix filters (stateless.advisory is
 		// the Wave 0 use case); --include-anonymous surfaces the
-		// rare subject=NULL defensive rows.
+		// rare subject=NULL defensive rows. Singular `get <id>`
+		// closes the Tier B audit gap (operator post-mortem).
 		return cmdAuditEvents(args[1:])
 	case "metrics":
 		// Move 1 PR-A: CLI twin for GET /v1/apps/{slug}/metrics.
@@ -277,6 +280,11 @@ func run(args []string) int {
 		// validates the token itself); `invitations accept <token>`
 		// requires an authenticated session + 5-min step-up.
 		return cmdInvitations(args[1:])
+	case "overage-cap":
+		// Tier B audit gap: per-account overage cap (€0.01/GB-h
+		// above the plan's included GB-h). schedd refuses new wakes
+		// once the cap is hit.
+		return cmdOverageCap(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1
