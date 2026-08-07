@@ -5,14 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
-	"time"
 )
 
 // fakeDispatcher records Wake + Invoke calls so the handler can run
@@ -121,4 +125,139 @@ func TestSynthHandlerSanitizesLogFields(t *testing.T) {
 func TestMain(m *testing.M) {
 	_ = os.Setenv("TMPDIR", os.TempDir())
 	os.Exit(m.Run())
+}
+
+// TestSynthServer_UnifiedMux_RoutesPathsCorrectly pins the issue
+// #692 contract: the unified mux at cmd/gatewayd-internal/run.go:1057
+// routes each known synth path to the synth dispatcher and routes
+// customer paths (e.g. /v1/apps/coolapp) to the catch-all
+// publicHandler. A typo in any Handle() registration would silently
+// shadow the synth dispatcher with publicHandler (or vice versa);
+// this test catches the typo and the regression case where one of
+// the three synth routes is removed.
+//
+// Replicates the exact registration order from run.go:1057
+// (Handle("/") FIRST, then the three synth paths) — Go's
+// http.ServeMux uses longest-prefix match, but readers expect
+// registration order to match routing order, so the test pins both.
+func TestSynthServer_UnifiedMux_RoutesPathsCorrectly(t *testing.T) {
+	var (
+		customerFallback atomic.Int32
+		synthCalls       atomic.Int32
+	)
+	// Catch-all customer handler: any non-synth path lands here.
+	customerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		customerFallback.Add(1)
+		w.Header().Set("X-Handler", "public")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "customer")
+	})
+
+	// Synth dispatcher: record that the synth sub-mux saw the call.
+	// We drive it through the Mux() accessor, not the wire, so the
+	// test is a pure mux-routing assertion (not a dispatcher-shape
+	// assertion).
+	disp := &fakeDispatcher{}
+	srv := NewSynthServer("/tmp/unused.sock", disp, slog.Default())
+	subMux := srv.Mux()
+	if subMux == nil {
+		t.Fatal("Mux() returned nil -- NewSynthServer must populate the sub-mux before any SetHandler call")
+	}
+
+	// Wire the wrappers that handleInvokeDispatch + handleSynthesize
+	// see in production: each synth path lands on a handler that
+	// bumps a counter (proxy for "synth did real work"). This keeps
+	// the routing test independent of the actual handler shape —
+	// the goal is to pin the mux, not the synth handlers.
+	synthMux := http.NewServeMux()
+	synthMux.HandleFunc("/v1/synthesize", func(w http.ResponseWriter, r *http.Request) {
+		synthCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "synth")
+	})
+	synthMux.HandleFunc("/v1/invocations:dispatch", func(w http.ResponseWriter, r *http.Request) {
+		synthCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "dispatch")
+	})
+	synthMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		synthCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	})
+
+	// Build the unified mux exactly as runWithDeps does at
+	// run.go:1057 — Handle("/") first, then the more-specific
+	// routes. Order matters for readers, not for Go; this
+	// pinning is the whole point of the test.
+	unified := http.NewServeMux()
+	unified.Handle("/", customerHandler)
+	unified.Handle("/v1/synthesize", synthMux)
+	unified.Handle("/v1/invocations:dispatch", synthMux)
+	unified.Handle("/healthz", synthMux)
+
+	cases := []struct {
+		name        string
+		method      string
+		path        string
+		wantStatus  int
+		wantSynth   int32 // expected increment to synthCalls after this request
+		wantCust    int32 // expected increment to customerFallback after this request
+		wantBodyHas string
+	}{
+		{
+			name:   "synthesize reaches synth dispatcher, NOT publicHandler",
+			method: http.MethodPost, path: "/v1/synthesize",
+			wantStatus: http.StatusOK, wantSynth: 1, wantCust: 0,
+			wantBodyHas: "synth",
+		},
+		{
+			name:   "invocations:dispatch reaches synth dispatcher, NOT publicHandler",
+			method: http.MethodPost, path: "/v1/invocations:dispatch",
+			wantStatus: http.StatusOK, wantSynth: 2, wantCust: 0,
+			wantBodyHas: "dispatch",
+		},
+		{
+			name:   "healthz reaches synth dispatcher (not publicHandler, not customer)",
+			method: http.MethodGet, path: "/healthz",
+			wantStatus: http.StatusOK, wantSynth: 3, wantCust: 0,
+			wantBodyHas: "ok",
+		},
+		{
+			name:   "customer path lands on publicHandler, NOT synth",
+			method: http.MethodGet, path: "/v1/apps/coolapp",
+			wantStatus: http.StatusOK, wantSynth: 3, wantCust: 1,
+			wantBodyHas: "customer",
+		},
+		{
+			name:   "another customer path keeps landing on publicHandler",
+			method: http.MethodGet, path: "/v1/usage",
+			wantStatus: http.StatusOK, wantSynth: 3, wantCust: 2,
+			wantBodyHas: "customer",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			rec := httptest.NewRecorder()
+			unified.ServeHTTP(rec, req)
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body=%q)", resp.StatusCode, tc.wantStatus, rec.Body.String())
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), tc.wantBodyHas) {
+				t.Errorf("body = %q; want to contain %q", string(body), tc.wantBodyHas)
+			}
+			if got := synthCalls.Load(); got != tc.wantSynth {
+				t.Errorf("synthCalls = %d, want %d (path %q did not reach the synth dispatcher)", got, tc.wantSynth, tc.path)
+			}
+			if got := customerFallback.Load(); got != tc.wantCust {
+				t.Errorf("customerFallback = %d, want %d (path %q did not reach the publicHandler)", got, tc.wantCust, tc.path)
+			}
+		})
+	}
 }

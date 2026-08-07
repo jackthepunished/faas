@@ -218,6 +218,12 @@ func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Durati
 		DialTLSContext: func(ctx context.Context, _ string, _ string, _ *tls.Config) (net.Conn, error) {
 			return dialWithTimeout(ctx, dialer, dialTimeout)
 		},
+		// Issue #691: bind http2.Transport defaults so a future Go
+		// stdlib default change can't widen a closed-but-reused
+		// connection window. IdleConnTimeout mirrors the H1
+		// transport at newInternalProxyTransport:149 so toggling
+		// FAAS_INTERNAL_H2C keeps idle-conn behaviour symmetric.
+		IdleConnTimeout: 90 * time.Second,
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
 	}

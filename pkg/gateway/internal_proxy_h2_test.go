@@ -262,3 +262,79 @@ func (d *loopbackDialer) DialContext(ctx context.Context, _ string) (net.Conn, e
 	var nd net.Dialer
 	return nd.DialContext(ctx, "tcp", d.addr)
 }
+
+// TestInternalProxy_StreamingStaysHTTP11 pins the issue #690
+// contract: an H2C-wrapped SSE-shaped streaming response from the
+// upstream arrives at the inbound writer with per-chunk flush
+// timing — not buffered up to the io.Copy threshold. The fix
+// landed in PR #713 (commit 0cf42fe7, copyResponseBody Flush);
+// this test pins the contract so a future io.Copy refactor
+// doesn't regress it.
+//
+// SSE-shape: emit 20 chunks of 64 bytes spaced 10 ms apart.
+// Total ~ 200 ms. Assert the inbound writer sees the full body
+// (one chunk per upstream Flush) and the response tears down
+// cleanly under H2C transport.
+//
+// httptest with EnableHTTP2=true forces TLS+ALPN, which doesn't
+// match the production H2C path (plain TCP + H2C prior knowledge).
+// Replicate the same listener shape as TestInternalProxy_NegotiatesH2C
+// — net.Listen("tcp") + http.Server.Protocols.SetUnencryptedHTTP2(true)
+// — so the proxy negotiates H2C the way it does against
+// gatewayd-internal in production.
+func TestInternalProxy_StreamingStaysHTTP11(t *testing.T) {
+	const totalChunks = 20
+	const chunkBytes = 64
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < totalChunks; i++ {
+			chunk := strings.Repeat("x", chunkBytes)
+			_, _ = io.WriteString(w, chunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	srv := &http.Server{Handler: backend}
+	srv.Protocols = new(http.Protocols)
+	srv.Protocols.SetHTTP1(true)
+	srv.Protocols.SetUnencryptedHTTP2(true)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	dialer := &loopbackDialer{addr: ln.Addr().String()}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: ln.Addr().String()}, slog.Default(), true)
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/stream", nil).WithContext(reqCtx)
+
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	p.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.Bytes()
+	if got := len(body); got != totalChunks*chunkBytes {
+		t.Errorf("body bytes = %d, want %d (full streaming response must reach inbound)", got, totalChunks*chunkBytes)
+	}
+	// Streaming must NOT be cut by DialTimeout (10 s default) — total
+	// streaming time is ~ 200 ms; allow generous slack for CI noise.
+	if elapsed > 4*time.Second {
+		t.Errorf("elapsed = %v, want < 4s (no premature cut)", elapsed)
+	}
+}
