@@ -11,8 +11,12 @@ vCPU budget.
 The shape mirrors `docs/ops/gatewayd-tls-cutover.md` — cut-over
 sequence + rollback criterion + verification + escalation. The
 sibling active-passive HA topology runbook is
-`docs/runbooks/gate-a.md` (this doc covers the multi-host
-horizontal-scale variant, not active-passive).
+[`docs/runbooks/active-passive-ha.md`](active-passive-ha.md)
+(this doc covers the multi-host horizontal-scale variant, not
+active-passive). Tier A8 / ADR-083 ships the active-passive
+lex-min leader election, warm-standby pre-warming, and DNS
+failover that closes the §14 M8 row "Gate-A runbook (2nd box
+active-passive)".
 
 > [!CAUTION]
 > **This runbook is staging-only until #250 (off-host Postgres backup) ships.**

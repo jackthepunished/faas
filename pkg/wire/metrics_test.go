@@ -199,6 +199,65 @@ func TestOpsMetrics_PgBackupLastPushedNilSafe(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_StandbyStatePreinstantiated — Tier A8 / ADR-083
+// standby-state enum gauge must surface in /metrics from boot
+// (precedent: alertEvaluatorEnabled at metrics.go:771-779 and
+// pgBackupLastPushed above). The FaasStandbyStateWarmingTooLong
+// alert queries this gauge; a missing series surfaces as "no
+// data" rather than 0, which the alert rule would misread.
+func TestOpsMetrics_StandbyStatePreinstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("gatewayd_public")
+	body := render(t, m)
+	want := `gatewayd_public_standby_state 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("missing line %q in:\n%s", want, body)
+	}
+	if got := m.StandbyState(); got != 1 {
+		t.Errorf("StandbyState() = %d, want 1 (warming)", got)
+	}
+	// Set must round-trip through both the gauge AND the shadow
+	// value (the latter is what callers read without scraping
+	// /metrics; precedent: alertEvaluatorEnabledValue).
+	m.SetStandbyState(2) // warm
+	body = render(t, m)
+	if !strings.Contains(body, `gatewayd_public_standby_state 2`) {
+		t.Errorf("gauge did not surface Set(2) value:\n%s", body)
+	}
+	if got := m.StandbyState(); got != 2 {
+		t.Errorf("StandbyState() after Set(2) = %d, want 2", got)
+	}
+	m.SetStandbyState(3) // draining
+	if got := m.StandbyState(); got != 3 {
+		t.Errorf("StandbyState() after Set(3) = %d, want 3", got)
+	}
+}
+
+// TestOpsMetrics_ActivePassiveFailoversPreinstantiated — Tier A8
+// / ADR-083 active-passive fail-over counter must surface every
+// closed outcome label in /metrics from boot (precedent:
+// liveMigrationDecisions / migratingReconcileDecisions). Operators
+// rely on the panel existing at day 1 — an idle box would
+// otherwise render the panel as "no data" until the first drain.
+func TestOpsMetrics_ActivePassiveFailoversPreinstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("gatewayd_public")
+	body := render(t, m)
+	for _, outcome := range []string{
+		"dns_flipped", "dns_stale", "peer_unreachable", "manual_drain",
+	} {
+		want := fmt.Sprintf("gatewayd_public_active_passive_failovers_total{outcome=%q} 0", outcome)
+		if !strings.Contains(body, want) {
+			t.Errorf("missing pre-instantiated label %q in:\n%s", want, body)
+		}
+	}
+	// Inc must round-trip; the dns_flipped label is the §12
+	// dashboard panel (sum over 5m for the rate).
+	m.ActivePassiveFailovers("dns_flipped").Inc()
+	body = render(t, m)
+	if !strings.Contains(body, `gatewayd_public_active_passive_failovers_total{outcome="dns_flipped"} 1`) {
+		t.Errorf("Inc did not surface value:\n%s", body)
+	}
+}
+
 // TestOpsMetrics_EgressDenyRegistryPreinstantiated (PR-E) — every
 // catalog (cidr, family) tuple must surface in /metrics from boot
 // with value 0, mirroring the OCI-pull and build histogram

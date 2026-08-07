@@ -1810,6 +1810,48 @@ const (
 	WarmHintCacheSize               = 1000
 	CertSyncIntervalSeconds         = 30
 
+	// Tier A8 (active-passive HA topology, ADR-083 — closes the
+	// §14 M8 "Gate-A runbook (2nd box active-passive)" gap left
+	// by Tier A4 + A5 + A7). Lex-min leader election lives in
+	// pkg/gateway/leader; standby warm-up + drain handoff lives
+	// in cmd/gatewayd-public (PR-B).
+	//
+	// HAFailoverProbeTimeoutMS is the per-probe HTTP HEAD timeout
+	// for the standby warm-up scraper in
+	// cmd/gatewayd-public/standby_warmup.go. Each probe pre-warms
+	// the per-app target-set cache so the new leader's first
+	// request to an app hits a warm cache (no cold-boot penalty).
+	// 500 ms is the worst-case round-trip from
+	// `gatewayd-public` → `gatewayd-internal` → cache write —
+	// much shorter than the existing wake-quiesce window. On
+	// timeout the scraper logs Warn and skips the app; the
+	// ADR-005 cold-boot safety net still serves the request.
+	// Tunable via FAAS_HA_FAILOVER_PROBE_TIMEOUT_MS.
+	//
+	// HADNSRecordStaleSeconds bounds the drain protocol in
+	// cmd/gatewayd-public/dns_handoff.go — the time between
+	// `StandbyState → draining` and `dns.DeleteRecord`. 30 s
+	// matches typical DNS TTL so the operator's resolver cache
+	// stays honest, and bounds the operator's `kubectl drain`
+	// analog (a stuck drain doesn't block the operator). On
+	// expiry the leader increments
+	// `gateway_active_passive_failovers_total{outcome="peer_unreachable"}`
+	// and the runbook's manual drain command kicks in.
+	// Tunable via FAAS_HA_DNS_RECORD_STALE_SECONDS.
+	//
+	// HAStandbyWarmupIntervalMS is the cadence at which a standby
+	// re-scrapes cmd/gatewayd-internal on each known app's
+	// hostname. The full per-app cache TTL is
+	// HAStandbyWarmupIntervalMS × targetSetCacheTTL; tuned so the
+	// standby's cache is always within one scrape of the leader's
+	// cache. Tunable via FAAS_HA_STANDBY_WARMUP_INTERVAL_MS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	HAFailoverProbeTimeoutMS  = 500
+	HADNSRecordStaleSeconds   = 30
+	HAStandbyWarmupIntervalMS = 500
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 
