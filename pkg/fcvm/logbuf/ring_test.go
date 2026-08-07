@@ -231,14 +231,37 @@ func TestRing_Subscribe(t *testing.T) {
 	}
 }
 
+func TestRing_SnapshotAndSubscribe(t *testing.T) {
+	r := New(1 << 20)
+	if _, err := r.Write("stdout", []byte("before\n")); err != nil {
+		t.Fatalf("Write before: %v", err)
+	}
+	snapshot, ch, cancel := r.SnapshotAndSubscribe(1)
+	defer cancel()
+	if len(snapshot) != 1 || snapshot[0].Line != "before" {
+		t.Fatalf("snapshot = %v, want one line before", snapshot)
+	}
+	if _, err := r.Write("stdout", []byte("after\n")); err != nil {
+		t.Fatalf("Write after: %v", err)
+	}
+	select {
+	case line := <-ch:
+		if line.Line != "after" {
+			t.Errorf("live line = %q, want after", line.Line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for live line")
+	}
+}
+
 // TestRing_ConcurrentWrites pins the contract that two goroutines writing
 // concurrently do not race, do not lose lines, and do not corrupt sequence
 // numbers. This is what the production path looks like: the VM's stdout and
 // stderr each push onto the same ring through two separate Writers.
 //
 // We assert the buffer is FIFO within each Write chunk (no torn lines),
-// and the highest Seq equals the total committed line count, which is
-// the property a slow consumer would rely on to resume correctly.
+// and the highest Seq equals the total committed line count, which is the
+// property a slow consumer would rely on to resume correctly.
 func TestRing_ConcurrentWrites(t *testing.T) {
 	const perGoroutine = 1000
 	r := New(8 << 20)
