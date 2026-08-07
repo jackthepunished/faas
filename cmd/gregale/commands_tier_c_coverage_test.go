@@ -163,6 +163,6 @@ func TestTierCRenderInvoicesEmpty(t *testing.T) {
 
 // _ keeps the strings + io package imports lint-clean.
 var (
-	_ = strings.HasPrefix
+	_           = strings.HasPrefix
 	_ io.Writer = devNull{}
 )
