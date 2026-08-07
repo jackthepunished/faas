@@ -163,6 +163,7 @@ func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult
 func (nopProvider) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
 	return 0, billing.ErrNotImplemented
 }
+func (nopProvider) Capabilities() billing.CapabilitySet { return 0 }
 
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
 // runWithDeps must not invoke the metricsListenAndServe factory at all. This
@@ -544,6 +545,17 @@ func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, in
 	defer r.mu.Unlock()
 	r.calls++
 	return nil
+}
+
+// Capabilities returns the Stripe-shaped set the meter pusher loop
+// observes in production for the surfaces this stub actually
+// implements. The metered usage + sandbox surfaces are exercised
+// by the shadow test; Refund is intentionally omitted from the
+// capability bitmask because the stub's Refund() returns
+// ErrNotImplemented (the real *stripe.Client implements Refund —
+// the stub is intentionally minimal).
+func (r *meterRec) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapUsageMetered | billing.CapSandbox)
 }
 
 func (r *meterRec) Calls() int {

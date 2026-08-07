@@ -58,6 +58,50 @@ const (
 	providerPaddle = "paddle"
 )
 
+// ProviderMeta describes one registered billing provider for the
+// admin/CLI surface (GET /v1/admin/billing-provider, `faas billing
+// status`). The Capabilities field is populated by constructing a
+// throwaway provider instance with empty secrets — the constructors
+// are cheap (no network until EnsurePlanProducts / PushUsageRecord)
+// and the static capability set is identical to the live one.
+type ProviderMeta struct {
+	// Name is the FAAS_BILLING_PROVIDER literal ("stripe", "paddle").
+	Name string
+	// Capabilities is the bitset the Provider reports.
+	Capabilities billing.CapabilitySet
+	// EnvVars lists the env-var names the provider reads at boot.
+	// Surfaced for operator documentation; the runtime semantics
+	// live in the provider's config.go (PR-P2).
+	EnvVars []string
+}
+
+// Providers returns the canonical list of registered billing providers.
+// The list is stable across runs and is the single source of truth
+// for the provider's identity + capabilities. Adding a new provider
+// is one entry here (PR-P5 turns this into a registry map).
+//
+// The returned slice is independent of the active provider — callers
+// combine it with the loaded provider's Capabilities() to render
+// the active state. The capability sets here come from constructing
+// throwaway provider instances with no secrets; the constructors
+// are pure so no network hits occur.
+func Providers() []ProviderMeta {
+	stripeProv := stripe.NewClient(nil, nil, "", "", nil)
+	paddleProv := paddle.NewProvider("", "", false, nil)
+	return []ProviderMeta{
+		{
+			Name:         providerStripe,
+			Capabilities: stripeProv.Capabilities(),
+			EnvVars:      []string{"STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET"},
+		},
+		{
+			Name:         providerPaddle,
+			Capabilities: paddleProv.Capabilities(),
+			EnvVars:      []string{"FAAS_PADDLE_API_KEY", "FAAS_PADDLE_WEBHOOK_SECRET", "FAAS_PADDLE_SANDBOX"},
+		},
+	}
+}
+
 // LoadProviderForAPID returns a billing.Provider for apid's webhook
 // ingress + changePlan handler.
 //

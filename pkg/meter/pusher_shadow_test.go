@@ -122,6 +122,17 @@ func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account,
 	return r.err
 }
 
+// Capabilities returns the Stripe-shaped set the meter pusher
+// observes in production for the surfaces this stub actually
+// implements. The shadow test exercises the metered usage +
+// sandbox surfaces; Refund is intentionally omitted from the
+// bitmask because the stub's Refund() returns ErrNotImplemented
+// (the real *stripe.Client implements Refund — the stub is
+// intentionally minimal).
+func (r *recordingStripe) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapUsageMetered | billing.CapSandbox)
+}
+
 // ClassifyPushError opts recordingStripe into the meterd pusher's
 // billing.Classifier dispatch (added with the big-Paddle-enablement
 // PR). The meterd pusher's classifier seam feeds synthetic errors

@@ -149,6 +149,15 @@ func (r *Reconciler) reconcileOne(ctx context.Context, acct state.Account, start
 	if acct.Plan == api.PlanFree {
 		return nil
 	}
+	// Capability short-circuit: if the active provider does not
+	// implement ReconcileUsage (Paddle today, since Paddle Billing
+	// has no usage-summary endpoint), skip the SDK call entirely.
+	// The errors.Is(err, billing.ErrNotImplemented) fallback below
+	// remains as a defensive check for older stub Client/Provider
+	// instances that haven't opted into Capabilities().
+	if !r.Provider.Capabilities().Has(billing.CapUsageReconcile) {
+		return nil
+	}
 	rows, err := r.Store.UsageByHour(ctx, acct.ID, start, end)
 	if err != nil {
 		return fmt.Errorf("usage by hour: %w", err)

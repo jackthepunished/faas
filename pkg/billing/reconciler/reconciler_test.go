@@ -23,6 +23,7 @@ import (
 type stubProvider struct {
 	pushed int64
 	err    error
+	caps   billing.CapabilitySet
 }
 
 func (s *stubProvider) EnsurePlanProducts(context.Context) error { return nil }
@@ -43,6 +44,9 @@ func (s *stubProvider) Refund(context.Context, string, int64) (*billing.RefundRe
 }
 func (s *stubProvider) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Time) (int64, error) {
 	return s.pushed, s.err
+}
+func (s *stubProvider) Capabilities() billing.CapabilitySet {
+	return s.caps
 }
 
 // seedMemStore constructs a MemStore with one account + a row
@@ -101,7 +105,7 @@ var _ = listAcctIDs // keep the helper exported for future tests
 // BillingDrift alert expects to see in production.
 func TestReconciler_ZeroDriftIsHappyPath(t *testing.T) {
 	store, id := seedMemStore(t, "acct_a", api.PlanHobby, 3600)
-	prov := &stubProvider{pushed: 3600}
+	prov := &stubProvider{pushed: 3600, caps: billing.CapabilitySet(billing.CapUsageReconcile)}
 	rec := New("stripe", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := rec.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -130,7 +134,7 @@ func TestReconciler_ZeroDriftIsHappyPath(t *testing.T) {
 // 0.005; this test pins the formula.
 func TestReconciler_EmitsDriftOnMismatch(t *testing.T) {
 	store, id := seedMemStore(t, "acct_drift", api.PlanHobby, 1000)
-	prov := &stubProvider{pushed: 990}
+	prov := &stubProvider{pushed: 990, caps: billing.CapabilitySet(billing.CapUsageReconcile)}
 	rec := New("stripe", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := rec.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -158,7 +162,13 @@ func TestReconciler_EmitsDriftOnMismatch(t *testing.T) {
 // for one account does not block the loop or fail RunOnce.
 func TestReconciler_ProviderErrorFailsSoft(t *testing.T) {
 	store, _ := seedMemStore(t, "acct_err", api.PlanHobby, 500)
-	prov := &stubProvider{err: errors.New("transient stripe blip")}
+	// caps advertises CapUsageReconcile so the new short-circuit
+	// does NOT skip the SDK call — the fail-soft-on-provider-error
+	// path must still be exercised by this test.
+	prov := &stubProvider{
+		err:  errors.New("transient stripe blip"),
+		caps: billing.CapabilitySet(billing.CapUsageReconcile),
+	}
 	rec := New("stripe", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := rec.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce should not fail-soft propagate: %v", err)
@@ -170,7 +180,13 @@ func TestReconciler_ProviderErrorFailsSoft(t *testing.T) {
 // signal" rather than an error.
 func TestReconciler_ErrNotImplementedSkipped(t *testing.T) {
 	store, id := seedMemStore(t, "acct_p", api.PlanHobby, 1234)
-	prov := &stubProvider{err: billing.ErrNotImplemented}
+	// caps advertises CapUsageReconcile so the new short-circuit
+	// does NOT skip the SDK call — the errors.Is(err, ErrNotImplemented)
+	// swallow path must still be exercised by this test.
+	prov := &stubProvider{
+		err:  billing.ErrNotImplemented,
+		caps: billing.CapabilitySet(billing.CapUsageReconcile),
+	}
 	rec := New("paddle", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := rec.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce should swallow ErrNotImplemented: %v", err)
@@ -187,6 +203,46 @@ func TestReconciler_ErrNotImplementedSkipped(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if strings.Contains(string(body), `account_id="`+id+`"`) {
 		t.Errorf("expected no gauge for ErrNotImplemented account, got:\n%s", body)
+	}
+}
+
+// TestReconciler_CapabilityShortCircuit confirms the new
+// Capabilities() check skips the SDK call entirely when the provider
+// does not advertise CapUsageReconcile (Paddle today). This pins the
+// detour that prevents the zero-pushed-but-non-zero-local drift
+// ratio from paging the BillingDrift alert on a Paddle box.
+//
+// Tripwire design: the seedMemStore seeds 1234 mb_seconds and the
+// stub returns pushed=999 with err=nil. If the short-circuit were
+// removed, the reconciler would compute drift = 1234 − 999 = 235,
+// emit a gauge with account_id, and the strings.Contains assertion
+// below would fail. A broken short-circuit therefore fails this
+// test with a clear signal (the local and pushed sums must NOT
+// be equal so Prometheus emits a non-zero gauge).
+func TestReconciler_CapabilityShortCircuit(t *testing.T) {
+	store, id := seedMemStore(t, "acct_paddle", api.PlanHobby, 1234)
+	// Stub advertises NO CapUsageReconcile. pushed differs from
+	// the seeded local sum so a non-short-circuited call would
+	// produce a non-zero gauge that Prometheus actually emits.
+	prov := &stubProvider{
+		pushed: 999,
+		err:    nil,
+		// caps is zero-valued — no CapUsageReconcile.
+	}
+	rec := New("paddle", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err := rec.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce should swallow the short-circuit (no SDK call): %v", err)
+	}
+	srv := httptest.NewServer(rec.Handler())
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("scrape GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), `account_id="`+id+`"`) {
+		t.Errorf("short-circuit should NOT emit any gauge for capability-skipped account, got:\n%s", body)
 	}
 }
 
