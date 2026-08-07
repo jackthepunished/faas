@@ -1051,7 +1051,7 @@ func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
 	// The body goroutine parks inside cr.Read (the ctxReader
 	// wrapper at forwardproxy.go:555-556) until the cancel
 	// propagates from r.Context().
-	body := &blockingReader{ctx: ctx}
+	body := &blockingReader{ctx: ctx, exitedCh: make(chan struct{})}
 
 	// blockingStream blocks Recv on ctx.Done(); the receiver
 	// loop is parked inside stream.Recv until the cancel
@@ -1100,7 +1100,9 @@ func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
 	if !stream.recvExited() {
 		t.Errorf("Recv did not exit on ctx cancel — receiver loop teardown regressed")
 	}
-	if !body.exited() {
+	select {
+	case <-body.exitedCh:
+	case <-time.After(2 * time.Second):
 		t.Errorf("blocking body did not exit on ctx cancel — ctxReader cancellation path regressed")
 	}
 }
@@ -1111,8 +1113,9 @@ func TestRawStreamReverseProxy_ClientCancel_TearsDownStream(t *testing.T) {
 // the ctxReader cancellation path at
 // pkg/gateway/forwardproxy.go:555-556 (issue #471 review F3 fix).
 type blockingReader struct {
-	ctx       context.Context
-	hasExited atomic.Bool
+	ctx      context.Context
+	exitedCh chan struct{}
+	exitOnce sync.Once
 }
 
 func (b *blockingReader) Read(_ []byte) (int, error) {
@@ -1121,12 +1124,10 @@ func (b *blockingReader) Read(_ []byte) (int, error) {
 	// test asserts this Read returns within 2 s of
 	// cancel.
 	<-b.ctx.Done()
-	b.hasExited.Store(true)
+	b.exitOnce.Do(func() {
+		close(b.exitedCh)
+	})
 	return 0, b.ctx.Err()
-}
-
-func (b *blockingReader) exited() bool {
-	return b.hasExited.Load()
 }
 
 // blockingRawBidiStream implements grpc.BidiStreamingClient and

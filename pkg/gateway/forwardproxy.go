@@ -347,13 +347,13 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				}
 			}
 			if errors.Is(err, io.EOF) {
-				bodyErrCh <- nil
 				_ = stream.CloseSend()
+				bodyErrCh <- nil
 				return
 			}
 			if err != nil {
-				bodyErrCh <- err
 				_ = stream.CloseSend()
+				bodyErrCh <- err
 				return
 			}
 		}
@@ -565,13 +565,13 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				}
 			}
 			if errors.Is(err, io.EOF) {
-				bodyErrCh <- nil
 				_ = stream.CloseSend()
+				bodyErrCh <- nil
 				return
 			}
 			if err != nil {
-				bodyErrCh <- err
 				_ = stream.CloseSend()
+				bodyErrCh <- err
 				return
 			}
 		}

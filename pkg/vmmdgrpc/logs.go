@@ -122,14 +122,13 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 	}
 	// Initial page: lines with Seq > since_seq in commit order, plus
 	// the since_written_at filter (issue #517 / PR-B acceptance #3).
-	// The ring's Snapshot filters by Seq >= sinceSeq (>= so a
-	// sinceSeq equal to the last seq is still considered replayed;
-	// the caller who wants strict "after" semantics passes seq+1);
-	// the local sinceTime bound is applied in the same linear scan
-	// — a separate filter pass would double the work for the
-	// common case where only one bound is set.
+	// SnapshotAndSubscribe registers the live subscriber under the same
+	// lock as the snapshot so a line committed between these phases is
+	// buffered for the live tail instead of being lost.
+	snapshot, ch, cancel := ring.SnapshotAndSubscribe(req.GetSinceSeq())
+	defer cancel()
 	sinceTime := req.GetSinceWrittenAt().AsTime()
-	for _, line := range ring.Snapshot(req.GetSinceSeq()) {
+	for _, line := range snapshot {
 		if !sinceTime.IsZero() && line.WrittenAt.Before(sinceTime) {
 			continue
 		}
@@ -138,10 +137,9 @@ func (s *Server) Logs(req *vmmdpb.LogsRequest, stream vmmdpb.Vmmd_LogsServer) er
 			return err
 		}
 	}
-	// Live tail. Subscribe returns an independent buffered channel per
-	// subscriber; concurrent subscribers do not share backpressure.
-	ch, cancel := ring.Subscribe()
-	defer cancel()
+	// Live tail. SnapshotAndSubscribe returns an independent buffered
+	// channel per subscriber; concurrent subscribers do not share
+	// backpressure.
 	for {
 		select {
 		case <-stream.Context().Done():

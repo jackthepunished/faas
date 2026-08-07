@@ -194,6 +194,10 @@ func (r *Ring) commitLocked(stream, line string, now time.Time) {
 func (r *Ring) Snapshot(sinceSeq int64) []Line {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.snapshotLocked(sinceSeq)
+}
+
+func (r *Ring) snapshotLocked(sinceSeq int64) []Line {
 	if r.size == 0 || sinceSeq <= 0 {
 		return nil
 	}
@@ -201,15 +205,13 @@ func (r *Ring) Snapshot(sinceSeq int64) []Line {
 	// fine — size is bounded by maxBytes/avgLineLen and the snapshot path
 	// runs on gRPC attach, not on every line.
 	start := 0
-	if sinceSeq > 0 {
-		for k := 0; k < r.size; k++ {
-			if r.lines[(r.head+k)%cap(r.lines)].Seq >= sinceSeq {
-				start = k
-				break
-			}
-			if k == r.size-1 {
-				return nil
-			}
+	for k := 0; k < r.size; k++ {
+		if r.lines[(r.head+k)%cap(r.lines)].Seq >= sinceSeq {
+			start = k
+			break
+		}
+		if k == r.size-1 {
+			return nil
 		}
 	}
 	out := make([]Line, r.size-start)
@@ -217,6 +219,20 @@ func (r *Ring) Snapshot(sinceSeq int64) []Line {
 		out[k] = r.lines[(r.head+start+k)%cap(r.lines)]
 	}
 	return out
+}
+
+func (r *Ring) SnapshotAndSubscribe(sinceSeq int64) ([]Line, <-chan Line, func()) {
+	ch := make(chan Line, 64)
+	r.mu.Lock()
+	snapshot := r.snapshotLocked(sinceSeq)
+	if r.closed {
+		r.mu.Unlock()
+		close(ch)
+		return snapshot, ch, func() {}
+	}
+	r.subs = append(r.subs, ch)
+	r.mu.Unlock()
+	return snapshot, ch, r.cancelSubscription(ch)
 }
 
 // Subscribe returns a channel that receives every committed Line from now
@@ -238,32 +254,29 @@ func (r *Ring) Subscribe() (<-chan Line, func()) {
 	}
 	r.subs = append(r.subs, ch)
 	r.mu.Unlock()
-	cancel := func() {
+	return ch, r.cancelSubscription(ch)
+}
+
+func (r *Ring) cancelSubscription(ch chan Line) func() {
+	return func() {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		// Close() may have already detached and closed this channel;
-		// don't double-close (panic). r.closed is set inside the same
-		// lock acquisition Close takes, so reading it under r.mu
-		// gives us the right answer even on a Close/cancel race.
 		if r.closed {
 			return
 		}
 		for i, c := range r.subs {
-			if c == ch {
-				r.subs = append(r.subs[:i], r.subs[i+1:]...)
-				break
+			if c != ch {
+				continue
 			}
+			r.subs = append(r.subs[:i], r.subs[i+1:]...)
+			select {
+			case <-ch:
+			default:
+			}
+			close(ch)
+			return
 		}
-		// Drain any pending Line so the channel's consumer sees a clean
-		// EOF rather than a stuck goroutine on a Send. After cancel we
-		// close the channel so range over it exits.
-		select {
-		case <-ch:
-		default:
-		}
-		close(ch)
 	}
-	return ch, cancel
 }
 
 // LowestRetainedSeq reports the Seq of the oldest line currently
