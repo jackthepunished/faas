@@ -244,18 +244,6 @@ type Instance struct {
 	// the dispatch path is tolerant of "" and skips the flip.
 	DeploymentID string
 
-	// LastLivenessDestroyAt (issue #554 closure / ADR-078 cooldown
-	// gate) is the wall-clock time of the most recent
-	// ReportLivenessFailed on this instance. The next loop
-	// incarnation on the cold-boot replacement instance reads it
-	// via Manager.LastLivenessDestroyAt and short-circuits any
-	// probe failures that fall inside the cfg.CooldownSeconds
-	// window — prevents the "noisy cold boot gets torn down by
-	// 3 consecutive probe failures" failure mode the customer
-	// surfaced. Zero value means "no destroy ever recorded" →
-	// the gate is bypassed (legacy behaviour preserved).
-	LastLivenessDestroyAt time.Time
-
 	// AllowlistHandleV4 / V6 are the nft handles of the
 	// per-netns allowlist accept rules captured at Wake time (or
 	// at the previous successful UpdateEgressAllowlist). Used by
@@ -413,6 +401,20 @@ type Manager struct {
 	// globally unique per live instance (slot is allocated
 	// linearly by the allocator). Guarded by mu.
 	cidToID map[uint32]string
+	// cooldownByDeployment (issue #554 closure / ADR-078, code
+	// review #725 finding F1) is the per-deployment liveness
+	// cooldown stamp map. Keyed on deployments.id (the
+	// deploymentID that survives across cold boots: schedd
+	// threads it into the new Instance row at CreateInstance and
+	// Wake stamps it onto the live record at BringUp, so the
+	// cold-boot replacement can read the stamp the dying instance
+	// wrote). The previous design stamped the dying Instance and
+	// Park deleted the entry — the replacement saw zero and the
+	// gate was structurally a no-op in production. Stamps are
+	// written by ReportLivenessFailed; reads are by the
+	// per-instance liveness loop via
+	// LastLivenessDestroyAtForDeployment. Guarded by mu.
+	cooldownByDeployment map[string]time.Time
 	// metrics is the cold-boot fallback counter (vmmd_cold_boot_fallback_total).
 	// nil-safe: bringUp calls m.metrics.ObserveFallback() which no-ops when nil,
 	// so unit tests that construct a Manager without metrics don't need a stub.
@@ -584,6 +586,7 @@ func NewManager(run Runner, vmm VMM, paths Paths, fcVersion string, log *slog.Lo
 		// for the framework_ready DGRAM receipt path. See the
 		// cidToID field comment for the lifecycle.
 		cidToID:              make(map[uint32]string),
+		cooldownByDeployment: make(map[string]time.Time),
 		metrics:              metrics,
 		conntrackCap:         api.ConntrackCapProbe(),
 		characterizationWait: api.CharacterizationHostDeadline,
@@ -806,9 +809,13 @@ type LivenessFailedSink func(ctx context.Context, instanceID, reason string)
 // than a panic.
 //
 // The signature takes the parent ctx (cmd vmmd lifecycle), the
-// instance id, the lease slot for the per-VM vsock CID, and the
-// resolved cfg. Returns the cancel func (or nil).
-type LivenessProbeStarter func(ctx context.Context, instance string, slot int, cfg LivenessProbeConfig) context.CancelFunc
+// instance id, the lease slot for the per-VM vsock CID, the
+// deployment id (for the cooldown gate stamp key — survives
+// across cold boots), and the resolved cfg. Returns the cancel
+// func (or nil). Empty deploymentID is allowed (legacy pre-PR-B
+// callers that don't carry deployment_id on the wire); the gate
+// falls back to the bypass branch in that case.
+type LivenessProbeStarter func(ctx context.Context, instance string, slot int, deploymentID string, cfg LivenessProbeConfig) context.CancelFunc
 
 // WithLivenessProbeStarter attaches the cmd-level loop launcher
 // (issue #554 / ADR-078). Same nil-safe + chaining pattern as the
@@ -869,27 +876,52 @@ func (m *Manager) DeleteLivenessConsecutiveFailures(instance string) {
 // path is a no-op so a unit test that doesn't construct a relay
 // doesn't have to stub one.
 //
-// Side effect (issue #554 closure / ADR-078 cooldown gate):
-// stamps the instance's LastLivenessDestroyAt so the next
-// liveness-loop incarnation (on the cold-boot instance that
-// replaces this one) can short-circuit fires within the
-// configured CooldownSeconds window. See
-// Manager.LastLivenessDestroyAt + cmd/vmmd/liveness_recv.go's
-// cooldown gate for the consumer.
+// Side effect (issue #554 closure / ADR-078 cooldown gate, code
+// review #725 finding F1): stamps the Manager's
+// cooldownByDeployment[deploymentID] = now so the next
+// liveness-loop incarnation on the cold-boot replacement instance
+// (which inherits deploymentID from schedd's CreateInstance) can
+// short-circuit fires within the configured CooldownSeconds
+// window. Stamping on the dying Instance was structurally broken:
+// Park deletes the live-map entry and the replacement carries a
+// fresh zero-valued Instance{}, so the gate was a no-op in
+// production. See Manager.LastLivenessDestroyAtForDeployment +
+// cmd/vmmd/liveness_recv.go's cooldown gate for the consumer.
+//
+// Legacy call sites that stamped Instance.LastLivenessDestroyAt
+// were removed; the field itself is gone (the dying instance is
+// about to be Parked anyway).
 func (m *Manager) ReportLivenessFailed(ctx context.Context, instanceID, reason string) {
 	if m.livenessRelay == nil {
 		return
 	}
 	m.livenessRelay(ctx, instanceID, reason)
-	// Stamp LastLivenessDestroyAt for the cooldown gate. We do
-	// this even when livenessRelay is nil-skip above for tests
-	// that want to exercise the gate without the schedd sink.
+	// Stamp cooldownByDeployment. We do this even when
+	// livenessRelay is nil-skipped above so tests can exercise
+	// the gate without the schedd sink.
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if inst, ok := m.live[instanceID]; ok {
-		now := time.Now()
-		inst.LastLivenessDestroyAt = now
+	inst, ok := m.live[instanceID]
+	if !ok {
+		// The instance has already been Parked between the
+		// sink call and the stamp; the gate is moot for this
+		// fire (no replacement will read it). Log + skip.
+		m.log.Debug("liveness: stamp skipped (instance not live)",
+			"instance", instanceID, "reason", reason)
+		return
 	}
+	if inst.DeploymentID == "" {
+		// Legacy wake path (pre-PR-B) carries no deployment_id
+		// on the wire. The gate cannot key on "" (every legacy
+		// wake would collide), so we skip the stamp and the
+		// gate falls back to the AlwaysSample behaviour for
+		// this instance. Logged Warn so operators can spot
+		// legacy callers in the wild.
+		m.log.Debug("liveness: stamp skipped (no deployment_id on instance)",
+			"instance", instanceID, "reason", reason)
+		return
+	}
+	m.cooldownByDeployment[inst.DeploymentID] = time.Now()
 }
 
 // LivenessProbeConfig is the per-instance configuration the schedd-side
@@ -1079,12 +1111,24 @@ func (m *Manager) startLivenessLoop(ctx context.Context, instance string, slot i
 	// cmd helper a closure that knows how to launch the loop and
 	// return its cancel func; the cmd wires that helper via
 	// WithLivenessProbeStarter.
+	//
+	// Resolve deploymentID from the live map so the cooldown gate
+	// can stamp on a key that survives across cold boots (code
+	// review #725 finding F1). An empty deploymentID is fine —
+	// legacy pre-PR-B callers carry "" on the wire; the gate
+	// falls back to the bypass branch in that case.
+	deploymentID := ""
+	m.mu.Lock()
+	if inst, ok := m.live[instance]; ok {
+		deploymentID = inst.DeploymentID
+	}
+	m.mu.Unlock()
 	if m.livenessStarter == nil {
 		m.log.Warn("liveness: registry wired but no starter; loop will not run",
 			"instance", instance)
 		return
 	}
-	cancelFn := m.livenessStarter(ctx, instance, slot, cfg)
+	cancelFn := m.livenessStarter(ctx, instance, slot, deploymentID, cfg)
 	if cancelFn != nil {
 		m.livenessRegistry.StartProbeLoop(instance, cancelFn)
 	}
@@ -2564,35 +2608,53 @@ func (m *Manager) LiveInstances() map[string]*Instance {
 	return out
 }
 
-// LastLivenessDestroyAt (issue #554 closure / ADR-078 cooldown
-// gate) returns the most recent ReportLivenessFailed stamp on
-// the named instance, or the zero time if no destroy has been
-// recorded. The cmd/vmmd liveness_recv loop reads this on every
-// tick and short-circuits fires within cfg.CooldownSeconds. The
-// read is under m.mu; the stamp side is too (see ReportLivenessFailed).
-// Returns zero time on a nil receiver or unknown instance so the
-// gate's bypass branch fires cleanly on cold-boot.
-func (m *Manager) LastLivenessDestroyAt(instanceID string) time.Time {
-	if m == nil {
+// LastLivenessDestroyAtForDeployment (issue #554 closure /
+// ADR-078 cooldown gate, code review #725 finding F1) returns the
+// most recent ReportLivenessFailed stamp for the named deployment,
+// or the zero time if no destroy has been recorded. The cmd/vmmd
+// liveness_recv loop reads this on every tick (keyed on the
+// cold-boot replacement's deploymentID, which inherits across
+// wakes because schedd threads it into the new Instance row at
+// CreateInstance) and short-circuits fires within
+// cfg.CooldownSeconds. The read is under m.mu; the stamp side is
+// too (see ReportLivenessFailed). Returns zero time on a nil
+// receiver or unknown deployment so the gate's bypass branch
+// fires cleanly on cold-boot and on the legacy pre-PR-B path
+// (no deployment_id on the wire).
+//
+// The previous design keyed on instanceID via the dying Instance's
+// LastLivenessDestroyAt field. That was structurally broken in
+// production: Park deletes the live-map entry, the cold-boot
+// replacement carries a fresh zero-valued Instance{}, and the gate
+// was a no-op. Keying on deploymentID survives the cold-boot
+// because schedd's CreateInstance threads deploymentID into the
+// new Instance row and Wake stamps it onto the live record at
+// BringUp.
+func (m *Manager) LastLivenessDestroyAtForDeployment(deploymentID string) time.Time {
+	if m == nil || deploymentID == "" {
 		return time.Time{}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	inst, ok := m.live[instanceID]
-	if !ok {
-		return time.Time{}
-	}
-	return inst.LastLivenessDestroyAt
+	return m.cooldownByDeployment[deploymentID]
 }
 
 // RegisterInstanceForTest is a test-only seam that injects an
 // instance into the live map so cooldown / liveness unit tests
-// (cmd/vmmd/liveness_recv_test.go) can drive Manager.LastLivenessDestroyAt
-// without going through the full BringUp path. The BringUp path
-// requires Runner + VMM + real netns which a unit test doesn't
-// have. The function name is verbose on purpose — production code
-// MUST NOT call this. Returns the manager for chaining.
-func (m *Manager) RegisterInstanceForTest(instanceID string) *Manager {
+// (cmd/vmmd/liveness_recv_test.go) can drive
+// Manager.LastLivenessDestroyAtForDeployment without going through
+// the full BringUp path. The BringUp path requires Runner + VMM +
+// real netns which a unit test doesn't have. The function name is
+// verbose on purpose — production code MUST NOT call this.
+// Returns the manager for chaining.
+//
+// `deploymentID` is the deployments.id that the cold-boot
+// replacement would inherit; the stamp lives at
+// cooldownByDeployment[deploymentID], not on the Instance, so the
+// stamp survives the test's Register→SetLivenessDestroy sequence
+// even if the Instance is replaced. Empty deploymentID skips the
+// stamp seam (legacy pre-PR-B path is also exempt).
+func (m *Manager) RegisterInstanceForTest(instanceID, deploymentID string) *Manager {
 	if m == nil {
 		return m
 	}
@@ -2601,28 +2663,36 @@ func (m *Manager) RegisterInstanceForTest(instanceID string) *Manager {
 	if m.live == nil {
 		m.live = map[string]*Instance{}
 	}
+	if m.cooldownByDeployment == nil {
+		m.cooldownByDeployment = map[string]time.Time{}
+	}
 	if _, ok := m.live[instanceID]; !ok {
-		m.live[instanceID] = &Instance{}
+		m.live[instanceID] = &Instance{DeploymentID: deploymentID}
+	} else if deploymentID != "" {
+		// Update the DeploymentID on an existing entry so the
+		// test-side stamp matches the test-side loop's read key.
+		m.live[instanceID].DeploymentID = deploymentID
 	}
 	return m
 }
 
-// SetLastLivenessDestroyAtForTest is a test-only seam that
-// stamps LastLivenessDestroyAt on a previously-registered
-// instance. Mirrors the production ReportLivenessFailed side
-// effect without driving the schedd relay. Test-only by naming
-// convention.
-func (m *Manager) SetLastLivenessDestroyAtForTest(instanceID string, t time.Time) {
-	if m == nil {
+// SetLastLivenessDestroyAtForDeployment is a test-only seam that
+// stamps Manager.cooldownByDeployment[deploymentID] = t. Mirrors
+// the production ReportLivenessFailed side effect without driving
+// the schedd relay. Test-only by naming convention. Empty
+// deploymentID is a no-op so a test that forgets to register the
+// deployment fails closed (no stamp → gate bypasses, no false
+// short-circuit).
+func (m *Manager) SetLastLivenessDestroyAtForDeployment(deploymentID string, t time.Time) {
+	if m == nil || deploymentID == "" {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	inst, ok := m.live[instanceID]
-	if !ok {
-		return
+	if m.cooldownByDeployment == nil {
+		m.cooldownByDeployment = map[string]time.Time{}
 	}
-	inst.LastLivenessDestroyAt = t
+	m.cooldownByDeployment[deploymentID] = t
 }
 
 // SnapshotLive returns a copy of the (instanceID, vethHost) map

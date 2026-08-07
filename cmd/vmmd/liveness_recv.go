@@ -86,12 +86,13 @@ type livenessProbeConfig = fcvm.LivenessProbeConfig
 // Destroy race can stop the loop without waiting for the next
 // tick.
 type livenessProbeLoop struct {
-	instance string
-	cfg      livenessProbeConfig
-	cid      uint32
-	mgr      *fcvm.Manager
-	log      *slog.Logger
-	count    int // current consecutive-failure count
+	instance     string
+	deploymentID string // set from WakeRequest at BringUp; survives across cold boots (code review #725 F1)
+	cfg          livenessProbeConfig
+	cid          uint32
+	mgr          *fcvm.Manager
+	log          *slog.Logger
+	count        int // current consecutive-failure count
 	// probeFn is the test seam: production code uses dialAndProbe
 	// (real AF_VSOCK), tests inject a stub that returns the
 	// closed-set outcome string ("ok", "non_200", "timeout",
@@ -159,26 +160,35 @@ func (l *livenessProbeLoop) runOne(ctx context.Context, timeoutMs int) {
 	elapsed := time.Since(start).Seconds()
 	l.mgr.ObserveLivenessProbe(outcome, elapsed)
 
-	// Cooldown gate (issue #554 closure / ADR-078). After a
-	// successful liveness destroy the cold-boot replacement
-	// instance has a grace window: probes that fail within
-	// cfg.CooldownSeconds of the previous destroy are
-	// short-circuited — we increment nothing, fire nothing,
-	// and let the cold-boot instance settle. The gate
+	// Cooldown gate (issue #554 closure / ADR-078, code review
+	// #725 finding F1). After a successful liveness destroy the
+	// cold-boot replacement instance has a grace window: probes
+	// that fail within cfg.CooldownSeconds of the previous
+	// destroy are short-circuited — we increment nothing, fire
+	// nothing, and let the cold-boot instance settle. The gate
 	// bypasses on cfg.CooldownSeconds <= 0 (Free plan / legacy
-	// callers). Reading via Manager.LastLivenessDestroyAt keeps
-	// the loop goroutine out of m.mu on the hot path; the
-	// Manager stamps under its own lock.
+	// callers) AND on empty deploymentID (legacy pre-PR-B
+	// callers that don't carry deployment_id on the wire).
+	//
+	// Reading via Manager.LastLivenessDestroyAtForDeployment
+	// keys on deploymentID (not instanceID) — the cold-boot
+	// replacement inherits deploymentID from schedd's
+	// CreateInstance + Wake stamp, so the gate sees the
+	// previous instance's destroy time even though the
+	// instance id is a fresh UUID. Reading via the Manager
+	// accessor keeps the loop goroutine out of m.mu on the
+	// hot path; the Manager stamps under its own lock.
 	nowFn := l.nowFn
 	if nowFn == nil {
 		nowFn = time.Now
 	}
-	if l.cfg.CooldownSeconds > 0 {
-		if last := l.mgr.LastLivenessDestroyAt(l.instance); !last.IsZero() {
+	if l.cfg.CooldownSeconds > 0 && l.deploymentID != "" {
+		if last := l.mgr.LastLivenessDestroyAtForDeployment(l.deploymentID); !last.IsZero() {
 			cooldown := time.Duration(l.cfg.CooldownSeconds) * time.Second
 			if nowFn().Sub(last) < cooldown {
 				l.log.Debug("liveness: cooldown window",
 					"instance", l.instance,
+					"deployment_id", l.deploymentID,
 					"since_destroy_s", int(nowFn().Sub(last).Seconds()),
 					"cooldown_s", l.cfg.CooldownSeconds)
 				return
@@ -423,13 +433,14 @@ func readAll(fd int, b []byte, deadline time.Duration) error {
 // Mirrors the production-only start() helper that lived inline in
 // livenessRegistry prior to the PR-review refactor that moved the
 // registry into pkg/fcvm.
-func startLivenessLoopHelper(parent context.Context, mgr *fcvm.Manager, log *slog.Logger, instance string, slot int, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
+func startLivenessLoopHelper(parent context.Context, mgr *fcvm.Manager, log *slog.Logger, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
 	loop := &livenessProbeLoop{
-		instance: instance,
-		cfg:      cfg,
-		cid:      fcvm.GuestVsockCID(slot),
-		mgr:      mgr,
-		log:      log,
+		instance:     instance,
+		deploymentID: deploymentID,
+		cfg:          cfg,
+		cid:          fcvm.GuestVsockCID(slot),
+		mgr:          mgr,
+		log:          log,
 	}
 	loopCtx, cancel := context.WithCancel(parent)
 	go func() {

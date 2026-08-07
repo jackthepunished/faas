@@ -86,7 +86,8 @@ func newTestLoop(t *testing.T, instanceID string, consec int) (*livenessProbeLoo
 		t.Fatalf("fcvm.Manager does not expose WithLivenessSink — test seam missing")
 	}
 	loop := &livenessProbeLoop{
-		instance: instanceID,
+		instance:     instanceID,
+		deploymentID: "dep-" + instanceID, // mirrors startLivenessLoopHelper's signature
 		cfg: livenessProbeConfig{
 			Path:                "/healthz",
 			PeriodSeconds:       5,
@@ -198,27 +199,30 @@ func TestLivenessRecv_ConnRefusedCounted(t *testing.T) {
 // owns the time-driven paths.
 
 // TestLivenessRecv_CooldownGateShortCircuits (issue #554 closure /
-// ADR-078) pins the cooldown gate at runOne: a probe failure that
-// falls inside cfg.CooldownSeconds of the previous
-// LastLivenessDestroyAt stamp must NOT increment the counter and
-// must NOT fire the relay. The customer-visible scenario is "I
-// just had a wedged VM torn down, the cold-boot replacement is
-// still warming up — don't tear it down too". Pre-#554 this
-// scenario was unreliable: the first 3 probe failures (typically
-// conn_refused during the guest-init listener bring-up) would
-// fire DestroyForLivenessFailure on a perfectly healthy cold-boot
-// instance. The gate bypasses cleanly when CooldownSeconds == 0
-// (Free plan / legacy callers) or LastLivenessDestroyAt is zero
-// (no prior destroy recorded).
+// ADR-078, code review #725 finding F1) pins the cooldown gate at
+// runOne: a probe failure that falls inside cfg.CooldownSeconds of
+// the previous LastLivenessDestroyAt stamp must NOT increment the
+// counter and must NOT fire the relay. The customer-visible
+// scenario is "I just had a wedged VM torn down, the cold-boot
+// replacement is still warming up — don't tear it down too".
+//
+// Post-F1: the stamp key is the DEPLOYMENT id, not the instance
+// id — the dying instance's UUID is gone after Park, but the
+// cold-boot replacement inherits the deployment id from
+// schedd's CreateInstance + Wake stamp. The unit test
+// mirrors production by stamping under deploymentID and reading
+// from a loop that carries the same deploymentID.
 func TestLivenessRecv_CooldownGateShortCircuits(t *testing.T) {
 	loop, sink, mgr := newTestLoop(t, "inst-cd", 3)
-	// Register the instance so Manager.LastLivenessDestroyAt
-	// returns a non-zero value.
-	mgr.RegisterInstanceForTest("inst-cd")
-	// Stamp a destroy 5 seconds in the past. cfg.CooldownSeconds=60
+	// Register the instance with its deployment id so the
+	// stamp + read share a key.
+	depID := loop.deploymentID
+	mgr.RegisterInstanceForTest("inst-cd", depID)
+	// Stamp a destroy 5 seconds in the past under the
+	// deployment id (NOT the instance id — see F1). cfg.CooldownSeconds=60
 	// (set by newTestLoop), so a probe now falls well within the
 	// window.
-	mgr.SetLastLivenessDestroyAtForTest("inst-cd", time.Now().Add(-5*time.Second))
+	mgr.SetLastLivenessDestroyAtForDeployment(depID, time.Now().Add(-5*time.Second))
 
 	// All three probes are non_200, but the gate must short-circuit.
 	loop.probeFn = func(_ context.Context, _ int) string {
@@ -238,10 +242,11 @@ func TestLivenessRecv_CooldownGateShortCircuits(t *testing.T) {
 // would be parked forever once the first destroy happened.
 func TestLivenessRecv_CooldownGateExpires(t *testing.T) {
 	loop, sink, mgr := newTestLoop(t, "inst-cd-2", 3)
-	mgr.RegisterInstanceForTest("inst-cd-2")
+	depID := loop.deploymentID
+	mgr.RegisterInstanceForTest("inst-cd-2", depID)
 	// Stamp a destroy 120 seconds in the past. CooldownSeconds=60,
 	// so we're well outside the window.
-	mgr.SetLastLivenessDestroyAtForTest("inst-cd-2", time.Now().Add(-120*time.Second))
+	mgr.SetLastLivenessDestroyAtForDeployment(depID, time.Now().Add(-120*time.Second))
 
 	loop.probeFn = func(_ context.Context, _ int) string {
 		return livenessOutcomeNon200
@@ -260,8 +265,9 @@ func TestLivenessRecv_CooldownGateExpires(t *testing.T) {
 func TestLivenessRecv_CooldownGateZeroCooldownBypasses(t *testing.T) {
 	loop, sink, mgr := newTestLoop(t, "inst-cd-3", 2)
 	loop.cfg.CooldownSeconds = 0 // legacy / Free
-	mgr.RegisterInstanceForTest("inst-cd-3")
-	mgr.SetLastLivenessDestroyAtForTest("inst-cd-3", time.Now().Add(-1*time.Second))
+	depID := loop.deploymentID
+	mgr.RegisterInstanceForTest("inst-cd-3", depID)
+	mgr.SetLastLivenessDestroyAtForDeployment(depID, time.Now().Add(-1*time.Second))
 
 	loop.probeFn = func(_ context.Context, _ int) string {
 		return livenessOutcomeNon200
@@ -271,5 +277,113 @@ func TestLivenessRecv_CooldownGateZeroCooldownBypasses(t *testing.T) {
 	}
 	if sink.count() != 1 {
 		t.Errorf("sink.count = %d, want 1 (CooldownSeconds=0 bypasses the gate)", sink.count())
+	}
+}
+
+// TestLivenessRecv_CooldownGateStampSurvivesInstanceReplacement
+// (code review #725 finding F1) pins the load-bearing invariant
+// the reviewer surfaced: the stamp key is the DEPLOYMENT id, not
+// the instance id. Stamping on the dying instance (the pre-F1
+// design) was structurally broken because Park deletes the
+// live-map entry and the replacement carries a fresh zero-valued
+// Instance{}. The test simulates the production flow:
+//
+//  1. Instance A is destroyed by ReportLivenessFailed (stamp
+//     under deploymentID D1).
+//  2. Park deletes instance A from m.live.
+//  3. Cold-boot creates instance B with the SAME deploymentID
+//     D1 (schedd's CreateInstance threads deploymentID through
+//     the new Instance row + Wake stamps it onto the live
+//     record at BringUp).
+//  4. The liveness loop on B must observe the stamp from A —
+//     if it observes zero, the gate was a no-op in production.
+func TestLivenessRecv_CooldownGateStampSurvivesInstanceReplacement(t *testing.T) {
+	loop, sink, mgr := newTestLoop(t, "inst-cold-boot", 3)
+	depID := loop.deploymentID // "dep-inst-cold-boot"
+
+	// Step 1+2: prior instance (different UUID, same deployment)
+	// was destroyed. Stamp under deploymentID, NOT the prior
+	// instance id — mirrors production's ReportLivenessFailed
+	// path.
+	mgr.RegisterInstanceForTest("inst-prior-destroyed", depID)
+	mgr.SetLastLivenessDestroyAtForDeployment(depID, time.Now().Add(-5*time.Second))
+	// The "prior destroyed" instance is now NOT in m.live (Park
+	// deleted it). The stamp persists in cooldownByDeployment
+	// keyed on depID.
+
+	// Step 3: the cold-boot replacement has a fresh UUID. Its
+	// loop is the `loop` variable above (deploymentID = depID).
+	mgr.RegisterInstanceForTest("inst-cold-boot", depID)
+
+	// Step 4: gate must short-circuit. If a regression reverts
+	// to instance-keyed stamping, the gate sees zero and the
+	// fires below would tear down a healthy cold-boot.
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
+	}
+	for i := 0; i < 3; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 0 {
+		t.Errorf("stamp must survive instance replacement (F1 invariant): sink.count = %d, want 0", sink.count())
+	}
+}
+
+// TestLivenessRecv_CooldownGateIsolatesDeployments confirms that
+// a stamp on deployment D1 does NOT short-circuit a loop on
+// deployment D2 — protects against accidental "all deployments
+// share one cooldown" semantics that would freeze a healthy
+// workload when an unrelated workload destroys.
+func TestLivenessRecv_CooldownGateIsolatesDeployments(t *testing.T) {
+	loop, sink, mgr := newTestLoop(t, "inst-d2", 3)
+	otherDep := "dep-other-app"
+	mgr.RegisterInstanceForTest("inst-other", otherDep)
+	mgr.SetLastLivenessDestroyAtForDeployment(otherDep, time.Now().Add(-5*time.Second))
+
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
+	}
+	for i := 0; i < 3; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 1 {
+		t.Errorf("cross-deployment stamp must not short-circuit: sink.count = %d, want 1", sink.count())
+	}
+}
+
+// TestLivenessRecv_CooldownGateEmptyDeploymentIDBypasses confirms
+// the legacy pre-PR-B path: a wake that doesn't carry
+// deploymentID on the wire produces a loop with empty
+// deploymentID, which must bypass the gate (the gate cannot
+// key on "" without colliding every legacy wake).
+func TestLivenessRecv_CooldownGateEmptyDeploymentIDBypasses(t *testing.T) {
+	sink := &recordingSink{}
+	mgr := fcvm.NewManager(nil, nil, fcvm.Paths{}, "1.10.0", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	type sinkSetter interface {
+		WithLivenessSink(fcvm.LivenessFailedSink) *fcvm.Manager
+	}
+	if ss, ok := any(mgr).(sinkSetter); ok {
+		ss.WithLivenessSink(fcvm.LivenessFailedSink(sink.Record))
+	}
+	loop := &livenessProbeLoop{
+		instance:     "inst-legacy",
+		deploymentID: "", // legacy pre-PR-B
+		cfg: livenessProbeConfig{
+			Path:                "/healthz",
+			PeriodSeconds:       5,
+			ConsecutiveFailures: 2,
+			CooldownSeconds:     60,
+		},
+		mgr: mgr,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	loop.probeFn = func(_ context.Context, _ int) string {
+		return livenessOutcomeNon200
+	}
+	for i := 0; i < 2; i++ {
+		loop.runOne(context.Background(), 2000)
+	}
+	if sink.count() != 1 {
+		t.Errorf("empty deploymentID must bypass cooldown: sink.count = %d, want 1", sink.count())
 	}
 }

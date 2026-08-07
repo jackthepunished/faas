@@ -1044,15 +1044,35 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// charges for. A deployment lookup that errors (stale
 	// instance row pointing at a deleted deployment) is treated as
 	// floor=0 — the biller does the same at sampler.go:478-480.
+	//
+	// depCache (code review #725 finding F4): cache distinct
+	// deployments per tick. An app with N instances all on
+	// deployment D1 produced N store.DeploymentByID(ctx, D1)
+	// round-trips pre-F4 — on PgStore that's N queries fetching
+	// the same row. The cache collapses it to 1 query per
+	// distinct deployment per tick. Scope is per-tick; the
+	// loop is rebuilt every reaper tick so cache lifetime
+	// never spans a stale deployment row.
+	depCache := map[string]int{}
 	for _, ins := range snapshot {
 		if ins.DeploymentID == "" {
 			continue
 		}
-		dep, err := store.DeploymentByID(ctx, ins.DeploymentID)
-		if err != nil {
-			continue
+		dFloor, cached := depCache[ins.DeploymentID]
+		if !cached {
+			dep, derr := store.DeploymentByID(ctx, ins.DeploymentID)
+			if derr != nil {
+				// Treat as floor=0 (matches the biller at
+				// sampler.go:478-480) and remember the
+				// miss so a later snapshot row on the same
+				// deployment doesn't re-query.
+				depCache[ins.DeploymentID] = 0
+				continue
+			}
+			dFloor = dep.EffectiveMinInstances()
+			depCache[ins.DeploymentID] = dFloor
 		}
-		if dFloor := dep.EffectiveMinInstances(); dFloor > appDeploymentFloor[ins.AppID] {
+		if dFloor > appDeploymentFloor[ins.AppID] {
 			appDeploymentFloor[ins.AppID] = dFloor
 		}
 	}
@@ -1262,15 +1282,32 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		runningByApp[s.AppID]++
 	}
-	// floorByApp (PR-C, issue #462 + issue #557 / ADR-071): per-app
-	// MinInstances for the min_floor_already comparison. Sourced from
-	// EffectiveMinInstances() (max of legacy column + ScalingPolicy
-	// jsonb) so the reaper agrees with the meter and the floor
-	// trigger — divergent configs must not silently park a customer
-	// below the floor they actually configured.
+	// floorByApp (PR-C, issue #462 + issue #557 / ADR-071, code
+	// review #725 finding F3): per-app MinInstances for the
+	// min_floor_already comparison. Sourced from
+	// max(app.EffectiveMinInstances(), max(ins.MinInstances)
+	// across this app's instances in the snapshot) — the
+	// snapshot rows already carry the post-enrichment
+	// MinInstances value (max of app + per-deployment floor,
+	// stamped at runReaper's snapshot walk) so a max across
+	// the app's instances collapses to the same number the
+	// biller charges for (pkg/meter/sampler.go:470-485) and
+	// that ReapIdle / ReapAggressive consult via
+	// ins.MinInstances. The previous shape used
+	// a.EffectiveMinInstances() alone, which under-reports
+	// when a customer sets a per-deployment floor via
+	// ScalingPolicy — the metric would emit
+	// schedd_scale_down_total{outcome="keep"} on a
+	// deployment that's actually held at the per-deployment
+	// floor, fooling operators reading the dashboard.
 	floorByApp := map[string]int{}
 	for _, a := range apps {
 		floorByApp[a.ID] = a.EffectiveMinInstances()
+	}
+	for _, s := range snapshot {
+		if floorByApp[s.AppID] < s.MinInstances {
+			floorByApp[s.AppID] = s.MinInstances
+		}
 	}
 	// For each considered app, emit either `park` (≥ 1 instance
 	// parked), `min_floor_already` (running already at the floor

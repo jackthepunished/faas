@@ -579,8 +579,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			CooldownSeconds:     api.DefaultLivenessCooldownSeconds,
 			IdleResetOnDestroy:  true,
 		},
-	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
-		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, cfg)
+	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
+		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, deploymentID, cfg)
 	})
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
