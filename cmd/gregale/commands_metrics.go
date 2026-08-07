@@ -25,6 +25,7 @@ import (
 	"os"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 )
 
 // metricsCmdUsage is the top-of-failure-line shown for `gregale metrics`
@@ -76,7 +77,7 @@ func cmdMetrics(args []string) int {
 // before the values so the customer understands the zeroes are
 // real (Prometheus isn't reachable), not a bug.
 func renderAppMetrics(w io.Writer, m api.AppMetricsResponse) {
-	if m.Source != "" && m.Source != "prometheus" {
+	if m.Source != "" && m.Source != appmetrics.SourcePrometheus {
 		_, _ = fmt.Fprintf(w, "Note: source=%s (values below are zero — Prometheus is unavailable)\n", m.Source)
 	}
 	_, _ = fmt.Fprintf(w, "App:        %s\n", m.AppID)

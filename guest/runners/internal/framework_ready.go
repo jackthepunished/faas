@@ -105,13 +105,46 @@ func (s *RunnerSignal) SignalReady(warmupMs int64) {
 	})
 }
 
+// dialProxy opens a unix-socket connection to the guest-init proxy.
+// Package-private indirection so unit tests can swap the dialer
+// (e.g. point at a net.Pipe in-memory pair) — see WithProxyDialHook.
+// Production callers go through net.Dialer's Timeout-bounded default,
+// which is the "stale socket from a previous boot" safety net.
+var dialProxy = func(network, path string) (net.Conn, error) {
+	d := net.Dialer{Timeout: FrameworkReadyDialTimeout}
+	return d.Dial(network, path)
+}
+
+// SetProxyDialHook swaps the dialer used by signalFrameworkReady.
+// It exists for unit tests that cannot bind a real unix socket at
+// FrameworkReadyProxyPath (e.g. macOS test boxes where /run is
+// read-only). Pass nil to restore the production net.Dialer.
+//
+// MUST be called from a test setup, not from production code. There
+// is no concurrency story here because the runner's signal is
+// sync.Once-gated; the worst case under a parallel test is a
+// half-swapped hook that the next test reverts.
+//
+// Returns the previous hook so tests can defer a restore.
+var SetProxyDialHook = func(dial func(network, path string) (net.Conn, error)) func(network, path string) (net.Conn, error) {
+	prev := dialProxy
+	if dial == nil {
+		dialProxy = func(network, path string) (net.Conn, error) {
+			d := net.Dialer{Timeout: FrameworkReadyDialTimeout}
+			return d.Dial(network, path)
+		}
+	} else {
+		dialProxy = dial
+	}
+	return prev
+}
+
 // signalFrameworkReady opens a unix-socket connection to the
 // guest-init proxy, writes "<runtime> <warmup_ms>\n", and
 // reads the proxy's "ok\n" or "err <reason>\n" reply. The
 // proxy is the framing boundary — the runner side stays narrow.
 func signalFrameworkReady(runtime string, warmupMs int64) error {
-	d := net.Dialer{Timeout: FrameworkReadyDialTimeout}
-	conn, err := d.Dial("unix", FrameworkReadyProxyPath)
+	conn, err := dialProxy("unix", FrameworkReadyProxyPath)
 	if err != nil {
 		return fmt.Errorf("dial proxy: %w", err)
 	}

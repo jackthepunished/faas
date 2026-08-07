@@ -6605,6 +6605,21 @@ func (m *MemStore) UsageDaily(_ context.Context, _ string, _ time.Time) ([]Daily
 	return nil, nil
 }
 
+// UsageSLOForApp + UsageSLOForAccount mirror pgstore for the
+// customer-facing SLO surface (issue #696 / ADR-082). The
+// MemStore does not maintain usage_minutes — pkg/meter
+// wires directly to PgStore in production. Returns (0, 0, nil)
+// so the handler treats the SLO panel as "empty" without
+// turning the response degraded (Prometheus may still be
+// reachable).
+func (m *MemStore) UsageSLOForApp(_ context.Context, _, _ string, _, _ time.Time) (float64, float64, error) {
+	return 0, 0, nil
+}
+
+func (m *MemStore) UsageSLOForAccount(_ context.Context, _ string, _, _ time.Time) (float64, float64, error) {
+	return 0, 0, nil
+}
+
 // AppendSnapshotStorage + StorageUsage mirror pgstore for the storage
 // rollup (ADR-049 §B.3). The MemStore does not maintain the rollup —
 // pkg/meter/storage.go wires directly to PgStore in production. Returns

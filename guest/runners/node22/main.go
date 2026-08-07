@@ -214,9 +214,28 @@ func invokeHandler(ctx context.Context, handlerPath string, env envelope) (respo
 	}
 	cmd.Stdin = &stdin
 
+	// Issue #254: customer stderr must reach the host log ring.
+	//
+	// stdout stays a bare buffer — it is protocol-bearing (the §4.9
+	// response envelope is json.Unmarshal'd from it below), so teeing
+	// it would interleave customer writes into the envelope and break
+	// the decode. Capturing customer stdout needs a separate framed
+	// channel; that is a spec change, not a bug fix.
+	//
+	// stderr is NOT protocol-bearing — it is only ever folded into the
+	// exec-error string below — so teeing it to os.Stderr is free. The
+	// runner's os.Stderr is inherited from guest-init (PID1), which
+	// tees its child's output into the supervisor ring via
+	// io.MultiWriter (guest/init/main_linux.go:276). That ring is what
+	// vmmd drains into pkg/fcvm/logbuf and the customer reads over
+	// `faas logs`. Without this tee, exceptions and stack traces — the
+	// bulk of what a customer needs to debug — never leave the VM.
+	//
+	// The in-memory buffer is retained alongside the tee so the
+	// exec-error message keeps its (stderr=...) suffix verbatim.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 
 	if err := cmd.Run(); err != nil {
 		return response{}, fmt.Errorf("handler exec: %w (stderr=%s)", err, stderr.String())

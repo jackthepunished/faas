@@ -21,7 +21,9 @@ import (
 // in a LocalCacheBackend (read-through LRU on disk). The cache is the
 // load-bearing piece that lets a registry outage degrade gracefully —
 // without it, every cold boot on every compute node depends on a
-// healthy registry. ADR-054 §2.
+// healthy registry. ADR-054 §2. For oci mode (multi-box), the cache
+// defaults to on at /var/lib/faas/cache when the env var is unset
+// (see wrapWithCache for the exact contract).
 //
 // Returned errors are stable so cmd/{imaged,vmmd}/main.go can wrap
 // them with %w and surface a single ops-friendly message at startup.
@@ -48,7 +50,11 @@ import (
 //	                                the resulting backend in a read-through
 //	                                LocalCacheBackend rooted at this dir.
 //	                                Solves the "registry outage → cold boot
-//	                                fails" gap (ADR-054 §2).
+//	                                fails" gap (ADR-054 §2). On oci mode
+//	                                (FAAS_STORAGE_BACKEND=oci) the cache
+//	                                defaults to on at /var/lib/faas/cache
+//	                                when the env var is unset; set to ""
+//	                                to explicitly disable.
 //	FAAS_STORAGE_CACHE_MAX_BYTES  local+oci — optional cache byte budget
 //	                                (default 1 GiB).
 //	FAAS_OCI_REGISTRY             oci-only — full URL incl. scheme (e.g. https://ghcr.io/org)
@@ -78,26 +84,52 @@ func BackendFromEnv() (StorageBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return wrapWithCache(be)
+	return wrapWithCache(be, kind)
 }
 
-// wrapWithCache wraps parent in a LocalCacheBackend when
-// FAAS_STORAGE_CACHE_DIR is set. The cache is opt-in: omitting the
-// env var returns the parent unchanged so a single-box deploy with
-// local-only storage pays nothing for the seam.
+// DefaultOCICacheDir is the canonical cache directory when
+// FAAS_STORAGE_BACKEND=oci and FAAS_STORAGE_CACHE_DIR is unset. ADR-054
+// §2 + the acceptance amendment pin this default for multi-box fleets.
+// Exported so tests and operator tooling can assert the contract.
+const DefaultOCICacheDir = "/var/lib/faas/cache"
+
+// resolveCacheDir applies the cache-dir env contract without performing
+// any I/O. Pure function — no MkdirAll, no parent construction. Lets
+// unit tests assert the resolution matrix hermetically (without creating
+// /var/lib/faas/cache on the dev machine).
 //
-// Returns the parent on any error from the cache constructor — a
-// misconfigured cache dir must not block startup of the daemon
-// when the underlying storage is healthy. The error is logged via
-// the package-level error chain (caller wraps) so an operator sees
-// the cache disabled but the daemon otherwise functional.
+//   - FAAS_STORAGE_CACHE_DIR set to a non-empty path → ("path", true).
+//   - FAAS_STORAGE_CACHE_DIR unset AND kind=="oci" →
+//     (DefaultOCICacheDir, true). Multi-box default-on.
+//   - FAAS_STORAGE_CACHE_DIR unset AND kind!="oci" → ("", false). Single-
+//     box opt-in.
+//   - FAAS_STORAGE_CACHE_DIR explicitly empty ("") → ("", false). The
+//     os.LookupEnv distinction is load-bearing: unset vs explicit empty.
 //
-// FAAS_STORAGE_CACHE_MAX_BYTES controls the byte budget; default
-// is 1 GiB (DefaultCacheMaxBytes). Negative or zero values fall
-// back to the default.
-func wrapWithCache(parent StorageBackend) (StorageBackend, error) {
-	dir := os.Getenv("FAAS_STORAGE_CACHE_DIR")
-	if dir == "" {
+// Returns the dir and a bool indicating whether the caller should wrap.
+func resolveCacheDir(kind string) (string, bool) {
+	dir, isSet := os.LookupEnv("FAAS_STORAGE_CACHE_DIR")
+	if isSet {
+		if dir == "" {
+			return "", false
+		}
+		return dir, true
+	}
+	if kind == "oci" {
+		return DefaultOCICacheDir, true
+	}
+	return "", false
+}
+
+// wrapWithCache wraps parent in a LocalCacheBackend according to the
+// cache env contract. See resolveCacheDir for the resolution matrix.
+//
+// Returns the parent unchanged when no cache is wanted. A misconfigured
+// cache dir blocks startup — better to fail loud than silently disable
+// the multi-box safety net.
+func wrapWithCache(parent StorageBackend, kind string) (StorageBackend, error) {
+	dir, ok := resolveCacheDir(kind)
+	if !ok {
 		return parent, nil
 	}
 	maxBytes := DefaultCacheMaxBytes
@@ -262,4 +294,48 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// AsCacheBackend walks the backend chain rooted at root and returns
+// the first *LocalCacheBackend it finds, or nil if none is present.
+//
+// The walk covers the two shapes BackendFromEnv produces today:
+//
+//   - root is *LocalCacheBackend directly (the wrap-with-cache
+//     outer layer; rare when the inner is a *PrefixRouter because
+//     wrapWithCache always sits on top).
+//   - root is *PrefixRouter wrapping a *LocalCacheBackend in one
+//     of its routes or its fallback (the production multi-box
+//     shape: local-prefix routes hold the LocalStorageBackend, the
+//     fallback holds the LocalCacheBackend → OCI registry chain).
+//
+// Future shapes (a metrics wrapper, a tracing wrapper, a router
+// enclosing the cache instead of being enclosed by it) are handled
+// by recursing through *PrefixRouter.routes and .fallback. Any
+// unrecognised wrapper type is skipped; a cache observer wired by
+// the caller MUST NOT silently fail to attach.
+//
+// Returns nil when no cache backend is reachable from root. Daemons
+// rely on a nil result to log "cache not wired" at startup rather
+// than install an observer that never fires — the alternative is a
+// silent zero-counter that looks healthy while stale-fallbacks
+// happen unmonitored.
+func AsCacheBackend(root StorageBackend) *LocalCacheBackend {
+	if root == nil {
+		return nil
+	}
+	if c, ok := root.(*LocalCacheBackend); ok {
+		return c
+	}
+	if r, ok := root.(*PrefixRouter); ok {
+		for _, child := range r.routes {
+			if c := AsCacheBackend(child); c != nil {
+				return c
+			}
+		}
+		if r.fallback != nil {
+			return AsCacheBackend(r.fallback)
+		}
+	}
+	return nil
 }

@@ -2333,6 +2333,118 @@ type AppsMetricsResponse struct {
 	Apps   map[string]AppMetricsResponse `json:"apps"`
 }
 
+// --- Customer-facing SLO surface (issue #696 / ADR-082) -----------------
+
+// SLODuration is the shared latency sub-shape used by AppSLOResponse
+// and AccountSLOResponse. Three percentiles over the SLO window (2xx
+// class only); NaN/Inf from histogram_quantile on an empty window is
+// coerced to 0 by the handler (mirrors pkg/appmetrics.SafeFloat).
+type SLODuration struct {
+	P50MS float64 `json:"p50_ms"`
+	P95MS float64 `json:"p95_ms"`
+	P99MS float64 `json:"p99_ms"`
+}
+
+// SLODefaultWindow is the server's default SLO window when the caller
+// omits ?window=. Matches the issue's "default SLO window" framing —
+// 24h is the canonical "yesterday's SLO" lookback.
+const SLODefaultWindow = "24h"
+
+// sloWindowSet is the closed vocabulary for the SLO `window` query
+// param. Strict subset of pkg/appmetrics.Ranges() (which is the
+// 7-range /metrics vocabulary) — the /slo endpoints offer only
+// customer-facing SLO windows, not the 5m/15m/6h/15d "current slice"
+// panels. Everything else is rejected with 400 CodeValidation.
+var sloWindowSet = []string{"1h", "24h", "7d"}
+
+// SLORanges returns a copy of the closed SLO window vocabulary. The
+// copy mirrors pkg/appmetrics.Ranges()'s "callers can't mutate the
+// package state" pattern.
+func SLORanges() []string {
+	out := make([]string, len(sloWindowSet))
+	copy(out, sloWindowSet)
+	return out
+}
+
+// IsValidSLORange returns true iff rng is in the closed SLO window
+// set. The HTTP handler validates ?window= via this helper so the
+// SDK and the CLI share the same vocabulary.
+func IsValidSLORange(rng string) bool {
+	for _, r := range sloWindowSet {
+		if r == rng {
+			return true
+		}
+	}
+	return false
+}
+
+// AppSLOResponse is the per-app SLO panel returned by
+// GET /v1/apps/{slug}/slo?window= (issue #696 / ADR-082). Distinct
+// from AppMetricsResponse (issue #273): the SLO surface is a
+// fixed-window (1h/24h/7d) summary of the customer-facing SLO
+// signals, not a 5m slice for the dashboard. The fields overlap
+// only on latency percentiles, error rate, and cold-boot rate — the
+// remaining fields (wake_queue_p95, throttled_total, instance_hours,
+// gb_hours) are net-new per the issue.
+//
+// Source follows the "degraded: <reason>" contract from
+// pkg/appmetrics (so the dashboard and the SDK share one empty-state
+// branch across /metrics and /slo). When Prometheus is unreachable,
+// every numeric field is zero and Source is prefixed with
+// "degraded: <reason>". When Postgres usage-rollup fails but the
+// PromQL pass succeeded, only InstanceHours/GBHours are zeroed and
+// Source is "degraded: postgres unavailable" — the latency/error/
+// cold-boot numbers stay non-zero.
+//
+// All numeric fields are zero-on-missing (no *float64 pointers, no
+// omitempty). The dashboard's "no data" branch renders on
+// RequestsTotal == 0 AND InstanceHours == 0 over the longest window.
+type AppSLOResponse struct {
+	AppID           string      `json:"app_id"`
+	AppSlug         string      `json:"app_slug"`
+	Window          string      `json:"window"` // echoed window, e.g. "24h"
+	Source          string      `json:"source"` // "prometheus" on success, "degraded: <reason>" otherwise
+	AsOf            string      `json:"as_of"`  // RFC3339Nano UTC
+	RequestDuration SLODuration `json:"request_duration"`
+	ErrorRatePct    float64     `json:"error_rate_pct"`
+	ColdBootRatePct float64     `json:"cold_boot_rate_pct"`
+	InstanceHours   float64     `json:"instance_hours"`
+	GBHours         float64     `json:"gb_hours"`
+	// WakeQueueP95MS is the FLEET wake-queue p95
+	// (gateway_wake_queue_wait_seconds is unlabeled — same as
+	// gateway_wake_latency_seconds on the /metrics surfaces).
+	// Labelled as such in the UI.
+	WakeQueueP95MS float64 `json:"wake_queue_p95_ms"`
+	RequestsTotal  int64   `json:"requests_total"`
+	ThrottledTotal int64   `json:"throttled_total"`
+}
+
+// AccountSLOResponse is the flat account-wide SLO rollup returned by
+// GET /v1/account/slo?window= (issue #696 / ADR-082). Mirrors the
+// per-app DTO field-for-field except for AppID/AppSlug (the rollup
+// is account-wide). The fields are scalar sums/rates across the
+// account; per-app drill-down is served by the existing
+// /v1/apps/metrics endpoint.
+//
+// Source / Window / AsOf follow the per-app shape exactly. The
+// "degraded:" contract is identical: Prometheus-down → zeroed
+// fields with the reason in Source; Postgres hiccup → only
+// InstanceHours/GBHours zeroed with "degraded: postgres unavailable"
+// in Source.
+type AccountSLOResponse struct {
+	Window          string      `json:"window"`
+	Source          string      `json:"source"`
+	AsOf            string      `json:"as_of"`
+	RequestDuration SLODuration `json:"request_duration"`
+	ErrorRatePct    float64     `json:"error_rate_pct"`
+	ColdBootRatePct float64     `json:"cold_boot_rate_pct"`
+	InstanceHours   float64     `json:"instance_hours"`
+	GBHours         float64     `json:"gb_hours"`
+	WakeQueueP95MS  float64     `json:"wake_queue_p95_ms"`
+	RequestsTotal   int64       `json:"requests_total"`
+	ThrottledTotal  int64       `json:"throttled_total"`
+}
+
 // ProjectScanRequest is the multipart body for POST /v1/projects/scan.
 // Defined as a DTO (rather than an inline handler struct) so the
 // schema-parity AST gate can assert field-for-field equivalence with

@@ -153,9 +153,14 @@ func invokeHandler(ctx context.Context, handlerPath string, env envelope) (respo
 	}
 	cmd.Stdin = &stdin
 
+	// Issue #254: tee customer stderr to os.Stderr so it reaches
+	// guest-init's supervisor ring and, from there, `faas logs`.
+	// stdout stays a bare buffer — it is protocol-bearing (the §4.9
+	// envelope is decoded from it below). See the full rationale at
+	// guest/runners/node22/main.go::invokeHandler.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, os.Stderr)
 
 	if err := cmd.Run(); err != nil {
 		return response{}, fmt.Errorf("handler exec: %w (stderr=%s)", err, stderr.String())

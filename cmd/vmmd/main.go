@@ -24,8 +24,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -530,6 +532,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// JailerVMM construction. Hoisted from the listener block
 	// below; same single-registry pattern as every other daemon.
 	ops := wire.NewOpsMetrics("vmmd")
+	// ADR-054 acceptance: wire the LocalCacheBackend observer so
+	// stale-fallback serves on the cold-boot Restore path emit
+	// `vmmd_storage_cache_stale_fallback_total`. vmmd is the
+	// primary emitter on the cold-boot path; imaged emits only on
+	// the build/GC paths. Uses storage.AsCacheBackend so the
+	// observer attaches even when the BackendFromEnv shape changes
+	// (a future metrics wrapper, router-encloses-cache, etc.). Nil
+	// result is expected on single-box local deploys — the cache is
+	// opt-in there.
+	if cacheBE := storage.AsCacheBackend(storageBackend); cacheBE != nil {
+		cacheBE.SetObserver(storage.LogCacheObserver{
+			Logger: log,
+			Next: storage.FuncCacheObserver(func() {
+				ops.StorageCacheStaleFallback().Inc()
+			}),
+		})
+	}
 	// Issue #667 / ADR-078: single storeStamper adapter satisfies
 	// BOTH the FrameworkReadyStamper interface (PR #470-FU-B) and
 	// the TailTerminalStamper interface (PR 3 of this issue) — the
@@ -1009,6 +1028,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		log.Info("vmmd: egress watcher wired", "node_id", nodeID, "staging", "/tmp/vmmd-egress-staging", "live", "/etc/nftables.conf")
 	}
+
+	// Issue #679 / PR-A: install the SIGHUP-driven egress
+	// bundle reload. The signal goroutine is serialised against
+	// Wake/Park/Destroy via Manager.SetEgressOperatorBundle's
+	// internal locking, so concurrent reloads + live-patches
+	// cannot corrupt the operator-bundle slice. A failed reload
+	// keeps the prior bundle live (best-effort, never blocks
+	// signal delivery).
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go watchEgressBundleReload(ctx, mgr, cfg.EgressOperatorAllowlist, log, hupCh)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)

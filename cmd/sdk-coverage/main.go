@@ -76,6 +76,17 @@ var routeExclude = map[string]bool{
 	"GET /auth/reset":              true, // HTML form render (browser-only)
 	"POST /logout":                 true, // dashboard form post (browser-only); SDK's Logout wraps the same handler as a convenience
 
+	// PR #722 review (cookie-only routes CLI rejects). The /v1/auth/sessions
+	// handlers read sessionFrom(r), which is cookie-only per
+	// pkg/auth/middleware/context.go:141; the SDK cannot model a
+	// bearer-key caller and the dashboard is the supported surface.
+	// /v1/auth/capabilities is mounted behind sessionAuth at
+	// server.go:1085 — same exclusion.
+	"GET /v1/auth/sessions":             true, // sessionFrom cookie-only; PR #722 dropped
+	"DELETE /v1/auth/sessions/{id}":     true, // same + CSRF cookie required
+	"POST /v1/auth/sessions/revoke_all": true, // same — fails 401 on bearer-key
+	"GET /v1/auth/capabilities":         true, // sessionAuth at server.go:1085
+
 	// GitHub install bind picker (PR-B). Browser-only: the dashboard's
 	// bind flow drives these via the JS island in the app-detail page
 	// using the session cookie established by /v1/auth/github. The
@@ -102,6 +113,8 @@ var sdkMethodExclude = map[string]bool{
 	"ExchangeCliAuthCode": true, // anonymous device-code poll; route excluded above
 	"GetStatusSLO":        true, // public status; route excluded above
 	"Logout":              true, // POST /logout is a browser-form post (excluded above); the SDK wraps the same handler as a convenience
+	"GetAccountDPA":       true, // public markdown; route excluded above (also reachable from /security)
+	"GetMyOrg":            true, // GET /v1/orgs/me was added in PR #722 before the OpenAPI spec tracked it; track both in lockstep on the next spec pass
 }
 
 // methodRouteMap pins the routes whose natural SDK verb doesn't
@@ -253,6 +266,14 @@ var methodRouteMap = map[string]string{
 	"GET /v1/instances":    "GetInstances",
 	"GET /v1/secrets":      "GetSecrets",
 	"GET /v1/apps/metrics": "GetAppsMetrics",
+
+	// Issue #696 / ADR-082 — customer-facing SLO surface.
+	// Closed-set windowed panel (1h | 24h | 7d) — distinct from
+	// the /metrics entry above which is the 5m dashboard panel.
+	// Per-app pattern mirrors GetAppMetrics; account-scoped
+	// mirrors GetAccountUsage (the usage account-scoped family).
+	"GET /v1/apps/{slug}/slo": "GetAppSLO",
+	"GET /v1/account/slo":     "GetAccountSLO",
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The auto-derivation
 	// picks Verb+Resource (e.g. "PostLogin" for POST /login) but the

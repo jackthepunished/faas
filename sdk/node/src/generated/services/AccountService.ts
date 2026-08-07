@@ -5,6 +5,7 @@
 import type { AccountDeletionResponse } from '../models/AccountDeletionResponse.js';
 import type { AccountExportResponse } from '../models/AccountExportResponse.js';
 import type { AccountResponse } from '../models/AccountResponse.js';
+import type { AccountSLOResponse } from '../models/AccountSLOResponse.js';
 import type { ChangePlanRequest } from '../models/ChangePlanRequest.js';
 import type { RaiseOverageCapRequest } from '../models/RaiseOverageCapRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
@@ -89,6 +90,53 @@ export class AccountService {
         401: `code: unauthorized`,
         402: `code: billing_past_due — account is suspended; pay invoice to resume.`,
         409: `code: conflict`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Account-wide SLO rollup (issue
+   * Flat scalar SLO rollup for the authenticated account. The
+   * same wire shape as the per-app endpoint without the
+   * `app_id` / `app_slug` fields — the rollup is sum-based
+   * across every app the account owns. `instance_hours` and
+   * `gb_hours` are summed from `usage_minutes` over the
+   * window; the per-app equivalent is the explicit
+   * `/v1/apps/{slug}/slo` endpoint.
+   *
+   * `window` is the same closed vocabulary as the per-app
+   * endpoint: `1h` | `24h` (default) | `7d`. Auth chain:
+   * `usage:read` scope + MFA.
+   *
+   * On Prometheus failure the endpoint returns 200 with
+   * zeroed fields and `source: "degraded: <reason>"`. When
+   * Postgres is down but the PromQL pass succeeded, only
+   * `instance_hours` / `gb_hours` are zeroed and `source` is
+   * `"degraded: postgres unavailable"`.
+   *
+   * @returns AccountSLOResponse The account-wide SLO rollup.
+   * @throws ApiError
+   */
+  public static getAccountSlo({
+    window = '24h',
+  }: {
+    /**
+     * Window for the account-wide SLO rollup. Default `24h`.
+     */
+    window?: '1h' | '24h' | '7d',
+  }): CancelablePromise<AccountSLOResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/account/slo',
+      query: {
+        'window': window,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

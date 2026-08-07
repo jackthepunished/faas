@@ -32,6 +32,9 @@ class CreateAppRequest:
     idle_timeout_s: int | Unset = UNSET
     streaming_enabled: bool | Unset = UNSET
     """Per-app streaming flag. Omitted at create-time → apid applies the plan default (issue #471)."""
+    websocket_enabled: bool | Unset = UNSET
+    """Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → apid applies the plan default;
+    PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."""
     warm_snapshot_enabled: bool | Unset = UNSET
     """Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan
     default. Free/Hobby PATCH-true is rejected."""
@@ -69,6 +72,8 @@ class CreateAppRequest:
 
         streaming_enabled = self.streaming_enabled
 
+        websocket_enabled = self.websocket_enabled
+
         warm_snapshot_enabled = self.warm_snapshot_enabled
 
         warm_snapshot_min_requests = self.warm_snapshot_min_requests
@@ -100,6 +105,8 @@ class CreateAppRequest:
             field_dict["idle_timeout_s"] = idle_timeout_s
         if streaming_enabled is not UNSET:
             field_dict["streaming_enabled"] = streaming_enabled
+        if websocket_enabled is not UNSET:
+            field_dict["websocket_enabled"] = websocket_enabled
         if warm_snapshot_enabled is not UNSET:
             field_dict["warm_snapshot_enabled"] = warm_snapshot_enabled
         if warm_snapshot_min_requests is not UNSET:
@@ -140,6 +147,8 @@ class CreateAppRequest:
 
         streaming_enabled = d.pop("streaming_enabled", UNSET)
 
+        websocket_enabled = d.pop("websocket_enabled", UNSET)
+
         warm_snapshot_enabled = d.pop("warm_snapshot_enabled", UNSET)
 
         warm_snapshot_min_requests = d.pop("warm_snapshot_min_requests", UNSET)
@@ -163,6 +172,7 @@ class CreateAppRequest:
             max_concurrency=max_concurrency,
             idle_timeout_s=idle_timeout_s,
             streaming_enabled=streaming_enabled,
+            websocket_enabled=websocket_enabled,
             warm_snapshot_enabled=warm_snapshot_enabled,
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,

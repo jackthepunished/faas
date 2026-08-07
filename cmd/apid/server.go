@@ -734,6 +734,18 @@ func (s *server) handler() http.Handler {
 	// pgstore helper — there's no (accountID, slug) pair to load
 	// because there's no slug path.
 	mux.HandleFunc("GET /v1/apps/metrics", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppsMetrics)))
+	// Issue #696 / ADR-082 — per-app SLO panel. Closed-set
+	// windowed vocabulary (1h | 24h | 7d). Auth chain matches
+	// /v1/apps/{slug}/metrics: read-only, NO MFA, primary
+	// caller is an API key with ScopesReadSurface. IDOR-safe
+	// via loadApp (cross-account slug → 404).
+	mux.HandleFunc("GET /v1/apps/{slug}/slo", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.getAppSLO)))
+	// Issue #696 / ADR-082 — account-scoped SLO rollup. Flat
+	// scalar responses (Billing-derivable instance_hours /
+	// gb_hours), so the auth chain matches /v1/usage (MFA +
+	// usage:read). Cross-account isolation is the SQL JOIN
+	// on apps.account_id = $1 in the pgstore helper.
+	mux.HandleFunc("GET /v1/account/slo", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.getAccountSLO))))
 	mux.HandleFunc("PATCH /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateApp))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteApp))))
 	// Issue #472 / ADR-054 — admin-only signature-enforcement toggle.
