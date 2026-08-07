@@ -1585,8 +1585,19 @@ const (
 	DefaultLivenessCooldownSeconds     = 60
 	DefaultLivenessMaxRestarts         = 3
 	DefaultLivenessWindowSeconds       = 300
-	MinLivenessPeriodSeconds           = 1
-	MaxLivenessPeriodSeconds           = 60
+	// ColdBootBudgetSeconds (issue #554 / ADR-079 follow-up, AC
+	// #1) is the wall-clock budget the §14 metal acceptance
+	// gate evaluates against when validating the liveness
+	// cycle on a real Firecracker VM. The envelope is:
+	//   LivenessPeriodSeconds * ConsecutiveFailures + ColdBootBudget
+	//   = 5 * 3 + 30 = 45 s
+	// After the 3 consecutive probe failures, vmmd has at most
+	// ColdBootBudgetSeconds to tear the wedged VM down + bring
+	// up a fresh one via cold boot (the load-bearing AC #1
+	// invariant — a wedged snapshot must NOT be restored).
+	ColdBootBudgetSeconds    = 30
+	MinLivenessPeriodSeconds = 1
+	MaxLivenessPeriodSeconds = 60
 
 	// Autoscale (issue #169 / §17 G8). ScaleUpDecisionIntervalSeconds
 	// is the trigger's tick rate — 1 s balances "admit the Nth

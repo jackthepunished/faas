@@ -475,7 +475,19 @@ const testDomain = "apps.test.example"
 //     second renumber). They hold the carved-out slots while this
 //     branch sits past the eviction_priority land and get
 //     `git rm`'d on merge.
-const e2eMigrationTarget = 145
+//
+//   - 145 → 157 with PR #697 (issue #554 / ADR-079 follow-up), which
+//     adds 00157_deployments_parked_reason.sql (parked_reason +
+//     parked_at + closed-set CHECK). Originally landed at 155; renumbered
+//     to 157 after main's PR #676 (issue #676 raw bridge) shipped the
+//     real 00155_apps_websocket_enabled.sql, then to 156 with a 156
+//     fence to dodge PR #698's 00156_apps_auth_default_flip, then back
+//     to 157 once PR #698 merged into main at 16:21:08 with
+//     00156_apps_auth_default_flip.sql — the 156 slot became a real
+//     main-landed migration and PR #697 picks 157 as the next free
+//     slot above main's head. The renumber chain is the standard
+//     PR-#697 follow-up to the PR-#653 145 chain.
+const e2eMigrationTarget = 157
 
 // StartWithEnv is the G2-aware entrypoint used by the secrets e2e:
 // the test wants apid to load a specific host.age.pub (FAAS_HOST_AGE_

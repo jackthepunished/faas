@@ -5468,6 +5468,20 @@ components:
           description: "Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby PATCH-true is rejected with 403 plan_require_authn_not_allowed."
           type: boolean
           example: false
+        # Issue #554 / ADR-079 follow-up (AC #3 wire): the
+        # most-recently parked deployment for this app, or absent
+        # when the app has never been parked. Operators see the
+        # closed-set reason (liveness_exhausted | lifecycle_park
+        # | admin_park) + the timestamp without grepping the
+        # audit log. Nested (not flat) so AppResponse conflates
+        # app-state with deployment-state only at the explicit
+        # ref — mirrors the per-deployment override pattern at
+        # DeploymentResponse.
+        parked_deployment:
+          oneOf:
+            - $ref: '#/components/schemas/ParkedDeploymentRef'
+            - type: 'null'
+          description: "Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why is my app evicted_cold?' without grepping the audit log."
 
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
@@ -5856,6 +5870,18 @@ components:
 
     # ─── Deployments ──────────────────────────────────────────────────────
 
+    ParkedDeploymentRef:
+      description: "Reference to a deployment that was parked (issue #554 / ADR-079 follow-up). Returned in AppResponse.parked_deployment when the app has at least one parked deployment. The `parked_reason` field is closed-set (liveness_exhausted | lifecycle_park | admin_park) — enforced at the schema layer via the deployments_parked_reason_check constraint from migration 00157."
+      type: object
+      required: [id, parked_reason, parked_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        parked_reason:
+          type: string
+          enum: [liveness_exhausted, lifecycle_park, admin_park]
+          description: "Closed-set parking reason from the schema-layer CHECK constraint."
+        parked_at: { type: string, format: date-time, description: "Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles)." }
+
     DeploymentResponse:
       description: "One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps. The optional `has_overrides` and `override_*` fields are the persisted echo of the create-time overrides object (issue #460 / ADR-053); they round-trip via `GET /v1/apps/{slug}/deployments/{id}` so a customer can audit what their last deploy pinned. Env values are NEVER echoed — only the keys (`override_env_keys`); env_secrets refs ARE echoed because the ref shape is non-secret by design."
       type: object
@@ -5911,6 +5937,14 @@ components:
             - $ref: '#/components/schemas/ScanResult'
             - type: 'null'
           description: "Per-deploy grype CVE scan surface (issue #464 / ADR-055). nil on pre-feature rows (the migration backfilled scan_status='skipped' + scan_result={reason: 'pre-feature'} on those; the apid read path returns nil so the dashboard / CLI see a clean absence — the /scan route surfaces the 'skipped' sentinel for those rows). Non-nil for post-feature rows in any of the {pending, complete, failed, skipped} states. The customer can deploy a CRITICAL-CVE image; the dashboard shows it; that is the contract (no enforcement at the deploy gate)."
+        parked_reason:
+          type: [string, "null"]
+          enum: [null, liveness_exhausted, lifecycle_park, admin_park]
+          description: "Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00157). Closed-set vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked deployments — surfaced as no field on the wire via omitempty."
+        parked_at:
+          type: [string, "null"]
+          format: date-time
+          description: "Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for never-parked deployments."
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."

@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AppManifest } from './AppManifest.js';
+import type { ParkedDeploymentRef } from './ParkedDeploymentRef.js';
 import type { PublicAuthStatus } from './PublicAuthStatus.js';
 import type { ScalingPolicy } from './ScalingPolicy.js';
 /**
@@ -80,6 +81,10 @@ export type AppResponse = {
    * Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby PATCH-true is rejected with 403 plan_require_authn_not_allowed.
    */
   require_authn?: boolean;
+  /**
+   * Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why is my app evicted_cold?' without grepping the audit log.
+   */
+  parked_deployment?: (ParkedDeploymentRef | null);
   public_auth?: PublicAuthStatus;
   auth_default_flipped_at?: string | null;
 };

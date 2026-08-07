@@ -50,7 +50,8 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request, acct state.Accou
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.appResponse(app, acct.Plan))
+	resp := s.appResponse(app, acct.Plan)
+	writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, app))
 }
 
 // validateUpdateApp enforces the per-app cold-wake floor rules
@@ -584,7 +585,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if req.EvictionPriority != nil && *req.EvictionPriority == string(api.EvictionPriorityReserved) && app.EvictionPriority != string(api.EvictionPriorityReserved) {
 		cap := acct.Plan.ReservedConcurrencyPerAccount()
 		if cap > 0 {
-			n, err := s.store.CountAppsWithEvictionPriority(ctx(r), acct.ID, string(api.EvictionPriorityReserved))
+			n, err := s.store.CountAppsWithEvictionPriority(r.Context(), acct.ID, string(api.EvictionPriorityReserved))
 			if err != nil {
 				api.WriteProblem(w, api.ErrInternal(fmt.Sprintf("count reserved apps: %v", err)))
 				return
@@ -752,12 +753,12 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			Sealed:   publicAuthSealed,
 		}
 	}
-	updated, err := s.store.UpdateApp(ctx(r), app.ID, params)
+	updated, err := s.store.UpdateApp(r.Context(), app.ID, params)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update app"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"updated","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app updated", "app", updated.ID, "slug", updated.Slug, "account", acct.ID)
 	// IAM-4 (issue #291): record what the customer actually altered.
@@ -865,7 +866,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		oldApp["egress_allowlist"] = egressStringList(app.EgressAllowlist)
 		newApp["egress_allowlist"] = egressStringList(updated.EgressAllowlist)
 	}
-	s.audit.Emit(ctx(r), "app.updated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.updated", &acct.ID, map[string]any{
 		"app_id": updated.ID,
 		"slug":   updated.Slug,
 		"old":    oldApp,
@@ -881,7 +882,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// when the field was already false (no-op) or when the
 	// operator left it unset (no intent to flip).
 	if req.WarmSnapshotEnabled != nil && app.WarmSnapshotEnabled && !updated.WarmSnapshotEnabled {
-		s.audit.Emit(ctx(r), "app.warm_snapshot_disabled", &acct.ID, map[string]any{
+		s.audit.Emit(r.Context(), "app.warm_snapshot_disabled", &acct.ID, map[string]any{
 			"app_id": updated.ID,
 			"slug":   updated.Slug,
 			"old":    true,
@@ -898,7 +899,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// was already the same value (no-op PATCH) or when the
 	// operator left it unset (no intent to flip).
 	if req.EvictionPriority != nil && app.EvictionPriority != updated.EvictionPriority {
-		s.audit.Emit(ctx(r), "app.eviction_priority_changed", &acct.ID, map[string]any{
+		s.audit.Emit(r.Context(), "app.eviction_priority_changed", &acct.ID, map[string]any{
 			"app_id": updated.ID,
 			"slug":   updated.Slug,
 			"old":    app.EvictionPriority,
@@ -918,14 +919,14 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// operator left it unset (no intent to flip).
 	switch {
 	case req.RequireAuthn != nil && !app.RequireAuthn && updated.RequireAuthn:
-		s.audit.Emit(ctx(r), "app.authn_required", &acct.ID, map[string]any{
+		s.audit.Emit(r.Context(), "app.authn_required", &acct.ID, map[string]any{
 			"app_id": updated.ID,
 			"slug":   updated.Slug,
 			"old":    false,
 			"new":    true,
 		})
 	case req.RequireAuthn != nil && app.RequireAuthn && !updated.RequireAuthn:
-		s.audit.Emit(ctx(r), "app.authn_disabled", &acct.ID, map[string]any{
+		s.audit.Emit(r.Context(), "app.authn_disabled", &acct.ID, map[string]any{
 			"app_id": updated.ID,
 			"slug":   updated.Slug,
 			"old":    true,
@@ -951,7 +952,7 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// customer rotate credentials on this PATCH?" without
 	// revealing the value.
 	if req.PublicAuth != nil && app.PublicAuthMode != updated.PublicAuthMode {
-		s.audit.Emit(ctx(r), "app.public_auth_changed", &acct.ID, map[string]any{
+		s.audit.Emit(r.Context(), "app.public_auth_changed", &acct.ID, map[string]any{
 			"app_id":          updated.ID,
 			"slug":            updated.Slug,
 			"old":             app.PublicAuthMode,
@@ -959,7 +960,8 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 			"has_basic_creds": req.PublicAuth.Mode == api.AppPublicAuthModeBasic,
 		})
 	}
-	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))
+	resp := s.appResponse(updated, acct.Plan)
+	writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, updated))
 }
 
 // deleteApp marks the app as deleted (soft delete; PG snapshot GC runs on the
@@ -975,14 +977,14 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// customer has already given up on. CancelInvocation is a no-op on
 	// terminal rows (returns state.ErrNotFound) so dispatching /
 	// completed rows are untouched.
-	pending, err := s.store.ListInvocationsForApp(ctx(r), app.ID,
+	pending, err := s.store.ListInvocationsForApp(r.Context(), app.ID,
 		state.InvocationPending, state.InvocationDispatching)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("list-inv"))
 		return
 	}
 	for _, inv := range pending {
-		if err := s.store.CancelInvocation(ctx(r), inv.ID); err != nil && !errors.Is(err, state.ErrNotFound) {
+		if err := s.store.CancelInvocation(r.Context(), inv.ID); err != nil && !errors.Is(err, state.ErrNotFound) {
 			// Don't fail the delete on a per-row cancel error; the
 			// drain will surface the row as failed and the customer
 			// sees it in the meter. Logging at warn so it's
@@ -991,11 +993,11 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 				"inv", inv.ID, "app", app.ID, "err", err)
 		}
 	}
-	if err := s.store.DeleteApp(ctx(r), app.ID); err != nil {
+	if err := s.store.DeleteApp(r.Context(), app.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not delete app"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"deleted","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app deleted", "app", app.ID, "slug", app.Slug, "account", acct.ID)
 	// IAM-4 (issue #291): record the soft delete. ADR-035 lists
@@ -1004,7 +1006,7 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// (spec §9: row goes to AppDeleted, snapshot GC follows on
 	// the next successful deploy). data carries the slug so the
 	// audit row is searchable even after the row soft-deletes.
-	s.audit.Emit(ctx(r), "app.deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.deleted", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"slug":   app.Slug,
 	})
@@ -1016,12 +1018,12 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 // getDeployment returns one deployment by id.
 func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	d, err := s.store.DeploymentByID(ctx(r), id)
+	d, err := s.store.DeploymentByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such deployment")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), d.AppID)
+	app, err := s.store.AppByID(r.Context(), d.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such deployment")
 		return
@@ -1048,12 +1050,12 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct stat
 // existing auditor (kind list frozen by ADR-074 §Decision 6).
 func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	d, err := s.store.DeploymentByID(ctx(r), id)
+	d, err := s.store.DeploymentByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such deployment")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), d.AppID)
+	app, err := s.store.AppByID(r.Context(), d.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such deployment")
 		return
@@ -1081,7 +1083,7 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 		api.WriteProblem(w, api.ErrMaxMinInstancesExceeded(v, planMax))
 		return
 	}
-	updated, err := s.store.UpdateDeploymentMinInstances(ctx(r), id, v)
+	updated, err := s.store.UpdateDeploymentMinInstances(r.Context(), id, v)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such deployment")
@@ -1109,21 +1111,21 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	if !ok {
 		return
 	}
-	current, err := s.store.LatestDeployment(ctx(r), app.ID)
+	current, err := s.store.LatestDeployment(r.Context(), app.ID)
 	if err != nil {
 		s.notFound(w, "no deployments")
 		return
 	}
-	target, err := s.store.LatestSupersededDeployment(ctx(r), app.ID)
+	target, err := s.store.LatestSupersededDeployment(r.Context(), app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrNoRollbackTarget())
 		return
 	}
-	if err := s.store.MarkDeploymentSuperseded(ctx(r), current.ID); err != nil {
+	if err := s.store.MarkDeploymentSuperseded(r.Context(), current.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not supersede current"))
 		return
 	}
-	if err := s.store.MarkDeploymentLive(ctx(r), target.ID); err != nil {
+	if err := s.store.MarkDeploymentLive(r.Context(), target.ID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not activate rollback target"))
 		return
 	}
@@ -1131,7 +1133,7 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	// not the pre-promotion Superseded we snapshotted into the local
 	// struct above. Listeners downstream branch on this field — fix
 	// surfaced by PR #117 review (finding F3).
-	fresh, err := s.store.DeploymentByID(ctx(r), target.ID)
+	fresh, err := s.store.DeploymentByID(r.Context(), target.ID)
 	if err == nil {
 		target = fresh
 	}
@@ -1141,14 +1143,14 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	// target already has a prepared ext4 + snap from the prior supersede),
 	// but the symmetry lets future listeners branch on status without
 	// a decode change.
-	_ = s.notif.Notify(ctx(r), db.NotifyDeploymentChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyDeploymentChanged,
 		fmt.Sprintf(`{"kind":"rollback","status":"live","app_id":"%s","deployment_id":"%s","from":"%s","to":"%s"}`,
 			app.ID, target.ID, current.ID, target.ID))
 	// F-03: emit the supersede transition for the deployment being
 	// retired. Prior code did not announce the supersede at all, so imaged's
 	// (F5) cleanupDeploymentFiles(p.To, true /* keepSnap */) branch never
 	// fired. status="superseded" makes the transition observable.
-	_ = s.notif.Notify(ctx(r), db.NotifyDeploymentChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyDeploymentChanged,
 		fmt.Sprintf(`{"kind":"superseded","status":"superseded","app_id":"%s","deployment_id":"%s","to":"%s"}`,
 			app.ID, current.ID, current.ID))
 	s.log.Info("app rolled back", "app", app.ID, "from", current.ID, "to", target.ID, "account", acct.ID)
@@ -1159,7 +1161,7 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 	// deployment_id promoted to live. The pg_notify emit above
 	// (lines 460+) carries the same ids for the live-system
 	// listener; the audit row is the read-only counterpart.
-	s.audit.Emit(ctx(r), "app.rolled_back", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.rolled_back", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"from":   current.ID,
 		"to":     target.ID,
@@ -1175,11 +1177,11 @@ func (s *server) parkApp(w http.ResponseWriter, r *http.Request, acct state.Acco
 		return
 	}
 	st := state.AppEvictedCold
-	if _, err := s.store.UpdateApp(ctx(r), app.ID, state.UpdateAppParams{Status: &st}); err != nil {
+	if _, err := s.store.UpdateApp(r.Context(), app.ID, state.UpdateAppParams{Status: &st}); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not park app"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"parked","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app parked", "app", app.ID, "account", acct.ID)
 	w.WriteHeader(http.StatusNoContent)
@@ -1192,11 +1194,11 @@ func (s *server) wakeApp(w http.ResponseWriter, r *http.Request, acct state.Acco
 		return
 	}
 	st := state.AppActive
-	if _, err := s.store.UpdateApp(ctx(r), app.ID, state.UpdateAppParams{Status: &st}); err != nil {
+	if _, err := s.store.UpdateApp(r.Context(), app.ID, state.UpdateAppParams{Status: &st}); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not wake app"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"woken","slug":"%s","app_id":"%s"}`, app.Slug, app.ID))
 	s.log.Info("app woken", "app", app.ID, "account", acct.ID)
 	w.WriteHeader(http.StatusNoContent)
@@ -1234,10 +1236,11 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if req.NewSlug == oldSlug {
 		// Idempotent no-op: skip the DB round-trip and return the
 		// current app shape so retries don't 4xx.
-		writeJSON(w, http.StatusOK, s.appResponse(app, acct.Plan))
+		resp := s.appResponse(app, acct.Plan)
+		writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, app))
 		return
 	}
-	updated, err := s.store.RenameApp(ctx(r), acct.ID, oldSlug, req.NewSlug)
+	updated, err := s.store.RenameApp(r.Context(), acct.ID, oldSlug, req.NewSlug)
 	if err != nil {
 		if errors.Is(err, state.ErrConflict) {
 			api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeAppRenameFailed,
@@ -1259,7 +1262,7 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// files. We do NOT scrub the old slug directory on rename — that
 	// race-conditions with concurrent deploys that still reference the
 	// old slug in their deployment.app_id-to-slug lookup.
-	_ = s.notif.Notify(ctx(r), db.NotifyAppChanged,
+	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
 		fmt.Sprintf(`{"kind":"renamed","app_id":"%s","from":%q,"to":%q}`, app.ID, oldSlug, req.NewSlug))
 	// CodeQL go/log-injection (CWE-117): oldSlug came from the
 	// apps.slug column (regex-validated at create) and req.NewSlug
@@ -1267,7 +1270,8 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// both so a future relax of validSlug (or a hostile migration)
 	// cannot smuggle CR/LF into the audit line.
 	s.log.Info("app renamed", "app", updated.ID, "from", logsanitize.Field(oldSlug), "to", logsanitize.Field(req.NewSlug), "account", acct.ID)
-	writeJSON(w, http.StatusOK, s.appResponse(updated, acct.Plan))
+	resp := s.appResponse(updated, acct.Plan)
+	writeJSON(w, http.StatusOK, s.withParkedDeploymentRef(r.Context(), resp, updated))
 }
 
 // --- instances -------------------------------------------------------------
@@ -1277,7 +1281,7 @@ func (s *server) listInstances(w http.ResponseWriter, r *http.Request, acct stat
 	if !ok {
 		return
 	}
-	instances, err := s.store.ListInstancesForApp(ctx(r), app.ID)
+	instances, err := s.store.ListInstancesForApp(r.Context(), app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list instances"))
 		return
@@ -1302,19 +1306,19 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 			"Bad request", "domain and app_id are required"))
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), req.AppID)
+	app, err := s.store.AppByID(r.Context(), req.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such app")
 		return
 	}
 	token := randomToken(16)
-	d, err := s.store.CreateCustomDomain(ctx(r), strings.ToLower(req.Domain), app.ID, token)
+	d, err := s.store.CreateCustomDomain(r.Context(), strings.ToLower(req.Domain), app.ID, token)
 	if err != nil {
 		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation,
 			"Domain taken", err.Error()))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyDomainChanged, `{"kind":"created","domain":"`+d.Domain+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyDomainChanged, `{"kind":"created","domain":"`+d.Domain+`"}`)
 	// d.Domain came in via the HTTP body (bearer-token authenticated).
 	// Sanitize at the log sink — CodeQL go/log-injection (CWE-117).
 	// The notify payload above is JSON-encoded so the pg_notify channel
@@ -1325,7 +1329,7 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 	// is the lowercased canonical form already stored on the row, so
 	// the audit row and the row stay in sync — a dashboard that
 	// joins events.domain with domains.domain gets no surprises.
-	s.audit.Emit(ctx(r), "domain.added", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "domain.added", &acct.ID, map[string]any{
 		"app_id": d.AppID,
 		"domain": d.Domain,
 	})
@@ -1333,7 +1337,7 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 }
 
 func (s *server) listDomains(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	domains, err := s.store.ListDomainsForAccount(ctx(r), acct.ID)
+	domains, err := s.store.ListDomainsForAccount(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list domains"))
 		return
@@ -1347,28 +1351,28 @@ func (s *server) listDomains(w http.ResponseWriter, r *http.Request, acct state.
 
 func (s *server) deleteDomain(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	domain := strings.ToLower(r.PathValue("domain"))
-	d, err := s.store.DomainByName(ctx(r), domain)
+	d, err := s.store.DomainByName(r.Context(), domain)
 	if err != nil {
 		s.notFound(w, "no such domain")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), d.AppID)
+	app, err := s.store.AppByID(r.Context(), d.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such domain")
 		return
 	}
-	if err := s.store.DeleteCustomDomain(ctx(r), domain); err != nil {
+	if err := s.store.DeleteCustomDomain(r.Context(), domain); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not delete domain"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyDomainChanged, `{"kind":"deleted","domain":"`+domain+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyDomainChanged, `{"kind":"deleted","domain":"`+domain+`"}`)
 	s.log.Info("domain deleted", "domain", domain, "account", acct.ID)
 	// IAM-4 (issue #291): record the domain detachment. Symmetric
 	// to domain.added; like the cron family, the pair is what an
 	// operator queries ("when did this domain get attached and
 	// later detached?"). data carries the low-cased canonical
 	// form for the same dashboard-join reason.
-	s.audit.Emit(ctx(r), "domain.removed", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "domain.removed", &acct.ID, map[string]any{
 		"app_id": d.AppID,
 		"domain": domain,
 	})
@@ -1404,7 +1408,7 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, api.ErrPlanCronsNotAllowed(acct.Plan))
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), req.AppID)
+	app, err := s.store.AppByID(r.Context(), req.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such app")
 		return
@@ -1417,7 +1421,7 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 	if path == "" {
 		path = "/"
 	}
-	c, err := s.store.CreateCronIfUnderQuota(ctx(r), req.AppID, req.Schedule, path, enabled, limits)
+	c, err := s.store.CreateCronIfUnderQuota(r.Context(), req.AppID, req.Schedule, path, enabled, limits)
 	if err != nil {
 		var qe *state.CronQuotaError
 		switch {
@@ -1430,14 +1434,14 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 		}
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"created","app_id":"`+app.ID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyCronChanged, `{"kind":"created","app_id":"`+app.ID+`"}`)
 	s.log.Info("cron created", "cron", c.ID, "app", app.ID, "account", acct.ID)
 	// IAM-4 (issue #291): record the cron schedule so a stolen CI
 	// token that adds a backend beacon is observable. Sits AFTER
 	// the PR #340 plan-tier gate (lines above); a Free customer
 	// gets a 402 and never reaches this line, so no audit row is
 	// emitted for the rejected attempt.
-	s.audit.Emit(ctx(r), "cron.created", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "cron.created", &acct.ID, map[string]any{
 		"cron_id":  c.ID,
 		"app_id":   c.AppID,
 		"schedule": c.Schedule,
@@ -1449,14 +1453,14 @@ func (s *server) createCron(w http.ResponseWriter, r *http.Request, acct state.A
 
 func (s *server) listCrons(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	// List every cron owned by any of this account's apps.
-	apps, err := s.store.ListApps(ctx(r), acct.ID)
+	apps, err := s.store.ListApps(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list crons"))
 		return
 	}
 	out := make([]api.CronResponse, 0)
 	for _, app := range apps {
-		cs, err := s.store.ListCronsForApp(ctx(r), app.ID)
+		cs, err := s.store.ListCronsForApp(r.Context(), app.ID)
 		if err != nil {
 			continue
 		}
@@ -1478,22 +1482,22 @@ func (s *server) updateCron(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, api.ErrCronInvalid("expected 5-field cron expression"))
 		return
 	}
-	c, err := s.store.CronByID(ctx(r), id)
+	c, err := s.store.CronByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such cron")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), c.AppID)
+	app, err := s.store.AppByID(r.Context(), c.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such cron")
 		return
 	}
-	updated, err := s.store.UpdateCron(ctx(r), id, req.Schedule, req.Path, req.Enabled, nil)
+	updated, err := s.store.UpdateCron(r.Context(), id, req.Schedule, req.Path, req.Enabled, nil)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update cron"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"updated","cron":"`+id+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyCronChanged, `{"kind":"updated","cron":"`+id+`"}`)
 	// IAM-4 (issue #291): record what changed and to what. We
 	// capture only the fields the caller actually sent (req.X != nil)
 	// so a schedule-only patch does NOT carry a `path` key on either
@@ -1513,7 +1517,7 @@ func (s *server) updateCron(w http.ResponseWriter, r *http.Request, acct state.A
 		oldCron["enabled"] = c.Enabled
 		newCron["enabled"] = updated.Enabled
 	}
-	s.audit.Emit(ctx(r), "cron.updated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "cron.updated", &acct.ID, map[string]any{
 		"cron_id": updated.ID,
 		"app_id":  updated.AppID,
 		"old":     oldCron,
@@ -1524,27 +1528,27 @@ func (s *server) updateCron(w http.ResponseWriter, r *http.Request, acct state.A
 
 func (s *server) deleteCron(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	c, err := s.store.CronByID(ctx(r), id)
+	c, err := s.store.CronByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such cron")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), c.AppID)
+	app, err := s.store.AppByID(r.Context(), c.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such cron")
 		return
 	}
-	if err := s.store.DeleteCron(ctx(r), id, c.AppID); err != nil {
+	if err := s.store.DeleteCron(r.Context(), id, c.AppID); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not delete cron"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyCronChanged, `{"kind":"deleted","cron":"`+id+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyCronChanged, `{"kind":"deleted","cron":"`+id+`"}`)
 	// IAM-4 (issue #291): record the cron removal so a teammate
 	// removing a customer's alarm is observable in the audit feed.
 	// Symmetric to cron.created; ADR-035's `key.*` / `secret.*`
 	// already pair .created with .deleted, so this closes the
 	// surface for the cron family.
-	s.audit.Emit(ctx(r), "cron.deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "cron.deleted", &acct.ID, map[string]any{
 		"cron_id": c.ID,
 		"app_id":  c.AppID,
 	})
@@ -1569,7 +1573,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// permitted at the cap (the old key retired just before the
 	// new one is minted — net 0).
 	limits := api.MustLimitsFor(acct.Plan)
-	if cur, cerr := s.store.CountAPIKeys(ctx(r), acct.ID); cerr == nil && cur >= limits.KeysMax {
+	if cur, cerr := s.store.CountAPIKeys(r.Context(), acct.ID); cerr == nil && cur >= limits.KeysMax {
 		api.WriteProblem(w, api.ErrAPIKeyLimitExceeded(limits, cur))
 		return
 	} else if cerr != nil {
@@ -1610,11 +1614,11 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// lineage path; rotation already uses rotated_from_id).
 	bindIP := clientIPFromRequest(r)
 	bindUA := logsanitize.Field(r.UserAgent())
-	org, perr := s.store.OrgByPersonalAccount(ctx(r), acct.ID)
+	org, perr := s.store.OrgByPersonalAccount(r.Context(), acct.ID)
 	var k state.APIKey
 	switch {
 	case perr == nil:
-		k, err = s.store.CreateOrgAPIKeyWithProvenance(ctx(r), org.ID, acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
+		k, err = s.store.CreateOrgAPIKeyWithProvenance(r.Context(), org.ID, acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
 	case errors.Is(perr, state.ErrNotFound):
 		// Legacy fallback path (pre-00127 fixtures). The
 		// 5-arg CreateAPIKeyWithExpiry is the production
@@ -1622,7 +1626,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// stamps the same audit-relevant columns so the
 		// fallback path is the same shape as the org-bound
 		// path.
-		k, err = s.store.CreateAPIKeyWithExpiryAndProvenance(ctx(r), acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
+		k, err = s.store.CreateAPIKeyWithExpiryAndProvenance(r.Context(), acct.ID, hash, req.Label, scopes, expiresAt, bindIP, bindUA, nil)
 	default:
 		api.WriteProblem(w, api.ErrCapacity("could not resolve personal org"))
 		return
@@ -1631,7 +1635,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrCapacity("could not create key"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"created","account":"`+acct.ID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"created","account":"`+acct.ID+`"}`)
 	s.log.Info("key created", "key", k.ID, "account", acct.ID)
 	// IAM-4 (ADR-035): record the key mint. subject = account_id (the
 	// owner); data.scopes is the per-key permission set so the
@@ -1651,7 +1655,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if k.ExpiresAt != nil {
 		auditPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	s.audit.Emit(ctx(r), "key.created", &acct.ID, auditPayload)
+	s.audit.Emit(r.Context(), "key.created", &acct.ID, auditPayload)
 	if perr == nil {
 		newPayload := map[string]any{
 			"key_id":     k.ID,
@@ -1663,7 +1667,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		if k.ExpiresAt != nil {
 			newPayload["expires_at"] = k.ExpiresAt.UTC().Format(time.RFC3339)
 		}
-		s.audit.Emit(ctx(r), "api_key.created", &acct.ID, newPayload)
+		s.audit.Emit(r.Context(), "api_key.created", &acct.ID, newPayload)
 	}
 	resp := api.APIKeyResponse{
 		ID:        k.ID,
@@ -1682,7 +1686,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 }
 
 func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	keys, err := s.store.ListAPIKeys(ctx(r), acct.ID)
+	keys, err := s.store.ListAPIKeys(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list keys"))
 		return
@@ -1721,7 +1725,7 @@ func (s *server) deleteKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// preserves the predecessor's id; revoced_at marks the kill).
 	// Repeated DELETE on a revoked key is idempotent — MarkAPIKeyRevoked
 	// is a "update if not revoked" and returns the row either way.
-	updated, err := s.store.MarkAPIKeyRevoked(ctx(r), acct.ID, id)
+	updated, err := s.store.MarkAPIKeyRevoked(r.Context(), acct.ID, id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -1730,14 +1734,14 @@ func (s *server) deleteKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrCapacity("could not revoke key"))
 		return
 	}
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"revoked","account":"`+acct.ID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"revoked","account":"`+acct.ID+`"}`)
 	// IAM-4 + IAM-1 (ADR-034 rev2 / ADR-035): record the key
 	// revocation carrying the dismissed scopes so an operator can
 	// answer "what did this key allow before it died?" without
 	// re-deriving it from logs. The `reason` field is "manual"
 	// (this path) vs "rotation" (rotateKey) vs "expired" (lazy
 	// auth-time gate). Dashboard filters by reason.
-	s.audit.Emit(ctx(r), "key.revoked", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "key.revoked", &acct.ID, map[string]any{
 		"key_id": updated.ID,
 		"scopes": updated.Scopes,
 		"reason": "manual",
@@ -1780,7 +1784,7 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// admin updates invalidate the cache and propagate on the
 	// next rotation.
 	var graceWindow time.Duration
-	gw, err := s.resolveGraceWindow(ctx(r), acct.ID)
+	gw, err := s.resolveGraceWindow(r.Context(), acct.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not resolve grace window"))
 		return
@@ -1805,7 +1809,7 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// the (id, org_id) lock predicate. GetAPIKey collapses
 	// cross-account reads to ErrNotFound at the SQL level — the
 	// same IDOR-safe shape the legacy MarkAPIKeyRevoked uses.
-	oldKey, err := s.store.GetAPIKey(ctx(r), acct.ID, id)
+	oldKey, err := s.store.GetAPIKey(r.Context(), acct.ID, id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -1831,7 +1835,7 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 	bindIP := clientIPFromRequest(r)
 	bindUA := logsanitize.Field(r.UserAgent())
 	parentID := oldKey.ID
-	newKey, oldKey, err := s.store.RotateOrgAPIKeyWithProvenance(ctx(r), oldKey.OrgID, id, hash, "", graceWindow, bindIP, bindUA, &parentID)
+	newKey, oldKey, err := s.store.RotateOrgAPIKeyWithProvenance(r.Context(), oldKey.OrgID, id, hash, "", graceWindow, bindIP, bindUA, &parentID)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such key")
@@ -1845,7 +1849,7 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 
-	_ = s.notif.Notify(ctx(r), db.NotifyKeyChanged, `{"kind":"rotated","account":"`+acct.ID+`"}`)
+	_ = s.notif.Notify(r.Context(), db.NotifyKeyChanged, `{"kind":"rotated","account":"`+acct.ID+`"}`)
 	var graceWindowDays int
 	if graceWindow > 0 {
 		graceWindowDays = int(graceWindow / (24 * time.Hour))
@@ -1859,11 +1863,11 @@ func (s *server) rotateKey(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"created_ua":         bindUA,
 		"parent_key_id":      oldKey.ID,
 	}
-	s.audit.Emit(ctx(r), "key.rotated", &acct.ID, auditPayload)
+	s.audit.Emit(r.Context(), "key.rotated", &acct.ID, auditPayload)
 	// PR 6 dual-emit: the new `api_key.rotated` carries org_id
 	// so the PR 5+ dashboard can group rotations by org. PR 9
 	// drops the legacy event.
-	s.audit.Emit(ctx(r), "api_key.rotated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "api_key.rotated", &acct.ID, map[string]any{
 		"old_key_id":         oldKey.ID,
 		"new_key_id":         newKey.ID,
 		"grace_window_days":  graceWindowDays,
@@ -1918,7 +1922,7 @@ func (s *server) getUsage(w http.ResponseWriter, r *http.Request, acct state.Acc
 			"Bad month", "expected YYYY-MM"))
 		return
 	}
-	rows, err := s.store.UsageByMonth(ctx(r), acct.ID, month)
+	rows, err := s.store.UsageByMonth(r.Context(), acct.ID, month)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not load usage"))
 		return
@@ -2025,7 +2029,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		// land here with the same template response, so the pre-PR-#3
 		// Stripe path is bit-for-bit unchanged.
 		if s.billingProvider != nil {
-			txID, checkoutURL, err := s.billingProvider.CreateUpgradeTransaction(ctx(r), acct, plan)
+			txID, checkoutURL, err := s.billingProvider.CreateUpgradeTransaction(r.Context(), acct, plan)
 			if err != nil {
 				s.log.Error("create_upgrade_tx",
 					"account", acct.ID,
@@ -2045,11 +2049,11 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, prob)
 		return
 	}
-	if err := s.store.UpdateAccountPlan(ctx(r), acct.ID, plan); err != nil {
+	if err := s.store.UpdateAccountPlan(r.Context(), acct.ID, plan); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update plan"))
 		return
 	}
-	updated, _ := s.store.AccountByID(ctx(r), acct.ID)
+	updated, _ := s.store.AccountByID(r.Context(), acct.ID)
 	// CodeQL go/log-injection (CWE-117): plan was enum-validated against
 	// the 4 Plan constants (free|hobby|pro|scale) by plan.Valid() in this
 	// handler — a bad value is rejected with 400 before reaching here,
@@ -2061,7 +2065,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 	// the pre-change plan (acct.Plan) and post-change plan so the
 	// audit row is self-describing — no need to walk the gdpr ledger
 	// to find the prior state.
-	s.audit.Emit(ctx(r), "account.plan_changed", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "account.plan_changed", &acct.ID, map[string]any{
 		"from": string(acct.Plan),
 		"to":   string(plan),
 	})
@@ -2072,7 +2076,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 	// change moves the live row state; mfaFlipOnUpgrade only
 	// needs the old/new pair, which we still have here.
 	if mfaFlipOnUpgrade(acct.Plan, plan) {
-		s.flipMFARequiredIfUnenrolled(ctx(r), updated, "plan_upgrade", map[string]any{
+		s.flipMFARequiredIfUnenrolled(r.Context(), updated, "plan_upgrade", map[string]any{
 			"from": string(acct.Plan),
 			"to":   string(plan),
 		})
@@ -2612,6 +2616,14 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 	// tag then drops the field from the wire response. The
 	// dashboard renders "scan pending" on the absence.
 	resp.Scan = s.scanResponse(d)
+	// Issue #554 / ADR-079 follow-up (AC #3 wire): surface the
+	// per-deployment parked_reason + parked_at columns from
+	// migration 00157. omitempty on the DTO handles the "never
+	// parked" branch — the field is absent on the wire for the
+	// vast majority of deployments. The closed-set vocabulary
+	// is enforced at the schema layer.
+	resp.ParkedReason = d.ParkedReason
+	resp.ParkedAt = d.ParkedAt
 	return resp
 }
 
@@ -2729,7 +2741,7 @@ func (s *server) listDeployments(w http.ResponseWriter, r *http.Request, acct st
 			return
 		}
 	}
-	rows, err := s.store.ListDeploymentsForAccount(ctx(r), acct.ID, before, limit)
+	rows, err := s.store.ListDeploymentsForAccount(r.Context(), acct.ID, before, limit)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list deployments"))
 		return
@@ -2763,7 +2775,7 @@ func (s *server) usageSummary(w http.ResponseWriter, r *http.Request, acct state
 			"Bad month", "expected YYYY-MM"))
 		return
 	}
-	rows, err := s.store.UsageByMonth(ctx(r), acct.ID, month)
+	rows, err := s.store.UsageByMonth(r.Context(), acct.ID, month)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not load usage"))
 		return
@@ -2831,7 +2843,7 @@ func (s *server) usageDaily(w http.ResponseWriter, r *http.Request, acct state.A
 			"Bad day", "expected YYYY-MM-DD"))
 		return
 	}
-	rows, err := s.store.UsageDaily(ctx(r), acct.ID, day)
+	rows, err := s.store.UsageDaily(r.Context(), acct.ID, day)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not load daily usage"))
 		return
@@ -2876,7 +2888,7 @@ func (s *server) usageStorage(w http.ResponseWriter, r *http.Request, acct state
 			"Bad day", "expected YYYY-MM-DD"))
 		return
 	}
-	rows, err := s.store.StorageUsage(ctx(r), acct.ID, day)
+	rows, err := s.store.StorageUsage(r.Context(), acct.ID, day)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not load storage usage"))
 		return
@@ -2924,7 +2936,7 @@ func (s *server) listInvoices(w http.ResponseWriter, r *http.Request, acct state
 		api.WriteProblem(w, perr)
 		return
 	}
-	rows, err := s.store.ListInvoicesForAccount(ctx(r), acct.ID, monthPtr, before, limit)
+	rows, err := s.store.ListInvoicesForAccount(r.Context(), acct.ID, monthPtr, before, limit)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list invoices"))
 		return
@@ -3062,15 +3074,15 @@ func validCron(s string) bool {
 // max 500). ?follow=0 closes after the initial page (CLI-friendly
 // "fetch once" mode).
 //
-//nolint:contextcheck // ctx(r) === r.Context(); suppressed per-call to avoid line-by-line noise in a long SSE handler.
+//nolint:contextcheck // r.Context() === r.Context(); suppressed per-call to avoid line-by-line noise in a long SSE handler.
 func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	d, err := s.store.DeploymentByID(ctx(r), id)
+	d, err := s.store.DeploymentByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such deployment")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), d.AppID)
+	app, err := s.store.AppByID(r.Context(), d.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such deployment")
 		return
@@ -3097,8 +3109,8 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 
 	// Walk backwards: the table returns DESC by seq, the SSE stream
 	// wants chronological. MemStore + PgStore both order DESC.
-	//nolint:contextcheck // Long SSE handler; ctx(r) == r.Context() but the linter loses the alias across the function's many statements.
-	page, _, err := s.store.ListDeploymentLogs(ctx(r), id, beforeSeq, limit)
+	//nolint:contextcheck // Long SSE handler; r.Context() == r.Context() but the linter loses the alias across the function's many statements.
+	page, _, err := s.store.ListDeploymentLogs(r.Context(), id, beforeSeq, limit)
 	if err != nil {
 		_, _ = fmt.Fprintf(w, "event: error\ndata: {\"error\":%q}\n\n", err.Error())
 		if flusher != nil {
@@ -3170,7 +3182,7 @@ func (s *server) streamDeploymentLogs(w http.ResponseWriter, r *http.Request, ac
 			// Cheap status poll. Emits `event: status` and exits
 			// when the deployment reaches a terminal state. The
 			// 10-min backstop below still fires if something hangs.
-			if d2, err := s.store.DeploymentByID(ctx(r), id); err == nil &&
+			if d2, err := s.store.DeploymentByID(r.Context(), id); err == nil &&
 				(d2.Status == state.DeployLive || d2.Status == state.DeployFailed) {
 				_, _ = fmt.Fprintf(w, "event: status\ndata: {\"status\":%q}\n\n", d2.Status)
 				if flusher != nil {
@@ -3227,22 +3239,22 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 // scope the rest of the build surface uses.
 func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	build, err := s.store.BuildByID(ctx(r), id)
+	build, err := s.store.BuildByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "no such build")
 		return
 	}
-	dep, err := s.store.DeploymentByID(ctx(r), build.DeploymentID)
+	dep, err := s.store.DeploymentByID(r.Context(), build.DeploymentID)
 	if err != nil {
 		s.notFound(w, "no such build")
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), dep.AppID)
+	app, err := s.store.AppByID(r.Context(), dep.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such build")
 		return
 	}
-	prov, err := s.store.BuildProvenanceByBuildID(ctx(r), build.ID)
+	prov, err := s.store.BuildProvenanceByBuildID(r.Context(), build.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrBuildProvenanceNotFound())
 		return
@@ -3323,19 +3335,19 @@ func (s *server) resolveSbomPath(r *http.Request, buildID string, acct state.Acc
 	notFound := func() (string, *api.Problem) {
 		return "", api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Not found", "no such build")
 	}
-	build, err := s.store.BuildByID(ctx(r), buildID)
+	build, err := s.store.BuildByID(r.Context(), buildID)
 	if err != nil {
 		return notFound()
 	}
-	dep, err := s.store.DeploymentByID(ctx(r), build.DeploymentID)
+	dep, err := s.store.DeploymentByID(r.Context(), build.DeploymentID)
 	if err != nil {
 		return notFound()
 	}
-	app, err := s.store.AppByID(ctx(r), dep.AppID)
+	app, err := s.store.AppByID(r.Context(), dep.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		return notFound()
 	}
-	prov, err := s.store.BuildProvenanceByBuildID(ctx(r), build.ID)
+	prov, err := s.store.BuildProvenanceByBuildID(r.Context(), build.ID)
 	if err != nil {
 		// Provenance row absent — pre-PR build.
 		return "", api.ErrBuildSBOMUnavailable()

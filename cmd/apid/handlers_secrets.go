@@ -57,7 +57,7 @@ func (s *server) listSecrets(w http.ResponseWriter, r *http.Request, acct state.
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAppSecrets(ctx(r), acct.ID, app.ID)
+	rows, err := s.store.ListAppSecrets(r.Context(), acct.ID, app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list secrets"))
 		return
@@ -112,11 +112,11 @@ func (s *server) setSecret(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, prob)
 		return
 	}
-	if prob := s.checkSecretQuota(ctx(r), acct, app, key, limits); prob != nil {
+	if prob := s.checkSecretQuota(r.Context(), acct, app, key, limits); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
-	if prob := s.sealAndPersist(ctx(r), acct, app, key, req.Value, limits); prob != nil {
+	if prob := s.sealAndPersist(r.Context(), acct, app, key, req.Value, limits); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -133,7 +133,7 @@ func (s *server) setSecret(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// plaintext value in the audit row — same posture as slog.
 	// data.app_id lets the audit log filter by app; data.name is
 	// the secret key (not the value).
-	s.audit.Emit(ctx(r), "secret.set", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "secret.set", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"name":   key,
 	})
@@ -203,7 +203,7 @@ func (s *server) deleteSecret(w http.ResponseWriter, r *http.Request, acct state
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteAppSecret(ctx(r), acct.ID, app.ID, key); err != nil {
+	if err := s.store.DeleteAppSecret(r.Context(), acct.ID, app.ID, key); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.ErrSecretNotFound(key))
 			return
@@ -217,7 +217,7 @@ func (s *server) deleteSecret(w http.ResponseWriter, r *http.Request, acct state
 		"account", acct.ID,
 	)
 	// IAM-4 (ADR-035): record the secret delete.
-	s.audit.Emit(ctx(r), "secret.deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "secret.deleted", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"name":   key,
 	})

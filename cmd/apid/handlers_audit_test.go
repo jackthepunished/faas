@@ -1646,3 +1646,107 @@ func mustAuditEventResponse(t *testing.T, ev *api.AuditEventResponse, msg string
 	}
 	return ev
 }
+
+// TestListAuditEvents_LivenessKinds (issue #554 / ADR-079 /
+// AC #5) pins the customer-facing audit filter for the two
+// liveness event kinds. The audit rows are emitted at
+// pkg/sched/engine.go:3729 (transitionWithKind writes the kind
+// `liveness_failed`) +
+// pkg/sched/engine.go:3828 (instances.parked_liveness_exhausted).
+//
+// The two kinds do NOT share a single prefix — the destroy row
+// starts with `liveness_` (no `instances.` prefix) and the park
+// row starts with `instances.parked_`. The customer-facing
+// dashboard therefore fires two queries (one per kind) and the
+// audit handler's `?kind_prefix=` filter handles each on its
+// own. This test pins both:
+//
+//   - `?kind_prefix=liveness_` — surfaces the 3 destroy rows.
+//   - `?kind_prefix=instances.parked_liveness_` — surfaces the
+//     1 park row.
+//
+// Without these pins, a future rename of either kind (e.g.
+// dropping the `instances.` prefix on the park row, splitting
+// the destroy row into `liveness.failed` + `liveness.parked`)
+// would silently break the dashboard's "liveness history" view.
+func TestListAuditEvents_LivenessKinds(t *testing.T) {
+	e := setup(t, api.PlanPro)
+
+	// The audit-events list endpoint is per-account-scoped —
+	// the subject column is opaque to the handler but the
+	// account-id filter is the query that gates results. Match
+	// the cron-fired test shape: subject = e.acct.ID, with the
+	// deployment id surfaced via the data JSON.
+	subject := e.acct.ID
+
+	// Three destroys + one park — mirrors the AC #3 envelope
+	// (3 destroys in 5 min trips ParkDeployment which emits the
+	// park audit row). The destroy row's kind is the bare
+	// `liveness_failed` (transitionWithKind passes the kind
+	// verbatim — no `instances.` prefix is added). The park
+	// row's kind is the fully-qualified `instances.parked_*`.
+	for i := 0; i < 3; i++ {
+		payload, err := json.Marshal(map[string]any{
+			"deployment": "dep-liveness-test",
+			"reason":     "liveness_n_consecutive",
+		})
+		if err != nil {
+			t.Fatalf("marshal liveness_failed: %v", err)
+		}
+		if err := e.store.AppendEvent(context.Background(), "schedd", "liveness_failed", &subject, payload); err != nil {
+			t.Fatalf("AppendEvent liveness_failed[%d]: %v", i, err)
+		}
+	}
+	parkPayload, err := json.Marshal(map[string]any{
+		"deployment":    "dep-liveness-test",
+		"reason":        "liveness_exhausted",
+		"now":           time.Now().UTC().Format(time.RFC3339Nano),
+		"window_recent": 3,
+	})
+	if err != nil {
+		t.Fatalf("marshal parked: %v", err)
+	}
+	if err := e.store.AppendEvent(context.Background(), "schedd", "instances.parked_liveness_exhausted", &subject, parkPayload); err != nil {
+		t.Fatalf("AppendEvent parked: %v", err)
+	}
+
+	// 1) kind_prefix=liveness_ — the per-destroy kind
+	// (transitionWithKind passes "liveness_failed" verbatim).
+	rec := e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=liveness_", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?kind_prefix=liveness_: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var destroyList api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &destroyList); err != nil {
+		t.Fatalf("decode destroy list: %v body=%s", err, rec.Body.String())
+	}
+	var livenessFails int
+	for _, ev := range destroyList.Events {
+		if ev.Kind == "liveness_failed" {
+			livenessFails++
+		}
+	}
+	if livenessFails != 3 {
+		t.Errorf("liveness_failed count = %d, want 3 (AC #5: per-destroy audit row)", livenessFails)
+	}
+
+	// 2) kind_prefix=instances.parked_liveness_ — the per-park
+	// kind (engine.go:3828 uses the fully-qualified name).
+	rec = e.do(t, http.MethodGet, "/v1/audit-events?kind_prefix=instances.parked_liveness_", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/audit-events?kind_prefix=instances.parked_liveness_: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var parkList api.ListAuditEventsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &parkList); err != nil {
+		t.Fatalf("decode park list: %v body=%s", err, rec.Body.String())
+	}
+	var parked int
+	for _, ev := range parkList.Events {
+		if ev.Kind == "instances.parked_liveness_exhausted" {
+			parked++
+		}
+	}
+	if parked != 1 {
+		t.Errorf("instances.parked_liveness_exhausted count = %d, want 1 (AC #5: per-park audit row)", parked)
+	}
+}

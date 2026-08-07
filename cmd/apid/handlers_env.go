@@ -48,7 +48,7 @@ func (s *server) listEnv(w http.ResponseWriter, r *http.Request, acct state.Acco
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAppEnv(ctx(r), acct.ID, app.ID)
+	rows, err := s.store.ListAppEnv(r.Context(), acct.ID, app.ID)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list env vars"))
 		return
@@ -100,11 +100,11 @@ func (s *server) setEnv(w http.ResponseWriter, r *http.Request, acct state.Accou
 		api.WriteProblem(w, prob)
 		return
 	}
-	if prob := s.checkEnvQuota(ctx(r), acct, app, key, limits); prob != nil {
+	if prob := s.checkEnvQuota(r.Context(), acct, app, key, limits); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
-	if err := s.store.UpsertAppEnv(ctx(r), acct.ID, app.ID, key, req.Value); err != nil {
+	if err := s.store.UpsertAppEnv(r.Context(), acct.ID, app.ID, key, req.Value); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not persist env var"))
 		return
 	}
@@ -122,7 +122,7 @@ func (s *server) setEnv(w http.ResponseWriter, r *http.Request, acct state.Accou
 	// customer can't hide credentials under the env var surface
 	// without losing the audit-kind signal that says "config change"
 	// vs "credential change". Same posture as slog: no plaintext.
-	s.audit.Emit(ctx(r), "env.set", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "env.set", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"name":   key,
 	})
@@ -179,7 +179,7 @@ func (s *server) deleteEnv(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteAppEnv(ctx(r), acct.ID, app.ID, key); err != nil {
+	if err := s.store.DeleteAppEnv(r.Context(), acct.ID, app.ID, key); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			api.WriteProblem(w, api.ErrEnvVarNotFound(key))
 			return
@@ -193,7 +193,7 @@ func (s *server) deleteEnv(w http.ResponseWriter, r *http.Request, acct state.Ac
 		"account", acct.ID,
 	)
 	// Issue #395: env.deleted is the DELETE counterpart of env.set.
-	s.audit.Emit(ctx(r), "env.deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "env.deleted", &acct.ID, map[string]any{
 		"app_id": app.ID,
 		"name":   key,
 	})

@@ -3866,12 +3866,28 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 //
 // `reason` is a closed-set label, today only "liveness_exhausted";
 // future stop-the-traffic paths (e.g. spec §17 retention) may
-// reuse this method. We do NOT carve a `deployments.parked_reason
-// text` column in this PR (slot 150 reserved but not migrated);
-// the audit row carries the reason in data JSON.
+// reuse this method. AC #3 follow-up (issue #554 / ADR-079): the
+// per-deployment `deployments.parked_reason` + `parked_at` columns
+// from migration 00157 are stamped here BEFORE the apps.status
+// flip so a re-stamp on a schedd crash loop does not re-paint
+// the timestamp (SetDeploymentParked is idempotent — see
+// pkg/state/pgstore.go). The audit row remains the durable
+// source of truth.
 func (e *Engine) ParkDeployment(ctx context.Context, deploymentID, reason string) error {
 	if deploymentID == "" {
 		return fmt.Errorf("sched: ParkDeployment: empty deploymentID")
+	}
+	// Closed-set guard (issue #554 follow-up): the
+	// deployments.parked_reason CHECK constraint accepts only
+	// {liveness_exhausted, lifecycle_park, admin_park}. A stray
+	// value would surface as a Postgres 23514 at the SQL layer
+	// and be silently warn-logged by SetDeploymentParked's
+	// caller — operators would see an evicted_cold app with no
+	// parked_reason on the wire. Fail fast here so the bug
+	// surfaces during dev, not in prod.
+	pr := state.ParkReason(reason)
+	if !pr.IsValid() {
+		return fmt.Errorf("sched: ParkDeployment: deployment %s: invalid reason %q (want one of liveness_exhausted, lifecycle_park, admin_park)", deploymentID, reason)
 	}
 	// Resolve the parent app so we can flip apps.status. The
 	// state store is the single source of truth for the
@@ -3881,6 +3897,18 @@ func (e *Engine) ParkDeployment(ctx context.Context, deploymentID, reason string
 		return fmt.Errorf("sched: ParkDeployment: deployment %s: %w", deploymentID, err)
 	}
 	appID := dep.AppID
+
+	// AC #3 wire: stamp the per-deployment parked_reason +
+	// parked_at columns so the apid GET /v1/apps/{slug}
+	// surface can render `parked_deployment: { id,
+	// parked_reason, parked_at }`. Idempotent — a re-stamp on
+	// a schedd crash loop is a no-op. Best-effort: a failure
+	// here logs a warning but does NOT fail the park, because
+	// the audit row (below) is the durable source of truth.
+	if err := e.store.SetDeploymentParked(ctx, deploymentID, reason, time.Now().UTC()); err != nil {
+		e.log.Warn("liveness: stamp deployment parked failed", "deployment", deploymentID, "err", err)
+	}
+
 	evicted := state.AppStatus("evicted_cold")
 	if _, err := e.store.UpdateApp(ctx, appID, state.UpdateAppParams{
 		Status: &evicted,

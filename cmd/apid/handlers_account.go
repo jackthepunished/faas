@@ -351,7 +351,7 @@ func gatherExport(ctx context.Context, s *server, acct state.Account, includeSec
 // Auth: admin scope (ScopesAdminOnly); middleware already
 // short-circuits non-admin callers.
 func (s *server) getGraceWindow(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	days, err := s.store.GetAccountKeyGraceWindow(ctx(r), acct.ID)
+	days, err := s.store.GetAccountKeyGraceWindow(r.Context(), acct.ID)
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
 		api.WriteProblem(w, api.ErrCapacity("could not read grace window"))
 		return
@@ -391,12 +391,12 @@ func (s *server) setGraceWindow(w http.ResponseWriter, r *http.Request, acct sta
 
 	// Read the prior value for the audit row. The cache may
 	// short-circuit this — invalidated-or-stale cache is fine.
-	oldDays, _ := s.resolveGraceWindow(ctx(r), acct.ID) // best-effort
-	_ = s.store.SetAccountKeyGraceWindow(ctx(r), acct.ID, req.Days)
+	oldDays, _ := s.resolveGraceWindow(r.Context(), acct.ID) // best-effort
+	_ = s.store.SetAccountKeyGraceWindow(r.Context(), acct.ID, req.Days)
 	if s.graceWindowCache != nil {
 		s.graceWindowCache.Invalidate(acct.ID)
 	}
-	s.audit.Emit(ctx(r), "key.grace_window_set", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "key.grace_window_set", &acct.ID, map[string]any{
 		"old_days": oldDays,
 		"new_days": req.Days, // *int — JSON null for the cleared case
 	})

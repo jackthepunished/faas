@@ -3679,7 +3679,7 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		                          status,
 		                          min_instances)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18)
-		 returning `+deploymentSelectColumns,
+		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
 		nullString(d.SourceURL), nullString(d.CommitSHA),
@@ -3708,7 +3708,7 @@ func (s *PgStore) DeploymentByID(ctx context.Context, id string) (Deployment, er
 
 func (s *PgStore) LatestDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select `+deploymentSelectColumns+`
+		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
 }
@@ -3743,7 +3743,7 @@ func (s *PgStore) CountLiveInstancesByDeployment(ctx context.Context, deployment
 
 func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) (Deployment, error) {
 	row := s.pool.QueryRow(ctx,
-		`select `+deploymentSelectColumns+`
+		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 and status = 'superseded'
 		 order by created_at desc limit 1`, appID)
 	return scanDeployment(row)
@@ -3765,7 +3765,7 @@ func (s *PgStore) LatestSupersededDeployment(ctx context.Context, appID string) 
 // per the ListDeploymentsForApp comment) this stays sub-10ms.
 func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumns+`
+		`select `+deploymentSelectColumnsWithRootfs+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.status <> 'deleted'
@@ -3787,7 +3787,7 @@ func (s *PgStore) ListAllDeployments(ctx context.Context) ([]Deployment, error) 
 // the plan stays a single index scan + nested loop, sub-5ms.
 func (s *PgStore) ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error) {
 	rows, err := s.pool.Query(ctx,
-		`select `+deploymentSelectColumns+`
+		`select `+deploymentSelectColumnsWithRootfs+`
 		   from deployments d
 		   join apps a on a.id = d.app_id
 		  where a.node_id = $1
@@ -3843,12 +3843,90 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 	row := s.pool.QueryRow(ctx, `
 		update deployments set min_instances = $2
 		 where id = $1
-		 returning `+deploymentSelectColumns, id, min)
+		 returning `+deploymentSelectColumnsWithRootfs, id, min)
 	d, err := scanDeployment(row)
 	if err != nil {
 		// pgx returns ErrNoRows when the UPDATE matches zero rows;
 		// translate to the store's canonical not-found error so the
 		// handler emits RFC 7807 not_found.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, err
+	}
+	return d, nil
+}
+
+// SetDeploymentParked stamps the per-deployment parked_reason +
+// parked_at columns (issue #554 / ADR-079 follow-up, migration
+// 00157). Idempotent: re-parking an already-parked deployment is
+// a no-op — the WHERE filter `parked_reason is null` guarantees
+// parked_at is set exactly once. A second park during a schedd
+// restart cycle must NOT repaint the timestamp, otherwise the
+// apid GET /v1/apps/{slug}.parked_deployment surface would drift
+// on every crash loop.
+//
+// The audit row (engine.ParkDeployment →
+// "instances.parked_liveness_exhausted" event) is the durable
+// source of truth; this method is the projection that powers the
+// customer-facing wire.
+//
+// Closed-set vocabulary is enforced at the schema layer via the
+// deployments_parked_reason_check constraint; an out-of-set
+// reason surfaces as a Postgres 23514 (check_violation) which
+// mapErr translates to a wrap-wrapped error so callers see the
+// underlying reason.
+//
+// Returns ErrNotFound when the deployment id is genuinely absent
+// (a stale id from the engine's appMu guard would otherwise
+// silently no-op).
+func (s *PgStore) SetDeploymentParked(ctx context.Context, id, reason string, at time.Time) error {
+	tag, err := s.pool.Exec(ctx,
+		`update deployments
+		    set parked_reason = $2, parked_at = $3
+		  where id = $1
+		    and parked_reason is null`,
+		id, reason, at.UTC())
+	if err != nil {
+		return fmt.Errorf("state: set deployment parked: %w", mapErr(err))
+	}
+	if tag.RowsAffected() == 0 {
+		// Two paths land here:
+		//   1. Row exists but parked_reason is already set — a
+		//      no-op idempotent re-stamp. Not an error.
+		//   2. Row does not exist — disambiguate via a probe.
+		var exists bool
+		if probeErr := s.pool.QueryRow(ctx,
+			`select exists(select 1 from deployments where id = $1)`,
+			id).Scan(&exists); probeErr != nil {
+			return fmt.Errorf("state: probe deployment parked: %w", mapErr(probeErr))
+		}
+		if !exists {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+
+// LatestParkedDeploymentForApp returns the most recently parked
+// deployment for an app, or ErrNotFound if none. Powers the apid
+// GET /v1/apps/{slug}.parked_deployment reference (AC #3 wire).
+//
+// The match is `parked_reason is not null order by parked_at desc
+// limit 1`. Superseded deployments still match — their
+// parked_reason/parked_at columns are not cleared on supersede,
+// so a customer who deployed, parked, then redeployed will see
+// the parked deployment reference pointing at the older row.
+func (s *PgStore) LatestParkedDeploymentForApp(ctx context.Context, appID string) (Deployment, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		   from deployments
+		  where app_id = $1
+		    and parked_reason is not null
+		  order by parked_at desc
+		  limit 1`, appID)
+	d, err := scanDeployment(row)
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Deployment{}, ErrNotFound
 		}
@@ -3885,12 +3963,12 @@ func (s *PgStore) ListDeploymentsForApp(ctx context.Context, appID string, limit
 	)
 	if limit > 0 {
 		rows, err = s.pool.Query(ctx,
-			`select `+deploymentSelectColumns+`
+			`select `+deploymentSelectColumnsWithRootfs+`
 			 from deployments where app_id = $1 order by created_at desc limit $2 offset $3`,
 			appID, limit, offset)
 	} else {
 		rows, err = s.pool.Query(ctx,
-			`select `+deploymentSelectColumns+`
+			`select `+deploymentSelectColumnsWithRootfs+`
 			 from deployments where app_id = $1 order by created_at desc offset $2`,
 			appID, offset)
 	}
@@ -9417,12 +9495,14 @@ const appsSelectColumns = `
 // nine callers) trips the linter instead of rotting silently.
 var _ = appsSelectColumns
 
-// deploymentSelectColumns is the canonical SELECT projection for a
-// deployment row. Used by every read path that needs the full
-// deployment state without the rootfs triple (CreateDeployment
-// RETURNING, LatestDeployment, LatestSupersededDeployment, and the
-// non-rootfs variants of ListDeploymentsForApp / ListDeploymentsForAccount).
-// The order is load-bearing — pgx scans scanDeployment positionally,
+// deploymentSelectColumnsWithRootfs is the canonical SELECT projection
+// for a deployment row. Used by every read path that needs the full
+// deployment state (CreateDeployment RETURNING, DeploymentByID,
+// LatestDeployment, LiveDeployment, LatestSupersededDeployment,
+// UpdateDeploymentMinInstances RETURNING, SetDeploymentParked
+// RETURNING, SetDeploymentFailed RETURNING, ListAllDeployments,
+// ListDeploymentsForAccount, ListDeploymentsByNodeID, etc). The
+// order is load-bearing — pgx scans scanDeploymentInto positionally,
 // and the scan order matches the SELECT list.
 //
 // Issue #460 / ADR-053: the trailing 6 columns are the override shape.
@@ -9436,33 +9516,26 @@ var _ = appsSelectColumns
 //   - int port: coalesce to 0 so the absence sentinel reads as 0
 //     (mirrors nullableOverridePort on the write side).
 //
-// Adding a new column touches: this const + scanDeployment +
+// Adding a new column touches: this const + scanDeploymentInto +
 // scanDeployments + the INSERT in CreateDeployment. Keep them
 // aligned; the gofmt/golangci-lint gate catches the constant binding
 // but not column-order drift.
-const deploymentSelectColumns = `
-	id, app_id, coalesce(build_id::text,''), image_digest, kind,
-	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
-	status, coalesce(error,''), coalesce(error_code,''), created_at,
-	coalesce(source_url,''), coalesce(commit_sha,''),
-	coalesce(override_entrypoint, ARRAY[]::text[]),
-	coalesce(override_cmd, ARRAY[]::text[]),
-	override_env, override_env_secrets,
-	coalesce(override_port, 0), override_healthcheck,
-	override_liveness_probe,
-	coalesce(sidecars, '[]'::jsonb),
-	min_instances,
-	scan_result, scan_status, scanned_at`
-
-// deploymentSelectColumnsWithRootfs is the variant used by read paths
-// that need the rootfs triple (rootfs_path, rootfs_key, rootfs_bytes)
-// — the three columns land between the source columns and the
-// status/error columns. Used by DeploymentByID, LiveDeployment,
-// SetDeploymentFailed.
 //
-// The order is the same as deploymentSelectColumns but with the
-// rootfs triple inserted at the canonical position. Keep this and
-// scanDeploymentWithRootfs in lockstep.
+// The rootfs triple (rootfs_path, rootfs_key, rootfs_bytes) is
+// always included — scanDeploymentInto has 32 positional scan
+// destinations and the helper is shared across read paths. Earlier
+// versions split this into "with rootfs" vs "without rootfs"
+// variants, but the asymmetry caused pgx's "number of field
+// descriptions must equal number of destinations" runtime error on
+// every LatestDeployment / UpdateDeploymentMinInstances /
+// LatestParkedDeploymentForApp call — see PR #697 review pass.
+//
+// Used by DeploymentByID, LiveDeployment, LatestDeployment,
+// LatestSupersededDeployment, UpdateDeploymentMinInstances,
+// LatestParkedDeploymentForApp, ListDeploymentsForAccount,
+// ListDeploymentsByNodeID, SetDeploymentFailed,
+// SetDeploymentParked (RETURNING), CreateDeployment (RETURNING),
+// and ListAllDeployments.
 const deploymentSelectColumnsWithRootfs = `
 	id, app_id, coalesce(build_id::text,''), image_digest, kind,
 	coalesce(source_path,''), coalesce(source_bytes,0), coalesce(handler,''), coalesce(log_path,''),
@@ -9476,54 +9549,87 @@ const deploymentSelectColumnsWithRootfs = `
 	override_liveness_probe,
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
-	scan_result, scan_status, scanned_at`
+	scan_result, scan_status, scanned_at,
+	coalesce(parked_reason,''), parked_at`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
-var _ = deploymentSelectColumns
+var _ = deploymentSelectColumnsWithRootfs
 var _ = deploymentSelectColumnsWithRootfs
 
 // deploymentSelectColumnsQualified is the d.alias-prefixed variant of
-// deploymentSelectColumns for SELECTs that JOIN with another table
-// (e.g. ListDeploymentsForAccount joins deployments d with apps a on
-// a.id = d.app_id). The qualifications resolve the id / app_id
+// deploymentSelectColumnsWithRootfs for SELECTs that JOIN with another
+// table (e.g. ListDeploymentsForAccount joins deployments d with apps
+// a on a.id = d.app_id). The qualifications resolve the id / app_id
 // ambiguity that arises when both tables carry the same column name.
-// Column order matches deploymentSelectColumns exactly so the
-// scanDeployments helper stays in lockstep across all read paths.
+// Column order matches deploymentSelectColumnsWithRootfs exactly so
+// the scanDeployments helper stays in lockstep across all read paths.
 const deploymentSelectColumnsQualified = `
 	d.id, d.app_id, coalesce(d.build_id::text,''), d.image_digest, d.kind,
 	coalesce(d.source_path,''), coalesce(d.source_bytes,0), coalesce(d.handler,''), coalesce(d.log_path,''),
+	coalesce(d.rootfs_path,''), coalesce(d.rootfs_key,''), coalesce(d.rootfs_bytes,0),
 	d.status, coalesce(d.error,''), coalesce(d.error_code,''), d.created_at,
 	coalesce(d.source_url,''), coalesce(d.commit_sha,''),
 	coalesce(d.override_entrypoint, ARRAY[]::text[]),
 	coalesce(d.override_cmd, ARRAY[]::text[]),
 	d.override_env, d.override_env_secrets,
 	coalesce(d.override_port, 0), d.override_healthcheck,
+	d.override_liveness_probe,
 	coalesce(d.sidecars, '[]'::jsonb),
-	d.min_instances`
+	d.min_instances,
+	d.scan_result, d.scan_status, d.scanned_at,
+	coalesce(d.parked_reason,''), d.parked_at`
 
 var _ = deploymentSelectColumnsQualified
 
-func scanDeployment(row pgx.Row) (Deployment, error) {
-	d := Deployment{}
+// scanDeploymentInto is the single source of truth for the
+// deployment-row column scan order shared by scanDeployment,
+// scanDeploymentWithRootfs, and scanDeployments. Adding a new
+// column means: append the column to the SELECT projection
+// constants (deploymentSelectColumnsWithRootfs /
+// deploymentSelectColumnsQualified), and append the destination
+// to this function — never to just one wrapper. Three previous
+// PRs landed the column in one wrapper and missed another, which
+// surfaced as pg-shard-2 failures (e.g. issue #554 follow-up
+// migration 00157 could have shipped the same shape of bug). The
+// helper eliminates that duplication class entirely. The
+// optional `rootfsPath` / `rootfsKey` / `rootfsBytes`
+// destinations are nil for scanDeployment and scanDeployments
+// callers that don't care about the rootfs triple (they ignore
+// the three fields anyway), but the columns still come back in
+// the SELECT projection so the destination count matches.
+func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *string, rootfsBytes *int64) error {
 	var kind, statusStr string
 	var scanStatus *string
 	var scannedAt *time.Time
-	// Issue #460 / ADR-053: six override columns scanned here so the
-	// SELECT projections in DeploymentByID / LatestDeployment / etc.
-	// match. The scan order matches the column order in the SELECT
-	// list — keep them in lockstep or pgx's positional Scan returns
-	// the wrong field into the wrong destination.
+	var parkedAt *time.Time
+	// Issue #460 / ADR-053: six override columns scanned here so
+	// the SELECT projections in DeploymentByID / LatestDeployment /
+	// etc. match. The scan order matches the column order in the
+	// SELECT list — keep them in lockstep or pgx's positional Scan
+	// returns the wrong field into the wrong destination.
 	//
 	// Issue #464 / ADR-055: scan columns (scan_result jsonb,
-	// scan_status text, scanned_at timestamptz) are scanned here too.
-	// scan_status is nullable (NULL on pre-PR-#651 rows, before the
-	// backfill passes — and NULL inside the window where the deploy
-	// ships ahead of the scan) so the destination is *string.
-	// scanned_at is also nullable for the same reason; destination
-	// is *time.Time. pgx scans a NULL into a nil pointer cleanly.
+	// scan_status text, scanned_at timestamptz) are scanned here
+	// too. scan_status is nullable (NULL on pre-PR-#651 rows,
+	// before the backfill passes — and NULL inside the window
+	// where the deploy ships ahead of the scan) so the destination
+	// is *string. scanned_at is also nullable for the same reason;
+	// destination is *time.Time. pgx scans a NULL into a nil
+	// pointer cleanly.
+	//
+	// Issue #554 follow-up: parked_reason + parked_at columns
+	// (migration 00157). parked_at is *time.Time so the closed-set
+	// "never parked" path (NULL parked_at) scans cleanly. The
+	// SELECT projection coalesces parked_reason to '' so the
+	// "never parked" path (NULL parked_reason) scans into the
+	// struct's plain string field — the closed-set is enforced at
+	// the schema layer via the deployments_parked_reason_check
+	// constraint, not on the scan side. The omitempty on the JSON
+	// tag keeps the wire clean when the value is empty.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
+		rootfsPath, rootfsKey, rootfsBytes,
 		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
 		&d.SourceURL, &d.CommitSHA,
 		&d.OverrideEntrypoint, &d.OverrideCmd,
@@ -9531,8 +9637,18 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 		&d.OverridePort, &d.OverrideHealthcheck,
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
-		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
-		return Deployment{}, mapErr(err)
+		&d.ScanResult, &scanStatus, &scannedAt,
+		&d.ParkedReason, &parkedAt); err != nil {
+		return mapErr(err)
+	}
+	if rootfsPath != nil {
+		d.RootfsPath = *rootfsPath
+	}
+	if rootfsKey != nil {
+		d.RootfsKey = *rootfsKey
+	}
+	if rootfsBytes != nil {
+		d.RootfsBytes = *rootfsBytes
 	}
 	d.Kind = DeploymentKind(kind)
 	d.Status = DeploymentStatus(statusStr)
@@ -9541,83 +9657,70 @@ func scanDeployment(row pgx.Row) (Deployment, error) {
 	}
 	if scannedAt != nil {
 		d.ScannedAt = *scannedAt
+	}
+	d.ParkedAt = parkedAt // nil for "never parked"; non-nil for a stamped park
+	return nil
+}
+
+func scanDeployment(row pgx.Row) (Deployment, error) {
+	d := Deployment{}
+	// Use local scratch vars for the rootfs triple so the call
+	// passes NON-NIL *string / *int64 destinations to row.Scan.
+	// pgx v5 panics with "invalid memory address or nil pointer
+	// dereference" when a typed-nil pointer is passed as a Scan
+	// destination (the unified 32-column helper unifies this path
+	// with scanDeploymentWithRootfs; previously scanDeployment had
+	// its own 29-column projection that skipped the rootfs columns
+	// entirely). The scratch values are discarded — callers don't
+	// see rootfs fields on the Deployment struct.
+	var rootfsPath, rootfsKey string
+	var rootfsBytes int64
+	if err := scanDeploymentInto(&d, row, &rootfsPath, &rootfsKey, &rootfsBytes); err != nil {
+		return Deployment{}, err
 	}
 	return d, nil
 }
 
-// scanDeploymentWithRootfs is the post-imaged variant that also reads the
-// rootfs_path / rootfs_key / rootfs_bytes columns stamped by
-// SetDeploymentRootfs. Every reads-everything query (used by schedd's prime
-// handshake, M5, and by the engine's Wake flow at LiveDeployment) uses this
-// so the snapshot_prime consumer sees the layer path AND schedd's wake wire
-// can carry the layer key (issue #96 / ADR-025 axis 2 / PR #116). Ordering
-// matches the SELECT projections in DeploymentByID, LiveDeployment, and
-// SetDeploymentFailed.
+// scanDeploymentWithRootfs is the post-imaged variant that also
+// reads the rootfs_path / rootfs_key / rootfs_bytes columns
+// stamped by SetDeploymentRootfs. Every reads-everything query
+// (used by schedd's prime handshake, M5, and by the engine's Wake
+// flow at LiveDeployment) uses this so the snapshot_prime
+// consumer sees the layer path AND schedd's wake wire can carry
+// the layer key (issue #96 / ADR-025 axis 2 / PR #116). Ordering
+// matches the SELECT projections in DeploymentByID, LiveDeployment,
+// and SetDeploymentFailed.
 func scanDeploymentWithRootfs(row pgx.Row) (Deployment, error) {
 	d := Deployment{}
-	var kind, statusStr, rootfsPath, rootfsKey string
-	var scanStatus *string
-	var scannedAt *time.Time
-	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
-		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
-		&rootfsPath, &rootfsKey, &d.RootfsBytes,
-		&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-		&d.SourceURL, &d.CommitSHA,
-		&d.OverrideEntrypoint, &d.OverrideCmd,
-		&d.OverrideEnv, &d.OverrideEnvSecrets,
-		&d.OverridePort, &d.OverrideHealthcheck,
-		&d.OverrideLivenessProbe,
-		&d.Sidecars, &d.MinInstances,
-		&d.ScanResult, &scanStatus, &scannedAt); err != nil {
-		return Deployment{}, mapErr(err)
-	}
-	d.RootfsPath = rootfsPath
-	d.RootfsKey = rootfsKey
-	d.Kind = DeploymentKind(kind)
-	d.Status = DeploymentStatus(statusStr)
-	if scanStatus != nil {
-		d.ScanStatus = *scanStatus
-	}
-	if scannedAt != nil {
-		d.ScannedAt = *scannedAt
+	var rootfsPath, rootfsKey string
+	var rootfsBytes int64
+	if err := scanDeploymentInto(&d, row, &rootfsPath, &rootfsKey, &rootfsBytes); err != nil {
+		return Deployment{}, err
 	}
 	return d, nil
 }
 
 func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 	var out []Deployment
+	// Local scratch vars for the rootfs triple — pgx v5 panics on
+	// typed-nil Scan destinations. The values are discarded.
+	var rootfsPath, rootfsKey string
+	var rootfsBytes int64
 	for rows.Next() {
 		d := Deployment{}
-		var kind, statusStr string
-		var scanStatus *string
-		var scannedAt *time.Time
-		// Mirrors scanDeployment: keep the override_liveness_probe
-		// scan destination aligned with the SELECT projection in
-		// deploymentSelectColumns / WithRootfs — adding a new column
+		// Mirrors scanDeployment: keep the column scan destination
+		// list aligned with the SELECT projection in
+		// deploymentSelectColumnsWithRootfs — adding a new column
 		// there without adding it here triggers pgx's "number of
 		// field descriptions must equal number of destinations"
 		// runtime error on every ListDeploymentsForApp / Account
 		// read path. Caught by the pg-shard-2 unit suite
-		// (TestPg_CreateDeployment_*).
-		if err := rows.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
-			&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
-			&statusStr, &d.Error, &d.ErrorCode, &d.CreatedAt,
-			&d.SourceURL, &d.CommitSHA,
-			&d.OverrideEntrypoint, &d.OverrideCmd,
-			&d.OverrideEnv, &d.OverrideEnvSecrets,
-			&d.OverridePort, &d.OverrideHealthcheck,
-			&d.OverrideLivenessProbe,
-			&d.Sidecars, &d.MinInstances,
-			&d.ScanResult, &scanStatus, &scannedAt); err != nil {
+		// (TestPg_CreateDeployment_*). The shared
+		// scanDeploymentInto helper makes drift impossible —
+		// changing one SELECT projection forces a single helper
+		// update.
+		if err := scanDeploymentInto(&d, rows, &rootfsPath, &rootfsKey, &rootfsBytes); err != nil {
 			return nil, err
-		}
-		d.Kind = DeploymentKind(kind)
-		d.Status = DeploymentStatus(statusStr)
-		if scanStatus != nil {
-			d.ScanStatus = *scanStatus
-		}
-		if scannedAt != nil {
-			d.ScannedAt = *scannedAt
 		}
 		out = append(out, d)
 	}

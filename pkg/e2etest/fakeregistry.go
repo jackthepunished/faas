@@ -114,6 +114,24 @@ func CPUBoundImage(repo string) (fakeImage, string) {
 	return layeredHelloImageWithCmd(repo, []string{"/bin/sh", "-c", "while :; do :; done"})
 }
 
+// WedgedLoopImage (issue #554 / ADR-079, AC #1 metal test) is the
+// busy-loop variant that ALSO traps SIGTERM via `trap ” TERM`,
+// so a "graceful" shutdown signal can't reach the process. vmmd's
+// liveness probe classifies the wedged process as
+// `conn_refused` (no :8080 listener) and the consecutive-fail
+// counter increments; after 3 cycles the engine parks the
+// deployment and the next wake must cold-boot.
+//
+// Sibling of CPUBoundImage — same shape (one base layer, no
+// above-base) — but with the SIGTERM trap prepended so a strict
+// subset of "wedged" is exercised (the busy loop never receives
+// a signal that would let it shut down). Used by
+// cmd/vmmd/liveness_metal_test.go (TestMetalLivenessCycle_AC1).
+func WedgedLoopImage(repo string) (fakeImage, string) {
+	cmd := []string{"/bin/sh", "-c", "trap '' TERM; while :; do :; done"}
+	return layeredHelloImageWithCmd(repo, cmd)
+}
+
 // layeredHelloImageWithCmd is layeredHelloImage with a custom Cmd.
 // Kept as a separate helper to avoid growing the existing
 // layeredHelloImage signature (which already has two callers —

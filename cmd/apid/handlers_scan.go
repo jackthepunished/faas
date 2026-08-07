@@ -57,7 +57,7 @@ import (
 // delegating the wire-shape construction to scanResponse.
 func (s *server) getDeploymentScan(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
-	d, err := s.store.DeploymentByID(ctx(r), id)
+	d, err := s.store.DeploymentByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "no such deployment")
@@ -67,7 +67,7 @@ func (s *server) getDeploymentScan(w http.ResponseWriter, r *http.Request, acct 
 			fmt.Sprintf("load deployment: %v", err)))
 		return
 	}
-	app, err := s.store.AppByID(ctx(r), d.AppID)
+	app, err := s.store.AppByID(r.Context(), d.AppID)
 	if err != nil || app.AccountID != acct.ID {
 		// Same posture as getDeployment: cross-account
 		// probes get 404, not 403 — we never reveal

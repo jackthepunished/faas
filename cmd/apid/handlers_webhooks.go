@@ -149,9 +149,9 @@ func (s *server) listAppWebhooks(w http.ResponseWriter, r *http.Request, acct st
 	if !ok {
 		return
 	}
-	rows, err := s.store.ListAppWebhooksForApp(ctx(r), app.ID)
+	rows, err := s.store.ListAppWebhooksForApp(r.Context(), app.ID)
 	if err != nil {
-		s.log.WarnContext(ctx(r), "list app webhooks", slog.String("err", err.Error()))
+		s.log.WarnContext(r.Context(), "list app webhooks", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not list webhooks"))
 		return
 	}
@@ -209,7 +209,7 @@ func (s *server) createAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, prob)
 		return
 	}
-	if prob := resolveAndCheckEgress(ctx(r), req.TargetURL); prob != nil {
+	if prob := resolveAndCheckEgress(r.Context(), req.TargetURL); prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -239,7 +239,7 @@ func (s *server) createAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 	if eventFilter == nil {
 		eventFilter = defaultAppWebhookEventFilter()
 	}
-	row, err := s.store.CreateAppWebhookIfUnderQuota(ctx(r), state.AppWebhook{
+	row, err := s.store.CreateAppWebhookIfUnderQuota(r.Context(), state.AppWebhook{
 		AccountID:    acct.ID,
 		AppID:        app.ID,
 		TargetURL:    req.TargetURL,
@@ -258,11 +258,11 @@ func (s *server) createAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 			api.WriteProblem(w, api.ErrAppWebhookInvalid("a webhook for this app already targets this URL"))
 			return
 		}
-		s.log.WarnContext(ctx(r), "create app webhook", slog.String("err", err.Error()))
+		s.log.WarnContext(r.Context(), "create app webhook", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not create webhook"))
 		return
 	}
-	s.audit.Emit(ctx(r), "app.webhook_created", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.webhook_created", &acct.ID, map[string]any{
 		"webhook_id":   row.ID,
 		"app_id":       app.ID,
 		"target_url":   row.TargetURL,
@@ -287,7 +287,7 @@ func (s *server) getAppWebhook(w http.ResponseWriter, r *http.Request, acct stat
 		return
 	}
 	id := r.PathValue("id")
-	row, err := s.store.AppWebhookByID(ctx(r), id)
+	row, err := s.store.AppWebhookByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "webhook not found")
 		return
@@ -320,7 +320,7 @@ func (s *server) updateAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 		return
 	}
 	id := r.PathValue("id")
-	existing, err := s.store.AppWebhookByID(ctx(r), id)
+	existing, err := s.store.AppWebhookByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "webhook not found")
 		return
@@ -335,7 +335,7 @@ func (s *server) updateAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 			api.WriteProblem(w, prob)
 			return
 		}
-		if prob := resolveAndCheckEgress(ctx(r), *req.TargetURL); prob != nil {
+		if prob := resolveAndCheckEgress(r.Context(), *req.TargetURL); prob != nil {
 			api.WriteProblem(w, prob)
 			return
 		}
@@ -379,17 +379,17 @@ func (s *server) updateAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 		}
 		params.WebhookSecretSealed = &sealed
 	}
-	row, err := s.store.UpdateAppWebhook(ctx(r), id, params)
+	row, err := s.store.UpdateAppWebhook(r.Context(), id, params)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "webhook not found")
 			return
 		}
-		s.log.WarnContext(ctx(r), "update app webhook", slog.String("err", err.Error()))
+		s.log.WarnContext(r.Context(), "update app webhook", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not update webhook"))
 		return
 	}
-	s.audit.Emit(ctx(r), "app.webhook_updated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.webhook_updated", &acct.ID, map[string]any{
 		"webhook_id":   row.ID,
 		"app_id":       app.ID,
 		"target_url":   row.TargetURL,
@@ -413,7 +413,7 @@ func (s *server) deleteAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 		return
 	}
 	id := r.PathValue("id")
-	existing, err := s.store.AppWebhookByID(ctx(r), id)
+	existing, err := s.store.AppWebhookByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "webhook not found")
 		return
@@ -422,12 +422,12 @@ func (s *server) deleteAppWebhook(w http.ResponseWriter, r *http.Request, acct s
 		s.notFound(w, "webhook not found")
 		return
 	}
-	if err := s.store.DeleteAppWebhook(ctx(r), id); err != nil {
-		s.log.WarnContext(ctx(r), "delete app webhook", slog.String("err", err.Error()))
+	if err := s.store.DeleteAppWebhook(r.Context(), id); err != nil {
+		s.log.WarnContext(r.Context(), "delete app webhook", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not delete webhook"))
 		return
 	}
-	s.audit.Emit(ctx(r), "app.webhook_deleted", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.webhook_deleted", &acct.ID, map[string]any{
 		"webhook_id": id,
 		"app_id":     app.ID,
 		"target_url": existing.TargetURL,
@@ -451,7 +451,7 @@ func (s *server) rotateAppWebhookSecret(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	id := r.PathValue("id")
-	existing, err := s.store.AppWebhookByID(ctx(r), id)
+	existing, err := s.store.AppWebhookByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "webhook not found")
 		return
@@ -479,17 +479,17 @@ func (s *server) rotateAppWebhookSecret(w http.ResponseWriter, r *http.Request, 
 		api.WriteProblem(w, api.ErrCapacity("could not seal webhook secret"))
 		return
 	}
-	row, err := s.store.UpdateAppWebhook(ctx(r), id, state.UpdateAppWebhookParams{WebhookSecretSealed: &sealed})
+	row, err := s.store.UpdateAppWebhook(r.Context(), id, state.UpdateAppWebhookParams{WebhookSecretSealed: &sealed})
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "webhook not found")
 			return
 		}
-		s.log.WarnContext(ctx(r), "rotate app webhook secret", slog.String("err", err.Error()))
+		s.log.WarnContext(r.Context(), "rotate app webhook secret", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not rotate webhook secret"))
 		return
 	}
-	s.audit.Emit(ctx(r), "app.webhook_secret_rotated", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.webhook_secret_rotated", &acct.ID, map[string]any{
 		"webhook_id": row.ID,
 		"app_id":     app.ID,
 		"rotated_at": row.UpdatedAt,
@@ -516,7 +516,7 @@ func (s *server) listAppWebhookDeliveries(w http.ResponseWriter, r *http.Request
 		return
 	}
 	id := r.PathValue("id")
-	existing, err := s.store.AppWebhookByID(ctx(r), id)
+	existing, err := s.store.AppWebhookByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "webhook not found")
 		return
@@ -531,9 +531,9 @@ func (s *server) listAppWebhookDeliveries(w http.ResponseWriter, r *http.Request
 			pageSize = n
 		}
 	}
-	rows, next, err := s.store.ListAppWebhookDeliveries(ctx(r), app.ID, id, pageSize, r.URL.Query().Get("page_token"))
+	rows, next, err := s.store.ListAppWebhookDeliveries(r.Context(), app.ID, id, pageSize, r.URL.Query().Get("page_token"))
 	if err != nil {
-		s.log.WarnContext(ctx(r), "list app webhook deliveries", slog.String("err", err.Error()))
+		s.log.WarnContext(r.Context(), "list app webhook deliveries", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not list deliveries"))
 		return
 	}
@@ -563,7 +563,7 @@ func (s *server) retryAppWebhookDelivery(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	id := r.PathValue("id")
-	existing, err := s.store.AppWebhookByID(ctx(r), id)
+	existing, err := s.store.AppWebhookByID(r.Context(), id)
 	if err != nil {
 		s.notFound(w, "webhook not found")
 		return
@@ -576,7 +576,7 @@ func (s *server) retryAppWebhookDelivery(w http.ResponseWriter, r *http.Request,
 	// Pass webhookID + accountID so the store's SQL-level IDOR guard
 	// returns ErrNotFound for deliveries that belong to a different
 	// webhook or account (see pkg/state ResetAppWebhookDeliveryFromDead).
-	if err := s.store.ResetAppWebhookDeliveryFromDead(ctx(r), did, id, acct.ID, timeNow()); err != nil {
+	if err := s.store.ResetAppWebhookDeliveryFromDead(r.Context(), did, id, acct.ID, timeNow()); err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			s.notFound(w, "delivery not found")
 			return
@@ -585,16 +585,16 @@ func (s *server) retryAppWebhookDelivery(w http.ResponseWriter, r *http.Request,
 			api.WriteProblem(w, api.ErrAppWebhookInvalid("delivery is not in 'dead' state; only dead deliveries can be retried"))
 			return
 		}
-		s.log.WarnContext(ctx(r), "retry app webhook delivery", slog.String("err", err.Error()))
+		s.log.WarnContext(r.Context(), "retry app webhook delivery", slog.String("err", err.Error()))
 		api.WriteProblem(w, api.ErrCapacity("could not retry delivery"))
 		return
 	}
-	row, err := s.store.AppWebhookDeliveryByID(ctx(r), did)
+	row, err := s.store.AppWebhookDeliveryByID(r.Context(), did)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not load delivery after retry"))
 		return
 	}
-	s.audit.Emit(ctx(r), "app.webhook_delivery_retried", &acct.ID, map[string]any{
+	s.audit.Emit(r.Context(), "app.webhook_delivery_retried", &acct.ID, map[string]any{
 		"webhook_id":  existing.ID,
 		"delivery_id": did,
 		"app_id":      app.ID,

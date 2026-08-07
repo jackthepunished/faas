@@ -5,7 +5,10 @@
 //     here (covered by metal test); we pin the lighter invariants.
 //
 //   - AC #4 — snapshots are NEVER restored after a liveness
-//     failure: pinned via TestLiveness_StaleSnapOnDestroy.
+//     failure: pinned via TestLiveness_StaleSnapOnDestroy
+//     (destroy-side, snapshot goes stale) + the wake-side
+//     counterpart TestLiveness_StaleSnapAndColdBootOnlyAfterDestroy
+//     (next wake MUST take the cold-boot path).
 //
 //   - AC #6 — `liveness_restarts_total{app, deployment}` metric
 //     emitted: pinned via TestLiveness_RestartCounterIncrement.
@@ -17,6 +20,7 @@ package sched
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,10 +141,60 @@ func TestLiveness_NilReceiverSafe(t *testing.T) {
 	}
 }
 
-// TestLiveness_3In5MinParksDeployment (AC #3) — three destroys
-// in the window parks the parent app. Uses the live
-// LivenessWindow + a real memstore UpdateApp call.
-func TestLiveness_3In5MinParksDeployment(t *testing.T) {
+// TestLiveness_ParkDeployment_RejectsStrayReason pins the
+// closed-set guard added to Engine.ParkDeployment. A stray
+// reason (one not in {liveness_exhausted, lifecycle_park,
+// admin_park}) must surface as a hard error — the
+// deployments.parked_reason CHECK constraint would reject it
+// at the SQL layer, and the silent warn-log in
+// SetDeploymentParked's caller path would mask the bug. The
+// guard moves the failure to the API boundary so a future
+// stray-reason caller is caught in dev, not in prod.
+//
+// This is the dev-time contract for the closed-set
+// vocabulary; the migration 00157 test pins the schema-layer
+// CHECK shape.
+func TestLiveness_ParkDeployment_RejectsStrayReason(t *testing.T) {
+	store := state.NewMemStore()
+	_, _, dep := seedApp(t, store, api.PlanPro, 512, 5)
+	engine := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0")
+
+	err := engine.ParkDeployment(context.Background(), dep.ID, "totally_not_a_park_reason")
+	if err == nil {
+		t.Fatal("ParkDeployment: stray reason returned nil, want error (closed-set guard)")
+	}
+	if !strings.Contains(err.Error(), "invalid reason") {
+		t.Errorf("err = %q, want substring %q", err.Error(), "invalid reason")
+	}
+
+	// Verify the parent app was NOT flipped to evicted_cold
+	// (the guard fires before the UpdateApp call).
+	app, err := store.AppByID(context.Background(), dep.AppID)
+	if err != nil {
+		t.Fatalf("AppByID: %v", err)
+	}
+	if string(app.Status) == "evicted_cold" {
+		t.Errorf("app.Status = %q after stray-reason park; guard must short-circuit before UpdateApp", app.Status)
+	}
+
+	// Verify the per-deployment parked_reason column stays
+	// NULL (SetDeploymentParked is called AFTER the guard
+	// would have rejected; the guard fires first).
+	post, err := store.DeploymentByID(context.Background(), dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if post.ParkedReason != "" {
+		t.Errorf("deployment.ParkedReason = %q after stray-reason park, want empty", post.ParkedReason)
+	}
+}
+
+// TestLiveness_3In5MinParksDeploymentAndPersistsReason (AC #3) —
+// three destroys in the window parks the parent app AND stamps
+// the per-deployment parked_reason + parked_at columns (issue
+// #554 follow-up / migration 00157). Uses the live LivenessWindow
+// + a real memstore UpdateApp call.
+func TestLiveness_3In5MinParksDeploymentAndPersistsReason(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, dep := seedApp(t, store, api.PlanPro, 512, 5)
 	vmm := &fakeVMM{}
@@ -164,6 +218,25 @@ func TestLiveness_3In5MinParksDeployment(t *testing.T) {
 	}
 	if string(final.Status) != "evicted_cold" {
 		t.Errorf("app.Status = %q, want %q (AC #3: park after 3 restarts in window)", final.Status, "evicted_cold")
+	}
+
+	// AC #3 follow-up: the per-deployment parked_reason +
+	// parked_at columns land so the apid
+	// GET /v1/apps/{slug}.parked_deployment reference can
+	// render. ParkDeployment's call site passes the closed-set
+	// reason "liveness_exhausted" — assert that, not the
+	// liveness-window reason ("liveness_n_consecutive"), since
+	// the column CHECK enforces the closed vocabulary.
+	post, err := store.DeploymentByID(context.Background(), dep.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID: %v", err)
+	}
+	if post.ParkedReason != "liveness_exhausted" {
+		t.Errorf("deployment.ParkedReason = %q, want %q (AC #3 wire: closed-set column)",
+			post.ParkedReason, "liveness_exhausted")
+	}
+	if post.ParkedAt == nil {
+		t.Errorf("deployment.ParkedAt = nil, want stamped timestamp (AC #3 wire)")
 	}
 }
 
@@ -215,4 +288,68 @@ func TestLiveness_RaceIgnoresAlreadyParked(t *testing.T) {
 func readCounterValue(t *testing.T, c prometheus.Counter) float64 {
 	t.Helper()
 	return testutil.ToFloat64(c)
+}
+
+// TestLiveness_StaleSnapAndColdBootOnlyAfterDestroy (AC #4 wake-
+// side pin) — after DestroyForLivenessFailure marks the
+// deployment's snapshots stale, the next usableSnapshotForWake
+// call must return haveSnap=false so the wake path picks
+// WakeColdBoot, not WakeRestore. Without this, a wedged snapshot
+// would be restored on the next wake and the customer outage
+// persists (ADR-005: "snapshot is cache, not truth").
+//
+// This is the wake-side counterpart to TestLiveness_StaleSnapOnDestroy
+// (which only pins the destroy-side flip). The combined pin
+// guarantees: a wedged snapshot is NEVER restored — every
+// post-liveness-failure wake must cold-boot.
+//
+// We pin via usableSnapshotForWake directly rather than driving
+// the full Wake flow because the fakeVMM's forceColdFallback
+// branch (engine_test.go:1489) is already covered in the AC #1
+// envelope (the wake side would still pick the cold-boot path
+// here because haveSnap=false). The structural invariant — "no
+// usable snapshot post-destroy" — is the load-bearing contract.
+func TestLiveness_StaleSnapAndColdBootOnlyAfterDestroy(t *testing.T) {
+	store := state.NewMemStore()
+	_, _, dep := seedApp(t, store, api.PlanPro, 512, 5)
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	// Seed a non-stale init snapshot.
+	snap, err := store.CreateSnapshot(context.Background(), state.Snapshot{
+		DeploymentID: dep.ID, FCVersion: "1.10.0",
+		MemBytes: 1 << 20, DiskBytes: 1 << 20, StorageKey: "/tmp/snap",
+		Tier: state.SnapshotTierInit,
+	})
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	// Pre-destroy: usableSnapshotForWake must find the snapshot
+	// (haveSnap=true → would take WakeRestore).
+	_, preOK, preTier := engine.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanPro))
+	if !preOK {
+		t.Fatalf("usableSnapshotForWake (pre) = no snap; AC #4 wake-side pin depends on a real pre-state snap")
+	}
+	if preTier == "cold_boot_fallback" {
+		t.Errorf("usableSnapshotForWake (pre) tier = %q, want init (warm is the post-upgrade sticky path)", preTier)
+	}
+
+	// Mark the snapshot stale (mirrors what
+	// DestroyForLivenessFailure does — see AC #4 destroy-side
+	// pin in TestLiveness_StaleSnapOnDestroy above at
+	// engine.go:3678).
+	if err := store.MarkSnapshotStale(context.Background(), snap.ID); err != nil {
+		t.Fatalf("MarkSnapshotStale: %v", err)
+	}
+
+	// Post-destroy: usableSnapshotForWake MUST return haveSnap=false
+	// → wake flow takes the cold-boot path, never WakeRestore.
+	_, postOK, postTier := engine.usableSnapshotForWake(context.Background(), dep.ID, string(api.PlanPro))
+	if postOK {
+		t.Errorf("usableSnapshotForWake (post) haveSnap = true, want false (AC #4: stale snapshot must NOT be restored on next wake)")
+	}
+	if postTier != "cold_boot_fallback" {
+		t.Errorf("usableSnapshotForWake (post) tier = %q, want cold_boot_fallback", postTier)
+	}
 }

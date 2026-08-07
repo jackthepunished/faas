@@ -58,7 +58,7 @@ func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	before := r.URL.Query().Get("before")
-	rows, err := s.store.ListInstancesForAccountPaged(ctx(r), acct.ID, limit, before)
+	rows, err := s.store.ListInstancesForAccountPaged(r.Context(), acct.ID, limit, before)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list instances"))
 		return
@@ -66,7 +66,7 @@ func (s *server) listInstancesForAccount(w http.ResponseWriter, r *http.Request,
 	if rows == nil {
 		rows = []state.Instance{}
 	}
-	floors := s.batchMinInstancesTargets(ctx(r), rows)
+	floors := s.batchMinInstancesTargets(r.Context(), rows)
 	out := make([]api.InstanceResponse, 0, len(rows))
 	for _, ins := range rows {
 		out = append(out, instanceResponse(ins, floors[ins.AppID]))
@@ -124,7 +124,7 @@ func (s *server) listSecretsForAccount(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	before := r.URL.Query().Get("before")
-	rows, err := s.store.ListAppSecretsForAccount(ctx(r), acct.ID, limit, before)
+	rows, err := s.store.ListAppSecretsForAccount(r.Context(), acct.ID, limit, before)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list secrets"))
 		return

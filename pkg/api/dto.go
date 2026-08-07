@@ -563,6 +563,28 @@ type AppResponse struct {
 	// the apid handler before they reach the store.
 	WarmSnapshotMinRequests int `json:"warm_snapshot_min_requests"`
 	WarmSnapshotMinMs       int `json:"warm_snapshot_min_ms"`
+	// ParkedDeployment (issue #554 / ADR-079 follow-up) is the
+	// most-recently parked deployment for this app, or nil if the
+	// app has never been parked. Powers the "why is my app
+	// evicted_cold?" UX surface — operators see the closed-set
+	// reason (liveness_exhausted | lifecycle_park | admin_park) +
+	// the timestamp without grepping the audit log. Nested (not
+	// flat) so AppResponse conflates app-state with
+	// deployment-state only at the explicit ref — mirrors the
+	// per-deployment override pattern at DeploymentResponse.
+	ParkedDeployment *ParkedDeploymentRef `json:"parked_deployment,omitempty"`
+}
+
+// ParkedDeploymentRef is the reference shape returned in
+// AppResponse.ParkedDeployment (issue #554 / ADR-079 follow-up).
+// Lives in pkg/api/dto.go per pkg-api-cannot-import-pkg-state so
+// the wire DTO does not pull in the state package. omitempty on
+// the pointer field handles the "app has never been parked"
+// branch (no field on the wire).
+type ParkedDeploymentRef struct {
+	ID           string     `json:"id"`
+	ParkedReason string     `json:"parked_reason"`
+	ParkedAt     *time.Time `json:"parked_at"`
 }
 
 // PublicAuthBlock (issue #477 / ADR-079) is the per-app
@@ -1089,6 +1111,14 @@ type DeploymentResponse struct {
 	// rows). Always non-nil for post-feature rows in any of
 	// the {pending, complete, failed, skipped} states.
 	Scan *ScanResult `json:"scan,omitempty"`
+	// ParkedReason / ParkedAt (issue #554 / ADR-079 follow-up)
+	// surface the per-deployment parking columns from migration
+	// 00157 on the GET /v1/deployments/{id} response. omitempty
+	// mirrors LastScaleOutAt — "never parked" → no field on the
+	// wire. The closed-set vocabulary is enforced at the schema
+	// layer via the deployments_parked_reason_check constraint.
+	ParkedReason string     `json:"parked_reason,omitempty"`
+	ParkedAt     *time.Time `json:"parked_at,omitempty"`
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}

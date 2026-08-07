@@ -3344,3 +3344,166 @@ func TestRaiseOverageCap_NoAuth(t *testing.T) {
 // engine_test.go package has ptrInt but the apid test package
 // needs its own (it cannot import a test file from pkg/sched).
 func ptrInt64(v int64) *int64 { return &v }
+
+// parkedRefStore is a thin wrapper over *state.MemStore that
+// overrides LatestParkedDeploymentForApp with a controllable
+// result. Used by TestWithParkedDeploymentRef_* to exercise the
+// three branches the helper must handle:
+//
+//  1. ErrNotFound (the "never parked" / healthy app path) →
+//     resp.ParkedDeployment stays nil, no warn-log.
+//  2. Real row → resp.ParkedDeployment populated, no warn-log.
+//  3. Arbitrary store error → resp.ParkedDeployment stays nil,
+//     warn-log emitted (the test captures slog via a buffer).
+//
+// The wrapper embeds *state.MemStore so method-set promotion
+// satisfies the full state.Store interface — no need to
+// re-implement the ~100 other methods just to stub one.
+type parkedRefStore struct {
+	*state.MemStore
+	// err is consulted by LatestParkedDeploymentForApp.
+	// When non-nil, the err is returned verbatim and the
+	// embedded memstore implementation is bypassed.
+	err error
+}
+
+func (p *parkedRefStore) LatestParkedDeploymentForApp(ctx context.Context, appID string) (state.Deployment, error) {
+	if p.err != nil {
+		return state.Deployment{}, p.err
+	}
+	// err is nil → fall through to the embedded memstore.
+	// Forward the inherited ctx so contextcheck sees a
+	// context-propagating call chain (passing a fresh
+	// context.Background() would trip the rule on test
+	// surfaces).
+	return p.MemStore.LatestParkedDeploymentForApp(ctx, appID)
+}
+
+// TestWithParkedDeploymentRef_HealthyAppBranch pins the
+// "never parked" path: the helper sees ErrNotFound and returns
+// resp unchanged (no ParkedDeployment field set). This is the
+// common-path branch — every healthy app lands here on
+// GET /v1/apps/{slug}. A regression (e.g. an accidental wrap
+// that surfaces the error) would render a 500 for every
+// listApps call.
+func TestWithParkedDeploymentRef_HealthyAppBranch(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app, err := e.store.CreateApp(context.Background(), state.App{
+		AccountID: e.acct.ID,
+		Slug:      "parked-ref-healthy",
+		Type:      state.AppTypeApp,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	resp := api.AppResponse{Slug: app.Slug}
+	got := e.s.withParkedDeploymentRef(context.Background(), resp, app)
+	if got.ParkedDeployment != nil {
+		t.Errorf("ParkedDeployment = %+v, want nil (healthy app has no park)", got.ParkedDeployment)
+	}
+}
+
+// TestWithParkedDeploymentRef_ParkedAppPopulates pins the
+// happy path: a parked deployment lands on the wire as the
+// nested ref with id + parked_reason + parked_at populated.
+// The store returns the seeded row verbatim.
+func TestWithParkedDeploymentRef_ParkedAppPopulates(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app, err := e.store.CreateApp(context.Background(), state.App{
+		AccountID: e.acct.ID,
+		Slug:      "parked-ref-populated",
+		Type:      state.AppTypeApp,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID:       app.ID,
+		Kind:        state.DeploymentKindImage,
+		ImageDigest: "sha256:p",
+		Status:      state.DeployLive,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	stamp := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	if err := e.store.SetDeploymentParked(context.Background(), dep.ID, "liveness_exhausted", stamp); err != nil {
+		t.Fatalf("SetDeploymentParked: %v", err)
+	}
+
+	resp := api.AppResponse{Slug: app.Slug}
+	got := e.s.withParkedDeploymentRef(context.Background(), resp, app)
+	if got.ParkedDeployment == nil {
+		t.Fatal("ParkedDeployment = nil, want ref (parked app)")
+	}
+	if got.ParkedDeployment.ID != dep.ID {
+		t.Errorf("ParkedDeployment.ID = %q, want %q", got.ParkedDeployment.ID, dep.ID)
+	}
+	if got.ParkedDeployment.ParkedReason != "liveness_exhausted" {
+		t.Errorf("ParkedDeployment.ParkedReason = %q, want liveness_exhausted", got.ParkedDeployment.ParkedReason)
+	}
+	if got.ParkedDeployment.ParkedAt == nil || !got.ParkedDeployment.ParkedAt.Equal(stamp) {
+		t.Errorf("ParkedDeployment.ParkedAt = %v, want %v", got.ParkedDeployment.ParkedAt, stamp)
+	}
+}
+
+// TestWithParkedDeploymentRef_StoreErrorLoggedAndIgnored pins the
+// degraded path: a non-ErrNotFound store error must NOT fail the
+// apid response (the rest of the app shape still renders) but MUST
+// log a warning so operators see the failure. Captures slog via a
+// bytes.Buffer-backed handler.
+func TestWithParkedDeploymentRef_StoreErrorLoggedAndIgnored(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	app, err := e.store.CreateApp(context.Background(), state.App{
+		AccountID: e.acct.ID,
+		Slug:      "parked-ref-store-error",
+		Type:      state.AppTypeApp,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+
+	// Swap s.store with a wrapper that returns an arbitrary
+	// error from LatestParkedDeploymentForApp. The rest of the
+	// store (AppByID, etc.) is method-promoted from the
+	// embedded *state.MemStore so the request still completes.
+	logBuf := &safeBuffer{}
+	captureLogger := slog.New(slog.NewJSONHandler(logBuf, nil))
+	srv := newServerWithDeps(
+		&parkedRefStore{MemStore: e.store, err: errors.New("simulated PG outage")},
+		captureLogger,
+		"gregale.dev",
+		noopNotifier{},
+		"",
+		noopMailer{},
+		stubGithubdClient{},
+		nil,
+		nil,
+		0,
+		"",
+	)
+
+	resp := api.AppResponse{Slug: app.Slug}
+	got := srv.withParkedDeploymentRef(context.Background(), resp, app)
+	if got.ParkedDeployment != nil {
+		t.Errorf("ParkedDeployment = %+v, want nil (store error → field stays empty)", got.ParkedDeployment)
+	}
+	// Verify the rest of the resp round-trips (the helper
+	// returns the same struct, so Slug must survive).
+	if got.Slug != app.Slug {
+		t.Errorf("resp.Slug = %q, want %q (helper must return resp unchanged on error)", got.Slug, app.Slug)
+	}
+
+	// The warn log must mention the app id + the error.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "parked deployment ref lookup") {
+		t.Errorf("expected warn-log with msg 'parked deployment ref lookup', got: %s", logged)
+	}
+	if !strings.Contains(logged, app.ID) {
+		t.Errorf("expected warn-log to mention app id %q, got: %s", app.ID, logged)
+	}
+	if !strings.Contains(logged, "simulated PG outage") {
+		t.Errorf("expected warn-log to mention the error, got: %s", logged)
+	}
+}

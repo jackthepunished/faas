@@ -103,6 +103,7 @@ export type { OrgMemberResponse } from './OrgMemberResponse.js';
 export type { OrgResponse } from './OrgResponse.js';
 export type { OrgSlug } from './OrgSlug.js';
 export type { OrgWithRole } from './OrgWithRole.js';
+export type { ParkedDeploymentRef } from './ParkedDeploymentRef.js';
 export type { PasswordLoginRequest } from './PasswordLoginRequest.js';
 export type { PasswordLoginResponse } from './PasswordLoginResponse.js';
 export type { PasswordResetConfirm } from './PasswordResetConfirm.js';
