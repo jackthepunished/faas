@@ -67,7 +67,7 @@ func cmdInvocationsList(args []string) int {
 		return jsonOut(writeJSON(resp))
 	}
 	if len(resp.Invocations) == 0 {
-		fmt.Fprintln(osStdout, "(no invocations)")
+		_, _ = fmt.Fprintln(osStdout, "(no invocations)")
 		return 0
 	}
 	for _, inv := range resp.Invocations {

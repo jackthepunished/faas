@@ -30,6 +30,7 @@ const (
 	subUpdate  = "update"
 	subRm      = "rm"
 	subSummary = "summary"
+	subInfo    = "info"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -2000,7 +2001,7 @@ func cmdUsageDaily(args []string) int {
 		return jsonOut(writeJSON(resp))
 	}
 	if len(resp.Items) == 0 {
-		fmt.Fprintf(os.Stdout, "No daily usage recorded for %s.\n", *day)
+		_, _ = fmt.Fprintf(os.Stdout, "No daily usage recorded for %s.\n", *day)
 		return 0
 	}
 	for _, u := range resp.Items {
@@ -2042,7 +2043,7 @@ func cmdUsageStorage(args []string) int {
 		return jsonOut(writeJSON(resp))
 	}
 	if len(resp.Items) == 0 {
-		fmt.Fprintf(os.Stdout, "No storage rollup recorded for %s.\n", *day)
+		_, _ = fmt.Fprintf(os.Stdout, "No storage rollup recorded for %s.\n", *day)
 		return 0
 	}
 	for _, u := range resp.Items {

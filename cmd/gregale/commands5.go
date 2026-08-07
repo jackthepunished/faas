@@ -830,7 +830,7 @@ func cmdQueueReceive(args []string) int {
 			if jsonOutput {
 				return jsonOut(writeJSON(api.QueueReceiveResponse{}))
 			}
-			fmt.Fprintln(osStdout, "(empty)")
+			_, _ = fmt.Fprintln(osStdout, "(empty)")
 			return 0
 		}
 		return printErr("Queue receive failed", err)
@@ -843,7 +843,7 @@ func cmdQueueReceive(args []string) int {
 		if jsonOutput {
 			return jsonOut(writeJSON(resp))
 		}
-		fmt.Fprintln(osStdout, "(empty)")
+		_, _ = fmt.Fprintln(osStdout, "(empty)")
 		return 0
 	}
 	if jsonOutput {
@@ -851,7 +851,7 @@ func cmdQueueReceive(args []string) int {
 	}
 	PrintOK(osStdout, "Row %s leased.", resp.ID)
 	if len(resp.Payload) > 0 {
-		fmt.Fprintln(osStdout, string(resp.Payload))
+		_, _ = fmt.Fprintln(osStdout, string(resp.Payload))
 	}
 	return 0
 }
@@ -918,7 +918,7 @@ func cmdQueuePeek(args []string) int {
 		return jsonOut(writeJSON(resp))
 	}
 	if len(resp.Messages) == 0 {
-		fmt.Fprintln(osStdout, "(no rows peekable)")
+		_, _ = fmt.Fprintln(osStdout, "(no rows peekable)")
 		return 0
 	}
 	for _, m := range resp.Messages {
@@ -954,7 +954,7 @@ func cmdQueueDeadLetter(args []string) int {
 		return jsonOut(writeJSON(resp))
 	}
 	if len(resp.Messages) == 0 {
-		fmt.Fprintln(osStdout, "(no dead-letter rows)")
+		_, _ = fmt.Fprintln(osStdout, "(no dead-letter rows)")
 		return 0
 	}
 	for _, m := range resp.Messages {
@@ -1019,9 +1019,6 @@ func splitArgsForFlags(args []string) (flags, pos []string) {
 		}
 		if len(a) >= 2 && a[0] == '-' && a[1] == '-' {
 			// --flag=value: one token, both halves intact.
-			if i+1 < len(a) && a[1:][1:] != "" {
-				// skip --flag case where '=' not present
-			}
 			if eq := indexByte(a, '='); eq >= 0 {
 				flags = append(flags, a)
 				i++

@@ -28,6 +28,15 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// flagName constants — lifted from string literals so goconst stops
+// flagging the repetition when the same flag name appears in both
+// the fs.Bool definition and the fs.Visit matcher (pointer-shape
+// detection in cmdAlertUpdate).
+const (
+	flagNameEnabled         = "enabled"
+	flagNameCooldownMinutes = "cooldown-minutes"
+)
+
 func cmdAlerts(args []string) int {
 	if len(args) == 0 {
 		PrintUsage(os.Stderr, "usage: gregale alerts <list|add|info|update|rm|rotate-secret> --app <slug>", "alerts")
@@ -38,7 +47,7 @@ func cmdAlerts(args []string) int {
 		return cmdAlertList(args[1:])
 	case subAdd:
 		return cmdAlertAdd(args[1:])
-	case "info":
+	case subInfo:
 		return cmdAlertInfo(args[1:])
 	case subUpdate:
 		return cmdAlertUpdate(args[1:])
@@ -75,7 +84,7 @@ func cmdAlertList(args []string) int {
 		return jsonOut(writeJSON(rules))
 	}
 	if len(rules) == 0 {
-		fmt.Fprintln(osStdout, "(no alert rules)")
+		_, _ = fmt.Fprintln(osStdout, "(no alert rules)")
 		return 0
 	}
 	for _, r := range rules {
@@ -98,8 +107,8 @@ func cmdAlertAdd(args []string) int {
 	failureSource := fs.String("failure-source", "", "failure source (any|cron|queue|delayed_task|async_invoke) — required iff --metric=failed_invocations")
 	webhookURL := fs.String("webhook-url", "", "webhook URL (required, https://...)")
 	webhookSecret := fs.String("webhook-secret", "", "webhook secret (required, ≤256 bytes)")
-	cooldown := fs.Int("cooldown-minutes", api.AlertRuleDefaultCooldownMinutes, fmt.Sprintf("cooldown window in minutes (%d..%d)", api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes))
-	enabled := fs.Bool("enabled", true, "whether the rule is enabled")
+	cooldown := fs.Int(flagNameCooldownMinutes, api.AlertRuleDefaultCooldownMinutes, fmt.Sprintf("cooldown window in minutes (%d..%d)", api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes))
+	enabled := fs.Bool(flagNameEnabled, true, "whether the rule is enabled")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -237,14 +246,14 @@ func cmdAlertUpdate(args []string) int {
 	fs := flag.NewFlagSet("alerts update", flag.ContinueOnError)
 	slug := fs.String("app", "", "app slug (required)")
 	name := fs.String("name", "", "rule name (3..120 chars)")
-	enabled := fs.Bool("enabled", true, "enable/disable the rule")
+	enabled := fs.Bool(flagNameEnabled, true, "enable/disable the rule")
 	metric := fs.String("metric", "", "metric (closed set)")
 	comparison := fs.String("comparison", "", "comparison (gt|gte|lt|lte)")
 	threshold := fs.Float64("threshold", math.NaN(), "threshold (must be finite)")
 	windowSpec := fs.String("window-spec", "", "window (5m|15m|1h|6h|24h|7d|15d)")
 	webhookURL := fs.String("webhook-url", "", "webhook URL")
 	webhookSecret := fs.String("webhook-secret", "", "webhook secret (≤256 bytes)")
-	cooldown := fs.Int("cooldown-minutes", api.AlertRuleDefaultCooldownMinutes, fmt.Sprintf("cooldown (%d..%d)", api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes))
+	cooldown := fs.Int(flagNameCooldownMinutes, api.AlertRuleDefaultCooldownMinutes, fmt.Sprintf("cooldown (%d..%d)", api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes))
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -268,9 +277,9 @@ func cmdAlertUpdate(args []string) int {
 	cooldownSet := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "enabled":
+		case flagNameEnabled:
 			enabledSet = true
-		case "cooldown-minutes":
+		case flagNameCooldownMinutes:
 			cooldownSet = true
 		}
 	})

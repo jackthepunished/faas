@@ -48,7 +48,7 @@ func cmdOrgs(args []string) int {
 		return cmdOrgsLs(args[1:])
 	case "create":
 		return cmdOrgsCreate(args[1:])
-	case "info":
+	case subInfo:
 		return cmdOrgsInfo(args[1:])
 	case subRm:
 		return cmdOrgsRm(args[1:])
@@ -659,7 +659,7 @@ func cmdOrgsKeysList(args []string) int {
 		return jsonOut(writeNDJSON(resp.Keys))
 	}
 	if len(resp.Keys) == 0 {
-		fmt.Fprintln(osStdout, "(no keys)")
+		_, _ = fmt.Fprintln(osStdout, "(no keys)")
 		return 0
 	}
 	for _, k := range resp.Keys {
@@ -843,7 +843,7 @@ func cmdOrgsInvitationsListAll(args []string) int {
 		return jsonOut(writeJSON(items))
 	}
 	if len(items) == 0 {
-		fmt.Fprintln(osStdout, "(no invitations)")
+		_, _ = fmt.Fprintln(osStdout, "(no invitations)")
 		return 0
 	}
 	for _, inv := range items {

@@ -67,7 +67,7 @@ func cmdInvoke(args []string) int {
 	}
 	PrintOK(os.Stdout, "Invocation %s status=%s", resp.ID, resp.Status)
 	if len(resp.Result) > 0 {
-		fmt.Fprintln(os.Stdout, string(resp.Result))
+		_, _ = fmt.Fprintln(os.Stdout, string(resp.Result))
 	}
 	return 0
 }
