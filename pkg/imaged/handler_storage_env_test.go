@@ -12,7 +12,11 @@
 // Why narrow: the load-bearing test is the handoff (env → Handler),
 // not the router's internal field shape. Internal field assertions
 // would force this test into the *PrefixRouter fields which are
-// unexported; the pins there are pkg/storage's responsibility.
+// unexported; the pins there are pkg/storage's responsibility. The
+// test is named _Handoff rather than _Build because it does NOT
+// drive the full build pipeline (no rootfs, no OCI manifest probe);
+// it only asserts the env-derived backend survives the
+// WithStorage / storageFor round-trip.
 
 package imaged
 
@@ -23,23 +27,34 @@ import (
 	"github.com/onebox-faas/faas/pkg/storage"
 )
 
-// TestHandler_BuildWithOCIBackendViaEnv pins the env-var end-to-end
+// TestHandler_OCIBackendEnv_Handoff pins the env-var end-to-end
 // handoff into imaged's Handler. The env vars resolve to a
 // *PrefixRouter (cache explicitly disabled so the assertion is
 // shape-stable); the test confirms:
 //
 //   - storage.BackendFromEnv succeeds with the OCI env vars.
-//   - The Handler's storageFor() returns the env-derived backend
-//     unchanged (no fall-through to the legacy LocalStorageBackend).
 //   - The BackendFromEnv result is a *PrefixRouter (the OCI fork
 //     registers snap/, base/, kernel/, layers/ as local-prefix routes
 //     and falls through to the OCI backend for apps/).
+//   - imaged's Handler accepts the env-derived backend via
+//     WithStorage and storageFor() returns it unchanged (no fall-
+//     through to the legacy LocalStorageBackend).
 //
 // The cache wrapper assertions live in pkg/storage/env_test.go
 // (TestBackendFromEnv_OCIDefaultsCacheDirHermetic and
 // TestBackendFromEnv_OCIDoesNotWrapWhenExplicitlyDisabled). We
 // disable the cache here to keep the type shape stable.
-func TestHandler_BuildWithOCIBackendViaEnv(t *testing.T) {
+//
+// Why this is named _Handoff rather than _Build: a true Build test
+// would need a real rootfs (≥10 MB) and a live OCI registry to
+// probe (the registry's HEAD /v2/ endpoint and the manifest schema
+// are validated end-to-end). That's covered by the metal suite and
+// the pkg/storage/oci_test.go integration tests, neither of which
+// runs in `make test`. This test is the unit-side env→Handler
+// wiring pin; renaming to _Handoff reflects that scope so a future
+// reader doesn't grep for "Build" and assume coverage they don't
+// have.
+func TestHandler_OCIBackendEnv_Handoff(t *testing.T) {
 	// Stable temp roots so the test never touches /srv/fc on the
 	// dev machine. The cache is explicitly disabled — the
 	// default-on path is pinned in pkg/storage/env_test.go.

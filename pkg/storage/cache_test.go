@@ -25,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -233,8 +234,14 @@ func TestLocalCacheBackend_StaleFallbackEnabled(t *testing.T) {
 // also asserts — this test exists so a future contributor who breaks
 // the default-off behaviour sees the test name in a failure message
 // and can grep for the env var's purpose.
+//
+// We t.Setenv to empty rather than relying on "unset": a parallel
+// test or a parent process that exports FAAS_STORAGE_CACHE_SERVE_STALE
+// would otherwise contaminate this test nondeterministically. t.Setenv
+// to "" restores the default-off state explicitly (the os.LookupEnv
+// distinction in serveStale treats unset == empty == default-off).
 func TestLocalCacheBackend_StaleFallbackDisabled_DefaultContract(t *testing.T) {
-	// No t.Setenv — default-off.
+	t.Setenv("FAAS_STORAGE_CACHE_SERVE_STALE", "")
 	tmp := t.TempDir()
 	parent := newFakeBackend()
 	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 0)
@@ -258,6 +265,112 @@ func TestLocalCacheBackend_StaleFallbackDisabled_DefaultContract(t *testing.T) {
 	if got := observerCalls.Load(); got != 0 {
 		t.Errorf("observer called %d times, want 0 (default-off; observer must not fire)", got)
 	}
+}
+
+// TestLocalCacheBackend_ServeStaleTruthyVariants pins the env
+// contract for FAAS_STORAGE_CACHE_SERVE_STALE: any value
+// strconv.ParseBool accepts as true engages the stale-fallback
+// branch. Operators reading a 12-factor example that says =1 or
+// =True must get the same behaviour as =true — the safety net is
+// on whenever the operator reasonably intends it. Conversely,
+// unset / empty / "0" / "false" / "no" / "off" all disable.
+//
+// Implementation note: each value gets a UNIQUE cache root keyed
+// by an integer counter — the env value is intentionally NOT used
+// in the path. macOS (APFS/HFS+) is case-insensitive by default,
+// so env values "t" vs "T" or "false" vs "FALSE" would alias to
+// the same on-disk directory and the previous subtest's Put
+// would survive into the next subtest's Get, short-circuiting
+// the stale-fallback path on readCache HIT (top). Linux CI
+// passes the matrix either way; macOS dev fails it without this
+// disambiguation.
+func TestLocalCacheBackend_ServeStaleTruthyVariants(t *testing.T) {
+	tmp := t.TempDir()
+	idx := 0
+	for _, val := range []string{"1", "t", "T", "true", "TRUE", "True"} {
+		idx++
+		val, i := val, idx
+		t.Run("on="+val, func(t *testing.T) {
+			withServeStale(t, val, func() {
+				cache, observerCalls := setupStaleFallbackCache(t, tmp, i)
+				got, err := readAll(context.Background(), cache, "snap/abc")
+				if err != nil {
+					t.Fatalf("val=%q Get: %v (expected stale fallback, not wrapped error)", val, err)
+				}
+				if got != "stale-blob" {
+					t.Errorf("val=%q Get = %q, want %q", val, got, "stale-blob")
+				}
+				if n := observerCalls.Load(); n != 1 {
+					t.Errorf("val=%q observer calls = %d, want 1", val, n)
+				}
+			})
+		})
+	}
+	for _, val := range []string{"", "0", "f", "F", "false", "FALSE", "no"} {
+		idx++
+		val, i := val, idx
+		t.Run("off="+val, func(t *testing.T) {
+			withServeStale(t, val, func() {
+				cache, observerCalls := setupStaleFallbackCache(t, tmp, i)
+				_, err := cache.Get(context.Background(), "snap/abc")
+				if err == nil {
+					t.Fatalf("val=%q Get = nil; want wrapped parent error", val)
+				}
+				if !strings.Contains(err.Error(), "registry unreachable") {
+					t.Errorf("val=%q err = %q, want it to wrap 'registry unreachable'", val, err)
+				}
+				if n := observerCalls.Load(); n != 0 {
+					t.Errorf("val=%q observer calls = %d, want 0 (off)", val, n)
+				}
+			})
+		})
+	}
+}
+
+// withServeStale sets FAAS_STORAGE_CACHE_SERVE_STALE for the
+// duration of fn, restoring the prior value (set or unset) on
+// cleanup. Empty val means unset.
+func withServeStale(t *testing.T, val string, fn func()) {
+	t.Helper()
+	prev, hadPrev := os.LookupEnv("FAAS_STORAGE_CACHE_SERVE_STALE")
+	if val == "" {
+		_ = os.Unsetenv("FAAS_STORAGE_CACHE_SERVE_STALE")
+	} else {
+		_ = os.Setenv("FAAS_STORAGE_CACHE_SERVE_STALE", val)
+	}
+	t.Cleanup(func() {
+		if hadPrev {
+			_ = os.Setenv("FAAS_STORAGE_CACHE_SERVE_STALE", prev)
+		} else {
+			_ = os.Unsetenv("FAAS_STORAGE_CACHE_SERVE_STALE")
+		}
+	})
+	fn()
+}
+
+// setupStaleFallbackCache builds a fresh cache + parent + observer
+// for the stale-fallback truthy matrix. The index i disambiguates
+// the cache root on case-insensitive filesystems (macOS); see
+// TestLocalCacheBackend_ServeStaleTruthyVariants' doc comment for
+// the case-collisions that motivated this. The parent's onGet
+// hook Puts the blob into the cache before returning error — the
+// only way to drive serveStale in unit tests since the
+// StorageBackend interface does not expose an InjectForTest seam.
+func setupStaleFallbackCache(t *testing.T, tmp string, i int) (storage.StorageBackend, *atomic.Int64) {
+	t.Helper()
+	parent := newFakeBackend()
+	cacheRoot := filepath.Join(tmp, fmt.Sprintf("cache-%03d", i))
+	cache, err := storage.NewLocalCacheBackend(parent, cacheRoot, 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	var observerCalls atomic.Int64
+	cache.SetObserver(storage.FuncCacheObserver(func() { observerCalls.Add(1) }))
+	parent.onGet = func(key string) error {
+		_ = cache.Put(context.Background(), key, strings.NewReader("stale-blob"))
+		return errors.New("registry unreachable")
+	}
+	return cache, &observerCalls
 }
 
 // TestLocalCacheBackend_ListRecoversOriginalKey pins the sidecar

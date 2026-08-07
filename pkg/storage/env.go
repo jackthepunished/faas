@@ -295,3 +295,47 @@ func envOr(key, def string) string {
 	}
 	return def
 }
+
+// AsCacheBackend walks the backend chain rooted at root and returns
+// the first *LocalCacheBackend it finds, or nil if none is present.
+//
+// The walk covers the two shapes BackendFromEnv produces today:
+//
+//   - root is *LocalCacheBackend directly (the wrap-with-cache
+//     outer layer; rare when the inner is a *PrefixRouter because
+//     wrapWithCache always sits on top).
+//   - root is *PrefixRouter wrapping a *LocalCacheBackend in one
+//     of its routes or its fallback (the production multi-box
+//     shape: local-prefix routes hold the LocalStorageBackend, the
+//     fallback holds the LocalCacheBackend → OCI registry chain).
+//
+// Future shapes (a metrics wrapper, a tracing wrapper, a router
+// enclosing the cache instead of being enclosed by it) are handled
+// by recursing through *PrefixRouter.routes and .fallback. Any
+// unrecognised wrapper type is skipped; a cache observer wired by
+// the caller MUST NOT silently fail to attach.
+//
+// Returns nil when no cache backend is reachable from root. Daemons
+// rely on a nil result to log "cache not wired" at startup rather
+// than install an observer that never fires — the alternative is a
+// silent zero-counter that looks healthy while stale-fallbacks
+// happen unmonitored.
+func AsCacheBackend(root StorageBackend) *LocalCacheBackend {
+	if root == nil {
+		return nil
+	}
+	if c, ok := root.(*LocalCacheBackend); ok {
+		return c
+	}
+	if r, ok := root.(*PrefixRouter); ok {
+		for _, child := range r.routes {
+			if c := AsCacheBackend(child); c != nil {
+				return c
+			}
+		}
+		if r.fallback != nil {
+			return AsCacheBackend(r.fallback)
+		}
+	}
+	return nil
+}

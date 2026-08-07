@@ -206,10 +206,13 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	ops := wire.NewOpsMetrics("imaged")
 	// ADR-054 acceptance: wire the LocalCacheBackend observer onto the
 	// daemon's *wire.OpsMetrics so stale-fallback serves emit
-	// `imaged_storage_cache_stale_fallback_total`. No-op when the
-	// resolved backend is not a *LocalCacheBackend (single-box local
-	// deploys never wrap, so the counter stays at zero forever).
-	if cacheBE, ok := storageBackend.(*storage.LocalCacheBackend); ok {
+	// `imaged_storage_cache_stale_fallback_total`. Uses
+	// storage.AsCacheBackend so the observer attaches even when the
+	// BackendFromEnv shape changes (a future metrics wrapper,
+	// router-encloses-cache, etc.). Nil result is expected on
+	// single-box local deploys — the cache is opt-in there and the
+	// counter stays at zero forever.
+	if cacheBE := storage.AsCacheBackend(storageBackend); cacheBE != nil {
 		cacheBE.SetObserver(storage.LogCacheObserver{
 			Logger: log,
 			Next: storage.FuncCacheObserver(func() {

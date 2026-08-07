@@ -559,9 +559,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// so the rate() comparison surfaces "one stall, two emitters"
 	// (consistent) vs "registry down across many wakes" (rate
 	// diverges — schedd's wake-side emits rise faster than vmmd's
-	// boot-side emits). No-op when the resolved backend is not a
-	// *LocalCacheBackend (single-box local deploys never wrap).
-	if cacheBE, ok := storageBackend.(*storage.LocalCacheBackend); ok {
+	// boot-side emits). Uses storage.AsCacheBackend so the observer
+	// attaches even when the BackendFromEnv shape changes (a future
+	// metrics wrapper, router-encloses-cache, etc.). Nil result is
+	// expected on single-box local deploys — the cache is opt-in
+	// there.
+	if cacheBE := storage.AsCacheBackend(storageBackend); cacheBE != nil {
 		cacheBE.SetObserver(storage.LogCacheObserver{
 			Logger: log,
 			Next: storage.FuncCacheObserver(func() {

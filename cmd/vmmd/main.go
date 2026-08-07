@@ -534,9 +534,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// stale-fallback serves on the cold-boot Restore path emit
 	// `vmmd_storage_cache_stale_fallback_total`. vmmd is the
 	// primary emitter on the cold-boot path; imaged emits only on
-	// the build/GC paths. No-op when the resolved backend is not a
-	// *LocalCacheBackend (single-box local deploys never wrap).
-	if cacheBE, ok := storageBackend.(*storage.LocalCacheBackend); ok {
+	// the build/GC paths. Uses storage.AsCacheBackend so the
+	// observer attaches even when the BackendFromEnv shape changes
+	// (a future metrics wrapper, router-encloses-cache, etc.). Nil
+	// result is expected on single-box local deploys — the cache is
+	// opt-in there.
+	if cacheBE := storage.AsCacheBackend(storageBackend); cacheBE != nil {
 		cacheBE.SetObserver(storage.LogCacheObserver{
 			Logger: log,
 			Next: storage.FuncCacheObserver(func() {

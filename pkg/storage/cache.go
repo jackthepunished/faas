@@ -64,6 +64,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,12 @@ import (
 //
 // OnStaleFallback fires once per Get that served a stale cache hit because
 // the parent backend failed and FAAS_STORAGE_CACHE_SERVE_STALE=true.
-// Observers must not block; they are called under the cache's mutex.
+// Observers must not block; notifyStaleFallback snapshots the observer
+// under c.mu and invokes OnStaleFallback OUTSIDE the lock so a slow
+// downstream (a remote slog sink, a Prometheus push) does NOT serialise
+// concurrent Get calls. A future contributor must NOT 'fix' the call
+// site to invoke under the lock — see notifyStaleFallback for the
+// lock-then-call pattern.
 //
 // The interface is nil-safe at the cache: a nil observer no-ops.
 type CacheObserver interface {
@@ -351,8 +357,27 @@ func (c *LocalCacheBackend) SetObserver(o CacheObserver) {
 // The env lookup is cheap (single os.Getenv on a short string) and the
 // call is on the failure path (cold boot with a registry outage), not
 // the steady-state hot path.
+//
+// Truthy parsing: accepts "1", "t", "T", "true", "TRUE", "True" —
+// anything strconv.ParseBool accepts as true. Unset, empty, "0",
+// "f", "F", "false", "FALSE", "no", "off" all return false. Operators
+// reading a 12-factor example that says FAAS_STORAGE_CACHE_SERVE_STALE=1
+// or =True get the same behaviour as =true — the safety net is on
+// whenever the operator reasonably intends it. Values ParseBool
+// rejects (e.g. "yes", "on", "y") fall through to false — those
+// spellings are not standard Go env conventions and an operator
+// using them can be expected to use "true" or "1" after reading the
+// runbook.
 func (c *LocalCacheBackend) serveStale() bool {
-	return os.Getenv("FAAS_STORAGE_CACHE_SERVE_STALE") == "true"
+	v := os.Getenv("FAAS_STORAGE_CACHE_SERVE_STALE")
+	if v == "" {
+		return false
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return on
 }
 
 // notifyStaleFallback snapshots the current observer under the cache
