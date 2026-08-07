@@ -24,7 +24,6 @@ import (
 	"os"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -104,33 +103,14 @@ func cmdAlertAdd(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
-	if *slug == "" || *name == "" || *metric == "" || *comparison == "" ||
-		*windowSpec == "" || *webhookURL == "" || *webhookSecret == "" || math.IsNaN(*threshold) {
-		PrintUsage(os.Stderr, "usage: gregale alerts add --app <slug> --name <text> --metric <v> --comparison <op> --threshold <num> --window-spec <w> --webhook-url <url> --webhook-secret <s> [--failure-source <s>] [--cooldown-minutes N] [--enabled=false]", "alerts")
+	if code, ok := requireAlertCreateFlags(slug, name, metric, comparison, windowSpec, webhookURL, webhookSecret, threshold, cooldown); !ok {
+		return code
+	}
+	if !validateAlertClosedSets(metric, comparison, windowSpec, failureSource) {
 		return 1
-	}
-	if !api.AllowedAlertRuleMetric(*metric) {
-		return printErr("Invalid metric", fmt.Errorf("--metric %q is not in the closed set", *metric))
-	}
-	if !api.AllowedAlertRuleComparison(*comparison) {
-		return printErr("Invalid comparison", fmt.Errorf("--comparison %q must be one of gt|gte|lt|lte", *comparison))
-	}
-	if !api.AllowedAlertRuleWindowSpec(*windowSpec) {
-		return printErr("Invalid window-spec", fmt.Errorf("--window-spec %q must be 5m|15m|1h|6h|24h|7d|15d", *windowSpec))
-	}
-	if *metric == "failed_invocations" {
-		if *failureSource == "" {
-			return printErr("Missing failure-source", fmt.Errorf("--failure-source is required when --metric=failed_invocations"))
-		}
-		if !api.AllowedAlertRuleFailureSource(*failureSource) {
-			return printErr("Invalid failure-source", fmt.Errorf("--failure-source %q must be any|cron|queue|delayed_task|async_invoke", *failureSource))
-		}
 	}
 	if !api.IsFiniteFloat(*threshold) {
 		return printErr("Invalid threshold", fmt.Errorf("--threshold must be a finite number; got %v", *threshold))
-	}
-	if *cooldown < api.AlertRuleCooldownMinMinutes || *cooldown > api.AlertRuleCooldownMaxMinutes {
-		return printErr("Invalid cooldown", fmt.Errorf("--cooldown-minutes %d outside [%d,%d]", *cooldown, api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes))
 	}
 	client, err := authedClient()
 	if err != nil {
@@ -156,6 +136,49 @@ func cmdAlertAdd(args []string) int {
 	}
 	PrintOK(osStdout, "Alert rule %s created for app %s.", resp.ID, *slug)
 	return 0
+}
+
+// requireAlertCreateFlags validates the presence + range of the
+// required closed-set / range-constrained flags shared by
+// cmdAlertAdd and cmdAlertUpdate. Returns (1, false) when the
+// usage line should fire, (0, true) on success. Extracts the
+// repeated presence check so both leaves stay under the
+// 50-line handler cap (CLAUDE.md "Handlers ≤ 50 lines — extract").
+func requireAlertCreateFlags(slug, name, metric, comparison, windowSpec, webhookURL, webhookSecret *string, threshold *float64, cooldown *int) (int, bool) {
+	if *slug == "" || *name == "" || *metric == "" || *comparison == "" ||
+		*windowSpec == "" || *webhookURL == "" || *webhookSecret == "" || math.IsNaN(*threshold) {
+		PrintUsage(os.Stderr, "usage: gregale alerts add --app <slug> --name <text> --metric <v> --comparison <op> --threshold <num> --window-spec <w> --webhook-url <url> --webhook-secret <s> [--failure-source <s>] [--cooldown-minutes N] [--enabled=false]", "alerts")
+		return 1, false
+	}
+	if *cooldown < api.AlertRuleCooldownMinMinutes || *cooldown > api.AlertRuleCooldownMaxMinutes {
+		return printErr("Invalid cooldown", fmt.Errorf("--cooldown-minutes %d outside [%d,%d]", *cooldown, api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes)), false
+	}
+	return 0, true
+}
+
+// validateAlertClosedSets checks the four closed-set enums shared by
+// alerts add + update. Fires the APIError-style printErr on the
+// first failure (consistent with the other leaves). On failure
+// returns false; the caller returns 1.
+func validateAlertClosedSets(metric, comparison, windowSpec, failureSource *string) bool {
+	if !api.AllowedAlertRuleMetric(*metric) {
+		return printErr("Invalid metric", fmt.Errorf("--metric %q is not in the closed set", *metric)) == 0
+	}
+	if !api.AllowedAlertRuleComparison(*comparison) {
+		return printErr("Invalid comparison", fmt.Errorf("--comparison %q must be one of gt|gte|lt|lte", *comparison)) == 0
+	}
+	if !api.AllowedAlertRuleWindowSpec(*windowSpec) {
+		return printErr("Invalid window-spec", fmt.Errorf("--window-spec %q must be 5m|15m|1h|6h|24h|7d|15d", *windowSpec)) == 0
+	}
+	if *metric == "failed_invocations" {
+		if *failureSource == "" {
+			return printErr("Missing failure-source", fmt.Errorf("--failure-source is required when --metric=failed_invocations")) == 0
+		}
+		if !api.AllowedAlertRuleFailureSource(*failureSource) {
+			return printErr("Invalid failure-source", fmt.Errorf("--failure-source %q must be any|cron|queue|delayed_task|async_invoke", *failureSource)) == 0
+		}
+	}
+	return true
 }
 
 // cmdAlertInfo mirrors cmdAuditEventsGet — single id, multi-line
@@ -233,31 +256,38 @@ func cmdAlertUpdate(args []string) int {
 	if !alertIDPattern.MatchString(id) {
 		return printErr("Invalid alert id", fmt.Errorf("must be a 32-hex-char UUID; got %q", id))
 	}
-	if *metric != "" && !api.AllowedAlertRuleMetric(*metric) {
-		return printErr("Invalid metric", fmt.Errorf("--metric %q is not in the closed set", *metric))
+	if !validateAlertUpdateFlags(metric, comparison, windowSpec, threshold, cooldown) {
+		return 1
 	}
-	if *comparison != "" && !api.AllowedAlertRuleComparison(*comparison) {
-		return printErr("Invalid comparison", fmt.Errorf("--comparison %q must be one of gt|gte|lt|lte", *comparison))
-	}
-	if *windowSpec != "" && !api.AllowedAlertRuleWindowSpec(*windowSpec) {
-		return printErr("Invalid window-spec", fmt.Errorf("--window-spec %q must be 5m|15m|1h|6h|24h|7d|15d", *windowSpec))
-	}
-	if !math.IsNaN(*threshold) && !api.IsFiniteFloat(*threshold) {
-		return printErr("Invalid threshold", fmt.Errorf("--threshold must be a finite number; got %v", *threshold))
-	}
-	if *cooldown < api.AlertRuleCooldownMinMinutes || *cooldown > api.AlertRuleCooldownMaxMinutes {
-		return printErr("Invalid cooldown", fmt.Errorf("--cooldown-minutes %d outside [%d,%d]", *cooldown, api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes))
-	}
+	// UpdateAlertRuleRequest is pointer-everything (pkg/api/alerts.go:124-134):
+	// "omitted" (leave alone) is distinguishable from "zero" (clear).
+	// fs.Visit tells us which flags the operator actually passed; without
+	// it, --enabled defaulting to true would silently re-enable a disabled
+	// rule on a rename-only update.
+	enabledSet := false
+	cooldownSet := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "enabled":
+			enabledSet = true
+		case "cooldown-minutes":
+			cooldownSet = true
+		}
+	})
 	req := api.UpdateAlertRuleRequest{
-		Name:            ptrIfNonEmpty(*name),
-		Enabled:         enabled,
-		Metric:          ptrIfNonEmpty(*metric),
-		Comparison:      ptrIfNonEmpty(*comparison),
-		Threshold:       thrIfFinite(*threshold),
-		WindowSpec:      ptrIfNonEmpty(*windowSpec),
-		WebhookURL:      ptrIfNonEmpty(*webhookURL),
-		WebhookSecret:   ptrIfNonEmpty(*webhookSecret),
-		CooldownMinutes: cooldown,
+		Name:          ptrIfNonEmpty(*name),
+		Metric:        ptrIfNonEmpty(*metric),
+		Comparison:    ptrIfNonEmpty(*comparison),
+		Threshold:     thrIfFinite(*threshold),
+		WindowSpec:    ptrIfNonEmpty(*windowSpec),
+		WebhookURL:    ptrIfNonEmpty(*webhookURL),
+		WebhookSecret: ptrIfNonEmpty(*webhookSecret),
+	}
+	if enabledSet {
+		req.Enabled = enabled
+	}
+	if cooldownSet {
+		req.CooldownMinutes = cooldown
 	}
 	client, err := authedClient()
 	if err != nil {
@@ -272,6 +302,30 @@ func cmdAlertUpdate(args []string) int {
 	}
 	PrintOK(osStdout, "Alert rule %s updated.", resp.ID)
 	return 0
+}
+
+// validateAlertUpdateFlags is the update-shape twin of
+// validateAlertClosedSets: every closed-set check is gated on
+// non-empty (omitted != invalid), and the threshold finite-check
+// is gated on non-NaN (the unset sentinel from flag.Float64).
+// Extracted so cmdAlertUpdate stays under the 50-line handler cap.
+func validateAlertUpdateFlags(metric, comparison, windowSpec *string, threshold *float64, cooldown *int) bool {
+	if *metric != "" && !api.AllowedAlertRuleMetric(*metric) {
+		return printErr("Invalid metric", fmt.Errorf("--metric %q is not in the closed set", *metric)) == 0
+	}
+	if *comparison != "" && !api.AllowedAlertRuleComparison(*comparison) {
+		return printErr("Invalid comparison", fmt.Errorf("--comparison %q must be one of gt|gte|lt|lte", *comparison)) == 0
+	}
+	if *windowSpec != "" && !api.AllowedAlertRuleWindowSpec(*windowSpec) {
+		return printErr("Invalid window-spec", fmt.Errorf("--window-spec %q must be 5m|15m|1h|6h|24h|7d|15d", *windowSpec)) == 0
+	}
+	if !math.IsNaN(*threshold) && !api.IsFiniteFloat(*threshold) {
+		return printErr("Invalid threshold", fmt.Errorf("--threshold must be a finite number; got %v", *threshold)) == 0
+	}
+	if *cooldown < api.AlertRuleCooldownMinMinutes || *cooldown > api.AlertRuleCooldownMaxMinutes {
+		return printErr("Invalid cooldown", fmt.Errorf("--cooldown-minutes %d outside [%d,%d]", *cooldown, api.AlertRuleCooldownMinMinutes, api.AlertRuleCooldownMaxMinutes)) == 0
+	}
+	return true
 }
 
 // cmdAlertRm mirrors cmdWebhookRm — 204 No Content on success.
@@ -366,10 +420,3 @@ func thrIfFinite(v float64) *float64 {
 	}
 	return &v
 }
-
-// truncate helper lives in commands_webhooks.go — same package.
-//
-// _ = strings import: cmdAlertUpdate uses strings.HasPrefix indirectly
-// via api.AllowedAlertRuleComparison; the import is here to keep the
-// leaf body minimal and the diff easy to review.
-var _ = strings.HasPrefix

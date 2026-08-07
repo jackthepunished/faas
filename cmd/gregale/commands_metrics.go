@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
@@ -158,14 +159,8 @@ func renderAppsMetrics(w io.Writer, m api.AppsMetricsResponse) {
 	}
 }
 
-// sortStrings is a tiny helper to keep renderAppsMetrics deterministic
-// without pulling sort into the import block for one call site.
-// The slice is small (per-app count for one account) — insertion-sort
-// is fine and keeps the file self-contained.
-func sortStrings(xs []string) {
-	for i := 1; i < len(xs); i++ {
-		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
-			xs[j-1], xs[j] = xs[j], xs[j-1]
-		}
-	}
-}
+// sortStrings delegates to stdlib sort.Strings (pdqsort, O(n log n)).
+// Extracted so renderAppsMetrics reads cleanly — the wrapper is one
+// line vs. the call site's naked sort.Strings(xs) which would scan
+// the diff for "why is sort imported here?"
+func sortStrings(xs []string) { sort.Strings(xs) }

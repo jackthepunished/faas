@@ -723,7 +723,7 @@ func cmdDashboard(args []string) int {
 //	ack          release a leased row
 func cmdQueueDispatch(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale queue <subcommand> --app <slug> [args]\n\n"+
+		PrintUsage(os.Stderr, "usage: gregale queue <subcommand> <slug> [args]\n\n"+
 			"  tail <slug>            long-poll the unified event stream (queue drain signals)\n"+
 			"  send <slug> --payload J enqueue one row\n"+
 			"  receive <slug>         drain the next row (blocks)\n"+
@@ -750,7 +750,7 @@ func cmdQueueDispatch(args []string) int {
 	case "ack":
 		return cmdQueueAck(args[1:])
 	default:
-		PrintUsage(os.Stderr, "usage: gregale queue <subcommand> --app <slug> [args]\n\n"+
+		PrintUsage(os.Stderr, "usage: gregale queue <subcommand> <slug> [args]\n\n"+
 			"  tail <slug>            long-poll the unified event stream\n"+
 			"  send <slug> --payload J enqueue one row\n"+
 			"  receive <slug>         drain the next row\n"+
@@ -768,14 +768,15 @@ func cmdQueueDispatch(args []string) int {
 func cmdQueueSend(args []string) int {
 	fs := flag.NewFlagSet("queue send", flag.ContinueOnError)
 	payload := fs.String("payload", "", "JSON payload (inline | @file | -)")
-	if err := fs.Parse(args); err != nil {
+	flags, pos := splitArgsForFlags(args)
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale queue send <slug> --payload <json|@file|->", "queue")
 		return 1
 	}
-	slug := fs.Arg(0)
+	slug := pos[0]
 	body, err := resolveQueuePayload(*payload)
 	if err != nil {
 		return printErr("Invalid payload", err)
@@ -801,14 +802,15 @@ func cmdQueueSend(args []string) int {
 // same signal.NotifyContext wiring.
 func cmdQueueReceive(args []string) int {
 	fs := flag.NewFlagSet("queue receive", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	flags, pos := splitArgsForFlags(args)
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale queue receive <slug>", "queue")
 		return 1
 	}
-	slug := fs.Arg(0)
+	slug := pos[0]
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -817,9 +819,30 @@ func cmdQueueReceive(args []string) int {
 	defer stop()
 	resp, err := client.QueueReceive(ctx, slug)
 	if err != nil {
+		// Long-poll timeout is the "empty queue" sentinel — the
+		// server waited the full window and nothing arrived. SDK
+		// raises ErrLongPollTimeout (pkg/api/errors.go:2036-2047)
+		// which is *api.Problem{Code:"long_poll_timeout",
+		// Status:504}. Treat as a successful empty result so
+		// polling shell loops exit cleanly.
+		var p *api.Problem
+		if errors.As(err, &p) && p.Code == "long_poll_timeout" {
+			if jsonOutput {
+				return jsonOut(writeJSON(api.QueueReceiveResponse{}))
+			}
+			fmt.Fprintln(osStdout, "(empty)")
+			return 0
+		}
 		return printErr("Queue receive failed", err)
 	}
 	if resp.ID == "" {
+		// Empty branch — server returned 204 / no row available.
+		// --json consumers MUST receive valid JSON (jq contract);
+		// human consumers get a one-line hint so they don't think
+		// the queue is broken.
+		if jsonOutput {
+			return jsonOut(writeJSON(resp))
+		}
 		fmt.Fprintln(osStdout, "(empty)")
 		return 0
 	}
@@ -837,14 +860,15 @@ func cmdQueueReceive(args []string) int {
 // Read-only; safe to call on a hot path.
 func cmdQueueState(args []string) int {
 	fs := flag.NewFlagSet("queue state", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	flags, pos := splitArgsForFlags(args)
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale queue state <slug>", "queue")
 		return 1
 	}
-	slug := fs.Arg(0)
+	slug := pos[0]
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -873,14 +897,15 @@ func cmdQueuePeek(args []string) int {
 	fs := flag.NewFlagSet("queue peek", flag.ContinueOnError)
 	limit := fs.Int("limit", 50, "max rows (1..100)")
 	before := fs.String("before", "", "pagination cursor (NextBefore from a prior call)")
-	if err := fs.Parse(args); err != nil {
+	flags, pos := splitArgsForFlags(args)
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale queue peek <slug> [--limit N] [--before C]", "queue")
 		return 1
 	}
-	slug := fs.Arg(0)
+	slug := pos[0]
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -908,14 +933,15 @@ func cmdQueueDeadLetter(args []string) int {
 	fs := flag.NewFlagSet("queue dead-letter", flag.ContinueOnError)
 	limit := fs.Int("limit", 50, "max rows (1..100)")
 	before := fs.String("before", "", "pagination cursor")
-	if err := fs.Parse(args); err != nil {
+	flags, pos := splitArgsForFlags(args)
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 1 {
+	if len(pos) != 1 {
 		PrintUsage(os.Stderr, "usage: gregale queue dead-letter <slug> [--limit N] [--before C]", "queue")
 		return 1
 	}
-	slug := fs.Arg(0)
+	slug := pos[0]
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -942,15 +968,16 @@ func cmdQueueDeadLetter(args []string) int {
 // row before the lease expires.
 func cmdQueueAck(args []string) int {
 	fs := flag.NewFlagSet("queue ack", flag.ContinueOnError)
-	if err := fs.Parse(args); err != nil {
+	flags, pos := splitArgsForFlags(args)
+	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if fs.NArg() != 2 {
+	if len(pos) != 2 {
 		PrintUsage(os.Stderr, "usage: gregale queue ack <slug> <row-id>", "queue")
 		return 1
 	}
-	slug := fs.Arg(0)
-	id := fs.Arg(1)
+	slug := pos[0]
+	id := pos[1]
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
@@ -966,6 +993,78 @@ func cmdQueueAck(args []string) int {
 // here so future queue-payload semantics (e.g. message deduplication
 // keys) don't have to import the invoke leaf.
 func resolveQueuePayload(s string) ([]byte, error) { return resolvePayload(s) }
+
+// splitArgsForFlags accepts the leaf's args slice and returns a
+// reordered copy with every `--flag value` (or `--flag=value`) pair
+// pulled to the FRONT. Go's stdlib flag.Parse stops at the first
+// non-flag token; without this helper the help text "queue send
+// <slug> --payload J" silently drops the payload. The reorder is
+// a one-pass scan: positional tokens land in `pos`, flag tokens
+// (and their values, when separated) land in `flags`. Bool flags
+// (`--async`) and bare `--` markers pass through unchanged.
+//
+// `--` is treated as "everything after this is positional" so the
+// queue subcommand can carry messages that themselves contain
+// leading dashes (rare but possible for JSON payloads starting
+// with `-`).
+func splitArgsForFlags(args []string) (flags, pos []string) {
+	flags = make([]string, 0, len(args))
+	pos = make([]string, 0, len(args))
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			pos = append(pos, args[i+1:]...)
+			return
+		}
+		if len(a) >= 2 && a[0] == '-' && a[1] == '-' {
+			// --flag=value: one token, both halves intact.
+			if i+1 < len(a) && a[1:][1:] != "" {
+				// skip --flag case where '=' not present
+			}
+			if eq := indexByte(a, '='); eq >= 0 {
+				flags = append(flags, a)
+				i++
+				continue
+			}
+			// --flag value: peek the next token; if it's not
+			// flag-shaped it belongs to this flag.
+			flags = append(flags, a)
+			if i+1 < len(args) && !looksLikeFlag(args[i+1]) {
+				flags = append(flags, args[i+1])
+				i += 2
+				continue
+			}
+			i++
+			continue
+		}
+		pos = append(pos, a)
+		i++
+	}
+	return
+}
+
+// looksLikeFlag returns true when a token begins with `-` and is
+// more than a single dash (avoiding negative-number false-positives
+// on positional int args). Used by splitArgsForFlags to decide
+// whether the token after `--flag` is the flag's value or the next
+// flag.
+func looksLikeFlag(s string) bool {
+	return len(s) >= 2 && s[0] == '-'
+}
+
+// indexByte is a strings.IndexByte alias kept local to this file to
+// avoid pulling strings into commands5.go's import block for one
+// call site. (Future maintainer: if more byte-search helpers land
+// here, promote to strings.IndexByte and drop this.)
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
 
 // cmdTail subscribes to /v1/events and prints one line per
 // `invocation_done` frame: "<invocation_id> <app_slug> <state>". With

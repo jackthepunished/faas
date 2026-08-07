@@ -128,6 +128,38 @@ func TestTierC_AlertsAdd_HappyPath(t *testing.T) {
 	}
 }
 
+// TestTierC_AlertsUpdate_NameOnlyDoesNotResendEnabledOrCooldown pins
+// the pointer-shape fix: a rename-only update must NOT re-enable a
+// disabled rule nor reset cooldown to the default. Without this the
+// CLI was silently breaking the operator's intent on every update.
+func TestTierC_AlertsUpdate_NameOnlyDoesNotResendEnabledOrCooldown(t *testing.T) {
+	resetJSONOut(t)
+	body := `{"id":"0123456789abcdef0123456789abcdef","name":"renamed","enabled":false,"metric":"error_rate_pct","window_spec":"5m","threshold":1.5,"comparison":"gt"}`
+	f := authedFakeAPI(t, body, http.StatusOK)
+	if code := cmdAlertUpdate([]string{
+		"--app", "demo", "--name", "renamed",
+		"0123456789abcdef0123456789abcdef",
+	}); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	// Body must carry `name` (the only thing we set) and must NOT
+	// carry enabled or cooldown_minutes — JSON unmarshal of the
+	// request body decodes into a generic map for the assertion.
+	var got map[string]any
+	if err := json.Unmarshal(f.sawBody, &got); err != nil {
+		t.Fatalf("decode body: %v; raw=%s", err, string(f.sawBody))
+	}
+	if got["name"] != "renamed" {
+		t.Errorf("name = %v, want \"renamed\"", got["name"])
+	}
+	if _, ok := got["enabled"]; ok {
+		t.Errorf("enabled present in body; must be omitted on rename-only update (got %v)", got["enabled"])
+	}
+	if _, ok := got["cooldown_minutes"]; ok {
+		t.Errorf("cooldown_minutes present in body; must be omitted on rename-only update (got %v)", got["cooldown_minutes"])
+	}
+}
+
 // --- alerts rotate-secret (one-shot plaintext dropped, mirroring
 // webhooks rotate-secret Tier B fix) ---
 
