@@ -30,6 +30,39 @@ const (
 	fwUnknown framework = "unknown"
 )
 
+// shape is the deploy shape auto-detected from the current directory when
+// `gregale deploy` runs with no source flag (issue #737 / ADR-083). A function
+// shape means "single handler file at the root, no app markers"; an app shape
+// means any app marker (package.json / requirements.txt / go.mod / Dockerfile
+// / …) is present at the root. The convention is intentionally narrow:
+// a customer with `package.json + handler.js` is unambiguously a Node app,
+// and must pass --function to force function mode (otherwise auto-detection
+// would silently break every existing Node user).
+//
+// shapeUnknown fires when the cwd is empty or contains only excluded files
+// (.git, .DS_Store, README, dotfiles). The CLI surfaces this as the no-source
+// error and lets the customer pick --image, --tarball, --template, --repo,
+// or the new --function/--app explicit flags.
+type shape int
+
+const (
+	shapeApp shape = iota
+	shapeFunction
+	shapeUnknown
+)
+
+// functionHandlerFiles is the closed set of file names that, when present
+// alone at the project root, signal a function deploy. The names match the
+// template convention at cmd/gregale/templates/function-node/handler.js (and
+// its python/go siblings). Anything else falls through to shapeApp or
+// shapeUnknown.
+var functionHandlerFiles = map[string]bool{
+	"handler.js": true,
+	"handler.ts": true,
+	"handler.py": true,
+	"handler.go": true,
+}
+
 // defaultExcludeDirs are directory names dropped anywhere in the tree. These
 // are build artifacts / VCS metadata that both bloat the tarball past the
 // SourceTarballMaxMB cap (pkg/api/limits.go) and are reproduced server-side by
@@ -112,6 +145,130 @@ func detectFramework(srcDir string) framework {
 		return fwGo
 	}
 	return fwUnknown
+}
+
+// detectShape sniffs the TOP-LEVEL entries of srcDir (no recursion) and returns
+// the deploy shape (issue #737 / ADR-083). The rule:
+//
+//   - shapeFunction: exactly one of {handler.js, handler.ts, handler.py,
+//     handler.go} at the root AND none of the app markers (package.json /
+//     requirements.txt / pyproject.toml / Pipfile / setup.py / go.mod /
+//     Dockerfile). A README.md and dotfiles are ignored — most repos have
+//     them and they don't change the shape.
+//   - shapeApp: any app marker present at the root. App markers always win
+//     over a co-located handler.* — a customer with `package.json +
+//     handler.js` is unambiguously a Node app and must pass --function to
+//     override.
+//   - shapeUnknown: cwd is empty, missing, or contains only excluded files.
+//
+// The detector is intentionally minimal: it mirrors the top-level sniff rule
+// the server's pkg/builderd/detect.go:41-95 applies to the uploaded tarball,
+// so a CLI-detected shape matches what builderd will see on the other end.
+// Files only ever seen during the build (node_modules, .git, __pycache__,
+// vendor) are NOT app markers — the framework detector only counts the
+// "primary" files, and so does shape.
+func detectShape(srcDir string) shape {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return shapeUnknown
+	}
+	var (
+		hasAppMarker bool
+		handlerFile  string // name of the single handler.* if present
+	)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Excluded files (build artifacts, OS junk) are not markers —
+		// they don't change the shape. Match the same set defaultExcludeFiles
+		// uses so behaviour is consistent with what gets packed.
+		if defaultExcludeFiles[name] {
+			continue
+		}
+		// Dotfiles (other than .git, which is excluded above) and
+		// README* are ignored. The customer reads a README on GitHub,
+		// not in a deployable function — and dotfiles (.env,
+		// .dockerignore, .npmrc) are common and not shape-changing.
+		if strings.HasPrefix(name, ".") || strings.HasPrefix(strings.ToLower(name), "readme") {
+			continue
+		}
+		switch strings.ToLower(name) {
+		// Keep in sync with detectFramework's app-marker switch and
+		// pkg/builderd/detect.go:73-82. If you change one, change all.
+		case "package.json", "requirements.txt", "pyproject.toml",
+			"pipfile", "setup.py", "go.mod", "dockerfile":
+			hasAppMarker = true
+		}
+		if functionHandlerFiles[name] {
+			// Second handler.* wins means the shape is ambiguous —
+			// fall through to shapeApp (any co-located handler that
+			// isn't a single, named handler.js signals "this is a
+			// project, not a function").
+			if handlerFile != "" {
+				hasAppMarker = true
+				continue
+			}
+			handlerFile = name
+		}
+	}
+	switch {
+	case hasAppMarker:
+		return shapeApp
+	case handlerFile != "":
+		return shapeFunction
+	default:
+		return shapeUnknown
+	}
+}
+
+// inferFunctionRuntime picks the apid runtime + wire handler for a
+// function-shaped repo. The runtime is keyed on the handler file's
+// extension; the wire handler is the literal `handler.handler` value
+// that imaged's function-layer manifest rewrites to /app/<runtime>.js
+// (per the convention at cmd/gregale/templates/function-node/handler.js
+// and defaultTemplateHandler at cmd/gregale/commands2.go:48). The bool
+// is false when the cwd lacks a single, recognised handler file —
+// callers should fall back to shapeUnknown in that case.
+//
+// This is the load-bearing helper that wires detectShape into the
+// cmdDeployTarball flow: detectShape picks shapeFunction, then
+// inferFunctionRuntime fills in runtime + handler for the multipart
+// form. Both default to the same convention the function-* templates
+// force today, so an existing function customer who runs
+// `gregale deploy` against a hand-written handler.js gets the exact
+// same wire shape they would have got via
+// `gregale --template function-node --tarball ...`.
+func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return "", "", false
+	}
+	var picked string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if functionHandlerFiles[e.Name()] {
+			if picked != "" {
+				return "", "", false // ambiguous — multiple handlers
+			}
+			picked = e.Name()
+		}
+	}
+	if picked == "" {
+		return "", "", false
+	}
+	switch strings.ToLower(picked) {
+	case "handler.js", "handler.ts":
+		return "node22", "handler.handler", true
+	case "handler.py":
+		return "python312", "handler.handler", true
+	case "handler.go":
+		return "go124", "handler.handler", true
+	}
+	return "", "", false
 }
 
 // zeroConfigSourceCapMB is the conservative per-plan floor used by the
@@ -272,6 +429,54 @@ func copyRegular(tw *tar.Writer, abs string) error {
 			filepath.Base(abs), n, zeroConfigSourceCapMB)
 	}
 	return nil
+}
+
+// resolveDeployShape runs the cwd detector and emits the customer-visible
+// "Detected: …" line for issue #737 / ADR-083. The print goes BEFORE the
+// multipart POST so the customer's first response from the CLI is the
+// deploy shape. The explicit --function / --app flags short-circuit the
+// detector (see the mutex check in cmdDeployTarball); this helper assumes
+// they have already been mutex-checked. On shapeUnknown, an actionable
+// error is returned — the caller turns it into a customer-visible
+// printErr. The returned (runtime, handler) are non-empty only on the
+// shapeFunction path; on shapeApp they are empty (server-side Railpack
+// auto-detects). Allocated to live in pack.go (next to detectShape /
+// inferFunctionRuntime) so the unit test exercises both the wire
+// contract and the print line in one place.
+func resolveDeployShape(srcDir string, explicitFunction, explicitApp bool) (shape, string, string, error) {
+	detected := detectShape(srcDir)
+	if explicitFunction {
+		detected = shapeFunction
+	} else if explicitApp {
+		detected = shapeApp
+	}
+	switch detected {
+	case shapeUnknown:
+		return shapeUnknown, "", "", fmt.Errorf(
+			"no deployable source found in %s: expected package.json, requirements.txt / pyproject.toml / "+
+				"Pipfile / setup.py, go.mod, or Dockerfile at the project root for an *app*, "+
+				"OR a single handler.{js,ts,py,go} for a *function* — "+
+				"or pass --image, --tarball, --template, --repo, --function, or --app",
+			filepath.Base(srcDir))
+	case shapeFunction:
+		rt, hnd, ok := inferFunctionRuntime(srcDir)
+		if !ok {
+			return shapeUnknown, "", "", fmt.Errorf(
+				"--function requires a single handler.{js,ts,py,go} at the project root; "+
+					"found zero or ambiguous handler files in %s",
+				filepath.Base(srcDir))
+		}
+		// Print uses the inferred values — the caller may still
+		// override them via an explicit --runtime / --handler (out of
+		// scope here, but the CLI does it just after this returns).
+		PrintOK(osStdout, "Detected: function, runtime=%s, handler=%s", rt, hnd)
+		return shapeFunction, rt, hnd, nil
+	case shapeApp:
+		fw := detectFramework(srcDir)
+		PrintOK(osStdout, "Detected: app, framework=%s", fw)
+		return shapeApp, "", "", nil
+	}
+	return shapeUnknown, "", "", fmt.Errorf("internal: resolveDeployShape fell through")
 }
 
 // autoPackCwd is the zero-config entry point: it packs srcDir into a fresh temp

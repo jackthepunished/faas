@@ -108,6 +108,113 @@ func TestDetectFramework_NestedMarkerIgnored(t *testing.T) {
 	}
 }
 
+// TestDetectShape covers issue #737 / ADR-083. The shape detector decides
+// whether `gregale deploy` on the cwd auto-picks app mode (any app marker)
+// or function mode (single handler.* with no app markers). Cases below
+// enumerate every shape boundary the CLI cares about.
+func TestDetectShape(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  shape
+	}{
+		// Function mode (the load-bearing new behaviour).
+		{"handler_js_only", []string{"handler.js"}, shapeFunction},
+		{"handler_ts_only", []string{"handler.ts"}, shapeFunction},
+		{"handler_py_only", []string{"handler.py"}, shapeFunction},
+		{"handler_go_only", []string{"handler.go"}, shapeFunction},
+		{"handler_with_readme", []string{"handler.js", "README.md"}, shapeFunction},
+		{"handler_with_dotfiles", []string{"handler.js", ".env", ".npmrc"}, shapeFunction},
+
+		// App mode — any app marker wins.
+		{"package_json_alone", []string{"package.json"}, shapeApp},
+		{"requirements_alone", []string{"requirements.txt"}, shapeApp},
+		{"go_mod_alone", []string{"go.mod"}, shapeApp},
+		{"dockerfile_alone", []string{"Dockerfile"}, shapeApp},
+		{"handler_plus_package_json", []string{"handler.js", "package.json"}, shapeApp},
+		{"handler_plus_dockerfile", []string{"handler.go", "Dockerfile"}, shapeApp},
+		{"two_handlers_is_ambiguous", []string{"handler.js", "handler.py"}, shapeApp},
+
+		// Unknown — the no-source error path.
+		{"empty", nil, shapeUnknown},
+		{"readme_only", []string{"README.md"}, shapeUnknown},
+		{"notes_only", []string{"notes.txt"}, shapeUnknown},
+		{"missing_dir_is_unknown", nil, shapeUnknown}, // caller passes non-existent path → ReadDir errors
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// For "missing_dir" we use a path that doesn't exist.
+			target := dir
+			if tc.name == "missing_dir_is_unknown" {
+				target = filepath.Join(dir, "does-not-exist")
+			}
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			if got := detectShape(target); got != tc.want {
+				t.Errorf("detectShape = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectShape_NestedHandlerIgnored mirrors
+// TestDetectFramework_NestedMarkerIgnored — the shape rule is top-level
+// only, matching detectFramework's rule. A handler.js in a subdirectory
+// does NOT signal function mode (the customer's repo might have a sample
+// handler in examples/, that doesn't mean they want function mode).
+func TestDetectShape_NestedHandlerIgnored(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "examples/handler.js", "// sample")
+	writeFile(t, dir, "README.md", "hi")
+	if got := detectShape(dir); got != shapeUnknown {
+		t.Errorf("detectShape = %d, want %d (nested handler.js must not count)", got, shapeUnknown)
+	}
+}
+
+// TestInferFunctionRuntime pins the runtime map from extension (issue #737
+// / ADR-083). The wire handler value is always "handler.handler" —
+// that's the literal imaged's function-layer manifest rewrites to
+// /app/<runtime>.{js,py}, matching the function-* template convention
+// (cmd/gregale/templates/function-node/handler.js).
+func TestInferFunctionRuntime(t *testing.T) {
+	cases := []struct {
+		name    string
+		files   []string
+		wantRt  string
+		wantHnd string
+		wantOK  bool
+	}{
+		{"handler_js", []string{"handler.js"}, "node22", "handler.handler", true},
+		{"handler_ts", []string{"handler.ts"}, "node22", "handler.handler", true},
+		{"handler_py", []string{"handler.py"}, "python312", "handler.handler", true},
+		{"handler_go", []string{"handler.go"}, "go124", "handler.handler", true},
+		{"handler_with_readme", []string{"handler.js", "README.md"}, "node22", "handler.handler", true},
+		{"no_handler", []string{"README.md"}, "", "", false},
+		{"two_handlers_ambiguous", []string{"handler.js", "handler.py"}, "", "", false},
+		{"app_marker_present_ignored", []string{"handler.js", "package.json"}, "node22", "handler.handler", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			rt, hnd, ok := inferFunctionRuntime(dir)
+			if ok != tc.wantOK {
+				t.Errorf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if rt != tc.wantRt {
+				t.Errorf("runtime = %q, want %q", rt, tc.wantRt)
+			}
+			if hnd != tc.wantHnd {
+				t.Errorf("handler = %q, want %q", hnd, tc.wantHnd)
+			}
+		})
+	}
+}
+
 func TestPackDirToTarGz_TopLevelDirAndCount(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Base(dir)
