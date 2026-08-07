@@ -18,10 +18,12 @@
 --                          (e.g. compliance hold); not wired yet.
 --
 -- additive + nullable: existing rows land with NULL parked_reason, NULL
--- parked_at. Per ADR-041 (slot discipline), this slot is 157 — a free
--- slot at the time of authoring; pre-flight
--- `git ls-tree origin/main migrations/ | grep '^157'` was empty. Renumbered
--- from 155 after PR #698 fenced slot 155 and claimed 156.
+-- parked_at. Per ADR-041 (slot discipline), this slot is 157. The
+-- renumber chain (155 → 157 → 156 → 157) closed out after PR #698
+-- (issue-695 apps.auth_default_flip) merged into main at 16:21:08
+-- with 00156_apps_auth_default_flip.sql — the 156 slot became a real
+-- main-landed migration and PR #697 picks 157 as the next free slot
+-- above main's head.
 ALTER TABLE deployments
   ADD COLUMN IF NOT EXISTS parked_reason text;
 ALTER TABLE deployments
