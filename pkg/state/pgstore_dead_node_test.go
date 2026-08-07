@@ -140,19 +140,21 @@ func TestPg_ListRunningInstancesOnDeadNodes_FilterByActiveOrStale(t *testing.T) 
 	liveNodeID := pgTestComputeNode(t, ctx, s, true, 0)
 	_, _ = pgTestSeedRunningInstance(t, ctx, s, liveNodeID)
 
-	// Threshold = now() + 1h so the live node (whose heartbeat is
+	// Threshold = now() - 1m so the live node (whose heartbeat is
 	// stamped at INSERT-time by the schema default `now()` and is
-	// therefore ≤ time.Now()) cannot trip the
+	// therefore ≥ now() - 1m) cannot trip the
 	// `last_heartbeat_at < $1` predicate. The dead node matches the
 	// OR clause (active=false) regardless of threshold. Using
-	// time.Now() would race against the SQL clock on slow runners:
-	// pgx's now() resolves at statement start, Go's now() resolves
-	// a few hundred µs later, so `INSERT_now < SELECT_now` was true
-	// and the live row leaked in. Adding 1h is the deterministic
-	// equivalent of "a heartbeat fresher than now" — exactly the
-	// freshness schedd guarantees after a successful heartbeat tick.
+	// time.Now() alone would race against the SQL clock: pgx's
+	// now() resolves at INSERT-statement start, Go's now() resolves
+	// on the client a few hundred µs later, so
+	// `INSERT_now < SELECT_now` was true and the live row leaked
+	// in. Subtracting a minute is the deterministic equivalent of
+	// "a heartbeat older than the staleness window" — exactly the
+	// staleness schedd's MarkComputeNodeInactive flip uses (90 s
+	// default).
 	rows, err := s.ListRunningInstancesOnDeadNodes(ctx,
-		time.Now().UTC().Add(time.Hour), 50)
+		time.Now().UTC().Add(-time.Minute), 50)
 	if err != nil {
 		t.Fatalf("ListRunningInstancesOnDeadNodes: %v", err)
 	}
