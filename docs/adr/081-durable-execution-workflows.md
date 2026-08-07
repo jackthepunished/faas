@@ -190,7 +190,7 @@ fails the step (the run continues if downstream steps have
 `on_error: continue`, otherwise the run is `dead`).
 
 The synthetic-wake RPC is the existing `GatewaySynth.Invoke` on
-`pkg/sched/loop.go:1302-1316` (the cron path crosses the
+`pkg/sched/loop.go:1313` (the cron path crosses the
 schedd→gatewayd boundary through this RPC; the new
 `pkg/sched/dispatch_workflows.go::runWorkflowsTick` calls the
 same interface). This is the **same shape** the future task-queue
@@ -199,7 +199,7 @@ PR (per ADR-080) uses.
 ### 3. DSL is declarative — JSON-shaped `WorkflowSpec` on the deploy DTO
 
 The DSL ships as a sibling JSON field on `CreateDeploymentRequest`
-(mirroring the existing `Sidecars` field at `pkg/api/dto.go:599`).
+(mirroring the existing `Sidecars` field at `pkg/api/dto.go:631`).
 There is no `gregale.yaml` parser today — the existing declarative
 surface is JSON-tagged fields on the deploy DTO. A future
 `gregale.yaml` parser is a possible follow-up (deferred — see
@@ -277,7 +277,7 @@ shape (`cron_limit_per_app` per plan) and the ADR-080 task-queue
 Free-disabled pattern.
 
 The error pair follows the existing cron precedent
-(`pkg/api/errors.go:1240-1252`):
+(`pkg/api/errors.go:1249` for the function, :1183-:1189 for the constants):
 
 - `ErrPlanWorkflowsNotAllowed(p Plan) *Problem` → 402
 - `ErrPlanWorkflowsQuota(p Plan, observed int) *Problem` → 403
@@ -287,7 +287,7 @@ The error pair follows the existing cron precedent
 
 ```go
 // pkg/api/limits.go (named struct fields, NOT [4]int arrays —
-// see pkg/api/limits.go:34 for the Limits struct shape)
+// see pkg/api/limits.go:39 for the Limits struct shape)
 type Limits struct {
     // … existing fields …
     WorkflowMaxConcurrent   int           // concurrent runs per app
@@ -321,7 +321,7 @@ The enforcer per cap:
 ### 7. State machine for `workflow_runs.status` and `workflow_steps.status`
 
 **Two state machines, both Pattern B** (the `InvocationState`
-precedent at `pkg/state/types.go:1294-1317` + SQL CHECK, no Go
+precedent at `pkg/state/types.go:1310` + SQL CHECK, no Go
 transition map — schedd is the only writer, transitions are gated
 by `Store.MarkWorkflow*` methods).
 
@@ -352,7 +352,7 @@ The repo has **no central enum** for audit event kinds (the
 `events.kind` column has no CHECK constraint; kinds are scattered
 across `pkg/events/` and `pkg/audit/`). Two existing patterns:
 
-- `pkg/events/wake.go:34-153` — typed struct constants with a
+- `pkg/events/wake.go:35-160` — typed struct constants with a
   `Kind()` method (canonical for the wake lifecycle).
 - Freeform strings via `pkg/audit.Auditor.Emit` (e.g.
   `cron.fired` at `pkg/sched/loop.go:1650`).
@@ -389,7 +389,7 @@ Hourly cadence + 1m first-fire delay
 `pkg/sched/watchdog.go:51-61`). Wired into `Loop.Run` via a new
 `WithWorkflowRetention(r *WorkflowRetention) *Loop` builder that
 mirrors the existing `WithRetention` slot at
-`pkg/sched/loop.go:90-97`.
+`pkg/sched/loop.go:94`.
 
 Why two windows: the `workflow_runs` rows are the customer-facing
 audit surface (visible in the dashboard); `workflow_events` rows
@@ -432,7 +432,7 @@ Cloud / Inngest / Restate.
   tables (CreateRun, ClaimRun, MarkStep*, RecordEvent,
   AdvanceRun, CancelRun, ListRuns, GetRun).
 - `pkg/events/workflow.go` — 9 typed constants implementing
-  `WorkflowEvent` (mirror `pkg/events/wake.go:34-153`).
+  `WorkflowEvent` (mirror `pkg/events/wake.go:35-160`).
 - `pkg/sched/hostkey.go` — schedd-side X25519 host identity
   loader. **Shared with the future ADR-080 task-queue PR.**
 - `pkg/auth/task_token.go` — `Bearer faas_task_<signed>`
