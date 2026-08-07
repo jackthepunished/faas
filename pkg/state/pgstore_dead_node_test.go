@@ -84,9 +84,12 @@ func pgTestComputeNode(t *testing.T, ctx context.Context, s *state.PgStore, acti
 	return n.ID
 }
 
-// pgTestSeedRunningInstance creates an account + app + RUNNING
-// instance on the given node, mirroring the MemStore test helper
-// in pkg/sched/deadnode_reconciler_test.go.
+// pgTestSeedRunningInstance creates an account + app + deployment +
+// RUNNING instance on the given node. MemStore accepts empty
+// deployment_id and empty wakeID strings; pgstore requires a valid
+// UUID for both (deployment_id is UUID-typed NOT NULL, wakeID is
+// UUID-typed and the SQL binds it as $6::uuid). Mirrors
+// pkg/state/pgstore_coverage_parity_test.go::pgCoverageFixture.
 func pgTestSeedRunningInstance(t *testing.T, ctx context.Context, s *state.PgStore, nodeID string) (string, string) {
 	t.Helper()
 	acct, err := s.CreateAccount(ctx, pgTestEmail(t)+"-"+uuid.NewString(), "hobby")
@@ -100,7 +103,16 @@ func pgTestSeedRunningInstance(t *testing.T, ctx context.Context, s *state.PgSto
 	if _, err := s.CreateApp(ctx, app); err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
-	ins, err := s.CreateInstance(ctx, app.ID, "", string(state.StateRunning), 256, nodeID, "")
+	deployment, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID: app.ID, Kind: state.DeploymentKindImage,
+		ImageDigest: "sha256:" + uuid.NewString(),
+		Status:      state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	ins, err := s.CreateInstance(ctx, app.ID, deployment.ID,
+		string(state.StateRunning), 256, nodeID, uuid.NewString())
 	if err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}

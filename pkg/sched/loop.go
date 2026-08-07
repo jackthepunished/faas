@@ -36,7 +36,7 @@ import (
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-pool               *pgxpool.Pool
+	pool               *pgxpool.Pool
 	engine             *Engine
 	log                *slog.Logger
 	gateway            GatewaySynth
