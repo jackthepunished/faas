@@ -50,6 +50,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/oci"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // alertRuleWebhookSecretBytes is the size of the random plaintext
@@ -73,6 +74,11 @@ const alertRuleSecretSealLabel = "alert_rule_secret"
 // alertRuleFamily so the literal has a single source of truth and
 // goconst stays happy.
 const alertRuleMetricFailedInvocations = "failed_invocations"
+
+// docsTypeBase is the canonical docs path prefix for problem
+// `type:` URLs emitted by the apid alert handlers. Sourced from
+// wire.DocsHost so a rotation only edits pkg/wire/docs.go.
+var docsTypeBase = "https://" + wire.DocsHost + "/problems"
 
 // --- list -------------------------------------------------------------------
 
@@ -843,7 +849,7 @@ func resolveAndCheckEgress(c context.Context, rawURL string) *api.Problem {
 		if !oci.EgressIPAllowed(addr.Unmap()) {
 			return &api.Problem{
 				Status: 403,
-				Type:   "https://docs.gregale.dev/problems/image-egress-denied",
+				Type:   docsTypeBase + "/image-egress-denied",
 				Title:  "Egress denied",
 				Detail: fmt.Sprintf("webhook_url resolves to %s, which is in the egress denylist", ipa.IP),
 				Code:   api.CodeImageEgressDenied,
