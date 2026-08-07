@@ -532,6 +532,13 @@ func cmdDeployTarball(args []string) int {
 	// app <slug> --require-authn`.
 	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
 	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
+	// Issue #556 PR-A: per-deployment traffic-split weight (Pro/Scale
+	// only). Sentinel value -1 = "unset" — `fs.Int` doesn't have a
+	// pointer type, so the explicit `fs.Visit` check below
+	// distinguishes "absent" from "explicit zero". The handler
+	// validates [0, 100] (422) and the plan gate (403) on the
+	// request path; we just thread the pointer through.
+	trafficPercent := fs.Int("traffic-percent", -1, "split weight for this deployment (0-100, Pro/Scale only; -1 = server default 100)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -557,6 +564,17 @@ func cmdDeployTarball(args []string) int {
 	case explicit["no-require-authn"]:
 		v := false
 		requireAuthnPtr = &v
+	}
+	// Issue #556 PR-A: derive the optional traffic_percent pointer.
+	// Sentinel -1 (the default value above) means "absent" — the
+	// handler will default to 100 server-side. Any explicit value
+	// (including 0) is forwarded as-is; the handler validates
+	// [0, 100] (422) and the plan gate (403) on the request path.
+	optTrafficPercent := func(v int) *int {
+		if v < 0 {
+			return nil
+		}
+		return &v
 	}
 	slug := *name
 	if slug == "" {
@@ -794,7 +812,7 @@ func cmdDeployTarball(args []string) int {
 		}
 		return streamDeployLogs(client, dep)
 	}
-	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{Image: *image})
+	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{Image: *image, TrafficPercent: optTrafficPercent(*trafficPercent)})
 	if err != nil {
 		return printErr("Deploy failed", err)
 	}
@@ -875,6 +893,60 @@ func cmdWake(args []string) int {
 	}
 	PrintOK(osStdout, "Waking…")
 	return 0
+}
+
+// cmdTrafficSet implements `gregale traffic set` (issue #556 PR-A).
+// The dispatch from main() splits on the sub-command name: `set`
+// lands here, future sub-commands (status, split) would route
+// alongside. The flag pair is --deployment <id> + --percent N; the
+// client.UpdateDeploymentTraffic method hits PATCH
+// /v1/deployments/{id}/traffic. The handler enforces the plan gate
+// (Pro+ only, 403) and range [0, 100] (422); the CLI just threads
+// the values through and prints the canonical "Set … → N%" OK line.
+//
+// Flag-presence check mirrors --min-instances in cmdApp / cmdAppScale:
+// absent --deployment or --percent fails loud with usage rather
+// than silently PATCHing the wrong row.
+func cmdTrafficSet(args []string) int {
+	fs := flag.NewFlagSet("traffic set", flag.ContinueOnError)
+	deployment := fs.String("deployment", "", "deployment id to set the traffic split on")
+	percent := fs.Int("percent", -1, "traffic weight in [0, 100]; -1 = unset (server default 100)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *deployment == "" || *percent < 0 {
+		PrintUsage(os.Stderr, "usage: gregale traffic set --deployment <id> --percent N", "traffic")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	dep, err := client.PatchDeploymentsIdTraffic(context.Background(), *deployment, *percent)
+	if err != nil {
+		return printErr("Traffic set failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(dep))
+	}
+	PrintOK(osStdout, "Set %s → %d%%", dep.ID, dep.TrafficPercent)
+	return 0
+}
+
+// cmdTraffic dispatches the `traffic` sub-command. PR-A wires the
+// `set` leaf; `status` is a follow-up that re-uses the same DTO.
+func cmdTraffic(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale traffic <set|status> [args]", "traffic")
+		return 1
+	}
+	switch args[0] {
+	case "set":
+		return cmdTrafficSet(args[1:])
+	default:
+		PrintUsage(os.Stderr, "usage: gregale traffic <set|status> [args]", "traffic")
+		return 1
+	}
 }
 
 // cmdDomains dispatches list/add/rm. Adding prints the TXT record the

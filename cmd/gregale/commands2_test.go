@@ -272,6 +272,81 @@ func TestCmdAppPublicAuth_ParsesAndForwards(t *testing.T) {
 	})
 }
 
+// TestCmdTrafficSet_BasicFlow (issue #556 PR-A) is the wire-level
+// CLI check for `gregale traffic set --deployment <id> --percent N`.
+// Pins:
+//  1. CLI dispatches to cmdTrafficSet.
+//  2. PATCH /v1/deployments/{id}/traffic is called with the
+//     canonical body shape ({"traffic_percent": N}).
+//  3. The 200 response renders as the canonical "Set … → N%" line.
+func TestCmdTrafficSet_BasicFlow(t *testing.T) {
+	const wantDepID = "0123456789abcdef0123456789abcdef"
+	const wantPercent = 25
+	var hits int32
+	var gotMethod, gotPath, gotBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSONTest(w, api.DeploymentResponse{
+			ID:            wantDepID,
+			AppID:         "app-id",
+			TrafficPercent: wantPercent,
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_test_x")
+
+	if code := cmdTrafficSet([]string{"--deployment", wantDepID, "--percent", itoaForCli(wantPercent)}); code != 0 {
+		t.Fatalf("cmdTrafficSet exit = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("PATCH hit count = %d, want 1", hits)
+	}
+	if gotMethod != "PATCH" {
+		t.Errorf("method = %q, want PATCH", gotMethod)
+	}
+	if gotPath != "/v1/deployments/"+wantDepID+"/traffic" {
+		t.Errorf("path = %q, want /v1/deployments/%s/traffic", gotPath, wantDepID)
+	}
+	wantBody := `{"traffic_percent":25}`
+	if gotBody != wantBody {
+		t.Errorf("body = %q, want %q", gotBody, wantBody)
+	}
+}
+
+// TestCmdTrafficSet_MissingArgs (issue #556 PR-A) pins the CLI's
+// flag-presence contract. The subcommand must reject missing
+// --deployment or --percent before any HTTP round-trip — the
+// existing TestCmdAppFlagSentinels / TestCmdAppPublicAuth patterns
+// treat this as a CLI-side correctness check.
+func TestCmdTrafficSet_MissingArgs(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_test_x")
+
+	// Missing --percent.
+	if code := cmdTrafficSet([]string{"--deployment", "x"}); code == 0 {
+		t.Errorf("missing --percent exit = 0, want non-zero")
+	}
+	// Missing --deployment.
+	if code := cmdTrafficSet([]string{"--percent", "50"}); code == 0 {
+		t.Errorf("missing --deployment exit = 0, want non-zero")
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Errorf("server was hit %d times; CLI must short-circuit before HTTP", hits)
+	}
+}
+
 // itoaForCli is a tiny local helper for the Hobby-rejects test so the
 // file doesn't depend on strconv (matches the apid test's itoa style).
 func itoaForCli(n int) string {

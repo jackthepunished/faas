@@ -678,6 +678,25 @@ func (c *Client) Rollback(ctx context.Context, slug string) (DeploymentResponse,
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
 }
 
+// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+// weight (issue #556 PR-A). percent must be in [0, 100]; the
+// handler enforces the range (422) and the plan gate (403,
+// Pro/Scale only). PR-A semantics: zeroing sibling live rows so
+// Σ over the app's live rows stays 100 by construction. The
+// returned DTO carries the refreshed TrafficPercent field.
+//
+// Method name matches the OpenAPI operationId-derived SDK alias
+// `PatchDeploymentsIdTraffic` (cmd/sdk-coverage derives names via
+// `<Method><PathSegments>` — PATCH /v1/deployments/{id}/traffic
+// becomes `PatchDeploymentsIdTraffic`). The PascalCase name
+// matches the route's verb path, which is how the generated SDK
+// names align.
+func (c *Client) PatchDeploymentsIdTraffic(ctx context.Context, id string, percent int) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "PATCH", "/v1/deployments/"+id+"/traffic",
+		UpdateDeploymentTrafficRequest{TrafficPercent: percent}, &out)
+}
+
 // Park and Wake toggle the app between cold-parked and live.
 func (c *Client) Park(ctx context.Context, slug string) error {
 	return c.do(ctx, "POST", "/v1/apps/"+slug+"/park", nil, nil)

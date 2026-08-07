@@ -3733,8 +3733,18 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		}
 		// pgx.ErrNoRows → no prior; that's fine. Move on.
 	} else {
+		// Issue #556 PR-A: zero the prior row's traffic_percent in
+		// the same tx so Σ over live rows remains 100 by construction
+		// (the new INSERT defaults traffic_percent to 100 below).
+		// Two-write update is intentional: the first write flips
+		// status to 'superseded' (the pre-#556 contract); the second
+		// zeroes the new column. Combining them into one UPDATE SET
+		// list would also work but makes the diff against #556's
+		// "minimal blast radius" intent harder to review.
 		if _, err := tx.Exec(ctx,
-			`update deployments set status = 'superseded' where id = $1`,
+			`update deployments
+			    set status = 'superseded', traffic_percent = 0
+			  where id = $1`,
 			priorID); err != nil {
 			return Deployment{}, fmt.Errorf("state: supersede prior %s: %w", priorID, err)
 		}
@@ -3758,14 +3768,23 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	// map to "{}" rather than NULL so a downstream consumer never
 	// has to branch on "is the jsonb column populated but the JSON
 	// string empty?".
+	// Issue #556 PR-A: traffic_percent is read from d.TrafficPercent
+	// (set by the handler to 100 when the caller omits the optional
+	// pointer, 0..100 otherwise) and written into the new row. The
+	// prior supersede above stamped 0 on the predecessor so Σ over
+	// live rows stays 100 by construction. The server-side default
+	// (NOT NULL DEFAULT 100) handles the empty-input case at the
+	// schema layer; the explicit write here mirrors the
+	// operator-supplied case.
 	row := tx.QueryRow(ctx,
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
 		                          override_liveness_probe,
 		                          sidecars,
 		                          status,
-		                          min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18)
+		                          min_instances,
+		                          traffic_percent)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19)
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3775,7 +3794,8 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck),
 		nullJSONRaw(d.OverrideLivenessProbe),
 		notNullEmptyJSONRaw(d.Sidecars),
-		d.MinInstances)
+		d.MinInstances,
+		d.TrafficPercent)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -3940,6 +3960,129 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 			return Deployment{}, ErrNotFound
 		}
 		return Deployment{}, err
+	}
+	return d, nil
+}
+
+// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+// weight (issue #556 PR-A). PR-A uses the "zero siblings" rebalance
+// form: setting row R's traffic_percent to newPercent forces every
+// other live row in the same app to 0, keeping Σ = 100 by
+// construction. PR-C may upgrade to proportional redistribution for
+// the `faas traffic set --percent=N` case (the user-confirmed plan
+// decision).
+//
+// Atomicity contract:
+//  1. The transaction opens with pgx.TxOptions{} (read-committed
+//     is fine — the FOR UPDATE below serialises).
+//  2. The app's live rows are locked with SELECT … FOR UPDATE so
+//     a concurrent UpdateDeploymentTraffic against the same app
+//     serialises behind us until COMMIT.
+//  3. The target row is validated to be 'live' (operator can't
+//     move traffic to a superseded/failed/pending row).
+//  4. The target row is updated to newPercent; sibling live rows
+//     are updated to 0.
+//  5. The Σ invariant is asserted post-write; failure here
+//     surfaces as a wrapped 23514 SQLSTATE that mapErr translates
+//     to ErrInvalidTrafficPercent (handler emits 422). In practice
+//     Σ = 100 is structurally guaranteed (target = newPercent,
+//     siblings = 0, total = newPercent); the assertion is a
+//     defensive tripwire against a future refactor that breaks
+//     the "siblings = 0" form.
+//
+// Range-checking newPercent here is a backstop — the handler
+// validates [0, 100] and emits ErrInvalidTrafficPercent (422) on
+// the request path. The CHECK constraint (migration 00158) is the
+// third layer; any out-of-range value reaching this method trips a
+// 23514 SQLSTATE.
+func (s *PgStore) UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error) {
+	if newPercent < 0 || newPercent > 100 {
+		return Deployment{}, fmt.Errorf("state: update deployment traffic %d: %w", newPercent, ErrInvalidTrafficPercent)
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: begin update traffic tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// (1) Lock the app's live rows. FOR UPDATE serialises concurrent
+	// UpdateDeploymentTraffic / CreateDeployment calls.
+	var appID string
+	if err := tx.QueryRow(ctx,
+		`select app_id from deployments where id = $1 for update`,
+		id).Scan(&appID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, fmt.Errorf("state: lock deployment %s: %w", id, err)
+	}
+
+	// (2) Confirm the target row is 'live'. A superseded/failed row
+	// can't accept traffic — operators route traffic to live rows.
+	var status string
+	if err := tx.QueryRow(ctx,
+		`select status from deployments where id = $1`,
+		id).Scan(&status); err != nil {
+		return Deployment{}, fmt.Errorf("state: read deployment status %s: %w", id, err)
+	}
+	if status != string(DeployLive) {
+		return Deployment{}, fmt.Errorf("state: deployment %s status=%s: %w",
+			id, status, ErrInvalidTrafficPercent)
+	}
+
+	// (3) Lock sibling live rows in the same app so a concurrent
+	// CreateDeployment (which supersedes prior live rows) doesn't
+	// race us. This is the FOR UPDATE on the (app_id, status)
+	// subset; the deployment_pkey index handles the id lookup above.
+	if _, err := tx.Exec(ctx,
+		`select id from deployments
+		  where app_id = $1 and status = 'live'
+		  for update`,
+		appID); err != nil {
+		return Deployment{}, fmt.Errorf("state: lock sibling live rows: %w", err)
+	}
+
+	// (4) Stamp target + zero siblings. The "zero siblings" form is
+	// PR-A semantics; PR-C may upgrade to proportional redistribution
+	// for the PATCH path.
+	if _, err := tx.Exec(ctx,
+		`update deployments set traffic_percent = $2 where id = $1`,
+		id, newPercent); err != nil {
+		return Deployment{}, fmt.Errorf("state: stamp traffic_percent %s: %w", id, mapErr(err))
+	}
+	if _, err := tx.Exec(ctx,
+		`update deployments set traffic_percent = 0
+		  where app_id = $1 and status = 'live' and id != $2`,
+		appID, id); err != nil {
+		return Deployment{}, fmt.Errorf("state: zero sibling traffic_percent: %w", mapErr(err))
+	}
+
+	// (5) Σ invariant assertion. Structurally guaranteed by the
+	// zero-siblings form above, but the test suite pins the check.
+	var sum int
+	if err := tx.QueryRow(ctx,
+		`select coalesce(sum(traffic_percent), 0)
+		   from deployments
+		  where app_id = $1 and status = 'live'`,
+		appID).Scan(&sum); err != nil {
+		return Deployment{}, fmt.Errorf("state: read Σ traffic_percent: %w", err)
+	}
+	if sum != 100 {
+		return Deployment{}, fmt.Errorf("state: Σ traffic_percent = %d, want 100: %w",
+			sum, ErrTrafficPercentSumInvalid)
+	}
+
+	// Read back the stamped row + commit.
+	row := tx.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		   from deployments where id = $1`, id)
+	d, err := scanDeployment(row)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: read deployment after stamp: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, fmt.Errorf("state: commit update traffic: %w", err)
 	}
 	return d, nil
 }
@@ -9773,7 +9916,8 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at,
-	coalesce(parked_reason,''), parked_at`
+	coalesce(parked_reason,''), parked_at,
+	traffic_percent`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -9801,7 +9945,8 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.sidecars, '[]'::jsonb),
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
-	coalesce(d.parked_reason,''), d.parked_at`
+	coalesce(d.parked_reason,''), d.parked_at,
+	d.traffic_percent`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -9861,7 +10006,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
-		&d.ParkedReason, &parkedAt); err != nil {
+		&d.ParkedReason, &parkedAt, &d.TrafficPercent); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {

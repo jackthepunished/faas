@@ -70,5 +70,9 @@ export type DeploymentResponse = {
    * Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for never-parked deployments.
    */
   parked_at?: string | null;
+  /**
+   * Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by construction.
+   */
+  traffic_percent?: number;
 };
 

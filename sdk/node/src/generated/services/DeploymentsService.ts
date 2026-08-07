@@ -7,6 +7,7 @@ import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
 import type { ScanResult } from '../models/ScanResult.js';
+import type { UpdateDeploymentTrafficRequest } from '../models/UpdateDeploymentTrafficRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -217,6 +218,65 @@ export class DeploymentsService {
         but the parent app's plan refuses the override (e.g. a
         Free app PATCHing \`min_instances=1\`). Stable code
         \`plan_min_instances_not_allowed\`.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Set the per-deployment traffic-split weight.
+   * Update the deployment's traffic_percent (issue #556 PR-A).
+   * PR-A uses the zero-siblings rebalance form: setting row R's
+   * traffic_percent to N forces every other live row in the same
+   * app to 0, keeping Σ = 100 by construction. Pro/Scale only —
+   * Free/Hobby are rejected at 403 `plan_traffic_split_not_allowed`.
+   * Range-check [0, 100] is enforced at the handler (422
+   * `invalid_traffic_percent`). The Σ invariant is asserted
+   * post-write as a defensive backstop (409
+   * `traffic_percent_sum_invalid`) — structurally unreachable
+   * with zero-siblings, but pinned by the test suite.
+   *
+   * @returns DeploymentResponse The updated deployment.
+   * @throws ApiError
+   */
+  public static updateDeploymentTraffic({
+    id,
+    requestBody,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+    requestBody: UpdateDeploymentTrafficRequest,
+  }): CancelablePromise<DeploymentResponse> {
+    return __request(OpenAPI, {
+      method: 'PATCH',
+      url: '/v1/deployments/{id}/traffic',
+      path: {
+        'id': id,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `\`400 Bad Request\` — request body failed JSON decode.
+        `,
+        401: `code: unauthorized`,
+        403: `\`403 Forbidden\` — the account's plan refuses traffic
+        splitting (Free / Hobby). Stable code
+        \`plan_traffic_split_not_allowed\`.
+        `,
+        404: `code: not_found`,
+        409: `\`409 Conflict\` — post-write Σ invariant check tripped.
+        Structurally unreachable with the zero-siblings rebalance
+        form, but pinned by the test suite as a defensive
+        backstop against future refactors.
+        `,
+        422: `\`422 Unprocessable Entity\` — \`traffic_percent\` was
+        outside the inclusive \`[0, 100]\` range. Stable code
+        \`invalid_traffic_percent\`.
         `,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).

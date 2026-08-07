@@ -76,6 +76,7 @@ Commands:
   slo          Per-app SLO panel (gregale slo <slug> [--window 24h])
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
+  traffic      Manage deployment traffic split (issue #556; Pro/Scale only)
   trusted-publishers  Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
   usage        Show this month's usage (gregale usage [--month YYYY-MM]|daily [--day YYYY-MM-DD]|storage [--day YYYY-MM-DD]|summary)
   version      Print the CLI version
@@ -195,6 +196,8 @@ func run(args []string) int {
 		return cmdPark(args[1:])
 	case "wake":
 		return cmdWake(args[1:])
+	case "traffic":
+		return cmdTraffic(args[1:])
 	case "domains":
 		return cmdDomains(args[1:])
 	case "crons":

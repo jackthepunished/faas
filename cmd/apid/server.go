@@ -789,6 +789,14 @@ func (s *server) handler() http.Handler {
 	// field is the floor; image / digest / overrides / sidecars stay
 	// immutable post-create).
 	mux.HandleFunc("PATCH /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentMinInstances))))
+	// Issue #556 PR-A — PATCH the per-deployment traffic-split
+	// weight. Dedicated route (not a sibling field on the
+	// /v1/deployments/{id} PATCH) because the request shape differs
+	// (traffic_percent mandatory) and the plan gate is Pro+ only.
+	// Same deploy-write scope; the row mutation is at least as
+	// powerful as the min_instances PATCH (Σ rebalance affects
+	// sibling live rows in the same app).
+	mux.HandleFunc("PATCH /v1/deployments/{id}/traffic", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentTraffic))))
 	// Builds (ADR-038). The provenance route is the only /v1/builds
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.
