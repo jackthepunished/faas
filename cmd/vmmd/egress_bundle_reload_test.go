@@ -53,7 +53,10 @@ func silentSighupLogger() *slog.Logger {
 
 // TestWatchEgressBundleReload_HupAppliesNewBundle verifies the
 // happy path: write a bundle file, send SIGHUP, observe the
-// stub's CIDRs reflect the file contents.
+// stub's CIDRs reflect the file contents. The watcher also
+// performs an initial load at startup (ADR-081 / PR-A contract:
+// "startup AND on SIGHUP"), so the call count is 2 here:
+// startup-load + SIGHUP-load.
 func TestWatchEgressBundleReload_HupAppliesNewBundle(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "operator_allowlist.toml")
@@ -68,21 +71,16 @@ func TestWatchEgressBundleReload_HupAppliesNewBundle(t *testing.T) {
 
 	go watchEgressBundleReload(ctx, stub, path, silentSighupLogger(), hup)
 
-	// Initial signal: applies the as-written bundle.
-	hup <- syscall.SIGHUP
+	// Wait for the goroutine's startup load to land.
+	waitForCalls(t, stub, 1, 2*time.Second)
 
-	// Wait for the goroutine to drain the call.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, calls := stub.snapshot(); calls > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// SIGHUP re-applies the same bundle (refines). Second call.
+	hup <- syscall.SIGHUP
+	waitForCalls(t, stub, 2, 2*time.Second)
 
 	got, calls := stub.snapshot()
-	if calls != 1 {
-		t.Fatalf("calls = %d, want 1", calls)
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 (startup + SIGHUP)", calls)
 	}
 	if len(got) != 2 {
 		t.Fatalf("cidrs len = %d, want 2; got=%v", len(got), got)
@@ -98,8 +96,44 @@ func TestWatchEgressBundleReload_HupAppliesNewBundle(t *testing.T) {
 	}
 }
 
+// TestWatchEgressBundleReload_StartupLoadWithoutSighup pins
+// the "startup AND on SIGHUP" contract: a fresh watcher applies
+// the bundle from the file at startup WITHOUT needing a SIGHUP.
+// This is the bug fix for PR #723 review finding #1 — pre-fix,
+// the watcher only acted on SIGHUP, so a fresh vmmd with a
+// configured bundle sat empty until an operator manually
+// HUP'd.
+func TestWatchEgressBundleReload_StartupLoadWithoutSighup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "operator_allowlist.toml")
+	if err := os.WriteFile(path, []byte(`cidrs = ["203.0.113.0/24"]`+"\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	stub := &stubEgressBundleTarget{}
+	hup := make(chan os.Signal, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go watchEgressBundleReload(ctx, stub, path, silentSighupLogger(), hup)
+
+	waitForCalls(t, stub, 1, 2*time.Second)
+
+	got, calls := stub.snapshot()
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (startup load, no SIGHUP required)", calls)
+	}
+	if len(got) != 1 {
+		t.Fatalf("cidrs len = %d, want 1; got=%v", len(got), got)
+	}
+	if got[0] != netip.MustParsePrefix("203.0.113.0/24") {
+		t.Errorf("cidrs[0] = %s, want 203.0.113.0/24", got[0])
+	}
+}
+
 // TestWatchEgressBundleReload_MultipleHups verifies a second
-// signal picks up the file's new contents.
+// signal picks up the file's new contents. 3 calls total: startup
+// + 2 SIGHUPs.
 func TestWatchEgressBundleReload_MultipleHups(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "operator_allowlist.toml")
@@ -117,19 +151,23 @@ func TestWatchEgressBundleReload_MultipleHups(t *testing.T) {
 
 	go watchEgressBundleReload(ctx, stub, path, silentSighupLogger(), hup)
 
-	hup <- syscall.SIGHUP
+	// Startup load.
 	waitForCalls(t, stub, 1, 2*time.Second)
 
-	// Overwrite the file with a different bundle.
+	// Overwrite the file with a different bundle, then SIGHUP.
 	if err := os.WriteFile(path, []byte(`cidrs = ["10.0.0.0/8", "192.0.2.0/24"]`+"\n"), 0o400); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	hup <- syscall.SIGHUP
 	waitForCalls(t, stub, 2, 2*time.Second)
+	// Second SIGHUP — file is unchanged, but the watcher still
+	// re-loads. Call count = 3.
+	hup <- syscall.SIGHUP
+	waitForCalls(t, stub, 3, 2*time.Second)
 
 	got, calls := stub.snapshot()
-	if calls != 2 {
-		t.Fatalf("calls = %d, want 2", calls)
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3 (startup + 2 SIGHUPs)", calls)
 	}
 	if len(got) != 2 {
 		t.Fatalf("cidrs len = %d, want 2; got=%v", len(got), got)
@@ -175,6 +213,8 @@ func TestWatchEgressBundleReload_EmptyPathDisablesGoroutine(t *testing.T) {
 // pins the "best-effort reload" contract: a failed reload
 // leaves the prior bundle live (the watcher does NOT call
 // SetEgressOperatorBundle with an empty slice on parse error).
+// The startup load here succeeds, then a SIGHUP-triggered
+// reload fails on a corrupted file — the prior bundle stays.
 func TestWatchEgressBundleReload_MalformedTomlKeepsPriorBundle(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "operator_allowlist.toml")
@@ -191,7 +231,7 @@ func TestWatchEgressBundleReload_MalformedTomlKeepsPriorBundle(t *testing.T) {
 
 	go watchEgressBundleReload(ctx, stub, path, silentSighupLogger(), hup)
 
-	hup <- syscall.SIGHUP
+	// Startup load succeeds.
 	waitForCalls(t, stub, 1, 2*time.Second)
 
 	// Now corrupt the file.
@@ -204,13 +244,41 @@ func TestWatchEgressBundleReload_MalformedTomlKeepsPriorBundle(t *testing.T) {
 
 	got, calls := stub.snapshot()
 	if calls != 1 {
-		t.Errorf("calls = %d, want 1 (malformed TOML = no set call)", calls)
+		t.Errorf("calls = %d, want 1 (malformed TOML = no set call beyond startup)", calls)
 	}
 	if len(got) != 1 {
 		t.Fatalf("cidrs len = %d, want 1 (prior bundle preserved); got=%v", len(got), got)
 	}
 	if got[0] != netip.MustParsePrefix("203.0.113.0/24") {
 		t.Errorf("cidrs[0] = %s, want 203.0.113.0/24", got[0])
+	}
+}
+
+// TestWatchEgressBundleReload_StartupMalformedTomlKeepsEmpty
+// pins the startup-load path's "best-effort" sibling: a
+// malformed vmmd.toml EgressOperatorAllowlist on a fresh boot
+// must NOT crash vmmd nor block startup. The watcher logs a
+// Warn and the manager bundle stays empty (Call count = 0).
+func TestWatchEgressBundleReload_StartupMalformedTomlKeepsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "operator_allowlist.toml")
+	if err := os.WriteFile(path, []byte("this is = not [valid toml"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	stub := &stubEgressBundleTarget{}
+	hup := make(chan os.Signal, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go watchEgressBundleReload(ctx, stub, path, silentSighupLogger(), hup)
+
+	// Give the startup-load a beat to attempt + fail.
+	time.Sleep(200 * time.Millisecond)
+
+	_, calls := stub.snapshot()
+	if calls != 0 {
+		t.Errorf("calls = %d, want 0 (malformed startup = no set call)", calls)
 	}
 }
 

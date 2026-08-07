@@ -57,27 +57,40 @@ family). The merged slice MUST partition cleanly by
 renderer does.
 
 **Wake path** (`pkg/fcvm/manager.go`, after the per-request
-ParsePrefix loop at line 1900-1912): append
-`m.operatorBundleSnapshot()` to `nc.EgressAllowlist`. Order
-matters: per-app first so an admin-set entry stays in its
-expected position when the renderer's family partition reads the
-slice.
+ParsePrefix loop at line 1900-1912): cache the per-app slice
+in `m.perAppAllowlist[req.AppID]` BEFORE the merge, then append
+`m.operatorBundleSnapshot()` to `nc.EgressAllowlist`. Per-app
+first so the renderer family partition reads the slice in the
+authoritative order. The per-app cache is the only place the
+un-augmented slice survives a SIGHUP-driven operator-bundle
+change — without it, `SetEgressOperatorBundle` would have to
+recover the per-app slice from `inst.Net.EgressAllowlist`, which
+is the merged slice, and would re-merge the previous operator
+bundle on top of the new one (operators could not subtract
+reachability).
 
 **Live-patch path** (`pkg/fcvm/manager.go::UpdateEgressAllowlist`):
-the per-app PATCH receives the per-app slice but the manager
-injects the operator bundle before rendering. The `samePrefixSet`
-fast-path at the top of the patch helper must compare the
-**merged** slice against the live netns state — otherwise a
-bundle change won't converge without a wake cycle.
+the per-app PATCH receives the per-app slice; the manager
+caches it (same key as Wake), then injects the operator bundle
+before rendering. The `samePrefixSet` fast-path at the top of
+the patch helper compares the **merged** slice against the live
+netns state — the cached `inst.Net.EgressAllowlist` is the
+merged slice (Wake stamps it), so merged-vs-merged is the
+correct comparison. A subsequent bundle change calls
+`SetEgressOperatorBundle` which reads the per-app cache and
+re-issues `UpdateEgressAllowlist` per appID.
 
 **SIGHUP handler** (`cmd/vmmd/main.go`): the wire layer already
 wires a SIGHUP-driven log-level reload in `pkg/wire/daemon.go`
 (`watchLogLevelReload`). The egress watcher follows the same
 shape — a dedicated goroutine in `cmd/vmmd/main.go` registered
-via `signal.Notify(hupCh, syscall.SIGHUP)`. A failed reload
-keeps the prior bundle live (best-effort; the daemon never
-refuses to keep running on a bundle error — a missing or
-malformed bundle just means the operator bundle is empty).
+via `signal.Notify(hupCh, syscall.SIGHUP)`. The watcher
+performs an **initial load at startup** (before the for-loop)
+so a fresh vmmd with a configured bundle installs before any
+Wake observes an empty operatorBundle. A failed startup load
+logs a Warn and leaves the manager bundle empty (the daemon
+never refuses to start on a bundle error). A failed SIGHUP
+reload keeps the prior bundle live (best-effort).
 
 ## Trust boundary
 

@@ -559,6 +559,21 @@ type Manager struct {
 	// merge is a no-op, matching today's behaviour.
 	operatorBundle   []netip.Prefix
 	operatorBundleMu sync.RWMutex
+	// perAppAllowlist (issue #679 / PR-A) is the per-app
+	// POST/PATCH-written egress slice, keyed by appID. The Wake
+	// and UpdateEgressAllowlist paths write here BEFORE the
+	// operator-bundle merge so SetEgressOperatorBundle can read
+	// the authoritative per-app slice on a subsequent bundle
+	// reload (otherwise reading inst.Net.EgressAllowlist would
+	// re-merge the previous operator bundle on top of the new
+	// one, breaking operator subtraction). The map is purely
+	// an authoritative-read cache; the rendered / live netns
+	// state still lives in inst.Net.EgressAllowlist.
+	perAppAllowlist map[string][]netip.Prefix
+	// perAppAllowlistMu guards perAppAllowlist. Held briefly
+	// for read-then-set; the Wake path is the only writer in
+	// the steady-state (UpdateEgressAllowlist also writes).
+	perAppAllowlistMu sync.RWMutex
 }
 
 // NewManager wires a Manager. fcVersion is the running Firecracker version (used
@@ -1920,6 +1935,22 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			nc.EgressAllowlist = append(nc.EgressAllowlist, prefix)
 		}
 	}
+	// Issue #679 / PR-A: cache the per-app slice BEFORE the
+	// operator-bundle merge so SetEgressOperatorBundle can read
+	// the authoritative per-app set on a subsequent bundle
+	// reload. The merge happens after this snapshot; the
+	// per-app cache is the only place the unaugmented slice
+	// survives a SIGHUP-driven operator-bundle change.
+	if req.AppID != "" {
+		m.perAppAllowlistMu.Lock()
+		if m.perAppAllowlist == nil {
+			m.perAppAllowlist = make(map[string][]netip.Prefix)
+		}
+		perAppSnapshot := make([]netip.Prefix, len(nc.EgressAllowlist))
+		copy(perAppSnapshot, nc.EgressAllowlist)
+		m.perAppAllowlist[req.AppID] = perAppSnapshot
+		m.perAppAllowlistMu.Unlock()
+	}
 	// Issue #679 / PR-A: merge the operator-managed egress
 	// bundle into the per-app slice before render. The bundle
 	// is loaded at vmmd startup + SIGHUP-reload; nil/empty is
@@ -2619,10 +2650,20 @@ func (m *Manager) operatorBundleSnapshot() []netip.Prefix {
 // + applyOneInstancePatch code path.
 //
 // cidrs MUST already be sorted + dedup'd — the loader
-// (pkg/vmmd/egress_bundle.go::LoadEgressBundle) is
+// (cmd/vmmd/egress_bundle.go::LoadEgressBundle) is
 // responsible. Empty slice reverts each netns to its per-app
 // slice (the merge becomes a no-op; if prior was merged, patch
-// with just per-app).
+// with just per-app). Operators can ALWAYS subtract reachability
+// by editing the bundle file to remove a CIDR and SIGHUPing.
+//
+// The per-app slice is read from m.perAppAllowlist (the
+// authoritative cache populated by Wake and UpdateEgressAllowlist
+// BEFORE the operator-bundle merge). Reading from
+// inst.Net.EgressAllowlist would re-merge the previous operator
+// bundle on top of the new one — wrong — so the per-app cache is
+// the only correct source. Apps that have never been seen by
+// Wake (AppID == "" instances) are skipped; they don't have a
+// per-app slice to merge with.
 //
 // nil-safe on m (a Manager constructed without ever calling
 // SetEgressOperatorBundle takes the empty path → noop for
@@ -2632,39 +2673,22 @@ func (m *Manager) SetEgressOperatorBundle(cidrs []netip.Prefix) {
 	m.operatorBundle = cidrs
 	m.operatorBundleMu.Unlock()
 
-	if len(m.live) == 0 {
+	// Snapshot the authoritative per-app slice map under a
+	// single read-lock acquisition. One lock, no per-appID
+	// re-entry.
+	m.perAppAllowlistMu.RLock()
+	perAppByID := make(map[string][]netip.Prefix, len(m.perAppAllowlist))
+	for appID, slice := range m.perAppAllowlist {
+		cp := make([]netip.Prefix, len(slice))
+		copy(cp, slice)
+		perAppByID[appID] = cp
+	}
+	m.perAppAllowlistMu.RUnlock()
+
+	if len(perAppByID) == 0 {
 		return
 	}
-	// Group live instances by app_id; one UpdateEgressAllowlist
-	// call per app forces the right diff path. The wire-shape
-	// allowlist arg IS the per-app slice; the merge happens
-	// inside the call below.
-	m.mu.Lock()
-	byApp := make(map[string]struct{}, len(m.live))
-	for id, inst := range m.live {
-		if inst.AppID == "" {
-			continue
-		}
-		byApp[inst.AppID] = struct{}{}
-		_ = id
-	}
-	m.mu.Unlock()
-	for appID := range byApp {
-		// Read each instance's per-app allowlist from its
-		// cached netns.Config under m.mu (the Wake path
-		// stamps inst.Net.EgressAllowlist with the per-app
-		// slice alone; the operator merge hasn't been
-		// persisted there). Pull them now and dispatch.
-		m.mu.Lock()
-		var perApp []netip.Prefix
-		for _, inst := range m.live {
-			if inst.AppID == appID {
-				perApp = make([]netip.Prefix, len(inst.Net.EgressAllowlist))
-				copy(perApp, inst.Net.EgressAllowlist)
-				break
-			}
-		}
-		m.mu.Unlock()
+	for appID, perApp := range perAppByID {
 		if err := m.UpdateEgressAllowlist(context.Background(), appID, perApp); err != nil {
 			m.log.Warn("fcvm: SetEgressOperatorBundle patch failed; live netns may be stale until next reconcile",
 				"app_id", appID, "err", err)
@@ -2771,6 +2795,23 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 	if appID == "" {
 		return fmt.Errorf("fcvm: UpdateEgressAllowlist: empty app_id")
 	}
+	// Issue #679 / PR-A: cache the per-app slice BEFORE the
+	// operator-bundle merge so SetEgressOperatorBundle can read
+	// the authoritative per-app set on a subsequent bundle
+	// reload. Without this, the only place to recover the
+	// per-app slice is inst.Net.EgressAllowlist, which is the
+	// merged slice (Wake stamps it at line 1940) and would
+	// re-merge the previous operator bundle on top of the new
+	// one — operators could not subtract reachability.
+	m.perAppAllowlistMu.Lock()
+	if m.perAppAllowlist == nil {
+		m.perAppAllowlist = make(map[string][]netip.Prefix)
+	}
+	cp := make([]netip.Prefix, len(allowlist))
+	copy(cp, allowlist)
+	m.perAppAllowlist[appID] = cp
+	m.perAppAllowlistMu.Unlock()
+
 	// Issue #679 / PR-A: merge the operator-managed egress
 	// bundle into the per-app slice before the per-instance
 	// argv build. The cached `prior` (read from

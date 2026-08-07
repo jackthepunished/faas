@@ -130,6 +130,21 @@ func watchEgressBundleReload(ctx context.Context, mgr egressBundleTarget, path s
 		log.Debug("vmmd: egress bundle reload disabled (no path configured)")
 		return
 	}
+	// ADR-081 / PR-A contract: "startup AND on SIGHUP". The
+	// startup load MUST happen at the top of the watcher so a
+	// fresh vmmd with a non-empty operator bundle installs
+	// before any Wake observes an empty operatorBundle. A
+	// missing file is not an error (loader returns zero-value
+	// bundle); a malformed file is Warned and the manager
+	// bundle stays empty rather than refusing to start.
+	if bundle, err := LoadEgressBundle(path, log); err != nil {
+		log.Warn("vmmd: egress bundle startup load failed; running with empty operator bundle",
+			"path", path, "err", err)
+	} else {
+		mgr.SetEgressOperatorBundle(bundle.CIDRs)
+		log.Info("vmmd: egress bundle loaded at startup",
+			"path", path, "cidrs", len(bundle.CIDRs))
+	}
 	for {
 		select {
 		case <-ctx.Done():
