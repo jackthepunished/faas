@@ -119,6 +119,20 @@ type Config struct {
 	// "hung imaged + orphan mount" window bounded without burning
 	// CPU on idle fleets.
 	ParentSweepInterval time.Duration `toml:"parent_sweep_interval"`
+
+	// EgressOperatorAllowlist is the path to a TOML file vmmd
+	// reads at startup AND on SIGHUP (issue #679 / PR-A). Every
+	// CIDR in the file is additive to every tenant's
+	// apps.egress_allowlist — operators can ONLY ADD
+	// reachability, never subtract. Empty disables the bundle
+	// (default — preserves today's behaviour). vmmd issues a
+	// Warn at startup if the path is set but the file does
+	// not exist (operator may have misconfigured the path).
+	//
+	// See pkg/vmmd/egress_bundle.go for the bundle loader and
+	// /etc/faas/egress/operator_allowlist.toml for the on-disk
+	// shape.
+	EgressOperatorAllowlist string `toml:"egress_operator_allowlist"`
 }
 
 // ComputeNodeConfig is the [compute_node] TOML section. Field naming
