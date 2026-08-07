@@ -294,6 +294,6 @@ var _ = math.NaN
 var _ = strings.Contains
 var _ = io.Discard
 var _ slog.Handler = slog.NewTextHandler(io.Discard, nil)
-var _ = fcvm.ParentCgroup
+var _ = fcvm.ParentCgroupRoot
 var _ state.Store
 var _ *wire.OpsMetrics
