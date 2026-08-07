@@ -589,7 +589,7 @@ func cmdAppRename(slug, newSlug string) int {
 // switch stays small.
 func cmdAppDispatch(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale app <slug> [scale|rename <new>|--ram N|--max-concurrency N|--idle SEC|--min N]", "apps")
+		PrintUsage(os.Stderr, "usage: gregale app <slug> [scale|rename <new>|security [--require-signed=true|false]|--ram N|--max-concurrency N|--idle SEC|--min N]", "apps")
 		return 1
 	}
 	slug := args[0]
@@ -603,6 +603,8 @@ func cmdAppDispatch(args []string) int {
 				return 1
 			}
 			return cmdAppRename(slug, args[2])
+		case subSecurity:
+			return cmdAppSecurity(args[2:])
 		}
 	}
 	// Backwards-compat: legacy flag-form dispatch is the existing cmdApp.

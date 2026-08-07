@@ -39,6 +39,7 @@ import (
 	"strings"
 
 	"github.com/onebox-faas/faas/cmd/gregale/templates"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // initCmdUsage is the top-of-failure-line shown for `gregale init` errors.
@@ -112,7 +113,7 @@ func runCmdInitList(stdout io.Writer) int {
 			_, _ = fmt.Fprintf(stdout, "  %s\n", n)
 		}
 	}
-	_, _ = fmt.Fprintf(stdout, "Docs: https://docs.gregale.dev/templates\n")
+	_, _ = fmt.Fprintf(stdout, "Docs: https://"+wire.DocsHost+"/templates\n")
 	return 0
 }
 
@@ -175,7 +176,7 @@ func runCmdInit(tpl, dest string, deploy bool, name string, stdout, stderr io.Wr
 	for _, line := range nextStepsFor(tpl) {
 		_, _ = fmt.Fprintf(stdout, "  %s\n", line)
 	}
-	PrintProgress(stdout, "Docs: https://docs.gregale.dev/storage")
+	PrintProgress(stdout, "Docs: https://"+wire.DocsHost+"/storage")
 
 	// Step 7: optional deploy chain. When --deploy is set, we hand off
 	// to cmdDeployTarball with --template + --name; cmdDeployTarball

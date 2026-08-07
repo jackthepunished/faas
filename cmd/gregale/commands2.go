@@ -37,6 +37,7 @@ const (
 	// PrintUsage doc line).
 	subLogsTail = "tail"
 	subInfo     = "info"
+	subGet      = "get"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
