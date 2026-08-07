@@ -122,6 +122,14 @@ func (r *recordingStripe) PushUsageRecord(_ context.Context, acct state.Account,
 	return r.err
 }
 
+// Capabilities returns the Stripe-shaped set so the meter pusher
+// observes the production dispatch path. The shadow test exercises
+// the metered + refund + sandbox surface — pin the corresponding
+// CapabilitySet so the new PR-P1 introspection contract is honored.
+func (r *recordingStripe) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapRefund | billing.CapUsageMetered | billing.CapSandbox)
+}
+
 // ClassifyPushError opts recordingStripe into the meterd pusher's
 // billing.Classifier dispatch (added with the big-Paddle-enablement
 // PR). The meterd pusher's classifier seam feeds synthetic errors

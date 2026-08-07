@@ -21,6 +21,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -36,7 +37,23 @@ import (
 // Implementations MUST be safe for concurrent use; meterd's quota + dunning
 // loops and apid's webhook ingress call into Provider from multiple
 // goroutines.
+//
+// Implementations declare which optional surfaces they expose via
+// Capabilities() (CapabilitySet). Callers SHOULD check the capability
+// bit before dispatching onto a provider-specific code path (e.g.
+// render the hosted-checkout URL only when CapHostedCheckout is set);
+// the runtime fallback is the previous sentinel-style contract —
+// CreateUpgradeTransaction returning ("", "", nil) ⇒ Stripe, methods
+// returning ErrNotImplemented ⇒ the provider doesn't support the
+// surface. The two co-exist so adding Capabilities() to existing
+// implementations is a non-breaking change.
 type Provider interface {
+	// Capabilities returns the bitmask of optional surfaces this
+	// implementation exposes. The set is stable for the life of the
+	// provider — call once at boot and cache, or query on every
+	// dispatch if cheap. See Capability / CapabilitySet below.
+	Capabilities() CapabilitySet
+
 	// EnsurePlanProducts is the idempotent product/price setup at boot.
 	// Stripe: stripe.Plans.List + stripe.Plans.New by Nickname. Paddle:
 	// paddle.Items.List + paddle.Items.Create by description match.
@@ -322,4 +339,95 @@ var ErrNotImplemented = errors.New("billing: provider does not implement this me
 // construction time.
 type Classifier interface {
 	ClassifyPushError(err error) string
+}
+
+// Capability is a single bit in the CapabilitySet returned by
+// Provider.Capabilities. Use CapabilitySet.Has to test for a given
+// capability. Bits are stable and additive — new capabilities get
+// new high bits; existing bits are never reassigned. The zero value
+// is "no optional surfaces", which matches the bare Provider
+// interface (a hypothetical minimum-viable provider that only
+// implements the four primitives M7 needs).
+type Capability uint64
+
+const (
+	// CapHostedCheckout means CreateUpgradeTransaction returns a
+	// real transaction id + checkout URL. apid renders the URL on
+	// the 402 Problem and the dashboard renders a hosted-checkout
+	// button. Paddle: yes. Stripe: no (Stripe returns the
+	// FAAS_BILLING_PORTAL_URL template instead, which is
+	// operator-configured, not provider-generated).
+	CapHostedCheckout Capability = 1 << iota
+
+	// CapRefund means Provider.Refund is implemented. apid's
+	// admin/refund route maps to a 502 when absent. Paddle: no
+	// (issue #279 — Paddle's refund ceremony is out of scope).
+	// Stripe: yes.
+	CapRefund
+
+	// CapUsageReconcile means Provider.ReconcileUsage is implemented
+	// and returns real pushed-mb_seconds. The reconciler
+	// (pkg/billing/reconciler) skips accounts whose active provider
+	// lacks this capability, before any SDK call fires. Paddle: no
+	// (Paddle Billing has no usage-summary endpoint). Stripe: yes.
+	CapUsageReconcile
+
+	// CapSandbox means the provider supports a sandbox / test
+	// environment toggle (Paddle: FAAS_PADDLE_SANDBOX, Stripe: sk_test_*
+	// API key prefix). The provider's config struct exposes it;
+	// Provider.Capabilities() surfaces it so admin/CLI can report
+	// it without re-reading the config.
+	CapSandbox
+
+	// CapUsageMetered means PushUsageRecord posts a metered
+	// UsageRecord against the customer's subscription item
+	// (Stripe's shape). Paddle: no (Paddle posts a flat-rate
+	// line item per push). Stripe: yes.
+	CapUsageMetered
+
+	// CapUsageLineItem means PushUsageRecord posts a one-shot
+	// line item per call (Paddle's shape). Stripe: no. apid /
+	// meterd do not dispatch on this — the provider's own
+	// implementation handles the wire shape — but it is exposed
+	// for the admin/CLI surface so operators can see the
+	// push-model a provider uses.
+	CapUsageLineItem
+)
+
+// CapabilitySet is the bitmask of capabilities a Provider exposes.
+// Construct via OR of the Cap* constants. The zero value is the bare
+// interface (no optional surfaces).
+type CapabilitySet uint64
+
+// Has reports whether the set contains the given capability. Callers
+// should use this in preference to errors.Is(err, ErrNotImplemented)
+// when the dispatch table can be built once at boot.
+func (s CapabilitySet) Has(c Capability) bool { return s&CapabilitySet(c) != 0 }
+
+// String returns the canonical comma-separated list of named
+// capabilities (e.g. "hosted_checkout,usage_line_item,sandbox").
+// Used by GET /v1/admin/billing-provider and the CLI's
+// `faas billing status` output. The order matches the iota declaration
+// order so the output is stable across runs.
+func (s CapabilitySet) String() string {
+	if s == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, 6)
+	for _, c := range []struct {
+		cap  Capability
+		name string
+	}{
+		{CapHostedCheckout, "hosted_checkout"},
+		{CapRefund, "refund"},
+		{CapUsageReconcile, "usage_reconcile"},
+		{CapSandbox, "sandbox"},
+		{CapUsageMetered, "usage_metered"},
+		{CapUsageLineItem, "usage_line_item"},
+	} {
+		if s.Has(c.cap) {
+			parts = append(parts, c.name)
+		}
+	}
+	return strings.Join(parts, ",")
 }

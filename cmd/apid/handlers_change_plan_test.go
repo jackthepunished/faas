@@ -343,6 +343,14 @@ func (f *fakeBillingProvider) ReconcileUsage(_ context.Context, _ state.Account,
 	return 0, billing.ErrNotImplemented
 }
 
+// Capabilities returns the Paddle-shaped set so the changePlan
+// handler dispatches via the new PR-P1 capability introspection
+// (CapHostedCheckout is set). Matches the production *paddle.Provider
+// capabilities so the test exercises the same code path.
+func (f *fakeBillingProvider) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapHostedCheckout | billing.CapUsageLineItem | billing.CapSandbox)
+}
+
 // TestChangePlan_PaddleCheckout_RendersPaddleExtension pins the
 // Paddle dispatch on the changePlan 402 path (PR #3 / ADR-025). The
 // fakeBillingProvider returns ("txn_abc", "https://paddle.example/checkout/xyz", nil);

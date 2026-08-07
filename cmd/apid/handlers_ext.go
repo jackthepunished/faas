@@ -2069,7 +2069,12 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		// No-provider box (FAAS_BILLING_PROVIDER unset) and Stripe both
 		// land here with the same template response, so the pre-PR-#3
 		// Stripe path is bit-for-bit unchanged.
-		if s.billingProvider != nil {
+		//
+		// Capabilities() is the primary dispatch signal (added in
+		// PR-P1 of the pluggable-billing rollout). The txID == "" check
+		// stays as a defensive fallback for any provider wired before
+		// the capability introspection was introduced.
+		if s.billingProvider != nil && s.billingProvider.Capabilities().Has(billing.CapHostedCheckout) {
 			txID, checkoutURL, err := s.billingProvider.CreateUpgradeTransaction(r.Context(), acct, plan)
 			if err != nil {
 				s.log.Error("create_upgrade_tx",

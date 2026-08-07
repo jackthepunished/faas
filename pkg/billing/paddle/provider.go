@@ -223,6 +223,19 @@ func (p *Provider) SetDedupeForTest(d PaddleOverageDedupe) {
 // interface is a build error here — mirrors pkg/billing/stripe.
 var _ billing.Provider = (*Provider)(nil)
 
+// Capabilities returns the Paddle provider's supported optional
+// surfaces (see pkg/billing/provider.go CapabilitySet). The set is
+// derived from the implementation's actual behaviour — CapHostedCheckout
+// is set because CreateUpgradeTransaction returns a real txn + URL.
+// CapRefund and CapUsageReconcile are intentionally absent: both
+// methods return billing.ErrNotImplemented (Paddle Billing has no
+// operator-refund API and no usage-summary endpoint at the time of
+// writing). The reconciler + apid admin/refund route use Capabilities()
+// to skip the call entirely instead of round-tripping to the SDK.
+func (p *Provider) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapHostedCheckout | billing.CapUsageLineItem | billing.CapSandbox)
+}
+
 // ---- billing.Provider surface ----
 
 // EnsurePlanProducts: idempotent boot-time setup. Lists products +

@@ -163,6 +163,7 @@ func (nopProvider) Refund(context.Context, string, int64) (*billing.RefundResult
 func (nopProvider) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
 	return 0, billing.ErrNotImplemented
 }
+func (nopProvider) Capabilities() billing.CapabilitySet { return 0 }
 
 // TestRun_MetricsAddrEmptySkipsListener — when cfg.MetricsAddr is empty,
 // runWithDeps must not invoke the metricsListenAndServe factory at all. This
@@ -544,6 +545,10 @@ func (r *meterRec) PushUsageRecord(context.Context, state.Account, time.Time, in
 	defer r.mu.Unlock()
 	r.calls++
 	return nil
+}
+
+func (r *meterRec) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapRefund | billing.CapUsageMetered | billing.CapSandbox)
 }
 
 func (r *meterRec) Calls() int {

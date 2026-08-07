@@ -364,6 +364,18 @@ func (c *Client) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Ti
 	return 0, billing.ErrNotImplemented
 }
 
+// Capabilities returns the Stripe provider's supported optional
+// surfaces (see pkg/billing/provider.go CapabilitySet). The set is
+// derived from the implementation's actual behaviour — PinHostedCheckout
+// is intentionally absent because Stripe's CreateUpgradeTransaction
+// returns ("", "", nil) and the apid handler falls back to
+// FAAS_BILLING_PORTAL_URL instead. CapUsageReconcile is absent because
+// ReconcileUsage returns ErrNotImplemented (the reconciler short-
+// circuits with errors.Is, mirroring the Paddle stub).
+func (c *Client) Capabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapRefund | billing.CapUsageMetered | billing.CapSandbox)
+}
+
 // centsToMillicents converts integer EUR cents to Stripe's native
 // millicents (×10). CLAUDE.md invariant: integer cents/millicents
 // only; never float on money. The factor is fixed (Stripe's wire
