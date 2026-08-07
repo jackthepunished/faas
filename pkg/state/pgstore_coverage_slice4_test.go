@@ -25,9 +25,9 @@ func TestPg_CoverageCreateApp(t *testing.T) {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	app := state.App{
-		ID:       uuid.NewString(),
+		ID:        uuid.NewString(),
 		AccountID: acct.ID,
-		Slug:     "app-" + uuid.NewString()[:8],
+		Slug:      "app-" + uuid.NewString()[:8],
 	}
 	got, err := s.CreateApp(ctx, app)
 	if err != nil {
