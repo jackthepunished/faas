@@ -88,11 +88,17 @@ unreachable, stuck drain):
 1. **Restore the dying leader's DNS record by hand:**
 
    ```sh
-   curl -X POST 'https://dns.hetzner.com/api/v1/records' \
-     -H "Auth-API-Token: $TOKEN" \
+   curl -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+     -H "Authorization: Bearer ${CF_API_TOKEN}" \
      -H "Content-Type: application/json" \
-     -d '{"zone_id":"<ZONE_ID>","name":"<old-leader>.example.com","type":"A","value":"<OLD_IP>","ttl":60}'
+     -d "{\"type\":\"A\",\"name\":\"<old-leader>.example.com\",\"content\":\"<OLD_IP>\",\"ttl\":60,\"proxied\":false}"
    ```
+
+   (Cloudflare API v4 — `proxied:false` matches the production
+   `pkg/gateway/dns_provider_cloudflare.go` shape. Caddy terminates
+   TLS at the edge, not Cloudflare, so the A-record must NOT be
+   proxied; otherwise Caddy's `X-Forwarded-For` sees Cloudflare's
+   anycast IPs instead of the customer's resolver.)
 
 2. **Set `active=true` on the dying leader:**
 
@@ -115,7 +121,9 @@ unreachable, stuck drain):
    mode:
 
    - `outcome="dns_stale"` → DNS provider unreachable; check
-     Hetzner status / token validity.
+     Cloudflare status page (`https://www.cloudflarestatus.com`)
+     and the token's permission set (Zone:DNS:Edit on the zone
+     in question).
    - `outcome="peer_unreachable"` → pg_notify consumer
      fell behind; check schedd logs for dropped events.
    - `outcome="manual_drain"` → operator-initiated path;
@@ -124,12 +132,57 @@ unreachable, stuck drain):
 5. **Page the on-call** if the failure mode is unclear;
    the escalation section below covers this.
 
+## Switching DNS providers
+
+The default DNS provider is `cloudflare` (production, paired with
+Caddy upstream of `gatewayd-public`). On staging or during a drill,
+operators may set `FAAS_DNS_PROVIDER=manual` to disable real DNS
+writes — the manual provider prints the curl to stderr so an
+operator can flip DNS by hand, but it does not change the
+leader-election topology.
+
+To switch from `manual` (drill mode) to `cloudflare` (prod mode):
+
+1. **Generate a Cloudflare API token** with Zone:DNS:Edit scope
+   on the target zone (`api.gregale.dev`). Never use the global
+   API key — the token-scoped key is what the secretbox namespace
+   expects.
+2. **Seal the token** with `pkg/secretbox.SealBytes`:
+
+   ```sh
+   faas secrets seal --namespace=dns_provider --file=cf-token.txt
+   ```
+
+   The output is the `FAAS_DNS_PROVIDER_SEALED` env var value
+   (`pkg/secretbox` writes a base64 blob with the namespace
+   prefix-on-blob layout, see pkg/secretbox/seal.go).
+3. **Restart both `gatewayd-public` daemons** with:
+
+   ```sh
+   FAAS_DNS_PROVIDER=cloudflare \
+   FAAS_DNS_ZONE=example.com \
+   FAAS_DNS_PROVIDER_SEALED=<sealed-blob> \
+   FAAS_HOST_KEY_PATH=/etc/faas/secrets/host.age \
+     systemctl restart gatewayd-public
+   ```
+
+   The `FAAS_HOST_KEY_PATH` env var is the existing
+   `pkg/secretbox.LoadHostKeys` precedent — see
+   `cmd/gatewayd-internal/run.go:395`. Empty → the unseal helper
+   returns `errSecretBoxUnconfigured` at the first DNS attempt,
+   which surfaces as `outcome="dns_stale"` on the failover
+   counter (the right behavior: fail loud, never silent no-op).
+4. **Verify the unseal path** by running the drill script
+   (`deploy/lima/run-ha-failover.sh`) on the Lima fleet and
+   confirming `outcome="dns_flipped"` advances (not
+   `outcome="manual_drain"`).
+
 ## Escalation
 
 The Tier A8 escalation tree (in order of preference):
 
 1. **DNS provider reachable but failing writes.** The
-   Hetzner API may be degraded; the runbook's manual curl
+   Cloudflare API may be degraded; the runbook's manual curl
    above restores the record by hand. The metric surfaces
    `outcome="dns_stale"` so the on-call sees the failure
    without needing to grep logs.

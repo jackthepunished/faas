@@ -96,6 +96,11 @@ type OpsMetrics struct {
 	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
 	// panel is the §12 warm-capture-error alert's primary signal.
 	warmSnapshotErrors *prometheus.CounterVec
+	// warmupErrors (Tier A8 / ADR-083). Per-(app slug) probe-failure
+	// counter for the standby warm-up scraper. Bounded cardinality
+	// (operator-managed FAAS_STANDBY_WARMUP_SLUGS_PATH); see
+	// the warmupErrors constructor block below.
+	warmupErrors *prometheus.CounterVec
 	// livenessRestarts (issue #554 / ADR-078) is the per-(app,
 	// deployment) counter the Engine.DestroyForLivenessFailure path
 	// increments on every liveness-driven destroy. The dashboard
@@ -950,6 +955,26 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")
+	// warmupErrors (Tier A8 / ADR-083). Counts probe failures on the
+	// standby warm-up scraper (cmd/gatewayd-public/standby_warmup.go).
+	// Labelled by app slug — the per-app cardinality is bounded by the
+	// operator-managed FAAS_STANDBY_WARMUP_SLUGS_PATH list (default
+	// ≤ 100 slugs / fleet). The PromQL
+	// `rate(gatewayd_public_warmup_errors_total[5m]) > 0` panel is
+	// the §12 standby-warmup alert's primary signal: a sustained
+	// non-zero rate means gatewayd-internal is unhealthy on a
+	// standby box (the new leader will cold-boot every request on
+	// flip). OpsMetrics.WarmupErrors(slug) returns the per-slug
+	// counter; nil-safe.
+	warmupErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_warmup_errors_total",
+		Help: "Count of standby warm-up probe failures (Tier A8 / ADR-083), labelled by app slug. Probe failures imply gatewayd-internal is unreachable or unhealthy on the standby box — the new leader will cold-boot every request on the active-passive flip. Sustained non-zero rate triggers the §12 standby-warmup alert.",
+	}, []string{"slug"})
+	// Pre-instantiate the empty-slug overflow row so the help/TYPE
+	// surfaces in /metrics from boot, matching the precedent in
+	// warmSnapshotErrors above and the (other, other) overflow rows
+	// elsewhere in this constructor.
+	warmupErrors.WithLabelValues("")
 	// Issue #554 / ADR-078: liveness restarts counter. Labelled by
 	// (app, deployment) — the bounded per-deployment set keeps the
 	// TSDB cardinality safe (Scale: ≤ 20 deployment per app; Hobby:
@@ -2078,6 +2103,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
 		warmSnapshotErrors:                 warmSnapshotErrors,
+		warmupErrors:                       warmupErrors,
 		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
@@ -2214,6 +2240,20 @@ func (m *OpsMetrics) WarmSnapshotErrors(reason string) prometheus.Counter {
 		return nil
 	}
 	return m.warmSnapshotErrors.WithLabelValues(reason)
+}
+
+// WarmupErrors returns the per-(app slug) probe-failure counter
+// the standby warm-up scraper increments on every probe failure
+// (Tier A8 / ADR-083). The dashboard panel "standby warmup: errors
+// by app (5m)" queries this; the §12 standby-warmup alert fires
+// on a sustained non-zero rate. Bounded cardinality by
+// FAAS_STANDBY_WARMUP_SLUGS_PATH. nil-safe — returns nil if m is
+// nil (a unit test without metrics keeps building).
+func (m *OpsMetrics) WarmupErrors(slug string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.warmupErrors.WithLabelValues(slug)
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram

@@ -27,7 +27,19 @@ import (
 // forgotten. The Cloudflare DNS provider returns this error
 // from its constructor; the orchestrator never gets a
 // half-wired provider.
+//
+// Exported as ErrSecretBoxUnconfigured so callers (cmd/gatewayd-public
+// in particular) can detect the "no-op default" case without
+// string-matching — they reassign OpenBytesDNSProvider before
+// the first call, so the default never fires in production.
 var errSecretBoxUnconfigured = errors.New("pkg/gateway: OpenBytesDNSProvider not configured — wire cmd/gatewayd-public/main.go at startup")
+
+// ErrSecretBoxUnconfigured is the exported form of the default
+// OpenBytesDNSProvider's error. Callers reassign
+// OpenBytesDNSProvider before first use; if they don't, the
+// default closure returns an error wrapping this sentinel so
+// the unseal helper can be detected at boot via errors.Is.
+var ErrSecretBoxUnconfigured = errSecretBoxUnconfigured
 
 // OpenBytesDNSProvider is the namespace-sealed unseal helper
 // for the DNS_PROVIDER namespace. Set by cmd/gatewayd-public

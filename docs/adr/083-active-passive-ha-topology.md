@@ -44,7 +44,7 @@ lex-min(name) over compute_nodes where active = true
 ```
 
 The lex-min node is the **leader** — it owns the public DNS record
-(Hetzner DNS API or operator-managed). All other active boxes are
+(Cloudflare API or operator-managed). All other active boxes are
 **warm standbys** — their `gatewayd-public` runs and stays warm
 (connection pool, TLS session tickets, per-app target-set cache,
 per-node schedd client cache), but they are NOT in DNS. On
@@ -164,10 +164,17 @@ type DNSProvider interface {
 
 Two implementations:
 
-- `pkg/gateway/dns_provider_hetzner.go` — first-class Hetzner DNS
-  API integration. Gated on `FAAS_DNS_PROVIDER=hetzner` +
-  `HETZNER_DNS_API_TOKEN` (sealed via `pkg/secretbox.SealBytes`,
-  namespace `DNS_PROVIDER`).
+- `pkg/gateway/dns_provider_cloudflare.go` — first-class Cloudflare
+  DNS API integration. Gated on `FAAS_DNS_PROVIDER=cloudflare` +
+  `CLOUDFLARE_API_TOKEN` (sealed via `pkg/secretbox.SealBytes`,
+  namespace `DNS_PROVIDER`). Cloudflare is the production choice
+  because Caddy already terminates TLS for the same hostname
+  upstream of `gatewayd-public` — the leader-election A-record
+  naturally lands on the same zone Cloudflare serves, so no
+  separate DNS-01 plumbing is required. Round 1 shipped a Hetzner
+  sibling; round 2 deletes it (production runs Cloudflare + Caddy
+  end-to-end; Hetzner DNS plumbing was dead weight — see PR-C
+  sweep per ADR-024 for the legacy `dns01_hetzner.go` ACME solver).
 - `pkg/gateway/dns_provider_manual.go` — operator-managed
   fallback. Gated on `FAAS_DNS_PROVIDER=manual`. Prints the required
   `curl` to stderr so a staging operator can flip DNS by hand.
@@ -201,11 +208,25 @@ log + skip).
 
 ### 3. DNS provider abstraction
 
-The first-class implementation is Hetzner DNS (the spec's hosting
-target). Operator-managed fallback (`FAAS_DNS_PROVIDER=manual`)
-prints the required `curl` to stderr so a staging operator can
-flip DNS by hand. This is the same pattern as the existing
-`FAAS_STORAGE_CACHE_SERVE_STALE` opt-in (ADR-054 acceptance PR).
+The first-class implementation is Cloudflare DNS, paired with
+Caddy as the TLS terminator upstream of `gatewayd-public`. The
+two share the same zone (Cloudflare serves the A-record;
+Caddy terminates HTTPS on the same hostname and reverse-proxies
+to the loopback `gatewayd-public` listener), so the leader-election
+A-record lands on a zone Cloudflare already serves — no separate
+DNS-01 plumbing required, and TLS terminates at the edge. The
+Cloudflare API token is sealed via `pkg/secretbox.SealBytes`
+under namespace `DNS_PROVIDER` (matches the webhook APP_WEBHOOK
+namespace precedent from ADR-076).
+
+Operator-managed fallback (`FAAS_DNS_PROVIDER=manual`) prints the
+required `curl` to stderr so a staging operator can flip DNS by
+hand. The drill script (`deploy/lima/run-ha-failover.sh`) runs in
+manual mode so a §14 M8 acceptance run doesn't touch real DNS.
+
+This is the same pattern as the existing
+`FAAS_STORAGE_CACHE_SERVE_STALE` opt-in (ADR-054 acceptance PR):
+first-class provider + operator-managed escape hatch.
 
 ### 4. Drain protocol: 30 s budget, in-flight respected
 
@@ -292,7 +313,7 @@ warmup scrape is the optimization, not the gate.
   Bounded by `HAFailoverProbeTimeoutMS = 500` ms per probe.
 - `pkg/gateway/dns_provider.go` — NEW: `DNSProvider` interface
   with `UpsertRecord` / `DeleteRecord`.
-- `pkg/gateway/dns_provider_hetzner.go` — NEW: Hetzner DNS
+- `pkg/gateway/dns_provider_cloudflare.go` — NEW: Cloudflare DNS
   implementation.
 - `pkg/gateway/dns_provider_manual.go` — NEW: operator-managed
   fallback that prints the required `curl` to stderr.
@@ -315,9 +336,9 @@ warmup scrape is the optimization, not the gate.
   `/metrics` on node-B for
   `gateway_active_passive_failovers_total{outcome="dns_flipped"} ≥ 1` + zero 5xx from the app for 60 s.
 - `deploy/lima/faas-metal-2node-ha.yaml` — NEW: 2-node variant
-  with the `Hetzner DNS` mock provider (no real DNS; the
-  provider's `UpsertRecord` writes to a tmpfs journal the test
-  scrapes).
+  with the `manual DNS` mock provider (no real DNS; the manual
+  provider's `UpsertRecord` prints the curl to stderr so the
+  drill script can scrape the journal).
 - `tests/property/concurrency_test.go` — NEW: two-host cluster
   fixture (per issue #297 acceptance item 5). Property: under
   random `compute_node_changed` events, the leader-election surface
@@ -394,7 +415,10 @@ M3+ via nested virt. The drill is the §14 M8 acceptance gate.
 ## Open follow-ups (deliberately deferred)
 
 - **Multi-region DNS (e.g. Route53 latency-based).** Single-DNS-
-  provider HA. Spec §Gate B.
+  provider HA. Spec §Gate B. (Originally listed as a Cloudflare
+  secondary; the production stance after PR-B is Cloudflare-only
+  with Caddy as the TLS terminator upstream — Route53 is a v1.1
+  follow-up only if multi-region expansion happens first.)
 - **Per-VM live migration (CRIU / Firecracker pause-and-resume).**
   Firecracker does not expose VM-level primitives. ADR-066 §"Open
   follow-ups" defers.
@@ -434,10 +458,11 @@ M3+ via nested virt. The drill is the §14 M8 acceptance gate.
   `HAFailoverProbeTimeoutMS` and `HADNSRecordStaleSeconds` in
   their `~/.config/faas/env`. Defaults are sane, but the surface
   is new.
-- **DNS provider is a new failure domain.** A Hetzner DNS outage
+- **DNS provider is a new failure domain.** A Cloudflare DNS outage
   blocks the failover handoff. The runbook's escalation section
   covers the manual drain command. A future v1.1 PR can add a
-  secondary DNS provider.
+  secondary DNS provider (Route53 was the originally-considered
+  secondary; deferred per ADR-024 PR-C).
 
 ## Verification
 
@@ -501,7 +526,7 @@ Closes the §14 M8 "Gate-A runbook (2nd box active-passive)" row:
       with `compute_node_changed` pg_notify subscription (PR-B).
 - [x] Standby warm-up scraper bounded by
       `HAFailoverProbeTimeoutMS` (PR-B).
-- [x] DNS provider abstraction + Hetzner + manual implementations
+- [x] DNS provider abstraction + Cloudflare + manual implementations
       (PR-B).
 - [x] Drain protocol with 30 s budget + metric bump (PR-B).
 - [x] `make ha-failover-drill` Makefile target (PR-C).
