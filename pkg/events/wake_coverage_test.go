@@ -271,3 +271,130 @@ func TestSweep_QueueAccepted(t *testing.T) {
 		t.Errorf("Subject = %v, want nil", e.Subject())
 	}
 }
+
+func TestSweep_TailFailed(t *testing.T) {
+	now := time.Now()
+	e := TailFailed{EmitAt: now, AppID: "a1", InstanceID: "i1", Reason: "timeout"}
+	if e.Kind() != WakeTailFailed {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Subject() != nil {
+		t.Errorf("Subject = %v, want nil", e.Subject())
+	}
+	if e.Payload()["reason"] != "timeout" {
+		t.Error("payload reason mismatch")
+	}
+}
+
+func TestSweep_LivenessFailed(t *testing.T) {
+	now := time.Now()
+	e := LivenessFailed{
+		EmitAt: now, InstanceID: "i1", AppID: "a1",
+		DeploymentID: "d1", Reason: "conn_refused",
+	}
+	if e.Kind() != InstanceLivenessFailed {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["reason"] != "conn_refused" {
+		t.Error("payload reason mismatch")
+	}
+}
+
+func TestSweep_LivenessRestarted(t *testing.T) {
+	now := time.Now()
+	e := LivenessRestarted{
+		EmitAt: now, InstanceID: "i1", AppID: "a1",
+		DeploymentID: "d1", Reason: "timeout",
+	}
+	if e.Kind() != InstanceLivenessRestarted {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["reason"] != "timeout" {
+		t.Error("payload reason mismatch")
+	}
+}
+
+func TestSweep_ParkedLivenessExhausted(t *testing.T) {
+	now := time.Now()
+	e := ParkedLivenessExhausted{
+		EmitAt: now, AppID: "a1", DeploymentID: "d1",
+		ParkedReason: "liveness_exhausted",
+	}
+	if e.Kind() != InstanceParkedLivenessExhausted {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["parked_reason"] != "liveness_exhausted" {
+		t.Error("payload parked_reason mismatch")
+	}
+}
+
+func TestSweep_BuildSucceeded(t *testing.T) {
+	now := time.Now()
+	e := BuildSucceeded{
+		EmitAt: now, AppID: "a1", DeploymentID: "d1",
+		ImageDigest: "sha256:abc", DurationMs: 5000,
+	}
+	if e.Kind() != WakeBuildSucceeded {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["duration_ms"] != int64(5000) {
+		t.Error("payload duration_ms mismatch")
+	}
+}
+
+func TestSweep_BuildFailed(t *testing.T) {
+	now := time.Now()
+	e := BuildFailed{
+		EmitAt: now, AppID: "a1", DeploymentID: "d1",
+		ImageDigest: "sha256:abc", Reason: "compile_err",
+	}
+	if e.Kind() != WakeBuildFailed {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["reason"] != "compile_err" {
+		t.Error("payload reason mismatch")
+	}
+}
+
+func TestSweep_DeployFailed(t *testing.T) {
+	now := time.Now()
+	e := DeployFailed{
+		EmitAt: now, AppID: "a1", DeploymentID: "d1",
+		Reason: "image_scan_failed",
+	}
+	if e.Kind() != WakeDeployFailed {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["reason"] != "image_scan_failed" {
+		t.Error("payload reason mismatch")
+	}
+}
+
+func TestSweep_SidecarInitExit(t *testing.T) {
+	now := time.Now()
+	e := SidecarInitExit{
+		EmitAt: now, AppID: "a1", InstanceID: "i1",
+		SidecarName: "log-shipper", Status: "init_ok",
+		ExitCode: 0, DurationMs: 200,
+	}
+	if e.Kind() != WakeSidecarInitExit {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["sidecar_name"] != "log-shipper" {
+		t.Error("payload sidecar_name mismatch")
+	}
+}
+
+func TestSweep_SidecarRestart(t *testing.T) {
+	now := time.Now()
+	e := SidecarRestart{
+		EmitAt: now, AppID: "a1", InstanceID: "i1",
+		SidecarName: "log-shipper", Attempt: 1, PreviousExitCode: 137,
+	}
+	if e.Kind() != WakeSidecarRestart {
+		t.Errorf("Kind = %q", e.Kind())
+	}
+	if e.Payload()["attempt"] != 1 {
+		t.Error("payload attempt mismatch")
+	}
+}
