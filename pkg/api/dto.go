@@ -822,6 +822,20 @@ type DeploymentLivenessProbe struct {
 	// survives an intermittent 5xx across the consecutive window
 	// (AC #2 — flaky app does NOT oscillate).
 	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
+	// CooldownS (issue #554 / ADR-078) is the per-deployment
+	// override of the vmmd-side cooldown gate. After a successful
+	// DestroyForLivenessFailure, the next liveness-failure fire on
+	// a fresh instance is skipped if it's within CooldownS seconds
+	// of the previous destroy — gives the cold-boot instance a
+	// grace window to come up without being torn down again by
+	// noise. 0 = inherit from the per-plan default
+	// (api.Limits.LivenessCooldownSeconds = 60s for Hobby/Pro/Scale).
+	// Clamped to [MinLivenessCooldownSeconds=10,
+	// MaxLivenessCooldownSeconds=600] by the apid validator.
+	// Distinct from the schedd-side LivenessWindow which is the
+	// "N restarts in W seconds → park deployment" gate (issue #554
+	// AC #3, pkg/sched/liveness_window.go).
+	CooldownS int `json:"cooldown_s,omitempty"`
 }
 
 // SecretRefPrefix is the wire prefix on env_secrets values that flags the
@@ -1005,6 +1019,35 @@ func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
 			return NewProblem(http.StatusBadRequest, CodeValidation,
 				"Invalid override",
 				fmt.Sprintf("liveness_probe.consecutive_failures must be <= 10; got %d.", o.LivenessProbe.ConsecutiveFailures))
+		}
+		// CooldownS (issue #554 closure / ADR-078, code review
+		// #725 finding F2). 0 = "no cooldown gate" (Free-plan
+		// legacy behaviour, gate bypasses — see
+		// cmd/vmmd/liveness_recv.go::runOne). Positive values
+		// must be in [MinLivenessCooldownSeconds=10,
+		// MaxLivenessCooldownSeconds=600] — the lower bound
+		// stops a customer from setting cooldown=1 and
+		// effectively neutering liveness for the cold-boot
+		// replacement window; the upper bound stops a typo
+		// (cooldown=999999) from wedging the deployment
+		// (gate would short-circuit every probe for ~11.5
+		// days, bypassing the §14 metal acceptance contract).
+		if o.LivenessProbe.CooldownS < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.cooldown_s must be >= 0 (0 = no cooldown gate); got %d.", o.LivenessProbe.CooldownS))
+		}
+		if o.LivenessProbe.CooldownS > 0 && o.LivenessProbe.CooldownS < MinLivenessCooldownSeconds {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.cooldown_s must be 0 (no cooldown) or in [%d, %d]; got %d.",
+					MinLivenessCooldownSeconds, MaxLivenessCooldownSeconds, o.LivenessProbe.CooldownS))
+		}
+		if o.LivenessProbe.CooldownS > MaxLivenessCooldownSeconds {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.cooldown_s must be <= %d; got %d.",
+					MaxLivenessCooldownSeconds, o.LivenessProbe.CooldownS))
 		}
 	}
 
@@ -2852,4 +2895,43 @@ func (ss Sidecars) Validate(limits Limits) *Problem {
 		}
 	}
 	return nil
+}
+
+// --- per-account egress allowlist extra (issue #679 / PR-B / ADR-082) ---
+
+// MaxAccountEgressAllowlistExtra is the admin-set ceiling on the
+// per-account additive budget on top of the plan's
+// apps.egress_allowlist cap (issue #679 / PR-B / ADR-082). Flat
+// 1024 — comfortably above the largest realistic override a Pro
+// or Scale account needs (Pro 16 + 1008 = 1024 max, Scale 64 +
+// 960 = 1024 max). The cap is intentional: a single account's
+// effective allowlist approaching 1024 entries is a customer-
+// abuse signal (a misconfigured SDK would round-trip the entire
+// internet into the per-app set). Operators wanting more should
+// use the operator-bundle (PR-A / ADR-081) which is a separate
+// additive axis that doesn't consume per-account slot.
+const MaxAccountEgressAllowlistExtra = 1024
+
+// SetAccountEgressAllowlistExtraRequest is the body of
+// PATCH /v1/account/egress_allowlist_extra (issue #679 / PR-B /
+// ADR-082). Extra is the per-account additive budget on top of
+// the plan cap. Extra < 0 is rejected at the apid gate with
+// ErrAccountEgressAllowlistExtraOutOfRange; Extra > 1024 is the
+// admin-set ceiling (MaxAccountEgressAllowlistExtra). Extra ==
+// 0 clears the override (the plan cap is authoritative again).
+type SetAccountEgressAllowlistExtraRequest struct {
+	Extra int `json:"extra"`
+}
+
+// AccountEgressAllowlistExtraResponse is the body of GET
+// /v1/account/egress_allowlist_extra (issue #679 / PR-B /
+// ADR-082). Extra is the per-account additive budget; PlanCap
+// is the plan-only cap (Pro 16 / Scale 64 / Free,Hobby 0); the
+// effective cap is PlanCap + Extra. MaxExtra is the admin-set
+// ceiling (1024) so the dashboard can render the range slider
+// without a second round-trip.
+type AccountEgressAllowlistExtraResponse struct {
+	Extra    int `json:"extra"`
+	PlanCap  int `json:"plan_cap"`
+	MaxExtra int `json:"max_extra"`
 }

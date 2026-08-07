@@ -107,7 +107,7 @@ func (s *PgStore) CreateAccountWithPersonalOrg(ctx context.Context, params Creat
 		           coalesce(stripe_subscription_item,''), created_at,
 		           deletion_requested_at, last_quota_warning_at, past_due_at,
 		           mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash,
-		           mfa_required`,
+		           mfa_required, egress_allowlist_extra`,
 		params.Email, string(params.Plan)).Scan)
 	if err != nil {
 		return CreateAccountWithPersonalOrgResult{}, mapErr(err)
@@ -149,7 +149,7 @@ func (s *PgStore) CreateAccountWithPersonalOrg(ctx context.Context, params Creat
 
 func (s *PgStore) AccountByID(ctx context.Context, id string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = $1`, id)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra from accounts where id = $1`, id)
 	return scanAccount(row)
 }
 
@@ -172,7 +172,7 @@ func (s *PgStore) AccountsByIDs(ctx context.Context, ids []string) (map[string]A
 		return out, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where id = any($1::uuid[])`, ids)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra from accounts where id = any($1::uuid[])`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("state: accounts by IDs: %w", err)
 	}
@@ -192,13 +192,13 @@ func (s *PgStore) AccountsByIDs(ctx context.Context, ids []string) (map[string]A
 
 func (s *PgStore) AccountByEmail(ctx context.Context, email string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required from accounts where email = $1`, email)
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra from accounts where email = $1`, email)
 	return scanAccount(row)
 }
 
 func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at, a.mfa_enrolled_at, a.mfa_secret_encrypted, a.mfa_recovery_codes_hash, a.mfa_required
+		`select a.id, a.email, a.plan, a.status, coalesce(a.provider_customer_id,''), coalesce(a.stripe_subscription_item,''), a.created_at, a.deletion_requested_at, a.last_quota_warning_at, a.past_due_at, a.mfa_enrolled_at, a.mfa_secret_encrypted, a.mfa_recovery_codes_hash, a.mfa_required, a.egress_allowlist_extra
 		 from accounts a join api_keys k on k.account_id = a.id where k.key_sha256 = $1`, hash)
 	return scanAccount(row)
 }
@@ -684,7 +684,7 @@ func Sha256Equal(a, b []byte) bool {
 // map.
 func (s *PgStore) AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra
 		 from accounts where provider_customer_id = $1`,
 		stripeCustomerID)
 	return scanAccount(row)
@@ -720,7 +720,7 @@ func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerI
 // tick + hourly Stripe push; bounded by the customer count on the box.
 func (s *PgStore) ListAllAccounts(ctx context.Context) ([]Account, error) {
 	rows, err := s.pool.Query(ctx,
-		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
+		`select id, email, plan, status, coalesce(provider_customer_id,''), coalesce(stripe_subscription_item,''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required, egress_allowlist_extra
 		 from accounts order by created_at`)
 	if err != nil {
 		return nil, err
@@ -752,12 +752,20 @@ func scanAccounts(rows pgx.Rows) ([]Account, error) {
 // (CreateAccount, AccountByID/Email/KeyHash/ProviderCustomerID, and
 // ListAllAccounts) so the chokepoints + requireMFA middleware always
 // see the post-enrollment state — Review Finding #1 fix.
+//
+// egress_allowlist_extra (issue #679 / PR-B / ADR-082) is the
+// per-account additive budget on top of the plan's
+// apps.egress_allowlist cap. NOT NULL DEFAULT 0, so the scan
+// uses an int (no *int): the column is never NULL. The
+// validator at cmd/apid/handlers_ext.go:104 reads this value
+// off the loaded Account; the apid admin handler is the only
+// writer.
 func scanAccountCols(scan func(...any) error) (Account, error) {
 	a := Account{}
 	var planStr, statusStr string
 	var deletionAt, lastWarnAt, pastDueAt *time.Time
 	var mfaEnrolledAt *time.Time
-	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt, &mfaEnrolledAt, &a.MFASecretEncrypted, &a.MFARecoveryCodesHash, &a.MFARequired); err != nil {
+	if err := scan(&a.ID, &a.Email, &planStr, &statusStr, &a.ProviderCustomerID, &a.StripeSubscriptionItem, &a.CreatedAt, &deletionAt, &lastWarnAt, &pastDueAt, &mfaEnrolledAt, &a.MFASecretEncrypted, &a.MFARecoveryCodesHash, &a.MFARequired, &a.EgressAllowlistExtra); err != nil {
 		return Account{}, err
 	}
 	a.Plan = api.Plan(planStr)
@@ -1142,6 +1150,42 @@ func (s *PgStore) GetAccountKeyGraceWindow(ctx context.Context, accountID string
 func (s *PgStore) SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error {
 	_, err := s.pool.Exec(ctx,
 		`update accounts set key_grace_window_days = $1 where id = $2`, days, accountID)
+	return err
+}
+
+// GetAccountEgressAllowlistExtra returns the per-account
+// additive budget on top of the plan's apps.egress_allowlist
+// cap (issue #679 / PR-B / ADR-082). 0 = no override; the plan
+// cap is authoritative. The validator at
+// cmd/apid/handlers_ext.go:104 adds this value to the plan cap
+// before the >-maxSize check. The DB CHECK constraint
+// (egress_allowlist_extra >= 0) defends against wire-bypasses
+// that skip the apid gate.
+func (s *PgStore) GetAccountEgressAllowlistExtra(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select egress_allowlist_extra from accounts where id = $1`, accountID).Scan(&n)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
+// SetAccountEgressAllowlistExtra sets the per-account additive
+// budget. n == 0 falls through to the plan cap. The audit
+// `account.egress_allowlist_extra_set` event is emitted by the
+// handler, not the store. The DB CHECK constraint
+// (egress_allowlist_extra >= 0) is the wire-bypass backstop;
+// the apid handler enforces the + 1024 ceiling before the
+// call lands here.
+//
+// Issue #679 / PR-B / ADR-082.
+func (s *PgStore) SetAccountEgressAllowlistExtra(ctx context.Context, accountID string, n int) error {
+	_, err := s.pool.Exec(ctx,
+		`update accounts set egress_allowlist_extra = $1 where id = $2`, n, accountID)
 	return err
 }
 
@@ -2384,6 +2428,49 @@ func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseT
 		instanceID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("state: abort migrating instance: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// FailRunningInstanceOnDeadNode flips a RUNNING row to FAILED when its
+// owning node is gone, stamping terminal_at so the §17 retention sweep
+// can age the row out.
+//
+// The predicate is the load-bearing race-safety guarantee, exactly as
+// in AbortMigratingInstance: `state = 'running' AND node_id = $2`. If
+// the node came back and its vmmd re-registered, or a peer already
+// transitioned the row (park, evict, migrate), RowsAffected() is 0 and
+// we return ErrConflict so the caller counts it and moves on rather
+// than second-guessing the state machine. Pinning node_id means a row
+// that migrated to a healthy node between the SELECT and this UPDATE
+// is never failed by a stale read.
+//
+// running → failed is a legal edge (machine.go validTransitions), and
+// FAILED is excluded from CountsForRAM(), which is what actually stops
+// the billing leak: meterd's sampler skips the row on its next tick.
+// FAILED (not PARKED) because no snapshot was taken — the VM died with
+// its host. The wake path treats FAILED as cold-bootable (ADR-005), so
+// the customer's next request still serves.
+func (s *PgStore) FailRunningInstanceOnDeadNode(ctx context.Context, instanceID, nodeID string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty instanceID")
+	}
+	if nodeID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty nodeID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'failed',
+		        terminal_at = now()
+		  where id = $1
+		    and state = 'running'
+		    and node_id = $2`,
+		instanceID, nodeID)
+	if err != nil {
+		return fmt.Errorf("state: fail running instance on dead node: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrConflict
@@ -6642,6 +6729,54 @@ func (s *PgStore) ListInstancesByStatesOlderThan(ctx context.Context, states []S
 		stateStrs, threshold)
 	if err != nil {
 		return nil, err
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
+// ListRunningInstancesOnDeadNodes is the dead-node billing
+// reconciler's lookup. Joins instances → compute_nodes and returns
+// RUNNING rows whose owning node is not alive.
+//
+// Liveness is the OR of two predicates on purpose:
+//
+//   - `active = false` — schedd's heartbeat sweep already flipped the
+//     node (pkg/sched/heartbeat.go). This is the steady-state signal.
+//   - `last_heartbeat_at < threshold` — the flip has not landed yet.
+//     MarkComputeNodeInactive is only called from the heartbeat
+//     goroutine, so a schedd restart (or a schedd that never came
+//     back) leaves a dead node with active = true indefinitely.
+//     Without this second predicate the reconciler would inherit the
+//     exact liveness blind spot it exists to close.
+//
+// ORDER BY last_heartbeat_at ASC so a capped tick drains the
+// longest-dead nodes first — those are the rows accruing the most
+// incorrect billing. The limit keeps one tick's write burst bounded
+// on a fleet where a whole node's worth of instances goes dead at
+// once; the caller re-runs on the next tick until the set is empty.
+func (s *PgStore) ListRunningInstancesOnDeadNodes(ctx context.Context, threshold time.Time, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: limit must be > 0, got %d", limit)
+	}
+	rows, err := s.pool.Query(ctx,
+		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at,
+		        i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
+		 from instances i
+		 join compute_nodes n on n.id = i.node_id
+		 where i.state = 'running'
+		   and (n.active = false or n.last_heartbeat_at < $1)
+		 -- Tie-break on instance id so a capped query is
+		 -- deterministic when many rows share the same heartbeat
+		 -- timestamp (MemStore's ListRunningInstancesOnDeadNodes
+		 -- does the same). Without this, a multi-host fleet where
+		 -- N>cap rows die at once can leave different rows waiting
+		 -- an extra tick between runs of identical input.
+		 order by n.last_heartbeat_at asc, i.id asc
+		 limit $2`,
+		threshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: %w", err)
 	}
 	defer rows.Close()
 	return scanInstances(rows)

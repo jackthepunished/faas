@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -112,6 +113,13 @@ type AppListItem struct {
 	AppID      string
 	Plan       string
 	QuotaLabel string
+	// SLO is the per-row SLO badge (issue #696 / ADR-082
+	// dashboard follow-up PR). nil = no badge (Prometheus not
+	// configured, or the row is beyond the apps-list badge
+	// cap). When non-nil the template renders the Label +
+	// Glyph ("ok" / "warn" / "down") inside the row's
+	// "SLO" cell.
+	SLO *views.SLOBadge
 }
 
 // ManifestView is the runner-scaffold snapshot shown on the app detail
@@ -191,6 +199,21 @@ type AppDetailData struct {
 	// "prometheus" / "degraded: <err>" vocabulary the public status
 	// page uses so the dashboard has one empty-state path.
 	Metrics *AppMetricsView
+	// SLOApp is the per-app SLO panel (issue #696 / ADR-082,
+	// dashboard follow-up PR). nil = skip the section entirely
+	// (the fetch failed non-fatally OR the window query-string was
+	// invalid). When non-nil with the "degraded:" prefix on Source
+	// the template renders the same empty-state badge the Metrics
+	// card uses. The window is echoed via SLODuration so the
+	// page's window-selector tab strip knows which tab is active.
+	SLOApp *views.AppSLOView
+	// SLODuration is the page-level helper that surfaces the
+	// current SLO window ("1h" / "24h" / "7d") and the as-of
+	// timestamp. The template uses the window to mark the
+	// active tab in the window-selector nav; the timestamp is
+	// pre-formatted at the handler edge so the template stays
+	// a pure renderer.
+	SLODuration views.SLOStamp
 	// Alerts is the per-app (and account-wide) alert-rule snapshot
 	// (issue #396 / ADR-045, PR 4). nil means the apid dashboard
 	// query failed non-fatally (the page renders the "Alerts"
@@ -577,6 +600,18 @@ type AccountData struct {
 	// dismissal cookie — count-zero is the natural off-switch.
 	// Renders on account.html beneath the FlashSurface block.
 	ActionRequiredSurface string
+	// SLOAccount is the per-account SLO panel (issue #696 /
+	// ADR-082, dashboard follow-up PR). nil = skip the
+	// section entirely (the fetch failed non-fatally OR the
+	// window query-string was invalid). When non-nil with the
+	// "degraded:" prefix on Source the template renders the
+	// same empty-state badge the per-app SLO card uses.
+	SLOAccount *views.AccountSLOView
+	// SLODuration mirrors the per-app page's helper. The
+	// template uses Window to mark the active tab in the
+	// window-selector nav; AsOf is the pre-formatted
+	// timestamp.
+	SLODuration views.SLOStamp
 }
 
 // AuthCapabilitiesView is the dashboard-facing slice of

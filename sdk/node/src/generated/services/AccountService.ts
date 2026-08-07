@@ -3,11 +3,13 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AccountDeletionResponse } from '../models/AccountDeletionResponse.js';
+import type { AccountEgressAllowlistExtraResponse } from '../models/AccountEgressAllowlistExtraResponse.js';
 import type { AccountExportResponse } from '../models/AccountExportResponse.js';
 import type { AccountResponse } from '../models/AccountResponse.js';
 import type { AccountSLOResponse } from '../models/AccountSLOResponse.js';
 import type { ChangePlanRequest } from '../models/ChangePlanRequest.js';
 import type { RaiseOverageCapRequest } from '../models/RaiseOverageCapRequest.js';
+import type { SetAccountEgressAllowlistExtraRequest } from '../models/SetAccountEgressAllowlistExtraRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -236,6 +238,72 @@ export class AccountService {
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
+      },
+    });
+  }
+  /**
+   * Read the per-account egress allowlist extra budget.
+   * Returns the per-account additive budget on top of the
+   * plan's `apps.egress_allowlist` cap (issue #679 / PR-B /
+   * ADR-082). The plan cap (Pro 16 / Scale 64) is
+   * authoritative for the default case; the additive budget
+   * lets admins raise one account's effective cap without
+   * changing the plan default for everyone. `extra=0`
+   * means "no override" — the plan cap is authoritative.
+   *
+   * Admin scope is required.
+   *
+   * @returns AccountEgressAllowlistExtraResponse Current extra + plan cap + global max extra.
+   * @throws ApiError
+   */
+  public static getAccountEgressAllowlistExtra(): CancelablePromise<AccountEgressAllowlistExtraResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/account/egress_allowlist_extra',
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Set the per-account egress allowlist extra budget.
+   * Writes the per-account additive budget. `extra=0` clears
+   * the override (the plan cap is authoritative again);
+   * negative values or values above `max_extra` (1024) are
+   * rejected with `account_egress_allowlist_extra_out_of_range`.
+   * The PATCH emits an `account.egress_allowlist_extra_set`
+   * audit row carrying `old_extra`, `new_extra`, `plan_cap`,
+   * and `max_extra` so the dashboard can render the toggle
+   * history.
+   *
+   * Admin scope + MFA are required.
+   *
+   * @returns AccountEgressAllowlistExtraResponse Override applied; the body echoes the new value.
+   * @throws ApiError
+   */
+  public static setAccountEgressAllowlistExtra({
+    requestBody,
+  }: {
+    requestBody: SetAccountEgressAllowlistExtraRequest,
+  }): CancelablePromise<AccountEgressAllowlistExtraResponse> {
+    return __request(OpenAPI, {
+      method: 'PATCH',
+      url: '/v1/account/egress_allowlist_extra',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `Invalid body (e.g. extra < 0 or extra > max_extra).`,
+        401: `code: unauthorized`,
+        403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
       },
     });
   }

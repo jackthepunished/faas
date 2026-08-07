@@ -388,6 +388,73 @@ func TestCreateDeploymentOverrides_Validate(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 			wantInBody: "liveness_probe.consecutive_failures must be <= 10; got 11",
 		},
+		// Issue #554 closure / ADR-078, code review #725 finding
+		// F2: cooldown_s is server-side clamped to [10, 600]
+		// (or 0 = no cooldown gate). The OpenAPI spec promises
+		// this; without the server-side check a typo (cooldown=999999)
+		// would wedge the deployment.
+		{
+			name: "liveness-probe-cooldown-negative",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					CooldownS: -1,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.cooldown_s must be >= 0 (0 = no cooldown gate); got -1",
+		},
+		{
+			name: "liveness-probe-cooldown-below-floor",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					CooldownS: 5, // >0 but below MinLivenessCooldownSeconds=10
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.cooldown_s must be 0 (no cooldown) or in [10, 600]; got 5",
+		},
+		{
+			name: "liveness-probe-cooldown-above-ceiling",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					CooldownS: 999999,
+				},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantInBody: "liveness_probe.cooldown_s must be <= 600; got 999999",
+		},
+		{
+			name: "liveness-probe-cooldown-zero-bypass-accepted",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					CooldownS: 0, // explicit "no cooldown" — Free-plan / legacy
+				},
+			},
+			// 0 is a valid sentinel — the gate bypasses cleanly
+			// in production; do NOT reject it.
+		},
+		{
+			name: "liveness-probe-cooldown-at-floor-accepted",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					CooldownS: MinLivenessCooldownSeconds, // 10 — inclusive floor
+				},
+			},
+		},
+		{
+			name: "liveness-probe-cooldown-at-ceiling-accepted",
+			overrides: &CreateDeploymentOverrides{
+				LivenessProbe: &DeploymentLivenessProbe{
+					Path:      "/healthz",
+					CooldownS: MaxLivenessCooldownSeconds, // 600 — inclusive ceiling
+				},
+			},
+		},
 		{
 			name: "liveness-probe-minimal-path-only",
 			overrides: &CreateDeploymentOverrides{

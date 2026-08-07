@@ -235,6 +235,61 @@ func TestUpdateAppMinInstances_Negative(t *testing.T) {
 	assertProblem(t, rec, 422, api.CodeInvalidMinInstances)
 }
 
+// TestUpdateDeploymentMinInstances_FreeGate pins the issue #557 /
+// ADR-072 plan-gate fix: a Free account PATCHing
+// deployments.min_instances MUST return 403
+// plan_min_instances_not_allowed, not 422
+// max_min_instances_exceeded. Pre-fix the handler skipped the
+// MinInstancesAllowed gate and Free plans masked the bug
+// accidentally because `MaxMinInstances == 0` always tripped the
+// value cap with the wrong error code. The fix adds the
+// `acct.Plan.MinInstancesAllowed()` gate at the top of the
+// handler, mirroring the per-app gate at validateUpdateApp.
+func TestUpdateDeploymentMinInstances_FreeGate(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	d := mustSeedDeployment(t, e, "free-dep")
+	one := 1
+	rec := e.do(t, "PATCH", "/v1/deployments/"+d.ID, api.UpdateDeploymentRequest{MinInstances: &one}, nil)
+	assertProblem(t, rec, 403, api.CodePlanMinInstancesNotAllowed)
+}
+
+// TestUpdateDeploymentMinInstances_HobbyHappy is the symmetric
+// happy-path: Hobby plans now accept the per-deployment floor
+// (issue #462 / ADR-058 / PR-A tier-up). The response carries the
+// new value. Mirrors TestUpdateAppMinInstances_Hobby above.
+func TestUpdateDeploymentMinInstances_HobbyHappy(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	d := mustSeedDeployment(t, e, "hobby-dep")
+	one := 1
+	rec := e.do(t, "PATCH", "/v1/deployments/"+d.ID, api.UpdateDeploymentRequest{MinInstances: &one}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.MinInstances != 1 {
+		t.Errorf("MinInstances = %d, want 1", out.MinInstances)
+	}
+}
+
+// TestUpdateDeploymentMinInstances_Negative pins the 422 path: a
+// Pro plan PATCHing -1 on a deployment gets
+// invalid_min_instances, not plan_min_instances_not_allowed.
+// Pre-fix the handler returned 400 (validation) instead of 422
+// (semantic) for negative values; the new code lifts the negative
+// check to the same 422 ErrInvalidMinInstances the per-app handler
+// emits. The plan gate ran first so a Free plan PATCHing -1 still
+// gets 403 (covered by TestUpdateDeploymentMinInstances_FreeGate).
+func TestUpdateDeploymentMinInstances_Negative(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	d := mustSeedDeployment(t, e, "pro-dep-neg")
+	neg := -1
+	rec := e.do(t, "PATCH", "/v1/deployments/"+d.ID, api.UpdateDeploymentRequest{MinInstances: &neg}, nil)
+	assertProblem(t, rec, 422, api.CodeInvalidMinInstances)
+}
+
 // TestUpdateAppAutoscaleRPS_FreeGate locks the plan-tier gate for the
 // reactive scale-up trigger (issue #169 / #172). Free plans cannot set
 // autoscale_target_rps at all — the handler must return 403
@@ -3505,5 +3560,137 @@ func TestWithParkedDeploymentRef_StoreErrorLoggedAndIgnored(t *testing.T) {
 	}
 	if !strings.Contains(logged, "simulated PG outage") {
 		t.Errorf("expected warn-log to mention the error, got: %s", logged)
+	}
+}
+
+// --- PR-B (issue #679 / ADR-082) per-account additive budget --------------
+//
+// The validator at `validateUpdateApp` consults
+// `acct.Plan.EgressAllowlistMaxSize() + acct.EgressAllowlistExtra`
+// for the per-app CIDR cap. The additive budget is admin-set
+// (mirrors grace_window_days); the customer-facing validator is
+// the only place the value is read. The tests below pin each
+// boundary case so the validator's effective cap is provably
+// `plan_cap + extra` across the plan tiers.
+//
+// Test surface:
+//   - Pro (cap 16) + extra=1, PATCH 17 → 200 (one over cap is OK).
+//   - Pro (cap 16) + extra=1, PATCH 18 → 400 (two over rejects).
+//   - Scale (cap 64) + extra=0, PATCH 64 → 200 (plan cap is exact).
+//   - Scale (cap 64) + extra=0, PATCH 65 → 400 (regression lock).
+//   - Pro (cap 16) + extra=0, PATCH 17 → 400 (regression lock).
+//
+// All of these are read-side only — the validator never writes
+// `EgressAllowlistExtra`. The store assertion is omitted by
+// design; the memstore field is touched only by the admin
+// handler (covered in handlers_account_test.go).
+//
+// TestUpdateAppEgressAllowlist_ExtraBudgetAllowsOneOverCap: Pro
+// (cap 16) with extra=1 — PATCH 17 entries must succeed. The
+// validator's effective cap is `16 + 1 = 17`.
+func TestUpdateAppEgressAllowlist_ExtraBudgetAllowsOneOverCap(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-extra-one")
+	if err := e.store.SetAccountEgressAllowlistExtra(context.Background(), e.acct.ID, 1); err != nil {
+		t.Fatalf("seed extra=1: %v", err)
+	}
+	seventeen := make([]string, 0, 17)
+	for i := 1; i <= 17; i++ {
+		seventeen = append(seventeen, fmt.Sprintf("10.0.%d.0/24", i))
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/pro-extra-one", api.UpdateAppRequest{
+		EgressAllowlist: &seventeen,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestUpdateAppEgressAllowlist_ExtraBudgetBoundaryRejected: Pro
+// (cap 16) with extra=1 — PATCH 18 entries must surface 400
+// egress_allowlist_too_long. The one-over-cap allowance is
+// exactly `extra`; the boundary is closed.
+func TestUpdateAppEgressAllowlist_ExtraBudgetBoundaryRejected(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-extra-one-too-many")
+	if err := e.store.SetAccountEgressAllowlistExtra(context.Background(), e.acct.ID, 1); err != nil {
+		t.Fatalf("seed extra=1: %v", err)
+	}
+	eighteen := make([]string, 0, 18)
+	for i := 1; i <= 18; i++ {
+		eighteen = append(eighteen, fmt.Sprintf("10.0.%d.0/24", i))
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/pro-extra-one-too-many", api.UpdateAppRequest{
+		EgressAllowlist: &eighteen,
+	}, nil)
+	assertProblem(t, rec, 400, api.CodeEgressAllowlistTooLong)
+}
+
+// TestUpdateAppEgressAllowlist_ScaleAtPlanCap: Scale (cap 64)
+// with extra=0 — PATCH 64 entries must succeed. The plan cap is
+// the exact limit when the extra budget is zero.
+func TestUpdateAppEgressAllowlist_ScaleAtPlanCap(t *testing.T) {
+	e := setup(t, api.PlanScale)
+	mustSeedApp(t, e, "scale-at-cap")
+	cap64 := make([]string, 0, 64)
+	for i := 1; i <= 64; i++ {
+		cap64 = append(cap64, fmt.Sprintf("10.0.%d.0/24", i))
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/scale-at-cap", api.UpdateAppRequest{
+		EgressAllowlist: &cap64,
+	}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestUpdateAppEgressAllowlist_ScaleOverPlanCap: Scale (cap 64)
+// with extra=0 — PATCH 65 entries must surface 400
+// egress_allowlist_too_long. The plan cap is the exact limit when
+// the extra budget is zero.
+func TestUpdateAppEgressAllowlist_ScaleOverPlanCap(t *testing.T) {
+	e := setup(t, api.PlanScale)
+	mustSeedApp(t, e, "scale-over-cap")
+	overCap := make([]string, 0, 65)
+	for i := 1; i <= 65; i++ {
+		overCap = append(overCap, fmt.Sprintf("10.0.%d.0/24", i))
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/scale-over-cap", api.UpdateAppRequest{
+		EgressAllowlist: &overCap,
+	}, nil)
+	assertProblem(t, rec, 400, api.CodeEgressAllowlistTooLong)
+}
+
+// TestUpdateAppEgressAllowlist_ExtraAppliedToValidatorMessage: a
+// PATCH over the bare plan cap but within the extra-augmented cap
+// must produce a 400 whose problem detail reports the EFFECTIVE
+// cap (plan+extra), not the bare plan cap. This is the wire-shape
+// invariant the dashboard depends on (the limit field is the
+// number the customer can hit 1-by-1, not the plan marketing
+// figure).
+func TestUpdateAppEgressAllowlist_ExtraAppliedToValidatorMessage(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	mustSeedApp(t, e, "pro-cap-message")
+	if err := e.store.SetAccountEgressAllowlistExtra(context.Background(), e.acct.ID, 4); err != nil {
+		t.Fatalf("seed extra=4: %v", err)
+	}
+	// 21 entries: > 16 (plan cap) but > 20 (plan+extra=20) — should
+	// reject with 400 and the limit field must read 20.
+	beyond := make([]string, 0, 21)
+	for i := 1; i <= 21; i++ {
+		beyond = append(beyond, fmt.Sprintf("10.0.%d.0/24", i))
+	}
+	rec := e.do(t, "PATCH", "/v1/apps/pro-cap-message", api.UpdateAppRequest{
+		EgressAllowlist: &beyond,
+	}, nil)
+	if rec.Code != 400 {
+		t.Fatalf("status %d, want 400: %s", rec.Code, rec.Body)
+	}
+	var p api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+		t.Fatalf("problem decode: %v: %s", err, rec.Body)
+	}
+	if p.Limit != nil && *p.Limit != 20 {
+		t.Errorf("problem.limit = %d, want 20 (plan_cap=16 + extra=4)", *p.Limit)
 	}
 }

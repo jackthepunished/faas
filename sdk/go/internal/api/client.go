@@ -47,6 +47,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -65,6 +66,11 @@ import (
 // before calling.
 type Client struct {
 	baseURL string
+	// token is guarded by tokenMu so long-lived daemons can rotate
+	// the bearer via SetToken without racing concurrent request
+	// builders. RWMutex because reads dominate writes — every
+	// outbound request reads; rotation is rare.
+	tokenMu sync.RWMutex
 	token   string
 
 	http       *http.Client // 30s default — used for every JSON call
@@ -107,7 +113,30 @@ func (c *Client) BaseURL() string { return c.baseURL }
 // secret; do NOT log it, surface it in errors, or persist it. SDK
 // callers that need to forward the token to other surfaces should
 // copy it into a local variable scoped to the request.
-func (c *Client) Token() string { return c.token }
+//
+// Safe for concurrent use; takes c.tokenMu read-lock.
+func (c *Client) Token() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.token
+}
+
+// SetToken rotates the bearer token used for subsequent requests
+// without reconstructing the Client. Useful for long-lived daemons
+// that mint short-lived session tokens via the SDK (issue #560 /
+// ADR-080 follow-up: faas.WithToken now wires through to this).
+// An empty token suppresses the Authorization header on subsequent
+// requests (useful for falling back to the anonymous device-code
+// flow mid-session).
+//
+// Safe for concurrent use; takes c.tokenMu write-lock. In-flight
+// requests built before SetToken continues to use the prior token;
+// new requests see the new token.
+func (c *Client) SetToken(token string) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+	c.token = token
+}
 
 // uploadHTTP returns the upload client or falls back to the default.
 func (c *Client) uploadHTTP() *http.Client {
@@ -115,6 +144,19 @@ func (c *Client) uploadHTTP() *http.Client {
 		return c.deployHTTP
 	}
 	return c.http
+}
+
+// addAuthHeader sets Authorization: Bearer <token> on req when the
+// Client holds a non-empty token. Reads c.tokenMu so it sees the
+// latest value set by SetToken (issue #560 / ADR-080 follow-up:
+// rotation without Client reconstruction).
+func (c *Client) addAuthHeader(req *http.Request) {
+	c.tokenMu.RLock()
+	token := c.token
+	c.tokenMu.RUnlock()
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 // do executes an HTTP request against c.baseURL+path with the SDK's
@@ -134,9 +176,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if err != nil {
 		return err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	// UX §3.2 / impl §4.2: every mutating call carries Idempotency-Key
 	// so a retried deploy/park/wake/rollback/etc. never double-charges
 	// or double-creates. We never override an explicit key the caller
@@ -215,9 +255,7 @@ func (c *Client) DeleteAccount(ctx context.Context, idempotencyKey string) (Acco
 	if err != nil {
 		return AccountDeletionResponse{}, err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	req.Header.Set("Idempotency-Key", idempotencyKey)
 	var out AccountDeletionResponse
 	return out, c.doReq(c.http, req, &out)
@@ -298,9 +336,7 @@ func (c *Client) DeployMultipart(ctx context.Context, slug string, source io.Rea
 	if err != nil {
 		return DeploymentResponse{}, err
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.addAuthHeader(req)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	// DeployMultipart bypasses Client.do (multipart Content-Type wins
 	// over the JSON default) and routes through the longer-timeout
@@ -354,6 +390,33 @@ func (c *Client) RaiseOverageCap(ctx context.Context, overageCapCents *int64) (A
 	body := map[string]any{"overage_cap_cents": overageCapCents}
 	var out AccountResponse
 	return out, c.do(ctx, "POST", "/v1/account/overage-cap", body, &out)
+}
+
+// GetEgressAllowlistExtra returns the per-account additive budget
+// on top of the plan's apps.egress_allowlist cap (issue #679 /
+// PR-B / ADR-082). The response carries the live value plus the
+// plan cap and the global ceiling so the CLI can render the
+// "Override: N / Plan cap: 16 / Max extra: 1024" trio without
+// a second round-trip.
+//
+// Admin scope + MFA are required (the client passes the same
+// auth as for RaiseOverageCap and ChangePlan).
+func (c *Client) GetEgressAllowlistExtra(ctx context.Context) (AccountEgressAllowlistExtraResponse, error) {
+	var out AccountEgressAllowlistExtraResponse
+	return out, c.do(ctx, "GET", "/v1/account/egress_allowlist_extra", nil, &out)
+}
+
+// SetEgressAllowlistExtra sets the per-account additive budget
+// (issue #679 / PR-B / ADR-082). Pass 0 to clear the override (the
+// plan cap is authoritative again). Negative values or values
+// above the global ceiling are rejected with
+// CodeAccountEgressAllowlistExtraOutOfRange (HTTP 400).
+//
+// Admin scope + MFA are required.
+func (c *Client) SetEgressAllowlistExtra(ctx context.Context, extra int) (AccountEgressAllowlistExtraResponse, error) {
+	var out AccountEgressAllowlistExtraResponse
+	return out, c.do(ctx, "PATCH", "/v1/account/egress_allowlist_extra",
+		SetAccountEgressAllowlistExtraRequest{Extra: extra}, &out)
 }
 
 // GetStatusSLO fetches the public SLO snapshot.
@@ -756,6 +819,34 @@ func (c *Client) UsageSummary(ctx context.Context, month string) (UsageSummaryRe
 	path := "/v1/usage/summary"
 	if month != "" {
 		path += "?month=" + month
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetAppSLO returns the per-app SLO panel for slug over the
+// named SLO window. window is one of "1h", "24h", "7d"
+// (strict subset of the /metrics vocabulary) — empty
+// falls back to the server's default (24h). Issue #696 /
+// ADR-082. Distinct from GetAppMetrics (issue #273 /
+// ADR-042) which is the 5m-window dashboard panel.
+func (c *Client) GetAppSLO(ctx context.Context, slug, window string) (AppSLOResponse, error) {
+	var out AppSLOResponse
+	path := "/v1/apps/" + slug + "/slo"
+	if window != "" {
+		path += "?window=" + window
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetAccountSLO returns the account-wide SLO rollup over
+// the named SLO window. Flat scalar response (no per-app
+// map). window follows the same closed vocabulary as the
+// per-app endpoint. Issue #696 / ADR-082.
+func (c *Client) GetAccountSLO(ctx context.Context, window string) (AccountSLOResponse, error) {
+	var out AccountSLOResponse
+	path := "/v1/account/slo"
+	if window != "" {
+		path += "?window=" + window
 	}
 	return out, c.do(ctx, "GET", path, nil, &out)
 }

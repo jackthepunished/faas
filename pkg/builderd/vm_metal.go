@@ -1,4 +1,4 @@
-//go:build metal
+//go:build metal && linux
 
 // Package builderd (metal) — ephemeral builder microVM spawn.
 //

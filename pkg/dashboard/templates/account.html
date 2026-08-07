@@ -142,6 +142,66 @@
           {{end}}
         </section>
       {{end}}
+
+      <!-- Issue #696 / ADR-082 dashboard follow-up PR. Per-account
+           SLO panel. Mirrors the per-app shape; the data is
+           fleet-wide (the per-app view is the per-app drill-down).
+           Window selector round-trips the ?window= query string.
+           nil = Prometheus not configured; degraded Source = empty
+           badge; zero requests AND zero usage = the "no data" empty
+           state. -->
+      {{if .Data.SLOAccount}}
+        <section aria-label="Account SLO">
+          <h2>SLO
+            <small style="font-weight:normal;color:#888">(last {{.Data.SLOAccount.Window}}, account-wide)</small>
+            <nav aria-label="SLO window" style="display:inline-block;margin-left:0.5em">
+              <a href="?window=1h" {{if eq .Data.SLODuration.Window "1h"}}class="badge"{{else}}style="color:#888"{{end}}>1h</a>
+              <a href="?window=24h" {{if eq .Data.SLODuration.Window "24h"}}class="badge"{{else}}style="color:#888"{{end}}>24h</a>
+              <a href="?window=7d" {{if eq .Data.SLODuration.Window "7d"}}class="badge"{{else}}style="color:#888"{{end}}>7d</a>
+            </nav>
+            {{if eq .Data.SLOAccount.Source "prometheus"}}{{else}}
+              <span class="badge dim" title="{{.Data.SLOAccount.Source}}">degraded</span>
+            {{end}}
+          </h2>
+          {{if and (eq .Data.SLOAccount.RequestsTotal 0) (eq .Data.SLOAccount.InstanceHours 0.0)}}
+            <p>No traffic in the last {{.Data.SLOAccount.Window}}. The SLO panel populates once any app in this account receives requests.</p>
+          {{else}}
+            <p>
+              Latency is end-to-end fleet-wide, 2xx class only. The
+              headroom vs. any single app's SLO is the well-known
+              "fleet / per-app" elasticity — when one app QPS-spikes
+              the per-app SLO drops but the fleet latency is smooth.
+            </p>
+            <table>
+              <thead><tr><th></th><th>Value</th><th>Trend</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>Latency p50 / p95 / p99</td>
+                  <td>{{printf "%.1f" .Data.SLOAccount.RequestDuration.P50MS}} / {{printf "%.1f" .Data.SLOAccount.RequestDuration.P95MS}} / {{printf "%.1f" .Data.SLOAccount.RequestDuration.P99MS}} ms</td>
+                  <td>{{.Data.SLOAccount.LatencySparklineHTML}}</td>
+                </tr>
+                <tr>
+                  <td>Error rate</td>
+                  <td>{{printf "%.2f" .Data.SLOAccount.ErrorRatePct}}%</td>
+                  <td>{{.Data.SLOAccount.ErrorSparklineHTML}}</td>
+                </tr>
+                <tr>
+                  <td>Cold-boot rate</td>
+                  <td>{{printf "%.2f" .Data.SLOAccount.ColdBootRatePct}}%</td>
+                  <td>{{.Data.SLOAccount.ColdBootSparklineHTML}}</td>
+                </tr>
+              </tbody>
+            </table>
+            <dl>
+              <dt>Requests</dt><dd>{{.Data.SLOAccount.RequestsTotal}}</dd>
+              <dt>Throttled</dt><dd>{{.Data.SLOAccount.ThrottledTotal}}</dd>
+              <dt>Wake queue p95 <small style="color:#888">(fleet)</small></dt><dd>{{printf "%.1f" .Data.SLOAccount.WakeQueueP95MS}} ms</dd>
+              <dt>Instance hours <small style="color:#888">(sum across all apps)</small></dt><dd>{{printf "%.3f" .Data.SLOAccount.InstanceHours}}</dd>
+              <dt>GB hours <small style="color:#888">(sum across all apps)</small></dt><dd>{{printf "%.4f" .Data.SLOAccount.GBHours}}</dd>
+            </dl>
+          {{end}}
+        </section>
+      {{end}}
     {{end}}
   </main>
   <footer>onebox faas · M7.5 dashboard · server-rendered, no SPA build</footer>

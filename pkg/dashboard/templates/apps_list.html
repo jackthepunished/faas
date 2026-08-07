@@ -71,7 +71,7 @@
       {{$items := .Data}}
       {{if $items}}
         <table>
-          <thead><tr><th>Slug</th><th>State</th><th>Lifecycle</th><th>Rate limit</th><th>URL</th><th>Last deploy</th><th></th></tr></thead>
+          <thead><tr><th>Slug</th><th>State</th><th>Lifecycle</th><th>Rate limit</th><th>SLO</th><th>URL</th><th>Last deploy</th><th></th></tr></thead>
           <tbody>
             {{range $items}}
               <tr>
@@ -95,6 +95,20 @@
                      a follow-up PR can wire hx-get without re-templating. -->
                 <td data-app-id="{{.AppID}}" data-plan="{{.Plan}}">
                   <span class="quota-cell">{{.QuotaLabel}}</span>
+                </td>
+                <!-- Issue #696 / ADR-082 dashboard follow-up PR.
+                     Per-row SLO badge: worst-field value (p95 latency
+                     if elevated, else error rate). nil = no badge
+                     (Prometheus not configured or row is beyond the
+                     25-app cap). The glyph drives the badge colour.
+                     The full per-app SLO panel lives on the row's
+                     "Details" page. -->
+                <td>
+                  {{if .SLO}}
+                    <span class="badge {{.SLO.Glyph}}" title="{{.SLO.Source}}">{{.SLO.Label}}</span>
+                  {{else}}
+                    <span style="color:#888">—</span>
+                  {{end}}
                 </td>
                 <td><a href="{{.URL}}">{{.URL}}</a></td>
                 <td>{{.LastDeployed}}</td>

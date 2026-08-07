@@ -3785,6 +3785,79 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/account/egress_allowlist_extra:
+    get:
+      tags: [account]
+      operationId: getAccountEgressAllowlistExtra
+      summary: Read the per-account egress allowlist extra budget.
+      description: |
+        Returns the per-account additive budget on top of the
+        plan's `apps.egress_allowlist` cap (issue #679 / PR-B /
+        ADR-082). The plan cap (Pro 16 / Scale 64) is
+        authoritative for the default case; the additive budget
+        lets admins raise one account's effective cap without
+        changing the plan default for everyone. `extra=0`
+        means "no override" — the plan cap is authoritative.
+
+        Admin scope is required.
+      responses:
+        '200':
+          description: Current extra + plan cap + global max extra.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountEgressAllowlistExtraResponse'
+              example: { extra: 0, plan_cap: 16, max_extra: 1024 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [account]
+      operationId: setAccountEgressAllowlistExtra
+      summary: Set the per-account egress allowlist extra budget.
+      description: |
+        Writes the per-account additive budget. `extra=0` clears
+        the override (the plan cap is authoritative again);
+        negative values or values above `max_extra` (1024) are
+        rejected with `account_egress_allowlist_extra_out_of_range`.
+        The PATCH emits an `account.egress_allowlist_extra_set`
+        audit row carrying `old_extra`, `new_extra`, `plan_cap`,
+        and `max_extra` so the dashboard can render the toggle
+        history.
+
+        Admin scope + MFA are required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetAccountEgressAllowlistExtraRequest'
+            example: { extra: 8 }
+      responses:
+        '200':
+          description: Override applied; the body echoes the new value.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountEgressAllowlistExtraResponse'
+              example: { extra: 8, plan_cap: 16, max_extra: 1024 }
+        '400':
+          description: "Invalid body (e.g. extra < 0 or extra > max_extra)."
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: about:blank
+                title: "egress_allowlist_extra out of range"
+                code: account_egress_allowlist_extra_out_of_range
+                status: 400
+                detail: "extra=1025 is outside [0, 1024]; clear with extra=0 to fall back to the plan cap."
+                limit: 1024
+                observed: 1025
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Audit events (IAM-4 / ADR-035) ───────────────────────────────────────
 
   /v1/audit-events:
@@ -6380,11 +6453,16 @@ components:
         - `interval_s` ∈ [0, 60] (0 = inherit per-plan default; Hobby/Pro/Scale → 5 s).
         - `timeout_s` ∈ [0, 5] (0 = inherit 2 s).
         - `consecutive_failures` ∈ [0, 10] (0 = inherit per-plan default; Hobby/Pro/Scale → 3).
+        - `cooldown_s` ∈ [10, 600] (cooldown gate enforced by the vmmd-side
+          probe loop after a destroy fires — see ADR-078; 0 = no cooldown, the
+          legacy Free-plan behaviour).
 
-        Per-deployment overrides of `interval_s` / `timeout_s` / `consecutive_failures`
+        Per-deployment overrides of `interval_s` / `timeout_s` / `consecutive_failures` / `cooldown_s`
         are clamped to the bounds above. The counter resets to 0 on the first 2xx
         and survives an intermittent 5xx across the consecutive window (AC #2:
-        flaky app does NOT oscillate).
+        flaky app does NOT oscillate). The cooldown gate short-circuits the
+        counter when a probe fires inside the previous destroy's window so the
+        cold-boot replacement instance has a grace period to settle.
       type: object
       required: [path]
       properties:
@@ -6392,6 +6470,7 @@ components:
         interval_s: { type: integer, minimum: 0, maximum: 60, description: "Per-plan poll cadence in seconds; 0 = inherit per-plan default (Hobby/Pro/Scale → 5 s). Clamped to [MinLivenessPeriodSeconds=1, MaxLivenessPeriodSeconds=60]." }
         timeout_s:  { type: integer, minimum: 0, maximum: 5, description: "Per-probe HTTP timeout in seconds; 0 = inherit 2 s default (VsockLivenessTimeoutMs). A timeout is treated identically to a non-2xx response by the failure counter." }
         consecutive_failures: { type: integer, minimum: 0, maximum: 10, description: "N at which DestroyForLivenessFailure fires; 0 = inherit per-plan default (Hobby/Pro/Scale → 3). The counter is reset to 0 on the first 2xx and survives an intermittent 5xx across the consecutive window (AC #2 — flaky app does NOT oscillate)." }
+        cooldown_s: { type: integer, minimum: 0, maximum: 600, description: "Cooldown window in seconds after a liveness-driven destroy fires. While inside the window the vmmd-side probe loop short-circuits the failure counter so the cold-boot replacement has time to settle (issue #554 closure / ADR-078). 0 = no cooldown (Free-plan / legacy behaviour); clamped to [MinLivenessCooldownSeconds=10, MaxLivenessCooldownSeconds=600] when the field is populated by a Pro/Scale deployment override." }
 
     ScanResult:
       description: |
@@ -7090,6 +7169,22 @@ components:
       properties:
         days: { type: [integer, "null"], minimum: 0 }
         plan_default: { type: integer, minimum: 0, description: "Platform default grace window in days (api.DefaultAPIKeyGraceWindowDays = 7)." }
+
+    SetAccountEgressAllowlistExtraRequest:
+      description: "Body of PATCH /v1/account/egress_allowlist_extra (issue #679 / PR-B / ADR-082). `extra` is the per-account additive budget on top of the plan's `apps.egress_allowlist` cap. `extra=0` clears the override (the plan cap is authoritative again); negative values or values above `max_extra` (1024) are rejected with `account_egress_allowlist_extra_out_of_range`."
+      type: object
+      required: [extra]
+      properties:
+        extra: { type: integer, minimum: 0, description: "Requested additive budget, in CIDR count. 0 = clear the override; values above max_extra are rejected." }
+
+    AccountEgressAllowlistExtraResponse:
+      description: "Body of GET /v1/account/egress_allowlist_extra and PATCH /v1/account/egress_allowlist_extra. The trio (extra, plan_cap, max_extra) lets the dashboard render the override + plan cap + global ceiling in a single round-trip."
+      type: object
+      required: [extra, plan_cap, max_extra]
+      properties:
+        extra: { type: integer, minimum: 0, description: "Effective additive budget currently in force. 0 = no override; the plan cap is authoritative." }
+        plan_cap: { type: integer, minimum: 0, description: "Plan cap on apps.egress_allowlist CIDR count (Pro 16, Scale 64; Free/Hobby 0 — those plans don't unlock the knob at all)." }
+        max_extra: { type: integer, minimum: 0, description: "Global ceiling on the per-account override (api.MaxAccountEgressAllowlistExtra = 1024). Flat across plans; the validator rejects out-of-range values with `account_egress_allowlist_extra_out_of_range`." }
 
     # ─── Audit events (IAM-4 / ADR-035) ──────────────────────────────────
 

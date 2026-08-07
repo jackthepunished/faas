@@ -1447,6 +1447,38 @@ func (m *MemStore) SetAccountKeyGraceWindow(_ context.Context, accountID string,
 	return nil
 }
 
+// GetAccountEgressAllowlistExtra mirrors PgStore. 0 = no override;
+// the plan cap is authoritative. The validator at
+// cmd/apid/handlers_ext.go:104 adds this to the plan cap before
+// the >-maxSize check on the per-app EgressAllowlist patch.
+//
+// Issue #679 / PR-B / ADR-082.
+func (m *MemStore) GetAccountEgressAllowlistExtra(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[accountID]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	return a.EgressAllowlistExtra, nil
+}
+
+// SetAccountEgressAllowlistExtra mirrors PgStore. n == 0 clears
+// the override (the plan cap is authoritative again).
+//
+// Issue #679 / PR-B / ADR-082.
+func (m *MemStore) SetAccountEgressAllowlistExtra(_ context.Context, accountID string, n int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[accountID]
+	if !ok {
+		return ErrNotFound
+	}
+	a.EgressAllowlistExtra = n
+	m.accounts[accountID] = a
+	return nil
+}
+
 // --- Org-bound API keys (issue #190 / IAM-6, PR 6) ------------------------
 //
 // Same shape as the legacy per-account API key methods, but filtered by
@@ -2536,6 +2568,86 @@ func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseTo
 	}
 	ins.State = string(StateParked)
 	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
+// ListRunningInstancesOnDeadNodes mirrors the PgStore join: RUNNING
+// rows whose node is inactive OR whose last heartbeat predates the
+// threshold. Sorted oldest-heartbeat-first so the capped tick drains
+// the longest-dead nodes first, matching the SQL ORDER BY. A row whose
+// node_id has no compute_nodes entry is treated as dead — the owner is
+// unknowable, so it cannot be confirmed alive.
+func (m *MemStore) ListRunningInstancesOnDeadNodes(_ context.Context, threshold time.Time, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: limit must be > 0, got %d", limit)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type scored struct {
+		ins Instance
+		hb  time.Time
+	}
+	var hits []scored
+	for _, ins := range m.instances {
+		if ins.State != string(StateRunning) {
+			continue
+		}
+		node, ok := m.computeNodes[ins.NodeID]
+		if ok && node.Active && !node.LastHeartbeatAt.Before(threshold) {
+			continue
+		}
+		hits = append(hits, scored{ins: ins, hb: node.LastHeartbeatAt})
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].hb.Equal(hits[j].hb) {
+			// Stable tie-break so a capped tick is deterministic
+			// across runs (map iteration order is not).
+			return hits[i].ins.ID < hits[j].ins.ID
+		}
+		return hits[i].hb.Before(hits[j].hb)
+	})
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	out := make([]Instance, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.ins)
+	}
+	return out, nil
+}
+
+// FailRunningInstanceOnDeadNode mirrors the PgStore conditional
+// UPDATE: the transition only lands when the row is still RUNNING and
+// still owned by the node the caller observed as dead. A row that
+// has vanished between the input-set query and this call returns
+// ErrConflict — the same outcome PgStore surfaces via
+// RowsAffected()==0. The reconciler's caller treats ErrConflict as
+// a peer-wins no-op, so a transient GC (retention sweep, manual
+// operator delete, future multi-host park path) is counted the same
+// way as "node recovered" rather than as outcome=error. ErrNotFound
+// is reserved for explicit precondition violations (the caller
+// passed an instanceID the store has never heard of) — that signal
+// is too loud to use as a silent "the row disappeared" handler.
+func (m *MemStore) FailRunningInstanceOnDeadNode(_ context.Context, instanceID, nodeID string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty instanceID")
+	}
+	if nodeID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty nodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrConflict
+	}
+	if ins.State != string(StateRunning) || ins.NodeID != nodeID {
+		return ErrConflict
+	}
+	ins.State = string(StateFailed)
+	now := m.clock()
+	ins.TerminalAt = &now
 	m.instances[instanceID] = ins
 	return nil
 }

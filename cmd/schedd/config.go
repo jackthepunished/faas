@@ -172,6 +172,32 @@ type Config struct {
 	// state='migrating' keeps the per-row work idempotent.
 	MigratingWatchdogIntervalSeconds int `toml:"migrating_watchdog_interval_seconds"`
 
+	// DeadNodeReconcilerIntervalSeconds is the cadence of the
+	// stale-RUNNING billing-leak self-healer in seconds. Zero
+	// reverts to api.DeadNodeReconcilerIntervalSeconds (= 30).
+	// Deliberately coarser than the §6.1 watchdog's 1 s tick:
+	// the staleness window this sweeper enforces is 120 s
+	// (api.DeadNodeReconcilerStalenessSeconds), so a 1 s tick
+	// would issue ~120 no-op queries per node death before any
+	// row is even eligible. Operators that want faster bill-stop
+	// on a node death can lower this; doing so under 10 s is not
+	// useful because the staleness threshold dominates the
+	// earliest-possible reconciliation time.
+	DeadNodeReconcilerIntervalSeconds int `toml:"dead_node_reconciler_interval_seconds"`
+
+	// DeadNodeReconcilerStalenessSeconds is how stale a
+	// compute_node's last_heartbeat_at must be (OR active=false)
+	// before its RUNNING instances are eligible for the
+	// failed-transition self-heal. Zero reverts to
+	// api.DeadNodeReconcilerStalenessSeconds (= 120). The default
+	// is the §6.1 heartbeat staleness (90 s) plus one 30 s
+	// tick of slack — short enough that a customer sees the
+	// bill stop within two reconciliation cycles after a vmmd
+	// dies, long enough that a transient heartbeat hiccup (a
+	// single missed 30 s ping) does not spuriously terminate
+	// live instances.
+	DeadNodeReconcilerStalenessSeconds int `toml:"dead_node_reconciler_staleness_seconds"`
+
 	// NodeName is the multi-box gate (ADR-056, mirrored from vmmd's
 	// [compute_node].name). When set, schedd constructs the
 	// handshake-layer NodeVerifier and surfaces a populated
@@ -319,6 +345,14 @@ func LoadConfig(path string) (*Config, error) {
 		// and an unset env var both resolve to the spec defaults.
 		MigratingWatchdogTickLimit:       0,
 		MigratingWatchdogIntervalSeconds: 0,
+		// Stale-RUNNING billing-leak self-healer. 0 means "use the
+		// api.* default" (api.DeadNodeReconcilerIntervalSeconds = 30,
+		// api.DeadNodeReconcilerStalenessSeconds = 120).
+		// cmd/schedd/main.go fills them in at loop-construction
+		// time so an unset TOML and an unset env var both resolve
+		// to the spec defaults.
+		DeadNodeReconcilerIntervalSeconds:  0,
+		DeadNodeReconcilerStalenessSeconds: 0,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {

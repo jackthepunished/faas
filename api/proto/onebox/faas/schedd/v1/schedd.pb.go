@@ -1001,8 +1001,28 @@ type StreamAppLogsRequest struct {
 	// host-side lower bound on the per-instance written_at; empty =
 	// no bound.
 	SinceWrittenAt *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=since_written_at,json=sinceWrittenAt,proto3" json:"since_written_at,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// level is the issue #309 / tier-2 DX filter floor — the
+	// customer-facing `faas logs --level=warn` flag. Empty = no
+	// level filter (default). Recognised values: "info", "warn",
+	// "error". The schedd applies a heuristic matcher (substring on
+	// common formats like [ERROR], level=error, "level":"error")
+	// per-instance on each line frame; non-matching lines are
+	// dropped before the per-instance fan-out coalesces into the
+	// single stream the gateway renders. Wire is additive per
+	// ADR-016 — pre-issue-#309 schedds see no level field and pass
+	// every line through.
+	Level string `protobuf:"bytes,5,opt,name=level,proto3" json:"level,omitempty"`
+	// grep is the issue #309 / tier-2 DX substring filter — the
+	// customer-facing `faas logs --grep=timeout` flag. Empty = no
+	// grep filter (default). The gateway pre-compiles the value as
+	// a Go regexp and the schedd applies it on each line frame
+	// (MatchString semantics; substring at the customer-facing
+	// surface, regex internally). The gateway rejects newlines
+	// (Move 4 substring-matcher never matches across line
+	// boundaries). Wire is additive per ADR-016.
+	Grep          string `protobuf:"bytes,6,opt,name=grep,proto3" json:"grep,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StreamAppLogsRequest) Reset() {
@@ -1061,6 +1081,20 @@ func (x *StreamAppLogsRequest) GetSinceWrittenAt() *timestamppb.Timestamp {
 		return x.SinceWrittenAt
 	}
 	return nil
+}
+
+func (x *StreamAppLogsRequest) GetLevel() string {
+	if x != nil {
+		return x.Level
+	}
+	return ""
+}
+
+func (x *StreamAppLogsRequest) GetGrep() string {
+	if x != nil {
+		return x.Grep
+	}
+	return ""
 }
 
 // StreamAppLogsResponse is one frame of the per-app log stream.
@@ -1590,12 +1624,14 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x0fsidecar_ram_mbs\x18\b \x03(\x05R\rsidecarRamMbs\"\x1a\n" +
 	"\x18ListInstanceStatsRequest\"X\n" +
 	"\x19ListInstanceStatsResponse\x12;\n" +
-	"\x04rows\x18\x01 \x03(\v2'.onebox.faas.schedd.v1.InstanceStatsRowR\x04rows\"\xb5\x01\n" +
+	"\x04rows\x18\x01 \x03(\v2'.onebox.faas.schedd.v1.InstanceStatsRowR\x04rows\"\xdf\x01\n" +
 	"\x14StreamAppLogsRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12\x1b\n" +
 	"\tsince_seq\x18\x02 \x01(\x03R\bsinceSeq\x12#\n" +
 	"\rdeployment_id\x18\x03 \x01(\tR\fdeploymentId\x12D\n" +
-	"\x10since_written_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x0esinceWrittenAt\"\xae\x02\n" +
+	"\x10since_written_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x0esinceWrittenAt\x12\x14\n" +
+	"\x05level\x18\x05 \x01(\tR\x05level\x12\x12\n" +
+	"\x04grep\x18\x06 \x01(\tR\x04grep\"\xae\x02\n" +
 	"\x15StreamAppLogsResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x10\n" +

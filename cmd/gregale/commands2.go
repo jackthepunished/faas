@@ -30,6 +30,8 @@ const (
 	subUpdate  = "update"
 	subRm      = "rm"
 	subSummary = "summary"
+	subInfo    = "info"
+	subGet     = "get"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -1283,12 +1285,14 @@ func cmdKeysGraceWindow(args []string) int {
 	return 0
 }
 
-// cmdUsage: dispatcher for `gregale usage [summary]`.
+// cmdUsage: dispatcher for `gregale usage [summary|daily|storage]`.
 //
-//	gregale usage                          → cmdUsageList  (per-app rows, current month)
-//	gregale usage --month YYYY-MM          → cmdUsageList  (per-app rows, explicit month)
-//	gregale usage summary                  → cmdUsageSummary (account roll-up, current month)
-//	gregale usage summary --month YYYY-MM  → cmdUsageSummary (account roll-up, explicit month)
+//	gregale usage                          → cmdUsageList     (per-app rows, current month)
+//	gregale usage --month YYYY-MM          → cmdUsageList     (per-app rows, explicit month)
+//	gregale usage summary                  → cmdUsageSummary  (account roll-up, current month)
+//	gregale usage summary --month YYYY-MM  → cmdUsageSummary  (account roll-up, explicit month)
+//	gregale usage daily [--day YYYY-MM-DD] → cmdUsageDaily    (per-(app, day) rollup, ADR-048 §5)
+//	gregale usage storage [--day YYYY-MM-DD] → cmdUsageStorage (per-(app, day) snapshot+layer bytes, ADR-049 §B.3)
 //
 // Strict positional dispatch matches cmdCrons / cmdDomains / cmdKeys:
 // an unknown positional returns 1 with `unknown usage subcommand "..."`.
@@ -1307,8 +1311,17 @@ func cmdUsage(args []string) int {
 	switch args[0] {
 	case subSummary:
 		return cmdUsageSummary(args[1:])
+	case "daily":
+		// Tier C: per-(app, day) usage rollup (ADR-048 §5).
+		// Distinct from `usage summary` which aggregates the
+		// whole month for billing.
+		return cmdUsageDaily(args[1:])
+	case "storage":
+		// Tier C: per-(app, day) snapshot+layer byte rollup
+		// (ADR-049 §B.3). Informational — not billed today.
+		return cmdUsageStorage(args[1:])
 	}
-	PrintUsage(os.Stderr, "usage: gregale usage [--month YYYY-MM] | gregale usage summary [--month YYYY-MM]", "usage")
+	PrintUsage(os.Stderr, "usage: gregale usage [--month YYYY-MM] | gregale usage summary [--month YYYY-MM] | gregale usage daily [--day YYYY-MM-DD] | gregale usage storage [--day YYYY-MM-DD]", "usage")
 	fmt.Fprintf(os.Stderr, "unknown usage subcommand %q\n", args[0])
 	return 1
 }
@@ -1951,11 +1964,95 @@ func mapFailureMessage(err string) string {
 	case "user_error":
 		return "Build failed — see log above for the failing command."
 	case "oom":
-		return "Build ran out of memory (2 GB limit). Try fewer/smaller dependencies, or upgrade for a larger build. Docs: https://docs.gregale.example/build/limits#memory"
+		return "Build ran out of memory (2 GB limit). Try fewer/smaller dependencies, or upgrade for a larger build. Docs: https://docs.gregale.dev/build/limits#memory"
 	case "timeout":
-		return "Build exceeded 10 min. Docs: https://docs.gregale.example/build/limits#timeout"
+		return "Build exceeded 10 min. Docs: https://docs.gregale.dev/build/limits#timeout"
 	case "infra":
 		return "Our build system hiccuped — we've been alerted and requeued your build automatically."
 	}
 	return "Build failed: " + err
+}
+
+// cmdUsageDaily: GET /v1/usage/daily?day=YYYY-MM-DD. Per-(app, day)
+// rollup (ADR-048 §5). Day is required by the server; we default
+// to today UTC when omitted, matching the dashboard panel.
+//
+// Renders one row per app: <app_id> <day> <requests> <gb-hours>
+// <egress GB>. The byte counters (tx_bytes, net_tx_bytes) follow
+// ADR-046 — informational, not billed — and are rendered only when
+// non-zero (matches cmdUsageList's trailing-column policy).
+func cmdUsageDaily(args []string) int {
+	fs := flag.NewFlagSet("usage-daily", flag.ContinueOnError)
+	day := fs.String("day", "", "day (YYYY-MM-DD); default: today UTC")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *day == "" {
+		*day = time.Now().UTC().Format("2006-01-02")
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.UsageDaily(context.Background(), *day)
+	if err != nil {
+		return printErr("Could not fetch daily usage", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if len(resp.Items) == 0 {
+		_, _ = fmt.Fprintf(os.Stdout, "No daily usage recorded for %s.\n", *day)
+		return 0
+	}
+	for _, u := range resp.Items {
+		gbh := float64(u.MBSeconds) / 3.6e6
+		if u.TXBytes > 0 || u.NetTxBytes > 0 {
+			txGB := float64(u.TXBytes) / (1024 * 1024 * 1024)
+			netGB := float64(u.NetTxBytes) / (1024 * 1024 * 1024)
+			fmt.Printf("%-36s %s %8d  %7.3f GB-h  egress %.3f GB (tx %.2f / net %.2f)\n",
+				u.AppID, u.Day, u.Requests, gbh, txGB+netGB, txGB, netGB)
+			continue
+		}
+		fmt.Printf("%-36s %s %8d  %7.3f GB-h\n", u.AppID, u.Day, u.Requests, gbh)
+	}
+	return 0
+}
+
+// cmdUsageStorage: GET /v1/usage/storage?day=YYYY-MM-DD. Per-(app,
+// day) snapshot+layer byte rollup (ADR-049 §B.3). Informational
+// only — not billed today. Renders one row per app: <app_id> <day>
+// <snapshot MB> <layer MB> <total MB>.
+func cmdUsageStorage(args []string) int {
+	fs := flag.NewFlagSet("usage-storage", flag.ContinueOnError)
+	day := fs.String("day", "", "day (YYYY-MM-DD); default: today UTC")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *day == "" {
+		*day = time.Now().UTC().Format("2006-01-02")
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.StorageUsage(context.Background(), *day)
+	if err != nil {
+		return printErr("Could not fetch storage usage", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if len(resp.Items) == 0 {
+		_, _ = fmt.Fprintf(os.Stdout, "No storage rollup recorded for %s.\n", *day)
+		return 0
+	}
+	for _, u := range resp.Items {
+		fmt.Printf("%-36s %s snapshot=%6d MB  layer=%6d MB  total=%6d MB\n",
+			u.AppID, u.Day,
+			u.SnapshotBytes/(1024*1024),
+			u.LayerBytes/(1024*1024),
+			(u.SnapshotBytes+u.LayerBytes)/(1024*1024))
+	}
+	return 0
 }

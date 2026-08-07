@@ -76,6 +76,19 @@ const (
 	cpuFairnessHotN       = 50 // requests per quiet app in the hot phase
 )
 
+// deployment is the per-app record used by TestCpuFairnessMetal and
+// the helpers it shares with measureQuietLatency. Hoisted to package
+// scope so measureQuietLatency (a top-level function) can take a typed
+// slice; the previous in-test inner type collided with the helper's
+// anonymous-struct parameter under -tags metal, where cmd/e2e_test
+// merges this file with apply_project_quota_e2e_test.go.
+type deployment struct {
+	slug  string
+	appID string
+	depID string
+	isHot bool
+}
+
 // TestCpuFairnessMetal runs the 3-phase acceptance:
 //  1. deploy-quiet×5 + hot×1 — all 6 Hobby apps reach PARKED.
 //  2. baseline — wake the 5 quiet apps, hit each 50 times, record
@@ -136,18 +149,12 @@ func TestCpuFairnessMetal(t *testing.T) {
 	// entrypoint is `while :; do :; done`. All 6 use the
 	// shared deploy-base so imaged's oci.LayersAboveBase
 	// treats the per-app layer as above-base.
-	type deployment struct {
-		slug  string
-		appID string
-		depID string
-		isHot bool
-	}
 	deps := make([]deployment, 0, cpuFairnessQuietCount+cpuFairnessHotCount)
 	for i := 0; i < cpuFairnessQuietCount; i++ {
-		deps = append(deps, deployApp(t, h, registry, key, "quiet-"+itoa(i), false))
+		deps = append(deps, deployApp(t, h, registry, key, "quiet-"+itoaLocal(i), false))
 	}
 	for i := 0; i < cpuFairnessHotCount; i++ {
-		deps = append(deps, deployApp(t, h, registry, key, "hot-"+itoa(i), true))
+		deps = append(deps, deployApp(t, h, registry, key, "hot-"+itoaLocal(i), true))
 	}
 	defer h.DumpLogs(t)
 
@@ -207,12 +214,7 @@ func TestCpuFairnessMetal(t *testing.T) {
 // isHot=false uses HelloImageAboveBase. Returns the app id + deployment
 // id so callers can wait on / inspect state. Shared by all 6 apps in
 // the experiment.
-func deployApp(t *testing.T, h *e2etest.Harness, registry *e2etest.FakeRegistry, key, slug string, isHot bool) struct {
-	slug  string
-	appID string
-	depID string
-	isHot bool
-} {
+func deployApp(t *testing.T, h *e2etest.Harness, registry *e2etest.FakeRegistry, key, slug string, isHot bool) deployment {
 	t.Helper()
 	var ref string
 	if isHot {
@@ -241,12 +243,7 @@ func deployApp(t *testing.T, h *e2etest.Harness, registry *e2etest.FakeRegistry,
 	if err := json.Unmarshal(raw, &depResp); err != nil {
 		t.Fatalf("decode deployment %s: %v body=%s", slug, err, raw)
 	}
-	return struct {
-		slug  string
-		appID string
-		depID string
-		isHot bool
-	}{slug: slug, appID: appID, depID: depResp.ID, isHot: isHot}
+	return deployment{slug: slug, appID: appID, depID: depResp.ID, isHot: isHot}
 }
 
 // measureQuietLatency hits each of the 5 quiet apps `n` times via the
@@ -268,17 +265,7 @@ func deployApp(t *testing.T, h *e2etest.Harness, registry *e2etest.FakeRegistry,
 //   - Quiet apps are hit in round-robin order so the test doesn't
 //     bias one app's wake over another (each app's first hit pays
 //     the wake latency; subsequent hits are hot).
-func measureQuietLatency(t *testing.T, h *e2etest.Harness, quiet []struct {
-	slug  string
-	appID string
-	depID string
-	isHot bool
-}, n int, hotApp *struct {
-	slug  string
-	appID string
-	depID string
-	isHot bool
-}) []time.Duration {
+func measureQuietLatency(t *testing.T, h *e2etest.Harness, quiet []deployment, n int, hotApp *deployment) []time.Duration {
 	t.Helper()
 	pool := pgtest.Open(t)
 	url := gatewayAppURL(h, "")
@@ -367,9 +354,12 @@ func percentile(durs []time.Duration, p float64) time.Duration {
 	return cp[idx]
 }
 
-// itoa is a tiny helper that avoids pulling in strconv just for the
-// loop counter — keeps the test file's import list short.
-func itoa(i int) string {
+// itoaLocal is a tiny helper that avoids pulling in strconv just for
+// the loop counter — keeps the test file's import list short.
+// Renamed from 'itoa' to avoid colliding with the same-named helper
+// in apply_project_quota_e2e_test.go when this file is compiled under
+// -tags metal (cmd/e2e_test).
+func itoaLocal(i int) string {
 	if i == 0 {
 		return "0"
 	}

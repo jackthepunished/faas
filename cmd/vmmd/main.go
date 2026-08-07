@@ -561,7 +561,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	tailStamper := stamperFromStore(store, log)
 	mgr := fcvm.NewManager(
 		wire.ExecRunner{},
-		fcvm.NewJailerVMM(fcvm.JailChrootBase, 30*time.Second).WithStorage(storageBackend),
+		fcvm.NewJailerVMM(fcvm.JailChrootBase, 30*time.Second).
+			WithStorage(storageBackend).
+			// Issue #309 / tier-2 DX: install the per-VMM
+			// slow-subscriber callback that every ring
+			// registerRing creates will fire on a full
+			// subscriber channel. The closure adapts to
+			// the vmmd-wide wire.OpsMetrics so the
+			// apid_logs_dropped_total{reason="slow_subscriber"}
+			// counter the §12 dashboard queries surfaces
+			// a real rate under load. The wire registry is
+			// per-daemon, so this closure runs in vmmd's
+			// /metrics scrape — the schedd's filter_* path
+			// lives on the schedd registry (different
+			// daemon), so the closed-set guard in
+			// IncLogDropped is what keeps the label space
+			// consistent across both scrape targets.
+			WithSlowSubscriberCallback(func() {
+				ops.IncLogDropped("slow_subscriber")
+			}),
 		fcvm.Paths{Kernel: cfg.KernelKey},
 		fcVersion,
 		log,
@@ -598,8 +616,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			CooldownSeconds:     api.DefaultLivenessCooldownSeconds,
 			IdleResetOnDestroy:  true,
 		},
-	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
-		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, cfg)
+	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
+		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, deploymentID, cfg)
 	})
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to

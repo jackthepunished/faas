@@ -135,6 +135,113 @@ type queryResponse struct {
 	} `json:"data"`
 }
 
+// QueryRangeSample is one step in a Prometheus query_range response.
+// Timestamp is the bucket-start time in nanoseconds (Prometheus
+// emits seconds-as-float; the renderer converts at the call site).
+// Value is the parsed sample value. The empty / no-data case is
+// represented by two zero values — callers that need to distinguish
+// "zero" from "no data" must check the enclosing slice length.
+type QueryRangeSample struct {
+	Timestamp int64
+	Value     float64
+}
+
+// QueryRange runs query against Prometheus's query_range endpoint
+// and returns one slice of samples per series. step controls the
+// bucket size (e.g. "1m" / "5m" / "1h"). start / end are epoch
+// seconds.
+//
+// The endpoint is /api/v1/query_range?query=…&start=…&end=…&step=….
+// Prometheus emits:
+//
+//	{"data":{"resultType":"matrix",
+//	          "result":[{"metric":{...},"values":[[ts,"x"],…]}]}}
+//
+// Series are returned in no particular order; multiple series
+// occur when the query is labelled (e.g. `sum by (class)`). The
+// caller picks the series it wants by its Metric label set.
+//
+// step is passed verbatim — Prometheus accepts Go-style durations
+// ("30s", "1m", "1h", "1d", "1w"). The dashboard's range fetcher
+// computes step from the window so the bucket count stays bounded
+// for the 168-bucket 7d view.
+//
+// Transport / error handling mirrors QueryScalar: 3s default
+// timeout, non-200 → truncated body in the error, non-matrix
+// resultType → error with the offending query.
+func (c *Client) QueryRange(ctx context.Context, query, start, end, step string) ([]struct {
+	Metric map[string]string
+	Values []QueryRangeSample
+}, error) {
+	if c == nil || c.baseURL == "" {
+		return nil, fmt.Errorf("promql: client not configured")
+	}
+	qctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	u := c.baseURL + "/api/v1/query_range?query=" + url.QueryEscape(query) +
+		"&start=" + url.QueryEscape(start) +
+		"&end=" + url.QueryEscape(end) +
+		"&step=" + url.QueryEscape(step)
+	req, err := http.NewRequestWithContext(qctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doer.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
+		return nil, fmt.Errorf("prometheus %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var pr struct {
+		Data struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]string `json:"metric"`
+				Values [][]any           `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, err
+	}
+	if pr.Data.ResultType != "matrix" {
+		return nil, fmt.Errorf("expected matrix, got %q for query %q", pr.Data.ResultType, query)
+	}
+	out := make([]struct {
+		Metric map[string]string
+		Values []QueryRangeSample
+	}, 0, len(pr.Data.Result))
+	for _, row := range pr.Data.Result {
+		samples := make([]QueryRangeSample, 0, len(row.Values))
+		for _, v := range row.Values {
+			if len(v) != 2 {
+				continue
+			}
+			ts, ok := v[0].(float64)
+			if !ok {
+				continue
+			}
+			raw, ok := v[1].(string)
+			if !ok {
+				continue
+			}
+			f, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				continue
+			}
+			samples = append(samples, QueryRangeSample{Timestamp: int64(ts), Value: f})
+		}
+		out = append(out, struct {
+			Metric map[string]string
+			Values []QueryRangeSample
+		}{Metric: row.Metric, Values: samples})
+	}
+	return out, nil
+}
+
 // QueryMap runs query against Prometheus and returns the result as a
 // map keyed by the `app` label on each vector sample. Used by the
 // account-scoped metrics rollup (issue #393) so N apps cost one

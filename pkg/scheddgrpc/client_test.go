@@ -378,7 +378,7 @@ func TestClientStreamAppLogs_FrameConversion(t *testing.T) {
 		},
 	})
 
-	stream, err := c.StreamAppLogs(context.Background(), wantAppID, 7, time.Time{}, "")
+	stream, err := c.StreamAppLogs(context.Background(), wantAppID, 7, time.Time{}, "", "", "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestClientStreamAppLogs_CleanEOFReturnsExactEOF(t *testing.T) {
 			return nil
 		},
 	})
-	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "")
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "", "", "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestClientStreamAppLogs_NotFoundPassesThrough(t *testing.T) {
 			return state.ErrNotFound
 		},
 	})
-	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "")
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "", "", "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestClientStreamAppLogs_GenericErrorIsUnavailable(t *testing.T) {
 			return errors.New("vmmd dial failed")
 		},
 	})
-	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "")
+	stream, err := c.StreamAppLogs(context.Background(), "app-1", 0, time.Time{}, "", "", "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}
@@ -499,7 +499,7 @@ func TestClientStreamAppLogs_ContextCancelUnblocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stream, err := c.StreamAppLogs(ctx, "app-1", 0, time.Time{}, "")
+	stream, err := c.StreamAppLogs(ctx, "app-1", 0, time.Time{}, "", "", "")
 	if err != nil {
 		t.Fatalf("StreamAppLogs: %v", err)
 	}

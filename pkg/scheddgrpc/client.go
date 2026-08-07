@@ -28,7 +28,12 @@ type ScheddClient interface {
 	Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	ParkInstance(ctx context.Context, instanceID, reason string) error
-	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string) (LogStream, error)
+	// StreamAppLogs (issue #309 / tier-2 DX): level + grep are
+	// the customer-facing --level / --grep filters forwarded
+	// to schedd (issue #254 / Move 4). Both empty = no filter;
+	// schedd applies them at the per-instance fan-out and
+	// increments apid_logs_dropped_total{reason=...} on drop.
+	StreamAppLogs(ctx context.Context, appID string, sinceSeq int64, sinceWrittenAt time.Time, deploymentID string, level string, grep string) (LogStream, error)
 	StreamWarmHints(ctx context.Context) (WarmHintStream, error)
 	Close() error
 }

@@ -499,6 +499,84 @@ func TestOpsMetrics_LogEmittedAcrossPrefixes(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_IncLogDropped (issue #309 / tier-2 DX) — the
+// per-reason drop counter increments on each IncLogDropped call
+// and the value surfaces in /metrics under
+// apid_logs_dropped_total{reason}. Pins the wire path end-to-end
+// so an accidental rename in the metric name or the label set
+// trips the test before the dashboard panel goes dark.
+//
+// The closed-set guard in IncLogDropped is the load-bearing
+// piece: an unknown reason value (e.g. a typo'd "slow-suscriber")
+// silently drops without creating a new Prometheus series. The
+// `TestOpsMetrics_IncLogDropped_UnknownReasonNoOp` case pins
+// that contract.
+func TestOpsMetrics_IncLogDropped(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.IncLogDropped("slow_subscriber")
+	m.IncLogDropped("slow_subscriber")
+	m.IncLogDropped("filter_grep")
+	m.IncLogDropped("filter_level")
+
+	body := render(t, m)
+	for _, want := range []string{
+		`apid_logs_dropped_total{reason="slow_subscriber"} 2`,
+		`apid_logs_dropped_total{reason="filter_grep"} 1`,
+		`apid_logs_dropped_total{reason="filter_level"} 1`,
+		// Pre-instantiation: the closed label set must surface
+		// in /metrics with zero values from boot, even before
+		// any drop fires. Same precedent as
+		// apid_logs_emitted_total / failedLoginTotal — a panel
+		// selector `rate(apid_logs_dropped_total[5m])` should
+		// never see "no data" on an idle daemon.
+		`# HELP apid_logs_dropped_total`,
+		`# TYPE apid_logs_dropped_total counter`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_IncLogDroppedNilSafe — same nil-receiver
+// contract as ObserveLogEmitted. A vmmd or schedd unit test
+// that constructs a nil *OpsMetrics must not panic when the
+// ring-write drop path runs.
+func TestOpsMetrics_IncLogDroppedNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	m.IncLogDropped("slow_subscriber")
+}
+
+// TestOpsMetrics_IncLogDropped_UnknownReasonNoOp pins the
+// closed-set guard. An unknown reason value must NOT create a
+// new Prometheus series — adding a fourth drop reason requires
+// extending both the pre-instantiation loop and the switch in
+// IncLogDropped. The test confirms a typo or a stale label
+// silently drops so the platform never leaks per-call label
+// values into the TSDB.
+func TestOpsMetrics_IncLogDropped_UnknownReasonNoOp(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.IncLogDropped("slow-suscriber")   // typo: hyphen instead of underscore
+	m.IncLogDropped("")                 // empty
+	m.IncLogDropped("slow_subscribers") // plural typo
+
+	body := render(t, m)
+	if strings.Contains(body, `apid_logs_dropped_total{reason="slow-suscriber"}`) {
+		t.Errorf("unknown reason value must not surface in /metrics:\n%s", body)
+	}
+	// The closed set must still be present at zero — unknown
+	// labels must not displace the pre-instantiated rows.
+	for _, want := range []string{
+		`apid_logs_dropped_total{reason="slow_subscriber"} 0`,
+		`apid_logs_dropped_total{reason="filter_grep"} 0`,
+		`apid_logs_dropped_total{reason="filter_level"} 0`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing pre-instantiated line %q in:\n%s", want, body)
+		}
+	}
+}
+
 func TestRenderSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		in   time.Duration

@@ -36,6 +36,21 @@ func TestBuildWriteReadVerify(t *testing.T) {
 	}
 }
 
+func TestVerifyAcceptsSymlinkRoot(t *testing.T) {
+	target := makeBundle(t)
+	root := filepath.Join(t.TempDir(), "current")
+	if err := os.Symlink(target, root); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := Read(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(root, manifest); err != nil {
+		t.Fatalf("Verify symlink root: %v", err)
+	}
+}
+
 func TestVerifyRejectsTamperedFile(t *testing.T) {
 	root := makeBundle(t)
 	if err := os.WriteFile(filepath.Join(root, "bin", "apid"), []byte("xxxx"), 0o755); err != nil {

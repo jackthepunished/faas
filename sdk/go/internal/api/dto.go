@@ -1134,3 +1134,23 @@ type ListAppWebhookDeliveriesOptions struct {
 	PageSize  int
 	PageToken string
 }
+
+// SetAccountEgressAllowlistExtraRequest is the body of PATCH
+// /v1/account/egress_allowlist_extra (issue #679 / PR-B / ADR-082).
+// Extra is the per-account additive budget on top of the plan's
+// apps.egress_allowlist cap. 0 = no override; the plan cap is
+// authoritative.
+type SetAccountEgressAllowlistExtraRequest struct {
+	Extra int `json:"extra"`
+}
+
+// AccountEgressAllowlistExtraResponse is the body of GET/PATCH
+// /v1/account/egress_allowlist_extra. The PlanCap and MaxExtra
+// fields are unconditionally populated so the dashboard can render
+// the "Override: N / Plan cap: 16 / Max extra: 1024" trio without
+// a second round-trip.
+type AccountEgressAllowlistExtraResponse struct {
+	Extra    int `json:"extra"`
+	PlanCap  int `json:"plan_cap"`
+	MaxExtra int `json:"max_extra"`
+}

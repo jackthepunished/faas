@@ -118,4 +118,13 @@ type (
 	// internal/api.PublicAuthStatus renders correctly.
 	PublicAuthBlock  = api.PublicAuthBlock
 	PublicAuthStatus = api.PublicAuthStatus
+
+	// Issue #679 / PR-B / ADR-082: per-account additive budget
+	// on top of the plan's apps.egress_allowlist cap. The
+	// write-side request is mirrored as an alias so the
+	// Client.SetEgressAllowlistExtra body shape is identical
+	// to the SDK's other admin-scope setters (ChangePlan,
+	// RaiseOverageCap).
+	SetAccountEgressAllowlistExtraRequest = api.SetAccountEgressAllowlistExtraRequest
+	AccountEgressAllowlistExtraResponse   = api.AccountEgressAllowlistExtraResponse
 )

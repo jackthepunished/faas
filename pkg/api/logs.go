@@ -22,14 +22,43 @@ import (
 // an `event: gap` frame (decoded into LogGapEvent on the SDK side)
 // rather than silently replaying from a stale position.
 type LogFilter struct {
-	// Grep is a substring match applied to each log line.
+	// Grep is a literal substring match applied to each log
+	// line (case-insensitive). Empty = no grep filter. The match
+	// is anchored on occurrence: `--grep=foo.bar` matches the
+	// literal characters `foo.bar`, NOT `fooXbar`. This is
+	// both the SDK contract (issue #309 / tier-2 DX) AND the
+	// implementation in pkg/scheddgrpc.LogFilter — substring
+	// semantics were chosen over Go regexp to (a) match
+	// customer mental models and (b) close the regex-DoS
+	// surface the peer review of PR #728 flagged.
+	//
+	// Embedded newlines and patterns longer than
+	// apislogs.MaxGrepPatternBytes are rejected by the gateway
+	// validator (apislogs.ValidateLogFilters).
 	Grep string
 	// Since is an RFC3339 timestamp lower-bound on the line timestamp.
 	Since string
-	// Level is an exact match on the structured `level` field
+	// Level is a severity floor on the structured `level` field
 	// (info, warn, error). Empty = no level filter. The CLI and the
 	// apid handler both call IsValidLogLevel before forwarding so an
 	// invalid value never reaches the wire.
+	//
+	// Customer-facing semantics (issue #309 / tier-2 DX):
+	//   --level=error passes only error lines
+	//   --level=warn   passes warn AND error lines
+	//   --level=info   passes info, warn, AND error lines
+	//
+	// The matcher is a heuristic — it recognises common line
+	// shapes (`[ERROR]`, `level=error`, JSON `{"level":"error"}`,
+	// `{"severity":"error"}`) and drops anything that doesn't
+	// match a recognised marker. A line emitted as bare stdout
+	// (e.g. `console.log("request handled")` with no level
+	// prefix) is treated as "below the floor" and DROPPED under
+	// any non-empty Level value. Customers needing strict
+	// filtering of bare stdout should use --grep with an
+	// explicit regex instead. The drop counter
+	// apid_logs_dropped_total{reason="filter_level"} ticks up
+	// on each such drop so the dashboard surfaces the rate.
 	Level string
 }
 

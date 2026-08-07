@@ -36,27 +36,40 @@ import (
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool              *pgxpool.Pool
-	engine            *Engine
-	log               *slog.Logger
-	gateway           GatewaySynth
-	now               func() time.Time
-	flowCounts        FlowCounter
-	ops               *wire.OpsMetrics       // issue #171 shared registry; nil safe
-	audit             *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
-	watchdog          *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention         *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat         *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	diskDrift         *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
-	migratingWatchdog *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
-	instStats         InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	scaleup           *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
-	targets           *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
-	floor             *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
-	recentLoad        *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
-	livenessWindow    *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
-	reaperAggressive  bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
-	reaperParkCap     int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	pool               *pgxpool.Pool
+	engine             *Engine
+	log                *slog.Logger
+	gateway            GatewaySynth
+	now                func() time.Time
+	flowCounts         FlowCounter
+	ops                *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	audit              *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
+	watchdog           *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention          *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat          *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	diskDrift          *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
+	migratingWatchdog  *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
+	deadNodeReconciler *DeadNodeReconciler    // dead-node billing-leak self-healer; nil opts out (no ticker arm)
+	instStats          InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	scaleup            *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	targets            *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	floor              *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
+	recentLoad         *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	livenessWindow     *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
+	reaperAggressive   bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap      int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	// lastFloorByApp (issue #557 closure / ADR-072): per-app
+	// effective floor from the previous reaper tick, used to emit
+	// `instances.parked_min_instances_released` when the floor
+	// drops and the idle park actually frees an instance below
+	// the previous bound. The aggressive branch's
+	// floorByApp > postPark predicate is structurally
+	// unsatisfiable (ReapAggressive's own `limit` arithmetic
+	// never parks below the floor it was given), so the audit
+	// emit lives on the idle path instead — keyed on
+	// lastFloorByApp > effectiveFloor AND ≥1 instance was parked
+	// by ReapIdle for the app this tick.
+	lastFloorByApp map[string]int
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
@@ -305,6 +318,23 @@ func (l *Loop) WithMigratingWatchdog(w *MigratingWatchdog) *Loop {
 	return l
 }
 
+// WithDeadNodeReconciler attaches the stale-RUNNING billing-leak
+// self-healer. Mirrors WithMigratingWatchdog's nil-skip semantics:
+// a nil reconciler means the select arm in Run never fires. Production
+// cmd/schedd wires sched.NewDeadNodeReconciler from the engine deps
+// so the sweeper shares the same store / engine / clock as the rest
+// of the loop. Cadence is the reconciler's own interval (default
+// api.DeadNodeReconcilerIntervalSeconds = 30 s, overridable via
+// FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS). The 30 s cadence is
+// deliberately coarser than the §6.1 watchdog's 1 s tick: the
+// staleness window this sweeper enforces is 120 s (api.DeadNode-
+// ReconcilerStalenessSeconds), so a 1 s tick would issue ~120
+// no-op queries per node death before any row is even eligible.
+func (l *Loop) WithDeadNodeReconciler(r *DeadNodeReconciler) *Loop {
+	l.deadNodeReconciler = r
+	return l
+}
+
 // Run blocks until ctx is cancelled. It owns three event sources: the LISTEN
 // subscriber, the reaper tick, and the cron tick.
 func (l *Loop) Run(ctx context.Context) error {
@@ -492,6 +522,17 @@ func (l *Loop) Run(ctx context.Context) error {
 		migratingWatchdogT = time.NewTicker(l.migratingWatchdog.interval)
 		defer migratingWatchdogT.Stop()
 	}
+	// Dead-node reconciler ticker (stale-RUNNING billing-leak fix).
+	// Default cadence api.DeadNodeReconcilerIntervalSeconds (30 s) —
+	// see WithDeadNodeReconciler for why this is coarser than the
+	// §6.1 watchdog's 1 s tick. nil opts out (the deadNodeTick
+	// helper returns nil for a nil ticker; the select case never
+	// fires).
+	var deadNodeReconcilerT *time.Ticker
+	if l.deadNodeReconciler != nil {
+		deadNodeReconcilerT = time.NewTicker(l.deadNodeReconciler.interval)
+		defer deadNodeReconcilerT.Stop()
+	}
 
 	for {
 		select {
@@ -525,6 +566,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runRecentLoad(ctx)
 		case <-migratingWatchdogTick(migratingWatchdogT):
 			l.runMigratingReconcile(ctx)
+		case <-deadNodeTick(deadNodeReconcilerT):
+			l.runDeadNodeReconcile(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -652,6 +695,19 @@ func migratingWatchdogTick(t *time.Ticker) <-chan time.Time {
 	return t.C
 }
 
+// deadNodeTick is the stale-RUNNING billing-leak reconciler ticker.
+// Same nil-safe shape as migratingWatchdogTick — nil ticker nil
+// channel, so the select case in Run never fires. Kept separate so a
+// regression that corrupts channel wiring shows up against a
+// recognisable name in the stack trace instead of a generic
+// "ticker returned nil" panic.
+func deadNodeTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
 // runHeartbeat dispatches one sweep of the per-node liveness
 // ticker. Exported as a method so tests can drive a single tick
 // without spinning up Run's goroutine. Tick errors are logged
@@ -766,6 +822,40 @@ func (l *Loop) runMigratingReconcile(ctx context.Context) {
 	if reconciled > 0 {
 		l.log.Debug("migrating watchdog: tick reconciled", "reconciled", reconciled)
 	}
+}
+
+// runDeadNodeReconcile dispatches one sweep of the stale-RUNNING
+// billing-leak reconciler. Exported as a method so tests drive a
+// single tick without spinning up Run. Per-batch errors are logged
+// + swallowed: a transient DB blip on the ListRunningInstancesOnDeadNodes
+// query is the only error that surfaces here, and the next tick
+// retries. Per-row outcomes (failed / conflict / error) are reported
+// by the metric inside Engine.ReconcileDeadNodeInstances — this
+// dispatch helper intentionally has no return path for them.
+//
+// context.Canceled is treated as a normal shutdown signal (matches
+// runMigratingReconcile); we don't surface it as a Warn since the
+// schedd is about to exit and operators don't need a flurry of
+// "tick failed" logs at shutdown.
+func (l *Loop) runDeadNodeReconcile(ctx context.Context) {
+	if l.deadNodeReconciler == nil {
+		// Direct-call guard for tests; the select case is already
+		// gated by the nil-ticker pattern in deadNodeTick (a nil
+		// ticker returns a nil channel, so the case never fires).
+		return
+	}
+	reconciled, err := l.deadNodeReconciler.handle(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			l.log.Warn("dead-node reconciler: tick failed", "err", err)
+		}
+		return
+	}
+	// No per-tick log on reconciled>0 here — the reconciler itself
+	// logs at Warn when any orphaned instances were terminated, and
+	// the metric carries the per-row outcome. A second Debug log at
+	// this layer would be noise.
+	_ = reconciled
 }
 
 // runScaleUp dispatches one tick of the per-app reactive scale-up
@@ -919,6 +1009,29 @@ func (l *Loop) runReaper(ctx context.Context) {
 	// `now := l.now()` (vs `time.Now()`) was lifted here: the
 	// integration tests pin all selectors to the same instant.
 	var snapshot []InstanceInfo
+	// appDeploymentFloor (issue #557 closure / ADR-072): per-app
+	// max deployment floor across the app's instances. The reaper
+	// stamps InstanceInfo.MinInstances with this max so it agrees
+	// with pkg/meter/sampler.go:470-485 (the biller). Without this
+	// mirror, an app with app.min_instances=0 and
+	// deployment.min_instances=3 is billed for 3 warm instances
+	// but reaped to 0 — a paid warm/park flap on every tick.
+	// Reading the instance.DeploymentID carrier means we don't
+	// need a separate ListDeploymentsByApp query; the snapshot
+	// walk already pulls every instance. A deployment lookup
+	// that errors (e.g. stale instance row pointing at a deleted
+	// deployment) is treated as floor=0 — the biller does the
+	// same and the customer sees a transient bill drop, never
+	// a false floor that keeps garbage resident.
+	appDeploymentFloor := map[string]int{}
+	for _, a := range apps {
+		floor := a.EffectiveMinInstances()
+		// Floor pushed by per-deployment overrides. We don't have
+		// the instance list yet — stash a placeholder (app floor)
+		// and re-walk after the snapshot is built so we can read
+		// each instance's DeploymentID carrier.
+		appDeploymentFloor[a.ID] = floor
+	}
 	for _, a := range apps {
 		plan := api.Plan("")
 		if acct, err := store.AccountByID(ctx, a.AccountID); err == nil {
@@ -941,10 +1054,14 @@ func (l *Loop) runReaper(ctx context.Context) {
 				}
 			}
 			snapshot = append(snapshot, InstanceInfo{
-				Instance:     ins.ID,
-				AppID:        ins.AppID,
-				Plan:         plan,
-				State:        state.State(ins.State),
+				Instance: ins.ID,
+				AppID:    ins.AppID,
+				Plan:     plan,
+				State:    state.State(ins.State),
+				// ADR-072: carrier for the post-snapshot
+				// app-wide max floor enrichment. Empty on legacy
+				// rows that pre-date the per-deployment column.
+				DeploymentID: ins.DeploymentID,
 				RAMMB:        ins.RAMMB,
 				LastRequest:  ins.LastRequestAt,
 				Started:      ins.StartedAt,
@@ -957,7 +1074,16 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// EffectiveMinInstances so the reaper agrees
 				// with the engine gate and the meterd sampler
 				// (closes the column/jsonb revenue gap).
-				MinInstances: a.EffectiveMinInstances(),
+				// ADR-072: the carrier is the app-wide max
+				// (`max(app.EffectiveMinInstances(),
+				// max(dep.EffectiveMinInstances() across the
+				// app's instances)`) so the reaper agrees with
+				// pkg/meter/sampler.go:470-485 (the biller).
+				// Without this mirror, a customer with
+				// app.min_instances=0 + deployment.min_instances=3
+				// is billed for 3 warm instances but reaped to 0
+				// — a paid warm/park flap on every tick.
+				MinInstances: appDeploymentFloor[a.ID],
 				OpenConns:    open,
 				// Issue #667 / ADR-078: in-flight waitUntil task count.
 				// Sourced from instances.tail_count (PR #671 schema);
@@ -985,6 +1111,52 @@ func (l *Loop) runReaper(ctx context.Context) {
 				// in the sort comparator handles pre-PR rows).
 				EvictionPriority: a.EvictionPriority,
 			})
+		}
+	}
+	// ADR-072 floor-mirror enrichment (post-snapshot): walk each
+	// instance's DeploymentID carrier, look up the deployment's
+	// floor, and push appDeploymentFloor to max(app, deployment)
+	// for the app-wide max. Then re-stamp every snapshot row's
+	// MinInstances with the (now-final) app-wide max so
+	// ReapIdle / ReapAggressive consult the same number the biller
+	// charges for. A deployment lookup that errors (stale
+	// instance row pointing at a deleted deployment) is treated as
+	// floor=0 — the biller does the same at sampler.go:478-480.
+	//
+	// depCache (code review #725 finding F4): cache distinct
+	// deployments per tick. An app with N instances all on
+	// deployment D1 produced N store.DeploymentByID(ctx, D1)
+	// round-trips pre-F4 — on PgStore that's N queries fetching
+	// the same row. The cache collapses it to 1 query per
+	// distinct deployment per tick. Scope is per-tick; the
+	// loop is rebuilt every reaper tick so cache lifetime
+	// never spans a stale deployment row.
+	depCache := map[string]int{}
+	for _, ins := range snapshot {
+		if ins.DeploymentID == "" {
+			continue
+		}
+		dFloor, cached := depCache[ins.DeploymentID]
+		if !cached {
+			dep, derr := store.DeploymentByID(ctx, ins.DeploymentID)
+			if derr != nil {
+				// Treat as floor=0 (matches the biller at
+				// sampler.go:478-480) and remember the
+				// miss so a later snapshot row on the same
+				// deployment doesn't re-query.
+				depCache[ins.DeploymentID] = 0
+				continue
+			}
+			dFloor = dep.EffectiveMinInstances()
+			depCache[ins.DeploymentID] = dFloor
+		}
+		if dFloor > appDeploymentFloor[ins.AppID] {
+			appDeploymentFloor[ins.AppID] = dFloor
+		}
+	}
+	for i := range snapshot {
+		if snapshot[i].MinInstances < appDeploymentFloor[snapshot[i].AppID] {
+			snapshot[i].MinInstances = appDeploymentFloor[snapshot[i].AppID]
 		}
 	}
 	resident := l.engine.Ledger().ResidentRAM()
@@ -1031,6 +1203,35 @@ func (l *Loop) runReaper(ctx context.Context) {
 		if err := l.engine.Store().StampAppScaleIn(ctx, appID); err != nil {
 			l.log.Warn("reaper: stamp scale-in", "app", appID, "err", err)
 		}
+		// Issue #557 closure / ADR-072: emit a
+		// `instances.parked_min_instances_released` audit row when
+		// the app-wide max floor (post-enrichment) has dropped
+		// below the previous tick's floor AND this tick actually
+		// parked ≥1 instance for the app. The pre-#557 audit
+		// emit lived in runReaperAggressive's
+		// `floorByApp > postPark` branch, which is structurally
+		// unsatisfiable (ReapAggressive's `limit` arithmetic
+		// never parks below the floor it was given). The idle
+		// path is the only branch that genuinely drops below
+		// the floor — keyed on lastFloorByApp vs the new
+		// app-wide max floor. Pre-#557 this case was silent;
+		// operators couldn't tell whether the bill change came
+		// from traffic or from a PATCH.
+		if l.lastFloorByApp != nil {
+			if prev, ok := l.lastFloorByApp[appID]; ok && prev > appDeploymentFloor[appID] {
+				l.emitFloorReleasedAudit(ctx, appID, prev, appDeploymentFloor[appID], now)
+			}
+		}
+	}
+	// Stamp the per-app floor after the idle branch consumes
+	// lastFloorByApp so the next tick's consult is fresh. Guarded
+	// on the field being non-nil so tests that don't care can skip
+	// the bookkeeping without nil-deref'ing.
+	if l.lastFloorByApp == nil {
+		l.lastFloorByApp = map[string]int{}
+	}
+	for _, a := range apps {
+		l.lastFloorByApp[a.ID] = appDeploymentFloor[a.ID]
 	}
 
 	// Aggressive scale-down (issue #171). Park the surplus above
@@ -1159,15 +1360,32 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		runningByApp[s.AppID]++
 	}
-	// floorByApp (PR-C, issue #462 + issue #557 / ADR-071): per-app
-	// MinInstances for the min_floor_already comparison. Sourced from
-	// EffectiveMinInstances() (max of legacy column + ScalingPolicy
-	// jsonb) so the reaper agrees with the meter and the floor
-	// trigger — divergent configs must not silently park a customer
-	// below the floor they actually configured.
+	// floorByApp (PR-C, issue #462 + issue #557 / ADR-071, code
+	// review #725 finding F3): per-app MinInstances for the
+	// min_floor_already comparison. Sourced from
+	// max(app.EffectiveMinInstances(), max(ins.MinInstances)
+	// across this app's instances in the snapshot) — the
+	// snapshot rows already carry the post-enrichment
+	// MinInstances value (max of app + per-deployment floor,
+	// stamped at runReaper's snapshot walk) so a max across
+	// the app's instances collapses to the same number the
+	// biller charges for (pkg/meter/sampler.go:470-485) and
+	// that ReapIdle / ReapAggressive consult via
+	// ins.MinInstances. The previous shape used
+	// a.EffectiveMinInstances() alone, which under-reports
+	// when a customer sets a per-deployment floor via
+	// ScalingPolicy — the metric would emit
+	// schedd_scale_down_total{outcome="keep"} on a
+	// deployment that's actually held at the per-deployment
+	// floor, fooling operators reading the dashboard.
 	floorByApp := map[string]int{}
 	for _, a := range apps {
 		floorByApp[a.ID] = a.EffectiveMinInstances()
+	}
+	for _, s := range snapshot {
+		if floorByApp[s.AppID] < s.MinInstances {
+			floorByApp[s.AppID] = s.MinInstances
+		}
 	}
 	// For each considered app, emit either `park` (≥ 1 instance
 	// parked), `min_floor_already` (running already at the floor
@@ -1203,21 +1421,16 @@ func (l *Loop) runReaperAggressive(ctx context.Context, apps []state.App, snapsh
 		}
 		l.ops.ObserveScaleDown(appID, "park")
 		l.emitScaleDownAudit(ctx, appID, desiredByApp[appID], ids, now)
-		// Issue #557 / ADR-071: if the post-park running count is
-		// below the customer's effective min_instances, that means
-		// the floor was lowered since the last tick — emit a
-		// `instances.parked_min_instances_released` audit row so
-		// operators can correlate the bill change with the PATCH
-		// that caused it. Pre-#557 this case was silent. The
-		// post-park count is the running count minus len(ids); we
-		// clamp at 0 to be defensive against racing parks.
-		postPark := runningByApp[appID] - len(ids)
-		if postPark < 0 {
-			postPark = 0
-		}
-		if floorByApp[appID] > postPark {
-			l.emitFloorReleasedAudit(ctx, appID, floorByApp[appID], postPark, now)
-		}
+		// Issue #557 closure / ADR-072: the
+		// `instances.parked_min_instances_released` audit emit
+		// used to live here on a `floorByApp[appID] > postPark`
+		// predicate, but that branch is structurally
+		// unsatisfiable — ReapAggressive's `limit` arithmetic
+		// never parks below the floor it was given
+		// (`max(floor, desired+1)` floors before any park).
+		// The audit now lives in runReaper's ReapIdle branch,
+		// keyed on the lastFloorByApp carrier and the
+		// post-enrichment app-wide max floor.
 		aggressiveParkOK := false
 		for _, id := range ids {
 			if err := l.engine.Park(ctx, id); err != nil {

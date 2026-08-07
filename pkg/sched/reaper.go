@@ -94,7 +94,22 @@ type InstanceInfo struct {
 	// groups by AppID and reads the floor from the first row it sees.
 	// Don't try to set MinInstances per-instance — it's a per-app
 	// concept reflected redundantly on each row.
+	//
+	// Issue #557 closure / ADR-072: the value stamped here is the
+	// app-wide max (`max(app.EffectiveMinInstances(),
+	// max(d.EffectiveMinInstances() across this app's instances)`) so
+	// the reaper agrees with pkg/meter/sampler.go:470-485. The
+	// snapshot walk in loop.go first stamps the app-floor value, then
+	// post-enriches after seeing each instance's DeploymentID.
 	MinInstances int
+	// DeploymentID (issue #557 closure / ADR-072) is the
+	// per-instance deployment id carrier — empty on legacy rows
+	// that pre-date the migration. The snapshot walk reads this
+	// to enrich appDeploymentFloor in runReaper. Not consulted by
+	// the selectors (ReapIdle / ReapAggressive / SelectEvictions);
+	// purely a carrier so the post-snapshot enrichment pass has
+	// the value at hand without re-Querying the store.
+	DeploymentID string
 	// WorkloadClass is the apps-row workload class
 	// (ADR-051 PR-D). Workers (background jobs / cron workers /
 	// long-running consumers) are reaper-exempt: they have no
