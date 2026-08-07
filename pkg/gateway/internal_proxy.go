@@ -35,6 +35,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -113,19 +114,29 @@ func NewInternalReverseProxy(dialer InternalDialer, target *url.URL, log *slog.L
 	if log == nil {
 		log = slog.Default()
 	}
-	var transport http.RoundTripper
-	if useH2C {
-		transport = newInternalProxyH2CTransport(dialer)
-	} else {
-		transport = newInternalProxyTransport(dialer)
-	}
-	return &InternalReverseProxy{
+	p := &InternalReverseProxy{
 		Dialer:      dialer,
 		Target:      target,
-		Transport:   transport,
 		Logger:      log,
 		DialTimeout: 10 * time.Second,
 	}
+	p.Transport = p.buildTransport(dialer, useH2C)
+	return p
+}
+
+// buildTransport constructs the appropriate transport with the
+// proxy's current DialTimeout wired in. Issue #687: the timeout
+// scopes only the dial step (transport.DialContext closure), not
+// the inbound RoundTrip context. Tests can mutate p.DialTimeout
+// before calling ServeHTTP, then re-call buildTransport to pick
+// up the new value — keeps the public API small (no
+// WithDialTimeout setter) while still allowing tests to pin the
+// dial-timeout-scope regression.
+func (p *InternalReverseProxy) buildTransport(dialer InternalDialer, useH2C bool) http.RoundTripper {
+	if useH2C {
+		return newInternalProxyH2CTransport(dialer, p.DialTimeout)
+	}
+	return newInternalProxyTransport(dialer, p.DialTimeout)
 }
 
 // newInternalProxyTransport returns an *http.Transport whose
@@ -133,7 +144,15 @@ func NewInternalReverseProxy(dialer InternalDialer, target *url.URL, log *slog.L
 // single seam the proxy uses; standard *http.Client semantics
 // cover request body, hop-by-hop connection close, idle-conn
 // reuse, and response timeout.
-func newInternalProxyTransport(dialer InternalDialer) *http.Transport {
+//
+// dialTimeout scopes ONLY the dial step (issue #687): the
+// DialContext closure wraps the caller's ctx with WithTimeout
+// so a slow upstream socket aborts at the deadline, but the
+// subsequent RoundTrip runs on the inbound request context
+// (customer deadline or server ReadTimeout). Pre-fix the
+// deadline wrapped the entire RoundTrip and prematurely cut
+// cold-wake streaming responses.
+func newInternalProxyTransport(dialer InternalDialer, dialTimeout time.Duration) *http.Transport {
 	return &http.Transport{
 		// Disable the env-driven HTTP proxy; this is a local hop.
 		Proxy: nil,
@@ -143,7 +162,7 @@ func newInternalProxyTransport(dialer InternalDialer) *http.Transport {
 		// identity (the unix socket path) so the same in-flight
 		// conn is reused across requests.
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "")
+			return dialWithTimeout(ctx, dialer, dialTimeout)
 		},
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
@@ -182,7 +201,7 @@ func newInternalProxyTransport(dialer InternalDialer) *http.Transport {
 // doesn't see different idle-conn behaviour. ReadIdleTimeout +
 // PingTimeout are H2-specific keepalive parameters that have no
 // HTTP/1.1 equivalent.
-func newInternalProxyH2CTransport(dialer InternalDialer) http.RoundTripper {
+func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Duration) http.RoundTripper {
 	t := &http2.Transport{
 		// AllowHTTP is the load-bearing flag — without it http2
 		// refuses to dial plain HTTP and falls back to TLS-or-error.
@@ -191,16 +210,34 @@ func newInternalProxyH2CTransport(dialer InternalDialer) http.RoundTripper {
 		// net.Conn. We ignore network/addr/cfg and route everything
 		// through the unix-socket InternalDialer. The context passed
 		// here is the request context (caller's deadline) — we
-		// propagate it to the dialer so cancellation works. Without
-		// this contextcheck flagged the closure (golangci-lint v2.4
-		// contextcheck rule).
+		// propagate it to the dialer so cancellation works. The
+		// dialTimeout (issue #687) scopes only the dial step; the
+		// RoundTrip body copy runs on the inbound request context
+		// (customer deadline). Without this contextcheck flagged
+		// the closure (golangci-lint v2.4 contextcheck rule).
 		DialTLSContext: func(ctx context.Context, _ string, _ string, _ *tls.Config) (net.Conn, error) {
-			return dialer.DialContext(ctx, "")
+			return dialWithTimeout(ctx, dialer, dialTimeout)
 		},
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
 	}
 	return t
+}
+
+// dialWithTimeout calls dialer.DialContext with ctx wrapped by
+// WithTimeout(dialTimeout) when dialTimeout > 0. Extracted so the
+// dial-timeout wrap pattern lives in one place — the two transport
+// constructors share the same shape (issue #687 PR-3 review
+// finding #4) and any future change to the timeout semantics
+// (e.g. a min-deadline with the inbound ctx) only needs to update
+// this function. Returns the dialer's net.Conn (or error).
+func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout time.Duration) (net.Conn, error) {
+	if dialTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+	}
+	return dialer.DialContext(ctx, "")
 }
 
 // ServeHTTP implements http.Handler. It rewrites the inbound
@@ -249,13 +286,17 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	} else {
 		outReq.Header.Set("X-Forwarded-Proto", "http")
 	}
-	// Bind the dial timeout via ctx so the transport honours it.
-	ctx := r.Context()
-	if p.DialTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, p.DialTimeout)
-		defer cancel()
-	}
+	// RoundTrip runs on r.Context() directly (issue #687). The dial
+	// step is bounded by p.DialTimeout via the transport's
+	// DialContext/DialTLSContext closure; the body copy is bounded
+	// by the inbound request deadline (customer-side) so a
+	// 60-second cold-wake streaming response is not cut at 10 s.
+	//
+	// resp.Body ownership transferred to copyResponseBody — it
+	// owns the close (defer in the read goroutine + the cancel
+	// arm). The bodyclose lint rule can't see across function
+	// boundaries, so annotate explicitly.
+	//nolint:bodyclose
 	resp, err := p.Transport.RoundTrip(outReq)
 	if err != nil {
 		// Distinguish "upstream unreachable" (502) from "client
@@ -270,7 +311,8 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "bad gateway: internal round-trip failed", http.StatusBadGateway)
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
+	// copyResponseBody owns Body.Close (issue #687: closes it on
+	// ctx cancel to release the H2C stream window).
 	// Copy headers + body to the inbound writer. Strip hop-by-hop
 	// in place on the response (RFC 7230 §6.1) — the internal
 	// daemon may have set Connection: close and we don't want to
@@ -286,7 +328,7 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(resp.StatusCode)
 	// Body copy bound to ctx — a hung upstream pins only the
 	// in-flight goroutine, not the listener.
-	if _, err := copyResponseBody(ctx, w, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
+	if _, err := copyResponseBody(r.Context(), w, resp.Body); err != nil && !errors.Is(err, context.Canceled) {
 		p.logger().Warn("internal body copy failed",
 			"target", p.Target.String(),
 			"err", err)
@@ -318,7 +360,25 @@ func isHopByHop(h string) bool {
 // copyResponseBody drains src to dst, returning on ctx cancel or
 // io.EOF. The caller is expected to have set a request-level
 // timeout (r.Context) that bounds the copy.
-func copyResponseBody(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+//
+// Issue #687 (PR-3 review follow-up): three things matter here.
+// (1) Per-Write Flush so SSE / chunked-JSON customers see flushes
+// at chunk boundaries, not at the 32 KiB io.Copy buffer boundary.
+// The Flush type assertion is a no-op for non-http.ResponseWriter
+// dst (test *strings.Builder, *bytes.Buffer) so the non-flusher
+// path is unchanged.
+// (2) On ctx cancel, close src so the goroutine's blocked Read
+// returns an error and exits. The H2C connection's stream window
+// is released instead of being held open by a stuck reader
+// (internal_proxy.go:289-292 in the pre-fix shape).
+// (3) Wait on the goroutine's done channel after cancel so the
+// goroutine-exit assertion in TestCopyResponseBody_CancelReleasesStreamWindow
+// is deterministic — bounded by one final Read latency.
+//
+// The function owns src's lifecycle: defer Body.Close in the
+// caller is redundant after this change.
+func copyResponseBody(ctx context.Context, dst io.Writer, src io.ReadCloser) (int64, error) {
+	flusher, _ := dst.(http.Flusher) // ok if dst isn't an http.ResponseWriter
 	type result struct {
 		n   int64
 		err error
@@ -329,13 +389,102 @@ func copyResponseBody(ctx context.Context, dst io.Writer, src io.Reader) (int64,
 		// cost memory without measurably improving throughput for
 		// the customer-app traffic shape (most responses are
 		// sub-MiB JSON / HTML).
-		n, err := io.Copy(dst, src)
-		done <- result{n, err}
+		//
+		// Issue #687 PR-3 review finding: defers run LIFO. The
+		// panic-recovery defer MUST be registered BEFORE the
+		// src.Close defer so it fires FIRST (during the unwind)
+		// — otherwise a panic in dst.Write / flusher.Flush would
+		// run src.Close first (closing the body without ever
+		// notifying the cancel arm) and the cancel arm's `<-done`
+		// would block forever. Register the recover defer first;
+		// the close defer runs last so the goroutine still exits.
+		//
+		// `total` is hoisted above both defers so the recover
+		// defer can reference it (Go's closure capture is by
+		// reference; the variable must be in scope at defer
+		// registration time, not just at defer execution time).
+		var total int64
+		defer func() {
+			if r := recover(); r != nil {
+				// Best-effort send so the cancel arm's `<-done`
+				// doesn't hang. `done` is buffered with capacity 1
+				// so this never blocks. We swallow the panic
+				// (don't re-raise) so the goroutine exits cleanly
+				// — a re-panic in a goroutine surfaces to the
+				// runtime as a crash, and the caller is already
+				// out of options (the underlying writer panicked,
+				// the stream is broken; nothing useful to do).
+				select {
+				case done <- result{total, fmt.Errorf("copyResponseBody: panic during copy: %v", r)}:
+				default:
+				}
+			}
+		}()
+		defer func() { _ = src.Close() }() // ensure goroutine exit even on panic
+		buf := make([]byte, 32*1024)
+		for {
+			n, rErr := src.Read(buf)
+			if n > 0 {
+				// Honour io.Writer contract: a Write may return
+				// fewer than len(p) bytes AND nil error. Loop on
+				// the unwritten tail until the full chunk is
+				// drained (matching io.Copy's shape). Without this,
+				// total overcounts the bytes the customer actually
+				// receives when a partial-write dst is passed.
+				//
+				// Issue #687 PR-3 review finding #2: the previous
+				// shape used `total += int64(n)` with `n` being the
+				// Read count, not the Write count — diverging from
+				// io.Copy semantics on partial writes.
+				written := 0
+				for written < n {
+					nw, wErr := dst.Write(buf[written:n])
+					written += nw
+					total += int64(nw)
+					if wErr != nil {
+						done <- result{total, wErr}
+						return
+					}
+					if nw == 0 {
+						// Write made no progress but returned nil —
+						// io.Copy treats this as the next-read loop
+						// unblocking; we follow suit and break out
+						// of the partial-write retry, letting the
+						// next Read refill the buffer. The bytes
+						// already written are counted; the ones not
+						// yet written will appear in the next Read.
+						break
+					}
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			if rErr != nil {
+				// Match io.Copy semantics: io.EOF on a clean read
+				// is success (the source has signalled end-of-stream
+				// without corruption), not an error. Any other
+				// error propagates so copyResponseBody callers see
+				// upstream-side read failures.
+				if rErr == io.EOF {
+					done <- result{total, nil}
+				} else {
+					done <- result{total, rErr}
+				}
+				return
+			}
+		}
 	}()
 	select {
 	case r := <-done:
 		return r.n, r.err
 	case <-ctx.Done():
+		// Close src so the goroutine's Read returns; the upstream
+		// unix socket sees the FIN and the H2C stream window is
+		// released. The second <-done makes the goroutine-exit
+		// assertion in tests deterministic.
+		_ = src.Close()
+		<-done
 		return 0, ctx.Err()
 	}
 }
