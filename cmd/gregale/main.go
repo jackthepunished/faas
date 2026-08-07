@@ -42,8 +42,9 @@ Commands:
   connect      Connect a third-party service (github)
   crons        Manage scheduled requests
   dashboard    Open the account dashboard in your browser
+  delayed-task Schedule a deferred invocation (delayed-task add|get|cancel)
   deployments  List deployments (--limit N | --before C | --all)
-  deployment   Get one deployment (<id>)
+  deployment   Get one deployment (<id> | set-min-instances <id> --min N)
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
   domains      Manage custom domains
   env          Pull/push .env <-> sealed secrets (--app <slug>)
@@ -67,6 +68,7 @@ Commands:
   plan         Change plan (free|hobby|pro|scale)
   ps           Show live instances + state for an app
   queue        Inspect the wake-queue depth (queue tail|send|receive|state|peek|dead-letter|ack)
+  registry     Per-app private container registry credentials (registry list|set|rm --app <slug>)
   rollback     Re-promote the previous deployment
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets (secrets list|set|unset|list-all)
@@ -77,6 +79,7 @@ Commands:
   trusted-publishers  Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
   usage        Show this month's usage (gregale usage [--month YYYY-MM]|daily [--day YYYY-MM-DD]|storage [--day YYYY-MM-DD]|summary)
   version      Print the CLI version
+  wake-timeline Walk the per-wake event stream (wake-timeline <slug> <wake-id> [--since RFC3339] [--limit N] [--all])
   wake         Wake a parked app (pulls out of snapshot)
   webhooks     Manage outbound webhooks (webhooks list|add|info|update|rm|deliveries|retry|rotate-secret)
   whoami       Show the authenticated account
@@ -196,6 +199,18 @@ func run(args []string) int {
 		return cmdDomains(args[1:])
 	case "crons":
 		return cmdCrons(args[1:])
+	case "delayed-task":
+		// Tier D: scheduled-at deferred invocations (issue #557 /
+		// ADR-072 sibling). Mirrors crons for dispatcher shape
+		// (add|get|cancel); cmdDelayedTask lives in
+		// commands_delayed_task.go.
+		return cmdDelayedTask(args[1:])
+	case "registry":
+		// Tier D: per-app private container registry credentials
+		// (issue #461 / ADR-062). Mirrors alerts for the
+		// list|set|rm dispatcher shape; cmdRegistry lives in
+		// commands_registry.go.
+		return cmdRegistry(args[1:])
 	case "webhooks":
 		// Issue #476 / ADR-076 — outbound webhook subscriptions
 		// and delivery ledger. Mirrors the crons surface (list /
@@ -246,6 +261,11 @@ func run(args []string) int {
 		// `gregale usage summary [--month X]` → account roll-up.
 		// Unknown positionals are rejected by the dispatcher.
 		return cmdUsage(args[1:])
+	case "wake-timeline":
+		// Tier D: per-wake event stream (issue #517 PR-C / ADR-064).
+		// Mirrors cmdAuditEventsGet for the positional shape;
+		// cmdWakeTimeline lives in commands_wake_timeline.go.
+		return cmdWakeTimeline(args[1:])
 	case "invoke":
 		// Tier C: functional smoke test. POST /v1/apps/{slug}/invoke
 		// (sync drain through the gateway) or /invoke/async (returns

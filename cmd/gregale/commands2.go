@@ -31,6 +31,7 @@ const (
 	subRm      = "rm"
 	subSummary = "summary"
 	subInfo    = "info"
+	subGet     = "get"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
