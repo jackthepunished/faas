@@ -15,10 +15,11 @@ sibling active-passive HA topology runbook is
 horizontal-scale variant, not active-passive).
 
 > [!CAUTION]
-> **This runbook is staging-only until Tier 1 Phase 2 ships.**
+> **This runbook is staging-only until #250 (off-host Postgres backup) ships.**
 >
-> The following pre-conditions are NOT all met at this doc's
-> publication time. Re-read the runbook before each cut-over;
+> Tier 1 Phase 1, 2, 3, 4, and 5 are all shipped. The remaining pre-
+> condition is off-host PG backup — a CP-host loss would be
+> unrecoverable without it. Re-read the runbook before each cut-over;
 > status flips are tracked at
 > [docs/adr/025-decoupled-control-plane-and-compute.md §Tier 2
 > pre-requisites](../adr/025-decoupled-control-plane-and-compute.md#tier-2-pre-requisites).
@@ -30,21 +31,28 @@ horizontal-scale variant, not active-passive).
 >   material under `/etc/faas/secrets/{ca,schedd,vmmd,...}/`
 >   at 0400 root:root, generated via `gregale pki init`.
 > - **Tier 1 Phase 2 (`node_signature` on `CapacityReport`)** —
->   ✗ NOT shipped. Compute nodes can still forge capacity
->   reports to bias placement (the wire-format identity of a
->   vmmd is not yet authenticated by schedd; only the chain +
->   SAN of the leaf cert proves it's "a vmmd", not "the
->   specific vmmd we provisioned"). The ledger's per-node
->   ceiling is still enforced (it's enforced in-process by
->   `NodeLedger.Admit`), but the chooser's bias is
->   un-verified. **Do not use this runbook in production
->   until Phase 2 lands.**
+>   ✓ shipped in PR #457 (commit `bfd1d2ca`, ADR-053 bundle).
+>   vmmd signs the `CapacityReport` it emits via `pkg/wire.NodeSigner`
+>   schedd verifies the leaf-CN → `compute_nodes.name` lookup before
+>   the report enters the chooser's bias calc. The ledger's per-node
+>   ceiling (`NodeLedger.Admit`) is unchanged; the trust path is
+>   additive. ADR-053 status was flipped in the same PR.
 > - **Tier 1 Phase 3 (`OCIRegistryStorageBackend` end-to-end,
->   issue #95 slice 3)** — ✗ NOT shipped. Snapshot locality
->   under multi-host is not yet viable; see the "Snapshot
->   cache" step below. Each compute node must hold a local
->   copy of every app's per-app layer today, which defeats
->   the §4.6 two-drive storage economics at fleet scale.
+>   issue #95 slice 4)** — ✓ shipped in the ADR-054 acceptance PR.
+>   The driver (`pkg/storage/oci.go`), router (`pkg/storage/router.go`),
+>   cache (`pkg/storage/cache.go`), and `BackendFromEnv` wiring live
+>   in every daemon (`cmd/{imaged,vmmd,schedd}/main.go`). The cache
+>   defaults to on at `/var/lib/faas/cache` for oci mode (multi-box
+>   default-on); explicit `FAAS_STORAGE_CACHE_DIR=""` disables. The
+>   stale-fallback branch is opt-in via `FAAS_STORAGE_CACHE_SERVE_STALE` —
+>   the pre-acceptance fail-loud contract is preserved when the env
+>   var is unset. The `StorageCacheStaleFallback` counter
+>   (`pkg/wire/metrics.go`) surfaces the registry-outage rate on the
+>   §12 dashboard. Each compute node no longer holds a local copy of
+>   every app's per-app layer; the §4.6 two-drive storage economics
+>   hold at fleet scale. ADR-054 itself was flipped from `proposed`
+>   to `accepted (revised 2026-08-07)` with the Amendment section
+>   documenting the three policy decisions.
 > - **Tier 1 Phase 4 (per-host egress policy templating)** —
 >   ✓ shipped in ADR-055. The static
 >   `policy_nftables.conf` is now a Jinja2 template
@@ -389,19 +397,19 @@ If the cut-over fails irrecoverably:
 
 ## Follow-ups (not in this runbook)
 
-- **Tier 1 Phase 2 (`node_signature`)** — closes the
-  "CapacityReport trust" gap in spec §6.4. Until it lands,
-  this runbook is staging-only.
-- **Tier 1 Phase 3 (`OCIRegistryStorageBackend` end-to-end)** —
-  closes the "Snapshot locality" gap. Without it, every compute
-  node holds a local copy of every app's per-app layer.
 - **#250 (off-host Postgres backup)** — required before the
-  runbook is production-safe.
+  runbook is production-safe. Even with Tier 1 fully shipped,
+  a CP-host loss is unrecoverable without off-host PG backup.
 - **#316 (`host.age` rotation runbook)** — shipped
   (ADR-057); 30-day overlap via `gregale host-age` CLI +
   `secretbox.LoadHostKeys` multi-identity plumbing. v2
   follow-up (`issue-316-followup-rekey`) covers the
   background re-seal of pre-rotation envelopes.
+- **Active-passive HA ADR** — no ADR exists yet; the
+  current runbook is the multi-host horizontal-scale
+  variant only. The active-passive topology is tracked in
+  `docs/runbooks/gate-a.md`. A separate ADR + acceptance PR
+  will follow when the topology is ready to ship.
 
 ## Acceptance
 

@@ -5,9 +5,10 @@
 // outage must NOT silently brick every cold boot on every
 // compute node (issue #96 review finding). LocalCacheBackend
 // wraps any StorageBackend with an LRU on disk rooted at
-// FAAS_STORAGE_CACHE_DIR (default /var/lib/faas/cache) so the
-// last-known-good blob is served when the parent backend is
-// unreachable.
+// FAAS_STORAGE_CACHE_DIR (default /var/lib/faas/cache when
+// FAAS_STORAGE_BACKEND=oci; opt-in otherwise) so a registry
+// outage degrades to last-known-good reads when the operator
+// opts in via FAAS_STORAGE_CACHE_SERVE_STALE.
 //
 // Semantics:
 //
@@ -16,9 +17,11 @@
 //     parent has accepted the blob.
 //   - Get reads cache first. On miss, Get fetches from parent
 //     and populates the cache. On parent failure, Get returns
-//     the wrapped error (no fallback to a stale cache hit;
-//     callers that want stale-fallback use a separate seam —
-//     the canonical "registry unreachable" gate at startup).
+//     the wrapped error UNLESS FAAS_STORAGE_CACHE_SERVE_STALE=true,
+//     in which case Get serves the last-known-good blob from the
+//     cache (Warn-level log + observer notification). The
+//     fail-loud default is pinned by TestLocalCacheBackend_ParentFailureSurfaces
+//     — single-box operators are not surprised by silent staleness.
 //   - Delete evicts from cache + forwards to parent. Best-effort
 //     propagation: a parent-side delete that fails is logged and
 //     the cache entry is evicted anyway, because stale data is
@@ -57,13 +60,81 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// CacheObserver is the optional notification surface the LocalCacheBackend
+// uses to report observable events to its caller. The interface is
+// deliberately minimal so pkg/storage does not depend on pkg/wire (or any
+// other metrics package). cmd/{imaged,vmmd,schedd}/main.go wire an adapter
+// that increments the corresponding Prometheus counter; tests can wire a
+// fake observer that records the calls.
+//
+// OnStaleFallback fires once per Get that served a stale cache hit because
+// the parent backend failed and FAAS_STORAGE_CACHE_SERVE_STALE=true.
+// Observers must not block; notifyStaleFallback snapshots the observer
+// under c.mu and invokes OnStaleFallback OUTSIDE the lock so a slow
+// downstream (a remote slog sink, a Prometheus push) does NOT serialise
+// concurrent Get calls. A future contributor must NOT 'fix' the call
+// site to invoke under the lock — see notifyStaleFallback for the
+// lock-then-call pattern.
+//
+// The interface is nil-safe at the cache: a nil observer no-ops.
+type CacheObserver interface {
+	OnStaleFallback()
+}
+
+// NopCacheObserver is the zero-value observer used when no observer is
+// wired. Useful in tests that don't care about the notification.
+type NopCacheObserver struct{}
+
+// OnStaleFallback satisfies CacheObserver with a no-op.
+func (NopCacheObserver) OnStaleFallback() {}
+
+// LogCacheObserver is the production-default observer: logs a Warn line
+// each time a stale fallback fires and calls a downstream CacheObserver
+// (typically the metrics adapter wired by cmd/*/main.go). The dual sink
+// keeps the §12 dashboard counter working AND gives operators a human-
+// readable signal in slog JSON logs.
+type LogCacheObserver struct {
+	Logger *slog.Logger
+	Next   CacheObserver
+}
+
+// OnStaleFallback logs the stale-fallback event and forwards to Next
+// when set. A nil Logger falls back to slog.Default().
+func (o LogCacheObserver) OnStaleFallback() {
+	l := o.Logger
+	if l == nil {
+		l = slog.Default()
+	}
+	l.Warn("storage cache: serving stale blob on parent failure",
+		"policy", "FAAS_STORAGE_CACHE_SERVE_STALE")
+	if o.Next != nil {
+		o.Next.OnStaleFallback()
+	}
+}
+
+// FuncCacheObserver adapts a plain func to the CacheObserver interface.
+// Useful when wiring a metrics adapter that lives in another package
+// (e.g. cmd/*/main.go) without that package importing pkg/storage just
+// for one method.
+type FuncCacheObserver func()
+
+// OnStaleFallback invokes the underlying func.
+func (f FuncCacheObserver) OnStaleFallback() {
+	if f == nil {
+		return
+	}
+	f()
+}
 
 // DefaultCacheMaxBytes is the byte-budget fallback when
 // FAAS_STORAGE_CACHE_MAX_BYTES is unset. 1 GiB keeps the cache
@@ -82,6 +153,12 @@ type LocalCacheBackend struct {
 	root     string
 	maxBytes int64
 	mu       sync.Mutex
+	// observer is the optional CacheObserver sink. The field is
+	// guarded by mu; readers take a copy under lock (see
+	// recordStaleFallback) so an operator-set observer is visible
+	// to concurrent Get calls without an extra synchronisation
+	// barrier on the hot path.
+	observer CacheObserver
 }
 
 // NewLocalCacheBackend wires a LocalCacheBackend rooted at
@@ -215,6 +292,16 @@ var errCacheBlobOversized = errors.New("storage: cache: blob exceeds maxBytes")
 // Get reads from cache first, then falls back to the parent.
 // On parent success, the blob is mirrored into the cache before
 // being returned. On cache hit, no parent round-trip happens.
+//
+// On parent failure, Get returns the wrapped error UNLESS
+// FAAS_STORAGE_CACHE_SERVE_STALE=true, in which case Get serves the
+// last-known-good cached blob (must have been Put earlier — the cache
+// only stores blobs the parent has accepted). The first readCache call
+// at the top of Get is the cache-first path; the second readCache call
+// below is the stale-fallback path. Both run only when the cache holds
+// the key (Put has mirrored it). When the cache is empty, stale-fallback
+// is a no-op and the wrapped parent error is returned regardless of the
+// env var.
 func (c *LocalCacheBackend) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
@@ -224,6 +311,12 @@ func (c *LocalCacheBackend) Get(ctx context.Context, key string) (io.ReadCloser,
 	}
 	rc, err := c.parent.Get(ctx, key)
 	if err != nil {
+		if c.serveStale() {
+			if data, ok := c.readCache(key); ok {
+				c.notifyStaleFallback()
+				return io.NopCloser(strings.NewReader(string(data))), nil
+			}
+		}
 		return nil, fmt.Errorf("storage: cache: get %q: parent: %w", key, err)
 	}
 	defer func() { _ = rc.Close() }()
@@ -235,6 +328,75 @@ func (c *LocalCacheBackend) Get(ctx context.Context, key string) (io.ReadCloser,
 		_ = cerr
 	}
 	return io.NopCloser(strings.NewReader(string(data))), nil
+}
+
+// SetObserver wires a CacheObserver onto the cache. The observer
+// receives OnStaleFallback notifications when the Get path serves a
+// stale blob. A nil observer disables notifications (the zero-value
+// default). Observer replacement is allowed; the previous observer
+// (if any) is dropped without notification.
+//
+// The setter mirrors the constructor-injection pattern used elsewhere
+// in the codebase (Handler.WithMetrics, DiskDrift.WithStorage). The
+// cmd/* main wiring calls SetObserver immediately after
+// BackendFromEnv returns, so production builds always have an observer
+// when the cache is wrapped.
+func (c *LocalCacheBackend) SetObserver(o CacheObserver) {
+	c.mu.Lock()
+	c.observer = o
+	c.mu.Unlock()
+}
+
+// serveStale reports whether the cache should serve a last-known-good
+// blob when the parent backend fails. The env lookup is done at every
+// parent error so operators can toggle the policy without a daemon
+// restart — matches the "default-on for oci mode" policy of the storage
+// env config (wrapWithCache reads FAAS_STORAGE_BACKEND at startup; this
+// hot-path env read is symmetric).
+//
+// The env lookup is cheap (single os.Getenv on a short string) and the
+// call is on the failure path (cold boot with a registry outage), not
+// the steady-state hot path.
+//
+// Truthy parsing: accepts "1", "t", "T", "true", "TRUE", "True" —
+// anything strconv.ParseBool accepts as true. Unset, empty, "0",
+// "f", "F", "false", "FALSE", "no", "off" all return false. Operators
+// reading a 12-factor example that says FAAS_STORAGE_CACHE_SERVE_STALE=1
+// or =True get the same behaviour as =true — the safety net is on
+// whenever the operator reasonably intends it. Values ParseBool
+// rejects (e.g. "yes", "on", "y") fall through to false — those
+// spellings are not standard Go env conventions and an operator
+// using them can be expected to use "true" or "1" after reading the
+// runbook.
+func (c *LocalCacheBackend) serveStale() bool {
+	v := os.Getenv("FAAS_STORAGE_CACHE_SERVE_STALE")
+	if v == "" {
+		return false
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return on
+}
+
+// notifyStaleFallback snapshots the current observer under the cache
+// mutex and calls OnStaleFallback outside the lock. A nil observer
+// no-ops. The lock-then-call pattern keeps an observer that panics or
+// blocks from holding up concurrent Get calls — the only contention is
+// the brief snapshot under c.mu.
+//
+// Observers must not block. The production observer (LogCacheObserver)
+// emits one Warn slog line and forwards to the metrics adapter; both
+// are constant-time.
+func (c *LocalCacheBackend) notifyStaleFallback() {
+	c.mu.Lock()
+	o := c.observer
+	c.mu.Unlock()
+	if o == nil {
+		return
+	}
+	o.OnStaleFallback()
 }
 
 // Delete evicts the cache entry + forwards to parent. The

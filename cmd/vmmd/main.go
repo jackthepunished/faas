@@ -530,6 +530,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// JailerVMM construction. Hoisted from the listener block
 	// below; same single-registry pattern as every other daemon.
 	ops := wire.NewOpsMetrics("vmmd")
+	// ADR-054 acceptance: wire the LocalCacheBackend observer so
+	// stale-fallback serves on the cold-boot Restore path emit
+	// `vmmd_storage_cache_stale_fallback_total`. vmmd is the
+	// primary emitter on the cold-boot path; imaged emits only on
+	// the build/GC paths. Uses storage.AsCacheBackend so the
+	// observer attaches even when the BackendFromEnv shape changes
+	// (a future metrics wrapper, router-encloses-cache, etc.). Nil
+	// result is expected on single-box local deploys — the cache is
+	// opt-in there.
+	if cacheBE := storage.AsCacheBackend(storageBackend); cacheBE != nil {
+		cacheBE.SetObserver(storage.LogCacheObserver{
+			Logger: log,
+			Next: storage.FuncCacheObserver(func() {
+				ops.StorageCacheStaleFallback().Inc()
+			}),
+		})
+	}
 	// Issue #667 / ADR-078: single storeStamper adapter satisfies
 	// BOTH the FrameworkReadyStamper interface (PR #470-FU-B) and
 	// the TailTerminalStamper interface (PR 3 of this issue) — the

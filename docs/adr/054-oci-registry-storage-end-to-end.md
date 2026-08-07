@@ -1,6 +1,6 @@
 # ADR-054 · `OCIRegistryStorageBackend` end-to-end
 
-- **Status:** proposed
+- **Status:** accepted (revised 2026-08-07)
 - **Date:** 2026-07-31
 - **Issue:** #95 slice 4 (multi-box rollout, Tier 1 Phase 3)
 - **Decision:** Wire `pkg/storage.OCIRegistryStorageBackend` into every
@@ -142,6 +142,56 @@
 - **Multi-region replication.** The OCI backend today pulls from one
   registry; a v1.1 ADR adds `FAAS_OCI_REGISTRY_FAILOVER`. Not
   relevant to the Tier 1 Phase 3 slice.
+
+## Amendment (2026-08-07)
+
+Acceptance PR resolves three policy decisions made during review of
+the production wiring, and downgrades the runbook `> [!CAUTION]`
+block in `docs/runbooks/multi-host-rollout.md`. The behaviour
+described above stands; the deliverable for the acceptance PR is
+the operator-facing contract.
+
+1. **Stale-fallback is opt-in, not default.** The
+   `LocalCacheBackend` `Get` method preserves the pre-acceptance
+   fail-loud contract (wrap parent error, do not serve stale) when
+   `FAAS_STORAGE_CACHE_SERVE_STALE` is unset. Operators opt in by
+   setting the env var on the daemon. The `StorageCacheStaleFallback`
+   counter in `pkg/wire/metrics.go` (exposed via the §12 storage
+   panel) lets ops alert on the "registry is down" rate. The
+   pre-acceptance test `TestLocalCacheBackend_ParentFailureSurfaces`
+   in `pkg/storage/cache_test.go` continues to pin the fail-loud
+   contract; the new `TestLocalCacheBackend_StaleFallbackEnabled` +
+   `TestLocalCacheBackend_StaleFallbackDisabled_DefaultContract`
+   pair pin the env-toggled branch.
+
+2. **Cache defaults to on for oci mode.** When
+   `FAAS_STORAGE_BACKEND=oci` and `FAAS_STORAGE_CACHE_DIR` is unset,
+   `storage.BackendFromEnv` defaults the cache to
+   `/var/lib/faas/cache` with the 1 GiB budget
+   (`DefaultCacheMaxBytes`). Single-box (`local`) keeps opt-in
+   behaviour — zero diff for existing operators. Explicit
+   `FAAS_STORAGE_CACHE_DIR=""` always disables (the `os.LookupEnv`
+   distinction in `storage.resolveCacheDir` honours the
+   unset-vs-empty difference). The default-on path is pinned
+   hermetically in `pkg/storage/env_test.go` via the
+   `TestResolveCacheDir_*` + `TestBackendFromEnv_*-Hermetic` matrix
+   — the cache construction is exercised through a `t.TempDir()` so
+   CI never creates `/var/lib/faas/cache` on a non-prod machine.
+
+3. **Runbook downgrade is part of this PR.** The `> [!CAUTION]`
+   block in `docs/runbooks/multi-host-rollout.md` is downgraded:
+   Phase 2 (`node_signature` on CapacityReport) and Phase 3
+   (`OCIRegistryStorageBackend`) entries flip from "✗ NOT shipped"
+   to "✓ shipped". The "Phase 3 must ship before this runbook is
+   production-safe" gate line is replaced with the remaining
+   ship-blockers (ADR-056 off-host PG backup, Gate-B cross-box mTLS,
+   active-passive HA ADR).
+
+The four items deferred in "Out of scope" stay deferred: multi-
+region failover, tiered GC across registry + cache, compression /
+dedup, and the cache hit-ratio Prometheus metric. The §12 storage
+panel renders hit/miss/stale as three counters; the hit/miss split
+is a v1.1 tightening.
 - **Tiered GC across registry + local cache.** Today's GC is
   per-backend. A future ADR adds a single `pkg/storage/gc.go` that
   orchestrates cross-backend eviction.

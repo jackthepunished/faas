@@ -836,6 +836,18 @@ type OpsMetrics struct {
 	// instantiated at boot below so the row surfaces in /metrics
 	// from the moment imaged starts.
 	registryCredentialMarkUsedFailures prometheus.Counter
+	// storageCacheStaleFallback: ADR-054 acceptance / multi-box
+	// cache policy. Counts the times a LocalCacheBackend served a
+	// last-known-good cached blob because the parent backend failed
+	// AND FAAS_STORAGE_CACHE_SERVE_STALE=true (opt-in). No labels —
+	// the policy is deployment-level; per-key labels would explode
+	// cardinality for no operator value. A non-zero rate signals
+	// "registry is down" — alertable via the §12 storage panel.
+	// Pre-instantiated at boot below so the row surfaces in /metrics
+	// from the moment the daemon starts. Only backends with the
+	// read-through cache wrapped (oci mode by default since the
+	// ADR-054 acceptance) emit on this counter.
+	storageCacheStaleFallback prometheus.Counter
 	// wakePhaseEmitted: issue #517 / PR-C / ADR-064. Per-(phase,
 	// result) counter for pkg/events.Platform.Emit. phase is the
 	// substring after `wake.` (e.g. "boot_started",
@@ -1661,6 +1673,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Count of imaged's store.MarkAppRegistryCredentialUsed failures after a successful authenticated pull (ADR-062, issue #461). The deployment itself succeeds — mark-used is intentionally non-fatal per ADR-062 §Decision 8 — but a persistent non-zero rate means `last_used_at` is lagging reality and rotation heuristics may evict still-in-use credentials. No labels; failure shape is closed (DB write refused, row vanished, transient connection drop).",
 	})
 	commonCollectors = append(commonCollectors, registryCredentialMarkUsedFailures)
+	// ADR-054 acceptance: stale-cache fallback counter. Unlabelled
+	// (deployment-level policy; closed-set cardinality). Pre-
+	// instantiated at boot so the row surfaces in /metrics from the
+	// moment the daemon starts. Only backends with the read-through
+	// cache wrapped emit on this counter; on a single-box local
+	// install the counter stays at zero forever.
+	storageCacheStaleFallback := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_storage_cache_stale_fallback_total",
+		Help: "Count of LocalCacheBackend stale-cache fallback serves (ADR-054 acceptance). Fires once per Get that returned a last-known-good cached blob because the parent backend failed AND FAAS_STORAGE_CACHE_SERVE_STALE=true. No labels (deployment-level policy; per-key labels would explode cardinality). A non-zero rate means 'registry is down' — alertable via the §12 storage panel.",
+	})
+	commonCollectors = append(commonCollectors, storageCacheStaleFallback)
 	reg.MustRegister(commonCollectors...)
 	// Pre-instantiate the closed (op,result) set for the OCI-pull
 	// histogram so its HELP/TYPE and zero-valued buckets surface in
@@ -2044,6 +2067,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
+		storageCacheStaleFallback:          storageCacheStaleFallback,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
 		egressSourceErrors:                 egressSourceErrors,
 		oauthDisabledTotal:                 oauthDisabledTotal,
@@ -2875,6 +2899,27 @@ func (m *OpsMetrics) RegistryCredentialMarkUsedFailures() prometheus.Counter {
 		return nil
 	}
 	return m.registryCredentialMarkUsedFailures
+}
+
+// StorageCacheStaleFallback returns the unlabelled counter the
+// LocalCacheBackend's CacheObserver adapter increments once per
+// Get that served a stale cached blob because the parent backend
+// failed AND FAAS_STORAGE_CACHE_SERVE_STALE=true. The counter is
+// unlabelled (deployment-level policy; closed-set cardinality).
+//
+// A non-zero rate signals "registry is down" — alertable via the
+// §12 storage panel. cmd/{imaged,vmmd,schedd}/main.go wire the
+// cache observer with a small adapter that calls this method
+// (pkg/storage has no prometheus dependency; the adapter lives
+// in the daemon, not in pkg/storage).
+//
+// nil-safe: returns nil when called on a nil receiver so the
+// adapter's call site doesn't need to guard.
+func (m *OpsMetrics) StorageCacheStaleFallback() prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.storageCacheStaleFallback
 }
 
 // Registry returns the underlying registry — pass to promhttp.HandlerFor

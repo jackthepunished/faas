@@ -1,11 +1,33 @@
 package storage
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// unsetEnvForTest unsets key for the duration of the test, restoring
+// the prior value (set or unset) on cleanup. Used when a test wants
+// the genuine "unset" state rather than "set to empty" — the env
+// resolution in storage.resolveCacheDir distinguishes unset from
+// explicit empty, and t.Setenv("k", "") cannot produce unset.
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	prev, ok := os.LookupEnv(key)
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unsetenv %s: %v", key, err)
+	}
+	t.Cleanup(func() {
+		if ok {
+			_ = os.Setenv(key, prev)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	})
+}
 
 // TestParseLocalPrefixes_Default: an empty env var returns the
 // canonical ADR-054 default list. The default is the union of
@@ -244,7 +266,7 @@ func TestBackendFromEnv_LocalPutLandsInSubdir(t *testing.T) {
 // refuses to default without FAAS_OCI_REGISTRY.
 func TestBackendFromEnv_OCIRequiresRegistry(t *testing.T) {
 	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
-	os.Unsetenv("FAAS_OCI_REGISTRY") // ensure unset
+	t.Setenv("FAAS_OCI_REGISTRY", "") // ensure unset (t.Setenv to "" + auto-restored)
 	_, err := BackendFromEnv()
 	if err == nil {
 		t.Fatal("expected error for oci backend without registry")
@@ -263,3 +285,208 @@ func TestBackendFromEnv_OCIRejectsUnknown(t *testing.T) {
 		t.Errorf("error %q lacks 'unknown'", got)
 	}
 }
+
+// TestResolveCacheDir_OCIDefaultsCacheDir pins the multi-box default:
+// FAAS_STORAGE_BACKEND=oci + FAAS_STORAGE_CACHE_DIR unset →
+// DefaultOCICacheDir, wrap=true.
+func TestResolveCacheDir_OCIDefaultsCacheDir(t *testing.T) {
+	unsetEnvForTest(t, "FAAS_STORAGE_CACHE_DIR")
+	dir, ok := resolveCacheDir("oci")
+	if !ok {
+		t.Fatal("resolveCacheDir(oci) ok=false; want true (default-on)")
+	}
+	if dir != DefaultOCICacheDir {
+		t.Errorf("dir = %q, want %q", dir, DefaultOCICacheDir)
+	}
+}
+
+// TestResolveCacheDir_OCICustomCacheDir: a custom dir is honoured
+// verbatim (no rewriting).
+func TestResolveCacheDir_OCICustomCacheDir(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "/var/lib/faas/cache-prod")
+	dir, ok := resolveCacheDir("oci")
+	if !ok {
+		t.Fatal("ok=false; want true")
+	}
+	if dir != "/var/lib/faas/cache-prod" {
+		t.Errorf("dir = %q, want %q", dir, "/var/lib/faas/cache-prod")
+	}
+}
+
+// TestResolveCacheDir_OCIExplicitDisable: explicit empty disables
+// regardless of kind. The os.LookupEnv distinction is load-bearing —
+// operators use the empty form to opt out when the default would
+// otherwise wrap.
+func TestResolveCacheDir_OCIExplicitDisable(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "")
+	dir, ok := resolveCacheDir("oci")
+	if ok {
+		t.Errorf("ok=true; want false (explicit disable). dir=%q", dir)
+	}
+}
+
+// TestResolveCacheDir_LocalNoDefault: single-box stays opt-in.
+func TestResolveCacheDir_LocalNoDefault(t *testing.T) {
+	unsetEnvForTest(t, "FAAS_STORAGE_CACHE_DIR")
+	if _, ok := resolveCacheDir("local"); ok {
+		t.Error("ok=true; want false (single-box opt-in)")
+	}
+}
+
+// TestBackendFromEnv_OCIDefaultsCacheDirHermetic: full BackendFromEnv
+// path with oci mode + override cache dir to t.TempDir. Asserts the
+// returned backend is *LocalCacheBackend rooted at the temp dir. Uses
+// t.Setenv("FAAS_STORAGE_CACHE_DIR", tmp) instead of relying on the
+// /var/lib/faas/cache default — that way CI never creates the
+// production path on a developer machine.
+func TestBackendFromEnv_OCIDefaultsCacheDirHermetic(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
+	t.Setenv("FAAS_OCI_REGISTRY", "http://127.0.0.1:0/fake")
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", filepath.Join(tmp, "cache"))
+	t.Setenv("FAAS_STORAGE_ROOT", filepath.Join(tmp, "fc"))
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	cache, ok := be.(*LocalCacheBackend)
+	if !ok {
+		t.Fatalf("backend = %T, want *LocalCacheBackend", be)
+	}
+	if cache.Root() != filepath.Join(tmp, "cache") {
+		t.Errorf("Root() = %q, want %q", cache.Root(), filepath.Join(tmp, "cache"))
+	}
+}
+
+// TestBackendFromEnv_OCIDoesNotWrapWhenExplicitlyDisabled: explicit
+// empty cache dir + oci mode → backend is NOT *LocalCacheBackend.
+func TestBackendFromEnv_OCIDoesNotWrapWhenExplicitlyDisabled(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
+	t.Setenv("FAAS_OCI_REGISTRY", "http://127.0.0.1:0/fake")
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "")
+	t.Setenv("FAAS_STORAGE_ROOT", t.TempDir())
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	if _, ok := be.(*LocalCacheBackend); ok {
+		t.Errorf("backend wrapped as *LocalCacheBackend; want no wrap (explicit disable)")
+	}
+}
+
+// TestBackendFromEnv_LocalDoesNotDefaultCacheDir: single-box stays
+// opt-in even when the cache dir env var is unset. (The /var/lib/faas/cache
+// default applies to oci mode only.)
+func TestBackendFromEnv_LocalDoesNotDefaultCacheDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FAAS_STORAGE_BACKEND", "local")
+	t.Setenv("FAAS_STORAGE_ROOT", tmp)
+	unsetEnvForTest(t, "FAAS_STORAGE_CACHE_DIR")
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	if _, ok := be.(*LocalCacheBackend); ok {
+		t.Errorf("backend wrapped as *LocalCacheBackend; local mode stays opt-in")
+	}
+}
+
+// TestAsCacheBackend_Direct: a *LocalCacheBackend as the root is
+// returned by AsCacheBackend unchanged. The direct-shape is rare in
+// production today (wrapWithCache always sits on top of a router or
+// OCI backend) but is the production case for unit tests that hand
+// the cache to consumers directly.
+func TestAsCacheBackend_Direct(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newCacheEnvTestBackend()
+	cache, err := NewLocalCacheBackend(parent, tmp, 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	got := AsCacheBackend(cache)
+	if got != cache {
+		t.Errorf("AsCacheBackend returned a different instance; want identity")
+	}
+}
+
+// TestAsCacheBackend_PrefixRouterFallback pins the production
+// multi-box shape: BackendFromEnv produces *PrefixRouter with the
+// cache wrapped around the OCI backend as the fallback. AsCacheBackend
+// must traverse the router and reach the cache.
+func TestAsCacheBackend_PrefixRouterFallback(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newCacheEnvTestBackend()
+	cache, err := NewLocalCacheBackend(parent, tmp, 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	router, err := NewPrefixRouter(
+		map[string]StorageBackend{"snap/": newCacheEnvTestBackend()},
+		cache,
+	)
+	if err != nil {
+		t.Fatalf("NewPrefixRouter: %v", err)
+	}
+	got := AsCacheBackend(router)
+	if got != cache {
+		t.Errorf("AsCacheBackend(router) = %p, want %p (cache from fallback)", got, cache)
+	}
+}
+
+// TestAsCacheBackend_PrefixRouterRoute pins the alt shape: a route
+// holds the cache instead of the fallback. Production doesn't build
+// this today, but the walk must handle it.
+func TestAsCacheBackend_PrefixRouterRoute(t *testing.T) {
+	tmp := t.TempDir()
+	parent := newCacheEnvTestBackend()
+	cache, err := NewLocalCacheBackend(parent, tmp, 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	router, err := NewPrefixRouter(
+		map[string]StorageBackend{"apps/": cache},
+		newCacheEnvTestBackend(),
+	)
+	if err != nil {
+		t.Fatalf("NewPrefixRouter: %v", err)
+	}
+	got := AsCacheBackend(router)
+	if got != cache {
+		t.Errorf("AsCacheBackend(router) = %p, want %p (cache from route)", got, cache)
+	}
+}
+
+// TestAsCacheBackend_NoCache: a backend with no cache in the chain
+// returns nil. Daemons must NOT install an observer on nil — the
+// alternative is a silent zero-counter that looks healthy while
+// stale-fallbacks happen unmonitored.
+func TestAsCacheBackend_NoCache(t *testing.T) {
+	be, err := NewLocalStorageBackend(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocalStorageBackend: %v", err)
+	}
+	if got := AsCacheBackend(be); got != nil {
+		t.Errorf("AsCacheBackend(no-cache) = %p, want nil", got)
+	}
+	if got := AsCacheBackend(nil); got != nil {
+		t.Errorf("AsCacheBackend(nil) = %p, want nil", got)
+	}
+}
+
+// cacheEnvTestBackend is a minimal StorageBackend stub for the
+// AsCacheBackend matrix. We only need a non-nil, no-op impl —
+// AsCacheBackend never reads or writes through it. Defined here
+// (not shared with cache_test.go) because cache_test.go is in
+// package storage_test and can't be imported from the whitebox
+// package storage tests.
+type cacheEnvTestBackend struct{}
+
+func newCacheEnvTestBackend() *cacheEnvTestBackend { return &cacheEnvTestBackend{} }
+
+func (*cacheEnvTestBackend) Put(_ context.Context, _ string, _ io.Reader) error {
+	return nil
+}
+func (*cacheEnvTestBackend) Get(_ context.Context, _ string) (io.ReadCloser, error) {
+	return nil, ErrNotFound
+}
+func (*cacheEnvTestBackend) Delete(_ context.Context, _ string) error { return nil }
