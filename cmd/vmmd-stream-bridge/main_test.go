@@ -49,3 +49,16 @@ func TestParseDeadline_Garbage(t *testing.T) {
 		t.Errorf("parseDeadline(\"not-a-time\") should fail, got nil")
 	}
 }
+
+func TestParseDeadline_NegativeDuration(t *testing.T) {
+	if _, err := parseDeadline("-1h"); err == nil {
+		t.Errorf("parseDeadline(\"-1h\") must reject negative durations (would produce a past-time deadline and 502 every request)")
+	}
+}
+
+func TestParseDeadline_PastTimestamp(t *testing.T) {
+	past := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
+	if _, err := parseDeadline(past); err == nil {
+		t.Errorf("parseDeadline(<past RFC3339>) must reject timestamps in the past")
+	}
+}

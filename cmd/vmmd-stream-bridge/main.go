@@ -17,7 +17,8 @@
 //
 // This binary is OFF by default — the v1 codepath in pkg/vmmdgrpc/
 // forward.go keeps the shell bridge in place. A future PR flips the
-// FAAS_STREAM_BRIDGE const to v2 once the metal streaming test
+// FAAS_STREAM_BRIDGE_VERSION env var (or the streamBridgeVersion var
+// default in forward.go) to "v2" once the metal streaming test
 // confirms H2C framing end-to-end on Lima nested KVM. Keeping the
 // v1 default means the binary can ship, be unit-tested, and be
 // staged into the jailer chroot today without touching production
@@ -69,7 +70,10 @@ import (
 const dialTimeout = 30 * time.Second
 
 // readHeaderTimeout caps how long we wait for the guest's first
-// response byte after the H2C request lands.
+// response byte (the HTTP/1.1 status line + headers) after the
+// H2C request lands. Applied only to the head read; the body
+// io.Copy that follows runs with no conn deadline so SSE / WS /
+// long-poll responses can stream past 30 s.
 const readHeaderTimeout = 30 * time.Second
 
 // defaultSessionDeadline is the wall-clock ceiling for a streaming
@@ -184,14 +188,13 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 		}
 		defer func() { _ = conn.Close() }()
 
-		// Set a per-stream read deadline so a wedged guest does not
-		// hold the H2C stream open past the session budget. Use the
-		// larger of readHeaderTimeout and the remaining deadline.
-		if remaining := time.Until(deadline); remaining > readHeaderTimeout {
-			_ = conn.SetReadDeadline(time.Now().Add(readHeaderTimeout))
-		} else {
-			_ = conn.SetReadDeadline(deadline)
-		}
+		// Read deadline is enforced by ctx (context.WithDeadline above),
+		// NOT by SetReadDeadline on the conn. A conn-wide deadline would
+		// cap the streaming body io.Copy at the same value, truncating
+		// SSE / WS / long-poll responses that legitimately stream past
+		// readHeaderTimeout (30 s). The ctx cancellation aborts the
+		// guest read at the session budget (default 24 h) instead, which
+		// is what production streaming actually needs.
 
 		// Bridge request body → guest.
 		go func() {
@@ -205,7 +208,18 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 		// Use a bufio.Reader on the conn to allow re-reading the
 		// first line.
 		br := newBufioReader(conn)
+		// Bound ONLY the response-head read at readHeaderTimeout so
+		// a wedged guest doesn't hang the H2C stream waiting for the
+		// first byte. The streaming body io.Copy below MUST run with
+		// no conn deadline so SSE / WS / long-poll responses can
+		// stream past 30 s; that bound is the ctx deadline (24 h by
+		// default) which the goroutine respects via cancellation.
+		_ = conn.SetReadDeadline(time.Now().Add(readHeaderTimeout))
 		resp, err := http.ReadResponse(br, r)
+		// Clear the deadline immediately so the body copy that
+		// follows can stream unboundedly. The zero time value
+		// disables the deadline per the net.Conn contract.
+		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			http.Error(w, fmt.Sprintf("read guest response: %v", err), http.StatusBadGateway)
 			return
@@ -239,9 +253,15 @@ func parseDeadline(s string) (time.Time, error) {
 		return time.Now().Add(defaultSessionDeadline), nil
 	}
 	if d, err := time.ParseDuration(s); err == nil {
+		if d <= 0 {
+			return time.Time{}, fmt.Errorf("duration %q must be positive (got %v)", s, d)
+		}
 		return time.Now().Add(d), nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		if t.Before(time.Now()) {
+			return time.Time{}, fmt.Errorf("RFC3339 timestamp %q is in the past", s)
+		}
 		return t, nil
 	}
 	return time.Time{}, fmt.Errorf("not a duration or RFC3339 timestamp")
