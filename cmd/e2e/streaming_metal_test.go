@@ -97,7 +97,10 @@ func TestE2E_Streaming_Metal_TTFBUnder1s(t *testing.T) {
 	key := h.SeedAccount(context.Background(), api.PlanHobby)
 
 	slug := "stream-ttfb-" + randHexSuffix()
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != 201 {
+	// Issue #695 / ADR-080: Hobby defaults to require_authn=true post-flip.
+	// The TTFB probe is anonymous; opt out at create time.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != 201 {
 		t.Fatalf("create app %q: status=%d", slug, got)
 	}
 	appID := mustGetAppID(t, h, key, slug)
@@ -178,7 +181,9 @@ func TestE2E_Streaming_Metal_TxBytesAccuracy(t *testing.T) {
 	key := h.SeedAccount(context.Background(), api.PlanHobby)
 
 	slug := "stream-txbytes-" + randHexSuffix()
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != 201 {
+	// Issue #695 / ADR-080: see TestE2E_Streaming_Metal_TTFBUnder1s.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != 201 {
 		t.Fatalf("create app %q: status=%d", slug, got)
 	}
 	appID := mustGetAppID(t, h, key, slug)
@@ -278,7 +283,10 @@ func TestE2E_Streaming_Metal_PlanMatrix(t *testing.T) {
 		t.Run(string(tc.plan), func(t *testing.T) {
 			key := h.SeedAccount(context.Background(), tc.plan)
 			slug := "stream-matrix-" + string(tc.plan) + "-" + randHexSuffix()
-			if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != 201 {
+			// Issue #695 / ADR-080: Hobby/Pro/Scale now default to
+			// require_authn=true; the matrix probe is anonymous.
+			falsy := false
+			if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != 201 {
 				t.Fatalf("create app %q: status=%d", slug, got)
 			}
 			appID := mustGetAppID(t, h, key, slug)
@@ -361,7 +369,9 @@ func TestE2E_Streaming_Metal_QuotaNonCounting(t *testing.T) {
 	key := h.SeedAccount(context.Background(), api.PlanHobby)
 
 	slug := "stream-quota-" + randHexSuffix()
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != 201 {
+	// Issue #695 / ADR-080: see TestE2E_Streaming_Metal_TTFBUnder1s.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != 201 {
 		t.Fatalf("create app %q: status=%d", slug, got)
 	}
 	appID := mustGetAppID(t, h, key, slug)

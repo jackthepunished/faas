@@ -1037,6 +1037,30 @@ type Store interface {
 	// soft-deleted apps so a recently-deleted reserved app doesn't
 	// leak into the cap and reject a subsequent recreate.
 	CountAppsWithEvictionPriority(ctx context.Context, accountID, priority string) (int, error)
+	// CountAuthDefaultFlippedApps returns the per-account count of
+	// apps that were stamped by the apps-auth-default grand-father
+	// migration (issue #695 / ADR-080). The migration sets
+	// auth_default_flipped_at on every pre-flip row; this query
+	// reads back the live pre-flip count so the apid dashboard
+	// banner can render "your existing N apps were grandfathered"
+	// + "your existing 0 apps were grandfathered" naturally turns
+	// the banner off (no dismissal cookie — count-zero is the
+	// off-switch). Excludes soft-deleted apps so the banner count
+	// tracks the customer's actual surface area.
+	CountAuthDefaultFlippedApps(ctx context.Context, accountID string) (int, error)
+	// AuthDefaultFlippedAt returns the timestamp the
+	// apps-auth-default grand-father migration ran (issue #695
+	// / ADR-080). The migration emits a single
+	// `apps.auth_default_global_flipped` event with the cut-over
+	// `at` timestamp; the dashboard banner reads this so the
+	// "On YYYY-MM-DD" copy renders the actual cut-over date
+	// instead of a hardcoded one. Returns (zero time, nil) when
+	// the migration hasn't run yet (banner copy falls back to
+	// "Recently" so the surface still works). Returns an error
+	// only on transient store failure — apid's call site
+	// swallows errors and falls back to the hardcoded date so a
+	// store hiccup doesn't 500 the dashboard load.
+	AuthDefaultFlippedAt(ctx context.Context) (time.Time, error)
 	UpdateApp(ctx context.Context, id string, p UpdateAppParams) (App, error)
 	// RenameApp changes an app's slug atomically (issue #63). Returns
 	// ErrNotFound if oldSlug doesn't belong to accountID; ErrConflict if

@@ -82,6 +82,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// — opt-in is a paid-tier feature (Cloud Run's
 			// `--no-allow-unauthenticated` shape).
 			RequireAuthn: false,
+			// Issue #695 / ADR-080: Free stays public-by-default.
+			// 'open' is the canonical mode for non-token-gated apps;
+			// require_authn=true would be meaningless on Free because
+			// bearer/basic are both gated off at this tier.
+			RequireAuthnDefault: false, PublicAuthModeDefault: "open",
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
 			KeysMax: 3,
 			// Issue #667 / ADR-078: tail primitive on with floor timeout.
@@ -163,6 +168,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Hobby is gated off for the same
 			// posture-change shape as Free.
 			RequireAuthn: false,
+			// Issue #695 / ADR-080: Hobby unlocks the token gate but
+			// bearer is still gated off (see PublicAuthBearerAllowed
+			// above) — the default opens the require_authn=true
+			// surface but stays on the 'open' mode so customers have
+			// a working PATCH escape hatch without us stranding them
+			// on a default they can't realise. PublicAuthModeDefault
+			// flips to 'bearer' in a follow-up if Hobby is opened up.
+			RequireAuthnDefault: true, PublicAuthModeDefault: "open",
 			// Issue #554 / ADR-078: Hobby unlocks liveness — the
 			// first paid tier gets the Cloud Run-parity primitive.
 			// 5s period / 3 consecutive / 60s cooldown / 3 in 300s.
@@ -237,6 +250,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Pro is the first tier where the
 			// per-app require_authn opt-in unlocks.
 			RequireAuthn: true,
+			// Issue #695 / ADR-080: Pro is the first tier where
+			// the new-app default flips to authenticated. Both
+			// 'bearer' and basic are unlocked here, so the mode
+			// can be the secure-by-default 'bearer' shape.
+			RequireAuthnDefault: true, PublicAuthModeDefault: "bearer",
 			// Issue #554 / ADR-078: Pro inherits the same liveness
 			// defaults as Hobby (5s / 3 / 60s / 3 in 300s). Pro is
 			// the unlock point for `GRPCLivenessAllowed()` once v2
@@ -315,6 +333,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Scale mirrors Pro — opt-in
 			// available, column default still false.
 			RequireAuthn: true,
+			// Issue #695 / ADR-080: Scale mirrors Pro — secure-by-default
+			// at the new-app stamp. Both bearer and basic are unlocked
+			// here, so the mode can stay 'bearer'.
+			RequireAuthnDefault: true, PublicAuthModeDefault: "bearer",
 			// Issue #554 / ADR-078: Scale mirrors Pro — same
 			// 5s / 3 / 60s / 3 in 300s defaults. The
 			// per-deployment override column on deployments is the
@@ -967,6 +989,62 @@ func TestPlanPublicAuthBasicAllowed(t *testing.T) {
 	for _, c := range cases {
 		if got := c.plan.PublicAuthBasicAllowed(); got != c.want {
 			t.Errorf("%s.PublicAuthBasicAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanRequireAuthnDefault pins the per-plan CREATE-TIME default for
+// apps.require_authn (issue #695 / ADR-080). Per-plan truth table:
+// Free=false, Hobby=true, Pro=true, Scale=true. apid's buildApp path
+// reads Plan.RequireAuthnDefault() when the POST body omitted the field
+// and stamps the result onto apps.require_authn. The migration 00155
+// grandfather marks every pre-flip row with auth_default_flipped_at so
+// no customer sees a behaviour change at the migration moment — this
+// accessor only affects post-flip CreateApp calls. Unknown plans must
+// fail closed (return false) — same contract as RequireAuthnAllowed
+// above; the fail-closed path lands on the schema column default.
+func TestPlanRequireAuthnDefault(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.RequireAuthnDefault(); got != c.want {
+			t.Errorf("%s.RequireAuthnDefault() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanPublicAuthModeDefault pins the per-plan CREATE-TIME default
+// for apps.public_auth_mode (issue #695 / ADR-080). Closed enum:
+// "open" / "bearer" / "basic". Per-plan truth table: Free="open",
+// Hobby="open" (no bearer scope on Hobby), Pro="bearer", Scale="bearer".
+// Hobby unlocks the require_authn gate but not the bearer scope —
+// defaulting to "bearer" without an unlocked scope would strand the
+// customer. apid's buildApp path reads Plan.PublicAuthModeDefault()
+// when the POST body omitted the field. Unknown plans must fail closed
+// (return "open") — same fail-closed contract as the bearer / basic
+// gate tests above.
+func TestPlanPublicAuthModeDefault(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want string
+	}{
+		{PlanFree, AppPublicAuthModeOpen},
+		{PlanHobby, AppPublicAuthModeOpen},
+		{PlanPro, AppPublicAuthModeBearer},
+		{PlanScale, AppPublicAuthModeBearer},
+		{Plan("unknown"), AppPublicAuthModeOpen},
+	}
+	for _, c := range cases {
+		if got := c.plan.PublicAuthModeDefault(); got != c.want {
+			t.Errorf("%s.PublicAuthModeDefault() = %q, want %q", c.plan, got, c.want)
 		}
 	}
 }

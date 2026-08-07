@@ -81,5 +81,6 @@ export type AppResponse = {
    */
   require_authn?: boolean;
   public_auth?: PublicAuthStatus;
+  auth_default_flipped_at?: string | null;
 };
 

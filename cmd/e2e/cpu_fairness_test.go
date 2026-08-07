@@ -224,7 +224,11 @@ func deployApp(t *testing.T, h *e2etest.Harness, registry *e2etest.FakeRegistry,
 		ref = registry.AddImage("library/"+slug, img)
 		_ = r
 	}
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app"}); got != http.StatusCreated {
+	// Issue #695 / ADR-080: post-flip Hobby defaults require_authn=true
+	// + public_auth_mode=open. The doGetWithHost probes below hit the
+	// routed URL anonymously — opt out at create-time.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: slug, Type: "app", RequireAuthn: &falsy}); got != http.StatusCreated {
 		t.Fatalf("create app %s: status=%d", slug, got)
 	}
 	appID := mustGetAppID(t, h, key, slug)

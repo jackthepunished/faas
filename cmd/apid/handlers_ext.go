@@ -728,6 +728,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// partial-PATCH (e.g. only flips RAM_MB) never
 		// touches the public_auth column.
 		SetPublicAuth: req.PublicAuth != nil,
+		// Issue #695 / ADR-080: grand-father clear path. Set
+		// whenever the customer made a deliberate choice on
+		// require_authn OR public_auth — that's the signal
+		// the dashboard banner looks for. A no-touch PATCH
+		// (e.g. RAM_MB-only) leaves ClearAuthDefaultFlippedAt
+		// false so the stamp stays and the banner keeps
+		// re-rendering. New post-flip apps (column NULL on
+		// create) are unaffected by the SET.
+		ClearAuthDefaultFlippedAt: req.RequireAuthn != nil || req.PublicAuth != nil,
 	}
 	if req.PublicAuth != nil {
 		// params.PublicAuth is unset when req.PublicAuth is

@@ -267,10 +267,64 @@ func cmdApps() int {
 		_, _ = fmt.Fprintln(osStdout, "Deploy one: `gregale deploy --template hello-node` (or `gregale deploy --tarball path/to/source.tar.gz`).")
 		return 0
 	}
+	// Header row + data rows. Format code:
+	//   SLUG (24) — STATUS (10) — URL (32) — AUTH (40)
+	// AUTH column (issue #695 / ADR-080) shows the app's
+	// require_authn + public_auth_mode state in human-readable
+	// form. The "since YYYY-MM-DD" suffix renders only when
+	// auth_default_flipped_at is non-null — pre-flip apps
+	// that have been grand-fathered by migration 00156.
+	_, _ = fmt.Fprintf(osStdout, "%-24s %-10s %-32s %s\n", "SLUG", "STATUS", "URL", "AUTH")
 	for _, a := range apps {
-		fmt.Printf("%-24s %-10s %s\n", a.Slug, a.Status, a.URL)
+		_, _ = fmt.Fprintf(osStdout, "%-24s %-10s %-32s %s\n", a.Slug, a.Status, a.URL, formatAppAuth(a))
 	}
 	return 0
+}
+
+// formatAppAuth (issue #695 / ADR-080) renders the AUTH column for
+// the `gregale app list` table. Prefix matches the customer's
+// observable auth state:
+//
+//	"AUTH: open"               — public, anonymous traffic allowed
+//	                              (require_authn=false).
+//	"AUTH: required"           — require_authn=true + public_auth_mode='open'.
+//	                              Gateway demands a Bearer token but
+//	                              accepts any — the bare pre-#477
+//	                              chain (kept for Hobby compat).
+//	"AUTH: bearer"             — require_authn=true + public_auth_mode='bearer'.
+//	                              Pro/Scale default post-#695; gateway
+//	                              validates the Bearer token against
+//	                              the per-account API key table.
+//	"AUTH: required + basic"   — require_authn=true + public_auth_mode='basic'
+//	                              + a sealed basic-cred pair is set
+//	                              (HasBasicCreds).
+//
+// The mode-aware branch is required: a Hobby bearer-shaped fixture
+// (require_authn=true, public_auth_mode='open') and a Pro fresh
+// default (require_authn=true, public_auth_mode='bearer') used to
+// both print "AUTH: required" — the review caught the missing
+// distinction. The order of cases matters: HasBasicCreds wins over
+// Mode (a basic-mode app with no creds is misconfigured and the
+// operator-facing surface still calls it out as basic).
+//
+// Suffix renders "since YYYY-MM-DD" only when auth_default_flipped_at
+// is non-null (pre-flip apps grand-fathered by migration 00156).
+func formatAppAuth(a api.AppResponse) string {
+	var prefix string
+	switch {
+	case a.RequireAuthn && a.PublicAuth.Mode == api.AppPublicAuthModeBasic && a.PublicAuth.HasBasicCreds:
+		prefix = "AUTH: required + basic"
+	case a.RequireAuthn && a.PublicAuth.Mode == api.AppPublicAuthModeBearer:
+		prefix = "AUTH: bearer"
+	case a.RequireAuthn:
+		prefix = "AUTH: required"
+	default:
+		prefix = "AUTH: open"
+	}
+	if a.AuthDefaultFlippedAt == nil {
+		return prefix
+	}
+	return fmt.Sprintf("%s · since %s", prefix, a.AuthDefaultFlippedAt.UTC().Format("2006-01-02"))
 }
 
 // deriveName uses the current directory as the default app slug (UX §2.3).

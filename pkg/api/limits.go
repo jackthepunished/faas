@@ -312,6 +312,28 @@ type Limits struct {
 	// (return false) — same contract as the other accessors above.
 	PublicAuthBasicAllowed bool
 
+	// RequireAuthnDefault (issue #695 / ADR-080) is the default
+	// value stamped onto a freshly created app's `require_authn`
+	// column when the customer omitted `require_authn` from the
+	// POST body. Per-plan truth table (Free/Hobby/Pro/Scale):
+	// false / true / true / true. Free stays public-by-default;
+	// Hobby+ ship secure-by-default. The companion column
+	// `apps.auth_default_flipped_at` is stamped on every pre-flip
+	// row by migration 00155 so pre-flip customers see no
+	// behaviour change. Unknown plans fail closed (return false on
+	// the accessor — the column default reverts to false).
+	RequireAuthnDefault bool
+	// PublicAuthModeDefault (issue #695 / ADR-080) is the default
+	// mode stamped onto a freshly created app's `public_auth_mode`
+	// column when the customer omitted `public_auth` from the POST
+	// body. Closed enum: "open" / "bearer" / "basic". Per-plan
+	// truth table: Free="open", Hobby="open" (no bearer scope on
+	// Hobby), Pro="bearer", Scale="bearer". Hobby unlocks the
+	// require_authn gate but not the bearer scope — defaulting to
+	// "bearer" without an unlocked scope would strand the customer.
+	// Unknown plans fail closed (return "open" on the accessor).
+	PublicAuthModeDefault string
+
 	// KeysMax (issue #189 / IAM-5) caps the per-account count of
 	// active + grace API keys. Revoked keys are exempt — they
 	// remain in the table for audit lineage but no longer count
@@ -641,6 +663,12 @@ var planLimits = map[Plan]Limits{
 		// existing Free apps keep working with no migration work.
 		PublicAuthBearerAllowed: false,
 		PublicAuthBasicAllowed:  false,
+		// Issue #695 / ADR-080: Free stays public-by-default. The
+		// token gate isn't unlocked on Free (RequireAuthn=false above);
+		// matching the default literal avoids customers creating a
+		// Free app and immediately seeing 401 from the gateway.
+		RequireAuthnDefault:   false,
+		PublicAuthModeDefault: "open",
 		// IAM-5 (issue #189): Free gets 3 keys — one for the customer's
 		// primary deploy target + one for a staging slot + one for
 		// break-glass. The abuse-vector (scripted key rotation under
@@ -814,6 +842,16 @@ var planLimits = map[Plan]Limits{
 		// 'open' mode is always available.
 		PublicAuthBearerAllowed: true,
 		PublicAuthBasicAllowed:  false,
+		// Issue #695 / ADR-080: Hobby unlocks the token gate as a
+		// default (RequireAuthnAllowed is gated above so customers
+		// can't PATCH-true, but defaults can stamp true). The mode
+		// stays "open" because Hobby doesn't unlock the bearer scope
+		// (PublicAuthBearerAllowed above is the gate for the PATCH;
+		// a Hobby customer with mode='bearer' default would have no
+		// way to authenticate). Customers who want the bearer
+		// experience upgrade to Pro.
+		RequireAuthnDefault:   true,
+		PublicAuthModeDefault: "open",
 		// IAM-5 (issue #189): Hobby gets 10 keys — 2 per app across
 		// the Hobby app budget (5) keeps every deploy target
 		// (CI / staging / prod / personal / monitoring) with a
@@ -988,6 +1026,13 @@ var planLimits = map[Plan]Limits{
 		// negligible at Pro scale (~50 apps).
 		PublicAuthBearerAllowed: true,
 		PublicAuthBasicAllowed:  true,
+		// Issue #695 / ADR-080: Pro unlocks both the token gate
+		// (RequireAuthn above) AND the bearer scope (PublicAuthBearerAllowed
+		// above). Default new apps to (true, "bearer") so the customer
+		// inherits secure-by-default. The opt-out path --no-require-authn
+		// --public-auth=open is universal across all plans and gates.
+		RequireAuthnDefault:   true,
+		PublicAuthModeDefault: "bearer",
 		// IAM-5 (issue #189): Pro gets 50 keys — 2 per app across the
 		// Pro app budget (25) plus a per-team allowance (CI / staging
 		// / prod / personal / monitoring / break-glass).
@@ -1154,6 +1199,13 @@ var planLimits = map[Plan]Limits{
 		// auth modes.
 		PublicAuthBearerAllowed: true,
 		PublicAuthBasicAllowed:  true,
+		// Issue #695 / ADR-080: Scale mirrors Pro on the auth default
+		// — the gate unlocks AND the bearer scope unlocks, so the
+		// secure-by-default literal (true, "bearer") applies. A future
+		// tier between Pro and Scale that unlocks mTLS would move
+		// the literal here as part of the same PR.
+		RequireAuthnDefault:   true,
+		PublicAuthModeDefault: "bearer",
 		// IAM-5 (issue #189): Scale gets 200 keys — 2 per app across
 		// the Scale app budget (100) plus a per-team allowance, with
 		// headroom for the rotating-CI shape of a SaaS-scale customer.
@@ -2203,6 +2255,40 @@ func (p Plan) RequireAuthnAllowed() bool {
 		return false // fail-closed
 	}
 	return l.RequireAuthn
+}
+
+// RequireAuthnDefault (issue #695 / ADR-080) returns the default
+// value that apid's buildApp path stamps onto a freshly created app's
+// `require_authn` column when the POST body omitted the field. Per-plan
+// truth table: Free=false, Hobby=true, Pro=true, Scale=true. The field
+// only affects the create-time stamp — pre-flip rows keep their
+// pre-flip value (the migration 00155 grandfather marks them with
+// auth_default_flipped_at without flipping the column itself).
+// Unknown plans fail closed (return false), matching the
+// RequireAuthnAllowed contract above.
+func (p Plan) RequireAuthnDefault() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false // fail-closed — column default reverts to false
+	}
+	return l.RequireAuthnDefault
+}
+
+// PublicAuthModeDefault (issue #695 / ADR-080) returns the default mode
+// apid stamps onto a freshly created app's `public_auth_mode` column.
+// Closed enum: "open" / "bearer" / "basic". Per-plan truth table:
+// Free="open", Hobby="open", Pro="bearer", Scale="bearer". Hobby unlocks
+// the require_authn gate but not the bearer scope (PublicAuthBearerAllowed
+// above is the gate for the PATCH) — defaulting to "bearer" without an
+// unlocked scope would strand the customer with a 401 they can't fix.
+// Unknown plans fail closed (return "open"), mirroring the
+// PublicAuthBearerAllowed contract above.
+func (p Plan) PublicAuthModeDefault() string {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return AppPublicAuthModeOpen // fail-closed
+	}
+	return l.PublicAuthModeDefault
 }
 
 // WarmSnapshotMinRequestsDefault returns the per-plan default for the

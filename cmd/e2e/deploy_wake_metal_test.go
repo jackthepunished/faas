@@ -106,8 +106,12 @@ func TestDeployWakeMetal(t *testing.T) {
 	img, ref := e2etest.HelloImageAboveBase("library/hello", helloBody)
 	ref = registry.AddImage("library/hello", img)
 
-	// Create the app on Hobby plan (256 MB RAM cap, 2-concurrency cap).
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: "hello", Type: "app"}); got != http.StatusCreated {
+	// Issue #695 / ADR-080: Hobby defaults to require_authn=true
+	// post-flip. The deploy-wake path here probes the parked→cold-boot
+	// surface, NOT the authn surface — opt out at create time so the
+	// anonymous GET against the routed app continues to work.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: "hello", Type: "app", RequireAuthn: &falsy}); got != http.StatusCreated {
 		t.Fatalf("create app: status=%d", got)
 	}
 	appID := mustGetAppID(t, h, key, "hello")

@@ -919,6 +919,34 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 	case "1":
 		data.FlashSurface = "Account restored. Welcome back."
 	}
+	// Issue #695 / ADR-080: per-account apps-auth-default
+	// grand-father banner. Renders when the account has at
+	// least one pre-flip app (auth_default_flipped_at IS NOT
+	// NULL on a live row). The banner copy points at the
+	// universal opt-out CLI; the count-zero path is the
+	// natural off-switch — no dismissal cookie required.
+	//
+	// The cut-over date is read from the events table (the
+	// apps.auth_default_global_flipped audit row emitted by
+	// the migration). A transient store error falls back to
+	// the empty string copy ("Recently") so the banner still
+	// renders with a reasonable message instead of 500ing
+	// the dashboard load. A never-applied environment (zero
+	// events) also falls back to "Recently" — the banner is
+	// unreachable in that state because CountAuthDefaultFlippedApps
+	// returns 0 too, so the empty-date path is a no-op.
+	if n, err := s.store.CountAuthDefaultFlippedApps(r.Context(), acct.ID); err == nil && n > 0 {
+		cutover := "Recently"
+		if t, terr := s.store.AuthDefaultFlippedAt(r.Context()); terr == nil && !t.IsZero() {
+			cutover = t.UTC().Format("2006-01-02")
+		}
+		data.ActionRequiredSurface = fmt.Sprintf(
+			"On %s the default for newly-created apps changed to require authentication. "+
+				"Your existing %d app(s) were not affected and continue to serve anonymous traffic. "+
+				"New apps now require \"Authorization: Bearer <token>\" by default; "+
+				"run \"gregale app <slug> --no-require-authn --public-auth=open\" to opt out any pre-flip app.",
+			cutover, n)
+	}
 	page := dashboard.Page{Title: "Account", Body: "account", Account: dashboardAccountView(view, appCount), Data: data}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)

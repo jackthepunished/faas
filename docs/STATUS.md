@@ -658,6 +658,56 @@ ADR-075 / issue #475 / migration 00138.
 
 ADR-076 / issue #476 / migrations 00140 + 00141.
 
+## Auth default flip — issue #695 / ADR-080
+
+Closes spec §17 G15. Cloud Run's analogue is IAM-authenticated by
+default with `--allow-unauthenticated` opening a route; this flip
+makes Gregale match that posture for newly-created apps.
+
+- **Schema** — `apps.auth_default_flipped_at timestamptz NULL`
+  (migration 00156, slot 155→156). Nullable so the migration is
+  forward-only contraction (down-migration drops the column).
+- **Grandfather mechanism** — migration stamps every pre-flip
+  row at flip-time (`UPDATE apps SET auth_default_flipped_at =
+  COALESCE(auth_default_flipped_at, now()) WHERE
+  auth_default_flipped_at IS NULL`, idempotent), and emits one
+  batch audit row `apps.auth_default_global_flipped` with the
+  migrated count (replay-safe via `WHERE NOT EXISTS`).
+- **Per-plan defaults** — `Plan.RequireAuthnDefault()` +
+  `Plan.PublicAuthModeDefault()` in `pkg/api/limits.go`. Truth
+  table:
+  | Plan  | require_authn | public_auth_mode |
+  |-------|---------------|-------------------|
+  | Free  | `false`       | `"open"`          |
+  | Hobby | `true`        | `"open"`          |
+  | Pro   | `true`        | `"bearer"`        |
+  | Scale | `true`        | `"bearer"`        |
+  Hobby stays on `"open"` because bearer scope is gated off at
+  that tier — defaulting to a mode a customer can't realise
+  would strand them.
+- **apid** — `buildApp` stamps both per-plan defaults onto the
+  returned `state.App` at create-time. Wire shape unchanged:
+  `AppResponse.require_authn` + `AppResponse.public_auth` already
+  shipped in #560 / #477.
+- **DTO** — new read-only field `AppResponse.auth_default_flipped_at`
+  (omitted via `omitempty` on fresh-create apps; surfaces RFC3339
+  for grandfathered apps so dashboards can render the
+  "since YYYY-MM-DD" suffix).
+- **CLI** — `faas apps list` adds an AUTH column. `AUTH: open` /
+  `AUTH: required` / `AUTH: required + basic`, suffixed with
+  `· since YYYY-MM-DD` on grandfathered apps. Per-app opt-out:
+  `faas app <slug> --no-require-authn`.
+- **Dashboard** — new `Page.ActionRequiredSurface` banner on the
+  account view. The banner surfaces the migration date and the
+  universal opt-out command (one place; no per-app link rot).
+- **E2E** — `cmd/e2e/deploy_wake_metal_test.go`,
+  `cmd/e2e/streaming_metal_test.go`,
+  `cmd/e2e/wake_timeline_metal_test.go` opt out at create-time
+  via `RequireAuthn: &falsy` because their anonymous probes
+  aren't testing the authn surface.
+
+ADR-080 / issue #695 / migration 00156.
+
 ## What's next
 
 M0 → M8 are the spec-defined milestones (spec §14, lines 444–461).
@@ -726,6 +776,22 @@ explicitly open issues that the doc otherwise implies are closed.
 These are still open on GitHub. Earlier revisions of this file
 sometimes implied they were closed; they aren't.
 
+- **#695** — Flip `apps.require_authn` global default to `true`
+  (Cloud Run `--no-allow-unauthenticated` parity). Migration
+  `00156` landed with a grand-father stamp on every pre-flip
+  row + one batch audit row; new apps stamp the per-plan default
+  via `api.Plan.RequireAuthnDefault()` /
+  `api.Plan.PublicAuthModeDefault()` at `apid::buildApp` time.
+  Per-plan truth table: Free `false/"open"`, Hobby `true/"open"`,
+  Pro `true/"bearer"`, Scale `true/"bearer"`. Hobby stays on
+  `"open"` because bearer scope is gated off at that tier — a
+  bare-bearer-default without a usable scope would strand the
+  customer. Existing apps are reachable exactly as they were at
+  flip-time; opt-out per app via
+  `faas app <slug> --no-require-authn`. Operator dashboard renders
+  the migration banner on the account view when
+  `count(apps where auth_default_flipped_at is not null) > 0`.
+  See ADR-080.
 - ~~**#254** — App logs SSE stream is a stub (tier-1 ship-blocker).
   Move 4: per-instance ring + schedd StreamAppLogs RPC + vmmd
   Logs RPC end-to-end. Consumer side (Move 3, PR #291) shipped.

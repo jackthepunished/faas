@@ -552,6 +552,7 @@ CREATE TABLE public.apps (
     warm_snapshot_min_ms integer DEFAULT 2000 NOT NULL,
     eviction_priority text DEFAULT 'best_effort'::text NOT NULL,
     require_authn boolean DEFAULT false NOT NULL,
+    auth_default_flipped_at timestamp with time zone,
     CONSTRAINT apps_autoscale_target_cpu_pct_range CHECK (((autoscale_target_cpu_pct IS NULL) OR ((autoscale_target_cpu_pct >= 0) AND (autoscale_target_cpu_pct <= 100)))),
     CONSTRAINT apps_autoscale_target_rps_nonneg CHECK (((autoscale_target_rps IS NULL) OR (autoscale_target_rps >= 0))),
     CONSTRAINT apps_eviction_priority_chk CHECK ((eviction_priority = ANY (ARRAY['best_effort'::text, 'reserved'::text]))),

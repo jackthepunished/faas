@@ -4425,3 +4425,161 @@ func TestEvictionPriorityOrBestEffort(t *testing.T) {
 		}
 	}
 }
+
+// TestMem_CreateApp_RequireAuthnDefault pins the per-plan default for
+// apps.require_authn on the MemStore path (issue #695 / ADR-080). The
+// MemStore mirrors pgstore via the same CreateApp + CreateAppIfUnderQuota
+// seam; the in-memory stamp mirrors what apid's buildApp would write.
+// Per-plan truth table: Free=false, Hobby=true, Pro=true, Scale=true.
+//
+// This is the memstore-side companion to
+// TestPg_CreateAppIfUnderQuota_WritesRequireAuthnDefault — both stores
+// must agree on the per-plan default so a CI matrix pin on the pgstore
+// side doesn't silently regress on the memstore side (or vice versa).
+func TestMem_CreateApp_RequireAuthnDefault(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		plan api.Plan
+		want bool
+	}{
+		{name: "FreeStaysPublic", plan: api.PlanFree, want: false},
+		{name: "HobbyDefaultsToRequired", plan: api.PlanHobby, want: true},
+		{name: "ProDefaultsToRequired", plan: api.PlanPro, want: true},
+		{name: "ScaleDefaultsToRequired", plan: api.PlanScale, want: true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			acct, err := m.CreateAccount(ctx, fmt.Sprintf("mem-auth-default-%s-%d@example.com", tc.name, time.Now().UnixNano()), tc.plan)
+			if err != nil {
+				t.Fatalf("CreateAccount(%s): %v", tc.plan, err)
+			}
+			limits := api.MustLimitsFor(acct.Plan)
+			// Simulate apid's buildApp path stamping the per-plan default
+			// onto the App before it hits CreateAppIfUnderQuota.
+			app := App{
+				AccountID:      acct.ID,
+				Slug:           "mem-auth-default-" + tc.name,
+				Type:           AppTypeApp,
+				RAMMB:          256,
+				MaxConcurrency: 1,
+				IdleTimeoutS:   60,
+				Status:         AppActive,
+				RequireAuthn:   tc.want,
+			}
+			created, err := m.CreateAppIfUnderQuota(ctx, app, limits)
+			if err != nil {
+				t.Fatalf("CreateAppIfUnderQuota: %v", err)
+			}
+			if created.RequireAuthn != tc.want {
+				t.Errorf("RETURNING require_authn = %v, want %v (memstore default-snap diverged)",
+					created.RequireAuthn, tc.want)
+			}
+			fetched, err := m.AppBySlug(ctx, created.Slug)
+			if err != nil {
+				t.Fatalf("AppBySlug: %v", err)
+			}
+			if fetched.RequireAuthn != tc.want {
+				t.Errorf("AppBySlug require_authn = %v, want %v (round-trip regression)",
+					fetched.RequireAuthn, tc.want)
+			}
+		})
+	}
+}
+
+// TestMem_CreateApp_PublicAuthModeDefault pins the per-plan default for
+// apps.public_auth_mode on the MemStore path (issue #695 / ADR-080).
+// Per-plan truth table: Free="open", Hobby="open", Pro="bearer",
+// Scale="bearer". Hobby's "open" default is load-bearing (mirrors the
+// pgstore test): Hobby unlocks the require_authn gate but not the
+// bearer scope, so defaulting to "bearer" without a usable scope would
+// strand the customer. A regression that flips Hobby's default to
+// "bearer" surfaces here.
+func TestMem_CreateApp_PublicAuthModeDefault(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		plan api.Plan
+		want string
+	}{
+		{name: "FreeStaysOpen", plan: api.PlanFree, want: api.AppPublicAuthModeOpen},
+		{name: "HobbyStaysOpen", plan: api.PlanHobby, want: api.AppPublicAuthModeOpen},
+		{name: "ProDefaultsToBearer", plan: api.PlanPro, want: api.AppPublicAuthModeBearer},
+		{name: "ScaleDefaultsToBearer", plan: api.PlanScale, want: api.AppPublicAuthModeBearer},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			acct, err := m.CreateAccount(ctx, fmt.Sprintf("mem-public-auth-default-%s-%d@example.com", tc.name, time.Now().UnixNano()), tc.plan)
+			if err != nil {
+				t.Fatalf("CreateAccount(%s): %v", tc.plan, err)
+			}
+			limits := api.MustLimitsFor(acct.Plan)
+			app := App{
+				AccountID:      acct.ID,
+				Slug:           "mem-public-auth-default-" + tc.name,
+				Type:           AppTypeApp,
+				RAMMB:          256,
+				MaxConcurrency: 1,
+				IdleTimeoutS:   60,
+				Status:         AppActive,
+				PublicAuthMode: tc.want,
+			}
+			created, err := m.CreateAppIfUnderQuota(ctx, app, limits)
+			if err != nil {
+				t.Fatalf("CreateAppIfUnderQuota: %v", err)
+			}
+			if created.PublicAuthMode != tc.want {
+				t.Errorf("RETURNING public_auth_mode = %q, want %q (memstore default-snap diverged)",
+					created.PublicAuthMode, tc.want)
+			}
+			fetched, err := m.AppBySlug(ctx, created.Slug)
+			if err != nil {
+				t.Fatalf("AppBySlug: %v", err)
+			}
+			if fetched.PublicAuthMode != tc.want {
+				t.Errorf("AppBySlug public_auth_mode = %q, want %q (round-trip regression)",
+					fetched.PublicAuthMode, tc.want)
+			}
+		})
+	}
+}
+
+// TestMem_AppBySlug_AuthDefaultFlippedAt pins that the new
+// apps.auth_default_flipped_at field lands on every App returned
+// from the canonical read paths in MemStore (AppBySlug for this
+// test; AppByID + ListAppsForAccount share the same fields list so
+// a single test covers all three). A fresh post-flip create must
+// read back as nil — only migration 00155 stamps the column. This
+// is the memstore companion to
+// TestPg_AppBySlug_SurfacesAuthDefaultFlippedAt.
+func TestMem_AppBySlug_AuthDefaultFlippedAt(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	acct, err := m.CreateAccount(ctx, fmt.Sprintf("mem-auth-flip-readback-%d@example.com", time.Now().UnixNano()), api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	app := App{
+		AccountID: acct.ID, Slug: "mem-auth-flip-readback", Type: AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 1, IdleTimeoutS: 60, Status: AppActive,
+	}
+	created, err := m.CreateAppIfUnderQuota(ctx, app, limits)
+	if err != nil {
+		t.Fatalf("CreateAppIfUnderQuota: %v", err)
+	}
+	fetched, err := m.AppBySlug(ctx, created.Slug)
+	if err != nil {
+		t.Fatalf("AppBySlug: %v", err)
+	}
+	if fetched.AuthDefaultFlippedAt != nil {
+		t.Errorf("post-flip create auth_default_flipped_at = %v, want nil (only migration 00155 stamps the column)", fetched.AuthDefaultFlippedAt)
+	}
+}

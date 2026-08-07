@@ -483,6 +483,19 @@ type App struct {
 	// db.NotifyKeyChanged invalidation) so the secretbox
 	// hot-path doesn't run on every request.
 	PublicAuthBasicSealed []byte
+	// AuthDefaultFlippedAt (issue #695 / ADR-080) is the
+	// grandfather marker for the apps-auth-default flip. Stamped
+	// on every pre-flip app by migration 00155 so the dashboard
+	// banner query + `faas apps list` annotation can render the
+	// "since YYYY-MM-DD" suffix on grandfathered rows. NULL on
+	// apps created AFTER the migration (no grandfather needed;
+	// the default is already applied at create-time via
+	// plan.RequireAuthnDefault() + plan.PublicAuthModeDefault()
+	// in apid's buildApp path). Read-only at the wire surface —
+	// the PATCH path never writes this column. A future
+	// contributor adding a PATCH path that writes it must refuse
+	// the field with 422 unprocessable_entity per ADR-080 §9.
+	AuthDefaultFlippedAt *time.Time
 	// WarmSnapshotMinRequests is the minimum successful request
 	// count before schedd promotes a warm-tier capture. Range
 	// [1, 100], default 5. Lowering this shortens the time to
@@ -1917,8 +1930,21 @@ type UpdateAppParams struct {
 	// only reads ciphertext.
 	PublicAuth    *AppPublicAuthUpdate
 	SetPublicAuth bool
-	Status        *AppStatus
-	Manifest      *AppManifest
+	// ClearAuthDefaultFlippedAt (issue #695 / ADR-080) is set
+	// by the apid PATCH handler when the customer makes any
+	// explicit choice on a grandfathered app (require_authn or
+	// public_auth PATCH). The signal means "the customer has
+	// seen the dashboard banner and made a deliberate
+	// choice" — the stamp is cleared so the per-account
+	// CountAuthDefaultFlippedApps drops, the yellow banner
+	// stops re-rendering, and the CLI AUTH column drops the
+	// `since YYYY-MM-DD` suffix. New post-flip apps are
+	// created with the column NULL so this flag is a no-op
+	// for them. Default false (a no-touch PATCH that doesn't
+	// touch auth columns must NOT silently clear the stamp).
+	ClearAuthDefaultFlippedAt bool
+	Status                    *AppStatus
+	Manifest                  *AppManifest
 	// RootDir is the workload's repo-relative build context (Phase 5
 	// repo decomposition, ADR-050 §3). Populated by pkg/reconcile on
 	// update; the apid handler leaves it nil on customer-initiated

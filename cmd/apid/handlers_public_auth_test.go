@@ -288,10 +288,12 @@ func TestPublicAuthPatch_AuditEmitsWithRedaction(t *testing.T) {
 	if data["slug"] != app.Slug {
 		t.Errorf("Data.slug = %v, want %s", data["slug"], app.Slug)
 	}
-	if data["old"] != "" && data["old"] != api.AppPublicAuthModeOpen {
-		// Pre-#477 default; the empty string never reaches
-		// here in practice (the seed path sets the default).
-		t.Errorf("Data.old = %v, want %q", data["old"], api.AppPublicAuthModeOpen)
+	if data["old"] != "" && data["old"] != api.AppPublicAuthModeOpen && data["old"] != api.AppPublicAuthModeBearer {
+		// Pre-#477 default was "" (empty); post-#477 the column
+		// surfaces as 'open' or 'bearer' (Pro/Scale default
+		// after issue #695 / ADR-080). Any other value is a
+		// regression.
+		t.Errorf("Data.old = %v, want one of \"\"/%q/%q", data["old"], api.AppPublicAuthModeOpen, api.AppPublicAuthModeBearer)
 	}
 	if data["new"] != api.AppPublicAuthModeBasic {
 		t.Errorf("Data.new = %v, want %q", data["new"], api.AppPublicAuthModeBasic)
@@ -385,7 +387,7 @@ func TestPublicAuthPatch_BasicRequiresCreds(t *testing.T) {
 	// before the SQL write (the seal step has no creds
 	// to encrypt).
 	row, _ := e.store.AppByID(context.Background(), app.ID)
-	if row.PublicAuthMode != "" && row.PublicAuthMode != api.AppPublicAuthModeOpen {
+	if row.PublicAuthMode != "" && row.PublicAuthMode != api.AppPublicAuthModeOpen && row.PublicAuthMode != api.AppPublicAuthModeBearer {
 		t.Fatalf("PublicAuthMode after rejected PATCH = %q; want default", row.PublicAuthMode)
 	}
 	// No audit row on basic-requires-creds rejection. Same

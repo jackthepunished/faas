@@ -1949,6 +1949,16 @@ func (m *MemStore) CreateApp(_ context.Context, app App) (App, error) {
 	// would. Pre-#475 tests that built App{} structs continue to read
 	// 'best_effort' on the round-trip.
 	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
+	// Issue #695 / ADR-080: defence-in-depth snap for public_auth_mode.
+	// pgstore floors '' to AppPublicAuthModeOpen at the SQL path
+	// (pgstore.go:1546-1549 / 1693-1697). CreateAppIfUnderQuota below
+	// already has this snap (added with issue #695); CreateApp was
+	// missing it — a hand-built App{} could round-trip with an empty
+	// mode and break the memstore/pgstore parity invariant. require_authn
+	// is bool (zero is the schema default), so no snap is needed there.
+	if app.PublicAuthMode == "" {
+		app.PublicAuthMode = api.AppPublicAuthModeOpen
+	}
 	m.apps[app.ID] = app
 	return app, nil
 }
@@ -1998,6 +2008,12 @@ func (m *MemStore) CreateAppIfUnderQuota(_ context.Context, app App, limits api.
 	// unconditional path so the per-account reserved-tier cap reader
 	// sees the same wire value.
 	app.EvictionPriority = EvictionPriorityOrBestEffort(app.EvictionPriority)
+	// Issue #695 / ADR-080: see CreateApp — same defence-in-depth
+	// snap for the public_auth mode. require_authn is bool (zero
+	// is the schema default), so no snap is needed there.
+	if app.PublicAuthMode == "" {
+		app.PublicAuthMode = api.AppPublicAuthModeOpen
+	}
 	m.apps[app.ID] = app
 	return app, nil
 }
@@ -2559,6 +2575,54 @@ func (m *MemStore) CountAppsWithEvictionPriority(_ context.Context, accountID, p
 	return n, nil
 }
 
+// CountAuthDefaultFlippedApps (issue #695 / ADR-080) mirrors the
+// pgstore implementation — counts live (non-deleted) apps with
+// auth_default_flipped_at != nil per account. See the pgstore
+// counterpart for the load-bearing semantics; the dashboard
+// banner turns itself off when the count reaches zero.
+func (m *MemStore) CountAuthDefaultFlippedApps(_ context.Context, accountID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, a := range m.apps {
+		if a.AccountID != accountID {
+			continue
+		}
+		if a.Status == AppDeleted {
+			continue
+		}
+		if a.AuthDefaultFlippedAt == nil {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// AuthDefaultFlippedAt (issue #695 / ADR-080) returns the
+// earliest stamp across all in-memory apps whose
+// AuthDefaultFlippedAt is non-nil. This stands in for the
+// pgstore events-table read; in memstore there's no separate
+// audit log so we project the stamp column directly. The
+// dashboard banner's "On YYYY-MM-DD" copy renders whichever
+// date the migration would have produced; the memstore path is
+// only hit by unit tests so the projection is sufficient.
+func (m *MemStore) AuthDefaultFlippedAt(_ context.Context) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var earliest time.Time
+	for _, a := range m.apps {
+		if a.AuthDefaultFlippedAt == nil {
+			continue
+		}
+		t := *a.AuthDefaultFlippedAt
+		if earliest.IsZero() || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	return earliest, nil
+}
+
 func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2714,6 +2778,16 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	}
 	if p.StartCommand != nil {
 		a.StartCommand = *p.StartCommand
+	}
+	// Issue #695 / ADR-080: grand-father clear path. Mirrors the
+	// pgstore $44 CASE so the in-memory and on-disk shapes stay
+	// consistent. Apid sets ClearAuthDefaultFlippedAt whenever the
+	// customer made a deliberate PATCH choice on require_authn OR
+	// public_auth; the stamp clears and the dashboard banner count
+	// drops. No-op for new post-flip apps (column is already NULL)
+	// and for no-touch PATCHes (SetRequireAuthn/SetPublicAuth false).
+	if p.ClearAuthDefaultFlippedAt {
+		a.AuthDefaultFlippedAt = nil
 	}
 	m.apps[id] = a
 	return a, nil

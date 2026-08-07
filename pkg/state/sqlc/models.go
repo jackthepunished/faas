@@ -143,6 +143,7 @@ type App struct {
 	WarmSnapshotMinMs       int32
 	EvictionPriority        string
 	RequireAuthn            bool
+	AuthDefaultFlippedAt    pgtype.Timestamptz
 }
 
 type AppEnv struct {

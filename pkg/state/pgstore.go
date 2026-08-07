@@ -1557,8 +1557,18 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, websocket_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	// Issue #695 / ADR-080: public_auth_mode is included in the column
+	// list so the App struct's value is written verbatim. Pre-#695 the
+	// schema default ('open') shadowed any value the caller passed,
+	// which broke the per-plan default path on Pro/Scale (default
+	// 'bearer' was overwritten back to 'open' on insert). Same shape
+	// for both CreateApp and CreateAppIfUnderQuota below.
+	//
+	// Issue #676 / PR-3: websocket_enabled is also written explicitly
+	// (same Set-bit-aware shape) so the per-plan default doesn't get
+	// shadowed by the schema DEFAULT.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1569,9 +1579,19 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	if statusValue == "" {
 		statusValue = AppActive
 	}
+	// Coerce an empty PublicAuthMode to AppPublicAuthModeOpen so the
+	// NOT NULL CHECK (public_auth_mode IN ('open','bearer','basic'))
+	// is satisfied. Mirrors the Type=="" / Status=="" floor above;
+	// apid always stamps the per-plan default before reaching this
+	// path, so the floor is a last-line defence for internal callers
+	// that build an App by hand.
+	publicAuthMode := app.PublicAuthMode
+	if publicAuthMode == "" {
+		publicAuthMode = AppPublicAuthModeOpen
+	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
 	return scanApp(row)
 }
 
@@ -1692,8 +1712,14 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, websocket_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+	// Issue #695 / ADR-080: public_auth_mode is in the column list so
+	// the App struct's value is written verbatim (same rationale as
+	// CreateApp above — schema default 'open' would otherwise shadow
+	// the per-plan default).
+	//
+	// Issue #676 / PR-3: websocket_enabled follows the same shape.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1703,9 +1729,16 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	if statusValue == "" {
 		statusValue = AppActive
 	}
+	// Coerce an empty PublicAuthMode to AppPublicAuthModeOpen so the
+	// NOT NULL CHECK is satisfied (mirrors CreateApp above). Apid
+	// always stamps the per-plan default before reaching this path.
+	publicAuthMode := app.PublicAuthMode
+	if publicAuthMode == "" {
+		publicAuthMode = AppPublicAuthModeOpen
+	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2385,6 +2418,52 @@ func (s *PgStore) CountAppsWithEvictionPriority(ctx context.Context, accountID, 
 	return n, err
 }
 
+// CountAuthDefaultFlippedApps (issue #695 / ADR-080) returns the
+// per-account count of apps stamped by the apps-auth-default
+// grand-father migration. Migration 00155 sets
+// auth_default_flipped_at on every pre-flip row; this query reads
+// back the live pre-flip count so the apid dashboard banner can
+// turn itself off when the customer has PATCHed every pre-flip app
+// back to public. Excludes soft-deleted apps so the banner tracks
+// the customer's actual surface. The apps_account_idx (account_id,
+// status) composite index keeps this O(N_per_account) — bounded by
+// the per-account app cap (Free 1, Hobby 5, Pro 25, Scale 100), so
+// the dashboard request stays constant-time in practice.
+//
+// The auth_default_flipped_at IS NOT NULL predicate picks up only
+// grand-fathered rows; a fresh post-flip create never has a stamp,
+// so a brand-new customer with no pre-flip apps reads 0 and the
+// banner is silent.
+func (s *PgStore) CountAuthDefaultFlippedApps(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*) from apps where account_id = $1 and status <> 'deleted' and auth_default_flipped_at is not null`,
+		accountID).Scan(&n)
+	return n, err
+}
+
+// AuthDefaultFlippedAt (issue #695 / ADR-080) reads the
+// `apps.auth_default_global_flipped` event's `at` timestamp. The
+// migration emits exactly one of these rows on apply (guarded by
+// `WHERE NOT EXISTS`); a replay produces no additional row, so the
+// MIN/MAX query always returns the original migration time. Returns
+// the zero time when no such event has been recorded yet (the apid
+// caller falls back to a "Recently" copy rather than blocking the
+// banner on a successful store read).
+func (s *PgStore) AuthDefaultFlippedAt(ctx context.Context) (time.Time, error) {
+	var t *time.Time
+	err := s.pool.QueryRow(ctx,
+		`select min(at) from events where kind = 'apps.auth_default_global_flipped'`,
+	).Scan(&t)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if t == nil {
+		return time.Time{}, nil
+	}
+	return *t, nil
+}
+
 func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (App, error) {
 	manifestBytes := []byte(nil)
 	if p.Manifest != nil {
@@ -2437,12 +2516,21 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   -- mode='basic' PATCH) clears the blob atomically.
 		   public_auth_mode   = case when $41 then $42::text  else public_auth_mode   end,
 		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end,
-		   -- Issue #676 / ADR-080: per-app raw-bytes Upgrade
-		   -- bridge. Same Set-bit convention as streaming_enabled
-		   -- above; apid gates PATCH-true through
-		   -- Plan.WebSocketResponseAllowed() (Free → 403
-		   -- plan_websocket_not_allowed).
-		   websocket_enabled = case when $44 then $45 else websocket_enabled end
+-- Issue #695 / ADR-080: grand-father marker. Cleared
+			   -- when the customer makes a deliberate PATCH choice
+			   -- on a grandfathered app (ClearAuthDefaultFlippedAt
+			   -- flag set by apid when SetRequireAuthn OR
+			   -- SetPublicAuth is true). The dashboard banner
+			   -- counts apps.auth_default_flipped_at IS NOT NULL
+			   -- per account; clearing the stamp brings the count
+			   -- toward zero and stops the banner from re-rendering.
+			   auth_default_flipped_at = case when $44 then NULL else auth_default_flipped_at end,
+			   -- Issue #676 / PR-3: per-app raw-bytes Upgrade
+			   -- bridge. Same Set-bit convention as streaming_enabled
+			   -- above; apid gates PATCH-true through
+			   -- Plan.WebSocketResponseAllowed() (Free → 403
+			   -- plan_websocket_not_allowed).
+			   websocket_enabled = case when $45 then $46 else websocket_enabled end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2501,7 +2589,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetPublicAuth,
 		derefString(ptrOrEmpty(p.PublicAuth)),
 		nilOrBytes(p.PublicAuth),
-		// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge.
+		// Issue #695 / ADR-080: grand-father clear path. apid sets
+		// this when the customer PATCHed require_authn or public_auth,
+		// which is the deliberate-choice signal the dashboard banner
+		// looks for. No-op for new post-flip apps (column is already
+		// NULL). A no-touch PATCH (RAM_MB-only, etc.) leaves the
+		// stamp alone so the banner keeps re-rendering.
+		p.ClearAuthDefaultFlippedAt,
+		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
 		// Same Set*/optional-pointer pattern as streaming_enabled.
 		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled))
 	return scanApp(row)
@@ -9229,7 +9324,14 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// into a *[]byte to keep the SQL NULL → Go nil
 		// convention explicit.
 		&a.PublicAuthMode, &a.PublicAuthBasicSealed,
-		// Issue #676 / ADR-080: per-app websocket_enabled flag.
+		// Issue #695 / ADR-080: grand-father marker. Nullable
+		// timestamptz scanned into *time.Time (pgx handles the
+		// SQL NULL → Go nil conversion natively — same shape
+		// as ReassignedAt / MigratedAt above). NOT NULL after
+		// migration 00156 backfills; NULL on apps created
+		// post-flip (no grandfather needed).
+		&a.AuthDefaultFlippedAt,
+		// Issue #676 / PR-3: per-app websocket_enabled flag.
 		// NOT NULL DEFAULT false (migration 00155); plain bool
 		// scan is safe.
 		&a.WebSocketEnabled); err != nil {
@@ -9298,7 +9400,11 @@ const appsSelectColumns = `
 	require_authn,
 	-- Issue #477 / ADR-079: per-app public_auth
 	public_auth_mode, public_auth_basic,
-	-- Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge flag.
+-- Issue #695 / ADR-080: grand-father marker. Set by
+	-- migration 00156 on every pre-flip row; reads null on
+	-- apps created post-flip.
+	auth_default_flipped_at,
+	-- Issue #676 / PR-3: per-app raw-bytes Upgrade bridge flag.
 	-- Boolean NOT NULL DEFAULT false (migration 00155); apid applies
 	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
 	-- writes through Plan.WebSocketResponseAllowed().

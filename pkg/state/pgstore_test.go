@@ -1055,6 +1055,179 @@ func TestPg_CreateAppIfUnderQuota_WritesStreamingEnabled(t *testing.T) {
 	}
 }
 
+// TestPg_CreateAppIfUnderQuota_WritesRequireAuthnDefault pins the
+// per-plan default for apps.require_authn (issue #695 / ADR-080).
+// Per-plan truth table: Free=false, Hobby=true, Pro=true, Scale=true.
+// The test stamps the per-plan default onto the App struct (mirroring
+// what apid's buildApp path does at create-time) and verifies the
+// INSERT writes the value AND the round-trip via AppBySlug reads it
+// back. A future regression that drops the column from
+// appsSelectColumns or breaks the pgstore default-snap surfaces here.
+//
+// The off-by-default case (Free) is the load-bearing one — the
+// default existed as the schema DEFAULT false before #695, and a
+// regression to "Free apps come back with require_authn=true" is
+// the kind of silent breakage the CI pin is meant to catch.
+func TestPg_CreateAppIfUnderQuota_WritesRequireAuthnDefault(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	cases := []struct {
+		name string
+		plan api.Plan
+		want bool
+	}{
+		{name: "FreeStaysPublic", plan: api.PlanFree, want: false},
+		{name: "HobbyDefaultsToRequired", plan: api.PlanHobby, want: true},
+		{name: "ProDefaultsToRequired", plan: api.PlanPro, want: true},
+		{name: "ScaleDefaultsToRequired", plan: api.PlanScale, want: true},
+	}
+	for i, tc := range cases {
+		i, tc := i, tc
+		t.Run(tc.name, func(t *testing.T) {
+			email := fmt.Sprintf("auth-default-insert-%d-%d@example.com", i, time.Now().UnixNano())
+			acct, err := s.CreateAccount(ctx, email, tc.plan)
+			if err != nil {
+				t.Fatalf("CreateAccount(%s): %v", tc.plan, err)
+			}
+			limits := api.MustLimitsFor(acct.Plan)
+
+			app := state.App{
+				AccountID:      acct.ID,
+				Slug:           "auth-default-" + tc.name,
+				Type:           state.AppTypeApp,
+				RAMMB:          256,
+				MaxConcurrency: 1,
+				IdleTimeoutS:   60,
+				Status:         state.AppActive,
+				// Simulate apid's buildApp path stamping the per-plan default.
+				RequireAuthn: tc.want,
+			}
+			created, err := s.CreateAppIfUnderQuota(ctx, app, limits)
+			if err != nil {
+				t.Fatalf("CreateAppIfUnderQuota: %v", err)
+			}
+			if created.RequireAuthn != tc.want {
+				t.Errorf("RETURNING require_authn = %v, want %v (insert dropped the column or the default-snap diverged from pgstore)",
+					created.RequireAuthn, tc.want)
+			}
+			fetched, err := s.AppBySlug(ctx, created.Slug)
+			if err != nil {
+				t.Fatalf("AppBySlug: %v", err)
+			}
+			if fetched.RequireAuthn != tc.want {
+				t.Errorf("AppBySlug require_authn = %v, want %v (round-trip regression)",
+					fetched.RequireAuthn, tc.want)
+			}
+		})
+	}
+}
+
+// TestPg_CreateAppIfUnderQuota_WritesPublicAuthModeDefault pins the
+// per-plan default for apps.public_auth_mode (issue #695 / ADR-080).
+// Per-plan truth table: Free="open", Hobby="open", Pro="bearer",
+// Scale="bearer". The same shape as the require_authn tripwire —
+// the stamp is on the App struct (mirroring apid's buildApp path),
+// the INSERT writes the value, AppBySlug reads it back unchanged.
+//
+// Hobby's "open" default is load-bearing: Hobby unlocks the
+// require_authn gate but not the bearer scope, so defaulting to
+// "bearer" without a usable scope would strand the customer. A
+// regression that flips Hobby's default to "bearer" surfaces here.
+func TestPg_CreateAppIfUnderQuota_WritesPublicAuthModeDefault(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	cases := []struct {
+		name string
+		plan api.Plan
+		want string
+	}{
+		{name: "FreeStaysOpen", plan: api.PlanFree, want: api.AppPublicAuthModeOpen},
+		{name: "HobbyStaysOpen", plan: api.PlanHobby, want: api.AppPublicAuthModeOpen},
+		{name: "ProDefaultsToBearer", plan: api.PlanPro, want: api.AppPublicAuthModeBearer},
+		{name: "ScaleDefaultsToBearer", plan: api.PlanScale, want: api.AppPublicAuthModeBearer},
+	}
+	for i, tc := range cases {
+		i, tc := i, tc
+		t.Run(tc.name, func(t *testing.T) {
+			email := fmt.Sprintf("public-auth-insert-%d-%d@example.com", i, time.Now().UnixNano())
+			acct, err := s.CreateAccount(ctx, email, tc.plan)
+			if err != nil {
+				t.Fatalf("CreateAccount(%s): %v", tc.plan, err)
+			}
+			limits := api.MustLimitsFor(acct.Plan)
+
+			app := state.App{
+				AccountID:      acct.ID,
+				Slug:           "public-auth-default-" + tc.name,
+				Type:           state.AppTypeApp,
+				RAMMB:          256,
+				MaxConcurrency: 1,
+				IdleTimeoutS:   60,
+				Status:         state.AppActive,
+				PublicAuthMode: tc.want,
+			}
+			created, err := s.CreateAppIfUnderQuota(ctx, app, limits)
+			if err != nil {
+				t.Fatalf("CreateAppIfUnderQuota: %v", err)
+			}
+			if created.PublicAuthMode != tc.want {
+				t.Errorf("RETURNING public_auth_mode = %q, want %q (insert dropped the column or the default-snap diverged from pgstore)",
+					created.PublicAuthMode, tc.want)
+			}
+			fetched, err := s.AppBySlug(ctx, created.Slug)
+			if err != nil {
+				t.Fatalf("AppBySlug: %v", err)
+			}
+			if fetched.PublicAuthMode != tc.want {
+				t.Errorf("AppBySlug public_auth_mode = %q, want %q (round-trip regression)",
+					fetched.PublicAuthMode, tc.want)
+			}
+		})
+	}
+}
+
+// TestPg_AppBySlug_SurfacesAuthDefaultFlippedAt pins that the new
+// apps.auth_default_flipped_at column lands on every App returned
+// from the canonical read paths (AppBySlug for this test;
+// AppByID + ListAppsForAccount share the same appsSelectColumns +
+// scanApp path so a single test covers all three). The column is
+// nullable; both NULL (post-flip create) and a stamped value (a
+// pre-flip row written by migration 00155) must round-trip
+// correctly. A regression that drops the column from
+// appsSelectColumns or breaks the scan target lands here as a
+// pgx NULL-scan failure (most often: a future contributor removing
+// the AuthDefaultFlippedAt positional argument from scanApp's
+// row.Scan call).
+func TestPg_AppBySlug_SurfacesAuthDefaultFlippedAt(t *testing.T) {
+	s, ctx := pgStore(t)
+
+	acct, err := s.CreateAccount(ctx, fmt.Sprintf("auth-flip-readback-%d@example.com", time.Now().UnixNano()), api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	limits := api.MustLimitsFor(acct.Plan)
+	app := state.App{
+		AccountID: acct.ID, Slug: "auth-flip-readback", Type: state.AppTypeApp,
+		RAMMB: 256, MaxConcurrency: 1, IdleTimeoutS: 60, Status: state.AppActive,
+	}
+	created, err := s.CreateAppIfUnderQuota(ctx, app, limits)
+	if err != nil {
+		t.Fatalf("CreateAppIfUnderQuota: %v", err)
+	}
+	// Fresh post-flip create: auth_default_flipped_at must read
+	// back as nil (not stamped — only the migration backfill
+	// stamps the column). A regression that auto-stamps new
+	// creates breaks here — the column is intentionally
+	// read-only-and-grandfathered-only.
+	fetched, err := s.AppBySlug(ctx, created.Slug)
+	if err != nil {
+		t.Fatalf("AppBySlug: %v", err)
+	}
+	if fetched.AuthDefaultFlippedAt != nil {
+		t.Errorf("post-flip create auth_default_flipped_at = %v, want nil (only migration 00155 stamps the column)", fetched.AuthDefaultFlippedAt)
+	}
+}
+
 // TestPg_SnapshotStorageKey_RoundTrip mirrors the MemStore test of the
 // same name on the PgStore side (F-3 review finding): CreateSnapshot
 // stores the value the caller passes, LatestSnapshot reads it back

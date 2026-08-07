@@ -143,22 +143,45 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if req.WarmSnapshotEnabled != nil {
 		warmEnabled = *req.WarmSnapshotEnabled
 	}
-	// Issue #560: per-app require_authn opt-in. The global default
-	// is always false — every existing customer stays
-	// public-by-default (issue AC #5, the load-bearing
-	// no-breakage invariant). The plan gate (Pro/Scale only)
-	// fires at the PATCH handler, not at Create time: a Free
-	// customer's CreateApp call with require_authn=true gets a
-	// 403 plan_require_authn_not_allowed via the standard
-	// plan-gate shape, but CreateApp without that pointer = no
-	// payload drift, no customer-visible gate at creation.
-	// The per-request override on Pro/Scale lets a customer opt
-	// out at create time (e.g. a Pro customer's brand-new
-	// staging app that wants the public path).
-	requireAuthn := false
+	// Issue #560 + issue #695 / ADR-080: per-app require_authn
+	// + public_auth_mode. The default is now per-plan — see
+	// pkg/api/limits.go (Plan.RequireAuthnDefault +
+	// Plan.PublicAuthModeDefault). Per-plan truth table:
+	// Free={false, "open"}, Hobby={true, "open"},
+	// Pro={true, "bearer"}, Scale={true, "bearer"}. Existing
+	// customers are unaffected because migration 00155
+	// grand-fathered every pre-flip row with
+	// auth_default_flipped_at and did NOT flip their
+	// require_authn / public_auth_mode values.
+	//
+	// Plan-gate at create-time: a Free/Hobby customer who POSTs
+	// require_authn=true gets 403 plan_require_authn_not_allowed
+	// BEFORE the App is built — same shape as the PATCH-time
+	// gate (handlers_ext.go:268). Without this gate a Free
+	// customer's create request would silently land as true
+	// (bypassing the Free-tier contract that RequireAuthnAllowed
+	// is supposed to enforce). Hobby unlocks the gate as a
+	// default but NOT as an opt-in: a Hobby customer can keep
+	// the default true on creation but cannot escalate back to
+	// true once they PATCH-false (the PATCH-time gate blocks it).
+	if req.RequireAuthn != nil && *req.RequireAuthn && !acct.Plan.RequireAuthnAllowed() {
+		return state.App{}, api.NewProblem(http.StatusForbidden,
+			api.CodePlanRequireAuthnNotAllowed,
+			"Per-app authentication is not allowed on this plan",
+			"Free and Hobby tiers do not support per-app require_authn; upgrade to Pro or higher.")
+	}
+	requireAuthn := acct.Plan.RequireAuthnDefault()
 	if req.RequireAuthn != nil {
 		requireAuthn = *req.RequireAuthn
 	}
+	// public_auth_mode has no wire-side override on
+	// CreateAppRequest today — PATCH is the only surface for
+	// it (the basic-cred sealing step requires plaintext
+	// credentials, which only makes sense on a PATCH
+	// roundtrip). The default lands here so a freshly
+	// created Hobby/Pro/Scale app inherits the gate as part
+	// of the secure-by-default flip.
+	publicAuthMode := acct.Plan.PublicAuthModeDefault()
 	// Apply the per-app threshold defaults from the plan; an
 	// explicit override on the request wins. Out-of-range values
 	// were already rejected at the JSON-decode layer
@@ -179,13 +202,19 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 		StreamingEnabled:    streaming,
 		WebSocketEnabled:    ws,
 		WarmSnapshotEnabled: warmEnabled,
-		// Issue #560: see the plan-default block above. Default
-		// false; the per-plan gate (RequireAuthnAllowed) is
-		// consulted only when an existing app is PATCHed true,
-		// not at Create time. State layer is the canonical source
-		// (apps.require_authn column); the DTO surfaces the same
-		// value.
-		RequireAuthn: requireAuthn,
+		// Issue #560 + issue #695 / ADR-080: see the
+		// plan-default block above. Default is per-plan
+		// (Plan.RequireAuthnDefault + Plan.PublicAuthModeDefault);
+		// the per-plan RequireAuthnAllowed gate is enforced
+		// at create-time too (see the rejection branch above)
+		// AND at PATCH-time (handlers_ext.go:268) so a Free
+		// customer's escalation surfaces as 403
+		// plan_require_authn_not_allowed before any SQL
+		// write. State layer is the canonical source
+		// (apps.require_authn + apps.public_auth_mode columns);
+		// the DTO surfaces the same values.
+		RequireAuthn:   requireAuthn,
+		PublicAuthMode: publicAuthMode,
 		// Coerce to the plan minimums when the request asked for a
 		// warm config but the plan says warm-snapshot is off: the
 		// store ignores them anyway (the cold-boot path doesn't
@@ -351,6 +380,13 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 			Mode:          a.PublicAuthMode,
 			HasBasicCreds: len(a.PublicAuthBasicSealed) > 0,
 		},
+		// Issue #695 / ADR-080: grand-father marker. Set by
+		// migration 00155 on every pre-flip row; null on
+		// apps created after the flip. Surfaced so the
+		// dashboard banner query + `faas apps list`
+		// annotation can render the "since YYYY-MM-DD"
+		// suffix on grandfathered rows.
+		AuthDefaultFlippedAt: a.AuthDefaultFlippedAt,
 		// Issue #462 / ADR-058 / PR-A: per-app scaling policy. nil
 		// = legacy row (projected from min_instances / max_concurrency
 		// by the read path). Non-nil = customer-authored policy.

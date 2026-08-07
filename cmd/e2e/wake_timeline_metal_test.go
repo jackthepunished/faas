@@ -119,7 +119,11 @@ func TestWakeTimelineMetal(t *testing.T) {
 	img, ref := e2etest.HelloImageAboveBase("library/hello", helloBody)
 	ref = registry.AddImage("library/hello", img)
 
-	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: "hello", Type: "app"}); got != http.StatusCreated {
+	// Issue #695 / ADR-080: Hobby defaults to require_authn=true
+	// post-flip. The wake-timeline probe is anonymous; opt out at
+	// create time so the routed GET continues to land on the app.
+	falsy := false
+	if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{Slug: "hello", Type: "app", RequireAuthn: &falsy}); got != http.StatusCreated {
 		t.Fatalf("create app: status=%d", got)
 	}
 

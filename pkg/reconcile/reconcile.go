@@ -203,6 +203,16 @@ func (s *Service) Plan(
 	if err != nil {
 		return Result{}, fmt.Errorf("reconcile: plan: load apps: %w", err)
 	}
+	// 2b. Resolve the account plan so the projected draft apps can
+	// stamp the per-plan auth defaults (issue #695 / ADR-080).
+	// Reconcile applies the same stamp on the apply path; the Plan
+	// path is read-only but its projections feed the same handler
+	// surface, so the projected Auth values must match what the
+	// apply path would actually write.
+	acct, err := s.Store.AccountByID(ctx, project.AccountID)
+	if err != nil {
+		return Result{}, fmt.Errorf("reconcile: plan: load account: %w", err)
+	}
 
 	// 3. Diff. workloadDiff is read-only; it does not touch the
 	// store and does not emit audit.
@@ -216,7 +226,7 @@ func (s *Service) Plan(
 	for _, a := range actions {
 		switch a.Op {
 		case "create":
-			draft := workloadToDraftApp(project, a.Workload, a.StartCommand)
+			draft := workloadToDraftApp(project, a.Workload, a.StartCommand, acct.Plan)
 			out.Added = append(out.Added, draft)
 		case "update":
 			out.Changed = append(out.Changed, a.App)
