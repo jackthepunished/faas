@@ -59,6 +59,9 @@ class AppResponse:
     streaming_enabled: bool | Unset = UNSET
     """Per-app streaming flag (issue #471). Free customers always see this as false; Hobby/Pro/Scale can PATCH it.
     PR-B activates the streamed response path; PR-A only persists the flag."""
+    websocket_enabled: bool | Unset = UNSET
+    """Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Default-on for Hobby/Pro/Scale; Free customers
+    always see this as false. PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed."""
     scaling_policy: None | ScalingPolicy | Unset = UNSET
     """Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from
     min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column
@@ -93,6 +96,7 @@ class AppResponse:
     without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision
     're-redaction invariant': neither basic_user nor basic_pass is EVER returned on the wire, even when
     mode='basic'. To rotate credentials, the customer PATCHes a fresh public_auth block."""
+    auth_default_flipped_at: datetime.datetime | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -138,6 +142,8 @@ class AppResponse:
 
         streaming_enabled = self.streaming_enabled
 
+        websocket_enabled = self.websocket_enabled
+
         scaling_policy: dict[str, Any] | None | Unset
         if isinstance(self.scaling_policy, Unset):
             scaling_policy = UNSET
@@ -180,6 +186,14 @@ class AppResponse:
         if not isinstance(self.public_auth, Unset):
             public_auth = self.public_auth.to_dict()
 
+        auth_default_flipped_at: None | str | Unset
+        if isinstance(self.auth_default_flipped_at, Unset):
+            auth_default_flipped_at = UNSET
+        elif isinstance(self.auth_default_flipped_at, datetime.datetime):
+            auth_default_flipped_at = self.auth_default_flipped_at.isoformat()
+        else:
+            auth_default_flipped_at = self.auth_default_flipped_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -206,6 +220,8 @@ class AppResponse:
             field_dict["egress_allowlist"] = egress_allowlist
         if streaming_enabled is not UNSET:
             field_dict["streaming_enabled"] = streaming_enabled
+        if websocket_enabled is not UNSET:
+            field_dict["websocket_enabled"] = websocket_enabled
         if scaling_policy is not UNSET:
             field_dict["scaling_policy"] = scaling_policy
         if last_scale_out_at is not UNSET:
@@ -226,6 +242,8 @@ class AppResponse:
             field_dict["require_authn"] = require_authn
         if public_auth is not UNSET:
             field_dict["public_auth"] = public_auth
+        if auth_default_flipped_at is not UNSET:
+            field_dict["auth_default_flipped_at"] = auth_default_flipped_at
 
         return field_dict
 
@@ -279,6 +297,8 @@ class AppResponse:
         egress_allowlist = cast(list[str], d.pop("egress_allowlist", UNSET))
 
         streaming_enabled = d.pop("streaming_enabled", UNSET)
+
+        websocket_enabled = d.pop("websocket_enabled", UNSET)
 
         def _parse_scaling_policy(data: object) -> None | ScalingPolicy | Unset:
             if data is None:
@@ -355,6 +375,23 @@ class AppResponse:
         else:
             public_auth = PublicAuthStatus.from_dict(_public_auth)
 
+        def _parse_auth_default_flipped_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                auth_default_flipped_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return auth_default_flipped_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        auth_default_flipped_at = _parse_auth_default_flipped_at(d.pop("auth_default_flipped_at", UNSET))
+
         app_response = cls(
             id=id,
             slug=slug,
@@ -372,6 +409,7 @@ class AppResponse:
             idle_timeout_s=idle_timeout_s,
             egress_allowlist=egress_allowlist,
             streaming_enabled=streaming_enabled,
+            websocket_enabled=websocket_enabled,
             scaling_policy=scaling_policy,
             last_scale_out_at=last_scale_out_at,
             last_scale_in_at=last_scale_in_at,
@@ -382,6 +420,7 @@ class AppResponse:
             eviction_priority=eviction_priority,
             require_authn=require_authn,
             public_auth=public_auth,
+            auth_default_flipped_at=auth_default_flipped_at,
         )
 
         app_response.additional_properties = d

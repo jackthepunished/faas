@@ -47,6 +47,9 @@ class UpdateAppRequest:
     streaming_enabled: bool | None | Unset = UNSET
     """Per-app streaming flag (issue #471). Omitted → no change. Free PATCHing true is 403
     plan_streaming_not_allowed."""
+    websocket_enabled: bool | None | Unset = UNSET
+    """Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → no change. Free PATCHing true is 403
+    plan_websocket_not_allowed."""
     scaling_policy: None | ScalingPolicy | Unset = UNSET
     """Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column."""
     require_signed: bool | None | Unset = UNSET
@@ -133,6 +136,12 @@ class UpdateAppRequest:
         else:
             streaming_enabled = self.streaming_enabled
 
+        websocket_enabled: bool | None | Unset
+        if isinstance(self.websocket_enabled, Unset):
+            websocket_enabled = UNSET
+        else:
+            websocket_enabled = self.websocket_enabled
+
         scaling_policy: dict[str, Any] | None | Unset
         if isinstance(self.scaling_policy, Unset):
             scaling_policy = UNSET
@@ -210,6 +219,8 @@ class UpdateAppRequest:
             field_dict["autoscale_target_cpu_pct"] = autoscale_target_cpu_pct
         if streaming_enabled is not UNSET:
             field_dict["streaming_enabled"] = streaming_enabled
+        if websocket_enabled is not UNSET:
+            field_dict["websocket_enabled"] = websocket_enabled
         if scaling_policy is not UNSET:
             field_dict["scaling_policy"] = scaling_policy
         if require_signed is not UNSET:
@@ -300,6 +311,15 @@ class UpdateAppRequest:
             return cast(bool | None | Unset, data)
 
         streaming_enabled = _parse_streaming_enabled(d.pop("streaming_enabled", UNSET))
+
+        def _parse_websocket_enabled(data: object) -> bool | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(bool | None | Unset, data)
+
+        websocket_enabled = _parse_websocket_enabled(d.pop("websocket_enabled", UNSET))
 
         def _parse_scaling_policy(data: object) -> None | ScalingPolicy | Unset:
             if data is None:
@@ -437,6 +457,7 @@ class UpdateAppRequest:
             autoscale_target_rps=autoscale_target_rps,
             autoscale_target_cpu_pct=autoscale_target_cpu_pct,
             streaming_enabled=streaming_enabled,
+            websocket_enabled=websocket_enabled,
             scaling_policy=scaling_policy,
             require_signed=require_signed,
             warm_snapshot_enabled=warm_snapshot_enabled,
