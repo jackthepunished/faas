@@ -2391,6 +2391,49 @@ func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseT
 	return nil
 }
 
+// FailRunningInstanceOnDeadNode flips a RUNNING row to FAILED when its
+// owning node is gone, stamping terminal_at so the §17 retention sweep
+// can age the row out.
+//
+// The predicate is the load-bearing race-safety guarantee, exactly as
+// in AbortMigratingInstance: `state = 'running' AND node_id = $2`. If
+// the node came back and its vmmd re-registered, or a peer already
+// transitioned the row (park, evict, migrate), RowsAffected() is 0 and
+// we return ErrConflict so the caller counts it and moves on rather
+// than second-guessing the state machine. Pinning node_id means a row
+// that migrated to a healthy node between the SELECT and this UPDATE
+// is never failed by a stale read.
+//
+// running → failed is a legal edge (machine.go validTransitions), and
+// FAILED is excluded from CountsForRAM(), which is what actually stops
+// the billing leak: meterd's sampler skips the row on its next tick.
+// FAILED (not PARKED) because no snapshot was taken — the VM died with
+// its host. The wake path treats FAILED as cold-bootable (ADR-005), so
+// the customer's next request still serves.
+func (s *PgStore) FailRunningInstanceOnDeadNode(ctx context.Context, instanceID, nodeID string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty instanceID")
+	}
+	if nodeID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty nodeID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'failed',
+		        terminal_at = now()
+		  where id = $1
+		    and state = 'running'
+		    and node_id = $2`,
+		instanceID, nodeID)
+	if err != nil {
+		return fmt.Errorf("state: fail running instance on dead node: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,
@@ -6642,6 +6685,48 @@ func (s *PgStore) ListInstancesByStatesOlderThan(ctx context.Context, states []S
 		stateStrs, threshold)
 	if err != nil {
 		return nil, err
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
+// ListRunningInstancesOnDeadNodes is the dead-node billing
+// reconciler's lookup. Joins instances → compute_nodes and returns
+// RUNNING rows whose owning node is not alive.
+//
+// Liveness is the OR of two predicates on purpose:
+//
+//   - `active = false` — schedd's heartbeat sweep already flipped the
+//     node (pkg/sched/heartbeat.go). This is the steady-state signal.
+//   - `last_heartbeat_at < threshold` — the flip has not landed yet.
+//     MarkComputeNodeInactive is only called from the heartbeat
+//     goroutine, so a schedd restart (or a schedd that never came
+//     back) leaves a dead node with active = true indefinitely.
+//     Without this second predicate the reconciler would inherit the
+//     exact liveness blind spot it exists to close.
+//
+// ORDER BY last_heartbeat_at ASC so a capped tick drains the
+// longest-dead nodes first — those are the rows accruing the most
+// incorrect billing. The limit keeps one tick's write burst bounded
+// on a fleet where a whole node's worth of instances goes dead at
+// once; the caller re-runs on the next tick until the set is empty.
+func (s *PgStore) ListRunningInstancesOnDeadNodes(ctx context.Context, threshold time.Time, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: limit must be > 0, got %d", limit)
+	}
+	rows, err := s.pool.Query(ctx,
+		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at,
+		        i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
+		 from instances i
+		 join compute_nodes n on n.id = i.node_id
+		 where i.state = 'running'
+		   and (n.active = false or n.last_heartbeat_at < $1)
+		 order by n.last_heartbeat_at asc
+		 limit $2`,
+		threshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: %w", err)
 	}
 	defer rows.Close()
 	return scanInstances(rows)

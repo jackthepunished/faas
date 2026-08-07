@@ -809,6 +809,15 @@ type OpsMetrics struct {
 	// instantiated in NewOpsMetrics so the row surfaces in
 	// /metrics from boot.
 	migratingReconcileDecisions *prometheus.CounterVec
+	// deadNodeReconcileDecisions: dead-node billing reconciler.
+	// schedd's Engine.ReconcileDeadNodeInstances increments this
+	// once per RUNNING row found on a node that has been
+	// unreachable past the staleness window. A non-zero `failed`
+	// rate means a vmmd died without transitioning its rows and
+	// customers were being billed for VMs that no longer exist —
+	// the §12 dashboard treats a sustained non-zero rate as an
+	// incident signal, not routine background repair.
+	deadNodeReconcileDecisions *prometheus.CounterVec
 	// githubdPathFilterTotal: issue #432 phase 5 / ADR-050
 	// §109. Counter labelled by `mode` ∈ {paths, full_fallback,
 	// truncated, error, breaker_open} — the closed set
@@ -1662,6 +1671,14 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node migrating-instance watchdog reconcile decisions (Tier A6 / ADR-067), labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}. `reinvited` is the §12 dashboard panel (active owner re-acked the same lease); `hard_deleted` is the tripwire for the new-owner vmmd dying mid-handoff. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via ObserveMigratingReconcile.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, migratingReconcileDecisions)
+	// Dead-node billing reconciler counter. Single-registry pattern
+	// (mirrors migratingReconcileDecisions): registered on every
+	// daemon, only schedd increments it in production.
+	deadNodeReconcileDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_dead_node_reconcile_total",
+		Help: "Dead-node billing reconciler decisions, labelled by outcome ∈ {failed, conflict, error}. `failed` counts RUNNING instances terminated because their compute_node stopped heartbeating past the staleness window — each one was billing the customer for a VM that no longer existed and holding §6.2-2 RAM ceiling. A sustained non-zero `failed` rate is an incident signal (a vmmd is dying without transitioning its rows), not routine repair. `conflict` is the benign peer-wins/node-recovered path.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, deadNodeReconcileDecisions)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -1795,6 +1812,13 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"reinvited", "hard_deleted", "conflict", "error",
 	} {
 		migratingReconcileDecisions.WithLabelValues(outcome)
+	}
+	// Pre-instantiate the dead-node reconciler's closed outcome set
+	// so the §12 panel reads zero on a healthy fleet rather than
+	// absent — an absent series and a zero series look identical in
+	// a graph but only one proves the reconciler is wired.
+	for _, outcome := range []string{"failed", "conflict", "error"} {
+		deadNodeReconcileDecisions.WithLabelValues(outcome)
 	}
 	// Issue #517 / PR-C / ADR-064: pre-instantiate the closed
 	// 13-phase × 2-result label set for wakePhaseEmitted and
@@ -2066,6 +2090,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
+		deadNodeReconcileDecisions:         deadNodeReconcileDecisions,
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		storageCacheStaleFallback:          storageCacheStaleFallback,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
@@ -2253,6 +2278,16 @@ func (m *OpsMetrics) LiveMigrationDecisions(outcome string) prometheus.Counter {
 // rules as LiveMigrationDecisions.
 func (m *OpsMetrics) MigratingReconcileDecisions(outcome string) prometheus.Counter {
 	return m.migratingReconcileDecisions.WithLabelValues(outcome)
+}
+
+// DeadNodeReconcileDecisions returns the labelled counter for the
+// dead-node billing reconciler. Called from
+// Engine.ReconcileDeadNodeInstances once per RUNNING row whose owning
+// compute_node stopped heartbeating past the staleness window.
+// outcome ∈ {failed, conflict, error}. Same caching rules as
+// MigratingReconcileDecisions.
+func (m *OpsMetrics) DeadNodeReconcileDecisions(outcome string) prometheus.Counter {
+	return m.deadNodeReconcileDecisions.WithLabelValues(outcome)
 }
 
 // EventsWriteFailures returns the unlabelled counter for audit-log

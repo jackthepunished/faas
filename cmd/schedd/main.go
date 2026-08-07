@@ -826,6 +826,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.WithMigratingWatchdogIntervalSeconds(n)
 	}
 
+	// Stale-RUNNING billing-leak self-healer (issue: dead vmmd
+	// leaves instances RUNNING in PG → meterd bills for VMs that
+	// no longer exist). Staleness override only — the tick cadence
+	// is owned by sched.NewDeadNodeReconciler below, mirroring
+	// how MigratingWatchdogTickLimit + Interval are split between
+	// the engine setter and the loop builder. Same fail-fast
+	// contract as the migrating-watchdog envs above.
+	if v := os.Getenv("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS: %s", v)
+		}
+		engine.WithDeadNodeReconcilerStalenessSeconds(n)
+	}
+
 	// Tier A4 / ADR-064: rebalancer subscriber. Watches
 	// compute_node_changed for active=false events and hands
 	// the dead node id to Engine.RebalanceOrphanedApps.
@@ -1076,6 +1093,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	loop.WithMigratingWatchdog(sched.NewMigratingWatchdog(
 		engine.ReconcileExpiredMigrations,
 		time.Duration(mwdInterval)*time.Second,
+		log))
+
+	// Stale-RUNNING billing-leak self-healer. Closes the gap
+	// between heartbeat (which flips compute_nodes.active=false)
+	// and meterd's sampler (which keeps billing on CountsForRAM
+	// regardless of node liveness). Cadence mirrors the
+	// migrating-watchdog pattern: zero cfg → api.* default. The
+	// handle is the engine method directly so the reconciler
+	// shares the same store / ledger / logger as the rest of the
+	// loop — there is no per-call indirection that could go stale.
+	dnrInterval := cfg.DeadNodeReconcilerIntervalSeconds
+	if dnrInterval <= 0 {
+		dnrInterval = api.DeadNodeReconcilerIntervalSeconds
+	}
+	loop.WithDeadNodeReconciler(sched.NewDeadNodeReconciler(
+		engine.ReconcileDeadNodeInstances,
+		time.Duration(dnrInterval)*time.Second,
 		log))
 	if cfg.GatewayMetricsURL != "" {
 		// Issue #171: share a single HTTPPromScraper between the

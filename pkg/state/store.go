@@ -1934,6 +1934,39 @@ type Store interface {
 	// parked_at. PgStore relies on migration 00016's partial index
 	// for the state predicate.
 	ListInstancesByStatesOlderThan(ctx context.Context, states []State, threshold time.Time) ([]Instance, error)
+	// ListRunningInstancesOnDeadNodes returns RUNNING instances whose
+	// owning compute_node is no longer alive — either active = false
+	// (schedd's heartbeat sweep already flipped it) or
+	// last_heartbeat_at older than threshold (the flip has not landed
+	// yet, e.g. the schedd that owns the heartbeat loop restarted).
+	//
+	// Why this exists: MarkComputeNodeInactive only writes
+	// compute_nodes; it deliberately leaves instances untouched. A
+	// vmmd that dies without transitioning its rows therefore leaves
+	// them in RUNNING forever, and meterd bills on
+	// State.CountsForRAM() with no node-liveness cross-check — so the
+	// customer pays for a VM that no longer exists. This is the input
+	// set for Engine.ReconcileDeadNodeInstances.
+	//
+	// Both liveness predicates are required: checking only active
+	// misses the window before the heartbeat sweep runs, and checking
+	// only last_heartbeat_at misses a node an operator drained by
+	// hand. Rows are returned oldest-heartbeat-first so a capped tick
+	// drains the worst offenders first.
+	ListRunningInstancesOnDeadNodes(ctx context.Context, threshold time.Time, limit int) ([]Instance, error)
+	// FailRunningInstanceOnDeadNode transitions a RUNNING instance to
+	// FAILED, stamping terminal_at, when its owning node is gone.
+	// FAILED is excluded from State.CountsForRAM(), so this is what
+	// stops meterd billing for a VM that no longer exists; it also
+	// frees the row from the §6.2-2 RAM ceiling.
+	//
+	// Implementations MUST make the write conditional on both
+	// `state = 'running'` and the supplied nodeID, and MUST return
+	// ErrConflict (not an error) when no row matches — that is the
+	// benign "a peer got there first / the node recovered" path. The
+	// nodeID predicate prevents a stale read from failing an instance
+	// that has since migrated to a healthy node.
+	FailRunningInstanceOnDeadNode(ctx context.Context, instanceID, nodeID string) error
 	// ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
 	// lookup (PR #74). Returns rows currently in any of the given states
 	// (today: {STOPPED, FAILED}) whose terminal_at is strictly older than
