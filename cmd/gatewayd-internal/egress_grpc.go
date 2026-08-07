@@ -109,8 +109,14 @@ func chmodSocket(path string, mode os.FileMode) error {
 // shape — the production code at start() net.Listen's, then
 // immediately chmods (chmodSocket retries on ENOENT) AND waits
 // here so any caller that immediately dials sees a stable surface.
-// The same 500ms budget is used so the worst-case startup latency
-// stays bounded.
+// The 2s budget is matched to the test's outer wait in
+// TestEgressStopStopStart_RepeatedCycle; on a loaded CI runner the
+// kernel's dirent publish can lag tens of ms after net.Listen
+// returns, and that lag is amplified under tight restart loops
+// (cycle 12 of 16 surfaced this in PR #703 run 31122020494).
+// 2s keeps worst-case startup latency bounded while still
+// tolerating the cumulative tmpfs pressure a daemon sees under
+// real ops restarts.
 func waitForSocketPath(path string, deadline time.Duration) error {
 	end := time.Now().Add(deadline)
 	var lastErr error
@@ -202,15 +208,18 @@ func (l *egressGRPCListener) start(ctx context.Context) error {
 		}
 		// The kernel publishes the dirent asynchronously after
 		// net.Listen returns. Under tmpfs load (CI runner pool,
-		// observed in TestEgressStopStopStart_RepeatedCycle at
-		// cycle 2 of a 16-cycle restart loop), the publish can
-		// lag tens of ms past the listen return — any caller
-		// that immediately dials or chmods hits ENOENT. Wait
-		// until the dirent is visible so callers see a stable
-		// surface. The subsequent chmodSocket call also retries
-		// on ENOENT, but waiting here shortens the failure mode
-		// for callers that don't retry.
-		if err := waitForSocketPath(l.socketPath, 500*time.Millisecond); err != nil {
+		// observed in TestEgressStopStopStart_RepeatedCycle —
+		// cycle 2 of 16 in run 31080218226, cycle 12 of 16 in
+		// PR #703 run 31122020494), the publish can lag tens of
+		// ms past the listen return and that lag is amplified
+		// under tight restart loops. Any caller that immediately
+		// dials or chmods hits ENOENT. Wait until the dirent is
+		// visible so callers see a stable surface. The subsequent
+		// chmodSocket call also retries on ENOENT, but waiting
+		// here shortens the failure mode for callers that don't
+		// retry. The 2s budget matches the test's outer
+		// waitForSocket in TestEgressStopStopStart_RepeatedCycle.
+		if err := waitForSocketPath(l.socketPath, 2*time.Second); err != nil {
 			_ = lis.Close()
 			return fmt.Errorf("gatewayd egress: wait for socket dirent: %w", err)
 		}
