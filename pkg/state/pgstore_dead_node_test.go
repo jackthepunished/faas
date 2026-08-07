@@ -96,27 +96,33 @@ func pgTestSeedRunningInstance(t *testing.T, ctx context.Context, s *state.PgSto
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	app := state.App{
-		ID: uuid.NewString(), AccountID: acct.ID, Slug: "dnr-pg-" + uuid.NewString(),
+	// CreateApp generates its own UUID via the schema default
+	// (apps.id DEFAULT gen_random_uuid()); the column list omits id
+	// so the caller-supplied value here is ignored and the returned
+	// App carries the canonical UUID. Capture it — downstream calls
+	// (CreateDeployment, CreateInstance) must use the returned ID,
+	// not the one we wrote into the literal.
+	created, err := s.CreateApp(ctx, state.App{
+		AccountID: acct.ID, Slug: "dnr-pg-" + uuid.NewString(),
 		NodeID: nodeID, Status: state.AppActive, RAMMB: 256,
-	}
-	if _, err := s.CreateApp(ctx, app); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
 	deployment, err := s.CreateDeployment(ctx, state.Deployment{
-		AppID: app.ID, Kind: state.DeploymentKindImage,
+		AppID: created.ID, Kind: state.DeploymentKindImage,
 		ImageDigest: "sha256:" + uuid.NewString(),
 		Status:      state.DeployPending,
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	ins, err := s.CreateInstance(ctx, app.ID, deployment.ID,
+	ins, err := s.CreateInstance(ctx, created.ID, deployment.ID,
 		string(state.StateRunning), 256, nodeID, uuid.NewString())
 	if err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
-	return app.ID, ins.ID
+	return created.ID, ins.ID
 }
 
 // TestPg_ListRunningInstancesOnDeadNodes_FilterByActiveOrStale pins
