@@ -24,6 +24,7 @@ import (
 	"os"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 )
 
 // sloCmdUsage is the top-of-failure-line shown for
@@ -111,7 +112,7 @@ func cmdAccountSLO(args []string) int {
 // real (Prometheus isn't reachable), not a bug. The same line
 // shape is used by the /metrics renderer in commands_metrics.go.
 func renderAppSLO(w io.Writer, s api.AppSLOResponse) {
-	if s.Source != "" && s.Source != "prometheus" {
+	if s.Source != "" && s.Source != appmetrics.SourcePrometheus {
 		_, _ = fmt.Fprintf(w, "Note: source=%s (some values may be zero — Prometheus and/or Postgres may be unavailable)\n", s.Source)
 	}
 	_, _ = fmt.Fprintf(w, "App:         %s\n", s.AppID)
@@ -140,7 +141,7 @@ func renderAppSLO(w io.Writer, s api.AppSLOResponse) {
 // Same shape, no AppID/AppSlug, GBHours/InstanceHours are summed
 // across the account.
 func renderAccountSLO(w io.Writer, s api.AccountSLOResponse) {
-	if s.Source != "" && s.Source != "prometheus" {
+	if s.Source != "" && s.Source != appmetrics.SourcePrometheus {
 		_, _ = fmt.Fprintf(w, "Note: source=%s (some values may be zero — Prometheus and/or Postgres may be unavailable)\n", s.Source)
 	}
 	_, _ = fmt.Fprintf(w, "Window:      %s\n", s.Window)

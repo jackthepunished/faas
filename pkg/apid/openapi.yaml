@@ -268,7 +268,7 @@ paths:
             type: string
             enum: [1h, 24h, 7d]
             default: 24h
-          description: SLO window. Default `24h`.
+          description: Window for the account-wide SLO rollup. Default `24h`.
       responses:
         '200':
           description: The account-wide SLO rollup.
@@ -1321,7 +1321,7 @@ paths:
             type: string
             enum: [1h, 24h, 7d]
             default: 24h
-          description: SLO window. Default `24h`.
+          description: Window for the per-app SLO panel. Default `24h`.
       responses:
         '200':
           description: The SLO panel.
@@ -7584,10 +7584,10 @@ components:
           description: "Echoed SLO window, e.g. `24h`."
         source:
           type: string
-          description: '"prometheus" on success; "degraded: <reason>" otherwise.'
+          description: '"prometheus" on success; "degraded: <reason>" otherwise. Per-app shape: when Postgres fails only instance_hours/gb_hours are zeroed.'
         as_of: { type: string, format: date-time, description: "RFC3339Nano UTC stamp at which the SLO panel was assembled." }
         request_duration: { $ref: '#/components/schemas/SLODuration' }
-        error_rate_pct: { type: number, description: "Share of [45]xx requests in the window." }
+        error_rate_pct: { type: number, description: "Share of [45]xx requests in the window for this app." }
         cold_boot_rate_pct: { type: number, description: "Share of requests that triggered a cold boot." }
         instance_hours: { type: number, description: "Sum of instance × minute / 60 over the window (from `usage_minutes`)." }
         gb_hours: { type: number, description: "Sum of mb_seconds / 3600 / 1024 over the window (from `usage_minutes`)." }
@@ -7617,13 +7617,13 @@ components:
         window:
           type: string
           enum: [1h, 24h, 7d]
-        source: { type: string, description: '"prometheus" on success; "degraded: <reason>" otherwise.' }
+        source: { type: string, description: '"prometheus" on success; "degraded: <reason>" otherwise. Account-wide shape: when Postgres fails only instance_hours/gb_hours are zeroed.' }
         as_of: { type: string, format: date-time }
         request_duration: { $ref: '#/components/schemas/SLODuration' }
         error_rate_pct: { type: number }
         cold_boot_rate_pct: { type: number }
-        instance_hours: { type: number, description: "Sum across all apps for the account." }
-        gb_hours: { type: number, description: "Sum across all apps for the account." }
+        instance_hours: { type: number, description: "Sum of instance-minutes / 60 across all apps for the account." }
+        gb_hours: { type: number, description: "Sum of mb_seconds / 3600 / 1024 across all apps for the account." }
         wake_queue_p95_ms: { type: number }
         requests_total: { type: integer, format: int64 }
         throttled_total: { type: integer, format: int64 }
