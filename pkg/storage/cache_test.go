@@ -160,7 +160,8 @@ func TestLocalCacheBackend_CacheMissFallsBackToParent(t *testing.T) {
 // Get surfaces the wrapped error verbatim. The cache does NOT
 // fall back to a stale entry — ADR-054 §2 keeps that contract
 // explicit; the "registry unreachable" gate at startup is a
-// separate seam that callers use to opt in to stale-fallback.
+// separate seam that callers use to opt in to stale-fallback
+// (FAAS_STORAGE_CACHE_SERVE_STALE=true).
 func TestLocalCacheBackend_ParentFailureSurfaces(t *testing.T) {
 	tmp := t.TempDir()
 	parent := newFakeBackend()
@@ -177,6 +178,85 @@ func TestLocalCacheBackend_ParentFailureSurfaces(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "registry unreachable") {
 		t.Errorf("err = %q, want it to wrap 'registry unreachable'", err)
+	}
+}
+
+// TestLocalCacheBackend_StaleFallbackEnabled pins the opt-in stale
+// path: when FAAS_STORAGE_CACHE_SERVE_STALE=true and the parent
+// backend fails, Get serves the last-known-good cached blob if one
+// is present. The cache observer fires once. The wrapped parent error
+// is NOT returned to the caller.
+//
+// Setup: drive the stale-fallback branch by having the parent's Get
+// hook Put the blob into the cache synchronously before returning
+// the failure. This models the realistic race: another wake on a
+// peer node Puts the blob into this node's cache while this node's
+// Get is in flight. Without the opt-in knob, the same hook fires and
+// the test below (DefaultContract) pins the fail-loud behaviour.
+func TestLocalCacheBackend_StaleFallbackEnabled(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_CACHE_SERVE_STALE", "true")
+	tmp := t.TempDir()
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	var observerCalls atomic.Int64
+	cache.SetObserver(storage.FuncCacheObserver(func() { observerCalls.Add(1) }))
+
+	// onGet Puts the stale blob into the cache before returning
+	// the failure. Mirrors a peer-node wake racing this node's
+	// cold-boot Get.
+	parent.onGet = func(key string) error {
+		_ = cache.Put(context.Background(), key, strings.NewReader("stale-blob"))
+		return errors.New("registry unreachable")
+	}
+	got, err := readAll(context.Background(), cache, "snap/abc")
+	if err != nil {
+		t.Fatalf("Get: %v (expected stale fallback, not wrapped error)", err)
+	}
+	if got != "stale-blob" {
+		t.Errorf("Get = %q, want %q (stale fallback bytes)", got, "stale-blob")
+	}
+	if got := observerCalls.Load(); got != 1 {
+		t.Errorf("observer called %d times, want 1", got)
+	}
+}
+
+// TestLocalCacheBackend_StaleFallbackDisabled_DefaultContract pins
+// the default-off behaviour: when FAAS_STORAGE_CACHE_SERVE_STALE is
+// NOT set, a parent failure returns the wrapped parent error even
+// when a stale cache entry exists (Put'd by another wake on a peer).
+// The cache observer never fires.
+//
+// This is the fail-loud contract TestLocalCacheBackend_ParentFailureSurfaces
+// also asserts — this test exists so a future contributor who breaks
+// the default-off behaviour sees the test name in a failure message
+// and can grep for the env var's purpose.
+func TestLocalCacheBackend_StaleFallbackDisabled_DefaultContract(t *testing.T) {
+	// No t.Setenv — default-off.
+	tmp := t.TempDir()
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(tmp, "cache"), 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	var observerCalls atomic.Int64
+	cache.SetObserver(storage.FuncCacheObserver(func() { observerCalls.Add(1) }))
+
+	parent.onGet = func(key string) error {
+		_ = cache.Put(context.Background(), key, strings.NewReader("stale-blob"))
+		return errors.New("registry unreachable")
+	}
+	_, err = cache.Get(context.Background(), "snap/abc")
+	if err == nil {
+		t.Fatal("Get = nil; want wrapped parent error (default-off stale fallback)")
+	}
+	if !strings.Contains(err.Error(), "registry unreachable") {
+		t.Errorf("err = %q, want it to wrap 'registry unreachable'", err)
+	}
+	if got := observerCalls.Load(); got != 0 {
+		t.Errorf("observer called %d times, want 0 (default-off; observer must not fire)", got)
 	}
 }
 

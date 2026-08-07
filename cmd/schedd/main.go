@@ -551,6 +551,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("schedd: storage backend: %w", err)
 	}
+	// ADR-054 acceptance: wire the LocalCacheBackend observer so
+	// stale-fallback serves on the wake path emit
+	// `schedd_storage_cache_stale_fallback_total`. The schedd
+	// counter complements the vmmd/imaged emissions: a single cold-
+	// boot that hits stale-fallback will trip both schedd and vmmd,
+	// so the rate() comparison surfaces "one stall, two emitters"
+	// (consistent) vs "registry down across many wakes" (rate
+	// diverges — schedd's wake-side emits rise faster than vmmd's
+	// boot-side emits). No-op when the resolved backend is not a
+	// *LocalCacheBackend (single-box local deploys never wrap).
+	if cacheBE, ok := storageBackend.(*storage.LocalCacheBackend); ok {
+		cacheBE.SetObserver(storage.LogCacheObserver{
+			Logger: log,
+			Next: storage.FuncCacheObserver(func() {
+				ops.StorageCacheStaleFallback().Inc()
+			}),
+		})
+	}
 	verifier, err := cosign.NewLocalVerifier(signPubPath, storageBackend)
 	if err != nil {
 		return fmt.Errorf("schedd: load sign pub %q: %w (run `faas sign-keys init` on imaged's host if missing)", signPubPath, err)

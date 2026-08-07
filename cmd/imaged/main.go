@@ -204,6 +204,19 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	// files/faas.rules.yml depend on imaged_oci_pull_duration_seconds
 	// being live, not empty.)
 	ops := wire.NewOpsMetrics("imaged")
+	// ADR-054 acceptance: wire the LocalCacheBackend observer onto the
+	// daemon's *wire.OpsMetrics so stale-fallback serves emit
+	// `imaged_storage_cache_stale_fallback_total`. No-op when the
+	// resolved backend is not a *LocalCacheBackend (single-box local
+	// deploys never wrap, so the counter stays at zero forever).
+	if cacheBE, ok := storageBackend.(*storage.LocalCacheBackend); ok {
+		cacheBE.SetObserver(storage.LogCacheObserver{
+			Logger: log,
+			Next: storage.FuncCacheObserver(func() {
+				ops.StorageCacheStaleFallback().Inc()
+			}),
+		})
+	}
 	// PR-E: wire oci.EgressDenyHook to the imaged-side counter so
 	// the OCI dialer refusals surface as
 	// imaged_oci_egress_deny_total{cidr,family}. The hook is

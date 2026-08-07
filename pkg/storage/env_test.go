@@ -263,3 +263,108 @@ func TestBackendFromEnv_OCIRejectsUnknown(t *testing.T) {
 		t.Errorf("error %q lacks 'unknown'", got)
 	}
 }
+
+// TestResolveCacheDir_OCIDefaultsCacheDir pins the multi-box default:
+// FAAS_STORAGE_BACKEND=oci + FAAS_STORAGE_CACHE_DIR unset →
+// DefaultOCICacheDir, wrap=true.
+func TestResolveCacheDir_OCIDefaultsCacheDir(t *testing.T) {
+	os.Unsetenv("FAAS_STORAGE_CACHE_DIR")
+	dir, ok := resolveCacheDir("oci")
+	if !ok {
+		t.Fatal("resolveCacheDir(oci) ok=false; want true (default-on)")
+	}
+	if dir != DefaultOCICacheDir {
+		t.Errorf("dir = %q, want %q", dir, DefaultOCICacheDir)
+	}
+}
+
+// TestResolveCacheDir_OCICustomCacheDir: a custom dir is honoured
+// verbatim (no rewriting).
+func TestResolveCacheDir_OCICustomCacheDir(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "/var/lib/faas/cache-prod")
+	dir, ok := resolveCacheDir("oci")
+	if !ok {
+		t.Fatal("ok=false; want true")
+	}
+	if dir != "/var/lib/faas/cache-prod" {
+		t.Errorf("dir = %q, want %q", dir, "/var/lib/faas/cache-prod")
+	}
+}
+
+// TestResolveCacheDir_OCIExplicitDisable: explicit empty disables
+// regardless of kind. The os.LookupEnv distinction is load-bearing —
+// operators use the empty form to opt out when the default would
+// otherwise wrap.
+func TestResolveCacheDir_OCIExplicitDisable(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "")
+	dir, ok := resolveCacheDir("oci")
+	if ok {
+		t.Errorf("ok=true; want false (explicit disable). dir=%q", dir)
+	}
+}
+
+// TestResolveCacheDir_LocalNoDefault: single-box stays opt-in.
+func TestResolveCacheDir_LocalNoDefault(t *testing.T) {
+	os.Unsetenv("FAAS_STORAGE_CACHE_DIR")
+	if _, ok := resolveCacheDir("local"); ok {
+		t.Error("ok=true; want false (single-box opt-in)")
+	}
+}
+
+// TestBackendFromEnv_OCIDefaultsCacheDirHermetic: full BackendFromEnv
+// path with oci mode + override cache dir to t.TempDir. Asserts the
+// returned backend is *LocalCacheBackend rooted at the temp dir. Uses
+// t.Setenv("FAAS_STORAGE_CACHE_DIR", tmp) instead of relying on the
+// /var/lib/faas/cache default — that way CI never creates the
+// production path on a developer machine.
+func TestBackendFromEnv_OCIDefaultsCacheDirHermetic(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
+	t.Setenv("FAAS_OCI_REGISTRY", "http://127.0.0.1:0/fake")
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", filepath.Join(tmp, "cache"))
+	t.Setenv("FAAS_STORAGE_ROOT", filepath.Join(tmp, "fc"))
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	cache, ok := be.(*LocalCacheBackend)
+	if !ok {
+		t.Fatalf("backend = %T, want *LocalCacheBackend", be)
+	}
+	if cache.Root() != filepath.Join(tmp, "cache") {
+		t.Errorf("Root() = %q, want %q", cache.Root(), filepath.Join(tmp, "cache"))
+	}
+}
+
+// TestBackendFromEnv_OCIDoesNotWrapWhenExplicitlyDisabled: explicit
+// empty cache dir + oci mode → backend is NOT *LocalCacheBackend.
+func TestBackendFromEnv_OCIDoesNotWrapWhenExplicitlyDisabled(t *testing.T) {
+	t.Setenv("FAAS_STORAGE_BACKEND", "oci")
+	t.Setenv("FAAS_OCI_REGISTRY", "http://127.0.0.1:0/fake")
+	t.Setenv("FAAS_STORAGE_CACHE_DIR", "")
+	t.Setenv("FAAS_STORAGE_ROOT", t.TempDir())
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	if _, ok := be.(*LocalCacheBackend); ok {
+		t.Errorf("backend wrapped as *LocalCacheBackend; want no wrap (explicit disable)")
+	}
+}
+
+// TestBackendFromEnv_LocalDoesNotDefaultCacheDir: single-box stays
+// opt-in even when the cache dir env var is unset. (The /var/lib/faas/cache
+// default applies to oci mode only.)
+func TestBackendFromEnv_LocalDoesNotDefaultCacheDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FAAS_STORAGE_BACKEND", "local")
+	t.Setenv("FAAS_STORAGE_ROOT", tmp)
+	os.Unsetenv("FAAS_STORAGE_CACHE_DIR")
+	be, err := BackendFromEnv()
+	if err != nil {
+		t.Fatalf("BackendFromEnv: %v", err)
+	}
+	if _, ok := be.(*LocalCacheBackend); ok {
+		t.Errorf("backend wrapped as *LocalCacheBackend; local mode stays opt-in")
+	}
+}
