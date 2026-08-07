@@ -2179,7 +2179,7 @@ paths:
               $ref: '#/components/schemas/UpdateDeploymentTrafficRequest'
       responses:
         '200':
-          description: The updated deployment.
+          description: The updated deployment with the new traffic_percent.
           content:
             application/json:
               schema:
