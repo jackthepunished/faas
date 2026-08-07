@@ -202,7 +202,7 @@ func runBuildSubtest(t *testing.T, h *e2etest.Harness, pool *pgxpool.Pool, key, 
 	}
 	appID := mustGetAppID(t, h, key, slug)
 
-	depBody, depStatus := postMultipartDeployment(t, h, key, slug, sourceTar, isDockerfile)
+	depBody, depStatus := postMultipartDeployment(t, h, key, slug, sourceTar, isDockerfile, "")
 	if depStatus != http.StatusAccepted {
 		t.Fatalf("create deployment %s: status=%d body=%s", slug, depStatus, depBody)
 	}
@@ -372,12 +372,18 @@ func assertBuildDoneSubstring(t *testing.T, h *e2etest.Harness, buildID, substr 
 // `source` file part (and optional `dockerfile` flag), POSTs it to apid's
 // /v1/apps/<slug>/deployments, and returns the response body + status.
 //
+// idempotencyKey is the optional Idempotency-Key header value. Empty
+// leaves the header unset — apid's middleware
+// (cmd/apid/server.go:1647-1667) treats an absent key as a fresh
+// mutation and auto-mints a UUIDv4. Non-empty replays the cached
+// response (issue #735 / DEPLOY-PROV-1 subtest 7).
+//
 // Why this lives here instead of cmd/e2e/test_helpers.go: the multipart
 // shape is specific to the build path (no image: field, source: required,
 // optional dockerfile:). Keeping it next to the test that uses it makes
 // the API contract obvious; if apid's createDeploymentMultipart drifts,
 // the diff is in one place.
-func postMultipartDeployment(t *testing.T, h *e2etest.Harness, key, slug string, sourceTar []byte, isDockerfile bool) ([]byte, int) {
+func postMultipartDeployment(t *testing.T, h *e2etest.Harness, key, slug string, sourceTar []byte, isDockerfile bool, idempotencyKey string) ([]byte, int) {
 	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -404,6 +410,9 @@ func postMultipartDeployment(t *testing.T, h *e2etest.Harness, key, slug string,
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	resp, err := h.HTTPClient().Do(req)
 	if err != nil {
 		t.Fatalf("deploy POST: %v", err)
@@ -420,10 +429,13 @@ func postMultipartDeployment(t *testing.T, h *e2etest.Harness, key, slug string,
 // the same struct). Nil overrides = behaves exactly like the
 // non-overrides helper above.
 //
+// idempotencyKey follows the same convention as postMultipartDeployment:
+// non-empty sets the Idempotency-Key header for replay.
+//
 // Kept in this file next to postMultipartDeployment so the multipart
 // shape stays in one place; apid's createDeployment handler parses
 // the `overrides` field as JSON into pkg/api.CreateDeploymentOverrides.
-func postMultipartDeploymentWithOverrides(t *testing.T, h *e2etest.Harness, key, slug string, sourceTar []byte, isDockerfile bool, ov *api.CreateDeploymentOverrides) ([]byte, int) {
+func postMultipartDeploymentWithOverrides(t *testing.T, h *e2etest.Harness, key, slug string, sourceTar []byte, isDockerfile bool, ov *api.CreateDeploymentOverrides, idempotencyKey string) ([]byte, int) {
 	t.Helper()
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
@@ -459,6 +471,9 @@ func postMultipartDeploymentWithOverrides(t *testing.T, h *e2etest.Harness, key,
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	if idempotencyKey != "" {
+		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 	resp, err := h.HTTPClient().Do(req)
 	if err != nil {
 		t.Fatalf("deploy POST: %v", err)

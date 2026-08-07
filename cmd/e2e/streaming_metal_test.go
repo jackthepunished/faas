@@ -106,7 +106,7 @@ func TestE2E_Streaming_Metal_TTFBUnder1s(t *testing.T) {
 	appID := mustGetAppID(t, h, key, slug)
 
 	src := NodeFixtureStreaming(t)
-	raw, status := postMultipartDeployment(t, h, key, slug, src, false)
+	raw, status := postMultipartDeployment(t, h, key, slug, src, false, "")
 	if status != http.StatusAccepted {
 		t.Fatalf("create deployment: status=%d body=%s", status, raw)
 	}
@@ -189,7 +189,7 @@ func TestE2E_Streaming_Metal_TxBytesAccuracy(t *testing.T) {
 	appID := mustGetAppID(t, h, key, slug)
 
 	src := NodeFixtureStreaming(t)
-	raw, status := postMultipartDeployment(t, h, key, slug, src, false)
+	raw, status := postMultipartDeployment(t, h, key, slug, src, false, "")
 	if status != http.StatusAccepted {
 		t.Fatalf("create deployment: status=%d body=%s", status, raw)
 	}
@@ -292,7 +292,7 @@ func TestE2E_Streaming_Metal_PlanMatrix(t *testing.T) {
 			appID := mustGetAppID(t, h, key, slug)
 
 			src := NodeFixtureStreaming(t)
-			raw, status := postMultipartDeployment(t, h, key, slug, src, false)
+			raw, status := postMultipartDeployment(t, h, key, slug, src, false, "")
 			if status != http.StatusAccepted {
 				t.Fatalf("create deployment: status=%d body=%s", status, raw)
 			}
@@ -377,7 +377,7 @@ func TestE2E_Streaming_Metal_QuotaNonCounting(t *testing.T) {
 	appID := mustGetAppID(t, h, key, slug)
 
 	src := NodeFixtureStreaming(t)
-	raw, status := postMultipartDeployment(t, h, key, slug, src, false)
+	raw, status := postMultipartDeployment(t, h, key, slug, src, false, "")
 	if status != http.StatusAccepted {
 		t.Fatalf("create deployment: status=%d body=%s", status, raw)
 	}
