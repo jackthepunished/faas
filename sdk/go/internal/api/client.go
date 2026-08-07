@@ -392,6 +392,33 @@ func (c *Client) RaiseOverageCap(ctx context.Context, overageCapCents *int64) (A
 	return out, c.do(ctx, "POST", "/v1/account/overage-cap", body, &out)
 }
 
+// GetEgressAllowlistExtra returns the per-account additive budget
+// on top of the plan's apps.egress_allowlist cap (issue #679 /
+// PR-B / ADR-082). The response carries the live value plus the
+// plan cap and the global ceiling so the CLI can render the
+// "Override: N / Plan cap: 16 / Max extra: 1024" trio without
+// a second round-trip.
+//
+// Admin scope + MFA are required (the client passes the same
+// auth as for RaiseOverageCap and ChangePlan).
+func (c *Client) GetEgressAllowlistExtra(ctx context.Context) (AccountEgressAllowlistExtraResponse, error) {
+	var out AccountEgressAllowlistExtraResponse
+	return out, c.do(ctx, "GET", "/v1/account/egress_allowlist_extra", nil, &out)
+}
+
+// SetEgressAllowlistExtra sets the per-account additive budget
+// (issue #679 / PR-B / ADR-082). Pass 0 to clear the override (the
+// plan cap is authoritative again). Negative values or values
+// above the global ceiling are rejected with
+// CodeAccountEgressAllowlistExtraOutOfRange (HTTP 400).
+//
+// Admin scope + MFA are required.
+func (c *Client) SetEgressAllowlistExtra(ctx context.Context, extra int) (AccountEgressAllowlistExtraResponse, error) {
+	var out AccountEgressAllowlistExtraResponse
+	return out, c.do(ctx, "PATCH", "/v1/account/egress_allowlist_extra",
+		SetAccountEgressAllowlistExtraRequest{Extra: extra}, &out)
+}
+
 // GetStatusSLO fetches the public SLO snapshot.
 func (c *Client) GetStatusSLO(ctx context.Context) (StatusPage, error) {
 	var out StatusPage

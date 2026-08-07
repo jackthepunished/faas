@@ -102,7 +102,14 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		if !acct.Plan.EgressAllowlistAllowed() {
 			return api.ErrPlanEgressAllowlistNotAllowed(acct.Plan)
 		}
-		maxSize := acct.Plan.EgressAllowlistMaxSize()
+		// Issue #679 / PR-B / ADR-082: per-account additive
+		// budget widens the effective cap for THIS account only.
+		// 0 (the default) = plan cap alone, preserves pre-PR-B
+		// behaviour. The ceiling is enforced at the admin
+		// handler (api.ErrAccountEgressAllowlistExtraOutOfRange);
+		// the validator is the read side and trusts the
+		// stored value.
+		maxSize := acct.Plan.EgressAllowlistMaxSize() + acct.EgressAllowlistExtra
 		if len(*req.EgressAllowlist) > maxSize {
 			return api.ErrEgressAllowlistTooLong(len(*req.EgressAllowlist), maxSize)
 		}

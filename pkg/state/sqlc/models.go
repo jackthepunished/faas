@@ -27,6 +27,7 @@ type Account struct {
 	MfaRequired            bool
 	OverageCapCents        pgtype.Int8
 	KeyGraceWindowDays     pgtype.Int4
+	EgressAllowlistExtra   int32
 }
 
 type AccountCredit struct {

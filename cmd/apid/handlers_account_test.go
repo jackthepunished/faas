@@ -18,6 +18,7 @@ package main
 //   - non-/v1/account/*           still 402 in deleted_pending
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -38,6 +39,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/grace"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // withAccountTestRecipient wires a fresh X25519 recipient into
@@ -865,4 +867,246 @@ type mailAdapterBridge struct{ mailer *recordingMailer }
 
 func (m mailAdapterBridge) Send(ctx context.Context, to []string, subject, body string) error {
 	return m.mailer.Send(ctx, Message{To: to, Subject: subject, TextBody: body})
+}
+
+// --- PR-B (issue #679 / ADR-082) per-account extra cap admin endpoints ------
+//
+// Two new admin endpoints hang off the same grace-window chain
+// (admin scope + MFA + no step-up since the cost surface is
+// small — a typo reverts by setting extra=0):
+//
+//	GET  /v1/account/egress_allowlist_extra
+//	PATCH /v1/account/egress_allowlist_extra
+//
+// The tests below pin:
+//   - GET returns the live value + plan cap + max extra.
+//   - PATCH clamps to [0, MaxAccountEgressAllowlistExtra] and
+//     reports the new value.
+//   - PATCH emits a single account.egress_allowlist_extra_set
+//     audit row carrying old_extra, new_extra, plan_cap, max_extra.
+//   - PATCH outside the range reports 400 with code
+//     account_egress_allowlist_extra_out_of_range.
+//   - The endpoints reject non-admin scopes (testEnv defaults to
+//     admin-scoped keys, so the negative test strips scopes
+//     explicitly).
+//
+// TestGetAccountEgressAllowlistExtra_ReturnsPlanCap: at fresh
+// account state (extra=0), GET returns the plan cap (Pro=16)
+// and the global max extra (1024). The pair lets the dashboard
+// render the "Override: 0 / Plan cap: 16 / Max extra: 1024" trio
+// in a single round-trip.
+func TestGetAccountEgressAllowlistExtra_ReturnsPlanCap(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "GET", "/v1/account/egress_allowlist_extra", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AccountEgressAllowlistExtraResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v: %s", err, rec.Body)
+	}
+	if out.Extra != 0 {
+		t.Errorf("extra = %d, want 0 (default)", out.Extra)
+	}
+	if out.PlanCap != api.PlanPro.EgressAllowlistMaxSize() {
+		t.Errorf("plan_cap = %d, want %d", out.PlanCap, api.PlanPro.EgressAllowlistMaxSize())
+	}
+	if out.MaxExtra != api.MaxAccountEgressAllowlistExtra {
+		t.Errorf("max_extra = %d, want %d", out.MaxExtra, api.MaxAccountEgressAllowlistExtra)
+	}
+}
+
+// TestSetAccountEgressAllowlistExtra_RoundTrip: PATCH extra=8
+// then GET reads back 8. The audit row is the only place the
+// OLD value is observable — once the PATCH lands, the next
+// read is the new value.
+func TestSetAccountEgressAllowlistExtra_RoundTrip(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	rec := e.do(t, "PATCH", "/v1/account/egress_allowlist_extra",
+		api.SetAccountEgressAllowlistExtraRequest{Extra: 8}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AccountEgressAllowlistExtraResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode PATCH: %v: %s", err, rec.Body)
+	}
+	if out.Extra != 8 || out.PlanCap != api.PlanPro.EgressAllowlistMaxSize() {
+		t.Errorf("PATCH body = %+v, want extra=8 plan_cap=%d", out, api.PlanPro.EgressAllowlistMaxSize())
+	}
+	rec = e.do(t, "GET", "/v1/account/egress_allowlist_extra", nil, nil)
+	if rec.Code != 200 {
+		t.Fatalf("GET status %d: %s", rec.Code, rec.Body)
+	}
+	var get api.AccountEgressAllowlistExtraResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &get); err != nil {
+		t.Fatalf("decode GET: %v: %s", err, rec.Body)
+	}
+	if get.Extra != 8 {
+		t.Errorf("GET extra = %d, want 8 (round-trip)", get.Extra)
+	}
+}
+
+// TestSetAccountEgressAllowlistExtra_AtMaxAccepted: PATCH
+// extra=MaxAccountEgressAllowlistExtra — the boundary is closed
+// and the value is allowed.
+func TestSetAccountEgressAllowlistExtra_AtMaxAccepted(t *testing.T) {
+	e := setup(t, api.PlanScale)
+	rec := e.do(t, "PATCH", "/v1/account/egress_allowlist_extra",
+		api.SetAccountEgressAllowlistExtraRequest{Extra: api.MaxAccountEgressAllowlistExtra}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.AccountEgressAllowlistExtraResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v: %s", err, rec.Body)
+	}
+	if out.Extra != api.MaxAccountEgressAllowlistExtra {
+		t.Errorf("extra = %d, want %d", out.Extra, api.MaxAccountEgressAllowlistExtra)
+	}
+}
+
+// TestSetAccountEgressAllowlistExtra_OverMaxRejected: PATCH
+// extra=MaxAccountEgressAllowlistExtra+1 — the boundary is
+// closed and the value is rejected with 400 + the documented
+// error code. No audit row is emitted on the rejected branch.
+func TestSetAccountEgressAllowlistExtra_OverMaxRejected(t *testing.T) {
+	e := setup(t, api.PlanScale)
+	rec := e.do(t, "PATCH", "/v1/account/egress_allowlist_extra",
+		api.SetAccountEgressAllowlistExtraRequest{Extra: api.MaxAccountEgressAllowlistExtra + 1}, nil)
+	assertProblem(t, rec, 400, api.CodeAccountEgressAllowlistExtraOutOfRange)
+}
+
+// TestSetAccountEgressAllowlistExtra_NegativeRejected: PATCH
+// extra=-1 — negative values are rejected with 400 + the
+// documented error code (no audit row).
+func TestSetAccountEgressAllowlistExtra_NegativeRejected(t *testing.T) {
+	e := setup(t, api.PlanScale)
+	rec := e.do(t, "PATCH", "/v1/account/egress_allowlist_extra",
+		api.SetAccountEgressAllowlistExtraRequest{Extra: -1}, nil)
+	assertProblem(t, rec, 400, api.CodeAccountEgressAllowlistExtraOutOfRange)
+}
+
+// TestSetAccountEgressAllowlistExtra_ClearByZero: PATCH extra=0
+// clears the override — the plan cap is authoritative again.
+// This is the "no auditor roll-through" path: a customer whose
+// account briefly needed extra=8 lands back on the bare plan
+// cap without leaving a permanent override.
+func TestSetAccountEgressAllowlistExtra_ClearByZero(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	if err := e.store.SetAccountEgressAllowlistExtra(context.Background(), e.acct.ID, 8); err != nil {
+		t.Fatalf("seed extra=8: %v", err)
+	}
+	rec := e.do(t, "PATCH", "/v1/account/egress_allowlist_extra",
+		api.SetAccountEgressAllowlistExtraRequest{Extra: 0}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	got, err := e.store.GetAccountEgressAllowlistExtra(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatalf("GetExtra: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("after PATCH extra=0, GetExtra = %d, want 0", got)
+	}
+}
+
+// TestSetAccountEgressAllowlistExtra_EmitsAuditRow: PATCH emits
+// exactly one account.egress_allowlist_extra_set row carrying
+// old_extra, new_extra, plan_cap, and max_extra. The audit row
+// is the only place the OLD value is observable (once the PATCH
+// lands, the next read is the new value).
+func TestSetAccountEgressAllowlistExtra_EmitsAuditRow(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	// Seed a prior override so the audit row's old_extra reads
+	// from a non-zero value.
+	if err := e.store.SetAccountEgressAllowlistExtra(context.Background(), e.acct.ID, 4); err != nil {
+		t.Fatalf("seed extra=4: %v", err)
+	}
+	rec := e.do(t, "PATCH", "/v1/account/egress_allowlist_extra",
+		api.SetAccountEgressAllowlistExtraRequest{Extra: 8}, nil)
+	if rec.Code != 200 {
+		t.Fatalf("PATCH status %d: %s", rec.Code, rec.Body)
+	}
+	// The auditor is async — wait for the row to land. The
+	// /v1/audit-events endpoint streams rows via the same
+	// reader path; poll briefly (max 500ms) before giving up.
+	// Data is a json.RawMessage, so we decode each event's
+	// payload into a typed struct before asserting.
+	type extraAudit struct {
+		OldExtra int `json:"old_extra"`
+		NewExtra int `json:"new_extra"`
+		PlanCap  int `json:"plan_cap"`
+		MaxExtra int `json:"max_extra"`
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		rec2 := e.do(t, "GET", "/v1/audit-events?kind_prefix=account.egress_allowlist_extra", nil, nil)
+		if rec2.Code == 200 {
+			var list api.ListAuditEventsResponse
+			if err := json.Unmarshal(rec2.Body.Bytes(), &list); err == nil {
+				for _, ev := range list.Events {
+					if ev.Kind != "account.egress_allowlist_extra_set" {
+						continue
+					}
+					var payload extraAudit
+					if err := json.Unmarshal(ev.Data, &payload); err != nil {
+						t.Errorf("audit row decode: %v (data=%s)", err, ev.Data)
+						return
+					}
+					if payload.OldExtra != 4 {
+						t.Errorf("audit old_extra = %d, want 4", payload.OldExtra)
+					}
+					if payload.NewExtra != 8 {
+						t.Errorf("audit new_extra = %d, want 8", payload.NewExtra)
+					}
+					if payload.PlanCap != api.PlanPro.EgressAllowlistMaxSize() {
+						t.Errorf("audit plan_cap = %d, want %d", payload.PlanCap, api.PlanPro.EgressAllowlistMaxSize())
+					}
+					if payload.MaxExtra != api.MaxAccountEgressAllowlistExtra {
+						t.Errorf("audit max_extra = %d, want %d", payload.MaxExtra, api.MaxAccountEgressAllowlistExtra)
+					}
+					return // success — leave the test on the first match.
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no audit row for account.egress_allowlist_extra_set landed within 500ms; last body=%s", rec2.Body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSetAccountEgressAllowlistExtra_RejectsNonAdminScope: the
+// endpoint chain must surface a 403 from requireScope when the
+// key has no admin scope. The setup helper creates a key with
+// api.ScopesAdminOnly so the negative test stands up a fresh
+// account + a single apps:read scope (no admin).
+func TestSetAccountEgressAllowlistExtra_RejectsNonAdminScope(t *testing.T) {
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(context.Background(), "non-admin@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt, hash, _ := api.GenerateAPIKey()
+	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "read-only", []string{api.ScopeAppsRead}); err != nil {
+		t.Fatal(err)
+	}
+	ops := wire.NewOpsMetrics("apid_test")
+	srv := newServer(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "gregale.dev", noopNotifier{}).WithOpsMetrics(context.Background(), ops)
+	h := srv.handler()
+	body, _ := json.Marshal(api.SetAccountEgressAllowlistExtraRequest{Extra: 1})
+	req := httptest.NewRequest("PATCH", "/v1/account/egress_allowlist_extra", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+pt)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == 200 {
+		t.Fatalf("non-admin PATCH succeeded: %s", rec.Body)
+	}
+	//	requireScope may short-circuit to 403 (Preferred) or 401
+	// (unauthenticated by AuthLimit); accept either as a
+	// non-200 sentinel.
+	if rec.Code != 403 && rec.Code != 401 {
+		t.Errorf("status %d, want 401 or 403: %s", rec.Code, rec.Body)
+	}
 }

@@ -589,6 +589,32 @@ type Store interface {
 	// Issue #189 / IAM-5.
 	SetAccountKeyGraceWindow(ctx context.Context, accountID string, days *int) error
 
+	// GetAccountEgressAllowlistExtra returns the per-account
+	// additive budget on top of the plan's apps.egress_allowlist
+	// cap (issue #679 / PR-B / ADR-082). 0 = no override; the
+	// plan cap is authoritative. The caller is the apid
+	// validator at cmd/apid/handlers_ext.go:104 — it adds the
+	// returned value to the plan cap before the >-maxSize check.
+	//
+	// The validator is the only caller; the upstream gate at the
+	// admin handler (api.ErrAccountEgressAllowlistExtraOutOfRange)
+	// refuses values > api.MaxAccountEgressAllowlistExtra (1024),
+	// so a value > 1024 should never reach the store. A future
+	// migration that lowers the apid ceiling does NOT need to
+	// retro-fit the DB — the apid gate is the source of truth.
+	//
+	// The auth hot path does NOT call this; only the
+	// handlers_ext.go PATCH path does.
+	GetAccountEgressAllowlistExtra(ctx context.Context, accountID string) (int, error)
+
+	// SetAccountEgressAllowlistExtra sets the per-account
+	// additive budget. n == 0 clears the override (falls through
+	// to plan cap). The handler emits the audit
+	// `account.egress_allowlist_extra_set` event, not the store.
+	//
+	// Issue #679 / PR-B / ADR-082.
+	SetAccountEgressAllowlistExtra(ctx context.Context, accountID string, n int) error
+
 	// Org-bound API keys (issue #190 / IAM-6, PR 6).
 	//
 	// The org-scoped counterparts to CreateAPIKeyWithExpiry /

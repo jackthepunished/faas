@@ -209,6 +209,19 @@ type Account struct {
 	// CHECK constraint accounts_key_grace_window_days_check enforces
 	// the (NULL or >= 0) shape at the DB layer.
 	KeyGraceWindowDays *int
+	// EgressAllowlistExtra is the per-account additive budget on top
+	// of the plan's apps.egress_allowlist cap (issue #679 / PR-B /
+	// ADR-082). 0 = no override; the plan cap (Pro 16 / Scale 64 /
+	// Free,Hobby 0) is authoritative. Positive values widen the
+	// effective cap for THIS account's apps by the given amount,
+	// subject to the apid-layer ceiling of
+	// api.MaxAccountEgressAllowlistExtra (1024). The operator-bundle
+	// axis (PR-A / ADR-081) is a separate additive layer that merges
+	// at the vmmd side; this field is consumed at the apid
+	// validator. The DB CHECK constraint
+	// accounts.egress_allowlist_extra (>= 0) is the wire-bypass
+	// backstop; the apid validator is the soft cap.
+	EgressAllowlistExtra int
 }
 
 // Active reports whether the account may deploy (not suspended/deleted).
