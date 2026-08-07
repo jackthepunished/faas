@@ -16,7 +16,7 @@
 //
 //  2. Phase 2 — park: 3 destroys in LivenessWindowSeconds flip
 //     apps.status to `evicted_cold` and stamp the per-deployment
-//     parked_reason + parked_at columns (migration 00156).
+//     parked_reason + parked_at columns (migration 00157).
 //
 //  3. Phase 3 — cold-boot wake: a fresh Invoke against the parked
 //     deployment must cold-boot (WakeColdBoot, not WakeRestore)

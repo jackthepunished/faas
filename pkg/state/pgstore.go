@@ -3859,7 +3859,7 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 
 // SetDeploymentParked stamps the per-deployment parked_reason +
 // parked_at columns (issue #554 / ADR-079 follow-up, migration
-// 00156). Idempotent: re-parking an already-parked deployment is
+// 00157). Idempotent: re-parking an already-parked deployment is
 // a no-op — the WHERE filter `parked_reason is null` guarantees
 // parked_at is set exactly once. A second park during a schedd
 // restart cycle must NOT repaint the timestamp, otherwise the
@@ -9591,7 +9591,7 @@ var _ = deploymentSelectColumnsQualified
 // to this function — never to just one wrapper. Three previous
 // PRs landed the column in one wrapper and missed another, which
 // surfaced as pg-shard-2 failures (e.g. issue #554 follow-up
-// migration 00156 could have shipped the same shape of bug). The
+// migration 00157 could have shipped the same shape of bug). The
 // helper eliminates that duplication class entirely. The
 // optional `rootfsPath` / `rootfsKey` / `rootfsBytes`
 // destinations are nil for scanDeployment and scanDeployments
@@ -9619,7 +9619,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	// pointer cleanly.
 	//
 	// Issue #554 follow-up: parked_reason + parked_at columns
-	// (migration 00156). parked_at is *time.Time so the closed-set
+	// (migration 00157). parked_at is *time.Time so the closed-set
 	// "never parked" path (NULL parked_reason + NULL parked_at)
 	// scans cleanly. parked_reason itself is text (closed-set
 	// enforced via the schema CHECK constraint), so a non-NULL

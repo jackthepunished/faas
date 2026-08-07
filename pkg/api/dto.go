@@ -1113,7 +1113,7 @@ type DeploymentResponse struct {
 	Scan *ScanResult `json:"scan,omitempty"`
 	// ParkedReason / ParkedAt (issue #554 / ADR-079 follow-up)
 	// surface the per-deployment parking columns from migration
-	// 00156 on the GET /v1/deployments/{id} response. omitempty
+	// 00157 on the GET /v1/deployments/{id} response. omitempty
 	// mirrors LastScaleOutAt — "never parked" → no field on the
 	// wire. The closed-set vocabulary is enforced at the schema
 	// layer via the deployments_parked_reason_check constraint.
