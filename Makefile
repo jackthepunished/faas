@@ -233,6 +233,14 @@ metal-lima-2node: ## Tier A5 / ADR-066: two-node Lima fleet for the cross-node l
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a ./deploy/lima/run-metal.sh
 	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b ./deploy/lima/run-metal.sh
 
+.PHONY: ha-failover-drill
+ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on the two-node Lima fleet (§14 M8)
+	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal-2node-ha.yaml --tty=false
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || limactl start deploy/lima/faas-metal-2node-ha.yaml --tty=false
+	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a FAAS_DNS_PROVIDER=manual ./deploy/lima/run-ha-failover.sh
+	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b FAAS_DNS_PROVIDER=manual ./deploy/lima/run-ha-failover.sh
+	@echo "ha-failover-drill: see docs/runbooks/active-passive-ha.md §Acceptance for the validation matrix."
+
 .PHONY: lint
 lint: egress-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift gate
 	@$(GO) tool golangci-lint run

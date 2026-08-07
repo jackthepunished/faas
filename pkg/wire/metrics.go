@@ -309,6 +309,48 @@ type OpsMetrics struct {
 	// alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the
 	// operator's "is meterd actually evaluating rules?" view.
 	alertEvaluatorEnabled prometheus.Gauge
+	// standbyState — operator-facing enum gauge stamped by
+	// gatewayd-public on every active-passive HA state transition
+	// (Tier A8 / ADR-083). Values are 1/2/3 mapped to the
+	// closed vocabulary {warming, warm, draining}; an un-set
+	// gauge defaults to 0 (the "never seen" state — surfaces as
+	// a "no data" rather than 0 to the alert rule). Pre-
+	// instantiated to warming in NewOpsMetrics so the row
+	// surfaces in /metrics from boot (precedent: alertEvaluator
+	// Enabled above and pgBackupLastPushed below). The
+	// `FaasStandbyStateWarmingTooLong` alert rule
+	// (deploy/ansible/roles/prometheus/files/ha_failover.rules.yml)
+	// fires when this gauge holds at 1 for > 60s on a node
+	// where the operator has marked active=true — that's the
+	// tripwire for a misconfigured DNS provider or a stuck
+	// leader election. Unlabelled — single-box per-node state,
+	// no fan-out needed today.
+	standbyState prometheus.Gauge
+	// standbyStateMu + standbyStateValue shadow the gauge so
+	// StandbyState() can return the current int without scraping
+	// /metrics (prometheus.Gauge exposes only Set/Inc/Dec/Add/Sub
+	// /Write — no Value() accessor). Same precedent as
+	// alertEvaluatorEnabledValue above. Lock contention is non-
+	// issue: the gauge is stamped at boot, on
+	// compute_node_changed, and on drain start — not per-tick.
+	standbyStateMu     sync.Mutex
+	standbyStateValue  int
+	// activePassiveFailoversTotal — Tier A8 / ADR-083
+	// active-passive HA fail-over observability. Counter labelled
+	// by outcome ∈ {dns_flipped, dns_stale, peer_unreachable,
+	// manual_drain} — the closed set the dns_handoff orchestrator
+	// (cmd/gatewayd-public/dns_handoff.go) can land in. `dns_flipped`
+	// is the §12 dashboard panel (the active-passive flip succeeded
+	// inside HADNSRecordStaleSeconds). `dns_stale` is the tripwire
+	// for the DNS provider failing UpsertRecord after retries —
+	// operationally distinct from `peer_unreachable` (which is the
+	// pg_notify consumer falling behind). `manual_drain` is the
+	// operator-initiated path. Single-registry: registered on every
+	// daemon (mirrors liveMigrationDecisions / rebalanceDecisions /
+	// migratingReconcileDecisions); only gatewayd-public increments
+	// via ActivePassiveFailovers in production. Pre-instantiated in
+	// NewOpsMetrics so the row surfaces in /metrics from boot.
+	activePassiveFailoversTotal *prometheus.CounterVec
 	// pgBackupLastPushed — operator-facing gauge stamped by the
 	// apid's pgBackupPushedSampler (cmd/apid/main.go). Holds the
 	// age of the newest tarball in /var/lib/pgsql/basebackup/ (in
@@ -1662,6 +1704,34 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node migrating-instance watchdog reconcile decisions (Tier A6 / ADR-067), labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}. `reinvited` is the §12 dashboard panel (active owner re-acked the same lease); `hard_deleted` is the tripwire for the new-owner vmmd dying mid-handoff. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via ObserveMigratingReconcile.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, migratingReconcileDecisions)
+	// ADR-083 / Tier A8: active-passive HA fail-over counter.
+	// Labelled by outcome ∈ {dns_flipped, dns_stale,
+	// peer_unreachable, manual_drain}. dns_flipped is the §12
+	// dashboard panel (the active-passive flip succeeded inside
+	// HADNSRecordStaleSeconds). Pre-instantiated at boot so the
+	// row surfaces in /metrics from the moment gatewayd-public
+	// starts. Only gatewayd-public increments in production, but
+	// the field is on the shared struct (single-registry pattern,
+	// memory wire/OpsMetrics) so /metrics doesn't show a 404 for
+	// cmd/<other> scrapes that incidentally probe the prefix.
+	activePassiveFailoversTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_active_passive_failovers_total",
+		Help: "Active-passive HA fail-over decisions (Tier A8 / ADR-083), labelled by outcome ∈ {dns_flipped, dns_stale, peer_unreachable, manual_drain}. `dns_flipped` is the §12 dashboard panel (the active-passive flip succeeded inside HADNSRecordStaleSeconds); `dns_stale` is the tripwire for the DNS provider failing UpsertRecord after retries (operationally distinct from `peer_unreachable` which is the pg_notify consumer falling behind); `manual_drain` is the operator-initiated path via the runbook. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions / migratingReconcileDecisions); only gatewayd-public increments via ActivePassiveFailovers.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, activePassiveFailoversTotal)
+	// ADR-083 / Tier A8: standby-state enum gauge. Unlabelled
+	// gauge held at the current StandbyState value (1=warming,
+	// 2=warm, 3=draining). Pre-instantiated to 1 so the row
+	// surfaces in /metrics from the moment the daemon starts
+	// (precedent: alertEvaluatorEnabled above). The
+	// `FaasStandbyStateWarmingTooLong` alert rule queries this
+	// gauge (deploy/ansible/roles/prometheus/files/ha_failover.rules.yml).
+	standbyState := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_standby_state",
+		Help: "Current standby state for this gatewayd-public (Tier A8 / ADR-083 / §14 M8). 1=warming (boot warm-up incomplete), 2=warm (active or standby-warm), 3=draining (operator-initiated drain in flight, in-flight requests bounded by HADNSRecordStaleSeconds). The FaasStandbyStateWarmingTooLong alert fires when this gauge holds at 1 for > 60s on a node where compute_nodes.active=true. Unlabelled — single-box per-node state.",
+	})
+	standbyState.Set(1) // StandbyStateWarming
+	commonCollectors = append(commonCollectors, standbyState)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -1795,6 +1865,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"reinvited", "hard_deleted", "conflict", "error",
 	} {
 		migratingReconcileDecisions.WithLabelValues(outcome)
+	}
+	// Pre-instantiate the Tier A8 / ADR-083 active-passive
+	// fail-over outcome set so the §12 panel renders zero on a
+	// healthy box (rather than "no data" until the first
+	// drain). Extending the outcome vocabulary requires
+	// extending this loop in lock-step with the dns_handoff
+	// orchestrator (cmd/gatewayd-public/dns_handoff.go).
+	for _, outcome := range []string{
+		"dns_flipped", "dns_stale", "peer_unreachable", "manual_drain",
+	} {
+		activePassiveFailoversTotal.WithLabelValues(outcome)
 	}
 	// Issue #517 / PR-C / ADR-064: pre-instantiate the closed
 	// 13-phase × 2-result label set for wakePhaseEmitted and
@@ -2066,6 +2147,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
+		activePassiveFailoversTotal:        activePassiveFailoversTotal,
+		standbyState:                       standbyState,
+		standbyStateValue:                  1, // StandbyStateWarming — mirrors the gauge.Set(1) above
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		storageCacheStaleFallback:          storageCacheStaleFallback,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
@@ -2253,6 +2337,47 @@ func (m *OpsMetrics) LiveMigrationDecisions(outcome string) prometheus.Counter {
 // rules as LiveMigrationDecisions.
 func (m *OpsMetrics) MigratingReconcileDecisions(outcome string) prometheus.Counter {
 	return m.migratingReconcileDecisions.WithLabelValues(outcome)
+}
+
+// ActivePassiveFailovers returns the labelled counter for the
+// Tier A8 / ADR-083 active-passive HA fail-over. Called from the
+// dns_handoff orchestrator (cmd/gatewayd-public/dns_handoff.go) once
+// per drain outcome. outcome ∈ {dns_flipped, dns_stale,
+// peer_unreachable, manual_drain}. The returned Counter is safe to
+// retain — same caching rules as the other WithLabelValues
+// accessors. The counter is on the shared OpsMetrics struct
+// (single-registry pattern) so /metrics doesn't show a 404 for
+// cmd/<other> scrapes that incidentally probe the prefix.
+func (m *OpsMetrics) ActivePassiveFailovers(outcome string) prometheus.Counter {
+	return m.activePassiveFailoversTotal.WithLabelValues(outcome)
+}
+
+// SetStandbyState stamps the enum gauge to the current StandbyState.
+// Called from cmd/gatewayd-public on every active-passive HA state
+// transition (boot→warming→warm→draining→drained). Unlabelled; the
+// gauge is the per-node state signal — fan-out is by Prometheus
+// scrape target. The `FaasStandbyStateWarmingTooLong` alert queries
+// this gauge; the runbook's escalation section covers the
+// investigation path (DNS provider, store connectivity, peer
+// network).
+func (m *OpsMetrics) SetStandbyState(s int) {
+	m.standbyStateMu.Lock()
+	m.standbyStateValue = s
+	m.standbyStateMu.Unlock()
+	m.standbyState.Set(float64(s))
+}
+
+// StandbyState returns the current enum-gauge value. Mirrors the
+// shadow-bool pattern AlertEvaluatorEnabled uses for the alert
+// evaluator (no prometheus.Gauge.Value() accessor exists); the
+// shadow is stamped on every SetStandbyState call so the read
+// path doesn't scrape /metrics. Used by cmd/gatewayd-public
+// startup assertions (the gauge MUST be 1 on boot — see
+// pkg/wire/metrics_test.go).
+func (m *OpsMetrics) StandbyState() int {
+	m.standbyStateMu.Lock()
+	defer m.standbyStateMu.Unlock()
+	return m.standbyStateValue
 }
 
 // EventsWriteFailures returns the unlabelled counter for audit-log
