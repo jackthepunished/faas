@@ -549,6 +549,16 @@ type Manager struct {
 	// daemon startup; the registry owns the 5-minute orphan
 	// sweep + SIGTERM sync-sweep.
 	parentMounts *vmmdmount.Registry
+	// operatorBundle (issue #679 / PR-A) is the operator-managed
+	// egress CIDR set every tenant's allowlist is merged with.
+	// Sorted + dedup'd at SIGHUP-reload time. operatorBundleMu
+	// guards the field; the lock is held briefly for the
+	// read-then-merge path at Wake and at live-patch, so the
+	// hot path (per-Wake / per-PATCH) does not contend on the
+	// bundle's contents. nil/empty slice is the default — the
+	// merge is a no-op, matching today's behaviour.
+	operatorBundle   []netip.Prefix
+	operatorBundleMu sync.RWMutex
 }
 
 // NewManager wires a Manager. fcVersion is the running Firecracker version (used
@@ -1910,6 +1920,14 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 			nc.EgressAllowlist = append(nc.EgressAllowlist, prefix)
 		}
 	}
+	// Issue #679 / PR-A: merge the operator-managed egress
+	// bundle into the per-app slice before render. The bundle
+	// is loaded at vmmd startup + SIGHUP-reload; nil/empty is
+	// a no-op and matches pre-PR-A behaviour exactly. The
+	// merge dedups across per-app + operator (an entry that's
+	// already in the per-app set doesn't get a duplicate row
+	// in the rendered anonymous daddr-set).
+	nc.EgressAllowlist = m.mergeOperatorBundle(nc.EgressAllowlist)
 
 	if err = m.setupNetwork(ctx, nc); err != nil {
 		return nil, fmt.Errorf("wake %s: network setup: %w", req.Instance, err)
@@ -2577,6 +2595,128 @@ func (m *Manager) NetnsFor(instance string) (string, bool) {
 	return inst.Lease.Netns, true
 }
 
+// operatorBundleSnapshot returns a copy of the current
+// operator-bundle slice under the read lock so callers can
+// safely merge it into a Wake or live-patch path without
+// worrying about concurrent SetEgressOperatorBundle calls.
+// Issue #679 / PR-A.
+func (m *Manager) operatorBundleSnapshot() []netip.Prefix {
+	m.operatorBundleMu.RLock()
+	defer m.operatorBundleMu.RUnlock()
+	if len(m.operatorBundle) == 0 {
+		return nil
+	}
+	out := make([]netip.Prefix, len(m.operatorBundle))
+	copy(out, m.operatorBundle)
+	return out
+}
+
+// SetEgressOperatorBundle installs the operator-bundle CIDRs
+// (issue #679 / PR-A) and patches every live netns whose
+// effective allowlist differs. Thread-safe; briefly under
+// m.mu to snapshot targets; release before nft exec. The
+// patch reuses UpdateEgressAllowlist's per-netns argv builders
+// + applyOneInstancePatch code path.
+//
+// cidrs MUST already be sorted + dedup'd — the loader
+// (pkg/vmmd/egress_bundle.go::LoadEgressBundle) is
+// responsible. Empty slice reverts each netns to its per-app
+// slice (the merge becomes a no-op; if prior was merged, patch
+// with just per-app).
+//
+// nil-safe on m (a Manager constructed without ever calling
+// SetEgressOperatorBundle takes the empty path → noop for
+// empty input).
+func (m *Manager) SetEgressOperatorBundle(cidrs []netip.Prefix) {
+	m.operatorBundleMu.Lock()
+	m.operatorBundle = cidrs
+	m.operatorBundleMu.Unlock()
+
+	if len(m.live) == 0 {
+		return
+	}
+	// Group live instances by app_id; one UpdateEgressAllowlist
+	// call per app forces the right diff path. The wire-shape
+	// allowlist arg IS the per-app slice; the merge happens
+	// inside the call below.
+	m.mu.Lock()
+	byApp := make(map[string]struct{}, len(m.live))
+	for id, inst := range m.live {
+		if inst.AppID == "" {
+			continue
+		}
+		byApp[inst.AppID] = struct{}{}
+		_ = id
+	}
+	m.mu.Unlock()
+	for appID := range byApp {
+		// Read each instance's per-app allowlist from its
+		// cached netns.Config under m.mu (the Wake path
+		// stamps inst.Net.EgressAllowlist with the per-app
+		// slice alone; the operator merge hasn't been
+		// persisted there). Pull them now and dispatch.
+		m.mu.Lock()
+		var perApp []netip.Prefix
+		for _, inst := range m.live {
+			if inst.AppID == appID {
+				perApp = make([]netip.Prefix, len(inst.Net.EgressAllowlist))
+				copy(perApp, inst.Net.EgressAllowlist)
+				break
+			}
+		}
+		m.mu.Unlock()
+		if err := m.UpdateEgressAllowlist(context.Background(), appID, perApp); err != nil {
+			m.log.Warn("fcvm: SetEgressOperatorBundle patch failed; live netns may be stale until next reconcile",
+				"app_id", appID, "err", err)
+		}
+	}
+}
+
+// mergeOperatorBundle appends the operator bundle to the
+// per-app slice and returns the union (sorted + dedup'd).
+// The per-app slice is treated as authoritative for ordering;
+// the operator bundle is appended then dedup'd against the
+// combined set. nil/empty operator bundle returns the
+// per-app slice unchanged.
+//
+// Issue #679 / PR-A.
+func (m *Manager) mergeOperatorBundle(perApp []netip.Prefix) []netip.Prefix {
+	bundle := m.operatorBundleSnapshot()
+	if len(bundle) == 0 {
+		return perApp
+	}
+	combined := make([]netip.Prefix, 0, len(perApp)+len(bundle))
+	combined = append(combined, perApp...)
+	combined = append(combined, bundle...)
+	return dedupSortedPrefixes(combined)
+}
+
+// dedupSortedPrefixes removes duplicate netip.Prefix values
+// from a slice that may not be sorted. Preserves first-seen
+// order (per-app entries arrive first). /0 is filtered out
+// defensively (loader already drops them, but a wire-bypass
+// could smuggle a /0 — same non-/0 contract as the Wake-side
+// parser at manager.go:1900-1912). Issue #679 / PR-A.
+func dedupSortedPrefixes(in []netip.Prefix) []netip.Prefix {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]netip.Prefix, 0, len(in))
+	for _, p := range in {
+		if p.Bits() == 0 {
+			continue
+		}
+		key := p.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
 // UpdateEgressAllowlist (ADR-031 + ADR-033, tier-2 PR-B, Track B):
 // walks Manager.live, and for each instance whose app_id matches
 // the request, applies the new egress allowlist in-place via
@@ -2631,6 +2771,13 @@ func (m *Manager) UpdateEgressAllowlist(ctx context.Context, appID string, allow
 	if appID == "" {
 		return fmt.Errorf("fcvm: UpdateEgressAllowlist: empty app_id")
 	}
+	// Issue #679 / PR-A: merge the operator-managed egress
+	// bundle into the per-app slice before the per-instance
+	// argv build. The cached `prior` (read from
+	// inst.Net.EgressAllowlist) is already the merged slice
+	// (Wake stamps it), so the samePrefixSet fast-path
+	// correctly compares merged-vs-merged below.
+	allowlist = m.mergeOperatorBundle(allowlist)
 
 	// Snapshot the targets + their cached handles under the
 	// manager lock. Released before any netns exec. The full

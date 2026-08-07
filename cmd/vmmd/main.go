@@ -24,8 +24,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"filippo.io/age"
@@ -1009,6 +1011,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		log.Info("vmmd: egress watcher wired", "node_id", nodeID, "staging", "/tmp/vmmd-egress-staging", "live", "/etc/nftables.conf")
 	}
+
+	// Issue #679 / PR-A: install the SIGHUP-driven egress
+	// bundle reload. The signal goroutine is serialised against
+	// Wake/Park/Destroy via Manager.SetEgressOperatorBundle's
+	// internal locking, so concurrent reloads + live-patches
+	// cannot corrupt the operator-bundle slice. A failed reload
+	// keeps the prior bundle live (best-effort, never blocks
+	// signal delivery).
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	defer signal.Stop(hupCh)
+	go watchEgressBundleReload(ctx, mgr, cfg.EgressOperatorAllowlist, log, hupCh)
 
 	// Heartbeat retains the §6.2 leak signal (live + leased must be 0 when idle).
 	tick := time.NewTicker(30 * time.Second)
