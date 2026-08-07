@@ -36,10 +36,20 @@ import (
 
 // pgTestComputeNode seeds a compute_node and stamps its heartbeat
 // to a relative age (negative offset from now). Returns the node ID.
+//
+// admission_ceiling_mb is mandatory: schema.sql has
+// compute_nodes_admission_ceiling_mb_check CHECK (admission_ceiling_mb > 0).
+// The MemStore test path doesn't enforce the constraint, so this is
+// a pgstore-only footgun. 256 MB keeps each node well under any
+// per-account RAM admission ceiling a future migration might add.
 func pgTestComputeNode(t *testing.T, ctx context.Context, s *state.PgStore, active bool, age time.Duration) string {
 	t.Helper()
 	n, err := s.CreateComputeNode(ctx, state.ComputeNode{
-		Name: "dnr-" + uuid.NewString(), Active: active, MemMB: 8192, MaxConcurrency: 16,
+		Name:              "dnr-" + uuid.NewString(),
+		Active:            active,
+		MemMB:             8192,
+		MaxConcurrency:    16,
+		AdmissionCeilingMB: 256,
 	})
 	if err != nil {
 		t.Fatalf("CreateComputeNode: %v", err)
