@@ -256,7 +256,7 @@ export class AppsService {
      */
     slug: string,
     /**
-     * SLO window. Default `24h`.
+     * Window for the per-app SLO panel. Default `24h`.
      */
     window?: '1h' | '24h' | '7d',
   }): CancelablePromise<AppSLOResponse> {

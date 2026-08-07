@@ -33,7 +33,8 @@ class AccountSLOResponse:
 
     window: AccountSLOResponseWindow
     source: str
-    """"prometheus" on success; "degraded: <reason>" otherwise."""
+    """"prometheus" on success; "degraded: <reason>" otherwise. Account-wide shape: when Postgres fails only
+    instance_hours/gb_hours are zeroed."""
     as_of: datetime.datetime
     request_duration: SLODuration
     """Shared latency sub-shape used by `AppSLOResponse` and
@@ -44,9 +45,9 @@ class AccountSLOResponse:
     error_rate_pct: float
     cold_boot_rate_pct: float
     instance_hours: float
-    """Sum across all apps for the account."""
+    """Sum of instance-minutes / 60 across all apps for the account."""
     gb_hours: float
-    """Sum across all apps for the account."""
+    """Sum of mb_seconds / 3600 / 1024 across all apps for the account."""
     wake_queue_p95_ms: float
     requests_total: int
     throttled_total: int

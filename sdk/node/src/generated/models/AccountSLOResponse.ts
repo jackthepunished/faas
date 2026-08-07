@@ -19,7 +19,7 @@ import type { SLODuration } from './SLODuration.js';
 export type AccountSLOResponse = {
   window: '1h' | '24h' | '7d';
   /**
-   * "prometheus" on success; "degraded: <reason>" otherwise.
+   * "prometheus" on success; "degraded: <reason>" otherwise. Account-wide shape: when Postgres fails only instance_hours/gb_hours are zeroed.
    */
   source: string;
   as_of: string;
@@ -27,11 +27,11 @@ export type AccountSLOResponse = {
   error_rate_pct: number;
   cold_boot_rate_pct: number;
   /**
-   * Sum across all apps for the account.
+   * Sum of instance-minutes / 60 across all apps for the account.
    */
   instance_hours: number;
   /**
-   * Sum across all apps for the account.
+   * Sum of mb_seconds / 3600 / 1024 across all apps for the account.
    */
   gb_hours: number;
   wake_queue_p95_ms: number;

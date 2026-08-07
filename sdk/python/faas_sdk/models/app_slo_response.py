@@ -40,7 +40,8 @@ class AppSLOResponse:
     window: AppSLOResponseWindow
     """Echoed SLO window, e.g. `24h`."""
     source: str
-    """"prometheus" on success; "degraded: <reason>" otherwise."""
+    """"prometheus" on success; "degraded: <reason>" otherwise. Per-app shape: when Postgres fails only
+    instance_hours/gb_hours are zeroed."""
     as_of: datetime.datetime
     """RFC3339Nano UTC stamp at which the SLO panel was assembled."""
     request_duration: SLODuration
@@ -50,7 +51,7 @@ class AppSLOResponse:
     on an empty window is coerced to 0 by the handler.
     """
     error_rate_pct: float
-    """Share of [45]xx requests in the window."""
+    """Share of [45]xx requests in the window for this app."""
     cold_boot_rate_pct: float
     """Share of requests that triggered a cold boot."""
     instance_hours: float

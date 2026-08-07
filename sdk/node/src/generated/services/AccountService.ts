@@ -124,7 +124,7 @@ export class AccountService {
     window = '24h',
   }: {
     /**
-     * SLO window. Default `24h`.
+     * Window for the account-wide SLO rollup. Default `24h`.
      */
     window?: '1h' | '24h' | '7d',
   }): CancelablePromise<AccountSLOResponse> {

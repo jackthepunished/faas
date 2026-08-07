@@ -28,7 +28,7 @@ export type AppSLOResponse = {
    */
   window: '1h' | '24h' | '7d';
   /**
-   * "prometheus" on success; "degraded: <reason>" otherwise.
+   * "prometheus" on success; "degraded: <reason>" otherwise. Per-app shape: when Postgres fails only instance_hours/gb_hours are zeroed.
    */
   source: string;
   /**
@@ -37,7 +37,7 @@ export type AppSLOResponse = {
   as_of: string;
   request_duration: SLODuration;
   /**
-   * Share of [45]xx requests in the window.
+   * Share of [45]xx requests in the window for this app.
    */
   error_rate_pct: number;
   /**
