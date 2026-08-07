@@ -9550,7 +9550,7 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at,
-	parked_reason, parked_at`
+	coalesce(parked_reason,''), parked_at`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -9578,7 +9578,7 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.sidecars, '[]'::jsonb),
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
-	d.parked_reason, d.parked_at`
+	coalesce(d.parked_reason,''), d.parked_at`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -9620,10 +9620,13 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 	//
 	// Issue #554 follow-up: parked_reason + parked_at columns
 	// (migration 00157). parked_at is *time.Time so the closed-set
-	// "never parked" path (NULL parked_reason + NULL parked_at)
-	// scans cleanly. parked_reason itself is text (closed-set
-	// enforced via the schema CHECK constraint), so a non-NULL
-	// value scans directly into a string.
+	// "never parked" path (NULL parked_at) scans cleanly. The
+	// SELECT projection coalesces parked_reason to '' so the
+	// "never parked" path (NULL parked_reason) scans into the
+	// struct's plain string field — the closed-set is enforced at
+	// the schema layer via the deployments_parked_reason_check
+	// constraint, not on the scan side. The omitempty on the JSON
+	// tag keeps the wire clean when the value is empty.
 	if err := row.Scan(&d.ID, &d.AppID, &d.BuildID, &d.ImageDigest, &kind,
 		&d.SourcePath, &d.SourceBytes, &d.Handler, &d.LogPath,
 		rootfsPath, rootfsKey, rootfsBytes,
