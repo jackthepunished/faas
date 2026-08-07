@@ -245,14 +245,28 @@ func (s *server) renderAppsList(w http.ResponseWriter, r *http.Request, log *slo
 	// dashboardSLOAppsListBadgeCap) so a 100-app account doesn't
 	// issue 100 PromQL calls per render. nil = no badge.
 	badges := s.fetchDashboardSLOBadges(ctx, log, items, acct)
-	for i := range items {
-		if badge, ok := badges[items[i].Slug]; ok {
-			items[i].SLO = &badge
-		}
-	}
+	attachSLOBadges(items, badges)
 	page := dashboard.Page{Title: "Apps", Body: "apps_list", Account: dashboardAccountView(view, len(apps)), Data: items}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
+	}
+}
+
+// attachSLOBadges wires the per-row SLO badge map produced
+// by fetchDashboardSLOBadges into the items slice. The
+// helper is extracted so the loop's pointer-aliasing
+// correctness is testable directly. The defensive `b := badge`
+// copy below is correct on every supported Go version, even
+// if a future refactor flips `for i := range items` into
+// `for i, badge := range items` with &badge on the for-clause
+// binding (where Go ≤ 1.21 would alias the &badge address
+// across all rows). PR #724 /code-review finding.
+func attachSLOBadges(items []dashboard.AppListItem, badges map[string]views.SLOBadge) {
+	for i := range items {
+		if badge, ok := badges[items[i].Slug]; ok {
+			b := badge
+			items[i].SLO = &b
+		}
 	}
 }
 

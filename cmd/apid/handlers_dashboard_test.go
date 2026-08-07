@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -926,5 +928,58 @@ func TestDashboardRaiseOverageCap_RejectsPreStepUpCookie(t *testing.T) {
 		&http.Cookie{Name: middleware.CookieNameAuthenticated, Value: csrfCookie})
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("pre-step-up cookie on /dashboard/raise-overage-cap: code = %d, want 403 (step-up gate)\nbody = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAppsListSLOLoop_PointersAreDistinct pins the per-row
+// SLO badge pointer wiring at handlers_dashboard.go
+// (attachSLOBadges). The loop takes &badge inside the body
+// where `badge` is declared inside the loop body via the
+// `if badge, ok := badges[...]; ok` short-form — on Go ≥ 1.22
+// that produces a fresh stack slot per iteration (the classic
+// for-range loop-variable aliasing gotcha does NOT apply here
+// because `badge` is NOT a for-clause binding).
+//
+// The test asserts the post-conditions the template cares
+// about regardless of the in-body/for-clause distinction:
+//
+//  1. items[i].SLO addresses are pairwise distinct (no
+//     aliasing, whether from a future refactor that flips
+//     the binding shape into the for-clause form, or any
+//     other subtle bug).
+//  2. The value at items[i].SLO round-trips the badge keyed
+//     on items[i].Slug (not some other row's badge).
+//
+// The helper is extracted (attachSLOBadges) so this test
+// drives the real production code — an inlined copy would
+// not bind against a future regression.
+func TestAppsListSLOLoop_PointersAreDistinct(t *testing.T) {
+	items := []dashboard.AppListItem{
+		{Slug: "app-a"},
+		{Slug: "app-b"},
+		{Slug: "app-c"},
+	}
+	badges := map[string]views.SLOBadge{
+		"app-a": {Label: "p95: 87.3ms", Glyph: "ok"},
+		"app-b": {Label: "err: 4.12%", Glyph: "warn"},
+		"app-c": {Label: "p95: 312.4ms", Glyph: "warn"},
+	}
+	attachSLOBadges(items, badges)
+	seen := make(map[*views.SLOBadge]int, len(items))
+	for i := range items {
+		seen[items[i].SLO]++
+	}
+	if len(seen) != len(items) {
+		t.Errorf("SLO pointers alias: got %d distinct addresses for %d rows", len(seen), len(items))
+	}
+	for _, it := range items {
+		if it.SLO == nil {
+			t.Errorf("row %q: nil SLO pointer", it.Slug)
+			continue
+		}
+		want := badges[it.Slug].Label
+		if it.SLO.Label != want {
+			t.Errorf("row %q: SLO.Label = %q, want %q", it.Slug, it.SLO.Label, want)
+		}
 	}
 }
