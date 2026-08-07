@@ -166,4 +166,48 @@ export class InvocationsService {
       },
     });
   }
+  /**
+   * Re-issue a failed or dead_letter invocation.
+   * Accepts no request body. The replayed row carries the original's
+   * payload + headers + method + path verbatim and is enqueued against
+   * the same app. The new row's Source is `replay` (issue #315).
+   *
+   * Only invocations whose current state is `failed` or `dead_letter`
+   * can be replayed — re-running a successful or in-flight invocation
+   * would be a customer bug, not a flow we want to enable by accident.
+   * A replay attempt on any other state returns 409
+   * `invocation_not_replayable`.
+   *
+   * @returns AsyncInvokeResponse The new invocation row was enqueued.
+   * @throws ApiError
+   */
+  public static replayInvocation({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<AsyncInvokeResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/invocations/{id}/replay',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        409: `The invocation is not in a replayable state. Returns the
+        \`invocation_not_replayable\` problem code with the current
+        state in the detail field; only \`failed\` and \`dead_letter\`
+        invocations can be replayed.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
 }
