@@ -53,7 +53,7 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
-  logs         Tail app or deployment logs (--follow)
+  logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
   metrics      Per-app request / latency / cold-boot metrics (gregale metrics <slug> [--range 5m])
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
