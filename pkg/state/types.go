@@ -911,7 +911,7 @@ type Deployment struct {
 	// TrafficPercent is the per-deployment traffic-split weight
 	// (issue #556 PR-A). Integer in [0, 100] enforced by the
 	// deployments_traffic_percent_chk CHECK constraint (migration
-	// 00158). On create: default 100 (server-side when caller passes
+	// 00159). On create: default 100 (server-side when caller passes
 	// 0); on supersede: zeroed in the same tx as the INSERT so Σ over
 	// live rows remains 100 by construction. PR-B's gateway picker
 	// consults this column via the new LiveDeployments(appID)

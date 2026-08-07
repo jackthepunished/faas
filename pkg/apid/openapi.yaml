@@ -6202,7 +6202,7 @@ components:
           description: "Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for never-parked deployments."
         # Issue #556 PR-A: per-deployment traffic-split weight.
         # Integer in [0, 100] enforced by the schema-layer CHECK
-        # constraint (migration 00158). Σ over live rows for the
+        # constraint (migration 00159). Σ over live rows for the
         # app is 100 by construction: CreateDeployment zeros the
         # prior row in the same tx; UpdateDeploymentTraffic zeros
         # siblings in its tx.

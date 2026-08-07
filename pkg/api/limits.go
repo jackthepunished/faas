@@ -462,7 +462,7 @@ type Limits struct {
 	// floor", not "production canary rollout". Apid's create
 	// + PATCH-traffic handlers reject Free/Hobby with 403
 	// plan_traffic_split_not_allowed. Column default
-	// (migration 00158) is 100, so every existing app routes
+	// (migration 00159) is 100, so every existing app routes
 	// 100% to its single live row regardless of plan — the
 	// gate only fires when a Free/Hobby customer tries to
 	// opt-in to a non-100 traffic_percent (which is denied).
@@ -1134,7 +1134,7 @@ var planLimits = map[Plan]Limits{
 		// TrafficSplit (issue #556): Pro unlocks
 		// per-deployment traffic splitting. The issue
 		// title says "Pro+ canary"; the migration
-		// (00158) and CreateDeployment handler stamp
+		// (00159) and CreateDeployment handler stamp
 		// traffic_percent=100 by default, so customers
 		// who never opt-in see no behavioural change.
 		TrafficSplit: true,
@@ -2415,7 +2415,7 @@ func (p Plan) RequireAuthnAllowed() bool {
 // Pro/Scale return true; Free/Hobby return false so apid's
 // createDeployment handler and the new updateDeploymentTraffic
 // handler (PATCH /v1/deployments/{id}/traffic) surface 403
-// plan_traffic_split_not_allowed. The migration (00158) column
+// plan_traffic_split_not_allowed. The migration (00159) column
 // default is 100, so every existing app routes 100% to its single
 // live row regardless of plan — the gate only fires when a Free/
 // Hobby customer tries to opt-in (which is denied). Unknown plans
