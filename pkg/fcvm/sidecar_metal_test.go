@@ -47,6 +47,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/fcvm/leakcheck"
 )
 
 // ensureSidecarExt4 returns the path to a sidecar ext4 image,
