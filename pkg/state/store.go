@@ -2619,9 +2619,18 @@ type Store interface {
 
 	// CountActiveOrgMembers returns the number of memberships with
 	// removed_at IS NULL for the given org. Filtered at the SQL
-	// layer so the count does not scan every row into Go. Used by
-	// apid's enforceMemberCap (Plan.OrgMembersMax) and by the
-	// store-side defence-in-depth check inside consumeOrgInvitation.
+	// layer so the count does not scan every row into Go. Used by:
+	//   - the store-side cap-in-tx check inside consumeOrgInvitation
+	//     (the load-bearing gate — Plan.OrgMembersMax)
+	//   - GET /v1/orgs/{slug}/seat_usage for the visibility-only
+	//     wire shape (IAM-6 / ADR-061 PR 7)
+	//
+	// IAM-6 / ADR-061 PR 7 note: the earlier comment claiming
+	// "apid's enforceMemberCap gates the handler path" is stale.
+	// That helper is intentionally unwired
+	// (cmd/apid/org_handler_helpers.go) and the future direct-add
+	// route (PR-11 follow-up) is what would call it.
+	//
 	// Returns 0 when the org has no rows.
 	CountActiveOrgMembers(ctx context.Context, orgID string) (int, error)
 
@@ -2660,6 +2669,22 @@ type Store interface {
 	// invitation-cleanup loop filters pending + expired at the
 	// caller.
 	ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([]OrgInvitation, error)
+
+	// ListOrgInvitationsForOrgPage is the cursor-paginated variant
+	// of ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is
+	// the invitation's id (UUID); the SQL filter `id < $before`
+	// partitions rows by id and the handler emits
+	// `out[len-1].ID` as the next cursor, so the walk visits every
+	// row exactly once regardless of insertion order.
+	//
+	// limit is clamped to [1, 100] inside the implementation;
+	// out-of-range values resolve to 25 (the documented default).
+	// The order is (created_at DESC, id DESC) — id is the
+	// tiebreaker so the cursor walk is well-defined when two rows
+	// share a created_at timestamp (concurrent mint from the same
+	// admin). Returned slice may be shorter than limit on the
+	// final page; an empty slice means "no more rows".
+	ListOrgInvitationsForOrgPage(ctx context.Context, orgID string, limit int, before string) ([]OrgInvitation, error)
 
 	// CountPendingOrgInvitations returns the number of invitation
 	// rows with consumed_at IS NULL AND revoked_at IS NULL AND

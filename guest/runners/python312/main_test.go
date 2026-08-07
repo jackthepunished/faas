@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/base64"
 	"flag"
+	"net/http"
 	"testing"
 
+	"github.com/onebox-faas/faas/guest/runners/internal"
 	"github.com/onebox-faas/faas/guest/runners/internal/runnerparity"
 )
 
@@ -13,7 +15,12 @@ import (
 // actual `python3` on PATH; the helper skips when missing.
 func TestHandle_RoundTrip(t *testing.T) {
 	fake := runnerparity.FakePyScript()
-	runnerparity.RunRoundTrip(t, fake, handle)
+	// PR 3 (issue #667 follow-up): wrap handle() with 0/empty
+	// tail-primitive args (feature disabled in the round-trip
+	// smoke test).
+	runnerparity.RunRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, _ int, _ string) {
+		handle(w, r, handlerPath, signal, 0, "")
+	})
 }
 
 // TestEnvelopeRoundTrip sanity-checks the JSON tags line up with §4.9,
@@ -32,6 +39,16 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 		WaitUntilSec: 30,
 		TailPipePath: "/tmp/faas-tail-xyz.jsonl",
 	}, []byte("hi"))
+}
+
+// TestHandle_WaitUntilEnvelopeRoundTrip (issue #667 / ADR-078 PR 3) is
+// the per-runtime counterpart to the hermetic
+// TestParity_AllRuntimesHonorWaitUntil file-walk.
+func TestHandle_WaitUntilEnvelopeRoundTrip(t *testing.T) {
+	fake := runnerparity.FakePyScriptWithTail()
+	runnerparity.RunWaitUntilEnvelopeRoundTrip(t, fake, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, tailWaitSec int, tailPipePath string) {
+		handle(w, r, handlerPath, signal, tailWaitSec, tailPipePath)
+	})
 }
 
 // TestPythonRunnerHandlerDefault pins the default --handler value. The

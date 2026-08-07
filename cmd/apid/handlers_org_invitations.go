@@ -1,18 +1,23 @@
 // Organization invitation + ownership-transfer handlers
-// (issue #190 / IAM-6 / ADR-061, PR 5).
+// (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7).
 //
 // Mounted at:
-//   - GET  /v1/invitations/{token}            peekInvitation
-//   - POST /v1/orgs/{slug}/transfer_ownership transferOrgOwnership
+//   - GET    /v1/invitations/{token}                       peekInvitation
+//   - POST   /v1/invitations/{token}/accept                acceptInvitation
+//   - DELETE /v1/orgs/{slug}/invitations/{token}           revokeInvitation
+//   - POST   /v1/orgs/{slug}/transfer_ownership            transferOrgOwnership
 //
 // The invitation-create handler (POST /v1/orgs/{slug}/members) lives
 // in handlers_org_members.go (create-only — returns the plaintext
-// token ONCE). The accept handler (POST /v1/invitations/{token}/accept)
-// is PR 8 (issue #190 PR-8 — SSO + GDPR bundle). PR 5 ships:
-//   - The peek surface (read-only, helps the dashboard render "you're
-//     invited to Acme Inc. as developer" without consuming the token).
-//   - The ownership-transfer surface (the data-layer seam from
-//     pkg/state::TransferOrgOwnership).
+// token ONCE). PR 5 shipped the peek + transfer surfaces; PR 7
+// closes the remaining customer-facing flows:
+//   - acceptInvitation consumes the token via Store.ConsumeOrgInvitation
+//     and emits the two audit kinds the dashboard needs (the member-
+//     side row plus the invitation-side row, both at the same call site).
+//   - revokeInvitation stamps revoked_at via Store.RevokeOrgInvitation
+//     and emits org.invitation.revoked. Gated by OrgActionInviteMembers
+//     (owner + admin), symmetric with the create-invite path.
+// PR 8 (SSO + GDPR bundle) reconsiders step-up at accept time.
 
 package main
 
@@ -150,4 +155,215 @@ func (s *server) transferOrgOwnership(w http.ResponseWriter, r *http.Request, ac
 		return
 	}
 	writeJSON(w, http.StatusOK, api.OrgResponseFromRow(orgToRow(updated)))
+}
+
+// acceptInvitation consumes an invitation token, inserts the
+// membership via Store.ConsumeOrgInvitation, and emits both the
+// member-side and the invitation-side audit rows. The store-side
+// cap-in-tx check is the load-bearing back-stop (mirrors the
+// invite-side posture documented at
+// handlers_org_members.go:127-134) — this handler does NOT call
+// enforceMemberCap.
+//
+// Mounted at POST /v1/invitations/{token}/accept. Auth chain is
+// s.authLimited → s.requireMFA → s.requireStepUp(5m) (the
+// 5-minute TTL + audit kind come from pkg/auth.Middleware
+// .RequireStepUp at middleware.go:802-873; PR-8 wires the chain,
+// ADR-077 documents the rationale). No s.loadOrg — the invitee
+// has no X-Active-Org yet (the invitation IS how they get one).
+// Bearer-key principals skip the step-up gate (an API key is
+// step-up-equivalent proof).
+func (s *server) acceptInvitation(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	token := r.PathValue("token")
+	if token == "" {
+		api.WriteProblem(w, api.ErrOrgInvitationInvalid())
+		return
+	}
+	plaintext, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		api.WriteProblem(w, api.ErrOrgInvitationInvalid())
+		return
+	}
+	hash := sha256.Sum256(plaintext)
+
+	// Email match + state + cap are all enforced inside
+	// ConsumeOrgInvitation's tx. We surface the typed sentinels
+	// to the same 410/403/409 the dashboard expects.
+	membership, inv, err := s.store.ConsumeOrgInvitation(r.Context(), hash[:], acct)
+	switch {
+	case errors.Is(err, state.ErrOrgInvitationInvalid), errors.Is(err, state.ErrOrgInvitationExpired):
+		api.WriteProblem(w, api.ErrOrgInvitationInvalid())
+		return
+	case errors.Is(err, state.ErrOrgAlreadyMember):
+		// Both store impls return zero OrgMembership{} on this
+		// sentinel (the existing membership is discoverable but
+		// the error itself carries no role). Surface the actual
+		// role via a fresh lookup: re-fetch the invitation for
+		// OrgID (the returned inv is also zero-valued here), then
+		// OrgMemberByAccount. Best-effort — on lookup failure
+		// fall back to "" (the role is informational, not
+		// load-bearing). Mirrors the secretbox SealBytes posture:
+		// surface what we know, never guess.
+		existingRole := ""
+		if reFetched, lookupErr := s.store.OrgInvitationByTokenHash(r.Context(), hash[:]); lookupErr == nil {
+			if existing, mErr := s.store.OrgMemberByAccount(r.Context(), reFetched.OrgID, acct.ID); mErr == nil {
+				existingRole = string(existing.Role)
+			}
+		}
+		api.WriteProblem(w, api.ErrOrgAlreadyMember(existingRole))
+		return
+	case errors.Is(err, state.ErrOrgMemberCapExceeded):
+		// The store reads the live cap; the dashboard can render
+		// "the plan caps this org at N members" via the seat_usage
+		// endpoint if the customer needs the numeric details.
+		api.WriteProblem(w, api.ErrOrgMemberCapExceeded(0, 0))
+		return
+	case err != nil:
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity, "ConsumeOrgInvitation failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+
+	// Two audit rows from one customer action: the invitation-side
+	// record (who/when/role) and the member-side record (the
+	// resulting membership). Both are emitted post-mutation per
+	// the ADR-035 best-effort contract; failure to emit does not
+	// roll back the membership insert.
+	s.audit.Emit(r.Context(), "org.invitation.accepted", &acct.ID, map[string]any{
+		"org_id":     inv.OrgID,
+		"email":      inv.Email,
+		"role":       string(inv.Role),
+		"invitation": inv.ID,
+	})
+	s.audit.Emit(r.Context(), "org.member.added", &acct.ID, map[string]any{
+		"org_id":     inv.OrgID,
+		"email":      inv.Email,
+		"role":       string(membership.Role),
+		"invitation": inv.ID,
+	})
+
+	writeJSON(w, http.StatusOK, api.OrgMemberResponseFromRow(s.memberToRow(r.Context(), membership)))
+}
+
+// revokeInvitation stamps revoked_at on a still-pending invitation
+// and emits org.invitation.revoked. Owner + admin only
+// (authz.OrgActionInviteMembers — symmetric with inviteOrgMember).
+// The store enforces ErrOrgInvitationInvalid when the row is
+// already consumed / revoked / unknown.
+//
+// Mounted at DELETE /v1/orgs/{slug}/invitations/{token}. The
+// plaintext token hash is logged with an 8-char prefix only — the
+// full hash is never written to the audit table (mirrors the
+// secret.set posture at handlers_secrets.go).
+func (s *server) revokeInvitation(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if !s.requireOrgAction(w, r, authz.OrgActionInviteMembers) {
+		return
+	}
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
+		return
+	}
+	token := r.PathValue("token")
+	if token == "" {
+		api.WriteProblem(w, api.ErrOrgInvitationInvalid())
+		return
+	}
+	plaintext, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		api.WriteProblem(w, api.ErrOrgInvitationInvalid())
+		return
+	}
+	hash := sha256.Sum256(plaintext)
+
+	if err := s.store.RevokeOrgInvitation(r.Context(), hash[:], acct.ID); err != nil {
+		switch {
+		case errors.Is(err, state.ErrOrgInvitationInvalid), errors.Is(err, state.ErrNotFound):
+			api.WriteProblem(w, api.ErrOrgInvitationInvalid())
+		default:
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				api.CodeCapacity, "RevokeOrgInvitation failed",
+				"try again; if the problem persists, contact support"))
+		}
+		return
+	}
+	s.audit.Emit(r.Context(), "org.invitation.revoked", &acct.ID, map[string]any{
+		"org_id": mem.OrgID,
+		// 8-char prefix is enough for the dashboard to link the
+		// revoke row back to the create row; full hash would let
+		// an attacker pivot to the token if the audit table is
+		// ever exfiltrated.
+		"token_hash_prefix": base64.RawURLEncoding.EncodeToString(hash[:])[:8],
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listOrgInvitations renders the org-scoped invitation list at
+// GET /v1/orgs/{slug}/invitations. Cursor-paginated via
+// ?before=<id>&limit=<n> (default 25, max 100 — matches the
+// pattern at handlers_account_scoped.go:54-82). Every role can
+// view (authz.OrgActionView); the same authz gate as
+// listOrgMembers so the dashboard's "Members" + "Pending
+// invitations" tables share the access model.
+//
+// Mounted at GET /v1/orgs/{slug}/invitations. PR-8 closes the
+// dashboard-render gap from PR-5 (the store method existed but
+// the handler never shipped). Emits one org.invitation.viewed
+// audit row per render — cheap (per-render, not per-row) and
+// documents "an admin looked at the pending invites" for the
+// compliance audit (ADR-035 §"Kind taxonomy" is success-only;
+// this row fires only when the page returns 200).
+func (s *server) listOrgInvitations(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if !s.requireOrgAction(w, r, authz.OrgActionView) {
+		return
+	}
+	mem, ok := s.requireMembership(w, r)
+	if !ok {
+		return
+	}
+	prob, limit := api.ParseLimit(r.URL.Query().Get("limit"), 25, 100, "invitations")
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
+	before := r.URL.Query().Get("before")
+	rows, err := s.store.ListOrgInvitationsForOrgPage(r.Context(), mem.OrgID, limit, before)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"ListOrgInvitationsForOrgPage failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	// Resolve the org slug for the translator. The store joins
+	// org_invitations.org_id → orgs.id, but mem.OrgMembership
+	// doesn't carry the slug (PR-5 left it off; the LoadOrg
+	// middleware resolves it from the X-Active-Org header). One
+	// extra round-trip per render is fine for the dashboard's
+	// "Pending invitations" panel (small N).
+	org, err := s.store.OrgByID(r.Context(), mem.OrgID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			api.CodeCapacity,
+			"OrgByID failed",
+			"try again; if the problem persists, contact support"))
+		return
+	}
+	now := time.Now()
+	out := api.InvitationListResponse{
+		Invitations: make([]api.OrgInvitationResponse, 0, len(rows)),
+	}
+	for _, inv := range rows {
+		out.Invitations = append(out.Invitations,
+			api.OrgInvitationResponseFromRow(invitationToRow(inv, org.Slug, now)))
+	}
+	if len(rows) == limit && len(rows) > 0 {
+		out.NextBefore = rows[len(rows)-1].ID
+	}
+	s.audit.Emit(r.Context(), "org.invitation.viewed", &acct.ID, map[string]any{
+		"org_id":        mem.OrgID,
+		"row_count":     len(out.Invitations),
+		"had_next_page": out.NextBefore != "",
+	})
+	writeJSON(w, http.StatusOK, out)
 }

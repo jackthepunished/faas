@@ -241,6 +241,22 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Free tier does not support per-app streaming; upgrade to Hobby or higher.")
 		}
 	}
+	// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge flag.
+	// Same plan-gate shape as streaming — Free + true = 403
+	// plan_websocket_not_allowed. Free is the abuse-floor tier where
+	// a single long-lived WS would pin a wake past wake_idle_timeout,
+	// so the gate is fail-closed at create AND PATCH time (no override
+	// path). A Hobby/Pro/Scale customer may PATCH true → false to
+	// opt out (a synchronous JSON API that does not want long-poll
+	// pinning); the false direction needs no gate.
+	if req.WebSocketEnabled != nil && *req.WebSocketEnabled {
+		if !acct.Plan.WebSocketResponseAllowed() {
+			return api.NewProblem(http.StatusForbidden,
+				api.CodePlanWebSocketNotAllowed,
+				"WebSocket / Upgrade traffic is not allowed on this plan",
+				"Free tier does not support per-app WebSocket; upgrade to Hobby or higher.")
+		}
+	}
 	// Issue #470 / ADR-055: per-app two-tier-snapshot flag. Same
 	// plan-gate shape as streaming — Free/Hobby + true = 403
 	// plan_warm_snapshot_not_allowed. Out-of-range thresholds =
@@ -641,6 +657,12 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// store is a plain column write.
 		StreamingEnabled:    req.StreamingEnabled,
 		SetStreamingEnabled: req.StreamingEnabled != nil,
+		// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge
+		// flag. The setter bit distinguishes "unset" from "explicit
+		// false" (opt out of websocket). Apid validation already
+		// gated the plan; the store is a plain column write.
+		WebSocketEnabled:    req.WebSocketEnabled,
+		SetWebSocketEnabled: req.WebSocketEnabled != nil,
 		// Issue #462 / ADR-058: per-app scaling policy. The
 		// setter bit on UpdateAppParams distinguishes "don't
 		// touch" (nil pointer) from "explicit zero policy"
@@ -776,6 +798,15 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// above — only fields the caller touched appear in the audit.
 		oldApp["streaming_enabled"] = app.StreamingEnabled
 		newApp["streaming_enabled"] = updated.StreamingEnabled
+	}
+	if req.WebSocketEnabled != nil {
+		// Issue #676 / ADR-080: record what the customer altered on
+		// the websocket flag. Same shape as the streaming block
+		// above — only fields the caller touched appear in the
+		// audit. The plan gate already validated this is a legal
+		// direction (Free + true is rejected upstream).
+		oldApp["websocket_enabled"] = app.WebSocketEnabled
+		newApp["websocket_enabled"] = updated.WebSocketEnabled
 	}
 	// Note: req.RequireSigned is intentionally NOT audited here —
 	// it's silently dropped by updateApp (see above). The audit

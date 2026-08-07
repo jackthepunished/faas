@@ -467,6 +467,20 @@ type Limits struct {
 	// time via buildApp so a Hobby customer's brand-new app is
 	// streaming-ready without an extra PATCH round-trip.
 	StreamingEnabled bool
+	// WebSocketEnabled (issue #676 / ADR-080) gates the per-app
+	// raw-bytes bridge path: when true, gatewayd-internal's Upgrade
+	// detector routes inbound Connection: Upgrade + Upgrade: <token>
+	// requests to the new rawStreamReverseProxy (which opens the
+	// ForwardRawStream RPC and pumps raw bytes into the guest's netns
+	// TCP socket). Same fail-closed shape as StreamingEnabled:
+	// Free defaults off (the abuse-floor tier where a long-lived WS
+	// would pin a wake past wake_idle_timeout), Hobby/Pro/Scale
+	// default on. The plan-level default is applied at CreateApp
+	// time in cmd/apid/handlers.go::buildApp using
+	// Plan.WebSocketEnabled(); an existing app may still flip the
+	// flag via PATCH (gated by Plan.WebSocketResponseAllowed so
+	// Free stays off even when an admin backfills the column).
+	WebSocketEnabled bool
 	// MaxResponseBodyBytes is the per-response body cap (spec §4.1
 	// for the legacy 25 MB bound; issue #471 raises the cap for
 	// Hobby+ to 100 MB so LLM-style streams have headroom). 0 means
@@ -702,6 +716,12 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            false,
 		MaxResponseBodyBytes:        MaxResponseBodyBytesDefault,
 		ResponseWriteTimeoutSeconds: ResponseWriteTimeoutDefault,
+		// WebSocket / Upgrade bridge (issue #676 / ADR-080): Free
+		// is the abuse-floor tier — a long-lived WS would pin a
+		// wake past wake_idle_timeout (the 30 s Free idle window).
+		// Default off; apid PATCH rejects with 403
+		// plan_websocket_not_allowed.
+		WebSocketEnabled: false,
 		// Warm-snapshot (issue #470 / ADR-055): Free is off by
 		// plan. Warm-tier apps keep warm.snap + init.snap on the
 		// parked disk budget; doubling the per-app snapshot
@@ -881,6 +901,13 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// WebSocket / Upgrade bridge (issue #676 / ADR-080): Hobby
+		// is the first paid tier — opt-in by default (the LLM/agent
+		// use case is the Hobby customer's entry point, and many
+		// agent SDKs speak WS over a thin HTTP boundary). The
+		// 100 MB / 900 s caps above cover a long-poll or chat WS
+		// session comfortably.
+		WebSocketEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Hobby is gated off
 		// for the same cost-shape reason as Free — doubling the
 		// parked per-app snapshot footprint doesn't fit the
@@ -1050,6 +1077,10 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// WebSocket / Upgrade bridge (issue #676 / ADR-080): Pro is
+		// the first tier where production workloads sit — opt-in by
+		// default for the same reason as Hobby (LLM / agent SDKs).
+		WebSocketEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Pro is the first
 		// tier where warm-snapshot is on by default. Per the issue
 		// body's acceptance: "for a Pro+ app that has served ≥5
@@ -1226,6 +1257,10 @@ var planLimits = map[Plan]Limits{
 		StreamingEnabled:            true,
 		MaxResponseBodyBytes:        100 * 1024 * 1024,
 		ResponseWriteTimeoutSeconds: 900,
+		// WebSocket / Upgrade bridge (issue #676 / ADR-080): Scale
+		// stays on by default — production workloads at this tier
+		// are expected to run agent / WS-backed services.
+		WebSocketEnabled: true,
 		// Warm-snapshot (issue #470 / ADR-055): Scale stays on
 		// by default — the per-app parked footprint cost fits
 		// inside the 452 GB budget, and the customer's wake-p50
@@ -1427,6 +1462,20 @@ const (
 	ResponseWriteTimeoutDefault         = 300              // 300 s (spec §4.1)
 	StreamingFlushBytesDefault          = 256 * 1024       // 256 KiB flush window (ADR-047)
 	StreamingFlushIntervalDefault       = 200 * time.Millisecond
+
+	// Raw-bridge (issue #676 / ADR-080) inbound cap. The raw-bytes
+	// bridge carries Upgrade / WebSocket / long-poll traffic from
+	// gatewayd-internal into the guest's netns TCP socket. The cap
+	// is per-request (the inbound body of one Upgrade handshake),
+	// not per-session — Upgrade sessions are long-lived and
+	// bytes-in is metered separately at the Prometheus layer. The
+	// init frame's max_request_bytes is clamped DOWN to this value
+	// on the vmmd side (callers cannot grow the cap; a Free-plan
+	// gatewayd cannot ask for math.MaxInt64 and disable the cap).
+	// Mirrors ForwardStreamMaxBodyBytes in pkg/vmmdgrpc (100 MiB on
+	// the same Hobby+ plans) so an LLM-style upgrade stream has
+	// the same headroom.
+	RawStreamMaxRequestBytes int64 = 100 * 1024 * 1024
 
 	// Post-response tail (issue #667 / ADR-078).
 	//
@@ -2131,6 +2180,34 @@ func (p Plan) StreamingResponseAllowed() bool {
 		return false
 	}
 	return l.StreamingEnabled
+}
+
+// WebSocketEnabled reports whether the plan defaults the per-app
+// apps.websocket_enabled column to true (issue #676 / ADR-080).
+// Hobby/Pro/Scale opt in; Free stays off (the abuse-floor tier where a
+// long-lived WS would pin a wake past wake_idle_timeout). The plan-level
+// default is applied at CreateApp time in cmd/apid/handlers.go::buildApp
+// using the WebSocketEnabled() accessor. Unknown plans fail closed
+// (return false) — same contract as StreamingEnabled / MinInstancesAllowed.
+func (p Plan) WebSocketEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.WebSocketEnabled
+}
+
+// WebSocketResponseAllowed reports whether the plan permits a customer
+// to set apps.websocket_enabled=true via PATCH. Hobby+ opt in; Free
+// returns false so apid's updateApp handler can surface 403
+// plan_websocket_not_allowed (issue #676 / ADR-080 AC #3). Same
+// fail-closed contract as WebSocketEnabled above.
+func (p Plan) WebSocketResponseAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.WebSocketEnabled
 }
 
 // WarmSnapshotEnabled reports whether the plan's default for the

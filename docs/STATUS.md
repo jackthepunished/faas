@@ -292,13 +292,37 @@ test, the docs fixes below, and the metal acceptance test.
   pins this — removing it requires removing ADR-078 §"Tail is
   informational" (a new ADR). The financial model and the
   customer-facing bill shape are unchanged.
-- **Acceptance gate:** `pkg/fcvm/tail_metal_test.go` (//go:build
-  metal) exercises the full path — handler returns, runner drains
+- **Acceptance gate:** `pkg/fcvm/tail_metal_linux_test.go` (//go:build
+  metal && linux) exercises the full path — handler returns, runner drains
   the tail, schedd park path observes the post-drain `tail_count
   == 0`, snapshot taken. Run with `make metal-lima RUN_ARGS='-run
   TestMetal_TailEndToEnd'`. `TestPushHour_ExcludesTailSeconds` and
   the cardinality tests run on every `go test` invocation and are
   the load-bearing pre-metal pre-merge checks.
+- **Acceptance-checkboxes #6, #7, #8 closed (issue #667 follow-up, PR
+  feat/issue-667-followup).** The original PR shipped the envelope
+  shape + host-side receipt handler + schedd reaper gate, but
+  deferred the runner-side tail host to this follow-up. Without
+  it, customers could stamp `envelope.WaitUntilSec` and serialize
+  it to JSON, but no runner acted on it. The runner-side tail host
+  (`guest/runners/internal/tail_host.go`) plus the new
+  `/run/guest-init/tail-events.sock` unix-domain proxy
+  (`guest/init/tail_events_proxy_linux.go`) close the loop. **#6** =
+  pathological tail killed at the ceiling
+  (`guest/runners/internal/tail_host_test.go`, 6 unit tests pinning
+  the TailHost surface). **#7** = cross-runtime parity
+  (`guest/runners/internal/runnerparity/tail_host_pin_test.go`
+  file-walk + 5 per-runtime `TestHandle_WaitUntilEnvelopeRoundTrip`
+  tests). **#8** = metal end-to-end
+  (`pkg/fcvm/tail_metal_linux_test.go::TestMetal_TailFullEndToEnd`
+  fires a REAL 0x04 DGRAM via vsock to `VMADDR_CID_HOST:1027` and
+  pins the wire encoding). Behavior change: `signal.SignalReady(...)`
+  now fires AFTER the tail host's `Drain()` returns (not on the first
+  non-5xx response as the original ADR described). The 5 s
+  `snapshotAndPark` watchdog is the hard ceiling — if the tail host
+  hangs, the park gate fires `tail_failed{reason=forced_at_park}`.
+  Metal run verified on Lima nested KVM. ADR-078 §"Amendment"
+  documents the change.
 
 ## M7.6 — extracted Next.js dashboard + githubd. ✅
 

@@ -224,19 +224,33 @@ func TestDispatcher_Delivered200OnFirstAttempt(t *testing.T) {
 
 	disp.cycle(context.Background())
 
-	// Give the inflight goroutine time to finish.
-	for i := 0; i < 50; i++ {
-		if attempts.Load() > 0 {
+	// Poll on the post-MarkSucceeded state — the HTTP attempt
+	// counter increments synchronously with w.WriteHeader, but
+	// the dispatcher's MarkSucceeded goroutine continues after
+	// the response is written. Polling on the success side
+	// (status == Succeeded) instead of the request side
+	// (attempts > 0) avoids asserting on a state whose
+	// mutator hasn't run yet — this is the load-bearing
+	// change that fixes the flaky "status: got in_flight"
+	// failure on shared CI runners.
+	var gotDel state.AppWebhookDelivery
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var err error
+		gotDel, err = m.AppWebhookDeliveryByID(context.Background(), del.ID)
+		if err != nil {
+			t.Fatalf("AppWebhookDeliveryByID: %v", err)
+		}
+		if gotDel.Status == state.AppWebhookDeliverySucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("attempts: got %d, want 1", got)
-	}
-	gotDel, err := m.AppWebhookDeliveryByID(context.Background(), del.ID)
-	if err != nil {
-		t.Fatalf("AppWebhookDeliveryByID: %v", err)
 	}
 	if gotDel.Status != state.AppWebhookDeliverySucceeded {
 		t.Errorf("status: got %s (last_error=%q), want succeeded", gotDel.Status, gotDel.LastError)

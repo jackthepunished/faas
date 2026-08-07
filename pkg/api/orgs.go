@@ -132,6 +132,26 @@ type TransferOwnershipRequest struct {
 	NewOwnerAccountID string `json:"new_owner_account_id"`
 }
 
+// SeatUsageResponse is the wire shape for GET
+// /v1/orgs/{slug}/seat_usage. Visibility-only (no billing / meterd
+// change); the dashboard renders "X of Y seats used" from these
+// three fields. PR-7 ships the count only; pricing stays out of
+// scope per ADR-061 §"Out of scope" — the seat-billing cut-over
+// is PR-9.
+//
+// Used is the live row count from
+// pkg/state.Store.CountActiveOrgMembers (the same count the cap-in-tx
+// inside ConsumeOrgInvitation reads). Limit is org.Plan.OrgMembersMax()
+// — Free + unknown plans return 0 (the fail-closed accessor shape
+// PR-2 landed) so the dashboard renders "personal org only" instead
+// of "0 of 0 used". Plan is the plan string verbatim so the dashboard
+// doesn't have to round-trip a separate /v1/orgs/{slug} request.
+type SeatUsageResponse struct {
+	Used  int    `json:"used"`
+	Limit int    `json:"limit"`
+	Plan  string `json:"plan"`
+}
+
 // OrgResponse is the canonical org shape on the wire. RFC3339
 // timestamps (zero-time serialises as empty). Mirrors pkg/api.CronResponse
 // for the timestamp posture. Used by:
@@ -322,8 +342,13 @@ type InvitationWithTokenResponse struct {
 type OrgInvitationWithToken = InvitationWithTokenResponse
 
 // ListInvitationsResponse wraps GET /v1/orgs/{slug}/invitations.
+// NextBefore is the cursor for the next page (matches the
+// pagination contract at pkg/api/paging.go — empty means "no more
+// pages"). Cursor is the last row's ID, fed back as ?before=<id>
+// on the next request.
 type InvitationListResponse struct {
 	Invitations []OrgInvitationResponse `json:"invitations"`
+	NextBefore  string                  `json:"next_before,omitempty"`
 }
 
 // ListInvitationsResponse is the historic name; renamed to

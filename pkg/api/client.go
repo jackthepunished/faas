@@ -1635,11 +1635,92 @@ func (c *Client) TransferOrgOwnership(ctx context.Context, slug string, req Tran
 // PeekInvitation is a read-only lookup that returns the invitation
 // metadata (email, role, org slug, expires_at) without consuming
 // the token. Used by the dashboard to render "you've been invited
-// to Acme Inc. as developer" before the invitee accepts. The accept
-// flow lands in PR 8.
+// to Acme Inc. as developer" before the invitee accepts.
 func (c *Client) PeekInvitation(ctx context.Context, token string) (OrgInvitationResponse, error) {
 	var out OrgInvitationResponse
 	return out, c.do(ctx, "GET", "/v1/invitations/"+token, nil, &out)
+}
+
+// AcceptInvitation consumes the token via Store.ConsumeOrgInvitation
+// (the load-bearing cap-in-tx check lives there) and inserts the
+// bearer as a new active member. Two audit rows fire post-mutation:
+// `org.invitation.accepted` and `org.member.added`. Returns 410
+// (`org_invitation_invalid`) on unknown / consumed / revoked /
+// expired tokens; 409 (`org_already_member`) if the bearer is
+// already a member; 403 (`org_member_cap_exceeded`) at the plan cap.
+func (c *Client) AcceptInvitation(ctx context.Context, token string) (OrgMemberResponse, error) {
+	var out OrgMemberResponse
+	return out, c.do(ctx, "POST", "/v1/invitations/"+token+"/accept", nil, &out)
+}
+
+// RevokeInvitation stamps revoked_at on a still-pending invitation.
+// Owner + admin only (org.invite_members, symmetric with
+// InviteOrgMember). Emits `org.invitation.revoked` with an 8-char
+// token-hash prefix (never the full hash).
+func (c *Client) RevokeInvitation(ctx context.Context, slug, token string) error {
+	return c.do(ctx, "DELETE", "/v1/orgs/"+slug+"/invitations/"+token, nil, nil)
+}
+
+// ListOrgInvitationsAll walks the next_before cursor on
+// GET /v1/orgs/{slug}/invitations until the server returns an
+// empty cursor, returning every invitation in created_at DESC
+// order. Useful for the dashboard "Pending invitations" panel
+// that wants the full list without forcing the customer to wire
+// a loop.
+//
+// The server caps each page at 100 rows (handled by
+// ListOrgInvitations); this method requests max page size when
+// walking. Cancelling ctx stops the walk at the next page
+// boundary — the current page's rows are returned up to the
+// cancellation point.
+func (c *Client) ListOrgInvitationsAll(ctx context.Context, slug string) ([]OrgInvitationResponse, error) {
+	var out []OrgInvitationResponse
+	cursor := ""
+	for {
+		page, err := c.ListOrgInvitations(ctx, slug, cursor, 100)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, page.Invitations...)
+		if page.NextBefore == "" {
+			return out, nil
+		}
+		cursor = page.NextBefore
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+	}
+}
+
+// ListOrgInvitations returns a single page of invitations for the
+// given org slug, cursor-paginated via ?before=<id>&limit=<n>
+// (default 25, max 100). Every role on the org can read (the
+// authz gate is OrgActionView, same as GET /v1/orgs/{slug}/members).
+// Emits one `org.invitation.viewed` audit row per render.
+func (c *Client) ListOrgInvitations(ctx context.Context, slug, before string, limit int) (InvitationListResponse, error) {
+	var out InvitationListResponse
+	path := "/v1/orgs/" + slug + "/invitations"
+	if before != "" || limit > 0 {
+		path += "?"
+		sep := ""
+		if before != "" {
+			path += "before=" + before
+			sep = "&"
+		}
+		if limit > 0 {
+			path += sep + "limit=" + strconv.Itoa(limit)
+		}
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetOrgSeatUsage returns {used, limit, plan} for the active org.
+// `limit` is the plan cap (OrgMembersMax). Free / unknown plans
+// return 0 (the fail-closed accessor). Visibility-only — PR 9 ships
+// the per-seat pricing cut-over.
+func (c *Client) GetOrgSeatUsage(ctx context.Context, slug string) (SeatUsageResponse, error) {
+	var out SeatUsageResponse
+	return out, c.do(ctx, "GET", "/v1/orgs/"+slug+"/seat_usage", nil, &out)
 }
 
 // --- Webhook delivery (issue #476 / ADR-076) -----------------------------

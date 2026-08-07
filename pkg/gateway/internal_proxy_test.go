@@ -39,16 +39,20 @@ func (d *stubDialer) DialContext(ctx context.Context, target string) (net.Conn, 
 // TestInternalReverseProxy_StripsHopByHopHeaders pins the RFC 7230
 // §6.1 contract: the inbound hop-by-hop headers are NOT forwarded
 // to the upstream.
+//
+// Issue #676 / ADR-080 (PR-3): the strip is BYPASSED when the
+// request carries an Upgrade token (Connection: Upgrade + Upgrade:
+// <token>) — the bytes flow raw through the gatewayd-internal
+// upgrade detector. This test pins the negative case (no Upgrade
+// header → Connection is still stripped). The positive case is
+// pinned by TestInternalReverseProxy_PreservesUpgradeHeaders
+// below.
 func TestInternalReverseProxy_StripsHopByHopHeaders(t *testing.T) {
 	var seenConnection atomic.Bool
-	var seenUpgrade atomic.Bool
 	var seenKeepAlive atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Connection") != "" {
 			seenConnection.Store(true)
-		}
-		if r.Header.Get("Upgrade") != "" {
-			seenUpgrade.Store(true)
 		}
 		if r.Header.Get("Keep-Alive") != "" {
 			seenKeepAlive.Store(true)
@@ -59,17 +63,14 @@ func TestInternalReverseProxy_StripsHopByHopHeaders(t *testing.T) {
 	dialer := &stubDialer{server: upstream}
 	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
 	req := httptest.NewRequest(http.MethodGet, "/hello", nil)
+	// Plain Connection: close (no Upgrade token) — strip applies.
 	req.Header.Set("Connection", "close")
-	req.Header.Set("Upgrade", "websocket")
 	req.Header.Set("Keep-Alive", "timeout=5")
 	req.Header.Set("X-Custom", "stays") // non-hop-by-hop, must survive
 	rr := httptest.NewRecorder()
 	p.ServeHTTP(rr, req)
 	if seenConnection.Load() {
 		t.Errorf("Connection header forwarded to upstream")
-	}
-	if seenUpgrade.Load() {
-		t.Errorf("Upgrade header forwarded to upstream")
 	}
 	if seenKeepAlive.Load() {
 		t.Errorf("Keep-Alive header forwarded to upstream")
@@ -302,5 +303,66 @@ func TestCopyResponseBody_ShortInput(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("n = %d, want 0", n)
+	}
+}
+
+// TestInternalReverseProxy_PreservesUpgradeHeaders pins the
+// issue #676 / ADR-080 contract: when the inbound request carries
+// Connection: Upgrade + Upgrade: <token>, the hop-by-hop strip is
+// SKIPPED so the WebSocket handshake reaches gatewayd-internal
+// intact. Without this guard, gatewayd-internal's upgrade
+// detector would never see the headers, and the customer's WS
+// client would silently fall through to a 502.
+func TestInternalReverseProxy_PreservesUpgradeHeaders(t *testing.T) {
+	var gotConnection, gotUpgrade string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotConnection = r.Header.Get("Connection")
+		gotUpgrade = r.Header.Get("Upgrade")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	dialer := &stubDialer{server: upstream}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
+	req := httptest.NewRequest(http.MethodGet, "/socket", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if gotConnection != "Upgrade" {
+		t.Errorf("Connection header = %q, want Upgrade (preserved for upgrade request)", gotConnection)
+	}
+	if gotUpgrade != "websocket" {
+		t.Errorf("Upgrade header = %q, want websocket (preserved for upgrade request)", gotUpgrade)
+	}
+}
+
+// TestInternalReverseProxy_StripsCaseInsensitiveUpgrade pins the
+// RFC 7230 §3.2 contract on the upgrade-headers bypass: a
+// lowercase `connection: upgrade` is still detected as an upgrade
+// request (the detector is case-insensitive on both Connection
+// token parsing AND the Upgrade header check) so the strip is
+// still skipped. The Go stdlib canonicalizes Connection on Set
+// to "Connection", so we use the raw map form to set "upgrade"
+// — the detector reads both via Header.Get + strings.EqualFold.
+func TestInternalReverseProxy_StripsCaseInsensitiveUpgrade(t *testing.T) {
+	var gotConnection, gotUpgrade string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotConnection = r.Header.Get("Connection")
+		gotUpgrade = r.Header.Get("Upgrade")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	dialer := &stubDialer{server: upstream}
+	p := NewInternalReverseProxy(dialer, &url.URL{Scheme: "http", Host: "internal"}, slog.Default(), false)
+	req := httptest.NewRequest(http.MethodGet, "/socket", nil)
+	req.Header["Connection"] = []string{"upgrade"}
+	req.Header["Upgrade"] = []string{"websocket"}
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if gotConnection != "upgrade" {
+		t.Errorf("Connection header = %q, want upgrade (preserved)", gotConnection)
+	}
+	if gotUpgrade != "websocket" {
+		t.Errorf("Upgrade header = %q, want websocket (preserved)", gotUpgrade)
 	}
 }

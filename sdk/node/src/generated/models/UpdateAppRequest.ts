@@ -29,6 +29,10 @@ export type UpdateAppRequest = {
    */
   streaming_enabled?: boolean | null;
   /**
+   * Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → no change. Free PATCHing true is 403 plan_websocket_not_allowed.
+   */
+  websocket_enabled?: boolean | null;
+  /**
    * Per-app scaling policy. Omitted → no change. Non-null → atomic full-overwrite of the jsonb column.
    */
   scaling_policy?: (null | ScalingPolicy);

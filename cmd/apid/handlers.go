@@ -120,6 +120,17 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	if req.StreamingEnabled != nil {
 		streaming = *req.StreamingEnabled
 	}
+	// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge flag.
+	// Mirrors the streaming-enabled shape above — plan-level
+	// default applied when the request didn't carry one, request
+	// override otherwise. Free stays off (a long-lived WS would
+	// pin a wake past the 30 s Free idle window); Hobby/Pro/Scale
+	// default on. The Plan.WebSocketEnabled() accessor is
+	// fail-closed — Free's accessor returns false.
+	ws := acct.Plan.WebSocketEnabled()
+	if req.WebSocketEnabled != nil {
+		ws = *req.WebSocketEnabled
+	}
 	// Issue #470 / ADR-055: per-app two-tier snapshot flag. Apply
 	// the plan-level default when the request didn't carry one —
 	// a Pro customer's brand-new app gets warm.snap capture
@@ -189,6 +200,7 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 		AccountID: acct.ID, Slug: req.Slug, Type: typ, Runtime: req.Runtime,
 		RAMMB: ram, MaxConcurrency: mc, IdleTimeoutS: req.IdleTimeoutS, Status: state.AppActive,
 		StreamingEnabled:    streaming,
+		WebSocketEnabled:    ws,
 		WarmSnapshotEnabled: warmEnabled,
 		// Issue #560 + issue #695 / ADR-080: see the
 		// plan-default block above. Default is per-plan
@@ -347,6 +359,10 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		// dashboards can show "streaming on / off" alongside the
 		// egress-allowlist flag.
 		StreamingEnabled: a.StreamingEnabled,
+		// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge
+		// flag. Surfaced so dashboards can show "websocket on / off"
+		// alongside the streaming pill.
+		WebSocketEnabled: a.WebSocketEnabled,
 		// Issue #560: per-app require_authn flag. Surfaced so
 		// dashboards can show "auth required on / off" alongside
 		// the streaming + require_signed pills, and so a customer

@@ -224,8 +224,19 @@ func (p *InternalReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	outReq.URL.Host = p.Target.Host
 	outReq.Host = p.Target.Host
 	outReq.RequestURI = "" // required for outgoing client requests
-	// Strip hop-by-hop in place (no second map alloc).
-	stripHopByHopInPlace(outReq.Header)
+	// Strip hop-by-hop in place (no second map alloc). The strip
+	// is correct for plain HTTP (RFC 7230 §6.1) — but it would
+	// destroy the Connection: Upgrade + Upgrade: <token>
+	// handshake for inbound WebSocket / h2c / MQTT-over-WS
+	// requests before gatewayd-internal's Upgrade detector ever
+	// sees them (issue #676 / ADR-080). Skip the strip when the
+	// request is an upgrade; the detector lives in pkg/gateway
+	// (upgrade.go) and is shared with Handler.ServeHTTP so the
+	// two sides of the public→internal hop agree on the
+	// case-insensitive RFC 7230 §3.2 parse.
+	if !isUpgradeRequest(r) {
+		stripHopByHopInPlace(outReq.Header)
+	}
 	// XFF trust: strip the inbound chain (the customer could
 	// forge any IP) and re-add only the public daemon's RemoteAddr.
 	// The internal daemon sees exactly one trusted hop.

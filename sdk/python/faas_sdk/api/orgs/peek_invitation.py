@@ -76,7 +76,8 @@ def sync_detailed(
     (email, role, org slug, expires_at) without consuming the
     token. Used by the dashboard to render \"you've been invited
     to Acme Inc. as developer\" without forcing the invitee
-    to accept yet. The accept flow lands in PR 8.
+    to accept yet. PR 7 added the accept surface at
+    `POST /v1/invitations/{token}/accept`.
 
     Args:
         token (str): Plaintext or base64url-encoded invitation token.
@@ -111,7 +112,8 @@ def sync(
     (email, role, org slug, expires_at) without consuming the
     token. Used by the dashboard to render \"you've been invited
     to Acme Inc. as developer\" without forcing the invitee
-    to accept yet. The accept flow lands in PR 8.
+    to accept yet. PR 7 added the accept surface at
+    `POST /v1/invitations/{token}/accept`.
 
     Args:
         token (str): Plaintext or base64url-encoded invitation token.
@@ -141,7 +143,8 @@ async def asyncio_detailed(
     (email, role, org slug, expires_at) without consuming the
     token. Used by the dashboard to render \"you've been invited
     to Acme Inc. as developer\" without forcing the invitee
-    to accept yet. The accept flow lands in PR 8.
+    to accept yet. PR 7 added the accept surface at
+    `POST /v1/invitations/{token}/accept`.
 
     Args:
         token (str): Plaintext or base64url-encoded invitation token.
@@ -174,7 +177,8 @@ async def asyncio(
     (email, role, org slug, expires_at) without consuming the
     token. Used by the dashboard to render \"you've been invited
     to Acme Inc. as developer\" without forcing the invitee
-    to accept yet. The accept flow lands in PR 8.
+    to accept yet. PR 7 added the accept surface at
+    `POST /v1/invitations/{token}/accept`.
 
     Args:
         token (str): Plaintext or base64url-encoded invitation token.

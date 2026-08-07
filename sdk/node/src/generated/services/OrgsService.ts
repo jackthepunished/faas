@@ -6,6 +6,7 @@ import type { APIKeyResponse } from '../models/APIKeyResponse.js';
 import type { ChangeMemberRoleRequest } from '../models/ChangeMemberRoleRequest.js';
 import type { CreateOrgAPIKeyRequest } from '../models/CreateOrgAPIKeyRequest.js';
 import type { CreateOrgRequest } from '../models/CreateOrgRequest.js';
+import type { InvitationListResponse } from '../models/InvitationListResponse.js';
 import type { InvitationWithTokenResponse } from '../models/InvitationWithTokenResponse.js';
 import type { InviteMemberRequest } from '../models/InviteMemberRequest.js';
 import type { ListOrgAPIKeysResponse } from '../models/ListOrgAPIKeysResponse.js';
@@ -17,6 +18,7 @@ import type { OrgResponse } from '../models/OrgResponse.js';
 import type { PatchOrgRequest } from '../models/PatchOrgRequest.js';
 import type { RotateOrgAPIKeyRequest } from '../models/RotateOrgAPIKeyRequest.js';
 import type { RotateOrgAPIKeyResponse } from '../models/RotateOrgAPIKeyResponse.js';
+import type { SeatUsageResponse } from '../models/SeatUsageResponse.js';
 import type { TransferOwnershipRequest } from '../models/TransferOwnershipRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -491,9 +493,10 @@ export class OrgsService {
    * Mints a 32-byte plaintext token, hashes it via SHA-256 for
    * storage, and returns the plaintext ONCE in the response.
    * The token expires after 14 days; admins can revoke earlier
-   * via `DELETE /v1/orgs/{slug}/invitations/{id}` (PR 8 owns
-   * the accept surface). Role cannot be `owner`; transfer-
-   * ownership is the only path to owner.
+   * via `DELETE /v1/orgs/{slug}/invitations/{token}` (PR 7 owns
+   * the accept surface too — see
+   * `POST /v1/invitations/{token}/accept`). Role cannot be
+   * `owner`; transfer-ownership is the only path to owner.
    *
    * @returns InvitationWithTokenResponse The invitation + the one-time plaintext token.
    * @throws ApiError
@@ -740,7 +743,8 @@ export class OrgsService {
    * (email, role, org slug, expires_at) without consuming the
    * token. Used by the dashboard to render "you've been invited
    * to Acme Inc. as developer" without forcing the invitee
-   * to accept yet. The accept flow lands in PR 8.
+   * to accept yet. PR 7 added the accept surface at
+   * `POST /v1/invitations/{token}/accept`.
    *
    * @returns OrgInvitationResponse The pending invitation.
    * @throws ApiError
@@ -765,6 +769,237 @@ export class OrgsService {
       errors: {
         401: `code: unauthorized`,
         410: `code: org_invitation_invalid | org_invitation_expired | org_invitation_invalid (already consumed/revoked)`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Accept an invitation token (consume + add as member).
+   * Consumes the invitation via `Store.ConsumeOrgInvitation` —
+   * the load-bearing tx stamps `consumed_at`, inserts the active
+   * membership, and reads the live member cap (PR 2 cap-in-tx
+   * back-stop; documents at `pkg/state/memstore.go`). Two audit
+   * rows fire post-mutation per ADR-035: `org.invitation.accepted`
+   * (invitation-side record) and `org.member.added` (member-side
+   * record). The bearer must have a valid session or API key but
+   * no `X-Active-Org` — the invitation IS how they get one. PR 8
+   * adds step-up at accept time.
+   *
+   * @returns OrgMemberResponse The new membership row.
+   * @throws ApiError
+   */
+  public static acceptInvitation({
+    token,
+    idempotencyKey,
+  }: {
+    /**
+     * Plaintext or base64url-encoded invitation token (same
+     * shape as the GET /v1/invitations/{token} parameter).
+     *
+     */
+    token: string,
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<OrgMemberResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/invitations/{token}/accept',
+      path: {
+        'token': token,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `\`403 Forbidden\` — the org is at the member cap. Stable
+        code \`org_member_cap_exceeded\`.
+        `,
+        409: `\`409 Conflict\` — the bearer is already an active member
+        of the target org. The wire detail carries the
+        caller's current role. Stable code \`org_already_member\`.
+        `,
+        410: `\`410 Gone\` — the token is unknown, already consumed,
+        already revoked, or expired. Stable codes
+        \`org_invitation_invalid\` | \`org_invitation_expired\`.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Revoke a pending invitation.
+   * Stamps `revoked_at` on a still-pending invitation via
+   * `Store.RevokeOrgInvitation`. Owner + admin only
+   * (`org.invite_members`, symmetric with the create-invite
+   * path). Already-consumed / already-revoked / unknown tokens
+   * collapse to a single `org_invitation_invalid` 410 (don't
+   * leak which row state was reached). Emits
+   * `org.invitation.revoked` with an 8-char token-hash prefix
+   * (never the full hash) for dashboard correlation.
+   *
+   * @returns void
+   * @throws ApiError
+   */
+  public static revokeInvitation({
+    slug,
+    token,
+  }: {
+    /**
+     * Org slug. Lowercase letters, digits, hyphens; must start
+     * and end with alnum. 3..32 chars. Mirrors `OrgSlugPattern`
+     * in `pkg/api/errors.go` exactly so the spec drift gate
+     * (`make spec-check`) stays green.
+     *
+     */
+    slug: string,
+    /**
+     * Plaintext or base64url-encoded invitation token. The URL
+     * is org-scoped here (vs the no-org-scoped peek at
+     * `GET /v1/invitations/{token}`), so admin/owner gate fires
+     * before the consume path resolves the hash.
+     *
+     */
+    token: string,
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: 'DELETE',
+      url: '/v1/orgs/{slug}/invitations/{token}',
+      path: {
+        'slug': slug,
+        'token': token,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `\`403 Forbidden\` — caller lacks \`org.invite_members\`.
+        Stable code \`org_role_forbidden\`.
+        `,
+        404: `code: not_found`,
+        410: `\`410 Gone\` — the token is unknown, already consumed,
+        or already revoked. Stable code \`org_invitation_invalid\`.
+        `,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Seat usage visibility for the active org.
+   * Returns `{used, limit, plan}` from `Store.CountActiveOrgMembers`
+   * (the same row the cap-in-tx inside `ConsumeOrgInvitation`
+   * reads). `limit` comes from `org.Plan.OrgMembersMax()` — the
+   * `free` plan returns `0` to render "personal org only" in the
+   * dashboard rather than "0 of 0 used". Visibility-only; PR 9
+   * ships the per-seat pricing cut-over per ADR-061 §"Out of
+   * scope". Every role may read (gated by `org.view`).
+   *
+   * @returns SeatUsageResponse The seat usage.
+   * @throws ApiError
+   */
+  public static getOrgSeatUsage({
+    slug,
+  }: {
+    /**
+     * Org slug. Lowercase letters, digits, hyphens; must start
+     * and end with alnum. 3..32 chars. Mirrors `OrgSlugPattern`
+     * in `pkg/api/errors.go` exactly so the spec drift gate
+     * (`make spec-check`) stays green.
+     *
+     */
+    slug: string,
+  }): CancelablePromise<SeatUsageResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/orgs/{slug}/seat_usage',
+      path: {
+        'slug': slug,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        403: `\`403 Forbidden\` — caller lacks \`org.view\`. Stable code
+        \`org_role_forbidden\`.
+        `,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List org invitations (every state).
+   * Cursor-paginated list of every invitation minted on the
+   * org — pending, consumed, revoked, expired — in
+   * `created_at DESC` order (id tiebreak). Cursor is the
+   * last row's `id`; `?before=<id>` partitions the next
+   * page. Default limit 25, max 100 (per the strict-mode
+   * pagination contract at issue #393). Every role may
+   * read (gated by `org.view`, the same access model as
+   * GET /v1/orgs/{slug}/members). PR-8 ships the surface
+   * so the dashboard can render a "Pending invitations"
+   * table next to the "Members" table. Each render emits
+   * one `org.invitation.viewed` audit row (success-only,
+   * per ADR-035).
+   *
+   * @returns InvitationListResponse The page of invitations.
+   * @throws ApiError
+   */
+  public static listOrgInvitations({
+    slug,
+    before,
+    limit = 25,
+  }: {
+    /**
+     * Org slug. Lowercase letters, digits, hyphens; must start
+     * and end with alnum. 3..32 chars. Mirrors `OrgSlugPattern`
+     * in `pkg/api/errors.go` exactly so the spec drift gate
+     * (`make spec-check`) stays green.
+     *
+     */
+    slug: string,
+    /**
+     * Cursor — the `id` of the last row from the prior page.
+     * Omit on the first page.
+     *
+     */
+    before?: string,
+    /**
+     * Max invitations to return per page. Silently capped at 100.
+     */
+    limit?: number,
+  }): CancelablePromise<InvitationListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/orgs/{slug}/invitations',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'before': before,
+        'limit': limit,
+      },
+      errors: {
+        400: `\`400 Bad Request\` — \`?limit=\` is malformed, < 1, or
+        > 100. Stable code \`validation_failed\`.
+        `,
+        401: `code: unauthorized`,
+        403: `\`403 Forbidden\` — caller is not a member of the
+        active org. Stable code \`org_role_forbidden\`.
+        `,
+        404: `code: not_found`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +72,42 @@ process.stdin.on('end', () => {
 	}
 }
 
+// FakeNodeScriptWithTail is the Node counterpart of
+// FakeGoScriptWithTail. Writes a JSONL entry to envelope.TailPipePath
+// before returning the response envelope, so the runner's
+// drainTailHost reads the pipe after invokeHandler returns. The
+// response envelope also echoes the tail_pipe_path and
+// wait_until_sec it saw in the input envelope — the per-runtime
+// parity test (RunWaitUntilEnvelopeRoundTrip) asserts the
+// runner threaded the env var correctly into the envelope.
+func FakeNodeScriptWithTail() FakeHandler {
+	return FakeHandler{
+		Script: `#!/usr/bin/env node
+let buf = '';
+process.stdin.on('data', (c) => { buf += c; });
+process.stdin.on('end', () => {
+  const env = JSON.parse(buf);
+  if (env.tail_pipe_path) {
+    require('fs').appendFileSync(env.tail_pipe_path,
+      JSON.stringify({id: 'task-tail-1', wait: false}) + '\n');
+  }
+  const out = {
+    status: 200,
+    headers: {
+      "X-Echo-Method": env.method,
+      "X-Echo-Path": env.path,
+      "X-Echo-TailPipe": env.tail_pipe_path || "",
+      "X-Echo-WaitUntilSec": String(env.wait_until_sec || 0),
+    },
+    body_b64: Buffer.from("echo:" + env.path).toString("base64")
+  };
+  process.stdout.write(JSON.stringify(out));
+});`,
+		Filename:    "handler.js",
+		Interpreter: []string{"node"},
+	}
+}
+
 // FakePyScript returns a FakeHandler that runs under `python3`. The
 // script echoes method + path back via the §4.9 response envelope.
 // Skipped at test time if `python3` is not on PATH.
@@ -82,6 +119,38 @@ env = json.loads(sys.stdin.read())
 out = {
     "status": 200,
     "headers": {"X-Echo-Method": env["method"], "X-Echo-Path": env["path"]},
+    "body_b64": base64.b64encode(("echo:" + env["path"]).encode()).decode(),
+}
+sys.stdout.write(json.dumps(out))
+`,
+		Filename:    "handler.py",
+		Interpreter: []string{"python3"},
+	}
+}
+
+// FakePyScriptWithTail writes a JSONL entry to envelope.TailPipePath
+// before returning the response envelope. The runner's
+// drainTailHost reads the pipe after invokeHandler returns. The
+// response envelope also echoes the tail_pipe_path and
+// wait_until_sec it saw in the input envelope — the per-runtime
+// parity test (RunWaitUntilEnvelopeRoundTrip) asserts the
+// runner threaded the env var correctly into the envelope.
+func FakePyScriptWithTail() FakeHandler {
+	return FakeHandler{
+		Script: `#!/usr/bin/env python3
+import sys, json, base64
+env = json.loads(sys.stdin.read())
+if env.get("tail_pipe_path"):
+    with open(env["tail_pipe_path"], "a") as f:
+        f.write(json.dumps({"id": "task-tail-1", "wait": False}) + "\n")
+out = {
+    "status": 200,
+    "headers": {
+        "X-Echo-Method": env["method"],
+        "X-Echo-Path": env["path"],
+        "X-Echo-TailPipe": env.get("tail_pipe_path", ""),
+        "X-Echo-WaitUntilSec": str(env.get("wait_until_sec", 0)),
+    },
     "body_b64": base64.b64encode(("echo:" + env["path"]).encode()).decode(),
 }
 sys.stdout.write(json.dumps(out))
@@ -103,6 +172,39 @@ method=$(printf '%s' "$env" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
 path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
 printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_b64":"%s"}' \
   "$method" "$path" "$(printf '%s' "echo:$path" | base64)"
+`,
+		Filename:    "handler",
+		Interpreter: nil,
+	}
+}
+
+// FakeGoScriptWithTail returns a FakeGoScript that additionally
+// writes a JSONL entry to envelope.TailPipePath before returning
+// the response envelope. The runner's tail host then reads the
+// pipe and emits 0x04 DGRAMs. Used by the per-runtime
+// TestHandle_WaitUntilEnvelopeRoundTrip to exercise the full
+// drain end-to-end (the emit fails because the proxy isn't
+// running in unit tests, but the runner's drain doesn't gate on
+// the emit — TailErrors stays empty on the happy path).
+//
+// The response also echoes the tail_pipe_path and wait_until_sec
+// it saw in the input envelope (the per-runtime parity test
+// asserts the runner threaded the env var correctly into the
+// envelope — issue #667 review item #12).
+func FakeGoScriptWithTail() FakeHandler {
+	return FakeHandler{
+		Script: `#!/bin/sh
+read -r env
+method=$(printf '%s' "$env" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+# tail_pipe_path + wait_until_sec from the envelope (issue #667 / ADR-078).
+tail_pipe=$(printf '%s' "$env" | sed -n 's/.*"tail_pipe_path":"\([^"]*\)".*/\1/p')
+wait_until_sec=$(printf '%s' "$env" | sed -n 's/.*"wait_until_sec":\([0-9][0-9]*\).*/\1/p')
+if [ -n "$tail_pipe" ]; then
+  printf '{"id":"task-tail-1","wait":false}\n' >> "$tail_pipe"
+fi
+printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s","X-Echo-TailPipe":"%s","X-Echo-WaitUntilSec":"%s"},"body_b64":"%s"}' \
+  "$method" "$path" "$tail_pipe" "$wait_until_sec" "$(printf '%s' "echo:$path" | base64)"
 `,
 		Filename:    "handler",
 		Interpreter: nil,
@@ -143,7 +245,29 @@ func (f FakeHandler) WriteMaterialize(t *testing.T) string {
 // path AND a RunnerSignal so the runner's per-package `handle`
 // signature (added an issue #470 / PR #470-FU-B fourth arg) stays
 // unchanged — production visibility of `handle` is preserved.
-func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal)) {
+// RunRoundTrip wires up an httptest.Server that delegates / to handler,
+// fires GET /hello?x=1, and asserts: status=200, X-Echo-Method=="GET",
+// X-Echo-Path=="/hello", body contains "echo:/hello". When
+// fake.Interpreter == []string{"node"}, the helper also asserts
+// Content-Type == "application/octet-stream" — node22's runtime
+// override (guest/runners/node22/main.go:102). All other runtimes
+// skip the Content-Type check; the python312/go124 runners pass through
+// the handler's Content-Type verbatim.
+//
+// The handler closure is invoked with the materialized handler script
+// path AND a RunnerSignal so the runner's per-package `handle`
+// signature (added an issue #470 / PR #470-FU-B fourth arg) stays
+// unchanged — production visibility of `handle` is preserved.
+//
+// PR 3 (issue #667 follow-up): the runner's `handle` signature
+// grew two new args (tailWaitSec, tailPipePath). The helper's
+// signature deliberately keeps the 4-arg shape so the 5
+// round-trip smoke tests don't need to know about the tail
+// primitive — the wrapper in each runner's main_test.go
+// bridges the signature change with 0/empty defaults (feature
+// disabled). See guest/runners/go124/main_test.go for the
+// pattern.
+func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal, int, string)) {
 	t.Helper()
 	script := fake.WriteMaterialize(t)
 
@@ -158,7 +282,7 @@ func RunRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWrit
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handler(w, r, script, signal)
+		handler(w, r, script, signal, 0, "")
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -276,4 +400,107 @@ func extractBodyB64(t *testing.T, marshaled []byte) string {
 		t.Fatalf("unmarshal envelope for body_b64 probe: %v", err)
 	}
 	return probe.BodyB64
+}
+
+// RunWaitUntilEnvelopeRoundTrip wires up an httptest.Server that
+// delegates / to handler, fires GET /hello?x=1, and asserts:
+//
+//  1. The runner's tail host reads the JSONL pipe at
+//     envelope.TailPipePath (FakeGoScriptWithTail writes one line).
+//  2. The runner's drain returns within the per-task ceiling
+//     (eliminate per-runtime infinite-drain bugs).
+//  3. The response envelope is intact (status=200, body unchanged).
+//
+// Unlike RunRoundTrip, this helper passes NON-ZERO tailWaitSec and
+// a non-empty tailPipePath so the runner's drainTailHost path is
+// exercised end-to-end. The 0x04 DGRAM emit fails in unit tests
+// (the proxy isn't running) — that's expected; the runner keeps
+// draining and the response stays clean (TailErrors empty on the
+// happy path because the runner's taskFn is a no-op, so the
+// per-task context doesn't fire).
+//
+// Per-runtime caller pattern (mirrors RunRoundTrip):
+//
+//	func TestHandle_WaitUntilEnvelopeRoundTrip(t *testing.T) {
+//	    runnerparity.RunWaitUntilEnvelopeRoundTrip(t, fake, handle)
+//	}
+//
+// PR 3 (issue #667 follow-up): this is the per-runtime counterpart
+// to the hermetic TestParity_AllRuntimesHonorWaitUntil file-walk
+// (that one pins the structural shape; this one pins the
+// per-runtime execution).
+func RunWaitUntilEnvelopeRoundTrip(t *testing.T, fake FakeHandler, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal, int, string)) {
+	t.Helper()
+	script := fake.WriteMaterialize(t)
+
+	signal := internal.NewRunnerSignal("parity-tail", time.Now())
+
+	// Per-test tempdir for the JSONL pipe. The runner's
+	// drainTailHost reads it after invokeHandler returns;
+	// the FakeHandlerWithTail writes one line before exiting.
+	dir := t.TempDir()
+	pipePath := filepath.Join(dir, "tail.jsonl")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 30s ceiling — long enough that the test never blocks
+		// on the per-task timeout (the runner's taskFn is a
+		// no-op, so contexts don't fire). Short enough that a
+		// hung drain would surface as a test timeout.
+		handler(w, r, script, signal, 30, pipePath)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	start := time.Now()
+	resp, err := http.Get(srv.URL + "/hello?x=1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Echo-Method"); got != "GET" {
+		t.Errorf("X-Echo-Method = %q, want GET", got)
+	}
+	if got := resp.Header.Get("X-Echo-Path"); got != "/hello" {
+		t.Errorf("X-Echo-Path = %q, want /hello", got)
+	}
+	// Pin the env-var → envelope round-trip: the FakeHandler's
+	// JSON output echoes back the tail_pipe_path it observed.
+	// If the runner forgot to thread the env var into the
+	// envelope (issue #667 review item #12), this assertion
+	// catches the drift. The handler subprocess reads its
+	// envelope from stdin and writes the tail_pipe_path value
+	// into the X-Echo-TailPipe response header.
+	if got := resp.Header.Get("X-Echo-TailPipe"); got != pipePath {
+		t.Errorf("X-Echo-TailPipe = %q, want %q (envelope.TailPipePath must equal the FAAS_TAIL_PIPE_PATH the runner was started with)", got, pipePath)
+	}
+	if got := resp.Header.Get("X-Echo-WaitUntilSec"); got != "30" {
+		t.Errorf("X-Echo-WaitUntilSec = %q, want 30 (envelope.WaitUntilSec must thread the per-task ceiling)", got)
+	}
+	body := new(bytes.Buffer)
+	if _, err := io.Copy(body, resp.Body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !strings.Contains(body.String(), "echo:/hello") {
+		t.Errorf("body = %q, want contains echo:/hello", body.String())
+	}
+	// Drain must complete in << the 30s ceiling. A regression
+	// where the runner's drainTailHost hangs would surface here.
+	if elapsed > 5*time.Second {
+		t.Errorf("drain did not return promptly: elapsed=%v, ceiling=5s", elapsed)
+	}
+	// The JSONL pipe was read by the runner's drain. If the
+	// runner never touched it, the file stays empty (the
+	// FakeHandlerWithTail writes one line, the runner reads it).
+	// We assert the file exists — the runner's ReadPipe
+	// tolerates the pipe being missing (treats as no-tasks),
+	// so an empty file is the "happy path" state.
+	if _, err := os.Stat(pipePath); err != nil {
+		t.Errorf("tail pipe stat: %v (runner may have unlinked the pipe before stat)", err)
+	}
 }

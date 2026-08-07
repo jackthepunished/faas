@@ -1519,14 +1519,18 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	// Issue #695 / ADR-080: public_auth_mode is included in the column
+// Issue #695 / ADR-080: public_auth_mode is included in the column
 	// list so the App struct's value is written verbatim. Pre-#695 the
 	// schema default ('open') shadowed any value the caller passed,
 	// which broke the per-plan default path on Pro/Scale (default
 	// 'bearer' was overwritten back to 'open' on insert). Same shape
 	// for both CreateApp and CreateAppIfUnderQuota below.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	//
+	// Issue #676 / PR-3: websocket_enabled is also written explicitly
+	// (same Set-bit-aware shape) so the per-plan default doesn't get
+	// shadowed by the schema DEFAULT.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1549,7 +1553,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode)
+app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
 	return scanApp(row)
 }
 
@@ -1670,12 +1674,14 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	// Issue #695 / ADR-080: public_auth_mode is in the column list so
+// Issue #695 / ADR-080: public_auth_mode is in the column list so
 	// the App struct's value is written verbatim (same rationale as
 	// CreateApp above — schema default 'open' would otherwise shadow
 	// the per-plan default).
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+	//
+	// Issue #676 / PR-3: websocket_enabled follows the same shape.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1694,7 +1700,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode)
+app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2472,7 +2478,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   -- mode='basic' PATCH) clears the blob atomically.
 		   public_auth_mode   = case when $41 then $42::text  else public_auth_mode   end,
 		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end,
-			   -- Issue #695 / ADR-080: grand-father marker. Cleared
+-- Issue #695 / ADR-080: grand-father marker. Cleared
 			   -- when the customer makes a deliberate PATCH choice
 			   -- on a grandfathered app (ClearAuthDefaultFlippedAt
 			   -- flag set by apid when SetRequireAuthn OR
@@ -2480,7 +2486,13 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- counts apps.auth_default_flipped_at IS NOT NULL
 			   -- per account; clearing the stamp brings the count
 			   -- toward zero and stops the banner from re-rendering.
-			   auth_default_flipped_at = case when $44 then NULL else auth_default_flipped_at end
+			   auth_default_flipped_at = case when $44 then NULL else auth_default_flipped_at end,
+			   -- Issue #676 / PR-3: per-app raw-bytes Upgrade
+			   -- bridge. Same Set-bit convention as streaming_enabled
+			   -- above; apid gates PATCH-true through
+			   -- Plan.WebSocketResponseAllowed() (Free → 403
+			   -- plan_websocket_not_allowed).
+			   websocket_enabled = case when $45 then $46 else websocket_enabled end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2539,13 +2551,16 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetPublicAuth,
 		derefString(ptrOrEmpty(p.PublicAuth)),
 		nilOrBytes(p.PublicAuth),
-		// Issue #695 / ADR-080: grand-father clear path. apid sets
+// Issue #695 / ADR-080: grand-father clear path. apid sets
 		// this when the customer PATCHed require_authn or public_auth,
 		// which is the deliberate-choice signal the dashboard banner
 		// looks for. No-op for new post-flip apps (column is already
 		// NULL). A no-touch PATCH (RAM_MB-only, etc.) leaves the
 		// stamp alone so the banner keeps re-rendering.
-		p.ClearAuthDefaultFlippedAt)
+		p.ClearAuthDefaultFlippedAt,
+		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
+		// Same Set*/optional-pointer pattern as streaming_enabled.
+		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled))
 	return scanApp(row)
 }
 
@@ -9271,13 +9286,17 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// into a *[]byte to keep the SQL NULL → Go nil
 		// convention explicit.
 		&a.PublicAuthMode, &a.PublicAuthBasicSealed,
-		// Issue #695 / ADR-080: grand-father marker. Nullable
+// Issue #695 / ADR-080: grand-father marker. Nullable
 		// timestamptz scanned into *time.Time (pgx handles the
 		// SQL NULL → Go nil conversion natively — same shape
 		// as ReassignedAt / MigratedAt above). NOT NULL after
-		// migration 00155 backfills; NULL on apps created
+		// migration 00156 backfills; NULL on apps created
 		// post-flip (no grandfather needed).
-		&a.AuthDefaultFlippedAt); err != nil {
+		&a.AuthDefaultFlippedAt,
+		// Issue #676 / PR-3: per-app websocket_enabled flag.
+		// NOT NULL DEFAULT false (migration 00155); plain bool
+		// scan is safe.
+		&a.WebSocketEnabled); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -9343,10 +9362,15 @@ const appsSelectColumns = `
 	require_authn,
 	-- Issue #477 / ADR-079: per-app public_auth
 	public_auth_mode, public_auth_basic,
-	-- Issue #695 / ADR-080: grand-father marker. Set by
-	-- migration 00155 on every pre-flip row; reads null on
+-- Issue #695 / ADR-080: grand-father marker. Set by
+	-- migration 00156 on every pre-flip row; reads null on
 	-- apps created post-flip.
-	auth_default_flipped_at`
+	auth_default_flipped_at,
+	-- Issue #676 / PR-3: per-app raw-bytes Upgrade bridge flag.
+	-- Boolean NOT NULL DEFAULT false (migration 00155); apid applies
+	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
+	-- writes through Plan.WebSocketResponseAllowed().
+	websocket_enabled`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`
@@ -11255,11 +11279,19 @@ func scanOrg(r rowScanner) (Org, error) {
 
 // AddOrgMember inserts a membership row. Returns ErrConflict on duplicate
 // PK, ErrOrgLastOwner when adding a second active owner would trip the
-// partial unique, ErrNotFound when the org row is missing,
-// ErrOrgMemberCapExceeded when the org's active-member count has
-// reached Plan.OrgMembersMax() (IAM-6 / ADR-061 PR 2 — the
-// defence-in-depth back-stop; consumeOrgInvitation runs the same
-// check, and cmd/apid's enforceMemberCap gates the handler path).
+// partial unique, ErrNotFound when the org row is missing.
+//
+// IAM-6 / ADR-061 PR 7 note: this method does NOT enforce
+// Plan.OrgMembersMax. The cap is only enforced inside
+// ConsumeOrgInvitation's tx (the load-bearing gate). The
+// initial-owner seed at org creation bypasses the cap by design —
+// the brand-new org has active=0, so the cap is non-binding — and
+// every subsequent membership insert flows through the consume
+// path which holds the lock + the count check. The earlier
+// comment claiming "cmd/apid's enforceMemberCap gates the handler
+// path" is stale; that helper is intentionally unwired
+// (cmd/apid/org_handler_helpers.go) and the future direct-add
+// route (PR-11 follow-up) is what would call it.
 func (s *PgStore) AddOrgMember(ctx context.Context, orgID, accountID string, role OrgRole, invitedBy *string) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -11682,6 +11714,44 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 	}
 	defer rows.Close()
 	out := make([]OrgInvitation, 0)
+	for rows.Next() {
+		inv, err := scanOrgInvitation(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
+// ListOrgInvitationsForOrgPage is the cursor-paginated variant of
+// ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
+// invitation's id (UUID); the SQL filter `id::text < $3` partitions
+// rows by id and the ORDER BY tiebreaks with id so the cursor walk
+// is well-defined when two rows share a created_at timestamp.
+//
+// limit is clamped to [1, 100]; out-of-range resolves to 25. The
+// before="" case is the first page (no filter). No JOIN: invitations
+// are org-scoped directly (org_id NOT NULL FK) so the org_id
+// predicate is the only filter the SQL needs.
+func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string, limit int, before string) ([]OrgInvitation, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	rows, err := s.pool.Query(ctx, `
+		select id, org_id, email::text, role, token_hash, invited_by_account_id,
+		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
+		  from org_invitations
+		 where org_id = $1
+		   and ($3 = '' or id::text < $3)
+		 order by created_at desc, id::text desc
+		 limit $2
+	`, orgID, limit, before)
+	if err != nil {
+		return nil, fmt.Errorf("state: list org invitations paged: %w", err)
+	}
+	defer rows.Close()
+	out := make([]OrgInvitation, 0, limit)
 	for rows.Next() {
 		inv, err := scanOrgInvitation(rows)
 		if err != nil {

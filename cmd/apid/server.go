@@ -627,17 +627,22 @@ func (s *server) handler() http.Handler {
 	// stay account-scoped).
 	mux.HandleFunc("GET /v1/orgs/me", s.auth(s.loadOrg(s.whoamiActiveOrg)))
 
-	// Orgs (ADR-061 / IAM-6 / issue #190, PR 5). Customer-visible
-	// org CRUD + member management + invitations + ownership
-	// transfer. The full surface is mounted here in one block so
-	// the route table reads top-down by resource. Patterns:
+	// Orgs (ADR-061 / IAM-6 / issue #190, PR 5 + PR 7). Customer-
+	// visible org CRUD + member management + invitations + ownership
+	// transfer + seat-usage visibility. The full surface is mounted
+	// here in one block so the route table reads top-down by resource.
+	// Patterns:
 	//   - account-scoped (no s.loadOrg): GET/POST /v1/orgs
-	//   - invitation peek (no s.loadOrg, no scope): GET /v1/invitations/{token}
+	//   - invitation peek/accept (no s.loadOrg, no scope):
+	//     GET /v1/invitations/{token}, POST /v1/invitations/{token}/accept
 	//   - org-scoped (s.loadOrg mounted inside scope wrapper):
 	//     GET/PATCH/DELETE /v1/orgs/{slug}, /v1/orgs/{slug}/members[/...],
-	//     /v1/orgs/{slug}/transfer_ownership
-	// Post-PATCH name updates land in PR 7 once the Store gains
-	// UpdateOrgName (PR 5 only persists plan via UpdateOrgPlan).
+	//     /v1/orgs/{slug}/transfer_ownership,
+	//     /v1/orgs/{slug}/invitations/{token} (revoke),
+	//     /v1/orgs/{slug}/seat_usage (PR 7 visibility-only)
+	// PR 9 ships the per-seat billing cut-over (pricing + Stripe
+	// subscription-item quantities) per ADR-061 §"Out of scope";
+	// PR 8 ships SSO + invitation-accept step-up.
 	mux.HandleFunc("GET /v1/orgs", s.authLimited(s.requireScope(api.ScopesReadSurface...)(s.listOrgsForCaller)))
 	mux.HandleFunc("POST /v1/orgs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createSharedOrg)))))
 	mux.HandleFunc("GET /v1/orgs/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.getOrg)))))
@@ -649,6 +654,20 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/orgs/{slug}/members/{user_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.removeOrgMember)))))
 	mux.HandleFunc("POST /v1/orgs/{slug}/transfer_ownership", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.requireStepUp(5*time.Minute)(s.transferOrgOwnership))))))
 	mux.HandleFunc("GET /v1/invitations/{token}", s.authLimited(s.peekInvitation))
+	// PR-8: accept-invitation now sits behind requireStepUp (5m).
+	// Compose order mirrors POST /v1/orgs/{slug}/transfer_ownership
+	// (server.go:655): authLimited → requireMFA → requireStepUp.
+	// Without step-up, a bearer who leaked an invitation token could
+	// mint themselves into the target org with no fresh TOTP — the
+	// threat model ADR-077 closed for the other 8 sensitive routes.
+	// Bearer-key principals skip the gate (an API key is step-up-
+	// equivalent proof); pre-PR-077 cookies fail open per the
+	// bypass tolerance at middleware.go:836-847.
+	mux.HandleFunc("POST /v1/invitations/{token}/accept", s.authLimited(s.requireMFA(s.requireStepUp(5*time.Minute)(s.acceptInvitation))))
+	mux.HandleFunc("DELETE /v1/orgs/{slug}/invitations/{token}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.loadOrg(s.revokeInvitation)))))
+	// PR-8 §2: list invitations surface (cursor-paginated, every role).
+	mux.HandleFunc("GET /v1/orgs/{slug}/invitations", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.listOrgInvitations)))))
+	mux.HandleFunc("GET /v1/orgs/{slug}/seat_usage", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.loadOrg(s.getOrgSeatUsage)))))
 	mux.HandleFunc("PATCH /v1/account/plan", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.requireStepUp(5*time.Minute)(s.idempotent(s.changePlan))))))
 	// Issue #561 — spend cap pause-workload. Account-self-scoped
 	// (mirror restoreAccount: any authenticated principal on the

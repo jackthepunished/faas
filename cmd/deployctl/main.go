@@ -13,6 +13,10 @@
 //	bundle-create <root> <release-id> <commit-sha> <target>
 //	                      write and verify an immutable release manifest
 //	bundle-check <root>   verify the manifest and every release file
+//	migration-dry-run <release-id>
+//	                      report host migration actions without mutating state
+//	legacy-import <release-id> <commit-sha>
+//	                      copy legacy binaries into a verified release baseline
 //
 // Invocation sites:
 //
@@ -72,6 +76,16 @@ func main() {
 	case "deploy":
 		if err := runDeploy(args); err != nil {
 			fmt.Fprintln(os.Stderr, "deployctl deploy:", err)
+			os.Exit(1)
+		}
+	case "migration-dry-run":
+		if err := runMigrationDryRun(args); err != nil {
+			fmt.Fprintln(os.Stderr, "deployctl migration-dry-run:", err)
+			os.Exit(1)
+		}
+	case "legacy-import":
+		if err := runLegacyImport(args); err != nil {
+			fmt.Fprintln(os.Stderr, "deployctl legacy-import:", err)
 			os.Exit(1)
 		}
 	default:
@@ -205,6 +219,46 @@ func runBundleCheck(args []string) error {
 		return err
 	}
 	fmt.Printf("release bundle %s verified (%d files)\n", manifest.ReleaseID, len(manifest.Files))
+	return nil
+}
+
+func runMigrationDryRun(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: deployctl migration-dry-run <release-id>")
+	}
+	report, err := deploycontroller.DryRun(deploycontroller.Config{
+		ReleasesRoot: "/opt/faas/releases",
+		CurrentPath:  "/opt/faas/current",
+		LockPath:     "/run/lock/faas-deploy.lock",
+	}, args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("release: %s\ncurrent: %s\nrollback available: %t\nlegacy binaries: %t\nlegacy source: %t\n", report.ReleaseID, report.CurrentTarget, report.HasPreviousRelease, report.LegacyBinDir, report.LegacySourceDir)
+	for _, check := range report.RequiredPaths {
+		fmt.Printf("path %s: exists=%t (%s)\n", check.Path, check.Exists, check.Reason)
+	}
+	for _, path := range report.StaleScratchFiles {
+		fmt.Printf("stale scratch candidate: %s\n", path)
+	}
+	for _, warning := range report.Warnings {
+		fmt.Printf("warning: %s\n", warning)
+	}
+	for _, action := range report.Actions {
+		fmt.Printf("action: %s\n", action)
+	}
+	return nil
+}
+
+func runLegacyImport(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: deployctl legacy-import <release-id> <commit-sha>")
+	}
+	manifest, err := deploycontroller.ImportLegacyBin("/opt/faas/bin", "/opt/faas/releases", args[0], args[1], time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("legacy release %s imported and verified (%d files); current pointer unchanged\n", manifest.ReleaseID, len(manifest.Files))
 	return nil
 }
 

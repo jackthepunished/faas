@@ -346,6 +346,16 @@ type App struct {
 	// v1 contract — a Free app with StreamingEnabled=false keeps the
 	// legacy 25 MB / 300 s envelope (spec §4.1).
 	StreamingEnabled bool
+	// WebSocketEnabled (issue #676 / ADR-080) toggles the per-app
+	// raw-bytes Upgrade bridge. When true, gatewayd-internal's
+	// Upgrade detector routes inbound Connection: Upgrade +
+	// Upgrade: <token> requests to rawStreamReverseProxy (which
+	// opens the ForwardRawStream RPC and pumps raw bytes into the
+	// guest's netns TCP socket). Mirrors StreamingEnabled's
+	// plan-gating contract: Free defaults to false and cannot
+	// PATCH it to true (apid returns 403
+	// plan_websocket_not_allowed); Hobby/Pro/Scale default to true.
+	WebSocketEnabled bool
 	// RequireSigned gates OCI image deploys (issue #472 / ADR-054) on
 	// a valid cosign signature from a trusted publisher. When true,
 	// imaged's buildImageLayer calls pkg/cosign.VerifyImageSignature
@@ -1832,6 +1842,16 @@ type UpdateAppParams struct {
 	// (e.g. a synchronous JSON API that wants Content-Length).
 	StreamingEnabled    *bool
 	SetStreamingEnabled bool
+	// WebSocketEnabled (issue #676 / ADR-080) toggles the per-app
+	// raw-bytes Upgrade bridge. SetWebSocketEnabled distinguishes
+	// "unset" (don't touch) from "explicit false" (opt out of
+	// Upgrade traffic). Plan-gated upstream: apid returns 403
+	// plan_websocket_not_allowed when the plan lacks the gate
+	// (Free). Hobby/Pro/Scale customers may PATCH true → false
+	// to disable WS for a specific app (e.g. a JSON API that
+	// should never accept an Upgrade).
+	WebSocketEnabled    *bool
+	SetWebSocketEnabled bool
 	// RequireSigned (issue #472 / ADR-054) gates OCI image deploys
 	// on a valid cosign signature from a trusted publisher. SetRequireSigned
 	// distinguishes "unset" (don't touch) from "explicit false"
