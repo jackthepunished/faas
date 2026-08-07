@@ -34,8 +34,9 @@ Commands:
   apps ls      Alias for 'gregale apps'
   apps -q      Delete an app
   app          Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
+  backup       Operator rclone config unseal (backup unseal-rclone)
   billing      Manage billing (gregale billing portal)
-  build        Build provenance (build provenance <id>)
+  build        Build provenance + sbom (build provenance <id>|build sbom <id>)
   connect      Connect a third-party service (github)
   crons        Manage scheduled requests
   dashboard    Open the account dashboard in your browser
@@ -46,26 +47,33 @@ Commands:
   env          Pull/push .env <-> sealed secrets (--app <slug>)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
+  invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
   invoices     List issued invoices
   keys         Manage API keys
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
   logs         Tail app or deployment logs (--follow)
   metrics      Per-app request / latency / cold-boot metrics (gregale metrics <slug> [--range 5m])
+  mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
+  orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|transfer-ownership|seat-usage|invitations ...)
   park         Park an app cold (kill all live instances)
+  pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
   plan         Change plan (free|hobby|pro|scale)
   ps           Show live instances + state for an app
   queue        Inspect the wake-queue depth
   rollback     Re-promote the previous deployment
+  scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets on an app (--app <slug>)
   sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
+  trusted-publishers  Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
   usage        Show this month's usage (gregale usage [--month YYYY-MM])
   usage summary  Account-wide usage roll-up (gregale usage summary [--month YYYY-MM])
   version      Print the CLI version
   wake         Wake a parked app (pulls out of snapshot)
+  webhooks     Manage outbound webhooks (webhooks list|add|update|rm|deliveries|retry)
   whoami       Show the authenticated account
 
 Run 'gregale <command> --help' for command details.
@@ -253,6 +261,22 @@ func run(args []string) int {
 		return cmdMetrics(args[1:])
 	case "queue":
 		return cmdQueueDispatch(args[1:])
+	case "mfa":
+		// IAM-2 / issue #186: MFA enrollment + step-up + recovery.
+		// Routes through authedClient(); the dispatcher itself lives
+		// in commands_mfa.go.
+		return cmdMfa(args[1:])
+	case "orgs":
+		// IAM-6 / ADR-061 / issue #190: org CRUD + members +
+		// invitations + ownership transfer. Sub-dispatchers live in
+		// commands_orgs.go (`orgs members ...`, `orgs invitations ...`).
+		return cmdOrgs(args[1:])
+	case "invitations":
+		// Standalone invitation entry points (no slug context).
+		// `invitations peek <token>` is unauth-friendly (the server
+		// validates the token itself); `invitations accept <token>`
+		// requires an authenticated session + 5-min step-up.
+		return cmdInvitations(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale: unknown command %q\nRun 'gregale help' for usage.\n", args[0])
 		return 1

@@ -42,3 +42,5 @@ vmlinux-*
 /gatewayd
 /gatewayd-public
 /gatewayd-internal
+/gregale
+/gregale-mfa-qr.png
