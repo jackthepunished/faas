@@ -45,10 +45,10 @@ import (
 func pgTestComputeNode(t *testing.T, ctx context.Context, s *state.PgStore, active bool, age time.Duration) string {
 	t.Helper()
 	n, err := s.CreateComputeNode(ctx, state.ComputeNode{
-		Name:              "dnr-" + uuid.NewString(),
-		Active:            active,
-		MemMB:             8192,
-		MaxConcurrency:    16,
+		Name:               "dnr-" + uuid.NewString(),
+		Active:             active,
+		MemMB:              8192,
+		MaxConcurrency:     16,
 		AdmissionCeilingMB: 256,
 	})
 	if err != nil {
