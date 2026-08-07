@@ -99,6 +99,31 @@ type MigrationHarness struct {
 	// gateway's pg_notify instance_changed listener on
 	// state='migrating' — see cmd/gatewayd-internal/backend.go).
 	ledger *NodeLedger
+	// destinationCeilingMB is the per-node RAM admission ceiling for
+	// the destination node (compute_nodes.admission_ceiling_mb for
+	// newOwnerNodeID), populated at NewMigrationHarness time from
+	// store.ListComputeNodes. Zero falls back to the global
+	// api.RAMAdmissionCeilingMB inside NodeLedger.Admit (the legacy
+	// single-box posture); on a heterogeneous fleet a non-zero
+	// value is load-bearing — without it the Phase 3 reservation
+	// would over-admit a destination whose ceiling is smaller than
+	// the global ceiling (violating invariant §6.2-2).
+	destinationCeilingMB int
+	// destinationVCPUBudget is the per-node vCPU admission budget
+	// for the destination node (compute_nodes.vcpu_budget for
+	// newOwnerNodeID). Zero falls back to api.VCPUSlots inside
+	// NodeLedger.Admit. Same load-bearing rationale as
+	// destinationCeilingMB.
+	destinationVCPUBudget int
+	// nodeCeilingResolver resolves a nodeID to its (RAM ceiling,
+	// vCPU budget) row from compute_nodes. Wired by the engine so
+	// the harness doesn't import pkg/state directly (one-way
+	// import graph: pkg/state → pkg/sched is forbidden, the
+	// engine wires both). nil means "no resolver wired" — the
+	// harness then reads the global api.RAMAdmissionCeilingMB
+	// and api.VCPUSlots fallbacks (the legacy single-box
+	// posture, safe for pre-multi-node test seams).
+	nodeCeilingResolver func(ctx context.Context, nodeID string) (ceilingMB int, vcpuBudget int, err error)
 	// specBuilder is the canonical AppSpec constructor the
 	// harness uses at Phase 3. Wiring it as a closure (rather
 	// than re-implementing the builder here) keeps the spec
@@ -158,6 +183,7 @@ type apiMigrationMetrics interface {
 // binary. Production wiring passes wire.NewOpsMetrics(...)
 // directly.
 func NewMigrationHarness(
+	ctx context.Context,
 	store state.Store,
 	vmm RoutedVMM,
 	metrics apiMigrationMetrics,
@@ -165,6 +191,7 @@ func NewMigrationHarness(
 	newOwnerNodeID string,
 	specBuilder func(ctx context.Context, instanceID string) (AppSpec, error),
 	ledger *NodeLedger,
+	nodeCeilingResolver func(ctx context.Context, nodeID string) (ceilingMB int, vcpuBudget int, err error),
 ) *MigrationHarness {
 	if specBuilder == nil {
 		panic("sched: NewMigrationHarness: specBuilder is nil (migration will silently corrupt AppSpec at first handoff)")
@@ -172,17 +199,35 @@ func NewMigrationHarness(
 	if ledger == nil {
 		panic("sched: NewMigrationHarness: ledger is nil (Tier A5 destination-side slot reservation would silently no-op at Phase 3)")
 	}
-	return &MigrationHarness{
-		store:          store,
-		vmm:            vmm,
-		metrics:        metrics,
-		log:            log,
-		specBuilder:    specBuilder,
-		newOwnerNodeID: newOwnerNodeID,
-		ledger:         ledger,
-		maxPerTick:     api.MigrateLiveMaxPerTick,
-		leaseSeconds:   api.MigrateLiveLeaseSeconds,
+	h := &MigrationHarness{
+		store:               store,
+		vmm:                 vmm,
+		metrics:             metrics,
+		log:                 log,
+		specBuilder:         specBuilder,
+		newOwnerNodeID:      newOwnerNodeID,
+		ledger:              ledger,
+		nodeCeilingResolver: nodeCeilingResolver,
+		maxPerTick:          api.MigrateLiveMaxPerTick,
+		leaseSeconds:        api.MigrateLiveLeaseSeconds,
 	}
+	// Resolve the destination's row ceiling/budget eagerly so a
+	// missing compute_nodes row surfaces at handoff time rather
+	// than silently over-admitting the destination (which is the
+	// exact regression the comment above is guarding against).
+	// nil resolver means "use the legacy fallback" — accepted for
+	// pre-multi-node test seams.
+	if nodeCeilingResolver != nil && newOwnerNodeID != "" {
+		ceilingMB, vcpuBudget, err := nodeCeilingResolver(ctx, newOwnerNodeID)
+		if err != nil {
+			log.Warn("sched: NewMigrationHarness: node ceiling resolve failed; falling back to global defaults",
+				"node_id", newOwnerNodeID, "err", err)
+		} else {
+			h.destinationCeilingMB = ceilingMB
+			h.destinationVCPUBudget = vcpuBudget
+		}
+	}
+	return h
 }
 
 // SetMaxPerTick overrides the per-batch cap (tests only). The
@@ -323,27 +368,30 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 	// KindMigration deliberately skips per-app concurrency (§6.2-1):
 	// the instance was already counted on the source node, so bumping
 	// on the destination would double-count and briefly cap an app
-	// that's mid-migration. The source ledger entry is released by
-	// the gateway's pg_notify listener on state='migrating' (see
-	// cmd/gatewayd-internal/backend.go:243-246). The reservation
-	// persists on Phase 4 success — the instance is now RUNNING on
-	// the destination and counts toward its ledger normally.
+	// that's mid-migration. The destination's per-node ceiling +
+	// vCPU budget come from the local compute_nodes row
+	// (h.newOwnerNodeRow — populated by the Engine at
+	// MigrateLiveInstances time, see engine.go:1810-1845); on a
+	// single-box deploy that row's AdmissionCeilingMB equals
+	// api.RAMAdmissionCeilingMB so the math collapses to the legacy
+	// box-wide ceiling (CLAUDE.md invariant 2). The source-side
+	// reservation is released by the source vmmd's Park/reaper path
+	// on the dying node — schedd's per-node ledger is per-process
+	// and the source's ledger lives on the source schedd, not here.
+	// The destination's reservation persists on Phase 4 success —
+	// the instance is now RUNNING on the destination and counts
+	// toward its ledger normally.
 	if err := h.ledger.Admit(Request{
-		Instance: instanceID,
-		RAMMB:    int(appSpec.MemSizeMiB),
-		VCPU:     int(appSpec.VCPUCount),
-		Kind:     KindMigration,
-		NodeID:   h.newOwnerNodeID,
+		Instance:    instanceID,
+		RAMMB:       int(appSpec.MemSizeMiB),
+		VCPU:        int(appSpec.VCPUCount),
+		Kind:        KindMigration,
+		NodeID:      h.newOwnerNodeID,
+		NodeCeilingMB: h.destinationCeilingMB,
+		VCPUBudget:    h.destinationVCPUBudget,
 		// AppID + Plan left zero-valued: KindMigration skips
 		// both the per-app concurrency check and the
 		// api.LimitsFor lookup (see admission.go Admit).
-		// NodeCeilingMB + VCPUBudget default to 0; the chooser
-		// wasn't run for migration so we don't have the row
-		// values in hand here. The ceiling fallback in
-		// ceilingForNode_locked returns the global
-		// api.RAMAdmissionCeilingMB so the per-node ceiling
-		// gate still fires — a future PR can thread the
-		// destination's row through Engine.MigrateLiveInstances.
 	}); err != nil {
 		// Phase 3 ledger refusal: destination has no headroom.
 		// Roll back Phase 2 + Phase 4 (same shape as wire
@@ -400,7 +448,14 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 			// Peer rollback / re-owner: the row was moved
 			// by a concurrent orchestrator. The dying vmmd
 			// still has the VM paused; tell it to abort
-			// (Phase 4 on the wire).
+			// (Phase 4 on the wire). Release the Phase 3
+			// ledger reservation first — same reasoning as
+			// the Phase 3 wire-failure path: the destination
+			// ledger must not over-count the rolled-back
+			// migration. No source-side ledger entry to
+			// release (the source's ledger lives on the
+			// source schedd process).
+			h.ledger.Release(instanceID)
 			h.metrics.LiveMigrationDecisions("conflict").Inc()
 			h.log.Debug("sched: migrate one: Phase 4 peer conflict",
 				"instance_id", instanceID,
@@ -410,6 +465,16 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 			return state.ErrConflict
 		}
 		if errors.Is(err, state.ErrNotFound) {
+			// Hard-deleted mid-flight; same Release reasoning
+			// as ErrConflict — the destination's per-node
+			// ledger still has the Phase 3 reservation
+			// (Admit succeeded; AdoptMigratedInstance
+			// returned an instanceID that the row no longer
+			// points at). Without Release, the next
+			// MigrateLiveInstances tick will see the
+			// destination's RAM headroom artificially
+			// depressed.
+			h.ledger.Release(instanceID)
 			h.log.Warn("sched: migrate one: Phase 4 instance gone",
 				"instance_id", instanceID,
 			)
@@ -419,8 +484,11 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 		// Anything else: lease expiry (ctx.DeadlineExceeded)
 		// or a transient DB error. Bump lease_expired on the
 		// context error; bump peer_failure on anything else
-		// (the operator can disambiguate via slog).
+		// (the operator can disambiguate via slog). Release
+		// runs first regardless — same invariant as the
+		// ErrConflict / ErrNotFound branches.
 		if errors.Is(err, leaseCtx.Err()) || errors.Is(err, context.DeadlineExceeded) {
+			h.ledger.Release(instanceID)
 			h.metrics.LiveMigrationDecisions("lease_expired").Inc()
 			h.log.Warn("sched: migrate one: Phase 4 lease expired",
 				"instance_id", instanceID,
@@ -430,6 +498,7 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 			_ = h.vmm.CancelLiveMigration(leaseCtx, fromNodeID, instanceID, prepared.LeaseToken)
 			return fmt.Errorf("sched: migrate one: phase 4 lease expired: %w", err)
 		}
+		h.ledger.Release(instanceID)
 		h.metrics.LiveMigrationDecisions("peer_failure").Inc()
 		h.log.Warn("sched: migrate one: Phase 4 commit failed",
 			"instance_id", instanceID,

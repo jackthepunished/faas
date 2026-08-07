@@ -38,6 +38,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -60,10 +61,33 @@ func stubSpecBuilder(_ context.Context, _ string) (AppSpec, error) {
 // MemStore + the supplied fakeVMM. Lease seconds is short (2s)
 // so the lease-expiry test runs quickly; maxPerTick is left at
 // the api default unless the caller overrides via SetMaxPerTick.
+// nodeCeilingResolver is nil by default so the harness uses the
+// legacy global ceiling fallback (api.RAMAdmissionCeilingMB /
+// api.VCPUSlots) — that mirrors pre-Tier-A5 test seams. Tests
+// that exercise the destination's per-node ceiling thread a stub
+// resolver via newHarnessForTestWithResolver.
 func newHarnessForTest(t *testing.T, store *state.MemStore, vmm *fakeVMM, ownerNodeID string) *MigrationHarness {
 	t.Helper()
 	ops := wire.NewOpsMetrics("schedd")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), ownerNodeID, stubSpecBuilder, NewNodeLedger())
+	h := NewMigrationHarness(t.Context(), store, vmm, ops, testLog(), ownerNodeID, stubSpecBuilder, NewNodeLedger(), nil)
+	h.SetLeaseSeconds(2)
+	return h
+}
+
+// newHarnessForTestWithResolver is the variant that wires a
+// resolver so the destination's per-node ceiling flows into the
+// Phase 3 ledger reservation. Used by
+// TestNewMigrationHarness_ThreadsDestinationCeiling.
+func newHarnessForTestWithResolver(
+	t *testing.T,
+	store *state.MemStore,
+	vmm *fakeVMM,
+	ownerNodeID string,
+	resolver func(ctx context.Context, nodeID string) (int, int, error),
+) *MigrationHarness {
+	t.Helper()
+	ops := wire.NewOpsMetrics("schedd")
+	h := NewMigrationHarness(t.Context(), store, vmm, ops, testLog(), ownerNodeID, stubSpecBuilder, NewNodeLedger(), resolver)
 	h.SetLeaseSeconds(2)
 	return h
 }
@@ -189,6 +213,160 @@ func TestMigrateOne_Phase3Fails(t *testing.T) {
 	}
 }
 
+// TestMigrateOne_Phase4FailureReleasesPhase3Reservation is the
+// regression test for the Phase 3 reservation leak that the
+// code-review flagged in PR #726. Every Phase 4 failure branch
+// (ErrConflict, ErrNotFound, lease_expired via
+// context.DeadlineExceeded, generic commit failure) must call
+// h.ledger.Release(instanceID) before returning, otherwise the
+// destination's per-node RAM + vCPU budget stays artificially
+// depressed across the next MigrateLiveInstances tick.
+//
+// Without the fix this test fails on the ResidentRAMForNode check
+// — the destination ledger still holds the 256 MB reservation
+// (stubSpecBuilder's MemSizeMiB + PerVMOverheadMB).
+//
+// We drive Phase 4 ErrConflict deterministically by mutating the
+// instance row inside fakeVMM.adoptHook, which runs AFTER Phase 3
+// succeeds (adoptRPC + ledger reservation are committed) and
+// BEFORE the orchestrator runs the Phase 4 conditional UPDATE.
+// The state machine's UpdateInstanceState flips the row out of
+// 'migrating', so the Phase 4 predicate matches zero rows and
+// MemStore returns ErrConflict. The ErrNotFound branch is
+// asserted by code inspection (the Release discipline is
+// identical across both branches and they share the same
+// pre-Release metric bump).
+func TestMigrateOne_Phase4FailureReleasesPhase3Reservation(t *testing.T) {
+	store := state.NewMemStore()
+	vmm := &fakeVMM{}
+	insID := seedInstanceForMigration(t, store, "dying")
+	// adoptHook fires AFTER AdoptMigratedInstance returns success
+	// (so Phase 3's ledger reservation is committed) and BEFORE
+	// the orchestrator runs the Phase 4 conditional UPDATE on
+	// state='migrating' + node_id='dying'. Flip the row out of
+	// 'migrating' so the predicate matches zero rows.
+	vmm.adoptHook = func(_ string) {
+		if err := store.UpdateInstanceState(context.Background(), insID, string(state.StateParked)); err != nil {
+			t.Fatalf("UpdateInstanceState: %v", err)
+		}
+	}
+	h := newHarnessForTest(t, store, vmm, "new-owner")
+
+	err := h.MigrateOne(context.Background(), insID, "dying")
+	if !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("MigrateOne: err = %v, want errors.Is(err, ErrConflict)", err)
+	}
+
+	// Phase 4 must have fired (the dying vmmd gets the cancel hint).
+	if vmm.cancels != 1 {
+		t.Errorf("cancels = %d, want 1 (Phase 4 rollback)", vmm.cancels)
+	}
+	// Phase 5 ack must NOT have fired (the row never flipped to
+	// 'running' on the destination).
+	if vmm.acks != 0 {
+		t.Errorf("acks = %d, want 0 (Phase 5 must not run after a Phase 4 failure)", vmm.acks)
+	}
+	// The Phase 3 reservation must be released. ResidentRAM for
+	// the destination node returns to 0 once the orphan
+	// reservation is freed; vCPU likewise; NodeCount drops to 0
+	// because the per-node counter is freed when both RAM and
+	// vCPU hit zero. Without the Release fix all three stay
+	// positive forever.
+	if got := h.ledger.ResidentRAMForNode("new-owner"); got != 0 {
+		t.Errorf("ResidentRAMForNode(new-owner) = %d, want 0 (Phase 3 reservation leaked)", got)
+	}
+	if got := h.ledger.UsedVCPUForNode("new-owner"); got != 0 {
+		t.Errorf("UsedVCPUForNode(new-owner) = %d, want 0 (Phase 3 reservation leaked)", got)
+	}
+	if got := h.ledger.NodeCount(); got != 0 {
+		t.Errorf("NodeCount = %d, want 0 (Phase 3 reservation leaked)", got)
+	}
+}
+
+// TestNewMigrationHarness_ThreadsDestinationCeiling pins the
+// Gap 2 fix: the destination's per-node ceiling + vCPU budget
+// must be threaded into the Phase 3 ledger reservation. Without
+// this, a heterogeneous fleet with one smaller destination gets
+// over-admitted (violating invariant §6.2-2).
+//
+// The first subtest asserts the resolver's (ceiling, vcpu) values
+// land on the harness fields and that a second Admit whose RAM
+// exceeds that ceiling is refused (proving the per-node gate,
+// not the global fallback, was hit). The second subtest pins
+// the resolver-error fallback: a broken resolver must NOT
+// silently panic or refuse the migration; the harness logs +
+// falls back to (0, 0) and the migration proceeds against the
+// global api.RAMAdmissionCeilingMB.
+func TestNewMigrationHarness_ThreadsDestinationCeiling(t *testing.T) {
+	// Ceiling is set to 320 MB so stubSpecBuilder's 256 MB spec
+	// (+ 8 MB overhead = 264 MB) fits on the first migration but
+	// leaves 56 MB of headroom — too tight for a second 264 MB
+	// admission (264 + 264 = 528 > 320). That proves the
+	// per-node ceiling gate fires from the resolver-supplied
+	// value rather than the global api.RAMAdmissionCeilingMB
+	// (47,600 MB) fallback.
+	const wantCeilingMB = 320
+	const wantVCPUBudget = 4
+	resolver := func(_ context.Context, nodeID string) (int, int, error) {
+		if nodeID != "new-owner" {
+			t.Errorf("resolver called with %q, want new-owner", nodeID)
+		}
+		return wantCeilingMB, wantVCPUBudget, nil
+	}
+
+	t.Run("threads_ceiling_into_reservation", func(t *testing.T) {
+		store := state.NewMemStore()
+		vmm := &fakeVMM{}
+		insID := seedInstanceForMigration(t, store, "dying")
+		h := newHarnessForTestWithResolver(t, store, vmm, "new-owner", resolver)
+
+		if err := h.MigrateOne(context.Background(), insID, "dying"); err != nil {
+			t.Fatalf("MigrateOne: %v", err)
+		}
+		if got := h.destinationCeilingMB; got != wantCeilingMB {
+			t.Errorf("destinationCeilingMB = %d, want %d (resolver value must be threaded)",
+				got, wantCeilingMB)
+		}
+		if got := h.destinationVCPUBudget; got != wantVCPUBudget {
+			t.Errorf("destinationVCPUBudget = %d, want %d (resolver value must be threaded)",
+				got, wantVCPUBudget)
+		}
+		// Second Admit with 260 MB — exceeds the remaining
+		// 320 - 264 = 56 MB headroom (260 + 8 = 268 > 56).
+		// The per-node ceiling gate must fire (not the
+		// global api.RAMAdmissionCeilingMB = 47,600).
+		err := h.ledger.Admit(Request{
+			Instance: "refuse-2", AppID: "app-refuse", Plan: api.PlanHobby,
+			RAMMB: 260, VCPU: 1, Kind: KindWake,
+			NodeID: "new-owner", NodeCeilingMB: wantCeilingMB, VCPUBudget: wantVCPUBudget,
+			MaxConcurrency: 5,
+		})
+		if err == nil {
+			t.Errorf("second Admit: err = nil, want per-node ceiling refusal")
+		}
+	})
+
+	t.Run("resolver_error_falls_back_to_global_defaults", func(t *testing.T) {
+		store := state.NewMemStore()
+		vmm := &fakeVMM{}
+		brokenResolver := func(_ context.Context, _ string) (int, int, error) {
+			return 0, 0, errors.New("simulated store lookup failure")
+		}
+		insID := seedInstanceForMigration(t, store, "dying")
+		h := newHarnessForTestWithResolver(t, store, vmm, "new-owner", brokenResolver)
+
+		if err := h.MigrateOne(context.Background(), insID, "dying"); err != nil {
+			t.Fatalf("MigrateOne with broken resolver: %v (want success — fallback to global defaults)", err)
+		}
+		if got := h.destinationCeilingMB; got != 0 {
+			t.Errorf("destinationCeilingMB = %d, want 0 (resolver failure falls back)", got)
+		}
+		if got := h.destinationVCPUBudget; got != 0 {
+			t.Errorf("destinationVCPUBudget = %d, want 0 (resolver failure falls back)", got)
+		}
+	})
+}
+
 func TestMigrateOne_LeaseExpires(t *testing.T) {
 	store := state.NewMemStore()
 	// sleepFor > leaseSeconds (2s) so the lease-bounded context
@@ -214,10 +392,10 @@ func TestMigrateOne_SpecBuilderError(t *testing.T) {
 	vmm := &fakeVMM{}
 	insID := seedInstanceForMigration(t, store, "dying")
 	ops := wire.NewOpsMetrics("schedd")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner",
+	h := NewMigrationHarness(context.Background(), store, vmm, ops, testLog(), "new-owner",
 		func(_ context.Context, _ string) (AppSpec, error) {
 			return AppSpec{}, errors.New("simulated spec build failure")
-		}, NewNodeLedger())
+		}, NewNodeLedger(), nil)
 	h.SetLeaseSeconds(2)
 
 	err := h.MigrateOne(context.Background(), insID, "dying")
@@ -244,8 +422,8 @@ func TestMigrateOne_NilSpecBuilderPanics(t *testing.T) {
 			t.Fatalf("NewMigrationHarness(nil specBuilder) did not panic")
 		}
 	}()
-	_ = NewMigrationHarness(state.NewMemStore(), &fakeVMM{}, wire.NewOpsMetrics("schedd"),
-		testLog(), "new-owner", nil, NewNodeLedger())
+	_ = NewMigrationHarness(context.Background(), state.NewMemStore(), &fakeVMM{}, wire.NewOpsMetrics("schedd"),
+		testLog(), "new-owner", nil, NewNodeLedger(), nil)
 }
 
 // readLiveMigrationDecision scrapes the closed-set
@@ -281,7 +459,7 @@ func TestMigrateOne_MetricOutcomeMigrated(t *testing.T) {
 	vmm := &fakeVMM{}
 	ops := wire.NewOpsMetrics("schedd")
 	insID := seedInstanceForMigration(t, store, "dying")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger())
+	h := NewMigrationHarness(context.Background(), store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger(), nil)
 	h.SetLeaseSeconds(2)
 
 	if err := h.MigrateOne(context.Background(), insID, "dying"); err != nil {
@@ -297,7 +475,7 @@ func TestMigrateOne_MetricOutcomePeerFailure(t *testing.T) {
 	vmm := &fakeVMM{adoptErr: errors.New("Restore failed")}
 	ops := wire.NewOpsMetrics("schedd")
 	insID := seedInstanceForMigration(t, store, "dying")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger())
+	h := NewMigrationHarness(context.Background(), store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger(), nil)
 	h.SetLeaseSeconds(2)
 
 	if err := h.MigrateOne(context.Background(), insID, "dying"); err == nil {
@@ -319,7 +497,7 @@ func TestMigrateOne_MetricOutcomeConflict(t *testing.T) {
 	if err := store.UpdateInstanceState(context.Background(), insID, string(state.StateParked)); err != nil {
 		t.Fatalf("UpdateInstanceState: %v", err)
 	}
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger())
+	h := NewMigrationHarness(context.Background(), store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger(), nil)
 	h.SetLeaseSeconds(2)
 
 	if err := h.MigrateOne(context.Background(), insID, "dying"); !errors.Is(err, state.ErrConflict) {
