@@ -1340,6 +1340,34 @@ func (c *Client) GetAppsMetrics(ctx context.Context, rng string) (AppsMetricsRes
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// GetAppSLO returns the per-app SLO panel for slug over the
+// named SLO window. window is one of "1h", "24h", "7d"
+// (strict subset of the /metrics vocabulary) — empty
+// falls back to the server's default (24h). Issue #696 /
+// ADR-082. Distinct from GetAppMetrics (issue #273 /
+// ADR-042) which is the 5m-window dashboard panel.
+func (c *Client) GetAppSLO(ctx context.Context, slug, window string) (AppSLOResponse, error) {
+	var out AppSLOResponse
+	path := "/v1/apps/" + slug + "/slo"
+	if window != "" {
+		path += "?window=" + window
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// GetAccountSLO returns the account-wide SLO rollup over
+// the named SLO window. Flat scalar response (no per-app
+// map). window follows the same closed vocabulary as the
+// per-app endpoint. Issue #696 / ADR-082.
+func (c *Client) GetAccountSLO(ctx context.Context, window string) (AccountSLOResponse, error) {
+	var out AccountSLOResponse
+	path := "/v1/account/slo"
+	if window != "" {
+		path += "?window=" + window
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // UsageSummary returns the account-wide monthly roll-up
 // (used_gb_hours, included_gb_hours, overage_gb_hours, overage_cents).
 // Distinct from GetUsage which returns per-app rows; empty month falls

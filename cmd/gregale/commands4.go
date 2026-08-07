@@ -26,7 +26,7 @@ import (
 // cmdAccount dispatches `gregale account <subcommand>`.
 func cmdAccount(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale account {export|delete|restore|status}", "account")
+		PrintUsage(os.Stderr, "usage: gregale account {export|delete|restore|status|slo}", "account")
 		return 1
 	}
 	switch args[0] {
@@ -38,6 +38,10 @@ func cmdAccount(args []string) int {
 		return cmdAccountRestore(args[1:])
 	case statusLiteral:
 		return cmdAccountStatus(args[1:])
+	case "slo":
+		// Move 2 PR-A: CLI twin for GET /v1/account/slo
+		// (issue #696 / ADR-082). Account-wide SLO rollup.
+		return cmdAccountSLO(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "gregale account: unknown subcommand %q\n", args[0])
 		return 1

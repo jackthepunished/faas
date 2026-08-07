@@ -2224,6 +2224,30 @@ type Store interface {
 	// day is a UTC midnight time; the returned rows cover the
 	// single day. Empty when no rollup has fired yet. ADR-048 §5.
 	UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error)
+	// UsageSLOForApp returns instance_hours and gb_hours
+	// summed across usage_minutes for the given app over the
+	// half-open UTC range [start, end). Powers the
+	// GET /v1/apps/{slug}/slo endpoint (issue #696 / ADR-082).
+	//
+	// Cross-account isolation is enforced at the SQL level by
+	// pinning BOTH `m.app_id = $1` AND `a.account_id = $2`. The
+	// caller (cmd/apid/handlers_slo.go) reads `acct.ID` from the
+	// session token and passes it here — so any future caller
+	// that bypasses loadApp (an operator-side SLO aggregate, an
+	// internal cron, a refactor that passes a fetched app_id from
+	// a different account's context) cannot leak another
+	// account's instance_hours / gb_hours. The JOIN to apps
+	// rejects rows whose app_id does not resolve, which is
+	// impossible by schema (NOT NULL FK on usage_minutes.app_id
+	// to apps.id).
+	//
+	// Returns (0, 0, nil) when no rows fall in the window.
+	UsageSLOForApp(ctx context.Context, appID, accountID string, start, end time.Time) (instanceHours, gbHours float64, err error)
+	// UsageSLOForAccount is the account-wide rollup of
+	// UsageSLOForApp. Powers GET /v1/account/slo. The pgstore
+	// restrains by account_id at the SQL level (no handler-side
+	// cross-account leak).
+	UsageSLOForAccount(ctx context.Context, accountID string, start, end time.Time) (instanceHours, gbHours float64, err error)
 	// AppendSnapshotStorage writes a snapshot_storage_daily row
 	// for the given (account, app, day). Idempotent on PK
 	// (account_id, app_id, day): a redelivered tick or a meterd

@@ -8511,6 +8511,94 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 	return out, rows.Err()
 }
 
+// UsageSLOForApp returns the customer-facing SLO rollup
+// (instance_hours, gb_hours) for one app over the half-open
+// UTC range [start, end). Powers GET /v1/apps/{slug}/slo
+// (issue #696 / ADR-082).
+//
+// Defensive cross-account: the SQL filters on BOTH
+// `m.app_id = $1` AND `a.account_id = $2`. The handler
+// passes the account_id read from the session token
+// (cmd/apid/handlers_slo.go:78) so any future caller that
+// bypasses loadApp — an operator-side SLO aggregate, an
+// internal cron, a refactor that passes a fetched app_id
+// from a different account's context — cannot leak the
+// other account's instance_hours / gb_hours. The JOIN to
+// apps is a schema-anchored existence check (NOT NULL FK
+// on usage_minutes.app_id guarantees the row resolves).
+//
+// Math:
+//   - instance_hours = COUNT(*) / 60
+//     usage_minutes is one row per (instance_id, minute).
+//     Each row represents one minute of "the instance was
+//     alive and accounted for in meterd's sampler". So
+//     COUNT(*) over the window is instance-minutes, and
+//     / 60 converts to instance-hours.
+//   - gb_hours = SUM(mb_seconds) / 3600 / 1024
+//     mb_seconds is the per-minute ram_mb × 60 snapshot
+//     (the actual RAM.billable_seconds counter, per the
+//     schema comment on usage_minutes.mb_seconds). Sum
+//     across the window is mb-seconds; / 3600 = mb-hours;
+//     / 1024 = GB-hours. Matches the meterd pusher's
+//     Math.GBHours shape (pkg/meter/pusher.go). The
+//     per-instance × per-minute sampling granularity
+//     matters here — a Scale customer running 20
+//     instances sees the same number as 20 instances × 1
+//     minute, not 1 instance × 20 minutes.
+//
+// Returns (0, 0, nil) when no rows fall in the window
+// (cold account, no usage yet, or the window is entirely
+// in the future). The handler treats that as "empty
+// SLO panel" — the partial-population degraded path
+// when the PromQL also failed is the one that surfaces
+// "0" with a "degraded:" source.
+//
+// builder_seconds / builder_kind are intentionally NOT
+// counted here — runtime GB-RAM-hour billing is
+// unchanged by the SLO surface. The meterd pusher
+// (pkg/meter/pusher.go::Math.GBHours) also excludes
+// them, so the SLO number and the billed number stay
+// consistent.
+func (s *PgStore) UsageSLOForApp(ctx context.Context, appID, accountID string, start, end time.Time) (float64, float64, error) {
+	var instanceHours, gbHours float64
+	err := s.pool.QueryRow(ctx,
+		`select coalesce(count(*)::float8 / 60.0, 0),
+		        coalesce(sum(mb_seconds)::float8 / 3600.0 / 1024.0, 0)
+		   from usage_minutes m
+		   join apps a on a.id = m.app_id
+		  where m.app_id = $1
+		    and a.account_id = $2
+		    and m.minute >= $3
+		    and m.minute <  $4`,
+		appID, accountID, start.UTC(), end.UTC()).Scan(&instanceHours, &gbHours)
+	if err != nil {
+		return 0, 0, err
+	}
+	return instanceHours, gbHours, nil
+}
+
+// UsageSLOForAccount is the account-wide SLO rollup of
+// UsageSLOForApp. Powers GET /v1/account/slo. Same math,
+// broader scope. The account_id is in the WHERE clause
+// (no handler-side cross-account leak; the pgstore is the
+// only place the rollup touches the table).
+func (s *PgStore) UsageSLOForAccount(ctx context.Context, accountID string, start, end time.Time) (float64, float64, error) {
+	var instanceHours, gbHours float64
+	err := s.pool.QueryRow(ctx,
+		`select coalesce(count(*)::float8 / 60.0, 0),
+		        coalesce(sum(mb_seconds)::float8 / 3600.0 / 1024.0, 0)
+		   from usage_minutes m
+		   join apps a on a.id = m.app_id
+		  where a.account_id = $1
+		    and m.minute >= $2
+		    and m.minute <  $3`,
+		accountID, start.UTC(), end.UTC()).Scan(&instanceHours, &gbHours)
+	if err != nil {
+		return 0, 0, err
+	}
+	return instanceHours, gbHours, nil
+}
+
 // AppendSnapshotStorage upserts one snapshot_storage_daily row.
 // NOT additive merge: the storage rollup is a point-in-time snapshot
 // of the current snapshot+layer bytes (pkg/meter/storage.go computes

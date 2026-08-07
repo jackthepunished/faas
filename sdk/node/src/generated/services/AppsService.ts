@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { AppMetricsResponse } from '../models/AppMetricsResponse.js';
 import type { AppResponse } from '../models/AppResponse.js';
+import type { AppSLOResponse } from '../models/AppSLOResponse.js';
 import type { AppsMetricsResponse } from '../models/AppsMetricsResponse.js';
 import type { CreateAppRequest } from '../models/CreateAppRequest.js';
 import type { RenameAppRequest } from '../models/RenameAppRequest.js';
@@ -206,6 +207,67 @@ export class AppsService {
       },
       query: {
         'range': range,
+      },
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Per-app customer-facing SLO panel (issue
+   * Closed-set windowed SLO panel for one app — the
+   * customer-facing equivalent of AWS CloudWatch
+   * per-function / GCP Cloud Run per-service. Distinct from
+   * `GET /v1/apps/{slug}/metrics` (issue #273 / ADR-042) which
+   * is the 5m-window dashboard panel. The /slo surface is the
+   * "yesterday's SLO" / "this week's SLO" summary, with the
+   * customer-facing SLO signals co-located with the
+   * billing-derivable `instance_hours` / `gb_hours` fields.
+   *
+   * The `window` parameter is a closed vocabulary, a strict
+   * subset of the /metrics range vocabulary:
+   *
+   * `1h` | `24h` (default) | `7d`
+   *
+   * `wake_queue_p95_ms` is the FLEET p95
+   * (`gateway_wake_queue_wait_seconds` is unlabeled). On
+   * Prometheus failure the endpoint returns 200 with zeroed
+   * fields and `source: "degraded: <reason>"`, matching the
+   * public status page contract. When Postgres is down but
+   * the PromQL pass succeeded, only `instance_hours` /
+   * `gb_hours` are zeroed and `source` is
+   * `"degraded: postgres unavailable"`.
+   *
+   * @returns AppSLOResponse The SLO panel.
+   * @throws ApiError
+   */
+  public static getAppSlo({
+    slug,
+    window = '24h',
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Window for the per-app SLO panel. Default `24h`.
+     */
+    window?: '1h' | '24h' | '7d',
+  }): CancelablePromise<AppSLOResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/slo',
+      path: {
+        'slug': slug,
+      },
+      query: {
+        'window': window,
       },
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,

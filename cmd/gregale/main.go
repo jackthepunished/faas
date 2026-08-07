@@ -66,6 +66,7 @@ Commands:
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets on an app (--app <slug>)
   sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
+  slo          Per-app SLO panel (gregale slo <slug> [--window 24h])
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
   trusted-publishers  Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
@@ -259,6 +260,12 @@ func run(args []string) int {
 		// Same data shape the dashboard panel renders, in the
 		// terminal where the rest of the debugging happens.
 		return cmdMetrics(args[1:])
+	case "slo":
+		// Move 2 PR-A: CLI twin for GET /v1/apps/{slug}/slo
+		// (issue #696 / ADR-082). Closed-set windowed SLO
+		// panel (1h | 24h | 7d) — distinct from `metrics` which
+		// is the 5m dashboard panel.
+		return cmdSLO(args[1:])
 	case "queue":
 		return cmdQueueDispatch(args[1:])
 	case "mfa":
