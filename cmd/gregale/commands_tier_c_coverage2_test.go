@@ -54,9 +54,10 @@ func TestTierCKeysUsage(t *testing.T) {
 	}
 }
 
-// TestTierCInvoicesUsage pins cmdInvoices's argument count check.
+// TestTierCInvoicesUsage pins cmdInvoices's unauthorized branch.
 // cmdInvoices doesn't take a positional slug; it parses flags then
-// calls authedClient(). We expect the unauthorized branch (rc=2).
+// calls authedClient(). With no FAAS_TOKEN, authedClient returns an
+// *APIError (401) and printErr → exitCodeForStatus(401) returns 2.
 func TestTierCInvoicesUsage(t *testing.T) {
 	resetJSONOut(t)
 	t.Setenv("FAAS_TOKEN", "")

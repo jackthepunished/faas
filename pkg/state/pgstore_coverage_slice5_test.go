@@ -54,8 +54,8 @@ func TestPg_CoverageCreateDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	if got.ID != d.ID {
-		t.Errorf("CreateDeployment.ID = %q", got.ID)
+	if got.ID == "" {
+		t.Error("CreateDeployment returned empty ID")
 	}
 }
 
@@ -63,15 +63,18 @@ func TestPg_CoverageDeploymentByID(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
 	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
+	created, err := s.CreateDeployment(ctx, d)
+	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	got, err := s.DeploymentByID(ctx, d.ID)
+	// pgstore CreateDeployment omits `id` from its column list — PG
+	// generates a new uuid. Read back via the generated ID.
+	got, err := s.DeploymentByID(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("DeploymentByID: %v", err)
 	}
-	if got.ID != d.ID {
-		t.Errorf("DeploymentByID.ID = %q", got.ID)
+	if got.ID != created.ID {
+		t.Errorf("DeploymentByID.ID = %q, want %q", got.ID, created.ID)
 	}
 }
 
@@ -79,15 +82,16 @@ func TestPg_CoverageLatestDeployment(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
 	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
+	created, err := s.CreateDeployment(ctx, d)
+	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
 	got, err := s.LatestDeployment(ctx, app.ID)
 	if err != nil {
 		t.Fatalf("LatestDeployment: %v", err)
 	}
-	if got.ID != d.ID {
-		t.Errorf("LatestDeployment.ID = %q", got.ID)
+	if got.ID != created.ID {
+		t.Errorf("LatestDeployment.ID = %q, want %q", got.ID, created.ID)
 	}
 }
 

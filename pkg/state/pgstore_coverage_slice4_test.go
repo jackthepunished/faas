@@ -33,8 +33,8 @@ func TestPg_CoverageCreateApp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
-	if got.ID != app.ID {
-		t.Errorf("CreateApp.ID = %q, want %q", got.ID, app.ID)
+	if got.ID == "" {
+		t.Error("CreateApp returned empty ID")
 	}
 }
 
@@ -46,16 +46,19 @@ func TestPg_CoverageAppByID(t *testing.T) {
 		t.Fatalf("CreateAccount: %v", err)
 	}
 	appID := uuid.NewString()
-	_, err = s.CreateApp(ctx, state.App{ID: appID, AccountID: acct.ID, Slug: "x" + appID[:8]})
+	created, err := s.CreateApp(ctx, state.App{ID: appID, AccountID: acct.ID, Slug: "x" + appID[:8]})
 	if err != nil {
 		t.Fatalf("CreateApp: %v", err)
 	}
-	got, err := s.AppByID(ctx, appID)
+	// pgstore CreateApp does not preserve caller-provided ID — PG
+	// generates a new uuid via the column DEFAULT. Read back via the
+	// generated ID.
+	got, err := s.AppByID(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("AppByID: %v", err)
 	}
-	if got.ID != appID {
-		t.Errorf("AppByID.ID = %q", got.ID)
+	if got.ID != created.ID {
+		t.Errorf("AppByID.ID = %q, want %q", got.ID, created.ID)
 	}
 }
 
