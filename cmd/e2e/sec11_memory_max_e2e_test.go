@@ -168,7 +168,7 @@ func TestSec11_MemoryMaxFenceEnforced_CrossProcess(t *testing.T) {
 	if _, err := e2etest.WaitForInstanceState(ctx, t, pool, appID, state.StateRunning, 60*time.Second); err != nil {
 		t.Fatalf("no running instance: %v", err)
 	}
-	scopeBase := filepath.Join("/sys/fs/cgroup", fcvm.ParentCgroup)
+	scopeBase := filepath.Join("/sys/fs/cgroup", fcvm.ParentCgroupRoot)
 	entries, err := os.ReadDir(scopeBase)
 	if err != nil {
 		t.Fatalf("read %s: %v (parent cgroup constant drift? pkg/fcvm/config.go:ParentCgroup)", scopeBase, err)

@@ -143,7 +143,7 @@ func TestMetalStats_PollerObservesCgroupDeltaAcrossTicks(t *testing.T) {
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, 100_000, 128*1024*1024)
 	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join("/sys/fs/cgroup", "faas-tenant.slice", instance)) })
 
-	first, ok := reader.Sample(instance)
+	first, ok := reader.Sample(instance, "")
 	if !ok {
 		t.Fatal("first sample returned ok=false")
 	}
@@ -153,7 +153,7 @@ func TestMetalStats_PollerObservesCgroupDeltaAcrossTicks(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, first.CPUUsageUsec+100_000, 192*1024*1024)
 
-	second, ok := reader.Sample(instance)
+	second, ok := reader.Sample(instance, "")
 	if !ok {
 		t.Fatal("second sample returned ok=false")
 	}
@@ -221,7 +221,7 @@ func TestMetalStats_PollerSurvivesConcurrentInstanceGrowth(t *testing.T) {
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		for _, id := range ids {
-			if _, ok := reader.Sample(id); !ok {
+			if _, ok := reader.Sample(id, ""); !ok {
 				close(stop)
 				wg.Wait()
 				t.Fatalf("Sample(%s) returned ok=false under contention — reader lost a cgroup tree", id)
@@ -252,7 +252,7 @@ func TestMetalStats_RSSRisesOnAllocation(t *testing.T) {
 
 	// Step 1: cold — RSS at zero.
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, 0, 0)
-	cold, ok := reader.Sample(instance)
+	cold, ok := reader.Sample(instance, "")
 	if !ok {
 		t.Fatal("cold Sample returned ok=false")
 	}
@@ -263,7 +263,7 @@ func TestMetalStats_RSSRisesOnAllocation(t *testing.T) {
 	// Step 2: warm — RSS at 128 MiB (simulates guest-init +
 	// runtime + node_modules loaded).
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, 0, 128*1024*1024)
-	warm, ok := reader.Sample(instance)
+	warm, ok := reader.Sample(instance, "")
 	if !ok {
 		t.Fatal("warm Sample returned ok=false")
 	}
@@ -273,7 +273,7 @@ func TestMetalStats_RSSRisesOnAllocation(t *testing.T) {
 
 	// Step 3: hot — RSS at 384 MiB (simulates runtime spike).
 	writeCgroupInstance(t, "/sys/fs/cgroup", instance, 0, 384*1024*1024)
-	hot, ok := reader.Sample(instance)
+	hot, ok := reader.Sample(instance, "")
 	if !ok {
 		t.Fatal("hot Sample returned ok=false")
 	}
