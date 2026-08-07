@@ -72,7 +72,8 @@ type OCIRegistryStorageBackend struct {
 	// callers on the same scope coalesce into one round-trip (issue
 	// #96 review finding #6). Maps scope → chan refreshResult. The
 	// channel has capacity 1 so the producer never blocks.
-	inFlight sync.Map
+	inFlight  sync.Map
+	refreshMu sync.Mutex
 }
 
 // cachedToken is the bearer cache entry. issuedAt is when FetchToken
@@ -1213,47 +1214,44 @@ func (o *OCIRegistryStorageBackend) bearer(ctx context.Context, scope string) (s
 // near-expiry token would issue N refresh round-trips; with it they
 // share one.
 //
-// Race note: a goroutine that observes the cached token as expired
-// but arrives at inFlight AFTER the producer's done-channel close
-// and inFlight delete must NOT spin up a second POST. The
-// post-LoadOrStore cache re-check short-circuits that case — the
-// producer populated the cache before deleting the entry, so a fresh
-// entry is always visible to late arrivals.
+// The refresh mutex makes the cache re-check, flight admission, result
+// publication, and flight deletion one coordinated state transition.
+// This prevents a late caller that observed the old expired entry from
+// starting a second refresh after the producer has completed.
 func (o *OCIRegistryStorageBackend) singleFlightRefresh(ctx context.Context, scope, refreshToken, realm string, auth *oci.BasicAuth) (string, error) {
+	o.refreshMu.Lock()
+	if fresh, ok := o.freshCachedAccessToken(scope); ok {
+		o.refreshMu.Unlock()
+		return fresh, nil
+	}
 	// LoadOrStore: the first goroutine wins the producer slot; every
 	// other goroutine on this scope sees the existing flight and waits
-	// on its done channel. We construct the flight inside the closure
-	// so the loser never allocates one.
+	// on its done channel. The mutex keeps the cache re-check and flight
+	// admission atomic, closing the late-arrival window between a
+	// producer's cache publication and flight deletion.
 	flight := &refreshFlight{done: make(chan refreshResult, 1)}
 	if existing, ok := o.inFlight.LoadOrStore(scope, flight); ok {
 		flight = existing.(*refreshFlight)
+		o.refreshMu.Unlock()
 	} else {
-		// We're the producer. Run the POST, populate the cache, and
-		// close the done channel under sync.Once so a future refactor
-		// that re-enters the closure is safe. Defer the inFlight
-		// cleanup so a panicking RefreshToken still unblocks followers.
-		defer o.inFlight.Delete(scope)
+		o.refreshMu.Unlock()
+
 		tok, err := oci.RefreshToken(ctx, o.hc, o.ua, realm, refreshToken, auth)
-		flight.once.Do(func() {
-			if err != nil {
-				flight.result = refreshResult{err: err}
-			} else {
-				o.tokenCache.Store(scope, cachedToken{
-					tok:      tok,
-					issuedAt: time.Now(),
-					realmURL: realm,
-				})
-				flight.result = refreshResult{token: tok.AccessToken}
-			}
-			close(flight.done)
-		})
+		o.refreshMu.Lock()
+		if err != nil {
+			flight.result = refreshResult{err: err}
+		} else {
+			o.tokenCache.Store(scope, cachedToken{
+				tok:      tok,
+				issuedAt: time.Now(),
+				realmURL: realm,
+			})
+			flight.result = refreshResult{token: tok.AccessToken}
+		}
+		close(flight.done)
+		o.inFlight.Delete(scope)
+		o.refreshMu.Unlock()
 	}
-	// All paths converge here: wait for the producer's result, then
-	// re-check the cache. The re-check catches the case where a fast
-	// producer populated the cache before this goroutine arrived at
-	// LoadOrStore, and any goroutine that wins the LoadOrStore race
-	// but arrives after Delete (and a fresh Store) sees the fresh
-	// cache and skips the producer's broadcast.
 	<-flight.done
 	if fresh, ok := o.freshCachedAccessToken(scope); ok {
 		return fresh, nil
@@ -1278,11 +1276,8 @@ func (o *OCIRegistryStorageBackend) freshCachedAccessToken(scope string) (string
 }
 
 // refreshFlight carries the single-flight state for a scope. done is
-// buffered so the producer never blocks on the close path; the
-// underlying sync.Once guards the producer side (we publish exactly
-// once even if a future refactor adds a second send site).
+// buffered so the producer never blocks on the close path.
 type refreshFlight struct {
-	once   sync.Once
 	done   chan refreshResult
 	result refreshResult
 }
