@@ -27,12 +27,9 @@
 # + provisioning write API) over plaintext. Asserted at task time.
 
 gv_version: "11.3.1"
-# SHA-256 of grafana-<version>.linux-amd64.tar.gz (or of the
-# installed /usr/sbin/grafana-server binary after apt install).
-# Compute with: `sha256sum /usr/sbin/grafana-server` on the
-# provisioning host. The role asserts against this value before
-# any templates render.
-gv_release_sha256: "REPLACE_WITH_SHA256_OF_v11.3.1_GRAFANA_SERVER"
+# SHA-256 of grafana-11.3.1.linux-amd64.tar.gz from dl.grafana.com.
+# The role asserts against this value before any templates render.
+gv_release_sha256: "cd426520532ee22582c4bcdc898ee33dd15f540b3ed0f9add0e1a09f4db2823b"
 gv_listen_addr: "10.0.0.1:3000"
 gv_data_dir: /var/lib/grafana
 gv_config_path: /etc/grafana/grafana.ini

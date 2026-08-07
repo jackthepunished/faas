@@ -12,7 +12,8 @@
 //   - pkg/httpsec outer wrapper (HSTS / CSP nonce / X-Frame-Options /
 //     Referrer-Policy / X-Content-Type-Options / Permissions-Policy)
 //   - /healthz, /readyz, /metrics on loopback FAAS_PUBLIC_CONTROL_ADDR
-//     (default 127.0.0.1:9090)
+//     (default 127.0.0.1:9092 — ADR-070; the legacy gatewayd daemon
+//     owns :9090 and must not collide on the same node)
 //   - Drain semantics: SIGTERM → flip /readyz → wait in-flight → Shutdown
 //
 // It does NOT own:
@@ -79,9 +80,10 @@ const (
 	// /run/faas tmpfs (the SOLE RuntimeDirectory=faas).
 	defaultInternalSocket = "/run/faas/gatewayd-internal.sock"
 	// defaultPublicControlAddr is the loopback control plane
-	// (/healthz, /readyz, /metrics). Loopback (not :9090) because
-	// the legacy gatewayd daemon binds :9090.
-	defaultPublicControlAddr = "127.0.0.1:9090"
+	// (/healthz, /readyz, /metrics). Pinned at :9092 per ADR-070
+	// (Tier A7 edge split); the legacy gatewayd daemon owns :9090
+	// and must not collide on the same node.
+	defaultPublicControlAddr = "127.0.0.1:9092"
 )
 
 // gatewaydPublicCapCheck is the DEPLOY-1 / ADR-075 capdecl gate
@@ -246,7 +248,10 @@ func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 }
 
 // buildServers constructs the plain-HTTP public + loopback control
-// servers.
+// servers. Both pin MaxHeaderBytes to api.DefaultMaxHeaderBytes
+// (1 MiB) so a future stdlib default change cannot widen the
+// attack surface on this listener; the value mirrors stdlib's
+// historical 1 MiB ceiling.
 func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux) (*http.Server, *http.Server) {
 	publicSrv := &http.Server{
 		Addr:              listenAddr,
@@ -254,11 +259,13 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      300 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
 	}
 	controlSrv := &http.Server{
 		Addr:              controlAddr,
 		Handler:           controlMux,
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
 	}
 	return publicSrv, controlSrv
 }

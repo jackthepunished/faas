@@ -1863,6 +1863,13 @@ const (
 	// support (CONFIG_NF_CONNTRACK_NET_NS=n). The egress tc cap is
 	// unaffected.
 	ConntrackCap = DefaultConntrackCap
+
+	// DefaultMaxHeaderBytes caps the http.Server header size on the
+	// gatewayd-public listeners (public + control). It mirrors stdlib's
+	// historical 1 MiB default but pins it so a future stdlib default
+	// change cannot widen the attack surface on this listener; a single
+	// tenant-crafted 1 MiB header is fine, 64 MiB is not.
+	DefaultMaxHeaderBytes = 1 << 20 // 1 MiB
 )
 
 // DefaultComputeNodeCeilingMB is the per-compute-node admission ceiling
