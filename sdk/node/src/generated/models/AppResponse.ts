@@ -41,6 +41,10 @@ export type AppResponse = {
    */
   streaming_enabled?: boolean;
   /**
+   * Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Default-on for Hobby/Pro/Scale; Free customers always see this as false. PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed.
+   */
+  websocket_enabled?: boolean;
+  /**
    * Per-app scaling policy (issue #462 / ADR-058). null = legacy row, project the empty-policy shape from min_instances / max_concurrency. Non-null = customer-authored policy persisted to the jsonb column `apps.scaling_policy`.
    */
   scaling_policy?: (null | ScalingPolicy);
