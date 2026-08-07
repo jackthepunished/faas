@@ -126,6 +126,14 @@ const (
 	publicAuthModeBasic  = "basic"
 )
 
+// docsTypeBase is the canonical docs path prefix for problem
+// `type:` URLs emitted from the gateway (RFC 7807 §3.1). Sourced
+// from wire.DocsHost so a rotation only edits pkg/wire/docs.go,
+// not this file. Distinct from pkg/api's `docsBase` because the
+// gateway emits problem types (full URN-shaped slugs) rather
+// than topic-path docs URLs.
+var docsTypeBase = "https://" + wire.DocsHost + "/errors"
+
 // Authn-failure reason taxonomy (issue #560 + issue #477).
 // The strings land on the `reason` field of the audit row
 // emitted by enforceRequireAuthn and enforcePublicAuth,
@@ -1350,7 +1358,7 @@ func (h *Handler) writeWebSocketNotAllowed(w http.ResponseWriter, appID string, 
 	if forwarderMissing {
 		detail = "This deployment has the WebSocket / Upgrade-traffic raw-bytes bridge disabled."
 	}
-	body := fmt.Sprintf(`{"type":"https://docs.gregale.dev/errors/plan_websocket_not_allowed","title":"WebSocket not enabled on this app or plan","status":501,"detail":%q,"code":"plan_websocket_not_allowed","app_id":%q}`, detail, appID)
+	body := fmt.Sprintf(`{"type":"`+docsTypeBase+`/plan_websocket_not_allowed","title":"WebSocket not enabled on this app or plan","status":501,"detail":%q,"code":"plan_websocket_not_allowed","app_id":%q}`, detail, appID)
 	w.WriteHeader(http.StatusNotImplemented)
 	_, _ = fmt.Fprint(w, body)
 }

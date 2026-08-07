@@ -30,6 +30,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // publicAuthBasicSealNamespace is the secretbox namespace tag
@@ -3015,7 +3016,7 @@ func parseInvoiceListParams(r *http.Request) (month *time.Time, before time.Time
 			return nil, time.Time{}, 0, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 				"Bad limit", "expected 1..100").
 				WithLimit(int64(limitMax), observed).
-				WithDocs("https://docs.gregale.dev/billing#invoices")
+				WithDocs("https://" + wire.DocsHost + "/billing#invoices")
 		}
 		limit = n
 	}
