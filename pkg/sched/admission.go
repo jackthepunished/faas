@@ -78,6 +78,28 @@ func NewNodeLedger() *NodeLedger {
 // name. New code should call NewNodeLedger.
 func NewLedger() *NodeLedger { return NewNodeLedger() }
 
+// Kind discriminates the reservation shape so the ledger honours the
+// right invariants per request class. The default zero value
+// (KindWake) preserves byte-compatibility with pre-Tier-A5 callers —
+// every existing Admit site that builds a literal Request struct gets
+// KindWake and the per-app concurrency path runs unchanged.
+type Kind uint8
+
+const (
+	// KindWake (default) is a standard wake-side reservation: counts
+	// toward per-app concurrency (§6.2-1), per-node RAM (§6.2-2),
+	// and per-node vCPU. Used by Wake / AdmitInstance.
+	KindWake Kind = iota
+	// KindMigration is a Tier A5 cross-node live-instance handoff
+	// reservation: counts toward per-node RAM and vCPU (§6.2-2) but
+	// NOT per-app concurrency (§6.2-1) — the migration target was
+	// already counted in the source node's per-app concurrency, so
+	// bumping here would double-count and artificially cap an app
+	// that is mid-migration. Tier A5 (ADR-066) wires this into the
+	// destination schedd at Phase 3 of the four-phase handoff.
+	KindMigration
+)
+
 // Request is an admission request for one instance (a wake or a build).
 type Request struct {
 	Instance string
@@ -104,6 +126,10 @@ type Request struct {
 	SidecarMBs     []int
 	VCPU           int // vcpus for this instance
 	MaxConcurrency int // the app's configured max (already validated ≤ plan cap)
+	// Kind discriminates the reservation shape (see Kind doc). Zero
+	// value (KindWake) is the standard wake path; KindMigration is
+	// the Tier A5 destination-side reservation.
+	Kind Kind
 	// NodeID is the compute_node chosen by sched.ChoosePlacement at
 	// the call site. The ledger does not pick placement — that's the
 	// Engine's job. Empty NodeID means "legacy box-wide accounting"
@@ -154,9 +180,23 @@ func (r Request) admissionMB() int {
 // "ledger.resident" field of pre-#97 code is gone — per-node
 // counters carry the same invariant, just keyed.
 func (l *NodeLedger) Admit(r Request) error {
-	limits, ok := api.LimitsFor(r.Plan)
-	if !ok {
-		return fmt.Errorf("sched: admit: unknown plan %q", r.Plan)
+	// Tier A5 / ADR-066: KindMigration skips LimitsFor. The
+	// migration target's plan limits are already enforced on the
+	// source node's Wake-time Admit; on the destination we only
+	// need the per-node RAM + vCPU ceilings (invariant §6.2-2),
+	// which use r.NodeCeilingMB / r.VCPUBudget directly. The
+	// per-app concurrency check below is also skipped for
+	// KindMigration, so Plan is unused on this path. We still
+	// validate Plan for KindWake so a malformed caller doesn't
+	// slip past the per-app concurrency check by leaving Plan
+	// empty.
+	var limits api.Limits
+	if r.Kind != KindMigration {
+		l, ok := api.LimitsFor(r.Plan)
+		if !ok {
+			return fmt.Errorf("sched: admit: unknown plan %q", r.Plan)
+		}
+		limits = l
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -169,12 +209,23 @@ func (l *NodeLedger) Admit(r Request) error {
 	// by the plan; use the tighter of the two defensively. Concurrency is
 	// per-app, NOT per-node — a customer's app can't run 5 instances on
 	// node A and another 5 on node B just because the fleet is large.
+	//
+	// Tier A5 / ADR-066: KindMigration reservations SKIP this check.
+	// The migration target was already counted in the source node's
+	// per-app concurrency (the instance was RUNNING there before
+	// Phase 1's Park). Counting it again on the destination would
+	// artificially cap an app that's mid-migration — a customer with
+	// 1 instance at MaxConcurrency=1 would see a transient ErrPlan
+	// during the failover window even though no extra instance was
+	// ever admitted. RAM/vCPU per-node ceilings (below) still apply.
 	maxConc := r.MaxConcurrency
 	if maxConc <= 0 || maxConc > limits.MaxConcurrency {
 		maxConc = limits.MaxConcurrency
 	}
-	if have := l.perApp[r.AppID]; have >= maxConc {
-		return api.ErrPlanLimitConcurrency(limits, have)
+	if r.Kind != KindMigration {
+		if have := l.perApp[r.AppID]; have >= maxConc {
+			return api.ErrPlanLimitConcurrency(limits, have)
+		}
 	}
 
 	// Per-node RAM headroom (invariant §6.2-2 re-stated per-node).
@@ -221,13 +272,16 @@ func (l *NodeLedger) Admit(r Request) error {
 
 	l.entries[r.Instance] = &reservation{
 		appID: r.AppID, deploymentID: r.DeploymentID, nodeID: r.NodeID,
-		admissionMB: r.admissionMB(), vcpu: r.VCPU, countsConc: true,
+		admissionMB: r.admissionMB(), vcpu: r.VCPU,
+		countsConc: r.Kind != KindMigration,
 	}
 	node.residentRAM += r.admissionMB()
 	node.usedVCPU += r.VCPU
-	l.perApp[r.AppID]++
-	if r.DeploymentID != "" {
-		l.perAppDeployment[r.AppID+"\x00"+r.DeploymentID]++
+	if r.Kind != KindMigration {
+		l.perApp[r.AppID]++
+		if r.DeploymentID != "" {
+			l.perAppDeployment[r.AppID+"\x00"+r.DeploymentID]++
+		}
 	}
 	return nil
 }

@@ -63,7 +63,7 @@ func stubSpecBuilder(_ context.Context, _ string) (AppSpec, error) {
 func newHarnessForTest(t *testing.T, store *state.MemStore, vmm *fakeVMM, ownerNodeID string) *MigrationHarness {
 	t.Helper()
 	ops := wire.NewOpsMetrics("schedd")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), ownerNodeID, stubSpecBuilder)
+	h := NewMigrationHarness(store, vmm, ops, testLog(), ownerNodeID, stubSpecBuilder, NewNodeLedger())
 	h.SetLeaseSeconds(2)
 	return h
 }
@@ -217,7 +217,7 @@ func TestMigrateOne_SpecBuilderError(t *testing.T) {
 	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner",
 		func(_ context.Context, _ string) (AppSpec, error) {
 			return AppSpec{}, errors.New("simulated spec build failure")
-		})
+		}, NewNodeLedger())
 	h.SetLeaseSeconds(2)
 
 	err := h.MigrateOne(context.Background(), insID, "dying")
@@ -245,7 +245,7 @@ func TestMigrateOne_NilSpecBuilderPanics(t *testing.T) {
 		}
 	}()
 	_ = NewMigrationHarness(state.NewMemStore(), &fakeVMM{}, wire.NewOpsMetrics("schedd"),
-		testLog(), "new-owner", nil)
+		testLog(), "new-owner", nil, NewNodeLedger())
 }
 
 // readLiveMigrationDecision scrapes the closed-set
@@ -281,7 +281,7 @@ func TestMigrateOne_MetricOutcomeMigrated(t *testing.T) {
 	vmm := &fakeVMM{}
 	ops := wire.NewOpsMetrics("schedd")
 	insID := seedInstanceForMigration(t, store, "dying")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder)
+	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger())
 	h.SetLeaseSeconds(2)
 
 	if err := h.MigrateOne(context.Background(), insID, "dying"); err != nil {
@@ -297,7 +297,7 @@ func TestMigrateOne_MetricOutcomePeerFailure(t *testing.T) {
 	vmm := &fakeVMM{adoptErr: errors.New("Restore failed")}
 	ops := wire.NewOpsMetrics("schedd")
 	insID := seedInstanceForMigration(t, store, "dying")
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder)
+	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger())
 	h.SetLeaseSeconds(2)
 
 	if err := h.MigrateOne(context.Background(), insID, "dying"); err == nil {
@@ -319,7 +319,7 @@ func TestMigrateOne_MetricOutcomeConflict(t *testing.T) {
 	if err := store.UpdateInstanceState(context.Background(), insID, string(state.StateParked)); err != nil {
 		t.Fatalf("UpdateInstanceState: %v", err)
 	}
-	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder)
+	h := NewMigrationHarness(store, vmm, ops, testLog(), "new-owner", stubSpecBuilder, NewNodeLedger())
 	h.SetLeaseSeconds(2)
 
 	if err := h.MigrateOne(context.Background(), insID, "dying"); !errors.Is(err, state.ErrConflict) {

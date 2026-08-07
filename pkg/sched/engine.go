@@ -2350,7 +2350,7 @@ func (e *Engine) MigrateLiveInstances(ctx context.Context, deadNodeID string) (i
 	}
 
 	harness := NewMigrationHarness(e.store, e.vmm, e.ops, e.log,
-		e.ownerNodeID, e.BuildAppSpecForMigration)
+		e.ownerNodeID, e.BuildAppSpecForMigration, e.ledger)
 	harness.SetMaxPerTick(maxPerTick)
 	leaseSeconds := api.MigrateLiveLeaseSeconds
 	if e.migrateLiveLeaseSeconds > 0 {

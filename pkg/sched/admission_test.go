@@ -3,6 +3,7 @@ package sched
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -175,5 +176,112 @@ func TestConcurrentAdmitReleaseNoCorruption(t *testing.T) {
 	// Everything released → back to zero, no drift.
 	if l.ResidentRAM() != 0 || l.UsedVCPU() != 0 {
 		t.Errorf("ledger drifted after concurrent admit/release: ram=%d vcpu=%d", l.ResidentRAM(), l.UsedVCPU())
+	}
+}
+
+// Tier A5 / ADR-066: KindMigration reservations count toward
+// per-node RAM + vCPU ceilings (invariant §6.2-2 re-stated
+// per-node) but NOT per-app concurrency (§6.2-1). The migration
+// target was already counted on the source node, so bumping on
+// the destination would double-count and briefly cap an app
+// that's mid-migration.
+//
+// The test pins: (a) Plan is allowed to be zero-valued for
+// KindMigration (admission.go Admit skips api.LimitsFor on this
+// branch); (b) per-node RAM is reserved; (c) per-app concurrency
+// stays at zero for the migration target; (d) Release frees both
+// the per-node RAM and the per-app counter (which is zero, but
+// Release must still walk the bookkeeping without crashing).
+func TestAdmitMigrationKindSkipsPerAppConcurrency(t *testing.T) {
+	l := NewLedger()
+	destNode := "node-b"
+	if err := l.Admit(Request{
+		Instance: "mig-1",
+		RAMMB:    512,
+		VCPU:     2,
+		Kind:     KindMigration,
+		NodeID:   destNode,
+		// AppID + Plan deliberately left zero to exercise the
+		// KindMigration short-circuit in admission.go.
+	}); err != nil {
+		t.Fatalf("admit migration: %v", err)
+	}
+	// Per-node RAM reserved (512 + PerVMOverheadMB).
+	wantRAM := 512 + api.PerVMOverheadMB
+	if got := l.ResidentRAMForNode(destNode); got != wantRAM {
+		t.Errorf("ResidentRAMForNode(%q) = %d, want %d (Tier A5 must reserve destination RAM)", destNode, got, wantRAM)
+	}
+	// Per-node vCPU reserved.
+	if got := l.UsedVCPUForNode(destNode); got != 2 {
+		t.Errorf("UsedVCPUForNode(%q) = %d, want 2 (Tier A5 must reserve destination vCPU)", destNode, got)
+	}
+	// Per-app concurrency NOT bumped (KindMigration skips §6.2-1
+	// to avoid double-counting across the source + destination).
+	if got := l.Concurrency(""); got != 0 {
+		t.Errorf("Concurrency(\"\") = %d, want 0 (KindMigration must skip per-app bump)", got)
+	}
+	// Release frees everything; subsequent per-node reads return
+	// zero and the per-node bucket is dropped (Release's
+	// residentRAM==0 && usedVCPU==0 GC at admission.go:280-282).
+	l.Release("mig-1")
+	if got := l.ResidentRAMForNode(destNode); got != 0 {
+		t.Errorf("post-release ResidentRAMForNode(%q) = %d, want 0", destNode, got)
+	}
+	if got := l.UsedVCPUForNode(destNode); got != 0 {
+		t.Errorf("post-release UsedVCPUForNode(%q) = %d, want 0", destNode, got)
+	}
+	if l.NodeCount() != 0 {
+		t.Errorf("post-release NodeCount = %d, want 0 (empty per-node bucket should be GC'd)", l.NodeCount())
+	}
+}
+
+// Tier A5 / ADR-066: a KindMigration reservation cannot exceed the
+// destination node's RAM ceiling. Two migrations sized at the plan
+// cap that fit in isolation but overflow the ceiling together must
+// be rejected; this pins that invariant §6.2-2 still fires for the
+// migration path (KindMigration skips per-app concurrency, NOT RAM).
+func TestAdmitMigrationKindHonoursRAMCeiling(t *testing.T) {
+	l := NewLedger()
+	destNode := "node-b"
+	// Use a tight per-node ceiling so the test is hermetic.
+	ceiling := 512 + api.PerVMOverheadMB
+	// First migration fits.
+	if err := l.Admit(Request{
+		Instance: "mig-1", RAMMB: 512, VCPU: 1, Kind: KindMigration,
+		NodeID: destNode, NodeCeilingMB: ceiling,
+	}); err != nil {
+		t.Fatalf("first migration admit: %v", err)
+	}
+	// Second one would overflow.
+	err := l.Admit(Request{
+		Instance: "mig-2", RAMMB: 512, VCPU: 1, Kind: KindMigration,
+		NodeID: destNode, NodeCeilingMB: ceiling,
+	})
+	if err == nil {
+		t.Fatalf("second migration admit: want ErrCapacity, got nil")
+	}
+	var prob *api.Problem
+	if !errors.As(err, &prob) || prob.Code != api.CodeCapacity {
+		t.Errorf("second migration: want CodeCapacity, got %v", err)
+	}
+}
+
+// Tier A5 / ADR-066: a KindWake reservation with Plan unset still
+// fails fast (the existing pre-Tier-A5 contract). Pinning this
+// guards the KindMigration branch from being copy-pasted and
+// accidentally swallowing the Plan validation for the wake path.
+func TestAdmitWakeKindRequiresKnownPlan(t *testing.T) {
+	l := NewLedger()
+	err := l.Admit(Request{
+		Instance: "i1", AppID: "app1",
+		RAMMB: 256, VCPU: 1, MaxConcurrency: 5,
+		// Plan deliberately empty.
+		Kind: KindWake,
+	})
+	if err == nil {
+		t.Fatalf("admit wake with empty Plan: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown plan") {
+		t.Errorf("admit wake: want 'unknown plan' error, got %v", err)
 	}
 }

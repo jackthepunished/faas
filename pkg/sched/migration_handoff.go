@@ -89,6 +89,16 @@ type MigrationHarness struct {
 	vmm     RoutedVMM
 	metrics apiMigrationMetrics
 	log     *slog.Logger
+	// ledger is schedd's per-node NodeLedger. Tier A5 (ADR-066)
+	// reserves destination RAM + vCPU at Phase 3 BEFORE the wire
+	// call so a flood of inbound migrations cannot over-admit a
+	// destination node (invariant §6.2-2). The reservation is
+	// released on Phase 3 wire failure; on Phase 4 success the
+	// reservation persists as the instance is now RUNNING on the
+	// destination (the source's ledger entry is released by the
+	// gateway's pg_notify instance_changed listener on
+	// state='migrating' — see cmd/gatewayd-internal/backend.go).
+	ledger *NodeLedger
 	// specBuilder is the canonical AppSpec constructor the
 	// harness uses at Phase 3. Wiring it as a closure (rather
 	// than re-implementing the builder here) keeps the spec
@@ -154,9 +164,13 @@ func NewMigrationHarness(
 	log *slog.Logger,
 	newOwnerNodeID string,
 	specBuilder func(ctx context.Context, instanceID string) (AppSpec, error),
+	ledger *NodeLedger,
 ) *MigrationHarness {
 	if specBuilder == nil {
 		panic("sched: NewMigrationHarness: specBuilder is nil (migration will silently corrupt AppSpec at first handoff)")
+	}
+	if ledger == nil {
+		panic("sched: NewMigrationHarness: ledger is nil (Tier A5 destination-side slot reservation would silently no-op at Phase 3)")
 	}
 	return &MigrationHarness{
 		store:          store,
@@ -165,6 +179,7 @@ func NewMigrationHarness(
 		log:            log,
 		specBuilder:    specBuilder,
 		newOwnerNodeID: newOwnerNodeID,
+		ledger:         ledger,
 		maxPerTick:     api.MigrateLiveMaxPerTick,
 		leaseSeconds:   api.MigrateLiveLeaseSeconds,
 	}
@@ -302,11 +317,61 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 		_ = h.vmm.CancelLiveMigration(leaseCtx, fromNodeID, instanceID, prepared.LeaseToken)
 		return fmt.Errorf("sched: migrate one: load app spec: %w", err)
 	}
+	// Phase 3 reservation: reserve destination-side RAM + vCPU BEFORE
+	// the wire call so a flood of inbound migrations cannot over-admit
+	// a destination node (invariant §6.2-2 re-stated per-node).
+	// KindMigration deliberately skips per-app concurrency (§6.2-1):
+	// the instance was already counted on the source node, so bumping
+	// on the destination would double-count and briefly cap an app
+	// that's mid-migration. The source ledger entry is released by
+	// the gateway's pg_notify listener on state='migrating' (see
+	// cmd/gatewayd-internal/backend.go:243-246). The reservation
+	// persists on Phase 4 success — the instance is now RUNNING on
+	// the destination and counts toward its ledger normally.
+	if err := h.ledger.Admit(Request{
+		Instance: instanceID,
+		RAMMB:    int(appSpec.MemSizeMiB),
+		VCPU:     int(appSpec.VCPUCount),
+		Kind:     KindMigration,
+		NodeID:   h.newOwnerNodeID,
+		// AppID + Plan left zero-valued: KindMigration skips
+		// both the per-app concurrency check and the
+		// api.LimitsFor lookup (see admission.go Admit).
+		// NodeCeilingMB + VCPUBudget default to 0; the chooser
+		// wasn't run for migration so we don't have the row
+		// values in hand here. The ceiling fallback in
+		// ceilingForNode_locked returns the global
+		// api.RAMAdmissionCeilingMB so the per-node ceiling
+		// gate still fires — a future PR can thread the
+		// destination's row through Engine.MigrateLiveInstances.
+	}); err != nil {
+		// Phase 3 ledger refusal: destination has no headroom.
+		// Roll back Phase 2 + Phase 4 (same shape as wire
+		// failure below; a different metric label so the §12
+		// dashboard can disambiguate capacity refusals from
+		// peer dial failures).
+		h.metrics.LiveMigrationDecisions("no_headroom").Inc()
+		h.log.Warn("sched: migrate one: Phase 3 ledger refused",
+			"instance_id", instanceID,
+			"new_owner_node_id", h.newOwnerNodeID,
+			"err", err,
+		)
+		_ = h.store.CancelInstanceMigration(leaseCtx, instanceID, fromNodeID, prepared.LeaseToken)
+		_ = h.vmm.CancelLiveMigration(leaseCtx, fromNodeID, instanceID, prepared.LeaseToken)
+		return fmt.Errorf("sched: migrate one: phase 3 ledger: %w", err)
+	}
 	adopted, err := h.vmm.AdoptMigratedInstance(leaseCtx, h.newOwnerNodeID, instanceID, appSpec,
 		prepared.MemStorageKey, prepared.VMStateStorageKey, prepared.LeaseToken)
 	if err != nil {
 		// Phase 3 wire failure (new owner dial / restore
-		// failed). Roll back Phase 2 + Phase 4.
+		// failed). Roll back Phase 2 + Phase 4 + ledger
+		// reservation. The Release must run BEFORE
+		// CancelInstanceMigration so a transient store error
+		// can't leave the destination ledger over-counted
+		// (the gateway's pg_notify path doesn't fire on this
+		// branch — we never committed state='migrating' to
+		// the row from the destination's perspective).
+		h.ledger.Release(instanceID)
 		h.metrics.LiveMigrationDecisions("peer_failure").Inc()
 		h.log.Warn("sched: migrate one: Phase 3 adopt failed",
 			"instance_id", instanceID,

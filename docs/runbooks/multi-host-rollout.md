@@ -395,6 +395,102 @@ If the cut-over fails irrecoverably:
   (because the rollback above restores single-box state in
   <30 s).
 
+## Tier A5 gate — cross-node live-instance migration
+
+ADR-066 (`docs/adr/066-tier-a5-cross-node-live-migration.md`,
+`Accepted (revised 2026-08-07)`) is the cross-node live-instance
+handoff story. The Tier A5 gate exercises the full four-phase
+commit end-to-end on a two-node fleet — the operator-facing
+acceptance for §14 M9.
+
+### Tier A5 pre-flight
+
+- A two-node fleet already bootstrapped per the procedure
+  above (`compute-01`, `compute-02`); both nodes have
+  `active=true` and `node_signature` populated (Tier 1 Phase 2,
+  shipped).
+- `OCIRegistryStorageBackend` end-to-end (Tier 1 Phase 3,
+  shipped via ADR-054 acceptance PR #457 + #716). Every
+  compute node reads per-app layers and snapshot blobs from
+  the registry; `LocalCacheBackend` defaults to
+  `/var/lib/faas/cache` on multi-box fleets.
+- An app already deployed + woken on `compute-01` with
+  state=`running`.
+
+### Tier A5 procedure
+
+1. **Identify the test instance** —
+   `psql -c "select id, app_id, node_id, state from instances
+   where state='running' and node_id=(select id from
+   compute_nodes where name='compute-01');"`
+2. **Trigger the drain** —
+   `psql -c "update compute_nodes set active=false where
+   name='compute-01';"` (operator's standard drain command;
+   no orchestration step required).
+3. **Watch the handoff** — within
+   `MigrateLiveLeaseSeconds` (90 s) + ~5 s:
+   `psql -c "select id, app_id, node_id, state,
+   migrated_from_node_id, migrated_at from instances where
+   id='<test-instance-id>';"` should now show
+   `state='running'` + `node_id` flipped to `compute-02`'s id +
+   `migrated_from_node_id` populated.
+4. **Verify the metric on `compute-02`** —
+   `curl -s http://compute-02:9100/metrics | grep
+   schedd_live_migration_decisions_total` shows
+   `outcome="migrated"` ≥ 1 and `outcome="peer_failure" = 0`.
+5. **Verify the metric on `compute-01`** — same query; the
+   source should show `outcome="peer_failure" = 0` (clean
+   handoff).
+6. **Smoke-test the customer experience** —
+   `curl https://<app>.compute-02.example.com/`. The response
+   should arrive within ~350 ms of the `UPDATE compute_nodes`
+   (cold-boot from snapshot on the destination's wake path).
+
+### Tier A5 validation matrix
+
+| Check | Expected | Source |
+|-------|----------|--------|
+| `instances.node_id` after drain | flipped to `compute-02.id` | `select id, node_id, state from instances` |
+| `instances.state` after drain | `'running'` | same query |
+| `instances.migrated_from_node_id` | non-null, equals `compute-01.id` | same query |
+| `instances.migrated_at` | non-null, within last 5 min | same query |
+| `apps.migrated_at` | non-null, within last 5 min | `select id, migrated_at from apps` |
+| `schedd_live_migration_decisions_total{outcome="migrated"}` on `compute-02` | ≥ 1 | `/metrics` |
+| `schedd_live_migration_decisions_total{outcome="peer_failure"}` on `compute-01` | 0 | `/metrics` |
+| `schedd_live_migration_decisions_total{outcome="no_headroom"}` | 0 (or 1 if the ceiling was tight; pre-flight must show headroom > 1 instance) | `/metrics` |
+| `make leakcheck` | zero leaked netns/TAPs/cgroups on both nodes | `make leakcheck` |
+
+### Tier A5 rollback
+
+If the handoff stalls in `state='migrating'` past the lease
+(`MigratingWatchdogTickLimit` × `MigratingWatchdogIntervalSeconds`
+= 50 s):
+
+- The Tier A6 watchdog (`pkg/sched/migrating_watchdog.go` →
+  `Engine.ReconcileExpiredMigrations`) hard-deletes stuck
+  instances; `apps.migrated_at` reverts on next re-attempt.
+- Operator-facing: `psql -c "update compute_nodes set active=true
+  where name='compute-01';"` restores the source for retry; a
+  new drain event re-runs the handoff.
+- Manual escape hatch: `psql -c "delete from instances where
+  state='migrating';"` clears stuck rows; the next wake re-creates
+  the instance from snapshot (ADR-005: cold boot must always work).
+
+### Tier A5 escalation
+
+- **No metric increment on either node** — the live_migrator
+  pg_notify subscriber (`cmd/schedd/main.go::subscribeLiveMigrator`)
+  is disconnected. Check `journalctl -u faas-schedd` for
+  `subscribe_live_migrator` errors.
+- **`outcome="no_headroom"` > 0** — destination has no RAM
+  headroom for the migration target. Drain another peer first,
+  or temporarily bump the destination's
+  `compute_nodes.admission_ceiling_mb`.
+- **`outcome="lease_expired"` > 0** — wire latency between
+  schedd and vmmd exceeds the lease window. Bump
+  `FAAS_MIGRATE_LIVE_LEASE_SECONDS` on the destination schedd
+  (the env override is `pkg/api/limits.go::MigrateLiveLeaseSeconds`).
+
 ## Follow-ups (not in this runbook)
 
 - **#250 (off-host Postgres backup)** — required before the

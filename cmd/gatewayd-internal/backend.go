@@ -240,8 +240,20 @@ func handleInvalidation(inv invalidator, n db.Notification, log *slog.Logger) {
 		// already healthy (the RUNNING emission arrives AFTER
 		// PGBackend.Admit has seeded the Target). Terminal-ish states
 		// evict the entry so the next request re-admits.
+		//
+		// Tier A5 / ADR-066: state='migrating' is also terminal-ish
+		// for routing purposes. Phase 1 of the cross-node handoff
+		// has Park'd the VM on the source vmmd; the new owner is
+		// mid-restore on the destination. Routing traffic to the
+		// source node mid-handoff would land on a VM that's about
+		// to be destroyed. The gateway-side evicts this entry so
+		// the next request re-admits (which goes through the wake
+		// path on the destination — see pkg/sched/migration_handoff.go
+		// Phase 4's MigrateInstanceOwner which stamps node_id
+		// before the gateway's RUNNING emission from the wake
+		// path lands).
 		switch p.State {
-		case "stopped", "failed", "parked", "snapshotting":
+		case "stopped", "failed", "parked", "snapshotting", "migrating":
 			inv.EvictInstance(p.AppID, p.InstanceID)
 		}
 	case db.NotifyAppChanged, db.NotifyDomainChanged:

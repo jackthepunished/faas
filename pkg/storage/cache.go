@@ -49,6 +49,30 @@
 //   - TTL-based eviction. ADR-054 §Consequences names this as
 //     a v1.1 tightening; not load-bearing for the Tier 1 slice.
 //   - Compression. Storage is cheap; v1 is a 1:1 mirror.
+//
+// Tier A5 / ADR-066 cross-node pull path. The cache is the
+// warm path for cross-node live-instance migration:
+//   - Phase 1 of the four-phase commit writes the snapshot
+//     blob to the configured StorageBackend on the source
+//     vmmd. On a multi-box fleet this is the
+//     OCIRegistryStorageBackend (ADR-054); the cache on the
+//     source node is populated as a side-effect of the Put.
+//   - Phase 3 on the destination vmmd reads the same blob via
+//     the destination's StorageBackend. The destination's
+//     cache (default /var/lib/faas/cache) is the warm path
+//     for the first migration of an instance; subsequent
+//     migrations of the same instance hit the local cache
+//     and never touch the registry. The cache is therefore
+//     the load-bearing piece for Tier A5 wake latency:
+//     without it, every cross-node restore round-trips the
+//     registry.
+//
+// Streaming Put/Get (a separate streaming-only interface) is
+// NOT needed for v1 — the existing OCI Put path uses
+// bufferAndHash for SHA-256 manifest computation, and a
+// streaming variant would only move the buffer inside the
+// OCI backend. A v1.1 optimisation may revisit this if the
+// snapshot blobs grow past the 130 MB fleet target.
 
 package storage
 
