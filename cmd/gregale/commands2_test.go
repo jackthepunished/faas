@@ -1020,6 +1020,131 @@ func TestCmdLogs_GrepSinceLevel(t *testing.T) {
 			t.Errorf("server was hit %d times; validation must short-circuit before HTTP", hits)
 		}
 	})
+
+	// Issue #315 (tier-2 DX): `gregale logs tail <slug>` is an alias
+	// for `gregale logs <slug> --follow`. Tests pin:
+	//   - Dispatch reaches the same SSE pump with follow=1.
+	//   - --follow on the alias is rejected with exit 2 (the alias
+	//     always follows, so passing the flag signals confusion).
+	//   - All other logs flags pass through verbatim.
+	//   - No-arg `logs tail` exits 1 with a usage hint.
+	t.Run("tail_alias_forces_follow", func(t *testing.T) {
+		stdout.Reset()
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		if code := cmdLogs([]string{"tail", "myapp"}); code != 0 {
+			t.Fatalf("cmdLogs(tail myapp) = %d, want 0; stdout=%q", code, stdout.String())
+		}
+		if got := gotQuery.Get("follow"); got != "1" {
+			t.Errorf("follow = %q, want 1 (alias must force --follow)", got)
+		}
+	})
+
+	t.Run("tail_alias_passes_filters_through", func(t *testing.T) {
+		stdout.Reset()
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		args := []string{
+			"tail",
+			"--grep", "ERROR",
+			"--since", "2026-07-28T00:00:00Z",
+			"--level", "error",
+			"myapp",
+		}
+		if code := cmdLogs(args); code != 0 {
+			t.Fatalf("cmdLogs(tail … myapp) = %d, want 0; stdout=%q", code, stdout.String())
+		}
+		if got := gotQuery.Get("follow"); got != "1" {
+			t.Errorf("follow = %q, want 1", got)
+		}
+		if got := gotQuery.Get("grep"); got != "ERROR" {
+			t.Errorf("grep = %q, want ERROR", got)
+		}
+		if got := gotQuery.Get("since"); got != "2026-07-28T00:00:00Z" {
+			t.Errorf("since = %q, want 2026-07-28T00:00:00Z", got)
+		}
+		if got := gotQuery.Get("level"); got != "error" {
+			t.Errorf("level = %q, want error", got)
+		}
+	})
+
+	t.Run("tail_alias_rejects_redundant_follow", func(t *testing.T) {
+		stdout.Reset()
+		hits := int32(0)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		code := cmdLogs([]string{"tail", "--follow", "myapp"})
+		if code != 2 {
+			t.Errorf("cmdLogs(tail --follow myapp) = %d, want 2 (redundant flag rejected)", code)
+		}
+		if atomic.LoadInt32(&hits) != 0 {
+			t.Errorf("server was hit %d times; redundant-flag rejection must short-circuit", hits)
+		}
+	})
+
+	t.Run("tail_alias_invalid_level_short_circuits", func(t *testing.T) {
+		stdout.Reset()
+		hits := int32(0)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		code := cmdLogs([]string{"tail", "--level", "trace", "myapp"})
+		if code != 2 {
+			t.Errorf("cmdLogs(tail --level trace myapp) = %d, want 2", code)
+		}
+		if atomic.LoadInt32(&hits) != 0 {
+			t.Errorf("server was hit %d times; validation must short-circuit", hits)
+		}
+	})
+
+	t.Run("tail_alias_no_args_exits_1", func(t *testing.T) {
+		stdout.Reset()
+		code := cmdLogs([]string{"tail"})
+		if code != 1 {
+			t.Errorf("cmdLogs(tail) = %d, want 1 (usage)", code)
+		}
+	})
 }
 
 // TestMapFailureMessage_BuildLimitsDocsLinks pins the docs URLs

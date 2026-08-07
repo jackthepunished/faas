@@ -426,6 +426,14 @@ const (
 	CodePlanFeatureGated   = "plan_feature_gated"
 	CodePlanDelayedCap     = "plan_delayed_tasks_cap"
 	CodeInvocationNotFound = "invocation_not_found"
+	// CodeInvocationNotReplayable (issue #315 / tier-2 DX) is the
+	// 409 surfaced by POST /v1/invocations/{id}/replay when the
+	// original invocation is in a state that cannot be re-issued
+	// (anything other than {failed, dead_letter}). Distinct from
+	// CodeConflict so the CLI's error template can render the
+	// "use `gregale invocation <id>` to inspect the state" hint
+	// without parsing prose.
+	CodeInvocationNotReplayable = "invocation_not_replayable"
 	// CodeBuildProvenanceNotFound is the ADR-038 / Tier 3 #197
 	// B3.10-read sentinel. Distinct from a generic "no such build"
 	// so the customer can branch: a build that exists with no
@@ -954,6 +962,11 @@ func StatusForCode(code string) int {
 		return http.StatusUnprocessableEntity
 	case CodeInvocationNotFound:
 		return http.StatusNotFound
+	case CodeInvocationNotReplayable:
+		// Issue #315: replay attempts on a non-replayable state
+		// surface 409 — the conflict is between the request and
+		// the resource's current state, not between two writes.
+		return http.StatusConflict
 	case CodeInvalidCredentials, CodeEmailNotVerified:
 		return http.StatusUnauthorized
 	case CodePasswordTooWeak, CodeAccountExists:
@@ -2051,6 +2064,19 @@ func ErrInvocationNotFound(id string) *Problem {
 		"Invocation not found",
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
 		WithDocs(docsBase + "/event-driven#invocations")
+}
+
+// ErrInvocationNotReplayable (issue #315 / tier-2 DX) is returned by
+// POST /v1/invocations/{id}/replay when the original's State is
+// outside the replayable allow-list ({failed, dead_letter}).
+// Rendered with the current state in the message so the customer
+// can decide whether to wait for a pending invocation, or accept
+// the completed result without re-running.
+func ErrInvocationNotReplayable(state string) *Problem {
+	return NewProblem(http.StatusConflict, CodeInvocationNotReplayable,
+		"Invocation is not in a replayable state",
+		fmt.Sprintf("only invocations in state 'failed' or 'dead_letter' can be replayed; current state is %q.", state)).
+		WithDocs("https://docs.gregale.dev/event-driven#invocations")
 }
 
 // ErrBuildProvenanceNotFound is the ADR-038 surface for a build

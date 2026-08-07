@@ -3420,6 +3420,49 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # Issue #315 / tier-2 DX: replay a failed or dead_letter
+  # invocation. The replay creates a fresh async invocation that
+  # carries the original's payload + headers + method + path,
+  # stamped with source='replay' so the dashboard and CLI can
+  # distinguish it from a fresh async_invoke at a glance. The
+  # customer polls the new id via GET /v1/invocations/{newID}
+  # the same way they would for any async invoke.
+  /v1/invocations/{id}/replay:
+    post:
+      tags: [invocations]
+      operationId: replayInvocation
+      summary: Re-issue a failed or dead_letter invocation.
+      description: |
+        Accepts no request body. The replayed row carries the original's
+        payload + headers + method + path verbatim and is enqueued against
+        the same app. The new row's Source is `replay` (issue #315).
+
+        Only invocations whose current state is `failed` or `dead_letter`
+        can be replayed — re-running a successful or in-flight invocation
+        would be a customer bug, not a flow we want to enable by accident.
+        A replay attempt on any other state returns 409
+        `invocation_not_replayable`.
+      parameters:
+        - $ref: '#/components/parameters/Id32'
+      responses:
+        '202':
+          description: The new invocation row was enqueued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AsyncInvokeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            The invocation is not in a replayable state. Returns the
+            `invocation_not_replayable` problem code with the current
+            state in the detail field; only `failed` and `dead_letter`
+            invocations can be replayed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/delayed-tasks/{id}:
     parameters:
       - $ref: '#/components/parameters/Id32'

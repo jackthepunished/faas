@@ -2026,6 +2026,15 @@ type AsyncInvokeResponse struct {
 	StatusURL string `json:"status_url"`
 }
 
+// InvocationReplayResponse is the 202-side of POST
+// /v1/invocations/{id}/replay. The wire is identical to
+// AsyncInvokeResponse — the replay creates a new async invocation
+// against the original's app/instance, so the read-side contract is
+// the same id + status_url the customer already polls. Aliased so
+// future divergence (e.g. an "original_id" field for dedup) has a
+// single place to grow without touching every SDK call site.
+type InvocationReplayResponse = AsyncInvokeResponse
+
 // InvokeResponse is the sync-side of POST /v1/apps/{slug}/invoke.
 // Status is the final row state (one of "completed" | "failed"
 // | "cancelled"); Result is the per-app payload the drain stamped

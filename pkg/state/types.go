@@ -1376,6 +1376,14 @@ const (
 	InvocationQueue       InvocationSource = "queue"
 	InvocationDelayedTask InvocationSource = "delayed_task"
 	InvocationCron        InvocationSource = "cron"
+	// InvocationReplay (issue #315 / tier-2 DX) is the source
+	// stamped on a replayed invocation. The dashboard's
+	// per-invocation detail page renders this so a customer
+	// triaging an incident can tell at a glance whether a row
+	// is original or a re-issue. NOT in the read-side render
+	// path — it shows up in `gregale invocation <id>` under the
+	// `Source:` label.
+	InvocationReplay InvocationSource = "replay"
 )
 
 // InvocationState is the row lifecycle on the invocations table. The

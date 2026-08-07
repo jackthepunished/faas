@@ -30,8 +30,14 @@ const (
 	subUpdate  = "update"
 	subRm      = "rm"
 	subSummary = "summary"
-	subInfo    = "info"
-	subGet     = "get"
+	// subLogsTail is the inner-subcommand name for `gregale logs
+	// tail <slug>` (issue #315 / tier-2 DX). Lifted from the
+	// inline literal at commands2.go:1719 + main.go:252 so goconst
+	// stops flagging the three occurrences (two source +
+	// PrintUsage doc line).
+	subLogsTail = "tail"
+	subInfo     = "info"
+	subGet      = "get"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -1721,7 +1727,17 @@ func validateRepoSlug(s string) error {
 // does not yet act on them (Move 4 will filter against vmmd's
 // per-instance ring buffer); the flags land now so the wire
 // contract is stable.
+//
+// Issue #315 (tier-2 DX): `gregale logs tail <slug>` is a thin alias
+// for `gregale logs <slug> --follow`. The inner-subcommand dispatch
+// mirrors cmdQueueDispatch (commands5.go:715-729). `tail` is the only
+// inner subcommand today; the switch leaves room for future siblings
+// (e.g. `logs list` for batch tail of all app's deployments) without
+// a wire-format break.
 func cmdLogs(args []string) int {
+	if len(args) > 0 && args[0] == subLogsTail {
+		return cmdLogsTail(args[1:])
+	}
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "follow new lines")
 	deployment := fs.String("deployment", "", "deployment id (default: latest)")
@@ -1753,18 +1769,75 @@ func cmdLogs(args []string) int {
 			return 2
 		}
 	}
-	slug := fs.Arg(0)
+	return runLogs(context.Background(), fs.Arg(0), *deployment, api.LogFilter{
+		Grep:  *grep,
+		Since: *since,
+		Level: *level,
+	}, *follow)
+}
+
+// cmdLogsTail implements `gregale logs tail <slug>` — issue #315
+// (tier-2 DX). Equivalent to `gregale logs <slug> --follow`; provided
+// as a verb-form alias so muscle-memory keyboard shortcuts (Docker,
+// kubectl, journalctl) work without translating to the long form.
+//
+// `--follow` is rejected explicitly: passing it is a no-op signal of
+// confusion (the alias already implies follow) and silently ignoring
+// it would mask a real customer mistake. All other logs flags pass
+// through verbatim so the alias and the long form stay wire-equivalent.
+func cmdLogsTail(args []string) int {
+	fs := flag.NewFlagSet("logs tail", flag.ContinueOnError)
+	follow := fs.Bool("follow", false, "follow new lines (alias always follows; flag is redundant)")
+	deployment := fs.String("deployment", "", "deployment id (default: latest)")
+	grep := fs.String("grep", "", "only show lines matching this substring")
+	since := fs.String("since", "", "only show lines at or after this RFC3339 timestamp")
+	level := fs.String("level", "", "only show lines at this level (info|warn|error)")
+	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale logs tail <slug> [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale logs tail <slug> [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
+		return 1
+	}
+	if *follow {
+		PrintFail(os.Stderr, "--follow is redundant with `logs tail` (alias always follows); drop the flag")
+		return 2
+	}
+	if *level != "" && !api.IsValidLogLevel(*level) {
+		PrintUsage(os.Stderr, "--level must be one of: info, warn, error", "logs")
+		return 2
+	}
+	if *since != "" {
+		if _, err := time.Parse(time.RFC3339, *since); err != nil {
+			PrintUsage(os.Stderr, "--since must be an RFC3339 timestamp (e.g. 2026-07-28T00:00:00Z)", "logs")
+			return 2
+		}
+	}
+	return runLogs(context.Background(), fs.Arg(0), *deployment, api.LogFilter{
+		Grep:  *grep,
+		Since: *since,
+		Level: *level,
+	}, true)
+}
+
+// runLogs is the shared SSE pump behind `gregale logs` and `gregale
+// logs tail`. It owns the auth round-trip, the signal-driven cancel,
+// and the typed Decoder loop so both call sites stay byte-identical on
+// the wire. Extracted from the original cmdLogs body during the
+// issue #315 tail-alias refactor.
+//
+// Exits with 130 on Ctrl-C (shell SIGINT convention), 0 on a clean
+// `event: end` or io.EOF, and surfaces a renderAPIError / printErr
+// path on the auth or attach errors that precede the SSE loop.
+func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter, follow bool) int {
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	body, err := client.StreamAppLogs(ctx, slug, *deployment, *follow, api.LogFilter{
-		Grep:  *grep,
-		Since: *since,
-		Level: *level,
-	})
+	body, err := client.StreamAppLogs(ctx, slug, deployment, follow, filter)
 	if err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) {
