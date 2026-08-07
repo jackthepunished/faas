@@ -21,6 +21,38 @@
   ansible.builtin.debug:
     var: fc_release
 
+# Pin defence-in-depth: a placeholder pin in defaults/main.yml would
+# silently let `get_url checksum:` accept any tarball that hashes to
+# the literal placeholder string. The grafana + prometheus roles
+# already fail closed on this; mirror the same assert here so a
+# future rebase that drops the real SHA cannot ship a "passing"
+# bootstrap on a fresh box. fc_kernel_sha256 is allowed to remain
+# the placeholder until the first `make fc-kernel` runs on the
+# target host (it's a build-output pin, not a release pin) — that's
+# asserted separately, where the kernel build task sets it.
+- name: firecracker — assert fc_release_sha256 is set + valid hex
+  ansible.builtin.assert:
+    that:
+      - fc_release_sha256 is defined
+      - fc_release_sha256 | length == 64
+      - not fc_release_sha256.startswith('REPLACE_WITH')
+    fail_msg: >-
+      fc_release_sha256 is missing, malformed, or still the placeholder
+      in roles/firecracker/defaults/main.yml. Compute the upstream SHA-256
+      with `curl -fsSL <url> | shasum -a 256` and pin it in defaults.
+      Refusing to apply — a placeholder SHA silently disables the
+      supply-chain check.
+
+- name: firecracker — assert fc_kernel_tar_sha256 is set + valid hex
+  ansible.builtin.assert:
+    that:
+      - fc_kernel_tar_sha256 is defined
+      - fc_kernel_tar_sha256 | length == 64
+      - not fc_kernel_tar_sha256.startswith('REPLACE_WITH')
+    fail_msg: >-
+      fc_kernel_tar_sha256 is missing, malformed, or still the
+      placeholder. Same shape as fc_release_sha256 above.
+
 - name: firecracker — mkdir /usr/local/bin and /srv/fc/base
   ansible.builtin.file:
     path: "{{ item }}"

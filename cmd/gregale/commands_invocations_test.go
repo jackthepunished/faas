@@ -1,10 +1,14 @@
 // commands_invocations_test.go — issue #315 / tier-2 DX.
 //
-// Tests for `gregale invocation <id> [--json] [--replay]`. Mirrors
-// commands_metrics_test.go shape: httptest fake-apid that records
-// the request, t.Setenv for FAAS_API / FAAS_TOKEN, swapIO for the
-// human-mode labelled-block assertions, and an inline fixture for
-// the api.Invocation payload.
+// Tests for `gregale invocations get <id> [--replay]`. The Tier C
+// `invocations list|get` surface (issue #394 follow-up) provides the
+// get-by-id read shape; this test file adds the Tier B `--replay`
+// extension that re-issues a failed or dead_letter invocation.
+//
+// Mirrors commands_metrics_test.go shape: httptest fake-apid that
+// records the request, t.Setenv for FAAS_API / FAAS_TOKEN, swapIO
+// for the human-mode labelled-block assertions, and an inline
+// fixture for the api.Invocation payload.
 package main
 
 import (
@@ -46,10 +50,10 @@ func invocationFixture() api.Invocation {
 
 // --- happy paths ------------------------------------------------------------
 
-// TestCmdInvocation_HappyPath pins the labelled-block render for a
+// TestCmdInvocationsGet_HappyPath pins the labelled-block render for a
 // successful read. Verifies path, query (no flags → no query), and
 // every human-mode label against the fixture.
-func TestCmdInvocation_HappyPath(t *testing.T) {
+func TestCmdInvocationsGet_HappyPath(t *testing.T) {
 	inv := invocationFixture()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/invocations/"+inv.ID {
@@ -64,7 +68,7 @@ func TestCmdInvocation_HappyPath(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := cmdInvocation([]string{inv.ID}); code != 0 {
+	if code := cmdInvocationsGet([]string{inv.ID}); code != 0 {
 		t.Fatalf("invocation = %d, want 0", code)
 	}
 	out := stdout.String()
@@ -84,39 +88,39 @@ func TestCmdInvocation_HappyPath(t *testing.T) {
 	}
 }
 
-// TestCmdInvocation_NoPositional ensures the usage line renders when
+// TestCmdInvocationsGet_NoPositional ensures the usage line renders when
 // the customer forgets the id.
-func TestCmdInvocation_NoPositional(t *testing.T) {
+func TestCmdInvocationsGet_NoPositional(t *testing.T) {
 	_, stderr, restore := swapIO(t)
 	defer restore()
 	t.Setenv("FAAS_API", "http://example.invalid")
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
-	if code := cmdInvocation(nil); code != 1 {
+	if code := cmdInvocationsGet(nil); code != 1 {
 		t.Errorf("invocation bare = %d, want 1 (usage)", code)
 	}
-	if !strings.Contains(stderr(), "usage: gregale invocation") {
+	if !strings.Contains(stderr(), "usage: gregale invocations get") {
 		t.Errorf("stderr missing usage line\nfull: %s", stderr())
 	}
 }
 
-// TestCmdInvocation_Unauthenticated: no token + empty HOME →
+// TestCmdInvocationsGet_Unauthenticated: no token + empty HOME →
 // authedClient fails. Mirrors TestCmdMetrics_Unauthenticated.
-func TestCmdInvocation_Unauthenticated(t *testing.T) {
+func TestCmdInvocationsGet_Unauthenticated(t *testing.T) {
 	t.Setenv("FAAS_TOKEN", "")
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
-	if code := cmdInvocation([]string{"abc"}); code == 0 {
+	if code := cmdInvocationsGet([]string{"abc"}); code == 0 {
 		t.Error("invocation without token must fail")
 	}
 }
 
 // --- JSON output ------------------------------------------------------------
 
-// TestCmdInvocation_JSON_SingleRecord: --json emits one indented
+// TestCmdInvocationsGet_JSON_SingleRecord: --json emits one indented
 // JSON object (writeJSON). Shape matches api.Invocation verbatim —
 // no client-side reshaping.
-func TestCmdInvocation_JSON_SingleRecord(t *testing.T) {
+func TestCmdInvocationsGet_JSON_SingleRecord(t *testing.T) {
 	inv := invocationFixture()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(inv)
@@ -132,7 +136,7 @@ func TestCmdInvocation_JSON_SingleRecord(t *testing.T) {
 	t.Cleanup(resetJSONOutput)
 	jsonOutput = true
 
-	if code := cmdInvocation([]string{inv.ID}); code != 0 {
+	if code := cmdInvocationsGet([]string{inv.ID}); code != 0 {
 		t.Fatalf("invocation --json = %d, want 0", code)
 	}
 	var got api.Invocation
@@ -149,12 +153,12 @@ func TestCmdInvocation_JSON_SingleRecord(t *testing.T) {
 
 // --- replay happy path ------------------------------------------------------
 
-// TestCmdInvocation_ReplayHappyPath: --replay issues a POST against
+// TestCmdInvocationsGet_ReplayHappyPath: --replay issues a POST against
 // /v1/invocations/{id}/replay AND a prior GET against the read
-// endpoint (cmdInvocation always reads first, then replays). The
+// endpoint (cmdInvocationsGet always reads first, then replays). The
 // fake-apid returns the replay's AsyncInvokeResponse and the test
 // asserts the labelled-block contains the new id + status URL.
-func TestCmdInvocation_ReplayHappyPath(t *testing.T) {
+func TestCmdInvocationsGet_ReplayHappyPath(t *testing.T) {
 	inv := invocationFixture()
 	replayID := "01xyz-replayed"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -179,8 +183,8 @@ func TestCmdInvocation_ReplayHappyPath(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := cmdInvocation([]string{"--replay", inv.ID}); code != 0 {
-		t.Fatalf("invocation --replay = %d, want 0", code)
+	if code := cmdInvocationsGet([]string{"--replay", inv.ID}); code != 0 {
+		t.Fatalf("invocations get --replay = %d, want 0", code)
 	}
 	out := stdout.String()
 	for _, want := range []string{
@@ -188,7 +192,7 @@ func TestCmdInvocation_ReplayHappyPath(t *testing.T) {
 		"App:", "my-app",
 		"Replay id:", replayID,
 		"Replay status:", "/v1/invocations/" + replayID,
-		"Poll with:", "gregale invocation", replayID,
+		"Poll with:", "gregale invocations get", replayID,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q\nfull: %s", want, out)
@@ -196,17 +200,17 @@ func TestCmdInvocation_ReplayHappyPath(t *testing.T) {
 	}
 }
 
-// TestCmdInvocation_ReplayJSONEnvelope: --json + --replay emit a
+// TestCmdInvocationsGet_ReplayJSONEnvelope: --json + --replay emit a
 // single {"original": ..., "replay": ...} object. Scripts depend on
 // the stable shape (UX §3.2 "agents depend on it").
 //
 // Test pattern mirrors TestCmdMetrics_JSON_SingleRecord: set
 // jsonOutput=true directly (rather than passing --json through the
-// args) because cmdInvocation's flag set only knows --replay. The
-// top-level run() dispatcher strips --json before reaching
-// cmdInvocation (main.go:101); this test exercises the printer
-// branch in isolation.
-func TestCmdInvocation_ReplayJSONEnvelope(t *testing.T) {
+// args) because cmdInvocationsGet's flag set only knows --replay.
+// The top-level run() dispatcher strips --json before reaching
+// the inner command; this test exercises the printer branch in
+// isolation.
+func TestCmdInvocationsGet_ReplayJSONEnvelope(t *testing.T) {
 	inv := invocationFixture()
 	replayID := "01xyz-replayed"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -232,7 +236,7 @@ func TestCmdInvocation_ReplayJSONEnvelope(t *testing.T) {
 	t.Cleanup(resetJSONOutput)
 	jsonOutput = true
 
-	if code := cmdInvocation([]string{"--replay", inv.ID}); code != 0 {
+	if code := cmdInvocationsGet([]string{"--replay", inv.ID}); code != 0 {
 		t.Fatalf("invocation --replay (json mode) = %d, want 0", code)
 	}
 	var env struct {
@@ -250,10 +254,10 @@ func TestCmdInvocation_ReplayJSONEnvelope(t *testing.T) {
 	}
 }
 
-// TestCmdInvocation_Replay_NotReplayable: server returns 409
+// TestCmdInvocationsGet_Replay_NotReplayable: server returns 409
 // ErrInvocationNotReplayable. The CLI surfaces it via renderAPIError
 // and exits with the status-mapped exit code (4 for 409).
-func TestCmdInvocation_Replay_NotReplayable(t *testing.T) {
+func TestCmdInvocationsGet_Replay_NotReplayable(t *testing.T) {
 	inv := invocationFixture()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -276,7 +280,7 @@ func TestCmdInvocation_Replay_NotReplayable(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	code := cmdInvocation([]string{"--replay", inv.ID})
+	code := cmdInvocationsGet([]string{"--replay", inv.ID})
 	if code == 0 {
 		t.Fatalf("replay on completed invocation must fail; got exit 0")
 	}
@@ -286,9 +290,9 @@ func TestCmdInvocation_Replay_NotReplayable(t *testing.T) {
 	}
 }
 
-// TestCmdInvocation_Replay_NotFound: cross-tenant or unknown id —
+// TestCmdInvocationsGet_Replay_NotFound: cross-tenant or unknown id —
 // 404 ErrInvocationNotFound. Mirrors the IDOR-safe contract.
-func TestCmdInvocation_Replay_NotFound(t *testing.T) {
+func TestCmdInvocationsGet_Replay_NotFound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(api.Problem{
@@ -305,7 +309,7 @@ func TestCmdInvocation_Replay_NotFound(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	code := cmdInvocation([]string{"--replay", "x"})
+	code := cmdInvocationsGet([]string{"--replay", "x"})
 	if code == 0 {
 		t.Fatalf("replay on missing invocation must fail; got exit 0")
 	}
@@ -314,9 +318,9 @@ func TestCmdInvocation_Replay_NotFound(t *testing.T) {
 	}
 }
 
-// TestCmdInvocation_Read_NotFound: bare read with unknown id → 404.
+// TestCmdInvocationsGet_Read_NotFound: bare read with unknown id → 404.
 // Sanity test that the read path also routes through renderAPIError.
-func TestCmdInvocation_Read_NotFound(t *testing.T) {
+func TestCmdInvocationsGet_Read_NotFound(t *testing.T) {
 	hits := int32(0)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&hits, 1)
@@ -334,7 +338,7 @@ func TestCmdInvocation_Read_NotFound(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	code := cmdInvocation([]string{"missing-id"})
+	code := cmdInvocationsGet([]string{"missing-id"})
 	if code == 0 {
 		t.Fatalf("read on missing invocation must fail; got exit 0")
 	}
@@ -348,9 +352,10 @@ func TestCmdInvocation_Read_NotFound(t *testing.T) {
 
 // --- dispatch ---------------------------------------------------------------
 
-// TestRun_DispatchInvocation: main.go's case "invocation" routes to
-// cmdInvocation. Mirrors TestRun_DispatchMetrics.
-func TestRun_DispatchInvocation(t *testing.T) {
+// TestRun_DispatchInvocationsGet: main.go's case "invocations" routes to
+// cmdInvocations which dispatches "get" to cmdInvocationsGet. Mirrors
+// TestRun_DispatchMetrics.
+func TestRun_DispatchInvocationsGet(t *testing.T) {
 	inv := invocationFixture()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(inv)
@@ -362,11 +367,11 @@ func TestRun_DispatchInvocation(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_live_x")
 
-	if code := run([]string{"invocation", inv.ID}); code != 0 {
-		t.Fatalf("run invocation = %d, want 0", code)
+	if code := run([]string{"invocations", "get", inv.ID}); code != 0 {
+		t.Fatalf("run invocations get = %d, want 0", code)
 	}
 	if !strings.Contains(stdout.String(), "Invocation:") {
-		t.Errorf("dispatch did not reach cmdInvocation; got %q", stdout.String())
+		t.Errorf("dispatch did not reach cmdInvocationsGet; got %q", stdout.String())
 	}
 }
 

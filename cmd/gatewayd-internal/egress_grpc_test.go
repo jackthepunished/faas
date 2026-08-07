@@ -157,12 +157,14 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		// cold filesystem (CI runner pool). The test's purpose
 		// is to verify the stop+start CYCLE stays bindable, not
 		// to time the kernel's dirent publish — so wait briefly.
-		// The 5s budget is generous (originally 2s; bumped after
-		// PR #715 CI run 31202393732 — cycle 10 took >2s on a
-		// saturated runner). The CI test flake family memory
+		// The 10s budget is generous (originally 2s; bumped to 5s
+		// after PR #715 CI run 31202393732 — cycle 10 took >2s on
+		// a saturated runner; bumped to 10s after PR #721 CI run
+		// 31220955977 — cycle 11 took >5s on the same pool).
+		// The CI test flake family memory
 		// (cmd-gatewayd-warmhints-drain-cancel-pre-cancel.md)
-		// documents the same 2s → 5s bump pattern.
-		if err := waitForSocket(sock, 5*time.Second); err != nil {
+		// documents the same bump pattern.
+		if err := waitForSocket(sock, 10*time.Second); err != nil {
 			t.Fatalf("cycle %d wait for socket: %v", i, err)
 		}
 		// The dirent's appearance precedes the gRPC server's
@@ -171,9 +173,9 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		// errors eagerly on ECONNREFUSED without retrying. Wrap
 		// the dial in a small retry budget so the test's
 		// purpose (cycle stays bindable) is what we measure,
-		// not the kernel's accept-poll cadence. 5s budget
+		// not the kernel's accept-poll cadence. 10s budget
 		// mirrors the waitForSocket bump above.
-		conn, err := dialWithRetry(sock, 5*time.Second, 10*time.Millisecond)
+		conn, err := dialWithRetry(sock, 10*time.Second, 10*time.Millisecond)
 		if err != nil {
 			t.Fatalf("cycle %d dial after start: %v", i, err)
 		}

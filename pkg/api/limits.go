@@ -1730,6 +1730,43 @@ const (
 	MigratingWatchdogTickLimit       = 50
 	MigratingWatchdogIntervalSeconds = 1
 
+	// Dead-node billing reconciler. schedd's heartbeat sweep flips
+	// compute_nodes.active = false when a node stops answering, but
+	// that write deliberately does not touch `instances` — so a vmmd
+	// that dies without transitioning its rows leaves them RUNNING
+	// forever. meterd bills on State.CountsForRAM() with no
+	// node-liveness cross-check (pkg/meter/sampler.go), which means
+	// the customer keeps paying for a VM that no longer exists, and
+	// the phantom rows keep consuming the §6.2-2 RAM ceiling.
+	// Engine.ReconcileDeadNodeInstances closes both.
+	//
+	// DeadNodeReconcilerStalenessSeconds is how long a node's
+	// last_heartbeat_at may age before its RUNNING instances are
+	// considered orphaned. It MUST be ≥ the heartbeat staleness
+	// window (state.DefaultHeartbeatStaleness, 90s) — reconciling
+	// sooner than schedd itself declares a node dead would fail
+	// instances on a node that is merely slow. 120s = 90s + one 30s
+	// heartbeat interval of slack, so a single missed tick during a
+	// GC pause or a schedd restart never fails a live instance.
+	//
+	// DeadNodeReconcilerTickLimit caps the per-tick write burst. A
+	// whole node's instances can go dead at once, and this is a
+	// terminal transition — bounding the batch keeps one tick's
+	// write amplification predictable. The sweep re-runs on the next
+	// tick until the set drains, ordered longest-dead-first so the
+	// worst billing offenders are corrected first.
+	DeadNodeReconcilerStalenessSeconds = 120
+	DeadNodeReconcilerTickLimit        = 50
+
+	// DeadNodeReconcilerIntervalSeconds is the sweep cadence. 30s,
+	// not the §6.1 watchdog's 1s: the staleness window is 120s, so a
+	// 1s tick would issue 120 identical no-op queries per node-death
+	// before the first row is even eligible. 30s bounds the worst-case
+	// extra billing exposure to one tick (a node dying just after a
+	// sweep is corrected ≤150s later, well inside a single billed
+	// minute) while keeping the query load negligible.
+	DeadNodeReconcilerIntervalSeconds = 30
+
 	// Tier A7 (edge split — gatewayd-public / gatewayd-internal,
 	// ADR-070): drain + replica registry + warm-hint-cache tunables.
 	//
@@ -1826,6 +1863,13 @@ const (
 	// support (CONFIG_NF_CONNTRACK_NET_NS=n). The egress tc cap is
 	// unaffected.
 	ConntrackCap = DefaultConntrackCap
+
+	// DefaultMaxHeaderBytes caps the http.Server header size on the
+	// gatewayd-public listeners (public + control). It mirrors stdlib's
+	// historical 1 MiB default but pins it so a future stdlib default
+	// change cannot widen the attack surface on this listener; a single
+	// tenant-crafted 1 MiB header is fine, 64 MiB is not.
+	DefaultMaxHeaderBytes = 1 << 20 // 1 MiB
 )
 
 // DefaultComputeNodeCeilingMB is the per-compute-node admission ceiling

@@ -30,6 +30,7 @@ Usage:
 Commands:
   account      Manage the local account (account export|delete|restore|status|dpa|slo)
   admin        Operator-only billing ops (admin credit --reason <text> <uuid> <cents>)
+  alerts       Per-app alert rules (alerts list|add|info|update|rm|rotate-secret --app <slug>)
   audit-events Audit-log query (audit-events list|get <id>)
   apps         List your apps
   apps ls      Alias for 'gregale apps'
@@ -48,23 +49,24 @@ Commands:
   env          Pull/push .env <-> sealed secrets (--app <slug>)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
-  invocation   Get one invocation by id (--json) or re-issue a failed one (--replay)
+  invoke       Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])
+  invocations  Per-account invocation ledger (invocations list|get <id> [--replay])
   invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
   invoices     List issued invoices
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
-  metrics      Per-app request / latency / cold-boot metrics (gregale metrics <slug> [--range 5m])
+  metrics      Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
-  orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|transfer-ownership|seat-usage|invitations ...|me)
+  orgs         Manage orgs + members (orgs ls|create|info|rm|members ...|keys ...|transfer-ownership|seat-usage|invitations ...|me)
   overage-cap  Set / clear the account's overage cap (--clear | <cents>)
   park         Park an app cold (kill all live instances)
   pki          Operator local-dev PKI bootstrap (pki init|status|rotate)
   plan         Change plan (free|hobby|pro|scale)
   ps           Show live instances + state for an app
-  queue        Inspect the wake-queue depth
+  queue        Inspect the wake-queue depth (queue tail|send|receive|state|peek|dead-letter|ack)
   rollback     Re-promote the previous deployment
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets (secrets list|set|unset|list-all)
@@ -73,11 +75,10 @@ Commands:
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
   trusted-publishers  Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
-  usage        Show this month's usage (gregale usage [--month YYYY-MM])
-  usage summary  Account-wide usage roll-up (gregale usage summary [--month YYYY-MM])
+  usage        Show this month's usage (gregale usage [--month YYYY-MM]|daily [--day YYYY-MM-DD]|storage [--day YYYY-MM-DD]|summary)
   version      Print the CLI version
   wake         Wake a parked app (pulls out of snapshot)
-  webhooks     Manage outbound webhooks (webhooks list|add|update|rm|deliveries|retry|rotate-secret)
+  webhooks     Manage outbound webhooks (webhooks list|add|info|update|rm|deliveries|retry|rotate-secret)
   whoami       Show the authenticated account
 
 Run 'gregale <command> --help' for command details.
@@ -233,11 +234,28 @@ func run(args []string) int {
 		return cmdSecrets(args[1:])
 	case "account":
 		return cmdAccount(args[1:])
+	case "alerts":
+		// Tier C: per-app alert rules (list|add|info|update|rm|
+		// rotate-secret). Mirrors `webhooks` for dispatcher shape;
+		// MFA-required writes, server-validated closed-set enums.
+		return cmdAlerts(args[1:])
 	case "usage":
 		// cmdUsage dispatches: bare `gregale usage` → per-app rows;
+		// `gregale usage daily [--day X]` → per-day breakdown;
+		// `gregale usage storage [--day X]` → per-app storage bytes;
 		// `gregale usage summary [--month X]` → account roll-up.
 		// Unknown positionals are rejected by the dispatcher.
 		return cmdUsage(args[1:])
+	case "invoke":
+		// Tier C: functional smoke test. POST /v1/apps/{slug}/invoke
+		// (sync drain through the gateway) or /invoke/async (returns
+		// the status_url). Same handler the dashboard's "Test" button
+		// uses; auth + MFA + deploy:write scope.
+		return cmdInvoke(args[1:])
+	case "invocations":
+		// Tier C: per-account invocation ledger (issue #394 follow-up).
+		// Mirrors `audit-events` for dispatcher shape.
+		return cmdInvocations(args[1:])
 	case "invoices":
 		return cmdInvoices(args[1:])
 	case "billing":
@@ -263,14 +281,9 @@ func run(args []string) int {
 		// Move 1 PR-A: CLI twin for GET /v1/apps/{slug}/metrics.
 		// Same data shape the dashboard panel renders, in the
 		// terminal where the rest of the debugging happens.
+		// Tier C: --account flips to GET /v1/account/metrics
+		// (account-wide aggregate).
 		return cmdMetrics(args[1:])
-	case "invocation":
-		// Issue #315 (tier-2 DX): CLI twin for GET
-		// /v1/invocations/{id} (read) + POST
-		// /v1/invocations/{id}/replay. Surfaces the same
-		// labelled-block shape as `gregale metrics` so the
-		// post-incident muscle memory is one shape.
-		return cmdInvocation(args[1:])
 	case "slo":
 		// Move 2 PR-A: CLI twin for GET /v1/apps/{slug}/slo
 		// (issue #696 / ADR-082). Closed-set windowed SLO
@@ -278,6 +291,8 @@ func run(args []string) int {
 		// is the 5m dashboard panel.
 		return cmdSLO(args[1:])
 	case "queue":
+		// Tier C extension: tail + send|receive|state|peek|
+		// dead-letter|ack. Dispatcher lives in commands5.go.
 		return cmdQueueDispatch(args[1:])
 	case "mfa":
 		// IAM-2 / issue #186: MFA enrollment + step-up + recovery.

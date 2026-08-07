@@ -1,22 +1,22 @@
-// commands_invocations.go — issue #315 (tier-2 DX): customer-facing
-// CLI twin for GET /v1/invocations/{id} (read) and POST
-// /v1/invocations/{id}/replay (re-issue a failed invocation).
+// commands_invocations.go — `gregale invocations <list|get>` (Tier C)
+// plus the Tier B `--replay` extension on `get` (issue #315).
 //
-// The HTTP endpoints (read + replay handler) live in
-// cmd/apid/handlers_invocations.go; this file is the CLI binding so
-// a customer in their editor can inspect + re-run an invocation
-// without a dashboard detour.
+// The Tier C list/get surface closes the audit gap for
+// /v1/invocations (issue #394 follow-up: the per-account
+// invocation ledger was SDK-only). The dashboard renders the same
+// list under the invocation-log panel; this leaf is the scriptable
+// twin.
 //
-// Output shape mirrors cmdMetrics (commands_metrics.go:79) — labelled
-// block in human mode (label: value per line, never a table — the
-// fields are heterogeneous widths and the durations are formatted as
-// "ago" deltas). --json emits one indented JSON object via
-// writeJSON; --replay re-issues the invocation via the SDK's
-// ReplayInvocation helper, prints the new id + status URL.
+// `gregale invocations get <id> --replay` extends the Tier C get
+// shape with the Tier B replay action (POST
+// /v1/invocations/{id}/replay, server enforces the failed/dead_letter
+// state allow-list). The Tier C read half (`gregale invocations get
+// <id>`) replaces the standalone Tier B `gregale invocation <id>`
+// command that previously occupied this file.
 //
-// Why a separate file: keeps commands_metrics.go focused on the
-// metrics surface and gives reviewers a single ~150-line diff for
-// the invocation read+replay shape.
+// Auth: self (route is auth + requireMFA + ScopesReadSurface).
+// Replay: requires ScopesDeployWriteSurface (server-enforced).
+
 package main
 
 import (
@@ -35,38 +35,90 @@ import (
 )
 
 // invocationCmdUsage is the top-of-failure-line shown for
-// `gregale invocation` errors. Mirrors PrintUsage's docs URL
+// `gregale invocations get` errors. Mirrors PrintUsage's docs URL
 // convention (output.go:144) so the line carries the stable docs
 // site pointer.
-const invocationCmdUsage = "usage: gregale invocation <id> [--json] [--replay]"
+const invocationGetCmdUsage = "usage: gregale invocations get [--json|--replay] <id>"
 
 // invocationCmdDocsTopic is the docs topic slug appended to
-// docsURLBase when PrintUsage emits the trailing "Docs:" row. Keeps
-// the CLI's help line stable across command additions.
-const invocationCmdDocsTopic = "invocation"
+// docsURLBase when PrintUsage emits the trailing "Docs:" row. Kept
+// on the plural "invocations" namespace since the singular form is
+// gone (issue #315 collapsed into `invocations get`).
+const invocationCmdDocsTopic = "invocations"
 
-// cmdInvocation implements `gregale invocation <id> [--json]
-// [--replay]`. Mirrors the read shape of cmdMetrics
-// (commands_metrics.go:45) — single positional id + a few flags,
-// JSON single record, human labelled block.
+func cmdInvocations(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale invocations <list|get [--replay]>", "invocations")
+		return 1
+	}
+	if strings.HasPrefix(args[0], "-") {
+		return cmdInvocationsList(args)
+	}
+	switch args[0] {
+	case subList:
+		return cmdInvocationsList(args[1:])
+	case "get":
+		return cmdInvocationsGet(args[1:])
+	}
+	fmt.Fprintf(os.Stderr, "unknown invocations subcommand %q\n", args[0])
+	return 1
+}
+
+// cmdInvocationsList implements `gregale invocations list
+// [--before <cursor>] [--limit N]`. Newest first. Auth surface same
+// as cmdAuditEventsList but the server emits invocation rows, not
+// audit-event rows, so the renderer shape is different.
+func cmdInvocationsList(args []string) int {
+	fs := flag.NewFlagSet("invocations list", flag.ContinueOnError)
+	before := fs.String("before", "", "pagination cursor (NextBefore from a prior call)")
+	limit := fs.Int("limit", 50, "max rows (1..100; server caps at 100)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "usage: gregale invocations list [--before C] [--limit N]")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.ListInvocations(context.Background(), *before, *limit)
+	if err != nil {
+		return printErr("Could not list invocations", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if len(resp.Invocations) == 0 {
+		_, _ = fmt.Fprintln(osStdout, "(no invocations)")
+		return 0
+	}
+	for _, inv := range resp.Invocations {
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\n", inv.ID, inv.CreatedAt.Format("2006-01-02T15:04:05Z07:00"), inv.State, inv.Method, inv.Path)
+	}
+	return 0
+}
+
+// cmdInvocationsGet fetches one invocation by id. Same posture as
+// cmdAuditEventsGet: the list is newest-first capped at 100, so a
+// deeply old row is unreachable via scrolling.
 //
-// --replay is the load-bearing flag for this command: it issues a
-// fresh async invocation that carries the original payload +
-// headers + method + path. The new invocation's id + status URL are
-// printed below the original's row. Only invocations whose State is
-// "failed" or "dead_letter" can be replayed; everything else returns
-// the SDK's APIError (server emits 409). A failed invocation whose
-// LastError is empty still passes the state gate (the drain records
-// an error string on Fail) — the wire distinguishes the two failure
-// shapes by the State's presence in the allow-list.
-func cmdInvocation(args []string) int {
-	fs := flag.NewFlagSet("invocation", flag.ContinueOnError)
+// --replay (issue #315, tier-2 DX) re-issues a failed or dead_letter
+// invocation. The new invocation's payload/method/path match the
+// original verbatim; the operator renders the original row first
+// (so they can confirm the target id), then the new
+// AsyncInvokeResponse underneath. JSON mode emits a single
+// {"original": ..., "replay": ...} envelope so scripts have a stable
+// shape regardless of --replay presence.
+func cmdInvocationsGet(args []string) int {
+	fs := flag.NewFlagSet("invocations get", flag.ContinueOnError)
 	replay := fs.Bool("replay", false, "re-issue a failed invocation (returns the new async invocation)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 1 {
-		PrintUsage(os.Stderr, invocationCmdUsage, invocationCmdDocsTopic)
+		PrintUsage(os.Stderr, invocationGetCmdUsage, invocationCmdDocsTopic)
 		return 1
 	}
 	id := fs.Arg(0)
@@ -85,11 +137,6 @@ func cmdInvocation(args []string) int {
 		return printErr("Could not fetch invocation", err)
 	}
 	if *replay {
-		// Replay shape: render the original row first (so the operator
-		// can confirm they targeted the right id), then the new
-		// AsyncInvokeResponse underneath. JSON output collapses to a
-		// single {"original": ..., "replay": ...} envelope so scripts
-		// have a stable shape regardless of --replay presence.
 		resp, err := client.ReplayInvocation(ctx, id)
 		if err != nil {
 			var ae *APIError
@@ -119,8 +166,8 @@ func cmdInvocation(args []string) int {
 
 // renderInvocation writes the human-mode labelled block for an
 // api.Invocation. Mirrors the dashboard panel's per-invocation
-// detail view (cmd/apid/dashboard/*) so a customer toggling between
-// terminal and browser sees the same labels.
+// detail view so a customer toggling between terminal and browser
+// sees the same labels.
 //
 // Empty Optional fields (InstanceID, ScheduledAt, Result, etc.) are
 // omitted so the block stays terse for in-progress rows. CompletedAt
@@ -167,7 +214,7 @@ func renderInvocation(w io.Writer, inv api.Invocation) {
 func renderReplayResponse(w io.Writer, r api.AsyncInvokeResponse) {
 	_, _ = fmt.Fprintf(w, "Replay id:        %s\n", r.ID)
 	_, _ = fmt.Fprintf(w, "Replay status:    %s\n", r.StatusURL)
-	_, _ = fmt.Fprintln(w, "Poll with:        gregale invocation", r.ID)
+	_, _ = fmt.Fprintln(w, "Poll with:        gregale invocations get", r.ID)
 }
 
 // oneLine collapses a multi-line string into a single line for the
@@ -213,7 +260,7 @@ func oneLine(s string) string {
 // still a JSON-serialisable struct (the SDK's wire shape must not
 // silently regress to a non-marshalable form). The closure runs at
 // init; if marshalling ever breaks the build fails here instead of
-// at the first customer's `gregale invocation --json`.
+// at the first customer's `gregale invocations get --json`.
 var _ = func() error {
 	_, err := json.Marshal(api.Invocation{})
 	return err

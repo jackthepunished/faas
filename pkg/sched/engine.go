@@ -238,6 +238,17 @@ type Engine struct {
 	// (dead owner) within the next tick.
 	migratingWatchdogIntervalSeconds int
 
+	// deadNodeReconcilerStalenessSeconds is the heartbeat-age
+	// threshold beyond which a RUNNING instance on a (now-dead)
+	// node is eligible for the failed-transition self-heal.
+	// Default api.DeadNodeReconcilerStalenessSeconds = 120 s;
+	// overridable via FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS
+	// -> WithDeadNodeReconcilerStalenessSeconds. Read inside
+	// ReconcileDeadNodeInstances at tick time so the threshold is
+	// always fresh — an operator tweak to the env var doesn't
+	// require a schedd restart (the next tick picks it up).
+	deadNodeReconcilerStalenessSeconds int
+
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
 
@@ -551,6 +562,22 @@ func (e *Engine) WithMigratingWatchdogIntervalSeconds(seconds int) *Engine {
 		panic(fmt.Sprintf("sched: WithMigratingWatchdogIntervalSeconds: seconds must be > 0, got %d", seconds))
 	}
 	e.migratingWatchdogIntervalSeconds = seconds
+	return e
+}
+
+// WithDeadNodeReconcilerStalenessSeconds sets the heartbeat-age
+// threshold beyond which a RUNNING instance on a dead node is
+// eligible for the failed-transition self-heal. Same "panic on
+// bad env" contract as the other With* setters: a typo in
+// FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS must not silently
+// fall back to the api.* default. The value is read at every
+// tick, so an operator can lower it mid-flight if a customer
+// complains about a billing interval they consider too long.
+func (e *Engine) WithDeadNodeReconcilerStalenessSeconds(seconds int) *Engine {
+	if seconds <= 0 {
+		panic(fmt.Sprintf("sched: WithDeadNodeReconcilerStalenessSeconds: seconds must be > 0, got %d", seconds))
+	}
+	e.deadNodeReconcilerStalenessSeconds = seconds
 	return e
 }
 
@@ -2528,6 +2555,106 @@ func (e *Engine) ReconcileExpiredMigrations(ctx context.Context) (int, error) {
 	}
 	e.log.Info("sched: reconcile expired migrations batch done",
 		"reconciled", reconciled, "attempted", len(rows))
+	return reconciled, nil
+}
+
+// ReconcileDeadNodeInstances closes the dead-node billing leak.
+//
+// The gap it fills: schedd's heartbeat sweep calls
+// MarkComputeNodeInactive when a node stops answering, but that
+// UPDATE touches only `compute_nodes` — instance rows are left
+// untouched by design (placement reads node state; it does not
+// rewrite instance state). Meanwhile meterd's sampler bills every row
+// whose State.CountsForRAM() is true, with no node-liveness
+// cross-check. So a vmmd that dies without transitioning its rows
+// leaves them RUNNING indefinitely: the customer is billed for a VM
+// that does not exist, and the phantom rows keep consuming the
+// §6.2-2 RAM admission ceiling, suppressing real wakes.
+//
+// The sweep is deliberately conservative. A row is only failed when
+// its node has been unreachable for DeadNodeReconcilerStalenessSeconds
+// (120s) — one full heartbeat interval beyond the 90s window at which
+// schedd itself declares a node dead. Failing sooner than schedd's own
+// verdict would terminate instances on a node that is merely slow.
+//
+// Per-row safety comes from the conditional UPDATE in
+// FailRunningInstanceOnDeadNode (state = 'running' AND node_id = $2).
+// If the node recovered, or a peer already parked/evicted/migrated the
+// row, RowsAffected() is 0, the store returns ErrConflict, and we count
+// it as a peer-wins no-op rather than second-guessing the state
+// machine. That is the same race-safety contract as
+// ReconcileExpiredMigrations.
+//
+// FAILED (not PARKED) is the correct terminal state: no snapshot was
+// taken, because the VM died with its host. Claiming PARKED would
+// assert a snapshot that does not exist. FAILED is cold-bootable
+// (ADR-005: snapshots are cache, not truth), so the customer's next
+// request still serves — it just pays the cold-boot path.
+//
+// Returns (reconciled, err). err is non-nil only when the input-set
+// query fails; per-row failures are logged and counted so one wedged
+// row never stalls the sweep.
+func (e *Engine) ReconcileDeadNodeInstances(ctx context.Context) (int, error) {
+	staleness := time.Duration(api.DeadNodeReconcilerStalenessSeconds) * time.Second
+	if e.deadNodeReconcilerStalenessSeconds > 0 {
+		staleness = time.Duration(e.deadNodeReconcilerStalenessSeconds) * time.Second
+	}
+	threshold := time.Now().UTC().Add(-staleness)
+	maxPerTick := api.DeadNodeReconcilerTickLimit
+
+	rows, err := e.store.ListRunningInstancesOnDeadNodes(ctx, threshold, maxPerTick)
+	if err != nil {
+		return 0, fmt.Errorf("sched: reconcile dead-node instances: list: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if len(rows) == maxPerTick {
+		// A full batch means there may be more waiting. Worth an
+		// operator line: a whole node's fleet going dead at once is
+		// exactly the "you broke something" event this sweep exists
+		// to surface, not just silently repair.
+		e.log.Info("sched: reconcile dead-node instances: batch at cap",
+			"cap", maxPerTick)
+	}
+
+	reconciled := 0
+	for _, ins := range rows {
+		recErr := e.store.FailRunningInstanceOnDeadNode(ctx, ins.ID, ins.NodeID)
+		switch {
+		case recErr == nil:
+			// Release the admission reservation so a replacement
+			// instance can be admitted immediately. Release is
+			// idempotent and a no-op on unknown instances
+			// (admission.go), so this is safe even when the
+			// reservation was already freed by another path.
+			e.ledger.Release(ins.ID)
+			if e.ops != nil {
+				e.ops.DeadNodeReconcileDecisions("failed").Inc()
+			}
+			e.log.Warn("sched: reconcile dead-node instances: failed orphaned instance",
+				"instance_id", ins.ID, "app_id", ins.AppID, "node_id", ins.NodeID,
+				"ram_mb", ins.RAMMB)
+			reconciled++
+		case errors.Is(recErr, state.ErrConflict):
+			// Node recovered, or a peer moved the row first. Benign.
+			if e.ops != nil {
+				e.ops.DeadNodeReconcileDecisions("conflict").Inc()
+			}
+			e.log.Debug("sched: reconcile dead-node instances: peer conflict",
+				"instance_id", ins.ID, "err", recErr)
+		default:
+			if e.ops != nil {
+				e.ops.DeadNodeReconcileDecisions("error").Inc()
+			}
+			e.log.Warn("sched: reconcile dead-node instances: transition failed",
+				"instance_id", ins.ID, "node_id", ins.NodeID, "err", recErr)
+		}
+	}
+	if reconciled > 0 {
+		e.log.Warn("sched: reconcile dead-node instances batch done",
+			"reconciled", reconciled, "attempted", len(rows))
+	}
 	return reconciled, nil
 }
 

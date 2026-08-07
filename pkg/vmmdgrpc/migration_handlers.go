@@ -62,6 +62,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/grpcerr"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // activeMigration is the in-memory tracker entry for a
@@ -185,7 +186,7 @@ func (s *Server) PrepareLiveMigration(ctx context.Context, req *vmmdpb.PrepareLi
 	if req.GetInstanceId() == "" || req.GetSnapshotStorageKey() == "" {
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing fields",
-			"instance_id and snapshot_storage_key are required").WithDocs("https://docs/vmmd#prepare")
+			"instance_id and snapshot_storage_key are required").WithDocs("https://" + wire.DocsHost + "/vmmd#prepare")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -237,7 +238,7 @@ func (s *Server) PrepareLiveMigration(ctx context.Context, req *vmmdpb.PrepareLi
 		// so the orchestrator can distinguish from a fresh
 		// Park failure.
 		err2 := api.NewProblem(int(codes.AlreadyExists), api.CodeConflict,
-			"Migration already active", err.Error()).WithDocs("https://docs/vmmd#prepare")
+			"Migration already active", err.Error()).WithDocs("https://" + wire.DocsHost + "/vmmd#prepare")
 		s.ops.Observe(op, time.Since(start), err2)
 		return nil, grpcerr.ToStatus(err2)
 	}
@@ -273,7 +274,7 @@ func (s *Server) AdoptMigratedInstance(ctx context.Context, req *vmmdpb.AdoptMig
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing fields",
 			"instance_id, mem_storage_key, vmstate_storage_key, and lease_token are required").
-			WithDocs("https://docs/vmmd#adopt")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#adopt")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -287,7 +288,7 @@ func (s *Server) AdoptMigratedInstance(ctx context.Context, req *vmmdpb.AdoptMig
 			code, apiCode = int(codes.NotFound), api.CodeNotFound
 		}
 		err2 := api.NewProblem(code, apiCode, "Lease lookup failed", err.Error()).
-			WithDocs("https://docs/vmmd#adopt")
+			WithDocs("https://" + wire.DocsHost + "/vmmd#adopt")
 		s.ops.Observe(op, time.Since(start), err2)
 		return nil, grpcerr.ToStatus(err2)
 	}
@@ -312,7 +313,7 @@ func (s *Server) AcknowledgeMigration(ctx context.Context, req *vmmdpb.Acknowled
 	if req.GetInstanceId() == "" || req.GetLeaseToken() == "" {
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing fields",
-			"instance_id and lease_token are required").WithDocs("https://docs/vmmd#ack")
+			"instance_id and lease_token are required").WithDocs("https://" + wire.DocsHost + "/vmmd#ack")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}
@@ -349,7 +350,7 @@ func (s *Server) CancelLiveMigration(ctx context.Context, req *vmmdpb.CancelLive
 	if req.GetInstanceId() == "" || req.GetLeaseToken() == "" {
 		err := api.NewProblem(int(codes.InvalidArgument), api.CodeValidation,
 			"Missing fields",
-			"instance_id and lease_token are required").WithDocs("https://docs/vmmd#cancel")
+			"instance_id and lease_token are required").WithDocs("https://" + wire.DocsHost + "/vmmd#cancel")
 		s.ops.Observe(op, time.Since(start), err)
 		return nil, grpcerr.ToStatus(err)
 	}

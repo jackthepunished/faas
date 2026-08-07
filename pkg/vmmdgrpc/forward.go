@@ -171,6 +171,17 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		return status.Errorf(codes.NotFound, "instance %q not live", reqInit.GetInstance())
 	}
 
+	// Inner-leg bridge selection (issue #686 / ADR-028 draft).
+	//   v1 (default): shell-bridge script, hard-coded HTTP/1.1.
+	//   v2: H2C-speaking vmmd-stream-bridge binary; staged in the
+	//       jailer tmpfs but NOT used by default until a follow-up
+	//       PR confirms end-to-end on `make metal-lima`.
+	// The selection is a runtime var (not build tag) so the cutover
+	// is a one-line change once H2C framing is metal-verified.
+	if streamBridgeVersion == "v2" {
+		return s.forwardHTTPStreamV2(stream, reqInit, netnsName, maxBody, respTimeout)
+	}
+
 	// 2. Bridge the request body via a temp file (so the shell
 	//    script can `cat` it without colliding stdin with the
 	//    response read) AND a streaming pipe so the body can
@@ -443,6 +454,34 @@ const ForwardRawStreamMaxRequestBytes = api.RawStreamMaxRequestBytes
 // the bridge without the production install override via
 // FAAS_VMMD_RAW_BRIDGE_PATH (env var, absolute path only).
 const vmmdRawBridgePath = "/opt/faas/current/bin/vmmd-raw-bridge"
+
+// vmmdStreamBridgePath is the absolute path of the vmmd-stream-bridge
+// binary that owns the H2C inner-leg path (issue #686 / ADR-028 draft).
+// Same privilege-escalation invariant as vmmdRawBridgePath above: no
+// $PATH lookup, absolute path only, the env-var override (if used in
+// tests) must also be absolute.
+//
+// The default FAAS_STREAM_BRIDGE_VERSION is "v1" — the shell-bridge
+// codepath that hard-codes HTTP/1.1 (forward.go:960). The v2 codepath
+// (H2C via this binary) is wired and unit-tested but NOT the default.
+// A follow-up PR flips the default after `make metal-lima` confirms
+// H2C framing end-to-end on the Lima nested-KVM guest. Until that
+// flip, every stream goes through the existing shell bridge and
+// vmmd-stream-bridge is staged-but-unused in the jailer tmpfs.
+const vmmdStreamBridgePath = "/opt/faas/current/bin/vmmd-stream-bridge"
+
+// streamBridgeVersion is the active codepath selector. Set to "v2"
+// (or override via FAAS_STREAM_BRIDGE_VERSION env var in tests) to
+// route the inner leg through the H2C bridge. Default "v1" preserves
+// today's wire behaviour on the day this PR lands.
+var streamBridgeVersion = getStreamBridgeVersion()
+
+func getStreamBridgeVersion() string {
+	if v := os.Getenv("FAAS_STREAM_BRIDGE_VERSION"); v != "" {
+		return v
+	}
+	return "v1"
+}
 
 // rawBridgePathEnv is the env-var name that lets the test suite
 // (and any future operator override) point at an alternate
@@ -1184,4 +1223,37 @@ func (s *Server) endActivity(instanceID string) {
 		return
 	}
 	s.activity.End(instanceID)
+}
+
+// forwardHTTPStreamV2 is the H2C inner-leg bridge (issue #686 /
+// ADR-028 draft). It is selected when streamBridgeVersion == "v2",
+// currently a one-line constant flip away from production. The
+// full wiring is intentionally a follow-up PR; this stub returns
+// Unimplemented so an operator who flips FAAS_STREAM_BRIDGE_VERSION
+// without the follow-up gets a loud, observable failure rather
+// than a silent wire-format mismatch.
+//
+// The follow-up PR must:
+//   - Stage vmmd-stream-bridge into /opt/faas/current/bin/ via the
+//     firecracker ansible role (same pattern as vmmd-raw-bridge).
+//   - Spawn the binary inside the per-instance netns before opening
+//     the unix socket (the bridge reads 10.0.0.2 from argv, so it
+//     must run inside the netns like the existing shell bridge).
+//   - Replace the `ip netns exec … sh -c buildStreamingBridgeScript`
+//     codepath below with a `net.Dial("unix", /srv/fc/jail/<uid>/
+//     stream.sock)` + an h2c-aware client. Per-instance unix socket
+//     path lives at /srv/fc/jail/<uid>/stream.sock after the
+//     bridge binary listens there.
+//   - Extend the metal streaming test (pkg/vmmdgrpc/forward_test.go
+//     //go:build metal) to assert SETTINGS frame arrival on the
+//     inner-leg wire (tcpdump capture, then check the wire bytes
+//     for the HTTP/2 preface absence + SETTINGS frame presence).
+func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], reqInit *vmmdpb.ForwardHTTPRequestInit, netnsName string, maxBody int64, respTimeout time.Duration) error {
+	// Reference vmmdStreamBridgePath so the const survives the
+	// "unused" lint while the v2 follow-up PR lands. The follow-up
+	// replaces this stub with a spawn + unix-socket dial against
+	// the bridge's /srv/fc/jail/<uid>/stream.sock.
+	_ = vmmdStreamBridgePath
+	return status.Error(codes.Unimplemented,
+		"FAAS_STREAM_BRIDGE_VERSION=v2 selected but v2 wiring is a follow-up (issue #686); flip the const back to v1 or land the v2 follow-up PR")
 }

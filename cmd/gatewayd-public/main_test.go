@@ -1,8 +1,11 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 // TestEnvOr_EmptyFallback pins the envOr semantics (empty env
@@ -39,5 +42,29 @@ func TestHstsEnabledFromEnv_LookupEnv(t *testing.T) {
 	}
 	if v := hstsEnabledFromEnv("FAAS_HSTS_ENABLED"); v != "" {
 		t.Errorf("hstsEnabledFromEnv unset = %q, want empty string", v)
+	}
+}
+
+// TestDefaultPublicControlAddr_ADR070 pins the loopback control
+// listener default at :9092 per ADR-070 (Tier A7 edge split). The
+// legacy gatewayd daemon binds :9090 on the same node; a default
+// drift here would silently collide and crash-loop both daemons on
+// a non-systemd bring-up.
+func TestDefaultPublicControlAddr_ADR070(t *testing.T) {
+	if defaultPublicControlAddr != "127.0.0.1:9092" {
+		t.Errorf("defaultPublicControlAddr = %q, want 127.0.0.1:9092 (ADR-070)", defaultPublicControlAddr)
+	}
+}
+
+// TestBuildServers_PinsMaxHeaderBytes asserts both servers expose
+// MaxHeaderBytes = api.DefaultMaxHeaderBytes. A future stdlib default
+// change cannot widen the attack surface on this listener.
+func TestBuildServers_PinsMaxHeaderBytes(t *testing.T) {
+	pub, ctrl := buildServers("127.0.0.1:8080", "127.0.0.1:9092", http.NotFoundHandler(), http.NewServeMux())
+	if pub.MaxHeaderBytes != api.DefaultMaxHeaderBytes {
+		t.Errorf("public MaxHeaderBytes = %d, want %d", pub.MaxHeaderBytes, api.DefaultMaxHeaderBytes)
+	}
+	if ctrl.MaxHeaderBytes != api.DefaultMaxHeaderBytes {
+		t.Errorf("control MaxHeaderBytes = %d, want %d", ctrl.MaxHeaderBytes, api.DefaultMaxHeaderBytes)
 	}
 }
