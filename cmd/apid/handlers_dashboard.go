@@ -28,6 +28,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/dashboard"
+	"github.com/onebox-faas/faas/pkg/dashboard/views"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -237,6 +238,18 @@ func (s *server) renderAppsList(w http.ResponseWriter, r *http.Request, log *slo
 	// Reuse the already-fetched apps list for the count (review
 	// finding #5: avoid a second SQL round-trip when we already
 	// have the data).
+	// Issue #696 / ADR-082 dashboard follow-up PR — per-row SLO
+	// badge. The badge shows the worst-field value (p95 latency
+	// if elevated, else error rate) and the colour reflects the
+	// threshold. Cost tripwire: capped at 25 apps (matches
+	// dashboardSLOAppsListBadgeCap) so a 100-app account doesn't
+	// issue 100 PromQL calls per render. nil = no badge.
+	badges := s.fetchDashboardSLOBadges(ctx, log, items, acct)
+	for i := range items {
+		if badge, ok := badges[items[i].Slug]; ok {
+			items[i].SLO = &badge
+		}
+	}
 	page := dashboard.Page{Title: "Apps", Body: "apps_list", Account: dashboardAccountView(view, len(apps)), Data: items}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
@@ -368,6 +381,17 @@ func (s *server) renderAppDetail(w http.ResponseWriter, r *http.Request, log *sl
 		// page render. The 3s timeout matches the per-query timeout
 		// in pkg/promql.
 		Metrics: s.fetchDashboardMetrics(ctx, log, app.ID),
+		// Issue #696 / ADR-082 dashboard follow-up PR — best-effort
+		// SLO panel. Same 3s budget envelope as Metrics. Window is
+		// resolved from ?window= on the URL (default 24h, "1h" / "24h"
+		// / "7d" closed set; invalid → default). The stamp echoes the
+		// active window so the template's window-selector tab strip
+		// can mark the current tab.
+		SLOApp: s.fetchDashboardSLO(ctx, log, app, acct, resolveSLOWindow(r)),
+		SLODuration: views.SLOStamp{
+			Window: resolveSLOWindow(r),
+			AsOf:   time.Now().UTC().Format(time.RFC3339Nano),
+		},
 		// Issue #396 / ADR-045 PR 4 — best-effort alert-rule
 		// snapshot. Failure is non-fatal: a Postgres blip on the
 		// alert_rules read renders the panel's warning empty-state
@@ -946,6 +970,15 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 				"New apps now require \"Authorization: Bearer <token>\" by default; "+
 				"run \"gregale app <slug> --no-require-authn --public-auth=open\" to opt out any pre-flip app.",
 			cutover, n)
+	}
+	// Issue #696 / ADR-082 dashboard follow-up PR — best-effort
+	// per-account SLO panel. Mirrors the per-app fetch in
+	// renderAppDetail. Same 3s budget envelope; nil = skip the
+	// section entirely (Prometheus not configured / fetch failed).
+	data.SLOAccount = s.fetchDashboardAccountSLO(r.Context(), log, acct, resolveSLOWindow(r))
+	data.SLODuration = views.SLOStamp{
+		Window: resolveSLOWindow(r),
+		AsOf:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	page := dashboard.Page{Title: "Account", Body: "account", Account: dashboardAccountView(view, appCount), Data: data}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
