@@ -3452,7 +3452,15 @@ paths:
               schema: { $ref: '#/components/schemas/AsyncInvokeResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+        '409':
+          description: |
+            The invocation is not in a replayable state. Returns the
+            `invocation_not_replayable` problem code with the current
+            state in the detail field; only `failed` and `dead_letter`
+            invocations can be replayed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/delayed-tasks/{id}:

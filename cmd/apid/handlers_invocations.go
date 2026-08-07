@@ -498,6 +498,18 @@ func (s *server) getInvocation(w http.ResponseWriter, r *http.Request, acct stat
 // path as getInvocation). Replay carries the customer's auth
 // context; the original's AccountID is never reused — we always
 // stamp acct.ID on the new row.
+//
+// IDOR defense (peer review of PR #733, finding F1): the handler
+// verifies BOTH that the original invocation belongs to the replayer's
+// account AND that the app the original ran against still does. If
+// the app has been transferred to a different account (orgs move
+// apps, accounts get re-assigned), an old failed invocation retained
+// under the original account must NOT be replayable against the
+// now-foreign app. The check is `app.AccountID == acct.ID` mirroring
+// loadAppAndPreflight (handlers.go:312); any mismatch surfaces 404
+// ErrInvocationNotFound, indistinguishable from a missing
+// invocation (no information leak about whether the app or the
+// invocation was the foreign object).
 func (s *server) replayInvocation(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	id := r.PathValue("id")
 	orig, err := s.store.InvocationByID(r.Context(), id)
@@ -505,6 +517,16 @@ func (s *server) replayInvocation(w http.ResponseWriter, r *http.Request, acct s
 		// Same 404 path as getInvocation — IDOR-safe. Don't
 		// surface 403 on a cross-tenant attempt; that would
 		// leak the existence of the row.
+		api.WriteProblem(w, api.ErrInvocationNotFound(id))
+		return
+	}
+	// Re-verify the original's app still belongs to the replayer's
+	// account. The original's AccountID may match the replayer's
+	// while the app has been transferred to a different account;
+	// without this check, the replay would land on a foreign app.
+	app, err := s.store.AppByID(r.Context(), orig.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		// Same 404 surface as the invocation check — never 403.
 		api.WriteProblem(w, api.ErrInvocationNotFound(id))
 		return
 	}

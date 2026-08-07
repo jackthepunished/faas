@@ -249,20 +249,65 @@ func TestReplayInvocation_UnknownID(t *testing.T) {
 	}
 }
 
-// TestReplayInvocation_RequiresMFA: the route is registered under
-// requireMFA (server.go:899). MFA enforcement on Free plans is
-// tested in cmd/apid/handlers_account_scoped_test.go
-// (TestMFARequired_Omitted); this test pins only that the replay
-// route participates in the same middleware stack. We use a Pro
-// plan and confirm the happy path returns 202 — the negative
-// path (no MFA enrolled) is covered by the test files that
-// exercise every other /v1/* mutation.
+// TestReplayInvocation_AppTransferredAway: the peer review (PR #733
+// finding F1) surfaced a gap where the replay handler only checked
+// orig.AccountID == acct.ID. After an app transfer/reassignment, an
+// old failed invocation retained under the original account could
+// be replayed against the now-foreign app. The fix re-loads the
+// app by orig.AppID and verifies app.AccountID == acct.ID; this
+// test pins the contract.
 //
-// Skipped rather than deleted so the test name documents the
-// contract in the test listing — any future refactor that drops
-// requireMFA from the replay route will surface here.
-func TestReplayInvocation_RequiresMFA(t *testing.T) {
-	t.Skip("MFA enforcement covered by TestMFARequired_Omitted; this test documents the route's middleware participation")
+// Set-up: the env's account owns the invocation row, but the
+// referenced app belongs to a foreign account. We construct that
+// scenario directly via the store (CreateApp takes a full App
+// struct, AccountID included; UpdateApp is a PATCH-style API that
+// does not expose AccountID by design — the real transfer path is
+// a separate, audited operation that's out of scope here).
+//
+// The replay from the env's account must now return 404, matching
+// the IDOR-safe pattern (never 403, never 200).
+func TestReplayInvocation_AppTransferredAway(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	// Seed a foreign app on a different account.
+	foreignApp, err := e.store.CreateApp(context.Background(), state.App{
+		AccountID: "00000000-0000-0000-0000-000000000099",
+		Slug:      "foreign-app",
+		Type:      state.AppTypeApp,
+		Status:    state.AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp foreign: %v", err)
+	}
+	// Insert an invocation that points at the foreign app but
+	// carries the env's account_id (the post-transfer state).
+	now := time.Now().UTC()
+	inv, err := e.store.EnqueueInvocation(context.Background(), state.Invocation{
+		AppID:     foreignApp.ID,
+		AccountID: e.acct.ID, // the env's account still owns the row
+		Source:    state.InvocationAsyncInvoke,
+		Method:    "POST",
+		Path:      "/api/charge",
+		Payload:   json.RawMessage(`{"amount":42}`),
+		DueAt:     now,
+		CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueInvocation: %v", err)
+	}
+	// Flip the row to failed so it would pass the state allow-list
+	// if the app-ownership check didn't catch the mismatch first.
+	if _, err := e.store.ClaimInvocation(context.Background(), inv.ID, "test-inst", 30); err != nil {
+		t.Fatalf("ClaimInvocation: %v", err)
+	}
+	if err := e.store.FailInvocation(context.Background(), inv.ID, "test failure", 0, 0); err != nil {
+		t.Fatalf("FailInvocation: %v", err)
+	}
+
+	rec := e.do(t, "POST", "/v1/invocations/"+inv.ID+"/replay", nil, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("replay against foreign app status = %d, want 404 (IDOR-safe); body=%s",
+			rec.Code, rec.Body.String())
+	}
 }
 
 // (the test file relies on strings.Contains directly — main_test.go

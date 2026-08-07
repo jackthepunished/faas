@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -367,4 +368,54 @@ func TestRun_DispatchInvocation(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Invocation:") {
 		t.Errorf("dispatch did not reach cmdInvocation; got %q", stdout.String())
 	}
+}
+
+// TestOneLine: peer review (PR #733 finding F3) flagged that
+// oneLine used s[:max-1] (byte slice) which can split a multibyte
+// rune and emit invalid UTF-8 to the terminal. The fix truncates
+// on rune boundaries — this test pins the contract for both
+// short (no truncation), exact-cap (no truncation), and the
+// over-cap path that previously emitted invalid UTF-8.
+//
+// CJK rebar: 宁 = 3 bytes (E5 AE 81), so a 119-byte input with
+// enough 3-byte glyphs forces the cut inside a multibyte sequence
+// under the old code. The new path keeps the rune count at or
+// under max-1 and emits a valid UTF-8 "…" suffix.
+func TestOneLine(t *testing.T) {
+	t.Run("short ASCII passes through", func(t *testing.T) {
+		got := oneLine("hello world")
+		if got != "hello world" {
+			t.Errorf("oneLine(short ASCII) = %q, want %q", got, "hello world")
+		}
+	})
+	t.Run("exact-rune-cap not truncated", func(t *testing.T) {
+		// 120 runes of ASCII sits exactly at the cap; no truncation.
+		s := strings.Repeat("a", 120)
+		got := oneLine(s)
+		if got != s {
+			t.Errorf("oneLine(120 'a's) was truncated; rune count = %d", utf8.RuneCountInString(got))
+		}
+	})
+	t.Run("over-cap truncated on rune boundary", func(t *testing.T) {
+		// 200 3-byte CJK runes = 600 bytes. Under the old byte-slice
+		// logic, s[:119] would split in the middle of a glyph and
+		// emit invalid UTF-8. The new path keeps 119 runes + "…".
+		s := strings.Repeat("宁", 200)
+		got := oneLine(s)
+		if !utf8.ValidString(got) {
+			t.Fatalf("oneLine(%d '宁') = %q is not valid UTF-8", len(s), got)
+		}
+		if utf8.RuneCountInString(got) > 120 {
+			t.Errorf("oneLine rune count = %d, want ≤ 120", utf8.RuneCountInString(got))
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Errorf("oneLine over-cap must end with the ellipsis sentinel; got %q", got)
+		}
+	})
+	t.Run("newlines collapsed to spaces", func(t *testing.T) {
+		got := oneLine("line1\nline2\r\nline3")
+		if got != "line1 line2  line3" {
+			t.Errorf("oneLine(newlines) = %q, want %q", got, "line1 line2  line3")
+		}
+	})
 }

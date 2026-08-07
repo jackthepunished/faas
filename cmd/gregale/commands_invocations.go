@@ -29,6 +29,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -175,15 +176,37 @@ func renderReplayResponse(w io.Writer, r api.AsyncInvokeResponse) {
 // alignment. Long payloads (>120 chars) are truncated with "…" so a
 // stray base64 blob doesn't blow past the terminal width — the JSON
 // path carries the full string verbatim.
+//
+// Truncation honours rune boundaries: a byte slice at max-1 can
+// split a multibyte UTF-8 sequence and emit invalid UTF-8 to a
+// terminal that handles all-writes-as-bytes. We always truncate on
+// a rune boundary so the output is always valid UTF-8. (A 4-byte
+// CJK glyph at the cut means we keep one fewer rune than the byte
+// ceiling — acceptable; the cap is a terminal-width hint, not a
+// wire contract.)
 func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\r", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.TrimSpace(s)
 	const max = 120
-	if len(s) > max {
-		return s[:max-1] + "…"
+	// Rune count is what the terminal sees; byte length would
+	// over-count multibyte sequences and trip the cap on short
+	// UTF-8 strings.
+	if utf8.RuneCountInString(s) <= max {
+		return s
 	}
-	return s
+	var b strings.Builder
+	b.Grow(max + 3) // worst-case "…" + slack
+	count := 0
+	for _, r := range s {
+		if count == max-1 {
+			break
+		}
+		b.WriteRune(r)
+		count++
+	}
+	b.WriteString("…")
+	return b.String()
 }
 
 // ensureJSONReusable is a compile-time check that api.Invocation is
