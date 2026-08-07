@@ -95,7 +95,7 @@ func TestElectLeaderFromNodes_MixedFiltersInactive(t *testing.T) {
 }
 
 // Empty Name with Active=true is filtered out — guards against a
-// future schema migration that flips a row's Name to ''. The
+// future schema migration that flips a row's Name to ”. The
 // partial index `idx_compute_nodes_active` does not cover this
 // case.
 func TestElectLeaderFromNodes_EmptyNameFiltered(t *testing.T) {
