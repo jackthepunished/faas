@@ -81,6 +81,21 @@ func (s *server) requireStepUp(ttl time.Duration) func(accountHandler) accountHa
 	}
 }
 
+// requireStepUpStrict is the PR-9 §4 twin of requireStepUp: same
+// 5m TTL but the bearer-key branch is rejected with 403 instead
+// of bypassed. Used on acceptInvitation only — the threat model
+// "a leaked invitation token can mint org membership without a
+// fresh TOTP" justifies the closure even on bearer principals.
+// The remaining 8 requireStepUp mounts keep the documented bypass
+// pending per-route audit.
+func (s *server) requireStepUpStrict(ttl time.Duration) func(accountHandler) accountHandler {
+	return func(next accountHandler) accountHandler {
+		pkgNext := middleware.AccountHandler(next)
+		pkgHandler := s.authMw.RequireStepUpStrict(ttl)(pkgNext)
+		return authAccountHandler(pkgHandler)
+	}
+}
+
 // requireStepUpHandler is the http.Handler-shaped twin for
 // dashboard routes (cmd/apid/server.go wires /dashboard/account/*
 // through sessionAuth → http.Handler, not through AccountHandler).

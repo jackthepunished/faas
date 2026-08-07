@@ -175,6 +175,14 @@ var ErrAPIKeyExpired = errors.New("state: api key expired")
 // Issue #189 / IAM-5.
 var ErrAPIKeyRevoked = errors.New("state: api key revoked")
 
+// ErrInvalidCursor is returned by List*ForOrgPage and friends when
+// the `before` cursor doesn't parse as a valid compound key. The
+// handler maps this to a 400 with the `invalid_cursor` Problem code;
+// PR-9 deliberately rejects the v1 behavior of silently returning
+// zero rows because that made broken clients fall behind without
+// any signal.
+var ErrInvalidCursor = errors.New("state: invalid cursor")
+
 // MaxDeploymentLogPage caps the per-call row count for
 // ListDeploymentLogs. Both implementations clamp the caller's
 // `limit` to this value before allocating — defense in depth so a
@@ -238,6 +246,24 @@ type Store interface {
 	// the e2e harness SeedAccount route through this helper.
 	CreateAccountWithPersonalOrg(ctx context.Context, params CreateAccountWithPersonalOrgParams) (CreateAccountWithPersonalOrgResult, error)
 	AccountByID(ctx context.Context, id string) (Account, error)
+	// AccountsByIDs returns a map of every account present in `ids`
+	// keyed by ID. Missing IDs are NOT errors — they simply don't
+	// appear in the returned map. The handler that joins this into
+	// dashboard renders treats absence as the "(deleted account)"
+	// race case (same contract as AccountByID's per-row missing
+	// case at cmd/apid/handlers_dashboard.go's
+	// dashboardMembershipProjection).
+	//
+	// Caller contract: empty `ids` returns (empty map, nil) without
+	// issuing a query; the planner renders an empty `ANY($1)` as
+	// never-true, so PgStore short-circuits. This is the batch
+	// equivalent of memstore.go's ListLatestInstancePerApp pattern
+	// (function-top lock + map absence + no per-id error shape).
+	//
+	// PR-9 §1: closes the N+1 fan-out in the org-detail dashboard
+	// render where every active member used to trigger a separate
+	// AccountByID round-trip.
+	AccountsByIDs(ctx context.Context, ids []string) (map[string]Account, error)
 	AccountByEmail(ctx context.Context, email string) (Account, error)
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
 	UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error

@@ -628,6 +628,78 @@ func TestRequireStepUp_MissingStamp_403(t *testing.T) {
 	}
 }
 
+// TestRequireStepUpStrict_BearerKey_RejectsWithoutFreshStepUp
+// (PR-9 §4) — pin the strict-mode rejection: with no step-up
+// stamp on the request (the bearer-key path), the gate MUST
+// fire with 403 instead of bypassing. PR-9 closes the
+// "API key is step-up-equivalent proof" assumption on routes
+// where a leaked token alone is sufficient to perform the
+// action (acceptInvitation is the first such route).
+func TestRequireStepUpStrict_BearerKey_RejectsWithoutFreshStepUp(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("POST", "/v1/invitations/abc/accept", nil, nil)
+	hits := 0
+	h := mw.RequireStepUpStrict(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		hits++
+	})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	// Strict mode: missing-stamp = REJECT with 403. The
+	// next handler must not run.
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (strict misses must reject)", hits)
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("code = %d, want 403", rec.Code)
+	}
+	// Audit row fires with strict=true.
+	rows := audit.rowsOf("auth.step_up_required")
+	if len(rows) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(rows))
+	}
+	if rows[0].data["strict"] != true {
+		t.Errorf("data.strict = %v, want true", rows[0].data["strict"])
+	}
+	if rows[0].data["reason"] != "missing" {
+		t.Errorf("data.reason = %v, want missing", rows[0].data["reason"])
+	}
+}
+
+// TestRequireStepUpStrict_FreshStamp_Passes (PR-9 §4) — pin the
+// happy path: a fresh step-up stamp on the request passes
+// through to the next handler. The strict mode is identical to
+// the lax mode for cookie principals whose stamp is fresh.
+func TestRequireStepUpStrict_FreshStamp_Passes(t *testing.T) {
+	authn := newFakeAuthn()
+	audit := &fakeAuditor{}
+	lim := middleware.NewLimiter(middleware.AuthLimitConfig{})
+	mw := authmw.New(authn, &fakeSessions{}, &fakeLookups{}, audit,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), lim, nil)
+
+	rec := httptest.NewRecorder()
+	r := mkRequest("POST", "/v1/invitations/abc/accept", nil, nil)
+	// Stamp set 30s ago — well within the 5m TTL.
+	r = r.WithContext(authmw.WithStepUp(r.Context(), time.Now().Add(-30*time.Second)))
+	hits := 0
+	h := mw.RequireStepUpStrict(5 * time.Minute)(func(_ http.ResponseWriter, _ *http.Request, _ state.Account) {
+		hits++
+	})
+	h(rec, r, mkActiveAccount("acct-1"))
+
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1 (fresh stamp passes)", hits)
+	}
+	if rows := audit.rowsOf("auth.step_up_required"); len(rows) != 0 {
+		t.Errorf("audit rows = %d, want 0 (fresh stamp passes)", len(rows))
+	}
+}
+
 // --- RequireSession: session-cookie branch -------------------------------
 
 func TestRequireSession_SessionHappyPath(t *testing.T) {

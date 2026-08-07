@@ -21,11 +21,14 @@ class InvitationListResponse:
 
     invitations: list[OrgInvitationResponse]
     next_before: str | Unset = UNSET
-    """Opaque cursor — set to the `id` of the last row on this
-    page when there's a next page. Pass back as `?before=`
-    to fetch it. Matches the same cursor shape as
-    MemberListResponse / AppListResponse so the SDK can
-    share one walker.
+    """Opaque cursor — set to the **base64-url-of-JSON** of
+    the last row's compound `(created_at, id)` key when
+    there's a next page. Pass back as `?before=` to
+    fetch it. PR-9 changes the encoding from the v1
+    bare-id cursor to the compound key so the
+    `created_at DESC, id DESC` order is preserved
+    exactly under random UUIDs. The wire shape is
+    opaque; clients MUST pass the value back unchanged.
     """
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

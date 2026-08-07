@@ -151,6 +151,38 @@ The bypass tolerance is the only place the gate is soft. The
 auth audit row classifies the branch (`reason: "missing"`) so
 operators can identify legacy cookies in production.
 
+## Tightened on acceptInvitation in PR-9
+
+PR-9 (issue #190 / IAM-6 follow-up) closes the bearer-bypass on
+`POST /v1/invitations/{token}/accept` only. The threat model:
+
+> a bearer with a leaked invitation token can mint themselves
+> into the target org with no fresh TOTP — the token alone is
+> sufficient to grant org membership.
+
+This is the one route where a leaked token alone is sufficient
+to perform the action. The other 8 `requireStepUp` mounts keep
+the v1 bypass pending per-route audit (each route's threat model
+must be re-evaluated individually against the same shape).
+
+The implementation:
+
+- `pkg/auth/middleware/middleware.go::RequireStepUpStrict` is a
+  sibling of `RequireStepUp` with the same TTL semantics but no
+  bearer-bypass branch. The cookie path is identical.
+- `cmd/apid/auth_facade.go::requireStepUpStrict` is the
+  server-side wrapper.
+- `cmd/apid/server.go:666` (the `acceptInvitation` mount) now
+  wires `requireStepUpStrict(5*time.Minute)` instead of the lax
+  `requireStepUp`. The remaining 8 mounts keep the v1 wiring.
+- The audit row fires with `strict: true` so the operator can
+  filter for the new posture in audit queries (e.g. `WHERE
+  data->>'strict' = 'true'`).
+
+PR-9.3 (file as separate issue) extends the same audit to each
+remaining route. Each route's audit is a PR-sized change against
+its specific threat model.
+
 ## Audit kinds
 
 - `auth.step_up_required` — `{path, method, reason: "missing"

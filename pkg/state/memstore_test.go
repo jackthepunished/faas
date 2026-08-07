@@ -140,6 +140,78 @@ func TestCreateAccountDuplicateEmail(t *testing.T) {
 	}
 }
 
+// TestMemStoreAccountsByIDs exercises the batch helper that
+// closes the N+1 fan-out in the dashboard org-detail render
+// (PR-9 §1). Mirrors the per-row AccountByID contract: missing
+// IDs are absent from the returned map (NOT errors), and the
+// empty-slice short-circuit returns an empty map without
+// touching the map.
+func TestMemStoreAccountsByIDs(t *testing.T) {
+	m := NewMemStore()
+	ctx := context.Background()
+
+	// Empty input → empty map, no error.
+	got, err := m.AccountsByIDs(ctx, nil)
+	if err != nil {
+		t.Fatalf("AccountsByIDs(nil) err = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(AccountsByIDs(nil)) = %d, want 0", len(got))
+	}
+	got, err = m.AccountsByIDs(ctx, []string{})
+	if err != nil {
+		t.Fatalf("AccountsByIDs([]) err = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(AccountsByIDs([])) = %d, want 0", len(got))
+	}
+
+	// Seed three accounts.
+	a1, err := m.CreateAccount(ctx, "alice@example.com", api.PlanHobby)
+	if err != nil {
+		t.Fatalf("CreateAccount alice: %v", err)
+	}
+	a2, err := m.CreateAccount(ctx, "bob@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount bob: %v", err)
+	}
+	a3, err := m.CreateAccount(ctx, "carol@example.com", api.PlanScale)
+	if err != nil {
+		t.Fatalf("CreateAccount carol: %v", err)
+	}
+
+	// Two present + one absent → map has 2 entries keyed by ID.
+	missing := uuid.NewString()
+	got, err = m.AccountsByIDs(ctx, []string{a1.ID, a2.ID, missing})
+	if err != nil {
+		t.Fatalf("AccountsByIDs: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(got) = %d, want 2", len(got))
+	}
+	if g1, ok := got[a1.ID]; !ok || g1.Email != a1.Email {
+		t.Errorf("got[a1] = %+v, ok=%v, want Email=%q", g1, ok, a1.Email)
+	}
+	if g2, ok := got[a2.ID]; !ok || g2.Email != a2.Email {
+		t.Errorf("got[a2] = %+v, ok=%v, want Email=%q", g2, ok, a2.Email)
+	}
+	if _, ok := got[missing]; ok {
+		t.Errorf("missing ID %q should not appear in map", missing)
+	}
+	if _, ok := got[a3.ID]; ok {
+		t.Errorf("a3.ID should not appear (not requested)")
+	}
+
+	// Duplicate IDs in the request → only one entry per unique ID.
+	got, err = m.AccountsByIDs(ctx, []string{a1.ID, a1.ID, a2.ID})
+	if err != nil {
+		t.Fatalf("AccountsByIDs dup: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("len(got) = %d, want 2 (unique IDs)", len(got))
+	}
+}
+
 func TestAccountByKeyHash(t *testing.T) {
 	m := NewMemStore()
 	ctx := context.Background()

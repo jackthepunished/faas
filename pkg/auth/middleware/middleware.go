@@ -801,6 +801,15 @@ func (m *Middleware) RequireMFA(next AccountHandler) AccountHandler {
 
 // --- RequireStepUp -------------------------------------------------------
 
+// Step-up audit "reason" values. Three occurrences (RequireStepUp,
+// RequireStepUpHandler, RequireStepUpStrict) trigger goconst at
+// 3 — keeping them as named constants is also the contract for
+// downstream SQL queries that filter on `data->>'reason'`.
+const (
+	stepUpReasonMissing = "missing"
+	stepUpReasonExpired = "expired"
+)
+
 // RequireStepUp gates a route on a fresh TOTP step-up. Reads the
 // stamp set by RequireSession's session-cookie branch (StepUpFrom)
 // and rejects when it's missing or older than ttl. Bearer-key
@@ -826,6 +835,14 @@ func (m *Middleware) RequireMFA(next AccountHandler) AccountHandler {
 //
 // The new stamp is written by /v1/account/mfa/verify on every
 // success — see cmd/apid/handlers_mfa.go reissueSessionCookie.
+//
+// PR-9: a per-route opt-in is needed for acceptInvitation: the
+// threat model "a bearer with a leaked invitation token can mint
+// themselves into the target org without a fresh TOTP" is closed
+// by RequireStepUpStrict, which fails-fast on the no-stamp branch
+// (the bearer path). All other sensitive routes continue to use
+// RequireStepUp with the documented bypass until the next PR
+// audits each route's threat model individually.
 func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) AccountHandler {
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
@@ -853,9 +870,9 @@ func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) Accou
 				next(w, r, acct)
 				return
 			}
-			reason := "missing"
+			reason := stepUpReasonMissing
 			if !ts.IsZero() {
-				reason = "expired"
+				reason = stepUpReasonExpired
 			}
 			api.WriteProblem(w, api.ErrStepUpRequired())
 			if m.Audit != nil {
@@ -864,6 +881,51 @@ func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) Accou
 					"method":  r.Method,
 					"reason":  reason,
 					"ttl_sec": int(ttl.Seconds()),
+				})
+			}
+		}
+	}
+}
+
+// RequireStepUpStrict is the same gate as RequireStepUp but the
+// bearer-key branch is REJECTED with 403 step_up_required, not
+// bypassed. Use this on routes where the threat model explicitly
+// excludes the bearer-key equivalent-proof posture — i.e. where a
+// leaked token alone is sufficient to perform the action and the
+// step-up chain exists to require a fresh TOTP even from the
+// bearer principal.
+//
+// PR-9: acceptInvitation is the first route to mount Strict.
+// Future PRs audit each remaining requireStepUp mount individually
+// (cmd/apid/server.go grep `requireStepUp` for the full list).
+//
+// The cookie path is unchanged — the absence of a step-up stamp
+// on a session-cookie principal still fails-fast (the v1 cookie
+// branch already did, and the Envelope.StepUpAt omission is the
+// same condition).
+func (m *Middleware) RequireStepUpStrict(ttl time.Duration) func(AccountHandler) AccountHandler {
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return func(next AccountHandler) AccountHandler {
+		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
+			ts, has := StepUpFrom(r)
+			if has && !ts.IsZero() && time.Since(ts) <= ttl {
+				next(w, r, acct)
+				return
+			}
+			reason := stepUpReasonMissing
+			if has && !ts.IsZero() {
+				reason = stepUpReasonExpired
+			}
+			api.WriteProblem(w, api.ErrStepUpRequired())
+			if m.Audit != nil {
+				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
+					"path":    r.URL.Path,
+					"method":  r.Method,
+					"reason":  reason,
+					"ttl_sec": int(ttl.Seconds()),
+					"strict":  true,
 				})
 			}
 		}
@@ -892,9 +954,9 @@ func (m *Middleware) RequireStepUpHandler(ttl time.Duration) func(http.Handler) 
 				next.ServeHTTP(w, r)
 				return
 			}
-			reason := "missing"
+			reason := stepUpReasonMissing
 			if !ts.IsZero() {
-				reason = "expired"
+				reason = stepUpReasonExpired
 			}
 			api.WriteProblem(w, api.ErrStepUpRequired())
 			if m.Audit != nil {

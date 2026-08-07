@@ -129,6 +129,63 @@ func (q *Queries) AccountByKeyHash(ctx context.Context, db DBTX, keySha256 []byt
 	return i, err
 }
 
+const accountsByIDs = `-- name: AccountsByIDs :many
+select id, email, plan, status, coalesce(provider_customer_id, ''), coalesce(stripe_subscription_item, ''), created_at, deletion_requested_at, last_quota_warning_at, past_due_at, mfa_enrolled_at, mfa_secret_encrypted, mfa_recovery_codes_hash, mfa_required
+from accounts where id = any($1::uuid[])
+`
+
+type AccountsByIDsRow struct {
+	ID                     pgtype.UUID
+	Email                  interface{}
+	Plan                   string
+	Status                 string
+	ProviderCustomerID     string
+	StripeSubscriptionItem string
+	CreatedAt              pgtype.Timestamptz
+	DeletionRequestedAt    pgtype.Timestamptz
+	LastQuotaWarningAt     pgtype.Timestamptz
+	PastDueAt              pgtype.Timestamptz
+	MfaEnrolledAt          pgtype.Timestamptz
+	MfaSecretEncrypted     []byte
+	MfaRecoveryCodesHash   [][]byte
+	MfaRequired            bool
+}
+
+func (q *Queries) AccountsByIDs(ctx context.Context, db DBTX, dollar_1 []pgtype.UUID) ([]AccountsByIDsRow, error) {
+	rows, err := db.Query(ctx, accountsByIDs, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AccountsByIDsRow{}
+	for rows.Next() {
+		var i AccountsByIDsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.Plan,
+			&i.Status,
+			&i.ProviderCustomerID,
+			&i.StripeSubscriptionItem,
+			&i.CreatedAt,
+			&i.DeletionRequestedAt,
+			&i.LastQuotaWarningAt,
+			&i.PastDueAt,
+			&i.MfaEnrolledAt,
+			&i.MfaSecretEncrypted,
+			&i.MfaRecoveryCodesHash,
+			&i.MfaRequired,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const appByID = `-- name: AppByID :one
 select id, account_id, slug, type, coalesce(runtime, ''), ram_mb, coalesce(idle_timeout_s, 0),
        max_concurrency, status, manifest, created_at

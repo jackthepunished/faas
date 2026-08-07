@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cursor"
 )
 
 // stripePushKey is the (account, hour) dedupe key the hourly Stripe
@@ -670,6 +671,27 @@ func (m *MemStore) AccountByID(_ context.Context, id string) (Account, error) {
 		return Account{}, ErrNotFound
 	}
 	return a, nil
+}
+
+// AccountsByIDs is the batch equivalent of AccountByID for the
+// in-memory store. Function-top lock + map absence + no per-id
+// error shape — mirrors the ListLatestInstancePerApp pattern.
+//
+// PR-9 §1: closes the N+1 fan-out in
+// cmd/apid/handlers_dashboard.go's renderOrgDetail member loop.
+func (m *MemStore) AccountsByIDs(_ context.Context, ids []string) (map[string]Account, error) {
+	out := make(map[string]Account, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range ids {
+		if a, ok := m.accounts[id]; ok {
+			out[id] = a
+		}
+	}
+	return out, nil
 }
 
 func (m *MemStore) AccountByEmail(_ context.Context, email string) (Account, error) {
@@ -9138,27 +9160,18 @@ func (m *MemStore) ListOrgInvitationsForOrg(_ context.Context, orgID string) ([]
 }
 
 // ListOrgInvitationsForOrgPage is the cursor-paginated mirror of
-// ListOrgInvitationsForOrg (PR-8 acceptance). Cursor is the
-// invitation's id (UUID); Memstore walks the sorted slice
-// directly: build the full sorted list, find the cursor row,
-// return the next `limit` rows. The position-based walk is
-// correct for Memstore's random-hex id generation (random hex
-// is uncorrelated with created_at, so a strict-less id
-// predicate would mismatch PgStore's `id::text < $3` ordering
-// and produce wrong page boundaries when two consecutive seeds
-// have distinct created_at).
+// ListOrgInvitationsForOrg (PR-8 acceptance; PR-9 cursor upgrade).
 //
-// PR-9 swap (issue #190 follow-up): both backends should switch
-// to a compound (created_at, id) cursor so the SQL `id::text <
-// $3` predicate stays strictly correct under random UUID ids.
-// Today's wire cursor is the row id only — sufficient for the
-// Memstore walk, but PgStore's `id::text < $3` can skip a
-// later-seeded row whose id is lexically larger but the cursor
-// is at its predecessor. The two backends' guarantees diverge
-// here; the unit-level test (handlers_org_invitations_test.go
-// ::TestListOrgInvitations_CursorPagination) pins the Memstore
-// semantics. PR-9 changes the wire cursor shape; this doc-comment
-// is the v1 footnote.
+// PR-9: matched the PgStore swap to a compound (created_at, id)
+// cursor (see pkg/cursor). The Memstore walk is unchanged —
+// build the full sorted list, find the row whose (created_at, id)
+// matches the cursor, skip past it to land on the next page's
+// first row. The cursor's id alone is no longer the lookup key,
+// which closes the v1 divergence between Memstore and PgStore
+// (the v1 foot-note in the prior version of this comment spelled
+// out the bug: PgStore's `id::text < $3` could skip a row whose
+// id is lexically larger than the cursor's predecessor under
+// random UUIDs).
 //
 // limit is clamped to [1, 100]; out-of-range resolves to 25.
 // before "" means first page (no filter). Unknown cursor (id not
@@ -9185,13 +9198,18 @@ func (m *MemStore) ListOrgInvitationsForOrgPage(_ context.Context, orgID string,
 		}
 		return all[i].CreatedAt.After(all[j].CreatedAt)
 	})
-	// Find the cursor position. Cursor row is the last row of the
-	// prior page; skip past it to land on the next page's first
-	// row.
+	// Find the cursor position. The cursor row is the last row of
+	// the prior page; skip past it to land on the next page's
+	// first row. PR-9 decodes the compound cursor here so the
+	// (created_at, id) tuple — not just id — must match.
 	skip := 0
 	if before != "" {
+		k, err := cursor.Decode(before)
+		if err != nil {
+			return nil, errors.Join(ErrInvalidCursor, err)
+		}
 		for i, row := range all {
-			if row.ID == before {
+			if row.CreatedAt.Equal(k.CreatedAt) && row.ID == k.ID {
 				skip = i + 1
 				break
 			}

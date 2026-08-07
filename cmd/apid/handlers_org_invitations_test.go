@@ -31,6 +31,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/cursor"
 	"github.com/onebox-faas/faas/pkg/session"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -139,7 +140,7 @@ func seedSharedOrgWithOutsideOwner(t *testing.T, e testEnv, slug, name string, p
 // have e.acct as an owner already (otherwise the store fires
 // ErrOrgAlreadyMember on the email-match branch).
 func TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent(t *testing.T) {
-	e := setup(t, api.PlanPro)
+	e, cookie := setupWithSessionFreshStepUpForTest(t)
 	org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr7-add", "Acme PR7 Add", api.PlanPro)
 
 	// Seed an invitation whose email matches the accepting
@@ -148,7 +149,12 @@ func TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent(t *testing.T) {
 	// mismatch with ErrOrgInvitationInvalid.
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
-	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	// PR-9 §4: PR-9 closes the bearer-bypass on acceptInvitation,
+	// so the PR-7 happy-path uses a fresh-stamp cookie.
+	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST accept: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -181,11 +187,15 @@ func TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent(t *testing.T) {
 // invitation-side mirror of TestAuditEvents_OrgMemberAddedOnAccept.
 // Both kinds fire from the same accept call site.
 func TestAuditEvents_OrgInvitationAcceptedEmitsEvent(t *testing.T) {
-	e := setup(t, api.PlanPro)
+	e, cookie := setupWithSessionFreshStepUpForTest(t)
 	org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr7-acc", "Acme PR7 Acc", api.PlanPro)
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
-	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	// PR-9 §4: see TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent.
+	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST accept: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -317,7 +327,7 @@ func TestAuditEvents_OrgMemberRemovedEmitsDottedKind(t *testing.T) {
 // so we mint an invitation for e.acct's email — the accept path
 // hits the already-member branch in the store.
 func TestAcceptInvitation_AlreadyMemberSurfacesExistingRole(t *testing.T) {
-	e := setup(t, api.PlanPro)
+	e, cookie := setupWithSessionFreshStepUpForTest(t)
 	org := seedSharedOrgWithOwner(t, e, "acme-pr7-already", "Acme PR7 Already", api.PlanPro)
 
 	// Mint an invitation whose email matches e.acct (the owner).
@@ -325,7 +335,10 @@ func TestAcceptInvitation_AlreadyMemberSurfacesExistingRole(t *testing.T) {
 	// gate passes, then the already-active-membership check fires.
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
-	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("already-member accept: code=%d, want 409; body=%s", rec.Code, rec.Body.String())
 	}
@@ -355,7 +368,7 @@ func TestAcceptInvitation_AlreadyMemberSurfacesExistingRole(t *testing.T) {
 // The store-side consume is the load-bearing check; the handler
 // surfaces the sentinel before the audit emit at handlers_org_invitations.go:191.
 func TestAcceptInvitation_GateFiresBeforeEmit(t *testing.T) {
-	e := setup(t, api.PlanPro)
+	e, cookie := setupWithSessionFreshStepUpForTest(t)
 	org := seedSharedOrgWithOwner(t, e, "acme-pr7-rev2", "Acme PR7 Rev2", api.PlanPro)
 	wireToken, hash := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
@@ -366,7 +379,10 @@ func TestAcceptInvitation_GateFiresBeforeEmit(t *testing.T) {
 		t.Fatalf("pre-revoke: %v", err)
 	}
 
-	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusGone {
 		t.Fatalf("accept after revoke: code=%d, want 410; body=%s", rec.Code, rec.Body.String())
 	}
@@ -397,7 +413,7 @@ func TestAcceptInvitation_GateFiresBeforeEmit(t *testing.T) {
 // members already on the org, one more accept attempt must surface
 // ErrOrgMemberCapExceeded (403) and emit neither kind.
 func TestAcceptInvitation_OverCapDoesNotEmit(t *testing.T) {
-	e := setup(t, api.PlanHobby)
+	e, cookie := setupWithSessionFreshStepUpForTest(t)
 	org := seedSharedOrgWithOwner(t, e, "hobby-pr7-cap", "Hobby PR7 Cap", api.PlanHobby)
 
 	// Fill to Hobby's OrgMembersMax=10 (1 owner + 9 dev). The owner
@@ -415,7 +431,10 @@ func TestAcceptInvitation_OverCapDoesNotEmit(t *testing.T) {
 	}
 
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
-	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("accept over-cap: code=%d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
@@ -683,6 +702,74 @@ func TestAcceptInvitation_RequiresStepUp(t *testing.T) {
 	})
 }
 
+// TestAcceptInvitation_BearerKey_RequiresStepUp (PR-9 §4) — pin
+// the bearer-key rejection on POST /v1/invitations/{token}/accept.
+// PR-9 closes the v1 bearer-bypass path: a leaked invitation token
+// alone is sufficient to grant org membership, so the bearer key
+// is no longer step-up-equivalent proof. The other 8 requireStepUp
+// mounts keep the documented bypass (PR-9 audits acceptInvitation
+// only). The audit row fires with strict=true so the operator can
+// filter for the new posture in audit queries.
+func TestAcceptInvitation_BearerKey_RequiresStepUp(t *testing.T) {
+	ensureRecoveryTestSecret(t)
+
+	e := setup(t, api.PlanPro)
+	org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr9-stp-bearer", "Acme PR9 Bearer Step-up", api.PlanPro)
+	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
+
+	// e.do sets Authorization: Bearer e.key — the v1 bypass
+	// let this through. PR-9 must reject with 403.
+	rec := e.do(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("bearer key: code=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("Unmarshal problem: %v", err)
+	}
+	if problem.Code != api.CodeStepUpRequired {
+		t.Errorf("problem.code = %q, want %q", problem.Code, api.CodeStepUpRequired)
+	}
+
+	// Audit row fires with strict=true so the operator can
+	// filter for the PR-9 closure in audit queries.
+	rows, err := e.store.ListEvents(context.Background(), e.acct.ID, 0)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	ev := findEventByKind(rows, "auth.step_up_required")
+	if ev == nil {
+		t.Fatalf("no auth.step_up_required row; rows=%s", eventDump(rows))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(ev.Data, &data); err != nil {
+		t.Fatalf("Data not JSON: %v", err)
+	}
+	if data["path"] != "/v1/invitations/"+wireToken+"/accept" {
+		t.Errorf("path = %v, want /v1/invitations/%s/accept", data["path"], wireToken)
+	}
+	if data["reason"] != "missing" {
+		t.Errorf("reason = %v, want missing", data["reason"])
+	}
+	if data["strict"] != true {
+		t.Errorf("strict = %v, want true (PR-9 §4 marker)", data["strict"])
+	}
+	if data["ttl_sec"] != float64(300) {
+		t.Errorf("ttl_sec = %v, want 300", data["ttl_sec"])
+	}
+
+	// The accept-side audit rows MUST NOT fire on the rejected
+	// request — the gate is BEFORE the store-side consume.
+	if findEventByKind(rows, "org.invitation.accepted") != nil {
+		t.Errorf("org.invitation.accepted emitted on rejected bearer request")
+	}
+	if findEventByKind(rows, "org.member.added") != nil {
+		t.Errorf("org.member.added emitted on rejected bearer request")
+	}
+}
+
 // reissueCookieWithStepUp unseals the source cookie via the
 // supplied session manager, swaps the StepUpAt stamp to the
 // requested time, and re-seals. Mirrors the
@@ -746,6 +833,42 @@ func setupWithSessionForTest(t *testing.T) (testEnv, *session.Manager, *http.Coo
 		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
 	return testEnv{h: srv.handler(), store: store, key: "", acct: acct, ops: ops},
 		mgr, &http.Cookie{Name: sessionCookie, Value: token}
+}
+
+// setupWithSessionFreshStepUpForTest is the PR-9 sibling of
+// setupWithSessionForTest: it mints a cookie with a fresh
+// step-up stamp so the test reaches the handler past the
+// requireStepUpStrict(5m) gate on POST /v1/invitations/{token}/accept.
+// Used by the legacy PR-7 happy-path tests that previously
+// relied on the bearer-key bypass; PR-9 closes the bypass.
+func setupWithSessionFreshStepUpForTest(t *testing.T) (testEnv, *http.Cookie) {
+	t.Helper()
+	store := state.NewMemStore()
+	acct, err := store.CreateAccount(context.Background(),
+		"session-fresh-pr9@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(context.Background(), sid, acct.ID,
+		"192.0.2.31", "session-pr9-fresh-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	stepUp := time.Now().Add(-30 * time.Second) // fresh within 5m TTL
+	token, err := mgr.IssueWithSessionAndBindingHashAndStepUp(sid, acct.ID, "", stepUp, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := wire.NewOpsMetrics("apid_session_pr9_test")
+	srv := newServerWithDeps(store, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		"example.com", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr,
+		nil, 15*60_000_000_000, "").WithOpsMetrics(context.Background(), ops)
+	return testEnv{h: srv.handler(), store: store, key: "", acct: acct, ops: ops},
+		&http.Cookie{Name: sessionCookie, Value: token}
 }
 
 // eventDump renders the rows slice as JSON for inclusion in a
@@ -886,11 +1009,18 @@ func TestListOrgInvitations_NonMemberIs404(t *testing.T) {
 	}
 }
 
-// TestListOrgInvitations_CursorPagination (PR 8) — drive the
-// cursor: limit=2 + 4 seeded invitations → 2 pages of 2 each.
-// Pin: the second-page request includes ?before=<id-from-page-1>
+// TestListOrgInvitations_CursorPagination (PR 8; PR-9 cursor upgrade) —
+// drive the cursor: limit=2 + 4 seeded invitations → 2 pages of 2 each.
+// Pin: the second-page request includes ?before=<cursor-from-page-1>
 // and returns the next 2 rows, with next_before empty on the
 // final page.
+//
+// PR-9: the wire cursor is now a compound (created_at, id) key
+// encoded by pkg/cursor. The test below asserts the cursor
+// decodes to the correct (created_at, id) of the last row, so
+// future PRs that mutate the cursor encoding get a clean error
+// here instead of silently feeding the wrong id to PgStore's
+// tuple predicate.
 func TestListOrgInvitations_CursorPagination(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	org := seedSharedOrgWithOwner(t, e, "list-pr8-cursor", "List PR8 Cursor", api.PlanPro)
@@ -923,6 +1053,31 @@ func TestListOrgInvitations_CursorPagination(t *testing.T) {
 	}
 	if p1.NextBefore == "" {
 		t.Fatalf("page1 next_before empty; should carry the cursor id")
+	}
+	// PR-9: the cursor must decode to the (created_at, id) of
+	// the last row on page 1. A regression that emits the bare
+	// id (or any other drift) trips here.
+	k1, err := cursor.Decode(p1.NextBefore)
+	if err != nil {
+		t.Fatalf("cursor.Decode(page1): %v", err)
+	}
+	last1 := p1.Invitations[len(p1.Invitations)-1]
+	if k1.ID != last1.ID {
+		t.Errorf("page1 cursor.ID = %q, want last row ID %q", k1.ID, last1.ID)
+	}
+	// The wire side of OrgInvitationResponse.CreatedAt is RFC3339
+	// (whole-second precision via FormatAlertTime); the cursor's
+	// CreatedAt is the raw store time. Compare at second
+	// precision to bridge the wire-format rounding — the cursor
+	// itself carries the high-precision value so the SQL
+	// predicate has the right anchor.
+	wireLast1, err := time.Parse(time.RFC3339, last1.CreatedAt)
+	if err != nil {
+		t.Fatalf("parse last1.CreatedAt %q: %v", last1.CreatedAt, err)
+	}
+	if k1.CreatedAt.Truncate(time.Second) != wireLast1.Truncate(time.Second) {
+		t.Errorf("page1 cursor.CreatedAt (truncated) = %v, want last row CreatedAt %v (wire %v)",
+			k1.CreatedAt.Truncate(time.Second), wireLast1.Truncate(time.Second), last1.CreatedAt)
 	}
 	// Page 2.
 	rec = e.do(t, http.MethodGet,
@@ -976,6 +1131,25 @@ func TestListOrgInvitations_CursorPagination(t *testing.T) {
 		if seen[r.ID] {
 			t.Errorf("row %s appears on both pages", r.ID)
 		}
+	}
+
+	// PR-9: a malformed cursor must surface as 400 invalid_cursor,
+	// not silently return 0 rows (the v1 behavior). The client
+	// can then retry with a fresh first-page request.
+	rec = e.do(t, http.MethodGet,
+		"/v1/orgs/list-pr8-cursor/invitations?limit=2&before=not!base64", nil,
+		map[string]string{"X-Active-Org": "list-pr8-cursor"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad cursor: code=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+	var badProblem struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &badProblem); err != nil {
+		t.Fatalf("Unmarshal bad cursor: %v", err)
+	}
+	if badProblem.Code != "invalid_cursor" {
+		t.Errorf("bad cursor code = %q, want invalid_cursor", badProblem.Code)
 	}
 }
 
