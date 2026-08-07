@@ -44,6 +44,17 @@ import (
 // and the verb name live one Edit apart for reviewers.
 const subSecurity = "security"
 
+// requireSignedTrue / requireSignedFalse are the strict literal
+// values the --require-signed flag accepts. The handler enforces the
+// same closed enum (handlers_ext.go:1074-1093), so we mirror it
+// locally as a fast-fail gate. Lifted to named consts so goconst
+// (golangci-lint v2.4.0) stops flagging the three repeated string
+// literals in the gate below.
+const (
+	requireSignedTrue  = "true"
+	requireSignedFalse = "false"
+)
+
 // cmdAppSecurity implements `gregale app security <slug>
 // [--require-signed=true|false]`. The only flag for now is
 // require_signed (ADR-054 §Decision 2); future per-app security
@@ -71,7 +82,7 @@ func cmdAppSecurity(args []string) int {
 	// "true" / "false" gate can run before strconv.ParseBool (which
 	// accepts "1", "t", "True", etc. — those would silently flip
 	// the server-side enum gate).
-	if *requireSigned != "" && *requireSigned != "true" && *requireSigned != "false" {
+	if *requireSigned != "" && *requireSigned != requireSignedTrue && *requireSigned != requireSignedFalse {
 		return printErr("Invalid --require-signed", fmt.Errorf("must be \"true\" or \"false\"; got %q", *requireSigned))
 	}
 	client, err := authedClient()
