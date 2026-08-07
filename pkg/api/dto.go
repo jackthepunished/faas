@@ -822,6 +822,20 @@ type DeploymentLivenessProbe struct {
 	// survives an intermittent 5xx across the consecutive window
 	// (AC #2 — flaky app does NOT oscillate).
 	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
+	// CooldownS (issue #554 / ADR-078) is the per-deployment
+	// override of the vmmd-side cooldown gate. After a successful
+	// DestroyForLivenessFailure, the next liveness-failure fire on
+	// a fresh instance is skipped if it's within CooldownS seconds
+	// of the previous destroy — gives the cold-boot instance a
+	// grace window to come up without being torn down again by
+	// noise. 0 = inherit from the per-plan default
+	// (api.Limits.LivenessCooldownSeconds = 60s for Hobby/Pro/Scale).
+	// Clamped to [MinLivenessCooldownSeconds=10,
+	// MaxLivenessCooldownSeconds=600] by the apid validator.
+	// Distinct from the schedd-side LivenessWindow which is the
+	// "N restarts in W seconds → park deployment" gate (issue #554
+	// AC #3, pkg/sched/liveness_window.go).
+	CooldownS int `json:"cooldown_s,omitempty"`
 }
 
 // SecretRefPrefix is the wire prefix on env_secrets values that flags the
@@ -1005,6 +1019,35 @@ func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
 			return NewProblem(http.StatusBadRequest, CodeValidation,
 				"Invalid override",
 				fmt.Sprintf("liveness_probe.consecutive_failures must be <= 10; got %d.", o.LivenessProbe.ConsecutiveFailures))
+		}
+		// CooldownS (issue #554 closure / ADR-078, code review
+		// #725 finding F2). 0 = "no cooldown gate" (Free-plan
+		// legacy behaviour, gate bypasses — see
+		// cmd/vmmd/liveness_recv.go::runOne). Positive values
+		// must be in [MinLivenessCooldownSeconds=10,
+		// MaxLivenessCooldownSeconds=600] — the lower bound
+		// stops a customer from setting cooldown=1 and
+		// effectively neutering liveness for the cold-boot
+		// replacement window; the upper bound stops a typo
+		// (cooldown=999999) from wedging the deployment
+		// (gate would short-circuit every probe for ~11.5
+		// days, bypassing the §14 metal acceptance contract).
+		if o.LivenessProbe.CooldownS < 0 {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.cooldown_s must be >= 0 (0 = no cooldown gate); got %d.", o.LivenessProbe.CooldownS))
+		}
+		if o.LivenessProbe.CooldownS > 0 && o.LivenessProbe.CooldownS < MinLivenessCooldownSeconds {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.cooldown_s must be 0 (no cooldown) or in [%d, %d]; got %d.",
+					MinLivenessCooldownSeconds, MaxLivenessCooldownSeconds, o.LivenessProbe.CooldownS))
+		}
+		if o.LivenessProbe.CooldownS > MaxLivenessCooldownSeconds {
+			return NewProblem(http.StatusBadRequest, CodeValidation,
+				"Invalid override",
+				fmt.Sprintf("liveness_probe.cooldown_s must be <= %d; got %d.",
+					MaxLivenessCooldownSeconds, o.LivenessProbe.CooldownS))
 		}
 	}
 

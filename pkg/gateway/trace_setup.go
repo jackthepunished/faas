@@ -28,11 +28,19 @@ import (
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+
+	"github.com/onebox-faas/faas/pkg/wire/otelinit"
 )
 
 // envTraceRingCap is the FAAS-flavored env var for the ring cap.
 // Defaults to DefaultTraceRingCap when unset.
 const envTraceRingCap = "FAAS_TRACE_RING_CAP"
+
+// gatewayDefaultSamplingRate is the head sampler rate when
+// OTEL_TRACES_SAMPLER_ARG is unset. 1.0 matches the otelinit
+// default so a gatewayd-public wired through this function
+// samples at the same rate as schedd's wire/otelinit boot path.
+const gatewayDefaultSamplingRate = 1.0
 
 // envObserverToken is the env var for the X-Faas-Trace-Auth header
 // gate. Empty value disables the GET endpoint (returns 404).
@@ -62,6 +70,20 @@ type TraceSetup struct {
 	// daemon hands it to the otelhttp.NewHandler / otelgrpc
 	// interceptors (PR-3).
 	TracerProvider *sdktrace.TracerProvider
+	// DeploymentCounter is the per-deployment 100% sampling
+	// window counter the gatewayd-side sampler consults (issue
+	// #555 / ADR-055). schedd's pkg/sched/deployment_counter_watcher
+	// watches the in-process Platform wake topic and calls
+	// counter.Reset(deploymentID) on the "last live instance
+	// parked" transition — the watcher wires against THIS counter
+	// (not the otelinit-owned one in schedd) so a reset on either
+	// daemon collapses into the same semantic: the next wake for
+	// that deployment gets a fresh 100-span window.
+	//
+	// Nil when the OTLP endpoint is unset AND the operator
+	// disabled deployment-aware sampling via env — the watcher
+	// nil-checks before calling Reset.
+	DeploymentCounter *otelinit.DeploymentCounter
 }
 
 // InstallTracePipeline builds a TraceRing + OTLP exporter (if env
@@ -119,10 +141,11 @@ func InstallTracePipeline(ctx context.Context, name, version string, log *slog.L
 		exporters = append(exporters, otlpExporter)
 	}
 
+	sampler, counter := buildSampler(log)
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(multiExporter(exporters)),
 		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
+		sdktrace.WithSampler(sampler),
 	)
 	otel.SetTracerProvider(tp)
 
@@ -132,10 +155,11 @@ func InstallTracePipeline(ctx context.Context, name, version string, log *slog.L
 	})
 
 	return &TraceSetup{
-		Ring:           ring,
-		Handler:        handler,
-		TracerProvider: tp,
-		Shutdown:       tp.Shutdown,
+		Ring:              ring,
+		Handler:           handler,
+		TracerProvider:    tp,
+		Shutdown:          tp.Shutdown,
+		DeploymentCounter: counter,
 	}, nil
 }
 
@@ -201,4 +225,61 @@ func (m multiExporter) Shutdown(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// envTracesSamplerArg is the OTel-standard env var for the head
+// sampler rate. Parsed identically to otelinit.go:182-190 —
+// strconv.ParseFloat with the same "invalid → fall back to
+// default + warn" semantics so a misconfigured operator sees the
+// same diagnostic regardless of which daemon they look at.
+const envTracesSamplerArg = "OTEL_TRACES_SAMPLER_ARG"
+
+// buildSampler constructs the per-deployment-aware sampler
+// (issue #555 closure / ADR-055). The sampler chain is:
+//
+//	sdktrace.ParentBased(
+//	    otelinit.NewDeploymentAware(
+//	        sdktrace.TraceIDRatioBased(rate),
+//	        otelinit.WithCounter(counter),
+//	    ),
+//	)
+//
+// ParentBased is the outer wrapper so a child span inherits the
+// parent's SampledFlag (W3C TraceContext invariant). DeploymentAware
+// only sees root spans and either forces RecordAndSample inside the
+// per-deployment window (counter.Observe returns inside=true) or
+// delegates to TraceIDRatioBased. The counter is returned to the
+// caller so pkg/sched/deployment_counter_watcher.go can wire its
+// Reset against the SAME map the sampler consults — without the
+// return, the watcher would reset a counter the sampler never reads.
+//
+// We deliberately do NOT mirror otelinit.Init's no-endpoint noop
+// branch (otelinit.go:158-168). The ring exporter is unconditional;
+// a gatewayd-public without OTLP must still feed the ring so
+// GET /v1/traces/{trace_id} continues to return spans from the
+// last 24h. The sampler runs against the SDK regardless of whether
+// the OTLP exporter is wired, so a deployment's first 100 root
+// spans are still captured into the local ring.
+func buildSampler(log *slog.Logger) (sdktrace.Sampler, *otelinit.DeploymentCounter) {
+	counter := otelinit.NewDeploymentCounter(otelinit.DefaultWindowSize)
+	rate := gatewayDefaultSamplingRate
+	if v := os.Getenv(envTracesSamplerArg); v != "" {
+		parsed, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			// Issue #555 review parity with otelinit.go:188 —
+			// fall back to the default rate but log loudly so a
+			// misconfigured operator can spot the typo. ParseFloat
+			// (vs fmt.Sscanf) rejects trailing junk ("1.0xyz"
+			// parsed as 1.0 pre-#555).
+			log.Warn("gateway/trace_setup: invalid OTEL_TRACES_SAMPLER_ARG, falling back",
+				"value", v, "err", err, "fallback", gatewayDefaultSamplingRate)
+		} else {
+			rate = parsed
+		}
+	}
+	root := sdktrace.TraceIDRatioBased(rate)
+	sampler := sdktrace.ParentBased(otelinit.NewDeploymentAware(root, otelinit.WithCounter(counter)))
+	log.Info("gateway/trace_setup: deployment-aware sampler wired",
+		"sampler_arg", rate, "window_size", counter.WindowSize())
+	return sampler, counter
 }

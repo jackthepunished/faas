@@ -79,16 +79,18 @@ func WithBaseURL(u string) Option {
 	}
 }
 
-// WithToken rotates the bearer token without reconstructing the
-// Client. Useful for long-lived daemons that mint short-lived
-// session tokens.
+// WithToken sets the bearer token on the Client. Useful for daemons
+// that need a non-empty token at construction time (the SDK already
+// supports NewClient(baseURL, token); WithToken is the post-PR-12
+// functional-option form).
 //
-// Deprecated: the internal token field is unexported. The option
-// returns errOptionUnsupported; PR 12 will un-deprecate it.
+// For long-lived clients that need to rotate the token after
+// construction, use (*api.Client).SetToken directly — Option funcs
+// only run during NewClient, so they can't rotate mid-session.
 func WithToken(token string) Option {
 	return func(c *Client) error {
-		_ = token
-		return errOptionUnsupported{option: "WithToken"}
+		c.Client.SetToken(token)
+		return nil
 	}
 }
 

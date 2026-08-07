@@ -522,6 +522,382 @@ func TestTick_AuditorEmitsFloorWake(t *testing.T) {
 	}
 }
 
+// --- per-deployment tick coverage (issue #557 / ADR-072) ----------------
+
+// fakeDeploymentStore is the production-side seam the per-deployment
+// floor sweep reads against. Mirrors the trigger.DeploymentStore
+// interface methods 1:1. The default zero value is "no deployments
+// configured" — every method either returns an empty slice / zero
+// value or, for the error knobs, returns nil unless the test
+// specifically opted in.
+type fakeDeploymentStore struct {
+	mu sync.Mutex
+
+	deps []state.Deployment
+	apps map[string]state.App
+
+	listAllErr   error
+	listByNIDErr error
+	appByIDErr   map[string]error // keyed by app id; nil = success
+
+	listAllCalls  bool
+	listByIDCalls int
+
+	// Which nodeID was last passed to ListDeploymentsByNodeID. The
+	// OwnerNodeIDRoutesToListDeploymentsByNodeID test asserts the
+	// trigger forwards t.ownerNodeID unchanged.
+	lastNodeID string
+}
+
+func (s *fakeDeploymentStore) ListAllDeployments(_ context.Context) ([]state.Deployment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listAllCalls = true
+	if s.listAllErr != nil {
+		return nil, s.listAllErr
+	}
+	return s.deps, nil
+}
+
+func (s *fakeDeploymentStore) ListDeploymentsByNodeID(_ context.Context, nodeID string) ([]state.Deployment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listByIDCalls++
+	s.lastNodeID = nodeID
+	if s.listByNIDErr != nil {
+		return nil, s.listByNIDErr
+	}
+	return s.deps, nil
+}
+
+func (s *fakeDeploymentStore) AppByID(_ context.Context, id string) (state.App, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err, ok := s.appByIDErr[id]; ok && err != nil {
+		return state.App{}, err
+	}
+	return s.apps[id], nil
+}
+
+func (s *fakeDeploymentStore) ConcurrencyForDeployment(_ context.Context, appID, deploymentID string) (int, error) {
+	// The Trigger delegates to the Ledger (fakeLedger.depConc) for
+	// the per-deployment concurrency; this method is part of the
+	// DeploymentStore interface so an alternate implementation
+	// (e.g. a Postgres-backed DeploymentStore) could read its own
+	// view. For the trigger's tickPerDeployment path the field is
+	// not consulted (see tickPerDeployment:462-465) — the value
+	// flows through t.ledger.ConcurrencyForDeployment. Returning
+	// 0 keeps the interface satisfied without affecting assertions.
+	return 0, nil
+}
+
+// floorDeployment constructs a per-deployment row for the tests.
+// The parent app is implied via d.AppID — the test wires both
+// floorDeployment{d1 of app1} and floorApp("app1", ...) so the
+// trigger's AppByID lookup finds the right row.
+func floorDeployment(id, appID string, minInstances int) state.Deployment {
+	return state.Deployment{
+		ID:           id,
+		AppID:        appID,
+		Kind:         state.DeploymentKindImage,
+		Status:       state.DeployLive,
+		MinInstances: minInstances,
+	}
+}
+
+// withDeploymentStore is a tiny helper that mirrors New()'s
+// signature but threads a non-nil deploymentStore through it. The
+// legacy New(store, nil, ...) call shape silently falls back to
+// tickPerApp; the production wiring at cmd/schedd/main.go:1138 uses
+// this non-nil shape, which is what every per-deployment test must
+// hit to be load-bearing.
+func withDeploymentStore(t *testing.T, appStore AppStore, depStore DeploymentStore, ledger Ledger, engine Engine, opts Options) *Trigger {
+	t.Helper()
+	if opts.Metrics == nil {
+		opts.Metrics = wire.NewOpsMetrics("schedd")
+	}
+	return New(appStore, depStore, ledger, engine, opts)
+}
+
+// TestTickPerDeployment_MaxOfAppAndDeploymentFloor pins issue #557
+// AC #1 on the per-deployment axis: app floor=1, deployment floor=3
+// → the per-deployment sweep must admit three instances, with the
+// per-app call taking a backseat. The effective floor is the max.
+func TestTickPerDeployment_MaxOfAppAndDeploymentFloor(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
+	ledger := &fakeLedger{
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
+		headroom: 47_600,
+	}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	auditor := &fakeAuditor{}
+	depStore := &fakeDeploymentStore{
+		deps: []state.Deployment{floorDeployment("d1", "app1", 3)},
+		apps: map[string]state.App{"app1": floorApp("app1", api.PlanHobby, 1)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{
+		Auditor:      auditor,
+		PlanResolver: resolver,
+	})
+
+	// 3 admits across 3 ticks (one per sweep, since the fake ledger
+	// does not auto-increment like the production ledger does).
+	for i := 1; i <= 3; i++ {
+		if err := tr.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+	if got, want := len(engine.calls), 3; got != want {
+		t.Errorf("engine.calls = %d, want %d (effective=max(app=1, dep=3)=3 admits)", got, want)
+	}
+	for i, call := range engine.calls {
+		if call != "app1|d1" {
+			t.Errorf("engine.calls[%d] = %q, want app1|d1 (per-deployment key)", i, call)
+		}
+	}
+
+	// 4th tick → ledger says conc=3, floor=3 → no admit.
+	ledger.depConc["app1\x00d1"] = 3
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 4: %v", err)
+	}
+	if got, want := len(engine.calls), 3; got != want {
+		t.Errorf("Tick 4 engine.calls = %d, want %d (floor met)", got, want)
+	}
+
+	// Auditor should have seen 3 dual-emits (6 emissions total).
+	if got, want := len(auditor.emissions), 6; got != want {
+		t.Errorf("auditor.emissions = %d, want %d (3 dual-emits)", got, want)
+	}
+}
+
+// TestTickPerDeployment_InheritsAppFloor confirms the inverse
+// direction: app floor=2, deployment floor=0 → the deployment
+// inherits the parent app's floor (ADR-072 §Decision 2). Admit
+// twice.
+func TestTickPerDeployment_InheritsAppFloor(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
+		headroom: 47_600,
+	}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	depStore := &fakeDeploymentStore{
+		deps: []state.Deployment{floorDeployment("d1", "app1", 0)},
+		apps: map[string]state.App{"app1": floorApp("app1", api.PlanHobby, 2)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{PlanResolver: resolver})
+
+	for i := 1; i <= 2; i++ {
+		if err := tr.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+	if got, want := len(engine.calls), 2; got != want {
+		t.Errorf("engine.calls = %d, want %d (deployment floor=0 inherits app floor=2)", got, want)
+	}
+	for i, call := range engine.calls {
+		if call != "app1|d1" {
+			t.Errorf("engine.calls[%d] = %q, want app1|d1", i, call)
+		}
+	}
+}
+
+// TestTickPerDeployment_DualEmitsBothAuditKinds pins ADR-072
+// §Decision 6: one admit produces BOTH
+// `instances.warmed_min_instances` and `floor.wake` events, both
+// carrying the deployment_id. The data shape matches what
+// downstream consumers (apid dashboard, billing reconciliation)
+// expect.
+func TestTickPerDeployment_DualEmitsBothAuditKinds(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
+	ledger := &fakeLedger{
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
+		headroom: 47_600,
+	}
+	engine := &fakeEngine{results: map[string]AdmitResult{"app1|d1": {InstanceID: "iid-abc"}}}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	auditor := &fakeAuditor{}
+	depStore := &fakeDeploymentStore{
+		deps: []state.Deployment{floorDeployment("d1", "app1", 1)},
+		apps: map[string]state.App{"app1": floorApp("app1", api.PlanHobby, 1)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{
+		Auditor:      auditor,
+		PlanResolver: resolver,
+	})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if got, want := len(auditor.emissions), 2; got != want {
+		t.Fatalf("auditor.emissions = %d, want %d (dual-emit)", got, want)
+	}
+
+	// Order: instances.warmed_min_instances first, floor.wake second
+	// (the trigger code emits them in that order — keep the test
+	// pinned to the call site, not a permutation).
+	wantKinds := []string{"instances.warmed_min_instances", "floor.wake"}
+	for i, em := range auditor.emissions {
+		if em.kind != wantKinds[i] {
+			t.Errorf("auditor.emissions[%d].kind = %q, want %q", i, em.kind, wantKinds[i])
+		}
+		if em.data["deployment_id"] != "d1" {
+			t.Errorf("auditor.emissions[%d] deployment_id = %v, want d1", i, em.data["deployment_id"])
+		}
+		if em.data["app_id"] != "app1" {
+			t.Errorf("auditor.emissions[%d] app_id = %v, want app1", i, em.data["app_id"])
+		}
+		if em.data["wake_id"] != "iid-abc" {
+			t.Errorf("auditor.emissions[%d] wake_id = %v, want iid-abc", i, em.data["wake_id"])
+		}
+		if em.data["floor"] != 1 {
+			t.Errorf("auditor.emissions[%d] floor = %v, want 1", i, em.data["floor"])
+		}
+	}
+}
+
+// TestTickPerDeployment_FreePlanDisabled confirms the plan gate
+// fires on the per-deployment axis too: a Free-plan app with a
+// deployment floor set MUST be silently dropped, mirroring the
+// per-app TestTick_FreePlanDisabled behaviour.
+func TestTickPerDeployment_FreePlanDisabled(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanFree, 0)}}
+	ledger := &fakeLedger{
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
+		headroom: 47_600,
+	}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanFree}}
+	depStore := &fakeDeploymentStore{
+		// Customer tried to set dep floor=2, but Free plan disables it.
+		deps: []state.Deployment{floorDeployment("d1", "app1", 2)},
+		apps: map[string]state.App{"app1": floorApp("app1", api.PlanFree, 0)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{PlanResolver: resolver})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (Free plan disables per-deployment floor too)", engine.calls)
+	}
+}
+
+// TestTickPerDeployment_AppByIDErrorObservesError exercises the
+// defensive branch at tickPerDeployment:435-439. If the parent app
+// lookup fails, the trigger MUST observe the OutcomeError metric
+// (so the operator alarm fires) and continue to the next
+// deployment rather than aborting the whole sweep.
+func TestTickPerDeployment_AppByIDErrorObservesError(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 0}, headroom: 47_600}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	depStore := &fakeDeploymentStore{
+		deps: []state.Deployment{
+			floorDeployment("d1", "app1", 1),
+			floorDeployment("d2", "app2", 1),
+		},
+		// app1 lookup errors; app2 succeeds.
+		appByIDErr: map[string]error{"app1": errors.New("store down")},
+		apps:       map[string]state.App{"app2": floorApp("app2", api.PlanHobby, 1)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{PlanResolver: resolver})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	// app1 errored → no admit. app2 has conc=0 floor=1 → admit once.
+	if got, want := len(engine.calls), 1; got != want {
+		t.Errorf("engine.calls = %d, want %d (app1 errored, app2 admitted)", got, want)
+	}
+	if engine.calls[0] != "app2|d2" {
+		t.Errorf("engine.calls[0] = %q, want app2|d2", engine.calls[0])
+	}
+}
+
+// TestTickPerDeployment_FloorMetSkips pins the satisfied-floor
+// shortcut on the per-deployment axis: when the ledger reports
+// concurrency >= effective floor, the trigger emits
+// OutcomeFloorMet and does NOT call AdmitInstanceForDeployment.
+// This is the per-deployment equivalent of TestTick_AdmitsUpToFloor
+// tick 3.
+func TestTickPerDeployment_FloorMetSkips(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 1)}}
+	ledger := &fakeLedger{
+		conc:     map[string]int{"app1": 3},
+		depConc:  map[string]int{"app1\x00d1": 3},
+		headroom: 47_600,
+	}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	depStore := &fakeDeploymentStore{
+		deps: []state.Deployment{floorDeployment("d1", "app1", 3)},
+		apps: map[string]state.App{"app1": floorApp("app1", api.PlanHobby, 1)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{PlanResolver: resolver})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.calls) != 0 {
+		t.Errorf("engine.calls = %v, want [] (floor met at 3, no admit)", engine.calls)
+	}
+}
+
+// TestTickPerDeployment_OwnerNodeIDRoutesToListDeploymentsByNodeID
+// mirrors TestTick_OwnerNodeIDRoutesToListAppsByNodeID on the
+// per-deployment axis. The trigger's WithOwnerNodeID must flip the
+// deployment sweep from ListAllDeployments to
+// ListDeploymentsByNodeID, passing the owner node id through
+// unchanged.
+func TestTickPerDeployment_OwnerNodeIDRoutesToListDeploymentsByNodeID(t *testing.T) {
+	appStore := &fakeStore{apps: []state.App{floorApp("app1", api.PlanHobby, 2)}}
+	ledger := &fakeLedger{
+		conc:     map[string]int{"app1": 0},
+		depConc:  map[string]int{"app1\x00d1": 0},
+		headroom: 47_600,
+	}
+	engine := &fakeEngine{}
+	resolver := &fakePlanResolver{plans: map[string]api.Plan{"acct1": api.PlanHobby}}
+	depStore := &fakeDeploymentStore{
+		deps: []state.Deployment{floorDeployment("d1", "app1", 2)},
+		apps: map[string]state.App{"app1": floorApp("app1", api.PlanHobby, 2)},
+	}
+	tr := withDeploymentStore(t, appStore, depStore, ledger, engine, Options{PlanResolver: resolver})
+
+	// Unsharded → ListAllDeployments.
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick (unsharded): %v", err)
+	}
+	if !depStore.listAllCalls {
+		t.Error("unsharded Tick did not call ListAllDeployments")
+	}
+	if depStore.listByIDCalls != 0 {
+		t.Errorf("unsharded Tick called ListDeploymentsByNodeID %d times, want 0", depStore.listByIDCalls)
+	}
+
+	// Sharded → ListDeploymentsByNodeID with the owner node id.
+	tr.WithOwnerNodeID("node-7")
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick (sharded): %v", err)
+	}
+	if depStore.listByIDCalls != 1 {
+		t.Errorf("sharded Tick called ListDeploymentsByNodeID %d times, want 1", depStore.listByIDCalls)
+	}
+	if depStore.lastNodeID != "node-7" {
+		t.Errorf("lastNodeID = %q, want node-7 (owner node id forwarded unchanged)", depStore.lastNodeID)
+	}
+}
+
 // TestEffectiveMaxConcurrency pins the legacy-app clamp: a pre-PR-A
 // app whose MaxConcurrency is 0 falls back to the plan ceiling, so
 // the trigger does not silently allow unlimited admits.

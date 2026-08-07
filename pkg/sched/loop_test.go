@@ -694,3 +694,166 @@ func TestLoopRunDiskDriftRespectsTickTimeout(t *testing.T) {
 // unreachable until a future contributor adds a real error
 // return from Tick — and when they do, the new test should
 // cover the actual emitted error, not a fabricated one.
+
+// TestRunReaperMirrorsDeploymentFloor (issue #557 closure / ADR-072)
+// pins the reaper / biller floor-mirror: an app with
+// app.min_instances=0 + deployment.min_instances=3 must keep
+// ≥ 3 RUNNING instances alive after the reaper tick — the same
+// number meterd's sampler charges for at sampler.go:470-485.
+// Pre-#557 the reaper stamped only a.EffectiveMinInstances (0)
+// onto InstanceInfo.MinInstances, so the idle park would have
+// swept the app to 0 even though the biller was emitting
+// synthetic usage rows for 3 instances per minute. The post-#557
+// post-enrichment pass walks each instance's DeploymentID,
+// looks up d.EffectiveMinInstances, and re-stamps the snapshot
+// rows with the app-wide max.
+func TestRunReaperMirrorsDeploymentFloor(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 512, 10)
+	// Set the deployment floor to 3 (issue #557 / ADR-072). The
+	// app-level floor stays at 0 — the whole point of the test
+	// is that the reaper honors the deployment axis without
+	// the customer having to set the app axis.
+	if _, err := store.UpdateDeploymentMinInstances(context.Background(), dep.ID, 3); err != nil {
+		t.Fatalf("UpdateDeploymentMinInstances: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	// Wake 5 instances so the floor=3 forces 2 parks.
+	wakeN(t, engine, app.ID, 5)
+	if got, want := liveCount(t, store, app.ID), 5; got != want {
+		t.Fatalf("setup: liveCount=%d, want %d", got, want)
+	}
+
+	// Backdate all 5 instances' LastRequest far past the idle
+	// timeout so ReapIdle is willing to park them. The deployment
+	// floor=3 must hold 3 alive regardless of the staleness.
+	ctx := context.Background()
+	rows, _ := store.ListInstancesForApp(ctx, app.ID)
+	touches := make([]state.InstanceTouch, 0, len(rows))
+	for _, r := range rows {
+		touches = append(touches, state.InstanceTouch{
+			InstanceID:  r.ID,
+			LastRequest: time.Now().Add(-2 * time.Hour),
+		})
+	}
+	if _, err := store.TouchInstancesLastSeen(ctx, touches); err != nil {
+		t.Fatalf("backdate touch: %v", err)
+	}
+
+	loop := NewLoop(nil, engine, testLog())
+	loop.runReaper(ctx)
+
+	// Floor mirror: 3 instances should remain RUNNING even though
+	// every instance was past its idle timeout and app.min_instances=0.
+	if got, want := liveCount(t, store, app.ID), 3; got != want {
+		t.Errorf("liveCount after reaper = %d, want %d (deployment floor mirror)", got, want)
+	}
+}
+
+// TestRunReaperFloorDropEmitsAuditRelocated (issue #557 closure /
+// ADR-072) pins the audit-emit relocation: when the floor drops
+// between ticks AND ReapIdle parks ≥ 1 instance for the app, the
+// reaper emits a `instances.parked_min_instances_released` row
+// ONCE per app per tick. Pre-#557 the same emit lived in
+// runReaperAggressive on a structurally unsatisfiable predicate
+// (ReapAggressive's `limit` arithmetic never parks below the floor
+// it was given), so the row was never written. Post-#557 the
+// emit lives in the ReapIdle branch, keyed on the new
+// lastFloorByApp carrier.
+func TestRunReaperFloorDropEmitsAuditRelocated(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 512, 10)
+	// Tick 1: floor=3, app.min_instances=3 (legacy column).
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetMinInstances: true,
+		MinInstances:    intPtr(3),
+	}); err != nil {
+		t.Fatalf("UpdateApp: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	loop := NewLoop(nil, engine, testLog())
+
+	// Wake 3 instances; backdate LastRequest past the idle timeout
+	// so the FIRST tick's reaper would park them all (floor=3 keeps
+	// 0 alive? no — floor=3 keeps 3 alive, so ReapIdle parks
+	// nothing this tick). We seed lastFloorByApp=3 BEFORE the
+	// floor drop so the second tick has a prev-floor to compare
+	// against. The MemStore's live count + the reaper's ledger
+	// are consistent across ticks; we manipulate state directly
+	// to avoid a real-time race.
+	wakeN(t, engine, app.ID, 3)
+	// Backdate LastRequest on every running instance past the
+	// idle timeout so ReapIdle is willing to park them once
+	// the floor drops.
+	rows, _ := store.ListInstancesForApp(context.Background(), app.ID)
+	touches := make([]state.InstanceTouch, 0, len(rows))
+	for _, r := range rows {
+		touches = append(touches, state.InstanceTouch{
+			InstanceID:  r.ID,
+			LastRequest: time.Now().Add(-2 * time.Hour),
+		})
+	}
+	if _, err := store.TouchInstancesLastSeen(context.Background(), touches); err != nil {
+		t.Fatalf("backdate touch: %v", err)
+	}
+	// Pre-seed lastFloorByApp BEFORE the first tick to mirror
+	// production: a long-running schedd has accumulated
+	// lastFloorByApp values from prior ticks.
+	loop.lastFloorByApp = map[string]int{app.ID: 3}
+
+	// Tick 1 (the fixture is already idle-parkable): floor=3,
+	// 3 instances, all past idle. ReapIdle's
+	// `running > floor && lastRequest > timeout` short-circuits
+	// — none parked. lastFloorByApp is refreshed to 3.
+	loop.runReaper(context.Background())
+	if got := liveCount(t, store, app.ID); got != 3 {
+		t.Fatalf("tick 1 liveCount=%d, want 3 (floor holds)", got)
+	}
+	// No audit row yet (no actual park, no floor drop).
+	if got := storeEvents(t, store, app.ID, "instances.parked_min_instances_released"); len(got) != 0 {
+		t.Errorf("tick 1: audit rows=%d, want 0 (no floor drop, no park)", len(got))
+	}
+
+	// Drop the floor to 0; this is the PATCH the customer made.
+	if _, err := store.UpdateApp(context.Background(), app.ID, state.UpdateAppParams{
+		SetMinInstances: true,
+		MinInstances:    intPtr(0),
+	}); err != nil {
+		t.Fatalf("UpdateApp drop: %v", err)
+	}
+	// Also drop the deployment floor so appDeploymentFloor
+	// collapses to 0 (the test is asserting the reaper honors a
+	// pure floor drop, not a deploy-floor inheritance).
+	if _, err := store.UpdateDeploymentMinInstances(context.Background(), dep.ID, 0); err != nil {
+		t.Fatalf("UpdateDeploymentMinInstances drop: %v", err)
+	}
+
+	// Tick 2: floor now 0, lastFloorByApp[appID]=3 from tick 1.
+	// 3 idle instances. ReapIdle parks all 3 (floor=0, no
+	// protection). The audit emit must fire because
+	// lastFloorByApp[appID]=3 > appDeploymentFloor[appID]=0 AND
+	// ReapIdle parked ≥ 1 instance for this app.
+	loop.runReaper(context.Background())
+	if got := liveCount(t, store, app.ID); got != 0 {
+		t.Errorf("tick 2 liveCount=%d, want 0 (floor dropped to 0)", got)
+	}
+	events := storeEvents(t, store, app.ID, "instances.parked_min_instances_released")
+	if len(events) != 1 {
+		t.Fatalf("tick 2: audit rows=%d, want 1 (floor drop + ≥1 park)", len(events))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(events[0].Data, &payload); err != nil {
+		t.Fatalf("audit data unmarshal: %v", err)
+	}
+	// floor (previous) and post_park (new effective). Reason is
+	// the static string the emitter stamps (mirrors the call site).
+	if payload["floor"] != float64(3) {
+		t.Errorf("payload.floor = %v, want 3", payload["floor"])
+	}
+	if payload["reason"] != "min_instances_lowered" {
+		t.Errorf("payload.reason = %v, want min_instances_lowered", payload["reason"])
+	}
+}

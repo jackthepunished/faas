@@ -244,7 +244,7 @@ func TestSec11_SeccompFilterEnforced_CrossProcess(t *testing.T) {
 		t.Errorf("wire mode=%q but kernel /proc says %q (SeccompStatus handler is reporting a phantom state)",
 			resp.GetMode(), kernelMode)
 	}
-	if kernelFilterLen != int(resp.GetFilterLen()) {
+	if kernelFilterLen != resp.GetFilterLen() {
 		t.Errorf("wire filter_len=%d but kernel /proc says %d",
 			resp.GetFilterLen(), kernelFilterLen)
 	}

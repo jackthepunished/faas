@@ -21,11 +21,16 @@
  * - `interval_s` ∈ [0, 60] (0 = inherit per-plan default; Hobby/Pro/Scale → 5 s).
  * - `timeout_s` ∈ [0, 5] (0 = inherit 2 s).
  * - `consecutive_failures` ∈ [0, 10] (0 = inherit per-plan default; Hobby/Pro/Scale → 3).
+ * - `cooldown_s` ∈ [10, 600] (cooldown gate enforced by the vmmd-side
+ * probe loop after a destroy fires — see ADR-078; 0 = no cooldown, the
+ * legacy Free-plan behaviour).
  *
- * Per-deployment overrides of `interval_s` / `timeout_s` / `consecutive_failures`
+ * Per-deployment overrides of `interval_s` / `timeout_s` / `consecutive_failures` / `cooldown_s`
  * are clamped to the bounds above. The counter resets to 0 on the first 2xx
  * and survives an intermittent 5xx across the consecutive window (AC #2:
- * flaky app does NOT oscillate).
+ * flaky app does NOT oscillate). The cooldown gate short-circuits the
+ * counter when a probe fires inside the previous destroy's window so the
+ * cold-boot replacement instance has a grace period to settle.
  *
  */
 export type DeploymentLivenessProbe = {
@@ -45,5 +50,9 @@ export type DeploymentLivenessProbe = {
    * N at which DestroyForLivenessFailure fires; 0 = inherit per-plan default (Hobby/Pro/Scale → 3). The counter is reset to 0 on the first 2xx and survives an intermittent 5xx across the consecutive window (AC #2 — flaky app does NOT oscillate).
    */
   consecutive_failures?: number;
+  /**
+   * Cooldown window in seconds after a liveness-driven destroy fires. While inside the window the vmmd-side probe loop short-circuits the failure counter so the cold-boot replacement has time to settle (issue #554 closure / ADR-078). 0 = no cooldown (Free-plan / legacy behaviour); clamped to [MinLivenessCooldownSeconds=10, MaxLivenessCooldownSeconds=600] when the field is populated by a Pro/Scale deployment override.
+   */
+  cooldown_s?: number;
 };
 
