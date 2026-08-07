@@ -121,7 +121,7 @@ func TestSourceDeployWakeMetal(t *testing.T) {
 	setAppIdleTimeout(t, h, key, "srcdeploy", api.IdleTimeoutFloorSeconds)
 
 	// Build the fixture once; both the live assertion (subtest 1) and
-	// the idempotency replay (subtest 7) upload the same bytes.
+	// the idempotency replay (subtest 8) upload the same bytes.
 	sourceTar := NodeFixture(t)
 
 	// Drive the multipart deploy. Capture deploymentID + buildID so the
