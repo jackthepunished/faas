@@ -134,8 +134,18 @@ func (s *server) fetchDashboardSLO(ctx context.Context, log *slog.Logger, app st
 		// stays disambiguable without logging the raw UUID.
 		// HashShort matches CodeQL's notSensitive() regex —
 		// structural barrier, not a sanitizer (see
-		// pkg/logsanitize.HashShort's doc).
-		log.Warn("dashboard renderAppDetail: SLO fetch degraded", "app_id_hash", logsanitize.HashShort(app.ID), "window", window, "source", src)
+		// pkg/logsanitize.HashShort's doc). The src + window
+		// fields are intentionally dropped: src is the
+		// 'degraded: <reason>' string built from the Prometheus
+		// err (CodeQL re-fires on err.Error() through multi-arg
+		// Warn), and window is query-derived (the closed-vocab
+		// guard is server-side but CodeQL's taint analysis
+		// doesn't see it). The 'fetch degraded' message +
+		// app_id_hash is enough to grep + correlate against
+		// the Prometheus query_range error log (FetchRange
+		// already logs the per-query failure with metric label
+		// + err detail).
+		log.Warn("dashboard renderAppDetail: SLO fetch degraded", "app_id_hash", logsanitize.HashShort(app.ID))
 	}
 	return view
 }
@@ -185,10 +195,11 @@ func (s *server) fetchDashboardAccountSLO(ctx context.Context, log *slog.Logger,
 		Step:                  rangeSeries.Step,
 	}
 	if src != appmetrics.SourcePrometheus && log != nil {
-		// Hash acct.ID — see the HashShort comment above. Per-app
-		// and per-account dashboard-render WARN lines share the
-		// same obfuscator-call barrier pattern.
-		log.Warn("dashboard renderAccount: SLO fetch degraded", "account_id_hash", logsanitize.HashShort(acct.ID), "window", window, "source", src)
+		// Hash acct.ID — see the per-app HashShort comment
+		// above for the CodeQL reasoning. src + window are
+		// dropped for the same reason (CodeQL re-fires on
+		// err.Error() flow + window's URL-query derivation).
+		log.Warn("dashboard renderAccount: SLO fetch degraded", "account_id_hash", logsanitize.HashShort(acct.ID))
 	}
 	return view
 }
