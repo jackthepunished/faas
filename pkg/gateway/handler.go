@@ -1323,6 +1323,38 @@ func (h *Handler) Limiter() *Limiter { return h.limiter }
 // noop for load tests that need to bypass the account bucket.
 func (h *Handler) AccountLimiter() *Limiter { return h.accountLimiter }
 
+// writeWebSocketNotAllowed short-circuits the upgrade path with a
+// deterministic 501 + x-faas-error-reason: websocket_not_on_plan
+// when the inbound request is an upgrade but the platform can't
+// service it (issue #707). Two trigger paths:
+//   - app.WebSocketEnabled is false (Hobby+ customer who PATCHed
+//     the flag off).
+//   - h.rawByNode is nil (raw forwarder not wired — test fixtures
+//     OR the FAAS_GATEWAY_RAW_STREAM_ENABLED=false follow-up).
+//
+// The previous fall-through to proxyByNode stripped Connection +
+// Upgrade as hop-by-hop (RFC 7230 §6.1) and returned 502 from the
+// upstream — a confusing failure shape that retried the WS
+// handshake in an infinite loop.
+//
+// The response is a stable RFC 7807 problem document with
+// code=plan_websocket_not_allowed; the x-faas-error-reason header
+// carries the same code for the WS-client-retry path (clients
+// read headers, not the problem body). The 501 status is the
+// canonical "feature not enabled on this deployment" code (the
+// WS protocol allows clients to back off; 502 doesn't).
+func (h *Handler) writeWebSocketNotAllowed(w http.ResponseWriter, appID string, forwarderMissing bool) {
+	w.Header().Set("x-faas-error-reason", "websocket_not_on_plan")
+	w.Header().Set("Content-Type", "application/problem+json")
+	detail := "This app has WebSocket / Upgrade traffic disabled."
+	if forwarderMissing {
+		detail = "This deployment has the WebSocket / Upgrade-traffic raw-bytes bridge disabled."
+	}
+	body := fmt.Sprintf(`{"type":"https://docs.gregale.dev/errors/plan_websocket_not_allowed","title":"WebSocket not enabled on this app or plan","status":501,"detail":%q,"code":"plan_websocket_not_allowed","app_id":%q}`, detail, appID)
+	w.WriteHeader(http.StatusNotImplemented)
+	_, _ = fmt.Fprint(w, body)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Status-class capture (used for metrics + slog). Doesn't buffer the body
 	// or alter the headers — strictly observability.
@@ -1563,11 +1595,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("x-faas-wake-id", wakeID)
 	}
 
-	// Streaming decision (PR-B / ADR-047). Three-way AND: the operator
+	// Streaming decision (PR-B / ADR-047). Four-way AND: the operator
 	// must have opted the process in (h.streamingEnabled, set via
 	// FAAS_GATEWAY_STREAMING), the per-app apps.streaming_enabled flag
-	// must be true (set on build / PATCH / plan default), and the
-	// per-request Accept header must not opt out. The
+	// must be true (set on build / PATCH / plan default), the
+	// per-request Accept header must not opt out, AND the request
+	// must NOT be an Upgrade (issue #708 / PR-3 review finding). The
 	// Accept: application/json override is the customer-visible
 	// contract from spec §4.1 — a client can force the buffered
 	// path for one request without a per-app PATCH.
@@ -1580,8 +1613,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// nil-safe in the sense that when the gate is false, w stays
 	// the original ResponseWriter and the recorder is never
 	// installed — the buffered path is a strict pass-through.
+	//
+	// Issue #708 (PR-3 review finding): an upgrade request is
+	// ALWAYS long-lived; wrapping it in capWriter (which enforces
+	// plan.MaxResponseBodyBytes, 100 MiB for Hobby+) would fire
+	// onCap mid-WS-frame and break the WS protocol. The raw path
+	// has its own 101 Switching Protocols contract that runs
+	// before any body bytes flow, so the cap is meaningless on
+	// the upgrade path. Skipping the wrap here keeps the WS
+	// session alive past 100 MiB of cumulative response bytes.
 	streaming := h.streamingEnabled && app.StreamingEnabled &&
-		!isAcceptJSON(r.Header.Get("Accept"))
+		!isAcceptJSON(r.Header.Get("Accept")) &&
+		!isUpgradeRequest(r)
 	if streaming {
 		writeTimeout := app.Plan.ResponseWriteTimeout()
 		w = h.setupStreamingWriter(w, rec, app, target, writeTimeout)
@@ -1630,12 +1673,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// per-app flag (cheap map lookup), then the rawByNode
 	// installation (the production cmd/gatewayd/main.go wires
 	// it; tests that don't exercise the raw path leave it nil).
-	// An upgrade request on an app with WebSocketEnabled=false
-	// falls through to proxyByNode which silently drops the
-	// Upgrade headers and returns 502 — better than 501 because
-	// the customer sees the same failure shape as a normal HTTP
-	// routing miss.
-	if isUpgradeRequest(r) && app.WebSocketEnabled && h.rawByNode != nil {
+	//
+	// Issue #707 (PR-3 review finding): an upgrade request on an
+	// app with WebSocketEnabled=false (Hobby+ customer who PATCHed
+	// the flag off) OR on a deployment where the raw forwarder
+	// is not wired (FAAS_GATEWAY_RAW_STREAM_ENABLED=false
+	// follow-up, or a unit test) MUST short-circuit to 501 with
+	// x-faas-error-reason: websocket_not_on_plan. The previous
+	// fall-through to proxyByNode stripped Connection + Upgrade
+	// as hop-by-hop (RFC 7230 §6.1) and returned 502 from the
+	// upstream — a confusing customer-facing failure that retried
+	// the WS handshake in an infinite loop. A deterministic 501
+	// names the cause and the WS client can back off cleanly.
+	if isUpgradeRequest(r) {
+		if !app.WebSocketEnabled || h.rawByNode == nil {
+			h.writeWebSocketNotAllowed(w, app.ID, h.rawByNode == nil)
+			return
+		}
 		// ADR-064 wake-timeline vocab: stamp the upgrade flag so
 		// downstream observability (slog fields, dashboards)
 		// can distinguish raw-bytes sessions from plain HTTP
@@ -1834,10 +1888,20 @@ func statusClass(status int) string {
 // gateway_request_duration_seconds histogram (issue #273 / ADR-042).
 // Distinct from statusClass above: that one returns the FULL 3-digit
 // code (used for the counter label so dashboards can drill into e.g.
-// 404 vs 503); this one buckets to the closed 4-set so a histogram
+// 404 vs 503); this one buckets to the closed 5-set so a histogram
 // with ~13 series per label combo stays bounded per app.
+//
+// The 1xx arm (issue #709 / PR-3 review finding): a successful
+// WebSocket / h2c handshake returns 101 Switching Protocols via
+// rawStreamOnceWithEvents; bucketing that as 5xx would inflate the
+// §12 dashboard's errors panel on every successful WS upgrade.
+// 100 Continue / 102 Processing / 103 Early Hints are rare on the
+// public edge but follow the same pattern — informational, not
+// errors.
 func statusClassBucket(status int) string {
 	switch {
+	case status >= 100 && status < 200:
+		return "1xx"
 	case status >= 200 && status < 300:
 		return "2xx"
 	case status >= 300 && status < 400:
@@ -1845,7 +1909,7 @@ func statusClassBucket(status int) string {
 	case status >= 400 && status < 500:
 		return "4xx"
 	default:
-		// Anything outside 1xx/2xx/3xx/4xx lands in 5xx — this
+		// 5xx and anything outside 100-599 lands in 5xx — this
 		// matches the §12 dashboard's "errors" panel definition.
 		return "5xx"
 	}
