@@ -30,6 +30,19 @@ import (
 	"github.com/onebox-faas/faas/guest/runners/internal"
 )
 
+// Fake-handler filenames and interpreter argv values. Extracted as
+// constants because each literal now appears in three-plus fixtures
+// (round-trip, with-tail, and the issue #254 stderr variants), which
+// trips goconst.
+const (
+	fileNode = "handler.js"
+	filePy   = "handler.py"
+	fileExec = "handler"
+
+	interpNode = "node"
+	interpPy   = "python3"
+)
+
 // FakeHandler is a self-contained executable that reads the §4.9 envelope
 // from stdin and writes back a response envelope (status=200,
 // X-Echo-Method, X-Echo-Path, body_b64="echo:<path>"). The Interpreter
@@ -67,8 +80,8 @@ process.stdin.on('end', () => {
   };
   process.stdout.write(JSON.stringify(out));
 });`,
-		Filename:    "handler.js",
-		Interpreter: []string{"node"},
+		Filename:    fileNode,
+		Interpreter: []string{interpNode},
 	}
 }
 
@@ -103,8 +116,8 @@ process.stdin.on('end', () => {
   };
   process.stdout.write(JSON.stringify(out));
 });`,
-		Filename:    "handler.js",
-		Interpreter: []string{"node"},
+		Filename:    fileNode,
+		Interpreter: []string{interpNode},
 	}
 }
 
@@ -123,8 +136,8 @@ out = {
 }
 sys.stdout.write(json.dumps(out))
 `,
-		Filename:    "handler.py",
-		Interpreter: []string{"python3"},
+		Filename:    filePy,
+		Interpreter: []string{interpPy},
 	}
 }
 
@@ -155,8 +168,8 @@ out = {
 }
 sys.stdout.write(json.dumps(out))
 `,
-		Filename:    "handler.py",
-		Interpreter: []string{"python3"},
+		Filename:    filePy,
+		Interpreter: []string{interpPy},
 	}
 }
 
@@ -173,7 +186,7 @@ path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
 printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_b64":"%s"}' \
   "$method" "$path" "$(printf '%s' "echo:$path" | base64)"
 `,
-		Filename:    "handler",
+		Filename:    fileExec,
 		Interpreter: nil,
 	}
 }
@@ -206,7 +219,7 @@ fi
 printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s","X-Echo-TailPipe":"%s","X-Echo-WaitUntilSec":"%s"},"body_b64":"%s"}' \
   "$method" "$path" "$tail_pipe" "$wait_until_sec" "$(printf '%s' "echo:$path" | base64)"
 `,
-		Filename:    "handler",
+		Filename:    fileExec,
 		Interpreter: nil,
 	}
 }
@@ -502,5 +515,178 @@ func RunWaitUntilEnvelopeRoundTrip(t *testing.T, fake FakeHandler, handler func(
 	// so an empty file is the "happy path" state.
 	if _, err := os.Stat(pipePath); err != nil {
 		t.Errorf("tail pipe stat: %v (runner may have unlinked the pipe before stat)", err)
+	}
+}
+
+// FakeScriptWritingStderr returns a shell FakeHandler that writes one
+// line to stderr before emitting the §4.9 response envelope on stdout.
+// Interpreter is nil (POSIX shebang, executed directly) — this is the
+// go124-shaped fake, for runners that exec the handler file directly.
+//
+// Node and Python runners spawn `node <file>` / `python3 <file>` and
+// would try to parse this shell script as source, so they use
+// FakeNodeScriptWritingStderr / FakePyScriptWritingStderr instead.
+//
+// The stdout envelope is byte-identical to FakeGoScript's, so a caller
+// can assert BOTH halves of the issue #254 contract in one round trip:
+// stderr escapes to the host, and stdout still decodes cleanly.
+func FakeScriptWritingStderr(stderrLine string) FakeHandler {
+	return FakeHandler{
+		Script: `#!/bin/sh
+read -r env
+printf '%s\n' "` + stderrLine + `" >&2
+method=$(printf '%s' "$env" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+path=$(printf '%s' "$env" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+printf '{"status":200,"headers":{"X-Echo-Method":"%s","X-Echo-Path":"%s"},"body_b64":"%s"}' \
+  "$method" "$path" "$(printf '%s' "echo:$path" | base64)"
+`,
+		Filename:    fileExec,
+		Interpreter: nil,
+	}
+}
+
+// FakeNodeScriptWritingStderr is the Node counterpart of
+// FakeScriptWritingStderr: writes one line to stderr via
+// console.error, then emits the §4.9 envelope on stdout.
+func FakeNodeScriptWritingStderr(stderrLine string) FakeHandler {
+	return FakeHandler{
+		Script: `#!/usr/bin/env node
+let buf = '';
+process.stdin.on('data', (c) => { buf += c; });
+process.stdin.on('end', () => {
+  const env = JSON.parse(buf);
+  console.error(` + "`" + stderrLine + "`" + `);
+  const out = {
+    status: 200,
+    headers: { "X-Echo-Method": env.method, "X-Echo-Path": env.path },
+    body_b64: Buffer.from("echo:" + env.path).toString("base64")
+  };
+  process.stdout.write(JSON.stringify(out));
+});`,
+		Filename:    fileNode,
+		Interpreter: []string{interpNode},
+	}
+}
+
+// FakePyScriptWritingStderr is the Python counterpart of
+// FakeScriptWritingStderr: writes one line to sys.stderr, then
+// emits the §4.9 envelope on stdout.
+func FakePyScriptWritingStderr(stderrLine string) FakeHandler {
+	return FakeHandler{
+		Script: `#!/usr/bin/env python3
+import sys, json, base64
+env = json.loads(sys.stdin.read())
+print("` + stderrLine + `", file=sys.stderr)
+out = {
+    "status": 200,
+    "headers": {"X-Echo-Method": env["method"], "X-Echo-Path": env["path"]},
+    "body_b64": base64.b64encode(("echo:" + env["path"]).encode()).decode(),
+}
+sys.stdout.write(json.dumps(out))
+`,
+		Filename:    filePy,
+		Interpreter: []string{interpPy},
+	}
+}
+
+// RunStderrReachesHost pins the issue #254 fix: a runner MUST tee the
+// customer handler's stderr to its own os.Stderr, because the runner's
+// os.Stderr is inherited from guest-init (PID1), which tees it into the
+// supervisor ring buffer that vmmd drains into pkg/fcvm/logbuf and the
+// customer reads over `faas logs`.
+//
+// Before the fix, every runner wired `cmd.Stderr = &stderr` (a bare
+// in-memory bytes.Buffer that was only ever folded into the exec-error
+// string). Customer stderr therefore never left the microVM, and
+// `faas logs` showed platform noise only.
+//
+// The helper redirects the process-wide os.Stderr through an os.Pipe
+// for the duration of the round trip, then asserts:
+//
+//  1. the handler's stderr line appears on the captured os.Stderr, AND
+//  2. the response still decodes (status 200 + echo body) — i.e. the
+//     tee did not corrupt the protocol-bearing stdout path.
+//
+// Assertion (2) is the load-bearing half: a contributor who "fixes"
+// logging by teeing stdout as well would satisfy (1) and break (2),
+// because the §4.9 envelope is json.Unmarshal'd from that same buffer.
+//
+// os.Stderr is process-global, so this helper must not run under
+// t.Parallel(). No runner test calls t.Parallel() today.
+func RunStderrReachesHost(t *testing.T, fake FakeHandler, wantLine string, handler func(http.ResponseWriter, *http.Request, string, *internal.RunnerSignal, int, string)) {
+	t.Helper()
+	script := fake.WriteMaterialize(t)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	// Drain concurrently: a handler that writes more than the pipe
+	// buffer (64 KiB on Linux/macOS) would deadlock on a lazy read.
+	type readResult struct {
+		out []byte
+		err error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, cErr := io.Copy(&buf, r)
+		done <- readResult{out: buf.Bytes(), err: cErr}
+	}()
+	// Restore before any assertion so a t.Fatalf below still reports
+	// to the real stderr rather than into the pipe.
+	restore := func() {
+		os.Stderr = orig
+		_ = w.Close()
+	}
+
+	signal := internal.NewRunnerSignal("parity-stderr", time.Now())
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
+		handler(rw, req, script, signal, 0, "")
+	})
+	srv := httptest.NewServer(mux)
+
+	resp, err := http.Get(srv.URL + "/hello?x=1")
+	if err != nil {
+		srv.Close()
+		restore()
+		t.Fatalf("get: %v", err)
+	}
+	body := new(bytes.Buffer)
+	_, copyErr := io.Copy(body, resp.Body)
+	_ = resp.Body.Close()
+	srv.Close()
+	restore()
+	if copyErr != nil {
+		t.Fatalf("read body: %v", copyErr)
+	}
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("drain captured stderr: %v", got.err)
+	}
+
+	// (1) customer stderr escaped to the host.
+	if !strings.Contains(string(got.out), wantLine) {
+		t.Errorf("customer stderr did not reach the runner's os.Stderr.\n"+
+			"want line: %q\ncaptured:  %q\n"+
+			"This is the issue #254 regression: cmd.Stderr must be "+
+			"io.MultiWriter(&stderr, os.Stderr), not a bare buffer — "+
+			"otherwise customer stack traces never leave the microVM.",
+			wantLine, string(got.out))
+	}
+
+	// (2) the protocol-bearing stdout path still decodes.
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200 — the response envelope failed to decode; "+
+			"did stdout get teed as well? stdout is protocol-bearing (§4.9).",
+			resp.StatusCode)
+	}
+	if !strings.Contains(body.String(), "echo:/hello") {
+		t.Errorf("body = %q, want contains echo:/hello — the §4.9 envelope did not "+
+			"survive the round trip; stdout must stay a bare buffer.", body.String())
 	}
 }

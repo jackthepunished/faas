@@ -14,6 +14,19 @@ import (
 // the runner expects. The runner execs the handler file directly with no
 // interpreter (guest/runners/go124/main.go:117), so POSIX-sh is enough
 // and the helper never skips this test.
+// TestHandle_StderrReachesHost pins issue #254: the customer handler's
+// stderr must be teed to the runner's os.Stderr (inherited from
+// guest-init PID1) so it lands in the log ring the customer reads over
+// `faas logs`. The helper also asserts the §4.9 stdout envelope still
+// decodes — stdout must stay a bare buffer.
+func TestHandle_StderrReachesHost(t *testing.T) {
+	const line = "go124-customer-stderr-marker"
+	fake := runnerparity.FakeScriptWritingStderr(line)
+	runnerparity.RunStderrReachesHost(t, fake, line, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, _ int, _ string) {
+		handle(w, r, handlerPath, signal, 0, "")
+	})
+}
+
 func TestHandle_RoundTrip(t *testing.T) {
 	fake := runnerparity.FakeGoScript()
 	// PR 3 (issue #667 follow-up): the runner's `handle` signature

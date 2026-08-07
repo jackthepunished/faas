@@ -13,6 +13,19 @@ import (
 // TestHandle_RoundTrip spins a stub handler with the same JSON contract
 // the runner expects. The runner's spawn-the-binary path needs an
 // actual `python3` on PATH; the helper skips when missing.
+// TestHandle_StderrReachesHost pins issue #254: the customer handler's
+// stderr must be teed to the runner's os.Stderr (inherited from
+// guest-init PID1) so it lands in the log ring the customer reads over
+// `faas logs`. The helper also asserts the §4.9 stdout envelope still
+// decodes — stdout must stay a bare buffer.
+func TestHandle_StderrReachesHost(t *testing.T) {
+	const line = "python313-customer-stderr-marker"
+	fake := runnerparity.FakePyScriptWritingStderr(line)
+	runnerparity.RunStderrReachesHost(t, fake, line, func(w http.ResponseWriter, r *http.Request, handlerPath string, signal *internal.RunnerSignal, _ int, _ string) {
+		handle(w, r, handlerPath, signal, 0, "")
+	})
+}
+
 func TestHandle_RoundTrip(t *testing.T) {
 	fake := runnerparity.FakePyScript()
 	// PR 3 (issue #667 follow-up): wrap handle() with 0/empty
