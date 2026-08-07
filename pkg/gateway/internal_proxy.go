@@ -35,6 +35,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -161,13 +162,7 @@ func newInternalProxyTransport(dialer InternalDialer, dialTimeout time.Duration)
 		// identity (the unix socket path) so the same in-flight
 		// conn is reused across requests.
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			dctx := ctx
-			if dialTimeout > 0 {
-				var cancel context.CancelFunc
-				dctx, cancel = context.WithTimeout(ctx, dialTimeout)
-				defer cancel()
-			}
-			return dialer.DialContext(dctx, "")
+			return dialWithTimeout(ctx, dialer, dialTimeout)
 		},
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
@@ -221,18 +216,28 @@ func newInternalProxyH2CTransport(dialer InternalDialer, dialTimeout time.Durati
 		// (customer deadline). Without this contextcheck flagged
 		// the closure (golangci-lint v2.4 contextcheck rule).
 		DialTLSContext: func(ctx context.Context, _ string, _ string, _ *tls.Config) (net.Conn, error) {
-			dctx := ctx
-			if dialTimeout > 0 {
-				var cancel context.CancelFunc
-				dctx, cancel = context.WithTimeout(ctx, dialTimeout)
-				defer cancel()
-			}
-			return dialer.DialContext(dctx, "")
+			return dialWithTimeout(ctx, dialer, dialTimeout)
 		},
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     15 * time.Second,
 	}
 	return t
+}
+
+// dialWithTimeout calls dialer.DialContext with ctx wrapped by
+// WithTimeout(dialTimeout) when dialTimeout > 0. Extracted so the
+// dial-timeout wrap pattern lives in one place — the two transport
+// constructors share the same shape (issue #687 PR-3 review
+// finding #4) and any future change to the timeout semantics
+// (e.g. a min-deadline with the inbound ctx) only needs to update
+// this function. Returns the dialer's net.Conn (or error).
+func dialWithTimeout(ctx context.Context, dialer InternalDialer, dialTimeout time.Duration) (net.Conn, error) {
+	if dialTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+	}
+	return dialer.DialContext(ctx, "")
 }
 
 // ServeHTTP implements http.Handler. It rewrites the inbound
@@ -384,17 +389,73 @@ func copyResponseBody(ctx context.Context, dst io.Writer, src io.ReadCloser) (in
 		// cost memory without measurably improving throughput for
 		// the customer-app traffic shape (most responses are
 		// sub-MiB JSON / HTML).
+		//
+		// Issue #687 PR-3 review finding: defers run LIFO. The
+		// panic-recovery defer MUST be registered BEFORE the
+		// src.Close defer so it fires FIRST (during the unwind)
+		// — otherwise a panic in dst.Write / flusher.Flush would
+		// run src.Close first (closing the body without ever
+		// notifying the cancel arm) and the cancel arm's `<-done`
+		// would block forever. Register the recover defer first;
+		// the close defer runs last so the goroutine still exits.
+		//
+		// `total` is hoisted above both defers so the recover
+		// defer can reference it (Go's closure capture is by
+		// reference; the variable must be in scope at defer
+		// registration time, not just at defer execution time).
+		var total int64
+		defer func() {
+			if r := recover(); r != nil {
+				// Best-effort send so the cancel arm's `<-done`
+				// doesn't hang. `done` is buffered with capacity 1
+				// so this never blocks. We swallow the panic
+				// (don't re-raise) so the goroutine exits cleanly
+				// — a re-panic in a goroutine surfaces to the
+				// runtime as a crash, and the caller is already
+				// out of options (the underlying writer panicked,
+				// the stream is broken; nothing useful to do).
+				select {
+				case done <- result{total, fmt.Errorf("copyResponseBody: panic during copy: %v", r)}:
+				default:
+				}
+			}
+		}()
 		defer func() { _ = src.Close() }() // ensure goroutine exit even on panic
 		buf := make([]byte, 32*1024)
-		var total int64
 		for {
 			n, rErr := src.Read(buf)
 			if n > 0 {
-				if _, wErr := dst.Write(buf[:n]); wErr != nil {
-					done <- result{total, wErr}
-					return
+				// Honour io.Writer contract: a Write may return
+				// fewer than len(p) bytes AND nil error. Loop on
+				// the unwritten tail until the full chunk is
+				// drained (matching io.Copy's shape). Without this,
+				// total overcounts the bytes the customer actually
+				// receives when a partial-write dst is passed.
+				//
+				// Issue #687 PR-3 review finding #2: the previous
+				// shape used `total += int64(n)` with `n` being the
+				// Read count, not the Write count — diverging from
+				// io.Copy semantics on partial writes.
+				written := 0
+				for written < n {
+					nw, wErr := dst.Write(buf[written:n])
+					written += nw
+					total += int64(nw)
+					if wErr != nil {
+						done <- result{total, wErr}
+						return
+					}
+					if nw == 0 {
+						// Write made no progress but returned nil —
+						// io.Copy treats this as the next-read loop
+						// unblocking; we follow suit and break out
+						// of the partial-write retry, letting the
+						// next Read refill the buffer. The bytes
+						// already written are counted; the ones not
+						// yet written will appear in the next Read.
+						break
+					}
 				}
-				total += int64(n)
 				if flusher != nil {
 					flusher.Flush()
 				}

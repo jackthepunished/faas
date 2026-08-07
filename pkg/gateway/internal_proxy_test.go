@@ -460,10 +460,20 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 	if c.gap > 0 {
 		time.Sleep(c.gap)
 	}
-	for i := 0; i < c.size && i < len(p); i++ {
+	// Honour io.Reader contract: n must be <= len(p). Without
+	// this clamp, a future test that constructs newChunkedReader
+	// with size > the caller's buffer (e.g. a reduced 1 KiB
+	// buffer in copyResponseBody) returns n > len(p) — undefined
+	// behaviour under io.Reader (the caller indexes buf[:n] out
+	// of bounds).
+	n := c.size
+	if n > len(p) {
+		n = len(p)
+	}
+	for i := 0; i < n; i++ {
 		p[i] = 'x'
 	}
-	return c.size, nil
+	return n, nil
 }
 
 func (c *chunkedReader) Close() error {
@@ -624,5 +634,62 @@ func TestInternalReverseProxy_LongStreaming_NotCutByDialTimeout(t *testing.T) {
 	}
 	if got := rr.Body.Len(); got != totalChunks*1024 {
 		t.Errorf("body bytes = %d, want %d (full streaming response must reach customer)", got, totalChunks*1024)
+	}
+}
+
+// panicOnWriteRecorder is an io.Writer that panics on the first
+// Write. Used by TestCopyResponseBody_WritePanicDoesNotHang to
+// pin the issue #687 PR-3 review finding #3 fix: the
+// copyResponseBody goroutine's recover defer MUST send on done
+// before re-panicking, otherwise the cancel arm's <-done blocks
+// forever.
+type panicOnWriteRecorder struct{}
+
+func (panicOnWriteRecorder) Write(_ []byte) (int, error) {
+	panic("deliberate test panic in copyResponseBody dst.Write path")
+}
+
+// TestCopyResponseBody_WritePanicReleasesCancelArm pins the
+// recover-defer in copyResponseBody (issue #687 PR-3 review
+// finding #3): when dst.Write panics, the goroutine's panic
+// recovery defer MUST send a result on done (so the cancel
+// arm's <-done unblocks) before the goroutine exits. Without
+// the recover defer, the goroutine would die in the panic —
+// and any caller parked on the cancel arm's <-done would
+// block forever, holding the H2C stream window open.
+//
+// Test shape: cancel the ctx at 50 ms (after the Write panic
+// fires at ~0 ms) and assert that copyResponseBody returns
+// within 100 ms of the cancel. Pre-fix, the goroutine would
+// silently die in the panic and the function would hang on
+// the cancel arm's <-done.
+func TestCopyResponseBody_WritePanicReleasesCancelArm(t *testing.T) {
+	src := io.NopCloser(io.Reader(newChunkedReader(1, 1024, 0)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The Write panic is swallowed by copyResponseBody's
+		// recover defer (the goroutine exits cleanly via the
+		// done-channel send in the recovery path). We don't
+		// wrap this in a recover() because the production
+		// code's recovery path handles it — if the recover
+		// defer regresses (e.g. panic propagates), the test
+		// fails with a runtime goroutine panic, which is a
+		// louder signal than a hung test.
+		_, _ = copyResponseBody(ctx, panicOnWriteRecorder{}, src)
+	}()
+
+	// The Write panic fires on the first Read+Write (within
+	// microseconds). The recover defer sends on done and the
+	// copyResponseBody goroutine returns. We assert the
+	// outer function returns within 100 ms — bounded by the
+	// cancel arm's wait on the goroutine's done send.
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("copyResponseBody did not return within 500ms of Write panic — recover defer / done-send regressed (cancel arm hangs)")
 	}
 }
