@@ -1007,6 +1007,32 @@ func (h *Harness) MeterdLogs() string {
 	return ""
 }
 
+// VmmdLogs returns the captured stdout/stderr of the vmmd subprocess.
+// Mirrors MeterdLogs (the same shared-buffer pattern). The buffer is
+// shared with stop()/DumpLogs (cmd.Stdout == cmd.Stderr per startProc
+// at line 620-621), so a concurrent push may append more lines after
+// this returns — the caller is expected to poll. Empty string means
+// vmmd wasn't started (e.g. Harness wired with DeployWake mask) or
+// has no captured output yet.
+//
+// Used by the §14 M6 source-deploy→wake e2e
+// (cmd/e2e/source_deploy_wake_metal_test.go) to assert vmmd's
+// "restore failed, falling back to cold boot" Warn at
+// pkg/fcvm/manager.go:2368 fired during a vmmd-restore-fail wake
+// — that log line is the load-bearing signal that the VMM-side
+// fallback (vs the planner-side cold-boot rejection) actually ran.
+func (h *Harness) VmmdLogs() string {
+	for _, p := range h.procs {
+		if filepath.Base(p.Path) != "vmmd" {
+			continue
+		}
+		if buf, ok := p.Stdout.(*safeBuffer); ok {
+			return buf.String()
+		}
+	}
+	return ""
+}
+
 // injectSearchPath adds (or replaces) the search_path query parameter on a
 // pgx DSN. The test's pool uses <schema>,public — match that so the daemon
 // subprocess reads the same tables the test wrote to.

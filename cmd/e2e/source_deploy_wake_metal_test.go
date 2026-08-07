@@ -18,7 +18,7 @@
 // tarball → builderd → imaged → Live but stops before any wake. The chain
 // between them is the gap this test closes.
 //
-// Seven subtests run sequentially against one harness (apid + schedd +
+// Eight subtests run sequentially against one harness (apid + schedd +
 // imaged + vmmd + gatewayd + builderd + meterd) and one PG schema:
 //
 //  1. source-deployed-live       — Node fixture → multipart → DeployLive
@@ -27,7 +27,8 @@
 //  4. idle-repark                — reaper parks the running instance
 //  5. force-stale-snapshot       — direct SQL update snapshots.fc_version
 //  6. wake-from-cold-boot        — HTTP probe → x-faas-wake-id → method=cold_boot
-//  7. idempotent-replay          — same Idempotency-Key → same deploy ID
+//  7. vmmd-restore-fail-fallback — corrupt snapshot file → restore error → cold_boot
+//  8. idempotent-replay          — same Idempotency-Key → same deploy ID
 //
 // Build tag: metal. Requires /dev/kvm + root + Firecracker on PATH +
 // FAAS_TEST_KERNEL + FAAS_BUILDER_BASE_PATH. Runs on EX44 via `make
@@ -45,6 +46,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -315,12 +317,167 @@ func TestSourceDeployWakeMetal(t *testing.T) {
 			t.Error("no snapshot rows marked stale after cold-boot fallback; MarkSnapshotStale didn't fire")
 		}
 	})
-	// Note: we intentionally do NOT re-park after subtest 6 — the next
-	// probe in subtest 7 would otherwise have to re-wake, and the
-	// idempotency assertion only needs the deployment row to exist, not
-	// the instance state.
+	// Note: subtest 6 leaves the instance RUNNING. Subtest 7 needs it
+	// parked again before it can re-wake, so we explicitly park + wait
+	// for StateParked inside the new subtest rather than relying on the
+	// reaper (which would add a 10-20s tick we'd otherwise have to budget).
 
-	// -- 7. idempotent-replay --------------------------------------------
+	// -- 7. vmmd-restore-fail-fallback -----------------------------------
+	// Subtest 6 exercised the PLANNER-side cold-boot fallback: the
+	// scheduler saw a fc_version mismatch in the snapshots row and never
+	// even asked vmmd to restore. This subtest exercises the VMM-SIDE
+	// fallback: the planner picks the snapshot (fc_version matches,
+	// stale=false) and vmmd's m.vmm.Restore(...) call fails because the
+	// on-disk snapshot file is corrupt. vmmd then logs "restore failed,
+	// falling back to cold boot" (pkg/fcvm/manager.go:2368) and returns
+	// WakeColdBoot; schedd's wake path (pkg/sched/engine.go:1568-1578)
+	// observes haveSnap=true && Method==WAKE_COLD_BOOT and calls
+	// MarkSnapshotStale on the bad snapshot. Two distinct fallback paths
+	// must both succeed — only one is the "intended" ADR-005 path.
+	//
+	// Path layout: snapshots.storage_key carries "snap/<depID>/mem" and
+	// the LocalStorageBackend joins it under <root>/<key>, so the
+	// harness's h.ImagedTmp + "snap/" + depID + "/mem" is the file we
+	// corrupt. After subtest 6's cold-boot wake, schedd re-snapshotted
+	// the freshly-booted VM (engine.go:3154 emits the new snapshot_written
+	// payload), so the on-disk file is fresh and non-empty — perfect
+	// target for a truncate.
+	t.Run("vmmd-restore-fail-fallback", func(t *testing.T) {
+		defer h.DumpLogs(t)
+
+		// Park the running instance from subtest 6 so the next wake is
+		// a real wake (not a hot forward). The reaper tick is 10s; an
+		// explicit park + 25s wait mirrors subtest 2.
+		pctx, pcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer pcancel()
+		if _, status := doReq(t, h, key, http.MethodPost, "/v1/apps/srcdeploy/park", nil); status != http.StatusAccepted {
+			t.Fatalf("park: status=%d", status)
+		}
+		if _, err := e2etest.WaitForInstanceState(pctx, t, pool, appID, state.StateParked, 25*time.Second); err != nil {
+			t.Fatalf("instance did not park after subtest 6 wake: %v", err)
+		}
+
+		// The cold-boot re-prime (engine.go:3154) wrote a fresh
+		// non-stale snapshots row; planner will pick it on the next
+		// wake unless the file is corrupt. Sanity-check the planner
+		// state BEFORE we corrupt the file, so the test's diagnosis is
+		// clear if a future seam regresses (e.g. sched stops re-priming
+		// after cold-boot, leaving the planner with no row to pick).
+		sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer scancel()
+		var preCount int
+		if err := pool.QueryRow(sctx,
+			`select count(*) from snapshots where deployment_id = $1 and stale = false`, depID,
+		).Scan(&preCount); err != nil {
+			t.Fatalf("count non-stale snapshots: %v", err)
+		}
+		if preCount == 0 {
+			t.Fatal("no non-stale snapshots before corrupt; subtest 6's cold-boot re-prime didn't fire — test cannot proceed")
+		}
+
+		// Corrupt the on-disk mem file. The key the planner will hand
+		// to vmmd is "snap/<depID>/mem" — see pkg/state/keys.go:55
+		// (SnapMemKey). LocalStorageBackend.join (pkg/storage/local.go:85)
+		// resolves keys under root, so the absolute path is
+		// <h.ImagedTmp>/snap/<depID>/mem.
+		//
+		// We write a partial block of garbage (not 0 bytes — LocalStorageBackend.Get
+		// at pkg/storage/local.go:209 treats a 0-byte file as not-found
+		// and we'd get a different error path: "no usable snapshot" at
+		// the planner layer, NOT the vmmd restore-fail branch we're
+		// pinning). The Firecracker snapshot loader parses the header
+		// and bails out with a non-recognisable magic number.
+		snapPath := filepath.Join(h.ImagedTmp, "snap", depID, "mem")
+		preStat, err := os.Stat(snapPath)
+		if err != nil {
+			t.Fatalf("stat snapshot file before corrupt: %v (path=%s)", err, snapPath)
+		}
+		if preStat.Size() == 0 {
+			t.Fatalf("snapshot file is empty (%s); subtest 6's cold-boot re-prime didn't write a snapshot — test cannot proceed", snapPath)
+		}
+		// Overwrite the first 4 KiB with non-zero garbage so Firecracker's
+		// snapshot loader fails its magic-number / version check on the
+		// very first read. We don't truncate the file — Firecracker reads
+		// metadata at the tail (snapshot layout depends on the page count,
+		// which the loader computes from file size); a 4 KiB garbage
+		// header is enough to trip the magic check, and keeping the rest
+		// of the bytes intact means the failure is unambiguously a header
+		// parse error rather than a truncated-file stat error.
+		if err := writeGarbage(snapPath, 4096); err != nil {
+			t.Fatalf("write garbage to snapshot file %s: %v", snapPath, err)
+		}
+		t.Logf("vmmd-restore-fail-fallback: corrupted snapshot file at %s (was %d bytes)", snapPath, preStat.Size())
+
+		// Wake through gatewayd. Planner sees the row (fc_version
+		// matches, stale=false) → picks WakeRestore → vmmd attempts
+		// Restore → file parse fails → cold-boot fallback → scheduler
+		// marks the bad snapshot stale. Method on boot_completed is
+		// cold_boot; MarkSnapshotStale flips stale=true on the snapshot
+		// row vmmd was given.
+		wctx, wcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer wcancel()
+		url := gatewayAppURL(h, "srcdeploy")
+		client := h.HTTPClient()
+		body, wakeID, status := doGetWithHostCapturingWakeID(t, client, url, "srcdeploy.apps.test.example", 60*time.Second)
+		if status != http.StatusOK {
+			t.Fatalf("status=%d body=%s", status, body)
+		}
+		if got := strings.TrimSpace(string(body)); got != sourceDeployHelloBody {
+			t.Fatalf("body=%q want %q", got, sourceDeployHelloBody)
+		}
+		if wakeID == "" || wakeID == firstWakeID {
+			t.Fatalf("wake_id=%q (first=%q); expected a fresh wake_id", wakeID, firstWakeID)
+		}
+
+		// Assert the AUTHORITATIVE completion signal: schedd re-emits
+		// boot_completed with Method=cold_boot after vmmd returns from
+		// the failed Restore + ColdBoot leg.
+		ev, err := e2etest.WaitForWakeMethod(wctx, t, pool, wakeID, "cold_boot", 30*time.Second)
+		if err != nil {
+			t.Fatalf("wake %s did not complete via cold_boot after restore failure: %v", wakeID, err)
+		}
+		t.Logf("vmmd-restore-fail-fallback: wake_id=%s method=cold_boot instance=%s", wakeID, instanceIDFromEvent(ev))
+
+		// Independent log-grep confirmation: vmmd emits the exact line
+		// "restore failed, falling back to cold boot" from
+		// pkg/fcvm/manager.go:2368. If a future refactor moves the
+		// fallback inside the VMM layer (where we can't observe it
+		// from outside), the planner-side MarkSnapshotStale still fires
+		// but this log assertion catches the change.
+		logs := h.VmmdLogs()
+		if !strings.Contains(logs, "restore failed, falling back to cold boot") {
+			t.Errorf("vmmd log missing 'restore failed, falling back to cold boot' line; the warn at pkg/fcvm/manager.go:2368 didn't fire — fallback path regressed")
+		}
+
+		// Independent DB confirmation: MarkSnapshotStale flipped the
+		// bad snapshot's stale flag. After this subtest there should be
+		// at least one stale row for the deployment (the bad one) AND
+		// at least one non-stale row (the re-prime after the
+		// cold-boot that vmmd just did — engine.go:3154 fires after
+		// every successful cold-boot wake).
+		mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer mcancel()
+		var staleAfter, freshAfter int
+		if err := pool.QueryRow(mctx,
+			`select count(*) from snapshots where deployment_id = $1 and stale = true`, depID,
+		).Scan(&staleAfter); err != nil {
+			t.Fatalf("count stale snapshots: %v", err)
+		}
+		if err := pool.QueryRow(mctx,
+			`select count(*) from snapshots where deployment_id = $1 and stale = false`, depID,
+		).Scan(&freshAfter); err != nil {
+			t.Fatalf("count non-stale snapshots: %v", err)
+		}
+		if staleAfter == 0 {
+			t.Errorf("no stale snapshot rows after restore-fail wake; schedd's MarkSnapshotStale branch at engine.go:1568-1578 didn't fire")
+		}
+		if freshAfter == 0 {
+			t.Errorf("no fresh non-stale snapshot rows after cold-boot wake; engine.go:3154 re-prime didn't fire")
+		}
+		t.Logf("vmmd-restore-fail-fallback: snapshots stale=%d fresh=%d", staleAfter, freshAfter)
+	})
+
+	// -- 8. idempotent-replay --------------------------------------------
 	// Re-issue the SAME multipart POST with the SAME Idempotency-Key.
 	// apid's idempotent middleware (cmd/apid/server.go:1647-1667)
 	// replays the cached 202 response body and stamps the
@@ -392,7 +549,7 @@ func TestSourceDeployWakeMetal(t *testing.T) {
 }
 
 // fixedIdempotencyKey returns a stable UUID-shaped string used as the
-// Idempotency-Key for subtest 7's replay. Stable (not time-based) so the
+// Idempotency-Key for subtest 8's replay. Stable (not time-based) so the
 // test is deterministic across runs against the same schema; the apid
 // idempotency table is keyed on (account_id, key) with a 24h TTL, so a
 // fresh key per run is correct.
@@ -406,7 +563,7 @@ func fixedIdempotencyKey() string {
 // instance — caller decides whether that's a failure).
 //
 // Mirrors doGetWithHost (deploy_wake_metal_test.go:372-388) but threads
-// the wake-id header back out so subtests 3 and 6 can assert on the
+// the wake-id header back out so subtests 3, 6, and 7 can assert on the
 // authoritative wake method.
 func doGetWithHostCapturingWakeID(t *testing.T, client *http.Client, url, host string, timeout time.Duration) ([]byte, string, int) {
 	t.Helper()
@@ -426,7 +583,7 @@ func doGetWithHostCapturingWakeID(t *testing.T, client *http.Client, url, host s
 	return body, resp.Header.Get("x-faas-wake-id"), resp.StatusCode
 }
 
-// postMultipartCapturingHeaders is the subtest-7-only multipart helper
+// postMultipartCapturingHeaders is the subtest-8-only multipart helper
 // that returns the Idempotent-Replayed response header alongside the
 // status and body. postMultipartDeployment swallows headers because
 // none of its existing callers need them; this sibling does the same
@@ -482,4 +639,42 @@ func instanceIDFromEvent(ev state.Event) string {
 	}
 	_ = json.Unmarshal(ev.Data, &p)
 	return p.InstanceID
+}
+
+// writeGarbage overwrites the first n bytes of path with non-zero
+// garbage so Firecracker's snapshot loader fails its magic-number /
+// version check on the very first read. n is clamped to the file's
+// current size (the corruption must happen INSIDE the existing file —
+// lengthening the file would change Firecracker's expected file
+// layout, and shortening to less than the header size would just trip
+// the OS-layer read; we want a parse error from the FC loader, not
+// a syscall error).
+//
+// Determinism: we write a fixed 0xFA byte pattern — distinct enough
+// from any real FC snapshot header to fail every magic check, and
+// reproducible across CI runs.
+func writeGarbage(path string, n int64) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if n > st.Size() {
+		n = st.Size()
+	}
+	if n == 0 {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, n)
+	for i := range buf {
+		buf[i] = 0xFA
+	}
+	if _, err := f.WriteAt(buf, 0); err != nil {
+		return err
+	}
+	return f.Sync()
 }
