@@ -7576,7 +7576,7 @@ components:
       type: object
       required: [app_id, app_slug, window, source, as_of, request_duration, error_rate_pct, cold_boot_rate_pct, instance_hours, gb_hours, wake_queue_p95_ms, requests_total, throttled_total]
       properties:
-        app_id: { type: string, format: uuid }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         app_slug: { type: string }
         window:
           type: string

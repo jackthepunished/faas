@@ -8400,12 +8400,16 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 // UTC range [start, end). Powers GET /v1/apps/{slug}/slo
 // (issue #696 / ADR-082).
 //
-// Defensive cross-account: the JOIN to apps on app_id pins
-// the rollup to the app's current account_id. A dangling
-// reference (a row in usage_minutes whose app_id no longer
-// exists) is silently dropped by the inner join — the
-// alternative (LEFT JOIN) would surface rows that have no
-// app_id, which is impossible by schema (NOT NULL FK).
+// Defensive cross-account: the SQL filters on BOTH
+// `m.app_id = $1` AND `a.account_id = $2`. The handler
+// passes the account_id read from the session token
+// (cmd/apid/handlers_slo.go:78) so any future caller that
+// bypasses loadApp — an operator-side SLO aggregate, an
+// internal cron, a refactor that passes a fetched app_id
+// from a different account's context — cannot leak the
+// other account's instance_hours / gb_hours. The JOIN to
+// apps is a schema-anchored existence check (NOT NULL FK
+// on usage_minutes.app_id guarantees the row resolves).
 //
 // Math:
 //   - instance_hours = COUNT(*) / 60
@@ -8439,7 +8443,7 @@ func (s *PgStore) UsageDaily(ctx context.Context, accountID string, day time.Tim
 // (pkg/meter/pusher.go::Math.GBHours) also excludes
 // them, so the SLO number and the billed number stay
 // consistent.
-func (s *PgStore) UsageSLOForApp(ctx context.Context, appID string, start, end time.Time) (float64, float64, error) {
+func (s *PgStore) UsageSLOForApp(ctx context.Context, appID, accountID string, start, end time.Time) (float64, float64, error) {
 	var instanceHours, gbHours float64
 	err := s.pool.QueryRow(ctx,
 		`select coalesce(count(*)::float8 / 60.0, 0),
@@ -8447,9 +8451,10 @@ func (s *PgStore) UsageSLOForApp(ctx context.Context, appID string, start, end t
 		   from usage_minutes m
 		   join apps a on a.id = m.app_id
 		  where m.app_id = $1
-		    and m.minute >= $2
-		    and m.minute <  $3`,
-		appID, start.UTC(), end.UTC()).Scan(&instanceHours, &gbHours)
+		    and a.account_id = $2
+		    and m.minute >= $3
+		    and m.minute <  $4`,
+		appID, accountID, start.UTC(), end.UTC()).Scan(&instanceHours, &gbHours)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -60,6 +60,7 @@ Commands:
   rollback     Re-promote the previous deployment
   secrets      Manage env secrets on an app (--app <slug>)
   sign-keys    Provision the cosign sign keypair (operator; --sign-key / --verify-key)
+  slo          Per-app SLO panel (gregale slo <slug> [--window 24h])
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
   usage        Show this month's usage (gregale usage [--month YYYY-MM])

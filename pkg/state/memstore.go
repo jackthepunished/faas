@@ -6544,7 +6544,7 @@ func (m *MemStore) UsageDaily(_ context.Context, _ string, _ time.Time) ([]Daily
 // so the handler treats the SLO panel as "empty" without
 // turning the response degraded (Prometheus may still be
 // reachable).
-func (m *MemStore) UsageSLOForApp(_ context.Context, _ string, _, _ time.Time) (float64, float64, error) {
+func (m *MemStore) UsageSLOForApp(_ context.Context, _, _ string, _, _ time.Time) (float64, float64, error) {
 	return 0, 0, nil
 }
 

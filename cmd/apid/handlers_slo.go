@@ -87,7 +87,7 @@ func (s *server) getAppSLO(w http.ResponseWriter, r *http.Request, acct state.Ac
 		return
 	}
 
-	resp, src := s.fetchAppSLO(r.Context(), app, window)
+	resp, src := s.fetchAppSLO(r.Context(), app, acct, window)
 	resp.AppID = app.ID
 	resp.AppSlug = app.Slug
 	resp.Window = window
@@ -124,7 +124,7 @@ func (s *server) getAccountSLO(w http.ResponseWriter, r *http.Request, acct stat
 // string ("prometheus" on success, "degraded: <reason>" on
 // failure). Safe when fetcher is nil — every Prometheus
 // field is zeroed and the source carries the reason.
-func (s *server) fetchAppSLO(ctx context.Context, app state.App, window string) (api.AppSLOResponse, string) {
+func (s *server) fetchAppSLO(ctx context.Context, app state.App, acct state.Account, window string) (api.AppSLOResponse, string) {
 	resp := api.AppSLOResponse{}
 	if s.promqlClient == nil {
 		// Try the Postgres rollup regardless — the dashboard
@@ -134,7 +134,7 @@ func (s *server) fetchAppSLO(ctx context.Context, app state.App, window string) 
 		// "degraded:" reasons).
 		if s.store != nil {
 			start, end := windowToRange(window)
-			instH, gbH, err := s.store.UsageSLOForApp(ctx, app.ID, start, end)
+			instH, gbH, err := s.store.UsageSLOForApp(ctx, app.ID, acct.ID, start, end)
 			if err == nil {
 				resp.InstanceHours = instH
 				resp.GBHours = gbH
@@ -218,7 +218,7 @@ func (s *server) fetchAppSLO(ctx context.Context, app state.App, window string) 
 	// partial-degraded form.
 	if s.store != nil {
 		start, end := windowToRange(window)
-		instH, gbH, err := s.store.UsageSLOForApp(ctx, app.ID, start, end)
+		instH, gbH, err := s.store.UsageSLOForApp(ctx, app.ID, acct.ID, start, end)
 		if err == nil {
 			resp.InstanceHours = instH
 			resp.GBHours = gbH

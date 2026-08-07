@@ -5,6 +5,7 @@ package api
 // "30d" without bumping the issue) fails the build.
 
 import (
+	"encoding/json"
 	"testing"
 )
 
@@ -90,22 +91,17 @@ func TestSLODefaultWindow_Pins24h(t *testing.T) {
 // auto-gen node/python SDKs all read this serialised shape, so
 // any field rename MUST be coordinated across pkg/api/dto.go,
 // sdk/go/internal/api/dto.go, and the OpenAPI spec.
+//
+// The test serialises a populated AppSLOResponse to JSON,
+// deserialises it back, and asserts every field survived. A
+// future field rename or json-tag typo on AppSLOResponse
+// (e.g. dropping the `json:"requests_total"` tag) would fail
+// here, keeping the SDK hand-mirror
+// (sdk/go/internal/api/dto.go) and the dashboard in lockstep
+// with pkg/api.
 func TestAppSLOResponse_JSONRoundtrip(t *testing.T) {
-	// Concrete check: zero-value struct still marshals to a
-	// valid JSON object (no missing keys that would surface
-	// as "null" surprises on the wire).
-	var zero AppSLOResponse
-	if zero.Window != "" {
-		t.Errorf("zero-value AppSLOResponse.Window = %q, want empty", zero.Window)
-	}
-	if zero.RequestsTotal != 0 {
-		t.Errorf("zero-value AppSLOResponse.RequestsTotal = %d, want 0", zero.RequestsTotal)
-	}
-	// Concrete check: the populated struct survives the
-	// JSON round-trip (the SDKs and the dashboard both
-	// build from this serialised shape).
 	in := AppSLOResponse{
-		AppID:           "abc",
+		AppID:           "0123456789abcdef0123456789abcdef",
 		AppSlug:         "my-app",
 		Window:          "24h",
 		Source:          "prometheus",
@@ -119,7 +115,47 @@ func TestAppSLOResponse_JSONRoundtrip(t *testing.T) {
 		RequestsTotal:   4321,
 		ThrottledTotal:  0,
 	}
-	_ = in
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var out AppSLOResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if out != in {
+		t.Errorf("round-trip mismatch:\n got  %+v\n want %+v", out, in)
+	}
+}
+
+// TestAccountSLOResponse_JSONRoundtrip mirrors the per-app
+// round-trip for the account-scoped DTO. Same invariant: a
+// json-tag typo on AccountSLOResponse must fail this test.
+func TestAccountSLOResponse_JSONRoundtrip(t *testing.T) {
+	in := AccountSLOResponse{
+		Window:          "7d",
+		Source:          "degraded: postgres unavailable",
+		AsOf:            "2026-08-07T15:30:00.000Z",
+		RequestDuration: SLODuration{P50MS: 22.1, P95MS: 91.0, P99MS: 410.0},
+		ErrorRatePct:    0.55,
+		ColdBootRatePct: 4.20,
+		InstanceHours:   12.0,
+		GBHours:         3.0,
+		WakeQueueP95MS:  14.0,
+		RequestsTotal:   12000,
+		ThrottledTotal:  23,
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var out AccountSLOResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if out != in {
+		t.Errorf("round-trip mismatch:\n got  %+v\n want %+v", out, in)
+	}
 }
 
 // TestAccountSLOResponse_OmitsAppFields pins the wire-shape
