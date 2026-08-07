@@ -1667,15 +1667,18 @@ func ErrRegistryCredentialNotFound(host string) *Problem {
 		WithDocs("https://docs.gregale.dev/registry-credentials")
 }
 
-// ErrPlanMinInstancesNotAllowed is returned when a Free or Hobby account
-// tries to set apps.min_instances (ux_spec §6.5, plan-tier gate). The
-// customer's bill on these plans is built around scale-to-zero; a
-// floor keeps N × RAMMB resident at all times, which is the cost
-// shape of Pro / Scale.
+// ErrPlanMinInstancesNotAllowed is returned when a Free account tries
+// to set apps.min_instances or deployments.min_instances (ux_spec §6.5,
+// plan-tier gate). The customer's bill on Free is built around
+// scale-to-zero; a floor keeps N × RAMMB resident at all times, which
+// is the cost shape of Hobby / Pro / Scale. Hobby was promoted to
+// the gate's "allowed" set by issue #462 / ADR-058 / PR-A — the
+// tier-up is as far as the gate goes, so Free is the remaining
+// locked tier.
 func ErrPlanMinInstancesNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanMinInstancesNotAllowed,
 		"Plan doesn't allow a min-instances floor",
-		fmt.Sprintf("the %s plan always scales to zero; upgrade to Pro or Scale to keep instances warm.", p)).
+		fmt.Sprintf("the %s plan always scales to zero; upgrade to Hobby, Pro, or Scale to keep instances warm.", p)).
 		WithDocs("https://docs.gregale.dev/plans#min-instances")
 }
 

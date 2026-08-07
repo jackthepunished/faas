@@ -1040,6 +1040,16 @@ func (s *server) getDeployment(w http.ResponseWriter, r *http.Request, acct stat
 // Validation:
 //   - 404 on a missing deployment or a deployment that belongs to a
 //     different account (IDOR-safe).
+//   - 403 on a Free account — Free plans cannot set the per-deployment
+//     min_instances floor. Plan tier first (same as the per-app gate
+//     at validateUpdateApp) so a Free customer sees the plan error
+//     rather than the value error. Pre-#557 / ADR-072 this branch
+//     was missing: Free plans masked the bug accidentally because
+//     `MaxMinInstances == 0` made `v > planMax` always true, but the
+//     wrong error code (422 ErrMaxMinInstancesExceeded, "value") was
+//     returned instead of the 403 "plan" code. Any future plan with
+//     `MaxMinInstances > 0` and `MinInstancesAllowed = false` would
+//     have opened a real bypass.
 //   - 422 on a negative value or a value > plan.MaxMinInstances().
 //     The plan cap applies to the EFFECTIVE floor per instance
 //     (max(app, deployment)), not separately per axis — keeps the
@@ -1071,9 +1081,18 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 			"min_instances must be present (use 0 to inherit from the parent app)"))
 		return
 	}
+	// Plan tier gate (issue #557 / ADR-072). Must run BEFORE the
+	// bounds check so a Free account PATCHing min_instances=1 sees
+	// the 403 plan_min_instances_not_allowed rather than the 422
+	// max_min_instances_exceeded (the value is legal; the plan is
+	// locked). Mirrors the per-app gate at validateUpdateApp:81-87.
+	if !acct.Plan.MinInstancesAllowed() {
+		api.WriteProblem(w, api.ErrPlanMinInstancesNotAllowed(acct.Plan))
+		return
+	}
 	v := *req.MinInstances
 	if v < 0 {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
+		api.WriteProblem(w, api.NewProblem(http.StatusUnprocessableEntity, api.CodeInvalidMinInstances,
 			"min_instances must be >= 0",
 			fmt.Sprintf("min_instances = %d; must be >= 0.", v)))
 		return
@@ -1083,6 +1102,7 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 		api.WriteProblem(w, api.ErrMaxMinInstancesExceeded(v, planMax))
 		return
 	}
+	prev := d.MinInstances
 	updated, err := s.store.UpdateDeploymentMinInstances(r.Context(), id, v)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
@@ -1091,6 +1111,20 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 		}
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "update failed", err.Error()))
 		return
+	}
+	// Audit emit (issue #557 / ADR-072 §Decision 6). The kind
+	// name is the same one the doc comment promised at the top of
+	// this function; pre-#557 the emit was a doc-only contract
+	// and no row was ever written. Operators correlate the bill
+	// change with the PATCH by greppping for the kind. Best-effort:
+	// a failure is logged but does not roll back the store write.
+	if s.audit != nil {
+		s.audit.Emit(r.Context(), "deployment.min_instances_changed", &acct.ID, map[string]any{
+			"app":         app.ID,
+			"deployment":  updated.ID,
+			"min_instances": v,
+			"prev":        prev,
+		})
 	}
 	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
 }

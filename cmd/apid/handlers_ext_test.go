@@ -235,6 +235,61 @@ func TestUpdateAppMinInstances_Negative(t *testing.T) {
 	assertProblem(t, rec, 422, api.CodeInvalidMinInstances)
 }
 
+// TestUpdateDeploymentMinInstances_FreeGate pins the issue #557 /
+// ADR-072 plan-gate fix: a Free account PATCHing
+// deployments.min_instances MUST return 403
+// plan_min_instances_not_allowed, not 422
+// max_min_instances_exceeded. Pre-fix the handler skipped the
+// MinInstancesAllowed gate and Free plans masked the bug
+// accidentally because `MaxMinInstances == 0` always tripped the
+// value cap with the wrong error code. The fix adds the
+// `acct.Plan.MinInstancesAllowed()` gate at the top of the
+// handler, mirroring the per-app gate at validateUpdateApp.
+func TestUpdateDeploymentMinInstances_FreeGate(t *testing.T) {
+	e := setup(t, api.PlanFree)
+	d := mustSeedDeployment(t, e, "free-dep")
+	one := 1
+	rec := e.do(t, "PATCH", "/v1/deployments/"+d.ID, api.UpdateDeploymentRequest{MinInstances: &one}, nil)
+	assertProblem(t, rec, 403, api.CodePlanMinInstancesNotAllowed)
+}
+
+// TestUpdateDeploymentMinInstances_HobbyHappy is the symmetric
+// happy-path: Hobby plans now accept the per-deployment floor
+// (issue #462 / ADR-058 / PR-A tier-up). The response carries the
+// new value. Mirrors TestUpdateAppMinInstances_Hobby above.
+func TestUpdateDeploymentMinInstances_HobbyHappy(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	d := mustSeedDeployment(t, e, "hobby-dep")
+	one := 1
+	rec := e.do(t, "PATCH", "/v1/deployments/"+d.ID, api.UpdateDeploymentRequest{MinInstances: &one}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var out api.DeploymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.MinInstances != 1 {
+		t.Errorf("MinInstances = %d, want 1", out.MinInstances)
+	}
+}
+
+// TestUpdateDeploymentMinInstances_Negative pins the 422 path: a
+// Pro plan PATCHing -1 on a deployment gets
+// invalid_min_instances, not plan_min_instances_not_allowed.
+// Pre-fix the handler returned 400 (validation) instead of 422
+// (semantic) for negative values; the new code lifts the negative
+// check to the same 422 ErrInvalidMinInstances the per-app handler
+// emits. The plan gate ran first so a Free plan PATCHing -1 still
+// gets 403 (covered by TestUpdateDeploymentMinInstances_FreeGate).
+func TestUpdateDeploymentMinInstances_Negative(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	d := mustSeedDeployment(t, e, "pro-dep-neg")
+	neg := -1
+	rec := e.do(t, "PATCH", "/v1/deployments/"+d.ID, api.UpdateDeploymentRequest{MinInstances: &neg}, nil)
+	assertProblem(t, rec, 422, api.CodeInvalidMinInstances)
+}
+
 // TestUpdateAppAutoscaleRPS_FreeGate locks the plan-tier gate for the
 // reactive scale-up trigger (issue #169 / #172). Free plans cannot set
 // autoscale_target_rps at all — the handler must return 403
