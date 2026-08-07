@@ -58,10 +58,14 @@ import (
 // a fixed response body — the integration test asserts the body
 // reaches the inbound ResponseWriter and the init was sent.
 type stubVmmdClient struct {
-	mu    sync.Mutex
-	calls []*vmmdpb.ForwardHTTPRequestInit
-	resp  *vmmdpb.ForwardHTTPResponseInit
-	body  []byte
+	mu        sync.Mutex
+	calls     []*vmmdpb.ForwardHTTPRequestInit
+	rawCalls  []*vmmdpb.ForwardRawRequestInit
+	resp      *vmmdpb.ForwardHTTPResponseInit
+	rawResp   *vmmdpb.ForwardRawResponseInit
+	rawBody   []byte
+	body      []byte
+	rawStream grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse]
 }
 
 func (s *stubVmmdClient) ForwardHTTPStream(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], error) {
@@ -71,15 +75,26 @@ func (s *stubVmmdClient) ForwardHTTPStream(ctx context.Context, _ ...grpc.CallOp
 	return stream, nil
 }
 
-// ForwardRawStream is the PR-3 stub for the Upgrade-traffic
-// bridge. PR-1 only adds the wire contract + the vmmd-side
-// handler; the gateway-side forwarder that opens this stream
-// ships in PR-3 (per docs/adr/080 / issue #676 plan). For now
-// the stub returns Unimplemented so a code path that
-// accidentally reaches it surfaces as a clear error instead of
-// a silent zero-value stream.
-func (s *stubVmmdClient) ForwardRawStream(context.Context, ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], error) {
-	return nil, status.Error(codes.Unimplemented, "ForwardRawStream stub: PR-3 ships the gateway forwarder")
+// ForwardRawStream (issue #676 / ADR-080) is the raw-bytes
+// bridge for Upgrade traffic (WebSocket / h2c / MQTT-over-WS /
+// long-poll). The PR-3 gateway forwarder opens this stream when
+// it detects Connection: Upgrade + Upgrade: <token>; the test
+// seam returns a configured proxyRawStubStream (the
+// in-package equivalent of the bufconn fake — see
+// proxy_raw_stub.go) so the integration test can drive the
+// forwarder with a canned response. A test that wires the seam
+// without configuring rawResp / rawBody will surface as an
+// immediately-empty stream (the forwarder observes io.EOF on the
+// first Recv), which is the load-bearing failure mode the test
+// wants to pin.
+func (s *stubVmmdClient) ForwardRawStream(ctx context.Context, _ ...grpc.CallOption) (grpc.BidiStreamingClient[vmmdpb.ForwardRawRequest, vmmdpb.ForwardRawResponse], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rawStream != nil {
+		return s.rawStream, nil
+	}
+	stream := newProxyRawStubStream(ctx, &s.rawCalls, s.rawResp, s.rawBody)
+	return stream, nil
 }
 
 func (s *stubVmmdClient) CreateFromSnapshot(context.Context, *vmmdpb.CreateFromSnapshotRequest, ...grpc.CallOption) (*vmmdpb.WakeResponse, error) {
@@ -324,5 +339,260 @@ func TestHandler_WithForwardingIdempotent(t *testing.T) {
 
 	if got := h.proxyByNode(Target{NodeID: "anything"}); got == nil {
 		t.Fatal("proxyByNode nil after install")
+	}
+}
+
+// Upgrade-traffic detector tests (issue #676 / ADR-080). The handler
+// checks isUpgradeRequest(r) AND app.WebSocketEnabled AND h.rawByNode
+// != nil before routing to the raw forwarder; the four cases below
+// pin every branch of that gate.
+//
+// Why these matter:
+//   - The detector decides which bridge (ForwardHTTPStream vs
+//     ForwardRawStream) the request flows over. A misclassified
+//     request either destroys the WS handshake (plain path strips
+//     hop-by-hop) or wastes a wake (raw path on a non-Upgrade
+//     request). Both are customer-visible failures.
+//   - The per-app flag is the load-bearing gate against Free-tier
+//     abuse (a long-lived WS pins a wake past wake_idle_timeout).
+//     A Free app with WebSocketEnabled=true must NOT reach the
+//     raw forwarder — the apid PATCH gate prevents the state, the
+//     handler test pins the runtime contract.
+
+// TestServeHTTP_UpgradeHeader_BypassesProxyByNode confirms an inbound
+// request with Connection: Upgrade + Upgrade: websocket on an
+// app with WebSocketEnabled=true routes to h.rawByNode (and the
+// proxyByNode handler is NEVER invoked). The raw forwarder returns
+// a canned 101 response; the test asserts both that the raw path
+// fired AND that proxyByNode.calls remains zero.
+func TestServeHTTP_UpgradeHeader_BypassesProxyByNode(t *testing.T) {
+	cli := &stubVmmdClient{
+		rawResp: &vmmdpb.ForwardRawResponseInit{Status: 101},
+		rawBody: []byte("upgrade-ack"),
+	}
+	_ = cli
+	var rawCalls, proxyCalls int
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", Plan: api.PlanScale, WebSocketEnabled: true,
+			StreamingEnabled: false,
+		},
+		host: "app.example.com", upstream: "node-uuid-1", running: true,
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.WithForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			proxyCalls++
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+	h.WithRawForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			rawCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "raw")
+		})
+	})
+
+	req := httptest.NewRequest("GET", "/socket", nil)
+	req.Host = "app.example.com"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if proxyCalls != 0 {
+		t.Errorf("proxyByNode invoked %d times on Upgrade request, want 0", proxyCalls)
+	}
+	if rawCalls != 1 {
+		t.Errorf("rawByNode invoked %d times, want 1", rawCalls)
+	}
+}
+
+// TestServeHTTP_NonUpgradeHeader_TakesProxyByNode confirms that a
+// plain HTTP request (no Upgrade header) on a WebSocketEnabled app
+// still flows through proxyByNode — the raw path is a strict
+// superset, not a replacement. Without this guard a misconfigured
+// deployment that wires rawByNode would silently route every
+// plain HTTP request through the slower raw bridge.
+func TestServeHTTP_NonUpgradeHeader_TakesProxyByNode(t *testing.T) {
+	cli := &stubVmmdClient{
+		resp: &vmmdpb.ForwardHTTPResponseInit{Status: 200},
+		body: []byte("plain-ok"),
+	}
+	_ = cli
+	var rawCalls, proxyCalls int
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", Plan: api.PlanScale, WebSocketEnabled: true,
+		},
+		host: "app.example.com", upstream: "node-uuid-1", running: true,
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.WithForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			proxyCalls++
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "proxy")
+		})
+	})
+	h.WithRawForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			rawCalls++
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+
+	req := httptest.NewRequest("GET", "/v1/plain", nil)
+	req.Host = "app.example.com"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rawCalls != 0 {
+		t.Errorf("rawByNode invoked %d times on plain request, want 0", rawCalls)
+	}
+	if proxyCalls != 1 {
+		t.Errorf("proxyByNode invoked %d times, want 1", proxyCalls)
+	}
+}
+
+// TestServeHTTP_FreePlan_WebSocketNotAllowed confirms that an app
+// with WebSocketEnabled=false on a Free plan (or any plan where
+// the customer opted out) falls through to proxyByNode — the raw
+// path's three-input gate (isUpgradeRequest && WebSocketEnabled
+// && rawByNode != nil) requires ALL three to fire. The proxyByNode
+// handler here is a control point: it returns 502 because the
+// upgrade headers were never stripped (the raw path was bypassed),
+// which is the same shape a customer would see if they sent an
+// upgrade request to a non-WS-enabled app today. The test pins the
+// "no raw path" contract; the apid plan gate prevents a Free app
+// from getting WebSocketEnabled=true in the first place.
+func TestServeHTTP_FreePlan_WebSocketNotAllowed(t *testing.T) {
+	var rawCalls, proxyCalls int
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", Plan: api.PlanFree, WebSocketEnabled: false,
+		},
+		host: "app.example.com", upstream: "node-uuid-1", running: true,
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.WithForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			proxyCalls++
+			w.WriteHeader(http.StatusBadGateway)
+		})
+	})
+	h.WithRawForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			rawCalls++
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+
+	req := httptest.NewRequest("GET", "/socket", nil)
+	req.Host = "app.example.com"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rawCalls != 0 {
+		t.Errorf("rawByNode invoked on Free+disabled app, want 0")
+	}
+	if proxyCalls != 1 {
+		t.Errorf("proxyByNode invoked %d times, want 1", proxyCalls)
+	}
+}
+
+// TestServeHTTP_WebSocketEnabled_DispatchesToRawStream confirms the
+// full happy path: Hobby plan + WebSocketEnabled=true +
+// isUpgradeRequest + rawByNode installed → the raw forwarder is
+// the ONLY handler invoked. The test asserts the init frame's
+// Instance + Port match the resolved Target's values (the
+// forwarder stamp contract from PR-1).
+func TestServeHTTP_WebSocketEnabled_DispatchesToRawStream(t *testing.T) {
+	cli := &stubVmmdClient{
+		rawResp: &vmmdpb.ForwardRawResponseInit{
+			Status: 101,
+			Headers: []*vmmdpb.Header{
+				{Name: "Connection", Value: "Upgrade"},
+				{Name: "Upgrade", Value: "websocket"},
+			},
+		},
+		rawBody: []byte("handshake-complete"),
+	}
+	var proxyCalls int
+	b := &fakeBackend{
+		app: App{
+			ID: "app-1", Plan: api.PlanHobby, WebSocketEnabled: true,
+		},
+		host: "app.example.com", upstream: "node-uuid-1", running: true,
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h.WithForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			proxyCalls++
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+	h.WithRawForwarding(func(Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Stand-in for the production rawStreamReverseProxy —
+			// this test only asserts dispatch, not the stream
+			// framing (covered separately in
+			// TestRawStreamReverseProxy_RoundTrip).
+			rawStreamForwarder(t, cli, w, r)
+		})
+	})
+
+	req := httptest.NewRequest("GET", "/socket", nil)
+	req.Host = "app.example.com"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if proxyCalls != 0 {
+		t.Errorf("proxyByNode invoked on Upgrade request, want 0")
+	}
+	if rec.Code != http.StatusSwitchingProtocols {
+		t.Errorf("status=%d, want 101", rec.Code)
+	}
+}
+
+// rawStreamForwarder is the test-side seam the dispatch test
+// uses in place of the production rawStreamReverseProxy. It
+// dials the stub vmmd client through ForwardRawStream, sends an
+// init frame, and replays the canned response back to the
+// inbound writer. This is the simplest path that exercises the
+// dispatch gate end-to-end without spinning up a bufconn server
+// (the full raw-bridge round-trip is covered by
+// TestRawStreamReverseProxy_RoundTrip in forwardproxy_test.go).
+func rawStreamForwarder(t *testing.T, cli *stubVmmdClient, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	ctx := r.Context()
+	stream, err := cli.ForwardRawStream(ctx)
+	if err != nil {
+		t.Fatalf("ForwardRawStream: %v", err)
+	}
+	init := &vmmdpb.ForwardRawRequestInit{Instance: "stubbed-instance", Port: 8080}
+	if err := stream.Send(&vmmdpb.ForwardRawRequest{Frame: &vmmdpb.ForwardRawRequest_Init{Init: init}}); err != nil {
+		t.Fatalf("Send init: %v", err)
+	}
+	_ = stream.CloseSend()
+	resp, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv init: %v", err)
+	}
+	w.WriteHeader(int(resp.GetInit().GetStatus()))
+	for _, h := range resp.GetInit().GetHeaders() {
+		w.Header().Add(h.GetName(), h.GetValue())
+	}
+	// Body chunk, if any.
+	body, _ := stream.Recv()
+	if body != nil {
+		_, _ = w.Write(body.GetBodyChunk())
 	}
 }

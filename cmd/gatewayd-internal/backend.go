@@ -107,6 +107,15 @@ func (r pgRouter) toApp(ctx context.Context, app state.App) (gateway.App, bool, 
 		AccountID:        acct.ID,
 		Plan:             acct.Plan,
 		StreamingEnabled: app.StreamingEnabled,
+		// Issue #676 / ADR-080: per-app raw-bytes Upgrade
+		// bridge flag. Plumbed from apps.websocket_enabled
+		// through pgRouter.toApp so Handler.ServeHTTP's
+		// three-input gate (isUpgradeRequest &&
+		// app.WebSocketEnabled && h.rawByNode != nil) can
+		// route inbound Connection: Upgrade requests to the
+		// raw forwarder. Default false on the App struct
+		// matches the apps.websocket_enabled column DEFAULT.
+		WebSocketEnabled: app.WebSocketEnabled,
 		RequireAuthn:     app.RequireAuthn,
 		PublicAuth: gateway.PublicAuthConfig{
 			Mode:        app.PublicAuthMode,

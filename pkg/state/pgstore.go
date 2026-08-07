@@ -1519,8 +1519,8 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// gate (Plan.EvictionPriorityReservedAllowed) at create time for
 	// explicit 'reserved' values.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, websocket_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1533,7 +1533,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, app.WebSocketEnabled)
 	return scanApp(row)
 }
 
@@ -1654,8 +1654,8 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// path coerces to 'best_effort' to preserve the pre-#475 create
 	// behaviour bit-for-bit.
 	evictionPriority := EvictionPriorityOrBestEffort(app.EvictionPriority)
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, websocket_enabled)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1667,7 +1667,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, app.WebSocketEnabled)
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2398,7 +2398,13 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		   -- (mode='open' with stale sealed blob from a prior
 		   -- mode='basic' PATCH) clears the blob atomically.
 		   public_auth_mode   = case when $41 then $42::text  else public_auth_mode   end,
-		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end
+		   public_auth_basic  = case when $41 then $43::bytea else public_auth_basic  end,
+		   -- Issue #676 / ADR-080: per-app raw-bytes Upgrade
+		   -- bridge. Same Set-bit convention as streaming_enabled
+		   -- above; apid gates PATCH-true through
+		   -- Plan.WebSocketResponseAllowed() (Free → 403
+		   -- plan_websocket_not_allowed).
+		   websocket_enabled = case when $44 then $45 else websocket_enabled end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2456,7 +2462,10 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		// p.PublicAuth with Sealed=nil in that case).
 		p.SetPublicAuth,
 		derefString(ptrOrEmpty(p.PublicAuth)),
-		nilOrBytes(p.PublicAuth))
+		nilOrBytes(p.PublicAuth),
+		// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge.
+		// Same Set*/optional-pointer pattern as streaming_enabled.
+		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled))
 	return scanApp(row)
 }
 
@@ -9181,7 +9190,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// bytea (NULL when mode='open'|'bearer'), scanned
 		// into a *[]byte to keep the SQL NULL → Go nil
 		// convention explicit.
-		&a.PublicAuthMode, &a.PublicAuthBasicSealed); err != nil {
+		&a.PublicAuthMode, &a.PublicAuthBasicSealed,
+		// Issue #676 / ADR-080: per-app websocket_enabled flag.
+		// NOT NULL DEFAULT false (migration 00155); plain bool
+		// scan is safe.
+		&a.WebSocketEnabled); err != nil {
 		return mapErr(err)
 	}
 	a.Type = AppType(typeStr)
@@ -9246,7 +9259,12 @@ const appsSelectColumns = `
 	eviction_priority,
 	require_authn,
 	-- Issue #477 / ADR-079: per-app public_auth
-	public_auth_mode, public_auth_basic`
+	public_auth_mode, public_auth_basic,
+	-- Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge flag.
+	-- Boolean NOT NULL DEFAULT false (migration 00155); apid applies
+	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
+	-- writes through Plan.WebSocketResponseAllowed().
+	websocket_enabled`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

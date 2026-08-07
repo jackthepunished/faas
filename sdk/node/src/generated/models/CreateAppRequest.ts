@@ -17,6 +17,10 @@ export type CreateAppRequest = {
    */
   streaming_enabled?: boolean;
   /**
+   * Per-app raw-bytes Upgrade bridge flag (issue #676 / ADR-080). Omitted → apid applies the plan default; PATCH-true on Free is rejected by apid with 403 plan_websocket_not_allowed.
+   */
+  websocket_enabled?: boolean;
+  /**
    * Per-app two-tier snapshot flag (issue #470 / ADR-055). Omitted at create-time → apid applies the plan default. Free/Hobby PATCH-true is rejected.
    */
   warm_snapshot_enabled?: boolean;

@@ -831,6 +831,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// vmmd overlay).
 	if deps.nodeCache != nil {
 		handler.WithForwarding(deps.nodeCache.Forwarding())
+		// Issue #676 / ADR-080: install the raw-bytes Upgrade
+		// bridge alongside the plain forwarder. WithRawForwarding
+		// takes the same NodeClientLookup + logger so the per-node
+		// gRPC channel is reused; only the RPC method differs
+		// (ForwardRawStream vs ForwardHTTPStream). The handler's
+		// three-input gate routes Connection: Upgrade requests
+		// here BEFORE falling through to WithForwarding's
+		// ForwardHTTPStream bridge.
+		handler.WithRawForwarding(deps.nodeCache.RawForwarding())
 	}
 
 	// Per-instance last_request_at flush loop (spec §4.1). Present in production;

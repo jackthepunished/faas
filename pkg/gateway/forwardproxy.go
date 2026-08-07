@@ -38,6 +38,7 @@ import (
 	"time"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
+	"github.com/onebox-faas/faas/pkg/api"
 	evts "github.com/onebox-faas/faas/pkg/events"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -448,6 +449,284 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// distinguish a clean bidi close from a client-disconnect
 	// (which surfaces as a Send error).
 	<-bodyErrCh
+}
+
+// rawStreamSessionDeadline is the wall-clock ceiling for a single
+// raw-bytes Upgrade session (issue #676 / ADR-080). WebSocket
+// sessions and long-poll clients are long-lived by design — a
+// chat-completion agent WS can hold a connection for hours. The
+// deadline is intentionally generous (24h) so customers don't see
+// forced reconnects during a normal session; the per-connection
+// inbound body cap (api.RawStreamMaxRequestBytes, 100 MiB) is the
+// load-bearing memory bound on the gateway side. The bridge
+// (cmd/vmmd-raw-bridge) is unbounded on the session body because
+// the inbound cap is enforced at the init frame.
+const rawStreamSessionDeadline = 24 * time.Hour
+
+// rawStreamOnceWithEvents (issue #676 / ADR-080) is the events-aware
+// raw-bytes forwarder for WebSocket / h2c / MQTT-over-WS / long-poll
+// Upgrade traffic. Where fwdStreamOnceWithEvents parses the inbound
+// request into Method/URL/Headers and reconstructs the response
+// from a parsed init + chunked body, rawStreamOnceWithEvents carries
+// bytes verbatim — gatewayd-internal → vmmd ForwardRawStream →
+// vmmd-raw-bridge → guest netns TCP socket — and back. This
+// preserves the Connection: Upgrade + Upgrade: <token> handshake
+// that the plain-HTTP forwarder's hop-by-hop strip would destroy.
+//
+// The shape mirrors fwdStreamOnceWithEvents: NodeClientLookup
+// resolution (handled by the caller, ForwardingRawReverseProxy),
+// a ctxReader-based body-copy goroutine, a receiver loop that
+// writes the init frame's status + headers then streams body
+// chunks via Write+Flush, and the same bodyErrCh drain on exit.
+//
+// Why a Flush per Write:
+//
+//   - The inbound transport is H2C (gRPC-gatewayd-internal); H2 has
+//     no "raw mode" but DATA frames are just bytes. Every Flush
+//     emits a DATA frame to the customer so a WS server's slow
+//     trickle (1 byte per 100 ms) reaches the customer within the
+//     flush interval rather than the 32 KiB io.Copy buffer.
+//
+// Why a 24h session deadline:
+//
+//   - WS sessions are long-lived by design. The deadline is the
+//     memory bound on the gateway-side goroutine pair, not a
+//     customer-visible timeout. A customer who exceeds 24h simply
+//     reconnects; the metrics layer (gateway_ws_session_duration_seconds)
+//     records the disconnect.
+//
+// nil events opts out (legacy callers and the test corpus).
+func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.VmmdClient, log *slog.Logger, t Target, events *evts.Platform) {
+	ctx, cancel := context.WithTimeout(r.Context(), rawStreamSessionDeadline)
+	defer cancel()
+
+	stream, err := cli.ForwardRawStream(ctx)
+	if err != nil {
+		log.Error("gateway: raw forwarder stream open failed",
+			"node", t.NodeID, "err", err.Error())
+		http.Error(w, "raw forwarder stream open failed", http.StatusBadGateway)
+		return
+	}
+
+	// Init frame: instance + port + per-request body cap. The
+	// bridge (pkg/vmmdgrpc/forward.go) clamps MaxRequestBytes
+	// DOWN to api.RawStreamMaxRequestBytes (PR-1 review-fix #2)
+	// so a misconfigured caller cannot grow the cap past the
+	// limit. The gateway-side forwarder just stamps the constant
+	// unchanged — the clamp is at the trust boundary.
+	//
+	// Headers are NOT included in the init frame; the raw bridge
+	// expects the inbound HTTP request to arrive as a body_chunk
+	// stream (the very first chunk is the request line + headers,
+	// the rest is the request body). This is the load-bearing
+	// difference from fwdStreamOnceWithEvents: the wire carries
+	// the bytes the client wrote, including the Connection +
+	// Upgrade headers the hop-by-hop strip would otherwise drop.
+	port := uint32(t.Port)
+	if sidecarPort := SidecarPortFrom(r); sidecarPort != 0 {
+		port = uint32(sidecarPort)
+	}
+	init := &vmmdpb.ForwardRawRequestInit{
+		Instance:        r.Header.Get("x-faas-instance"),
+		Port:            port,
+		MaxRequestBytes: api.RawStreamMaxRequestBytes,
+	}
+	if err := stream.Send(&vmmdpb.ForwardRawRequest{
+		Frame: &vmmdpb.ForwardRawRequest_Init{Init: init},
+	}); err != nil {
+		log.Error("gateway: raw forwarder stream init send failed",
+			"node", t.NodeID, "err", err.Error())
+		http.Error(w, "raw forwarder stream init failed", http.StatusBadGateway)
+		return
+	}
+
+	// Body-copy goroutine: stream r.Body → stream in 8 KiB
+	// chunks. The first error wins; the receiver loop below
+	// surfaces it via bodyErrCh so the bidi close is clean.
+	//
+	// Cancellation: when r.Context() is cancelled (client
+	// disconnect, gateway-side deadline), the goroutine exits
+	// promptly via the inner ctxReader.Read returning
+	// ctx.Err(). Same F3 fix as fwdStreamOnceWithEvents.
+	bodyErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8*1024)
+		cr := &ctxReader{r: r.Body, ctx: r.Context()}
+		for {
+			n, err := cr.Read(buf)
+			if n > 0 {
+				if serr := stream.Send(&vmmdpb.ForwardRawRequest{
+					Frame: &vmmdpb.ForwardRawRequest_BodyChunk{
+						BodyChunk: append([]byte(nil), buf[:n]...),
+					},
+				}); serr != nil {
+					bodyErrCh <- serr
+					return
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				bodyErrCh <- nil
+				_ = stream.CloseSend()
+				return
+			}
+			if err != nil {
+				bodyErrCh <- err
+				_ = stream.CloseSend()
+				return
+			}
+		}
+	}()
+
+	// Receiver loop: read frames and pipe into w. The first
+	// frame is ForwardRawResponseInit (status + headers + error);
+	// subsequent frames are body_chunk bytes that go straight
+	// to w.Write + Flush (the statusRecorder intercepts Write
+	// to fire maybeFlush → onFlush; the explicit Flush on the
+	// raw path guarantees the H2C DATA frame emits even when
+	// the chunk is below the 32 KiB maybeFlush threshold).
+	wroteHeader := false
+	for {
+		frame, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			// Drain the body goroutine so we don't leak.
+			select {
+			case <-bodyErrCh:
+			default:
+			}
+			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+				log.Warn("gateway: raw forwarder stream Unavailable; surfacing 503",
+					"node", t.NodeID)
+				http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				http.Error(w, "instance gone", http.StatusServiceUnavailable)
+				return
+			}
+			log.Error("gateway: raw forwarder stream Recv failed",
+				"node", t.NodeID, "err", err.Error())
+			http.Error(w, "raw forwarder stream failed", http.StatusBadGateway)
+			return
+		}
+		if init := frame.GetInit(); init != nil && !wroteHeader {
+			for _, h := range init.GetHeaders() {
+				w.Header().Add(h.GetName(), h.GetValue())
+			}
+			w.WriteHeader(int(init.GetStatus()))
+			wroteHeader = true
+			// Mirror fwdStreamOnceWithEvents: emit
+			// wake.proxy_first_byte on the first downstream
+			// byte. nil events opts out (legacy callers and
+			// the test corpus).
+			if evs := events; evs != nil {
+				started := proxyStartFromContext(r.Context())
+				evs.Emit(r.Context(), evts.ProxyFirstByte{
+					EmitAt:     time.Now().UTC(),
+					WakeID:     t.WakeID,
+					AppID:      r.Header.Get("x-faas-app"),
+					RequestID:  r.Header.Get("x-faas-request-id"),
+					InstanceID: t.InstanceID,
+					NodeID:     t.NodeID,
+					LatencyMs:  time.Since(started).Milliseconds(),
+				})
+			}
+			// If the init carries an error string (the bridge
+			// failed to dial the guest and wrote a synthetic
+			// 502 with the dial error in the body), surface
+			// that as the response body so a customer reading
+			// `init.error != ''` sees the cause. The status
+			// was already written above; the body is the
+			// last write before the receiver loop exits.
+			if init.Error != "" {
+				_, _ = w.Write([]byte(init.Error))
+				_, _ = io.WriteString(w, "\n")
+				flushSafe(w)
+			}
+			continue
+		}
+		if chunk := frame.GetBodyChunk(); len(chunk) > 0 {
+			if _, werr := w.Write(chunk); werr != nil {
+				// Client disconnect mid-stream. The
+				// receiver stops reading frames. The
+				// body-copy goroutine is cancelled via
+				// the ctxReader (F3 fix) so it exits
+				// within the stream-teardown window;
+				// drain bodyErrCh so the handler
+				// doesn't return while the goroutine
+				// is still unwinding.
+				log.Debug("gateway: raw forwarder stream client write failed",
+					"node", t.NodeID, "err", werr.Error())
+				<-bodyErrCh
+				return
+			}
+			// Flush per Write so the H2C transport emits
+			// a DATA frame on every body_chunk. The
+			// statusRecorder's maybeFlush only fires at
+			// the 32 KiB threshold or the periodic timer;
+			// a WS frame of 256 bytes would otherwise
+			// buffer in the gateway until one of those
+			// triggers fired.
+			flushSafe(w)
+		}
+	}
+
+	// Wait for the body goroutine to drain so we can
+	// distinguish a clean bidi close from a client-disconnect
+	// (which surfaces as a Send error).
+	<-bodyErrCh
+}
+
+// flushSafe is a recover-guarded wrapper around http.Flusher.Flush
+// (via http.NewResponseController) for the raw-bytes Upgrade path.
+// The inbound transport is H2C in production (a real Flusher), but
+// the test corpus uses httptest.NewRecorder which is NOT a Flusher.
+// http.NewResponseController(w).Flush() panics on a non-Flusher
+// transport; recover() turns the panic into a no-op so the test
+// corpus keeps working without per-test transport plumbing. The
+// recover is per-call so a panic in production code surfaces
+// correctly on the next Flush.
+func flushSafe(w http.ResponseWriter) {
+	defer func() {
+		_ = recover() // non-Flusher transport: degrade to buffered Write
+	}()
+	_ = http.NewResponseController(w).Flush()
+}
+
+// ForwardingRawReverseProxy returns an http.Handler factory that
+// drives the raw-bytes bridge (issue #676 / ADR-080). Where
+// ForwardingReverseProxy routes plain HTTP through
+// fwdOnceWithEvents → fwdStreamOnceWithEvents → ForwardHTTPStream,
+// this factory routes Upgrade traffic through rawStreamOnceWithEvents
+// → ForwardRawStream. The handler.ServeHTTP call site decides which
+// factory's output to invoke (per the isUpgradeRequest detector);
+// the factories share the same NodeClientLookup so the underlying
+// gRPC channel is reused regardless of which RPC is in flight.
+func ForwardingRawReverseProxy(nodes NodeClientLookup, log *slog.Logger) func(t Target) http.Handler {
+	return ForwardingRawReverseProxyWithEvents(nodes, log, nil)
+}
+
+// ForwardingRawReverseProxyWithEvents is the events-aware variant
+// of ForwardingRawReverseProxy (issue #676 / ADR-080). nil events
+// opts out (pre-PR-C fixtures and the unit-test corpus).
+func ForwardingRawReverseProxyWithEvents(nodes NodeClientLookup, log *slog.Logger, events *evts.Platform) func(t Target) http.Handler {
+	if log == nil {
+		log = slog.Default()
+	}
+	return func(t Target) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := contextWithProxyStart(r.Context(), time.Now())
+			cli, closer, ok := nodes.ClientFor(r.Context(), t.NodeID)
+			if !ok {
+				http.Error(w, "node unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			defer func() { _ = closer.Close() }()
+			rawStreamOnceWithEvents(w, r.WithContext(ctx), cli, log, t, events)
+		})
+	}
 }
 
 // ctxReader is a context-aware io.Reader wrapper used by

@@ -174,6 +174,17 @@ func (n *nodeCache) Forwarding() func(gateway.Target) http.Handler {
 	return gateway.ForwardingReverseProxyWithEvents(n.cache, n.log, n.events)
 }
 
+// RawForwarding (issue #676 / ADR-080) is the raw-bytes Upgrade
+// bridge counterpart of Forwarding. Both factories share the same
+// underlying NodeClientCache so the per-node gRPC channel is
+// reused regardless of which RPC is in flight (only the RPC
+// method differs: ForwardHTTPStream vs ForwardRawStream). The
+// handler's three-input gate routes Connection: Upgrade requests
+// here BEFORE falling through to Forwarding.
+func (n *nodeCache) RawForwarding() func(gateway.Target) http.Handler {
+	return gateway.ForwardingRawReverseProxyWithEvents(n.cache, n.log, n.events)
+}
+
 // Close shuts down every cached *grpc.ClientConn. Called once at
 // shutdown; subsequent ClientFor calls return ok=false so any
 // in-flight listener draining sees "node unavailable" → 503.

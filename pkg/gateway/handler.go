@@ -34,6 +34,17 @@ type App struct {
 	// Default-false in fakeBackend unit tests (the in-memory
 	// backend doesn't populate the column).
 	StreamingEnabled bool
+	// WebSocketEnabled is the per-app raw-bytes Upgrade bridge flag
+	// (issue #676 / ADR-080). Plumbed through pgRouter.toApp from
+	// apps.websocket_enabled so ServeHTTP can route inbound
+	// Connection: Upgrade + Upgrade: <token> requests to the
+	// rawStreamReverseProxy without re-reading the database. apid
+	// applies Plan.WebSocketEnabled() at CreateApp time and gates
+	// PATCH writes through Plan.WebSocketResponseAllowed() (Free
+	// returns false → 403 plan_websocket_not_allowed). Default-false
+	// in fakeBackend unit tests; tests that want to exercise the
+	// raw path set this to true alongside an app.Plan != PlanFree.
+	WebSocketEnabled bool
 	// NodeID is the durable shard key the owning schedd
 	// resolves at startup (Phase 2 / Gate A). Populated by
 	// pgRouter.toApp / the AppResolver closure from apps.node_id;
@@ -322,6 +333,22 @@ type Handler struct {
 	// func(Target) http.Handler — the wire defaulting at vmmd
 	// keeps pre-PR-C targets (Port=0) reaching 8080.
 	proxyByNode func(t Target) http.Handler
+	// rawByNode (issue #676 / ADR-080) is the Upgrade-traffic
+	// counterpart of proxyByNode. When non-nil, the handler
+	// dispatches inbound Connection: Upgrade + Upgrade: <token>
+	// requests through it instead of proxyByNode — the raw
+	// forwarder opens ForwardRawStream and pumps bytes verbatim
+	// into the guest's netns TCP socket. nil = the raw path is
+	// disabled (default for tests and the e2e harness without a
+	// vmmd overlay; production wires ForwardingRawReverseProxy in
+	// cmd/gatewayd/main.go alongside proxyByNode).
+	//
+	// Detection happens BEFORE proxyByNode is invoked: see the
+	// isUpgradeRequest branch at the proxyByNode call site in
+	// ServeHTTP. The App.WebSocketEnabled flag is the per-app
+	// gate (Free defaults off; Hobby/Pro/Scale default on via
+	// Plan.WebSocketEnabled / WebSocketResponseAllowed).
+	rawByNode func(t Target) http.Handler
 	// topNSample is the per-request bump for the gateway-side
 	// top-N sampler (cmd/gatewayd/topn.go, issue #300). Set via
 	// SetTopNSample from cmd/gatewayd/main.go. nil in unit
@@ -489,6 +516,21 @@ func (h *Handler) WithAccountLimiter(l *Limiter) *Handler {
 // addr-based proxy path (used by tests and the e2e harness).
 func (h *Handler) WithForwarding(fn func(t Target) http.Handler) *Handler {
 	h.proxyByNode = fn
+	return h
+}
+
+// WithRawForwarding installs the per-node raw-bytes Upgrade
+// forwarder (issue #676 / ADR-080) built by
+// pkg/gateway/forwardproxy.go's ForwardingRawReverseProxy. When
+// set, every inbound Connection: Upgrade + Upgrade: <token>
+// request whose App.WebSocketEnabled is true dispatches through
+// fn(nodeID). Reuses the same NodeClientLookup that
+// WithForwarding installs (the raw RPC runs on the same per-node
+// gRPC channel as the plain-HTTP RPC). nil = the raw path is
+// disabled (default for tests without the vmmd overlay; production
+// wires this in cmd/gatewayd/main.go alongside WithForwarding).
+func (h *Handler) WithRawForwarding(fn func(t Target) http.Handler) *Handler {
+	h.rawByNode = fn
 	return h
 }
 
@@ -1574,6 +1616,47 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	wakeStart := time.Now()
+	// Issue #676 / ADR-080: detect inbound Connection: Upgrade +
+	// Upgrade: <token> requests BEFORE the plain-HTTP forwarder
+	// strips the hop-by-hop headers. The raw-bytes bridge carries
+	// the verbatim bytes (including the upgrade headers) into the
+	// guest's netns TCP socket via the ForwardRawStream RPC, so
+	// the WS / h2c / MQTT-over-WS handshake survives. The
+	// detector is shared between this dispatch point and the
+	// public→internal hop (pkg/gateway/internal_proxy.go) so the
+	// hop-by-hop strip is bypassed on both sides.
+	//
+	// Gate order: isUpgradeRequest first (cheapest), then the
+	// per-app flag (cheap map lookup), then the rawByNode
+	// installation (the production cmd/gatewayd/main.go wires
+	// it; tests that don't exercise the raw path leave it nil).
+	// An upgrade request on an app with WebSocketEnabled=false
+	// falls through to proxyByNode which silently drops the
+	// Upgrade headers and returns 502 — better than 501 because
+	// the customer sees the same failure shape as a normal HTTP
+	// routing miss.
+	if isUpgradeRequest(r) && app.WebSocketEnabled && h.rawByNode != nil {
+		// ADR-064 wake-timeline vocab: stamp the upgrade flag so
+		// downstream observability (slog fields, dashboards)
+		// can distinguish raw-bytes sessions from plain HTTP
+		// without re-deriving from Connection/Upgrade.
+		r.Header.Set("x-faas-upgrade", "true")
+		h.rawByNode(target).ServeHTTP(w, r)
+		// Per-request accounting still fires for the raw path
+		// (issue #676 / ADR-080): the upgrade request is one
+		// HTTP request for metrics purposes — the per-request
+		// ObserveRequest histogram, top-N sampler, and lastSeen
+		// touch all flow through observe(). What we SKIP is
+		// the streamingFallbackLog (the raw path has no
+		// buffered fallback concept; a WS handshake that
+		// succeeded is exactly the success case the customer
+		// wants). The raw forwarder emits its own
+		// gateway_ws_session_duration_seconds / bytes counters
+		// via evts.Platform so the session-level accounting
+		// doesn't double-count.
+		h.observe(r, rec.status, app.ID, string(app.Plan), cold, target)
+		return
+	}
 	if h.proxyByNode != nil {
 		// Issue #98 / ADR-028: Target.NodeID is the compute_node.id;
 		// the forwarder dials the per-node vmmd over the overlay and

@@ -2594,6 +2594,14 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.SetStreamingEnabled {
 		a.StreamingEnabled = boolOrFalse(p.StreamingEnabled)
 	}
+	// Issue #676 / ADR-080: per-app raw-bytes Upgrade bridge. Same
+	// Set-bit convention as streaming_enabled above — the Set bit
+	// distinguishes "don't touch" from "explicit false" (opt out
+	// of Upgrade traffic). Apid already gated the plan; the store
+	// is a plain column write.
+	if p.SetWebSocketEnabled {
+		a.WebSocketEnabled = boolOrFalse(p.WebSocketEnabled)
+	}
 	// Issue #462 / ADR-058 / PR-A: per-app scaling policy. The
 	// Set bit is the canonical "unset vs explicit zero" signal;
 	// when Set is true the jsonb column is overwritten (deep-copied
