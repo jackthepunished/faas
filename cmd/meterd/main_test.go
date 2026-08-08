@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -22,6 +23,9 @@ import (
 	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
+	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
+	"github.com/onebox-faas/faas/pkg/billing/paddle"
+	"github.com/onebox-faas/faas/pkg/billing/stripe"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/meter"
@@ -872,4 +876,86 @@ func TestRun_MetricsAddr_StripePushLabels(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("loop did not return within 3s of cancel")
 	}
+}
+
+// captureWarnLogger returns a slog.Logger writing JSON records into the
+// returned buffer at WARN level (so Info records don't pollute the
+// capture) plus a pointer to the buffer. Tests parse the buffer line-by-
+// line to assert on which messages fired.
+func captureWarnLogger() (*slog.Logger, *bytes.Buffer) {
+	buf := &bytes.Buffer{}
+	h := slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})
+	return slog.New(h), buf
+}
+
+// TestWarnIfEmptyAPIKey_TOMLOnlyNoFalsePositive pins Finding 2 of the
+// PR-P3 /code-review medium report. Before the fix, meterd's empty-key
+// warn read deps.getenv directly, so a TOML-only Stripe or Paddle deploy
+// emitted a misleading "API key is empty" warning on every boot even
+// though the SDK was correctly initialized via the TOML fallback. After
+// the fix, warnIfEmptyAPIKey reads the merged cfg, so the TOML value
+// suppresses the warn.
+func TestWarnIfEmptyAPIKey_TOMLOnlyNoFalsePositive(t *testing.T) {
+	t.Run("stripe TOML key suppresses warn", func(t *testing.T) {
+		log, buf := captureWarnLogger()
+		cfg := &billingloader.RootBillingConfig{
+			Stripe: &stripe.Config{APIKey: "sk_test_toml_value"},
+			Paddle: &paddle.Config{},
+		}
+		warnIfEmptyAPIKey(log, cfg, "stripe")
+		if buf.Len() != 0 {
+			t.Errorf("expected no warn for TOML-only Stripe; got: %s", buf.String())
+		}
+	})
+	t.Run("paddle TOML key suppresses warn", func(t *testing.T) {
+		log, buf := captureWarnLogger()
+		cfg := &billingloader.RootBillingConfig{
+			Stripe: &stripe.Config{},
+			Paddle: &paddle.Config{APIKey: "pdl_test_toml_value"},
+		}
+		warnIfEmptyAPIKey(log, cfg, "paddle")
+		if buf.Len() != 0 {
+			t.Errorf("expected no warn for TOML-only Paddle; got: %s", buf.String())
+		}
+	})
+	t.Run("stripe no key fires warn", func(t *testing.T) {
+		log, buf := captureWarnLogger()
+		cfg := &billingloader.RootBillingConfig{
+			Stripe: &stripe.Config{APIKey: ""},
+			Paddle: &paddle.Config{},
+		}
+		warnIfEmptyAPIKey(log, cfg, "stripe")
+		if !strings.Contains(buf.String(), "Stripe API key is empty") {
+			t.Errorf("expected Stripe empty-key warn; got: %s", buf.String())
+		}
+	})
+	t.Run("paddle no key fires warn", func(t *testing.T) {
+		log, buf := captureWarnLogger()
+		cfg := &billingloader.RootBillingConfig{
+			Stripe: &stripe.Config{},
+			Paddle: &paddle.Config{APIKey: ""},
+		}
+		warnIfEmptyAPIKey(log, cfg, "paddle")
+		if !strings.Contains(buf.String(), "Paddle API key is empty") {
+			t.Errorf("expected Paddle empty-key warn; got: %s", buf.String())
+		}
+	})
+	t.Run("nil cfg is silent", func(t *testing.T) {
+		log, buf := captureWarnLogger()
+		warnIfEmptyAPIKey(log, nil, "stripe")
+		if buf.Len() != 0 {
+			t.Errorf("expected no warn for nil cfg; got: %s", buf.String())
+		}
+	})
+	t.Run("unknown provider is silent", func(t *testing.T) {
+		log, buf := captureWarnLogger()
+		cfg := &billingloader.RootBillingConfig{
+			Stripe: &stripe.Config{APIKey: ""},
+			Paddle: &paddle.Config{APIKey: ""},
+		}
+		warnIfEmptyAPIKey(log, cfg, "lemonsqueezy")
+		if buf.Len() != 0 {
+			t.Errorf("expected no warn for unknown provider; got: %s", buf.String())
+		}
+	})
 }

@@ -74,6 +74,16 @@ type Provider struct {
 	// construction); not a uniqueness constraint, the
 	// (account_id, window_start) PK is.
 	instanceID string
+	// lastSyncAt is stamped at the end of every successful
+	// EnsurePlanProducts call. Surfaced via the OpProvider
+	// interface (PR-P3) so operators can tell from `faas billing
+	// status` whether the catalog hydration ran and when. Zero
+	// (un-initialized) when no hydration has yet succeeded —
+	// ListCatalog surfaces this so the CLI can render "never".
+	// catalog.mu guards the write (called under the same lock as
+	// the catalog map updates in ensureProducts); reads hold the
+	// RLock via the snapshot helpers.
+	lastSyncAt time.Time
 }
 
 // paddleOverageLease is the lease window for a ClaimPaddleOverageWindow
@@ -255,6 +265,14 @@ func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
 	if err := p.ensurePlansAndPrices(ctx); err != nil {
 		return fmt.Errorf("paddle: ensure plans: %w", err)
 	}
+	// PR-P3: stamp lastSyncAt under the same catalog mutex the
+	// snapshot helpers read through. The snapshot read paths
+	// (ListCatalog) hold the RLock; this write acquires the full
+	// lock to stay consistent with the catalog map updates inside
+	// ensureProducts.
+	p.catalog.mu.Lock()
+	p.lastSyncAt = p.now()
+	p.catalog.mu.Unlock()
 	p.log.Info("paddle: EnsurePlanProducts complete", "monthly", p.snapshotPlans(), "overage", p.snapshotOverage())
 	return nil
 }

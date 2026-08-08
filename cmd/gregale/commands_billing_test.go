@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/browser"
@@ -195,6 +196,13 @@ func TestCmdBilling_Dispatch(t *testing.T) {
 		if !strings.Contains(stdout.String(), "portal") {
 			t.Errorf("help output missing 'portal' subcommand; got: %q", stdout.String())
 		}
+		// PR-P3 subcommands also appear in the help text so an
+		// operator running `faas billing help` discovers them.
+		for _, sub := range []string{"status", "price-catalog", "reconcile"} {
+			if !strings.Contains(stdout.String(), sub) {
+				t.Errorf("help output missing %q subcommand; got: %q", sub, stdout.String())
+			}
+		}
 	})
 	t.Run("unknown subcommand exits 1", func(t *testing.T) {
 		stderr, restore := captureStderr(t)
@@ -206,6 +214,99 @@ func TestCmdBilling_Dispatch(t *testing.T) {
 			t.Errorf("stderr missing 'unknown subcommand'; got: %q", stderr.String())
 		}
 	})
+}
+
+// billingCatalogStub is the minimal apid stub for the PR-P3 catalog
+// endpoints. It answers GET /v1/admin/billing-paddle-catalog with the
+// configure() result. Tests that need to exercise sync / reset mount
+// the same handler under their respective paths; the catalog GET
+// covers the read-side assertions.
+func billingCatalogStub(t *testing.T, configure func() api.BillingCatalogResponse) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/admin/billing-paddle-catalog", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(configure())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func TestCmdBillingStatus_RendersCatalog(t *testing.T) {
+	apiURL := billingCatalogStub(t, func() api.BillingCatalogResponse {
+		return api.BillingCatalogResponse{
+			Provider: "paddle",
+			SyncedAt: "2026-08-08T12:00:00Z",
+			Entries: []api.BillingCatalogEntry{
+				{Plan: "hobby", Kind: api.BillingCatalogKindMonthly, Handle: "pri_h_monthly", SyncedAt: parseTime(t, "2026-08-08T12:00:00Z")},
+				{Plan: "hobby", Kind: api.BillingCatalogKindOverage, Handle: "pri_h_overage", SyncedAt: parseTime(t, "2026-08-08T12:00:00Z")},
+				{Plan: "pro", Kind: api.BillingCatalogKindMonthly, Handle: "pri_p_monthly", SyncedAt: parseTime(t, "2026-08-08T12:00:00Z")},
+			},
+		}
+	})
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restore := captureStdout(t)
+	defer restore()
+	if code := cmdBillingStatus(nil); code != 0 {
+		t.Fatalf("cmdBillingStatus = %d, want 0", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{"Provider:", "paddle", "pri_h_monthly", "pri_p_monthly"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status output missing %q; got: %q", want, out)
+		}
+	}
+}
+
+func TestCmdBillingStatus_EmptyCatalogHints(t *testing.T) {
+	apiURL := billingCatalogStub(t, func() api.BillingCatalogResponse {
+		return api.BillingCatalogResponse{Provider: "paddle", SyncedAt: ""}
+	})
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restore := captureStdout(t)
+	defer restore()
+	if code := cmdBillingStatus(nil); code != 0 {
+		t.Fatalf("cmdBillingStatus = %d, want 0", code)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "never synced") {
+		t.Errorf("status output missing 'never synced'; got: %q", out)
+	}
+	if !strings.Contains(out, "faas billing price-catalog sync") {
+		t.Errorf("status output missing actionable hint; got: %q", out)
+	}
+}
+
+func TestCmdBillingStatus_RejectsArgs(t *testing.T) {
+	t.Setenv("FAAS_API", "http://localhost")
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+	stderr, restore := captureStderr(t)
+	defer restore()
+	if code := cmdBillingStatus([]string{"junk"}); code != 1 {
+		t.Errorf("cmdBillingStatus with extra args = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "unexpected args") {
+		t.Errorf("stderr missing 'unexpected args'; got: %q", stderr.String())
+	}
+}
+
+// parseTime is a tiny RFC 3339 helper used by the catalog stub.
+func parseTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	tt, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("parseTime(%q): %v", s, err)
+	}
+	return tt
 }
 
 // captureStdout / captureStderr are declared in cli_login_test.go

@@ -1,9 +1,14 @@
 // commands_billing.go — `faas billing …` family (issue #253).
 //
-//   faas billing             dispatch help (prints subcommand list)
-//   faas billing portal      open the Stripe billing portal in your browser
-//                            (or print the URL when --print is set / DISPLAY is
-//                            unavailable)
+//   faas billing                 dispatch help (prints subcommand list)
+//   faas billing portal          open the Stripe billing portal in your browser
+//                                (or print the URL when --print is set / DISPLAY
+//                                is unavailable)
+//   faas billing status          read the active billing Provider's cached
+//                                catalog (PR-P3)
+//   faas billing price-catalog   list | sync | reset the Paddle catalog (PR-P3)
+//   faas billing reconcile       run a single-account reconcile via the active
+//                                billing Provider (PR-P3)
 //
 // This is the CLI companion to GET /dashboard/billing's "Open Stripe
 // billing portal" button. Same URL, same auth chain (Bearer via
@@ -43,6 +48,12 @@ func cmdBilling(args []string) int {
 	switch args[0] {
 	case billingSubPortal:
 		return cmdBillingPortal(args[1:])
+	case billingSubStatus:
+		return cmdBillingStatus(args[1:])
+	case billingSubPriceCatalog:
+		return cmdBillingPriceCatalog(args[1:])
+	case billingSubReconcile:
+		return cmdBillingReconcile(args[1:])
 	case billingSubHelp, flagHelpShort, flagHelpLong:
 		printBillingUsage(osStdout)
 		return 0
@@ -55,8 +66,11 @@ func cmdBilling(args []string) int {
 
 func printBillingUsage(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "usage: faas billing <subcommand>\n\n"+
-		"  portal      open the Stripe billing portal in your browser\n"+
-		"              (--print  print URL to stdout only; --no-open  skip browser)\n"+
+		"  portal              open the Stripe billing portal in your browser\n"+
+		"                      (--print  print URL to stdout only; --no-open  skip browser)\n"+
+		"  status              read the active billing Provider's cached catalog (Paddle-only)\n"+
+		"  price-catalog       list | sync | reset the Paddle price + product catalog\n"+
+		"  reconcile <id>      run a single-account reconcile via the active billing Provider\n"+
 		"\n"+
 		"Run 'faas billing help' for this message.\n")
 }

@@ -934,6 +934,22 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/accounts/{id}/credits",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.issueCredit))))
 
+	// PR-P3: operator-facing billing surface. Same two-layer gate as
+	// issueCredit above (scope + email allowlist inside the handler).
+	// The Paddle catalog handlers type-assert to paddle.OpProvider; on
+	// Stripe the assertion fails and the handler renders a uniform 501.
+	// The reconcile endpoint works against any provider that
+	// implements billing.Provider.ReconcileUsage (Stripe today; Paddle
+	// returns ErrNotImplemented and maps to 501 via the handler).
+	mux.HandleFunc("GET /v1/admin/billing-paddle-catalog",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.listPaddleCatalog)))
+	mux.HandleFunc("POST /v1/admin/billing-paddle-catalog/sync",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.syncPaddleCatalog))))
+	mux.HandleFunc("DELETE /v1/admin/billing-paddle-catalog",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.resetPaddleCatalog)))
+	mux.HandleFunc("POST /v1/admin/billing-reconcile/{id}",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.reconcileAccount)))
+
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
 	// cookie (implicitly admin) or any API key carrying {admin,

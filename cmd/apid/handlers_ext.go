@@ -2075,7 +2075,40 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		// stays as a defensive fallback for any provider wired before
 		// the capability introspection was introduced.
 		if s.billingProvider != nil && s.billingProvider.Capabilities().Has(billing.CapHostedCheckout) {
-			txID, checkoutURL, err := s.billingProvider.CreateUpgradeTransaction(r.Context(), acct, plan)
+			// PR-P3: Paddle's CreateUpgradeTransaction requires an
+			// existing Paddle customer (ctm_…) to attach the
+			// subscription to. Stripe's path does not need this
+			// sidecar (cus_… is created lazily on the first
+			// Stripe-side subscription POST), so the guard is
+			// capability-scoped — only providers that opt into
+			// CapHostedCheckout pay the extra round-trip.
+			//
+			// Idempotent: if acct.ProviderCustomerID is already set
+			// the call is a no-op. A second changePlan request from
+			// the same browser session reuses the existing ID and
+			// does not POST a duplicate customer to Paddle.
+			upgradeAcct := acct
+			if upgradeAcct.ProviderCustomerID == "" {
+				custID, cerr := s.billingProvider.CreateCustomer(r.Context(), acct)
+				if cerr != nil {
+					s.log.Error("create_customer",
+						"account", acct.ID,
+						"target_plan", logsanitize.Field(string(plan)),
+						"err", cerr)
+					api.WriteProblem(w, api.ErrCapacity("upgrade unavailable"))
+					return
+				}
+				if err := s.store.UpdateAccountPaddleCustomerID(r.Context(), acct.ID, custID); err != nil {
+					s.log.Error("stamp_customer_id",
+						"account", acct.ID,
+						"customer_id", custID,
+						"err", err)
+					api.WriteProblem(w, api.ErrCapacity("upgrade unavailable"))
+					return
+				}
+				upgradeAcct.ProviderCustomerID = custID
+			}
+			txID, checkoutURL, err := s.billingProvider.CreateUpgradeTransaction(r.Context(), upgradeAcct, plan)
 			if err != nil {
 				s.log.Error("create_upgrade_tx",
 					"account", acct.ID,
@@ -2449,6 +2482,32 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 				To: []string{acct.Email}, Subject: subject, TextBody: body,
 			}); err != nil {
 				s.log.Warn("apid: payment_failed mail",
+					"account", acct.ID, "err", err)
+			}
+		}
+	case billing.EventSubscriptionPastDue:
+		// PR-P3: Paddle's `subscription.past_due` event lands here.
+		// Stripe's path uses EventPaymentFailed (the
+		// invoice.payment_failed webhook) for the same logical
+		// transition; Paddle separates "payment failed" (the per-
+		// charge transaction.failed) from "subscription is now in
+		// past_due state" (the subscription-level ping). Both
+		// flip active → past_due via the same CAS, so a Paddle
+		// subscription.past_due arriving AFTER a Stripe
+		// invoice.payment_failed on the same account collapses
+		// safely (the second MarkDunningStep returns ErrNotFound
+		// because status is already past_due).
+		//
+		// No email here: the past_due transition email is fired
+		// exactly once on the first delivery (EventPaymentFailed
+		// or this branch, whichever lands first). Emitting twice
+		// would double-mail customers.
+		if err := s.store.MarkDunningStep(ctx, acct.ID, state.AccountActive, state.AccountPastDue); err != nil {
+			if errors.Is(err, state.ErrNotFound) {
+				s.log.Debug("apid: subscription_past_due on already-advanced account",
+					"account", acct.ID, "from_status", acct.Status)
+			} else {
+				s.log.Warn("apid: subscription_past_due MarkDunningStep",
 					"account", acct.ID, "err", err)
 			}
 		}
