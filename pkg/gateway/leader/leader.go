@@ -68,10 +68,20 @@ type Leader struct {
 // `compute_nodes`. Mirrors `pkg/state.ComputeNode` without taking
 // a hard dependency on it (the test fixture builds a slice
 // directly).
+//
+// PublicIP is the operator-managed egress address used by the
+// Tier A9 / ADR-084 standby write-redirect layer
+// (cmd/gatewayd-internal/proxy.go) to build the cross-box leader
+// URL. Empty when the operator hasn't populated it (single-box
+// dev mode); PR-B's LeaderResolver treats empty as the no-op /
+// fall-through case. The election algorithm itself ignores
+// PublicIP — it's metadata that callers may read after
+// `ElectLeader`/`ElectLeaderFromNodes` returns.
 type ComputeNode struct {
-	Name   string
-	NodeID string
-	Active bool
+	Name     string
+	NodeID   string
+	Active   bool
+	PublicIP string
 }
 
 // LeaderStore is the surface `ElectLeader` reads from. The

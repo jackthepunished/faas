@@ -1715,3 +1715,40 @@ func TestPlanWebSocketEnabled_UnknownFailsClosed(t *testing.T) {
 		t.Errorf("Plan(nonexistent).WebSocketResponseAllowed() = true, want false (fail-closed)")
 	}
 }
+
+// TestHAConstantsStable pins the high-availability timing /
+// retry constants introduced by Tier A8 (ADR-083) and Tier A9
+// (ADR-084). These are NOT plan-level limits (no per-plan
+// derivation); they are the cluster-wide operating parameters
+// the writeGate and standby warmup use. Review finding #8 of
+// PR #761: rename any of these and the test fails before the
+// call-site drift in cmd/gatewayd-internal/proxy.go reaches
+// runtime.
+//
+// The expected values are the design decisions captured in the
+// ADRs / noble-swimming-balloon.md plan. A change requires the
+// matching ADR update in the same PR.
+func TestHAConstantsStable(t *testing.T) {
+	cases := []struct {
+		name string
+		got  any
+		want any
+	}{
+		// Tier A8 (ADR-083) — active-passive HA topology.
+		{"HAFailoverProbeTimeoutMS", HAFailoverProbeTimeoutMS, 500},
+		{"HADNSRecordStaleSeconds", HADNSRecordStaleSeconds, 30},
+		{"HAStandbyWarmupIntervalMS", HAStandbyWarmupIntervalMS, 500},
+
+		// Tier A9 (ADR-084) — standby write-redirect.
+		{"StandbyWriteRedirectTimeoutMS", StandbyWriteRedirectTimeoutMS, 5000},
+		{"StandbyWriteRetryAfterSeconds", StandbyWriteRetryAfterSeconds, 5},
+		{"StandbyWriteLeaderURLCacheTTLSeconds", StandbyWriteLeaderURLCacheTTLSeconds, 5},
+		{"StandbyWriteNoLeaderRetryAfterSeconds", StandbyWriteNoLeaderRetryAfterSeconds, 60},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v (ADR-083/084 design value)",
+				c.name, c.got, c.want)
+		}
+	}
+}

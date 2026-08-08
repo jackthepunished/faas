@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
+	"github.com/onebox-faas/faas/pkg/gateway/writegate"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -101,6 +102,23 @@ type OpsMetrics struct {
 	// (operator-managed FAAS_STANDBY_WARMUP_SLUGS_PATH); see
 	// the warmupErrors constructor block below.
 	warmupErrors *prometheus.CounterVec
+	// writeRedirectTotal (Tier A9 / ADR-084) counts every write
+	// request the cmd/gatewayd-internal writeGate classifies
+	// (relayed, redirected, blocked, or short-circuited). Labelled
+	// by outcome ∈ {relayed, redirect_307, same_box,
+	// cookie_blocked, leader_unreachable, loop_prevented,
+	// mTLS_failure, error} AND auth_kind ∈ {bearer, cookie,
+	// anonymous}. The closed label sets keep the TSDB cardinality
+	// bounded — the writeGate classifies at request entry, never
+	// per-request-derived. See pkg/gateway/writegate for the
+	// classification rules.
+	writeRedirectTotal *prometheus.CounterVec
+	// writeRedirectLatency (Tier A9 / ADR-084) is the histogram
+	// of cross-box relay durations observed by writeGate. Only
+	// cross-box hops emit a sample (local same-box and 307
+	// fallback paths don't); the histogram's nil branch means a
+	// pure-local daemon never bumps a series.
+	writeRedirectLatency prometheus.Histogram
 	// livenessRestarts (issue #554 / ADR-078) is the per-(app,
 	// deployment) counter the Engine.DestroyForLivenessFailure path
 	// increments on every liveness-driven destroy. The dashboard
@@ -1006,6 +1024,42 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// warmSnapshotErrors above and the (other, other) overflow rows
 	// elsewhere in this constructor.
 	warmupErrors.WithLabelValues("")
+	// writeRedirectTotal (Tier A9 / ADR-084). The two label sets
+	// are closed (no per-request-derived values); pre-instantiation
+	// at every (outcome, auth_kind) pair keeps the /metrics body
+	// honest from boot (the §12 panel queries a non-zero baseline
+	// from t=0; a counter that only appears after the first
+	// incident confuses the alert rule). The PromQL
+	// `rate(gatewayd_internal_write_redirect_total{outcome="relayed"}[5m])`
+	// is the cross-box hop health signal;
+	// `{outcome="loop_prevented"}` is the redirect-storm DoS
+	// alarm; `{outcome="leader_unreachable"}` alerts via the
+	// existing §12 failover panel (per ADR-083 §Open follow-up
+	// #2, this is the canary that closes ADR-083).
+	writeRedirectTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_write_redirect_total",
+		Help: "Count of write requests the cmd/gatewayd-internal writeGate classified (Tier A9 / ADR-084). outcome ∈ {relayed, redirect_307, same_box, cookie_blocked, leader_unreachable, loop_prevented, mTLS_failure, error}; auth_kind ∈ {bearer, cookie, anonymous}. The closed label sets keep TSDB cardinality bounded — see pkg/gateway/writegate for the classification rules.",
+	}, []string{"outcome", "auth_kind"})
+	writeRedirectOutcomes := writegate.AllWriteOutcomes
+	writeRedirectAuthKinds := writegate.AllAuthKinds
+	for _, outcome := range writeRedirectOutcomes {
+		for _, kind := range writeRedirectAuthKinds {
+			writeRedirectTotal.WithLabelValues(string(outcome), string(kind))
+		}
+	}
+	// writeRedirectLatency (Tier A9 / ADR-084). Buckets sized for
+	// the cross-box mTLS hop (overlay round-trip + leader apid
+	// handler). The top bucket is generous — a degraded overlay
+	// can stretch a hop to seconds before the
+	// StandbyWriteRedirectTimeoutMS=5000 fires and the writeGate
+	// degrades to 307.
+	writeRedirectLatency := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: prefix + "_write_redirect_latency_seconds",
+		Help: "Cross-box apid relay duration (Tier A9 / ADR-084). Only cross-box hops emit a sample; same-box and 307-fallback paths do not. The histogram's nil branch means a pure-local daemon never bumps a series.",
+		Buckets: []float64{
+			0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+		},
+	})
 	// Issue #554 / ADR-078: liveness restarts counter. Labelled by
 	// (app, deployment) — the bounded per-deployment set keeps the
 	// TSDB cardinality safe (Scale: ≤ 20 deployment per app; Hobby:
@@ -1658,7 +1712,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -2181,6 +2236,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		watchdogKills:                      watchdogKills,
 		warmSnapshotErrors:                 warmSnapshotErrors,
 		warmupErrors:                       warmupErrors,
+		writeRedirectTotal:                 writeRedirectTotal,
+		writeRedirectLatency:               writeRedirectLatency,
 		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
@@ -2333,6 +2390,43 @@ func (m *OpsMetrics) WarmupErrors(slug string) prometheus.Counter {
 		return nil
 	}
 	return m.warmupErrors.WithLabelValues(slug)
+}
+
+// WriteRedirectTotal returns the (outcome, auth_kind)-labeled
+// counter the cmd/gatewayd-internal writeGate bumps per
+// classification (Tier A9 / ADR-084). The closed label sets
+// `outcome ∈ {relayed, redirect_307, same_box, cookie_blocked,
+// leader_unreachable, loop_prevented, mTLS_failure, error}` and
+// `auth_kind ∈ {bearer, cookie, anonymous}` are pre-instantiated
+// at every (outcome, kind) pair in the constructor block above;
+// callers should not introduce new label values (writeGate
+// classifies at request entry, never per-request-derived). The
+// Prometheus query
+// `rate(gatewayd_internal_write_redirect_total{outcome="relayed"}[5m])`
+// is the cross-box hop health signal; `{outcome="loop_prevented"}`
+// is the redirect-storm DoS alarm. nil-safe — returns nil if m
+// is nil.
+func (m *OpsMetrics) WriteRedirectTotal(outcome, authKind string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.writeRedirectTotal.WithLabelValues(outcome, authKind)
+}
+
+// WriteRedirectLatency returns the histogram observer the
+// cmd/gatewayd-internal writeGate uses to record cross-box mTLS
+// hop durations (Tier A9 / ADR-084). Only cross-box hops emit a
+// sample; same-box fall-through and 307-fallback paths do not.
+// Buckets are sized for the overlay round-trip + leader apid
+// handler (5 ms to 5 s — the top bucket matches
+// pkg/api/limits.go::StandbyWriteRedirectTimeoutMS). nil-safe —
+// returns nil if m is nil; callers should use Observe with
+// nil-safe wrappers if they need to.
+func (m *OpsMetrics) WriteRedirectLatency() prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.writeRedirectLatency
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram
