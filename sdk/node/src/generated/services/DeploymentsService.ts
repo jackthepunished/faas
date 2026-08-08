@@ -239,7 +239,7 @@ export class DeploymentsService {
    * `traffic_percent_sum_invalid`) — structurally unreachable
    * with zero-siblings, but pinned by the test suite.
    *
-   * @returns DeploymentResponse The updated deployment.
+   * @returns DeploymentResponse The updated deployment with the new traffic_percent.
    * @throws ApiError
    */
   public static updateDeploymentTraffic({

@@ -3776,6 +3776,17 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	// (NOT NULL DEFAULT 100) handles the empty-input case at the
 	// schema layer; the explicit write here mirrors the
 	// operator-supplied case.
+	//
+	// Defensive default: if a caller hands us d.TrafficPercent=0
+	// (Go zero value, the wire-omitted case from a test or a
+	// future handler that forgets to set the field), stamp 100
+	// here so we never INSERT a row at 0 that would then receive
+	// no traffic. Mirrors memstore.CreateDeployment (the unit-test
+	// suite that exercises MemStore stays aligned with PgStore),
+	// and matches the schema NOT NULL DEFAULT 100 contract.
+	if d.TrafficPercent == 0 {
+		d.TrafficPercent = 100
+	}
 	row := tx.QueryRow(ctx,
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
