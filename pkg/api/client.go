@@ -47,10 +47,24 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// cookieOnlyPathRE matches API routes that are gated server-side to
+// the dashboard session cookie. The bearer-key CLI cannot reach
+// them — a request would 401 (or 302 to the login page) because the
+// session-cookie middleware (cmd/apid/server.go:1097 and
+// cmd/apid/handlers_sessions.go:71-77) treats bearer-key callers
+// as anonymous. The guard in c.do (below) short-circuits the
+// request with CodeUnsupportedByCLI so the failure mode is honest
+// ("the CLI cannot reach this route") rather than a confusing
+// 401/302. The companion tripwire
+// (pkg/api/lint_tripwires_test.go) ensures no other pkg/api file
+// composes a path that matches this regex.
+var cookieOnlyPathRE = regexp.MustCompile(`^/v1/auth/(sessions|capabilities)(/.*)?$`)
 
 // Client is a typed wrapper over the v1 REST API. Construct with
 // NewClient (30s default timeout) or NewClientWithDeployTimeout
@@ -153,6 +167,23 @@ func (c *Client) uploadHTTP() *http.Client {
 // when body != nil, decodes non-2xx as Problem, and unmarshals a
 // successful response into out when out != nil.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	// Cookie-only-route guard — reject paths the bearer-key CLI cannot
+	// reach before allocating anything. The regex matches the closed
+	// set /v1/auth/sessions and /v1/auth/capabilities (with optional
+	// trailing subpath). The status is 403 because the call is
+	// well-formed but the caller's auth mode does not match the
+	// route's policy — semantically a peer of CodeDeploySignatureInvalid
+	// (403 for "this caller cannot complete this action"). Docs URL
+	// points at the (forthcoming) /cli/cookie-only-routes page; the
+	// tripwire enforces the same URL in pkg/api/lint_tripwires_test.go.
+	if cookieOnlyPathRE.MatchString(path) {
+		return NewProblem(
+			http.StatusForbidden,
+			CodeUnsupportedByCLI,
+			"endpoint requires the dashboard session cookie",
+			"the gregale CLI cannot reach this route — use the dashboard at "+docsBase+"/dashboard/sessions",
+		).WithDocs(docsBase + "/cli/cookie-only-routes")
+	}
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
