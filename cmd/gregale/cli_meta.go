@@ -52,12 +52,23 @@ type cliCommand struct {
 	// Positionals documents the required positional args in order.
 	// Used by the man-page renderer to fill the SYNOPSIS section.
 	// Example: ["<slug>", "<wake-id>"] for `gregale wake-timeline`.
+	// A leading `<slug>` marker also drives cache-backed completion
+	// across all four shell backends (see hasSlugFirst).
 	Positionals []string
 	// ClosedSet enumerates the allowed values for the FIRST positional
 	// when the command takes exactly one. Today only `plan` uses this
 	// (free|hobby|pro|scale). Mirrors api.Plans so the manifest is the
 	// source of truth for completion of the plan literal.
 	ClosedSet []string
+}
+
+// hasSlugFirst reports whether the first positional is the <slug>
+// placeholder. The completion backends use this to wire up cache-
+// backed slug completion for every command that takes an app slug
+// (app, invoke, metrics, slo, wake-timeline) — driven by the manifest
+// rather than a hardcoded name list.
+func (c cliCommand) hasSlugFirst() bool {
+	return len(c.Positionals) > 0 && c.Positionals[0] == "<slug>"
 }
 
 // cliSub is one verb under a cliCommand (e.g. alerts.list, alerts.add).

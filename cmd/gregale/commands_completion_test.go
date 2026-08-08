@@ -23,6 +23,8 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -292,6 +294,148 @@ func TestEscapeRoff(t *testing.T) {
 		if got := escapeRoff(tc.in); got != tc.want {
 			t.Errorf("escapeRoff(%q) = %q; want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestBash_SlugRegexExtractsSlugs is the regression test for the
+// grep -E bug: the original completion script emitted a regex with
+// literal '{' and '}' which grep rejects ("invalid repeat"). The
+// fix replaces the regex with a sed slice + slug extractor. We
+// verify the FIXED script's helper returns the expected slug list
+// from a populated cache file. Skip when bash isn't available
+// (CI runners without /bin/bash — uncommon).
+func TestBash_SlugRegexExtractsSlugs(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	cacheJSON := `{"version":1,"apps":[{"slug":"alpha","id":"1","name":"Alpha"},{"slug":"beta","id":"2","name":"Beta"}],"orgs":[],"saved_at":"2026-08-08T00:00:00Z"}`
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "completion-cache.json")
+	if err := os.WriteFile(cachePath, []byte(cacheJSON), 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	// Render the bash completion script and write it to a temp file.
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "gregale-completion.bash")
+	var scriptBuf bytes.Buffer
+	captureStdoutSwap(t, &scriptBuf, cmdCompletionBash)
+	if err := os.WriteFile(scriptPath, scriptBuf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	// Drive the script's __gregale_cache_slugs helper. We can't
+	// source the full script (complete -F registration requires a
+	// real shell session), but we CAN inspect the function body
+	// and execute the helper directly with FAAS_COMPLETION_CACHE_PATH
+	// pointing at our seeded file. We invoke it through bash -c
+	// after sourcing just the helper definitions.
+	src := `. ` + scriptPath + `
+export FAAS_COMPLETION_CACHE_PATH="` + cachePath + `"
+__gregale_cache_path() { printf '%s' "$FAAS_COMPLETION_CACHE_PATH"; }
+__gregale_cache_slugs apps
+`
+	cmd := exec.Command("/bin/bash", "-c", src)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("bash exec failed: %v\noutput: %s", err, string(out))
+	}
+	got := strings.TrimSpace(string(out))
+	want := "alpha\nbeta"
+	if got != want {
+		t.Fatalf("slug extraction: got %q want %q", got, want)
+	}
+}
+
+// TestPowershell_AppCommandHasSubcommandAndSlugEntries is the
+// regression test for the `len(c.Positionals) == 0` gate that
+// suppressed subcommand completion for commands with BOTH
+// subcommands (scale/rename/security) AND a <slug> positional.
+// The fix drops the positionals gate; the rendered PowerShell
+// script must now contain subcommand entries for `app`.
+func TestPowershell_AppCommandHasSubcommandAndSlugEntries(t *testing.T) {
+	var buf bytes.Buffer
+	captureStdoutSwap(t, &buf, cmdCompletionPowershell)
+	out := buf.String()
+	if !strings.Contains(out, "$tokens[1] -eq 'app'") {
+		t.Fatalf("app dispatch missing:\n%s", out)
+	}
+	if !strings.Contains(out, "__gregaleCacheSlugs 'apps'") {
+		t.Fatalf("app slug-cache completion missing — hasSlugFirst not honoured:\n%s", out)
+	}
+	for _, sub := range []string{"scale", "rename", "security"} {
+		// Go's %q renders a string with double quotes (no escape
+		// needed for simple ASCII), so we match either quote style.
+		dq := `"` + sub + `"`
+		sq := `'` + sub + `'`
+		if !strings.Contains(out, dq) && !strings.Contains(out, sq) {
+			t.Errorf("app subcommand %q missing from PowerShell completion", sub)
+		}
+	}
+}
+
+// TestMan_PerCommandSourceLabelIsGregale is the regression test
+// for the uppercased source field. The .TH source should be the
+// brand ("gregale") not the page slug ("GREGALE-ALERTS").
+func TestMan_PerCommandSourceLabelIsGregale(t *testing.T) {
+	c, ok := lookupCliCommand("alerts")
+	if !ok {
+		t.Fatalf("alerts not in manifest")
+	}
+	var buf bytes.Buffer
+	renderManCommand(&buf, c)
+	out := buf.String()
+	// The header line must end with the brand ("gregale") in the
+	// source slot — not the uppercased page slug ("GREGALE-ALERTS").
+	if !strings.Contains(out, `.TH GREGALE-ALERTS(1)`) {
+		t.Errorf("alerts man: title missing or wrong:\n%s", out)
+	}
+	if strings.Contains(out, `"GREGALE-ALERTS"`) {
+		t.Errorf("alerts man: source label is uppercased page slug (should be 'gregale'):\n%s", out)
+	}
+	if !strings.Contains(out, `"gregale"`) {
+		t.Errorf("alerts man: source label 'gregale' missing:\n%s", out)
+	}
+}
+
+// TestMan_RequiredFlagRenderedWithoutBrackets is the regression
+// test for the SYNOPSIS+FLAGS required-flag marker. The Req field
+// was documented but the renderer emitted `[ --name value ]` for
+// both required and optional flags. Required flags must lose the
+// brackets in SYNOPSIS and gain a `(required)` suffix in FLAGS.
+func TestMan_RequiredFlagRenderedWithoutBrackets(t *testing.T) {
+	c, ok := lookupCliCommand("init")
+	if !ok {
+		t.Fatalf("init not in manifest")
+	}
+	var buf bytes.Buffer
+	renderManCommand(&buf, c)
+	out := buf.String()
+	// --template and --path are Req: true in cli_meta.go.
+	if !strings.Contains(out, "--template") || !strings.Contains(out, "--path") {
+		t.Fatalf("init man: required flags missing entirely:\n%s", out)
+	}
+	// The required-flag line must NOT be wrapped in `[ ... ]`.
+	if strings.Contains(out, "[ --template ") || strings.Contains(out, "[ --path ") {
+		t.Errorf("init man: required flag rendered with optional brackets (Req marker dropped):\n%s", out)
+	}
+	// FLAGS section must mark them with `(required)`.
+	if !strings.Contains(out, "(required)") {
+		t.Errorf("init man: FLAGS section missing (required) marker:\n%s", out)
+	}
+}
+
+// TestCompletion_BashScriptIsSyntacticallyValid pipes the rendered
+// bash completion through `bash -n` to catch parse errors. Skips
+// on hosts without /bin/bash (rare; CI runners have it).
+func TestCompletion_BashScriptIsSyntacticallyValid(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skipf("bash not available: %v", err)
+	}
+	var buf bytes.Buffer
+	captureStdoutSwap(t, &buf, cmdCompletionBash)
+	cmd := exec.Command("/bin/bash", "-n")
+	cmd.Stdin = &buf
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bash -n failed: %v\noutput:\n%s", err, string(out))
 	}
 }
 

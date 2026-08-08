@@ -60,29 +60,30 @@ func renderPowershellHeader(w io.Writer) {
 
 func renderPowershellCommand(w io.Writer, c cliCommand) {
 	_, _ = fmt.Fprintf(w, "  if ($tokens[1] -eq '%s') {\n", c.Name)
-	// Top-level positional: closed-set or slug cache.
-	if len(c.ClosedSet) > 0 {
-		for _, v := range c.ClosedSet {
-			_, _ = fmt.Fprintf(w, "    if (%q -like \"$wordToComplete*\") { [System.Management.Automation.CompletionResult]::new(%q, %q, 'ParameterValue', %q) }\n",
-				v, v, v, v)
-		}
-	} else if len(c.Positionals) > 0 && (c.Name == "app" || c.Name == "apps") {
-		_, _ = fmt.Fprintln(w, "    foreach ($s in __gregaleCacheSlugs 'apps') {")
-		_, _ = fmt.Fprintln(w, "      if ($s -like \"$wordToComplete*\") { [System.Management.Automation.CompletionResult]::new($s, $s, 'ParameterValue', $s) }")
-		_, _ = fmt.Fprintln(w, "    }")
-	}
-	// Subcommand completion.
-	if len(c.Subcommands) > 0 && len(c.Positionals) == 0 {
-		verbs := make([]string, 0, len(c.Subcommands))
-		for _, s := range c.Subcommands {
-			verbs = append(verbs, s.Name)
-		}
+	// Subcommand completion: always rendered when the command has
+	// any subcommands. The earlier `len(c.Positionals) == 0` gate
+	// suppressed subcommand completion for commands like `app` that
+	// have BOTH subcommands (scale/rename/security) AND a <slug>
+	// positional — inconsistent with bash/zsh/fish.
+	if len(c.Subcommands) > 0 {
 		_, _ = fmt.Fprintf(w, "    if ($tokens.Count -eq 2) {\n")
 		for _, s := range c.Subcommands {
 			_, _ = fmt.Fprintf(w, "      if (%q -like \"$wordToComplete*\") { [System.Management.Automation.CompletionResult]::new(%q, %q, 'ParameterName', %q) }\n",
 				s.Name, s.Name, s.Name, escapePS(s.Short))
 		}
 		_, _ = fmt.Fprintln(w, "      return")
+		_, _ = fmt.Fprintln(w, "    }")
+	}
+	// Top-level positional: closed-set (plan) or slug cache (app,
+	// invoke, metrics, slo, wake-timeline — driven by hasSlugFirst).
+	if len(c.ClosedSet) > 0 {
+		for _, v := range c.ClosedSet {
+			_, _ = fmt.Fprintf(w, "    if (%q -like \"$wordToComplete*\") { [System.Management.Automation.CompletionResult]::new(%q, %q, 'ParameterValue', %q) }\n",
+				v, v, v, v)
+		}
+	} else if c.hasSlugFirst() {
+		_, _ = fmt.Fprintln(w, "    foreach ($s in __gregaleCacheSlugs 'apps') {")
+		_, _ = fmt.Fprintln(w, "      if ($s -like \"$wordToComplete*\") { [System.Management.Automation.CompletionResult]::new($s, $s, 'ParameterValue', $s) }")
 		_, _ = fmt.Fprintln(w, "    }")
 	}
 	// Flags.

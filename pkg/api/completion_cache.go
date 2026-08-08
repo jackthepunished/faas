@@ -128,6 +128,14 @@ func (c *CompletionCache) SetPath(path string) {
 func (c *CompletionCache) Path() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.pathLocked()
+}
+
+// pathLocked is Path's body without the lock. Callers MUST hold
+// c.mu — used by readLocked and writeEntryLocked when they are
+// already inside the MaybeRefresh outer critical section, to avoid
+// re-entrant Lock on the same mutex.
+func (c *CompletionCache) pathLocked() string {
 	if c.path != "" {
 		return c.path
 	}
@@ -149,7 +157,16 @@ func (c *CompletionCache) Path() string {
 // treated as missing (the next refresh overwrites it) so a
 // half-flushed tmp from a previous crash never bricks the CLI.
 func (c *CompletionCache) Read() (CompletionCacheEntry, time.Time, error) {
-	path := c.Path()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readLocked()
+}
+
+// readLocked is Read's lock-held body. Callers MUST hold c.mu.
+// Used by MaybeRefresh to fold the read-modify-write into one
+// critical section.
+func (c *CompletionCache) readLocked() (CompletionCacheEntry, time.Time, error) {
+	path := c.pathLocked()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -189,6 +206,15 @@ func (c *CompletionCache) IsFresh(mtime time.Time) bool {
 // owner's eyes only); the file is 0600. Errors are returned to
 // the caller — the c.do middleware swallows them with slog.Warn.
 func (c *CompletionCache) WriteEntry(entry CompletionCacheEntry) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writeEntryLocked(entry)
+}
+
+// writeEntryLocked is WriteEntry's lock-held body. Callers MUST
+// hold c.mu. Used by MaybeRefresh to fold the read-modify-write
+// into one critical section.
+func (c *CompletionCache) writeEntryLocked(entry CompletionCacheEntry) error {
 	entry.Version = completionCacheVersion
 	if entry.SavedAt.IsZero() {
 		entry.SavedAt = c.now().UTC()
@@ -197,7 +223,7 @@ func (c *CompletionCache) WriteEntry(entry CompletionCacheEntry) error {
 	if err != nil {
 		return fmt.Errorf("marshal completion cache: %w", err)
 	}
-	path := c.Path()
+	path := c.pathLocked()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir completion cache dir: %w", err)
@@ -250,6 +276,14 @@ func (c *CompletionCache) WriteEntry(entry CompletionCacheEntry) error {
 // Add new endpoints by extending the path switch. The cache file
 // is whole-record-replaced on every qualifying response (small N
 // — accounts have at most a few hundred apps).
+//
+// Concurrency: the read-modify-write is serialised under c.mu so
+// concurrent refreshes of DIFFERENT fields (one goroutine hitting
+// /v1/apps while another hits /v1/orgs) don't clobber each other.
+// Read + WriteEntry both take the lock individually; without the
+// outer lock here, the inner locks allow a baseline read, a peer
+// rewrite, and a stale baseline write that loses the peer's field.
+// The outer lock collapses the RMW into one critical section.
 func (c *CompletionCache) MaybeRefresh(path string, body []byte) {
 	if len(body) == 0 {
 		return
@@ -271,10 +305,11 @@ func (c *CompletionCache) MaybeRefresh(path string, body []byte) {
 			}
 			recs = append(recs, CompletionCacheRecord{ID: a.ID, Slug: a.Slug, Name: a.Name})
 		}
-		// Preserve existing orgs; rewrite apps only.
-		existing, _, _ := c.Read()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		existing, _, _ := c.readLocked()
 		existing.Apps = recs
-		_ = c.WriteEntry(existing)
+		_ = c.writeEntryLocked(existing)
 	case "/v1/orgs":
 		var env struct {
 			Orgs []struct {
@@ -293,8 +328,10 @@ func (c *CompletionCache) MaybeRefresh(path string, body []byte) {
 			}
 			recs = append(recs, CompletionCacheRecord{ID: o.ID, Slug: o.Slug, Name: o.Name})
 		}
-		existing, _, _ := c.Read()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		existing, _, _ := c.readLocked()
 		existing.Orgs = recs
-		_ = c.WriteEntry(existing)
+		_ = c.writeEntryLocked(existing)
 	}
 }

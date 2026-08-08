@@ -39,8 +39,11 @@ func renderFishHeader(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  if test -z \"$path\"; or not test -r \"$path\"")
 	_, _ = fmt.Fprintln(w, "    return 1")
 	_, _ = fmt.Fprintln(w, "  end")
-	_, _ = fmt.Fprintln(w, "  grep -oE \"\\\"$kind\\\"\\\":\\[{[^}]*}\\]\" \"$path\" 2>/dev/null \\")
-	_, _ = fmt.Fprintln(w, "    | sed -E 's/.*\\[//; s/\\]$//; s/\"slug\":\"([^\"]+)\"/\\1/g'")
+	// sed slice rather than grep -E with literal braces — fish's
+	// grep treats '{' as a quantifier metacharacter and rejects it.
+	_, _ = fmt.Fprintln(w, "  sed -n \"/\\\"$kind\\\":\\[/,/]/p\" \"$path\" 2>/dev/null \\")
+	_, _ = fmt.Fprintln(w, "    | grep -oE '\"slug\":\"[^\"]+\"' \\")
+	_, _ = fmt.Fprintln(w, "    | sed -E 's/.*\"slug\":\"([^\"]+)\".*/\\1/'")
 	_, _ = fmt.Fprintln(w, "end")
 	_, _ = fmt.Fprintln(w)
 }
@@ -66,8 +69,10 @@ func renderFishCommand(w io.Writer, c cliCommand) {
 		_, _ = fmt.Fprintf(w, "complete -c gregale -f -n \"__fish_seen_subcommand_from %s\" -a \"%s\"\n",
 			c.Name, strings.Join(c.ClosedSet, " "))
 	}
-	// Slug cache completion.
-	if len(c.Positionals) > 0 && (c.Name == "app" || c.Name == "apps") {
+	// Slug cache completion for any command whose first positional
+	// is the <slug> marker (app, invoke, metrics, slo, wake-timeline).
+	// Driven by cliCommand.hasSlugFirst — no hardcoded name list.
+	if c.hasSlugFirst() {
 		_, _ = fmt.Fprintf(w, "complete -c gregale -f -n \"__fish_seen_subcommand_from %s\" -a \"(__gregale_cache_slugs apps)\"\n",
 			c.Name)
 	}

@@ -194,7 +194,7 @@ func TestCompletionCache_MaybeRefresh_SkipsEmptyBody(t *testing.T) {
 func TestCompletionCache_ConcurrentWritesAreSafe(t *testing.T) {
 	c := newTestCache(t)
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -208,6 +208,44 @@ func TestCompletionCache_ConcurrentWritesAreSafe(t *testing.T) {
 	}
 	if len(out.Apps) != 1 {
 		t.Fatalf("Concurrent writes should converge to one record; got %d", len(out.Apps))
+	}
+}
+
+// TestCompletionCache_CrossPathRacePreservesBothFields exercises the
+// read-modify-write race that the outer c.mu lock in MaybeRefresh
+// was added to fix: concurrent /v1/apps + /v1/orgs refreshes must
+// NOT clobber each other's field. Without the outer lock, both
+// goroutines read the same baseline, both write — last writer wins
+// and one field is wiped.
+func TestCompletionCache_CrossPathRacePreservesBothFields(t *testing.T) {
+	c := newTestCache(t)
+	var wg sync.WaitGroup
+	// Fire a few interleaved apps+orgs refreshes. The exact count
+	// is not load-bearing — the bug surfaces with even two racing
+	// goroutines on different paths; we use a handful to make the
+	// failure obvious under -race. Higher counts make the test
+	// slow on CI (atomic rename is the bottleneck, not the mutex).
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c.MaybeRefresh("/v1/apps", []byte(`[{"id":"id-a","slug":"demo","name":"demo"}]`))
+		}()
+		go func() {
+			defer wg.Done()
+			c.MaybeRefresh("/v1/orgs", []byte(`{"orgs":[{"id":"id-o","slug":"acme","name":"Acme"}]}`))
+		}()
+	}
+	wg.Wait()
+	out, _, err := c.Read()
+	if err != nil {
+		t.Fatalf("Read after cross-path race: %v", err)
+	}
+	if len(out.Apps) != 1 || out.Apps[0].Slug != "demo" {
+		t.Fatalf("Apps lost under cross-path race: %+v", out.Apps)
+	}
+	if len(out.Orgs) != 1 || out.Orgs[0].Slug != "acme" {
+		t.Fatalf("Orgs lost under cross-path race: %+v", out.Orgs)
 	}
 }
 

@@ -40,8 +40,11 @@ func renderZshHeader(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "  local kind=\"$1\"")
 	_, _ = fmt.Fprintln(w, "  local path=\"$(gregale completion-cache-path 2>/dev/null)\"")
 	_, _ = fmt.Fprintln(w, "  [[ -z \"$path\" || ! -r \"$path\" ]] && return 1")
-	_, _ = fmt.Fprintln(w, "  grep -oE \"\\\"$kind\\\"\\\":\\[{[^}]*}\\]\" \"$path\" 2>/dev/null \\")
-	_, _ = fmt.Fprintln(w, "    | sed -E 's/.*\\[//; s/\\]$//; s/\"slug\":\"([^\"]+)\"/\\1/g'")
+	// sed slice rather than grep -E with literal braces — grep
+	// treats '{' as a quantifier metacharacter and rejects it.
+	_, _ = fmt.Fprintln(w, "  sed -n \"/\\\"$kind\\\":\\[/,/]/p\" \"$path\" 2>/dev/null \\")
+	_, _ = fmt.Fprintln(w, "    | grep -oE '\"slug\":\"[^\"]+\"' \\")
+	_, _ = fmt.Fprintln(w, "    | sed -E 's/.*\"slug\":\"([^\"]+)\".*/\\1/'")
 	_, _ = fmt.Fprintln(w, "}")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, "_gregale() {")
@@ -78,7 +81,7 @@ func renderZshCommand(w io.Writer, c cliCommand) {
 	args = append(args, flagList...)
 	if len(c.ClosedSet) > 0 {
 		args = append(args, "1:plan:("+strings.Join(c.ClosedSet, " ")+")")
-	} else if len(c.Positionals) > 0 && (c.Name == "app" || c.Name == "apps") {
+	} else if c.hasSlugFirst() {
 		args = append(args, "1:slug:($(_gregale_cache_slugs apps))")
 	}
 	if len(args) == 0 {

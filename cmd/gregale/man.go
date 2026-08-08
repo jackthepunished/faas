@@ -29,6 +29,12 @@ import (
 
 const manDocsTopic = "man"
 
+// manSourceBrand is the .TH source field for every page. We don't
+// vary it per-command because the brand is what `whatis` and
+// `man -k` index on — operators expect to grep `gregale` (lower-
+// case) across every page in the section.
+const manSourceBrand = "gregale"
+
 // gregaleVersion is read from wire.Version at startup via
 // initGregaleVersion() (set in main.go via a tiny init() or
 // assigned at process boot — wire.Version is a string constant
@@ -70,7 +76,7 @@ func lookupCliCommand(name string) (cliCommand, bool) {
 
 // renderManTop writes the gregale(1) top-level page.
 func renderManTop(w io.Writer) {
-	manHeader(w, "GREGALE(1)", "gregale Manual", "gregale")
+	manHeader(w, "GREGALE(1)", "gregale Manual", manSourceBrand)
 	manSection(w, "NAME", func(w io.Writer) {
 		fmt.Fprintln(w, ".B gregale")
 		fmt.Fprintln(w, "\\- deploy apps and functions that scale to zero")
@@ -135,7 +141,10 @@ func renderManTop(w io.Writer) {
 
 // renderManCommand writes the gregale-<command>(1) per-command page.
 func renderManCommand(w io.Writer, c cliCommand) {
-	manHeader(w, "GREGALE-"+strings.ToUpper(c.Name)+"(1)", "gregale "+c.Name+" Manual", "gregale-"+c.Name)
+	// The .TH source field is the brand ("gregale"), not the page
+	// slug — whatis/man -k index on the source label, and operators
+	// expect to grep `gregale` (lowercase) across every page.
+	manHeader(w, "GREGALE-"+strings.ToUpper(c.Name)+"(1)", "gregale "+c.Name+" Manual", manSourceBrand)
 	manSection(w, "NAME", func(w io.Writer) {
 		fmt.Fprintf(w, ".B gregale-%s\n", c.Name)
 		fmt.Fprintf(w, "\\- %s\n", escapeRoff(c.Short))
@@ -149,10 +158,13 @@ func renderManCommand(w io.Writer, c cliCommand) {
 			fmt.Fprintf(w, ".RI %s\n", p)
 		}
 		for _, f := range c.Flags {
+			// Required flags lose the surrounding brackets so the
+			// reader can distinguish them from optional flags at a
+			// glance — the conventional groff marker for "no brackets
+			// means required".
 			if f.Req {
-				fmt.Fprintf(w, ".RI [ --%s ", f.Name)
-				fmt.Fprint(w, ".IR value ")
-				fmt.Fprint(w, "]\n")
+				fmt.Fprintf(w, ".RI --%s ", f.Name)
+				fmt.Fprint(w, ".IR value\n")
 			} else {
 				fmt.Fprintf(w, ".RI [ --%s ", f.Name)
 				fmt.Fprint(w, ".IR value ")
@@ -177,7 +189,15 @@ func renderManCommand(w io.Writer, c cliCommand) {
 		manSection(w, "FLAGS", func(w io.Writer) {
 			fmt.Fprintln(w, ".TP")
 			for _, f := range c.Flags {
-				fmt.Fprintf(w, ".BR --%s\n", f.Name)
+				// Required flags get a "(required)" suffix in the
+				// FLAGS section so a reader scanning for the marker
+				// finds it without cross-referencing the SYNOPSIS.
+				flagHeader := fmt.Sprintf("--%s", f.Name)
+				if f.Req {
+					fmt.Fprintf(w, ".BR %s\n(required)\n", flagHeader)
+				} else {
+					fmt.Fprintf(w, ".BR %s\n", flagHeader)
+				}
 				fmt.Fprintf(w, "%s\n", escapeRoff(f.Short))
 				if len(f.ClosedSet) > 0 {
 					fmt.Fprintf(w, "Allowed values: %s.\n", strings.Join(f.ClosedSet, ", "))
@@ -198,11 +218,15 @@ func renderManCommand(w io.Writer, c cliCommand) {
 	manFooter(w)
 }
 
-// manHeader writes the page preamble only: .TH title section date source
-// manual. The NAME section is rendered by renderManTop/renderManCommand
-// via manSection("NAME", ...) — keeping all .SH openings in one place.
+// manHeader writes the page preamble only: .TH title section date source.
+// The source field is the brand (`gregale`) for every page — the
+// per-command title (GREGALE-ALERTS) lives in the title slot, so
+// grepping the source label stays consistent across the whole
+// man section. The NAME section is rendered by renderManTop /
+// renderManCommand via manSection("NAME", ...) — keeping all .SH
+// openings in one place.
 func manHeader(w io.Writer, title, subtitle, source string) {
-	fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregaleVersion, strings.ToUpper(source))
+	fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregaleVersion, source)
 	_ = subtitle // subtitle is rendered inside the NAME section body
 }
 
