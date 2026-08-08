@@ -347,6 +347,67 @@ func TestCmdTrafficSet_MissingArgs(t *testing.T) {
 	}
 }
 
+// TestCmdTrafficSet_DefaultIsProportional (issue #556 / PR-C) pins
+// the CLI's default behaviour post-C7: a bare `faas traffic set
+// --deployment <id> --percent N` performs a proportional
+// rebalance. There is no `--redistribute` flag (deferred to PR-D per
+// ADR-084 §D7). A test that asserts no `--redistribute` argument is
+// honoured AND the wire body is the canonical proportional shape
+// ({"traffic_percent": N}) pins both:
+//   - the default semantics is proportional
+//   - the flag-deferral did NOT silently land a no-op `--redistribute`
+//     alias that callers might mistake for "explicit zero on siblings".
+func TestCmdTrafficSet_DefaultIsProportional(t *testing.T) {
+	const wantDepID = "0123456789abcdef0123456789abcdef"
+	const wantPercent = 25
+	var hits int32
+	var gotBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSONTest(w, api.DeploymentResponse{
+			ID:             wantDepID,
+			AppID:          "app-id",
+			TrafficPercent: wantPercent,
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_test_x")
+
+	// The bare command — no `--redistribute`. Pre-PR-C this
+	// returned 409 (S2). PR-C makes it the proportional default.
+	if code := cmdTrafficSet([]string{"--deployment", wantDepID, "--percent", itoaForCli(wantPercent)}); code != 0 {
+		t.Fatalf("cmdTrafficSet exit = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("PATCH hit count = %d, want 1", hits)
+	}
+	wantBody := `{"traffic_percent":25}`
+	if gotBody != wantBody {
+		t.Errorf("body = %q, want %q (proportional default — no --redistribute needed)", gotBody, wantBody)
+	}
+
+	// A second invocation with an unknown `--redistribute` flag
+	// must surface a non-zero exit (FlagSet rejects unknown
+	// flags). This pins the deferral: the flag does NOT silently
+	// exist as a no-op alias. If a future PR-D adds the flag,
+	// this assertion is the tripwire to update.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSONTest(w, api.DeploymentResponse{ID: wantDepID, TrafficPercent: 25})
+	}))
+	defer srv2.Close()
+	t.Setenv("FAAS_API", srv2.URL)
+	if code := cmdTrafficSet([]string{"--deployment", wantDepID, "--percent", "25", "--redistribute"}); code == 0 {
+		t.Errorf("--redistribute must NOT be silently honoured (deferred to PR-D per ADR-084 §D7)")
+	}
+}
+
 // itoaForCli is a tiny local helper for the Hobby-rejects test so the
 // file doesn't depend on strconv (matches the apid test's itoa style).
 func itoaForCli(n int) string {

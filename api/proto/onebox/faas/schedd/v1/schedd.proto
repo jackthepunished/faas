@@ -230,6 +230,20 @@ message LivenessFailedAck {
 message WakeRequest {
   // app_id is the apps.id UUID (the gateway resolves host→app before calling).
   string app_id = 1;
+  // deployment_id (issue #556 / PR-C) is the optional per-deployment
+  // wake hint. When non-empty, schedd wakes an instance on this
+  // specific live deployment (the gateway-side weighted picker
+  // (PGBackend.Pick) chooses the bucket and forwards the id here
+  // so a cold bucket gets a wake instead of falling through to the
+  // newest live deployment). Empty = Phase-1 fast path uses the
+  // newest live deployment (pre-PR-C behaviour).
+  //
+  // Additive per ADR-016 — pre-PR-C callers omit the field and
+  // observe the existing newest-live behaviour. schedd validates
+  // the id against the live deployment set before admitting; an
+  // unknown or non-live id is rejected with NotFound so a stale
+  // gateway cache can't wake a ghost bucket.
+  string deployment_id = 2;
 }
 
 // WakeMethod reports whether the wake was a snapshot restore or a cold boot.
@@ -280,6 +294,15 @@ message WakeResponse {
   // gateway caches it on Target and stamps it onto ForwardHTTPRequest.
   // Additive per ADR-016.
   int32  port        = 6;
+  // deployment_id (issue #556 / PR-C) is the live deployment the
+  // wake landed on. Mirrors AdmitInstanceResponse.deployment_id (PR-B);
+  // populated on both the Phase-1 fast path (read from the instance
+  // row) and the cold-bucket fan-out path (the deployment_id passed
+  // in WakeRequest). Empty on error paths.
+  //
+  // Additive per ADR-016 — pre-PR-C callers ignore the field and
+  // observe the same wire response as before.
+  string deployment_id = 7;
 }
 
 // AdmitInstanceRequest mirrors WakeRequest for the schedule scale-out
@@ -288,6 +311,14 @@ message WakeResponse {
 // land on the request without breaking Wake's contract.
 message AdmitInstanceRequest {
   string app_id = 1;
+  // deployment_id (issue #556 / PR-C) is the optional
+  // per-deployment wake hint for the wake-fan-out path. Empty
+  // falls through to schedd's default (newest live deployment)
+  // — the legacy single-deployment behaviour. Non-empty
+  // asks schedd to admit onto that specific live deployment so
+  // the picker has a routable Target on retry. Additive per
+  // ADR-016.
+  string deployment_id = 2;
 }
 
 // AdmitInstanceResponse is the typed result of Engine.AdmitInstance.

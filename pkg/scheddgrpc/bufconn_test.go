@@ -26,7 +26,7 @@ import (
 )
 
 type fakeEngine struct {
-	wakeFn          func(ctx context.Context, appID string) (sched.WakeResult, error)
+	wakeFn          func(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
 	admitInstanceFn func(ctx context.Context, appID string) (sched.WakeResult, error)
 	reportFn        func(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	parkFn          func(ctx context.Context, instanceID, reason string) error
@@ -51,18 +51,19 @@ type fakeEngine struct {
 	destroyFn func(ctx context.Context, instanceID, reason string) error
 }
 
-func (f *fakeEngine) Wake(ctx context.Context, appID string) (sched.WakeResult, error) {
-	return f.wakeFn(ctx, appID)
+func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error) {
+	return f.wakeFn(ctx, appID, deploymentID)
 }
 
-func (f *fakeEngine) AdmitInstance(ctx context.Context, appID string) (sched.WakeResult, error) {
+func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error) {
 	if f.admitInstanceFn != nil {
 		return f.admitInstanceFn(ctx, appID)
 	}
 	// Default: behave like Wake so existing tests that don't set
 	// admitInstanceFn continue to compile and pass unchanged.
+	// (PR-C widening: deployment_id is forwarded to Wake via "")
 	if f.wakeFn != nil {
-		return f.wakeFn(ctx, appID)
+		return f.wakeFn(ctx, appID, "")
 	}
 	return sched.WakeResult{}, nil
 }
@@ -234,7 +235,7 @@ func readCounter(t *testing.T, m *wire.OpsMetrics, metricName string, reason str
 
 func TestWake_Success(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{InstanceID: "i-1", NodeID: "node-test-1", Method: vmmdpb.WakeMethod_WAKE_RESTORE}, nil
 		},
 	})
@@ -252,7 +253,7 @@ func TestWake_Success(t *testing.T) {
 
 func TestWake_CapacityDenialSurfacesProblem(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{}, api.ErrCapacity("no RAM headroom")
 		},
 	})
@@ -268,7 +269,7 @@ func TestWake_CapacityDenialSurfacesProblem(t *testing.T) {
 
 func TestWake_PlainErrorIsInternal(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{}, errors.New("db exploded")
 		},
 	})
@@ -315,7 +316,7 @@ func TestReportActivity(t *testing.T) {
 func TestWake_PropagatesWakeID(t *testing.T) {
 	const wantWakeID = "0193f7c0-1234-7abc-9def-0123456789ab"
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{
 				InstanceID: "i-1",
 				NodeID:     "node-test-1",
@@ -480,7 +481,7 @@ func TestServerParkInstance_InternalError(t *testing.T) {
 // to dial :8080 against a guest that bound :9090 → 503.
 func TestWake_PropagatesPort(t *testing.T) {
 	cli := newServer(t, &fakeEngine{
-		wakeFn: func(context.Context, string) (sched.WakeResult, error) {
+		wakeFn: func(context.Context, string, string) (sched.WakeResult, error) {
 			return sched.WakeResult{
 				InstanceID: "i-1",
 				NodeID:     "node-test-1",
@@ -520,5 +521,71 @@ func TestAdmitInstance_PropagatesPort(t *testing.T) {
 	}
 	if got := resp.GetPort(); got != 9090 {
 		t.Errorf("port = %d, want 9090", got)
+	}
+}
+
+// TestWake_DeploymentIDForwarded (issue #556 / PR-C) pins the
+// wire-contract widening: WakeRequest.deployment_id reaches
+// SchedAPI.Wake as the second arg; the engine's response
+// deployment_id surfaces in WakeResponse.deployment_id (field 7).
+// This is the only mechanism by which the gateway can route a
+// cold-bucket wake onto a specific live deployment — without it
+// the wake-fan-out path in pkg/gateway/handler.go would have no
+// way to disambiguate sibling live deployments.
+func TestWake_DeploymentIDForwarded(t *testing.T) {
+	var gotDeploymentID string
+	cli := newServer(t, &fakeEngine{
+		wakeFn: func(_ context.Context, appID, deploymentID string) (sched.WakeResult, error) {
+			gotDeploymentID = deploymentID
+			return sched.WakeResult{
+				InstanceID:   "i-1",
+				NodeID:       "node-test-1",
+				Method:       vmmdpb.WakeMethod_WAKE_RESTORE,
+				DeploymentID: deploymentID,
+			}, nil
+		},
+	})
+	resp, err := cli.Wake(context.Background(), &scheddpb.WakeRequest{
+		AppId:        "app-1",
+		DeploymentId: "dep-canary",
+	})
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if gotDeploymentID != "dep-canary" {
+		t.Errorf("engine received deploymentID = %q, want %q", gotDeploymentID, "dep-canary")
+	}
+	if got := resp.GetDeploymentId(); got != "dep-canary" {
+		t.Errorf("response deployment_id = %q, want %q", got, "dep-canary")
+	}
+}
+
+// TestWake_DeploymentIDEmptyPreserved (issue #556 / PR-C) pins the
+// legacy-compat path: when WakeRequest.deployment_id is empty the
+// engine receives "" and the response carries "" — the field is
+// additive per ADR-016 and an empty value MUST NOT be silently
+// rewritten to the newest live deployment (that decision lives in
+// the engine, not in the wire layer).
+func TestWake_DeploymentIDEmptyPreserved(t *testing.T) {
+	var gotDeploymentID string = "sentinel"
+	cli := newServer(t, &fakeEngine{
+		wakeFn: func(_ context.Context, appID, deploymentID string) (sched.WakeResult, error) {
+			gotDeploymentID = deploymentID
+			return sched.WakeResult{
+				InstanceID: "i-1",
+				NodeID:     "node-test-1",
+				Method:     vmmdpb.WakeMethod_WAKE_RESTORE,
+			}, nil
+		},
+	})
+	resp, err := cli.Wake(context.Background(), &scheddpb.WakeRequest{AppId: "app-1"})
+	if err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if gotDeploymentID != "" {
+		t.Errorf("engine received deploymentID = %q, want \"\" (legacy mode)", gotDeploymentID)
+	}
+	if got := resp.GetDeploymentId(); got != "" {
+		t.Errorf("response deployment_id = %q, want \"\" (legacy mode)", got)
 	}
 }

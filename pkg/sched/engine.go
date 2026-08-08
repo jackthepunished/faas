@@ -804,7 +804,7 @@ type WakeResult struct {
 // shared admitAndDispatch runs Phase 2-4. AdmitInstance (issue #168)
 // skips Phase 1 explicitly so a gateway can demand a new instance
 // even when others are already RUNNING.
-func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
+func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
 	// ── Phase 1: fast path under appMu ─────────────────────────────
 	release := e.lockApp(appID)
 	if ins, err := e.store.RunningInstanceForApp(ctx, appID); err == nil {
@@ -881,8 +881,22 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 // second/third/... capacity slot can be opened on demand, plus the
 // liftCapacityToResult=true flag that turns a CodePlanLimitConcur
 // ledger refusal into the typed AtCapacity result.
-func (e *Engine) AdmitInstance(ctx context.Context, appID string) (WakeResult, error) {
-	return e.admitAndDispatch(ctx, appID, true)
+// AdmitInstance is the schedule scale-out primitive (issue #168).
+// Bypasses the Phase-1 fast-path so a gateway can demand a new
+// instance even when others are already RUNNING. Returns a typed
+// AtCapacity result on the benign "already at max_concurrency"
+// outcome — see sched.WakeResult.AtCapacity.
+//
+// deploymentID (issue #556 / PR-C): the optional per-deployment
+// wake hint for the wake-fan-out path. Empty falls through to
+// the newest live deployment — the legacy single-deployment
+// behaviour. Non-empty asks the engine to admit on that specific
+// live deployment. Additive per ADR-016.
+func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
+	if deploymentID == "" {
+		return e.admitAndDispatch(ctx, appID, true)
+	}
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
 }
 
 // AdmitInstanceForDeployment is the floor-trigger entry point that
@@ -902,7 +916,7 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID string) (WakeResult, e
 // superseded deployment.
 func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
 	if deploymentID == "" {
-		return e.AdmitInstance(ctx, appID)
+		return e.AdmitInstance(ctx, appID, "")
 	}
 	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, true)
 }

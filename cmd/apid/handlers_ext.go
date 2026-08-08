@@ -1151,16 +1151,24 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 //  1. Resolve deployment + IDOR guard (deployment must belong to
 //     this account).
 //  2. Decode body; require traffic_percent in body.
-//  3. Plan tier gate (Pro+ only) — must run BEFORE the range check
-//     so a Free account PATCHing any value sees the 403
-//     plan_traffic_split_not_allowed rather than 422 (the value
-//     is legal; the plan is locked).
-//  4. Range check [0, 100] — 422 invalid_traffic_percent with
+//  3. Range check [0, 100] — 422 invalid_traffic_percent with
 //     WithLimit(100, observed) so the CLI renders the cap.
+//     Range-before-plan is intentional: a malformed value is loud
+//     regardless of plan, and the plan gate only fires on a legal
+//     value (so the operator sees the 403 "plan locked" not a 422
+//     "value illegal").
+//  4. Plan tier gate (Pro+ only) — 403 plan_traffic_split_not_allowed
+//     for Hobby/Free.
 //  5. Call store.UpdateDeploymentTraffic (atomic, with FOR UPDATE
-//     lock on live rows + Σ = 100 invariant check).
+//     lock on live rows + Σ = 100 invariant check via
+//     RedistributeTraffic largest-remainder — issue #556 PR-C).
 //  6. Audit emit deployment.traffic_percent_changed with
 //     {app, deployment, traffic_percent, prev} payload.
+//  7. pg_notify `deployment_changed` with kind="traffic" so the
+//     PR-B gateway refresh subscriber (cmd/gatewayd-internal/
+//     backend.go:298) reloads weights within ~1s. Pre-PR-C the
+//     handler emitted no notify and the refresh was dead code on
+//     this path.
 //
 // Audit: best-effort — a failure is logged but does not roll
 // back the store write. Same contract as
@@ -1216,8 +1224,11 @@ func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request,
 			// the canonical 422 shape.
 			api.WriteProblem(w, api.ErrInvalidTrafficPercent(req.TrafficPercent))
 		case errors.Is(err, state.ErrTrafficPercentSumInvalid):
-			// Defensive 409 — structurally unreachable with
-			// zero-siblings semantics, pinned by test.
+			// Defensive 409 — unreachable in the live-siblings case
+			// (largest-remainder redistribution is Σ=100 by
+			// construction), but reachable when the caller asks
+			// for target=0 on a sole live row (legitimate Σ=0 —
+			// pinned by TestPg_UpdateDeploymentTraffic_SoleLiveRow).
 			api.WriteProblem(w, api.ErrTrafficPercentSumInvalid(0))
 		default:
 			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "update failed", err.Error()))
@@ -1231,6 +1242,23 @@ func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request,
 			"traffic_percent": req.TrafficPercent,
 			"prev":            prev,
 		})
+	}
+	// Notify the gateway so PR-B's refresh subscriber reloads
+	// weights within ~1s. Pre-PR-C (issue #556 PR-A) the handler
+	// emitted no notify and `faas traffic set` was silently a no-op
+	// for the running gateway until an unrelated `deployment_changed`
+	// fired (new deploy, supersede, rollback). The kind="traffic"
+	// discriminant lets the subscriber (and any future audit
+	// pipeline) distinguish a weight change from a status change;
+	// the existing subscriber ignores the field, so this is purely
+	// additive. Failure is logged-and-continued — same contract as
+	// the audit emit above.
+	if s.notif != nil {
+		if err := s.notif.Notify(r.Context(), db.NotifyDeploymentChanged,
+			fmt.Sprintf(`{"kind":"traffic","app_id":"%s","deployment_id":"%s","traffic_percent":%d}`,
+				app.ID, updated.ID, req.TrafficPercent)); err != nil {
+			s.log.Warn("apid: notify deployment_changed (traffic) failed", "err", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
 }

@@ -283,9 +283,12 @@ type Target struct {
 type Backend interface {
 	// Lookup resolves a hostname to its app (cache-first, spec §4.1).
 	Lookup(ctx context.Context, host string) (App, bool)
-	// Pick returns one routable Target for appID via atomic round-robin, or
-	// ok=false when the cache is empty (caller should ensure capacity first).
-	Pick(appID string) (Target, bool)
+	// Pick returns a PickResult (issue #556 / PR-C): the routable
+	// Target plus the signals the handler needs to drive
+	// wake-fan-out (Picked deploymentID, ColdBucket signal).
+	// OK=false when the cache is empty (caller should ensure
+	// capacity first).
+	Pick(appID string) PickResult
 	// HealthyCount returns the number of routable Targets currently cached
 	// for appID. Drives the WakeGate's shouldWake predicate.
 	HealthyCount(appID string) int
@@ -299,7 +302,29 @@ type Backend interface {
 	// On the at-capacity path wakeID is empty, method is
 	// WakeMethodUnspecified, and err is nil. On real failure err is a
 	// non-nil *api.Problem and method is WakeMethodUnspecified.
-	Admit(ctx context.Context, appID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	// Admit asks schedd to admit ONE additional instance for
+	// appID, only when HealthyCount(appID) < maxConcurrency at
+	// the moment the call commits. Implementations MUST
+	// serialize the HealthyCount check and the cache update so
+	// a burst of concurrent Admit calls can never collectively
+	// exceed maxConcurrency (issue #168 fan-out invariant).
+	//
+	// deploymentID (issue #556 / PR-C): the live deployment
+	// the new instance should be admitted for. Empty falls
+	// through to schedd's default (newest live deployment) —
+	// the legacy behaviour every pre-PR-B caller exercises.
+	// Non-empty is the wake-fan-out path: the picker landed
+	// on a cold bucket and the handler asks schedd to wake
+	// that specific deployment so the retry Pick has a
+	// routable Target.
+	//
+	// On the admitted path wakeID is non-empty, the new
+	// Target is cached, and method reflects what schedd
+	// actually did (restore or cold boot). On the at-capacity
+	// path wakeID is empty, method is WakeMethodUnspecified,
+	// and err is nil. On real failure err is a non-nil
+	// *api.Problem and method is WakeMethodUnspecified.
+	Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
 // Handler is gatewayd's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -1575,8 +1600,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (an instance_changed notification race). On that rare miss, fall
 	// through to the capacity problem — the WakeGate will retry on the
 	// next request.
-	target, ok := h.backend.Pick(app.ID)
-	if !ok {
+	pick := h.backend.Pick(app.ID)
+	// Wake-fan-out (issue #556 / PR-C): when Pick landed on a
+	// cold bucket in a multi-deployment app, signal the handler
+	// via ColdBucket. Admit an instance on that specific
+	// deployment so the retry Pick has a routable Target.
+	// Bounded to ONE admit per request — sustained cold-bucket
+	// hits are recovered via the next deployment_changed notify
+	// that re-seeds the cache.
+	if !pick.OK && pick.ColdBucket != "" {
+		//nolint:contextcheck // request ctx at handler boundary; this is the wake-fan-out retry branch.
+		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, limits.MaxConcurrency); err != nil {
+			// Log-and-continue: the existing "warmest bucket"
+			// fallback inside Pick already handled the
+			// fallback path. Failure here means the cold
+			// bucket won't wake this request — the next
+			// notify will refresh weights.
+			h.log.Warn("apid: wake-fan-out admit failed", "err", err, "deployment_id", pick.ColdBucket)
+		}
+		pick = h.backend.Pick(app.ID)
+	}
+	if !pick.OK {
 		// Race: every cached instance was evicted between
 		// ensureCapacity returning and our Pick. Surface the observed
 		// (current) HealthyCount so the operator's metrics panel
@@ -1585,6 +1629,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
+	target := pick.Target
 
 	// Stamp the per-instance identity on the request BEFORE proxying so
 	// the per-node vmmd forwarder (issue #98 / ADR-028) can attribute
@@ -2361,7 +2406,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 		// atomically checks HealthyCount < maxConcurrency under its
 		// own lock, so concurrent callers cannot collectively
 		// exceed the cap.
-		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
+		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
 		if e != nil {
 			return false, "", WakeMethodUnspecified, e
 		}
@@ -2388,7 +2433,7 @@ func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency in
 			return h.backend.HealthyCount(appID) < maxConcurrency
 		},
 		func(ctx context.Context) error {
-			id, m, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
+			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
 			if e != nil {
 				return e
 			}

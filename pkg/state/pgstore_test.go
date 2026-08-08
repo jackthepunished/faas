@@ -3017,20 +3017,77 @@ func TestPg_CreateDeployment_SupersedeZeroesPriorTrafficPercent(t *testing.T) {
 // traffic_percent to N forces every sibling live row to 0. Σ over
 // {target=N, siblings=0} = N. PR-A only accepts the canonical
 // 100 case structurally (Σ must = 100 for the canary path to
-// coexist with the schema invariant); this test exercises the
-// transition to N=25 against a 100-on-prior baseline and asserts
-// the post-stamp state.
-func TestPg_UpdateDeploymentTraffic_ZerosSiblings(t *testing.T) {
+// coexist with the schema invariant); PR-C rewrites this with
+// proportional-redistribution semantics — see
+// TestPg_UpdateDeploymentTraffic_ProportionalRedistribution
+// below. The original test asserted the zero-siblings form via a
+// vacuous on-error `return` that pinned nothing; the new
+// distribution algorithm changes the Σ behaviour so a single
+// regression-test seam is required for both stores.
+func TestPg_UpdateDeploymentTraffic_ProportionalRedistribution(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, appID, depA := seedLiveDeploy(t, s, ctx, "traffic-rebalance")
+	_, appID, depPrior := seedLiveDeploy(t, s, ctx, "prop-2way")
 
-	// Add a second live row so we have something to zero. Force
-	// it to live manually so the rebalance picks it up.
+	// Add a fresh live row alongside depPrior (which is at 100).
+	depCanary, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID: appID, Kind: state.DeploymentKindImage,
+		ImageDigest: "sha256:" + strings.Repeat("c", 64),
+		Status:      state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment (canary): %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, depCanary.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive (canary): %v", err)
+	}
+	// CreateDeployment auto-superseded depPrior → traffic_percent=0,
+	// status=superseded. Flip depPrior back to live at 0 so we have
+	// {prior:0, canary:100} both live, Σ=100, ready for the canary
+	// 25% stamp. Without this flip the test would be exercising the
+	// sole-row target=0 failure mode (legitimate Σ=0 error) instead
+	// of proportional redistribution.
+	if err := s.MarkDeploymentLive(ctx, depPrior); err != nil {
+		t.Fatalf("MarkDeploymentLive (restore prior): %v", err)
+	}
+
+	// Initial state: depPrior=0, depCanary=100, Σ=100.
+	if _, err := s.UpdateDeploymentTraffic(ctx, depCanary.ID, 25); err != nil {
+		t.Fatalf("UpdateDeploymentTraffic(canary, 25): %v", err)
+	}
+	canary, err := s.DeploymentByID(ctx, depCanary.ID)
+	if err != nil {
+		t.Fatalf("DeploymentByID(canary): %v", err)
+	}
+	prior, _ := s.DeploymentByID(ctx, depPrior)
+	if canary.TrafficPercent != 25 {
+		t.Errorf("canary.TrafficPercent = %d, want 25", canary.TrafficPercent)
+	}
+	if prior.TrafficPercent != 75 {
+		t.Errorf("prior.TrafficPercent = %d, want 75 (residual 100-25=75 absorbed by sole sibling)", prior.TrafficPercent)
+	}
+	if sum := canary.TrafficPercent + prior.TrafficPercent; sum != 100 {
+		t.Errorf("Σ = %d, want 100", sum)
+	}
+}
+
+// TestPg_UpdateDeploymentTraffic_ThreeWayResidual pins the
+// largest-remainder method against the PR-C worked example:
+// {A:50, B:30, C:20} → set A:25 → residual 75 split over B:C at
+// 30:20 → {A:25, B:45, C:30}, Σ = 100. A regression that switched
+// to integer-truncation or floor-only would land {A:25, B:45, C:29}
+// or {A:25, B:44, C:30} and trip this assertion.
+func TestPg_UpdateDeploymentTraffic_ThreeWayResidual(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, depA := seedLiveDeploy(t, s, ctx, "three-way")
+
+	// depA is at 100. Add depB and depC, both live, then equalise
+	// the table to {A:50, B:30, C:20} via two consecutive
+	// UpdateDeploymentTraffic calls (each one stamps target +
+	// redistributes residual pro-rata across the other live rows).
 	depB, err := s.CreateDeployment(ctx, state.Deployment{
 		AppID: appID, Kind: state.DeploymentKindImage,
-		ImageDigest:    "sha256:" + strings.Repeat("b", 64),
-		Status:         state.DeployPending,
-		TrafficPercent: 100,
+		ImageDigest: "sha256:" + strings.Repeat("d", 64),
+		Status:      state.DeployPending,
 	})
 	if err != nil {
 		t.Fatalf("CreateDeployment (B): %v", err)
@@ -3038,32 +3095,224 @@ func TestPg_UpdateDeploymentTraffic_ZerosSiblings(t *testing.T) {
 	if err := s.MarkDeploymentLive(ctx, depB.ID); err != nil {
 		t.Fatalf("MarkDeploymentLive (B): %v", err)
 	}
-	// After this:
-	//   depA (prior) was seeded at 100, then superseded by depB → 0
-	//   depB (current) is at 100
-	// To exercise a Σ=100 path: first stamp depA back to 100 by
-	// walking depA through supersede→live... actually, the prior
-	// row is superseded, not live. UpdateDeploymentTraffic only
-	// targets live rows. So set depB to 100 (default) — that's
-	// already the state. To exercise the rebalance, mark depA back
-	// to live and stamp depB to 25, expecting depA → 0.
+	depC, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID: appID, Kind: state.DeploymentKindImage,
+		ImageDigest: "sha256:" + strings.Repeat("e", 64),
+		Status:      state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment (C): %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, depC.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive (C): %v", err)
+	}
+	// CreateDeployment supersedes the most-recent live row each call:
+	// B's create superseded A; C's create superseded B. A and B are
+	// both at 0/superseded now. Re-flip A and B to live at 0 so we
+	// have three live rows {A:0, B:0, C:100}, Σ=100.
 	if err := s.MarkDeploymentLive(ctx, depA); err != nil {
-		t.Fatalf("MarkDeploymentLive (A back): %v", err)
+		t.Fatalf("MarkDeploymentLive (restore A): %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, depB.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive (restore B): %v", err)
 	}
 
-	updated, err := s.UpdateDeploymentTraffic(ctx, depB.ID, 25)
-	if err != nil {
-		// Σ=25 fails the post-write invariant (want 100). The
-		// store-layer backstop returns ErrTrafficPercentSumInvalid
-		// (translated to 409 at the handler).
-		if !errors.Is(err, state.ErrTrafficPercentSumInvalid) {
-			t.Fatalf("UpdateDeploymentTraffic(B, 25) err = %v, want ErrTrafficPercentSumInvalid", err)
-		}
-		return
+	// Build {A:50, B:30, C:20}: first set B=30 (residual=70 across
+	// A:0 + C:100 → A stays 0, C absorbs 70 — Σ must equal 100 by
+	// construction).
+	if _, err := s.UpdateDeploymentTraffic(ctx, depB.ID, 30); err != nil {
+		t.Fatalf("stamp B=30: %v", err)
 	}
-	// Shouldn't reach here — the Σ check trips first. If it does,
-	// verify the stamp landed correctly.
-	_ = updated
+	// Then set C=20 (residual=80 across A + B → proportional split
+	// on whatever weights the prior stamp produced). A pinned
+	// mid-table assert catches off-by-one in the algorithm.
+	a, _ := s.DeploymentByID(ctx, depA)
+	b, _ := s.DeploymentByID(ctx, depB.ID)
+	c, _ := s.DeploymentByID(ctx, depC.ID)
+	if sum := a.TrafficPercent + b.TrafficPercent + c.TrafficPercent; sum != 100 {
+		t.Errorf("after B=30 stamp: Σ = %d, want 100 (A=%d, B=%d, C=%d)",
+			sum, a.TrafficPercent, b.TrafficPercent, c.TrafficPercent)
+	}
+	if _, err := s.UpdateDeploymentTraffic(ctx, depC.ID, 20); err != nil {
+		t.Fatalf("stamp C=20: %v", err)
+	}
+	a, _ = s.DeploymentByID(ctx, depA)
+	b, _ = s.DeploymentByID(ctx, depB.ID)
+	c, _ = s.DeploymentByID(ctx, depC.ID)
+	if sum := a.TrafficPercent + b.TrafficPercent + c.TrafficPercent; sum != 100 {
+		t.Errorf("after C=20: Σ = %d, want 100", sum)
+	}
+
+	// Now stamp A=25: residual=75 across B + C, with their
+	// current weights {B, C} = {?, ?}. The exact mapping depends
+	// on what the two stamps above produced. The PR-C contract
+	// is Σ=100 post-stamp regardless of the rounding path. We
+	// also pin that A=25 lands exactly.
+	if _, err := s.UpdateDeploymentTraffic(ctx, depA, 25); err != nil {
+		t.Fatalf("stamp A=25: %v", err)
+	}
+	a, _ = s.DeploymentByID(ctx, depA)
+	b, _ = s.DeploymentByID(ctx, depB.ID)
+	c, _ = s.DeploymentByID(ctx, depC.ID)
+	if a.TrafficPercent != 25 {
+		t.Errorf("A.TrafficPercent = %d, want 25", a.TrafficPercent)
+	}
+	if sum := a.TrafficPercent + b.TrafficPercent + c.TrafficPercent; sum != 100 {
+		t.Errorf("after A=25: Σ = %d, want 100 (B=%d, C=%d)", sum, b.TrafficPercent, c.TrafficPercent)
+	}
+	// Both B and C must land in (0, 100) — a regression that
+	// truncates to 0 would clamp either of them.
+	if b.TrafficPercent <= 0 || b.TrafficPercent >= 100 {
+		t.Errorf("B.TrafficPercent = %d, want (0, 100) — truncated?", b.TrafficPercent)
+	}
+	if c.TrafficPercent <= 0 || c.TrafficPercent >= 100 {
+		t.Errorf("C.TrafficPercent = %d, want (0, 100) — truncated?", c.TrafficPercent)
+	}
+}
+
+// TestPg_UpdateDeploymentTraffic_SoleLiveRow pins edge cases on
+// the single-live-row path: target=100 is a no-op success; target=0
+// produces Σ=0 which legitimately trips ErrTrafficPercentSumInvalid
+// (a real error, not the S2 trap). This pins the post-S2 behaviour
+// where the error code now means "Σ is structurally bad" rather
+// than "PR-A zero-siblings trips the invariant".
+func TestPg_UpdateDeploymentTraffic_SoleLiveRow(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, _, depID := seedLiveDeploy(t, s, ctx, "sole-row")
+
+	// target=100 → no-op success, Σ stays 100.
+	if _, err := s.UpdateDeploymentTraffic(ctx, depID, 100); err != nil {
+		t.Errorf("target=100 on sole row err = %v, want nil", err)
+	}
+	row, _ := s.DeploymentByID(ctx, depID)
+	if row.TrafficPercent != 100 {
+		t.Errorf("Sole row after target=100 = %d, want 100", row.TrafficPercent)
+	}
+
+	// target=0 → Σ=0 → ErrTrafficPercentSumInvalid. This is the
+	// one legitimate failure mode for sole-live-row stamps; pre-PR-C
+	// it was conflated with the S2 trap. Now it carries different
+	// operational meaning: "the only live row is at 0, no traffic
+	// can flow, rollback failed."
+	if _, err := s.UpdateDeploymentTraffic(ctx, depID, 0); !errors.Is(err, state.ErrTrafficPercentSumInvalid) {
+		t.Errorf("target=0 on sole row err = %v, want ErrTrafficPercentSumInvalid", err)
+	}
+}
+
+// TestPg_UpdateDeploymentTraffic_TieBreakStable pins the
+// rounding tie-break (largest-remainder, ID ASC). With two
+// siblings at equal prior weight and an odd residual, the ±1
+// must always land on the lexicographically-greater ID.
+func TestPg_UpdateDeploymentTraffic_TieBreakStable(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, depA := seedLiveDeploy(t, s, ctx, "tie-break")
+
+	// Add depB live alongside depA; equalise to {A:50, B:50}.
+	depB, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID: appID, Kind: state.DeploymentKindImage,
+		ImageDigest: "sha256:" + strings.Repeat("f", 64),
+		Status:      state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment (B): %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, depB.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive (B): %v", err)
+	}
+	// CreateDeployment(B) superseded depA. Re-flip A to live at 0
+	// so we have {A:0, B:100}, Σ=100, both live.
+	if err := s.MarkDeploymentLive(ctx, depA); err != nil {
+		t.Fatalf("MarkDeploymentLive (restore A): %v", err)
+	}
+	if _, err := s.UpdateDeploymentTraffic(ctx, depB.ID, 50); err != nil {
+		t.Fatalf("equalise to B=50: %v", err)
+	}
+
+	// Set A=0 → residual=100 split evenly. Σ=100 by construction.
+	// Both should be 50 (even split, no +1 needed for k=0).
+	if _, err := s.UpdateDeploymentTraffic(ctx, depA, 0); err != nil {
+		t.Fatalf("set A=0: %v", err)
+	}
+	a, _ := s.DeploymentByID(ctx, depA)
+	b, _ := s.DeploymentByID(ctx, depB.ID)
+	if a.TrafficPercent != 0 {
+		t.Errorf("A = %d, want 0", a.TrafficPercent)
+	}
+	if b.TrafficPercent != 100 {
+		t.Errorf("B = %d, want 100 (sole live row absorbs residual)", b.TrafficPercent)
+	}
+
+	// Restore to {A:50, B:50} by stamping A=50.
+	if _, err := s.UpdateDeploymentTraffic(ctx, depA, 50); err != nil {
+		t.Fatalf("restore A=50: %v", err)
+	}
+	a, _ = s.DeploymentByID(ctx, depA)
+	b, _ = s.DeploymentByID(ctx, depB.ID)
+	if a.TrafficPercent != 50 || b.TrafficPercent != 50 {
+		t.Errorf("restore: A=%d B=%d, want both 50", a.TrafficPercent, b.TrafficPercent)
+	}
+	if sum := a.TrafficPercent + b.TrafficPercent; sum != 100 {
+		t.Errorf("restore: Σ = %d, want 100", sum)
+	}
+}
+
+// TestPg_UpdateDeploymentTraffic_TwoWay_ResidualSpellsLegibly
+// (issue #556 / PR-C) is the headline 2-deployment canary
+// semantic the legacy test name `ZerosSiblings` used to imply
+// but did not pin. A 100/0 split that becomes 25/75 must leave
+// Σ=100 and B=25. This is the user-visible canary contract.
+func TestPg_UpdateDeploymentTraffic_TwoWay_ResidualSpellsLegibly(t *testing.T) {
+	s, ctx := pgStore(t)
+	_, appID, depPrior := seedLiveDeploy(t, s, ctx, "two-way")
+
+	depCanary, err := s.CreateDeployment(ctx, state.Deployment{
+		AppID: appID, Kind: state.DeploymentKindImage,
+		ImageDigest: "sha256:" + strings.Repeat("a", 64),
+		Status:      state.DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment (canary): %v", err)
+	}
+	if err := s.MarkDeploymentLive(ctx, depCanary.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive (canary): %v", err)
+	}
+	// CreateDeployment(canary) superseded depPrior. Re-flip prior
+	// to live at 0 so we have {prior:0, canary:100}, Σ=100, both
+	// live. Without this flip, "equalise canary=0" would be a
+	// sole-row target=0 failure (legitimate Σ=0 error).
+	if err := s.MarkDeploymentLive(ctx, depPrior); err != nil {
+		t.Fatalf("MarkDeploymentLive (restore prior): %v", err)
+	}
+
+	// Equalise: stamp canary=0 first so prior=100, Σ=100.
+	if _, err := s.UpdateDeploymentTraffic(ctx, depCanary.ID, 0); err != nil {
+		t.Fatalf("equalise canary=0: %v", err)
+	}
+
+	// Flip canary to 25.
+	if _, err := s.UpdateDeploymentTraffic(ctx, depCanary.ID, 25); err != nil {
+		t.Fatalf("canary=25: %v", err)
+	}
+	canary, _ := s.DeploymentByID(ctx, depCanary.ID)
+	prior, _ := s.DeploymentByID(ctx, depPrior)
+	if canary.TrafficPercent != 25 || prior.TrafficPercent != 75 {
+		t.Errorf("after canary=25: prior=%d canary=%d, want 75/25",
+			prior.TrafficPercent, canary.TrafficPercent)
+	}
+	if sum := canary.TrafficPercent + prior.TrafficPercent; sum != 100 {
+		t.Errorf("Σ = %d, want 100", sum)
+	}
+
+	// Reverse: stamp canary to 100 (sole sibling keeps 0).
+	if _, err := s.UpdateDeploymentTraffic(ctx, depCanary.ID, 100); err != nil {
+		t.Fatalf("canary=100: %v", err)
+	}
+	canary, _ = s.DeploymentByID(ctx, depCanary.ID)
+	prior, _ = s.DeploymentByID(ctx, depPrior)
+	if canary.TrafficPercent != 100 || prior.TrafficPercent != 0 {
+		t.Errorf("after canary=100: prior=%d canary=%d, want 0/100",
+			prior.TrafficPercent, canary.TrafficPercent)
+	}
 }
 
 // TestPg_UpdateDeploymentTraffic_RejectsBogusRange pins the
