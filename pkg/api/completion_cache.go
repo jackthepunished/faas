@@ -178,14 +178,14 @@ func (c *CompletionCache) readLocked() (CompletionCacheEntry, time.Time, error) 
 	if err := json.Unmarshal(data, &e); err != nil {
 		// Corrupt cache — treat as missing. Don't surface the error
 		// to the user; the next refresh overwrites.
-		return CompletionCacheEntry{}, time.Time{}, nil
+		return CompletionCacheEntry{}, time.Time{}, nil //nolint:nilerr
 	}
 	if e.Version != completionCacheVersion {
 		return CompletionCacheEntry{}, time.Time{}, nil
 	}
 	st, err := os.Stat(path)
 	if err != nil {
-		return CompletionCacheEntry{}, time.Time{}, nil
+		return CompletionCacheEntry{}, time.Time{}, nil //nolint:nilerr
 	}
 	return e, st.ModTime(), nil
 }

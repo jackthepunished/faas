@@ -66,11 +66,11 @@ func cmdCompletion(args []string) int {
 	case "powershell":
 		return cmdCompletionPowershell()
 	case "completion-cache-path":
-		fmt.Fprintln(osStdout, cachePathForScripts())
+		_, _ = fmt.Fprintln(osStdout, cachePathForScripts())
 		return 0
 	case "completion-cache-list":
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "gregale completion completion-cache-list: missing <kind>")
+			_, _ = fmt.Fprintln(os.Stderr, "gregale completion completion-cache-list: missing <kind>")
 			return 1
 		}
 		return cmdCompletionCacheList(args[1])
@@ -92,9 +92,9 @@ func cmdCompletionCacheList(kind string) int {
 	}
 	var recs []api.CompletionCacheRecord
 	switch kind {
-	case "apps":
+	case dispatchApps:
 		recs = entry.Apps
-	case "orgs":
+	case dispatchOrgs:
 		recs = entry.Orgs
 	default:
 		return 0
@@ -103,7 +103,7 @@ func cmdCompletionCacheList(kind string) int {
 		if r.Slug == "" {
 			continue
 		}
-		fmt.Fprintln(osStdout, r.Slug)
+		_, _ = fmt.Fprintln(osStdout, r.Slug)
 	}
 	return 0
 }

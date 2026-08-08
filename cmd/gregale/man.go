@@ -78,8 +78,8 @@ func lookupCliCommand(name string) (cliCommand, bool) {
 func renderManTop(w io.Writer) {
 	manHeader(w, "GREGALE(1)", "gregale Manual", manSourceBrand)
 	manSection(w, "NAME", func(w io.Writer) {
-		fmt.Fprintln(w, ".B gregale")
-		fmt.Fprintln(w, "\\- deploy apps and functions that scale to zero")
+		_, _ = fmt.Fprintln(w, ".B gregale")
+		_, _ = fmt.Fprintln(w, "\\- deploy apps and functions that scale to zero")
 	})
 	manSection(w, "SYNOPSIS", func(w io.Writer) {
 		fmt.Fprintln(w, ".B gregale")
@@ -128,13 +128,13 @@ func renderManTop(w io.Writer) {
 		fmt.Fprintln(w, ".RE")
 	})
 	manSection(w, "SEE ALSO", func(w io.Writer) {
-		fmt.Fprintf(w, ".UR %scompletion\n", docsURLBase)
-		fmt.Fprintln(w, "gregale completion (bash|zsh|fish|powershell)")
-		fmt.Fprintln(w, ".UE")
-		fmt.Fprintln(w, ".PP")
-		fmt.Fprintf(w, ".UR %s\n", docsURLBase)
-		fmt.Fprintln(w, "gregale docs")
-		fmt.Fprintln(w, ".UE")
+		_, _ = fmt.Fprintf(w, ".UR %scompletion\n", docsURLBase)
+		_, _ = fmt.Fprintln(w, "gregale completion (bash|zsh|fish|powershell)")
+		_, _ = fmt.Fprintln(w, ".UE")
+		_, _ = fmt.Fprintln(w, ".PP")
+		_, _ = fmt.Fprintf(w, ".UR %s\n", docsURLBase)
+		_, _ = fmt.Fprintln(w, "gregale docs")
+		_, _ = fmt.Fprintln(w, ".UE")
 	})
 	manFooter(w)
 }
@@ -146,16 +146,16 @@ func renderManCommand(w io.Writer, c cliCommand) {
 	// expect to grep `gregale` (lowercase) across every page.
 	manHeader(w, "GREGALE-"+strings.ToUpper(c.Name)+"(1)", "gregale "+c.Name+" Manual", manSourceBrand)
 	manSection(w, "NAME", func(w io.Writer) {
-		fmt.Fprintf(w, ".B gregale-%s\n", c.Name)
-		fmt.Fprintf(w, "\\- %s\n", escapeRoff(c.Short))
+		_, _ = fmt.Fprintf(w, ".B gregale-%s\n", c.Name)
+		_, _ = fmt.Fprintf(w, "\\- %s\n", escapeRoff(c.Short))
 	})
 	manSection(w, "SYNOPSIS", func(w io.Writer) {
-		fmt.Fprintf(w, ".B gregale %s\n", c.Name)
+		_, _ = fmt.Fprintf(w, ".B gregale %s\n", c.Name)
 		for _, s := range c.Subcommands {
-			fmt.Fprintf(w, ".RI [ %s ]\n", s.Name)
+			_, _ = fmt.Fprintf(w, ".RI [ %s ]\n", s.Name)
 		}
 		for _, p := range c.Positionals {
-			fmt.Fprintf(w, ".RI %s\n", p)
+			_, _ = fmt.Fprintf(w, ".RI %s\n", p)
 		}
 		for _, f := range c.Flags {
 			// Required flags lose the surrounding brackets so the
@@ -163,12 +163,12 @@ func renderManCommand(w io.Writer, c cliCommand) {
 			// glance — the conventional groff marker for "no brackets
 			// means required".
 			if f.Req {
-				fmt.Fprintf(w, ".RI --%s ", f.Name)
-				fmt.Fprint(w, ".IR value\n")
+				_, _ = fmt.Fprintf(w, ".RI --%s ", f.Name)
+				_, _ = fmt.Fprint(w, ".IR value\n")
 			} else {
-				fmt.Fprintf(w, ".RI [ --%s ", f.Name)
-				fmt.Fprint(w, ".IR value ")
-				fmt.Fprint(w, "]\n")
+				_, _ = fmt.Fprintf(w, ".RI [ --%s ", f.Name)
+				_, _ = fmt.Fprint(w, ".IR value ")
+				_, _ = fmt.Fprint(w, "]\n")
 			}
 		}
 	})
