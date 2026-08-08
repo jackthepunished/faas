@@ -576,13 +576,11 @@ func TestSourceDeployWakeMetal(t *testing.T) {
 			t.Fatalf("create function app: status=%d", got)
 		}
 		funcAppID := mustGetAppID(t, h, key, "srcfunc")
-		// Set the function-tier runtime on the row so the
-		// multipart validator in cmd/apid/deploy_inputs.go:144
-		// accepts the deployment.
-		if _, err := pool.Exec(context.Background(),
-			`update apps set runtime = $1 where id = $2`, "node22", funcAppID); err != nil {
-			t.Fatalf("set function runtime: %v", err)
-		}
+		// apps.runtime is already set by the CreateApp call above
+		// (cmd/apid/handlers.go:202 stamps req.Runtime onto the row).
+		// No direct SQL update needed — the multipart validator at
+		// cmd/apid/deploy_inputs.go:144 reads apps.runtime to
+		// accept the function deploy.
 
 		// Tarball content: a single handler.js. Pack with the
 		// same NodeFixture helper but rename the inner file to

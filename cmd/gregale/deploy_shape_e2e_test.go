@@ -35,7 +35,7 @@ func TestResolveDeployShape_Function(t *testing.T) {
 	osStdout = &buf
 	defer func() { osStdout = oldOut }()
 
-	sh, rt, hnd, err := resolveDeployShape(dir, false, false)
+	sh, rt, hnd, err := resolveDeployShape(dir, false, false, false)
 	if err != nil {
 		t.Fatalf("resolveDeployShape: %v", err)
 	}
@@ -55,6 +55,49 @@ func TestResolveDeployShape_Function(t *testing.T) {
 	}
 }
 
+// TestResolveDeployShape_JSONSuppressesPrint pins the §3.2 --json
+// contract: when a customer runs `gregale deploy --json` on a
+// handler.js-only cwd, stdout must remain a parseable JSON stream.
+// resolveDeployShape must NOT write "Detected: function, ..." to
+// stdout in that mode — that line would land before the deploy
+// response's JSON and break `gregale deploy --json | jq`. The
+// shape is still resolved (the wire is unchanged), only the
+// customer-visible banner is suppressed.
+func TestResolveDeployShape_JSONSuppressesPrint(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		sh    shape
+	}{
+		{"function", []string{"handler.js"}, shapeFunction},
+		{"app", []string{"package.json"}, shapeApp},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			var buf bytes.Buffer
+			oldOut := osStdout
+			osStdout = &buf
+			defer func() { osStdout = oldOut }()
+
+			// jsonOutput=true is the load-bearing flag for this test.
+			sh, _, _, err := resolveDeployShape(dir, false, false, true)
+			if err != nil {
+				t.Fatalf("resolveDeployShape: %v", err)
+			}
+			if sh != tc.sh {
+				t.Errorf("shape = %d, want %d", sh, tc.sh)
+			}
+			if strings.Contains(buf.String(), "Detected:") {
+				t.Errorf("stdout must not contain Detected: line under jsonOutput=true; got %q", buf.String())
+			}
+		})
+	}
+}
+
 // TestResolveDeployShape_App pins the app-shape print line: a cwd
 // containing package.json must produce the
 // "Detected: app, framework=node" line. The framework name comes
@@ -69,7 +112,7 @@ func TestResolveDeployShape_App(t *testing.T) {
 	osStdout = &buf
 	defer func() { osStdout = oldOut }()
 
-	sh, _, _, err := resolveDeployShape(dir, false, false)
+	sh, _, _, err := resolveDeployShape(dir, false, false, false)
 	if err != nil {
 		t.Fatalf("resolveDeployShape: %v", err)
 	}
@@ -95,7 +138,7 @@ func TestResolveDeployShape_Unknown(t *testing.T) {
 	osStdout = &buf
 	defer func() { osStdout = oldOut }()
 
-	sh, _, _, err := resolveDeployShape(dir, false, false)
+	sh, _, _, err := resolveDeployShape(dir, false, false, false)
 	if err == nil {
 		t.Fatalf("resolveDeployShape on empty dir should error; got shape=%d", sh)
 	}
@@ -131,7 +174,7 @@ func TestResolveDeployShape_ExplicitFunctionForcesFunction(t *testing.T) {
 	osStdout = &buf
 	defer func() { osStdout = oldOut }()
 
-	sh, rt, hnd, err := resolveDeployShape(dir, true, false)
+	sh, rt, hnd, err := resolveDeployShape(dir, true, false, false)
 	if err != nil {
 		t.Fatalf("resolveDeployShape(--function): %v", err)
 	}
@@ -162,7 +205,7 @@ func TestResolveDeployShape_ExplicitAppForcesApp(t *testing.T) {
 	osStdout = &buf
 	defer func() { osStdout = oldOut }()
 
-	sh, _, _, err := resolveDeployShape(dir, false, true)
+	sh, _, _, err := resolveDeployShape(dir, false, true, false)
 	if err != nil {
 		t.Fatalf("resolveDeployShape(--app): %v", err)
 	}
@@ -200,7 +243,7 @@ func TestResolveDeployShape_FunctionRuntimes(t *testing.T) {
 			osStdout = &buf
 			defer func() { osStdout = oldOut }()
 
-			sh, rt, hnd, err := resolveDeployShape(dir, false, false)
+			sh, rt, hnd, err := resolveDeployShape(dir, false, false, false)
 			if err != nil {
 				t.Fatalf("resolveDeployShape: %v", err)
 			}
@@ -216,6 +259,131 @@ func TestResolveDeployShape_FunctionRuntimes(t *testing.T) {
 			wantSub := "Detected: function, runtime=" + tc.wantRt + ", handler=handler.handler"
 			if !strings.Contains(buf.String(), wantSub) {
 				t.Errorf("stdout missing %q; got %q", wantSub, buf.String())
+			}
+		})
+	}
+}
+
+// TestBuildCreateRequest pins the CreateAppRequest wire-shape contract
+// for issue #737 / ADR-083. The headline regression it catches: an
+// auto-detected function cwd (handler.js-only) where buildCreateRequest
+// sets Type="function" but leaves Runtime="" — apid's buildApp
+// validator (cmd/apid/handlers.go:98) would then 400 the request with
+// "Invalid runtime, functions require runtime node22, ...". The
+// customer would see "Detected: function, runtime=node22, ..." followed
+// by "Could not create app: Invalid runtime ..." — silently broken.
+func TestBuildCreateRequest(t *testing.T) {
+	tru := true
+	falsy := false
+	cases := []struct {
+		name      string
+		sh        shape
+		runtime   string
+		authnPtr  *bool
+		wantType  string
+		wantRt    string
+		wantAuthn *bool
+	}{
+		// Function path: must propagate BOTH Type and Runtime.
+		// The auto-detect path is the load-bearing case — the
+		// header regression the test pins.
+		{
+			name:     "function_with_runtime",
+			sh:       shapeFunction,
+			runtime:  "node22",
+			wantType: "function",
+			wantRt:   "node22",
+		},
+		{
+			name:     "function_python_runtime",
+			sh:       shapeFunction,
+			runtime:  "python312",
+			wantType: "function",
+			wantRt:   "python312",
+		},
+		// Function with empty runtime — Type is still set, but
+		// Runtime stays empty so apid's validator surfaces a
+		// clear "Invalid runtime" 400 (better than a silent
+		// server-side type guess).
+		{
+			name:     "function_empty_runtime",
+			sh:       shapeFunction,
+			runtime:  "",
+			wantType: "function",
+			wantRt:   "",
+		},
+		// App path: Type stays empty (apid treats as "app"); no
+		// function fields leak onto the wire.
+		{
+			name:     "app_no_function_fields",
+			sh:       shapeApp,
+			runtime:  "",
+			wantType: "",
+			wantRt:   "",
+		},
+		// App path with runtime incidentally set — must NOT
+		// leak onto the wire. The CLI clears *runtime on the
+		// --app path (commands2.go:564-568), so this case
+		// catches a regression where the clear stops working.
+		{
+			name:     "app_with_runtime_still_app",
+			sh:       shapeApp,
+			runtime:  "node22",
+			wantType: "",
+			wantRt:   "",
+		},
+		// RequireAuthn propagation (issue #560) must survive the
+		// helper extraction — explicit true / false / unset.
+		{
+			name:      "function_with_authn_true",
+			sh:        shapeFunction,
+			runtime:   "node22",
+			authnPtr:  &tru,
+			wantType:  "function",
+			wantRt:    "node22",
+			wantAuthn: &tru,
+		},
+		{
+			name:      "app_with_authn_false",
+			sh:        shapeApp,
+			runtime:   "",
+			authnPtr:  &falsy,
+			wantType:  "",
+			wantRt:    "",
+			wantAuthn: &falsy,
+		},
+		{
+			name:      "function_with_authn_unset",
+			sh:        shapeFunction,
+			runtime:   "node22",
+			authnPtr:  nil,
+			wantType:  "function",
+			wantRt:    "node22",
+			wantAuthn: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildCreateRequest("slug", tc.sh, tc.runtime, tc.authnPtr)
+			if got.Slug != "slug" {
+				t.Errorf("Slug = %q, want %q", got.Slug, "slug")
+			}
+			if got.Type != tc.wantType {
+				t.Errorf("Type = %q, want %q", got.Type, tc.wantType)
+			}
+			if got.Runtime != tc.wantRt {
+				t.Errorf("Runtime = %q, want %q", got.Runtime, tc.wantRt)
+			}
+			if tc.wantAuthn == nil {
+				if got.RequireAuthn != nil {
+					t.Errorf("RequireAuthn = %v, want nil (unset)", *got.RequireAuthn)
+				}
+			} else {
+				if got.RequireAuthn == nil {
+					t.Errorf("RequireAuthn = nil, want %v", *tc.wantAuthn)
+				} else if *got.RequireAuthn != *tc.wantAuthn {
+					t.Errorf("RequireAuthn = %v, want %v", *got.RequireAuthn, *tc.wantAuthn)
+				}
 			}
 		})
 	}

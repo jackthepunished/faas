@@ -140,6 +140,22 @@ func TestDetectShape(t *testing.T) {
 		{"readme_only", []string{"README.md"}, shapeUnknown},
 		{"notes_only", []string{"notes.txt"}, shapeUnknown},
 		{"missing_dir_is_unknown", nil, shapeUnknown}, // caller passes non-existent path → ReadDir errors
+
+		// Issue #737 / ADR-083 / macOS APFS (case-insensitive by
+		// default): capital-H handler files must still resolve to
+		// shapeFunction. Pinned against the regression where
+		// functionHandlerFiles lookup was case-sensitive while the
+		// app-marker switch used strings.ToLower — silent shapeUnknown
+		// on a project that would have deployed end-to-end.
+		{"handler_capital_JS", []string{"Handler.JS"}, shapeFunction},
+		{"handler_capital_py", []string{"Handler.PY"}, shapeFunction},
+		{"handler_mixed_Go", []string{"HANDLER.go"}, shapeFunction},
+		{"handler_capital_with_readme", []string{"Handler.js", "README.md"}, shapeFunction},
+		// Mixed-case app markers still resolve to app (this
+		// already worked; kept here so the case-folding parity
+		// between handler and app markers is visible in one place).
+		{"package_json_capital_P", []string{"Package.json"}, shapeApp},
+		{"dockerfile_capital_D", []string{"DOCKERFILE"}, shapeApp},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

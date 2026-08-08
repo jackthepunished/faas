@@ -493,6 +493,45 @@ func cmdAppsRm(args []string) int {
 // opens the dashboard's repo-picker page (slice 8) where the customer binds
 // the repo + branch; subsequent pushes auto-deploy via the webhook path.
 //
+// buildCreateRequest stamps the issue #737 / ADR-083 fields onto the
+// CreateAppRequest the CLI hands to apid. Two non-obvious fields:
+//
+//   - Type: shapeFunction → "function", else "" (apid treats empty
+//     as "app"). Without this, apid stores the row as type=app and
+//     the multipart validator at cmd/apid/deploy_inputs.go:144
+//     rejects the function deploy.
+//
+//   - Runtime: only set when resolvedShape == shapeFunction AND
+//     runtime is non-empty. apid's buildApp validator at
+//     cmd/apid/handlers.go:98 requires Runtime to be in the function
+//     whitelist on a function-typed app; an empty Runtime trips a
+//     400 between the "Detected: function, ..." line and the
+//     multipart upload, which would silently break the headline
+//     auto-detection feature. The auto-detect path always populates
+//     runtime via inferFunctionRuntime before this is called; the
+//     explicit --function --tarball path relies on the explicit
+//     --runtime flag, with --handler defaulting to "handler.handler"
+//     (defaultTemplateHandler, commands2.go:48).
+func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *bool) api.CreateAppRequest {
+	req := api.CreateAppRequest{
+		Slug:         slug,
+		RequireAuthn: requireAuthnPtr,
+	}
+	if sh == shapeFunction {
+		req.Type = "function"
+		if runtime != "" {
+			req.Runtime = runtime
+		}
+	}
+	return req
+}
+
+// cmdDeployTarball implements `gregale deploy` (image / tarball / repo
+// / template / zero-config). Zero-config (issue #313) packs the cwd
+// and proceeds down the --tarball path. Issue #737 / ADR-083 added the
+// function-vs-app auto-detect on the zero-config path and the
+// --function / --app explicit-shape flags.
+//
 // `--template NAME` materializes one of the eleven embedded starter
 // projects (cmd/gregale/templates/embed.go) into a tempdir, tars+gzip it,
 // and proceeds down the --tarball path. For the function templates
@@ -726,7 +765,7 @@ func cmdDeployTarball(args []string) int {
 		// response from the CLI is the deploy shape. An explicit
 		// --function / --app short-circuits the detector — see the
 		// mutex block above.
-		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app)
+		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
 		if err != nil {
 			return printErr("No deployable source found in "+filepath.Base(cwd), err)
 		}
@@ -852,18 +891,7 @@ func cmdDeployTarball(args []string) int {
 		return 0
 	}
 
-	createReq := api.CreateAppRequest{
-		Slug:         slug,
-		RequireAuthn: requireAuthnPtr,
-	}
-	// Issue #737 / ADR-083: when the cwd auto-detector or the
-	// explicit --function flag picked function mode, set Type on
-	// the wire so the apid row lands as type=function. shapeApp is
-	// the default (CreateAppRequest.Type="" is treated as "app" by
-	// the server), so we only set it on the function path.
-	if resolvedShape == shapeFunction {
-		createReq.Type = "function"
-	}
+	createReq := buildCreateRequest(slug, resolvedShape, *runtime, requireAuthnPtr)
 	if _, err := client.CreateApp(ctx, createReq); err != nil {
 		var ae *APIError
 		if !errors.As(err, &ae) || ae.Problem.Status != 409 {

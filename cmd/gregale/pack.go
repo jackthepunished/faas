@@ -201,7 +201,7 @@ func detectShape(srcDir string) shape {
 			"pipfile", "setup.py", "go.mod", "dockerfile":
 			hasAppMarker = true
 		}
-		if functionHandlerFiles[name] {
+		if functionHandlerFiles[strings.ToLower(name)] {
 			// Second handler.* wins means the shape is ambiguous —
 			// fall through to shapeApp (any co-located handler that
 			// isn't a single, named handler.js signals "this is a
@@ -210,7 +210,7 @@ func detectShape(srcDir string) shape {
 				hasAppMarker = true
 				continue
 			}
-			handlerFile = name
+			handlerFile = strings.ToLower(name)
 		}
 	}
 	switch {
@@ -250,11 +250,11 @@ func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
 		if e.IsDir() {
 			continue
 		}
-		if functionHandlerFiles[e.Name()] {
+		if functionHandlerFiles[strings.ToLower(e.Name())] {
 			if picked != "" {
 				return "", "", false // ambiguous — multiple handlers
 			}
-			picked = e.Name()
+			picked = strings.ToLower(e.Name())
 		}
 	}
 	if picked == "" {
@@ -431,6 +431,11 @@ func copyRegular(tw *tar.Writer, abs string) error {
 	return nil
 }
 
+// buildCreateRequest stamps the issue #737 / ADR-083 fields onto the
+// CreateAppRequest the CLI hands to apid. Lives in commands2.go (next
+// to the caller) so the function-testable wire-shape contract stays
+// in one file; tests in commands2_test.go exercise it directly.
+
 // resolveDeployShape runs the cwd detector and emits the customer-visible
 // "Detected: …" line for issue #737 / ADR-083. The print goes BEFORE the
 // multipart POST so the customer's first response from the CLI is the
@@ -443,7 +448,13 @@ func copyRegular(tw *tar.Writer, abs string) error {
 // auto-detects). Allocated to live in pack.go (next to detectShape /
 // inferFunctionRuntime) so the unit test exercises both the wire
 // contract and the print line in one place.
-func resolveDeployShape(srcDir string, explicitFunction, explicitApp bool) (shape, string, string, error) {
+//
+// The print is suppressed when jsonOutput is true: the §3.2 --json
+// contract requires stdout to be a single parseable JSON object, so
+// a freeform "Detected: …" line would corrupt `gregale deploy --json
+// | jq`. The shape is still resolved (the wire shape is the same
+// either way); only the customer-visible banner is gated.
+func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput bool) (shape, string, string, error) {
 	detected := detectShape(srcDir)
 	if explicitFunction {
 		detected = shapeFunction
@@ -469,11 +480,15 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp bool) (shap
 		// Print uses the inferred values — the caller may still
 		// override them via an explicit --runtime / --handler (out of
 		// scope here, but the CLI does it just after this returns).
-		PrintOK(osStdout, "Detected: function, runtime=%s, handler=%s", rt, hnd)
+		if !jsonOutput {
+			PrintOK(osStdout, "Detected: function, runtime=%s, handler=%s", rt, hnd)
+		}
 		return shapeFunction, rt, hnd, nil
 	case shapeApp:
 		fw := detectFramework(srcDir)
-		PrintOK(osStdout, "Detected: app, framework=%s", fw)
+		if !jsonOutput {
+			PrintOK(osStdout, "Detected: app, framework=%s", fw)
+		}
 		return shapeApp, "", "", nil
 	}
 	return shapeUnknown, "", "", fmt.Errorf("internal: resolveDeployShape fell through")
