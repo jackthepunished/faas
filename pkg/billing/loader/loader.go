@@ -5,29 +5,31 @@
 //
 // Lives in its own sub-package (not pkg/billing) because pkg/billing
 // is imported by pkg/billing/{paddle,stripe} and the loader imports
-// those — a same-package location would cycle.
+// those — a same-package location would cycle. PR-P2 keeps that
+// direction-of-imports: the loader imports the providers for the
+// constructors, and the per-provider packages don't import the loader.
 //
 // Two functions (not one) because the Stripe constructor needs
-// stripe.PushDedupe for the meterd path and not for the apid path:
+// state.Store (for the meterd PushDedupe surface) and not for the
+// apid path:
 //
-//   - LoadProviderForAPID returns a paddle.Provider when
-//     FAAS_BILLING_PROVIDER=paddle (and runs EnsurePlanProducts so the
-//     catalog is populated before the first webhook lands); nil + "stripe"
+//   - LoadProviderForAPID returns a paddle.Provider when the active
+//     provider is Paddle (and runs EnsurePlanProducts so the catalog
+//     is populated before the first webhook lands); nil + "stripe"
 //     otherwise. The apid Stripe path stays inline (cmd/apid/server.go
 //     reads FAAS_BILLING_PORTAL_URL + STRIPE_WEBHOOK_SECRET directly,
 //     since apid doesn't need to construct a *stripe.Client — only the
 //     webhook signature check + the billing-portal template URL).
 //
 //   - LoadProviderForMeterd returns a Provider for the meterd pusher
-//     loop. For Stripe, constructs a *stripe.Client with the meterd
-//     PushDedupe so the per-hour dedupe surface is wired. For Paddle,
-//     constructs a *paddle.Provider; meterd doesn't need the webhook
-//     secret (no ingress in meterd) so the second arg is the empty
-//     string.
+//     loop. For Stripe, the builder constructs a *stripe.Client with
+//     the supplied state.Store as the PushDedupe. For Paddle, the
+//     builder constructs a *paddle.Provider; meterd doesn't need the
+//     webhook secret (no ingress in meterd).
 //
-//     FAAS_BILLING_PROVIDER= anything else returns an error so a typo
-//     ("braintree", "paypal") fails the daemon boot loudly rather than
-//     silently defaulting to Stripe.
+//     An unknown FAAS_BILLING_PROVIDER value returns an error so a
+//     typo ("braintree", "paypal") fails the daemon boot loudly
+//     rather than silently defaulting to Stripe.
 //
 // Env vars consumed (all optional except per the per-branch docs):
 //
@@ -37,12 +39,19 @@
 //	FAAS_PADDLE_API_KEY     required when Paddle is the active provider (apid + meterd)
 //	FAAS_PADDLE_WEBHOOK_SECRET  required when Paddle is the active provider (apid only)
 //	FAAS_PADDLE_SANDBOX     "1" / "true" to use api.sandbox.paddle.com (apid + meterd)
+//
+// TOML config precedence: env > TOML > Defaults. The daemon's
+// LoadConfig reads the [billing] block from its TOML file via
+// LoadBillingConfig, then ApplyBillingEnvOverlay writes env values
+// over the TOML-loaded fields. The loader functions below operate
+// on the merged cfg + raw env().
 package loader
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
@@ -58,61 +67,179 @@ const (
 	providerPaddle = "paddle"
 )
 
+// resolveSecret implements the env > TOML precedence for an individual
+// secret. ApplyBillingEnvOverlay populates the cfg surface with the
+// env value when non-empty, but the per-provider closures below are
+// the consumer side — they need to pick the env value when the caller
+// passed it, fall back to the TOML value when env is empty. This is
+// not a second overlay; it's the read side of the same precedence.
+//
+// Why a helper instead of re-reading cfg? The cfg pointer is the
+// merged value after ApplyBillingEnvOverlay, so a closure looking at
+// cfg.Stripe.APIKey cannot tell whether the value came from env or
+// TOML — and the production call site passes the *raw* env reader
+// (the caller already applied the overlay). Using two parallel inputs
+// (env + cfg) keeps the precedence explicit at the closure site.
+func resolveSecret(envVal, tomlVal string) string {
+	if envVal != "" {
+		return envVal
+	}
+	return tomlVal
+}
+
+// resolveSandbox implements the env > TOML precedence for the
+// FAAS_PADDLE_SANDBOX knob. Env spelling accepts "1" / "true" /
+// "0" / "false" / "" (empty = no override, take TOML). TOML is a
+// plain bool (Defaults() leaves it false). The boolean identity is
+// preserved across the merge so a true TOML value remains true when
+// env is unset.
+func resolveSandbox(envVal string, tomlVal bool) bool {
+	switch envVal {
+	case paddleSandboxTrue1, paddleSandboxTrueWord:
+		return true
+	case "0", "false":
+		return false
+	default:
+		return tomlVal
+	}
+}
+
 // ProviderMeta describes one registered billing provider for the
 // admin/CLI surface (GET /v1/admin/billing-provider, `faas billing
-// status`). The Capabilities field is populated by constructing a
-// throwaway provider instance with empty secrets — the constructors
-// are cheap (no network until EnsurePlanProducts / PushUsageRecord)
-// and the static capability set is identical to the live one.
+// status`). The PR-P2 extension adds BuildAPID / BuildMeterd closures
+// so the loader can dispatch to the right provider without a switch.
+//
+// The Build closures return `any` (the concrete provider type) so
+// the per-provider package doesn't need to import pkg/billing — the
+// loader type-asserts the result to billing.Provider before returning
+// to the caller. The compile-time assertion in each provider package
+// (e.g. `var _ billing.Provider = (*Client)(nil)`) guarantees the
+// concrete type satisfies the interface.
 type ProviderMeta struct {
 	// Name is the FAAS_BILLING_PROVIDER literal ("stripe", "paddle").
+	// Stable; the canonical-name list.
 	Name string
 	// Capabilities is the bitset the Provider reports.
 	Capabilities billing.CapabilitySet
 	// EnvVars lists the env-var names the provider reads at boot.
 	// Surfaced for operator documentation; the runtime semantics
-	// live in the provider's config.go (PR-P2).
+	// live in the provider's config.go.
 	EnvVars []string
+	// BuildAPID constructs the provider for apid's webhook ingress
+	// + changePlan handler. nil is the "apid doesn't need a
+	// Provider instance" case (the legacy apid Stripe path).
+	//
+	// The closure receives the env-overlaid cfg so it can resolve
+	// secrets via env > TOML precedence (resolveSecret helper). The
+	// raw env reader is also passed so callers that pre-apply the
+	// overlay can still distinguish env-originated vs TOML-originated
+	// values.
+	BuildAPID func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error)
+	// BuildMeterd constructs the provider for meterd's pusher loop.
+	// Always non-nil for registered providers — meterd requires a
+	// Provider on every path. The cfg is the env-overlaid merge;
+	// the env reader is the raw source. Same env > TOML precedence
+	// pattern as BuildAPID.
+	BuildMeterd func(cfg *RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (any, error)
 }
 
 // Providers returns the canonical list of registered billing providers.
 // The list is stable across runs and is the single source of truth
-// for the provider's identity + capabilities. Adding a new provider
-// is one entry here (PR-P5 turns this into a registry map).
+// for the provider's identity + capabilities. PR-P2 keeps the
+// pre-PR-P2 inline-construction shape (the loader package imports
+// both providers) so the package graph stays acyclic. A future
+// PR-P5 stub can build its own ProviderMeta and either replace
+// this list or extend it via a separate Register() helper.
 //
-// The returned slice is independent of the active provider — callers
-// combine it with the loaded provider's Capabilities() to render
-// the active state. The capability sets here come from constructing
-// throwaway provider instances with no secrets; the constructors
-// are pure so no network hits occur.
+// The returned slice is sorted alphabetically by Name so the
+// deterministic-order invariant is locked (the test
+// TestProviders_RegistersAllProviders pins the order).
 func Providers() []ProviderMeta {
 	stripeProv := stripe.NewClient(nil, nil, "", "", nil)
 	paddleProv := paddle.NewProvider("", "", false, nil)
-	return []ProviderMeta{
+	out := []ProviderMeta{
 		{
 			Name:         providerStripe,
 			Capabilities: stripeProv.Capabilities(),
 			EnvVars:      []string{"STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET"},
+			// BuildAPID nil → apid reads STRIPE_WEBHOOK_SECRET +
+			// FAAS_BILLING_PORTAL_URL inline (cmd/apid/main.go).
+			BuildAPID: nil,
+			BuildMeterd: func(cfg *RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (any, error) {
+				var stripeCfg *stripe.Config
+				if cfg != nil {
+					stripeCfg = cfg.Stripe
+				}
+				tomlAPIKey, tomlSecret := "", ""
+				if stripeCfg != nil {
+					tomlAPIKey = stripeCfg.APIKey
+					tomlSecret = stripeCfg.WebhookSecret
+				}
+				return stripe.NewClient(
+					store,
+					store,
+					resolveSecret(env("STRIPE_API_KEY"), tomlAPIKey),
+					resolveSecret(env("STRIPE_WEBHOOK_SECRET"), tomlSecret),
+					log,
+				), nil
+			},
 		},
 		{
 			Name:         providerPaddle,
 			Capabilities: paddleProv.Capabilities(),
 			EnvVars:      []string{"FAAS_PADDLE_API_KEY", "FAAS_PADDLE_WEBHOOK_SECRET", "FAAS_PADDLE_SANDBOX"},
+			BuildAPID: func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error) {
+				var paddleCfg *paddle.Config
+				if cfg != nil {
+					paddleCfg = cfg.Paddle
+				}
+				tomlAPIKey, tomlSecret, tomlSandbox := "", "", false
+				if paddleCfg != nil {
+					tomlAPIKey = paddleCfg.APIKey
+					tomlSecret = paddleCfg.WebhookSecret
+					tomlSandbox = paddleCfg.Sandbox
+				}
+				sandbox := resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox)
+				return paddle.NewProvider(
+					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
+					resolveSecret(env("FAAS_PADDLE_WEBHOOK_SECRET"), tomlSecret),
+					sandbox,
+					log,
+				), nil
+			},
+			BuildMeterd: func(cfg *RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (any, error) {
+				var paddleCfg *paddle.Config
+				if cfg != nil {
+					paddleCfg = cfg.Paddle
+				}
+				tomlAPIKey, tomlSandbox := "", false
+				if paddleCfg != nil {
+					tomlAPIKey = paddleCfg.APIKey
+					tomlSandbox = paddleCfg.Sandbox
+				}
+				return paddle.NewProviderWithDedupe(
+					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
+					resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox),
+					log,
+					store,
+				), nil
+			},
 		},
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // LoadProviderForAPID returns a billing.Provider for apid's webhook
 // ingress + changePlan handler.
 //
-//   - FAAS_BILLING_PROVIDER empty or "stripe" → returns (nil, "stripe", nil).
-//     The apid Stripe path stays inline; apid reads FAAS_BILLING_PORTAL_URL
+//   - cfg.Provider empty or "stripe" → returns (nil, "stripe", nil).
+//     The apid Stripe path stays inline; apid reads
+//     FAAS_BILLING_PORTAL_URL + STRIPE_WEBHOOK_SECRET directly because
+//     it doesn't need to construct a *stripe.Client (only the webhook
+//     signature check + the billing-portal template URL).
 //
-//   - STRIPE_WEBHOOK_SECRET directly because it doesn't need to
-//     construct a *stripe.Client (only the webhook signature check +
-//     the billing-portal template URL).
-//
-//   - FAAS_BILLING_PROVIDER "paddle" → constructs a *paddle.Provider and
+//   - cfg.Provider "paddle" → constructs a *paddle.Provider and
 //     best-effort runs EnsurePlanProducts so the price catalog is
 //     populated before the first /v1/webhooks/paddle POST can land.
 //     Returns the provider + the literal "paddle" even if the catalog
@@ -122,29 +249,46 @@ func Providers() []ProviderMeta {
 //     ingress is independent of the catalog). Returns the provider +
 //     the literal "paddle".
 //
-// (Note: the prior comment text mentioned a "FlushOverageNow" method.
-// That method never existed — the overage push path used an in-memory
-// pendingOverage sync.Map keyed by account, which was deleted in the
-// big-Paddle-enablement PR. The path is now stateless per-push:
-// PushUsageRecord sums the durable usage_minutes rows on every call
-// and POSTs directly. No FlushNow API, no accumulator, no rehydration
-// on boot — the Idempotency-Key header + the cross-process dedupe
-// row collapse to the same one-bill-per-(account, month) outcome.)
-//
 //   - Any other value → error so a typo fails the boot loudly.
+//
+// cfg is the env-overlaid TOML config (the caller called
+// ApplyBillingEnvOverlay before this function). env is the wake-up
+// reader that the closure-built providers use to read individual
+// secrets — env already reflects the env-overlaid final value.
 //
 // ctx is the boot-level context — a daemon shutdown cancels it, which
 // lets an in-flight EnsurePlanProducts call abort cleanly instead of
 // racing the process exit.
-func LoadProviderForAPID(ctx context.Context, env func(string) string, log *slog.Logger) (billing.Provider, string, error) {
-	switch env("FAAS_BILLING_PROVIDER") {
-	case "", providerStripe:
-		return nil, providerStripe, nil
-	case providerPaddle:
-		apiKey := env("FAAS_PADDLE_API_KEY")
-		webhookSecret := env("FAAS_PADDLE_WEBHOOK_SECRET")
-		sandbox := env("FAAS_PADDLE_SANDBOX") == "1" || env("FAAS_PADDLE_SANDBOX") == "true"
-		p := paddle.NewProvider(apiKey, webhookSecret, sandbox, log)
+func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (billing.Provider, string, error) {
+	if cfg == nil {
+		cfg = &RootBillingConfig{}
+	}
+	name := cfg.Provider
+	if name == "" {
+		// TOML missing + env unset → default to Stripe (legacy).
+		name = providerStripe
+	}
+	for _, m := range Providers() {
+		if m.Name != name {
+			continue
+		}
+		if m.BuildAPID == nil {
+			// Legacy apid surface (today: Stripe) — apid reads its
+			// env vars inline. Returning nil + name keeps the rest
+			// of the apid boot path unchanged.
+			return nil, m.Name, nil
+		}
+		p, err := m.BuildAPID(cfg, env, log)
+		if err != nil {
+			return nil, m.Name, fmt.Errorf("billing: build %s for apid: %w", m.Name, err)
+		}
+		// Type-assert the closure's `any` return back to billing.Provider.
+		// The compile-time assertion in each provider package guarantees
+		// the concrete type satisfies the interface.
+		bp, ok := p.(billing.Provider)
+		if !ok {
+			return nil, m.Name, fmt.Errorf("billing: provider %s BuildAPID returned %T, does not satisfy billing.Provider", m.Name, p)
+		}
 		// EnsurePlanProducts at boot so the price catalog is populated
 		// before the first /v1/webhooks/paddle call (the dunning state
 		// machine + the changePlan 402 path both read planMonthly /
@@ -158,51 +302,66 @@ func LoadProviderForAPID(ctx context.Context, env func(string) string, log *slog
 		// ingress is independent of the catalog — the dunning state
 		// machine reads acct.Plan, not price handles, so the boot
 		// failure mode is the upgrade 402 path only.
-		if err := p.EnsurePlanProducts(ctx); err != nil {
-			log.Warn("billing: paddle EnsurePlanProducts failed at boot — upgrade 402 will degrade to 500 until next run",
-				"err", err)
+		if err := bp.EnsurePlanProducts(ctx); err != nil {
+			log.Warn("billing: EnsurePlanProducts failed at boot — upgrade 402 will degrade to 500 until next run",
+				"provider", m.Name, "err", err)
 		}
-		return p, providerPaddle, nil
-	default:
-		return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", env("FAAS_BILLING_PROVIDER"))
+		return bp, m.Name, nil
 	}
+	return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", name)
 }
 
 // LoadProviderForMeterd returns a billing.Provider for the meterd pusher
 // loop. Always non-nil on success — the meterd pusher requires a Provider
 // (the legacy *stripe.Client path is folded into the interface).
 //
-//   - FAAS_BILLING_PROVIDER empty or "stripe" → constructs a
-//     *stripe.Client with the supplied PushDedupe (the meterd dedupe
-//     surface is the HasStripePushHour / RecordStripePushHour pair on
-//     state.Store, which stripe.NewClient needs).
+//   - cfg.Provider empty or "stripe" → the Stripe BuildMeterd closure
+//     constructs a *stripe.Client with the supplied state.Store as both
+//     the StateStore and the PushDedupe (the Stripe provider's
+//     NewClient takes both args; today every Store implementation
+//     satisfies both interfaces).
 //
-//   - FAAS_BILLING_PROVIDER "paddle" → constructs a *paddle.Provider;
-//     meterd doesn't need the webhook secret (no ingress) so the second
-//     arg is empty.
+//   - cfg.Provider "paddle" → the Paddle BuildMeterd closure constructs
+//     a *paddle.Provider with the state.Store as the cross-process
+//     overage dedupe. meterd doesn't need the webhook secret (no
+//     ingress) so the second arg is empty.
 //
 //   - Any other value → error so a typo fails the boot loudly.
+//
+// cfg is the env-overlaid TOML config. env is the env-var reader the
+// per-provider closure uses. store is the meterd-side state (passed
+// through to the closure; the Stripe + Paddle closures each interpret
+// it differently).
 //
 // Note: no ctx parameter — the Stripe + Paddle constructors here don't
 // accept a context (they don't dial out at construction time; the
 // ping happens later on the pusher tick). The pusher loop's own ctx
 // governs the actual SDK calls. LoadProviderForAPID takes ctx because
 // it eagerly runs EnsurePlanProducts at boot.
-func LoadProviderForMeterd(env func(string) string, store state.Store, dedupe stripe.PushDedupe, log *slog.Logger) (billing.Provider, string, error) {
-	switch env("FAAS_BILLING_PROVIDER") {
-	case "", providerStripe:
-		return stripe.NewClient(store, dedupe, env("STRIPE_API_KEY"), env("STRIPE_WEBHOOK_SECRET"), log), providerStripe, nil
-	case providerPaddle:
-		apiKey := env("FAAS_PADDLE_API_KEY")
-		sandbox := env("FAAS_PADDLE_SANDBOX") == "1" || env("FAAS_PADDLE_SANDBOX") == "true"
-		// meterd doesn't need the webhook secret (no ingress in meterd).
-		// store is also the cross-process dedupe gate (state.Store
-		// implements paddle.PaddleOverageDedupe via the Has/Record pair
-		// added in the same PR) — mirrors how the Stripe branch above
-		// passes the same `store` as its PushDedupe.
-		p := paddle.NewProviderWithDedupe(apiKey, sandbox, log, store)
-		return p, providerPaddle, nil
-	default:
-		return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", env("FAAS_BILLING_PROVIDER"))
+func LoadProviderForMeterd(cfg *RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (billing.Provider, string, error) {
+	if cfg == nil {
+		cfg = &RootBillingConfig{}
 	}
+	name := cfg.Provider
+	if name == "" {
+		name = providerStripe
+	}
+	for _, m := range Providers() {
+		if m.Name != name {
+			continue
+		}
+		if m.BuildMeterd == nil {
+			return nil, m.Name, fmt.Errorf("billing: provider %s registered with nil BuildMeterd", m.Name)
+		}
+		p, err := m.BuildMeterd(cfg, env, store, log)
+		if err != nil {
+			return nil, m.Name, fmt.Errorf("billing: build %s for meterd: %w", m.Name, err)
+		}
+		bp, ok := p.(billing.Provider)
+		if !ok {
+			return nil, m.Name, fmt.Errorf("billing: provider %s BuildMeterd returned %T, does not satisfy billing.Provider", m.Name, p)
+		}
+		return bp, m.Name, nil
+	}
+	return nil, "", fmt.Errorf("billing: unknown FAAS_BILLING_PROVIDER=%q", name)
 }

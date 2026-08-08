@@ -191,6 +191,14 @@ type runDeps struct {
 	// the production capset, and MustCheckOnBoot calls os.Exit
 	// on violation).
 	capCheck func() error
+	// PR-P2: TOML config wiring. configPath defaults to
+	// /etc/faas/apid.toml in defaultDeps; tests override to point at
+	// a temp file with a hand-rolled [billing] block.
+	configPath string
+	// loadBillingConfig reads the [billing] block from apid.toml.
+	// nil in production (defaultDeps wires billingloader.LoadBillingConfigFromPath);
+	// tests stub to return a hand-rolled *RootBillingConfig.
+	loadBillingConfig func(path string) (*billingloader.RootBillingConfig, error)
 }
 
 func defaultDeps() runDeps {
@@ -202,7 +210,9 @@ func defaultDeps() runDeps {
 		newSrv: func(addr string, h http.Handler) *http.Server {
 			return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
 		},
-		loginTTL: 15 * time.Minute,
+		loginTTL:          15 * time.Minute,
+		configPath:        "/etc/faas/apid.toml",
+		loadBillingConfig: billingloader.LoadBillingConfigFromPath,
 	}
 }
 
@@ -550,7 +560,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and the changePlan 402 path falls back to the FAAS_BILLING_PORTAL_URL
 	// template above — the pre-PR-#3 Stripe path is bit-for-bit
 	// unchanged.
-	billingProv, provName, err := billingloader.LoadProviderForAPID(ctx, deps.getenv, log)
+	//
+	// PR-P2: read the [billing] block from apid.toml first, then
+	// overlay env on top. Missing file is non-fatal (defaults). Bad
+	// TOML is fatal. The loader sees the merged cfg + the raw env
+	// reader (closures re-read the secrets the overlay just wrote).
+	loadBillingConfig := deps.loadBillingConfig
+	if loadBillingConfig == nil {
+		loadBillingConfig = billingloader.LoadBillingConfigFromPath
+	}
+	billingCfg, err := loadBillingConfig(deps.configPath)
+	if err != nil {
+		return fmt.Errorf("apid: load billing config: %w", err)
+	}
+	billingCfg = billingloader.ApplyBillingEnvOverlay(billingCfg, deps.getenv)
+	billingProv, provName, err := billingloader.LoadProviderForAPID(ctx, billingCfg, deps.getenv, log)
 	if err != nil {
 		return fmt.Errorf("apid: load billing provider: %w", err)
 	}
