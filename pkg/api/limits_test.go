@@ -254,7 +254,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// the new-app default flips to authenticated. Both
 			// 'bearer' and basic are unlocked here, so the mode
 			// can be the secure-by-default 'bearer' shape.
+			// Issue #556 PR-A: Pro unlocks traffic-split
+			// (issue #556 "Pro+ canary"). Hobby's value-prop
+			// stays "near-Free with a floor" — canary
+			// rollout adds RAM-billable live deployments
+			// the Hobby plan doesn't subsidise.
 			RequireAuthnDefault: true, PublicAuthModeDefault: "bearer",
+			// Issue #556 PR-A: Pro unlocks traffic splitting.
+			TrafficSplit: true,
 			// Issue #554 / ADR-078: Pro inherits the same liveness
 			// defaults as Hobby (5s / 3 / 60s / 3 in 300s). Pro is
 			// the unlock point for `GRPCLivenessAllowed()` once v2
@@ -336,7 +343,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #695 / ADR-080: Scale mirrors Pro — secure-by-default
 			// at the new-app stamp. Both bearer and basic are unlocked
 			// here, so the mode can stay 'bearer'.
+			// Issue #556 PR-A: Scale mirrors Pro — canary rollout
+			// is part of the production-tier value-prop.
 			RequireAuthnDefault: true, PublicAuthModeDefault: "bearer",
+			// Issue #556 PR-A: Pro unlocks traffic splitting.
+			TrafficSplit: true,
 			// Issue #554 / ADR-078: Scale mirrors Pro — same
 			// 5s / 3 / 60s / 3 in 300s defaults. The
 			// per-deployment override column on deployments is the
@@ -1017,6 +1028,36 @@ func TestPlanRequireAuthnDefault(t *testing.T) {
 	for _, c := range cases {
 		if got := c.plan.RequireAuthnDefault(); got != c.want {
 			t.Errorf("%s.RequireAuthnDefault() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanTrafficSplitAllowed pins the per-plan gate for the
+// traffic-splitting feature (issue #556 PR-A). Per-plan truth
+// table: Free=false (locked), Hobby=false (Hobby's value-prop is
+// "near-Free with a floor"; canary rollout adds RAM-billable
+// live deployments the Hobby plan doesn't subsidise),
+// Pro=true (the "Pro+ canary" issue body), Scale=true. apid's
+// createDeployment + updateDeploymentTraffic handlers consult
+// this gate so a Free/Hobby account PATCHing or supplying
+// traffic_percent on create sees the canonical 403
+// plan_traffic_split_not_allowed. Unknown plans must fail closed
+// (return false) — same fail-closed contract as the bearer /
+// basic gate tests above.
+func TestPlanTrafficSplitAllowed(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, false},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.TrafficSplitAllowed(); got != c.want {
+			t.Errorf("%s.TrafficSplitAllowed() = %v, want %v", c.plan, got, c.want)
 		}
 	}
 }

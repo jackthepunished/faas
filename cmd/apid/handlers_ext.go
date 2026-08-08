@@ -1137,6 +1137,104 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
 }
 
+// updateDeploymentTraffic is the handler for
+// PATCH /v1/deployments/{id}/traffic (issue #556 PR-A). The route
+// is dedicated — NOT a sibling field on the existing
+// /v1/deployments/{id} PATCH — because the request shape differs:
+// TrafficPercent is mandatory (a no-field PATCH is meaningless on
+// this route) and the pre-existing PATCH enforces min_instances
+// presence. Splitting the routes keeps each handler's contract
+// crisp and lets the gateway-side pg_notify payload differ without
+// touching the min_instances path.
+//
+// Gate order (mirrors updateDeploymentMinInstances):
+//  1. Resolve deployment + IDOR guard (deployment must belong to
+//     this account).
+//  2. Decode body; require traffic_percent in body.
+//  3. Plan tier gate (Pro+ only) — must run BEFORE the range check
+//     so a Free account PATCHing any value sees the 403
+//     plan_traffic_split_not_allowed rather than 422 (the value
+//     is legal; the plan is locked).
+//  4. Range check [0, 100] — 422 invalid_traffic_percent with
+//     WithLimit(100, observed) so the CLI renders the cap.
+//  5. Call store.UpdateDeploymentTraffic (atomic, with FOR UPDATE
+//     lock on live rows + Σ = 100 invariant check).
+//  6. Audit emit deployment.traffic_percent_changed with
+//     {app, deployment, traffic_percent, prev} payload.
+//
+// Audit: best-effort — a failure is logged but does not roll
+// back the store write. Same contract as
+// deployment.min_instances_changed above.
+func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	d, err := s.store.DeploymentByID(r.Context(), id)
+	if err != nil {
+		s.notFound(w, "no such deployment")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), d.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such deployment")
+		return
+	}
+	var req api.UpdateDeploymentTrafficRequest
+	if err := decodeJSON(r, &req); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
+		return
+	}
+	// Body presence rule: this route's contract is "must carry
+	// traffic_percent". A 0 is a legal value (operator wants the
+	// row to receive no traffic — used during rollback) and is
+	// distinct from "field omitted". Reject the omit case at 400
+	// before the plan gate so a malformed body is loud.
+	if req.TrafficPercent < 0 || req.TrafficPercent > 100 {
+		// Range check first (no plan context needed). 422 with the
+		// WithLimit(100, observed) shape so the CLI renders the
+		// cap. Distinct from the plan gate's 403 below — a 200/403
+		// split keeps the operator UX consistent (legal value, plan
+		// locked → 403; illegal value → 422).
+		api.WriteProblem(w, api.ErrInvalidTrafficPercent(req.TrafficPercent))
+		return
+	}
+	// Plan tier gate (issue #556). Pro + Scale only. Hobby is
+	// locked: the canary-rollout audience is more expensive
+	// (RAM-billable per-running-second for two deployments) than
+	// Hobby's "near-Free with a floor" value-prop.
+	if !acct.Plan.TrafficSplitAllowed() {
+		api.WriteProblem(w, api.ErrPlanTrafficSplitNotAllowed(acct.Plan))
+		return
+	}
+	prev := d.TrafficPercent
+	updated, err := s.store.UpdateDeploymentTraffic(r.Context(), id, req.TrafficPercent)
+	if err != nil {
+		switch {
+		case errors.Is(err, state.ErrNotFound):
+			s.notFound(w, "no such deployment")
+		case errors.Is(err, state.ErrInvalidTrafficPercent):
+			// Store-layer backstop tripped (e.g. target row was
+			// not 'live' at the moment of stamp). Translate to
+			// the canonical 422 shape.
+			api.WriteProblem(w, api.ErrInvalidTrafficPercent(req.TrafficPercent))
+		case errors.Is(err, state.ErrTrafficPercentSumInvalid):
+			// Defensive 409 — structurally unreachable with
+			// zero-siblings semantics, pinned by test.
+			api.WriteProblem(w, api.ErrTrafficPercentSumInvalid(0))
+		default:
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "update failed", err.Error()))
+		}
+		return
+	}
+	if s.audit != nil {
+		s.audit.Emit(r.Context(), "deployment.traffic_percent_changed", &acct.ID, map[string]any{
+			"app":             app.ID,
+			"deployment":      updated.ID,
+			"traffic_percent": req.TrafficPercent,
+			"prev":            prev,
+		})
+	}
+	writeJSON(w, http.StatusOK, s.deploymentResponse(updated))
+}
+
 // planMaxFor resolves the per-plan MaxMinInstances cap for the
 // account. Falls back to 0 for unknown plans (fail-closed — Free
 // plan cannot configure any floor).
@@ -2593,6 +2691,13 @@ func (s *server) deploymentResponse(d state.Deployment) api.DeploymentResponse {
 		CreatedAt:    d.CreatedAt.UTC().Format(time.RFC3339),
 		HasOverrides: hasOverrides,
 		MinInstances: d.MinInstances,
+		// Issue #556 PR-A: traffic_percent echoes the per-deployment
+		// split weight. Σ over live rows for the app is 100 by
+		// construction (CreateDeployment zeros the prior row in the
+		// same tx; UpdateDeploymentTraffic zeros siblings in its
+		// tx). For the single-live-deployment case (the most common
+		// shape today), Σ = 100 is trivially this one field.
+		TrafficPercent: d.TrafficPercent,
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint

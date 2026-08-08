@@ -391,6 +391,38 @@ const (
 	// --min-instances").
 	CodeMaxMinInstancesExceeded = "max_min_instances_exceeded"
 
+	// CodePlanTrafficSplitNotAllowed (issue #556 / traffic
+	// splitting across deployments) is a 403 for plan-tier
+	// rejections: a Free/Hobby customer tries to set a
+	// non-default traffic_percent on a deployment. Mirrors
+	// CodePlanMinInstancesNotAllowed so the CLI renders the same
+	// "your plan doesn't allow this — upgrade" shape. The
+	// migration (00160) column default is 100, so customers
+	// who never opt-in see no behavioural change; the gate
+	// only fires when a customer explicitly opts in to a
+	// non-100 traffic_percent on create or PATCH-traffic.
+	CodePlanTrafficSplitNotAllowed = "plan_traffic_split_not_allowed"
+	// CodeInvalidTrafficPercent (issue #556) is a 422 for shape
+	// violations: traffic_percent is outside [0, 100] (or
+	// negative). Distinct from CodeValidation so the CLI can
+	// render the cap+observed pair via WithLimit (mirrors the
+	// CodeInvalidMinInstances pattern at line 1692). The state
+	// layer (pkg/state.UpdateDeploymentTraffic) also lifts
+	// this code on out-of-range input as a defence-in-depth
+	// backstop.
+	CodeInvalidTrafficPercent = "invalid_traffic_percent"
+	// CodeTrafficPercentSumInvalid (issue #556) is a 409
+	// (Conflict) for the defensive backstop: post-write
+	// Σ(traffic_percent WHERE status='live') != 100. In
+	// practice this is unreachable — the schema CHECK
+	// (00160) gates the per-row range and the
+	// UpdateDeploymentTraffic transaction zeroes siblings
+	// before stamping the target. The state layer asserts
+	// the invariant explicitly and lifts to this code if
+	// violated, so a future refactor that breaks the Σ
+	// tripwire surfaces a 409 (not a silent DB drift).
+	CodeTrafficPercentSumInvalid = "traffic_percent_sum_invalid"
+
 	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
 	// codes are the load-bearing 400-class shapes; the stateful
@@ -834,6 +866,15 @@ func StatusForCode(code string) int {
 		return http.StatusNotFound
 	case CodeConflict, CodeDomainNotVerified, CodeNoRollbackTarget:
 		return http.StatusConflict
+	case CodeTrafficPercentSumInvalid:
+		// 409 — issue #556. Σ(traffic_percent WHERE status='live')
+		// != 100 after UpdateDeploymentTraffic. Defensive backstop;
+		// unreachable in practice. Sits next to CodeConflict /
+		// CodeDomainNotVerified / CodeNoRollbackTarget because the
+		// semantics are "the requested state cannot be applied
+		// alongside the existing row set", not "your plan forbids
+		// this".
+		return http.StatusConflict
 	case CodeDeployFailed:
 		return http.StatusUnprocessableEntity
 	case CodeDeploySignatureInvalid:
@@ -842,6 +883,13 @@ func StatusForCode(code string) int {
 		// path). See CodeDeploySignatureInvalid declaration above.
 		return http.StatusForbidden
 	case CodeImageNotFound, CodeImageManifestInvalid:
+		return http.StatusUnprocessableEntity
+	case CodeInvalidTrafficPercent:
+		// 422 — issue #556. traffic_percent outside [0, 100].
+		// Sits next to CodeImageNotFound / CodeImageManifestInvalid
+		// (422 family). Mirrors CodeInvalidMinInstances's
+		// shape-second 422 contract; the plan-gate cousin
+		// (CodePlanTrafficSplitNotAllowed) is the 403 above.
 		return http.StatusUnprocessableEntity
 	case CodeImageEgressDenied:
 		return http.StatusForbidden
@@ -856,6 +904,10 @@ func StatusForCode(code string) int {
 	case CodePayment:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
+		return http.StatusForbidden
+	case CodePlanTrafficSplitNotAllowed:
+		// 403 — issue #556. Free/Hobby trying to set a
+		// non-default traffic_percent; mirrors CodePlanMinInstancesNotAllowed.
 		return http.StatusForbidden
 	case CodeSecretInvalidKey, CodeSecretNotFound:
 		return http.StatusBadRequest
@@ -1748,6 +1800,55 @@ func ErrMaxMinInstancesExceeded(got, planMax int) *Problem {
 		fmt.Sprintf("min_instances must be in [0, %d] for this plan; got %d.", planMax, got)).
 		WithLimit(int64(planMax), int64(got)).
 		WithDocs(docsBase + "/apps#min-instances")
+}
+
+// ErrPlanTrafficSplitNotAllowed (issue #556 / traffic splitting
+// across deployments) is returned when a Free/Hobby account tries
+// to set a non-default traffic_percent on a deployment (ux_spec
+// §6.5 plan-tier gate family, joined by issue #556). The customer's
+// bill on Free/Hobby is built around scale-to-zero; keeping two or
+// more live deployments warm simultaneously is the cost shape of
+// Pro / Scale (per-running-second RAM × N deployments). Hobby was
+// deliberately NOT promoted to the gate's "allowed" set (unlike
+// MinInstancesAllowed which Hobby unlocks per issue #462) — see
+// the Limits.TrafficSplit field comment in pkg/api/limits.go.
+func ErrPlanTrafficSplitNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanTrafficSplitNotAllowed,
+		"Plan doesn't allow traffic splitting",
+		fmt.Sprintf("the %s plan routes 100%% to the most recent deployment; upgrade to Pro or Scale to keep N canary deployments warm.", p)).
+		WithDocs("https://docs.gregale.dev/plans#traffic-split")
+}
+
+// ErrInvalidTrafficPercent (issue #556) is returned when the
+// requested traffic_percent is outside [0, 100] (the schema CHECK
+// in migration 00160 is the second-line defence; this surfaces
+// before that check, the API gate fires first). 422 mirrors the
+// ErrInvalidMinInstances shape at line 1688 (plan-gate-first vs
+// shape-second; this is shape, so 422 not 403).
+func ErrInvalidTrafficPercent(got int) *Problem {
+	const cap = 100
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidTrafficPercent,
+		"Invalid traffic_percent",
+		fmt.Sprintf("traffic_percent must be in [0, %d]; got %d.", cap, got)).
+		WithLimit(int64(cap), int64(got)).
+		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
+}
+
+// ErrTrafficPercentSumInvalid (issue #556) is the defensive
+// backstop for the Σ = 100 invariant. The state layer's
+// UpdateDeploymentTraffic transaction asserts the post-write sum
+// and lifts to this code if violated. In practice this is
+// unreachable: the schema CHECK gates the per-row range and the
+// transaction zeroes siblings before stamping the target. The
+// code exists so a future refactor that breaks the Σ tripwire
+// surfaces a 409 (not a silent DB drift). 409 Conflict because
+// the requested state is internally consistent (range-check
+// passed) but cannot be applied alongside the existing row set.
+func ErrTrafficPercentSumInvalid(observed int) *Problem {
+	return NewProblem(http.StatusConflict, CodeTrafficPercentSumInvalid,
+		"traffic_percent sum invariant violated",
+		fmt.Sprintf("sum of traffic_percent across live deployments must be 100; observed %d.", observed)).
+		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
 }
 
 // ErrSidecarCapExceeded is returned when the request carries more

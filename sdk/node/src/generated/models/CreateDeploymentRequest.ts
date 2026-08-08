@@ -24,5 +24,9 @@ export type CreateDeploymentRequest = {
    * Up to 2 stateless sidecars (1 init + 1 sidecar). nil/omitted = no sidecars. See ADR-068 for the hard 2-cap and stateless-only contract.
    */
   sidecars?: Array<Sidecar>;
+  /**
+   * Per-deployment traffic-split weight (issue #556 PR-A). nil = server default 100; explicit 0..100 = opt into canary (Pro/Scale only).
+   */
+  traffic_percent?: number | null;
 };
 

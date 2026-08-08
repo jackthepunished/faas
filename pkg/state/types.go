@@ -908,6 +908,18 @@ type Deployment struct {
 	// does NOT carry the plan context, so the helper is just
 	// min(0, MinInstances)→0 + raw value.
 	MinInstances int `json:"min_instances,omitempty"`
+	// TrafficPercent is the per-deployment traffic-split weight
+	// (issue #556 PR-A). Integer in [0, 100] enforced by the
+	// deployments_traffic_percent_chk CHECK constraint (migration
+	// 00160). On create: default 100 (server-side when caller passes
+	// 0); on supersede: zeroed in the same tx as the INSERT so Σ over
+	// live rows remains 100 by construction. PR-B's gateway picker
+	// consults this column via the new LiveDeployments(appID)
+	// plural query; PR-A only persists the shape and exposes it on
+	// the DTO wire. The "zero siblings" semantics for the
+	// UpdateDeploymentTraffic transaction live in pgstore.go, not
+	// here — this struct just carries the field.
+	TrafficPercent int `json:"traffic_percent,omitempty"`
 	// Scan columns (issue #464 / ADR-055 / PR-3). Per-deploy grype
 	// scan result, status, and scanned_at. Mirror the deployments
 	// table columns added by migrations/00135. The pgstore reads

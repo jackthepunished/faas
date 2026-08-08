@@ -2184,6 +2184,60 @@ func (m *MemStore) UpdateDeploymentMinInstances(_ context.Context, id string, mi
 	return d, nil
 }
 
+// UpdateDeploymentTraffic mirrors PgStore.UpdateDeploymentTraffic
+// (issue #556 PR-A). The "zero siblings" rebalance semantics is
+// the same as the pgstore: setting row R's traffic_percent to
+// newPercent forces every other live row in the same app to 0,
+// keeping Σ = 100 by construction. The MemStore version runs under
+// m.mu so a concurrent CreateDeployment / UpdateDeploymentTraffic
+// call serialises behind us — same race-free contract the
+// pgstore's FOR UPDATE provides.
+//
+// Range-check matches pgstore (handler already validates, this is
+// defence in depth). Status guard: only 'live' rows accept
+// traffic; a superseded/failed/pending row trips
+// ErrInvalidTrafficPercent. The Σ invariant is asserted post-write
+// (structurally guaranteed by zero-siblings, but pinned by test).
+func (m *MemStore) UpdateDeploymentTraffic(_ context.Context, id string, newPercent int) (Deployment, error) {
+	if newPercent < 0 || newPercent > 100 {
+		return Deployment{}, ErrInvalidTrafficPercent
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	if d.Status != DeployLive {
+		return Deployment{}, ErrInvalidTrafficPercent
+	}
+
+	// Stamp target + zero siblings.
+	d.TrafficPercent = newPercent
+	m.deployments[id] = d
+	appID := d.AppID
+	for otherID, other := range m.deployments {
+		if other.AppID != appID || other.Status != DeployLive || otherID == id {
+			continue
+		}
+		other.TrafficPercent = 0
+		m.deployments[otherID] = other
+	}
+
+	// Σ invariant (defensive).
+	var sum int
+	for _, row := range m.deployments {
+		if row.AppID == appID && row.Status == DeployLive {
+			sum += row.TrafficPercent
+		}
+	}
+	if sum != 100 {
+		return Deployment{}, ErrTrafficPercentSumInvalid
+	}
+	return d, nil
+}
+
 // ListInstancesByNodeID mirrors pkg/state/pgstore.go:875. Same
 // in-process predicate; for the in-memory store this is a linear
 // scan over m.instances — fine for tests + the e2e harness.
@@ -3245,8 +3299,15 @@ func (m *MemStore) CreateDeployment(_ context.Context, d Deployment) (Deployment
 		// Match PgStore exactly: mutate the stored prior in-place so
 		// subsequent LatestDeployment / DeploymentByID readers see
 		// the supersede immediately, under m.mu.
+		//
+		// Issue #556 PR-A: zero the prior row's traffic_percent so
+		// Σ over live rows remains 100 by construction. The new row
+		// is stamped at d.TrafficPercent below (handler defaults to
+		// 100 when the caller omits the optional pointer). Mirrors
+		// the pgstore's two-field SET in CreateDeployment.
 		prior := m.deployments[priorID]
 		prior.Status = DeploySuperseded
+		prior.TrafficPercent = 0
 		m.deployments[priorID] = prior
 	}
 
@@ -3261,6 +3322,16 @@ func (m *MemStore) CreateDeployment(_ context.Context, d Deployment) (Deployment
 	}
 	if d.Kind == "" {
 		d.Kind = DeploymentKindImage
+	}
+	// Issue #556 PR-A: default traffic_percent to 100 when caller
+	// supplies zero. The schema's NOT NULL DEFAULT 100 covers the
+	// SQL write path; mirroring here keeps the in-memory shape
+	// aligned so unit tests that exercise the store don't need
+	// Postgres. PR-A semantics: traffic_percent on a fresh deploy
+	// is 100; on supersede it's 0 (set above); PR-C may add
+	// proportional forms.
+	if d.TrafficPercent == 0 {
+		d.TrafficPercent = 100
 	}
 	m.deployments[d.ID] = d
 	return d, nil
