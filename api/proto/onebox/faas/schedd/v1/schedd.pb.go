@@ -391,8 +391,16 @@ func (x *WakeResponse) GetDeploymentId() string {
 // future per-app target hints (placement preference, eager-warm) can
 // land on the request without breaking Wake's contract.
 type AdmitInstanceRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AppId         string                 `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	AppId string                 `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
+	// deployment_id (issue #556 / PR-C) is the optional
+	// per-deployment wake hint for the wake-fan-out path. Empty
+	// falls through to schedd's default (newest live deployment)
+	// — the legacy single-deployment behaviour. Non-empty
+	// asks schedd to admit onto that specific live deployment so
+	// the picker has a routable Target on retry. Additive per
+	// ADR-016.
+	DeploymentId  string `protobuf:"bytes,2,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -430,6 +438,13 @@ func (*AdmitInstanceRequest) Descriptor() ([]byte, []int) {
 func (x *AdmitInstanceRequest) GetAppId() string {
 	if x != nil {
 		return x.AppId
+	}
+	return ""
+}
+
+func (x *AdmitInstanceRequest) GetDeploymentId() string {
+	if x != nil {
+		return x.DeploymentId
 	}
 	return ""
 }
@@ -1637,9 +1652,10 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\aproblem\x18\x04 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x17\n" +
 	"\awake_id\x18\x05 \x01(\tR\x06wakeId\x12\x12\n" +
 	"\x04port\x18\x06 \x01(\x05R\x04port\x12#\n" +
-	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"-\n" +
+	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"R\n" +
 	"\x14AdmitInstanceRequest\x12\x15\n" +
-	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xb2\x02\n" +
+	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
+	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\"\xb2\x02\n" +
 	"\x15AdmitInstanceResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +

@@ -55,7 +55,7 @@ func (f *fakeEngine) Wake(ctx context.Context, appID, deploymentID string) (sche
 	return f.wakeFn(ctx, appID, deploymentID)
 }
 
-func (f *fakeEngine) AdmitInstance(ctx context.Context, appID string) (sched.WakeResult, error) {
+func (f *fakeEngine) AdmitInstance(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error) {
 	if f.admitInstanceFn != nil {
 		return f.admitInstanceFn(ctx, appID)
 	}

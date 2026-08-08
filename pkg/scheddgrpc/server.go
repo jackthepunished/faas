@@ -128,7 +128,18 @@ type SchedAPI interface {
 	// instance even when others are already RUNNING. Returns a typed
 	// AtCapacity result on the benign "already at max_concurrency"
 	// outcome — see sched.WakeResult.AtCapacity.
-	AdmitInstance(ctx context.Context, appID string) (sched.WakeResult, error)
+	// AdmitInstance is the schedule scale-out primitive (issue #168).
+	// Bypasses the Phase-1 fast-path so a gateway can demand a new
+	// instance even when others are already RUNNING. Returns a typed
+	// AtCapacity result on the benign "already at max_concurrency"
+	// outcome — see sched.WakeResult.AtCapacity.
+	//
+	// deploymentID (issue #556 / PR-C): the optional per-deployment
+	// wake hint for the wake-fan-out path. Empty falls through to
+	// the engine's default (newest live deployment) — the legacy
+	// single-deployment path. Non-empty asks the engine to admit on
+	// that specific live deployment. Additive per ADR-016.
+	AdmitInstance(ctx context.Context, appID, deploymentID string) (sched.WakeResult, error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	// ParkWithReason is the meterd-triggered variant (M7, spec §4.7).
 	// The reason string is for the audit log; the park semantics are
@@ -329,7 +340,7 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		return nil, err
 	}
 	start := time.Now()
-	res, err := s.engine.AdmitInstance(ctx, req.GetAppId())
+	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))

@@ -537,7 +537,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID)
+			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID, "")
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -1205,9 +1205,9 @@ type unwiredBackend struct{}
 func (unwiredBackend) Lookup(context.Context, string) (gateway.App, bool) {
 	return gateway.App{}, false
 }
-func (unwiredBackend) Pick(string) (gateway.Target, bool) { return gateway.Target{}, false }
-func (unwiredBackend) HealthyCount(string) int            { return 0 }
-func (unwiredBackend) Admit(context.Context, string, int) (string, gateway.WakeMethod, bool, error) {
+func (unwiredBackend) Pick(string) gateway.PickResult { return gateway.PickResult{} }
+func (unwiredBackend) HealthyCount(string) int        { return 0 }
+func (unwiredBackend) Admit(context.Context, string, string, int) (string, gateway.WakeMethod, bool, error) {
 	return "", gateway.WakeMethodUnspecified, false, nil
 }
 

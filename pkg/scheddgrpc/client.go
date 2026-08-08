@@ -24,7 +24,7 @@ import (
 // warmhint stream, close. Each method maps 1:1 to a method on
 // *Client, so any fake only needs to forward the same shape.
 type ScheddClient interface {
-	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error)
+	AdmitInstance(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
 	// Wake (issue #556 / PR-C): deploymentID is the optional
 	// per-deployment wake hint forwarded to schedd. Empty falls
 	// through to the newest live deployment. Return tuple gains
@@ -152,8 +152,14 @@ func (c *Client) Wake(ctx context.Context, appID, deploymentID string) (instance
 //     "" pre-PR-B callers see empty and the gateway treats that as
 //     "single-deployment legacy mode". Schedd surfaces this from
 //     Engine.AdmitInstance's WakeResult.DeploymentID (engine.go).
-func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error) {
-	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID})
+//
+// deploymentID hint (issue #556 / PR-C): when non-empty schedd
+// admits the new instance on this specific live deployment
+// (wake-fan-out path); empty falls through to the newest live
+// deployment (legacy single-deployment path). Additive per
+// ADR-016.
+func (c *Client) AdmitInstance(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error) {
+	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID, DeploymentId: deploymentID})
 	if err != nil {
 		return "", "", "", "", 0, false, 0, liftErr(err)
 	}

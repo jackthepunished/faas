@@ -187,7 +187,13 @@ type Scheduler interface {
 	//     app_concurrency_reached outcome is NEVER lifted to an error —
 	//     it surfaces as atCapacity=true so the gateway can treat it
 	//     as a no-op. method is 0.
-	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error)
+	// deploymentID (issue #556 / PR-C): the optional
+	// per-deployment wake hint for the wake-fan-out path. Empty
+	// falls through to schedd's default (newest live deployment)
+	// — the legacy single-deployment behaviour. Non-empty asks
+	// schedd to admit on that specific live deployment. Additive
+	// per ADR-016.
+	AdmitInstance(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, method int32, atCapacity bool, port int, err error)
 }
 
 // ErrSchedulerUnconfigured is returned by NoopScheduler.AdmitInstance.
@@ -198,7 +204,7 @@ var ErrSchedulerUnconfigured = errors.New("gateway: scheduler not configured (M5
 // need the wake path.
 type NoopScheduler struct{}
 
-func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
+func (NoopScheduler) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
 	return "", "", "", "", 0, false, 0, ErrSchedulerUnconfigured
 }
 
@@ -336,7 +342,7 @@ func (f *FakeScheduler) AdmitsFor(appID string) int {
 	return f.admitsByApp[appID]
 }
 
-func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, string, int32, bool, int, error) {
+func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID, deploymentIDHint string) (string, string, string, string, int32, bool, int, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond

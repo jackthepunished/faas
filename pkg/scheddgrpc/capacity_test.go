@@ -71,7 +71,7 @@ type capturingEngine struct {
 func (c *capturingEngine) Wake(_ context.Context, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
-func (c *capturingEngine) AdmitInstance(_ context.Context, _ string) (sched.WakeResult, error) {
+func (c *capturingEngine) AdmitInstance(_ context.Context, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
 func (c *capturingEngine) ReportActivity(_ context.Context, _ []state.InstanceTouch) (int, error) {

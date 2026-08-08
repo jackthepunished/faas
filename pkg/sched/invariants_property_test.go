@@ -180,7 +180,7 @@ func TestProperty_EngineAdmitInstance_RespectsMaxConcurrency(t *testing.T) {
 	}, goroutines)
 	for i := 0; i < goroutines; i++ {
 		go func() {
-			res, err := e.AdmitInstance(context.Background(), app.ID)
+			res, err := e.AdmitInstance(context.Background(), app.ID, "")
 			results <- struct {
 				res WakeResult
 				err error

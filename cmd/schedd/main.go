@@ -1444,7 +1444,7 @@ type schedScaleUpEngine struct {
 // engine and lifts the relevant fields into the thinned
 // scaleup.AdmitResult.
 func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (scaleup.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID)
+	r, err := s.engine.AdmitInstance(ctx, appID, "")
 	if err != nil {
 		return scaleup.AdmitResult{}, err
 	}
@@ -1472,7 +1472,7 @@ type schedTargetsEngine struct {
 // per-tick AtCapacity signal that the dashboard's "would have
 // scaled but cap reached" pane depends on.
 func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (targets.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID)
+	r, err := s.engine.AdmitInstance(ctx, appID, "")
 	if err != nil {
 		return targets.AdmitResult{}, err
 	}
@@ -1492,7 +1492,7 @@ type schedFloorEngine struct {
 
 // AdmitInstance implements floor.Engine.
 func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID)
+	r, err := s.engine.AdmitInstance(ctx, appID, "")
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}

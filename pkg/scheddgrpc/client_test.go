@@ -172,7 +172,7 @@ func TestClientAdmitInstance_AdmitsNewInstance(t *testing.T) {
 			}, nil
 		},
 	})
-	instanceID, nodeID, _, wakeID, method, atCapacity, _, err := c.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, _, wakeID, method, atCapacity, _, err := c.AdmitInstance(context.Background(), "app-1", "")
 	if err != nil {
 		t.Fatalf("AdmitInstance: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestClientAdmitInstance_AtCapacityIsTypedResult(t *testing.T) {
 			return sched.WakeResult{AtCapacity: true}, nil
 		},
 	})
-	instanceID, nodeID, _, wakeID, method, atCapacity, _, err := c.AdmitInstance(context.Background(), "app-1")
+	instanceID, nodeID, _, wakeID, method, atCapacity, _, err := c.AdmitInstance(context.Background(), "app-1", "")
 	if err != nil {
 		t.Fatalf("AdmitInstance: at_capacity must NOT be lifted to an error; got %v", err)
 	}
@@ -238,7 +238,7 @@ func TestClientAdmitInstance_LiftsError(t *testing.T) {
 			return sched.WakeResult{}, api.ErrCapacity("no RAM headroom")
 		},
 	})
-	_, _, _, _, _, _, _, err := c.AdmitInstance(context.Background(), "app-1")
+	_, _, _, _, _, _, _, err := c.AdmitInstance(context.Background(), "app-1", "")
 	if err == nil {
 		t.Fatal("expected capacity denial on AdmitInstance")
 	}
@@ -265,7 +265,7 @@ func TestClientAdmitInstance_PropagatesPort(t *testing.T) {
 			}, nil
 		},
 	})
-	_, _, _, _, _, _, port, err := c.AdmitInstance(context.Background(), "app-1")
+	_, _, _, _, _, _, port, err := c.AdmitInstance(context.Background(), "app-1", "")
 	if err != nil {
 		t.Fatalf("AdmitInstance: %v", err)
 	}

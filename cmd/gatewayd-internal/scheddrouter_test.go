@@ -54,7 +54,7 @@ type stubSchedd struct {
 	target string
 }
 
-func (s *stubSchedd) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
+func (s *stubSchedd) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
 	panic("stubSchedd.AdmitInstance")
 }
 func (s *stubSchedd) Wake(context.Context, string, string) (string, string, string, string, int, error) {

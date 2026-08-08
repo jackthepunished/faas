@@ -346,7 +346,7 @@ func wakeN(t *testing.T, engine *Engine, appID string, n int) {
 	t.Helper()
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
-		ins, err := engine.AdmitInstance(ctx, appID)
+		ins, err := engine.AdmitInstance(ctx, appID, "")
 		if err != nil {
 			t.Fatalf("AdmitInstance[%d]: %v", i, err)
 		}

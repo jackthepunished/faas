@@ -34,7 +34,7 @@ type rotatingScheduler struct {
 	method     int32         // raw wake method for Admit
 }
 
-func (r *rotatingScheduler) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
+func (r *rotatingScheduler) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
 	idx := r.calls.Add(1)
 	nodeID := r.nextNodeID()
 	// Scheduler signature (issue #460 / ADR-053 PR-C + issue #556 PR-B):
@@ -67,7 +67,7 @@ func TestPGBackend_PickRotatesWithinWinningNode(t *testing.T) {
 
 	// Seed 4 admits (3 on A, 1 on B). HealthyCount is total.
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -81,14 +81,14 @@ func TestPGBackend_PickRotatesWithinWinningNode(t *testing.T) {
 	// rotating across the 3 A instances.
 	seenA := map[string]bool{}
 	for i := 0; i < 8; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-A" {
-			t.Errorf("Pick #%d returned NodeID = %q, want node-A (winning node by healthyCount)", i, t1.NodeID)
+		if t1.Target.NodeID != "node-A" {
+			t.Errorf("Pick #%d returned NodeID = %q, want node-A (winning node by healthyCount)", i, t1.Target.NodeID)
 		}
-		seenA[t1.InstanceID] = true
+		seenA[t1.Target.InstanceID] = true
 	}
 	// Round-robin across the 3 A instances.
 	if len(seenA) < 2 {
@@ -122,7 +122,7 @@ func TestPGBackend_PickPrefersWarmAffinityNode(t *testing.T) {
 	})
 
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -131,12 +131,12 @@ func TestPGBackend_PickPrefersWarmAffinityNode(t *testing.T) {
 	// tie-break). node-A should never be returned while node-B is
 	// non-empty.
 	for i := 0; i < 12; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-B" {
-			t.Errorf("Pick #%d returned NodeID = %q, want node-B (warm hint)", i, t1.NodeID)
+		if t1.Target.NodeID != "node-B" {
+			t.Errorf("Pick #%d returned NodeID = %q, want node-B (warm hint)", i, t1.Target.NodeID)
 		}
 	}
 }
@@ -162,19 +162,19 @@ func TestPGBackend_PickColdPathHonorsLexOrder(t *testing.T) {
 	// No WithWarmHint set → picker uses healthyCount + lex tie-break.
 
 	for i := 0; i < 2; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
 
 	// 6 picks: all from node-A (lex order wins on tied counts).
 	for i := 0; i < 6; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-A" {
-			t.Errorf("Pick #%d returned NodeID = %q, want node-A (lex tie-break)", i, t1.NodeID)
+		if t1.Target.NodeID != "node-A" {
+			t.Errorf("Pick #%d returned NodeID = %q, want node-A (lex tie-break)", i, t1.Target.NodeID)
 		}
 	}
 }
@@ -189,7 +189,7 @@ func TestPGBackend_PickSingleNodeFastPath(t *testing.T) {
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -198,14 +198,14 @@ func TestPGBackend_PickSingleNodeFastPath(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-A" {
-			t.Errorf("Pick #%d NodeID = %q, want node-A", i, t1.NodeID)
+		if t1.Target.NodeID != "node-A" {
+			t.Errorf("Pick #%d NodeID = %q, want node-A", i, t1.Target.NodeID)
 		}
-		seen[t1.InstanceID] = true
+		seen[t1.Target.InstanceID] = true
 	}
 	if len(seen) != 3 {
 		t.Errorf("distinct picks = %d, want 3 (round-robin across the single node)", len(seen))
@@ -232,7 +232,7 @@ func TestPGBackend_PickAfterEvictNodeEntry(t *testing.T) {
 	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil)
 
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -246,12 +246,12 @@ func TestPGBackend_PickAfterEvictNodeEntry(t *testing.T) {
 		t.Fatalf("HealthyCount after draining A = %d, want 1", got)
 	}
 	for i := 0; i < 4; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.InstanceID != "i-3" {
-			t.Errorf("Pick #%d returned InstanceID = %q, want i-3 (the surviving node-B entry)", i, t1.InstanceID)
+		if t1.Target.InstanceID != "i-3" {
+			t.Errorf("Pick #%d returned InstanceID = %q, want i-3 (the surviving node-B entry)", i, t1.Target.InstanceID)
 		}
 	}
 }
@@ -285,7 +285,7 @@ func TestPGBackend_PickFollowsWarmHintCache(t *testing.T) {
 
 	// Seed: 2 admits on each node (A, B, A, B → 2/2 split).
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -293,12 +293,12 @@ func TestPGBackend_PickFollowsWarmHintCache(t *testing.T) {
 	// Phase 1: empty cache. Picker uses healthyCount + lex
 	// tie-break → node-A wins. 4 picks all from node-A.
 	for i := 0; i < 4; i++ {
-		t1, ok := b.Pick("app")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok (phase 1)", i)
+		t1 := b.Pick("app")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-A" {
-			t.Errorf("Pick #%d (phase 1) = NodeID %q, want node-A (lex tie-break, empty cache)", i, t1.NodeID)
+		if t1.Target.NodeID != "node-A" {
+			t.Errorf("Pick #%d (phase 1) = NodeID %q, want node-A (lex tie-break, empty cache)", i, t1.Target.NodeID)
 		}
 	}
 
@@ -308,12 +308,12 @@ func TestPGBackend_PickFollowsWarmHintCache(t *testing.T) {
 	// but driven through the real cache instead of a closure).
 	cache.Update("app", "node-B")
 	for i := 0; i < 4; i++ {
-		t1, ok := b.Pick("app")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok (phase 2)", i)
+		t1 := b.Pick("app")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-B" {
-			t.Errorf("Pick #%d (phase 2) = NodeID %q, want node-B (warm hint via cache)", i, t1.NodeID)
+		if t1.Target.NodeID != "node-B" {
+			t.Errorf("Pick #%d (phase 2) = NodeID %q, want node-B (warm hint via cache)", i, t1.Target.NodeID)
 		}
 	}
 
@@ -321,12 +321,12 @@ func TestPGBackend_PickFollowsWarmHintCache(t *testing.T) {
 	// tie-break (node-A).
 	cache.Forget("app")
 	for i := 0; i < 4; i++ {
-		t1, ok := b.Pick("app")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok (phase 3)", i)
+		t1 := b.Pick("app")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.NodeID != "node-A" {
-			t.Errorf("Pick #%d (phase 3) = NodeID %q, want node-A (hint cleared via Forget)", i, t1.NodeID)
+		if t1.Target.NodeID != "node-A" {
+			t.Errorf("Pick #%d (phase 3) = NodeID %q, want node-A (hint cleared via Forget)", i, t1.Target.NodeID)
 		}
 	}
 }

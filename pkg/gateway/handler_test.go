@@ -79,7 +79,7 @@ func (b *fakeBackend) Lookup(_ context.Context, host string) (App, bool) {
 	return App{}, false
 }
 
-func (b *fakeBackend) Pick(_ string) (Target, bool) {
+func (b *fakeBackend) Pick(_ string) PickResult {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.failNextPick {
@@ -89,19 +89,21 @@ func (b *fakeBackend) Pick(_ string) (Target, bool) {
 		// consumed (single-shot) so a second Pick in the same test
 		// (e.g. a retry path) gets the normal round-robin.
 		b.failNextPick = false
-		return Target{}, false
+		return PickResult{}
 	}
 	if len(b.targets) > 0 {
 		idx := b.nextIdx.Add(1) - 1
-		return b.targets[int(idx%uint64(len(b.targets)))], true
+		t := b.targets[int(idx%uint64(len(b.targets)))]
+		return PickResult{Target: t, OK: true, Picked: t.DeploymentID}
 	}
 	if b.running {
 		// Legacy single-target mode (preserves pre-#168 test
 		// expectations): Target.NodeID doubles as the addr. WakeID
 		// is empty so the handler doesn't stamp x-faas-wake-id.
-		return Target{NodeID: b.upstream, InstanceID: "i-fake", WakeID: ""}, true
+		t := Target{NodeID: b.upstream, InstanceID: "i-fake", WakeID: ""}
+		return PickResult{Target: t, OK: true}
 	}
-	return Target{}, false
+	return PickResult{}
 }
 
 func (b *fakeBackend) HealthyCount(_ string) int {
@@ -116,7 +118,7 @@ func (b *fakeBackend) HealthyCount(_ string) int {
 	return 0
 }
 
-func (b *fakeBackend) Admit(_ context.Context, _ string, maxConcurrency int) (string, WakeMethod, bool, error) {
+func (b *fakeBackend) Admit(_ context.Context, _, _ string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Issue #168 fan-out invariant: the HealthyCount + addTarget pair
 	// must be serialized. The fakeBackend takes b.mu for the whole
 	// call so concurrent Admit callers cannot collectively exceed

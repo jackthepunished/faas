@@ -69,14 +69,14 @@ type rotatingDeployScheduler struct {
 	idx         int
 }
 
-func (r *rotatingDeployScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, string, int32, bool, int, error) {
+func (r *rotatingDeployScheduler) AdmitInstance(ctx context.Context, appID, _ string) (string, string, string, string, int32, bool, int, error) {
 	// Snapshot the deploymentID BEFORE the parent's AdmitInstance
 	// runs, since the parent mints ids and we want to drive our
 	// own counter.
 	dep := r.deployments[r.idx%len(r.deployments)]
 	r.idx++
 	r.FakeScheduler.WithDeploymentID(dep)
-	return r.FakeScheduler.AdmitInstance(ctx, appID)
+	return r.FakeScheduler.AdmitInstance(ctx, appID, "")
 }
 
 // TestPGBackend_PickWeighted_AcrossTwoDeployments (PR-B / issue #556):
@@ -102,7 +102,7 @@ func TestPGBackend_PickWeighted_AcrossTwoDeployments(t *testing.T) {
 	// Seed 5 admits: 2 on dep-25, 3 on dep-75 (both buckets non-empty
 	// so the cold-deployment fallback never fires).
 	for i := 0; i < 5; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 10); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -115,17 +115,17 @@ func TestPGBackend_PickWeighted_AcrossTwoDeployments(t *testing.T) {
 	const tolerance = totalPicks / 100 // 1% = 10 picks
 	gotDep25, gotDep75 := 0, 0
 	for i := 0; i < totalPicks; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		switch t1.DeploymentID {
+		switch t1.Target.DeploymentID {
 		case "dep-25":
 			gotDep25++
 		case "dep-75":
 			gotDep75++
 		default:
-			t.Fatalf("Pick #%d = DeploymentID %q, want dep-25 or dep-75", i, t1.DeploymentID)
+			t.Fatalf("Pick #%d = DeploymentID %q, want dep-25 or dep-75", i, t1.Target.DeploymentID)
 		}
 	}
 	if diff := gotDep25 - wantDep25; diff < -tolerance || diff > tolerance {
@@ -152,7 +152,7 @@ func TestPGBackend_PickRoundRobin_WithinDeployment(t *testing.T) {
 		t.Fatalf("RefreshDeploymentWeights: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
@@ -161,14 +161,14 @@ func TestPGBackend_PickRoundRobin_WithinDeployment(t *testing.T) {
 	const tolerance = 2
 	counts := map[string]int{}
 	for i := 0; i < totalPicks; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.DeploymentID != "dep-1" {
-			t.Errorf("Pick #%d = DeploymentID %q, want dep-1 (single deployment)", i, t1.DeploymentID)
+		if t1.Target.DeploymentID != "dep-1" {
+			t.Errorf("Pick #%d = DeploymentID %q, want dep-1 (single deployment)", i, t1.Target.DeploymentID)
 		}
-		counts[t1.InstanceID]++
+		counts[t1.Target.InstanceID]++
 	}
 	if len(counts) != 3 {
 		t.Fatalf("distinct instances picked = %d, want 3", len(counts))
@@ -194,19 +194,19 @@ func TestPGBackend_RefreshDeploymentWeights_OnNotifyDeploymentChanged(t *testing
 		t.Fatalf("initial refresh: %v", err)
 	}
 	for i := 0; i < 4; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
 
 	// Pre-refresh: 100% to dep-A.
 	for i := 0; i < 10; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("pre-refresh Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.DeploymentID != "dep-A" {
-			t.Errorf("pre-refresh Pick #%d = DeploymentID %q, want dep-A", i, t1.DeploymentID)
+		if t1.Target.DeploymentID != "dep-A" {
+			t.Errorf("pre-refresh Pick #%d = DeploymentID %q, want dep-A", i, t1.Target.DeploymentID)
 		}
 	}
 
@@ -240,7 +240,7 @@ func TestPGBackend_RefreshDeploymentWeights_OnNotifyDeploymentChanged(t *testing
 	// restore the 25/75 ratio.
 	sched.WithDeploymentID("dep-B")
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 10); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
 			t.Fatalf("dep-B Admit #%d: %v", i+1, err)
 		}
 	}
@@ -258,17 +258,17 @@ func TestPGBackend_RefreshDeploymentWeights_OnNotifyDeploymentChanged(t *testing
 	const tolerance = totalPicks / 100
 	gotA, gotB := 0, 0
 	for i := 0; i < totalPicks; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("post-refresh Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		switch t1.DeploymentID {
+		switch t1.Target.DeploymentID {
 		case "dep-A":
 			gotA++
 		case "dep-B":
 			gotB++
 		default:
-			t.Fatalf("post-refresh Pick #%d = DeploymentID %q, want dep-A or dep-B", i, t1.DeploymentID)
+			t.Fatalf("post-refresh Pick #%d = DeploymentID %q, want dep-A or dep-B", i, t1.Target.DeploymentID)
 		}
 	}
 	wantA, wantB := totalPicks*25/100, totalPicks*75/100
@@ -299,23 +299,23 @@ func TestPGBackend_PickSingleDeployment_ByteIdenticalToLegacy(t *testing.T) {
 		t.Fatalf("refresh: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if _, _, _, err := b.Admit(context.Background(), "app-1", 5); err != nil {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
 			t.Fatalf("Admit #%d: %v", i+1, err)
 		}
 	}
 	seen := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		t1, ok := b.Pick("app-1")
-		if !ok {
-			t.Fatalf("Pick #%d = !ok", i)
+		t1 := b.Pick("app-1")
+		if !t1.OK {
+			t.Fatal("Pick: !ok")
 		}
-		if t1.DeploymentID != "dep-only" {
-			t.Errorf("Pick #%d = DeploymentID %q, want dep-only", i, t1.DeploymentID)
+		if t1.Target.DeploymentID != "dep-only" {
+			t.Errorf("Pick #%d = DeploymentID %q, want dep-only", i, t1.Target.DeploymentID)
 		}
-		if t1.NodeID != "node-A" {
-			t.Errorf("Pick #%d = NodeID %q, want node-A", i, t1.NodeID)
+		if t1.Target.NodeID != "node-A" {
+			t.Errorf("Pick #%d = NodeID %q, want node-A", i, t1.Target.NodeID)
 		}
-		seen[t1.InstanceID] = true
+		seen[t1.Target.InstanceID] = true
 	}
 	if len(seen) != 3 {
 		t.Errorf("distinct instances = %d, want 3 (single-deployment round-robin)", len(seen))

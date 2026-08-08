@@ -764,7 +764,7 @@ func TestAdmitAndDispatch_WorkerClassExempt(t *testing.T) {
 		}
 		ops := wire.NewOpsMetrics("schedd")
 		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
-		r, err := e.AdmitInstance(context.Background(), app.ID)
+		r, err := e.AdmitInstance(context.Background(), app.ID, "")
 		if err != nil {
 			t.Fatalf("AdmitInstance: %v", err)
 		}
@@ -804,7 +804,7 @@ func TestAdmitAndDispatch_WorkerClassExempt(t *testing.T) {
 		// failure. The first-check MUST NOT fire (WorkloadClass is
 		// zero-value = stateless). Symmetric pin to the worker-class
 		// branch: AtCapacity must be false on the warm-up path.
-		r, err := e.AdmitInstance(context.Background(), app.ID)
+		r, err := e.AdmitInstance(context.Background(), app.ID, "")
 		if err != nil {
 			var p *api.Problem
 			if errors.As(err, &p) {
@@ -840,7 +840,7 @@ func TestAdmitAndDispatch_CooldownSwitchedToWaitForWarm(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("prime ledger: %v", err)
 	}
-	_, err := e.AdmitInstance(context.Background(), app.ID)
+	_, err := e.AdmitInstance(context.Background(), app.ID, "")
 	if err == nil {
 		t.Fatal("AdmitInstance = nil, want *api.Problem{CodeWaitForWarm}")
 	}
@@ -896,7 +896,7 @@ func TestAdmitAndDispatch_MinFloorAlready_StaysPlanLimitConcur(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("prime ledger 2: %v", err)
 	}
-	_, err := e.AdmitInstance(context.Background(), app.ID)
+	_, err := e.AdmitInstance(context.Background(), app.ID, "")
 	if err == nil {
 		t.Fatal("AdmitInstance = nil, want *api.Problem{CodePlanLimitConcur}")
 	}

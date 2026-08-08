@@ -31,18 +31,18 @@ type fixedBackend struct {
 func (f *fixedBackend) Lookup(_ context.Context, _ string) (gateway.App, bool) {
 	return f.app, f.appOK
 }
-func (f *fixedBackend) Pick(_ string) (gateway.Target, bool) {
+func (f *fixedBackend) Pick(_ string) gateway.PickResult {
 	if len(f.picks) == 0 {
-		return gateway.Target{}, false
+		return gateway.PickResult{}
 	}
 	t := f.picks[f.pickIdx%len(f.picks)]
 	f.pickIdx++
-	return t, true
+	return gateway.PickResult{Target: t, OK: true, Picked: t.DeploymentID}
 }
 func (f *fixedBackend) HealthyCount(_ string) int {
 	return len(f.picks)
 }
-func (f *fixedBackend) Admit(_ context.Context, _ string, _ int) (string, gateway.WakeMethod, bool, error) {
+func (f *fixedBackend) Admit(_ context.Context, _, _ string, _ int) (string, gateway.WakeMethod, bool, error) {
 	f.admitCalls++
 	if f.admitErr != nil {
 		return "", gateway.WakeMethodUnspecified, false, f.admitErr
@@ -62,13 +62,13 @@ func TestUnwiredBackendReturnsNotFound(t *testing.T) {
 	if _, ok := b.Lookup(context.Background(), "any"); ok {
 		t.Error("Lookup should report not-found")
 	}
-	if _, ok := b.Pick("any"); ok {
+	if res := b.Pick("any"); res.OK {
 		t.Error("Pick should report not-found")
 	}
 	if got := b.HealthyCount("any"); got != 0 {
 		t.Errorf("HealthyCount = %d, want 0", got)
 	}
-	if _, _, _, err := b.Admit(context.Background(), "any", 1); err != nil {
+	if _, _, _, err := b.Admit(context.Background(), "any", "", 1); err != nil {
 		t.Errorf("Admit should be no-op: %v", err)
 	}
 }
@@ -245,13 +245,13 @@ func TestFixedBackend_Delegates(t *testing.T) {
 	if a, ok := b.Lookup(context.Background(), "name"); !ok || a.ID != "a1" {
 		t.Errorf("Lookup = %+v,%v", a, ok)
 	}
-	if tgt, ok := b.Pick("a"); !ok || tgt.NodeID != "10.0.0.2:8080" {
-		t.Errorf("Pick = %+v,%v", tgt, ok)
+	if res := b.Pick("a"); !res.OK || res.Target.NodeID != "10.0.0.2:8080" {
+		t.Errorf("Pick = %+v,%v", res.Target, res.OK)
 	}
 	if got := b.HealthyCount("a"); got != 1 {
 		t.Errorf("HealthyCount = %d, want 1", got)
 	}
-	if _, _, _, err := b.Admit(context.Background(), "x", 1); err == nil || err.Error() != "upstream" {
+	if _, _, _, err := b.Admit(context.Background(), "x", "", 1); err == nil || err.Error() != "upstream" {
 		t.Errorf("Admit err = %v", err)
 	}
 	if b.admitCalls != 1 {
