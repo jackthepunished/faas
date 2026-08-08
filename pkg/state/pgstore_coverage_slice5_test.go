@@ -156,7 +156,7 @@ func TestPg_CoverageSetDeploymentParked(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
 	created := seedPgDeployment(t, s, ctx, app)
-	if err := s.SetDeploymentParked(ctx, created.ID, "idle", time.Now()); err != nil {
+	if err := s.SetDeploymentParked(ctx, created.ID, "admin_park", time.Now()); err != nil {
 		t.Errorf("SetDeploymentParked: %v", err)
 	}
 }

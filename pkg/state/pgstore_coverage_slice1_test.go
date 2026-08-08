@@ -50,7 +50,7 @@ func TestPg_CoverageAccountLifecycle(t *testing.T) {
 
 	// AccountByKeyHash — bind a key, then look it up by hash.
 	plainKey := []byte("pk_test_" + uuid.NewString())
-	apiKey, err := s.CreateAPIKey(ctx, acct.ID, plainKey, "test-key", nil)
+	apiKey, err := s.CreateAPIKey(ctx, acct.ID, plainKey, "test-key", []string{"apps:read"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
