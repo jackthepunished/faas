@@ -12,8 +12,9 @@ security and privacy attestations (SOC 2 Type 1, ISO 27001, GDPR DPA).
 | [subprocessors.md](subprocessors.md) | Public sub-processor list with category, data, region, DPA reference. | Platform + Legal | Draft |
 | [subprocessors.json](subprocessors.json) | Source-of-truth JSON for the sub-processor list; `subprocessor-check` CI gate renders `subprocessors.md` from this. | Platform | Draft |
 | [subprocessor-archive.json](subprocessor-archive.json) | Removed sub-processors with effective date + removal reason. | Platform | Draft |
-| [responsible-disclosure.md](responsible-disclosure.md) | Public security disclosure policy + 24/72/7-day SLAs + PGP. | Security | Open |
-| [../../SECURITY.md](../../SECURITY.md) | Repo-root mirror of `responsible-disclosure.md` (GitHub convention). | Security | Open |
+| [responsible-disclosure.md](responsible-disclosure.md) | Public security disclosure policy + 24/72/7-day SLAs + PGP. | Security | Draft |
+| [../../SECURITY.md](../../SECURITY.md) | Repo-root mirror of `responsible-disclosure.md` (GitHub convention). | Security | Draft |
+| [../../.well-known/security.txt](../../.well-known/security.txt) | RFC 9116 security.txt for tool-driven discovery. | Security | Draft |
 | [vendor-risk-management.md](vendor-risk-management.md) | Tier classification (critical / important / general) + per-tier assessment depth + re-assessment cadence. | Security | Open |
 | [vendor-assessments/](vendor-assessments/) | One file per critical-tier vendor with questionnaire + DPA + decision. | Security | Open |
 | [access-review.sql](access-review.sql) | Quarterly SQL template joining `accounts`, `keys`, `sessions`, `invitations`, `events`, `usage_monthly`. | Security | Open |
@@ -23,7 +24,7 @@ security and privacy attestations (SOC 2 Type 1, ISO 27001, GDPR DPA).
 
 - `docs/DPA.md` — the in-repo Data Processing Addendum template. Production binding lives at `/etc/faas/dpa.md` (rendered from a template, single source of truth).
 - `docs/faas_implementation_spec.md` §5.1 (audit event taxonomy), §11 (security hardening checklist), §12 (observability SLOs), §17 (known gaps register — GDPR G6 lives there).
-- `docs/adr/020-customer-secrets.md` (sealed secrets), `039-server-side-session-revocation.md` (sessions), `042-webhook-replay-protection.md` (replay dedupe), `054-...` (code signing), `077-step-up-mfa.md`, `079-liveness-probe-restart-wedged-vm.md`.
+- `docs/adr/020-customer-secrets.md` (sealed secrets), `021-account-export-and-staged-deletion.md` (GDPR endpoints), `042-webhook-replay-protection.md` (replay dedupe), `058-cosign-deploy-time-enforcement.md` (code signing), `077-step-up-mfa.md`, `079-liveness-probe-restart-wedged-vm.md`.
 
 ## Tracking
 
