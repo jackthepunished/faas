@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.gregale.dev/dpa/subprocessors.schema.json",
+  "version": "1.0.0",
+  "effective_date": "2026-08-08",
+  "notice_window_days": 30,
+  "controller_artifact_path": "docs/compliance/subprocessors.json",
+  "rendered_artifact_path": "docs/compliance/subprocessors.md",
+  "generator": "cmd/subprocessor-md",
+  "dpa_reference": "docs/DPA.md §7",
+  "sub_processors": [
+    {
+      "id": "postgres-hosting",
+      "category": "database",
+      "vendor": "Hetzner",
+      "service": "Hetzner managed single-tenant Postgres",
+      "data_categories": [
+        "account metadata",
+        "app metadata",
+        "deployment artifacts (digests only — secrets never stored here)",
+        "audit events",
+        "usage metering records"
+      ],
+      "data_region": "EU (FSN1 / NBG1 datacenters)",
+      "encryption": "AES-256 at rest; TLS 1.3 in transit",
+      "retention_days": 30,
+      "dpa_signed": true,
+      "dpa_reference": "docs/DPA.md §7",
+      "operator_switch_env": null,
+      "rationale": "Single source of truth for platform state. The model budget (spec §13) assumes EU jurisdiction; FSN1/NBG1 gives us that."
+    },
+    {
+      "id": "stripe-billing",
+      "category": "billing",
+      "vendor": "Stripe",
+      "service": "Stripe Billing + metered usage records",
+      "data_categories": [
+        "customer email",
+        "plan tier",
+        "metered usage (account-id + hours + MB-RAM-hours)",
+        "invoice items"
+      ],
+      "data_region": "US (Stripe default) — controller can opt into EU via Stripe account settings",
+      "encryption": "Stripe-managed; PCI-DSS Level 1 attestation",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "Stripe Data Processing Addendum (linked from Stripe Dashboard)",
+      "operator_switch_env": "FAAS_BILLING_PROVIDER",
+      "rationale": "Default billing provider. We pass account-id + plan + metered usage; Stripe handles card data under its own PCI-DSS attestation. Processor never sees card numbers."
+    },
+    {
+      "id": "paddle-billing",
+      "category": "billing",
+      "vendor": "Paddle",
+      "service": "Paddle Billing (opt-in alternative to Stripe)",
+      "data_categories": [
+        "customer email",
+        "plan tier",
+        "metered usage (account-id + hours + MB-RAM-hours)"
+      ],
+      "data_region": "EU (Paddle default) or US (Paddle US entity)",
+      "encryption": "Paddle-managed; PCI-DSS Level 1 attestation",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "Paddle Data Processing Addendum (linked from Paddle Dashboard)",
+      "operator_switch_env": "FAAS_BILLING_PROVIDER",
+      "rationale": "Opt-in alternative for EU-jurisdiction customers who want EU billing data residency. Paddle Billing has no usage-summary endpoint, so ReconcileUsage + Refund return ErrNotImplemented for Paddle accounts (issue #279)."
+    },
+    {
+      "id": "transactional-email-resend",
+      "category": "transactional-email",
+      "vendor": "Resend",
+      "service": "Resend transactional email transport",
+      "data_categories": [
+        "recipient email (account holder only)",
+        "subject + body of the transactional message"
+      ],
+      "data_region": "US (Resend default)",
+      "encryption": "TLS 1.3 in transit",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "Resend Data Processing Addendum (linked from Resend Dashboard)",
+      "operator_switch_env": "FAAS_MAIL_TRANSPORT",
+      "rationale": "Optional transactional email transport. Production wires FAAS_MAIL_TRANSPORT=resend; default in dev is 'log' (writes to slog; no third-party processing). Email bodies contain no end-user PII — they target the account holder only."
+    },
+    {
+      "id": "transactional-email-postmark",
+      "category": "transactional-email",
+      "vendor": "Postmark",
+      "service": "Postmark transactional email transport",
+      "data_categories": [
+        "recipient email (account holder only)",
+        "subject + body of the transactional message"
+      ],
+      "data_region": "US (Postmark default)",
+      "encryption": "TLS 1.3 in transit",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "Postmark Data Processing Addendum (linked from Postmark Dashboard)",
+      "operator_switch_env": "FAAS_MAIL_TRANSPORT",
+      "rationale": "Optional transactional email transport. Production wires FAAS_MAIL_TRANSPORT=postmark; default in dev is 'log' (writes to slog; no third-party processing). Email bodies contain no end-user PII."
+    },
+    {
+      "id": "off-host-backup-storage",
+      "category": "off-host-backup",
+      "vendor": "Hetzner",
+      "service": "Hetzner Storage Box (SFTP + rclone)",
+      "data_categories": [
+        "encrypted Postgres dump (AES-256 / X25519-sealed via ADR-020)"
+      ],
+      "data_region": "EU (FSN1 / NBG1 datacenters)",
+      "encryption": "Storage Box sees ciphertext only — encryption with operator's host X25519 age recipient happens BEFORE transit (ADR-020)",
+      "retention_days": 30,
+      "dpa_signed": true,
+      "dpa_reference": "docs/DPA.md §7",
+      "operator_switch_env": null,
+      "rationale": "Off-host encrypted backups (DR drill requirement, SOC 2 CC7.5 / ISO 27001 A.5.29/A.5.30). The customer's own storage box is the Processor-side target; Processor holds the decryption key but does not access backup contents absent a Controller-initiated restore request."
+    },
+    {
+      "id": "oauth-google",
+      "category": "identity-provider",
+      "vendor": "Google",
+      "service": "Google OAuth (OpenID Connect)",
+      "data_categories": [
+        "OAuth subject (sub)",
+        "verified email address",
+        "optional profile name and avatar URL"
+      ],
+      "data_region": "US (Google default)",
+      "encryption": "TLS 1.3 in transit",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "Google Cloud Data Processing Addendum (linked from Google Cloud Console)",
+      "operator_switch_env": null,
+      "rationale": "Account holders who choose Google login exchange the OAuth subject and a verified email — and the optional profile name and avatar URL — at POST /v1/auth/google/callback. No contact list, no Drive, no repo list. Scopes are openid email profile."
+    },
+    {
+      "id": "oauth-github",
+      "category": "identity-provider",
+      "vendor": "GitHub",
+      "service": "GitHub OAuth",
+      "data_categories": [
+        "GitHub user-id",
+        "primary verified email address",
+        "login handle",
+        "optional name and avatar URL"
+      ],
+      "data_region": "US (GitHub default)",
+      "encryption": "TLS 1.3 in transit",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "GitHub Data Protection Addendum (linked from GitHub Settings)",
+      "operator_switch_env": null,
+      "rationale": "Account holders who choose GitHub login exchange the GitHub user-id, primary verified email, and login handle — and the optional name and avatar URL — at POST /v1/auth/github/callback. No repo list, no contact list, no org list. Scopes are read:user user:email."
+    },
+    {
+      "id": "github-checks-api",
+      "category": "developer-platform",
+      "vendor": "GitHub",
+      "service": "GitHub Checks API + install-token exchange (outbound from githubd)",
+      "data_categories": [
+        "SHA-only commit metadata (Checks API)",
+        "OAuth install-token exchange payloads"
+      ],
+      "data_region": "US (GitHub default)",
+      "encryption": "TLS 1.3 in transit",
+      "retention_days": null,
+      "dpa_signed": true,
+      "dpa_reference": "GitHub Data Protection Addendum (linked from GitHub Settings)",
+      "operator_switch_env": null,
+      "rationale": "githubd daemon is the only outbound caller to api.github.com. Outbound traffic carries SHA-only commit metadata (Checks) and OAuth install-token exchange — no customer PII. Inbound webhook reception at POST /webhooks/github is HMAC-SHA-256 verified (X-Hub-Signature-256, constant-time compare) before any payload is consumed."
+    }
+  ]
+}

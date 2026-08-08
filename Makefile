@@ -521,12 +521,12 @@ spec-lint: spec-install ## vacuum lint (style + rules) on the OpenAPI spec
 	@vacuum lint -r $(VACUUM_RULES) $(SPEC)
 
 .PHONY: spec-check
-spec-check: spec-install spec-lint spec-sync denylist-md ## CI gate: vacuum lint + AST parity + git clean + denylist.md drift (runs in PR CI)
+spec-check: spec-install spec-lint spec-sync denylist-md subprocessor-md ## CI gate: vacuum lint + AST parity + git clean + denylist.md + subprocessor.md drift (runs in PR CI)
 	# No -race: the AST tests are pure CPU (no I/O, no goroutines). -race
 	# would double the wall time without adding signal.
 	@$(GO) test -count=1 -run TestSpecCompliance ./cmd/apid/...
-	@git diff --exit-code -- $(SPEC) $(SPEC_EMBED) $(VACUUM_RULES) docs/denylist.md || \
-	  (echo "spec-check: drift (spec or denylist.md) — re-run 'make spec-check' or hand-fix to match"; exit 1)
+	@git diff --exit-code -- $(SPEC) $(SPEC_EMBED) $(VACUUM_RULES) docs/denylist.md docs/compliance/subprocessors.md || \
+	  (echo "spec-check: drift (spec, denylist.md, or subprocessor.md) — re-run 'make spec-check' or hand-fix to match"; exit 1)
 	@echo "spec-check: OK"
 
 .PHONY: images-lock-check
@@ -566,6 +566,15 @@ denylist-md: ## Regenerate docs/denylist.md from the shared egress catalog (ADR-
 	# git diff stays reviewable.
 	@$(GO) run ./cmd/denylist-md > docs/denylist.md
 	@echo "denylist-md: docs/denylist.md regenerated"
+
+.PHONY: subprocessor-md
+subprocessor-md: ## Regenerate docs/compliance/subprocessors.md from docs/compliance/subprocessors.json
+	# Pure-Go generator — same shape as denylist-md. Enforces the DPA §7
+	# 30-day notice window: any sub-processor entry with an effective_date
+	# younger than notice_published_at + 30d fails the run. Order: by id
+	# ascending so the diff stays reviewable.
+	@$(GO) run ./cmd/subprocessor-md > docs/compliance/subprocessors.md
+	@echo "subprocessor-md: docs/compliance/subprocessors.md regenerated"
 
 .PHONY: sdk-check
 sdk-check: ## CI gate: every OpenAPI route has a typed SDK method on pkg/api.Client

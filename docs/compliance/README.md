@@ -9,9 +9,9 @@ security and privacy attestations (SOC 2 Type 1, ISO 27001, GDPR DPA).
 |---|---|---|---|
 | [soc2-control-mapping.md](soc2-control-mapping.md) | Maps every SOC 2 Trust Services Criteria (TSC) control to the artifact in the codebase that satisfies it. | Platform | Draft |
 | [iso27001-statement-of-applicability.md](iso27001-statement-of-applicability.md) | ISO/IEC 27001:2022 Annex A — Applicable / Not-applicable per control + rationale. | Platform | Draft |
-| [subprocessors.md](subprocessors.md) | Public sub-processor list with category, data, region, DPA reference. | Platform + Legal | Open |
-| [subprocessors.json](subprocessors.json) | Source-of-truth JSON for the sub-processor list; `subprocessor-check` CI gate renders `subprocessors.md` from this. | Platform | Open |
-| [subprocessor-archive.json](subprocessor-archive.json) | Removed sub-processors with effective date + removal reason. | Platform | Open |
+| [subprocessors.md](subprocessors.md) | Public sub-processor list with category, data, region, DPA reference. | Platform + Legal | Draft |
+| [subprocessors.json](subprocessors.json) | Source-of-truth JSON for the sub-processor list; `subprocessor-check` CI gate renders `subprocessors.md` from this. | Platform | Draft |
+| [subprocessor-archive.json](subprocessor-archive.json) | Removed sub-processors with effective date + removal reason. | Platform | Draft |
 | [responsible-disclosure.md](responsible-disclosure.md) | Public security disclosure policy + 24/72/7-day SLAs + PGP. | Security | Open |
 | [../../SECURITY.md](../../SECURITY.md) | Repo-root mirror of `responsible-disclosure.md` (GitHub convention). | Security | Open |
 | [vendor-risk-management.md](vendor-risk-management.md) | Tier classification (critical / important / general) + per-tier assessment depth + re-assessment cadence. | Security | Open |
