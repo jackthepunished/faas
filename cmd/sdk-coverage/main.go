@@ -261,6 +261,19 @@ var methodRouteMap = map[string]string{
 	"POST /v1/projects/scan": "ScanProject",
 	"POST /v1/projects":      "ApplyProjectPlan",
 
+	// PR-P3 — operator billing surface (issue #279 / ADR-049 + ADR-050).
+	// The auto-derivation produces names with literal hyphens
+	// (e.g. "GetAdminBilling-paddle-catalog") because the spec paths
+	// carry the k8s-style hyphen; the SDK verbs follow the operationId
+	// (ListPaddleCatalog, ResetPaddleCatalog, SyncPaddleCatalog,
+	// ReconcileAccount) so the explicit map drops the path-separator
+	// noise and keeps the SDK surface cohesive with the CLI
+	// (`faas billing status|price-catalog ...`).
+	"GET /v1/admin/billing-paddle-catalog":       "ListPaddleCatalog",
+	"DELETE /v1/admin/billing-paddle-catalog":    "ResetPaddleCatalog",
+	"POST /v1/admin/billing-paddle-catalog/sync": "SyncPaddleCatalog",
+	"POST /v1/admin/billing-reconcile/{id}":      "ReconcileAccount",
+
 	// Issue #273 / ADR-042 — per-app metrics. The auto-derivation
 	// would produce GetAppsSlugMetrics (Swagger-style); the SDK
 	// names it GetAppMetrics to match the existing per-app methods

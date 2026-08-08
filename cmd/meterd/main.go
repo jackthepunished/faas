@@ -83,6 +83,14 @@ type scheddCPUAdapter struct {
 
 const scheddCPUAdapterTTL = 30 * time.Second
 
+// Provider name constants used throughout meterd. Centralised so the
+// goconst linter doesn't trip when a new call site appears, and so a
+// rename only touches one place.
+const (
+	provStripe = "stripe"
+	provPaddle = "paddle"
+)
+
 func (a *scheddCPUAdapter) CPUUsageUsec(instanceID string) (uint64, bool) {
 	a.refresh()
 	a.mu.Lock()
@@ -680,20 +688,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if loadErr != nil {
 			return fmt.Errorf("meterd: load billing provider: %w", loadErr)
 		}
-		// Empty STRIPE_API_KEY on a Stripe box is a soft-warn today
+		// Empty API key on a Stripe box is a soft-warn today
 		// (pushUsageRecordSDKSum returns an error per call, the loop
-		// logs and skips); with the Paddle provider, FAAS_PADDLE_API_KEY
-		// must be set or the SDK refuses to initialize. Surface the
-		// provider name so an operator can match the warning to the
-		// right env var.
-		if provName == "stripe" && deps.getenv("STRIPE_API_KEY") == "" {
-			log.Warn("STRIPE_API_KEY is empty — daily Stripe push will no-op (pushUsageRecordSDKSum returns an error without a key)",
-				"provider", provName)
-		}
-		if provName == "paddle" && deps.getenv("FAAS_PADDLE_API_KEY") == "" {
-			log.Warn("FAAS_PADDLE_API_KEY is empty — daily Paddle push will no-op",
-				"provider", provName)
-		}
+		// logs and skips); with the Paddle provider, the API key must
+		// be set or the SDK refuses to initialize. Surface the provider
+		// name so an operator can match the warning to the right
+		// source.
+		//
+		// Read from the merged cfg (env wins if non-empty, TOML is the
+		// fallback — pkg/billing/loader/config.go::ApplyBillingEnvOverlay)
+		// so a TOML-only deploy doesn't emit a false-positive warning.
+		// Reading deps.getenv directly here would warn even when the
+		// TOML key is present and the SDK initializes fine.
+		warnIfEmptyAPIKey(log, billingCfg, provName)
 		log.Info("meterd billing provider loaded", "provider", provName)
 	}
 
@@ -1072,4 +1079,27 @@ func (a storageStoreAdapter) LatestSnapshotBytes(ctx context.Context, appID stri
 
 func (a storageStoreAdapter) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {
 	return a.s.AppendSnapshotStorage(ctx, accountID, appID, day, snapshotBytes, layerBytes)
+}
+
+// warnIfEmptyAPIKey emits a soft warning when the active provider has no
+// API key in the merged config. Reading from billingCfg — the merged view
+// after ApplyBillingEnvOverlay (env wins if non-empty, TOML is the
+// fallback) — means a TOML-only deploy doesn't trigger a false-positive
+// warn on every boot.
+//
+// Extracted so tests can pin the behaviour without spinning up runWithDeps.
+func warnIfEmptyAPIKey(log *slog.Logger, billingCfg *billingloader.RootBillingConfig, provName string) {
+	if billingCfg == nil {
+		return
+	}
+	if provName == provStripe && billingCfg.Stripe != nil && billingCfg.Stripe.APIKey == "" {
+		log.Warn("Stripe API key is empty — daily Stripe push will no-op (pushUsageRecordSDKSum returns an error without a key)",
+			"provider", provName)
+		return
+	}
+	if provName == provPaddle && billingCfg.Paddle != nil && billingCfg.Paddle.APIKey == "" {
+		log.Warn("Paddle API key is empty — daily Paddle push will no-op",
+			"provider", provName)
+		return
+	}
 }

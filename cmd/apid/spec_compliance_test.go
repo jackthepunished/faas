@@ -42,6 +42,7 @@ const (
 	orgsFile      = "orgs.go"          // issue #190 / IAM-6 / ADR-061 PR 5
 	scanFile      = "dto_scan.go"      // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
 	webhooksFile  = "webhooks.go"      // issue #476 / ADR-076
+	billingFile   = "billing.go"       // PR-P3 — admin reconcile + future billing DTOs
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -544,6 +545,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", orgsFile),
 		filepath.Join(root, "pkg", "api", scanFile),
 		filepath.Join(root, "pkg", "api", webhooksFile),
+		filepath.Join(root, "pkg", "api", billingFile),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {

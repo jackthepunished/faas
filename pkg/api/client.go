@@ -1957,3 +1957,67 @@ func (c *Client) GetMyOrg(ctx context.Context) (OrgMeResponse, error) {
 	var out OrgMeResponse
 	return out, c.do(ctx, "GET", "/v1/orgs/me", nil, &out)
 }
+
+// --- PR-P3 admin billing surface -------------------------------------------
+//
+// Four methods backing the operator-facing CLI subcommands:
+//
+//	ListPaddleCatalog  — GET    /v1/admin/billing-paddle-catalog
+//	SyncPaddleCatalog  — POST   /v1/admin/billing-paddle-catalog/sync
+//	ResetPaddleCatalog — DELETE /v1/admin/billing-paddle-catalog
+//	ReconcileAccount   — POST   /v1/admin/billing-reconcile/{id}
+//
+// Auth: admin-scoped API key + email in FAAS_ADMIN_EMAILS allowlist.
+// The handlers return 501 with code billing_op_unsupported when the
+// active provider does not implement paddle.OpProvider (Stripe
+// today). The client surfaces that as a typed error via c.do's
+// Problem unmarshal; callers that care can branch on the code.
+
+// ListPaddleCatalog fetches the cached Paddle price + product
+// catalog. Returns 200 + BillingCatalogResponse on success; the
+// handler 501s on non-Paddle providers.
+func (c *Client) ListPaddleCatalog(ctx context.Context) (BillingCatalogResponse, error) {
+	var out BillingCatalogResponse
+	return out, c.do(ctx, "GET", "/v1/admin/billing-paddle-catalog", nil, &out)
+}
+
+// SyncPaddleCatalog forces an EnsurePlanProducts round-trip and
+// returns the post-sync catalog. idemKey is the Idempotency-Key
+// header value; pass an empty string to let the SDK auto-UUIDv4
+// (the typical CLI path; the dashboard's manual retry uses a
+// stable "cli-paddle-sync-<ts>" key).
+func (c *Client) SyncPaddleCatalog(ctx context.Context, idemKey string) (BillingCatalogResponse, error) {
+	if idemKey == "" {
+		idemKey = newUUIDv4()
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		c.baseURL+"/v1/admin/billing-paddle-catalog/sync", nil)
+	if err != nil {
+		return BillingCatalogResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Idempotency-Key", idemKey)
+	var out BillingCatalogResponse
+	return out, c.doReq(c.http, req, &out)
+}
+
+// ResetPaddleCatalog signals a Paddle catalog reset. The handler
+// is a no-op for Paddle (catalog is durable on the platform); the
+// CLI prints the "delete products from the Paddle Dashboard, then
+// call sync" warning based on the empty entries + empty synced_at
+// in the response.
+func (c *Client) ResetPaddleCatalog(ctx context.Context) (BillingCatalogResponse, error) {
+	var out BillingCatalogResponse
+	return out, c.do(ctx, "DELETE", "/v1/admin/billing-paddle-catalog", nil, &out)
+}
+
+// ReconcileAccount runs a single-account reconcile against the
+// active billing Provider. accountID is the target account UUID.
+// Stripe implements this; Paddle returns 501 with code
+// billing_reconcile_unsupported.
+func (c *Client) ReconcileAccount(ctx context.Context, accountID string) (BillingReconcileResponse, error) {
+	var out BillingReconcileResponse
+	return out, c.do(ctx, "POST", "/v1/admin/billing-reconcile/"+accountID, nil, &out)
+}

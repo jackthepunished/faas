@@ -195,6 +195,15 @@ e2e: ## End-to-end tests in cmd/e2e (needs Postgres reachable; metal subset via 
 	# reruns + cold-cache cold-runner edge cases.
 	$(GO) test -race -count=1 -timeout=20m ./cmd/e2e/...
 
+.PHONY: e2e-sandbox
+e2e-sandbox: ## Live Paddle sandbox walk (operator-only; PR-P3). Reads secrets from secrets/.env.sandbox — NEVER committed.
+	@test -f secrets/.env.sandbox || (echo "secrets/.env.sandbox missing; create it with FAAS_PADDLE_SANDBOX_API_KEY + FAAS_PADDLE_SANDBOX_WEBHOOK_SECRET from api.sandbox.paddle.com" ; exit 1)
+	@test -n "$$DATABASE_URL" || (echo "DATABASE_URL not set; set it to a reachable Postgres to run e2e-sandbox" ; exit 1)
+	# Operator-only: the test self-skips unless FAAS_PADDLE_SANDBOX_E2E=1
+	# is exported. The build tag keeps the file out of `go test ./...`
+	# CI runs. The secrets file is gitignored.
+	FAAS_PADDLE_SANDBOX_E2E=1 $(GO) test -tags paddle_sandbox_e2e -race -count=1 -run=PaddleSandbox -timeout=10m ./cmd/e2e/...
+
 .PHONY: backup-pg
 backup-pg: ## Take a Postgres base backup into /var/lib/pgsql/basebackup/basebackup-<UTC>/ (spec §14 M8)
 	@test -d /var/lib/pgsql/basebackup || (echo "/var/lib/pgsql/basebackup missing — run the postgres role first" ; exit 1)

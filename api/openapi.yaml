@@ -4493,6 +4493,155 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Operator billing surface (PR-P3) ────────────────────────────────────
+  # Admin-only + admin-allowlist-gated surface for inspecting and
+  # mutating the billing Provider catalog. The Paddle catalog
+  # handlers type-assert to paddle.OpProvider; on Stripe the
+  # assertion fails and the handler returns 501 with code
+  # billing_op_unsupported. The reconcile endpoint works against
+  # any provider that implements billing.Provider.ReconcileUsage
+  # (Stripe today; Paddle returns ErrNotImplemented and maps to
+  # 501 via the handler).
+  /v1/admin/billing-paddle-catalog:
+    get:
+      tags: [admin]
+      operationId: listPaddleCatalog
+      summary: Read the cached Paddle price + product catalog (admin-only).
+      description: |
+        Returns the in-memory catalog snapshot from *paddle.Provider.
+        synced_at is the timestamp of the most recent successful
+        EnsurePlanProducts call; an empty string means no hydration
+        has run yet. On a Stripe deployment the handler returns 501
+        with code billing_op_unsupported — the type assertion at
+        the dispatcher fails and the surface is provider-scoped.
+      responses:
+        '200':
+          description: Catalog snapshot. Entries may be empty if no hydration has run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BillingCatalogResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — GET /v1/admin/billing-paddle-catalog requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '501':
+          description: 'code: billing_op_unsupported — active provider does not implement the paddle.OpProvider surface.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    delete:
+      tags: [admin]
+      operationId: resetPaddleCatalog
+      summary: Signal a Paddle catalog reset (admin-only).
+      description: |
+        Paddle's catalog is durable on the platform — the in-memory
+        reset is a no-op (returns nil immediately) and the handler
+        renders a 200 with empty entries so the CLI can print the
+        "delete products from the Paddle Dashboard, then call
+        sync" message. Future work (issue #279+) may add
+        merchant-side cleanup; this handler will then return 502
+        on SDK failure rather than 200.
+      responses:
+        '200':
+          description: Reset signal recorded. Always returns empty entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BillingCatalogResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — DELETE /v1/admin/billing-paddle-catalog requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '501':
+          description: 'code: billing_op_unsupported — provider does not implement paddle.OpProvider.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/admin/billing-paddle-catalog/sync:
+    post:
+      tags: [admin]
+      operationId: syncPaddleCatalog
+      summary: Force a Paddle catalog hydration (admin-only).
+      description: |
+        Idempotent: re-running on the same platform hits the
+        Status=active filter on ListProducts, finds existing
+        products/prices, and skips POST. Idempotency-Key middleware
+        replays the same 200 for a flaky-network retry so the SDK
+        round-trip is not re-issued. Returns the post-sync catalog.
+      responses:
+        '200':
+          description: Post-sync catalog. synced_at is "now" by construction.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BillingCatalogResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — POST /v1/admin/billing-paddle-catalog/sync requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '501':
+          description: 'code: billing_op_unsupported — active provider does not advertise paddle.OpProvider; the type assertion at the dispatcher fails.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: 'code: billing_sync_failed — Paddle SDK round-trip failed.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/admin/billing-reconcile/{id}:
+    post:
+      tags: [admin]
+      operationId: reconcileAccount
+      summary: Run a single-account reconcile against the active billing Provider (admin-only).
+      description: |
+        Loads the account, calls billing.Provider.ReconcileUsage for
+        a rolling 30-day window [start, end). Stripe implements
+        this (ADR-049 §B.1); Paddle returns billing.ErrNotImplemented
+        and the handler maps to 501. The response surfaces the
+        SDK-returned mb_seconds total so an operator can diff
+        against the local usage_minutes sum.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: Account UUID whose 30-day reconcile window the operator wants to inspect.
+      responses:
+        '200':
+          description: Reconcile ran. mb_seconds is the SDK-returned total for [start, end).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BillingReconcileResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — POST /v1/admin/billing-reconcile/{id} requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '501':
+          description: 'code: billing_reconcile_unsupported — provider does not implement ReconcileUsage.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: 'code: billing_reconcile_failed — SDK round-trip failed.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Organizations (issue #190 / IAM-6 / ADR-061, PR 5 + PR 7) ──────────
   # Customer-visible org surface. Account-scoped (/v1/orgs list +
   # create) and path-scoped (/v1/orgs/{slug}/...) routes. The
@@ -6406,6 +6555,58 @@ components:
           type: [string, "null"]
           format: uri
           description: 'Substituted portal URL; absent when the box has no portal configured.'
+
+    BillingReconcileResponse:
+      description: |
+        Returned by POST /v1/admin/billing-reconcile/{id} (PR-P3).
+        mb_seconds is the integer total the provider SDK returned
+        for the rolling 30-day window [start, end). Operators can
+        diff the SDK-side number against the local usage_minutes
+        sum to spot drift between the platform's billing source
+        of truth and the provider's ledger.
+      type: object
+      required: [account_id, start, end, mb_seconds]
+      properties:
+        account_id: { type: string, format: uuid }
+        start:      { type: string, format: date-time, description: 'Window start (RFC 3339, UTC).' }
+        end:        { type: string, format: date-time, description: 'Window end (RFC 3339, UTC).' }
+        mb_seconds: { type: integer, minimum: 0, description: 'Integer mb_seconds total for the window.' }
+
+    BillingCatalogEntry:
+      description: |
+        One row in the Paddle price + product catalog (PR-P3).
+        Plan values are the billable api.Plan constants
+        ("hobby", "pro", "scale") — PlanFree is intentionally
+        absent because it carries no recurring line item.
+        Handle is the Paddle-side id (pri_… for monthly / overage,
+        pro_… for product). SyncedAt is RFC 3339 UTC from the
+        catalog's lastSyncAt.
+      type: object
+      required: [plan, kind, handle, synced_at]
+      properties:
+        plan:     { type: string, enum: [hobby, pro, scale] }
+        kind:     { type: string, enum: [monthly, overage, product] }
+        handle:   { type: string, description: 'Paddle price (pri_…) or product (pro_…) ID.' }
+        synced_at: { type: string, format: date-time }
+
+    BillingCatalogResponse:
+      description: |
+        Wire shape for GET / POST / DELETE
+        /v1/admin/billing-paddle-catalog (PR-P3). Provider is
+        the active billing provider's name (paddle / stripe);
+        on a Stripe deployment the handler 501s before
+        serializing this struct. SyncedAt is the timestamp of
+        the most recent successful EnsurePlanProducts call;
+        empty string when no hydration has yet completed
+        (POST and DELETE both reset it).
+      type: object
+      required: [provider, synced_at, entries]
+      properties:
+        provider:  { type: string, description: 'Active provider name (paddle / stripe).' }
+        synced_at: { type: string, description: 'RFC 3339 last-sync timestamp; empty string when never synced.' }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/BillingCatalogEntry' }
 
     BuildProvenanceResponse:
       description: |
