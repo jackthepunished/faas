@@ -433,10 +433,10 @@ func runCheck(args []string, quiet bool) error {
 //   - `~` drifted: generated file's bytes differ from committed ⇒ FAIL
 //   - `+` only in regenerated: generated file missing from committed ⇒ FAIL
 //   - `-` only in committed: committed file not generated ⇒ NOT a failure.
-//     Legacy artefacts (faas-gatewayd.service, README.md, pg-basebackup-*,
-//     *.toml.example, faas.conf) are preserved on purpose — removing them
-//     is a separate ops change, not a generator regression. Preserved
-//     artefacts do NOT trip the gate.
+//     Legacy artefacts (README.md, pg-basebackup-*, *.toml.example,
+//     faas.conf) are preserved on purpose — removing them is a separate ops
+//     change, not a generator regression. Preserved artefacts do NOT trip
+//     the gate.
 //
 // Reports the names that drift; `quiet` controls print/no-print.
 func compareTrees(committed, regenerated string, quiet bool) error {

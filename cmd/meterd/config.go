@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -35,9 +36,12 @@ type Config struct {
 	ScheddTLSCAPath   string `toml:"schedd_tls_ca_path"`
 
 	// GatewayEgressSocket is the gatewayd egress dial target meterd
-	// dials to read tx_bytes (ADR-046). Defaults to
-	// /run/faas/gatewayd-egress.sock; multi-box deployments override
-	// with tcp:// or dns:// plus the gateway_egress_tls_* cluster.
+	// dials to read tx_bytes (ADR-046). Defaults to the legacy
+	// /run/faas/gatewayd-egress.sock (preserved verbatim through the
+	// PR-A refactor; PR-C flips the default to egresssocket.DefaultSocketPath
+	// and adds a read-both-prefer-new fallback for one release cycle).
+	// Multi-box deployments override with tcp:// or dns:// plus the
+	// gateway_egress_tls_* cluster.
 	GatewayEgressSocket string `toml:"gateway_egress_socket"`
 
 	// GatewayEgressTLSCertPath / Key / CA configure the mTLS material
@@ -69,7 +73,7 @@ func (c *Config) LoadGatewayEgressTLS() (*tls.Config, error) {
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
 		SocketPath:          "/run/faas/schedd.sock",
-		GatewayEgressSocket: "/run/faas/gatewayd-egress.sock",
+		GatewayEgressSocket: egresssocket.LegacySocketPath,
 		Meter:               &meter.Config{},
 	}
 	b, err := os.ReadFile(path)
