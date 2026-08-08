@@ -16,12 +16,12 @@ func TestResolveSocketPath(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                  string
-		envVal                string
-		legacyEnvVal          string
-		cfgVal                string
-		legacyCfgVal          string
-		want                  string
+		name         string
+		envVal       string
+		legacyEnvVal string
+		cfgVal       string
+		legacyCfgVal string
+		want         string
 	}{
 		// Default fallback: every source empty → DefaultSocketPath.
 		{
@@ -30,9 +30,9 @@ func TestResolveSocketPath(t *testing.T) {
 		},
 		// Each source wins in isolation.
 		{
-			name:         "envVal wins over default",
-			envVal:       "/run/faas/egress.custom.sock",
-			want:         "/run/faas/egress.custom.sock",
+			name:   "envVal wins over default",
+			envVal: "/run/faas/egress.custom.sock",
+			want:   "/run/faas/egress.custom.sock",
 		},
 		{
 			name:         "legacyEnvVal wins when envVal empty",
@@ -157,7 +157,7 @@ func TestResolveFromOS_EnvWinsOverConfig(t *testing.T) {
 	t.Parallel()
 
 	env := map[string]string{
-		"FAAS_EGRESS_SOCKET":       "/run/faas/from-env-new.sock",
+		"FAAS_EGRESS_SOCKET":         "/run/faas/from-env-new.sock",
 		"FAAS_GATEWAY_EGRESS_SOCKET": "/run/faas/from-env-legacy.sock",
 	}
 	getenv := func(key string) string { return env[key] }

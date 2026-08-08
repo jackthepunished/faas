@@ -30,11 +30,11 @@
 // When ResolveSocketPath is called with all four sources, the
 // preference order is:
 //
-//	1. envVal              (FAAS_EGRESS_SOCKET)
-//	2. legacyEnvVal        (FAAS_GATEWAY_EGRESS_SOCKET, deprecated)
-//	3. cfgVal              (egress_socket = ...)
-//	4. legacyCfgVal        (gateway_egress_socket = ..., deprecated)
-//	5. DefaultSocketPath   (/run/faas/egress.sock)
+//  1. envVal              (FAAS_EGRESS_SOCKET)
+//  2. legacyEnvVal        (FAAS_GATEWAY_EGRESS_SOCKET, deprecated)
+//  3. cfgVal              (egress_socket = ...)
+//  4. legacyCfgVal        (gateway_egress_socket = ..., deprecated)
+//  5. DefaultSocketPath   (/run/faas/egress.sock)
 //
 // Each non-empty source is honoured as-is; no normalization, no
 // env-var expansion. Callers that need a path they can `os.Stat`
