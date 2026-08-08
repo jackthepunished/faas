@@ -1,0 +1,6 @@
+Contact: mailto:security@gregale.dev
+Contact: https://github.com/poyrazK/faas/security/advisories/new
+Expires: 2027-12-31T23:59:59z
+Preferred-Languages: en
+Canonical: https://docs.gregale.dev/.well-known/security.txt
+Policy: https://docs.gregale.dev/security

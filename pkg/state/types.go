@@ -1497,6 +1497,14 @@ const (
 // restore succeeded). The ledger is INSERT-only from the application
 // side; the table survives the account's DeleteAccount so a DPO can
 // audit completed erasure against an email + timestamp.
+//
+// RequestID carries the inbound X-Request-Id (PR-5.2 / issue #755)
+// when the customer supplied one — used to make GET /v1/account/export
+// idempotent across retries so a flaky network doesn't double-cost the
+// 24h rate-limit window. Zero value ("") means the customer did not
+// supply an id; for non-export actions the column is also zero. The
+// id is stored as a text column (no FK to anywhere) so a regenerated
+// request id from a future process does not orphan historical rows.
 type GdprRequest struct {
 	ID           string
 	AccountID    string
@@ -1504,6 +1512,7 @@ type GdprRequest struct {
 	Action       GdprAction
 	RequestedAt  time.Time
 	CompletedAt  time.Time // zero until the downstream action completes
+	RequestID    string    // optional X-Request-Id from the inbound request (PR-5.2)
 }
 
 // Instance mirrors the instances row; schedd is the sole writer (spec §6).

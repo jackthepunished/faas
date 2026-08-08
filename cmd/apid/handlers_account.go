@@ -22,6 +22,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/mail"
+	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -37,10 +38,99 @@ type deletionPendingPayload struct {
 }
 
 // exportAccount writes a single JSON bundle of every row tied to the
+// account. includeSecretsFalse drops the ciphertext slice (the
+// default is to include — see ADR-021 D4). Kept as a sentinel
+// constant so goconst does not flag every "false" comparison site
+// (the dashboard / REST endpoints all read the same query value).
+const includeSecretsFalse = "false"
+
+// exportAccount writes a single JSON bundle of every row tied to the
 // account. ?include_secrets=false drops the ciphertext slice (the
 // default is to include — see ADR-021 D4).
 func (s *server) exportAccount(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	include := r.URL.Query().Get("include_secrets") != "false"
+	// Idempotency probe (issue #755 / PR-5.2). If the customer
+	// supplied an X-Request-Id and a prior ledger row exists for
+	// (account_id, request_id), the retry is logically the same
+	// action as the original — skip the rate-limit and skip a fresh
+	// ledger insert. We still re-build the bundle from the same
+	// data sources so the customer sees any row-deltas since the
+	// first call (the durable receipt is the ledger row; the bundle
+	// is fully derived from the account's data).
+	//
+	// Empty inbound id falls through to the rate-limit path —
+	// every existing customer keeps the same behaviour they had
+	// before PR-5.2.
+	requestID := middleware.RequestIDFrom(r)
+	isIdempotentRetry := false
+	if requestID != "" {
+		prior, err := s.store.FindGdprRequestByRequestID(r.Context(), acct.ID, requestID)
+		switch {
+		case err == nil && prior.Action == state.GdprActionExport:
+			isIdempotentRetry = true
+			s.log.Info("apid: export request_id idempotent hit",
+				"account", acct.ID, "request_id", requestID, "ledger_id", prior.ID)
+		case err != nil && !errors.Is(err, state.ErrNotFound):
+			// Probe failure is not a customer-visible problem — fall
+			// through to the normal path. The worst case is the
+			// customer gets a 429 on what would have been a retry,
+			// which is the same behaviour as before PR-5.2.
+			s.log.Warn("apid: export idempotency probe failed",
+				"account", acct.ID, "request_id", requestID, "err", err)
+		}
+	}
+
+	// 24h rate limit (issue #755 / PR-5.1). GDPR self-serve exports
+	// are abusive under load — each bundle scans every per-account
+	// table, so a single customer hitting the endpoint once a minute
+	// for a day would cost more than the rest of the plan's quota
+	// combined. The ledger (gdpr_requests) is the source of truth
+	// so the rate-limit survives process restart and is observable
+	// by the same DPO query that reads the action history.
+	//
+	// First call inside the 24h window is allowed; the second call
+	// gets 429 + Retry-After. Idempotent retries (PR-5.2) bypass
+	// the rate-limit because the prior ledger row already paid for
+	// the slot — the customer's second call is logically the same
+	// action as the first, not a new action.
+	//
+	// We intentionally count the in-flight request *before*
+	// gathering the bundle so a concurrent retry cannot both
+	// succeed — the check is racy with a parallel caller only at
+	// the millisecond boundary, which is fine because the cost of
+	// a double-bundle (one customer's bundle) is bounded.
+	rateSince := time.Now().UTC().Add(-api.ExportRateLimitWindow)
+	if !isIdempotentRetry {
+		n, err := s.store.CountGdprRequestsSince(r.Context(), acct.ID, string(state.GdprActionExport), rateSince)
+		if err != nil {
+			// A failing ledger query should not block an export — log
+			// warn and proceed (mirrors the X-Audit-Logged best-effort
+			// posture below). The customer is not worse off than before
+			// PR-5.1; the rate-limit is a new affordance, not a
+			// load-bearing security gate.
+			s.log.Warn("apid: export rate-limit query failed",
+				"account", acct.ID, "err", err)
+		} else if n > 0 {
+			// Compute seconds-until-reset so Retry-After is precise.
+			// Walk the recent ledger for the most-recent export so the
+			// hint matches reality (not just "24h from now").
+			retryAfterS := api.ExportRateLimitWindowSeconds
+			if recents, lerr := s.store.ListGdprRequestsForAccount(r.Context(), acct.ID, n); lerr == nil {
+				for _, rec := range recents {
+					if rec.Action == state.GdprActionExport && !rec.RequestedAt.IsZero() {
+						resetAt := rec.RequestedAt.Add(api.ExportRateLimitWindow)
+						secs := int(time.Until(resetAt).Seconds())
+						if secs > retryAfterS {
+							retryAfterS = secs
+						}
+						break
+					}
+				}
+			}
+			api.WriteProblem(w, api.ErrExportRateLimited(retryAfterS))
+			return
+		}
+	}
+	include := r.URL.Query().Get("include_secrets") != includeSecretsFalse
 	bundle, err := gatherExport(r.Context(), s, acct, include)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not assemble export"))
@@ -53,15 +143,54 @@ func (s *server) exportAccount(w http.ResponseWriter, r *http.Request, acct stat
 	// X-Audit-Logged: false so the customer can tell (in DevTools,
 	// by mtime of the bundle, etc.) that their export landed in
 	// their hands but did not make it into the audit trail.
-	if !s.recordGdprRequest(r.Context(), acct, state.GdprActionExport) {
+	//
+	// Idempotent retries (PR-5.2) skip the ledger insert: the prior
+	// call already wrote the durable receipt. A retry that double-
+	// inserted would inflate the rate-limit count for the customer's
+	// own retries — a self-inflicted 429 after a flaky network is the
+	// worst possible UX. The prior row's id is enough for the DPO to
+	// re-derive the receipt.
+	if isIdempotentRetry {
+		w.Header().Set("X-Idempotent-Replay", "true")
+	} else if !s.recordGdprRequest(r.Context(), acct, state.GdprActionExport, middleware.RequestIDFrom(r)) {
 		w.Header().Set("X-Audit-Logged", "false")
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition",
 		`attachment; filename="faas-account-`+acct.ID+`-`+
 			time.Now().UTC().Format("20060102")+`.json"`)
+	// Encode the bundle to a buffer first so we can stamp the
+	// byte_count on the audit row before the bytes leave the
+	// process. Streaming Encode directly to w would skip the count
+	// (and any bytes-after-the-emit would not be covered by the
+	// audit). The buffer doubles as a temporary copy — fine for
+	// the bundle sizes the platform exports today (low MB) and
+	// avoids a json.Encoder.Snapshot API we don't have.
+	encoded, err := json.Marshal(bundle)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not marshal export"))
+		return
+	}
+	// Audit row for the customer-facing export action (issue #755
+	// / PR-5.4). Distinct from the gdpr_requests ledger row above:
+	// the audit row is the events-table side of the same action,
+	// carrying structured data that downstream consumers (DPO
+	// dashboards, regulator exports) can query. byte_count is the
+	// pre-write size so a forensic auditor can detect a
+	// tampering-in-flight scenario (the count in the audit row
+	// vs the count the customer received). request_id is the
+	// inbound id when the customer supplied one — same id that
+	// the gdpr_requests ledger row carries, so a DPO can join
+	// the two tables on it. Best-effort: the auditor is
+	// non-blocking (spec §5.1) so a backlog cannot block exports.
+	acctID := acct.ID
+	s.audit.Emit(r.Context(), "account.export_requested", &acctID, map[string]any{
+		"request_id": middleware.RequestIDFrom(r),
+		"byte_count": len(encoded),
+		"replay":     isIdempotentRetry,
+	})
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(bundle)
+	_, _ = w.Write(encoded)
 }
 
 // deleteAccount schedules the account for hard delete in 30 days.
@@ -133,7 +262,7 @@ func (s *server) scheduleDeletion(ctx context.Context, acct state.Account, via s
 			// shown proof of erasure against email + timestamp. The
 			// row outlives DeleteAccount; pkg/grace stamps
 			// completed_at after the hard-delete fires.
-			s.recordGdprRequest(ctx, fresh, state.GdprActionDelete)
+			s.recordGdprRequest(ctx, fresh, state.GdprActionDelete, "")
 			// IAM-4 (ADR-035): record the deletion scheduling.
 			// data.via lets the operator distinguish a dashboard
 			// form submission from a CLI/API DELETE — useful when
@@ -157,13 +286,22 @@ func (s *server) scheduleDeletion(ctx context.Context, acct state.Account, via s
 // flaky audit DB can never block a customer's GDPR action.
 // Mirrors the pg_notify best-effort posture in scheduleDeletion
 // above.
-func (s *server) recordGdprRequest(ctx context.Context, acct state.Account, action state.GdprAction) bool {
+//
+// requestID is the inbound X-Request-Id when the caller supplied
+// one (issue #755 / PR-5.2) — empty when not. The id is recorded on
+// the ledger row so the idempotency probe can find the prior call
+// if a customer retries. Recorded verbatim (no sanitization) because
+// the id is generated by the customer's stack (CLI, dashboard,
+// retry library) and any sanitization would mask legitimate
+// correlation ids.
+func (s *server) recordGdprRequest(ctx context.Context, acct state.Account, action state.GdprAction, requestID string) bool {
 	req := state.GdprRequest{
 		ID:           uuid.NewString(),
 		AccountID:    acct.ID,
 		AccountEmail: acct.Email,
 		Action:       action,
 		RequestedAt:  time.Now().UTC(),
+		RequestID:    requestID,
 	}
 	// Export + restore complete at insert time; delete completes
 	// when pkg/grace fires DeleteAccount and calls
@@ -188,7 +326,7 @@ func (s *server) restoreAccount(w http.ResponseWriter, r *http.Request, acct sta
 		api.WriteProblem(w, prob)
 		return
 	}
-	s.recordGdprRequest(r.Context(), fresh, state.GdprActionRestore)
+	s.recordGdprRequest(r.Context(), fresh, state.GdprActionRestore, "")
 	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), fresh, r))
 }
 

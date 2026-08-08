@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.gregale.dev/dpa/subprocessor-archive.schema.json",
+  "version": "1.0.0",
+  "removed_sub_processors": [],
+  "_comment": "Each removed sub-processor becomes one object here. Shape: {\"id\": \"...\", \"vendor\": \"...\", \"service\": \"...\", \"effective_from\": \"YYYY-MM-DD\", \"effective_until\": \"YYYY-MM-DD\", \"removal_reason\": \"...\", \"archived_at\": \"YYYY-MM-DD\"}. The id MUST NOT be reused in subprocessors.json — once archived, the id is dead."
+}

@@ -12,17 +12,15 @@
 -- basename matches the reservation regex from its "added
 -- migration versions" computation).
 --
--- Issue #556 / PR-B holds slot 162 for the partial index backing
--- the gateway's LiveDeployments plural query (see
--- migrations/00162_deployments_live_traffic_idx.sql). Slot 161
--- is reserved as a one-slot gap so any in-flight sibling PR may
--- claim 161 without colliding. PR-B's reservation is dropped at
--- merge time once a sibling PR claims 161 OR the next real
--- schema lands at 162+1.
+-- Issue #755 / PR-5 (GDPR endpoint hardening) skipped slots 159,
+-- 160, 161, and 162 to land at 163 / 164 (after main's
+-- 00162_deployments_live_traffic_idx, which is on main). This 161
+-- fence holds the slot open for any sibling PR that wants 161
+-- once PR-5 merges; whichever PR lands first deletes its
+-- corresponding fence on the next rebase per ADR-041.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
--- but produces no schema change. Future-proof against upstream
--- generator drift without chasing each new template revision.
+-- but produces no schema change.
 --
 select 1;
 
