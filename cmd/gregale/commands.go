@@ -364,10 +364,21 @@ func sanitizeSlug(s string) string {
 // Otherwise (UX §3.2), the leading `✗` glyph is dropped when stdout is
 // not a TTY or NO_COLOR is set; the body of each line is unchanged.
 func printErr(title string, err error) int {
+	// Issue #744 / ADR-086: extract the nested-marker workspace hint
+	// from the error chain BEFORE the jsonOutput branch so both modes
+	// can route it to stderr. The hint must NEVER appear on stdout (it
+	// would corrupt `gregale deploy --json | jq`), so JSON mode prints
+	// only the envelope and writes the hint via osStderr; text mode
+	// appends the hint to the existing PrintFail line.
+	var hintErr *NestedMarkerHintError
+	hasHint := errors.As(err, &hintErr)
 	if jsonOutput {
 		var ae *APIError
 		if errors.As(err, &ae) {
 			_ = writeJSONProblem(ae.Problem)
+			if hasHint {
+				PrintWarn(osStderr, "%s", hintErr.Hint)
+			}
 			return exitCodeForStatus(ae.Problem.Status)
 		}
 		// Non-API errors (network, etc.) — synthesise a 500 Problem so
@@ -375,19 +386,39 @@ func printErr(title string, err error) int {
 		_ = writeJSONProblem(api.Problem{
 			Status: 500, Code: "internal", Title: title, Detail: err.Error(),
 		})
+		if hasHint {
+			PrintWarn(osStderr, "%s", hintErr.Hint)
+		}
 		return 1
 	}
 	var ae *APIError
 	if errors.As(err, &ae) {
-		renderAPIError(os.Stderr, ae)
+		renderAPIError(osStderr, ae)
+		if hasHint {
+			PrintWarn(osStderr, "%s", hintErr.Hint)
+		}
 		return exitCodeForStatus(ae.Problem.Status)
 	}
 	var ec *exitErr
 	if errors.As(err, &ec) {
-		PrintFail(os.Stderr, "%s\n  %s", title, ec.msg)
+		PrintFail(osStderr, "%s\n  %s", title, ec.msg)
+		if hasHint {
+			PrintWarn(osStderr, "%s", hintErr.Hint)
+		}
 		return ec.code
 	}
-	PrintFail(os.Stderr, "%s\n  %s", title, err.Error())
+	if hasHint {
+		// The hint replaces the title — the bare error message already
+		// encodes the cwd + reasons (e.g. "no deployable source found in
+		// <dir>: expected package.json, ..."), and the title is the
+		// same string the caller passed in. Rendering both would
+		// duplicate the cwd in the customer-visible output (issue #744
+		// review finding). The hint is the actionable next step; the
+		// error text is the context; the title is dropped.
+		PrintFail(osStderr, "%s\n  %s", err.Error(), hintErr.Hint)
+		return 1
+	}
+	PrintFail(osStderr, "%s\n  %s", title, err.Error())
 	return 1
 }
 

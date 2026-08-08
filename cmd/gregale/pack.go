@@ -97,6 +97,29 @@ var defaultExcludeFiles = map[string]bool{
 	"Thumbs.db": true,
 }
 
+// appMarker is the closed set of filenames whose presence at the project
+// root (or, for the depth-2 hint path, under a single subdirectory) marks
+// a directory as containing deployable source for an *app* (Railpack
+// framework path). A README.md or dotfile in the same directory is NOT
+// a marker — those files don't change the deploy shape.
+//
+// Single source of truth: detectFramework and detectNestedMarkerHint
+// both consult this map, so a new marker (e.g. Cargo.toml for a Rust
+// Railpack pipeline that lands in a future ADR) only needs to be added
+// here, not in two switches. The marker→framework mapping mirrors
+// pkg/builderd/detect.go:73-82 on the server side — the CLI is
+// intentionally the lighter view (no Dockerfile priority ordering —
+// see detectFramework, which applies Dockerfile-wins as a post-pass).
+var appMarker = map[string]framework{
+	"package.json":     fwNode,
+	"requirements.txt": fwPython,
+	"pyproject.toml":   fwPython,
+	"pipfile":          fwPython,
+	"setup.py":         fwPython,
+	"go.mod":           fwGo,
+	"dockerfile":       fwDocker,
+}
+
 // packEpoch is a fixed modification time stamped on every archive entry so the
 // packed tarball is byte-reproducible for a given input (tests depend on this,
 // and it avoids leaking local mtimes).
@@ -132,36 +155,135 @@ func detectFramework(srcDir string) framework {
 	if err != nil {
 		return fwUnknown
 	}
-	var hasDocker, hasNode, hasPython, hasGo bool
+	// Single source of truth: appMarker (issue #744 / ADR-086). A new
+	// marker added to the map is picked up here AND by
+	// detectNestedMarkerHint without further edits. The Dockerfile-wins
+	// post-pass at the end mirrors pkg/builderd/detect.go — when both a
+	// Dockerfile and a language marker are present, the Dockerfile wins.
+	var hasDocker bool
+	var lang framework
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		switch strings.ToLower(e.Name()) {
-		// Keep in sync with pkg/builderd/detect.go — the rule intentionally
-		// mirrors the server-side detector; if you change one, change both.
-		case "dockerfile":
-			hasDocker = true
-		case "package.json":
-			hasNode = true
-		case "requirements.txt", "pyproject.toml", "pipfile", "setup.py":
-			hasPython = true
-		case "go.mod":
-			hasGo = true
+		if fw, ok := appMarker[strings.ToLower(e.Name())]; ok {
+			if fw == fwDocker {
+				hasDocker = true
+				continue
+			}
+			if lang == "" {
+				lang = fw
+			}
 		}
 	}
-	switch {
-	case hasDocker:
+	if hasDocker {
 		return fwDocker
-	case hasNode:
-		return fwNode
-	case hasPython:
-		return fwPython
-	case hasGo:
-		return fwGo
+	}
+	if lang != "" {
+		return lang
 	}
 	return fwUnknown
 }
+
+// detectNestedMarkerHint returns true if srcDir contains at least one app
+// marker within 2 subdirectory levels of the project root, capturing the
+// common monorepo layout (apps/web/package.json, services/api/go.mod,
+// libs/x/pyproject.toml, frontend/package.json). Used by resolveDeployShape's
+// shapeUnknown branch (issue #744 / ADR-086) to surface a "looks like a
+// workspace" hint pointing the customer at `gregale scan --path .` instead
+// of opening an issue.
+//
+// Cheap on purpose: a recursive os.ReadDir per top-level subdir, capped at
+// depth 2, no file contents read. Excluded subdirs (defaultExcludeDirs —
+// node_modules, .git, vendor, __pycache__ — plus dotfile dirs) are skipped
+// at every depth so a stray node_modules/x/package.json does not
+// false-positive as a workspace.
+//
+// Depth-3+ monorepos (e.g. apps/web/services/api/package.json — three
+// subdirectory levels deep) intentionally return false: the customer gets
+// the existing bare error. Deeper detection belongs to `gregale scan`
+// (pkg/reposcan), which already handles it via the
+// workspaces_extra_test.go "monorepo" fixture. The CLI hint is just a
+// pointer at the next step.
+func detectNestedMarkerHint(srcDir string) bool {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if isExcludedSubdir(e.Name()) {
+			continue
+		}
+		// walkForMarkers(d1, 1) recurses one level into each top-level
+		// subdir, which puts us at depth 2 from the project root — files
+		// at apps/web/package.json are seen; files at
+		// apps/web/services/api/package.json (depth 3) are not.
+		if walkForMarkers(filepath.Join(srcDir, e.Name()), 1) {
+			return true
+		}
+	}
+	return false
+}
+
+// walkForMarkers recurses at most maxDepth levels below dir looking for an
+// app marker. Returns true on the first hit. Excluded subdirs
+// (defaultExcludeDirs + dotfiles) are skipped at every level so a real
+// workspace isn't false-positive-masked by a sibling node_modules tree.
+func walkForMarkers(dir string, maxDepth int) bool {
+	if maxDepth < 0 {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			if isExcludedSubdir(name) {
+				continue
+			}
+			if walkForMarkers(filepath.Join(dir, name), maxDepth-1) {
+				return true
+			}
+			continue
+		}
+		if _, ok := appMarker[strings.ToLower(name)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isExcludedSubdir reports whether a subdirectory should be skipped at any
+// depth during the nested-marker hint walk (issue #744 / ADR-086). The
+// defaultExcludeDirs set covers build artifacts and VCS metadata; dotfile
+// dirs (e.g. .vscode, .github) are also skipped so a repo with .vscode/
+// doesn't confuse the marker sniff.
+func isExcludedSubdir(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	return defaultExcludeDirs[strings.ToLower(name)]
+}
+
+// NestedMarkerHintError wraps a deploy-shape error to carry the
+// "looks like a workspace — try: gregale scan --path ." hint through
+// printErr (issue #744 / ADR-086). The wrapped err is the original
+// shapeUnknown message; Hint is the additional customer-facing line.
+// errors.As extracts the hint in printErr so JSON-mode consumers can
+// programmatically detect it without parsing free-form stderr text.
+type NestedMarkerHintError struct {
+	Dir  string
+	Hint string
+	Err  error
+}
+
+func (e *NestedMarkerHintError) Error() string { return e.Err.Error() }
+func (e *NestedMarkerHintError) Unwrap() error { return e.Err }
 
 // detectShape sniffs the TOP-LEVEL entries of srcDir (no recursion) and returns
 // the deploy shape (issue #737 / ADR-083). The rule:
@@ -479,12 +601,30 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 	}
 	switch detected {
 	case shapeUnknown:
-		return shapeUnknown, "", "", fmt.Errorf(
+		baseErr := fmt.Errorf(
 			"no deployable source found in %s: expected package.json, requirements.txt / pyproject.toml / "+
 				"Pipfile / setup.py, go.mod, or Dockerfile at the project root for an *app*, "+
 				"OR a single handler.{js,ts,py,go} for a *function* — "+
 				"or pass --image, --tarball, --template, --repo, --function, or --app",
 			filepath.Base(srcDir))
+		// Issue #744 / ADR-086: if the cwd has app markers at depth 1 (a
+		// common monorepo layout — apps/web/package.json, services/api/go.mod),
+		// surface a customer-visible hint pointing at `gregale scan --path .`.
+		// The hint is wrapped in NestedMarkerHintError so printErr can route
+		// it to stderr without corrupting --json stdout. Customers with deep
+		// (depth-3+) monorepos still get the bare error — that's fine, the
+		// reposcan tree handles them via `gregale scan` regardless.
+		if detectNestedMarkerHint(srcDir) {
+			return shapeUnknown, "", "", &NestedMarkerHintError{
+				Dir: filepath.Base(srcDir),
+				Hint: fmt.Sprintf(
+					"Hint: found app markers under subdirectories of %s — this looks like a workspace (monorepo). "+
+						"Run `gregale scan --path .` to decompose it into per-app plans, then apply them individually.",
+					filepath.Base(srcDir)),
+				Err: baseErr,
+			}
+		}
+		return shapeUnknown, "", "", baseErr
 	case shapeFunction:
 		rt, hnd, ok := inferFunctionRuntime(srcDir)
 		if !ok {
