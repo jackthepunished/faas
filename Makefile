@@ -1,5 +1,10 @@
 # One-box FaaS — build & ops entrypoints (spec §Commands).
-# Go >= 1.23. One binary per cmd/ dir.
+# Go >= 1.24. One binary per cmd/ dir.
+# (Bumped from 1.23: cmd/vmmd-stream-bridge uses the Go 1.24+
+# http.Protocols API for H2C — srv.Protocols.SetUnencryptedHTTP2(true).
+# go.mod pins 1.25.7; this comment is the floor for the toolchain
+# so a developer on 1.23.x sees a clean compile error rather than
+# a runtime panic.)
 
 GO      ?= go
 GOOS    ?= $(shell $(GO) env GOOS)
@@ -7,7 +12,7 @@ GOARCH  ?= $(shell $(GO) env GOARCH)
 export GOOS GOARCH
 PKGS    := ./...
 COVERAGE_DIR := coverage
-DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge builderd imaged meterd gregale githubd hostage-gen
+DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge vmmd-stream-bridge builderd imaged meterd gregale githubd hostage-gen
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
