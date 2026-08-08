@@ -122,7 +122,7 @@ func TestPg_CoverageGetAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-2"), "k", []string{})
+	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-2"), "k", []string{"apps:read"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestPg_CoverageTouchKeyLastUsed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-3"), "k", []string{})
+	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-3"), "k", []string{"apps:read"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestPg_CoverageDeleteAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-4"), "k", []string{})
+	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-4"), "k", []string{"apps:read"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestPg_CoverageDeleteAPIKeyReturning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-5"), "k", []string{})
+	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-5"), "k", []string{"apps:read"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestPg_CoverageMarkAPIKeyRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-6"), "k", []string{})
+	key, err := s.CreateAPIKey(ctx, acct.ID, []byte("hash-6"), "k", []string{"apps:read"})
 	if err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}

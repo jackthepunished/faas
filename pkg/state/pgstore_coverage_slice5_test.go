@@ -13,6 +13,12 @@ import (
 // This file drives the 0%-coverage PgStore Deployment/Org/Cron
 // methods through the pgtest harness. Each test follows the
 // canonical pattern: pgStore(t), create account+app, exercise.
+//
+// Note: pgstore.CreateDeployment omits `id` from its INSERT column
+// list (see pkg/state/pgstore.go:3630 and migration 00001_init.sql
+// `deployments.id default gen_random_uuid()`). All tests that
+// later UPDATE / SET on the deployment must use the *returned*
+// `created.ID`, not the input `d.ID`.
 
 // seedPgAccountAndApp returns an account + an app in the schema.
 func seedPgAccountAndApp(t *testing.T, s *state.PgStore, ctx stateCtx) (state.Account, state.App) {
@@ -41,6 +47,23 @@ type stateCtx = interface {
 	Value(key any) any
 }
 
+// seedPgDeployment inserts an Image-kind deployment under app and
+// returns the row PG actually persisted (input ID is ignored).
+func seedPgDeployment(t *testing.T, s *state.PgStore, ctx stateCtx, app state.App) state.Deployment {
+	t.Helper()
+	d := state.Deployment{
+		ID:        uuid.NewString(),
+		AppID:     app.ID,
+		Kind:      state.DeploymentKindImage,
+		CreatedAt: time.Now(),
+	}
+	created, err := s.CreateDeployment(ctx, d)
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	return created
+}
+
 func TestPg_CoverageCreateDeployment(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
@@ -62,13 +85,7 @@ func TestPg_CoverageCreateDeployment(t *testing.T) {
 func TestPg_CoverageDeploymentByID(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	created, err := s.CreateDeployment(ctx, d)
-	if err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	// pgstore CreateDeployment omits `id` from its column list — PG
-	// generates a new uuid. Read back via the generated ID.
+	created := seedPgDeployment(t, s, ctx, app)
 	got, err := s.DeploymentByID(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("DeploymentByID: %v", err)
@@ -81,11 +98,7 @@ func TestPg_CoverageDeploymentByID(t *testing.T) {
 func TestPg_CoverageLatestDeployment(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	created, err := s.CreateDeployment(ctx, d)
-	if err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
+	created := seedPgDeployment(t, s, ctx, app)
 	got, err := s.LatestDeployment(ctx, app.ID)
 	if err != nil {
 		t.Fatalf("LatestDeployment: %v", err)
@@ -129,11 +142,8 @@ func TestPg_CoverageListDeploymentsByNodeID(t *testing.T) {
 func TestPg_CoverageUpdateDeploymentMinInstances(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	got, err := s.UpdateDeploymentMinInstances(ctx, d.ID, 2)
+	created := seedPgDeployment(t, s, ctx, app)
+	got, err := s.UpdateDeploymentMinInstances(ctx, created.ID, 2)
 	if err != nil {
 		t.Fatalf("UpdateDeploymentMinInstances: %v", err)
 	}
@@ -145,11 +155,8 @@ func TestPg_CoverageUpdateDeploymentMinInstances(t *testing.T) {
 func TestPg_CoverageSetDeploymentParked(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	if err := s.SetDeploymentParked(ctx, d.ID, "idle", time.Now()); err != nil {
+	created := seedPgDeployment(t, s, ctx, app)
+	if err := s.SetDeploymentParked(ctx, created.ID, "idle", time.Now()); err != nil {
 		t.Errorf("SetDeploymentParked: %v", err)
 	}
 }
@@ -157,11 +164,8 @@ func TestPg_CoverageSetDeploymentParked(t *testing.T) {
 func TestPg_CoverageMarkDeploymentSuperseded(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	if err := s.MarkDeploymentSuperseded(ctx, d.ID); err != nil {
+	created := seedPgDeployment(t, s, ctx, app)
+	if err := s.MarkDeploymentSuperseded(ctx, created.ID); err != nil {
 		t.Errorf("MarkDeploymentSuperseded: %v", err)
 	}
 }
@@ -169,11 +173,8 @@ func TestPg_CoverageMarkDeploymentSuperseded(t *testing.T) {
 func TestPg_CoverageMarkDeploymentLive(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	if err := s.MarkDeploymentLive(ctx, d.ID); err != nil {
+	created := seedPgDeployment(t, s, ctx, app)
+	if err := s.MarkDeploymentLive(ctx, created.ID); err != nil {
 		t.Errorf("MarkDeploymentLive: %v", err)
 	}
 }
@@ -181,11 +182,8 @@ func TestPg_CoverageMarkDeploymentLive(t *testing.T) {
 func TestPg_CoverageSetDeploymentRootfs(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	if err := s.SetDeploymentRootfs(ctx, d.ID, "/srv/fc/rootfs.ext4", "keyhex", 1024); err != nil {
+	created := seedPgDeployment(t, s, ctx, app)
+	if err := s.SetDeploymentRootfs(ctx, created.ID, "/srv/fc/rootfs.ext4", "keyhex", 1024); err != nil {
 		t.Errorf("SetDeploymentRootfs: %v", err)
 	}
 }
@@ -193,11 +191,8 @@ func TestPg_CoverageSetDeploymentRootfs(t *testing.T) {
 func TestPg_CoverageUpsertDeploymentScanResult(t *testing.T) {
 	s, ctx := pgStore(t)
 	_, app := seedPgAccountAndApp(t, s, ctx)
-	d := state.Deployment{ID: uuid.NewString(), AppID: app.ID, Kind: state.DeploymentKindImage, CreatedAt: time.Now()}
-	if _, err := s.CreateDeployment(ctx, d); err != nil {
-		t.Fatalf("CreateDeployment: %v", err)
-	}
-	if err := s.UpsertDeploymentScanResult(ctx, d.ID, []byte(`{}`), "complete"); err != nil {
+	created := seedPgDeployment(t, s, ctx, app)
+	if err := s.UpsertDeploymentScanResult(ctx, created.ID, []byte(`{}`), "complete"); err != nil {
 		t.Errorf("UpsertDeploymentScanResult: %v", err)
 	}
 }

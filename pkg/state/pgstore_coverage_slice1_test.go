@@ -33,7 +33,10 @@ func TestPg_CoverageAccountLifecycle(t *testing.T) {
 	if got, err := s.AccountByID(ctx, acct.ID); err != nil || got.ID != acct.ID {
 		t.Fatalf("AccountByID happy = %+v, %v", got, err)
 	}
-	if _, err := s.AccountByID(ctx, "missing-id"); !errors.Is(err, state.ErrNotFound) {
+	// pgx trips SQLSTATE 22P02 on a non-UUID "missing-id" before the
+	// not-found check fires — pass a syntactically-valid zero uuid
+	// (see pkg/state/pgstore_update_app_widened_test.go:91-99).
+	if _, err := s.AccountByID(ctx, "00000000-0000-0000-0000-000000000000"); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("AccountByID missing = %v, want ErrNotFound", err)
 	}
 
