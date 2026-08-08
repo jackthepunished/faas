@@ -383,7 +383,7 @@ func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseW
 		renderArchiveTerminal(w, flusher, "archive_degraded")
 		return
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 
 	scanner := bufio.NewScanner(gz)
 	// Bump the scanner buffer so 64 KiB log lines (a

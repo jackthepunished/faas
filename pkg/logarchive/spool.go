@@ -232,11 +232,23 @@ func (s *Spool) LocalBytes() int64 {
 // shipper needs at flush time. Walks the spool root on disk
 // rather than the in-memory map, so a CloseAll'd spool still
 // surfaces .partial files for the next tick.
+//
+// Best-effort by design: per-entry stat / rel-path errors are
+// silently swallowed so a single unreadable .partial file
+// (race with the in-process evictor, transient EPERM on the
+// shared tmpfs) doesn't take down the entire snapshot. The
+// shipper's per-file os.Open will surface the read failure
+// with the file's real path so the metric counter still
+// increments.
 func (s *Spool) FilesSnapshot() []FileInfo {
 	s.mu.Lock()
 	root := s.root
 	s.mu.Unlock()
 	out := []FileInfo{}
+	//nolint:nilerr // Best-effort snapshot — see the docstring above.
+	// Per-entry errors (walkErr, filepath.Rel, d.Info) are swallowed
+	// so a single unreadable .partial file doesn't poison the whole
+	// snapshot; the shipper's per-file os.Open surfaces the failure.
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil

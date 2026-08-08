@@ -136,7 +136,7 @@ func (c *S3Client) PutObject(ctx context.Context, key, contentType string, r io.
 	if err != nil {
 		return fmt.Errorf("logarchive: put: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return parseS3Response(resp, "PUT")
 }
 
@@ -157,7 +157,7 @@ func (c *S3Client) GetObject(ctx context.Context, key string, w io.Writer) (int6
 	if err != nil {
 		return 0, fmt.Errorf("logarchive: get: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Status check only — we must NOT drain the success-path
 	// body, or io.Copy below would see 0 bytes.
 	if err := checkS3Status(resp, "GET"); err != nil {

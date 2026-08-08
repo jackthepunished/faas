@@ -37,6 +37,22 @@ import (
 	"time"
 )
 
+// S3 error-code vocabulary classifyFailure matches against. The
+// strings come from the S3 API reference (sigv4-error-codes.md);
+// hoisted to constants so goconst stops flagging the three
+// repeated literals and so future additions stay grep-able.
+const (
+	s3ErrAccessDenied          = "AccessDenied"
+	s3ErrSignatureDoesNotMatch = "SignatureDoesNotMatch"
+	s3ErrInvalidAccessKeyId    = "InvalidAccessKeyId"
+	s3ErrTooManyRequests       = "TooManyRequests"
+	s3ErrSlowDown              = "SlowDown"
+	s3ErrRequestThrottled      = "RequestThrottled"
+	s3ErrEntityTooLarge        = "EntityTooLarge"
+	s3ErrKeyTooLong            = "KeyTooLong"
+	s3ErrBodyLengthMismatch    = "BodyLengthMismatch"
+)
+
 // Shipper is the loop driver. Construct with NewShipper; drive
 // with Run (blocks until ctx cancel) or RunOnce (one pass,
 // returns the (files shipped, bytes shipped, error) tuple).
@@ -194,11 +210,15 @@ func (s *Shipper) uploadFile(ctx context.Context, f FileInfo) (int64, error) {
 		return 0, fmt.Errorf("flush %s: %w", f.Path, err)
 	}
 
+	//nolint:forbidigo // vetted path — f.Path is the .partial file
+	// the shipper just renamed from /var/log/faas/archive/{instance}/
+	// {day}.partial (spool.go:Spool.Append) and was just stat'd at
+	// the top of this function; no untrusted input crosses the gate.
 	src, err := os.Open(f.Path)
 	if err != nil {
 		return 0, fmt.Errorf("open %s: %w", f.Path, err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	gzPath := strings.TrimSuffix(f.Path, ".partial") + ".gz"
 	gz, err := os.Create(gzPath)
@@ -233,11 +253,14 @@ func (s *Shipper) uploadFile(ctx context.Context, f FileInfo) (int64, error) {
 	}
 	uploadStart := s.now()
 	key := s.bucketKey(f.Instance, f.Day)
+	//nolint:forbidigo // vetted path — gzPath is the .jsonl.gz
+	// the shipper just renamed from .partial inside
+	// /var/log/faas/archive/; stat'd above, owner faas:faas (spec §11).
 	gzReader, err := os.Open(gzPath)
 	if err != nil {
 		return 0, fmt.Errorf("open %s for upload: %w", gzPath, err)
 	}
-	defer gzReader.Close()
+	defer func() { _ = gzReader.Close() }()
 	if err := s.s3.PutObject(ctx, key, "application/gzip", gzReader, stat.Size()); err != nil {
 		s.metrics.ObserveUploadDuration(s.now().Sub(uploadStart).Seconds())
 		// Best-effort cleanup of the local gz on failure —
@@ -289,13 +312,13 @@ func classifyFailure(err error) string {
 	var perm *Permanent
 	if errors.As(err, &perm) {
 		switch perm.Code {
-		case "AccessDenied", "SignatureDoesNotMatch", "InvalidAccessKeyId":
+		case s3ErrAccessDenied, s3ErrSignatureDoesNotMatch, s3ErrInvalidAccessKeyId:
 			return FailureReasonAuth
-		case "TooManyRequests", "SlowDown", "RequestThrottled":
+		case s3ErrTooManyRequests, s3ErrSlowDown, s3ErrRequestThrottled:
 			return FailureReasonThrottle
-		case "EntityTooLarge", "KeyTooLong":
+		case s3ErrEntityTooLarge, s3ErrKeyTooLong:
 			return FailureReasonSize
-		case "BodyLengthMismatch":
+		case s3ErrBodyLengthMismatch:
 			return FailureReasonBodyLength
 		}
 	}

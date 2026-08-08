@@ -7,6 +7,18 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.deployment_response_parked_reason_type_1 import (
+    DeploymentResponseParkedReasonType1,
+    check_deployment_response_parked_reason_type_1,
+)
+from ..models.deployment_response_parked_reason_type_2_type_1 import (
+    DeploymentResponseParkedReasonType2Type1,
+    check_deployment_response_parked_reason_type_2_type_1,
+)
+from ..models.deployment_response_parked_reason_type_3_type_1 import (
+    DeploymentResponseParkedReasonType3Type1,
+    check_deployment_response_parked_reason_type_3_type_1,
+)
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -72,6 +84,19 @@ class DeploymentResponse:
     dashboard / CLI see a clean absence — the /scan route surfaces the 'skipped' sentinel for those rows). Non-nil
     for post-feature rows in any of the {pending, complete, failed, skipped} states. The customer can deploy a
     CRITICAL-CVE image; the dashboard shows it; that is the contract (no enforcement at the deploy gate)."""
+    parked_reason: (
+        DeploymentResponseParkedReasonType1
+        | DeploymentResponseParkedReasonType2Type1
+        | DeploymentResponseParkedReasonType3Type1
+        | None
+        | Unset
+    ) = UNSET
+    """Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00157). Closed-set vocabulary
+    enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked
+    deployments — surfaced as no field on the wire via omitempty."""
+    parked_at: datetime.datetime | None | Unset = UNSET
+    """Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for
+    never-parked deployments."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -159,6 +184,26 @@ class DeploymentResponse:
         else:
             scan = self.scan
 
+        parked_reason: None | str | Unset
+        if isinstance(self.parked_reason, Unset):
+            parked_reason = UNSET
+        elif isinstance(self.parked_reason, str):
+            parked_reason = self.parked_reason
+        elif isinstance(self.parked_reason, str):
+            parked_reason = self.parked_reason
+        elif isinstance(self.parked_reason, str):
+            parked_reason = self.parked_reason
+        else:
+            parked_reason = self.parked_reason
+
+        parked_at: None | str | Unset
+        if isinstance(self.parked_at, Unset):
+            parked_at = UNSET
+        elif isinstance(self.parked_at, datetime.datetime):
+            parked_at = self.parked_at.isoformat()
+        else:
+            parked_at = self.parked_at
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -199,6 +244,10 @@ class DeploymentResponse:
             field_dict["min_instances"] = min_instances
         if scan is not UNSET:
             field_dict["scan"] = scan
+        if parked_reason is not UNSET:
+            field_dict["parked_reason"] = parked_reason
+        if parked_at is not UNSET:
+            field_dict["parked_at"] = parked_at
 
         return field_dict
 
@@ -321,6 +370,71 @@ class DeploymentResponse:
 
         scan = _parse_scan(d.pop("scan", UNSET))
 
+        def _parse_parked_reason(
+            data: object,
+        ) -> (
+            DeploymentResponseParkedReasonType1
+            | DeploymentResponseParkedReasonType2Type1
+            | DeploymentResponseParkedReasonType3Type1
+            | None
+            | Unset
+        ):
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                parked_reason_type_1 = check_deployment_response_parked_reason_type_1(data)
+
+                return parked_reason_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                parked_reason_type_2_type_1 = check_deployment_response_parked_reason_type_2_type_1(data)
+
+                return parked_reason_type_2_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                parked_reason_type_3_type_1 = check_deployment_response_parked_reason_type_3_type_1(data)
+
+                return parked_reason_type_3_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(
+                DeploymentResponseParkedReasonType1
+                | DeploymentResponseParkedReasonType2Type1
+                | DeploymentResponseParkedReasonType3Type1
+                | None
+                | Unset,
+                data,
+            )
+
+        parked_reason = _parse_parked_reason(d.pop("parked_reason", UNSET))
+
+        def _parse_parked_at(data: object) -> datetime.datetime | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                parked_at_type_0 = datetime.datetime.fromisoformat(data)
+
+                return parked_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.datetime | None | Unset, data)
+
+        parked_at = _parse_parked_at(d.pop("parked_at", UNSET))
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -342,6 +456,8 @@ class DeploymentResponse:
             override_liveness_probe=override_liveness_probe,
             min_instances=min_instances,
             scan=scan,
+            parked_reason=parked_reason,
+            parked_at=parked_at,
         )
 
         deployment_response.additional_properties = d

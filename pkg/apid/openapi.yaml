@@ -1755,7 +1755,7 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-              example: {"type":"about:blank","title":"","status":403,"code":"log_archive_retention_exceeded","detail":"?date=2026-07-01 is outside the per-plan window"}
+              example: '{"type":"about:blank","title":"","status":403,"code":"log_archive_retention_exceeded","detail":"?date=2026-07-01 is outside the per-plan window"}'
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
