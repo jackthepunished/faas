@@ -119,8 +119,20 @@ jobs:
             install -m 0755 "bin/${bin}" "${BUNDLE_ROOT}/bin/${bin}"
           done
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "${BUNDLE_ROOT}/bin/deployctl" ./cmd/deployctl
-          cp deploy/controlplane/systemd/* "${BUNDLE_ROOT}/systemd/"
-          cp deploy/controlplane/tmpfiles.d/faas.conf "${BUNDLE_ROOT}/tmpfiles.d/"
+          for unit in \
+            faas-apid.service \
+            faas-cp.slice \
+            faas-gatewayd-internal.service \
+            faas-gatewayd-public.service \
+            faas-githubd.service \
+            faas-imaged.service \
+            faas-meterd.service \
+            faas-schedd.service \
+            faas-vmmd.service; do
+            install -m 0644 "deploy/controlplane/systemd/${unit}" "${BUNDLE_ROOT}/systemd/${unit}"
+          done
+          test ! -e "${BUNDLE_ROOT}/systemd/faas-gatewayd.service"
+          install -m 0644 deploy/controlplane/tmpfiles.d/faas.conf "${BUNDLE_ROOT}/tmpfiles.d/faas.conf"
           go run ./cmd/deployctl bundle-create "${BUNDLE_ROOT}" "${RELEASE_ID}" "${GITHUB_SHA}" "linux/amd64"
           echo "BUNDLE_ROOT=${BUNDLE_ROOT}" >> "${GITHUB_ENV}"
           echo "RELEASE_ID=${RELEASE_ID}" >> "${GITHUB_ENV}"
