@@ -197,16 +197,16 @@ func TestEmitSignatureAudit_WithNotifierWritesChannel(t *testing.T) {
 // PullLayers return errors — they're not exercised by these paths
 // (the verify hook only calls PullDigest + (on ManifestPuller) PullBlob).
 type stubPuller struct {
-	digest     string
-	digestErr  error
-	config     oci.ImageConfig
-	configErr  error
-	layers     oci.PullLayersResult
-	layersErr  error
-	manifest   oci.Manifest
+	digest      string
+	digestErr   error
+	config      oci.ImageConfig
+	configErr   error
+	layers      oci.PullLayersResult
+	layersErr   error
+	manifest    oci.Manifest
 	manifestErr error
-	blob       io.ReadCloser
-	blobErr    error
+	blob        io.ReadCloser
+	blobErr     error
 
 	manifestPuller bool
 }

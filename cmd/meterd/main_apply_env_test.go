@@ -96,10 +96,10 @@ func TestApplyEnvTick_AllMeteredIntervals(t *testing.T) {
 func TestBuildAlertEvaluator_DisabledWhenBothUnset(t *testing.T) {
 	deps := runDeps{
 		getenv: envReader(map[string]string{
-			"FAAS_PROMETHEUS_URL":          "",
-			"FAAS_HOST_AGE_IDENTITY_PATH":  "",
-			"FAAS_ALERT_EVAL_INTERVAL":     "",
-			"FAAS_ALERT_PROVIDERS_CONFIG":  "",
+			"FAAS_PROMETHEUS_URL":         "",
+			"FAAS_HOST_AGE_IDENTITY_PATH": "",
+			"FAAS_ALERT_EVAL_INTERVAL":    "",
+			"FAAS_ALERT_PROVIDERS_CONFIG": "",
 		}),
 	}
 	ev := buildAlertEvaluator(deps, nil, discardLog(), nil)
@@ -117,9 +117,9 @@ func TestBuildAlertEvaluator_DisabledWhenBothUnset(t *testing.T) {
 func TestBuildAlertEvaluator_DisabledWhenOnlyIrrelevantSet(t *testing.T) {
 	deps := runDeps{
 		getenv: envReader(map[string]string{
-			"FAAS_SAMPLE_INTERVAL":   "1s",
-			"FAAS_QUOTA_INTERVAL":    "1m",
-			"FAAS_PROMETHEUS_URL":    "",
+			"FAAS_SAMPLE_INTERVAL":        "1s",
+			"FAAS_QUOTA_INTERVAL":         "1m",
+			"FAAS_PROMETHEUS_URL":         "",
 			"FAAS_HOST_AGE_IDENTITY_PATH": "",
 		}),
 	}
