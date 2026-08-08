@@ -1852,6 +1852,50 @@ const (
 	HADNSRecordStaleSeconds   = 30
 	HAStandbyWarmupIntervalMS = 500
 
+	// Tier A9 (standby write-redirect, ADR-084 — closes ADR-083
+	// §Open follow-up #2). The redirect lives in
+	// cmd/gatewayd-internal/proxy.go (PR-B); the constants below
+	// bound every timer that PR-B's writeGate consults so the
+	// PR-A refactor can land them in advance.
+	//
+	// StandbyWriteRedirectTimeoutMS is the cross-box mTLS hop
+	// budget for the transparent relay. A standby that receives
+	// a bearer-authenticated mutation opens an outbound
+	// https://<leaderURL>/ dial; on timeout the standby
+	// degrades to 307 Temporary Redirect so the CLI's stdlib
+	// http.Client follows the public edge instead. Tunable via
+	// FAAS_STANDBY_WRITE_REDIRECT_TIMEOUT_MS.
+	//
+	// StandbyWriteRetryAfterSeconds is the Retry-After value
+	// attached to the 503/307 responses the standby emits (cookie
+	// writes on standbys, dial-failure fallback). 5 s is well
+	// under the typical DNS TTL so the customer's next retry
+	// usually lands on the new leader via DNS resolution.
+	// Tunable via FAAS_STANDBY_WRITE_RETRY_AFTER_SECONDS.
+	//
+	// StandbyWriteLeaderURLCacheTTLSeconds bounds the lifetime
+	// of the cached leader URL inside pkg/gateway/writegate's
+	// LeaderResolver. The cache is invalidated promptly on
+	// compute_node_changed (pg_notify subscriber); 5 s is the
+	// upper bound when the subscriber misses an event (e.g.
+	// network blip on the unix socket). Tunable via
+	// FAAS_STANDBY_WRITE_LEADER_URL_CACHE_TTL_SECONDS.
+	//
+	// StandbyWriteNoLeaderRetryAfterSeconds is the Retry-After
+	// for the 503 emitted when election returns no active peer
+	// (all boxes drained, or pg outage). 60 s is the spec's
+	// "standby state warming too long" alert threshold —
+	// longer than DNS TTL but short enough that a customer
+	// retry doesn't pile up. Tunable via
+	// FAAS_STANDBY_WRITE_NO_LEADER_RETRY_AFTER_SECONDS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	StandbyWriteRedirectTimeoutMS        = 5000
+	StandbyWriteRetryAfterSeconds        = 5
+	StandbyWriteLeaderURLCacheTTLSeconds = 5
+	StandbyWriteNoLeaderRetryAfterSeconds = 60
+
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
 
