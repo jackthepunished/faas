@@ -1891,9 +1891,9 @@ const (
 	//
 	// Hard limits policy (CLAUDE.md): every limit is a constant
 	// here, never inlined.
-	StandbyWriteRedirectTimeoutMS        = 5000
-	StandbyWriteRetryAfterSeconds        = 5
-	StandbyWriteLeaderURLCacheTTLSeconds = 5
+	StandbyWriteRedirectTimeoutMS         = 5000
+	StandbyWriteRetryAfterSeconds         = 5
+	StandbyWriteLeaderURLCacheTTLSeconds  = 5
 	StandbyWriteNoLeaderRetryAfterSeconds = 60
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
