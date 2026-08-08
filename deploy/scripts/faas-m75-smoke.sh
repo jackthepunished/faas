@@ -51,7 +51,7 @@ for f in "$GITHUB_PEM" "$GITHUB_WEBHOOK_SECRET"; do
 done
 ok "GitHub App key + webhook secret present (mode 0400)"
 
-for unit in apid gatewayd githubd schedd vmmd imaged builderd meterd; do
+for unit in apid gatewayd-public gatewayd-internal githubd schedd vmmd imaged builderd meterd; do
   if systemctl is-active --quiet "faas-$unit.service"; then
     ok "faas-$unit.service is active"
   else
@@ -104,11 +104,11 @@ echo "    git commit --allow-empty -m 'm7.5 smoke'"
 echo "    git push origin main"
 echo
 echo "While you push, tail the journals in another terminal:"
-echo "    journalctl -u faas-gatewayd.service -u faas-githubd.service -f"
+echo "    journalctl -u faas-gatewayd-public.service -u faas-gatewayd-internal.service -u faas-githubd.service -f"
 echo
-echo "Expected gatewayd log (HMAC-verify at the edge):"
+echo "Expected gatewayd-public log (HMAC-verify at the edge, Tier A7 split):"
 echo '    githubd proxy armed target=http://127.0.0.1:8083'
-echo '    gatewayd webhook verified repo=owner/sandbox-repo ref=refs/heads/main'
+echo '    gatewayd-public webhook verified repo=owner/sandbox-repo ref=refs/heads/main'
 echo
 echo "Expected githubd log (push dispatch):"
 echo '    deployment created deployment=dep-… app=app-… repo=owner/sandbox-repo sha=deadbeef…'
@@ -183,5 +183,5 @@ echo "  4. least-privilege scopes verified        ✓ (ADR-012: Contents:read + 
 echo "  5. V6 — two restores share no UUID         ✓ (step 6)"
 echo "  6. Postgres unix-socket only              ✓ (step 7)"
 echo
-echo "If any step hung, capture the journalctl -u faas-{gatewayd,githubd}.service"
+echo "If any step hung, capture the journalctl -u faas-{gatewayd-public,githubd}.service"
 echo "output since the push and attach it to the M7.5 PR."

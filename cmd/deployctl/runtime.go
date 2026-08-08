@@ -92,8 +92,6 @@ func (r hostRuntime) Activate(ctx context.Context, releaseRoot string) error {
 			return err
 		}
 	}
-	_ = runCommand(ctx, "systemctl", "stop", "faas-gatewayd.service")
-	_ = runCommand(ctx, "systemctl", "disable", "faas-gatewayd.service")
 	return nil
 }
 
