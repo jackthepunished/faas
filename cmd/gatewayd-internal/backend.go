@@ -209,7 +209,7 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 				// Defensive — wrapper keeps open until ctx cancels.
 				return
 			}
-			handleInvalidation(inv, n, log)
+			handleInvalidation(ctx, inv, n, log)
 		}
 	}
 }
@@ -237,7 +237,7 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 // A malformed payload that omits either app_id or instance_id is
 // logged-and-dropped — better to over-evict (next request re-admits)
 // than to crash the edge loop.
-func handleInvalidation(inv invalidator, n db.Notification, log *slog.Logger) {
+func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification, log *slog.Logger) {
 	switch n.Channel {
 	case db.NotifyInstanceChanged:
 		var p struct {
@@ -316,7 +316,7 @@ func handleInvalidation(inv invalidator, n db.Notification, log *slog.Logger) {
 			log.Warn("gatewayd: bad deployment_changed payload", "payload", n.Payload)
 			return
 		}
-		if err := inv.RefreshDeploymentWeights(context.Background(), p.AppID); err != nil {
+		if err := inv.RefreshDeploymentWeights(ctx, p.AppID); err != nil {
 			log.Warn("gatewayd: refresh deployment weights failed", "app", p.AppID, "err", err)
 		}
 	}

@@ -164,15 +164,15 @@ func TestHandleInvalidation(t *testing.T) {
 	f := &fakeInvalidator{}
 	log := testLogger()
 
-	handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `{"instance_id":"i-1","app_id":"app-7","state":"parked"}`}, log)
-	handleInvalidation(f, db.Notification{Channel: db.NotifyAppChanged, Payload: `{"app_id":"app-7"}`}, log)
-	handleInvalidation(f, db.Notification{Channel: db.NotifyDomainChanged, Payload: `{"domain":"x.io"}`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `{"instance_id":"i-1","app_id":"app-7","state":"parked"}`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyAppChanged, Payload: `{"app_id":"app-7"}`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyDomainChanged, Payload: `{"domain":"x.io"}`}, log)
 	// Malformed instance payload → no evict, no panic.
-	handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `not json`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `not json`}, log)
 	// instance payload missing instance_id → no evict.
-	handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `{"app_id":"app-7"}`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: `{"app_id":"app-7"}`}, log)
 	// Unknown channel → ignored.
-	handleInvalidation(f, db.Notification{Channel: "other", Payload: `{}`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: "other", Payload: `{}`}, log)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -197,14 +197,14 @@ func TestHandleInvalidation_DeploymentChangedRefreshesWeights(t *testing.T) {
 	log := testLogger()
 
 	// Happy path: valid payload → refresh.
-	handleInvalidation(f, db.Notification{
+	handleInvalidation(context.Background(), f, db.Notification{
 		Channel: db.NotifyDeploymentChanged,
 		Payload: `{"app_id":"app-7","deployment_id":"dep-3"}`,
 	}, log)
 	// Malformed payload → no refresh, no panic.
-	handleInvalidation(f, db.Notification{Channel: db.NotifyDeploymentChanged, Payload: `not json`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyDeploymentChanged, Payload: `not json`}, log)
 	// Empty app_id → no refresh.
-	handleInvalidation(f, db.Notification{Channel: db.NotifyDeploymentChanged, Payload: `{"app_id":"","deployment_id":"d-1"}`}, log)
+	handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyDeploymentChanged, Payload: `{"app_id":"","deployment_id":"d-1"}`}, log)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -228,7 +228,7 @@ func TestHandleInvalidation_LifecycleStatesDoNotEvict(t *testing.T) {
 		f := &fakeInvalidator{}
 		log := testLogger()
 		payload := `{"instance_id":"i-lifecycle","app_id":"app-9","state":"` + state + `"}`
-		handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: payload}, log)
+		handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: payload}, log)
 
 		f.mu.Lock()
 		evicted := len(f.evicted)
@@ -254,7 +254,7 @@ func TestHandleInvalidation_TerminalStatesEvict(t *testing.T) {
 		f := &fakeInvalidator{}
 		log := testLogger()
 		payload := `{"instance_id":"i-term","app_id":"app-9","state":"` + state + `"}`
-		handleInvalidation(f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: payload}, log)
+		handleInvalidation(context.Background(), f, db.Notification{Channel: db.NotifyInstanceChanged, Payload: payload}, log)
 
 		f.mu.Lock()
 		got := f.evicted["i-term"]
