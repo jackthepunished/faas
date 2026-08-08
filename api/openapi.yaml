@@ -4158,7 +4158,7 @@ paths:
         - name: since
           in: query
           schema: { type: string, format: date-time }
-          description: "Only return rows with `received_at >= since` (RFC 3339). Omit to read from the newest row."
+          description: "Audit-log rows with `received_at >= since` (RFC 3339) are returned. Omit to read from the newest row."
         - name: kind_prefix
           in: query
           schema: { type: string }
@@ -4166,7 +4166,7 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
-          description: "Max rows to return. Silently capped at 100."
+          description: "Audit-log page size. Silently capped at 100."
       responses:
         '200':
           description: Newest-first audit-log entries for the caller.
@@ -4185,7 +4185,7 @@ paths:
                     received_at: "2026-08-08T12:00:00Z"
                     data: { source: grace-sweep, email: "alice@example.com", actor: grace-sweep }
         '400':
-          description: Bad request — malformed `since` or `limit`.
+          description: Bad request — malformed `since`, `limit`, or `kind_prefix` (each must be RFC 3339 / a positive integer / a non-empty string when present).
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -4215,7 +4215,7 @@ paths:
         - name: since
           in: query
           schema: { type: string, format: date-time }
-          description: "Only return rows with `received_at >= since` (RFC 3339). Omit to read from the newest row."
+          description: "Operator-side audit-log rows with `received_at >= since` (RFC 3339) are returned. Omit to read from the newest row."
         - name: kind_prefix
           in: query
           schema: { type: string }
@@ -4223,7 +4223,7 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
-          description: "Max rows to return. Silently capped at 100."
+          description: "Operator-side audit-log page size. Silently capped at 100."
         - name: include_anonymous
           in: query
           schema: { type: boolean, default: false }
@@ -7668,7 +7668,7 @@ components:
           items: { $ref: '#/components/schemas/AuditLogEntry' }
         limit:
           type: integer
-          description: "Effective limit applied (always 1..100)."
+          description: "Effective page size applied (always 1..100; mirrors the customer and operator /v1/audit-log routes)."
           example: 50
 
     WakeTimelineEvent:
