@@ -666,7 +666,7 @@ func cmdDeployTarball(args []string) int {
 			// Default Node runtime is node22 (per docs/runtimes/go124.md
 			// tier-1 stance: no default-flip in the same PR that adds a
 			// new runtime). Use function-node24 for the Node 24 variant.
-			*runtime = "node22"
+			*runtime = runtimeNode22
 			*handler = defaultTemplateHandler
 		case "function-node24":
 			// Tier 1 PR 1 row: parallel to function-node, runtime is
@@ -678,7 +678,7 @@ func cmdDeployTarball(args []string) int {
 		case "function-python":
 			// Default Python runtime is python312 (no default-flip in
 			// Tier 1; python313 stays opt-in via function-python313).
-			*runtime = "python312"
+			*runtime = runtimePython312
 			*handler = defaultTemplateHandler
 		case "function-python313":
 			// Tier 1 PR 1 row: parallel to function-python, runtime
@@ -692,7 +692,7 @@ func cmdDeployTarball(args []string) int {
 			// manifest locks the entrypoint to /app/handler). We set
 			// a non-empty value so the multipart writer doesn't skip
 			// the field, but the value is never read by the runtime.
-			*runtime = "go124"
+			*runtime = runtimeGo124
 			*handler = "handler.go"
 		}
 		f, err := os.CreateTemp("", "gregale-template-*.tar.gz")

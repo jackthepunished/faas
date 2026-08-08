@@ -30,6 +30,22 @@ const (
 	fwUnknown framework = "unknown"
 )
 
+// Function runtime literals — declared as constants here so the
+// inferFunctionRuntime switch can use named values rather than
+// repeating the wire string (which goconst would otherwise flag
+// because the runtime names recur across the CLI: --template
+// function-node forces "node22", the wire form field carries
+// "node22", etc.). The whitelist matches apid's validator at
+// cmd/apid/handlers.go:98 (node22 / node24 / python312 /
+// python313 / go124 / go124-alpine); this PR only emits the
+// runtime values the auto-detect path can infer, but adding a
+// new runtime to the map is a follow-up ADR.
+const (
+	runtimeNode22    = "node22"
+	runtimePython312 = "python312"
+	runtimeGo124     = "go124"
+)
+
 // shape is the deploy shape auto-detected from the current directory when
 // `gregale deploy` runs with no source flag (issue #737 / ADR-083). A function
 // shape means "single handler file at the root, no app markers"; an app shape
@@ -262,11 +278,11 @@ func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
 	}
 	switch strings.ToLower(picked) {
 	case "handler.js", "handler.ts":
-		return "node22", defaultTemplateHandler, true
+		return runtimeNode22, defaultTemplateHandler, true
 	case "handler.py":
-		return "python312", defaultTemplateHandler, true
+		return runtimePython312, defaultTemplateHandler, true
 	case "handler.go":
-		return "go124", defaultTemplateHandler, true
+		return runtimeGo124, defaultTemplateHandler, true
 	}
 	return "", "", false
 }
