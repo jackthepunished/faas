@@ -925,6 +925,14 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodePlanAlertRuleQuota:
 		return http.StatusForbidden
+	case CodePlanLogArchiveNotAllowed:
+		// Issue #562 / PR-B: Free customers don't have log
+		// archive read-back. Same shape as the other plan-
+		// gated "X unavailable on this plan" codes: 402 +
+		// a deliberate upsell. The gatewayd-internal archive
+		// handler maps LogArchiveEnabled() == false to this
+		// code via ErrPlanLogArchiveNotAllowed.
+		return http.StatusPaymentRequired
 	// Issue #561 — spend cap pauses workload. 402 mirrors the existing
 	// `CodePlanFeatureGated` / `CodePlanCronsNotAllowed` /
 	// `CodePlanAlertRulesNotAllowed` family: a deliberate account-level
@@ -1282,6 +1290,31 @@ const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
 // reached. Distinct from CodePlanWebhooksNotAllowed so the CLI
 // can branch on upsell-vs-delete copy without parsing the body.
 const CodePlanWebhookQuota = "plan_webhook_quota"
+
+// CodePlanLogArchiveNotAllowed is the 402 the customer sees when
+// they request ?archive=1 against an app on a plan whose
+// LogArchiveEnabled() returns false (Free today, issue #562).
+// Fires BEFORE the gatewayd-internal handler touches S3 so a
+// Free customer gets a clean 402 instead of an S3 403 from a
+// bucket they don't have read access to. The wire is the same
+// as ErrPlanCronsNotAllowed: 402 + a stable `code` the SDK
+// branches on without parsing the body.
+const CodePlanLogArchiveNotAllowed = "plan_log_archive_not_allowed"
+
+// ErrPlanLogArchiveNotAllowed is returned by the gatewayd-internal
+// archive log read-back handler when the customer's plan has
+// LogArchiveEnabled() == false (Free today). Mirrors
+// ErrPlanCronsNotAllowed and ErrPlanAlertRulesNotAllowed so the
+// upsell surface is consistent across plan-gated features. The
+// Hobby+ copy is the deliberate upgrade hint; Free never sees
+// the bucket-proxy path so the customer gets the upsell message
+// rather than a silent 404.
+func ErrPlanLogArchiveNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanLogArchiveNotAllowed,
+		"Log archive unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include log archive read-back; upgrade to Hobby or above to query historical logs from object storage.", p)).
+		WithDocs(docsBase + "/plans#log-archive")
+}
 
 // CodeAppWebhookInvalid is the 400 the customer sees for any
 // malformed webhook body — missing target_url, invalid retry_policy,

@@ -49,6 +49,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
 	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -312,6 +313,21 @@ type runDeps struct {
 	// client cache. Wired in run() from newScheddRouter. nil in
 	// tests — the legacy single-sched path stays in effect.
 	scheddRouter *scheddRouter
+	// archiveS3 (issue #562 PR-B) is the S3 client the
+	// bucket-proxy read-back handler uses to fetch archived
+	// .jsonl.gz objects. Constructed in run() from the same
+	// FAAS_LOG_ARCHIVE_* env vars apid uses for its shipper
+	// (single source of truth on the box). nil in tests +
+	// when FAAS_LOG_ARCHIVE_BUCKET is unset / unseal
+	// incomplete; the handler surfaces a 503
+	// log_archive_unconfigured in that branch.
+	archiveS3 *logarchive.S3Client
+	// archiveBucket (issue #562 PR-B) is the destination bucket
+	// name the shipper writes into and the read-back handler
+	// reads from. Kept separate from archiveS3.Bucket so the
+	// archive handler can be tested without rebuilding the
+	// client. Empty when archiveS3 is nil.
+	archiveBucket string
 	// capCheck: DEPLOY-1 / ADR-075 capdecl gate seam (review
 	// finding M2). nil → runtimecheck.MustCheckOnBoot(capsDecl,
 	// log, nil) which exits on violation in production. Tests
@@ -698,6 +714,40 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// It outlives `run` because we want the AppLogsHandler to keep a
 	// pointer to the same client; defers Close.
 	deps.scheddClient = sched
+	// Issue #562 PR-B: build the S3 client the bucket-proxy
+	// read-back handler uses to fetch archived .jsonl.gz
+	// objects. We re-use the same FAAS_LOG_ARCHIVE_* env vars
+	// apid's shipper reads (single source of truth on the
+	// box — same endpoint, region, key, secret, bucket). When
+	// the bucket is unset (the disabled-path branch), the
+	// handler surfaces 503 log_archive_unconfigured rather
+	// than booting a half-configured client. apid is the
+	// canonical shipper owner; gatewayd-internal only reads.
+	// The wire-up happens AFTER the public-auth unseal so an
+	// operator who rotates host.age picks up the new envelope
+	// on the same boot — no separate restart needed.
+	archiveCfg, archiveCfgErr := logarchive.ConfigFromEnv(os.Getenv, log)
+	switch {
+	case archiveCfgErr != nil:
+		log.Warn("gatewayd-internal: log archive config parse failed; archive read-back disabled", "err", archiveCfgErr)
+	case !archiveCfg.Enabled():
+		log.Info("gatewayd-internal: log archive disabled (FAAS_LOG_ARCHIVE_BUCKET unset); archive read-back will return 503")
+	default:
+		s3c, s3Err := logarchive.NewS3Client(
+			archiveCfg.Endpoint, archiveCfg.Region, archiveCfg.Bucket,
+			archiveCfg.KeyID, archiveCfg.Secret,
+		)
+		if s3Err != nil {
+			log.Warn("gatewayd-internal: S3 client build failed; archive read-back disabled", "err", s3Err)
+		} else {
+			deps.archiveS3 = s3c
+			deps.archiveBucket = archiveCfg.Bucket
+			log.Info("gatewayd-internal: log archive read-back armed",
+				"endpoint", archiveCfg.Endpoint,
+				"region", archiveCfg.Region,
+				"bucket", archiveCfg.Bucket)
+		}
+	}
 	// ADR-025 axis 4: StreamWarmHints consumer. Long-lived
 	// goroutine under the same ctx as the rest of the daemon —
 	// drains the sticky-warm affinity stream from schedd into
@@ -924,17 +974,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	var logsHandler http.Handler
 	if deps.authMw != nil && deps.pgStore != nil && deps.scheddRouter != nil {
 		logsMux := http.NewServeMux()
-		logsMux.Handle("GET /v1/apps/{slug}/logs", &AppLogsHandler{
-			Auth: deps.authMw,
-			// Phase 2 / Gate A: dial the owner schedd via the
-			// per-node router. The legacy scheddClient field is
-			// retained for the warm-hint stream (single-stream
-			// fallback); the log stream is the second fan-in
-			// consumer and resolves per-app.
-			ScheddFor: appLogsScheddResolver{store: deps.pgStore, router: deps.scheddRouter},
-			Store:     deps.pgStore,
-			Log:       log,
-			Ops:       nil,
+		// PR-B (issue #562): mount a tiny dispatcher that routes
+		// ?archive=1 to the bucket-proxy read-back handler
+		// (cmd/gatewayd-internal/app_logs_archive.go) and the
+		// bare /v1/apps/{slug}/logs path to the live handler.
+		// The mux is mounted at GET /v1/apps/{slug}/logs and the
+		// dispatcher reads r.URL.Query().Get("archive"); query
+		// params don't appear in r.URL.Path, so the mux still
+		// routes to the dispatcher regardless of whether
+		// ?archive=1 is present.
+		logsMux.Handle("GET /v1/apps/{slug}/logs", &appLogsDispatcher{
+			live: &AppLogsHandler{
+				Auth: deps.authMw,
+				// Phase 2 / Gate A: dial the owner schedd via the
+				// per-node router. The legacy scheddClient field is
+				// retained for the warm-hint stream (single-stream
+				// fallback); the log stream is the second fan-in
+				// consumer and resolves per-app.
+				ScheddFor: appLogsScheddResolver{store: deps.pgStore, router: deps.scheddRouter},
+				Store:     deps.pgStore,
+				Log:       log,
+				Ops:       nil,
+			},
+			archive: &ArchiveLogsHandler{
+				Auth:   deps.authMw,
+				S3:     deps.archiveS3,
+				Bucket: deps.archiveBucket,
+				Store:  deps.pgStore,
+				Log:    log,
+				Ops:    nil,
+			},
 		})
 		logsHandler = logsMux
 	}
