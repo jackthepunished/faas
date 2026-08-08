@@ -3,6 +3,7 @@ package loader
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/BurntSushi/toml"
 
@@ -162,6 +163,19 @@ func ApplyBillingEnvOverlay(cfg *RootBillingConfig, env func(string) string) *Ro
 	}
 	if v := env("FAAS_PADDLE_SANDBOX"); v != "" {
 		cfg.Paddle.Sandbox = v == paddleSandboxTrue1 || v == paddleSandboxTrueWord
+	}
+	// PR-P4 — FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS exposes the
+	// replay-protection window as an operator knob (sandbox VMs with
+	// bad NTP need this). Mirrors stripe.Config.ToleranceSeconds.
+	// Bad parse (non-integer) falls through silently — the verifier
+	// clamps <= 0 to webhookDefaultTolerance, so a stale TOML value
+	// is safer than a noisy Warn on every boot. envTick in
+	// cmd/meterd/main.go is the operator-side diagnostic surface
+	// for tolerance drift.
+	if v := env("FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS"); v != "" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil {
+			cfg.Paddle.ToleranceSeconds = n
+		}
 	}
 	// The [billing].provider field is also env-overridable: an
 	// operator who sets FAAS_BILLING_PROVIDER in the systemd

@@ -91,26 +91,73 @@ the legacy `stripe.Client`.
 
 ## Failure modes
 
-| Symptom                                                    | Likely cause                                                                  |
-|------------------------------------------------------------|-------------------------------------------------------------------------------|
-| Boot fails with `unknown FAAS_BILLING_PROVIDER`            | Typo in the env var (e.g. `braintree`, `paypal`). Set to `paddle` or unset. |
-| Boot fails with `paddle EnsurePlanProducts: …`             | Network egress to `api.paddle.com` blocked (or `api.sandbox.paddle.com` if sandbox=1). Check `iptables` + `FAAS_BRIDGE_OUTBOUND`. |
-| Webhook returns 503                                        | `FAAS_PADDLE_WEBHOOK_SECRET` is empty. Provider refuses to verify.            |
-| Webhook returns 400 (`code: validation_failed`)            | Signature mismatch (wrong secret in dashboard) or clock skew > 5 min.         |
-| `transaction.paid` 200 but no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`). 200 stops Paddle from retrying; check the customer mapping. |
-| `changePlan` 402 carries `paddle_checkout_url` but URL 404 | Paddle sandbox product/price IDs not yet created. Run `EnsurePlanProducts` manually (it's idempotent — re-running on an existing catalog is a no-op). |
+| Symptom                                                    | Likely cause                                                                  | Diagnostic                                                                                          |
+|------------------------------------------------------------|-------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| Boot fails with `unknown FAAS_BILLING_PROVIDER`            | Typo in the env var (e.g. `braintree`, `paypal`). Set to `paddle` or unset.  | Boot log carries the typed error.                                                                   |
+| Boot fails with `paddle EnsurePlanProducts: …`             | Network egress to `api.paddle.com` blocked (or `api.sandbox.paddle.com` if sandbox=1). Check `iptables` + `FAAS_BRIDGE_OUTBOUND`. | Boot log line; idempotent — re-run after fixing.                                                    |
+| Webhook returns 503                                        | `FAAS_PADDLE_WEBHOOK_SECRET` is empty. Provider refuses to verify.            | Boot log `paddle_webhook.no_provider`.                                                              |
+| Webhook returns 400 (`code: validation_failed`)            | Signature mismatch (wrong secret in dashboard) or clock skew > tolerance.     | `journalctl -u faas-apid` shows `paddle_webhook.verify_failed err=…`. Also increments `paddle_webhook_verify_failed_total`. |
+| `transaction.paid` 200 but no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`). 200 stops Paddle from retrying. | `journalctl -u faas-apid` shows `paddle_webhook.unknown_customer customer_id=…`. Check the mapping. |
+| `changePlan` 402 carries `paddle_checkout_url` but URL 404 | Paddle sandbox product/price IDs not yet created. Run `EnsurePlanProducts` manually (it's idempotent — re-running on an existing catalog is a no-op). | `faas billing price-catalog list` shows the catalog snapshot.                                       |
+| Duplicate Paddle events arriving within seconds            | Paddle redelivery (network blip). Deduped by `pkg/webhookdedupe` (5-min TTL). | `paddle_webhook_replay_suppressed_total` increments; audit row `webhook.replay_rejected` is emitted. |
+
+## Webhook hardening knobs
+
+| Env var                                   | Default | Purpose                                                                                  |
+|-------------------------------------------|---------|------------------------------------------------------------------------------------------|
+| `FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS`   | `300`   | Replay-protection window. Applies symmetrically (rejects future-dated too). The default matches Stripe. Useful when sandbox VMs have bad NTP. |
+
+Prometheus counters (single-registry on every daemon; only `apid` increments):
+
+- `paddle_webhook_verify_failed_total` — unlabelled; tripwire for "wrong webhook secret in dashboard" or "clock skew beyond tolerance".
+- `paddle_webhook_replay_suppressed_total` — unlabelled; tripwire for "Paddle is redelivering" (sustained rate is normal during a Paddle-side incident; sustained rate over 30 min is the alert).
+
+## Sandbox walk
+
+`make e2e-sandbox` exercises the full `changePlan → 402 → webhook → state-flip` round-trip against `api.sandbox.paddle.com`. Operator-only — gated on `secrets/.env.sandbox` + `FAAS_PADDLE_SANDBOX_E2E=1`. Skipped in CI by design (no Paddle sandbox account in CI secrets).
+
+```sh
+# 1. Create secrets/.env.sandbox with the two keys from
+#    https://sandbox-vendors.paddle.com → Developer tools → Authentication.
+cat > secrets/.env.sandbox <<EOF
+FAAS_PADDLE_SANDBOX_API_KEY=pdl_sandbox_…
+FAAS_PADDLE_SANDBOX_WEBHOOK_SECRET=whk_…
+EOF
+chmod 0600 secrets/.env.sandbox
+
+# 2. Set DATABASE_URL for the harness (any reachable Postgres).
+export DATABASE_URL=postgres:///faas?host=/run/postgresql&user=faas
+
+# 3. Run the walk.
+make e2e-sandbox
+```
+
+The walk fires three sequential tests via a `/tmp/faas-paddle-sandbox-handoff.json` file:
+
+1. `TestPaddleSandbox_ChangePlanReturnsCheckoutURL` — signup → `PATCH /v1/account/plan {plan: hobby}` → asserts 402 + `paddle_checkout_url` + `tx_id`. Writes the customer + transaction IDs to the handoff file.
+2. `TestPaddleSandbox_SubscriptionCreatedStampsCustomerID` — POSTs a signed `subscription.created` event with the handoff's `ctm_…` ID → asserts `accounts.provider_customer_id` is populated.
+3. `TestPaddleSandbox_TransactionCompletedIsNoop` — POSTs a signed `transaction.completed` event → asserts no state flip.
+
+A passing run validates that the apid webhook handler, the catalog OpProvider, and the live Paddle sandbox all agree on the customer → account mapping. Re-run is idempotent (every test creates fresh state).
 
 ## Secret rotation
 
-Paddle API keys and webhook secrets live at
-`/etc/faas/secrets/paddle.{api_key,webhook_secret}` (mode `0440`,
-owner `root:faas`), sealed at rest per gap G2 (spec §17). Rotation
-procedure:
+Paddle API keys and webhook secrets are configured through the `sealed.env` systemd `EnvironmentFile=` (`/etc/faas/sealed.env`), not through on-disk secret files. The TOML equivalent (`[billing.paddle]` in `apid.toml` / `meterd.toml`) covers the same fields for containerized deploys; the loader's `ApplyBillingEnvOverlay` makes **env win over TOML** when both are set (`pkg/billing/loader/config.go:157-172`). Rotation cadence is monthly per `docs/ops/secrets-rotation.md`.
+
+Procedure (env form):
+
+1. Generate the new key/secret in the Paddle dashboard (Developer tools → Authentication, Developer tools → Notifications).
+2. Edit `/etc/faas/sealed.env` — replace `FAAS_PADDLE_API_KEY` and/or `FAAS_PADDLE_WEBHOOK_SECRET`. The file is mode `0600 root:root`; do not `chmod` it.
+3. `systemctl restart faas-apid faas-meterd` — both daemons read the env vars at boot; mid-flight rotation requires a process restart.
+4. Validate: `faas billing status` prints the new catalog SyncedAt timestamp (re-stamped on `EnsurePlanProducts` at boot). Send a Paddle test event from the dashboard (Notifications → your endpoint → Send test) and confirm `journalctl -u faas-apid` shows `paddle_webhook` activity without `verify_failed`.
+
+Procedure (TOML form — for containers / k8s):
 
 1. Generate the new key/secret in the Paddle dashboard.
-2. Install on the reference node with `install -m 0440 -o root -g faas`.
-3. `systemctl restart faas-apid faas-meterd` — both daemons read the
-   env vars at boot; mid-flight rotation requires a process restart.
+2. Update the `[billing.paddle]` block in `apid.toml` / `meterd.toml` and redeploy. The `Secrets:` secret-store abstraction (k8s `Secret`, docker `--env-file`, etc.) is the operator's choice.
+3. Roll the daemons.
+
+For gap-G2 sealing at rest (sensitive providers), wrap the `sealed.env` write in the operator's age / sops / vault flow — the repo's `host.age` precedent (`docs/ops/host-age-rotation.md`) is the canonical pattern.
 
 ## Health checks
 
@@ -119,10 +166,27 @@ procedure:
 - The `apid` boot log line `billing provider loaded provider=paddle`
   is the canonical "the env var reached the daemon" signal.
 - `meterd` boot log: `meterd billing provider loaded provider=paddle`.
+- After PR-P4 (this PR): `make verify-secrets` fails the playbook if
+  `FAAS_BILLING_PROVIDER=paddle` is set without `FAAS_PADDLE_API_KEY`.
+- Operator-side smoke test: `make doctor-paddle` (operator-only target,
+  not in CI) prints `faas billing status --watch` output + the last
+  60 seconds of `faas-apid` journal lines.
+
+## Column rename history (note)
+
+The rename `accounts.stripe_customer_id → accounts.provider_customer_id` already shipped in migration **00040** (well before PR-P4). Both providers write to the same column: `stripe.Customer.ID` → `cus_…`, `paddle.Customer.ID` → `ctm_…`. For an operator querying the table:
+
+```sql
+SELECT provider_customer_id FROM accounts WHERE id = '…';
+```
+
+The column has been provider-neutral since 00040; PR-P4 added **no** rename migration. The earlier plan for PR-P4 included the rename as Stream F, but the work was already done upstream and a re-rename would have been a no-op guarded by the DO-block — the migration was removed before commit. ADR-032 §Consequences records the original deferral and its subsequent resolution.
 
 ## Related
 
-- ADR-032 — Paddle as an opt-in billing provider (decision record).
+- ADR-032 — Paddle as an opt-in billing provider (decision record; PR-split section amended by PR-P4 to reflect that the column rename was already shipped in 00040).
 - ADR-025 — provider-pluggable billing layer (the abstraction).
+- ADR-042 — webhook replay protection (the `pkg/webhookdedupe` contract).
 - `pkg/billing/loader/` — the canonical selector implementation.
 - `pkg/billing/paddle/` — the Paddle Billing v2 implementation.
+- `docs/runbooks/BillingDrift.md` — alert runbook for `meterd_billing_drift_*` (works for both providers).

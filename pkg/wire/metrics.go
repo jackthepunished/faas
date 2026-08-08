@@ -299,6 +299,26 @@ type OpsMetrics struct {
 	// audit events table is the per-customer detail; this is the
 	// fleet-wide counter for the §12 dashboard).
 	alertDeliveryAttemptsTotal *prometheus.CounterVec
+	// paddleWebhookVerifyFailedTotal — counts Paddle webhook signature
+	// verify failures (PR-P4). Unlabelled; the per-event detail
+	// (event_id, err message, tolerance) lives in the journal line
+	// emitted by cmd/apid/handlers_ext.go::paddleWebhook ("paddle_webhook.verify_failed")
+	// and in the response body of the 400 RFC 7807 problem. The counter
+	// is the fleet-level tripwire for "wrong webhook secret in
+	// dashboard" or "clock skew beyond tolerance". The handler is the
+	// only incrementer (apid only); the field exists on every daemon
+	// per the single-registry pattern. Mirrors alertEvalSkippedDegradedTotal
+	// (line 288) — both are unlabelled fleet-level signals with no PII.
+	paddleWebhookVerifyFailedTotal prometheus.Counter
+	// paddleWebhookReplaySuppressedTotal — counts Paddle webhook events
+	// rejected by pkg/webhookdedupe (PR-P4). Unlabelled; the per-event
+	// detail (delivery_id) lives in the existing webhook.replay_rejected
+	// audit row. The counter is the fleet-level tripwire for "Paddle is
+	// redelivering" — a sustained rate over 30 min is the alert. The
+	// handler is the only incrementer (apid only); the field exists on
+	// every daemon per the single-registry pattern. Mirrors
+	// alertEvalFiredTotal (line 293).
+	paddleWebhookReplaySuppressedTotal prometheus.Counter
 	// alertEvaluatorEnabled — operator-facing gauge scraped by
 	// /healthz and the dashboard's alert-evaluation-health panel.
 	// 1 when the Evaluator tick is wired and running on the current
@@ -1237,6 +1257,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, outcome := range []string{"delivered", "failed"} {
 		alertDeliveryAttemptsTotal.WithLabelValues(outcome)
 	}
+	// PR-P4 — Paddle webhook hardening counters. Single-registry:
+	// registered on every daemon's OpsMetrics; only apid increments.
+	// Unlabelled — the per-event detail lives in the journal line
+	// + the audit row, both of which carry the event_id.
+	paddleWebhookVerifyFailedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_paddle_webhook_verify_failed_total",
+		Help: "Count of Paddle webhook signature verify failures (cmd/apid/handlers_ext.go::paddleWebhook). Unlabelled — the per-event detail (event_id, err, tolerance) is in the journal line emitted alongside the increment. The counter is the fleet-level tripwire for 'wrong webhook secret in dashboard' or 'clock skew beyond tolerance' (PR-P4).",
+	})
+	paddleWebhookReplaySuppressedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_paddle_webhook_replay_suppressed_total",
+		Help: "Count of Paddle webhook events rejected by pkg/webhookdedupe (PR-P4). Unlabelled — the per-event delivery_id is in the existing webhook.replay_rejected audit row. The counter is the fleet-level tripwire for 'Paddle is redelivering' — a sustained rate over 30 min is the alert.",
+	})
 	alertEvaluatorEnabled := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: prefix + "_alert_evaluator_enabled",
 		Help: "1 when the pkg/alerts.Evaluator tick is wired and running on this meterd process; 0 when it isn't (Prometheus not configured, FAAS_HOST_AGE_IDENTITY_PATH empty, no host.age on disk, or meterd's caller skipped the loop). Unlabelled. Pair with alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the dashboard's alert-evaluation-health panel; alert rule 'alertEvalDisabled' queries this gauge for the §12 self-healing alert.",
@@ -1586,6 +1618,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
+		paddleWebhookVerifyFailedTotal, paddleWebhookReplaySuppressedTotal,
 		auditOrgEvent, authzDenied, authzAllowed,
 		wakeIDV4Fallback,
 		snapshotDiskDrift,
@@ -2070,6 +2103,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		alertEvalSkippedDegradedTotal:      alertEvalSkippedDegradedTotal,
 		alertEvalFiredTotal:                alertEvalFiredTotal,
 		alertDeliveryAttemptsTotal:         alertDeliveryAttemptsTotal,
+		paddleWebhookVerifyFailedTotal:     paddleWebhookVerifyFailedTotal,
+		paddleWebhookReplaySuppressedTotal: paddleWebhookReplaySuppressedTotal,
 		alertEvaluatorEnabled:              alertEvaluatorEnabled,
 		pgBackupLastPushed:                 pgBackupLastPushed,
 		ipLabels:                           newIPLabelSet(maxIPLabelValues),
@@ -3853,6 +3888,31 @@ func (m *OpsMetrics) ObserveGithubdPathFilter(mode string) {
 	case PathFilterModePaths, PathFilterModeFullFallback, PathFilterModeTruncated, PathFilterModeError, PathFilterModeBreakerOpen:
 		m.githubdPathFilterTotal.WithLabelValues(mode).Inc()
 	}
+}
+
+// IncPaddleWebhookVerifyFailed increments the paddleWebhookVerifyFailedTotal
+// counter (PR-P4). Called from cmd/apid/handlers_ext.go::paddleWebhook
+// on signature verify failure. Nil-receiver safe so tests that don't
+// wire metrics keep working — the same nil-guard pattern as
+// ObserveGithubdPathFilter above. Single-registry: the field is
+// registered on every daemon's OpsMetrics; only apid increments.
+func (m *OpsMetrics) IncPaddleWebhookVerifyFailed() {
+	if m == nil || m.paddleWebhookVerifyFailedTotal == nil {
+		return
+	}
+	m.paddleWebhookVerifyFailedTotal.Inc()
+}
+
+// IncPaddleWebhookReplaySuppressed increments the
+// paddleWebhookReplaySuppressedTotal counter (PR-P4). Called from
+// cmd/apid/handlers_ext.go::paddleWebhook when pkg/webhookdedupe
+// reports a replay. Nil-receiver safe; single-registry; only apid
+// increments.
+func (m *OpsMetrics) IncPaddleWebhookReplaySuppressed() {
+	if m == nil || m.paddleWebhookReplaySuppressedTotal == nil {
+		return
+	}
+	m.paddleWebhookReplaySuppressedTotal.Inc()
 }
 
 // GithubdPathFilterTotal returns the labelled-counter accessor for

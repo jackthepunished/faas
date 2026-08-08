@@ -21,6 +21,14 @@ import (
 // third provider using it yet — when one lands, hoist.
 const webhookDefaultTolerance = 5 * time.Minute
 
+// WebhookDefaultToleranceSeconds is the integer form of
+// webhookDefaultTolerance, exposed for the loader so the env overlay
+// (FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS) has a stable default value
+// to reference without importing the time package from the loader.
+// Kept in sync with webhookDefaultTolerance; a change here MUST
+// update the comment above and vice-versa.
+const WebhookDefaultToleranceSeconds = 300
+
 // parsePaddleEvent decodes a Paddle webhook body into the
 // normalized billing.Event. Provider-shaped JSON stays here —
 // apid sees only the Event envelope.

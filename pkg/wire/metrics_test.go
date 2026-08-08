@@ -518,6 +518,63 @@ func TestOpsMetrics_IncLogDropped_UnknownReasonNoOp(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_IncPaddleWebhookVerifyFailed (PR-P4) — the
+// paddle_webhook_verify_failed_total counter starts at 0, increments
+// by 1 per IncPaddleWebhookVerifyFailed call, and surfaces in
+// /metrics with the closed-vocabulary HELP/TYPE headers. Same
+// pattern as TestOpsMetrics_IncLogDropped above (closed label set,
+// pre-instantiated zero surface, no daemon-uniqueness requirement).
+func TestOpsMetrics_IncPaddleWebhookVerifyFailed(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.IncPaddleWebhookVerifyFailed()
+	m.IncPaddleWebhookVerifyFailed()
+	m.IncPaddleWebhookVerifyFailed()
+
+	body := render(t, m)
+	for _, want := range []string{
+		`apid_paddle_webhook_verify_failed_total 3`,
+		`# HELP apid_paddle_webhook_verify_failed_total`,
+		`# TYPE apid_paddle_webhook_verify_failed_total counter`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_IncPaddleWebhookReplaySuppressed (PR-P4) — the
+// paddle_webhook_replay_suppressed_total counter mirrors the
+// verify_failed counter's contract. The two counters are paired
+// in the operator's runbook (failure-mode table row + runbook
+// "Webhook hardening knobs" section) so a single test per counter
+// keeps the wire-time fast.
+func TestOpsMetrics_IncPaddleWebhookReplaySuppressed(t *testing.T) {
+	m := wire.NewOpsMetrics("apid")
+	m.IncPaddleWebhookReplaySuppressed()
+
+	body := render(t, m)
+	for _, want := range []string{
+		`apid_paddle_webhook_replay_suppressed_total 1`,
+		`# HELP apid_paddle_webhook_replay_suppressed_total`,
+		`# TYPE apid_paddle_webhook_replay_suppressed_total counter`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing line %q in:\n%s", want, body)
+		}
+	}
+}
+
+// TestOpsMetrics_PaddleWebhookCountersNilSafe (PR-P4) — same
+// nil-receiver contract as TestOpsMetrics_IncLogDroppedNilSafe.
+// Tests that construct a nil *OpsMetrics (cmd unit tests with no
+// metrics wiring) must not panic when the handler short-circuits
+// through the paddle webhook path.
+func TestOpsMetrics_PaddleWebhookCountersNilSafe(t *testing.T) {
+	var m *wire.OpsMetrics
+	m.IncPaddleWebhookVerifyFailed()
+	m.IncPaddleWebhookReplaySuppressed()
+}
+
 func TestRenderSeconds(t *testing.T) {
 	for _, tc := range []struct {
 		in   time.Duration

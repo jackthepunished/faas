@@ -815,6 +815,23 @@ jobs:
       - name: migrations check (static)
         run: make migrations-check
 
+      # PR-P4 — assert deploy/scripts/verify-secrets.sh is shaped
+      # correctly (executable, bash-parseable, presence of the
+      # Paddle + Stripe blocks added by Streams A + B). The
+      # script itself runs against /etc/faas/sealed.env on a real
+      # control-plane node; CI only checks it parses + has the
+      # expected Paddle+Stripe block headers, via a hermetic
+      # SECRETS_FILE override (an empty fixture that the script
+      # must not reject as malformed). see cmd/gregale/_test for
+      # the equivalent CLI flag parse-tripwire pattern.
+      - name: verify-secrets.sh static check
+        run: |
+          set -euo pipefail
+          test -x deploy/scripts/verify-secrets.sh
+          bash -n deploy/scripts/verify-secrets.sh
+          grep -q "FAAS_PADDLE_API_KEY" deploy/scripts/verify-secrets.sh
+          grep -q "FAAS_BILLING_PROVIDER=paddle" deploy/scripts/verify-secrets.sh
+
       # Cross-PR slot collision. TestMigrationsUniquePrefixes (in the static
       # step above) only sees one branch at a time: a PR builds against
       # refs/pull/N/merge, which cannot contain a sibling PR's files. So two

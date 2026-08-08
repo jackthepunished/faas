@@ -2344,6 +2344,25 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// billingWebhookTolerance returns the configured replay-protection
+// window for the active billing provider. PR-P4 introduced the
+// operator knob (FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS, default 300s);
+// pre-PR-P4 the value was a literal 5*time.Minute at the call site.
+// For Stripe the existing stripe.Config.ToleranceSeconds path is
+// preserved; for Paddle the loader's BuildAPID closure calls
+// SetWebhookTolerance after construction, and this helper queries
+// the provider. On a non-Paddle deployment the helper returns the
+// default (the only consumer — paddleWebhook — has already gated on
+// the provider name before calling VerifyWebhook).
+func (s *server) billingWebhookTolerance() time.Duration {
+	if p, ok := s.billingProvider.(interface {
+		WebhookTolerance() time.Duration
+	}); ok {
+		return p.WebhookTolerance()
+	}
+	return 5 * time.Minute
+}
+
 // paddleWebhook accepts signed Paddle events. Mirrors stripeWebhook
 // (cmd/apid/handlers_ext.go:672) but the signature verify + JSON parse
 // happen inside s.billingProvider.VerifyWebhook so apid never sees
@@ -2375,8 +2394,27 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 	headers := map[string]string{
 		"Paddle-Signature": r.Header.Get("Paddle-Signature"),
 	}
-	ev, err := s.billingProvider.VerifyWebhook(body, headers, 5*time.Minute)
+	// PR-P4 — tolerance is now configurable via FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS
+	// (or [billing.paddle].webhook_tolerance_seconds in TOML). The
+	// verifier in pkg/billing/paddle/webhook.go clamps <= 0 to
+	// webhookDefaultTolerance, so an unset / bad-parsed config is
+	// the safe pre-PR-P4 behaviour.
+	tol := s.billingWebhookTolerance()
+	ev, err := s.billingProvider.VerifyWebhook(body, headers, tol)
 	if err != nil {
+		// PR-P4 — surface the verify failure to operators. Pre-PR-P4
+		// the handler returned 400 with no log line, so an operator
+		// debugging "wrong secret in the dashboard" had nothing to
+		// grep for. The Counter is unlabelled — fleet-level signal,
+		// not per-event detail (the per-event detail lives in the
+		// audit row + the journal).
+		s.log.Warn("paddle_webhook.verify_failed",
+			"err", logsanitize.Field(err.Error()),
+			"tolerance", tol.String(),
+		)
+		if s.ops != nil {
+			s.ops.IncPaddleWebhookVerifyFailed()
+		}
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad signature", err.Error()))
 		return
 	}
@@ -2385,6 +2423,18 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 		// Unknown customer: 200 so Paddle stops retrying. New
 		// customers land via CreateCustomer; we don't auto-provision
 		// on a webhook.
+		//
+		// PR-P4 — surface the unknown-customer path to operators.
+		// The customer ID is a `ctm_…` identifier, NOT a secret, so
+		// no sanitiser is needed. The existing failure-mode table in
+		// docs/ops/billing-provider-switch.md tells operators to go
+		// grep for this exact line when a `transaction.paid` 200s
+		// without a state flip — pre-PR-P4 that grep returned
+		// nothing.
+		s.log.Info("paddle_webhook.unknown_customer",
+			"customer_id", ev.CustomerID,
+			"event_type", int(ev.Type),
+		)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -2403,6 +2453,15 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 					"provider":    webhookdedupe.ProviderPaddle,
 					"delivery_id": logsanitize.Field(ev.EventID),
 				})
+				// PR-P4 — counter for the replay-suppressed branch.
+				// Unlabelled (closed-vocabulary event_type is implied
+				// by the audit row). Mirrors alertEvalFiredTotal
+				// (pkg/wire/metrics.go:293). Helps operators
+				// distinguish "Paddle is redelivering" from "Paddle
+				// is sending brand-new events".
+				if s.ops != nil {
+					s.ops.IncPaddleWebhookReplaySuppressed()
+				}
 				w.WriteHeader(http.StatusOK)
 				return
 			}
