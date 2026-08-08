@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00160_gdpr_request_id.sql (issue #755 /
+// Migration-apply test for 00164_gdpr_request_id.sql (issue #755 /
 // PR-5.2). Pins the additive shape + the load-bearing partial index.
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00160.
+//  1. Migration set applies cleanly through 00164.
 //  2. gdpr_requests.request_id column exists and is nullable.
 //  3. gdpr_requests_request_id_idx is a partial index
 //     (WHERE request_id IS NOT NULL) — the WHERE clause is what
@@ -24,7 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00160_GdprRequestId(t *testing.T) {
+func TestMigrations_00164_GdprRequestId(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

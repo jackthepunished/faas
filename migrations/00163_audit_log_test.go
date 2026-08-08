@@ -1,12 +1,12 @@
 //go:build !no_pg
 
-// Migration-apply test for 00159_audit_log.sql (issue #755 / PR-5).
+// Migration-apply test for 00163_audit_log.sql (issue #755 / PR-5).
 // Pins the audit_log table shape + the load-bearing FK-free invariant
 // the events-FK-survival story depends on.
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00159.
+//  1. Migration set applies cleanly through 00163.
 //  2. audit_log: column shape, nullable account_id + account_email
 //     + actor + data, NOT NULL id / kind / received_at.
 //  3. audit_log has NO foreign key constraints (the audit row must
@@ -26,7 +26,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00159_AuditLog(t *testing.T) {
+func TestMigrations_00163_AuditLog(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

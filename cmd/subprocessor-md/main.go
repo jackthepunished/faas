@@ -46,7 +46,7 @@ type subProcessor struct {
 	RetentionDays     *int     `json:"retention_days"` // nullable
 	DPASigned         bool     `json:"dpa_signed"`
 	DPAReference      string   `json:"dpa_reference"`
-	OperatorSwitchEnv *string  `json:"operator_switch_env"`    // nullable
+	OperatorSwitchEnv *string  `json:"operator_switch_env"` // nullable
 	Rationale         string   `json:"rationale"`
 	NoticePublishedAt *string  `json:"notice_published_at"` // date when the 30-day notice was first published at docs.gregale.dev/dpa/subprocessors
 	EffectiveDate     *string  `json:"effective_date"`      // date when the sub-processor starts processing customer data; must be ≥ 30 days after notice_published_at

@@ -70,10 +70,10 @@ func makeNotifier(rec *recordingNotifier) func(context.Context, string, string) 
 // match: grace.Auditor is a 4-method interface and this satisfies it
 // without pulling in the apid auditor concrete type.
 type recordingAuditor struct {
-	mu          sync.Mutex
-	kinds       []string
-	accountIDs  []string
-	data        []map[string]any
+	mu         sync.Mutex
+	kinds      []string
+	accountIDs []string
+	data       []map[string]any
 }
 
 func (r *recordingAuditor) Emit(_ context.Context, kind string, accountID *string, data map[string]any) {

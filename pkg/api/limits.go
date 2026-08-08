@@ -49,7 +49,7 @@ var Plans = []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
 // Retry-After header when no prior export is found in the ledger
 // (the upper bound the wire will advertise).
 const (
-	ExportRateLimitWindow         = 24 * time.Hour
+	ExportRateLimitWindow        = 24 * time.Hour
 	ExportRateLimitWindowSeconds = int(24 * time.Hour / time.Second)
 )
 

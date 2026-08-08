@@ -1,4 +1,4 @@
--- filename: 00160_gdpr_request_id.sql
+-- filename: 00164_gdpr_request_id.sql
 -- +goose Up
 -- Issue #755 / PR-5.2: add request_id column to gdpr_requests so the
 -- 24h export rate-limit can be made idempotent on X-Request-Id.

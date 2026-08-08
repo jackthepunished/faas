@@ -207,7 +207,7 @@ const (
 	// endpoint, not a billing gate. Maps to HTTP 429 + Retry-After:
 	// the window is 24h so the retry hint is in seconds-until-reset.
 	CodeExportRateLimited = "export_rate_limited"
-	CodeUnauthorized     = "unauthorized"
+	CodeUnauthorized      = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from

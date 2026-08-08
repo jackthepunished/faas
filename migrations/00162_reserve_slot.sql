@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 --
--- 00161_reserve_slot.sql — slot reservation placeholder
+-- 00162_reserve_slot.sql — slot reservation placeholder
 -- (ADR-041 / PR #391 migration gate carve-out).
 --
 -- This file is a deliberate no-op kept only to satisfy the
@@ -13,11 +13,13 @@
 -- migration versions" computation).
 --
 -- Issue #755 / PR-5 (GDPR endpoint hardening) skipped slots 159,
--- 160, 161, and 162 to land at 163 / 164 (after main's
--- 00162_deployments_live_traffic_idx, which is on main). This 161
--- fence holds the slot open for any sibling PR that wants 161
--- once PR-5 merges; whichever PR lands first deletes its
--- corresponding fence on the next rebase per ADR-041.
+-- 160, 161, and 162 to land at 163 / 164. Slot 162 is held by
+-- main's 00162_deployments_live_traffic_idx (issue #556 / PR-B).
+-- This 162 fence exists only so PR-5's local embed passes
+-- TestMigrationsContiguous before rebase; the real migration is
+-- already on main. Drop on rebase: whichever sibling PR claims
+-- 162 will collide with this fence and resolve on the next rebase
+-- per ADR-041.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change.
