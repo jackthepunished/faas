@@ -12,8 +12,14 @@ import (
 )
 
 func TestProviders_RegistersAllProviders(t *testing.T) {
+	// PR-P2: alphabetical sort (paddle, stripe). The PR-P1 slice
+	// literal was [stripe, paddle]; after PR-P2 the registry order
+	// is determined by Register() call order at init() time, which
+	// is implementation-defined. The loader sorts by Name to keep
+	// output deterministic, so this test asserts the alphabetical
+	// ordering. PR-P5 (new provider example) will extend this slice.
 	got := Providers()
-	want := []string{"stripe", "paddle"}
+	want := []string{"paddle", "stripe"}
 	if len(got) != len(want) {
 		t.Fatalf("Providers() returned %d entries, want %d (%v)", len(got), len(want), got)
 	}

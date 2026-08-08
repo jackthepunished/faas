@@ -700,6 +700,19 @@ type CreateDeploymentRequest struct {
 	// silently dropped; the customer who set it expects it to
 	// apply).
 	Sidecars Sidecars `json:"sidecars,omitempty"`
+	// TrafficPercent (issue #556 / traffic splitting across
+	// deployments, PR-A) is the per-deployment traffic share in
+	// the [0, 100] range. Pointer so that omitted == "server
+	// default 100" (today's behaviour preserved exactly: 100%
+	// of traffic goes to the most-recent live row). Explicit
+	// values <100 enable canary: PATCH /v1/deployments/{id}/traffic
+	// rebalances Σ(traffic_percent WHERE status='live') = 100
+	// across siblings atomically. nil on the wire → handler
+	// defaults to 100; explicit 0 → "this row receives no
+	// traffic" (the rollback path); explicit 10/25/50 →
+	// canary share. Plan-gated at Pro+ via
+	// acct.Plan.TrafficSplitAllowed().
+	TrafficPercent *int `json:"traffic_percent,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -1162,6 +1175,19 @@ type DeploymentResponse struct {
 	// layer via the deployments_parked_reason_check constraint.
 	ParkedReason string     `json:"parked_reason,omitempty"`
 	ParkedAt     *time.Time `json:"parked_at,omitempty"`
+	// TrafficPercent (issue #556 / traffic splitting across
+	// deployments, PR-A) is the per-deployment traffic share
+	// surfaced on GET /v1/deployments/{id} and GET
+	// /v1/apps/{slug} (the per-deployment live row only — the
+	// App-level aggregate traffic split is PR-B/C scope). Always
+	// present in [0, 100]; the migration stamps 100 on every
+	// pre-feature row, the handler defaults to 100 on create, and
+	// the supersede step inside CreateDeployment's transaction
+	// stamps 0 on the prior row so Σ=100 trivially for the
+	// one-live-deployment case. See migration 00160 and
+	// pkg/state.UpdateDeploymentTraffic for the rebalance
+	// semantics.
+	TrafficPercent int `json:"traffic_percent"`
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
@@ -1171,6 +1197,18 @@ type DeploymentResponse struct {
 // to change them).
 type UpdateDeploymentRequest struct {
 	MinInstances *int `json:"min_instances"`
+}
+
+// UpdateDeploymentTrafficRequest is the body for
+// PATCH /v1/deployments/{id}/traffic (issue #556 PR-A). The PATCH
+// route is dedicated to traffic splitting rather than reusing
+// UpdateDeploymentRequest because the request shape differs:
+// TrafficPercent MUST be present (a no-field PATCH is meaningless
+// here), and the pre-existing PATCH at /v1/deployments/{id} has
+// its own "min_instances required" presence rule. Splitting the
+// DTOs keeps each handler's contract crisp.
+type UpdateDeploymentTrafficRequest struct {
+	TrafficPercent int `json:"traffic_percent"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's

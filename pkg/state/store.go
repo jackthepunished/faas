@@ -13,6 +13,29 @@ import (
 // ErrNotFound is returned by Store reads when a row does not exist.
 var ErrNotFound = errors.New("state: not found")
 
+// ErrInvalidTrafficPercent is returned by UpdateDeploymentTraffic
+// (and the create-deployment range-check backstop) when the
+// requested traffic_percent falls outside [0, 100]. The CHECK
+// constraint on deployments.traffic_percent (migration 00160) is
+// the schema-layer guard; this sentinel surfaces the same range
+// violation when the store is the one running the backstop
+// (UpdateDeploymentTraffic holds the FOR UPDATE lock — the handler
+// already validated the request before this method ran, but the
+// store validates again as defence in depth). Translated at the
+// handler boundary to api.ErrInvalidTrafficPercent (422) so the
+// HTTP response uses the canonical RFC 7807 code.
+var ErrInvalidTrafficPercent = errors.New("state: invalid traffic_percent")
+
+// ErrTrafficPercentSumInvalid is the defensive backstop returned by
+// UpdateDeploymentTraffic when the post-write Σ invariant check
+// trips. Structurally unreachable with PR-A's "zero siblings"
+// rebalance form (Σ = newPercent + 0 = 100 by construction), but
+// pinned in the test suite as a tripwire against future refactors
+// (PR-C's proportional redistribution, for example, must still
+// satisfy Σ = 100). Translated at the handler boundary to
+// api.ErrTrafficPercentSumInvalid (409 Conflict).
+var ErrTrafficPercentSumInvalid = errors.New("state: traffic_percent sum != 100")
+
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
@@ -1328,6 +1351,14 @@ type Store interface {
 	// successful deploy (an app always has a live snapshot OR a cold-bootable
 	// rootfs — never neither, invariant §6.2-3).
 	LiveDeployment(ctx context.Context, appID string) (Deployment, error)
+	// LiveDeployments (issue #556 / PR-B) returns every live row
+	// for the app, ordered created_at DESC. Empty slice (nil, nil)
+	// when the app has no live deployments — the gateway's
+	// per-deployment weighted picker treats that as "no live
+	// deployment, 503". Backed by the partial index
+	// deployments_live_traffic_idx (migration 00162); MemStore
+	// iterates m.deployments filtered by status='live'.
+	LiveDeployments(ctx context.Context, appID string) ([]Deployment, error)
 	// CountLiveInstancesByDeployment returns the number of instances
 	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
 	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher
@@ -1347,6 +1378,20 @@ type Store interface {
 	// zero rows and MemStore returned all rows. NaN `offset` (= negative
 	// value) is treated as 0 by both backends.
 	ListDeploymentsForApp(ctx context.Context, appID string, limit, offset int) ([]Deployment, error)
+	// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+	// weight (issue #556 PR-A). newPercent must be in [0, 100]; the
+	// store layer validates this in addition to the schema CHECK
+	// constraint (migration 00160). PR-A semantics: zero every
+	// sibling live row (Σ = 100 by construction); PR-C may upgrade
+	// to proportional redistribution. Returns the refreshed row or
+	// ErrInvalidTrafficPercent / ErrTrafficPercentSumInvalid on
+	// invariant violations, ErrNotFound when the deployment id is
+	// unknown. The handler is responsible for the plan-gate (Pro+
+	// only, ErrPlanTrafficSplitNotAllowed) and the request-time
+	// range-check — this method holds the FOR UPDATE lock that
+	// makes the rebalance race-free against CreateDeployment.
+	UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error)
+
 	// SetDeploymentFailed is the failure-specific helper ADR-021 introduced
 	// alongside the deployments.error_code column. Status is pinned to
 	// 'failed'; code is the RFC 7807 code pkg/api.SentinelToCode lifted

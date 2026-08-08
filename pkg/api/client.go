@@ -47,10 +47,24 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// cookieOnlyPathRE matches API routes that are gated server-side to
+// the dashboard session cookie. The bearer-key CLI cannot reach
+// them — a request would 401 (or 302 to the login page) because the
+// session-cookie middleware (cmd/apid/server.go:1097 and
+// cmd/apid/handlers_sessions.go:71-77) treats bearer-key callers
+// as anonymous. The guard in c.do (below) short-circuits the
+// request with CodeUnsupportedByCLI so the failure mode is honest
+// ("the CLI cannot reach this route") rather than a confusing
+// 401/302. The companion tripwire
+// (pkg/api/lint_tripwires_test.go) ensures no other pkg/api file
+// composes a path that matches this regex.
+var cookieOnlyPathRE = regexp.MustCompile(`^/v1/auth/(sessions|capabilities)(/.*)?$`)
 
 // Client is a typed wrapper over the v1 REST API. Construct with
 // NewClient (30s default timeout) or NewClientWithDeployTimeout
@@ -71,6 +85,14 @@ type Client struct {
 
 	http       *http.Client // 30s default — used for every JSON call
 	deployHTTP *http.Client // optional, used by DeployMultipart
+
+	// cache powers `gregale completion <shell>` for the per-account
+	// positional completion paths (e.g. <slug> in `gregale app <slug>`).
+	// Nil → the c.do middleware short-circuits the refresh (preserves
+	// the test-suite posture where no on-disk cache should leak between
+	// subtests). NewClient wires a fresh cache so completion just works;
+	// tests that want hermetic isolation call SetCompletionCache(nil).
+	cache *CompletionCache
 }
 
 // NewClient builds a client for baseURL with the given bearer token.
@@ -81,7 +103,28 @@ func NewClient(baseURL, token string) *Client {
 		baseURL: baseURL,
 		token:   token,
 		http:    &http.Client{Timeout: 30 * time.Second},
+		cache:   NewCompletionCache(),
 	}
+}
+
+// SetCompletionCache wires a (possibly nil) cache. Passing nil
+// disables the auto-refresh — useful for tests that don't want
+// disk writes leaking between cases. Returns the receiver so the
+// call site can chain or discard.
+func (c *Client) SetCompletionCache(cache *CompletionCache) *Client {
+	c.cache = cache
+	return c
+}
+
+// CompletionCache returns the current cache. May be nil if the
+// client was built before NewCompletionCache existed (binary
+// compat — older callers that constructed Client{} directly) or
+// after an explicit SetCompletionCache(nil). Completion scripts
+// that want to read the cache for TAB-time lookups should call
+// this rather than constructing their own cache, so the file
+// path stays consistent with whatever the middleware wrote.
+func (c *Client) CompletionCache() *CompletionCache {
+	return c.cache
 }
 
 // NewClientWithDeployTimeout is like NewClient but configures a
@@ -124,6 +167,23 @@ func (c *Client) uploadHTTP() *http.Client {
 // when body != nil, decodes non-2xx as Problem, and unmarshals a
 // successful response into out when out != nil.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	// Cookie-only-route guard — reject paths the bearer-key CLI cannot
+	// reach before allocating anything. The regex matches the closed
+	// set /v1/auth/sessions and /v1/auth/capabilities (with optional
+	// trailing subpath). The status is 403 because the call is
+	// well-formed but the caller's auth mode does not match the
+	// route's policy — semantically a peer of CodeDeploySignatureInvalid
+	// (403 for "this caller cannot complete this action"). Docs URL
+	// points at the (forthcoming) /cli/cookie-only-routes page; the
+	// tripwire enforces the same URL in pkg/api/lint_tripwires_test.go.
+	if cookieOnlyPathRE.MatchString(path) {
+		return NewProblem(
+			http.StatusForbidden,
+			CodeUnsupportedByCLI,
+			"endpoint requires the dashboard session cookie",
+			"the gregale CLI cannot reach this route — use the dashboard at "+docsBase+"/dashboard/sessions",
+		).WithDocs(docsBase + "/cli/cookie-only-routes")
+	}
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -173,6 +233,14 @@ func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
 			return &APIError{Problem: p}
 		}
 		return fmt.Errorf("API error: %s", resp.Status)
+	}
+	// Tier A8 / ADR-083: auto-refresh the completion cache on every
+	// 2xx. Runs before the unmarshal so the raw body is still in hand;
+	// errors are swallowed inside MaybeRefresh so a broken cache
+	// (disk full, permission denied, corrupt JSON) never fails a
+	// request. Nil-safe for tests that opt out via SetCompletionCache(nil).
+	if c.cache != nil {
+		c.cache.MaybeRefresh(req.URL.Path, data)
 	}
 	if out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -676,6 +744,25 @@ func (c *Client) GetStatusSLO(ctx context.Context) (StatusPage, error) {
 func (c *Client) Rollback(ctx context.Context, slug string) (DeploymentResponse, error) {
 	var out DeploymentResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
+}
+
+// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+// weight (issue #556 PR-A). percent must be in [0, 100]; the
+// handler enforces the range (422) and the plan gate (403,
+// Pro/Scale only). PR-A semantics: zeroing sibling live rows so
+// Σ over the app's live rows stays 100 by construction. The
+// returned DTO carries the refreshed TrafficPercent field.
+//
+// Method name matches the OpenAPI operationId-derived SDK alias
+// `PatchDeploymentsIdTraffic` (cmd/sdk-coverage derives names via
+// `<Method><PathSegments>` — PATCH /v1/deployments/{id}/traffic
+// becomes `PatchDeploymentsIdTraffic`). The PascalCase name
+// matches the route's verb path, which is how the generated SDK
+// names align.
+func (c *Client) PatchDeploymentsIdTraffic(ctx context.Context, id string, percent int) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "PATCH", "/v1/deployments/"+id+"/traffic",
+		UpdateDeploymentTrafficRequest{TrafficPercent: percent}, &out)
 }
 
 // Park and Wake toggle the app between cold-parked and live.

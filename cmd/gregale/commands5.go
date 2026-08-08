@@ -604,7 +604,7 @@ func cmdAppDispatch(args []string) int {
 			}
 			return cmdAppRename(slug, args[2])
 		case subSecurity:
-			return cmdAppSecurity(args[2:])
+			return cmdAppSecurity(slug, args[2:])
 		}
 	}
 	// Backwards-compat: legacy flag-form dispatch is the existing cmdApp.

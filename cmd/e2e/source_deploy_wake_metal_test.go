@@ -546,6 +546,120 @@ func TestSourceDeployWakeMetal(t *testing.T) {
 		}
 		t.Logf("idempotent-replay: same dep=%s; deployments=%d before, %d after", depID, beforeCount, afterCount)
 	})
+
+	// -- 9. auto-pick-function-from-handler-js -------------------------
+	// Issue #737 / ADR-083 acceptance: a function-shaped tarball
+	// (`handler.js` only at the root) reaches apid with the new
+	// wire shape (`runtime=node22` + `handler=handler.handler`
+	// multipart form fields + `Type=function` on CreateApp) and
+	// apid's function-deploy path returns 202 with a fresh
+	// deployment ID. Pins the CLI's new `gregale deploy` zero-config
+	// function path end-to-end at the wire boundary.
+	//
+	// We deliberately stop at the 202 — a full live + wake + invoke
+	// cycle would double the wall-clock of this test (~6 min target
+	// per the file header) and isn't needed here: the function wire
+	// contract is what this PR adds, and the function-deploy path
+	// beyond the wire is pinned by cmd/apid/deploy_inputs_test.go
+	// (TestDeployFunction_Multipart, lines 516-593) and
+	// cmd/apid/handlers_test.go (TestCreateApp_FunctionRuntime*).
+	t.Run("auto-pick-function-from-handler-js", func(t *testing.T) {
+		// Fresh function-shaped app (Type=function on CreateApp
+		// matches what the CLI's auto-detect path sets when the
+		// cwd is `handler.js`-only).
+		if got := postOK(t, h, key, "/v1/apps", api.CreateAppRequest{
+			Slug:         "srcfunc",
+			Type:         "function",
+			Runtime:      "node22",
+			RequireAuthn: &falsy,
+		}); got != http.StatusCreated {
+			t.Fatalf("create function app: status=%d", got)
+		}
+		funcAppID := mustGetAppID(t, h, key, "srcfunc")
+		// apps.runtime is already set by the CreateApp call above
+		// (cmd/apid/handlers.go:202 stamps req.Runtime onto the row).
+		// No direct SQL update needed — the multipart validator at
+		// cmd/apid/deploy_inputs.go:144 reads apps.runtime to
+		// accept the function deploy.
+
+		// Tarball content: a single handler.js. Pack with the
+		// same NodeFixture helper but rename the inner file to
+		// handler.js so the function-layer manifest can find it.
+		// The CLI's auto-detect path emits exactly this wire
+		// shape (`runtime=node22` + `handler=handler.handler`)
+		// when a customer with a `handler.js`-only cwd runs
+		// `gregale deploy`.
+		funcTar := FunctionNodeFixture(t)
+
+		// Hand-built multipart — mirrors postMultipartDeployment
+		// but with the new function form fields. Duplicated
+		// because postMultipartDeployment doesn't accept
+		// runtime/handler (those are CLI-side fields, not
+		// ad-hoc test surface) and adding optional form fields
+		// to that helper would muddy its existing callers.
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		srcPart, err := mw.CreateFormFile("source", "src.tar.gz")
+		if err != nil {
+			t.Fatalf("multipart CreateFormFile: %v", err)
+		}
+		if _, err := srcPart.Write(funcTar); err != nil {
+			t.Fatalf("multipart Write source: %v", err)
+		}
+		// Issue #737 / ADR-083 wire shape. The CLI's auto-detect
+		// path emits these exact field names; the apid function
+		// validator at deploy_inputs.go:144-160 requires both to
+		// be set on a function-typed app.
+		if err := mw.WriteField("runtime", "node22"); err != nil {
+			t.Fatalf("multipart WriteField runtime: %v", err)
+		}
+		if err := mw.WriteField("handler", "handler.handler"); err != nil {
+			t.Fatalf("multipart WriteField handler: %v", err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatalf("multipart Close: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost,
+			fmt.Sprintf("%s/v1/apps/srcfunc/deployments", h.APIDURL), &body)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		resp, err := h.HTTPClient().Do(req)
+		if err != nil {
+			t.Fatalf("function deploy POST: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		raw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("function deploy status=%d body=%s", resp.StatusCode, raw)
+		}
+
+		// Decode the deployment ID and assert the row is
+		// function-typed (NOT app) — pins that the CLI's
+		// Type="function" propagated through CreateApp into the
+		// apps table.
+		var respEnv struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &respEnv); err != nil {
+			t.Fatalf("decode function deploy response: %v body=%s", err, raw)
+		}
+		if respEnv.ID == "" {
+			t.Fatalf("function deploy response missing id; body=%s", raw)
+		}
+		var appType string
+		if err := pool.QueryRow(context.Background(),
+			`select type::text from apps where id = $1`, funcAppID,
+		).Scan(&appType); err != nil {
+			t.Fatalf("query app type: %v", err)
+		}
+		if appType != "function" {
+			t.Errorf("app.type = %q, want %q (CLI's Type=function must reach the row)", appType, "function")
+		}
+		t.Logf("auto-pick-function-from-handler-js: dep=%s app_type=%s", respEnv.ID, appType)
+	})
 }
 
 // fixedIdempotencyKey returns a stable UUID-shaped string used as the

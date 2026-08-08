@@ -274,6 +274,29 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, p)
 		return
 	}
+	// Issue #556 PR-A: traffic_percent is opt-in via the request
+	// (pointer-typed so "omitted" ≠ "explicit zero"). Three layers:
+	//   1. Plan gate (Pro + Scale only) — must run BEFORE the range
+	//      check so a Free/Hobby account supplying the field sees
+	//      403 plan_traffic_split_not_allowed rather than 422
+	//      invalid_traffic_percent. The value is legal; the plan
+	//      is locked.
+	//   2. Range check [0, 100] when present — 422 with the
+	//      WithLimit(100, observed) shape so the CLI renders the
+	//      cap.
+	//   3. Default to 100 when omitted — mirrors the schema's
+	//      NOT NULL DEFAULT 100 and preserves today's behaviour
+	//      exactly (most-recent live row receives all traffic).
+	if req.TrafficPercent != nil {
+		if !acct.Plan.TrafficSplitAllowed() {
+			api.WriteProblem(w, api.ErrPlanTrafficSplitNotAllowed(acct.Plan))
+			return
+		}
+		if v := *req.TrafficPercent; v < 0 || v > 100 {
+			api.WriteProblem(w, api.ErrInvalidTrafficPercent(v))
+			return
+		}
+	}
 	// PR-B: prior-deployment supersede is in store.CreateDeployment's tx;
 	// we read prev BEFORE the call so the supersede-notify can carry
 	// its id (LatestDeployment returns the post-supersede row).

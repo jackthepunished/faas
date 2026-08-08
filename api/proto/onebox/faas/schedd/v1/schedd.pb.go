@@ -425,7 +425,14 @@ type AdmitInstanceResponse struct {
 	// The production gateway path consumes this — set on the admitted
 	// path; 0 on the at-capacity path (no instance was admitted).
 	// Additive per ADR-016.
-	Port          int32 `protobuf:"varint,7,opt,name=port,proto3" json:"port,omitempty"`
+	Port int32 `protobuf:"varint,7,opt,name=port,proto3" json:"port,omitempty"`
+	// deployment_id (issue #556 / PR-B) is the live deployment the
+	// new instance was admitted for. The gateway caches it on
+	// Target so the per-deployment weighted picker (PGBackend.Pick)
+	// routes subsequent requests to the right deployment bucket.
+	// Empty on the at-capacity path (no instance was admitted).
+	// Additive per ADR-016.
+	DeploymentId  string `protobuf:"bytes,8,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -507,6 +514,13 @@ func (x *AdmitInstanceResponse) GetPort() int32 {
 		return x.Port
 	}
 	return 0
+}
+
+func (x *AdmitInstanceResponse) GetDeploymentId() string {
+	if x != nil {
+		return x.DeploymentId
+	}
+	return ""
 }
 
 // Touch is one instance's most-recent request time.
@@ -1586,7 +1600,7 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\awake_id\x18\x05 \x01(\tR\x06wakeId\x12\x12\n" +
 	"\x04port\x18\x06 \x01(\x05R\x04port\"-\n" +
 	"\x14AdmitInstanceRequest\x12\x15\n" +
-	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\x8d\x02\n" +
+	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xb2\x02\n" +
 	"\x15AdmitInstanceResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
@@ -1596,7 +1610,8 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\vat_capacity\x18\x05 \x01(\bR\n" +
 	"atCapacity\x121\n" +
 	"\aproblem\x18\x06 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x12\n" +
-	"\x04port\x18\a \x01(\x05R\x04port\"A\n" +
+	"\x04port\x18\a \x01(\x05R\x04port\x12#\n" +
+	"\rdeployment_id\x18\b \x01(\tR\fdeploymentId\"A\n" +
 	"\x05Touch\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +

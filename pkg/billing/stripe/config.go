@@ -16,3 +16,19 @@ type Config struct {
 	// Defaults to 5 min (Stripe's recommended default).
 	ToleranceSeconds int `toml:"tolerance_seconds"`
 }
+
+// Defaults fills in working defaults for missing fields. Idempotent —
+// a second call leaves populated fields untouched. Matches the
+// cmd/meterd/config.go:85-87 nested-section shape so the loader's
+// LoadBillingConfig can call c.Stripe.Defaults() after the TOML
+// parse without special-casing stripe.
+//
+// 5-minute tolerance mirrors Stripe's recommended default; the
+// apid webhook handler passes this value through to
+// Client.VerifyWebhook (PR-P2 keeps the existing apid call site
+// unchanged — the default is plumbed here, not at the handler).
+func (c *Config) Defaults() {
+	if c.ToleranceSeconds == 0 {
+		c.ToleranceSeconds = 300 // 5 minutes
+	}
+}

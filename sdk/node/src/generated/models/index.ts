@@ -171,6 +171,7 @@ export type { UpdateAppRequest } from './UpdateAppRequest.js';
 export type { UpdateAppWebhookRequest } from './UpdateAppWebhookRequest.js';
 export type { UpdateCronRequest } from './UpdateCronRequest.js';
 export type { UpdateDeploymentRequest } from './UpdateDeploymentRequest.js';
+export type { UpdateDeploymentTrafficRequest } from './UpdateDeploymentTrafficRequest.js';
 export type { UsageExportResponse } from './UsageExportResponse.js';
 export type { UsageResponse } from './UsageResponse.js';
 export type { UsageSummaryResponse } from './UsageSummaryResponse.js';

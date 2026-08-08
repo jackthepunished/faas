@@ -181,7 +181,9 @@ func TestTierD_RegistryRm_HappyPath(t *testing.T) {
 
 func TestTierD_AppSecurity_NoArgsExitsOne(t *testing.T) {
 	resetJSONOut(t)
-	if code := cmdAppSecurity(nil); code != 1 {
+	// Empty slug → usage error path (mirrors cmdAppScale's empty-slug
+	// gate; cmdAppDispatch routes here with args[0] as the slug).
+	if code := cmdAppSecurity("", nil); code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
 }
@@ -190,7 +192,7 @@ func TestTierD_AppSecurity_HappyPath(t *testing.T) {
 	resetJSONOut(t)
 	body := `{"require_signed":true}`
 	f := authedFakeAPI(t, body, http.StatusOK)
-	if code := cmdAppSecurity([]string{"demo", "--require-signed=true"}); code != 0 {
+	if code := cmdAppSecurity("demo", []string{"--require-signed=true"}); code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 	if f.sawMethod != "PATCH" || f.sawPath != "/v1/apps/demo/security" {
@@ -214,7 +216,7 @@ func TestTierD_AppSecurity_FalseFlagWorks(t *testing.T) {
 	resetJSONOut(t)
 	body := `{"require_signed":false}`
 	f := authedFakeAPI(t, body, http.StatusOK)
-	if code := cmdAppSecurity([]string{"demo", "--require-signed=false"}); code != 0 {
+	if code := cmdAppSecurity("demo", []string{"--require-signed=false"}); code != 0 {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 	var got map[string]any
@@ -229,7 +231,7 @@ func TestTierD_AppSecurity_FalseFlagWorks(t *testing.T) {
 func TestTierD_AppSecurity_BadLiteralExitsOne(t *testing.T) {
 	resetJSONOut(t)
 	authedFakeAPI(t, "", http.StatusOK)
-	if code := cmdAppSecurity([]string{"demo", "--require-signed=yes"}); code != 1 {
+	if code := cmdAppSecurity("demo", []string{"--require-signed=yes"}); code != 1 {
 		t.Fatalf("exit = %d, want 1 (strict literal gate)", code)
 	}
 }

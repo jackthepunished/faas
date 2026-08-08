@@ -1488,17 +1488,28 @@ func captureStderr(t *testing.T) (*stderrReader, func()) {
 	path := tmp.Name()
 	old := os.Stderr
 	os.Stderr = tmp
+	// Also swap the package var osStderr (commands3.go) so error-path
+	// output routed through printErr's PrintWarn/renderAPIError flow
+	// lands in the tempfile too. Without this, the cwd-only-`os.Stderr`
+	// swap would catch fmt.Fprintf(os.Stderr, ...) but miss printErr,
+	// which became ADR-086 hint-aware.
+	oldPkg := osStderr
+	osStderr = tmp
 	rd := &stderrReader{path: path}
 	restore := func() {
 		_ = os.Stderr.Sync()
 		_ = os.Stderr.Close()
 		os.Stderr = old
+		osStderr = oldPkg
 		rd.reload()
 	}
 	t.Cleanup(func() {
 		_ = os.Remove(path)
 		if os.Stderr == tmp {
 			os.Stderr = old
+		}
+		if osStderr == tmp {
+			osStderr = oldPkg
 		}
 	})
 	return rd, restore

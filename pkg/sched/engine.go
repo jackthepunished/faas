@@ -748,6 +748,18 @@ type WakeResult struct {
 	// lookup so the gateway sees the same value AdmitInstance would
 	// have produced; on the admit path it comes from bootInput.spec.
 	Port int
+	// DeploymentID (issue #556 / PR-B) is the live deployment id
+	// the new instance was admitted for. The gateway caches it on
+	// Target so the per-deployment weighted picker (PGBackend.Pick)
+	// routes subsequent requests to the right deployment bucket.
+	// Set on every admitted path (Phase-1 fast path reads the
+	// deployment from LiveDeployment; admit path from the dep the
+	// ledger admit produced). Empty on AtCapacity=true and on
+	// errors. Additive per ADR-016 — pre-PR-B callers see empty and
+	// the gateway treats that as "single-deployment legacy mode"
+	// (Target.DeploymentID empty, picker collapses to today's
+	// behaviour).
+	DeploymentID string
 }
 
 // Wake ensures a running instance for appID and returns its address (spec §4.3
@@ -822,10 +834,18 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 		// column on state.Instance + the RunningInstanceForApp query,
 		// which is overkill for synth traffic.
 		var port int
+		// deploymentID (issue #556 / PR-B) is the live deployment id
+		// the gateway caches on Target so the per-deployment weighted
+		// picker routes subsequent requests to the right bucket. Read
+		// alongside OverridePort — same LiveDeployment lookup, no extra
+		// round-trip. Empty on a LiveDeployment read failure (the
+		// gateway treats empty as "single-deployment legacy mode").
+		var deploymentID string
 		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
 			port = dep.OverridePort
+			deploymentID = dep.ID
 		} else {
-			e.log.Warn("sched: wake: live deployment lookup for port failed; falling through with 0",
+			e.log.Warn("sched: wake: live deployment lookup for port/deployment_id failed; falling through with 0/\"\"",
 				"app", appID, "err", depErr)
 		}
 		release()
@@ -835,7 +855,7 @@ func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
 		// brought the instance up; an operator tailing a warm request
 		// can still pin it back to the schedd slog line that stamped
 		// it (gaps analysis 2026-07-23 review finding #1).
-		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port}, nil
+		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port, DeploymentID: deploymentID}, nil
 	} else if !errors.Is(err, state.ErrNotFound) {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: running lookup: %w", err)
@@ -1723,7 +1743,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		})
 	}
 
-	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port}, nil
+	return WakeResult{InstanceID: bootInput.insID, NodeID: fresh.NodeID, Method: out.Method, WakeID: bootInput.wakeID, Port: bootInput.spec.Port, DeploymentID: bootInput.depID}, nil
 }
 
 // bootInput is the immutable bundle of values needed across the

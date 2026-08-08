@@ -110,6 +110,27 @@ type Ring struct {
 	// path without spinning up a Prometheus registry.
 	onSlowSubscriber func()
 
+	// onEvict (issue #562 / log archive to object storage) is
+	// invoked once per line evicted from the ring's byte
+	// budget. The eviction loop in commitLocked calls it
+	// while holding r.mu; the callback MUST NOT block or
+	// allocate beyond the syscall-equivalent cost of a
+	// bufio-flushed write — a slow callback stalls every
+	// subsequent Write on this instance. Nil = no callback
+	// wired (the default in tests); production wires it via
+	// SetEvictCallback to a closure that hands the line to a
+	// per-instance logarchive.Spool writer. The eviction
+	// path is the load-bearing seam that closes the
+	// "evicted = silently lost" hole the per-instance ring
+	// contract had since Move 4 (issue #254) — without this
+	// hook, every line that crosses the 10 MiB byte cap is
+	// lost before the 5-min shipper can read it.
+	//
+	// Same callback indirection rationale as onSlowSubscriber:
+	// pkg/logarchive imports pkg/wire, not the other way
+	// around; the callback keeps logbuf a leaf.
+	onEvict func(Line)
+
 	closed bool
 }
 
@@ -145,6 +166,36 @@ func New(maxBytes int) *Ring {
 func (r *Ring) SetSlowSubscriberCallback(cb func()) {
 	r.mu.Lock()
 	r.onSlowSubscriber = cb
+	r.mu.Unlock()
+}
+
+// SetEvictCallback installs (or removes, when nil) the per-line
+// callback the commitLocked eviction loop invokes on every line
+// that crosses the byte budget (issue #562 / log archive to
+// object storage). Wire from a per-ring constructor closure
+// that adapts the ring to the pkg/logarchive.Spool writer, e.g.:
+//
+//	ring := logbuf.New(0)
+//	ring.SetEvictCallback(func(l Line) {
+//	    spool.Write(instanceID, l)
+//	})
+//
+// The callback is read under r.mu; the caller does NOT need to
+// hold a lock when installing. Calling this after the ring has
+// begun receiving writes is safe; the new callback takes effect
+// on the next eviction. Nil-safe: commitLocked's evict branch
+// skips the call when onEvict is nil, so tests that don't wire
+// a spool see the original behaviour (silent eviction).
+//
+// The eviction callback runs WHILE the ring lock is held; the
+// spool's writer is responsible for not blocking on disk I/O.
+// pkg/logarchive.Spool uses a bufio.Writer with a 64 KiB buffer
+// so the syscall count amortises across many evictions — a
+// single direct Write per eviction would burn a syscall per
+// line on a chatty app and stall the producer.
+func (r *Ring) SetEvictCallback(cb func(Line)) {
+	r.mu.Lock()
+	r.onEvict = cb
 	r.mu.Unlock()
 }
 
@@ -248,10 +299,27 @@ func (r *Ring) commitLocked(stream, line string, now time.Time) {
 	// evict BEFORE assigning to the slot because the slot overwrites the
 	// head slot on full ring; the per-line overhead in the slice is
 	// constant so we don't need to charge it here.
+	//
+	// Issue #562 / log archive to object storage: each evicted line is
+	// forwarded to the optional onEvict callback before being dropped
+	// from the slot. The callback is the load-bearing seam that
+	// converts "evicted = silently lost" into "evicted = persisted
+	// locally + shipped async". The callback runs under r.mu, so it
+	// must not block — pkg/logarchive.Spool amortises syscalls via a
+	// 64 KiB bufio buffer. We capture the callback reference at the
+	// top of the loop so a concurrent SetEvictCallback can't tear the
+	// callback mid-eviction (the SetEvictCallback setter acquires r.mu
+	// to swap the field; reading the field here under the same lock
+	// gives us a stable handoff).
+	evictCb := r.onEvict
 	for r.totalBytes+len(line) > r.maxBytes && r.size > 0 {
-		r.totalBytes -= len(r.lines[r.head].Line)
+		evicted := r.lines[r.head]
+		r.totalBytes -= len(evicted.Line)
 		r.head = (r.head + 1) % cap(r.lines)
 		r.size--
+		if evictCb != nil {
+			evictCb(evicted)
+		}
 	}
 	// Grow the underlying slice on demand. We choose capacity over exact
 	// fit so a chatty app doesn't reallocate every line; maxBytes caps the

@@ -386,6 +386,27 @@ export class AppsService {
    * currently mounted behind `s.authLimited` and is documented here for
    * reference; the dashboard and CLI also consume it directly.
    *
+   * Two modes share this URL:
+   *
+   * - **Live (default)** — `?follow=1` holds the connection open and
+   * streams new entries from the per-instance ring buffer. The
+   * stream terminates with `event: end` when the backstop fires
+   * (10 minutes idle), the schedd returns NotFound (parked app), or
+   * the connection closes.
+   *
+   * - **Archive (`?archive=1`)** — fetches a single day's
+   * per-instance log batch from the S3 bucket the apid shipper
+   * writes into. `?instance=<id>` selects the Firecracker instance
+   * id; `?date=YYYY-MM-DD` selects the day. The response is the
+   * same SSE shape as the live stream (`event: log` per line,
+   * `event: end` terminal with `archive_complete` /
+   * `archive_missing` / `archive_degraded` reasons) so the SDK
+   * decoder treats the two paths interchangeably. Archive is
+   * gated by `Plan.LogArchiveEnabled()` — Free customers receive
+   * 402 + `plan_log_archive_not_allowed`. The per-plan retention
+   * cap (Hobby 7d / Pro 30d / Scale 90d) refuses `?date=` values
+   * outside the window with 403 + `log_archive_retention_exceeded`.
+   *
    * @returns any A text/event-stream of structured log lines, terminated by an empty SSE frame when the connection closes.
    * @throws ApiError
    */
@@ -395,6 +416,9 @@ export class AppsService {
     grep,
     since,
     level,
+    archive = 0,
+    instance,
+    date,
   }: {
     /**
      * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
@@ -417,6 +441,21 @@ export class AppsService {
      *
      */
     level?: 'info' | 'warn' | 'error',
+    /**
+     * If 1, serve archived logs from S3 instead of the live ring buffer. Requires `instance=<id>` and `date=YYYY-MM-DD`. Gated by `Plan.LogArchiveEnabled()` — Free plans receive 402 + `plan_log_archive_not_allowed`. The per-plan retention cap (Hobby 7d / Pro 30d / Scale 90d) refuses `date=` values outside the window.
+     *
+     */
+    archive?: 0 | 1,
+    /**
+     * Required when `archive=1`. The Firecracker instance id to read archived logs from (matches the `instance_id` field in the live SSE frames).
+     *
+     */
+    instance?: string,
+    /**
+     * Required when `archive=1`. The day to read in YYYY-MM-DD UTC. Must be inside the per-plan retention cap (Hobby 7d / Pro 30d / Scale 90d) — outside values return 403 + `log_archive_retention_exceeded`. Future dates are refused with the same code.
+     *
+     */
+    date?: string,
   }): CancelablePromise<any> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -429,9 +468,14 @@ export class AppsService {
         'grep': grep,
         'since': since,
         'level': level,
+        'archive': archive,
+        'instance': instance,
+        'date': date,
       },
       errors: {
         401: `code: unauthorized`,
+        402: `Plan does not include log archive read-back. Free plans receive this on \`?archive=1\`.`,
+        403: `Log archive retention cap exceeded; \`?date=\` is outside the per-plan window.`,
         404: `code: not_found`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).

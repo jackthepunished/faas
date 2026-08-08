@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/daemonunitspec"
+	"github.com/onebox-faas/faas/pkg/deploycontroller"
 	"github.com/onebox-faas/faas/pkg/releasebundle"
 )
 
@@ -27,12 +32,17 @@ func (r hostRuntime) Preflight(_ context.Context, manifest releasebundle.Manifes
 	if manifest.Target != "linux/amd64" {
 		return fmt.Errorf("unsupported release target %q", manifest.Target)
 	}
+	if err := ensureBaseStagingRoots(); err != nil {
+		return err
+	}
 	for _, path := range []string{
 		filepath.Join(releaseRoot, "bin", "migrate"),
 		filepath.Join(releaseRoot, "systemd"),
 		"/etc/systemd/system",
 		"/run/faas",
 		"/srv/fc/base",
+		"/srv/fc/base-staging",
+		"/srv/fc/scans",
 		"/dev/shm",
 	} {
 		if _, err := os.Stat(path); err != nil {
@@ -52,7 +62,10 @@ func (r hostRuntime) Migrate(ctx context.Context, manifest releasebundle.Manifes
 }
 
 func (r hostRuntime) Activate(ctx context.Context, releaseRoot string) error {
-	if err := cleanupBaseScratch("/dev/shm/faas-base-staging"); err != nil {
+	if err := ensureBaseStagingRoots(); err != nil {
+		return err
+	}
+	if err := cleanupAllBaseScratch(); err != nil {
 		return fmt.Errorf("cleanup base scratch: %w", err)
 	}
 	units := filepath.Join(releaseRoot, "systemd")
@@ -95,6 +108,65 @@ func (r hostRuntime) Activate(ctx context.Context, releaseRoot string) error {
 	return nil
 }
 
+// baseStagingRoots are the two controller-owned staging trees the
+// daemon unit expects to exist before imaged starts:
+//   - /srv/fc/base-staging — disk-backed OCI layer extraction for full
+//     base builds (FAAS_BASE_EXTRACT_ROOT). The extracted tree can be
+//     gigabytes (a Go toolchain base is ~850 MB unpacked); it must NOT
+//     live on the 2 GiB /dev/shm tmpfs (imaged ENOSPC crash-loop,
+//     2026-08-05 → 2026-08-06).
+//   - /dev/shm/faas-base-staging — tmpfs staging for the parent-ref
+//     overlay upper/work dirs (FAAS_BASE_STAGING_ROOT). The kernel
+//     rejects overlay mounts whose upper fs doesn't support tmpfile,
+//     and host /tmp is ext4, so this one stays on tmpfs (ADR-053).
+var baseStagingRoots = []string{
+	"/srv/fc/base-staging",
+	"/dev/shm/faas-base-staging",
+}
+
+// ensureBaseStagingRoots creates both controller-owned staging roots
+// with the ownership the faas-imaged unit runs under, so a fresh host
+// (or one where the dirs were wiped by a reboot of /dev/shm) starts
+// clean. The dirs must be writable by the faas-imaged service user
+// (imaged creates faas-base-* temp dirs inside them) — so they are
+// chowned to faas-imaged:faas with 0755, not left root-owned. Runs as
+// root (deployctl on the host); a failure here is a hard error — the
+// unit cannot stage bases without these dirs.
+func ensureBaseStagingRoots() error {
+	svcUser, err := user.Lookup("faas-imaged")
+	if err != nil {
+		return fmt.Errorf("lookup faas-imaged: %w", err)
+	}
+	svcGroup, err := user.LookupGroup("faas")
+	if err != nil {
+		return fmt.Errorf("lookup faas group: %w", err)
+	}
+	uid, err := strconv.Atoi(svcUser.Uid)
+	if err != nil {
+		return fmt.Errorf("parse faas-imaged uid %q: %w", svcUser.Uid, err)
+	}
+	gid, err := strconv.Atoi(svcGroup.Gid)
+	if err != nil {
+		return fmt.Errorf("parse faas gid %q: %w", svcGroup.Gid, err)
+	}
+	for _, root := range baseStagingRoots {
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			return fmt.Errorf("ensure base staging root %s: %w", root, err)
+		}
+		if err := os.Chown(root, uid, gid); err != nil {
+			return fmt.Errorf("chown base staging root %s: %w", root, err)
+		}
+	}
+	return nil
+}
+
+// cleanupBaseScratch removes controller-owned stale staging entries
+// (faas-base-* extraction dirs and faas-base-mkfs-*.ext4 mkfs temps)
+// from the given root, leaving everything else untouched. Only entries
+// owned by the faas-imaged service user are removed — a foreign
+// directory with a matching name (e.g. an operator's artifact) is
+// preserved. The "what is controller-owned" predicate lives in
+// pkg/deploycontroller so the dry-run report and this cleanup agree.
 func cleanupBaseScratch(root string) error {
 	entries, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
@@ -103,15 +175,66 @@ func cleanupBaseScratch(root string) error {
 	if err != nil {
 		return err
 	}
+	owner, err := user.Lookup("faas-imaged")
+	if err != nil {
+		// No faas-imaged user on this host — we cannot verify an entry
+		// is controller-owned, so remove nothing. Conservative: on a
+		// real control-plane host the user exists (bootstrap creates
+		// it), and a missing user here means we're not on a host that
+		// needs scratch cleanup (e.g. a dev box or a unit test).
+		return fmt.Errorf("cleanupBaseScratch: %w", err)
+	}
+	ownerUID, err := strconv.Atoi(owner.Uid)
+	if err != nil {
+		return fmt.Errorf("parse faas-imaged uid %q: %w", owner.Uid, err)
+	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "faas-base-mkfs-") || !strings.HasSuffix(entry.Name(), ".ext4") {
+		if !deploycontroller.IsControllerStagingEntry(entry) {
 			continue
 		}
-		if err := os.Remove(filepath.Join(root, entry.Name())); err != nil {
+		name := entry.Name()
+		full := filepath.Join(root, name)
+		info, err := os.Stat(full)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		// Only remove entries owned by the imaged service user. The
+		// syscall.Stat_t fields differ across platforms, but the
+		// deployctl runtime only ever runs on the linux host.
+		sys, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || int(sys.Uid) != ownerUID {
+			continue
+		}
+		if entry.IsDir() {
+			if err := os.RemoveAll(full); err != nil {
+				return err
+			}
+		} else if err := os.Remove(full); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// cleanupAllBaseScratch cleans both controller-owned staging roots and
+// returns a combined error (best-effort: a failure on one root does not
+// skip the other). A missing faas-imaged user is not an error — it just
+// means there is nothing controller-owned to clean.
+func cleanupAllBaseScratch() error {
+	var errs []error
+	for _, root := range baseStagingRoots {
+		if err := cleanupBaseScratch(root); err != nil {
+			var unknownUser *user.UnknownUserError
+			if errors.As(err, &unknownUser) {
+				continue
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", root, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (r hostRuntime) Restart(ctx context.Context, _ releasebundle.Manifest) error {

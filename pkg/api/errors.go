@@ -246,7 +246,18 @@ const (
 	// AEAD-bound AccountID disagrees with the sessions row. AEAD
 	// forgery on the same key ought to be unreachable; if it ever
 	// fires the operator should investigate the key-sealing path.
-	CodeSessionInvalid    = "session_invalid"
+	CodeSessionInvalid = "session_invalid"
+	// CodeUnsupportedByCLI is returned by the SDK client when a caller
+	// targets an API route that requires the dashboard session cookie
+	// (e.g. /v1/auth/sessions, /v1/auth/capabilities). The bearer-key
+	// CLI cannot reach these routes — they are mounted behind
+	// sessionAuth (cmd/apid/server.go:1097) and reject 401 on a
+	// bearer header. The guard in pkg/api/client.go lifts this into
+	// a clean 403 before the request is even issued so the failure
+	// mode is honest, not a confusing auth error. See
+	// pkg/api/client.go's cookieOnlyPathRE and the tripwire in
+	// pkg/api/lint_tripwires_test.go.
+	CodeUnsupportedByCLI  = "unsupported_by_cli"
 	CodeDomainNotVerified = "domain_not_verified"
 	CodeCronInvalid       = "cron_invalid"
 	CodeAlertRuleInvalid  = "alert_rule_invalid"
@@ -390,6 +401,38 @@ const (
 	// actionable retry guidance ("raise your plan or lower
 	// --min-instances").
 	CodeMaxMinInstancesExceeded = "max_min_instances_exceeded"
+
+	// CodePlanTrafficSplitNotAllowed (issue #556 / traffic
+	// splitting across deployments) is a 403 for plan-tier
+	// rejections: a Free/Hobby customer tries to set a
+	// non-default traffic_percent on a deployment. Mirrors
+	// CodePlanMinInstancesNotAllowed so the CLI renders the same
+	// "your plan doesn't allow this — upgrade" shape. The
+	// migration (00160) column default is 100, so customers
+	// who never opt-in see no behavioural change; the gate
+	// only fires when a customer explicitly opts in to a
+	// non-100 traffic_percent on create or PATCH-traffic.
+	CodePlanTrafficSplitNotAllowed = "plan_traffic_split_not_allowed"
+	// CodeInvalidTrafficPercent (issue #556) is a 422 for shape
+	// violations: traffic_percent is outside [0, 100] (or
+	// negative). Distinct from CodeValidation so the CLI can
+	// render the cap+observed pair via WithLimit (mirrors the
+	// CodeInvalidMinInstances pattern at line 1692). The state
+	// layer (pkg/state.UpdateDeploymentTraffic) also lifts
+	// this code on out-of-range input as a defence-in-depth
+	// backstop.
+	CodeInvalidTrafficPercent = "invalid_traffic_percent"
+	// CodeTrafficPercentSumInvalid (issue #556) is a 409
+	// (Conflict) for the defensive backstop: post-write
+	// Σ(traffic_percent WHERE status='live') != 100. In
+	// practice this is unreachable — the schema CHECK
+	// (00160) gates the per-row range and the
+	// UpdateDeploymentTraffic transaction zeroes siblings
+	// before stamping the target. The state layer asserts
+	// the invariant explicitly and lifts to this code if
+	// violated, so a future refactor that breaks the Σ
+	// tripwire surfaces a 409 (not a silent DB drift).
+	CodeTrafficPercentSumInvalid = "traffic_percent_sum_invalid"
 
 	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
@@ -834,6 +877,15 @@ func StatusForCode(code string) int {
 		return http.StatusNotFound
 	case CodeConflict, CodeDomainNotVerified, CodeNoRollbackTarget:
 		return http.StatusConflict
+	case CodeTrafficPercentSumInvalid:
+		// 409 — issue #556. Σ(traffic_percent WHERE status='live')
+		// != 100 after UpdateDeploymentTraffic. Defensive backstop;
+		// unreachable in practice. Sits next to CodeConflict /
+		// CodeDomainNotVerified / CodeNoRollbackTarget because the
+		// semantics are "the requested state cannot be applied
+		// alongside the existing row set", not "your plan forbids
+		// this".
+		return http.StatusConflict
 	case CodeDeployFailed:
 		return http.StatusUnprocessableEntity
 	case CodeDeploySignatureInvalid:
@@ -841,7 +893,23 @@ func StatusForCode(code string) int {
 		// CodeSigInvalid's 503 (which fires on the cold-boot layer-verify
 		// path). See CodeDeploySignatureInvalid declaration above.
 		return http.StatusForbidden
+	case CodeUnsupportedByCLI:
+		// 403 — the cookie-only-route guard (pkg/api/client.go)
+		// rejected the path before issuing the request. 403 is
+		// the closest sibling to CodeDeploySignatureInvalid's
+		// "this caller cannot complete this action" semantic.
+		// Companion to CodeSessionExpired (401) which is the
+		// server-side mirror for a cookie that WAS sent but is
+		// gone.
+		return http.StatusForbidden
 	case CodeImageNotFound, CodeImageManifestInvalid:
+		return http.StatusUnprocessableEntity
+	case CodeInvalidTrafficPercent:
+		// 422 — issue #556. traffic_percent outside [0, 100].
+		// Sits next to CodeImageNotFound / CodeImageManifestInvalid
+		// (422 family). Mirrors CodeInvalidMinInstances's
+		// shape-second 422 contract; the plan-gate cousin
+		// (CodePlanTrafficSplitNotAllowed) is the 403 above.
 		return http.StatusUnprocessableEntity
 	case CodeImageEgressDenied:
 		return http.StatusForbidden
@@ -856,6 +924,10 @@ func StatusForCode(code string) int {
 	case CodePayment:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
+		return http.StatusForbidden
+	case CodePlanTrafficSplitNotAllowed:
+		// 403 — issue #556. Free/Hobby trying to set a
+		// non-default traffic_percent; mirrors CodePlanMinInstancesNotAllowed.
 		return http.StatusForbidden
 	case CodeSecretInvalidKey, CodeSecretNotFound:
 		return http.StatusBadRequest
@@ -925,6 +997,14 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodePlanAlertRuleQuota:
 		return http.StatusForbidden
+	case CodePlanLogArchiveNotAllowed:
+		// Issue #562 / PR-B: Free customers don't have log
+		// archive read-back. Same shape as the other plan-
+		// gated "X unavailable on this plan" codes: 402 +
+		// a deliberate upsell. The gatewayd-internal archive
+		// handler maps LogArchiveEnabled() == false to this
+		// code via ErrPlanLogArchiveNotAllowed.
+		return http.StatusPaymentRequired
 	// Issue #561 — spend cap pauses workload. 402 mirrors the existing
 	// `CodePlanFeatureGated` / `CodePlanCronsNotAllowed` /
 	// `CodePlanAlertRulesNotAllowed` family: a deliberate account-level
@@ -1282,6 +1362,31 @@ const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
 // reached. Distinct from CodePlanWebhooksNotAllowed so the CLI
 // can branch on upsell-vs-delete copy without parsing the body.
 const CodePlanWebhookQuota = "plan_webhook_quota"
+
+// CodePlanLogArchiveNotAllowed is the 402 the customer sees when
+// they request ?archive=1 against an app on a plan whose
+// LogArchiveEnabled() returns false (Free today, issue #562).
+// Fires BEFORE the gatewayd-internal handler touches S3 so a
+// Free customer gets a clean 402 instead of an S3 403 from a
+// bucket they don't have read access to. The wire is the same
+// as ErrPlanCronsNotAllowed: 402 + a stable `code` the SDK
+// branches on without parsing the body.
+const CodePlanLogArchiveNotAllowed = "plan_log_archive_not_allowed"
+
+// ErrPlanLogArchiveNotAllowed is returned by the gatewayd-internal
+// archive log read-back handler when the customer's plan has
+// LogArchiveEnabled() == false (Free today). Mirrors
+// ErrPlanCronsNotAllowed and ErrPlanAlertRulesNotAllowed so the
+// upsell surface is consistent across plan-gated features. The
+// Hobby+ copy is the deliberate upgrade hint; Free never sees
+// the bucket-proxy path so the customer gets the upsell message
+// rather than a silent 404.
+func ErrPlanLogArchiveNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanLogArchiveNotAllowed,
+		"Log archive unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include log archive read-back; upgrade to Hobby or above to query historical logs from object storage.", p)).
+		WithDocs(docsBase + "/plans#log-archive")
+}
 
 // CodeAppWebhookInvalid is the 400 the customer sees for any
 // malformed webhook body — missing target_url, invalid retry_policy,
@@ -1748,6 +1853,55 @@ func ErrMaxMinInstancesExceeded(got, planMax int) *Problem {
 		fmt.Sprintf("min_instances must be in [0, %d] for this plan; got %d.", planMax, got)).
 		WithLimit(int64(planMax), int64(got)).
 		WithDocs(docsBase + "/apps#min-instances")
+}
+
+// ErrPlanTrafficSplitNotAllowed (issue #556 / traffic splitting
+// across deployments) is returned when a Free/Hobby account tries
+// to set a non-default traffic_percent on a deployment (ux_spec
+// §6.5 plan-tier gate family, joined by issue #556). The customer's
+// bill on Free/Hobby is built around scale-to-zero; keeping two or
+// more live deployments warm simultaneously is the cost shape of
+// Pro / Scale (per-running-second RAM × N deployments). Hobby was
+// deliberately NOT promoted to the gate's "allowed" set (unlike
+// MinInstancesAllowed which Hobby unlocks per issue #462) — see
+// the Limits.TrafficSplit field comment in pkg/api/limits.go.
+func ErrPlanTrafficSplitNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanTrafficSplitNotAllowed,
+		"Plan doesn't allow traffic splitting",
+		fmt.Sprintf("the %s plan routes 100%% to the most recent deployment; upgrade to Pro or Scale to keep N canary deployments warm.", p)).
+		WithDocs("https://docs.gregale.dev/plans#traffic-split")
+}
+
+// ErrInvalidTrafficPercent (issue #556) is returned when the
+// requested traffic_percent is outside [0, 100] (the schema CHECK
+// in migration 00160 is the second-line defence; this surfaces
+// before that check, the API gate fires first). 422 mirrors the
+// ErrInvalidMinInstances shape at line 1688 (plan-gate-first vs
+// shape-second; this is shape, so 422 not 403).
+func ErrInvalidTrafficPercent(got int) *Problem {
+	const cap = 100
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidTrafficPercent,
+		"Invalid traffic_percent",
+		fmt.Sprintf("traffic_percent must be in [0, %d]; got %d.", cap, got)).
+		WithLimit(int64(cap), int64(got)).
+		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
+}
+
+// ErrTrafficPercentSumInvalid (issue #556) is the defensive
+// backstop for the Σ = 100 invariant. The state layer's
+// UpdateDeploymentTraffic transaction asserts the post-write sum
+// and lifts to this code if violated. In practice this is
+// unreachable: the schema CHECK gates the per-row range and the
+// transaction zeroes siblings before stamping the target. The
+// code exists so a future refactor that breaks the Σ tripwire
+// surfaces a 409 (not a silent DB drift). 409 Conflict because
+// the requested state is internally consistent (range-check
+// passed) but cannot be applied alongside the existing row set.
+func ErrTrafficPercentSumInvalid(observed int) *Problem {
+	return NewProblem(http.StatusConflict, CodeTrafficPercentSumInvalid,
+		"traffic_percent sum invariant violated",
+		fmt.Sprintf("sum of traffic_percent across live deployments must be 100; observed %d.", observed)).
+		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
 }
 
 // ErrSidecarCapExceeded is returned when the request carries more

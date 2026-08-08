@@ -202,8 +202,8 @@ func TestPGBackend_AdmitAtCapacityIsTypedResult(t *testing.T) {
 // typed at_capacity=true outcome (issue #168).
 type atCapScheduler struct{}
 
-func (atCapScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
-	return "", "", "", 0, true, 0, nil
+func (atCapScheduler) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
+	return "", "", "", "", 0, true, 0, nil
 }
 
 // TestPGBackend_AdmitForwardsWakeMethod (PR scale-out readiness) — the
@@ -272,8 +272,8 @@ type controllableScheduler struct {
 	rawMethod int32
 }
 
-func (c *controllableScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
-	return "i-test", "n-test", "w-test", c.rawMethod, false, 0, nil
+func (c *controllableScheduler) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
+	return "i-test", "n-test", "", "w-test", c.rawMethod, false, 0, nil
 }
 
 func TestPGBackend_FlushRoutesForcesReresolve(t *testing.T) {
@@ -364,9 +364,9 @@ type capturingScheduler struct {
 	admitted int
 }
 
-func (c *capturingScheduler) AdmitInstance(_ context.Context, _ string) (string, string, string, int32, bool, int, error) {
+func (c *capturingScheduler) AdmitInstance(_ context.Context, _ string) (string, string, string, string, int32, bool, int, error) {
 	c.admitted++
-	return "fake-instance-" + c.id, "127.0.0.1", "w-1", 8080, true, 0, nil
+	return "fake-instance-" + c.id, "127.0.0.1", "", "w-1", 8080, true, 0, nil
 }
 
 // TestPGBackend_ResolveSched_MultiBox_RejectsTransientMiss covers

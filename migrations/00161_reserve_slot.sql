@@ -1,0 +1,34 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00161_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Issue #556 / PR-B holds slot 162 for the partial index backing
+-- the gateway's LiveDeployments plural query (see
+-- migrations/00162_deployments_live_traffic_idx.sql). Slot 161
+-- is reserved as a one-slot gap so any in-flight sibling PR may
+-- claim 161 without colliding. PR-B's reservation is dropped at
+-- merge time once a sibling PR claims 161 OR the next real
+-- schema lands at 162+1.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

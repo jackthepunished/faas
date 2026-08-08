@@ -190,9 +190,12 @@ type AppResponse struct {
 }
 
 // CreateDeploymentRequest ships a version (JSON variant; the multipart
-// variant is used for tarball/dockerfile deploys).
+// variant is used for tarball/dockerfile deploys). TrafficPercent is
+// the canary weight (issue #556 PR-A); nil = server default 100,
+// explicit 0..100 = opt into split (Pro/Scale only).
 type CreateDeploymentRequest struct {
-	Image string `json:"image,omitempty"` // registry.gregale.dev/...@sha256:...
+	Image          string `json:"image,omitempty"` // registry.gregale.dev/...@sha256:...
+	TrafficPercent *int   `json:"traffic_percent,omitempty"`
 }
 
 // DeploymentResponse is a deployment as returned by the API.
@@ -211,8 +214,17 @@ type DeploymentResponse struct {
 	// api/state.SerializeDeployment knows the column is a string and
 	// that "" is the canonical empty value, so the dashboard /
 	// programmatic consumer can branch on ErrorCode != "".
-	ErrorCode string `json:"error_code,omitempty"`
-	CreatedAt string `json:"created_at"`
+	ErrorCode      string `json:"error_code,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	TrafficPercent int    `json:"traffic_percent,omitempty"`
+}
+
+// UpdateDeploymentTrafficRequest is the body for
+// PATCH /v1/deployments/{id}/traffic (issue #556 PR-A). Required
+// field — handler rejects an absent body at 400 before the plan
+// gate (403) and range check (422).
+type UpdateDeploymentTrafficRequest struct {
+	TrafficPercent int `json:"traffic_percent"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's

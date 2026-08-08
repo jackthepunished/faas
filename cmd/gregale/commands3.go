@@ -36,6 +36,10 @@ import (
 var (
 	osStdout io.Writer = os.Stdout
 	osStdin  io.Reader = os.Stdin
+	// osStderr is the same seam for stderr, used by the issue #744 /
+	// ADR-086 NestedMarkerHintError path so tests can capture the hint
+	// line without a subprocess. Production wiring points at os.Stderr.
+	osStderr io.Writer = os.Stderr
 )
 
 func cmdSecrets(args []string) int {

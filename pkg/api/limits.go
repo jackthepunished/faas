@@ -449,6 +449,24 @@ type Limits struct {
 	// app.account_id) receive 403 from the gatewayd-internal
 	// authz branch, not from this gate.
 	RequireAuthn bool
+
+	// TrafficSplit (issue #556 / traffic splitting across
+	// deployments) is the plan gate for the per-deployment
+	// traffic_percent opt-in. Pro/Scale = true; Free/Hobby =
+	// false. Differs from RequireAuthn in the Hobby tier: Hobby
+	// unlocks require_authn (issue #462 / ADR-058) but stays
+	// locked on traffic_split because the audience is more
+	// expensive — keeping N canary deployments warm is
+	// RAM-billable per running second for every "extra" live
+	// deployment, and Hobby's value-prop is "near-Free with a
+	// floor", not "production canary rollout". Apid's create
+	// + PATCH-traffic handlers reject Free/Hobby with 403
+	// plan_traffic_split_not_allowed. Column default
+	// (migration 00160) is 100, so every existing app routes
+	// 100% to its single live row regardless of plan — the
+	// gate only fires when a Free/Hobby customer tries to
+	// opt-in to a non-100 traffic_percent (which is denied).
+	TrafficSplit bool
 	// WarmSnapshotMinMsDefault is the per-app time-since-first-ready
 	// threshold for warm-tier capture, applied at CreateApp when
 	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
@@ -581,6 +599,24 @@ type Limits struct {
 	// deployment-park branch. Default 300 s (5 min). Floor 60 s,
 	// ceiling 3600 s.
 	LivenessWindowSeconds int
+
+	// LogArchiveEnabled (issue #562) gates the per-plan log
+	// archive + read-back surface (FAAS_LOG_ARCHIVE_*). Free is
+	// off — the S3 backend + read-back path is a paid-tier
+	// feature (the abuse-floor tier doesn't need cross-process
+	// log persistence; the ring buffer is enough). Hobby/Pro/
+	// Scale opt in. The plan-level gate is read by apid's
+	// bgBefore wire-up (cmd/apid/main.go) and by the gatewayd
+	// bucket-proxy handler (issue #562 PR-B) so a Free-tier
+	// customer's read-back request returns 402 immediately
+	// without burning a bucket request.
+	LogArchiveEnabled bool
+	// LogArchiveRetentionDaysMax is the per-plan ceiling on
+	// FAAS_LOG_ARCHIVE_RETENTION_DAYS. Hobby gets 7, Pro 30,
+	// Scale 90 — matches the typical incident-window expectations
+	// per tier (Hobby's "last week", Pro's "this month", Scale's
+	// "this quarter"). 0 means "no archive on this plan" (Free).
+	LogArchiveRetentionDaysMax int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -735,6 +771,14 @@ var planLimits = map[Plan]Limits{
 		// default (false) keeps every existing customer
 		// public-by-default.
 		RequireAuthn: false,
+		// TrafficSplit (issue #556): Free does not unlock
+		// per-deployment traffic splitting. The column
+		// default (100) keeps today's behaviour — 100% to the
+		// single live row — so no existing Free customer is
+		// affected; the gate only fires when a Free customer
+		// passes a non-100 traffic_percent on create (403
+		// plan_traffic_split_not_allowed).
+		TrafficSplit: false,
 		// Tail primitive (issue #667 / ADR-078): Free enables with
 		// the floor timeout (5 s) and the floor concurrency cap (4).
 		// Customers on Free get the primitive, just tightly bounded —
@@ -755,6 +799,13 @@ var planLimits = map[Plan]Limits{
 		// Window=0) cause `Plan.LivenessAllowed()` to return false
 		// via the fail-closed default — see §Comment at
 		// LivenessPeriodSeconds.
+		// Log archive (issue #562): Free is the abuse-floor tier
+		// and doesn't get the S3 archive + read-back surface —
+		// the in-process ring buffer is the only log surface. The
+		// shipper's bgBefore closure fails closed on this gate
+		// (returns immediately on ctx.Done()).
+		LogArchiveEnabled:          false,
+		LogArchiveRetentionDaysMax: 0,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -923,6 +974,16 @@ var planLimits = map[Plan]Limits{
 		// feature toggle, and the issue pairs it with
 		// internal-only ingress (Pro+).
 		RequireAuthn: false,
+		// TrafficSplit (issue #556): Hobby does not unlock
+		// per-deployment traffic splitting. Hobby's value-prop
+		// is "near-Free with a floor" (MinInstancesAllowed
+		// unlocked by issue #462 / ADR-058), not "production
+		// canary rollout". The 2-3 live deployment bill shape
+		// costs 2-3× the per-running-second RAM; Hobby's price
+		// point doesn't cover it. Free/Hobby see 403
+		// plan_traffic_split_not_allowed when they try to
+		// pass a non-100 traffic_percent on create or PATCH.
+		TrafficSplit: false,
 		// Tail primitive (issue #667 / ADR-078): Hobby unlocks
 		// the 15 s timeout + 16 per-instance concurrent tails.
 		// Matches the issue's "send a confirmation email"
@@ -947,6 +1008,14 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Hobby unlocks the archive
+		// + read-back surface at the first paid tier. 7-day
+		// retention matches the "last week" incident-window
+		// expectation of a Hobby customer; shipper cycle is the
+		// 5-minute default so a Hobby customer's logs land in
+		// S3 within the spec §4.1 latency budget.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 7,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -1095,6 +1164,13 @@ var planLimits = map[Plan]Limits{
 		// recommendation. The column default is still
 		// false — the customer must explicitly PATCH true.
 		RequireAuthn: true,
+		// TrafficSplit (issue #556): Pro unlocks
+		// per-deployment traffic splitting. The issue
+		// title says "Pro+ canary"; the migration
+		// (00160) and CreateDeployment handler stamp
+		// traffic_percent=100 by default, so customers
+		// who never opt-in see no behavioural change.
+		TrafficSplit: true,
 		// Tail primitive (issue #667 / ADR-078): Pro unlocks
 		// the 30 s timeout + 64 per-instance concurrent tails.
 		// Matches the issue's per-plan matrix value; covers
@@ -1115,6 +1191,13 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Pro extends the retention
+		// window to 30 days — covers a "this month" customer
+		// post-mortem window. S3 storage cost scales linearly
+		// with retention, so the per-plan matrix stays tight
+		// rather than being a single shared cap.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 30,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1273,6 +1356,12 @@ var planLimits = map[Plan]Limits{
 		// Customers on the largest plan who want
 		// token-gating still set it per-deployment.
 		RequireAuthn: true,
+		// TrafficSplit (issue #556): Scale unlocks
+		// per-deployment traffic splitting — the
+		// revenue-protecting feature for the Scale
+		// tier (5/25/100% staged rollout to defend
+		// against bad deploys on a checkout API).
+		TrafficSplit: true,
 		// Tail primitive (issue #667 / ADR-078): Scale unlocks
 		// the 60 s timeout + 256 per-instance concurrent tails —
 		// the ceiling per the issue's per-plan matrix. The 60 s
@@ -1298,6 +1387,14 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Scale gets 90-day retention
+		// — covers a "this quarter" compliance window that
+		// SaaS-scale customers typically need. Storage cost is
+		// the customer's (separate billing path outside of the
+		// free GB-h allowance), so the per-plan matrix stays
+		// generous at the top tier.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 90,
 	},
 }
 
@@ -2220,6 +2317,32 @@ func (p Plan) LivenessAllowed() bool {
 	return l.LivenessPeriodSeconds > 0
 }
 
+// LogArchiveEnabled (issue #562) reports whether the plan
+// ships logs to S3. Free returns false (the abuse-floor tier
+// has no archive + read-back surface). Unknown plans fail
+// closed to false so a missing plan row never silently
+// enables the shipper + bucket-proxy surface.
+func (p Plan) LogArchiveEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.LogArchiveEnabled
+}
+
+// LogArchiveRetentionDaysMax (issue #562) returns the
+// per-plan ceiling on FAAS_LOG_ARCHIVE_RETENTION_DAYS. 0
+// for Free (no archive); the apid bgBefore closure uses
+// this to clamp the configured value at boot so an operator
+// can't set a higher retention than the plan allows.
+func (p Plan) LogArchiveRetentionDaysMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LogArchiveRetentionDaysMax
+}
+
 // LivenessPeriodSeconds returns the per-plan default poll cadence
 // for the liveness probe (issue #554). 0 for Free — coupled to
 // LivenessAllowed() above; if the customer is on a plan where
@@ -2403,6 +2526,27 @@ func (p Plan) RequireAuthnAllowed() bool {
 		return false // fail-closed
 	}
 	return l.RequireAuthn
+}
+
+// TrafficSplitAllowed reports whether the plan permits a customer to
+// set a non-default traffic_percent on a deployment (issue #556).
+// Pro/Scale return true; Free/Hobby return false so apid's
+// createDeployment handler and the new updateDeploymentTraffic
+// handler (PATCH /v1/deployments/{id}/traffic) surface 403
+// plan_traffic_split_not_allowed. The migration (00160) column
+// default is 100, so every existing app routes 100% to its single
+// live row regardless of plan — the gate only fires when a Free/
+// Hobby customer tries to opt-in (which is denied). Unknown plans
+// fail closed (return false), matching the RequireAuthnAllowed
+// contract above. Hobby deliberately stays locked (vs Hobby's
+// unlocked MinInstancesAllowed): see the Limits.TrafficSplit
+// field comment.
+func (p Plan) TrafficSplitAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false // fail-closed
+	}
+	return l.TrafficSplit
 }
 
 // RequireAuthnDefault (issue #695 / ADR-080) returns the default

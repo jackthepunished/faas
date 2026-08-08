@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/grace"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/logintoken"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/secretbox"
@@ -88,6 +90,57 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// firstNonEmpty returns the first non-empty string among the
+// args. Used by the log archive wire-up so an explicit env
+// var (FAAS_LOG_ARCHIVE_*) wins over a value in the sealed
+// archive-creds.json envelope — operators expect the env to
+// override defaults, never the other way around.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// archiveCreds is the on-disk shape of the unsealed
+// archive-creds.json envelope (issue #562). The envelope is
+// sealed by an external operator with host.age (or the
+// per-deploy box-age-key — same shape as the rclone.conf
+// envelope, see cmd/gregale/commands_backup.go::defaultBoxAgeKey)
+// and mounted at /etc/faas/secrets/storage-box/archive-creds.json
+// via systemd LoadCredential= (deploy/ansible role).
+//
+// The file is JSON for parse simplicity — no envelope decoder
+// in the hot path, the apid boot reads it once. Fields are
+// optional so the operator can stage an incomplete envelope
+// while waiting on the bucket/region/endpoint values from
+// the S3 vendor.
+type archiveCreds struct {
+	Endpoint string `json:"endpoint,omitempty"`
+	Region   string `json:"region,omitempty"`
+	KeyID    string `json:"key_id,omitempty"`
+	Secret   string `json:"secret,omitempty"`
+}
+
+// readArchiveCreds parses the unsealed archive-creds.json
+// envelope from path. The file is read once at boot — the
+// shipper doesn't watch for rotation. A future PR can add a
+// SIGHUP-driven reload if a credential rotation breaks the
+// running daemon.
+func readArchiveCreds(path string) (archiveCreds, error) {
+	var c archiveCreds
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return c, err
+	}
+	if err := json.Unmarshal(data, &c); err != nil {
+		return c, fmt.Errorf("logarchive: parse %s: %w", path, err)
+	}
+	return c, nil
 }
 
 // listenAddr is the bind address for apid. Behind gatewayd; not a public
@@ -191,6 +244,14 @@ type runDeps struct {
 	// the production capset, and MustCheckOnBoot calls os.Exit
 	// on violation).
 	capCheck func() error
+	// PR-P2: TOML config wiring. configPath defaults to
+	// /etc/faas/apid.toml in defaultDeps; tests override to point at
+	// a temp file with a hand-rolled [billing] block.
+	configPath string
+	// loadBillingConfig reads the [billing] block from apid.toml.
+	// nil in production (defaultDeps wires billingloader.LoadBillingConfigFromPath);
+	// tests stub to return a hand-rolled *RootBillingConfig.
+	loadBillingConfig func(path string) (*billingloader.RootBillingConfig, error)
 }
 
 func defaultDeps() runDeps {
@@ -202,7 +263,9 @@ func defaultDeps() runDeps {
 		newSrv: func(addr string, h http.Handler) *http.Server {
 			return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
 		},
-		loginTTL: 15 * time.Minute,
+		loginTTL:          15 * time.Minute,
+		configPath:        "/etc/faas/apid.toml",
+		loadBillingConfig: billingloader.LoadBillingConfigFromPath,
 	}
 }
 
@@ -298,6 +361,59 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Log:   log,
 		})
 		go func() { _ = eventRetentionCleanup.Run(ctx) }()
+		// Issue #562 / PR-A: log archive shipper. Walks the local
+		// spool dir every cfg.FlushInterval (5 min default) and
+		// gzip-PUTs .partial files to s3://{bucket}/faas-logs/{instance}/
+		// {YYYY}/{MM}/{DD}.jsonl.gz. Disabled (returns nil on ctx
+		// cancel) when FAAS_LOG_ARCHIVE_BUCKET is unset — the
+		// pgAdmin-style on-box ring buffer is the only log surface
+		// for Free + Hobby tiers in that mode.
+		//
+		// Credentials are read from the archive-creds.json envelope
+		// unsealed by `gregale backup unseal-archive-creds` and
+		// mounted at /etc/faas/secrets/storage-box/archive-creds.json
+		// via systemd LoadCredential= (deploy/ansible role sets this
+		// up). On a host that hasn't been unsealed yet the file is
+		// missing and the shipper fails closed on ErrAuthMissing.
+		// Future PR-C will add the unseal CLI leaf + the ansible
+		// wiring.
+		shipCfg, shipErr := logarchive.ConfigFromEnv(os.Getenv, log)
+		switch {
+		case shipErr != nil:
+			log.Warn("logarchive.config_failed", "err", shipErr)
+		case !shipCfg.Enabled():
+			log.Info("logarchive.disabled", "reason", "FAAS_LOG_ARCHIVE_BUCKET unset")
+		default:
+			archiveCredsPath := "/etc/faas/secrets/storage-box/archive-creds.json"
+			if creds, err := readArchiveCreds(archiveCredsPath); err != nil {
+				log.Warn("logarchive.creds_unavailable", "path", archiveCredsPath, "err", err)
+			} else {
+				s3, err := logarchive.NewS3Client(
+					firstNonEmpty(shipCfg.Endpoint, creds.Endpoint),
+					firstNonEmpty(shipCfg.Region, creds.Region),
+					shipCfg.Bucket,
+					firstNonEmpty(shipCfg.KeyID, creds.KeyID),
+					firstNonEmpty(shipCfg.Secret, creds.Secret),
+				)
+				if err != nil {
+					log.Warn("logarchive.s3client_init_failed", "err", err)
+				} else {
+					spool := logarchive.NewSpool(shipCfg.SpoolRoot, shipCfg.LocalBytesMax)
+					shipMetrics := logarchive.NewMetrics(srv.ops.Registry())
+					sh, err := logarchive.NewShipper(shipCfg, spool, s3, log, shipMetrics)
+					if err != nil {
+						log.Warn("logarchive.shipper_init_failed", "err", err)
+					} else {
+						go func() {
+							if err := sh.Run(ctx); err != nil && ctx.Err() == nil {
+								log.Warn("logarchive.run_returned_error", "err", err)
+							}
+							_ = sh.Spool().CloseAll()
+						}()
+					}
+				}
+			}
+		}
 		// Issue #300: topNSampler drives the apid_top_tenant_rps
 		// gauge from the rolling per-account count fed by
 		// observeWrap (server.go:observeWrap). 5s tick; runs for
@@ -550,7 +666,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and the changePlan 402 path falls back to the FAAS_BILLING_PORTAL_URL
 	// template above — the pre-PR-#3 Stripe path is bit-for-bit
 	// unchanged.
-	billingProv, provName, err := billingloader.LoadProviderForAPID(ctx, deps.getenv, log)
+	//
+	// PR-P2: read the [billing] block from apid.toml first, then
+	// overlay env on top. Missing file is non-fatal (defaults). Bad
+	// TOML is fatal. The loader sees the merged cfg + the raw env
+	// reader (closures re-read the secrets the overlay just wrote).
+	loadBillingConfig := deps.loadBillingConfig
+	if loadBillingConfig == nil {
+		loadBillingConfig = billingloader.LoadBillingConfigFromPath
+	}
+	billingCfg, err := loadBillingConfig(deps.configPath)
+	if err != nil {
+		return fmt.Errorf("apid: load billing config: %w", err)
+	}
+	billingCfg = billingloader.ApplyBillingEnvOverlay(billingCfg, deps.getenv)
+	billingProv, provName, err := billingloader.LoadProviderForAPID(ctx, billingCfg, deps.getenv, log)
 	if err != nil {
 		return fmt.Errorf("apid: load billing provider: %w", err)
 	}

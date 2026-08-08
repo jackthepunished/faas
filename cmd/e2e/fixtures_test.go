@@ -62,6 +62,35 @@ http.createServer((req, res) => {
 	return buildTarGz(t, files)
 }
 
+// FunctionNodeFixture returns the bytes of a minimal function-tier
+// source tarball (issue #737 / ADR-083): a single `handler.js` at
+// the project root, no app markers, no package.json. This is the
+// exact shape a customer gets when they run `gregale deploy` in a
+// directory containing only a hand-written handler.js — the CLI's
+// auto-detect path picks shapeFunction and emits the function wire
+// shape (`runtime=node22` + `handler=handler.handler`). The fixture
+// exists so the metal 9th subtest can drive the apid function path
+// at the wire boundary without spinning up a cold build (the unit
+// test in cmd/apid/deploy_inputs_test.go covers the function
+// deploy → live path). The body is a no-op handler; the test stops
+// at the 202 response + `apps.type=function` row check, so the body
+// content is intentionally minimal — its only purpose is to exist
+// inside a valid tarball.
+func FunctionNodeFixture(t *testing.T) []byte {
+	t.Helper()
+	const handlerJS = `// Issue #737 / ADR-083 function-tier fixture.
+// Wire handler is "handler.handler" (literal) per
+// cmd/gregale/templates/function-node/handler.js convention;
+// imaged's function-layer manifest rewrites this to /app/handler.js
+// in the guest microVM.
+exports.handler = async () => ({ statusCode: 200, body: 'function ok' });
+`
+	files := map[string]string{
+		"handler.js": handlerJS,
+	}
+	return buildTarGz(t, files)
+}
+
 // NodeFixturePort returns the bytes of a minimal Node 22 source tarball
 // whose index.js reads the `PORT` env var (issue #460 / ADR-053, PR-C).
 // The platform contract is that guest-init always stamps PORT

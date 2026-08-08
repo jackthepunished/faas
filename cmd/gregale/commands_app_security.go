@@ -1,12 +1,15 @@
 // commands_app_security.go — Tier D audit-gap close.
-// `gregale app security <slug> [--require-signed=true|false]`
+// `gregale app <slug> security [--require-signed=true|false]`
 // (PATCH /v1/apps/{slug}/security, issue #472 / ADR-054).
 //
 // Mirrors cmdAlertUpdate (commands_alerts.go:245-313) exactly: same
 // pointer-everything fs.Visit detection so `--require-signed=false`
 // is distinguishable from "leave alone". The leaf is wired into
 // cmdAppDispatch (commands5.go:586) alongside `scale` / `rename`
-// as a sibling subcommand.
+// as a sibling subcommand — slug is the first positional across
+// all three leaves (cmdAppScale / cmdAppRename take it as a
+// separate string param; cmdAppSecurity follows the same shape
+// so the dispatcher can route uniformly).
 //
 // Closed-set gate: `--require-signed=` accepts only the literal
 // strings "true" / "false" (lowercase). Anything else is rejected
@@ -55,29 +58,33 @@ const (
 	requireSignedFalse = "false"
 )
 
-// cmdAppSecurity implements `gregale app security <slug>
+// cmdAppSecurity implements `gregale app <slug> security
 // [--require-signed=true|false]`. The only flag for now is
 // require_signed (ADR-054 §Decision 2); future per-app security
 // bits (trusted-publisher allowlist mutation, deploy-time SBOM
 // enforcement) extend the AppSecurityRequest DTO + this leaf's
 // flag set together. Don't grow the leaf until the DTO grows.
-func cmdAppSecurity(args []string) int {
+//
+// Signature mirrors cmdAppScale / cmdAppRename: slug is the first
+// positional, threaded in by cmdAppDispatch (commands5.go:607) so
+// the dispatcher can route the three subcommand leaves uniformly
+// (slug, args[2:]).
+func cmdAppSecurity(slug string, args []string) int {
+	if slug == "" {
+		PrintUsage(os.Stderr, "usage: gregale app <slug> security [--require-signed=true|false]", "apps")
+		return 1
+	}
 	// splitArgsForFlags: Go's flag.Parse halts at the first non-flag
-	// positional, so `gregale app security demo --require-signed=false`
+	// positional, so `gregale app demo security --require-signed=false`
 	// would silently drop --require-signed=false if we parsed args
 	// directly. The reorder helper pulls the flag to the front so
 	// the parser sees it. Mirrors cmdDelayedTaskAdd (commands_delayed_task.go:118).
-	flags, pos := splitArgsForFlags(args)
+	flags, _ := splitArgsForFlags(args)
 	fs := flag.NewFlagSet("app security", flag.ContinueOnError)
 	requireSigned := fs.String("require-signed", "", "require signed images on deploy (true|false)")
 	if err := fs.Parse(flags); err != nil {
 		return 1
 	}
-	if len(pos) != 1 {
-		PrintUsage(os.Stderr, "usage: gregale app security <slug> [--require-signed=true|false]", "apps")
-		return 1
-	}
-	slug := pos[0]
 	// --require-signed is parsed as a string so the strict literal
 	// "true" / "false" gate can run before strconv.ParseBool (which
 	// accepts "1", "t", "True", etc. — those would silently flip

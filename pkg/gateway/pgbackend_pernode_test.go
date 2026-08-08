@@ -34,13 +34,15 @@ type rotatingScheduler struct {
 	method     int32         // raw wake method for Admit
 }
 
-func (r *rotatingScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
+func (r *rotatingScheduler) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
 	idx := r.calls.Add(1)
 	nodeID := r.nextNodeID()
-	// Scheduler signature (issue #460 / ADR-053 PR-C):
-	// (instanceID, nodeID, wakeID, method, atCapacity, port, err).
+	// Scheduler signature (issue #460 / ADR-053 PR-C + issue #556 PR-B):
+	// (instanceID, nodeID, deploymentID, wakeID, method, atCapacity, port, err).
 	// Port=0 → legacy 8080 default at vmmd's buildBridgeScript boundary.
-	return "i-" + strconv.FormatInt(idx, 10), nodeID, "wake-" + strconv.FormatInt(idx, 10), r.method, false, 0, nil
+	// deploymentID="" → legacy single-deployment mode (picker collapses
+	// to today's single-targetSet behaviour).
+	return "i-" + strconv.FormatInt(idx, 10), nodeID, "", "wake-" + strconv.FormatInt(idx, 10), r.method, false, 0, nil
 }
 
 // TestPGBackend_PickRotatesWithinWinningNode seeds two nodes with
