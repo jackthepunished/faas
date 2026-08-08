@@ -258,6 +258,50 @@ func TestOpsMetrics_ActivePassiveFailoversPreinstantiated(t *testing.T) {
 	}
 }
 
+// TestOpsMetrics_WriteRedirectPreinstantiated — Tier A9 / ADR-084
+// write-redirect counter must surface every (outcome, auth_kind)
+// label combination in /metrics from boot. The §12 dashboard
+// relies on the panel existing at day 1 — an idle box would
+// otherwise render the panel as "no data" until the first
+// standby write. The label vocabulary is closed (8 outcomes ×
+// 3 auth_kinds = 24 series), imported from pkg/gateway/writegate
+// (review finding #5 of PR #761) so a drift between the writeGate
+// outcome vocabulary and the metric pre-instantiation breaks the
+// compile rather than the dashboard.
+func TestOpsMetrics_WriteRedirectPreinstantiated(t *testing.T) {
+	m := wire.NewOpsMetrics("gatewayd_internal")
+	body := render(t, m)
+	outcomes := []string{
+		"relayed", "redirect_307", "same_box", "cookie_blocked",
+		"leader_unreachable", "loop_prevented", "mTLS_failure", "error",
+	}
+	authKinds := []string{"bearer", "cookie", "anonymous"}
+	for _, outcome := range outcomes {
+		for _, kind := range authKinds {
+			// Prometheus emits labels in alphabetical order,
+			// so auth_kind comes before outcome in the wire form.
+			want := fmt.Sprintf(
+				`gatewayd_internal_write_redirect_total{auth_kind=%q,outcome=%q} 0`,
+				kind, outcome)
+			if !strings.Contains(body, want) {
+				t.Errorf("missing pre-instantiated label %s in:\n%s", want, body)
+			}
+		}
+	}
+	// Round-trip: Inc on the bearer+relayed counter must surface.
+	m.WriteRedirectTotal("relayed", "bearer").Inc()
+	body = render(t, m)
+	want := `gatewayd_internal_write_redirect_total{auth_kind="bearer",outcome="relayed"} 1`
+	if !strings.Contains(body, want) {
+		t.Errorf("Inc did not surface value:\n%s", body)
+	}
+	// Histogram accessor must be non-nil and Observe must succeed.
+	if m.WriteRedirectLatency() == nil {
+		t.Fatalf("WriteRedirectLatency() = nil (histogram not registered)")
+	}
+	m.WriteRedirectLatency().Observe(0.123)
+}
+
 // TestOpsMetrics_EgressDenyRegistryPreinstantiated (PR-E) — every
 // catalog (cidr, family) tuple must surface in /metrics from boot
 // with value 0, mirroring the OCI-pull and build histogram
