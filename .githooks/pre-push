@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# pre-push hint for issue #745 / DEPLOY-PROV-9.
+#
+# If the push touches api/openapi.yaml or pkg/apid/openapi.yaml, warn when
+# the embedded copy looks stale relative to the source-of-truth spec. This
+# is NON-BLOCKING (exit 0): the spec-check CI job + the ruleset required
+# status check are the load-bearing gates. This hook is local-DX only,
+# catching drift at push time rather than 4-5 min later in CI.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Disable per-push:
+#   git push --no-verify
+
+set -euo pipefail
+
+# Find the upstream we are pushing to. On a fresh clone there may be no
+# @{u} yet — in that case diff against HEAD (i.e. check whether the
+# pending commit already differs from itself, which means "is the working
+# tree or index touching the files we care about").
+remote_branch="${1:-}"
+local_ref="${2:-}"
+
+# Identify the diff range. Prefer @{u}; fall back to working tree.
+if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+  range='@{u}..HEAD'
+else
+  range='HEAD'
+fi
+
+# Files that must move together.
+spec_src="api/openapi.yaml"
+spec_embed="pkg/apid/openapi.yaml"
+
+# Did the push touch either file?
+touched_src="$(git diff --name-only "$range" -- "$spec_src" 2>/dev/null || true)"
+touched_embed="$(git diff --name-only "$range" -- "$spec_embed" 2>/dev/null || true)"
+
+if [[ -z "$touched_src" && -z "$touched_embed" ]]; then
+  exit 0
+fi
+
+# If only the embedded copy is touched (i.e. the dev did run spec-sync
+# without touching the source), that's the *correct* drift-recovery
+# commit — pass silently.
+if [[ -z "$touched_src" && -n "$touched_embed" ]]; then
+  exit 0
+fi
+
+# The source was touched. Check whether the embedded copy is in sync.
+if ! cmp -s "$spec_src" "$spec_embed"; then
+  cat >&2 <<EOF
+::warning:: pre-push: $spec_src changed but $spec_embed is stale.
+   The required CI check 'spec-check (OpenAPI lint + AST parity)' will
+   fail this push until the embedded copy is regenerated. Run:
+
+       make spec-sync
+
+   (or 'git push --no-verify' to skip this hint — CI will still gate.)
+EOF
+  # Non-blocking: the spec-check CI job is the load-bearing gate.
+  exit 0
+fi
+
+exit 0
