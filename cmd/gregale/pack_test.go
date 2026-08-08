@@ -108,6 +108,61 @@ func TestDetectFramework_NestedMarkerIgnored(t *testing.T) {
 	}
 }
 
+// TestDetectNestedMarkerHint pins the depth-2 workspace hint for issue #744
+// / ADR-086. The load-bearing case: a monorepo with apps/web/package.json
+// (and nothing at the root) returns true so resolveDeployShape can emit the
+// `gregale scan --path .` hint. Excluded dirs and depth-3+ must return false
+// to avoid false positives.
+func TestDetectNestedMarkerHint(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  bool
+	}{
+		// The headline case — common monorepo layout.
+		{"apps_web_package_json", []string{"apps/web/package.json"}, true},
+		{"services_api_go_mod", []string{"services/api/go.mod"}, true},
+		{"two_nested_markers", []string{"apps/web/package.json", "services/api/go.mod"}, true},
+		{"nested_requirements", []string{"api/requirements.txt"}, true},
+		{"nested_dockerfile", []string{"deploy/Dockerfile"}, true},
+		{"nested_pyproject", []string{"libs/x/pyproject.toml"}, true},
+
+		// Root markers win — these are NOT nested, they're app-shaped;
+		// detectFramework already returned the answer for them, and the
+		// hint must not double-fire.
+		{"root_package_json_wins", []string{"package.json"}, false},
+		{"root_dockerfile_wins", []string{"Dockerfile"}, false},
+
+		// Excluded dirs must not false-positive.
+		{"node_modules_ignored", []string{"node_modules/x/package.json"}, false},
+		{"dot_git_ignored", []string{".git/HEAD"}, false},
+		{"vendor_ignored", []string{"vendor/x/go.mod"}, false},
+		{"__pycache___ignored", []string{"__pycache__/x/requirements.txt"}, false},
+
+		// Depth-3+ is intentionally out of scope — pkg/reposcan handles it.
+		{"depth_3_returns_false", []string{"apps/services/api/package.json"}, false},
+
+		// Empty / README-only — nothing to hint at.
+		{"empty_dir", nil, false},
+		{"readme_only", []string{"README.md"}, false},
+
+		// Nested dir with non-marker files only — not a workspace.
+		{"nested_dir_no_markers", []string{"docs/index.md", "apps/web/index.js"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			got := detectNestedMarkerHint(dir)
+			if got != tc.want {
+				t.Errorf("detectNestedMarkerHint = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDetectShape covers issue #737 / ADR-083. The shape detector decides
 // whether `gregale deploy` on the cwd auto-picks app mode (any app marker)
 // or function mode (single handler.* with no app markers). Cases below

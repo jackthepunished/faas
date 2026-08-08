@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -386,5 +387,151 @@ func TestBuildCreateRequest(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestResolveDeployShape_NestedMarkerHint pins the customer-visible
+// behaviour of issue #744 / ADR-086: a cwd whose only deployable source
+// is a marker buried at depth 1 (the common monorepo layout
+// apps/web/package.json) must surface a `Hint: ... gregale scan --path .`
+// line so the customer knows what to do next.
+//
+// Text mode: the hint is appended to the PrintFail line on stderr.
+// --json mode: the hint goes to stderr ONLY (stdout must remain a
+// parseable JSON envelope).
+func TestResolveDeployShape_NestedMarkerHint(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "apps/web/package.json", "{}")
+	writeFile(t, dir, "README.md", "monorepo root")
+
+	_, _, _, err := resolveDeployShape(dir, false, false, false)
+	if err == nil {
+		t.Fatalf("resolveDeployShape on nested-marker cwd should error; got nil")
+	}
+
+	// The error must wrap a *NestedMarkerHintError so programmatic
+	// consumers (dashboards, CI scripts) can errors.As it.
+	var hintErr *NestedMarkerHintError
+	if !errors.As(err, &hintErr) {
+		t.Fatalf("error chain missing *NestedMarkerHintError; got %T: %v", err, err)
+	}
+	if !strings.Contains(hintErr.Hint, "gregale scan --path .") {
+		t.Errorf("hint missing 'gregale scan --path .'; got %q", hintErr.Hint)
+	}
+
+	// Drive printErr (text mode) and assert the hint lands on stderr.
+	var stdout, stderr bytes.Buffer
+	oldOut, oldErr := osStdout, osStderr
+	osStdout, osStderr = &stdout, &stderr
+	defer func() { osStdout, osStderr = oldOut, oldErr }()
+
+	prevJSON := jsonOutput
+	jsonOutput = false
+	defer func() { jsonOutput = prevJSON }()
+
+	code := printErr("Could not resolve deploy shape", err)
+	if code == 0 {
+		t.Errorf("printErr returned 0; expected non-zero exit code on shape error")
+	}
+	if !strings.Contains(stderr.String(), "gregale scan --path .") {
+		t.Errorf("stderr missing hint; got %q", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "gregale scan --path .") {
+		t.Errorf("stdout must not contain hint in text mode; got %q", stdout.String())
+	}
+}
+
+// TestResolveDeployShape_NestedMarkerHint_JSON pins the §3.3 --json contract
+// from ADR-086: when a customer runs `gregale deploy --json` on a cwd with
+// nested markers, printErr must (a) NOT include the hint in the JSON
+// envelope (the envelope is the wire error), and (b) emit the hint as a
+// separate human-readable line so a customer running
+// `gregale deploy --json 2>&1 | less` still sees the next-step guidance.
+//
+// Implementation note: the JSON envelope path uses writeJSONProblem, which
+// writes to os.Stderr directly (not via the osStderr swap). This is
+// pre-existing behaviour — see json_flag.go:writeJSONProblem — and a
+// property this test deliberately does NOT regress. We pin only the
+// shape-resolution error chain (typed NestedMarkerHintError) + the
+// stderr hint line via the swap, which is the load-bearing contract.
+func TestResolveDeployShape_NestedMarkerHint_JSON(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "apps/web/package.json", "{}")
+
+	sh, _, _, err := resolveDeployShape(dir, false, false, true)
+	if err == nil {
+		t.Fatalf("resolveDeployShape(--json) on nested-marker cwd should error; got nil")
+	}
+	if sh != shapeUnknown {
+		t.Errorf("shape = %d, want %d (shapeUnknown)", sh, shapeUnknown)
+	}
+
+	// The error chain must carry the hint for downstream consumers
+	// (dashboards, CI scripts) that errors.As it.
+	var hintErr *NestedMarkerHintError
+	if !errors.As(err, &hintErr) {
+		t.Fatalf("error chain missing *NestedMarkerHintError; got %T: %v", err, err)
+	}
+	if !strings.Contains(hintErr.Hint, "gregale scan --path .") {
+		t.Errorf("hint missing 'gregale scan --path .'; got %q", hintErr.Hint)
+	}
+
+	// Drive printErr under --json and confirm the hint lands on the
+	// swappable stderr (the PrintWarn side of printErr's typed-error
+	// branch). The JSON envelope itself is exercised by
+	// json_flag_test.go; we only assert the hint split here.
+	var stderr bytes.Buffer
+	oldErr := osStderr
+	osStderr = &stderr
+	defer func() { osStderr = oldErr }()
+
+	prevJSON := jsonOutput
+	jsonOutput = true
+	defer func() { jsonOutput = prevJSON }()
+
+	code := printErr("Could not resolve deploy shape", err)
+	if code == 0 {
+		t.Errorf("printErr returned 0; expected non-zero exit code on shape error")
+	}
+	if !strings.Contains(stderr.String(), "gregale scan --path .") {
+		t.Errorf("stderr missing hint under --json; got %q", stderr.String())
+	}
+}
+
+// TestResolveDeployShape_NoNestedHintOnEmptyDir pins the negative case:
+// a cwd with no markers at any depth must produce the bare error and
+// MUST NOT carry the hint (no false-positive on a totally empty repo).
+func TestResolveDeployShape_NoNestedHintOnEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+
+	_, _, _, err := resolveDeployShape(dir, false, false, false)
+	if err == nil {
+		t.Fatalf("resolveDeployShape on empty dir should error; got nil")
+	}
+
+	var hintErr *NestedMarkerHintError
+	if errors.As(err, &hintErr) {
+		t.Errorf("empty dir must NOT carry NestedMarkerHintError; got hint %q", hintErr.Hint)
+	}
+}
+
+// TestResolveDeployShape_NoNestedHintOnExcludedDirs pins the false-positive
+// guard: a cwd whose only nested markers live under excluded dirs
+// (node_modules / .git / vendor / __pycache__) must NOT carry the hint.
+func TestResolveDeployShape_NoNestedHintOnExcludedDirs(t *testing.T) {
+	dir := t.TempDir()
+	// node_modules/<pkg>/package.json — a real-world monorepo WILL have
+	// these, and we don't want every Node project to fire the hint.
+	writeFile(t, dir, "node_modules/some-pkg/package.json", "{}")
+	writeFile(t, dir, ".git/HEAD", "ref: refs/heads/main")
+
+	_, _, _, err := resolveDeployShape(dir, false, false, false)
+	if err == nil {
+		t.Fatalf("resolveDeployShape should error (no top-level markers); got nil")
+	}
+
+	var hintErr *NestedMarkerHintError
+	if errors.As(err, &hintErr) {
+		t.Errorf("excluded-dir markers must NOT fire NestedMarkerHintError; got hint %q", hintErr.Hint)
 	}
 }
