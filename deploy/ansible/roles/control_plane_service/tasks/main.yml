@@ -213,6 +213,52 @@
       intentional but the perms are not — refusing.
   when: faas_host_age_previous_stat.stat.exists
 
+# Issue #562 — log archive S3 credential envelope (issue #562
+# PR-A). The unsealed archive-creds.json envelope is read by
+# apid at boot (cmd/apid/main.go::readArchiveCreds). Mirrors
+# the host.age / session.key / sign-keypair / rclone.conf
+# pattern: fail-loud perm tripwire so a drift never silently
+# exports the S3 access key to every daemon.
+#
+# Mode 0400 root:root matches the unseal-archive-creds CLI
+# leaf's chmod (cmd/gregale/commands_backup_unseal_archive.go).
+# apid reads the envelope via LoadCredential= so it never
+# touches the on-disk 0400 file; the tripwire is for the box
+# that runs `gregale backup unseal-archive-creds` and would
+# otherwise write a loose-perm file.
+- name: control_plane_service — assert archive-creds.json mode is 0400 root:root if present (issue #562)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/storage-box/archive-creds.json
+  register: faas_archive_creds_stat
+- name: control_plane_service — assert archive-creds.json perms (issue #562)
+  ansible.builtin.assert:
+    that:
+      - faas_archive_creds_stat.stat.mode == "0400"
+      - faas_archive_creds_stat.stat.pw_name == "root"
+      - faas_archive_creds_stat.stat.gr_name == "root"
+    fail_msg: >-
+      archive-creds.json present with loose perms ({{ faas_archive_creds_stat.stat.mode }}
+      {{ faas_archive_creds_stat.stat.pw_name }}:{{ faas_archive_creds_stat.stat.gr_name }}).
+      The unseal-archive-creds CLI leaf stamps 0400 root:root; refusing to ship a
+      credential envelope with broader access.
+  when: faas_archive_creds_stat.stat.exists
+
+# Issue #562 — install the apid systemd drop-in that surfaces
+# the S3 archive credentials envelope via LoadCredential= and
+# grants the shipper write access to /var/log/faas/archive.
+# Drop-in files live alongside the unit and are auto-loaded
+# by systemd when the unit is reloaded (mirrors the
+# postgres storage-box drop-in at deploy/ansible/roles/
+# postgres/files/postgresql.service.d/99-faas-storage-box.conf).
+- name: control_plane_service — install apid log-archive drop-in (issue #562)
+  ansible.builtin.copy:
+    src: "faas-apid.service.d/99-faas-log-archive.conf"
+    dest: "/etc/systemd/system/faas-apid.service.d/99-faas-log-archive.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  register: faas_log_archive_dropin
+
 # Tier 3 / ADR-038 §Phase 3 — cosign sign-keypair (build attestation).
 # imaged reads /etc/faas/secrets/sign.key at startup
 # (cmd/imaged/main.go:103-109 fail-loud os.Stat). The file MUST be

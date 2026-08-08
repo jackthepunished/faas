@@ -90,7 +90,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #189 / IAM-5: Free = 3 keys (primary deploy + staging + break-glass).
 			KeysMax: 3,
 			// Issue #667 / ADR-078: tail primitive on with floor timeout.
-			TailEnabled: true, TailTimeoutS: 5, TailCapMax: 16, ConcurrentTailsPerInstance: 4},
+			TailEnabled: true, TailTimeoutS: 5, TailCapMax: 16, ConcurrentTailsPerInstance: 4,
+			// Issue #562: Free has no archive surface.
+			LogArchiveEnabled: false, LogArchiveRetentionDaysMax: 0},
 		PlanHobby: {Plan: PlanHobby, DeployedApps: 5, MaxConcurrency: 2, RAMMB: 256, AppLayerMaxMB: 512, SourceTarballMaxMB: 100, VCPU: 2, IdleTimeoutS: 60, IncludedGBHours: 50, PriceMillicents: 900_000, RateLimitRPS: 20, RateLimitBurst: 100, EgressMbit: 25, SecretCountMax: 25, SecretValueMaxBytes: 8192, MaxMinInstances: 1,
 			// Issue #559: Hobby = 5 (smallest paid tier — one Node
 			// event loop comfortably handles 5 concurrent requests).
@@ -183,7 +185,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #189 / IAM-5: Hobby = 10 keys (2 per app across 5 apps).
 			KeysMax: 10,
 			// Issue #667 / ADR-078: tail primitive on at 15 s.
-			TailEnabled: true, TailTimeoutS: 15, TailCapMax: 16, ConcurrentTailsPerInstance: 16},
+			TailEnabled: true, TailTimeoutS: 15, TailCapMax: 16, ConcurrentTailsPerInstance: 16,
+			// Issue #562: Hobby unlocks log archive with 7-day retention.
+			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 7},
 		// ADR-031: Pro opt-in for per-app egress allowlist with a 16-CIDR cap.
 		PlanPro: {Plan: PlanPro, DeployedApps: 25, MaxConcurrency: 5, RAMMB: 512, AppLayerMaxMB: 1024, SourceTarballMaxMB: 250, VCPU: 2, IdleTimeoutS: 300, IncludedGBHours: 250, PriceMillicents: 2_900_000, RateLimitRPS: 100, RateLimitBurst: 500, EgressMbit: 100, SecretCountMax: 50, SecretValueMaxBytes: 16384, MaxMinInstances: 3,
 			// Issue #559: Pro = 25 (typical SaaS-tier workload
@@ -263,7 +267,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #189 / IAM-5: Pro = 50 keys (2 per app across 25 apps).
 			KeysMax: 50,
 			// Issue #667 / ADR-078: tail primitive on at 30 s.
-			TailEnabled: true, TailTimeoutS: 30, TailCapMax: 16, ConcurrentTailsPerInstance: 64},
+			TailEnabled: true, TailTimeoutS: 30, TailCapMax: 16, ConcurrentTailsPerInstance: 64,
+			// Issue #562: Pro extends retention to 30 days.
+			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 30},
 		// ADR-031: Scale double-up to 64 CIDR cap (2× Pro, tracks 2×
 		// DeployedApps).
 		PlanScale: {Plan: PlanScale, DeployedApps: 100, MaxConcurrency: 20, RAMMB: 1024, AppLayerMaxMB: 2048, SourceTarballMaxMB: 250, VCPU: 4, IdleTimeoutS: 600, IncludedGBHours: 1500, PriceMillicents: 9_900_000, RateLimitRPS: 500, RateLimitBurst: 2000, EgressMbit: 250, SecretCountMax: 100, SecretValueMaxBytes: 32768, MaxMinInstances: 10,
@@ -346,7 +352,9 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #189 / IAM-5: Scale = 200 keys (2 per app across 100 apps).
 			KeysMax: 200,
 			// Issue #667 / ADR-078: tail primitive on at 60 s.
-			TailEnabled: true, TailTimeoutS: 60, TailCapMax: 16, ConcurrentTailsPerInstance: 256},
+			TailEnabled: true, TailTimeoutS: 60, TailCapMax: 16, ConcurrentTailsPerInstance: 256,
+			// Issue #562: Scale extends retention to 90 days.
+			LogArchiveEnabled: true, LogArchiveRetentionDaysMax: 90},
 	}
 	for _, p := range Plans {
 		got := MustLimitsFor(p)
@@ -785,6 +793,52 @@ func TestPlanEgressAllowlistAllowed(t *testing.T) {
 	for _, c := range cases {
 		if got := c.plan.EgressAllowlistAllowed(); got != c.want {
 			t.Errorf("%s.EgressAllowlistAllowed() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanLogArchiveEnabled pins the per-plan gate for the
+// log archive + read-back surface (issue #562). Free → false
+// (the abuse-floor tier doesn't get the S3 archive); Hobby,
+// Pro, Scale → true. Unknown plans default to false
+// (fail-closed, same contract as the other plan gates).
+func TestPlanLogArchiveEnabled(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want bool
+	}{
+		{PlanFree, false},
+		{PlanHobby, true},
+		{PlanPro, true},
+		{PlanScale, true},
+		{Plan("unknown"), false},
+	}
+	for _, c := range cases {
+		if got := c.plan.LogArchiveEnabled(); got != c.want {
+			t.Errorf("%s.LogArchiveEnabled() = %v, want %v", c.plan, got, c.want)
+		}
+	}
+}
+
+// TestPlanLogArchiveRetentionDaysMax pins the per-plan
+// retention ceiling (issue #562). 0 for Free (no archive);
+// 7 / 30 / 90 for Hobby / Pro / Scale (the "last week /
+// this month / this quarter" customer expectations per tier).
+// Unknown plans default to 0 (fail-closed).
+func TestPlanLogArchiveRetentionDaysMax(t *testing.T) {
+	cases := []struct {
+		plan Plan
+		want int
+	}{
+		{PlanFree, 0},
+		{PlanHobby, 7},
+		{PlanPro, 30},
+		{PlanScale, 90},
+		{Plan("unknown"), 0},
+	}
+	for _, c := range cases {
+		if got := c.plan.LogArchiveRetentionDaysMax(); got != c.want {
+			t.Errorf("%s.LogArchiveRetentionDaysMax() = %d, want %d", c.plan, got, c.want)
 		}
 	}
 }

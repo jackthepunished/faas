@@ -581,6 +581,24 @@ type Limits struct {
 	// deployment-park branch. Default 300 s (5 min). Floor 60 s,
 	// ceiling 3600 s.
 	LivenessWindowSeconds int
+
+	// LogArchiveEnabled (issue #562) gates the per-plan log
+	// archive + read-back surface (FAAS_LOG_ARCHIVE_*). Free is
+	// off — the S3 backend + read-back path is a paid-tier
+	// feature (the abuse-floor tier doesn't need cross-process
+	// log persistence; the ring buffer is enough). Hobby/Pro/
+	// Scale opt in. The plan-level gate is read by apid's
+	// bgBefore wire-up (cmd/apid/main.go) and by the gatewayd
+	// bucket-proxy handler (issue #562 PR-B) so a Free-tier
+	// customer's read-back request returns 402 immediately
+	// without burning a bucket request.
+	LogArchiveEnabled bool
+	// LogArchiveRetentionDaysMax is the per-plan ceiling on
+	// FAAS_LOG_ARCHIVE_RETENTION_DAYS. Hobby gets 7, Pro 30,
+	// Scale 90 — matches the typical incident-window expectations
+	// per tier (Hobby's "last week", Pro's "this month", Scale's
+	// "this quarter"). 0 means "no archive on this plan" (Free).
+	LogArchiveRetentionDaysMax int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -755,6 +773,13 @@ var planLimits = map[Plan]Limits{
 		// Window=0) cause `Plan.LivenessAllowed()` to return false
 		// via the fail-closed default — see §Comment at
 		// LivenessPeriodSeconds.
+		// Log archive (issue #562): Free is the abuse-floor tier
+		// and doesn't get the S3 archive + read-back surface —
+		// the in-process ring buffer is the only log surface. The
+		// shipper's bgBefore closure fails closed on this gate
+		// (returns immediately on ctx.Done()).
+		LogArchiveEnabled:          false,
+		LogArchiveRetentionDaysMax: 0,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -947,6 +972,14 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Hobby unlocks the archive
+		// + read-back surface at the first paid tier. 7-day
+		// retention matches the "last week" incident-window
+		// expectation of a Hobby customer; shipper cycle is the
+		// 5-minute default so a Hobby customer's logs land in
+		// S3 within the spec §4.1 latency budget.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 7,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -1115,6 +1148,13 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Pro extends the retention
+		// window to 30 days — covers a "this month" customer
+		// post-mortem window. S3 storage cost scales linearly
+		// with retention, so the per-plan matrix stays tight
+		// rather than being a single shared cap.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 30,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1298,6 +1338,14 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Scale gets 90-day retention
+		// — covers a "this quarter" compliance window that
+		// SaaS-scale customers typically need. Storage cost is
+		// the customer's (separate billing path outside of the
+		// free GB-h allowance), so the per-plan matrix stays
+		// generous at the top tier.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 90,
 	},
 }
 
@@ -2132,6 +2180,32 @@ func (p Plan) LivenessAllowed() bool {
 		return false
 	}
 	return l.LivenessPeriodSeconds > 0
+}
+
+// LogArchiveEnabled (issue #562) reports whether the plan
+// ships logs to S3. Free returns false (the abuse-floor tier
+// has no archive + read-back surface). Unknown plans fail
+// closed to false so a missing plan row never silently
+// enables the shipper + bucket-proxy surface.
+func (p Plan) LogArchiveEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.LogArchiveEnabled
+}
+
+// LogArchiveRetentionDaysMax (issue #562) returns the
+// per-plan ceiling on FAAS_LOG_ARCHIVE_RETENTION_DAYS. 0
+// for Free (no archive); the apid bgBefore closure uses
+// this to clamp the configured value at boot so an operator
+// can't set a higher retention than the plan allows.
+func (p Plan) LogArchiveRetentionDaysMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LogArchiveRetentionDaysMax
 }
 
 // LivenessPeriodSeconds returns the per-plan default poll cadence

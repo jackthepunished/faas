@@ -58,14 +58,16 @@ const subUnsealRclone = "unseal-rclone"
 
 func cmdBackup(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale backup <unseal-rclone> [flags]", "backup")
+		PrintUsage(os.Stderr, "usage: gregale backup <subcommand> [flags]\n  known subcommands: unseal-rclone, unseal-archive-creds", "backup")
 		return 1
 	}
 	switch args[0] {
 	case subUnsealRclone:
 		return cmdBackupUnsealRclone(args[1:])
+	case subUnsealArchiveCreds:
+		return cmdBackupUnsealArchiveCreds(args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "gregale backup: unknown subcommand %q (known: unseal-rclone)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gregale backup: unknown subcommand %q (known: unseal-rclone, unseal-archive-creds)\n", args[0])
 		return 1
 	}
 }
