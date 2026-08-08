@@ -502,7 +502,18 @@ type runDeps struct {
 	// inject a stub that returns a no-op Provider so the loop body
 	// runs without touching Stripe/Paddle. Mirrors the test-double
 	// pattern at cmd/apid/main.go.
-	loadBillingProvider func(env func(string) string, store state.Store, log *slog.Logger) (billing.Provider, string, error)
+	//
+	// PR-P2: the env-overlaid TOML config is threaded through so the
+	// loader can pick the active provider (Stripe vs Paddle) without
+	// the daemon reaching into pkg/billing/loader. The caller applies
+	// ApplyBillingEnvOverlay before the call; loadBillingProvider does
+	// not re-read env.
+	loadBillingProvider func(cfg *billingloader.RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (billing.Provider, string, error)
+	// loadBillingConfig reads the [billing] block from meterd.toml.
+	// nil in production (defaultDeps wires billingloader.LoadBillingConfigFromPath);
+	// tests stub to return a hand-rolled *RootBillingConfig so the
+	// loader path can be exercised without writing a temp TOML.
+	loadBillingConfig func(path string) (*billingloader.RootBillingConfig, error)
 	// The two collaborators are wired in production by runWithDeps
 	// after the pool is open; tests can pre-populate via the fields.
 	parker parkInstanceParker
@@ -542,11 +553,12 @@ func defaultDeps() runDeps {
 			}
 			return c, nil
 		},
-		loadBillingProvider: func(env func(string) string, store state.Store, log *slog.Logger) (billing.Provider, string, error) {
-			return billingloader.LoadProviderForMeterd(env, store, store, log)
+		loadBillingProvider: func(cfg *billingloader.RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (billing.Provider, string, error) {
+			return billingloader.LoadProviderForMeterd(cfg, env, store, log)
 		},
-		mailer: nil, // populated lazily in runWithDeps via mail.SenderFromEnv
-		now:    time.Now,
+		loadBillingConfig: billingloader.LoadBillingConfigFromPath,
+		mailer:            nil, // populated lazily in runWithDeps via mail.SenderFromEnv
+		now:               time.Now,
 		metricsListenAndServe: func(addr string, h http.Handler) (*http.Server, error) {
 			ln, err := net.Listen("tcp", addr)
 			if err != nil {
@@ -649,10 +661,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if deps.loadBillingProvider == nil {
 			return fmt.Errorf("meterd: nil loadBillingProvider and nil pusher (refusing to start unbounded)")
 		}
-		var err error
-		pusher, provName, err = deps.loadBillingProvider(deps.getenv, store, log)
+		// PR-P2: read the [billing] block from the daemon's TOML and
+		// overlay env on top. Missing file is non-fatal (defaults), bad
+		// TOML is fatal — LoadBillingConfig wraps with %w so the operator
+		// sees the underlying parse error. The env overlay runs after
+		// LoadBillingConfig so env wins over TOML (the docs claim).
+		loadBillingConfig := deps.loadBillingConfig
+		if loadBillingConfig == nil {
+			loadBillingConfig = billingloader.LoadBillingConfigFromPath
+		}
+		billingCfg, err := loadBillingConfig(deps.configPath)
 		if err != nil {
-			return fmt.Errorf("meterd: load billing provider: %w", err)
+			return fmt.Errorf("meterd: load billing config: %w", err)
+		}
+		billingCfg = billingloader.ApplyBillingEnvOverlay(billingCfg, deps.getenv)
+		var loadErr error
+		pusher, provName, loadErr = deps.loadBillingProvider(billingCfg, deps.getenv, store, log)
+		if loadErr != nil {
+			return fmt.Errorf("meterd: load billing provider: %w", loadErr)
 		}
 		// Empty STRIPE_API_KEY on a Stripe box is a soft-warn today
 		// (pushUsageRecordSDKSum returns an error per call, the loop
