@@ -48,19 +48,6 @@ func arrayServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// stringServer returns a server that responds with `"x"` to every
-// request. Used for string-returning methods.
-func stringServer(t *testing.T) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `"x"`)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
-}
-
 // bytesServer returns a server that responds with raw bytes.
 // Used for []byte-returning methods.
 func bytesServer(t *testing.T) *httptest.Server {

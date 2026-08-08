@@ -14,6 +14,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -106,7 +107,7 @@ func TestMemStore_TransferOrgOwnership_SameAccount(t *testing.T) {
 	t.Parallel()
 	m, ctx, owner, org := memOrgFixture(t)
 	err := m.TransferOrgOwnership(ctx, org.ID, owner.ID, owner.ID)
-	if err != ErrOrgLastOwner {
+	if !errors.Is(err, ErrOrgLastOwner) {
 		t.Errorf("err = %v, want ErrOrgLastOwner", err)
 	}
 }
@@ -124,7 +125,7 @@ func TestMemStore_TransferOrgOwnership_ToAlreadyOwner(t *testing.T) {
 	}
 	m.mu.Unlock()
 	err := m.TransferOrgOwnership(ctx, org.ID, owner.ID, other.ID)
-	if err != ErrOrgLastOwner {
+	if !errors.Is(err, ErrOrgLastOwner) {
 		t.Errorf("err = %v, want ErrOrgLastOwner (target already owner)", err)
 	}
 }
