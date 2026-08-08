@@ -321,3 +321,184 @@ func TestPGBackend_PickSingleDeployment_ByteIdenticalToLegacy(t *testing.T) {
 		t.Errorf("distinct instances = %d, want 3 (single-deployment round-robin)", len(seen))
 	}
 }
+
+// TestPGBackend_Pick_ColdBucketSignalsHandler (issue #556 PR-C):
+// when the weighted stride picks a deployment whose targetSet is
+// empty (cold), PickResult.ColdBucket must equal that deploymentID
+// and OK must be false — the handler will then call Admit(appID,
+// ColdBucket) to wake it. The cold-bucket fallback must NOT silently
+// re-route to a sibling with instances — that defeats the operator's
+// stated ratio.
+//
+// Pre-PR-C behaviour would have routed to the largest non-empty
+// sibling in this scenario. The new contract: signal the handler,
+// let the handler decide whether to wake the cold bucket or 503.
+func TestPGBackend_Pick_ColdBucketSignalsHandler(t *testing.T) {
+	sched := gateway.NewFakeScheduler("node-A").WithDeploymentID("dep-A")
+	store := &fakeWeightsStore{rows: map[string][]gateway.DeploymentWeightsRow{
+		"app-1": {
+			{ID: "dep-A", TrafficPercent: 25},
+			{ID: "dep-B", TrafficPercent: 75},
+		},
+	}}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil).WithStore(store)
+	if err := b.RefreshDeploymentWeights(context.Background(), "app-1"); err != nil {
+		t.Fatalf("RefreshDeploymentWeights: %v", err)
+	}
+	// Seed ONLY dep-A with 2 instances. dep-B is the cold bucket
+	// that the weighted stride will land on ~75% of the time.
+	for i := 0; i < 2; i++ {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
+			t.Fatalf("Admit #%d: %v", i+1, err)
+		}
+	}
+
+	// Drive enough picks that the stride hits dep-B at least once.
+	// 25/75 means expected 75/100 of 200 = 150 cold hits. With 200
+	// picks the cold case fires reliably. PR-C's contract: the
+	// legacy cold-bucket fallback is preserved (Target points to
+	// the warm sibling), AND ColdBucket signals the handler which
+	// deployment the picker actually landed on. The handler then
+	// decides whether to wake the cold bucket.
+	coldHits := 0
+	warmHits := 0
+	for i := 0; i < 200; i++ {
+		res := b.Pick("app-1")
+		if res.ColdBucket != "" {
+			coldHits++
+			if res.ColdBucket != "dep-B" {
+				t.Errorf("cold Pick #%d = ColdBucket %q, want dep-B", i, res.ColdBucket)
+			}
+			if res.Picked != "dep-B" {
+				t.Errorf("cold Pick #%d = Picked %q, want dep-B", i, res.Picked)
+			}
+			// Legacy fallback: Target points to dep-A (the only
+			// warm sibling). The handler reads ColdBucket to know
+			// the operator's intended destination.
+			if !res.OK || res.Target.DeploymentID != "dep-A" {
+				t.Errorf("cold Pick #%d = Target{%+v} OK=%v, want OK=true DepID=dep-A (legacy fallback)", i, res.Target, res.OK)
+			}
+			continue
+		}
+		warmHits++
+		if !res.OK {
+			t.Errorf("warm Pick #%d !OK without ColdBucket", i)
+		}
+		if res.Target.DeploymentID != "dep-A" {
+			t.Errorf("warm Pick #%d = DeploymentID %q, want dep-A", i, res.Target.DeploymentID)
+		}
+	}
+	if coldHits == 0 {
+		t.Fatalf("expected cold hits on dep-B in 200 picks (75%% target), got 0")
+	}
+	if warmHits == 0 {
+		t.Fatalf("expected warm hits on dep-A in 200 picks (25%% target), got 0")
+	}
+	t.Logf("cold=%d warm=%d (ratio ~3:1, matches 75:25)", coldHits, warmHits)
+}
+
+// TestPGBackend_Pick_Implicit100_OnlyOnEmptyWeights (issue #556
+// PR-C): the implicit-100% synthesis in Admit must fire ONLY when
+// picker.weights is empty (legacy pre-PR-B apps with no notify
+// arrival yet). If the picker already has a weight table and Admit
+// is called for a deployment not in the table, the synthesis must
+// NOT clobber the real table with a single 100% entry.
+//
+// This pins the bonus-cleanup narrowing at pgbackend.go:717-720.
+// Pre-PR-C behaviour would have synthesised an implicit 100% on
+// the cold bucket, masking a misconfigured app's real weight
+// table.
+func TestPGBackend_Pick_Implicit100_OnlyOnEmptyWeights(t *testing.T) {
+	// Real weight table has dep-A only at 100%. The cold bucket
+	// the picker doesn't know about is dep-B.
+	sched := gateway.NewFakeScheduler("node-A").WithDeploymentID("dep-A")
+	store := &fakeWeightsStore{rows: map[string][]gateway.DeploymentWeightsRow{
+		"app-1": {{ID: "dep-A", TrafficPercent: 100}},
+	}}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil).WithStore(store)
+	if err := b.RefreshDeploymentWeights(context.Background(), "app-1"); err != nil {
+		t.Fatalf("RefreshDeploymentWeights: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+			t.Fatalf("Admit #%d: %v", i+1, err)
+		}
+	}
+
+	// Admit on dep-B — the picker doesn't know dep-B. Pre-PR-C
+	// would have synthesised an implicit 100% on dep-B, clobbering
+	// the real weight table. PR-C narrows the synthesis so the
+	// real table survives.
+	sched.WithDeploymentID("dep-B")
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", 5); err != nil {
+		t.Fatalf("Admit on dep-B: %v", err)
+	}
+
+	// 20 picks: every one must still go to dep-A (the real weight
+	// table). If the synthesis had clobbered, ~half would land on
+	// the dep-B bucket (which now has 1 instance).
+	for i := 0; i < 20; i++ {
+		res := b.Pick("app-1")
+		if !res.OK {
+			t.Fatalf("Pick #%d !OK (ColdBucket=%q, Picked=%q) — real weight table was clobbered", i, res.ColdBucket, res.Picked)
+		}
+		if res.Target.DeploymentID != "dep-A" {
+			t.Errorf("Pick #%d = DeploymentID %q, want dep-A (implicit-100 must not clobber a real weight table)", i, res.Target.DeploymentID)
+		}
+	}
+}
+
+// TestPGBackend_RefreshDeploymentWeights_PrunesStaleSets (issue
+// #556 PR-C): after a deployment is removed from the live weight
+// table, RefreshDeploymentWeights must drop its empty targetSet
+// from picker.sets. Without this prune, HealthyCount over-counts
+// and the picker carries phantom buckets indefinitely (no
+// instance_changed notify will arrive for a superseded deployment).
+func TestPGBackend_RefreshDeploymentWeights_PrunesStaleSets(t *testing.T) {
+	sched := gateway.NewFakeScheduler("node-A").WithDeploymentID("dep-A")
+	store := &fakeWeightsStore{rows: map[string][]gateway.DeploymentWeightsRow{
+		"app-1": {
+			{ID: "dep-A", TrafficPercent: 50},
+			{ID: "dep-B", TrafficPercent: 50},
+		},
+	}}
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil).WithStore(store)
+	if err := b.RefreshDeploymentWeights(context.Background(), "app-1"); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, _, _, err := b.Admit(context.Background(), "app-1", "", 10); err != nil {
+			t.Fatalf("Admit #%d: %v", i+1, err)
+		}
+	}
+	if got := b.HealthyCount("app-1"); got != 3 {
+		t.Fatalf("HealthyCount pre-supersede = %d, want 3", got)
+	}
+
+	// Simulate dep-B being superseded: the live weight table now
+	// contains only dep-A. dep-B's targetSet is empty (no
+	// instance_changed will arrive after supersession).
+	store.rows["app-1"] = []gateway.DeploymentWeightsRow{{ID: "dep-A", TrafficPercent: 100}}
+	if err := b.RefreshDeploymentWeights(context.Background(), "app-1"); err != nil {
+		t.Fatalf("post-supersede refresh: %v", err)
+	}
+
+	// HealthyCount must drop to dep-A's 3 instances — the empty
+	// dep-B set must have been pruned. Pre-PR-C would have
+	// counted dep-B's empty set, inflating the total.
+	if got := b.HealthyCount("app-1"); got != 3 {
+		t.Errorf("HealthyCount post-supersede = %d, want 3 (empty dep-B set must be pruned)", got)
+	}
+
+	// Picks must all land on dep-A (single-deployment fast path
+	// post-supersede, byte-identical to legacy single-deployment).
+	for i := 0; i < 5; i++ {
+		res := b.Pick("app-1")
+		if !res.OK {
+			t.Fatalf("Pick #%d !OK post-supersede: ColdBucket=%q Picked=%q", i, res.ColdBucket, res.Picked)
+		}
+		if res.Target.DeploymentID != "dep-A" {
+			t.Errorf("Pick #%d = DeploymentID %q, want dep-A", i, res.Target.DeploymentID)
+		}
+	}
+}
