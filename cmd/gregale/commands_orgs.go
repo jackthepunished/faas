@@ -35,6 +35,16 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 )
 
+// orgSlugRe is the compiled OrgSlugPattern (pkg/api/errors.go:787)
+// used by validateOrgsUpdateFlags. Compiled once at package init
+// instead of recompiled on every CLI invocation — a CLI that
+// loops over hundreds of orgs in a script would otherwise pay the
+// regex-parse cost per call. Hoisted to a package var (mirrors
+// how pkg/api/registry_auth.go exposes RegistryHostRe()) so a
+// malformed api.OrgSlugPattern panics at CLI start, not at the
+// first validateOrgsUpdateFlags call.
+var orgSlugRe = regexp.MustCompile(api.OrgSlugPattern)
+
 // cmdOrgs dispatches `gregale orgs <subcommand>`. The top-level
 // fan-out mirrors the existing webhooks/crons dispatcher shape so
 // the customer sees the same `list|create|info|rm` + nested
@@ -935,7 +945,7 @@ func validateOrgsUpdateFlags(slug, name, plan *string) bool {
 		PrintUsage(os.Stderr, "usage: gregale orgs update --org <slug> [--name <text>] [--plan <free|hobby|pro|scale>]", "orgs")
 		return false
 	}
-	if !regexp.MustCompile(api.OrgSlugPattern).MatchString(*slug) {
+	if !orgSlugRe.MatchString(*slug) {
 		printErr("Invalid --org", fmt.Errorf("must match OrgSlugPattern (lowercase, dashes, 3..32 chars); got %q", *slug))
 		return false
 	}

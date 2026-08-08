@@ -68,7 +68,6 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -513,28 +512,25 @@ func renderArchiveTerminal(w http.ResponseWriter, flusher http.Flusher, reason s
 }
 
 // archiveTerminalForError maps an S3 GetObject error into the
-// terminal reason vocabulary. *Permanent → archive_missing
-// (S3 returned 4xx — either NoSuchKey for a real archive gap,
-// or AccessDenied for a credentials drift). Anything else →
-// archive_degraded (5xx, network, gzip pipe error).
+// terminal reason vocabulary. nil → archive_complete.
+// logarchive.IsPermanent → archive_missing (S3 returned 4xx —
+// either NoSuchKey for a real archive gap, or AccessDenied for
+// a credentials drift; either way the customer can't fix it
+// client-side, so we surface it as missing rather than a
+// degraded retry storm). Anything else → archive_degraded
+// (5xx, network, gzip pipe error).
+//
+// The full error chain lives in
+// /var/log/faas/gatewayd-internal.log under the same code the
+// operator greps for; the SSE wire envelope carries only the
+// reason vocabulary so the SDK decoder can branch on a closed
+// set.
 func archiveTerminalForError(err error) string {
 	if err == nil {
 		return "archive_complete"
 	}
 	if logarchive.IsPermanent(err) {
-		// 4xx — surface as missing so the SDK's branch on
-		// archive_missing prompts a "no logs for that day"
-		// UX rather than a degraded retry storm. A real
-		// AccessDenied stays as missing because the customer
-		// can't fix it client-side anyway.
 		return "archive_missing"
-	}
-	// Trim the package prefix so the wire payload stays
-	// compact. The full error chain lives in
-	// /var/log/faas/gatewayd-internal.log under the same
-	// code the operator greps for.
-	if !strings.HasPrefix(err.Error(), "logarchive:") {
-		return "archive_degraded"
 	}
 	return "archive_degraded"
 }
