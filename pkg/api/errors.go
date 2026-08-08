@@ -199,6 +199,14 @@ const (
 	// builder below) so a script can compute the raise amount
 	// without parsing prose.
 	CodeAdmissionRefused = "admission_refused"
+	// CodeExportRateLimited marks a GET /v1/account/export that
+	// landed inside the per-account 24h rate window (issue #755 /
+	// PR-5.1). Distinct from CodeQuotaExhausted (plan-level monthly
+	// usage cap, 429) and CodePlanLimitConcur (per-app concurrency,
+	// 429) — this is a self-imposed abuse-mitigation on a GDPR
+	// endpoint, not a billing gate. Maps to HTTP 429 + Retry-After:
+	// the window is 24h so the retry hint is in seconds-until-reset.
+	CodeExportRateLimited = "export_rate_limited"
 	CodeUnauthorized     = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
@@ -844,7 +852,7 @@ func StatusForCode(code string) int {
 	switch code {
 	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
 		return http.StatusForbidden
-	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached:
+	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached, CodeExportRateLimited:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
@@ -1196,6 +1204,28 @@ func ErrAdmissionRefused(observedCents, capCents int64) *Problem {
 			observedCents, capCents)).
 		WithLimit(capCents, observedCents).
 		WithDocs(docsBase + "/billing#spend-cap")
+}
+
+// ErrExportRateLimited is returned by GET /v1/account/export when
+// the account has already served an export inside the 24h rate
+// window (issue #755 / PR-5.1). 429 + Retry-After: the wire carries
+// seconds-until-reset so a well-behaved SDK can back off without
+// re-parsing the body. distinct from CodeQuotaExhausted (plan-level
+// monthly usage, 429) and CodePlanLimitConcur (per-app concurrency,
+// 429): this is a self-imposed abuse-mitigation on a GDPR endpoint,
+// not a billing gate, so the human-readable Title is "export rate
+// limited" rather than "quota exhausted". retryAfterS is bounded at
+// 1 second (matches the ErrWaitForWarm convention) so the wire
+// always emits a positive Retry-After.
+func ErrExportRateLimited(retryAfterS int) *Problem {
+	if retryAfterS <= 0 {
+		retryAfterS = 1
+	}
+	return NewProblem(http.StatusTooManyRequests, CodeExportRateLimited,
+		"Export rate limited",
+		"Only one account export is allowed per 24h window; retry after the indicated back-off.").
+		WithHeader("Retry-After", fmt.Sprintf("%d", retryAfterS)).
+		WithDocs("https://docs.gregale.dev/gdpr#export-rate-limit")
 }
 
 // ErrInternal is the catch-all 500 envelope for handler-side failures

@@ -65,6 +65,29 @@ func makeNotifier(rec *recordingNotifier) func(context.Context, string, string) 
 	}
 }
 
+// recordingAuditor captures every Emit so the test can assert the
+// audit row was emitted (issue #755 / PR-5.5). Minimal interface
+// match: grace.Auditor is a 4-method interface and this satisfies it
+// without pulling in the apid auditor concrete type.
+type recordingAuditor struct {
+	mu          sync.Mutex
+	kinds       []string
+	accountIDs  []string
+	data        []map[string]any
+}
+
+func (r *recordingAuditor) Emit(_ context.Context, kind string, accountID *string, data map[string]any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.kinds = append(r.kinds, kind)
+	acctID := ""
+	if accountID != nil {
+		acctID = *accountID
+	}
+	r.accountIDs = append(r.accountIDs, acctID)
+	r.data = append(r.data, data)
+}
+
 // runOnceInterval is the Interval passed to params() in tests that
 // drive RunOnce directly. RunOnce never reads the ticker Interval,
 // so any positive value works; one hour is the same value Run would
@@ -702,4 +725,85 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// TestRunOnce_EmitsAccountDeletedAudit (issue #755 / PR-5.5).
+// After DeleteAccount fires, the sweep must Emit one
+// "account.deleted" audit row carrying actor=source=grace-sweep
+// and the deleted account's email. The audit row is what the
+// audit_log table backfills at DeleteAccount-time so the regulator
+// can re-derive the post-deletion state.
+func TestRunOnce_EmitsAccountDeletedAudit(t *testing.T) {
+	store := state.NewMemStore()
+	mailer := &recordingSender{}
+	notif := &recordingNotifier{}
+	audit := &recordingAuditor{}
+	acct := seedAccount(t, store)
+	if err := store.MarkAccountDeletionPending(context.Background(), acct.ID); err != nil {
+		t.Fatalf("MarkAccountDeletionPending: %v", err)
+	}
+
+	future := time.Now().Add(31 * 24 * time.Hour)
+	g := grace.New(grace.Params{
+		Store:    store,
+		Mailer:   mailer,
+		Now:      nowFrozen(future),
+		Interval: runOnceInterval,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Notif:    makeNotifier(notif),
+		Audit:    audit,
+	})
+	if err := g.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(audit.kinds) != 1 {
+		t.Fatalf("audit emissions = %d, want 1: kinds=%v", len(audit.kinds), audit.kinds)
+	}
+	if audit.kinds[0] != "account.deleted" {
+		t.Errorf("audit kind = %q, want \"account.deleted\"", audit.kinds[0])
+	}
+	if audit.accountIDs[0] != acct.ID {
+		t.Errorf("audit account_id = %q, want %q", audit.accountIDs[0], acct.ID)
+	}
+	if got := audit.data[0]["actor"]; got != "grace-sweep" {
+		t.Errorf("audit data.actor = %v, want \"grace-sweep\"", got)
+	}
+	if got := audit.data[0]["source"]; got != "grace-sweep" {
+		t.Errorf("audit data.source = %v, want \"grace-sweep\"", got)
+	}
+	if got := audit.data[0]["email"]; got != acct.Email {
+		t.Errorf("audit data.email = %v, want %q", got, acct.Email)
+	}
+}
+
+// TestRunOnce_NoAuditEmittedWhenNothingDeleted (issue #755 / PR-5.5).
+// A no-op sweep (no rows past grace) must NOT emit account.deleted —
+// the audit log is for actual deletions, not for "sweep ran and saw
+// nothing". This guards against a regression where the Emit was
+// hoisted out of the post-DeleteAccount block.
+func TestRunOnce_NoAuditEmittedWhenNothingDeleted(t *testing.T) {
+	store := state.NewMemStore()
+	mailer := &recordingSender{}
+	notif := &recordingNotifier{}
+	audit := &recordingAuditor{}
+	// Account exists in 'active' state — never marked for deletion.
+	_ = seedAccount(t, store)
+
+	g := grace.New(grace.Params{
+		Store:    store,
+		Mailer:   mailer,
+		Now:      time.Now,
+		Interval: runOnceInterval,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Notif:    makeNotifier(notif),
+		Audit:    audit,
+	})
+	if err := g.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(audit.kinds) != 0 {
+		t.Errorf("audit emissions on no-op sweep = %v, want none", audit.kinds)
+	}
 }

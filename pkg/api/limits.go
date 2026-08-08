@@ -33,6 +33,26 @@ const (
 // and for deterministic tests — do not reorder.
 var Plans = []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
 
+// GDPR self-service export rate limit (issue #755 / PR-5.1). Single
+// global value (not per-plan) because the cost is per-bundle (one
+// export scans every per-account table) and the abuse case is
+// "customer hits the endpoint once a minute". A plan-tiered version
+// would invite gaming — a Free customer hitting Pro's 5x window
+// would cost the same as a Pro customer. 24h was chosen to match the
+// DPA §7 30-day sub-processor notice window's "half-life" cadence —
+// the export bundle contains sub-processor references, so the
+// window should comfortably exceed a customer re-reading the
+// sub-processor list inside one sub-processor-change cycle.
+//
+// ExportRateLimitWindow is the lookback window; ExportRateLimitWindowSeconds
+// is the integer-seconds expression of the same value, used for the
+// Retry-After header when no prior export is found in the ledger
+// (the upper bound the wire will advertise).
+const (
+	ExportRateLimitWindow         = 24 * time.Hour
+	ExportRateLimitWindowSeconds = int(24 * time.Hour / time.Second)
+)
+
 // Limits is the full quota/limit set for one plan. Every field has a spec
 // reference. Add a field here (never a literal elsewhere) when a new limit
 // appears, and cover it in limits_test.go.

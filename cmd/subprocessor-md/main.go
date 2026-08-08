@@ -140,7 +140,7 @@ func render(cat catalog) string {
 	var b []byte
 	b = append(b, []byte("# Sub-processors\n\n")...)
 	b = append(b, []byte("<!-- GENERATED — do not edit by hand; regenerate with `make subprocessor-md`. -->\n\n")...)
-	b = append(b, []byte(fmt.Sprintf("Single source of truth: [`docs/compliance/subprocessors.json`](subprocessors.json).\n\n"))...)
+	b = append(b, []byte("Single source of truth: [`docs/compliance/subprocessors.json`](subprocessors.json).\n\n")...)
 	b = append(b, []byte(fmt.Sprintf("> **Notice window:** Processor shall notify Controller at least\n> **%d days** before adding a new sub-processor. Controller may\n> object on reasonable data-protection grounds; the parties shall\n> work in good faith to resolve the objection before the change\n> takes effect (%s). The %d-day window is enforced by the\n> `subprocessor-check` CI gate (PR-3): every new sub-processor\n> entry must carry a `notice_published_at` timestamp that is at\n> least %d days older than `effective_date` before the operator\n> can deploy the change.\n\n",
 		cat.NoticeWindowDays, cat.DPAReference, cat.NoticeWindowDays, cat.NoticeWindowDays))...)
 

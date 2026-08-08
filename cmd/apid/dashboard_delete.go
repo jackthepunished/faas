@@ -109,13 +109,13 @@ func (s *server) dashboardExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Mirror the REST endpoint's ?include_secrets=false flag.
-	include := r.URL.Query().Get("include_secrets") != "false"
+	include := r.URL.Query().Get("include_secrets") != includeSecretsFalse
 	bundle, err := gatherExport(r.Context(), s, acct, include)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not assemble export"))
 		return
 	}
-	if !s.recordGdprRequest(r.Context(), acct, state.GdprActionExport) {
+	if !s.recordGdprRequest(r.Context(), acct, state.GdprActionExport, middleware.RequestIDFrom(r)) {
 		w.Header().Set("X-Audit-Logged", "false")
 	}
 	w.Header().Set("Content-Type", "application/json")

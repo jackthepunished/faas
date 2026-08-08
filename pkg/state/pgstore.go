@@ -11248,12 +11248,16 @@ func (s *PgStore) AppendGdprRequest(ctx context.Context, r GdprRequest) error {
 	if r.RequestedAt.IsZero() {
 		r.RequestedAt = time.Now().UTC()
 	}
+	// Empty request_id round-trips as NULL so the partial unique
+	// index (gdpr_requests_request_id_idx) excludes it from the
+	// index entirely — a NULL request_id is the "no inbound id"
+	// path, distinct from a real id.
 	_, err := s.pool.Exec(ctx,
 		`insert into gdpr_requests
-		   (id, account_id, account_email, action, requested_at, completed_at)
-		 values ($1, $2, $3, $4, $5, $6)`,
+		   (id, account_id, account_email, action, requested_at, completed_at, request_id)
+		 values ($1, $2, $3, $4, $5, $6, nullif($7, ''))`,
 		r.ID, r.AccountID, r.AccountEmail, string(r.Action),
-		r.RequestedAt.UTC(), nullableTimestamptz(r.CompletedAt))
+		r.RequestedAt.UTC(), nullableTimestamptz(r.CompletedAt), r.RequestID)
 	return err
 }
 
@@ -11266,7 +11270,7 @@ func (s *PgStore) ListGdprRequestsForAccount(ctx context.Context, accountID stri
 		return nil, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, account_email, action, requested_at, completed_at
+		`select id, account_id, account_email, action, requested_at, completed_at, request_id
 		   from gdpr_requests
 		  where account_id = $1
 		  order by requested_at desc
@@ -11282,7 +11286,7 @@ func (s *PgStore) ListGdprRequestsForAccount(ctx context.Context, accountID stri
 			completedAt pgtype.Timestamptz
 		)
 		if err := rows.Scan(&g.ID, &g.AccountID, &g.AccountEmail,
-			&g.Action, &g.RequestedAt, &completedAt); err != nil {
+			&g.Action, &g.RequestedAt, &completedAt, &g.RequestID); err != nil {
 			return nil, err
 		}
 		if completedAt.Valid {
@@ -11291,6 +11295,62 @@ func (s *PgStore) ListGdprRequestsForAccount(ctx context.Context, accountID stri
 		out = append(out, g)
 	}
 	return out, rows.Err()
+}
+
+// CountGdprRequestsSince is the rate-limit probe for
+// GET /v1/account/export (issue #755 / PR-5.1). Returns how many
+// (account_id, action) ledger rows landed at or after since. The
+// gdpr_requests_account_action_idx partial index covers the
+// (account_id, action, requested_at desc) prefix so this is an
+// index-only count even for accounts with long export histories.
+// limit=0 callers should pass since=time.Now() and check >1.
+func (s *PgStore) CountGdprRequestsSince(ctx context.Context, accountID, action string, since time.Time) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*)::int
+		   from gdpr_requests
+		  where account_id = $1
+		    and action = $2
+		    and requested_at >= $3`,
+		accountID, action, since.UTC()).Scan(&n)
+	return n, err
+}
+
+// FindGdprRequestByRequestID is the idempotency probe for
+// GET /v1/account/export (issue #755 / PR-5.2). Returns the most
+// recent ledger row matching (account_id, request_id) when one
+// exists, or ErrNotFound when it does not. Backed by the partial
+// index gdpr_requests_request_id_idx so the lookup is O(log n)
+// even for accounts with millions of legacy rows where most
+// request_ids are NULL (NULL rows are excluded by the WHERE
+// clause). Returns (zero, ErrNotFound) when no row matches.
+func (s *PgStore) FindGdprRequestByRequestID(ctx context.Context, accountID, requestID string) (GdprRequest, error) {
+	if requestID == "" {
+		return GdprRequest{}, ErrNotFound
+	}
+	var (
+		g           GdprRequest
+		completedAt pgtype.Timestamptz
+	)
+	err := s.pool.QueryRow(ctx,
+		`select id, account_id, account_email, action, requested_at, completed_at, request_id
+		   from gdpr_requests
+		  where account_id = $1
+		    and request_id = $2
+		  order by requested_at desc
+		  limit 1`, accountID, requestID).
+		Scan(&g.ID, &g.AccountID, &g.AccountEmail,
+			&g.Action, &g.RequestedAt, &completedAt, &g.RequestID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GdprRequest{}, ErrNotFound
+		}
+		return GdprRequest{}, err
+	}
+	if completedAt.Valid {
+		g.CompletedAt = completedAt.Time
+	}
+	return g, nil
 }
 
 // nullableTimestamptz returns a pgx-friendly NULL when t.IsZero(), so

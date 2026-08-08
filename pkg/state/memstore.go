@@ -8692,6 +8692,74 @@ func (m *MemStore) CompleteGdprRequest(_ context.Context, accountID, action stri
 	return ErrNotFound
 }
 
+// CountGdprRequestsSince mirrors PgStore.CountGdprRequestsSince for
+// the in-memory implementation. PR-5.1 / issue #755 — the rate-limit
+// probe on GET /v1/account/export. Locks once, scans the slice
+// backwards so the most-recent row is checked first (an account
+// that has exported today will hit the limit faster than walking
+// the slice in order).
+func (m *MemStore) CountGdprRequestsSince(_ context.Context, accountID, action string, since time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sinceUTC := since.UTC()
+	n := 0
+	for i := len(m.gdprRequests) - 1; i >= 0; i-- {
+		r := &m.gdprRequests[i]
+		if r.AccountID != accountID || r.Action != GdprAction(action) {
+			continue
+		}
+		if r.RequestedAt.Before(sinceUTC) {
+			// Slice is requested_at-ascending (AppendGdprRequest
+			// pushes to the tail), so anything older than since
+			// can be skipped wholesale — early exit.
+			break
+		}
+		n++
+	}
+	return n, nil
+}
+
+// FindGdprRequestByRequestID mirrors PgStore.FindGdprRequestByRequestID
+// for the in-memory implementation. PR-5.2 / issue #755 — the
+// idempotency probe for X-Request-Id retries on GET /v1/account/export.
+// Walks the slice backwards so the most-recent row (the one we want to
+// honor for a retry) is checked first. Empty requestID is a no-op
+// that returns ErrNotFound, matching PgStore.
+func (m *MemStore) FindGdprRequestByRequestID(_ context.Context, accountID, requestID string) (GdprRequest, error) {
+	if requestID == "" {
+		return GdprRequest{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.gdprRequests) - 1; i >= 0; i-- {
+		r := &m.gdprRequests[i]
+		if r.AccountID == accountID && r.RequestID == requestID {
+			return *r, nil
+		}
+	}
+	return GdprRequest{}, ErrNotFound
+}
+
+// BackdateGdprRequestsForTest rewrites the requested_at on every
+// ledger row matching (account_id, action) to the supplied anchor.
+// Test-only seam for the rate-limit roll-forward test
+// (cmd/apid/handlers_account_test.go::TestExportAccount_RateLimit_AllowsAfter24h)
+// — production code MUST NOT call this; the GDPR ledger is append-
+// only and timestamping edits would defeat the audit-trail purpose.
+// Lives on MemStore so the apid-side test can drive a 24h+ window
+// in microseconds without sleeping.
+func (m *MemStore) BackdateGdprRequestsForTest(_ context.Context, accountID string, action GdprAction, when time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	whenUTC := when.UTC()
+	for i := range m.gdprRequests {
+		r := &m.gdprRequests[i]
+		if r.AccountID == accountID && r.Action == action {
+			r.RequestedAt = whenUTC
+		}
+	}
+}
+
 // LoadAndStampLastQuotaWarning mirrors PgStore.LoadAndStampLastQuotaWarning
 // for the in-memory implementation. Same contract:
 //   - First call of the UTC day → (false, nil) and the row's stamp is

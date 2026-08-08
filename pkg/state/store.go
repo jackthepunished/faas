@@ -428,6 +428,24 @@ type Store interface {
 	// after DeleteAccount succeeds so the delete row in the ledger
 	// carries the actual hard-delete timestamp.
 	CompleteGdprRequest(ctx context.Context, accountID, action string) error
+	// CountGdprRequestsSince returns how many ledger rows for
+	// (account_id, action) have requested_at >= since. Backed by an
+	// index-only count on gdpr_requests so the rate-limit check on
+	// GET /v1/account/export (PR-5.1 / issue #755) is O(log n) even
+	// for accounts with long export histories. Used to enforce the
+	// 24h export rate limit — the caller decides the policy window.
+	CountGdprRequestsSince(ctx context.Context, accountID, action string, since time.Time) (int, error)
+	// FindGdprRequestByRequestID returns the most recent ledger row
+	// for (account_id, request_id) when one exists, or
+	// (GdprRequest{}, ErrNotFound) otherwise. Used by the export
+	// handler (PR-5.2 / issue #755) to make X-Request-Id retries
+	// idempotent — the second call returns the original ledger row
+	// (and the handler can re-build the bundle from the same data
+	// sources without a fresh DB scan, or short-circuit to the
+	// cached bundle if one is available). The account_id predicate
+	// is load-bearing: an attacker who learns a request id cannot
+	// probe another account's history.
+	FindGdprRequestByRequestID(ctx context.Context, accountID, requestID string) (GdprRequest, error)
 	ListBuildsForAccount(ctx context.Context, accountID string) ([]Build, error)
 	ListCronsForAccount(ctx context.Context, accountID string) ([]Cron, error)
 	// UsageByAccount aggregates every per-minute usage_minutes row that

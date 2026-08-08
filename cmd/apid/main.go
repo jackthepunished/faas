@@ -332,6 +332,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			Notif: func(ctx context.Context, ch, payload string) error {
 				return srv.notif.Notify(ctx, ch, payload)
 			},
+			Audit: srv.audit, // issue #755 / PR-5.5: emit account.deleted from the sweep
 		})
 		go func() { _ = graceLoop.Run(ctx) }()
 		// Login-token cleanup (issue #165 PR #2, ADR-032). The
