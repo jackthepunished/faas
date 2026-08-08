@@ -279,6 +279,82 @@ func TestMkdirBaseStaging_ParentsRootDir(t *testing.T) {
 	}
 }
 
+// TestMkdirBaseExtraction_RespectsFAAS_BASE_EXTRACT_ROOT — the full
+// OCI layer extraction root override. The production unit ships
+// FAAS_BASE_EXTRACT_ROOT=/srv/fc/base-staging so the extracted tree
+// (which can be gigabytes for a Go toolchain base) lives on disk, not
+// on the 2 GiB /dev/shm tmpfs (imaged ENOSPC crash-loop, 2026-08-05 →
+// 2026-08-06; see pkg/daemonunitspec/imaged.go).
+func TestMkdirBaseExtraction_RespectsFAAS_BASE_EXTRACT_ROOT(t *testing.T) {
+	override := t.TempDir()
+	t.Setenv("FAAS_BASE_EXTRACT_ROOT", override)
+
+	d, err := MkdirBaseExtraction()
+	if err != nil {
+		t.Fatalf("MkdirBaseExtraction: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+
+	rel, err := filepath.Rel(override, d)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	if strings.HasPrefix(rel, "..") {
+		t.Errorf("returned dir %q is not under override root %q (rel=%q)", d, override, rel)
+	}
+	if !strings.HasPrefix(filepath.Base(d), "faas-base-") {
+		t.Errorf("returned dir basename %q does not match faas-base-* pattern", filepath.Base(d))
+	}
+}
+
+// TestMkdirBaseExtraction_ParentsRootDir — the extraction root may
+// point at a path that does not exist yet (fresh /srv/fc/base-staging
+// before the controller creates it). MkdirAll with mode 0755 should
+// create the intermediate dirs.
+func TestMkdirBaseExtraction_ParentsRootDir(t *testing.T) {
+	nested := filepath.Join(t.TempDir(), "fresh", "nested", "extract-root")
+	t.Setenv("FAAS_BASE_EXTRACT_ROOT", nested)
+
+	d, err := MkdirBaseExtraction()
+	if err != nil {
+		t.Fatalf("MkdirBaseExtraction: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+
+	info, err := os.Stat(nested)
+	if err != nil {
+		t.Fatalf("stat created root %s: %v", nested, err)
+	}
+	if !info.IsDir() {
+		t.Errorf("%s is not a directory", nested)
+	}
+	if perm := info.Mode().Perm(); perm != 0o755 {
+		t.Errorf("root dir mode = %o, want 0755", perm)
+	}
+}
+
+// TestMkdirBaseExtraction_UnitFileSetsDiskBackedRoot — the load-bearing
+// default for production lives in the unit files, not in code: the unit
+// ships `Environment=FAAS_BASE_EXTRACT_ROOT=/srv/fc/base-staging` so
+// the full OCI layer extraction bypasses the 2 GiB /dev/shm tmpfs.
+// Pinning the contract here so a future unit-file edit that drops the
+// env var fails CI loudly instead of silently regressing every deploy.
+func TestMkdirBaseExtraction_UnitFileSetsDiskBackedRoot(t *testing.T) {
+	for _, unitPath := range []string{
+		"../../deploy/systemd/faas-imaged.service",
+		"../../deploy/controlplane/systemd/faas-imaged.service",
+	} {
+		body, err := os.ReadFile(unitPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", unitPath, err)
+		}
+		want := "FAAS_BASE_EXTRACT_ROOT=/srv/fc/base-staging"
+		if !strings.Contains(string(body), want) {
+			t.Errorf("%s does not contain %q\n--- unit file ---\n%s", unitPath, want, string(body))
+		}
+	}
+}
+
 // TestMkdirBaseStaging_UnitFileSetsDevShm — the load-bearing default
 // for production lives in deploy/systemd/faas-imaged.service, not in
 // code: the unit ships `Environment=FAAS_BASE_STAGING_ROOT=/dev/shm/faas-base-staging`
