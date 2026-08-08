@@ -499,6 +499,45 @@ func cmdAppsRm(args []string) int {
 // opens the dashboard's repo-picker page (slice 8) where the customer binds
 // the repo + branch; subsequent pushes auto-deploy via the webhook path.
 //
+// buildCreateRequest stamps the issue #737 / ADR-083 fields onto the
+// CreateAppRequest the CLI hands to apid. Two non-obvious fields:
+//
+//   - Type: shapeFunction → "function", else "" (apid treats empty
+//     as "app"). Without this, apid stores the row as type=app and
+//     the multipart validator at cmd/apid/deploy_inputs.go:144
+//     rejects the function deploy.
+//
+//   - Runtime: only set when resolvedShape == shapeFunction AND
+//     runtime is non-empty. apid's buildApp validator at
+//     cmd/apid/handlers.go:98 requires Runtime to be in the function
+//     whitelist on a function-typed app; an empty Runtime trips a
+//     400 between the "Detected: function, ..." line and the
+//     multipart upload, which would silently break the headline
+//     auto-detection feature. The auto-detect path always populates
+//     runtime via inferFunctionRuntime before this is called; the
+//     explicit --function --tarball path relies on the explicit
+//     --runtime flag, with --handler defaulting to "handler.handler"
+//     (defaultTemplateHandler, commands2.go:48).
+func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *bool) api.CreateAppRequest {
+	req := api.CreateAppRequest{
+		Slug:         slug,
+		RequireAuthn: requireAuthnPtr,
+	}
+	if sh == shapeFunction {
+		req.Type = "function"
+		if runtime != "" {
+			req.Runtime = runtime
+		}
+	}
+	return req
+}
+
+// cmdDeployTarball implements `gregale deploy` (image / tarball / repo
+// / template / zero-config). Zero-config (issue #313) packs the cwd
+// and proceeds down the --tarball path. Issue #737 / ADR-083 added the
+// function-vs-app auto-detect on the zero-config path and the
+// --function / --app explicit-shape flags.
+//
 // `--template NAME` materializes one of the eleven embedded starter
 // projects (cmd/gregale/templates/embed.go) into a tempdir, tars+gzip it,
 // and proceeds down the --tarball path. For the function templates
@@ -515,6 +554,14 @@ func cmdDeployTarball(args []string) int {
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
+	// Issue #737 / ADR-083: explicit shape override. Without either flag
+	// the CLI auto-detects from the cwd (handler.*-only → function,
+	// otherwise app). With --function or --app, detection is skipped.
+	// Mutually exclusive — silently mixing is exactly the bug this ADR
+	// fixes. The --function path requires --runtime (or accepts the
+	// default "handler.handler" wire value if --handler is unset).
+	function := fs.Bool("function", false, "deploy as a function (single handler.* file); skips cwd auto-detection")
+	app := fs.Bool("app", false, "deploy as an app (Railpack framework); skips cwd auto-detection and clears --runtime/--handler")
 	// Phase 3 (repo decomposition) — one-key provision flags. Presence
 	// of --only or --project-slug short-circuits the existing CreateApp
 	// + DeployTarball path and routes through ScanProject →
@@ -554,6 +601,29 @@ func cmdDeployTarball(args []string) int {
 	if *requireAuthn && *noRequireAuthn {
 		return printErr("Invalid flags", fmt.Errorf("--require-authn and --no-require-authn are mutually exclusive"))
 	}
+	// Issue #737 / ADR-083: --function and --app are mutually exclusive.
+	// Setting both is ambiguous noise; reject before any side effects so
+	// the customer's first response from the CLI is not a silent shape
+	// pick. Mirrors the --require-authn/--no-require-authn check above.
+	if *function && *app {
+		return printErr("Invalid flags", fmt.Errorf("--function and --app are mutually exclusive"))
+	}
+	// --app clears any --runtime/--handler the customer also set. The
+	// customer intended an app deploy; passing function fields is
+	// either a typo or a leftover from a copy-paste, and silently
+	// mixing is exactly the bug this ADR fixes. We still surface the
+	// result so a confused customer can diagnose.
+	if *app && (*runtime != "" || *handler != "") {
+		PrintProgress(os.Stderr, "WARN: --app clears --runtime=%q and --handler=%q (function fields are ignored on app deploys)", *runtime, *handler)
+		*runtime = ""
+		*handler = ""
+	}
+	// --function without --runtime is allowed: the wire defaults to
+	// "handler.handler" (matches the function-* template convention at
+	// defaultTemplateHandler, line 48). What --function REQUIRES is
+	// for the customer's source to actually be a function — handled
+	// below when detectShape runs (or, for the --tarball path, when
+	// apid's function-runtime whitelist rejects it).
 	// fs.Visit distinguishes "unset" from "explicit zero": if the
 	// customer passed either --require-authn or --no-require-authn
 	// (but not both — checked above), we propagate the bool to the
@@ -620,7 +690,7 @@ func cmdDeployTarball(args []string) int {
 			// Default Node runtime is node22 (per docs/runtimes/go124.md
 			// tier-1 stance: no default-flip in the same PR that adds a
 			// new runtime). Use function-node24 for the Node 24 variant.
-			*runtime = "node22"
+			*runtime = runtimeNode22
 			*handler = defaultTemplateHandler
 		case "function-node24":
 			// Tier 1 PR 1 row: parallel to function-node, runtime is
@@ -632,7 +702,7 @@ func cmdDeployTarball(args []string) int {
 		case "function-python":
 			// Default Python runtime is python312 (no default-flip in
 			// Tier 1; python313 stays opt-in via function-python313).
-			*runtime = "python312"
+			*runtime = runtimePython312
 			*handler = defaultTemplateHandler
 		case "function-python313":
 			// Tier 1 PR 1 row: parallel to function-python, runtime
@@ -646,7 +716,7 @@ func cmdDeployTarball(args []string) int {
 			// manifest locks the entrypoint to /app/handler). We set
 			// a non-empty value so the multipart writer doesn't skip
 			// the field, but the value is never read by the runtime.
-			*runtime = "go124"
+			*runtime = runtimeGo124
 			*handler = "handler.go"
 		}
 		f, err := os.CreateTemp("", "gregale-template-*.tar.gz")
@@ -677,28 +747,90 @@ func cmdDeployTarball(args []string) int {
 	// set --dockerfile when a Dockerfile is at the root. --repo returned
 	// earlier and --template already set *tarball, so reaching here with both
 	// *image and *tarball empty means the customer gave no source at all.
+	// Issue #737 / ADR-083: resolved shape from cwd auto-detection or
+	// the explicit --function/--app short-circuit. Defaults to
+	// shapeApp so a --tarball / --image / --template deploy (no cwd
+	// pack) stays on the existing app-shaped path. The CreateApp call
+	// below reads resolvedShape and sets Type="function" on the wire
+	// only when the cwd path picked function mode — explicit
+	// --function/--app outside the cwd pack also write to
+	// resolvedShape via this variable in the same branch.
+	var resolvedShape = shapeApp
+	// Issue #737 / ADR-083: explicit --function / --app on a
+	// --tarball / --template path skips the cwd detector (no cwd
+	// pack happens), but still flips resolvedShape so CreateApp
+	// sends Type="function" when the customer asked for it. Without
+	// this branch, `gregale deploy --tarball my.tgz --function` would
+	// still create an app-type app row.
+	if *function {
+		resolvedShape = shapeFunction
+		// Default the wire --handler to the function-template
+		// convention so a customer who runs `gregale deploy
+		// --tarball my.tgz --function --runtime node22` without
+		// --handler gets the same shape as
+		// `gregale --template function-node --tarball my.tgz`.
+		// Without this, apid's function validator rejects the
+		// empty handler form field with a 400.
+		if *handler == "" {
+			*handler = defaultTemplateHandler
+		}
+	} else if *app {
+		resolvedShape = shapeApp
+	}
 	if *image == "" && *tarball == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return printErr("Could not read current directory", err)
 		}
-		path, fw, n, err := autoPackCwd(cwd)
+		// Issue #737 / ADR-083: resolveDeployShape does detect +
+		// infer + print in one seam so the unit test can drive the
+		// "Detected:" line without bringing up apid. The print goes
+		// BEFORE the multipart upload so the customer's first
+		// response from the CLI is the deploy shape. An explicit
+		// --function / --app short-circuits the detector — see the
+		// mutex block above.
+		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
 		if err != nil {
-			return printErr("Could not pack current directory", err)
+			return printErr("No deployable source found in "+filepath.Base(cwd), err)
 		}
-		defer func() { _ = os.Remove(path) }()
-		if fw == fwUnknown {
-			return printErr("No deployable source found in "+filepath.Base(cwd),
-				errors.New("expected package.json, requirements.txt / pyproject.toml / "+
-					"Pipfile / setup.py, go.mod, or Dockerfile at the project root — "+
-					"or pass --image, --tarball, --template, or --repo"))
+		switch detected {
+		case shapeFunction:
+			// An explicit --runtime / --handler on the CLI wins over
+			// the inferred value (customer may be overriding the
+			// default-extension→runtime map). The helper already
+			// printed "Detected: function, runtime=<rt>, handler=<h>"
+			// using the inferred values; the wire uses whatever is
+			// in *runtime / *handler here.
+			if *runtime == "" {
+				*runtime = rt
+			}
+			if *handler == "" {
+				*handler = hnd
+			}
+			// Pack the cwd so the multipart upload has a tarball —
+			// the function convention needs the file on the wire for
+			// imaged to stage it.
+			path, _, n, err := autoPackCwd(cwd)
+			if err != nil {
+				return printErr("Could not pack current directory", err)
+			}
+			defer func() { _ = os.Remove(path) }()
+			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+			*tarball = path
+			resolvedShape = shapeFunction
+		case shapeApp:
+			path, fw, n, err := autoPackCwd(cwd)
+			if err != nil {
+				return printErr("Could not pack current directory", err)
+			}
+			defer func() { _ = os.Remove(path) }()
+			if fw == fwDocker {
+				*dockerfile = true
+			}
+			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+			*tarball = path
+			resolvedShape = shapeApp
 		}
-		if fw == fwDocker {
-			*dockerfile = true
-		}
-		PrintProgress(os.Stderr, "detected %s project in %s, packing %d file(s)",
-			fw, filepath.Base(cwd), n)
-		*tarball = path
 	}
 
 	client, err := authedClientWithDeployTimeout(5 * time.Minute)
@@ -783,10 +915,8 @@ func cmdDeployTarball(args []string) int {
 		return 0
 	}
 
-	if _, err := client.CreateApp(ctx, api.CreateAppRequest{
-		Slug:         slug,
-		RequireAuthn: requireAuthnPtr,
-	}); err != nil {
+	createReq := buildCreateRequest(slug, resolvedShape, *runtime, requireAuthnPtr)
+	if _, err := client.CreateApp(ctx, createReq); err != nil {
 		var ae *APIError
 		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
 			return printErr("Could not create app", err)
