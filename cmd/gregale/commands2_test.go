@@ -1272,3 +1272,108 @@ func TestMapFailureMessage_BuildLimitsDocsLinks(t *testing.T) {
 		}
 	})
 }
+
+// TestCmdOpenDocs pins the open docs subcommand (Tier A8.1):
+//   - positional slug resolves to /cli/<slug>
+//   - --slug flag resolves to /cli/<slug>
+//   - empty slug resolves to the docs root (not /cli/app —
+//     sanitizeSlugForURL's empty-input fallback is bypassed here)
+//   - two positionals is rejected
+//   - unknown flag is rejected (via flag.ContinueOnError)
+//
+// All assertions use --json so the test stays hermetic (no
+// browser.Open invocation). Each subtest gets its own captureStdout
+// because the helper does not expose a Reset (the buffer is the
+// only state, so a fresh capture per case is the cleanest pattern).
+func TestCmdOpenDocs(t *testing.T) {
+	// Enable --json for the duration of the test. jsonOutput is
+	// package-global; without this restore, a follow-on test in
+	// the same binary would inherit JSON mode.
+	oldJSON := jsonOutput
+	jsonOutput = true
+	defer func() { jsonOutput = oldJSON }()
+
+	cases := []struct {
+		name        string
+		args        []string
+		wantCode    int
+		wantURLFrag string
+		wantSlug    string
+	}{
+		{"positional_slug", []string{"apps"}, 0, "/cli/apps", "apps"},
+		{"flag_slug", []string{"--slug", "queue"}, 0, "/cli/queue", "queue"},
+		// "open docs" with no args at all resolves to the docs
+		// root, NOT /cli/app. This is the smoke-test case that
+		// catches the bug where sanitizeSlugForURL("") falls back
+		// to "app" instead of "".
+		{"no_args_resolves_to_root", []string{}, 0, "https://docs.gregale.dev", ""},
+		// Two positionals is rejected (the docs subcommand takes
+		// at most one positional).
+		{"two_positional_rejected", []string{"a", "b"}, 1, "", ""},
+		// Unknown flag is rejected with the docs topic in the
+		// PrintUsage call.
+		{"unknown_flag_rejected", []string{"--nope"}, 1, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, restoreOut := captureStdout(t)
+			defer restoreOut()
+			code := cmdOpenDocs(tc.args)
+			if code != tc.wantCode {
+				t.Errorf("cmdOpenDocs(%v) code = %d, want %d", tc.args, code, tc.wantCode)
+			}
+			if tc.wantCode != 0 {
+				// On error, no JSON envelope expected — the
+				// function exits via PrintUsage / PrintFail,
+				// both of which write to stderr (captured
+				// separately if needed).
+				return
+			}
+			var got struct {
+				Slug string `json:"slug"`
+				URL  string `json:"url"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("decode JSON: %v\noutput: %s", err, stdout.String())
+			}
+			if got.Slug != tc.wantSlug {
+				t.Errorf("slug = %q, want %q", got.Slug, tc.wantSlug)
+			}
+			if !strings.Contains(got.URL, tc.wantURLFrag) {
+				t.Errorf("url = %q, want it to contain %q", got.URL, tc.wantURLFrag)
+			}
+		})
+	}
+}
+
+// TestCmdOpenDocs_DispatchesFromCmdOpen pins the wiring: `cmdOpen`
+// must route `docs` to cmdOpenDocs and pass the remaining args.
+// We invoke cmdOpen directly with the args; the test substitutes
+// osStdout (cmdOpenDocs's JSON path) so we can decode the wire
+// shape end-to-end.
+func TestCmdOpenDocs_DispatchesFromCmdOpen(t *testing.T) {
+	oldJSON := jsonOutput
+	jsonOutput = true
+	defer func() { jsonOutput = oldJSON }()
+
+	stdout, restoreOut := captureStdout(t)
+	defer restoreOut()
+
+	code := cmdOpen([]string{"docs", "queue"})
+	if code != 0 {
+		t.Errorf("cmdOpen(docs queue) = %d, want 0", code)
+	}
+	var got struct {
+		Slug string `json:"slug"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON: %v\noutput: %s", err, stdout.String())
+	}
+	if got.Slug != "queue" {
+		t.Errorf("slug = %q, want %q", got.Slug, "queue")
+	}
+	if !strings.Contains(got.URL, "/cli/queue") {
+		t.Errorf("url = %q, want it to contain /cli/queue", got.URL)
+	}
+}

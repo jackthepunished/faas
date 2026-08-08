@@ -406,6 +406,9 @@ var cliCommands = []cliCommand{
 		Name:    "open",
 		DocSlug: "open",
 		Short:   "Open the app's URL (or its dashboard page) in your browser",
+		Subcommands: []cliSub{
+			{Name: "docs", Short: "Open a CLI docs page (open docs [<slug>])"},
+		},
 	},
 	{
 		Name:    "orgs",

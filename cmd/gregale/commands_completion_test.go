@@ -601,6 +601,7 @@ func extractPrintUsageTopics() ([]printUsageSite, error) {
 		"invocationCmdDocsTopic": "invocations",
 		"completionDocsTopic":    "completion",
 		"manDocsTopic":           "man",
+		"docsOpenTopic":          "open",
 	}
 
 	entries, err := os.ReadDir(".")
