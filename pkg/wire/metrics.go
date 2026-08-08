@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
+	"github.com/onebox-faas/faas/pkg/gateway/writegate"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -1039,14 +1040,11 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_write_redirect_total",
 		Help: "Count of write requests the cmd/gatewayd-internal writeGate classified (Tier A9 / ADR-084). outcome ∈ {relayed, redirect_307, same_box, cookie_blocked, leader_unreachable, loop_prevented, mTLS_failure, error}; auth_kind ∈ {bearer, cookie, anonymous}. The closed label sets keep TSDB cardinality bounded — see pkg/gateway/writegate for the classification rules.",
 	}, []string{"outcome", "auth_kind"})
-	writeRedirectOutcomes := []string{
-		"relayed", "redirect_307", "same_box", "cookie_blocked",
-		"leader_unreachable", "loop_prevented", "mTLS_failure", "error",
-	}
-	writeRedirectAuthKinds := []string{"bearer", "cookie", "anonymous"}
+	writeRedirectOutcomes := writegate.AllWriteOutcomes
+	writeRedirectAuthKinds := writegate.AllAuthKinds
 	for _, outcome := range writeRedirectOutcomes {
 		for _, kind := range writeRedirectAuthKinds {
-			writeRedirectTotal.WithLabelValues(outcome, kind)
+			writeRedirectTotal.WithLabelValues(string(outcome), string(kind))
 		}
 	}
 	// writeRedirectLatency (Tier A9 / ADR-084). Buckets sized for

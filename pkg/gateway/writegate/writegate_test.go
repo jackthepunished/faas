@@ -27,7 +27,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -100,6 +99,14 @@ func TestIsCarveOutPath_Allowlist(t *testing.T) {
 		CarveOutOAuthGoogleCB,
 		CarveOutOAuthGitHubCB,
 	}
+	// Drift guard: if the production map size diverges from the
+	// test's local list, fail loud (review finding #6 of PR #761).
+	// Adding a constant without updating the map (or vice versa)
+	// surfaces immediately at `go test` time.
+	if len(unauthenticatedCarveOuts) != len(allowlist) {
+		t.Fatalf("carve-out drift: map has %d entries, allowlist slice has %d",
+			len(unauthenticatedCarveOuts), len(allowlist))
+	}
 	for _, p := range allowlist {
 		if !IsCarveOutPath(p) {
 			t.Errorf("IsCarveOutPath(%q) = false, want true (allowlist drift!)", p)
@@ -147,6 +154,19 @@ func TestAuthKindOf_Bearer(t *testing.T) {
 		// Trailing whitespace is preserved by net/http; the
 		// HasPrefix check accepts the trailing-space variant.
 		"Bearer ",
+		// Bare "Bearer" with no trailing space / no token — a
+		// malformed Authorization header some HTTP clients emit
+		// when the token is empty. Review finding #4 of PR #761:
+		// must classify as bearer so the cross-box hop is taken
+		// (rather than the anonymous carve-out path, which would
+		// be a security-relevant regression). apid's auth chain
+		// rejects the empty token downstream with 401.
+		"Bearer",
+		"bearer",
+		"BEARER",
+		// Leading whitespace — net/http preserves it; we
+		// TrimSpace before the scheme check.
+		"  Bearer abc123",
 	}
 	for _, h := range cases {
 		r := httptest.NewRequest(http.MethodPost, "/v1/apps", nil)
@@ -353,20 +373,48 @@ func TestIsWriteRequest_NonApidPathsFalse(t *testing.T) {
 // Anchored-root regression — the existing
 // cmd/gatewayd-internal/proxy.go `isApidPath` predicate
 // explicitly rejects `/v1.zip` (an nginx-style filename
-// collision). PR-A's placeholder predicate accepts `/v1.zip`
-// as a prefix-match on `/v1`; PR-B refines it. The test
-// pins the regression so PR-B doesn't drop it during the
-// extract.
+// collision). PR-A's `apidPathMatch` mirrors the production
+// `hasApidPrefix` discipline (writegate.go:299-308), so this
+// regression is now closed at the source. The test pins it so
+// a future refactor that strips the anchor discipline is
+// caught at `go test` time.
 //
-// This is a known-known PR-A limitation. The test names the
-// failure mode in the t.Errorf message so the PR-B review
-// surfaces it as "FIXME before merge".
+// This test now asserts (not t.Skip) — the previous
+// t.Skip-based tripwire was a known anti-pattern (review
+// finding #1 of PR #761). PR-B's refinement is already in
+// PR-A via the full `hasApidPrefix` copy.
 func TestIsWriteRequest_AnchoredRootRegression(t *testing.T) {
-	r := httptest.NewRequest(http.MethodPost, "/v1.zip", nil)
-	if !IsWriteRequest(r) {
-		t.Skip("FIXME PR-B: refine apidPathMatch to reject /v1.zip; this test currently passes only after PR-B's fix lands")
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// Collision filenames: PR #180's review finding #6.
+		{"/v1.zip", false},
+		{"/dashboardfoo", false},
+		{"/loginfoo", false},
+		{"/signupfoo", false},
+		{"/logoutfoo", false},
+		{"/cli-authfoo", false},
+		{"/statusfoo", false},
+		{"/healthzfoo", false},
+		// These ARE valid (anchored at "/" boundary).
+		{"/v1", true},
+		{"/v1/", true},
+		{"/dashboard", true},
+		{"/dashboard/", true},
+		{"/login", true},
+		{"/login/", true},
+		// New auth roots from PR #180.
+		{"/login/forgot", true},
+		{"/auth/verify", true},
+		{"/auth/reset", true},
 	}
-	t.Logf("anchored-root regression currently passes — PR-B's refinement is already applied")
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, c.path, nil)
+		if got := IsWriteRequest(r); got != c.want {
+			t.Errorf("IsWriteRequest(POST %s) = %v, want %v", c.path, got, c.want)
+		}
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -378,15 +426,19 @@ func TestApidPathMatch_AllBranches(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/v1/apps", true},
+		// Anchored roots — exact + "/" subtree form.
+		{"/v1", true},
 		{"/v1/", true},
+		{"/v1/apps", true},
 		{"/v1/auth/login", true},
 		{"/dashboard", true},
 		{"/dashboard/", true},
 		{"/login", true},
-		{"/login/oauth", true},
+		{"/login/", true},
+		{"/login/forgot", true}, // PR #180 new root
 		{"/signup", true},
-		{"/auth/login", true},
+		{"/auth/verify", true}, // PR #180 new root
+		{"/auth/reset", true},  // PR #180 new root
 		{"/oauth/callback", true},
 		{"/logout", true},
 		{"/cli-auth", true},
@@ -399,7 +451,9 @@ func TestApidPathMatch_AllBranches(t *testing.T) {
 		{"/fn/foo", false},
 		{"/static/app.js", false},
 		{"/metrics", false},
-		{"/v1.zip", false}, // PR-B regression pin
+		{"/v1.zip", false}, // anchored-root regression
+		{"/auth/login", false},
+		{"/oauth", false}, // bare /oauth — see comment in apidPathMatch
 		{"", false},
 	}
 	for _, c := range cases {
@@ -552,15 +606,21 @@ func TestAuthKind_LabelsUnique(t *testing.T) {
 // LoopGuardSentinel must be the exact wire header name; if
 // this changes, the §12 dashboard's `request_header{header=...}`
 // queries silently break. Pin it.
+//
+// Round-trip through http.CanonicalHeaderKey to confirm the
+// constant survives net/http's canonicalization unchanged (the
+// production code at writegate.go:280 uses
+// `r.Header[http.CanonicalHeaderKey(LoopGuardSentinel)]` for
+// the loop-guard lookup — a constant whose canonical form
+// differs from its literal value would silently miss loop
+// attempts). Review finding #7 of PR #761.
 func TestLoopGuardSentinelStable(t *testing.T) {
 	const want = "X-Faas-Forwarded-Leader"
 	if LoopGuardSentinel != want {
 		t.Fatalf("LoopGuardSentinel = %q, want %q (dashboard query regression)", LoopGuardSentinel, want)
 	}
-	// The sentinel name must be lowercase-able by net/http's
-	// canonical form (no underscores, no special chars beyond
-	// hyphens). Confirm no surprise casing.
-	if strings.ToLower(LoopGuardSentinel) == LoopGuardSentinel {
-		t.Errorf("LoopGuardSentinel is lowercase; net/http canonicalizes to Title-Case and tests will diverge")
+	if got := http.CanonicalHeaderKey(LoopGuardSentinel); got != want {
+		t.Fatalf("CanonicalHeaderKey(%q) = %q, want %q (loop-guard map lookup would miss)",
+			LoopGuardSentinel, got, want)
 	}
 }

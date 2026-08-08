@@ -123,6 +123,32 @@ const (
 	OutcomeError WriteOutcome = "error"
 )
 
+// AllWriteOutcomes is the closed slice of every WriteOutcome
+// value. The pkg/wire pre-instantiation loops over this slice
+// to seed every (outcome, auth_kind) label combination at boot
+// (review finding #5 of PR #761: the label vocabulary MUST be
+// imported from this package, not re-declared as raw strings
+// in metrics.go — a drift here silently breaks the §12 PromQL
+// `outcome=~"..."` regex matcher).
+//
+// Order matches the Outcome* constants above. Adding a new
+// value requires:
+//  1. Appending the constant to the block above.
+//  2. Appending it here.
+//  3. Documenting it in docs/faas_implementation_spec.md §12.
+//
+// The compile will fail in pkg/wire if step 1 ≠ step 2.
+var AllWriteOutcomes = []WriteOutcome{
+	OutcomeRelayed,
+	OutcomeRedirect307,
+	OutcomeSameBox,
+	OutcomeCookieBlocked,
+	OutcomeLeaderUnreachable,
+	OutcomeLoopPrevented,
+	OutcomeMTLSFailure,
+	OutcomeError,
+}
+
 // AuthKind is the closed label set for the
 // `<prefix>_write_redirect_total{auth_kind=...}` counter.
 //
@@ -138,6 +164,15 @@ const (
 	AuthCookie    AuthKind = "cookie"
 	AuthAnonymous AuthKind = "anonymous"
 )
+
+// AllAuthKinds is the closed slice of every AuthKind value.
+// See AllWriteOutcomes for the rationale on closed-slice
+// pre-instantiation; the same drift-prevention rule applies.
+var AllAuthKinds = []AuthKind{
+	AuthBearer,
+	AuthCookie,
+	AuthAnonymous,
+}
 
 // unauthenticatedCarveOuts is the closed allowlist of paths that
 // are mutations (POST/PUT/PATCH/DELETE) but MUST run locally even
@@ -175,13 +210,13 @@ const (
 // goconst lint will catch a missed map entry). The order
 // matches the allowlist ordering in writegate_test.go.
 const (
-	CarveOutWebhookStripe     = "/v1/webhooks/stripe"
-	CarveOutWebhookPaddle     = "/v1/webhooks/paddle"
-	CarveOutCLIAuthCode       = "/v1/cli-auth/code"
-	CarveOutCLIAuthExchange   = "/v1/cli-auth/exchange"
-	CarveOutCLIAuthRoot       = "/cli-auth"
-	CarveOutOAuthGoogleCB     = "/v1/auth/google/callback"
-	CarveOutOAuthGitHubCB     = "/v1/auth/github/callback"
+	CarveOutWebhookStripe   = "/v1/webhooks/stripe"
+	CarveOutWebhookPaddle   = "/v1/webhooks/paddle"
+	CarveOutCLIAuthCode     = "/v1/cli-auth/code"
+	CarveOutCLIAuthExchange = "/v1/cli-auth/exchange"
+	CarveOutCLIAuthRoot     = "/cli-auth"
+	CarveOutOAuthGoogleCB   = "/v1/auth/google/callback"
+	CarveOutOAuthGitHubCB   = "/v1/auth/github/callback"
 )
 
 // The allowlist is intentionally small (7 entries) and stable;
@@ -241,8 +276,19 @@ func IsWriteMethod(method string) bool {
 // which auth kind is in play so the cross-box hop carries the
 // right headers (Authorization) and the cookie-only path emits
 // the right error response.
+//
+// Scheme matching accepts both `Bearer <token>` and bare `Bearer`
+// (no trailing space, no token) so a malformed `Authorization: Bearer`
+// header — which some HTTP clients emit when the token is empty —
+// is still classified as AuthBearer. Classifying it as anonymous
+// would route an otherwise-bearer request through the
+// unauthenticated cross-box path, which is a security-relevant
+// regression (review finding #4 of PR #761). The bare-Bearer
+// request will still 401 at apid's auth chain because the empty
+// token is rejected downstream — the gate's job is only to
+// classify, not authenticate.
 func AuthKindOf(r *http.Request) AuthKind {
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(h), "bearer ") {
+	if h := strings.TrimSpace(r.Header.Get("Authorization")); strings.HasPrefix(strings.ToLower(h), "bearer") {
 		return AuthBearer
 	}
 	if c, err := r.Cookie("faas_sid"); err == nil && c != nil {
@@ -307,38 +353,77 @@ func IsWriteRequest(r *http.Request) bool {
 	return apidPathMatch(r.URL.Path)
 }
 
-// apidPathMatch is the PR-A placeholder for the apid-bound
-// predicate. PR-B replaces this with the full predicate extracted
-// from cmd/gatewayd-internal/proxy.go (preserving the regression
-// coverage in cmd/gatewayd-internal/proxy_test.go and the new
-// writegate_test.go).
-//
-// For PR-A's classification tests, the predicate accepts anything
-// starting with /v1/, /dashboard, /login, /signup, /auth/, /oauth/,
-// /logout, /cli-auth, /healthz, /status, /cli-auth (mirroring the
-// documented apid surface in cmd/gatewayd-internal/proxy.go:11-23).
-func apidPathMatch(path string) bool {
-	switch {
-	case strings.HasPrefix(path, "/v1/"):
-		return true
-	case strings.HasPrefix(path, "/dashboard"):
-		return true
-	case strings.HasPrefix(path, "/login"):
-		return true
-	case strings.HasPrefix(path, "/signup"):
-		return true
-	case strings.HasPrefix(path, "/auth/"):
-		return true
-	case strings.HasPrefix(path, "/oauth/"):
-		return true
-	case strings.HasPrefix(path, "/logout"):
-		return true
-	case strings.HasPrefix(path, "/cli-auth"):
-		return true
-	case strings.HasPrefix(path, "/status"):
-		return true
-	case strings.HasPrefix(path, "/healthz"):
+// apidRoot constants mirror the production `isApidPath` anchored
+// roots at cmd/gatewayd-internal/proxy.go:235-247. The list is
+// exhaustive for the apid public surface (issue #85) — anything
+// outside falls through to the wake/proxy path (which 404s for
+// legitimate apid traffic, so missing entries are loud bugs that
+// tests will catch immediately). PR-A intentionally mirrors the
+// full list, not a placeholder, so the writeGate is correct on
+// day one — PR-B will switch to importing the production
+// constants directly (a subsequent refactor; both files share
+// the constant values verbatim so the switch is a one-line
+// import).
+const (
+	apidRootV1          = "/v1"
+	apidRootDashboard   = "/dashboard"
+	apidRootOAuthPrefix = "/oauth/"
+	apidRootLogin       = "/login"
+	apidRootSignup      = "/signup"
+	apidRootLoginForgot = "/login/forgot"
+	apidRootAuthVerify  = "/auth/verify"
+	apidRootAuthReset   = "/auth/reset"
+	apidRootLogout      = "/logout"
+	apidRootStatus      = "/status"
+	apidRootHealthz     = "/healthz"
+	apidRootCliAuth     = "/cli-auth"
+)
+
+// hasApidPrefix reports whether p begins with prefix anchored at
+// the trailing slash — p matches if it is exactly prefix, or
+// prefix followed by "/", or prefix followed by "/" and then
+// more path. This prevents accidental shadowing like "/v1.zip"
+// matching "/v1" — review finding #6 from the dashboard era.
+// Mirrors cmd/gatewayd-internal/proxy.go:172-177 verbatim; PR-B
+// will switch this to a direct import.
+func hasApidPrefix(p, prefix string) bool {
+	if p == prefix || p == prefix+"/" {
 		return true
 	}
-	return false
+	return strings.HasPrefix(p, prefix+"/")
+}
+
+// apidPathMatch mirrors cmd/gatewayd-internal/proxy.go:203-229
+// `isApidPath`. The 11 anchored roots cover every apid-bound
+// surface (dashboard, OAuth callbacks, the §4.2 REST API,
+// login/signup/magic-link/password-reset, logout, status,
+// healthz, cli-auth). The /oauth/* prefix is the subtree form
+// only — bare `/oauth` is intentionally rejected (apid 404s
+// either way, but pinning the rejection in tests defends against
+// an accidental future expansion).
+//
+// PR-B replaces this function with the production one — both
+// share the same constant block so the switch is a one-line
+// import. Until then, the duplication is intentional (PR-A
+// ships the predicate in a fully-correct form so the writeGate
+// is right from day one; review finding #3 of PR #761).
+func apidPathMatch(p string) bool {
+	for _, root := range []string{
+		apidRootV1,
+		apidRootDashboard,
+		apidRootLogin,
+		apidRootSignup,
+		apidRootLoginForgot,
+		apidRootAuthVerify,
+		apidRootAuthReset,
+		apidRootLogout,
+		apidRootStatus,
+		apidRootHealthz,
+		apidRootCliAuth,
+	} {
+		if hasApidPrefix(p, root) {
+			return true
+		}
+	}
+	return strings.HasPrefix(p, apidRootOAuthPrefix)
 }
