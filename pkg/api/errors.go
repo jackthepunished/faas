@@ -246,7 +246,18 @@ const (
 	// AEAD-bound AccountID disagrees with the sessions row. AEAD
 	// forgery on the same key ought to be unreachable; if it ever
 	// fires the operator should investigate the key-sealing path.
-	CodeSessionInvalid    = "session_invalid"
+	CodeSessionInvalid = "session_invalid"
+	// CodeUnsupportedByCLI is returned by the SDK client when a caller
+	// targets an API route that requires the dashboard session cookie
+	// (e.g. /v1/auth/sessions, /v1/auth/capabilities). The bearer-key
+	// CLI cannot reach these routes — they are mounted behind
+	// sessionAuth (cmd/apid/server.go:1097) and reject 401 on a
+	// bearer header. The guard in pkg/api/client.go lifts this into
+	// a clean 403 before the request is even issued so the failure
+	// mode is honest, not a confusing auth error. See
+	// pkg/api/client.go's cookieOnlyPathRE and the tripwire in
+	// pkg/api/lint_tripwires_test.go.
+	CodeUnsupportedByCLI  = "unsupported_by_cli"
 	CodeDomainNotVerified = "domain_not_verified"
 	CodeCronInvalid       = "cron_invalid"
 	CodeAlertRuleInvalid  = "alert_rule_invalid"
@@ -881,6 +892,15 @@ func StatusForCode(code string) int {
 		// 403 — the deploy is REJECTED at accept time, distinct from
 		// CodeSigInvalid's 503 (which fires on the cold-boot layer-verify
 		// path). See CodeDeploySignatureInvalid declaration above.
+		return http.StatusForbidden
+	case CodeUnsupportedByCLI:
+		// 403 — the cookie-only-route guard (pkg/api/client.go)
+		// rejected the path before issuing the request. 403 is
+		// the closest sibling to CodeDeploySignatureInvalid's
+		// "this caller cannot complete this action" semantic.
+		// Companion to CodeSessionExpired (401) which is the
+		// server-side mirror for a cookie that WAS sent but is
+		// gone.
 		return http.StatusForbidden
 	case CodeImageNotFound, CodeImageManifestInvalid:
 		return http.StatusUnprocessableEntity

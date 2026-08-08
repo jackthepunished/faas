@@ -603,6 +603,7 @@ func cmdDeployTarball(args []string) int {
 	// request path; we just thread the pointer through.
 	trafficPercent := fs.Int("traffic-percent", -1, "split weight for this deployment (0-100, Pro/Scale only; -1 = server default 100)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME | --template NAME", "deploy")
 		return 1
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
@@ -1647,6 +1648,7 @@ func cmdInvoices(args []string) int {
 	before := fs.String("before", "", "pagination cursor (RFC3339Nano)")
 	limit := fs.Int("limit", 25, "page size (1..100)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale invoices [--month YYYY-MM] [--before C] [--limit N]", "invoices")
 		return 1
 	}
 	client, err := authedClient()
@@ -1774,7 +1776,25 @@ func cmdConnect(args []string) int {
 // cmdOpen implements `gregale open <slug>`. Looks up the app's URL via
 // the v1 API and launches the OS browser. With --dashboard, opens
 // the dashboard's app-detail page instead of the public URL.
+//
+// Subcommands (Tier A8.1):
+//   - docs [--slug <slug>]
+//     Opens docs.gregale.dev/cli/<slug> (or the top-level
+//     docs.gregale.dev when no slug is given) in the default
+//     browser. No API call needed — the docs site is the
+//     canonical help surface and is reachable without an
+//     authenticated session.
+//
+// The subcommand dispatch happens BEFORE the flag parse so the
+// docs subcommand's own flags (--slug) don't collide with the
+// parent `open` flags (--dashboard). The first positional arg
+// selects the subcommand; everything after is forwarded.
 func cmdOpen(args []string) int {
+	// Subcommand dispatch: when the first positional is `docs`,
+	// hand off to cmdOpenDocs with the remaining args.
+	if len(args) > 0 && args[0] == "docs" {
+		return cmdOpenDocs(args[1:])
+	}
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
 	dash := fs.Bool("dashboard", false, "open the dashboard page instead of the live URL")
 	if err := fs.Parse(args); err != nil {
@@ -1819,6 +1839,94 @@ func cmdOpen(args []string) int {
 		default:
 			_, _ = fmt.Fprintln(osStdout, "App is warm — opening.")
 		}
+	}
+	_, _ = fmt.Fprintf(osStdout, "Opening %s\n", target)
+	if err := browser.Open(target); err != nil {
+		PrintFail(os.Stderr, "Could not open browser: %v", err)
+		fmt.Fprintf(os.Stderr, "  Open this URL manually:\n  %s\n", target)
+		return 0
+	}
+	return 0
+}
+
+// docsOpenTopic is the docs URL slug for the `open` command's
+// own man page. The `open docs` subcommand (cmdOpenDocs below)
+// does not surface a "Docs:" line because the user is already
+// ON the docs surface; this constant is consumed by PrintUsage
+// when the subcommand's flag parser fails.
+const docsOpenTopic = "open"
+
+// cmdOpenDocs implements `gregale open docs [--slug <slug>]`. Opens
+// the customer-facing CLI docs in the default browser. The docs
+// site is reachable without an authenticated session, so this
+// subcommand does NOT call authedClient — a logged-out customer
+// hitting `gregale open docs apps` (perhaps from a fresh shell)
+// still gets the right page.
+//
+// Slug resolution:
+//   - positional arg: `gregale open docs apps` → /cli/apps
+//   - --slug flag:    `gregale open docs --slug queue` → /cli/queue
+//   - both or neither is an error (mutually exclusive, but at
+//     least one is required — opening the bare docs root would
+//     be confusing; `gregale man` already covers that case).
+//   - empty slug defaults to the docs root (docs.gregale.dev).
+//
+// The DocsTopic constant docsOpenTopic is exposed so the manifest
+// entry below can pin the docs URL slug for the `open` command's
+// own man page.
+func cmdOpenDocs(args []string) int {
+	fs := flag.NewFlagSet("open docs", flag.ContinueOnError)
+	slugFlag := fs.String("slug", "", "docs page slug (e.g. apps, queue, deploy); opens the docs root when empty")
+	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale open docs [<slug>] [--slug <slug>]", docsOpenTopic)
+		return 1
+	}
+	slug := *slugFlag
+	// Positional wins over --slug when both are given: the user
+	// typed the slug directly, so the explicit position is more
+	// intent-revealing than the flag.
+	if fs.NArg() > 0 {
+		if slug != "" && fs.Arg(0) != slug {
+			PrintFail(os.Stderr, "conflicting slug: positional %q vs --slug %q", fs.Arg(0), slug)
+			return 1
+		}
+		slug = fs.Arg(0)
+	}
+	if fs.NArg() > 1 {
+		PrintFail(os.Stderr, "too many positional args (got %d, want 0 or 1)", fs.NArg())
+		return 1
+	}
+	// Slug sanitization — the docs URL is rooted at /cli/<slug>,
+	// so any non-path-safe character (slash, percent, etc.) is
+	// stripped to '_' rather than silently percent-encoded. The
+	// caller gets a path that cannot escape /cli/.
+	safeSlug := sanitizeSlugForURL(slug)
+	// sanitizeSlugForURL returns appSlugFallback ("app") for the
+	// empty string — that's the dashboardAppURL contract (never
+	// produce a bare /dashboard/apps/ path). For docs we want
+	// the opposite: empty slug means "open the docs root", so
+	// re-empty the slug here after sanitization if the caller
+	// supplied no slug at all.
+	if slug == "" {
+		safeSlug = ""
+	}
+	var target string
+	switch safeSlug {
+	case "":
+		// Top-level docs — strips the trailing /cli/ from
+		// docsURLBase so the landing page renders.
+		target = strings.TrimSuffix(docsURLBase, "/cli/")
+	default:
+		target = docsURLBase + safeSlug
+	}
+	if jsonOutput {
+		// JSON path — emit the resolved URL and exit without
+		// touching the browser. Scripting wrappers can pipe the
+		// URL into a curl / xdg-open of their choice.
+		return jsonOut(writeJSON(map[string]string{
+			"url":  target,
+			"slug": safeSlug,
+		}))
 	}
 	_, _ = fmt.Fprintf(osStdout, "Opening %s\n", target)
 	if err := browser.Open(target); err != nil {

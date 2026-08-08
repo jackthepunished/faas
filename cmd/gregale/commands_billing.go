@@ -38,6 +38,7 @@ const (
 func cmdBilling(args []string) int {
 	if len(args) == 0 {
 		printBillingUsage(os.Stderr)
+		PrintUsage(os.Stderr, "usage: gregale billing <subcommand>", "billing")
 		return 1
 	}
 	switch args[0] {

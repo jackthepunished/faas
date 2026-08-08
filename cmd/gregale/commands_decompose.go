@@ -56,6 +56,7 @@ func cmdScan(args []string) int {
 	installID := fs.Int64("install-id", 0, "GitHub install id (with --repo)")
 	prodBranch := fs.String("production-branch", "main", "production branch for the project")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale scan [--tarball P] [--path DIR] [--repo OWNER/NAME]", "scan")
 		return 1
 	}
 

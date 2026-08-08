@@ -805,3 +805,92 @@ func TestStreamAppLogs_URLEscape(t *testing.T) {
 		t.Fatalf("zero-value path mismatch:\n got: %s\nwant: %s", seenZero, want)
 	}
 }
+
+// TestClient_RejectsCookieOnlyPaths pins the cookie-only-route guard.
+// The guard short-circuits any path matching ^/v1/auth/(sessions|
+// capabilities)(/.*)?$ before the HTTP request is issued, returning
+// a *Problem with CodeUnsupportedByCLI and the docs URL. The plan
+// (Tier A8.1) adds this so the bearer-key CLI never silently hits
+// a 401/302 from a route it has no business calling. Mirror of
+// pkg/api/client.go::cookieOnlyPathRE.
+func TestClient_RejectsCookieOnlyPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"sessions_root", "/v1/auth/sessions"},
+		{"sessions_subpath", "/v1/auth/sessions/sess_abc123"},
+		{"capabilities_root", "/v1/auth/capabilities"},
+		{"capabilities_subpath", "/v1/auth/capabilities/refresh"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The handler must never be reached; an error here is
+			// the test failure (the guard fired before http).
+			srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				t.Errorf("server reached for %s — guard should have rejected", tc.path)
+			}))
+			defer srv.Close()
+			c := NewClient(srv.URL, "fp_live_key")
+
+			// Walk through c.do via a public method that targets
+			// the path. Since no such method exists for the
+			// cookie-only routes (intentional — see
+			// pkg/api/client.go:419-428), assert the rejection
+			// directly via the c.do entry point, the same
+			// surface a future SDK author would hit if they
+			// tried to add one. We re-create the call shape
+			// using a synthetic GET against the rejected path.
+			ctx := context.Background()
+			var out map[string]any
+			err := c.do(ctx, http.MethodGet, tc.path, nil, &out)
+
+			// The guard returns *Problem directly (no HTTP round-trip,
+			// so no *APIError wrapping). Assert against *Problem via
+			// errors.As — the Error() method on *Problem makes the
+			// chain errors.As-compatible.
+			var p *Problem
+			if !errors.As(err, &p) {
+				t.Fatalf("expected *Problem, got %T: %v", err, err)
+			}
+			if p.Code != CodeUnsupportedByCLI {
+				t.Errorf("Code = %q, want %q", p.Code, CodeUnsupportedByCLI)
+			}
+			if p.Status != http.StatusForbidden {
+				t.Errorf("Status = %d, want %d", p.Status, http.StatusForbidden)
+			}
+			if p.DocsURL == "" {
+				t.Error("DocsURL is empty — guard must populate the docs URL")
+			}
+			if !strings.Contains(p.DocsURL, "/cli/cookie-only-routes") {
+				t.Errorf("DocsURL = %q, want it to contain /cli/cookie-only-routes", p.DocsURL)
+			}
+		})
+	}
+}
+
+// TestClient_AllowsNonCookieOnlyAuthRoutes guards the inverted policy:
+// the regex must NOT over-match. /v1/auth/logout is the dashboard's
+// session-cookie logout endpoint, but the CLI's `faas logout`
+// (cmd/gregale/commands.go) calls a *different* bearer-key endpoint
+// (PostAccountLogout → /v1/auth/logout). That endpoint is NOT in the
+// cookie-only set, so this test pins the regex boundary.
+func TestClient_AllowsNonCookieOnlyAuthRoutes(t *testing.T) {
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		if r.URL.Path != "/v1/auth/logout" {
+			t.Errorf("server hit at unexpected path %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "fp_live_key")
+	ctx := context.Background()
+	if err := c.PostAccountLogout(ctx); err != nil {
+		t.Fatalf("PostAccountLogout: %v", err)
+	}
+	if !hit {
+		t.Error("server never hit — regex over-matched to /v1/auth/logout")
+	}
+}
