@@ -75,7 +75,7 @@ func cmdCompletion(args []string) int {
 		}
 		return cmdCompletionCacheList(args[1])
 	}
-	fmt.Fprintf(os.Stderr, "gregale completion: unknown subcommand %q (want bash|zsh|fish|powershell)\n", args[0])
+	_, _ = fmt.Fprintf(os.Stderr, "gregale completion: unknown subcommand %q (want bash|zsh|fish|powershell)\n", args[0])
 	return 1
 }
 

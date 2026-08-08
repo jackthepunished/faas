@@ -52,7 +52,7 @@ func cmdMan(args []string) int {
 	case 1:
 		cmd, ok := lookupCliCommand(args[0])
 		if !ok {
-			fmt.Fprintf(os.Stderr, "gregale man: unknown command %q\n", args[0])
+			_, _ = fmt.Fprintf(os.Stderr, "gregale man: unknown command %q\n", args[0])
 			return 1
 		}
 		renderManCommand(osStdout, cmd)
@@ -82,50 +82,50 @@ func renderManTop(w io.Writer) {
 		_, _ = fmt.Fprintln(w, "\\- deploy apps and functions that scale to zero")
 	})
 	manSection(w, "SYNOPSIS", func(w io.Writer) {
-		fmt.Fprintln(w, ".B gregale")
-		fmt.Fprintln(w, ".RI [ command ]")
-		fmt.Fprintln(w, ".RI [ flags ]")
+		_, _ = fmt.Fprintln(w, ".B gregale")
+		_, _ = fmt.Fprintln(w, ".RI [ command ]")
+		_, _ = fmt.Fprintln(w, ".RI [ flags ]")
 	})
 	manSection(w, "DESCRIPTION", func(w io.Writer) {
-		fmt.Fprintln(w, `.PP`)
-		fmt.Fprintln(w, `gregale is the customer-facing CLI for the Gregale FaaS platform.`)
-		fmt.Fprintln(w, `It is the primary interface to the platform; every action the platform`)
-		fmt.Fprintln(w, `supports is reachable from this single binary.`)
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `gregale is the customer-facing CLI for the Gregale FaaS platform.`)
+		_, _ = fmt.Fprintln(w, `It is the primary interface to the platform; every action the platform`)
+		_, _ = fmt.Fprintln(w, `supports is reachable from this single binary.`)
 	})
 	manSection(w, "COMMANDS", func(w io.Writer) {
-		fmt.Fprintln(w, `.PP`)
-		fmt.Fprintln(w, `Run \fBgregale help\fP for the full command list. The most common verbs:`)
-		fmt.Fprintln(w, ".TP")
-		fmt.Fprintln(w, ".BR apps ,", " \\fIalerts\\fP,")
-		fmt.Fprintln(w, ".BR deployments ,", " \\fIregistry\\fP,")
-		fmt.Fprintln(w, ".BR webhooks ,", " \\fIinvocations\\fP,")
-		fmt.Fprintln(w, ".BR crons ,", " \\fIdelayed-task\\fP,")
-		fmt.Fprintln(w, ".BR orgs ,", " \\fIkeys\\fP,")
-		fmt.Fprintln(w, ".BR mfa")
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `Run \fBgregale help\fP for the full command list. The most common verbs:`)
+		_, _ = fmt.Fprintln(w, ".TP")
+		_, _ = fmt.Fprintln(w, ".BR apps ,", " \\fIalerts\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR deployments ,", " \\fIregistry\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR webhooks ,", " \\fIinvocations\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR crons ,", " \\fIdelayed-task\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR orgs ,", " \\fIkeys\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR mfa")
 	})
 	manSection(w, "GLOBAL FLAGS", func(w io.Writer) {
-		fmt.Fprintln(w, ".TP")
-		fmt.Fprintln(w, ".BR \\-\\-json")
-		fmt.Fprintln(w, `Machine-readable output. Equivalent to`)
-		fmt.Fprintln(w, `.B FAAS_JSON=1`)
-		fmt.Fprintln(w, `in the environment.`)
+		_, _ = fmt.Fprintln(w, ".TP")
+		_, _ = fmt.Fprintln(w, ".BR \\-\\-json")
+		_, _ = fmt.Fprintln(w, `Machine-readable output. Equivalent to`)
+		_, _ = fmt.Fprintln(w, `.B FAAS_JSON=1`)
+		_, _ = fmt.Fprintln(w, `in the environment.`)
 	})
 	manSection(w, "EXAMPLES", func(w io.Writer) {
-		fmt.Fprintln(w, `.PP`)
-		fmt.Fprintln(w, `List your apps:`)
-		fmt.Fprintln(w, `.PP`)
-		fmt.Fprintln(w, ".RS 4")
-		fmt.Fprintln(w, `.nf`)
-		fmt.Fprintln(w, `gregale apps`)
-		fmt.Fprintln(w, `.fi`)
-		fmt.Fprintln(w, ".RE")
-		fmt.Fprintln(w, `.PP`)
-		fmt.Fprintln(w, `Deploy from a tarball:`)
-		fmt.Fprintln(w, ".RS 4")
-		fmt.Fprintln(w, ".nf")
-		fmt.Fprintln(w, "gregale deploy --tarball ./app.tar.gz --app my-app")
-		fmt.Fprintln(w, ".fi")
-		fmt.Fprintln(w, ".RE")
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `List your apps:`)
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, ".RS 4")
+		_, _ = fmt.Fprintln(w, `.nf`)
+		_, _ = fmt.Fprintln(w, `gregale apps`)
+		_, _ = fmt.Fprintln(w, `.fi`)
+		_, _ = fmt.Fprintln(w, ".RE")
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `Deploy from a tarball:`)
+		_, _ = fmt.Fprintln(w, ".RS 4")
+		_, _ = fmt.Fprintln(w, ".nf")
+		_, _ = fmt.Fprintln(w, "gregale deploy --tarball ./app.tar.gz --app my-app")
+		_, _ = fmt.Fprintln(w, ".fi")
+		_, _ = fmt.Fprintln(w, ".RE")
 	})
 	manSection(w, "SEE ALSO", func(w io.Writer) {
 		_, _ = fmt.Fprintf(w, ".UR %scompletion\n", docsURLBase)
@@ -173,47 +173,47 @@ func renderManCommand(w io.Writer, c cliCommand) {
 		}
 	})
 	manSection(w, "DESCRIPTION", func(w io.Writer) {
-		fmt.Fprintf(w, ".PP\n%s\n", escapeRoff(c.Short))
+		_, _ = fmt.Fprintf(w, ".PP\n%s\n", escapeRoff(c.Short))
 	})
 	if len(c.Subcommands) > 0 {
 		manSection(w, "SUBCOMMANDS", func(w io.Writer) {
-			fmt.Fprintln(w, ".TP")
+			_, _ = fmt.Fprintln(w, ".TP")
 			for _, s := range c.Subcommands {
-				fmt.Fprintf(w, ".BR %s\n", s.Name)
-				fmt.Fprintf(w, "%s\n", escapeRoff(s.Short))
-				fmt.Fprintln(w, ".TP")
+				_, _ = fmt.Fprintf(w, ".BR %s\n", s.Name)
+				_, _ = fmt.Fprintf(w, "%s\n", escapeRoff(s.Short))
+				_, _ = fmt.Fprintln(w, ".TP")
 			}
 		})
 	}
 	if len(c.Flags) > 0 {
 		manSection(w, "FLAGS", func(w io.Writer) {
-			fmt.Fprintln(w, ".TP")
+			_, _ = fmt.Fprintln(w, ".TP")
 			for _, f := range c.Flags {
 				// Required flags get a "(required)" suffix in the
 				// FLAGS section so a reader scanning for the marker
 				// finds it without cross-referencing the SYNOPSIS.
 				flagHeader := fmt.Sprintf("--%s", f.Name)
 				if f.Req {
-					fmt.Fprintf(w, ".BR %s\n(required)\n", flagHeader)
+					_, _ = fmt.Fprintf(w, ".BR %s\n(required)\n", flagHeader)
 				} else {
-					fmt.Fprintf(w, ".BR %s\n", flagHeader)
+					_, _ = fmt.Fprintf(w, ".BR %s\n", flagHeader)
 				}
-				fmt.Fprintf(w, "%s\n", escapeRoff(f.Short))
+				_, _ = fmt.Fprintf(w, "%s\n", escapeRoff(f.Short))
 				if len(f.ClosedSet) > 0 {
-					fmt.Fprintf(w, "Allowed values: %s.\n", strings.Join(f.ClosedSet, ", "))
+					_, _ = fmt.Fprintf(w, "Allowed values: %s.\n", strings.Join(f.ClosedSet, ", "))
 				}
-				fmt.Fprintln(w, ".TP")
+				_, _ = fmt.Fprintln(w, ".TP")
 			}
 		})
 	}
 	manSection(w, "SEE ALSO", func(w io.Writer) {
-		fmt.Fprintf(w, ".UR %s%s\n", docsURLBase, c.DocSlug)
-		fmt.Fprintf(w, "gregale %s (docs)\n", c.Name)
-		fmt.Fprintln(w, ".UE")
-		fmt.Fprintln(w, ".PP")
-		fmt.Fprintf(w, ".UR %s\n", docsURLBase)
-		fmt.Fprintln(w, "gregale(1) top-level manual")
-		fmt.Fprintln(w, ".UE")
+		_, _ = fmt.Fprintf(w, ".UR %s%s\n", docsURLBase, c.DocSlug)
+		_, _ = fmt.Fprintf(w, "gregale %s (docs)\n", c.Name)
+		_, _ = fmt.Fprintln(w, ".UE")
+		_, _ = fmt.Fprintln(w, ".PP")
+		_, _ = fmt.Fprintf(w, ".UR %s\n", docsURLBase)
+		_, _ = fmt.Fprintln(w, "gregale(1) top-level manual")
+		_, _ = fmt.Fprintln(w, ".UE")
 	})
 	manFooter(w)
 }
@@ -226,14 +226,14 @@ func renderManCommand(w io.Writer, c cliCommand) {
 // renderManCommand via manSection("NAME", ...) — keeping all .SH
 // openings in one place.
 func manHeader(w io.Writer, title, subtitle, source string) {
-	fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregaleVersion, source)
+	_, _ = fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregaleVersion, source)
 	_ = subtitle // subtitle is rendered inside the NAME section body
 }
 
 // manSection writes a section header followed by the body callback.
 // The body callback receives w and emits the roff for the section.
 func manSection(w io.Writer, name string, body func(w io.Writer)) {
-	fmt.Fprintf(w, ".SH %s\n", strings.ToUpper(name))
+	_, _ = fmt.Fprintf(w, ".SH %s\n", strings.ToUpper(name))
 	body(w)
 }
 
@@ -241,7 +241,7 @@ func manSection(w io.Writer, name string, body func(w io.Writer)) {
 // Most renderers add a final newline so the file ends cleanly
 // regardless of how the user pipes the output.
 func manFooter(w io.Writer) {
-	fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w)
 }
 
 // escapeRoff backslash-escapes roff-significant characters. The
