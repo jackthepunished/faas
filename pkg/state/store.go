@@ -1351,6 +1351,14 @@ type Store interface {
 	// successful deploy (an app always has a live snapshot OR a cold-bootable
 	// rootfs — never neither, invariant §6.2-3).
 	LiveDeployment(ctx context.Context, appID string) (Deployment, error)
+	// LiveDeployments (issue #556 / PR-B) returns every live row
+	// for the app, ordered created_at DESC. Empty slice (nil, nil)
+	// when the app has no live deployments — the gateway's
+	// per-deployment weighted picker treats that as "no live
+	// deployment, 503". Backed by the partial index
+	// deployments_live_traffic_idx (migration 00162); MemStore
+	// iterates m.deployments filtered by status='live'.
+	LiveDeployments(ctx context.Context, appID string) ([]Deployment, error)
 	// CountLiveInstancesByDeployment returns the number of instances
 	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
 	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher

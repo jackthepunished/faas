@@ -3838,6 +3838,38 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 	return scanDeploymentWithRootfs(row)
 }
 
+// LiveDeployments (issue #556 / PR-B) returns every row where
+// app_id=$1 AND status='live', ordered created_at DESC. Used by the
+// gateway's per-deployment weighted picker: on every NotifyDeploymentChanged
+// the gateway reads the full live set to rebuild its (deployment_id,
+// traffic_percent) cache. The query is index-only against the
+// deployments_live_traffic_idx partial index added in migration 00162
+// (the INCLUDE clause carries traffic_percent + id so the planner
+// never touches the heap).
+//
+// Returns (nil, nil) when the app has no live rows — the gateway
+// treats that as "no live deployment, 503". Per-row errors during
+// the rows.Next() loop are propagated by scanDeployments via the
+// returned error (no partial result is returned on failure).
+//
+// Determinism note: created_at is the canonical sort key. The
+// (app_id, created_at desc) index from migration 00007 covers the
+// search; the planner switches to deployments_live_traffic_idx when
+// the partial predicate is selective (typical: one or two live rows
+// per app, vs. O(N) total rows).
+func (s *PgStore) LiveDeployments(ctx context.Context, appID string) ([]Deployment, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments
+		 where app_id = $1 and status = 'live'
+		 order by created_at desc`, appID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list live deployments app=%s: %w", appID, err)
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
+}
+
 // CountLiveInstancesByDeployment returns the number of instances in
 // {WAKING, COLD_BOOTING, RUNNING} for the given deployment_id (issue
 // #555 PR-6). The DeploymentCounterWatcher

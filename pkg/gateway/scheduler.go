@@ -160,6 +160,15 @@ func tierFromWakeMethod(m WakeMethod) string {
 // scheddWakeMethodToGateway so this package doesn't have to depend on
 // the protobuf package — the same boundary scheddgrpc.Client already
 // crosses.
+//
+// deploymentID (issue #556 / PR-B) is the live deployment id the new
+// instance was admitted for. The gateway caches it on Target so the
+// per-deployment weighted picker (PGBackend.Pick) routes subsequent
+// requests to the right deployment bucket. Empty on the at-capacity
+// path; "" pre-PR-B for any caller that hasn't been refreshed to
+// thread the field — the gateway treats empty as "single-deployment
+// legacy mode" (Target.DeploymentID empty, picker collapses to
+// today's behaviour).
 type Scheduler interface {
 	// AdmitInstance attempts to admit ONE additional instance for appID
 	// (issue #168). Unlike the legacy Wake primitive, this RPC skips
@@ -167,18 +176,18 @@ type Scheduler interface {
 	// demand a new instance even when others are already running.
 	// Three outcomes:
 	//
-	//   - admitted: instanceID/nodeID/wakeID non-empty, atCapacity=false,
-	//     method reflects what schedd actually did (1 = restore,
-	//     0/2+ = cold boot, see scheddWakeMethodToGateway).
-	//   - at_capacity: instanceID/nodeID/wakeID empty, atCapacity=true.
-	//     The gateway treats this as a benign no-op when it already
-	//     has ≥1 cached target. method is 0.
+	//   - admitted: instanceID/nodeID/deploymentID/wakeID non-empty,
+	//     atCapacity=false, method reflects what schedd actually did
+	//     (1 = restore, 0/2+ = cold boot, see scheddWakeMethodToGateway).
+	//   - at_capacity: instanceID/nodeID/deploymentID/wakeID empty,
+	//     atCapacity=true. The gateway treats this as a benign no-op
+	//     when it already has ≥1 cached target. method is 0.
 	//   - failure: non-nil err. Real admission failures (RAM headroom,
 	//     chooser, store) travel as *api.Problem. The benign
 	//     app_concurrency_reached outcome is NEVER lifted to an error —
 	//     it surfaces as atCapacity=true so the gateway can treat it
 	//     as a no-op. method is 0.
-	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, port int, err error)
+	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error)
 }
 
 // ErrSchedulerUnconfigured is returned by NoopScheduler.AdmitInstance.
@@ -189,8 +198,8 @@ var ErrSchedulerUnconfigured = errors.New("gateway: scheduler not configured (M5
 // need the wake path.
 type NoopScheduler struct{}
 
-func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
-	return "", "", "", 0, false, 0, ErrSchedulerUnconfigured
+func (NoopScheduler) AdmitInstance(context.Context, string) (string, string, string, string, int32, bool, int, error) {
+	return "", "", "", "", 0, false, 0, ErrSchedulerUnconfigured
 }
 
 // FakeScheduler is the in-process scheduler used by handler/cmd/gatewayd
@@ -221,6 +230,13 @@ type FakeScheduler struct {
 	// override port the fake scheduler returns. 0 = legacy 8080
 	// (vmmd wire boundary default). Set via WithPort.
 	port int
+
+	// deploymentID (issue #556 / PR-B) is the deployment id the fake
+	// scheduler returns. Default: empty (the gateway treats that as
+	// "single-deployment legacy mode" — see Target.DeploymentID doc).
+	// Set via WithDeploymentID for tests that exercise the
+	// per-deployment weighted picker.
+	deploymentID string
 
 	// admitsByApp tracks per-app AdmitInstance call counts; useful for the
 	// wake-coalesce + multi-instance tests.
@@ -297,6 +313,17 @@ func (f *FakeScheduler) WithPort(p int) *FakeScheduler {
 	return f
 }
 
+// WithDeploymentID (issue #556 / PR-B) sets the deployment id the
+// fake scheduler reports on AdmitInstance. Default is empty — the
+// gateway treats that as "single-deployment legacy mode" (Target.
+// DeploymentID is empty; the per-deployment picker collapses to
+// today's behaviour). Tests that exercise multi-deployment splits
+// set WithDeploymentID per-admit.
+func (f *FakeScheduler) WithDeploymentID(id string) *FakeScheduler {
+	f.deploymentID = id
+	return f
+}
+
 // Calls returns the number of AdmitInstance() calls made (test assertion hook).
 func (f *FakeScheduler) Calls() int {
 	return int(f.totalCalls.Load())
@@ -309,7 +336,7 @@ func (f *FakeScheduler) AdmitsFor(appID string) int {
 	return f.admitsByApp[appID]
 }
 
-func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, int32, bool, int, error) {
+func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string, string, string, string, int32, bool, int, error) {
 	f.mu.Lock()
 	f.admitsByApp[appID]++
 	latency := time.Duration(f.latencyMs) * time.Millisecond
@@ -322,13 +349,17 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string
 	// Defaults to 0 (legacy 8080 at the wire boundary); tests that
 	// need a non-default port set WithPort.
 	port := f.port
+	// PR-B (issue #556): per-deployment id the gateway caches on
+	// Target. Defaults to empty (legacy single-deployment mode);
+	// tests that exercise the picker set WithDeploymentID.
+	deploymentID := f.deploymentID
 	f.mu.Unlock()
 
 	if latency > 0 {
 		select {
 		case <-time.After(latency):
 		case <-ctx.Done():
-			return "", "", "", 0, false, 0, ctx.Err()
+			return "", "", "", "", 0, false, 0, ctx.Err()
 		}
 	}
 
@@ -356,7 +387,7 @@ func (f *FakeScheduler) AdmitInstance(ctx context.Context, appID string) (string
 	default:
 		rawMethod = WireWakeColdBoot
 	}
-	return instanceID, nodeID, wakeID, rawMethod, false, port, err
+	return instanceID, nodeID, deploymentID, wakeID, rawMethod, false, port, err
 }
 
 // itoa renders a uint64 as a base-10 string without importing strconv into

@@ -452,7 +452,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 			}
 			return cli, true, nil
 		}).
-		WithPublicAuthCache(deps.publicAuthCache)
+		WithPublicAuthCache(deps.publicAuthCache).
+		// Issue #556 / PR-B: wire the per-deployment weight
+		// store so a deployment_changed notify refreshes the
+		// picker's weight table. The adapter translates
+		// state.Deployment to gateway.DeploymentWeightsRow
+		// (the gateway package does not import pkg/state).
+		WithStore(weightsStoreAdapter{store: pgStore})
 
 	// Phase 2 / Gate A: gate the resolveSched legacy fallback on the
 	// active fleet. Single-box posture (only default-local active)
@@ -531,7 +537,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return err
 			}
-			_, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID)
+			_, _, _, _, _, _, _, err = cli.AdmitInstance(ctx, appID)
 			return err
 		},
 		// Move 1: Wake the instance, then route the synthetic
@@ -1255,4 +1261,30 @@ func assertLoopbackBind(addr string) error {
 		return nil
 	}
 	return fmt.Errorf("control listener %q is not loopback; bind 127.0.0.1:9090 (or ::1) only", addr)
+}
+
+// weightsStoreAdapter (issue #556 / PR-B) adapts pkg/state.PgStore to
+// the gateway.deploymentWeightsStore seam. The gateway package
+// deliberately does NOT import pkg/state (same shape as Router above)
+// so the hot-path picker has no Postgres dependency surface in tests;
+// this adapter lives on the gatewayd-internal side where the
+// pkg/state import already exists. It translates state.Deployment to
+// gateway.DeploymentWeightsRow (only fields the picker reads).
+type weightsStoreAdapter struct {
+	store *state.PgStore
+}
+
+func (a weightsStoreAdapter) LiveDeployments(ctx context.Context, appID string) ([]gateway.DeploymentWeightsRow, error) {
+	deps, err := a.store.LiveDeployments(ctx, appID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]gateway.DeploymentWeightsRow, 0, len(deps))
+	for _, d := range deps {
+		out = append(out, gateway.DeploymentWeightsRow{
+			ID:             d.ID,
+			TrafficPercent: d.TrafficPercent,
+		})
+	}
+	return out, nil
 }

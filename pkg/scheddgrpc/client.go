@@ -24,7 +24,7 @@ import (
 // warmhint stream, close. Each method maps 1:1 to a method on
 // *Client, so any fake only needs to forward the same shape.
 type ScheddClient interface {
-	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, port int, err error)
+	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error)
 	Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	ParkInstance(ctx context.Context, instanceID, reason string) error
@@ -142,12 +142,17 @@ func (c *Client) Wake(ctx context.Context, appID string) (instanceID, nodeID, wa
 //   - err: non-nil only on real admission failures (RAM headroom,
 //     chooser, store). The benign app_concurrency_reached outcome is
 //     never lifted to an error.
-func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, method int32, atCapacity bool, port int, err error) {
+//   - deploymentID (issue #556 / PR-B): the live deployment id the
+//     new instance was admitted for. Empty on the at-capacity path;
+//     "" pre-PR-B callers see empty and the gateway treats that as
+//     "single-deployment legacy mode". Schedd surfaces this from
+//     Engine.AdmitInstance's WakeResult.DeploymentID (engine.go).
+func (c *Client) AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error) {
 	resp, err := c.cli.AdmitInstance(ctx, &scheddpb.AdmitInstanceRequest{AppId: appID})
 	if err != nil {
-		return "", "", "", 0, false, 0, liftErr(err)
+		return "", "", "", "", 0, false, 0, liftErr(err)
 	}
-	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), int32(resp.GetMethod()), resp.GetAtCapacity(), int(resp.GetPort()), nil
+	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetDeploymentId(), resp.GetWakeId(), int32(resp.GetMethod()), resp.GetAtCapacity(), int(resp.GetPort()), nil
 }
 
 // ReportActivity flushes a batch of last_request_at touches to schedd. Returns
