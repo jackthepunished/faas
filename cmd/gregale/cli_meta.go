@@ -589,6 +589,21 @@ var cliCommands = []cliCommand{
 		Short:   "Wake a parked app (pulls out of snapshot)",
 	},
 	{
+		Name:    "traffic",
+		DocSlug: "traffic",
+		Short:   "Manage deployment traffic split (issue #556; Pro/Scale only)",
+		Subcommands: []cliSub{
+			{
+				Name:  "set",
+				Short: "Set the traffic split for a deployment",
+				Flags: []cliFlag{
+					{Name: "deployment", Short: "deployment id to set the traffic split on", Req: true},
+					{Name: "percent", Short: "traffic weight in [0, 100]; -1 = unset (server default 100)", Req: true},
+				},
+			},
+		},
+	},
+	{
 		Name:    "webhooks",
 		DocSlug: "webhooks",
 		Short:   "Manage outbound webhooks (webhooks list|add|info|update|rm|deliveries|retry|rotate-secret)",
