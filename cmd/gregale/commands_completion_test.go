@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -480,4 +481,195 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// Tier A8.1 / ADR-083 follow-up: PrintUsage ↔ cliCommand.DocSlug parity.
+//
+// The completion + man subsystem (Tier A8, PR #752) treats the manifest
+// as the source of truth — every manifest entry shows up in completion
+// scripts and gets a man page. PrintUsage(..., topic) (cmd/gregale/output.go:156)
+// builds the docs URL the same way (`docs.gregale.dev/cli/<topic>`),
+// so the topic string must resolve to a cliCommand.DocSlug or Name;
+// otherwise the man page and the --help URL point at a 404.
+//
+// The test walks every PrintUsage(...) call site in cmd/gregale/ via
+// go/ast (same machinery as extractMainCaseArms above) and asserts
+// two invariants:
+//
+//  1. Forward: every topic resolves to a cliCommand.DocSlug / Name
+//     OR one of a small set of semantic slugs (auth, apps, park-wake)
+//     that the docs site recognises but the manifest doesn't carry
+//     as a top-level entry.
+//  2. Inverse: every cliCommand.DocSlug has at least one PrintUsage
+//     caller — catches orphan manifest entries (a command added to
+//     cli_meta.go with no leaf that actually prints its docs URL).
+//
+// The semantic-slug allow-list lives in the test, not production
+// code, because the test is the only place we enforce the convention.
+// Adding a new semantic slug is a one-line test edit + a code-review
+// note.
+func TestUsageDocSlugParity(t *testing.T) {
+	// 1. Build the set of accepted topics.
+	accepted := make(map[string]string, len(cliCommands)+4)
+	for _, c := range cliCommands {
+		accepted[c.Name] = "cliCommand.Name=" + c.Name
+		accepted[c.DocSlug] = "cliCommand.DocSlug=" + c.DocSlug + " (name=" + c.Name + ")"
+	}
+	semantic := map[string]string{
+		"auth":        "login/logout/whoami share the auth docs page",
+		"apps":        "gregale app <slug> family uses apps (manifest entry app has DocSlug=apps)",
+		"park-wake":   "park + wake share the park-wake docs page",
+		"account-slo": "gregale account slo [--window X] is a sibling docs page under /cli/slo",
+	}
+	for k, v := range semantic {
+		accepted[k] = "semantic: " + v
+	}
+
+	// 2. Walk every PrintUsage call site under cmd/gregale/.
+	usages, err := extractPrintUsageTopics()
+	if err != nil {
+		t.Fatalf("walk PrintUsage call sites: %v", err)
+	}
+	if len(usages) == 0 {
+		t.Fatal("no PrintUsage call sites found — extractor is broken")
+	}
+
+	// 3. Forward invariant: every topic resolves.
+	for _, u := range usages {
+		if _, ok := accepted[u.topic]; !ok {
+			t.Errorf("%s: PrintUsage topic %q does not resolve to any cliCommand.DocSlug/Name or semantic topic", u.where, u.topic)
+		}
+	}
+
+	// 4. Inverse invariant: every cliCommand.DocSlug has a caller.
+	used := make(map[string]int, len(usages))
+	for _, u := range usages {
+		used[u.topic]++
+	}
+	// Internal pseudo-commands excluded from the inverse check, mirroring
+	// the internal allow-list in TestCompletion_ManifestDrift above.
+	// `completion` and `man` dispatch to their own subcommands (the
+	// PrintUsage lives inside cmdCompletion / cmdMan, not in per-leaf
+	// handlers), so a missing caller from a leaf doesn't mean an
+	// orphan manifest entry.
+	internalInverse := map[string]struct{}{
+		"completion": {},
+		"man":        {},
+	}
+	for _, c := range cliCommands {
+		if _, isInternal := internalInverse[c.Name]; isInternal {
+			continue
+		}
+		if used[c.DocSlug] == 0 && used[c.Name] == 0 {
+			t.Errorf("cliCommand %q (DocSlug %q) has zero PrintUsage call sites — orphan manifest entry", c.Name, c.DocSlug)
+		}
+	}
+
+	// 5. Sanity: each topic that IS used must have a non-zero count
+	// (catches a topic that's accidentally listed twice in different
+	// places that we deduplicated to one — fail loudly instead).
+	for topic, n := range used {
+		if n == 0 {
+			t.Errorf("internal: used[%q] == 0 — extractor bug", topic)
+		}
+	}
+}
+
+// printUsageSite is one PrintUsage(...) call site extracted by
+// extractPrintUsageTopics. Topic is the second argument (the docs
+// URL slug); Where is a "file:line" string suitable for test errors.
+type printUsageSite struct {
+	where string
+	topic string
+}
+
+// extractPrintUsageTopics walks every non-test .go file under the
+// current package directory (cmd/gregale/) and collects the topic
+// string passed as the second argument of every PrintUsage(...) call.
+// Mirrors extractMainCaseArms above: parses each file once via
+// go/parser, walks the AST with ast.Inspect.
+//
+// Const-typed topics (e.g. metricsCmdDocsTopic in commands_metrics.go)
+// are resolved via the topicConsts allow-list below — same pattern
+// as the dispatchConsts map in TestCompletion_ManifestDrift.
+func extractPrintUsageTopics() ([]printUsageSite, error) {
+	topicConsts := map[string]string{
+		"initCmdDocsTopic":       "init",
+		"metricsCmdDocsTopic":    "metrics",
+		"sloCmdDocsTopic":        "slo",
+		"sloAccountCmdDocsTopic": "account-slo",
+		"invocationCmdDocsTopic": "invocations",
+		"completionDocsTopic":    "completion",
+		"manDocsTopic":           "man",
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return nil, fmt.Errorf("readdir cmd/gregale: %w", err)
+	}
+	var sites []printUsageSite
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, name, nil, parser.ParseComments)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", name, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			id, ok := call.Fun.(*ast.Ident)
+			if !ok || id.Name != "PrintUsage" {
+				return true
+			}
+			if len(call.Args) < 3 {
+				return true
+			}
+			topic, ok := printUsageTopicString(call.Args[2], topicConsts)
+			if !ok {
+				return true
+			}
+			pos := fset.Position(call.Pos())
+			sites = append(sites, printUsageSite{
+				where: fmt.Sprintf("%s:%d", pos.Filename, pos.Line),
+				topic: topic,
+			})
+			return true
+		})
+	}
+	return sites, nil
+}
+
+// printUsageTopicString extracts the topic literal from a PrintUsage
+// call's second argument. Handles two shapes: a string literal
+// (`"alerts"`) and an identifier resolved via topicConsts
+// (`metricsCmdDocsTopic` → `"metrics"`). Returns ("", false) when
+// the argument is neither — skip the site silently (the caller
+// can't verify dynamic topics).
+func printUsageTopicString(expr ast.Expr, topicConsts map[string]string) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		return strings.Trim(e.Value, `"`), true
+	case *ast.Ident:
+		if v, ok := topicConsts[e.Name]; ok {
+			return v, true
+		}
+		// Unknown identifier: treat as a literal topic and let the
+		// test's accepted-map decide whether it resolves. This catches
+		// typos in topic names that would otherwise compile but 404
+		// at runtime.
+		return e.Name, true
+	}
+	return "", false
 }

@@ -603,6 +603,7 @@ func cmdDeployTarball(args []string) int {
 	// request path; we just thread the pointer through.
 	trafficPercent := fs.Int("traffic-percent", -1, "split weight for this deployment (0-100, Pro/Scale only; -1 = server default 100)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME | --template NAME", "deploy")
 		return 1
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
@@ -1647,6 +1648,7 @@ func cmdInvoices(args []string) int {
 	before := fs.String("before", "", "pagination cursor (RFC3339Nano)")
 	limit := fs.Int("limit", 25, "page size (1..100)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale invoices [--month YYYY-MM] [--before C] [--limit N]", "invoices")
 		return 1
 	}
 	client, err := authedClient()
