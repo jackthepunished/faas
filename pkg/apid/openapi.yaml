@@ -1669,6 +1669,27 @@ paths:
         Server-Sent Events stream of instance logs. NOTE: this endpoint is
         currently mounted behind `s.authLimited` and is documented here for
         reference; the dashboard and CLI also consume it directly.
+
+        Two modes share this URL:
+
+        - **Live (default)** — `?follow=1` holds the connection open and
+          streams new entries from the per-instance ring buffer. The
+          stream terminates with `event: end` when the backstop fires
+          (10 minutes idle), the schedd returns NotFound (parked app), or
+          the connection closes.
+
+        - **Archive (`?archive=1`)** — fetches a single day's
+          per-instance log batch from the S3 bucket the apid shipper
+          writes into. `?instance=<id>` selects the Firecracker instance
+          id; `?date=YYYY-MM-DD` selects the day. The response is the
+          same SSE shape as the live stream (`event: log` per line,
+          `event: end` terminal with `archive_complete` /
+          `archive_missing` / `archive_degraded` reasons) so the SDK
+          decoder treats the two paths interchangeably. Archive is
+          gated by `Plan.LogArchiveEnabled()` — Free customers receive
+          402 + `plan_log_archive_not_allowed`. The per-plan retention
+          cap (Hobby 7d / Pro 30d / Scale 90d) refuses `?date=` values
+          outside the window with 403 + `log_archive_retention_exceeded`.
       parameters:
         - name: follow
           in: query
@@ -1691,12 +1712,50 @@ paths:
             against the same enum (api.IsValidLogLevel in pkg/api/logs.go);
             an unknown value short-circuits with an SSE error frame carrying
             code invalid_level.
+        - name: archive
+          in: query
+          schema: { type: integer, enum: [0, 1], default: 0 }
+          description: >
+            If 1, serve archived logs from S3 instead of the live ring buffer.
+            Requires `instance=<id>` and `date=YYYY-MM-DD`. Gated by
+            `Plan.LogArchiveEnabled()` — Free plans receive 402 +
+            `plan_log_archive_not_allowed`. The per-plan retention cap
+            (Hobby 7d / Pro 30d / Scale 90d) refuses `date=` values
+            outside the window.
+        - name: instance
+          in: query
+          schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,128}$' }
+          description: >
+            Required when `archive=1`. The Firecracker instance id to read
+            archived logs from (matches the `instance_id` field in the live
+            SSE frames).
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+          description: >
+            Required when `archive=1`. The day to read in YYYY-MM-DD UTC.
+            Must be inside the per-plan retention cap (Hobby 7d / Pro 30d
+            / Scale 90d) — outside values return 403 +
+            `log_archive_retention_exceeded`. Future dates are refused
+            with the same code.
       responses:
         '200':
           description: A text/event-stream of structured log lines, terminated by an empty SSE frame when the connection closes.
           content:
             text/event-stream: {}
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Plan does not include log archive read-back. Free plans receive this on `?archive=1`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: {"type":"about:blank","title":"Log archive unavailable on this plan","status":402,"code":"plan_log_archive_not_allowed","detail":"the free plan does not include log archive read-back; upgrade to Hobby or above to query historical logs from object storage."}
+        '403':
+          description: Log archive retention cap exceeded; `?date=` is outside the per-plan window.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: '{"type":"about:blank","title":"","status":403,"code":"log_archive_retention_exceeded","detail":"?date=2026-07-01 is outside the per-plan window"}'
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 

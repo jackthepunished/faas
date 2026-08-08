@@ -17,7 +17,13 @@
 //     decrypt failure surfaces as the wrong-key wrapper, not a
 //     silent corruption.
 //
-// Both contracts are exercised with a tmpdir + a freshly-generated
+//   - unsealArchiveCreds mirrors unsealRclone's contracts
+//     (refuse-overwrite + wrong-key) AND adds the JSON-shape
+//     sanity check: a half-decrypted envelope must surface as
+//     "plaintext is not a valid archive-creds.json" rather than
+//     silently ship garbage to S3 (issue #562 PR-A).
+//
+// All contracts are exercised with a tmpdir + a freshly-generated
 // age X25519 pair so the test never touches /etc/faas/secrets/ and
 // runs cleanly on a developer laptop without the production secret
 // path populated.
@@ -184,5 +190,132 @@ func TestUnsealRclone_WrongKey(t *testing.T) {
 	// never created.
 	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
 		t.Fatalf("output file should not exist on wrong-key failure: stat err = %v", statErr)
+	}
+}
+
+// TestUnsealArchiveCreds_HappyPath seals a fake archive-creds.json
+// (the wire shape cmd/apid/main.go::readArchiveCreds expects) and
+// asserts the round-trip bytes match and the output file ends up
+// mode 0400 root:root — the perm tripwire the ansible role
+// asserts (deploy/ansible/roles/control_plane_service/tasks/
+// main.yml:215-235).
+func TestUnsealArchiveCreds_HappyPath(t *testing.T) {
+	identPath := generateAgeKey(t)
+	const plaintext = `{"endpoint":"https://s3.us-east-1.amazonaws.com","region":"us-east-1","key_id":"AKIA","secret":"wJal"}` + "\n"
+	envelope := sealForRecipients(t, identPath, plaintext)
+
+	outPath := filepath.Join(t.TempDir(), "archive-creds.json")
+	f := &unsealArchiveCredsFlags{
+		ageIdentity: identPath,
+		in:          envelope,
+		out:         outPath,
+		force:       false,
+	}
+	if err := unsealArchiveCreds(f); err != nil {
+		t.Fatalf("unsealArchiveCreds: %v", err)
+	}
+
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read unsealed: %v", err)
+	}
+	if string(got) != plaintext {
+		t.Fatalf("round-trip mismatch:\n got: %q\nwant: %q", got, plaintext)
+	}
+
+	st, err := os.Stat(outPath)
+	if err != nil {
+		t.Fatalf("stat out: %v", err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o400 {
+		t.Fatalf("mode: got %#o want 0400", mode)
+	}
+}
+
+// TestUnsealArchiveCreds_RefuseOverwrite pins the
+// refuse-rotate-by-default contract — same shape as
+// TestUnsealRclone_RefuseOverwrite above. The unseal flow
+// exists for bootstrap, not rotation; --force is the
+// documented escape hatch.
+func TestUnsealArchiveCreds_RefuseOverwrite(t *testing.T) {
+	identPath := generateAgeKey(t)
+	envelope := sealForRecipients(t, identPath, `{"key_id":"x"}`)
+
+	outPath := filepath.Join(t.TempDir(), "archive-creds.json")
+	if err := unsealArchiveCreds(&unsealArchiveCredsFlags{
+		ageIdentity: identPath,
+		in:          envelope,
+		out:         outPath,
+		force:       false,
+	}); err != nil {
+		t.Fatalf("first unseal: %v", err)
+	}
+
+	err := unsealArchiveCreds(&unsealArchiveCredsFlags{
+		ageIdentity: identPath,
+		in:          envelope,
+		out:         outPath,
+		force:       false,
+	})
+	if err == nil {
+		t.Fatal("second unseal without --force should refuse, got nil error")
+	}
+	if !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("refusal error: got %q, want substring 'refusing to overwrite'", err.Error())
+	}
+}
+
+// TestUnsealArchiveCreds_WrongKey rejects a wrong box-age-key.
+// We seal with identity A and try to unseal with identity B.
+// A partial decrypt must NOT leave a half-written file on disk
+// — the atomic-rename happens only after io.ReadAll + JSON
+// validation succeed.
+func TestUnsealArchiveCreds_WrongKey(t *testing.T) {
+	identA := generateAgeKey(t)
+	identB := generateAgeKey(t)
+	envelope := sealForRecipients(t, identA, `{"key_id":"x"}`)
+
+	outPath := filepath.Join(t.TempDir(), "archive-creds.json")
+	err := unsealArchiveCreds(&unsealArchiveCredsFlags{
+		ageIdentity: identB,
+		in:          envelope,
+		out:         outPath,
+		force:       false,
+	})
+	if err == nil {
+		t.Fatal("unseal with wrong key should fail, got nil error")
+	}
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		t.Fatalf("output file should not exist on wrong-key failure: stat err = %v", statErr)
+	}
+}
+
+// TestUnsealArchiveCreds_BadJSONShape pins the JSON-shape
+// sanity check. A wrong-key-on-bad-json envelope would
+// silently ship garbage to S3 on the first PUT; this test
+// surfaces the failure at unseal time. A "not even JSON"
+// plaintext (operator error — they sealed the wrong file)
+// must be rejected.
+func TestUnsealArchiveCreds_BadJSONShape(t *testing.T) {
+	identPath := generateAgeKey(t)
+	// Not JSON at all — the operator accidentally sealed
+	// the wrong file.
+	envelope := sealForRecipients(t, identPath, "this is not json")
+
+	outPath := filepath.Join(t.TempDir(), "archive-creds.json")
+	err := unsealArchiveCreds(&unsealArchiveCredsFlags{
+		ageIdentity: identPath,
+		in:          envelope,
+		out:         outPath,
+		force:       false,
+	})
+	if err == nil {
+		t.Fatal("bad-JSON-shape plaintext should fail, got nil error")
+	}
+	if !strings.Contains(err.Error(), "not a valid archive-creds.json") {
+		t.Fatalf("err=%q, want substring 'not a valid archive-creds.json'", err.Error())
+	}
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		t.Fatalf("output file should not exist on bad-JSON failure: stat err = %v", statErr)
 	}
 }

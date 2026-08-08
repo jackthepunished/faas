@@ -21,7 +21,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -254,14 +253,4 @@ func oneLine(s string) string {
 	}
 	b.WriteString("…")
 	return b.String()
-}
-
-// ensureJSONReusable is a compile-time check that api.Invocation is
-// still a JSON-serialisable struct (the SDK's wire shape must not
-// silently regress to a non-marshalable form). The closure runs at
-// init; if marshalling ever breaks the build fails here instead of
-// at the first customer's `gregale invocations get --json`.
-var _ = func() error {
-	_, err := json.Marshal(api.Invocation{})
-	return err
 }

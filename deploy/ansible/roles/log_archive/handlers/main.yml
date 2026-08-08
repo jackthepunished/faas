@@ -1,0 +1,27 @@
+# log_archive — daemon-reload handler (issue #562).
+#
+# Only used by the gatewayd-internal systemd drop-in task above.
+# We don't restart the daemon — the role never silently bounces
+# the edge on a deployed box. An operator who wants the new
+# `LoadCredential=` to take effect on a live host runs
+# `systemctl restart faas-gatewayd-internal` themselves; the
+# next ansible run will see the unit already loaded and skip
+# the daemon-reload.
+#
+# Same shape as deploy/ansible/roles/postgres_backup/handlers/
+# main.yml:13-22. The `failed_when: false` is a defensive
+# fallback for chroot/CI environments without systemd; the
+# main.yml daemon-reload task already runs the real reload
+# and surfaces a failure on a real EX44.
+
+- name: detect systemd availability
+  ansible.builtin.stat:
+    path: /run/systemd/system
+  register: systemd_available
+  failed_when: false
+
+- name: daemon-reload log_archive
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: systemd_available.stat.exists | bool
+  failed_when: false
