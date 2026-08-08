@@ -439,6 +439,16 @@ func TestResolveDeployShape_NestedMarkerHint(t *testing.T) {
 	if strings.Contains(stdout.String(), "gregale scan --path .") {
 		t.Errorf("stdout must not contain hint in text mode; got %q", stdout.String())
 	}
+
+	// Pin the no-duplicate behaviour (issue #744 review finding): the
+	// hint branch must drop the title because the wrapped err.Error()
+	// already encodes the cwd ("no deployable source found in <dir>: ...").
+	// A regression that rendered both title and err.Error() would print
+	// the cwd twice on stderr — visually noisy and confusing.
+	occurrences := strings.Count(stderr.String(), "no deployable source found in")
+	if occurrences != 1 {
+		t.Errorf("stderr should contain 'no deployable source found in' exactly once (no title+err duplication); got %d occurrences in %q", occurrences, stderr.String())
+	}
 }
 
 // TestResolveDeployShape_NestedMarkerHint_JSON pins the §3.3 --json contract

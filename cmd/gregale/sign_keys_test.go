@@ -35,11 +35,18 @@ func swapIO(t *testing.T) (stdout *bytes.Buffer, readStderr func() string, resto
 	}
 	oldOut := osStdout
 	oldErr := os.Stderr
+	// Also swap the package var osStderr (commands3.go) so error-path
+	// output routed through printErr's PrintWarn/renderAPIError flow
+	// lands in the tempfile too. Same compatibility shim as
+	// captureStderr in commands5_test.go (issue #744 / ADR-086).
+	oldPkgErr := osStderr
 	osStdout = &outBuf
 	os.Stderr = errFile
+	osStderr = errFile
 	restore = func() {
 		osStdout = oldOut
 		os.Stderr = oldErr
+		osStderr = oldPkgErr
 		_ = errFile.Close()
 	}
 	readStderr = func() string {

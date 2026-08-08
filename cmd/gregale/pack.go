@@ -106,18 +106,18 @@ var defaultExcludeFiles = map[string]bool{
 // Single source of truth: detectFramework and detectNestedMarkerHint
 // both consult this map, so a new marker (e.g. Cargo.toml for a Rust
 // Railpack pipeline that lands in a future ADR) only needs to be added
-// here, not in two switches. The set matches pkg/builderd/detect.go:73-82
-// on the server side — the CLI is intentionally the lighter view (no
-// Dockerfile priority ordering, since the CLI's job is to hint, not to
-// pick a build pipeline).
-var appMarker = map[string]bool{
-	"package.json":     true,
-	"requirements.txt": true,
-	"pyproject.toml":   true,
-	"pipfile":          true,
-	"setup.py":         true,
-	"go.mod":           true,
-	"dockerfile":       true,
+// here, not in two switches. The marker→framework mapping mirrors
+// pkg/builderd/detect.go:73-82 on the server side — the CLI is
+// intentionally the lighter view (no Dockerfile priority ordering —
+// see detectFramework, which applies Dockerfile-wins as a post-pass).
+var appMarker = map[string]framework{
+	"package.json":     fwNode,
+	"requirements.txt": fwPython,
+	"pyproject.toml":   fwPython,
+	"pipfile":          fwPython,
+	"setup.py":         fwPython,
+	"go.mod":           fwGo,
+	"dockerfile":       fwDocker,
 }
 
 // packEpoch is a fixed modification time stamped on every archive entry so the
@@ -155,36 +155,32 @@ func detectFramework(srcDir string) framework {
 	if err != nil {
 		return fwUnknown
 	}
-	var hasDocker, hasNode, hasPython, hasGo bool
+	// Single source of truth: appMarker (issue #744 / ADR-086). A new
+	// marker added to the map is picked up here AND by
+	// detectNestedMarkerHint without further edits. The Dockerfile-wins
+	// post-pass at the end mirrors pkg/builderd/detect.go — when both a
+	// Dockerfile and a language marker are present, the Dockerfile wins.
+	var hasDocker bool
+	var lang framework
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		// Keep in sync with pkg/builderd/detect.go — the rule intentionally
-		// mirrors the server-side detector; if you change one, change both.
-		// Marker membership is sourced from appMarker so a single edit
-		// (issue #744 / ADR-086) covers both detectFramework and the new
-		// detectNestedMarkerHint helper.
-		switch strings.ToLower(e.Name()) {
-		case "dockerfile":
-			hasDocker = true
-		case "package.json":
-			hasNode = true
-		case "requirements.txt", "pyproject.toml", "pipfile", "setup.py":
-			hasPython = true
-		case "go.mod":
-			hasGo = true
+		if fw, ok := appMarker[strings.ToLower(e.Name())]; ok {
+			if fw == fwDocker {
+				hasDocker = true
+				continue
+			}
+			if lang == "" {
+				lang = fw
+			}
 		}
 	}
-	switch {
-	case hasDocker:
+	if hasDocker {
 		return fwDocker
-	case hasNode:
-		return fwNode
-	case hasPython:
-		return fwPython
-	case hasGo:
-		return fwGo
+	}
+	if lang != "" {
+		return lang
 	}
 	return fwUnknown
 }
@@ -255,7 +251,7 @@ func walkForMarkers(dir string, maxDepth int) bool {
 			}
 			continue
 		}
-		if appMarker[strings.ToLower(name)] {
+		if _, ok := appMarker[strings.ToLower(name)]; ok {
 			return true
 		}
 	}

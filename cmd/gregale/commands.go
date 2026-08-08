@@ -408,10 +408,17 @@ func printErr(title string, err error) int {
 		return ec.code
 	}
 	if hasHint {
-		PrintFail(osStderr, "%s\n  %s\n  %s", title, err.Error(), hintErr.Hint)
+		// The hint replaces the title — the bare error message already
+		// encodes the cwd + reasons (e.g. "no deployable source found in
+		// <dir>: expected package.json, ..."), and the title is the
+		// same string the caller passed in. Rendering both would
+		// duplicate the cwd in the customer-visible output (issue #744
+		// review finding). The hint is the actionable next step; the
+		// error text is the context; the title is dropped.
+		PrintFail(osStderr, "%s\n  %s", err.Error(), hintErr.Hint)
 		return 1
 	}
-	PrintFail(os.Stderr, "%s\n  %s", title, err.Error())
+	PrintFail(osStderr, "%s\n  %s", title, err.Error())
 	return 1
 }
 
