@@ -1,0 +1,264 @@
+// commands/man.go — Tier A8 / ADR-083.
+//
+// `gregale man` (full gregale(1) page) and `gregale man <command>`
+// (per-command gregale-<command>(1)) emit roff source to stdout.
+//
+// Output format is groff man (the same flavour `man` renders on
+// Linux + macOS). The script can pipe the result to `man -l -`
+// for immediate rendering, or redirect to a file under
+// /usr/local/share/man/man1/ for permanent installation.
+//
+// The roff emits NAME / SYNOPSIS / DESCRIPTION / COMMANDS /
+// EXAMPLES / SEE ALSO sections per the Linux man-pages(7)
+// convention. Headers are bracketed in .SH; the synopsis uses
+// .B for the literal tokens; URLs are .UR + .UE.
+//
+// Output is human-only (never takes --json) — the roff itself
+// IS the structured format. A `--json` flag would require
+// defining an alternate schema just for this command, which is
+// not worth the surface.
+
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+const manDocsTopic = "man"
+
+// manSourceBrand is the .TH source field for every page. We don't
+// vary it per-command because the brand is what `whatis` and
+// `man -k` index on — operators expect to grep `gregale` (lower-
+// case) across every page in the section.
+const manSourceBrand = "gregale"
+
+// gregaleVersion is read from wire.Version at startup via
+// initGregaleVersion() (set in main.go via a tiny init() or
+// assigned at process boot — wire.Version is a string constant
+// already, so this is just an indirection so tests can swap it).
+var gregaleVersion = "dev"
+
+// cmdMan dispatches `gregale man [command]`. With no arg, prints
+// the top-level gregale(1) page; with one arg, prints the
+// per-command page gregale-<command>(1).
+func cmdMan(args []string) int {
+	switch len(args) {
+	case 0:
+		renderManTop(osStdout)
+		return 0
+	case 1:
+		cmd, ok := lookupCliCommand(args[0])
+		if !ok {
+			_, _ = fmt.Fprintf(os.Stderr, "gregale man: unknown command %q\n", args[0])
+			return 1
+		}
+		renderManCommand(osStdout, cmd)
+		return 0
+	default:
+		PrintUsage(os.Stderr, "usage: gregale man [<command>]", manDocsTopic)
+		return 1
+	}
+}
+
+// lookupCliCommand returns the cliCommand for name. Linear scan
+// is fine — the manifest has ~50 entries.
+func lookupCliCommand(name string) (cliCommand, bool) {
+	for _, c := range cliCommands {
+		if c.Name == name {
+			return c, true
+		}
+	}
+	return cliCommand{}, false
+}
+
+// renderManTop writes the gregale(1) top-level page.
+func renderManTop(w io.Writer) {
+	manHeader(w, "GREGALE(1)", "gregale Manual", manSourceBrand)
+	manSection(w, "NAME", func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, ".B gregale")
+		_, _ = fmt.Fprintln(w, "\\- deploy apps and functions that scale to zero")
+	})
+	manSection(w, "SYNOPSIS", func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, ".B gregale")
+		_, _ = fmt.Fprintln(w, ".RI [ command ]")
+		_, _ = fmt.Fprintln(w, ".RI [ flags ]")
+	})
+	manSection(w, "DESCRIPTION", func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `gregale is the customer-facing CLI for the Gregale FaaS platform.`)
+		_, _ = fmt.Fprintln(w, `It is the primary interface to the platform; every action the platform`)
+		_, _ = fmt.Fprintln(w, `supports is reachable from this single binary.`)
+	})
+	manSection(w, "COMMANDS", func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `Run \fBgregale help\fP for the full command list. The most common verbs:`)
+		_, _ = fmt.Fprintln(w, ".TP")
+		_, _ = fmt.Fprintln(w, ".BR apps ,", " \\fIalerts\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR deployments ,", " \\fIregistry\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR webhooks ,", " \\fIinvocations\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR crons ,", " \\fIdelayed-task\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR orgs ,", " \\fIkeys\\fP,")
+		_, _ = fmt.Fprintln(w, ".BR mfa")
+	})
+	manSection(w, "GLOBAL FLAGS", func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, ".TP")
+		_, _ = fmt.Fprintln(w, ".BR \\-\\-json")
+		_, _ = fmt.Fprintln(w, `Machine-readable output. Equivalent to`)
+		_, _ = fmt.Fprintln(w, `.B FAAS_JSON=1`)
+		_, _ = fmt.Fprintln(w, `in the environment.`)
+	})
+	manSection(w, "EXAMPLES", func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `List your apps:`)
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, ".RS 4")
+		_, _ = fmt.Fprintln(w, `.nf`)
+		_, _ = fmt.Fprintln(w, `gregale apps`)
+		_, _ = fmt.Fprintln(w, `.fi`)
+		_, _ = fmt.Fprintln(w, ".RE")
+		_, _ = fmt.Fprintln(w, `.PP`)
+		_, _ = fmt.Fprintln(w, `Deploy from a tarball:`)
+		_, _ = fmt.Fprintln(w, ".RS 4")
+		_, _ = fmt.Fprintln(w, ".nf")
+		_, _ = fmt.Fprintln(w, "gregale deploy --tarball ./app.tar.gz --app my-app")
+		_, _ = fmt.Fprintln(w, ".fi")
+		_, _ = fmt.Fprintln(w, ".RE")
+	})
+	manSection(w, "SEE ALSO", func(w io.Writer) {
+		_, _ = fmt.Fprintf(w, ".UR %scompletion\n", docsURLBase)
+		_, _ = fmt.Fprintln(w, "gregale completion (bash|zsh|fish|powershell)")
+		_, _ = fmt.Fprintln(w, ".UE")
+		_, _ = fmt.Fprintln(w, ".PP")
+		_, _ = fmt.Fprintf(w, ".UR %s\n", docsURLBase)
+		_, _ = fmt.Fprintln(w, "gregale docs")
+		_, _ = fmt.Fprintln(w, ".UE")
+	})
+	manFooter(w)
+}
+
+// renderManCommand writes the gregale-<command>(1) per-command page.
+func renderManCommand(w io.Writer, c cliCommand) {
+	// The .TH source field is the brand ("gregale"), not the page
+	// slug — whatis/man -k index on the source label, and operators
+	// expect to grep `gregale` (lowercase) across every page.
+	manHeader(w, "GREGALE-"+strings.ToUpper(c.Name)+"(1)", "gregale "+c.Name+" Manual", manSourceBrand)
+	manSection(w, "NAME", func(w io.Writer) {
+		_, _ = fmt.Fprintf(w, ".B gregale-%s\n", c.Name)
+		_, _ = fmt.Fprintf(w, "\\- %s\n", escapeRoff(c.Short))
+	})
+	manSection(w, "SYNOPSIS", func(w io.Writer) {
+		_, _ = fmt.Fprintf(w, ".B gregale %s\n", c.Name)
+		for _, s := range c.Subcommands {
+			_, _ = fmt.Fprintf(w, ".RI [ %s ]\n", s.Name)
+		}
+		for _, p := range c.Positionals {
+			_, _ = fmt.Fprintf(w, ".RI %s\n", p)
+		}
+		for _, f := range c.Flags {
+			// Required flags lose the surrounding brackets so the
+			// reader can distinguish them from optional flags at a
+			// glance — the conventional groff marker for "no brackets
+			// means required".
+			if f.Req {
+				_, _ = fmt.Fprintf(w, ".RI --%s ", f.Name)
+				_, _ = fmt.Fprint(w, ".IR value\n")
+			} else {
+				_, _ = fmt.Fprintf(w, ".RI [ --%s ", f.Name)
+				_, _ = fmt.Fprint(w, ".IR value ")
+				_, _ = fmt.Fprint(w, "]\n")
+			}
+		}
+	})
+	manSection(w, "DESCRIPTION", func(w io.Writer) {
+		_, _ = fmt.Fprintf(w, ".PP\n%s\n", escapeRoff(c.Short))
+	})
+	if len(c.Subcommands) > 0 {
+		manSection(w, "SUBCOMMANDS", func(w io.Writer) {
+			_, _ = fmt.Fprintln(w, ".TP")
+			for _, s := range c.Subcommands {
+				_, _ = fmt.Fprintf(w, ".BR %s\n", s.Name)
+				_, _ = fmt.Fprintf(w, "%s\n", escapeRoff(s.Short))
+				_, _ = fmt.Fprintln(w, ".TP")
+			}
+		})
+	}
+	if len(c.Flags) > 0 {
+		manSection(w, "FLAGS", func(w io.Writer) {
+			_, _ = fmt.Fprintln(w, ".TP")
+			for _, f := range c.Flags {
+				// Required flags get a "(required)" suffix in the
+				// FLAGS section so a reader scanning for the marker
+				// finds it without cross-referencing the SYNOPSIS.
+				flagHeader := fmt.Sprintf("--%s", f.Name)
+				if f.Req {
+					_, _ = fmt.Fprintf(w, ".BR %s\n(required)\n", flagHeader)
+				} else {
+					_, _ = fmt.Fprintf(w, ".BR %s\n", flagHeader)
+				}
+				_, _ = fmt.Fprintf(w, "%s\n", escapeRoff(f.Short))
+				if len(f.ClosedSet) > 0 {
+					_, _ = fmt.Fprintf(w, "Allowed values: %s.\n", strings.Join(f.ClosedSet, ", "))
+				}
+				_, _ = fmt.Fprintln(w, ".TP")
+			}
+		})
+	}
+	manSection(w, "SEE ALSO", func(w io.Writer) {
+		_, _ = fmt.Fprintf(w, ".UR %s%s\n", docsURLBase, c.DocSlug)
+		_, _ = fmt.Fprintf(w, "gregale %s (docs)\n", c.Name)
+		_, _ = fmt.Fprintln(w, ".UE")
+		_, _ = fmt.Fprintln(w, ".PP")
+		_, _ = fmt.Fprintf(w, ".UR %s\n", docsURLBase)
+		_, _ = fmt.Fprintln(w, "gregale(1) top-level manual")
+		_, _ = fmt.Fprintln(w, ".UE")
+	})
+	manFooter(w)
+}
+
+// manHeader writes the page preamble only: .TH title section date source.
+// The source field is the brand (`gregale`) for every page — the
+// per-command title (GREGALE-ALERTS) lives in the title slot, so
+// grepping the source label stays consistent across the whole
+// man section. The NAME section is rendered by renderManTop /
+// renderManCommand via manSection("NAME", ...) — keeping all .SH
+// openings in one place.
+func manHeader(w io.Writer, title, subtitle, source string) {
+	_, _ = fmt.Fprintf(w, ".TH %s 1 \"%s\" \"%s\"\n", title, gregaleVersion, source)
+	_ = subtitle // subtitle is rendered inside the NAME section body
+}
+
+// manSection writes a section header followed by the body callback.
+// The body callback receives w and emits the roff for the section.
+func manSection(w io.Writer, name string, body func(w io.Writer)) {
+	_, _ = fmt.Fprintf(w, ".SH %s\n", strings.ToUpper(name))
+	body(w)
+}
+
+// manFooter writes the trailing blank line + end-of-file marker.
+// Most renderers add a final newline so the file ends cleanly
+// regardless of how the user pipes the output.
+func manFooter(w io.Writer) {
+	_, _ = fmt.Fprintln(w)
+}
+
+// escapeRoff backslash-escapes roff-significant characters. The
+// common ones are backslash itself and the period at the start
+// of a line (which would otherwise be interpreted as a macro).
+// Inside .SH and .TP sections the period is harmless; we only
+// escape when text is part of a paragraph.
+func escapeRoff(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	// Period-only escaping: only the first character of each line.
+	// For our use (single-line summaries), we just protect a leading
+	// period if any.
+	if strings.HasPrefix(s, ".") {
+		s = "\\&" + s
+	}
+	return s
+}

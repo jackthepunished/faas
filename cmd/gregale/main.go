@@ -41,6 +41,7 @@ Commands:
   build        Build provenance + sbom (build provenance <id>|build sbom <id>)
   connect      Connect a third-party service (github)
   crons        Manage scheduled requests
+  completion   Print shell completion script (bash|zsh|fish|powershell)
   dashboard    Open the account dashboard in your browser
   delayed-task Schedule a deferred invocation (delayed-task add|get|cancel)
   deployments  List deployments (--limit N | --before C | --all)
@@ -57,6 +58,7 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
+  man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
   metrics      Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
@@ -99,6 +101,14 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+func init() {
+	// Tier A8 / ADR-083: gregaleVersion is the value substituted into
+	// the man page header (`.TH GREGALE(1) "version"`). Wired once
+	// at process boot from wire.Version so the man page reflects the
+	// binary the user is running, not a hardcoded literal.
+	gregaleVersion = wire.Version
+}
+
 func run(args []string) int {
 	// Issue #64 D1: every command accepts --json (top-level). Strip
 	// it before dispatch and set jsonOutput so per-command printers
@@ -122,6 +132,14 @@ func run(args []string) int {
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 		return 0
+	case "completion":
+		// Tier A8 / ADR-083. Routes to one of bash|zsh|fish|powershell
+		// via cmdCompletion; the dispatcher is in completion.go.
+		return cmdCompletion(args[1:])
+	case "man":
+		// Tier A8 / ADR-083. No arg → gregale(1); one arg →
+		// gregale-<command>(1). Dispatcher is in man.go.
+		return cmdMan(args[1:])
 	case "login":
 		return cmdLogin(args[1:])
 	case "logout":

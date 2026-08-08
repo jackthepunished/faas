@@ -72,6 +72,12 @@ const (
 	// terminalExitForDeployment branch.
 	statusLive = "live"
 
+	// streamEventError is the SSE event name emitted by the build
+	// log stream when the upstream closes (5xx mid-stream, network
+	// reset, etc.). Mirrors the `event:` field of the build-log
+	// endpoint; see pkg/api streaming bridge for the producer.
+	streamEventError = "error"
+
 	// cmdNames reused across the run() dispatch table (main.go) so
 	// goconst stops flagging the repeated "apps" / "status" / etc.
 	// literals. Tests intentionally keep the literal form.
@@ -86,6 +92,10 @@ const (
 	// appSlugFallback — the dispatch table places it before the
 	// "app" case so `gregale deployment <id>` is never read as an app slug.
 	dispatchDeployment = "deployment"
+
+	// Plural orgs list. Mirrors dispatchApps shape; user runs
+	// `gregale orgs` to list accounts they belong to.
+	dispatchOrgs = "orgs"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>
@@ -2157,7 +2167,7 @@ streamLoop:
 					PrintWarn(os.Stderr, "build log stream ended (%s); checking deployment status…", end.Reason)
 				}
 				break streamLoop
-			case "error":
+			case streamEventError:
 				PrintWarn(os.Stderr, "stream closed; follow manually: gregale logs --deployment %s", dep.ID)
 				return 3
 			default:

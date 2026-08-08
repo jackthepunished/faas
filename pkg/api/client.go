@@ -71,6 +71,14 @@ type Client struct {
 
 	http       *http.Client // 30s default — used for every JSON call
 	deployHTTP *http.Client // optional, used by DeployMultipart
+
+	// cache powers `gregale completion <shell>` for the per-account
+	// positional completion paths (e.g. <slug> in `gregale app <slug>`).
+	// Nil → the c.do middleware short-circuits the refresh (preserves
+	// the test-suite posture where no on-disk cache should leak between
+	// subtests). NewClient wires a fresh cache so completion just works;
+	// tests that want hermetic isolation call SetCompletionCache(nil).
+	cache *CompletionCache
 }
 
 // NewClient builds a client for baseURL with the given bearer token.
@@ -81,7 +89,28 @@ func NewClient(baseURL, token string) *Client {
 		baseURL: baseURL,
 		token:   token,
 		http:    &http.Client{Timeout: 30 * time.Second},
+		cache:   NewCompletionCache(),
 	}
+}
+
+// SetCompletionCache wires a (possibly nil) cache. Passing nil
+// disables the auto-refresh — useful for tests that don't want
+// disk writes leaking between cases. Returns the receiver so the
+// call site can chain or discard.
+func (c *Client) SetCompletionCache(cache *CompletionCache) *Client {
+	c.cache = cache
+	return c
+}
+
+// CompletionCache returns the current cache. May be nil if the
+// client was built before NewCompletionCache existed (binary
+// compat — older callers that constructed Client{} directly) or
+// after an explicit SetCompletionCache(nil). Completion scripts
+// that want to read the cache for TAB-time lookups should call
+// this rather than constructing their own cache, so the file
+// path stays consistent with whatever the middleware wrote.
+func (c *Client) CompletionCache() *CompletionCache {
+	return c.cache
 }
 
 // NewClientWithDeployTimeout is like NewClient but configures a
@@ -173,6 +202,14 @@ func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
 			return &APIError{Problem: p}
 		}
 		return fmt.Errorf("API error: %s", resp.Status)
+	}
+	// Tier A8 / ADR-083: auto-refresh the completion cache on every
+	// 2xx. Runs before the unmarshal so the raw body is still in hand;
+	// errors are swallowed inside MaybeRefresh so a broken cache
+	// (disk full, permission denied, corrupt JSON) never fails a
+	// request. Nil-safe for tests that opt out via SetCompletionCache(nil).
+	if c.cache != nil {
+		c.cache.MaybeRefresh(req.URL.Path, data)
 	}
 	if out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
