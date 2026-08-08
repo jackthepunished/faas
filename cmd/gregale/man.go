@@ -43,7 +43,11 @@ var gregaleVersion = "dev"
 
 // cmdMan dispatches `gregale man [command]`. With no arg, prints
 // the top-level gregale(1) page; with one arg, prints the
-// per-command page gregale-<command>(1).
+// per-command page gregale-<command>(1). On an unknown command
+// the dispatcher tries to suggest the nearest match by
+// Levenshtein distance (suggestCommand, below) before failing —
+// users typo'ing `gregale man aps` get "did you mean 'apps'?"
+// instead of a bare "unknown command".
 func cmdMan(args []string) int {
 	switch len(args) {
 	case 0:
@@ -53,6 +57,9 @@ func cmdMan(args []string) int {
 		cmd, ok := lookupCliCommand(args[0])
 		if !ok {
 			_, _ = fmt.Fprintf(os.Stderr, "gregale man: unknown command %q\n", args[0])
+			if sug, has := suggestCommand(args[0]); has {
+				_, _ = fmt.Fprintf(os.Stderr, "  Did you mean %q?\n", sug)
+			}
 			return 1
 		}
 		renderManCommand(osStdout, cmd)
@@ -261,4 +268,88 @@ func escapeRoff(s string) string {
 		s = "\\&" + s
 	}
 	return s
+}
+
+// suggestCommand returns the closest cliCommand.Name to query by
+// Levenshtein distance, but only when exactly one candidate is at
+// the minimum distance AND that distance is ≤2. Ties and distances
+// above the threshold return ("", false) so the caller falls
+// through to a plain "unknown command" message — ambiguous
+// suggestions are worse than none (a user might pick the wrong
+// one of two equally-close candidates). The threshold of 2 covers
+// the common typos (`aps`, `appss`, `appsss`) without suggesting
+// across unrelated commands (`apps` → `mfa` is distance 4).
+func suggestCommand(query string) (string, bool) {
+	const maxDist = 2
+	bestName := ""
+	bestDist := maxDist + 1
+	tied := false
+	for _, c := range cliCommands {
+		d := levenshtein(query, c.Name)
+		switch {
+		case d < bestDist:
+			bestName, bestDist, tied = c.Name, d, false
+		case d == bestDist:
+			// Tie: another command at the same distance makes the
+			// suggestion ambiguous, so we suppress it.
+			tied = true
+		}
+	}
+	if tied || bestDist > maxDist || bestName == "" {
+		return "", false
+	}
+	return bestName, true
+}
+
+// levenshtein computes the edit distance between a and b using
+// the classic dynamic-programming algorithm: O(len(a)*len(b))
+// time and space. We use a single-row rolling buffer (size
+// len(b)+1) to keep allocations small — the caller is the man
+// dispatcher, which fires at most once per `gregale man` invocation,
+// so the work is tiny. No third-party dependency: a real dep
+// would be 5x the code and one more thing to vet.
+func levenshtein(a, b string) int {
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	// prev is the row for i-1; cur is the row for i. We allocate
+	// once and reuse across iterations.
+	prev := make([]int, lb+1)
+	cur := make([]int, lb+1)
+	for j := 0; j <= lb; j++ {
+		prev[j] = j
+	}
+	for i := 1; i <= la; i++ {
+		cur[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := cur[j-1] + 1
+			sub := prev[j-1] + cost
+			cur[j] = min3(del, ins, sub)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[lb]
+}
+
+// min3 returns the smallest of three ints. Inlined because Go 1.23
+// doesn't have a stdlib helper, and the function is hot (one call
+// per cell of the DP table).
+func min3(a, b, c int) int {
+	m := a
+	if b < m {
+		m = b
+	}
+	if c < m {
+		m = c
+	}
+	return m
 }
