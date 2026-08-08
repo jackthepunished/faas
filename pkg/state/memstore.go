@@ -2196,8 +2196,9 @@ func (m *MemStore) UpdateDeploymentMinInstances(_ context.Context, id string, mi
 // Range-check matches pgstore (handler already validates, this is
 // defence in depth). Status guard: only 'live' rows accept
 // traffic; a superseded/failed/pending row trips
-// ErrInvalidTrafficPercent. The Σ invariant is asserted post-write
-// (structurally guaranteed by zero-siblings, but pinned by test).
+// ErrInvalidTrafficPercent. PR-C mirrors the pgstore proportional
+// redistribution (RedistributeTraffic) so both stores share the
+// largest-remainder algorithm. Σ invariant is asserted post-write.
 func (m *MemStore) UpdateDeploymentTraffic(_ context.Context, id string, newPercent int) (Deployment, error) {
 	if newPercent < 0 || newPercent > 100 {
 		return Deployment{}, ErrInvalidTrafficPercent
@@ -2213,19 +2214,43 @@ func (m *MemStore) UpdateDeploymentTraffic(_ context.Context, id string, newPerc
 		return Deployment{}, ErrInvalidTrafficPercent
 	}
 
-	// Stamp target + zero siblings.
+	// Stamp target first; sibling weights collected for redistribution.
 	d.TrafficPercent = newPercent
 	m.deployments[id] = d
 	appID := d.AppID
+
+	// Collect siblings (id-ordered for stable tie-break).
+	type sibling struct {
+		ID    string
+		Prior int
+	}
+	var siblings []sibling
 	for otherID, other := range m.deployments {
 		if other.AppID != appID || other.Status != DeployLive || otherID == id {
 			continue
 		}
-		other.TrafficPercent = 0
-		m.deployments[otherID] = other
+		siblings = append(siblings, sibling{ID: otherID, Prior: other.TrafficPercent})
+	}
+	// Stable order: ID ASC. Siblings map iteration is non-deterministic
+	// so we sort explicitly.
+	sort.SliceStable(siblings, func(a, b int) bool { return siblings[a].ID < siblings[b].ID })
+
+	helperSiblings := make([]struct {
+		ID    string
+		Prior int
+	}, len(siblings))
+	for i, s := range siblings {
+		helperSiblings[i].ID = s.ID
+		helperSiblings[i].Prior = s.Prior
+	}
+	newWeights := RedistributeTraffic(helperSiblings, 100-newPercent)
+	for i, s := range siblings {
+		other := m.deployments[s.ID]
+		other.TrafficPercent = newWeights[i]
+		m.deployments[s.ID] = other
 	}
 
-	// Σ invariant (defensive).
+	// Σ invariant (defensive tripwire).
 	var sum int
 	for _, row := range m.deployments {
 		if row.AppID == appID && row.Status == DeployLive {

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -4008,12 +4009,16 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 }
 
 // UpdateDeploymentTraffic stamps the per-deployment traffic-split
-// weight (issue #556 PR-A). PR-A uses the "zero siblings" rebalance
-// form: setting row R's traffic_percent to newPercent forces every
-// other live row in the same app to 0, keeping Σ = 100 by
-// construction. PR-C may upgrade to proportional redistribution for
-// the `faas traffic set --percent=N` case (the user-confirmed plan
-// decision).
+// weight (issue #556 PR-A/PR-C). PR-A used the "zero siblings"
+// rebalance form: setting row R's traffic_percent to newPercent
+// forced every other live row in the same app to 0, keeping Σ = 100
+// by construction — but made every non-100 value a hard error since
+// Σ was structurally newPercent. PR-C upgrades to proportional
+// redistribution via the largest-remainder method
+// (RedistributeTraffic): a `faas traffic set --percent 25` on a
+// prior 100/0 app now leaves 75 on the prior deployment, Σ = 100,
+// no error. The Σ post-write assertion stays as a defensive
+// tripwire.
 //
 // Atomicity contract:
 //  1. The transaction opens with pgx.TxOptions{} (read-committed
@@ -4024,14 +4029,13 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 //  3. The target row is validated to be 'live' (operator can't
 //     move traffic to a superseded/failed/pending row).
 //  4. The target row is updated to newPercent; sibling live rows
-//     are updated to 0.
-//  5. The Σ invariant is asserted post-write; failure here
-//     surfaces as a wrapped 23514 SQLSTATE that mapErr translates
-//     to ErrInvalidTrafficPercent (handler emits 422). In practice
-//     Σ = 100 is structurally guaranteed (target = newPercent,
-//     siblings = 0, total = newPercent); the assertion is a
-//     defensive tripwire against a future refactor that breaks
-//     the "siblings = 0" form.
+//     are updated proportionally via RedistributeTraffic. Σ is
+//     guaranteed by the algorithm; the post-write SELECT … sum()
+//     is a defence-in-depth tripwire that fails the transaction
+//     on Σ != 100.
+//  5. Range-check + status guard return ErrInvalidTrafficPercent;
+//     Σ != 100 returns ErrTrafficPercentSumInvalid (handler
+//     translates to 422 / 409).
 //
 // Range-checking newPercent here is a backstop — the handler
 // validates [0, 100] and emits ErrInvalidTrafficPercent (422) on
@@ -4086,23 +4090,68 @@ func (s *PgStore) UpdateDeploymentTraffic(ctx context.Context, id string, newPer
 		return Deployment{}, fmt.Errorf("state: lock sibling live rows: %w", err)
 	}
 
-	// (4) Stamp target + zero siblings. The "zero siblings" form is
-	// PR-A semantics; PR-C may upgrade to proportional redistribution
-	// for the PATCH path.
+	// (4) Stamp target + redistribute residual across siblings via
+	// the largest-remainder method (see RedistributeTraffic).
+	//
+	// Read sibling weights first so the algorithm has the prior
+	// distribution to redistribute proportionally. We re-stamp
+	// inside the same tx that holds the FOR UPDATE locks above.
+	rows, err := tx.Query(ctx,
+		`select id, traffic_percent
+		   from deployments
+		  where app_id = $1 and status = 'live' and id != $2
+		  order by id`,
+		appID, id)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: read sibling weights: %w", err)
+	}
+	type sibling struct {
+		ID    string
+		Prior int
+	}
+	var siblings []sibling
+	for rows.Next() {
+		var s sibling
+		if err := rows.Scan(&s.ID, &s.Prior); err != nil {
+			rows.Close()
+			return Deployment{}, fmt.Errorf("state: scan sibling weight: %w", err)
+		}
+		siblings = append(siblings, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Deployment{}, fmt.Errorf("state: iterate sibling weights: %w", err)
+	}
+
 	if _, err := tx.Exec(ctx,
 		`update deployments set traffic_percent = $2 where id = $1`,
 		id, newPercent); err != nil {
 		return Deployment{}, fmt.Errorf("state: stamp traffic_percent %s: %w", id, mapErr(err))
 	}
-	if _, err := tx.Exec(ctx,
-		`update deployments set traffic_percent = 0
-		  where app_id = $1 and status = 'live' and id != $2`,
-		appID, id); err != nil {
-		return Deployment{}, fmt.Errorf("state: zero sibling traffic_percent: %w", mapErr(err))
+
+	// RedistributeTraffic returns weights that sum to (100 - newPercent);
+	// siblings[idx].ID gets newWeights[idx]. Σ + newPercent = 100 by
+	// construction (the algorithm enforces it; see helper doc).
+	helperSiblings := make([]struct {
+		ID    string
+		Prior int
+	}, len(siblings))
+	for i, s := range siblings {
+		helperSiblings[i].ID = s.ID
+		helperSiblings[i].Prior = s.Prior
+	}
+	newWeights := RedistributeTraffic(helperSiblings, 100-newPercent)
+	for i, s := range siblings {
+		if _, err := tx.Exec(ctx,
+			`update deployments set traffic_percent = $2 where id = $1`,
+			s.ID, newWeights[i]); err != nil {
+			return Deployment{}, fmt.Errorf("state: stamp sibling %s traffic_percent: %w", s.ID, mapErr(err))
+		}
 	}
 
-	// (5) Σ invariant assertion. Structurally guaranteed by the
-	// zero-siblings form above, but the test suite pins the check.
+	// (5) Σ invariant assertion. Structurally guaranteed by
+	// RedistributeTraffic + the newPercent stamp above, but the
+	// test suite pins the check (defence in depth).
 	var sum int
 	if err := tx.QueryRow(ctx,
 		`select coalesce(sum(traffic_percent), 0)
@@ -4128,6 +4177,128 @@ func (s *PgStore) UpdateDeploymentTraffic(ctx context.Context, id string, newPer
 		return Deployment{}, fmt.Errorf("state: commit update traffic: %w", err)
 	}
 	return d, nil
+}
+
+// RedistributeTraffic assigns weights to N siblings that sum to
+// residual (typically 100 - newPercent from UpdateDeploymentTraffic)
+// using the largest-remainder method. The returned slice is in the
+// same order as siblings; caller maps weights[i] → siblings[i].ID.
+//
+// Algorithm (largest-remainder / Hamilton's method):
+//  1. Let Σ = Σ_{i=1..n} siblings[i].Prior. (Σ > 0 — a sole live
+//     row at 100 has no siblings and the caller handles that case
+//     before calling.)
+//  2. For each i, exact = siblings[i].Prior / Σ * residual.
+//  3. base[i] = floor(exact). remainder[i] = exact - base[i].
+//  4. Sort (remainder, ID) by (remainder DESC, ID ASC).
+//  5. The first k indices (where k = residual - Σ base[i]) each
+//     get +1, so the Σ of new weights = residual by construction.
+//     The tie-break is (fraction DESC, ID ASC) — stable across
+//     runs so two operators seeing the same state see the same
+//     rebalance.
+//
+// Worked example (PR-C test pin): {A:50, B:30, C:20} → set A:25
+// residual=75. Σ_{prior-target} = B:30 + C:20 = 50.
+//
+//	exact_B = 30/50*75 = 45.0   base=45, remainder=0.0
+//	exact_C = 20/50*75 = 30.0   base=30, remainder=0.0
+//
+// k = 75 - (45+30) = 0 → no +1 awarded. Result: {B:45, C:30}.
+// Σ = 75. Σ + A:25 = 100. ✓
+//
+// Tie-break example: {A:50, B:50} → set A:0 residual=100.
+// Σ = 100. exact_A = exact_B = 50.0. base=50 each, remainder=0.
+// k = 100 - 100 = 0 → no tie-break needed; both = 50.
+// For a tie that triggers the +1 (e.g. {A:33, B:33, C:34},
+// set A:0, residual=100, Σ=67):
+//
+//	exact_B = 33/67*100 = 49.25..., base=49, remainder=0.25
+//	exact_C = 34/67*100 = 50.74..., base=50, remainder=0.74
+//
+// k = 100 - 99 = 1 → C gets +1 (largest remainder).
+// Result: {B:49, C:51}. Σ = 100.
+//
+// Defensive: if Σ ≤ 0 (all siblings were 0 before — degenerate),
+// every sibling gets `residual / n` and the residual mod n is
+// absorbed by the first n%min siblings in ID ASC order. Σ = residual.
+func RedistributeTraffic(siblings []struct {
+	ID    string
+	Prior int
+}, residual int) []int {
+	n := len(siblings)
+	if n == 0 {
+		return nil
+	}
+	if residual <= 0 {
+		// Caller asked for zero or negative residual (target ≥ 100).
+		// All siblings drop to 0 — single edge case for `target=100`
+		// on an N-row app where the caller must already have
+		// stamped the target to 100 and we just zero the rest.
+		out := make([]int, n)
+		return out
+	}
+	// Σ prior weight of siblings.
+	var sumPrior int
+	for _, s := range siblings {
+		sumPrior += s.Prior
+	}
+	if sumPrior <= 0 {
+		// Degenerate: distribute residual evenly across n siblings,
+		// first `residual mod n` (in ID-ASC order) absorb the ±1.
+		// This shouldn't happen in practice (a Σ=0 sibling would
+		// mean a deployment with 0% traffic — supersede-zeroed —
+		// sitting live alongside another live row, which the
+		// supersede path disallows), but a sane fallback is
+		// mandatory for the integration tests to be deterministic.
+		base := residual / n
+		out := make([]int, n)
+		indices := make([]int, n)
+		for i := range indices {
+			indices[i] = i
+			out[i] = base
+		}
+		// Sort indices by siblings[i].ID ASC so the tie-break is
+		// stable.
+		sort.SliceStable(indices, func(a, b int) bool {
+			return siblings[indices[a]].ID < siblings[indices[b]].ID
+		})
+		for i := 0; i < residual%n; i++ {
+			out[indices[i]]++
+		}
+		return out
+	}
+	// Normal path.
+	type slot struct {
+		idx       int
+		base      int
+		remainder float64
+	}
+	slots := make([]slot, n)
+	var sumBase int
+	for i, s := range siblings {
+		exact := float64(s.Prior) / float64(sumPrior) * float64(residual)
+		b := int(exact) // floor for non-negative; exact ≥ 0
+		slots[i] = slot{idx: i, base: b, remainder: exact - float64(b)}
+		sumBase += b
+	}
+	// Award +1 to the top-k slots by (remainder DESC, ID ASC) where
+	// k = residual - sumBase. sumBase ≤ residual by definition of
+	// floor; k ∈ [0, n).
+	k := residual - sumBase
+	sort.SliceStable(slots, func(a, b int) bool {
+		if slots[a].remainder != slots[b].remainder {
+			return slots[a].remainder > slots[b].remainder
+		}
+		return siblings[slots[a].idx].ID < siblings[slots[b].idx].ID
+	})
+	out := make([]int, n)
+	for i, s := range slots {
+		out[s.idx] = s.base
+		if i < k {
+			out[s.idx]++
+		}
+	}
+	return out
 }
 
 // SetDeploymentParked stamps the per-deployment parked_reason +
