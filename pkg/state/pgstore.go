@@ -11284,13 +11284,17 @@ func (s *PgStore) ListGdprRequestsForAccount(ctx context.Context, accountID stri
 		var (
 			g           GdprRequest
 			completedAt pgtype.Timestamptz
+			requestID   pgtype.Text // NULL = no inbound X-Request-Id (PR-5.2)
 		)
 		if err := rows.Scan(&g.ID, &g.AccountID, &g.AccountEmail,
-			&g.Action, &g.RequestedAt, &completedAt, &g.RequestID); err != nil {
+			&g.Action, &g.RequestedAt, &completedAt, &requestID); err != nil {
 			return nil, err
 		}
 		if completedAt.Valid {
 			g.CompletedAt = completedAt.Time
+		}
+		if requestID.Valid {
+			g.RequestID = requestID.String
 		}
 		out = append(out, g)
 	}
