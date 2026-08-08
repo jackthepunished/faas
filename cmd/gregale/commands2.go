@@ -1911,8 +1911,8 @@ func cmdOpenDocs(args []string) int {
 		safeSlug = ""
 	}
 	var target string
-	switch {
-	case safeSlug == "":
+	switch safeSlug {
+	case "":
 		// Top-level docs — strips the trailing /cli/ from
 		// docsURLBase so the landing page renders.
 		target = strings.TrimSuffix(docsURLBase, "/cli/")
