@@ -1609,6 +1609,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// hits are recovered via the next deployment_changed notify
 	// that re-seeds the cache.
 	if !pick.OK && pick.ColdBucket != "" {
+		//nolint:contextcheck // request ctx at handler boundary; this is the wake-fan-out retry branch.
 		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, limits.MaxConcurrency); err != nil {
 			// Log-and-continue: the existing "warmest bucket"
 			// fallback inside Pick already handled the

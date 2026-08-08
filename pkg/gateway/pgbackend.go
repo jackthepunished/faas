@@ -933,16 +933,6 @@ func buildCumulativeWeights(weights []deploymentWeight) []int {
 	return cum
 }
 
-// pickerHasDeployment returns true when bucket appears in the
-// picker's weight table. Test seam / Admit helper (PR-B /
-// issue #556) — the picker synthesises an implicit 100% weight
-// when Admit populates a bucket the picker doesn't yet know
-// about, so the hot-path Pick can route correctly between the
-// next RefreshDeploymentWeights event.
-func pickerHasDeployment(p *appPicker, bucket string) bool {
-	return pickerHasDeploymentByID(p.weights, bucket)
-}
-
 // pickerHasDeploymentByID is the slice-level predicate (PR-C
 // stale-set prune). Walks the supplied weight table — caller
 // passes either p.weights or a freshly-rebuilt next slice.
