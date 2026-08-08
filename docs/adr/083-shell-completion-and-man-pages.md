@@ -218,3 +218,41 @@ repo. Slot 083 is the next free.
   can add `//go:build bash_complete` and `//go:build roff_complete`
   test files for the integrated validation when the toolchain is
   reliably available.
+
+## Post-review fixes (PR #752 follow-up)
+
+A `code-review medium` pass surfaced 8 findings. 7 were real bugs;
+finding #5 (Client.cache sync) was folded into #2 — the outer
+`MaybeRefresh` mutex makes the cache's internal I/O atomic regardless
+of how the client shares its pointer.
+
+| # | Bug | Fix |
+|---|---|---|
+| 1 | bash/zsh/fish slug-cache regex used grep -E with literal `{` — grep rejects "invalid repeat". | sed slice + grep for `"slug":"…"` fields. |
+| 2 | `MaybeRefresh` had a read-modify-write race: concurrent `/v1/apps` + `/v1/orgs` clobbered each other's field. | Outer `c.mu` lock; `readLocked`/`writeEntryLocked`/`pathLocked` helpers avoid re-entrant Lock on `Path()`. |
+| 3 | bash ClosedSet gate required both `len(ClosedSet)>0 && len(Positionals)>0` — unsatisfiable (plan's closed set IS its positional). | Gate on `len(ClosedSet)>0` alone. |
+| 4 | Slug-cache completion hardcoded to `c.Name=="app"||"apps"`; other commands with `<slug>` positionals (invoke, metrics, slo, wake-timeline) had no TAB completion. | `cliCommand.hasSlugFirst()` helper, driven by `Positionals[0]=="<slug>"`. |
+| 6 | man page `.TH` source field was uppercased to `GREGALE-FOO`. | `manSourceBrand = "gregale"` for all pages. |
+| 7 | `cliFlag.Req` documented but the renderer emitted identical `[ --name value ]` for required and optional flags. | Required flags drop the brackets in SYNOPSIS; FLAGS section adds `(required)` suffix. |
+| 8 | PowerShell subcommand completion gated by `len(Positionals)==0`, suppressing subcommands for `app` (which has both). | Gate removed. |
+
+New regression tests added in `commands_completion_test.go` and
+`completion_cache_test.go`:
+
+- `TestCompletionCache_CrossPathRacePreservesBothFields` — fires
+  interleaved apps + orgs refreshes; fails without the outer lock.
+- `TestBash_SlugRegexExtractsSlugs` — drives the rendered bash
+  helper end-to-end against a seeded cache file.
+- `TestCompletion_BashScriptIsSyntacticallyValid` — `bash -n` on
+  the rendered script.
+- `TestPowershell_AppCommandHasSubcommandAndSlugEntries` — `app`
+  emits both subcommand and slug-cache entries.
+- `TestMan_PerCommandSourceLabelIsGregale` — source slot is
+  `gregale` (not uppercased page slug).
+- `TestMan_RequiredFlagRenderedWithoutBrackets` — required flags
+  rendered distinctly in SYNOPSIS and FLAGS.
+
+The original "out of scope" `bash -n` integration test was added
+inline (`TestCompletion_BashScriptIsSyntacticallyValid`) — it
+skips on hosts without `/bin/bash`, which is rare enough that the
+skip path is acceptable; the dev boxes and CI runners both have it.
