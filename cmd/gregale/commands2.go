@@ -731,7 +731,7 @@ func cmdDeployTarball(args []string) int {
 	// only when the cwd path picked function mode — explicit
 	// --function/--app outside the cwd pack also write to
 	// resolvedShape via this variable in the same branch.
-	var resolvedShape shape = shapeApp
+	var resolvedShape = shapeApp
 	// Issue #737 / ADR-083: explicit --function / --app on a
 	// --tarball / --template path skips the cwd detector (no cwd
 	// pack happens), but still flips resolvedShape so CreateApp

@@ -262,11 +262,11 @@ func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
 	}
 	switch strings.ToLower(picked) {
 	case "handler.js", "handler.ts":
-		return "node22", "handler.handler", true
+		return "node22", defaultTemplateHandler, true
 	case "handler.py":
-		return "python312", "handler.handler", true
+		return "python312", defaultTemplateHandler, true
 	case "handler.go":
-		return "go124", "handler.handler", true
+		return "go124", defaultTemplateHandler, true
 	}
 	return "", "", false
 }
