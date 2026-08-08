@@ -25,7 +25,12 @@ import (
 // *Client, so any fake only needs to forward the same shape.
 type ScheddClient interface {
 	AdmitInstance(ctx context.Context, appID string) (instanceID, nodeID, deploymentID, wakeID string, method int32, atCapacity bool, port int, err error)
-	Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error)
+	// Wake (issue #556 / PR-C): deploymentID is the optional
+	// per-deployment wake hint forwarded to schedd. Empty falls
+	// through to the newest live deployment. Return tuple gains
+	// deploymentIDOut (the deployment schedd actually woke onto;
+	// "" on error).
+	Wake(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, port int, err error)
 	ReportActivity(ctx context.Context, touches []state.InstanceTouch) (int, error)
 	ParkInstance(ctx context.Context, instanceID, reason string) error
 	// StreamAppLogs (issue #309 / tier-2 DX): level + grep are
@@ -112,12 +117,12 @@ func (c *Client) Close() error {
 // Admission denials arrive as an *api.Problem so gateway.writeWakeError
 // maps them straight to the right RFC 7807 status. Satisfies
 // gateway.Scheduler.
-func (c *Client) Wake(ctx context.Context, appID string) (instanceID, nodeID, wakeID string, port int, err error) {
-	resp, err := c.cli.Wake(ctx, &scheddpb.WakeRequest{AppId: appID})
+func (c *Client) Wake(ctx context.Context, appID, deploymentID string) (instanceID, nodeID, deploymentIDOut, wakeID string, port int, err error) {
+	resp, err := c.cli.Wake(ctx, &scheddpb.WakeRequest{AppId: appID, DeploymentId: deploymentID})
 	if err != nil {
-		return "", "", "", 0, liftErr(err)
+		return "", "", "", "", 0, liftErr(err)
 	}
-	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetWakeId(), int(resp.GetPort()), nil
+	return resp.GetInstanceId(), resp.GetNodeId(), resp.GetDeploymentId(), resp.GetWakeId(), int(resp.GetPort()), nil
 }
 
 // AdmitInstance (issue #168) is the schedule scale-out RPC. Distinct

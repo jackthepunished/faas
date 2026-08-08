@@ -82,7 +82,7 @@ func TestEngineWake_EmitsCanonicalSequence(t *testing.T) {
 	vmm := &fakeVMM{}
 	notif := &fakeNotifier{}
 	e := wakeEngineWithEvents(t, store, vmm, notif)
-	res, err := e.Wake(context.Background(), app.ID)
+	res, err := e.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestEngineKillStuck_EmitsStalled(t *testing.T) {
 	e := wakeEngineWithEvents(t, store, vmm, notif)
 	// Wake to seed an instance, then roll it back to WAKING so
 	// KillStuck recognizes it as stuck.
-	if _, err := e.Wake(context.Background(), app.ID); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	ins, err := store.RunningInstanceForApp(context.Background(), app.ID)
@@ -144,7 +144,7 @@ func TestEnginePark_EmitsStartedCompleted(t *testing.T) {
 	vmm := &fakeVMM{}
 	notif := &fakeNotifier{}
 	e := wakeEngineWithEvents(t, store, vmm, notif)
-	if _, err := e.Wake(context.Background(), app.ID); err != nil {
+	if _, err := e.Wake(context.Background(), app.ID, ""); err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
 	ins, err := store.RunningInstanceForApp(context.Background(), app.ID)
@@ -187,7 +187,7 @@ func TestEnginePark_TailDrainWatchdogSucceedsWhenCounterDrains(t *testing.T) {
 	vmm := &fakeVMM{}
 	notif := &fakeNotifier{}
 	e := wakeEngineWithEvents(t, store, vmm, notif)
-	res, err := e.Wake(context.Background(), app.ID)
+	res, err := e.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}

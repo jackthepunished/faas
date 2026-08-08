@@ -1862,7 +1862,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		}
 		l.audit.Emit(ctx, "cron.fired", &acct.ID, payload)
 	}()
-	if _, err := l.engine.Wake(ctx, c.AppID); err != nil {
+	if _, err := l.engine.Wake(ctx, c.AppID, ""); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return
 	}

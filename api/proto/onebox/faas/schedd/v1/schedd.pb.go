@@ -190,7 +190,21 @@ func (x *LivenessFailedAck) GetOk() bool {
 type WakeRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// app_id is the apps.id UUID (the gateway resolves host→app before calling).
-	AppId         string `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
+	AppId string `protobuf:"bytes,1,opt,name=app_id,json=appId,proto3" json:"app_id,omitempty"`
+	// deployment_id (issue #556 / PR-C) is the optional per-deployment
+	// wake hint. When non-empty, schedd wakes an instance on this
+	// specific live deployment (the gateway-side weighted picker
+	// (PGBackend.Pick) chooses the bucket and forwards the id here
+	// so a cold bucket gets a wake instead of falling through to the
+	// newest live deployment). Empty = Phase-1 fast path uses the
+	// newest live deployment (pre-PR-C behaviour).
+	//
+	// Additive per ADR-016 — pre-PR-C callers omit the field and
+	// observe the existing newest-live behaviour. schedd validates
+	// the id against the live deployment set before admitting; an
+	// unknown or non-live id is rejected with NotFound so a stale
+	// gateway cache can't wake a ghost bucket.
+	DeploymentId  string `protobuf:"bytes,2,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -228,6 +242,13 @@ func (*WakeRequest) Descriptor() ([]byte, []int) {
 func (x *WakeRequest) GetAppId() string {
 	if x != nil {
 		return x.AppId
+	}
+	return ""
+}
+
+func (x *WakeRequest) GetDeploymentId() string {
+	if x != nil {
+		return x.DeploymentId
 	}
 	return ""
 }
@@ -272,7 +293,16 @@ type WakeResponse struct {
 	// path so the value is consistent with AdmitInstanceResponse.port;
 	// gateway caches it on Target and stamps it onto ForwardHTTPRequest.
 	// Additive per ADR-016.
-	Port          int32 `protobuf:"varint,6,opt,name=port,proto3" json:"port,omitempty"`
+	Port int32 `protobuf:"varint,6,opt,name=port,proto3" json:"port,omitempty"`
+	// deployment_id (issue #556 / PR-C) is the live deployment the
+	// wake landed on. Mirrors AdmitInstanceResponse.deployment_id (PR-B);
+	// populated on both the Phase-1 fast path (read from the instance
+	// row) and the cold-bucket fan-out path (the deployment_id passed
+	// in WakeRequest). Empty on error paths.
+	//
+	// Additive per ADR-016 — pre-PR-C callers ignore the field and
+	// observe the same wire response as before.
+	DeploymentId  string `protobuf:"bytes,7,opt,name=deployment_id,json=deploymentId,proto3" json:"deployment_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -347,6 +377,13 @@ func (x *WakeResponse) GetPort() int32 {
 		return x.Port
 	}
 	return 0
+}
+
+func (x *WakeResponse) GetDeploymentId() string {
+	if x != nil {
+		return x.DeploymentId
+	}
+	return ""
 }
 
 // AdmitInstanceRequest mirrors WakeRequest for the schedule scale-out
@@ -1588,9 +1625,10 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"instanceId\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"#\n" +
 	"\x11LivenessFailedAck\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok\"$\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\"I\n" +
 	"\vWakeRequest\x12\x15\n" +
-	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xe3\x01\n" +
+	"\x06app_id\x18\x01 \x01(\tR\x05appId\x12#\n" +
+	"\rdeployment_id\x18\x02 \x01(\tR\fdeploymentId\"\x88\x02\n" +
 	"\fWakeResponse\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12\x17\n" +
@@ -1598,7 +1636,8 @@ const file_onebox_faas_schedd_v1_schedd_proto_rawDesc = "" +
 	"\x06method\x18\x03 \x01(\x0e2!.onebox.faas.schedd.v1.WakeMethodR\x06method\x121\n" +
 	"\aproblem\x18\x04 \x01(\v2\x17.google.protobuf.StructR\aproblem\x12\x17\n" +
 	"\awake_id\x18\x05 \x01(\tR\x06wakeId\x12\x12\n" +
-	"\x04port\x18\x06 \x01(\x05R\x04port\"-\n" +
+	"\x04port\x18\x06 \x01(\x05R\x04port\x12#\n" +
+	"\rdeployment_id\x18\a \x01(\tR\fdeploymentId\"-\n" +
 	"\x14AdmitInstanceRequest\x12\x15\n" +
 	"\x06app_id\x18\x01 \x01(\tR\x05appId\"\xb2\x02\n" +
 	"\x15AdmitInstanceResponse\x12\x1f\n" +

@@ -29,7 +29,7 @@ func TestLoopReaperParksIdleInstance(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID)
+	res, err := engine.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestRunReaperPopulatesOpenConns(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID)
+	res, err := engine.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestRunReaperFlowCounterErrorFailsOpen(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID)
+	res, err := engine.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestRunReaperConsultsRealFlowcountReader(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
 
-	res, err := engine.Wake(context.Background(), app.ID)
+	res, err := engine.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}

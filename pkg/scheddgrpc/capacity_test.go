@@ -68,7 +68,7 @@ type capturingEngine struct {
 	seen map[string]bool
 }
 
-func (c *capturingEngine) Wake(_ context.Context, _ string) (sched.WakeResult, error) {
+func (c *capturingEngine) Wake(_ context.Context, _, _ string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
 func (c *capturingEngine) AdmitInstance(_ context.Context, _ string) (sched.WakeResult, error) {

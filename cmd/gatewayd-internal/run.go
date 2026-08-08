@@ -559,7 +559,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke resolve schedd %s: %w", appID, err)
 			}
-			instanceID, _, _, _, err := cli.Wake(ctx, appID)
+			instanceID, _, _, _, _, err := cli.Wake(ctx, appID, "")
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}

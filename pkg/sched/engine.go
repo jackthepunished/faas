@@ -804,7 +804,7 @@ type WakeResult struct {
 // shared admitAndDispatch runs Phase 2-4. AdmitInstance (issue #168)
 // skips Phase 1 explicitly so a gateway can demand a new instance
 // even when others are already RUNNING.
-func (e *Engine) Wake(ctx context.Context, appID string) (WakeResult, error) {
+func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResult, error) {
 	// ── Phase 1: fast path under appMu ─────────────────────────────
 	release := e.lockApp(appID)
 	if ins, err := e.store.RunningInstanceForApp(ctx, appID); err == nil {

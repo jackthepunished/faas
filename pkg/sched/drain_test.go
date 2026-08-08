@@ -64,7 +64,7 @@ func newDrainHarness(t *testing.T, plan api.Plan, withSynth bool) (*Drain, state
 	// claim → wake → invoke lifecycle runs against a live instance
 	// (the always-Wake path means the second call is the idempotent
 	// fast path that returns the existing handle).
-	if _, err := eng.Wake(ctx, app.ID); err != nil {
+	if _, err := eng.Wake(ctx, app.ID, ""); err != nil {
 		t.Fatalf("seed Wake: %v", err)
 	}
 	// Park it so the drain's Wake goes through a real cold-boot path.
