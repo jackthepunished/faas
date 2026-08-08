@@ -629,6 +629,31 @@ sdk-gen: ## (re)generate every generated SDK + assert clean diff vs HEAD
 	@$(MAKE) sdk-gen-python-check
 	@echo "sdk-gen: OK"
 
+# Issue #745 (DEPLOY-PROV-9) pre-PR aggregator. Mirrors the
+# required-status-check list enforced by the main branch ruleset
+# (see docs/ci-required-checks.md). Local devs can run this before
+# `git push` to surface drift without waiting 4-5 min for CI to
+# evaluate. Does NOT cover jobs that require Postgres service
+# containers (lint+build / unit-tests / e2e) — those run in CI only.
+#
+# Order matters: spec-check runs first because it catches the
+# api/openapi.yaml ↔ pkg/apid/openapi.yaml drift that motivated the
+# issue; sdk-gen runs last so a successful pre-pr implies every
+# downstream artefact is in sync with the spec.
+.PHONY: pre-pr
+pre-pr: ## Pre-PR drift check: every regenerate-and-diff gate that runs in CI
+	@echo "==> pre-pr: spec-check (api/openapi.yaml ↔ pkg/apid/openapi.yaml)"
+	@$(MAKE) spec-check
+	@echo "==> pre-pr: proto-check (checked-in *.pb.go matches protoc)"
+	@$(MAKE) proto-check
+	@echo "==> pre-pr: sqlc-check (checked-in sqlc output matches regenerated)"
+	@$(MAKE) sqlc-check
+	@echo "==> pre-pr: egress-check (nftables render + Go cross-check)"
+	@$(MAKE) egress-check
+	@echo "==> pre-pr: sdk-gen (node + python SDK regenerated, no diff)"
+	@$(MAKE) sdk-gen
+	@echo "pre-pr: OK (every drift gate clean)"
+
 .PHONY: sdk-smoke-python
 sdk-smoke-python: ## Build fakeapid fixture + run Python SDK smoke + unit tests
 	@cd sdk/fakeapid && go build -o bin/fakeapid .
