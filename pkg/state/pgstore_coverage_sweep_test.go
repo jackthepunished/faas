@@ -42,6 +42,7 @@ package state_test
 //     LatestParkedDeploymentForApp
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -53,16 +54,9 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-type stateCtx = interface {
-	Deadline() (time.Time, bool)
-	Done() <-chan struct{}
-	Err() error
-	Value(key any) any
-}
-
 // seedPgAccountAndApp returns an account + an app in the schema. Reused
 // from the deleted slice5_test.go.
-func seedPgAccountAndApp(t *testing.T, s *state.PgStore, ctx stateCtx) (state.Account, state.App) {
+func seedPgAccountAndApp(t *testing.T, s *state.PgStore, ctx context.Context) (state.Account, state.App) {
 	t.Helper()
 	email := "pg-seed-" + uuid.NewString() + "@example.com"
 	acct, err := s.CreateAccount(ctx, email, api.PlanPro)
@@ -83,7 +77,7 @@ func seedPgAccountAndApp(t *testing.T, s *state.PgStore, ctx stateCtx) (state.Ac
 
 // seedPgDeployment inserts an Image-kind deployment under app and
 // returns the row PG actually persisted (input ID is ignored).
-func seedPgDeployment(t *testing.T, s *state.PgStore, ctx stateCtx, app state.App) state.Deployment {
+func seedPgDeployment(t *testing.T, s *state.PgStore, ctx context.Context, app state.App) state.Deployment {
 	t.Helper()
 	d := state.Deployment{
 		ID:        uuid.NewString(),
