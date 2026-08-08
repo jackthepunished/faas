@@ -125,12 +125,14 @@ func TestAppsSuffix(t *testing.T) {
 }
 
 // fakeInvalidator records EvictInstance / FlushRoutes /
-// InvalidatePublicAuth calls (issue #477 / ADR-079).
+// InvalidatePublicAuth calls (issue #477 / ADR-079) and
+// RefreshDeploymentWeights calls (issue #556 / PR-B).
 type fakeInvalidator struct {
 	mu            sync.Mutex
 	evicted       map[string]string // instance_id -> app_id
 	flushCnt      int
 	publicAuthCnt int
+	refreshed     []string // app_ids that received RefreshDeploymentWeights
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -150,6 +152,12 @@ func (f *fakeInvalidator) InvalidatePublicAuth() {
 	f.mu.Lock()
 	f.publicAuthCnt++
 	f.mu.Unlock()
+}
+func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID string) error {
+	f.mu.Lock()
+	f.refreshed = append(f.refreshed, appID)
+	f.mu.Unlock()
+	return nil
 }
 
 func TestHandleInvalidation(t *testing.T) {
@@ -176,6 +184,35 @@ func TestHandleInvalidation(t *testing.T) {
 	}
 	if f.flushCnt != 2 {
 		t.Errorf("flush count = %d, want 2 (app + domain)", f.flushCnt)
+	}
+}
+
+// TestHandleInvalidation_DeploymentChangedRefreshesWeights (issue #556 /
+// PR-B) — a db.NotifyDeploymentChanged event must trigger
+// RefreshDeploymentWeights on the picker so a `faas traffic set`
+// takes effect within ~1s. Malformed / empty payloads are
+// logged-and-dropped rather than crashing the edge loop.
+func TestHandleInvalidation_DeploymentChangedRefreshesWeights(t *testing.T) {
+	f := &fakeInvalidator{}
+	log := testLogger()
+
+	// Happy path: valid payload → refresh.
+	handleInvalidation(f, db.Notification{
+		Channel: db.NotifyDeploymentChanged,
+		Payload: `{"app_id":"app-7","deployment_id":"dep-3"}`,
+	}, log)
+	// Malformed payload → no refresh, no panic.
+	handleInvalidation(f, db.Notification{Channel: db.NotifyDeploymentChanged, Payload: `not json`}, log)
+	// Empty app_id → no refresh.
+	handleInvalidation(f, db.Notification{Channel: db.NotifyDeploymentChanged, Payload: `{"app_id":"","deployment_id":"d-1"}`}, log)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.refreshed) != 1 {
+		t.Fatalf("refreshed = %v, want 1 entry (app-7)", f.refreshed)
+	}
+	if f.refreshed[0] != "app-7" {
+		t.Errorf("refreshed[0] = %q, want app-7", f.refreshed[0])
 	}
 }
 

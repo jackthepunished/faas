@@ -318,6 +318,13 @@ message AdmitInstanceResponse {
   // path; 0 on the at-capacity path (no instance was admitted).
   // Additive per ADR-016.
   int32  port        = 7;
+  // deployment_id (issue #556 / PR-B) is the live deployment the
+  // new instance was admitted for. The gateway caches it on
+  // Target so the per-deployment weighted picker (PGBackend.Pick)
+  // routes subsequent requests to the right deployment bucket.
+  // Empty on the at-capacity path (no instance was admitted).
+  // Additive per ADR-016.
+  string deployment_id = 8;
 }
 
 // Touch is one instance's most-recent request time.

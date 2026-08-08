@@ -253,6 +253,14 @@ type Target struct {
 	// buildStreamingBridgeScript resolves 0 to netns.AppPort (8080)
 	// for legacy cached targets that pre-date the field.
 	Port int
+	// DeploymentID (issue #556 / PR-B) is the live deployment id the
+	// target was admitted for. The per-deployment weighted picker
+	// (PGBackend.Pick) routes subsequent requests to the right
+	// deployment bucket based on each bucket's traffic_percent.
+	// Empty on legacy / pre-PR-B targets — the picker collapses to
+	// today's single-targetSet behaviour when DeploymentID is empty
+	// (one app, one targetSet, round-robin within it).
+	DeploymentID string
 }
 
 // Backend is the seam between the edge and the rest of the platform (in

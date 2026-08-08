@@ -1,27 +1,34 @@
--- filename: 00161_reserve_slot.sql
--- Slot 161 — bridge fence for issue #556 / PR #732 after the
--- rebase renumber 00158 → 00159 → 00160 (PR #738 took 158 for
--- accounts_egress_allowlist_extra; PR #733 took 159 for the
--- cli-exploration replay surface). The traffic_percent migration
--- was renumbered to 160; this fence holds slot 161 until a
--- follow-up PR (PR-B for issue #556: gatewayd inter-deployment
--- picker) claims it.
---
--- ADR-041 reservation pattern: the fence body is a no-op
--- `SELECT 1;` so goose applies it cleanly and writes a row in
--- goose_db_version. The fence is deleted by whichever PR first
--- lands at slot 161; do NOT back-fill this fence.
-
 -- +goose Up
 -- +goose StatementBegin
-SELECT 1;
--- +goose StatementEnd
--- +goose StatementBegin
+--
+-- 00161_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- Issue #556 / PR-B holds slot 162 for the partial index backing
+-- the gateway's LiveDeployments plural query (see
+-- migrations/00162_deployments_live_traffic_idx.sql). Slot 161
+-- is reserved as a one-slot gap so any in-flight sibling PR may
+-- claim 161 without colliding. PR-B's reservation is dropped at
+-- merge time once a sibling PR claims 161 OR the next real
+-- schema lands at 162+1.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change. Future-proof against upstream
+-- generator drift without chasing each new template revision.
+--
+select 1;
+
 -- +goose StatementEnd
 
 -- +goose Down
 -- +goose StatementBegin
-SELECT 1;
--- +goose StatementEnd
--- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
 -- +goose StatementEnd

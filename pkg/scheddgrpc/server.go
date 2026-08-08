@@ -330,12 +330,17 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 		return nil, grpcerr.ToStatus(toProblem(err))
 	}
 	return &scheddpb.AdmitInstanceResponse{
-		InstanceId: res.InstanceID,
-		NodeId:     res.NodeID,
-		Method:     mapMethod(res.Method),
-		WakeId:     res.WakeID,
-		AtCapacity: res.AtCapacity,
-		Port:       int32(res.Port),
+		InstanceId:   res.InstanceID,
+		NodeId:       res.NodeID,
+		Method:       mapMethod(res.Method),
+		WakeId:       res.WakeID,
+		AtCapacity:   res.AtCapacity,
+		Port:         int32(res.Port),
+		// deployment_id (issue #556 / PR-B) — see engine.go WakeResult
+		// doc comment. Empty on the at-capacity path; "" pre-PR-B callers
+		// see empty and the gateway treats that as "single-deployment
+		// legacy mode" (Target.DeploymentID empty, picker collapses).
+		DeploymentId: res.DeploymentID,
 	}, nil
 }
 

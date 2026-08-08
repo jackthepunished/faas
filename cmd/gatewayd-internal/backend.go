@@ -154,10 +154,16 @@ func appsSuffix(domain string) string {
 // rotation drops the whole cache. Operators who rotate a key on a busy
 // account pay at most one cache rebuild across all public-auth-locked
 // apps (acceptable because key rotations are rare).
+//
+// Issue #556 / PR-B added RefreshDeploymentWeights: a
+// deployment_changed notification reloads the per-deployment weight
+// table for the affected app so a `faas traffic set --percent 25`
+// takes effect within ~1s without restarting the edge.
 type invalidator interface {
 	EvictInstance(appID, instanceID string)
 	FlushRoutes()
 	InvalidatePublicAuth()
+	RefreshDeploymentWeights(ctx context.Context, appID string) error
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -177,7 +183,17 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 	// (appID, sealed-hash) → entry without a per-entry key-tag,
 	// so a key rotation drops the whole cache (see
 	// PublicAuthCache.InvalidateAll).
-	channels := []string{db.NotifyInstanceChanged, db.NotifyAppChanged, db.NotifyDomainChanged, db.NotifyKeyChanged}
+	//
+	// Issue #556 / PR-B: append NotifyDeploymentChanged so a
+	// `faas traffic set --percent N` triggers
+	// RefreshDeploymentWeights on the per-app picker.
+	channels := []string{
+		db.NotifyInstanceChanged,
+		db.NotifyAppChanged,
+		db.NotifyDomainChanged,
+		db.NotifyKeyChanged,
+		db.NotifyDeploymentChanged,
+	}
 	notif, err := db.SubscribeWithReconnect(ctx, pool, channels, log)
 	if err != nil {
 		log.Error("gatewayd: subscribe invalidations", "err", err)
@@ -279,5 +295,29 @@ func handleInvalidation(inv invalidator, n db.Notification, log *slog.Logger) {
 		// apps (acceptable because key rotations are
 		// rare; the next request re-unseals cleanly).
 		inv.InvalidatePublicAuth()
+	case db.NotifyDeploymentChanged:
+		// Issue #556 / PR-B. A `faas traffic set --percent N`
+		// updates deployments.traffic_percent under FOR UPDATE
+		// and emits this notification. The gateway-side
+		// appPicker holds an in-memory weight table per app;
+		// RefreshDeploymentWeights reloads it from Postgres
+		// so the next Pick reflects the new ratio within ~1s.
+		// Empty / malformed payloads are logged-and-dropped —
+		// the picker retains its current weights until the
+		// next valid event (better to over-stale than to
+		// crash the edge loop). A non-nil refresh error is
+		// logged-and-continued: a brief staleness window is
+		// preferable to crashing the notify path.
+		var p struct {
+			AppID        string `json:"app_id"`
+			DeploymentID string `json:"deployment_id"`
+		}
+		if err := json.Unmarshal([]byte(n.Payload), &p); err != nil || p.AppID == "" {
+			log.Warn("gatewayd: bad deployment_changed payload", "payload", n.Payload)
+			return
+		}
+		if err := inv.RefreshDeploymentWeights(context.Background(), p.AppID); err != nil {
+			log.Warn("gatewayd: refresh deployment weights failed", "app", p.AppID, "err", err)
+		}
 	}
 }

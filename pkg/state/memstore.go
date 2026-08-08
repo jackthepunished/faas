@@ -3379,6 +3379,31 @@ func (m *MemStore) LiveDeployment(_ context.Context, appID string) (Deployment, 
 	return latest, nil
 }
 
+// LiveDeployments (issue #556 / PR-B) mirrors the Postgres
+// plural query in pkg/state/pgstore.go — returns every row where
+// app_id=$1 AND status='live', ordered created_at DESC. Returns
+// (nil, nil) when the app has no live rows so the test seam
+// stays nil-vs-empty consistent with scanDeployments' empty-set
+// shape (MemStore callers don't have to special-case an empty
+// slice vs. an error).
+func (m *MemStore) LiveDeployments(_ context.Context, appID string) ([]Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Deployment
+	for _, d := range m.deployments {
+		if d.AppID != appID || d.Status != DeployLive {
+			continue
+		}
+		out = append(out, d)
+	}
+	// Sort created_at DESC for parity with PgStore (it costs O(n log n)
+	// but the set is tiny — ≤ a handful of live deployments per app).
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
 // CountLiveInstancesByDeployment mirrors PgStore.CountLiveInstancesByDeployment
 // for the in-memory test seam (issue #555 PR-6). The state filter
 // matches the SQL — {waking, cold_booting, running} — and the
