@@ -2099,9 +2099,29 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 					return
 				}
 				if err := s.store.UpdateAccountPaddleCustomerID(r.Context(), acct.ID, custID); err != nil {
+					// PR-P4 review finding #1: at this point a
+					// Paddle customer has been created on Paddle's
+					// side (custID is the ctm_… handle) but the DB
+					// stamp failed — the customer is orphaned with
+					// no row binding it to acct. On retry the
+					// sidecar fires again because
+					// upgradeAcct.ProviderCustomerID is still "",
+					// creating a second orphan on Paddle's
+					// dashboard.
+					//
+					// Compensating action (DELETE on
+					// /customers/{custID} via Paddle's REST API)
+					// is out of scope for this PR — it requires a
+					// new paddle.Provider.ArchiveCustomer method +
+					// a tx-scoped defer in this handler. Filed
+					// for PR-P5. For now we surface the orphan via
+					// a structured field so an operator can grep
+					// `orphan_paddle_customer=true` and reconcile
+					// by hand on the Paddle dashboard.
 					s.log.Error("stamp_customer_id",
 						"account", acct.ID,
 						"customer_id", custID,
+						"orphan_paddle_customer", true,
 						"err", err)
 					api.WriteProblem(w, api.ErrCapacity("upgrade unavailable"))
 					return

@@ -93,10 +93,10 @@ func cmdBillingStatus(args []string) int {
 // instead of getting silent default behaviour.
 func parseBillingStatusFlags(args []string) (bool, time.Duration, bool, bool, error) {
 	var (
-		watch        bool
-		watchDur     = billingStatusWatchDefault
-		asJSON       bool
-		noClear      bool
+		watch         bool
+		watchDur      = billingStatusWatchDefault
+		asJSON        bool
+		noClear       bool
 		watchValueSet bool
 	)
 	for i := 0; i < len(args); i++ {
@@ -133,7 +133,6 @@ func parseBillingStatusFlags(args []string) (bool, time.Duration, bool, bool, er
 	if watchValueSet && watchDur <= 0 {
 		return false, 0, false, false, fmt.Errorf("--watch duration must be positive (got %s)", watchDur)
 	}
-	_ = watchDur
 	return watch, watchDur, asJSON, noClear, nil
 }
 

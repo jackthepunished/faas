@@ -52,7 +52,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/billing"
@@ -210,16 +209,26 @@ func Providers() []ProviderMeta {
 					log,
 				)
 				// PR-P4 — install the operator-configured webhook
-				// tolerance. Env wins over TOML (matching the rest
-				// of ApplyBillingEnvOverlay). An unset / <= 0 value
-				// stays at 0 so WebhookTolerance() clamps to the
-				// default — pre-PR-P4 behaviour is preserved when
-				// the operator has not configured the knob.
-				if envVal := env("FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS"); envVal != "" {
-					if n, parseErr := strconv.Atoi(envVal); parseErr == nil {
-						p.SetWebhookTolerance(time.Duration(n) * time.Second)
-					}
-				} else if tomlTolerance > 0 {
+				// tolerance. The single source of truth is
+				// tomlTolerance (cfg.Paddle.ToleranceSeconds), already
+				// populated by ApplyBillingEnvOverlay with the
+				// env-vs-TOML precedence applied (env wins; bad
+				// parse is silently dropped — see
+				// TestApplyBillingEnvOverlay_FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS).
+				//
+				// PR-P4 review finding #3: an earlier revision also
+				// read env("FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS")
+				// here and re-parsed it. That duplicated the
+				// overlay's parser and created two paths that could
+				// drift if one was updated and the other wasn't.
+				// Removed; if you need to change the parser, edit
+				// ApplyBillingEnvOverlay in config.go.
+				//
+				// A value <= 0 leaves p.webhookTolerance at 0, which
+				// WebhookTolerance() clamps to the default —
+				// pre-PR-P4 behaviour is preserved when the operator
+				// has not configured the knob.
+				if tomlTolerance > 0 {
 					p.SetWebhookTolerance(time.Duration(tomlTolerance) * time.Second)
 				}
 				return p, nil

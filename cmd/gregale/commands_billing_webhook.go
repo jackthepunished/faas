@@ -123,11 +123,11 @@ func cmdBillingWebhookTestStripe(args []string) int {
 // provider-specific default (api.sandbox.paddle.com or
 // api.stripe.com) used when --live is set without --url.
 type webhookTestConfig struct {
-	url        string
-	secret     string
+	url         string
+	secret      string
 	payloadPath string
-	live       bool
-	timeout    time.Duration
+	live        bool
+	timeout     time.Duration
 }
 
 // parseWebhookTestFlags walks args for the four CLI flags. The CLI
