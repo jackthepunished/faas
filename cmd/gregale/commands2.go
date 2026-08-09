@@ -473,6 +473,9 @@ func cmdApp(args []string) int {
 }
 
 // cmdAppsRm implements `gregale apps -q <slug>` (DELETE /v1/apps/{slug}).
+// On the interactive path (no -q) the user must retype the slug
+// verbatim (issue #312) so a stray `y` cannot delete the app.
+
 func cmdAppsRm(args []string) int {
 	fs := flag.NewFlagSet("apps-rm", flag.ContinueOnError)
 	quiet := fs.Bool("q", false, "suppress confirmation prompt")
@@ -489,11 +492,8 @@ func cmdAppsRm(args []string) int {
 		return printErr("Not logged in", err)
 	}
 	if !*quiet {
-		fmt.Fprintf(os.Stderr, "Delete %q and all its deployments? [y/N] ", slug)
-		var ans string
-		_, _ = fmt.Scanln(&ans)
-		if strings.ToLower(strings.TrimSpace(ans)) != "y" {
-			fmt.Println("aborted")
+		fmt.Fprintf(os.Stderr, "Delete %q and all its deployments?\n", slug)
+		if !requireTyped(slug) {
 			return 1
 		}
 	}
