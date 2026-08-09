@@ -375,6 +375,12 @@ var cliCommands = []cliCommand{
 		Short:   "Remove the stored token",
 	},
 	{
+		Name:    "signup",
+		DocSlug: "auth",
+		Short:   "Create a new account (signup [--email-only EMAIL])",
+		Flags:   []cliFlag{{Name: "email-only", Short: "send a one-time signup link to this email (no password prompt)"}},
+	},
+	{
 		Name:    "logs",
 		DocSlug: "logs",
 		Short:   "Tail app or deployment logs (--follow)",

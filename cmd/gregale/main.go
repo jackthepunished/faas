@@ -58,6 +58,7 @@ Commands:
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
+  signup       Create a new account (signup [--email-only EMAIL])
   man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
   logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
   metrics      Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
@@ -142,6 +143,8 @@ func run(args []string) int {
 		return cmdMan(args[1:])
 	case "login":
 		return cmdLogin(args[1:])
+	case dispatchSignup:
+		return cmdSignup(args[1:])
 	case "logout":
 		if len(args) > 1 {
 			PrintUsage(os.Stderr, "usage: gregale logout", "auth")
