@@ -1279,6 +1279,40 @@ func (c *Client) PasswordLogin(ctx context.Context, email, password string) (Pas
 		PasswordLoginRequest{Email: email, Password: password}, &out)
 }
 
+// ProgrammaticSignup creates an account (or signs in an existing one)
+// and returns a freshly-minted api_key. Used by `gregale signup` on
+// the interactive (password) path. The success body carries an
+// api_key.Plaintext — the caller must persist it before returning.
+//
+// Distinct from PasswordSignup: this hits the JSON-only
+// /v1/auth/signup route (no session cookie), and the response
+// carries the api_key payload. Both /v1/auth/signup and
+// /v1/auth/login return the same ProgrammaticAuthResponse shape.
+func (c *Client) ProgrammaticSignup(ctx context.Context, email, password string) (ProgrammaticAuthResponse, error) {
+	var out ProgrammaticAuthResponse
+	return out, c.do(ctx, "POST", "/v1/auth/signup",
+		PasswordSignupRequest{Email: email, Password: password}, &out)
+}
+
+// ProgrammaticLogin signs the caller in via email + password and
+// returns a freshly-issued api_key. Mirror of ProgrammaticSignup
+// for the "I already have an account" CLI use case. Both endpoints
+// share the same wire shape.
+func (c *Client) ProgrammaticLogin(ctx context.Context, email, password string) (ProgrammaticAuthResponse, error) {
+	var out ProgrammaticAuthResponse
+	return out, c.do(ctx, "POST", "/v1/auth/login",
+		PasswordLoginRequest{Email: email, Password: password}, &out)
+}
+
+// RequestMagicLinkSignup asks the server to email a one-time signup
+// link. Always returns 200 with an identical body — the response is
+// not a Promise of email; the CLI prints "Check your email" and
+// exits 0 regardless of whether the email is bound (anti-enumeration).
+func (c *Client) RequestMagicLinkSignup(ctx context.Context, email string) error {
+	return c.do(ctx, "POST", "/v1/auth/signup/magic-link",
+		MagicLinkSignupRequest{Email: email}, nil)
+}
+
 // RequestPasswordReset mints a password-reset email. The server
 // always returns 200 with an identical body regardless of whether the
 // email is bound to an account, so the surface does not leak account

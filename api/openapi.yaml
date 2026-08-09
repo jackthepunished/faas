@@ -627,6 +627,111 @@ paths:
                   status: { type: string, enum: [ok] }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/auth/signup:
+    post:
+      tags: [auth]
+      operationId: programmaticSignup
+      summary: Programmatic signup (JSON-only, bearer-key CLI path).
+      description: |
+        Issue #311 / `gregale signup` — JSON-only endpoint that
+        creates an account (or signs the caller in idempotently),
+        mints a fresh programmatic API key, and returns the
+        `ProgrammaticAuthResponse` payload. The CLI persists the
+        plaintext via `saveToken()` without a dashboard round-trip.
+
+        Anti-enumeration posture mirrors `/signup`:
+          - email unbound: create + set password + mint key.
+          - email bound + same password: idempotent sign-in + mint key.
+          - email bound + different password: 401 `invalid_credentials`.
+        No Set-Cookie header; bearer-key only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordSignupRequest'
+      responses:
+        '200':
+          description: |
+            Account created (or reused) + freshly minted API key.
+            The plaintext is returned ONCE; the caller persists it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProgrammaticAuthResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: programmaticLogin
+      summary: Programmatic login (JSON-only, bearer-key CLI path).
+      description: |
+        Issue #311 / `gregale login` mirror — JSON-only endpoint
+        that authenticates an email + password and returns a
+        `ProgrammaticAuthResponse` payload. Same response shape as
+        `/v1/auth/signup` so the CLI can reuse its unmarshaler.
+
+        Anti-enumeration posture mirrors `/login`: Argon2id pad
+        on the no-row branch, identical 401 on wrong-password vs
+        unbound email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordLoginRequest'
+      responses:
+        '200':
+          description: Authenticated + freshly minted API key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProgrammaticAuthResponse'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/auth/signup/magic-link:
+    post:
+      tags: [auth]
+      operationId: programmaticSignupMagicLink
+      summary: Magic-link signup (JSON-only, no password).
+      description: |
+        Issue #311 / `gregale signup --email-only EMAIL` — emails
+        a one-time signup link to the given address. Always
+        returns 200 with the same body regardless of whether the
+        email is bound, unbound, malformed, or missing in the
+        request — the response cannot be used to enumerate
+        accounts.
+
+        On a real-account hit, the handler creates the account if
+        unbound, mints a 32-byte token, persists its SHA-256 via
+        `IssueLoginToken` (15-minute TTL), and emails the
+        `/auth/verify?token=...` link through the platform mailer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MagicLinkSignupRequest'
+      responses:
+        '200':
+          description: |
+            Request accepted. The signup link is mailed if the address
+            is recognised (or could be registered).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /auth/reset:
     get:
       tags: [auth]
@@ -5486,6 +5591,55 @@ components:
       properties:
         email: { type: string, format: email }
         password: { type: string, minLength: 12, maxLength: 256 }
+
+    ProgrammaticAuthResponse:
+      description: |
+        Body for the JSON-only POST /v1/auth/{signup,login} pair
+        (issue #311). Distinct from PasswordLoginResponse: this
+        one carries the `api_key` payload so the bearer-key CLI
+        can use the result without a dashboard round-trip. The
+        plaintext is returned ONCE; the caller persists it via
+        `saveToken()` before this response is dropped.
+      type: object
+      required: [account_id, plan, api_key]
+      properties:
+        account_id: { type: string, description: "Account UUID." }
+        plan: { type: string, enum: [free, hobby, pro, scale] }
+        api_key:
+          $ref: '#/components/schemas/ProgrammaticAPIKey'
+
+    ProgrammaticAPIKey:
+      description: |
+        Freshly minted API key returned on the first
+        request. The `plaintext` field is the only copy the
+        caller will ever see — store it in `~/.config/faas/auth.json`
+        immediately. The `id` is the row's UUID for later
+        list/delete via `/v1/keys`.
+      type: object
+      required: [plaintext, prefix, id]
+      properties:
+        plaintext:
+          type: string
+          description: |
+            `fp_live_<48-hex>`. Returned ONCE.
+        prefix:
+          type: string
+          description: |
+            `fp_live_<8-hex>` — the prefix used in the auth
+            header for greppable identification.
+        id:
+          type: string
+          description: "API key row UUID."
+
+    MagicLinkSignupRequest:
+      description: |
+        Email for the magic-link signup path. Optional; the
+        handler accepts a missing or unparseable email and still
+        returns 200 so the response cannot be used to enumerate
+        accounts.
+      type: object
+      properties:
+        email: { type: string, format: email }
 
     PasswordResetRequest:
       description: "Email for a password-reset request. Optional — the form-page path submits no body; the SDK sends the email."

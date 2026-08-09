@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -565,6 +566,277 @@ func writeLoginJSON(w http.ResponseWriter, acct state.Account) {
 		AccountID: acct.ID,
 		Plan:      string(acct.Plan),
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic auth surface (issue #311) — JSON-only, bearer-key CLI path.
+// ---------------------------------------------------------------------------
+
+// magicLinkPath is the verify URL the on-disk link points at. Kept
+// distinct from resetTokenPath so future copy/branding can diverge
+// without changing the wire shape.
+const magicLinkPath = "/auth/verify"
+
+// postV1AuthSignup is the JSON-only POST /v1/auth/signup. Returns a
+// ProgrammaticAuthResponse{account_id, plan, api_key} on success so
+// the gregale CLI can persist the plaintext via saveToken() without
+// a dashboard round-trip.
+//
+// Anti-enumeration posture (spec §11):
+//   - email unbound: create account, set password, mint api_key, return 200.
+//   - email bound + same password: idempotent sign-in, mint a fresh
+//     api_key, return 200.
+//   - email bound + different password: pad Argon2id verify, emit
+//     failed-login audit, return 401 invalid_credentials (NEVER 409 —
+//     an attacker cannot enumerate via /v1/auth/signup).
+//   - weak password: 400 password_too_weak (mirrors the postSignup path).
+//
+// The wire shape is identical to postV1AuthLogin so the CLI can reuse
+// the same ProgrammaticAuthResponse unmarshaler.
+func (s *server) postV1AuthSignup(w http.ResponseWriter, r *http.Request) {
+	email, password, ok := decodeEmailPasswordRequest(w, r)
+	if !ok {
+		return
+	}
+	if err := auth.Validate(password); err != nil {
+		api.WriteProblem(w, api.ErrPasswordTooWeak(err.Error()))
+		return
+	}
+
+	acct, err := s.store.AccountByEmail(r.Context(), email)
+	if err != nil {
+		// Email unbound — create the account, set the password, mint
+		// a fresh api_key. Mirrors the postSignup race-closure: a
+		// concurrent signup returns ErrConflict which we collapse to
+		// the idempotent sign-in path so the duplicate caller never
+		// learns "this email is taken".
+		res, createErr := s.store.CreateAccountWithPersonalOrg(r.Context(), state.CreateAccountWithPersonalOrgParams{
+			Email: email,
+			Plan:  api.PlanFree,
+		})
+		if createErr != nil {
+			if errors.Is(createErr, state.ErrConflict) {
+				existing, ok := s.verifyPasswordOrPad(r.Context(), email, password)
+				if !ok {
+					s.audit.EmitFailedLogin(
+						middleware.ClientIP(r),
+						auth.HashEmail(email),
+						r.UserAgent())
+					api.WriteProblem(w, api.ErrInvalidCredentials())
+					return
+				}
+				s.mintAndWriteV1AuthJSON(w, r, existing)
+				return
+			}
+			email = strings.ReplaceAll(email, "\r", "")
+			email = strings.ReplaceAll(email, "\n", "")
+			s.log.Error("v1auth_signup.create_account", "err", createErr, "email", email)
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				"internal_error", "Internal Error", "failed to create account"))
+			return
+		}
+		created := res.Account
+		phc, err := auth.Encode(password)
+		if err != nil {
+			s.log.Error("v1auth_signup.argon2id_encode", "err", err)
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				"internal_error", "Internal Error", "failed to hash password"))
+			return
+		}
+		if err := s.store.SetAccountPassword(r.Context(), created.ID, phc); err != nil {
+			s.log.Error("v1auth_signup.set_password", "err", err)
+			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+				"internal_error", "Internal Error", "failed to set password"))
+			return
+		}
+		s.mintAndWriteV1AuthJSON(w, r, created)
+		return
+	}
+
+	// Email is bound. Two sub-cases — same as the postSignup path.
+	hash, err := s.store.AccountPasswordByAccountID(r.Context(), acct.ID)
+	if err != nil {
+		// Bound account with no password row (OAuth-only): pad.
+		_, _ = auth.Verify(auth.DummyPHC, password)
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			auth.HashEmail(email),
+			r.UserAgent())
+		api.WriteProblem(w, api.ErrInvalidCredentials())
+		return
+	}
+	ok, err = auth.Verify(hash, password)
+	if err != nil || !ok {
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			auth.HashEmail(email),
+			r.UserAgent())
+		api.WriteProblem(w, api.ErrInvalidCredentials())
+		return
+	}
+	s.mintAndWriteV1AuthJSON(w, r, acct)
+}
+
+// postV1AuthLogin is the JSON-only POST /v1/auth/login. Same response
+// shape as postV1AuthSignup (ProgrammaticAuthResponse). Mirrors the
+// anti-enumeration posture of postLoginEmail: Argon2id pad on the
+// no-row branch, identical 401 on wrong-password vs unbound email.
+func (s *server) postV1AuthLogin(w http.ResponseWriter, r *http.Request) {
+	email, password, ok := decodeEmailPasswordRequest(w, r)
+	if !ok {
+		return
+	}
+	acct, hit := s.verifyPasswordOrPad(r.Context(), email, password)
+	if !hit {
+		s.audit.EmitFailedLogin(
+			middleware.ClientIP(r),
+			auth.HashEmail(email),
+			r.UserAgent())
+		api.WriteProblem(w, api.ErrInvalidCredentials())
+		return
+	}
+	s.mintAndWriteV1AuthJSON(w, r, acct)
+}
+
+// postV1AuthSignupMagicLink is the JSON-only POST /v1/auth/signup/magic-link.
+// ALWAYS returns 200 with an identical body regardless of whether the
+// email is bound, so the response cannot be used to enumerate accounts.
+// On a real-account hit, mint a 32-byte token, persist via
+// IssueLoginToken with a 15-minute TTL, and email the
+// /auth/verify?token=… link via the platform mailer.
+func (s *server) postV1AuthSignupMagicLink(w http.ResponseWriter, r *http.Request) {
+	email := strings.TrimSpace(strings.ToLower(extractEmailFromRequest(r)))
+	if email != "" && looksLikeEmail(email) {
+		acct, err := s.store.AccountByEmail(r.Context(), email)
+		if err != nil {
+			// Unbound: create the account on the magic-link path so
+			// the dashboard verify page lands the user on a logged-in
+			// session for a fresh address. Mirrors the same shape as
+			// postForgotPassword (mailer fires only on a real hit).
+			res, createErr := s.store.CreateAccountWithPersonalOrg(r.Context(), state.CreateAccountWithPersonalOrgParams{
+				Email: email,
+				Plan:  api.PlanFree,
+			})
+			if createErr == nil {
+				acct = res.Account
+			} else if !errors.Is(createErr, state.ErrConflict) {
+				email = strings.ReplaceAll(email, "\r", "")
+				email = strings.ReplaceAll(email, "\n", "")
+				s.log.Error("v1auth_signup_magic.create_account", "err", createErr, "email", email)
+			}
+		}
+		if acct.ID != "" {
+			s.sendMagicLinkEmail(r.Context(), r, acct, email)
+		}
+	}
+	// Always 200 with the same body. Anti-enumeration.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, `{"status":"ok"}`)
+}
+
+// mintAndWriteV1AuthJSON mints a fresh programmatic api_key for acct
+// and writes the ProgrammaticAuthResponse body. Mirrors the
+// /v1/keys mint pattern (handlers_ext.go:1751): GenerateAPIKey →
+// SHA-256 → CreateAPIKeyWithExpiryAndProvenance with provenance
+// ("cli_signup", ip, ua), label "signup", expiry 0. The audit
+// provenance columns (created_ip, created_ua) are stamped on the
+// row so a SOC 2 auditor can answer "who minted this key from which
+// UA" without joining through Loki (R2 risk).
+func (s *server) mintAndWriteV1AuthJSON(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	plaintext, hash, err := api.GenerateAPIKey()
+	if err != nil {
+		s.log.Error("v1auth_signup.generate_key", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			"internal_error", "Internal Error", "could not generate api key"))
+		return
+	}
+	bindIP := clientIPFromRequest(r)
+	bindUA := r.UserAgent()
+	org, perr := s.store.OrgByPersonalAccount(r.Context(), acct.ID)
+	var k state.APIKey
+	switch {
+	case perr == nil:
+		// Personal-org modern path. The label "signup" distinguishes
+		// these rows from /v1/keys-add key-mints in the audit query.
+		k, err = s.store.CreateOrgAPIKeyWithProvenance(r.Context(), org.ID, acct.ID, hash, "signup", nil, nil, bindIP, bindUA, nil)
+	case errors.Is(perr, state.ErrNotFound):
+		// Legacy fallback (pre-00127 fixtures). Same provenance columns.
+		k, err = s.store.CreateAPIKeyWithExpiryAndProvenance(r.Context(), acct.ID, hash, "signup", nil, nil, bindIP, bindUA, nil)
+	default:
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			"internal_error", "Internal Error", "could not resolve personal org"))
+		return
+	}
+	if err != nil {
+		s.log.Error("v1auth_signup.create_key", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			"internal_error", "Internal Error", "could not create api key"))
+		return
+	}
+	writeV1AuthJSON(w, acct, plaintext, k)
+}
+
+// writeV1AuthJSON writes the ProgrammaticAuthResponse with the
+// freshly-minted api_key payload. The plaintext is returned ONCE;
+// the caller (gregale CLI) persists via saveToken() before this
+// response is dropped.
+func writeV1AuthJSON(w http.ResponseWriter, acct state.Account, plaintext string, k state.APIKey) {
+	prefix := api.APIKeyPrefix
+	if len(plaintext) >= len(api.APIKeyPrefix)+8 {
+		prefix = plaintext[:len(api.APIKeyPrefix)+8]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(api.ProgrammaticAuthResponse{
+		AccountID: acct.ID,
+		Plan:      string(acct.Plan),
+		APIKey: api.ProgrammaticAPIKey{
+			Plaintext: plaintext,
+			Prefix:    prefix,
+			ID:        k.ID,
+		},
+	})
+}
+
+// sendMagicLinkEmail is the magic-link sibling of sendPasswordResetEmail:
+// mints a 32-byte token, persists SHA-256(token) via IssueLoginToken
+// with a 15-minute TTL, and emails the base64url-encoded plaintext
+// via the platform mailer. Mailer errors are logged but never
+// surface — the public endpoint remains a constant 200.
+func (s *server) sendMagicLinkEmail(ctx context.Context, r *http.Request, acct state.Account, email string) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		s.log.Error("v1auth_signup_magic.rand", "err", err)
+		return
+	}
+	hash := api.HashToken(raw)
+	expiresAt := time.Now().Add(passwordResetTTL)
+	if err := s.store.IssueLoginToken(ctx, hash, acct.ID, expiresAt); err != nil {
+		s.log.Error("v1auth_signup_magic.issue_token", "err", err)
+		return
+	}
+	scheme := schemeHTTP
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == schemeHTTPS {
+		scheme = schemeHTTPS
+	}
+	host := r.Host
+	if s.domain != "" && s.domain != domainUnset {
+		host = s.domain
+		scheme = schemeHTTPS
+	}
+	link := fmt.Sprintf("%s://%s%s?token=%s", scheme, host, magicLinkPath, base64.RawURLEncoding.EncodeToString(raw))
+	body := fmt.Sprintf(
+		"Hi,\n\nWelcome to faas. Confirm your email by clicking the link below (valid for 15 minutes):\n\n  %s\n\nIf you did not request this, you can ignore this email.\n",
+		link)
+	subject := "Confirm your faas account"
+	if err := s.mailer.Send(ctx, Message{
+		To:       []string{email},
+		Subject:  subject,
+		TextBody: body,
+	}); err != nil {
+		s.log.Error("v1auth_signup_magic.mailer", "err", err)
+	}
 }
 
 // Keep the imports tidy — these helpers are referenced by the

@@ -1190,6 +1190,23 @@ func (s *server) handler() http.Handler {
 		// faster than the spec §11 10/min/IP budget.
 		CountStatuses: []int{http.StatusUnauthorized, http.StatusGone},
 	}, http.HandlerFunc(auth.verify)))
+	// Programmatic auth surface (issue #311). JSON-only, bearer-key
+	// CLI path — three endpoints that share the spec §11 10/min/IP
+	// authlimit bucket with the rest of the cookie auth surface.
+	// Distinct from the dashboard /login|/signup cookie surface by
+	// response shape (ProgrammaticAuthResponse carries api_key, no
+	// Set-Cookie header) and by being behind the same authlimit
+	// counter so a brute-force on /v1/auth/login burns the same
+	// bucket as /login.
+	mux.Handle("POST /v1/auth/signup", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.postV1AuthSignup)))
+	mux.Handle("POST /v1/auth/login", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.postV1AuthLogin)))
+	mux.Handle("POST /v1/auth/signup/magic-link", s.dashboardAuthChain(middleware.AuthLimitConfig{
+		CountStatuses: []int{middleware.CountEveryAttempt},
+	}, http.HandlerFunc(s.postV1AuthSignupMagicLink)))
 	mux.Handle("POST /logout", s.dashboardChain(http.HandlerFunc(auth.logout)))
 	// /oauth/callback is the GitHub App install redirect target
 	// (review finding #1+#2 closure for the M7.5 OAuth path).
