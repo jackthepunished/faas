@@ -54,10 +54,7 @@ func TestDetectVersion_NodeNvmrc(t *testing.T) {
 		".nvmrc":       "22.11.0\n",
 		"package.json": `{"engines":{"node":">=20.0.0"}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "22.11.0" {
 		t.Errorf("got %q, want %q", got, "22.11.0")
 	}
@@ -67,10 +64,7 @@ func TestDetectVersion_NodeNvmrcVPrefix(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		".nvmrc": "v22.11.0\n",
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "22.11.0" {
 		t.Errorf("got %q, want %q", got, "22.11.0")
 	}
@@ -80,10 +74,7 @@ func TestDetectVersion_NodeEnginesCaret(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		"package.json": `{"engines":{"node":"^22.11.0"}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "22.11.0" {
 		t.Errorf("got %q, want %q", got, "22.11.0")
 	}
@@ -93,10 +84,7 @@ func TestDetectVersion_NodeEnginesOnly(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		"package.json": `{"engines":{"node":">=20.0.0"}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "20.0.0" {
 		t.Errorf("got %q, want %q", got, "20.0.0")
 	}
@@ -108,10 +96,7 @@ func TestDetectVersion_NvmrcWinsOverEngines(t *testing.T) {
 		".nvmrc":       "20.10.0",
 		"package.json": `{"engines":{"node":">=22.11.0"}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "20.10.0" {
 		t.Errorf("got %q, want %q (nvmrc should win)", got, "20.10.0")
 	}
@@ -121,10 +106,7 @@ func TestDetectVersion_PythonPythonVersion(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		".python-version": "3.11.0",
 	})
-	got, err := detectVersion(p, FrameworkPython)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkPython)
 	if got != "3.11.0" {
 		t.Errorf("got %q, want %q", got, "3.11.0")
 	}
@@ -137,10 +119,7 @@ name = "demo"
 requires-python = ">=3.13"
 `,
 	})
-	got, err := detectVersion(p, FrameworkPython)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkPython)
 	if got != "3.13" {
 		t.Errorf("got %q, want %q", got, "3.13")
 	}
@@ -153,10 +132,7 @@ func TestDetectVersion_GoDirective(t *testing.T) {
 go 1.24
 `,
 	})
-	got, err := detectVersion(p, FrameworkGo)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkGo)
 	if got != "1.24" {
 		t.Errorf("got %q, want %q", got, "1.24")
 	}
@@ -166,10 +142,7 @@ func TestDetectVersion_EmptyWhenUnknown(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		"README.md": "hello",
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "" {
 		t.Errorf("got %q, want empty", got)
 	}
@@ -180,10 +153,7 @@ func TestDetectVersion_EmptyWhenMalformedJSON(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		"package.json": `{"engines": { "node": `, // truncated
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: malformed JSON must not error, got %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "" {
 		t.Errorf("got %q, want empty", got)
 	}
@@ -194,26 +164,16 @@ func TestDetectVersion_DockerEmpty(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		"Dockerfile": "FROM scratch",
 	})
-	got, err := detectVersion(p, FrameworkDocker)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkDocker)
 	if got != "" {
 		t.Errorf("got %q, want empty for docker", got)
 	}
 }
 
 func TestDetectVersion_TarballMissing(t *testing.T) {
-	// Non-existent file should error gracefully (Detect itself returns
-	// an error which DetectWithVersion propagates). detectVersion
-	// itself is best-effort but the underlying readTarFile errors.
-	// We assert that the function does not panic.
-	got, err := detectVersion("/nonexistent/path.tar.gz", FrameworkNode)
-	if err != nil {
-		// acceptable — the readTarFile error is non-fatal for the
-		// caller because DetectWithVersion swallows it.
-		t.Logf("expected error for missing tarball: %v", err)
-	}
+	// Non-existent file should not panic; returns "" because the
+	// underlying readTarFile swallows the open error.
+	got := detectVersion("/nonexistent/path.tar.gz", FrameworkNode)
 	if got != "" {
 		t.Errorf("got %q, want empty", got)
 	}
@@ -230,10 +190,7 @@ func TestDetectVersion_OversizedFileTreatedAsMissing(t *testing.T) {
 		".nvmrc":       string(big),
 		"package.json": `{"engines":{"node":">=22.11.0"}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "22.11.0" {
 		t.Errorf("got %q, want %q (oversized .nvmrc should fall back to engines.node)", got, "22.11.0")
 	}
@@ -245,10 +202,7 @@ func TestDetectVersion_NodeDeepNestedIgnored(t *testing.T) {
 		"apps/web/.nvmrc": "22.11.0",
 		"package.json":    `{"engines":{"node":">=20.0.0"}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "20.0.0" {
 		t.Errorf("got %q, want %q (nested .nvmrc must be ignored)", got, "20.0.0")
 	}
@@ -259,10 +213,7 @@ func TestDetectVersion_EnginesNodeNotString(t *testing.T) {
 	p := tempTarball(t, map[string]string{
 		"package.json": `{"engines":{"node":22}}`,
 	})
-	got, err := detectVersion(p, FrameworkNode)
-	if err != nil {
-		t.Fatalf("detectVersion: %v", err)
-	}
+	got := detectVersion(p, FrameworkNode)
 	if got != "" {
 		t.Errorf("got %q, want empty", got)
 	}

@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"regexp"
@@ -23,9 +22,9 @@ const maxVersionFileBytes = 64 * 1024
 // inferred language version for the given framework, or "" if no
 // version can be determined. The function is purely additive: every
 // parser returns "" on any parse error (malformed JSON, missing
-// fields, comments-only pyproject.toml) so a bad source file never
-// breaks the build. The build pipeline never reads this value — it
-// exists for operator observability (ADR-087).
+// fields, comments-only pyproject.toml, unreadable tarball) so a bad
+// source file never breaks the build. The build pipeline never reads
+// this value — it exists for operator observability (ADR-087).
 //
 // Per-framework priority order:
 //
@@ -42,63 +41,59 @@ const maxVersionFileBytes = 64 * 1024
 // on the control plane (ADR-052).
 //
 //nolint:forbidigo // path is the apid-spooled tarball; same rationale as Detect above.
-func detectVersion(path string, fw Framework) (string, error) {
+func detectVersion(path string, fw Framework) string {
 	switch fw {
 	case FrameworkNode:
-		nvmrc, err := readTarFile(path, ".nvmrc")
-		if err == nil && nvmrc != "" {
+		if nvmrc := readTarFile(path, ".nvmrc"); nvmrc != "" {
 			if v := normalizeSemver(stripLines(nvmrc)); v != "" {
-				return v, nil
+				return v
 			}
 		}
-		pkg, err := readTarFile(path, "package.json")
-		if err == nil && pkg != "" {
+		if pkg := readTarFile(path, "package.json"); pkg != "" {
 			if v := versionFromPackageJSONNode(pkg); v != "" {
-				return v, nil
+				return v
 			}
 		}
 	case FrameworkPython:
-		pyver, err := readTarFile(path, ".python-version")
-		if err == nil && pyver != "" {
+		if pyver := readTarFile(path, ".python-version"); pyver != "" {
 			if v := normalizePythonVersion(stripLines(pyver)); v != "" {
-				return v, nil
+				return v
 			}
 		}
-		pyproj, err := readTarFile(path, "pyproject.toml")
-		if err == nil && pyproj != "" {
+		if pyproj := readTarFile(path, "pyproject.toml"); pyproj != "" {
 			if v := versionFromPyprojectRequires(pyproj); v != "" {
-				return v, nil
+				return v
 			}
 		}
 	case FrameworkGo:
-		gomod, err := readTarFile(path, "go.mod")
-		if err == nil && gomod != "" {
+		if gomod := readTarFile(path, "go.mod"); gomod != "" {
 			if v := versionFromGoModDirective(gomod); v != "" {
-				return v, nil
+				return v
 			}
 		}
 	case FrameworkDocker, FrameworkUnknown:
 		// explicit out-of-scope / no anchor
 	}
-	return "", nil
+	return ""
 }
 
 // readTarFile extracts the top-level file named entryName from the
 // gzipped tarball at path and returns its contents (capped at
-// maxVersionFileBytes). Returns "" on any error so the caller treats
-// the file as "not present" — the build pipeline never depends on
-// version detection.
-func readTarFile(path, entryName string) (string, error) {
+// maxVersionFileBytes). Returns "" on any error or oversized entry so
+// the caller treats the file as "not present" — the build pipeline
+// never depends on version detection. Errors are intentionally
+// swallowed: parse failures are not failures of the build.
+func readTarFile(path, entryName string) string {
 	//nolint:forbidigo // path is the apid-spooled tarball; same trust rationale as Detect above.
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open: %w", err)
+		return ""
 	}
 	defer func() { _ = f.Close() }()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return "", fmt.Errorf("gzip: %w", err)
+		return ""
 	}
 	defer func() { _ = gz.Close() }()
 
@@ -107,10 +102,10 @@ func readTarFile(path, entryName string) (string, error) {
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return "", nil
+			return ""
 		}
 		if err != nil {
-			return "", fmt.Errorf("tar: %w", err)
+			return ""
 		}
 		// Top-level only — nested configs (e.g. apps/web/.nvmrc) are
 		// not part of the source-marker scan. Mirrors Detector.Detect.
@@ -126,12 +121,12 @@ func readTarFile(path, entryName string) (string, error) {
 		lr := io.LimitReader(tr, maxVersionFileBytes+1)
 		buf, err := io.ReadAll(lr)
 		if err != nil {
-			return "", fmt.Errorf("read: %w", err)
+			return ""
 		}
 		if len(buf) > maxVersionFileBytes {
-			return "", nil // treat as missing
+			return "" // treat as missing
 		}
-		return string(buf), nil
+		return string(buf)
 	}
 }
 
@@ -149,36 +144,30 @@ func stripLines(s string) string {
 	return ""
 }
 
-// semverLike is a permissive dotted-version matcher: 1.2.3, 22.11.0,
-// 1.24. Optional pre-release suffix is stripped. The first match is
-// captured so callers see the bare version.
-var semverLike = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
-
-// pythonSemverLike matches dotted versions of the form 3.11.0 / 3.11.
-// Defaults to 3-component, but the regex accepts 2-component because
-// .python-version commonly writes "3.11" without patch.
-var pythonSemverLike = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
+// versionLike is the dotted-version matcher used by both the node and
+// python normalizers. The .python-version file commonly writes "3.11"
+// (two-component) so the regex accepts X.Y or X.Y.Z. The matcher's
+// first hit is returned, so a body like "engines.node >= 22.11.0"
+// yields "22.11.0".
+var versionLike = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
 
 // normalizeSemver strips a leading "v" and extracts the first dotted
 // version it can find. Returns "" on no match.
 func normalizeSemver(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")
-	if m := semverLike.FindString(s); m != "" {
-		return m
-	}
-	return ""
+	return versionLike.FindString(s)
 }
 
 // normalizePythonVersion strips a leading "v" and returns the first
 // dotted version. .python-version files are commonly just "3.11."
+// Kept as a named entry point for symmetry with the CLI mirror
+// (cmd/gregale/pack.go::normalizeVersion), even though the
+// implementation is identical today.
 func normalizePythonVersion(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")
-	if m := pythonSemverLike.FindString(s); m != "" {
-		return m
-	}
-	return ""
+	return versionLike.FindString(s)
 }
 
 // versionFromPackageJSONNode parses engines.node from a package.json
@@ -203,7 +192,9 @@ func versionFromPackageJSONNode(body string) string {
 		return ""
 	}
 	s = strings.TrimSpace(s)
-	// Strip the leading operator (^, ~, >=, >, <=, <, =).
+	// Strip the leading operator. Order matters: 2-char prefixes
+	// (>=, <=) come first so they're not eaten by the single-char
+	// match.
 	for _, op := range []string{">=", "<=", ">", "<", "^", "~", "="} {
 		if strings.HasPrefix(s, op) {
 			s = strings.TrimPrefix(s, op)
@@ -214,8 +205,12 @@ func versionFromPackageJSONNode(body string) string {
 	return normalizeSemver(s)
 }
 
-// versionFromPyprojectRequires pulls the first dotted version out of
-// the requires-python = ">=3.11" line. Strips the operator prefix.
+// pyprojectRequiresRe matches the leading
+//
+//	requires-python = ">=3.11"
+//
+// line in a pyproject.toml body. The capture group is the bare string
+// after the equals sign, with quotes stripped.
 var pyprojectRequiresRe = regexp.MustCompile(`(?i)requires-python\s*=\s*["']([^"']+)["']`)
 
 // versionFromPyprojectRequires parses the bare string version. We do

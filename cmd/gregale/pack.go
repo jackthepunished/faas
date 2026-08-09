@@ -219,7 +219,7 @@ func detectFrameworkVersion(srcDir string, fw framework) string {
 	switch fw {
 	case fwNode:
 		if v := cliReadFirstLine(srcDir, ".nvmrc"); v != "" {
-			if out := normalizeSemver(stripVersionPrefix(v)); out != "" {
+			if out := normalizeVersion(stripVersionPrefix(v)); out != "" {
 				return out
 			}
 		}
@@ -230,7 +230,7 @@ func detectFrameworkVersion(srcDir string, fw framework) string {
 		}
 	case fwPython:
 		if v := cliReadFirstLine(srcDir, ".python-version"); v != "" {
-			if out := normalizePythonVersion(stripVersionPrefix(v)); out != "" {
+			if out := normalizeVersion(stripVersionPrefix(v)); out != "" {
 				return out
 			}
 		}
@@ -249,6 +249,30 @@ func detectFrameworkVersion(srcDir string, fw framework) string {
 		// explicit out-of-scope / no anchor
 	}
 	return ""
+}
+
+// funcErrorSuggestion returns the trailing "Detected <fw> project ..."
+// snippet for the --function error path, or "" when the snippet
+// would be empty / malformed (no version file, no whitelisted
+// runtime). Extracted from resolveDeployShape so the conditional is
+// readable and so the malformed-runtime case (e.g. node 26 → no
+// whitelisted entry → empty --runtime) is impossible.
+func funcErrorSuggestion(srcDir string) string {
+	fw := detectFramework(srcDir)
+	if fw == fwUnknown || fw == fwDocker {
+		return ""
+	}
+	ver := detectFrameworkVersion(srcDir, fw)
+	if ver == "" {
+		return ""
+	}
+	rt := runtimeSuggestionFor(fw, ver)
+	if rt == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		" Detected %s project (version %s) — try `--runtime %s --handler handler.handler`.",
+		fw, ver, rt)
 }
 
 // cliReadFile reads up to 64 KB of the named file in srcDir and returns
@@ -292,24 +316,20 @@ func stripVersionPrefix(s string) string {
 	return strings.TrimPrefix(strings.TrimSpace(s), "v")
 }
 
-// normalizeSemver extracts the first dotted version (X.Y or X.Y.Z) from
-// s. Mirrors pkg/builderd/detectversion.go::normalizeSemver.
-func normalizeSemver(s string) string {
-	m := semverLikeCLI.FindString(s)
-	return m
-}
+// versionLikeCLI is the dotted-version matcher used by both the
+// node and python parsers. The .python-version file commonly writes
+// "3.11" (two-component) so the regex accepts X.Y or X.Y.Z. Mirrors
+// pkg/builderd/detectversion.go::semverLike.
+var versionLikeCLI = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
 
-// normalizePythonVersion mirrors the server-side normalizer.
-func normalizePythonVersion(s string) string {
-	m := pythonSemverLikeCLI.FindString(s)
-	return m
+// normalizeVersion extracts the first dotted version (X.Y or X.Y.Z)
+// from s. Mirrors pkg/builderd/detectversion.go::normalizeSemver —
+// the server kept two named variants (semverLike / pythonSemverLike)
+// despite byte-identical regexes, so the CLI does too for symmetry,
+// and uses one shared regex to avoid duplication.
+func normalizeVersion(s string) string {
+	return versionLikeCLI.FindString(s)
 }
-
-// pre-compiled regexes (CLI mirror). Identical to the server-side
-// versions in pkg/builderd/detectversion.go. Init-time via init() at
-// the bottom of this file would also work, but vars are simpler.
-var semverLikeCLI = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
-var pythonSemverLikeCLI = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
 
 // cliVersionFromPackageJSONNode mirrors pkg/builderd's
 // versionFromPackageJSONNode. Only the bare-version-extraction path is
@@ -332,13 +352,16 @@ func cliVersionFromPackageJSONNode(body string) string {
 		return ""
 	}
 	s = strings.TrimSpace(s)
+	// Strip the leading operator. Order matters: 2-char prefixes
+	// (>=, <=) come first so they're not eaten by the single-char
+	// match.
 	for _, op := range []string{">=", "<=", ">", "<", "^", "~", "="} {
 		if strings.HasPrefix(s, op) {
 			s = strings.TrimPrefix(s, op)
 			break
 		}
 	}
-	return normalizeSemver(strings.TrimSpace(s))
+	return normalizeVersion(strings.TrimSpace(s))
 }
 
 // cliVersionFromPyprojectRequires mirrors the server-side regex
@@ -360,7 +383,7 @@ func cliVersionFromPyprojectRequires(body string) string {
 	if comma := strings.Index(val, ","); comma >= 0 {
 		val = strings.TrimSpace(val[:comma])
 	}
-	return normalizePythonVersion(val)
+	return normalizeVersion(val)
 }
 
 // cliVersionFromGoModDirective mirrors the server-side regex.
@@ -376,19 +399,19 @@ func cliVersionFromGoModDirective(body string) string {
 // runtimeSuggestionFor maps a (framework, version) pair to the
 // closest whitelisted runtime name on the wire (cmd/apid/handlers.go:98).
 // Returns "" when no version is found or the framework is not
-// supported — the caller falls back to the bare error. The
-// whitelist is intentionally a small allow-list; we do not surface
-// never-released majors (e.g. "node26") because the build pipeline
-// wouldn't have a matching FAAS_DEPLOY_BASE_REF_NODE26 to consume.
+// supported — the caller falls back to the bare error.
 //
 // Fallback policy: when the marker's version is older than the
 // lowest whitelisted runtime (e.g. node20 → node22, python3.11 →
-// python312), we still suggest the closest available — the explicit
+// python312) we still suggest the closest available — the explicit
 // --runtime flag the customer types MUST be whitelisted, and the
 // marker's intent ("I want node 20") is best served by the closest
-// available (node22 is M6 v1's lowest). Returning "" would leave the
-// customer with the bare "no handler file" error and no actionable
-// hint, which is the opposite of the issue #740 / ADR-087 goal.
+// available. When the version is NEWER than the highest whitelisted
+// runtime (e.g. node26 → highest is node24, hypothetical python3.15
+// → highest is python313) we still suggest the highest available —
+// refusing to lie about a non-existent runtime is moot when the
+// closest is the highest whitelisted entry the customer can actually
+// type. Returning "" only on a totally unparseable version.
 func runtimeSuggestionFor(fw framework, ver string) string {
 	if ver == "" {
 		return ""
@@ -402,11 +425,7 @@ func runtimeSuggestionFor(fw framework, ver string) string {
 		return ""
 	}
 	// The whitelist (cmd/apid/handlers.go:98) is the source of truth:
-	// node22, node24, python312, python313, go124. Below the lowest
-	// entry we still suggest the lowest entry (e.g. node20 → node22).
-	// Above the highest entry we refuse to lie: a node 26 source
-	// has no node26 runtime, so we return "" rather than suggest
-	// node24.
+	// node22, node24, python312, python313, go124.
 	switch fw {
 	case fwNode:
 		switch {
@@ -438,8 +457,9 @@ func runtimeSuggestionFor(fw framework, ver string) string {
 	case fwGo:
 		if major >= 1 {
 			// 1.24 → go124. The whitelist only has one Go runtime
-			// today; a 1.25+ suggestion would be a lie, so we
-			// require minor >= 24 exactly.
+			// today; a 1.25+ suggestion would point to a runtime
+			// that doesn't exist yet, so we require minor >= 24
+			// exactly.
 			minor, mErr := strconv.Atoi(majorMinor[1])
 			if mErr != nil {
 				return ""
@@ -901,16 +921,11 @@ func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput
 			// the root, surface the marker's version as a runtime
 			// suggestion so the error message is actionable. The
 			// suggestion is best-effort: when no version file is
-			// present we fall back to the bare error.
-			fw := detectFramework(srcDir)
-			suggestion := ""
-			if fw != fwUnknown && fw != fwDocker {
-				if ver := detectFrameworkVersion(srcDir, fw); ver != "" {
-					suggestion = fmt.Sprintf(
-						" Detected %s project (version %s) — try `--runtime %s --handler handler.handler`.",
-						fw, ver, runtimeSuggestionFor(fw, ver))
-				}
-			}
+			// present, OR the version maps to no whitelisted
+			// runtime (e.g. an unreleased future major), we fall
+			// back to the bare error rather than emit a malformed
+			// `--runtime  --handler ...` arg.
+			suggestion := funcErrorSuggestion(srcDir)
 			return shapeUnknown, "", "", fmt.Errorf(
 				"--function requires a single handler.{js,ts,py,go} at the project root; "+
 					"found zero or ambiguous handler files in %s.%s",

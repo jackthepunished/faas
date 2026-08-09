@@ -104,6 +104,5 @@ func (d *Detector) DetectWithVersion(path string) (Framework, string, error) {
 	if err != nil {
 		return fw, "", err
 	}
-	ver, _ := detectVersion(path, fw) // best-effort; never propagates error
-	return fw, ver, nil
+	return fw, detectVersion(path, fw), nil
 }

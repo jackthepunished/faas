@@ -672,3 +672,73 @@ func TestRuntimeSuggestionFor(t *testing.T) {
 		})
 	}
 }
+
+// TestFuncErrorSuggestion pins the high-level "should the error
+// message include a marker suggestion, and if so does it have a
+// non-empty --runtime" contract. Regression: a previous version of
+// the suggestion logic emitted "Detected X project — try `--runtime
+//  --handler ...`." with an empty --runtime when the version mapped
+// to no whitelisted runtime. This test pins that the suggestion is
+// only emitted when runtimeSuggestionFor returns non-empty.
+func TestFuncErrorSuggestion(t *testing.T) {
+	cases := []struct {
+		name    string
+		files   map[string]string
+		wantSub string // substring the suggestion must contain; "" = no suggestion
+	}{
+		{
+			name:    "no_marker_no_suggestion",
+			files:   nil, // empty dir — no package.json, no go.mod
+			wantSub: "",
+		},
+		{
+			name:    "node_with_nvmrc_emits_full_suggestion",
+			files:   map[string]string{".nvmrc": "22.11.0", "package.json": "{}"},
+			wantSub: "`--runtime node22 --handler handler.handler`",
+		},
+		{
+			name: "node_with_nvmrc_no_empty_runtime_arg",
+			files: map[string]string{".nvmrc": "22.11.0", "package.json": "{}"},
+			// Sanity: a valid suggestion must never contain
+			// `--runtime  --handler` with an empty runtime. This
+			// is the regression-pin for the bug where
+			// runtimeSuggestionFor returned "" but the suggestion
+			// was still emitted with the empty arg.
+			wantSub: "`--runtime node22 --handler",
+		},
+		{
+			name:  "go_with_no_whitelisted_runtime_emits_no_suggestion",
+			files: map[string]string{"go.mod": "module x\n\ngo 1.22\n"},
+			// Even though a version IS detected (1.22),
+			// runtimeSuggestionFor("go", "1.22") == "" because
+			// the only whitelisted Go runtime is 1.24+, so the
+			// suggestion is suppressed rather than emitted with
+			// an empty --runtime.
+			wantSub: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for k, v := range tc.files {
+				writeFile(t, dir, k, v)
+			}
+			got := funcErrorSuggestion(dir)
+			if tc.wantSub == "" {
+				if got != "" {
+					t.Errorf("expected empty suggestion, got %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.wantSub) {
+				t.Errorf("expected suggestion to contain %q; got %q", tc.wantSub, got)
+			}
+			// Negative pin: no valid suggestion may contain an
+			// empty --runtime. This is the bug we're guarding
+			// against regression of.
+			if strings.Contains(got, "`--runtime  --handler") {
+				t.Errorf("suggestion must not contain empty --runtime; got %q", got)
+			}
+		})
+	}
+}
