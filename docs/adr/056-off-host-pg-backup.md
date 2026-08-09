@@ -1,7 +1,8 @@
 # ADR-056 · Off-host Postgres backup to Hetzner Storage Box
 
-- **Status:** proposed
+- **Status:** accepted v1.0
 - **Date:** 2026-07-31
+- **Accepted:** 2026-08-09
 - **Decision:** Ship a continuous WAL push (via a rewritten
   `archive_command`) + a nightly basebackup push (via a new
   `faas-pg-basebackup-push.{service,timer}` pair) to a Hetzner

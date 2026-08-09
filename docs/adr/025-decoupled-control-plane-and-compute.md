@@ -24,7 +24,7 @@ The following are still un-shipped at v1.1 time and gate the load-bearing failur
 
 - **Tier 1 Phase 3** (`OCIRegistryStorageBackend` end-to-end) — blocks the "Snapshot locality" row in §6.4. Mitigates the case where a compute node cold-boots without the per-app layer.
 - **Tier 1 Phase 4** (per-host egress policy templating) — blocks the "Egress policy per host" row in §6.4. Mitigates the case where one host's `policy_nftables.conf` references another host's `MasqueradeCIDR`.
-- **#250** (off-host Postgres backup) — gates production safety. Phase D runbook (`docs/runbooks/multi-host-rollout.md`, not yet written) inherits this. Multi-host without off-host PG backup means a CP-host loss is unrecoverable.
+- **#250** (off-host Postgres backup) — **RETIRED 2026-08-09** by ADR-056 acceptance (v1.0). The compound `archive_command` (cp + rclone to Hetzner Storage Box), `faas-pg-basebackup-push.{service,timer}` pair, sealed-at-rest `/etc/faas/secrets/storage-box/` credentials, `pg_backup_last_pushed_seconds` gauge + `PgBackupStale` alert, and `pg-restore-verify.sh` T-7 throwaway verify are all in tree. See ADR-056 §Load-bearing design choices and `docs/runbooks/PostgresBackup.md`.
 
 **PR #425** (closed-not-merged 2026-07-29) was the prior attempt at this status flip; it lacked the callout above. This v1.1 supersedes it.
 
