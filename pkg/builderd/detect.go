@@ -1,108 +1,78 @@
 package builderd
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"errors"
-	"fmt"
-	"io"
-	"os"
-	"strings"
+	"io/fs"
+
+	"github.com/onebox-faas/faas/pkg/markers"
 )
 
-// Framework is the autodetected build pipeline (spec §4.5, §9). The builder VM
-// runs Railpack internally; this enum names which language profile Railpack
-// should target. M6 v1 ships Node and Python — these are the two cases the §14
-// acceptance gate exercises (bare Node and bare Python repos, no config).
-type Framework string
+// Framework is the autodetected build pipeline (spec §4.5, §9).
+// Aliased from pkg/markers (issue #736 / DEPLOY-PROV-2 / ADR-088)
+// so existing callers (pkg/builderd/builderd.go, build_base.go)
+// compile unchanged. The CLI also imports pkg/markers directly
+// with a type alias to avoid pulling in pkg/builderd's
+// transitive deps (DB, scheduler, firecracker).
+type Framework = markers.Framework
 
 const (
-	FrameworkNode    Framework = "node"
-	FrameworkPython  Framework = "python"
-	FrameworkGo      Framework = "go"     // tarball contains a go.mod at the root
-	FrameworkDocker  Framework = "docker" // tarball contains a Dockerfile at the root
-	FrameworkUnknown Framework = "unknown"
+	FrameworkNode    = markers.FrameworkNode
+	FrameworkPython  = markers.FrameworkPython
+	FrameworkGo      = markers.FrameworkGo
+	FrameworkDocker  = markers.FrameworkDocker
+	FrameworkUnknown = markers.FrameworkUnknown
 )
 
-// Detector sniffs a source tarball to pick a Framework. The detection rule
-// is deliberately dumb and stable: it inspects the top-level entries of the
-// tarball and picks one framework. A Dockerfile at the root wins over the
-// language markers (matches `faas deploy --dockerfile`).
+// Detector sniffs a source tarball to pick a Framework. The
+// detection rule itself lives in pkg/markers (the single source
+// of truth); this type is a thin shim so existing callers that
+// inject a *Detector for testability continue to work. See
+// ADR-088 for the design.
 type Detector struct{}
 
 // NewDetector returns a Detector.
 func NewDetector() *Detector { return &Detector{} }
 
-// Detect reads the tarball at path and returns its framework. Errors are
-// best-effort: an unreadable tarball returns FrameworkUnknown + error so the
-// caller can record a user_error failure_class.
-//
-//nolint:forbidigo // path is the apid-spooled tarball that already passed apid's validateTarballShape (in cmd/apid/deploy_inputs.go) before builderd received the build notification. Symlink-attack impossible because apid wrote the file with a fresh random id. Direct unit-test callers construct the path themselves; rationale holds.
+// Detect reads the tarball at path and returns its framework.
+// Delegates to markers.DetectFromTarball. The parity contract
+// pkg/markers.DetectFromTarball exposes is (FrameworkUnknown,
+// nil) for missing markers; the builderd.Detect shim wraps
+// that into an error so the existing build pipeline can record
+// a user_error failure_class (see TestProcessOne_FrameworkDetectFailsFlipsDeployment
+// and TestProcessOne_UnknownFrameworkFails below). See ADR-088.
 func (d *Detector) Detect(path string) (Framework, error) {
-	f, err := os.Open(path)
+	fw, err := markers.DetectFromTarball(path)
 	if err != nil {
-		return FrameworkUnknown, fmt.Errorf("detect: open: %w", err)
+		return fw, err
 	}
-	defer func() { _ = f.Close() }()
-
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return FrameworkUnknown, fmt.Errorf("detect: gzip: %w", err)
+	if fw == markers.FrameworkUnknown {
+		return fw, errors.New("detect: no package.json, requirements.txt, pyproject.toml, Pipfile, setup.py, go.mod, or Dockerfile found at tarball root")
 	}
-	defer func() { _ = gz.Close() }()
-
-	tr := tar.NewReader(gz)
-	hasDocker := false
-	hasNode := false
-	hasPython := false
-	hasGo := false
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return FrameworkUnknown, fmt.Errorf("detect: read tar: %w", err)
-		}
-		// Only sniff the top-level entries — `faas deploy` always sends a
-		// tarball whose root is the project (verified by apid's
-		// validateTarballShape).
-		if strings.Contains(hdr.Name, "/") {
-			continue
-		}
-		switch strings.ToLower(hdr.Name) {
-		case "dockerfile":
-			hasDocker = true
-		case "package.json":
-			hasNode = true
-		case "requirements.txt", "pyproject.toml", "pipfile", "setup.py":
-			hasPython = true
-		case "go.mod":
-			hasGo = true
-		}
-	}
-	switch {
-	case hasDocker:
-		return FrameworkDocker, nil
-	case hasNode:
-		return FrameworkNode, nil
-	case hasPython:
-		return FrameworkPython, nil
-	case hasGo:
-		return FrameworkGo, nil
-	}
-	return FrameworkUnknown, errors.New("detect: no package.json, requirements.txt, go.mod, or Dockerfile found at tarball root")
+	return fw, nil
 }
 
-// DetectWithVersion is Detect plus a best-effort version read. The
-// version is "" when no version file is found or the parser fails; it
-// is never an error condition. See detectversion.go for the per-parser
-// priority order and ADR-087 for the operator-only rationale (the
-// build pipeline never reads the returned version).
+// DetectFromFS is the FS variant — used by tests that don't
+// want to round-trip through a tarball. Mirrors Detect on the
+// CLI side via cmd/gregale/pack.go.
+func (d *Detector) DetectFromFS(fsys fs.FS) (Framework, error) {
+	return markers.DetectFromFS(fsys)
+}
+
+// DetectWithVersion is Detect plus a best-effort version read.
+// The version is "" when no version file is found or the parser
+// fails; it is never an error condition. See ADR-087 for the
+// per-parser priority order and the operator-only rationale
+// (the build pipeline never reads the returned version).
+//
+// The unknown-framework case is reported as an error to preserve
+// the original pkg/builderd.detch.Detect contract — the build
+// pipeline at builderd.go:339 uses this to record a user_error
+// failure_class (see TestProcessOne_FrameworkDetectFailsFlipsDeployment
+// and TestProcessOne_UnknownFrameworkFails). ADR-088.
 func (d *Detector) DetectWithVersion(path string) (Framework, string, error) {
 	fw, err := d.Detect(path)
 	if err != nil {
 		return fw, "", err
 	}
-	return fw, detectVersion(path, fw), nil
+	return fw, markers.VersionFromTarball(path, fw), nil
 }
