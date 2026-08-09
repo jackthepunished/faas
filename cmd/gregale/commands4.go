@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // cmdAccount dispatches `gregale account <subcommand>`.
@@ -81,8 +80,10 @@ func cmdAccountExport(args []string) int {
 	return 0
 }
 
-// cmdAccountDelete schedules the 30-day grace deletion. Mirrors the
-// `gregale apps -q <slug>` y/N pattern (-q skips the prompt for CI).
+// cmdAccountDelete schedules the 30-day grace deletion. Requires
+// the user to type `delete my account` exactly (issue #312) so a
+// stray `y` cannot delete the account. -q skips the prompt for
+// scripted / CI use.
 func cmdAccountDelete(args []string) int {
 	fs := flag.NewFlagSet("account delete", flag.ContinueOnError)
 	quiet := fs.Bool("q", false, "suppress confirmation prompt")
@@ -96,12 +97,8 @@ func cmdAccountDelete(args []string) int {
 	if !*quiet {
 		fmt.Fprintf(os.Stderr,
 			"This will schedule your account for permanent deletion in 30 days. "+
-				"You can cancel with `gregale account restore` before the deadline. "+
-				"Continue? [y/N] ")
-		var ans string
-		_, _ = fmt.Scanln(&ans)
-		if strings.ToLower(strings.TrimSpace(ans)) != "y" {
-			fmt.Println("aborted")
+				"You can cancel with `gregale account restore` before the deadline.\n")
+		if !requireTyped("delete my account") {
 			return 1
 		}
 	}

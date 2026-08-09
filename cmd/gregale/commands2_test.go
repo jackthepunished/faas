@@ -1471,3 +1471,71 @@ func TestCmdOpenDocs_DispatchesFromCmdOpen(t *testing.T) {
 		t.Errorf("url = %q, want it to contain /cli/queue", got.URL)
 	}
 }
+
+// TestCmdAppsRm_TypedConfirmation_Success — interactive path (no
+// -q) where the user types the slug verbatim. The DELETE fires
+// (issue #312 safety path; a stray 'y' will NOT delete the app).
+func TestCmdAppsRm_TypedConfirmation_Success(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		method  string
+		delPath string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		method = r.Method
+		delPath = r.URL.Path
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	pipeStdin(t, "myapp\n")
+
+	if code := cmdAppsRm([]string{"myapp"}); code != 0 {
+		t.Fatalf("cmdAppsRm (typed) = %d, want 0", code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if method != "DELETE" {
+		t.Errorf("method = %q, want DELETE", method)
+	}
+	if delPath != "/v1/apps/myapp" {
+		t.Errorf("path = %q, want /v1/apps/myapp", delPath)
+	}
+}
+
+// TestCmdAppsRm_TypedConfirmation_Mismatch — interactive path where
+// the user typed the wrong slug. The DELETE must NOT fire and the
+// exit code must be 1. This is the load-bearing safety test: it
+// pins that a typo on the typed-confirmation prompt aborts the
+// destructive operation.
+func TestCmdAppsRm_TypedConfirmation_Mismatch(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		method string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		method = r.Method
+		mu.Unlock()
+		t.Errorf("DELETE fired after confirmation mismatch (path=%s)", r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	pipeStdin(t, "wrong\n")
+
+	if code := cmdAppsRm([]string{"myapp"}); code != 1 {
+		t.Errorf("cmdAppsRm (typed-wrong) = %d, want 1", code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if method != "" {
+		t.Errorf("method = %q, want empty (DELETE was not sent)", method)
+	}
+}
