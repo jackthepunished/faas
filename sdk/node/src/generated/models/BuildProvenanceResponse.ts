@@ -11,6 +11,13 @@
  * `runner_digest`, and `sbom_storage_key` are populated by
  * Phase 3 (cosign signer + syft SBOM), but the columns exist
  * today so Phase 3 is a zero-cost schema change.
+ * `framework_version` is the language version the customer's
+ * source declares (`.nvmrc`, `package.json::engines.node`,
+ * `pyproject.toml::requires-python`, `.python-version`,
+ * `.tool-versions`, `go.mod` directive); added in issue #740 /
+ * DEPLOY-PROV-5 / ADR-087. OBSERVATIONAL ONLY — the build
+ * pipeline never reads it (the runtime is bound by the OCI
+ * base ref via `FAAS_DEPLOY_BASE_REF_<RUNTIME>`).
  *
  */
 export type BuildProvenanceResponse = {
@@ -40,5 +47,9 @@ export type BuildProvenanceResponse = {
    * Phase 3 populator fills this from `syft` output. Empty string when not yet populated.
    */
   sbom_storage_key?: string | null;
+  /**
+   * Source-declared language version (nodes 22.11.0 / python 3.13 / go 1.24, etc.). Empty string when no version file is present or any parser fails — best-effort, never an error. Added in DEPLOY-PROV-5 / issue #740 / ADR-087.
+   */
+  framework_version?: string | null;
 };
 

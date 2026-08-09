@@ -677,7 +677,9 @@ func TestRuntimeSuggestionFor(t *testing.T) {
 // message include a marker suggestion, and if so does it have a
 // non-empty --runtime" contract. Regression: a previous version of
 // the suggestion logic emitted "Detected X project — try `--runtime
-//  --handler ...`." with an empty --runtime when the version mapped
+//
+//	--handler ...`." with an empty --runtime when the version mapped
+//
 // to no whitelisted runtime. This test pins that the suggestion is
 // only emitted when runtimeSuggestionFor returns non-empty.
 func TestFuncErrorSuggestion(t *testing.T) {
@@ -697,7 +699,7 @@ func TestFuncErrorSuggestion(t *testing.T) {
 			wantSub: "`--runtime node22 --handler handler.handler`",
 		},
 		{
-			name: "node_with_nvmrc_no_empty_runtime_arg",
+			name:  "node_with_nvmrc_no_empty_runtime_arg",
 			files: map[string]string{".nvmrc": "22.11.0", "package.json": "{}"},
 			// Sanity: a valid suggestion must never contain
 			// `--runtime  --handler` with an empty runtime. This

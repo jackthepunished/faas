@@ -203,7 +203,7 @@ func TestResolveDeployShape_FunctionErrorFallsBackWhenNoVersion(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for --function with no handler file")
 	}
-	if strings.Contains(err.Error(), "Detected " ) {
+	if strings.Contains(err.Error(), "Detected ") {
 		t.Errorf("error must not include a marker suggestion when no version file is present; got %q", err.Error())
 	}
 }

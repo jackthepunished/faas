@@ -1021,7 +1021,7 @@ type BuildProvenance struct {
 	// Populated by pkg/builderd::recordProvenance (issue #740 /
 	// DEPLOY-PROV-5 / ADR-087). Empty when no version file is found
 	// or any parser fails — best-effort, never an error.
-	FrameworkVer   string
+	FrameworkVer string
 }
 
 // CustomDomain is a customer's CNAME'd domain. apid owns this table;
