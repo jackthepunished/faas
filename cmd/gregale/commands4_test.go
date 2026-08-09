@@ -181,6 +181,64 @@ func TestCmdAccountDelete_ForwardsIdempotencyKey(t *testing.T) {
 	}
 }
 
+// TestCmdAccountDelete_TypedConfirmation_Success — interactive path
+// (no -q) where the user types 'delete my account' exactly. The
+// DELETE fires, the server records the Idempotency-Key (issue #312
+// safety path; a stray 'y' will NOT delete the account any more).
+func TestCmdAccountDelete_TypedConfirmation_Success(t *testing.T) {
+	sink := &accountSink{
+		onDelete: func(key string) (int, any) {
+			if !strings.HasPrefix(key, "cli-delete-") {
+				t.Errorf("Idempotency-Key = %q, want cli-delete-<hex>", key)
+			}
+			return http.StatusOK, nil
+		},
+	}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	pipeStdin(t, "delete my account\n")
+
+	if code := cmdAccountDelete(nil); code != 0 {
+		t.Fatalf("cmdAccountDelete (typed) = %d, want 0", code)
+	}
+	if sink.lastMethod != "DELETE" {
+		t.Errorf("method = %q, want DELETE", sink.lastMethod)
+	}
+	if sink.lastPath != "/v1/account" {
+		t.Errorf("path = %q", sink.lastPath)
+	}
+}
+
+// TestCmdAccountDelete_TypedConfirmation_Mismatch — interactive path
+// where the user typed the wrong string. The DELETE must NOT fire
+// and the exit code must be 1. This is the load-bearing safety test:
+// it pins that a typo on the typed-confirmation prompt aborts the
+// destructive operation.
+func TestCmdAccountDelete_TypedConfirmation_Mismatch(t *testing.T) {
+	sink := &accountSink{
+		onDelete: func(key string) (int, any) {
+			t.Errorf("DELETE fired after confirmation mismatch (idem-key=%q)", key)
+			return http.StatusOK, nil
+		},
+	}
+	srv := httptest.NewServer(sink)
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	pipeStdin(t, "no\n")
+
+	if code := cmdAccountDelete(nil); code != 1 {
+		t.Errorf("cmdAccountDelete (typed-wrong) = %d, want 1", code)
+	}
+	if sink.lastMethod != "" {
+		t.Errorf("method = %q, want empty (DELETE was not sent)", sink.lastMethod)
+	}
+}
+
 // silence unused imports for builds where these are only referenced
 // by tests above.
 var _ = bytes.NewBuffer
