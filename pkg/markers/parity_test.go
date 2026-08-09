@@ -219,9 +219,9 @@ func TestDetectCLIParity(t *testing.T) {
 // (docker, unknown).
 func TestVersionParity(t *testing.T) {
 	cases := []struct {
-		name     string
-		fw       markers.Framework
-		files    map[string]string
+		name         string
+		fw           markers.Framework
+		files        map[string]string
 		wantNotEmpty bool
 	}{
 		{"node_nvmrc", markers.FrameworkNode, map[string]string{
@@ -271,10 +271,10 @@ func TestVersionParity(t *testing.T) {
 // TestMarkers_PriorityOrder in detect_test.go.
 func TestMarkerForAndIsAppMarker(t *testing.T) {
 	cases := []struct {
-		name    string
-		input   string
-		wantFW  markers.Framework
-		wantIs  bool
+		name   string
+		input  string
+		wantFW markers.Framework
+		wantIs bool
 	}{
 		{"Dockerfile", "Dockerfile", markers.FrameworkDocker, true},
 		{"dockerfile_lower", "dockerfile", markers.FrameworkDocker, true},

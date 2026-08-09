@@ -21,7 +21,9 @@ type appMarker struct {
 // case statements at pkg/builderd/detect.go:73-82 (now
 // superseded). Case-insensitive matching applies at the call
 // site. Priority order:
-//   Docker > Node > Python > Go
+//
+//	Docker > Node > Python > Go
+//
 // matches pkg/builderd.Detect's prior behaviour and the
 // TestDetect_PythonBeatsGo / TestDetect_DockerfileBeatsGo pins.
 var appMarkers = []appMarker{
