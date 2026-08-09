@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -156,8 +157,22 @@ type Config struct {
 // ComputeNodeConfig is the [compute_node] TOML section. Field naming
 // tracks pkg/state.ComputeNode 1:1; values flow into the upsert
 // after the resource sizing checks (VPCPUs > 0, MemMB > 0, etc.).
+//
+// TargetURL is the dial target schedd/gatewayd use to reach this
+// vmmd (the value written to compute_nodes.target_url on
+// self-registration). It is intentionally separate from ListenAddr
+// (the bind address) — a sensible bind like `tcp://0.0.0.0:50051`
+// is NOT a routable dial target, and using the bind form as the
+// dial target silently routes wakes to the local host's own vmmd
+// instead of the second box. Operators on a multi-box fleet MUST
+// set this to a routable FQDN or IP (e.g. `tcp://vmmd-2.faas:50051`)
+// or set OverlayIP (auto-detected via tailscale) and leave
+// TargetURL empty to let ResolveTargetURL derive it. The empty
+// fallback (legacy default-local single-box path) is
+// `unix://`+SocketPath.
 type ComputeNodeConfig struct {
 	NodeName           string `toml:"name"`                 // defaults to short hostname when empty
+	TargetURL          string `toml:"target_url"`           // dial target written to compute_nodes.target_url
 	VPCPUs             int    `toml:"vpcpus"`               // total vCPUs this box offers
 	MemMB              int    `toml:"mem_mb"`               // total RAM in MiB
 	MaxConcurrency     int    `toml:"max_concurrency"`      // parallel live instances
@@ -171,6 +186,24 @@ type ComputeNodeConfig struct {
 func (c *Config) ResolveListenTarget() string {
 	if c.ListenAddr != "" {
 		return c.ListenAddr
+	}
+	return "unix://" + c.SocketPath
+}
+
+// ResolveTargetURL returns the dial target schedd/gatewayd use to
+// reach this vmmd. Explicit TargetURL wins; otherwise falls back to
+// `tcp://`+OverlayIP+`:50051` when OverlayIP is set; otherwise
+// unix://+SocketPath for single-box default-local. The resolved
+// string is wire.ParseTarget-compatible. Pair this with
+// ResolveListenTarget — they answer different questions:
+// ResolveListenTarget is "what do I bind to",
+// ResolveTargetURL is "what do others dial to reach me".
+func (c *Config) ResolveTargetURL() string {
+	if url := strings.TrimSpace(c.ComputeNode.TargetURL); url != "" {
+		return url
+	}
+	if ip := strings.TrimSpace(c.ComputeNode.OverlayIP); ip != "" {
+		return "tcp://" + ip + ":50051"
 	}
 	return "unix://" + c.SocketPath
 }

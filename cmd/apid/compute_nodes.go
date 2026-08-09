@@ -201,7 +201,7 @@ func (s *server) createOrUpdateComputeNode(w http.ResponseWriter, r *http.Reques
 			"vpcpus, mem_mb, max_concurrency, admission_ceiling_mb must all be > 0"))
 		return
 	}
-	row, err := s.store.UpsertComputeNode(r.Context(), state.ComputeNode{
+	row, err := s.store.UpsertComputeNodeFromOperator(r.Context(), state.ComputeNode{
 		Name:               p.Name,
 		TargetURL:          p.TargetURL,
 		VPCPUs:             p.VPCPUs,

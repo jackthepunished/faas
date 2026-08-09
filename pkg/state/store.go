@@ -2199,7 +2199,39 @@ type Store interface {
 	// round-trip. Returns the row (id, timestamps refreshed).
 	// ErrConflict is reserved for a future partial-cluster failure;
 	// the upsert path doesn't currently fail.
+	//
+	// Deprecated: prefer UpsertComputeNodeFromOperator (apid POST
+	// path) or UpsertComputeNodeFromVmmd (vmmd self-registration
+	// path) so the two ownerships — operator-set target_url vs
+	// vmmd-owned resource numbers — don't clobber each other on
+	// upsert. Kept for backwards compat with the handful of test
+	// fixtures that don't care about the ownership split; new
+	// callers should pick the explicit variant.
 	UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error)
+	// UpsertComputeNodeFromOperator is the apid POST /v1/compute-nodes
+	// write path. The operator owns target_url (the routable FQDN
+	// schedd/gatewayd dial); vmmd's self-registration preserves it.
+	// ON CONFLICT (name) DO UPDATE SET target_url = excluded.target_url,
+	// vpcpus, mem_mb, max_concurrency, admission_ceiling_mb,
+	// vcpu_budget, active=true — full set, the operator's POST
+	// wins on every field.
+	UpsertComputeNodeFromOperator(ctx context.Context, node ComputeNode) (ComputeNode, error)
+	// UpsertComputeNodeFromVmmd is the vmmd self-registration
+	// write path (cmd/vmmd/register.go). Writes only the
+	// vmmd-owned resource numbers + re-activates the row. ON
+	// CONFLICT (name) DO UPDATE SET vpcpus, mem_mb,
+	// max_concurrency, admission_ceiling_mb, vcpu_budget,
+	// active=true, target_url = COALESCE(compute_nodes.target_url,
+	// excluded.target_url) — the existing target_url (operator's
+	// POSTed value, or the seed row's value on cold start) is
+	// preserved on conflict. The COALESCE handles the cold-INSERT
+	// case where no operator POST has happened yet: vmmd's own
+	// view of its dialable address lands in the row, the same
+	// shape as the old UpsertComputeNode. This split closes the
+	// trap where vmmd's startup UPSERT silently overwrote an
+	// operator's carefully-POSTed target_url with the bind
+	// address.
+	UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNode) (ComputeNode, error)
 	// UpsertNodeKey inserts or updates a (compute_node_id, key_id)
 	// row in compute_node_keys (ADR-053 / migration 00076). vmmd's
 	// self-registration calls this on startup once it has loaded

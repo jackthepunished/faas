@@ -51,7 +51,17 @@ import (
 // detectOverlayIP is function-typed so tests can inject a stub that
 // returns "100.64.0.1" without shelling out to `tailscale ip -4`
 // (Linux/macOS only — gated to //go:build metal otherwise).
-func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeConfig, listenTarget string, detectOverlayIP func(context.Context) (string, error), log *slog.Logger) (state.ComputeNode, error) {
+//
+// targetURL is the dial target schedd/gatewayd use to reach this
+// vmmd (the value written to compute_nodes.target_url). It is
+// intentionally separate from the gRPC bind target — a bind like
+// `tcp://0.0.0.0:50051` is fine for listening on all interfaces
+// but is NOT a routable dial target. The caller passes the dial
+// target here; registerComputeNode does not infer it from the
+// bind address (the conflation between the two was the load-
+// bearing bug fixed in the second-box cutover PR; see
+// docs/runbooks/multi-host-rollout.md §3.5).
+func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeConfig, targetURL string, detectOverlayIP func(context.Context) (string, error), log *slog.Logger) (state.ComputeNode, error) {
 	name := strings.TrimSpace(cfg.NodeName)
 	if name == "" {
 		// Empty name = operator chose not to self-register. vmmd
@@ -87,14 +97,14 @@ func registerComputeNode(ctx context.Context, st state.Store, cfg ComputeNodeCon
 
 	row := state.ComputeNode{
 		Name:               name,
-		TargetURL:          listenTarget,
+		TargetURL:          targetURL,
 		VPCPUs:             cfg.VPCPUs,
 		MemMB:              cfg.MemMB,
 		MaxConcurrency:     cfg.MaxConcurrency,
 		AdmissionCeilingMB: cfg.AdmissionCeilingMB,
 		Active:             true,
 	}
-	got, err := st.UpsertComputeNode(ctx, row)
+	got, err := st.UpsertComputeNodeFromVmmd(ctx, row)
 	if err != nil {
 		return state.ComputeNode{}, fmt.Errorf("vmmd: upsert compute_nodes %q: %w", name, err)
 	}

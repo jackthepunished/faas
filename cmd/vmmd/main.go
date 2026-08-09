@@ -27,6 +27,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -392,7 +393,28 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return err
 	}
 	listenTarget := cfg.ResolveListenTarget()
-	log.Info("config", "listen_addr", listenTarget, "socket", cfg.SocketPath, "kernel_key", cfg.KernelKey,
+	// targetURL is the DIAL target schedd/gatewayd use to reach
+	// this vmmd. Distinct from listenTarget (the bind address):
+	// a bind like tcp://0.0.0.0:50051 listens on all interfaces,
+	// but it is NOT a routable dial target — schedd/gatewayd
+	// would dial 0.0.0.0:50051 and resolve to the local host,
+	// not the second box. ResolveTargetURL prefers an explicit
+	// [compute_node].target_url (the operator's routable FQDN),
+	// then falls back to tcp://+overlay_ip+:50051, then to the
+	// unix socket for single-box. See
+	// docs/runbooks/multi-host-rollout.md §3.5 for the operator
+	// warning. We also log a Warn at startup if the resolved
+	// targetURL is a tcp:// form AND it matches the bind form
+	// (the most common re-introduction of the conflation is
+	// "set listen_addr to the FQDN" without a separate
+	// target_url — works on dev but routes to wrong host on
+	// a multi-box fleet).
+	targetURL := cfg.ResolveTargetURL()
+	if listenTarget == targetURL && strings.HasPrefix(targetURL, "tcp://") {
+		log.Warn("vmmd: target_url equals listen_addr — schedd/gatewayd will dial the same string you bind to; set [compute_node].target_url to a routable FQDN for multi-box routing to land on this host",
+			"target_url", targetURL, "listen_addr", listenTarget)
+	}
+	log.Info("config", "listen_addr", listenTarget, "target_url", targetURL, "socket", cfg.SocketPath, "kernel_key", cfg.KernelKey,
 		"kernel_path_legacy", cfg.KernelPath,
 		"metrics_addr", cfg.MetricsAddr)
 
@@ -499,7 +521,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		defer pool.Close()
 		store = deps.openStore(pool)
-		cn, err := registerComputeNode(ctx, store, cfg.ComputeNode, listenTarget, deps.detectOverlayIP, log)
+		cn, err := registerComputeNode(ctx, store, cfg.ComputeNode, targetURL, deps.detectOverlayIP, log)
 		if err != nil {
 			return err
 		}
