@@ -2958,7 +2958,7 @@ func (*ForwardHTTPStreamRequest_BodyChunk) isForwardHTTPStreamRequest_Frame() {}
 
 // ForwardHTTPRequestInit is the first frame of ForwardHTTPStreamRequest.
 // It reuses the Header envelope from the unary ForwardHTTPRequest so
-// gatewayd can build a single init frame and pass it to both RPCs
+// gatewayd-internal can build a single init frame and pass it to both RPCs
 // without a copy. The init frame is the only place `stream` is
 // honoured; subsequent frames are pure body bytes.
 type ForwardHTTPRequestInit struct {

@@ -148,7 +148,7 @@ func TestWarmHintConsumer_DrainSkipsMalformedEvents(t *testing.T) {
 
 func TestWarmHintConsumer_HintFuncAdapter(t *testing.T) {
 	// Pins the cache → WarmHintFunc shape that
-	// cmd/gatewayd/main.go wires into backend.WithWarmHint. The
+	// cmd/gatewayd-internal/main.go wires into backend.WithWarmHint. The
 	// picker's per-request call site (pgbackend.go:316-321)
 	// reads WarmHintFunc(appID) and consumes (nodeID, found).
 	cache := gateway.NewWarmHintCache()

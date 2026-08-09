@@ -7,7 +7,7 @@
 //
 // Why subprocesses (not in-process wiring):
 //
-//   - cmd/apid, cmd/schedd, cmd/imaged, cmd/gatewayd, cmd/vmmd, cmd/meterd
+//   - cmd/apid, cmd/schedd, cmd/imaged, cmd/gatewayd-internal, cmd/vmmd, cmd/meterd
 //     are all package main; Go forbids importing them as libraries, so the
 //     only way to drive the real listener lifecycle is `go build` + `exec.Cmd`.
 //   - This matches the EX44 / Lima deployment: every daemon is its own
@@ -19,13 +19,13 @@
 //   - meterd_quota_e2e_test.go     (no tag)        boots apid + schedd +
 //     meterd for the M7 "park within one tick" gate (issue #52).
 //   - deploy_wake_metal_test.go    //go:build metal boots apid + schedd +
-//     imaged + vmmd + gatewayd.
+//     imaged + vmmd + gatewayd-internal.
 //     Needs /dev/kvm and root.
 //
 // Per-daemon configuration:
 //
 //   - apid        env    FAAS_APID_LISTEN=127.0.0.1:<port>
-//   - gatewayd    env    FAAS_GATEWAY_LISTEN=127.0.0.1:<port>
+//   - gatewayd-internal    env    FAAS_GATEWAY_LISTEN=127.0.0.1:<port>
 //     FAAS_SCHEDD_SOCKET=<tmp>/schedd.sock
 //     FAAS_APPS_DOMAIN=<test domain>
 //   - imaged      env    FAAS_GUEST_INIT=<repo>/guest/init  (or empty)
@@ -420,7 +420,7 @@ const testDomain = "apps.test.example"
 //     fence dropped on merge).
 //
 //     After the first rebase merged (slot 120 live on the
-//     branch), PR #547 (Tier A7 gatewayd split) opened against
+//     branch), PR #547 (Tier A7 gatewayd-internal split) opened against
 //     main claiming slots 00119/00120/00121. The cross-PR slot
 //     gate then rejected PR #543's push with "migration slot
 //     00120 is also claimed by open PR #547", forcing a second
@@ -637,7 +637,7 @@ func startAPID(t *testing.T, h *Harness, bin, dbURL string) {
 //
 // gateway_metrics_url is intentionally empty: schedd is started
 // BEFORE gatewayd-internal in Start() (the schedd first-boot
-// migration runs while gatewayd is still booting), so the control
+// migration runs while gatewayd-internal is still booting), so the control
 // plane address isn't known yet. With an empty URL, schedd's
 // scaleup trigger is disabled (cmd/schedd/config.go:110-118,
 // issue #169 / #172). Boot path is unaffected — schedd logs a
@@ -667,7 +667,7 @@ gateway_metrics_url = ""
 }
 
 // startGatewayd boots gatewayd-internal (Tier A7 PR-B+) against the
-// per-test schedd + apid + PG schema. The legacy 'gatewayd' binary is
+// per-test schedd + apid + PG schema. The legacy 'gatewayd-internal' binary is
 // gone (its source moved into cmd/gatewayd-internal/ in PR-A); the
 // single binary now serves the real routing + wake + proxy chain.
 //
@@ -884,7 +884,7 @@ func (h *Harness) stop() {
 func buildBinaries(t *testing.T, bin string) {
 	t.Helper()
 	modulePath := modulePath(t)
-	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd' binary is gone
+	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd-internal' binary is gone
 	// (its source moved into cmd/gatewayd-internal/). PR-B will boot
 	// the split pair (gatewayd-public + gatewayd-internal) in
 	// startGatewayd; for now we just build the new daemons so the

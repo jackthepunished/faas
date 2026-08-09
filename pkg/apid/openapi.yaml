@@ -6,7 +6,7 @@ info:
   summary: Customer-facing REST API for the one-box FaaS platform.
   description: |
     Public REST surface exposed by `apid` on `127.0.0.1:8081` (proxied by
-    `gatewayd` at the public listener). Every route is authenticated with a
+    `gatewayd-public` at the public listener). Every route is authenticated with a
     Bearer API key (`fp_live_…`) and rate-limited per-IP (10 failed-auth / min).
     Successful POSTs accept an `Idempotency-Key` header (24h TTL) and replay
     with `Idempotent-Replayed: true`.
@@ -29,7 +29,7 @@ info:
 
 servers:
   - url: https://{host}
-    description: Public endpoint (proxied through gatewayd).
+    description: Public endpoint (proxied through gatewayd-public).
     variables:
       host:
         default: api.gregale.dev
@@ -3380,7 +3380,7 @@ paths:
 
         Rate-limit tiering: one call now replaces N per-app calls,
         so per-page-load token spend drops from N to 1. The
-        per-account bucket (ADR-040) still applies at the gatewayd
+        per-account bucket (ADR-040) still applies at the gatewayd-internal
         edge; this route charges 1 token via the apid authLimited
         middleware, same as every other `/v1/*` route.
       parameters:
@@ -5979,7 +5979,7 @@ components:
           example: 70
         # Issue #471 / ADR-047 (PR-A): per-app streaming flag.
         # When true on a paid plan that unlocks streaming
-        # (Hobby/Pro/Scale), gatewayd can flush the response
+        # (Hobby/Pro/Scale), gatewayd-internal can flush the response
         # body incrementally instead of buffering end-to-end.
         # Free apps stay at false regardless of the customer's
         # preference (apid's plan-gate rejects PATCH true on

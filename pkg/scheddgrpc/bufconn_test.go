@@ -310,7 +310,7 @@ func TestReportActivity(t *testing.T) {
 
 // TestWake_PropagatesWakeID asserts the per-wake stable identifier
 // minted by schedd's engine reaches the gRPC response verbatim. The
-// gatewayd client reads resp.GetWakeId() and sets it as the
+// gatewayd-internal client reads resp.GetWakeId() and sets it as the
 // x-faas-wake-id response header — if this contract breaks, downstream
 // logs and dashboards lose their correlation key.
 func TestWake_PropagatesWakeID(t *testing.T) {
@@ -500,7 +500,7 @@ func TestWake_PropagatesPort(t *testing.T) {
 }
 
 // TestAdmitInstance_PropagatesPort mirrors the Wake port test for
-// the AdmitInstance RPC, which is the production-path call gatewayd
+// the AdmitInstance RPC, which is the production-path callgatewayd-internal
 // actually uses. The legacy Wake call still carries Port for
 // back-compat with any pre-sliced-4 callers, but the gateway forward
 // path is on AdmitInstance + Target.Port in pkg/gateway.

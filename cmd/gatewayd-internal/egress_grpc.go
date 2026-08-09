@@ -61,7 +61,7 @@ func egressGRPCSocketPath() string {
 }
 
 // egressGRPCListener owns the *grpc.Server + its bound unix
-// socket. Lifetime is bound to the cmd/gatewayd daemon: start()
+// socket. Lifetime is bound to the cmd/gatewayd-internal daemon: start()
 // binds + serves; stop() shuts down the server with a 5-second
 // grace and removes the socket file (the daemon owns the
 // socket, recreate is safer than fail-on-EADDRINUSE at next

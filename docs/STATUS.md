@@ -743,7 +743,7 @@ explicitly open issues that the doc otherwise implies are closed.
   this PR via `pkg/gateway/metrics.go::tlsCertExpiry` + `tlsOnDemandDenied`
   + `pkg/gateway/cert_expiry.go` refresher, wired into
   `cmd/gatewayd-public/main.go`; three alert rules land in `faas.rules.yml`;
-  operator runbook at `docs/ops/gatewayd-tls-cutover.md`.
+  operator runbook at `docs/ops/gatewayd-public-tls-cutover.md` (the legacy `docs/ops/gatewayd-tls-cutover.md` retains the pre-PR-A cut-over steps; current process lives in the public-edge runbook).
 - **§14 V2 latency driver** — 100 park→wake cycles per app class,
   p50 ≤ 350 ms / p95 ≤ 800 ms. The Hobby-class gate is wired via
   `TestDeployWakeMetal/wake-latency-p50p95-100cycles` (extends the

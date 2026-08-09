@@ -116,8 +116,8 @@ type UpdateAppRequest struct {
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
 	// StreamingEnabled (issue #471) toggles the per-app streaming
-	// response path through gatewayd. When true (or unset on a plan
-	// where the default is true), gatewayd streams the response body
+	// response path through gatewayd-internal. When true (or unset on a plan
+	// where the default is true), gatewayd-internal streams the response body
 	// from the guest through to the client with a periodic 200 ms /
 	// 256 KiB tx_bytes flush; when false, the legacy buffered path
 	// runs (spec §4.1: 25 MB / 300 s). Plan-gated upstream: Free

@@ -120,7 +120,7 @@ type RunFunc func(ctx context.Context, log *slog.Logger) error
 // SIGHUP is also wired (issue #518 PR-A): the handler re-reads FAAS_LOG_LEVEL
 // and atomically swaps the shared slog.LevelVar. Operators reload log level
 // with `kill -HUP $(pidof <daemon>)` (or systemd's `systemctl kill -s HUP
-// faas-<daemon>.service`); the legacy gatewayd unit's ExecReload annotation
+// faas-<daemon>.service`); the legacy gatewayd-internal unit's ExecReload annotation
 // is no longer relevant (Tier A7 split removed that unit — see ADR-070).
 func Daemon(name string, fn RunFunc) {
 	configPath := flag.String("config", "/etc/faas/"+name+".toml", "path to the daemon's TOML config")

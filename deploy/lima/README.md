@@ -100,7 +100,7 @@ httpd entrypoint instead of a real app).
 The M5 deploy→wake test (`cmd/e2e/deploy_wake_metal_test.go`) is the
 `spec §14` acceptance for "faas deploy → parked → first request wakes".
 It goes through the full wire (apid → imaged → schedd → vmmd → firecracker,
-then a real HTTP request through gatewayd) and asserts the served body
+then a real HTTP request through gatewayd-public) and asserts the served body
 matches the OCI-fixture bytes byte-for-byte.
 
 It boots the V6 rootfs as both `basePath("")` (no runtime) and

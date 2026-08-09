@@ -44,7 +44,8 @@
 -- cluster wires the internal side):
 --   - cmd/gatewayd-public/warmhint_cache.go (NEW)
 --   - cmd/gatewayd-internal/warmhints.go (NEW, moved from the
---     legacy monolithic daemon's cmd/gatewayd/warmhints.go)
+--     legacy monolithic daemon's cmd/gatewayd/warmhints.go — that
+--     file is the historical reference; live path is internal)
 
 CREATE TABLE IF NOT EXISTS warm_hint (
     app_id     uuid        PRIMARY KEY,

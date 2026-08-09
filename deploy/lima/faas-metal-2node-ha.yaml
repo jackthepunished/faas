@@ -97,7 +97,7 @@ provision:
         build-essential e2fsprogs iproute2 iptables nftables git curl ca-certificates \
         busybox-static jq postgresql
 
-      # Tier A8 only needs the gatewayd user accounts — apid,
+      # Tier A8 only needs the gatewayd-public and gatewayd-internal user accounts — apid,
       # schedd, vmmd aren't required for the failover drill
       # (the drill exercises DNS flip + standby warmup, not
       # app wakes). vmmd account is still required because

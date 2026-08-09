@@ -222,7 +222,7 @@ func TestTopTenantRPS_HotIDInTopN(t *testing.T) {
 // synthetic-fixture test.
 //
 // Implementation note: this is the blackbox analog of the same
-// test in cmd/gatewayd/topn_test.go (which is whitebox on the
+// test in cmd/gatewayd-internal/topn_test.go (which is whitebox on the
 // private primitive). The two primitives are independent (no
 // shared test surface) so each gets its own coverage.
 func TestTopTenantRPS_ResetAfter24h(t *testing.T) {

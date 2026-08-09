@@ -13,7 +13,7 @@ import (
 const legacyMigrate = "migrate"
 
 var legacyBinaries = []string{
-	"apid", "schedd", "gatewayd", "gatewayd-internal", "gatewayd-public",
+	"apid", "schedd", "gatewayd-internal", "gatewayd-internal", "gatewayd-public",
 	"builderd", "imaged", "meterd", "githubd", "vmmd", "gregale", "hostage-gen",
 	legacyMigrate, "deployctl",
 }

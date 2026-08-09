@@ -174,7 +174,7 @@ func FromStatus(err error) (*api.Problem, bool) {
 	}
 
 	// Recover the HTTP status from the stable Code so HTTP surfaces that render
-	// the lifted Problem verbatim (gatewayd's wake-denial path → WriteProblem)
+	// the lifted Problem verbatim (gatewayd-internal's wake-denial path → WriteProblem)
 	// emit the right status rather than WriteHeader(0). The gRPC code is lossy
 	// (both 429 and 503 map to ResourceExhausted), so we key off the Code.
 	p.Status = api.StatusForCode(p.Code)

@@ -810,7 +810,7 @@ func TestOpsMetrics_SnapshotDiskDriftNilSafe(t *testing.T) {
 // daemon. The accessor must be nil-safe on a nil receiver so
 // engine unit tests without metrics keep working.
 func TestOpsMetrics_WakePhaseClosedSet(t *testing.T) {
-	for _, prefix := range []string{"schedd", "vmmd", "gatewayd", "apid", "builderd"} {
+	for _, prefix := range []string{"schedd", "vmmd", "gatewayd-internal", "apid", "builderd"} {
 		m := wire.NewOpsMetrics(prefix)
 		// Increment one phase to verify the counter surfaces
 		// under the correct metric name.

@@ -1,14 +1,14 @@
 // Package egresssink implements the per-instance minute-bucketed byte
-// ring buffer that gatewayd populates with HTTP response body bytes
+// ring buffer that gatewayd-internal populates with HTTP response body bytes
 // and meterd drains to populate usage_minutes.tx_bytes.
 //
-// Why this lives in pkg/gateway/egresssink rather than cmd/gatewayd:
+// Why this lives in pkg/gateway/egresssink rather than cmd/gatewayd-internal/:
 //
 //	The meterd-side adapter (cmd/meterd/main.go) eventually dials a
-//	unix-socket gRPC stream from gatewayd and reads DrainBytes records
+//	unix-socket gRPC stream from gatewayd-internal and reads DrainBytes records
 //	back. Keeping the primitive in a leaf package means the dialer
-//	imports it without taking on cmd/gatewayd → pkg/gateway →
-//	cmd/gatewayd internal dependencies, and the gateway-side writer
+//	imports it without taking on cmd/gatewayd-internal/→ pkg/gateway →
+//	cmd/gatewayd-internal/internal dependencies, and the gateway-side writer
 //	(handler.go) imports it without dragging in any gRPC types.
 //
 // Why per-instance minute buckets rather than a single global counter:
@@ -35,19 +35,19 @@
 // Why the sweeper:
 //
 //	An instance parks (state → PARKED). Park removes it from the
-//	gateway pool but does NOT signal the sink — gatewayd is happy
+//	gateway pool but does NOT signal the sink — gatewayd-internal is happy
 //	to forget about it on its own. Without eviction the map grows
 //	indefinitely as tenants cycle through instances over weeks.
 //	Sweeping on every Record keeps the hot path evict-clean and the
 //	memory ceiling is bounded by the active fleet (same bound
-//	gatewayd already enforces via the LiveSet).
+//	gatewayd-internal already enforces via the LiveSet).
 //
 // Lifecycle:
 //
-//	One EgressSink instance per cmd/gatewayd daemon. Constructed in
-//	cmd/gatewayd/main.go after the Handler; Read by both the proxy
+//	One EgressSink instance per cmd/gatewayd-internal/daemon. Constructed in
+//	cmd/gatewayd-internal/main.go after the Handler; Read by both the proxy
 //	path (handler.go via RecordResponseBytes) and the gRPC egress
-//	service (cmd/gatewayd via the sink's DrainRecords). Meterd
+//	service (cmd/gatewayd-internal/via the sink's DrainRecords). Meterd
 //	re-uses the same DrainRecords interface over gRPC — the wire
 //	shape mirrors the in-memory one to avoid a translation step.
 package egresssink
@@ -67,7 +67,7 @@ import (
 const BucketsToKeep = 3
 
 // EgressSink is the per-instance, minute-bucketed byte ring buffer.
-// Safe for concurrent use; one per gatewayd process.
+// Safe for concurrent use; one per gatewayd-internal process.
 type EgressSink struct {
 	// now is the clock injection point so tests can advance time
 	// deterministically without sleeping.

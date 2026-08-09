@@ -6,7 +6,7 @@ Deploys the non-KVM parts of the platform on a standalone Cloud VM (GCP, Digital
 
 | Daemon | Port / Socket | Purpose |
 |--------|---------------|---------|
-| `gatewayd` | `:8080` (public HTTP) | Edge proxy, routing, rate limits |
+| `gatewayd-public` | `:8080` (public HTTP) | Edge proxy, routing, rate limits |
 | `apid` | `127.0.0.1:8081` | REST API, auth, quotas |
 | `schedd` | `/run/faas/schedd.sock` | Scheduler, instance state machine |
 | `imaged` | (event-driven) | OCI pull + ext4 layer builder |
@@ -69,8 +69,8 @@ The script:
 
 ```bash
 # From the host
-curl http://127.0.0.1:8080/healthz                              # gatewayd → apid
-curl http://127.0.0.1:9090/healthz                              # gatewayd control
+curl http://127.0.0.1:8080/healthz                              # gatewayd-public → apid
+curl http://127.0.0.1:9090/healthz                              # gatewayd-public control
 TOKEN=$(awk -F= '/^FAAS_DEV_TOKEN=/{print $2; exit}' /root/faas-dev-credentials.txt | awk '{print $1}')
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/account
 
@@ -244,7 +244,7 @@ HTTPS). To enable TLS:
    storage_dir = "/var/lib/faas/certs"
    contact_email = "ops@example.com"
    ```
-   `gatewayd` will then request a Let's Encrypt wildcard via the Hetzner
+   `gatewayd-public` will then request a Let's Encrypt wildcard via the Hetzner
    DNS-01 challenge on first start. (Drop the `wildcard_cert_domain` +
    Hetzner knobs if you'd rather use the HTTP-01 challenge; for that you
    also need port 80 open and the `OnDemandHTTP01Allowlist` populated.)
@@ -257,9 +257,9 @@ HTTPS). To enable TLS:
    - Homepage: `https://apps.gregale.dev`
    - Callback: `https://apps.gregale.dev/oauth/github/callback`
    - Webhook:  `https://apps.gregale.dev/webhooks/github`
-5. **Restart gatewayd** so it picks up the new TOML:
+5. **Restart gatewayd-public** so it picks up the new TOML:
    ```bash
-   sudo systemctl restart faas-gatewayd
+   sudo systemctl restart faas-gatewayd-public
    ```
 6. (Optional) **Add a CDN / WAF** in front for DDoS protection. This guide
    intentionally leaves CDN choice to the operator.

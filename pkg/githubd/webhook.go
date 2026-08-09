@@ -25,7 +25,7 @@ import (
 
 // ErrBadPushSignature is returned by VerifyPushSignature when the
 // header is malformed or the HMAC does not match. Surfaces to the
-// gatewayd proxy as 401.
+// gatewayd-internal proxy as 401.
 var ErrBadPushSignature = errors.New("githubd: bad X-Hub-Signature-256")
 
 // VerifyPushSignature checks an X-Hub-Signature-256 header against
@@ -38,7 +38,7 @@ var ErrBadPushSignature = errors.New("githubd: bad X-Hub-Signature-256")
 // comparison uses hmac.Equal (constant time).
 //
 // Empty secret → ErrBadPushSignature (refuses to verify against no
-// key; gatewayd treats this as a misconfig).
+// key; gatewayd-internal treats this as a misconfig).
 func VerifyPushSignature(body []byte, header string, secret []byte) error {
 	if len(secret) == 0 {
 		return fmt.Errorf("%w: empty secret", ErrBadPushSignature)

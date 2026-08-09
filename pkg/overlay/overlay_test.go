@@ -188,7 +188,7 @@ func TestDial_HappyTCPTarget(t *testing.T) {
 // TestDial_TCPRequiresTLS pins the wire-level guard the
 // production call site relies on: a tcp target with nil TLS
 // must be rejected at parse time, not at first-RPC time, so a
-// config drift in gatewayd (forgot to load [vmmd_tls]) is
+// config drift in gatewayd-internal (forgot to load [vmmd_tls]) is
 // surfaced at startup instead of silently dropping every
 // customer request.
 //

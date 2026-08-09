@@ -6,7 +6,7 @@
 // the same conditions as Peek: nil/noop limiter, unknown plan, or a
 // bucket that has never been Allow'd for this app.
 //
-// The control-listener endpoint (cmd/gatewayd/quota_handler.go)
+// The control-listener endpoint (cmd/gatewayd-internal/quota_handler.go)
 // serialises this as JSON; the dashboard polls it via HTMX every 30 s.
 // The same shape is also used by the gateway's response-header writer
 // (Handler.writeRateLimitHeaders) so the JSON snapshot and the
@@ -23,7 +23,7 @@ import (
 // (ok=true, remaining=0).
 //
 // The OK flag is always present in the JSON shape — the handler in
-// cmd/gatewayd/quota_handler.go renders "ok":true / "ok":false
+// cmd/gatewayd-internal/quota_handler.go renders "ok":true / "ok":false
 // literally on both the 200 response and the noop path so browser
 // JS can do a single `body.ok` check without a fallback to a missing
 // field. Distinct from omitting the field — which Go's encoding/json

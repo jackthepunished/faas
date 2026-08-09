@@ -96,7 +96,7 @@ func (p *Problem) Error() string {
 }
 
 // WriteProblem renders p as an RFC 7807 problem+json response with its status
-// code. Every HTTP surface (gatewayd, apid) uses this so error shape is uniform.
+// code. Every HTTP surface (gatewayd-internal, apid) uses this so error shape is uniform.
 func WriteProblem(w http.ResponseWriter, p *Problem) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	for k, vs := range p.extraHeaders {
@@ -128,7 +128,7 @@ func (p *Problem) WithDocs(url string) *Problem {
 }
 
 // WithHeader attaches a single response header to the Problem so
-// gatewayd's writeWakeError can write it onto the wire without
+// gatewayd-internal's writeWakeError can write it onto the wire without
 // branches on each error code. Used today by the build-attestation
 // transient-I/O path (Retry-After: 5 — review finding #1a on
 // PR #322). Multiple WithHeader calls compose: each call appends a
@@ -275,7 +275,7 @@ const (
 	// CodeSigInvalid is returned by schedd when the layer's
 	// signature fails verification (or is missing) on cold-boot.
 	// The deployment transitions to DeployFailed with this code;
-	// the wake that triggered the verify returns 503 to gatewayd
+	// the wake that triggered the verify returns 503 to gatewayd-internal
 	// with the same code. ADR-038 §Consequences Compatibility.
 	CodeSigInvalid       = "sig_invalid"
 	CodeNoRollbackTarget = "no_rollback_target"

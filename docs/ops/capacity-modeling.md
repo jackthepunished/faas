@@ -88,7 +88,8 @@ load-test harness in `cmd/e2e/loadtest/` to:
   `https://apps.<domain>/` for a small fixture app, measure
   `gateway_wake_latency_seconds` p50/p95 per second. The
   Prometheus metric is shipped via `pkg/wire.DefaultOpsMetrics`.
-  Each box's metric is scraped by its own gatewayd instance;
+  Each box's metric is scraped by its own gatewayd-public +
+  gatewayd-internal pair;
   cluster-total is `Σ(gateway_wake_latency_seconds_count)`.
 - **Live RAM residency** — `pkg/sched.NodeLedger.ResidentRAM()` is
   the authoritative read; `ResidentRAMForNode(nodeID)` returns the
@@ -164,11 +165,12 @@ in Phase E pins this under multi-node.
 ### Wake path RPS scaling
 
 `(projected)` Wake path RPS scales linearly with the number of
-gatewayd instances behind a load balancer, NOT with compute nodes.
+gatewayd-internal instances behind a load balancer (with
+gatewayd-public terminating TLS at the edge), NOT with compute nodes.
 A compute node does not increase wake RPS; it increases the
 admitted-RAM and vCPU budgets. The wake-path bottleneck today is
-gatewayd's listener (spec §6.4 "WakeResponse reverts" row); a
-2-gatewayd fleet would double the wake RPS, a 2-compute-node
+gatewayd-internal's listener (spec §6.4 "WakeResponse reverts" row); a
+2-gatewayd-internal fleet would double the wake RPS, a 2-compute-node
 fleet does not.
 
 ### Snapshot locality
@@ -204,8 +206,8 @@ open Tier 1 / Tier 2 PR):
 - **(open)** `node_capacity_reports` audit table (ADR-025 §4.5
   follow-up). Today's drops are logged but not queryable.
 - **(open)** Wake-path RPS at the cluster level — a
-  load-balanced gatewayd fleet has never been measured at
-  multi-host scale.
+  load-balanced gatewayd-internal + gatewayd-public fleet has never
+  been measured at multi-host scale.
 
 ## §6 Acceptance against issue #297
 

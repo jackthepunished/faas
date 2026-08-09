@@ -100,7 +100,7 @@ Each component: single Go binary, own systemd unit, structured logs (JSON, `slog
 
 ### 4.1 `gatewayd-public` ⏵ `gatewayd-internal` — edge proxy
 
-As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-A7 readers should consult the monolithic `gatewayd` content in the original commit.
+As of Tier A7 (ADR-070), this section describes the two split daemons. Pre-Tier-A7 readers should consult the monolithic `gatewayd` (then a single daemon) content in the original commit.
 
 **Owns:** TLS termination (gatewayd-public), routing + wake-blocking + request accounting + per-tenant rate limits (gatewayd-internal).
 
@@ -953,7 +953,7 @@ Conventions (agents: treat as lint): errors wrapped with `%w` + operation contex
 
 | # | Gap | Resolution lean | Decide by |
 |---|---|---|---|
-| G1 | **Registry unspecced** — §4.2 accepts `image: registry.gregale.dev/...` but no registry component exists | v1: accept **public registries only** (Docker Hub, ghcr.io), digest-pinned, pulled by imaged through the build egress policy. Own registry (CNCF `distribution` behind gatewayd) only if private images become a paid ask | M5 |
+| G1 | **Registry unspecced** — §4.2 accepts `image: registry.gregale.dev/...` but no registry component exists | v1: accept **public registries only** (Docker Hub, ghcr.io), digest-pinned, pulled by imaged through the build egress policy. Own registry (CNCF `distribution` behind the public edge) only if private images become a paid ask | M5 |
 | G2 | **Customer secrets** — apps need env secrets; no encryption/injection/redaction design | `faas secrets set KEY=…` → sealed with a host age key, stored encrypted in PG, injected into `/etc/faas/app.json` env at boot only, values redacted from build/app logs by pattern; never in snapshots of *other* deployments | **Closed by ADR-020 (PR #73 + M8 readiness PR for vmmd host-key lifecycle).** Sealed with X25519 host age key (filippo.io/age); injected into `/etc/faas/secrets.env` on every wake; values never cross the VM boundary in cleartext; vmmd generates/loads the host key at boot. |
 | G3 | **Dashboard/web UI** — spec is API+CLI only | **RESOLVED (ADR-011, `ux_spec.md` §4/§11):** CLI-first, but a *thin* server-rendered dashboard (apid, Go templates + HTMX) ships **at launch** because GitHub connect-repo needs an OAuth callback + repo picker. Scope kept minimal: auth, GitHub connect, apps/logs, usage/billing, account | M7.5 (was post-M8) |
 | G8 | **GitHub push-to-deploy** — chosen at launch; no component exists | **RESOLVED (ADR-012, `ux_spec.md` §5):** `githubd` (or apid module) — push-webhook receiver on `gatewayd-public /webhooks/github` (signature-verified), Checks-API status writer, per-repo install-token cache, least-privilege scopes. PR-preview envs deferred to v1.1 | M7.5 |

@@ -208,7 +208,7 @@ func (NoopScheduler) AdmitInstance(context.Context, string, string) (string, str
 	return "", "", "", "", 0, false, 0, ErrSchedulerUnconfigured
 }
 
-// FakeScheduler is the in-process scheduler used by handler/cmd/gatewayd
+// FakeScheduler is the in-process scheduler used by handler/cmd/gatewayd-internal/
 // tests. It records every AdmitInstance call and returns a stable fake
 // identity per call; configurable LatencyMs simulates a cold wake.
 //

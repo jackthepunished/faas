@@ -1,11 +1,11 @@
-// client_warmhints.go — gatewayd-side typed adapter for the
+// client_warmhints.go — gatewayd-internal-side typed adapter for the
 // schedd StreamWarmHints gRPC stream (ADR-025 axis 4).
 //
 // Mirrors client_logs.go:50-98 (the StreamAppLogs adapter). The
 // proto stream is converted into a typed WarmHintStream surface
-// so the gatewayd consumer doesn't reach into the generated
+// so the gatewayd-internal consumer doesn't reach into the generated
 // protobuf package. Errors pass through unchanged — the consumer
-// in cmd/gatewayd/warmhints.go distinguishes io.EOF (clean
+// in cmd/gatewayd-internal/warmhints.go distinguishes io.EOF (clean
 // shutdown) from gRPC status codes via errors.Is / status.FromError.
 
 package scheddgrpc
@@ -21,7 +21,7 @@ import (
 )
 
 // WarmHintEvent is the transport-neutral mirror of
-// scheddpb.StreamWarmHintsResponse. Defined here so the gatewayd
+// scheddpb.StreamWarmHintsResponse. Defined here so thegatewayd-internal
 // consumer can name scheddgrpc.WarmHintEvent without importing
 // either the protobuf package or pkg/sched directly — same shape
 // as sched.WarmHintEvent (the engine-side broadcaster type),
@@ -42,7 +42,7 @@ type WarmHintEvent = sched.WarmHintEvent
 //
 // Errors pass through unchanged so callers can map gRPC codes
 // (Canceled, Unavailable) themselves. Do not call liftErr on
-// these — the consumer in cmd/gatewayd/warmhints.go treats
+// these — the consumer in cmd/gatewayd-internal/warmhints.go treats
 // Unavailable as a transient reconnect signal rather than a
 // platform-level failure.
 type WarmHintStream interface {
@@ -83,7 +83,7 @@ var _ WarmHintStream = (*warmHintStreamAdapter)(nil)
 
 // Recv blocks for the next event or end-of-stream. WrittenAt is
 // converted via timestamppb.AsTime; an unset proto timestamp
-// yields the zero time.Time, which the gatewayd cache treats
+// yields the zero time.Time, which the gatewayd-internal cache treats
 // as "use the existing entry" (no-op update).
 func (a *warmHintStreamAdapter) Recv() (WarmHintEvent, error) {
 	resp, err := a.inner.Recv()

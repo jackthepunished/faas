@@ -248,7 +248,7 @@ func TestHotPathDoesNotWakeOrTagCold(t *testing.T) {
 // the value the scheduler returned byte-for-byte. In production schedd
 // mints a UUIDv7 (via google/uuid), so the contract is: header == whatever
 // Wake returned, header is non-empty, header is a valid UUID. Catching
-// drift between the gateway and the scheduler — e.g. if gatewayd starts
+// drift between the gateway and the scheduler — e.g. if gatewayd-internal starts
 // regenerating IDs locally — is the whole point of this test.
 func TestColdWakePropagatesUUIDv7WakeID(t *testing.T) {
 	h, b, _ := newTestHandler(t)

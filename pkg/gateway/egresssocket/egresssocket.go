@@ -52,7 +52,7 @@ import "os"
 const DefaultSocketPath = "/run/faas/egress.sock"
 
 // LegacySocketPath is the pre-PR-C default the monolithic
-// gatewayd daemon used when it served the egress channel directly.
+// gatewayd-internal daemon used when it served the egress channel directly.
 // Kept here so existing deployments with the legacy socket path
 // continue to work for one release cycle via the resolver's
 // legacyEnvVal + legacyCfgVal slots (PR-C+D flip). PR-E + a

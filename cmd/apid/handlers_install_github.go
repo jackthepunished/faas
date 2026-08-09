@@ -23,7 +23,7 @@
 //
 // Both routes are cookie-session-authenticated (NOT API-key auth)
 // and live on the dashboard mux so the §11 middleware stack applies.
-// They fall under /v1/* so cmd/gatewayd/proxy.go:isApidPath already
+// They fall under /v1/* so cmd/gatewayd-internal/proxy.go:isApidPath already
 // forwards them to apid.
 package main
 

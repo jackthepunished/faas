@@ -123,7 +123,7 @@ ok "host.age SHA-256: $SHA_PRE (stamped at $LATEST_BB/host.age)"
 # --- 1. Stop daemons + Postgres -----------------------------------------
 
 heading "1/7 Stop daemons + Postgres"
-for unit in apid gatewayd schedd vmmd imaged builderd meterd githubd; do
+for unit in apid gatewayd-internal gatewayd-public schedd vmmd imaged builderd meterd githubd; do
   if systemctl is-active --quiet "faas-$unit.service"; then
     systemctl stop "faas-$unit.service"
     ok "stopped faas-$unit.service"
@@ -172,7 +172,7 @@ heading "5/7 Start Postgres + daemons"
 systemctl start postgresql
 ok "postgresql started"
 
-for unit in apid gatewayd schedd vmmd imaged builderd meterd githubd; do
+for unit in apid gatewayd-internal gatewayd-public schedd vmmd imaged builderd meterd githubd; do
   systemctl start "faas-$unit.service"
   ok "started faas-$unit.service"
 done
@@ -351,7 +351,7 @@ FIELDS
   echo "  shipping; most-recent WAL recorded above."
   echo "- Basebackup taken via pg_basebackup -Ft -z -D <dir> during the nightly"
   echo "  cron at ${DRILL_START_ISO}, or via 'make backup-pg' for an immediate run."
-  echo "- All eight faas units (apid, gatewayd, githubd, schedd, vmmd,"
+  echo "- All nine faas units (apid, gatewayd-internal, gatewayd-public, githubd, schedd, vmmd,"
   echo "  imaged, builderd, meterd) were healthy at drill start."
   echo
   echo "## Anomalies / observations"

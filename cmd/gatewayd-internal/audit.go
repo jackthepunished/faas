@@ -72,7 +72,7 @@ func (a *gatewaydAuditor) Emit(ctx context.Context, kind string, subject *string
 }
 
 // Compile-time check: *state.PgStore satisfies auditStore so the
-// production wiring in cmd/gatewayd/main.go can pass a pgStore
+// production wiring in cmd/gatewayd-internal/main.go can pass a pgStore
 // directly without an adapter. The check fails to compile if
 // state.Store.AppendEvent drifts.
 var _ auditStore = (*state.PgStore)(nil)

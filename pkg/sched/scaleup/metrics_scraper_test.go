@@ -56,7 +56,7 @@ gateway_requests_total{plan="pro"} 7
 
 // TestHTTPPromScraper_ParseIntegration verifies the full path:
 // the scraper reads the body, parses it, and returns the per-app
-// map. Uses fakeHTTPFetcher so no live gatewayd is needed.
+// map. Uses fakeHTTPFetcher so no live gatewayd-internal is needed.
 func TestHTTPPromScraper_ParseIntegration(t *testing.T) {
 	body := `gateway_requests_total{app="a1"} 100
 gateway_requests_total{app="a1"} 50

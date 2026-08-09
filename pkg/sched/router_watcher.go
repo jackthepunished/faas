@@ -6,8 +6,8 @@
 // never re-asks the store. After any compute_nodes UPSERT — admin
 // URL rotation, active flip, soft-delete — schedd keeps dialling
 // the stale target_url until a daemon restart. This watcher closes
-// that gap by subscribing to the same channel gatewayd's
-// NodeClientCache uses (cmd/gatewayd/nodecache.go::WatchEvictions)
+// that gap by subscribing to the same channel gatewayd-internal's
+// NodeClientCache uses (cmd/gatewayd-internal/nodecache.go::WatchEvictions)
 // and drops the dialed client + reloads target_url on every
 // payload.
 //

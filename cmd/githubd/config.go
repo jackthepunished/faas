@@ -19,7 +19,7 @@ import (
 type Config struct {
 	// HTTPAddr is the loopback bind address the plain HTTP webhook
 	// listener uses. Defaults to 127.0.0.1:8083 (spec §11: githubd
-	// is loopback-only, gatewayd reverse-proxies /webhooks/github).
+	// is loopback-only, gatewayd-public reverse-proxies /webhooks/github).
 	HTTPAddr string `toml:"http_addr"`
 
 	// SocketPath is the unix-domain socket the gRPC server binds when

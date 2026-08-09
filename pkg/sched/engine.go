@@ -72,7 +72,7 @@ const (
 //
 // Returning *api.Problem with code=sig_invalid means "refuse to
 // boot this layer" — the engine transitions the deployment to
-// DeployFailed and returns 503 to gatewayd. Any other error is a
+// DeployFailed and returns 503 to gatewayd-internal. Any other error is a
 // transient I/O failure; the caller decides whether to retry.
 type LayerVerifier interface {
 	Verify(ctx context.Context, layerKey, sigKey string) error
@@ -278,7 +278,7 @@ type Engine struct {
 	// warmBroadcaster is the push-side of sticky-warm affinity
 	// (ADR-025 axis 4). Every RecordWake that actually changes the
 	// (appID → nodeID) entry fans out a WarmHintEvent to every
-	// subscribed consumer (today: every gatewayd's StreamWarmHints
+	// subscribed consumer (today: every gatewayd-internal's StreamWarmHints
 	// gRPC stream). nil is tolerated by admitAndDispatch (the emit
 	// call becomes a no-op) so pre-PR test fixtures that don't wire
 	// the broadcaster keep their existing single-box behaviour.
@@ -712,7 +712,7 @@ func (e *Engine) NodeKeyRegistry() *NodeKeyRegistry {
 // ForwardHTTP RPC.
 //
 // The previous shape carried `Addr = host_ip:8080`, an inner-netns
-// placeholder reachable only from gatewayd on the local box. Remote
+// placeholder reachable only from gatewayd-internal on the local box. Remote
 // nodes return `host_ip` from inside a different jailer's netns and
 // the gateway cannot dial it. The new shape carries the routable
 // identity (the compute_node.id), with the dial target chosen on
@@ -723,7 +723,7 @@ type WakeResult struct {
 	Method     vmmdpb.WakeMethod
 	// WakeID is the per-wake-attempt correlation handle (gaps analysis
 	// 2026-07-23). UUIDv7 minted at Phase 2 before CreateInstance;
-	// gatewayd propagates it back to the client as x-faas-wake-id and
+	// gatewayd-internal propagates it back to the client as x-faas-wake-id and
 	// operators see it on schedule/wake slog calls. On the Phase-1
 	// fast path (a second Wake for an already-RUNNING app) this is
 	// the wake_id of the wake that brought the instance up — surfaced
@@ -817,7 +817,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// Why a LiveDeployment read is acceptable here: Wake is the
 		// legacy fast path used by meterd's per-minute sampler + cron
 		// firings, NOT the customer hot path. Production customer
-		// requests go through AdmitInstance (cmd/gatewayd/main.go),
+		// requests go through AdmitInstance (cmd/gatewayd-internal/main.go),
 		// which has the live deployment already loaded. So this read
 		// adds one cheap PG roundtrip (~1ms, single-row lookup with
 		// the existing (app_id, status) partial index) per minute per
@@ -1224,7 +1224,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	//
 	// Push-side fanout (ADR-025 axis 4): if the new entry actually
 	// changed appID's warm node, broadcast a WarmHintEvent to every
-	// gatewayd subscribed via Engine.StreamWarmHints. Same per-app
+	// gatewayd-internal subscribed via Engine.StreamWarmHints. Same per-app
 	// lock guards the cache write + the emit so the gRPC stream
 	// observes writes in the same order the cache does. nil
 	// broadcaster is a no-op (the test-only path that constructs
@@ -1483,7 +1483,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			// Transient I/O — fail the boot but don't mark the
 			// layer compromised. Same shape as the vmmd
 			// round-trip failure path below: transition + release.
-			// Wrap in a *api.Problem so gatewayd's writeWakeError
+			// Wrap in a *api.Problem so gatewayd-internal's writeWakeError
 			// sees a Problem (and therefore writes through to the
 			// client with Retry-After) instead of falling through
 			// to its ErrCapacity fallback that lacks the header
@@ -1525,7 +1525,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		defer wakeSpan.End()
 	}
 	// issue #517 bootCtx stamp point: lift the inbound correlation
-	// (request_id / invocation_id from gatewayd) and join the
+	// (request_id / invocation_id from gatewayd-internal) and join the
 	// engine-minted wake_id / instance_id so a single inbound id
 	// carries across the schedd → vmmd boundary.
 	inboundCorr, _ := wire.FromContext(ctx)
@@ -2851,7 +2851,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 				return err
 			}
 			// Transient I/O — same Retry-After shape as the Wake
-			// branch. Wrap as a Problem so gatewayd's writeWakeError
+			// branch. Wrap as a Problem so gatewayd-internal's writeWakeError
 			// flushes both status + header in one path (review
 			// finding #1a on PR #322).
 			e.log.Warn("prime: verifier i/o error",

@@ -49,7 +49,7 @@ verdict:     PASS
   shipping; most-recent WAL recorded above.
 - Basebackup taken via `pg_basebackup -Ft -z -D <dir>` during the nightly
   cron at <ISO-8601>, or via `make backup-pg` for an immediate run.
-- All eight faas units (`apid`, `gatewayd`, `githubd`, `schedd`, `vmmd`,
+- All eight faas units (`apid`, `gatewayd-internal`, `githubd`, `schedd`, `vmmd`,
   `imaged`, `builderd`, `meterd`) were healthy at drill start.
 
 ## Anomalies / observations

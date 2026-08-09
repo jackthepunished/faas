@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# hetzner-zone-setup.sh — idempotent Hetzner DNS bootstrap for gatewayd TLS.
+# hetzner-zone-setup.sh — idempotent Hetzner DNS bootstrap for gatewayd-public TLS.
 #
-# Spec §4.1: gatewayd terminates TLS for *.apps.gregale.dev via DNS-01 against
+# Spec §4.1: gatewayd-public terminates TLS for *.apps.gregale.dev via DNS-01 against
 # the Hetzner DNS API. Three records have to exist before the first
 # daemon start:
 #
@@ -183,7 +183,7 @@ fi
 echo "    zone_id=$ZONE_ID"
 
 # The wildcard A: certmagic wants *.apps.<zone> to resolve to the
-# gatewayd box. We write it as the bare apps.<zone> (Hetzner treats
+# gatewayd-public box. We write it as the bare apps.<zone> (Hetzner treats
 # "apps.gregale.dev" as the record name and serves both apex + wildcard
 # lookups; the wildcard `*` prefix isn't a record on its own).
 echo "==> A $APPS_DOMAIN -> $HOST_IP"

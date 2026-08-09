@@ -7,7 +7,7 @@
 #     network or metadata exfiltration
 #   - allow outbound to public IPs only
 #
-# The tap-side NAT is used in M2+ when gatewayd pulls guest traffic
+# The tap-side NAT is used in M2+ when gatewayd-internal pulls guest traffic
 # out to the public net; we deploy it now so the ruleset is converged
 # before the first cold boot.
 #

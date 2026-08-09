@@ -173,7 +173,7 @@ func withMFAPending(ctx context.Context, pending bool) context.Context {
 // ok return distinguishes "not stamped" from "stamped false" so
 // RequireMFA can short-circuit correctly on each branch.
 //
-// Exported so tests + future callers (PR-2 gatewayd AppLogsHandler)
+// Exported so tests + future callers (PR-2 gatewayd-internal AppLogsHandler)
 // can inspect without going through WithMFAPending.
 func MFAPendingFrom(r *http.Request) (bool, bool) {
 	v := r.Context().Value(mfaPendingCtxKey{})

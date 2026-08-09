@@ -1,7 +1,10 @@
-# gatewayd deploy
+# gatewayd-public deploy (historical)
 
-This directory contains the systemd unit and nftables ruleset fragment for
-gatewayd, the only public listener on the box (spec §4.1).
+This directory contains the legacy systemd unit and nftables ruleset fragment
+for the monolithic gatewayd; the post-ADR-070 split into gatewayd-public
+(edge) and gatewayd-internal (routing/wake) is wired in
+`deploy/ansible/roles/control_plane_service/`. The legacy unit + nftables
+fragment here are retained for diff archaeology only.
 
 ## Install
 

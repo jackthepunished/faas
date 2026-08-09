@@ -3,7 +3,7 @@
 // githubd owns: push-webhook receiver, Checks-API status writer, OAuth
 // callback handler, per-repo install-token cache. It is the SOLE
 // outbound caller to api.github.com (Checks API + install token
-// exchange); its inbound public surface is gatewayd at /webhooks/github
+// exchange); its inbound public surface is gatewayd-public at /webhooks/github
 // (HMAC-verified at the edge per ADR-012).
 //
 // Wire discipline mirrors vmmd (ADR-013) and schedd (ADR-018):

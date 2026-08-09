@@ -1,6 +1,6 @@
 // Issue #98 / ADR-028: vmmd's HTTP bridge into per-instance netns.
 //
-// gatewayd's hot path speaks HTTP to vmmd over the Tailscale/Wireguard
+// gatewayd-internal's hot path speaks HTTP to vmmd over the Tailscale/Wireguard
 // overlay (no second transport — pkg/wire.DialContext does TCP+overlay+mTLS
 // already, issue #95). vmmd receives the request, nsenter's the
 // per-instance netns, dials netns.GuestIP:netns.AppPort on the inner side,
@@ -91,7 +91,7 @@ const ForwardStreamResponseTimeout = 900 * time.Second
 const streamBridgeSessionDeadline = 24 * time.Hour
 
 // ForwardHTTPStream (issue #471 PR-B + PR-C / ADR-047) is the
-// bidi bridge the gatewayd hot path uses for every request. Wire
+// bidi bridge the gatewayd-internal hot path uses for every request. Wire
 // shape:
 //
 //	client → server: 1× ForwardHTTPRequestInit, then N× body_chunk
@@ -170,10 +170,10 @@ func (s *Server) ForwardHTTPStream(stream grpc.BidiStreamingServer[vmmdpb.Forwar
 		// A non-streaming init frame on the streaming RPC
 		// (the legacy `stream=true` field was unimplemented in
 		// some early bridge scripts) is treated as the
-		// smaller cap. Today gatewayd always sets stream=true
+		// smaller cap. Today gatewayd-internal always sets stream=true
 		// (handler.go:setupStreamingWriter stamps the header),
 		// so this branch is unreachable from production
-		// gatewayd but the guard is cheap insurance.
+		// gatewayd-internal but the guard is cheap insurance.
 		maxBody = 25 * 1024 * 1024
 		respTimeout = 60 * time.Second
 	}
@@ -767,7 +767,7 @@ func rawBridgeSpawn(ctx context.Context, netnsName string, dialPort uint32) (*ex
 // on the cap. A caller that sets max_request_bytes to
 // math.MaxInt64 still gets the 100 MiB ceiling, so the
 // pkg/api/limits.go invariant ("never inline a limit; the table
-// is the source of truth") survives a misconfigured gatewayd.
+// is the source of truth") survives a misconfigured gatewayd-internal.
 //
 // Returns the body-error channel AND a *sync.WaitGroup that
 // signals when the goroutine has actually exited. rawBridgeFinish
@@ -1311,7 +1311,7 @@ func (s *Server) endActivity(instanceID string) {
 // instead of HTTP/1.1, so gRPC unary and streaming clients see H2
 // framing all the way to the guest container. Per-connection
 // overhead is reduced by the H2 frame coalescing — the wire is
-// also small enough that the liveness checks (e.g. gatewayd
+// also small enough that the liveness checks (e.g.gatewayd-internal
 // health probing) keep working without changes.
 func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.ForwardHTTPStreamRequest, vmmdpb.ForwardHTTPStreamResponse], reqInit *vmmdpb.ForwardHTTPRequestInit, netnsName string, maxBody int64, respTimeout time.Duration) error {
 	const op = "ForwardHTTPStreamV2"

@@ -149,7 +149,7 @@ func (s *SynthServer) Start() error {
 	// Mode 0660 group `faas` — only schedd in that group can dial.
 	// The wire package's ListenOrRecreateByName handles chmod in
 	// production; this server keeps the lock tight regardless of who
-	// ran cmd/gatewayd.
+	// ran cmd/gatewayd-internal/
 	if err := os.Chmod(s.socketPath, 0o660); err != nil {
 		_ = lis.Close()
 		return fmt.Errorf("gateway synth: chmod: %w", err)
@@ -171,7 +171,7 @@ func (s *SynthServer) Stop(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-// SocketPath returns the bound socket. Wired in cmd/gatewayd so
+// SocketPath returns the bound socket. Wired in cmd/gatewayd-internal/so
 // schedd knows where to dial.
 func (s *SynthServer) SocketPath() string { return s.socketPath }
 
@@ -211,7 +211,7 @@ func (s *SynthServer) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 	// method is recorded in the synth call log so the dashboard can
 	// distinguish cron-fired POSTs from GETs once the proxy-side
-	// follow-up routes a real request through gatewayd.
+	// follow-up routes a real request through gatewayd-internal.
 	//
 	// The values flow from the JSON request body — CodeQL's
 	// go/log-injection (CWE-117) flags them as attacker-controlled
