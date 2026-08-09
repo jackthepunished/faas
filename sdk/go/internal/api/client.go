@@ -733,6 +733,40 @@ func (c *Client) PasswordLogin(ctx context.Context, email, password string) (Pas
 		PasswordLoginRequest{Email: email, Password: password}, &out)
 }
 
+// ProgrammaticSignup is the JSON-only POST /v1/auth/signup. Returns
+// the ProgrammaticAuthResponse payload (mirrors PasswordSignup with
+// the api_key surfaced). The Gregale CLI uses this on the
+// `gregale signup` interactive path so the bearer-key token lands
+// in ~/.config/faas/auth.json without a dashboard round-trip.
+//
+// The plaintext is returned ONCE; callers must persist it in the
+// same call frame.
+func (c *Client) ProgrammaticSignup(ctx context.Context, email, password string) (ProgrammaticAuthResponse, error) {
+	var out ProgrammaticAuthResponse
+	return out, c.do(ctx, "POST", "/v1/auth/signup",
+		PasswordSignupRequest{Email: email, Password: password}, &out)
+}
+
+// ProgrammaticLogin is the JSON-only POST /v1/auth/login. Same
+// response shape as ProgrammaticSignup so the CLI reuses a single
+// unmarshaler. Anti-enumeration posture mirrors /login: Argon2id pad
+// on the no-row branch, identical 401 on wrong-password vs unbound.
+func (c *Client) ProgrammaticLogin(ctx context.Context, email, password string) (ProgrammaticAuthResponse, error) {
+	var out ProgrammaticAuthResponse
+	return out, c.do(ctx, "POST", "/v1/auth/login",
+		PasswordLoginRequest{Email: email, Password: password}, &out)
+}
+
+// RequestMagicLinkSignup is the JSON-only POST /v1/auth/signup/magic-link.
+// The server always returns 200 with the same body regardless of
+// whether the email is bound, unbound, malformed, or missing. The
+// signup link is mailed via the platform's mailer when the address
+// is recognised (or could be registered).
+func (c *Client) RequestMagicLinkSignup(ctx context.Context, email string) error {
+	return c.do(ctx, "POST", "/v1/auth/signup/magic-link",
+		MagicLinkSignupRequest{Email: email}, nil)
+}
+
 // RequestPasswordReset mints a password-reset email. The server
 // always returns 200 with an identical body regardless of whether the
 // email is bound to an account, so the surface does not leak account

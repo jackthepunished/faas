@@ -181,6 +181,44 @@ func (f *fixture) handler() http.Handler {
 		_, _ = w.Write(accountResponse)
 	})
 
+	// Issue #311 — programmatic auth surface. The fakeapid fixture
+	// returns the canonical ProgrammaticAuthResponse so the CLI
+	// exercises the full unmarshaler + saveToken() path against the
+	// fixture. The plaintext is a deterministic string suffixed with
+	// the request path so a test can assert which route was hit.
+	programmaticAuthBody := func(route string) []byte {
+		return fmt.Appendf(nil, `{"account_id":"acc_fixture_311","plan":"free","api_key":{"plaintext":"fp_live_fixture_%s","prefix":"fp_live_","id":"key_fixture_311"}}`, route)
+	}
+	mux.HandleFunc("/v1/auth/signup", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported on /v1/auth/signup", "fixture")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(programmaticAuthBody("signup"))
+	})
+	mux.HandleFunc("/v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported on /v1/auth/login", "fixture")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(programmaticAuthBody("login"))
+	})
+	mux.HandleFunc("/v1/auth/signup/magic-link", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			problemJSON(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported on /v1/auth/signup/magic-link", "fixture")
+			return
+		}
+		// Anti-enumeration: the fixture always returns 200 with the
+		// same body regardless of the input.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
 	mux.HandleFunc("/v1/apps", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:

@@ -422,6 +422,32 @@ type PasswordSignupRequest struct {
 	Password string `json:"password"`
 }
 
+// ProgrammaticAuthResponse is the body for the JSON-only
+// POST /v1/auth/{signup,login} pair (issue #311). Distinct from
+// PasswordLoginResponse: this one carries the api_key payload so the
+// bearer-key CLI can use the result without a dashboard round-trip.
+type ProgrammaticAuthResponse struct {
+	AccountID string             `json:"account_id"`
+	Plan      string             `json:"plan"`
+	APIKey    ProgrammaticAPIKey `json:"api_key"`
+}
+
+// ProgrammaticAPIKey is the freshly minted API key returned on the
+// first request. Plaintext is returned ONCE; the caller persists it.
+type ProgrammaticAPIKey struct {
+	Plaintext string `json:"plaintext"`
+	Prefix    string `json:"prefix"`
+	ID        string `json:"id"`
+}
+
+// MagicLinkSignupRequest is the body of POST /v1/auth/signup/magic-link.
+// The email is optional — the handler accepts a missing or unparseable
+// email and still returns 200 so the response cannot be used to
+// enumerate accounts.
+type MagicLinkSignupRequest struct {
+	Email string `json:"email"`
+}
+
 // PasswordResetRequest is the body of POST /login/forgot. The email
 // is optional — the same-shape internal handler is hit by the form
 // page (no body) and the SDK (email in body). The handler always
