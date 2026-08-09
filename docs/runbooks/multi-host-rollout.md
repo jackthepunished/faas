@@ -18,13 +18,13 @@ lex-min leader election, warm-standby pre-warming, and DNS
 failover that closes the §14 M8 row "Gate-A runbook (2nd box
 active-passive)".
 
-> [!CAUTION]
-> **This runbook is staging-only until #250 (off-host Postgres backup) ships.**
->
-> Tier 1 Phase 1, 2, 3, 4, and 5 are all shipped. The remaining pre-
-> condition is off-host PG backup — a CP-host loss would be
-> unrecoverable without it. Re-read the runbook before each cut-over;
-> status flips are tracked at
+> [!NOTE]
+> **Production-ready as of 2026-08-09.** All five Tier 1 phases +
+> off-host Postgres backup (#250 / ADR-056, accepted via PR #784)
+> are shipped. The Tier 2 pre-requisites bullet for #250 has been
+> retired from ADR-025. This runbook is the operator-facing
+> reference for the multi-host cutover; status flips are tracked
+> at
 > [docs/adr/025-decoupled-control-plane-and-compute.md §Tier 2
 > pre-requisites](../adr/025-decoupled-control-plane-and-compute.md#tier-2-pre-requisites).
 >
@@ -95,10 +95,15 @@ active-passive)".
 >   stay byte-for-byte unchanged so single-box CI keeps
 >   working. Defense-in-depth alongside `wire.PeerCN`
 >   (ADR-052).
-> - **#250 (off-host Postgres backup)** — ✗ NOT shipped.
->   Multi-host without off-host PG backup means a CP-host
->   loss is unrecoverable. The runbook is staging-only on
->   this ground alone, even with Tier 1 fully shipped.
+> - **#250 (off-host Postgres backup)** — ✓ shipped in
+>   PR #784 (ADR-056 v1.0, accepted 2026-08-09). Compound
+>   `archive_command` (cp + rclone to Hetzner Storage Box),
+>   `faas-pg-basebackup-push.{service,timer}` pair, sealed-at-rest
+>   `/etc/faas/secrets/storage-box/` credentials, the
+>   `pg_backup_last_pushed_seconds` gauge + `PgBackupStale`
+>   alert, and `pg-restore-verify.sh` T-7 throwaway verify are
+>   all in tree. The Tier 2 pre-requisites bullet for #250 was
+>   retired from ADR-025 the same day.
 > - **#316 (`host.age` rotation runbook)** — ✓ shipped
 >   (PR for issue #316, ADR-057). 30-day rotation-overlap
 >   window via `gregale host-age {init,rotate,status,prune-previous}`,
@@ -255,11 +260,22 @@ curl -fsS -X POST 'https://faas-fsn-1:8081/v1/compute-nodes' \
   }'
 ```
 
+> **This `target_url` is the source of truth for the dial
+> target.** It MUST be a routable FQDN or IP that another host
+> can dial — NOT `0.0.0.0` (which resolves to the local host's
+> own vmmd, not the second box). See §3.5 for the
+> `listen_addr`/`target_url` distinction. The field is operator-
+> owned: vmmd's startup UPSERT preserves it on restart (it does
+> NOT clobber the operator's value with whatever `listen_addr`
+> contains — that was the pre-fix trap; see
+> `pkg/state.UpsertComputeNodeFromVmmd`).
+
 The row is `active=true` by default. The `compute_node_changed`
 pg_notify trigger (migration 00026) fires and evicts gatewayd's
 per-node client cache for any prior `fsn-2` entry. The admin POST
 is idempotent — re-POSTing with the same name UPSERTs the row
-(ADR-029).
+via `UpsertComputeNodeFromOperator` (ADR-029). The operator's
+target_url wins on every field.
 
 > **Note:** the synthetic `default-local` row is hard-delete
 > refused with HTTP 409 `default_local_protected` (ADR-029). Do
@@ -275,15 +291,74 @@ journalctl -u faas-vmmd -f
 Expected output (within ~5 s):
 
 ```
-vmmd registered node_id=... name=fsn-2 target_url=tcp://vmmd-2.faas:50051
+vmmd: compute_node registered name=fsn-2 id=... target_url=tcp://vmmd-2.faas:50051 vpcpus=160 mem_mb=56000 admission_ceiling_mb=47600
 vmmd capacity_publisher starting 1s tick
 ```
 
-vmmd UPSERTs the `compute_nodes` row on startup. The two UPSERTs
-(admin POST + vmmd self-registration) are idempotent — the row
-ends with vmmd's view of `vpcpus`/`mem_mb`/`target_url`, which
-should match the operator POST. If they don't match, the admin
-POST was wrong; re-POST with the right values.
+> The `target_url=tcp://vmmd-2.faas:50051` line MUST show the
+> operator's POSTed FQDN — NOT the bind address
+> (`tcp://0.0.0.0:50051`) and NOT the unix socket. If you see
+> either of those, the operator's target_url was clobbered —
+> re-POST and restart. vmmd's startup UPSERT preserves the
+> operator's target_url via `UpsertComputeNodeFromVmmd`
+> (`coalesce(compute_nodes.target_url, excluded.target_url)`);
+> the pre-fix trap was that vmmd's UPSERT silently overwrote the
+> operator's value with the bind form. See §3.5 for the
+> distinction.
+
+vmmd UPSERTs the `compute_nodes` row on startup via
+`UpsertComputeNodeFromVmmd`. The two UPSERTs (admin POST via
+`UpsertComputeNodeFromOperator` + vmmd self-registration) are
+idempotent — the row ends with the operator's `target_url` (vmmd
+does not touch it) and vmmd's view of `vpcpus` / `mem_mb`. If
+they don't match the operator POST, the admin POST was wrong;
+re-POST with the right values.
+
+### 3.5. `listen_addr` vs `target_url` — the load-bearing distinction
+
+Two fields, two concerns:
+
+- **`listen_addr`** (top-level `vmmd.toml`) — the address vmmd
+  BINDS to. `tcp://0.0.0.0:50051` is fine for listening on all
+  interfaces; `tcp://[::]:50051` for IPv6. The bind address is
+  what `net.ListenConfig.Listen(ctx, "tcp", t.Address)` resolves
+  to.
+- **`[compute_node].target_url`** — the address schedd/gatewayd
+  DIAL to reach this vmmd. Must be a routable FQDN or IP that
+  another host can resolve, e.g. `tcp://vmmd-2.faas:50051` or
+  `tcp://100.64.0.1:50051`. NEVER `0.0.0.0` — that resolves to
+  the dialer's own loopback / local vmmd, not the second box.
+
+The two fields are now separate in `vmmd.toml` (post-PR-fix;
+before this PR they were the same string, and `0.0.0.0` would
+silently land on the local host's own vmmd). Pre-flight on
+every `systemctl restart faas-vmmd`:
+
+- vmmd logs a Warn if the resolved `target_url` is a `tcp://`
+  form AND it equals `listen_addr` (the most common re-
+  introduction of the conflation: operator sets
+  `listen_addr = tcp://vmmd-2.faas:50051` and never sets
+  `target_url` separately; works on dev but on multi-box the
+  bind form is the dial form, which routes to wrong host).
+- The fix is one line: add `[compute_node].target_url =
+  "tcp://vmmd-2.faas:50051"` (or set `[compute_node].overlay_ip`
+  for the auto-detected Tailscale IP fallback).
+
+### 4.5. Operator POST preservation across vmmd restarts
+
+`vmmd`'s startup UPSERT (`UpsertComputeNodeFromVmmd`) preserves
+the operator's `target_url` on conflict — the existing
+operator-POSTed value stays. The COALESCE in pgstore
+(`coalesce(compute_nodes.target_url, excluded.target_url)`)
+handles the cold-INSERT case where no operator POST has happened
+yet: the seed row from migration 00024 carries a non-empty
+target_url already, but a fresh box's first registration gets
+vmmd's own view of its dialable address.
+
+Concretely: an operator POST is the **source of truth** for
+`target_url`. vmmd will not silently overwrite it on restart.
+If you need to change the dial target (host swap, IP rotation),
+re-POST with the new value — do NOT just edit `listen_addr`.
 
 ### 5. Capacity report visibility
 
@@ -347,6 +422,9 @@ bias is wrong — check `node_capacity_table` (step 5) and
 | 11| `schedd_target_url` populated on new node          | `psql -c "select name, schedd_target_url from compute_nodes where name='fsn-2'"`         | non-null                       |
 | 12| `schedd` resolved its `OwnerNodeID`                | `ssh faas-fsn-2 'journalctl -u faas-schedd --since -1m \| grep -i owner'`                | one log line                   |
 | 13| Apps split across owners within 60 s of a create   | `psql -c "select node_id, count(*) from apps group by node_id"`                          | both `default-local` and `fsn-2` non-zero |
+| 14| `compute_nodes.target_url` matches operator POST (not the bind address) | `psql -c "select name, target_url from compute_nodes where name='fsn-2'"` | routable FQDN/IP, NOT `0.0.0.0` and NOT `unix://` |
+| 15| `journalctl -u faas-vmmd` shows `compute_node registered target_url=tcp://<fqdn>:50051` | `journalctl -u faas-vmmd -n 50 \| grep "compute_node registered"` | the FQDN, not `0.0.0.0` |
+| 16| vmmd does NOT log the `listen_addr==target_url` Warn | `journalctl -u faas-vmmd -n 50 \| grep -i "target_url equals listen_addr"` | no output (no conflation re-introduced) |
 
 ### 8. Rollback
 
@@ -497,9 +575,10 @@ If the handoff stalls in `state='migrating'` past the lease
 
 ## Follow-ups (not in this runbook)
 
-- **#250 (off-host Postgres backup)** — required before the
-  runbook is production-safe. Even with Tier 1 fully shipped,
-  a CP-host loss is unrecoverable without off-host PG backup.
+- **#250 (off-host Postgres backup)** — ✓ shipped (PR #784,
+  ADR-056 v1.0). No longer a production-safety blocker; the
+  Tier 2 pre-requisites bullet was retired from ADR-025 on
+  2026-08-09.
 - **#316 (`host.age` rotation runbook)** — shipped
   (ADR-057); 30-day overlap via `gregale host-age` CLI +
   `secretbox.LoadHostKeys` multi-identity plumbing. v2

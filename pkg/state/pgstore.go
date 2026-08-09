@@ -7801,6 +7801,85 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 	return n, nil
 }
 
+// UpsertComputeNodeFromOperator is the apid POST /v1/compute-nodes
+// write path. The operator owns target_url; the on-conflict
+// branch re-applies target_url from the excluded row so the
+// operator's POST wins on every field. Identical schema to
+// UpsertComputeNode today — split out as a distinct method so
+// the ownership boundary is visible at the call site
+// (cmd/apid/compute_nodes.go) and so future divergence (e.g.
+// an operator-side COALESCE for region/zone that vmmd shouldn't
+// touch) has exactly one place to land.
+func (s *PgStore) UpsertComputeNodeFromOperator(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	row := s.pool.QueryRow(ctx, `
+		insert into compute_nodes
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
+		     region, zone)
+		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		on conflict (name) do update
+		  set target_url          = excluded.target_url,
+		      vpcpus              = excluded.vpcpus,
+		      mem_mb              = excluded.mem_mb,
+		      max_concurrency     = excluded.max_concurrency,
+		      admission_ceiling_mb = excluded.admission_ceiling_mb,
+		      vcpu_budget         = excluded.vcpu_budget,
+		      active              = true
+		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
+		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
+		          region, zone, schedd_target_url
+	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+	n, err := scanComputeNode(row)
+	if err != nil {
+		return ComputeNode{}, fmt.Errorf("state: upsert compute_node (operator) %q: %w", node.Name, err)
+	}
+	return n, nil
+}
+
+// UpsertComputeNodeFromVmmd is the vmmd self-registration write
+// path (cmd/vmmd/register.go). Writes the vmmd-owned resource
+// numbers + re-activates the row. On conflict, target_url is
+// PRESERVED — `coalesce(compute_nodes.target_url,
+// excluded.target_url)` keeps the existing operator-POSTed
+// value intact. The COALESCE handles the cold-INSERT case where
+// no operator POST has happened yet: the seed row from migration
+// 00024 carries a non-empty target_url, but a fresh
+// `registerComputeNode` on a brand-new box (no seed, no POST)
+// still gets a non-null target_url via excluded.target_url.
+//
+// This is the load-bearing fix for the second-box cutover:
+// without the COALESCE, vmmd's startup UPSERT silently
+// overwrote the operator's carefully-POSTed `tcp://vmmd-2.faas:50051`
+// with whatever `listen_addr` contained (often
+// `tcp://0.0.0.0:50051`), routing wakes to the local host
+// instead of the second box. See
+// docs/runbooks/multi-host-rollout.md §3.5 + §4.5.
+func (s *PgStore) UpsertComputeNodeFromVmmd(ctx context.Context, node ComputeNode) (ComputeNode, error) {
+	row := s.pool.QueryRow(ctx, `
+		insert into compute_nodes
+		    (name, target_url, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, vcpu_budget, active,
+		     region, zone)
+		values ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
+		on conflict (name) do update
+		  set vpcpus              = excluded.vpcpus,
+		      mem_mb              = excluded.mem_mb,
+		      max_concurrency     = excluded.max_concurrency,
+		      admission_ceiling_mb = excluded.admission_ceiling_mb,
+		      vcpu_budget         = excluded.vcpu_budget,
+		      active              = true,
+		      target_url          = coalesce(compute_nodes.target_url, excluded.target_url)
+		returning id, name, target_url, vpcpus, mem_mb, max_concurrency,
+		          admission_ceiling_mb, vcpu_budget, active, last_heartbeat_at, created_at,
+		          region, zone, schedd_target_url
+	`, node.Name, node.TargetURL, node.VPCPUs, node.MemMB, node.MaxConcurrency,
+		node.AdmissionCeilingMB, node.VCPUBudget, node.Region, node.Zone)
+	n, err := scanComputeNode(row)
+	if err != nil {
+		return ComputeNode{}, fmt.Errorf("state: upsert compute_node (vmmd) %q: %w", node.Name, err)
+	}
+	return n, nil
+}
+
 // UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
 // in compute_node_keys (migration 00076, ADR-053). vmmd's
 // self-registration calls this on startup once it has loaded its

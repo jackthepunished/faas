@@ -135,6 +135,145 @@ func TestRegisterComputeNode_OverlayDetectionErrorContinues(t *testing.T) {
 	}
 }
 
+// TestRegisterComputeNode_TargetURLPreservesOperatorValue pins the
+// end-to-end ownership contract through registerComputeNode: an
+// operator's POSTed target_url survives a vmmd restart even when
+// vmmd's view of its dial target is wrong (the conflation that
+// shipped with PR #445 / ADR-025 v1.1). The fix is the
+// UpsertComputeNodeFromVmmd ownership split + the explicit
+// targetURL parameter on registerComputeNode (no longer inferred
+// from listen_addr).
+//
+// Sequence:
+//  1. apid POSTs target_url=tcp://vmmd-2.faas:50051 via the
+//     operator path (UpsertComputeNodeFromOperator).
+//  2. vmmd restarts; registerComputeNode is called with
+//     targetURL=tcp://0.0.0.0:50051 (the bind address —
+//     deliberately wrong to surface the trap).
+//  3. The stored row's target_url MUST still be the operator's
+//     FQDN; vmmd-owned resource numbers are refreshed.
+func TestRegisterComputeNode_TargetURLPreservesOperatorValue(t *testing.T) {
+	st := state.NewMemStore()
+	ctx := context.Background()
+
+	// Step 1: operator POST (apid path).
+	operator, err := st.UpsertComputeNodeFromOperator(ctx, state.ComputeNode{
+		Name:      "fsn-2",
+		TargetURL: "tcp://vmmd-2.faas:50051",
+		VPCPUs:    160, MemMB: 56000,
+		MaxConcurrency: 200, AdmissionCeilingMB: 47600,
+	})
+	if err != nil {
+		t.Fatalf("operator upsert: %v", err)
+	}
+	operatorID := operator.ID
+
+	// Step 2: vmmd restart with a wrong target_url.
+	got, err := registerComputeNode(ctx, st,
+		ComputeNodeConfig{
+			NodeName: "fsn-2", VPCPUs: 160, MemMB: 56000,
+			MaxConcurrency: 200, AdmissionCeilingMB: 47600,
+		}, "tcp://0.0.0.0:50051", nil, testLogger())
+	if err != nil {
+		t.Fatalf("vmmd register: %v", err)
+	}
+
+	// Step 3: target_url preserved.
+	if got.TargetURL != "tcp://vmmd-2.faas:50051" {
+		t.Errorf("vmmd register CLOBBERED operator target_url: got %q, want tcp://vmmd-2.faas:50051",
+			got.TargetURL)
+	}
+	if got.ID != operatorID {
+		t.Errorf("id changed across re-register: %q -> %q", operatorID, got.ID)
+	}
+}
+
+// TestRegisterComputeNode_TargetURLFromConfig exercises the new
+// ResolveTargetURL shape — when the operator leaves target_url
+// empty in [compute_node], registerComputeNode is called with
+// whatever the caller derives (here: tcp://100.64.0.1:50051 from
+// overlay_ip). The stored row carries that dial target. This is
+// the multi-box "auto-detect via Tailscale" path.
+func TestRegisterComputeNode_TargetURLFromConfig(t *testing.T) {
+	st := state.NewMemStore()
+	got, err := registerComputeNode(context.Background(), st,
+		ComputeNodeConfig{
+			NodeName: "box-east-1", VPCPUs: 1, MemMB: 1024,
+			MaxConcurrency: 1, AdmissionCeilingMB: 512,
+			OverlayIP: "100.64.0.1",
+		}, "tcp://100.64.0.1:50051", nil, testLogger())
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if got.TargetURL != "tcp://100.64.0.1:50051" {
+		t.Errorf("target_url = %q, want tcp://100.64.0.1:50051", got.TargetURL)
+	}
+}
+
+// TestResolveTargetURL_ConfigResolution is the unit-level pin
+// for the ResolveTargetURL precedence rules:
+//  1. Explicit [compute_node].target_url wins (highest priority).
+//  2. Otherwise tcp://+OverlayIP+:50051 when overlay_ip is set.
+//  3. Otherwise unix://+SocketPath (single-box default-local).
+func TestResolveTargetURL_ConfigResolution(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{
+			name: "explicit target_url wins",
+			cfg: Config{
+				SocketPath: "/run/faas/vmmd.sock",
+				ComputeNode: ComputeNodeConfig{
+					TargetURL: "tcp://vmmd-2.faas:50051",
+					OverlayIP: "100.64.0.1",
+				},
+			},
+			want: "tcp://vmmd-2.faas:50051",
+		},
+		{
+			name: "overlay_ip fallback",
+			cfg: Config{
+				SocketPath: "/run/faas/vmmd.sock",
+				ComputeNode: ComputeNodeConfig{
+					OverlayIP: "100.64.0.1",
+				},
+			},
+			want: "tcp://100.64.0.1:50051",
+		},
+		{
+			name: "single-box unix fallback",
+			cfg: Config{
+				SocketPath:  "/run/faas/vmmd.sock",
+				ComputeNode: ComputeNodeConfig{
+					// no target_url, no overlay_ip
+				},
+			},
+			want: "unix:///run/faas/vmmd.sock",
+		},
+		{
+			name: "whitespace target_url treated as empty",
+			cfg: Config{
+				SocketPath: "/run/faas/vmmd.sock",
+				ComputeNode: ComputeNodeConfig{
+					TargetURL: "   ",
+					OverlayIP: "100.64.0.2",
+				},
+			},
+			want: "tcp://100.64.0.2:50051",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.cfg.ResolveTargetURL()
+			if got != tc.want {
+				t.Errorf("ResolveTargetURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // generateP256PrivateKey is the test helper for the slice-3
 // registerComputeNodeKey coverage. Returns a fresh ECDSA P-256
 // key + its canonical key_id (SHA-256(SPKI) hex) so the test can

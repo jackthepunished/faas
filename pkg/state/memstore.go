@@ -5848,6 +5848,12 @@ func (m *MemStore) CreateComputeNode(_ context.Context, node ComputeNode) (Compu
 // drained it. The loop-then-store mirrors a write-then-map in the
 // MemStore: cheaper than a SELECT-then-UPDATE for tests that hammer the
 // path. CreatedAt stays monotonic on conflict.
+//
+// Deprecated: prefer UpsertComputeNodeFromOperator (apid POST
+// path) or UpsertComputeNodeFromVmmd (vmmd self-registration path)
+// so the operator-set target_url is not silently clobbered by
+// vmmd's restart. Kept for backwards compat with the existing
+// test fixtures that don't care about the ownership split.
 func (m *MemStore) UpsertComputeNode(_ context.Context, node ComputeNode) (ComputeNode, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -5864,6 +5870,64 @@ func (m *MemStore) UpsertComputeNode(_ context.Context, node ComputeNode) (Compu
 	if existing != nil {
 		n.ID = existing.ID
 		n.CreatedAt = existing.CreatedAt
+	} else if n.ID == "" {
+		n.ID = newID()
+	}
+	if n.CreatedAt.IsZero() {
+		n.CreatedAt = time.Now()
+	}
+	if n.LastHeartbeatAt.IsZero() {
+		n.LastHeartbeatAt = n.CreatedAt
+	}
+	n.Active = true
+	m.computeNodes[n.ID] = n
+	return n, nil
+}
+
+// UpsertComputeNodeFromOperator mirrors pgstore's operator-side
+// upsert (apid POST /v1/compute-nodes). On conflict, every field
+// is taken from the new row — the operator's POST wins.
+func (m *MemStore) UpsertComputeNodeFromOperator(_ context.Context, node ComputeNode) (ComputeNode, error) {
+	return m.upsertComputeNodeLocked(node, false /* preserveTargetURLOnConflict */)
+}
+
+// UpsertComputeNodeFromVmmd mirrors pgstore's vmmd-side
+// self-registration. On conflict, target_url is preserved (the
+// operator's POSTed value wins); the other fields are taken from
+// the new row. The cold-INSERT case (no existing row) takes
+// target_url from the new row, same shape as
+// UpsertComputeNodeFromOperator — there's nothing to preserve.
+//
+// This is the load-bearing fix for the second-box cutover. See
+// pgstore's comment on UpsertComputeNodeFromVmmd for the trap.
+func (m *MemStore) UpsertComputeNodeFromVmmd(_ context.Context, node ComputeNode) (ComputeNode, error) {
+	return m.upsertComputeNodeLocked(node, true /* preserveTargetURLOnConflict */)
+}
+
+// upsertComputeNodeLocked is the shared write path for the two
+// ownership variants. preserveTargetURLOnConflict=true means "the
+// vmmd path: keep the existing row's target_url on conflict" (a
+// missing existing target_url falls back to the new row's value,
+// matching pgstore's COALESCE).
+func (m *MemStore) upsertComputeNodeLocked(node ComputeNode, preserveTargetURLOnConflict bool) (ComputeNode, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var existing *ComputeNode
+	for id, current := range m.computeNodes {
+		if current.Name == node.Name {
+			current := current
+			existing = &current
+			delete(m.computeNodes, id)
+			break
+		}
+	}
+	n := node
+	if existing != nil {
+		n.ID = existing.ID
+		n.CreatedAt = existing.CreatedAt
+		if preserveTargetURLOnConflict && existing.TargetURL != "" {
+			n.TargetURL = existing.TargetURL
+		}
 	} else if n.ID == "" {
 		n.ID = newID()
 	}

@@ -2,7 +2,7 @@
 
 - **Status:** accepted v1.1 (2026-07-31). v1.1 adds the §6.4 failure-mode catalogue (spec §6.4); v1.0 was the original three-axis decoupling.
 
-> **⚠️ Status flips do not authorise a real cutover.** The first second control-plane node is gated by the [Tier 2 pre-requisites](#tier-2-pre-requisites) below and the runbook `docs/runbooks/multi-host-rollout.md` (Phase D of the Tier 2 plan, issue #297 — **TBD**, not yet written).
+> **⚠️ Status flips do not authorise a real cutover.** The first second control-plane node is gated by the [Tier 2 pre-requisites](#tier-2-pre-requisites) below and the runbook `docs/runbooks/multi-host-rollout.md`. As of 2026-08-09 all five Tier 1 phases + off-host PG backup are shipped and the runbook is the operator-facing reference for the multi-host cutover — see `docs/runbooks/multi-host-rollout.md` §3 + §4 for the bootstrap procedure, and §3.5 for the `listen_addr`/`target_url` distinction the operator must understand to avoid the wrong-host routing trap.
 - **Date:** 2026-07-21 (proposed); 2026-07-31 (accepted v1.1)
 - **Decision:** Evolve the FaaS architecture from a strict single-box loopback deployment to a decoupled, location-transparent topology. Specifically:
   - Transition the internal service-to-service gRPC boundaries (e.g. `schedd` ➔ `vmmd`, `builderd` ➔ `vmmd`) from hardcoded UNIX domain sockets to support standard TCP/IP networking secured via **Mutual TLS (mTLS)**.
