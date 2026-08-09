@@ -20,7 +20,7 @@
 //
 // The reconnect loop calls keys.Refresh on every 'compute_node_changed'
 // notify (one channel covers both compute_nodes and compute_node_keys
-// per migration 00075; the trigger fires on either table).
+// per migration 00076; the trigger fires on either table).
 //
 // Pre-slice-3 schedd (the legacy path) does not construct this loader
 // at all. The engine's NodeKeyRegistry() returns nil and the handler
@@ -42,7 +42,7 @@ import (
 )
 
 // pgNodeKeyLoader is the production-side sched.NodeKeyLoader.
-// Reads every row from compute_node_keys (migration 00075) and
+// Reads every row from compute_node_keys (migration 00076) and
 // returns them in the engine-side sched.NodeKeyRow shape.
 //
 // Performance note: the table is small (one row per compute node,

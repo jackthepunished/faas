@@ -527,6 +527,20 @@ var cliCommands = []cliCommand{
 		},
 	},
 	{
+		Name:    dispatchNodeKey,
+		DocSlug: "node-key",
+		Short:   "Provision the per-node CapacityReport signing keypair (operator; ADR-053)",
+		Subcommands: []cliSub{
+			{Name: subNodeInit, Short: "Initialise the node signing keypair"},
+			{Name: subNodeRotate, Short: "Rotate the node signing keypair"},
+			{Name: subNodeStatus, Short: "Show node keypair status"},
+		},
+		Flags: []cliFlag{
+			{Name: "node-key", Short: "path to the node signing private key"},
+			{Name: "node-key-pub", Short: "path to the node signing public key"},
+		},
+	},
+	{
 		Name:    "slo",
 		DocSlug: "slo",
 		Short:   "Per-app SLO panel (gregale slo <slug> [--window 24h])",

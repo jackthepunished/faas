@@ -72,7 +72,7 @@ CANNOT see an untrusted leaf.
   forgets the handler-layer CN check is still safe.
 - **No new pg_notify channel.** Reuse `db.NotifyComputeNodeChanged`
   (already covers both `compute_nodes` and `compute_node_keys`
-  writes per migration 00075's broader trigger).
+  writes per migration 00076's broader trigger).
 
 ## Three implementations
 

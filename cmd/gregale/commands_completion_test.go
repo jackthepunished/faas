@@ -101,6 +101,7 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 		"appSlugFallback":           "app",
 		"statusLiteral":             "status",
 		"dispatchSignKeys":          "sign-keys",
+		"dispatchNodeKey":           "node-key",
 		"dispatchTrustedPublishers": "trusted-publishers",
 		"dispatchHostAge":           "host-age",
 		"dispatchBackup":            "backup",

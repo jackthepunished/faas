@@ -81,6 +81,38 @@ kernel_path = "/srv/fc/alt/vmlinux"
 	if cfg.KernelPath != "/srv/fc/alt/vmlinux" {
 		t.Errorf("KernelPath = %q", cfg.KernelPath)
 	}
+	// node_key_path override (ADR-053). The default (empty string)
+	// is the "use the env var or canonical default" sentinel;
+	// setting it explicitly means "load from THIS path".
+	// The Override body above doesn't include the key, so this
+	// stays empty — see TestLoadConfig_NodeKeyPathOverride below
+	// for the positive case.
+	if cfg.NodeKeyPath != "" {
+		t.Errorf("NodeKeyPath = %q, want empty (not in toml body)", cfg.NodeKeyPath)
+	}
+}
+
+// TestLoadConfig_NodeKeyPathOverride pins the wiring between
+// vmmd.toml and loadNodeSigningKey (ADR-053). Without this seam,
+// operators using a non-canonical install path (air-gapped fleet,
+// tmpdir in CI, read-only PKI mount) would have to set
+// FAAS_VMMD_NODE_KEY_PATH per-process instead of declaratively in
+// the toml. The canonical install leaves NodeKeyPath empty; only
+// override-bearing fixtures set it.
+func TestLoadConfig_NodeKeyPathOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vmmd.toml")
+	body := `node_key_path = "/etc/faas/secrets/vmmd/node.key"` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.NodeKeyPath != "/etc/faas/secrets/vmmd/node.key" {
+		t.Errorf("NodeKeyPath = %q, want %q",
+			cfg.NodeKeyPath, "/etc/faas/secrets/vmmd/node.key")
+	}
 }
 
 func TestLoadConfig_PartialTOMLKeepsDefaults(t *testing.T) {

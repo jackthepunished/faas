@@ -107,7 +107,7 @@ type runDeps struct {
 	// subscribeNodeKeyChanges (ADR-053) is the producer-side seam
 	// for the 'compute_node_changed' pg_notify consumer that
 	// refreshes the in-memory NodeKeyRegistry on every relevant
-	// INSERT/UPDATE/DELETE (migration 00075's trigger fires on
+	// INSERT/UPDATE/DELETE (migration 00076's trigger fires on
 	// both compute_nodes AND compute_node_keys). nil = the
 	// subscriber is not started; the initial Refresh at startup
 	// still runs so a slice-3 schedd with no vmmd registered
@@ -500,7 +500,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// ADR-053 — slice-3 signature verification. Construct the
 	// in-memory (key_id → *ecdsa.PublicKey) registry, load the
-	// initial snapshot from compute_node_keys (migration 00075),
+	// initial snapshot from compute_node_keys (migration 00076),
 	// then subscribe to the 'compute_node_changed' pg_notify
 	// channel so a vmmd registering (or rotating) its key
 	// lands on the next listener tick. The handler
