@@ -1,6 +1,13 @@
 # ADR-062 · Tier A: per-node schedd + schedd-side async placement claim
 
 - **Status:** proposed
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-08-01
 - **Issue:** Phase 2 / Gate A — multi-host equality for schedd; the last
   mile after Tier 1 (mTLS + OCI) and Tier A (live capacity +

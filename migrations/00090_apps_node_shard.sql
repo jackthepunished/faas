@@ -27,7 +27,7 @@
 --   scheme CHECK). Distinct from the existing
 --   compute_nodes.target_url which is the vmmd target
 --   (Firecracker + jailer). schedd_target_url is the
---   schedd gRPC target gatewayd dials when routing a
+--   schedd gRPC target gatewayd-internal dials when routing a
 --   customer request to the app's owner schedd. Defaulted
 --   on the synthetic default-local row to the canonical
 --   unix socket so the single-box posture is preserved
@@ -51,7 +51,7 @@
 --     every schedd would call Engine.Prime on every prime
 --     notification — on a 5-node fleet that's 5× the
 --     snapshot work for no benefit).
---   * gatewayd dials the per-node schedd client lazily from
+--   * gatewayd-internal dials the per-node schedd client lazily from
 --     a compute_node_changed-driven cache keyed by node_id
 --     and backed by schedd_target_url. Customer traffic to
 --     app X is routed to the schedd that owns X.
@@ -75,7 +75,7 @@
 -- handler), and the schedd_target_url scheme check
 -- (rejects an operator POST that sets "https://..." or
 -- "/path/to/sock" — the wire.ParseTarget consumer at
--- gatewayd would crash on a non-(unix|tcp) scheme).
+-- gatewayd-internal would crash on a non-(unix|tcp) scheme).
 --
 -- Replay-safety: every ADD COLUMN is IF NOT EXISTS, every
 -- constraint add is paired with a DROP IF EXISTS in the
@@ -128,7 +128,7 @@ create index if not exists apps_node_id_idx on apps (node_id);
 
 -- Step 4: add compute_nodes.schedd_target_url. The CHECK
 -- is on the scheme only; the rest of the URL is opaque to
--- Postgres and validated at the consumer (gatewayd's
+-- Postgres and validated at the consumer (gatewayd-internal's
 -- wire.ParseTarget refuses anything not matching
 -- ^(unix|tcp):// anyway, so the DB-level check is a
 -- tripwire for an operator POST that would otherwise

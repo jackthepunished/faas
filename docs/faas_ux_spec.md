@@ -283,7 +283,7 @@ Events that email the user: email verification; deploy failed (with log link) �
 Choosing GitHub-push-to-deploy at launch (§5) and the OAuth flow it needs changes two things vs. the current implementation spec, to be ratified as ADRs:
 
 - **ADR-011 — thin dashboard at launch** (was gap G3 "post-M8, pre-GA"). Rationale: connect-repo needs an OAuth callback + repo picker; shipping a CLI-only launch would strand the git funnel the founder chose. Keep it thin (§4). Consequence: a slice of dashboard work moves into the launch milestones (§12).
-- **ADR-012 — `githubd` (or an `apid` module) for the GitHub App**: webhook receiver (push events), Checks-API status writer, per-repo install token cache. Least-privilege scopes (§5.2). Consequence: one new inbound surface on `gatewayd` (`/webhooks/github`, signature-verified) and one new milestone slice (§12).
+- **ADR-012 — `githubd` (or an `apid` module) for the GitHub App**: webhook receiver (push events), Checks-API status writer, per-repo install token cache. Least-privilege scopes (§5.2). Consequence: one new inbound surface on `gatewayd-public` (`/webhooks/github`, signature-verified) and one new milestone slice (§12).
 
 Both are recorded here so the implementation spec's §17 gap register and §3 ADR log get updated in lockstep — do not implement git-deploy without landing ADR-011 and ADR-012 first.
 

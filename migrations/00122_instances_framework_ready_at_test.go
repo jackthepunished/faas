@@ -24,7 +24,7 @@
 //     level).
 //
 // Slot note: 00122 was picked on the second rebase onto main
-// after PR #547 (Tier A7 gatewayd split) claimed slots
+// after PR #547 (Tier A7 edge split) claimed slots
 // 00119/00120/00121. Originally the migration was 00112
 // (PR-creation slot per ADR-041); the renumber chain 112 → 116
 // → 117 → 118 → 119 → 120 collapsed into 120 on the first

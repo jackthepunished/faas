@@ -4,7 +4,7 @@
 -- 00126_pg_ratelimit.sql — Tier A7 edge split (ADR-070 item 7).
 --
 -- Today's per-process token bucket (pkg/gateway/ratelimit.go) is
--- correct for one-box (one gatewayd, one bucket per app). After the
+-- correct for one-box (one gatewayd-internal, one bucket per app). After the
 -- Tier A7 split the platform runs N gatewayd-internal replicas
 -- behind one gatewayd-public; sticky-by-warm-node routing (ADR-070)
 -- does NOT pin a single replica, so per-process buckets see a

@@ -1,6 +1,13 @@
 # ADR-016 · M1 `Stats()` shape + `vmmd_*` Prometheus naming
 
 - **Status:** accepted
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-16
 - **Decision:** vmmd's `Stats()` returns a `StatsResponse` proto with `live_count`, `leased_count`, `total_resident_bytes` (Int64Value so unset != 0), and an `instances[]` array carrying `{instance, lease_uid, host_ip, state_in_bytes}` per live instance. Two Prometheus metrics ship with vmmd as the platform's first `vmmd_*` series: `vmmd_ops_total{op,code}` and `vmmd_op_duration_seconds{op}` (a histogram).
 - **Why:** Spec §4.4 line 138 names `Stats()` with no payload definition — we have to commit to one before the proto is generated. §12 names dashboard rows that no daemon emits yet (`cold-boot fallback rate`, `resident_ram_pct_of_target`, etc.). vmmd is the natural emitter for the `op_total` and `op_duration_seconds` series because vmmd is the only place a `cold-boot fallback` actually happens (every wake goes through `Manager.bringUp`, `pkg/fcvm/manager.go:159`). Locking the names now means later milestones quote them by reference. The histogram is the building block for the dashboard's p50/p95 latency row once gatewayd (M4) feeds request latency too.

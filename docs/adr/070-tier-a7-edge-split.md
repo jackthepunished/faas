@@ -436,3 +436,15 @@ follows the existing post-#533-merge renumber-reset pattern.
   split, warm hints split). The brief asks for a clean
   state-isolation model; the split is the only path that
   delivers it.
+
+## PR-E note (2026-08-09)
+
+This ADR is the source of truth for the `gatewayd-public` /
+`gatewayd-internal` split and is intentionally NOT carrying the
+PR-E narration banner that the rest of the `docs/adr/` files picked
+up. The body references `cmd/gatewayd/` only where it describes the
+pre-split era or the legacy daemon's specific responsibilities (the
+`pkg/gateway/certsync` consumer, the `cmd/gatewayd/main.go:878`
+wiring fix) — those references are the historical substance of the
+split and stay verbatim. Cite this ADR rather than the banner when
+explaining the split.

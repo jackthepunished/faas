@@ -8,9 +8,10 @@ the moment we go from one node (a single `default-local` row in
 ceiling, its own capacity reports, and its own share of the cluster
 vCPU budget.
 
-The shape mirrors `docs/ops/gatewayd-tls-cutover.md` — cut-over
-sequence + rollback criterion + verification + escalation. The
-sibling active-passive HA topology runbook is
+The shape mirrors the historical TLS cut-over runbook under
+`docs/ops/` (PR-A-excluded) — cut-over sequence + rollback criterion +
+verification + escalation. The sibling active-passive HA topology
+runbook is
 [`docs/runbooks/active-passive-ha.md`](active-passive-ha.md)
 (this doc covers the multi-host horizontal-scale variant, not
 active-passive). Tier A8 / ADR-083 ships the active-passive
@@ -76,7 +77,7 @@ active-passive)".
 >   `make bootstrap` rerun.
 > - **Tier 1 Phase 5 (`pkg/wire.NodeVerifier`)** —
 >   ✓ shipped in ADR-056. Every cross-box mTLS leg
->   (vmmd↔schedd, schedd→vmmd, gatewayd→vmmd) now installs
+>   (vmmd↔schedd, schedd→vmmd, gatewayd-internal→vmmd) now installs
 >   a `tls.Config.VerifyPeerCertificate` hook that augments
 >   stdlib chain/SAN/EKU trust with a leaf-CN →
 >   `compute_nodes.name` lookup. The verifier runs
@@ -123,8 +124,8 @@ Two physical nodes (per spec §14
 | 2nd compute (new)   | `gregale-fsn-2`   | `fsn-2`              | `tcp://vmmd-2.faas:50051` (mTLS)      | `tcp://schedd-2.faas:7100` (mTLS)         |
 
 Both nodes share the same Postgres. The new node runs the full
-daemon fleet (apid, schedd, vmmd, imaged, meterd, gatewayd,
-builderd) — no "control plane on one box, compute on another"
+daemon fleet (apid, schedd, vmmd, imaged, meterd, gatewayd-public,
+gatewayd-internal, builderd) — no "control plane on one box, compute on another"
 split until Gate-B. The control plane is on `fsn-1`; the new
 compute node advertises itself via vmmd's
 `Schedd.ReportCapacity` client-stream (ADR-025 §4.1).
@@ -140,7 +141,7 @@ self-registration UPSERTs the same row. The synthetic
 ```sh
 # 1. Confirm the new node has the daemon fleet provisioned.
 ssh faas-fsn-2 'systemctl is-system-running && \
-  for d in apid schedd vmmd imaged meterd gatewayd builderd githubd; do \
+  for d in apid schedd vmmd imaged meterd gatewayd-public gatewayd-internal builderd githubd; do \
     systemctl is-active faas-$d || exit 1; \
   done'
 
@@ -271,7 +272,7 @@ curl -fsS -X POST 'https://faas-fsn-1:8081/v1/compute-nodes' \
 > `pkg/state.UpsertComputeNodeFromVmmd`).
 
 The row is `active=true` by default. The `compute_node_changed`
-pg_notify trigger (migration 00026) fires and evicts gatewayd's
+pg_notify trigger (migration 00026) fires and evicts gatewayd-internal's
 per-node client cache for any prior `fsn-2` entry. The admin POST
 is idempotent — re-POSTing with the same name UPSERTs the row
 via `UpsertComputeNodeFromOperator` (ADR-029). The operator's
@@ -434,7 +435,7 @@ wake, capacity reports stop after 30 s, mTLS handshake fails):
 ```sh
 # 1. Drain fsn-2 from placement.
 psql -c "UPDATE compute_nodes SET active=false WHERE name='fsn-2';"
-# The compute_node_changed trigger fires; gatewayd evicts the
+# The compute_node_changed trigger fires; gatewayd-internal evicts the
 # cached conn; schedd's watchdog treats the row as drained;
 # placement skips it.
 

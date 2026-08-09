@@ -1,6 +1,13 @@
 # ADR-052 · Control-plane mTLS for multi-box + handler-layer peer binding
 
 - **Status:** accepted v1.0
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-30 (proposed)
 - **Accepted:** 2026-08-09
 - **Issue:** #95 slice 2 (multi-box rollout)

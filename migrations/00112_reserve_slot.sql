@@ -19,8 +19,8 @@
 -- #470 PR #470-FU-B, framework_ready signal). On the first rebase
 -- onto main (1768ed4b) the renumber chain 112 → 116 → 117 → 118
 -- → 119 → 120 collapsed into a single 112 → 120 jump and the
--- 112 fence was renamed to 119. After PR #547 (Tier A7
--- gatewayd split) opened slots 119/120/121 on main, this
+-- 112 fence was renamed to 119. After PR #547 (Tier A7 edge
+-- split) opened slots 119/120/121 on main, this
 -- branch's 120 was renumbered to 122 — but the 112 fence had
 -- been consumed by the earlier rename and is restored here so
 -- the embedded FS stays contiguous 1..122.

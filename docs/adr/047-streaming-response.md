@@ -3,6 +3,13 @@
 - **Status:** accepted (PR-D 2026-08-01; PR-A #481, PR-B + PR-C #490
   shipped earlier. PR-D closes the four deferred items: metal e2e,
   ADR status flip, dashboards, unary ForwardHTTP removal)
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-31 (initial); 2026-08-01 (PR-D finalization)
 - **Issue:** #471 (HTTP streaming responses through the FaaS gateway)
 - **Predecessors:** ADR-009 (identical inner network world — the

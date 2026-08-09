@@ -2,7 +2,7 @@
 
 Spec §14, Phase 2 / Gate A. Founding doc for the multi-host
 topology: N peer-equal schedds, each owning a slice of apps via
-`apps.node_id`, and `gatewayd` routing each customer request to the
+`apps.node_id`, and `gatewayd-internal` routing each customer request to the
 owner schedd. The mid-PR architectural pivot moved the placement
 chooser out of `apid` (where the depguard rule
 `apid-control-plane-only` forbids it) into schedd via
@@ -21,7 +21,7 @@ chooser out of `apid` (where the depguard rule
   post-claim** for v1.0 — rebalance is a v1.1 follow-up.
 - **Eligibility.** A compute node is eligible to host apps iff
   `compute_nodes.active = true`. Inactive rows are skipped by
-  schedd's chooser and absent from `gatewayd`'s dial cache.
+  schedd's chooser and absent from `gatewayd-internal`'s dial cache.
 
 ## Topology
 
@@ -253,7 +253,7 @@ tick.
 A fresh app's first Wake may arrive in the gateway before the
 schedd has stamped `node_id`. The gateway's per-node schedd client
 cache rejects empty NodeID today and the existing fallthrough path
-in `cmd/gatewayd/scheddrouter.go` handles it. The customer's
+in `cmd/gatewayd-internal/scheddrouter.go` handles it. The customer's
 TCP-level retry closes any gap.
 
 No new gateway retry/poll is added in this gate. The schedd
@@ -314,7 +314,7 @@ rolling back is local:
    catches up on its next boot via the cold-start sweep
    (`Engine.RebalanceOrphanedApps(ctx, "")`).
 
-`vmmd`, `imaged`, `meterd`, `builderd`, `apid`, `gatewayd` are
+`vmmd`, `imaged`, `meterd`, `builderd`, `apid`, `gatewayd-public`, `gatewayd-internal` are
 unaffected by the rollback.
 
 ## Removed in this gate
