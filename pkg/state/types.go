@@ -287,7 +287,7 @@ type APIKey struct {
 	// OrgID is the org the key was minted against (issue #190 / IAM-6,
 	// PR 6). Migration 00127 flips api_keys.org_id from NULL to
 	// NOT NULL after the deterministic personal-org backfill, so every
-	// row carries a non-empty string. The PR 7 (schedd/meterdgatewayd-internal
+	// row carries a non-empty string. The PR 7 (schedd/meterd/gatewayd-internal
 	// cutover) bump to AuthenticateKey's signature will thread this
 	// into admission decisions; PR 6 only adds the field so the
 	// Store/handler/auth triple don't need a coordinated rename.
@@ -391,7 +391,7 @@ type App struct {
 	// explicitly before CreateApp.
 	WorkloadClass WorkloadClass
 	// StreamingEnabled toggles the per-app streaming response path
-	// through gatewayd-internal (issue #471 / ADR-047). When true,gatewayd-internal
+	// through gatewayd-internal (issue #471 / ADR-047). When true, gatewayd-internal
 	// streams response body chunks instance → gateway → client with
 	// a periodic 200 ms / 256 KiB tx_bytes flush so ADR-046 metering
 	// stays accurate. Plan-gated upstream: Free defaults to false and

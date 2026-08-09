@@ -44,7 +44,7 @@
     /* Finding 6: per-app rate-limit cell. The static "—" placeholder
        renders muted so a missing wire-in is visually distinct from
        a real bucket-state reading (a real reading renders
-       "N/M remaining"). Cells will poll once the apidgatewayd-internal
+       "N/M remaining"). Cells will poll once the apid→gatewayd-internal
        loopback dial lands. */
     .quota-cell { color: #6b7280; font-size: 0.85rem; }
     .quota-cell.ok { color: #065f46; }
@@ -83,7 +83,7 @@
                 <td><span class="badge {{.StateBadge}}" title="{{.StateBadgeLabel}}">{{.StateBadgeGlyph}} {{.StateBadgeLabel}}</span></td>
                 <td><span class="badge {{.Status}}">{{.Status}}</span></td>
                 <!-- Finding 6 (issue #314): per-app rate-limit bucket
-                     indicator. The cell is refreshed by thegatewayd-internal
+                     indicator. The cell is refreshed by the gatewayd-internal
                      quota endpoint via HTMX; the JS consumes the JSON
                      emitted by /v1/internal/quota?app_id=<uuid>&plan=<plan>.
                      Until the apid→gatewayd-internal loopback dial lands, this

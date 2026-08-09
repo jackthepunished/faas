@@ -667,7 +667,7 @@ gateway_metrics_url = ""
 }
 
 // startGatewayd boots gatewayd-internal (Tier A7 PR-B+) against the
-// per-test schedd + apid + PG schema. The legacy 'gatewayd-internal' binary is
+// per-test schedd + apid + PG schema. The legacy 'gatewayd' binary is
 // gone (its source moved into cmd/gatewayd-internal/ in PR-A); the
 // single binary now serves the real routing + wake + proxy chain.
 //
@@ -884,7 +884,7 @@ func (h *Harness) stop() {
 func buildBinaries(t *testing.T, bin string) {
 	t.Helper()
 	modulePath := modulePath(t)
-	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd-internal' binary is gone
+	// Tier A7 (ADR-070) PR-A: the legacy 'gatewayd' binary is gone
 	// (its source moved into cmd/gatewayd-internal/). PR-B will boot
 	// the split pair (gatewayd-public + gatewayd-internal) in
 	// startGatewayd; for now we just build the new daemons so the
