@@ -136,7 +136,7 @@ func defaultDetectOverlayIP(ctx context.Context) (string, error) {
 }
 
 // registerComputeNodeKey writes the public half of vmmd's signing
-// key into compute_node_keys (migration 00075 / ADR-053) so
+// key into compute_node_keys (migration 00076 / ADR-053) so
 // schedd's NodeKeyRegistry can verify node_signature on every
 // CapacityReport.
 //
@@ -159,7 +159,7 @@ func defaultDetectOverlayIP(ctx context.Context) (string, error) {
 // The PEM body is a SubjectPublicKeyInfo (RFC 7468 §13) wrapped in
 // a PUBLIC KEY block — the same shape the schedd-side
 // parsePublicKeyPEM accepts in pkg/sched/nodekeys.go. Reusing the
-// PEM wire rather than passing raw DER keeps the migration 00075
+// PEM wire rather than passing raw DER keeps the migration 00076
 // schema (`public_key_pem text`) unchanged and gives an operator
 // reading the table a copy-paste-able verification artifact.
 //

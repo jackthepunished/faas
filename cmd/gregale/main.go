@@ -243,6 +243,14 @@ func run(args []string) int {
 		return cmdKeys(args[1:])
 	case dispatchSignKeys:
 		return cmdSignKeys(args[1:])
+	case dispatchNodeKey:
+		// ADR-053 — operator-side provisioning for the per-node
+		// CapacityReport signing keypair. Mirrors sign-keys shape
+		// (init|rotate|status) but writes /etc/faas/secrets/vmmd/
+		// {node.key (0400 root:root), node.pub (0444)} and prints
+		// the key_id (SHA-256 hex of the SPKI) at init time so an
+		// operator can confirm the same value schedd will register.
+		return cmdNodeKey(args[1:])
 	case dispatchTrustedPublishers:
 		// Issue #472 / ADR-054 — operator CLI for the per-app
 		// cosign trusted-publisher list. Admin API key required;

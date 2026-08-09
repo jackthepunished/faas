@@ -110,8 +110,36 @@ var errNodeKeyInsecure = errors.New("vmmd: node.key mode permits group/other acc
 // registry listens for `compute_node_changed` pg_notify and
 // picks up the row within its next refresh tick (migration
 // 00076).
-func loadNodeSigningKey() (*ecdsa.PrivateKey, string, error) {
-	path := envOr("FAAS_VMMD_NODE_KEY_PATH", defaultNodeKeyPath)
+// loadNodeSigningKeyDefault is the zero-arg shim used by every
+// call site that doesn't carry a vmmd.toml (notably the
+// loadNodeSigningKey unit tests and any test that exercises the
+// env-var fallback path). Delegates to loadNodeSigningKey with
+// an empty pathOverride so the env-or-default resolution
+// applies.
+func loadNodeSigningKeyDefault() (*ecdsa.PrivateKey, string, error) {
+	return loadNodeSigningKey("")
+}
+
+func loadNodeSigningKey(pathOverride string) (*ecdsa.PrivateKey, string, error) {
+	// Resolution order (most-specific first):
+	//   1. pathOverride — empty string means "use the next layer down".
+	//      Wired from cfg.NodeKeyPath in run() so a vmmd.toml with
+	//      `node_key_path = "/path/to/key"` is honoured.
+	//   2. FAAS_VMMD_NODE_KEY_PATH env var — containerised-deploys
+	//      path (no toml in those images).
+	//   3. defaultNodeKeyPath — the canonical install location
+	//      /etc/faas/secrets/vmmd/node.key.
+	//
+	// Layer 1 wins over the env var so an operator who sets BOTH
+	// gets the toml value; that matches the precedence every other
+	// daemon follows (config.go + daemonunitspec wiring). Passing
+	// empty from run() preserves the original env-or-default
+	// behaviour for callers that don't carry a config (notably
+	// tests that exercise this function directly).
+	path := pathOverride
+	if path == "" {
+		path = envOr("FAAS_VMMD_NODE_KEY_PATH", defaultNodeKeyPath)
+	}
 	//nolint:forbidigo // vetted daemon-id path (/etc/faas/secrets/vmmd/node.key); the
 	// openCustomerFile guard is for customer-supplied CLI paths. Here the
 	// path is constructed from the FAAS_VMMD_NODE_KEY_PATH env var with a
@@ -494,7 +522,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// posture (legacy schedd accepts unsigned reports per
 		// ADR-016, so a missing key row is not a wire-level
 		// regression).
-		keyLoadedNode, keyLoadedID, keyErr := loadNodeSigningKey()
+		keyLoadedNode, keyLoadedID, keyErr := loadNodeSigningKey(cfg.NodeKeyPath)
 		if keyErr != nil {
 			return fmt.Errorf("vmmd: load node signing key: %w", keyErr)
 		}

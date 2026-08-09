@@ -278,7 +278,7 @@ type MemStore struct {
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
 	// computeNodeKeys is the in-memory mirror of compute_node_keys
-	// (migration 00075, ADR-053). Keyed by (nodeID, keyID) tuple
+	// (migration 00076, ADR-053). Keyed by (nodeID, keyID) tuple
 	// joined by a NUL so the composite key stays string-typed for
 	// map lookup; the value is the canonical public_key_pem string.
 	// Tests that don't pre-seed this map have empty key registries
@@ -545,7 +545,7 @@ func NewMemStore() *MemStore {
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
 		// computeNodeKeys is the in-memory mirror of
-		// compute_node_keys (migration 00075). Empty by default
+		// compute_node_keys (migration 00076). Empty by default
 		// — vmmd's self-registration populates it via
 		// UpsertNodeKey. Tests that exercise the slice-3
 		// signature path inject rows by calling the method
@@ -5872,7 +5872,7 @@ func (m *MemStore) UpsertComputeNode(_ context.Context, node ComputeNode) (Compu
 }
 
 // UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
-// in the in-memory mirror of compute_node_keys (migration 00075,
+// in the in-memory mirror of compute_node_keys (migration 00076,
 // ADR-053). Mirrors PgStore.UpsertNodeKey's ON CONFLICT DO NOTHING
 // semantics: a re-insert of the same (nodeID, keyID) is a no-op
 // (the existing public_key_pem is preserved). See

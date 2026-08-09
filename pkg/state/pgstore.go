@@ -7799,7 +7799,7 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 }
 
 // UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
-// in compute_node_keys (migration 00075, ADR-053). vmmd's
+// in compute_node_keys (migration 00076, ADR-053). vmmd's
 // self-registration calls this on startup once it has loaded its
 // node signing key (cmd/vmmd/main.go::loadNodeSigningKey) and
 // computed the key_id (the SHA-256 hex of the SubjectPublicKeyInfo).

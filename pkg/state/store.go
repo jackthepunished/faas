@@ -2201,7 +2201,7 @@ type Store interface {
 	// the upsert path doesn't currently fail.
 	UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error)
 	// UpsertNodeKey inserts or updates a (compute_node_id, key_id)
-	// row in compute_node_keys (ADR-053 / migration 00075). vmmd's
+	// row in compute_node_keys (ADR-053 / migration 00076). vmmd's
 	// self-registration calls this on startup once it has loaded
 	// its node signing key (cmd/vmmd/main.go::loadNodeSigningKey)
 	// and computed the key_id (the SHA-256 hex of the
