@@ -1,5 +1,15 @@
 # ADR-056 · Off-host Postgres backup to Hetzner Storage Box
 
+> **Slot-collision note (2026-08-09):** The slot number 056 is shared with
+> [`docs/adr/056-wire-node-verifier.md`](056-wire-node-verifier.md)
+> (handshake-layer CN-binding verifier, accepted 2026-08-09 alongside this
+> ADR). Per the repo-wide convention recorded in
+> [`docs/adr/068-issue-517-closure-evidence.md`](068-issue-517-closure-evidence.md)
+> §"Note on slot-collision hygiene", the **filename is canonical** —
+> readers following a "ADR-056" citation should pick the file whose
+> subject matches the citation. ADR-025 §Tier 2 pre-requisites and the
+> `PostgresBackup.md` runbook cite this file by name.
+
 - **Status:** accepted v1.0
 - **Date:** 2026-07-31
 - **Accepted:** 2026-08-09

@@ -1,7 +1,8 @@
 # ADR-052 · Control-plane mTLS for multi-box + handler-layer peer binding
 
-- **Status:** proposed
-- **Date:** 2026-07-30
+- **Status:** accepted v1.0
+- **Date:** 2026-07-30 (proposed)
+- **Accepted:** 2026-08-09
 - **Issue:** #95 slice 2 (multi-box rollout)
 - **Decision:** Ship cross-host mTLS as the second slice of issue #95.
   Slice 1 (already landed on `main`) gave us `pkg/wire.Dial` / `wire.Listen`

@@ -1,7 +1,19 @@
 # ADR-056 · Handshake-layer CN-binding verifier (`pkg/wire.NodeVerifier`)
 
-- **Status:** proposed
-- **Date:** 2026-07-31
+> **Slot-collision note (2026-08-09):** The slot number 056 is shared with
+> [`docs/adr/056-off-host-pg-backup.md`](056-off-host-pg-backup.md)
+> (off-host Postgres backup, accepted 2026-08-09 via PR #784). Per the
+> repo-wide convention recorded in
+> [`docs/adr/068-issue-517-closure-evidence.md`](068-issue-517-closure-evidence.md)
+> §"Note on slot-collision hygiene", the **filename is canonical** —
+> readers following a "ADR-056" citation should pick the file whose
+> subject matches the citation. Code citations in `pkg/wire/*.go`
+> point to this file; the runbook `multi-host-rollout.md` §Pre-conditions
+> cites this file by name.
+
+- **Status:** accepted v1.0
+- **Date:** 2026-07-31 (proposed)
+- **Accepted:** 2026-08-09
 - **Issue:** #95 slice 5 (multi-box rollout, Tier 1 Phase 5)
 - **Decision:** Add a generic, audit-friendly mTLS handshake-layer
   verifier that binds a peer's leaf-`Subject.CommonName` to a
