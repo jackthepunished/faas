@@ -207,7 +207,7 @@ journalctl -u 'faas-*' -f
 journalctl -u faas-apid -n 50
 
 # Service status
-systemctl status faas-apid faas-schedd faas-gatewayd faas-imaged faas-meterd faas-githubd
+systemctl status faas-apid faas-schedd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-meterd faas-githubd faas-builderd
 
 # Postgres
 sudo -u postgres psql faas

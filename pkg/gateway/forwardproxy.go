@@ -1,6 +1,6 @@
 // Issue #98 / ADR-028: gatewayd-internal's HTTP→gRPC forwarder.
 //
-// Gatewayd's hot path looks up the compute_node.id an instance lives on
+// gatewayd-internal's hot path looks up the compute_node.id an instance lives on
 // (cached in PGBackend.targets after Wake) and forwards the inbound HTTP
 // request to vmmd's ForwardHTTP RPC. vmmd then nsenter's the per-instance
 // netns and dials netns.GuestIP:netns.AppPort on the inner side (see

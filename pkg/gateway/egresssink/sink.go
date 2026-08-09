@@ -13,7 +13,7 @@
 //
 // Why per-instance minute buckets rather than a single global counter:
 //
-//	Gatewayd proxies to N live instances at once. Each instance has
+//	gatewayd-internal proxies to N live instances at once. Each instance has
 //	its own usage_minutes row (keyed on instance_id + minute).
 //	Aggregate-then-split loses the attribution we need for billing
 //	forensics — PR #266 (ADR-046) is the seam; the per-instance shape

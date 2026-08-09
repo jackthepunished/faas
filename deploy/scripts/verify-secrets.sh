@@ -56,7 +56,7 @@ check "faas-apid loads FAAS_SESSION_KEY" bash -c '
 
 # 4. The other five daemons MUST NOT carry FAAS_SESSION_KEY in
 #    their environment — that was the leak surface.
-for unit in faas-gatewayd faas-imaged faas-githubd faas-meterd faas-schedd; do
+for unit in faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-githubd faas-meterd faas-schedd; do
   check "${unit} does NOT load FAAS_SESSION_KEY" bash -c "
     ! systemctl show ${unit} -p Environment 2>/dev/null | grep -q 'FAAS_SESSION_KEY'
   "

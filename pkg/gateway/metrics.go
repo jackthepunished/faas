@@ -181,7 +181,7 @@ type Metrics struct {
 	// label name `account_id` with apid so a single Grafana
 	// panel can join both surfaces — but the label VALUE at
 	// the gateway is the resolved app_id, not an authenticated
-	// principal. Gatewayd is pre-auth (TLS + hostname routing
+	// principal. The public edge (gatewayd-public) is pre-auth (TLS + hostname routing
 	// only); the only tenant-attributable key on the request
 	// path is the app_id (the apps table's owner is in apid's
 	// domain). Operators reading the panel should treat

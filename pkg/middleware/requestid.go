@@ -2,7 +2,7 @@
 // every daemon's public listener (spec §11 — Single public listener).
 //
 // Slice 2 ships three middlewares that close §11 gaps apid needs:
-// RequestID, Recovery, and AuthLimit. Gatewayd has had its own
+// RequestID, Recovery, and AuthLimit. The gatewayd-public edge has had its own
 // request-id primitive since M0 — the pkg/middleware copy is the same
 // algorithm so the wire header (x-faas-request-id) stays compatible.
 package middleware

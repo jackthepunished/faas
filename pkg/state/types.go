@@ -532,7 +532,7 @@ type App struct {
 	// secretbox-sealed APP_BASIC_AUTH blob carrying the
 	// {username, password} pair the basic-auth path verifies
 	// against. Nil/empty for open/bearer modes; set ONLY when
-	// PublicAuthMode='basic'. Gatewayd-internal unseals it
+	// PublicAuthMode='basic'. gatewayd-internal unseals it
 	// at boot (and caches the unsealed form for 60s +
 	// db.NotifyKeyChanged invalidation) so the secretbox
 	// hot-path doesn't run on every request.
