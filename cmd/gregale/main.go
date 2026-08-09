@@ -41,22 +41,25 @@ Commands:
   build        Build provenance + sbom (build provenance <id>|build sbom <id>)
   connect      Connect a third-party service (github)
   crons        Manage scheduled requests
+  completion   Print shell completion script (bash|zsh|fish|powershell)
   dashboard    Open the account dashboard in your browser
+  delayed-task Schedule a deferred invocation (delayed-task add|get|cancel)
   deployments  List deployments (--limit N | --before C | --all)
-  deployment   Get one deployment (<id>)
+  deployment   Get one deployment (<id> | set-min-instances <id> --min N)
   deploy       Deploy (--image REF | --tarball PATH | --repo OWNER/NAME | --template NAME)
   domains      Manage custom domains
   env          Pull/push .env <-> sealed secrets (--app <slug>)
   host-age     Operator host.age rotation (host-age init|rotate|status|prune-previous)
   init         Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
   invoke       Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])
-  invocations  Per-account invocation ledger (invocations list|get <id>)
+  invocations  Per-account invocation ledger (invocations list|get <id> [--replay])
   invitations  Standalone invitation actions (invitations peek <token>|accept <token>)
   invoices     List issued invoices
   keys         Manage API keys (keys list|add|rm|rotate|grace-window)
   login        Authenticate this machine (--token for CI)
   logout       Remove the stored token
-  logs         Tail app or deployment logs (--follow)
+  man          Print the gregale(1) man page (or gregale-<command>(1) with one arg)
+  logs         Tail app or deployment logs (--follow); logs tail <slug> is an alias that always follows
   metrics      Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
   mfa          Manage account MFA (mfa enroll|confirm|verify|recover|disable)
   open         Open the app's URL (or its dashboard page) in your browser
@@ -67,6 +70,7 @@ Commands:
   plan         Change plan (free|hobby|pro|scale)
   ps           Show live instances + state for an app
   queue        Inspect the wake-queue depth (queue tail|send|receive|state|peek|dead-letter|ack)
+  registry     Per-app private container registry credentials (registry list|set|rm --app <slug>)
   rollback     Re-promote the previous deployment
   scan         Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
   secrets      Manage env secrets (secrets list|set|unset|list-all)
@@ -74,9 +78,11 @@ Commands:
   slo          Per-app SLO panel (gregale slo <slug> [--window 24h])
   status       Personal SLO numbers (availability, wake p95, build success)
   tail         Live tail of the unified event stream (--follow)
+  traffic      Manage deployment traffic split (issue #556; Pro/Scale only)
   trusted-publishers  Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
   usage        Show this month's usage (gregale usage [--month YYYY-MM]|daily [--day YYYY-MM-DD]|storage [--day YYYY-MM-DD]|summary)
   version      Print the CLI version
+  wake-timeline Walk the per-wake event stream (wake-timeline <slug> <wake-id> [--since RFC3339] [--limit N] [--all])
   wake         Wake a parked app (pulls out of snapshot)
   webhooks     Manage outbound webhooks (webhooks list|add|info|update|rm|deliveries|retry|rotate-secret)
   whoami       Show the authenticated account
@@ -93,6 +99,14 @@ Docs: ` + docsURL + `
 
 func main() {
 	os.Exit(run(os.Args[1:]))
+}
+
+func init() {
+	// Tier A8 / ADR-083: gregaleVersion is the value substituted into
+	// the man page header (`.TH GREGALE(1) "version"`). Wired once
+	// at process boot from wire.Version so the man page reflects the
+	// binary the user is running, not a hardcoded literal.
+	gregaleVersion = wire.Version
 }
 
 func run(args []string) int {
@@ -118,6 +132,14 @@ func run(args []string) int {
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 		return 0
+	case "completion":
+		// Tier A8 / ADR-083. Routes to one of bash|zsh|fish|powershell
+		// via cmdCompletion; the dispatcher is in completion.go.
+		return cmdCompletion(args[1:])
+	case "man":
+		// Tier A8 / ADR-083. No arg → gregale(1); one arg →
+		// gregale-<command>(1). Dispatcher is in man.go.
+		return cmdMan(args[1:])
 	case "login":
 		return cmdLogin(args[1:])
 	case "logout":
@@ -192,10 +214,24 @@ func run(args []string) int {
 		return cmdPark(args[1:])
 	case "wake":
 		return cmdWake(args[1:])
+	case "traffic":
+		return cmdTraffic(args[1:])
 	case "domains":
 		return cmdDomains(args[1:])
 	case "crons":
 		return cmdCrons(args[1:])
+	case "delayed-task":
+		// Tier D: scheduled-at deferred invocations (issue #557 /
+		// ADR-072 sibling). Mirrors crons for dispatcher shape
+		// (add|get|cancel); cmdDelayedTask lives in
+		// commands_delayed_task.go.
+		return cmdDelayedTask(args[1:])
+	case "registry":
+		// Tier D: per-app private container registry credentials
+		// (issue #461 / ADR-062). Mirrors alerts for the
+		// list|set|rm dispatcher shape; cmdRegistry lives in
+		// commands_registry.go.
+		return cmdRegistry(args[1:])
 	case "webhooks":
 		// Issue #476 / ADR-076 — outbound webhook subscriptions
 		// and delivery ledger. Mirrors the crons surface (list /
@@ -207,6 +243,14 @@ func run(args []string) int {
 		return cmdKeys(args[1:])
 	case dispatchSignKeys:
 		return cmdSignKeys(args[1:])
+	case dispatchNodeKey:
+		// ADR-053 — operator-side provisioning for the per-node
+		// CapacityReport signing keypair. Mirrors sign-keys shape
+		// (init|rotate|status) but writes /etc/faas/secrets/vmmd/
+		// {node.key (0400 root:root), node.pub (0444)} and prints
+		// the key_id (SHA-256 hex of the SPKI) at init time so an
+		// operator can confirm the same value schedd will register.
+		return cmdNodeKey(args[1:])
 	case dispatchTrustedPublishers:
 		// Issue #472 / ADR-054 — operator CLI for the per-app
 		// cosign trusted-publisher list. Admin API key required;
@@ -246,6 +290,11 @@ func run(args []string) int {
 		// `gregale usage summary [--month X]` → account roll-up.
 		// Unknown positionals are rejected by the dispatcher.
 		return cmdUsage(args[1:])
+	case "wake-timeline":
+		// Tier D: per-wake event stream (issue #517 PR-C / ADR-064).
+		// Mirrors cmdAuditEventsGet for the positional shape;
+		// cmdWakeTimeline lives in commands_wake_timeline.go.
+		return cmdWakeTimeline(args[1:])
 	case "invoke":
 		// Tier C: functional smoke test. POST /v1/apps/{slug}/invoke
 		// (sync drain through the gateway) or /invoke/async (returns

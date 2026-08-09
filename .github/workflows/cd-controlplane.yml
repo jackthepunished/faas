@@ -97,7 +97,12 @@ jobs:
 
       - name: Attach SBOM to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        # Pinned to the commit v2 currently resolves to (release 2.6.2,
+        # 2026-04-12). Dependabot bumps this SHA weekly — see
+        # .github/dependabot.yml github-actions ecosystem. SHA-pinning
+        # is required to clear CodeQL actions/unpinned-tag (CWE-829)
+        # and matches the supply-chain posture in §11.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: bin/sbom.json
 
@@ -115,15 +120,70 @@ jobs:
           RELEASE_ID="${GITHUB_SHA}"
           BUNDLE_ROOT="${RUNNER_TEMP}/faas-release/${RELEASE_ID}"
           mkdir -p "${BUNDLE_ROOT}/bin" "${BUNDLE_ROOT}/systemd" "${BUNDLE_ROOT}/tmpfiles.d"
-          for bin in apid schedd gatewayd-public gatewayd-internal imaged meterd githubd vmmd gregale migrate; do
+          for bin in apid schedd gatewayd-public gatewayd-internal imaged meterd githubd vmmd vmmd-raw-bridge vmmd-stream-bridge gregale migrate; do
             install -m 0755 "bin/${bin}" "${BUNDLE_ROOT}/bin/${bin}"
           done
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "${BUNDLE_ROOT}/bin/deployctl" ./cmd/deployctl
-          cp deploy/controlplane/systemd/* "${BUNDLE_ROOT}/systemd/"
-          cp deploy/controlplane/tmpfiles.d/faas.conf "${BUNDLE_ROOT}/tmpfiles.d/"
+          for unit in \
+            faas-apid.service \
+            faas-cp.slice \
+            faas-gatewayd-internal.service \
+            faas-gatewayd-public.service \
+            faas-githubd.service \
+            faas-imaged.service \
+            faas-meterd.service \
+            faas-schedd.service \
+            faas-vmmd.service; do
+            install -m 0644 "deploy/controlplane/systemd/${unit}" "${BUNDLE_ROOT}/systemd/${unit}"
+          done
+          test ! -e "${BUNDLE_ROOT}/systemd/faas-gatewayd.service"
+          install -m 0644 deploy/controlplane/tmpfiles.d/faas.conf "${BUNDLE_ROOT}/tmpfiles.d/faas.conf"
           go run ./cmd/deployctl bundle-create "${BUNDLE_ROOT}" "${RELEASE_ID}" "${GITHUB_SHA}" "linux/amd64"
           echo "BUNDLE_ROOT=${BUNDLE_ROOT}" >> "${GITHUB_ENV}"
           echo "RELEASE_ID=${RELEASE_ID}" >> "${GITHUB_ENV}"
+
+      # The controller (deployctl) ships and verifies the release, but
+      # imaged's base-stage scanner (grype) + SBOM tool (syft) are host
+      # tooling, not release binaries: cmd/imaged's WithGrypeRun /
+      # WithSyftRun wiring (cmd/imaged/main.go) shells out to `grype` /
+      # `syft` on PATH. When they're missing, the base-stage sidecar
+      # fails-closed with CRITICAL=9999 (pkg/imaged/base_stage.go::
+      # writeScanSidecar) and vmmd refuses every boot. The Ansible
+      # supply_chain_scanners role installs them for ansible-managed
+      # boxes; this step covers the controller-managed (cd-controlplane)
+      # host so both provisioning paths stay in lock-step. Pins mirror
+      # deploy/ansible/roles/supply_chain_scanners/defaults/main.yml —
+      # keep the two in lock-step.
+      - name: Provision Grype/Syft on host
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            root@${{ env.CP_HOST }} 'set -euo pipefail
+            install_grype() {
+              local v=0.116.0 sha=40aff724297312f91ea390d003bed8d8651c74cc7f5b26732db80b3a408d2fc5
+              local t=/usr/local/bin/grype
+              [[ -x "$t" && "$(sha256sum "$t" | cut -d" " -f1)" == "$sha" ]] && return 0
+              curl -fsSL -o /tmp/grype.tar.gz "https://github.com/anchore/grype/releases/download/v${v}/grype_${v}_linux_amd64.tar.gz"
+              echo "$sha  /tmp/grype.tar.gz" | sha256sum -c -
+              tar -xzf /tmp/grype.tar.gz -C /tmp grype
+              install -m 0755 /tmp/grype "$t"
+              rm -f /tmp/grype.tar.gz /tmp/grype
+            }
+            install_syft() {
+              local v=1.0.0 sha=27dfeaca134cd8aeff6135ba349ff922109bd89b955755459601667d69fed88e
+              local t=/usr/local/bin/syft
+              [[ -x "$t" && "$(sha256sum "$t" | cut -d" " -f1)" == "$sha" ]] && return 0
+              curl -fsSL -o /tmp/syft.tar.gz "https://github.com/anchore/syft/releases/download/v${v}/syft_${v}_linux_amd64.tar.gz"
+              echo "$sha  /tmp/syft.tar.gz" | sha256sum -c -
+              tar -xzf /tmp/syft.tar.gz -C /tmp syft
+              install -m 0755 /tmp/syft "$t"
+              rm -f /tmp/syft.tar.gz /tmp/syft
+            }
+            install_grype
+            install_syft
+            grype version
+            syft version
+          '
 
       - name: Upload and activate immutable release
         run: |

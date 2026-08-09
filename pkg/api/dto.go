@@ -700,6 +700,19 @@ type CreateDeploymentRequest struct {
 	// silently dropped; the customer who set it expects it to
 	// apply).
 	Sidecars Sidecars `json:"sidecars,omitempty"`
+	// TrafficPercent (issue #556 / traffic splitting across
+	// deployments, PR-A) is the per-deployment traffic share in
+	// the [0, 100] range. Pointer so that omitted == "server
+	// default 100" (today's behaviour preserved exactly: 100%
+	// of traffic goes to the most-recent live row). Explicit
+	// values <100 enable canary: PATCH /v1/deployments/{id}/traffic
+	// rebalances Σ(traffic_percent WHERE status='live') = 100
+	// across siblings atomically. nil on the wire → handler
+	// defaults to 100; explicit 0 → "this row receives no
+	// traffic" (the rollback path); explicit 10/25/50 →
+	// canary share. Plan-gated at Pro+ via
+	// acct.Plan.TrafficSplitAllowed().
+	TrafficPercent *int `json:"traffic_percent,omitempty"`
 }
 
 // CreateDeploymentOverrides is the optional override object on
@@ -892,7 +905,7 @@ func (o *CreateDeploymentOverrides) Validate(limits Limits) *Problem {
 			fmt.Sprintf("%s plan allows %d env+env_secrets entries per override; got %d (env=%d, env_secrets=%d).",
 				limits.Plan, limits.EnvVarsMax, totalEnv, len(o.Env), len(o.EnvSecrets))).
 			WithLimit(int64(limits.EnvVarsMax), int64(totalEnv)).
-			WithDocs("https://docs.gregale.dev/deploy-overrides#env")
+			WithDocs(docsBase + "/deploy-overrides#env")
 	}
 
 	// env: key grammar + per-value byte cap. The same byte cap
@@ -1079,6 +1092,7 @@ type BuildProvenanceResponse struct {
 	StartedAt      string `json:"started_at"`
 	FinishedAt     string `json:"finished_at"`
 	SBOMStorageKey string `json:"sbom_storage_key"`
+	FrameworkVer   string `json:"framework_version"`
 }
 
 // DeploymentResponse is a deployment as returned by the API.
@@ -1162,6 +1176,19 @@ type DeploymentResponse struct {
 	// layer via the deployments_parked_reason_check constraint.
 	ParkedReason string     `json:"parked_reason,omitempty"`
 	ParkedAt     *time.Time `json:"parked_at,omitempty"`
+	// TrafficPercent (issue #556 / traffic splitting across
+	// deployments, PR-A) is the per-deployment traffic share
+	// surfaced on GET /v1/deployments/{id} and GET
+	// /v1/apps/{slug} (the per-deployment live row only — the
+	// App-level aggregate traffic split is PR-B/C scope). Always
+	// present in [0, 100]; the migration stamps 100 on every
+	// pre-feature row, the handler defaults to 100 on create, and
+	// the supersede step inside CreateDeployment's transaction
+	// stamps 0 on the prior row so Σ=100 trivially for the
+	// one-live-deployment case. See migration 00160 and
+	// pkg/state.UpdateDeploymentTraffic for the rebalance
+	// semantics.
+	TrafficPercent int `json:"traffic_percent"`
 }
 
 // UpdateDeploymentRequest is the body for PATCH /v1/deployments/{id}
@@ -1171,6 +1198,18 @@ type DeploymentResponse struct {
 // to change them).
 type UpdateDeploymentRequest struct {
 	MinInstances *int `json:"min_instances"`
+}
+
+// UpdateDeploymentTrafficRequest is the body for
+// PATCH /v1/deployments/{id}/traffic (issue #556 PR-A). The PATCH
+// route is dedicated to traffic splitting rather than reusing
+// UpdateDeploymentRequest because the request shape differs:
+// TrafficPercent MUST be present (a no-field PATCH is meaningless
+// here), and the pre-existing PATCH at /v1/deployments/{id} has
+// its own "min_instances required" presence rule. Splitting the
+// DTOs keeps each handler's contract crisp.
+type UpdateDeploymentTrafficRequest struct {
+	TrafficPercent int `json:"traffic_percent"`
 }
 
 // AccountResponse is the whoami payload. Limits is the plan's
@@ -1778,7 +1817,7 @@ func ValidateAppConfig(l Limits, ramMB, maxConcurrency int) *Problem {
 			"Concurrency over plan limit",
 			fmt.Sprintf("%s plan caps max_concurrency at %d; requested %d.", l.Plan, l.MaxConcurrency, maxConcurrency)).
 			WithLimit(int64(l.MaxConcurrency), int64(maxConcurrency)).
-			WithDocs("https://docs.gregale.dev/plans#concurrency")
+			WithDocs(docsBase + "/plans#concurrency")
 	}
 	return nil
 }
@@ -2026,6 +2065,15 @@ type AsyncInvokeResponse struct {
 	StatusURL string `json:"status_url"`
 }
 
+// InvocationReplayResponse is the 202-side of POST
+// /v1/invocations/{id}/replay. The wire is identical to
+// AsyncInvokeResponse — the replay creates a new async invocation
+// against the original's app/instance, so the read-side contract is
+// the same id + status_url the customer already polls. Aliased so
+// future divergence (e.g. an "original_id" field for dedup) has a
+// single place to grow without touching every SDK call site.
+type InvocationReplayResponse = AsyncInvokeResponse
+
 // InvokeResponse is the sync-side of POST /v1/apps/{slug}/invoke.
 // Status is the final row state (one of "completed" | "failed"
 // | "cancelled"); Result is the per-app payload the drain stamped
@@ -2257,6 +2305,49 @@ type AuditEventResponse struct {
 type ListAuditEventsResponse struct {
 	Events []AuditEventResponse `json:"events"`
 	Limit  int                  `json:"limit"`
+}
+
+// --- audit_log (issue #755 / PR-6) ---------------------------------------
+//
+// AuditLogEntry is the wire shape for one row of the FK-free audit_log
+// table (migrations/00163_audit_log.sql). Distinct from
+// AuditEventResponse on three load-bearing axes:
+//
+//   - ID is a UUID, not a bigint — the table uses uuid.UUID PK so the
+//     row outlives a deleted accounts row.
+//   - AccountID is a UUID rendered as a canonical-hyphenated string
+//     (matches uuid.UUID.String()). It is omitempty: anonymous rows
+//     (account_id IS NULL, e.g. background activity) render without
+//     an AccountID field on the wire.
+//   - AccountEmail is the verbatim email captured at copy-time inside
+//     PgStore.DeleteAccount / MemStore.DeleteAccount. It is omitempty:
+//     anonymous rows have no email, and the regulator can still read
+//     them with an empty AccountEmail field. Empty string == "no
+//     customer-context at the moment of emission".
+//
+// Data is the raw jsonb payload; kind-specific schemas are documented
+// per-kind in the ADR. ReceivedAt is RFC 3339 so the dashboard's
+// "newest first" sort stays correct across timezones.
+type AuditLogEntry struct {
+	ID           string          `json:"id"` // uuid canonical form
+	Kind         string          `json:"kind"`
+	AccountID    string          `json:"account_id,omitempty"`    // uuid canonical; absent on anonymous rows
+	AccountEmail string          `json:"account_email,omitempty"` // captured at copy-time
+	Actor        string          `json:"actor,omitempty"`
+	ReceivedAt   string          `json:"received_at"` // RFC 3339
+	Data         json.RawMessage `json:"data,omitempty"`
+}
+
+// ListAuditLogResponse is the wire shape for GET /v1/audit-log and
+// GET /v1/audit-log/all. Entries are newest-first
+// (received_at DESC, id DESC) per the audit_log_received_at_idx so the
+// dashboard can render top-of-list without re-sorting. Limit echoes
+// the effective limit applied by the handler (capped at
+// listAuditLogLimitMax) so the SDK can display "showing 50 of N"
+// without re-issuing the request.
+type ListAuditLogResponse struct {
+	Entries []AuditLogEntry `json:"entries"`
+	Limit   int             `json:"limit"`
 }
 
 // --- GitHub install bind picker (PR-B; §11) ---------------------------------

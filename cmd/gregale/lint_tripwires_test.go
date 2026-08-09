@@ -253,6 +253,16 @@ func TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire(t *testing.T) {
 			if name == "vendor" || name == "node_modules" || name == ".git" {
 				return filepath.SkipDir
 			}
+			// Skip Claude Code's local worktree checkouts under
+			// .claude/worktrees/. These are sibling worktrees of stale
+			// feature branches parked by Claude Code; they live next
+			// to the repo root and contain copies of pkg/, cmd/, etc.
+			// that would falsely trip the literal scan. The directory
+			// itself is untracked (see .gitignore), so CI never sees
+			// it — the skip is purely for local-dev ergonomics.
+			if strings.Contains(path, string(filepath.Separator)+".claude"+string(filepath.Separator)+"worktrees"+string(filepath.Separator)) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
@@ -447,6 +457,13 @@ func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
 			if name == "vendor" || name == "node_modules" || name == ".git" {
 				return filepath.SkipDir
 			}
+			// Skip Claude Code's local worktree checkouts under
+			// .claude/worktrees/. See the matching skip in
+			// TestLintTripwire_NoLiteralWakeHeaderOutsidePkgWire for
+			// the rationale (untracked, local-dev-only).
+			if strings.Contains(path, string(filepath.Separator)+".claude"+string(filepath.Separator)+"worktrees"+string(filepath.Separator)) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(path, ".go") {
@@ -499,6 +516,20 @@ func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
 	//   - `://DOMAIN"`         string-terminated generic catch-all
 	//   - `docs.DOMAIN`        matches the issue's literal spelling + `apps.DOMAIN` style
 	//   - `.DOMAIN`            suffix-bearing catch-all (covers `apps.DOMAIN`)
+	//   - `https://docs/vmmd#` malformed-host regression caught in PR-A
+	//       (issue #420): the original `https://docs/vmmd#<fragment>` had
+	//       a bare `docs` host with no TLD — every other vmmdgrpc site
+	//       composes `https://` + wire.DocsHost + `/vmmd#<fragment>`. The
+	//       `https://docs/` substring overlaps with `https://docs/DOMAIN`,
+	//       but the vmmd fragment is presentational and not a placeholder
+	//       — we ban the whole shape so a future regression that drops
+	//       the TLD AND the placeholder guard would still fire.
+	//   - `docs.gregale.example` RFC 2606 reserved-TLD regression caught
+	//       in PR-A (issue #420): the pre-#458 docs host used the
+	//       IANA-reserved example TLD (`example`). PR #458 renamed to
+	//       `docs.gregale.dev` but missed two sites in cmd/gregale. The
+	//       literal must stay out of the tree entirely — reserved TLDs
+	//       cannot resolve, so a stray lookup fails fast and obviously.
 	//
 	// Overlap note: `https://docs/DOMAIN` is a strict superset of
 	// `https://DOMAIN`, and `://DOMAIN/` is a strict superset of
@@ -516,6 +547,8 @@ func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
 		"://DOMAIN\"",
 		"docs.DOMAIN",
 		".DOMAIN",
+		"https://docs/vmmd#",
+		"docs.gregale.example",
 	}
 
 	var violations []string
@@ -551,43 +584,99 @@ func TestLintTripwire_NoLiteralDocsDomainEverywhere(t *testing.T) {
 // silently blind to itself — a future refactor that breaks the
 // walker's substring match would land without anyone noticing
 // because the live walker never finds a violation on a clean tree.
+//
+// One sub-test per forbidden entry, each seeded with a distinct
+// synthetic literal so a regression in any single entry's substring
+// match is named.
 func TestLintTripwire_NoLiteralDocsDomainSelfTest(t *testing.T) {
-	// Build a small Go file that contains a forbidden substring in a
-	// string context the walker will recognise.
-	tmp := t.TempDir()
-	src := `package tripwiretest
+	cases := []struct {
+		name   string
+		src    string
+		forbid string
+	}{
+		{
+			// Pre-#439 placeholder form — the original issue #420
+			// literal. Kept as the canonical walker exercise.
+			name: "docs_DOMAIN_placeholder",
+			src: `package tripwiretest
 
 // Synthetic production-like file carrying the forbidden placeholder
 // literal. Exists only to exercise the AST walker.
 var url = "https://docs/DOMAIN/vmmd#create"
-`
-	srcPath := filepath.Join(tmp, "tripwire.go")
-	if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
-		t.Fatalf("seed file: %v", err)
+`,
+			forbid: "https://docs/DOMAIN",
+		},
+		{
+			// PR-A (issue #420) malformed-host regression: the host
+			// was dropped to bare `docs` (no TLD) on the vmmd error
+			// sites. The literal `https://docs/vmmd#prepare` snuck
+			// past the original tripwire because the substring
+			// `https://docs/DOMAIN` requires the placeholder token.
+			// PR-C closes the gap by banning the whole
+			// `https://docs/vmmd#` shape.
+			name: "docs_vmmd_no_tld",
+			src: `package tripwiretest
+
+// Synthetic production-like file carrying the malformed-host
+// regression. The vmmd fragment is a presentational path, not a
+// placeholder — the tripwire bans the whole shape so a future
+// regression that drops the TLD AND the placeholder guard would
+// still fire.
+var url = "https://docs/vmmd#prepare"
+`,
+			forbid: "https://docs/vmmd#",
+		},
+		{
+			// PR-A (issue #420) RFC 2606 reserved-TLD regression:
+			// the pre-#458 docs host used the IANA-reserved example
+			// TLD. PR #458 renamed to `docs.gregale.dev` but missed
+			// two sites in cmd/gregale. The reserved TLD must stay
+			// out of the tree entirely — reserved TLDs cannot
+			// resolve, so a stray lookup fails fast and obviously.
+			name: "docs_example_reserved_tld",
+			src: `package tripwiretest
+
+// Synthetic production-like file carrying the RFC 2606 reserved-TLD
+// regression. The .example TLD is unreachable by design.
+var url = "https://docs.gregale.example/build/limits#memory"
+`,
+			forbid: "docs.gregale.example",
+		},
 	}
 
-	fset := token.NewFileSet()
-	pf, err := parser.ParseFile(fset, srcPath, nil, parser.AllErrors)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	forbidden := []string{"https://docs/DOMAIN"}
-	var found string
-	ast.Inspect(pf, func(n ast.Node) bool {
-		lit, ok := n.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
-			return true
-		}
-		for _, forbid := range forbidden {
-			if strings.Contains(lit.Value, forbid) {
-				found = fset.Position(lit.Pos()).String()
-				return false
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			srcPath := filepath.Join(tmp, "tripwire.go")
+			if err := os.WriteFile(srcPath, []byte(tc.src), 0o644); err != nil {
+				t.Fatalf("seed file: %v", err)
 			}
-		}
-		return true
-	})
-	if found == "" {
-		t.Fatal("self-test: walker did not detect the seeded DOMAIN placeholder literal — the tripwire may be silently broken")
+
+			fset := token.NewFileSet()
+			pf, err := parser.ParseFile(fset, srcPath, nil, parser.AllErrors)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+
+			forbidden := []string{tc.forbid}
+			var found string
+			ast.Inspect(pf, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					return true
+				}
+				for _, forbid := range forbidden {
+					if strings.Contains(lit.Value, forbid) {
+						found = fset.Position(lit.Pos()).String()
+						return false
+					}
+				}
+				return true
+			})
+			if found == "" {
+				t.Fatalf("self-test: walker did not detect the seeded %q literal — the tripwire may be silently broken for this entry", tc.forbid)
+			}
+		})
 	}
 }

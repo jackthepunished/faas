@@ -14,6 +14,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.app_manifest import AppManifest
+    from ..models.parked_deployment_ref import ParkedDeploymentRef
     from ..models.public_auth_status import PublicAuthStatus
     from ..models.scaling_policy import ScalingPolicy
 
@@ -91,6 +92,10 @@ class AppResponse:
     """Per-deployment token-gate flag (issue #560). When true, gatewayd-internal demands `Authorization: Bearer
     <token>` on every request; cross-account tokens receive 403 insufficient_scope. Pro/Scale only — Free/Hobby
     PATCH-true is rejected with 403 plan_require_authn_not_allowed."""
+    parked_deployment: None | ParkedDeploymentRef | Unset = UNSET
+    """Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The
+    reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why
+    is my app evicted_cold?' without grepping the audit log."""
     public_auth: PublicAuthStatus | Unset = UNSET
     """Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents
     without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision
@@ -100,6 +105,7 @@ class AppResponse:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.parked_deployment_ref import ParkedDeploymentRef
         from ..models.scaling_policy import ScalingPolicy
 
         id = self.id
@@ -182,6 +188,14 @@ class AppResponse:
 
         require_authn = self.require_authn
 
+        parked_deployment: dict[str, Any] | None | Unset
+        if isinstance(self.parked_deployment, Unset):
+            parked_deployment = UNSET
+        elif isinstance(self.parked_deployment, ParkedDeploymentRef):
+            parked_deployment = self.parked_deployment.to_dict()
+        else:
+            parked_deployment = self.parked_deployment
+
         public_auth: dict[str, Any] | Unset = UNSET
         if not isinstance(self.public_auth, Unset):
             public_auth = self.public_auth.to_dict()
@@ -240,6 +254,8 @@ class AppResponse:
             field_dict["eviction_priority"] = eviction_priority
         if require_authn is not UNSET:
             field_dict["require_authn"] = require_authn
+        if parked_deployment is not UNSET:
+            field_dict["parked_deployment"] = parked_deployment
         if public_auth is not UNSET:
             field_dict["public_auth"] = public_auth
         if auth_default_flipped_at is not UNSET:
@@ -250,6 +266,7 @@ class AppResponse:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.app_manifest import AppManifest
+        from ..models.parked_deployment_ref import ParkedDeploymentRef
         from ..models.public_auth_status import PublicAuthStatus
         from ..models.scaling_policy import ScalingPolicy
 
@@ -368,6 +385,23 @@ class AppResponse:
 
         require_authn = d.pop("require_authn", UNSET)
 
+        def _parse_parked_deployment(data: object) -> None | ParkedDeploymentRef | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                parked_deployment_type_0 = ParkedDeploymentRef.from_dict(data)
+
+                return parked_deployment_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | ParkedDeploymentRef | Unset, data)
+
+        parked_deployment = _parse_parked_deployment(d.pop("parked_deployment", UNSET))
+
         _public_auth = d.pop("public_auth", UNSET)
         public_auth: PublicAuthStatus | Unset
         if isinstance(_public_auth, Unset):
@@ -419,6 +453,7 @@ class AppResponse:
             warm_snapshot_min_ms=warm_snapshot_min_ms,
             eviction_priority=eviction_priority,
             require_authn=require_authn,
+            parked_deployment=parked_deployment,
             public_auth=public_auth,
             auth_default_flipped_at=auth_default_flipped_at,
         )

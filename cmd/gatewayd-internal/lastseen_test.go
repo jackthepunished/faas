@@ -43,10 +43,10 @@ func (a *fakeScheddClientAdapter) ReportActivity(ctx context.Context, touches []
 	return a.rep.ReportActivity(ctx, touches)
 }
 
-func (a *fakeScheddClientAdapter) AdmitInstance(context.Context, string) (string, string, string, int32, bool, int, error) {
+func (a *fakeScheddClientAdapter) AdmitInstance(context.Context, string, string) (string, string, string, string, int32, bool, int, error) {
 	panic("fakeScheddClientAdapter.AdmitInstance: not wired")
 }
-func (a *fakeScheddClientAdapter) Wake(context.Context, string) (string, string, string, int, error) {
+func (a *fakeScheddClientAdapter) Wake(context.Context, string, string) (string, string, string, string, int, error) {
 	panic("fakeScheddClientAdapter.Wake: not wired")
 }
 func (a *fakeScheddClientAdapter) ParkInstance(context.Context, string, string) error {

@@ -23,6 +23,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
+	"github.com/onebox-faas/faas/pkg/gateway/writegate"
 	"github.com/onebox-faas/faas/pkg/netns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -96,6 +97,28 @@ type OpsMetrics struct {
 	// the TSDB series. The PromQL `rate(vmmd_warm_snapshot_errors_total[5m])`
 	// panel is the §12 warm-capture-error alert's primary signal.
 	warmSnapshotErrors *prometheus.CounterVec
+	// warmupErrors (Tier A8 / ADR-083). Per-(app slug) probe-failure
+	// counter for the standby warm-up scraper. Bounded cardinality
+	// (operator-managed FAAS_STANDBY_WARMUP_SLUGS_PATH); see
+	// the warmupErrors constructor block below.
+	warmupErrors *prometheus.CounterVec
+	// writeRedirectTotal (Tier A9 / ADR-084) counts every write
+	// request the cmd/gatewayd-internal writeGate classifies
+	// (relayed, redirected, blocked, or short-circuited). Labelled
+	// by outcome ∈ {relayed, redirect_307, same_box,
+	// cookie_blocked, leader_unreachable, loop_prevented,
+	// mTLS_failure, error} AND auth_kind ∈ {bearer, cookie,
+	// anonymous}. The closed label sets keep the TSDB cardinality
+	// bounded — the writeGate classifies at request entry, never
+	// per-request-derived. See pkg/gateway/writegate for the
+	// classification rules.
+	writeRedirectTotal *prometheus.CounterVec
+	// writeRedirectLatency (Tier A9 / ADR-084) is the histogram
+	// of cross-box relay durations observed by writeGate. Only
+	// cross-box hops emit a sample (local same-box and 307
+	// fallback paths don't); the histogram's nil branch means a
+	// pure-local daemon never bumps a series.
+	writeRedirectLatency prometheus.Histogram
 	// livenessRestarts (issue #554 / ADR-078) is the per-(app,
 	// deployment) counter the Engine.DestroyForLivenessFailure path
 	// increments on every liveness-driven destroy. The dashboard
@@ -329,6 +352,48 @@ type OpsMetrics struct {
 	// alertEvalFiredTotal / alertEvalSkippedDegradedTotal for the
 	// operator's "is meterd actually evaluating rules?" view.
 	alertEvaluatorEnabled prometheus.Gauge
+	// standbyState — operator-facing enum gauge stamped by
+	// gatewayd-public on every active-passive HA state transition
+	// (Tier A8 / ADR-083). Values are 1/2/3 mapped to the
+	// closed vocabulary {warming, warm, draining}; an un-set
+	// gauge defaults to 0 (the "never seen" state — surfaces as
+	// a "no data" rather than 0 to the alert rule). Pre-
+	// instantiated to warming in NewOpsMetrics so the row
+	// surfaces in /metrics from boot (precedent: alertEvaluator
+	// Enabled above and pgBackupLastPushed below). The
+	// `FaasStandbyStateWarmingTooLong` alert rule
+	// (deploy/ansible/roles/prometheus/files/ha_failover.rules.yml)
+	// fires when this gauge holds at 1 for > 60s on a node
+	// where the operator has marked active=true — that's the
+	// tripwire for a misconfigured DNS provider or a stuck
+	// leader election. Unlabelled — single-box per-node state,
+	// no fan-out needed today.
+	standbyState prometheus.Gauge
+	// standbyStateMu + standbyStateValue shadow the gauge so
+	// StandbyState() can return the current int without scraping
+	// /metrics (prometheus.Gauge exposes only Set/Inc/Dec/Add/Sub
+	// /Write — no Value() accessor). Same precedent as
+	// alertEvaluatorEnabledValue above. Lock contention is non-
+	// issue: the gauge is stamped at boot, on
+	// compute_node_changed, and on drain start — not per-tick.
+	standbyStateMu    sync.Mutex
+	standbyStateValue int
+	// activePassiveFailoversTotal — Tier A8 / ADR-083
+	// active-passive HA fail-over observability. Counter labelled
+	// by outcome ∈ {dns_flipped, dns_stale, peer_unreachable,
+	// manual_drain} — the closed set the dns_handoff orchestrator
+	// (cmd/gatewayd-public/dns_handoff.go) can land in. `dns_flipped`
+	// is the §12 dashboard panel (the active-passive flip succeeded
+	// inside HADNSRecordStaleSeconds). `dns_stale` is the tripwire
+	// for the DNS provider failing UpsertRecord after retries —
+	// operationally distinct from `peer_unreachable` (which is the
+	// pg_notify consumer falling behind). `manual_drain` is the
+	// operator-initiated path. Single-registry: registered on every
+	// daemon (mirrors liveMigrationDecisions / rebalanceDecisions /
+	// migratingReconcileDecisions); only gatewayd-public increments
+	// via ActivePassiveFailovers in production. Pre-instantiated in
+	// NewOpsMetrics so the row surfaces in /metrics from boot.
+	activePassiveFailoversTotal *prometheus.CounterVec
 	// pgBackupLastPushed — operator-facing gauge stamped by the
 	// apid's pgBackupPushedSampler (cmd/apid/main.go). Holds the
 	// age of the newest tarball in /var/lib/pgsql/basebackup/ (in
@@ -851,6 +916,15 @@ type OpsMetrics struct {
 	// instantiated in NewOpsMetrics so the row surfaces in
 	// /metrics from boot.
 	migratingReconcileDecisions *prometheus.CounterVec
+	// deadNodeReconcileDecisions: dead-node billing reconciler.
+	// schedd's Engine.ReconcileDeadNodeInstances increments this
+	// once per RUNNING row found on a node that has been
+	// unreachable past the staleness window. A non-zero `failed`
+	// rate means a vmmd died without transitioning its rows and
+	// customers were being billed for VMs that no longer exist —
+	// the §12 dashboard treats a sustained non-zero rate as an
+	// incident signal, not routine background repair.
+	deadNodeReconcileDecisions *prometheus.CounterVec
 	// githubdPathFilterTotal: issue #432 phase 5 / ADR-050
 	// §109. Counter labelled by `mode` ∈ {paths, full_fallback,
 	// truncated, error, breaker_open} — the closed set
@@ -950,6 +1024,62 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	}, []string{"reason"})
 	warmSnapshotErrors.WithLabelValues("vmm_call")
 	warmSnapshotErrors.WithLabelValues("store_write")
+	// warmupErrors (Tier A8 / ADR-083). Counts probe failures on the
+	// standby warm-up scraper (cmd/gatewayd-public/standby_warmup.go).
+	// Labelled by app slug — the per-app cardinality is bounded by the
+	// operator-managed FAAS_STANDBY_WARMUP_SLUGS_PATH list (default
+	// ≤ 100 slugs / fleet). The PromQL
+	// `rate(gatewayd_public_warmup_errors_total[5m]) > 0` panel is
+	// the §12 standby-warmup alert's primary signal: a sustained
+	// non-zero rate means gatewayd-internal is unhealthy on a
+	// standby box (the new leader will cold-boot every request on
+	// flip). OpsMetrics.WarmupErrors(slug) returns the per-slug
+	// counter; nil-safe.
+	warmupErrors := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_warmup_errors_total",
+		Help: "Count of standby warm-up probe failures (Tier A8 / ADR-083), labelled by app slug. Probe failures imply gatewayd-internal is unreachable or unhealthy on the standby box — the new leader will cold-boot every request on the active-passive flip. Sustained non-zero rate triggers the §12 standby-warmup alert.",
+	}, []string{"slug"})
+	// Pre-instantiate the empty-slug overflow row so the help/TYPE
+	// surfaces in /metrics from boot, matching the precedent in
+	// warmSnapshotErrors above and the (other, other) overflow rows
+	// elsewhere in this constructor.
+	warmupErrors.WithLabelValues("")
+	// writeRedirectTotal (Tier A9 / ADR-084). The two label sets
+	// are closed (no per-request-derived values); pre-instantiation
+	// at every (outcome, auth_kind) pair keeps the /metrics body
+	// honest from boot (the §12 panel queries a non-zero baseline
+	// from t=0; a counter that only appears after the first
+	// incident confuses the alert rule). The PromQL
+	// `rate(gatewayd_internal_write_redirect_total{outcome="relayed"}[5m])`
+	// is the cross-box hop health signal;
+	// `{outcome="loop_prevented"}` is the redirect-storm DoS
+	// alarm; `{outcome="leader_unreachable"}` alerts via the
+	// existing §12 failover panel (per ADR-083 §Open follow-up
+	// #2, this is the canary that closes ADR-083).
+	writeRedirectTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_write_redirect_total",
+		Help: "Count of write requests the cmd/gatewayd-internal writeGate classified (Tier A9 / ADR-084). outcome ∈ {relayed, redirect_307, same_box, cookie_blocked, leader_unreachable, loop_prevented, mTLS_failure, error}; auth_kind ∈ {bearer, cookie, anonymous}. The closed label sets keep TSDB cardinality bounded — see pkg/gateway/writegate for the classification rules.",
+	}, []string{"outcome", "auth_kind"})
+	writeRedirectOutcomes := writegate.AllWriteOutcomes
+	writeRedirectAuthKinds := writegate.AllAuthKinds
+	for _, outcome := range writeRedirectOutcomes {
+		for _, kind := range writeRedirectAuthKinds {
+			writeRedirectTotal.WithLabelValues(string(outcome), string(kind))
+		}
+	}
+	// writeRedirectLatency (Tier A9 / ADR-084). Buckets sized for
+	// the cross-box mTLS hop (overlay round-trip + leader apid
+	// handler). The top bucket is generous — a degraded overlay
+	// can stretch a hop to seconds before the
+	// StandbyWriteRedirectTimeoutMS=5000 fires and the writeGate
+	// degrades to 307.
+	writeRedirectLatency := prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: prefix + "_write_redirect_latency_seconds",
+		Help: "Cross-box apid relay duration (Tier A9 / ADR-084). Only cross-box hops emit a sample; same-box and 307-fallback paths do not. The histogram's nil branch means a pure-local daemon never bumps a series.",
+		Buckets: []float64{
+			0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+		},
+	})
 	// Issue #554 / ADR-078: liveness restarts counter. Labelled by
 	// (app, deployment) — the bounded per-deployment set keeps the
 	// TSDB cardinality safe (Scale: ≤ 20 deployment per app; Hobby:
@@ -1614,7 +1744,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// only needs to be added here, not in two parallel MustRegister
 	// calls that would silently drift apart.
 	commonCollectors := []prometheus.Collector{
-		ops, dur, watchdogKills, warmSnapshotErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, guestInitDuration, wakeSnapshotTier, guestTailSeconds, guestTailFailedTotal, tailCapReached, eventsWriteFail, auditWriteFail,
+		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur,
 		buildDur, buildQueueWait, residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal,
@@ -1748,6 +1879,42 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Cross-node migrating-instance watchdog reconcile decisions (Tier A6 / ADR-067), labelled by outcome ∈ {reinvited, hard_deleted, conflict, error}. `reinvited` is the §12 dashboard panel (active owner re-acked the same lease); `hard_deleted` is the tripwire for the new-owner vmmd dying mid-handoff. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via ObserveMigratingReconcile.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, migratingReconcileDecisions)
+	// ADR-083 / Tier A8: active-passive HA fail-over counter.
+	// Labelled by outcome ∈ {dns_flipped, dns_stale,
+	// peer_unreachable, manual_drain}. dns_flipped is the §12
+	// dashboard panel (the active-passive flip succeeded inside
+	// HADNSRecordStaleSeconds). Pre-instantiated at boot so the
+	// row surfaces in /metrics from the moment gatewayd-public
+	// starts. Only gatewayd-public increments in production, but
+	// the field is on the shared struct (single-registry pattern,
+	// memory wire/OpsMetrics) so /metrics doesn't show a 404 for
+	// cmd/<other> scrapes that incidentally probe the prefix.
+	activePassiveFailoversTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_active_passive_failovers_total",
+		Help: "Active-passive HA fail-over decisions (Tier A8 / ADR-083), labelled by outcome ∈ {dns_flipped, dns_stale, peer_unreachable, manual_drain}. `dns_flipped` is the §12 dashboard panel (the active-passive flip succeeded inside HADNSRecordStaleSeconds); `dns_stale` is the tripwire for the DNS provider failing UpsertRecord after retries (operationally distinct from `peer_unreachable` which is the pg_notify consumer falling behind); `manual_drain` is the operator-initiated path via the runbook. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions / migratingReconcileDecisions); only gatewayd-public increments via ActivePassiveFailovers.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, activePassiveFailoversTotal)
+	// ADR-083 / Tier A8: standby-state enum gauge. Unlabelled
+	// gauge held at the current StandbyState value (1=warming,
+	// 2=warm, 3=draining). Pre-instantiated to 1 so the row
+	// surfaces in /metrics from the moment the daemon starts
+	// (precedent: alertEvaluatorEnabled above). The
+	// `FaasStandbyStateWarmingTooLong` alert rule queries this
+	// gauge (deploy/ansible/roles/prometheus/files/ha_failover.rules.yml).
+	standbyState := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_standby_state",
+		Help: "Current standby state for this gatewayd-public (Tier A8 / ADR-083 / §14 M8). 1=warming (boot warm-up incomplete), 2=warm (active or standby-warm), 3=draining (operator-initiated drain in flight, in-flight requests bounded by HADNSRecordStaleSeconds), 4=drained (terminal success — DNS flipped, in-flight reached zero, box is safe to shut down), 5=failed (terminal failure — DNS provider exhausted retries OR peer_unreachable stuck; operator intervention required). The FaasStandbyStateWarmingTooLong alert fires when this gauge holds at 1 for > 60s on a node where compute_nodes.active=true. Unlabelled — single-box per-node state.",
+	})
+	standbyState.Set(StandbyStateWarming)
+	commonCollectors = append(commonCollectors, standbyState)
+	// Dead-node billing reconciler counter. Single-registry pattern
+	// (mirrors migratingReconcileDecisions): registered on every
+	// daemon, only schedd increments it in production.
+	deadNodeReconcileDecisions := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_dead_node_reconcile_total",
+		Help: "Dead-node billing reconciler decisions, labelled by outcome ∈ {failed, conflict, error}. `failed` counts RUNNING instances terminated because their compute_node stopped heartbeating past the staleness window — each one was billing the customer for a VM that no longer existed and holding §6.2-2 RAM ceiling. A sustained non-zero `failed` rate is an incident signal (a vmmd is dying without transitioning its rows), not routine repair. `conflict` is the benign peer-wins/node-recovered path.",
+	}, []string{"outcome"})
+	commonCollectors = append(commonCollectors, deadNodeReconcileDecisions)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -1881,6 +2048,24 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		"reinvited", "hard_deleted", "conflict", "error",
 	} {
 		migratingReconcileDecisions.WithLabelValues(outcome)
+	}
+	// Pre-instantiate the Tier A8 / ADR-083 active-passive
+	// fail-over outcome set so the §12 panel renders zero on a
+	// healthy box (rather than "no data" until the first
+	// drain). Extending the outcome vocabulary requires
+	// extending this loop in lock-step with the dns_handoff
+	// orchestrator (cmd/gatewayd-public/dns_handoff.go).
+	for _, outcome := range []string{
+		"dns_flipped", "dns_stale", "peer_unreachable", "manual_drain",
+	} {
+		activePassiveFailoversTotal.WithLabelValues(outcome)
+	}
+	// Pre-instantiate the dead-node reconciler's closed outcome set
+	// so the §12 panel reads zero on a healthy fleet rather than
+	// absent — an absent series and a zero series look identical in
+	// a graph but only one proves the reconciler is wired.
+	for _, outcome := range []string{"failed", "conflict", "error"} {
+		deadNodeReconcileDecisions.WithLabelValues(outcome)
 	}
 	// Issue #517 / PR-C / ADR-064: pre-instantiate the closed
 	// 13-phase × 2-result label set for wakePhaseEmitted and
@@ -2083,6 +2268,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dur:                                dur,
 		watchdogKills:                      watchdogKills,
 		warmSnapshotErrors:                 warmSnapshotErrors,
+		warmupErrors:                       warmupErrors,
+		writeRedirectTotal:                 writeRedirectTotal,
+		writeRedirectLatency:               writeRedirectLatency,
 		livenessRestarts:                   livenessRestarts,
 		guestInitDuration:                  guestInitDuration,
 		wakeSnapshotTier:                   wakeSnapshotTier,
@@ -2154,6 +2342,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
+		activePassiveFailoversTotal:        activePassiveFailoversTotal,
+		standbyState:                       standbyState,
+		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
+		deadNodeReconcileDecisions:         deadNodeReconcileDecisions,
 		registryCredentialMarkUsedFailures: registryCredentialMarkUsedFailures,
 		storageCacheStaleFallback:          storageCacheStaleFallback,
 		apidLogsEmittedTotal:               apidLogsEmittedTotal,
@@ -2219,6 +2411,57 @@ func (m *OpsMetrics) WarmSnapshotErrors(reason string) prometheus.Counter {
 		return nil
 	}
 	return m.warmSnapshotErrors.WithLabelValues(reason)
+}
+
+// WarmupErrors returns the per-(app slug) probe-failure counter
+// the standby warm-up scraper increments on every probe failure
+// (Tier A8 / ADR-083). The dashboard panel "standby warmup: errors
+// by app (5m)" queries this; the §12 standby-warmup alert fires
+// on a sustained non-zero rate. Bounded cardinality by
+// FAAS_STANDBY_WARMUP_SLUGS_PATH. nil-safe — returns nil if m is
+// nil (a unit test without metrics keeps building).
+func (m *OpsMetrics) WarmupErrors(slug string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.warmupErrors.WithLabelValues(slug)
+}
+
+// WriteRedirectTotal returns the (outcome, auth_kind)-labeled
+// counter the cmd/gatewayd-internal writeGate bumps per
+// classification (Tier A9 / ADR-084). The closed label sets
+// `outcome ∈ {relayed, redirect_307, same_box, cookie_blocked,
+// leader_unreachable, loop_prevented, mTLS_failure, error}` and
+// `auth_kind ∈ {bearer, cookie, anonymous}` are pre-instantiated
+// at every (outcome, kind) pair in the constructor block above;
+// callers should not introduce new label values (writeGate
+// classifies at request entry, never per-request-derived). The
+// Prometheus query
+// `rate(gatewayd_internal_write_redirect_total{outcome="relayed"}[5m])`
+// is the cross-box hop health signal; `{outcome="loop_prevented"}`
+// is the redirect-storm DoS alarm. nil-safe — returns nil if m
+// is nil.
+func (m *OpsMetrics) WriteRedirectTotal(outcome, authKind string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.writeRedirectTotal.WithLabelValues(outcome, authKind)
+}
+
+// WriteRedirectLatency returns the histogram observer the
+// cmd/gatewayd-internal writeGate uses to record cross-box mTLS
+// hop durations (Tier A9 / ADR-084). Only cross-box hops emit a
+// sample; same-box fall-through and 307-fallback paths do not.
+// Buckets are sized for the overlay round-trip + leader apid
+// handler (5 ms to 5 s — the top bucket matches
+// pkg/api/limits.go::StandbyWriteRedirectTimeoutMS). nil-safe —
+// returns nil if m is nil; callers should use Observe with
+// nil-safe wrappers if they need to.
+func (m *OpsMetrics) WriteRedirectLatency() prometheus.Observer {
+	if m == nil {
+		return nil
+	}
+	return m.writeRedirectLatency
 }
 
 // GuestInitDuration returns the {(app, runner)}-labeled histogram
@@ -2342,6 +2585,95 @@ func (m *OpsMetrics) LiveMigrationDecisions(outcome string) prometheus.Counter {
 // rules as LiveMigrationDecisions.
 func (m *OpsMetrics) MigratingReconcileDecisions(outcome string) prometheus.Counter {
 	return m.migratingReconcileDecisions.WithLabelValues(outcome)
+}
+
+// ActivePassiveFailovers returns the labelled counter for the
+// Tier A8 / ADR-083 active-passive HA fail-over. Called from the
+// dns_handoff orchestrator (cmd/gatewayd-public/dns_handoff.go) once
+// per drain outcome. outcome ∈ {dns_flipped, dns_stale,
+// peer_unreachable, manual_drain}. The returned Counter is safe to
+// retain — same caching rules as the other WithLabelValues
+// accessors. The counter is on the shared OpsMetrics struct
+// (single-registry pattern) so /metrics doesn't show a 404 for
+// cmd/<other> scrapes that incidentally probe the prefix.
+func (m *OpsMetrics) ActivePassiveFailovers(outcome string) prometheus.Counter {
+	return m.activePassiveFailoversTotal.WithLabelValues(outcome)
+}
+
+// StandbyState enum (ADR-083 / Tier A8 / §14 M8). Closed vocabulary
+// the §12 Prometheus rules and docs/runbooks/active-passive-ha.md
+// escalate against. The terminal values (Drained / Failed) are the
+// audit's fix #1: without them the gauge sticks at Draining and the
+// runbook-implied `FaasStandbyStateDrainingTooLong` alert cannot
+// fire. Use the named constants instead of raw ints everywhere in
+// the active-passive HA path.
+const (
+	// StandbyStateWarming is the boot value; set at
+	// metrics.NewOpsMetrics time and held until the WarmupLoop's
+	// first tick completes. FaasStandbyStateWarmingTooLong fires
+	// if the gauge holds at 1 for > 60s on a node where
+	// compute_nodes.active=true.
+	StandbyStateWarming = 1
+	// StandbyStateWarm is the steady state on both the active and
+	// the standby-warm box. The standby holds at 2 forever; the
+	// active transitions 2→3 on drain.
+	StandbyStateWarm = 2
+	// StandbyStateDraining is the in-flight drain. Held until the
+	// orchestrator either succeeds (→Drained) or exhausts retries
+	// (→Failed). FaasStandbyStateDrainingTooLong fires if the
+	// gauge holds at 3 for > HADNSRecordStaleSeconds + backoff
+	// slack.
+	StandbyStateDraining = 3
+	// StandbyStateDrained is the terminal success state — DNS
+	// flipped, in-flight reached zero inside the budget, the box
+	// is safe to shut down. This is the value the manual drain
+	// path waits for before SIGKILLing the listener.
+	StandbyStateDrained = 4
+	// StandbyStateFailed is the terminal failure state — DNS
+	// provider exhausted retries OR pg_notify peer_unreachable
+	// stuck inside the budget. The box stays in the fleet as a
+	// standby-only contributor (the orchestrator does NOT retry
+	// on its own — operator intervention is required per the
+	// runbook's escalation section).
+	StandbyStateFailed = 5
+)
+
+// SetStandbyState stamps the enum gauge to the current StandbyState.
+// Called from cmd/gatewayd-public on every active-passive HA state
+// transition (boot→warming→warm→draining→drained|failed). Unlabelled;
+// the gauge is the per-node state signal — fan-out is by Prometheus
+// scrape target. The `FaasStandbyStateWarmingTooLong` alert queries
+// this gauge; the runbook's escalation section covers the
+// investigation path (DNS provider, store connectivity, peer
+// network).
+func (m *OpsMetrics) SetStandbyState(s int) {
+	m.standbyStateMu.Lock()
+	m.standbyStateValue = s
+	m.standbyStateMu.Unlock()
+	m.standbyState.Set(float64(s))
+}
+
+// StandbyState returns the current enum-gauge value. Mirrors the
+// shadow-bool pattern AlertEvaluatorEnabled uses for the alert
+// evaluator (no prometheus.Gauge.Value() accessor exists); the
+// shadow is stamped on every SetStandbyState call so the read
+// path doesn't scrape /metrics. Used by cmd/gatewayd-public
+// startup assertions (the gauge MUST be 1 on boot — see
+// pkg/wire/metrics_test.go).
+func (m *OpsMetrics) StandbyState() int {
+	m.standbyStateMu.Lock()
+	defer m.standbyStateMu.Unlock()
+	return m.standbyStateValue
+}
+
+// DeadNodeReconcileDecisions returns the labelled counter for the
+// dead-node billing reconciler. Called from
+// Engine.ReconcileDeadNodeInstances once per RUNNING row whose owning
+// compute_node stopped heartbeating past the staleness window.
+// outcome ∈ {failed, conflict, error}. Same caching rules as
+// MigratingReconcileDecisions.
+func (m *OpsMetrics) DeadNodeReconcileDecisions(outcome string) prometheus.Counter {
+	return m.deadNodeReconcileDecisions.WithLabelValues(outcome)
 }
 
 // EventsWriteFailures returns the unlabelled counter for audit-log

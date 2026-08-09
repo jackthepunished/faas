@@ -14,6 +14,26 @@ Deploys the non-KVM parts of the platform on a standalone Cloud VM (GCP, Digital
 | `githubd` | `127.0.0.1:8083` + socket | GitHub App OAuth, webhooks |
 | Postgres 15/16 | Unix socket | Database |
 
+## Base staging layout (imaged)
+
+`imaged` stages function runtime bases on first start. The controller
+(`deployctl`) creates and cleans two staging roots before each deploy:
+
+- `/srv/fc/base-staging` — **disk-backed** full OCI layer extraction
+  (`FAAS_BASE_EXTRACT_ROOT`). The unpacked tree can be gigabytes (a Go
+  toolchain base is ~850 MB); it must NOT live on the 2 GiB `/dev/shm`
+  tmpfs or imaged crash-loops with `no space left on device`.
+- `/dev/shm/faas-base-staging` — **tmpfs** staging for the parent-ref
+  overlay upper/work dirs (`FAAS_BASE_STAGING_ROOT`). The kernel
+  rejects overlay mounts whose upper fs doesn't support `tmpfile`, and
+  host `/tmp` is ext4, so this one stays on tmpfs (ADR-053).
+
+`deployctl`'s `Preflight`/`Activate` also ensures `/srv/fc/scans`
+exists (base scan sidecars) and the CD workflow provisions the
+checksum-pinned `grype`/`syft` binaries into `/usr/local/bin` — imaged
+fails-closed (`CRITICAL=9999`) when they're missing, which makes vmmd
+refuse every boot.
+
 ## Quick start
 
 ### 1. Create a VM / Droplet

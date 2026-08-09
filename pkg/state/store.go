@@ -13,6 +13,29 @@ import (
 // ErrNotFound is returned by Store reads when a row does not exist.
 var ErrNotFound = errors.New("state: not found")
 
+// ErrInvalidTrafficPercent is returned by UpdateDeploymentTraffic
+// (and the create-deployment range-check backstop) when the
+// requested traffic_percent falls outside [0, 100]. The CHECK
+// constraint on deployments.traffic_percent (migration 00160) is
+// the schema-layer guard; this sentinel surfaces the same range
+// violation when the store is the one running the backstop
+// (UpdateDeploymentTraffic holds the FOR UPDATE lock — the handler
+// already validated the request before this method ran, but the
+// store validates again as defence in depth). Translated at the
+// handler boundary to api.ErrInvalidTrafficPercent (422) so the
+// HTTP response uses the canonical RFC 7807 code.
+var ErrInvalidTrafficPercent = errors.New("state: invalid traffic_percent")
+
+// ErrTrafficPercentSumInvalid is the defensive backstop returned by
+// UpdateDeploymentTraffic when the post-write Σ invariant check
+// trips. Structurally unreachable with PR-A's "zero siblings"
+// rebalance form (Σ = newPercent + 0 = 100 by construction), but
+// pinned in the test suite as a tripwire against future refactors
+// (PR-C's proportional redistribution, for example, must still
+// satisfy Σ = 100). Translated at the handler boundary to
+// api.ErrTrafficPercentSumInvalid (409 Conflict).
+var ErrTrafficPercentSumInvalid = errors.New("state: traffic_percent sum != 100")
+
 // ErrQuotaExceeded is returned by CreateAppIfUnderQuota when the
 // account already holds limits.DeployedApps live apps. The error wraps
 // the observed count so apid can include it in the 403 envelope via
@@ -405,6 +428,24 @@ type Store interface {
 	// after DeleteAccount succeeds so the delete row in the ledger
 	// carries the actual hard-delete timestamp.
 	CompleteGdprRequest(ctx context.Context, accountID, action string) error
+	// CountGdprRequestsSince returns how many ledger rows for
+	// (account_id, action) have requested_at >= since. Backed by an
+	// index-only count on gdpr_requests so the rate-limit check on
+	// GET /v1/account/export (PR-5.1 / issue #755) is O(log n) even
+	// for accounts with long export histories. Used to enforce the
+	// 24h export rate limit — the caller decides the policy window.
+	CountGdprRequestsSince(ctx context.Context, accountID, action string, since time.Time) (int, error)
+	// FindGdprRequestByRequestID returns the most recent ledger row
+	// for (account_id, request_id) when one exists, or
+	// (GdprRequest{}, ErrNotFound) otherwise. Used by the export
+	// handler (PR-5.2 / issue #755) to make X-Request-Id retries
+	// idempotent — the second call returns the original ledger row
+	// (and the handler can re-build the bundle from the same data
+	// sources without a fresh DB scan, or short-circuit to the
+	// cached bundle if one is available). The account_id predicate
+	// is load-bearing: an attacker who learns a request id cannot
+	// probe another account's history.
+	FindGdprRequestByRequestID(ctx context.Context, accountID, requestID string) (GdprRequest, error)
 	ListBuildsForAccount(ctx context.Context, accountID string) ([]Build, error)
 	ListCronsForAccount(ctx context.Context, accountID string) ([]Cron, error)
 	// UsageByAccount aggregates every per-minute usage_minutes row that
@@ -1328,6 +1369,14 @@ type Store interface {
 	// successful deploy (an app always has a live snapshot OR a cold-bootable
 	// rootfs — never neither, invariant §6.2-3).
 	LiveDeployment(ctx context.Context, appID string) (Deployment, error)
+	// LiveDeployments (issue #556 / PR-B) returns every live row
+	// for the app, ordered created_at DESC. Empty slice (nil, nil)
+	// when the app has no live deployments — the gateway's
+	// per-deployment weighted picker treats that as "no live
+	// deployment, 503". Backed by the partial index
+	// deployments_live_traffic_idx (migration 00162); MemStore
+	// iterates m.deployments filtered by status='live'.
+	LiveDeployments(ctx context.Context, appID string) ([]Deployment, error)
 	// CountLiveInstancesByDeployment returns the number of instances
 	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
 	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher
@@ -1347,6 +1396,20 @@ type Store interface {
 	// zero rows and MemStore returned all rows. NaN `offset` (= negative
 	// value) is treated as 0 by both backends.
 	ListDeploymentsForApp(ctx context.Context, appID string, limit, offset int) ([]Deployment, error)
+	// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+	// weight (issue #556 PR-A). newPercent must be in [0, 100]; the
+	// store layer validates this in addition to the schema CHECK
+	// constraint (migration 00160). PR-A semantics: zero every
+	// sibling live row (Σ = 100 by construction); PR-C may upgrade
+	// to proportional redistribution. Returns the refreshed row or
+	// ErrInvalidTrafficPercent / ErrTrafficPercentSumInvalid on
+	// invariant violations, ErrNotFound when the deployment id is
+	// unknown. The handler is responsible for the plan-gate (Pro+
+	// only, ErrPlanTrafficSplitNotAllowed) and the request-time
+	// range-check — this method holds the FOR UPDATE lock that
+	// makes the rebalance race-free against CreateDeployment.
+	UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error)
+
 	// SetDeploymentFailed is the failure-specific helper ADR-021 introduced
 	// alongside the deployments.error_code column. Status is pinned to
 	// 'failed'; code is the RFC 7807 code pkg/api.SentinelToCode lifted
@@ -1960,6 +2023,39 @@ type Store interface {
 	// parked_at. PgStore relies on migration 00016's partial index
 	// for the state predicate.
 	ListInstancesByStatesOlderThan(ctx context.Context, states []State, threshold time.Time) ([]Instance, error)
+	// ListRunningInstancesOnDeadNodes returns RUNNING instances whose
+	// owning compute_node is no longer alive — either active = false
+	// (schedd's heartbeat sweep already flipped it) or
+	// last_heartbeat_at older than threshold (the flip has not landed
+	// yet, e.g. the schedd that owns the heartbeat loop restarted).
+	//
+	// Why this exists: MarkComputeNodeInactive only writes
+	// compute_nodes; it deliberately leaves instances untouched. A
+	// vmmd that dies without transitioning its rows therefore leaves
+	// them in RUNNING forever, and meterd bills on
+	// State.CountsForRAM() with no node-liveness cross-check — so the
+	// customer pays for a VM that no longer exists. This is the input
+	// set for Engine.ReconcileDeadNodeInstances.
+	//
+	// Both liveness predicates are required: checking only active
+	// misses the window before the heartbeat sweep runs, and checking
+	// only last_heartbeat_at misses a node an operator drained by
+	// hand. Rows are returned oldest-heartbeat-first so a capped tick
+	// drains the worst offenders first.
+	ListRunningInstancesOnDeadNodes(ctx context.Context, threshold time.Time, limit int) ([]Instance, error)
+	// FailRunningInstanceOnDeadNode transitions a RUNNING instance to
+	// FAILED, stamping terminal_at, when its owning node is gone.
+	// FAILED is excluded from State.CountsForRAM(), so this is what
+	// stops meterd billing for a VM that no longer exists; it also
+	// frees the row from the §6.2-2 RAM ceiling.
+	//
+	// Implementations MUST make the write conditional on both
+	// `state = 'running'` and the supplied nodeID, and MUST return
+	// ErrConflict (not an error) when no row matches — that is the
+	// benign "a peer got there first / the node recovered" path. The
+	// nodeID predicate prevents a stale read from failing an instance
+	// that has since migrated to a healthy node.
+	FailRunningInstanceOnDeadNode(ctx context.Context, instanceID, nodeID string) error
 	// ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
 	// lookup (PR #74). Returns rows currently in any of the given states
 	// (today: {STOPPED, FAILED}) whose terminal_at is strictly older than
@@ -2105,7 +2201,7 @@ type Store interface {
 	// the upsert path doesn't currently fail.
 	UpsertComputeNode(ctx context.Context, node ComputeNode) (ComputeNode, error)
 	// UpsertNodeKey inserts or updates a (compute_node_id, key_id)
-	// row in compute_node_keys (ADR-053 / migration 00075). vmmd's
+	// row in compute_node_keys (ADR-053 / migration 00076). vmmd's
 	// self-registration calls this on startup once it has loaded
 	// its node signing key (cmd/vmmd/main.go::loadNodeSigningKey)
 	// and computed the key_id (the SHA-256 hex of the
@@ -2196,6 +2292,31 @@ type Store interface {
 	// the customer-facing timeline endpoint can chain the two
 	// queries under the same cursor.
 	ListEventsBySidecar(ctx context.Context, sidecarName string, since time.Time, limit int) ([]Event, error)
+
+	// InsertAuditLog (issue #755 / PR-6) writes one row to the
+	// FK-free audit_log table (migrations/00163_audit_log.sql).
+	// Append-only by spec: there is no UpdateAuditLog / DeleteAuditLog
+	// pair, and the table has no UPDATE / DELETE permission in
+	// production. The pgstore implementation runs the insert
+	// through pgx.Tx when called from inside DeleteAccount (so the
+	// audit row rides the same tx as the accounts row delete) and
+	// through the pool when called standalone.
+	//
+	// The memstore mirrors the shape so handler tests can exercise
+	// the read path without spinning Postgres.
+	InsertAuditLog(ctx context.Context, entry AuditLog) error
+
+	// ListAuditLog (issue #755 / PR-6) is the dashboard read path
+	// for the audit_log table. The filter struct drives every
+	// WHERE clause; no string-built queries (matches the repo
+	// convention enforced by the sqlc-check CI gate). Order is
+	// (received_at DESC, id DESC) so the result is stable across
+	// ties and honors the audit_log_received_at_idx.
+	//
+	// The customer-scoped handler pins AccountID to the calling
+	// account's ID; the operator endpoint leaves AccountID nil and
+	// passes IncludeAnonymous=true when ?include_anonymous=true.
+	ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]AuditLog, error)
 	// DeploymentSidecarRAMs (issue #463 / ADR-070 / PR-C) returns
 	// the per-deployment sidecar RAM slice from the jsonb column.
 	// Empty/nil when the deployment has no sidecars — matching the

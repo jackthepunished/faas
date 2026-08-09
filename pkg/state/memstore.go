@@ -171,6 +171,13 @@ type MemStore struct {
 	deploymentSidecarLayers map[string]DeploymentSidecarLayer
 	snapshots               []Snapshot
 	events                  []Event
+	// auditLog (issue #755 / PR-6) is the in-memory mirror of the
+	// pgstore.audit_log table. Append-only by spec — MemStore has no
+	// UpdateAuditLog / DeleteAuditLog pair. The DeleteAccount path
+	// appends one account.deleted row inside the same critical
+	// section that drops the accounts row, mirroring the PG
+	// atomicity contract.
+	auditLog []AuditLog
 	// usage holds one row per (instance, minute) — mirrors PgStore's
 	// usage_minutes PK. Aggregated into `usageByMonth` (per app, per
 	// calendar month) so UsageByMonth can keep returning the spec §10
@@ -278,7 +285,7 @@ type MemStore struct {
 	// (PgStore) gets the same row from migrations/00024_compute_nodes.
 	computeNodes map[string]ComputeNode
 	// computeNodeKeys is the in-memory mirror of compute_node_keys
-	// (migration 00075, ADR-053). Keyed by (nodeID, keyID) tuple
+	// (migration 00076, ADR-053). Keyed by (nodeID, keyID) tuple
 	// joined by a NUL so the composite key stays string-typed for
 	// map lookup; the value is the canonical public_key_pem string.
 	// Tests that don't pre-seed this map have empty key registries
@@ -545,7 +552,7 @@ func NewMemStore() *MemStore {
 		// inserts the synthetic default-local row below.
 		computeNodes: map[string]ComputeNode{},
 		// computeNodeKeys is the in-memory mirror of
-		// compute_node_keys (migration 00075). Empty by default
+		// compute_node_keys (migration 00076). Empty by default
 		// — vmmd's self-registration populates it via
 		// UpsertNodeKey. Tests that exercise the slice-3
 		// signature path inject rows by calling the method
@@ -2184,6 +2191,85 @@ func (m *MemStore) UpdateDeploymentMinInstances(_ context.Context, id string, mi
 	return d, nil
 }
 
+// UpdateDeploymentTraffic mirrors PgStore.UpdateDeploymentTraffic
+// (issue #556 PR-A). The "zero siblings" rebalance semantics is
+// the same as the pgstore: setting row R's traffic_percent to
+// newPercent forces every other live row in the same app to 0,
+// keeping Σ = 100 by construction. The MemStore version runs under
+// m.mu so a concurrent CreateDeployment / UpdateDeploymentTraffic
+// call serialises behind us — same race-free contract the
+// pgstore's FOR UPDATE provides.
+//
+// Range-check matches pgstore (handler already validates, this is
+// defence in depth). Status guard: only 'live' rows accept
+// traffic; a superseded/failed/pending row trips
+// ErrInvalidTrafficPercent. PR-C mirrors the pgstore proportional
+// redistribution (RedistributeTraffic) so both stores share the
+// largest-remainder algorithm. Σ invariant is asserted post-write.
+func (m *MemStore) UpdateDeploymentTraffic(_ context.Context, id string, newPercent int) (Deployment, error) {
+	if newPercent < 0 || newPercent > 100 {
+		return Deployment{}, ErrInvalidTrafficPercent
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	d, ok := m.deployments[id]
+	if !ok {
+		return Deployment{}, ErrNotFound
+	}
+	if d.Status != DeployLive {
+		return Deployment{}, ErrInvalidTrafficPercent
+	}
+
+	// Stamp target first; sibling weights collected for redistribution.
+	d.TrafficPercent = newPercent
+	m.deployments[id] = d
+	appID := d.AppID
+
+	// Collect siblings (id-ordered for stable tie-break).
+	type sibling struct {
+		ID    string
+		Prior int
+	}
+	var siblings []sibling
+	for otherID, other := range m.deployments {
+		if other.AppID != appID || other.Status != DeployLive || otherID == id {
+			continue
+		}
+		siblings = append(siblings, sibling{ID: otherID, Prior: other.TrafficPercent})
+	}
+	// Stable order: ID ASC. Siblings map iteration is non-deterministic
+	// so we sort explicitly.
+	sort.SliceStable(siblings, func(a, b int) bool { return siblings[a].ID < siblings[b].ID })
+
+	helperSiblings := make([]struct {
+		ID    string
+		Prior int
+	}, len(siblings))
+	for i, s := range siblings {
+		helperSiblings[i].ID = s.ID
+		helperSiblings[i].Prior = s.Prior
+	}
+	newWeights := RedistributeTraffic(helperSiblings, 100-newPercent)
+	for i, s := range siblings {
+		other := m.deployments[s.ID]
+		other.TrafficPercent = newWeights[i]
+		m.deployments[s.ID] = other
+	}
+
+	// Σ invariant (defensive tripwire).
+	var sum int
+	for _, row := range m.deployments {
+		if row.AppID == appID && row.Status == DeployLive {
+			sum += row.TrafficPercent
+		}
+	}
+	if sum != 100 {
+		return Deployment{}, ErrTrafficPercentSumInvalid
+	}
+	return d, nil
+}
+
 // ListInstancesByNodeID mirrors pkg/state/pgstore.go:875. Same
 // in-process predicate; for the in-memory store this is a linear
 // scan over m.instances — fine for tests + the e2e harness.
@@ -2568,6 +2654,86 @@ func (m *MemStore) AbortMigratingInstance(_ context.Context, instanceID, leaseTo
 	}
 	ins.State = string(StateParked)
 	ins.LeaseToken = ""
+	m.instances[instanceID] = ins
+	return nil
+}
+
+// ListRunningInstancesOnDeadNodes mirrors the PgStore join: RUNNING
+// rows whose node is inactive OR whose last heartbeat predates the
+// threshold. Sorted oldest-heartbeat-first so the capped tick drains
+// the longest-dead nodes first, matching the SQL ORDER BY. A row whose
+// node_id has no compute_nodes entry is treated as dead — the owner is
+// unknowable, so it cannot be confirmed alive.
+func (m *MemStore) ListRunningInstancesOnDeadNodes(_ context.Context, threshold time.Time, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: limit must be > 0, got %d", limit)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type scored struct {
+		ins Instance
+		hb  time.Time
+	}
+	var hits []scored
+	for _, ins := range m.instances {
+		if ins.State != string(StateRunning) {
+			continue
+		}
+		node, ok := m.computeNodes[ins.NodeID]
+		if ok && node.Active && !node.LastHeartbeatAt.Before(threshold) {
+			continue
+		}
+		hits = append(hits, scored{ins: ins, hb: node.LastHeartbeatAt})
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].hb.Equal(hits[j].hb) {
+			// Stable tie-break so a capped tick is deterministic
+			// across runs (map iteration order is not).
+			return hits[i].ins.ID < hits[j].ins.ID
+		}
+		return hits[i].hb.Before(hits[j].hb)
+	})
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	out := make([]Instance, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.ins)
+	}
+	return out, nil
+}
+
+// FailRunningInstanceOnDeadNode mirrors the PgStore conditional
+// UPDATE: the transition only lands when the row is still RUNNING and
+// still owned by the node the caller observed as dead. A row that
+// has vanished between the input-set query and this call returns
+// ErrConflict — the same outcome PgStore surfaces via
+// RowsAffected()==0. The reconciler's caller treats ErrConflict as
+// a peer-wins no-op, so a transient GC (retention sweep, manual
+// operator delete, future multi-host park path) is counted the same
+// way as "node recovered" rather than as outcome=error. ErrNotFound
+// is reserved for explicit precondition violations (the caller
+// passed an instanceID the store has never heard of) — that signal
+// is too loud to use as a silent "the row disappeared" handler.
+func (m *MemStore) FailRunningInstanceOnDeadNode(_ context.Context, instanceID, nodeID string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty instanceID")
+	}
+	if nodeID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty nodeID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ins, ok := m.instances[instanceID]
+	if !ok {
+		return ErrConflict
+	}
+	if ins.State != string(StateRunning) || ins.NodeID != nodeID {
+		return ErrConflict
+	}
+	ins.State = string(StateFailed)
+	now := m.clock()
+	ins.TerminalAt = &now
 	m.instances[instanceID] = ins
 	return nil
 }
@@ -3165,8 +3331,15 @@ func (m *MemStore) CreateDeployment(_ context.Context, d Deployment) (Deployment
 		// Match PgStore exactly: mutate the stored prior in-place so
 		// subsequent LatestDeployment / DeploymentByID readers see
 		// the supersede immediately, under m.mu.
+		//
+		// Issue #556 PR-A: zero the prior row's traffic_percent so
+		// Σ over live rows remains 100 by construction. The new row
+		// is stamped at d.TrafficPercent below (handler defaults to
+		// 100 when the caller omits the optional pointer). Mirrors
+		// the pgstore's two-field SET in CreateDeployment.
 		prior := m.deployments[priorID]
 		prior.Status = DeploySuperseded
+		prior.TrafficPercent = 0
 		m.deployments[priorID] = prior
 	}
 
@@ -3181,6 +3354,16 @@ func (m *MemStore) CreateDeployment(_ context.Context, d Deployment) (Deployment
 	}
 	if d.Kind == "" {
 		d.Kind = DeploymentKindImage
+	}
+	// Issue #556 PR-A: default traffic_percent to 100 when caller
+	// supplies zero. The schema's NOT NULL DEFAULT 100 covers the
+	// SQL write path; mirroring here keeps the in-memory shape
+	// aligned so unit tests that exercise the store don't need
+	// Postgres. PR-A semantics: traffic_percent on a fresh deploy
+	// is 100; on supersede it's 0 (set above); PR-C may add
+	// proportional forms.
+	if d.TrafficPercent == 0 {
+		d.TrafficPercent = 100
 	}
 	m.deployments[d.ID] = d
 	return d, nil
@@ -3226,6 +3409,31 @@ func (m *MemStore) LiveDeployment(_ context.Context, appID string) (Deployment, 
 		return Deployment{}, ErrNotFound
 	}
 	return latest, nil
+}
+
+// LiveDeployments (issue #556 / PR-B) mirrors the Postgres
+// plural query in pkg/state/pgstore.go — returns every row where
+// app_id=$1 AND status='live', ordered created_at DESC. Returns
+// (nil, nil) when the app has no live rows so the test seam
+// stays nil-vs-empty consistent with scanDeployments' empty-set
+// shape (MemStore callers don't have to special-case an empty
+// slice vs. an error).
+func (m *MemStore) LiveDeployments(_ context.Context, appID string) ([]Deployment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Deployment
+	for _, d := range m.deployments {
+		if d.AppID != appID || d.Status != DeployLive {
+			continue
+		}
+		out = append(out, d)
+	}
+	// Sort created_at DESC for parity with PgStore (it costs O(n log n)
+	// but the set is tiny — ≤ a handful of live deployments per app).
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
 }
 
 // CountLiveInstancesByDeployment mirrors PgStore.CountLiveInstancesByDeployment
@@ -5671,7 +5879,7 @@ func (m *MemStore) UpsertComputeNode(_ context.Context, node ComputeNode) (Compu
 }
 
 // UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
-// in the in-memory mirror of compute_node_keys (migration 00075,
+// in the in-memory mirror of compute_node_keys (migration 00076,
 // ADR-053). Mirrors PgStore.UpsertNodeKey's ON CONFLICT DO NOTHING
 // semantics: a re-insert of the same (nodeID, keyID) is a no-op
 // (the existing public_key_pem is preserved). See
@@ -5870,6 +6078,91 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 		// && false made this branch dead; tests caught it.
 		if subj == nil || (e.Subject != nil && *e.Subject == *subj) {
 			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// InsertAuditLog (issue #755 / PR-6) appends one row to the in-memory
+// audit_log mirror. The Data json.RawMessage is copied so a caller
+// can reuse the input slice without aliasing the stored row. The
+// append is guarded by m.mu (the rest of the audit_log surface is
+// read-also-mu-guarded). When called from inside DeleteAccount
+// (critical section already held by DeleteAccount itself) the
+// mu.Lock here is a recursive re-entry — Go's sync.Mutex is
+// non-reentrant, so DeleteAccount calls the inner appendAuditLog
+// helper that does NOT re-lock. Standalone callers (handlers,
+// tests) go through this method and pay the lock normally.
+func (m *MemStore) InsertAuditLog(_ context.Context, entry AuditLog) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.appendAuditLogLocked(entry)
+	return nil
+}
+
+// appendAuditLogLocked is the mu-held-critical-section variant of
+// InsertAuditLog. Caller must hold m.mu. DeleteAccount calls this
+// directly so it can stay inside its own critical section without
+// deadlocking on a re-entry.
+func (m *MemStore) appendAuditLogLocked(entry AuditLog) {
+	var dataCopy json.RawMessage
+	if len(entry.Data) > 0 {
+		dataCopy = append(json.RawMessage(nil), entry.Data...)
+	}
+	m.auditLog = append(m.auditLog, AuditLog{
+		ID:           entry.ID,
+		Kind:         entry.Kind,
+		AccountID:    entry.AccountID,
+		AccountEmail: entry.AccountEmail,
+		Actor:        entry.Actor,
+		ReceivedAt:   entry.ReceivedAt,
+		Data:         dataCopy,
+	})
+}
+
+// ListAuditLog (issue #755 / PR-6) is the dashboard read path. Walks
+// m.auditLog in reverse (newest-first) and applies the same WHERE
+// semantics as pgstore.ListAuditLog: AccountID is "match-or-null",
+// KindPrefix is a LIKE prefix match, Since is an inclusive lower
+// bound on ReceivedAt, IncludeAnonymous gates the AccountID-is-nil
+// rows. Limit defaults to 100 when zero / negative.
+//
+// Returned slice is a fresh copy of each AuditLog row (Data
+// included) so a caller can hold it past the next store mutation.
+func (m *MemStore) ListAuditLog(_ context.Context, filter AuditLogFilter) ([]AuditLog, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	var out []AuditLog
+	for i := len(m.auditLog) - 1; i >= 0; i-- {
+		row := m.auditLog[i]
+		if filter.AccountID != nil {
+			if row.AccountID == nil || *row.AccountID != *filter.AccountID {
+				continue
+			}
+		}
+		if filter.KindPrefix != "" && !strings.HasPrefix(row.Kind, filter.KindPrefix) {
+			continue
+		}
+		if !filter.Since.IsZero() && row.ReceivedAt.Before(filter.Since) {
+			continue
+		}
+		if !filter.IncludeAnonymous && row.AccountID == nil {
+			continue
+		}
+		// Defensive copy so the caller's slice doesn't alias the
+		// in-memory store row.
+		clone := row
+		if len(row.Data) > 0 {
+			clone.Data = append(json.RawMessage(nil), row.Data...)
+		}
+		out = append(out, clone)
+		if len(out) >= limit {
+			break
 		}
 	}
 	return out, nil
@@ -7955,6 +8248,41 @@ func (m *MemStore) DeleteAccount(_ context.Context, id string) error {
 		keptEvents = append(keptEvents, e)
 	}
 	m.events = keptEvents
+
+	// audit_log backfill (issue #755 / PR-6). Appends one
+	// account.deleted row to the in-memory audit_log mirror so the
+	// memstore surface mirrors the pgstore atomicity contract: the
+	// audit row is recorded at the moment of deletion and outlives
+	// the accounts row. Placement: AFTER the events cascade (the
+	// events table is the per-event trail that gets erased under
+	// GDPR) and BEFORE the parent delete(m.accounts, id).
+	//
+	// Uses appendAuditLogLocked directly (NOT InsertAuditLog) because
+	// DeleteAccount already holds m.mu — sync.Mutex is non-reentrant,
+	// so calling the locked InsertAuditLog would deadlock.
+	auditPayload, mErr := json.Marshal(map[string]string{
+		"source": "grace-sweep",
+		"email":  a.Email,
+		"actor":  "grace-sweep",
+	})
+	if mErr != nil {
+		return fmt.Errorf("memstore: marshal audit_log payload for %s: %w", id, mErr)
+	}
+	var auditAccountID *uuid.UUID
+	if idUUID != uuid.Nil {
+		idCopy := idUUID
+		auditAccountID = &idCopy
+	}
+	m.appendAuditLogLocked(AuditLog{
+		ID:           uuid.New(),
+		Kind:         AuditLogKindAccountDeleted,
+		AccountID:    auditAccountID,
+		AccountEmail: a.Email,
+		Actor:        "grace-sweep",
+		ReceivedAt:   time.Now().UTC(),
+		Data:         auditPayload,
+	})
+
 	delete(m.accounts, id)
 	return nil
 }
@@ -8514,6 +8842,74 @@ func (m *MemStore) CompleteGdprRequest(_ context.Context, accountID, action stri
 		}
 	}
 	return ErrNotFound
+}
+
+// CountGdprRequestsSince mirrors PgStore.CountGdprRequestsSince for
+// the in-memory implementation. PR-5.1 / issue #755 — the rate-limit
+// probe on GET /v1/account/export. Locks once, scans the slice
+// backwards so the most-recent row is checked first (an account
+// that has exported today will hit the limit faster than walking
+// the slice in order).
+func (m *MemStore) CountGdprRequestsSince(_ context.Context, accountID, action string, since time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sinceUTC := since.UTC()
+	n := 0
+	for i := len(m.gdprRequests) - 1; i >= 0; i-- {
+		r := &m.gdprRequests[i]
+		if r.AccountID != accountID || r.Action != GdprAction(action) {
+			continue
+		}
+		if r.RequestedAt.Before(sinceUTC) {
+			// Slice is requested_at-ascending (AppendGdprRequest
+			// pushes to the tail), so anything older than since
+			// can be skipped wholesale — early exit.
+			break
+		}
+		n++
+	}
+	return n, nil
+}
+
+// FindGdprRequestByRequestID mirrors PgStore.FindGdprRequestByRequestID
+// for the in-memory implementation. PR-5.2 / issue #755 — the
+// idempotency probe for X-Request-Id retries on GET /v1/account/export.
+// Walks the slice backwards so the most-recent row (the one we want to
+// honor for a retry) is checked first. Empty requestID is a no-op
+// that returns ErrNotFound, matching PgStore.
+func (m *MemStore) FindGdprRequestByRequestID(_ context.Context, accountID, requestID string) (GdprRequest, error) {
+	if requestID == "" {
+		return GdprRequest{}, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.gdprRequests) - 1; i >= 0; i-- {
+		r := &m.gdprRequests[i]
+		if r.AccountID == accountID && r.RequestID == requestID {
+			return *r, nil
+		}
+	}
+	return GdprRequest{}, ErrNotFound
+}
+
+// BackdateGdprRequestsForTest rewrites the requested_at on every
+// ledger row matching (account_id, action) to the supplied anchor.
+// Test-only seam for the rate-limit roll-forward test
+// (cmd/apid/handlers_account_test.go::TestExportAccount_RateLimit_AllowsAfter24h)
+// — production code MUST NOT call this; the GDPR ledger is append-
+// only and timestamping edits would defeat the audit-trail purpose.
+// Lives on MemStore so the apid-side test can drive a 24h+ window
+// in microseconds without sleeping.
+func (m *MemStore) BackdateGdprRequestsForTest(_ context.Context, accountID string, action GdprAction, when time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	whenUTC := when.UTC()
+	for i := range m.gdprRequests {
+		r := &m.gdprRequests[i]
+		if r.AccountID == accountID && r.Action == action {
+			r.RequestedAt = whenUTC
+		}
+	}
 }
 
 // LoadAndStampLastQuotaWarning mirrors PgStore.LoadAndStampLastQuotaWarning

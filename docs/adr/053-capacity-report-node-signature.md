@@ -1,6 +1,8 @@
 # ADR-053 · `node_signature` on `CapacityReport`
 
-- **Status:** proposed
+- **Status:** accepted v1.0 (2026-08-09). All code, schema, and tests landed
+  on the slice-3 path; this flip retires ADR-025 v1.1's "Tier 1 Phase 2
+  (`node_signature` on `CapacityReport`)" pre-requisite.
 - **Date:** 2026-07-31
 - **Issue:** #95 slice 3 (multi-box rollout, Tier 1 Phase 2)
 - **Decision:** Ship the cryptographic trust layer for `CapacityReport`.
@@ -44,7 +46,7 @@
      vmmd refuses to start — mirroring the same fail-fast posture as
      `pkg/cosign.NewLocalSigner` and `pkg/secretbox.LoadHostKey`. The
      public half is published to schedd via a new `compute_node_keys`
-     table (migration 00075): `(compute_node_id uuid NOT NULL,
+     table (migration 00076): `(compute_node_id uuid NOT NULL,
      key_id text NOT NULL, public_key_pem text NOT NULL,
      created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY
      (compute_node_id, key_id))`. vmmd registers its own row on

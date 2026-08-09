@@ -1,0 +1,141 @@
+# faas-metal-2node-ha — Tier A8 (ADR-083) active-passive HA fleet
+# (issue #297 slice 6 / §14 M8 row "Gate-A runbook (2nd box
+# active-passive)").
+#
+# WHY: Tier A8 acceptance is the active-passive failover drill.
+# A single-node faas-metal.yaml is insufficient because the
+# DNSHandoff orchestrator only fires on `compute_node_changed`
+# pg_notify events — which require TWO compute_nodes rows in
+# pg's `compute_nodes` table. The 2node-b (Tier A5) guest
+# provisions two compute nodes too, but the test surface there
+# is the four-phase handoff; for Tier A8 we need a clean
+# fleet shape (two nodes, one leader per election cycle,
+# `gatewayd-public` running on both) so the
+# deploy/lima/run-ha-failover.sh drill can run end-to-end
+# without colliding with the Tier A5 migration test.
+#
+# Usage:
+#   limactl start deploy/lima/faas-metal-2node-ha.yaml --name faas-ha-a
+#   limactl start deploy/lima/faas-metal-2node-ha.yaml --name faas-ha-b
+#   # In each guest, set FAAS_NODE_NAME=node-a / node-b so the
+#   # schedd registers as a distinct compute_node. Both run a
+#   # local Postgres; the drill uses FAAS_DNS_PROVIDER=manual
+#   # so no external DNS calls happen (the manual provider
+#   # prints the curl to stderr).
+#   # Then run:
+#   #   deploy/lima/run-ha-failover.sh
+#   # Asserts node-a drains, node-b picks up leadership, the
+#   # standby_state gauge transitions land on Drained (4) and
+#   # Warm (2) respectively. Exits 0 on success.
+#
+# CAVEAT (do not forget): same as faas-metal.yaml — arm64 Lima
+# guests, NOT production x86_64. The bare-metal x86_64
+# control-plane node remains the source of truth for §14 M8
+# acceptance. A green drill here validates the arch-agnostic
+# active-passive flip logic, not the x86_64 production
+# topology.
+
+vmType: vz
+arch: aarch64
+nestedVirtualization: true
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+
+mounts:
+  - location: "~"
+    writable: true
+
+probes:
+  - description: "nested KVM present (/dev/kvm)"
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 60s bash -c "until test -e /dev/kvm; do sleep 2; done"; then
+        echo >&2 "/dev/kvm never appeared — nested virtualization was not granted."
+        exit 1
+      fi
+    hint: |
+      /dev/kvm is missing. Requires Apple Silicon M3+ / macOS 15+.
+
+# Minimal provisioner — Tier A8 doesn't need /dev/kvm (no
+# Firecracker boot path; gatewayd-public is plain HTTP behind
+# Caddy + Cloudflare, the failover flip is a DNS A-record
+# change, not a VM migration). The probe stays so the lima
+# instance shape matches faas-metal-2node-b for fleet
+# consistency — Tier A5 + Tier A8 drills share the same
+# guest OS.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      apt_wait() {
+        local deadline=$((SECONDS + 60))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+              && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
+            return 0
+          fi
+          sleep 1
+        done
+        echo "apt_wait: dpkg lock still held after 60s" >&2
+        return 1
+      }
+
+      export DEBIAN_FRONTEND=noninteractive
+      apt_wait
+      apt-get update -y
+      apt_wait
+      apt-get install -y --no-install-recommends \
+        build-essential e2fsprogs iproute2 iptables nftables git curl ca-certificates \
+        busybox-static jq postgresql
+
+      # Tier A8 only needs the gatewayd user accounts — apid,
+      # schedd, vmmd aren't required for the failover drill
+      # (the drill exercises DNS flip + standby warmup, not
+      # app wakes). vmmd account is still required because
+      # /etc/faas/secrets is vmmd-owned (FAAS_HOST_KEY_PATH
+      # convention — see cmd/gatewayd-internal/run.go:395).
+      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+        if ! id -u "$u" >/dev/null 2>&1; then
+          useradd -r -M -s /usr/sbin/nologin "$u"
+        fi
+      done
+      groupadd -f faas || true
+      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+        usermod -aG faas "$u" 2>/dev/null || true
+      done
+      install -d -m 0755 -o root -g root /etc/faas
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/base
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/jail
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/snap
+      install -d -m 0755 -o faas-vmmd -g faas /srv/fc/layers
+
+      install -d -m 0755 -o postgres -g postgres /var/run/postgresql
+      ln -sfn /var/run/postgresql /run/postgresql
+      cat >/etc/postgresql/16/main/pg_hba.conf <<EOF
+      local all all trust
+      host all all 127.0.0.1/32 trust
+      host all all ::1/128 trust
+      EOF
+      pg_ctlcluster 16 main start || true
+      sleep 1
+      pg_ctlcluster 16 main reload || true
+      sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='faas'" \
+        | grep -q 1 || sudo -u postgres psql -c "CREATE ROLE faas LOGIN SUPERUSER"
+      sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='faas'" \
+        | grep -q 1 || sudo -u postgres createdb faas
+      sudo -u postgres psql -c "GRANT ALL ON DATABASE faas TO faas" || true
+
+      groupadd -f kvm || true
+      DEFAULT_USER="$(getent passwd | awk -F: '$3>=500 && $3<65000 && $7 ~ /(bash|zsh|sh)$/ {print $1; exit}')"
+      DEFAULT_USER="${DEFAULT_USER:-poyrazk}"
+      DEFAULT_USER="${DEFAULT_USER:-ubuntu}"
+      usermod -aG kvm "${DEFAULT_USER}" || true

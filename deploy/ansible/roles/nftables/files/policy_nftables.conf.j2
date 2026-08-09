@@ -62,5 +62,8 @@ table inet faas {
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr {{ masquerade_cidr }} oifname "{{ public_iface }}" masquerade
+{%- if masquerade_cidr_v6 is defined and masquerade_cidr_v6 %}
+    ip6 saddr {{ masquerade_cidr_v6 }} oifname "{{ public_iface }}" masquerade
+{%- endif %}
   }
 }

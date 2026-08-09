@@ -30,7 +30,14 @@ const (
 	subUpdate  = "update"
 	subRm      = "rm"
 	subSummary = "summary"
-	subInfo    = "info"
+	// subLogsTail is the inner-subcommand name for `gregale logs
+	// tail <slug>` (issue #315 / tier-2 DX). Lifted from the
+	// inline literal at commands2.go:1719 + main.go:252 so goconst
+	// stops flagging the three occurrences (two source +
+	// PrintUsage doc line).
+	subLogsTail = "tail"
+	subInfo     = "info"
+	subGet      = "get"
 
 	statusPending  = "pending"
 	statusVerified = "verified"
@@ -65,6 +72,12 @@ const (
 	// terminalExitForDeployment branch.
 	statusLive = "live"
 
+	// streamEventError is the SSE event name emitted by the build
+	// log stream when the upstream closes (5xx mid-stream, network
+	// reset, etc.). Mirrors the `event:` field of the build-log
+	// endpoint; see pkg/api streaming bridge for the producer.
+	streamEventError = "error"
+
 	// cmdNames reused across the run() dispatch table (main.go) so
 	// goconst stops flagging the repeated "apps" / "status" / etc.
 	// literals. Tests intentionally keep the literal form.
@@ -79,6 +92,10 @@ const (
 	// appSlugFallback — the dispatch table places it before the
 	// "app" case so `gregale deployment <id>` is never read as an app slug.
 	dispatchDeployment = "deployment"
+
+	// Plural orgs list. Mirrors dispatchApps shape; user runs
+	// `gregale orgs` to list accounts they belong to.
+	dispatchOrgs = "orgs"
 )
 
 // cmdApp implements `gregale app <slug>` (GET /v1/apps/{slug}), `gregale app <slug>
@@ -492,6 +509,45 @@ func cmdAppsRm(args []string) int {
 // opens the dashboard's repo-picker page (slice 8) where the customer binds
 // the repo + branch; subsequent pushes auto-deploy via the webhook path.
 //
+// buildCreateRequest stamps the issue #737 / ADR-083 fields onto the
+// CreateAppRequest the CLI hands to apid. Two non-obvious fields:
+//
+//   - Type: shapeFunction → "function", else "" (apid treats empty
+//     as "app"). Without this, apid stores the row as type=app and
+//     the multipart validator at cmd/apid/deploy_inputs.go:144
+//     rejects the function deploy.
+//
+//   - Runtime: only set when resolvedShape == shapeFunction AND
+//     runtime is non-empty. apid's buildApp validator at
+//     cmd/apid/handlers.go:98 requires Runtime to be in the function
+//     whitelist on a function-typed app; an empty Runtime trips a
+//     400 between the "Detected: function, ..." line and the
+//     multipart upload, which would silently break the headline
+//     auto-detection feature. The auto-detect path always populates
+//     runtime via inferFunctionRuntime before this is called; the
+//     explicit --function --tarball path relies on the explicit
+//     --runtime flag, with --handler defaulting to "handler.handler"
+//     (defaultTemplateHandler, commands2.go:48).
+func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *bool) api.CreateAppRequest {
+	req := api.CreateAppRequest{
+		Slug:         slug,
+		RequireAuthn: requireAuthnPtr,
+	}
+	if sh == shapeFunction {
+		req.Type = "function"
+		if runtime != "" {
+			req.Runtime = runtime
+		}
+	}
+	return req
+}
+
+// cmdDeployTarball implements `gregale deploy` (image / tarball / repo
+// / template / zero-config). Zero-config (issue #313) packs the cwd
+// and proceeds down the --tarball path. Issue #737 / ADR-083 added the
+// function-vs-app auto-detect on the zero-config path and the
+// --function / --app explicit-shape flags.
+//
 // `--template NAME` materializes one of the eleven embedded starter
 // projects (cmd/gregale/templates/embed.go) into a tempdir, tars+gzip it,
 // and proceeds down the --tarball path. For the function templates
@@ -508,6 +564,14 @@ func cmdDeployTarball(args []string) int {
 	runtime := fs.String("runtime", "", "function runtime (node22|python312|go124|go124-alpine|node24|python313)")
 	handler := fs.String("handler", "", "function handler (e.g. handler.handler)")
 	name := fs.String("name", "", "app name (default: current directory)")
+	// Issue #737 / ADR-083: explicit shape override. Without either flag
+	// the CLI auto-detects from the cwd (handler.*-only → function,
+	// otherwise app). With --function or --app, detection is skipped.
+	// Mutually exclusive — silently mixing is exactly the bug this ADR
+	// fixes. The --function path requires --runtime (or accepts the
+	// default "handler.handler" wire value if --handler is unset).
+	function := fs.Bool("function", false, "deploy as a function (single handler.* file); skips cwd auto-detection")
+	app := fs.Bool("app", false, "deploy as an app (Railpack framework); skips cwd auto-detection and clears --runtime/--handler")
 	// Phase 3 (repo decomposition) — one-key provision flags. Presence
 	// of --only or --project-slug short-circuits the existing CreateApp
 	// + DeployTarball path and routes through ScanProject →
@@ -531,7 +595,15 @@ func cmdDeployTarball(args []string) int {
 	// app <slug> --require-authn`.
 	requireAuthn := fs.Bool("require-authn", false, "require Authorization: Bearer <token> on every request (Pro/Scale only)")
 	noRequireAuthn := fs.Bool("no-require-authn", false, "drop the token requirement; back to public-by-default")
+	// Issue #556 PR-A: per-deployment traffic-split weight (Pro/Scale
+	// only). Sentinel value -1 = "unset" — `fs.Int` doesn't have a
+	// pointer type, so the explicit `fs.Visit` check below
+	// distinguishes "absent" from "explicit zero". The handler
+	// validates [0, 100] (422) and the plan gate (403) on the
+	// request path; we just thread the pointer through.
+	trafficPercent := fs.Int("traffic-percent", -1, "split weight for this deployment (0-100, Pro/Scale only; -1 = server default 100)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale deploy --image REF | --tarball PATH | --repo OWNER/NAME | --template NAME", "deploy")
 		return 1
 	}
 	// Issue #560: flag-pair mutex check (mirrors cmdApp /
@@ -540,6 +612,29 @@ func cmdDeployTarball(args []string) int {
 	if *requireAuthn && *noRequireAuthn {
 		return printErr("Invalid flags", fmt.Errorf("--require-authn and --no-require-authn are mutually exclusive"))
 	}
+	// Issue #737 / ADR-083: --function and --app are mutually exclusive.
+	// Setting both is ambiguous noise; reject before any side effects so
+	// the customer's first response from the CLI is not a silent shape
+	// pick. Mirrors the --require-authn/--no-require-authn check above.
+	if *function && *app {
+		return printErr("Invalid flags", fmt.Errorf("--function and --app are mutually exclusive"))
+	}
+	// --app clears any --runtime/--handler the customer also set. The
+	// customer intended an app deploy; passing function fields is
+	// either a typo or a leftover from a copy-paste, and silently
+	// mixing is exactly the bug this ADR fixes. We still surface the
+	// result so a confused customer can diagnose.
+	if *app && (*runtime != "" || *handler != "") {
+		PrintProgress(os.Stderr, "WARN: --app clears --runtime=%q and --handler=%q (function fields are ignored on app deploys)", *runtime, *handler)
+		*runtime = ""
+		*handler = ""
+	}
+	// --function without --runtime is allowed: the wire defaults to
+	// "handler.handler" (matches the function-* template convention at
+	// defaultTemplateHandler, line 48). What --function REQUIRES is
+	// for the customer's source to actually be a function — handled
+	// below when detectShape runs (or, for the --tarball path, when
+	// apid's function-runtime whitelist rejects it).
 	// fs.Visit distinguishes "unset" from "explicit zero": if the
 	// customer passed either --require-authn or --no-require-authn
 	// (but not both — checked above), we propagate the bool to the
@@ -556,6 +651,17 @@ func cmdDeployTarball(args []string) int {
 	case explicit["no-require-authn"]:
 		v := false
 		requireAuthnPtr = &v
+	}
+	// Issue #556 PR-A: derive the optional traffic_percent pointer.
+	// Sentinel -1 (the default value above) means "absent" — the
+	// handler will default to 100 server-side. Any explicit value
+	// (including 0) is forwarded as-is; the handler validates
+	// [0, 100] (422) and the plan gate (403) on the request path.
+	optTrafficPercent := func(v int) *int {
+		if v < 0 {
+			return nil
+		}
+		return &v
 	}
 	slug := *name
 	if slug == "" {
@@ -595,7 +701,7 @@ func cmdDeployTarball(args []string) int {
 			// Default Node runtime is node22 (per docs/runtimes/go124.md
 			// tier-1 stance: no default-flip in the same PR that adds a
 			// new runtime). Use function-node24 for the Node 24 variant.
-			*runtime = "node22"
+			*runtime = runtimeNode22
 			*handler = defaultTemplateHandler
 		case "function-node24":
 			// Tier 1 PR 1 row: parallel to function-node, runtime is
@@ -607,7 +713,7 @@ func cmdDeployTarball(args []string) int {
 		case "function-python":
 			// Default Python runtime is python312 (no default-flip in
 			// Tier 1; python313 stays opt-in via function-python313).
-			*runtime = "python312"
+			*runtime = runtimePython312
 			*handler = defaultTemplateHandler
 		case "function-python313":
 			// Tier 1 PR 1 row: parallel to function-python, runtime
@@ -621,7 +727,7 @@ func cmdDeployTarball(args []string) int {
 			// manifest locks the entrypoint to /app/handler). We set
 			// a non-empty value so the multipart writer doesn't skip
 			// the field, but the value is never read by the runtime.
-			*runtime = "go124"
+			*runtime = runtimeGo124
 			*handler = "handler.go"
 		}
 		f, err := os.CreateTemp("", "gregale-template-*.tar.gz")
@@ -652,28 +758,90 @@ func cmdDeployTarball(args []string) int {
 	// set --dockerfile when a Dockerfile is at the root. --repo returned
 	// earlier and --template already set *tarball, so reaching here with both
 	// *image and *tarball empty means the customer gave no source at all.
+	// Issue #737 / ADR-083: resolved shape from cwd auto-detection or
+	// the explicit --function/--app short-circuit. Defaults to
+	// shapeApp so a --tarball / --image / --template deploy (no cwd
+	// pack) stays on the existing app-shaped path. The CreateApp call
+	// below reads resolvedShape and sets Type="function" on the wire
+	// only when the cwd path picked function mode — explicit
+	// --function/--app outside the cwd pack also write to
+	// resolvedShape via this variable in the same branch.
+	var resolvedShape = shapeApp
+	// Issue #737 / ADR-083: explicit --function / --app on a
+	// --tarball / --template path skips the cwd detector (no cwd
+	// pack happens), but still flips resolvedShape so CreateApp
+	// sends Type="function" when the customer asked for it. Without
+	// this branch, `gregale deploy --tarball my.tgz --function` would
+	// still create an app-type app row.
+	if *function {
+		resolvedShape = shapeFunction
+		// Default the wire --handler to the function-template
+		// convention so a customer who runs `gregale deploy
+		// --tarball my.tgz --function --runtime node22` without
+		// --handler gets the same shape as
+		// `gregale --template function-node --tarball my.tgz`.
+		// Without this, apid's function validator rejects the
+		// empty handler form field with a 400.
+		if *handler == "" {
+			*handler = defaultTemplateHandler
+		}
+	} else if *app {
+		resolvedShape = shapeApp
+	}
 	if *image == "" && *tarball == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return printErr("Could not read current directory", err)
 		}
-		path, fw, n, err := autoPackCwd(cwd)
+		// Issue #737 / ADR-083: resolveDeployShape does detect +
+		// infer + print in one seam so the unit test can drive the
+		// "Detected:" line without bringing up apid. The print goes
+		// BEFORE the multipart upload so the customer's first
+		// response from the CLI is the deploy shape. An explicit
+		// --function / --app short-circuits the detector — see the
+		// mutex block above.
+		detected, rt, hnd, err := resolveDeployShape(cwd, *function, *app, jsonOutput)
 		if err != nil {
-			return printErr("Could not pack current directory", err)
+			return printErr("No deployable source found in "+filepath.Base(cwd), err)
 		}
-		defer func() { _ = os.Remove(path) }()
-		if fw == fwUnknown {
-			return printErr("No deployable source found in "+filepath.Base(cwd),
-				errors.New("expected package.json, requirements.txt / pyproject.toml / "+
-					"Pipfile / setup.py, go.mod, or Dockerfile at the project root — "+
-					"or pass --image, --tarball, --template, or --repo"))
+		switch detected {
+		case shapeFunction:
+			// An explicit --runtime / --handler on the CLI wins over
+			// the inferred value (customer may be overriding the
+			// default-extension→runtime map). The helper already
+			// printed "Detected: function, runtime=<rt>, handler=<h>"
+			// using the inferred values; the wire uses whatever is
+			// in *runtime / *handler here.
+			if *runtime == "" {
+				*runtime = rt
+			}
+			if *handler == "" {
+				*handler = hnd
+			}
+			// Pack the cwd so the multipart upload has a tarball —
+			// the function convention needs the file on the wire for
+			// imaged to stage it.
+			path, _, n, err := autoPackCwd(cwd)
+			if err != nil {
+				return printErr("Could not pack current directory", err)
+			}
+			defer func() { _ = os.Remove(path) }()
+			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+			*tarball = path
+			resolvedShape = shapeFunction
+		case shapeApp:
+			path, fw, n, err := autoPackCwd(cwd)
+			if err != nil {
+				return printErr("Could not pack current directory", err)
+			}
+			defer func() { _ = os.Remove(path) }()
+			if fw == fwDocker {
+				*dockerfile = true
+			}
+			PrintProgress(os.Stderr, "packing %d file(s) from %s", n, filepath.Base(cwd))
+			*tarball = path
+			resolvedShape = shapeApp
 		}
-		if fw == fwDocker {
-			*dockerfile = true
-		}
-		PrintProgress(os.Stderr, "detected %s project in %s, packing %d file(s)",
-			fw, filepath.Base(cwd), n)
-		*tarball = path
 	}
 
 	client, err := authedClientWithDeployTimeout(5 * time.Minute)
@@ -758,10 +926,8 @@ func cmdDeployTarball(args []string) int {
 		return 0
 	}
 
-	if _, err := client.CreateApp(ctx, api.CreateAppRequest{
-		Slug:         slug,
-		RequireAuthn: requireAuthnPtr,
-	}); err != nil {
+	createReq := buildCreateRequest(slug, resolvedShape, *runtime, requireAuthnPtr)
+	if _, err := client.CreateApp(ctx, createReq); err != nil {
 		var ae *APIError
 		if !errors.As(err, &ae) || ae.Problem.Status != 409 {
 			return printErr("Could not create app", err)
@@ -793,7 +959,7 @@ func cmdDeployTarball(args []string) int {
 		}
 		return streamDeployLogs(client, dep)
 	}
-	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{Image: *image})
+	dep, err := client.Deploy(ctx, slug, api.CreateDeploymentRequest{Image: *image, TrafficPercent: optTrafficPercent(*trafficPercent)})
 	if err != nil {
 		return printErr("Deploy failed", err)
 	}
@@ -876,9 +1042,64 @@ func cmdWake(args []string) int {
 	return 0
 }
 
+// cmdTrafficSet implements `gregale traffic set` (issue #556 PR-A).
+// The dispatch from main() splits on the sub-command name: `set`
+// lands here, future sub-commands (status, split) would route
+// alongside. The flag pair is --deployment <id> + --percent N; the
+// client.UpdateDeploymentTraffic method hits PATCH
+// /v1/deployments/{id}/traffic. The handler enforces the plan gate
+// (Pro+ only, 403) and range [0, 100] (422); the CLI just threads
+// the values through and prints the canonical "Set … → N%" OK line.
+//
+// Flag-presence check mirrors --min-instances in cmdApp / cmdAppScale:
+// absent --deployment or --percent fails loud with usage rather
+// than silently PATCHing the wrong row.
+func cmdTrafficSet(args []string) int {
+	fs := flag.NewFlagSet("traffic set", flag.ContinueOnError)
+	deployment := fs.String("deployment", "", "deployment id to set the traffic split on")
+	percent := fs.Int("percent", -1, "traffic weight in [0, 100]; -1 = unset (server default 100)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *deployment == "" || *percent < 0 {
+		PrintUsage(os.Stderr, "usage: gregale traffic set --deployment <id> --percent N", "traffic")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	dep, err := client.PatchDeploymentsIdTraffic(context.Background(), *deployment, *percent)
+	if err != nil {
+		return printErr("Traffic set failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(dep))
+	}
+	PrintOK(osStdout, "Set %s → %d%%", dep.ID, dep.TrafficPercent)
+	return 0
+}
+
+// cmdTraffic dispatches the `traffic` sub-command. PR-A wires the
+// `set` leaf; `status` is a follow-up that re-uses the same DTO.
+func cmdTraffic(args []string) int {
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale traffic <set|status> [args]", "traffic")
+		return 1
+	}
+	switch args[0] {
+	case "set":
+		return cmdTrafficSet(args[1:])
+	default:
+		PrintUsage(os.Stderr, "usage: gregale traffic <set|status> [args]", "traffic")
+		return 1
+	}
+}
+
 // cmdDomains dispatches list/add/rm. Adding prints the TXT record the
 // customer must publish for verification (spec §7).
 func cmdDomains(args []string) int {
+	parent, _ := lookupCliCommand("domains")
 	if len(args) == 0 {
 		PrintUsage(os.Stderr, "usage: gregale domains <list|add|rm> [args]", "domains")
 		return 1
@@ -943,11 +1164,14 @@ func cmdDomains(args []string) int {
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "unknown domains subcommand %q\n", args[0])
+	sug, _ := suggestSubcommand(args[0], parent)
+	maybeSuggestSub(sug)
 	return 1
 }
 
 // cmdCrons: list/add/update/rm.
 func cmdCrons(args []string) int {
+	parent, _ := lookupCliCommand("crons")
 	if len(args) == 0 {
 		PrintUsage(os.Stderr, "usage: gregale crons <list|add|update|rm> [args]", "crons")
 		return 1
@@ -1024,6 +1248,8 @@ func cmdCrons(args []string) int {
 		return 0
 	}
 	fmt.Fprintf(os.Stderr, "unknown crons subcommand %q\n", args[0])
+	sug, _ := suggestSubcommand(args[0], parent)
+	maybeSuggestSub(sug)
 	return 1
 }
 
@@ -1132,6 +1358,7 @@ func cmdCronsUpdate(args []string) int {
 
 // cmdKeys: list/add/rm. Adding returns the plaintext token once (spec §2.2).
 func cmdKeys(args []string) int {
+	parent, _ := lookupCliCommand("keys")
 	if len(args) == 0 {
 		PrintUsage(os.Stderr, "usage: gregale keys <list|add|rm|rotate|grace-window> [args]", "keys")
 		return 1
@@ -1188,6 +1415,8 @@ func cmdKeys(args []string) int {
 		return cmdKeysGraceWindow(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown keys subcommand %q\n", args[0])
+	sug, _ := suggestSubcommand(args[0], parent)
+	maybeSuggestSub(sug)
 	return 1
 }
 
@@ -1301,6 +1530,7 @@ func cmdKeysGraceWindow(args []string) int {
 // arg to the leaf FlagSet also preserves its normal unknown-flag
 // handling (cmdUsageList exits 1 on `--bogus`).
 func cmdUsage(args []string) int {
+	parent, _ := lookupCliCommand("usage")
 	if len(args) == 0 {
 		return cmdUsageList(nil)
 	}
@@ -1322,6 +1552,8 @@ func cmdUsage(args []string) int {
 	}
 	PrintUsage(os.Stderr, "usage: gregale usage [--month YYYY-MM] | gregale usage summary [--month YYYY-MM] | gregale usage daily [--day YYYY-MM-DD] | gregale usage storage [--day YYYY-MM-DD]", "usage")
 	fmt.Fprintf(os.Stderr, "unknown usage subcommand %q\n", args[0])
+	sug, _ := suggestSubcommand(args[0], parent)
+	maybeSuggestSub(sug)
 	return 1
 }
 
@@ -1428,6 +1660,7 @@ func cmdInvoices(args []string) int {
 	before := fs.String("before", "", "pagination cursor (RFC3339Nano)")
 	limit := fs.Int("limit", 25, "page size (1..100)")
 	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale invoices [--month YYYY-MM] [--before C] [--limit N]", "invoices")
 		return 1
 	}
 	client, err := authedClient()
@@ -1539,6 +1772,12 @@ func cmdConnect(args []string) int {
 			return printErr("Not logged in", err)
 		}
 		target := dashboardAccountURL(apiBase())
+		if jsonOutput {
+			return jsonOut(writeJSON(map[string]any{
+				"url":     target,
+				"service": "github",
+			}))
+		}
 		fmt.Printf("Opening %s to connect GitHub…\n", target)
 		if err := browser.Open(target); err != nil {
 			PrintFail(os.Stderr, "Could not open browser: %v", err)
@@ -1555,7 +1794,25 @@ func cmdConnect(args []string) int {
 // cmdOpen implements `gregale open <slug>`. Looks up the app's URL via
 // the v1 API and launches the OS browser. With --dashboard, opens
 // the dashboard's app-detail page instead of the public URL.
+//
+// Subcommands (Tier A8.1):
+//   - docs [--slug <slug>]
+//     Opens docs.gregale.dev/cli/<slug> (or the top-level
+//     docs.gregale.dev when no slug is given) in the default
+//     browser. No API call needed — the docs site is the
+//     canonical help surface and is reachable without an
+//     authenticated session.
+//
+// The subcommand dispatch happens BEFORE the flag parse so the
+// docs subcommand's own flags (--slug) don't collide with the
+// parent `open` flags (--dashboard). The first positional arg
+// selects the subcommand; everything after is forwarded.
 func cmdOpen(args []string) int {
+	// Subcommand dispatch: when the first positional is `docs`,
+	// hand off to cmdOpenDocs with the remaining args.
+	if len(args) > 0 && args[0] == "docs" {
+		return cmdOpenDocs(args[1:])
+	}
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
 	dash := fs.Bool("dashboard", false, "open the dashboard page instead of the live URL")
 	if err := fs.Parse(args); err != nil {
@@ -1600,6 +1857,94 @@ func cmdOpen(args []string) int {
 		default:
 			_, _ = fmt.Fprintln(osStdout, "App is warm — opening.")
 		}
+	}
+	_, _ = fmt.Fprintf(osStdout, "Opening %s\n", target)
+	if err := browser.Open(target); err != nil {
+		PrintFail(os.Stderr, "Could not open browser: %v", err)
+		fmt.Fprintf(os.Stderr, "  Open this URL manually:\n  %s\n", target)
+		return 0
+	}
+	return 0
+}
+
+// docsOpenTopic is the docs URL slug for the `open` command's
+// own man page. The `open docs` subcommand (cmdOpenDocs below)
+// does not surface a "Docs:" line because the user is already
+// ON the docs surface; this constant is consumed by PrintUsage
+// when the subcommand's flag parser fails.
+const docsOpenTopic = "open"
+
+// cmdOpenDocs implements `gregale open docs [--slug <slug>]`. Opens
+// the customer-facing CLI docs in the default browser. The docs
+// site is reachable without an authenticated session, so this
+// subcommand does NOT call authedClient — a logged-out customer
+// hitting `gregale open docs apps` (perhaps from a fresh shell)
+// still gets the right page.
+//
+// Slug resolution:
+//   - positional arg: `gregale open docs apps` → /cli/apps
+//   - --slug flag:    `gregale open docs --slug queue` → /cli/queue
+//   - both or neither is an error (mutually exclusive, but at
+//     least one is required — opening the bare docs root would
+//     be confusing; `gregale man` already covers that case).
+//   - empty slug defaults to the docs root (docs.gregale.dev).
+//
+// The DocsTopic constant docsOpenTopic is exposed so the manifest
+// entry below can pin the docs URL slug for the `open` command's
+// own man page.
+func cmdOpenDocs(args []string) int {
+	fs := flag.NewFlagSet("open docs", flag.ContinueOnError)
+	slugFlag := fs.String("slug", "", "docs page slug (e.g. apps, queue, deploy); opens the docs root when empty")
+	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale open docs [<slug>] [--slug <slug>]", docsOpenTopic)
+		return 1
+	}
+	slug := *slugFlag
+	// Positional wins over --slug when both are given: the user
+	// typed the slug directly, so the explicit position is more
+	// intent-revealing than the flag.
+	if fs.NArg() > 0 {
+		if slug != "" && fs.Arg(0) != slug {
+			PrintFail(os.Stderr, "conflicting slug: positional %q vs --slug %q", fs.Arg(0), slug)
+			return 1
+		}
+		slug = fs.Arg(0)
+	}
+	if fs.NArg() > 1 {
+		PrintFail(os.Stderr, "too many positional args (got %d, want 0 or 1)", fs.NArg())
+		return 1
+	}
+	// Slug sanitization — the docs URL is rooted at /cli/<slug>,
+	// so any non-path-safe character (slash, percent, etc.) is
+	// stripped to '_' rather than silently percent-encoded. The
+	// caller gets a path that cannot escape /cli/.
+	safeSlug := sanitizeSlugForURL(slug)
+	// sanitizeSlugForURL returns appSlugFallback ("app") for the
+	// empty string — that's the dashboardAppURL contract (never
+	// produce a bare /dashboard/apps/ path). For docs we want
+	// the opposite: empty slug means "open the docs root", so
+	// re-empty the slug here after sanitization if the caller
+	// supplied no slug at all.
+	if slug == "" {
+		safeSlug = ""
+	}
+	var target string
+	switch safeSlug {
+	case "":
+		// Top-level docs — strips the trailing /cli/ from
+		// docsURLBase so the landing page renders.
+		target = strings.TrimSuffix(docsURLBase, "/cli/")
+	default:
+		target = docsURLBase + safeSlug
+	}
+	if jsonOutput {
+		// JSON path — emit the resolved URL and exit without
+		// touching the browser. Scripting wrappers can pipe the
+		// URL into a curl / xdg-open of their choice.
+		return jsonOut(writeJSON(map[string]string{
+			"url":  target,
+			"slug": safeSlug,
+		}))
 	}
 	_, _ = fmt.Fprintf(osStdout, "Opening %s\n", target)
 	if err := browser.Open(target); err != nil {
@@ -1720,7 +2065,17 @@ func validateRepoSlug(s string) error {
 // does not yet act on them (Move 4 will filter against vmmd's
 // per-instance ring buffer); the flags land now so the wire
 // contract is stable.
+//
+// Issue #315 (tier-2 DX): `gregale logs tail <slug>` is a thin alias
+// for `gregale logs <slug> --follow`. The inner-subcommand dispatch
+// mirrors cmdQueueDispatch (commands5.go:715-729). `tail` is the only
+// inner subcommand today; the switch leaves room for future siblings
+// (e.g. `logs list` for batch tail of all app's deployments) without
+// a wire-format break.
 func cmdLogs(args []string) int {
+	if len(args) > 0 && args[0] == subLogsTail {
+		return cmdLogsTail(args[1:])
+	}
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := fs.Bool("follow", false, "follow new lines")
 	deployment := fs.String("deployment", "", "deployment id (default: latest)")
@@ -1752,18 +2107,75 @@ func cmdLogs(args []string) int {
 			return 2
 		}
 	}
-	slug := fs.Arg(0)
+	return runLogs(context.Background(), fs.Arg(0), *deployment, api.LogFilter{
+		Grep:  *grep,
+		Since: *since,
+		Level: *level,
+	}, *follow)
+}
+
+// cmdLogsTail implements `gregale logs tail <slug>` — issue #315
+// (tier-2 DX). Equivalent to `gregale logs <slug> --follow`; provided
+// as a verb-form alias so muscle-memory keyboard shortcuts (Docker,
+// kubectl, journalctl) work without translating to the long form.
+//
+// `--follow` is rejected explicitly: passing it is a no-op signal of
+// confusion (the alias already implies follow) and silently ignoring
+// it would mask a real customer mistake. All other logs flags pass
+// through verbatim so the alias and the long form stay wire-equivalent.
+func cmdLogsTail(args []string) int {
+	fs := flag.NewFlagSet("logs tail", flag.ContinueOnError)
+	follow := fs.Bool("follow", false, "follow new lines (alias always follows; flag is redundant)")
+	deployment := fs.String("deployment", "", "deployment id (default: latest)")
+	grep := fs.String("grep", "", "only show lines matching this substring")
+	since := fs.String("since", "", "only show lines at or after this RFC3339 timestamp")
+	level := fs.String("level", "", "only show lines at this level (info|warn|error)")
+	if err := fs.Parse(args); err != nil {
+		PrintUsage(os.Stderr, "usage: gregale logs tail <slug> [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale logs tail <slug> [--deployment ID] [--grep SUBSTR] [--since RFC3339] [--level info|warn|error]", "logs")
+		return 1
+	}
+	if *follow {
+		PrintFail(os.Stderr, "--follow is redundant with `logs tail` (alias always follows); drop the flag")
+		return 2
+	}
+	if *level != "" && !api.IsValidLogLevel(*level) {
+		PrintUsage(os.Stderr, "--level must be one of: info, warn, error", "logs")
+		return 2
+	}
+	if *since != "" {
+		if _, err := time.Parse(time.RFC3339, *since); err != nil {
+			PrintUsage(os.Stderr, "--since must be an RFC3339 timestamp (e.g. 2026-07-28T00:00:00Z)", "logs")
+			return 2
+		}
+	}
+	return runLogs(context.Background(), fs.Arg(0), *deployment, api.LogFilter{
+		Grep:  *grep,
+		Since: *since,
+		Level: *level,
+	}, true)
+}
+
+// runLogs is the shared SSE pump behind `gregale logs` and `gregale
+// logs tail`. It owns the auth round-trip, the signal-driven cancel,
+// and the typed Decoder loop so both call sites stay byte-identical on
+// the wire. Extracted from the original cmdLogs body during the
+// issue #315 tail-alias refactor.
+//
+// Exits with 130 on Ctrl-C (shell SIGINT convention), 0 on a clean
+// `event: end` or io.EOF, and surfaces a renderAPIError / printErr
+// path on the auth or attach errors that precede the SSE loop.
+func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter, follow bool) int {
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	body, err := client.StreamAppLogs(ctx, slug, *deployment, *follow, api.LogFilter{
-		Grep:  *grep,
-		Since: *since,
-		Level: *level,
-	})
+	body, err := client.StreamAppLogs(ctx, slug, deployment, follow, filter)
 	if err != nil {
 		var ae *APIError
 		if errors.As(err, &ae) {
@@ -1881,7 +2293,7 @@ streamLoop:
 					PrintWarn(os.Stderr, "build log stream ended (%s); checking deployment status…", end.Reason)
 				}
 				break streamLoop
-			case "error":
+			case streamEventError:
 				PrintWarn(os.Stderr, "stream closed; follow manually: gregale logs --deployment %s", dep.ID)
 				return 3
 			default:
@@ -1963,9 +2375,9 @@ func mapFailureMessage(err string) string {
 	case "user_error":
 		return "Build failed — see log above for the failing command."
 	case "oom":
-		return "Build ran out of memory (2 GB limit). Try fewer/smaller dependencies, or upgrade for a larger build. Docs: https://docs.gregale.example/build/limits#memory"
+		return "Build ran out of memory (2 GB limit). Try fewer/smaller dependencies, or upgrade for a larger build. Docs: https://docs.gregale.dev/build/limits#memory"
 	case "timeout":
-		return "Build exceeded 10 min. Docs: https://docs.gregale.example/build/limits#timeout"
+		return "Build exceeded 10 min. Docs: https://docs.gregale.dev/build/limits#timeout"
 	case "infra":
 		return "Our build system hiccuped — we've been alerted and requeued your build automatically."
 	}

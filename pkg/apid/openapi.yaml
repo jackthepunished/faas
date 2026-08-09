@@ -1669,6 +1669,27 @@ paths:
         Server-Sent Events stream of instance logs. NOTE: this endpoint is
         currently mounted behind `s.authLimited` and is documented here for
         reference; the dashboard and CLI also consume it directly.
+
+        Two modes share this URL:
+
+        - **Live (default)** — `?follow=1` holds the connection open and
+          streams new entries from the per-instance ring buffer. The
+          stream terminates with `event: end` when the backstop fires
+          (10 minutes idle), the schedd returns NotFound (parked app), or
+          the connection closes.
+
+        - **Archive (`?archive=1`)** — fetches a single day's
+          per-instance log batch from the S3 bucket the apid shipper
+          writes into. `?instance=<id>` selects the Firecracker instance
+          id; `?date=YYYY-MM-DD` selects the day. The response is the
+          same SSE shape as the live stream (`event: log` per line,
+          `event: end` terminal with `archive_complete` /
+          `archive_missing` / `archive_degraded` reasons) so the SDK
+          decoder treats the two paths interchangeably. Archive is
+          gated by `Plan.LogArchiveEnabled()` — Free customers receive
+          402 + `plan_log_archive_not_allowed`. The per-plan retention
+          cap (Hobby 7d / Pro 30d / Scale 90d) refuses `?date=` values
+          outside the window with 403 + `log_archive_retention_exceeded`.
       parameters:
         - name: follow
           in: query
@@ -1691,12 +1712,50 @@ paths:
             against the same enum (api.IsValidLogLevel in pkg/api/logs.go);
             an unknown value short-circuits with an SSE error frame carrying
             code invalid_level.
+        - name: archive
+          in: query
+          schema: { type: integer, enum: [0, 1], default: 0 }
+          description: >
+            If 1, serve archived logs from S3 instead of the live ring buffer.
+            Requires `instance=<id>` and `date=YYYY-MM-DD`. Gated by
+            `Plan.LogArchiveEnabled()` — Free plans receive 402 +
+            `plan_log_archive_not_allowed`. The per-plan retention cap
+            (Hobby 7d / Pro 30d / Scale 90d) refuses `date=` values
+            outside the window.
+        - name: instance
+          in: query
+          schema: { type: string, pattern: '^[A-Za-z0-9._-]{1,128}$' }
+          description: >
+            Required when `archive=1`. The Firecracker instance id to read
+            archived logs from (matches the `instance_id` field in the live
+            SSE frames).
+        - name: date
+          in: query
+          schema: { type: string, format: date }
+          description: >
+            Required when `archive=1`. The day to read in YYYY-MM-DD UTC.
+            Must be inside the per-plan retention cap (Hobby 7d / Pro 30d
+            / Scale 90d) — outside values return 403 +
+            `log_archive_retention_exceeded`. Future dates are refused
+            with the same code.
       responses:
         '200':
           description: A text/event-stream of structured log lines, terminated by an empty SSE frame when the connection closes.
           content:
             text/event-stream: {}
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Plan does not include log archive read-back. Free plans receive this on `?archive=1`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: {"type":"about:blank","title":"Log archive unavailable on this plan","status":402,"code":"plan_log_archive_not_allowed","detail":"the free plan does not include log archive read-back; upgrade to Hobby or above to query historical logs from object storage."}
+        '403':
+          description: Log archive retention cap exceeded; `?date=` is outside the per-plan window.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: '{"type":"about:blank","title":"","status":403,"code":"log_archive_retention_exceeded","detail":"?date=2026-07-01 is outside the per-plan window"}'
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -2150,6 +2209,64 @@ paths:
             but the parent app's plan refuses the override (e.g. a
             Free app PATCHing `min_instances=1`). Stable code
             `plan_min_instances_not_allowed`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/deployments/{id}/traffic:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    patch:
+      tags: [deployments]
+      operationId: updateDeploymentTraffic
+      summary: Set the per-deployment traffic-split weight.
+      description: |
+        Update the deployment's traffic_percent (issue #556 PR-A).
+        PR-A uses the zero-siblings rebalance form: setting row R's
+        traffic_percent to N forces every other live row in the same
+        app to 0, keeping Σ = 100 by construction. Pro/Scale only —
+        Free/Hobby are rejected at 403 `plan_traffic_split_not_allowed`.
+        Range-check [0, 100] is enforced at the handler (422
+        `invalid_traffic_percent`). The Σ invariant is asserted
+        post-write as a defensive backstop (409
+        `traffic_percent_sum_invalid`) — structurally unreachable
+        with zero-siblings, but pinned by the test suite.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDeploymentTrafficRequest'
+      responses:
+        '200':
+          description: The updated deployment with the new traffic_percent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentResponse'
+        '400':
+          description: |
+            `400 Bad Request` — request body failed JSON decode.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `403 Forbidden` — the account's plan refuses traffic
+            splitting (Free / Hobby). Stable code
+            `plan_traffic_split_not_allowed`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `409 Conflict` — post-write Σ invariant check tripped.
+            Structurally unreachable with the zero-siblings rebalance
+            form, but pinned by the test suite as a defensive
+            backstop against future refactors.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '422':
+          description: |
+            `422 Unprocessable Entity` — `traffic_percent` was
+            outside the inclusive `[0, 100]` range. Stable code
+            `invalid_traffic_percent`.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -3420,6 +3537,49 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # Issue #315 / tier-2 DX: replay a failed or dead_letter
+  # invocation. The replay creates a fresh async invocation that
+  # carries the original's payload + headers + method + path,
+  # stamped with source='replay' so the dashboard and CLI can
+  # distinguish it from a fresh async_invoke at a glance. The
+  # customer polls the new id via GET /v1/invocations/{newID}
+  # the same way they would for any async invoke.
+  /v1/invocations/{id}/replay:
+    post:
+      tags: [invocations]
+      operationId: replayInvocation
+      summary: Re-issue a failed or dead_letter invocation.
+      description: |
+        Accepts no request body. The replayed row carries the original's
+        payload + headers + method + path verbatim and is enqueued against
+        the same app. The new row's Source is `replay` (issue #315).
+
+        Only invocations whose current state is `failed` or `dead_letter`
+        can be replayed — re-running a successful or in-flight invocation
+        would be a customer bug, not a flow we want to enable by accident.
+        A replay attempt on any other state returns 409
+        `invocation_not_replayable`.
+      parameters:
+        - $ref: '#/components/parameters/Id32'
+      responses:
+        '202':
+          description: The new invocation row was enqueued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AsyncInvokeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            The invocation is not in a replayable state. Returns the
+            `invocation_not_replayable` problem code with the current
+            state in the detail field; only `failed` and `dead_letter`
+            invocations can be replayed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/delayed-tasks/{id}:
     parameters:
       - $ref: '#/components/parameters/Id32'
@@ -3973,6 +4133,129 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Audit log (issue #755 / PR-6) ─────────────────────────────────────
+
+  /v1/audit-log:
+    get:
+      tags: [audit]
+      operationId: listAuditLog
+      summary: List the caller's audit-log entries (post-deletion evidence).
+      description: |
+        Newest-first. Reads the FK-free `audit_log` table
+        (migrations/00163_audit_log.sql), distinct from
+        `/v1/audit-events` which reads the live `events` table. The
+        `audit_log` table is append-only by spec (ISO 27001 SoA
+        A.5.33 — retention forever) and a regulator / DPO can replay
+        post-deletion state from the row alone.
+
+        Scope: session cookie (implicitly admin) or any API key
+        carrying `{admin, apps:read}` (`api.ScopesReadSurface`).
+        MFA-gated. Cross-account invisibility is enforced by pinning
+        `account_id` to the calling account's id inside the handler;
+        the SQL filter rejects `account_id IS NULL` rows by default
+        (a customer never sees anonymous rows).
+      parameters:
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: "Audit-log rows with `received_at >= since` (RFC 3339) are returned. Omit to read from the newest row."
+        - name: kind_prefix
+          in: query
+          schema: { type: string }
+          description: "Only return rows whose `kind` starts with this prefix (e.g. `account.` returns `account.deleted`)."
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          description: "Audit-log page size. Silently capped at 100."
+      responses:
+        '200':
+          description: Newest-first audit-log entries for the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListAuditLogResponse'
+              example:
+                limit: 50
+                entries:
+                  - id: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    kind: account.deleted
+                    account_id: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    account_email: "alice@example.com"
+                    actor: grace-sweep
+                    received_at: "2026-08-08T12:00:00Z"
+                    data: { source: grace-sweep, email: "alice@example.com", actor: grace-sweep }
+        '400':
+          description: Bad request — malformed `since`, `limit`, or `kind_prefix` (each must be RFC 3339 / a positive integer / a non-empty string when present).
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/audit-log/all:
+    get:
+      tags: [audit]
+      operationId: listAuditLogAll
+      summary: Operator view of every audit-log entry (cross-account).
+      description: |
+        Admin-only read of the FK-free `audit_log` table. Reads
+        across accounts by default; pass `?account_id=<uuid>` to
+        restrict to one account. `?include_anonymous=true` surfaces
+        the `account_id IS NULL` rows emitted by background /
+        anonymous activity (the customer-scoped `/v1/audit-log`
+        endpoint never returns those rows).
+
+        Scope: session cookie (implicitly admin) or an admin API
+        key (`api.ScopesAdminOnly` — `{admin}`). Not MFA-gated at
+        the handler level because admin sessions / admin keys are
+        already MFA-gated upstream at session / key issue time.
+      parameters:
+        - name: account_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: "Restrict the result to rows with this `account_id`. Omit to read across all accounts."
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+          description: "Operator-side audit-log rows with `received_at >= since` (RFC 3339) are returned. Omit to read from the newest row."
+        - name: kind_prefix
+          in: query
+          schema: { type: string }
+          description: "Only return rows whose `kind` starts with this prefix."
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          description: "Operator-side audit-log page size. Silently capped at 100."
+        - name: include_anonymous
+          in: query
+          schema: { type: boolean, default: false }
+          description: "When `true`, also surface rows with `account_id IS NULL` (anonymous / background activity). Default `false`."
+      responses:
+        '200':
+          description: Newest-first audit-log entries across accounts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListAuditLogResponse'
+              example:
+                limit: 50
+                entries:
+                  - id: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    kind: account.deleted
+                    account_id: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+                    account_email: "alice@example.com"
+                    actor: grace-sweep
+                    received_at: "2026-08-08T12:00:00Z"
+                    data: { source: grace-sweep, email: "alice@example.com", actor: grace-sweep }
+                  - id: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e20"
+                    kind: system.health
+                    received_at: "2026-08-08T11:55:00Z"
+                    data: { source: healthcheck, status: ok }
+        '400':
+          description: Bad request — malformed `since`, `limit`, or `account_id`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Wake timeline (issue #517 / PR-C / ADR-064) ──────────────────────────
 
   /v1/apps/{slug}/wakes/{wake_id}/timeline:
@@ -4051,7 +4334,7 @@ paths:
                     data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", instance_id: "inst-1", node_id: "node-1", healthcheck_path: "/healthz", probe_count: 1, elapsed_ms: 760 }
                   - at: "2026-07-25T13:25:01.220Z"
                     kind: wake.proxy_first_byte
-                    actor: gatewayd
+                    actor: egress
                     data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", instance_id: "inst-1", node_id: "node-1", latency_ms: 40 }
         '400':
           description: Malformed query parameter on the wake-timeline read — `since` not RFC 3339 or `limit` out of range.
@@ -6291,6 +6574,18 @@ components:
           type: [string, "null"]
           format: date-time
           description: "Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for never-parked deployments."
+        # Issue #556 PR-A: per-deployment traffic-split weight.
+        # Integer in [0, 100] enforced by the schema-layer CHECK
+        # constraint (migration 00160). Σ over live rows for the
+        # app is 100 by construction: CreateDeployment zeros the
+        # prior row in the same tx; UpdateDeploymentTraffic zeros
+        # siblings in its tx.
+        traffic_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: "Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by construction."
+          example: 100
 
     UpdateDeploymentRequest:
       description: "Body for PATCH /v1/deployments/{id} (issue #557 closure / ADR-072). The only mutable field post-create is the per-deployment cold-wake floor; image / digest / overrides / sidecars stay immutable."
@@ -6301,6 +6596,18 @@ components:
           type: integer
           minimum: 0
           description: "Per-deployment cold-wake floor override for PATCH /v1/deployments/{id}. 0 = inherit from parent app; positive value is the deployment's own floor. Effective per-instance floor = max(app, deployment). Validated against the parent app's plan MaxMinInstances cap."
+
+    UpdateDeploymentTrafficRequest:
+      description: "Body for PATCH /v1/deployments/{id}/traffic (issue #556 PR-A). Sets the per-deployment traffic-split weight (integer [0, 100]). PR-A uses the zero-siblings rebalance form: setting row R's traffic_percent to N forces every other live row in the same app to 0, keeping Σ = 100 by construction. Pro/Scale only — Free/Hobby are rejected at 403 plan_traffic_split_not_allowed."
+      type: object
+      required: [traffic_percent]
+      properties:
+        traffic_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: "Per-deployment traffic-split weight. 0 = no traffic (used during rollback). 100 = sole live deployment."
+          example: 25
 
     DeploymentListResponse:
       description: "Paginated deployment list with a `next_before` cursor for backward pagination."
@@ -6434,6 +6741,13 @@ components:
         `runner_digest`, and `sbom_storage_key` are populated by
         Phase 3 (cosign signer + syft SBOM), but the columns exist
         today so Phase 3 is a zero-cost schema change.
+        `framework_version` is the language version the customer's
+        source declares (`.nvmrc`, `package.json::engines.node`,
+        `pyproject.toml::requires-python`, `.python-version`,
+        `.tool-versions`, `go.mod` directive); added in issue #740 /
+        DEPLOY-PROV-5 / ADR-087. OBSERVATIONAL ONLY — the build
+        pipeline never reads it (the runtime is bound by the OCI
+        base ref via `FAAS_DEPLOY_BASE_REF_<RUNTIME>`).
       type: object
       required:
         - id
@@ -6458,6 +6772,7 @@ components:
         started_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time }
         sbom_storage_key: { type: [string, "null"], description: "Phase 3 populator fills this from `syft` output. Empty string when not yet populated." }
+        framework_version: { type: [string, "null"], description: "Source-declared language version (nodes 22.11.0 / python 3.13 / go 1.24, etc.). Empty string when no version file is present or any parser fails — best-effort, never an error. Added in DEPLOY-PROV-5 / issue #740 / ADR-087." }
 
     AccountCreditResponse:
       description: |
@@ -6545,6 +6860,19 @@ components:
           items:
             $ref: '#/components/schemas/Sidecar'
           description: "Up to 2 stateless sidecars (1 init + 1 sidecar). nil/omitted = no sidecars. See ADR-068 for the hard 2-cap and stateless-only contract."
+        # Issue #556 PR-A: per-deployment traffic-split weight
+        # (Pro/Scale only). nil/omitted = server default 100 (the
+        # most-recent live row receives all traffic, preserving
+        # today's behaviour). explicit 0..100 = opt into canary
+        # rollout on this deploy; the handler enforces the range
+        # [0, 100] (422 invalid_traffic_percent) and the plan gate
+        # (403 plan_traffic_split_not_allowed).
+        traffic_percent:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 100
+          description: "Per-deployment traffic-split weight (issue #556 PR-A). nil = server default 100; explicit 0..100 = opt into canary (Pro/Scale only)."
+          example: 10
 
     CreateDeploymentOverrides:
       description: |
@@ -7444,6 +7772,114 @@ components:
           description: "Effective limit applied (always 1..100)."
           example: 50
 
+    # ─── Audit log (issue #755 / PR-6) ──────────────────────────────────────
+    # The audit_log table is the FK-free, immutable post-deletion
+    # evidence surface (migrations/00163_audit_log.sql). Distinct
+    # from AuditEventResponse on three load-bearing axes:
+    #
+    #   - id is a UUID (uuid.UUID PK), not a bigint — the row
+    #     outlives a deleted accounts row.
+    #   - account_id is rendered as a UUID canonical string and is
+    #     omitted for anonymous rows (account_id IS NULL).
+    #   - account_email is captured at copy-time inside
+    #     PgStore.DeleteAccount / MemStore.DeleteAccount so the audit
+    #     row is self-contained — a regulator reading a row for a
+    #     UUID that no longer exists in accounts still sees the
+    #     human identifier.
+
+    AuditLogEntry:
+      description: |
+        One row of the FK-free `audit_log` table (issue #755 /
+        PR-6). The row outlives the account it relates to so a
+        regulator / DPO can re-derive the post-deletion state
+        without joining back to a deleted `accounts` row. The
+        table is append-only by spec (ISO 27001 SoA A.5.33 —
+        retention forever); there is no UPDATE / DELETE
+        permission in production and no Go-side path that would
+        emit one.
+      type: object
+      required: [id, kind, received_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: "Audit-log row id (uuid canonical form)."
+          example: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+        kind:
+          type: string
+          description: |
+            Namespaced audit-log kind. The PR-6 surface currently
+            emits only `account.deleted` from inside
+            `(*PgStore).DeleteAccount` / `(*MemStore).DeleteAccount`
+            so the regulator can replay post-deletion state. The
+            closed vocabulary will widen in a follow-up PR if a
+            future audit emitter reuses the table for a new
+            evidence surface.
+          example: account.deleted
+        account_id:
+          type: string
+          format: uuid
+          description: |
+            Account id (uuid canonical form) the row was recorded
+            against. Nullable in the schema (anonymous /
+            background activity can emit rows); omitted on the
+            wire when the column is NULL.
+          example: "0190f8e1-2a3b-7c4d-9e5f-6a7b8c9d0e1f"
+        account_email:
+          type: string
+          description: |
+            Email captured at copy-time inside
+            `DeleteAccount`. The audit row is self-contained: a
+            regulator reading a row for a UUID that no longer
+            exists in `accounts` still sees the human identifier
+            without joining back to a deleted accounts row.
+            Omitted when the row was emitted by anonymous
+            activity.
+          example: "alice@example.com"
+        actor:
+          type: string
+          description: |
+            Which daemon wrote the row. PR-6 emits `grace-sweep`
+            from inside the DeleteAccount store method. Future
+            emitters (follow-up PRs) will widen the vocabulary.
+          example: grace-sweep
+        received_at:
+          type: string
+          format: date-time
+          description: "When the audit-log row was recorded (RFC 3339, UTC)."
+          example: "2026-08-08T12:00:00Z"
+        data:
+          type: object
+          description: |
+            Kind-specific payload. Always a JSON object; the
+            inner shape depends on `kind`. For
+            `account.deleted`, the payload carries `source`
+            (`grace-sweep` today), `email` (the verbatim
+            captured email), and `actor` (`grace-sweep` today)
+            so the dashboard can render the row without joining
+            back to a deleted `accounts` row.
+          additionalProperties: true
+          example: { source: grace-sweep, email: "alice@example.com", actor: grace-sweep }
+
+    ListAuditLogResponse:
+      description: |
+        Envelope for `GET /v1/audit-log` and `GET /v1/audit-log/all`
+        (issue #755 / PR-6). `entries` is newest-first
+        (`received_at DESC, id DESC`) so the dashboard can render
+        top-of-list without re-sorting. `limit` echoes the
+        effective limit applied by the handler so the SDK can
+        render `showing N of M` without re-issuing the request.
+      type: object
+      required: [entries, limit]
+      properties:
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/AuditLogEntry' }
+        limit:
+          type: integer
+          description: "Effective page size applied (always 1..100; mirrors the customer and operator /v1/audit-log routes)."
+          example: 50
+
     WakeTimelineEvent:
       description: |
         One frame of the wake timeline (issue #517 / PR-C /
@@ -7466,7 +7902,7 @@ components:
           example: wake.boot_started
         actor:
           type: string
-          description: "Daemon that wrote the row (`schedd` / `vmmd` / `gatewayd` / `builderd` / `apid`)."
+          description: "Daemon that wrote the row (`schedd` / `vmmd` / `gatewayd` / `egress` / `builderd` / `apid`)."
           example: schedd
         data:
           type: object

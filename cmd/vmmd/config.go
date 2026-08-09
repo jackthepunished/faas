@@ -133,6 +133,24 @@ type Config struct {
 	// /etc/faas/egress/operator_allowlist.toml for the on-disk
 	// shape.
 	EgressOperatorAllowlist string `toml:"egress_operator_allowlist"`
+
+	// NodeKeyPath is the on-disk path to the slice-3 per-node
+	// ECDSA P-256 signing key vmmd uses to sign CapacityReport
+	// (ADR-053). Defaults to defaultNodeKeyPath
+	// (/etc/faas/secrets/vmmd/node.key); operators can override
+	// here when the canonical install path is wrong (e.g.
+	// Air-gapped fleet whose PKI is rooted on a read-only mount,
+	// or a CI fixture that wants the key in a tmpdir). Mode is
+	// strictly 0400 root:root — loadNodeSigningKey refuses
+	// anything looser.
+	//
+	// Wired alongside TLSCertPath on purpose: both are
+	// daemon-level secrets (not per-tenant, not per-app), and
+	// the canonical install puts both under /etc/faas/secrets/.
+	// Env override `FAAS_VMMD_NODE_KEY_PATH` continues to win
+	// over the toml value for the containerised-deploys path
+	// (no toml in those images).
+	NodeKeyPath string `toml:"node_key_path"`
 }
 
 // ComputeNodeConfig is the [compute_node] TOML section. Field naming

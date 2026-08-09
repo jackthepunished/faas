@@ -77,6 +77,16 @@ type HostPolicy struct {
 	// HTTPS / DNS replies) dies at the first SYN-ACK or A-record.
 	// Tier-1 of the network roadmap.
 	MasqueradeCIDR string
+
+	// MasqueradeCIDR6 is the IPv6 counterpart of MasqueradeCIDR. Defaults
+	// to "" so v4-only deployments ship an unchanged ruleset; v6 dual-stack
+	// nodes override via host_vars. The renderer emits an
+	// `ip6 saddr <CIDR6> oifname <iface> masquerade` sibling on the next
+	// line of the postrouting chain so v6 tenant traffic reaches the
+	// public internet under the host identity (same threat model as the
+	// v4 rule). Byte-for-byte locked with deploy/ansible/roles/nftables/
+	// files/policy_nftables.conf.j2; `make egress-check` is the gate.
+	MasqueradeCIDR6 string
 }
 
 // DefaultHostPolicy is the platform-wide host nftables policy. Source of
@@ -197,6 +207,15 @@ func (h HostPolicy) Render() string {
 	b.WriteString("  chain postrouting {\n")
 	b.WriteString("    type nat hook postrouting priority srcnat; policy accept;\n")
 	fmt.Fprintf(&b, "    ip saddr %s oifname %q masquerade\n", h.MasqueradeCIDR, h.PublicIface)
+	// IPv6 sibling — emitted only when MasqueradeCIDR6 is non-empty so
+	// v4-only deployments ship an unchanged ruleset. The sibling mirrors
+	// the v4 rule exactly (same oifname, same nat chain); without it,
+	// v6 tenant traffic falls through `policy accept` and reaches the
+	// public internet under the tenant's link-local source — a return-
+	// routability black hole analogous to the v4 omission.
+	if h.MasqueradeCIDR6 != "" {
+		fmt.Fprintf(&b, "    ip6 saddr %s oifname %q masquerade\n", h.MasqueradeCIDR6, h.PublicIface)
+	}
 	b.WriteString("  }\n")
 	b.WriteString("}\n")
 	return b.String()

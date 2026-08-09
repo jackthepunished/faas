@@ -42,7 +42,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	gatewaydpb "github.com/onebox-faas/faas/api/proto/onebox/faas/gatewayd/v1"
+	egresspb "github.com/onebox-faas/faas/api/proto/onebox/faas/egress/v1"
 	"github.com/onebox-faas/faas/pkg/alerts"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/audit"
@@ -51,6 +51,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/billing/reconciler"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/promql"
@@ -223,8 +224,8 @@ func (a *scheddEgressAdapter) EgressBytes(instanceID string) (uint64, uint64, bo
 // is the meterd-side source for usage_minutes.tx_bytes
 // (gateway HTTP response bytes). Production wires the gatewayd
 // gRPC stream
-// (onebox.faas.gatewayd.v1.EgressTxService.StreamBytes on
-// FAAS_GATEWAY_SYNTH_SOCKET) into a background goroutine that
+// (onebox.faas.egress.v1.EgressTxService.StreamBytes on
+// FAAS_GATEWAY_EGRESS_SOCKET) into a background goroutine that
 // feeds a per-(instance, minute) byte snapshot. Sample-time
 // reads (EgressBytes) look up the snapshot under the read lock
 // and return (txBytes, 0, true) when the gateway reported any
@@ -279,11 +280,11 @@ type gatewayEgressAdapter struct {
 	// dialFn is the unix-socket dialer for the gateway
 	// stream. Tests substitute a fake dialer that returns a
 	// hand-rolled stream client; production wires the
-	// gatewaydpb-grpc DailContext. tlsCfg is nil on the
+	// egresspb-grpc DailContext. tlsCfg is nil on the
 	// single-box default-local path; mTLS-wrapped remote
 	// gatewayd deployments pass the loaded *tls.Config here
 	// (ADR-052).
-	dialFn func(ctx context.Context, socketPath string, tlsCfg *tls.Config) (gatewaydpb.EgressTxServiceClient, error)
+	dialFn func(ctx context.Context, socketPath string, tlsCfg *tls.Config) (egresspb.EgressTxServiceClient, error)
 }
 
 // EgressBytes returns the latest drained (instanceID,
@@ -368,8 +369,8 @@ func (a *gatewayEgressAdapter) startStream(ctx context.Context, socketPath strin
 // consumeStream runs one stream-receive iteration: open the
 // server-streaming RPC, fold every frame into the snapshot,
 // return when the upstream closes or the ctx cancels.
-func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client gatewaydpb.EgressTxServiceClient, log *slog.Logger) {
-	stream, err := client.StreamBytes(ctx, &gatewaydpb.StreamBytesRequest{})
+func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client egresspb.EgressTxServiceClient, log *slog.Logger) {
+	stream, err := client.StreamBytes(ctx, &egresspb.StreamBytesRequest{})
 	if err != nil {
 		if log != nil {
 			log.Warn("gatewayEgressAdapter: stream open failed", "err", err)
@@ -396,7 +397,7 @@ func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client gateway
 // be treated as its own bucket (different minuteUnix) and
 // coexist with the truncated bucket; that's the documented
 // "no implicit re-bucketing" contract.
-func (a *gatewayEgressAdapter) recordFrame(frame *gatewaydpb.BytesFrame) {
+func (a *gatewayEgressAdapter) recordFrame(frame *egresspb.BytesFrame) {
 	if frame == nil || frame.InstanceId == "" || frame.Minute == nil {
 		return
 	}
@@ -436,12 +437,12 @@ func (a *gatewayEgressAdapter) Tracked() int {
 // streaming RPC" shape (gRPC's stream stays alive across the
 // lifetime of the conn, and a dropped conn signals a stream close
 // which the goroutine handler reconnects on).
-func dialGatewayEgressStream(ctx context.Context, target string, tlsCfg *tls.Config) (gatewaydpb.EgressTxServiceClient, error) {
+func dialGatewayEgressStream(ctx context.Context, target string, tlsCfg *tls.Config) (egresspb.EgressTxServiceClient, error) {
 	conn, err := wire.DialContext(ctx, target, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("meterd: dial gatewayd egress %s: %w", target, err)
 	}
-	return gatewaydpb.NewEgressTxServiceClient(conn), nil
+	return egresspb.NewEgressTxServiceClient(conn), nil
 }
 
 // egressAggregator combines scheddEgressAdapter (net_tx_bytes)
@@ -783,13 +784,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// future test harness can omit the egress wire without
 	// touching the constructor.
 	scheddEgress := &scheddEgressAdapter{cpu: cpu}
-	// Load the mTLS config for the gatewayd egress dial (ADR-052).
-	// Single-box deployments keep all three paths empty and
-	// LoadGatewayEgressTLS returns (nil, nil); multi-box deployments
-	// point gateway_egress_target at tcp:// or dns:// + a TLS cluster.
-	gwEgressTLS, err := cfg.LoadGatewayEgressTLS()
+	// Load the mTLS config for the egress dial (ADR-052). Single-box
+	// deployments keep all three paths empty and LoadEgressTLS returns
+	// (nil, nil); multi-box deployments point egress_target at tcp://
+	// or dns:// + a TLS cluster.
+	gwEgressTLS, err := cfg.LoadEgressTLS()
 	if err != nil {
-		return fmt.Errorf("meterd: load gateway egress TLS: %w", err)
+		return fmt.Errorf("meterd: load egress TLS: %w", err)
 	}
 	gwEgress := &gatewayEgressAdapter{
 		now:    deps.now,
@@ -798,26 +799,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		dialFn: dialGatewayEgressStream,
 	}
 	// PR-2: kick off the gateway stream consumer. The unix-socket
-	// path defaults to the same FAAS_GATEWAY_SYNTH_SOCKET that schedd
-	//'s synth dialer uses; both daemons reach the same gatewayd via
-	// the same group-`faas` DAC auth (ADR-015). ctx here is the loop
-	// ctx — when the daemon shuts down the goroutine returns.
-	envOr := func(key, fallback string) string {
-		if v, ok := os.LookupEnv(key); ok && v != "" {
+	// path is resolved by egresssocket.ResolveFromOS, which prefers
+	// FAAS_EGRESS_SOCKET (added in PR-C+D), then the legacy
+	// FAAS_GATEWAY_EGRESS_SOCKET (one release cycle), then
+	// cfg.EgressSocket, then cfg.GatewayEgressSocket (deprecated),
+	// then egresssocket.DefaultSocketPath. Both sockets (this one and
+	// FAAS_GATEWAY_SYNTH_SOCKET) share the same group-`faas` DAC auth
+	// (ADR-015). ctx here is the loop ctx — when the daemon shuts
+	// down the goroutine returns.
+	envOr := func(key string) string {
+		if v, ok := os.LookupEnv(key); ok {
 			return v
 		}
-		return fallback
+		return ""
 	}
-	// FAAS_GATEWAY_EGRESS_SOCKET is the ADR-046 PR-2 producer
-	// channel (separate from FAAS_GATEWAY_SYNTH_SOCKET, which
-	// stays HTTP-shaped for cron dispatch). Both share the same
-	// group-`faas` DAC auth (ADR-015). The env var wins over
-	// cfg.GatewayEgressSocket so the e2e harness can dial a
-	// per-test socket without rewriting the unit file.
-	gwSocketPath := envOr("FAAS_GATEWAY_EGRESS_SOCKET", cfg.GatewayEgressSocket)
-	if gwSocketPath == "" {
-		gwSocketPath = "/run/faas/gatewayd-egress.sock"
-	}
+	gwSocketPath := egresssocket.ResolveFromOS(envOr, cfg.EgressSocket, cfg.GatewayEgressSocket)
 	gwEgress.startStream(ctx, gwSocketPath, log)
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and

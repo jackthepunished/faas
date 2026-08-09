@@ -309,6 +309,16 @@ func buildDeploymentForInsert(app state.App, req *api.CreateDeploymentRequest, o
 	dep := state.Deployment{
 		AppID: app.ID, ImageDigest: req.Image, Kind: state.DeploymentKindImage, Status: state.DeployPending,
 	}
+	// Issue #556 PR-A: thread the optional TrafficPercent pointer
+	// through. Omitted (nil) → server-side default 100 (matches
+	// schema NOT NULL DEFAULT 100 and the pre-#556 behaviour of
+	// "100% to the most-recent live row"). Explicit 0..100 → write
+	// that value. The handler's plan-gate + range-check above ran
+	// before this point, so a non-nil value here is in [0, 100] and
+	// the account's plan allows traffic splitting.
+	if req.TrafficPercent != nil {
+		dep.TrafficPercent = *req.TrafficPercent
+	}
 	if overrides != nil {
 		applyOverridesToDeployment(&dep, overrides)
 	}
@@ -428,4 +438,21 @@ func notifyAndAuditDeployment(ctxr context.Context, s *server, acct state.Accoun
 	// Issue #463 / ADR-068: sidecar audit event (delegated to its
 	// own helper so the sidecar surface is grep-able from one place).
 	emitSidecarSetAudit(ctxr, s.audit, acct, app, d, req.Sidecars)
+	// Issue #556 PR-A: emit a distinct audit row when the caller
+	// supplied an explicit traffic_percent (i.e. opted into canary
+	// mode on this deploy). The omitted case (server default 100)
+	// is the pre-#556 behaviour and is already covered by
+	// app.deployed; emitting a separate row keeps the canary path
+	// greppable for operators reviewing the rollout timeline. The
+	// supersede branch above zeroed the prior row's traffic_percent
+	// — operators can correlate by matching deployment_id across
+	// app.deployed + deployment.traffic_percent_set_on_create +
+	// deployment.traffic_percent_changed (PATCH path).
+	if req.TrafficPercent != nil {
+		s.audit.Emit(ctxr, "deployment.traffic_percent_set_on_create", &acct.ID, map[string]any{
+			"app_id":          app.ID,
+			"deployment_id":   d.ID,
+			"traffic_percent": *req.TrafficPercent,
+		})
+	}
 }

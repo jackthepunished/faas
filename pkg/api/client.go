@@ -47,10 +47,24 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// cookieOnlyPathRE matches API routes that are gated server-side to
+// the dashboard session cookie. The bearer-key CLI cannot reach
+// them — a request would 401 (or 302 to the login page) because the
+// session-cookie middleware (cmd/apid/server.go:1097 and
+// cmd/apid/handlers_sessions.go:71-77) treats bearer-key callers
+// as anonymous. The guard in c.do (below) short-circuits the
+// request with CodeUnsupportedByCLI so the failure mode is honest
+// ("the CLI cannot reach this route") rather than a confusing
+// 401/302. The companion tripwire
+// (pkg/api/lint_tripwires_test.go) ensures no other pkg/api file
+// composes a path that matches this regex.
+var cookieOnlyPathRE = regexp.MustCompile(`^/v1/auth/(sessions|capabilities)(/.*)?$`)
 
 // Client is a typed wrapper over the v1 REST API. Construct with
 // NewClient (30s default timeout) or NewClientWithDeployTimeout
@@ -71,6 +85,14 @@ type Client struct {
 
 	http       *http.Client // 30s default — used for every JSON call
 	deployHTTP *http.Client // optional, used by DeployMultipart
+
+	// cache powers `gregale completion <shell>` for the per-account
+	// positional completion paths (e.g. <slug> in `gregale app <slug>`).
+	// Nil → the c.do middleware short-circuits the refresh (preserves
+	// the test-suite posture where no on-disk cache should leak between
+	// subtests). NewClient wires a fresh cache so completion just works;
+	// tests that want hermetic isolation call SetCompletionCache(nil).
+	cache *CompletionCache
 }
 
 // NewClient builds a client for baseURL with the given bearer token.
@@ -81,7 +103,28 @@ func NewClient(baseURL, token string) *Client {
 		baseURL: baseURL,
 		token:   token,
 		http:    &http.Client{Timeout: 30 * time.Second},
+		cache:   NewCompletionCache(),
 	}
+}
+
+// SetCompletionCache wires a (possibly nil) cache. Passing nil
+// disables the auto-refresh — useful for tests that don't want
+// disk writes leaking between cases. Returns the receiver so the
+// call site can chain or discard.
+func (c *Client) SetCompletionCache(cache *CompletionCache) *Client {
+	c.cache = cache
+	return c
+}
+
+// CompletionCache returns the current cache. May be nil if the
+// client was built before NewCompletionCache existed (binary
+// compat — older callers that constructed Client{} directly) or
+// after an explicit SetCompletionCache(nil). Completion scripts
+// that want to read the cache for TAB-time lookups should call
+// this rather than constructing their own cache, so the file
+// path stays consistent with whatever the middleware wrote.
+func (c *Client) CompletionCache() *CompletionCache {
+	return c.cache
 }
 
 // NewClientWithDeployTimeout is like NewClient but configures a
@@ -124,6 +167,23 @@ func (c *Client) uploadHTTP() *http.Client {
 // when body != nil, decodes non-2xx as Problem, and unmarshals a
 // successful response into out when out != nil.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	// Cookie-only-route guard — reject paths the bearer-key CLI cannot
+	// reach before allocating anything. The regex matches the closed
+	// set /v1/auth/sessions and /v1/auth/capabilities (with optional
+	// trailing subpath). The status is 403 because the call is
+	// well-formed but the caller's auth mode does not match the
+	// route's policy — semantically a peer of CodeDeploySignatureInvalid
+	// (403 for "this caller cannot complete this action"). Docs URL
+	// points at the (forthcoming) /cli/cookie-only-routes page; the
+	// tripwire enforces the same URL in pkg/api/lint_tripwires_test.go.
+	if cookieOnlyPathRE.MatchString(path) {
+		return NewProblem(
+			http.StatusForbidden,
+			CodeUnsupportedByCLI,
+			"endpoint requires the dashboard session cookie",
+			"the gregale CLI cannot reach this route — use the dashboard at "+docsBase+"/dashboard/sessions",
+		).WithDocs(docsBase + "/cli/cookie-only-routes")
+	}
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -173,6 +233,14 @@ func (c *Client) doReq(cli *http.Client, req *http.Request, out any) error {
 			return &APIError{Problem: p}
 		}
 		return fmt.Errorf("API error: %s", resp.Status)
+	}
+	// Tier A8 / ADR-083: auto-refresh the completion cache on every
+	// 2xx. Runs before the unmarshal so the raw body is still in hand;
+	// errors are swallowed inside MaybeRefresh so a broken cache
+	// (disk full, permission denied, corrupt JSON) never fails a
+	// request. Nil-safe for tests that opt out via SetCompletionCache(nil).
+	if c.cache != nil {
+		c.cache.MaybeRefresh(req.URL.Path, data)
 	}
 	if out != nil && len(data) > 0 {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -678,6 +746,25 @@ func (c *Client) Rollback(ctx context.Context, slug string) (DeploymentResponse,
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/rollback", nil, &out)
 }
 
+// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+// weight (issue #556 PR-A). percent must be in [0, 100]; the
+// handler enforces the range (422) and the plan gate (403,
+// Pro/Scale only). PR-A semantics: zeroing sibling live rows so
+// Σ over the app's live rows stays 100 by construction. The
+// returned DTO carries the refreshed TrafficPercent field.
+//
+// Method name matches the OpenAPI operationId-derived SDK alias
+// `PatchDeploymentsIdTraffic` (cmd/sdk-coverage derives names via
+// `<Method><PathSegments>` — PATCH /v1/deployments/{id}/traffic
+// becomes `PatchDeploymentsIdTraffic`). The PascalCase name
+// matches the route's verb path, which is how the generated SDK
+// names align.
+func (c *Client) PatchDeploymentsIdTraffic(ctx context.Context, id string, percent int) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "PATCH", "/v1/deployments/"+id+"/traffic",
+		UpdateDeploymentTrafficRequest{TrafficPercent: percent}, &out)
+}
+
 // Park and Wake toggle the app between cold-parked and live.
 func (c *Client) Park(ctx context.Context, slug string) error {
 	return c.do(ctx, "POST", "/v1/apps/"+slug+"/park", nil, nil)
@@ -953,6 +1040,22 @@ func (c *Client) GetInvocation(ctx context.Context, id string) (Invocation, erro
 	return out, c.do(ctx, "GET", "/v1/invocations/"+id, nil, &out)
 }
 
+// ReplayInvocation re-issues a failed invocation. The server
+// enqueues a fresh async invocation carrying the original payload,
+// headers, method, and path; returns 202 + AsyncInvokeResponse on
+// success and 409 if the original is not in a replayable state (the
+// handler's allow-list is {failed, dead_letter} — see
+// cmd/apid/handlers_invocations.go::replayInvocation for the source
+// of truth, issue #315 tier-2 DX).
+//
+// Account-scoped: a customer can't replay another tenant's
+// invocation; the server surfaces ErrInvocationNotFound in that
+// case (same IDOR-safe path as GetInvocation).
+func (c *Client) ReplayInvocation(ctx context.Context, id string) (AsyncInvokeResponse, error) {
+	var out AsyncInvokeResponse
+	return out, c.do(ctx, "POST", "/v1/invocations/"+id+"/replay", nil, &out)
+}
+
 // API keys.
 //
 // CreateKey accepts an explicit scopes slice. Pass nil to preserve the
@@ -1129,6 +1232,62 @@ func (c *Client) ListAuditEvents(ctx context.Context, since, kindPrefix, appID s
 func (c *Client) GetAuditEvent(ctx context.Context, id string) (AuditEventResponse, error) {
 	var out AuditEventResponse
 	return out, c.do(ctx, "GET", "/v1/audit-events/"+id, nil, &out)
+}
+
+// ListAuditLog returns the caller's audit-log entries newest-first
+// (issue #755 / PR-6). Reads the FK-free `audit_log` table
+// (migrations/00163_audit_log.sql), distinct from ListAuditEvents
+// which reads the live `events` table. Customer-scoped: pinned to
+// the calling account's id inside the handler; `account_id IS NULL`
+// rows are filtered out server-side.
+func (c *Client) ListAuditLog(ctx context.Context, since, kindPrefix string, limit int) (ListAuditLogResponse, error) {
+	var out ListAuditLogResponse
+	q := url.Values{}
+	if since != "" {
+		q.Set("since", since)
+	}
+	if kindPrefix != "" {
+		q.Set("kind_prefix", kindPrefix)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/audit-log"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListAuditLogAll is the operator-side read of the audit-log
+// surface (issue #755 / PR-6). Admin-scoped: reads across accounts
+// when `accountID == ""` and surfaces `account_id IS NULL` rows
+// when `includeAnonymous == true`. Gated server-side on the
+// admin scope; the SDK caller must be holding an admin API key or
+// an admin session.
+func (c *Client) ListAuditLogAll(ctx context.Context, accountID, since, kindPrefix string, limit int, includeAnonymous bool) (ListAuditLogResponse, error) {
+	var out ListAuditLogResponse
+	q := url.Values{}
+	if accountID != "" {
+		q.Set("account_id", accountID)
+	}
+	if since != "" {
+		q.Set("since", since)
+	}
+	if kindPrefix != "" {
+		q.Set("kind_prefix", kindPrefix)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if includeAnonymous {
+		q.Set("include_anonymous", "true")
+	}
+	path := "/v1/audit-log/all"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
 // CLI auth device-code flow (spec §2.2).

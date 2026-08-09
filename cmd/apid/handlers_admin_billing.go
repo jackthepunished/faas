@@ -246,6 +246,7 @@ func (s *server) reconcileAccount(w http.ResponseWriter, r *http.Request, acct s
 			"apid booted without a billing provider; reconcile is not reachable"))
 		return
 	}
+
 	// Capability gate. Stripe's ReconcileUsage is a stub returning
 	// ErrNotImplemented (pkg/billing/stripe/client.go) and Stripe's
 	// Capabilities bitmask does NOT include CapUsageReconcile. Without

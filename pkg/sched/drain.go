@@ -272,7 +272,7 @@ func (d *Drain) dispatchOne(ctx context.Context, inv state.Invocation) {
 	// 3. Wake (Always-Wake = idempotent). Returns the live instance
 	// handle on success; the drain stamps it onto the row so the
 	// meter's per-instance count is non-zero for this minute.
-	wakeRes, err := d.engine.Wake(ctx, inv.AppID)
+	wakeRes, err := d.engine.Wake(ctx, inv.AppID, "")
 	if err != nil {
 		retryAfter := time.Duration(d.retryAfterSeconds) * time.Second
 		// Permanent wake errors short-circuit to state='failed' — a

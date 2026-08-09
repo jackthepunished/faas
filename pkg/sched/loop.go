@@ -36,27 +36,28 @@ import (
 // runs the idle reaper on a 10 s tick and cron on a 60 s tick (spec §4.3). The
 // Engine holds the store, ledger, and vmmd client; the Loop only orchestrates.
 type Loop struct {
-	pool              *pgxpool.Pool
-	engine            *Engine
-	log               *slog.Logger
-	gateway           GatewaySynth
-	now               func() time.Time
-	flowCounts        FlowCounter
-	ops               *wire.OpsMetrics       // issue #171 shared registry; nil safe
-	audit             *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
-	watchdog          *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention         *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
-	heartbeat         *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	diskDrift         *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
-	migratingWatchdog *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
-	instStats         InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	scaleup           *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
-	targets           *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
-	floor             *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
-	recentLoad        *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
-	livenessWindow    *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
-	reaperAggressive  bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
-	reaperParkCap     int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	pool               *pgxpool.Pool
+	engine             *Engine
+	log                *slog.Logger
+	gateway            GatewaySynth
+	now                func() time.Time
+	flowCounts         FlowCounter
+	ops                *wire.OpsMetrics       // issue #171 shared registry; nil safe
+	audit              *audit.Auditor         // cron-fired audit row writer; nil opts out (no row written)
+	watchdog           *Watchdog              // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	retention          *Retention             // §17 retention sweep; nil means "no retention" (tests can opt out)
+	heartbeat          *Heartbeat             // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	diskDrift          *DiskDrift             // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
+	migratingWatchdog  *MigratingWatchdog     // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
+	deadNodeReconciler *DeadNodeReconciler    // dead-node billing-leak self-healer; nil opts out (no ticker arm)
+	instStats          InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	scaleup            *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	targets            *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	floor              *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
+	recentLoad         *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
+	livenessWindow     *LivenessWindow        // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
+	reaperAggressive   bool                   // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap      int                    // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 	// lastFloorByApp (issue #557 closure / ADR-072): per-app
 	// effective floor from the previous reaper tick, used to emit
 	// `instances.parked_min_instances_released` when the floor
@@ -317,6 +318,23 @@ func (l *Loop) WithMigratingWatchdog(w *MigratingWatchdog) *Loop {
 	return l
 }
 
+// WithDeadNodeReconciler attaches the stale-RUNNING billing-leak
+// self-healer. Mirrors WithMigratingWatchdog's nil-skip semantics:
+// a nil reconciler means the select arm in Run never fires. Production
+// cmd/schedd wires sched.NewDeadNodeReconciler from the engine deps
+// so the sweeper shares the same store / engine / clock as the rest
+// of the loop. Cadence is the reconciler's own interval (default
+// api.DeadNodeReconcilerIntervalSeconds = 30 s, overridable via
+// FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS). The 30 s cadence is
+// deliberately coarser than the §6.1 watchdog's 1 s tick: the
+// staleness window this sweeper enforces is 120 s (api.DeadNode-
+// ReconcilerStalenessSeconds), so a 1 s tick would issue ~120
+// no-op queries per node death before any row is even eligible.
+func (l *Loop) WithDeadNodeReconciler(r *DeadNodeReconciler) *Loop {
+	l.deadNodeReconciler = r
+	return l
+}
+
 // Run blocks until ctx is cancelled. It owns three event sources: the LISTEN
 // subscriber, the reaper tick, and the cron tick.
 func (l *Loop) Run(ctx context.Context) error {
@@ -504,6 +522,17 @@ func (l *Loop) Run(ctx context.Context) error {
 		migratingWatchdogT = time.NewTicker(l.migratingWatchdog.interval)
 		defer migratingWatchdogT.Stop()
 	}
+	// Dead-node reconciler ticker (stale-RUNNING billing-leak fix).
+	// Default cadence api.DeadNodeReconcilerIntervalSeconds (30 s) —
+	// see WithDeadNodeReconciler for why this is coarser than the
+	// §6.1 watchdog's 1 s tick. nil opts out (the deadNodeTick
+	// helper returns nil for a nil ticker; the select case never
+	// fires).
+	var deadNodeReconcilerT *time.Ticker
+	if l.deadNodeReconciler != nil {
+		deadNodeReconcilerT = time.NewTicker(l.deadNodeReconciler.interval)
+		defer deadNodeReconcilerT.Stop()
+	}
 
 	for {
 		select {
@@ -537,6 +566,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runRecentLoad(ctx)
 		case <-migratingWatchdogTick(migratingWatchdogT):
 			l.runMigratingReconcile(ctx)
+		case <-deadNodeTick(deadNodeReconcilerT):
+			l.runDeadNodeReconcile(ctx)
 		case <-retentionFirst:
 			// One-shot first fire (see retentionFirstFireDelay). After
 			// this the channel is set to nil so subsequent ticks
@@ -664,6 +695,19 @@ func migratingWatchdogTick(t *time.Ticker) <-chan time.Time {
 	return t.C
 }
 
+// deadNodeTick is the stale-RUNNING billing-leak reconciler ticker.
+// Same nil-safe shape as migratingWatchdogTick — nil ticker nil
+// channel, so the select case in Run never fires. Kept separate so a
+// regression that corrupts channel wiring shows up against a
+// recognisable name in the stack trace instead of a generic
+// "ticker returned nil" panic.
+func deadNodeTick(t *time.Ticker) <-chan time.Time {
+	if t == nil {
+		return nil
+	}
+	return t.C
+}
+
 // runHeartbeat dispatches one sweep of the per-node liveness
 // ticker. Exported as a method so tests can drive a single tick
 // without spinning up Run's goroutine. Tick errors are logged
@@ -778,6 +822,40 @@ func (l *Loop) runMigratingReconcile(ctx context.Context) {
 	if reconciled > 0 {
 		l.log.Debug("migrating watchdog: tick reconciled", "reconciled", reconciled)
 	}
+}
+
+// runDeadNodeReconcile dispatches one sweep of the stale-RUNNING
+// billing-leak reconciler. Exported as a method so tests drive a
+// single tick without spinning up Run. Per-batch errors are logged
+// + swallowed: a transient DB blip on the ListRunningInstancesOnDeadNodes
+// query is the only error that surfaces here, and the next tick
+// retries. Per-row outcomes (failed / conflict / error) are reported
+// by the metric inside Engine.ReconcileDeadNodeInstances — this
+// dispatch helper intentionally has no return path for them.
+//
+// context.Canceled is treated as a normal shutdown signal (matches
+// runMigratingReconcile); we don't surface it as a Warn since the
+// schedd is about to exit and operators don't need a flurry of
+// "tick failed" logs at shutdown.
+func (l *Loop) runDeadNodeReconcile(ctx context.Context) {
+	if l.deadNodeReconciler == nil {
+		// Direct-call guard for tests; the select case is already
+		// gated by the nil-ticker pattern in deadNodeTick (a nil
+		// ticker returns a nil channel, so the case never fires).
+		return
+	}
+	reconciled, err := l.deadNodeReconciler.handle(ctx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			l.log.Warn("dead-node reconciler: tick failed", "err", err)
+		}
+		return
+	}
+	// No per-tick log on reconciled>0 here — the reconciler itself
+	// logs at Warn when any orphaned instances were terminated, and
+	// the metric carries the per-row outcome. A second Debug log at
+	// this layer would be noise.
+	_ = reconciled
 }
 
 // runScaleUp dispatches one tick of the per-app reactive scale-up
@@ -1784,7 +1862,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		}
 		l.audit.Emit(ctx, "cron.fired", &acct.ID, payload)
 	}()
-	if _, err := l.engine.Wake(ctx, c.AppID); err != nil {
+	if _, err := l.engine.Wake(ctx, c.AppID, ""); err != nil {
 		l.log.Warn("cron: wake", "cron_id", c.ID, "err", err)
 		return
 	}

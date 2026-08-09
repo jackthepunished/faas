@@ -13,6 +13,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
+	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
 )
 
 // egressSockPath returns a macOS-compatible unix socket path
@@ -157,12 +158,14 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		// cold filesystem (CI runner pool). The test's purpose
 		// is to verify the stop+start CYCLE stays bindable, not
 		// to time the kernel's dirent publish — so wait briefly.
-		// The 5s budget is generous (originally 2s; bumped after
-		// PR #715 CI run 31202393732 — cycle 10 took >2s on a
-		// saturated runner). The CI test flake family memory
+		// The 10s budget is generous (originally 2s; bumped to 5s
+		// after PR #715 CI run 31202393732 — cycle 10 took >2s on
+		// a saturated runner; bumped to 10s after PR #721 CI run
+		// 31220955977 — cycle 11 took >5s on the same pool).
+		// The CI test flake family memory
 		// (cmd-gatewayd-warmhints-drain-cancel-pre-cancel.md)
-		// documents the same 2s → 5s bump pattern.
-		if err := waitForSocket(sock, 5*time.Second); err != nil {
+		// documents the same bump pattern.
+		if err := waitForSocket(sock, 10*time.Second); err != nil {
 			t.Fatalf("cycle %d wait for socket: %v", i, err)
 		}
 		// The dirent's appearance precedes the gRPC server's
@@ -171,9 +174,9 @@ func TestEgressStopStopStart_RepeatedCycle(t *testing.T) {
 		// errors eagerly on ECONNREFUSED without retrying. Wrap
 		// the dial in a small retry budget so the test's
 		// purpose (cycle stays bindable) is what we measure,
-		// not the kernel's accept-poll cadence. 5s budget
+		// not the kernel's accept-poll cadence. 10s budget
 		// mirrors the waitForSocket bump above.
-		conn, err := dialWithRetry(sock, 5*time.Second, 10*time.Millisecond)
+		conn, err := dialWithRetry(sock, 10*time.Second, 10*time.Millisecond)
 		if err != nil {
 			t.Fatalf("cycle %d dial after start: %v", i, err)
 		}
@@ -222,5 +225,63 @@ func dialWithRetry(path string, deadline, backoff time.Duration) (net.Conn, erro
 			return nil, err
 		}
 		time.Sleep(backoff)
+	}
+}
+
+// TestEgressGRPCSocketPath pins the read-both-prefer-new resolver
+// contract at the daemon binding site (cmd/gatewayd-internal/egress_grpc.go
+// egressGRPCSocketPath()): the new env var wins, the legacy env var
+// is the read-both fallback, the const default kicks in when neither
+// is set, and the function never returns "". This is the regression
+// guard for PR-C's default flip — if a future refactor breaks the
+// precedence or drops the legacy slot, this test goes red.
+//
+// Tests call ResolveSocketPath directly with literal values (per
+// egresssocket's own contract) rather than going through
+// egressGRPCSocketPath() — the daemon-side wrapper just hands the
+// env var values through; the precedence logic lives in
+// pkg/gateway/egresssocket.
+func TestEgressGRPCSocketPath(t *testing.T) {
+	cases := []struct {
+		name                           string
+		env, legacyEnv, cfg, legacyCfg string
+		want                           string
+	}{
+		{
+			name:      "new env wins over legacy env",
+			env:       "/run/faas/egress.sock",
+			legacyEnv: "/tmp/legacy.sock",
+			want:      "/run/faas/egress.sock",
+		},
+		{
+			name:      "legacy env is the read-both fallback when new env is empty",
+			legacyEnv: "/tmp/legacy.sock",
+			want:      "/tmp/legacy.sock",
+		},
+		{
+			name: "config value wins when both env vars are empty",
+			cfg:  "/tmp/cfg.sock",
+			want: "/tmp/cfg.sock",
+		},
+		{
+			name:      "legacy config is the read-both fallback when only it is populated",
+			legacyCfg: "/tmp/legacy-cfg.sock",
+			want:      "/tmp/legacy-cfg.sock",
+		},
+		{
+			name: "const default kicks in when every source is empty",
+			want: "/run/faas/egress.sock",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := egresssocket.ResolveSocketPath(tc.env, tc.legacyEnv, tc.cfg, tc.legacyCfg)
+			if got != tc.want {
+				t.Errorf("ResolveSocketPath = %q, want %q", got, tc.want)
+			}
+			if got == "" {
+				t.Errorf("ResolveSocketPath returned empty string (resolver contract: never-empty)")
+			}
+		})
 	}
 }

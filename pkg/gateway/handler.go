@@ -126,6 +126,14 @@ const (
 	publicAuthModeBasic  = "basic"
 )
 
+// docsTypeBase is the canonical docs path prefix for problem
+// `type:` URLs emitted from the gateway (RFC 7807 §3.1). Sourced
+// from wire.DocsHost so a rotation only edits pkg/wire/docs.go,
+// not this file. Distinct from pkg/api's `docsBase` because the
+// gateway emits problem types (full URN-shaped slugs) rather
+// than topic-path docs URLs.
+var docsTypeBase = "https://" + wire.DocsHost + "/errors"
+
 // Authn-failure reason taxonomy (issue #560 + issue #477).
 // The strings land on the `reason` field of the audit row
 // emitted by enforceRequireAuthn and enforcePublicAuth,
@@ -245,6 +253,14 @@ type Target struct {
 	// buildStreamingBridgeScript resolves 0 to netns.AppPort (8080)
 	// for legacy cached targets that pre-date the field.
 	Port int
+	// DeploymentID (issue #556 / PR-B) is the live deployment id the
+	// target was admitted for. The per-deployment weighted picker
+	// (PGBackend.Pick) routes subsequent requests to the right
+	// deployment bucket based on each bucket's traffic_percent.
+	// Empty on legacy / pre-PR-B targets — the picker collapses to
+	// today's single-targetSet behaviour when DeploymentID is empty
+	// (one app, one targetSet, round-robin within it).
+	DeploymentID string
 }
 
 // Backend is the seam between the edge and the rest of the platform (in
@@ -267,9 +283,12 @@ type Target struct {
 type Backend interface {
 	// Lookup resolves a hostname to its app (cache-first, spec §4.1).
 	Lookup(ctx context.Context, host string) (App, bool)
-	// Pick returns one routable Target for appID via atomic round-robin, or
-	// ok=false when the cache is empty (caller should ensure capacity first).
-	Pick(appID string) (Target, bool)
+	// Pick returns a PickResult (issue #556 / PR-C): the routable
+	// Target plus the signals the handler needs to drive
+	// wake-fan-out (Picked deploymentID, ColdBucket signal).
+	// OK=false when the cache is empty (caller should ensure
+	// capacity first).
+	Pick(appID string) PickResult
 	// HealthyCount returns the number of routable Targets currently cached
 	// for appID. Drives the WakeGate's shouldWake predicate.
 	HealthyCount(appID string) int
@@ -283,7 +302,29 @@ type Backend interface {
 	// On the at-capacity path wakeID is empty, method is
 	// WakeMethodUnspecified, and err is nil. On real failure err is a
 	// non-nil *api.Problem and method is WakeMethodUnspecified.
-	Admit(ctx context.Context, appID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
+	// Admit asks schedd to admit ONE additional instance for
+	// appID, only when HealthyCount(appID) < maxConcurrency at
+	// the moment the call commits. Implementations MUST
+	// serialize the HealthyCount check and the cache update so
+	// a burst of concurrent Admit calls can never collectively
+	// exceed maxConcurrency (issue #168 fan-out invariant).
+	//
+	// deploymentID (issue #556 / PR-C): the live deployment
+	// the new instance should be admitted for. Empty falls
+	// through to schedd's default (newest live deployment) —
+	// the legacy behaviour every pre-PR-B caller exercises.
+	// Non-empty is the wake-fan-out path: the picker landed
+	// on a cold bucket and the handler asks schedd to wake
+	// that specific deployment so the retry Pick has a
+	// routable Target.
+	//
+	// On the admitted path wakeID is non-empty, the new
+	// Target is cached, and method reflects what schedd
+	// actually did (restore or cold boot). On the at-capacity
+	// path wakeID is empty, method is WakeMethodUnspecified,
+	// and err is nil. On real failure err is a non-nil
+	// *api.Problem and method is WakeMethodUnspecified.
+	Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (wakeID string, method WakeMethod, atCapacity bool, err error)
 }
 
 // Handler is gatewayd's HTTP entrypoint: route → rate-limit → (wake-block if
@@ -1350,7 +1391,7 @@ func (h *Handler) writeWebSocketNotAllowed(w http.ResponseWriter, appID string, 
 	if forwarderMissing {
 		detail = "This deployment has the WebSocket / Upgrade-traffic raw-bytes bridge disabled."
 	}
-	body := fmt.Sprintf(`{"type":"https://docs.gregale.dev/errors/plan_websocket_not_allowed","title":"WebSocket not enabled on this app or plan","status":501,"detail":%q,"code":"plan_websocket_not_allowed","app_id":%q}`, detail, appID)
+	body := fmt.Sprintf(`{"type":"`+docsTypeBase+`/plan_websocket_not_allowed","title":"WebSocket not enabled on this app or plan","status":501,"detail":%q,"code":"plan_websocket_not_allowed","app_id":%q}`, detail, appID)
 	w.WriteHeader(http.StatusNotImplemented)
 	_, _ = fmt.Fprint(w, body)
 }
@@ -1559,8 +1600,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (an instance_changed notification race). On that rare miss, fall
 	// through to the capacity problem — the WakeGate will retry on the
 	// next request.
-	target, ok := h.backend.Pick(app.ID)
-	if !ok {
+	pick := h.backend.Pick(app.ID)
+	// Wake-fan-out (issue #556 / PR-C): when Pick landed on a
+	// cold bucket in a multi-deployment app, signal the handler
+	// via ColdBucket. Admit an instance on that specific
+	// deployment so the retry Pick has a routable Target.
+	// Bounded to ONE admit per request — sustained cold-bucket
+	// hits are recovered via the next deployment_changed notify
+	// that re-seeds the cache.
+	if !pick.OK && pick.ColdBucket != "" {
+		//nolint:contextcheck // request ctx at handler boundary; this is the wake-fan-out retry branch.
+		if _, _, _, err := h.backend.Admit(r.Context(), app.ID, pick.ColdBucket, limits.MaxConcurrency); err != nil {
+			// Log-and-continue: the existing "warmest bucket"
+			// fallback inside Pick already handled the
+			// fallback path. Failure here means the cold
+			// bucket won't wake this request — the next
+			// notify will refresh weights.
+			h.log.Warn("apid: wake-fan-out admit failed", "err", err, "deployment_id", pick.ColdBucket)
+		}
+		pick = h.backend.Pick(app.ID)
+	}
+	if !pick.OK {
 		// Race: every cached instance was evicted between
 		// ensureCapacity returning and our Pick. Surface the observed
 		// (current) HealthyCount so the operator's metrics panel
@@ -1569,6 +1629,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
+	target := pick.Target
 
 	// Stamp the per-instance identity on the request BEFORE proxying so
 	// the per-node vmmd forwarder (issue #98 / ADR-028) can attribute
@@ -2177,7 +2238,7 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// codeql[go/reflected-xss] false-positive: statusRecorder is a pass-through; every caller writes application/json, application/problem+json (api.WriteProblem at :326/:335/:366/:384/:906/:911/:914) or proxies to a Firecracker guest rendered via html/template. See statusRecorder doc-comment.
+// lgtm[go/reflected-xss] false-positive: statusRecorder is a pass-through; every caller writes application/json, application/problem+json (api.WriteProblem at :326/:335/:366/:384/:906/:911/:914) or proxies to a Firecracker guest rendered via html/template. See statusRecorder doc-comment.
 func (s *statusRecorder) Write(b []byte) (int, error) {
 	if !s.wroteHeader {
 		// First Write with no explicit WriteHeader → 200.
@@ -2185,7 +2246,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.wroteHeader = true
 	}
 
-	// codeql[go/reflected-xss] false-positive: statusRecorder is a pass-through; every caller writes application/json, application/problem+json (api.WriteProblem at :326/:335/:366/:384/:906/:911/:914) or proxies to a Firecracker guest rendered via html/template. See statusRecorder doc-comment.
+	// lgtm[go/reflected-xss] false-positive: statusRecorder is a pass-through; every caller writes application/json, application/problem+json (api.WriteProblem at :326/:335/:366/:384/:906/:911/:914) or proxies to a Firecracker guest rendered via html/template. See statusRecorder doc-comment.
 	n, err := s.ResponseWriter.Write(b)
 	// bytes only advance when the underlying Write actually consumes
 	// the buffer — a partial write (err != nil, n<len(b)) still counts
@@ -2345,7 +2406,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID string, maxConcurren
 		// atomically checks HealthyCount < maxConcurrency under its
 		// own lock, so concurrent callers cannot collectively
 		// exceed the cap.
-		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
+		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
 		if e != nil {
 			return false, "", WakeMethodUnspecified, e
 		}
@@ -2372,7 +2433,7 @@ func (h *Handler) coldStart(ctx context.Context, appID string, maxConcurrency in
 			return h.backend.HealthyCount(appID) < maxConcurrency
 		},
 		func(ctx context.Context) error {
-			id, m, atCapacity, e := h.backend.Admit(ctx, appID, maxConcurrency)
+			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", maxConcurrency)
 			if e != nil {
 				return e
 			}

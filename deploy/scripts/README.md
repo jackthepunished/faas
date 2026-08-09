@@ -3,7 +3,7 @@
 Operator-runnable scripts invoked by the bootstrap playbook and the
 ops runbooks. Each script is intentionally named after the daemons
 or milestone it supports, not the brand (`faas-m8-restore-drill.sh`,
-`faas-m75-smoke.sh`, `faas-gatewayd-tls-rotate.sh`).
+`faas-m75-smoke.sh`, `verify-secrets.sh`).
 
 The `faas-*` script prefixes are a **filesystem-identity carryover**.
 The Gregale docs-rebrand pass intentionally does not rename the

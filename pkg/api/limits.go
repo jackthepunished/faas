@@ -33,6 +33,26 @@ const (
 // and for deterministic tests — do not reorder.
 var Plans = []Plan{PlanFree, PlanHobby, PlanPro, PlanScale}
 
+// GDPR self-service export rate limit (issue #755 / PR-5.1). Single
+// global value (not per-plan) because the cost is per-bundle (one
+// export scans every per-account table) and the abuse case is
+// "customer hits the endpoint once a minute". A plan-tiered version
+// would invite gaming — a Free customer hitting Pro's 5x window
+// would cost the same as a Pro customer. 24h was chosen to match the
+// DPA §7 30-day sub-processor notice window's "half-life" cadence —
+// the export bundle contains sub-processor references, so the
+// window should comfortably exceed a customer re-reading the
+// sub-processor list inside one sub-processor-change cycle.
+//
+// ExportRateLimitWindow is the lookback window; ExportRateLimitWindowSeconds
+// is the integer-seconds expression of the same value, used for the
+// Retry-After header when no prior export is found in the ledger
+// (the upper bound the wire will advertise).
+const (
+	ExportRateLimitWindow        = 24 * time.Hour
+	ExportRateLimitWindowSeconds = int(24 * time.Hour / time.Second)
+)
+
 // Limits is the full quota/limit set for one plan. Every field has a spec
 // reference. Add a field here (never a literal elsewhere) when a new limit
 // appears, and cover it in limits_test.go.
@@ -449,6 +469,24 @@ type Limits struct {
 	// app.account_id) receive 403 from the gatewayd-internal
 	// authz branch, not from this gate.
 	RequireAuthn bool
+
+	// TrafficSplit (issue #556 / traffic splitting across
+	// deployments) is the plan gate for the per-deployment
+	// traffic_percent opt-in. Pro/Scale = true; Free/Hobby =
+	// false. Differs from RequireAuthn in the Hobby tier: Hobby
+	// unlocks require_authn (issue #462 / ADR-058) but stays
+	// locked on traffic_split because the audience is more
+	// expensive — keeping N canary deployments warm is
+	// RAM-billable per running second for every "extra" live
+	// deployment, and Hobby's value-prop is "near-Free with a
+	// floor", not "production canary rollout". Apid's create
+	// + PATCH-traffic handlers reject Free/Hobby with 403
+	// plan_traffic_split_not_allowed. Column default
+	// (migration 00160) is 100, so every existing app routes
+	// 100% to its single live row regardless of plan — the
+	// gate only fires when a Free/Hobby customer tries to
+	// opt-in to a non-100 traffic_percent (which is denied).
+	TrafficSplit bool
 	// WarmSnapshotMinMsDefault is the per-app time-since-first-ready
 	// threshold for warm-tier capture, applied at CreateApp when
 	// the plan allows it. Free/Hobby = 0 (irrelevant). Pro/Scale =
@@ -581,6 +619,24 @@ type Limits struct {
 	// deployment-park branch. Default 300 s (5 min). Floor 60 s,
 	// ceiling 3600 s.
 	LivenessWindowSeconds int
+
+	// LogArchiveEnabled (issue #562) gates the per-plan log
+	// archive + read-back surface (FAAS_LOG_ARCHIVE_*). Free is
+	// off — the S3 backend + read-back path is a paid-tier
+	// feature (the abuse-floor tier doesn't need cross-process
+	// log persistence; the ring buffer is enough). Hobby/Pro/
+	// Scale opt in. The plan-level gate is read by apid's
+	// bgBefore wire-up (cmd/apid/main.go) and by the gatewayd
+	// bucket-proxy handler (issue #562 PR-B) so a Free-tier
+	// customer's read-back request returns 402 immediately
+	// without burning a bucket request.
+	LogArchiveEnabled bool
+	// LogArchiveRetentionDaysMax is the per-plan ceiling on
+	// FAAS_LOG_ARCHIVE_RETENTION_DAYS. Hobby gets 7, Pro 30,
+	// Scale 90 — matches the typical incident-window expectations
+	// per tier (Hobby's "last week", Pro's "this month", Scale's
+	// "this quarter"). 0 means "no archive on this plan" (Free).
+	LogArchiveRetentionDaysMax int
 }
 
 // planLimits is the authoritative table. Values: spec §1 quota row, §4.1 rate
@@ -735,6 +791,14 @@ var planLimits = map[Plan]Limits{
 		// default (false) keeps every existing customer
 		// public-by-default.
 		RequireAuthn: false,
+		// TrafficSplit (issue #556): Free does not unlock
+		// per-deployment traffic splitting. The column
+		// default (100) keeps today's behaviour — 100% to the
+		// single live row — so no existing Free customer is
+		// affected; the gate only fires when a Free customer
+		// passes a non-100 traffic_percent on create (403
+		// plan_traffic_split_not_allowed).
+		TrafficSplit: false,
 		// Tail primitive (issue #667 / ADR-078): Free enables with
 		// the floor timeout (5 s) and the floor concurrency cap (4).
 		// Customers on Free get the primitive, just tightly bounded —
@@ -755,6 +819,13 @@ var planLimits = map[Plan]Limits{
 		// Window=0) cause `Plan.LivenessAllowed()` to return false
 		// via the fail-closed default — see §Comment at
 		// LivenessPeriodSeconds.
+		// Log archive (issue #562): Free is the abuse-floor tier
+		// and doesn't get the S3 archive + read-back surface —
+		// the in-process ring buffer is the only log surface. The
+		// shipper's bgBefore closure fails closed on this gate
+		// (returns immediately on ctx.Done()).
+		LogArchiveEnabled:          false,
+		LogArchiveRetentionDaysMax: 0,
 	},
 	PlanHobby: {
 		Plan:               PlanHobby,
@@ -923,6 +994,16 @@ var planLimits = map[Plan]Limits{
 		// feature toggle, and the issue pairs it with
 		// internal-only ingress (Pro+).
 		RequireAuthn: false,
+		// TrafficSplit (issue #556): Hobby does not unlock
+		// per-deployment traffic splitting. Hobby's value-prop
+		// is "near-Free with a floor" (MinInstancesAllowed
+		// unlocked by issue #462 / ADR-058), not "production
+		// canary rollout". The 2-3 live deployment bill shape
+		// costs 2-3× the per-running-second RAM; Hobby's price
+		// point doesn't cover it. Free/Hobby see 403
+		// plan_traffic_split_not_allowed when they try to
+		// pass a non-100 traffic_percent on create or PATCH.
+		TrafficSplit: false,
 		// Tail primitive (issue #667 / ADR-078): Hobby unlocks
 		// the 15 s timeout + 16 per-instance concurrent tails.
 		// Matches the issue's "send a confirmation email"
@@ -947,6 +1028,14 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Hobby unlocks the archive
+		// + read-back surface at the first paid tier. 7-day
+		// retention matches the "last week" incident-window
+		// expectation of a Hobby customer; shipper cycle is the
+		// 5-minute default so a Hobby customer's logs land in
+		// S3 within the spec §4.1 latency budget.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 7,
 	},
 	PlanPro: {
 		Plan:               PlanPro,
@@ -1095,6 +1184,13 @@ var planLimits = map[Plan]Limits{
 		// recommendation. The column default is still
 		// false — the customer must explicitly PATCH true.
 		RequireAuthn: true,
+		// TrafficSplit (issue #556): Pro unlocks
+		// per-deployment traffic splitting. The issue
+		// title says "Pro+ canary"; the migration
+		// (00160) and CreateDeployment handler stamp
+		// traffic_percent=100 by default, so customers
+		// who never opt-in see no behavioural change.
+		TrafficSplit: true,
 		// Tail primitive (issue #667 / ADR-078): Pro unlocks
 		// the 30 s timeout + 64 per-instance concurrent tails.
 		// Matches the issue's per-plan matrix value; covers
@@ -1115,6 +1211,13 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Pro extends the retention
+		// window to 30 days — covers a "this month" customer
+		// post-mortem window. S3 storage cost scales linearly
+		// with retention, so the per-plan matrix stays tight
+		// rather than being a single shared cap.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 30,
 	},
 	PlanScale: {
 		Plan:               PlanScale,
@@ -1273,6 +1376,12 @@ var planLimits = map[Plan]Limits{
 		// Customers on the largest plan who want
 		// token-gating still set it per-deployment.
 		RequireAuthn: true,
+		// TrafficSplit (issue #556): Scale unlocks
+		// per-deployment traffic splitting — the
+		// revenue-protecting feature for the Scale
+		// tier (5/25/100% staged rollout to defend
+		// against bad deploys on a checkout API).
+		TrafficSplit: true,
 		// Tail primitive (issue #667 / ADR-078): Scale unlocks
 		// the 60 s timeout + 256 per-instance concurrent tails —
 		// the ceiling per the issue's per-plan matrix. The 60 s
@@ -1298,6 +1407,14 @@ var planLimits = map[Plan]Limits{
 		LivenessCooldownSeconds:     DefaultLivenessCooldownSeconds,
 		LivenessMaxRestarts:         DefaultLivenessMaxRestarts,
 		LivenessWindowSeconds:       DefaultLivenessWindowSeconds,
+		// Log archive (issue #562): Scale gets 90-day retention
+		// — covers a "this quarter" compliance window that
+		// SaaS-scale customers typically need. Storage cost is
+		// the customer's (separate billing path outside of the
+		// free GB-h allowance), so the per-plan matrix stays
+		// generous at the top tier.
+		LogArchiveEnabled:          true,
+		LogArchiveRetentionDaysMax: 90,
 	},
 }
 
@@ -1730,6 +1847,43 @@ const (
 	MigratingWatchdogTickLimit       = 50
 	MigratingWatchdogIntervalSeconds = 1
 
+	// Dead-node billing reconciler. schedd's heartbeat sweep flips
+	// compute_nodes.active = false when a node stops answering, but
+	// that write deliberately does not touch `instances` — so a vmmd
+	// that dies without transitioning its rows leaves them RUNNING
+	// forever. meterd bills on State.CountsForRAM() with no
+	// node-liveness cross-check (pkg/meter/sampler.go), which means
+	// the customer keeps paying for a VM that no longer exists, and
+	// the phantom rows keep consuming the §6.2-2 RAM ceiling.
+	// Engine.ReconcileDeadNodeInstances closes both.
+	//
+	// DeadNodeReconcilerStalenessSeconds is how long a node's
+	// last_heartbeat_at may age before its RUNNING instances are
+	// considered orphaned. It MUST be ≥ the heartbeat staleness
+	// window (state.DefaultHeartbeatStaleness, 90s) — reconciling
+	// sooner than schedd itself declares a node dead would fail
+	// instances on a node that is merely slow. 120s = 90s + one 30s
+	// heartbeat interval of slack, so a single missed tick during a
+	// GC pause or a schedd restart never fails a live instance.
+	//
+	// DeadNodeReconcilerTickLimit caps the per-tick write burst. A
+	// whole node's instances can go dead at once, and this is a
+	// terminal transition — bounding the batch keeps one tick's
+	// write amplification predictable. The sweep re-runs on the next
+	// tick until the set drains, ordered longest-dead-first so the
+	// worst billing offenders are corrected first.
+	DeadNodeReconcilerStalenessSeconds = 120
+	DeadNodeReconcilerTickLimit        = 50
+
+	// DeadNodeReconcilerIntervalSeconds is the sweep cadence. 30s,
+	// not the §6.1 watchdog's 1s: the staleness window is 120s, so a
+	// 1s tick would issue 120 identical no-op queries per node-death
+	// before the first row is even eligible. 30s bounds the worst-case
+	// extra billing exposure to one tick (a node dying just after a
+	// sweep is corrected ≤150s later, well inside a single billed
+	// minute) while keeping the query load negligible.
+	DeadNodeReconcilerIntervalSeconds = 30
+
 	// Tier A7 (edge split — gatewayd-public / gatewayd-internal,
 	// ADR-070): drain + replica registry + warm-hint-cache tunables.
 	//
@@ -1772,6 +1926,92 @@ const (
 	ReplicaHeartbeatIntervalSeconds = 5
 	WarmHintCacheSize               = 1000
 	CertSyncIntervalSeconds         = 30
+
+	// Tier A8 (active-passive HA topology, ADR-083 — closes the
+	// §14 M8 "Gate-A runbook (2nd box active-passive)" gap left
+	// by Tier A4 + A5 + A7). Lex-min leader election lives in
+	// pkg/gateway/leader; standby warm-up + drain handoff lives
+	// in cmd/gatewayd-public (PR-B).
+	//
+	// HAFailoverProbeTimeoutMS is the per-probe HTTP HEAD timeout
+	// for the standby warm-up scraper in
+	// cmd/gatewayd-public/standby_warmup.go. Each probe pre-warms
+	// the per-app target-set cache so the new leader's first
+	// request to an app hits a warm cache (no cold-boot penalty).
+	// 500 ms is the worst-case round-trip from
+	// `gatewayd-public` → `gatewayd-internal` → cache write —
+	// much shorter than the existing wake-quiesce window. On
+	// timeout the scraper logs Warn and skips the app; the
+	// ADR-005 cold-boot safety net still serves the request.
+	// Tunable via FAAS_HA_FAILOVER_PROBE_TIMEOUT_MS.
+	//
+	// HADNSRecordStaleSeconds bounds the drain protocol in
+	// cmd/gatewayd-public/dns_handoff.go — the time between
+	// `StandbyState → draining` and `dns.DeleteRecord`. 30 s
+	// matches typical DNS TTL so the operator's resolver cache
+	// stays honest, and bounds the operator's `kubectl drain`
+	// analog (a stuck drain doesn't block the operator). On
+	// expiry the leader increments
+	// `gateway_active_passive_failovers_total{outcome="peer_unreachable"}`
+	// and the runbook's manual drain command kicks in.
+	// Tunable via FAAS_HA_DNS_RECORD_STALE_SECONDS.
+	//
+	// HAStandbyWarmupIntervalMS is the cadence at which a standby
+	// re-scrapes cmd/gatewayd-internal on each known app's
+	// hostname. The full per-app cache TTL is
+	// HAStandbyWarmupIntervalMS × targetSetCacheTTL; tuned so the
+	// standby's cache is always within one scrape of the leader's
+	// cache. Tunable via FAAS_HA_STANDBY_WARMUP_INTERVAL_MS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	HAFailoverProbeTimeoutMS  = 500
+	HADNSRecordStaleSeconds   = 30
+	HAStandbyWarmupIntervalMS = 500
+
+	// Tier A9 (standby write-redirect, ADR-084 — closes ADR-083
+	// §Open follow-up #2). The redirect lives in
+	// cmd/gatewayd-internal/proxy.go (PR-B); the constants below
+	// bound every timer that PR-B's writeGate consults so the
+	// PR-A refactor can land them in advance.
+	//
+	// StandbyWriteRedirectTimeoutMS is the cross-box mTLS hop
+	// budget for the transparent relay. A standby that receives
+	// a bearer-authenticated mutation opens an outbound
+	// https://<leaderURL>/ dial; on timeout the standby
+	// degrades to 307 Temporary Redirect so the CLI's stdlib
+	// http.Client follows the public edge instead. Tunable via
+	// FAAS_STANDBY_WRITE_REDIRECT_TIMEOUT_MS.
+	//
+	// StandbyWriteRetryAfterSeconds is the Retry-After value
+	// attached to the 503/307 responses the standby emits (cookie
+	// writes on standbys, dial-failure fallback). 5 s is well
+	// under the typical DNS TTL so the customer's next retry
+	// usually lands on the new leader via DNS resolution.
+	// Tunable via FAAS_STANDBY_WRITE_RETRY_AFTER_SECONDS.
+	//
+	// StandbyWriteLeaderURLCacheTTLSeconds bounds the lifetime
+	// of the cached leader URL inside pkg/gateway/writegate's
+	// LeaderResolver. The cache is invalidated promptly on
+	// compute_node_changed (pg_notify subscriber); 5 s is the
+	// upper bound when the subscriber misses an event (e.g.
+	// network blip on the unix socket). Tunable via
+	// FAAS_STANDBY_WRITE_LEADER_URL_CACHE_TTL_SECONDS.
+	//
+	// StandbyWriteNoLeaderRetryAfterSeconds is the Retry-After
+	// for the 503 emitted when election returns no active peer
+	// (all boxes drained, or pg outage). 60 s is the spec's
+	// "standby state warming too long" alert threshold —
+	// longer than DNS TTL but short enough that a customer
+	// retry doesn't pile up. Tunable via
+	// FAAS_STANDBY_WRITE_NO_LEADER_RETRY_AFTER_SECONDS.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	StandbyWriteRedirectTimeoutMS         = 5000
+	StandbyWriteRetryAfterSeconds         = 5
+	StandbyWriteLeaderURLCacheTTLSeconds  = 5
+	StandbyWriteNoLeaderRetryAfterSeconds = 60
 
 	// Free-tier disk reaper (spec §4.3): zero requests this long => EVICTED_COLD.
 	FreeTierColdEvictDays = 14
@@ -1826,6 +2066,13 @@ const (
 	// support (CONFIG_NF_CONNTRACK_NET_NS=n). The egress tc cap is
 	// unaffected.
 	ConntrackCap = DefaultConntrackCap
+
+	// DefaultMaxHeaderBytes caps the http.Server header size on the
+	// gatewayd-public listeners (public + control). It mirrors stdlib's
+	// historical 1 MiB default but pins it so a future stdlib default
+	// change cannot widen the attack surface on this listener; a single
+	// tenant-crafted 1 MiB header is fine, 64 MiB is not.
+	DefaultMaxHeaderBytes = 1 << 20 // 1 MiB
 )
 
 // DefaultComputeNodeCeilingMB is the per-compute-node admission ceiling
@@ -2090,6 +2337,32 @@ func (p Plan) LivenessAllowed() bool {
 	return l.LivenessPeriodSeconds > 0
 }
 
+// LogArchiveEnabled (issue #562) reports whether the plan
+// ships logs to S3. Free returns false (the abuse-floor tier
+// has no archive + read-back surface). Unknown plans fail
+// closed to false so a missing plan row never silently
+// enables the shipper + bucket-proxy surface.
+func (p Plan) LogArchiveEnabled() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.LogArchiveEnabled
+}
+
+// LogArchiveRetentionDaysMax (issue #562) returns the
+// per-plan ceiling on FAAS_LOG_ARCHIVE_RETENTION_DAYS. 0
+// for Free (no archive); the apid bgBefore closure uses
+// this to clamp the configured value at boot so an operator
+// can't set a higher retention than the plan allows.
+func (p Plan) LogArchiveRetentionDaysMax() int {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return 0
+	}
+	return l.LogArchiveRetentionDaysMax
+}
+
 // LivenessPeriodSeconds returns the per-plan default poll cadence
 // for the liveness probe (issue #554). 0 for Free — coupled to
 // LivenessAllowed() above; if the customer is on a plan where
@@ -2273,6 +2546,27 @@ func (p Plan) RequireAuthnAllowed() bool {
 		return false // fail-closed
 	}
 	return l.RequireAuthn
+}
+
+// TrafficSplitAllowed reports whether the plan permits a customer to
+// set a non-default traffic_percent on a deployment (issue #556).
+// Pro/Scale return true; Free/Hobby return false so apid's
+// createDeployment handler and the new updateDeploymentTraffic
+// handler (PATCH /v1/deployments/{id}/traffic) surface 403
+// plan_traffic_split_not_allowed. The migration (00160) column
+// default is 100, so every existing app routes 100% to its single
+// live row regardless of plan — the gate only fires when a Free/
+// Hobby customer tries to opt-in (which is denied). Unknown plans
+// fail closed (return false), matching the RequireAuthnAllowed
+// contract above. Hobby deliberately stays locked (vs Hobby's
+// unlocked MinInstancesAllowed): see the Limits.TrafficSplit
+// field comment.
+func (p Plan) TrafficSplitAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false // fail-closed
+	}
+	return l.TrafficSplit
 }
 
 // RequireAuthnDefault (issue #695 / ADR-080) returns the default

@@ -30,6 +30,23 @@ type PathCheck struct {
 	Reason string
 }
 
+// IsControllerStagingEntry reports whether an entry under a base
+// staging root is controller-owned scratch: either a faas-base-*
+// extraction dir or a faas-base-mkfs-*.ext4 mkfs temp file. Shared by
+// the dry-run stale-scratch report and the host runtime cleanup
+// (cmd/deployctl/runtime.go) so the two always agree on what is
+// controller-owned.
+func IsControllerStagingEntry(entry os.DirEntry) bool {
+	name := entry.Name()
+	if !strings.HasPrefix(name, "faas-base-") {
+		return false
+	}
+	if entry.IsDir() {
+		return true
+	}
+	return strings.HasPrefix(name, "faas-base-mkfs-") && strings.HasSuffix(name, ".ext4")
+}
+
 func DryRun(config Config, releaseID string) (MigrationReport, error) {
 	if config.ReleasesRoot == "" || config.CurrentPath == "" {
 		return MigrationReport{}, fmt.Errorf("deploycontroller: incomplete dry-run config")
@@ -96,6 +113,7 @@ func DryRun(config Config, releaseID string) (MigrationReport, error) {
 		{"/run/faas", "runtime socket directory"},
 		{"/srv/fc/base", "base image storage"},
 		{"/srv/fc/base-staging", "disk-backed extraction staging"},
+		{"/srv/fc/scans", "base scan sidecar storage"},
 		{"/dev/shm", "tmpfs overlay staging"},
 	} {
 		report.RequiredPaths = append(report.RequiredPaths, PathCheck{Path: path.path, Exists: pathExists(path.path), Reason: path.reason})
@@ -107,7 +125,7 @@ func DryRun(config Config, releaseID string) (MigrationReport, error) {
 			continue
 		}
 		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasPrefix(entry.Name(), "faas-base-mkfs-") || !strings.HasSuffix(entry.Name(), ".ext4") {
+			if !IsControllerStagingEntry(entry) {
 				continue
 			}
 			report.StaleScratchFiles = append(report.StaleScratchFiles, filepath.Join(root, entry.Name()))

@@ -172,6 +172,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/usage/daily":                      "UsageDaily",
 	"GET /v1/usage/storage":                    "StorageUsage",
 	"GET /v1/invoices":                         "ListInvoices",
+	"POST /v1/invocations/{id}/replay":         "ReplayInvocation", // issue #315 — re-issue a failed/dead_letter invocation
 	"GET /v1/apps/{slug}/secrets":              "ListSecrets",
 	"GET /v1/domains":                          "ListDomains",
 	"POST /v1/domains":                         "CreateDomain",
@@ -241,6 +242,13 @@ var methodRouteMap = map[string]string{
 	// the SDK's flat resource naming.
 	"GET /v1/audit-events":      "ListAuditEvents",
 	"GET /v1/audit-events/{id}": "GetAuditEvent",
+
+	// Issue #755 / PR-6 — audit_log dashboard surface. Reads the
+	// FK-free audit_log table (migrations/00163_audit_log.sql);
+	// distinct from /v1/audit-events which reads the live events
+	// table. Two routes by audience (customer-scoped / operator).
+	"GET /v1/audit-log":     "ListAuditLog",
+	"GET /v1/audit-log/all": "ListAuditLogAll",
 
 	// Issue #517 / PR-C / ADR-064 — wake timeline. The route is a
 	// sub-resource of /v1/apps/{slug}/wakes/{wake_id}/timeline; the

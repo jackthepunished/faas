@@ -8,6 +8,24 @@ import (
 	"strconv"
 )
 
+// docsBase is the canonical documentation URL prefix sourced
+// from pkg/wire.DocsHost. Every WithDocs() / Type: / example
+// value in this file composes against this constant so a future
+// host rotation only edits pkg/wire/docs.go + this constant, not
+// every call site.
+//
+// Duplication note: pkg/wire.DocsHost and this constant must
+// stay in lock-step — pkg/api cannot import pkg/wire (pkg/wire
+// imports pkg/api for api.Plans, creating a cycle). The
+// TestLintTripwire_NoLiteralDocsDomainEverywhere tripwire in
+// cmd/gregale/lint_tripwires_test.go enforces the invariant via
+// an explicit "docs.gregale.dev must appear in pkg/wire/docs.go
+// AND pkg/api/errors.go (and nowhere else)" check (see the
+// host-mirror assertion added in PR-BC).
+//
+// Mirrors cmd/gregale/output.go:118's docsURLBase precedent.
+const docsBase = "https://docs.gregale.dev"
+
 // AsProblem walks err's chain and returns the first *Problem. Returns nil
 // if none of the wrapped errors is a *Problem. Used by gRPC handlers in
 // pkg/vmmdgrpc to lift a Manager-emitted error without leaking internal
@@ -181,7 +199,15 @@ const (
 	// builder below) so a script can compute the raise amount
 	// without parsing prose.
 	CodeAdmissionRefused = "admission_refused"
-	CodeUnauthorized     = "unauthorized"
+	// CodeExportRateLimited marks a GET /v1/account/export that
+	// landed inside the per-account 24h rate window (issue #755 /
+	// PR-5.1). Distinct from CodeQuotaExhausted (plan-level monthly
+	// usage cap, 429) and CodePlanLimitConcur (per-app concurrency,
+	// 429) — this is a self-imposed abuse-mitigation on a GDPR
+	// endpoint, not a billing gate. Maps to HTTP 429 + Retry-After:
+	// the window is 24h so the retry hint is in seconds-until-reset.
+	CodeExportRateLimited = "export_rate_limited"
+	CodeUnauthorized      = "unauthorized"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
@@ -228,7 +254,18 @@ const (
 	// AEAD-bound AccountID disagrees with the sessions row. AEAD
 	// forgery on the same key ought to be unreachable; if it ever
 	// fires the operator should investigate the key-sealing path.
-	CodeSessionInvalid    = "session_invalid"
+	CodeSessionInvalid = "session_invalid"
+	// CodeUnsupportedByCLI is returned by the SDK client when a caller
+	// targets an API route that requires the dashboard session cookie
+	// (e.g. /v1/auth/sessions, /v1/auth/capabilities). The bearer-key
+	// CLI cannot reach these routes — they are mounted behind
+	// sessionAuth (cmd/apid/server.go:1097) and reject 401 on a
+	// bearer header. The guard in pkg/api/client.go lifts this into
+	// a clean 403 before the request is even issued so the failure
+	// mode is honest, not a confusing auth error. See
+	// pkg/api/client.go's cookieOnlyPathRE and the tripwire in
+	// pkg/api/lint_tripwires_test.go.
+	CodeUnsupportedByCLI  = "unsupported_by_cli"
 	CodeDomainNotVerified = "domain_not_verified"
 	CodeCronInvalid       = "cron_invalid"
 	CodeAlertRuleInvalid  = "alert_rule_invalid"
@@ -373,6 +410,38 @@ const (
 	// --min-instances").
 	CodeMaxMinInstancesExceeded = "max_min_instances_exceeded"
 
+	// CodePlanTrafficSplitNotAllowed (issue #556 / traffic
+	// splitting across deployments) is a 403 for plan-tier
+	// rejections: a Free/Hobby customer tries to set a
+	// non-default traffic_percent on a deployment. Mirrors
+	// CodePlanMinInstancesNotAllowed so the CLI renders the same
+	// "your plan doesn't allow this — upgrade" shape. The
+	// migration (00160) column default is 100, so customers
+	// who never opt-in see no behavioural change; the gate
+	// only fires when a customer explicitly opts in to a
+	// non-100 traffic_percent on create or PATCH-traffic.
+	CodePlanTrafficSplitNotAllowed = "plan_traffic_split_not_allowed"
+	// CodeInvalidTrafficPercent (issue #556) is a 422 for shape
+	// violations: traffic_percent is outside [0, 100] (or
+	// negative). Distinct from CodeValidation so the CLI can
+	// render the cap+observed pair via WithLimit (mirrors the
+	// CodeInvalidMinInstances pattern at line 1692). The state
+	// layer (pkg/state.UpdateDeploymentTraffic) also lifts
+	// this code on out-of-range input as a defence-in-depth
+	// backstop.
+	CodeInvalidTrafficPercent = "invalid_traffic_percent"
+	// CodeTrafficPercentSumInvalid (issue #556) is a 409
+	// (Conflict) for the defensive backstop: post-write
+	// Σ(traffic_percent WHERE status='live') != 100. In
+	// practice this is unreachable — the schema CHECK
+	// (00160) gates the per-row range and the
+	// UpdateDeploymentTraffic transaction zeroes siblings
+	// before stamping the target. The state layer asserts
+	// the invariant explicitly and lifts to this code if
+	// violated, so a future refactor that breaks the Σ
+	// tripwire surfaces a 409 (not a silent DB drift).
+	CodeTrafficPercentSumInvalid = "traffic_percent_sum_invalid"
+
 	// Sidecar containers (issue #463 / ADR-068). Eight RFC 7807
 	// codes for the sidecar surface. The cap and type-uniqueness
 	// codes are the load-bearing 400-class shapes; the stateful
@@ -408,6 +477,14 @@ const (
 	CodePlanFeatureGated   = "plan_feature_gated"
 	CodePlanDelayedCap     = "plan_delayed_tasks_cap"
 	CodeInvocationNotFound = "invocation_not_found"
+	// CodeInvocationNotReplayable (issue #315 / tier-2 DX) is the
+	// 409 surfaced by POST /v1/invocations/{id}/replay when the
+	// original invocation is in a state that cannot be re-issued
+	// (anything other than {failed, dead_letter}). Distinct from
+	// CodeConflict so the CLI's error template can render the
+	// "use `gregale invocation <id>` to inspect the state" hint
+	// without parsing prose.
+	CodeInvocationNotReplayable = "invocation_not_replayable"
 	// CodeBuildProvenanceNotFound is the ADR-038 / Tier 3 #197
 	// B3.10-read sentinel. Distinct from a generic "no such build"
 	// so the customer can branch: a build that exists with no
@@ -775,7 +852,7 @@ func StatusForCode(code string) int {
 	switch code {
 	case CodePlanLimitApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue:
 		return http.StatusForbidden
-	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached:
+	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached, CodeExportRateLimited:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge
@@ -808,6 +885,15 @@ func StatusForCode(code string) int {
 		return http.StatusNotFound
 	case CodeConflict, CodeDomainNotVerified, CodeNoRollbackTarget:
 		return http.StatusConflict
+	case CodeTrafficPercentSumInvalid:
+		// 409 — issue #556. Σ(traffic_percent WHERE status='live')
+		// != 100 after UpdateDeploymentTraffic. Defensive backstop;
+		// unreachable in practice. Sits next to CodeConflict /
+		// CodeDomainNotVerified / CodeNoRollbackTarget because the
+		// semantics are "the requested state cannot be applied
+		// alongside the existing row set", not "your plan forbids
+		// this".
+		return http.StatusConflict
 	case CodeDeployFailed:
 		return http.StatusUnprocessableEntity
 	case CodeDeploySignatureInvalid:
@@ -815,7 +901,23 @@ func StatusForCode(code string) int {
 		// CodeSigInvalid's 503 (which fires on the cold-boot layer-verify
 		// path). See CodeDeploySignatureInvalid declaration above.
 		return http.StatusForbidden
+	case CodeUnsupportedByCLI:
+		// 403 — the cookie-only-route guard (pkg/api/client.go)
+		// rejected the path before issuing the request. 403 is
+		// the closest sibling to CodeDeploySignatureInvalid's
+		// "this caller cannot complete this action" semantic.
+		// Companion to CodeSessionExpired (401) which is the
+		// server-side mirror for a cookie that WAS sent but is
+		// gone.
+		return http.StatusForbidden
 	case CodeImageNotFound, CodeImageManifestInvalid:
+		return http.StatusUnprocessableEntity
+	case CodeInvalidTrafficPercent:
+		// 422 — issue #556. traffic_percent outside [0, 100].
+		// Sits next to CodeImageNotFound / CodeImageManifestInvalid
+		// (422 family). Mirrors CodeInvalidMinInstances's
+		// shape-second 422 contract; the plan-gate cousin
+		// (CodePlanTrafficSplitNotAllowed) is the 403 above.
 		return http.StatusUnprocessableEntity
 	case CodeImageEgressDenied:
 		return http.StatusForbidden
@@ -830,6 +932,10 @@ func StatusForCode(code string) int {
 	case CodePayment:
 		return http.StatusPaymentRequired
 	case CodePlanLimitSecrets:
+		return http.StatusForbidden
+	case CodePlanTrafficSplitNotAllowed:
+		// 403 — issue #556. Free/Hobby trying to set a
+		// non-default traffic_percent; mirrors CodePlanMinInstancesNotAllowed.
 		return http.StatusForbidden
 	case CodeSecretInvalidKey, CodeSecretNotFound:
 		return http.StatusBadRequest
@@ -899,6 +1005,14 @@ func StatusForCode(code string) int {
 		return http.StatusPaymentRequired
 	case CodePlanAlertRuleQuota:
 		return http.StatusForbidden
+	case CodePlanLogArchiveNotAllowed:
+		// Issue #562 / PR-B: Free customers don't have log
+		// archive read-back. Same shape as the other plan-
+		// gated "X unavailable on this plan" codes: 402 +
+		// a deliberate upsell. The gatewayd-internal archive
+		// handler maps LogArchiveEnabled() == false to this
+		// code via ErrPlanLogArchiveNotAllowed.
+		return http.StatusPaymentRequired
 	// Issue #561 — spend cap pauses workload. 402 mirrors the existing
 	// `CodePlanFeatureGated` / `CodePlanCronsNotAllowed` /
 	// `CodePlanAlertRulesNotAllowed` family: a deliberate account-level
@@ -936,6 +1050,11 @@ func StatusForCode(code string) int {
 		return http.StatusUnprocessableEntity
 	case CodeInvocationNotFound:
 		return http.StatusNotFound
+	case CodeInvocationNotReplayable:
+		// Issue #315: replay attempts on a non-replayable state
+		// surface 409 — the conflict is between the request and
+		// the resource's current state, not between two writes.
+		return http.StatusConflict
 	case CodeInvalidCredentials, CodeEmailNotVerified:
 		return http.StatusUnauthorized
 	case CodePasswordTooWeak, CodeAccountExists:
@@ -981,7 +1100,7 @@ func ErrPlanLimitApps(l Limits, observed int) *Problem {
 		"App limit reached",
 		fmt.Sprintf("%s plan allows %d deployed app(s); you have %d.", l.Plan, l.DeployedApps, observed)).
 		WithLimit(int64(l.DeployedApps), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#apps")
+		WithDocs(docsBase + "/plans#apps")
 }
 
 // ErrPlanLimitRAM is returned when a requested ram_mb exceeds the plan cap.
@@ -990,7 +1109,7 @@ func ErrPlanLimitRAM(l Limits, requestedMB int) *Problem {
 		"RAM over plan limit",
 		fmt.Sprintf("%s plan caps %d MB/app; requested %d MB.", l.Plan, l.RAMMB, requestedMB)).
 		WithLimit(int64(l.RAMMB), int64(requestedMB)).
-		WithDocs("https://docs.gregale.dev/plans#ram")
+		WithDocs(docsBase + "/plans#ram")
 }
 
 // ErrAppLayerTooLarge is returned when the built app layer (deps + code) exceeds
@@ -1003,7 +1122,7 @@ func ErrAppLayerTooLarge(l Limits, observedBytes int64) *Problem {
 		fmt.Sprintf("%s plan caps the app layer at %d MB; built layer is %.1f MB.",
 			l.Plan, l.AppLayerMaxMB, float64(observedBytes)/(1024*1024))).
 		WithLimit(capBytes, observedBytes).
-		WithDocs("https://docs.gregale.dev/build/limits#app-layer")
+		WithDocs(docsBase + "/build/limits#app-layer")
 }
 
 // ErrPlanLimitConcurrency is returned when waking another instance would exceed
@@ -1013,7 +1132,7 @@ func ErrPlanLimitConcurrency(l Limits, observed int) *Problem {
 		"Concurrency limit reached",
 		fmt.Sprintf("%s plan allows %d concurrent instance(s) per app; %d already live.", l.Plan, l.MaxConcurrency, observed)).
 		WithLimit(int64(l.MaxConcurrency), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#concurrency")
+		WithDocs(docsBase + "/plans#concurrency")
 }
 
 // ErrCapacity is returned when admission is refused for lack of box capacity
@@ -1030,7 +1149,7 @@ func ErrAppConcurrencyReached(l Limits, observed int) *Problem {
 		"App concurrency reached",
 		fmt.Sprintf("%s plan allows %d concurrent instance(s) per app; %d already live.", l.Plan, l.MaxConcurrency, observed)).
 		WithLimit(int64(l.MaxConcurrency), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#concurrency")
+		WithDocs(docsBase + "/plans#concurrency")
 }
 
 func ErrCapacity(detail string) *Problem {
@@ -1060,7 +1179,7 @@ func ErrWaitForWarm(cooldownS int, l Limits, observed int) *Problem {
 				"Plan %s allows %d concurrent instance(s); %d live.",
 			cooldownS, l.Plan, l.MaxConcurrency, observed)).
 		WithLimit(int64(cooldownS), int64(observed)).
-		WithDocs("https://docs.gregale.dev/scaling-policy#cooldown").
+		WithDocs(docsBase+"/scaling-policy#cooldown").
 		WithHeader("Retry-After", strconv.Itoa(cooldownS))
 }
 
@@ -1084,7 +1203,29 @@ func ErrAdmissionRefused(observedCents, capCents int64) *Problem {
 				"Raise the cap (POST /v1/account/overage-cap) to resume wake traffic.",
 			observedCents, capCents)).
 		WithLimit(capCents, observedCents).
-		WithDocs("https://docs.gregale.dev/billing#spend-cap")
+		WithDocs(docsBase + "/billing#spend-cap")
+}
+
+// ErrExportRateLimited is returned by GET /v1/account/export when
+// the account has already served an export inside the 24h rate
+// window (issue #755 / PR-5.1). 429 + Retry-After: the wire carries
+// seconds-until-reset so a well-behaved SDK can back off without
+// re-parsing the body. distinct from CodeQuotaExhausted (plan-level
+// monthly usage, 429) and CodePlanLimitConcur (per-app concurrency,
+// 429): this is a self-imposed abuse-mitigation on a GDPR endpoint,
+// not a billing gate, so the human-readable Title is "export rate
+// limited" rather than "quota exhausted". retryAfterS is bounded at
+// 1 second (matches the ErrWaitForWarm convention) so the wire
+// always emits a positive Retry-After.
+func ErrExportRateLimited(retryAfterS int) *Problem {
+	if retryAfterS <= 0 {
+		retryAfterS = 1
+	}
+	return NewProblem(http.StatusTooManyRequests, CodeExportRateLimited,
+		"Export rate limited",
+		"Only one account export is allowed per 24h window; retry after the indicated back-off.").
+		WithHeader("Retry-After", fmt.Sprintf("%d", retryAfterS)).
+		WithDocs("https://docs.gregale.dev/gdpr#export-rate-limit")
 }
 
 // ErrInternal is the catch-all 500 envelope for handler-side failures
@@ -1123,7 +1264,7 @@ func ErrStepUpRequired() *Problem {
 func ErrBillingNotImplemented(detail string) *Problem {
 	return NewProblem(http.StatusNotImplemented, CodeBillingNotImplemented,
 		"Billing provider does not support this surface", detail).
-		WithDocs("https://docs.gregale.dev/billing/providers")
+		WithDocs(docsBase + "/billing/providers")
 }
 
 // ErrSourceTooLarge is returned when an uploaded tarball exceeds the plan cap.
@@ -1133,7 +1274,7 @@ func ErrSourceTooLarge(l Limits, observedBytes int64) *Problem {
 		"Source too large",
 		fmt.Sprintf("%s plan caps source at %d MB.", l.Plan, l.SourceTarballMaxMB)).
 		WithLimit(capBytes, observedBytes).
-		WithDocs("https://docs.gregale.dev/build/limits")
+		WithDocs(docsBase + "/build/limits")
 }
 
 // ErrSourceInvalid is returned when a tarball fails shape validation
@@ -1141,7 +1282,7 @@ func ErrSourceTooLarge(l Limits, observedBytes int64) *Problem {
 func ErrSourceInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSourceInvalid,
 		"Source invalid", reason).
-		WithDocs("https://docs.gregale.dev/build/source")
+		WithDocs(docsBase + "/build/source")
 }
 
 // ErrStatelessOnlyViolation is returned when a deploy shape (or resolved
@@ -1160,11 +1301,14 @@ func ErrStatelessOnlyViolation(kind, detail string) *Problem {
 		fmt.Sprintf("%s: %s — this platform is stateless in year one; "+
 			"use a managed service (S3/R2/Neon/Upstash/MongoDB Atlas).",
 			kind, detail)).
-		// Every WithDocs() in this file points at docs.gregale.dev; the
-		// /storage page is added by PR-B (Wave 0, faas init + reference
-		// templates) — until then the URL 404s, consistent with every
-		// other docs URL in the file.
-		WithDocs("https://docs.gregale.dev/storage")
+		// Every WithDocs() in this file is sourced from
+		// docsBase (the package-local constant), which is
+		// duplicated from pkg/wire.DocsHost because pkg/api
+		// cannot import pkg/wire (cycle). The /storage page
+		// is added by PR-B (Wave 0, faas init + reference
+		// templates) — until then the URL 404s, consistent
+		// with every other docs URL in the file.
+		WithDocs(docsBase + "/storage")
 }
 
 // ErrDomainNotVerified is returned when a customer tries to bind a domain
@@ -1173,14 +1317,14 @@ func ErrDomainNotVerified(domain string) *Problem {
 	return NewProblem(http.StatusConflict, CodeDomainNotVerified,
 		"Domain not verified",
 		fmt.Sprintf("TXT challenge for %q not yet satisfied; publish the required TXT record and retry.", domain)).
-		WithDocs("https://docs.gregale.dev/domains/verify")
+		WithDocs(docsBase + "/domains/verify")
 }
 
 // ErrCronInvalid is returned for malformed cron expressions.
 func ErrCronInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeCronInvalid,
 		"Invalid cron schedule", reason).
-		WithDocs("https://docs.gregale.dev/crons")
+		WithDocs(docsBase + "/crons")
 }
 
 // CodePlanCronsNotAllowed is the 402 the customer sees when the
@@ -1249,6 +1393,31 @@ const CodePlanWebhooksNotAllowed = "plan_webhooks_not_allowed"
 // can branch on upsell-vs-delete copy without parsing the body.
 const CodePlanWebhookQuota = "plan_webhook_quota"
 
+// CodePlanLogArchiveNotAllowed is the 402 the customer sees when
+// they request ?archive=1 against an app on a plan whose
+// LogArchiveEnabled() returns false (Free today, issue #562).
+// Fires BEFORE the gatewayd-internal handler touches S3 so a
+// Free customer gets a clean 402 instead of an S3 403 from a
+// bucket they don't have read access to. The wire is the same
+// as ErrPlanCronsNotAllowed: 402 + a stable `code` the SDK
+// branches on without parsing the body.
+const CodePlanLogArchiveNotAllowed = "plan_log_archive_not_allowed"
+
+// ErrPlanLogArchiveNotAllowed is returned by the gatewayd-internal
+// archive log read-back handler when the customer's plan has
+// LogArchiveEnabled() == false (Free today). Mirrors
+// ErrPlanCronsNotAllowed and ErrPlanAlertRulesNotAllowed so the
+// upsell surface is consistent across plan-gated features. The
+// Hobby+ copy is the deliberate upgrade hint; Free never sees
+// the bucket-proxy path so the customer gets the upsell message
+// rather than a silent 404.
+func ErrPlanLogArchiveNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanLogArchiveNotAllowed,
+		"Log archive unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include log archive read-back; upgrade to Hobby or above to query historical logs from object storage.", p)).
+		WithDocs(docsBase + "/plans#log-archive")
+}
+
 // CodeAppWebhookInvalid is the 400 the customer sees for any
 // malformed webhook body — missing target_url, invalid retry_policy,
 // out-of-vocabulary event, oversize webhook_secret, etc.
@@ -1262,7 +1431,7 @@ func ErrPlanCronsNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanCronsNotAllowed,
 		"Crons unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include cron; upgrade to Hobby or above to schedule synthetic requests.", p)).
-		WithDocs("https://docs.gregale.dev/plans#crons")
+		WithDocs(docsBase + "/plans#crons")
 }
 
 // ErrPlanCronQuota is returned when CreateCronIfUnderQuota surfaces
@@ -1277,7 +1446,7 @@ func ErrPlanCronQuota(plan Plan, scope string, limit, observed int) *Problem {
 		fmt.Sprintf("%s plan caps crons at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#crons")
+		WithDocs(docsBase + "/plans#crons")
 }
 
 // ErrPlanEvictionPriorityReservedNotAllowed is the 403 apid returns
@@ -1290,7 +1459,7 @@ func ErrPlanEvictionPriorityReservedNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanEvictionPriorityReservedNotAllowed,
 		"Reserved eviction priority is not available on this plan",
 		fmt.Sprintf("the %s plan does not include the reserved eviction tier; upgrade to Hobby or above to opt in. The 'best_effort' tier is available on every plan.", p)).
-		WithDocs("https://docs.gregale.dev/plans#eviction-priority")
+		WithDocs(docsBase + "/plans#eviction-priority")
 }
 
 // ErrPlanPublicAuthBearerNotAllowed is the 402 apid returns when a
@@ -1306,7 +1475,7 @@ func ErrPlanPublicAuthBearerNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanPublicAuthBearerNotAllowed,
 		"Bearer public-URL auth is not available on this plan",
 		fmt.Sprintf("the %s plan does not include bearer-mode public auth; upgrade to Hobby or above to opt in. The 'open' mode is available on every plan.", p)).
-		WithDocs("https://docs.gregale.dev/plans#public-auth")
+		WithDocs(docsBase + "/plans#public-auth")
 }
 
 // ErrPlanPublicAuthBasicNotAllowed is the 402 apid returns when a
@@ -1321,7 +1490,7 @@ func ErrPlanPublicAuthBasicNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanPublicAuthBasicNotAllowed,
 		"Basic public-URL auth is not available on this plan",
 		fmt.Sprintf("the %s plan does not include basic-mode public auth; upgrade to Pro or above to opt in. The 'open' and 'bearer' modes are available on lower plans.", p)).
-		WithDocs("https://docs.gregale.dev/plans#public-auth")
+		WithDocs(docsBase + "/plans#public-auth")
 }
 
 // ErrPlanEvictionPriorityReservedQuota is the 422 apid returns when
@@ -1338,7 +1507,7 @@ func ErrPlanEvictionPriorityReservedQuota(p Plan, observed, limit int) *Problem 
 		fmt.Sprintf("%s plan caps the reserved eviction tier at %d app(s) per account; you have %d. Flip an existing reserved app to best_effort to add another.",
 			p, limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#eviction-priority")
+		WithDocs(docsBase + "/plans#eviction-priority")
 }
 
 // ErrAlertRuleInvalid is returned for malformed alert-rule bodies:
@@ -1350,7 +1519,7 @@ func ErrPlanEvictionPriorityReservedQuota(p Plan, observed, limit int) *Problem 
 func ErrAlertRuleInvalid(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeAlertRuleInvalid,
 		"Invalid alert rule", reason).
-		WithDocs("https://docs.gregale.dev/alerts")
+		WithDocs(docsBase + "/alerts")
 }
 
 // ErrPlanAlertRulesNotAllowed is returned by apid's createAlertRule
@@ -1363,7 +1532,7 @@ func ErrPlanAlertRulesNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanAlertRulesNotAllowed,
 		"Alert rules unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include alert rules; upgrade to Hobby or above to fire alerts.", p)).
-		WithDocs("https://docs.gregale.dev/plans#alerts")
+		WithDocs(docsBase + "/plans#alerts")
 }
 
 // ErrPlanAlertRuleQuota is returned when
@@ -1379,7 +1548,7 @@ func ErrPlanAlertRuleQuota(plan Plan, scope string, limit, observed int) *Proble
 		fmt.Sprintf("%s plan caps alert rules at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#alerts")
+		WithDocs(docsBase + "/plans#alerts")
 }
 
 // ErrPlanWebhooksNotAllowed is returned by apid's createAppWebhook
@@ -1393,7 +1562,7 @@ func ErrPlanWebhooksNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanWebhooksNotAllowed,
 		"Outbound webhooks unavailable on this plan",
 		fmt.Sprintf("the %s plan does not include outbound webhooks; upgrade to Hobby or above to subscribe.", p)).
-		WithDocs("https://docs.gregale.dev/plans#webhooks")
+		WithDocs(docsBase + "/plans#webhooks")
 }
 
 // ErrPlanWebhookQuota is returned when
@@ -1409,7 +1578,7 @@ func ErrPlanWebhookQuota(plan Plan, scope string, limit, observed int) *Problem 
 		fmt.Sprintf("%s plan caps webhooks at %d for %s; you have %d. Delete one to add another.",
 			plan, limit, scopeName, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/plans#webhooks")
+		WithDocs(docsBase + "/plans#webhooks")
 }
 
 // ErrAppWebhookInvalid is returned for malformed webhook bodies:
@@ -1426,7 +1595,7 @@ func ErrHandlerMissing() *Problem {
 	return NewProblem(http.StatusBadRequest, CodeHandlerMissing,
 		"Handler required",
 		"function deploys require a handler path (e.g. handler.handler)").
-		WithDocs("https://docs.gregale.dev/functions")
+		WithDocs(docsBase + "/functions")
 }
 
 // ErrDeployFailed wraps a deployment failure message into a Problem so the
@@ -1434,7 +1603,7 @@ func ErrHandlerMissing() *Problem {
 func ErrDeployFailed(detail string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeDeployFailed,
 		"Deploy failed", detail).
-		WithDocs("https://docs.gregale.dev/deploys")
+		WithDocs(docsBase + "/deploys")
 }
 
 // ErrDeploySignatureInvalid is returned by apid when an OCI image
@@ -1448,7 +1617,7 @@ func ErrDeployFailed(detail string) *Problem {
 func ErrDeploySignatureInvalid(detail string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeDeploySignatureInvalid,
 		"Signed-image enforcement rejected the deploy", detail).
-		WithDocs("https://docs.gregale.dev/deploys#signed-images")
+		WithDocs(docsBase + "/deploys#signed-images")
 }
 
 // ErrTrustedSignerInvalid is the 400 mirror of ErrSecretInvalidKey
@@ -1458,7 +1627,7 @@ func ErrDeploySignatureInvalid(detail string) *Problem {
 func ErrTrustedSignerInvalid(detail string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeTrustedSignerInvalid,
 		"Trusted signer invalid", detail).
-		WithDocs("https://docs.gregale.dev/deploys#trusted-signers")
+		WithDocs(docsBase + "/deploys#trusted-signers")
 }
 
 // ErrTrustedSignerNotFound is the 404 mirror of ErrSecretNotFound
@@ -1478,7 +1647,7 @@ func ErrNoRollbackTarget() *Problem {
 	return NewProblem(http.StatusConflict, CodeNoRollbackTarget,
 		"No previous deployment",
 		"there's no superseded deployment to roll back to; deploy at least twice.").
-		WithDocs("https://docs.gregale.dev/deploys#rollback")
+		WithDocs(docsBase + "/deploys#rollback")
 }
 
 // ErrPlanLimitSecrets is returned when a secret PUT would exceed the plan's
@@ -1488,7 +1657,7 @@ func ErrPlanLimitSecrets(l Limits, observed int) *Problem {
 		"Secret count limit reached",
 		fmt.Sprintf("%s plan allows %d secret(s) per app; you have %d.", l.Plan, l.SecretCountMax, observed)).
 		WithLimit(int64(l.SecretCountMax), int64(observed)).
-		WithDocs("https://docs.gregale.dev/secrets#limits")
+		WithDocs(docsBase + "/secrets#limits")
 }
 
 // ErrSecretInvalidKey is returned when a secret key fails the
@@ -1498,7 +1667,7 @@ func ErrSecretInvalidKey(detail string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSecretInvalidKey,
 		"Invalid secret key",
 		fmt.Sprintf("secret keys must match %s; %s", SecretKeyPattern, detail)).
-		WithDocs("https://docs.gregale.dev/secrets#keys")
+		WithDocs(docsBase + "/secrets#keys")
 }
 
 // ErrSecretValueTooLarge is returned when a PUT value exceeds
@@ -1510,7 +1679,7 @@ func ErrSecretValueTooLarge(l Limits, observedBytes int) *Problem {
 		"Secret value too large",
 		fmt.Sprintf("%s plan caps secret values at %d bytes; got %d.", l.Plan, l.SecretValueMaxBytes, observedBytes)).
 		WithLimit(int64(l.SecretValueMaxBytes), int64(observedBytes)).
-		WithDocs("https://docs.gregale.dev/secrets#limits")
+		WithDocs(docsBase + "/secrets#limits")
 }
 
 // ErrSecretNotFound is returned by DELETE /v1/apps/{slug}/secrets/{key} when
@@ -1520,7 +1689,7 @@ func ErrSecretNotFound(key string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeSecretNotFound,
 		"Secret not set",
 		fmt.Sprintf("no secret named %q on this app.", key)).
-		WithDocs("https://docs.gregale.dev/secrets")
+		WithDocs(docsBase + "/secrets")
 }
 
 // ErrPlanLimitEnvVars is returned when an env PUT would exceed the plan's
@@ -1532,7 +1701,7 @@ func ErrPlanLimitEnvVars(l Limits, observed int) *Problem {
 		"Env var count limit reached",
 		fmt.Sprintf("%s plan allows %d env var(s) per app; you have %d.", l.Plan, l.EnvVarsMax, observed)).
 		WithLimit(int64(l.EnvVarsMax), int64(observed)).
-		WithDocs("https://docs.gregale.dev/env#limits")
+		WithDocs(docsBase + "/env#limits")
 }
 
 // ErrAPIKeyExpired is returned by the auth middleware when the
@@ -1546,7 +1715,7 @@ func ErrAPIKeyExpired() *Problem {
 	return NewProblem(http.StatusUnauthorized, CodeAPIKeyExpired,
 		"API key expired",
 		"the bearer key has expired; rotate it and use the new plaintext").
-		WithDocs("https://docs.gregale.dev/auth#expiry")
+		WithDocs(docsBase + "/auth#expiry")
 }
 
 // ErrAPIKeyRevoked is returned by the auth middleware when the
@@ -1558,7 +1727,7 @@ func ErrAPIKeyRevoked() *Problem {
 	return NewProblem(http.StatusUnauthorized, CodeAPIKeyRevoked,
 		"API key revoked",
 		"the bearer key has been revoked; mint a new one via POST /v1/keys").
-		WithDocs("https://docs.gregale.dev/auth#revocation")
+		WithDocs(docsBase + "/auth#revocation")
 }
 
 // ErrAPIKeyLimitExceeded is returned when a POST /v1/keys would
@@ -1573,7 +1742,7 @@ func ErrAPIKeyLimitExceeded(l Limits, observed int) *Problem {
 		fmt.Sprintf("%s plan allows %d API key(s) per account; you have %d active or in grace. Revoke a key before minting a new one.",
 			l.Plan, l.KeysMax, observed)).
 		WithLimit(int64(l.KeysMax), int64(observed)).
-		WithDocs("https://docs.gregale.dev/auth#quotas")
+		WithDocs(docsBase + "/auth#quotas")
 }
 
 // ErrPlanLimitTrustedSigners is returned when a trusted-signer PUT
@@ -1587,7 +1756,7 @@ func ErrPlanLimitTrustedSigners(l Limits, observed int) *Problem {
 		"Trusted signer count limit reached",
 		fmt.Sprintf("%s plan allows %d trusted signer(s) per app; you have %d.", l.Plan, l.TrustedSignerCountMax, observed)).
 		WithLimit(int64(l.TrustedSignerCountMax), int64(observed)).
-		WithDocs("https://docs.gregale.dev/deploys#trusted-signers")
+		WithDocs(docsBase + "/deploys#trusted-signers")
 }
 
 // ErrEnvVarInvalidKey is returned when an env key fails the
@@ -1600,7 +1769,7 @@ func ErrEnvVarInvalidKey(detail string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeEnvVarInvalidKey,
 		"Invalid env var key",
 		fmt.Sprintf("env var keys must match %s; %s", SecretKeyPattern, detail)).
-		WithDocs("https://docs.gregale.dev/env#keys")
+		WithDocs(docsBase + "/env#keys")
 }
 
 // ErrEnvVarValueTooLarge is returned when a PUT value exceeds
@@ -1612,7 +1781,7 @@ func ErrEnvVarValueTooLarge(l Limits, observedBytes int) *Problem {
 		"Env var value too large",
 		fmt.Sprintf("%s plan caps env values at %d bytes; got %d.", l.Plan, l.EnvValueMaxBytes, observedBytes)).
 		WithLimit(int64(l.EnvValueMaxBytes), int64(observedBytes)).
-		WithDocs("https://docs.gregale.dev/env#limits")
+		WithDocs(docsBase + "/env#limits")
 }
 
 // ErrEnvVarNotFound is returned by DELETE /v1/apps/{slug}/env/{key} when
@@ -1623,7 +1792,7 @@ func ErrEnvVarNotFound(key string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeEnvVarNotFound,
 		"Env var not set",
 		fmt.Sprintf("no env var named %q on this app.", key)).
-		WithDocs("https://docs.gregale.dev/env")
+		WithDocs(docsBase + "/env")
 }
 
 // ErrPlanRegistryCredentialsNotAllowed is returned when the customer's
@@ -1636,7 +1805,7 @@ func ErrPlanRegistryCredentialsNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanRegistryCredentialNotAllowed,
 		"Plan doesn't allow private-registry credentials",
 		fmt.Sprintf("the %s plan cannot store private-registry credentials; upgrade to Hobby or higher.", p)).
-		WithDocs("https://docs.gregale.dev/registry-credentials")
+		WithDocs(docsBase + "/registry-credentials")
 }
 
 // ErrPlanRegistryCredentialQuota is returned when the customer's plan
@@ -1650,7 +1819,7 @@ func ErrPlanRegistryCredentialQuota(l Limits, observed int) *Problem {
 		"Per-app registry credential quota reached",
 		fmt.Sprintf("the %s plan caps private-registry credentials at %d per app; got %d. Delete one before adding another.", l.Plan, l.RegistryCredentialMax, observed)).
 		WithLimit(int64(l.RegistryCredentialMax), int64(observed)).
-		WithDocs("https://docs.gregale.dev/registry-credentials#quota")
+		WithDocs(docsBase + "/registry-credentials#quota")
 }
 
 // ErrInvalidRegistryHost is returned when the request body's registry
@@ -1661,7 +1830,7 @@ func ErrInvalidRegistryHost(detail error) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeInvalidRegistryHost,
 		"Invalid registry host",
 		detail.Error()).
-		WithDocs("https://docs.gregale.dev/registry-credentials#registry-format")
+		WithDocs(docsBase + "/registry-credentials#registry-format")
 }
 
 // ErrRegistryCredentialNotFound is returned by DELETE
@@ -1672,7 +1841,7 @@ func ErrRegistryCredentialNotFound(host string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeRegistryCredentialNotFound,
 		"Registry credential not set",
 		fmt.Sprintf("no credential stored for registry %q on this app.", host)).
-		WithDocs("https://docs.gregale.dev/registry-credentials")
+		WithDocs(docsBase + "/registry-credentials")
 }
 
 // ErrPlanMinInstancesNotAllowed is returned when a Free account tries
@@ -1687,7 +1856,7 @@ func ErrPlanMinInstancesNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanMinInstancesNotAllowed,
 		"Plan doesn't allow a min-instances floor",
 		fmt.Sprintf("the %s plan always scales to zero; upgrade to Hobby, Pro, or Scale to keep instances warm.", p)).
-		WithDocs("https://docs.gregale.dev/plans#min-instances")
+		WithDocs(docsBase + "/plans#min-instances")
 }
 
 // ErrInvalidMinInstances is returned when the requested min_instances
@@ -1698,7 +1867,7 @@ func ErrInvalidMinInstances(got, maxConcur int) *Problem {
 		"Invalid min_instances",
 		fmt.Sprintf("min_instances must be in [0, %d] (plan max_concurrency); got %d.", maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
-		WithDocs("https://docs.gregale.dev/apps#min-instances")
+		WithDocs(docsBase + "/apps#min-instances")
 }
 
 // ErrMaxMinInstancesExceeded (issue #557 / ADR-071 §Decision 5) is
@@ -1713,7 +1882,56 @@ func ErrMaxMinInstancesExceeded(got, planMax int) *Problem {
 		"min_instances exceeds plan cap",
 		fmt.Sprintf("min_instances must be in [0, %d] for this plan; got %d.", planMax, got)).
 		WithLimit(int64(planMax), int64(got)).
-		WithDocs("https://docs.gregale.dev/apps#min-instances")
+		WithDocs(docsBase + "/apps#min-instances")
+}
+
+// ErrPlanTrafficSplitNotAllowed (issue #556 / traffic splitting
+// across deployments) is returned when a Free/Hobby account tries
+// to set a non-default traffic_percent on a deployment (ux_spec
+// §6.5 plan-tier gate family, joined by issue #556). The customer's
+// bill on Free/Hobby is built around scale-to-zero; keeping two or
+// more live deployments warm simultaneously is the cost shape of
+// Pro / Scale (per-running-second RAM × N deployments). Hobby was
+// deliberately NOT promoted to the gate's "allowed" set (unlike
+// MinInstancesAllowed which Hobby unlocks per issue #462) — see
+// the Limits.TrafficSplit field comment in pkg/api/limits.go.
+func ErrPlanTrafficSplitNotAllowed(p Plan) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanTrafficSplitNotAllowed,
+		"Plan doesn't allow traffic splitting",
+		fmt.Sprintf("the %s plan routes 100%% to the most recent deployment; upgrade to Pro or Scale to keep N canary deployments warm.", p)).
+		WithDocs("https://docs.gregale.dev/plans#traffic-split")
+}
+
+// ErrInvalidTrafficPercent (issue #556) is returned when the
+// requested traffic_percent is outside [0, 100] (the schema CHECK
+// in migration 00160 is the second-line defence; this surfaces
+// before that check, the API gate fires first). 422 mirrors the
+// ErrInvalidMinInstances shape at line 1688 (plan-gate-first vs
+// shape-second; this is shape, so 422 not 403).
+func ErrInvalidTrafficPercent(got int) *Problem {
+	const cap = 100
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidTrafficPercent,
+		"Invalid traffic_percent",
+		fmt.Sprintf("traffic_percent must be in [0, %d]; got %d.", cap, got)).
+		WithLimit(int64(cap), int64(got)).
+		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
+}
+
+// ErrTrafficPercentSumInvalid (issue #556) is the defensive
+// backstop for the Σ = 100 invariant. The state layer's
+// UpdateDeploymentTraffic transaction asserts the post-write sum
+// and lifts to this code if violated. In practice this is
+// unreachable: the schema CHECK gates the per-row range and the
+// transaction zeroes siblings before stamping the target. The
+// code exists so a future refactor that breaks the Σ tripwire
+// surfaces a 409 (not a silent DB drift). 409 Conflict because
+// the requested state is internally consistent (range-check
+// passed) but cannot be applied alongside the existing row set.
+func ErrTrafficPercentSumInvalid(observed int) *Problem {
+	return NewProblem(http.StatusConflict, CodeTrafficPercentSumInvalid,
+		"traffic_percent sum invariant violated",
+		fmt.Sprintf("sum of traffic_percent across live deployments must be 100; observed %d.", observed)).
+		WithDocs("https://docs.gregale.dev/deployments#traffic-percent")
 }
 
 // ErrSidecarCapExceeded is returned when the request carries more
@@ -1727,7 +1945,7 @@ func ErrSidecarCapExceeded(seen, cap int) *Problem {
 		"Too many sidecars",
 		fmt.Sprintf("request carried %d sidecars; the cap is %d (issue #463 / ADR-068 §Decision 1).", seen, cap)).
 		WithLimit(int64(cap), int64(seen)).
-		WithDocs("https://docs.gregale.dev/sidecars#cap")
+		WithDocs(docsBase + "/sidecars#cap")
 }
 
 // ErrSidecarInvalidType is returned when a sidecar carries a `type`
@@ -1771,7 +1989,7 @@ func ErrSidecarStatefulDenied(name, image string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
 		"Stateful sidecar image is not allowed",
 		fmt.Sprintf("sidecar %q image %q is on the stateful denylist; stateless sidecars only (issue #463 / ADR-068 §Decision 4).", name, image)).
-		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+		WithDocs(docsBase + "/sidecars#stateless")
 }
 
 // ErrSidecarStatefulDeniedWithHint is the API-gate sidecar variant
@@ -1792,7 +2010,7 @@ func ErrSidecarStatefulDeniedWithHint(name, image, hint string) *Problem {
 	}
 	return NewProblem(http.StatusForbidden, CodeSidecarStatefulDenied,
 		"Stateful sidecar image is not allowed", detail).
-		WithDocs("https://docs.gregale.dev/sidecars#stateless")
+		WithDocs(docsBase + "/sidecars#stateless")
 }
 
 // ErrSidecarInvalidName is returned when the sidecar name does
@@ -1834,7 +2052,7 @@ func ErrSidecarNotAllowedOnPlan(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodeSidecarNotAllowedOnPlan,
 		"Plan doesn't allow sidecars",
 		fmt.Sprintf("the %s plan doesn't allow sidecars (issue #463 / ADR-068).", p)).
-		WithDocs("https://docs.gregale.dev/plans#sidecars")
+		WithDocs(docsBase + "/plans#sidecars")
 }
 
 // ErrPlanMaxInstancesNotAllowed (issue #462 / ADR-058) is the
@@ -1846,7 +2064,7 @@ func ErrPlanMaxInstancesNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanMaxInstancesNotAllowed,
 		"Plan doesn't allow a max_instances ceiling",
 		fmt.Sprintf("the %s plan does not expose a per-app max_instances; upgrade to Hobby or higher to set it.", p)).
-		WithDocs("https://docs.gregale.dev/apps#max-instances")
+		WithDocs(docsBase + "/apps#max-instances")
 }
 
 // ErrInvalidMaxInstances (issue #462 / ADR-058) is the 422
@@ -1860,7 +2078,7 @@ func ErrInvalidMaxInstances(got, minInstances, maxConcur int) *Problem {
 		"Invalid max_instances",
 		fmt.Sprintf("max_instances must be in [%d, %d] (plan max_concurrency); got %d.", minInstances, maxConcur, got)).
 		WithLimit(int64(maxConcur), int64(got)).
-		WithDocs("https://docs.gregale.dev/apps#max-instances")
+		WithDocs(docsBase + "/apps#max-instances")
 }
 
 // ErrInvalidCooldown (issue #462 / ADR-058) is the 422 bounds
@@ -1874,7 +2092,7 @@ func ErrInvalidCooldown(field string, got, minSeconds, maxSeconds int) *Problem 
 		"Invalid cooldown",
 		fmt.Sprintf("%s must be in [%d, %d]; got %d.", field, minSeconds, maxSeconds, got)).
 		WithLimit(int64(maxSeconds), int64(got)).
-		WithDocs("https://docs.gregale.dev/apps#scaling-policy")
+		WithDocs(docsBase + "/apps#scaling-policy")
 }
 
 // ErrScalingTargetIncompatibleWithWorkloadClass (issue #462 /
@@ -1890,7 +2108,7 @@ func ErrScalingTargetIncompatibleWithWorkloadClass(metric string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeScalingTargetIncompatibleWithWorkloadClass,
 		"Target metric is not compatible with this app's workload class",
 		fmt.Sprintf("target.metric=%q is not compatible with worker-class apps; use an rps or p99_latency_ms target instead.", metric)).
-		WithDocs("https://docs.gregale.dev/apps#scaling-policy")
+		WithDocs(docsBase + "/apps#scaling-policy")
 }
 
 // ErrPlanEgressAllowlistNotAllowed (ADR-031) is returned when a Free or Hobby
@@ -1903,7 +2121,7 @@ func ErrPlanEgressAllowlistNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanEgressAllowlistNotAllowed,
 		"Plan doesn't allow an egress allowlist",
 		fmt.Sprintf("the %s plan cannot pin an egress IP allowlist; upgrade to Pro or Scale to unlock this operator surface.", p)).
-		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+		WithDocs(docsBase + "/apps#egress-allowlist")
 }
 
 // ErrPlanLivenessProbeNotAllowed (issue #554 / ADR-078) is returned when a
@@ -1919,7 +2137,7 @@ func ErrPlanLivenessProbeNotAllowed(p Plan) *Problem {
 	return NewProblem(http.StatusForbidden, CodePlanLivenessProbeNotAllowed,
 		"Plan doesn't allow a liveness probe",
 		fmt.Sprintf("the %s plan cannot pin a liveness probe; upgrade to Hobby or above to unlock the Cloud-Run-parity primitive.", p)).
-		WithDocs("https://docs.gregale.dev/deploy-overrides#liveness-probe")
+		WithDocs(docsBase + "/deploy-overrides#liveness-probe")
 }
 
 // ErrEgressAllowlistTooLong (ADR-031) is returned when the PATCH carries more
@@ -1931,7 +2149,7 @@ func ErrEgressAllowlistTooLong(got, maxSize int) *Problem {
 		"Egress allowlist too long",
 		fmt.Sprintf("egress_allowlist has %d entries; plan caps it at %d.", got, maxSize)).
 		WithLimit(int64(maxSize), int64(got)).
-		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+		WithDocs(docsBase + "/apps#egress-allowlist")
 }
 
 // ErrAccountEgressAllowlistExtraOutOfRange (issue #679 / PR-B /
@@ -1948,7 +2166,7 @@ func ErrAccountEgressAllowlistExtraOutOfRange(got, maxExtra int) *Problem {
 		"Account egress allowlist extra out of range",
 		fmt.Sprintf("egress_allowlist_extra=%d; max is %d.", got, maxExtra)).
 		WithLimit(int64(maxExtra), int64(got)).
-		WithDocs("https://docs.gregale.dev/account#egress-allowlist-extra")
+		WithDocs(docsBase + "/account#egress-allowlist-extra")
 }
 
 // ErrInvalidEgressAllowlist (ADR-031 + ADR-032) is a 400 for
@@ -1961,7 +2179,7 @@ func ErrInvalidEgressAllowlist(entry string, reason error) *Problem {
 	return NewProblem(http.StatusBadRequest, CodeInvalidEgressAllowlist,
 		"Invalid egress allowlist entry",
 		fmt.Sprintf("entry %q is not a valid v4 or v6 CIDR (non-/0): %v.", entry, reason)).
-		WithDocs("https://docs.gregale.dev/apps#egress-allowlist")
+		WithDocs(docsBase + "/apps#egress-allowlist")
 }
 
 // ErrValidation is a 400 fallback for malformed request bodies. Used by
@@ -1984,7 +2202,7 @@ func ErrPlanQueueDepth(limit, observed int) *Problem {
 		"Per-app queue depth exceeded",
 		fmt.Sprintf("the plan caps this app at %d pending + dispatching rows; observed %d.", limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/event-driven#queue-depth")
+		WithDocs(docsBase + "/event-driven#queue-depth")
 }
 
 // ErrPlanSourceBytes is returned when a request body for an event-shaped
@@ -1995,7 +2213,7 @@ func ErrPlanSourceBytes(limit int, observed int64) *Problem {
 		"Invocation payload too large",
 		fmt.Sprintf("this plan caps each invocation at %d bytes; observed %d.", limit, observed)).
 		WithLimit(int64(limit), observed).
-		WithDocs("https://docs.gregale.dev/event-driven#payload-size")
+		WithDocs(docsBase + "/event-driven#payload-size")
 }
 
 // ErrPlanFeatureGated is returned when the customer's plan does not
@@ -2007,7 +2225,7 @@ func ErrPlanFeatureGated(feature string, p Plan) *Problem {
 	return NewProblem(http.StatusPaymentRequired, CodePlanFeatureGated,
 		"Plan doesn't include this feature",
 		fmt.Sprintf("the %s plan doesn't unlock %s; upgrade to Hobby or higher to use event-driven features.", p, feature)).
-		WithDocs("https://docs.gregale.dev/plans#event-driven")
+		WithDocs(docsBase + "/plans#event-driven")
 }
 
 // ErrPlanDelayedTasksCap is the variant surfaced when a delayed-task
@@ -2019,7 +2237,7 @@ func ErrPlanDelayedTasksCap(limit, observed int) *Problem {
 		"Per-app delayed-task cap exceeded",
 		fmt.Sprintf("the plan caps this app at %d scheduled delayed_tasks; observed %d.", limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/event-driven#delayed-tasks")
+		WithDocs(docsBase + "/event-driven#delayed-tasks")
 }
 
 // ErrInvocationNotFound is the Move 1 counterpart to ErrSecretNotFound:
@@ -2029,6 +2247,19 @@ func ErrInvocationNotFound(id string) *Problem {
 	return NewProblem(http.StatusNotFound, CodeInvocationNotFound,
 		"Invocation not found",
 		fmt.Sprintf("no invocation with id %q on this account.", id)).
+		WithDocs(docsBase + "/event-driven#invocations")
+}
+
+// ErrInvocationNotReplayable (issue #315 / tier-2 DX) is returned by
+// POST /v1/invocations/{id}/replay when the original's State is
+// outside the replayable allow-list ({failed, dead_letter}).
+// Rendered with the current state in the message so the customer
+// can decide whether to wait for a pending invocation, or accept
+// the completed result without re-running.
+func ErrInvocationNotReplayable(state string) *Problem {
+	return NewProblem(http.StatusConflict, CodeInvocationNotReplayable,
+		"Invocation is not in a replayable state",
+		fmt.Sprintf("only invocations in state 'failed' or 'dead_letter' can be replayed; current state is %q.", state)).
 		WithDocs("https://docs.gregale.dev/event-driven#invocations")
 }
 
@@ -2043,7 +2274,7 @@ func ErrBuildProvenanceNotFound() *Problem {
 	return NewProblem(http.StatusNotFound, CodeBuildProvenanceNotFound,
 		"Build provenance not found",
 		"the build succeeded but no provenance row exists; builderd logged a warning when the populator failed").
-		WithDocs("https://docs.gregale.dev/builds#provenance")
+		WithDocs(docsBase + "/builds#provenance")
 }
 
 // ErrBuildSBOMUnavailable is the issue #299 / ADR-038 Phase 3 surface
@@ -2058,7 +2289,7 @@ func ErrBuildSBOMUnavailable() *Problem {
 	return NewProblem(http.StatusServiceUnavailable, CodeBuildSBOMUnavailable,
 		"Build SBOM unavailable",
 		"no SBOM has been generated for this build; imaged's syft populator did not run or did not persist the artefact").
-		WithDocs("https://docs.gregale.dev/builds#sbom")
+		WithDocs(docsBase + "/builds#sbom")
 }
 
 // ErrLongPollTimeout is returned by the long-poll handlers (sync
@@ -2071,7 +2302,7 @@ func ErrLongPollTimeout() *Problem {
 	return NewProblem(http.StatusGatewayTimeout, "long_poll_timeout",
 		"Long-poll wait budget ran out",
 		"the server waited for the configured long-poll window and the event did not arrive; retry.").
-		WithDocs("https://docs.gregale.dev/event-driven#long-poll")
+		WithDocs(docsBase + "/event-driven#long-poll")
 }
 
 // ErrInvalidScheduledAt is returned when a delayed-task POST carries a
@@ -2082,7 +2313,7 @@ func ErrInvalidScheduledAt() *Problem {
 	return NewProblem(http.StatusBadRequest, "invalid_scheduled_at",
 		"Invalid scheduled_at",
 		"scheduled_at must be a future timestamp; the server clock rejected the value").
-		WithDocs("https://docs.gregale.dev/event-driven#delayed-tasks")
+		WithDocs(docsBase + "/event-driven#delayed-tasks")
 }
 
 // --- Dashboard auth (issue #165, ADR-032 PR #2) ----------------------------
@@ -2098,7 +2329,7 @@ func ErrInvalidCredentials() *Problem {
 	return NewProblem(http.StatusUnauthorized, CodeInvalidCredentials,
 		"Sign in failed",
 		"email or password is incorrect.").
-		WithDocs("https://docs.gregale.dev/auth/sign-in")
+		WithDocs(docsBase + "/auth/sign-in")
 }
 
 // ErrEmailNotVerified is the 401 returned by the Google / GitHub OAuth
@@ -2110,7 +2341,7 @@ func ErrEmailNotVerified(provider string) *Problem {
 	return NewProblem(http.StatusUnauthorized, CodeEmailNotVerified,
 		"Email not verified",
 		fmt.Sprintf("the %s account's primary email is not verified; verify it on the provider and retry.", provider)).
-		WithDocs("https://docs.gregale.dev/auth/oauth")
+		WithDocs(docsBase + "/auth/oauth")
 }
 
 // ErrPasswordTooWeak is the 400 returned by POST /signup and POST
@@ -2120,7 +2351,7 @@ func ErrEmailNotVerified(provider string) *Problem {
 func ErrPasswordTooWeak(reason string) *Problem {
 	return NewProblem(http.StatusBadRequest, CodePasswordTooWeak,
 		"Password too weak", reason).
-		WithDocs("https://docs.gregale.dev/auth/password")
+		WithDocs(docsBase + "/auth/password")
 }
 
 // ErrResetTokenInvalid is the 410 returned by GET / POST /auth/reset
@@ -2131,7 +2362,7 @@ func ErrResetTokenInvalid() *Problem {
 	return NewProblem(http.StatusGone, CodeResetTokenInvalid,
 		"Reset link invalid",
 		"this password-reset link is unknown or has already been used.").
-		WithDocs("https://docs.gregale.dev/auth/reset")
+		WithDocs(docsBase + "/auth/reset")
 }
 
 // ErrResetTokenExpired is the 410 returned by GET / POST /auth/reset
@@ -2142,7 +2373,7 @@ func ErrResetTokenExpired() *Problem {
 	return NewProblem(http.StatusGone, CodeResetTokenExpired,
 		"Reset link expired",
 		"this password-reset link has expired; request a new one.").
-		WithDocs("https://docs.gregale.dev/auth/reset")
+		WithDocs(docsBase + "/auth/reset")
 }
 
 // --- Organizations (issue #190 / IAM-6 / ADR-061) --------------------------
@@ -2163,7 +2394,7 @@ func ErrOrgNotFound(slug string) *Problem {
 	return NewProblem(http.StatusNotFound, CodeOrgNotFound,
 		"Organization not found",
 		fmt.Sprintf("no organization with slug %q is visible to this account.", slug)).
-		WithDocs("https://docs.gregale.dev/orgs")
+		WithDocs(docsBase + "/orgs")
 }
 
 // ErrOrgSlugInvalid is the 422 returned when a slug fails the
@@ -2176,7 +2407,7 @@ func ErrOrgSlugInvalid(reason string) *Problem {
 	return NewProblem(http.StatusUnprocessableEntity, CodeOrgSlugInvalid,
 		"Invalid organization slug",
 		fmt.Sprintf("org slugs must match %s; %s", OrgSlugPattern, reason)).
-		WithDocs("https://docs.gregale.dev/orgs#slugs")
+		WithDocs(docsBase + "/orgs#slugs")
 }
 
 // ErrOrgSlugTaken is the 409 returned when the slug is already in
@@ -2187,7 +2418,7 @@ func ErrOrgSlugTaken(slug string) *Problem {
 	return NewProblem(http.StatusConflict, CodeOrgSlugTaken,
 		"Organization slug in use",
 		fmt.Sprintf("slug %q is already taken; pick another.", slug)).
-		WithDocs("https://docs.gregale.dev/orgs#slugs")
+		WithDocs(docsBase + "/orgs#slugs")
 }
 
 // ErrOrgMemberCapExceeded is the 403 returned when the plan's
@@ -2199,7 +2430,7 @@ func ErrOrgMemberCapExceeded(limit, observed int) *Problem {
 		fmt.Sprintf("the plan caps this organization at %d member(s); you have %d.",
 			limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/orgs#member-cap")
+		WithDocs(docsBase + "/orgs#member-cap")
 }
 
 // ErrOrgInvitationCapExceeded is the 403 returned when the
@@ -2212,7 +2443,7 @@ func ErrOrgInvitationCapExceeded(limit, observed int) *Problem {
 		fmt.Sprintf("the plan caps this organization at %d pending invitation(s); you have %d.",
 			limit, observed)).
 		WithLimit(int64(limit), int64(observed)).
-		WithDocs("https://docs.gregale.dev/orgs#invitation-cap")
+		WithDocs(docsBase + "/orgs#invitation-cap")
 }
 
 // ErrOrgRoleForbidden is the 403 returned when the authenticated
@@ -2223,7 +2454,7 @@ func ErrOrgRoleForbidden(action string) *Problem {
 	return NewProblem(http.StatusForbidden, CodeOrgRoleForbidden,
 		"Insufficient role for this action",
 		fmt.Sprintf("your role does not allow %s on this organization.", action)).
-		WithDocs("https://docs.gregale.dev/orgs#roles")
+		WithDocs(docsBase + "/orgs#roles")
 }
 
 // ErrOrgAlreadyMember is the 409 returned when the accepting
@@ -2234,7 +2465,7 @@ func ErrOrgAlreadyMember(role string) *Problem {
 	return NewProblem(http.StatusConflict, CodeOrgAlreadyMember,
 		"Already a member of this organization",
 		fmt.Sprintf("this account is already a member of the organization with role %q.", role)).
-		WithDocs("https://docs.gregale.dev/orgs#members")
+		WithDocs(docsBase + "/orgs#members")
 }
 
 // ErrOrgInvitationInvalid is the 410 returned when the invitation
@@ -2245,7 +2476,7 @@ func ErrOrgInvitationInvalid() *Problem {
 	return NewProblem(http.StatusGone, CodeOrgInvitationInvalid,
 		"Invitation invalid",
 		"this invitation is unknown, already consumed, or has been revoked.").
-		WithDocs("https://docs.gregale.dev/orgs#invitations")
+		WithDocs(docsBase + "/orgs#invitations")
 }
 
 // ErrOrgInvitationExpired is the 410 returned when the invitation
@@ -2256,7 +2487,7 @@ func ErrOrgInvitationExpired() *Problem {
 	return NewProblem(http.StatusGone, CodeOrgInvitationExpired,
 		"Invitation expired",
 		"this invitation has expired; ask the inviter to send a new one.").
-		WithDocs("https://docs.gregale.dev/orgs#invitations")
+		WithDocs(docsBase + "/orgs#invitations")
 }
 
 // ErrOrgLastOwner is the 409 returned when removing, demoting,
@@ -2266,7 +2497,7 @@ func ErrOrgLastOwner() *Problem {
 	return NewProblem(http.StatusConflict, CodeOrgLastOwner,
 		"Cannot remove the last owner",
 		"transfer ownership to another member before removing or demoting this role.").
-		WithDocs("https://docs.gregale.dev/orgs#ownership")
+		WithDocs(docsBase + "/orgs#ownership")
 }
 
 // ErrOrgPersonalImmutable is the 409 returned when a caller
@@ -2277,7 +2508,7 @@ func ErrOrgPersonalImmutable() *Problem {
 	return NewProblem(http.StatusConflict, CodeOrgPersonalImmutable,
 		"Personal organizations are immutable",
 		"this organization is the personal organization of one account; it cannot accept members or be deleted independently.").
-		WithDocs("https://docs.gregale.dev/orgs#personal-orgs")
+		WithDocs(docsBase + "/orgs#personal-orgs")
 }
 
 // ErrOrgAPIKeyRequiresOrg is the 409 returned when a legacy API
@@ -2288,5 +2519,5 @@ func ErrOrgAPIKeyRequiresOrg() *Problem {
 	return NewProblem(http.StatusConflict, CodeOrgAPIKeyRequiresOrg,
 		"API key must be bound to an organization",
 		"this legacy API key has no organization binding; create a new key via /v1/orgs/{slug}/keys.").
-		WithDocs("https://docs.gregale.dev/orgs#api-keys")
+		WithDocs(docsBase + "/orgs#api-keys")
 }

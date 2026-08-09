@@ -789,6 +789,14 @@ func (s *server) handler() http.Handler {
 	// field is the floor; image / digest / overrides / sidecars stay
 	// immutable post-create).
 	mux.HandleFunc("PATCH /v1/deployments/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentMinInstances))))
+	// Issue #556 PR-A — PATCH the per-deployment traffic-split
+	// weight. Dedicated route (not a sibling field on the
+	// /v1/deployments/{id} PATCH) because the request shape differs
+	// (traffic_percent mandatory) and the plan gate is Pro+ only.
+	// Same deploy-write scope; the row mutation is at least as
+	// powerful as the min_instances PATCH (Σ rebalance affects
+	// sibling live rows in the same app).
+	mux.HandleFunc("PATCH /v1/deployments/{id}/traffic", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateDeploymentTraffic))))
 	// Builds (ADR-038). The provenance route is the only /v1/builds
 	// surface today; deployments.id remains the parent resource.
 	// Build:read scope (api.ScopesReadSurface) gates the read.
@@ -897,6 +905,15 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/apps/{slug}/delayed-tasks", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.delayedTaskCreate)))))
 	mux.HandleFunc("GET /v1/invocations", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listInvocations))))
 	mux.HandleFunc("GET /v1/invocations/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getInvocation))))
+	// Issue #315 / tier-2 DX: replay a failed or dead_letter
+	// invocation. POST + write scope (mirrors the write side of
+	// async_invoke at line 888). Idempotent-wrapped because a
+	// retried POST after a network blip must not double-enqueue —
+	// the customer's CI / dashboard may issue the same replay
+	// twice. The SDK adds Idempotency-Key automatically on POST
+	// (client.go:146) and the apid wrapper stores it on the
+	// request's first response.
+	mux.HandleFunc("POST /v1/invocations/{id}/replay", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.replayInvocation)))))
 	mux.HandleFunc("GET /v1/delayed-tasks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.delayedTaskGet))))
 	mux.HandleFunc("DELETE /v1/delayed-tasks/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.delayedTaskCancel))))
 
@@ -957,6 +974,22 @@ func (s *server) handler() http.Handler {
 	// routes are gated separately below.
 	mux.HandleFunc("GET /v1/audit-events", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAuditEvents))))
 	mux.HandleFunc("GET /v1/audit-events/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAuditEvent))))
+
+	// Issue #755 / PR-6 — audit_log dashboard surface. Reads the
+	// FK-free audit_log table (migrations/00163_audit_log.sql),
+	// distinct from /v1/audit-events which reads the live events
+	// table. Two routes by audience:
+	//
+	//   - /v1/audit-log: customer-scoped, MFA + apps:read; pinned
+	//     to the calling account's ID inside the handler. Same
+	//     scope posture as /v1/audit-events.
+	//   - /v1/audit-log/all: operator-only, admin scope; can read
+	//     across accounts and opt into account_id IS NULL rows
+	//     with ?include_anonymous=true. No MFA gate — admin
+	//     sessions and admin API keys are already MFA-gated upstream
+	//     at session issue time.
+	mux.HandleFunc("GET /v1/audit-log", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAuditLog))))
+	mux.HandleFunc("GET /v1/audit-log/all", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.listAuditLogAll)))
 
 	// Issue #517 / PR-C / ADR-064: customer-facing wake-timeline
 	// surface. Sub-resource of /v1/apps/{slug} — same auth chain
@@ -1691,7 +1724,7 @@ func (s *server) idempotent(next accountHandler) accountHandler {
 // which renders through html/template (templates/*.html). CodeQL cannot
 // see through the ResponseWriter wrapper so it conservatively flags any
 // Write as a possible HTML sink; the upstream content type and renderer
-// make that unreachable. See the // codeql[go/reflected-xss] false-positive
+// make that unreachable. See the // lgtm[go/reflected-xss] false-positive
 // suppression directly above the Write method.
 type captureWriter struct {
 	http.ResponseWriter
@@ -1704,10 +1737,10 @@ func (c *captureWriter) WriteHeader(status int) {
 	c.ResponseWriter.WriteHeader(status)
 }
 
-// codeql[go/reflected-xss] false-positive: captureWriter is a pass-through; upstream content type + renderer make the XSS sink unreachable. See captureWriter doc-comment.
+// lgtm[go/reflected-xss] false-positive: captureWriter is a pass-through; upstream content type + renderer make the XSS sink unreachable. See captureWriter doc-comment.
 func (c *captureWriter) Write(b []byte) (int, error) {
 	c.body.Write(b)
-	// codeql[go/reflected-xss] false-positive: captureWriter is a pass-through; upstream content type + renderer make the XSS sink unreachable. See captureWriter doc-comment.
+	// lgtm[go/reflected-xss] false-positive: captureWriter is a pass-through; upstream content type + renderer make the XSS sink unreachable. See captureWriter doc-comment.
 	return c.ResponseWriter.Write(b)
 }
 

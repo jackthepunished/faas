@@ -20,7 +20,8 @@
 
 The following are still un-shipped at v1.1 time and gate the load-bearing failure modes in [spec §6.4](https://github.com/poyrazK/faas/blob/main/docs/faas_implementation_spec.md#6.4-failure-mode-catalogue-adr-025-v11-adr-028-v11-adr-029-v11). When each ships, retire the corresponding bullet from this list and from the [Tier 2 plan](https://github.com/poyrazK/faas/issues/297) cross-references.
 
-- **Tier 1 Phase 2** (`node_signature` on `CapacityReport`) — blocks the "CapacityReport trust" row in §6.4. Mitigates the case where a remote vmmd forges a report to bias placement.
+- **Tier 1 Phase 2** (`node_signature` on `CapacityReport`) — **RETIRED 2026-08-09** by ADR-053 acceptance (v1.0) and ADR-058 Tier A1 acceptance. The cryptographic stamp + the chooser ledger-floor (`max(live, ledger.ResidentRAMForNode)`) ship together; the chooser no longer trusts stale `Σ(ram_mb+8)` sums. See ADR-053 §1 and ADR-058 §Decision.
+
 - **Tier 1 Phase 3** (`OCIRegistryStorageBackend` end-to-end) — blocks the "Snapshot locality" row in §6.4. Mitigates the case where a compute node cold-boots without the per-app layer.
 - **Tier 1 Phase 4** (per-host egress policy templating) — blocks the "Egress policy per host" row in §6.4. Mitigates the case where one host's `policy_nftables.conf` references another host's `MasqueradeCIDR`.
 - **#250** (off-host Postgres backup) — gates production safety. Phase D runbook (`docs/runbooks/multi-host-rollout.md`, not yet written) inherits this. Multi-host without off-host PG backup means a CP-host loss is unrecoverable.

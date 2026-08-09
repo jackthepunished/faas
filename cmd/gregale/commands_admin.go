@@ -41,6 +41,7 @@ func cmdAdmin(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: gregale admin <credit|consume-credits>")
 		fmt.Fprintln(os.Stderr, "  gregale admin credit --reason <text> <account_uuid> <cents>")
 		fmt.Fprintln(os.Stderr, "  gregale admin consume-credits <invoice-id>")
+		PrintUsage(os.Stderr, "usage: gregale admin <subcommand>", "admin")
 		return 2
 	}
 	switch args[0] {

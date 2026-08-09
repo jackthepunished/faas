@@ -232,20 +232,21 @@ type Build struct {
 }
 
 type BuildProvenance struct {
-	ID              pgtype.UUID
-	BuildID         pgtype.UUID
-	BuildkitVersion pgtype.Text
-	RailpackVersion pgtype.Text
-	BaseDigest      pgtype.Text
-	SourceSha256    string
-	SourceUrl       pgtype.Text
-	CommitSha       pgtype.Text
-	Plan            pgtype.Text
-	RunnerDigest    pgtype.Text
-	BuilderNodeID   pgtype.Text
-	StartedAt       pgtype.Timestamptz
-	FinishedAt      pgtype.Timestamptz
-	SbomStorageKey  pgtype.Text
+	ID               pgtype.UUID
+	BuildID          pgtype.UUID
+	BuildkitVersion  pgtype.Text
+	RailpackVersion  pgtype.Text
+	BaseDigest       pgtype.Text
+	SourceSha256     string
+	SourceUrl        pgtype.Text
+	CommitSha        pgtype.Text
+	Plan             pgtype.Text
+	RunnerDigest     pgtype.Text
+	BuilderNodeID    pgtype.Text
+	StartedAt        pgtype.Timestamptz
+	FinishedAt       pgtype.Timestamptz
+	SbomStorageKey   pgtype.Text
+	FrameworkVersion pgtype.Text
 }
 
 // Per-build wall-clock seconds, one row per terminal build. Source: cmd/builderd reaper + markSucceeded/markFailed adapters. ADR-048. Informational only — not billed.

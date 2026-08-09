@@ -97,10 +97,13 @@ func (f *fakeSinkSchedAPI) CapacitySink() scheddgrpc.CapacitySink {
 
 // Stubs for the other SchedAPI methods. They're never called
 // from ReportCapacity; they exist to satisfy the interface.
-func (f *fakeSinkSchedAPI) Wake(context.Context, string) (sched.WakeResult, error) {
+// Wake + AdmitInstance take a deploymentID (issue #556 / PR-C):
+// the per-deployment wake hint for the picker / wake-fan-out
+// path. Empty preserves the legacy single-deployment behaviour.
+func (f *fakeSinkSchedAPI) Wake(context.Context, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
-func (f *fakeSinkSchedAPI) AdmitInstance(context.Context, string) (sched.WakeResult, error) {
+func (f *fakeSinkSchedAPI) AdmitInstance(context.Context, string, string) (sched.WakeResult, error) {
 	return sched.WakeResult{}, nil
 }
 func (f *fakeSinkSchedAPI) ReportActivity(context.Context, []state.InstanceTouch) (int, error) {

@@ -108,6 +108,184 @@ func TestDetectFramework_NestedMarkerIgnored(t *testing.T) {
 	}
 }
 
+// TestDetectNestedMarkerHint pins the depth-2 workspace hint for issue #744
+// / ADR-086. The load-bearing case: a monorepo with apps/web/package.json
+// (and nothing at the root) returns true so resolveDeployShape can emit the
+// `gregale scan --path .` hint. Excluded dirs and depth-3+ must return false
+// to avoid false positives.
+func TestDetectNestedMarkerHint(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  bool
+	}{
+		// The headline case — common monorepo layout.
+		{"apps_web_package_json", []string{"apps/web/package.json"}, true},
+		{"services_api_go_mod", []string{"services/api/go.mod"}, true},
+		{"two_nested_markers", []string{"apps/web/package.json", "services/api/go.mod"}, true},
+		{"nested_requirements", []string{"api/requirements.txt"}, true},
+		{"nested_dockerfile", []string{"deploy/Dockerfile"}, true},
+		{"nested_pyproject", []string{"libs/x/pyproject.toml"}, true},
+
+		// Root markers win — these are NOT nested, they're app-shaped;
+		// detectFramework already returned the answer for them, and the
+		// hint must not double-fire.
+		{"root_package_json_wins", []string{"package.json"}, false},
+		{"root_dockerfile_wins", []string{"Dockerfile"}, false},
+
+		// Excluded dirs must not false-positive.
+		{"node_modules_ignored", []string{"node_modules/x/package.json"}, false},
+		{"dot_git_ignored", []string{".git/HEAD"}, false},
+		{"vendor_ignored", []string{"vendor/x/go.mod"}, false},
+		{"__pycache___ignored", []string{"__pycache__/x/requirements.txt"}, false},
+
+		// Depth-3+ is intentionally out of scope — pkg/reposcan handles it.
+		{"depth_3_returns_false", []string{"apps/services/api/package.json"}, false},
+
+		// Empty / README-only — nothing to hint at.
+		{"empty_dir", nil, false},
+		{"readme_only", []string{"README.md"}, false},
+
+		// Nested dir with non-marker files only — not a workspace.
+		{"nested_dir_no_markers", []string{"docs/index.md", "apps/web/index.js"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			got := detectNestedMarkerHint(dir)
+			if got != tc.want {
+				t.Errorf("detectNestedMarkerHint = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectShape covers issue #737 / ADR-083. The shape detector decides
+// whether `gregale deploy` on the cwd auto-picks app mode (any app marker)
+// or function mode (single handler.* with no app markers). Cases below
+// enumerate every shape boundary the CLI cares about.
+func TestDetectShape(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []string
+		want  shape
+	}{
+		// Function mode (the load-bearing new behaviour).
+		{"handler_js_only", []string{"handler.js"}, shapeFunction},
+		{"handler_ts_only", []string{"handler.ts"}, shapeFunction},
+		{"handler_py_only", []string{"handler.py"}, shapeFunction},
+		{"handler_go_only", []string{"handler.go"}, shapeFunction},
+		{"handler_with_readme", []string{"handler.js", "README.md"}, shapeFunction},
+		{"handler_with_dotfiles", []string{"handler.js", ".env", ".npmrc"}, shapeFunction},
+
+		// App mode — any app marker wins.
+		{"package_json_alone", []string{"package.json"}, shapeApp},
+		{"requirements_alone", []string{"requirements.txt"}, shapeApp},
+		{"go_mod_alone", []string{"go.mod"}, shapeApp},
+		{"dockerfile_alone", []string{"Dockerfile"}, shapeApp},
+		{"handler_plus_package_json", []string{"handler.js", "package.json"}, shapeApp},
+		{"handler_plus_dockerfile", []string{"handler.go", "Dockerfile"}, shapeApp},
+		{"two_handlers_is_ambiguous", []string{"handler.js", "handler.py"}, shapeApp},
+
+		// Unknown — the no-source error path.
+		{"empty", nil, shapeUnknown},
+		{"readme_only", []string{"README.md"}, shapeUnknown},
+		{"notes_only", []string{"notes.txt"}, shapeUnknown},
+		{"missing_dir_is_unknown", nil, shapeUnknown}, // caller passes non-existent path → ReadDir errors
+
+		// Issue #737 / ADR-083 / macOS APFS (case-insensitive by
+		// default): capital-H handler files must still resolve to
+		// shapeFunction. Pinned against the regression where
+		// functionHandlerFiles lookup was case-sensitive while the
+		// app-marker switch used strings.ToLower — silent shapeUnknown
+		// on a project that would have deployed end-to-end.
+		{"handler_capital_JS", []string{"Handler.JS"}, shapeFunction},
+		{"handler_capital_py", []string{"Handler.PY"}, shapeFunction},
+		{"handler_mixed_Go", []string{"HANDLER.go"}, shapeFunction},
+		{"handler_capital_with_readme", []string{"Handler.js", "README.md"}, shapeFunction},
+		// Mixed-case app markers still resolve to app (this
+		// already worked; kept here so the case-folding parity
+		// between handler and app markers is visible in one place).
+		{"package_json_capital_P", []string{"Package.json"}, shapeApp},
+		{"dockerfile_capital_D", []string{"DOCKERFILE"}, shapeApp},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// For "missing_dir" we use a path that doesn't exist.
+			target := dir
+			if tc.name == "missing_dir_is_unknown" {
+				target = filepath.Join(dir, "does-not-exist")
+			}
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			if got := detectShape(target); got != tc.want {
+				t.Errorf("detectShape = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectShape_NestedHandlerIgnored mirrors
+// TestDetectFramework_NestedMarkerIgnored — the shape rule is top-level
+// only, matching detectFramework's rule. A handler.js in a subdirectory
+// does NOT signal function mode (the customer's repo might have a sample
+// handler in examples/, that doesn't mean they want function mode).
+func TestDetectShape_NestedHandlerIgnored(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "examples/handler.js", "// sample")
+	writeFile(t, dir, "README.md", "hi")
+	if got := detectShape(dir); got != shapeUnknown {
+		t.Errorf("detectShape = %d, want %d (nested handler.js must not count)", got, shapeUnknown)
+	}
+}
+
+// TestInferFunctionRuntime pins the runtime map from extension (issue #737
+// / ADR-083). The wire handler value is always "handler.handler" —
+// that's the literal imaged's function-layer manifest rewrites to
+// /app/<runtime>.{js,py}, matching the function-* template convention
+// (cmd/gregale/templates/function-node/handler.js).
+func TestInferFunctionRuntime(t *testing.T) {
+	cases := []struct {
+		name    string
+		files   []string
+		wantRt  string
+		wantHnd string
+		wantOK  bool
+	}{
+		{"handler_js", []string{"handler.js"}, "node22", "handler.handler", true},
+		{"handler_ts", []string{"handler.ts"}, "node22", "handler.handler", true},
+		{"handler_py", []string{"handler.py"}, "python312", "handler.handler", true},
+		{"handler_go", []string{"handler.go"}, "go124", "handler.handler", true},
+		{"handler_with_readme", []string{"handler.js", "README.md"}, "node22", "handler.handler", true},
+		{"no_handler", []string{"README.md"}, "", "", false},
+		{"two_handlers_ambiguous", []string{"handler.js", "handler.py"}, "", "", false},
+		{"app_marker_present_ignored", []string{"handler.js", "package.json"}, "node22", "handler.handler", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, f := range tc.files {
+				writeFile(t, dir, f, "")
+			}
+			rt, hnd, ok := inferFunctionRuntime(dir)
+			if ok != tc.wantOK {
+				t.Errorf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if rt != tc.wantRt {
+				t.Errorf("runtime = %q, want %q", rt, tc.wantRt)
+			}
+			if hnd != tc.wantHnd {
+				t.Errorf("handler = %q, want %q", hnd, tc.wantHnd)
+			}
+		})
+	}
+}
+
 func TestPackDirToTarGz_TopLevelDirAndCount(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Base(dir)
@@ -319,5 +497,250 @@ func TestAutoPackCwd_CleansUpOnError(t *testing.T) {
 	}
 	if path != "" {
 		t.Errorf("path = %q, want empty on error", path)
+	}
+}
+
+// TestDetectFrameworkVersion_NodeNvmrc pins the CLI-side mirror of
+// pkg/builderd/detectversion.go (issue #740 / DEPLOY-PROV-5 /
+// ADR-087). The CLI banner must read .nvmrc when present and surface
+// the bare version.
+func TestDetectFrameworkVersion_NodeNvmrc(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".nvmrc", "22.11.0")
+	writeFile(t, dir, "package.json", "{}")
+	got := detectFrameworkVersion(dir, fwNode)
+	if got != "22.11.0" {
+		t.Errorf("got %q, want %q", got, "22.11.0")
+	}
+}
+
+// TestDetectFrameworkVersion_NodeNvmrcVPrefix pins the leading-v
+// strip (".nvmrc" commonly writes "v22.11.0").
+func TestDetectFrameworkVersion_NodeNvmrcVPrefix(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".nvmrc", "v22.11.0")
+	writeFile(t, dir, "package.json", "{}")
+	got := detectFrameworkVersion(dir, fwNode)
+	if got != "22.11.0" {
+		t.Errorf("got %q, want %q", got, "22.11.0")
+	}
+}
+
+// TestDetectFrameworkVersion_NodeEngines pins the package.json
+// fallback path. The caret-prefix is stripped; only the bare version
+// is returned.
+func TestDetectFrameworkVersion_NodeEngines(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "package.json", `{"engines":{"node":"^22.11.0"}}`)
+	got := detectFrameworkVersion(dir, fwNode)
+	if got != "22.11.0" {
+		t.Errorf("got %q, want %q", got, "22.11.0")
+	}
+}
+
+// TestDetectFrameworkVersion_NvmrcWinsOverEngines pins the priority
+// order. .nvmrc takes precedence over engines.node when both are
+// present.
+func TestDetectFrameworkVersion_NvmrcWinsOverEngines(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".nvmrc", "20.10.0")
+	writeFile(t, dir, "package.json", `{"engines":{"node":">=22.11.0"}}`)
+	got := detectFrameworkVersion(dir, fwNode)
+	if got != "20.10.0" {
+		t.Errorf("got %q, want %q (.nvmrc wins)", got, "20.10.0")
+	}
+}
+
+// TestDetectFrameworkVersion_PythonPythonVersion pins the
+// python-version path.
+func TestDetectFrameworkVersion_PythonPythonVersion(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, ".python-version", "3.11.0")
+	got := detectFrameworkVersion(dir, fwPython)
+	if got != "3.11.0" {
+		t.Errorf("got %q, want %q", got, "3.11.0")
+	}
+}
+
+// TestDetectFrameworkVersion_PythonRequiresPython pins the
+// pyproject.toml requires-python path.
+func TestDetectFrameworkVersion_PythonRequiresPython(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "pyproject.toml", `[project]
+name = "demo"
+requires-python = ">=3.13"
+`)
+	got := detectFrameworkVersion(dir, fwPython)
+	if got != "3.13" {
+		t.Errorf("got %q, want %q", got, "3.13")
+	}
+}
+
+// TestDetectFrameworkVersion_GoDirective pins the go.mod directive
+// path.
+func TestDetectFrameworkVersion_GoDirective(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", `module example.com/foo
+
+go 1.24
+`)
+	got := detectFrameworkVersion(dir, fwGo)
+	if got != "1.24" {
+		t.Errorf("got %q, want %q", got, "1.24")
+	}
+}
+
+// TestDetectFrameworkVersion_EmptyOnUnknown pins the negative case:
+// no version file → "". Customer just sees the framework= banner.
+func TestDetectFrameworkVersion_EmptyOnUnknown(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "package.json", "{}")
+	got := detectFrameworkVersion(dir, fwNode)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestDetectFrameworkVersion_EmptyOnMalformedJSON pins the
+// best-effort parsing contract: a malformed package.json must NOT
+// panic or error; the function returns "" and the banner omits the
+// version= token.
+func TestDetectFrameworkVersion_EmptyOnMalformedJSON(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "package.json", `{"engines": { "node": `)
+	got := detectFrameworkVersion(dir, fwNode)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestDetectFrameworkVersion_DockerEmpty pins the explicit
+// out-of-scope: Docker mode never returns a version (FROM parsing is
+// intentionally not implemented per issue #740).
+func TestDetectFrameworkVersion_DockerEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "Dockerfile", "FROM scratch")
+	got := detectFrameworkVersion(dir, fwDocker)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestDetectFrameworkVersion_NoOpOnUnknownFramework pins the
+// unknown-framework branch: returns "" without reading the cwd.
+func TestDetectFrameworkVersion_NoOpOnUnknownFramework(t *testing.T) {
+	dir := t.TempDir()
+	got := detectFrameworkVersion(dir, fwUnknown)
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// TestRuntimeSuggestionFor pins the (framework, version) →
+// whitelisted runtime name mapping used by the function error path's
+// runtime suggestion (issue #740 / ADR-087). The mapping is the
+// single source of truth for which `--runtime` value the CLI prints
+// in the error message; pinning here means a new runtime addition
+// forces an explicit test change.
+func TestRuntimeSuggestionFor(t *testing.T) {
+	cases := []struct {
+		name string
+		fw   framework
+		ver  string
+		want string
+	}{
+		{"node_22", fwNode, "22.11.0", "node22"},
+		{"node_24", fwNode, "24.0.0", "node24"},
+		{"node_20_falls_back_to_node22", fwNode, "20.0.0", "node22"},
+		{"node_18_older_falls_back_to_node22", fwNode, "18.0.0", "node22"},
+		{"python_313", fwPython, "3.13.0", "python313"},
+		{"python_312", fwPython, "3.12.0", "python312"},
+		{"python_311_falls_back_to_python312", fwPython, "3.11.0", "python312"},
+		{"python_310_older_falls_back_to_python312", fwPython, "3.10.0", "python312"},
+		{"go_124", fwGo, "1.24.0", "go124"},
+		{"go_122_below_whitelist", fwGo, "1.22.0", ""},
+		{"docker_no_op", fwDocker, "1.0", ""},
+		{"empty_version", fwNode, "", ""},
+		{"malformed_version", fwNode, "not-a-version", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runtimeSuggestionFor(tc.fw, tc.ver)
+			if got != tc.want {
+				t.Errorf("runtimeSuggestionFor(%q, %q) = %q, want %q", tc.fw, tc.ver, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFuncErrorSuggestion pins the high-level "should the error
+// message include a marker suggestion, and if so does it have a
+// non-empty --runtime" contract. Regression: a previous version of
+// the suggestion logic emitted "Detected X project — try `--runtime
+//
+//	--handler ...`." with an empty --runtime when the version mapped
+//
+// to no whitelisted runtime. This test pins that the suggestion is
+// only emitted when runtimeSuggestionFor returns non-empty.
+func TestFuncErrorSuggestion(t *testing.T) {
+	cases := []struct {
+		name    string
+		files   map[string]string
+		wantSub string // substring the suggestion must contain; "" = no suggestion
+	}{
+		{
+			name:    "no_marker_no_suggestion",
+			files:   nil, // empty dir — no package.json, no go.mod
+			wantSub: "",
+		},
+		{
+			name:    "node_with_nvmrc_emits_full_suggestion",
+			files:   map[string]string{".nvmrc": "22.11.0", "package.json": "{}"},
+			wantSub: "`--runtime node22 --handler handler.handler`",
+		},
+		{
+			name:  "node_with_nvmrc_no_empty_runtime_arg",
+			files: map[string]string{".nvmrc": "22.11.0", "package.json": "{}"},
+			// Sanity: a valid suggestion must never contain
+			// `--runtime  --handler` with an empty runtime. This
+			// is the regression-pin for the bug where
+			// runtimeSuggestionFor returned "" but the suggestion
+			// was still emitted with the empty arg.
+			wantSub: "`--runtime node22 --handler",
+		},
+		{
+			name:  "go_with_no_whitelisted_runtime_emits_no_suggestion",
+			files: map[string]string{"go.mod": "module x\n\ngo 1.22\n"},
+			// Even though a version IS detected (1.22),
+			// runtimeSuggestionFor("go", "1.22") == "" because
+			// the only whitelisted Go runtime is 1.24+, so the
+			// suggestion is suppressed rather than emitted with
+			// an empty --runtime.
+			wantSub: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for k, v := range tc.files {
+				writeFile(t, dir, k, v)
+			}
+			got := funcErrorSuggestion(dir)
+			if tc.wantSub == "" {
+				if got != "" {
+					t.Errorf("expected empty suggestion, got %q", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.wantSub) {
+				t.Errorf("expected suggestion to contain %q; got %q", tc.wantSub, got)
+			}
+			// Negative pin: no valid suggestion may contain an
+			// empty --runtime. This is the bug we're guarding
+			// against regression of.
+			if strings.Contains(got, "`--runtime  --handler") {
+				t.Errorf("suggestion must not contain empty --runtime; got %q", got)
+			}
+		})
 	}
 }

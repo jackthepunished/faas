@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,11 +39,16 @@ type Router interface {
 	ResolveHost(ctx context.Context, host string) (app App, ok bool, err error)
 }
 
-// targetSet (issue #168, placement scheduler PR) is the per-app list
-// of routable instances the gateway holds. Members are unique by
+// targetSet (issue #168, placement scheduler PR) is the per-deployment
+// list of routable instances the gateway holds. Members are unique by
 // InstanceID; Pick uses a per-node sub-cursor so the picker biases
 // toward the node with the most healthy entries and applies a
 // sticky-warm affinity bonus (ADR-025).
+//
+// PR-B (issue #556): one targetSet now corresponds to one *deployment*,
+// not the whole app. The app-level picker (appPicker) holds a targetSet
+// per live deployment and routes traffic to one of them by
+// deployment.traffic_percent.
 //
 // Concurrency model:
 //   - subCursors maps each distinct NodeID to an atomic round-robin
@@ -225,6 +231,35 @@ func (s *targetSet) pick(warmHint string) (Target, bool) {
 // without changing the legacy Scheduler contract tests rely on.
 // When the hooks are unset, Admit falls through to the legacy single
 // schedd field — matching pre-Gate-A behaviour.
+//
+// PR-B (issue #556) — traffic splitting across deployments:
+//
+// The PGBackend's hot-path picker is per-app + per-deployment.
+// apps maps appID → *appPicker. Each appPicker holds:
+//
+//   - weights []deploymentWeight, sorted (Percent DESC, DeploymentID ASC)
+//     for stable tie-break on the cumulative-weight binary search.
+//   - cum []int, the cumulative sum of weights (last entry is always 100
+//     once PR-A's UpdateDeploymentTraffic has stamped Σ=100 on the row).
+//   - cursor atomic.Uint64 — Pick increments it and binary-searches cum
+//     with (cursor mod 100) as the slot index. O(log N) per request, where
+//     N is the number of live deployments for that app (small — Pro+ canary
+//     is bounded by a handful of slots per app).
+//   - sets map[string]*targetSet — one per live deployment. Pick chooses
+//     a deployment via the weighted stride, then hands off to its targetSet
+//     for the per-node sub-cursor round-robin.
+//
+// Single-deployment fast path: when weights has length 1, Pick skips
+// the weighted stride and goes straight to the sole targetSet's
+// pick(warmHint) — byte-identical to the pre-PR-B behaviour. The
+// backward-compat test (TestPGBackend_PickSingleDeployment_ByteIdenticalToLegacy)
+// pins this so a pre-PR-A app sees zero behaviour change.
+//
+// When a request lands on a deployment with an empty targetSet (cold
+// deployment, no admitted instances yet), the picker falls through
+// to the largest-weight deployment's targetSet — biases warm
+// deployments but does not deadlock the request. PR-C ships
+// wake-fan-out to remove this fallback.
 type PGBackend struct {
 	router Router
 	sched  Scheduler
@@ -241,10 +276,21 @@ type PGBackend struct {
 	warmHint WarmHintFunc
 
 	tgtMu sync.RWMutex
-	// targets is the hot-path app_id → *targetSet cache. Each targetSet
-	// holds 1..max_concurrency Targets, picked via per-node sub-cursors
-	// (issue #168 + ADR-025).
-	targets map[string]*targetSet
+	// appsPicker (PR-B / issue #556) is the hot-path app_id → *appPicker cache.
+	// Each appPicker holds one *targetSet per live deployment of the app,
+	// plus the weighted-pick state. Pre-PR-B code used `targets
+	// map[string]*targetSet`; the new shape preserves the per-instance
+	// round-robin (targetSet.pick) while adding the per-deployment
+	// weighted stride. PR-B keeps targetSet.pick unchanged.
+	appsPicker map[string]*appPicker
+
+	// store (PR-B / issue #556) is the gateway-side seam for the
+	// RefreshDeploymentWeights notify handler. nil = no refresh; the
+	// picker retains its initial weights until the daemon restarts.
+	// Production wires this from cmd/gatewayd-internal so a deployment
+	// row's traffic_percent change invalidates the in-memory cache
+	// without restarting the edge. Tests inject a fake Store.
+	store deploymentWeightsStore
 
 	// appResolver (Phase 2 / Gate A) maps appID → state.App so the
 	// per-node client cache can find apps.node_id without a second
@@ -358,13 +404,69 @@ func NewPGBackend(router Router, sched Scheduler, log *slog.Logger) *PGBackend {
 		log = slog.Default()
 	}
 	return &PGBackend{
-		router:  router,
-		sched:   sched,
-		log:     log,
-		routes:  NewRouteCache(RouteCacheCap),
-		apps:    map[string]App{},
-		targets: map[string]*targetSet{},
+		router:     router,
+		sched:      sched,
+		log:        log,
+		routes:     NewRouteCache(RouteCacheCap),
+		apps:       map[string]App{},
+		appsPicker: map[string]*appPicker{},
 	}
+}
+
+// appPicker (PR-B / issue #556) is the per-app picker state the
+// gateway holds when traffic is split across N deployments. One app
+// → one appPicker → N *targetSets keyed by deployment ID.
+//
+// The picker algorithm:
+//
+//  1. Pick a deployment via weighted stride: cursor.Add(1) mod 100
+//     gives the slot index; binary-search cum for the smallest i with
+//     cum[i] > slot. cum is the cumulative-weight array (last entry
+//     = 100 once UpdateDeploymentTraffic stamps Σ=100).
+//  2. Look up the chosen targetSet. If empty (cold deployment), fall
+//     through to the largest-weight deployment's targetSet — biases
+//     warm deployments but never deadlocks the request.
+//  3. Hand off to the targetSet's per-node sub-cursor round-robin
+//     (issue #168 + ADR-025 — unchanged).
+//
+// Concurrency: cursor is the only mutable atomic; weights and cum are
+// rebuilt atomically by RefreshDeploymentWeights under tgtMu.Lock.
+// targetSet instances live inside sets and are protected by their own
+// mu (b.tgtMu).
+type appPicker struct {
+	weights []deploymentWeight
+	cum     []int                 // cum[i] = Σ_{j≤i} weights[j].Percent; cum[len-1] = 100
+	cursor  atomic.Uint64         // Pick increments; (cursor-1) mod 100 is the slot
+	sets    map[string]*targetSet // deploymentID → targetSet
+}
+
+// deploymentWeight is the per-deployment row of the picker's
+// weight table (PR-B / issue #556). Percent is the live traffic
+// share (0–100, Σ=100 within an app, enforced under PR-A's
+// UpdateDeploymentTraffic FOR UPDATE lock).
+type deploymentWeight struct {
+	DeploymentID string
+	Percent      int
+}
+
+// deploymentWeightsStore is the gateway-side seam used by
+// RefreshDeploymentWeights (PR-B / issue #556). It is the narrow
+// slice of state.Store the picker needs; production wires
+// pkg/state.PgStore, tests inject a fake. Declared gateway-local so
+// the picker has no pkg/state import — same shape as Router above.
+type deploymentWeightsStore interface {
+	LiveDeployments(ctx context.Context, appID string) ([]DeploymentWeightsRow, error)
+}
+
+// DeploymentWeightsRow is the gateway-side projection of the
+// live-deployment row the picker needs (PR-B / issue #556). The
+// gateway does not import pkg/state, so the production wiring
+// adapter (cmd/gatewayd-internal/main.go) translates from
+// state.Deployment to this shape. Only fields the picker reads are
+// exposed: the live deployment's ID and its traffic percent.
+type DeploymentWeightsRow struct {
+	ID             string
+	TrafficPercent int
 }
 
 // RouteCacheCap is the host→app_id cache ceiling (spec §4.1: 10,000 routes).
@@ -393,18 +495,54 @@ func (b *PGBackend) Lookup(ctx context.Context, host string) (App, bool) {
 	return app, true
 }
 
-// Pick returns one routable Target for appID via per-node sub-cursors
-// (issue #168, placement scheduler PR). Returns ("", false) when the
-// cache is empty (no wake has populated it yet, or every cached
-// instance was evicted). The handler must ensure capacity before
-// calling Pick so this only returns false on the rare eviction race.
+// Pick returns one routable Target for appID via the per-app
+// weighted picker (PR-B / issue #556). Returns ("", false) when
+// the cache is empty (no wake has populated it yet, every cached
+// instance was evicted, or the app has no live deployments).
+// The handler must ensure capacity before calling Pick so this
+// only returns false on the rare eviction race.
 //
-// Sticky-warm affinity (ADR-025): b.warmHint, if non-nil, biases the
-// pick toward the node that last warmed this app. nil warmHint
-// degrades to per-node healthyCount scoring with the lex tie-break
-// on node-id — a fresh deploy (no warm hint) still distributes
-// across nodes that already have live instances.
-func (b *PGBackend) Pick(appID string) (Target, bool) {
+// Algorithm:
+//
+//  1. Look up the appPicker. nil or empty weights → false.
+//  2. Single-deployment fast path: skip the weighted stride and
+//     hand off to the sole targetSet's per-node sub-cursor
+//     (byte-identical to pre-PR-B).
+//  3. Multi-deployment: cursor.Add(1) mod 100 → slot, binary
+//     search cum for the chosen deployment. If that targetSet is
+//     empty (cold deployment), fall through to the largest-weight
+//     deployment's targetSet (PR-C ships wake-fan-out to remove
+//     the fallback).
+//
+// Sticky-warm affinity (ADR-025) applies per-deployment inside
+// the targetSet (unchanged from issue #168).
+// PickResult (issue #556 / PR-C) widens the legacy (Target, bool)
+// tuple with two signals the handler needs to drive wake-fan-out:
+//
+//   - Picked: the deploymentID the weighted stride landed on. May be
+//     empty when no live deployment is known (empty weights). Set on
+//     every success path (warm single-dep, warm multi-dep, AND cold
+//     multi-dep where the fallback is the same bucket).
+//   - ColdBucket: when non-empty, signals "the bucket we landed on
+//     has no routable Targets". Set ONLY on the cold multi-dep
+//     fallback path. The handler uses this to decide whether to call
+//     Backend.Admit(ctx, appID, ColdBucket, max) and retry Pick.
+//
+// On the legacy single-deployment fast path (byte-identical to
+// pre-PR-B), Picked=weights[0].DeploymentID and ColdBucket="".
+//
+// PR-B's pre-existing behaviour is preserved: OK=false on empty
+// cache / picker miss (the handler maps this to
+// api.ErrAppConcurrencyReached — the WakeGate will retry). PR-C
+// adds the signal tuple but does NOT change the failure semantics.
+type PickResult struct {
+	Target     Target
+	OK         bool
+	Picked     string
+	ColdBucket string
+}
+
+func (b *PGBackend) Pick(appID string) PickResult {
 	var warmHint string
 	if b.warmHint != nil {
 		if n, found := b.warmHint(appID); found {
@@ -412,63 +550,143 @@ func (b *PGBackend) Pick(appID string) (Target, bool) {
 		}
 	}
 	b.tgtMu.RLock()
-	set := b.targets[appID]
-	if set == nil {
+	picker := b.appsPicker[appID]
+	if picker == nil || len(picker.weights) == 0 {
 		b.tgtMu.RUnlock()
-		return Target{}, false
+		return PickResult{}
+	}
+	// Single-deployment fast path: byte-identical to pre-PR-B.
+	if len(picker.weights) == 1 {
+		set := picker.sets[picker.weights[0].DeploymentID]
+		if set == nil {
+			b.tgtMu.RUnlock()
+			return PickResult{}
+		}
+		t, ok := set.pick(warmHint)
+		b.tgtMu.RUnlock()
+		if !ok {
+			return PickResult{}
+		}
+		return PickResult{Target: t, OK: true, Picked: picker.weights[0].DeploymentID}
+	}
+	// Multi-deployment weighted stride.
+	slot := int(picker.cursor.Add(1)-1) % 100
+	chosen := picker.weights[0].DeploymentID // safe fallback if binary search misses
+	// Binary search cum for smallest i with cum[i] > slot.
+	lo, hi := 0, len(picker.cum)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if picker.cum[mid] > slot {
+			chosen = picker.weights[mid].DeploymentID
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	set := picker.sets[chosen]
+	if set == nil || len(set.entries) == 0 {
+		// Cold deployment — fall through to the largest-weight
+		// deployment's targetSet. Find by max Percent.
+		//
+		// PR-C: signal the handler via ColdBucket=chosen so it can
+		// admit an instance on `chosen` and retry Pick. The
+		// fallback below keeps the legacy "warmest bucket" path
+		// operational during the rollout window (before any
+		// wake-fan-out has run).
+		var (
+			fallbackID  string
+			fallbackSet *targetSet
+			best        int
+		)
+		for _, w := range picker.weights {
+			s := picker.sets[w.DeploymentID]
+			if s == nil || len(s.entries) == 0 {
+				continue
+			}
+			if w.Percent > best || fallbackSet == nil {
+				best = w.Percent
+				fallbackID = w.DeploymentID
+				fallbackSet = s
+			}
+		}
+		if fallbackSet == nil {
+			b.tgtMu.RUnlock()
+			return PickResult{Picked: chosen, ColdBucket: chosen}
+		}
+		t, ok := fallbackSet.pick(warmHint)
+		b.tgtMu.RUnlock()
+		if !ok {
+			return PickResult{Picked: chosen, ColdBucket: chosen}
+		}
+		t.DeploymentID = fallbackID
+		return PickResult{Target: t, OK: true, Picked: chosen, ColdBucket: chosen}
 	}
 	t, ok := set.pick(warmHint)
 	b.tgtMu.RUnlock()
-	return t, ok
+	if !ok {
+		return PickResult{Picked: chosen, ColdBucket: chosen}
+	}
+	t.DeploymentID = chosen
+	return PickResult{Target: t, OK: true, Picked: chosen}
 }
 
-// HealthyCount returns the number of routable Targets currently cached for
-// appID (issue #168). Drives the WakeGate's shouldWake predicate: stop
+// HealthyCount returns the number of routable Targets currently
+// cached for appID across all live deployments (PR-B /
+// issue #556). Drives the WakeGate's shouldWake predicate: stop
 // admitting once we're at the plan's effective max_concurrency.
+// Σ over deployments — splitting traffic across N deployments
+// does NOT double-bill the cap (issue #556 acceptance #3, §6.2-2).
 func (b *PGBackend) HealthyCount(appID string) int {
 	b.tgtMu.RLock()
-	set := b.targets[appID]
-	if set == nil {
+	picker := b.appsPicker[appID]
+	if picker == nil {
 		b.tgtMu.RUnlock()
 		return 0
 	}
-	n := len(set.entries)
+	n := 0
+	for _, set := range picker.sets {
+		n += len(set.entries)
+	}
 	b.tgtMu.RUnlock()
 	return n
 }
 
-// Admit asks schedd to admit ONE additional instance for appID (issue #168).
-// On the admitted path the new Target is added to the per-app targetSet
-// (dedup by InstanceID). On the at-capacity path the engine's typed result
-// is passed through (wakeID empty, method WakeMethodUnspecified, err nil).
-// On a real failure (RAM headroom, chooser, store) the error is preserved —
-// schedd lifts them to *api.Problem at the wire boundary.
+// Admit asks schedd to admit ONE additional instance for appID
+// (issue #168). On the admitted path the new Target is added to
+// the per-deployment targetSet keyed by deploymentID (PR-B /
+// issue #556). On the at-capacity path the engine's typed result
+// is passed through. On a real failure (RAM headroom, chooser,
+// store) the error is preserved.
 //
-// Fan-out invariant (issue #168): HealthyCount < maxConcurrency is enforced
-// atomically inside this method. Concurrent callers serialize on tgtMu so a
-// burst of N requests cannot collectively exceed the cap. Schedd also
-// enforces the cap via its per-app ledger, but that round-trip is expensive
-// — the gateway-side check is the cheap fast path that keeps the RPC count
-// ≤ maxConcurrency per burst.
+// PR-B: the cap check now sums across all per-deployment
+// targetSets (issue #556 acceptance #3) so a burst cannot
+// over-admit across deployments. Concurrent callers serialize on
+// tgtMu. The Target is stamped with DeploymentID from the wire so
+// the picker can route subsequent requests to the same bucket.
 //
-// method is the wake-outcome schedd actually performed (PR scale-out
-// readiness, ADR-028). On the admitted path the value is
-// WakeMethodSnapshotRestore or WakeMethodColdBoot, translated by
-// scheddgrpc.Client from the wire's scheddpb.WakeMethod. On
-// at-capacity and error paths the value is WakeMethodUnspecified.
+// method is the wake-outcome schedd actually performed (ADR-028).
+// On the admitted path the value is WakeMethodSnapshotRestore or
+// WakeMethodColdBoot; on at-capacity and error paths it is
+// WakeMethodUnspecified.
 //
 // Phase 2 / Gate A: when WithAppResolver + WithClientForApp are
 // configured, Admit first resolves the owning schedd via
 // apps.node_id. Otherwise it falls through to the legacy single
-// b.sched field — byte-identical to pre-Gate-A behaviour for
-// single-box installs where the hooks are not wired.
-func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int) (string, WakeMethod, bool, error) {
+// b.sched field.
+func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Cheap fast path: refuse before we spend a gRPC round-trip.
+	// Σ over all per-deployment targetSets (issue #556 acceptance #3).
 	b.tgtMu.Lock()
-	set := b.targets[appID]
-	if set != nil && len(set.entries) >= maxConcurrency {
-		b.tgtMu.Unlock()
-		return "", WakeMethodUnspecified, true, nil
+	picker := b.appsPicker[appID]
+	if picker != nil {
+		total := 0
+		for _, set := range picker.sets {
+			total += len(set.entries)
+		}
+		if total >= maxConcurrency {
+			b.tgtMu.Unlock()
+			return "", WakeMethodUnspecified, true, nil
+		}
 	}
 	b.tgtMu.Unlock()
 
@@ -477,77 +695,267 @@ func (b *PGBackend) Admit(ctx context.Context, appID string, maxConcurrency int)
 		return "", WakeMethodUnspecified, false, err
 	}
 
-	instanceID, nodeID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID)
+	// PR-C wake-fan-out: forward the per-deployment hint to
+	// schedd so the new instance is admitted on the specific
+	// live deployment the picker landed on. Empty falls through
+	// to schedd's default (newest live deployment) — the legacy
+	// single-deployment path.
+	instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port, err := sched.AdmitInstance(ctx, appID, deploymentID)
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
+	}
+	// Use the deploymentID schedd actually used (matches the
+	// bucket the picker will route to); fall through to the
+	// caller's hint if schedd returned "".
+	if returnedDeploymentID != "" {
+		deploymentID = returnedDeploymentID
 	}
 	method := scheddWakeMethodToGateway(rawMethod)
 	if atCapacity {
 		return "", WakeMethodUnspecified, true, nil
 	}
 	if nodeID == "" || instanceID == "" {
-		// schedd returned a successful admit with empty ids. This is
-		// an internal-server-error class event — the wire contract
-		// says instance_id/node_id are populated on the admitted
-		// path. Lift to *api.Problem so writeWakeError surfaces a
-		// descriptive 5xx instead of the generic "wake failed" 503.
 		return "", WakeMethodUnspecified, false, api.NewProblem(http.StatusInternalServerError,
 			api.CodeCapacity, "schedd admit returned empty ids",
 			fmt.Sprintf("instance=%q node=%q wake=%q", instanceID, nodeID, wakeID))
 	}
+	// Pre-PR-B fallback: a pre-PR-B schedd returns deploymentID="".
+	// The picker collapses to single-targetSet behaviour when there
+	// is no appPicker yet OR when the chosen deploymentID is not in
+	// the picker. We use a sentinel "_" key for the legacy bucket
+	// so the picker stays byte-identical with a single live row.
+	bucket := deploymentID
+	if bucket == "" {
+		bucket = "_legacy"
+	}
 	b.tgtMu.Lock()
-	set = b.targets[appID]
+	picker = b.appsPicker[appID]
+	if picker == nil {
+		// Lazy-create a picker. If the store is wired, the
+		// notify path seeds weights via RefreshDeploymentWeights
+		// on the next deployment_changed event. If the store is
+		// NOT wired (legacy single-box posture, or tests without
+		// a state.Store seam), Admit synthesizes an implicit
+		// single-deployment weight entry below so Pick routes
+		// correctly without waiting for a refresh.
+		picker = &appPicker{sets: map[string]*targetSet{}}
+		b.appsPicker[appID] = picker
+	}
+	set := picker.sets[bucket]
 	if set == nil {
 		set = &targetSet{
 			subCursors: map[string]*atomic.Uint64{},
 		}
-		b.targets[appID] = set
+		picker.sets[bucket] = set
+	}
+	// Synthesize an implicit 100% weight ONLY when the picker has
+	// no weight table at all (the legacy pre-PR-B single-bucket
+	// posture, or a fresh test without a state.Store seam). Once
+	// the picker knows about multiple deployments we MUST NOT
+	// clobber the table — a missing-bucket admit on a multi-dep
+	// app is a wake-fan-out signal (handled in PickResult.
+	// ColdBucket), not an implicit-100 override.
+	if len(picker.weights) == 0 {
+		picker.weights = []deploymentWeight{{DeploymentID: bucket, Percent: 100}}
+		picker.cum = []int{100}
 	}
 	set.add(Target{
-		NodeID:     nodeID,
-		InstanceID: instanceID,
-		WakeID:     wakeID,
-		AddedAt:    time.Now(),
-		// PR-C (issue #460 / ADR-053): cache the per-deployment
-		// override port on the Target. The forwarder reads this
-		// to stamp ForwardHTTPRequestInit.port so vmmd dials the
-		// override port instead of legacy 8080. Zero is fine
-		// (vmmd server-side defaults to netns.AppPort).
-		Port: port,
+		NodeID:       nodeID,
+		InstanceID:   instanceID,
+		WakeID:       wakeID,
+		AddedAt:      time.Now(),
+		Port:         port,
+		DeploymentID: deploymentID,
 	})
 	b.tgtMu.Unlock()
 	return wakeID, method, false, nil
 }
 
-// EvictInstance drops a specific instance from its app's targetSet (issue
-// #168). The instance_changed notification loop calls this with the
-// instance_id from the pg_notify payload; only that single entry is
-// removed, leaving any other instances in the set routable.
+// EvictInstance drops a specific instance from its app's per-deployment
+// targetSets (PR-B / issue #556). The instance_changed notification
+// loop calls this with the instance_id from the pg_notify payload;
+// only that single entry is removed across all per-deployment
+// buckets, leaving any other instances routable.
+//
+// Walks every per-deployment targetSet under the app's picker —
+// we don't know which bucket owns the instance without an index.
+// If the picker is empty after the walk, the picker is dropped.
+// Per-bucket targetSets are preserved even when their entries
+// become empty (cold deployment under non-zero weight); only the
+// picker-level drop happens here. The per-deployment weight
+// removal is RefreshDeploymentWeights's job — that's where we
+// learn a deployment is no longer 'live'.
 func (b *PGBackend) EvictInstance(appID, instanceID string) {
 	if appID == "" || instanceID == "" {
 		return
 	}
 	b.tgtMu.Lock()
-	set := b.targets[appID]
-	if set == nil {
+	picker := b.appsPicker[appID]
+	if picker == nil {
 		b.tgtMu.Unlock()
 		return
 	}
-	if set.remove(instanceID) == 0 {
-		delete(b.targets, appID)
+	totalRemaining := 0
+	for _, set := range picker.sets {
+		totalRemaining += set.remove(instanceID)
+	}
+	if totalRemaining == 0 {
+		delete(b.appsPicker, appID)
 	}
 	b.tgtMu.Unlock()
 }
 
-// EvictTarget drops ALL cached targets for appID (legacy contract). Kept
-// for callers that don't yet parse the instance_id from the
-// instance_changed payload — it under-evicts nothing because the next
+// EvictTarget drops ALL cached targets for appID (legacy contract).
+// Kept for callers that don't yet parse the instance_id from the
+// instance_changed payload — under-evicts nothing because the next
 // request will Pick from what's left and miss if everything's gone,
 // then re-admit. New code should prefer EvictInstance.
 func (b *PGBackend) EvictTarget(appID string) {
 	b.tgtMu.Lock()
-	delete(b.targets, appID)
+	delete(b.appsPicker, appID)
 	b.tgtMu.Unlock()
+}
+
+// RefreshDeploymentWeights (PR-B / issue #556) reloads the
+// per-deployment weight table for appID from the store. The
+// notify loop calls this on db.NotifyDeploymentChanged so a
+// `faas traffic set --percent 25` takes effect within ~1s
+// without restarting the edge.
+//
+// Behaviour:
+//
+//   - Reads LiveDeployments(appID). Empty slice → drop the picker
+//     entirely (no live deployments, 503).
+//   - Builds a new weights slice filtered to Percent > 0, sorted
+//     (Percent DESC, DeploymentID ASC) for stable tie-break on the
+//     cumulative-weight binary search.
+//   - Rebuilds cum so cum[len-1] = 100. PR-A's UpdateDeploymentTraffic
+//     enforces Σ=100 under FOR UPDATE; the test data may carry
+//     a deployment with Percent=0 (sibling of a 100% primary),
+//     which we filter out.
+//   - Existing per-deployment targetSets are preserved. Instances
+//     stay routable through the picker; only the weight table
+//     flips.
+//
+// Returns the error wrapped with operation context. The notify
+// handler logs-and-continues on a non-nil error — a brief
+// staleness window is preferable to crashing the edge.
+func (b *PGBackend) RefreshDeploymentWeights(ctx context.Context, appID string) error {
+	if b.store == nil {
+		// No store wired — nothing to refresh. The picker
+		// retains its initial weights until the daemon
+		// restarts. Production always wires the store from
+		// cmd/gatewayd-internal so this branch is a test seam.
+		return nil
+	}
+	rows, err := b.store.LiveDeployments(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("gatewayd: refresh deployment weights app=%s: %w", appID, err)
+	}
+	next := buildDeploymentWeights(rows)
+	b.tgtMu.Lock()
+	defer b.tgtMu.Unlock()
+	if len(next) == 0 {
+		delete(b.appsPicker, appID)
+		return nil
+	}
+	picker, ok := b.appsPicker[appID]
+	if !ok {
+		picker = &appPicker{sets: map[string]*targetSet{}}
+		b.appsPicker[appID] = picker
+	}
+	picker.weights = next
+	picker.cum = buildCumulativeWeights(next)
+	// Existing per-deployment targetSets in picker.sets are
+	// preserved — instances stay routable through the picker.
+	//
+	// PR-C stale-set pruning: if a deployment is no longer in
+	// the live weight table AND its targetSet is empty, drop it
+	// from picker.sets. Without this prune, a deployment that
+	// has been superseded would linger in picker.sets and
+	// HealthyCount would over-count on the empty-set branch
+	// (sets are walked by len(set.entries) but stale entries
+	// stay until the next instance_changed notification — and a
+	// deployment that's been superseded will never produce
+	// another instance_changed). Empty-set + not-in-weights is
+	// the precise signal that the deployment is gone.
+	for id, set := range picker.sets {
+		if len(set.entries) == 0 && !pickerHasDeploymentByID(next, id) {
+			delete(picker.sets, id)
+		}
+	}
+	return nil
+}
+
+// buildDeploymentWeights filters rows to Percent > 0 and sorts
+// (Percent DESC, DeploymentID ASC) for stable tie-break on the
+// cumulative-weight binary search (PR-B / issue #556). A
+// deployment with Percent == 0 is filtered out: the picker must
+// never route to it (caller treats that as "no live deployment,
+// 503" rather than a cold fallback).
+//
+// The slice is small (Pro+ canary is bounded by a handful of
+// deployments per app), so an O(N log N) sort is fine. Test seam.
+func buildDeploymentWeights(rows []DeploymentWeightsRow) []deploymentWeight {
+	out := make([]deploymentWeight, 0, len(rows))
+	for _, r := range rows {
+		if r.TrafficPercent <= 0 {
+			continue
+		}
+		out = append(out, deploymentWeight{
+			DeploymentID: r.ID,
+			Percent:      r.TrafficPercent,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Percent != out[j].Percent {
+			return out[i].Percent > out[j].Percent
+		}
+		return out[i].DeploymentID < out[j].DeploymentID
+	})
+	return out
+}
+
+// buildCumulativeWeights builds the cumulative-weight array the
+// picker binary-searches. cum[i] = Σ_{j≤i} weights[j].Percent.
+// Σ within an app is 100 by construction (PR-A's
+// UpdateDeploymentTraffic enforces it under FOR UPDATE); a
+// production row set whose Σ is something else (test data,
+// migration in flight) still works — the search returns the
+// last index when slot ≥ cum[len-1].
+func buildCumulativeWeights(weights []deploymentWeight) []int {
+	cum := make([]int, len(weights))
+	var sum int
+	for i, w := range weights {
+		sum += w.Percent
+		cum[i] = sum
+	}
+	return cum
+}
+
+// pickerHasDeploymentByID is the slice-level predicate (PR-C
+// stale-set prune). Walks the supplied weight table — caller
+// passes either p.weights or a freshly-rebuilt next slice.
+func pickerHasDeploymentByID(weights []deploymentWeight, id string) bool {
+	for _, w := range weights {
+		if w.DeploymentID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// WithStore (PR-B / issue #556) arms the deployment-weights store
+// for RefreshDeploymentWeights. nil = no store wired; the picker
+// retains its initial weights until the daemon restarts (test
+// seam). Production wires this from cmd/gatewayd-internal so a
+// db.NotifyDeploymentChanged event triggers the refresh.
+//
+// The setter returns *PGBackend for fluent chaining (same shape
+// as every other PGBackend.With*).
+func (b *PGBackend) WithStore(s deploymentWeightsStore) *PGBackend {
+	b.store = s
+	return b
 }
 
 // FlushRoutes clears the host→app and app→plan caches. gatewayd calls this on

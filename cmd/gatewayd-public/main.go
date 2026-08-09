@@ -12,7 +12,8 @@
 //   - pkg/httpsec outer wrapper (HSTS / CSP nonce / X-Frame-Options /
 //     Referrer-Policy / X-Content-Type-Options / Permissions-Policy)
 //   - /healthz, /readyz, /metrics on loopback FAAS_PUBLIC_CONTROL_ADDR
-//     (default 127.0.0.1:9090)
+//     (default 127.0.0.1:9092 — ADR-070; the legacy gatewayd daemon
+//     owns :9090 and must not collide on the same node)
 //   - Drain semantics: SIGTERM → flip /readyz → wait in-flight → Shutdown
 //
 // It does NOT own:
@@ -44,6 +45,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +58,8 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/httpsec"
+	"github.com/onebox-faas/faas/pkg/secretbox"
+	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -79,9 +83,10 @@ const (
 	// /run/faas tmpfs (the SOLE RuntimeDirectory=faas).
 	defaultInternalSocket = "/run/faas/gatewayd-internal.sock"
 	// defaultPublicControlAddr is the loopback control plane
-	// (/healthz, /readyz, /metrics). Loopback (not :9090) because
-	// the legacy gatewayd daemon binds :9090.
-	defaultPublicControlAddr = "127.0.0.1:9090"
+	// (/healthz, /readyz, /metrics). Pinned at :9092 per ADR-070
+	// (Tier A7 edge split); the legacy gatewayd daemon owns :9090
+	// and must not collide on the same node.
+	defaultPublicControlAddr = "127.0.0.1:9092"
 )
 
 // gatewaydPublicCapCheck is the DEPLOY-1 / ADR-075 capdecl gate
@@ -135,12 +140,59 @@ func run(ctx context.Context, log *slog.Logger) error {
 		return fmt.Errorf("gatewayd-public: open db: %w", err)
 	}
 	defer pool.Close()
+	// pgStore is the shared state.Store. gatewayd-public only
+	// needs ActiveComputeNodes (for the leader-election adapter
+	// in cmd/gatewayd-public/store_adapter.go); the rest of the
+	// store's surface is for gatewayd-internal (apps, accounts,
+	// sessions). We construct it here so the DNSHandoff wiring
+	// has a Store to call into. Mirrors cmd/gatewayd-internal/run.go:366.
+	pgStore := state.NewPgStore(pool)
 
 	// Readiness probe. Single signal: PG ping. (certsync/internal-proxy
 	// signals are gone in plain-HTTP mode — once both listeners are
 	// bound, /readyz=200.)
 	probe, pgProbeSig, pgStop := setupReadiness(ctx, pool, log)
 	defer pgStop()
+
+	// Tier A8 / ADR-083 wiring (code-review fix #2 + #3 + #5).
+	// Built BEFORE the public listener so the in-flight tracker
+	// can be hung off the listener's ConnState callback. The DNS
+	// handoff subscribes to pg_notify compute_node_changed; the
+	// standby warmup probes the local public listener on every
+	// tick. Both block on ctx; both return nil on cancel.
+	//
+	// Sealed-secret seam (fix #3): the package-level
+	// OpenBytesDNSProvider var in pkg/gateway starts out as
+	// errSecretBoxUnconfigured. main.go reassigns it at startup
+	// to a closure that loads host.age identities via
+	// secretbox.LoadHostKeys (mirrors cmd/gatewayd-internal's
+	// public_auth_unsealer.go). When FAAS_HOST_KEY_PATH is unset
+	// the identity list is empty and the closure returns
+	// errSecretBoxUnconfigured on first call — the right
+	// behaviour (fail loud at the first DNS attempt, never
+	// silently no-op).
+	if hp := os.Getenv("FAAS_HOST_KEY_PATH"); hp != "" {
+		identities, idErr := secretbox.LoadHostKeys(filepath.Dir(hp))
+		if idErr != nil || len(identities) == 0 {
+			errMsg := "<nil>"
+			if idErr != nil {
+				errMsg = idErr.Error()
+			}
+			log.Warn("gatewayd-public: load host identities for DNS token unseal; DNS_PROVIDER namespace unseal will fail at first call",
+				"err", errMsg)
+		}
+		gateway.OpenBytesDNSProvider = func(sealed []byte) ([]byte, error) {
+			if len(identities) == 0 {
+				return nil, gateway.ErrSecretBoxUnconfigured
+			}
+			_, plaintext, err := secretbox.OpenBytesMulti(identities, sealed)
+			if err != nil {
+				return nil, fmt.Errorf("dns_provider unseal: %w", err)
+			}
+			return plaintext, nil
+		}
+	}
+	inflight := gateway.NewConnStateTracker()
 
 	// Reverse-proxy to gatewayd-internal over the unix socket.
 	internalSocket := envOr("FAAS_INTERNAL_SOCKET", defaultInternalSocket)
@@ -198,6 +250,22 @@ func run(ctx context.Context, log *slog.Logger) error {
 	controlAddr := envOr("FAAS_PUBLIC_CONTROL_ADDR", defaultPublicControlAddr)
 	listenAddr := envOr("FAAS_PUBLIC_LISTEN_ADDR", defaultListenAddr)
 	publicSrv, controlSrv := buildServers(listenAddr, controlAddr, publicHandler, controlMux)
+	// Tier A8 / ADR-083 (code-review fix #5): hook the public
+	// listener's ConnState to the in-flight tracker so the
+	// DNSHandoff orchestrator can wait for in-flight to reach
+	// zero on drain. The control listener doesn't drain — it
+	// only serves /healthz, /readyz, /metrics — so it's not
+	// counted.
+	publicSrv.ConnState = inflight.ConnState
+
+	// Tier A8 / ADR-083 (code-review fix #2 + #6): start the
+	// DNSHandoff subscriber and the StandbyWarmup loop. Both are
+	// gated on the FAAS_DNS_PROVIDER and FAAS_STANDBY_WARMUP_ENABLED
+	// knobs and both return nil on ctx cancellation. The DNSHandoff
+	// is skipped when no store is wired (the dev single-box path).
+	if err := startHAComponents(ctx, log, pool, pgStore, inflight, envOr("FAAS_NODE_NAME", ""), envOr("FAAS_NODE_PUBLIC_IP", listenAddr)); err != nil {
+		return err
+	}
 
 	// Drain orchestration.
 	if err := runDrain(ctx, log, publicSrv, controlSrv, pgProbeSig, pgStop, traceSetup); err != nil {
@@ -246,7 +314,10 @@ func setupReadiness(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (
 }
 
 // buildServers constructs the plain-HTTP public + loopback control
-// servers.
+// servers. Both pin MaxHeaderBytes to api.DefaultMaxHeaderBytes
+// (1 MiB) so a future stdlib default change cannot widen the
+// attack surface on this listener; the value mirrors stdlib's
+// historical 1 MiB ceiling.
 func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, controlMux *http.ServeMux) (*http.Server, *http.Server) {
 	publicSrv := &http.Server{
 		Addr:              listenAddr,
@@ -254,11 +325,13 @@ func buildServers(listenAddr, controlAddr string, publicHandler http.Handler, co
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      300 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
 	}
 	controlSrv := &http.Server{
 		Addr:              controlAddr,
 		Handler:           controlMux,
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    api.DefaultMaxHeaderBytes,
 	}
 	return publicSrv, controlSrv
 }

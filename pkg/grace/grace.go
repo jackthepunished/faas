@@ -42,6 +42,18 @@ type Sender interface {
 // function so pkg/grace stays free of pgx imports.
 type Notifier func(ctx context.Context, channel, payload string) error
 
+// Auditor emits an audit row to the events table (issue #755 /
+// PR-5.5). pkg/grace depends on this seam so the post-hard-delete
+// audit row carries the source-of-truth that the deletion fired
+// at <now> from the sweep goroutine (not a customer's DELETE).
+// accountID may be nil if the auditor is invoked outside an account
+// scope (none today); data is the structured payload that lands in
+// the events.data JSONB column. Optional — nil falls back to no-op
+// so tests can leave it unset.
+type Auditor interface {
+	Emit(ctx context.Context, kind string, accountID *string, data map[string]any)
+}
+
 // Params wires the runtime dependencies the Grace loop needs. All
 // fields except Store are optional and fall back to no-op behavior;
 // Store must be non-nil (the constructor panics otherwise).
@@ -52,6 +64,7 @@ type Params struct {
 	Now      func() time.Time
 	Log      *slog.Logger
 	Notif    Notifier
+	Audit    Auditor // optional; PR-5.5 emits account.deleted after DeleteAccount fires
 }
 
 // Grace is the 30-day deletion-grace timer. Owns the ticker + the
@@ -81,8 +94,16 @@ func New(p Params) *Grace {
 	if p.Notif == nil {
 		p.Notif = func(context.Context, string, string) error { return nil }
 	}
+	if p.Audit == nil {
+		p.Audit = noopAuditor{}
+	}
 	return &Grace{p: p}
 }
+
+// noopAuditor discards every emit. Default for tests.
+type noopAuditor struct{}
+
+func (noopAuditor) Emit(_ context.Context, _ string, _ *string, _ map[string]any) {}
 
 // noopSender discards every message. Default for tests.
 type noopSender struct{}
@@ -149,6 +170,33 @@ func (g *Grace) RunOnce(ctx context.Context) error {
 			g.p.Log.Warn("grace: hard delete failed", "account", acct.ID, "err", err)
 			continue
 		}
+		// Audit the hard delete (issue #755 / PR-5.5 events-side
+		// + PR-6 audit_log-side). Two parallel rows are written so
+		// the post-deletion state is preserved across two tables:
+		//
+		//   - The events row written here (account_id = the deleted
+		//     account) is the per-event trail that the
+		//     pkg/eventretention 90-day sweep (ADR-075) will trim.
+		//   - The audit_log row written by DeleteAccount inside the
+		//     same tx (PR-6) is the FK-free, immutable
+		//     post-deletion evidence a regulator / DPO can read
+		//     after the accounts row is gone. ISO 27001 SoA A.5.33
+		//     retention = forever.
+		//
+		// actor distinguishes the sweep from a customer's DELETE so
+		// a forensic auditor can tell the two surfaces apart.
+		// Best-effort: the events-side auditor is non-blocking by
+		// spec §5.1, so a backlog here cannot delay the sweep. The
+		// audit_log-side insert lives inside the DeleteAccount tx,
+		// so an insert failure rolls back the entire delete and
+		// surfaces the error to the sweep above (the
+		// `hard delete failed` log).
+		acctID := acct.ID
+		g.p.Audit.Emit(ctx, "account.deleted", &acctID, map[string]any{
+			"actor":  "grace-sweep",
+			"email":  acct.Email,
+			"source": "grace-sweep",
+		})
 		// Stamp completed_at on the GDPR audit row so the export
 		// bundle reflects "yes, your account was hard-deleted at
 		// <now>". Best-effort; ErrNotFound just means the customer

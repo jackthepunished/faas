@@ -107,7 +107,7 @@ type runDeps struct {
 	// subscribeNodeKeyChanges (ADR-053) is the producer-side seam
 	// for the 'compute_node_changed' pg_notify consumer that
 	// refreshes the in-memory NodeKeyRegistry on every relevant
-	// INSERT/UPDATE/DELETE (migration 00075's trigger fires on
+	// INSERT/UPDATE/DELETE (migration 00076's trigger fires on
 	// both compute_nodes AND compute_node_keys). nil = the
 	// subscriber is not started; the initial Refresh at startup
 	// still runs so a slice-3 schedd with no vmmd registered
@@ -500,7 +500,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// ADR-053 — slice-3 signature verification. Construct the
 	// in-memory (key_id → *ecdsa.PublicKey) registry, load the
-	// initial snapshot from compute_node_keys (migration 00075),
+	// initial snapshot from compute_node_keys (migration 00076),
 	// then subscribe to the 'compute_node_changed' pg_notify
 	// channel so a vmmd registering (or rotating) its key
 	// lands on the next listener tick. The handler
@@ -826,6 +826,37 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.WithMigratingWatchdogIntervalSeconds(n)
 	}
 
+	// Stale-RUNNING billing-leak self-healer (issue: dead vmmd
+	// leaves instances RUNNING in PG → meterd bills for VMs that
+	// no longer exist). Same fail-fast contract as the
+	// migrating-watchdog envs above: a typo in either override
+	// must not silently fall back to the api.* default. The
+	// staleness env routes through the engine setter
+	// (WithDeadNodeReconcilerStalenessSeconds) because the
+	// reconciler reads it at tick time — operator tweaks don't
+	// require a schedd restart. The interval env patches cfg
+	// directly because the loop builder owns the ticker; the env
+	// is the highest-precedence source so it overrides TOML
+	// without redeploy.
+	if v := os.Getenv("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_DEAD_NODE_RECONCILER_STALENESS_SECONDS: %s", v)
+		}
+		engine.WithDeadNodeReconcilerStalenessSeconds(n)
+	}
+	if v := os.Getenv("FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_DEAD_NODE_RECONCILER_INTERVAL_SECONDS: %s", v)
+		}
+		cfg.DeadNodeReconcilerIntervalSeconds = n
+	}
+
 	// Tier A4 / ADR-064: rebalancer subscriber. Watches
 	// compute_node_changed for active=false events and hands
 	// the dead node id to Engine.RebalanceOrphanedApps.
@@ -1076,6 +1107,23 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	loop.WithMigratingWatchdog(sched.NewMigratingWatchdog(
 		engine.ReconcileExpiredMigrations,
 		time.Duration(mwdInterval)*time.Second,
+		log))
+
+	// Stale-RUNNING billing-leak self-healer. Closes the gap
+	// between heartbeat (which flips compute_nodes.active=false)
+	// and meterd's sampler (which keeps billing on CountsForRAM
+	// regardless of node liveness). Cadence mirrors the
+	// migrating-watchdog pattern: zero cfg → api.* default. The
+	// handle is the engine method directly so the reconciler
+	// shares the same store / ledger / logger as the rest of the
+	// loop — there is no per-call indirection that could go stale.
+	dnrInterval := cfg.DeadNodeReconcilerIntervalSeconds
+	if dnrInterval <= 0 {
+		dnrInterval = api.DeadNodeReconcilerIntervalSeconds
+	}
+	loop.WithDeadNodeReconciler(sched.NewDeadNodeReconciler(
+		engine.ReconcileDeadNodeInstances,
+		time.Duration(dnrInterval)*time.Second,
 		log))
 	if cfg.GatewayMetricsURL != "" {
 		// Issue #171: share a single HTTPPromScraper between the
@@ -1396,7 +1444,7 @@ type schedScaleUpEngine struct {
 // engine and lifts the relevant fields into the thinned
 // scaleup.AdmitResult.
 func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID string) (scaleup.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID)
+	r, err := s.engine.AdmitInstance(ctx, appID, "")
 	if err != nil {
 		return scaleup.AdmitResult{}, err
 	}
@@ -1424,7 +1472,7 @@ type schedTargetsEngine struct {
 // per-tick AtCapacity signal that the dashboard's "would have
 // scaled but cap reached" pane depends on.
 func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID string) (targets.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID)
+	r, err := s.engine.AdmitInstance(ctx, appID, "")
 	if err != nil {
 		return targets.AdmitResult{}, err
 	}
@@ -1444,7 +1492,7 @@ type schedFloorEngine struct {
 
 // AdmitInstance implements floor.Engine.
 func (s schedFloorEngine) AdmitInstance(ctx context.Context, appID string) (floor.AdmitResult, error) {
-	r, err := s.engine.AdmitInstance(ctx, appID)
+	r, err := s.engine.AdmitInstance(ctx, appID, "")
 	if err != nil {
 		return floor.AdmitResult{}, err
 	}

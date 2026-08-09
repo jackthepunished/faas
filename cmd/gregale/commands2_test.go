@@ -272,6 +272,142 @@ func TestCmdAppPublicAuth_ParsesAndForwards(t *testing.T) {
 	})
 }
 
+// TestCmdTrafficSet_BasicFlow (issue #556 PR-A) is the wire-level
+// CLI check for `gregale traffic set --deployment <id> --percent N`.
+// Pins:
+//  1. CLI dispatches to cmdTrafficSet.
+//  2. PATCH /v1/deployments/{id}/traffic is called with the
+//     canonical body shape ({"traffic_percent": N}).
+//  3. The 200 response renders as the canonical "Set … → N%" line.
+func TestCmdTrafficSet_BasicFlow(t *testing.T) {
+	const wantDepID = "0123456789abcdef0123456789abcdef"
+	const wantPercent = 25
+	var hits int32
+	var gotMethod, gotPath, gotBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSONTest(w, api.DeploymentResponse{
+			ID:             wantDepID,
+			AppID:          "app-id",
+			TrafficPercent: wantPercent,
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_test_x")
+
+	if code := cmdTrafficSet([]string{"--deployment", wantDepID, "--percent", itoaForCli(wantPercent)}); code != 0 {
+		t.Fatalf("cmdTrafficSet exit = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("PATCH hit count = %d, want 1", hits)
+	}
+	if gotMethod != "PATCH" {
+		t.Errorf("method = %q, want PATCH", gotMethod)
+	}
+	if gotPath != "/v1/deployments/"+wantDepID+"/traffic" {
+		t.Errorf("path = %q, want /v1/deployments/%s/traffic", gotPath, wantDepID)
+	}
+	wantBody := `{"traffic_percent":25}`
+	if gotBody != wantBody {
+		t.Errorf("body = %q, want %q", gotBody, wantBody)
+	}
+}
+
+// TestCmdTrafficSet_MissingArgs (issue #556 PR-A) pins the CLI's
+// flag-presence contract. The subcommand must reject missing
+// --deployment or --percent before any HTTP round-trip — the
+// existing TestCmdAppFlagSentinels / TestCmdAppPublicAuth patterns
+// treat this as a CLI-side correctness check.
+func TestCmdTrafficSet_MissingArgs(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_test_x")
+
+	// Missing --percent.
+	if code := cmdTrafficSet([]string{"--deployment", "x"}); code == 0 {
+		t.Errorf("missing --percent exit = 0, want non-zero")
+	}
+	// Missing --deployment.
+	if code := cmdTrafficSet([]string{"--percent", "50"}); code == 0 {
+		t.Errorf("missing --deployment exit = 0, want non-zero")
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Errorf("server was hit %d times; CLI must short-circuit before HTTP", hits)
+	}
+}
+
+// TestCmdTrafficSet_DefaultIsProportional (issue #556 / PR-C) pins
+// the CLI's default behaviour post-C7: a bare `faas traffic set
+// --deployment <id> --percent N` performs a proportional
+// rebalance. There is no `--redistribute` flag (deferred to PR-D per
+// ADR-084 §D7). A test that asserts no `--redistribute` argument is
+// honoured AND the wire body is the canonical proportional shape
+// ({"traffic_percent": N}) pins both:
+//   - the default semantics is proportional
+//   - the flag-deferral did NOT silently land a no-op `--redistribute`
+//     alias that callers might mistake for "explicit zero on siblings".
+func TestCmdTrafficSet_DefaultIsProportional(t *testing.T) {
+	const wantDepID = "0123456789abcdef0123456789abcdef"
+	const wantPercent = 25
+	var hits int32
+	var gotBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSONTest(w, api.DeploymentResponse{
+			ID:             wantDepID,
+			AppID:          "app-id",
+			TrafficPercent: wantPercent,
+		})
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_test_x")
+
+	// The bare command — no `--redistribute`. Pre-PR-C this
+	// returned 409 (S2). PR-C makes it the proportional default.
+	if code := cmdTrafficSet([]string{"--deployment", wantDepID, "--percent", itoaForCli(wantPercent)}); code != 0 {
+		t.Fatalf("cmdTrafficSet exit = %d, want 0", code)
+	}
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("PATCH hit count = %d, want 1", hits)
+	}
+	wantBody := `{"traffic_percent":25}`
+	if gotBody != wantBody {
+		t.Errorf("body = %q, want %q (proportional default — no --redistribute needed)", gotBody, wantBody)
+	}
+
+	// A second invocation with an unknown `--redistribute` flag
+	// must surface a non-zero exit (FlagSet rejects unknown
+	// flags). This pins the deferral: the flag does NOT silently
+	// exist as a no-op alias. If a future PR-D adds the flag,
+	// this assertion is the tripwire to update.
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSONTest(w, api.DeploymentResponse{ID: wantDepID, TrafficPercent: 25})
+	}))
+	defer srv2.Close()
+	t.Setenv("FAAS_API", srv2.URL)
+	if code := cmdTrafficSet([]string{"--deployment", wantDepID, "--percent", "25", "--redistribute"}); code == 0 {
+		t.Errorf("--redistribute must NOT be silently honoured (deferred to PR-D per ADR-084 §D7)")
+	}
+}
+
 // itoaForCli is a tiny local helper for the Hobby-rejects test so the
 // file doesn't depend on strconv (matches the apid test's itoa style).
 func itoaForCli(n int) string {
@@ -396,6 +532,39 @@ func TestCmdConnect_FallsBackOnBrowserError(t *testing.T) {
 	}
 	if len(rec.urls) != 1 {
 		t.Errorf("recorded urls = %d, want 1", len(rec.urls))
+	}
+}
+
+// TestCmdConnect_GithubJSONOutput pins the --json branch added in
+// Tier A8.2: when jsonOutput is set, cmdConnect emits
+// {"url": "...", "service": "github"} instead of opening the
+// browser. Mirrors the canonical JSON-shape pattern used by
+// commands_registry.go and the new TestCmdBillingPortal_JSONOutput.
+func TestCmdConnect_GithubJSONOutput(t *testing.T) {
+	rec := withRecorder(t)
+	t.Setenv("FAAS_TOKEN", "tok")
+	t.Setenv("FAAS_API", "https://api.example.test")
+
+	jsonOutput = true
+	defer func() { jsonOutput = false }()
+
+	stdout, restore := captureStdout(t)
+	defer restore()
+	if code := cmdConnect([]string{"github"}); code != 0 {
+		t.Fatalf("cmdConnect github --json = %d, want 0", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout not valid JSON: %v\noutput: %s", err, stdout.String())
+	}
+	if got["url"] != "https://api.example.test/dashboard/account" {
+		t.Errorf("json url = %v, want the dashboard account URL", got["url"])
+	}
+	if got["service"] != "github" {
+		t.Errorf("json service = %v, want \"github\"", got["service"])
+	}
+	if len(rec.urls) != 0 {
+		t.Errorf("--json opened browser %d times; want 0", len(rec.urls))
 	}
 }
 
@@ -1020,4 +1189,285 @@ func TestCmdLogs_GrepSinceLevel(t *testing.T) {
 			t.Errorf("server was hit %d times; validation must short-circuit before HTTP", hits)
 		}
 	})
+
+	// Issue #315 (tier-2 DX): `gregale logs tail <slug>` is an alias
+	// for `gregale logs <slug> --follow`. Tests pin:
+	//   - Dispatch reaches the same SSE pump with follow=1.
+	//   - --follow on the alias is rejected with exit 2 (the alias
+	//     always follows, so passing the flag signals confusion).
+	//   - All other logs flags pass through verbatim.
+	//   - No-arg `logs tail` exits 1 with a usage hint.
+	t.Run("tail_alias_forces_follow", func(t *testing.T) {
+		stdout.Reset()
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		if code := cmdLogs([]string{"tail", "myapp"}); code != 0 {
+			t.Fatalf("cmdLogs(tail myapp) = %d, want 0; stdout=%q", code, stdout.String())
+		}
+		if got := gotQuery.Get("follow"); got != "1" {
+			t.Errorf("follow = %q, want 1 (alias must force --follow)", got)
+		}
+	})
+
+	t.Run("tail_alias_passes_filters_through", func(t *testing.T) {
+		stdout.Reset()
+		var gotQuery url.Values
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.Query()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		args := []string{
+			"tail",
+			"--grep", "ERROR",
+			"--since", "2026-07-28T00:00:00Z",
+			"--level", "error",
+			"myapp",
+		}
+		if code := cmdLogs(args); code != 0 {
+			t.Fatalf("cmdLogs(tail … myapp) = %d, want 0; stdout=%q", code, stdout.String())
+		}
+		if got := gotQuery.Get("follow"); got != "1" {
+			t.Errorf("follow = %q, want 1", got)
+		}
+		if got := gotQuery.Get("grep"); got != "ERROR" {
+			t.Errorf("grep = %q, want ERROR", got)
+		}
+		if got := gotQuery.Get("since"); got != "2026-07-28T00:00:00Z" {
+			t.Errorf("since = %q, want 2026-07-28T00:00:00Z", got)
+		}
+		if got := gotQuery.Get("level"); got != "error" {
+			t.Errorf("level = %q, want error", got)
+		}
+	})
+
+	t.Run("tail_alias_rejects_redundant_follow", func(t *testing.T) {
+		stdout.Reset()
+		hits := int32(0)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		code := cmdLogs([]string{"tail", "--follow", "myapp"})
+		if code != 2 {
+			t.Errorf("cmdLogs(tail --follow myapp) = %d, want 2 (redundant flag rejected)", code)
+		}
+		if atomic.LoadInt32(&hits) != 0 {
+			t.Errorf("server was hit %d times; redundant-flag rejection must short-circuit", hits)
+		}
+	})
+
+	t.Run("tail_alias_invalid_level_short_circuits", func(t *testing.T) {
+		stdout.Reset()
+		hits := int32(0)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: end\ndata: {}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		defer srv.Close()
+		t.Setenv("FAAS_API", srv.URL)
+		t.Setenv("FAAS_TOKEN", "fp_live_x")
+		code := cmdLogs([]string{"tail", "--level", "trace", "myapp"})
+		if code != 2 {
+			t.Errorf("cmdLogs(tail --level trace myapp) = %d, want 2", code)
+		}
+		if atomic.LoadInt32(&hits) != 0 {
+			t.Errorf("server was hit %d times; validation must short-circuit", hits)
+		}
+	})
+
+	t.Run("tail_alias_no_args_exits_1", func(t *testing.T) {
+		stdout.Reset()
+		code := cmdLogs([]string{"tail"})
+		if code != 1 {
+			t.Errorf("cmdLogs(tail) = %d, want 1 (usage)", code)
+		}
+	})
+}
+
+// TestMapFailureMessage_BuildLimitsDocsLinks pins the docs URLs
+// emitted in the build-failure copy (mapFailureMessage's oom and
+// timeout branches) to the live docs host. Issue #420 / PR-A:
+// the original literals pointed at docs.gregale.example (RFC 2606
+// reserved TLD) — a missed rename from PR #458. This test pins the
+// post-fix shape so the placeholder can't drift back. We assert via
+// strings.Contains (not exact match) because the surrounding copy
+// may churn; what matters is the host + path. The third case
+// pins the negative — `user_error` should NOT leak the reserved
+// TLD or any docs URL at all.
+func TestMapFailureMessage_BuildLimitsDocsLinks(t *testing.T) {
+	cases := []struct {
+		name       string
+		errClass   string
+		wantSubstr string // empty string = "must NOT contain the reserved TLD"
+	}{
+		{
+			name:       "oom",
+			errClass:   "oom",
+			wantSubstr: "https://docs.gregale.dev/build/limits#memory",
+		},
+		{
+			name:       "timeout",
+			errClass:   "timeout",
+			wantSubstr: "https://docs.gregale.dev/build/limits#timeout",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mapFailureMessage(tc.errClass)
+			if !strings.Contains(got, tc.wantSubstr) {
+				t.Fatalf("mapFailureMessage(%q) = %q; want substring %q", tc.errClass, got, tc.wantSubstr)
+			}
+			// Negative: never the RFC 2606 reserved TLD.
+			if strings.Contains(got, "https://docs.gregale.example") {
+				t.Fatalf("mapFailureMessage(%q) leaked the reserved TLD docs.gregale.example: %q", tc.errClass, got)
+			}
+		})
+	}
+
+	// Negative: the `user_error` branch has no docs link at all.
+	// Pin so a future copy change can't reintroduce one pointing
+	// at the reserved TLD.
+	t.Run("user_error_no_docs_link", func(t *testing.T) {
+		got := mapFailureMessage("user_error")
+		if strings.Contains(got, "https://docs.gregale.example") {
+			t.Fatalf("mapFailureMessage(user_error) leaked the reserved TLD docs.gregale.example: %q", got)
+		}
+	})
+}
+
+// TestCmdOpenDocs pins the open docs subcommand (Tier A8.1):
+//   - positional slug resolves to /cli/<slug>
+//   - --slug flag resolves to /cli/<slug>
+//   - empty slug resolves to the docs root (not /cli/app —
+//     sanitizeSlugForURL's empty-input fallback is bypassed here)
+//   - two positionals is rejected
+//   - unknown flag is rejected (via flag.ContinueOnError)
+//
+// All assertions use --json so the test stays hermetic (no
+// browser.Open invocation). Each subtest gets its own captureStdout
+// because the helper does not expose a Reset (the buffer is the
+// only state, so a fresh capture per case is the cleanest pattern).
+func TestCmdOpenDocs(t *testing.T) {
+	// Enable --json for the duration of the test. jsonOutput is
+	// package-global; without this restore, a follow-on test in
+	// the same binary would inherit JSON mode.
+	oldJSON := jsonOutput
+	jsonOutput = true
+	defer func() { jsonOutput = oldJSON }()
+
+	cases := []struct {
+		name        string
+		args        []string
+		wantCode    int
+		wantURLFrag string
+		wantSlug    string
+	}{
+		{"positional_slug", []string{"apps"}, 0, "/cli/apps", "apps"},
+		{"flag_slug", []string{"--slug", "queue"}, 0, "/cli/queue", "queue"},
+		// "open docs" with no args at all resolves to the docs
+		// root, NOT /cli/app. This is the smoke-test case that
+		// catches the bug where sanitizeSlugForURL("") falls back
+		// to "app" instead of "".
+		{"no_args_resolves_to_root", []string{}, 0, "https://docs.gregale.dev", ""},
+		// Two positionals is rejected (the docs subcommand takes
+		// at most one positional).
+		{"two_positional_rejected", []string{"a", "b"}, 1, "", ""},
+		// Unknown flag is rejected with the docs topic in the
+		// PrintUsage call.
+		{"unknown_flag_rejected", []string{"--nope"}, 1, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, restoreOut := captureStdout(t)
+			defer restoreOut()
+			code := cmdOpenDocs(tc.args)
+			if code != tc.wantCode {
+				t.Errorf("cmdOpenDocs(%v) code = %d, want %d", tc.args, code, tc.wantCode)
+			}
+			if tc.wantCode != 0 {
+				// On error, no JSON envelope expected — the
+				// function exits via PrintUsage / PrintFail,
+				// both of which write to stderr (captured
+				// separately if needed).
+				return
+			}
+			var got struct {
+				Slug string `json:"slug"`
+				URL  string `json:"url"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("decode JSON: %v\noutput: %s", err, stdout.String())
+			}
+			if got.Slug != tc.wantSlug {
+				t.Errorf("slug = %q, want %q", got.Slug, tc.wantSlug)
+			}
+			if !strings.Contains(got.URL, tc.wantURLFrag) {
+				t.Errorf("url = %q, want it to contain %q", got.URL, tc.wantURLFrag)
+			}
+		})
+	}
+}
+
+// TestCmdOpenDocs_DispatchesFromCmdOpen pins the wiring: `cmdOpen`
+// must route `docs` to cmdOpenDocs and pass the remaining args.
+// We invoke cmdOpen directly with the args; the test substitutes
+// osStdout (cmdOpenDocs's JSON path) so we can decode the wire
+// shape end-to-end.
+func TestCmdOpenDocs_DispatchesFromCmdOpen(t *testing.T) {
+	oldJSON := jsonOutput
+	jsonOutput = true
+	defer func() { jsonOutput = oldJSON }()
+
+	stdout, restoreOut := captureStdout(t)
+	defer restoreOut()
+
+	code := cmdOpen([]string{"docs", "queue"})
+	if code != 0 {
+		t.Errorf("cmdOpen(docs queue) = %d, want 0", code)
+	}
+	var got struct {
+		Slug string `json:"slug"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON: %v\noutput: %s", err, stdout.String())
+	}
+	if got.Slug != "queue" {
+		t.Errorf("slug = %q, want %q", got.Slug, "queue")
+	}
+	if !strings.Contains(got.URL, "/cli/queue") {
+		t.Errorf("url = %q, want it to contain /cli/queue", got.URL)
+	}
 }

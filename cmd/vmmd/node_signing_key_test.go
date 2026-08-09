@@ -76,7 +76,7 @@ func TestLoadNodeSigningKey_HappyPath(t *testing.T) {
 	priv := writeNodeKey(t, path, 0o400)
 	setNodeKeyPath(t, path)
 
-	got, gotKeyID, err := loadNodeSigningKey()
+	got, gotKeyID, err := loadNodeSigningKeyDefault()
 	if err != nil {
 		t.Fatalf("loadNodeSigningKey: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestLoadNodeSigningKey_MissingFile(t *testing.T) {
 	dir := t.TempDir()
 	setNodeKeyPath(t, filepath.Join(dir, "does-not-exist"))
 
-	priv, keyID, err := loadNodeSigningKey()
+	priv, keyID, err := loadNodeSigningKeyDefault()
 	if err != nil {
 		t.Errorf("missing file should be nil-err, got %v", err)
 	}
@@ -148,7 +148,7 @@ func TestLoadNodeSigningKey_RejectsLooseMode(t *testing.T) {
 				t.Skipf("platform dropped high bits: got mode %#o, want %#o", st.Mode(), tc.mode)
 			}
 
-			_, _, err := loadNodeSigningKey()
+			_, _, err := loadNodeSigningKeyDefault()
 			if err == nil {
 				t.Errorf("loadNodeSigningKey on mode %#o succeeded; want error", tc.mode)
 				return
@@ -172,7 +172,7 @@ func TestLoadNodeSigningKey_Accepts0400(t *testing.T) {
 	writeNodeKey(t, path, 0o400)
 	setNodeKeyPath(t, path)
 
-	if _, _, err := loadNodeSigningKey(); err != nil {
+	if _, _, err := loadNodeSigningKeyDefault(); err != nil {
 		t.Errorf("loadNodeSigningKey on mode 0400 returned %v; want nil", err)
 	}
 }
@@ -188,7 +188,7 @@ func TestLoadNodeSigningKey_RejectsNonPEM(t *testing.T) {
 	}
 	setNodeKeyPath(t, path)
 
-	_, _, err := loadNodeSigningKey()
+	_, _, err := loadNodeSigningKeyDefault()
 	if err == nil {
 		t.Fatal("non-PEM file succeeded; want error")
 	}
@@ -220,7 +220,7 @@ func TestLoadNodeSigningKey_RejectsWrongPEMType(t *testing.T) {
 	}
 	setNodeKeyPath(t, path)
 
-	_, _, err = loadNodeSigningKey()
+	_, _, err = loadNodeSigningKeyDefault()
 	if err == nil {
 		t.Fatal("SEC1 PEM succeeded; want error")
 	}
@@ -251,7 +251,7 @@ func TestLoadNodeSigningKey_RejectsNonP256Curve(t *testing.T) {
 	}
 	setNodeKeyPath(t, path)
 
-	_, _, err = loadNodeSigningKey()
+	_, _, err = loadNodeSigningKeyDefault()
 	if err == nil {
 		t.Fatal("P-384 key succeeded; want error")
 	}
@@ -306,7 +306,7 @@ func TestLoadNodeSigningKey_RejectsSetuidStickySetgid(t *testing.T) {
 				t.Skipf("platform dropped high bits: got mode %#o, want %#o (e.g. macOS HFS+ doesn't preserve sticky/setgid on regular files)", st.Mode(), tc.mode)
 			}
 
-			_, _, err := loadNodeSigningKey()
+			_, _, err := loadNodeSigningKeyDefault()
 			if err == nil {
 				t.Errorf("loadNodeSigningKey on mode %#o succeeded; want error", tc.mode)
 				return
@@ -356,4 +356,61 @@ func mustNodeSigningKey(t *testing.T, k *ecdsa.PrivateKey, msg string) *ecdsa.Pr
 		t.Fatal(msg)
 	}
 	return k
+}
+
+// TestLoadNodeSigningKey_PathOverrideWinsOverEnv pins the
+// resolution order documented on loadNodeSigningKey: a non-empty
+// pathOverride beats FAAS_VMMD_NODE_KEY_PATH, which beats the
+// default. This is the load-bearing seam for vmmd.toml's
+// node_key_path knob (cmd/vmmd/config.go) — without it, an
+// operator who sets both the toml value AND the env var would
+// see the env-var path win, contradicting what every other
+// daemon does (config.go + daemonunitspec precedence).
+//
+// Concretely: seed two distinct keypairs, point the env var at
+// the "wrong" one, and pass the "right" one through pathOverride.
+// The loader MUST return the override's key_id; if it returns
+// the env's, the precedence is upside-down.
+func TestLoadNodeSigningKey_PathOverrideWinsOverEnv(t *testing.T) {
+	dir := t.TempDir()
+
+	// "right" key — what cfg.NodeKeyPath would point at.
+	rightPath := filepath.Join(dir, "right.key")
+	rightPriv := writeNodeKey(t, rightPath, 0o400)
+	rightID, err := sched.KeyIDForPublicKey(&rightPriv.PublicKey)
+	if err != nil {
+		t.Fatalf("rightID: %v", err)
+	}
+
+	// "wrong" key — what FAAS_VMMD_NODE_KEY_PATH points at.
+	// Deliberately distinct bytes so the test can tell them apart.
+	wrongPath := filepath.Join(dir, "wrong.key")
+	_ = writeNodeKey(t, wrongPath, 0o400)
+	t.Setenv("FAAS_VMMD_NODE_KEY_PATH", wrongPath)
+
+	// Empty override → env-or-default path. Sanity check the
+	// fixture is wired: with "" the env value wins and we get
+	// a non-nil key back (the wrong one). If this branch fails
+	// the test below would still pass for the wrong reason.
+	if _, _, err := loadNodeSigningKey(""); err != nil {
+		t.Fatalf("empty-override baseline: %v", err)
+	}
+
+	// Non-empty override → wins over env. The returned key_id
+	// must match the "right" keypair's, NOT the "wrong" one
+	// (which is what the env var is pointing at).
+	gotPriv, gotID, err := loadNodeSigningKey(rightPath)
+	if err != nil {
+		t.Fatalf("override call: %v", err)
+	}
+	if gotID != rightID {
+		t.Errorf("override lost precedence: got key_id %s, want %s (env-var path %s won instead)",
+			gotID, rightID, wrongPath)
+	}
+	// Belt-and-braces: compare the priv keys directly so a future
+	// change to KeyIDForPublicKey's hash function can't make this
+	// test trivially pass via a coincidence.
+	if gotPriv.D.Cmp(rightPriv.D) != 0 {
+		t.Errorf("override returned wrong priv key (D values differ)")
+	}
 }

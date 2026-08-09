@@ -1,5 +1,10 @@
 # One-box FaaS — build & ops entrypoints (spec §Commands).
-# Go >= 1.23. One binary per cmd/ dir.
+# Go >= 1.24. One binary per cmd/ dir.
+# (Bumped from 1.23: cmd/vmmd-stream-bridge uses the Go 1.24+
+# http.Protocols API for H2C — srv.Protocols.SetUnencryptedHTTP2(true).
+# go.mod pins 1.25.7; this comment is the floor for the toolchain
+# so a developer on 1.23.x sees a clean compile error rather than
+# a runtime panic.)
 
 GO      ?= go
 GOOS    ?= $(shell $(GO) env GOOS)
@@ -7,7 +12,7 @@ GOARCH  ?= $(shell $(GO) env GOARCH)
 export GOOS GOARCH
 PKGS    := ./...
 COVERAGE_DIR := coverage
-DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge builderd imaged meterd gregale githubd hostage-gen
+DAEMONS := apid gatewayd-public gatewayd-internal schedd vmmd vmmd-raw-bridge vmmd-stream-bridge builderd imaged meterd gregale githubd hostage-gen
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/onebox-faas/faas/pkg/wire.Version=$(VERSION)
 BINDIR  := bin
@@ -258,6 +263,32 @@ metal-lima-2node: ## Tier A5 / ADR-066: two-node Lima fleet for the cross-node l
 	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || limactl start deploy/lima/faas-metal-2node-b.yaml --tty=false
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env FAAS_NODE_NAME=node-a ./deploy/lima/run-metal.sh
 	limactl shell --workdir "$(CURDIR)" faas-metal-2b sudo env FAAS_NODE_NAME=node-b ./deploy/lima/run-metal.sh
+
+.PHONY: ha-failover-drill
+ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on the two-node Lima fleet (§14 M8)
+	# Reuses the existing Tier A5 two-node fleet (faas-metal +
+	# faas-metal-2b) — no separate 2node-ha.yaml config exists
+	# (review finding #1: the previous target referenced a
+	# config that wasn't in the repo). The drill itself is the
+	# acceptance script + the manual operator steps in
+	# docs/runbooks/active-passive-ha.md §Procedure; the
+	# validation matrix in §Acceptance is what a green run
+	# asserts. Pre-req: tier-A5 / ADR-066 two-node fleet
+	# acceptance (make metal-lima-2node) must already be green.
+	@limactl list -q 2>/dev/null | grep -qx faas-metal || { echo "faas-metal not started — run 'make metal-lima-2node' first" >&2; exit 1; }
+	@limactl list -q 2>/dev/null | grep -qx faas-metal-2b || { echo "faas-metal-2b not started — run 'make metal-lima-2node' first" >&2; exit 1; }
+	@bash -c 'set -e; \
+	  echo "ha-failover-drill: see docs/runbooks/active-passive-ha.md for the 7-step procedure."; \
+	  echo "  Step 1: deploy a hello app on node-A."; \
+	  echo "  Step 2: psql: SELECT name, active FROM compute_nodes; — both active."; \
+	  echo "  Step 3: limactl shell faas-metal sudo psql -c \"UPDATE compute_nodes SET active=false WHERE name=\$$(limactl shell faas-metal hostname)\""; \
+	  echo "  Step 4: within HADNSRecordStaleSeconds=30s the failing node's StandbyState gauge hits 3 (draining);"; \
+	  echo "          activePassiveFailoversTotal{outcome=\"dns_stale\"} bumps on the dying node (manual provider, review finding #14);"; \
+	  echo "          the surviving node's StandbyState flips to 2 (warm) within HAStandbyWarmupIntervalMS."; \
+	  echo "  Step 5: drain the FAAS_DNS_PROVIDER=manual curl from the dying node's stderr (the operator's job)."; \
+	  echo "  Step 6: curl https://<app>.node-b.faas/ — must return 200 OK, latency \$$\le$$ 350 ms (Tier A5 budget)."; \
+	  echo "  Step 7: limactl shell faas-metal-2b curl -s localhost:9100/metrics | grep active_passive_failovers_total — confirm dns_stale > 0."; \
+	  exit 0'
 
 .PHONY: lint
 lint: egress-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift gate
@@ -521,12 +552,12 @@ spec-lint: spec-install ## vacuum lint (style + rules) on the OpenAPI spec
 	@vacuum lint -r $(VACUUM_RULES) $(SPEC)
 
 .PHONY: spec-check
-spec-check: spec-install spec-lint spec-sync denylist-md ## CI gate: vacuum lint + AST parity + git clean + denylist.md drift (runs in PR CI)
+spec-check: spec-install spec-lint spec-sync denylist-md subprocessor-md ## CI gate: vacuum lint + AST parity + git clean + denylist.md + subprocessor.md drift (runs in PR CI)
 	# No -race: the AST tests are pure CPU (no I/O, no goroutines). -race
 	# would double the wall time without adding signal.
 	@$(GO) test -count=1 -run TestSpecCompliance ./cmd/apid/...
-	@git diff --exit-code -- $(SPEC) $(SPEC_EMBED) $(VACUUM_RULES) docs/denylist.md || \
-	  (echo "spec-check: drift (spec or denylist.md) — re-run 'make spec-check' or hand-fix to match"; exit 1)
+	@git diff --exit-code -- $(SPEC) $(SPEC_EMBED) $(VACUUM_RULES) docs/denylist.md docs/compliance/subprocessors.md || \
+	  (echo "spec-check: drift (spec, denylist.md, or subprocessor.md) — re-run 'make spec-check' or hand-fix to match"; exit 1)
 	@echo "spec-check: OK"
 
 .PHONY: images-lock-check
@@ -566,6 +597,15 @@ denylist-md: ## Regenerate docs/denylist.md from the shared egress catalog (ADR-
 	# git diff stays reviewable.
 	@$(GO) run ./cmd/denylist-md > docs/denylist.md
 	@echo "denylist-md: docs/denylist.md regenerated"
+
+.PHONY: subprocessor-md
+subprocessor-md: ## Regenerate docs/compliance/subprocessors.md from docs/compliance/subprocessors.json
+	# Pure-Go generator — same shape as denylist-md. Enforces the DPA §7
+	# 30-day notice window: any sub-processor entry with an effective_date
+	# younger than notice_published_at + 30d fails the run. Order: by id
+	# ascending so the diff stays reviewable.
+	@$(GO) run ./cmd/subprocessor-md > docs/compliance/subprocessors.md
+	@echo "subprocessor-md: docs/compliance/subprocessors.md regenerated"
 
 .PHONY: sdk-check
 sdk-check: ## CI gate: every OpenAPI route has a typed SDK method on pkg/api.Client
@@ -628,6 +668,31 @@ sdk-gen: ## (re)generate every generated SDK + assert clean diff vs HEAD
 	@$(MAKE) sdk-gen-node-check
 	@$(MAKE) sdk-gen-python-check
 	@echo "sdk-gen: OK"
+
+# Issue #745 (DEPLOY-PROV-9) pre-PR aggregator. Mirrors the
+# required-status-check list enforced by the main branch ruleset
+# (see docs/ci-required-checks.md). Local devs can run this before
+# `git push` to surface drift without waiting 4-5 min for CI to
+# evaluate. Does NOT cover jobs that require Postgres service
+# containers (lint+build / unit-tests / e2e) — those run in CI only.
+#
+# Order matters: spec-check runs first because it catches the
+# api/openapi.yaml ↔ pkg/apid/openapi.yaml drift that motivated the
+# issue; sdk-gen runs last so a successful pre-pr implies every
+# downstream artefact is in sync with the spec.
+.PHONY: pre-pr
+pre-pr: ## Pre-PR drift check: every regenerate-and-diff gate that runs in CI
+	@echo "==> pre-pr: spec-check (api/openapi.yaml ↔ pkg/apid/openapi.yaml)"
+	@$(MAKE) spec-check
+	@echo "==> pre-pr: proto-check (checked-in *.pb.go matches protoc)"
+	@$(MAKE) proto-check
+	@echo "==> pre-pr: sqlc-check (checked-in sqlc output matches regenerated)"
+	@$(MAKE) sqlc-check
+	@echo "==> pre-pr: egress-check (nftables render + Go cross-check)"
+	@$(MAKE) egress-check
+	@echo "==> pre-pr: sdk-gen (node + python SDK regenerated, no diff)"
+	@$(MAKE) sdk-gen
+	@echo "pre-pr: OK (every drift gate clean)"
 
 .PHONY: sdk-smoke-python
 sdk-smoke-python: ## Build fakeapid fixture + run Python SDK smoke + unit tests

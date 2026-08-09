@@ -4783,3 +4783,231 @@ func TestMemStore_EgressAllowlistExtra_UnknownAccountIsNotFound(t *testing.T) {
 		t.Errorf("GetAccountEgressAllowlistExtra missing acct: err = %v, want ErrNotFound", err)
 	}
 }
+
+// memstoreSeedAppLive creates an account + app + one live deployment
+// and returns them. Used by the four MemStore_UpdateDeploymentTraffic
+// pinned tests below (issue #556 / PR-C).
+func memstoreSeedAppLive(t *testing.T, m *MemStore, ctx context.Context, suffix string) (accID, appID, depID string) {
+	t.Helper()
+	acc, err := m.CreateAccount(ctx, suffix+"@x.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	app, err := m.CreateApp(ctx, App{
+		AccountID: acc.ID, Slug: suffix + "-app", Type: AppTypeApp,
+		RAMMB: 512, MaxConcurrency: 5, IdleTimeoutS: 60, Status: AppActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateApp: %v", err)
+	}
+	dep, err := m.CreateDeployment(ctx, Deployment{
+		AppID: app.ID, Kind: DeploymentKindImage, ImageDigest: "sha256:abc",
+		Status: DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if err := m.MarkDeploymentLive(ctx, dep.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive: %v", err)
+	}
+	return acc.ID, app.ID, dep.ID
+}
+
+// memstoreSeedLiveSibling creates a second deployment and flips the
+// superseded prior (created by CreateDeployment's auto-supersede)
+// back to live at 0 traffic, AND flips the new deployment to live at
+// 100, so the resulting pair is {prior:0, sibling:100}, Σ=100, both
+// live. This is the precondition for every proportional-redistribution
+// test in this file. CreateDeployment leaves the new row in
+// DeployPending; UpdateDeploymentTraffic guards on DeployLive, so the
+// sibling must be promoted to live before the test body exercises it.
+//
+// Returns (priorDepID, newDepID).
+func memstoreSeedLiveSibling(t *testing.T, m *MemStore, ctx context.Context, priorDepID, tag string) (string, string) {
+	t.Helper()
+	appID := m.deployments[priorDepID].AppID
+	newDep, err := m.CreateDeployment(ctx, Deployment{
+		AppID: appID, Kind: DeploymentKindImage,
+		ImageDigest: "sha256:" + tag, Status: DeployPending,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment (%s): %v", tag, err)
+	}
+	// CreateDeployment auto-superseded priorDepID → traffic_percent=0,
+	// status=superseded. Flip prior back to live at 0 so we have two
+	// live rows summing to 100.
+	if err := m.MarkDeploymentLive(ctx, priorDepID); err != nil {
+		t.Fatalf("MarkDeploymentLive (restore prior): %v", err)
+	}
+	// Promote the new row from DeployPending to DeployLive. The
+	// status guard in UpdateDeploymentTraffic requires the target to
+	// be live before it can take a weight.
+	if err := m.MarkDeploymentLive(ctx, newDep.ID); err != nil {
+		t.Fatalf("MarkDeploymentLive (sibling %s): %v", tag, err)
+	}
+	return priorDepID, newDep.ID
+}
+
+// TestMem_UpdateDeploymentTraffic_ProportionalRedistribution
+// mirrors pgstore: a 100/0 split → set canary to 25 → prior drops
+// to 75, Σ=100. PR-A's zero-siblings made this impossible;
+// PR-C's largest-remainder (RedistributeTraffic, called from both
+// stores) makes it the headline contract.
+func TestMem_UpdateDeploymentTraffic_ProportionalRedistribution(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	_, _, depPrior := memstoreSeedAppLive(t, m, ctx, "prop-2way-mem")
+
+	// Seed live sibling: after this, prior is back at 0 + live,
+	// canary at 100 + live, Σ=100.
+	depPrior, depCanary := memstoreSeedLiveSibling(t, m, ctx, depPrior, "canary-mem")
+	prior, _ := m.DeploymentByID(ctx, depPrior)
+	canary, _ := m.DeploymentByID(ctx, depCanary)
+	if prior.TrafficPercent != 0 || canary.TrafficPercent != 100 {
+		t.Fatalf("after seed: prior=%d canary=%d, want 0/100",
+			prior.TrafficPercent, canary.TrafficPercent)
+	}
+
+	// Flip canary to 25 → prior jumps to 75.
+	if _, err := m.UpdateDeploymentTraffic(ctx, depCanary, 25); err != nil {
+		t.Fatalf("canary=25: %v", err)
+	}
+	prior, _ = m.DeploymentByID(ctx, depPrior)
+	canary, _ = m.DeploymentByID(ctx, depCanary)
+	if prior.TrafficPercent != 75 {
+		t.Errorf("prior.TrafficPercent = %d, want 75", prior.TrafficPercent)
+	}
+	if canary.TrafficPercent != 25 {
+		t.Errorf("canary.TrafficPercent = %d, want 25", canary.TrafficPercent)
+	}
+	if sum := prior.TrafficPercent + canary.TrafficPercent; sum != 100 {
+		t.Errorf("Σ = %d, want 100", sum)
+	}
+}
+
+// TestMem_UpdateDeploymentTraffic_ThreeWayResidual mirrors the
+// pgstore three-way test in memstore: 3 live rows, multiple stamps,
+// Σ must remain 100 across all transitions.
+func TestMem_UpdateDeploymentTraffic_ThreeWayResidual(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	_, _, depA := memstoreSeedAppLive(t, m, ctx, "three-way-mem")
+	// Seed depB live alongside depA: prior=0, B=100, Σ=100.
+	depA, depB := memstoreSeedLiveSibling(t, m, ctx, depA, "B-mem")
+	// Seed depC live alongside A: prior(0) gets superseded again,
+	// B(100) stays live. Flip prior back: A=0, B=100, C=100? No —
+	// CreateDeployment supersedes the most recent live row (B),
+	// so after this B→0, C→100. Then restore A to live at 0, but
+	// B is already 0 from supersede — Σ = 0+0+100 = 100 ✓.
+	depB, depC := memstoreSeedLiveSibling(t, m, ctx, depB, "C-mem")
+	// After this: A=superseded at 0, B=superseded at 0, C=live at 100.
+	// Re-flip A and B to live at 0.
+	if err := m.MarkDeploymentLive(ctx, depA); err != nil {
+		t.Fatalf("MarkDeploymentLive (A): %v", err)
+	}
+	if err := m.MarkDeploymentLive(ctx, depB); err != nil {
+		t.Fatalf("MarkDeploymentLive (B): %v", err)
+	}
+
+	// Build a 3-way table; Σ must be 100 after every stamp.
+	if _, err := m.UpdateDeploymentTraffic(ctx, depB, 30); err != nil {
+		t.Fatalf("B=30: %v", err)
+	}
+	a, _ := m.DeploymentByID(ctx, depA)
+	b, _ := m.DeploymentByID(ctx, depB)
+	if sum := a.TrafficPercent + b.TrafficPercent + c_deployOnly(depC, m, ctx).TrafficPercent; sum != 100 {
+		t.Errorf("after B=30: Σ = %d, want 100", sum)
+	}
+	if _, err := m.UpdateDeploymentTraffic(ctx, depC, 20); err != nil {
+		t.Fatalf("C=20: %v", err)
+	}
+	a, _ = m.DeploymentByID(ctx, depA)
+	b, _ = m.DeploymentByID(ctx, depB)
+	c, _ := m.DeploymentByID(ctx, depC)
+	if sum := a.TrafficPercent + b.TrafficPercent + c.TrafficPercent; sum != 100 {
+		t.Errorf("after C=20: Σ = %d, want 100", sum)
+	}
+	// Stamp A=25 → Σ must stay 100; A lands exactly at 25.
+	if _, err := m.UpdateDeploymentTraffic(ctx, depA, 25); err != nil {
+		t.Fatalf("A=25: %v", err)
+	}
+	a, _ = m.DeploymentByID(ctx, depA)
+	b, _ = m.DeploymentByID(ctx, depB)
+	c, _ = m.DeploymentByID(ctx, depC)
+	if a.TrafficPercent != 25 {
+		t.Errorf("A = %d, want 25", a.TrafficPercent)
+	}
+	if sum := a.TrafficPercent + b.TrafficPercent + c.TrafficPercent; sum != 100 {
+		t.Errorf("after A=25: Σ = %d, want 100 (B=%d C=%d)", sum, b.TrafficPercent, c.TrafficPercent)
+	}
+}
+
+// c_deployOnly is a small inline helper to keep the test readable;
+// returns the deployment for Σ asserts.
+func c_deployOnly(id string, m *MemStore, ctx context.Context) Deployment {
+	d, _ := m.DeploymentByID(ctx, id)
+	return d
+}
+
+// TestMem_UpdateDeploymentTraffic_SoleLiveRow mirrors the pgstore
+// sole-row edge cases: target=100 no-op success; target=0 → Σ=0 →
+// ErrTrafficPercentSumInvalid (the one legitimate failure mode).
+func TestMem_UpdateDeploymentTraffic_SoleLiveRow(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	_, _, depID := memstoreSeedAppLive(t, m, ctx, "sole-row-mem")
+
+	if _, err := m.UpdateDeploymentTraffic(ctx, depID, 100); err != nil {
+		t.Errorf("target=100 on sole row err = %v, want nil", err)
+	}
+	row, _ := m.DeploymentByID(ctx, depID)
+	if row.TrafficPercent != 100 {
+		t.Errorf("Sole row after target=100 = %d, want 100", row.TrafficPercent)
+	}
+	if _, err := m.UpdateDeploymentTraffic(ctx, depID, 0); !errors.Is(err, ErrTrafficPercentSumInvalid) {
+		t.Errorf("target=0 on sole row err = %v, want ErrTrafficPercentSumInvalid", err)
+	}
+}
+
+// TestMem_UpdateDeploymentTraffic_TieBreakStable mirrors the
+// pgstore tie-break: 2 siblings equal weight, even residual
+// (no +1 needed); equal weights after restore.
+func TestMem_UpdateDeploymentTraffic_TieBreakStable(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	_, _, depA := memstoreSeedAppLive(t, m, ctx, "tie-break-mem")
+	depA, depB := memstoreSeedLiveSibling(t, m, ctx, depA, "B-mem")
+	// Equalise to {A:50, B:50} from {A:0, B:100}: stamp A=50 → residual
+	// 50 absorbed by sole sibling B.
+	if _, err := m.UpdateDeploymentTraffic(ctx, depA, 50); err != nil {
+		t.Fatalf("equalise A=50: %v", err)
+	}
+	a, _ := m.DeploymentByID(ctx, depA)
+	b, _ := m.DeploymentByID(ctx, depB)
+	if a.TrafficPercent != 50 || b.TrafficPercent != 50 {
+		t.Errorf("equalise: A=%d B=%d, want 50/50", a.TrafficPercent, b.TrafficPercent)
+	}
+
+	// Set A=0 → residual 100 absorbed by B. Σ=100.
+	if _, err := m.UpdateDeploymentTraffic(ctx, depA, 0); err != nil {
+		t.Fatalf("A=0: %v", err)
+	}
+	a, _ = m.DeploymentByID(ctx, depA)
+	b, _ = m.DeploymentByID(ctx, depB)
+	if a.TrafficPercent != 0 || b.TrafficPercent != 100 {
+		t.Errorf("A=0: A=%d B=%d, want 0/100", a.TrafficPercent, b.TrafficPercent)
+	}
+
+	// Restore to 50/50.
+	if _, err := m.UpdateDeploymentTraffic(ctx, depA, 50); err != nil {
+		t.Fatalf("restore A=50: %v", err)
+	}
+	a, _ = m.DeploymentByID(ctx, depA)
+	b, _ = m.DeploymentByID(ctx, depB)
+	if a.TrafficPercent != 50 || b.TrafficPercent != 50 {
+		t.Errorf("restore: A=%d B=%d, want 50/50", a.TrafficPercent, b.TrafficPercent)
+	}
+	if sum := a.TrafficPercent + b.TrafficPercent; sum != 100 {
+		t.Errorf("restore: Σ = %d, want 100", sum)
+	}
+}

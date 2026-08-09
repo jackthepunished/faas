@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"filippo.io/age"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1108,5 +1109,352 @@ func TestSetAccountEgressAllowlistExtra_RejectsNonAdminScope(t *testing.T) {
 	// non-200 sentinel.
 	if rec.Code != 403 && rec.Code != 401 {
 		t.Errorf("status %d, want 401 or 403: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestExportAccount_RateLimit_AllowsFirstRequest (issue #755 /
+// PR-5.1). The first GET /v1/account/export inside the 24h window
+// must succeed with 200 — the rate-limit is a second-request
+// affordance, not a first-request block.
+func TestExportAccount_RateLimit_AllowsFirstRequest(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "rate-app")
+
+	rec := e.do(t, "GET", "/v1/account/export", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first export: %d %s", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("X-Audit-Logged") == "false" {
+		t.Errorf("X-Audit-Logged=false on first request: %s", rec.Body)
+	}
+}
+
+// TestExportAccount_RateLimit_BlocksSecondRequest (issue #755 /
+// PR-5.1). The second GET inside the 24h window must return 429 +
+// CodeExportRateLimited + Retry-After. The ledger row from the
+// first request is what the rate-limit query observes — verify the
+// second call sees the in-flight ledger (not the new one it would
+// have written), proving the check happens before the bundle.
+func TestExportAccount_RateLimit_BlocksSecondRequest(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "rate-app-2")
+
+	// First call lands inside the window.
+	rec := e.do(t, "GET", "/v1/account/export", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first export: %d %s", rec.Code, rec.Body)
+	}
+
+	// Second call must hit the rate-limit.
+	rec = e.do(t, "GET", "/v1/account/export", nil, nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second export: %d %s, want 429", rec.Code, rec.Body)
+	}
+	var prob api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &prob); err != nil {
+		t.Fatalf("decode problem: %v: %s", err, rec.Body)
+	}
+	if prob.Code != api.CodeExportRateLimited {
+		t.Errorf("problem.code = %q, want %q", prob.Code, api.CodeExportRateLimited)
+	}
+	// Retry-After must be present + bounded (>0).
+	ra := rec.Header().Get("Retry-After")
+	if ra == "" {
+		t.Errorf("Retry-After header missing")
+	} else {
+		var secs int
+		if _, err := fmt.Sscanf(ra, "%d", &secs); err != nil {
+			t.Errorf("Retry-After %q not integer: %v", ra, err)
+		}
+		if secs <= 0 {
+			t.Errorf("Retry-After = %d, want >0", secs)
+		}
+		// Upper bound: window seconds (24h). The wire advertises the
+		// precise time-until-reset, which is bounded above by the
+		// window itself.
+		if secs > api.ExportRateLimitWindowSeconds {
+			t.Errorf("Retry-After = %d, want <= %d", secs, api.ExportRateLimitWindowSeconds)
+		}
+	}
+}
+
+// TestExportAccount_RateLimit_AllowsAfter24h verifies the window
+// rolls forward. We can't wait 24h in a test, but we can rewrite
+// the ledger row's requested_at to >24h ago and verify the second
+// call returns 200. The MemStore path is the one under test; the
+// PgStore path is exercised by e2e.
+func TestExportAccount_RateLimit_AllowsAfter24h(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "rate-app-3")
+
+	// First call lands inside the window.
+	rec := e.do(t, "GET", "/v1/account/export", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first export: %d %s", rec.Code, rec.Body)
+	}
+
+	// Backdate the just-written ledger row to >24h ago so the
+	// rate-limit query's lookback window no longer sees it.
+	cutoff := time.Now().UTC().Add(-2 * api.ExportRateLimitWindow)
+	e.store.BackdateGdprRequestsForTest(context.Background(), e.acct.ID, state.GdprActionExport, cutoff)
+
+	// Second call must now succeed.
+	rec = e.do(t, "GET", "/v1/account/export", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("post-window export: %d %s, want 200", rec.Code, rec.Body)
+	}
+}
+
+// TestExportAccount_RequestIdIdempotent_RetrySucceeds (issue #755 /
+// PR-5.2). A retry with the same X-Request-Id inside the 24h window
+// must succeed (200), not 429 — the customer's second call is
+// logically the same action as the first.
+func TestExportAccount_RequestIdIdempotent_RetrySucceeds(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "idem-app")
+
+	reqID := "test-request-id-retry-001"
+	// x-faas-request-id is the canonical header that
+	// pkg/middleware/requestid.go reads (matches gatewayd's wire
+	// surface). X-Request-Id is the more generic name; the middleware
+	// ignores it.
+	hdrs := map[string]string{"X-Faas-Request-Id": reqID}
+
+	// First call lands inside the window — must succeed.
+	rec := e.do(t, "GET", "/v1/account/export", nil, hdrs)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first export: %d %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("X-Idempotent-Replay"); got != "" {
+		t.Errorf("first request X-Idempotent-Replay = %q, want empty", got)
+	}
+
+	// Second call with the same X-Request-Id — must succeed (not 429).
+	rec = e.do(t, "GET", "/v1/account/export", nil, hdrs)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry export: %d %s, want 200 (idempotent retry)", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("X-Idempotent-Replay"); got != "true" {
+		t.Errorf("retry X-Idempotent-Replay = %q, want \"true\"", got)
+	}
+
+	// The retry must NOT have inserted a second ledger row.
+	rows, err := e.store.ListGdprRequestsForAccount(context.Background(), e.acct.ID, 100)
+	if err != nil {
+		t.Fatalf("list gdpr requests: %v", err)
+	}
+	exportRows := 0
+	for _, r := range rows {
+		if r.Action == state.GdprActionExport {
+			exportRows++
+		}
+	}
+	if exportRows != 1 {
+		t.Errorf("ledger export rows = %d, want 1 (retry must not double-insert)", exportRows)
+	}
+}
+
+// TestExportAccount_RequestIdIdempotent_DistinctIdsStillRateLimited
+// (issue #755 / PR-5.2). Distinct X-Request-Id values are
+// independent actions: the rate-limit still applies. This guards
+// against an over-eager idempotency probe that skips the rate-limit
+// for any request with a non-empty X-Request-Id.
+func TestExportAccount_RequestIdIdempotent_DistinctIdsStillRateLimited(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "idem-app-2")
+
+	// First call with id A.
+	rec := e.do(t, "GET", "/v1/account/export", nil,
+		map[string]string{"X-Faas-Request-Id": "id-A"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first export: %d %s", rec.Code, rec.Body)
+	}
+
+	// Second call with id B — distinct, so the rate-limit applies.
+	rec = e.do(t, "GET", "/v1/account/export", nil,
+		map[string]string{"X-Faas-Request-Id": "id-B"})
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("distinct-id retry: %d %s, want 429", rec.Code, rec.Body)
+	}
+}
+
+// TestExportAccount_EmitsExportRequestedAudit (issue #755 /
+// PR-5.4). A successful export must emit one account.export_requested
+// audit row carrying request_id + byte_count + replay=false. The
+// audit row is observable via store.ListEvents — same query the
+// regulator's downstream export tool consumes.
+func TestExportAccount_EmitsExportRequestedAudit(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "audit-export-app")
+
+	reqID := "audit-test-export-001"
+	rec := e.do(t, "GET", "/v1/account/export", nil,
+		map[string]string{"X-Faas-Request-Id": reqID})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export: %d %s", rec.Code, rec.Body)
+	}
+	// Body length is the byte_count the audit row carries.
+	expectedBytes := rec.Body.Len()
+
+	events, err := e.store.ListEvents(context.Background(), e.acct.ID, 100)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var found *state.Event
+	for i := range events {
+		if events[i].Kind == "account.export_requested" {
+			found = &events[i]
+			break
+		}
+	}
+	if found == nil {
+		kinds := make([]string, len(events))
+		for i, ev := range events {
+			kinds[i] = ev.Kind
+		}
+		t.Fatalf("account.export_requested audit row missing. emitted kinds: %v", kinds)
+	}
+	// Subject is a *uuid.UUID; non-nil means the audit row carries
+	// the account_id the regulator can join on.
+	if found.Subject == nil {
+		t.Errorf("audit subject is nil")
+	}
+	// Decode the data JSONB payload to assert the structured fields.
+	var data map[string]any
+	if err := json.Unmarshal(found.Data, &data); err != nil {
+		t.Fatalf("decode audit data: %v: %s", err, found.Data)
+	}
+	if got := data["request_id"]; got != reqID {
+		t.Errorf("audit data.request_id = %v, want %q", got, reqID)
+	}
+	if got, ok := data["byte_count"].(float64); !ok || int(got) != expectedBytes {
+		t.Errorf("audit data.byte_count = %v (type %T), want %d", data["byte_count"], data["byte_count"], expectedBytes)
+	}
+	if got := data["replay"]; got != false {
+		t.Errorf("audit data.replay = %v, want false", got)
+	}
+}
+
+// TestExportBundleV1WireShape (issue #755 / PR-5.6) pins the
+// top-level section list of the export bundle against the
+// cmd/apid/testdata/export-v1.json fixture. The fixture carries
+// the section names + types (object for account, array for the
+// rest); the test decodes both the fixture and the live bundle,
+// asserts the section list is identical, and asserts each
+// section's wire type is right.
+//
+// Why only the section list (not per-row keys): the per-section
+// DTOs in pkg/api/dto.go are the source of truth for field names.
+// Pinning a literal key list here would drift the moment a DTO
+// gains a field, and the drift becomes the bug (a false-positive
+// test failure for a benign addition). The section list is what
+// makes a wire-shape change breaking — if a handler drops the
+// `app_secrets` slice, or wraps `crons` as an object, the test
+// fires.
+//
+// What this catches:
+//   - a handler drops a top-level section (live is a subset of
+//     fixture)
+//   - a handler adds an unexpected top-level section (live is a
+//     superset of fixture) — useful for the v2 migration story
+//     where breaking schema changes are easy to make accidentally
+//   - a section's value flips from object to array or vice versa
+//     (json.Unmarshal into map[string]any + type assertion)
+//
+// What this does NOT catch:
+//   - field-value drift within a section — out of scope for the
+//     wire-shape pin; covered by type-assertion tests in
+//     TestExportAccount_FullBundle + TestExportAccount_RedactionInvariant
+//   - section reordering — JSON object key order is not
+//     semantically meaningful and the Go json package does not
+//     preserve it on the wire
+func TestExportBundleV1WireShape(t *testing.T) {
+	withAccountTestRecipient(t)
+	e := setup(t, api.PlanHobby)
+	seedOneApp(t, e, "wire-shape-app")
+	// Upsert a secret so the app_secrets slice is non-nil — a nil
+	// slice round-trips as JSON null, not [], which would trip the
+	// "want array" assertion below. The literal secret VALUE never
+	// appears in the export (re-encryption per ADR-020); "wire-key"
+	// is a placeholder the test never asserts on.
+	rec := e.do(t, "PUT", "/v1/apps/wire-shape-app/secrets/WIRE_KEY",
+		api.PutAppSecretRequest{Value: "wire-secret"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed secret: %d %s", rec.Code, rec.Body)
+	}
+
+	rec = e.do(t, "GET", "/v1/account/export", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export: %d %s", rec.Code, rec.Body)
+	}
+	var live map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &live); err != nil {
+		t.Fatalf("decode live bundle: %v: %s", err, rec.Body)
+	}
+
+	// Load the fixture relative to the test source so the test
+	// doesn't depend on cwd (issue #83 review #7).
+	fixturePath := filepath.Join("testdata", "export-v1.json")
+	raw, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", fixturePath, err)
+	}
+	var fixture map[string]any
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	fixtureSections, ok := fixture["_sections"].(map[string]any)
+	if !ok {
+		t.Fatalf("fixture _sections missing or not object: %v", fixture["_sections"])
+	}
+
+	// Top-level shape: the live bundle must contain exactly the
+	// fixture's _sections keys, no more, no less.
+	wantTop := make([]string, 0, len(fixtureSections))
+	for k := range fixtureSections {
+		wantTop = append(wantTop, k)
+	}
+	for _, k := range wantTop {
+		if _, ok := live[k]; !ok {
+			t.Errorf("live bundle missing top-level section %q", k)
+		}
+	}
+	// _sections + _underscore-prefixed keys are fixture-only
+	// metadata, not in the live.
+	for k := range live {
+		if _, isFixtureMeta := fixture[k]; isFixtureMeta {
+			t.Errorf("live bundle has fixture-only key %q", k)
+			continue
+		}
+		if _, ok := fixtureSections[k]; !ok {
+			t.Errorf("live bundle has unexpected top-level section %q (fixture does not declare it)", k)
+		}
+	}
+
+	// Per-section type check: account is an object, every other
+	// section is an array. exported_at is a string.
+	for section, wantType := range fixtureSections {
+		val := live[section]
+		switch wantType {
+		case "string":
+			if _, ok := val.(string); !ok {
+				t.Errorf("live %s = %T, want string", section, val)
+			}
+		case "object (AccountResponse, pkg/api/dto.go)":
+			if _, ok := val.(map[string]any); !ok {
+				t.Errorf("live %s = %T, want object", section, val)
+			}
+		default:
+			// Array sections.
+			if _, ok := val.([]any); !ok {
+				t.Errorf("live %s = %T, want array", section, val)
+			}
+		}
 	}
 }

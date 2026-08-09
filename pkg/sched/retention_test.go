@@ -202,7 +202,7 @@ func TestTransitionStampsTerminalAt(t *testing.T) {
 	vmm := &fakeVMM{}
 	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOpsMetrics(wire.NewOpsMetrics("schedd"))
 
-	res, err := engine.Wake(context.Background(), app.ID)
+	res, err := engine.Wake(context.Background(), app.ID, "")
 	if err != nil {
 		t.Fatalf("Wake: %v", err)
 	}

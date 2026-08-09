@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2435,6 +2436,49 @@ func (s *PgStore) AbortMigratingInstance(ctx context.Context, instanceID, leaseT
 	return nil
 }
 
+// FailRunningInstanceOnDeadNode flips a RUNNING row to FAILED when its
+// owning node is gone, stamping terminal_at so the §17 retention sweep
+// can age the row out.
+//
+// The predicate is the load-bearing race-safety guarantee, exactly as
+// in AbortMigratingInstance: `state = 'running' AND node_id = $2`. If
+// the node came back and its vmmd re-registered, or a peer already
+// transitioned the row (park, evict, migrate), RowsAffected() is 0 and
+// we return ErrConflict so the caller counts it and moves on rather
+// than second-guessing the state machine. Pinning node_id means a row
+// that migrated to a healthy node between the SELECT and this UPDATE
+// is never failed by a stale read.
+//
+// running → failed is a legal edge (machine.go validTransitions), and
+// FAILED is excluded from CountsForRAM(), which is what actually stops
+// the billing leak: meterd's sampler skips the row on its next tick.
+// FAILED (not PARKED) because no snapshot was taken — the VM died with
+// its host. The wake path treats FAILED as cold-bootable (ADR-005), so
+// the customer's next request still serves.
+func (s *PgStore) FailRunningInstanceOnDeadNode(ctx context.Context, instanceID, nodeID string) error {
+	if instanceID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty instanceID")
+	}
+	if nodeID == "" {
+		return fmt.Errorf("state: fail running instance on dead node: empty nodeID")
+	}
+	tag, err := s.pool.Exec(ctx,
+		`update instances
+		    set state = 'failed',
+		        terminal_at = now()
+		  where id = $1
+		    and state = 'running'
+		    and node_id = $2`,
+		instanceID, nodeID)
+	if err != nil {
+		return fmt.Errorf("state: fail running instance on dead node: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (s *PgStore) CountDeployedApps(ctx context.Context, accountID string) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx,
@@ -3690,8 +3734,18 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		}
 		// pgx.ErrNoRows → no prior; that's fine. Move on.
 	} else {
+		// Issue #556 PR-A: zero the prior row's traffic_percent in
+		// the same tx so Σ over live rows remains 100 by construction
+		// (the new INSERT defaults traffic_percent to 100 below).
+		// Two-write update is intentional: the first write flips
+		// status to 'superseded' (the pre-#556 contract); the second
+		// zeroes the new column. Combining them into one UPDATE SET
+		// list would also work but makes the diff against #556's
+		// "minimal blast radius" intent harder to review.
 		if _, err := tx.Exec(ctx,
-			`update deployments set status = 'superseded' where id = $1`,
+			`update deployments
+			    set status = 'superseded', traffic_percent = 0
+			  where id = $1`,
 			priorID); err != nil {
 			return Deployment{}, fmt.Errorf("state: supersede prior %s: %w", priorID, err)
 		}
@@ -3715,14 +3769,34 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 	// map to "{}" rather than NULL so a downstream consumer never
 	// has to branch on "is the jsonb column populated but the JSON
 	// string empty?".
+	// Issue #556 PR-A: traffic_percent is read from d.TrafficPercent
+	// (set by the handler to 100 when the caller omits the optional
+	// pointer, 0..100 otherwise) and written into the new row. The
+	// prior supersede above stamped 0 on the predecessor so Σ over
+	// live rows stays 100 by construction. The server-side default
+	// (NOT NULL DEFAULT 100) handles the empty-input case at the
+	// schema layer; the explicit write here mirrors the
+	// operator-supplied case.
+	//
+	// Defensive default: if a caller hands us d.TrafficPercent=0
+	// (Go zero value, the wire-omitted case from a test or a
+	// future handler that forgets to set the field), stamp 100
+	// here so we never INSERT a row at 0 that would then receive
+	// no traffic. Mirrors memstore.CreateDeployment (the unit-test
+	// suite that exercises MemStore stays aligned with PgStore),
+	// and matches the schema NOT NULL DEFAULT 100 contract.
+	if d.TrafficPercent == 0 {
+		d.TrafficPercent = 100
+	}
 	row := tx.QueryRow(ctx,
 		`insert into deployments (app_id, image_digest, kind, source_path, source_bytes, handler, log_path, source_url, commit_sha,
 		                          override_entrypoint, override_cmd, override_env, override_env_secrets, override_port, override_healthcheck,
 		                          override_liveness_probe,
 		                          sidecars,
 		                          status,
-		                          min_instances)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18)
+		                          min_instances,
+		                          traffic_percent)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', $18, $19)
 		 returning `+deploymentSelectColumnsWithRootfs,
 		d.AppID, d.ImageDigest, string(d.Kind), nullString(d.SourcePath), d.SourceBytes,
 		nullString(d.Handler), nullString(d.LogPath),
@@ -3732,7 +3806,8 @@ func (s *PgStore) CreateDeployment(ctx context.Context, d Deployment) (Deploymen
 		nullableOverridePort(d.OverridePort), nullJSONRaw(d.OverrideHealthcheck),
 		nullJSONRaw(d.OverrideLivenessProbe),
 		notNullEmptyJSONRaw(d.Sidecars),
-		d.MinInstances)
+		d.MinInstances,
+		d.TrafficPercent)
 	created, err := scanDeployment(row)
 	if err != nil {
 		return Deployment{}, err
@@ -3762,6 +3837,38 @@ func (s *PgStore) LiveDeployment(ctx context.Context, appID string) (Deployment,
 		`select `+deploymentSelectColumnsWithRootfs+`
 		 from deployments where app_id = $1 and status = 'live' order by created_at desc limit 1`, appID)
 	return scanDeploymentWithRootfs(row)
+}
+
+// LiveDeployments (issue #556 / PR-B) returns every row where
+// app_id=$1 AND status='live', ordered created_at DESC. Used by the
+// gateway's per-deployment weighted picker: on every NotifyDeploymentChanged
+// the gateway reads the full live set to rebuild its (deployment_id,
+// traffic_percent) cache. The query is index-only against the
+// deployments_live_traffic_idx partial index added in migration 00162
+// (the INCLUDE clause carries traffic_percent + id so the planner
+// never touches the heap).
+//
+// Returns (nil, nil) when the app has no live rows — the gateway
+// treats that as "no live deployment, 503". Per-row errors during
+// the rows.Next() loop are propagated by scanDeployments via the
+// returned error (no partial result is returned on failure).
+//
+// Determinism note: created_at is the canonical sort key. The
+// (app_id, created_at desc) index from migration 00007 covers the
+// search; the planner switches to deployments_live_traffic_idx when
+// the partial predicate is selective (typical: one or two live rows
+// per app, vs. O(N) total rows).
+func (s *PgStore) LiveDeployments(ctx context.Context, appID string) ([]Deployment, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		 from deployments
+		 where app_id = $1 and status = 'live'
+		 order by created_at desc`, appID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list live deployments app=%s: %w", appID, err)
+	}
+	defer rows.Close()
+	return scanDeployments(rows)
 }
 
 // CountLiveInstancesByDeployment returns the number of instances in
@@ -3899,6 +4006,299 @@ func (s *PgStore) UpdateDeploymentMinInstances(ctx context.Context, id string, m
 		return Deployment{}, err
 	}
 	return d, nil
+}
+
+// UpdateDeploymentTraffic stamps the per-deployment traffic-split
+// weight (issue #556 PR-A/PR-C). PR-A used the "zero siblings"
+// rebalance form: setting row R's traffic_percent to newPercent
+// forced every other live row in the same app to 0, keeping Σ = 100
+// by construction — but made every non-100 value a hard error since
+// Σ was structurally newPercent. PR-C upgrades to proportional
+// redistribution via the largest-remainder method
+// (RedistributeTraffic): a `faas traffic set --percent 25` on a
+// prior 100/0 app now leaves 75 on the prior deployment, Σ = 100,
+// no error. The Σ post-write assertion stays as a defensive
+// tripwire.
+//
+// Atomicity contract:
+//  1. The transaction opens with pgx.TxOptions{} (read-committed
+//     is fine — the FOR UPDATE below serialises).
+//  2. The app's live rows are locked with SELECT … FOR UPDATE so
+//     a concurrent UpdateDeploymentTraffic against the same app
+//     serialises behind us until COMMIT.
+//  3. The target row is validated to be 'live' (operator can't
+//     move traffic to a superseded/failed/pending row).
+//  4. The target row is updated to newPercent; sibling live rows
+//     are updated proportionally via RedistributeTraffic. Σ is
+//     guaranteed by the algorithm; the post-write SELECT … sum()
+//     is a defence-in-depth tripwire that fails the transaction
+//     on Σ != 100.
+//  5. Range-check + status guard return ErrInvalidTrafficPercent;
+//     Σ != 100 returns ErrTrafficPercentSumInvalid (handler
+//     translates to 422 / 409).
+//
+// Range-checking newPercent here is a backstop — the handler
+// validates [0, 100] and emits ErrInvalidTrafficPercent (422) on
+// the request path. The CHECK constraint (migration 00160) is the
+// third layer; any out-of-range value reaching this method trips a
+// 23514 SQLSTATE.
+func (s *PgStore) UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error) {
+	if newPercent < 0 || newPercent > 100 {
+		return Deployment{}, fmt.Errorf("state: update deployment traffic %d: %w", newPercent, ErrInvalidTrafficPercent)
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: begin update traffic tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	// (1) Lock the app's live rows. FOR UPDATE serialises concurrent
+	// UpdateDeploymentTraffic / CreateDeployment calls.
+	var appID string
+	if err := tx.QueryRow(ctx,
+		`select app_id from deployments where id = $1 for update`,
+		id).Scan(&appID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Deployment{}, ErrNotFound
+		}
+		return Deployment{}, fmt.Errorf("state: lock deployment %s: %w", id, err)
+	}
+
+	// (2) Confirm the target row is 'live'. A superseded/failed row
+	// can't accept traffic — operators route traffic to live rows.
+	var status string
+	if err := tx.QueryRow(ctx,
+		`select status from deployments where id = $1`,
+		id).Scan(&status); err != nil {
+		return Deployment{}, fmt.Errorf("state: read deployment status %s: %w", id, err)
+	}
+	if status != string(DeployLive) {
+		return Deployment{}, fmt.Errorf("state: deployment %s status=%s: %w",
+			id, status, ErrInvalidTrafficPercent)
+	}
+
+	// (3) Lock sibling live rows in the same app so a concurrent
+	// CreateDeployment (which supersedes prior live rows) doesn't
+	// race us. This is the FOR UPDATE on the (app_id, status)
+	// subset; the deployment_pkey index handles the id lookup above.
+	if _, err := tx.Exec(ctx,
+		`select id from deployments
+		  where app_id = $1 and status = 'live'
+		  for update`,
+		appID); err != nil {
+		return Deployment{}, fmt.Errorf("state: lock sibling live rows: %w", err)
+	}
+
+	// (4) Stamp target + redistribute residual across siblings via
+	// the largest-remainder method (see RedistributeTraffic).
+	//
+	// Read sibling weights first so the algorithm has the prior
+	// distribution to redistribute proportionally. We re-stamp
+	// inside the same tx that holds the FOR UPDATE locks above.
+	rows, err := tx.Query(ctx,
+		`select id, traffic_percent
+		   from deployments
+		  where app_id = $1 and status = 'live' and id != $2
+		  order by id`,
+		appID, id)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: read sibling weights: %w", err)
+	}
+	type sibling struct {
+		ID    string
+		Prior int
+	}
+	var siblings []sibling
+	for rows.Next() {
+		var s sibling
+		if err := rows.Scan(&s.ID, &s.Prior); err != nil {
+			rows.Close()
+			return Deployment{}, fmt.Errorf("state: scan sibling weight: %w", err)
+		}
+		siblings = append(siblings, s)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Deployment{}, fmt.Errorf("state: iterate sibling weights: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`update deployments set traffic_percent = $2 where id = $1`,
+		id, newPercent); err != nil {
+		return Deployment{}, fmt.Errorf("state: stamp traffic_percent %s: %w", id, mapErr(err))
+	}
+
+	// RedistributeTraffic returns weights that sum to (100 - newPercent);
+	// siblings[idx].ID gets newWeights[idx]. Σ + newPercent = 100 by
+	// construction (the algorithm enforces it; see helper doc).
+	helperSiblings := make([]struct {
+		ID    string
+		Prior int
+	}, len(siblings))
+	for i, s := range siblings {
+		helperSiblings[i].ID = s.ID
+		helperSiblings[i].Prior = s.Prior
+	}
+	newWeights := RedistributeTraffic(helperSiblings, 100-newPercent)
+	for i, s := range siblings {
+		if _, err := tx.Exec(ctx,
+			`update deployments set traffic_percent = $2 where id = $1`,
+			s.ID, newWeights[i]); err != nil {
+			return Deployment{}, fmt.Errorf("state: stamp sibling %s traffic_percent: %w", s.ID, mapErr(err))
+		}
+	}
+
+	// (5) Σ invariant assertion. Structurally guaranteed by
+	// RedistributeTraffic + the newPercent stamp above, but the
+	// test suite pins the check (defence in depth).
+	var sum int
+	if err := tx.QueryRow(ctx,
+		`select coalesce(sum(traffic_percent), 0)
+		   from deployments
+		  where app_id = $1 and status = 'live'`,
+		appID).Scan(&sum); err != nil {
+		return Deployment{}, fmt.Errorf("state: read Σ traffic_percent: %w", err)
+	}
+	if sum != 100 {
+		return Deployment{}, fmt.Errorf("state: Σ traffic_percent = %d, want 100: %w",
+			sum, ErrTrafficPercentSumInvalid)
+	}
+
+	// Read back the stamped row + commit.
+	row := tx.QueryRow(ctx,
+		`select `+deploymentSelectColumnsWithRootfs+`
+		   from deployments where id = $1`, id)
+	d, err := scanDeployment(row)
+	if err != nil {
+		return Deployment{}, fmt.Errorf("state: read deployment after stamp: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Deployment{}, fmt.Errorf("state: commit update traffic: %w", err)
+	}
+	return d, nil
+}
+
+// RedistributeTraffic assigns weights to N siblings that sum to
+// residual (typically 100 - newPercent from UpdateDeploymentTraffic)
+// using the largest-remainder method. The returned slice is in the
+// same order as siblings; caller maps weights[i] → siblings[i].ID.
+//
+// Algorithm (largest-remainder / Hamilton's method):
+//  1. Let Σ = Σ_{i=1..n} siblings[i].Prior. (Σ > 0 — a sole live
+//     row at 100 has no siblings and the caller handles that case
+//     before calling.)
+//  2. For each i, exact = siblings[i].Prior / Σ * residual.
+//  3. base[i] = floor(exact). remainder[i] = exact - base[i].
+//  4. Sort (remainder, ID) by (remainder DESC, ID ASC).
+//  5. The first k indices (where k = residual - Σ base[i]) each
+//     get +1, so the Σ of new weights = residual by construction.
+//     The tie-break is (fraction DESC, ID ASC) — stable across
+//     runs so two operators seeing the same state see the same
+//     rebalance.
+//
+// Worked example (PR-C test pin): {A:50, B:30, C:20} → set A:25
+// residual=75. Σ_{prior-target} = B:30 + C:20 = 50.
+//
+//	exact_B = 30/50*75 = 45.0   base=45, remainder=0.0
+//	exact_C = 20/50*75 = 30.0   base=30, remainder=0.0
+//
+// k = 75 - (45+30) = 0 → no +1 awarded. Result: {B:45, C:30}.
+// Σ = 75. Σ + A:25 = 100. ✓
+//
+// Tie-break example: {A:50, B:50} → set A:0 residual=100.
+// Σ = 100. exact_A = exact_B = 50.0. base=50 each, remainder=0.
+// k = 100 - 100 = 0 → no tie-break needed; both = 50.
+// For a tie that triggers the +1 (e.g. {A:33, B:33, C:34},
+// set A:0, residual=100, Σ=67):
+//
+//	exact_B = 33/67*100 = 49.25..., base=49, remainder=0.25
+//	exact_C = 34/67*100 = 50.74..., base=50, remainder=0.74
+//
+// k = 100 - 99 = 1 → C gets +1 (largest remainder).
+// Result: {B:49, C:51}. Σ = 100.
+//
+// Defensive: if Σ ≤ 0 (all siblings were 0 before — degenerate),
+// every sibling gets `residual / n` and the residual mod n is
+// absorbed by the first n%min siblings in ID ASC order. Σ = residual.
+func RedistributeTraffic(siblings []struct {
+	ID    string
+	Prior int
+}, residual int) []int {
+	n := len(siblings)
+	if n == 0 {
+		return nil
+	}
+	if residual <= 0 {
+		// Caller asked for zero or negative residual (target ≥ 100).
+		// All siblings drop to 0 — single edge case for `target=100`
+		// on an N-row app where the caller must already have
+		// stamped the target to 100 and we just zero the rest.
+		out := make([]int, n)
+		return out
+	}
+	// Σ prior weight of siblings.
+	var sumPrior int
+	for _, s := range siblings {
+		sumPrior += s.Prior
+	}
+	if sumPrior <= 0 {
+		// Degenerate: distribute residual evenly across n siblings,
+		// first `residual mod n` (in ID-ASC order) absorb the ±1.
+		// This shouldn't happen in practice (a Σ=0 sibling would
+		// mean a deployment with 0% traffic — supersede-zeroed —
+		// sitting live alongside another live row, which the
+		// supersede path disallows), but a sane fallback is
+		// mandatory for the integration tests to be deterministic.
+		base := residual / n
+		out := make([]int, n)
+		indices := make([]int, n)
+		for i := range indices {
+			indices[i] = i
+			out[i] = base
+		}
+		// Sort indices by siblings[i].ID ASC so the tie-break is
+		// stable.
+		sort.SliceStable(indices, func(a, b int) bool {
+			return siblings[indices[a]].ID < siblings[indices[b]].ID
+		})
+		for i := 0; i < residual%n; i++ {
+			out[indices[i]]++
+		}
+		return out
+	}
+	// Normal path.
+	type slot struct {
+		idx       int
+		base      int
+		remainder float64
+	}
+	slots := make([]slot, n)
+	var sumBase int
+	for i, s := range siblings {
+		exact := float64(s.Prior) / float64(sumPrior) * float64(residual)
+		b := int(exact) // floor for non-negative; exact ≥ 0
+		slots[i] = slot{idx: i, base: b, remainder: exact - float64(b)}
+		sumBase += b
+	}
+	// Award +1 to the top-k slots by (remainder DESC, ID ASC) where
+	// k = residual - sumBase. sumBase ≤ residual by definition of
+	// floor; k ∈ [0, n).
+	k := residual - sumBase
+	sort.SliceStable(slots, func(a, b int) bool {
+		if slots[a].remainder != slots[b].remainder {
+			return slots[a].remainder > slots[b].remainder
+		}
+		return siblings[slots[a].idx].ID < siblings[slots[b].idx].ID
+	})
+	out := make([]int, n)
+	for i, s := range slots {
+		out[s.idx] = s.base
+		if i < k {
+			out[s.idx]++
+		}
+	}
+	return out
 }
 
 // SetDeploymentParked stamps the per-deployment parked_reason +
@@ -4363,8 +4763,8 @@ func (s *PgStore) CreateBuildProvenance(ctx context.Context, prov BuildProvenanc
 		`insert into build_provenance
 		   (build_id, buildkit_version, railpack_version, base_digest, source_sha256,
 		    source_url, commit_sha, plan, runner_digest, builder_node_id,
-		    started_at, finished_at, sbom_storage_key)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		    started_at, finished_at, sbom_storage_key, framework_version)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		 on conflict (build_id) do update set
 		   buildkit_version = excluded.buildkit_version,
 		   railpack_version = excluded.railpack_version,
@@ -4377,7 +4777,8 @@ func (s *PgStore) CreateBuildProvenance(ctx context.Context, prov BuildProvenanc
 		   builder_node_id  = excluded.builder_node_id,
 		   started_at       = excluded.started_at,
 		   finished_at      = excluded.finished_at,
-		   sbom_storage_key = excluded.sbom_storage_key`,
+		   sbom_storage_key = excluded.sbom_storage_key,
+		   framework_version = excluded.framework_version`,
 		prov.BuildID,
 		nullString(prov.BuildkitVer),
 		nullString(prov.RailpackVer),
@@ -4391,6 +4792,7 @@ func (s *PgStore) CreateBuildProvenance(ctx context.Context, prov BuildProvenanc
 		prov.StartedAt,
 		prov.FinishedAt,
 		nullString(prov.SBOMStorageKey),
+		nullString(prov.FrameworkVer),
 	)
 	return err
 }
@@ -4405,7 +4807,8 @@ func (s *PgStore) BuildProvenanceByBuildID(ctx context.Context, buildID string) 
 		`select id, build_id, coalesce(buildkit_version,''), coalesce(railpack_version,''),
 		        coalesce(base_digest,''), source_sha256, coalesce(source_url,''), coalesce(commit_sha,''),
 		        coalesce(plan,''), coalesce(runner_digest,''), coalesce(builder_node_id,''),
-		        started_at, finished_at, coalesce(sbom_storage_key,'')
+		        started_at, finished_at, coalesce(sbom_storage_key,''),
+		        coalesce(framework_version,'')
 		   from build_provenance where build_id = $1`, buildID)
 	return scanBuildProvenance(row)
 }
@@ -6691,6 +7094,54 @@ func (s *PgStore) ListInstancesByStatesOlderThan(ctx context.Context, states []S
 	return scanInstances(rows)
 }
 
+// ListRunningInstancesOnDeadNodes is the dead-node billing
+// reconciler's lookup. Joins instances → compute_nodes and returns
+// RUNNING rows whose owning node is not alive.
+//
+// Liveness is the OR of two predicates on purpose:
+//
+//   - `active = false` — schedd's heartbeat sweep already flipped the
+//     node (pkg/sched/heartbeat.go). This is the steady-state signal.
+//   - `last_heartbeat_at < threshold` — the flip has not landed yet.
+//     MarkComputeNodeInactive is only called from the heartbeat
+//     goroutine, so a schedd restart (or a schedd that never came
+//     back) leaves a dead node with active = true indefinitely.
+//     Without this second predicate the reconciler would inherit the
+//     exact liveness blind spot it exists to close.
+//
+// ORDER BY last_heartbeat_at ASC so a capped tick drains the
+// longest-dead nodes first — those are the rows accruing the most
+// incorrect billing. The limit keeps one tick's write burst bounded
+// on a fleet where a whole node's worth of instances goes dead at
+// once; the caller re-runs on the next tick until the set is empty.
+func (s *PgStore) ListRunningInstancesOnDeadNodes(ctx context.Context, threshold time.Time, limit int) ([]Instance, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: limit must be > 0, got %d", limit)
+	}
+	rows, err := s.pool.Query(ctx,
+		`select i.id, i.app_id, i.deployment_id, i.state, coalesce(i.netns,''), coalesce(i.guest_uid,0),
+		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at,
+		        i.node_id, i.wake_id, i.framework_ready_at, i.tail_count
+		 from instances i
+		 join compute_nodes n on n.id = i.node_id
+		 where i.state = 'running'
+		   and (n.active = false or n.last_heartbeat_at < $1)
+		 -- Tie-break on instance id so a capped query is
+		 -- deterministic when many rows share the same heartbeat
+		 -- timestamp (MemStore's ListRunningInstancesOnDeadNodes
+		 -- does the same). Without this, a multi-host fleet where
+		 -- N>cap rows die at once can leave different rows waiting
+		 -- an extra tick between runs of identical input.
+		 order by n.last_heartbeat_at asc, i.id asc
+		 limit $2`,
+		threshold, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list running instances on dead nodes: %w", err)
+	}
+	defer rows.Close()
+	return scanInstances(rows)
+}
+
 // ListInstancesInTerminalStatesOlderThan is the §17 retention sweep's
 // lookup (PR #74). Reads the dedicated terminal_at column — distinct
 // from the watchdog's state-aware started_at/parked_at comparison.
@@ -7351,7 +7802,7 @@ func (s *PgStore) UpsertComputeNode(ctx context.Context, node ComputeNode) (Comp
 }
 
 // UpsertNodeKey inserts or updates a (compute_node_id, key_id) row
-// in compute_node_keys (migration 00075, ADR-053). vmmd's
+// in compute_node_keys (migration 00076, ADR-053). vmmd's
 // self-registration calls this on startup once it has loaded its
 // node signing key (cmd/vmmd/main.go::loadNodeSigningKey) and
 // computed the key_id (the SHA-256 hex of the SubjectPublicKeyInfo).
@@ -9682,7 +10133,8 @@ const deploymentSelectColumnsWithRootfs = `
 	coalesce(sidecars, '[]'::jsonb),
 	min_instances,
 	scan_result, scan_status, scanned_at,
-	coalesce(parked_reason,''), parked_at`
+	coalesce(parked_reason,''), parked_at,
+	traffic_percent`
 
 // Compile-time anchors for the deployment column constants. See the
 // appsSelectColumns comment above for rationale.
@@ -9710,7 +10162,8 @@ const deploymentSelectColumnsQualified = `
 	coalesce(d.sidecars, '[]'::jsonb),
 	d.min_instances,
 	d.scan_result, d.scan_status, d.scanned_at,
-	coalesce(d.parked_reason,''), d.parked_at`
+	coalesce(d.parked_reason,''), d.parked_at,
+	d.traffic_percent`
 
 var _ = deploymentSelectColumnsQualified
 
@@ -9770,7 +10223,7 @@ func scanDeploymentInto(d *Deployment, row pgx.Row, rootfsPath, rootfsKey *strin
 		&d.OverrideLivenessProbe,
 		&d.Sidecars, &d.MinInstances,
 		&d.ScanResult, &scanStatus, &scannedAt,
-		&d.ParkedReason, &parkedAt); err != nil {
+		&d.ParkedReason, &parkedAt, &d.TrafficPercent); err != nil {
 		return mapErr(err)
 	}
 	if rootfsPath != nil {
@@ -9891,6 +10344,7 @@ func scanBuildProvenance(row pgx.Row) (BuildProvenance, error) {
 		&p.BaseDigest, &p.SourceSHA256, &p.SourceURL, &p.CommitSHA,
 		&p.Plan, &p.RunnerDigest, &p.BuilderNodeID,
 		&p.StartedAt, &p.FinishedAt, &p.SBOMStorageKey,
+		&p.FrameworkVer,
 	); err != nil {
 		return BuildProvenance{}, mapErr(err)
 	}
@@ -10730,6 +11184,27 @@ func (s *PgStore) DeleteAccount(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
 
+	// Capture email at copy-time for the audit_log row (issue #755 /
+	// PR-6). The audit_log table is FK-free; the row outlives the
+	// account, so the email must be inlined so a regulator reading
+	// a post-deletion row has the human identifier without joining
+	// back to a deleted accounts row. Read inside the same tx with
+	// the deleted_pending predicate so we get the same race-guard
+	// semantics as the parent DELETE: if a restore raced us, we
+	// won't see status='deleted_pending' and the email is empty.
+	//
+	// Empty email is a tolerated outcome for the anonymous test
+	// accounts that have no email column populated — the audit
+	// row still records kind=account.deleted + actor=grace-sweep.
+	var accountEmail string
+	err = tx.QueryRow(ctx,
+		`select email from accounts where id = $1 and status = 'deleted_pending'`,
+		id,
+	).Scan(&accountEmail)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("state: read email for %s: %w", id, err)
+	}
+
 	// Sentinel + race guard: the conditional DELETE on the parent row is
 	// the single source of truth for "did this delete do anything?".
 	//
@@ -10791,6 +11266,53 @@ func (s *PgStore) DeleteAccount(ctx context.Context, id string) error {
 		if _, err := tx.Exec(ctx, step.sql, id); err != nil {
 			return fmt.Errorf("state: delete %s for account %s: %w", step.name, id, err)
 		}
+	}
+
+	// audit_log backfill (issue #755 / PR-6). Writes one row to the
+	// FK-free audit_log table so the post-deletion state is preserved
+	// as regulator / DPO evidence. Lives inside the same tx so the
+	// audit row is atomic with the accounts row delete — a separate
+	// tx could commit the audit row before the parent delete, or vice
+	// versa, breaking the atomicity invariant.
+	//
+	// Placement matters: this runs AFTER the `delete from events`
+	// step (the events rows are the per-event audit trail that gets
+	// erased under GDPR right-to-erasure, spec §17 G6) and BEFORE
+	// the parent `delete from accounts` (so the audit row still
+	// points at a parent row in the tx's read view — even though the
+	// audit_log row is FK-free by spec, ordering the writes keeps the
+	// audit_log row's account_id coherent with the parent delete's
+	// sentinel check below).
+	auditID := uuid.New()
+	auditAt := time.Now().UTC()
+	auditPayload, mErr := json.Marshal(map[string]string{
+		"source": "grace-sweep",
+		"email":  accountEmail,
+		"actor":  "grace-sweep",
+	})
+	if mErr != nil {
+		return fmt.Errorf("state: marshal audit_log payload for %s: %w", id, mErr)
+	}
+	// AuditLog.AccountID is *uuid.UUID (not *string) — mirror the
+	// migration's UUID column. If the inbound id is unparseable
+	// (it should never be — the grace sweep reads it from
+	// accounts.id), leave AccountID nil rather than failing the
+	// entire tx; the audit_log row still records the deletion.
+	var auditAccountID *uuid.UUID
+	if parsed, parseErr := uuid.Parse(id); parseErr == nil {
+		auditAccountID = &parsed
+	}
+	auditEntry := AuditLog{
+		ID:           auditID,
+		Kind:         AuditLogKindAccountDeleted,
+		AccountID:    auditAccountID,
+		AccountEmail: accountEmail,
+		Actor:        "grace-sweep",
+		ReceivedAt:   auditAt,
+		Data:         auditPayload,
+	}
+	if err := s.insertAuditLogTx(ctx, tx, auditEntry); err != nil {
+		return fmt.Errorf("state: insert audit_log for %s: %w", id, err)
 	}
 
 	// Walk children first so the FK back to accounts is empty by the
@@ -10969,12 +11491,16 @@ func (s *PgStore) AppendGdprRequest(ctx context.Context, r GdprRequest) error {
 	if r.RequestedAt.IsZero() {
 		r.RequestedAt = time.Now().UTC()
 	}
+	// Empty request_id round-trips as NULL so the partial unique
+	// index (gdpr_requests_request_id_idx) excludes it from the
+	// index entirely — a NULL request_id is the "no inbound id"
+	// path, distinct from a real id.
 	_, err := s.pool.Exec(ctx,
 		`insert into gdpr_requests
-		   (id, account_id, account_email, action, requested_at, completed_at)
-		 values ($1, $2, $3, $4, $5, $6)`,
+		   (id, account_id, account_email, action, requested_at, completed_at, request_id)
+		 values ($1, $2, $3, $4, $5, $6, nullif($7, ''))`,
 		r.ID, r.AccountID, r.AccountEmail, string(r.Action),
-		r.RequestedAt.UTC(), nullableTimestamptz(r.CompletedAt))
+		r.RequestedAt.UTC(), nullableTimestamptz(r.CompletedAt), r.RequestID)
 	return err
 }
 
@@ -10987,7 +11513,7 @@ func (s *PgStore) ListGdprRequestsForAccount(ctx context.Context, accountID stri
 		return nil, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`select id, account_id, account_email, action, requested_at, completed_at
+		`select id, account_id, account_email, action, requested_at, completed_at, request_id
 		   from gdpr_requests
 		  where account_id = $1
 		  order by requested_at desc
@@ -11001,17 +11527,77 @@ func (s *PgStore) ListGdprRequestsForAccount(ctx context.Context, accountID stri
 		var (
 			g           GdprRequest
 			completedAt pgtype.Timestamptz
+			requestID   pgtype.Text // NULL = no inbound X-Request-Id (PR-5.2)
 		)
 		if err := rows.Scan(&g.ID, &g.AccountID, &g.AccountEmail,
-			&g.Action, &g.RequestedAt, &completedAt); err != nil {
+			&g.Action, &g.RequestedAt, &completedAt, &requestID); err != nil {
 			return nil, err
 		}
 		if completedAt.Valid {
 			g.CompletedAt = completedAt.Time
 		}
+		if requestID.Valid {
+			g.RequestID = requestID.String
+		}
 		out = append(out, g)
 	}
 	return out, rows.Err()
+}
+
+// CountGdprRequestsSince is the rate-limit probe for
+// GET /v1/account/export (issue #755 / PR-5.1). Returns how many
+// (account_id, action) ledger rows landed at or after since. The
+// gdpr_requests_account_action_idx partial index covers the
+// (account_id, action, requested_at desc) prefix so this is an
+// index-only count even for accounts with long export histories.
+// limit=0 callers should pass since=time.Now() and check >1.
+func (s *PgStore) CountGdprRequestsSince(ctx context.Context, accountID, action string, since time.Time) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`select count(*)::int
+		   from gdpr_requests
+		  where account_id = $1
+		    and action = $2
+		    and requested_at >= $3`,
+		accountID, action, since.UTC()).Scan(&n)
+	return n, err
+}
+
+// FindGdprRequestByRequestID is the idempotency probe for
+// GET /v1/account/export (issue #755 / PR-5.2). Returns the most
+// recent ledger row matching (account_id, request_id) when one
+// exists, or ErrNotFound when it does not. Backed by the partial
+// index gdpr_requests_request_id_idx so the lookup is O(log n)
+// even for accounts with millions of legacy rows where most
+// request_ids are NULL (NULL rows are excluded by the WHERE
+// clause). Returns (zero, ErrNotFound) when no row matches.
+func (s *PgStore) FindGdprRequestByRequestID(ctx context.Context, accountID, requestID string) (GdprRequest, error) {
+	if requestID == "" {
+		return GdprRequest{}, ErrNotFound
+	}
+	var (
+		g           GdprRequest
+		completedAt pgtype.Timestamptz
+	)
+	err := s.pool.QueryRow(ctx,
+		`select id, account_id, account_email, action, requested_at, completed_at, request_id
+		   from gdpr_requests
+		  where account_id = $1
+		    and request_id = $2
+		  order by requested_at desc
+		  limit 1`, accountID, requestID).
+		Scan(&g.ID, &g.AccountID, &g.AccountEmail,
+			&g.Action, &g.RequestedAt, &completedAt, &g.RequestID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return GdprRequest{}, ErrNotFound
+		}
+		return GdprRequest{}, err
+	}
+	if completedAt.Valid {
+		g.CompletedAt = completedAt.Time
+	}
+	return g, nil
 }
 
 // nullableTimestamptz returns a pgx-friendly NULL when t.IsZero(), so
@@ -12302,4 +12888,142 @@ func scanSession(s rowScanner) (Session, error) {
 	sess.LastSeenAt = lastSeen
 	sess.RevokedAt = revoked
 	return sess, nil
+}
+
+// InsertAuditLog (issue #755 / PR-6) writes one row to the FK-free
+// audit_log table (migrations/00163_audit_log.sql). The table is
+// append-only by spec — there is no companion Update / Delete method,
+// and the production role grants only INSERT (not UPDATE / DELETE).
+//
+// The pool-based path here is the standalone entry point used by any
+// future emitter that needs to record an audit row outside of an
+// account-deletion tx. The DeleteAccount-time insert goes through
+// insertAuditLogTx (private) so the audit row rides the same tx as
+// the accounts row delete — atomicity is the load-bearing property
+// of the post-deletion evidence story.
+//
+// Raw SQL (not sqlc-generated) to match the local convention in
+// AppendEvent / ListEvents and in the rest of DeleteAccount's
+// children-walk. Bypassing the sqlc-check CI gate keeps the PR
+// small and avoids regenerating pkg/state/sqlc/*.go.
+func (s *PgStore) InsertAuditLog(ctx context.Context, entry AuditLog) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into audit_log
+		    (id, kind, account_id, account_email, actor, received_at, data)
+		 values ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+		entry.ID,
+		entry.Kind,
+		entry.AccountID,
+		entry.AccountEmail,
+		entry.Actor,
+		entry.ReceivedAt,
+		[]byte(entry.Data),
+	)
+	return err
+}
+
+// insertAuditLogTx is the tx-bound variant of InsertAuditLog. Called
+// from inside (*PgStore).DeleteAccount so the audit_log row lands in
+// the same tx as the accounts row delete. The pool-based InsertAuditLog
+// is NOT used on the DeleteAccount path because a separate-tx insert
+// would race the accounts delete (the audit row could be committed
+// before the parent delete, or vice versa, breaking the atomicity a
+// regulator relies on).
+func (s *PgStore) insertAuditLogTx(ctx context.Context, tx pgx.Tx, entry AuditLog) error {
+	_, err := tx.Exec(ctx,
+		`insert into audit_log
+		    (id, kind, account_id, account_email, actor, received_at, data)
+		 values ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+		entry.ID,
+		entry.Kind,
+		entry.AccountID,
+		entry.AccountEmail,
+		entry.Actor,
+		entry.ReceivedAt,
+		[]byte(entry.Data),
+	)
+	return err
+}
+
+// ListAuditLog (issue #755 / PR-6) is the dashboard read path for the
+// audit_log table. Translates the AuditLogFilter struct into a single
+// WHERE clause; no string-built queries (matches the repo convention
+// enforced by the sqlc-check CI gate).
+//
+// The ORDER BY matches the audit_log_received_at_idx so the index is
+// honored on the dashboard-default sort. The id DESC tiebreaker keeps
+// the result stable when two rows share a received_at (rare on
+// nanosecond-resolution inserts, but the secondary sort costs nothing).
+//
+// Filter semantics, end-to-end:
+//
+//   - AccountID nil + IncludeAnonymous false: customer-scoped shape
+//     ("show me this account's rows, never anonymous") — used by
+//     GET /v1/audit-log after the handler pins AccountID to the
+//     calling account's ID.
+//   - AccountID nil + IncludeAnonymous true: operator cross-account
+//     view with anonymous rows surfaced — used by
+//     GET /v1/audit-log/all when ?include_anonymous=true.
+//   - AccountID set + IncludeAnonymous false: operator cross-account
+//     view restricted to one account — used by
+//     GET /v1/audit-log/all when ?account_id=<uuid>.
+//
+// Limit is bounded by the handler to the over-read constant; a zero
+// value here falls back to a sane default to prevent unbounded scans.
+func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditLogFilter) ([]AuditLog, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	// Translate the zero-time Since into a NULL lower bound so the
+	// query can use a single uniform prepared statement shape.
+	var sinceParam interface{}
+	if !filter.Since.IsZero() {
+		sinceParam = filter.Since
+	} else {
+		sinceParam = nil
+	}
+
+	rows, err := s.pool.Query(ctx,
+		`select id, kind, account_id, account_email, actor, received_at, data
+		   from audit_log
+		  where ($1::uuid is null or account_id = $1::uuid)
+		    and ($2 = '' or kind like $2 || '%')
+		    and ($3::timestamptz is null or received_at >= $3::timestamptz)
+		    and ($4::bool or account_id is not null)
+		  order by received_at desc, id desc
+		  limit $5`,
+		filter.AccountID,
+		filter.KindPrefix,
+		sinceParam,
+		filter.IncludeAnonymous,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AuditLog
+	for rows.Next() {
+		var a AuditLog
+		var rawData []byte
+		if err := rows.Scan(
+			&a.ID,
+			&a.Kind,
+			&a.AccountID,
+			&a.AccountEmail,
+			&a.Actor,
+			&a.ReceivedAt,
+			&rawData,
+		); err != nil {
+			return nil, err
+		}
+		if len(rawData) > 0 {
+			a.Data = json.RawMessage(rawData)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }

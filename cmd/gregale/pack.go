@@ -3,11 +3,14 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +33,57 @@ const (
 	fwUnknown framework = "unknown"
 )
 
+// Function runtime literals — declared as constants here so the
+// inferFunctionRuntime switch can use named values rather than
+// repeating the wire string (which goconst would otherwise flag
+// because the runtime names recur across the CLI: --template
+// function-node forces "node22", the wire form field carries
+// "node22", etc.). The whitelist matches apid's validator at
+// cmd/apid/handlers.go:98 (node22 / node24 / python312 /
+// python313 / go124 / go124-alpine); this PR only emits the
+// runtime values the auto-detect path can infer, but adding a
+// new runtime to the map is a follow-up ADR.
+const (
+	runtimeNode22    = "node22"
+	runtimeNode24    = "node24"
+	runtimePython312 = "python312"
+	runtimePython313 = "python313"
+	runtimeGo124     = "go124"
+)
+
+// shape is the deploy shape auto-detected from the current directory when
+// `gregale deploy` runs with no source flag (issue #737 / ADR-083). A function
+// shape means "single handler file at the root, no app markers"; an app shape
+// means any app marker (package.json / requirements.txt / go.mod / Dockerfile
+// / …) is present at the root. The convention is intentionally narrow:
+// a customer with `package.json + handler.js` is unambiguously a Node app,
+// and must pass --function to force function mode (otherwise auto-detection
+// would silently break every existing Node user).
+//
+// shapeUnknown fires when the cwd is empty or contains only excluded files
+// (.git, .DS_Store, README, dotfiles). The CLI surfaces this as the no-source
+// error and lets the customer pick --image, --tarball, --template, --repo,
+// or the new --function/--app explicit flags.
+type shape int
+
+const (
+	shapeApp shape = iota
+	shapeFunction
+	shapeUnknown
+)
+
+// functionHandlerFiles is the closed set of file names that, when present
+// alone at the project root, signal a function deploy. The names match the
+// template convention at cmd/gregale/templates/function-node/handler.js (and
+// its python/go siblings). Anything else falls through to shapeApp or
+// shapeUnknown.
+var functionHandlerFiles = map[string]bool{
+	"handler.js": true,
+	"handler.ts": true,
+	"handler.py": true,
+	"handler.go": true,
+}
+
 // defaultExcludeDirs are directory names dropped anywhere in the tree. These
 // are build artifacts / VCS metadata that both bloat the tarball past the
 // SourceTarballMaxMB cap (pkg/api/limits.go) and are reproduced server-side by
@@ -46,6 +100,29 @@ var defaultExcludeDirs = map[string]bool{
 var defaultExcludeFiles = map[string]bool{
 	".DS_Store": true,
 	"Thumbs.db": true,
+}
+
+// appMarker is the closed set of filenames whose presence at the project
+// root (or, for the depth-2 hint path, under a single subdirectory) marks
+// a directory as containing deployable source for an *app* (Railpack
+// framework path). A README.md or dotfile in the same directory is NOT
+// a marker — those files don't change the deploy shape.
+//
+// Single source of truth: detectFramework and detectNestedMarkerHint
+// both consult this map, so a new marker (e.g. Cargo.toml for a Rust
+// Railpack pipeline that lands in a future ADR) only needs to be added
+// here, not in two switches. The marker→framework mapping mirrors
+// pkg/builderd/detect.go:73-82 on the server side — the CLI is
+// intentionally the lighter view (no Dockerfile priority ordering —
+// see detectFramework, which applies Dockerfile-wins as a post-pass).
+var appMarker = map[string]framework{
+	"package.json":     fwNode,
+	"requirements.txt": fwPython,
+	"pyproject.toml":   fwPython,
+	"pipfile":          fwPython,
+	"setup.py":         fwPython,
+	"go.mod":           fwGo,
+	"dockerfile":       fwDocker,
 }
 
 // packEpoch is a fixed modification time stamped on every archive entry so the
@@ -83,35 +160,540 @@ func detectFramework(srcDir string) framework {
 	if err != nil {
 		return fwUnknown
 	}
-	var hasDocker, hasNode, hasPython, hasGo bool
+	// Single source of truth: appMarker (issue #744 / ADR-086). A new
+	// marker added to the map is picked up here AND by
+	// detectNestedMarkerHint without further edits. The Dockerfile-wins
+	// post-pass at the end mirrors pkg/builderd/detect.go — when both a
+	// Dockerfile and a language marker are present, the Dockerfile wins.
+	var hasDocker bool
+	var lang framework
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		switch strings.ToLower(e.Name()) {
-		// Keep in sync with pkg/builderd/detect.go — the rule intentionally
-		// mirrors the server-side detector; if you change one, change both.
-		case "dockerfile":
-			hasDocker = true
-		case "package.json":
-			hasNode = true
-		case "requirements.txt", "pyproject.toml", "pipfile", "setup.py":
-			hasPython = true
-		case "go.mod":
-			hasGo = true
+		if fw, ok := appMarker[strings.ToLower(e.Name())]; ok {
+			if fw == fwDocker {
+				hasDocker = true
+				continue
+			}
+			if lang == "" {
+				lang = fw
+			}
+		}
+	}
+	if hasDocker {
+		return fwDocker
+	}
+	if lang != "" {
+		return lang
+	}
+	return fwUnknown
+}
+
+// detectFrameworkVersion is the CLI-side mirror of
+// pkg/builderd/detectversion.go. It pre-walks srcDir (the local cwd
+// the customer is packing from) and returns the best-effort language
+// version declared by the source, or "" if no version marker is found
+// or any parser fails. Used by resolveDeployShape's shapeApp banner
+// (issue #740 / DEPLOY-PROV-5 / ADR-087) to render
+//
+//	Detected: app, framework=node, version=22.11.0
+//
+// BEFORE the multipart POST. The server independently re-derives the
+// same value for the build_provenance.framework_version column; the
+// CLI banner is purely informational — the operator reads the
+// authoritative value via `gregale build provenance <id>`.
+//
+// Priority order mirrors pkg/builderd/detectversion.go (kept in sync
+// intentionally — the CLI is the lighter view; the server is the
+// authoritative re-read):
+//
+//	node    → .nvmrc → package.json::engines.node → ""
+//	python  → .python-version → pyproject.toml::requires-python → ""
+//	go      → go.mod → "go X.Y" directive → ""
+//	docker  → "" (containers pin via FROM; out-of-scope per issue #740)
+//
+// Any parse error → "". A 64 KB cap per file mirrors the server-side
+// bound at pkg/builderd/detectversion.go::maxVersionFileBytes.
+func detectFrameworkVersion(srcDir string, fw framework) string {
+	switch fw {
+	case fwNode:
+		if v := cliReadFirstLine(srcDir, ".nvmrc"); v != "" {
+			if out := normalizeVersion(stripVersionPrefix(v)); out != "" {
+				return out
+			}
+		}
+		if body := cliReadFile(srcDir, "package.json"); body != "" {
+			if out := cliVersionFromPackageJSONNode(body); out != "" {
+				return out
+			}
+		}
+	case fwPython:
+		if v := cliReadFirstLine(srcDir, ".python-version"); v != "" {
+			if out := normalizeVersion(stripVersionPrefix(v)); out != "" {
+				return out
+			}
+		}
+		if body := cliReadFile(srcDir, "pyproject.toml"); body != "" {
+			if out := cliVersionFromPyprojectRequires(body); out != "" {
+				return out
+			}
+		}
+	case fwGo:
+		if body := cliReadFile(srcDir, "go.mod"); body != "" {
+			if out := cliVersionFromGoModDirective(body); out != "" {
+				return out
+			}
+		}
+	case fwDocker, fwUnknown:
+		// explicit out-of-scope / no anchor
+	}
+	return ""
+}
+
+// funcErrorSuggestion returns the trailing "Detected <fw> project ..."
+// snippet for the --function error path, or "" when the snippet
+// would be empty / malformed (no version file, no whitelisted
+// runtime). Extracted from resolveDeployShape so the conditional is
+// readable and so the malformed-runtime case (e.g. node 26 → no
+// whitelisted entry → empty --runtime) is impossible.
+func funcErrorSuggestion(srcDir string) string {
+	fw := detectFramework(srcDir)
+	if fw == fwUnknown || fw == fwDocker {
+		return ""
+	}
+	ver := detectFrameworkVersion(srcDir, fw)
+	if ver == "" {
+		return ""
+	}
+	rt := runtimeSuggestionFor(fw, ver)
+	if rt == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		" Detected %s project (version %s) — try `--runtime %s --handler handler.handler`.",
+		fw, ver, rt)
+}
+
+// cliReadFile reads up to 64 KB of the named file in srcDir and returns
+// its contents. Returns "" on any error so the caller treats the file
+// as not-present. A 64 KB cap mirrors the server-side bound.
+func cliReadFile(srcDir, name string) string {
+	const maxBytes = 64 * 1024
+	path := filepath.Join(srcDir, name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if len(data) > maxBytes {
+		return ""
+	}
+	return string(data)
+}
+
+// cliReadFirstLine returns the first non-blank, non-comment trimmed
+// line of the named file. "" on any error or all-blank file.
+func cliReadFirstLine(srcDir, name string) string {
+	body := cliReadFile(srcDir, name)
+	if body == "" {
+		return ""
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+// stripVersionPrefix strips a leading "v" from a version string. The
+// rest of the version is matched by the per-parser regex; that's how
+// "v22.11.0" turns into "22.11.0" without forcing a strict semver
+// parse.
+func stripVersionPrefix(s string) string {
+	return strings.TrimPrefix(strings.TrimSpace(s), "v")
+}
+
+// versionLikeCLI is the dotted-version matcher used by both the
+// node and python parsers. The .python-version file commonly writes
+// "3.11" (two-component) so the regex accepts X.Y or X.Y.Z. Mirrors
+// pkg/builderd/detectversion.go::semverLike.
+var versionLikeCLI = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
+
+// normalizeVersion extracts the first dotted version (X.Y or X.Y.Z)
+// from s. Mirrors pkg/builderd/detectversion.go::normalizeSemver —
+// the server kept two named variants (semverLike / pythonSemverLike)
+// despite byte-identical regexes, so the CLI does too for symmetry,
+// and uses one shared regex to avoid duplication.
+func normalizeVersion(s string) string {
+	return versionLikeCLI.FindString(s)
+}
+
+// cliVersionFromPackageJSONNode mirrors pkg/builderd's
+// versionFromPackageJSONNode. Only the bare-version-extraction path is
+// copied; the server has the full encoding/json path because the
+// CLI-side path runs on untrusted customer source files.
+func cliVersionFromPackageJSONNode(body string) string {
+	var pkg struct {
+		Engines struct {
+			Node json.RawMessage `json:"node"`
+		} `json:"engines"`
+	}
+	if err := json.Unmarshal([]byte(body), &pkg); err != nil {
+		return ""
+	}
+	if len(pkg.Engines.Node) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(pkg.Engines.Node, &s); err != nil {
+		return ""
+	}
+	s = strings.TrimSpace(s)
+	// Strip the leading operator. Order matters: 2-char prefixes
+	// (>=, <=) come first so they're not eaten by the single-char
+	// match.
+	for _, op := range []string{">=", "<=", ">", "<", "^", "~", "="} {
+		if strings.HasPrefix(s, op) {
+			s = strings.TrimPrefix(s, op)
+			break
+		}
+	}
+	return normalizeVersion(strings.TrimSpace(s))
+}
+
+// cliVersionFromPyprojectRequires mirrors the server-side regex
+// parser. We keep the regex identical so the server-side test cases
+// translate 1:1 to the CLI side.
+func cliVersionFromPyprojectRequires(body string) string {
+	re := regexp.MustCompile(`(?i)requires-python\s*=\s*["']([^"']+)["']`)
+	m := re.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	val := strings.TrimSpace(m[1])
+	for _, op := range []string{">=", "<=", "==", "!=", ">", "<", "~=", "^", "="} {
+		if strings.HasPrefix(val, op) {
+			val = strings.TrimPrefix(val, op)
+			break
+		}
+	}
+	if comma := strings.Index(val, ","); comma >= 0 {
+		val = strings.TrimSpace(val[:comma])
+	}
+	return normalizeVersion(val)
+}
+
+// cliVersionFromGoModDirective mirrors the server-side regex.
+func cliVersionFromGoModDirective(body string) string {
+	re := regexp.MustCompile(`(?m)^\s*go\s+(\d+\.\d+(?:\.\d+)?)\s*$`)
+	m := re.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// runtimeSuggestionFor maps a (framework, version) pair to the
+// closest whitelisted runtime name on the wire (cmd/apid/handlers.go:98).
+// Returns "" when no version is found or the framework is not
+// supported — the caller falls back to the bare error.
+//
+// Fallback policy: when the marker's version is older than the
+// lowest whitelisted runtime (e.g. node20 → node22, python3.11 →
+// python312) we still suggest the closest available — the explicit
+// --runtime flag the customer types MUST be whitelisted, and the
+// marker's intent ("I want node 20") is best served by the closest
+// available. When the version is NEWER than the highest whitelisted
+// runtime (e.g. node26 → highest is node24, hypothetical python3.15
+// → highest is python313) we still suggest the highest available —
+// refusing to lie about a non-existent runtime is moot when the
+// closest is the highest whitelisted entry the customer can actually
+// type. Returning "" only on a totally unparseable version.
+func runtimeSuggestionFor(fw framework, ver string) string {
+	if ver == "" {
+		return ""
+	}
+	majorMinor := strings.SplitN(ver, ".", 3)
+	if len(majorMinor) < 2 {
+		return ""
+	}
+	major, err := strconv.Atoi(majorMinor[0])
+	if err != nil {
+		return ""
+	}
+	// The whitelist (cmd/apid/handlers.go:98) is the source of truth:
+	// node22, node24, python312, python313, go124.
+	switch fw {
+	case fwNode:
+		switch {
+		case major >= 24:
+			return runtimeNode24
+		case major >= 22:
+			return runtimeNode22
+		case major >= 1:
+			// node18, node20, etc. → still suggest the lowest
+			// available (node22). Major >= 1 covers every realistic
+			// Node source — "node0" is not a thing.
+			return runtimeNode22
+		}
+	case fwPython:
+		if major >= 3 {
+			// 3.13 → python313, 3.11 → python312 (still in
+			// whitelist). 3.10, 3.11, 3.12, 3.13 all map to the
+			// closest available. We require minor for the past-
+			// 3.13 disambiguation.
+			minor, mErr := strconv.Atoi(majorMinor[1])
+			if mErr != nil {
+				return ""
+			}
+			if minor >= 13 {
+				return runtimePython313
+			}
+			return runtimePython312
+		}
+	case fwGo:
+		if major >= 1 {
+			// 1.24 → go124. The whitelist only has one Go runtime
+			// today; a 1.25+ suggestion would point to a runtime
+			// that doesn't exist yet, so we require minor >= 24
+			// exactly.
+			minor, mErr := strconv.Atoi(majorMinor[1])
+			if mErr != nil {
+				return ""
+			}
+			if minor >= 24 {
+				return runtimeGo124
+			}
+		}
+	}
+	return ""
+}
+
+// detectNestedMarkerHint returns true if srcDir contains at least one app
+// marker within 2 subdirectory levels of the project root, capturing the
+// common monorepo layout (apps/web/package.json, services/api/go.mod,
+// libs/x/pyproject.toml, frontend/package.json). Used by resolveDeployShape's
+// shapeUnknown branch (issue #744 / ADR-086) to surface a "looks like a
+// workspace" hint pointing the customer at `gregale scan --path .` instead
+// of opening an issue.
+//
+// Cheap on purpose: a recursive os.ReadDir per top-level subdir, capped at
+// depth 2, no file contents read. Excluded subdirs (defaultExcludeDirs —
+// node_modules, .git, vendor, __pycache__ — plus dotfile dirs) are skipped
+// at every depth so a stray node_modules/x/package.json does not
+// false-positive as a workspace.
+//
+// Depth-3+ monorepos (e.g. apps/web/services/api/package.json — three
+// subdirectory levels deep) intentionally return false: the customer gets
+// the existing bare error. Deeper detection belongs to `gregale scan`
+// (pkg/reposcan), which already handles it via the
+// workspaces_extra_test.go "monorepo" fixture. The CLI hint is just a
+// pointer at the next step.
+func detectNestedMarkerHint(srcDir string) bool {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if isExcludedSubdir(e.Name()) {
+			continue
+		}
+		// walkForMarkers(d1, 1) recurses one level into each top-level
+		// subdir, which puts us at depth 2 from the project root — files
+		// at apps/web/package.json are seen; files at
+		// apps/web/services/api/package.json (depth 3) are not.
+		if walkForMarkers(filepath.Join(srcDir, e.Name()), 1) {
+			return true
+		}
+	}
+	return false
+}
+
+// walkForMarkers recurses at most maxDepth levels below dir looking for an
+// app marker. Returns true on the first hit. Excluded subdirs
+// (defaultExcludeDirs + dotfiles) are skipped at every level so a real
+// workspace isn't false-positive-masked by a sibling node_modules tree.
+func walkForMarkers(dir string, maxDepth int) bool {
+	if maxDepth < 0 {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			if isExcludedSubdir(name) {
+				continue
+			}
+			if walkForMarkers(filepath.Join(dir, name), maxDepth-1) {
+				return true
+			}
+			continue
+		}
+		if _, ok := appMarker[strings.ToLower(name)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// isExcludedSubdir reports whether a subdirectory should be skipped at any
+// depth during the nested-marker hint walk (issue #744 / ADR-086). The
+// defaultExcludeDirs set covers build artifacts and VCS metadata; dotfile
+// dirs (e.g. .vscode, .github) are also skipped so a repo with .vscode/
+// doesn't confuse the marker sniff.
+func isExcludedSubdir(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return true
+	}
+	return defaultExcludeDirs[strings.ToLower(name)]
+}
+
+// NestedMarkerHintError wraps a deploy-shape error to carry the
+// "looks like a workspace — try: gregale scan --path ." hint through
+// printErr (issue #744 / ADR-086). The wrapped err is the original
+// shapeUnknown message; Hint is the additional customer-facing line.
+// errors.As extracts the hint in printErr so JSON-mode consumers can
+// programmatically detect it without parsing free-form stderr text.
+type NestedMarkerHintError struct {
+	Dir  string
+	Hint string
+	Err  error
+}
+
+func (e *NestedMarkerHintError) Error() string { return e.Err.Error() }
+func (e *NestedMarkerHintError) Unwrap() error { return e.Err }
+
+// detectShape sniffs the TOP-LEVEL entries of srcDir (no recursion) and returns
+// the deploy shape (issue #737 / ADR-083). The rule:
+//
+//   - shapeFunction: exactly one of {handler.js, handler.ts, handler.py,
+//     handler.go} at the root AND none of the app markers (package.json /
+//     requirements.txt / pyproject.toml / Pipfile / setup.py / go.mod /
+//     Dockerfile). A README.md and dotfiles are ignored — most repos have
+//     them and they don't change the shape.
+//   - shapeApp: any app marker present at the root. App markers always win
+//     over a co-located handler.* — a customer with `package.json +
+//     handler.js` is unambiguously a Node app and must pass --function to
+//     override.
+//   - shapeUnknown: cwd is empty, missing, or contains only excluded files.
+//
+// The detector is intentionally minimal: it mirrors the top-level sniff rule
+// the server's pkg/builderd/detect.go:41-95 applies to the uploaded tarball,
+// so a CLI-detected shape matches what builderd will see on the other end.
+// Files only ever seen during the build (node_modules, .git, __pycache__,
+// vendor) are NOT app markers — the framework detector only counts the
+// "primary" files, and so does shape.
+func detectShape(srcDir string) shape {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return shapeUnknown
+	}
+	var (
+		hasAppMarker bool
+		handlerFile  string // name of the single handler.* if present
+	)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Excluded files (build artifacts, OS junk) are not markers —
+		// they don't change the shape. Match the same set defaultExcludeFiles
+		// uses so behaviour is consistent with what gets packed.
+		if defaultExcludeFiles[name] {
+			continue
+		}
+		// Dotfiles (other than .git, which is excluded above) and
+		// README* are ignored. The customer reads a README on GitHub,
+		// not in a deployable function — and dotfiles (.env,
+		// .dockerignore, .npmrc) are common and not shape-changing.
+		if strings.HasPrefix(name, ".") || strings.HasPrefix(strings.ToLower(name), "readme") {
+			continue
+		}
+		switch strings.ToLower(name) {
+		// Keep in sync with detectFramework's app-marker switch and
+		// pkg/builderd/detect.go:73-82. If you change one, change all.
+		case "package.json", "requirements.txt", "pyproject.toml",
+			"pipfile", "setup.py", "go.mod", "dockerfile":
+			hasAppMarker = true
+		}
+		if functionHandlerFiles[strings.ToLower(name)] {
+			// Second handler.* wins means the shape is ambiguous —
+			// fall through to shapeApp (any co-located handler that
+			// isn't a single, named handler.js signals "this is a
+			// project, not a function").
+			if handlerFile != "" {
+				hasAppMarker = true
+				continue
+			}
+			handlerFile = strings.ToLower(name)
 		}
 	}
 	switch {
-	case hasDocker:
-		return fwDocker
-	case hasNode:
-		return fwNode
-	case hasPython:
-		return fwPython
-	case hasGo:
-		return fwGo
+	case hasAppMarker:
+		return shapeApp
+	case handlerFile != "":
+		return shapeFunction
+	default:
+		return shapeUnknown
 	}
-	return fwUnknown
+}
+
+// inferFunctionRuntime picks the apid runtime + wire handler for a
+// function-shaped repo. The runtime is keyed on the handler file's
+// extension; the wire handler is the literal `handler.handler` value
+// that imaged's function-layer manifest rewrites to /app/<runtime>.js
+// (per the convention at cmd/gregale/templates/function-node/handler.js
+// and defaultTemplateHandler at cmd/gregale/commands2.go:48). The bool
+// is false when the cwd lacks a single, recognised handler file —
+// callers should fall back to shapeUnknown in that case.
+//
+// This is the load-bearing helper that wires detectShape into the
+// cmdDeployTarball flow: detectShape picks shapeFunction, then
+// inferFunctionRuntime fills in runtime + handler for the multipart
+// form. Both default to the same convention the function-* templates
+// force today, so an existing function customer who runs
+// `gregale deploy` against a hand-written handler.js gets the exact
+// same wire shape they would have got via
+// `gregale --template function-node --tarball ...`.
+func inferFunctionRuntime(srcDir string) (runtime, handler string, ok bool) {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return "", "", false
+	}
+	var picked string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if functionHandlerFiles[strings.ToLower(e.Name())] {
+			if picked != "" {
+				return "", "", false // ambiguous — multiple handlers
+			}
+			picked = strings.ToLower(e.Name())
+		}
+	}
+	if picked == "" {
+		return "", "", false
+	}
+	switch strings.ToLower(picked) {
+	case "handler.js", "handler.ts":
+		return runtimeNode22, defaultTemplateHandler, true
+	case "handler.py":
+		return runtimePython312, defaultTemplateHandler, true
+	case "handler.go":
+		return runtimeGo124, defaultTemplateHandler, true
+	}
+	return "", "", false
 }
 
 // zeroConfigSourceCapMB is the conservative per-plan floor used by the
@@ -272,6 +854,107 @@ func copyRegular(tw *tar.Writer, abs string) error {
 			filepath.Base(abs), n, zeroConfigSourceCapMB)
 	}
 	return nil
+}
+
+// buildCreateRequest stamps the issue #737 / ADR-083 fields onto the
+// CreateAppRequest the CLI hands to apid. Lives in commands2.go (next
+// to the caller) so the function-testable wire-shape contract stays
+// in one file; tests in commands2_test.go exercise it directly.
+
+// resolveDeployShape runs the cwd detector and emits the customer-visible
+// "Detected: …" line for issue #737 / ADR-083. The print goes BEFORE the
+// multipart POST so the customer's first response from the CLI is the
+// deploy shape. The explicit --function / --app flags short-circuit the
+// detector (see the mutex check in cmdDeployTarball); this helper assumes
+// they have already been mutex-checked. On shapeUnknown, an actionable
+// error is returned — the caller turns it into a customer-visible
+// printErr. The returned (runtime, handler) are non-empty only on the
+// shapeFunction path; on shapeApp they are empty (server-side Railpack
+// auto-detects). Allocated to live in pack.go (next to detectShape /
+// inferFunctionRuntime) so the unit test exercises both the wire
+// contract and the print line in one place.
+//
+// The print is suppressed when jsonOutput is true: the §3.2 --json
+// contract requires stdout to be a single parseable JSON object, so
+// a freeform "Detected: …" line would corrupt `gregale deploy --json
+// | jq`. The shape is still resolved (the wire shape is the same
+// either way); only the customer-visible banner is gated.
+func resolveDeployShape(srcDir string, explicitFunction, explicitApp, jsonOutput bool) (shape, string, string, error) {
+	detected := detectShape(srcDir)
+	if explicitFunction {
+		detected = shapeFunction
+	} else if explicitApp {
+		detected = shapeApp
+	}
+	switch detected {
+	case shapeUnknown:
+		baseErr := fmt.Errorf(
+			"no deployable source found in %s: expected package.json, requirements.txt / pyproject.toml / "+
+				"Pipfile / setup.py, go.mod, or Dockerfile at the project root for an *app*, "+
+				"OR a single handler.{js,ts,py,go} for a *function* — "+
+				"or pass --image, --tarball, --template, --repo, --function, or --app",
+			filepath.Base(srcDir))
+		// Issue #744 / ADR-086: if the cwd has app markers at depth 1 (a
+		// common monorepo layout — apps/web/package.json, services/api/go.mod),
+		// surface a customer-visible hint pointing at `gregale scan --path .`.
+		// The hint is wrapped in NestedMarkerHintError so printErr can route
+		// it to stderr without corrupting --json stdout. Customers with deep
+		// (depth-3+) monorepos still get the bare error — that's fine, the
+		// reposcan tree handles them via `gregale scan` regardless.
+		if detectNestedMarkerHint(srcDir) {
+			return shapeUnknown, "", "", &NestedMarkerHintError{
+				Dir: filepath.Base(srcDir),
+				Hint: fmt.Sprintf(
+					"Hint: found app markers under subdirectories of %s — this looks like a workspace (monorepo). "+
+						"Run `gregale scan --path .` to decompose it into per-app plans, then apply them individually.",
+					filepath.Base(srcDir)),
+				Err: baseErr,
+			}
+		}
+		return shapeUnknown, "", "", baseErr
+	case shapeFunction:
+		rt, hnd, ok := inferFunctionRuntime(srcDir)
+		if !ok {
+			// Issue #740 / DEPLOY-PROV-5 / ADR-087: when the user
+			// passed --function on a directory that has an app
+			// marker's version file but no handler.{js,ts,py,go} at
+			// the root, surface the marker's version as a runtime
+			// suggestion so the error message is actionable. The
+			// suggestion is best-effort: when no version file is
+			// present, OR the version maps to no whitelisted
+			// runtime (e.g. an unreleased future major), we fall
+			// back to the bare error rather than emit a malformed
+			// `--runtime  --handler ...` arg.
+			suggestion := funcErrorSuggestion(srcDir)
+			return shapeUnknown, "", "", fmt.Errorf(
+				"--function requires a single handler.{js,ts,py,go} at the project root; "+
+					"found zero or ambiguous handler files in %s.%s",
+				filepath.Base(srcDir), suggestion)
+		}
+		// Print uses the inferred values — the caller may still
+		// override them via an explicit --runtime / --handler (out of
+		// scope here, but the CLI does it just after this returns).
+		if !jsonOutput {
+			PrintOK(osStdout, "Detected: function, runtime=%s, handler=%s", rt, hnd)
+		}
+		return shapeFunction, rt, hnd, nil
+	case shapeApp:
+		fw := detectFramework(srcDir)
+		// Issue #740 / DEPLOY-PROV-5 / ADR-087: mirror the
+		// server-side parser in the CLI banner. The version is
+		// informational; the server independently re-derives it
+		// for build_provenance.framework_version.
+		ver := detectFrameworkVersion(srcDir, fw)
+		if !jsonOutput {
+			if ver != "" {
+				PrintOK(osStdout, "Detected: app, framework=%s, version=%s", fw, ver)
+			} else {
+				PrintOK(osStdout, "Detected: app, framework=%s", fw)
+			}
+		}
+		return shapeApp, "", "", nil
+	}
+	return shapeUnknown, "", "", fmt.Errorf("internal: resolveDeployShape fell through")
 }
 
 // autoPackCwd is the zero-config entry point: it packs srcDir into a fresh temp

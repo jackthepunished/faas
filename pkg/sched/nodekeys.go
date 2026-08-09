@@ -1,7 +1,7 @@
 package sched
 
 // nodekeys.go — in-memory registry of (key_id → *ecdsa.PublicKey)
-// populated from the compute_node_keys table (migration 00075).
+// populated from the compute_node_keys table (migration 00076).
 //
 // Background. ADR-053 closes the CapacityReport trust gap:
 // every report carries a 64-byte ECDSA-P-256 (r||s) signature
@@ -195,7 +195,7 @@ func (r *NodeKeyRegistry) Refresh(ctx context.Context) (int, error) {
 // Run drains an already-opened 'compute_node_changed' channel
 // until ctx is cancelled or the channel closes. Each notify
 // triggers a Refresh; the production channel covers both
-// compute_nodes AND compute_node_keys writes (migration 00075's
+// compute_nodes AND compute_node_keys writes (migration 00076's
 // trigger fires on either table), so a single subscription
 // refreshes both lifecycles.
 //

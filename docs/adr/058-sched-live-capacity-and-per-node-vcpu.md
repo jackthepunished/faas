@@ -1,6 +1,9 @@
 # ADR-058 · schedd honours live capacity + per-node vCPU budget (Tier A)
 
-- **Status:** proposed
+- **Status:** accepted v1.0 (2026-08-09). Tier A1 (`Engine.applyLiveCapacityMB`
+  with ledger-floor) and Tier A2 (per-node `compute_nodes.vcpu_budget`,
+  `Request.VCPUBudget`, chooser `usedVCPU` map) both landed; this flip retires
+  ADR-025 v1.1's "Tier 1 Phase 2" pre-requisite together with ADR-053.
 - **Date:** 2026-08-01
 - **Issue:** multi-box audit, Tier A gaps (engine chooser never reads live
   capacity table; vCPU reported but not enforced in placement)

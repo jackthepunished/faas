@@ -685,6 +685,40 @@ func TestStatusForCode_AlertRules(t *testing.T) {
 	}
 }
 
+// TestErrPlanLogArchiveNotAllowed pins the 402 the gatewayd-internal
+// archive read-back handler emits when the customer's plan has
+// LogArchiveEnabled() == false (Free today, issue #562). The
+// shape mirrors TestErrPlanAlertRulesNotAllowed: stable code
+// + a Plan-named detail line. The dashboard surfaces the upsell
+// copy ("upgrade to Hobby or above to query historical logs
+// from object storage") straight from p.Detail.
+func TestErrPlanLogArchiveNotAllowed(t *testing.T) {
+	for _, p := range []Plan{PlanFree, PlanHobby} {
+		t.Run(string(p), func(t *testing.T) {
+			prob := ErrPlanLogArchiveNotAllowed(p)
+			if prob.Status != http.StatusPaymentRequired {
+				t.Errorf("Status = %d, want 402", prob.Status)
+			}
+			if prob.Code != CodePlanLogArchiveNotAllowed {
+				t.Errorf("Code = %q, want %q", prob.Code, CodePlanLogArchiveNotAllowed)
+			}
+			if !strings.Contains(prob.Detail, string(p)) {
+				t.Errorf("Detail = %q, want to name plan %q", prob.Detail, p)
+			}
+		})
+	}
+}
+
+// TestStatusForCode_LogArchive locks the 402 inverse-status mapping
+// for the plan_log_archive_not_allowed code (issue #562 / PR-B).
+// A future drift between CodePlanLogArchiveNotAllowed and the 402
+// gate fires here, not in production.
+func TestStatusForCode_LogArchive(t *testing.T) {
+	if got := StatusForCode(CodePlanLogArchiveNotAllowed); got != http.StatusPaymentRequired {
+		t.Errorf("StatusForCode(%q) = %d, want 402", CodePlanLogArchiveNotAllowed, got)
+	}
+}
+
 // TestStatusForCode_OrgCodes pins the inverse-status table for the
 // 12 IAM-6 / ADR-061 org codes. The cluster is split across 404
 // (slug not found — IDOR convention), 422 (slug shape), 409

@@ -126,7 +126,7 @@ func TestDeployHealthcheckMetal(t *testing.T) {
 	src := NodeFixtureHealthcheck(t)
 	raw, status := postMultipartDeploymentWithOverrides(t, h, key, slug, src, false, &api.CreateDeploymentOverrides{
 		Healthcheck: &api.DeploymentHealthcheck{Path: "/healthz"},
-	})
+	}, "")
 	if status != http.StatusAccepted {
 		t.Fatalf("create deployment: status=%d body=%s", status, raw)
 	}

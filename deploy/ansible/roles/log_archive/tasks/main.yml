@@ -1,0 +1,170 @@
+# log_archive — operator wiring for the issue #562 log archive pipeline.
+#
+# This role is the *post-PR-A* half of issue #562: the in-process
+# shipper (apid, pkg/logarchive) and the bucket-proxy read-back
+# (gatewayd-internal, cmd/gatewayd-internal/app_logs_archive.go) are
+# already wired at the Go level. What ships here is the operator
+# surface that lets those two daemons share a single unsealed
+# credential envelope without each one re-running host.age unseal
+# at boot.
+#
+# Concretely this role:
+#   1. Fail-closed asserts on the operator-provisioned
+#      /etc/faas/secrets/storage-box/archive-creds.json envelope
+#      (mode/owner/group must match the canonical pattern).
+#   2. Creates the local spool root /var/log/faas/archive
+#      (faas:faas, 0750) so the apid shipper has somewhere to
+#      drop .partial files before the upload lands. Spec §11.
+#   3. Drops the gatewayd-internal systemd drop-in
+#      (files/faas-gatewayd-internal.service.d/99-faas-log-archive.conf)
+#      so the read-back handler can LoadCredential the same
+#      envelope apid reads. Mirrors the existing apid drop-in
+#      at control_plane_service/files/faas-apid.service.d/.
+#
+# What this role does NOT do (and why):
+#   * No cron purge unit — the apid shipper's PurgeInterval
+#     ticker (pkg/logarchive/shipper.go:125) already sweeps
+#     the local spool on the same 5-minute cadence the
+#     spec calls for. Adding a second systemd timer would
+#     race the in-process purger on the same files; the
+#     the apid shipper is the canonical owner. The bucket-
+#     side retention is enforced by the customer's plan
+#     (Plan.LogArchiveRetentionDays, plan-gated at the
+#     gatewayd-internal handler — Hobby 7d / Pro 30d /
+#     Scale 90d) and by the S3 lifecycle policy the
+#     operator attaches when the bucket is provisioned
+#     (NOT a faas concern; documented in the runbook).
+#   * No `gregale backup unseal-archive-creds` invocation
+#     here — that CLI ships in PR-A and the operator
+#     runs it once during bootstrap.sh step 11d (mirrors
+#     the unseal-rclone flow at deploy/ansible/roles/
+#     postgres/files/postgresql.service.d/
+#     99-faas-storage-box.conf). This role assumes the
+#     envelope is already on disk; the assert catches
+#     any future perms drift.
+#   * No S3 lifecycle policy attachment — that's an
+#     operator action on the bucket itself; see the
+#     runbook FaasLogArchiveShipperDegraded.md "Bucket
+#     lifecycle policy" section for the recommended shape.
+#
+# Idempotency: `copy` overwrites cleanly; `file` for the spool
+# root is a no-op on a converged box; the asserts are read-only.
+# Re-running produces zero `changed`.
+
+# Fail-closed assert: the archive creds envelope MUST be 0440
+# root:faas. Both the apid shipper and gatewayd-internal's
+# read-back handler read it via systemd's LoadCredential= staging
+# dir (the `$CREDENTIALS_DIRECTORY` the unit exposes at boot).
+# The faas group membership is what lets both daemons — which
+# run as User=faas / Group=faas — traverse the credential
+# without root. Mirrors the postgres_backup role's perms
+# assert at deploy/ansible/roles/postgres_backup/tasks/main.yml
+# :198-225 (same shape, different owner/group pair).
+- name: log_archive — stat archive creds envelope
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/storage-box/archive-creds.json
+  register: log_archive_creds_stat
+  failed_when: false  # chroot/CI may not have /etc/faas/secrets
+
+# Skipped in chroot/CI (no /etc/faas/secrets/ yet). On a real
+# EX44 the bootstrap.sh step that unseals host.age-sealed
+# secrets into the staging dir is required before this role
+# passes — same shape as the postgres_backup perms assert.
+- name: log_archive — assert creds envelope matches perms profile
+  ansible.builtin.assert:
+    that:
+      - log_archive_creds_stat.stat.exists
+      - log_archive_creds_stat.stat.mode == "0440"
+      - log_archive_creds_stat.stat.pw_name == "root"
+      - log_archive_creds_stat.stat.gr_name == "faas"
+    fail_msg: >-
+      /etc/faas/secrets/storage-box/archive-creds.json must be
+      0440 root:faas (issue #562). Re-run `gregale backup
+      unseal-archive-creds` (PR-A CLI leaf) to repopulate from
+      the host.age-sealed form. The faas group membership lets
+      both apid and gatewayd-internal read the envelope via
+      systemd LoadCredential= without root.
+  when: log_archive_creds_stat.stat.exists
+
+# Spec §11: /var/log/faas/archive is the spool root the apid
+# shipper writes .partial files into (pkg/logarchive/spool.go).
+# Owned by faas:faas (the daemon user) so the in-process
+# shipper can mmap + rename + unlink without root. Mode 0750
+# so the faas group can traverse but other users cannot list —
+# the contents reveal customer instance IDs which are
+# account-scoped (spec §11, §13).
+- name: log_archive — create spool root /var/log/faas/archive
+  ansible.builtin.file:
+    path: /var/log/faas/archive
+    state: directory
+    owner: faas
+    group: faas
+    mode: "0750"
+  failed_when: false  # chroot/CI may not have the faas user yet
+
+# Spec §11 sanity check — refuse to claim success if the spool
+# root is world-readable. Same shape as the postgres_backup
+# basebackup-root mode assert. Catches a wrong umask in a
+# future edit of this file.
+- name: log_archive — verify spool root mode (spec §11)
+  ansible.builtin.stat:
+    path: /var/log/faas/archive
+  register: log_archive_spool_stat
+  failed_when: false
+- name: log_archive — assert spool root mode ≤ 0750
+  ansible.builtin.assert:
+    that:
+      - log_archive_spool_stat.stat.exists
+      - log_archive_spool_stat.stat.mode in ["0750", "0700"]
+      - log_archive_spool_stat.stat.pw_name == "faas"
+      - log_archive_spool_stat.stat.gr_name == "faas"
+    fail_msg: "/var/log/faas/archive must be 0750 or tighter, faas:faas (spec §11)"
+  when: log_archive_spool_stat.stat.exists
+
+# Drop the gatewayd-internal systemd drop-in so the read-back
+# handler can LoadCredential the same envelope apid reads.
+# The drop-in is owned by this role (not the gatewayd_service
+# role) so the issue #562 wiring lives in one place; the
+# gatewayd_service role only owns the base unit + TOML.
+- name: log_archive — drop gatewayd-internal archive drop-in
+  ansible.builtin.copy:
+    src: faas-gatewayd-internal.service.d/99-faas-log-archive.conf
+    dest: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-log-archive.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: daemon-reload log_archive
+
+# Spec §11 mode check on the gatewayd-internal drop-in itself.
+# A future edit that flips this to 0644 root:faas (so the faas
+# daemon can read it without going through systemd) would be
+# a security regression — only root should touch unit drop-ins.
+- name: log_archive — verify drop-in mode (spec §11)
+  ansible.builtin.stat:
+    path: /etc/systemd/system/faas-gatewayd-internal.service.d/99-faas-log-archive.conf
+  register: log_archive_dropin_stat
+  failed_when: false
+- name: log_archive — assert drop-in is 0644 root:root
+  ansible.builtin.assert:
+    that:
+      - log_archive_dropin_stat.stat.exists
+      - log_archive_dropin_stat.stat.mode == "0644"
+      - log_archive_dropin_stat.stat.pw_name == "root"
+      - log_archive_dropin_stat.stat.gr_name == "root"
+    fail_msg: >-
+      /etc/systemd/system/faas-gatewayd-internal.service.d/
+      99-faas-log-archive.conf must be 0644 root:root (spec §11).
+      systemd unit drop-ins must not be group-readable to the
+      daemon they configure — the daemon reads the credential
+      via $CREDENTIALS_DIRECTORY, not by reading the unit file.
+  when: log_archive_dropin_stat.stat.exists
+
+# daemon-reload so the gatewayd-internal unit picks up the
+# new LoadCredential= on the next restart. We don't restart
+# the daemon here — `systemctl restart faas-gatewayd-internal`
+# is an operator action (deployed boxes have a customer SLO
+# and the role never silently bounces the edge).
+- name: log_archive — daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+  failed_when: false  # chroot/CI lacks systemd
