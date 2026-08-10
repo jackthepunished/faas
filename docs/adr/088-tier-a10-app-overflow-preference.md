@@ -52,7 +52,7 @@ apid resolves the name to the UUID via the existing
 On Create, the same tri-state applies — `overflow_node` is settable
 at create time.
 
-### Schema (migration 00165)
+### Schema (migration 00167)
 
 ```sql
 alter table apps add column if not exists overflow_node uuid;
@@ -125,7 +125,7 @@ peer).
 
 ## Migrations
 
-- `00165_apps_overflow_node.sql` — adds `apps.overflow_node uuid
+- `00167_apps_overflow_node.sql` — adds `apps.overflow_node uuid
   NULL` + empty-uuid CHECK + FK with `ON DELETE SET NULL` + partial
   index `apps_overflow_node_idx` (NULL excluded).
 
@@ -202,7 +202,7 @@ the customer's `overflow_node` value).
 
 ## Implementation
 
-- Migration `00165_apps_overflow_node.sql` + test.
+- Migration `00167_apps_overflow_node.sql` + test.
 - `state.App.OverflowNode *string` adjacent to `NodeID`.
 - `State.UpdateApp(ctx, id, params)` extended with optional
   `OverflowNode *string` — or a focused

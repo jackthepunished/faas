@@ -41,12 +41,12 @@ func nilStringPtr(s string) *string {
 //
 //   - wire == nil     → ("", nil)              — no preference
 //   - wire == ""      → ("", nil) if !strict   — at PATCH time
-//                     → ("", prob) if strict   — at CREATE time
-//                       (no "clear" path for a fresh row)
+//     → ("", prob) if strict   — at CREATE time
+//     (no "clear" path for a fresh row)
 //   - wire non-empty  → Store.ComputeNodeByName(name)
-//       · ErrNotFound  → 422 invalid_overflow_node
-//       · active=false → 422 invalid_overflow_node
-//       · ok           → (row.ID, nil)
+//     · ErrNotFound  → 422 invalid_overflow_node
+//     · active=false → 422 invalid_overflow_node
+//     · ok           → (row.ID, nil)
 func (s *server) resolveOverflowNode(ctx context.Context, wire *string, strictEmpty bool) (string, *api.Problem) {
 	if wire == nil {
 		return "", nil

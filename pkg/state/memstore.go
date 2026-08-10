@@ -2993,7 +2993,7 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	// with a nil pointer, and "set" when Set is true with a
 	// non-nil pointer. Apid has already validated the UUID
 	// against the empty-uuid CHECK + FK with ON DELETE SET
-	// NULL (migration 00165) before reaching this path; the
+	// NULL (migration 00167) before reaching this path; the
 	// store is a plain column write. Memstore mirrors the
 	// pgstore shape so every test that exercises UpdateApp
 	// sees the same behaviour regardless of backend.

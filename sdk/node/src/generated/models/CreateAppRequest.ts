@@ -37,6 +37,10 @@ export type CreateAppRequest = {
    */
   eviction_priority?: 'best_effort' | 'reserved';
   /**
+   * Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is compute_nodes.name (resolved server-side). Omitted → no preference; empty string at create-time is rejected with 422 invalid_overflow_node because the column starts NULL and there is no 'clear' path at create-time.
+   */
+  overflow_node?: string;
+  /**
    * Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false). Pro/Scale only.
    */
   require_authn?: boolean;

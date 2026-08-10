@@ -1620,7 +1620,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// this path; the store is a plain write. NULL preference
 	// (the A9 default fallback) round-trips via nullString
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
-	// ON DELETE SET NULL (migration 00165) enforce the
+	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::uuid)
@@ -1786,7 +1786,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// this path; the store is a plain write. NULL preference
 	// (the A9 default fallback) round-trips via nullString
 	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
-	// ON DELETE SET NULL (migration 00165) enforce the
+	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23::uuid)
@@ -2655,7 +2655,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- distinguishes "don't touch" (default)
 			   -- from "explicit NULL" (clear — back to A9
 			   -- fallback). The empty-uuid CHECK + the FK
-			   -- with ON DELETE SET NULL (migration 00165)
+			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
 			   overflow_node = case when $47 then $48::uuid else overflow_node end
@@ -10217,7 +10217,7 @@ const appsSelectColumns = `
 	-- Tier A10 / ADR-088: per-app overflow_node preference.
 	-- Nullable UUID; FK to compute_nodes(id) with ON DELETE SET
 	-- NULL cascades the preference to NULL on operator-side
-	-- compute_node deletion (migration 00165). The empty-uuid
+	-- compute_node deletion (migration 00167). The empty-uuid
 	-- CHECK is a tripwire against buggy INSERT paths. NULL
 	-- coerces to the empty string via coalesce so the pgx
 	-- scan sees a string target — the App.OverflowNode field

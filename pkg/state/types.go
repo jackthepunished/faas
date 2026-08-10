@@ -466,13 +466,13 @@ type App struct {
 	// installs preserve bit-for-bit behaviour.
 	NodeID string
 	// OverflowNode is the customer's per-app preferred spill
-	// target (Tier A10, ADR-088, migration 00165). When set, the
+	// target (Tier A10, ADR-088, migration 00167). When set, the
 	// Tier A9 capacity-pressure rebalancer consults it BEFORE
 	// falling back to the first-peer-with-headroom selection.
 	// Nullable: a NULL app is the "no preference" default — the
 	// engine behaves exactly like A9 (random first peer with
 	// headroom, sorted by name ASC). UNSET-uuid is rejected by
-	// apps_overflow_node_chk (migration 00165) as a tripwire
+	// apps_overflow_node_chk (migration 00167) as a tripwire
 	// against buggy INSERT paths. The wire field is the
 	// human-readable compute_nodes.name; apid resolves the name
 	// to the UUID server-side via Store.ComputeNodeByName
@@ -2160,7 +2160,7 @@ type UpdateAppParams struct {
 	// distinguishes "unset" (don't touch the column) from
 	// "explicit NULL" (clear — back to A9 default fallback). The
 	// store is a plain column write; the empty-uuid CHECK +
-	// FK with ON DELETE SET NULL (migration 00165) cover the
+	// FK with ON DELETE SET NULL (migration 00167) cover the
 	// identity + ON-cascade contract.
 	OverflowNode    *string
 	SetOverflowNode bool

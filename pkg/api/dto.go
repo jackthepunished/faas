@@ -231,7 +231,7 @@ type UpdateAppRequest struct {
 	// fallback), non-empty = resolve server-side (404 on unknown
 	// name → 422 invalid_overflow_node; 422 on inactive node).
 	// Resolution is `Store.ComputeNodeByName(name)` → the FK on
-	// apps.overflow_node (migration 00165). Engine consults the
+	// apps.overflow_node (migration 00167). Engine consults the
 	// resolved UUID on the next pressured sweep; falls through to
 	// A9 if the peer has no headroom or is inactive.
 	OverflowNode *string `json:"overflow_node,omitempty"`

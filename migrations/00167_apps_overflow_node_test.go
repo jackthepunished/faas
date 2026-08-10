@@ -1,6 +1,6 @@
 //go:build !no_pg
 
-// Migration-apply tests for 00165 (apps.overflow_node + the
+// Migration-apply tests for 00167 (apps.overflow_node + the
 // apps_overflow_node_chk empty-uuid CHECK + the FK with ON DELETE
 // SET NULL + the partial index apps_overflow_node_idx; Tier A10
 // per-app overflow_node preference, ADR-088).
@@ -48,13 +48,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-// TestMigration_00165_1_ColumnShape pins the apps.overflow_node
-// column shape after 00165 applies. data_type='uuid' +
+// TestMigration_00167_1_ColumnShape pins the apps.overflow_node
+// column shape after 00167 applies. data_type='uuid' +
 // is_nullable='YES'. Any drift (e.g. someone tightening NOT
 // NULL, or typing text instead of uuid) fails loud — the
 // engine relies on the column being nullable so a fresh INSERT
 // with no preference succeeds.
-func TestMigration_00165_1_ColumnShape(t *testing.T) {
+func TestMigration_00167_1_ColumnShape(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -79,12 +79,12 @@ func TestMigration_00165_1_ColumnShape(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_2_AllowsNull pins the no-preference case.
+// TestMigration_00167_2_AllowsNull pins the no-preference case.
 // INSERT a row with overflow_node = NULL; SELECT it back; assert
 // NULL round-trips. The rebalancer's hot path treats a NULL
 // preference as "fall back to first-peer-with-headroom" — so a
 // NULL app must round-trip cleanly.
-func TestMigration_00165_2_AllowsNull(t *testing.T) {
+func TestMigration_00167_2_AllowsNull(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -129,12 +129,12 @@ func TestMigration_00165_2_AllowsNull(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_3_AllowsValidUUID pins the normal
+// TestMigration_00167_3_AllowsValidUUID pins the normal
 // preference-set case. INSERT a row with overflow_node pointing
 // at a real compute_node; SELECT it back; assert the value
 // round-trips. The engine's hot path reads overflow_node on every
 // pressured app; a non-NULL value must round-trip verbatim.
-func TestMigration_00165_3_AllowsValidUUID(t *testing.T) {
+func TestMigration_00167_3_AllowsValidUUID(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -186,13 +186,13 @@ func TestMigration_00165_3_AllowsValidUUID(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_4_RejectsEmptyUUID pins the empty-uuid
+// TestMigration_00167_4_RejectsEmptyUUID pins the empty-uuid
 // tripwire. INSERT a row with overflow_node = the all-zero UUID
 // 00000000-... — a buggy "uninitialised" sentinel; the CHECK
 // must fire and reject with SQLSTATE 23514. Without this guard a
 // future bug could silently route an app to a non-existent
 // compute_node.
-func TestMigration_00165_4_RejectsEmptyUUID(t *testing.T) {
+func TestMigration_00167_4_RejectsEmptyUUID(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -233,12 +233,12 @@ func TestMigration_00165_4_RejectsEmptyUUID(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_5_FKEnforced pins the FOREIGN KEY. INSERT
+// TestMigration_00167_5_FKEnforced pins the FOREIGN KEY. INSERT
 // a row with overflow_node pointing at a non-existent UUID — the
 // FK must fire and reject with SQLSTATE 23503. Without this
 // guard, the engine would observe an overflow_node that no
 // compute_node row matches and silently miss the spill target.
-func TestMigration_00165_5_FKEnforced(t *testing.T) {
+func TestMigration_00167_5_FKEnforced(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -277,7 +277,7 @@ func TestMigration_00165_5_FKEnforced(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_6_OnDeleteSetNull pins the SET NULL
+// TestMigration_00167_6_OnDeleteSetNull pins the SET NULL
 // foreign-key behaviour. When a compute_node referenced by an
 // app's overflow_node is drained (compute_nodes DELETE — a
 // future operator action; today there's an admin endpoint that
@@ -286,7 +286,7 @@ func TestMigration_00165_5_FKEnforced(t *testing.T) {
 // overflow_node reference, NOT error or RESTRICT. Apps whose
 // only preference was the drained node fall through to the
 // first-peer-with-headroom fallback at engine-time.
-func TestMigration_00165_6_OnDeleteSetNull(t *testing.T) {
+func TestMigration_00167_6_OnDeleteSetNull(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -347,14 +347,14 @@ func TestMigration_00165_6_OnDeleteSetNull(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_7_PartialIndex pins the partial-index
+// TestMigration_00167_7_PartialIndex pins the partial-index
 // shape. apps_overflow_node_idx must exist as a btree index
 // over (overflow_node) with a WHERE overflow_node IS NOT NULL
 // predicate. The "NULL excluded" predicate is load-bearing: a
 // NULL-preference app must NOT be in the index (most apps in
 // the fleet do not declare an explicit spill target). Indexing
 // only the non-NULL tail keeps the index narrow.
-func TestMigration_00165_7_PartialIndex(t *testing.T) {
+func TestMigration_00167_7_PartialIndex(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -394,12 +394,12 @@ func TestMigration_00165_7_PartialIndex(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_8_ReplaySafe pins the idempotency
+// TestMigration_00167_8_ReplaySafe pins the idempotency
 // contract. A second MigrateUp() returns nil — every ADD
 // COLUMN is IF NOT EXISTS, every constraint add is paired
 // with a DROP IF EXISTS in the down block, every index add is
 // paired with DROP INDEX IF EXISTS (PR #377 / ADR-041).
-func TestMigration_00165_8_ReplaySafe(t *testing.T) {
+func TestMigration_00167_8_ReplaySafe(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()
@@ -412,12 +412,12 @@ func TestMigration_00165_8_ReplaySafe(t *testing.T) {
 	}
 }
 
-// TestMigration_00165_9_DownSymmetry pins the down path.
+// TestMigration_00167_9_DownSymmetry pins the down path.
 // Drive the SQL the down body carries directly, then re-apply
 // the up body and assert the column + CHECK + FK + index
 // come back. A non-symmetric down would leave a broken schema
-// on a release that needs to roll back 00165 in isolation.
-func TestMigration_00165_9_DownSymmetry(t *testing.T) {
+// on a release that needs to roll back 00167 in isolation.
+func TestMigration_00167_9_DownSymmetry(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 	defer pool.Close()

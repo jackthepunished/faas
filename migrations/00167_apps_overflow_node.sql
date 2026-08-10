@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- filename: 00165_apps_overflow_node.sql
+-- filename: 00167_apps_overflow_node.sql
 --
 -- Tier A10 — per-app overflow_node preference (ADR-088).
 --
