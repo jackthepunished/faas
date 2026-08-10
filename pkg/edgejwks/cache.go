@@ -89,12 +89,12 @@ type Options struct {
 // per-URL mutexes so concurrent Get on distinct URLs don't contend;
 // the registry map itself is guarded by mu.
 type jwksCache struct {
-	mu          sync.Mutex
-	byURL       map[string]*urlEntry
-	httpClient  *http.Client
-	refresh     time.Duration
-	fetchTO     time.Duration
-	onFetchErr  func(url string, err error)
+	mu         sync.Mutex
+	byURL      map[string]*urlEntry
+	httpClient *http.Client
+	refresh    time.Duration
+	fetchTO    time.Duration
+	onFetchErr func(url string, err error)
 }
 
 type urlEntry struct {

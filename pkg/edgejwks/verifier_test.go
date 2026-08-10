@@ -207,8 +207,8 @@ func TestVerify_MissingAudienceSkipped(t *testing.T) {
 		Expiry:   jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
 	}, nil)
 	_, err := v.Verify(context.Background(), tok, edgejwks.VerifierRule{
-		JWKSURL:    url,
-		Issuer:     "https://idp.example.com/",
+		JWKSURL: url,
+		Issuer:  "https://idp.example.com/",
 		// Audience empty → aud check skipped
 		Algorithms: []string{"RS256"},
 	})

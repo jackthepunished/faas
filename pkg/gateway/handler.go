@@ -1267,7 +1267,7 @@ func corsResponseOps(rule *EdgeRuleCORSResolved, allowedOrigin string) []EdgeRul
 // applyEdgeRuleJWT (ADR-091 / issue #561 PR 5) consults the
 // per-host edge-rule matcher for a `kind=jwt` rule. On a hit:
 //   - No Authorization header → 401 (edge_rule.jwt_missing audit
-//     + outcome=missing metric).
+//   - outcome=missing metric).
 //   - Present header but token fails verify → 401
 //     (edge_rule.jwt_failed audit + outcome=failed metric; the
 //     JWTVerifier distinguishes bad-sig / wrong-iss / wrong-aud /

@@ -169,18 +169,18 @@ type EdgeRuleHeadersResolved struct {
 // at create-time so the gateway stamper can trust the input
 // shape.
 type EdgeRuleCORSResolved struct {
-	ID              string
-	AccountID       string
-	AppID           string
-	Priority        int
-	PathGlob        string
-	Methods         map[string]bool
-	AllowOrigins    []string
-	AllowMethods    []string
-	AllowHeaders    []string
-	ExposeHeaders   []string
+	ID               string
+	AccountID        string
+	AppID            string
+	Priority         int
+	PathGlob         string
+	Methods          map[string]bool
+	AllowOrigins     []string
+	AllowMethods     []string
+	AllowHeaders     []string
+	ExposeHeaders    []string
 	AllowCredentials bool
-	MaxAgeSeconds   int
+	MaxAgeSeconds    int
 }
 
 // EdgeRuleJWTResolved is the kind=jwt subset (ADR-091). PR 5 calls

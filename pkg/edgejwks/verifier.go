@@ -26,16 +26,16 @@ import (
 // outcome (jwt_missing / jwt_failed). Keep the messages stable — they
 // end up in slog and customer-facing 401 bodies.
 var (
-	ErrJWKSNotRegistered  = errors.New("edgejwks: jwks_url not registered")
-	ErrJWTMissingToken    = errors.New("edgejwks: missing bearer token")
-	ErrJWTBadSignature    = errors.New("edgejwks: bad signature")
-	ErrJWTExpired         = errors.New("edgejwks: token expired")
-	ErrJWTNotYetValid     = errors.New("edgejwks: token not yet valid")
-	ErrJWTWrongIssuer     = errors.New("edgejwks: issuer mismatch")
-	ErrJWTWrongAudience   = errors.New("edgejwks: audience mismatch")
-	ErrJWTMissingClaim    = errors.New("edgejwks: required claim missing or wrong")
-	ErrJWTWrongAlgorithm  = errors.New("edgejwks: algorithm not in rule vocabulary")
-	ErrJWTNoMatchingKey   = errors.New("edgejwks: no matching kid in jwks")
+	ErrJWKSNotRegistered = errors.New("edgejwks: jwks_url not registered")
+	ErrJWTMissingToken   = errors.New("edgejwks: missing bearer token")
+	ErrJWTBadSignature   = errors.New("edgejwks: bad signature")
+	ErrJWTExpired        = errors.New("edgejwks: token expired")
+	ErrJWTNotYetValid    = errors.New("edgejwks: token not yet valid")
+	ErrJWTWrongIssuer    = errors.New("edgejwks: issuer mismatch")
+	ErrJWTWrongAudience  = errors.New("edgejwks: audience mismatch")
+	ErrJWTMissingClaim   = errors.New("edgejwks: required claim missing or wrong")
+	ErrJWTWrongAlgorithm = errors.New("edgejwks: algorithm not in rule vocabulary")
+	ErrJWTNoMatchingKey  = errors.New("edgejwks: no matching kid in jwks")
 )
 
 // Claims is the parsed subset pkg/gateway surfaces. Subject/Issuer/Aud
