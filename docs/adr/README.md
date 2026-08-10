@@ -86,3 +86,56 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 
 ADR-011 and ADR-012 are required by the UX spec (§11) before git-deploy work
 begins at M7.5; both landed on 2026-07-17 alongside the M7.5 PR open.
+
+## PR-E (2026-08-09) legacy gatewayd narration
+
+PR-E swept the legacy `cmd/gatewayd/` narration across the rest of `docs/adr/`
+by appending a `Superseded (in part, PR-E):` banner immediately after each
+ADR's existing `Status` line (or its existing superseded block). The banner
+points readers at ADR-070 as the source of truth for the
+`gatewayd-public` / `gatewayd-internal` split and notes that any
+`cmd/gatewayd/<file>.go` citations in those bodies are stale.
+
+Files carrying the banner:
+
+- docs/adr/011-thin-dashboard.md
+- docs/adr/012-githubd.md
+- docs/adr/015-unix-socket-auth-v1.md
+- docs/adr/016-vmmd-stats-and-metrics.md
+- docs/adr/018-schedd-grpc-surface.md
+- docs/adr/023-ipv6-egress-policy.md (banner appended after the existing PR-D block)
+- docs/adr/024-certmagic-cutover.md
+- docs/adr/025-decoupled-control-plane-and-compute.md
+- docs/adr/028-gatewayd-remote-routing.md
+- docs/adr/029-apid-compute-nodes-admin.md
+- docs/adr/037-reactive-scaleup-trigger.md
+- docs/adr/040-per-account-rate-limit.md
+- docs/adr/041-tenant-abuse-observability.md
+- docs/adr/042-per-app-metrics-and-cold-boot-rename.md
+- docs/adr/042-webhook-replay-protection.md
+- docs/adr/045-account-scoped-list-endpoints.md
+- docs/adr/046-egress-metering-visibility.md
+- docs/adr/046-pkg-auth-extraction.md
+- docs/adr/047-streaming-response.md
+- docs/adr/052-control-plane-mtls-and-handler-peer-binding.md
+- docs/adr/055-per-host-egress-policy-templating.md
+- docs/adr/056-wire-node-verifier.md
+- docs/adr/062-tier-a-per-node-schedd-and-placement.md
+- docs/adr/064-tier-a4-cross-node-rebalance.md
+- docs/adr/064-wake-timeline-canonical-vocabulary.md
+- docs/adr/066-tier-a5-cross-node-live-migration.md
+- docs/adr/068-issue-517-closure-evidence.md
+- docs/adr/074-warm-snapshot-audit-gc.md
+- docs/adr/075-deploy-1-capdecl-mount-rpc-boundary.md
+- docs/adr/076-session-binding-hash.md
+- docs/adr/078-deploy-2-daemonunit-generator.md
+- docs/adr/079-customer-handler-on-unix-socket-and-h2c.md
+- docs/adr/079-per-app-public-auth.md
+- docs/adr/080-per-app-async-task-queue.md
+- docs/adr/080-raw-bytes-bridge-for-upgrade-traffic.md
+- docs/adr/081-durable-execution-workflows.md
+- docs/adr/083-active-passive-ha-topology.md
+- docs/adr/084-traffic-splitting-pr-c.md
+
+ADR-070 itself is the source of truth for the split and carries an end-of-file
+note instead of the banner.

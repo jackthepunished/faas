@@ -99,13 +99,13 @@ provision:
       # Per-daemon service accounts. vmmd runs the jailed firecracker +
       # chowns the chroot to the per-instance uid range (20000–29999), so
       # /srv/fc, /etc/faas, and the per-daemon config live here.
-      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+      for u in faas faas-apid faas-schedd faas-vmmd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-builderd faas-meterd faas-githubd; do
         if ! id -u "$u" >/dev/null 2>&1; then
           useradd -r -M -s /usr/sbin/nologin "$u"
         fi
       done
       groupadd -f faas || true
-      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd faas-imaged; do
+      for u in faas-apid faas-schedd faas-vmmd faas-gatewayd-internal faas-gatewayd-public faas-imaged faas-builderd faas-meterd faas-githubd; do
         usermod -aG faas "$u" 2>/dev/null || true
       done
       install -d -m 0755 -o root -g root /etc/faas

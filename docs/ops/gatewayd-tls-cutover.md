@@ -1,5 +1,13 @@
 # gatewayd TLS cut-over runbook
 
+> **PR-E note (2026-08-09 — historical archive):** This runbook
+> documents the legacy `cmd/gatewayd/` daemon's TLS cut-over. The
+> cited unit is `faas-gatewayd.service` (deleted in PR-A); the
+> current public ingress is `faas-gatewayd-public.service` (TLS
+> terminates upstream at Caddy + Cloudflare per ADR-070 revision
+> 2026-08-04). Retained for diff archaeology and pre-PR-A operator
+> audit. Do not follow this runbook on a current deployment.
+
 Step-by-step operator procedure for flipping a reference node from plain `:8080`
 (`[tls].disabled = true`) to TLS on `:443` + ACME on `:80` (`disabled =
 false`). Followed by the validation matrix that proves the cut-over is

@@ -1,5 +1,5 @@
 // envhsts.go — tiny package-level helper to parse FAAS_HSTS_ENABLED.
-// Shared between cmd/apid and cmd/gatewayd so the daemon-local
+// Shared between cmd/apid and cmd/gatewayd-internal/so the daemon-local
 // copies don't trip golangci-lint's goconst over the `"true"` /
 // `"false"` literals. Returning bool (not *bool) keeps the call
 // sites simple: `httpsec.SetHSTSEnabled(httpsec.HSTSEnabledFromEnv(getenv))`.

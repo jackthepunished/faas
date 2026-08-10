@@ -1,5 +1,5 @@
 // Package middleware lifts the authentication + authorization
-// middleware out of cmd/apid so cmd/gatewayd (and any future daemon
+// middleware out of cmd/apid so cmd/gatewayd-internal/(and any future daemon
 // that needs to authenticate a customer request) can compose the
 // same chain without duplicating cmd/apid's auth surface.
 //
@@ -22,7 +22,7 @@
 //
 // ADR-046 records the architectural decision. The lift preserves
 // the cmd/apid semantics 1:1 — same 401, same 402, same 403, same
-// audit rows, same headers — so PR-2 (gatewayd AppLogsHandler) and
+// audit rows, same headers — so PR-2 (gatewayd-internal AppLogsHandler) and
 // any future component can depend on pkg/auth without re-deriving
 // the chain.
 //
@@ -67,7 +67,7 @@ import (
 
 // Authenticator is the subset of pkg/state.Store that the
 // authentication middleware needs. Defined here so the concrete
-// store wiring stays in cmd/apid and cmd/gatewayd; pkg/auth doesn't
+// store wiring stays in cmd/apid and cmd/gatewayd-internal/ pkg/auth doesn't
 // import pkg/state's PgStore directly (that would couple auth to a
 // specific store implementation and make unit tests impossible
 // without PG).
@@ -106,7 +106,7 @@ type Sessions interface {
 // requires. The seal accepts AEAD-bound envelopes regardless of DB
 // state; the cross-check against the sessions table is the load-
 // bearing defense against stolen-cookie replay. cmd/apid's
-// *state.Store already provides this; gatewayd's fake store will
+// *state.Store already provides this; gatewayd-internal's fake store will
 // too. The error contract: state.ErrNotFound ⇒ session unknown /
 // revoked (caller maps to 401); any other error is an operational
 // failure (caller logs + 401).
@@ -139,7 +139,7 @@ type AccountHandler func(w http.ResponseWriter, r *http.Request, acct state.Acco
 
 // --- Middleware ----------------------------------------------------------
 
-// Middleware is the auth constructor. cmd/apid and cmd/gatewayd
+// Middleware is the auth constructor. cmd/apid and cmd/gatewayd-internal/
 // each build one from their own dependency set and pass it down to
 // the handler chain.
 //

@@ -4,7 +4,7 @@
 // google.golang.org/grpc metadata package; CorrelationFromIncoming
 // reads it back on the server side. Together they form the bridge
 // that lets a single inbound request_id / wake_id cross from the
-// HTTP edge (gatewayd) through gRPC (schedd → vmmd) and re-attach to
+// HTTP edge (gatewayd-internal) through gRPC (schedd → vmmd) and re-attach to
 // every slog record the downstream daemon emits.
 //
 // Wire shape: the gRPC metadata keys mirror the HTTP header names
@@ -62,7 +62,7 @@ const (
 // appends a second MD layer (gRPC supports nested MD). The first read
 // (in CorrelationFromIncoming) returns the most recent layer. This
 // matters because schedd may add wake_id to a ctx that already carries
-// request_id from gatewayd.
+// request_id from gatewayd-internal.
 func WithCorrelationOutgoing(ctx context.Context, fields CorrelationFields) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
@@ -112,7 +112,7 @@ func WithCorrelationOutgoing(ctx context.Context, fields CorrelationFields) cont
 // middleware; the first/last layer convention is documented in the
 // grpc-go package's FromIncomingContext doc-comment). This is the
 // correct behaviour for an envelope helper: schedd may have added
-// wake_id to a ctx that already carries request_id from gatewayd, and
+// wake_id to a ctx that already carries request_id from gatewayd-internal, and
 // the reader must surface both.
 //
 // Multi-valued MD entries (rare, only produced by proxies that duplicate

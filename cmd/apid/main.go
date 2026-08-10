@@ -143,7 +143,7 @@ func readArchiveCreds(path string) (archiveCreds, error) {
 	return c, nil
 }
 
-// listenAddr is the bind address for apid. Behind gatewayd; not a public
+// listenAddr is the bind address for apid. Behind gatewayd-internal; not a public
 // listener. Overridable via FAAS_APID_LISTEN so the e2e harness can pick a
 // free port without colliding with a dev daemon on 8081.
 var listenAddr = envOr("FAAS_APID_LISTEN", "127.0.0.1:8081")
@@ -222,7 +222,7 @@ func resolveGithubdStagingRoot(getenv func(string) string) string {
 	return "/var/lib/faas/githubd"
 }
 
-// runDeps is the DI seam for run — same pattern as vmmd / gatewayd so we can
+// runDeps is the DI seam for run — same pattern as vmmd / gatewayd-internal so we can
 // exercise the listener lifecycle without binding :8081 from tests.
 type runDeps struct {
 	listen   func(network, addr string) (net.Listener, error)
@@ -430,7 +430,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		go pgBackupPushedSampler.run(ctx)
 		// Webhook replay-dedupe sweep (issue #294). The
 		// webhook_deliveries table is written by all three ingresses
-		// (GitHub via gatewayd, Stripe + Paddle via apid); the TTL
+		// (GitHub via gatewayd-internal, Stripe + Paddle via apid); the TTL
 		// expires_at column + the partial index keep the per-tick
 		// DELETE bounded by (60s tick × ~rows added in that window).
 		// 60s matches the meterd dunning sweep cadence.

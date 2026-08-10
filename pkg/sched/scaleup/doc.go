@@ -14,7 +14,7 @@
 //   - instats: per-instance CPU% from pkg/sched/instancestats.Reader
 //     (PR #205). Nil-safe; if instats is nil, the CPU signal is skipped
 //     and the trigger runs in RPS-only mode.
-//   - promScraper: scrapes gatewayd's /metrics for the per-app RPS
+//   - promScraper: scrapes gatewayd-internal's /metrics for the per-app RPS
 //     signal. Nil-safe; if nil, the trigger no-ops on the RPS path.
 //   - ledger: pkg/sched.NodeLedger.Concurrency(appID) gives the
 //     current per-app live instance count used as the divisor.

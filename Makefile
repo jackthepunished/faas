@@ -179,7 +179,7 @@ test-load: ## Hot-path load test (1k rps, //go:build load) — spec §14 M4 row 
 	$(GO) test -tags=load -race -count=1 -v -timeout=10m ./pkg/gateway/...
 
 .PHONY: gateway-bench
-gateway-bench: ## Bench gatewayd cold/hot/concurrent paths with -race; emits ns/op + allocs/op
+gateway-bench: ## Bench gatewayd-internal cold/hot/concurrent paths with -race; emits ns/op + allocs/op
 	$(GO) test -race -bench=. -benchmem -run=^$ ./pkg/gateway/
 
 .PHONY: test-metal

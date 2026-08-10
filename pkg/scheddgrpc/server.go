@@ -88,7 +88,7 @@ type CapacitySink = sched.CapacitySink
 // goroutine constructs it.
 //
 // Pre-aliased callers (pkg/apislogs.RenderAppLogEvent,
-// pkg/apislogs.RenderAppLogGap, cmd/gatewayd) need no change:
+// pkg/apislogs.RenderAppLogGap, cmd/gatewayd-internal) need no change:
 // scheddgrpc.LogFrame and sched.LogFrame are the same type.
 type LogFrame = sched.LogFrame
 
@@ -480,7 +480,7 @@ func (s *Server) ReportLivenessFailed(ctx context.Context, req *scheddpb.Livenes
 // acceptance #3 + #4) implements the schedd-side half of the
 // per-app log stream. It fans out the per-instance vmmd Logs
 // RPCs into a single server-streaming response so the apid /
-// gatewayd consumer can render one SSE stream per app.
+// gatewayd-internal consumer can render one SSE stream per app.
 //
 // Two phases that mirror the vmmd Logs RPC:
 //
@@ -555,7 +555,7 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 	// RPC (issue #309 / tier-2 DX). Pre-#309 the gateway parsed
 	// these and discarded them with `_ = level; _ = grep`; the
 	// additive proto fields (StreamAppLogsRequest.level/grep,
-	// ADR-016) carry them from gatewayd → schedd and we apply
+	// ADR-016) carry them from gatewayd-internal → schedd and we apply
 	// them at the per-instance fan-out so a single regex
 	// compile / level matcher covers all instances. Both empty
 	// = NoFilter; the gateway already validated the regex and
@@ -688,7 +688,7 @@ func (s *Server) StreamAppLogs(req *scheddpb.StreamAppLogsRequest, stream schedd
 //     (a non-nil sink error from the proto Send, or an unexpected
 //     state from the engine). The gateway consumer freezes its
 //     cache on Unavailable and reconnects — see
-//     cmd/gatewayd/warmhints.go::Run for the policy.
+//     cmd/gatewayd-internal/warmhints.go::Run for the policy.
 //
 // Observability note: the single Observe call below times the
 // entire stream lifetime (open → close), not per-event. Long-

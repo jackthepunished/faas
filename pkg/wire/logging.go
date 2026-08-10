@@ -1,7 +1,7 @@
 // Package wire — logging.go holds the cross-daemon standard slog envelope
 // (issue #517). NewCorrelationLogger attaches the canonical correlation
 // fields to every record a child logger emits, so a single inbound request
-// produces logs across gatewayd → schedd → vmmd that all carry the same
+// produces logs across gatewayd-internal → schedd → vmmd that all carry the same
 // request_id and (on a cold wake) the same wake_id.
 //
 // The envelope is intentionally a thin wrapper around slog.Logger.With so
@@ -83,7 +83,7 @@ type CorrelationFields struct {
 // FromContext returns the correlation fields stored on ctx by the inbound
 // gRPC metadata reader (CorrelationFromIncoming in grpcmetadata.go). The
 // boolean is false when no fields were set; the caller can then either
-// mint a fresh request_id (gatewayd) or pass through (intermediate hops).
+// mint a fresh request_id (gatewayd-internal) or pass through (intermediate hops).
 //
 // Reads via the same context key the metadata helper writes; both helpers
 // live in pkg/wire so the read/write pair stays in lockstep.
@@ -130,7 +130,7 @@ func WithContext(ctx context.Context, fields CorrelationFields) context.Context 
 // An additional "daemon" attribute is always emitted so the operator can
 // filter the aggregate log stream by source daemon without consulting a
 // separate index. daemon is the literal value the caller passes; the
-// cmd/<daemon>/main.go constructors pass "gatewayd", "schedd", "vmmd",
+// cmd/<daemon>/main.go constructors pass "gatewayd-internal", "schedd", "vmmd",
 // "apid", "builderd", "imaged".
 func NewCorrelationLogger(base *slog.Logger, fields CorrelationFields, daemon string) *slog.Logger {
 	if base == nil {

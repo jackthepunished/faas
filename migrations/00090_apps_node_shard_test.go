@@ -22,7 +22,7 @@
 //	4. compute_nodes_schedd_target_url_scheme_chk rejects
 //	   an operator POST that sets a non-(unix|tcp) scheme
 //	   (e.g. "https://..." or "/path/to/sock"); the dial
-//	   layer at gatewayd would panic on a non-canonical
+//	   layer at gatewayd-internal would panic on a non-canonical
 //	   scheme, the CHECK is the tripwire.
 //	5. The default-local row seeded by migration 00024
 //	   carries schedd_target_url = 'unix:///run/faas/schedd.sock'

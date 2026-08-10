@@ -1,7 +1,7 @@
 # FaasWakeLatencyHigh
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_wake_latency_seconds_bucket` (gatewayd `/metrics`).
+Metric: `gateway_wake_latency_seconds_bucket` (gatewayd-internal `/metrics`).
 Spec: §12 (gateway_wake_latency_seconds p95 ≤ 0.8 s target, > 1.5 s warn).
 Severity: warn.
 
@@ -25,7 +25,7 @@ curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=histogram_quantile(0.95,sum(
 ## Check
 
 ```bash
-journalctl -u gatewayd schedd vmmd --since '-15m' --no-pager | grep -iE 'cold.boot|fallback|snapshot'
+journalctl -u gatewayd-internal schedd vmmd --since '-15m' --no-pager | grep -iE 'cold.boot|fallback|snapshot'
 fcvm-snapshot --list 2>/dev/null | head -20  # if fcvm-cli exists
 ```
 

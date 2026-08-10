@@ -1,6 +1,13 @@
 # ADR-012 · `githubd` daemon for GitHub App integration
 
 - **Status:** accepted
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-17
 - **Decision:** Introduce `cmd/githubd/` as a new daemon that owns the GitHub App surface for push-to-deploy (resolves gap G8). githubd owns: (1) push-webhook receiver for `push` events on the production branch, (2) Checks-API status writer (`queued` → `building` → `live`/`failed` with logs link), (3) OAuth callback handler for the install flow, (4) per-repo install-token cache. githubd talks to `apid` over gRPC on `/run/faas/githubd.sock` (mode 0660 group `faas`, ADR-015 unix-socket auth) using the `pkg/githubdgrpc` package (ADR-018 schedd pattern). githubd's own HTTP listener is loopback-only at `127.0.0.1:8083`; the public webhook surface lives on `gatewayd` at `/webhooks/github`, HMAC-verified at the edge, then reverse-proxied to githubd.
 - **Why:** outbound `api.github.com` traffic + Checks-token refresh + webhook signature verification don't fit `apid`'s "customer-intent CRUD" ownership. Mixing them in apid would dilute that ownership and pull api.github.com's latency into apid's hot path. The webhook + Checks flows are background-ish (seconds-to-tens-of-seconds); colocating them in their own daemon with its own goroutine budget is the load-bearing shape (CLAUDE.md: "Components talk via Postgres rows + `pg_notify`, or gRPC on unix sockets"). Least-privilege scope review per §11 (spec §11 line 398): the GitHub App requests only `Contents:read` + `Checks:write` + push webhook — no org-wide access.

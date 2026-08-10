@@ -40,6 +40,9 @@ class CreateDeploymentRequest:
     sidecars: list[Sidecar] | Unset = UNSET
     """Up to 2 stateless sidecars (1 init + 1 sidecar). nil/omitted = no sidecars. See ADR-068 for the hard 2-cap
     and stateless-only contract."""
+    traffic_percent: int | None | Unset = UNSET
+    """Per-deployment traffic-split weight (issue #556 PR-A). nil = server default 100; explicit 0..100 = opt into
+    canary (Pro/Scale only)."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,6 +71,12 @@ class CreateDeploymentRequest:
                 sidecars_item = sidecars_item_data.to_dict()
                 sidecars.append(sidecars_item)
 
+        traffic_percent: int | None | Unset
+        if isinstance(self.traffic_percent, Unset):
+            traffic_percent = UNSET
+        else:
+            traffic_percent = self.traffic_percent
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -79,6 +88,8 @@ class CreateDeploymentRequest:
             field_dict["require_signed"] = require_signed
         if sidecars is not UNSET:
             field_dict["sidecars"] = sidecars
+        if traffic_percent is not UNSET:
+            field_dict["traffic_percent"] = traffic_percent
 
         return field_dict
 
@@ -125,11 +136,21 @@ class CreateDeploymentRequest:
 
                 sidecars.append(sidecars_item)
 
+        def _parse_traffic_percent(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        traffic_percent = _parse_traffic_percent(d.pop("traffic_percent", UNSET))
+
         create_deployment_request = cls(
             image=image,
             overrides=overrides,
             require_signed=require_signed,
             sidecars=sidecars,
+            traffic_percent=traffic_percent,
         )
 
         create_deployment_request.additional_properties = d

@@ -367,9 +367,9 @@ func TestAuthLimit_BlockLogStripsControlChars(t *testing.T) {
 }
 
 // TestAuthLimit_ClientIPFromLoopbackHop_XForwardedFor pins the issue
-// #89 fix: when apid receives a request via the gatewayd → apid
+// #89 fix: when apid receives a request via the gatewayd-internal → apid
 // loopback hop (r.RemoteAddr is loopback), it must key the bucket on
-// the X-Forwarded-For value gatewayd pinned, NOT on the loopback
+// the X-Forwarded-For value gatewayd-internal pinned, NOT on the loopback
 // address. Otherwise every customer's /v1/* traffic collapses to one
 // bucket and one bad actor locks out the cohort.
 //
@@ -392,7 +392,7 @@ func TestAuthLimit_ClientIPFromLoopbackHop_XForwardedFor(t *testing.T) {
 	h := middleware.AuthLimit(cfg)(http.HandlerFunc(gate))
 
 	// Two requests from "different customers" sharing the same
-	// gatewayd loopback hop. Each carries its real IP in
+	// gatewayd-internal loopback hop. Each carries its real IP in
 	// X-Forwarded-For; each must land in its own bucket.
 	fire := func(xff string) int {
 		rec := httptest.NewRecorder()

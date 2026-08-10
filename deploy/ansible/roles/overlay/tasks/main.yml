@@ -9,7 +9,7 @@
 #     provider so the ExecStart= command matches the binary on PATH.
 #   - Both providers write /etc/faas/overlay.env with the authkey
 #     path + hostname, so daemons that need the overlay state
-#     (gatewayd, schedd) can read it without shell-out to
+#     (gatewayd-internal, schedd) can read it without shell-out to
 #     `tailscale status`.
 #   - The role does NOT mint keys or join a tailnet. Operators own
 #     the authkey flow; the role only consumes the authkey file

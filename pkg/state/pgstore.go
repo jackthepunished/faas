@@ -7917,7 +7917,7 @@ func (s *PgStore) UpsertNodeKey(ctx context.Context, nodeID string, keyID string
 // again to reactivate a drained row on the next successful dial. The
 // pg_notify trigger on compute_nodes (operator-visible via
 // pkg/db/notify.NotifyComputeNodeChanged) fires on the UPDATE so
-// gatewayd's per-node client cache can drop/add entries without
+// gatewayd-internal's per-node client cache can drop/add entries without
 // restart.
 func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bool) error {
 	tag, err := s.pool.Exec(ctx,

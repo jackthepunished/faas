@@ -267,17 +267,17 @@ func (l *authLimiter) isLimited(ip string, now time.Time) bool {
 // sockets, tests).
 //
 // Issue #89: apid binds loopback-only (spec §11), so when requests
-// reach apid via the gatewayd → apid loopback hop, r.RemoteAddr is
+// reach apid via the gatewayd-internal → apid loopback hop, r.RemoteAddr is
 // 127.0.0.1:<ephemeral> for every customer and the per-IP bucket
-// collapses to one. gatewayd pins X-Forwarded-For to the real client
-// IP on every /v1/* forward (cmd/gatewayd/proxy.go::proxyToApid). We
+// collapses to one. gatewayd-internal pins X-Forwarded-For to the real client
+// IP on every /v1/* forward (cmd/gatewayd-internal/proxy.go::proxyToApid). We
 // trust the header only when:
 //
 //   - r.RemoteAddr is loopback (127.0.0.0/8 or ::1) — the connection
 //     came from this host, so the only way X-Forwarded-For is set
-//     is by a trusted local proxy (gatewayd). A customer on the
+//     is by a trusted local proxy (gatewayd-internal). A customer on the
 //     public internet cannot reach a loopback hop directly.
-//   - the header carries exactly one IP — gatewayd always sets one
+//   - the header carries exactly one IP — gatewayd-internal always sets one
 //     value; a chain ("a, b") means an upstream proxy is already in
 //     the path and we cannot trust any link in it.
 //
@@ -296,7 +296,7 @@ func defaultClientIP(r *http.Request) string {
 	}
 	if isLoopbackHost(host) {
 		// Loopback hop — try to recover the real client IP from
-		// gatewayd's pin. Only trust the header when it carries
+		// gatewayd-internal's pin. Only trust the header when it carries
 		// exactly one value (see function comment).
 		if v := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); v != "" &&
 			!strings.Contains(v, ",") {

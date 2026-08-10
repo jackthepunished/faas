@@ -2,7 +2,7 @@
 // apid exposes for M7.5 (ADR-011). The decision is to ship a thin Go
 // html/template + HTMX shell — no SPA build chain, no JS framework —
 // so the whole funnel fits inside the 6 GB control-plane slice
-// (spec §13). gatewayd reverse-proxies /dashboard/* and /oauth/* to
+// (spec §13). gatewayd-internal reverse-proxies /dashboard/* and /oauth/* to
 // apid's loopback listener so the §11 single-public-listener invariant
 // stays intact (ADR-011).
 //
@@ -106,7 +106,7 @@ type AppListItem struct {
 	// Finding 6 (issue #314): per-app rate-limit bucket column. The
 	// handler renders a static placeholder ("—" — "not yet wired") at
 	// this PR; the dashboard /v1/internal/quota wiring is the
-	// follow-up that adds the apid→gatewayd loopback dial so a real
+	// follow-up that adds the apid→gatewayd-internal loopback dial so a real
 	// Peek value can land here without going through the self-DoS-ing
 	// public listener. AppID + Plan are pre-supplied as data-attrs on
 	// the cell so the follow-up PR can wire hx-get without re-templating.

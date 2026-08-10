@@ -111,7 +111,7 @@ type Limits struct {
 	IncludedGBHours int   // included GB-RAM-hours per calendar month
 	PriceMillicents int64 // monthly subscription price
 
-	// Edge (gatewayd, spec §4.1).
+	// Edge (gatewayd-internal, spec §4.1).
 	RateLimitRPS   int // token-bucket refill rate
 	RateLimitBurst int // token-bucket burst
 	// RateLimitPerAccountRPM is the per-account requests/minute cap
@@ -495,11 +495,11 @@ type Limits struct {
 	WarmSnapshotMinMsDefault int
 
 	// StreamingEnabled (issue #471) gates the per-app streaming
-	// response path through gatewayd (Flusher + periodic 200 ms /
+	// response path through gatewayd-internal (Flusher + periodic 200 ms /
 	// 256 KiB tx_bytes flush; ADR-047). Free defaults off — the
 	// buffered path is the v1 contract and Free is the abuse-floor
 	// tier where an unbounded stream would let one app monopolise
-	// gatewayd. Hobby/Pro/Scale default on; apid's updateApp handler
+	// the gatewayd-internal process. Hobby/Pro/Scale default on; apid's updateApp handler
 	// rejects Free PATCH with 403 plan_streaming_not_allowed (issue
 	// #471 AC #3). The plan-level default is applied at CreateApp
 	// time via buildApp so a Hobby customer's brand-new app is
@@ -524,7 +524,7 @@ type Limits struct {
 	// Hobby+ to 100 MB so LLM-style streams have headroom). 0 means
 	// "fall back to api.MaxResponseBodyBytesDefault" so an unknown
 	// plan fails closed rather than silently inheriting Free's cap.
-	// gatewayd wraps the response writer in http.MaxBytesWriter at
+	// gatewayd-internal wraps the response writer in http.MaxBytesWriter at
 	// this number; PR-A leaves the writer unused on the buffered
 	// path and PR-B activates it on the streaming path.
 	MaxResponseBodyBytes int64
@@ -626,7 +626,7 @@ type Limits struct {
 	// feature (the abuse-floor tier doesn't need cross-process
 	// log persistence; the ring buffer is enough). Hobby/Pro/
 	// Scale opt in. The plan-level gate is read by apid's
-	// bgBefore wire-up (cmd/apid/main.go) and by the gatewayd
+	// bgBefore wire-up (cmd/apid/main.go) and by the gatewayd-internal
 	// bucket-proxy handler (issue #562 PR-B) so a Free-tier
 	// customer's read-back request returns 402 immediately
 	// without burning a bucket request.
@@ -1160,7 +1160,7 @@ var planLimits = map[Plan]Limits{
 		// Streaming (issue #471 / ADR-047): Pro is paid-tier streaming
 		// — same cap as Hobby. 100 MB / 900 s covers LLM chat
 		// completions and JSON/CSV exports; SaaS-scale apps don't
-		// need a higher cap because gatewayd's per-instance egress
+		// need a higher cap because gatewayd-internal's per-instance egress
 		// bandwidth ceiling (250 Mbit for Scale) is the binding
 		// constraint long before 100 MB matters.
 		StreamingEnabled:            true,
@@ -1588,7 +1588,7 @@ const (
 	// bytes-in is metered separately at the Prometheus layer. The
 	// init frame's max_request_bytes is clamped DOWN to this value
 	// on the vmmd side (callers cannot grow the cap; a Free-plan
-	// gatewayd cannot ask for math.MaxInt64 and disable the cap).
+	// gatewayd-internal cannot ask for math.MaxInt64 and disable the cap).
 	// Mirrors ForwardStreamMaxBodyBytes in pkg/vmmdgrpc (100 MiB on
 	// the same Hobby+ plans) so an LLM-style upgrade stream has
 	// the same headroom.
@@ -1884,6 +1884,53 @@ const (
 	// minute) while keeping the query load negligible.
 	DeadNodeReconcilerIntervalSeconds = 30
 
+	// Tier A9 (capacity-pressure-triggered cross-node app rebalance,
+	// ADR-087 — sibling to the dead-node rebalancer of ADR-064).
+	// Today apps are durably pinned to a single compute_node via
+	// apps.node_id (NOT NULL post-migration 00090). When the owner
+	// node is at capacity but still healthy (active=true), the wake
+	// path returns AtCapacity=true and the customer sees 503 even
+	// though a peer schedd has headroom. Tier A9 closes the gap
+	// with a sustained-pressure watcher that reassigns the app's
+	// apps.node_id to a peer with admission headroom.
+	//
+	// PressureAtCapacityThresholdPerMin is the per-app
+	// AtCapacity-event count over a 60s sliding window that marks
+	// the app as "pressured" and eligible for cross-node reassign.
+	// 5/min is high enough to ignore single-fail GC pauses or a
+	// cold-boot burst, low enough that a sustained customer spike
+	// reassigns within two reassessment sweeps (60s). Tunable via
+	// FAAS_PRESSURE_THRESHOLD_PER_MIN (env-overridable, see
+	// cmd/schedd/main.go::runWithDeps; propagated via
+	// Engine.WithPressureConfig).
+	//
+	// PressureReassessmentIntervalSeconds is the sweep cadence at
+	// which the watcher reconciles the aggregator. 30s matches the
+	// existing rebalancer / router_watcher / dead-node-reconciler
+	// family. A 1s tick would issue 60 identical no-op queries per
+	// app before the threshold could fire. Tunable via
+	// FAAS_PRESSURE_REASSESSMENT_SECONDS.
+	//
+	// PressureMigrationPolicy is the closed-set string that gates
+	// the four-phase live-instance migration (ADR-066) on the
+	// pressure path. Closed set ∈ {skip_live, migrate_after_1,
+	// migrate_after_2}. Default migrate_after_2: cheap parked-only
+	// reassign on the first sustained sweep, expensive live
+	// migration on the second sustained sweep within the same
+	// window. skip_live never migrates live instances (cheap path
+	// only — apps with live instances stay pinned and the customer
+	// sees 503 until the instances drain). migrate_after_1 fires
+	// the live handoff on the first sustained sweep (highest
+	// cost, lowest customer-facing latency). Closed-set validation
+	// lives in cmd/schedd/main.go; bad values panic at startup.
+	// Tunable via FAAS_PRESSURE_MIGRATION_POLICY.
+	//
+	// Hard limits policy (CLAUDE.md): every limit is a constant
+	// here, never inlined.
+	PressureAtCapacityThresholdPerMin   = 5
+	PressureReassessmentIntervalSeconds = 30
+	PressureMigrationPolicy             = "migrate_after_2"
+
 	// Tier A7 (edge split — gatewayd-public / gatewayd-internal,
 	// ADR-070): drain + replica registry + warm-hint-cache tunables.
 	//
@@ -1914,7 +1961,7 @@ const (
 	// FAAS_CERT_SYNC_INTERVAL_SECONDS.
 	//
 	// Legacy daemon only (revised 2026-08-04): the certsync
-	// replicator + this constant are owned by `cmd/gatewayd/` for
+	// replicator + this constant are owned by `cmd/gatewayd-public/` for
 	// the migration window. PR #633 stripped certsync from
 	// `gatewayd-public`; PR-C will sweep the constant + the
 	// `pkg/gateway/certsync` package together once the legacy
@@ -2446,7 +2493,7 @@ func (p Plan) GRPCLivenessAllowed() bool {
 // streaming_enabled column to true (issue #471 / ADR-047). Hobby/Pro/
 // Scale opt in; Free stays off (spec §4.1 baseline; Free is the
 // abuse-floor tier where an unbounded stream would let one app pin
-// gatewayd). The plan-level default is applied at CreateApp time in
+// gatewayd-internal). The plan-level default is applied at CreateApp time in
 // cmd/apid/handlers.go::buildApp; an existing app may still flip the
 // flag via PATCH (gated by StreamingResponseAllowed so Free stays off
 // even when an admin backfills the column). Unknown plans fail closed
@@ -2630,7 +2677,7 @@ func (p Plan) WarmSnapshotMinMsDefault() int {
 // 25 MB) when the plan row's field is unset or the plan is unknown.
 // The default is the strict spec baseline (a guest cannot exceed it);
 // when limits are missing the cap clamps to that baseline rather
-// than dropping to a permissive ceiling. Used by gatewayd to wrap
+// than dropping to a permissive ceiling. Used by gatewayd-internal to wrap
 // the response writer in http.MaxBytesWriter at this number (PR-B
 // activates it on the streaming path; PR-A's buffered path stays
 // under the cap naturally).
@@ -2648,7 +2695,7 @@ func (p Plan) MaxResponseBodyBytes() int64 {
 // ResponseWriteTimeout returns the per-response write timeout for this
 // plan, falling back to ResponseWriteTimeoutDefault (spec §4.1's 300 s)
 // when the plan row's field is unset. Same fail-closed shape as
-// MaxResponseBodyBytes. Used by gatewayd to configure http.Server
+// MaxResponseBodyBytes. Used by gatewayd-internal to configure http.Server
 // .WriteTimeout so a single response cannot pin the listener.
 func (p Plan) ResponseWriteTimeout() time.Duration {
 	l, ok := LimitsFor(p)

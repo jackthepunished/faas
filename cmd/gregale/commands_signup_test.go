@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -258,6 +259,202 @@ func TestCmdSignup_DispatchesFromMain(t *testing.T) {
 	// integration path on the cli_login_test.go family.
 	if dispatchSignup != "signup" {
 		t.Errorf("dispatchSignup = %q, want %q", dispatchSignup, "signup")
+	}
+}
+
+// TestCmdSignup_Interactive_PipeReadsPlain: when stdin is a pipe
+// (testOnlyTTY=false, the CI default), signupInteractive routes the
+// password read through readPasswordLineFrom — the same path the
+// pre-fix code used. This locks in that the TTY-gated silent-echo
+// refactor (G10) does NOT regress the pipe/redirect branch: exit 0,
+// counter.signup == 1, token saved = signupPlaintext. The TTY branch
+// itself (term.ReadPassword) is unreachable from the Go test suite
+// because a pipe fd reports IsTerminal==false; we cover it in a
+// manual smoke step in the PR body.
+func TestCmdSignup_Interactive_PipeReadsPlain(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	// No withTTYForTest — pipeStdin sets osStdin to a non-*os.File
+	// reader, so readInteractivePassword lands in the line-read
+	// branch by virtue of the type assertion failing.
+	pipeStdin(t, "alice@example.com\ncorrect-horse-battery-staple\ncorrect-horse-battery-staple\n")
+
+	if got := cmdSignup(nil); got != 0 {
+		t.Fatalf("cmdSignup exit = %d, want 0 (pipe path regression)", got)
+	}
+	if c := atomic.LoadInt32(&counter.signup); c != 1 {
+		t.Errorf("/v1/auth/signup hit %d times, want 1", c)
+	}
+	if got := readSavedToken(t); got != signupPlaintext {
+		t.Errorf("saved token = %q, want %q", got, signupPlaintext)
+	}
+}
+
+// TestCmdSignup_PasswordStdin_HappyPath: pipe email + password (no
+// confirm), counter.signup == 1, token file written, exit 0. This is
+// the CI-shape smoke.
+func TestCmdSignup_PasswordStdin_HappyPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	pipeStdin(t, "alice@example.com\ncorrect-horse-battery-staple\n")
+
+	if got := cmdSignup([]string{"--password-stdin"}); got != 0 {
+		t.Fatalf("cmdSignup --password-stdin exit = %d, want 0", got)
+	}
+	if c := atomic.LoadInt32(&counter.signup); c != 1 {
+		t.Errorf("/v1/auth/signup hit %d times, want 1", c)
+	}
+	if c := atomic.LoadInt32(&counter.magicLink); c != 0 {
+		t.Errorf("/v1/auth/signup/magic-link hit %d times, want 0", c)
+	}
+	if got := readSavedToken(t); got != signupPlaintext {
+		t.Errorf("saved token = %q, want %q", got, signupPlaintext)
+	}
+}
+
+// TestCmdSignup_PasswordStdin_RejectsShortPassword: auth.Validate
+// fires pre-HTTP. The CI shape is single-shot — a 6-char password
+// hits the same client-side guard as the interactive path. counter.signup
+// must stay at 0.
+func TestCmdSignup_PasswordStdin_RejectsShortPassword(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	rd, restore := captureStderr(t)
+	pipeStdin(t, "alice@example.com\nshort\n")
+	if got := cmdSignup([]string{"--password-stdin"}); got == 0 {
+		t.Errorf("cmdSignup --password-stdin exit = 0, want non-zero (weak password)")
+	}
+	restore()
+	if c := atomic.LoadInt32(&counter.signup); c != 0 {
+		t.Errorf("/v1/auth/signup hit %d times, want 0 (rejected pre-HTTP)", c)
+	}
+	if !strings.Contains(rd.String(), "weak") {
+		t.Errorf("stderr = %q, want 'weak' marker", rd.String())
+	}
+}
+
+// TestCmdSignup_PasswordStdin_MutuallyExclusiveWithEmailOnly: passing
+// both flags must short-circuit before any HTTP call. Neither signup
+// nor magic-link counter may increment.
+func TestCmdSignup_PasswordStdin_MutuallyExclusiveWithEmailOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	rd, restore := captureStderr(t)
+	// No stdin write — neither branch should reach a reader.
+	if got := cmdSignup([]string{"--email-only", "alice@example.com", "--password-stdin"}); got == 0 {
+		t.Errorf("cmdSignup --email-only --password-stdin exit = 0, want non-zero (mutex violation)")
+	}
+	restore()
+	if c := atomic.LoadInt32(&counter.signup); c != 0 {
+		t.Errorf("/v1/auth/signup hit %d times, want 0 (mutex short-circuited)", c)
+	}
+	if c := atomic.LoadInt32(&counter.magicLink); c != 0 {
+		t.Errorf("/v1/auth/signup/magic-link hit %d times, want 0 (mutex short-circuited)", c)
+	}
+	if !strings.Contains(rd.String(), "mutually exclusive") {
+		t.Errorf("stderr = %q, want 'mutually exclusive' marker", rd.String())
+	}
+}
+
+// TestCmdSignup_PasswordStdin_EmptyStdin: email line closes the email
+// read; the password drain then sees EOF with no bytes. signupFromStdin
+// must reject this pre-HTTP rather than POST an empty password.
+func TestCmdSignup_PasswordStdin_EmptyStdin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	rd, restore := captureStderr(t)
+	pipeStdin(t, "alice@example.com\n")
+	if got := cmdSignup([]string{"--password-stdin"}); got == 0 {
+		t.Errorf("cmdSignup --password-stdin exit = 0, want non-zero (empty password)")
+	}
+	restore()
+	if c := atomic.LoadInt32(&counter.signup); c != 0 {
+		t.Errorf("/v1/auth/signup hit %d times, want 0 (empty stdin rejected)", c)
+	}
+	if !strings.Contains(rd.String(), "password") {
+		t.Errorf("stderr = %q, want 'password' marker", rd.String())
+	}
+}
+
+// TestReadInteractivePassword_FallsBackOnNonFile: the helper's TTY
+// gate is `if f, ok := osStdin.(*os.File); ok && term.IsTerminal(int(f.Fd()))`.
+// When osStdin is a non-file reader (pipe, bytes.Buffer, …) the type
+// assertion fails and the helper returns the line it read. This test
+// is the unit-level regression guard for the silent-echo refactor: the
+// helper must NOT crash on a non-file reader, must return the same
+// trimmed line as readPasswordLineFrom, and must NOT print to stderr
+// twice (no trailing newline from the silent-echo branch).
+func TestReadInteractivePassword_FallsBackOnNonFile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	prev := osStdin
+	t.Cleanup(func() { osStdin = prev })
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { r.Close() })
+	osStdin = r
+
+	go func() {
+		defer w.Close()
+		_, _ = w.WriteString("correct-horse-battery-staple\n")
+	}()
+
+	rd, restore := captureStderr(t)
+	defer restore()
+
+	br := bufio.NewReader(osStdin)
+	got, err := readInteractivePassword(br, "Password: ")
+	if err != nil {
+		t.Fatalf("readInteractivePassword: %v", err)
+	}
+	if got != "correct-horse-battery-staple" {
+		t.Errorf("got %q, want %q", got, "correct-horse-battery-staple")
+	}
+	// The line-read branch does NOT print a trailing newline — the
+	// user-typed \n is consumed by br.ReadString('\n') and then
+	// trimmed by strings.TrimRight. Stderr should contain ONLY the
+	// "Password: " prompt, no newline. The silent-echo branch is
+	// the one that prints an extra \n so the next prompt lands on a
+	// fresh line; if we accidentally wired that emit to the non-TTY
+	// path, this assertion would fail.
+	if got := rd.String(); got != "Password: " {
+		t.Errorf("stderr = %q, want %q", got, "Password: ")
 	}
 }
 

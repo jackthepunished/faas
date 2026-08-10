@@ -1,12 +1,12 @@
-// Token / secret loaders for gatewayd (spec §11/G2). The shape mirrors
+// Token / secret loaders for gatewayd-internal (spec §11/G2). The shape mirrors
 // pkg/secretbox.LoadRecipient: stat-check perm bits before reading, fail
 // closed if the file is group/other writable or has any exec/setuid bits.
 //
-// Why this lives in cmd/gatewayd (not pkg/gateway or pkg/secretbox):
+// Why this lives in cmd/gatewayd-internal (not pkg/gateway or pkg/secretbox):
 //
 //   - pkg/gateway is a shared lib — importing pkg/secretbox from it would
 //     force every consumer (test binaries, alternate frontends) to take
-//     pkg/secretbox's deps. Putting the loader in cmd/gatewayd keeps
+//     pkg/secretbox's deps. Putting the loader in cmd/gatewayd-internal keeps
 //     pkg/gateway free of the 0400 perm-check dependency.
 //   - pkg/secretbox is age-specific; the Hetzner token is a plain bearer
 //     token and doesn't share the age X25519 shape.

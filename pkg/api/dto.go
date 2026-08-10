@@ -116,8 +116,8 @@ type UpdateAppRequest struct {
 	// Values outside [1, 100] return 422 CodeInvalidAutoscaleTargetCPUPct.
 	AutoscaleTargetCPUPct *int `json:"autoscale_target_cpu_pct,omitempty"`
 	// StreamingEnabled (issue #471) toggles the per-app streaming
-	// response path through gatewayd. When true (or unset on a plan
-	// where the default is true), gatewayd streams the response body
+	// response path through gatewayd-internal. When true (or unset on a plan
+	// where the default is true), gatewayd-internal streams the response body
 	// from the guest through to the client with a periodic 200 ms /
 	// 256 KiB tx_bytes flush; when false, the legacy buffered path
 	// runs (spec §4.1: 25 MB / 300 s). Plan-gated upstream: Free
@@ -1095,6 +1095,42 @@ type BuildProvenanceResponse struct {
 	FrameworkVer   string `json:"framework_version"`
 }
 
+// BuildResponse is the public surface of a builds row (DEPLOY-PROV-6 /
+// ADR-089, issue #741). Companion to BuildProvenanceResponse (post-
+// mortem export, ADR-038) and the /sbom route (post-mortem blob,
+// ADR-038 Phase 3): BuildResponse is the LIFECYCLE surface — status,
+// timestamps, failure_class, server-computed duration.
+//
+// Status mirrors builds.status, a 4-state enum (queued|running|
+// succeeded|failed) — schema.sql:662 CHECK constraint. 'cancelled'
+// from the original issue example is intentionally absent; the
+// schema doesn't support it and no transition code exists. Adding
+// it requires a separate migration + builderd path.
+//
+// failure_class is empty unless status='failed'; the failure_class
+// CHECK constraint is oom|timeout|user_error|infra (schema.sql:660).
+// error_message is NOT in this response — the detailed per-failure
+// string lives on deployments.error_message; clients that need it
+// should call GetDeployment(deployment_id). ADR-089 §4.
+//
+// duration_seconds is server-computed (FinishedAt-StartedAt) only
+// when both timestamps are set; the field is omitted otherwise so a
+// queued/running build stays minimal. CI scripts shouldn't have to
+// parse RFC3339 to compute elapsed time.
+type BuildResponse struct {
+	ID              string `json:"id"`
+	DeploymentID    string `json:"deployment_id"`
+	Kind            string `json:"kind"` // railpack|dockerfile|tarball|github
+	SourceBytes     int64  `json:"source_bytes"`
+	Status          string `json:"status"` // queued|running|succeeded|failed
+	FailureClass    string `json:"failure_class,omitempty"`
+	LogPath         string `json:"log_path,omitempty"`
+	EnqueuedAt      string `json:"enqueued_at"`
+	StartedAt       string `json:"started_at,omitempty"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	DurationSeconds int    `json:"duration_seconds,omitempty"`
+}
+
 // DeploymentResponse is a deployment as returned by the API.
 type DeploymentResponse struct {
 	ID          string `json:"id"`
@@ -1985,16 +2021,78 @@ type StorageUsageListResponse struct {
 }
 
 // BillingPortalResponse is the wire shape for GET /v1/billing/portal
-// (issue #253). URL is the operator-configured billing portal link —
-// today: FAAS_BILLING_PORTAL_URL with `{account_id}` substituted.
-// Empty URL is a 200 (the request itself succeeded); it is the
-// "absent" sentinel meaning the box has no portal configured and
-// the CLI should print a friendly hint instead of opening the
-// browser to "". The field is omitempty so an unset URL on a Free
-// account does not surface as JSON null in either the dashboard's
-// SSR page or the SDK response.
+// (issue #253, extended in issue #242). URL is the operator-configured
+// billing portal link — today: FAAS_BILLING_PORTAL_URL with
+// `{account_id}` substituted. Empty URL is a 200 (the request itself
+// succeeded); it is the "absent" sentinel meaning the box has no
+// portal configured and the CLI should print a friendly hint instead
+// of opening the browser to "". The field is omitempty so an unset URL
+// on a Free account does not surface as JSON null in either the
+// dashboard's SSR page or the SDK response.
+//
+// PaymentMethod (issue #242) carries the canonical card-on-file summary
+// so the CLI's `faas billing payment-method` subcommand and the
+// dashboard's billing page both render from the same round-trip.
+// Field is omitempty; Free / no-card-on-file responses carry no
+// payment_method key.
 type BillingPortalResponse struct {
-	URL string `json:"url,omitempty"`
+	URL           string                `json:"url,omitempty"`
+	PaymentMethod *PaymentMethodSummary `json:"payment_method,omitempty"`
+}
+
+// PaymentMethodSummary is the provider-agnostic card-on-file summary
+// (issue #242). Both Stripe (PaymentMethods.List) and Paddle
+// (Customer.Get carries payment_method) reduce to this shape at the
+// provider boundary in pkg/billing/; the conversion lives behind
+// billing.Provider.PaymentMethodSummary so neither provider's
+// internal field names leak onto the wire. Brand is the lowercase
+// card brand (visa, mastercard, amex, …) per the Stripe convention
+// Paddle mirrors; empty when unknown.
+//
+// Last4 is the trailing 4 digits of the PAN. ExpMonth / ExpYear carry
+// the card expiry as integers (1..12 / 4-digit). Zero values are the
+// "unknown" sentinel — Free / no-card-on-file clients see all-zero
+// fields; the CLI renders the zero as the "no payment method on file"
+// CTA.
+type PaymentMethodSummary struct {
+	Brand    string `json:"brand"`
+	Last4    string `json:"last4"`
+	ExpMonth int    `json:"exp_month"`
+	ExpYear  int    `json:"exp_year"`
+}
+
+// BillingRetryResponse is the wire shape for POST /v1/billing/retry
+// (issue #242). AttemptID is the provider-side handle for the new
+// charge attempt (Stripe `in_…` invoice id; Paddle `txn_…` transaction
+// id). ProviderRefID is the underlying payment-intent id or merchant
+// transaction reference for ops debugging. Status is the provider's
+// last-known status at the time of the call — the Stripe / Paddle
+// webhook will fill in the final state asynchronously. NextBillingAt
+// is the next scheduled billing-cycle timestamp (RFC 3339); null when
+// the retry does not advance the cycle.
+//
+// All integer money paths use int64 millicents at the SDK boundary
+// (pkg/billing/), but this DTO does not carry money — the amount was
+// already locked in at the original subscription or charge. Currency
+// comes from the provider's catalog, not the retry call.
+type BillingRetryResponse struct {
+	AttemptID     string     `json:"attempt_id"`
+	ProviderRefID string     `json:"provider_ref_id"`
+	Status        string     `json:"status"`
+	NextBillingAt *time.Time `json:"next_billing_at"`
+}
+
+// BillingCancelResponse is the wire shape for POST /v1/billing/cancel
+// (issue #242). The cancel is scheduled, not immediate — the account
+// keeps the current plan until `effective_at`, then downgrades to Free
+// on the next dunning tick. EffectiveAt is Stripe's `current_period_end`
+// or the account's period-end timestamp on Paddle; rendered in --json
+// as an RFC 3339 string. CancelScheduled is always true on 200 (the
+// HTTP 200 is itself the contract) but the field is preserved so
+// --json scripts can branch on it without parsing the response status.
+type BillingCancelResponse struct {
+	CancelScheduled bool      `json:"cancel_scheduled"`
+	EffectiveAt     time.Time `json:"effective_at"`
 }
 
 // APIKeyExportResponse is one row in the export's API key slice.

@@ -19,7 +19,7 @@ will trip this alert, while a daemon that's idle but alive will not.
 
 ```bash
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=up{job=~"apid|gatewayd|schedd|vmmd|imaged|builderd|meterd|githubd"}'
-systemctl status faas-apid faas-gatewayd faas-schedd faas-vmmd faas-imaged faas-builderd faas-meterd faas-githubd
+systemctl status faas-apid faas-gatewayd-public faas-gatewayd-internal faas-schedd faas-vmmd faas-imaged faas-builderd faas-meterd faas-githubd
 ```
 
 ## Check

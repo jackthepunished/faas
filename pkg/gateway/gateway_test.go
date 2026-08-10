@@ -225,7 +225,7 @@ func TestLimiterForgetAccount(t *testing.T) {
 }
 
 // TestNewLimiterWithClock covers the test-only clock-injection seam used by
-// cmd/gatewayd/backend_test.go for the 1001-request acceptance (issue #292).
+// cmd/gatewayd-internal/backend_test.go for the 1001-request acceptance (issue #292).
 func TestNewLimiterWithClock(t *testing.T) {
 	clock := time.Now()
 	l := NewLimiterWithClock(func() time.Time { return clock })

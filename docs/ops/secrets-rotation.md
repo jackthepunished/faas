@@ -11,17 +11,17 @@ response, not as scheduled maintenance).
 CertMagic uses the Hetzner DNS API to write `_acme-challenge` TXT
 records for the wildcard `*.apps.gregale.dev` cert and on-demand
 HTTP-01-challenged custom-domain certs. The token is read once at
-gatewayd startup from `/etc/faas/secrets/hetzner-dns.token` and held
+gatewayd-public startup from `/etc/faas/secrets/hetzner-dns.token` and held
 in process memory for the daemon's lifetime; **token rotation today
-requires a `systemctl restart faas-gatewayd`** because the
-`loadSecretFile` seam (cmd/gatewayd/secrets.go) is single-shot. A
+requires a `systemctl restart faas-gatewayd-public`** because the
+`loadSecretFile` seam (cmd/gatewayd-public/secrets.go) is single-shot. A
 file-watch reload is a follow-up.
 
 - **Owner:** platform team rotation list, PagerDuty schedule
   `faas-platform-oncall`.
 - **Cadence:** 90 days.
 - **Storage:** `/etc/faas/secrets/hetzner-dns.token`, mode `0440`,
-  owner `root:faas`. The perm check in `cmd/gatewayd/secrets.go`
+  owner `root:faas`. The perm check in `cmd/gatewayd-public/secrets.go`
   refuses to start the daemon if the file is group/other-writable or
   has any exec/setuid/setgid bits.
 - **Source of truth:** Hetzner Cloud Console → Project → Security →
@@ -32,7 +32,7 @@ file-watch reload is a follow-up.
 ### Procedure
 
 1. Generate a new token in the Hetzner Cloud Console. Label it
-   `gatewayd-prod-YYYY-MM-DD` so the rotation history is auditable.
+   `gatewayd-public-prod-YYYY-MM-DD` so the rotation history is auditable.
 2. Install it on the reference node:
 
    ```sh
@@ -47,11 +47,11 @@ file-watch reload is a follow-up.
    # expect: 440 root:faas
    ```
 
-4. Restart gatewayd:
+4. Restart the public-edge daemon:
 
    ```sh
-   sudo systemctl restart faas-gatewayd
-   sudo journalctl -u faas-gatewayd -f
+   sudo systemctl restart faas-gatewayd-public
+   sudo journalctl -u faas-gatewayd-public -f
    # expect: "public listening (TLS) addr=:443" within ~5 s
    ```
 
@@ -74,7 +74,7 @@ zone), reinstall the previous token and restart:
 ```sh
 sudo install -m 0440 -o root -g faas /dev/stdin \
     /etc/faas/secrets/hetzner-dns.token <<<"$OLD_HETZNER_DNS_TOKEN"
-sudo systemctl restart faas-gatewayd
+sudo systemctl restart faas-gatewayd-public
 ```
 
 CertMagic leaves any issued certs in `/var/lib/faas/certs/`; they're
@@ -105,8 +105,8 @@ token has lost write authority.
 - **`apid session secret`** — generated at apid install time, lives in
   apid's TOML. Rotated only if leaked; invalidates every active
   customer session.
-- **GitHub App webhook secret** — loaded into gatewayd's env at
-  startup (`loadGithubWebhookSecret` in cmd/gatewayd/main.go).
+- **GitHub App webhook secret** — loaded into gatewayd-public's env at
+  startup (`loadGithubWebhookSecret` in cmd/gatewayd-public/main.go).
   Rotation cadence: same as the GitHub App's own private key (annual
   or under incident). Restart required.
 - **Stripe API key** — lives in meterd's env. Rotation cadence: on

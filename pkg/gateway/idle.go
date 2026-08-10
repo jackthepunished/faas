@@ -42,7 +42,7 @@ type LastSeenSink interface {
 	Flush(ctx context.Context) error
 }
 
-// MemoryLastSeen is the in-memory LastSeenSink used by gatewayd until schedd
+// MemoryLastSeen is the in-memory LastSeenSink used by gatewayd-internal until schedd
 // lands its PG-flushing implementation. Safe for concurrent use.
 type MemoryLastSeen struct {
 	mu sync.Mutex

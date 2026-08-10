@@ -27,7 +27,7 @@ ReadWritePaths=/etc/faas/secrets /run/faas /srv/fc /var/log/faas
 # even though `ss -lnx` shows the LISTEN entry (run 30839233808).
 #
 # This unit is the SOLE owner of /run/faas on disk. schedd and
-# gatewayd do NOT declare RuntimeDirectory=faas — when systemd sees
+# gatewayd-internal does NOT declare RuntimeDirectory=faas — when systemd sees
 # RuntimeDirectory=faas on multiple units, only the first one to
 # start gets its bind-mount propagated to the host /run; the others
 # silently fall through to writing into the existing dirent, which

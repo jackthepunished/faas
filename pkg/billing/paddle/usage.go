@@ -8,6 +8,7 @@ import (
 
 	"github.com/PaddleHQ/paddle-go-sdk/v5"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -130,15 +131,30 @@ func calendarMonthStart(t time.Time) time.Time {
 type FlushFn func(ctx context.Context, p *Provider, acct state.Account, windowStart time.Time, mbSeconds int64) error
 
 // defaultFlushLocked is the production FlushFn: looks up the
-// overage price handle for the account's plan, posts a quantity-1
-// Transactions line item with the (acct, windowStart)
-// Idempotency-Key stamped into CustomData AND forwarded as a
-// transport-level Idempotency-Key HTTP header via the wrapper at
-// transport.go.
+// overage price handle for the account's plan, computes the
+// integer wire quantity for the (account, window) push via
+// billing.WireQuantityForMBSeconds, and posts a single Transactions
+// line item with that quantity.
 //
-// The Idempotency-Key injection happens via the SDK's
-// ContextWithTransitID (which the SDK stamps as X-Transit-Id on
-// the outbound request); our RoundTripper at transport.go reads
+// Wire quantity: billing.WireQuantityForMBSeconds(mbSeconds). The
+// same integer formula Stripe uses (pkg/billing/stripe/usage.go),
+// shared via pkg/billing/plans.go so the two providers cannot drift.
+// The overage price handle's UnitPrice.Amount is
+// millicentsToPaddleAmount(billing.PlanOverageMillicentsPerGBHour())
+// = "1" (one cent), so a push of N wire units bills N/1000 of a
+// cent for the overage line — the unit-multiplication that was
+// missing before this PR (Paddle was posting Quantity=1, which
+// silently under-billed every account by ~250× for the canonical
+// Hobby 24h case: 6_187 wire units vs 1).
+//
+// CustomData["mb_seconds"] is retained for the operator audit trail
+// (the merchant dashboard renders the integer sum alongside the wire
+// line item so a finance-ops reviewer can reconcile). The wire
+// Quantity is the billable value; CustomData is documentation.
+//
+// Idempotency: the (acct, windowStart) Idempotency-Key is stamped via
+// ContextWithTransitID (which the SDK forwards as X-Transit-Id on
+// the outbound request); the RoundTripper at transport.go reads
 // X-Transit-Id and copies it as Idempotency-Key on POST /transactions.
 // Paddle's API server may not honor the header today (SDK team is
 // working on native support); the header is observable on the
@@ -149,6 +165,16 @@ type FlushFn func(ctx context.Context, p *Provider, acct state.Account, windowSt
 // aggregated by month — this matches the operator-visible billing
 // model and is independent of the per-window dedupe grain.
 func defaultFlushLocked(ctx context.Context, p *Provider, acct state.Account, windowStart time.Time, mbSeconds int64) error {
+	if mbSeconds < 0 {
+		// Defensive guard — PushUsageRecord's pre-SDK guards already
+		// short-circuit on negative mb_seconds (provider.go:319-321),
+		// but a future caller that bypasses PushUsageRecord (tests,
+		// backfills) would otherwise see WireQuantityForMBSeconds
+		// truncate a negative toward zero and silently drop the line.
+		// Use the same sentinel so the classifier at errors.go
+		// renders the same Prometheus label as the entry-point path.
+		return fmt.Errorf("%w (account %s, qty %d)", ErrNegativeMBSeconds, acct.ID, mbSeconds)
+	}
 	priceID := p.overagePriceForPlan(acct.Plan)
 	if priceID == "" {
 		return fmt.Errorf("%w (plan=%s)", ErrOveragePriceMissing, acct.Plan)
@@ -156,6 +182,8 @@ func defaultFlushLocked(ctx context.Context, p *Provider, acct state.Account, wi
 	monthStr := calendarMonthString(windowStart)
 	idem := fmt.Sprintf("faas-overage-%s-%s", acct.ID, windowStart.Format(time.RFC3339))
 	customerID := acct.ProviderCustomerID // acct.ProviderCustomerID carries Stripe cus_… or Paddle ctm_… — same column, provider-discriminated by value shape per ADR-032.
+
+	qty := billing.WireQuantityForMBSeconds(mbSeconds)
 
 	// Stamp the transit ID on the context. The SDK's internal/client
 	// (client.go:98-101) reads this and sets X-Transit-Id on the
@@ -165,12 +193,12 @@ func defaultFlushLocked(ctx context.Context, p *Provider, acct state.Account, wi
 	// header + the CustomData field.
 	ctx = paddle.ContextWithTransitID(ctx, idem)
 
-	_, err := p.client.CreateTransaction(ctx, &paddle.CreateTransactionRequest{
+	req := &paddle.CreateTransactionRequest{
 		CustomerID: &customerID,
 		Items: []paddle.CreateTransactionItems{{
 			TransactionItemFromCatalog: &paddle.TransactionItemFromCatalog{
 				PriceID:  priceID,
-				Quantity: 1,
+				Quantity: int(qty),
 			},
 		}},
 		CustomData: paddle.CustomData{
@@ -180,7 +208,26 @@ func defaultFlushLocked(ctx context.Context, p *Provider, acct state.Account, wi
 			"mb_seconds":           fmt.Sprintf("%d", mbSeconds),
 			"faas_paddle_idem_key": idem,
 		},
-	})
+	}
+
+	// Test-seam: append the wire-quantity row before the SDK POST so
+	// a recorder-driven test observes what *would* be posted. nil
+	// recorder → no-op. Mirrors the FlushFn stub (which intercepts
+	// before the SDK is touched) without replacing the production
+	// body — the seam answers a different question: not "what error
+	// did the SDK return?" but "what quantity did we bill?".
+	p.flushRecorderMu.Lock()
+	if p.flushRecorder != nil {
+		p.flushRecorder = append(p.flushRecorder, RecordedFlush{
+			AccountID:   acct.ID,
+			WindowStart: windowStart,
+			MBSeconds:   mbSeconds,
+			Quantity:    qty,
+		})
+	}
+	p.flushRecorderMu.Unlock()
+
+	_, err := p.client.CreateTransaction(ctx, req)
 	if err != nil {
 		return fmt.Errorf("paddle: CreateTransaction: %w", err)
 	}

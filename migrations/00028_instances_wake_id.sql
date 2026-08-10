@@ -6,7 +6,7 @@
 -- x-faas-request-id, which is per-HTTP-request — every cold-wake
 -- boundary mints a new one even for "the same wake". This column
 -- is stamped by schedd at the Wake() Phase 2 INSERT (engine.go:254)
--- before vmmd is called; gatewayd propagates it back to the client
+-- before vmmd is called; gatewayd-internal propagates it back to the client
 -- as x-faas-wake-id and the dashboard / CLI surface it.
 --
 -- Distinct from instances.id (the row PK, gen_random_uuid() at INSERT):

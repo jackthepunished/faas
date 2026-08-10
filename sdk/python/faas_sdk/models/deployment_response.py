@@ -97,6 +97,9 @@ class DeploymentResponse:
     parked_at: datetime.datetime | None | Unset = UNSET
     """Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for
     never-parked deployments."""
+    traffic_percent: int | Unset = UNSET
+    """Per-deployment traffic-split weight (issue #556 PR-A). Summed across live rows for the app = 100 by
+    construction."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +207,8 @@ class DeploymentResponse:
         else:
             parked_at = self.parked_at
 
+        traffic_percent = self.traffic_percent
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -248,6 +253,8 @@ class DeploymentResponse:
             field_dict["parked_reason"] = parked_reason
         if parked_at is not UNSET:
             field_dict["parked_at"] = parked_at
+        if traffic_percent is not UNSET:
+            field_dict["traffic_percent"] = traffic_percent
 
         return field_dict
 
@@ -435,6 +442,8 @@ class DeploymentResponse:
 
         parked_at = _parse_parked_at(d.pop("parked_at", UNSET))
 
+        traffic_percent = d.pop("traffic_percent", UNSET)
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -458,6 +467,7 @@ class DeploymentResponse:
             scan=scan,
             parked_reason=parked_reason,
             parked_at=parked_at,
+            traffic_percent=traffic_percent,
         )
 
         deployment_response.additional_properties = d

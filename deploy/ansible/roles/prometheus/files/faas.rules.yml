@@ -217,7 +217,7 @@ groups:
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasBuildQueueBacklog.md"
 
       # ─────────────────────────────────────────────────────────────────
-      # Gateway wake latency p95 (gatewayd)
+      # Gateway wake latency p95 (gatewayd-internal)
       # Spec §12 row: "gateway_wake_latency_seconds p95 ≤ 0.8s target, > 1.5s warn".
       # ─────────────────────────────────────────────────────────────────
       - alert: FaasWakeLatencyHigh
@@ -225,7 +225,7 @@ groups:
         for: 10m
         labels:
           severity: warn
-          component: gatewayd
+          component: gatewayd-internal
           family: wake_latency
         annotations:
           summary: "Gateway wake p95 > 1.5s"
@@ -278,7 +278,7 @@ groups:
         for: 10m
         labels:
           severity: page
-          component: gatewayd
+          component: gatewayd-internal
           family: api_availability
         annotations:
           summary: "API availability < 99.5% (rolling 5m)"
@@ -575,7 +575,7 @@ groups:
           runbook_url: "https://github.com/poyrazK/faas/blob/main/docs/runbooks/FaasTrafficAnomaly.md"
 
       # ─────────────────────────────────────────────────────────────────
-      # TLS cert expiry (gatewayd / gateway_tls_cert_expiry_seconds).
+      # TLS cert expiry (gatewayd-public / gateway_tls_cert_expiry_seconds).
       # ADR-024 H3 closure: page at ≤14 days, warn between 14 and 30.
       # The gauge carries min(notAfter − now) across cached certs on
       # cfg.StorageDir/certificates/...; first-mint pre-boot state is
@@ -593,7 +593,7 @@ groups:
         for: 5m
         labels:
           severity: page
-          component: gatewayd
+          component: gatewayd-public
           family: tls_cert_expiry
         annotations:
           summary: "TLS cert expires in ≤14 days"
@@ -605,7 +605,7 @@ groups:
         for: 5m
         labels:
           severity: warn
-          component: gatewayd
+          component: gatewayd-public
           family: tls_cert_expiry
         annotations:
           summary: "TLS cert expiry < 30 days"
@@ -627,7 +627,7 @@ groups:
         for: 5m
         labels:
           severity: page
-          component: gatewayd
+          component: gatewayd-public
           family: tls_cert_expiry
           hostname: "{{ $labels.hostname }}"
           kind: "{{ $labels.kind }}"
@@ -641,7 +641,7 @@ groups:
         for: 10m
         labels:
           severity: warn
-          component: gatewayd
+          component: gatewayd-public
           family: tls_cert_expiry
           hostname: "{{ $labels.hostname }}"
           kind: "{{ $labels.kind }}"
@@ -663,7 +663,7 @@ groups:
         for: 15m
         labels:
           severity: warn
-          component: gatewayd
+          component: gatewayd-public
           family: tls_cert_expiry
         annotations:
           summary: "Cert-expiry refresher walk was partial"
@@ -672,7 +672,7 @@ groups:
 
       # ─────────────────────────────────────────────────────────────────
       # On-demand cert mint denial rate
-      # (gatewayd / gateway_tls_on_demand_denied_total{reason}).
+      # (gatewayd-public / gateway_tls_on_demand_denied_total{reason}).
       # ADR-024 H3 closure: spec §11 abuse-vector observability — a
       # non-zero rate of denials (sum across the reason label set) is the
       # signal that someone is probing :443 for unowned SNIs. The
@@ -692,7 +692,7 @@ groups:
         for: 5m
         labels:
           severity: warn
-          component: gatewayd
+          component: gatewayd-public
           family: tls_on_demand_denied
         annotations:
           summary: "On-demand TLS denials > 1/min"
@@ -701,7 +701,7 @@ groups:
 
       # ─────────────────────────────────────────────────────────────────
       # Per-account gateway rate-limit rejections
-      # (gatewayd / gateway_per_account_rate_limited_total{account_id, plan}).
+      # (gatewayd-internal / gateway_per_account_rate_limited_total{account_id, plan}).
       # ADR-040 / issue #292 — defends against a botnet rotating across a
       # single customer's many apps (each app stays under per-app rps, but
       # the sum easily blows past the account's plan budget).
@@ -719,7 +719,7 @@ groups:
         for: 5m
         labels:
           severity: warn
-          component: gatewayd
+          component: gatewayd-internal
           family: per_account_rate_limit
         annotations:
           summary: "Per-account gateway rejections above 100/min (fleet)"

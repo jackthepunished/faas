@@ -1,5 +1,5 @@
 // Property tests for the gateway-side topAccountSet primitive
-// (cmd/gatewayd/topn.go). This is a private mirror of
+// (cmd/gatewayd-internal/topn.go). This is a private mirror of
 // pkg/wire/topn.go's primitive — kept identical in shape so a
 // future refactor can collapse both into a single shared
 // primitive. The two are NOT yet shared via tests (the ADR-040

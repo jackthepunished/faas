@@ -4282,7 +4282,7 @@ func (m *MemStore) DeleteCron(_ context.Context, id, appID string) error {
 
 // MarkCronFired stamps the cron row's LastFiredAt field. Used by the
 // schedd dispatch loop after a synthetic cron request has been
-// dispatched through gatewayd (spec §4.4, M7).
+// dispatched through gatewayd-internal (spec §4.4, M7).
 func (m *MemStore) MarkCronFired(_ context.Context, id string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -5985,7 +5985,7 @@ func (m *MemStore) LookupNodeKey(_ context.Context, computeNodeID string, keyID 
 // goroutine reanimates a drained node to true on the next successful
 // dial. MemStore flips the flag in place; production also flips but
 // additionally fires the compute_node_changed pg_notify trigger so
-// gatewayd sees the change without polling.
+// gatewayd-internal sees the change without polling.
 func (m *MemStore) SetComputeNodeActive(_ context.Context, id string, active bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

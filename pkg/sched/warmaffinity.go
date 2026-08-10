@@ -110,9 +110,9 @@ func (w *WarmAffinity) RecordWakeIfChanged(appID, nodeID string) (string, bool) 
 	w.m[appID] = warmEntry{nodeID: nodeID, lastSeen: w.now()}
 	if !ok {
 		// No prior entry — any nodeID counts as a change because
-		// the gatewayd hint cache had "" before and now has
+		// the gatewayd-internal hint cache had "" before and now has
 		// nodeID. The first wake for a cold app MUST broadcast so
-		// other gatewayds in the fleet see the new affinity.
+		// other gatewayd-internals in the fleet see the new affinity.
 		return "", true
 	}
 	return prev.nodeID, prev.nodeID != nodeID

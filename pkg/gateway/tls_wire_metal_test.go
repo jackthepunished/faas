@@ -1,6 +1,6 @@
 //go:build metal
 
-// Metal-tagged ACME staging smoke tests for gatewayd (spec §4.1, §11). These
+// Metal-tagged ACME staging smoke tests for gatewayd-internal (spec §4.1, §11). These
 // tests dial the real Hetzner DNS API + acme-staging-v02.api.letsencrypt.org
 // to mint a wildcard cert and an on-demand custom-domain cert. They are the
 // load-bearing evidence that the certmagic wiring works against the live
@@ -27,7 +27,7 @@
 //     staging certs and consume rate-limit budget)
 //   - FAAS_METAL_TLS_PUBLIC_HTTP_LISTENER != "1" for TestMetalCertMagic_OnDemandStaging
 //     only (this test triggers an HTTP-01 challenge against the host's public
-//     IP; without a running gatewayd on :80 answering /.well-known/acme-challenge,
+//     IP; without a running gatewayd-internal on :80 answering /.well-known/acme-challenge,
 //     the challenge hangs for 90 s and the test fails. The wildcard mint test
 //     uses DNS-01 and does NOT need this gate.)
 //
@@ -164,13 +164,13 @@ func TestMetalCertMagic_StagingE2E(t *testing.T) {
 //     HTTP listener — it relies on a separate LetsEncrypt validation
 //     traffic being routed to the EX44 public IP. Operators must run this
 //     only on a host that already answers HTTP-01 challenges for the
-//     customDomain (typically: a running gatewayd with the same allowlist).
+//     customDomain (typically: a running gatewayd-internal with the same allowlist).
 //   - Stores the issued cert under cfg.StorageDir.
 func TestMetalCertMagic_OnDemandStaging(t *testing.T) {
 	token, zone, appsDomain, customDomain := metalTLSEnv(t)
 	storageDir := metalStorageDir(t)
 	// HTTP-01 challenge lands on the host's public IP:80. Without a real
-	// gatewayd listener answering /.well-known/acme-challenge for
+	// gatewayd-internal listener answering /.well-known/acme-challenge for
 	// customDomain, the challenge hangs for the full 90 s timeout and the
 	// test fails with a misleading context-deadline error. Gate this test
 	// separately so operators running the suite on a non-public host only

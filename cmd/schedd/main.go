@@ -3,7 +3,7 @@
 // schedd is the ONLY writer to the instances table and the sole owner of the
 // state machine (spec §Component ownership, §6). It runs admission control, the
 // idle reaper, eviction, and cron in one process — single writer, no distributed
-// locking. It serves a gRPC Wake/ReportActivity surface to gatewayd on
+// locking. It serves a gRPC Wake/ReportActivity surface to gatewayd-internal on
 // /run/faas/schedd.sock (ADR-018) and dials vmmd on /run/faas/vmmd.sock to drive
 // the microVM lifecycle (ADR-014).
 package main
@@ -271,7 +271,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (the multi-box gate, mirroring vmmd's cfg.ComputeNode.NodeName
 	// at cmd/vmmd/main.go:394). When the gate is open, schedd is
 	// part of a multi-box deployment and the verifier sits in
-	// front of every mTLS leg (server-side on the gatewayd-facing
+	// front of every mTLS leg (server-side on the gatewayd-internal-facing
 	// surface, client-side on the vmmd dial). Empty NodeName =
 	// single-box dev / pre-slice-3 schedd keeps the verifier off
 	// entirely; stdlib chain + RFC 6125 SAN + EKU alone run.
@@ -602,7 +602,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// emit site for wake.queue_accepted / wake.admitted /
 	// wake.boot_started / wake.boot_completed / wake.boot_failed /
 	// wake.park_started / wake.park_completed / wake.stalled
-	// (vmmd / gatewayd / builderd / apid mirror corroborating
+	// (vmmd / gatewayd-internal / builderd / apid mirror corroborating
 	// observations).
 	//
 	// Issue #555 PR-6 — wire a real Broadcaster (was nil before)
@@ -645,7 +645,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Warn("seed ledger", "err", err)
 	}
 
-	// gRPC surface for gatewayd (ADR-018): unix socket by default;
+	// gRPC surface for gatewayd-internal (ADR-018): unix socket by default;
 	// tcp requires the tls_* cluster and is issue #95.
 	serverTLS, err := cfg.LoadServerTLSWithVerifier(nodeVerifier)
 	if err != nil {
@@ -826,6 +826,44 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.WithMigratingWatchdogIntervalSeconds(n)
 	}
 
+	// Tier A9 / ADR-087: pressure-rebalancer config. Same
+	// fail-fast contract as the A4/A5/A6 envs above — a
+	// typo in any of the three overrides must not silently
+	// fall back to the api.* defaults. The pressure
+	// rebalance watcher reads the threshold + cadence at
+	// every tick, so an operator tweak is picked up on the
+	// next sweep without a schedd restart. The migration
+	// policy is closed-set: validators panic on a bad value
+	// via WithPressureMigrationPolicy.
+	pressureThreshold := api.PressureAtCapacityThresholdPerMin
+	pressureReassess := api.PressureReassessmentIntervalSeconds
+	pressurePolicy := api.PressureMigrationPolicy
+	if v := os.Getenv("FAAS_PRESSURE_THRESHOLD_PER_MIN"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_PRESSURE_THRESHOLD_PER_MIN must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_PRESSURE_THRESHOLD_PER_MIN: %s", v)
+		}
+		pressureThreshold = n
+	}
+	if v := os.Getenv("FAAS_PRESSURE_REASSESSMENT_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			log.Error("FAAS_PRESSURE_REASSESSMENT_SECONDS must be a positive integer",
+				"value", v)
+			return fmt.Errorf("FAAS_PRESSURE_REASSESSMENT_SECONDS: %s", v)
+		}
+		pressureReassess = n
+	}
+	if v := os.Getenv("FAAS_PRESSURE_MIGRATION_POLICY"); v != "" {
+		pressurePolicy = v
+	}
+	engine.WithPressureConfig(pressureThreshold, pressureReassess)
+	engine.WithPressureMigrationPolicy(pressurePolicy)
+	pressureAgg := sched.NewPressureAggregator()
+	engine.WithPressureAggregator(pressureAgg)
+
 	// Stale-RUNNING billing-leak self-healer (issue: dead vmmd
 	// leaves instances RUNNING in PG → meterd bills for VMs that
 	// no longer exist). Same fail-fast contract as the
@@ -868,6 +906,45 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log,
 		)
 		go subscribeWithReconnect(ctx, "rebalancer", log, deps.subscribeRebalancer, pool, reb.Run)
+	}
+
+	// Tier A9 / ADR-087: pressure-rebalancer watcher. Polls
+	// the in-process aggregator (incremented at every
+	// WakeResult{AtCapacity:true} return) on a fixed cadence
+	// and dispatches Engine.RebalancePressuredApps for each
+	// pressured app. The beforeSweepHook bumps the per-app
+	// sweep counter so the policy gate (migrate_after_2)
+	// reads the current sweep count when the handle is
+	// invoked. Spawned only when ownerNodeID is set — the
+	// legacy single-box posture has no peer to migrate to.
+	if ownerNodeID != "" {
+		prReb := sched.NewPressureRebalancer(
+			pressureAgg,
+			pressureThreshold,
+			time.Duration(pressureReassess)*time.Second,
+			func(appID string) { engine.IncrementPressureSweepCounter(appID) },
+			func(ctx context.Context, appID string) error {
+				return engine.RebalancePressuredApps(ctx, appID)
+			},
+			log,
+		)
+		go func() {
+			if err := prReb.Run(ctx); err != nil &&
+				!errors.Is(err, context.Canceled) {
+				log.Warn("sched: pressure rebalancer: run returned", "err", err)
+			}
+		}()
+		// Cold-start sweep — catches apps that breached the
+		// threshold while schedd was down. The aggregator
+		// is in-process and survives restarts only if the
+		// schedd hadn't restarted; in practice the sweep
+		// is best-effort.
+		go func() {
+			if n := prReb.RunColdStartSweep(ctx); n > 0 {
+				log.Info("sched: pressure rebalancer: cold-start sweep done",
+					"apps_swept", n)
+			}
+		}()
 	}
 
 	// Tier A5 / ADR-066: live-instance migration subscriber.
@@ -1130,7 +1207,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// scale-up trigger and the aggressive-reaper signal mirror.
 		// The scraper surface is stateless (one Scrape call → one
 		// HTTP GET + parse); two callers are safe and a shared
-		// connection keeps gatewayd's listener traffic to ~1
+		// connection keeps gatewayd-internal's listener traffic to ~1
 		// req/sec instead of ~2.
 		var scraper scaleup.PromScraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
 		trigger := scaleup.New(
@@ -1232,7 +1309,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"window_s", api.ScaleUpWindowSeconds,
 			"aggressive", cfg.ReaperAggressive)
 	}
-	// Cron dispatch path: route synthetic requests through gatewayd's
+	// Cron dispatch path: route synthetic requests through gatewayd-internal's
 	// internal listener so metering + rate limits apply identically
 	// to user traffic (spec §4.4, M7). Multi-box schedd uses the
 	// GatewaySynthTarget URL (placement scheduler PR, ADR-025 axis 3
@@ -1247,7 +1324,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if synthTarget != "" {
 		synth, dialErr := sched.DialGatewaySynthTarget(synthTarget, nil, log)
 		if dialErr != nil {
-			log.Warn("gateway synth dial: cron traffic will not flow until gatewayd is up",
+			log.Warn("gateway synth dial: cron traffic will not flow until gatewayd-internal is up",
 				"target", synthTarget, "err", dialErr)
 		} else {
 			loop.WithGatewaySynth(synth)

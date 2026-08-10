@@ -1,9 +1,9 @@
 # FaasTLSCertExpiryPageByHost
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_tls_cert_expiry_by_host_seconds{hostname,kind}` (gatewayd `/metrics`).
-Spec: §12 + ADR-024 H3 follow-up (Finding 2 of the gatewayd gap
-analysis; PR in `worktree-tier1-gatewayd-fix`).
+Metric: `gateway_tls_cert_expiry_by_host_seconds{hostname,kind}` (gatewayd-public `/metrics`).
+Spec: §12 + ADR-024 H3 follow-up (Finding 2 of the pre-split edge gap
+analysis; PR in the archived Tier-1 worktree).
 Severity: page.
 
 > **Legacy daemon only (revised 2026-08-04).** This runbook applies
@@ -14,6 +14,11 @@ Severity: page.
 > `gatewayd-public`; the legacy daemon keeps them during the
 > migration window. PR-C sweeps the certmagic packages and
 > this runbook will be archived alongside them.
+>
+> The certmagic surface lives on `gatewayd-public` post-ADR-070;
+> the legacy `gatewayd.toml` config file is retained as the
+> historical reference, with the current config at
+> `/etc/faas/gatewayd-public.toml`.
 
 ## Symptom
 
@@ -53,14 +58,14 @@ DNS-01-driven and run automatically; failure modes are:
 Customer-owned custom domains. Each customer gets a fresh cert on
 their first request. Failure modes:
 
-- The customer's CNAME no longer points to the gatewayd IP — verify
+- The customer's CNAME no longer points to the gatewayd-public IP — verify
   `dig +short CNAME <customer-domain>` returns the apps-domain
   target.
 - The customer's HTTP-01 challenge endpoint (`/.well-known/acme-challenge/`)
   is being intercepted by their own CDN/proxy — verify by curl from
   outside the box.
 - The customer removed their `custom_domains` row in apid but kept
-  the DNS record — gatewayd's allowlist will reject the mint.
+  the DNS record — gatewayd-public's allowlist will reject the mint.
   Reach out to the customer; this is a legitimate revoke.
 
 ## Verify
@@ -82,14 +87,14 @@ For `kind=wildcard`:
 
 ```bash
 faas cert refresh --host='*.<zone>'   # forces DNS-01 re-mint
-journalctl -u faas-gatewayd -f        # watch for "renewing" log line
+journalctl -u faas-gatewayd-public -f        # watch for "renewing" log line
 ```
 
 For `kind=ondemand`:
 
 ```bash
 # Trigger a fresh mint by hitting the cert-mint path directly.
-curl -fsS https://$HOST/healthz   # this is what gatewayd's allowlist hooks
+curl -fsS https://$HOST/healthz   # this is what gatewayd-public's allowlist hooks
 faas cert refresh --host=$HOST    # explicit refresh for diagnostic logging
 ```
 
@@ -97,7 +102,7 @@ If certmagic's renew loop is wedged (the same Warn line repeating
 for > 30 minutes):
 
 ```bash
-systemctl restart faas-gatewayd
+systemctl restart faas-gatewayd-public
 # Watch the gauge climb back above 60d within 10 minutes of the
 # first mint after restart.
 ```

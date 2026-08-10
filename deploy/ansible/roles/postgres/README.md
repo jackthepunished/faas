@@ -66,6 +66,6 @@ chroot bootstrap) without halting. On a real control-plane node the handlers in
 ## Refs
 
 - Spec §11 (security baseline), §Component ownership (apid is the
-  only writer; gatewayd does not connect to Postgres).
+  only writer; gatewayd-internal does not connect to Postgres).
 - `deploy/scripts/faas-m75-smoke.sh` step 7 verifies the conf post-
   bootstrap.

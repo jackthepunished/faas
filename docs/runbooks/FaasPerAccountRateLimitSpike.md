@@ -1,8 +1,8 @@
 # FaasPerAccountRateLimitSpike
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_per_account_rate_limited_total{account_id, plan}` (gatewayd `/metrics`).
-Spec: §4.1 gatewayd rate-limit contract + ADR-040 (issue #292).
+Metric: `gateway_per_account_rate_limited_total{account_id, plan}` (gatewayd-internal `/metrics`).
+Spec: §4.1 gatewayd-internal rate-limit contract + ADR-040 (issue #292).
 Severity: warn.
 
 ## Symptom
@@ -35,7 +35,7 @@ curl -fsS http://127.0.0.1:9090/metrics | grep gateway_per_account_rate_limited_
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=sum(rate(gateway_per_account_rate_limited_total[5m]))'
 # Plan breakdown — cross-check whether one plan row dominates.
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=sum by (plan) (rate(gateway_per_account_rate_limited_total[5m]))'
-journalctl -u faas-gatewayd --since '-15m' --no-pager | grep -i 'rate limit'
+journalctl -u faas-gatewayd-internal --since '-15m' --no-pager | grep -i 'rate limit'
 ```
 
 ## Check
@@ -80,8 +80,8 @@ amtool silence add \
 ```bash
 # Drop every per-account bucket. Use after a config regression:
 # SIGHUP re-reads pkg/api/limits.go and ForgetAll's both the per-app
-# and per-account limiters in cmd/gatewayd/main.go.
-kill -HUP $(pidof faas-gatewayd)
+# and per-account limiters in cmd/gatewayd-internal/main.go.
+kill -HUP $(pidof faas-gatewayd-internal)
 ```
 
 SIGHUP drops every bucket — the abuse victim's bucket resets too,

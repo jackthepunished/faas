@@ -1,7 +1,7 @@
 # FaasTLSCertExpiryWarnByHost
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_tls_cert_expiry_by_host_seconds{hostname,kind}` (gatewayd `/metrics`).
+Metric: `gateway_tls_cert_expiry_by_host_seconds{hostname,kind}` (gatewayd-public `/metrics`).
 Spec: §12 + ADR-024 H3 follow-up (Finding 2).
 Severity: warn.
 
@@ -13,6 +13,11 @@ Severity: warn.
 > `gatewayd-public`; the legacy daemon keeps them during the
 > migration window. PR-C sweeps the certmagic packages and
 > this runbook will be archived alongside them.
+>
+> The certmagic surface lives on `gatewayd-public` post-ADR-070;
+> the legacy `gatewayd.toml` config file is retained as the
+> historical reference, with the current config at
+> `/etc/faas/gatewayd-public.toml`.
 
 ## Symptom
 
@@ -34,7 +39,7 @@ curl -fsS http://127.0.0.1:9090/metrics \
 
 ```bash
 # Is certmagic's renew loop alive at all? (No frozen = no renew)
-journalctl -u faas-gatewayd --since '-1h' --no-pager | grep -iE 'renewal|obtaining'
+journalctl -u faas-gatewayd-public --since '-1h' --no-pager | grep -iE 'renewal|obtaining'
 ```
 
 ## Recover (if 12h pass without auto-renew)
@@ -46,7 +51,7 @@ faas cert refresh --host=$HOST
 
 # If that doesn't bring the gauge above 30d within 5 minutes, fall
 # back to:
-systemctl restart faas-gatewayd
+systemctl restart faas-gatewayd-public
 ```
 
 ## Silence

@@ -3,7 +3,7 @@
 --
 -- 00125_warm_hint.sql — Tier A7 edge split (ADR-070).
 --
--- The sticky-warm hint that gatewayd reads to bias per-app routing
+-- The sticky-warm hint that gatewayd-internal reads to bias per-app routing
 -- toward the node that most recently warmed the app used to live
 -- only on the per-process WarmHintCache (pkg/gateway/warmhint_cache.go),
 -- fed by schedd's StreamWarmHints gRPC. After the gatewayd-public /
@@ -43,8 +43,9 @@
 -- Consumers (this PR cluster wires the public side; the file-move
 -- cluster wires the internal side):
 --   - cmd/gatewayd-public/warmhint_cache.go (NEW)
---   - cmd/gatewayd-internal/warmhints.go (NEW, moved from
---     cmd/gatewayd/warmhints.go)
+--   - cmd/gatewayd-internal/warmhints.go (NEW, moved from the
+--     legacy monolithic daemon's cmd/gatewayd/warmhints.go — that
+--     file is the historical reference; live path is internal)
 
 CREATE TABLE IF NOT EXISTS warm_hint (
     app_id     uuid        PRIMARY KEY,

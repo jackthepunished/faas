@@ -13,7 +13,7 @@ package main
 //      Free/Hobby + basic = 402
 //      plan_public_auth_basic_not_allowed.
 //   3. mode='basic' seal round-trip persists a non-empty
-//      apps.public_auth_basic blob the gatewayd unsealer
+//      apps.public_auth_basic blob the gatewayd-internal unsealer
 //      can decrypt under the APP_BASIC_AUTH namespace.
 //      PATCHing back to mode='open' clears that blob so a
 //      stale secretbox row never reaches a fresh request.

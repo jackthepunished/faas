@@ -54,7 +54,7 @@ x86_64 box or a cloud KVM host.
 ## Repo map
 
 ```
-cmd/{apid,gatewayd,gatewayd-public,gatewayd-internal,schedd,vmmd,builderd,imaged,meterd,gregale}   daemons + CLI (Go)
+cmd/{apid,gatewayd-public,gatewayd-internal,schedd,vmmd,builderd,imaged,meterd,gregale}   daemons + CLI (Go)
 pkg/{api,state,fcvm,netns,oci,rootfs,meter,stripex,wire,apid}   shared libs
 pkg/api/limits.go     EVERY plan quota/limit lives in this one table — never inline a limit
 guest/init            static Go PID1 inside every microVM
@@ -73,8 +73,8 @@ docs/adr/
 - `gatewayd-public` is the ONLY public listener on a node (TLS-only edge;
   introduced by the Tier A7 split, ADR-070). `gatewayd-internal` is the
   routing + wake + proxy daemon that listens on a unix socket on the
-  node and is reached only by `gatewayd-public`. The legacy
-  `gatewayd` daemon stays in-tree during the migration window. Cross-node
+  node and is reached only by `gatewayd-public`. The legacy monolithic
+  `gatewayd` daemon was removed in PR-A (Tier A7 ship). Cross-node
   HA is achieved by having N nodes each with one `gatewayd-public` in
   front of their local `gatewayd-internal` set — NOT by having multiple
   public listeners on one node.

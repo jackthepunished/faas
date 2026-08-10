@@ -84,7 +84,7 @@ func (p *Problem) Error() string {
 }
 
 // WriteProblem renders p as an RFC 7807 problem+json response with its status
-// code. Every HTTP surface (gatewayd, apid) uses this so error shape is uniform.
+// code. Every HTTP surface (gatewayd-internal, apid) uses this so error shape is uniform.
 func WriteProblem(w http.ResponseWriter, p *Problem) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(p.Status)

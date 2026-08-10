@@ -1,12 +1,12 @@
-// cmd/gatewayd AppLogsHandler — issue #254 / Move 4 PR-2 production
+// cmd/gatewayd-internal AppLogsHandler — issue #254 / Move 4 PR-2 production
 // wiring. The customer-facing `GET /v1/apps/{slug}/logs` route
-// moves from cmd/apid (PR-A) to cmd/gatewayd (PR-2) because
-// gatewayd is the only public listener (spec §11) and it already
-// imports pkg/scheddgrpc (ADR-018, ADR-043). The auth chain
+// moves from cmd/apid (PR-A) to cmd/gatewayd-internal (PR-2) because
+// gatewayd-internal sits directly behind gatewayd-public (spec §11)
+// and already imports pkg/scheddgrpc (ADR-018, ADR-043). The auth chain
 // (bearer / session / MFA / scope / IDOR-safe LoadApp) is shared
 // with cmd/apid via pkg/auth.Middleware (ADR-046).
 //
-// Why this lives in gatewayd and not apid: depguard
+// Why this lives in gatewayd-internal and not apid: depguard
 // (`.golangci.yml` apid-control-plane-only) forbids cmd/apid from
 // importing pkg/scheddgrpc. Replicating the scheddClient bridge
 // apid shipped in PR-A would leak the gRPC transport into the
@@ -38,7 +38,7 @@ import (
 // point of the interface. Reusing *scheddgrpc.Client directly
 // would force every test through `//go:build metal` and a fake
 // gRPC server, neither of which fits the unit-test loop. See
-// cmd/gatewayd/app_logs_test.go::controllableScheddClient.
+// cmd/gatewayd-internal/app_logs_test.go::controllableScheddClient.
 //
 // sinceWrittenAt (issue #517 / PR-B, AC3) is the RFC3339 lower
 // bound the handler forwards to schedd for the per-instance
@@ -67,16 +67,16 @@ type logStreamerResolver interface {
 }
 
 // AppLogsHandler owns `GET /v1/apps/{slug}/logs`. The route is
-// mounted on the gatewayd mux before the apidProxy wrapper
-// (cmd/gatewayd/main.go) so the apid loopback proxy never sees
+// mounted on the gatewayd-internal mux before the apidProxy wrapper
+// (cmd/gatewayd-internal/main.go) so the apid loopback proxy never sees
 // the path — the carve-out lives in isApidLogsPath
-// (cmd/gatewayd/proxy.go) per the §11 single-public-listener
+// (cmd/gatewayd-internal/proxy.go) per the §11 single-public-listener
 // invariant.
 //
 // The handler composes four services:
 //
 //   - *mwauth.Middleware — the pkg/auth.Middleware apid shares
-//     with gatewayd. Carries the bearer / session / MFA / scope
+//     with gatewayd-internal. Carries the bearer / session / MFA / scope
 //     gate + the IDOR-safe LoadApp. Same AuthLimit bucket the
 //     apid routes use, so the spec §11 "10/min/IP" rule covers
 //     both gateways.
@@ -101,7 +101,7 @@ type AppLogsHandler struct {
 	Ops       *wire.OpsMetrics
 
 	// Heartbeat is the SSE liveness interval. Defaults to 15s in
-	// production (cmd/gatewayd/main.go); tests shorten it to a
+	// production (cmd/gatewayd-internal/main.go); tests shorten it to a
 	// few ms so timer cases don't have to wait the production
 	// interval.
 	Heartbeat time.Duration

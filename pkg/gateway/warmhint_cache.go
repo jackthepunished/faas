@@ -1,4 +1,4 @@
-// warmhint_cache.go — gatewayd's sticky-warm affinity cache
+// warmhint_cache.go — gatewayd-internal's sticky-warm affinity cache
 // (ADR-025 axis 4).
 //
 // The picker (pkg/gateway/pgbackend.go::PGBackend.Pick) reads
@@ -13,18 +13,18 @@
 // per-node healthyCount scoring on saturation (ADR-009). The
 // WarmAffinityTTL on the schedd side (api.WarmAffinityTTL,
 // default 30 min) bounds staleness on both sides simultaneously,
-// so a gatewayd that reconnects after a long outage converges
+// so a gatewayd-internal that reconnects after a long outage converges
 // within one TTL as new emits land.
 //
-// Initial state on gatewayd startup is empty — Pick degrades to
+// Initial state on gatewayd-internal startup is empty — Pick degrades to
 // least-loaded via the existing healthyCount path (ADR-005 cold
 // boot must always work). The cache is process-local; a second
-// gatewayd sees the same hint stream and converges independently.
+// gatewayd-internal sees the same hint stream and converges independently.
 //
 // No TTL on the cache itself: the stream IS the source of truth.
 // WarmAffinityTTL on the schedd side governs eviction of old
 // entries; if schedd forgets an entry it stops emitting for that
-// app, and the gatewayd's hint lingers harmlessly until a future
+// app, and the gatewayd-internal's hint lingers harmlessly until a future
 // emit replaces it.
 
 package gateway
@@ -39,9 +39,9 @@ import (
 // unbounded; its cardinality is bounded by Σ(hot_apps), not by
 // fleet size, so memory cost is small.
 //
-// Exported because cmd/gatewayd constructs it (the stream
+// Exported because cmd/gatewayd-internal/constructs it (the stream
 // consumer holds a pointer) and feeds it from
-// cmd/gatewayd/warmhints.go.
+// cmd/gatewayd-internal/warmhints.go.
 type WarmHintCache struct {
 	mu sync.RWMutex
 	m  map[string]string // appID -> nodeID
@@ -55,7 +55,7 @@ func NewWarmHintCache() *WarmHintCache {
 }
 
 // Update stamps (appID → nodeID). Called from the stream
-// consumer in cmd/gatewayd/warmhints.go on every WarmHintEvent.
+// consumer in cmd/gatewayd-internal/warmhints.go on every WarmHintEvent.
 // Empty appID/nodeID is a silent no-op so a malformed wire
 // payload doesn't poison the cache.
 //
@@ -103,7 +103,7 @@ func (c *WarmHintCache) Hint(appID string) (string, bool) {
 }
 
 // HintFunc adapts the cache to the picker's WarmHintFunc
-// signature (pkg/gateway/pgbackend.go:26). cmd/gatewayd wires
+// signature (pkg/gateway/pgbackend.go:26). cmd/gatewayd-internal/wires
 // this into PGBackend via WithWarmHint at backend construction
 // time; the picker reads it on every Pick.
 //

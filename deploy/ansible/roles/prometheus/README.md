@@ -8,7 +8,7 @@ and runs it as a hardened systemd unit on the bridge IP.
 ## Scrape targets (spec §12)
 
 - `apid`      `:9092`
-- `gatewayd`  `:9093`
+- `gatewayd-public`  `:9093`
 - `schedd`    `:9091` (also exposes `/metrics/fcvm`)
 - `vmmd`      `:9104` (also exposes `/metrics/fallback`)
 - `imaged`    `:9095`

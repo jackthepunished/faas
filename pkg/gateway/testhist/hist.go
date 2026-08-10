@@ -19,7 +19,7 @@
 //
 // The Quantile function reads the histogram in-process via the standard
 // Prometheus dto. cmd/e2e tests that need to read a histogram living in
-// a different process (gatewayd running as a subprocess) should scrape
+// a different process (gatewayd-internal running as a subprocess) should scrape
 // the /metrics exposition with SnapshotFromText instead.
 package testhist
 
@@ -79,7 +79,7 @@ func Quantile(t *testing.T, h prometheus.Histogram, q float64) time.Duration {
 // /metrics serves) for the named histogram and returns its bucket
 // cumulative counts, total count, and total sum. This is the scrape-time
 // counterpart to Snapshot, intended for cmd/e2e tests that need to read
-// a histogram living in a subprocess (gatewayd).
+// a histogram living in a subprocess (gatewayd-internal).
 //
 // metricName must match exactly (no regex). Returns an error if the
 // histogram is not present or its bucket lines are missing/malformed.

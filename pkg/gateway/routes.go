@@ -66,7 +66,7 @@ func (c *RouteCache) Invalidate(host string) {
 	}
 }
 
-// Reset drops every cached route. gatewayd calls this on an app/domain change
+// Reset drops every cached route. gatewayd-internal calls this on an app/domain change
 // notification (spec §4.1): at one-box scale (single-digit apps, spec §4.3) a
 // full re-resolve on the next request is cheaper than tracking which host a
 // given app_id maps to, and it can never leave a stale route behind.

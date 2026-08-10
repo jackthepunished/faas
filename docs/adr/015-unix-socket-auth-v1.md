@@ -1,6 +1,13 @@
 # ADR-015 · M1 unix-socket auth (v1.0 = mode 0660 group `faas`)
 
 - **Status:** accepted
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-16
 - **Decision:** vmmd binds `/run/faas/vmmd.sock` with mode `0660` and group `faas`. schedd, gatewayd, builderd (and any future control-plane daemon) join the `faas` group so the kernel grants write access via standard unix DAC. No mTLS, no SO_PEERCRED check on the wire, no socket firewall.
 - **Why:** (a) Every daemon on the box already runs as a known user (apid, schedd, vmmd…). If a user cannot join the `faas` group, they cannot dial — same threat model as PG's `peer` auth (`doc/faas_implementation_spec.md:398`). (b) The only explicitly-listed daemon-to-daemon auth reference in the repo is spec line 398 about PG; spec §4.4 doesn't mention auth; CLAUDE.md's "Components talk via Postgres rows + pg_notify, or gRPC on unix sockets" is the whole architecture. Picking a layered-DAC approach that doesn't need a transport-level auth side-channel keeps the daemon code narrow. (c) Spec §16 (open questions) defers "Regional expansion = FSN + HEL pair at Gate A?" — when that lands, the per-host unix-socket model stops being meaningful and mTLS has to happen at the wire. We commit to that decision now.

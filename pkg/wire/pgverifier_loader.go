@@ -36,7 +36,7 @@ func NewPGNodeLoader(pool *pgxpool.Pool) NodeLoader {
 // leaf-CN binds to compute_nodes.name, not compute_nodes.id.
 //
 // `active = true` mirrors the gateway's PGBackend.targets filter
-// (cmd/gatewayd/pgbackend.go); inactive rows are not eligible for
+// (cmd/gatewayd-internal/pgbackend.go); inactive rows are not eligible for
 // handshake binding.
 func (l pgNodeLoader) LoadNodes(ctx context.Context) ([]NodeRow, error) {
 	if l.pool == nil {

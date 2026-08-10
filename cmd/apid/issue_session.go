@@ -150,7 +150,7 @@ func (s *server) rollbackCreatedSession(ctx context.Context, sid, accountID stri
 // that way at apid, so "" is correct rather than "unknown").
 //
 // The gateway strips the X-Forwarded-For we read here is NOT
-// trusted: the dashboard fronts through gatewayd which stamps
+// trusted: the dashboard fronts through gatewayd-public which stamps
 // RemoteAddr with the TCP peer IP. A direct apid exposure with
 // a forged XFF is a separate threat to model. Per spec §11 the
 // peer-IP is what we audit; XFF transparency is a future PR.
