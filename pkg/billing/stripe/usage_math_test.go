@@ -1,170 +1,25 @@
 package stripe
 
+// usage_math_test.go used to own TestWireQuantityForMBSeconds,
+// TestWireQuantityForMBSeconds_HundredTBResidentDay,
+// TestWireQuantityForMBSeconds_NeverNegativeMathResult, and
+// TestWireQuantityConstants. The constants and helper moved to
+// pkg/billing/plans.go so both providers (Stripe + Paddle) share
+// the same integer-money formula (PR-P-fixes — closes the
+// Paddle under-billing bug where defaultFlushLocked hard-coded
+// Quantity=1 and silently under-billed every account by ~250×
+// for the canonical Hobby 24h case).
+//
+// The shared tests now live in pkg/billing/plans_test.go. This
+// file keeps TestLegacyWireQuantityForGBHours_BitIdentical
+// because the legacy float wire path is stripe-specific
+// (Paddle never had it) — the formula `int64(gbHours * 1000)`
+// is pinned against the shared WireQuantityMillicentsPerGBHour
+// constant.
+
 import (
 	"testing"
 )
-
-// TestWireQuantityForMBSeconds pins the customer-billing wire-quantity
-// formula hermetically. Before this test, the only thing that
-// validated `qty == 6187` for a 256 MB Hobby app resident for 24 h
-// was TestInvoiceShadow24h_Sandbox in sandbox_test.go, which needs
-// STRIPE_API_KEY and silently skips in CI (and therefore on every PR).
-// A regression in the customer-billing formula would ship green.
-//
-// Reference derivation:
-//   - Plan: Hobby (256 MB)
-//   - Billed RAM: 256 + 8 = 264 MB (§4.7 "plan RAM + 8 MB per running
-//     second" — the 8 MB overhead is for virtio/firecracker bookkeeping,
-//     not the customer's working set)
-//   - Window: 24 h = 86_400 s
-//   - mbSeconds = 264 * 86_400 = 22_809_600
-//   - qty = 22_809_600 * 1000 / (1024 * 3600) = 22_809_600_000 / 3_686_400
-//     = 6186.666… → truncates to 6187 wire units
-//
-// The trailing remainder (6186.666…) is the sub-milliunit gap; it is
-// dropped on purpose — see WireQuantityForMBSeconds's docstring and
-// CLAUDE.md's "Floats near money fail review". The accumulation of
-// this remainder across millions of windows is the entire reason the
-// float path was retired.
-func TestWireQuantityForMBSeconds(t *testing.T) {
-	const (
-		hobbyRamMB   = 256
-		billedMB     = hobbyRamMB + 8
-		hoursInDay   = 24
-		secsInHour   = 3600
-		secsInDay    = hoursInDay * secsInHour
-		canonicalQty = 6187
-	)
-
-	cases := []struct {
-		name      string
-		mbSeconds int64
-		want      int64
-	}{
-		// The acceptance case — a Hobby app resident for exactly one
-		// full day. qty MUST be 6187, not 6186, not 6188, not a
-		// float-rounded "6186.67". If this ever fails, the customer's
-		// daily bill changes.
-		{
-			name:      "hobby_24h_canonical",
-			mbSeconds: billedMB * secsInDay, // 22_809_600
-			want:      canonicalQty,
-		},
-
-		// Boundary: zero. A parked-app with no resident-seconds MUST
-		// produce a zero qty (no wire record at all would be the next
-		// layer's decision, but the math must not invent units).
-		{name: "zero", mbSeconds: 0, want: 0},
-
-		// One minute of one MB — smallest billable quantum. The
-		// customer should NOT be charged for a single second of
-		// runtime, only full minutes (meterd rounds upstream), but the
-		// helper itself must return the integer answer for whatever
-		// sum lands on it. 60 mb-s → 60 * 1000 / 3_686_400 = 0
-		// (truncated). Documents the sub-milliunit floor.
-		{name: "one_minute_one_mb", mbSeconds: 60, want: 0},
-
-		// One hour of one MB. 3_600 mb-s → 3_600_000 / 3_686_400 = 0
-		// (truncated, just barely). Pinned so any future change to
-		// the constant floors would surface here.
-		{name: "one_hour_one_mb", mbSeconds: 3_600, want: 0},
-
-		// Exactly one MB-second * 1000 — the breakpoint where 1 wire
-		// unit (one milli-cent of a GB-h) is reached. 3_687 mb-s →
-		// 3_687_000 / 3_686_400 = 1 (truncated from 1.000162…).
-		// The 3_686 vs 3_687 split is the rounding boundary the
-		// helper must respect exactly.
-		{name: "first_wire_unit", mbSeconds: 3_687, want: 1},
-
-		// One MB-resident-second below the breakpoint. 3_686 mb-s →
-		// 3_686_000 / 3_686_400 = 0 (truncated from 0.999892…).
-		// Companion to the previous case — together they pin the
-		// exact floor.
-		{name: "below_first_wire_unit", mbSeconds: 3_686, want: 0},
-
-		// Pro plan (512 MB) for one hour. 520 * 3_600 = 1_872_000
-		// mb-s → 1_872_000_000 / 3_686_400 = 507 (truncated from
-		// 507.815…). Pin the higher-volume case to make sure the
-		// integer math doesn't overflow at the megabyte scale.
-		{name: "pro_one_hour", mbSeconds: 520 * 3_600, want: 507},
-
-		// Free plan (128 MB) for one hour. 136 * 3_600 = 489_600
-		// mb-s → 489_600_000 / 3_686_400 = 132 (truncated from
-		// 132.810…). Cheapest plan, smallest integer.
-		{name: "free_one_hour", mbSeconds: 136 * 3_600, want: 132},
-
-		// Scale plan (1024 MB) for one hour. 1032 * 3_600 = 3_715_200
-		// mb-s → 3_715_200_000 / 3_686_400 = 1007 (truncated from
-		// 1007.717…). Top-of-fleet case for the per-hour helper.
-		{name: "scale_one_hour", mbSeconds: 1032 * 3_600, want: 1007},
-
-		// Hobby resident for exactly one GB-second. 1_024 * 60 * 60 =
-		// 3_686_400 mb-s (1 GB resident for 1 hour) → 3_686_400_000
-		// / 3_686_400 = 1000 wire units. Pinned because 1000 is the
-		// cleanest round answer the formula produces, and is what a
-		// naive `gbHours * 1000` formula returns too — verifying the
-		// two paths agree at the exactly-aligned point.
-		{name: "one_gb_hour", mbSeconds: 1024 * 3600, want: 1000},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := WireQuantityForMBSeconds(tc.mbSeconds)
-			if got != tc.want {
-				t.Fatalf("WireQuantityForMBSeconds(%d) = %d, want %d",
-					tc.mbSeconds, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestWireQuantityForMBSeconds_HundredTBResidentDay pins the
-// answer at a high-but-representative billable volume: a
-// 100 TB-resident instance for 24 h, which is ~10_000x the
-// canonical Hobby 24h window. The arithmetic is constant-folded
-// at compile time, so this isn't an overflow test (Go's int64
-// max is 9.22e18 and the numerator is 9.06e15); it's a pin of
-// the helper's answer at a wire-quantity magnitude that stresses
-// the integer multiply. If a future contributor narrows the
-// helper to int32 or introduces a float, the answer (`2_457_600_000`,
-// just above int32 max) would surface as a wrong value here.
-func TestWireQuantityForMBSeconds_HundredTBResidentDay(t *testing.T) {
-	// 100 TB-resident for 24 h.
-	//   mbSeconds = 100 * 1024 * 1024 * 86_400 = 9_059_696_640_000
-	//   numerator = mbSeconds * 1000 = 9_059_696_640_000_000
-	//   qty = numerator / 3_686_400 = 2_457_600_000
-	const tb = 1024 * 1024
-	mbSeconds := int64(100 * tb * 86_400)
-	const want int64 = 2_457_600_000
-	got := WireQuantityForMBSeconds(mbSeconds)
-	if got != want {
-		t.Fatalf("100 TB-resident-24h: got %d, want %d (mbSeconds=%d)",
-			got, want, mbSeconds)
-	}
-}
-
-// TestWireQuantityForMBSeconds_NeverNegative pins the contract
-// that the helper itself is the *math* layer, not the *guard*
-// layer. meterds never produces a negative window (it's a sum of
-// non-negative per-second contributions), and the call sites no
-// longer wrap ErrNegativeQuantity at runtime — the upstreams
-// guarantee non-negativity.
-//
-// This test documents that contract: a small negative input
-// (-1) yields 0 (truncation toward zero in Go integer division),
-// not a panic and not a silently-overflowed int64. If a future
-// refactor adds a defensive guard inside the helper, this test
-// will fail and force the author to decide what layer the guard
-// belongs to.
-func TestWireQuantityForMBSeconds_NeverNegativeMathResult(t *testing.T) {
-	got := WireQuantityForMBSeconds(-1)
-	// -1 * 1000 / secondsPerGBHour = -1000 / 3686400 = 0 (truncated
-	// toward zero in Go integer division). So a small negative
-	// input produces 0, not a panic'd reflection of overflow.
-	if got != 0 {
-		t.Fatalf("small negative input: got %d, want 0", got)
-	}
-}
 
 // TestLegacyWireQuantityForGBHours_BitIdentical pins the deprecated
 // path's contract: it MUST be bit-identical to
@@ -212,26 +67,12 @@ func TestLegacyWireQuantityForGBHours_BitIdentical(t *testing.T) {
 			// "improves" the test by replacing this with a
 			// magic number, the inline comment is the
 			// prompt that explains what the number is.
-			want := int64(tc.gbHours * WireQuantityMillicentsPerGBHour)
+			want := int64(tc.gbHours * float64(WireQuantityMillicentsPerGBHour))
 			if got != want {
 				t.Fatalf("legacyWireQuantityForGBHours(%v) = %d, "+
 					"want %d (bit-identical to int64(gbHours * 1000))",
 					tc.gbHours, got, want)
 			}
 		})
-	}
-}
-
-// TestWireQuantityConstants pins the two constants in the formula. If
-// either changes, every customer's bill changes; both must be a
-// deliberate edit and a re-run of this test.
-func TestWireQuantityConstants(t *testing.T) {
-	if WireQuantityMillicentsPerGBHour != 1000 {
-		t.Fatalf("WireQuantityMillicentsPerGBHour = %d, want 1000 (spec §4.7)",
-			WireQuantityMillicentsPerGBHour)
-	}
-	if secondsPerGBHour != 1024*3600 {
-		t.Fatalf("secondsPerGBHour = %d, want %d (1 GB = 1024 MB, 1 h = 3600 s)",
-			secondsPerGBHour, 1024*3600)
 	}
 }

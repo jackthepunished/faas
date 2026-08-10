@@ -420,7 +420,7 @@ type OpsMetrics struct {
 	ipLabels *ipLabelSet
 	// topTenantRPS: introduced in issue #300 — a per-tenant RPS
 	// gauge sampled every 5s by the daemon's topNSampler goroutine
-	// (cmd/apid/topn.go / cmd/gatewayd/listener.go). Bounded at
+	// (cmd/apid/topn.go / cmd/gatewayd-internal/listener.go). Bounded at
 	// topAccountSetCap (1000) real customer ids plus the "other"
 	// overflow bucket (see pkg/wire/topn.go). Layered above
 	// accountLabelSet: an id admitted at the 10k level can still
@@ -539,7 +539,7 @@ type OpsMetrics struct {
 	// (unlabelled) so the bucket set is sized to the actual hot path
 	// (sub-ms per row) — the general `dur` histogram tops out at 5 s
 	// and would lose all resolution here. nil on daemons that don't
-	// expose the path (apid, imaged, builderd, gatewayd, meterd,
+	// expose the path (apid, imaged, builderd, gatewayd-internal, meterd,
 	// githubd, faas CLI). Buckets: 100 µs → 100 ms.
 	cpuStatsCollectDur prometheus.Histogram
 	// residentGBPerCustomer: per-plan "resident GB-hours per paying
@@ -900,6 +900,66 @@ type OpsMetrics struct {
 	// be present so /metrics doesn't show a 404 for cmd/<other>
 	// scrapes that incidentally probe the prefix).
 	rebalanceDecisions *prometheus.CounterVec
+	// appAtCapacityTotal: Tier A9 / ADR-087 capacity-pressure
+	// trigger observability. Counter labelled by (app, kind)
+	// where kind ∈ {wake, admit, scaleup, floor} — the closed set
+	// of engine return sites that can produce
+	// WakeResult{AtCapacity: true}. The `app` label is bounded by
+	// the running app set on the owning schedd (AtCapacity is a
+	// hot-app signal; the per-app series churns out as the app
+	// cools). The metric is the §12 dashboard panel for the
+	// pressure-rebalancer trigger rate; a sustained non-zero rate
+	// per app is the indicator that the fleet needs tuning
+	// (consider raising capacity on the owner schedd, or
+	// spreading the customer across multi-app deployments).
+	// Single-registry: registered on every daemon (mirrors the
+	// rebalanceDecisions pattern); only schedd increments via
+	// AppAtCapacityTotal (the engine callsite stamps
+	// `app=appID, kind=branch`). Pre-instantiated in
+	// NewOpsMetrics below — kind labels are pre-instantiated at
+	// boot, app labels populate lazily on first wake.
+	appAtCapacityTotal *prometheus.CounterVec
+	// pressureReassignmentsTotal: Tier A9 / ADR-087
+	// pressure-rebalancer observability. Counter labelled by
+	// outcome ∈ {migrated, conflict, no_headroom,
+	// no_eligibility, no_peer} — the closed set
+	// the pressure-rebalancer's batch loop can land in once per
+	// app per sweep. `migrated` is the §12 dashboard panel
+	// (sum over 5m for the rate); the `peer_live_migrated`
+	// label was removed in the Tier A10 follow-up PR because the
+	// helper it gated always no-op'd (see NewOpsMetrics body for
+	// the rationale); Tier A10.1 (peer-to-peer migrator) will
+	// re-introduce it.
+	// pressure path (a non-zero rate means the policy gate
+	// opened the live migration window); `no_headroom` is the
+	// tripwire for sustained full-cluster pressure (call the
+	// operator). `no_peer` fires when the only active compute
+	// node is the owner (single-box mode or fleet-wide drain).
+	// Single-registry: registered on every daemon (mirrors the
+	// rebalanceDecisions / liveMigrationDecisions pattern);
+	// only schedd increments via PressureReassignments. Pre-
+	// instantiated at boot so the rows surface in /metrics from
+	// the moment schedd starts.
+	pressureReassignmentsTotal *prometheus.CounterVec
+	// overflowTargetSpillHitsTotal: Tier A10 / ADR-088
+	// per-app overflow_node preference observability. Counter
+	// labelled by outcome ∈ {used, unavailable, fallback_used} —
+	// the closed set the pressure-rebalancer's overflow-peer
+	// resolution path can land in once per app per sweep.
+	// `used` = the customer's preferred overflow_node had
+	// headroom and the engine reassigned to it; `unavailable` =
+	// the preferred node was inactive / no headroom / no longer
+	// exists (the engine fell through to the A9 first-peer-with-
+	// headroom path); `fallback_used` = the fallback path
+	// actually landed an assignment after an `unavailable`
+	// observation. The first two are the tripwires for "is the
+	// preference honoured?"; the third answers "did the
+	// fallback save the sweep?" so a high
+	// `unavailable` + low `fallback_used` rate is the
+	// sustained-full-cluster-pressure tripwire. Single-registry:
+	// registered on every daemon; only schedd increments via
+	// OverflowTargetSpillHits.
+	overflowTargetSpillHitsTotal *prometheus.CounterVec
 	// migratingReconcileDecisions: Tier A6 / ADR-067
 	// migrating-instance watchdog observability. Counter labelled
 	// by outcome ∈ {reinvited, hard_deleted, conflict, error} —
@@ -973,7 +1033,7 @@ type OpsMetrics struct {
 	// on an idle daemon and the histogram has a series to bucket
 	// into the moment the first wake fires. Single-registry:
 	// registered on every daemon so the struct stays a single
-	// registry — only schedd / vmmd / gatewayd / builderd / apid
+	// registry — only schedd / vmmd / gatewayd-internal / builderd / apid
 	// increment via Platform.Emit in production; other daemons
 	// sit at zero. Closed set is the 13 phases from
 	// pkg/events/wake.go.
@@ -1153,6 +1213,69 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_rebalance_decisions_total",
 		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-064), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
 	}, []string{"outcome"})
+	// ADR-087 / Tier A9: per-(app, kind) AtCapacity trigger counter.
+	// Labelled by (app, kind); kind is pre-instantiated at boot so the
+	// kind=* rows surface in /metrics from the moment schedd starts
+	// (matching the precedent at the requestTotal / requestFailures
+	// counter initialiser pattern). The app label is populated lazily
+	// on first wake — the per-app series churns out as the app cools,
+	// keeping the active series count bounded by the per-schedd live
+	// app set. Single-registry: registered on every daemon (mirrors
+	// rebalanceDecisions); only schedd increments via
+	// AppAtCapacityTotal.
+	appAtCapacityTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_at_capacity_total",
+		Help: "Count of WakeResult{AtCapacity: true} returns the engine produced, labelled by app id and the engine branch that returned the no-op (kind ∈ {wake, admit, scaleup, floor}). The per-app rate is the §12 dashboard panel for the pressure-rebalancer trigger (ADR-087); a sustained non-zero rate per app means the customer's wake load is bumping the owner's max_concurrency ceiling. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via AppAtCapacityTotal.",
+	}, []string{"app", "kind"})
+	for _, kind := range []string{"wake", "admit", "scaleup", "floor"} {
+		appAtCapacityTotal.WithLabelValues("__none__", kind)
+	}
+	// ADR-087 / Tier A9: pressure-rebalancer decision counter.
+	// Labelled by outcome ∈ {migrated, conflict, no_headroom,
+	// no_eligibility, no_peer}. The closed set is
+	// pre-instantiated at boot so the rows surface in /metrics from
+	// the moment schedd starts (matching the rebalanceDecisions /
+	// liveMigrationDecisions precedent). Single-registry: registered
+	// on every daemon (mirrors rebalanceDecisions); only schedd
+	// increments via PressureReassignments.
+	//
+	// Note (ADR-087 / Tier A10 follow-up 2026-08-10): the
+	// `peer_live_migrated` outcome label was removed in PR
+	// #799 (Tier A10 follow-ups) because the
+	// maybeMigrateLiveInstancesFor helper it gated always
+	// no-op'd — it called Engine.MigrateLiveInstances with
+	// `deadNodeID=e.ownerNodeID`, which the function's own
+	// self-path early-return rejected (return 0, nil).
+	// ADR-066's four-phase handoff only supports destination =
+	// local schedd (active-passive HA, ADR-083); peer-to-peer
+	// live migration on the pressure path is a Tier A10.1
+	// follow-up. The migration policy knob keeps the closed set
+	// {skip_live, migrate_after_1, migrate_after_2} so a future
+	// PR can wire the policy to a real peer-to-peer migrator
+	// without churn on the API surface.
+	pressureReassignmentsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_pressure_reassignments_total",
+		Help: "Cross-node capacity-pressure rebalance decisions (Tier A9 / ADR-087), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, no_peer, overflow_target_unavailable}. `migrated` is the §12 dashboard panel (sum over 5m for the rate); `no_headroom` is the tripwire for sustained full-cluster pressure (call the operator); `overflow_target_unavailable` is the Tier A10 / ADR-088 tripwire when the customer's preferred spill target is full or inactive. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via PressureReassignments.",
+	}, []string{"outcome"})
+	for _, outcome := range []string{"migrated", "conflict", "no_headroom", "no_eligibility", "no_peer", "overflow_target_unavailable"} {
+		pressureReassignmentsTotal.WithLabelValues(outcome)
+	}
+	// ADR-088 / Tier A10: per-app overflow_node preference
+	// observability. New CounterVec (separate from
+	// pressureReassignmentsTotal) so a Grafana panel can branch
+	// "preference honoured?" vs "did the engine move the app at
+	// all?" without reading the same series with two queries.
+	// outcome ∈ {used, unavailable, fallback_used} — closed set
+	// pre-instantiated at boot so the rows surface in /metrics
+	// from the moment schedd starts (matching the
+	// pressureReassignmentsTotal pattern above).
+	overflowTargetSpillHitsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_overflow_target_spill_hits_total",
+		Help: "Per-app overflow_node preference resolution outcomes (Tier A10 / ADR-088), labelled by outcome ∈ {used, unavailable, fallback_used}. `used` = the customer's preferred overflow_node had headroom and the engine reassigned to it; `unavailable` = the preferred node was inactive / no headroom / no longer exists (the engine fell through to the A9 first-peer-with-headroom path); `fallback_used` = the fallback path actually landed an assignment after an `unavailable` observation. The first two are the tripwires for 'is the preference honoured?'; the third answers 'did the fallback save the sweep?' so a high `unavailable` + low `fallback_used` rate is the sustained-full-cluster-pressure tripwire. Single-registry: registered on every daemon; only schedd increments via OverflowTargetSpillHits.",
+	}, []string{"outcome"})
+	for _, outcome := range []string{"used", "unavailable", "fallback_used"} {
+		overflowTargetSpillHitsTotal.WithLabelValues(outcome)
+	}
 	eventsWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_events_write_failures_total",
 		Help: "Count of state-transitions whose events audit-log row could not be written. The transition itself succeeded; this is observation-only (the state row is the source of truth).",
@@ -1319,7 +1442,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// auditOrgEvent (PR 6 / issue #190): closed 11-verb counter per
 	// outcome. The increment site lives in pkg/authz/authorize.go
 	// (deny paths) — apid emits one Counter per deny + one per allow;
-	// schedd / meterd / gatewayd do not call AuthorizeOrgAction
+	// schedd / meterd / gatewayd-internal do not call AuthorizeOrgAction
 	// today, so their registries have the counters registered but
 	// always-zero (matches the single-registry pattern in
 	// [wire-opsmetrics-single-registry]). result ∈ {allowed, denied}.
@@ -1446,7 +1569,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// CPU hot path is per-RPC, not per-tick, and we want bucket
 	// resolution at the cache.Lookup scale (sub-ms per row,
 	// ~µs at 100 instances). nil on daemons that don't expose the
-	// path (apid, imaged, builderd, gatewayd, meterd, githubd,
+	// path (apid, imaged, builderd, gatewayd-internal, meterd, githubd,
 	// faas CLI).
 	var cpuStatsCollectDurLocal prometheus.Histogram
 	switch prefix {
@@ -1728,7 +1851,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// proxy <5s; the 60s tail catches pathological stalls.
 	wakePhaseEmitted := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_wake_phase_emitted_total",
-		Help: "Count of wake-timeline events emitted via pkg/events.Platform, labelled by phase (the substring after `wake.`, e.g. `boot_started`, `readiness_200`, `proxy_first_byte`) and result ∈ {ok, failed} (issue #517 / PR-C, ADR-064). Single-registry: registered on every daemon; only schedd / vmmd / gatewayd / builderd / apid increment via Platform.Emit. The closed 13-phase set is pre-instantiated at boot so the §12 wake-latency panel surfaces zero on an idle daemon.",
+		Help: "Count of wake-timeline events emitted via pkg/events.Platform, labelled by phase (the substring after `wake.`, e.g. `boot_started`, `readiness_200`, `proxy_first_byte`) and result ∈ {ok, failed} (issue #517 / PR-C, ADR-064). Single-registry: registered on every daemon; only schedd / vmmd / gatewayd-internal / builderd / apid increment via Platform.Emit. The closed 13-phase set is pre-instantiated at boot so the §12 wake-latency panel surfaces zero on an idle daemon.",
 	}, []string{"phase", "result"})
 	wakePhaseDur := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name: prefix + "_wake_phase_duration_seconds",
@@ -1915,6 +2038,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Dead-node billing reconciler decisions, labelled by outcome ∈ {failed, conflict, error}. `failed` counts RUNNING instances terminated because their compute_node stopped heartbeating past the staleness window — each one was billing the customer for a VM that no longer existed and holding §6.2-2 RAM ceiling. A sustained non-zero `failed` rate is an incident signal (a vmmd is dying without transitioning its rows), not routine repair. `conflict` is the benign peer-wins/node-recovered path.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, deadNodeReconcileDecisions)
+	// ADR-087 / Tier A9: pressure-rebalancer decision counter.
+	// Single-registry: registered on every daemon (mirrors
+	// deadNodeReconcileDecisions); only schedd increments via
+	// PressureReassignments in production.
+	commonCollectors = append(commonCollectors, pressureReassignmentsTotal)
+	// ADR-088 / Tier A10: per-app overflow_node preference
+	// observability. Single-registry: registered on every
+	// daemon; only schedd increments via OverflowTargetSpillHits
+	// in production.
+	commonCollectors = append(commonCollectors, overflowTargetSpillHitsTotal)
+	// ADR-087 / Tier A9: per-(app, kind) AtCapacity trigger counter.
+	// Single-registry: registered on every daemon (mirrors
+	// deadNodeReconcileDecisions); only schedd increments via
+	// AppAtCapacityTotal in production.
+	commonCollectors = append(commonCollectors, appAtCapacityTotal)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -2194,7 +2332,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// RPS gauge so the help/TYPE surfaces in /metrics from boot, before
 	// the first 5s sampler tick fires. Same precedent as the closed
 	// scale-up outcome / egress-deny catalog loops above. Real customer
-	// ids are added by TopTenantRPSFor (cmd/apid/topn.go / cmd/gatewayd/
+	// ids are added by TopTenantRPSFor (cmd/apid/topn.go / cmd/gatewayd-internal/
 	// listener.go), which routes through topAccountSet and demotes past
 	// top-1000 into this bucket.
 	topTenantRPS.WithLabelValues(topAccountOtherLabel)
@@ -2342,6 +2480,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
+		appAtCapacityTotal:                 appAtCapacityTotal,
+		pressureReassignmentsTotal:         pressureReassignmentsTotal,
+		overflowTargetSpillHitsTotal:       overflowTargetSpillHitsTotal,
 		activePassiveFailoversTotal:        activePassiveFailoversTotal,
 		standbyState:                       standbyState,
 		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
@@ -2562,6 +2703,66 @@ func (m *OpsMetrics) TailCapReached(plan string) prometheus.Counter {
 // WatchdogKills — the returned Counter is safe to retain.
 func (m *OpsMetrics) RebalanceDecisions(outcome string) prometheus.Counter {
 	return m.rebalanceDecisions.WithLabelValues(outcome)
+}
+
+// AppAtCapacityTotal returns the per-(app, kind) counter the
+// engine increments at every WakeResult{AtCapacity: true} return
+// site (Tier A9 / ADR-087). app is the customer app id; kind ∈
+// {wake, admit, scaleup, floor} is the engine branch that
+// produced the no-op. The per-app rate is the §12 dashboard
+// panel for the pressure-rebalancer trigger. Same caching rules
+// as RebalanceDecisions — the returned Counter is safe to retain.
+// Nil-safe on receiver so a unit test without metrics keeps
+// building.
+func (m *OpsMetrics) AppAtCapacityTotal(app, kind string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.appAtCapacityTotal.WithLabelValues(app, kind)
+}
+
+// PressureReassignments returns the per-(outcome) counter the
+// Tier A9 / ADR-087 pressure-rebalancer increments once per app
+// per sweep. outcome ∈ {migrated, conflict, no_headroom,
+// no_eligibility, no_peer, overflow_target_unavailable}.
+// `migrated` is the §12 dashboard panel;
+// `overflow_target_unavailable` is the Tier A10 / ADR-088
+// tripwire when the customer's preferred spill target is full
+// or inactive. The `peer_live_migrated` label was removed in
+// the Tier A10 follow-up PR because the
+// maybeMigrateLiveInstancesFor helper it gated always no-op'd
+// (passed e.ownerNodeID as deadNodeID, which
+// MigrateLiveInstances self-skips at engine.go:2944); Tier
+// A10.1 will re-introduce it once a true peer-to-peer migrator
+// is wired. `no_headroom` is the tripwire for sustained
+// full-cluster pressure (call the operator). Same caching
+// rules as RebalanceDecisions — the returned Counter is safe
+// to retain.
+func (m *OpsMetrics) PressureReassignments(outcome string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.pressureReassignmentsTotal.WithLabelValues(outcome)
+}
+
+// OverflowTargetSpillHits returns the per-(outcome) counter the
+// Tier A10 / ADR-088 pressure-rebalancer increments once per app
+// per sweep when an overflow_node preference was consulted.
+// outcome ∈ {used, unavailable, fallback_used}. `used` is the
+// happy path (the preferred node had headroom and the engine
+// reassigned to it); `unavailable` is the spill-out tripwire
+// (the preferred node was inactive, full, or gone — the engine
+// fell through to the A9 first-peer-with-headroom path);
+// `fallback_used` answers "did the fallback save the sweep?"
+// after an `unavailable` observation. A high `unavailable` rate
+// with a low `fallback_used` rate is the sustained-full-cluster-
+// pressure tripwire. Same caching rules as PressureReassignments
+// — the returned Counter is safe to retain.
+func (m *OpsMetrics) OverflowTargetSpillHits(outcome string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.overflowTargetSpillHitsTotal.WithLabelValues(outcome)
 }
 
 // LiveMigrationDecisions returns the labelled counter for the
@@ -3196,7 +3397,7 @@ func (m *OpsMetrics) CapacitySignatureRejected() prometheus.Counter {
 // (issue #279 / PR-B / ADR-039). The histogram is per-RPC (not
 // per-tick) and unlabelled; the underlying Histogram is a
 // singleton, not a vec. nil on daemons that don't expose the
-// path (apid, imaged, builderd, gatewayd, meterd, githubd,
+// path (apid, imaged, builderd, gatewayd-internal, meterd, githubd,
 // faas CLI) — the vmmdgrpc.Stats and scheddgrpc.ListInstanceStats
 // handlers guard the call with a nil check. Safe to cache.
 func (m *OpsMetrics) CPUStatsCollectDuration() prometheus.Histogram {

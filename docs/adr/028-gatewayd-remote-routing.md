@@ -1,6 +1,13 @@
 # ADR-028 · gatewayd Remote Routing via gRPC-Bridged ForwardHTTP
 
 - **Status:** accepted v1.2 (2026-08-01). Shipped via PRs #112, #113, #114, #115, #119, #122; the placeholder `host_ip:8080` is gone, `WakeResponse.node_id` is on the wire, and gatewayd's `NodeClientCache` evicts on `compute_node_changed`. v1.1 cross-references ADR-025 v1.1 and ADR-029 v1.1 — the three-axis story now reads as a unit. v1.2 (PR-D / ADR-047): the legacy unary `ForwardHTTP` RPC was removed in favour of the bidi `ForwardHTTPStream` RPC — every code path between gatewayd and vmmd now streams. The §6.4 failure-mode catalogue (spec §6.4) lists the per-error-mode contract for `ForwardHTTPStream` (overlay partition, per-instance bridge fail, TargetSet regression guard, WakeResponse wire-shape reverts).
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-22 (proposed); 2026-07-31 (accepted v1.1); 2026-08-01 (accepted v1.2 — streaming supersession)
 - **Issue:** #98
 - **Decision:** Replace gatewayd's direct HTTP-to-inner-VM reverse proxy

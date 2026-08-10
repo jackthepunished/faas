@@ -4,6 +4,14 @@ Status: Accepted, 2026-07-28. Owner: @poyrazK. Closes issue #294.
 Related: spec §5.1 (audit events), §11 (security rules), ADR-035
 (auth audit events), ADR-021 (grace timer — sweep cadence precedent).
 
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
+
 ## Context
 
 The three webhook ingresses on the box (GitHub via gatewayd, Stripe +

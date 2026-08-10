@@ -43,7 +43,7 @@ const (
 // the full state row verbatim.
 //
 // PR-H retires the AppBinding struct in githubdgrpc — the only
-// remaining caller is cmd/gatewayd/end_to_end_test.go, which gets
+// remaining caller is cmd/gatewayd-internal/end_to_end_test.go, which gets
 // updated to the new return shape in this commit.
 type AppBindingStore interface {
 	GetAppBinding(ctx context.Context, repoFullName, branch string) (state.GitHubBinding, error)
@@ -620,12 +620,12 @@ func refToBranch(ref string) string {
 
 // WebhookHTTPHandler returns an http.Handler that serves
 // POST /webhooks/github. Today it returns 503 because the proxy
-// (cmd/gatewayd) verifies the signature and forwards; this handler
-// is loopback-only and reachable from the gatewayd reverse proxy.
+// (cmd/gatewayd-internal) verifies the signature and forwards; this handler
+// is loopback-only and reachable from the gatewayd-internal reverse proxy.
 // A future PR may let githubd stand up its own listener when
-// gatewayd isn't on the same host (not in v1.0).
+// gatewayd-internal isn't on the same host (not in v1.0).
 func (s *Service) WebhookHTTPHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "githubd: webhook arrives via gatewayd's edge-verifying proxy", http.StatusNotImplemented)
+		http.Error(w, "githubd: webhook arrives via gatewayd-internal's edge-verifying proxy", http.StatusNotImplemented)
 	})
 }

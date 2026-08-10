@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { CreateCronRequest } from '../models/CreateCronRequest.js';
 import type { CronResponse } from '../models/CronResponse.js';
+import type { ListCronRunsResponse } from '../models/ListCronRunsResponse.js';
 import type { UpdateCronRequest } from '../models/UpdateCronRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
@@ -122,6 +123,59 @@ export class CronsService {
       url: '/v1/crons/{id}',
       path: {
         'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List recent runs of a cron.
+   * Execution history for one cron, newest first. Each row reports
+   * when the fire started, how long it took (`duration_ms`,
+   * computed server-side), and a normalized `outcome` — so a
+   * timeout is distinguishable from a generic failure without
+   * parsing `error`.
+   *
+   * Paginated by `?before=<id>` (the LAST id of the returned
+   * slice). Defaults to 10 per page; capped at 100. For a wider,
+   * cross-source view use `GET /v1/invocations`.
+   *
+   * @returns ListCronRunsResponse A page of runs for this cron, newest first.
+   * @throws ApiError
+   */
+  public static listCronRuns({
+    id,
+    before,
+    limit = 10,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+    /**
+     * Cursor — return runs older than this run id. Omit for the most recent page.
+     */
+    before?: string,
+    /**
+     * Page size; 1-100, default 10.
+     */
+    limit?: number,
+  }): CancelablePromise<ListCronRunsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/crons/{id}/runs',
+      path: {
+        'id': id,
+      },
+      query: {
+        'before': before,
+        'limit': limit,
       },
       errors: {
         401: `code: unauthorized`,

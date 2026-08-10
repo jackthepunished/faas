@@ -48,7 +48,7 @@ func TestRingBuffer_EvictsOldBuckets(t *testing.T) {
 }
 
 // TestRingBuffer_GatewayRestartDoesNotSpike verifies that a
-// cumulative-count regression (gatewayd restart resets the counter)
+// cumulative-count regression (gatewayd-internal restart resets the counter)
 // does NOT surface as a traffic spike. Without the clamp, a
 // restart would feed the scale-up trigger a fake burst and admit
 // dozens of instances. With the cold-boot guard, the restart
@@ -59,7 +59,7 @@ func TestRingBuffer_GatewayRestartDoesNotSpike(t *testing.T) {
 	base := time.Unix(1_000_000, 0)
 	// First observation: cumulative = 1000. Seeded with delta=0.
 	r.Touch(base, map[string]int64{"app1": 1000})
-	// Second observation: cumulative = 5 (gatewayd restarted).
+	// Second observation: cumulative = 5 (gatewayd-internal restarted).
 	// Regression path: clear ring, reseed with delta=0.
 	r.Touch(base.Add(time.Second), map[string]int64{"app1": 5})
 	// Sum = 0 (cold-boot guard on both seed + restart seed).

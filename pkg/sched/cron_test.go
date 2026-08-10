@@ -14,9 +14,9 @@ import (
 )
 
 // fakeSynth is the cron-loop stub for the gateway-internal RPC. The
-// production loop wires an HTTP client pointed at /run/faas/gatewayd-
-// internal.sock; tests record the calls so the dispatch path is
-// exercised without binding a socket.
+// production loop wires an HTTP client pointed at
+// /run/faas/gatewayd-internal.sock; tests record the calls so the
+// dispatch path is exercised without binding a socket.
 type fakeSynth struct {
 	calls atomic.Int64
 	last  atomic.Value // last synth call: (appID, method, path)
@@ -36,7 +36,7 @@ func (f *fakeSynth) SynthesizeRequest(_ context.Context, appID, method, path str
 
 // Invoke is the Move 1 path. fakeSynth just records the call so
 // cron dispatch tests can assert on it (the production path goes
-// through gatewayd).
+// through gatewayd-internal).
 func (f *fakeSynth) Invoke(_ context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
 	f.calls.Add(1)
 	f.last.Store(synthCall{AppID: appID, Method: inv.Method, Path: inv.Path})

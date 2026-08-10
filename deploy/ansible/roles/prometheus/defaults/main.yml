@@ -47,7 +47,7 @@ prom_alertmanager_url: "http://127.0.0.1:9093"
 # - imaged default 9102 (cmd/imaged/main.go — PR #132).
 # - githubd shares the loopback :8083 mux (pkg/githubd/server.go —
 #   no separate metrics port; webhook + /metrics on the same listener).
-# - gatewayd default 9090 (cmd/gatewayd/config.go — Prometheus role
+# - gatewayd-public default 9090 (cmd/gatewayd-public/config.go — Prometheus role
 #   defaults previously had 9093; drifted from real).
 # - builderd/meterd MetricsAddr is operator-supplied TOML. The ports
 #   here match the production deployment on the EX44:

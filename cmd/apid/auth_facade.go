@@ -2,7 +2,7 @@
 // s.requireScope + s.loadApp method names delegate to pkg/auth.Middleware
 // so the route table stays unchanged (cmd/apid/server.go mounts every
 // /v1/* route through these methods). The middleware lives in pkg/auth
-// because Move 4 (issue #254) needs cmd/gatewayd to compose the same
+// because Move 4 (issue #254) needs cmd/gatewayd-internal to compose the same
 // chain without duplicating cmd/apid's auth surface.
 //
 // ADR-046 records the extraction. This file is the apid-side seam:
@@ -18,7 +18,7 @@
 //
 // What stays in cmd/apid (NOT delegated to pkg/auth):
 //   - s.adminAllows — per-daemon operator-email allowlist (compute_nodes.go).
-//     PR-2 (gatewayd AppLogsHandler) doesn't need it; keep the seam
+//     PR-2 (gatewayd-internal AppLogsHandler) doesn't need it; keep the seam
 //     per-daemon.
 //   - mfaEnrollRequired — login-handler-only predicate that decides
 //     whether to stamp MfaPending=true on a freshly issued cookie.

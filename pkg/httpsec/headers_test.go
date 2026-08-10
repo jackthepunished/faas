@@ -213,7 +213,7 @@ func TestNonce_GateTrue_EmitsCSP(t *testing.T) {
 }
 
 // TestNonce_GateFalse_OmitsCSP confirms the gate-false path leaves
-// no CSP header — gatewayd's customer-app path depends on this.
+// no CSP header — gatewayd-internal's customer-app path depends on this.
 func TestNonce_GateFalse_OmitsCSP(t *testing.T) {
 	rec := httptest.NewRecorder()
 	httpsec.Nonce(func(*http.Request) bool { return false },
@@ -227,7 +227,7 @@ func TestNonce_GateFalse_OmitsCSP(t *testing.T) {
 }
 
 // TestNonce_GateNil_OmitsCSP confirms a nil gate (defensive —
-// gatewayd's wiring must pass isApidPath, but a unit test should
+// gatewayd-internal's wiring must pass isApidPath, but a unit test should
 // not crash on accidental nil) suppresses CSP rather than emitting
 // it without scoping.
 func TestNonce_GateNil_OmitsCSP(t *testing.T) {

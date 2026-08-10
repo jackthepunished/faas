@@ -1,6 +1,13 @@
 # ADR-045 · Account-scoped list endpoints (issue #393)
 
 - **Status:** accepted
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-28
 - **Decision:** Add three additive account-scoped list endpoints — `GET /v1/instances`, `GET /v1/secrets`, `GET /v1/apps/metrics` — that each replace a per-app fan-out (issue #393). Reuse the existing per-app pgstore / PromQL / middleware surfaces verbatim; no middleware change on apid.
 - **Why:** Today three dashboard pages (Workers, Secrets, Overview) issue one HTTP request per app to render — **N+1** at Pro (25) and Scale (100). Each call is independently `authLimited`, so a customer opening the dashboard is the most likely path to trip *their own* rate limit while merely reading their own data. Fan-out also creates a partial-failure mode the console papers over with a footnote ("could not read instances for: x, y") because one 404 must not blank the page.

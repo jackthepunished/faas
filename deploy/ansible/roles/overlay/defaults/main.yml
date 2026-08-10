@@ -1,7 +1,7 @@
 # Issue #98 / ADR-028: cross-box overlay (Tailscale / Wireguard).
 #
-# The overlay is the dial layer gatewayd uses to reach remote vmmd
-# boxes. Without it, a multi-node FaaS is impossible: gatewayd
+# The overlay is the dial layer gatewayd-internal uses to reach remote vmmd
+# boxes. Without it, a multi-node FaaS is impossible: gatewayd-internal
 # would have to reach the vmmd host's bridge IP, which is bound to
 # the jailer netns inside that host.
 #
@@ -41,10 +41,10 @@ faas_overlay_hostname: "{{ inventory_hostname }}"
 # these to scope per-node firewall rules (e.g. tag:cp for control
 # plane, tag:compute for vmmd hosts).
 faas_overlay_tags: "tag:faas"
-# Acceptance routes: gatewayd needs to reach vmmd on the overlay.
+# Acceptance routes: gatewayd-internal needs to reach vmmd on the overlay.
 # Both providers route the vmmd gRPC port over the overlay
 # interface via systemd's BindToInterface= directive — see
 # templates/faas-vmmd.service.j2. The port is fixed (50051)
-# because gatewayd's NodeClientCache derives it from the
+# because gatewayd-internal's NodeClientCache derives it from the
 # compute_nodes row at dial time.
 faas_overlay_vmmd_port: 50051

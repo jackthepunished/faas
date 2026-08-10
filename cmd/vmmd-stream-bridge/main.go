@@ -1,5 +1,5 @@
 // Command vmmd-stream-bridge (issue #686) is the inner-leg H2C
-// streaming bridge for the gatewayd → vmmd → guest path.
+// streaming bridge for the gatewayd-internal → vmmd → guest path.
 //
 // The legacy streaming bridge (buildStreamingBridgeScript in
 // pkg/vmmdgrpc/forward.go:989) shell-scripts a `/dev/tcp` dial and

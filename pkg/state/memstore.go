@@ -2987,6 +2987,24 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.ClearAuthDefaultFlippedAt {
 		a.AuthDefaultFlippedAt = nil
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// Set bit controls the write — "don't touch" by default,
+	// "explicit NULL" (clear → A9 fallback) when Set is true
+	// with a nil pointer, and "set" when Set is true with a
+	// non-nil pointer. Apid has already validated the UUID
+	// against the empty-uuid CHECK + FK with ON DELETE SET
+	// NULL (migration 00167) before reaching this path; the
+	// store is a plain column write. Memstore mirrors the
+	// pgstore shape so every test that exercises UpdateApp
+	// sees the same behaviour regardless of backend.
+	if p.SetOverflowNode {
+		if p.OverflowNode == nil {
+			a.OverflowNode = nil
+		} else {
+			s := *p.OverflowNode
+			a.OverflowNode = &s
+		}
+	}
 	m.apps[id] = a
 	return a, nil
 }
@@ -4282,7 +4300,7 @@ func (m *MemStore) DeleteCron(_ context.Context, id, appID string) error {
 
 // MarkCronFired stamps the cron row's LastFiredAt field. Used by the
 // schedd dispatch loop after a synthetic cron request has been
-// dispatched through gatewayd (spec §4.4, M7).
+// dispatched through gatewayd-internal (spec §4.4, M7).
 func (m *MemStore) MarkCronFired(_ context.Context, id string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4435,6 +4453,8 @@ func (m *MemStore) CompleteInvocation(_ context.Context, id string, result json.
 	}
 	now := time.Now()
 	inv.CompletedAt = &now
+	outcome := OutcomeSuccess
+	inv.Outcome = &outcome
 	m.invocations[id] = inv
 	return nil
 }
@@ -4448,7 +4468,7 @@ func (m *MemStore) CompleteInvocation(_ context.Context, id string, result json.
 // so the drain's redelivery is a no-op). Mirrors the PG contract
 // exactly so the drain's cap re-check on pending rows works on both
 // backends.
-func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string, retryAfter time.Duration, budget int) error {
+func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string, retryAfter time.Duration, budget int, opts ...FailOption) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inv, ok := m.invocations[id]
@@ -4458,6 +4478,7 @@ func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string
 	if inv.State != InvocationPending && inv.State != InvocationDispatching {
 		return ErrNotFound
 	}
+	failOpts := ApplyFailOptions(opts)
 	inv.LastError = lastError
 	if retryAfter > 0 {
 		// Transient. Either re-queue (budget == 0 or attempts not yet
@@ -4481,10 +4502,18 @@ func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string
 			inv.State = InvocationDeadLetter
 			now := time.Now()
 			inv.CompletedAt = &now
+			// issue #791 — the dead-letter arm overrides whatever the
+			// caller passed, exactly as it already overrides state.
+			outcome := OutcomeDeadLetter
+			inv.Outcome = &outcome
 		} else {
 			inv.State = InvocationPending
 			inv.DueAt = time.Now().Add(retryAfter)
 			inv.LeaseExpiresAt = nil
+			// issue #791 — the row is non-terminal again, so it carries
+			// no outcome. Clearing matters on a re-queue after a prior
+			// terminal classification would otherwise linger.
+			inv.Outcome = nil
 			// Do NOT bump attempts here. ClaimInvocation already
 			// incremented it for this dispatch attempt; double-bumping
 			// would make MaxQueueAttempts=10 dead-letter after 5
@@ -4497,6 +4526,10 @@ func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string
 		inv.State = InvocationFailed
 		now := time.Now()
 		inv.CompletedAt = &now
+		// issue #791 — the caller's classification lands here;
+		// ApplyFailOptions defaults it to OutcomeFailed.
+		outcome := failOpts.Outcome
+		inv.Outcome = &outcome
 	}
 	m.invocations[id] = inv
 	return nil
@@ -4580,6 +4613,43 @@ func (m *MemStore) ListInvocationsForAccount(_ context.Context, accountID string
 		// If the cursor isn't in the page (already GC'd, expired),
 		// PgStore falls back to the inner SELECT; MemStore returns the
 		// full page, which is the cheap-and-cheerful answer.
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListCronRunsForCron is the per-cron run-history read (issue #791).
+// Mirrors ListInvocationsForAccount's ordering and cursor semantics
+// with a CronID predicate instead of an account one. MemStore is
+// single-process so a linear scan is fine.
+func (m *MemStore) ListCronRunsForCron(_ context.Context, cronID string, limit int, before string) ([]Invocation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Invocation
+	for _, inv := range m.invocations {
+		if inv.CronID != nil && *inv.CronID == cronID {
+			out = append(out, inv)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	if before != "" {
+		cursorIdx := -1
+		for i, inv := range out {
+			if inv.ID == before {
+				cursorIdx = i
+				break
+			}
+		}
+		if cursorIdx >= 0 {
+			out = out[cursorIdx+1:]
+		}
 	}
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
@@ -5985,7 +6055,7 @@ func (m *MemStore) LookupNodeKey(_ context.Context, computeNodeID string, keyID 
 // goroutine reanimates a drained node to true on the next successful
 // dial. MemStore flips the flag in place; production also flips but
 // additionally fires the compute_node_changed pg_notify trigger so
-// gatewayd sees the change without polling.
+// gatewayd-internal sees the change without polling.
 func (m *MemStore) SetComputeNodeActive(_ context.Context, id string, active bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

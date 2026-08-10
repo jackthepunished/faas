@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/state"
 	stripe "github.com/stripe/stripe-go"
 )
@@ -42,40 +43,28 @@ var (
 	ErrNegativeQuantity = errors.New("stripex: negative usage quantity")
 )
 
-// WireQuantityMillicentsPerGBHour is the scale factor used to convert
-// GB-RAM-hours into the integer wire-quantity that Stripe's metered
-// subscription_item accepts. The spec defines billing in
-// millicents-of-GB-h (1 GB-h = 1000 wire units), so millicents-of-GB
-// and wire-quantity-of-GB-h are the same integer axis. Centralized in
-// one constant so the conversion and the tests stay in lockstep.
-const WireQuantityMillicentsPerGBHour = 1000
+// WireQuantityMillicentsPerGBHour + WireQuantityForMBSeconds moved to
+// pkg/billing/plans.go — the wire-quantity unit is a financial-model
+// constant shared with pkg/billing/paddle. Keeping a single declaration
+// ensures the two providers cannot drift on the integer-money formula
+// (CLAUDE.md: "Floats near money fail review"; pre-P-fixes code had
+// pkg/billing/stripe as the only owner and Paddle hard-coded Quantity=1,
+// silently under-billing by ~250× for the canonical Hobby 24h case).
+//
+// These package-local aliases keep the call sites below readable without
+// importing pkg/billing at every one — the canonical helpers live at
+// billing.WireQuantityForMBSeconds and billing.WireQuantityMillicentsPerGBHour.
+const (
+	WireQuantityMillicentsPerGBHour = billing.WireQuantityMillicentsPerGBHour
+	secondsPerGBHour                = billing.SecondsPerGBHour
+)
 
-// secondsPerGBHour is the integer conversion factor for mb_seconds →
-// GB-RAM-hours: 1 MB resident for 1 second = 1/(1024*3600) GB-h. The
-// product is exact integer arithmetic — no float — so the wire
-// quantity is deterministic across architectures and rounding modes.
-const secondsPerGBHour = 1024 * 3600
-
-// WireQuantityForMBSeconds converts a summed mb_seconds window into the
-// integer wire quantity Stripe's metered subscription_item accepts.
-//
-//	qty = mbSeconds * WireQuantityMillicentsPerGBHour / secondsPerGBHour
-//
-// Pure integer math — no float, no per-hour truncation loss. Extracted
-// from the SDK-touching push path so the money-critical formula can be
-// pinned by a hermetic unit test (no live Stripe). The canonical
-// acceptance case is a 256 MB Hobby app (billed at ram+8 = 264 MB)
-// resident for a full 24 h: 264 * 60 * 60 * 24 = 22_809_600 mb-s →
-// 6187. See usage_math_test.go.
-//
-// Truncation is by design — the sub-milliunit remainder is dropped
-// exactly the way the spec's integer money model requires (CLAUDE.md:
-// "Floats near money fail review"). Range guard: the largest billable
-// window under spec §4.7 is a 1 TB instance resident for 24 h =
-// ~2.1e9 mb_seconds, so mbSeconds * 1000 ≈ 2.1e12, well below int64
-// max (~9.2e18).
+// WireQuantityForMBSeconds is the stripe-side alias for billing.WireQuantityForMBSeconds.
+// Kept as a one-line wrapper so the pre-existing call sites (usage.go:126,
+// usage_math_test.go) and any future tests don't need to import pkg/billing
+// just to compute a wire quantity. The shared helper is the source of truth.
 func WireQuantityForMBSeconds(mbSeconds int64) int64 {
-	return mbSeconds * WireQuantityMillicentsPerGBHour / secondsPerGBHour
+	return billing.WireQuantityForMBSeconds(mbSeconds)
 }
 
 // legacyWireQuantityForGBHours is the pre-M7 float wire formula
@@ -87,7 +76,7 @@ func WireQuantityForMBSeconds(mbSeconds int64) int64 {
 // WireQuantityForMBSeconds path replaced it. Use
 // WireQuantityForMBSeconds instead.
 func legacyWireQuantityForGBHours(gbHours float64) int64 {
-	return int64(gbHours * WireQuantityMillicentsPerGBHour)
+	return int64(gbHours * float64(WireQuantityMillicentsPerGBHour))
 }
 
 // pushUsageRecordSDKSum is the seam where stripe-go lands (issue #52).

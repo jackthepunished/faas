@@ -64,11 +64,22 @@ from .async_invoke_response import AsyncInvokeResponse
 from .audit_event_response import AuditEventResponse
 from .audit_event_response_data import AuditEventResponseData
 from .audit_event_response_severity import AuditEventResponseSeverity
+from .audit_log_entry import AuditLogEntry
+from .audit_log_entry_data import AuditLogEntryData
 from .auth_capabilities import AuthCapabilities
 from .auth_providers import AuthProviders
+from .billing_catalog_entry import BillingCatalogEntry
+from .billing_catalog_entry_kind import BillingCatalogEntryKind
+from .billing_catalog_entry_plan import BillingCatalogEntryPlan
+from .billing_catalog_response import BillingCatalogResponse
 from .billing_portal_response import BillingPortalResponse
+from .billing_reconcile_response import BillingReconcileResponse
 from .build_export_response import BuildExportResponse
 from .build_provenance_response import BuildProvenanceResponse
+from .build_response import BuildResponse
+from .build_response_failure_class import BuildResponseFailureClass
+from .build_response_kind import BuildResponseKind
+from .build_response_status import BuildResponseStatus
 from .change_member_role_request import ChangeMemberRoleRequest
 from .change_member_role_request_role import ChangeMemberRoleRequestRole
 from .change_plan_request import ChangePlanRequest
@@ -155,10 +166,12 @@ from .invoke_response_result import InvokeResponseResult
 from .invoke_response_status import InvokeResponseStatus
 from .issue_account_credit_body import IssueAccountCreditBody
 from .list_audit_events_response import ListAuditEventsResponse
+from .list_audit_log_response import ListAuditLogResponse
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
+from .magic_link_signup_request import MagicLinkSignupRequest
 from .member_list_response import MemberListResponse
 from .mfa_confirm_request import MFAConfirmRequest
 from .mfa_confirm_response import MFAConfirmResponse
@@ -204,6 +217,11 @@ from .plan_workload_class import PlanWorkloadClass
 from .plan_workload_tier import PlanWorkloadTier
 from .post_account_sessions_revoke_all_body import PostAccountSessionsRevokeAllBody
 from .problem import Problem
+from .programmatic_api_key import ProgrammaticAPIKey
+from .programmatic_auth_response import ProgrammaticAuthResponse
+from .programmatic_auth_response_plan import ProgrammaticAuthResponsePlan
+from .programmatic_signup_magic_link_response_200 import ProgrammaticSignupMagicLinkResponse200
+from .programmatic_signup_magic_link_response_200_status import ProgrammaticSignupMagicLinkResponse200Status
 from .project_apply_request import ProjectApplyRequest
 from .project_scan_request import ProjectScanRequest
 from .public_auth_block import PublicAuthBlock
@@ -281,6 +299,7 @@ from .update_app_webhook_request_retry_policy import UpdateAppWebhookRequestRetr
 from .update_cron_request import UpdateCronRequest
 from .update_deployment_min_instances_body import UpdateDeploymentMinInstancesBody
 from .update_deployment_request import UpdateDeploymentRequest
+from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .usage_export_response import UsageExportResponse
 from .usage_response import UsageResponse
 from .usage_summary_response import UsageSummaryResponse
@@ -355,11 +374,22 @@ __all__ = (
     "AuditEventResponse",
     "AuditEventResponseData",
     "AuditEventResponseSeverity",
+    "AuditLogEntry",
+    "AuditLogEntryData",
     "AuthCapabilities",
     "AuthProviders",
+    "BillingCatalogEntry",
+    "BillingCatalogEntryKind",
+    "BillingCatalogEntryPlan",
+    "BillingCatalogResponse",
     "BillingPortalResponse",
+    "BillingReconcileResponse",
     "BuildExportResponse",
     "BuildProvenanceResponse",
+    "BuildResponse",
+    "BuildResponseFailureClass",
+    "BuildResponseKind",
+    "BuildResponseStatus",
     "ChangeMemberRoleRequest",
     "ChangeMemberRoleRequestRole",
     "ChangePlanRequest",
@@ -446,10 +476,12 @@ __all__ = (
     "InvokeResponseStatus",
     "IssueAccountCreditBody",
     "ListAuditEventsResponse",
+    "ListAuditLogResponse",
     "ListInstancesResponse",
     "ListInvocationsResponse",
     "ListOrgAPIKeysResponse",
     "ListSecretsForAccountResponse",
+    "MagicLinkSignupRequest",
     "MemberListResponse",
     "MFAConfirmRequest",
     "MFAConfirmResponse",
@@ -495,6 +527,11 @@ __all__ = (
     "PlanWorkloadTier",
     "PostAccountSessionsRevokeAllBody",
     "Problem",
+    "ProgrammaticAPIKey",
+    "ProgrammaticAuthResponse",
+    "ProgrammaticAuthResponsePlan",
+    "ProgrammaticSignupMagicLinkResponse200",
+    "ProgrammaticSignupMagicLinkResponse200Status",
     "ProjectApplyRequest",
     "ProjectScanRequest",
     "PublicAuthBlock",
@@ -570,6 +607,7 @@ __all__ = (
     "UpdateCronRequest",
     "UpdateDeploymentMinInstancesBody",
     "UpdateDeploymentRequest",
+    "UpdateDeploymentTrafficRequest",
     "UsageExportResponse",
     "UsageResponse",
     "UsageSummaryResponse",

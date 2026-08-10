@@ -168,6 +168,7 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/crons/{id}":                     "UpdateCron",
 	"POST /v1/crons":                           "CreateCron",
 	"GET /v1/crons":                            "ListCrons",
+	"GET /v1/crons/{id}/runs":                  "ListCronRuns", // issue #791 — per-cron execution history
 	"GET /v1/usage/summary":                    "UsageSummary",
 	"GET /v1/usage":                            "GetUsage",
 	"GET /v1/usage/daily":                      "UsageDaily",

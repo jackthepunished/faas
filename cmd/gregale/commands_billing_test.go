@@ -1,4 +1,4 @@
-// commands_billing_test.go — issue #253 CLI surface pin.
+// commands_billing_test.go — issue #253 + #242 CLI surface pin.
 //
 // Pins the four documented behaviours of `faas billing portal`:
 //   1. --print prints the URL and skips the browser
@@ -6,6 +6,11 @@
 //   3. empty URL → "portal not configured" friendly error, exit 1
 //   4. no auth → exit 2 (handled by `requireNoAuth`)
 //   5. unknown subcommand → usage error, exit 1
+//
+// Issue #242 adds retry / cancel / payment-method subcommands:
+//   - retry: POST /v1/billing/retry → 200; prints attempt+provider IDs
+//   - cancel: POST /v1/billing/cancel → 200; prints effective date
+//   - payment-method: GET /v1/billing/portal → prints card-on-file
 //
 // The dispatcher (cmdBilling) is pinned by the subcommand routing:
 // `faas billing help` exits 0; `faas billing bogus` exits 1.
@@ -198,7 +203,8 @@ func TestCmdBilling_Dispatch(t *testing.T) {
 		}
 		// PR-P3 subcommands also appear in the help text so an
 		// operator running `faas billing help` discovers them.
-		for _, sub := range []string{"status", "price-catalog", "reconcile"} {
+		// Issue #242 adds retry / cancel / payment-method.
+		for _, sub := range []string{"status", "price-catalog", "reconcile", "retry", "cancel", "payment-method"} {
 			if !strings.Contains(stdout.String(), sub) {
 				t.Errorf("help output missing %q subcommand; got: %q", sub, stdout.String())
 			}
@@ -371,3 +377,223 @@ func parseTime(t *testing.T, s string) time.Time {
 // is referenced to ensure we exercise the seam that cmdBillingPortal
 // touches.
 var _ = browser.Default
+
+// ─── Issue #242: retry / cancel / payment-method ────────────────────────
+//
+// These three subcommands slot into the dispatch help text added at
+// commands_billing.go::printBillingUsage. The stubs mirror the
+// existing billingPortalStub shape — minimal apid-side answer for
+// each of the new endpoints.
+
+// billingMutationsStub mounts both POST /v1/billing/retry and
+// POST /v1/billing/cancel with the configure() responses. Tests
+// that need only one of the two call the matching subcommand and
+// the other route goes unhit. The mux 404s anything else so a
+// misrouted request is visible in test output.
+func billingMutationsStub(t *testing.T, retry func() api.BillingRetryResponse, cancel func() api.BillingCancelResponse) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/retry", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(retry())
+	})
+	mux.HandleFunc("/v1/billing/cancel", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(cancel())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestCmdBillingRetry_Success pins the happy path: POST returns
+// 200 with attempt + provider IDs, CLI prints both. --json emits
+// the raw envelope.
+func TestCmdBillingRetry_Success(t *testing.T) {
+	apiURL := billingMutationsStub(t,
+		func() api.BillingRetryResponse {
+			return api.BillingRetryResponse{
+				AttemptID:     "in_1abcd",
+				ProviderRefID: "pi_1abcd",
+				Status:        "pending_provider_confirmation",
+			}
+		},
+		func() api.BillingCancelResponse {
+			t.Fatal("cancel route should not be hit on retry")
+			return api.BillingCancelResponse{}
+		},
+	)
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restore := captureStdout(t)
+	defer restore()
+	if code := cmdBillingRetry(nil); code != 0 {
+		t.Errorf("cmdBillingRetry = %d, want 0", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{"in_1abcd", "pi_1abcd", "pending_provider_confirmation"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q; got: %q", want, out)
+		}
+	}
+}
+
+// TestCmdBillingRetry_NoOpenCharge prints the friendly hint when
+// the server returns 404 + code=billing_no_open_charge (account in
+// good standing; the dunning email was stale).
+func TestCmdBillingRetry_NoOpenCharge(t *testing.T) {
+	// Override the stub with a 404-only variant.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/retry", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(api.Problem{
+			Status: http.StatusNotFound,
+			Code:   "billing_no_open_charge",
+			Title:  "No open charge to retry",
+			Detail: "the account is in good standing; no open invoice or transaction to retry",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	apiURL := srv.URL
+
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stderr, restore := captureStderr(t)
+	defer restore()
+	if code := cmdBillingRetry(nil); code != 1 {
+		t.Errorf("cmdBillingRetry no-open-charge = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "good standing") {
+		t.Errorf("stderr missing friendly hint; got: %q", stderr.String())
+	}
+}
+
+// TestCmdBillingRetry_RequiresLogin pins the no-auth path.
+func TestCmdBillingRetry_RequiresLogin(t *testing.T) {
+	requireNoAuth(t)
+	if code := cmdBillingRetry(nil); code != 2 {
+		t.Errorf("cmdBillingRetry no-auth = %d, want 2", code)
+	}
+}
+
+// TestCmdBillingCancel_Success pins the happy path. The y/N
+// confirm is skipped via --yes (the typed-confirm path is the
+// same code path; tested separately).
+func TestCmdBillingCancel_Success(t *testing.T) {
+	apiURL := billingMutationsStub(t,
+		func() api.BillingRetryResponse { return api.BillingRetryResponse{} },
+		func() api.BillingCancelResponse {
+			return api.BillingCancelResponse{
+				CancelScheduled: true,
+				EffectiveAt:     parseTime(t, "2026-09-08T00:00:00Z"),
+			}
+		},
+	)
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restore := captureStdout(t)
+	defer restore()
+	if code := cmdBillingCancel([]string{"--yes"}); code != 0 {
+		t.Errorf("cmdBillingCancel --yes = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "2026-09-08") {
+		t.Errorf("stdout missing effective date; got: %q", stdout.String())
+	}
+}
+
+// TestCmdBillingCancel_AlreadyCancelledFriendlyHint: server
+// returns 409 + code=billing_already_cancelled; CLI renders the
+// hint instead of the SDK error.
+func TestCmdBillingCancel_AlreadyCancelledFriendlyHint(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/cancel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(api.Problem{
+			Status: http.StatusConflict,
+			Code:   "billing_already_cancelled",
+			Title:  "No active subscription to cancel",
+			Detail: "this account has no active subscription to cancel",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stderr, restore := captureStderr(t)
+	defer restore()
+	if code := cmdBillingCancel([]string{"--yes"}); code != 1 {
+		t.Errorf("cmdBillingCancel already-cancelled = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "No active subscription") {
+		t.Errorf("stderr missing friendly hint; got: %q", stderr.String())
+	}
+}
+
+// TestCmdBillingPaymentMethod_PrintsAndOpens pins the read+open
+// flow: card-on-file summary rendered, then browser.Open called
+// for the portal URL.
+func TestCmdBillingPaymentMethod_PrintsAndOpens(t *testing.T) {
+	apiURL := billingPortalStub(t, func() api.BillingPortalResponse {
+		return api.BillingPortalResponse{
+			URL: "https://billing.example.com/portal?account=acct_42",
+			PaymentMethod: &api.PaymentMethodSummary{
+				Brand:    "visa",
+				Last4:    "4242",
+				ExpMonth: 12,
+				ExpYear:  2027,
+			},
+		}
+	})
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stdout, restore := captureStdout(t)
+	defer restore()
+	if code := cmdBillingPaymentMethod([]string{"--print"}); code != 0 {
+		t.Errorf("cmdBillingPaymentMethod --print = %d, want 0", code)
+	}
+	out := stdout.String()
+	for _, want := range []string{"visa", "4242", "12/2027", "https://billing.example.com/portal"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q; got: %q", want, out)
+		}
+	}
+}
+
+// TestCmdBillingPaymentMethod_NoCardOnFile pins the no-card path:
+// server returns URL but no PaymentMethod block; CLI renders the
+// "no payment method on file" hint + opens the portal URL.
+func TestCmdBillingPaymentMethod_NoCardOnFile(t *testing.T) {
+	apiURL := billingPortalStub(t, func() api.BillingPortalResponse {
+		return api.BillingPortalResponse{
+			URL: "https://billing.example.com/portal?account=acct_42",
+		}
+	})
+	t.Setenv("FAAS_API", apiURL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	stderr, restore := captureStderr(t)
+	defer restore()
+	if code := cmdBillingPaymentMethod([]string{"--print"}); code != 1 {
+		t.Errorf("cmdBillingPaymentMethod no-card = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "No payment method") {
+		t.Errorf("stderr missing friendly hint; got: %q", stderr.String())
+	}
+}

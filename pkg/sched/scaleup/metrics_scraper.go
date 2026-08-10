@@ -17,7 +17,7 @@ type HTTPFetcher interface {
 }
 
 // HTTPPromScraper parses `gateway_requests_total{app="..."}` from
-// gatewayd's /metrics endpoint and returns the per-app cumulative
+// gatewayd-internal's /metrics endpoint and returns the per-app cumulative
 // request count. The scraper is purely a parser — the trigger's
 // ring buffer owns the per-app deltas + windowing.
 //
@@ -31,7 +31,7 @@ type HTTPPromScraper struct {
 }
 
 // Scrape implements PromScraper. Reads the entire body into memory
-// (gatewayd's /metrics is small — every request counter line is one
+// (gatewayd-internal's /metrics is small — every request counter line is one
 // row per app per code, so the body is bounded by `apps × 5 codes`).
 // Returns a non-nil empty map on any HTTP / parse error so the
 // trigger's Touch path treats the tick as a no-op without a spammy
@@ -61,7 +61,7 @@ func (s *HTTPPromScraper) Scrape(ctx context.Context) (map[string]int64, error) 
 // per-code; the trigger wants the per-app total). Returns
 // `appID → total count`.
 //
-// The parser is intentionally tiny — gatewayd emits only one metric
+// The parser is intentionally tiny — gatewayd-internal emits only one metric
 // family with the `app` label, and the surrounding exposition is
 // stable. A more sophisticated parser (e.g. prometheus/common) would
 // pull in a substantial dependency for what is fundamentally a
@@ -110,10 +110,10 @@ func parseGatewayRequestsTotal(body string) map[string]int64 {
 
 // NewHTTPPromScraper constructs the production scraper with a
 // shared *http.Client wrapped in an adapter so the underlying
-// transport keeps the connection to gatewayd alive across ticks.
+// transport keeps the connection to gatewayd-internal alive across ticks.
 // Without this, every 1Hz tick would open a fresh TCP connection
 // (60 conn/min to the local listener). The timeout is short (2s)
-// because the scheduler cannot afford to wait on a slow gatewayd —
+// because the scheduler cannot afford to wait on a slow gatewayd-internal —
 // the trigger tick is 1s.
 func NewHTTPPromScraper(url string) *HTTPPromScraper {
 	return &HTTPPromScraper{

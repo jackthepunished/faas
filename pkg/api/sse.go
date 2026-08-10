@@ -56,7 +56,7 @@ type LogEvent struct {
 }
 
 // LogGapEvent is the parsed shape of an `event: gap` SSE frame
-// (issue #517 / PR-B, AC4). The frame is emitted by gatewayd when
+// (issue #517 / PR-B, AC4). The frame is emitted by gatewayd-internal when
 // the per-instance log ring no longer retains the cursor the
 // caller asked for; downstream consumers use Reason +
 // GapToWrittenAt to surface a banner ("some earlier logs were

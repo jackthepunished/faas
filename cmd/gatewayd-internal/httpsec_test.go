@@ -1,6 +1,6 @@
-// httpsec_test.go — confirm the gatewayd-side httpsec wiring
+// httpsec_test.go — confirm the gatewayd-internal-side httpsec wiring
 // (issue #249 / spec §11) distinguishes apid paths from customer-
-// app paths. The full cmd/gatewayd/main.go boot is heavy (TLS
+// app paths. The full cmd/gatewayd-internal/main.go boot is heavy (TLS
 // bundle, schedd dialer, CertMagic); this test pins the load-
 // bearing discriminator — isApidPath — by exercising the same
 // middleware chain main.go builds:
@@ -35,7 +35,7 @@ func httpsecFixture(t *testing.T) http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok:"+r.URL.Path)
 	})
-	// Mirror cmd/gatewayd/main.go's adapter: isApidPath takes a
+	// Mirror cmd/gatewayd-internal/main.go's adapter: isApidPath takes a
 	// string, httpsec.Nonce wants *http.Request.
 	gate := func(r *http.Request) bool { return isApidPath(r.URL.Path) }
 	return httpsec.Static(httpsec.Nonce(gate, inner))
@@ -143,7 +143,7 @@ func TestHttpsec_HSTSDisabledByEnv(t *testing.T) {
 }
 
 // TestHttpsec_HSTSEnabledEnvHelper pins the FAAS_HSTS_ENABLED
-// parsing contract shared by cmd/gatewayd/main.go and
+// parsing contract shared by cmd/gatewayd-internal/main.go and
 // cmd/apid/main.go via pkg/httpsec.HSTSEnabledFromEnv. Both
 // daemons parse the same set of truthy / falsy tokens; this
 // test lives in gatewayd because the regex-heavy gatewayd

@@ -1,7 +1,8 @@
-// End-to-end integration test for the gatewayd → githubd proxy.
+// End-to-end integration test for the gatewayd-internal → githubd proxy.
 //
 // Recorded push_event.json (cmd/githubd/testdata/push_event.json) is
-// HMAC-signed at the gatewayd edge → proxied through newGithubdProxy
+// HMAC-signed at the gatewayd-public edge → forwarded over the
+// unix socket → proxied through newGithubdProxy
 // to a fake githubd loopback listener → Service.HandlePushRequest
 // dispatches via the new reconcile+source path → asserts the
 // proxy translates the upstream response back to the caller.
@@ -90,7 +91,7 @@ func TestEndToEnd_RecordedPushReachesUpstream(t *testing.T) {
 	// without reconcile wired → HandlePushRequest short-circuits
 	// to a nil-deref-free path. We exercise the no-binding fall-
 	// through instead, since wiring reconcile here would mean
-	// re-implementing the unit-test rig inside cmd/gatewayd.
+	// re-implementing the unit-test rig inside cmd/gatewayd-internal.
 	secret := []byte("end-to-end-webhook-secret")
 
 	svc := githubd.NewService(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -194,7 +195,7 @@ func TestEndToEnd_TamperedSignatureRejectedAtEdge(t *testing.T) {
 // TestEndToEnd_M75_RecordedPushReachesUpstream is the slice-9
 // acceptance gate (spec §14 M7.5 row 1): "push to main reaches
 // the upstream githubd listener." The recorded push_event.json
-// is replayed through the full gatewayd → githubd proxy stack.
+// is replayed through the full gatewayd-internal → githubd proxy stack.
 // The proxy contract is the load-bearing assertion here; the
 // githubd reconcile internals are pinned separately by
 // pkg/githubd/service_test.go::TestHandlePushRequest_HappyPath

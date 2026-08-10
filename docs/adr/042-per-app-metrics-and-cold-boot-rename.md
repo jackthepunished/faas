@@ -7,6 +7,14 @@ precedent for "roll up at the edge, not in Prometheus"); ADR-029
 (per-account rate limit — same `__other__` placeholder precedent,
 unrelated in concern).
 
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
+
 ## Context
 
 Customers cannot see how their own app is performing. The only

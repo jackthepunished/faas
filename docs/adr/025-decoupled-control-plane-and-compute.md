@@ -3,6 +3,13 @@
 - **Status:** accepted v1.1 (2026-07-31). v1.1 adds the §6.4 failure-mode catalogue (spec §6.4); v1.0 was the original three-axis decoupling.
 
 > **⚠️ Status flips do not authorise a real cutover.** The first second control-plane node is gated by the [Tier 2 pre-requisites](#tier-2-pre-requisites) below and the runbook `docs/runbooks/multi-host-rollout.md`. As of 2026-08-09 all five Tier 1 phases + off-host PG backup are shipped and the runbook is the operator-facing reference for the multi-host cutover — see `docs/runbooks/multi-host-rollout.md` §3 + §4 for the bootstrap procedure, and §3.5 for the `listen_addr`/`target_url` distinction the operator must understand to avoid the wrong-host routing trap.
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-21 (proposed); 2026-07-31 (accepted v1.1)
 - **Decision:** Evolve the FaaS architecture from a strict single-box loopback deployment to a decoupled, location-transparent topology. Specifically:
   - Transition the internal service-to-service gRPC boundaries (e.g. `schedd` ➔ `vmmd`, `builderd` ➔ `vmmd`) from hardcoded UNIX domain sockets to support standard TCP/IP networking secured via **Mutual TLS (mTLS)**.
@@ -26,8 +33,14 @@ The following are still un-shipped at v1.1 time and gate the load-bearing failur
 
 - **Tier 1 Phase 5** (`pkg/wire.NodeVerifier` handshake-layer CN→`compute_nodes.name` binding) — **RETIRED 2026-08-09** by ADR-056-wire-node-verifier acceptance (v1.0). The verifier augments (never replaces) stdlib chain/SAN/EKU trust and runs in `tls.Config.VerifyPeerCertificate` so rejection happens BEFORE any RPC dispatch. Single-box dev keeps `AllowAllNodeVerifier`; multi-box schedd + vmmd wire `PGNodeVerifier` (snapshot-backed, loader-failure-keeps-last-known-good). Defense-in-depth: handler-layer `wire.PeerCN(ctx)` (ADR-052) stays untouched. See `docs/adr/056-wire-node-verifier.md` (filename canonical — slot 056 is also claimed by `056-off-host-pg-backup.md`; see `docs/adr/068-issue-517-closure-evidence.md` §"Note on slot-collision hygiene").
 
-- **Tier 1 Phase 3** (`OCIRegistryStorageBackend` end-to-end) — blocks the "Snapshot locality" row in §6.4. Mitigates the case where a compute node cold-boots without the per-app layer.
-- **Tier 1 Phase 4** (per-host egress policy templating) — blocks the "Egress policy per host" row in §6.4. Mitigates the case where one host's `policy_nftables.conf` references another host's `MasqueradeCIDR`.
+- **Tier 1 Phase 3** (`OCIRegistryStorageBackend` end-to-end) — **RETIRED 2026-08-10** by ADR-054 acceptance (v1.0). The driver (`pkg/storage/oci.go`), router (`pkg/storage/router.go`), cache (`pkg/storage/cache.go`), and `BackendFromEnv` wiring live in every daemon (`cmd/{imaged,vmmd,schedd}/main.go`). The cache defaults to on at `/var/lib/faas/cache` for oci mode (multi-box default-on); explicit `FAAS_STORAGE_CACHE_DIR=""` disables. The stale-fallback branch is opt-in via `FAAS_STORAGE_CACHE_SERVE_STALE` — the pre-acceptance fail-loud contract is preserved when the env var is unset. The `StorageCacheStaleFallback` counter (`pkg/wire/metrics.go`) surfaces the registry-outage rate on the §12 dashboard. The per-deploy grype scan routes through `h.stageScanExt4` so OCI-mode deploys don't silently lose the §17 G1 scan guarantee (AC #4 of ADR-075). The `pkg/imaged/{gc,loop,handler,base_stage}.go` publish + cleanup paths + `pkg/sched/disk_drift.go::tickWithStorage` + `pkg/fcvm/{manager,vmm}.go::materializeFromStorage` all consume the wired backend. Each compute node no longer holds a local copy of every app's per-app layer; the §4.6 two-drive storage economics hold at fleet scale. ADR-054 §Reference call sites was tightened in the same PR (audit items 5/7/11: `apps/`→`snap/` wording, `gc.go`→`loop.go` function-name, and the build-pipeline test delegated to dedicated files per the existing doc comment). See `docs/adr/054-oci-registry-storage-end-to-end.md` (especially the Amendment section) and `docs/runbooks/multi-host-rollout.md` §Pre-conditions.
+- **Tier 1 Phase 4** (per-host egress policy templating) — **RETIRED 2026-08-09** by ADR-055 acceptance (v1.0). The static `policy_nftables.conf` is now a Jinja2 template (`policy_nftables.conf.j2`) that substitutes `{{ public_iface }}` and `{{ masquerade_cidr }}` at the two substitution sites. The Go render at `pkg/netns.HostPolicy.Render()` is the source of truth; `make egress-render-cross-check` byte-compares the Go and Jinja2 surfaces for every supported pair. The runtime `pg_notify` watcher (`cmd/vmmd/egress_watcher.go`, migration 00078) keeps `/etc/nftables.conf` live-reloadable without a `make bootstrap` rerun. See `docs/adr/055-per-host-egress-policy-templating.md` and `docs/runbooks/multi-host-rollout.md` §Per-host egress policy.
+
+All five Tier 1 phases + #250 are now retired. The remaining cutover
+gate items (Gate-B cross-box mTLS hardening, active-passive HA
+ADR-083 Tier A8) live outside Tier 1 and are tracked separately in
+the Gate-B cutover plan; see `docs/runbooks/multi-host-rollout.md`
+§Pre-conditions for the operator-facing pre-flight checklist.
 - **#250** (off-host Postgres backup) — **RETIRED 2026-08-09** by ADR-056 acceptance (v1.0). The compound `archive_command` (cp + rclone to Hetzner Storage Box), `faas-pg-basebackup-push.{service,timer}` pair, sealed-at-rest `/etc/faas/secrets/storage-box/` credentials, `pg_backup_last_pushed_seconds` gauge + `PgBackupStale` alert, and `pg-restore-verify.sh` T-7 throwaway verify are all in tree. See ADR-056 §Load-bearing design choices and `docs/runbooks/PostgresBackup.md`.
 
 **PR #425** (closed-not-merged 2026-07-29) was the prior attempt at this status flip; it lacked the callout above. This v1.1 supersedes it.

@@ -1612,8 +1612,18 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// Issue #676 / PR-3: websocket_enabled is also written explicitly
 	// (same Set-bit-aware shape) so the per-plan default doesn't get
 	// shadowed by the schema DEFAULT.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+	//
+	// Tier A10 / ADR-088: overflow_node preference is in the
+	// column list so the App struct's value is written verbatim
+	// at create time. apid resolved the wire name → UUID
+	// server-side via Store.ComputeNodeByName before reaching
+	// this path; the store is a plain write. NULL preference
+	// (the A9 default fallback) round-trips via nullString
+	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
+	// ON DELETE SET NULL (migration 00167) enforce the
+	// integrity contract downstream.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1636,7 +1646,12 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		// Tier A10 / ADR-088: overflow_node preference (nullable
+		// UUID). nullString coerces a nil pointer or empty
+		// string to SQL NULL; Postgres infers the UUID type
+		// from the column, same as NodeID above.
+		nullString(derefString(app.OverflowNode)))
 	return scanApp(row)
 }
 
@@ -1763,8 +1778,18 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// the per-plan default).
 	//
 	// Issue #676 / PR-3: websocket_enabled follows the same shape.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	//
+	// Tier A10 / ADR-088: overflow_node preference is in the
+	// column list so the App struct's value is written verbatim
+	// at create time. apid resolved the wire name → UUID
+	// server-side via Store.ComputeNodeByName before reaching
+	// this path; the store is a plain write. NULL preference
+	// (the A9 default fallback) round-trips via nullString
+	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
+	// ON DELETE SET NULL (migration 00167) enforce the
+	// integrity contract downstream.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1783,7 +1808,12 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		// Tier A10 / ADR-088: overflow_node preference (nullable
+		// UUID). nullString coerces a nil pointer or empty
+		// string to SQL NULL; Postgres infers the UUID type
+		// from the column, same as NodeID above.
+		nullString(derefString(app.OverflowNode)))
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2618,7 +2648,17 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- above; apid gates PATCH-true through
 			   -- Plan.WebSocketResponseAllowed() (Free → 403
 			   -- plan_websocket_not_allowed).
-			   websocket_enabled = case when $45 then $46 else websocket_enabled end
+			   websocket_enabled = case when $45 then $46 else websocket_enabled end,
+			   -- Tier A10 / ADR-088: per-app overflow_node
+			   -- preference. Same Set-bit convention as the
+			   -- surrounding fields — SetOverflowNode
+			   -- distinguishes "don't touch" (default)
+			   -- from "explicit NULL" (clear — back to A9
+			   -- fallback). The empty-uuid CHECK + the FK
+			   -- with ON DELETE SET NULL (migration 00167)
+			   -- enforce the integrity contract; the store
+			   -- is a plain column write.
+			   overflow_node = case when $47 then $48 else overflow_node end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2686,7 +2726,15 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.ClearAuthDefaultFlippedAt,
 		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
 		// Same Set*/optional-pointer pattern as streaming_enabled.
-		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled))
+		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled),
+		// Tier A10 / ADR-088: overflow_node preference. The
+		// Set bit controls the CASE; the value slot is a
+		// nullable UUID — nullString coerces nil/empty to
+		// SQL NULL, and Postgres infers the UUID type from
+		// the column. The Set bit distinguishes "don't
+		// touch" (don't run the SET clause) from "explicit
+		// NULL" (clear — back to A9 fallback).
+		p.SetOverflowNode, nullString(derefString(p.OverflowNode)))
 	return scanApp(row)
 }
 
@@ -6022,7 +6070,7 @@ func (s *PgStore) CountFailedInvocationsSince(ctx context.Context, accountID, ap
 const invocationSelectCols = `id, app_id, account_id, source, state, method, path,
        payload, headers, due_at, scheduled_at, cron_id, ack_url,
        result, lease_expires_at, received_at, completed_at, attempts,
-       last_error, created_at, instance_id`
+       last_error, created_at, instance_id, outcome`
 
 func (s *PgStore) EnqueueInvocation(ctx context.Context, inv Invocation) (Invocation, error) {
 	payload, err := jsonOrEmpty(inv.Payload)
@@ -6155,9 +6203,12 @@ func (s *PgStore) ClaimInvocation(ctx context.Context, id, instanceID string, le
 }
 
 func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json.RawMessage) error {
+	// outcome (issue #791) is stamped alongside state so the cron
+	// run-history read never has to infer success from state.
 	tag, err := s.pool.Exec(ctx, `
 		update invocations
 		   set state = 'completed',
+		       outcome = 'success',
 		       completed_at = now(),
 		       received_at = coalesce(received_at, now()),
 		       result = coalesce($2, result)
@@ -6171,7 +6222,7 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 	return nil
 }
 
-func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int) error {
+func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError string, retryAfter time.Duration, budget int, opts ...FailOption) error {
 	// Issue #394 — dead-letter path. When retryAfter > 0 and budget > 0
 	// and attempts is already at the ceiling (ClaimInvocation already
 	// bumped attempts to the current attempt count — see pgstore.go
@@ -6196,6 +6247,13 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 	//                                          does not apply.
 	var query string
 	var args []any
+	// issue #791 — outcome. The permanent branch stamps the caller's
+	// classification (default 'failed', 'timeout' from the drain's
+	// deadline paths); the transient branch clears it because the row
+	// returns to a non-terminal state; the dead-letter arm of the
+	// budget CASE stamps 'dead_letter' regardless of what the caller
+	// asked for, mirroring how that branch already overrides state.
+	failOpts := ApplyFailOptions(opts)
 	switch {
 	case retryAfter > 0 && budget > 0:
 		// Same int→text concat workaround as ClaimInvocation: pass
@@ -6206,6 +6264,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
 		query = `update invocations
 				    set state = case when attempts >= $4 then 'dead_letter' else 'pending' end,
+				        outcome = case when attempts >= $4 then 'dead_letter' else null end,
 				        due_at = case when attempts >= $4 then due_at else now() + $2::interval end,
 				        completed_at = case when attempts >= $4 then now() else completed_at end,
 				        lease_expires_at = null,
@@ -6221,6 +6280,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
 		query = `update invocations
 				    set state = 'pending',
+				        outcome = null,
 				        due_at = now() + $2::interval,
 				        lease_expires_at = null,
 				        last_error = $3,
@@ -6230,10 +6290,11 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 	default:
 		query = `update invocations
 				    set state = 'failed',
+				        outcome = $3,
 				        completed_at = now(),
 				        last_error = $2
 				  where id = $1 and state in ('dispatching','pending')`
-		args = []any{id, lastError}
+		args = []any{id, lastError, string(failOpts.Outcome)}
 	}
 	tag, err := s.pool.Exec(ctx, query, args...)
 	if err != nil {
@@ -6371,6 +6432,46 @@ func (s *PgStore) ListInvocationsForApp(ctx context.Context, appID string, state
 		where app_id = $1
 		  and state = any($2::text[])
 		order by created_at desc, id desc`, appID, stateStrs)
+	if err != nil {
+		return nil, err
+	}
+	return scanInvocations(rows)
+}
+
+// ListCronRunsForCron is the per-cron run-history read (issue #791)
+// behind GET /v1/crons/{id}/runs. Index-backed by
+// invocations_cron_idx (migrations/00166), whose
+// `(cron_id, created_at DESC) WHERE cron_id IS NOT NULL` shape matches
+// this predicate and ORDER BY exactly.
+//
+// The cursor is the same opaque `before`-is-an-id convention as
+// ListInvocationsForAccount, including the correlated subselect that
+// resolves the cursor row's created_at. It intentionally does NOT
+// re-check ownership: the caller has already proven the cron belongs
+// to it (apid's listCronRuns runs the CronByID → AppByID → AccountID
+// check first), and the cron_id filter is total — a row can belong to
+// exactly one cron.
+func (s *PgStore) ListCronRunsForCron(ctx context.Context, cronID string, limit int, before string) ([]Invocation, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	var rows pgx.Rows
+	var err error
+	if before == "" {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where cron_id = $1
+			order by created_at desc, id desc
+			limit $2`, cronID, limit)
+	} else {
+		rows, err = s.pool.Query(ctx, `select `+invocationSelectCols+`
+			from invocations
+			where cron_id = $1
+			  and created_at < (
+			      select created_at from invocations where id = $2 and cron_id = $1)
+			order by created_at desc, id desc
+			limit $3`, cronID, before, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -6613,11 +6714,12 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	var scheduledAt, leaseExpires, receivedAt, completedAt *time.Time
 	var cronID, ackURL, lastErr, instanceID *string
 	var payload, headers, result []byte
+	var outcome *string
 	if err := scan(
 		&inv.ID, &inv.AppID, &inv.AccountID, &source, &state, &inv.Method, &inv.Path,
 		&payload, &headers, &inv.DueAt, &scheduledAt, &cronID, &ackURL,
 		&result, &leaseExpires, &receivedAt, &completedAt, &inv.Attempts,
-		&lastErr, &inv.CreatedAt, &instanceID,
+		&lastErr, &inv.CreatedAt, &instanceID, &outcome,
 	); err != nil {
 		return Invocation{}, err
 	}
@@ -6656,6 +6758,10 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	}
 	if instanceID != nil {
 		inv.InstanceID = *instanceID
+	}
+	if outcome != nil {
+		o := InvocationOutcome(*outcome)
+		inv.Outcome = &o
 	}
 	return inv, nil
 }
@@ -7917,7 +8023,7 @@ func (s *PgStore) UpsertNodeKey(ctx context.Context, nodeID string, keyID string
 // again to reactivate a drained row on the next successful dial. The
 // pg_notify trigger on compute_nodes (operator-visible via
 // pkg/db/notify.NotifyComputeNodeChanged) fires on the UPDATE so
-// gatewayd's per-node client cache can drop/add entries without
+// gatewayd-internal's per-node client cache can drop/add entries without
 // restart.
 func (s *PgStore) SetComputeNodeActive(ctx context.Context, id string, active bool) error {
 	tag, err := s.pool.Exec(ctx,
@@ -10172,6 +10278,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var allowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
+	// Tier A10 / ADR-088: scratch sink for the overflow_node
+	// projection. coalesce(overflow_node::text, '') returns
+	// '' for the NULL-preference case, which we promote to
+	// App.OverflowNode == nil below.
+	var overflowNodeStr string
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
@@ -10203,8 +10314,21 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// Issue #676 / PR-3: per-app websocket_enabled flag.
 		// NOT NULL DEFAULT false (migration 00155); plain bool
 		// scan is safe.
-		&a.WebSocketEnabled); err != nil {
+		&a.WebSocketEnabled,
+		// Tier A10 / ADR-088: per-app overflow_node preference.
+		// Scanned into a scratch string then conditionally
+		// promoted to *string so NULL round-trips as Go-nil —
+		// nil = "no preference" (back to A9 fallback). The
+		// pgx string → Go nil promotion mirrors how the
+		// column-list normalisation handles other nullable
+		// string-shaped values like RootDir / WorkloadName
+		// (see below).
+		&overflowNodeStr); err != nil {
 		return mapErr(err)
+	}
+	if overflowNodeStr != "" {
+		s := overflowNodeStr
+		a.OverflowNode = &s
 	}
 	a.Type = AppType(typeStr)
 	a.Status = AppStatus(statusStr)
@@ -10277,7 +10401,16 @@ const appsSelectColumns = `
 	-- Boolean NOT NULL DEFAULT false (migration 00155); apid applies
 	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
 	-- writes through Plan.WebSocketResponseAllowed().
-	websocket_enabled`
+	websocket_enabled,
+	-- Tier A10 / ADR-088: per-app overflow_node preference.
+	-- Nullable UUID; FK to compute_nodes(id) with ON DELETE SET
+	-- NULL cascades the preference to NULL on operator-side
+	-- compute_node deletion (migration 00167). The empty-uuid
+	-- CHECK is a tripwire against buggy INSERT paths. NULL
+	-- coerces to the empty string via coalesce so the pgx
+	-- scan sees a string target — the App.OverflowNode field
+	-- is *string (nil = no preference = default A9 fallback).
+	coalesce(overflow_node::text, '')`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

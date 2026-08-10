@@ -72,7 +72,7 @@ const (
 //
 // Returning *api.Problem with code=sig_invalid means "refuse to
 // boot this layer" — the engine transitions the deployment to
-// DeployFailed and returns 503 to gatewayd. Any other error is a
+// DeployFailed and returns 503 to gatewayd-internal. Any other error is a
 // transient I/O failure; the caller decides whether to retry.
 type LayerVerifier interface {
 	Verify(ctx context.Context, layerKey, sigKey string) error
@@ -248,6 +248,41 @@ type Engine struct {
 	// always fresh — an operator tweak to the env var doesn't
 	// require a schedd restart (the next tick picks it up).
 	deadNodeReconcilerStalenessSeconds int
+	// pressureAggregator (Tier A9 / ADR-087) is the in-process
+	// sliding-window per-app counter of WakeResult{AtCapacity: true}
+	// returns. The engine increments it at every AtCapacity return
+	// site; the pressure-rebalancer (pkg/sched/pressure_rebalancer.go)
+	// polls it every PressureReassessmentIntervalSeconds. Nil is
+	// tolerated by IncAtCapacity (test fixtures without the
+	// aggregator stay buildable).
+	pressureAggregator *PressureAggregator
+	// pressureThresholdPerMin mirrors api.PressureAtCapacityThresholdPerMin.
+	// Per-app event count over a 60s sliding window that marks the
+	// app as "pressured". Default 5; overridable via
+	// FAAS_PRESSURE_THRESHOLD_PER_MIN -> WithPressureConfig.
+	pressureThresholdPerMin int
+	// pressureReassessmentIntervalSeconds mirrors
+	// api.PressureReassessmentIntervalSeconds. Pressure-rebalancer
+	// sweep cadence. Default 30; overridable via
+	// FAAS_PRESSURE_REASSESSMENT_SECONDS -> WithPressureConfig.
+	pressureReassessmentIntervalSeconds int
+	// pressureMigrationPolicy mirrors api.PressureMigrationPolicy.
+	// Closed-set string ∈ {skip_live, migrate_after_1, migrate_after_2}.
+	// Parsed once at schedd startup; propagated via
+	// WithPressureMigrationPolicy. Unknown values panic at startup.
+	pressureMigrationPolicy string
+	// pressureSweepCounter counts the consecutive sweeps the
+	// pressure-rebalancer has launched for an app within the
+	// current cooldown window. Reset on a successful reassign and
+	// on the per-event Reset() call. The policy gate reads this
+	// counter (migrate_after_2 opens the live-migration window on
+	// the second sweep).
+	pressureSweepCounter map[string]int
+	// pressureSweepMu guards pressureSweepCounter. The map is
+	// accessed by the engine (rebalance + reset) and the watcher
+	// (increment before delegation); a single mutex keeps the
+	// reads race-free without burning atomic shims.
+	pressureSweepMu sync.Mutex
 
 	mu    sync.Mutex
 	appMu map[string]*sync.Mutex // app_id -> serialisation lock (never GC'd; one-box scale)
@@ -278,7 +313,7 @@ type Engine struct {
 	// warmBroadcaster is the push-side of sticky-warm affinity
 	// (ADR-025 axis 4). Every RecordWake that actually changes the
 	// (appID → nodeID) entry fans out a WarmHintEvent to every
-	// subscribed consumer (today: every gatewayd's StreamWarmHints
+	// subscribed consumer (today: every gatewayd-internal's StreamWarmHints
 	// gRPC stream). nil is tolerated by admitAndDispatch (the emit
 	// call becomes a no-op) so pre-PR test fixtures that don't wire
 	// the broadcaster keep their existing single-box behaviour.
@@ -581,6 +616,111 @@ func (e *Engine) WithDeadNodeReconcilerStalenessSeconds(seconds int) *Engine {
 	return e
 }
 
+// WithPressureConfig (Tier A9 / ADR-087) sets the per-engine
+// overrides for the capacity-pressure rebalancer tunables — the
+// aggregation threshold and the reassessment sweep cadence.
+// Same "panic on bad env" contract as WithRebalanceConfig: a
+// typo in FAAS_PRESSURE_THRESHOLD_PER_MIN or
+// FAAS_PRESSURE_REASSESSMENT_SECONDS must not silently fall back
+// to the api.* defaults. The values are read at every sweep, so
+// an operator tweak to the env vars doesn't require a schedd
+// restart (the next tick picks them up).
+func (e *Engine) WithPressureConfig(thresholdPerMin, reassessmentSeconds int) *Engine {
+	if thresholdPerMin <= 0 {
+		panic(fmt.Sprintf("sched: WithPressureConfig: thresholdPerMin must be > 0, got %d", thresholdPerMin))
+	}
+	if reassessmentSeconds <= 0 {
+		panic(fmt.Sprintf("sched: WithPressureConfig: reassessmentSeconds must be > 0, got %d", reassessmentSeconds))
+	}
+	e.pressureThresholdPerMin = thresholdPerMin
+	e.pressureReassessmentIntervalSeconds = reassessmentSeconds
+	return e
+}
+
+// WithPressureMigrationPolicy (Tier A9 / ADR-087) sets the
+// per-engine override for the pressure-rebalancer migration
+// policy. Closed-set validation: a typo in
+// FAAS_PRESSURE_MIGRATION_POLICY must not silently fall back to
+// the api.* default. Unknown values panic at startup — closed-set
+// is the contract; falling back to a default would mask operator
+// typos that would silently change customer-facing latency.
+func (e *Engine) WithPressureMigrationPolicy(policy string) *Engine {
+	switch policy {
+	case "skip_live", "migrate_after_1", "migrate_after_2":
+		e.pressureMigrationPolicy = policy
+	default:
+		panic(fmt.Sprintf("sched: WithPressureMigrationPolicy: policy must be one of {skip_live, migrate_after_1, migrate_after_2}, got %q", policy))
+	}
+	return e
+}
+
+// WithPressureAggregator (Tier A9 / ADR-087) attaches the
+// in-process sliding-window counter to the engine. The engine
+// increments it at every WakeResult{AtCapacity: true} return;
+// the watcher (pkg/sched/pressure_rebalancer.go) polls it for
+// PressuredApps on each sweep. Nil is tolerated by the call
+// sites (test fixtures without the aggregator stay buildable).
+func (e *Engine) WithPressureAggregator(agg *PressureAggregator) *Engine {
+	if e == nil {
+		return e
+	}
+	e.pressureAggregator = agg
+	if e.pressureSweepCounter == nil {
+		e.pressureSweepCounter = make(map[string]int)
+	}
+	return e
+}
+
+// IncAtCapacity (Tier A9 / ADR-087) is the engine's hook into
+// the pressure aggregator. Called at every WakeResult{AtCapacity:
+// true} return site; the aggregator keeps a 60s sliding window
+// per app. The Prom counter is incremented on the same path so
+// the §12 dashboard panel stays consistent with the
+// pressure-rebalancer trigger. Nil-safe on both aggregator and
+// metrics so test fixtures without either keep building.
+func (e *Engine) IncAtCapacity(appID, kind string) {
+	if e == nil {
+		return
+	}
+	if e.pressureAggregator != nil {
+		e.pressureAggregator.IncAtCapacity(appID, time.Now())
+	}
+	if e.ops != nil {
+		e.ops.AppAtCapacityTotal(appID, kind).Inc()
+	}
+}
+
+// IncrementPressureSweepCounter (Tier A9 / ADR-087) bumps the
+// per-app consecutive-sweep counter the policy gate reads to
+// open the live-migration window. Called by the watcher at
+// every sweep before delegation; reset by the engine on a
+// successful reassign.
+func (e *Engine) IncrementPressureSweepCounter(appID string) int {
+	if e == nil {
+		return 0
+	}
+	e.pressureSweepMu.Lock()
+	defer e.pressureSweepMu.Unlock()
+	if e.pressureSweepCounter == nil {
+		e.pressureSweepCounter = make(map[string]int)
+	}
+	e.pressureSweepCounter[appID]++
+	return e.pressureSweepCounter[appID]
+}
+
+// ResetPressureSweepCounter (Tier A9 / ADR-087) clears the
+// per-app consecutive-sweep counter after a successful reassign
+// (or any other terminal event). The watcher also calls this
+// between sweeps for apps that fell below the threshold.
+func (e *Engine) ResetPressureSweepCounter(appID string) {
+	if e == nil {
+		return
+	}
+	e.pressureSweepMu.Lock()
+	defer e.pressureSweepMu.Unlock()
+	delete(e.pressureSweepCounter, appID)
+}
+
 func (e *Engine) WithOwnerNodeID(nodeID string) *Engine {
 	if e == nil {
 		return e
@@ -712,7 +852,7 @@ func (e *Engine) NodeKeyRegistry() *NodeKeyRegistry {
 // ForwardHTTP RPC.
 //
 // The previous shape carried `Addr = host_ip:8080`, an inner-netns
-// placeholder reachable only from gatewayd on the local box. Remote
+// placeholder reachable only from gatewayd-internal on the local box. Remote
 // nodes return `host_ip` from inside a different jailer's netns and
 // the gateway cannot dial it. The new shape carries the routable
 // identity (the compute_node.id), with the dial target chosen on
@@ -723,7 +863,7 @@ type WakeResult struct {
 	Method     vmmdpb.WakeMethod
 	// WakeID is the per-wake-attempt correlation handle (gaps analysis
 	// 2026-07-23). UUIDv7 minted at Phase 2 before CreateInstance;
-	// gatewayd propagates it back to the client as x-faas-wake-id and
+	// gatewayd-internal propagates it back to the client as x-faas-wake-id and
 	// operators see it on schedule/wake slog calls. On the Phase-1
 	// fast path (a second Wake for an already-RUNNING app) this is
 	// the wake_id of the wake that brought the instance up — surfaced
@@ -817,7 +957,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// Why a LiveDeployment read is acceptable here: Wake is the
 		// legacy fast path used by meterd's per-minute sampler + cron
 		// firings, NOT the customer hot path. Production customer
-		// requests go through AdmitInstance (cmd/gatewayd/main.go),
+		// requests go through AdmitInstance (cmd/gatewayd-internal/main.go),
 		// which has the live deployment already loaded. So this read
 		// adds one cheap PG roundtrip (~1ms, single-row lookup with
 		// the existing (app_id, status) partial index) per minute per
@@ -954,6 +1094,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 	// Worker class is the same short-circuit as admitAndDispatch.
 	if app.WorkloadClass == state.WorkloadClassWorker {
 		release()
+		e.IncAtCapacity(appID, "admit")
 		return WakeResult{AtCapacity: true}, nil
 	}
 
@@ -963,12 +1104,14 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 	if depErr != nil {
 		release()
 		if errors.Is(depErr, state.ErrNotFound) {
+			e.IncAtCapacity(appID, "admit")
 			return WakeResult{AtCapacity: true}, nil
 		}
 		return WakeResult{}, depErr
 	}
 	if dep.Status != state.DeployLive {
 		release()
+		e.IncAtCapacity(appID, "admit")
 		return WakeResult{AtCapacity: true}, nil
 	}
 
@@ -1011,6 +1154,7 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 		if liftCapacityToResult {
 			var prob *api.Problem
 			if errors.As(err, &prob) {
+				e.IncAtCapacity(appID, "admit")
 				return WakeResult{AtCapacity: true}, nil
 			}
 		}
@@ -1066,6 +1210,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	// branches are unreachable for worker-class apps.
 	if app.WorkloadClass == state.WorkloadClassWorker {
 		release()
+		e.IncAtCapacity(appID, "wake")
 		return WakeResult{AtCapacity: true}, nil
 	}
 
@@ -1095,6 +1240,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		switch outcome {
 		case wakeRejectAtCap:
 			if liftCapacityToResult {
+				e.IncAtCapacity(appID, "wake")
 				return WakeResult{AtCapacity: true}, nil
 			}
 			return WakeResult{}, api.ErrPlanLimitConcurrency(limits, e.ledger.Concurrency(app.ID))
@@ -1132,6 +1278,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			// a -race surface against the next goroutine that
 			// hits the gate on the same account.
 			if liftCapacityToResult {
+				e.IncAtCapacity(appID, "wake")
 				return WakeResult{AtCapacity: true}, nil
 			}
 			return WakeResult{}, api.ErrAdmissionRefused(obsCents, capCents)
@@ -1224,7 +1371,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 	//
 	// Push-side fanout (ADR-025 axis 4): if the new entry actually
 	// changed appID's warm node, broadcast a WarmHintEvent to every
-	// gatewayd subscribed via Engine.StreamWarmHints. Same per-app
+	// gatewayd-internal subscribed via Engine.StreamWarmHints. Same per-app
 	// lock guards the cache write + the emit so the gRPC stream
 	// observes writes in the same order the cache does. nil
 	// broadcaster is a no-op (the test-only path that constructs
@@ -1282,6 +1429,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 					"app", appID, "instance", ins.ID, "err", delErr)
 			}
 			release()
+			e.IncAtCapacity(appID, "wake")
 			return WakeResult{AtCapacity: true}, nil
 		}
 		e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "admit_denied")
@@ -1483,7 +1631,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 			// Transient I/O — fail the boot but don't mark the
 			// layer compromised. Same shape as the vmmd
 			// round-trip failure path below: transition + release.
-			// Wrap in a *api.Problem so gatewayd's writeWakeError
+			// Wrap in a *api.Problem so gatewayd-internal's writeWakeError
 			// sees a Problem (and therefore writes through to the
 			// client with Retry-After) instead of falling through
 			// to its ErrCapacity fallback that lacks the header
@@ -1525,7 +1673,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID string, liftCapacit
 		defer wakeSpan.End()
 	}
 	// issue #517 bootCtx stamp point: lift the inbound correlation
-	// (request_id / invocation_id from gatewayd) and join the
+	// (request_id / invocation_id from gatewayd-internal) and join the
 	// engine-minted wake_id / instance_id so a single inbound id
 	// carries across the schedd → vmmd boundary.
 	inboundCorr, _ := wire.FromContext(ctx)
@@ -2266,6 +2414,335 @@ func (e *Engine) RebalanceOrphanedApps(ctx context.Context, deadNodeID string) e
 	return nil
 }
 
+// RebalancePressuredApps (Tier A9 / ADR-087) reassigns a
+// single pressured app to a peer schedd's fleet when the
+// owner-of-record is at sustained capacity-refusal pressure.
+// The cheap path (this method) only handles the parked-only
+// case; the policy-gated live-instance migration hook was
+// removed in the Tier A10 follow-up PR (see the comment at the
+// ReassignAppOwner call site below) — peer-to-peer live
+// migration on the pressure path is a Tier A10.1 follow-up
+// pending a real peer-to-peer migrator (ADR-066's four-phase
+// handoff only supports destination = local schedd).
+//
+// Triggered by the pressure-rebalancer (pkg/sched/pressure_rebalancer.go)
+// on every sweep where the app's sliding-window AtCapacity
+// count exceeds the threshold. The watcher increments the
+// consecutive-sweep counter BEFORE this call; the policy gate
+// (migrate_after_2) reads the counter to decide whether to
+// also fire the four-phase live handoff.
+//
+// appID is the pressured app. Empty string means "cold-start
+// sweep" — every app currently above the threshold is in
+// scope (the watcher enumerates via aggregator.PressuredApps).
+//
+// Errors are logged per-app; the batch returns nil on
+// non-conflict failures (a transient DB blip on one app must
+// not halt the sweep — the next sweep retries).
+func (e *Engine) RebalancePressuredApps(ctx context.Context, appID string) error {
+	if e.ownerNodeID == "" {
+		// Legacy single-box posture: no peer to migrate to.
+		// The pressure signal is informative only; the
+		// threshold is the operator's cue to add capacity.
+		return nil
+	}
+	if appID == "" {
+		// Cold-start sweep is delegated to the watcher; the
+		// engine's per-app method is the per-tick path.
+		return nil
+	}
+
+	app, err := e.store.AppByID(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("sched: pressure rebalance: lookup app: %w", err)
+	}
+	// apps.node_id is the source of truth for ownership. If a
+	// peer schedd already claimed the app (a racing sweep
+	// won), or the app is no longer ours, silently drop.
+	if app.NodeID == "" {
+		e.observePressure("no_eligibility")
+		return nil
+	}
+	if app.NodeID != e.ownerNodeID {
+		e.observePressure("no_eligibility")
+		return nil
+	}
+	// Eligibility filter — mirrors RebalanceOrphanedApps.
+	if app.Status != state.AppActive && app.Status != state.AppEvictedCold {
+		e.observePressure("no_eligibility")
+		return nil
+	}
+	// Cooldown filter — apps.reassigned_at is the authoritative
+	// source. The pressure-rebalancer's per-apps cooldown is the
+	// same deadline as the dead-node rebalancer's; both stamp
+	// the same column via Store.ReassignAppOwner.
+	cooldownSec := api.RebalanceCooldownSeconds
+	if e.rebalanceCooldownSeconds > 0 {
+		cooldownSec = e.rebalanceCooldownSeconds
+	}
+	if app.ReassignedAt != nil &&
+		time.Since(*app.ReassignedAt) < time.Duration(cooldownSec)*time.Second {
+		e.observePressure("cooldown")
+		return nil
+	}
+	// Peer selection — name-ASC sort, deterministic.
+	// Tier A10 / ADR-088: per-app overflow_node preference. If
+	// the customer pinned a spill target, try it first; on
+	// miss (inactive / no headroom / gone) the engine observes
+	// `overflow_target_unavailable` on the A9 outcome axis
+	// AND `unavailable` on the A10 spill axis, then falls
+	// through to the existing first-peer-with-headroom path.
+	// A successful overflow-target assignment is counted as a
+	// regular `migrated` on the A9 axis (the outcome is the
+	// same — the app moved) and `used` on the A10 axis (the
+	// preference was honoured). The two metric surfaces stay
+	// independent so a Grafana panel can branch "did the
+	// preference matter?" without reading the same series.
+	var overflowTargetUsed bool
+	peer := ""
+	if app.OverflowNode != nil && *app.OverflowNode != "" {
+		var perr error
+		peer, perr = e.findOverflowPeerWithHeadroom(ctx, app, *app.OverflowNode)
+		if perr != nil {
+			e.log.Warn("sched: pressure rebalance: overflow peer lookup",
+				"app_id", app.ID, "overflow_node", *app.OverflowNode, "err", perr)
+		}
+		if peer != "" {
+			overflowTargetUsed = true
+		} else {
+			// Mirror the unavailable outcome on the A9 axis so
+			// the dashboard's existing "no_headroom" panel
+			// doesn't swallow a preference miss as a routine
+			// "fleet full" event. Operators branching on
+			// `overflow_target_unavailable` know the customer
+			// pinned a target and the engine couldn't honour
+			// it (vs `no_headroom` which is "no peer anywhere
+			// on the fleet has space").
+			e.observePressure("overflow_target_unavailable")
+			e.observeOverflowSpill("unavailable")
+		}
+	}
+	if peer == "" {
+		peer, err = e.findPeerWithHeadroom(ctx, app)
+		if err != nil {
+			return fmt.Errorf("sched: pressure rebalance: find peer: %w", err)
+		}
+		if peer == "" {
+			e.observePressure("no_headroom")
+			// Tier A10 / ADR-088: if the customer's
+			// overflow_node preference was missed earlier
+			// (overflowTargetUsed=false) and the fallback
+			// also produced no peer, no spill-axis label is
+			// warranted — the sweep simply had no place to
+			// land the app. A non-empty peer would have
+			// bumped `fallback_used` at the success site.
+			return nil
+		}
+		// Tier A10 / ADR-088: the overflow preference was
+		// missed earlier (overflowTargetUsed=false) and
+		// the A9 fallback actually landed a peer. Bump
+		// `fallback_used` so the spill-axis panel
+		// distinguishes "preference lost, fleet empty"
+		// (no fallback_used increment) from "preference
+		// lost, fleet absorbed the app" (this increment).
+		if !overflowTargetUsed {
+			e.observeOverflowSpill("fallback_used")
+		}
+	}
+	// Live-instance migration hook (Tier A10 follow-up):
+	// previously called e.maybeMigrateLiveInstancesFor here and
+	// bumped observePressure("peer_live_migrated") on success.
+	// That helper always no-op'd because MigrateLiveInstances
+	// self-skips when deadNodeID == e.ownerNodeID (engine.go:2944
+	// in pkg/sched/engine.go), and ADR-066's four-phase handoff
+	// only supports destination = local schedd (active-passive HA,
+	// ADR-083) — peer-to-peer live migration on the pressure path
+	// is a Tier A10.1 follow-up. Until that ships, the pressure
+	// rebalancer's effective policy is `skip_live`: only parked
+	// apps are reassigned; apps with live instances on the owner
+	// stay pinned (the customer's wake fails until the instances
+	// drain). The migration policy knob keeps the closed set
+	// {skip_live, migrate_after_1, migrate_after_2} so a future
+	// PR can wire the policy to a real peer-to-peer migrator
+	// without churn on the API surface.
+	//
+	// Atomic reassign of apps.node_id. RowsAffected==0 (the
+	// peer-claim race) is the only conflict path; the engine
+	// sees ErrConflict and increments the conflict metric.
+	if err := e.store.ReassignAppOwner(ctx, app.ID, app.NodeID, peer); err != nil {
+		if errors.Is(err, state.ErrConflict) {
+			e.observePressure("conflict")
+			return nil
+		}
+		e.observePressure("no_eligibility")
+		e.log.Warn("sched: pressure rebalance: reassign failed",
+			"app_id", app.ID, "from_node", app.NodeID, "to_node", peer, "err", err)
+		return nil
+	}
+	// Reset the aggregator slice for this app — the new owner
+	// may be at lower pressure; let the counter rebuild
+	// against the new owner's metric.
+	if e.pressureAggregator != nil {
+		e.pressureAggregator.Reset(app.ID)
+	}
+	e.ResetPressureSweepCounter(app.ID)
+	e.observePressure("migrated")
+	// Tier A10 / ADR-088: bump the spill-axis `used` counter
+	// alongside the A9 `migrated` outcome. The two metric
+	// surfaces stay independent so a Grafana panel can branch
+	// "did the preference matter?" (used vs no_used) without
+	// reading the same series with two queries.
+	if overflowTargetUsed {
+		e.observeOverflowSpill("used")
+	}
+	// Emit the per-app reassignment notify. The gateway's
+	// per-node schedd client cache subscribes to this channel
+	// and evicts the now-stale dial target for the old owner;
+	// pkg/sched/placement_claim.go's subscriber drops the
+	// pressure_rebalanced kind so no re-entry loop happens.
+	if e.notif != nil {
+		payload := fmt.Sprintf(
+			`{"kind":"pressure_rebalanced","app_id":%q,"from_node":%q,"to_node":%q}`,
+			app.ID, app.NodeID, peer)
+		if err := e.notif.Notify(ctx, db.NotifyAppChanged, payload); err != nil {
+			e.log.Warn("sched: pressure rebalance: notify rebalanced",
+				"app_id", app.ID, "from", app.NodeID, "to", peer, "err", err)
+		}
+	}
+	e.log.Info("sched: pressure rebalance: migrated app",
+		"app_id", app.ID, "slug", app.Slug,
+		"from_node", app.NodeID, "to_node", peer)
+	return nil
+}
+
+// observePressure is the per-outcome pressure-rebalancer metric
+// helper. Centralising the nil-safety keeps the call sites
+// single-line.
+func (e *Engine) observePressure(outcome string) {
+	if e.ops != nil {
+		e.ops.PressureReassignments(outcome).Inc()
+	}
+}
+
+// observeOverflowSpill is the per-outcome Tier A10 / ADR-088
+// overflow_node preference metric helper. Mirrors
+// observePressure's nil-safe shape so the call sites stay
+// single-line and the metric surface stays "ops != nil → bump".
+func (e *Engine) observeOverflowSpill(outcome string) {
+	if e.ops != nil {
+		e.ops.OverflowTargetSpillHits(outcome).Inc()
+	}
+}
+
+// findPeerWithHeadroom returns the first peer (sorted by name
+// ASC, deterministic) whose admission_headroom is at least
+// app.RAMMB + api.PerVMOverheadMB. Returns "" if no peer
+// qualifies. Errors are wrapped with %w+op.
+func (e *Engine) findPeerWithHeadroom(ctx context.Context, app state.App) (string, error) {
+	nodes, err := e.store.ActiveComputeNodes(ctx)
+	if err != nil {
+		return "", fmt.Errorf("sched: pressure rebalance: list active nodes: %w", err)
+	}
+	// Sort by name for deterministic tie-break (the caller
+	// picks the first peer with headroom, so the iteration
+	// order is load-bearing for the test surface).
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
+	neededMB := int64(app.RAMMB) + int64(api.PerVMOverheadMB)
+	for _, n := range nodes {
+		if n.ID == e.ownerNodeID {
+			continue
+		}
+		used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
+		if err != nil {
+			e.log.Warn("sched: pressure rebalance: peer used_mb read failed",
+				"node_id", n.ID, "node_name", n.Name, "err", err)
+			continue
+		}
+		ceiling := n.AdmissionCeilingMB
+		if ceiling <= 0 {
+			ceiling = api.RAMAdmissionCeilingMB
+		}
+		if int64(ceiling)-used >= neededMB {
+			return n.ID, nil
+		}
+	}
+	return "", nil
+}
+
+// findOverflowPeerWithHeadroom (Tier A10 / ADR-088) resolves a
+// per-app overflow_node preference to a single peer UUID,
+// applying the same headroom check findPeerWithHeadroom uses.
+// targetUUID is the resolved compute_nodes.id the customer
+// pinned at create / PATCH time (apid does the name → UUID
+// resolution server-side so this helper never sees a wire
+// shape). Returns "" if any of the following is true:
+//
+//   - targetUUID == e.ownerNodeID (no-op self-migration).
+//   - target node is missing (operator deleted it; the FK
+//     ON DELETE SET NULL would have cleared the column, but a
+//     racing sweep can still observe the prior value before
+//     the SET NULL lands).
+//   - target node is inactive (operator drained it; the
+//     customer didn't notice and never unset the preference).
+//   - target node has no headroom for this app
+//     (ceiling - used < neededMB).
+//
+// Errors from the underlying Store reads are wrapped with
+// %w+op; the engine caller decides whether to log+fall-through
+// (it does) or surface the error (it doesn't — the fallback
+// path is the canonical recovery).
+func (e *Engine) findOverflowPeerWithHeadroom(ctx context.Context, app state.App, targetUUID string) (string, error) {
+	if targetUUID == e.ownerNodeID {
+		return "", nil
+	}
+	n, err := e.store.ComputeNodeByID(ctx, targetUUID)
+	if err != nil {
+		// ErrNotFound is the deleted-node path — the FK
+		// ON DELETE SET NULL would normally have cleared
+		// the column, so this is a racing-sweep observation
+		// only. ANY other error is also swallowed (logged at
+		// debug below) because the engine's fallback to
+		// first-peer-with-headroom is the canonical recovery
+		// for a preference miss — a transient store blip
+		// shouldn't escalate to a sweep-wide failure. Return
+		// "" + nil so the caller falls through without
+		// logging at warn.
+		if !errors.Is(err, state.ErrNotFound) {
+			e.log.Debug("sched: pressure rebalance: overflow peer lookup failed",
+				"app_id", app.ID, "overflow_node", targetUUID, "err", err)
+		}
+		return "", nil
+	}
+	if !n.Active {
+		return "", nil
+	}
+	used, err := e.store.ComputeNodeUsedMB(ctx, n.ID)
+	if err != nil {
+		return "", fmt.Errorf("sched: pressure rebalance: overflow peer used_mb read: %w", err)
+	}
+	ceiling := n.AdmissionCeilingMB
+	if ceiling <= 0 {
+		ceiling = api.RAMAdmissionCeilingMB
+	}
+	neededMB := int64(app.RAMMB) + int64(api.PerVMOverheadMB)
+	if int64(ceiling)-used < neededMB {
+		return "", nil
+	}
+	return n.ID, nil
+}
+
+// pressureSweepCounterValue is the read-only accessor for the
+// pressure-sweep counter. Read under the mutex; no allocation
+// (the engine's watchdog / engine test paths use the value).
+func (e *Engine) pressureSweepCounterValue(appID string) int {
+	if e == nil {
+		return 0
+	}
+	e.pressureSweepMu.Lock()
+	defer e.pressureSweepMu.Unlock()
+	return e.pressureSweepCounter[appID]
+}
+
 // admissionCeilingForOwn returns the active per-node
 // admission ceiling for ownerNodeID, or 0 when the row is
 // missing/un-registered. Mirrors choosePlacementLocked's
@@ -2851,7 +3328,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 				return err
 			}
 			// Transient I/O — same Retry-After shape as the Wake
-			// branch. Wrap as a Problem so gatewayd's writeWakeError
+			// branch. Wrap as a Problem so gatewayd-internal's writeWakeError
 			// flushes both status + header in one path (review
 			// finding #1a on PR #322).
 			e.log.Warn("prime: verifier i/o error",

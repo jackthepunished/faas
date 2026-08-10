@@ -1,6 +1,6 @@
 // Package overlay is the cross-box dial abstraction for issue #98 /
 // ADR-028 / issue #120. vmmd's gRPC listener is the only thing
-// gatewayd (or schedd's heartbeat goroutine) dials over the overlay;
+// gatewayd-internal (or schedd's heartbeat goroutine) dials over the overlay;
 // the dial itself is just a thin wrapper around pkg/wire.DialContext
 // with the per-node target resolved from the compute_nodes row.
 //
@@ -35,7 +35,7 @@
 //
 // Production callers (issue #120):
 //
-//   - cmd/gatewayd/nodecache.go: per-node dial closure inside
+//   - cmd/gatewayd-internal/nodecache.go: per-node dial closure inside
 //     NodeClientCache. The cache itself is unrelated to this
 //     package; only the underlying wire.DialContext call is swapped.
 //   - pkg/sched/vmmclient.go: DialVMMContext — schedd's per-node
@@ -55,7 +55,7 @@ import (
 )
 
 // Target is a parsed compute_nodes.target_url — the destination
-// gatewayd / schedd dials. The wrapper exists so callers can't pass
+// gatewayd-internal / schedd dials. The wrapper exists so callers can't pass
 // a raw string + a raw TLS config together and accidentally mismatch
 // them; the only construction path is New, which does no validation
 // (the wire layer's ParseTarget covers that).

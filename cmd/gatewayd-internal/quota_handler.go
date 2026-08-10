@@ -57,7 +57,7 @@ import (
 // internalQuotaHandler returns an http.HandlerFunc that reads the
 // per-app rate-limit bucket for the (plan, app_id) query pair. h is
 // the public-listener Handler (so the same Limiter instance is used;
-// the snapshot reads from THIS gatewayd process's bucket). logger
+// the snapshot reads from THIS gatewayd-internal process's bucket). logger
 // is the access-log sink; pass nil to disable access logging (tests).
 func internalQuotaHandler(h *gateway.Handler, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -66,10 +66,10 @@ func internalQuotaHandler(h *gateway.Handler, logger *slog.Logger) http.HandlerF
 			// source so a CR/LF in the query string can't break the
 			// log-injection invariant (one log line per event).
 			// r.RemoteAddr comes from the kernel, not the request, so
-			// it doesn't need sanitizing. Precedent: cmd/gatewayd/
+			// it doesn't need sanitizing. Precedent: cmd/gatewayd-internal/
 			// proxy.go:322 (apid proxy upstream error) and
 			// githubd_proxy.go:142 (replay rejection).
-			logger.Debug("gatewayd internal quota poll", "remote", r.RemoteAddr, "query", logsanitize.Field(r.URL.RawQuery))
+			logger.Debug("internal quota poll", "remote", r.RemoteAddr, "query", logsanitize.Field(r.URL.RawQuery))
 		}
 		q := r.URL.Query()
 		planStr := q.Get("plan")

@@ -1,5 +1,14 @@
 # `gregale.dev` gatewayd cut-over runbook
 
+> **PR-E note (2026-08-09 — historical archive):** This runbook
+> documents the legacy `cmd/gatewayd/` daemon's production cert
+> rotation. The cited unit is `faas-gatewayd.service` (deleted in
+> PR-A); the current public ingress is `faas-gatewayd-public.service`
+> (TLS terminates upstream at Caddy + Cloudflare per ADR-070
+> revision 2026-08-04). Retained for diff archaeology and pre-PR-A
+> operator audit. Do not follow this runbook on a current
+> deployment.
+
 One-time operator procedure for minting the production wildcard cert
 `*.gregale.dev` on a reference control-plane node via DNS-01 against the Hetzner DNS API, and
 for replacing the placeholder `apps.example.com` configuration the box

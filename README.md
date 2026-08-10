@@ -54,7 +54,12 @@ control-plane node remains the acceptance source of truth.
 Spec §14 milestones. Long form (per-PR attribution, what's left on
 each board) lives in [`docs/STATUS.md`](docs/STATUS.md).
 
-- **M0–M6 ✅** — scaffold, vmmd, imaged, apid, gatewayd, builderd.
+[^legacy]: M0–M6 used the monolithic `gatewayd` daemon; the public edge
+    was split into `gatewayd-public` (TLS) and `gatewayd-internal`
+    (routing + wake + proxy) per ADR-070 in PR-A. Milestone labels
+    here still reference the M-era monolithic name for continuity.
+
+- **M0–M6 ✅** — scaffold, vmmd, imaged, apid, gatewayd[^legacy], builderd.
 - **M7 ✅** — meterd wiring + stripe-go SDK landed in PR #59 (closes #52).
 - **M8 🚧** — §11 hardening + SLO dashboard landed; §14 drills +
   CertMagic pending.

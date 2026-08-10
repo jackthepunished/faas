@@ -1,6 +1,13 @@
 # ADR-011 · Thin dashboard at launch
 
 - **Status:** accepted
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-17
 - **Decision:** Ship a *thin* server-rendered dashboard inside `apid` at launch (was gap G3, moved from post-M8 to M7.5). Go `html/template` + HTMX, no SPA build chain, fits the 6 GB control-plane slice (spec §13). The dashboard routes (`/dashboard/*`, `/login`, `/auth/verify`, `/oauth/*`) are reverse-proxied from `gatewayd` to `apid`'s loopback listener — `apid` stays loopback-only, `gatewayd` remains the single public listener (§11).
 - **Why:** the GitHub connect-repo funnel (UX spec §5) requires an OAuth callback and a repo picker. A CLI-only launch strands the git-deploy path the founder chose (UX spec §11 line 272: *"do not implement git-deploy without landing ADR-011 and ADR-012 first"*). The dashboard is the OAuth state machine's natural host — colocating the callback handler, the repo picker, and the per-account surface keeps the state where the read API lives.

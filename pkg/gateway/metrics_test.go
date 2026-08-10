@@ -737,7 +737,7 @@ func TestComputeNodeChangedSubscriberAliveObserves(t *testing.T) {
 
 // TestTouchComputeNodeChangedSubscriberNilSafe — the wrapper must not
 // panic when called on a nil receiver (mirrors ObserveWakeLocalityNilSafe
-// above and SetTLSCertExpiryNilSafe earlier in this file). cmd/gatewayd
+// above and SetTLSCertExpiryNilSafe earlier in this file). cmd/gatewayd-internal/
 // tests pass a nil *Metrics; production wires deps.metrics which is
 // always non-nil after NewMetrics.
 func TestTouchComputeNodeChangedSubscriberNilSafe(t *testing.T) {

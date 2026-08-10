@@ -2512,6 +2512,51 @@ paths:
   # The provenance route is the only /v1/builds surface today.
   # deployments.id remains the parent resource; Build:read scope
   # (api.ScopesReadSurface) gates the read.
+  #
+  # DEPLOY-PROV-6 / ADR-089 (issue #741) added /v1/builds/{id} as
+  # the LIFECYCLE surface (status, timestamps, failure_class,
+  # duration). Companion to /provenance (post-mortem export) and
+  # /sbom (post-mortem blob). Same auth + same IDOR chain.
+
+  /v1/builds/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [deployments]
+      operationId: getBuild
+      summary: Get build status.
+      description: |
+        Returns the lifecycle row for a build id — current status,
+        enqueued/started/finished timestamps, failure_class (when
+        status='failed'), and a server-computed duration_seconds
+        (only set when both started_at and finished_at are
+        populated). Companion to /v1/builds/{id}/provenance (post-
+        mortem export) and /v1/builds/{id}/sbom (post-mortem
+        blob); this one is the LIFECYCLE surface CI scripts call
+        to fail-fast on build error without scraping SSE.
+
+        The status enum is `queued|running|succeeded|failed` (the
+        builds_status_check CHECK constraint; no 'cancelled' value).
+        failure_class, when present, is one of `oom|timeout|
+        user_error|infra` (the builds_failure_class_check CHECK
+        constraint). error_message is intentionally NOT in the
+        response — it lives on deployments; call GET
+        /v1/deployments/{id} for the per-failure string.
+      responses:
+        '200':
+          description: Build lifecycle row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BuildResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            `404 Not Found` — the build id does not exist OR
+            belongs to another account. Stable code
+            `build_not_found`. The 404 surface is uniform so
+            cross-account probes can't enumerate.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/builds/{id}/provenance:
     parameters:
@@ -2760,6 +2805,46 @@ paths:
       summary: Delete a cron.
       responses:
         '204': { description: No body. The cron trigger was removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/crons/{id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [crons]
+      operationId: listCronRuns
+      summary: List recent runs of a cron.
+      description: |
+        Execution history for one cron, newest first. Each row reports
+        when the fire started, how long it took (`duration_ms`,
+        computed server-side), and a normalized `outcome` — so a
+        timeout is distinguishable from a generic failure without
+        parsing `error`.
+
+        Paginated by `?before=<id>` (the LAST id of the returned
+        slice). Defaults to 10 per page; capped at 100. For a wider,
+        cross-source view use `GET /v1/invocations`.
+      parameters:
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: "Cursor — return runs older than this run id. Omit for the most recent page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+          description: "Page size; 1-100, default 10."
+      responses:
+        '200':
+          description: A page of runs for this cron, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListCronRunsResponse'
+                example: {"runs":[{"id":"0123456789abcdef0123456789abcdef","started_at":"2026-08-10T09:00:00Z","completed_at":"2026-08-10T09:00:01.2Z","duration_ms":1200,"outcome":"success","attempts":1},{"id":"fedcba9876543210fedcba9876543210","started_at":"2026-08-09T21:00:00Z","completed_at":"2026-08-09T21:00:30Z","duration_ms":30000,"outcome":"timeout","attempts":1,"error":"invoke: gateway timeout"}]}
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
@@ -4654,7 +4739,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
-  # ─── Billing portal link (issue #253) ──────────────────────────────────
+  # ─── Billing portal link (issue #253, extended in issue #242) ────────
   # The dashboard's "Open Stripe billing portal" button and the CLI's
   # `faas billing portal` both hit this endpoint. The URL itself does
   # not mutate anything; the customer-facing mutations (card update,
@@ -4663,11 +4748,18 @@ paths:
   # (FAAS_BILLING_PORTAL_URL with `{account_id}` substituted). An
   # empty url field is the "absent" sentinel — the operator has not
   # configured a portal on the box.
+  #
+  # Issue #242: the response now also carries payment_method, the
+  # canonical card-on-file summary (provider-agnostic shape), so
+  # the CLI's `faas billing payment-method` subcommand and the
+  # dashboard's billing page both render from the same round-trip.
+  # Field is omitempty — operator boxes without a configured payment
+  # method still return 200 with payment_method absent.
   /v1/billing/portal:
     get:
       tags: [billing]
       operationId: getBillingPortal
-      summary: Get the operator-configured Stripe billing portal URL.
+      summary: Get the operator-configured billing portal URL (and the card-on-file summary).
       description: |
         Returns the URL the customer should be sent to in order to
         manage their subscription (update card, view invoices,
@@ -4676,17 +4768,143 @@ paths:
         does NOT call Stripe's `BillingPortal.Session` SDK on this
         path (issue #253 acceptance #3 partial — a follow-up PR will
         add the SDK call once the spec defines the contract).
+
+        The response also carries a `payment_method` block (issue
+        #242) — the card-on-file summary (brand, last-4, expiry).
+        The CLI's `faas billing payment-method` renders from this
+        field; the dashboard's billing page does the same. The
+        field is omitempty so no-card-on-file responses stay clean.
       responses:
         '200':
-          description: Portal URL (may be empty when the box has no portal configured).
+          description: Portal URL + payment-method summary (any field may be empty when the box has no portal configured).
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/BillingPortalResponse'
               example:
                 url: "https://billing.example.com/portal?account=9f1d8e7c-6b5a-4d3c-2b1a-0fedcba98765"
+                payment_method:
+                  brand: "visa"
+                  last4: "4242"
+                  exp_month: 12
+                  exp_year: 2027
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Billing retry (issue #242) ────────────────────────────────────────
+  # POST /v1/billing/retry — runs the latest unpaid charge against
+  # the customer's saved card. Closes the CC8.1 lie in the dunning
+  # email (`pkg/mail/account.go:107,150`); the email promises the
+  # customer `faas billing retry`, this endpoint is what the CLI
+  # actually calls.
+  #
+  # Stripe: apid looks up the account's most recent open invoice
+  # and calls `Invoices.Pay`, which retries on the saved payment
+  # method. Idempotency-Key pins to `acct.ID / retry / invoice.ID`
+  # so a flaky network redelivery lands on the same Stripe-side attempt.
+  #
+  # Paddle: apid creates a fresh `CreateTransaction` against the
+  # existing `ctm_…` customer for the same plan + month-to-date
+  # overage, then returns the merchant-dashboard txn URL.
+  #
+  # The authed account is the only account that can be retried —
+  # a forged acct ID returns 404 (the server routes by bearer, not
+  # by request body).
+  /v1/billing/retry:
+    post:
+      tags: [billing]
+      operationId: retryLatestCharge
+      summary: Retry the latest unpaid invoice / transaction for this account.
+      description: |
+        Stripe path: calls `Invoices.Pay` on the most recent open
+        invoice for the customer. The Idempotency-Key header (auto
+        UUIDv4 if absent) collapses retries on the same
+        `acct.ID / retry / invoice.ID` key.
+
+        Paddle path: creates a new `Transaction` against the
+        existing customer for the same plan + month-to-date overage.
+        The CLI forwards the merchant-dashboard URL via the
+        response's `provider_ref_id` extension.
+      responses:
+        '200':
+          description: New charge attempt created. The CLI prints attempt + provider reference IDs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingRetryResponse'
+              example:
+                attempt_id: "in_1abcd"
+                provider_ref_id: "pi_1abcd"
+                status: "pending_provider_confirmation"
+                next_billing_at: null
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No open charge to retry — the account is in good standing, or the operator has not configured a billing provider.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: Provider-side failure (Stripe API error / Paddle timeout). The CLI surfaces this as 'retry failed'.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  # ─── Billing cancel (issue #242) ───────────────────────────────────────
+  # POST /v1/billing/cancel — sets cancel_at_period_end on the active
+  # subscription. Account keeps running until period end, then
+  # downgrades to Free (spec §4.7). Idempotent: a re-cancel returns
+  # 409 with `already_cancelled` so the CLI can render a friendly
+  # hint.
+  #
+  # Stripe: apid calls `Subscriptions.Update(cancel_at_period_end=true)`.
+  # Stripe-side state holds the cancel-scheduled flag; the SDK
+  # round-trip is the source of truth.
+  #
+  # Paddle: Paddle's `Customer` object carries the
+  # `scheduled_change` field; apid stamps the cancel intent onto
+  # the customer via `Paddle.Customer.Update`. The next monthly
+  # rebill reads the flag and skips generating a new
+  # CreateTransaction; the account downgrades to Free on the next
+  # dunning tick.
+  #
+  # Destructive: the CLI requires the typed-confirm gate from PR #782
+  # ("cancel subscription"). apid itself does not gate (MFA-on-cancel
+  # is a tier-3 follow-up) so headless callers can wire the endpoint
+  # behind their own confirm dialog.
+  /v1/billing/cancel:
+    post:
+      tags: [billing]
+      operationId: cancelAtPeriodEnd
+      summary: Set cancel_at_period_end on the active subscription; keep the account active until period end.
+      description: |
+        Stripe: `Subscriptions.Update(cancel_at_period_end=true)`.
+        Paddle: `Customer.Update(scheduled_change=cancel)` on the
+        customer's stored object.
+
+        Returns the effective cancel timestamp (`current_period_end`
+        on Stripe; the next month-rollover instant on Paddle) in
+        RFC 3339 so the CLI can print "your apps will stop on …".
+      responses:
+        '200':
+          description: Cancellation scheduled; account remains on the plan until period end.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingCancelResponse'
+              example:
+                cancel_scheduled: true
+                effective_at: "2026-09-08T00:00:00Z"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409':
+          description: Already cancelled. CLI renders a friendly hint.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: Provider-side failure.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   # ─── Operator credits (issue #279) ─────────────────────────────────────
   # Admin-only endpoint that issues a positive-cents credit to a
@@ -6319,6 +6537,19 @@ components:
             - type: 'null'
           description: "Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why is my app evicted_cold?' without grepping the audit log."
 
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Resolved UUID (not the wire name) — apid resolves the
+        # wire name to the UUID server-side before persisting,
+        # so the read-back is unambiguous across
+        # operator-deployed fleets with non-unique names. NULL
+        # when no preference is set (default A9 fallback;
+        # random first peer with headroom).
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps before the A9 fallback; falls through to A9 when the target is inactive or full."
+          type: [string, "null"]
+          format: uuid
+          example: "00000000-0000-0000-0000-000000000000"
+
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
         # PublicAuthStatus shape — `has_basic_creds` is true
@@ -6393,6 +6624,17 @@ components:
           type: string
           enum: [best_effort, reserved]
           example: best_effort
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Wire form is the human-readable compute_nodes.name;
+        # apid resolves to the UUID server-side via
+        # Store.ComputeNodeByName before persisting. 404 on
+        # unknown name; 422 on inactive node. Omitted at
+        # create-time → default A9 fallback (no preference).
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is compute_nodes.name (resolved server-side). Omitted → no preference; empty string at create-time is rejected with 422 invalid_overflow_node because the column starts NULL and there is no 'clear' path at create-time."
+          type: string
+          minLength: 1
+          example: "box-eu-1"
         # Issue #560 + issue #695 / ADR-080: optional at
         # create-time. Omitted → apid applies the per-plan
         # default (Free=false, Hobby=true, Pro=true, Scale=true).
@@ -6568,6 +6810,17 @@ components:
           oneOf:
             - type: "null"
             - $ref: '#/components/schemas/PublicAuthBlock'
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Wire type is the human-readable compute_nodes.name;
+        # apid resolves to the UUID server-side. Tri-state:
+        # omitted → no change; "" → clear (back to A9
+        # fallback); non-empty → resolve via
+        # Store.ComputeNodeByName and store the UUID. 404 on
+        # unknown name; 422 on inactive node.
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node."
+          type: [string, "null"]
+          example: "box-eu-1"
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
@@ -6875,16 +7128,86 @@ components:
 
     BillingPortalResponse:
       description: |
-        Operator-configured Stripe billing portal URL (issue #253).
-        The url field is omitted when the box has FAAS_BILLING_PORTAL_URL
-        unset — that is the "absent" sentinel; the CLI branches on it
-        to print a friendly hint instead of opening the browser to "".
+        Operator-configured billing portal URL (issue #253) plus the
+        card-on-file summary (issue #242). The url field is omitted
+        when the box has FAAS_BILLING_PORTAL_URL unset — that is the
+        "absent" sentinel; the CLI branches on it to print a friendly
+        hint instead of opening the browser to "". The payment_method
+        field is omitted when the account has no card on file (Free
+        plan, or post-checkout before the first paid cycle settles).
       type: object
       properties:
         url:
           type: [string, "null"]
           format: uri
           description: 'Substituted portal URL; absent when the box has no portal configured.'
+        payment_method:
+          $ref: '#/components/schemas/PaymentMethodSummary'
+          description: |
+            Card-on-file summary. Omitted when the account has no
+            payment method on file (Free / never-checked-out). The
+            CLI's `faas billing payment-method` and the dashboard's
+            billing page render from this field.
+
+    PaymentMethodSummary:
+      description: |
+        Card-on-file summary (issue #242). Provider-agnostic shape —
+        the same wire shape is returned whether the operator runs
+        Stripe or Paddle. brand is the lowercase network label
+        ("visa", "mastercard", "amex"); last4 is the last-4 of the
+        PAN (no full PAN, no PCI surface); exp_month / exp_year are
+        integer card-face expiry fields.
+      type: object
+      required: [brand, last4, exp_month, exp_year]
+      properties:
+        brand:     { type: string, example: visa,     description: 'Card network (lowercase).' }
+        last4:     { type: string, example: '4242',   description: 'Last 4 digits of the PAN.' }
+        exp_month: { type: integer, minimum: 1, maximum: 12, example: 12,    description: 'Card expiry month (1-12).' }
+        exp_year:  { type: integer, minimum: 2020,               example: 2027,  description: 'Card expiry year.' }
+
+    BillingRetryResponse:
+      description: |
+        Returned by POST /v1/billing/retry (issue #242). The CLI
+        prints attempt_id and provider_ref_id so the customer can
+        quote them to support if the charge still fails. status is
+        "pending_provider_confirmation" — the CLI does not poll for
+        a settlement flip; that flip arrives via the provider's
+        webhook (EventPaymentSucceeded) and is rendered by the
+        dashboard / dunning email pipeline.
+      type: object
+      required: [attempt_id, provider_ref_id, status]
+      properties:
+        attempt_id:
+          type: string
+          description: 'apId-side attempt handle (Stripe: in_…, Paddle: txn_…-related).'
+        provider_ref_id:
+          type: string
+          description: 'Provider-side handle for the new attempt (Stripe: pi_…, Paddle: tx_…).'
+        status:
+          type: string
+          description: 'Always "pending_provider_confirmation" today; reserved for future settlement states.'
+        next_billing_at:
+          type: [string, "null"]
+          format: date-time
+          description: 'Next scheduled billing instant after the retry settles; null when not known yet.'
+
+    BillingCancelResponse:
+      description: |
+        Returned by POST /v1/billing/cancel (issue #242). The CLI
+        renders effective_at as "your apps will stop on <date>".
+        cancel_scheduled is always true on 200; the 409 path returns
+        a Problem with a friendly "already cancelled" hint so a
+        re-cancel idempotency click does not surface as a server error.
+      type: object
+      required: [cancel_scheduled, effective_at]
+      properties:
+        cancel_scheduled:
+          type: boolean
+          description: 'Always true; the absence of an active subscription returns 409 instead.'
+        effective_at:
+          type: string
+          format: date-time
+          description: 'RFC 3339 instant at which the subscription terminates (Stripe: current_period_end; Paddle: next month-rollover).'
 
     BillingReconcileResponse:
       description: |
@@ -6980,6 +7303,52 @@ components:
         finished_at: { type: string, format: date-time }
         sbom_storage_key: { type: [string, "null"], description: "Phase 3 populator fills this from `syft` output. Empty string when not yet populated." }
         framework_version: { type: [string, "null"], description: "Source-declared language version (nodes 22.11.0 / python 3.13 / go 1.24, etc.). Empty string when no version file is present or any parser fails — best-effort, never an error. Added in DEPLOY-PROV-5 / issue #740 / ADR-087." }
+
+    BuildResponse:
+      description: |
+        DEPLOY-PROV-6 / ADR-089 (issue #741): the LIFECYCLE row for
+        a single build — current status, enqueued/started/finished
+        timestamps, failure_class, server-computed duration_seconds.
+        Companion to BuildProvenanceResponse (post-mortem export,
+        ADR-038) and the /sbom route (post-mortem blob, ADR-038
+        Phase 3). The status field mirrors builds.status — a
+        4-state enum `queued|running|succeeded|failed` per the
+        `builds_status_check` CHECK constraint. 'cancelled' is
+        intentionally absent (ADR-089 §1).
+
+        failure_class is the low-cardinality enum
+        `oom|timeout|user_error|infra` per the
+        `builds_failure_class_check` CHECK; present only when
+        status='failed'.
+
+        duration_seconds is server-computed (FinishedAt − StartedAt)
+        only when BOTH timestamps are populated; absent otherwise
+        (so a queued/running build stays minimal). CI scripts can
+        rely on its presence as "the build reached a terminal state
+        and elapsed N wall-clock seconds." error_message is
+        intentionally NOT in this response — it lives on
+        deployments; clients that need the per-failure string call
+        GET /v1/deployments/{id}.
+      type: object
+      required:
+        - id
+        - deployment_id
+        - kind
+        - source_bytes
+        - status
+        - enqueued_at
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        deployment_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        kind: { type: string, enum: [railpack, dockerfile, tarball, github] }
+        source_bytes: { type: integer, format: int64 }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        failure_class: { type: string, enum: [oom, timeout, user_error, infra] }
+        log_path: { type: string }
+        enqueued_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        duration_seconds: { type: integer, description: "Server-computed FinishedAt − StartedAt in whole seconds. Absent until the build reaches a terminal state." }
 
     AccountCreditResponse:
       description: |
@@ -7426,6 +7795,32 @@ components:
         enabled: { type: boolean }
         created_at: { type: string, format: date-time }
         last_fired_at: { type: [string, "null"], format: date-time }
+
+    CronRun:
+      description: "One execution of a cron: when it fired, how long it ran, and how it ended. Backed by the underlying invocations row, projected so callers need not compute a duration or interpret raw state."
+      type: object
+      required: [id, started_at, outcome, attempts]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        started_at: { type: string, format: date-time, description: "When the cron fired (the invocation's created_at), not when the app began executing." }
+        completed_at: { type: [string, "null"], format: date-time, description: "When the run reached a terminal state; null while still in flight." }
+        duration_ms: { type: [integer, "null"], description: "completed_at - started_at in milliseconds, computed server-side. Null while the run is still in flight." }
+        outcome:
+          type: string
+          enum: [success, failed, timeout, dead_letter, running]
+          description: "Normalized result. `timeout` means the dispatch exceeded its deadline; `dead_letter` means the retry budget was exhausted; `running` means the run has not reached a terminal state yet. Branch on this, never on `error`."
+        attempts: { type: integer, description: "Dispatch attempts for this run; greater than 1 means it was retried." }
+        instance_id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$', description: "The instance that served the run; null if the fire never reached one." }
+        error: { type: [string, "null"], description: "Operator-facing failure text. Unstructured and unversioned — do not parse it." }
+
+    ListCronRunsResponse:
+      description: "Page of cron runs; ordered newest-first. Pass the LAST id of the returned slice as the next `?before=` to load older runs."
+      type: object
+      required: [runs]
+      properties:
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/CronRun' }
 
     CreateCronRequest:
       description: "Cron creation payload: schedule expression and target URL."
@@ -8782,8 +9177,8 @@ components:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
-        source: { type: string, enum: [async_invoke, queue, delayed_task, cron] }
-        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled] }
+        source: { type: string, enum: [async_invoke, queue, delayed_task, cron, replay] }
+        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled, dead_letter] }
         method: { type: string }
         path: { type: string }
         payload: { type: object, additionalProperties: true }

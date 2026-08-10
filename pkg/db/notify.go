@@ -116,7 +116,7 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         €0.01/GB-h (spec §1, §10).
 //	NotifyCronFired         {"cron_id":uuid, "app_id":uuid, "at":rfc3339nano}
 //	                         schedd → dashboard: a synthetic cron request
-//	                         was dispatched through gatewayd so metering
+//	                         was dispatched through gatewayd-internal so metering
 //	                         and rate limits apply identically (spec §4.4,
 //	                         M7 cron firing).
 //	NotifyAccountDeletionPending {"account_id":uuid, "scheduled_at":rfc3339nano,
@@ -190,7 +190,7 @@ const (
 	NotifyAlertRuleChanged = "alert_rule_changed"
 	// NotifyComputeNodeChanged {"node_id":uuid, "active":bool}
 	// schedd (SetComputeNodeActive + UpsertComputeNode) →
-	// gatewayd (NodeClientCache.Evict). gatewayd's per-node
+	// gatewayd-internal (NodeClientCache.Evict). gatewayd-internal's per-node
 	// *grpc.ClientConn must drop on every UPSERT (admin UPDATE)
 	// and every active=false (heartbeat watchdog), so a future
 	// request to the same node re-dials against the fresh row.
@@ -326,7 +326,7 @@ func Subscribe(ctx context.Context, pool *pgxpool.Pool, channels []string) (<-ch
 // Backoff resets to 100ms after each successful (re-)subscribe.
 //
 // F-11: replaced the silent-LISTEN-close bug class across every daemon
-// loop (schedd, builderd, imaged, gatewayd). The four call sites all
+// loop (schedd, builderd, imaged, gatewayd-internal). The four call sites all
 // switched from `db.Subscribe(...)` to this function.
 func SubscribeWithReconnect(
 	ctx context.Context,

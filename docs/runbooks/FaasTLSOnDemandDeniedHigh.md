@@ -1,7 +1,7 @@
 # FaasTLSOnDemandDeniedHigh
 
 Source: `deploy/ansible/roles/prometheus/files/faas.rules.yml`.
-Metric: `gateway_tls_on_demand_denied_total{reason}` (gatewayd `/metrics`).
+Metric: `gateway_tls_on_demand_denied_total{reason}` (gatewayd-public `/metrics`).
 Spec: §11 abuse-vector observability + ADR-024 H3 (closed in PR #345).
 Severity: warn.
 
@@ -35,14 +35,14 @@ curl -fsS http://127.0.0.1:9090/metrics | grep gateway_tls_on_demand_denied_tota
 # Reason breakdown — the per-reason sum lets you confirm allowlist is
 # the source (vs a frozen-zero on dns01 or token = H3.b unmerged).
 curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=sum by (reason) (rate(gateway_tls_on_demand_denied_total[5m]))'
-journalctl -u faas-gatewayd --since '-15m' --no-pager | grep -iE 'on-demand denied|allowlist'
+journalctl -u faas-gatewayd-public --since '-15m' --no-pager | grep -iE 'on-demand denied|allowlist'
 ```
 
 ## Check
 
 ```bash
 # Who is hitting us? The slog line carries the host.
-journalctl -u faas-gatewayd --since '-1h' --no-pager \
+journalctl -u faas-gatewayd-public --since '-1h' --no-pager \
   | grep 'on-demand denied' \
   | awk '{for(i=1;i<=NF;i++) if($i=="host=") print $(i+1)}' \
   | sort | uniq -c | sort -rn | head -20
@@ -61,6 +61,11 @@ If the count is dominated by a single SNI, it could be:
   on every request. Fix: pin the LB to forward the SNI correctly,
   or add the LB's SNI to the allowlist.
 
+> **Note:** the original monolithic edge daemon role for this deny check was split by
+> ADR-070; the production check now lives on `gatewayd-public`. An
+> attacker SNI not in the allowlist is rejected at
+> `gatewayd-public`'s certmagic surface.
+
 ## Silence
 
 ```bash
@@ -77,4 +82,4 @@ Allowlist denials are the **correct** response to a non-owned SNI
 the rate is sustained and the source is a known scanner, the
 recovery is "let it fire and let alertmanager notify once per
 shift". If a customer probe is the cause, the fix is upstream
-(not in gatewayd).
+(not in gatewayd-public).

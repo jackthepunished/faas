@@ -101,7 +101,7 @@ func (r *RingBuffer) Touch(now time.Time, counts map[string]int64) {
 			// and lastSeen=cumulative. Seeding with the raw
 			// cumulative value would inflate the first window
 			// (the bucket's count is what AppRPS sums) — if
-			// gatewayd has already served N requests when the
+			// gatewayd-internal has already served N requests when the
 			// trigger is enabled mid-flight, AppRPS would report
 			// N/conc for the first 5 ticks. The next Touch
 			// computes a real delta against this seeded
@@ -113,7 +113,7 @@ func (r *RingBuffer) Touch(now time.Time, counts map[string]int64) {
 			}
 			continue
 		}
-		// Compute per-tick delta. Negative deltas (gatewayd
+		// Compute per-tick delta. Negative deltas gatewayd-internal
 		// restart) signal a fresh boot — the cumulative
 		// counter is per-process and resets to 0 on restart.
 		// Treat the regression as a fresh start: clear the

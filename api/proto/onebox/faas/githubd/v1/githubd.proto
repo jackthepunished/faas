@@ -3,7 +3,7 @@
 // githubd owns: push-webhook receiver, Checks-API status writer, OAuth
 // callback handler, per-repo install-token cache. It is the SOLE
 // outbound caller to api.github.com (Checks API + install token
-// exchange); its inbound public surface is gatewayd at /webhooks/github
+// exchange); its inbound public surface is gatewayd-public at /webhooks/github
 // (HMAC-verified at the edge per ADR-012).
 //
 // Wire discipline mirrors vmmd (ADR-013) and schedd (ADR-018):
@@ -56,12 +56,12 @@ service Githubd {
 
   // CreateDeploymentFromPush turns a verified GitHub push webhook into
   // a deployment row in apid's `deployments` table. githubd calls this
-  // after gatewayd forwards the request and the HMAC check passes.
+  // after gatewayd-public forwards the request and the HMAC check passes.
   // Returns the empty deployment_id when no app is bound to the repo
   // (a common case for forks / first-time installs).
   //
   // DEPRECATED (issue #432 phase 5 closure): the inbound-webhook path
-  // is HTTP-only (gatewayd → /webhooks/github → githubd). The gRPC
+  // is HTTP-only (gatewayd-public → /webhooks/github → githubd). The gRPC
   // surface was originally designed for repo-level dispatch but cannot
   // carry per-app build inputs (source_path on disk, source URL for
   // provenance). Issue #432 phase 5 closes the loop with EnqueueBuild

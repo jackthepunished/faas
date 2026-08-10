@@ -37,11 +37,11 @@ import (
 
 // TestNextBackoff_Ladder pins the doubling cadence: 1s → 2s →
 // 4s → 8s → 16s → 30s (capped, doubled until cap). This is the
-// same shape cmd/gatewayd/warmhints.go:103-138 uses today, so the
+// same shape cmd/gatewayd-internal/warmhints.go:103-138 uses today, so the
 // vmmd capacity-publisher reconnect stays in sync with the
-// gatewayd warmhint-publisher reconnect. The test asserts the
+// gatewayd-internal warmhint-publisher reconnect. The test asserts the
 // exact cadence so a future refactor that switches to "5s/10s"
-// steps can't silently regress the gatewayd/vmmd coordination.
+// steps can't silently regress the gatewayd-internal/vmmd coordination.
 func TestNextBackoff_Ladder(t *testing.T) {
 	t.Parallel()
 	steps := []time.Duration{

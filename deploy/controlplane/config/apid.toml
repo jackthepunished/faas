@@ -1,7 +1,7 @@
 # DO dev deployment — apid config.
-# Loopback bind: matches FAAS_APID_LISTEN in sealed.env. gatewayd is the
+# Loopback bind: matches FAAS_APID_LISTEN in sealed.env. gatewayd-public is the
 # only public listener (spec §11); this listener is reached via the
-# gatewayd → apid reverse proxy. This TOML is parsed by wire.Daemon for
+# gatewayd-internal → apid reverse proxy. This TOML is parsed by wire.Daemon for
 # logging only — the authoritative bind is FAAS_APID_LISTEN.
 listen_addr = "127.0.0.1:8081"
 base_domain = "__DROPLET_IP__.nip.io"

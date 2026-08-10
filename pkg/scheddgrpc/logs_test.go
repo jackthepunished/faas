@@ -173,7 +173,7 @@ var _ *wire.OpsMetrics = (*wire.OpsMetrics)(nil)
 // the gap frame — Finding 2's contract — and a subsequent line
 // frame arrives intact.
 //
-// A regression here means gatewayd's RenderAppLogGap stops
+// A regression here means gatewayd-internal's RenderAppLogGap stops
 // seeing `is_gap=true` and falls back to its broken
 // "since_below_retained" heuristic — Finding 1.
 func TestStreamAppLogs_GapForwardedOverSchedd(t *testing.T) {

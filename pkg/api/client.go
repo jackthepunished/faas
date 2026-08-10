@@ -525,6 +525,26 @@ func (c *Client) GetBuildsIdSbom(ctx context.Context, id string) ([]byte, error)
 	return out, c.doBytes(ctx, "GET", "/v1/builds/"+id+"/sbom", nil, &out)
 }
 
+// GetBuildsId returns the lifecycle row for a build id (DEPLOY-PROV-6
+// / ADR-089, issue #741). Backs `gregale build status <id>` and the
+// CLI's SSE fallback pollBuildStatus loop.
+//
+// The 404 surface is "no such build" — both for non-existent ids
+// and for cross-account probes (the server's IDOR chain collapses
+// every negative path to a uniform 404). The SDK propagates the
+// server's *APIError; callers can check apierr.Code() against
+// CodeBuildNotFound when the distinction matters (e.g. for
+// "follow manually" hints in the CLI).
+//
+// Method name: derived by cmd/sdk-coverage/main.go::deriveMethodName
+// from `GET /v1/builds/{id}` → GetBuildsId. Mirrors the existing
+// GetBuildsIdProvenance / GetBuildsIdSbom. No methodRouteMap entry
+// needed; sdk-check fails if the derived name doesn't match.
+func (c *Client) GetBuildsId(ctx context.Context, id string) (BuildResponse, error) {
+	var out BuildResponse
+	return out, c.do(ctx, "GET", "/v1/builds/"+id, nil, &out)
+}
+
 // DeployMultipart ships a source tarball (with optional runtime +
 // handler) to the multipart deploy endpoint. sourceName is the form
 // filename apid sees in the multipart "source" part; pass the
@@ -843,6 +863,30 @@ func (c *Client) UpdateCron(ctx context.Context, id string, req UpdateCronReques
 }
 func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
+}
+
+// ListCronRuns returns a page of the cron's execution history (issue
+// #791 / PR A): newest-first, server-computed duration_ms, outcome
+// classification (success/failed/timeout/dead_letter/running).
+// before is the LAST run id of the previous page; omit for the most
+// recent page. limit is 1..100, default 10 — the handler validates
+// and surfaces a 400 Problem with limit + observed on garbage input
+// (matches the canonical parseCronRunsLimit helper). For a wider,
+// cross-source view use ListInvocations.
+func (c *Client) ListCronRuns(ctx context.Context, id, before string, limit int) (ListCronRunsResponse, error) {
+	path := "/v1/crons/" + id + "/runs"
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out ListCronRunsResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
 // --- Alert rules (issue #396 / ADR-045 PR 3) -------------------------------
@@ -1632,12 +1676,60 @@ func (c *Client) ListDeployments(ctx context.Context, before string, limit int) 
 // friendly hint instead of opening the browser to "". The endpoint
 // is authenticated via the standard Bearer / API-key chain (same
 // surface as usage reads).
+//
+// Issue #242: this signature is preserved for callers that only
+// care about the URL (cmdBillingPortal). New callers that need
+// the payment-method summary should use GetBillingPortalFull.
 func (c *Client) GetBillingPortal(ctx context.Context) (string, error) {
-	var out BillingPortalResponse
-	if err := c.do(ctx, "GET", "/v1/billing/portal", nil, &out); err != nil {
+	full, err := c.GetBillingPortalFull(ctx)
+	if err != nil {
 		return "", err
 	}
-	return out.URL, nil
+	return full.URL, nil
+}
+
+// GetBillingPortalFull returns both the portal URL AND the
+// card-on-file summary (issue #242). The CLI's `faas billing
+// payment-method` subcommand renders from this method; the
+// dashboard's billing page does the same. PaymentMethod is the
+// zero value when the account has no card on file — the CLI
+// branches on the empty brand to print a "no payment method on
+// file" hint.
+func (c *Client) GetBillingPortalFull(ctx context.Context) (BillingPortalResponse, error) {
+	var out BillingPortalResponse
+	if err := c.do(ctx, "GET", "/v1/billing/portal", nil, &out); err != nil {
+		return BillingPortalResponse{}, err
+	}
+	return out, nil
+}
+
+// PostBillingRetry retries the latest unpaid invoice / transaction
+// for the authenticated account (issue #242). Closes the
+// customer-trust lie in pkg/mail/account.go:107,150 — the dunning
+// email promises `faas billing retry`; this is what it calls.
+// Returns the apId-side attempt id + the provider-side reference
+// id + a status string ("pending_provider_confirmation" today).
+func (c *Client) PostBillingRetry(ctx context.Context) (BillingRetryResponse, error) {
+	var out BillingRetryResponse
+	if err := c.do(ctx, "POST", "/v1/billing/retry", nil, &out); err != nil {
+		return BillingRetryResponse{}, err
+	}
+	return out, nil
+}
+
+// PostBillingCancel sets cancel_at_period_end on the authenticated
+// account's subscription (issue #242). Account keeps running
+// until period end then downgrades to Free (spec §4.7). The
+// destructive nature is gated on the CLI side (typed-confirm from
+// PR #782: "cancel subscription"); apid itself does not gate.
+// Returns the effective-at timestamp so the CLI can print
+// "your apps will stop on <date>".
+func (c *Client) PostBillingCancel(ctx context.Context) (BillingCancelResponse, error) {
+	var out BillingCancelResponse
+	if err := c.do(ctx, "POST", "/v1/billing/cancel", nil, &out); err != nil {
+		return BillingCancelResponse{}, err
+	}
+	return out, nil
 }
 
 // ListInvoices returns a single page of the authenticated account's

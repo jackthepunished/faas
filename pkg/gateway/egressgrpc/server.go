@@ -1,6 +1,6 @@
 // Package egressgrpc is the gateway-side implementation of the
 // ADR-046 PR-2 producer channel
-// (onebox.faas.gatewayd.v1.EgressTxService.StreamBytes). The
+// (onebox.faas.egress.v1.EgressTxService.StreamBytes). The
 // service drains the per-instance ring buffer
 // (pkg/gateway/egresssink.EgressSink) on a fixed cadence and
 // pushes one BytesFrame per (instance_id, minute) bucket through
@@ -8,7 +8,7 @@
 //
 // Layering (gateway side):
 //
-//	cmd/gatewayd/main.go registers an EgressTxServiceServer
+//	cmd/gatewayd-internal/main.go registers an EgressTxServiceServer
 //	alongside the existing SynthServer on a single *grpc.Server
 //	bound to the same /run/faas/gatewayd-internal.sock unix-domain
 //	socket (FAAS_GATEWAY_SYNTH_SOCKET). The unix-socket DAC auth
@@ -54,7 +54,7 @@ import (
 var StreamCadence = 1 * time.Second
 
 // Server is the gateway-side EgressTxService implementation. One
-// per gatewayd process; constructed in cmd/gatewayd/main.go
+// per gatewayd-internal process; constructed in cmd/gatewayd-internal/main.go
 // after the Handler + EgressSink are wired.
 //
 // Concurrency: the embedded *grpc.Server handles per-stream
@@ -101,12 +101,12 @@ func (s *Server) ActiveStreams() int { return int(s.activeStreams.Load()) }
 // StreamBytes is the single RPC. The per-stream goroutine owns
 // the cadence ticker and drains the sink on every tick,
 // forwarding one frame per (instance_id, minute) bucket. The
-// stream stays open until ctx cancels (meterd hangs up, gatewayd
+// stream stays open until ctx cancels (meterd hangs up,gatewayd-internal
 // shuts down) — meterd's dialer reconnects on transient failures
-// (P0 gatewayd restart), picking up from the next cadence tick.
+// (P0 gatewayd-internal restart), picking up from the next cadence tick.
 //
 // Empty drains are silent (zero-frame emits) so a working
-// gatewayd that happens to have no observed bytes this tick
+// gatewayd-internal that happens to have no observed bytes this tick
 // doesn't trigger spurious "no data" alerts on the meterd side.
 func (s *Server) StreamBytes(req *egresspb.StreamBytesRequest, stream grpc.ServerStreamingServer[egresspb.BytesFrame]) error {
 	if s.sink == nil {

@@ -61,7 +61,7 @@ is the multi-node replacement (all Gate A, per D2/D3):
 | gRPC over unix sockets in `/run/faas/` (vmmd/schedd) | TCP behind mTLS — the re-eval trigger already noted in ADR-013/015/018 |
 | Snapshots on local `/srv/fc` | wake-on-node-B needs node-A's snapshot → **sticky placement** (route an app to its warm node) or shared/replicated snapshot store. Cold-boot fallback (ADR-005) is the safety net that makes this non-fatal. |
 | One in-process admission ledger, one 47,600 MB budget (`pkg/sched/admission.go`) | ledger **per node** + a **placement scheduler** deciding *which node* admits a VM. This is the one genuinely new component. |
-| `gatewayd` = the only public listener | an edge/routing tier that knows which node an app is warm on (or route-anywhere + wake). |
+| `gatewayd` = the only public listener *(split into `gatewayd-public` + `gatewayd-internal` per ADR-070)* | an edge/routing tier that knows which node an app is warm on (or route-anywhere + wake). |
 | One `schedd`, sole writer to `instances` | one `schedd` per node; apps sharded by node; `apid` routes writes to the owning shard (spec line 131). |
 
 Everything else — per-slot resource derivation (`pkg/fcvm`), Postgres/sqlc,

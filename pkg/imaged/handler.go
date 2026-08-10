@@ -606,10 +606,106 @@ func (h *Handler) runGrype(ctx context.Context, dir string) (*ScanResult, error)
 // dashboard renders a "scan failed" chip; the deploy itself
 // is unaffected.
 //
+// stageScanExt4 resolves the scan-source ext4 for the per-deploy
+// grype scan. The grype subprocess takes `grype dir:<path>` where
+// `<path>` may be a file or directory (it accepts both); the
+// helper returns a path + cleanup func that the caller defers.
+//
+// Routing (ADR-054 acceptance closure, Tier 1 Phase 3):
+//
+//   - LocalStorageBackend: return the canonical appsRoot path
+//     unchanged. Single-box behaviour preserved 1:1; the bytes
+//     are read off `/var/lib/faas/apps/<slug>/<depID>.ext4`.
+//   - Anything else (PrefixRouter, OCI registry, etc.): stage the
+//     blob to a tempdir under h.appsRoot (or os.TempDir() if the
+//     appsRoot isn't writable) and return that path. The caller
+//     MUST defer the returned cleanup func to remove the staged
+//     file. The LocalCacheBackend wrapper on top of the OCI
+//     registry gives the second + third scan of the same layer
+//     a free cache hit — staging is not a re-fetch.
+//
+// Returns ("", noop, err) on a path-traversal slug (the
+// appsRootPath guard rejects bad slugs) or a Get error from the
+// backend. The grype runner is NOT called in that case; the
+// caller stamps scan_status='failed' with the error string.
+func (h *Handler) stageScanExt4(ctx context.Context, be storage.StorageBackend, app state.App, dep state.Deployment) (string, func(), error) {
+	// Local backend short-circuit. The legacy appsRootPath stays
+	// because SetDeploymentRootfs (handler.go:1334+1380+1697)
+	// stamps it onto the deployment row as a diagnostic column.
+	if _, isLocal := be.(*storage.LocalStorageBackend); isLocal {
+		p := h.appsRootPath(app.Slug, dep.ID)
+		if p == "" {
+			return "", func() {}, errors.New("slug/path-traversal guard rejected")
+		}
+		return p, func() {}, nil
+	}
+
+	// Remote backend (OCI registry, hybrid router, …). Stage
+	// the ext4 bytes to a local tempdir so grype dir:<path> can
+	// scan a filesystem path regardless of where the canonical
+	// bytes live.
+	appsKey := sched.AppLayerKey(app.Slug, dep.ID)
+	rc, err := be.Get(ctx, appsKey)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("imaged: scan stage backend.Get(%q): %w", appsKey, err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	// MkdirTemp roots under h.appsRoot (the daemon's writable
+	// scratch area) when possible; falls back to os.TempDir()
+	// if the appsRoot doesn't exist or isn't writable. The
+	// tempdir itself becomes the grype source — grype
+	// dir:<tempdir> walks all files under it, of which there
+	// is exactly one (the staged ext4).
+	stageRoot := h.appsRoot
+	if stageRoot == "" {
+		stageRoot = os.TempDir()
+	}
+	stageDir, mkErr := os.MkdirTemp(stageRoot, "imaged-scan-")
+	if mkErr != nil {
+		// appsRoot wasn't writable; fall back to os.TempDir()
+		// to avoid taking the scan path down with the daemon.
+		stageDir, mkErr = os.MkdirTemp(os.TempDir(), "imaged-scan-")
+		if mkErr != nil {
+			return "", func() {}, fmt.Errorf("imaged: scan stage MkdirTemp: %w", mkErr)
+		}
+	}
+	stagedPath := filepath.Join(stageDir, "rootfs.ext4")
+	out, openErr := os.OpenFile(stagedPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if openErr != nil {
+		_ = os.RemoveAll(stageDir)
+		return "", func() {}, fmt.Errorf("imaged: scan stage OpenFile(%q): %w", stagedPath, openErr)
+	}
+	if _, copyErr := io.Copy(out, rc); copyErr != nil {
+		_ = out.Close()
+		_ = os.RemoveAll(stageDir)
+		return "", func() {}, fmt.Errorf("imaged: scan stage io.Copy: %w", copyErr)
+	}
+	if syncErr := out.Sync(); syncErr != nil {
+		_ = out.Close()
+		_ = os.RemoveAll(stageDir)
+		return "", func() {}, fmt.Errorf("imaged: scan stage Sync: %w", syncErr)
+	}
+	if closeErr := out.Close(); closeErr != nil {
+		_ = os.RemoveAll(stageDir)
+		return "", func() {}, fmt.Errorf("imaged: scan stage Close: %w", closeErr)
+	}
+	cleanup := func() { _ = os.RemoveAll(stageDir) }
+	return stageDir, cleanup, nil
+}
+
 // Marshal contract: *ScanResult + Error field are plain Go
 // types (ints, string) so json.Marshal can't fail at runtime.
 // A future field that breaks this invariant (e.g. a chan)
 // surfaces as an immediate panic in tests.
+//
+// Scan source: ADR-054 acceptance closure (Tier 1 Phase 3)
+// routes the scan through the wired StorageBackend. Under
+// `FAAS_STORAGE_BACKEND=oci`, the layer ext4 lives in the
+// registry, not on local disk — the helper `stageScanExt4`
+// materializes the bytes to a tempdir so the grype subprocess
+// has a filesystem path to scan. The legacy appsRootPath is
+// preserved as the SetDeploymentRootfs DB column, untouched.
 func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.Deployment) {
 	if h.store == nil || h.log == nil {
 		// Defensive: tests that build a Handler without wiring
@@ -620,18 +716,15 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 		return
 	}
 	start := time.Now()
-	ext4Path := h.appsRootPath(app.Slug, dep.ID)
-	if ext4Path == "" {
-		// Defensive: appsRootPath guards against path-traversal
-		// slugs (apparent / IDOR escape attempt, or a corrupt
-		// DB row). The scan is best-effort (AC #4: don't block
-		// the deploy). Stamp scan_status='failed' with the
-		// reason so the dashboard renders the failure distinctly
-		// from a grype runner error.
-		reason := "slug/path-traversal guard rejected"
-		h.log.Warn("imaged: per-deploy scan skipped",
-			"deployment", dep.ID, "app", app.Slug, "reason", reason)
-		failedResult := &ScanResult{Error: reason}
+	be, err := h.storageFor()
+	if err != nil {
+		// storageFor only errors when h.appsRoot is empty /
+		// contains NUL bytes and no WithStorage was wired. The
+		// defensive branch is unreachable in production (the
+		// daemon wires WithStorage at cmd/imaged/main.go:239).
+		h.log.Warn("imaged: per-deploy scan skipped, storageFor",
+			"deployment", dep.ID, "app", app.Slug, "err", err)
+		failedResult := &ScanResult{Error: "storageFor: " + err.Error()}
 		b, mErr := json.Marshal(failedResult)
 		if mErr != nil {
 			return
@@ -644,7 +737,30 @@ func (h *Handler) runDeployScan(ctx context.Context, app state.App, dep state.De
 		h.ops.ObserveDeployScanTotal(app.Slug, "skipped")
 		return
 	}
-	result, err := h.runGrype(ctx, ext4Path)
+	scanDir, cleanup, err := h.stageScanExt4(ctx, be, app, dep)
+	if err != nil {
+		// Defensive: path-traversal guard, Get error, or
+		// MkdirTemp failure. Stamp scan_status='failed' with
+		// the reason so the dashboard renders the failure
+		// distinctly from a grype runner error (AC #4 of
+		// ADR-075: don't block the deploy).
+		h.log.Warn("imaged: per-deploy scan skipped, stage",
+			"deployment", dep.ID, "app", app.Slug, "err", err)
+		failedResult := &ScanResult{Error: err.Error()}
+		b, mErr := json.Marshal(failedResult)
+		if mErr != nil {
+			return
+		}
+		if writeErr := h.store.UpsertDeploymentScanResult(ctx, dep.ID, b, "failed"); writeErr != nil {
+			h.log.Warn("imaged: stamp scan_status=failed",
+				"deployment", dep.ID, "err", writeErr)
+		}
+		h.ops.ObserveDeployScanDuration(app.Slug, "skipped", time.Since(start))
+		h.ops.ObserveDeployScanTotal(app.Slug, "skipped")
+		return
+	}
+	defer cleanup()
+	result, err := h.runGrype(ctx, scanDir)
 	if err != nil {
 		// Fail the scan, not the deploy. Log the grype error
 		// so the operator sees the underlying cause.

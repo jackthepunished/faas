@@ -3,7 +3,7 @@
 // githubd owns: push-webhook receiver, Checks-API status writer, OAuth
 // callback handler, per-repo install-token cache. It is the SOLE outbound
 // caller to api.github.com (Checks + install-token exchange); its inbound
-// public surface is gatewayd at /webhooks/github (HMAC-verified at the
+// public surface is gatewayd-public at /webhooks/github (HMAC-verified at the
 // edge). It talks to apid over gRPC on /run/faas/githubd.sock
 // (ADR-015 unix-socket DAC; apid is the only caller in v1.0).
 //

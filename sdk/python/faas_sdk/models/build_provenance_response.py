@@ -22,6 +22,13 @@ class BuildProvenanceResponse:
     `runner_digest`, and `sbom_storage_key` are populated by
     Phase 3 (cosign signer + syft SBOM), but the columns exist
     today so Phase 3 is a zero-cost schema change.
+    `framework_version` is the language version the customer's
+    source declares (`.nvmrc`, `package.json::engines.node`,
+    `pyproject.toml::requires-python`, `.python-version`,
+    `.tool-versions`, `go.mod` directive); added in issue #740 /
+    DEPLOY-PROV-5 / ADR-087. OBSERVATIONAL ONLY — the build
+    pipeline never reads it (the runtime is bound by the OCI
+    base ref via `FAAS_DEPLOY_BASE_REF_<RUNTIME>`).
 
     """
 
@@ -43,6 +50,10 @@ class BuildProvenanceResponse:
     runner_digest: str | Unset = UNSET
     sbom_storage_key: None | str | Unset = UNSET
     """Phase 3 populator fills this from `syft` output. Empty string when not yet populated."""
+    framework_version: None | str | Unset = UNSET
+    """Source-declared language version (nodes 22.11.0 / python 3.13 / go 1.24, etc.). Empty string when no version
+    file is present or any parser fails — best-effort, never an error. Added in DEPLOY-PROV-5 / issue #740 /
+    ADR-087."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,6 +89,12 @@ class BuildProvenanceResponse:
         else:
             sbom_storage_key = self.sbom_storage_key
 
+        framework_version: None | str | Unset
+        if isinstance(self.framework_version, Unset):
+            framework_version = UNSET
+        else:
+            framework_version = self.framework_version
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -105,6 +122,8 @@ class BuildProvenanceResponse:
             field_dict["runner_digest"] = runner_digest
         if sbom_storage_key is not UNSET:
             field_dict["sbom_storage_key"] = sbom_storage_key
+        if framework_version is not UNSET:
+            field_dict["framework_version"] = framework_version
 
         return field_dict
 
@@ -146,6 +165,15 @@ class BuildProvenanceResponse:
 
         sbom_storage_key = _parse_sbom_storage_key(d.pop("sbom_storage_key", UNSET))
 
+        def _parse_framework_version(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        framework_version = _parse_framework_version(d.pop("framework_version", UNSET))
+
         build_provenance_response = cls(
             id=id,
             build_id=build_id,
@@ -161,6 +189,7 @@ class BuildProvenanceResponse:
             commit_sha=commit_sha,
             runner_digest=runner_digest,
             sbom_storage_key=sbom_storage_key,
+            framework_version=framework_version,
         )
 
         build_provenance_response.additional_properties = d

@@ -1,4 +1,4 @@
-// Package gateway holds gatewayd's edge logic: per-app rate limiting, the host→
+// Package gateway holds gatewayd-internal's edge logic: per-app rate limiting, the host→
 // app routing cache, and the wake gate that holds requests during a cold wake
 // (spec §4.1). The HTTP/TLS server wires these together; each piece here is a
 // self-contained, testable unit.
@@ -45,7 +45,7 @@ func NewLimiter() *Limiter {
 }
 
 // NewLimiterWithClock returns a limiter whose internal clock is the supplied
-// func. Test seam for the cmd/gatewayd/backend_test.go 1001-request
+// func. Test seam for the cmd/gatewayd-internal/backend_test.go 1001-request
 // acceptance (issue #292 / ADR-040) — frozen-clock tests cannot depend on
 // the package-private now field. Production code uses NewLimiter.
 func NewLimiterWithClock(now func() time.Time) *Limiter {
@@ -150,8 +150,8 @@ func (l *Limiter) Forget(appID string) {
 // Allow on tick N+1 would have made.
 //
 // Cross-process limitation (documented in the header contract): in a
-// multi-gatewayd fleet each gateway process keeps its own bucket; the
-// values reflect THIS gatewayd's view. ADR-040 already flagged this;
+// multi-gatewayd-internal fleet each gateway process keeps its own bucket; the
+// values reflect THIS gatewayd-internal's view. ADR-040 already flagged this;
 // this surface makes the limitation visible, not gone.
 func (l *Limiter) Peek(appID string, plan api.Plan) (limit, remaining, resetSeconds int, ok bool) {
 	if l == nil || l.noop {

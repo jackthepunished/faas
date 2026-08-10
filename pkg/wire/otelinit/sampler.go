@@ -215,7 +215,7 @@ func (s *DeploymentAware) ShouldSample(p sdktrace.SamplingParameters) sdktrace.S
 	if depID == "" {
 		// No deployment_id attribute → fall back to the wrapped
 		// root sampler. This matches the contract for non-schedd
-		// spans (gatewayd.handler, vmmd.create_*, etc.) that do
+		// spans (gatewayd-internal.handler, vmmd.create_*, etc.) that do
 		// not stamp deployment_id today; their sampling decision
 		// remains the head-ratio decision.
 		return s.root.ShouldSample(p)

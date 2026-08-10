@@ -75,7 +75,7 @@ func TestRecentLoad_GatewayRestartDoesNotSpike(t *testing.T) {
 	r.Touch(context.Background(), base) // seeds lastSeen=1000, count=0
 	cum = 1010
 	r.Touch(context.Background(), base.Add(time.Second)) // delta=10
-	// Simulated restart: gatewayd's counter resets to 0.
+	// Simulated restart: gatewayd-internal's counter resets to 0.
 	cum = 5
 	r.Touch(context.Background(), base.Add(2*time.Second)) // cumulative < lastSeen → ring cleared
 	cum = 10
@@ -178,7 +178,7 @@ func (errFake) Error() string { return "synthetic scrape failure" }
 
 // TestRecentLoad_RestartClearsRing (issue #171 review finding):
 // the production code path treats `cumulative < lastSeen` as
-// gatewayd restart and clears the per-app ring so the new
+// gatewayd-internal restart and clears the per-app ring so the new
 // window's first delta is measured from the new boot's
 // perspective. Without this, a single cumulative drop would
 // inflate the delta to MAX_INT and cause extreme scale-up +
@@ -206,7 +206,7 @@ func TestRecentLoad_RestartClearsRing(t *testing.T) {
 		t.Errorf("after second Touch: RecentRPS = %v, want 50", rps)
 	}
 
-	// Tick 3: gatewayd restart — cumulative drops to 5. Mirror
+	// Tick 3: gatewayd-internal restart — cumulative drops to 5. Mirror
 	// must clear the ring and treat the new observation as the
 	// boot point.
 	cum = 5

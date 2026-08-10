@@ -33,10 +33,13 @@ import (
 )
 
 const (
-	billingSubPortal = "portal"
-	billingSubHelp   = "help"
-	flagHelpLong     = "--help"
-	flagHelpShort    = "-h"
+	billingSubPortal        = "portal"
+	billingSubRetry         = "retry"
+	billingSubCancel        = "cancel"
+	billingSubPaymentMethod = "payment-method"
+	billingSubHelp          = "help"
+	flagHelpLong            = "--help"
+	flagHelpShort           = "-h"
 )
 
 // cmdBilling dispatches `faas billing <subcommand>` to the right
@@ -53,6 +56,12 @@ func cmdBilling(args []string) int {
 	switch args[0] {
 	case billingSubPortal:
 		return cmdBillingPortal(args[1:])
+	case billingSubRetry:
+		return cmdBillingRetry(args[1:])
+	case billingSubCancel:
+		return cmdBillingCancel(args[1:])
+	case billingSubPaymentMethod:
+		return cmdBillingPaymentMethod(args[1:])
 	case billingSubStatus:
 		return cmdBillingStatus(args[1:])
 	case billingSubPriceCatalog:
@@ -77,6 +86,11 @@ func printBillingUsage(w io.Writer) {
 	_, _ = fmt.Fprintf(w, "usage: faas billing <subcommand>\n\n"+
 		"  portal              open the Stripe billing portal in your browser\n"+
 		"                      (--print  print URL to stdout only; --no-open  skip browser)\n"+
+		"  payment-method      show the card-on-file summary; open the portal to update\n"+
+		"  retry               retry the latest unpaid charge (issue #242; closes the\n"+
+		"                      dunning-email lie at pkg/mail/account.go:107,150)\n"+
+		"  cancel              set cancel_at_period_end on the active subscription;\n"+
+		"                      y/N confirm (--yes for non-interactive shells)\n"+
 		"  status              read the active billing Provider's cached catalog (Paddle-only)\n"+
 		"                      (--watch N  re-poll every 5 s for N seconds; --json  emit JSON)\n"+
 		"  price-catalog       list | sync | reset the Paddle price + product catalog\n"+

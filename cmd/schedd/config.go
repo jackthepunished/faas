@@ -44,7 +44,7 @@ type Config struct {
 	VMMTLSKeyPath  string `toml:"vmmd_tls_key_path"`
 	VMMTLSCAPath   string `toml:"vmmd_tls_ca_path"`
 
-	// Server-mTLS material for the gatewayd-facing gRPC surface (issue
+	// Server-mTLS material for the gatewayd-internal-facing gRPC surface (issue
 	// #95). All three paths empty => no TLS; all three set =>
 	// RequireAndVerifyClientCert. Partial cluster => startup error.
 	TLSCertPath string `toml:"tls_cert_path"`
@@ -52,7 +52,7 @@ type Config struct {
 	TLSCAPath   string `toml:"tls_ca_path"`
 
 	// GatewaySynthSocket is the legacy unix-domain socket schedd dials
-	// to fire synthetic cron requests through gatewayd (spec §4.4, M7).
+	// to fire synthetic cron requests through gatewayd-internal (spec §4.4, M7).
 	// Mode 0660 group `faas` (ADR-015). Defaults to
 	// /run/faas/gatewayd-internal.sock. Deprecated: multi-box schedd
 	// uses GatewaySynthTarget (a wire.ParseTarget-style URL). Setting
@@ -61,10 +61,10 @@ type Config struct {
 	GatewaySynthSocket string `toml:"gateway_synth_socket"`
 
 	// GatewaySynthTarget is the wire.ParseTarget-style URL schedd
-	// uses to dial gatewayd's internal listener (placement scheduler
+	// uses to dial gatewayd-internal's listener (placement scheduler
 	// PR, ADR-025 axis 3, Q8). Accepts unix://|tcp://|dns://.
 	// Multi-box operators set this to
-	// tcp://<gatewayd-overlay-ip>:9090 (or https://... when the
+	// tcp://<gatewayd-internal-overlay-ip>:9090 (or https://... when the
 	// tailnet ACL isn't enough on its own). Empty GatewaySynthTarget
 	// falls back to the legacy GatewaySynthSocket for backwards
 	// compatibility — existing tests + the e2e harness rely on the
@@ -116,14 +116,14 @@ type Config struct {
 	// least 2 × Interval.
 	HeartbeatStaleness time.Duration `toml:"heartbeat_staleness"`
 
-	// GatewayMetricsURL is the absolute URL of gatewayd's /metrics
+	// GatewayMetricsURL is the absolute URL of gatewayd-internal's /metrics
 	// endpoint (issue #169 / #172). The schedd scale-up trigger
 	// scrapes this URL every cfg.ScaleUpInterval for
 	// `gateway_requests_total{app=...}` so it can compute per-app
 	// RPS. Empty disables the trigger (Loop.WithScaleUp is not
 	// called → the ticker arm never fires). Defaults to
-	// http://127.0.0.1:9090/metrics, matching gatewayd's
-	// ControlAddr default (cmd/gatewayd/config.go).
+	// http://127.0.0.1:9090/metrics, matching gatewayd-internal's
+	// ControlAddr default (cmd/gatewayd-internal/config.go).
 	GatewayMetricsURL string `toml:"gateway_metrics_url"`
 
 	// ScaleUpInterval is the per-app reactive scale-up trigger
@@ -330,7 +330,7 @@ func LoadConfig(path string) (*Config, error) {
 		// FAAS_GATEWAY_SYNTH_TARGET env to take precedence.
 		GatewaySynthTarget: "",
 		OwnerUser:          "faas-schedd",
-		// Issue #169 / #172: default to gatewayd's loopback
+		// Issue #169 / #172: default to gatewayd-internal's loopback
 		// control listener. Empty disables the trigger (the
 		// loop with WithScaleUp(nil) skips the ticker arm).
 		GatewayMetricsURL: "http://127.0.0.1:9090/metrics",

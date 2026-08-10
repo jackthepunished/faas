@@ -1514,7 +1514,7 @@ func (l *Loop) emitFloorReleasedAudit(ctx context.Context, appID string, floor, 
 
 // GatewaySynth is the slice of the gateway-internal RPC the cron
 // loop (and Move 1's drain) use to fire a synthetic request through
-// gatewayd (so metering + rate-limit apply identically to user
+// gatewayd-internal (so metering + rate-limit apply identically to user
 // traffic). Defined as an interface here so the cron loop can be
 // tested without a live gateway socket.
 //
@@ -1529,7 +1529,7 @@ type GatewaySynth interface {
 }
 
 // httpGatewaySynth is the production GatewaySynth: an HTTP client
-// pointed at gatewayd's internal listener. The transport is chosen
+// pointed at gatewayd-internal's internal listener. The transport is chosen
 // by the dial target:
 //
 //   - unix:// — net.Dial("unix", ...) over a unix socket; the host
@@ -1548,7 +1548,7 @@ type httpGatewaySynth struct {
 }
 
 // DialGatewaySynth opens an HTTP unix-socket client targeting
-// gatewayd's internal listener. The client is stateless — the unix
+// gatewayd-internal's internal listener. The client is stateless — the unix
 // socket is opened per request by the transport — so dial failures
 // surface on the first SynthesizeRequest call.
 //
@@ -1578,10 +1578,10 @@ func DialGatewaySynth(socketPath string, log *slog.Logger) (GatewaySynth, error)
 	}, nil
 }
 
-// DialGatewaySynthTarget opens an HTTP client targeting gatewayd's
+// DialGatewaySynthTarget opens an HTTP client targeting gatewayd-internal's
 // internal listener over a wire.ParseTarget-style URL
 // (unix://|tcp://|dns://). Placement scheduler PR / ADR-025 axis 3
-// (Q8): in a multi-box deploy, schedd and gatewayd are not on the
+// (Q8): in a multi-box deploy, schedd and gatewayd-internal are not on the
 // same host, so the unix-socket dial is no longer reachable. The
 // TCP path uses TLS when the env wires a TLS config
 // (FAAS_GATEWAY_SYNTH_TLS_CA / CERT / KEY; spec §7); the dns path
@@ -1635,7 +1635,7 @@ func DialGatewaySynthTarget(rawTarget string, tlsCfg *tls.Config, log *slog.Logg
 	}
 }
 
-// SynthesizeRequest posts {app_id, method, path} to gatewayd's internal
+// SynthesizeRequest posts {app_id, method, path} to gatewayd-internal's internal
 // /v1/synthesize endpoint over the unix socket. The HTTP transport
 // (DialContext) handles the dial; this method just shapes the request.
 func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method, path string) error {
@@ -1651,7 +1651,7 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// issue #517: stamp the per-cron-fire request_id on the
-	// synthetic inbound request so gatewayd's middleware picks it
+	// synthetic inbound request so gatewayd-internal's middleware picks it
 	// up unchanged and the downstream wake timeline logs share
 	// the same correlation id. Falls back to a fresh mint when
 	// dispatchOneCron didn't set one (defence in depth — direct
@@ -1673,7 +1673,7 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 	return nil
 }
 
-// Invoke posts the Move 1 invocation envelope to gatewayd's
+// Invoke posts the Move 1 invocation envelope to gatewayd-internal's
 // /v1/invocations:dispatch route. The response carries the post-dispatch
 // state (dispatched/completed) so the drain can call Store.CompleteInvocation
 // with the result blob. Network errors bubble up so the drain can retry.
@@ -1719,7 +1719,7 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 //     not in the past, skip.
 //  3. Wake the app via the engine (idempotent — already-running apps
 //     return their current instance).
-//  4. SynthesizeRequest through gatewayd so metering + rate limits apply.
+//  4. SynthesizeRequest through gatewayd-internal so metering + rate limits apply.
 //  5. MarkCronFired + emit NotifyCronFired for the dashboard.
 //
 // Step 3+4 are the load-bearing spec bits (M7); they route the
@@ -1769,7 +1769,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		return
 	}
 	// issue #517: mint a fresh request_id at the cron dispatch
-	// boundary so the synthetic request that flows through gatewayd
+	// boundary so the synthetic request that flows throughgatewayd-internal
 	// carries the same correlation id the rest of the wake
 	// timeline logs use. Stored on ctx so SynthesizeRequest can
 	// stamp it on the outbound x-faas-request-id header, and on
@@ -1902,11 +1902,30 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		// Invoke delivers the synthetic HTTP envelope through the
 		// wake gate; the meter + the runner both see this as a
 		// request with method+path+headers. The synth adapter
-		// (cmd/gatewayd) does its own always-Wake internally and
+		// (cmd/gatewayd-internal) does its own always-Wake internally and
 		// returns the live instance id on the echoed Invocation.
 		invokeOut, ierr := l.gateway.Invoke(ctx, c.AppID, inv)
 		if ierr != nil {
 			l.log.Warn("cron: invoke", "cron_id", c.ID, "err", ierr)
+			// issue #791 — terminate the row. Before this, a failed
+			// cron invoke left the claimed row parked in
+			// state='dispatching' forever: the drain's tick filters
+			// on state='pending' so it never reclaimed it, and
+			// nothing else wrote a terminal state. The run-history
+			// surface would render every failed fire as perpetually
+			// "running", and the queue-depth counters (which count
+			// dispatching) drifted up by one per failure.
+			//
+			// retryAfter=0 because the cron loop owns its own
+			// schedule: the next boundary re-fires this cron anyway,
+			// so re-queueing the row would double-dispatch. The
+			// outcome classifier turns a blown deadline into
+			// 'timeout' and everything else into 'failed'.
+			if enq.ID != "" {
+				if err := l.engine.Store().FailInvocation(ctx, enq.ID, "invoke: "+ierr.Error(), 0, 0, failOutcome(ierr)); err != nil {
+					l.log.Warn("cron: fail invocation", "cron_id", c.ID, "err", err)
+				}
+			}
 			// Fall through to legacy wake-only shape so this
 			// doesn't silently drop. tests may rely on the
 			// SynthesizeRequest call for back-compat assertions.
@@ -1931,7 +1950,7 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 			// the deferred emit can record status="ok" with the
 			// wake that served the fire. invocation_id is the
 			// drain row id; instance_id is the live VM that
-			// gatewayd picked. Mirrors the invocations_history
+			// gatewayd-internal picked. Mirrors the invocations_history
 			// join so an operator can pivot from the audit row to
 			// the wake record with one query.
 			fireSucceeded = true

@@ -119,7 +119,7 @@ type Builderd struct {
 	// ADR-064). When non-nil, the markSucceeded / markFailed
 	// helpers emit wake.build_succeeded / wake.build_failed on
 	// the events table. nil opts out (the unit-test default +
-	// pre-PR-C fixtures). Mirrors schedd/vmmd/gatewayd wiring.
+	// pre-PR-C fixtures). Mirrors schedd/vmmd/gatewayd-internal wiring.
 	events *events.Platform
 	// builderNodeID is the compute_node name builderd writes onto every
 	// provenance row (ADR-038). Defaulted to "default-local" on the

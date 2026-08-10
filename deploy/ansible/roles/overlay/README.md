@@ -1,6 +1,6 @@
 # faas_overlay — issue #98 / ADR-028
 
-Installs and configures the cross-box overlay so gatewayd can reach
+Installs and configures the cross-box overlay so gatewayd-internal can reach
 remote vmmd boxes. Two providers:
 
 - `tailscale` (default) — authkey-based, one operator action.
@@ -56,4 +56,4 @@ After `ansible-playbook`:
   one-shot completes.
 - `tailscale status` (Tailscale) or `wg show` (Wireguard) lists the
   interface with an IP.
-- `nc -vz <peer-overlay-ip> 50051` from gatewayd's box succeeds.
+- `nc -vz <peer-overlay-ip> 50051` from gatewayd-internal's box succeeds.

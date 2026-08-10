@@ -1,6 +1,13 @@
 # ADR-055 · Per-host egress policy templating
 
 - **Status:** proposed
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-31
 - **Issue:** #95 slice 5 (multi-box rollout, Tier 1 Phase 4)
 - **Decision:** Replace the static `policy_nftables.conf` artifact

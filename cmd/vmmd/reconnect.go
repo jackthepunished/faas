@@ -5,8 +5,8 @@
 // loop dials schedd, opens a stream, and on transient failure
 // re-dials with an exponential backoff ladder: 1s → 2s → 4s →
 // 8s → 16s → 30s (capped; pure doubling until cap). The same
-// shape exists in cmd/gatewayd's warmhints publisher
-// (gatewayd/warmhints.go:103-138) and the schedd-side pg_notify
+// shape exists in cmd/gatewayd-internal/warmhints.go
+// (cmd/gatewayd-internal/warmhints.go:103-138) and the schedd-side pg_notify
 // subscribe loop (cmd/schedd/main.go:558-613). This file pins
 // the vmmd-side helpers so the capacity publisher and any
 // future vmmd-stream (egress-allowlist push, health-heartbeat
@@ -39,7 +39,7 @@ import (
 
 // MaxBackoff is the upper bound of the ladder. Reaches capacity
 // after 4 failures (1s → 2s → 5s → 10s → 30s). The 30s cap
-// mirrors WarmHintPublisher's maxBackoff (gatewayd/warmhints.go:78)
+// mirrors WarmHintPublisher's maxBackoff (cmd/gatewayd-internal/warmhints.go:78)
 // and the schedd-side pg_notify loop (cmd/schedd/main.go:584).
 const MaxBackoff = 30 * time.Second
 
@@ -138,8 +138,8 @@ func jitterMs() time.Duration {
 	return time.Duration(n) * time.Millisecond
 }
 
-// nextBackoff doubles d up to max. Mirrors the gatewayd warmhints
-// publisher (cmd/gatewayd/warmhints.go:181-187) and the schedd-
+// nextBackoff doubles d up to max. Mirrors the gatewayd-internal warmhints
+// publisher (cmd/gatewayd-internal/warmhints.go:181-187) and the schedd-
 // side pg_notify loop (cmd/schedd/main.go:558-613) so the three
 // daemons use a consistent cadence. Pure math — clock-independent
 // and safe to call in tight test loops.
@@ -173,7 +173,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // backoffLadder returns the canonical ladder: 1s, 2s, 4s, 8s,
-// 16s, 30s. Same shape as cmd/gatewayd/warmhints.go:103-138
+// 16s, 30s. Same shape as cmd/gatewayd-internal/warmhints.go:103-138
 // (which uses pure doubling until cap). Exposed for tests that
 // pin the shape; the publisher's reconnect loop computes steps
 // inline via nextBackoff rather than reading this slice.

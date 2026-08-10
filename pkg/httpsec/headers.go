@@ -1,6 +1,6 @@
 // headers.go — the five static hardening headers, set on every
 // response (JSON, HTML, SSE, problem docs alike). Mounted at the
-// outermost wrapper of both gatewayd's publicHandler and apid's
+// outermost wrapper of both gatewayd-internal's publicHandler and apid's
 // server.handler() return.
 //
 // Headers and values are pinned by issue #249; do not relax them
@@ -32,7 +32,7 @@ const (
 )
 
 // HSTSEnabled gates Strict-Transport-Security. Default true; flipped
-// to false by cmd/{apid,gatewayd}/main.go when FAAS_HSTS_ENABLED=false
+// to false by cmd/{apid,gatewayd-internal}/main.go when FAAS_HSTS_ENABLED=false
 // is set (dev mode). RFC 6797 §7.2 says UAs ignore HSTS on plain HTTP,
 // so the env knob is purely cosmetic — production TLS listeners always
 // emit it.

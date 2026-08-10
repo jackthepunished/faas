@@ -6,13 +6,13 @@
 //
 //   1. The migration set applies cleanly through 00026.
 //   2. INSERT into compute_nodes fires compute_node_changed with the
-//      new row's id and active=true. gatewayd's per-node client cache
+//      new row's id and active=true. gatewayd-internal's per-node client cache
 //      eviction hook keys on this payload — a regression that drops
 //      the trigger would leave stale conns cached past a node's IP
 //      rotation.
 //   3. UPDATE on compute_nodes (SetComputeNodeActive path) fires the
 //      same channel with the post-update active flag, so the watchdog
-//      and heartbeat goroutine paths both surface in gatewayd's cache.
+//      and heartbeat goroutine paths both surface in gatewayd-internal's cache.
 //
 // The test subscribes via db.Subscribe before issuing the writes so
 // the LISTEN connection is parked on the channel; pg_notify fires
@@ -82,7 +82,7 @@ func TestMigrations_00026_ComputeNodeNotify(t *testing.T) {
 
 	// (2) UPDATE — SetComputeNodeActive's drained-row path. The
 	// payload's active field must mirror the post-update value, not
-	// the pre-update value; gatewayd evicts on either transition but
+	// the pre-update value; gatewayd-internal evicts on either transition but
 	// re-arming on active=true depends on the truth coming through.
 	if _, err := pool.Exec(ctx,
 		`update compute_nodes set active = false where id = $1`, newID,

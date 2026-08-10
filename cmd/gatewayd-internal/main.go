@@ -29,7 +29,7 @@
 //
 // The control plane (/healthz, /readyz, /metrics) is wired inside
 // run.go's runWithDeps on the address passed via FAAS_GATEWAYD_CONFIG
-// (control_addr key) — defaults to :9090 in cmd/gatewayd/config.go.
+// (control_addr key) — defaults to :9090 in cmd/gatewayd-internal/config.go.
 //
 // Drain: SIGTERM → /readyz=503 → GatewayDrainGraceSeconds → Shutdown
 // (handled inside runWithDeps, ADR-068 internal-first order).

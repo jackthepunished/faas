@@ -233,7 +233,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			RateLimitPerAccountRPM: 1000,
 			// Issue #471 / ADR-047 (PR-A): Pro keeps the same streaming
 			// envelope as Hobby. The cap is the same; the per-app
-			// streaming path is gatewayd-edged, not per-tier.
+			// streaming path is gatewayd-internal-edged, not per-tier.
 			StreamingEnabled: true, MaxResponseBodyBytes: 104_857_600, ResponseWriteTimeoutSeconds: 900,
 			// Issue #676 / ADR-080: Pro unlocks the raw-bytes
 			// Upgrade bridge for the same reason as Hobby — production

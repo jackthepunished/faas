@@ -1,6 +1,13 @@
 # ADR-018 · schedd gRPC surface + ReportActivity ownership (M5)
 
 - **Status:** accepted
+- **Superseded (in part, PR-E):** prose referred to the monolithic
+  `cmd/gatewayd/` daemon split by ADR-070 into `gatewayd-public` (TLS-only
+  edge) and `gatewayd-internal` (routing + wake + proxy). Body is preserved
+  verbatim; readers should substitute "gatewayd-internal" for the
+  routing/wake/proxy path and "gatewayd-public" for the certmagic/TLS path.
+  `cmd/gatewayd/<file>.go` citations in this body are stale; see PR-E for
+  the new file locations.
 - **Date:** 2026-07-16
 - **Updated:** 2026-07-24 (issue #168) — added `AdmitInstance` for fan-out admission.
 - **Decision:** schedd exposes a gRPC service `onebox.faas.schedd.v1.Schedd` on

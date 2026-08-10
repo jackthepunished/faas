@@ -2,7 +2,7 @@
 // loaded yet?" signal the post-Tier-A7 /readyz handler reads.
 //
 // Background: pkg/gateway/routes.go::RouteCache is a passive LRU;
-// today's gatewayd fills it lazily — the first request for a host
+// today's gatewayd-internal fills it lazily — the first request for a host
 // triggers a Postgres lookup, subsequent requests hit the cache. In
 // one-box that was fine: the first request for a cold app paid the
 // lookup cost and the wake gate cold-started the VM in parallel.
@@ -17,7 +17,7 @@
 // The split triggers a re-shape:
 //
 //  1. At boot, gatewayd-internal calls LoadFromPG() (the existing
-//     helper at cmd/gatewayd/backend.go:loadRouteCache) which runs
+//     helper at cmd/gatewayd-internal/backend.go:loadRouteCache) which runs
 //     one `SELECT host, app_id FROM …` and Pushes every row into
 //     the cache.
 //  2. While that SELECT is running, the daemon is NOT ready — the

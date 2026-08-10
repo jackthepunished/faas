@@ -85,6 +85,10 @@ export type AppResponse = {
    * Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why is my app evicted_cold?' without grepping the audit log.
    */
   parked_deployment?: (ParkedDeploymentRef | null);
+  /**
+   * Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps before the A9 fallback; falls through to A9 when the target is inactive or full.
+   */
+  overflow_node?: string | null;
   public_auth?: PublicAuthStatus;
   auth_default_flipped_at?: string | null;
 };

@@ -2,7 +2,7 @@
 // (ADR-046). The pkg/auth interface surfaces (`middleware.Authenticator`,
 // `middleware.SessionLookup`, `middleware.Auditor`) are defined over
 // the *minimal* method set the middleware needs; the concrete
-// `*state.PgStore` lives in cmd/gatewayd and provides every method
+// `*state.PgStore` lives in cmd/gatewayd-internal and provides every method
 // via duck-typing.
 //
 // cmd/apid has the same shapes in `cmd/apid/auth_adapters.go`. They

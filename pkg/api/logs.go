@@ -16,7 +16,7 @@ import (
 // optional; the zero value passes through every line.
 //
 // Since issue #517 / PR-B the wire contract is enforced end-to-end:
-// gatewayd forwards Since to schedd, schedd forwards to vmmd, and
+// gatewayd-internal forwards Since to schedd, schedd forwards to vmmd, and
 // vmmd applies the bound against the per-instance ring buffer at
 // attach time. A cursor below the ring's lowest retained seq emits
 // an `event: gap` frame (decoded into LogGapEvent on the SDK side)

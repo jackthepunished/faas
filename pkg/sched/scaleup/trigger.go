@@ -73,10 +73,10 @@ type Engine interface {
 }
 
 // PromScraper is the per-app RPS signal source. Production impl
-// scrapes gatewayd's /metrics for `gateway_requests_total`. Returns
+// scrapes gatewayd-internal's /metrics for `gateway_requests_total`. Returns
 // the per-app request count for the most recent reading; the trigger
 // maintains the per-app deltas in its ring buffer. The
-// returned map is app_id → count (lifetime since gatewayd last booted).
+// returned map is app_id → count (lifetime since gatewayd-internal last booted).
 type PromScraper interface {
 	Scrape(ctx context.Context) (map[string]int64, error)
 }
