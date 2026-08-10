@@ -221,8 +221,8 @@ func TestObsRateLimits_HappyPath_EmptyStore(t *testing.T) {
 	if resp.LagSeconds != 30 {
 		t.Errorf("lag_seconds: got %d, want 30 (ADR-091 §3.5)", resp.LagSeconds)
 	}
-	if len(resp.Sources) != 2 || resp.Sources[0] != "durable" || resp.Sources[1] != "live" {
-		t.Errorf("sources: got %v, want [durable live]", resp.Sources)
+	if len(resp.Sources) != 2 || resp.Sources[0] != obsRateLimitSourceDurable || resp.Sources[1] != obsRateLimitSourceLive {
+		t.Errorf("sources: got %v, want [%s %s]", resp.Sources, obsRateLimitSourceDurable, obsRateLimitSourceLive)
 	}
 	if resp.Durable == nil {
 		t.Errorf("durable must be non-nil slice")
@@ -290,8 +290,8 @@ func TestObsRateLimits_SourcesStable(t *testing.T) {
 	if !ok {
 		t.Fatalf("sources field missing or wrong type: %+v", raw["sources"])
 	}
-	if len(srcs) != 2 || srcs[0] != "durable" || srcs[1] != "live" {
-		t.Fatalf("sources: got %v, want [durable live]", srcs)
+	if len(srcs) != 2 || srcs[0] != obsRateLimitSourceDurable || srcs[1] != obsRateLimitSourceLive {
+		t.Fatalf("sources: got %v, want [%s %s]", srcs, obsRateLimitSourceDurable, obsRateLimitSourceLive)
 	}
 }
 

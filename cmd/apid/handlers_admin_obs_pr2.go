@@ -63,6 +63,18 @@ const (
 // meterd's clock from the apid HTTP path.
 const obsRateLimitLiveLagSeconds = 30
 
+// obsRateLimitSourceDurable / obsRateLimitSourceLive are the
+// wire-stable source names for the rate-limit aggregate (ADR-091
+// §3.5). They are name-spaced from the deployment-status literal
+// "live" (handlers_admin_obs_projection.go) because goconst
+// matches literal text, not resource. Adding a future source
+// (gatewayd-public rate-limit snapshot) is an append — the
+// Sources slice stays stable.
+const (
+	obsRateLimitSourceDurable = "durable"
+	obsRateLimitSourceLive    = "live"
+)
+
 // obsAnomalies handles GET /v1/admin/obs/anomalies (ADR-091 §3.6).
 //
 // Query parameters:
@@ -171,7 +183,7 @@ func (s *server) obsRateLimits(w http.ResponseWriter, r *http.Request, acct stat
 	writeJSON(w, http.StatusOK, api.ObsRateLimitResponse{
 		GeneratedAt: time.Now().UTC(),
 		WindowHours: int(window / time.Hour),
-		Sources:     []string{"durable", "live"},
+		Sources:     []string{obsRateLimitSourceDurable, obsRateLimitSourceLive},
 		LagSeconds:  obsRateLimitLiveLagSeconds,
 		Durable:     durable,
 		Live:        live,
