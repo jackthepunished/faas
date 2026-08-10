@@ -3,11 +3,13 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { AuthCapabilities } from '../models/AuthCapabilities.js';
+import type { MagicLinkSignupRequest } from '../models/MagicLinkSignupRequest.js';
 import type { PasswordLoginRequest } from '../models/PasswordLoginRequest.js';
 import type { PasswordLoginResponse } from '../models/PasswordLoginResponse.js';
 import type { PasswordResetConfirm } from '../models/PasswordResetConfirm.js';
 import type { PasswordResetRequest } from '../models/PasswordResetRequest.js';
 import type { PasswordSignupRequest } from '../models/PasswordSignupRequest.js';
+import type { ProgrammaticAuthResponse } from '../models/ProgrammaticAuthResponse.js';
 import type { SessionListResponse } from '../models/SessionListResponse.js';
 import type { SessionsRevokeAllResponse } from '../models/SessionsRevokeAllResponse.js';
 import type { SetPasswordRequest } from '../models/SetPasswordRequest.js';
@@ -112,6 +114,119 @@ export class AuthService {
       body: requestBody,
       mediaType: 'application/json',
       errors: {
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Programmatic signup (JSON-only, bearer-key CLI path).
+   * Issue #311 / `gregale signup` — JSON-only endpoint that
+   * creates an account (or signs the caller in idempotently),
+   * mints a fresh programmatic API key, and returns the
+   * `ProgrammaticAuthResponse` payload. The CLI persists the
+   * plaintext via `saveToken()` without a dashboard round-trip.
+   *
+   * Anti-enumeration posture mirrors `/signup`:
+   * - email unbound: create + set password + mint key.
+   * - email bound + same password: idempotent sign-in + mint key.
+   * - email bound + different password: 401 `invalid_credentials`.
+   * No Set-Cookie header; bearer-key only.
+   *
+   * @returns ProgrammaticAuthResponse Account created (or reused) + freshly minted API key.
+   * The plaintext is returned ONCE; the caller persists it.
+   *
+   * @throws ApiError
+   */
+  public static programmaticSignup({
+    requestBody,
+  }: {
+    requestBody: PasswordSignupRequest,
+  }): CancelablePromise<ProgrammaticAuthResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/auth/signup',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: invalid_credentials — wrong email or password. Drafted for the dashboard auth surface (issue #165 PR #2, ADR-032).`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Programmatic login (JSON-only, bearer-key CLI path).
+   * Issue #311 / `gregale login` mirror — JSON-only endpoint
+   * that authenticates an email + password and returns a
+   * `ProgrammaticAuthResponse` payload. Same response shape as
+   * `/v1/auth/signup` so the CLI can reuse its unmarshaler.
+   *
+   * Anti-enumeration posture mirrors `/login`: Argon2id pad
+   * on the no-row branch, identical 401 on wrong-password vs
+   * unbound email.
+   *
+   * @returns ProgrammaticAuthResponse Authenticated + freshly minted API key.
+   * @throws ApiError
+   */
+  public static programmaticLogin({
+    requestBody,
+  }: {
+    requestBody: PasswordLoginRequest,
+  }): CancelablePromise<ProgrammaticAuthResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/auth/login',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: invalid_credentials — wrong email or password. Drafted for the dashboard auth surface (issue #165 PR #2, ADR-032).`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Magic-link signup (JSON-only, no password).
+   * Issue #311 / `gregale signup --email-only EMAIL` — emails
+   * a one-time signup link to the given address. Always
+   * returns 200 with the same body regardless of whether the
+   * email is bound, unbound, malformed, or missing in the
+   * request — the response cannot be used to enumerate
+   * accounts.
+   *
+   * On a real-account hit, the handler creates the account if
+   * unbound, mints a 32-byte token, persists its SHA-256 via
+   * `IssueLoginToken` (15-minute TTL), and emails the
+   * `/auth/verify?token=...` link through the platform mailer.
+   *
+   * @returns any Request accepted. The signup link is mailed if the address
+   * is recognised (or could be registered).
+   *
+   * @throws ApiError
+   */
+  public static programmaticSignupMagicLink({
+    requestBody,
+  }: {
+    requestBody: MagicLinkSignupRequest,
+  }): CancelablePromise<{
+    status: 'ok';
+  }> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/auth/signup/magic-link',
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
