@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -112,6 +113,13 @@ type Config struct {
 	// builderd runs on a non-default node (multi-node deployments
 	// post-PR-B).
 	BuilderNodeID string `toml:"builder_node_id"`
+
+	// Role is the box shape this builderd inhabits (Gate-B; env
+	// override FAAS_BUILDERD_ROLE wins when set). builderd is a
+	// compute-only daemon — it refuses to start under
+	// RoleControlPlane. RoleSingleBox is the default and lets
+	// single-box dev boot unmoved.
+	Role role.Role `toml:"role"`
 }
 
 // ResolveVMMTarget returns the dial target for vmmd. VMMTarget wins
@@ -163,6 +171,11 @@ func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Gate-B: even on the missing-file path, resolve Role
+			// against FAAS_BUILDERD_ROLE so env wins over the
+			// empty TOML default. role.FromConfig falls back to
+			// RoleSingleBox when the env is unset.
+			c.Role = role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")
 			return c, nil
 		}
 		return nil, fmt.Errorf("builderd: read %q: %w", path, err)
@@ -170,5 +183,12 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("builderd: parse %q: %w", path, err)
 	}
+	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
+	// c.Role is consulted against FAAS_BUILDERD_ROLE. Setting Role
+	// in the defaults-struct literal lets toml.Unmarshal overwrite
+	// it, which would silently make the env override dead. The
+	// role gate at boot calls role.Require to refuse to start
+	// under the wrong box shape.
+	c.Role = role.FromConfig(string(c.Role), "FAAS_BUILDERD_ROLE")
 	return c, nil
 }

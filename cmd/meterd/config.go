@@ -12,6 +12,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssocket"
 	"github.com/onebox-faas/faas/pkg/meter"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -69,6 +70,13 @@ type Config struct {
 	GatewayEgressTLSCertPath string `toml:"gateway_egress_tls_cert_path"`
 	GatewayEgressTLSKeyPath  string `toml:"gateway_egress_tls_key_path"`
 	GatewayEgressTLSCAPath   string `toml:"gateway_egress_tls_ca_path"`
+
+	// Role is the box shape this meterd inhabits (Gate-B; env
+	// override FAAS_METERD_ROLE wins when set). meterd is a
+	// control-plane daemon — it refuses to start under
+	// RoleComputeOnly. RoleSingleBox is the default and lets
+	// single-box dev boot unmoved.
+	Role role.Role `toml:"role"`
 }
 
 // LoadScheddTLS returns the client mTLS config meterd uses to dial
@@ -98,6 +106,7 @@ func (c *Config) LoadGatewayEgressTLS() (*tls.Config, error) {
 // file is not an error — the defaults produce a working daemon.
 func LoadConfig(path string) (*Config, error) {
 	c := &Config{
+		Role:                role.RoleSingleBox,
 		SocketPath:          "/run/faas/schedd.sock",
 		EgressSocket:        egresssocket.DefaultSocketPath,
 		GatewayEgressSocket: egresssocket.LegacySocketPath,
@@ -106,6 +115,11 @@ func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Gate-B: even on the missing-file path, resolve Role
+			// against FAAS_METERD_ROLE so env wins over the
+			// empty TOML default. role.FromConfig falls back to
+			// RoleSingleBox when the env is unset.
+			c.Role = role.FromConfig(string(c.Role), "FAAS_METERD_ROLE")
 			return c, nil
 		}
 		return nil, fmt.Errorf("meterd: read %q: %w", path, err)
@@ -117,5 +131,12 @@ func LoadConfig(path string) (*Config, error) {
 		c.Meter = &meter.Config{}
 	}
 	c.Meter.Defaults()
+	// Gate-B: resolve Role AFTER toml.Decode so the post-decode
+	// c.Role is consulted against FAAS_METERD_ROLE. Setting Role
+	// in the defaults-struct literal lets toml.Decode overwrite
+	// it, which would silently make the env override dead. The
+	// role gate at boot calls role.Require to refuse to start
+	// under the wrong box shape.
+	c.Role = role.FromConfig(string(c.Role), "FAAS_METERD_ROLE")
 	return c, nil
 }

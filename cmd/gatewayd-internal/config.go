@@ -21,6 +21,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/onebox-faas/faas/pkg/gateway"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -113,6 +114,13 @@ type Config struct {
 	// BurntSushi/toml — e.g. "300s", "15m", "1h30m". Plain integer
 	// nanoseconds are NOT accepted (a bare `900` parses as 900 ns).
 	ResponseWriteTimeout time.Duration `toml:"response_write_timeout"`
+
+	// Role is the box shape this gatewayd-internal inhabits
+	// (Gate-B; env override FAAS_GATEWAYD_ROLE wins when set).
+	// gatewayd-internal is a compute-only daemon — it refuses to
+	// start under RoleControlPlane. RoleSingleBox is the default
+	// and lets single-box dev boot unmoved.
+	Role role.Role `toml:"role"`
 }
 
 // TOMLTLSConfig is the on-disk TLS subset. Function pointers and derived
@@ -149,11 +157,20 @@ func LoadConfig(path string) (*Config, error) {
 		TLS:             TOMLTLSConfig{Disabled: true}, // e2e harness default
 	}
 	if path == "" {
+		// Gate-B: resolve Role from FAAS_GATEWAYD_ROLE even on the
+		// env-only path so the role gate has the post-decode value.
+		// role.FromConfig falls back to RoleSingleBox when the env
+		// is unset, preserving single-box dev back-compat.
+		c.Role = role.FromConfig(string(c.Role), "FAAS_GATEWAYD_ROLE")
 		return c, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			// Gate-B: same as the path=="" branch — resolve Role
+			// from FAAS_GATEWAYD_ROLE so env wins over the empty
+			// TOML default.
+			c.Role = role.FromConfig(string(c.Role), "FAAS_GATEWAYD_ROLE")
 			return c, nil
 		}
 		return nil, fmt.Errorf("gatewayd: read %q: %w", path, err)
@@ -161,6 +178,13 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("gatewayd: parse %q: %w", path, err)
 	}
+	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
+	// c.Role is consulted against FAAS_GATEWAYD_ROLE. Setting Role
+	// in the defaults-struct literal lets toml.Unmarshal overwrite
+	// it, which would silently make the env override dead. The
+	// role gate at boot calls role.Require to refuse to start
+	// under the wrong box shape.
+	c.Role = role.FromConfig(string(c.Role), "FAAS_GATEWAYD_ROLE")
 	return c, nil
 }
 

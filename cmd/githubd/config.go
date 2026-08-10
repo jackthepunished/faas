@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -39,6 +40,13 @@ type Config struct {
 	TLSCertPath string `toml:"tls_cert_path"`
 	TLSKeyPath  string `toml:"tls_key_path"`
 	TLSCAPath   string `toml:"tls_ca_path"`
+
+	// Role is the box shape this githubd inhabits (Gate-B; env
+	// override FAAS_GITHUBD_ROLE wins when set). githubd is a
+	// control-plane daemon — it refuses to start under
+	// RoleComputeOnly. RoleSingleBox is the default and lets
+	// single-box dev boot unmoved.
+	Role role.Role `toml:"role"`
 }
 
 // ResolveListenTarget returns the gRPC target the server should bind.
@@ -70,6 +78,11 @@ func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Gate-B: even on the missing-file path, resolve Role
+			// against FAAS_GITHUBD_ROLE so env wins over the
+			// empty TOML default. role.FromConfig falls back to
+			// RoleSingleBox when the env is unset.
+			c.Role = role.FromConfig(string(c.Role), "FAAS_GITHUBD_ROLE")
 			return c, nil
 		}
 		return nil, fmt.Errorf("githubd: read %q: %w", path, err)
@@ -77,5 +90,12 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("githubd: parse %q: %w", path, err)
 	}
+	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
+	// c.Role is consulted against FAAS_GITHUBD_ROLE. Setting Role
+	// in the defaults-struct literal lets toml.Unmarshal overwrite
+	// it, which would silently make the env override dead. The
+	// role gate at boot calls role.Require to refuse to start
+	// under the wrong box shape.
+	c.Role = role.FromConfig(string(c.Role), "FAAS_GITHUBD_ROLE")
 	return c, nil
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/vmmdmount"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -152,6 +153,16 @@ type Config struct {
 	// over the toml value for the containerised-deploys path
 	// (no toml in those images).
 	NodeKeyPath string `toml:"node_key_path"`
+
+	// Role is the box shape this vmmd inhabits (Gate-B; env
+	// override FAAS_VMMD_ROLE wins when set). vmmd is a
+	// compute-only daemon — it refuses to start under
+	// RoleControlPlane. RoleSingleBox is the default and lets
+	// single-box dev boot unmoved. The host_vars setting
+	// `faas_box_role: compute-only` propagates through ansible
+	// to FAAS_VMMD_ROLE on the vmmd unit; a missing env keeps
+	// the field at RoleSingleBox.
+	Role role.Role `toml:"role"`
 }
 
 // ComputeNodeConfig is the [compute_node] TOML section. Field naming
@@ -285,6 +296,11 @@ func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Gate-B: even on the missing-file path, resolve Role
+			// against FAAS_VMMD_ROLE so env wins over the empty
+			// TOML default. role.FromConfig falls back to
+			// RoleSingleBox when the env is unset.
+			c.Role = role.FromConfig(string(c.Role), "FAAS_VMMD_ROLE")
 			return c, nil
 		}
 		return nil, fmt.Errorf("vmmd: read %q: %w", path, err)
@@ -292,5 +308,12 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("vmmd: parse %q: %w", path, err)
 	}
+	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
+	// c.Role is consulted against FAAS_VMMD_ROLE. Setting Role in
+	// the defaults-struct literal lets toml.Unmarshal overwrite it,
+	// which would silently make the env override dead. The role
+	// gate at boot calls role.Require to refuse to start under the
+	// wrong box shape.
+	c.Role = role.FromConfig(string(c.Role), "FAAS_VMMD_ROLE")
 	return c, nil
 }

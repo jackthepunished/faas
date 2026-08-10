@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -215,6 +216,16 @@ type Config struct {
 	// and the [compute_nodes] row is provisioned by `faas node
 	// register` (out of scope for ADR-056).
 	NodeName string `toml:"node_name"`
+
+	// Role is the box shape this schedd inhabits (Gate-B; env
+	// override FAAS_SCHEDD_ROLE wins when set). schedd is a
+	// control-plane daemon — it refuses to start under
+	// RoleComputeOnly. RoleSingleBox is the default and lets
+	// single-box dev boot unmoved. The host_vars setting
+	// `faas_box_role: control-plane` propagates through ansible
+	// to FAAS_SCHEDD_ROLE on the schedd unit; a missing env
+	// keeps the field at RoleSingleBox.
+	Role role.Role `toml:"role"`
 }
 
 // ResolveListenTarget returns the gRPC target schedd should bind.
@@ -357,6 +368,11 @@ func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Gate-B: even on the missing-file path, resolve Role
+			// against FAAS_SCHEDD_ROLE so env wins over the empty
+			// TOML default. role.FromConfig falls back to
+			// RoleSingleBox when the env is unset.
+			c.Role = role.FromConfig(string(c.Role), "FAAS_SCHEDD_ROLE")
 			return c, nil
 		}
 		return nil, fmt.Errorf("schedd: read %q: %w", path, err)
@@ -364,5 +380,12 @@ func LoadConfig(path string) (*Config, error) {
 	if err := toml.Unmarshal(b, c); err != nil {
 		return nil, fmt.Errorf("schedd: parse %q: %w", path, err)
 	}
+	// Gate-B: resolve Role AFTER toml.Unmarshal so the post-decode
+	// c.Role is consulted against FAAS_SCHEDD_ROLE. Setting Role in
+	// the defaults-struct literal lets toml.Unmarshal overwrite it,
+	// which would silently make the env override dead. The role
+	// gate at boot calls role.Require to refuse to start under the
+	// wrong box shape.
+	c.Role = role.FromConfig(string(c.Role), "FAAS_SCHEDD_ROLE")
 	return c, nil
 }
