@@ -1,6 +1,8 @@
 // Handlers for the headless source-ref deploy path (issue #739,
 // DEPLOY-PROV-4 / ADR-092). The customer-facing entry point is
-//   POST /v1/apps/{slug}/deployments/source-ref
+//
+//	POST /v1/apps/{slug}/deployments/source-ref
+//
 // accepting JSON {repo, ref, format}. Server resolves the durable
 // install row, mints an installation token via the githubd gRPC
 // bridge, fetches the upstream tarball through the same bridge,
@@ -9,7 +11,8 @@
 // emits the `deploy.source_ref` audit row.
 //
 // Auth chain (cmd/apid/server.go):
-//   authLimited → requireMFA → requireScope(ScopesDeployWriteSurface) → idempotent → handleSourceRefDeploy
+//
+//	authLimited → requireMFA → requireScope(ScopesDeployWriteSurface) → idempotent → handleSourceRefDeploy
 //
 // Why a separate file: the handler reads SourceRefStreamer + IDOR
 // + audit + cap helper wiring in one place, mirrors the canonical
@@ -226,14 +229,14 @@ func (s *server) auditSourceRefDeploy(ctx context.Context, acct state.Account, a
 		"source_sha", resolvedSHA,
 	)
 	s.audit.Emit(ctx, "deploy.source_ref", &acct.ID, map[string]any{
-		"app_id":         app.ID,
-		"deployment_id":  res.DeploymentID,
-		"build_id":       res.BuildID,
-		"repo":           req.Repo,
-		"ref":            req.Ref,
-		"source_sha":     resolvedSHA,
-		"install_id":     installID,
-		"supersedes":     prev.ID,
+		"app_id":        app.ID,
+		"deployment_id": res.DeploymentID,
+		"build_id":      res.BuildID,
+		"repo":          req.Repo,
+		"ref":           req.Ref,
+		"source_sha":    resolvedSHA,
+		"install_id":    installID,
+		"supersedes":    prev.ID,
 	})
 }
 

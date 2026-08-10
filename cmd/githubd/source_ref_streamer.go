@@ -108,7 +108,7 @@ func newSourceRefStreamer(installs sourceRefInstallsLookup, tokens sourceRefToke
 //   - io.ReadCloser on success. Close() drains + closes the body.
 //   - githubd.ErrNoBinding when state.ErrNotFound surfaces from
 //     the install lookup (the apid handler turns this into 404
-//     + code=github_install_not_found).
+//   - code=github_install_not_found).
 //   - gitfetch.ErrUnauthorized (wrapped) when a 401 survives one
 //     cache-invalidate + retry. apid maps this to 503
 //     code=source_ref_unavailable per ADR-092 §3.7.
@@ -370,7 +370,7 @@ func (a *tokenCacheAdapter) Invalidate(installationID int64) {
 
 // Compile-time guards.
 var (
-	_ sourceRefInstallsLookup = (*stateInstallsAdapter)(nil)
-	_ sourceRefTokenLookup    = (*tokenCacheAdapter)(nil)
+	_ sourceRefInstallsLookup   = (*stateInstallsAdapter)(nil)
+	_ sourceRefTokenLookup      = (*tokenCacheAdapter)(nil)
 	_ githubd.SourceRefStreamer = (*sourceRefStreamer)(nil)
 )

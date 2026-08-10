@@ -56,9 +56,9 @@ type sourceRefFake struct {
 	mux sync.Mutex
 
 	// Recorded calls.
-	mintCalls    int
-	mintAcctID   string
-	mintInstID   int64
+	mintCalls  int
+	mintAcctID string
+	mintInstID int64
 
 	streamCalls    int
 	streamAcctID   string

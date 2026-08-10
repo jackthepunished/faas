@@ -83,11 +83,11 @@ type AuditEvent func(event string, accountID string, payload map[string]any)
 type RealService struct {
 	githubdgrpc.UnimplementedService
 
-	Auth      *AppAuth
-	Tokens    *TokenCache
-	Checks    *ChecksAPI
-	Store     BindingsStore
-	Installs  StoreInstalls
+	Auth     *AppAuth
+	Tokens   *TokenCache
+	Checks   *ChecksAPI
+	Store    BindingsStore
+	Installs StoreInstalls
 	// Streamer is the SourceRefStreamer implementation wired
 	// for the DEPLOY-PROV-4 / ADR-092 (issue #739) source-ref
 	// deploy path. Production wiring (cmd/githubd/main.go) passes

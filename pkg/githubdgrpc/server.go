@@ -321,9 +321,9 @@ func (s *Server) StreamSourceRef(req *githubdpb.StreamSourceRefRequest, stream g
 		n, rerr := rc.Read(buf)
 		if n > 0 {
 			chunk := &githubdpb.StreamSourceRefChunk{
-				Data:           append([]byte(nil), buf[:n]...),
-				BytesStreamed:  total,
-				Truncated:      truncated && rerr == io.EOF,
+				Data:          append([]byte(nil), buf[:n]...),
+				BytesStreamed: total,
+				Truncated:     truncated && rerr == io.EOF,
 			}
 			if serr := stream.Send(chunk); serr != nil {
 				return toStatusErr(serr)

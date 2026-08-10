@@ -75,7 +75,7 @@ type StreamSourceRefResult struct {
 
 // StreamSourceRefStats mirrors pkg/githubdgrpc.StreamSourceRefStats.
 type StreamSourceRefStats struct {
-	Truncated    bool
+	Truncated     bool
 	BytesStreamed int64
 	Err           error
 }

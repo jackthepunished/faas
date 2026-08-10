@@ -183,12 +183,12 @@ const (
 	// mirrors CodeCapacity / CodeBuildXXX — the failure is transient
 	// and the customer's CLI/CI will retry on the backoff.
 	CodeSourceRefUnavailable = "source_ref_unavailable"
-	CodeAppLayerTooBig  = "app_layer_too_large"
-	CodeBuildUndetected = "build_undetected"
-	CodeBuildOOM        = "build_oom"
-	CodeBuildTimeout    = "build_timeout"
-	CodeQuotaExhausted  = "quota_exhausted"
-	CodeBillingPastDue  = "billing_past_due"
+	CodeAppLayerTooBig       = "app_layer_too_large"
+	CodeBuildUndetected      = "build_undetected"
+	CodeBuildOOM             = "build_oom"
+	CodeBuildTimeout         = "build_timeout"
+	CodeQuotaExhausted       = "quota_exhausted"
+	CodeBillingPastDue       = "billing_past_due"
 	// CodeBillingNotImplemented is returned when the selected
 	// billing provider (FAAS_BILLING_PROVIDER) does not implement the
 	// requested method (issue #279: Paddle's Refund). Distinct from
