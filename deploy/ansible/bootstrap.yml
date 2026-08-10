@@ -1,0 +1,130 @@
+# Gate-B cross-box mTLS hardening (issue #297) — per-box enablement
+# playbook. Three plays, one per host group, dispatching to a role
+# subset:
+#
+#   1. [control_plane] — fsn-1: shared preconditions + control-plane-only
+#      roles (postgres, postgres_backup, control_plane_service,
+#      gatewayd_public_service, githubd_service, log_archive).
+#   2. [compute_nodes] — fsn-2: shared preconditions + compute-only
+#      roles (vmmd_service, gatewayd_internal_service,
+#      compute_only_service, log_archive).
+#   3. [box] — legacy single-box dev/lima shape. Every role, including
+#      both vmmd and apid, so `make bootstrap` against 127.0.0.1
+#      keeps working unchanged.
+#
+# Per-box role isolation is enforced at two layers:
+#   - This playbook only applies the role subset each box needs.
+#   - Each daemon's role gate (pkg/role, PR-1) refuses to start under
+#     the wrong FAAS_<DAEMON>_ROLE — the back-stop for any operator
+#     who hand-runs a control-plane binary on the compute-only box.
+#
+# sha-bench the legacy site.yml: born as a single-box play with
+# `serial: 1` + `max_fail_percentage: 0` (cl deploy/ansible/site.yml:25-29).
+# Each play below keeps the same `serial: 1` + `max_fail_percentage: 0`
+# shape — a half-bootstrapped box is worse than a known-bad one.
+#
+# Per-box daemons:
+#   fsn-1 (control-plane): apid, schedd, meterd, gatewayd-public, githubd
+#   fsn-2 (compute-only):  vmmd, gatewayd-internal, builderd, imaged
+#   single-box (legacy):   every daemon
+#
+# The `vars_files` block is conditional on the host running postgres
+# (i.e. on [control_plane] or [box]); the four hetzner_storage_box_*
+# vars are read from /etc/faas/sealed.env at ansible-run time and are
+# not box-shape-conditional themselves.
+
+- name: Bootstrap a Gate-B control-plane node (fsn-1)
+  hosts: control_plane
+  gather_facts: true
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+
+  vars_files:
+    - group_vars/box/hetzner.yml
+
+  roles:
+    # Shared preconditions (every box):
+    - role: cgroups_v2
+    - role: grub
+    - role: lvm
+    - role: xfs
+    - role: firecracker
+    - role: supply_chain_scanners
+    - role: systemd_slices
+    - role: nftables
+    - role: overlay
+    - role: node_exporter
+    - role: alertmanager
+    - role: prometheus
+    - role: grafana
+    # Control-plane-only:
+    - role: postgres
+    - role: postgres_backup
+    - role: control_plane_service
+    - role: gatewayd_public_service
+    - role: githubd_service
+    - role: log_archive
+
+- name: Bootstrap a Gate-B compute-only node (fsn-2)
+  hosts: compute_nodes
+  gather_facts: true
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+
+  roles:
+    # Shared preconditions (same as cp):
+    - role: cgroups_v2
+    - role: grub
+    - role: lvm
+    - role: xfs
+    - role: firecracker
+    - role: supply_chain_scanners
+    - role: systemd_slices
+    - role: nftables
+    - role: overlay
+    - role: node_exporter
+    - role: alertmanager
+    - role: prometheus
+    - role: grafana
+    # Compute-only:
+    - role: vmmd_service
+    - role: gatewayd_internal_service
+    - role: compute_only_service
+    - role: log_archive
+
+- name: Bootstrap a single-box dev/lima host (legacy)
+  hosts: box
+  gather_facts: true
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+
+  vars_files:
+    - group_vars/box/hetzner.yml
+
+  roles:
+    # Everything; the legacy single-box shape. PR-2 keeps this working
+    # so existing `make bootstrap` against 127.0.0.1 is unchanged.
+    - role: cgroups_v2
+    - role: grub
+    - role: lvm
+    - role: xfs
+    - role: firecracker
+    - role: supply_chain_scanners
+    - role: systemd_slices
+    - role: nftables
+    - role: postgres
+    - role: postgres_backup
+    - role: control_plane_service
+    - role: vmmd_service
+    - role: gatewayd_internal_service
+    - role: gatewayd_public_service
+    - role: githubd_service
+    - role: log_archive
+    - role: compute_only_service
+    - role: node_exporter
+    - role: alertmanager
+    - role: prometheus
+    - role: grafana

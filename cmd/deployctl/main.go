@@ -108,25 +108,61 @@ type target struct {
 // slice in order so it emits first.
 const cpcpIndex = 0
 
-// defaultTargets — the three trees systemd unit files live in across
-// the platform. Index 0 is cp-cp (see cpcpIndex); index 1 is the
-// legacy tree + dev VMs; index 2 is the ansible role drop-in.
+// defaultTargets — the trees systemd unit files live in across the
+// platform. Index 0 is cp-cp (see cpcpIndex); index 1 is the legacy
+// tree + dev VMs; index 2+ are the per-box ansible role drop-ins
+// (Gate-B PR-2: split into control_plane_service, githubd_service,
+// compute_only_service so each role ships only its own daemons).
 var defaultTargets = []target{
 	{dir: "deploy/controlplane/systemd"},
 	{dir: "deploy/systemd", skip: legacySkips()},
 	{dir: "deploy/ansible/roles/control_plane_service/files", skip: ansibleRoleSkips()},
+	{dir: "deploy/ansible/roles/githubd_service/files", skip: githubdOnlySkips()},
+	{dir: "deploy/ansible/roles/compute_only_service/files", skip: computeOnlySkips()},
 }
 
 // ansibleRoleSkips: the ansible control_plane_service role only ships
-// 4 of the 8 daemons today (apid, imaged, meterd, schedd). vmmd +
-// gatewayd-internal + gatewayd-public + githubd are NOT shipped by
-// this role. Widening the role to all 8 is a separate ops change.
+// 3 of the 8 daemons today (apid, meterd, schedd). imaged moved to
+// compute_only_service in Gate-B PR-2; vmmd + gatewayd-internal +
+// gatewayd-public + githubd are NOT shipped by this role. Widening
+// the role to all 8 is a separate ops change.
 func ansibleRoleSkips() map[string]bool {
 	return map[string]bool{
-		"gatewayd-public":   true,
-		"gatewayd-internal": true,
 		"githubd":           true,
 		"vmmd":              true,
+		"imaged":            true,
+		"gatewayd-public":   true,
+		"gatewayd-internal": true,
+	}
+}
+
+// githubdOnlySkips: githubd_service is single-daemon (Gate-B PR-2).
+// Every daemon other than githubd is skipped so the role's files/
+// tree only carries faas-githubd.service + githubd.toml.example.
+func githubdOnlySkips() map[string]bool {
+	return map[string]bool{
+		"apid":              true,
+		"schedd":            true,
+		"meterd":            true,
+		"imaged":            true,
+		"vmmd":              true,
+		"gatewayd-public":   true,
+		"gatewayd-internal": true,
+	}
+}
+
+// computeOnlySkips: compute_only_service ships imaged only (Gate-B
+// PR-2). vmmd + gatewayd-internal have their own ansible roles;
+// builderd is out of scope until PR-4's runbook TODO is acted on.
+func computeOnlySkips() map[string]bool {
+	return map[string]bool{
+		"apid":              true,
+		"schedd":            true,
+		"meterd":            true,
+		"githubd":           true,
+		"vmmd":              true,
+		"gatewayd-public":   true,
+		"gatewayd-internal": true,
 	}
 }
 

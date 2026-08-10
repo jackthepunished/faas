@@ -1,0 +1,14 @@
+# Gate-B (issue #297 / ADR-025 §Tier 2) control-plane box.
+# fsn-1 runs apid, schedd, meterd, gatewayd-public, githubd.
+# Postgres + the Tier 1 PKI CA live here. The role gate at boot
+# (pkg/role, PR-1) refuses to start apid/schedd/meterd/gatewayd-public/
+# githubd under RoleComputeOnly; this var is the deploy-time source
+# of truth — every daemon's systemd unit reads it via FAAS_<DAEMON>_ROLE.
+#
+# faas_node_name matches the FAAS_NODE_NAME convention used by
+# deploy/lima/faas-metal-2node-b.yaml and the vmmd ComputeNode.NodeName
+# field. schedd treats this as the canonical compute_node identity at
+# PR-3 cross-box handshake.
+
+faas_box_role: control-plane
+faas_node_name: fsn-1

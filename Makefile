@@ -358,9 +358,19 @@ scan: ## Supply-chain scan: govulncheck (HIGH+) + Grype image scan + syft SBOM (
 	syft dir:. -o cyclonedx-json=bin/sbom.json --source-version "$$(git rev-parse --short HEAD)" --source-type directory
 
 .PHONY: bootstrap
-bootstrap: ## Idempotent host setup (ansible) — only on a dev EX44
-	@test -f deploy/ansible/site.yml || (echo "deploy/ansible/site.yml not present yet (M0)"; exit 1)
-	ansible-playbook -i deploy/ansible/inventory deploy/ansible/site.yml
+bootstrap: ## Idempotent single-box setup (ansible) — dev/lima. Back-compat for `make bootstrap` against 127.0.0.1.
+	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml not present yet (Gate-B PR-2)"; exit 1)
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit box -e faas_box_role=single-box
+
+.PHONY: bootstrap-control-plane
+bootstrap-control-plane: ## Bootstrap fsn-1 (control-plane) — Gate-B PR-2
+	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml not present yet (Gate-B PR-2)"; exit 1)
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit control_plane -e faas_box_role=control-plane
+
+.PHONY: bootstrap-compute
+bootstrap-compute: ## Bootstrap fsn-2 (compute-only) — Gate-B PR-2
+	@test -f deploy/ansible/bootstrap.yml || (echo "deploy/ansible/bootstrap.yml not present yet (Gate-B PR-2)"; exit 1)
+	ansible-playbook -i deploy/ansible/inventory/hosts.ini deploy/ansible/bootstrap.yml --limit compute_nodes -e faas_box_role=compute-only
 
 .PHONY: tidy
 tidy: ## go mod tidy
