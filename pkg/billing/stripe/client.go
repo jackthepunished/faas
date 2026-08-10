@@ -373,6 +373,22 @@ func (c *Client) ReconcileUsage(_ context.Context, _ state.Account, _, _ time.Ti
 // ReconcileUsage returns ErrNotImplemented (the reconciler short-
 // circuits with errors.Is, mirroring the Paddle stub).
 func (c *Client) Capabilities() billing.CapabilitySet {
+	return StripeCapabilities()
+}
+
+// StripeCapabilities returns the static capability set for the
+// Stripe provider. Lifted out of *Client.Capabilities so the
+// loader's Providers() metadata-only path (loader.go:160) does not
+// have to construct a *Client just to read the bits. The capability
+// set is invariant — Capabilities() never reads c.api — so a free
+// function is the correct shape.
+//
+// Exported because the loader (pkg/billing/loader) is a separate
+// package and needs to read the static set without constructing a
+// *Client. Exposing the function (not the value) keeps future
+// capability-set composition (e.g. adding CapUsageReconcile) localised
+// to this file. Mirrors paddle.PaddleCapabilities.
+func StripeCapabilities() billing.CapabilitySet {
 	return billing.CapabilitySet(billing.CapRefund | billing.CapUsageMetered | billing.CapSandbox)
 }
 

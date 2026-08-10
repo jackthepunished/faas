@@ -58,6 +58,8 @@ import (
 // monthly price set up yet (Free plan / never-checked-out) — apid
 // maps that to 404.
 func (p *Provider) RetryLatestCharge(ctx context.Context, acct state.Account) (string, string, error) {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic on p.client.CreateTransaction.
 	if p.client == nil {
 		return "", "", fmt.Errorf("paddle: SDK not initialized")
 	}
@@ -125,6 +127,8 @@ func (p *Provider) RetryLatestCharge(ctx context.Context, acct state.Account) (s
 // Returns ErrAlreadyCancelled when acct has no ProviderCustomerID
 // (Free / never-checked-out / post-cancel).
 func (p *Provider) CancelAtPeriodEnd(ctx context.Context, acct state.Account) (time.Time, error) {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic on p.client.UpdateCustomer.
 	if p.client == nil {
 		return time.Time{}, fmt.Errorf("paddle: SDK not initialized")
 	}
@@ -166,6 +170,8 @@ func (p *Provider) CancelAtPeriodEnd(ctx context.Context, acct state.Account) (t
 // the value verbatim. ExpMonth/ExpYear map from Card.ExpiryMonth/
 // ExpiryYear (Paddle's field name).
 func (p *Provider) PaymentMethodSummary(ctx context.Context, acct state.Account) (billing.PaymentMethod, error) {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic on p.client.ListCustomerPaymentMethods.
 	if p.client == nil {
 		return billing.PaymentMethod{}, fmt.Errorf("paddle: SDK not initialized")
 	}

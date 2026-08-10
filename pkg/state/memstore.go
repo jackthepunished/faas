@@ -1002,26 +1002,40 @@ func (m *MemStore) CountDeployments(_ context.Context, id string) (int, error) {
 
 // --- end MFA -----------------------------------------------------------------
 
-// UpdateAccountProviderCustomerID records the Stripe `cus_…` ID. MemStore
-// keeps an index map for O(1) webhook lookup; PgStore mirrors with a
-// schema-level unique index (added in Slice 2's migration).
-func (m *MemStore) UpdateAccountProviderCustomerID(_ context.Context, id, stripeCustomerID string) error {
+// UpdateAccountProviderCustomerID records the Stripe `cus_…` or
+// Paddle `ctm_…` ID on the account row. MemStore keeps an index map
+// for O(1) webhook lookup; PgStore mirrors with a schema-level
+// unique index (added in Slice 2's migration). The shared
+// accounts.provider_customer_id column is reused for both providers
+// per ADR-025 — the two ID shapes are disjoint prefixes so the
+// shared column is safe in single-provider deployments
+// (FAAS_BILLING_PROVIDER is per-deployment, not per-row).
+func (m *MemStore) UpdateAccountProviderCustomerID(_ context.Context, id, providerCustomerID string) error {
+	// Empty providerCustomerID would silently corrupt the
+	// reverse-lookup map (an empty-string key would point at the
+	// most-recently-updated account, and AccountByProviderCustomerID
+	// would return that account instead of ErrNotFound). Production
+	// callers (apid changePlan, the Paddle webhook) check for empty
+	// first; this is the store-side belt to that brace.
+	if providerCustomerID == "" {
+		return fmt.Errorf("state: UpdateAccountProviderCustomerID: empty providerCustomerID for account %q", id)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]
 	if !ok {
 		return ErrNotFound
 	}
-	a.ProviderCustomerID = stripeCustomerID
+	a.ProviderCustomerID = providerCustomerID
 	m.accounts[id] = a
 	// Maintain the reverse-lookup map for AccountByProviderCustomerID.
 	for k, v := range m.stripeByCustomer {
-		if v == id && k != stripeCustomerID {
+		if v == id && k != providerCustomerID {
 			delete(m.stripeByCustomer, k)
 			break
 		}
 	}
-	m.stripeByCustomer[stripeCustomerID] = id
+	m.stripeByCustomer[providerCustomerID] = id
 	return nil
 }
 
@@ -1056,42 +1070,6 @@ func (m *MemStore) AccountByProviderCustomerID(_ context.Context, stripeCustomer
 		return Account{}, ErrNotFound
 	}
 	return a, nil
-}
-
-// UpdateAccountPaddleCustomerID mirrors UpdateAccountProviderCustomerID
-// for the Paddle ctm_… ID. The accounts.provider_customer_id column is
-// reused (ADR-025 — column rename is a separate migration PR), so the
-// underlying field + reverse-lookup map are the same; the dedicated
-// method name keeps the Paddle call sites self-documenting.
-func (m *MemStore) UpdateAccountPaddleCustomerID(_ context.Context, id, paddleCustomerID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	a, ok := m.accounts[id]
-	if !ok {
-		return ErrNotFound
-	}
-	a.ProviderCustomerID = paddleCustomerID // column is reused per ADR-025
-	m.accounts[id] = a
-	// Maintain the reverse-lookup map. Same map as the Stripe path —
-	// a single deployment uses one provider, so the prefix-stripped
-	// (cus_ vs ctm_) index is unambiguous in practice.
-	for k, v := range m.stripeByCustomer {
-		if v == id && k != paddleCustomerID {
-			delete(m.stripeByCustomer, k)
-			break
-		}
-	}
-	m.stripeByCustomer[paddleCustomerID] = id
-	return nil
-}
-
-// AccountByPaddleCustomerID is the reverse-lookup the Paddle webhook
-// uses to find the account behind a `customer_id` field. Same map as
-// the Stripe path (the column is reused); the dedicated method name
-// keeps the Paddle call sites self-documenting and leaves the door
-// open for a column-rename PR to swap bodies without touching callers.
-func (m *MemStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
-	return m.AccountByProviderCustomerID(ctx, paddleCustomerID)
 }
 
 // ListAllAccounts walks the account map under the store mutex. The

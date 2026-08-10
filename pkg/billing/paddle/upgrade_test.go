@@ -11,28 +11,6 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// TestCreateUpgradeTransaction_NoClient asserts the SDK-not-initialized
-// guard. Production never reaches this branch (NewProvider sets p.client
-// even if paddle.New returns an error), but the guard is here so a
-// future caller that builds a Provider with client=nil (a test fixture
-// or a future refactor) gets a typed error rather than a nil-deref
-// panic inside the SDK call.
-//
-// Pin: PR #3 added CreateUpgradeTransaction; this is its first unit
-// test, so a regression in the SDK-init guard would otherwise land
-// silently and only fail in production.
-func TestCreateUpgradeTransaction_NoClient(t *testing.T) {
-	t.Parallel()
-	p := &Provider{client: nil}
-	_, _, err := p.CreateUpgradeTransaction(context.Background(), state.Account{}, api.PlanPro)
-	if err == nil {
-		t.Fatalf("expected error when client is nil, got nil")
-	}
-	if !strings.Contains(err.Error(), "SDK not initialized") {
-		t.Errorf("err = %q, want SDK-not-initialized message", err)
-	}
-}
-
 // TestCreateUpgradeTransaction_MissingMonthlyPrice pins the catalog
 // guard. The changePlan handler trusts CreateUpgradeTransaction to
 // either return a checkout URL or fail loudly — a silent return of

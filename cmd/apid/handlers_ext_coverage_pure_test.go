@@ -89,7 +89,7 @@ func TestLookupAccountByPaddleID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.store.UpdateAccountPaddleCustomerID(ctx, acct.ID, "ctm_known"); err != nil {
+	if err := srv.store.UpdateAccountProviderCustomerID(ctx, acct.ID, "ctm_known"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := srv.lookupAccountByPaddleID(ctx, "ctm_known")

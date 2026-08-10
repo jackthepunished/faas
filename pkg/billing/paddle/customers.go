@@ -21,6 +21,8 @@ import (
 // accounts.provider_customer_id column first — a second call with
 // the ID already set is a no-op.
 func (p *Provider) CreateCustomer(ctx context.Context, acct state.Account) (string, error) {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic on p.client.CreateCustomer.
 	if p.client == nil {
 		return "", fmt.Errorf("paddle: SDK not initialized (apiKey=%q)", redactAPIKey(p.apiKey))
 	}

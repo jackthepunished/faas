@@ -2327,7 +2327,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 					api.WriteProblem(w, api.ErrCapacity("upgrade unavailable"))
 					return
 				}
-				if err := s.store.UpdateAccountPaddleCustomerID(r.Context(), acct.ID, custID); err != nil {
+				if err := s.store.UpdateAccountProviderCustomerID(r.Context(), acct.ID, custID); err != nil {
 					// PR-P4 review finding #1: at this point a
 					// Paddle customer has been created on Paddle's
 					// side (custID is the ctm_… handle) but the DB
@@ -2922,7 +2922,7 @@ func (s *server) lookupAccountByPaddleID(ctx context.Context, paddleID string) (
 	if paddleID == "" {
 		return state.Account{}, errors.New("apid: empty paddle customer id")
 	}
-	return s.store.AccountByPaddleCustomerID(ctx, paddleID)
+	return s.store.AccountByProviderCustomerID(ctx, paddleID)
 }
 
 // --- response helpers ------------------------------------------------------

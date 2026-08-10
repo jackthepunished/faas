@@ -104,6 +104,17 @@ jobs:
       - name: build
         run: make build
 
+      # +incompatible direct-dep gate (release blocker B1). Today this
+      # flags github.com/stripe/stripe-go v70.15.0+incompatible (go.mod:25)
+      # — v70 pre-dates the modern lookup_key primitive on PlanParams
+      # (v74+), and `+incompatible` means Go will never auto-bump past
+      # it. The gate stays failing until a follow-up PR upgrades stripe-go
+      # to a current major; the tripwire prevents any *other* direct dep
+      # from ever slipping in unannounced. See
+      # scripts/ci/check_no_incompatible_deps.sh for the rationale.
+      - name: forbid +incompatible direct deps
+        run: make lint-incompatible-mods
+
       # promtool check rules — gate for spec §12 alert rules. Downloads
       # the same Prometheus release the ansible role pins
       # (deploy/ansible/roles/prometheus/defaults/main.yml:prom_version)

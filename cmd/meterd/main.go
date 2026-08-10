@@ -796,7 +796,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// deployments keep all three paths empty and LoadEgressTLS returns
 	// (nil, nil); multi-box deployments point egress_target at tcp://
 	// or dns:// + a TLS cluster.
-	gwEgressTLS, err := cfg.LoadEgressTLS()
+	gwEgressTLS, err := cfg.LoadGatewayEgressTLS()
 	if err != nil {
 		return fmt.Errorf("meterd: load egress TLS: %w", err)
 	}
@@ -810,8 +810,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// path is resolved by egresssocket.ResolveFromOS, which prefers
 	// FAAS_EGRESS_SOCKET (added in PR-C+D), then the legacy
 	// FAAS_GATEWAY_EGRESS_SOCKET (one release cycle), then
-	// cfg.EgressSocket, then cfg.GatewayEgressSocket (deprecated),
-	// then egresssocket.DefaultSocketPath. Both sockets (this one and
+	// the cfg's GatewayEgressSocket, then
+	// egresssocket.DefaultSocketPath. Both sockets (this one and
 	// FAAS_GATEWAY_SYNTH_SOCKET) share the same group-`faas` DAC auth
 	// (ADR-015). ctx here is the loop ctx — when the daemon shuts
 	// down the goroutine returns.
@@ -821,7 +821,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		return ""
 	}
-	gwSocketPath := egresssocket.ResolveFromOS(envOr, cfg.EgressSocket, cfg.GatewayEgressSocket)
+	gwSocketPath := egresssocket.ResolveFromOS(envOr, "", cfg.GatewayEgressSocket)
 	gwEgress.startStream(ctx, gwSocketPath, log)
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and

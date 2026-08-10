@@ -54,7 +54,10 @@ func requireSandbox(t *testing.T) string {
 // between the two runs.
 func TestEnsurePlanProducts_AreIdempotent(t *testing.T) {
 	key := requireSandbox(t)
-	p := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p, err := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -92,7 +95,10 @@ func TestEnsurePlanProducts_AreIdempotent(t *testing.T) {
 // doesn't expose Idempotency-Key today — that's a future PR).
 func TestCreateCustomer_PostsToPaddleSandbox(t *testing.T) {
 	key := requireSandbox(t)
-	p := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p, err := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 
 	acctID := "acct_sandbox_" + time.Now().UTC().Format("20060102_150405")
 	acct := state.Account{
@@ -120,7 +126,10 @@ func TestCreateCustomer_PostsToPaddleSandbox(t *testing.T) {
 // double-bills between test runs that hit the same calendar month).
 func TestPushOverageTransaction_PostsToPaddleSandbox(t *testing.T) {
 	key := requireSandbox(t)
-	p := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	p, err := NewProvider(key, "", true, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 
 	// EnsurePlanProducts runs first so the overage price handle is
 	// in the catalog; the catalog lookup is what would otherwise

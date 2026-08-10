@@ -47,6 +47,8 @@ type CreateUpgradeTxnFn func(ctx context.Context, p *Provider, acct state.Accoun
 // Problem carries these as PaddleCheckoutURL + TxID extensions so the
 // dashboard can render an upsell button + confirmation id.
 func (p *Provider) CreateUpgradeTransaction(ctx context.Context, acct state.Account, targetPlan api.Plan) (string, string, error) {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic in the upgrade path.
 	if p.client == nil {
 		return "", "", fmt.Errorf("paddle: SDK not initialized")
 	}

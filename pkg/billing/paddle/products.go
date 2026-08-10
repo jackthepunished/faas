@@ -76,6 +76,9 @@ type planPriceSpec struct {
 // AND plan → pri_… (monthly price) AND plan → pri_… (overage price).
 // meterd's quota + dunning timers use the overage price handle.
 func (p *Provider) ensureProducts(ctx context.Context) error {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic on the first SDK
+	// call below.
 	if p.client == nil {
 		return errors.New("paddle: SDK not initialized")
 	}

@@ -290,6 +290,10 @@ ha-failover-drill: ## Tier A8 / ADR-083: active-passive HA fail-over drill on th
 	  echo "  Step 7: limactl shell faas-metal-2b curl -s localhost:9100/metrics | grep active_passive_failovers_total — confirm dns_stale > 0."; \
 	  exit 0'
 
+.PHONY: lint-incompatible-mods
+lint-incompatible-mods: ## CI: fail if any direct go.mod require is +incompatible
+	@bash scripts/ci/check_no_incompatible_deps.sh
+
 .PHONY: ha-write-redirect-drill
 ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on the two-node Lima fleet (§14 M9)
 	# Read-only drill (per ADR-089 §Open follow-ups): assumes the
@@ -344,7 +348,7 @@ ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on t
 	  exit 0'
 
 .PHONY: lint
-lint: egress-check ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift gate
+lint: egress-check lint-incompatible-mods ## golangci-lint via go tool (matches CI version v2.4.0) + egress artifact drift + +incompatible direct-dep gate
 	@$(GO) tool golangci-lint run
 
 .PHONY: scan

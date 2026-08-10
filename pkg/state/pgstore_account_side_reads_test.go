@@ -5,10 +5,10 @@ package state_test
 // This file covers Store methods that had no PgStore test before slice 6:
 //
 //   Lookup:    AccountByKeyHash (via the api_keys JOIN shape),
-//              AccountByProviderCustomerID, AccountByPaddleCustomerID.
+//              AccountByProviderCustomerID, AccountByProviderCustomerID.
 //   Mutate:    UpdateAccountProviderCustomerID,
 //              UpdateAccountStripeSubscriptionItem,
-//              UpdateAccountPaddleCustomerID.
+//              UpdateAccountProviderCustomerID.
 //   Walk:      ListAllAccounts.
 //
 // All assertions go through the Store API; no raw SQL.
@@ -124,32 +124,32 @@ func TestPg_UpdateAccountStripeSubscriptionItem_UnknownAccountReturnsErrNotFound
 	}
 }
 
-// TestPg_UpdateAccountPaddleCustomerID_Persists pins the Paddle side of
+// TestPg_UpdateAccountProviderCustomerID_Persists pins the Paddle side of
 // provider_customer_id (the column is reused per ADR-025). The mutation
 // is identical to the Stripe path; the dedicated method keeps Paddle call
 // sites self-documenting.
-func TestPg_UpdateAccountPaddleCustomerID_Persists(t *testing.T) {
+func TestPg_UpdateAccountProviderCustomerID_Persists(t *testing.T) {
 	s, ctx := pgStore(t)
 	acctID := createAccount(t, s, ctx, pgTestEmail(t))
-	if err := s.UpdateAccountPaddleCustomerID(ctx, acctID, "ctm_TEST"); err != nil {
-		t.Fatalf("UpdateAccountPaddleCustomerID: %v", err)
+	if err := s.UpdateAccountProviderCustomerID(ctx, acctID, "ctm_TEST"); err != nil {
+		t.Fatalf("UpdateAccountProviderCustomerID: %v", err)
 	}
-	got, err := s.AccountByPaddleCustomerID(ctx, "ctm_TEST")
+	got, err := s.AccountByProviderCustomerID(ctx, "ctm_TEST")
 	if err != nil {
-		t.Fatalf("AccountByPaddleCustomerID: %v", err)
+		t.Fatalf("AccountByProviderCustomerID: %v", err)
 	}
 	if got.ID != acctID {
 		t.Errorf("ID = %q, want %q", got.ID, acctID)
 	}
 }
 
-// TestPg_AccountByPaddleCustomerID_UnknownReturnsErrNotFound pins the
+// TestPg_AccountByProviderCustomerID_UnknownReturnsErrNotFound pins the
 // reverse-lookup miss branch (delegated to AccountByProviderCustomerID).
-func TestPg_AccountByPaddleCustomerID_UnknownReturnsErrNotFound(t *testing.T) {
+func TestPg_AccountByProviderCustomerID_UnknownReturnsErrNotFound(t *testing.T) {
 	s, ctx := pgStore(t)
-	_, err := s.AccountByPaddleCustomerID(ctx, "ctm_NEVER")
+	_, err := s.AccountByProviderCustomerID(ctx, "ctm_NEVER")
 	if !errors.Is(err, state.ErrNotFound) {
-		t.Errorf("AccountByPaddleCustomerID(unknown) = %v, want ErrNotFound", err)
+		t.Errorf("AccountByProviderCustomerID(unknown) = %v, want ErrNotFound", err)
 	}
 }
 

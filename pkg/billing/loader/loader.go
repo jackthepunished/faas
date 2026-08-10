@@ -156,12 +156,17 @@ type ProviderMeta struct {
 // deterministic-order invariant is locked (the test
 // TestProviders_RegistersAllProviders pins the order).
 func Providers() []ProviderMeta {
-	stripeProv := stripe.NewClient(nil, nil, "", "", nil)
-	paddleProv := paddle.NewProvider("", "", false, nil)
+	// Both providers expose a static Capabilities() helper
+	// (stripe.StripeCapabilities, paddle.PaddleCapabilities) so the
+	// metadata-only lookup here does not have to construct a *Client
+	// / *Provider just to read the bits. Providers() is invoked once
+	// at boot, not per-request, but the asymmetry was a /code-review
+	// finding (PR #802 follow-up). Capabilities() never reads
+	// c.api / p.client — both functions return a constant.
 	out := []ProviderMeta{
 		{
 			Name:         providerStripe,
-			Capabilities: stripeProv.Capabilities(),
+			Capabilities: stripe.StripeCapabilities(),
 			EnvVars:      []string{"STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET"},
 			// BuildAPID nil → apid reads STRIPE_WEBHOOK_SECRET +
 			// FAAS_BILLING_PORTAL_URL inline (cmd/apid/main.go).
@@ -187,7 +192,7 @@ func Providers() []ProviderMeta {
 		},
 		{
 			Name:         providerPaddle,
-			Capabilities: paddleProv.Capabilities(),
+			Capabilities: paddle.PaddleCapabilities(),
 			EnvVars:      []string{"FAAS_PADDLE_API_KEY", "FAAS_PADDLE_WEBHOOK_SECRET", "FAAS_PADDLE_SANDBOX"},
 			BuildAPID: func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error) {
 				var paddleCfg *paddle.Config
@@ -202,12 +207,15 @@ func Providers() []ProviderMeta {
 					tomlTolerance = paddleCfg.ToleranceSeconds
 				}
 				sandbox := resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox)
-				p := paddle.NewProvider(
+				p, err := paddle.NewProvider(
 					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
 					resolveSecret(env("FAAS_PADDLE_WEBHOOK_SECRET"), tomlSecret),
 					sandbox,
 					log,
 				)
+				if err != nil {
+					return nil, fmt.Errorf("billing/loader: build Paddle provider for apid: %w", err)
+				}
 				// PR-P4 — install the operator-configured webhook
 				// tolerance. The single source of truth is
 				// tomlTolerance (cfg.Paddle.ToleranceSeconds), already
@@ -243,12 +251,16 @@ func Providers() []ProviderMeta {
 					tomlAPIKey = paddleCfg.APIKey
 					tomlSandbox = paddleCfg.Sandbox
 				}
-				return paddle.NewProviderWithDedupe(
+				p, err := paddle.NewProviderWithDedupe(
 					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
 					resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox),
 					log,
 					store,
-				), nil
+				)
+				if err != nil {
+					return nil, fmt.Errorf("billing/loader: build Paddle provider for meterd: %w", err)
+				}
+				return p, nil
 			},
 		},
 	}
