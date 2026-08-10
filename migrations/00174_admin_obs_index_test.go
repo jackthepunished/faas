@@ -38,7 +38,6 @@ func TestMigrations_00174_AdminObsIndex(t *testing.T) {
 	}{
 		{"orgs", "orgs_created_at_idx"},
 		{"orgs", "orgs_status_idx"},
-		{"builds", "builds_account_created_idx"},
 		{"events", "events_kind_at_idx"},
 	}
 	for _, w := range want {

@@ -217,26 +217,29 @@ learns to omit the new column.
 ```sql
 -- +goose Up
 CREATE INDEX IF NOT EXISTS orgs_created_at_idx
-    ON public.orgs USING btree (created_at DESC);
+    ON orgs USING btree (created_at DESC);
 CREATE INDEX IF NOT EXISTS orgs_status_idx
-    ON public.orgs USING btree (status) WHERE status <> 'active';
-CREATE INDEX IF NOT EXISTS builds_account_created_idx
-    ON public.builds USING btree (account_id, created_at DESC);
+    ON orgs USING btree (status) WHERE status <> 'active';
 CREATE INDEX IF NOT EXISTS events_kind_at_idx
-    ON public.events USING btree (kind, at DESC);
+    ON events USING btree (kind, at DESC);
 
 -- +goose Down
+DROP INDEX IF EXISTS events_kind_at_idx;
 DROP INDEX IF EXISTS public.events_kind_at_idx;
-DROP INDEX IF EXISTS public.builds_account_created_idx;
 DROP INDEX IF EXISTS public.orgs_status_idx;
 DROP INDEX IF EXISTS public.orgs_created_at_idx;
 ```
 
-The four composite/partial indexes back the fleet-wide scans that
-PR #1 (`orgs_created_at_idx`, `orgs_status_idx`), PR #2
-(`builds_account_created_idx`), and PR #3 (`events_kind_at_idx`)
-introduce. They are added in PR #1 to keep the migration slot
-contiguous; the PRs that read them land later.
+The three partial/composite indexes back the fleet-wide scans that
+PR #1 (`orgs_created_at_idx`, `orgs_status_idx`) and
+PR #3 (`events_kind_at_idx`) introduce. They are added in PR #1
+to keep the migration slot contiguous; the PRs that read them land
+later. The original PR-1 plan called for a fourth index
+(`builds_account_created_idx`) but the `builds` table only carries
+`deployment_id` (per 00001_init.sql) — accounts are reached via
+deployments → apps → accounts. PR #2 adds the right shape
+(`build_provenance.build_id` + `started_at`) once the build-status
+endpoint (issue-741, PR #792) lands.
 
 Replay-safe (`IF NOT EXISTS`); drop in `+goose Down` so the migration
 can be reverted in a development database. Migration test asserts the

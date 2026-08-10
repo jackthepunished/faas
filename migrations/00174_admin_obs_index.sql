@@ -26,9 +26,15 @@
 --   * orgs_status_idx         — partial index on non-'active' rows so
 --                               the "X suspended accounts today" KPI
 --                               stays cheap as the active base grows.
---   * builds_account_created_idx — composite (account_id, created_at
---                               DESC); covers both per-account and
---                               fleet-wide build scans with one plan.
+-- The original PR-1 plan listed a fourth index
+-- (builds_account_created_idx) but the `builds` table only carries
+-- `deployment_id` (per 00001_init.sql) — accounts are reached via
+-- deployments → apps → accounts. PR-2 will add the right shape
+-- (build_provenance.build_id + started_at, joined downstream from a
+-- per-account aggregate query) once the build-status endpoint
+-- (issue-741, PR #792) lands. Adding the wrong index here would
+-- have triggered a per-PR migration drop+add cycle.
+--
 --   * events_kind_at_idx     — composite (kind, at DESC) for the
 --                               rate-limit / anomaly aggregates (PR #2
 --                               will reuse this index from the day the
@@ -42,9 +48,6 @@ CREATE INDEX IF NOT EXISTS orgs_status_idx
     ON orgs USING btree (status)
     WHERE status <> 'active';
 
-CREATE INDEX IF NOT EXISTS builds_account_created_idx
-    ON builds USING btree (account_id, created_at DESC);
-
 CREATE INDEX IF NOT EXISTS events_kind_at_idx
     ON events USING btree (kind, at DESC);
 -- +goose StatementEnd
@@ -52,7 +55,6 @@ CREATE INDEX IF NOT EXISTS events_kind_at_idx
 -- +goose Down
 -- +goose StatementBegin
 DROP INDEX IF EXISTS events_kind_at_idx;
-DROP INDEX IF EXISTS builds_account_created_idx;
 DROP INDEX IF EXISTS orgs_status_idx;
 DROP INDEX IF EXISTS orgs_created_at_idx;
 -- +goose StatementEnd
