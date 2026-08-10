@@ -944,7 +944,7 @@ func TestV1AuthSignup_NewEmail_APIKeyHasProvenance(t *testing.T) {
 }
 
 // TestV1AuthLogin_ExistingAccount_ReturnsKey — happy path. The
-// ProgrammaticLogin endpoint returns the same ProgrammaticAuthResponse
+// PostAuthLogin endpoint returns the same ProgrammaticAuthResponse
 // shape as the signup endpoint so the CLI can reuse the
 // unmarshaler.
 func TestV1AuthLogin_ExistingAccount_ReturnsKey(t *testing.T) {

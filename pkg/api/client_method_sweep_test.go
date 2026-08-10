@@ -392,7 +392,7 @@ func TestSweep_DoMarshalFailure(t *testing.T) {
 func TestSweep_PostV1AuthSignup(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_X","email":"alice@example.com","plan":"free","api_key":{"plaintext":"fp_live_abc123","prefix":"fp_live_","id":"key_01HXYZ"}}`)
 	c := NewClient(srv.URL, "fp_test")
-	resp, err := c.ProgrammaticSignup(context.Background(), "alice@example.com", "correct-horse-battery-staple")
+	resp, err := c.PostAuthSignup(context.Background(), "alice@example.com", "correct-horse-battery-staple")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -407,7 +407,7 @@ func TestSweep_PostV1AuthSignup(t *testing.T) {
 func TestSweep_PostV1AuthLogin(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_Y","email":"bob@example.com","plan":"hobby","api_key":{"plaintext":"fp_live_def456","prefix":"fp_live_","id":"key_01HABC"}}`)
 	c := NewClient(srv.URL, "fp_test")
-	resp, err := c.ProgrammaticLogin(context.Background(), "bob@example.com", "correct-horse-battery-staple")
+	resp, err := c.PostAuthLogin(context.Background(), "bob@example.com", "correct-horse-battery-staple")
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -419,7 +419,7 @@ func TestSweep_PostV1AuthLogin(t *testing.T) {
 func TestSweep_PostV1AuthSignupMagicLink(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `{}`)
 	c := NewClient(srv.URL, "fp_test")
-	if err := c.RequestMagicLinkSignup(context.Background(), "carol@example.com"); err != nil {
+	if err := c.PostAuthSignupMagicLink(context.Background(), "carol@example.com"); err != nil {
 		t.Fatalf("err = %v", err)
 	}
 }

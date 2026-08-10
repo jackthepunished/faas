@@ -89,7 +89,7 @@ func signupInteractive() int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := NewClient(apiBase(), "")
-	resp, err := c.ProgrammaticSignup(ctx, email, pw1)
+	resp, err := c.PostAuthSignup(ctx, email, pw1)
 	if err != nil {
 		return printErr("Signup failed", err)
 	}
@@ -108,7 +108,7 @@ func signupMagicLink(email string) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c := NewClient(apiBase(), "")
-	if err := c.RequestMagicLinkSignup(ctx, email); err != nil {
+	if err := c.PostAuthSignupMagicLink(ctx, email); err != nil {
 		return printErr("Could not send magic link", err)
 	}
 	_, _ = fmt.Fprintln(osStdout, "Check your email — a one-time signup link is on the way.")
