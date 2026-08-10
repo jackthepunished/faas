@@ -19,8 +19,8 @@ package state_test
 //       ClearMFA, SetMFARequired, ConsumeRecoveryCode, MatchRecoveryCode)
 //     AccountsByIDs
 //     CreateAccountWithPersonalOrg
-//     ListAllAccounts, AccountByPaddleCustomerID, AccountByProviderCustomerID
-//     UpdateAccountPaddleCustomerID
+//     ListAllAccounts, AccountByProviderCustomerID, AccountByProviderCustomerID
+//     UpdateAccountProviderCustomerID
 //     GetAccountEgressAllowlistExtra / SetAccountEgressAllowlistExtra
 //     GetAccountKeyGraceWindow / SetAccountKeyGraceWindow
 //     NewPgStore
@@ -305,9 +305,9 @@ func TestPg_CoverageSweepAccounts(t *testing.T) {
 		_, _ = s.ListAllAccounts(ctx)
 	})
 
-	t.Run("AccountByPaddleCustomerIDMissing", func(t *testing.T) {
-		if _, err := s.AccountByPaddleCustomerID(ctx, "ctm_nonexistent_"+uuid.NewString()); err == nil {
-			t.Fatal("AccountByPaddleCustomerID with non-existent id returned nil err")
+	t.Run("AccountByProviderCustomerIDMissing", func(t *testing.T) {
+		if _, err := s.AccountByProviderCustomerID(ctx, "ctm_nonexistent_"+uuid.NewString()); err == nil {
+			t.Fatal("AccountByProviderCustomerID with non-existent id returned nil err")
 		}
 	})
 
@@ -317,14 +317,14 @@ func TestPg_CoverageSweepAccounts(t *testing.T) {
 		}
 	})
 
-	t.Run("UpdateAccountPaddleCustomerID", func(t *testing.T) {
+	t.Run("UpdateAccountProviderCustomerID", func(t *testing.T) {
 		email := "pg-paddle-" + uuid.NewString() + "@example.com"
 		acct, err := s.CreateAccount(ctx, email, api.PlanFree)
 		if err != nil {
 			t.Fatalf("CreateAccount: %v", err)
 		}
-		if err := s.UpdateAccountPaddleCustomerID(ctx, acct.ID, "ctm_test_"+uuid.NewString()); err != nil {
-			t.Errorf("UpdateAccountPaddleCustomerID: %v", err)
+		if err := s.UpdateAccountProviderCustomerID(ctx, acct.ID, "ctm_test_"+uuid.NewString()); err != nil {
+			t.Errorf("UpdateAccountProviderCustomerID: %v", err)
 		}
 	})
 

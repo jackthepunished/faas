@@ -65,24 +65,24 @@ func TestMemStoreCoverageStripeAndPaddleMissing(t *testing.T) {
 	if err := m.UpdateAccountStripeSubscriptionItem(ctx, account.ID, "si_x"); err != nil {
 		t.Fatal(err)
 	}
-	// UpdateAccountPaddleCustomerID — missing + remap.
-	if err := m.UpdateAccountPaddleCustomerID(ctx, "missing", "ctm_x"); !errors.Is(err, ErrNotFound) {
+	// UpdateAccountProviderCustomerID — missing + remap.
+	if err := m.UpdateAccountProviderCustomerID(ctx, "missing", "ctm_x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("paddle missing = %v", err)
 	}
-	if err := m.UpdateAccountPaddleCustomerID(ctx, account.ID, "ctm_1"); err != nil {
+	if err := m.UpdateAccountProviderCustomerID(ctx, account.ID, "ctm_1"); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := m.AccountByPaddleCustomerID(ctx, "ctm_1"); err != nil || got.ID != account.ID {
+	if got, err := m.AccountByProviderCustomerID(ctx, "ctm_1"); err != nil || got.ID != account.ID {
 		t.Fatalf("paddle lookup = %+v, %v", got, err)
 	}
 	// Remap: the old ctm_1 index entry must go.
-	if err := m.UpdateAccountPaddleCustomerID(ctx, account.ID, "ctm_2"); err != nil {
+	if err := m.UpdateAccountProviderCustomerID(ctx, account.ID, "ctm_2"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.AccountByPaddleCustomerID(ctx, "ctm_1"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.AccountByProviderCustomerID(ctx, "ctm_1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("paddle old still resolvable = %v", err)
 	}
-	if got, err := m.AccountByPaddleCustomerID(ctx, "ctm_2"); err != nil || got.ID != account.ID {
+	if got, err := m.AccountByProviderCustomerID(ctx, "ctm_2"); err != nil || got.ID != account.ID {
 		t.Fatalf("paddle new = %+v, %v", got, err)
 	}
 }

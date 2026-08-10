@@ -483,7 +483,7 @@ func TestChangePlan_PaddleCheckout_CreateCustomerSidecar(t *testing.T) {
 }
 
 // paddleStampErrStore wraps state.MemStore and lets a test inject a
-// synthetic error on UpdateAccountPaddleCustomerID. Used by
+// synthetic error on UpdateAccountProviderCustomerID. Used by
 // TestChangePlan_PaddleCheckout_StampFailureSurfacesOrphan — PR-P4
 // review finding #1 pins that the stamp-failure path must:
 //  1. return 503 (ErrCapacity "upgrade unavailable")
@@ -502,15 +502,15 @@ type paddleStampErrStore struct {
 	stampErr error
 }
 
-func (s *paddleStampErrStore) UpdateAccountPaddleCustomerID(ctx context.Context, accountID, paddleCustomerID string) error {
+func (s *paddleStampErrStore) UpdateAccountProviderCustomerID(ctx context.Context, accountID, paddleCustomerID string) error {
 	if s.stampErr != nil {
 		return s.stampErr
 	}
-	return s.MemStore.UpdateAccountPaddleCustomerID(ctx, accountID, paddleCustomerID)
+	return s.MemStore.UpdateAccountProviderCustomerID(ctx, accountID, paddleCustomerID)
 }
 
 // TestChangePlan_PaddleCheckout_StampFailureSurfacesOrphan (PR-P4
-// review finding #1). When UpdateAccountPaddleCustomerID fails after
+// review finding #1). When UpdateAccountProviderCustomerID fails after
 // CreateCustomer succeeded, the response is 503 + an `orphan_paddle_customer`
 // log line. The DB row's ProviderCustomerID stays empty (the sidecar
 // retry path is the known issue; compensation is deferred to PR-P5).
@@ -524,7 +524,7 @@ func TestChangePlan_PaddleCheckout_StampFailureSurfacesOrphan(t *testing.T) {
 	if _, err := store.CreateAPIKey(context.Background(), acct.ID, hash, "test", api.ScopesAdminOnly); err != nil {
 		t.Fatal(err)
 	}
-	// Wrap the store so UpdateAccountPaddleCustomerID returns a
+	// Wrap the store so UpdateAccountProviderCustomerID returns a
 	// synthetic error — the stamp path fails AFTER CreateCustomer
 	// succeeded (the orphan window).
 	wrap := &paddleStampErrStore{
@@ -590,7 +590,7 @@ func TestChangePlan_PaddleCheckout_NoDoubleCreate(t *testing.T) {
 	// Pre-stamp ProviderCustomerID so the sidecar guard is in
 	// the "already populated" branch from the first request.
 	acct := e.acct
-	if err := e.store.UpdateAccountPaddleCustomerID(context.Background(), acct.ID, "ctm_existing"); err != nil {
+	if err := e.store.UpdateAccountProviderCustomerID(context.Background(), acct.ID, "ctm_existing"); err != nil {
 		t.Fatal(err)
 	}
 	// Re-fetch so the handler's acct argument sees the stamp.

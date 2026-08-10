@@ -368,24 +368,13 @@ type Store interface {
 	// AccountByProviderCustomerID resolves an account from the Stripe customer
 	// ID. The webhook is the only caller; backed by an index in production
 	// (deferred). Returns ErrNotFound for unknown customers.
-	AccountByProviderCustomerID(ctx context.Context, stripeCustomerID string) (Account, error)
-	// UpdateAccountPaddleCustomerID records the Paddle `ctm_…` ID on the
-	// account row so the Paddle webhook can join. Mirrors
-	// UpdateAccountProviderCustomerID; the existing provider_customer_id
-	// column is reused per ADR-025 (the column name is on the
-	// documented stale-names list — the rename is a separate, smaller
-	// migration PR). Stripe cus_… and Paddle ctm_… values are
-	// disjoint prefixes so the shared column is safe in single-provider
-	// deployments (the FAAS_BILLING_PROVIDER selector is per-deployment,
-	// not per-row).
-	UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error
-	// AccountByPaddleCustomerID resolves an account from the Paddle
-	// customer ID. Same body as AccountByProviderCustomerID — the lookup
-	// is against the same column. Kept as a named entry (not a thin
-	// wrapper from the call sites) so the Paddle webhook code path
-	// reads self-documentingly and the column-rename PR can swap
-	// bodies without touching the call sites.
-	AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error)
+	//
+	// Also serves as the Paddle `ctm_…` reverse-lookup: the shared
+	// accounts.provider_customer_id column is reused per ADR-025, and
+	// Stripe cus_… / Paddle ctm_… values are disjoint prefixes so the
+	// shared column is safe in single-provider deployments (the
+	// FAAS_BILLING_PROVIDER selector is per-deployment, not per-row).
+	AccountByProviderCustomerID(ctx context.Context, providerCustomerID string) (Account, error)
 	// ListAllAccounts returns every account. meterd walks it on every
 	// quota tick and every Stripe push; on a one-box that's bounded
 	// (Free + Hobby + Pro + Scale test accounts + a handful of paid).

@@ -2868,15 +2868,15 @@ func TestMemStore_ListLatestInstancesForApp_BoundedLimit(t *testing.T) {
 	}
 }
 
-// TestAccountByPaddleCustomerID_Mirror asserts the Paddle mirror of
+// TestAccountByProviderCustomerID_Mirror asserts the Paddle mirror of
 // AccountByProviderCustomerID is a 1-line pass-through that reads from
 // the same reverse-lookup map (accounts.provider_customer_id is reused
 // per ADR-025). The test exercises the full write→read round-trip:
-// UpdateAccountPaddleCustomerID writes ctm_xyz, AccountByPaddleCustomerID
+// UpdateAccountProviderCustomerID writes ctm_xyz, AccountByProviderCustomerID
 // reads it back, and AccountByProviderCustomerID returns the same account
 // (the column is shared — the dedicated Paddle method name is just a
 // self-documenting alias for the same body).
-func TestAccountByPaddleCustomerID_Mirror(t *testing.T) {
+func TestAccountByProviderCustomerID_Mirror(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	m := NewMemStore()
@@ -2884,13 +2884,13 @@ func TestAccountByPaddleCustomerID_Mirror(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	if err := m.UpdateAccountPaddleCustomerID(ctx, acct.ID, "ctm_test_xyz"); err != nil {
-		t.Fatalf("UpdateAccountPaddleCustomerID: %v", err)
+	if err := m.UpdateAccountProviderCustomerID(ctx, acct.ID, "ctm_test_xyz"); err != nil {
+		t.Fatalf("UpdateAccountProviderCustomerID: %v", err)
 	}
 
-	got, err := m.AccountByPaddleCustomerID(ctx, "ctm_test_xyz")
+	got, err := m.AccountByProviderCustomerID(ctx, "ctm_test_xyz")
 	if err != nil {
-		t.Fatalf("AccountByPaddleCustomerID: %v", err)
+		t.Fatalf("AccountByProviderCustomerID: %v", err)
 	}
 	if got.ID != acct.ID {
 		t.Errorf("ID = %q, want %q", got.ID, acct.ID)
@@ -2913,7 +2913,7 @@ func TestAccountByPaddleCustomerID_Mirror(t *testing.T) {
 	// Unknown ID returns ErrNotFound — pins the negative case so a
 	// future refactor that aliases the bodies can't silently swallow
 	// it.
-	if _, err := m.AccountByPaddleCustomerID(ctx, "ctm_does_not_exist"); !errors.Is(err, ErrNotFound) {
+	if _, err := m.AccountByProviderCustomerID(ctx, "ctm_does_not_exist"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown id err = %v, want ErrNotFound", err)
 	}
 }

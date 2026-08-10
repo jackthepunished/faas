@@ -691,32 +691,6 @@ func (s *PgStore) AccountByProviderCustomerID(ctx context.Context, stripeCustome
 	return scanAccount(row)
 }
 
-// UpdateAccountPaddleCustomerID mirrors UpdateAccountProviderCustomerID
-// for the Paddle ctm_… ID. The accounts.provider_customer_id column is
-// reused (ADR-025 — column rename is a separate migration PR), so the
-// underlying UPDATE is identical; the dedicated method name keeps the
-// Paddle call sites self-documenting.
-func (s *PgStore) UpdateAccountPaddleCustomerID(ctx context.Context, id, paddleCustomerID string) error {
-	tag, err := s.pool.Exec(ctx,
-		`update accounts set provider_customer_id = $2 where id = $1`,
-		id, paddleCustomerID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// AccountByPaddleCustomerID is the reverse-lookup the Paddle webhook
-// uses to find the account behind a `customer_id` field. Same column
-// as the Stripe path (the rename is a separate PR per ADR-025); the
-// dedicated method name keeps the Paddle call sites self-documenting.
-func (s *PgStore) AccountByPaddleCustomerID(ctx context.Context, paddleCustomerID string) (Account, error) {
-	return s.AccountByProviderCustomerID(ctx, paddleCustomerID)
-}
-
 // ListAllAccounts returns every account. Meterd walks this on the quota
 // tick + hourly Stripe push; bounded by the customer count on the box.
 func (s *PgStore) ListAllAccounts(ctx context.Context) ([]Account, error) {

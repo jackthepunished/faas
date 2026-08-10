@@ -134,8 +134,8 @@ func TestPaddle_TransactionPaid_RestoresPastDueToActive(t *testing.T) {
 	if err := store.UpdateAccountStatus(ctx, acct.ID, state.AccountPastDue); err != nil {
 		t.Fatalf("UpdateAccountStatus: %v", err)
 	}
-	if err := store.UpdateAccountPaddleCustomerID(ctx, acct.ID, paddleTestCtmID); err != nil {
-		t.Fatalf("UpdateAccountPaddleCustomerID: %v", err)
+	if err := store.UpdateAccountProviderCustomerID(ctx, acct.ID, paddleTestCtmID); err != nil {
+		t.Fatalf("UpdateAccountProviderCustomerID: %v", err)
 	}
 
 	body := map[string]any{
@@ -191,8 +191,8 @@ func TestPaddle_TransactionPaymentFailed_FlipsActiveToPastDue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateAccount: %v", err)
 	}
-	if err := store.UpdateAccountPaddleCustomerID(ctx, acct.ID, paddleTestCtmID); err != nil {
-		t.Fatalf("UpdateAccountPaddleCustomerID: %v", err)
+	if err := store.UpdateAccountProviderCustomerID(ctx, acct.ID, paddleTestCtmID); err != nil {
+		t.Fatalf("UpdateAccountProviderCustomerID: %v", err)
 	}
 
 	body := map[string]any{

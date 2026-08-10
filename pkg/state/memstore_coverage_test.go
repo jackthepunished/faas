@@ -55,10 +55,10 @@ func TestMemStoreCoverageAccountsAndKeys(t *testing.T) {
 	if got, err := m.AccountByProviderCustomerID(ctx, "cus_coverage"); err != nil || got.ID != account.ID {
 		t.Fatalf("provider lookup = %+v, %v", got, err)
 	}
-	if err := m.UpdateAccountPaddleCustomerID(ctx, account.ID, "ctm_coverage"); err != nil {
+	if err := m.UpdateAccountProviderCustomerID(ctx, account.ID, "ctm_coverage"); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := m.AccountByPaddleCustomerID(ctx, "ctm_coverage"); err != nil || got.ID != account.ID {
+	if got, err := m.AccountByProviderCustomerID(ctx, "ctm_coverage"); err != nil || got.ID != account.ID {
 		t.Fatalf("paddle lookup = %+v, %v", got, err)
 	}
 	if _, err := m.APIKeyByHash(ctx, []byte("missing")); !errors.Is(err, ErrNotFound) {
