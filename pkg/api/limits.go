@@ -3184,3 +3184,23 @@ func BillableRAMMBWithSidecars(ramMB int, sidecarMBs []int) int {
 func (l Limits) IdleTimeoutBounds() (floor, ceiling int) {
 	return IdleTimeoutFloorSeconds, l.IdleTimeoutS * IdleTimeoutMaxMultiple
 }
+
+// Obs admin pagination (issue #777 / ADR-091). The operator surface
+// differs from the customer surface (pkg/api/paging.go defaults to
+// 25/100) because the operator UI is fleet-wide and a single page
+// often renders a region of the table at a glance. 200 is the
+// default; 500 is the hard cap; anything above is silently clamped
+// to the cap so a misconfigured operator client cannot OOM the apid
+// daemon. Documented in the ADR (§"Pagination caps are global
+// constants") so the operator-vs-customer divergence is explicit.
+const (
+	ObsAdminPaginationDefault = 200
+	ObsAdminPaginationMax     = 500
+
+	// ObsAdminWindowMaxHours bounds the ?since= window on time-series
+	// operator queries. 168h = 7d is the longest the operator can scan
+	// without breaking the read-amplification budget; longer windows
+	// are a deliberate future concern (anomaly detection moves to
+	// PromQL when the control plane goes multi-node, ADR-091 §6).
+	ObsAdminWindowMaxHours = 168
+)

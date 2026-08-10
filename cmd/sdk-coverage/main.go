@@ -62,6 +62,17 @@ var routeExclude = map[string]bool{
 	// coverage map.
 	"GET /v1/traces/{trace_id}": true,
 
+	// Issue #777 / ADR-091: operator observability backend. Same
+	// operator-only posture as /v1/compute-nodes — admin scope
+	// + FAAS_ADMIN_EMAILS allowlist. Mirror the exclusion across
+	// BOTH this list AND cmd/apid/spec_compliance_test.go::routeExclude;
+	// the two lists must move together.
+	"GET /v1/admin/obs/overview":                true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants":                 true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
+
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie
 	// is the browser-only auth artifact. These routes are 302
