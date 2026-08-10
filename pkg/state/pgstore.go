@@ -9765,13 +9765,24 @@ func (s *PgStore) PaddleOverageDedupeSchema(ctx context.Context) (PaddleOverageD
 	// FILTERs treat NULL as "neither pending nor completed" and
 	// exclude it from both totals. That's the right shape — the
 	// pre-flight reports what the meterd pusher sees.
-	if err := s.pool.QueryRow(ctx, `
-		select
-		  count(*) filter (where state = 'pending'),
-		  count(*) filter (where state = 'completed')
-		from paddle_overage_dedupe
-	`).Scan(&out.PendingRows, &out.CompletedRows); err != nil {
-		return out, fmt.Errorf("count paddle_overage_dedupe states: %w", err)
+	//
+	// Guard on out.HasState: with 00034 applied but 00041 not
+	// yet, the table exists but `state` does not, and the
+	// FILTER would 42703. The handler contract is "partial 00041
+	// surfaces the missing column hint", not a raw probe error
+	// — skip the count when the column isn't there yet. The
+	// schema-qualified FROM also matches the to_regclass probe
+	// above so a non-default search_path can't make the two
+	// probes disagree.
+	if out.HasState {
+		if err := s.pool.QueryRow(ctx, `
+			select
+			  count(*) filter (where state = 'pending'),
+			  count(*) filter (where state = 'completed')
+			from public.paddle_overage_dedupe
+		`).Scan(&out.PendingRows, &out.CompletedRows); err != nil {
+			return out, fmt.Errorf("count paddle_overage_dedupe states: %w", err)
+		}
 	}
 	return out, nil
 }
