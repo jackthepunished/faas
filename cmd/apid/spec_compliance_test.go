@@ -62,6 +62,17 @@ var routeExclude = map[string]bool{
 	"DELETE /v1/compute-nodes/{name}":         true, // operator-only
 	"GET /v1/compute-nodes/{name}/heartbeats": true, // CP-1: operator-only (heartbeat history; schedd-owned)
 	"GET /v1/compute-nodes/events":            true, // CP-1: operator-only SSE on compute_node_changed
+	// Issue #777 / ADR-091: operator observability backend.
+	// Mirror the operator-only exclusion across both this list
+	// AND cmd/sdk-coverage/main.go::routeExclude. The two lists
+	// must move together; the SDK does not model operator-only
+	// surfaces, and the public OpenAPI spec does not document
+	// them.
+	"GET /v1/admin/obs/overview":                true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants":                 true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
 	"GET /v1/events":                          true, // SSE (cookie+Bearer, not s.auth)
 	"GET /login":                              true, // dashboard magic-link GET (HTML form, browser-only)
 	"POST /logout":                            true, // dashboard logout (HTML form, browser-only)
