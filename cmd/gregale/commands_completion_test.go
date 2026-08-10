@@ -106,6 +106,7 @@ func TestCompletion_ManifestDrift(t *testing.T) {
 		"dispatchHostAge":           "host-age",
 		"dispatchBackup":            "backup",
 		"dispatchPKI":               "pki",
+		"dispatchSignup":            "signup",
 	}
 	caseNames, err := extractMainCaseArms(dispatchConsts)
 	if err != nil {

@@ -799,3 +799,84 @@ func TestStreamAppLogs_URLEscape(t *testing.T) {
 		t.Fatalf("zero-value path mismatch:\n got: %s\nwant: %s", seenZero, want)
 	}
 }
+
+// Issue #311 — programmatic auth surface sweep coverage. The
+// PostAuthSignup, PostAuthLogin, and PostAuthSignupMagicLink methods
+// round-trip the wire shape end-to-end through an httptest server.
+// Mirrors the pkg/api/client_method_sweep_test.go pattern. Method
+// names follow deriveMethodName (cmd/sdk-coverage/main.go).
+
+func TestSweep_PostAuthSignup(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/signup" {
+			t.Errorf("path = %q, want /v1/auth/signup", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"account_id":"acc_X","email":"alice@example.com","plan":"free","api_key":{"plaintext":"fp_live_abc123","prefix":"fp_live_","id":"key_01HXYZ"}}`)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "fp_test")
+	resp, err := c.PostAuthSignup(context.Background(), "alice@example.com", "correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("PostAuthSignup: %v", err)
+	}
+	if resp.AccountID != "acc_X" {
+		t.Errorf("account_id = %q, want acc_X", resp.AccountID)
+	}
+	if resp.APIKey.Plaintext != "fp_live_abc123" {
+		t.Errorf("api_key.plaintext = %q, want fp_live_abc123", resp.APIKey.Plaintext)
+	}
+	if resp.APIKey.Prefix != "fp_live_" {
+		t.Errorf("api_key.prefix = %q, want fp_live_", resp.APIKey.Prefix)
+	}
+}
+
+func TestSweep_PostAuthLogin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/login" {
+			t.Errorf("path = %q, want /v1/auth/login", r.URL.Path)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["email"] != "bob@example.com" {
+			t.Errorf("email = %v, want bob@example.com", body["email"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"account_id":"acc_Y","email":"bob@example.com","plan":"hobby","api_key":{"plaintext":"fp_live_def456","prefix":"fp_live_","id":"key_01HABC"}}`)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "fp_test")
+	resp, err := c.PostAuthLogin(context.Background(), "bob@example.com", "correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("PostAuthLogin: %v", err)
+	}
+	if resp.APIKey.ID != "key_01HABC" {
+		t.Errorf("api_key.id = %q, want key_01HABC", resp.APIKey.ID)
+	}
+}
+
+func TestSweep_PostAuthSignupMagicLink(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/auth/signup/magic-link" {
+			t.Errorf("path = %q, want /v1/auth/signup/magic-link", r.URL.Path)
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["email"] != "carol@example.com" {
+			t.Errorf("email = %v, want carol@example.com", body["email"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "fp_test")
+	if err := c.PostAuthSignupMagicLink(context.Background(), "carol@example.com"); err != nil {
+		t.Fatalf("PostAuthSignupMagicLink: %v", err)
+	}
+}

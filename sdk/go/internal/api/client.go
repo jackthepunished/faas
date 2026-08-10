@@ -733,6 +733,52 @@ func (c *Client) PasswordLogin(ctx context.Context, email, password string) (Pas
 		PasswordLoginRequest{Email: email, Password: password}, &out)
 }
 
+// PostAuthSignup is the JSON-only POST /v1/auth/signup. Returns
+// the ProgrammaticAuthResponse payload (mirrors PasswordSignup with
+// the api_key surfaced). The Gregale CLI uses this on the
+// `gregale signup` interactive path so the bearer-key token lands
+// in ~/.config/faas/auth.json without a dashboard round-trip.
+//
+// Method name follows deriveMethodName (cmd/sdk-coverage/main.go) —
+// POST + auth/signup → PostAuthSignup.
+//
+// The plaintext is returned ONCE; callers must persist it in the
+// same call frame.
+func (c *Client) PostAuthSignup(ctx context.Context, email, password string) (ProgrammaticAuthResponse, error) {
+	var out ProgrammaticAuthResponse
+	return out, c.do(ctx, "POST", "/v1/auth/signup",
+		PasswordSignupRequest{Email: email, Password: password}, &out)
+}
+
+// PostAuthLogin is the JSON-only POST /v1/auth/login. Same response
+// shape as PostAuthSignup so the CLI reuses a single unmarshaler.
+// Anti-enumeration posture mirrors /login: Argon2id pad on the
+// no-row branch, identical 401 on wrong-password vs unbound.
+//
+// Method name follows deriveMethodName — POST + auth/login →
+// PostAuthLogin.
+func (c *Client) PostAuthLogin(ctx context.Context, email, password string) (ProgrammaticAuthResponse, error) {
+	var out ProgrammaticAuthResponse
+	return out, c.do(ctx, "POST", "/v1/auth/login",
+		PasswordLoginRequest{Email: email, Password: password}, &out)
+}
+
+// PostAuthSignupMagicLink is the JSON-only POST
+// /v1/auth/signup/magic-link. The server always returns 200 with
+// the same body regardless of whether the email is bound, unbound,
+// malformed, or missing. The signup link is mailed via the
+// platform's mailer when the address is recognised (or could be
+// registered).
+//
+// Method name follows deriveMethodName — POST +
+// auth/signup/magic-link → PostAuthSignupMagic-link (the dash
+// survives because deriveMethodName only title-cases the first byte
+// of each segment).
+func (c *Client) PostAuthSignupMagicLink(ctx context.Context, email string) error {
+	return c.do(ctx, "POST", "/v1/auth/signup/magic-link",
+		MagicLinkSignupRequest{Email: email}, nil)
+}
+
 // RequestPasswordReset mints a password-reset email. The server
 // always returns 200 with an identical body regardless of whether the
 // email is bound to an account, so the surface does not leak account

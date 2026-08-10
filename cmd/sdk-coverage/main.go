@@ -268,6 +268,22 @@ var methodRouteMap = map[string]string{
 	"POST /v1/projects/scan": "ScanProject",
 	"POST /v1/projects":      "ApplyProjectPlan",
 
+	// Issue #311 — gregale signup split from login (PR #786). The
+	// programmatic-auth surface is JSON-only and orthogonal to the
+	// cookie-auth /login /signup dashboard routes (which are
+	// pin-mapped to PasswordLogin / PasswordSignup further up).
+	// The auto-derivation would produce PostAuthSignup / PostAuthLogin
+	// (matches the SDK) but a literal-hyphen
+	// "PostAuthSignupMagic-link" for the magic-link route — Go method
+	// names can't carry hyphens, so the SDK normalises it to
+	// PostAuthSignupMagicLink. Pin all three so the gate stays the
+	// SDK's source of truth on verb choice (same convention as the
+	// audit-events / registry-credentials / paddle-catalog patterns
+	// above).
+	"POST /v1/auth/signup":            "PostAuthSignup",
+	"POST /v1/auth/login":             "PostAuthLogin",
+	"POST /v1/auth/signup/magic-link": "PostAuthSignupMagicLink",
+
 	// PR-P3 — operator billing surface (issue #279 / ADR-049 + ADR-050).
 	// The auto-derivation produces names with literal hyphens
 	// (e.g. "GetAdminBilling-paddle-catalog") because the spec paths

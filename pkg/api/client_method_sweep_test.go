@@ -385,3 +385,44 @@ func TestSweep_DoMarshalFailure(t *testing.T) {
 		t.Errorf("err = %v, want marshal error", err)
 	}
 }
+
+// Issue #311 — programmatic auth sweep coverage. The three new
+// client methods round-trip the wire shape end-to-end through an
+// httptest server.
+func TestSweep_PostV1AuthSignup(t *testing.T) {
+	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_X","email":"alice@example.com","plan":"free","api_key":{"plaintext":"fp_live_abc123","prefix":"fp_live_","id":"key_01HXYZ"}}`)
+	c := NewClient(srv.URL, "fp_test")
+	resp, err := c.PostAuthSignup(context.Background(), "alice@example.com", "correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if resp.AccountID != "acc_X" {
+		t.Errorf("account_id = %q, want acc_X", resp.AccountID)
+	}
+	if resp.APIKey.Plaintext != "fp_live_abc123" {
+		t.Errorf("api_key.plaintext = %q, want fp_live_abc123", resp.APIKey.Plaintext)
+	}
+}
+
+func TestSweep_PostV1AuthLogin(t *testing.T) {
+	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_Y","email":"bob@example.com","plan":"hobby","api_key":{"plaintext":"fp_live_def456","prefix":"fp_live_","id":"key_01HABC"}}`)
+	c := NewClient(srv.URL, "fp_test")
+	resp, err := c.PostAuthLogin(context.Background(), "bob@example.com", "correct-horse-battery-staple")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if resp.APIKey.ID != "key_01HABC" {
+		t.Errorf("api_key.id = %q, want key_01HABC", resp.APIKey.ID)
+	}
+}
+
+func TestSweep_PostV1AuthSignupMagicLink(t *testing.T) {
+	srv, _ := newSweepServer(t, 200, `{}`)
+	c := NewClient(srv.URL, "fp_test")
+	if err := c.PostAuthSignupMagicLink(context.Background(), "carol@example.com"); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// (unused — keep json import alive for the r/t field below)
+var _ = json.Unmarshal

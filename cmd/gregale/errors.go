@@ -43,6 +43,8 @@ var errorDocsURL = map[string]string{
 	api.CodeBillingPastDue:             docsURLPrefix + "/billing",
 	api.CodeCapacity:                   docsURLPrefix + "/capacity",
 	api.CodeUnauthorized:               docsURLPrefix + "/auth",
+	api.CodePasswordTooWeak:            docsURLPrefix + "/auth/password",
+	api.CodeInvalidCredentials:         docsURLPrefix + "/auth/login",
 	api.CodeNotFound:                   docsURLPrefix + "/not-found",
 	api.CodeValidation:                 docsURLPrefix + "/validation",
 	api.CodeConflict:                   docsURLPrefix + "/conflict",

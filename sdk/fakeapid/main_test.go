@@ -89,6 +89,94 @@ func TestAccount_OK(t *testing.T) {
 	}
 }
 
+// Issue #311 — programmatic auth surface fixtures. The Gregale CLI
+// uses these endpoints on the `gregale signup` interactive path. The
+// fakeapid returns the canonical ProgrammaticAuthResponse shape so
+// the CLI exercises the full unmarshaler + saveToken() path against
+// the fixture. The plaintext is suffixed with the route so a test
+// can assert which route was hit.
+func TestV1AuthSignup_FixtureReturnsProgrammaticAuthResponse(t *testing.T) {
+	srv := newServer(t)
+	resp, err := http.Post(srv.URL+"/v1/auth/signup", "application/json",
+		strings.NewReader(`{"email":"alice@example.com","password":"correct-horse-battery-staple"}`))
+	if err != nil {
+		t.Fatalf("POST /v1/auth/signup: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, k := range []string{"account_id", "plan", "api_key"} {
+		if _, ok := body[k]; !ok {
+			t.Errorf("missing ProgrammaticAuthResponse field %q: %+v", k, body)
+		}
+	}
+	apiKey, ok := body["api_key"].(map[string]any)
+	if !ok {
+		t.Fatalf("api_key not an object: %+v", body["api_key"])
+	}
+	for _, k := range []string{"plaintext", "prefix", "id"} {
+		if _, ok := apiKey[k]; !ok {
+			t.Errorf("missing ProgrammaticAPIKey field %q: %+v", k, apiKey)
+		}
+	}
+	plaintext, _ := apiKey["plaintext"].(string)
+	if !strings.HasSuffix(plaintext, "_signup") {
+		t.Errorf("api_key.plaintext = %q, want suffix \"_signup\"", plaintext)
+	}
+}
+
+func TestV1AuthLogin_FixtureReturnsProgrammaticAuthResponse(t *testing.T) {
+	srv := newServer(t)
+	resp, err := http.Post(srv.URL+"/v1/auth/login", "application/json",
+		strings.NewReader(`{"email":"alice@example.com","password":"correct-horse-battery-staple"}`))
+	if err != nil {
+		t.Fatalf("POST /v1/auth/login: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	apiKey, ok := body["api_key"].(map[string]any)
+	if !ok {
+		t.Fatalf("api_key not an object: %+v", body["api_key"])
+	}
+	plaintext, _ := apiKey["plaintext"].(string)
+	if !strings.HasSuffix(plaintext, "_login") {
+		t.Errorf("api_key.plaintext = %q, want suffix \"_login\"", plaintext)
+	}
+}
+
+func TestV1AuthSignupMagicLink_AlwaysReturns200OK(t *testing.T) {
+	srv := newServer(t)
+	// Every input — well-formed, malformed, missing — returns 200
+	// with the same body. Anti-enumeration closure.
+	for _, body := range []string{
+		`{"email":"alice@example.com"}`,
+		`{"email":"not-an-email"}`,
+		`{}`,
+		``,
+	} {
+		resp, err := http.Post(srv.URL+"/v1/auth/signup/magic-link", "application/json",
+			strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/auth/signup/magic-link body=%q: %v", body, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("body=%q status: got %d, want 200", body, resp.StatusCode)
+		}
+	}
+}
+
 // TestListApps_OK: GET /v1/apps returns an array of AppResponse.
 func TestListApps_OK(t *testing.T) {
 	srv := newServer(t)
