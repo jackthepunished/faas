@@ -1,0 +1,229 @@
+// Operator observability backend DTOs (issue #777 / ADR-091).
+//
+// Every type in this file is wire shape for /v1/admin/obs/* — the
+// operator surface that lets the platform owner answer "do I have
+// any users" and "what is happening" without per-account scope.
+// The surface is operator-only (admin scope + FAAS_ADMIN_EMAILS
+// allowlist) and deliberately excluded from the public OpenAPI
+// spec; a frontend agent builds against the wire contract here
+// rather than the SDK.
+//
+// Sensitive-field policy (ADR-091 §3, PII redaction by default):
+//   - Email never appears on the default list/detail path.
+//   - ?include_pii=1 is the only opt-in, and it emits a pii.accessed
+//     audit row in the handler.
+//   - No projection ever carries sealed-blob MFA fields, hashed
+//     passwords, hashed tokens, sealed webhook secrets, sealed env
+//     secrets, or jail internals (netns, guest_uid, host_ip,
+//     lease_token). The handlers in cmd/apid/handlers_admin_obs.go
+//     carry the projection helpers; the spec_compliance_test grep
+//     tests pin the omissions in handlers_admin_obs_security_test.go.
+//
+// Pinned in ADR-091 §"Pagination caps are global constants": the
+// default page size is 200, hard cap 500 (ObsAdminPaginationDefault /
+// ObsAdminPaginationMax). The list responses always carry a
+// non-nil Items slice so the JSON shape is stable.
+package api
+
+import "time"
+
+// ObsOverviewResponse is the body of GET /v1/admin/obs/overview.
+// A single-object response (not a list) because the overview is a
+// KPI bundle, not a paginated collection. GeneratedAt is the
+// server-side clock at handler entry; a frontend can display
+// "snapshot at HH:MM" without parsing log timestamps.
+type ObsOverviewResponse struct {
+	GeneratedAt               time.Time                `json:"generated_at"`
+	Totals                    ObsOverviewTotals        `json:"totals"`
+	TopRateLimitedAccounts24h []ObsOverviewRateLimited `json:"top_rate_limited_accounts_24h"`
+	NodeHealth                []ObsOverviewNodeHealth  `json:"node_health"`
+	RecentFailures1h          []ObsOverviewFailureKind `json:"recent_failures_1h"`
+}
+
+// ObsOverviewTotals is the headline KPI block. The numbers are
+// point-in-time counts derived from existing store methods; nothing
+// here is sampled, weighted, or extrapolated. The cardinality is
+// intentionally small (10 fields) so a frontend dashboard tile
+// renders without scrolling.
+type ObsOverviewTotals struct {
+	AccountsActive    int `json:"accounts_active"`
+	AccountsPastDue   int `json:"accounts_past_due"`
+	AccountsSuspended int `json:"accounts_suspended"`
+	OrgsTotal         int `json:"orgs_total"`
+	AppsTotal         int `json:"apps_total"`
+	InstancesLive     int `json:"instances_live"`
+	InstancesWaking   int `json:"instances_waking"`
+	NodesActive       int `json:"nodes_active"`
+	NodesInactive     int `json:"nodes_inactive"`
+	AuditEvents24h    int `json:"audit_events_24h"`
+}
+
+// ObsOverviewRateLimited is one row of the top-N rate-limited
+// accounts tile on the overview. AccountID is a UUID string;
+// Hits is the count over the 24h window. Cap of 5 entries is
+// pinned in the handler (ADR-091 §"Label cardinality" — the top-N
+// is bounded so a future Prometheus gauge can't blow up label
+// cardinality if this view is scraped).
+type ObsOverviewRateLimited struct {
+	AccountID string `json:"account_id"`
+	Hits      int    `json:"hits"`
+}
+
+// ObsOverviewNodeHealth is the per-node health summary on the
+// overview. Stale is true when LastHeartbeatAt is older than the
+// schedd staleness threshold (typically 60s); the operator UI
+// renders it as a yellow chip so a node that's down shows
+// visually distinct from one that's freshly heartbeating.
+type ObsOverviewNodeHealth struct {
+	Name            string    `json:"name"`
+	Active          bool      `json:"active"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at,omitempty"`
+	Stale           bool      `json:"stale"`
+}
+
+// ObsOverviewFailureKind is the failure-bucket rollup. The handler
+// scans the audit_log table over a 1h window and groups by kind;
+// anything past the top-5 (per ADR-091 §"Label cardinality")
+// aggregates to a single "other" row.
+type ObsOverviewFailureKind struct {
+	Kind  string `json:"kind"`
+	Count int    `json:"count"`
+}
+
+// ObsTenantRow is one row of the GET /v1/admin/obs/tenants
+// response. PII redaction is enforced at the projection helper:
+// Email is the empty string by default and populated only when
+// the caller passed ?include_pii=1 (which also emits a
+// pii.accessed audit row per ADR-091 §3).
+//
+// The *Count fields are pre-aggregated in the handler so the
+// frontend does not need a second round-trip to render the
+// dashboard tile. Cursor pagination is via NextCursor in the
+// outer response.
+type ObsTenantRow struct {
+	AccountID            string    `json:"account_id"`
+	Plan                 string    `json:"plan"`
+	Status               string    `json:"status"`
+	OrgSlug              string    `json:"org_slug,omitempty"`
+	IsPersonal           bool      `json:"is_personal"`
+	CreatedAt            time.Time `json:"created_at"`
+	MFAEnrolled          bool      `json:"mfa_enrolled"`
+	AppsCount            int       `json:"apps_count"`
+	DeploymentsLiveCount int       `json:"deployments_live_count"`
+
+	// Email is omitted on the default path. Wire-shape stays
+	// consistent (a present-but-empty string) so a frontend can
+	// branch on the field's presence; the projection helper
+	// returns "" by default.
+	Email string `json:"email,omitempty"`
+}
+
+// ObsTenantListResponse is the body of GET /v1/admin/obs/tenants.
+// Cursor pagination follows the rest of the API (cmd/apid/
+// handlers_account_scoped.go:54-82 pattern): NextCursor is the
+// empty string when there are no more pages; Items is always
+// non-nil.
+type ObsTenantListResponse struct {
+	Items      []ObsTenantRow `json:"items"`
+	NextCursor string         `json:"next_cursor"`
+	Limit      int            `json:"limit"`
+}
+
+// ObsTenantDetailResponse is the body of GET /v1/admin/obs/tenants/{id}.
+// Account mirrors ObsTenantRow (minus the *_count fields, which
+// move up to the top level for the detail view); Apps, Orgs,
+// APIKeys, Sessions are per-tenant roll-ups so a single fetch
+// renders the per-tenant drawer.
+type ObsTenantDetailResponse struct {
+	Account  ObsTenantRow    `json:"account"`
+	Apps     []ObsTenantApp  `json:"apps"`
+	Orgs     []ObsTenantOrg  `json:"orgs"`
+	APIKeys  ObsTenantCounts `json:"api_keys"`
+	Sessions ObsTenantCounts `json:"sessions"`
+}
+
+// ObsTenantApp is a single app row in the tenant detail view.
+// Status is the app state (active|evicted_cold|deleted_*) and
+// Deployments is the count of non-deleted deployments. The
+// handler pre-aggregates so the frontend renders the drawer
+// without a second round-trip.
+type ObsTenantApp struct {
+	ID          string `json:"id"`
+	Slug        string `json:"slug"`
+	Status      string `json:"status"`
+	Deployments int    `json:"deployments"`
+}
+
+// ObsTenantOrg is a single org row in the tenant detail view.
+// Role is the account's role in the org (owner|admin|developer|
+// viewer|billing) per ADR-061.
+type ObsTenantOrg struct {
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	Role string `json:"role"`
+}
+
+// ObsTenantCounts is the per-tenant counter pair. Used twice in
+// ObsTenantDetailResponse (api_keys, sessions).
+type ObsTenantCounts struct {
+	Active  int `json:"active"`
+	Revoked int `json:"revoked"`
+}
+
+// ObsNodeRow is one row of GET /v1/admin/obs/nodes. Mirrors the
+// computeNodeResponse shape (cmd/apid/compute_nodes.go:107) so the
+// existing operator tooling can switch over with no client
+// changes; the only addition is LastHeartbeatAt omitempty for
+// never-heartbeated nodes.
+type ObsNodeRow struct {
+	ID                 string    `json:"id"`
+	Name               string    `json:"name"`
+	Active             bool      `json:"active"`
+	VPCPUs             int       `json:"vpcpus"`
+	MemMB              int       `json:"mem_mb"`
+	MaxConcurrency     int       `json:"max_concurrency"`
+	AdmissionCeilingMB int       `json:"admission_ceiling_mb"`
+	OverlayIP          string    `json:"overlay_ip,omitempty"`
+	LastHeartbeatAt    time.Time `json:"last_heartbeat_at,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+// ObsNodeListResponse is the body of GET /v1/admin/obs/nodes.
+// Cursor pagination is present on the obs surface even though
+// /v1/compute-nodes today returns a flat array; the obs surface
+// is the long-term canonical and the new contract is what the
+// operator UI builds against.
+type ObsNodeListResponse struct {
+	Items      []ObsNodeRow `json:"items"`
+	NextCursor string       `json:"next_cursor"`
+	Limit      int          `json:"limit"`
+}
+
+// ObsHeartbeatListResponse is the body of GET /v1/admin/obs/nodes/{name}/heartbeats.
+// The window defaults to 30m (handler), hard cap 24h
+// (ObsAdminWindowMaxHours). SinceClamped is true when the
+// caller passed a ?since= older than the hard cap and the
+// handler clamped it; the frontend can show "clamped to 24h"
+// so the operator knows they are not seeing the full history.
+type ObsHeartbeatListResponse struct {
+	NodeID       string            `json:"node_id"`
+	Name         string            `json:"name"`
+	Since        time.Time         `json:"since"`
+	SinceClamped bool              `json:"since_clamped"`
+	Heartbeats   []ObsHeartbeatRow `json:"heartbeats"`
+	Limit        int               `json:"limit"`
+}
+
+// ObsHeartbeatRow is one row of the heartbeat list. The fields
+// mirror the existing compute_node_heartbeats table; GapToPrevious
+// is the millisecond gap from the prior row (handler-computed)
+// so the operator can spot dropped heartbeats without scanning
+// the raw timestamps.
+type ObsHeartbeatRow struct {
+	ReceivedAt      time.Time `json:"received_at"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+	Source          string    `json:"source"`
+	GapToPreviousMs int64     `json:"gap_to_previous_ms"`
+	Missed          bool      `json:"missed"`
+	Stale           bool      `json:"stale"`
+}

@@ -232,6 +232,7 @@ var cliCommands = []cliCommand{
 			{Name: "info", Short: "Show one cron rule"},
 			{Name: "update", Short: "Update one cron rule"},
 			{Name: "rm", Short: "Delete one cron rule"},
+			{Name: "runs", Short: "Show execution history"},
 		},
 	},
 	{

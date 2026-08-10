@@ -982,6 +982,28 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/billing-reconcile/{id}",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.reconcileAccount)))
 
+	// Operator observability backend (issue #777 / ADR-091). The
+	// /v1/admin/obs/* surface gives the platform owner read-only
+	// visibility into fleet state (users, apps, nodes, heartbeats).
+	// Same two-layer gate as the rest of /v1/admin/* (admin scope
+	// + email allowlist, the second enforced inside each handler
+	// via s.adminAllows), plus MFA — the obs view exposes
+	// secret-adjacent metadata (MFA enrollment, account email) and
+	// the cost is a one-time TOTP per 24h session thanks to
+	// step-up elsewhere (ADR-091 §"Two-layer gate confirmed").
+	// All five routes are GETs; no s.idempotent wrapper needed
+	// (matches /v1/compute-nodes read precedent).
+	mux.HandleFunc("GET /v1/admin/obs/overview",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsOverview))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListTenants))))
+	mux.HandleFunc("GET /v1/admin/obs/tenants/{id}",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsGetTenant))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsListNodes))))
+	mux.HandleFunc("GET /v1/admin/obs/nodes/{name}/heartbeats",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.obsNodeHeartbeats))))
+
 	// IAM-4 (ADR-035) — auth audit log surface. Read-only; the
 	// events table is append-only (spec §5). Scope gating: session
 	// cookie (implicitly admin) or any API key carrying {admin,

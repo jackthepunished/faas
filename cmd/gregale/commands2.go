@@ -29,6 +29,7 @@ const (
 	subAdd    = "add"
 	subUpdate = "update"
 	subRm     = "rm"
+	subRuns   = "runs"
 	// subRotate is reused across every resource's `… rotate …`
 	// subcommand literal (host-age, keys, pki, secrets, sign-keys,
 	// node-key, etc.) so goconst stops flagging the repeated
@@ -36,7 +37,7 @@ const (
 	// switches in commands2/3.go. Per-resource dispatch sites that
 	// want stronger typing keep their own name-spaced const
 	// (subHostAgeRotate / subPKIRotate / etc.).
-	subRotate  = "rotate"
+	subRotate = "rotate"
 	subSummary = "summary"
 	// subLogsTail is the inner-subcommand name for `gregale logs
 	// tail <slug>` (issue #315 / tier-2 DX). Lifted from the
@@ -1236,7 +1237,7 @@ func cmdDomains(args []string) int {
 func cmdCrons(args []string) int {
 	parent, _ := lookupCliCommand("crons")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale crons <list|add|update|rm> [args]", "crons")
+		PrintUsage(os.Stderr, "usage: gregale crons <list|add|update|rm|runs> [args]", "crons")
 		return 1
 	}
 	switch args[0] {
@@ -1295,6 +1296,8 @@ func cmdCrons(args []string) int {
 		return 0
 	case subUpdate:
 		return cmdCronsUpdate(args[1:])
+	case subRuns:
+		return cmdCronsRuns(args[1:])
 	case subRm:
 		if len(args) != 2 {
 			PrintUsage(os.Stderr, "usage: gregale crons rm <id>", "crons")
