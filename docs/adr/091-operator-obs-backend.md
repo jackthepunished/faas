@@ -4,7 +4,7 @@
 - Date: 2026-08-10
 - Scope: `apid` HTTP surface, `pkg/api/limits.go`, `cmd/apid/server.go`,
   `cmd/sdk-coverage/main.go`, `cmd/apid/spec_compliance_test.go`,
-  `migrations/00174_admin_obs_index.sql`.
+  `migrations/00190_admin_obs_index.sql`.
 
 ## 1. Context
 
@@ -212,7 +212,7 @@ Adding a new sealed column to `state.Account` MUST add a marker to
 the grep list and the test will fail until the projection helper
 learns to omit the new column.
 
-## 5. SQL — `migrations/00174_admin_obs_index.sql`
+## 5. SQL — `migrations/00190_admin_obs_index.sql`
 
 ```sql
 -- +goose Up
@@ -362,7 +362,7 @@ default 200, cap 2000.
   in this ADR; cap pinned in `pkg/api/limits.go`.
 - `routeExclude` lists drift apart. PR description must call out
   "two-list sync" as a checklist item.
-- Migration slot 00174: verify no parallel PR is in flight; otherwise
+- Migration slot 00190: verify no parallel PR is in flight; otherwise
   drop a fence per `041-migration-slot-reservation.md`.
 - `/v1/compute-nodes*` and `/v1/admin/obs/nodes*` co-exist for one
   release; PR #3 marks the older path with `Deprecation`, then 410

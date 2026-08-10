@@ -1,4 +1,4 @@
--- filename: 00174_admin_obs_index.sql
+-- filename: 00190_admin_obs_index.sql
 -- +goose Up
 -- +goose StatementBegin
 -- Issue #777 / ADR-091: the operator observability backend at
@@ -11,11 +11,11 @@
 -- partial indexes now while the table is small; a future PR-A
 -- (multi-host) ships without a perf regression on the obs surface.
 --
--- Slot 174 is the next free slot on origin/main. Slots 168 through
--- 172 are reserved by sibling PRs we cannot disturb (per ADR-041 /
--- migration-slot-renumber-at-pr-creation memory), and 173 is taken
--- by invocations_outcome — confirm with `git fetch origin main;
--- git ls-tree origin/main migrations | tail` before opening this PR.
+-- Slot 190 is the next free slot. Origin/main tops out at 173
+-- (in vocations_outcome) with reservations 168-172; the pre-merge
+-- cross-PR gate on PRs #797 / #800 also flags slots in that band,
+-- so we leapfrog to 190. Confirm with `git fetch origin main;
+-- git ls-tree origin/main migrations | tail` before opening.
 --
 -- Replay-safe (ADR-041): CREATE INDEX IF NOT EXISTS is idempotent
 -- in Postgres; rolling forward re-applies cleanly.
