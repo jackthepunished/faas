@@ -205,23 +205,6 @@ func isApidLogsPath(p string) bool {
 	return tail == "/logs" || strings.HasPrefix(tail, "/logs/")
 }
 
-// hasApidPrefix reports whether p begins with prefix anchored at
-// the trailing slash — p matches if it is exactly prefix, or
-// prefix followed by "/", or prefix followed by "/" and then more
-// path. This prevents accidental shadowing like "/v1.zip" matching
-// "/v1" — review finding #6 from the dashboard era.
-//
-// DEPRECATED: the live predicate is now `apid.IsApidPath` (see
-// `pkg/apid/router.go`); this wrapper is preserved only for any
-// future local matcher that wants to share the same anti-shadowing
-// discipline. New code MUST call `apid.IsApidPath` directly.
-func hasApidPrefix(p, prefix string) bool {
-	if p == prefix || p == prefix+"/" {
-		return true
-	}
-	return strings.HasPrefix(p, prefix+"/")
-}
-
 // isApidPath returns true for the prefixes gatewayd forwards to
 // apid. Keep the list exhaustive for the apid public surface
 // (issue #85) — anything outside falls through to the wake/proxy
