@@ -426,8 +426,14 @@ type PasswordSignupRequest struct {
 // POST /v1/auth/{signup,login} pair (issue #311). Distinct from
 // PasswordLoginResponse: this one carries the api_key payload so the
 // bearer-key CLI can use the result without a dashboard round-trip.
+//
+// Email is echoed back so SDK callers can render "Logged in as
+// <email>" without an extra Whoami round-trip. Mirrors pkg/api's
+// ProgrammaticAuthResponse — drift fix tracked in PR #793
+// (pre-existing from PR #786).
 type ProgrammaticAuthResponse struct {
 	AccountID string             `json:"account_id"`
+	Email     string             `json:"email"`
 	Plan      string             `json:"plan"`
 	APIKey    ProgrammaticAPIKey `json:"api_key"`
 }
