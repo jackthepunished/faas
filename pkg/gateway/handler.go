@@ -460,6 +460,36 @@ type Handler struct {
 	// (cmd/gatewayd-internal/main.go → secretbox.MultiOpen
 	// → publicAuthUnsealer closure).
 	publicAuthUnsealer PublicAuthUnsealer
+
+	// edgeRules (ADR-089 / issue #561 PR 3) is the
+	// per-host LRU-backed matcher consulted between the
+	// apps-suffix gate and Backend.Lookup in ServeHTTP.
+	// nil = matcher disabled (default; pre-PR-3 behaviour).
+	// Production wires it from cmd/gatewayd-internal/edge_rules.go
+	// via WithEdgeRules so unit tests + the e2e harness can
+	// opt out without touching the gate. The matcher
+	// substitutes the gateway.App end-to-end on a `kind=route`
+	// hit — downstream RequireAuthn / PublicAuth / wake gate /
+	// proxy all see the *target* app's context, not the
+	// inbound host's (auth remains per-app).
+	edgeRules EdgeRuleMatcher
+	// resolveTargetApp is the closure the matcher uses to
+	// swap the gateway.App when a `kind=route` rule fires.
+	// It returns (App{}, false) when the slug is not found
+	// or the target is cross-account — the matcher emits
+	// `edge_rule.route_blocked` audit + `outcome=blocked`
+	// metric in that case. nil = same as edgeRules==nil
+	// (matcher disabled; pre-PR-3 behaviour preserved).
+	resolveTargetApp ResolveTargetApp
+	// edgeRuleAudit emits the `edge_rule.route_matched` /
+	// `edge_rule.route_blocked` audit rows when a kind=route
+	// rule fires (PR 3 only; PR 4-7 extend the kind set).
+	// nil = audit-disabled (unit tests). Production wires
+	// the gatewaydAuditor thin wrapper from
+	// cmd/gatewayd-internal/edge_rules.go so the rows land
+	// in the same events table every other gatewayd-scope
+	// row uses.
+	edgeRuleAudit EdgeRuleAuditor
 }
 
 // emptyAccountWarned is the process-wide trip flag for
@@ -607,6 +637,29 @@ func (h *Handler) WithRequireAuthn(authn RequireAuthnAuthenticator, audit Requir
 	return h
 }
 
+// WithEdgeRules (ADR-089 / issue #561 PR 3) arms the
+// per-host edge-rule matcher. matcher may be nil (matcher
+// disabled; pre-PR-3 behaviour preserved for unit tests +
+// the e2e harness). resolve may be nil when matcher is
+// nil; when matcher is non-nil resolve MUST be non-nil —
+// production wires the AppBySlug closure from
+// cmd/gatewayd-internal/run.go so the same-account check
+// at matchAndSubstituteRoute sees a real AccountID on
+// every target App. audit may be nil (audit-disabled
+// mode); the matcher still substitutes the App but the
+// `edge_rule.route_matched` / `edge_rule.route_blocked`
+// rows are dropped (mirrors WithRequireAuthn's
+// `audit may be nil` shape).
+//
+// Returns *Handler for fluent chaining (same shape as
+// every other Handler.With*).
+func (h *Handler) WithEdgeRules(matcher EdgeRuleMatcher, resolve ResolveTargetApp, audit EdgeRuleAuditor) *Handler {
+	h.edgeRules = matcher
+	h.resolveTargetApp = resolve
+	h.edgeRuleAudit = audit
+	return h
+}
+
 // WithPublicAuth (issue #477 / ADR-079) arms the per-app
 // public-URL auth gate. cache may be nil (no caching; the
 // basic-auth path unseals per-request, slower but correct).
@@ -743,6 +796,95 @@ func (h *Handler) emitAuthnAudit(r *http.Request, app App, subject *string, kind
 		return
 	}
 	h.requireAuthnAudit.Emit(r.Context(), kind, subject, data)
+}
+
+// matchAndSubstituteRoute (ADR-089 / issue #561 PR 3) consults
+// the per-host edge-rule matcher BEFORE Backend.Lookup. On a
+// `kind=route` hit, *app is overwritten with the target App
+// (already populated with the same-account check) and returns
+// true. The caller (`ServeHTTP`) skips Backend.Lookup and
+// jumps straight to `haveApp` so downstream RequireAuthn /
+// PublicAuth / wake gate / proxy all see the *target* app's
+// context (auth remains per-app).
+//
+// Returns false when:
+//
+//   - the matcher is nil (pre-PR-3 behaviour preserved; unit
+//     tests + the e2e harness wire nil and expect the legacy
+//     host→app lookup)
+//   - the matcher returned nil (no rule whose host, path,
+//     method matched)
+//   - the same-account check failed (rule.AccountID !=
+//     targetApp.AccountID): emits `edge_rule.route_blocked`
+//     audit + `outcome=blocked` metric, then SILENTLY falls
+//     through. The customer-facing response is the same 404
+//     as a clean miss so a malicious actor can't probe for
+//     cross-account targets via timing or response shape.
+//   - the target app was deleted (AppBySlug 404): the cache
+//     is advisory; a stale read only widens the hit window.
+//     We do NOT emit audit/metric for a transient miss —
+//     the next request will hit the loader and the rule
+//     is naturally dropped once its app row is gone.
+//
+// Nil-safe: h.edgeRules == nil OR h.resolveTargetApp == nil
+// returns false and ServeHTTP proceeds with the legacy
+// Backend.Lookup. Extracted from ServeHTTP to keep the
+// handler cap under 50 lines.
+func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
+	if h.edgeRules == nil || h.resolveTargetApp == nil {
+		return false
+	}
+	rule := h.edgeRules.MatchRoute(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	if rule == nil {
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("route", "miss")
+		}
+		return false
+	}
+	target, ok := h.resolveTargetApp(r.Context(), rule.TargetAppSlug)
+	if !ok {
+		// Transient — the target app row was deleted (or
+		// pending, or the slug was never on this box).
+		// Silent fall-through; next request re-resolves.
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("route", "miss")
+		}
+		return false
+	}
+	if target.AccountID != rule.AccountID {
+		// Defense-in-depth on top of the apid create-time
+		// same-account guarantee at
+		// cmd/apid/handlers_edge_rules.go:184-201. Emits
+		// the blocked audit + metric; the customer sees
+		// the same 404 as a clean miss.
+		if h.edgeRuleAudit != nil {
+			h.edgeRuleAudit.Emit(r.Context(), "edge_rule.route_blocked", &target.AccountID, map[string]any{
+				"rule_id":         rule.ID,
+				"from_host":       r.Host,
+				"to_slug":         rule.TargetAppSlug,
+				"rule_account_id": rule.AccountID,
+				"target_app_id":   target.ID,
+			})
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveEdgeRuleMatch("route", "blocked")
+		}
+		return false
+	}
+	// Happy path: audit + metric, then substitute.
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.route_matched", nil, map[string]any{
+			"rule_id":   rule.ID,
+			"from_host": r.Host,
+			"to_slug":   rule.TargetAppSlug,
+			"app_id":    target.ID,
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch("route", "match")
+	}
+	*app = target
+	return true
 }
 
 // bearerTokenFromHeader is the per-deployment authz branch's
@@ -1448,13 +1590,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	app, ok := h.backend.Lookup(r.Context(), appHost) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+	// Issue #561 / ADR-089 PR 3 — consult the per-host
+	// edge-rule matcher BEFORE Backend.Lookup. On a
+	// `kind=route` hit the matcher overwrites `app` with
+	// the target App and we skip the Lookup entirely
+	// (the substituted App is authoritative; re-running
+	// Lookup on the inbound hostname would waste a cache
+	// miss). Downstream RequireAuthn / PublicAuth / wake
+	// gate / proxy all see the *target* app's context,
+	// not the inbound host's. nil-safe: h.edgeRules nil
+	// (default) returns false and we fall through to the
+	// legacy host→app lookup.
+	var (
+		app       App
+		lookedApp App
+		ok        bool
+	)
+	if h.matchAndSubstituteRoute(r, &app) {
+		goto haveApp
+	}
+	//nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+	lookedApp, ok = h.backend.Lookup(r.Context(), appHost)
 	if !ok {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
 			"No such app", fmt.Sprintf("no app is routed to %q", appHost)))
 		h.observe(r, rec.status, "", "", false, Target{})
 		return
 	}
+	app = lookedApp
+haveApp:
 
 	// Issue #560 / per-deployment require_authn. Runs AFTER
 	// Host→app resolution (so we know which app's

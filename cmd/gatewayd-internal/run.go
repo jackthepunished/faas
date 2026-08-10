@@ -307,6 +307,21 @@ type runDeps struct {
 	// gatewaydAuditor.Emit(ctx, kind, subject, data) shape,
 	// not the apid auditor's wider surface.
 	requireAuthnAudit *gatewaydAuditor
+	// edgeRulesMatcher (ADR-089 / issue #561 PR 3) is the
+	// per-host LRU-backed gateway.EdgeRuleMatcher the handler
+	// consults on every request before Backend.Lookup. nil =
+	// matcher disabled (default; the handler's
+	// matchAndSubstituteRoute short-circuits to false so the
+	// legacy host→app lookup path runs unchanged). Production
+	// wires a single *gatewaydEdgeRules constructed by
+	// newGatewaydEdgeRules in run() so the cache + state.Store
+	// loader share the same instance.
+	edgeRulesMatcher *gatewaydEdgeRules
+	// edgeRulesAudit (ADR-089 PR 3) is the audit thin wrapper
+	// the handler's edge_rule.route_matched / edge_rule.route_blocked
+	// rows go through. nil = audit-disabled (matches the
+	// WithRequireAuthn audit nil-allowance).
+	edgeRulesAudit *gatewaydEdgeRulesAud
 	// publicAuthCache (issue #477 / ADR-079) is the unsealed
 	// basic-auth credential cache shared between the Handler
 	// (enforcePublicAuthBasic reads through it) and the
@@ -511,6 +526,11 @@ func run(ctx context.Context, log *slog.Logger) error {
 			return cli, true, nil
 		}).
 		WithPublicAuthCache(deps.publicAuthCache).
+		// ADR-089 / issue #561 PR 3: arm the per-host edge-rule
+		// matcher the invalidator resets on db.NotifyEdgeRuleChanged.
+		// Nil-safe; production always wires a real *gatewaydEdgeRules
+		// in run() above.
+		WithEdgeRules(deps.edgeRulesMatcher).
 		// Issue #556 / PR-B: wire the per-deployment weight
 		// store so a deployment_changed notify refreshes the
 		// picker's weight table. The adapter translates
@@ -743,6 +763,14 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// outside unit tests).
 	deps.requireAuthnAdapter = newRequireAuthnAdapter(deps.authMw)
 	deps.requireAuthnAudit = newGatewaydAuditor(deps.pgStore, log)
+	// ADR-089 / issue #561 PR 3 — build the edge-rule matcher
+	// next to the requireAuthn chain so the per-host cache +
+	// audit thin wrapper share the same auditor. The matcher
+	// reads state.EdgeRule via the store; reset on
+	// db.NotifyEdgeRuleChanged is wired via PGBackend.WithEdgeRules
+	// below.
+	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log)
+	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
 	// Issue #477 / ADR-079: build the unsealed basic-auth
 	// credential cache + the secretbox unsealer closure.
 	// The cache is shared between the Handler (read path)
@@ -867,6 +895,32 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil. Production wires both unconditionally after
 	// deps.authMw is built in run().
 	handler.WithRequireAuthn(deps.requireAuthnAdapter, deps.requireAuthnAudit)
+	// ADR-089 / issue #561 PR 3: arm the per-host edge-rule
+	// matcher so ServeHTTP consults it BEFORE Backend.Lookup
+	// (handler.go:1599-1618). The resolve closure wraps
+	// AppBySlug so a matched route re-targets the gateway.App
+	// end-to-end (handler.go:matchAndSubstituteRoute does the
+	// same-account check).
+	//
+	// Note: state.App does not carry Plan (the apps table
+	// doesn't denormalize it; Plan lives on accounts). The
+	// routed App returned here has Plan="", which surfaces as
+	// an empty `plan` label on gateway_requests_total for
+	// routed requests — bounded cardinality, distinguishable
+	// from non-routed (plan=Free|Hobby|Pro|Scale). Populating
+	// Plan properly is PR 8 (denormalize on apps row OR
+	// back-to-back AccountByID join — both deferred; the
+	// metrics label gap is acceptable for a v1 surface).
+	handler.WithEdgeRules(deps.edgeRulesMatcher, func(ctx context.Context, slug string) (gateway.App, bool) {
+		app, err := deps.pgStore.AppBySlug(ctx, slug)
+		if err != nil {
+			return gateway.App{}, false
+		}
+		return gateway.App{
+			ID:        app.ID,
+			AccountID: app.AccountID,
+		}, true
+	}, deps.edgeRulesAudit)
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// The 60s cache lives on the Handler (production wires
 	// deps.publicAuthCache below); the secretbox unseal goes
