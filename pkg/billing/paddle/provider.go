@@ -67,6 +67,23 @@ type Provider struct {
 	// production body (defaultCreateUpgradeTxn).
 	createUpgradeTxnFn CreateUpgradeTxnFn
 	now                func() time.Time
+	// flushRecorder is the test seam defaultFlushLocked writes one
+	// RecordedFlush row into per push. nil → no recording (production
+	// and the bulk of unit tests that exercise the dedupe / flusher
+	// counters). When set, the slice is appended under
+	// flushRecorderMu — tests that race two flushes against the same
+	// provider must take the same mutex. Read with FlushRecorderForTest
+	// or by reading the slice through the returned pointer.
+	//
+	// Sits next to flushFn rather than replacing it because the two
+	// seams answer different questions: flushFn lets tests substitute
+	// the SDK POST entirely (counter / err-injection / capture-only),
+	// while flushRecorder observes the production body without
+	// changing it. The PR that closed the under-billing bug needs
+	// the latter — flushFn alone hides the Quantity field on the
+	// CreateTransactionRequest the production body builds.
+	flushRecorder   []RecordedFlush
+	flushRecorderMu sync.Mutex
 	// instanceID is the free-form identity stamp passed into
 	// ClaimPaddleOverageWindow — used by ops to identify which
 	// process holds the claim when a stuck row is investigated.
@@ -207,6 +224,47 @@ func NewProviderForTest(log *slog.Logger) *Provider {
 // SDK push is also seam-driven for testability.
 func (p *Provider) FlushFnForTest(fn FlushFn) {
 	p.flushFn = fn
+}
+
+// RecordedFlush is one row the FlushRecorder captures per push through
+// defaultFlushLocked. The load-bearing field is Quantity — the wire
+// quantity posted to Paddle's per-line-item Quantity field. A regression
+// in the wire-quantity conversion (e.g. reverting to Quantity=1) is
+// caught by asserting records[i].Quantity == expected.
+//
+// MBSeconds + WindowStart + AccountID are kept for parity with the
+// existing FlushFn signature so a test can drive both seams from the
+// same input. The CustomData field is intentionally not recorded here
+// — it's already pinned by a separate Paddle merchant-dashboard
+// inspection; if the audit-trail format ever changes, that's a
+// downstream concern.
+type RecordedFlush struct {
+	AccountID   string
+	WindowStart time.Time
+	MBSeconds   int64
+	Quantity    int64
+}
+
+// FlushRecorderForTest installs a recording sink and returns the slice
+// the production defaultFlushLocked appends into. The slice is appended
+// under flushRecorderMu; tests that read it concurrently must take the
+// returned pointer's own mutex or copy the slice first. The seam is
+// intentionally minimal — it sits next to FlushFnForTest so a test can
+// choose to (a) substitute the production body entirely, (b) let the
+// production body run and observe what it posted, or (c) both — install
+// a recorder and a flushFn stub to count + capture in the same run.
+//
+// Two flushes on the same *Provider are serialised by
+// flushOverageLocked's per-(acct, window) claim gate, so concurrent
+// flushes on distinct windows are still safe to record — the mutex
+// protects the slice header, not the row contents.
+func (p *Provider) FlushRecorderForTest() *[]RecordedFlush {
+	p.flushRecorderMu.Lock()
+	defer p.flushRecorderMu.Unlock()
+	if p.flushRecorder == nil {
+		p.flushRecorder = []RecordedFlush{}
+	}
+	return &p.flushRecorder
 }
 
 // SetOveragePriceForTest primes the catalog's planOverage entry for

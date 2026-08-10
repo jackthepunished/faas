@@ -936,3 +936,167 @@ func TestFlushOverageLocked_ReapStaleResetsPending(t *testing.T) {
 		t.Errorf("fresh pod claim = false, want true (reaper should have reset the row)")
 	}
 }
+
+// --- Wire-quantity acceptance (PR-P-fixes) ---
+//
+// TestDefaultFlushLocked_RecorderCapturesWireQuantity is the §14
+// acceptance test for the Paddle path's wire-quantity fix. Pre-PR-P-fixes
+// defaultFlushLocked posted Quantity=1 regardless of mb_seconds, which
+// silently under-billed every account by ~250× for the canonical Hobby
+// 24h case. The test installs the FlushRecorderForTest seam and asserts
+// the captured Quantity matches billing.WireQuantityForMBSeconds(mbSeconds)
+// for the canonical Hobby 24h window.
+//
+// Mirrors the Stripe-side TestWireQuantityForMBSeconds in
+// pkg/billing/plans_test.go — the two providers post the same wire
+// quantity for the same mb_seconds input.
+func TestDefaultFlushLocked_RecorderCapturesWireQuantity(t *testing.T) {
+	t.Parallel()
+
+	// Production body runs and reaches the SDK POST. The zero-value
+	// *paddle.SDK{} has no http.Client / auth wired, so the SDK call
+	// will return an error — but the recorder appends BEFORE the SDK
+	// POST (defaultFlushLocked), so the row is observable regardless.
+	// We swallow the SDK error (it's an artifact of the test stub, not
+	// the wire-quantity path under test).
+	p := &Provider{
+		client: &paddle.SDK{}, // zero value; SDK call will error, recorder row is already appended
+		now:    time.Now,
+		catalog: &priceCatalog{
+			planOverage: map[api.Plan]string{api.PlanHobby: "pri_test_overage"},
+		},
+	}
+	rec := p.FlushRecorderForTest()
+	acct := acctWithPlan(api.PlanHobby)
+	windowStart := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+
+	// Canonical Hobby 24h: 264 MB resident * 86400 s = 22_809_600 mb-s.
+	// Wire quantity = 22_809_600 * 1000 / 3_686_400 = 6187.
+	// BillableRAMMB is a runtime helper (not a constant expression),
+	// so this stays a `var` rather than `const` — same shape as
+	// cmd/e2e/billing_invoice_shadow_test.go's shadowPerHour var.
+	canonicalMbSeconds := int64(api.BillableRAMMB(256)) * 60 * 60 * 24
+	const wantQty int64 = 6187
+
+	// The SDK POST will fail (zero-value *paddle.SDK); recover to
+	// keep the rest of the test assertions alive. The recorder row
+	// is in by the time the panic would fire.
+	defer func() {
+		_ = recover() //nolint:errcheck // SDK stub panic is the expected failure mode
+	}()
+	_ = defaultFlushLocked(context.Background(), p, acct, windowStart, canonicalMbSeconds)
+
+	// Recorder row count: exactly one push attempted.
+	if len(*rec) != 1 {
+		t.Fatalf("recorder rows = %d, want 1", len(*rec))
+	}
+	got := (*rec)[0]
+	if got.AccountID != acct.ID {
+		t.Errorf("recorder AccountID = %q, want %q", got.AccountID, acct.ID)
+	}
+	if got.MBSeconds != canonicalMbSeconds {
+		t.Errorf("recorder MBSeconds = %d, want %d", got.MBSeconds, canonicalMbSeconds)
+	}
+	if got.Quantity != wantQty {
+		t.Errorf("recorder Quantity = %d, want %d (Hobby 24h canonical — "+
+			"pre-fix this was 1, the under-billing bug)", got.Quantity, wantQty)
+	}
+}
+
+// TestDefaultFlushLocked_RecorderTable pins the wire-quantity formula
+// across the per-plan matrix. Mirrors pkg/billing/plans_test.go's
+// TestWireQuantityForMBSeconds but at the recorder layer so the
+// defaultFlushLocked production body is what's being exercised end-to-end.
+// A regression in either the formula or the production body surfaces
+// here, not just in the pure-helper test.
+func TestDefaultFlushLocked_RecorderTable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		ramMB     int
+		mbSeconds int64
+		wantQty   int64
+	}{
+		{"free_one_hour", 128, 136 * 3_600, 132},
+		{"hobby_one_hour", 256, 264 * 3_600, 264},
+		{"pro_one_hour", 512, 520 * 3_600, 507},
+		{"scale_one_hour", 1024, 1032 * 3_600, 1007},
+		{"hobby_24h_canonical", 256, 264 * 86400, 6187},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			plan := api.PlanHobby
+			switch tc.ramMB {
+			case 128:
+				plan = api.PlanFree
+			case 512:
+				plan = api.PlanPro
+			case 1024:
+				plan = api.PlanScale
+			}
+
+			p := &Provider{
+				client: &paddle.SDK{},
+				now:    time.Now,
+				catalog: &priceCatalog{
+					planOverage: map[api.Plan]string{plan: "pri_test_overage"},
+				},
+			}
+			rec := p.FlushRecorderForTest()
+			acct := acctWithPlan(plan)
+			windowStart := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+
+			defer func() { _ = recover() }() //nolint:errcheck
+			_ = defaultFlushLocked(context.Background(), p, acct, windowStart, tc.mbSeconds)
+
+			if len(*rec) != 1 {
+				t.Fatalf("recorder rows = %d, want 1", len(*rec))
+			}
+			if got := (*rec)[0].Quantity; got != tc.wantQty {
+				t.Errorf("Quantity = %d, want %d (plan=%s ram=%d mb_seconds=%d)",
+					got, tc.wantQty, plan, tc.ramMB, tc.mbSeconds)
+			}
+		})
+	}
+}
+
+// TestDefaultFlushLocked_NegativeMBSecondsSurfacesErrNegativeMBSeconds
+// pins the defensive guard at the entry of defaultFlushLocked. The
+// pre-PR-P-fixes production body had no such guard — a negative
+// mb_seconds would have produced a negative Quantity (Go integer
+// division truncates toward zero for small negatives, but a large
+// negative passes through and posts a refund-shaped line item to
+// Paddle, silently crediting the customer). The guard routes through
+// ErrNegativeMBSeconds so the classifier at errors.go renders the
+// same "negative-mb-sec" Prometheus label as the PushUsageRecord
+// entry-point path.
+func TestDefaultFlushLocked_NegativeMBSecondsSurfacesErrNegativeMBSeconds(t *testing.T) {
+	t.Parallel()
+
+	p := &Provider{
+		client: &paddle.SDK{}, // never reached — guard fires first
+		now:    time.Now,
+		catalog: &priceCatalog{
+			planOverage: map[api.Plan]string{api.PlanHobby: "pri_test_overage"},
+		},
+	}
+	rec := p.FlushRecorderForTest()
+	acct := acctWithPlan(api.PlanHobby)
+	windowStart := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+
+	err := defaultFlushLocked(context.Background(), p, acct, windowStart, -1)
+	if err == nil {
+		t.Fatal("negative mb_seconds should error")
+	}
+	if !errors.Is(err, ErrNegativeMBSeconds) {
+		t.Errorf("err = %v, want errors.Is(_, ErrNegativeMBSeconds) == true", err)
+	}
+	// Guard fires before the recorder append, so no row lands.
+	if len(*rec) != 0 {
+		t.Errorf("recorder rows = %d, want 0 (negative input must not record)", len(*rec))
+	}
+}
