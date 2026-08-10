@@ -510,12 +510,13 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "secrets",
 		DocSlug: "secrets",
-		Short:   "Manage env secrets (secrets list|set|unset|list-all)",
+		Short:   "Manage env secrets (secrets list|set|unset|list-all|rotate)",
 		Subcommands: []cliSub{
 			{Name: "list", Short: "List sealed secrets"},
 			{Name: "set", Short: "Set a sealed secret"},
 			{Name: "unset", Short: "Remove a sealed secret"},
 			{Name: "list-all", Short: "List every secret across apps"},
+			{Name: "rotate", Short: "Re-seal one secret under the current host key"},
 		},
 	},
 	{
