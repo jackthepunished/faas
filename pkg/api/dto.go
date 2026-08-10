@@ -1985,16 +1985,78 @@ type StorageUsageListResponse struct {
 }
 
 // BillingPortalResponse is the wire shape for GET /v1/billing/portal
-// (issue #253). URL is the operator-configured billing portal link —
-// today: FAAS_BILLING_PORTAL_URL with `{account_id}` substituted.
-// Empty URL is a 200 (the request itself succeeded); it is the
-// "absent" sentinel meaning the box has no portal configured and
-// the CLI should print a friendly hint instead of opening the
-// browser to "". The field is omitempty so an unset URL on a Free
-// account does not surface as JSON null in either the dashboard's
-// SSR page or the SDK response.
+// (issue #253, extended in issue #242). URL is the operator-configured
+// billing portal link — today: FAAS_BILLING_PORTAL_URL with
+// `{account_id}` substituted. Empty URL is a 200 (the request itself
+// succeeded); it is the "absent" sentinel meaning the box has no
+// portal configured and the CLI should print a friendly hint instead
+// of opening the browser to "". The field is omitempty so an unset URL
+// on a Free account does not surface as JSON null in either the
+// dashboard's SSR page or the SDK response.
+//
+// PaymentMethod (issue #242) carries the canonical card-on-file summary
+// so the CLI's `faas billing payment-method` subcommand and the
+// dashboard's billing page both render from the same round-trip.
+// Field is omitempty; Free / no-card-on-file responses carry no
+// payment_method key.
 type BillingPortalResponse struct {
-	URL string `json:"url,omitempty"`
+	URL           string                `json:"url,omitempty"`
+	PaymentMethod *PaymentMethodSummary `json:"payment_method,omitempty"`
+}
+
+// PaymentMethodSummary is the provider-agnostic card-on-file summary
+// (issue #242). Both Stripe (PaymentMethods.List) and Paddle
+// (Customer.Get carries payment_method) reduce to this shape at the
+// provider boundary in pkg/billing/; the conversion lives behind
+// billing.Provider.PaymentMethodSummary so neither provider's
+// internal field names leak onto the wire. Brand is the lowercase
+// card brand (visa, mastercard, amex, …) per the Stripe convention
+// Paddle mirrors; empty when unknown.
+//
+// Last4 is the trailing 4 digits of the PAN. ExpMonth / ExpYear carry
+// the card expiry as integers (1..12 / 4-digit). Zero values are the
+// "unknown" sentinel — Free / no-card-on-file clients see all-zero
+// fields; the CLI renders the zero as the "no payment method on file"
+// CTA.
+type PaymentMethodSummary struct {
+	Brand    string `json:"brand"`
+	Last4    string `json:"last4"`
+	ExpMonth int    `json:"exp_month"`
+	ExpYear  int    `json:"exp_year"`
+}
+
+// BillingRetryResponse is the wire shape for POST /v1/billing/retry
+// (issue #242). AttemptID is the provider-side handle for the new
+// charge attempt (Stripe `in_…` invoice id; Paddle `txn_…` transaction
+// id). ProviderRefID is the underlying payment-intent id or merchant
+// transaction reference for ops debugging. Status is the provider's
+// last-known status at the time of the call — the Stripe / Paddle
+// webhook will fill in the final state asynchronously. NextBillingAt
+// is the next scheduled billing-cycle timestamp (RFC 3339); null when
+// the retry does not advance the cycle.
+//
+// All integer money paths use int64 millicents at the SDK boundary
+// (pkg/billing/), but this DTO does not carry money — the amount was
+// already locked in at the original subscription or charge. Currency
+// comes from the provider's catalog, not the retry call.
+type BillingRetryResponse struct {
+	AttemptID     string     `json:"attempt_id"`
+	ProviderRefID string     `json:"provider_ref_id"`
+	Status        string     `json:"status"`
+	NextBillingAt *time.Time `json:"next_billing_at"`
+}
+
+// BillingCancelResponse is the wire shape for POST /v1/billing/cancel
+// (issue #242). The cancel is scheduled, not immediate — the account
+// keeps the current plan until `effective_at`, then downgrades to Free
+// on the next dunning tick. EffectiveAt is Stripe's `current_period_end`
+// or the account's period-end timestamp on Paddle; rendered in --json
+// as an RFC 3339 string. CancelScheduled is always true on 200 (the
+// HTTP 200 is itself the contract) but the field is preserved so
+// --json scripts can branch on it without parsing the response status.
+type BillingCancelResponse struct {
+	CancelScheduled bool      `json:"cancel_scheduled"`
+	EffectiveAt     time.Time `json:"effective_at"`
 }
 
 // APIKeyExportResponse is one row in the export's API key slice.
