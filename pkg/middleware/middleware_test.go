@@ -584,12 +584,12 @@ func TestAuthLimit_ClientIPFromLoopbackHop_XForwardedFor_IPv6(t *testing.T) {
 // accessor added in ADR-091 §3.5 / PR #2.
 //
 // Three properties are locked down by this test:
-//   1. Snapshot reflects only IPs with failures inside the configured
-//      Window — expired entries are pruned by the same logic that
-//      recordFailure / isLimited use (no off-by-one on the cutoff).
-//   2. Snapshot is a deep copy: mutating the returned slice does not
-//      affect the limiter's internal state.
-//   3. Sort order is Hits DESC, IP ASC for stable operator-UI render.
+//  1. Snapshot reflects only IPs with failures inside the configured
+//     Window — expired entries are pruned by the same logic that
+//     recordFailure / isLimited use (no off-by-one on the cutoff).
+//  2. Snapshot is a deep copy: mutating the returned slice does not
+//     affect the limiter's internal state.
+//  3. Sort order is Hits DESC, IP ASC for stable operator-UI render.
 func TestAuthLimit_Snapshot_DeepCopiesHits(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cfg := middleware.AuthLimitConfig{

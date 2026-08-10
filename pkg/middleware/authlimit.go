@@ -163,10 +163,10 @@ func NewLimiter(cfg AuthLimitConfig) *Limiter {
 // immediately drop. The hits counter is "failures inside Window as
 // of snapshot time"; it is not the lifetime counter.
 type LimiterSnapshot struct {
-	Window     time.Duration
+	Window      time.Duration
 	MaxFailures int
-	Entries    []LimiterSnapshotEntry
-	Now        time.Time
+	Entries     []LimiterSnapshotEntry
+	Now         time.Time
 }
 
 // LimiterSnapshotEntry is one client-IP row in a LimiterSnapshot.
