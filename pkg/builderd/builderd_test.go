@@ -1,6 +1,9 @@
 package builderd
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -555,11 +558,34 @@ func writeSparse(t *testing.T, path string, size int64) error {
 	return nil
 }
 
-// makeTarballWithName is a small wrapper around the makeTarball in
-// detect_test.go so this file's tests don't have to redeclare the helper.
+// makeTarballWithName is a thin fixture helper for the build-roundtrip
+// tests below. It builds a gzipped tarball at path whose top-level
+// entries are the given names (empty content). Used to be a wrapper
+// around the makeTarball helper in detect_test.go; that helper now
+// lives in pkg/markers/detect_test.go and dropped with the deleted
+// detect_test.go (issue #736 / ADR-088), so the helper is inlined
+// here. Keep package-private — builderd's tests reach the markers
+// package via DetectFromTarball etc., not via a fixture helper.
 func makeTarballWithName(t *testing.T, path string, names []string) {
 	t.Helper()
-	makeTarball(t, path, names)
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, n := range names {
+		hdr := &tar.Header{Name: n, Mode: 0o644, Size: 0, Typeflag: tar.TypeReg}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // contains is a tiny substring helper.
