@@ -94,6 +94,17 @@ type Metrics struct {
 	wakeQueueWait prometheus.Histogram
 	queueDepth    *prometheus.GaugeVec
 	rateLimited   *prometheus.CounterVec
+	// edgeRuleMatch: ADR-089 PR 3. Counter labelled by
+	// (kind, outcome) — `kind` is the EdgeRuleKind
+	// (route|rewrite|redirect|headers|cors|jwt|ip; closed set
+	// per migrations/00192_edge_rules.sql:49-51), `outcome` is
+	// one of {match, miss, blocked}. The handler increments
+	// from matchAndSubstituteRoute (handler.go:1449-1451) so the
+	// §12 dashboard panel "edge rule match rate" surfaces from
+	// first scrape — the closed label set is pre-instantiated
+	// at boot below. PR 4-7 extend kind; the outcome set is
+	// stable across all kinds.
+	edgeRuleMatch *prometheus.CounterVec
 	// responseBytes: ADR-046 PR-2 producer observability.
 	// Counter labelled by app (UUID, bounded by per-plan app
 	// quotas) and plan (Free|Hobby|Pro|Scale — closed set). The
@@ -281,6 +292,13 @@ func NewMetrics() *Metrics {
 			Name: "gateway_requests_total",
 			Help: "Total gateway requests, labelled by app, plan, and HTTP status class.",
 		}, []string{"app", "plan", "code"}),
+		// ADR-089 PR 3 — kind=route substitution outcomes.
+		// Pre-instantiated below so the §12 panel surfaces from
+		// first scrape; PR 4-7 add (kind=rewrite, ...), (kind=jwt, ...).
+		edgeRuleMatch: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_edge_rule_match_total",
+			Help: "Edge-rule matcher outcomes, labelled by kind and outcome (match|miss|blocked). ADR-089 PR 3.",
+		}, []string{"kind", "outcome"}),
 		wakeLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "gateway_wake_latency_seconds",
 			Help: "End-to-end latency from request received to first upstream byte after a cold wake.",
@@ -507,6 +525,14 @@ func NewMetrics() *Metrics {
 	// tlsOnDemandDenied / accountRateLimited pre-instantiation
 	// pattern above. To add a new outcome (e.g. remote_*):
 	// extend this slice; the metric name stays stable.
+	// ADR-089 PR 3 — pre-instantiate the closed (kind, outcome)
+	// cross product for every shipped kind. PR 4-7 add kinds to
+	// the outer loop; the outcome set is stable across kinds.
+	for _, kind := range []string{"route"} {
+		for _, outcome := range []string{"match", "miss", "blocked"} {
+			m.edgeRuleMatch.WithLabelValues(kind, outcome)
+		}
+	}
 	for _, outcome := range []string{"local_snapshot", "local_coldboot"} {
 		m.wakeLocality.WithLabelValues(outcome)
 	}
@@ -539,7 +565,7 @@ func NewMetrics() *Metrics {
 	for _, plan := range []string{"free", "hobby", "pro", "scale"} {
 		m.streamActive.WithLabelValues("__other__", plan)
 	}
-	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive)
+	reg.MustRegister(m.requests, m.requestDuration, m.wakeLatency, m.wakeQueueWait, m.queueDepth, m.rateLimited, m.accountRateLimited, m.coldBoot, m.tlsCertExpiry, m.tlsCertExpiryByHost, m.tlsCertExpiryRefresherWalkComplete, m.tlsOnDemandDenied, m.wakeLocality, m.wakeSnapshotTier, m.computeNodeChangedSubscriberAlive, m.responseBytes, m.streamFlushes, m.streamActive, m.edgeRuleMatch)
 	return m
 }
 
@@ -714,6 +740,26 @@ func (m *Metrics) ObserveWakeLocality(outcome string) {
 		return
 	}
 	m.wakeLocality.WithLabelValues(outcome).Inc()
+}
+
+// ObserveEdgeRuleMatch (ADR-089 PR 3) increments the edge-rule
+// matcher counter. kind is the EdgeRuleKind (route today; PR 4-7
+// extend), outcome ∈ {match, miss, blocked}. The label tuples are
+// pre-instantiated at boot in NewMetrics so the §12 dashboard panel
+// "edge rule match rate" surfaces from first scrape — see the
+// tlsOnDemandDenied / wakeLocality pre-instantiation loop above.
+// Nil-safe so the Handler hot path doesn't need a nil guard.
+// "match" is fired only when a rule substituted the inbound App
+// end-to-end; "blocked" is fired only on cross-account attempts
+// (defense-in-depth on top of the apid create-time same-account
+// guarantee); "miss" is fired on a clean miss (no rule for the
+// host, or no rule whose path/method matched). PR 4-7 will call
+// this with additional kind values from their own match paths.
+func (m *Metrics) ObserveEdgeRuleMatch(kind, outcome string) {
+	if m == nil {
+		return
+	}
+	m.edgeRuleMatch.WithLabelValues(kind, outcome).Inc()
 }
 
 // ObserveWakeSnapshotTier (issue #470 / PR #470-FU-B) increments

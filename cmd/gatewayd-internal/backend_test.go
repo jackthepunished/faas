@@ -127,12 +127,15 @@ func TestAppsSuffix(t *testing.T) {
 // fakeInvalidator records EvictInstance / FlushRoutes /
 // InvalidatePublicAuth calls (issue #477 / ADR-079) and
 // RefreshDeploymentWeights calls (issue #556 / PR-B).
+// ResetEdgeRules (ADR-089 PR 3) is a no-op here — the test
+// is about the switch-arm dispatch, not the matcher itself.
 type fakeInvalidator struct {
 	mu            sync.Mutex
 	evicted       map[string]string // instance_id -> app_id
 	flushCnt      int
 	publicAuthCnt int
 	refreshed     []string // app_ids that received RefreshDeploymentWeights
+	resetCnt      int      // ResetEdgeRules call count (ADR-089 PR 3)
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -151,6 +154,11 @@ func (f *fakeInvalidator) FlushRoutes() {
 func (f *fakeInvalidator) InvalidatePublicAuth() {
 	f.mu.Lock()
 	f.publicAuthCnt++
+	f.mu.Unlock()
+}
+func (f *fakeInvalidator) ResetEdgeRules() {
+	f.mu.Lock()
+	f.resetCnt++
 	f.mu.Unlock()
 }
 func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID string) error {
@@ -213,6 +221,33 @@ func TestHandleInvalidation_DeploymentChangedRefreshesWeights(t *testing.T) {
 	}
 	if f.refreshed[0] != "app-7" {
 		t.Errorf("refreshed[0] = %q, want app-7", f.refreshed[0])
+	}
+}
+
+// TestHandleInvalidation_EdgeRuleChanged (ADR-089 / issue #561 PR 3)
+// pins the new arm: any db.NotifyEdgeRuleChanged event must trigger
+// ResetEdgeRules on the invalidator so the per-host edge-rule LRU
+// is dropped wholesale. Payload contents are intentionally dropped —
+// the cache is per-host and the matcher can't surgical-evict without
+// the rule's match_host. Malformed / unknown channels are no-ops.
+func TestHandleInvalidation_EdgeRuleChanged(t *testing.T) {
+	f := &fakeInvalidator{}
+	log := testLogger()
+
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyEdgeRuleChanged,
+		Payload: `{"app_id":"app-7","rule_id":"r-1"}`,
+	}, log)
+	// Malformed payload → still reset (wholesale, payload-agnostic).
+	handleInvalidation(context.Background(), f, db.Notification{
+		Channel: db.NotifyEdgeRuleChanged,
+		Payload: `not json`,
+	}, log)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resetCnt != 2 {
+		t.Errorf("resetCnt = %d, want 2", f.resetCnt)
 	}
 }
 

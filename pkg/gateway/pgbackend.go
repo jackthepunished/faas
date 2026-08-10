@@ -328,6 +328,16 @@ type PGBackend struct {
 	// cmd/gatewayd-internal so the 60s TTL + per-key
 	// invalidation through db.NotifyKeyChanged both apply.
 	publicAuthCache *PublicAuthCache
+	// edgeRules (ADR-089 / issue #561 PR 3) is the
+	// per-host edge-rule matcher the invalidator drives.
+	// nil = no matcher wired (default; pre-PR-3 behaviour
+	// preserved). cmd/gatewayd-internal wires it via
+	// WithEdgeRules next to WithPublicAuthCache so the
+	// db.NotifyEdgeRuleChanged subscriber in
+	// cmd/gatewayd-internal/backend.go can call Reset()
+	// on it. ResetEdgeRules is nil-safe so the
+	// subscriber never has to branch.
+	edgeRules EdgeRuleMatcher
 }
 
 // AppResolverFunc is the typed alias for WithAppResolver. Mirrors
@@ -992,6 +1002,30 @@ func (b *PGBackend) InvalidatePublicAuth() {
 func (b *PGBackend) WithPublicAuthCache(cache *PublicAuthCache) *PGBackend {
 	b.publicAuthCache = cache
 	return b
+}
+
+// WithEdgeRules (ADR-089 / issue #561 PR 3) arms the
+// per-host edge-rule matcher the invalidator resets on
+// db.NotifyEdgeRuleChanged. matcher may be nil (matcher
+// disabled; pre-PR-3 behaviour preserved). The setter
+// returns *PGBackend for fluent chaining (same shape as
+// every other PGBackend.With*).
+func (b *PGBackend) WithEdgeRules(matcher EdgeRuleMatcher) *PGBackend {
+	b.edgeRules = matcher
+	return b
+}
+
+// ResetEdgeRules (ADR-089 / issue #561 PR 3) drops the
+// edge-rule matcher's per-host LRU. cmd/gatewayd-internal
+// calls this on db.NotifyEdgeRuleChanged (cmd/gatewayd-internal/backend.go
+// handleInvalidation switch arm). nil-safe: an unwired
+// matcher is a no-op so the notify subscriber never has
+// to branch on a wiring check.
+func (b *PGBackend) ResetEdgeRules() {
+	if b.edgeRules == nil {
+		return
+	}
+	b.edgeRules.Reset()
 }
 
 func (b *PGBackend) getApp(appID string) (App, bool) {

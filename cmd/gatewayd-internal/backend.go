@@ -155,6 +155,14 @@ func appsSuffix(domain string) string {
 // account pay at most one cache rebuild across all public-auth-locked
 // apps (acceptable because key rotations are rare).
 //
+// Issue #561 / ADR-089 PR 3 added ResetEdgeRules: a
+// `edge_rule_changed` notification drops the whole edge-rule
+// LRU (the cache is per-host; per-rule invalidation would
+// require the matcher to know the rule's host key, which the
+// notification doesn't carry). The cache is advisory — a stale
+// read only widens the hit window, never wrong-routes — so a
+// wholesale flush is correct.
+//
 // Issue #556 / PR-B added RefreshDeploymentWeights: a
 // deployment_changed notification reloads the per-deployment weight
 // table for the affected app so a `faas traffic set --percent 25`
@@ -164,6 +172,12 @@ type invalidator interface {
 	FlushRoutes()
 	InvalidatePublicAuth()
 	RefreshDeploymentWeights(ctx context.Context, appID string) error
+	// ResetEdgeRules (ADR-089 PR 3) drops the per-host
+	// edge-rule LRU. Wholesale — per-rule invalidation would
+	// require the notification payload to carry the host
+	// key, which it doesn't. The cache is advisory so a
+	// brief staleness window is fine.
+	ResetEdgeRules()
 }
 
 // watchInvalidations subscribes to the pg_notify channels that affect routing
@@ -193,6 +207,7 @@ func watchInvalidations(ctx context.Context, pool *pgxpool.Pool, inv invalidator
 		db.NotifyDomainChanged,
 		db.NotifyKeyChanged,
 		db.NotifyDeploymentChanged,
+		db.NotifyEdgeRuleChanged,
 	}
 	notif, err := db.SubscribeWithReconnect(ctx, pool, channels, log)
 	if err != nil {
@@ -319,5 +334,18 @@ func handleInvalidation(ctx context.Context, inv invalidator, n db.Notification,
 		if err := inv.RefreshDeploymentWeights(ctx, p.AppID); err != nil {
 			log.Warn("gatewayd: refresh deployment weights failed", "app", p.AppID, "err", err)
 		}
+	case db.NotifyEdgeRuleChanged:
+		// Issue #561 / ADR-089 PR 3. A create / update /
+		// delete on any edge_rule row emits this notification
+		// (cmd/apid/handlers_edge_rules.go:256/455/511).
+		// Wholesale Reset — the cache is advisory and a
+		// stale read only widens the hit window (the
+		// gateway.App cross-account check catches a
+		// deleted target). The payload (app_id, rule_id)
+		// is intentionally dropped: the cache is per-host
+		// keyed, and we'd need the rule's match_host to
+		// surgical-evict. Wholesale flush is cheaper and
+		// correct.
+		inv.ResetEdgeRules()
 	}
 }
