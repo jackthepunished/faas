@@ -579,3 +579,109 @@ func TestAuthLimit_ClientIPFromLoopbackHop_XForwardedFor_IPv6(t *testing.T) {
 		t.Fatalf("B second: code = %d, want 401 (still under threshold)", c)
 	}
 }
+
+// TestAuthLimit_Snapshot_DeepCopiesHits pins the operator-obs Snapshot
+// accessor added in ADR-091 §3.5 / PR #2.
+//
+// Three properties are locked down by this test:
+//  1. Snapshot reflects only IPs with failures inside the configured
+//     Window — expired entries are pruned by the same logic that
+//     recordFailure / isLimited use (no off-by-one on the cutoff).
+//  2. Snapshot is a deep copy: mutating the returned slice does not
+//     affect the limiter's internal state.
+//  3. Sort order is Hits DESC, IP ASC for stable operator-UI render.
+func TestAuthLimit_Snapshot_DeepCopiesHits(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cfg := middleware.AuthLimitConfig{
+		Window:      time.Minute,
+		MaxFailures: 100,
+		Now:         func() time.Time { return now },
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	gate := func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", http.StatusUnauthorized) }
+	lim := middleware.NewLimiter(cfg)
+	h := middleware.AuthLimitWithLimiter(cfg, lim)(http.HandlerFunc(gate))
+
+	fire := func(remoteAddr string) {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/x", nil)
+		r.RemoteAddr = remoteAddr
+		h.ServeHTTP(rec, r)
+	}
+
+	// Two hits from IP "1.1.1.1", three from "2.2.2.2", one from
+	// "3.3.3.3" — order so the hits-DESC sort yields 2.2.2.2 first.
+	// These are recorded at `now` (oldNow). Snapshot fires at
+	// (oldNow + 30s) which is well inside the 1m Window, so all
+	// six failures are still live.
+	fire("1.1.1.1:1")
+	fire("1.1.1.1:1")
+	fire("2.2.2.2:2")
+	fire("2.2.2.2:2")
+	fire("2.2.2.2:2")
+	fire("3.3.3.3:3")
+
+	// Inject an EXPIRED failure for "4.4.4.4" by recording one
+	// at (now - 2m), then advance the clock past Window(now). After
+	// the advance, every failure at (now - 2m) is past the Window
+	// cutoff and must NOT appear in the snapshot. The closure over
+	// the package-local `now` is what cfg.Now reads.
+	oldNow := now
+	now = oldNow.Add(-2 * time.Minute) // backdate so the next failure is stale
+	fire("4.4.4.4:4")
+	// Advance past `oldNow + 1m` (window cutoff) — 4.4.4.4's
+	// single failure at (oldNow - 2m) is now strictly older than
+	// the cutoff and must be dropped.
+	now = oldNow.Add(30 * time.Second) // keep the 1.1.1.1/2.2.2.2/3.3.3.3 failures inside Window
+	// Do NOT fire 4.4.4.4 again — the snapshot must show no entries
+	// for 4.4.4.4 because its only failure is past the cutoff. This
+	// pins the "drop expired entries from the front" behaviour the
+	// snapshot shares with isLimited/recordFailure.
+
+	snap := lim.Snapshot()
+	if snap.Window != time.Minute || snap.MaxFailures != 100 {
+		t.Fatalf("snapshot window/max: got %+v, want 1m/100", snap)
+	}
+	if snap.Now.IsZero() {
+		t.Fatalf("snapshot.Now must be populated")
+	}
+
+	// Build a map for membership + count assertions.
+	got := map[string]int{}
+	for _, e := range snap.Entries {
+		got[e.IP] = e.Hits
+	}
+	// 4.4.4.4 was recorded at (now - 2m) — after the clock advance,
+	// the snapshot window is (now + 2m - 1m) = (now + 1m), so the
+	// failure at (now - 2m) is past the cutoff and must NOT appear.
+	if _, ok := got["4.4.4.4"]; ok {
+		t.Fatalf("4.4.4.4 appeared in snapshot despite being past Window: %+v", snap.Entries)
+	}
+	if got["1.1.1.1"] != 2 {
+		t.Fatalf("1.1.1.1 hits: got %d, want 2", got["1.1.1.1"])
+	}
+	if got["2.2.2.2"] != 3 {
+		t.Fatalf("2.2.2.2 hits: got %d, want 3", got["2.2.2.2"])
+	}
+	if got["3.3.3.3"] != 1 {
+		t.Fatalf("3.3.3.3 hits: got %d, want 1", got["3.3.3.3"])
+	}
+
+	// Sort order: 2.2.2.2 (3), 1.1.1.1 (2), then 3.3.3.3 (1,
+	// no 4.4.4.4 because expired).
+	if len(snap.Entries) != 3 {
+		t.Fatalf("entries: got %d, want 3 (full: %+v)", len(snap.Entries), snap.Entries)
+	}
+	wantOrder := []string{"2.2.2.2", "1.1.1.1", "3.3.3.3"}
+	for i, want := range wantOrder {
+		if snap.Entries[i].IP != want {
+			t.Fatalf("entries[%d].IP: got %q, want %q (full: %+v)", i, snap.Entries[i].IP, want, snap.Entries)
+		}
+	}
+
+	// Mutating the returned snapshot must not affect the limiter.
+	snap.Entries[0].Hits = 9999
+	if lim.Snapshot().Entries[0].Hits != 3 {
+		t.Fatalf("snapshot not deep-copied: post-mutation hits = %d, want 3", lim.Snapshot().Entries[0].Hits)
+	}
+}

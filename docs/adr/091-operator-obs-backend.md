@@ -136,13 +136,42 @@ The response carries a `sources: ["durable", "live"]` field so the
 operator UI can render the lag in a tooltip. The 30s lag is
 documented inline at the top of the wire response.
 
+**No inter-process state for the live view.** A snapshot accessor
+(`authLimiter.Snapshot()`) is added to `pkg/auth/authlimit` and called
+once per request from the apid handler. gatewayd-public does NOT
+publish rate-limit state — the operator surface is apid-only. Cross-
+host rate-limit visibility arrives when the control plane goes multi-
+host (per §"Scale-out"); today one apid process owns its own snapshot.
+
+**Source-of-truth ordering.** Durable rows are authoritative; the
+live snapshot is a hint that an account is *currently* over the
+limit. A `currently_rate_limited: true` row with zero durable hits
+over the last 5 min is a freshly-flushed caller and is rendered
+differently in the UI (PR #3 wires the badge; PR #2 returns the
+field).
+
 ### 3.6 Anomalies read `usage_minutes`, not Prometheus
 
 One-box posture: `usage_minutes` (the customer-billing aggregate) is
 the cheapest source for the operator view — same table, no Prometheus
 dependency, no second control-plane process. The aggregate lives in
-SQL (a sqlc query): per-app and per-account, day-over-day delta, Z-
-score > 3.0 in a 7-day window.
+SQL (a sqlc query).
+
+**Baseline = hour-of-day, per `(account_id, app_id, EXTRACT(HOUR FROM minute))`
+over the last 7 days.** A row is flagged anomalous when its current-minute
+usage_minutes exceeds the 7-day hour-of-day mean + 3× stddev (or
+mean × 5.0 when stddev is below a small floor — guards against
+noisy-low-traffic apps where stddev explodes). Z-score alone was the
+original draft; hour-of-day matches the operator's intuition (a hobby
+app spiking at 02:00 UTC is more interesting than a +20% blip at
+14:00) and tolerates diurnal traffic shape without false positives.
+
+The aggregate returns the top-N rows by deviation (default 50, cap 200)
+with `current`, `baseline_mean`, `baseline_stddev`, `z_score`, and
+`reason` (`"hour_of_day"` vs `"raw_z"`) so the operator UI can render
+the explanation inline. The `reason` field is wire-stable; future
+detectors (PromQL on multi-host, baseline model swap) plug in by
+emitting new `reason` values without breaking the contract.
 
 When the control plane goes multi-host (per §"Scale-out"), this
 endpoint moves to a PromQL evaluation in the metrics daemon. The
@@ -371,3 +400,57 @@ default 200, cap 2000.
   PR #3 lands, `?include_pii=1` is operational but not auditable.
   This is a documented gap; PR #1 marks it as such on the wire
   response (`audit_emitted: false` in PR #1, `true` in PR #3).
+
+## 8. Wire contract (PR #2)
+
+Times are RFC 3339. IDs are UUID strings. All errors are RFC 7807.
+Both endpoints inherit the §3.1 two-layer gate + §3.2 MFA + §3.7
+pagination caps + §3.8 route exclusion (added to both `routeExclude`
+lists in this PR, in lockstep — review must check both files).
+
+### `GET /v1/admin/obs/anomalies`
+
+Query: `?window_hours=<n>` (default 24, hard cap 168 per §3.7),
+`?limit=<n>` (default 50, cap 200).
+
+```json
+200 OK
+{
+  "generated_at": "2026-08-10T12:00:00Z",
+  "window_hours": 24,
+  "baseline_window_days": 7,
+  "items": [
+    {
+      "account_id": "uuid",
+      "app_id": "uuid",
+      "minute": "2026-08-10T11:42:00Z",
+      "current": 312.0,
+      "baseline_mean": 41.0,
+      "baseline_stddev": 8.5,
+      "z_score": 31.9,
+      "reason": "hour_of_day"
+    }
+  ]
+}
+```
+
+### `GET /v1/admin/obs/rate-limits`
+
+Query: `?window_hours=<n>` (default 24, hard cap 168),
+`?account_id=<uuid>` (optional, narrows to one tenant).
+
+```json
+200 OK
+{
+  "generated_at": "2026-08-10T12:00:00Z",
+  "window_hours": 24,
+  "sources": ["durable", "live"],
+  "lag_seconds": 30,
+  "durable": [
+    {"account_id": "uuid", "hits": 412, "last_event_at": "2026-08-10T11:59:58Z"}
+  ],
+  "live": [
+    {"account_id": "uuid", "currently_rate_limited": true, "live_hits_30s": 17, "last_event_at": "2026-08-10T12:00:01Z"}
+  ]
+}
+```

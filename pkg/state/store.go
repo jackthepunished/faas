@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
 // ErrNotFound is returned by Store reads when a row does not exist.
@@ -2467,6 +2468,19 @@ type Store interface {
 	// day is a UTC midnight time; the returned rows cover the
 	// single day. Empty when no rollup has fired yet. ADR-048 §5.
 	UsageDaily(ctx context.Context, accountID string, day time.Time) ([]DailyUsage, error)
+	// TrafficAnomalyAggregate is the per-(account, app, minute) anomaly
+	// scan that powers GET /v1/admin/obs/anomalies (ADR-091 §3.6 /
+	// PR #2). The handler passes (since, baselineCutoff, limit);
+	// see the sqlc query in pkg/state/queries.sql for the scoring
+	// formula and reason taxonomy.
+	TrafficAnomalyAggregate(ctx context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error)
+	// PerAccountRateLimitAggregate is the durable view of
+	// auth.rate_limited events grouped by account_id (subject)
+	// over a rolling window. Powers GET /v1/admin/obs/rate-limits
+	// (ADR-091 §3.5 / PR #2). Anonymous events (subject IS NULL)
+	// collapse under the all-zeros UUID so the operator UI can
+	// render the credential-stuffing signal distinctly.
+	PerAccountRateLimitAggregate(ctx context.Context, arg sqlc.PerAccountRateLimitAggregateParams) ([]sqlc.PerAccountRateLimitAggregateRow, error)
 	// UsageSLOForApp returns instance_hours and gb_hours
 	// summed across usage_minutes for the given app over the
 	// half-open UTC range [start, end). Powers the

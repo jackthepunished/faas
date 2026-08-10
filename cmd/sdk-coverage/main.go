@@ -72,6 +72,8 @@ var routeExclude = map[string]bool{
 	"GET /v1/admin/obs/tenants/{id}":            true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes":                   true, // ADR-091 — operator-only
 	"GET /v1/admin/obs/nodes/{name}/heartbeats": true, // ADR-091 — operator-only
+	"GET /v1/admin/obs/anomalies":               true, // ADR-091 — operator-only (PR #2)
+	"GET /v1/admin/obs/rate-limits":             true, // ADR-091 — operator-only (PR #2)
 
 	// Dashboard auth (issue #165 PR #2, ADR-032). The SDK uses the
 	// device-code flow for programmatic auth; the dashboard cookie

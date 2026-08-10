@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -149,6 +150,85 @@ func NewLimiter(cfg AuthLimitConfig) *Limiter {
 		cfg.ClientIPFn = defaultClientIP
 	}
 	return &Limiter{inner: &authLimiter{cfg: cfg}}
+}
+
+// LimiterSnapshot is a point-in-time view of a Limiter's tracked
+// failures, suitable for the operator observability surface
+// (ADR-091 §3.5). The snapshot is a deep copy: the underlying
+// timestamps are owned by the caller, so the operator handler can
+// project them onto the wire without holding the limiter mutex.
+//
+// Per-IP entries are de-duplicated against the configured Window so a
+// caller never sees stale entries that the limiter itself would
+// immediately drop. The hits counter is "failures inside Window as
+// of snapshot time"; it is not the lifetime counter.
+type LimiterSnapshot struct {
+	Window      time.Duration
+	MaxFailures int
+	Entries     []LimiterSnapshotEntry
+	Now         time.Time
+}
+
+// LimiterSnapshotEntry is one client-IP row in a LimiterSnapshot.
+// AccountID is empty: the limiter is keyed by IP alone (per spec §11
+// "10/min/IP"); correlation to account_id is the durable view's job
+// (events.kind = 'auth.rate_limited'), see PerAccountRateLimitAggregate
+// in pkg/state/queries.sql.
+type LimiterSnapshotEntry struct {
+	IP   string
+	Hits int
+}
+
+// Snapshot returns a deep-copy view of every tracked IP failure
+// inside the configured Window as of lim.inner.cfg.Now(). The slice
+// is sorted by Hits DESC then IP ASC for deterministic operator-UI
+// rendering.
+//
+// Cost is O(n) over the failure map, holding the limiter mutex for
+// the duration of the copy. The handler that calls this is the
+// operator endpoint, which is rare — the lock window is bounded by
+// the bucket count (today: <100 IPs in normal ops, <10k under attack).
+//
+// Callers MUST NOT mutate the returned LimiterSnapshot: the deep
+// copy is by-value, but the entry slice is shared via reference.
+// Treat the returned value as read-only.
+func (l *Limiter) Snapshot() LimiterSnapshot {
+	if l == nil || l.inner == nil {
+		return LimiterSnapshot{}
+	}
+	l.inner.mu.Lock()
+	defer l.inner.mu.Unlock()
+	now := l.inner.cfg.Now()
+	cutoff := now.Add(-l.inner.cfg.Window)
+	out := LimiterSnapshot{
+		Window:      l.inner.cfg.Window,
+		MaxFailures: l.inner.cfg.MaxFailures,
+		Now:         now,
+	}
+	if len(l.inner.failures) == 0 {
+		return out
+	}
+	for ip, fs := range l.inner.failures {
+		// Drop expired entries from the front — same logic as
+		// isLimited / recordFailure. The slice is in arrival order.
+		i := 0
+		for i < len(fs) && fs[i].Before(cutoff) {
+			i++
+		}
+		fs = fs[i:]
+		if len(fs) == 0 {
+			continue
+		}
+		out.Entries = append(out.Entries, LimiterSnapshotEntry{IP: ip, Hits: len(fs)})
+	}
+	// Sort by Hits DESC, then IP ASC for stable render.
+	sort.Slice(out.Entries, func(i, j int) bool {
+		if out.Entries[i].Hits != out.Entries[j].Hits {
+			return out.Entries[i].Hits > out.Entries[j].Hits
+		}
+		return out.Entries[i].IP < out.Entries[j].IP
+	})
+	return out
 }
 
 // AuthLimitWithLimiter is AuthLimit but the bucket is shared with other

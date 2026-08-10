@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/cursor"
+	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
 
 // stripePushKey is the (account, hour) dedupe key the hourly Stripe
@@ -10285,4 +10287,230 @@ func (m *MemStore) ExpireOrgInvitations(_ context.Context, now time.Time) (int64
 		}
 	}
 	return n, nil
+}
+
+// TrafficAnomalyAggregate is the in-memory mirror of
+// (PgStore).TrafficAnomalyAggregate. The MemStore backs the unit
+// tests for the operator-obs handlers; production runs against the
+// pgstore, so the memstore impl is intentionally minimal — it walks
+// the in-memory usage_minutes map and applies the same scoring
+// formula. Empty result on an empty store; full result when usage
+// rows are seeded.
+//
+// See ADR-091 §3.6 / PR #2 for the scoring model.
+func (m *MemStore) TrafficAnomalyAggregate(_ context.Context, arg sqlc.TrafficAnomalyAggregateParams) ([]sqlc.TrafficAnomalyAggregateRow, error) {
+	if !arg.Minute.Valid || !arg.Minute_2.Valid || arg.Column3 <= 0 {
+		return nil, fmt.Errorf("state: traffic_anomaly_aggregate: invalid params (since=%v baseline=%v limit=%d)", arg.Minute, arg.Minute_2, arg.Column3)
+	}
+	since := arg.Minute.Time
+	baselineCutoff := arg.Minute_2.Time
+	limit := int(arg.Column3)
+	type bucket struct {
+		sum, sumSq float64
+		n          int
+	}
+	bl := map[string]*bucket{} // key = accountID|appID|hour
+	key := func(a, b string, h int) string {
+		return a + "|" + b + "|" + fmt.Sprint(h)
+	}
+	m.mu.Lock()
+	for _, u := range m.usage {
+		if u.Minute.Before(baselineCutoff) || !u.Minute.Before(since) {
+			continue
+		}
+		if u.MBSeconds <= 0 {
+			continue
+		}
+		k := key(u.AccountID, u.AppID, u.Minute.UTC().Hour())
+		bk := bl[k]
+		if bk == nil {
+			bk = &bucket{}
+			bl[k] = bk
+		}
+		bk.sum += float64(u.MBSeconds)
+		bk.sumSq += float64(u.MBSeconds) * float64(u.MBSeconds)
+		bk.n++
+	}
+	current := map[string]float64{} // (acct, app, minute RFC3339) -> sum
+	for _, u := range m.usage {
+		if u.Minute.Before(since) {
+			continue
+		}
+		if u.MBSeconds <= 0 {
+			continue
+		}
+		k := u.AccountID + "|" + u.AppID + "|" + u.Minute.UTC().Format(time.RFC3339)
+		current[k] += float64(u.MBSeconds)
+	}
+	m.mu.Unlock()
+	type scored struct {
+		r sqlc.TrafficAnomalyAggregateRow
+		z float64
+	}
+	out := make([]sqlc.TrafficAnomalyAggregateRow, 0)
+	var scoredRows []scored
+	for k, cur := range current {
+		// Parse key back — three parts joined by "|", minute is
+		// RFC 3339 which itself contains no "|".
+		parts := strings.SplitN(k, "|", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		accountID, appID, minuteRFC := parts[0], parts[1], parts[2]
+		minute, _ := time.Parse(time.RFC3339, minuteRFC)
+		bk := bl[key(accountID, appID, minute.UTC().Hour())]
+		if bk == nil || bk.n < 3 {
+			continue
+		}
+		mean := bk.sum / float64(bk.n)
+		variance := (bk.sumSq / float64(bk.n)) - mean*mean
+		if variance < 0 {
+			variance = 0
+		}
+		stddev := sqrtFloat64(variance)
+		var z float64
+		var reason string
+		switch {
+		case stddev < 1.0 && cur >= 5.0*mean && mean > 0:
+			z = (cur - mean) / 5.0
+			reason = "raw_z"
+		case stddev >= 1.0 && cur >= mean+3.0*stddev:
+			z = (cur - mean) / stddev
+			reason = "hour_of_day"
+		default:
+			continue
+		}
+		scoredRows = append(scoredRows, scored{
+			r: sqlc.TrafficAnomalyAggregateRow{
+				AccountID:        uuidToPgtype(accountID),
+				AppID:            uuidToPgtype(appID),
+				Minute:           pgtypeTimestamptzFromTime(minute),
+				CurrentMbSeconds: cur,
+				MeanMbSeconds:    mean,
+				StddevMbSeconds:  stddev,
+				SampleCount:      int32(bk.n),
+				ZScore:           &z,
+				Reason:           reason,
+			},
+			z: z,
+		})
+	}
+	sort.Slice(scoredRows, func(i, j int) bool { return scoredRows[i].z > scoredRows[j].z })
+	if len(scoredRows) > limit {
+		scoredRows = scoredRows[:limit]
+	}
+	for _, s := range scoredRows {
+		out = append(out, s.r)
+	}
+	return out, nil
+}
+
+// PerAccountRateLimitAggregate is the in-memory mirror of
+// (PgStore).PerAccountRateLimitAggregate. Counts events rows of
+// kind='auth.rate_limited' over the since window, grouped by
+// subject (uuid) — anonymous events (subject empty) collapse under
+// the all-zeros UUID. See ADR-091 §3.5 / PR #2.
+func (m *MemStore) PerAccountRateLimitAggregate(_ context.Context, arg sqlc.PerAccountRateLimitAggregateParams) ([]sqlc.PerAccountRateLimitAggregateRow, error) {
+	if !arg.At.Valid || arg.Column2 <= 0 {
+		return nil, fmt.Errorf("state: per_account_rate_limit_aggregate: invalid params (since=%v limit=%d)", arg.At, arg.Column2)
+	}
+	since := arg.At.Time
+	type bucket struct {
+		hits int
+		last time.Time
+	}
+	bl := map[string]*bucket{} // key = subject UUID string (or zeros)
+	m.mu.Lock()
+	for _, ev := range m.events {
+		if ev.Kind != "auth.rate_limited" {
+			continue
+		}
+		if ev.At.Before(since) {
+			continue
+		}
+		key := "00000000-0000-0000-0000-000000000000"
+		if ev.Subject != nil && *ev.Subject != uuid.Nil {
+			key = ev.Subject.String()
+		}
+		bk := bl[key]
+		if bk == nil {
+			bk = &bucket{}
+			bl[key] = bk
+		}
+		bk.hits++
+		if ev.At.After(bk.last) {
+			bk.last = ev.At
+		}
+	}
+	m.mu.Unlock()
+	type rlrow struct {
+		r sqlc.PerAccountRateLimitAggregateRow
+	}
+	var rows []rlrow
+	limit := int(arg.Column2)
+	for k, bk := range bl {
+		rows = append(rows, rlrow{r: sqlc.PerAccountRateLimitAggregateRow{
+			AccountID:   uuidToPgtype(k),
+			Hits:        int32(bk.hits),
+			LastEventAt: bk.last,
+		}})
+	}
+	la := func(r sqlc.PerAccountRateLimitAggregateRow) time.Time {
+		if t, ok := r.LastEventAt.(time.Time); ok {
+			return t
+		}
+		return time.Time{}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].r.Hits != rows[j].r.Hits {
+			return rows[i].r.Hits > rows[j].r.Hits
+		}
+		return la(rows[i].r).After(la(rows[j].r))
+	})
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	out := make([]sqlc.PerAccountRateLimitAggregateRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.r)
+	}
+	return out, nil
+}
+
+// sqrtFloat64 is a small helper for the in-memory anomaly stddev
+// calculation. MemStore lives in package state and avoids pulling
+// in math just for sqrt; the inline implementation matches math.Sqrt
+// within float64 precision for the inputs the anomaly aggregate
+// sees (mb_seconds values, typically <1e9).
+func sqrtFloat64(x float64) float64 {
+	if x <= 0 {
+		return 0
+	}
+	z := x
+	for i := 0; i < 32; i++ {
+		z = (z + x/z) / 2
+	}
+	return z
+}
+
+// uuidToPgtype parses a UUID string into a pgtype.UUID with
+// Valid=true. Returns a zero pgtype.UUID with Valid=false on parse
+// failure; the operator handlers never propagate the all-zeros
+// sentinel to the wire (the SQL coalesce in the durable query
+// already returns the literal all-zeros UUID for anonymous events).
+func uuidToPgtype(s string) pgtype.UUID {
+	var u pgtype.UUID
+	if err := u.Scan(s); err != nil {
+		return pgtype.UUID{}
+	}
+	return u
+}
+
+// pgtypeTimestamptzFromTime builds a pgtype.Timestamptz with
+// Valid=true from a Go time.Time. The MemStore anomaly aggregate
+// only emits non-zero timestamps (it parses the RFC 3339 minute
+// key); this helper exists so the Row.Minute field is wire-shape
+// consistent with pgstore.
+func pgtypeTimestamptzFromTime(t time.Time) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: t.UTC(), Valid: true}
 }
