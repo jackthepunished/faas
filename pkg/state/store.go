@@ -1738,6 +1738,49 @@ type Store interface {
 	UpdateAlertDeliveryStatus(ctx context.Context, id string, status AlertDeliveryStatus, attempt int, statusCode int, lastErr string, deliveredAt *time.Time) error
 	ListAlertDeliveriesForRule(ctx context.Context, ruleID string, limit int) ([]AlertDelivery, error)
 
+	// Edge rules (ADR-089, planned). apid is the only writer;
+	// gatewayd-internal reads via MatchEdgeRulesForHost. Per-app
+	// scope only — there is no account-wide flavour. The action
+	// column is jsonb (kind-tagged union); see EdgeRuleAction in
+	// types.go for the per-kind shapes.
+	//
+	// CreateEdgeRule is the un-capped insert path used by tests.
+	// The customer-facing handler always calls
+	// CreateEdgeRuleIfUnderQuota (same TOCTOU-defence pattern as
+	// CreateAlertRuleIfUnderQuota). The quota is enforced under
+	// FOR UPDATE on the parent app row so concurrent inserts can't
+	// race past the cap.
+	CreateEdgeRule(ctx context.Context, in CreateEdgeRuleParams) (EdgeRule, error)
+	// CreateEdgeRuleIfUnderQuota inserts the rule iff the app is
+	// under its plan's per-app quota (limits.EdgeRulesPerApp).
+	// Returns:
+	//   - (EdgeRule{}, *EdgeRuleQuotaError) when the cap trips
+	//   - (EdgeRule{}, ErrNotFound) when the app row is missing
+	//   - (EdgeRule{}, ErrConflict) on a FK violation (account gone)
+	CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeRuleParams, limits api.Limits) (EdgeRule, error)
+	ListEdgeRulesForAccount(ctx context.Context, accountID string) ([]EdgeRule, error)
+	ListEdgeRulesForApp(ctx context.Context, appID string) ([]EdgeRule, error)
+	GetEdgeRuleByID(ctx context.Context, id string) (EdgeRule, error)
+	// UpdateEdgeRule coalesces the optional fields onto edge_rules.
+	// nil pointers leave the field untouched; Action is
+	// *EdgeRuleAction because a nil means "do not touch the jsonb
+	// column"; a non-nil replaces it wholesale. The kind-tagged
+	// union has no partial-update shape — the customer re-sends
+	// the full action body.
+	UpdateEdgeRule(ctx context.Context, id string, params UpdateEdgeRuleParams) (EdgeRule, error)
+	DeleteEdgeRule(ctx context.Context, id string) error
+	// CountEdgeRulesForApp is the quota check (called by the apid
+	// handler before the insert; the insert itself runs the same
+	// count inside the FOR UPDATE on the apps row).
+	CountEdgeRulesForApp(ctx context.Context, appID string) (int, error)
+	// MatchEdgeRulesForHost is the gateway hot-path read. Returns
+	// every enabled rule whose match_host matches `host` (or "*"),
+	// ordered by priority ASC. The gatewayd matcher iterates in
+	// priority order and short-circuits on first match. Returns
+	// the full action payload so the gateway doesn't need a
+	// second round-trip per kind.
+	MatchEdgeRulesForHost(ctx context.Context, host string) ([]EdgeRule, error)
+
 	// CountFailedInvocationsSince counts terminal-failed invocations on
 	// (accountID, appID, source) since `since`. The meterd evaluator
 	// uses this for the failed_invocations metric branch — Issue

@@ -872,6 +872,24 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/apps/{slug}/alerts/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteAlertRule))))
 	mux.HandleFunc("POST /v1/apps/{slug}/alerts/{id}/rotate-secret", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.rotateAlertRuleSecret))))
 
+	// Edge rules (ADR-089, planned). Customer-facing resource that
+	// runs in pkg/gateway BEFORE host→app resolution. Mirrors the
+	// alert-rules decorator chain: authLimited → requireMFA →
+	// requireScope (read|deploy-write); POST is also wrapped in
+	// idempotent so SDK retries are safe. Plan-kind gate
+	// (jwt|ip → 402) and per-app quota (402) live inside
+	// createEdgeRule so a Free customer posting to a non-existent
+	// slug still gets a clean 402, not a 404 slug leak (same
+	// pattern as createAlertRule). The two list routes cover the
+	// two read surfaces: account-wide overview for the dashboard
+	// pane, app-scoped for the per-app config view.
+	mux.HandleFunc("GET /v1/edge-rules", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listEdgeRules))))
+	mux.HandleFunc("GET /v1/apps/{slug}/edge-rules", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listEdgeRulesForApp))))
+	mux.HandleFunc("POST /v1/apps/{slug}/edge-rules", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createEdgeRule)))))
+	mux.HandleFunc("GET /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getEdgeRule))))
+	mux.HandleFunc("PATCH /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateEdgeRule))))
+	mux.HandleFunc("DELETE /v1/edge-rules/{id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteEdgeRule))))
+
 	// Outbound webhooks (issue #476 / ADR-076). CRUD surface under
 	// /v1/apps/{slug}/webhooks mirrors /v1/apps/{slug}/alerts: same
 	// plan-tier gate (Free → 402 plan_webhooks_not_allowed), same
