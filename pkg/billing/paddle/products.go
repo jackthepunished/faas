@@ -2,6 +2,7 @@ package paddle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -75,6 +76,13 @@ type planPriceSpec struct {
 // AND plan → pri_… (monthly price) AND plan → pri_… (overage price).
 // meterd's quota + dunning timers use the overage price handle.
 func (p *Provider) ensureProducts(ctx context.Context) error {
+	// Defensive: see Provider.EnsurePlanProducts. Hand-built
+	// *Provider values would otherwise nil-panic on the first SDK
+	// call below.
+	if p.client == nil {
+		return errors.New("paddle: SDK not initialized")
+	}
+
 	// 1. List active products with the faas-plan- prefix. Status
 	//    filter is Paddle's documented list-filter knob, so the query
 	//    avoids matching archived products from prior re-catalogues.

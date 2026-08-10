@@ -996,6 +996,15 @@ func (m *MemStore) CountDeployments(_ context.Context, id string) (int, error) {
 // shared column is safe in single-provider deployments
 // (FAAS_BILLING_PROVIDER is per-deployment, not per-row).
 func (m *MemStore) UpdateAccountProviderCustomerID(_ context.Context, id, providerCustomerID string) error {
+	// Empty providerCustomerID would silently corrupt the
+	// reverse-lookup map (an empty-string key would point at the
+	// most-recently-updated account, and AccountByProviderCustomerID
+	// would return that account instead of ErrNotFound). Production
+	// callers (apid changePlan, the Paddle webhook) check for empty
+	// first; this is the store-side belt to that brace.
+	if providerCustomerID == "" {
+		return fmt.Errorf("state: UpdateAccountProviderCustomerID: empty providerCustomerID for account %q", id)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.accounts[id]

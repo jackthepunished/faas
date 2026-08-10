@@ -176,22 +176,6 @@ func (p *Provider) claimedBy() string {
 // without live configuration. EnsurePlanProducts must be called
 // before PushUsageRecord / CreateCustomer in production; both fail
 // fast with a descriptive error if the catalog is empty.
-// newPaddleSDKFn is the SDK-construction seam NewProvider delegates
-// to. Production points at paddleNewSandbox / paddleNew; tests can
-// swap the package-private field to assert the boot-time error path
-// (TestNewProvider_PropagatesSDKInitError) without standing up a
-// real Paddle sandbox. Same pattern as FlushFnForTest below —
-// package-scope, so test packages from outside this directory can
-// reach for it without exposing the field directly.
-var (
-	paddleNewSandbox = func(apiKey string, opts ...paddle.Option) (*paddle.SDK, error) {
-		return paddle.NewSandbox(apiKey, opts...)
-	}
-	paddleNew = func(apiKey string, opts ...paddle.Option) (*paddle.SDK, error) {
-		return paddle.New(apiKey, opts...)
-	}
-)
-
 // PaddleCapabilities returns the static capability set for the Paddle
 // provider. Lifted out of *Provider.Capabilities so the loader's
 // Providers() metadata-only path (loader.go:160) does not have to
@@ -216,9 +200,9 @@ func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) (
 	var client *paddle.SDK
 	var err error
 	if sandbox {
-		client, err = paddleNewSandbox(apiKey, paddle.WithClient(httpClient))
+		client, err = paddle.NewSandbox(apiKey, paddle.WithClient(httpClient))
 	} else {
-		client, err = paddleNew(apiKey, paddle.WithClient(httpClient))
+		client, err = paddle.New(apiKey, paddle.WithClient(httpClient))
 	}
 	if err != nil {
 		// NewSandbox / New only fail on programmer error (invalid
@@ -388,6 +372,14 @@ func (p *Provider) Capabilities() billing.CapabilitySet {
 // `Status: active` filter on ListProducts, finds the existing
 // products/prices, and skips the POST. No merchant-side flag.
 func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
+	// Defensive: NewProvider returns an error and the loader refuses to
+	// start the daemon when the SDK cannot be constructed (B2 invariant).
+	// The guard stays so future hand-built *Provider values
+	// (NewProviderForTest, future test fixtures) get a descriptive
+	// error rather than a nil-panic in ensurePlansAndPrices.
+	if p.client == nil {
+		return fmt.Errorf("paddle: SDK not initialized (apiKey=%q)", redactAPIKey(p.apiKey))
+	}
 	if err := p.ensurePlansAndPrices(ctx); err != nil {
 		return fmt.Errorf("paddle: ensure plans: %w", err)
 	}
