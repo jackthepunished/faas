@@ -1,0 +1,31 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00168_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- Sibling of migrations/00166_reserve_slot.sql (PR #798, ADR-088)
+-- from PR #795 (issue #791 PR A). The original migration was
+-- 00166 but PRs #797 (compute_nodes_public_ip), #799 (edge_rules),
+-- #798 (apps_overflow_node, ADR-088), #800 (app_secrets_kid), and
+-- #803 (builds_deployment_started_idx) all claimed slots in this
+-- window in parallel; this PR renumbered twice (→171, →173) as
+-- the race tightened. Slots 168-172 are held here so the embedded
+-- FS stays contiguous while the five-way slot race resolves on
+-- its own. Whichever of the siblings merges first deletes its
+-- 00168/00169/00170/00171/00172 fence on the next rebase per
+-- ADR-041.
+--
+-- Body: `select 1;` — deliberate no-op. The replay-safety gate in
+-- ci.yml drops files matching the reservation regex from its
+-- "added migration versions" computation. See
+-- migrations/00056_reserve_slot.sql for the canonical template.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd

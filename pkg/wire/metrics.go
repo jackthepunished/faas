@@ -921,12 +921,15 @@ type OpsMetrics struct {
 	appAtCapacityTotal *prometheus.CounterVec
 	// pressureReassignmentsTotal: Tier A9 / ADR-087
 	// pressure-rebalancer observability. Counter labelled by
-	// outcome ∈ {migrated, peer_live_migrated, conflict,
-	// no_headroom, no_eligibility, no_peer} — the closed set
+	// outcome ∈ {migrated, conflict, no_headroom,
+	// no_eligibility, no_peer} — the closed set
 	// the pressure-rebalancer's batch loop can land in once per
 	// app per sweep. `migrated` is the §12 dashboard panel
-	// (sum over 5m for the rate); `peer_live_migrated` is the
-	// tripwire for the four-phase live handoff firing on the
+	// (sum over 5m for the rate); the `peer_live_migrated`
+	// label was removed in the Tier A10 follow-up PR because the
+	// helper it gated always no-op'd (see NewOpsMetrics body for
+	// the rationale); Tier A10.1 (peer-to-peer migrator) will
+	// re-introduce it.
 	// pressure path (a non-zero rate means the policy gate
 	// opened the live migration window); `no_headroom` is the
 	// tripwire for sustained full-cluster pressure (call the
@@ -1228,18 +1231,33 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		appAtCapacityTotal.WithLabelValues("__none__", kind)
 	}
 	// ADR-087 / Tier A9: pressure-rebalancer decision counter.
-	// Labelled by outcome ∈ {migrated, peer_live_migrated, conflict,
-	// no_headroom, no_eligibility, no_peer}. The closed set is
+	// Labelled by outcome ∈ {migrated, conflict, no_headroom,
+	// no_eligibility, no_peer}. The closed set is
 	// pre-instantiated at boot so the rows surface in /metrics from
 	// the moment schedd starts (matching the rebalanceDecisions /
 	// liveMigrationDecisions precedent). Single-registry: registered
 	// on every daemon (mirrors rebalanceDecisions); only schedd
 	// increments via PressureReassignments.
+	//
+	// Note (ADR-087 / Tier A10 follow-up 2026-08-10): the
+	// `peer_live_migrated` outcome label was removed in PR
+	// #799 (Tier A10 follow-ups) because the
+	// maybeMigrateLiveInstancesFor helper it gated always
+	// no-op'd — it called Engine.MigrateLiveInstances with
+	// `deadNodeID=e.ownerNodeID`, which the function's own
+	// self-path early-return rejected (return 0, nil).
+	// ADR-066's four-phase handoff only supports destination =
+	// local schedd (active-passive HA, ADR-083); peer-to-peer
+	// live migration on the pressure path is a Tier A10.1
+	// follow-up. The migration policy knob keeps the closed set
+	// {skip_live, migrate_after_1, migrate_after_2} so a future
+	// PR can wire the policy to a real peer-to-peer migrator
+	// without churn on the API surface.
 	pressureReassignmentsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_pressure_reassignments_total",
-		Help: "Cross-node capacity-pressure rebalance decisions (Tier A9 / ADR-087), labelled by outcome ∈ {migrated, peer_live_migrated, conflict, no_headroom, no_eligibility, no_peer}. `migrated` is the §12 dashboard panel (sum over 5m for the rate); `peer_live_migrated` is the tripwire for the policy gate opening the four-phase live handoff (ADR-066) on the pressure path; `no_headroom` is the tripwire for sustained full-cluster pressure (call the operator). Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via PressureReassignments.",
+		Help: "Cross-node capacity-pressure rebalance decisions (Tier A9 / ADR-087), labelled by outcome ∈ {migrated, conflict, no_headroom, no_eligibility, no_peer, overflow_target_unavailable}. `migrated` is the §12 dashboard panel (sum over 5m for the rate); `no_headroom` is the tripwire for sustained full-cluster pressure (call the operator); `overflow_target_unavailable` is the Tier A10 / ADR-088 tripwire when the customer's preferred spill target is full or inactive. Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via PressureReassignments.",
 	}, []string{"outcome"})
-	for _, outcome := range []string{"migrated", "peer_live_migrated", "conflict", "no_headroom", "no_eligibility", "no_peer", "overflow_target_unavailable"} {
+	for _, outcome := range []string{"migrated", "conflict", "no_headroom", "no_eligibility", "no_peer", "overflow_target_unavailable"} {
 		pressureReassignmentsTotal.WithLabelValues(outcome)
 	}
 	// ADR-088 / Tier A10: per-app overflow_node preference
@@ -2705,13 +2723,21 @@ func (m *OpsMetrics) AppAtCapacityTotal(app, kind string) prometheus.Counter {
 
 // PressureReassignments returns the per-(outcome) counter the
 // Tier A9 / ADR-087 pressure-rebalancer increments once per app
-// per sweep. outcome ∈ {migrated, peer_live_migrated, conflict,
-// no_headroom, no_eligibility, no_peer}. `migrated` is the §12
-// dashboard panel; `peer_live_migrated` is the tripwire for the
-// policy gate opening the four-phase live handoff (ADR-066);
-// `no_headroom` is the tripwire for sustained full-cluster
-// pressure (call the operator). Same caching rules as
-// RebalanceDecisions — the returned Counter is safe to retain.
+// per sweep. outcome ∈ {migrated, conflict, no_headroom,
+// no_eligibility, no_peer, overflow_target_unavailable}.
+// `migrated` is the §12 dashboard panel;
+// `overflow_target_unavailable` is the Tier A10 / ADR-088
+// tripwire when the customer's preferred spill target is full
+// or inactive. The `peer_live_migrated` label was removed in
+// the Tier A10 follow-up PR because the
+// maybeMigrateLiveInstancesFor helper it gated always no-op'd
+// (passed e.ownerNodeID as deadNodeID, which
+// MigrateLiveInstances self-skips at engine.go:2944); Tier
+// A10.1 will re-introduce it once a true peer-to-peer migrator
+// is wired. `no_headroom` is the tripwire for sustained
+// full-cluster pressure (call the operator). Same caching
+// rules as RebalanceDecisions — the returned Counter is safe
+// to retain.
 func (m *OpsMetrics) PressureReassignments(outcome string) prometheus.Counter {
 	if m == nil {
 		return nil

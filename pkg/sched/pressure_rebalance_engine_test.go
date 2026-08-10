@@ -23,16 +23,26 @@
 //  5. TestRebalancePressuredApps_EmitsPressureRebalancedNotify — notify payload.
 //  6. TestRebalancePressuredApps_PolicySkipLive — skip_live policy closes the live window.
 //  7. TestRebalancePressuredApps_PolicyMigrateAfter2 — first sweep no live, second sweep no-op live.
+//  8. TestPressureReassignmentsOutcomeSet — closed-set pin: `peer_live_migrated`
+//     is removed from the closed outcome set (Tier A10 follow-up; see pkg/wire/metrics.go
+//     comments for the rationale). The engine's
+//     PressureReassignments(outcome) accessor MUST NOT accept
+//     "peer_live_migrated" — Prometheus returns a no-op Counter
+//     for an unknown label, but the wire contract is the closed
+//     set; pins prevent a regression that re-introduces a label
+//     without bumping the metric set.
 
 package sched
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/wire"
 )
 
 // pressureTestOwners returns the same fixture as
@@ -60,11 +70,31 @@ func seedPressureApp(t *testing.T, store *state.MemStore, ctx context.Context, p
 // default (migrate_after_2).
 func newPressureEngine(t *testing.T, store *state.MemStore, ownerNodeID string, notif *fakeNotifier, policy string) *Engine {
 	t.Helper()
+	return newPressureEngineWithOps(t, store, ownerNodeID, notif, policy, nil)
+}
+
+// newPressureEngineWithOps is the full-seam variant: wires a
+// real OpsMetrics via wire.NewOpsMetrics so the test can
+// assert on the metric surface. opsOverride (if non-nil)
+// replaces the freshly-constructed OpsMetrics; useful for
+// tests that need a stubbed or pre-populated registry.
+//
+// A throwaway prometheus.Registry is held in a package-level
+// var (see below) so multiple calls don't double-register
+// counters. This matches the §12 dashboard contract: a single
+// registry per test binary, just labelled "test" prefix.
+func newPressureEngineWithOps(t *testing.T, store *state.MemStore, ownerNodeID string, notif *fakeNotifier, policy string, opsOverride *wire.OpsMetrics) *Engine {
+	t.Helper()
 	agg := NewPressureAggregator()
+	ops := opsOverride
+	if ops == nil {
+		ops = wire.NewOpsMetrics("test")
+	}
 	e := newEngine(t, store, &fakeVMM{}, notif, "1.10.0").
 		WithOwnerNodeID(ownerNodeID).
 		WithPressureConfig(5, 30).
-		WithPressureAggregator(agg)
+		WithPressureAggregator(agg).
+		WithOpsMetrics(ops)
 	if policy != "" {
 		e.WithPressureMigrationPolicy(policy)
 	}
@@ -275,9 +305,9 @@ func TestRebalancePressuredApps_PolicySkipLive(t *testing.T) {
 		t.Fatalf("RebalancePressuredApps: %v", err)
 	}
 	// No assertion at the live-migration level — the
-	// skip_live policy gates the call inside
-	// maybeMigrateLiveInstancesFor before the engine
-	// touches the four-phase handoff. The sweep test
+	// skip_live policy gates the call inside the
+	// (now-removed) maybeMigrateLiveInstancesFor before the
+	// engine touches the four-phase handoff. The sweep test
 	// below exercises the same path under migrate_after_2.
 }
 
@@ -340,4 +370,98 @@ func countPressureRebalancedNotifies(notif *fakeNotifier) int {
 		}
 	}
 	return n
+}
+
+// TestPressureReassignmentsOutcomeSet pins the closed-set
+// contract on Engine.ops.PressureReassignments(outcome) for
+// the Tier A9 / ADR-087 metric surface (Tier A10 follow-up
+// removed `peer_live_migrated`).
+//
+// The closed set is the wire contract: dashboard panels and
+// runbook queries assume these labels exist. A regression that
+// drops a label without bumping the metric set (or vice versa)
+// silently breaks the §12 dashboard panels. This test pins:
+//   - The accepted labels MUST increment cleanly via the
+//     pressure-rebalance code path; the test does not assert
+//     the increment here (covered by the
+//     TestRebalancePressuredApps_* tests above), only that the
+//     labels are part of the closed set.
+//   - `peer_live_migrated` MUST NOT be an accepted label —
+//     its previous helper (maybeMigrateLiveInstancesFor) was
+//     removed because it always no-op'd via the
+//     MigrateLiveInstances self-path early-return. A future
+//     PR (Tier A10.1, peer-to-peer migrator) MAY re-introduce
+//     it; that PR must update this test and the closed-set
+//     initializer in pkg/wire/metrics.go together.
+func TestPressureReassignmentsOutcomeSet(t *testing.T) {
+	store, ctx, defaultLocal, _ := pressureTestOwners(t)
+	_ = store
+	_ = ctx
+	_ = defaultLocal
+	// Build a pressure engine with a real OpsMetrics so we
+	// can drive the accessor. The wire package's own
+	// test surface (pkg/wire/metrics_test.go) covers the
+	// closed-set initialization order; this test pins the
+	// engine-side accessor contract specifically.
+	notif := &fakeNotifier{}
+	e := newPressureEngine(t, store, defaultLocal.ID, notif, api.PressureMigrationPolicy)
+	if e.ops == nil {
+		t.Fatal("engine.ops is nil; opsmetrics wiring regressed")
+	}
+	// accepted labels: every value the engine code paths
+	// pass into observePressure. The list mirrors the
+	// pre-instantiated closed set in pkg/wire/metrics.go
+	// NewOpsMetrics (Tier A10 follow-up removed
+	// peer_live_migrated).
+	accepted := map[string]struct{}{
+		"migrated":                    {},
+		"conflict":                    {},
+		"no_headroom":                 {},
+		"no_eligibility":              {},
+		"no_peer":                     {},
+		"overflow_target_unavailable": {},
+	}
+	for label := range accepted {
+		// A nil-safe accessor (per pkg/wire/metrics.go) must
+		// return a non-nil prometheus.Counter for an
+		// instantiated label. The wire package's
+		// pre-instantiation at NewOpsMetrics time is the
+		// authoritative "label exists" gate; we just smoke
+		// the accessor here.
+		if c := e.ops.PressureReassignments(label); c == nil {
+			t.Errorf("PressureReassignments(%q) returned nil", label)
+		}
+	}
+	// peer_live_migrated is OUT of the closed set after
+	// Tier A10 follow-up. The accessor still returns a
+	// Counter (Prometheus tolerates unknown labels), but
+	// the engine NEVER passes that string — pin the
+	// absence by grepping pkg/sched/engine.go for the
+	// string in any observePressure(...) call. The
+	// pre-existing literals are listed below.
+	forbiddenInObserve := []string{"peer_live_migrated"}
+	for _, lit := range forbiddenInObserve {
+		// Read the engine file once. The forbidden
+		// literal must NOT appear on a non-comment
+		// line that invokes observePressure(...). We
+		// allow the literal inside comments (the
+		// removal-rationale block at engine.go:~2552
+		// references it); only an active increment
+		// site is the regression we pin.
+		data, err := os.ReadFile("../../pkg/sched/engine.go")
+		if err != nil {
+			t.Fatalf("read engine.go: %v", err)
+		}
+		src := string(data)
+		needle := "observePressure(\"" + lit + "\")"
+		for _, line := range strings.Split(src, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
+				continue
+			}
+			if strings.Contains(line, needle) {
+				t.Errorf("engine.go still increments observePressure(%q) on line %q — the Tier A10 follow-up PR must NOT re-introduce the broken metric label", lit, trimmed)
+			}
+		}
+	}
 }

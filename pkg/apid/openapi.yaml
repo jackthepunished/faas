@@ -2761,6 +2761,46 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/crons/{id}/runs:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [crons]
+      operationId: listCronRuns
+      summary: List recent runs of a cron.
+      description: |
+        Execution history for one cron, newest first. Each row reports
+        when the fire started, how long it took (`duration_ms`,
+        computed server-side), and a normalized `outcome` — so a
+        timeout is distinguishable from a generic failure without
+        parsing `error`.
+
+        Paginated by `?before=<id>` (the LAST id of the returned
+        slice). Defaults to 10 per page; capped at 100. For a wider,
+        cross-source view use `GET /v1/invocations`.
+      parameters:
+        - name: before
+          in: query
+          required: false
+          schema: { type: string }
+          description: "Cursor — return runs older than this run id. Omit for the most recent page."
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+          description: "Page size; 1-100, default 10."
+      responses:
+        '200':
+          description: A page of runs for this cron, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListCronRunsResponse'
+                example: {"runs":[{"id":"0123456789abcdef0123456789abcdef","started_at":"2026-08-10T09:00:00Z","completed_at":"2026-08-10T09:00:01.2Z","duration_ms":1200,"outcome":"success","attempts":1},{"id":"fedcba9876543210fedcba9876543210","started_at":"2026-08-09T21:00:00Z","completed_at":"2026-08-09T21:00:30Z","duration_ms":30000,"outcome":"timeout","attempts":1,"error":"invoke: gateway timeout"}]}
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   # ─── Projects (ADR-050 / Phase 3) ───────────────────────────────────
   # Two endpoints:
   #   POST /v1/projects/scan  — dry-run; runs reposcan.Scan over the
@@ -7708,6 +7748,32 @@ components:
         created_at: { type: string, format: date-time }
         last_fired_at: { type: [string, "null"], format: date-time }
 
+    CronRun:
+      description: "One execution of a cron: when it fired, how long it ran, and how it ended. Backed by the underlying invocations row, projected so callers need not compute a duration or interpret raw state."
+      type: object
+      required: [id, started_at, outcome, attempts]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        started_at: { type: string, format: date-time, description: "When the cron fired (the invocation's created_at), not when the app began executing." }
+        completed_at: { type: [string, "null"], format: date-time, description: "When the run reached a terminal state; null while still in flight." }
+        duration_ms: { type: [integer, "null"], description: "completed_at - started_at in milliseconds, computed server-side. Null while the run is still in flight." }
+        outcome:
+          type: string
+          enum: [success, failed, timeout, dead_letter, running]
+          description: "Normalized result. `timeout` means the dispatch exceeded its deadline; `dead_letter` means the retry budget was exhausted; `running` means the run has not reached a terminal state yet. Branch on this, never on `error`."
+        attempts: { type: integer, description: "Dispatch attempts for this run; greater than 1 means it was retried." }
+        instance_id: { type: [string, "null"], pattern: '^[a-f0-9]{32}$', description: "The instance that served the run; null if the fire never reached one." }
+        error: { type: [string, "null"], description: "Operator-facing failure text. Unstructured and unversioned — do not parse it." }
+
+    ListCronRunsResponse:
+      description: "Page of cron runs; ordered newest-first. Pass the LAST id of the returned slice as the next `?before=` to load older runs."
+      type: object
+      required: [runs]
+      properties:
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/CronRun' }
+
     CreateCronRequest:
       description: "Cron creation payload: schedule expression and target URL."
       type: object
@@ -9034,8 +9100,8 @@ components:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         account_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
-        source: { type: string, enum: [async_invoke, queue, delayed_task, cron] }
-        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled] }
+        source: { type: string, enum: [async_invoke, queue, delayed_task, cron, replay] }
+        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled, dead_letter] }
         method: { type: string }
         path: { type: string }
         payload: { type: object, additionalProperties: true }
