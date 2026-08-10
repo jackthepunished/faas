@@ -1907,6 +1907,25 @@ func (l *Loop) dispatchOneCron(ctx context.Context, c state.Cron, now time.Time)
 		invokeOut, ierr := l.gateway.Invoke(ctx, c.AppID, inv)
 		if ierr != nil {
 			l.log.Warn("cron: invoke", "cron_id", c.ID, "err", ierr)
+			// issue #791 — terminate the row. Before this, a failed
+			// cron invoke left the claimed row parked in
+			// state='dispatching' forever: the drain's tick filters
+			// on state='pending' so it never reclaimed it, and
+			// nothing else wrote a terminal state. The run-history
+			// surface would render every failed fire as perpetually
+			// "running", and the queue-depth counters (which count
+			// dispatching) drifted up by one per failure.
+			//
+			// retryAfter=0 because the cron loop owns its own
+			// schedule: the next boundary re-fires this cron anyway,
+			// so re-queueing the row would double-dispatch. The
+			// outcome classifier turns a blown deadline into
+			// 'timeout' and everything else into 'failed'.
+			if enq.ID != "" {
+				if err := l.engine.Store().FailInvocation(ctx, enq.ID, "invoke: "+ierr.Error(), 0, 0, failOutcome(ierr)); err != nil {
+					l.log.Warn("cron: fail invocation", "cron_id", c.ID, "err", err)
+				}
+			}
 			// Fall through to legacy wake-only shape so this
 			// doesn't silently drop. tests may rely on the
 			// SynthesizeRequest call for back-compat assertions.

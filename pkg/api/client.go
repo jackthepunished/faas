@@ -845,6 +845,30 @@ func (c *Client) DeleteCron(ctx context.Context, id string) error {
 	return c.do(ctx, "DELETE", "/v1/crons/"+id, nil, nil)
 }
 
+// ListCronRuns returns a page of the cron's execution history (issue
+// #791 / PR A): newest-first, server-computed duration_ms, outcome
+// classification (success/failed/timeout/dead_letter/running).
+// before is the LAST run id of the previous page; omit for the most
+// recent page. limit is 1..100, default 10 — the handler validates
+// and surfaces a 400 Problem with limit + observed on garbage input
+// (matches the canonical parseCronRunsLimit helper). For a wider,
+// cross-source view use ListInvocations.
+func (c *Client) ListCronRuns(ctx context.Context, id, before string, limit int) (ListCronRunsResponse, error) {
+	path := "/v1/crons/" + id + "/runs"
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out ListCronRunsResponse
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // --- Alert rules (issue #396 / ADR-045 PR 3) -------------------------------
 
 // ListAlertRules returns every alert rule visible at the given app

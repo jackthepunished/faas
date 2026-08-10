@@ -1462,6 +1462,82 @@ type Invocation struct {
 	Attempts       int              `json:"attempts"`
 	LastError      string           `json:"last_error,omitempty"`
 	CreatedAt      time.Time        `json:"created_at"`
+	// Outcome is the normalized terminal classification (issue #791).
+	// nil while the row is non-terminal (pending / dispatching); the
+	// read surfaces render nil as "running". See InvocationOutcome.
+	Outcome *InvocationOutcome `json:"outcome,omitempty"`
+}
+
+// InvocationOutcome is the normalized, durable classification of a
+// terminal invocation (issue #791, migrations/00166). It exists
+// because InvocationState collapses every permanent failure into
+// InvocationFailed: a gateway 504 (the app blew its deadline) and a
+// malformed-payload reject are indistinguishable on `state` alone,
+// and recovering the difference by substring-matching LastError is
+// brittle — that text is operator-facing, unversioned, and varies by
+// call site. The classification is therefore recorded at write time,
+// where the caller already knows it.
+//
+// Written only by Store.CompleteInvocation (always OutcomeSuccess)
+// and Store.FailInvocation (via WithOutcome, defaulting to
+// OutcomeFailed / OutcomeDeadLetter). Non-terminal rows carry no
+// outcome at all.
+type InvocationOutcome string
+
+const (
+	// OutcomeSuccess is stamped by CompleteInvocation.
+	OutcomeSuccess InvocationOutcome = "success"
+	// OutcomeFailed is the default terminal classification for a
+	// permanent failure with no more specific cause.
+	OutcomeFailed InvocationOutcome = "failed"
+	// OutcomeTimeout marks a dispatch that exceeded its deadline —
+	// a gateway 504 or an expired claim lease. Callers opt in via
+	// FailInvocation(..., WithOutcome(OutcomeTimeout)); it is never
+	// inferred from LastError.
+	OutcomeTimeout InvocationOutcome = "timeout"
+	// OutcomeDeadLetter mirrors InvocationDeadLetter: the per-plan
+	// retry budget was exhausted. Set automatically by FailInvocation
+	// on the dead-letter branch, so callers need not pass it.
+	OutcomeDeadLetter InvocationOutcome = "dead_letter"
+)
+
+// FailOptions carries the optional, non-breaking extras for
+// Store.FailInvocation. It is threaded as a variadic option rather
+// than a positional parameter because FailInvocation has ~20 call
+// sites across pkg/sched and the test suites; only the two deadline
+// paths in the drain need to say anything beyond the default.
+type FailOptions struct {
+	// Outcome overrides the terminal classification on the permanent
+	// branch (retryAfter == 0). Ignored on the transient-requeue
+	// branch, which leaves the row non-terminal and therefore
+	// outcome-less. The dead-letter branch always wins over this.
+	Outcome InvocationOutcome
+}
+
+// FailOption mutates FailOptions. See WithOutcome.
+type FailOption func(*FailOptions)
+
+// WithOutcome classifies a permanent failure as something more
+// specific than OutcomeFailed — in practice OutcomeTimeout, passed by
+// the drain's deadline paths. A no-op when the row takes the
+// transient-retry or dead-letter branch.
+func WithOutcome(o InvocationOutcome) FailOption {
+	return func(f *FailOptions) { f.Outcome = o }
+}
+
+// ApplyFailOptions folds opts over the defaults. Exported so both
+// store backends derive the effective options identically.
+func ApplyFailOptions(opts []FailOption) FailOptions {
+	f := FailOptions{Outcome: OutcomeFailed}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&f)
+		}
+	}
+	if f.Outcome == "" {
+		f.Outcome = OutcomeFailed
+	}
+	return f
 }
 
 // QueueStats is the projection returned by Store.QueueState (issue

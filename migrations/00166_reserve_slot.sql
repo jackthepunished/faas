@@ -1,0 +1,36 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00166_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / PR #391 migration gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path (the replay-safety gate in ci.yml drops files whose
+-- basename matches the reservation regex from its "added
+-- migration versions" computation).
+--
+-- PR #795 (issue #791 PR A, GET /v1/crons/{id}/runs + invocations
+-- outcome column) renumbered to slot 169 after the cross-PR
+-- collision detector rejected slot 166 — PR #797
+-- (compute_nodes_public_ip) and PR #799 (edge_rules) both shipped a
+-- 00166_*.sql of their own. Per the standard recovery (memory
+-- cross-pr-slot-gate-reservation-fence-pattern), this file holds the
+-- slot while 00167/00168 are unclaimed (no sibling reservation), and
+-- 00169 carries the real migration. Whichever of #795/#797/#799
+-- merges first drops its own 00166_reserve_slot.sql on the next
+-- rebase per ADR-041.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
