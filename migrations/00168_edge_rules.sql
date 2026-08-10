@@ -1,4 +1,4 @@
--- filename: 00166_edge_rules.sql
+-- filename: 00168_edge_rules.sql
 -- +goose Up
 -- +goose StatementBegin
 -- Edge rules (issue #TBD / ADR-089, planned). Customer-configurable
@@ -8,10 +8,10 @@
 -- matcher. See docs/adr/089-edge-rules.md for the decisions; this
 -- file is the schema-only half.
 --
--- Slot 166 is the next free slot on origin/main (165 was taken by
--- build_provenance.framework_version). If a sibling PR grabs 166
+-- Slot 168 is the next free slot on origin/main (165 was taken by
+-- build_provenance.framework_version). If a sibling PR grabs 168
 -- first, renumber per migrations/README.md and update the companion
--- 00166_edge_rules_test.go filename + the literal UUIDs the test
+-- 00168_edge_rules_test.go filename + the literal UUIDs the test
 -- seeds.
 --
 -- Replay-safe (ADR-041 / PR #377): every DDL is guarded by IF NOT

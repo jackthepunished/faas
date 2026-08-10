@@ -17,9 +17,11 @@
 -- 00165_build_provenance_framework_version.sql landed by a parallel
 -- PR) to slot 00167. Slot 00166 is also claimed by three other open
 -- PRs (#795 invocations_outcome, #797 compute_nodes_public_ip,
--- #799 edge_rules). Whichever of those lands first deletes this
--- 00166 fence on its next rebase per ADR-041, exposing the
--- neighbour slot for the next sibling.
+-- #799 edge_rules). PR #799 (edge-rules) renumbered its migration to
+-- 00168 on rebase to leave the fence intact for the other two
+-- siblings. Whichever of #795 / #797 lands first deletes this 00166
+-- fence on its next rebase per ADR-041, exposing the neighbour slot
+-- for the remaining sibling.
 --
 -- Body: `select 1;` — executes against the live DB at apply time
 -- but produces no schema change.

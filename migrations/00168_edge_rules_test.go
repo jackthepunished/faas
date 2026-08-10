@@ -1,13 +1,13 @@
 //go:build !no_pg
 
-// Migration-apply test for 00166_edge_rules.sql (ADR-089 / PR 1 of
+// Migration-apply test for 00168_edge_rules.sql (ADR-089 / PR 1 of
 // the edge-rules rollout). Pins the table shape + the seven-kind
 // CHECK + the priority CHECK + the partial indexes + the
 // ON DELETE CASCADE behaviour.
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00166.
+//  1. Migration set applies cleanly through 00168.
 //  2. The table exists with all 13 columns and the jsonb `action`
 //     column has data_type='jsonb' (NOT 'text' — drift here is the
 //     most likely silent regression).
@@ -23,12 +23,12 @@
 //     gateway's LIKE prefix scan.
 //  8. Replay-safety: a second MigrateUp is a no-op (ADR-041).
 //
-// Seed UUIDs carry the slot number in the last group (`...000166`,
-// `...000266`, `...000366`) so a reader scanning the test fixtures
+// Seed UUIDs carry the slot number in the last group (`...000168`,
+// `...000268`, `...000368`) so a reader scanning the test fixtures
 // can pin each row to this migration without grepping the file
 // name. The literal slot value MUST stay in sync with the
 // filename; renumber per migrations/README.md if a sibling PR
-// grabs 00166 first.
+// grabs 00168 first.
 //
 // Build tag matches the rest of the migration tests; set
 // FAAS_SKIP_PG_TESTS=1 to skip locally (see migrations/README.md).
@@ -43,13 +43,13 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00166_EdgeRules(t *testing.T) {
+func TestMigrations_00168_EdgeRules(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
-	// (1) Apply through 00166.
+	// (1) Apply through 00168.
 	if err := db.MigrateUp(ctx, pool); err != nil {
-		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 166)", err)
+		t.Fatalf("db.MigrateUp: %v (regression: missing migration slot between 1 and 168)", err)
 	}
 
 	// (2) Table shape + action column type. Drift on action type
@@ -74,7 +74,7 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 	// payload. ON CONFLICT DO NOTHING so reruns are idempotent.
 	if _, err := pool.Exec(ctx, `
 		insert into accounts (id, email, plan, created_at)
-		values ('00000000-0000-0000-0000-000000000166',
+		values ('00000000-0000-0000-0000-000000000168',
 		        'edge-rules-test@example.com', 'hobby', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -82,8 +82,8 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		insert into apps (id, account_id, slug, runtime, status, created_at)
-		values ('00000000-0000-0000-0000-000000000266',
-		        '00000000-0000-0000-0000-000000000166',
+		values ('00000000-0000-0000-0000-000000000268',
+		        '00000000-0000-0000-0000-000000000168',
 		        'edge-rules-test-app', 'node22', 'live', now())
 		on conflict (id) do nothing
 	`); err != nil {
@@ -94,9 +94,9 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 			id, account_id, app_id, match_host, match_path,
 			match_methods, priority, enabled, kind, action
 		) values (
-			'00000000-0000-0000-0000-000000000366',
-			'00000000-0000-0000-0000-000000000166',
-			'00000000-0000-0000-0000-000000000266',
+			'00000000-0000-0000-0000-000000000368',
+			'00000000-0000-0000-0000-000000000168',
+			'00000000-0000-0000-0000-000000000268',
 			'*.example.com', '/api/*',
 			ARRAY['GET','POST'], 50, true, 'rewrite',
 			'{"kind":"rewrite","rewrite":{"from":"/api","to":"/v1"}}'::jsonb
@@ -114,9 +114,9 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 		insert into edge_rules (
 			id, account_id, app_id, match_host, kind, action
 		) values (
-			'00000000-0000-0000-0000-000000000466',
-			'00000000-0000-0000-0000-000000000166',
-			'00000000-0000-0000-0000-000000000266',
+			'00000000-0000-0000-0000-000000000468',
+			'00000000-0000-0000-0000-000000000168',
+			'00000000-0000-0000-0000-000000000268',
 			'*', 'cors',
 			'{"kind":"cors","cors":{"allow_origins":["https://app.example.com"],"allow_methods":["GET"],"allow_credentials":false,"max_age_seconds":600}}'::jsonb
 		)
@@ -135,7 +135,7 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		select match_path, match_methods, priority, enabled, kind
 		  from edge_rules
-		 where id = '00000000-0000-0000-0000-000000000466'
+		 where id = '00000000-0000-0000-0000-000000000468'
 	`).Scan(&gotMatchPath, &gotMatchMethods, &gotPriority, &gotEnabled, &gotKind); err != nil {
 		t.Fatalf("read defaults row: %v", err)
 	}
@@ -158,8 +158,8 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 	// (5) CHECK on kind: reject an invalid kind.
 	if _, err := pool.Exec(ctx, `
 		insert into edge_rules (account_id, app_id, match_host, kind, action)
-		values ('00000000-0000-0000-0000-000000000166',
-		        '00000000-0000-0000-0000-000000000266',
+		values ('00000000-0000-0000-0000-000000000168',
+		        '00000000-0000-0000-0000-000000000268',
 		        'bad.example.com', 'nonsense', '{}'::jsonb)
 	`); err == nil {
 		t.Errorf("edge_rules.kind = 'nonsense' accepted; want CHECK violation (regression: closed enum must be enforced at the DB layer)")
@@ -168,8 +168,8 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 	// (6) CHECK on priority: reject a negative value.
 	if _, err := pool.Exec(ctx, `
 		insert into edge_rules (account_id, app_id, match_host, priority, kind, action)
-		values ('00000000-0000-0000-0000-000000000166',
-		        '00000000-0000-0000-0000-000000000266',
+		values ('00000000-0000-0000-0000-000000000168',
+		        '00000000-0000-0000-0000-000000000268',
 		        'bad.example.com', -1, 'cors', '{}'::jsonb)
 	`); err == nil {
 		t.Errorf("edge_rules.priority = -1 accepted; want CHECK violation (regression: 0..10000 range must be enforced)")
@@ -181,7 +181,7 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 	var preCount int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from edge_rules
-		 where app_id = '00000000-0000-0000-0000-000000000266'
+		 where app_id = '00000000-0000-0000-0000-000000000268'
 	`).Scan(&preCount); err != nil {
 		t.Fatalf("count pre-cascade: %v", err)
 	}
@@ -189,14 +189,14 @@ func TestMigrations_00166_EdgeRules(t *testing.T) {
 		t.Fatalf("expected ≥1 rule row for the test app; seed didn't land")
 	}
 	if _, err := pool.Exec(ctx, `
-		delete from apps where id = '00000000-0000-0000-0000-000000000266'
+		delete from apps where id = '00000000-0000-0000-0000-000000000268'
 	`); err != nil {
 		t.Fatalf("delete app: %v", err)
 	}
 	var postCount int
 	if err := pool.QueryRow(ctx, `
 		select count(*) from edge_rules
-		 where app_id = '00000000-0000-0000-0000-000000000266'
+		 where app_id = '00000000-0000-0000-0000-000000000268'
 	`).Scan(&postCount); err != nil {
 		t.Fatalf("count post-cascade: %v", err)
 	}
