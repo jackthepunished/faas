@@ -139,7 +139,7 @@ func (v *joseVerifier) Verify(ctx context.Context, rawToken string, rule Verifie
 	// Get is safe even if not — returns ok=false).
 	set, registered, err := v.cache.Get(ctx, rule.JWKSURL, kid)
 	if err != nil {
-		return nil, fmt.Errorf("%w: fetch %s: %v", ErrJWKSNotRegistered, rule.JWKSURL, err)
+		return nil, fmt.Errorf("%w: fetch %s: %w", ErrJWKSNotRegistered, rule.JWKSURL, err)
 	}
 	if !registered || set == nil {
 		return nil, ErrJWKSNotRegistered
@@ -175,7 +175,7 @@ func (v *joseVerifier) Verify(ctx context.Context, rawToken string, rule Verifie
 		}
 		var std jwt.Claims
 		if err := decodeJSON(payload, &std); err != nil {
-			return nil, fmt.Errorf("%w: decode: %v", ErrJWTBadSignature, err)
+			return nil, fmt.Errorf("%w: decode: %w", ErrJWTBadSignature, err)
 		}
 		// Time-based validation (exp/nbf/iat) with skew.
 		exp := jwt.Expected{}
@@ -193,7 +193,7 @@ func (v *joseVerifier) Verify(ctx context.Context, rawToken string, rule Verifie
 		if len(rule.RequiredClaims) > 0 {
 			generic := map[string]any{}
 			if err := decodeJSON(payload, &generic); err != nil {
-				return nil, fmt.Errorf("%w: decode claims: %v", ErrJWTMissingClaim, err)
+				return nil, fmt.Errorf("%w: decode claims: %w", ErrJWTMissingClaim, err)
 			}
 			for k, want := range rule.RequiredClaims {
 				got, present := generic[k]
@@ -238,15 +238,15 @@ func mapParseError(err error) error {
 	}
 	switch {
 	case errors.Is(err, jwt.ErrExpired):
-		return fmt.Errorf("%w: %v", ErrJWTExpired, err)
+		return fmt.Errorf("%w: %w", ErrJWTExpired, err)
 	case errors.Is(err, jwt.ErrNotValidYet):
-		return fmt.Errorf("%w: %v", ErrJWTNotYetValid, err)
+		return fmt.Errorf("%w: %w", ErrJWTNotYetValid, err)
 	case errors.Is(err, jwt.ErrInvalidIssuer):
-		return fmt.Errorf("%w: %v", ErrJWTWrongIssuer, err)
+		return fmt.Errorf("%w: %w", ErrJWTWrongIssuer, err)
 	case errors.Is(err, jwt.ErrInvalidAudience):
-		return fmt.Errorf("%w: %v", ErrJWTWrongAudience, err)
+		return fmt.Errorf("%w: %w", ErrJWTWrongAudience, err)
 	case errors.Is(err, jwt.ErrIssuedInTheFuture):
-		return fmt.Errorf("%w: %v", ErrJWTNotYetValid, err)
+		return fmt.Errorf("%w: %w", ErrJWTNotYetValid, err)
 	}
 	// go-jose v4 wraps ErrUnexpectedSignatureAlgorithm in an
 	// exported error type whose String() includes "unexpected
@@ -254,11 +254,11 @@ func mapParseError(err error) error {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "algorithm"):
-		return fmt.Errorf("%w: %v", ErrJWTWrongAlgorithm, err)
+		return fmt.Errorf("%w: %w", ErrJWTWrongAlgorithm, err)
 	case strings.Contains(msg, "signature"):
-		return fmt.Errorf("%w: %v", ErrJWTBadSignature, err)
+		return fmt.Errorf("%w: %w", ErrJWTBadSignature, err)
 	default:
-		return fmt.Errorf("%w: %v", ErrJWTBadSignature, err)
+		return fmt.Errorf("%w: %w", ErrJWTBadSignature, err)
 	}
 }
 

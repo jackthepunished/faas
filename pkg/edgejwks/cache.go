@@ -212,7 +212,7 @@ func (e *urlEntry) fetch(ctx context.Context, hc *http.Client, timeout time.Dura
 	if err != nil {
 		return fmt.Errorf("edgejwks: fetch %s: %w", rawURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("edgejwks: fetch %s: status %d", rawURL, resp.StatusCode)
 	}
