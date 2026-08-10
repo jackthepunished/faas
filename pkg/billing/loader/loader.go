@@ -157,7 +157,13 @@ type ProviderMeta struct {
 // TestProviders_RegistersAllProviders pins the order).
 func Providers() []ProviderMeta {
 	stripeProv := stripe.NewClient(nil, nil, "", "", nil)
-	paddleProv := paddle.NewProvider("", "", false, nil)
+	// Paddle's Capabilities() is static and invariant — the
+	// metadata-only lookup here never needs a *Provider. Reading the
+	// static capability set from the package-private helper avoids
+	// the now-error-returning NewProvider signature on this code
+	// path (NewProvider requires a non-nil log + correct options,
+	// and constructing it just to call .Capabilities() is wasted
+	// work — Providers() is invoked once at boot, not per-request).
 	out := []ProviderMeta{
 		{
 			Name:         providerStripe,
@@ -187,7 +193,7 @@ func Providers() []ProviderMeta {
 		},
 		{
 			Name:         providerPaddle,
-			Capabilities: paddleProv.Capabilities(),
+			Capabilities: paddle.PaddleCapabilities(),
 			EnvVars:      []string{"FAAS_PADDLE_API_KEY", "FAAS_PADDLE_WEBHOOK_SECRET", "FAAS_PADDLE_SANDBOX"},
 			BuildAPID: func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error) {
 				var paddleCfg *paddle.Config
@@ -202,12 +208,15 @@ func Providers() []ProviderMeta {
 					tomlTolerance = paddleCfg.ToleranceSeconds
 				}
 				sandbox := resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox)
-				p := paddle.NewProvider(
+				p, err := paddle.NewProvider(
 					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
 					resolveSecret(env("FAAS_PADDLE_WEBHOOK_SECRET"), tomlSecret),
 					sandbox,
 					log,
 				)
+				if err != nil {
+					return nil, fmt.Errorf("billing/loader: build Paddle provider for apid: %w", err)
+				}
 				// PR-P4 — install the operator-configured webhook
 				// tolerance. The single source of truth is
 				// tomlTolerance (cfg.Paddle.ToleranceSeconds), already
@@ -243,12 +252,16 @@ func Providers() []ProviderMeta {
 					tomlAPIKey = paddleCfg.APIKey
 					tomlSandbox = paddleCfg.Sandbox
 				}
-				return paddle.NewProviderWithDedupe(
+				p, err := paddle.NewProviderWithDedupe(
 					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
 					resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox),
 					log,
 					store,
-				), nil
+				)
+				if err != nil {
+					return nil, fmt.Errorf("billing/loader: build Paddle provider for meterd: %w", err)
+				}
+				return p, nil
 			},
 		},
 	}

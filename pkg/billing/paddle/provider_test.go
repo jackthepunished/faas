@@ -51,7 +51,10 @@ func TestVerifyPaddleSignature_RoundTrip(t *testing.T) {
 	when := time.Now()
 	header := signPaddleBody(testWebhookKey, body, when)
 
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 	ev, err := p.VerifyWebhook(body, map[string]string{"Paddle-Signature": header}, time.Minute)
 	if err != nil {
 		t.Fatalf("VerifyWebhook happy-path: %v", err)
@@ -68,7 +71,10 @@ func TestVerifyPaddleSignature_LowercaseHeaderAccepted(t *testing.T) {
 	when := time.Now()
 	header := signPaddleBody(testWebhookKey, body, when)
 
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 	if _, err := p.VerifyWebhook(body, map[string]string{"paddle-signature": header}, time.Minute); err != nil {
 		t.Fatalf("VerifyWebhook lower-case header: %v", err)
 	}
@@ -81,8 +87,11 @@ func TestVerifyPaddleSignature_RejectsBadSignature(t *testing.T) {
 	when := time.Now()
 	wrong := signPaddleBody("not-the-real-secret-0123456789abcdef", body, when)
 
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
-	_, err := p.VerifyWebhook(body, map[string]string{"Paddle-Signature": wrong}, time.Minute)
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
+	_, err = p.VerifyWebhook(body, map[string]string{"Paddle-Signature": wrong}, time.Minute)
 	if err == nil {
 		t.Fatal("VerifyWebhook accepted wrong-secret signature")
 	}
@@ -98,8 +107,11 @@ func TestVerifyPaddleSignature_RejectsClockSkew(t *testing.T) {
 	stale := time.Now().Add(-10 * time.Minute) // outside 5-min default tolerance
 	header := signPaddleBody(testWebhookKey, body, stale)
 
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
-	_, err := p.VerifyWebhook(body, map[string]string{"Paddle-Signature": header}, 0) // 0 → default 5m tolerance
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
+	_, err = p.VerifyWebhook(body, map[string]string{"Paddle-Signature": header}, 0) // 0 → default 5m tolerance
 	if err == nil {
 		t.Fatal("VerifyWebhook accepted a stale signature")
 	}
@@ -111,8 +123,11 @@ func TestVerifyPaddleSignature_RejectsClockSkew(t *testing.T) {
 func TestVerifyPaddleSignature_RejectsEmptySecret(t *testing.T) {
 	t.Parallel()
 
-	p := paddle.NewProvider(testAPIKey, "", true, discardLog())
-	_, err := p.VerifyWebhook([]byte(`{}`), map[string]string{"Paddle-Signature": "ts=0;h1=00"}, 0)
+	p, err := paddle.NewProvider(testAPIKey, "", true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
+	_, err = p.VerifyWebhook([]byte(`{}`), map[string]string{"Paddle-Signature": "ts=0;h1=00"}, 0)
 	if err == nil {
 		t.Fatal("VerifyWebhook accepted empty webhook secret")
 	}
@@ -124,8 +139,11 @@ func TestVerifyPaddleSignature_RejectsEmptySecret(t *testing.T) {
 func TestVerifyPaddleSignature_RejectsMissingHeader(t *testing.T) {
 	t.Parallel()
 
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
-	_, err := p.VerifyWebhook([]byte(`{}`), map[string]string{}, 0)
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
+	_, err = p.VerifyWebhook([]byte(`{}`), map[string]string{}, 0)
 	if err == nil {
 		t.Fatal("VerifyWebhook accepted empty headers")
 	}
@@ -145,7 +163,10 @@ func TestVerifyPaddleSignature_RejectsMalformedHeader(t *testing.T) {
 		"ts=1234567890;h1=00;sneaky=injection",         // extra fields
 		"ts=1234567890 ;h1=" + strings.Repeat("0", 64), // whitespace within fields
 	}
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 	for _, header := range cases {
 		t.Run(header, func(t *testing.T) {
 			_, err := p.VerifyWebhook([]byte(`{}`), map[string]string{"Paddle-Signature": header}, 0)
@@ -179,7 +200,10 @@ func TestParsePaddleEvent_MapsAllSubscriptionTypes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			body := fmt.Appendf(nil, `{"event_id":"evt_%s","event_type":%q,"data":{"customer_id":"ctm_xyz","subscription_id":"sub_abc","items":[{"price":{"id":"pri_test"}}]}}`, tc.name, tc.eventType)
-			p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+			p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+			if err != nil {
+				t.Fatalf("paddle.NewProvider: %v", err)
+			}
 			pNow := time.Now()
 			header := signPaddleBody(testWebhookKey, body, pNow)
 			ev, err := p.VerifyWebhook(body, map[string]string{"Paddle-Signature": header}, time.Minute)
@@ -213,13 +237,16 @@ func TestParsePaddleEvent_MapsAllSubscriptionTypes(t *testing.T) {
 func TestParsePaddleEvent_RejectsMalformedBody(t *testing.T) {
 	t.Parallel()
 
-	p := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	p, err := paddle.NewProvider(testAPIKey, testWebhookKey, true, discardLog())
+	if err != nil {
+		t.Fatalf("paddle.NewProvider: %v", err)
+	}
 	// Build a real signature over a body that's NOT valid JSON, so
 	// the HMAC verifier succeeds but parsePaddleEvent fails.
 	bad := []byte(`{not even json`)
 	when := time.Now()
 	header := signPaddleBody(testWebhookKey, bad, when)
-	_, err := p.VerifyWebhook(bad, map[string]string{"Paddle-Signature": header}, time.Minute)
+	_, err = p.VerifyWebhook(bad, map[string]string{"Paddle-Signature": header}, time.Minute)
 	if err == nil {
 		t.Fatal("VerifyWebhook accepted malformed JSON body")
 	}

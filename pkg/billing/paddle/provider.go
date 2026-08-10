@@ -176,22 +176,57 @@ func (p *Provider) claimedBy() string {
 // without live configuration. EnsurePlanProducts must be called
 // before PushUsageRecord / CreateCustomer in production; both fail
 // fast with a descriptive error if the catalog is empty.
-func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) *Provider {
+// newPaddleSDKFn is the SDK-construction seam NewProvider delegates
+// to. Production points at paddleNewSandbox / paddleNew; tests can
+// swap the package-private field to assert the boot-time error path
+// (TestNewProvider_PropagatesSDKInitError) without standing up a
+// real Paddle sandbox. Same pattern as FlushFnForTest below —
+// package-scope, so test packages from outside this directory can
+// reach for it without exposing the field directly.
+var (
+	paddleNewSandbox = func(apiKey string, opts ...paddle.Option) (*paddle.SDK, error) {
+		return paddle.NewSandbox(apiKey, opts...)
+	}
+	paddleNew = func(apiKey string, opts ...paddle.Option) (*paddle.SDK, error) {
+		return paddle.New(apiKey, opts...)
+	}
+)
+
+// PaddleCapabilities returns the static capability set for the Paddle
+// provider. Lifted out of *Provider.Capabilities so the loader's
+// Providers() metadata-only path (loader.go:160) does not have to
+// construct a *Provider just to read the bits. The capability set is
+// invariant — Capabilities() never reads p.client — so a free function
+// is the correct shape.
+//
+// Exported because the loader (pkg/billing/loader) is a separate
+// package and needs to read the static set without constructing a
+// *Provider. Exposing the function (not the value) keeps future
+// capability-set composition (e.g. adding CapRefund) localised to
+// this file.
+func PaddleCapabilities() billing.CapabilitySet {
+	return billing.CapabilitySet(billing.CapHostedCheckout | billing.CapUsageLineItem | billing.CapSandbox)
+}
+
+func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) (*Provider, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	httpClient := &http.Client{Transport: NewIdempotencyRT(http.DefaultTransport)}
 	var client *paddle.SDK
 	var err error
-	httpClient := &http.Client{Transport: NewIdempotencyRT(http.DefaultTransport)}
 	if sandbox {
-		client, err = paddle.NewSandbox(apiKey, paddle.WithClient(httpClient))
+		client, err = paddleNewSandbox(apiKey, paddle.WithClient(httpClient))
 	} else {
-		client, err = paddle.New(apiKey, paddle.WithClient(httpClient))
+		client, err = paddleNew(apiKey, paddle.WithClient(httpClient))
 	}
 	if err != nil {
 		// NewSandbox / New only fail on programmer error (invalid
-		// options); surface loudly so the daemon doesn't bind silently.
-		log.Error("paddle: SDK init failed", "err", err, "sandbox", sandbox)
+		// options). Surfacing as a constructor return error means the
+		// loader can refuse to start the daemon instead of binding with
+		// a half-constructed provider — the operator misconfig becomes
+		// a clean boot failure, not a per-method runtime tripwire.
+		return nil, fmt.Errorf("paddle: SDK init: %w (sandbox=%t)", err, sandbox)
 	}
 	return &Provider{
 		apiKey:        apiKey,
@@ -200,7 +235,7 @@ func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) *
 		log:           log,
 		catalog:       &priceCatalog{planMonthly: map[api.Plan]string{}, planOverage: map[api.Plan]string{}, planCustomers: map[api.Plan]string{}},
 		now:           time.Now,
-	}
+	}, nil
 }
 
 // NewProviderWithDedupe is the meterd-side constructor. Same as
@@ -214,10 +249,13 @@ func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) *
 // Keeping this as a separate constructor (rather than a WithDedupe
 // option) avoids touching every existing test call site that uses
 // NewProvider — the loader is the only caller that needs the dedupe.
-func NewProviderWithDedupe(apiKey string, sandbox bool, log *slog.Logger, dedupe PaddleOverageDedupe) *Provider {
-	p := NewProvider(apiKey, "", sandbox, log)
+func NewProviderWithDedupe(apiKey string, sandbox bool, log *slog.Logger, dedupe PaddleOverageDedupe) (*Provider, error) {
+	p, err := NewProvider(apiKey, "", sandbox, log)
+	if err != nil {
+		return nil, err
+	}
 	p.dedupe = dedupe
-	return p
+	return p, nil
 }
 
 // NewProviderForTest is the test-only constructor that returns a
@@ -334,7 +372,7 @@ var _ billing.Provider = (*Provider)(nil)
 // writing). The reconciler + apid admin/refund route use Capabilities()
 // to skip the call entirely instead of round-tripping to the SDK.
 func (p *Provider) Capabilities() billing.CapabilitySet {
-	return billing.CapabilitySet(billing.CapHostedCheckout | billing.CapUsageLineItem | billing.CapSandbox)
+	return PaddleCapabilities()
 }
 
 // ---- billing.Provider surface ----
@@ -350,9 +388,6 @@ func (p *Provider) Capabilities() billing.CapabilitySet {
 // `Status: active` filter on ListProducts, finds the existing
 // products/prices, and skips the POST. No merchant-side flag.
 func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
-	if p.client == nil {
-		return fmt.Errorf("paddle: SDK not initialized (apiKey=%q)", redactAPIKey(p.apiKey))
-	}
 	if err := p.ensurePlansAndPrices(ctx); err != nil {
 		return fmt.Errorf("paddle: ensure plans: %w", err)
 	}
@@ -401,6 +436,12 @@ func (p *Provider) ensurePlansAndPrices(ctx context.Context) error {
 // on native support); the header presence is observable on the wire
 // for ops debugging and is forward-compat.
 func (p *Provider) PushUsageRecord(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
+	// Pre-SDK guard for the misconfigured case. Today this branch is
+	// unreachable from production paths (NewProvider returns an error
+	// and the loader refuses to start the daemon when the SDK cannot
+	// be constructed) — the guard stays as a defensive runtime check
+	// in case the *Provider is hand-constructed in a future caller
+	// (e.g. a test, or a one-off script).
 	if p.client == nil {
 		return fmt.Errorf("%w (account %s)", ErrNoAPIKey, acct.ID)
 	}
