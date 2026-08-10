@@ -1650,6 +1650,18 @@ type Store interface {
 	// lastFiredAt map; PgStore uses a column added in migration 00003.
 	MarkCronFired(ctx context.Context, cronID string, at time.Time) error
 
+	// Fire-now request queue (ADR-090 PR-C / migrations/00193).
+	// apid inserts on POST /v1/crons/{id}/run; schedd claims +
+	// dispatches via RunCronNow. The interface is the single seam
+	// between handlers (apid, pkg/api/client.go callers) and the
+	// underlying store; MemStore keeps an in-memory slice for tests,
+	// PgStore uses the cron_fire_now_requests table.
+	InsertFireNowRequest(ctx context.Context, cronID, accountID string) (string, error)
+	ClaimPendingFireNowRequest(ctx context.Context) (FireNowRequest, error)
+	MarkFireNowRequestSucceeded(ctx context.Context, requestID, invocationID string) error
+	MarkFireNowRequestFailed(ctx context.Context, requestID, errMsg string) error
+	GetFireNowRequest(ctx context.Context, requestID string) (FireNowRequest, error)
+
 	// Alert rules (issue #396, ADR-045). apid is the only writer;
 	// meterd reads via ListEnabledAlertRules and the dispatch + cool-down
 	// primitives. Account-scoped (per-app quotas enforced under the

@@ -180,6 +180,7 @@ var methodRouteMap = map[string]string{
 	"POST /v1/crons":                           "CreateCron",
 	"GET /v1/crons":                            "ListCrons",
 	"GET /v1/crons/{id}/runs":                  "ListCronRuns", // issue #791 — per-cron execution history
+	"POST /v1/crons/{id}/run":                  "FireCron",     // issue #791 — manual fire-now (PR-C)
 	"GET /v1/usage/summary":                    "UsageSummary",
 	"GET /v1/usage":                            "GetUsage",
 	"GET /v1/usage/daily":                      "UsageDaily",

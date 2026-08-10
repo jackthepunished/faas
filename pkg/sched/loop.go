@@ -1777,6 +1777,18 @@ const (
 	// audit rows are emitted; MarkCronFired is NOT called so the
 	// next scheduled fire still lands at the boundary.
 	TriggerManual CronDispatchTrigger = "manual"
+
+	// AuditEventCronFired is the IAM-4 audit event name emitted by
+	// the 60s tick path. Const-ified so the goconst lint (3+ literal
+	// hits across dispatchCronLocked + its inline audit emit) finds
+	// one canonical anchor; downstream audit pipelines should
+	// match on this constant rather than the bare string.
+	AuditEventCronFired = "cron.fired"
+	// AuditEventCronFiredManually is the IAM-4 audit event name for
+	// manual fires (POST /v1/crons/{id}/run, ADR-090). Splits from
+	// the schedule path so audit-event allowlists can gate on the
+	// event name directly without consulting the trigger payload.
+	AuditEventCronFiredManually = "cron.fired.manually"
 )
 
 // CronRun is the lightweight return shape from a fire-now dispatch.
@@ -1916,9 +1928,9 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 		if !lastFiredAtBefore.IsZero() {
 			payload["last_fired_at_before"] = lastFiredAtBefore.UTC().Format(time.RFC3339Nano)
 		}
-		eventName := "cron.fired"
+		eventName := AuditEventCronFired
 		if trigger == TriggerManual {
-			eventName = "cron.fired.manually"
+			eventName = AuditEventCronFiredManually
 		}
 		l.audit.Emit(ctx, eventName, &acct.ID, payload)
 	}()

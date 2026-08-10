@@ -119,6 +119,16 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         was dispatched through gatewayd-internal so metering
 //	                         and rate limits apply identically (spec §4.4,
 //	                         M7 cron firing).
+//	NotifyCronRunNow        {"request_id":uuid}
+//	                         apid → schedd: a customer just POSTed
+//	                         /v1/crons/{id}/run; the row in
+//	                         cron_fire_now_requests (migrations/00193) is
+//	                         the durable record; the notify is the
+//	                         wakeup. schedd's fire-now consumer
+//	                         (pkg/sched/fire_now.go) does
+//	                         `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1`
+//	                         from the table and calls RunCronNow in
+//	                         its own process. ADR-090 PR-C.
 //	NotifyAccountDeletionPending {"account_id":uuid, "scheduled_at":rfc3339nano,
 //	                         "restore_until":rfc3339nano}
 //	                         apid → audit/sessions: customer scheduled
@@ -145,21 +155,26 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                             would try to mount .tar as virtio-blk and
 //	                             400). Only imaged subscribes.
 const (
-	NotifyAppChanged             = "app_changed"
-	NotifyDeploymentChanged      = "deployment_changed"
-	NotifyDomainChanged          = "domain_changed"
-	NotifyCronChanged            = "cron_changed"
-	NotifyKeyChanged             = "key_changed"
-	NotifyBuildQueued            = "build_queued"
-	NotifyBuildLog               = "build_log"
-	NotifyDomainVerify           = "domain_verify"
-	NotifyInstanceChanged        = "instance_changed"
-	NotifySnapshotPrime          = "snapshot_prime"
-	NotifySnapshotBoot           = "snapshot_boot"
-	NotifySnapshotWritten        = "snapshot_written"
-	NotifyBillingPastDue         = "billing_past_due"
-	NotifyQuotaWarning           = "quota_warning"
-	NotifyCronFired              = "cron_fired"
+	NotifyAppChanged        = "app_changed"
+	NotifyDeploymentChanged = "deployment_changed"
+	NotifyDomainChanged     = "domain_changed"
+	NotifyCronChanged       = "cron_changed"
+	NotifyKeyChanged        = "key_changed"
+	NotifyBuildQueued       = "build_queued"
+	NotifyBuildLog          = "build_log"
+	NotifyDomainVerify      = "domain_verify"
+	NotifyInstanceChanged   = "instance_changed"
+	NotifySnapshotPrime     = "snapshot_prime"
+	NotifySnapshotBoot      = "snapshot_boot"
+	NotifySnapshotWritten   = "snapshot_written"
+	NotifyBillingPastDue    = "billing_past_due"
+	NotifyQuotaWarning      = "quota_warning"
+	NotifyCronFired         = "cron_fired"
+	// NotifyCronRunNow fires when a row is inserted into
+	// cron_fire_now_requests (migrations/00193) — apid emits, schedd
+	// consumes via cmd/schedd/main.go's existing SubscribeWithReconnect
+	// block. See the payload contract in the file header. ADR-090 PR-C.
+	NotifyCronRunNow             = "cron_run_now"
 	NotifyAccountDeletionPending = "account_deletion_pending"
 	NotifyAccountDeleted         = "account_deleted"
 	// NotifyCliAuthCodeActivated fires when a dashboard /cli-auth

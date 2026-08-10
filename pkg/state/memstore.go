@@ -103,6 +103,11 @@ type MemStore struct {
 	buildProvenance map[string]BuildProvenance
 	domains         map[string]CustomDomain
 	crons           map[string]Cron
+	// fireNowRequests mirrors cron_fire_now_requests (migrations/00193)
+	// for in-process handler tests. Keyed by request id (UUID);
+	// status transitions follow the production 5-state CHECK (pending
+	// → running → succeeded|failed|cancelled).
+	fireNowRequests map[string]FireNowRequest
 	// alertRules mirrors alert_rules for handler tests. Keyed by
 	// ruleID. AlertDelivery rows are kept separately so the
 	// delivery list query can walk just the matching subset on
@@ -484,6 +489,7 @@ func NewMemStore() *MemStore {
 		buildProvenance:      map[string]BuildProvenance{},
 		domains:              map[string]CustomDomain{},
 		crons:                map[string]Cron{},
+		fireNowRequests:      map[string]FireNowRequest{},
 		alertRules:           map[string]AlertRule{},
 		alertDeliveries:      map[string]AlertDelivery{},
 		appWebhooks:          map[string]AppWebhook{},
@@ -4318,6 +4324,97 @@ func (m *MemStore) MarkCronFired(_ context.Context, id string, at time.Time) err
 	c.LastFiredAt = at
 	m.crons[id] = c
 	return nil
+}
+
+// Fire-now request queue (ADR-090 PR-C). In-memory mirrors the
+// cron_fire_now_requests table (migrations/00193) — same shape, same
+// status enum. Tests that exercise the fire-now path construct a
+// MemStore with fireNowRequests pre-seeded; production wiring uses
+// PgStore. claim() is FIFO-by-requested_at with the same SELECT FOR
+// UPDATE SKIP LOCKED semantics (one row at a time).
+//
+// Concurrency: the mutex guards the map + the cursor; Insert /
+// Claim / Mark* all take it for the duration of their critical
+// section. The map is keyed by request id (UUID); collisions are
+// impossible in practice.
+func (m *MemStore) InsertFireNowRequest(_ context.Context, cronID, accountID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := uuid.NewString()
+	m.fireNowRequests[id] = FireNowRequest{
+		ID:          id,
+		CronID:      cronID,
+		AccountID:   accountID,
+		RequestedAt: time.Now().UTC(),
+		Status:      FireNowStatusPending,
+	}
+	return id, nil
+}
+
+func (m *MemStore) ClaimPendingFireNowRequest(_ context.Context) (FireNowRequest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var oldestID string
+	var oldestAt time.Time
+	for id, r := range m.fireNowRequests {
+		if r.Status != FireNowStatusPending {
+			continue
+		}
+		if oldestID == "" || r.RequestedAt.Before(oldestAt) {
+			oldestID = id
+			oldestAt = r.RequestedAt
+		}
+	}
+	if oldestID == "" {
+		return FireNowRequest{}, ErrFireNowRequestNotFound
+	}
+	r := m.fireNowRequests[oldestID]
+	r.Status = FireNowStatusRunning
+	m.fireNowRequests[oldestID] = r
+	return r, nil
+}
+
+func (m *MemStore) MarkFireNowRequestSucceeded(_ context.Context, requestID, invocationID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.fireNowRequests[requestID]
+	if !ok || r.Status != FireNowStatusRunning {
+		return ErrFireNowRequestNotFound
+	}
+	r.Status = FireNowStatusSucceeded
+	r.InvocationID = &invocationID
+	now := time.Now().UTC()
+	r.FinishedAt = &now
+	m.fireNowRequests[requestID] = r
+	return nil
+}
+
+func (m *MemStore) MarkFireNowRequestFailed(_ context.Context, requestID, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.fireNowRequests[requestID]
+	if !ok || r.Status != FireNowStatusRunning {
+		return ErrFireNowRequestNotFound
+	}
+	r.Status = FireNowStatusFailed
+	if len(errMsg) > 1024 {
+		errMsg = errMsg[:1024]
+	}
+	r.Error = &errMsg
+	now := time.Now().UTC()
+	r.FinishedAt = &now
+	m.fireNowRequests[requestID] = r
+	return nil
+}
+
+func (m *MemStore) GetFireNowRequest(_ context.Context, requestID string) (FireNowRequest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.fireNowRequests[requestID]
+	if !ok {
+		return FireNowRequest{}, ErrFireNowRequestNotFound
+	}
+	return r, nil
 }
 
 func (m *MemStore) ListCronsForApp(_ context.Context, appID string) ([]Cron, error) {

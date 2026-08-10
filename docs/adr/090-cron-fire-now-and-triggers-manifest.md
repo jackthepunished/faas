@@ -31,8 +31,10 @@ Add two coupled surfaces, both built on the existing `POST /v1/crons` write path
 - **Route mount** in `cmd/apid/server.go` next to the existing cron block (lines 844-851). Middleware order locked: `authLimited → requireMFA → requireScope(ScopesDeployWriteSurface) → idempotent → handler`. The `idempotent` wrapper is innermost so replay lookup happens after auth/scope.
 - **Handler** `cmd/apid/handlers_cron_run.go::fireCronNow` mirrors the existing two-step IDOR check (`handlers_ext.go:1576-1644`): `CronByID` → `AppByID` → `app.AccountID == acct.ID`. Cross-account and missing return byte-identical 404 bodies — no existence oracle. Disabled crons return 410 with a new `cron_disabled` stable code.
 - **Scoping** rides on the existing `ScopesDeployWriteSurface` (`admin` + `deploy:write`). No new `cron:write` constant. No DB CHECK constraint change. The reasoning is in §Sub-decisions 1.
-- **Reuse of schedd** is via a new exported `sched.RunCronNow(ctx, l *Loop, cronID, accountID uuid.UUID, trigger string) (CronRun, error)` extracted from `dispatchOneCron`. The path below the boundary guard at `loop.go:1789-1798` is moved into a new `dispatchCronLocked(ctx, c, now, trigger)` helper. `dispatchOneCron` reduces to: parse schedule → boundary guard → `dispatchCronLocked(... "schedule")`. `RunCronNow` reduces to: load cron → enabled check → `dispatchCronLocked(... "manual")`. The deferred audit emit at `loop.go:1840-1864` is the single writer of `cron.fired*` rows — do not duplicate it.
-- **Idempotency**: `s.idempotent(...)` (`server.go:1745-1766`) is sufficient. Replay keys on `(account, Idempotency-Key)` and returns the stored 202, so the second call never reaches `RunCronNow` and never enqueues. Propagating the key down to `EnqueueInvocation` is belt-and-braces and is out of scope.
+- **Reuse of schedd** is via a new exported `sched.RunCronNow(ctx, cronID, accountID string) (CronRun, error)` extracted from `dispatchOneCron`. The path below the boundary guard at `loop.go:1789-1798` is moved into a new `dispatchCronLocked(ctx, c, now, trigger)` helper. `dispatchOneCron` reduces to: parse schedule → boundary guard → `dispatchCronLocked(... "schedule")`. `RunCronNow` reduces to: load cron → enabled check → `dispatchCronLocked(... "manual")`. The deferred audit emit at `loop.go:1840-1864` is the single writer of `cron.fired*` rows — do not duplicate it.
+- **Daemon bridge**: apid does NOT have a `*sched.Loop` reference — apid and schedd are separate daemons (CLAUDE.md ownership). Fire-now crosses the process boundary via a new `cron_fire_now_requests` table (`migrations/00193_cron_fire_now_requests.sql`) plus a new pg_notify channel `db.NotifyCronRunNow` (`pkg/db/notify.go`). The handler inserts a row (status `pending`) and emits the notify, then returns 202 with the request id. schedd subscribes via `SubscribeWithReconnect` (its existing wiring for `NotifyCronChanged` at `cmd/schedd/main.go:178-188`), and on each delivery `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1` pulls one pending row, calls `RunCronNow`, and updates status. A 60s safety tick (next to `cronT`) handles missed notifies — the row is the source of truth, the notify is just a wakeup. This pattern matches the existing `build_queued` channel (`pkg/db/notify.go:88-90` + `cmd/imaged` consumer).
+- **Why a new table, not a column on `crons`**: a column like `fire_now_requested_at` pollutes the lifecycle row with an execution-intent signal that doesn't belong there. The new `cron_fire_now_requests` table isolates the fire-now lifecycle, supports future `pause|cancel|backfill` semantics, and keeps the audit row + invocation id in one place. The `ApplyMigration` cost is one additive table + index.
+- **Idempotency**: `s.idempotent(...)` (`server.go:1745-1766`) is sufficient. Replay keys on `(account, Idempotency-Key)` and returns the stored 202, so the second call never reaches `InsertFireNowRequest` and never enqueues. Propagating the key down to `EnqueueInvocation` is belt-and-braces and is out of scope.
 - **Audit**: `cron.fired.manually` (new event name) with the same payload struct as `cron.fired` plus the `trigger: "manual"` field. The tick path emits `cron.fired` with `trigger: "schedule"`. One struct, two event names — see §Sub-decisions 2.
 - **MarkCronFired is NOT called from `RunCronNow`** (`pkg/state/pgstore.go:5303-5313`). A manual fire must not shift `last_fired_at` — that stays owned by the tick path. The next scheduled fire still lands at the boundary.
 
@@ -79,6 +81,8 @@ Add two coupled surfaces, both built on the existing `POST /v1/crons` write path
 
 1. **No new `cron:write` scope.** The cron write surface already rides on `ScopesDeployWriteSurface` (`admin` + `deploy:write`). A new scope would require a closed-vocabulary addition at `pkg/api/apikey.go:109-128`, a DB CHECK constraint migration (the apikey.go::validScopes closed set is gated by `migrations/00046` and widened by `00063`), and SDK regeneration. The blast radius of fire-now is bounded by the existing two-step IDOR check + idempotency wrapper; the additional restriction does not earn its surface cost. Spec §11 treats fire-now as a side-effectful deploy; the principle is "use the existing scope unless the new operation contradicts the existing one." Fire-now does not contradict.
 
+6. **Bridge the daemon gap via table + notify, not gRPC.** pg_notify is the existing apid↔schedd ↔imaged primitive (`pkg/db/notify.go:73-217`). gRPC between apid and schedd would couple process lifecycles (apid would 503 when schedd is down — wrong: cron writes already decouple via `NotifyCronChanged`). The table + notify pattern keeps the bridge stateless — apid can crash after insert, schedd picks up the row on its next tick.
+
 2. **One audit payload struct, two event names.** The shared struct lives at `pkg/sched/loop.go:1840-1864` (the deferred emit). Adding `trigger` to the existing payload is the minimal change. The tick path emits `event: "cron.fired"`, `trigger: "schedule"`. The fire-now path emits `event: "cron.fired.manually"`, `trigger: "manual"`. Downstream audit-event allowlists must learn `cron.fired.manually` before merge or rows get silently dropped at the audit stage.
 
 3. **No new scope / no DB migration / no schema change.** Both surfaces are pure wire + CLI. The cron write loop (`CreateCronIfUnderQuota`) is reused unchanged. The cron `last_fired_at` column is updated only by the tick path. The 60s `cronT` tick cadence is unchanged.
@@ -93,13 +97,23 @@ Add two coupled surfaces, both built on the existing `POST /v1/crons` write path
 |------|--------|
 | `docs/adr/090-cron-fire-now-and-triggers-manifest.md` | NEW |
 | `pkg/sched/loop.go` | Extract `dispatchCronLocked`; add `RunCronNow`; add `trigger` field to the shared `cron.fired*` payload struct at lines 1840-1864. |
+| `pkg/sched/fire_now.go` | NEW — fire-now dispatch loop: subscribes to `NotifyCronRunNow`, polls 60s safety tick, `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1`, calls `RunCronNow`, updates row status. |
+| `pkg/sched/fire_now_test.go` | NEW — happy path, skip-locked concurrency, notify recovery. |
+| `migrations/00192_reserve_slot.sql` | NEW — slot fence (post-rebase slot pickup). |
+| `migrations/00193_cron_fire_now_requests.sql` | NEW — table + index + CHECK on status. |
+| `migrations/00193_cron_fire_now_requests_test.go` | NEW — apply walk test. |
+| `pkg/state/pgstore.go` | ADD `InsertFireNowRequest(ctx, cronID, accountID) (uuid.UUID, error)`, `ListPendingFireNowRequests(ctx) ([]FireNowRequest, error)`, `MarkFireNowRequestRunning(ctx, id)`, `MarkFireNowRequestSucceeded(ctx, id, invocationID)`, `MarkFireNowRequestFailed(ctx, id, err)`. |
+| `pkg/state/types.go` | ADD `FireNowRequest` struct + `FireNowStatus` enum. |
+| `pkg/state/queries.sql` | NEW — sqlc queries for the 5 helpers. |
+| `pkg/db/notify.go` | ADD `NotifyCronRunNow` constant + payload contract doc. |
+| `cmd/schedd/main.go` | Wire fire-now subscriber in the existing `SubscribeWithReconnect` block. |
 | `pkg/sched/<test>` | Add `RunCronNow` tests (fires far-future cron, leaves `last_fired_at` unchanged). |
-| `pkg/api/dto.go` | Add `FireCronResponse` (reuses `CronRun`). |
-| `pkg/api/client.go` | Add `Client.FireCron(ctx, id)`. |
+| `pkg/api/dto.go` | Add `FireCronResponse{RequestID uuid.UUID, Status string}`. |
+| `pkg/api/client.go` | Add `Client.FireCron(ctx, id) (uuid.UUID, error)`. |
 | `pkg/api/errors.go` | Add `CodeCronDisabled` + `ErrCronDisabled` near 1342-1360. |
 | `pkg/api/client_test.go` | Add `FireCron` round-trip test. |
 | `cmd/apid/server.go` | Register `POST /v1/crons/{id}/run` route near 844-851. |
-| `cmd/apid/handlers_cron_run.go` | NEW — `fireCronNow` handler. |
+| `cmd/apid/handlers_cron_run.go` | NEW — `fireCronNow` handler (insert row + notify + 202). |
 | `cmd/apid/handlers_cron_run_test.go` | NEW — 202/400/404/404-byte-identical/410/503 + idempotency tests. |
 | `pkg/gregalemanifest/manifest.go` | NEW — `Load`, `Validate`, schema types. |
 | `pkg/gregalemanifest/manifest_test.go` | NEW — table-driven tests. |
@@ -131,4 +145,4 @@ Add two coupled surfaces, both built on the existing `POST /v1/crons` write path
 
 ## Rollback
 
-Revert the 6 commits. No DB rollback. No migration. The endpoint, the SDK method, the manifest parser, and the CLI hook are all pure additions. The cron `last_fired_at` column is unchanged by this PR. The `trigger` field added to the audit payload is `omitempty` so old rows are valid under the new reader.
+Revert the 6+ commits. The `cron_fire_now_requests` migration rolls back via goose `Down` (DROP TABLE). The endpoint, the SDK method, the manifest parser, and the CLI hook are all pure additions; a pure revert restores the prior behaviour (no fire-now, no manifest). The cron `last_fired_at` column is unchanged by this PR. The `trigger` field added to the audit payload is `omitempty` so old rows are valid under the new reader.

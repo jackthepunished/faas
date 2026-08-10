@@ -2402,6 +2402,24 @@ type ListCronRunsResponse struct {
 	Runs []CronRun `json:"runs"`
 }
 
+// FireCronResponse is the 202 body for POST /v1/crons/{id}/run
+// (ADR-090 PR-C). The endpoint is asynchronous — apid inserts a
+// pending row into cron_fire_now_requests and emits db.NotifyCronRunNow,
+// then returns 202 immediately. schedd's fire-now consumer
+// (pkg/sched/fire_now.go) processes the row in its own process and
+// stamps the terminal status.
+//
+// RequestID is the cron_fire_now_requests.id; clients use it to
+// poll the row's status (future GET /v1/cron-fire-now-requests/{id})
+// or to correlate the audit-event stream (`cron.fired.manually`)
+// back to their request. Status starts at "pending" — terminal
+// values are "succeeded" or "failed".
+type FireCronResponse struct {
+	RequestID string `json:"request_id"`
+	CronID    string `json:"cron_id"`
+	Status    string `json:"status"`
+}
+
 // --- Issue #394 — queue introspection -------------------------------
 //
 // QueueStateResponse is the read-only depth/stats contract for
