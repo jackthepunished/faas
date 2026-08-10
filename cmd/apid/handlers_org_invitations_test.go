@@ -151,10 +151,7 @@ func TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent(t *testing.T) {
 
 	// PR-9 §4: PR-9 closes the bearer-bypass on acceptInvitation,
 	// so the PR-7 happy-path uses a fresh-stamp cookie.
-	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	e.h.ServeHTTP(rec, req)
+	rec := e.doWithCookie(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST accept: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -192,10 +189,7 @@ func TestAuditEvents_OrgInvitationAcceptedEmitsEvent(t *testing.T) {
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
 	// PR-9 §4: see TestAuditEvents_OrgMemberAddedOnAcceptEmitsEvent.
-	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	e.h.ServeHTTP(rec, req)
+	rec := e.doWithCookie(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", cookie)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST accept: code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -335,10 +329,7 @@ func TestAcceptInvitation_AlreadyMemberSurfacesExistingRole(t *testing.T) {
 	// gate passes, then the already-active-membership check fires.
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	e.h.ServeHTTP(rec, req)
+	rec := e.doWithCookie(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", cookie)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("already-member accept: code=%d, want 409; body=%s", rec.Code, rec.Body.String())
 	}
@@ -379,10 +370,7 @@ func TestAcceptInvitation_GateFiresBeforeEmit(t *testing.T) {
 		t.Fatalf("pre-revoke: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	e.h.ServeHTTP(rec, req)
+	rec := e.doWithCookie(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", cookie)
 	if rec.Code != http.StatusGone {
 		t.Fatalf("accept after revoke: code=%d, want 410; body=%s", rec.Code, rec.Body.String())
 	}
@@ -431,10 +419,7 @@ func TestAcceptInvitation_OverCapDoesNotEmit(t *testing.T) {
 	}
 
 	wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
-	req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
-	req.AddCookie(cookie)
-	rec := httptest.NewRecorder()
-	e.h.ServeHTTP(rec, req)
+	rec := e.doWithCookie(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", cookie)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("accept over-cap: code=%d, want 403; body=%s", rec.Code, rec.Body.String())
 	}
@@ -583,10 +568,7 @@ func TestAcceptInvitation_RequiresStepUp(t *testing.T) {
 		org := seedSharedOrgWithOutsideOwner(t, e, "acme-pr8-stp-miss", "Acme PR8 Step-up Missing", api.PlanPro)
 		wireToken, _ := seedInvitationForPrincipal(t, e.store, &org, e.acct.ID, e.acct.Email, state.OrgRoleDeveloper)
 
-		req := httptest.NewRequest(http.MethodPost, "/v1/invitations/"+wireToken+"/accept", nil)
-		req.AddCookie(cookie)
-		rec := httptest.NewRecorder()
-		e.h.ServeHTTP(rec, req)
+		rec := e.doWithCookie(t, http.MethodPost, "/v1/invitations/"+wireToken+"/accept", cookie)
 
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("missing step-up: code=%d body=%s, want 403", rec.Code, rec.Body.String())
@@ -872,6 +854,23 @@ func setupWithSessionFreshStepUpForTest(t *testing.T) (testEnv, *http.Cookie) {
 }
 
 // eventDump renders the rows slice as JSON for inclusion in a
+// doWithCookie is the cookie-bearing sibling of testEnv.do for the
+// routes that PR-9 flipped to require a fresh step-up stamp
+// (acceptInvitation). Plugs the session cookie into the request
+// before dispatching to the raw handler. Mirrors the testEnv.do
+// shape (returns *httptest.ResponseRecorder) so the assertion
+// sites stay one-liners.
+func (e testEnv) doWithCookie(t *testing.T, method, path string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	return rec
+}
+
 // t.Fatal message. Mirrors the SA5011 escape hatch used in the
 // other audit-emit tests.
 func eventDump(rows []state.Event) string {

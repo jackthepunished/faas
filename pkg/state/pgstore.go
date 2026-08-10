@@ -13113,7 +13113,7 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 // key encoded by pkg/cursor. The SQL filter switches to a tuple
 // predicate on the (created_at, id::text) row, partitioned by
 // the decoded cursor. When `before` is empty (first page) the
-// filter is elided via the $5 flag.
+// cursor parameters bind as SQL NULL and the predicate short-circuits.
 //
 // limit is clamped to [1, 100]; out-of-range resolves to 25. The
 // before="" case is the first page (no filter). No JOIN: invitations
@@ -13128,11 +13128,8 @@ func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string
 	// the handler can surface a 400 validation_failed (the v1
 	// cursor silently returned 0 rows on malformed input, which
 	// made broken clients silently fall behind — DO NOT regress).
-	var (
-		cursorTS  time.Time
-		cursorID  string
-		hasCursor bool
-	)
+	var cursorTS *time.Time
+	var cursorID string
 	if before != "" {
 		k, err := cursor.Decode(before)
 		if err != nil {
@@ -13143,26 +13140,18 @@ func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string
 			// multi-error wrap (Go 1.20+).
 			return nil, errors.Join(ErrInvalidCursor, err)
 		}
-		cursorTS = k.CreatedAt
+		cursorTS = &k.CreatedAt
 		cursorID = k.ID
-		hasCursor = true
-	}
-	// Tie the cursor predicates to the empty-case flag so the
-	// planner can short-circuit the first-page query without a
-	// NULL-aware anchor CTE.
-	emptyFlag := ""
-	if hasCursor {
-		emptyFlag = "x"
 	}
 	rows, err := s.pool.Query(ctx, `
 		select id, org_id, email::text, role, token_hash, invited_by_account_id,
 		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
 		  from org_invitations
 		 where org_id = $1
-		   and ($5 = '' or (created_at, id::text) < ($3::timestamptz, $4))
+		   and ($3::timestamptz is null or (created_at, id::text) < ($3::timestamptz, $4))
 		 order by created_at desc, id::text desc
 		 limit $2
-	`, orgID, limit, cursorTS, cursorID, emptyFlag)
+	`, orgID, limit, cursorTS, cursorID)
 	if err != nil {
 		return nil, fmt.Errorf("state: list org invitations paged: %w", err)
 	}

@@ -844,47 +844,7 @@ const (
 // RequireStepUp with the documented bypass until the next PR
 // audits each route's threat model individually.
 func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) AccountHandler {
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
-	return func(next AccountHandler) AccountHandler {
-		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
-			ts, has := StepUpFrom(r)
-			// Bearer-key principal (no step-up stamp): bypass.
-			// Pre-PR-077 cookie without step_up_at is also bypass-
-			// aware — the middleware is opt-in and the absence of a
-			// stamp carries the same risk profile as the bearer-
-			// bypass path. The Envelope.StepUpAt field is omitempty
-			// so a cookie issued before PR-077 reads StepUpAt zero
-			// and the bypass fails open: this is the documented
-			// "rolling out, the gate hasn't tripped anyone yet"
-			// behaviour. Once every active session carries a stamp
-			// (one TOTP rotation cycle later), the bypass becomes
-			// the legacy-cookie anti-pattern that future audit
-			// queries can filter for (subject = sid, no StepUpAt).
-			if !has {
-				next(w, r, acct)
-				return
-			}
-			if !ts.IsZero() && time.Since(ts) <= ttl {
-				next(w, r, acct)
-				return
-			}
-			reason := stepUpReasonMissing
-			if !ts.IsZero() {
-				reason = stepUpReasonExpired
-			}
-			api.WriteProblem(w, api.ErrStepUpRequired())
-			if m.Audit != nil {
-				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
-					"path":    r.URL.Path,
-					"method":  r.Method,
-					"reason":  reason,
-					"ttl_sec": int(ttl.Seconds()),
-				})
-			}
-		}
-	}
+	return m.requireStepUp(ttl, false)
 }
 
 // RequireStepUpStrict is the same gate as RequireStepUp but the
@@ -904,12 +864,36 @@ func (m *Middleware) RequireStepUp(ttl time.Duration) func(AccountHandler) Accou
 // branch already did, and the Envelope.StepUpAt omission is the
 // same condition).
 func (m *Middleware) RequireStepUpStrict(ttl time.Duration) func(AccountHandler) AccountHandler {
+	return m.requireStepUp(ttl, true)
+}
+
+// requireStepUp is the shared implementation of RequireStepUp
+// (lax: bearer-key bypass) and RequireStepUpStrict (no bypass).
+// strict:true in the audit row is the post-PR-9 marker operators
+// filter for in audit queries.
+func (m *Middleware) requireStepUp(ttl time.Duration, strict bool) func(AccountHandler) AccountHandler {
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
 	return func(next AccountHandler) AccountHandler {
 		return func(w http.ResponseWriter, r *http.Request, acct state.Account) {
 			ts, has := StepUpFrom(r)
+			// Lax mode: bearer-key principal (no step-up stamp) bypasses.
+			// Pre-PR-077 cookie without step_up_at is also bypass-
+			// aware — the middleware is opt-in and the absence of a
+			// stamp carries the same risk profile as the bearer-
+			// bypass path. The Envelope.StepUpAt field is omitempty
+			// so a cookie issued before PR-077 reads StepUpAt zero
+			// and the bypass fails open: this is the documented
+			// "rolling out, the gate hasn't tripped anyone yet"
+			// behaviour. Once every active session carries a stamp
+			// (one TOTP rotation cycle later), the bypass becomes
+			// the legacy-cookie anti-pattern that future audit
+			// queries can filter for (subject = sid, no StepUpAt).
+			if !strict && !has {
+				next(w, r, acct)
+				return
+			}
 			if has && !ts.IsZero() && time.Since(ts) <= ttl {
 				next(w, r, acct)
 				return
@@ -920,13 +904,16 @@ func (m *Middleware) RequireStepUpStrict(ttl time.Duration) func(AccountHandler)
 			}
 			api.WriteProblem(w, api.ErrStepUpRequired())
 			if m.Audit != nil {
-				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
+				data := map[string]any{
 					"path":    r.URL.Path,
 					"method":  r.Method,
 					"reason":  reason,
 					"ttl_sec": int(ttl.Seconds()),
-					"strict":  true,
-				})
+				}
+				if strict {
+					data["strict"] = true
+				}
+				m.Audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, data)
 			}
 		}
 	}
