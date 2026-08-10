@@ -545,6 +545,65 @@ func (c *Client) GetBuildsId(ctx context.Context, id string) (BuildResponse, err
 	return out, c.do(ctx, "GET", "/v1/builds/"+id, nil, &out)
 }
 
+// GetBuilds returns a single page of builds across the
+// authenticated account's deployments, ordered started_at DESC
+// (nulls last; queued builds stay at the bottom of the first
+// page). status="" means "any status". app="" means "any app".
+// before is the opaque pagination cursor from a previous
+// resp.NextBefore ("" for first page); limit is the page size
+// (server clamps at 200, 0 means default).
+//
+// Cursor shape (post-review fix for issues #74 + #75): the wire
+// format is "<started_at>|<id_hex>" — the id is the Build.ID of
+// the last row on the previous page. The id tiebreaker solves
+// two problems the original single-column cursor had:
+//  1. queued builds (started_at IS NULL) had no anchor — the
+//     cursor was always the last non-null row, which silently
+//     dropped the queued tail across page boundaries.
+//  2. whole-second wire precision truncates sub-second DB
+//     started_at — two rows in the same wall-clock second
+//     were always both bound by the same strict-less-than.
+//
+// The id tiebreaker makes the keyset comparison deterministic
+// regardless of precision loss and lets queued-only pages
+// still thread a cursor (the started_at segment is empty).
+//
+// The cursor is opaque — re-parse it on the wire side via the
+// server's `?before=<cursor>` round-trip, not via time.Parse.
+// See ADR-091 §3 + the code-review fix.
+//
+// Backs `gregale build list` and any CI script that wants
+// "what's still running for app X" without scraping SSE
+// (DEPLOY-PROV-6 follow-up / ADR-091, issue #741 close-out).
+//
+// Method name: derived by cmd/sdk-coverage/main.go::deriveMethodName
+// from `GET /v1/builds` → GetBuilds. Matches the existing
+// aggregate-from-all-apps convention (/v1/instances → GetInstances,
+// /v1/secrets → GetSecrets, /v1/apps/metrics → GetAppsMetrics —
+// see cmd/sdk-coverage/main.go:306-310). No methodRouteMap entry
+// needed; sdk-check fails if the derived name doesn't match.
+func (c *Client) GetBuilds(ctx context.Context, app, status, before string, limit int) (BuildListResponse, error) {
+	var out BuildListResponse
+	v := url.Values{}
+	if app != "" {
+		v.Set("app", app)
+	}
+	if status != "" {
+		v.Set("status", status)
+	}
+	if before != "" {
+		v.Set("before", before)
+	}
+	if limit > 0 {
+		v.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	path := "/v1/builds"
+	if encoded := v.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // DeployMultipart ships a source tarball (with optional runtime +
 // handler) to the multipart deploy endpoint. sourceName is the form
 // filename apid sees in the multipart "source" part; pass the

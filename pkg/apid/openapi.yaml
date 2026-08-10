@@ -2519,6 +2519,74 @@ paths:
   # the LIFECYCLE surface (status, timestamps, failure_class,
   # duration). Companion to /provenance (post-mortem export) and
   # /sbom (post-mortem blob). Same auth + same IDOR chain.
+  #
+  # DEPLOY-PROV-6 follow-up / ADR-091 (issue #741 close-out) added
+  # /v1/builds as the LIST surface — operator "what's building now?"
+  # view. Same auth + IDOR chain (account-scoped by default; ?app=
+  # narrows to one app via AppBySlug + AccountID). Cursor
+  # pagination + status filter mirror /v1/deployments.
+
+  /v1/builds:
+    parameters:
+      - { name: app, in: query, schema: { type: string }, required: false,
+          description: "Filter to a single app slug. Cross-account slug renders 404." }
+      - { name: status, in: query, schema: { type: string, enum: [queued, running, succeeded, failed] },
+          required: false, description: "Filter to a single status. Omit for any status." }
+      - { name: before, in: query, schema: { type: string }, required: false,
+          description: "Opaque cursor token from a previous response's `next_before`. Format: `<rfc3339nano>|<id_hex>` (pipe-separated). Empty started_at segment encodes a queued-tail cursor (the `<id_hex>` part alone). Round-trip verbatim — do NOT re-parse or re-encode." }
+      - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 },
+          required: false, description: "Page size (default 50, capped at 200)." }
+    get:
+      tags: [deployments]
+      operationId: getBuilds
+      summary: List builds (operator view).
+      description: |
+        Returns every build the authenticated account owns, ordered
+        started_at DESC (nulls last — queued builds stay at the
+        bottom of the first page). Optional ?app=<slug> narrows to
+        one app; optional ?status=<s> filters to the 4-value status
+        enum (queued|running|succeeded|failed; omit for any status).
+        Cursor pagination via ?before=<opaque token>; limit defaults
+        to 50, capped at 200.
+
+        The response shape mirrors /v1/deployments: items + a
+        next_before cursor (empty when end of list). The cursor is
+        the opaque tuple `<rfc3339nano>|<id_hex>` of the LAST row
+        on this page — server-emitted, round-tripped verbatim. The
+        id tiebreaker makes the keyset deterministic for queued
+        tails (started_at IS NULL) and for sub-second collisions
+        on started_at. See ADR-091 §3.
+
+        BuildResponse.started_at (the per-row wire field) is
+        RFC3339 (whole-second) for backward compatibility with
+        `GET /v1/builds/{id}`. The cursor's started_at segment is
+        RFC3339Nano (sub-second preserved) so the keyset
+        sub-second clause is reachable on rows whose started_at
+        falls in the same wall-clock second. The two are
+        deliberately different and the cursor's higher precision
+        is intentional.
+      responses:
+        '200':
+          description: A page of builds (ordered started_at DESC, nulls last).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BuildListResponse' }
+        '400':
+          description: |
+            `400 Bad Request` — bad cursor (not RFC3339), bad status
+            filter (not one of queued|running|succeeded|failed), or
+            bad limit (non-numeric / out of range). Stable code
+            `validation_failed`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            `404 Not Found` — only raised when ?app=<slug> is set
+            and the slug is unknown OR belongs to another account
+            (uniform 404 so cross-account probes can't enumerate).
+            Stable code `app_not_found`.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/builds/{id}:
     parameters:
@@ -7552,6 +7620,46 @@ components:
         started_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time }
         duration_seconds: { type: integer, description: "Server-computed FinishedAt − StartedAt in whole seconds. Absent until the build reaches a terminal state." }
+
+    BuildListResponse:
+      description: |
+        DEPLOY-PROV-6 follow-up / ADR-091 (issue #741 close-out):
+        the page shape for GET /v1/builds. Items is one page of
+        builds ordered started_at DESC NULLS LAST — queued builds
+        (started_at IS NULL) sink to the bottom of the first page
+        per the new index builds_deployment_started_idx. The
+        next_before cursor is the opaque tuple
+        `<rfc3339nano>|<id_hex>` of the LAST row on this page
+        (post-review fix; code review surfaced issues 1+2 that
+        the id tiebreaker resolves). The started_at segment is
+        empty for queued-tail pages (the cursor becomes a pure
+        id anchor in the NULL zone). An empty next_before
+        signals end-of-list. Round-trip the cursor verbatim on
+        subsequent requests; do NOT re-parse or re-encode.
+
+        Mirrors DeploymentListResponse in shape only. The new
+        index and the sibling ListBuildsForAccountPaged method
+        (state layer) make this O(page-size) regardless of
+        account size; the unlimited
+        ListBuildsForAccount(ctx, accountID) stays intact for the
+        GDPR export at cmd/apid/handlers_account.go.
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/BuildResponse' }
+        next_before:
+          type: string
+          description: |
+            Opaque cursor for the next page. Empty = end of list.
+            Wire format: `<rfc3339nano>|<id_hex>` (pipe-separated).
+            The id is the Build.ID of the LAST row on this page;
+            the started_at segment is RFC3339Nano (sub-second
+            preserved) for non-queued rows, or empty for queued
+            rows (the cursor then keys on id alone in the NULL
+            zone). Round-trip verbatim — server-parsed, no client
+            re-encoding.
 
     AccountCreditResponse:
       description: |

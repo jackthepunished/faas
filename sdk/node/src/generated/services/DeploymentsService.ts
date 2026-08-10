@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { BuildListResponse } from '../models/BuildListResponse.js';
 import type { BuildProvenanceResponse } from '../models/BuildProvenanceResponse.js';
 import type { BuildResponse } from '../models/BuildResponse.js';
 import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.js';
@@ -382,6 +383,87 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `Deployment row missing, cross-account probe, or scan has not run yet.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * List builds (operator view).
+   * Returns every build the authenticated account owns, ordered
+   * started_at DESC (nulls last — queued builds stay at the
+   * bottom of the first page). Optional ?app=<slug> narrows to
+   * one app; optional ?status=<s> filters to the 4-value status
+   * enum (queued|running|succeeded|failed; omit for any status).
+   * Cursor pagination via ?before=<opaque token>; limit defaults
+   * to 50, capped at 200.
+   *
+   * The response shape mirrors /v1/deployments: items + a
+   * next_before cursor (empty when end of list). The cursor is
+   * the opaque tuple `<rfc3339nano>|<id_hex>` of the LAST row
+   * on this page — server-emitted, round-tripped verbatim. The
+   * id tiebreaker makes the keyset deterministic for queued
+   * tails (started_at IS NULL) and for sub-second collisions
+   * on started_at. See ADR-091 §3.
+   *
+   * BuildResponse.started_at (the per-row wire field) is
+   * RFC3339 (whole-second) for backward compatibility with
+   * `GET /v1/builds/{id}`. The cursor's started_at segment is
+   * RFC3339Nano (sub-second preserved) so the keyset
+   * sub-second clause is reachable on rows whose started_at
+   * falls in the same wall-clock second. The two are
+   * deliberately different and the cursor's higher precision
+   * is intentional.
+   *
+   * @returns BuildListResponse A page of builds (ordered started_at DESC, nulls last).
+   * @throws ApiError
+   */
+  public static getBuilds({
+    app,
+    status,
+    before,
+    limit = 50,
+  }: {
+    /**
+     * Filter to a single app slug. Cross-account slug renders 404.
+     */
+    app?: string,
+    /**
+     * Filter to a single status. Omit for any status.
+     */
+    status?: 'queued' | 'running' | 'succeeded' | 'failed',
+    /**
+     * Opaque cursor token from a previous response's `next_before`. Format: `<rfc3339nano>|<id_hex>` (pipe-separated). Empty started_at segment encodes a queued-tail cursor (the `<id_hex>` part alone). Round-trip verbatim — do NOT re-parse or re-encode.
+     */
+    before?: string,
+    /**
+     * Page size (default 50, capped at 200).
+     */
+    limit?: number,
+  }): CancelablePromise<BuildListResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/builds',
+      query: {
+        'app': app,
+        'status': status,
+        'before': before,
+        'limit': limit,
+      },
+      errors: {
+        400: `\`400 Bad Request\` — bad cursor (not RFC3339), bad status
+        filter (not one of queued|running|succeeded|failed), or
+        bad limit (non-numeric / out of range). Stable code
+        \`validation_failed\`.
+        `,
+        401: `code: unauthorized`,
+        404: `\`404 Not Found\` — only raised when ?app=<slug> is set
+        and the slug is unknown OR belongs to another account
+        (uniform 404 so cross-account probes can't enumerate).
+        Stable code \`app_not_found\`.
+        `,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

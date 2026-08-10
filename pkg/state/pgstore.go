@@ -10937,15 +10937,30 @@ func scanDeployments(rows pgx.Rows) ([]Deployment, error) {
 func scanBuild(row pgx.Row) (Build, error) {
 	b := Build{}
 	var kind, statusStr, fc string
-	var startedAt, finishedAt *time.Time
+	// pgtype.Timestamptz is the canonical nullable timestamptz
+	// reader in this file (see test_request_id_tz_row at
+	// pgstore.go:12322) — its `.Valid` flag round-trips NULL
+	// cleanly across both row.Scan (single-row callers like
+	// BuildByID) and rows.Scan (multi-row callers like
+	// ListBuildsForAccountPaged). `*time.Time` works for
+	// single-row scans when the dst pointer is nil, but pgx
+	// v5.10.0 rejects NULL into a nil `*time.Time` when the
+	// same scan args are reused across rows.Scan iterations —
+	// the running build has started_at set + finished_at NULL,
+	// and the second iteration's `finishedAt` is left at the
+	// first iteration's post-scan value, which is then
+	// incompatible with column NULL. pgtype.Timestamptz avoids
+	// the trap by always being a value type with a `.Valid`
+	// flag.
+	var startedAt, finishedAt pgtype.Timestamptz
 	if err := row.Scan(&b.ID, &b.DeploymentID, &kind, &b.SourceBytes, &statusStr, &fc, &b.LogPath, &startedAt, &finishedAt, &b.EnqueuedAt); err != nil {
 		return Build{}, mapErr(err)
 	}
-	if startedAt != nil {
-		b.StartedAt = *startedAt
+	if startedAt.Valid {
+		b.StartedAt = startedAt.Time
 	}
-	if finishedAt != nil {
-		b.FinishedAt = *finishedAt
+	if finishedAt.Valid {
+		b.FinishedAt = finishedAt.Time
 	}
 	b.Kind = DeploymentKind(kind)
 	b.Status = BuildStatus(statusStr)
@@ -11977,8 +11992,186 @@ func (s *PgStore) ListBuildsForAccount(ctx context.Context, accountID string) ([
 	for rows.Next() {
 		b := Build{}
 		var kind, statusStr, fc string
-		if err := rows.Scan(&b.ID, &b.DeploymentID, &kind, &b.SourceBytes, &statusStr, &fc, &b.LogPath, &b.StartedAt, &b.FinishedAt); err != nil {
+		// pgtype.Timestamptz for nullable timestamps (same
+		// pattern as ListBuildsForAccountPaged immediately
+		// below and scanBuild at pgstore.go:10962): &b.StartedAt
+		// / &b.FinishedAt are *time.Time (Build fields are not
+		// pointers) and pgx v5.10.0 rejects NULL into a fresh
+		// *time.Time under rows.Scan.
+		var startedAt, finishedAt pgtype.Timestamptz
+		if err := rows.Scan(&b.ID, &b.DeploymentID, &kind, &b.SourceBytes, &statusStr, &fc, &b.LogPath, &startedAt, &finishedAt); err != nil {
 			return nil, err
+		}
+		if startedAt.Valid {
+			b.StartedAt = startedAt.Time
+		}
+		if finishedAt.Valid {
+			b.FinishedAt = finishedAt.Time
+		}
+		b.Kind = DeploymentKind(kind)
+		b.Status = BuildStatus(statusStr)
+		b.FailureClass = FailureClass(fc)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// ListBuildsForAccountPaged returns one page of builds across the
+// account's deployments, ordered started_at desc nulls last with
+// id DESC as the tiebreaker (DEPLOY-PROV-6 follow-up / ADR-091,
+// issue #741 close-out, post-review fix).
+//
+// Keyset pagination: pass the previous response's (started_at, id)
+// tuple as (before.Time, beforeID) to page backwards. before.IsZero()
+// = first page (beforeID ignored). The id tiebreaker is what makes
+// pagination deterministic for queued builds (started_at IS NULL)
+// AND for sub-second collisions on started_at — without it, rows
+// whose started_at lands in the same wall-clock second as the
+// cursor are dropped on the next page (whole-second wire format
+// vs. sub-second DB precision), and queued-only pages lose the
+// cursor entirely (no non-null started_at to anchor it on).
+//
+// The query is supported by builds_deployment_started_idx
+// (migrations/00197, originally renumbered 166 → 191 → 193 → 195
+// → 197 during cross-PR reviews — each renumber was forced by a
+// sibling PR's reservation fence landing in the same slot mid-
+// rebase; the slot family uses the canonical cross-pr-slot-gate-
+// reservation-fence-pattern + drop-on-rebase cleanup; the latest
+// cycle is 195 → 197 after PR #819 placed a 195_reserve_slot fence
+// + 196 webhook_event_allowlist_cron_fired_manually real migration
+// on its branch, so PR #803 jumped to 197, the next free slot beyond
+// PR #819's 196). The leading deployment_id column lets the planner's
+// nested-loop strategy probe each outer deployment row's builds via
+// a bounded range scan instead of fetching + filtering in-memory.
+// The DESC NULLS LAST ordering matches the SQL surface so queued
+// builds stay at the bottom of every page.
+//
+// limit is clamped server-side by the handler (1..200).
+func (s *PgStore) ListBuildsForAccountPaged(
+	ctx context.Context, accountID, statusFilter, appIDFilter string,
+	before time.Time, beforeID string, limit int,
+) ([]Build, error) {
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	// Branch order is load-bearing (post-review fix): the
+	// "queued-tail cursor" case has `before.IsZero() &&
+	// beforeID != ""` — the started_at segment is empty but the
+	// id segment anchors the boundary in the NULL zone. If we
+	// tested `before.IsZero()` FIRST it would swallow that case
+	// (the very first page branch has no keyset predicate, and
+	// "no started_at" doesn't mean "no cursor"). So the queued-
+	// tail branch is checked before the "first page" branch.
+	switch {
+	case before.IsZero() && beforeID != "":
+		// Queued-tail cursor contract: empty started_at segment
+		// in the opaque cursor — caller is asking for rows
+		// AFTER a queued tail boundary. The keyset becomes id-
+		// only in the NULL zone: "rows with started_at IS NULL
+		// AND id < beforeID". All non-NULL rows (started_at
+		// set) have already been returned in pages with non-
+		// empty started_at cursors; the queued tail is the
+		// last zone to walk. ORDER BY id DESC walks the queued
+		// tail from newest-id to oldest-id.
+		rows, err = s.pool.Query(ctx,
+			`select b.id, b.deployment_id, b.kind, b.source_bytes, b.status,
+			        coalesce(b.failure_class,''), coalesce(b.log_path,''),
+			        b.started_at, b.finished_at, b.enqueued_at
+			 from builds b
+			 join deployments d on d.id = b.deployment_id
+			 join apps a on a.id = d.app_id
+			 where a.account_id = $1
+			   and ($2 = '' or b.status = $2)
+			   and ($3 = '' or d.app_id = $3::uuid)
+			   and b.started_at is null
+			   and b.id < $4
+			 order by b.id desc
+			 limit $5`, accountID, statusFilter, appIDFilter, beforeID, limit)
+	case before.IsZero() && beforeID == "":
+		// First page: no keyset predicate, just the ordering +
+		// limit. id DESC is the stable tiebreaker that makes
+		// page-2's WHERE clause deterministic.
+		rows, err = s.pool.Query(ctx,
+			`select b.id, b.deployment_id, b.kind, b.source_bytes, b.status,
+			        coalesce(b.failure_class,''), coalesce(b.log_path,''),
+			        b.started_at, b.finished_at, b.enqueued_at
+			 from builds b
+			 join deployments d on d.id = b.deployment_id
+			 join apps a on a.id = d.app_id
+			 where a.account_id = $1
+			   and ($2 = '' or b.status = $2)
+			   and ($3 = '' or d.app_id = $3::uuid)
+			 order by b.started_at desc nulls last, b.id desc
+			 limit $4`, accountID, statusFilter, appIDFilter, limit)
+	default:
+		// Keyset (started_at, id) < (before, beforeID) under
+		// the DESC NULLS LAST ordering. Naively encoded as a
+		// row-value comparison it WOULD be `(b.started_at,
+		// b.id) < ($4, $5)` — but PG's row-value `<` is three-
+		// valued for tuples with NULL elements: a `(NULL, x) <
+		// (T, y)` row returns NULL and is therefore excluded
+		// by WHERE, which silently drops queued tails (started_at
+		// IS NULL) past page boundaries.
+		//
+		// The fix is a disjunction that respects all of the
+		// ordering cases:
+		//   1. earlier started_at          → included
+		//   2. equal started_at, smaller id → included
+		//   3. NULL started_at             → included (queued
+		//      zone falls AFTER every non-NULL row in DESC
+		//      NULLS LAST ordering, so any queued row is
+		//      strictly less than a non-NULL cursor)
+		// Case 3 ignores the id because once we're in the
+		// NULL zone, the ordering is by id DESC. The page-2
+		// result, in id-DESC order, advances the cursor to
+		// the SMALLEST queued id, which then anchors the
+		// queued-tail branch (case 1 of the switch above)
+		// on subsequent pages.
+		rows, err = s.pool.Query(ctx,
+			`select b.id, b.deployment_id, b.kind, b.source_bytes, b.status,
+			        coalesce(b.failure_class,''), coalesce(b.log_path,''),
+			        b.started_at, b.finished_at, b.enqueued_at
+			 from builds b
+			 join deployments d on d.id = b.deployment_id
+			 join apps a on a.id = d.app_id
+			 where a.account_id = $1
+			   and ($2 = '' or b.status = $2)
+			   and ($3 = '' or d.app_id = $3::uuid)
+			   and (
+			       b.started_at < $4
+			       or (b.started_at = $4 and b.id < $5)
+			       or b.started_at is null
+			   )
+			 order by b.started_at desc nulls last, b.id desc
+			 limit $6`, accountID, statusFilter, appIDFilter, before, beforeID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Build
+	for rows.Next() {
+		b := Build{}
+		var kind, statusStr, fc string
+		// pgtype.Timestamptz is the canonical nullable timestamp
+		// reader here (mirrors scanBuild at pgstore.go:10962):
+		// &b.StartedAt / &b.FinishedAt are *time.Time (Build
+		// fields are not pointers), and pgx v5.10.0 refuses
+		// NULL into a fresh *time.Time under rows.Scan. The
+		// pgtype wrapper encodes NULL via .Valid = false so
+		// the inner `b.StartedAt = ...` only fires on a real
+		// timestamp.
+		var startedAt, finishedAt pgtype.Timestamptz
+		if err := rows.Scan(&b.ID, &b.DeploymentID, &kind, &b.SourceBytes,
+			&statusStr, &fc, &b.LogPath, &startedAt, &finishedAt, &b.EnqueuedAt); err != nil {
+			return nil, err
+		}
+		if startedAt.Valid {
+			b.StartedAt = startedAt.Time
+		}
+		if finishedAt.Valid {
+			b.FinishedAt = finishedAt.Time
 		}
 		b.Kind = DeploymentKind(kind)
 		b.Status = BuildStatus(statusStr)
