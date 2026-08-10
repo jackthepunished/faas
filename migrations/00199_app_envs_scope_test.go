@@ -1,17 +1,19 @@
 //go:build !no_pg
 
-// Migration-apply test for 00198_app_envs_scope.sql
+// Migration-apply test for 00199_app_envs_scope.sql
 // (ADR-090 PR-A / multi-scope app envs).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00198 (no goose
-//     duplicate-version panic against the 00198_reserve_slot.sql
-//     fence that PR-A removes in the same commit as the real
-//     migration).
+//  1. Migration set applies cleanly through 00199 (no goose
+//     duplicate-version panic). PR-A does not touch a fence in this
+//     slot — it renumbered from 00198 to 00199 to avoid colliding
+//     with PR #819's webhook_event_allowlist_cron_fired_manually
+//     migration. See migrations/00199_app_envs_scope.sql header for
+//     the cross-PR slot-gate rationale.
 //  2. app_envs.scope column exists, is text NOT NULL, and has the
 //     DEFAULT 'default' literal (PG11+ fast-default). Every
-//     pre-00198 row gets scope='default' lazily on first read/write
+//     pre-00199 row gets scope='default' lazily on first read/write
 //     without an UPDATE rewrite, so the migration is metadata-only.
 //  3. PK is widened to (app_id, scope, key) — verified via
 //     pg_constraint (NOT pg_index.indkey which is unstable across
@@ -43,7 +45,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00198_AppEnvsScope(t *testing.T) {
+func TestMigrations_00199_AppEnvsScope(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 

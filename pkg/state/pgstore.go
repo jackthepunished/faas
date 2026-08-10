@@ -10447,7 +10447,7 @@ func (s *PgStore) MarkAppRegistryCredentialUsed(ctx context.Context, accountID, 
 // posture as the secrets table (rotation flows re-PUT without changing
 // the value are still treated as a write).
 //
-// ADR-090 PR-A: the underlying PK is (app_id, scope, key) post-00198,
+// ADR-090 PR-A: the underlying PK is (app_id, scope, key) post-00199,
 // so the flat writers hardcode scope='default' at the SQL boundary.
 // Use UpsertAppEnvInScope for any other scope.
 func (s *PgStore) UpsertAppEnv(ctx context.Context, accountID, appID, key, value string) error {
@@ -10466,7 +10466,7 @@ func (s *PgStore) DeleteAppEnv(ctx context.Context, accountID, appID, key string
 // ListAppEnv returns every (key, value) row on the app where
 // scope='default', scoped to accountID. Order: by scope ASC, key ASC
 // for deterministic staging (the flat reader sees the same ordering
-// as pre-00198 because all its rows share scope='default'). Returns
+// as pre-00199 because all its rows share scope='default'). Returns
 // nil slice when the app has no env rows.
 //
 // ADR-090 PR-A: the WHERE clause adds `scope='default'` so the flat

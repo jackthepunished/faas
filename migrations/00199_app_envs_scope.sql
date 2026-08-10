@@ -1,11 +1,11 @@
 -- +goose Up
 -- +goose StatementBegin
 
--- 00198_app_envs_scope.sql — ADR-090 PR-A.
+-- 00199_app_envs_scope.sql — ADR-090 PR-A.
 --
 -- Widen the app_envs PRIMARY KEY from (app_id, key) to (app_id, scope,
 -- key) by adding a new `scope` column. The default backfill is the
--- PG11+ fast-default — see ADR-090 D1. Every pre-00198 row gets
+-- PG11+ fast-default — see ADR-090 D1. Every pre-00199 row gets
 -- scope='default' lazily on first read/write without an UPDATE
 -- rewrite, so the migration is metadata-only on PG15.
 --
@@ -26,13 +26,13 @@
 -- 00064_invocations_dead_letter.sql:56-71 and
 -- 00053_deployments_source_url.sql:57-70.
 --
--- Cross-PR slot gate: 00198 is collision-clean at PR-A open time
--- (main's max real migration is 00197_builds_deployment_started_idx;
--- 00193/00195/00196 are pre-existing fences unrelated to ADR-090).
--- Re-verify `git ls-tree origin/main migrations/ | grep 00198` is
--- empty immediately before commit. If a competing PR lands 00198
--- first, renumber PR-A to the next free slot and amend the fence
--- removal accordingly.
+-- Cross-PR slot gate: PR-A originally claimed 00198 but had to
+-- renumber to 00199 after PR #819 (open since 2026-08-10T16:52:56Z)
+-- also claimed 00198 for webhook_event_allowlist_cron_fired_manually.
+-- Per ADR-041 the earlier opener keeps the slot; PR-A moves to the
+-- next free real slot. Fences 00193 / 00195 / 00196 are pre-existing
+-- on main and unrelated to ADR-090. PR-B and PR-C of the ADR-090
+-- cluster will land at 00200 and 00201 respectively.
 --
 -- Index strategy: the new composite index
 -- `app_envs_account_app_scope_idx (account_id, app_id, scope)`

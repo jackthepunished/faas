@@ -360,12 +360,12 @@ type secretKey struct {
 }
 
 // envKey mirrors the app_envs PRIMARY KEY (app_id, scope, key)
-// post-ADR-090-PR-A (migration 00198). Pre-PR the PK was
+// post-ADR-090-PR-A (migration 00199). Pre-PR the PK was
 // (app_id, key); the Scope field is always 'default' for the flat
 // methods (UpsertAppEnv / DeleteAppEnv / ListAppEnv / CountAppEnv)
 // and is the caller-supplied value for the …InScope variants. The
 // scope literal is the same one the schema's fast-default picks for
-// pre-00198 rows.
+// pre-00199 rows.
 type envKey struct {
 	AppID string
 	Scope string

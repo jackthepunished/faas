@@ -1,0 +1,44 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00198_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / cross-PR gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path beyond goose writing a row to goose_db_version. The
+-- replay-safety gate in ci.yml drops files whose basename matches
+-- the reservation regex from its "added migration versions"
+-- computation (see scripts/ci/check_migration_slots.sh ::
+-- reserved_from_paths), so this file is carved out of the
+-- cross-PR overlap check.
+--
+-- Context: PR-A (ADR-090 / app_envs.scope PK widening) renumbered
+-- from 00198 to 00199 after PR #819 (open since 2026-08-10T16:52:56Z)
+-- also claimed 00198 for
+-- webhook_event_allowlist_cron_fired_manually. PR #819 has
+-- seniority on slot 00198. PR-A holds slot 00199. Without this
+-- reservation at 00198, the branch's embedded FS would have a gap
+-- at position 198 and TestMigrationsContiguous would fail at PR
+-- time. When PR #819 lands first (the senior claim), this fence
+-- becomes a duplicate-version collision against their real
+-- migration at the same slot and must be removed in a follow-up
+-- commit. If PR-A lands first (unlikely — #819 is senior), the
+-- fence survives on main until PR-B / PR-C of the ADR-090
+-- cluster renumber the outline to use 00198 (no such renumber is
+-- planned; the ADR-090 cluster sits at 00199 / 00200 / 00201
+-- respectively and this fence stays on main as a no-op forever).
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
