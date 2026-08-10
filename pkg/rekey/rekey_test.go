@@ -331,11 +331,11 @@ type failingFakeStore struct {
 	faultCursor string
 }
 
-func (s *failingFakeStore) UpsertAppSecretWithKid(_ context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+func (s *failingFakeStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
 	if s.faultCursor != "" && encodeCursor(accountID, appID, key) == s.faultCursor {
 		return context.DeadlineExceeded // sentinel "persist failed"
 	}
-	return s.fakeStore.UpsertAppSecretWithKid(context.Background(), accountID, appID, key, kid, ciphertext)
+	return s.fakeStore.UpsertAppSecretWithKid(ctx, accountID, appID, key, kid, ciphertext)
 }
 
 // TestRun_CrashMidRow pins the cursor-pin-on-failure + >=

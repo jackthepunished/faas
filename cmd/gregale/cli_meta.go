@@ -301,7 +301,7 @@ var cliCommands = []cliCommand{
 		Short:   "Operator host.age rotation (host-age init|rotate|status|prune-previous)",
 		Subcommands: []cliSub{
 			{Name: "init", Short: "Initialise host.age"},
-			{Name: "rotate", Short: "Rotate host.age"},
+			{Name: subRotate, Short: "Rotate host.age"},
 			{Name: "status", Short: "Show host.age status"},
 			{Name: "prune-previous", Short: "Prune the previous host.age key"},
 		},
@@ -359,7 +359,7 @@ var cliCommands = []cliCommand{
 			{Name: "list", Short: "List API keys"},
 			{Name: "add", Short: "Mint a new API key"},
 			{Name: "rm", Short: "Revoke an API key"},
-			{Name: "rotate", Short: "Rotate an API key"},
+			{Name: subRotate, Short: "Rotate an API key"},
 			{Name: "grace-window", Short: "Set the rotation grace window"},
 		},
 	},
@@ -453,7 +453,7 @@ var cliCommands = []cliCommand{
 		Subcommands: []cliSub{
 			{Name: "init", Short: "Initialise the local PKI"},
 			{Name: statusLiteral, Short: "Show PKI status"},
-			{Name: "rotate", Short: "Rotate the PKI"},
+			{Name: subRotate, Short: "Rotate the PKI"},
 		},
 	},
 	{
@@ -516,7 +516,7 @@ var cliCommands = []cliCommand{
 			{Name: "set", Short: "Set a sealed secret"},
 			{Name: "unset", Short: "Remove a sealed secret"},
 			{Name: "list-all", Short: "List every secret across apps"},
-			{Name: "rotate", Short: "Re-seal one secret under the current host key"},
+			{Name: subRotate, Short: "Re-seal one secret under the current host key"},
 		},
 	},
 	{
@@ -525,7 +525,7 @@ var cliCommands = []cliCommand{
 		Short:   "Provision the cosign sign keypair (operator; --sign-key / --verify-key)",
 		Subcommands: []cliSub{
 			{Name: "init", Short: "Initialise the cosign keypair"},
-			{Name: "rotate", Short: "Rotate the cosign keypair"},
+			{Name: subRotate, Short: "Rotate the cosign keypair"},
 			{Name: statusLiteral, Short: "Show keypair status"},
 		},
 		Flags: []cliFlag{

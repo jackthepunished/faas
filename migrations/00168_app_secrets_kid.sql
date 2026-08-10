@@ -1,4 +1,4 @@
--- filename: 00166_app_secrets_kid.sql
+-- filename: 00168_app_secrets_kid.sql
 -- +goose Up
 -- ADR-089 PR-A: per-secret rotation surface needs a way to tell the
 -- operator "what host key sealed this row?" without parsing the age

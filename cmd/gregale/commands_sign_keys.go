@@ -38,11 +38,11 @@ import (
 
 const dispatchSignKeys = "sign-keys"
 
-// subInit / subRotate / subStatus are the leaf names. Mirrors the
-// subList / subAdd / subRm pattern in commands2.go.
+// subInit / subStatus are the leaf names. subRotate is declared in
+// commands2.go (shared across every resource's `… rotate …` literal
+// so goconst stops flagging the cli_meta.go manifest).
 const (
 	subInit   = "init"
-	subRotate = "rotate"
 	subStatus = "status"
 )
 

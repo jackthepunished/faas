@@ -155,6 +155,8 @@ export type { RateLimitPlain } from './models/RateLimitPlain.js';
 export type { RenameAppRequest } from './models/RenameAppRequest.js';
 export type { RepoResponse } from './models/RepoResponse.js';
 export type { RotateAlertRuleSecretResponse } from './models/RotateAlertRuleSecretResponse.js';
+export type { RotateAppSecretRequest } from './models/RotateAppSecretRequest.js';
+export type { RotateAppSecretResponse } from './models/RotateAppSecretResponse.js';
 export type { RotateAppWebhookSecretResponse } from './models/RotateAppWebhookSecretResponse.js';
 export type { RotateKeyResponse } from './models/RotateKeyResponse.js';
 export type { RotateOrgAPIKeyRequest } from './models/RotateOrgAPIKeyRequest.js';

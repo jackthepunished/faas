@@ -57,7 +57,7 @@ func cmdSecrets(args []string) int {
 		return secretsUnset(args[1:])
 	case "list-all":
 		return secretsListAll(args[1:])
-	case "rotate":
+	case subRotate:
 		return secretsRotate(args[1:])
 	}
 	fmt.Fprintf(os.Stderr, "unknown secrets subcommand %q\n", args[0])
