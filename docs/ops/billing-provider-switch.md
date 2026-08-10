@@ -132,13 +132,17 @@ export DATABASE_URL=postgres:///faas?host=/run/postgresql&user=faas
 make e2e-sandbox
 ```
 
-The walk fires three sequential tests via a `/tmp/faas-paddle-sandbox-handoff.json` file:
+The walk fires five sequential tests via a `/tmp/faas-paddle-sandbox-handoff.json` file:
 
 1. `TestPaddleSandbox_ChangePlanReturnsCheckoutURL` — signup → `PATCH /v1/account/plan {plan: hobby}` → asserts 402 + `paddle_checkout_url` + `tx_id`. Writes the customer + transaction IDs to the handoff file.
 2. `TestPaddleSandbox_SubscriptionCreatedStampsCustomerID` — POSTs a signed `subscription.created` event with the handoff's `ctm_…` ID → asserts `accounts.provider_customer_id` is populated.
 3. `TestPaddleSandbox_TransactionCompletedIsNoop` — POSTs a signed `transaction.completed` event → asserts no state flip.
+4. `TestPaddleSandbox_PerWindowClaimRoundTrip` — runs the meterd production path (`NewProviderWithDedupe` → `EnsurePlanProducts` → `PushUsageRecord`) directly against the sandbox and asserts the `paddle_overage_dedupe` row is stamped with `state=completed`, `pushed_at` non-null, `claimed_by` non-null, `pushed_mb_seconds` = the integer the test pushed. Distinct from `pkg/billing/paddle/sandbox_test.go` (which exercises the Provider with `dedupe=nil`); this one wires the production constructor and asserts the dedupe row state after a real SDK POST.
+5. `TestPaddleSandbox_WebhookSignatureRoundTrip` — SDK-side pinning of the contract Tests 2/3 prove at the apid HTTP layer. Signs a real Paddle-shaped JSON body with the operator's webhook secret; asserts `VerifyWebhook` accepts it with canonical and lowercase header keys, and rejects a tampered body with `errors.Is(err, billing.ErrBadSignature)`.
 
-A passing run validates that the apid webhook handler, the catalog OpProvider, and the live Paddle sandbox all agree on the customer → account mapping. Re-run is idempotent (every test creates fresh state).
+A passing run validates that the apid webhook handler, the catalog OpProvider, the meterd pusher, and the live Paddle sandbox all agree on the customer → account mapping AND on the wire shape the SDK signs/verifies. Re-run is idempotent (every test creates fresh state).
+
+The B4 pre-flight has a separate pgstore-level pin in `pkg/state/pgstore_paddle_overage_schema_test.go` that runs in CI's pg shard (no sandbox credentials required). The two probes (`TestPgStorePaddleOverageDedupeSchema_PostApply` + `_PreApply_ReturnsTableMissing`) keep the to_regclass + information_schema probe honest — a future migration that drops a 00041 column or breaks the missing-table hint flips them red.
 
 ## Secret rotation
 
