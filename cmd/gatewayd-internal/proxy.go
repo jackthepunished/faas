@@ -40,6 +40,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/onebox-faas/faas/pkg/apid"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/middleware"
 )
@@ -67,6 +68,14 @@ type apidProxy struct {
 	next        http.Handler
 	logsHandler http.Handler
 	log         *slog.Logger
+
+	// writeGate is the Tier A9 / ADR-084 standby write-redirect
+	// handler. nil-safe — tests and the legacy single-node build
+	// omit it and the gate is silently bypassed. When set, every
+	// apid-bound request flows through the gate BEFORE the proxy
+	// hop; the gate's bypass path is a true no-op so the proxy
+	// hop is unchanged for reads and same-box writes.
+	writeGate http.Handler
 }
 
 // newApidProxy parses target and returns the wrapping handler.
@@ -83,6 +92,17 @@ func newApidProxy(target string, next http.Handler, log *slog.Logger) http.Handl
 // AppLogsHandler; unit tests omit it (logsHandler=nil) and
 // the carve-out is benign.
 func newApidProxyWithLogs(target string, next http.Handler, logsHandler http.Handler, log *slog.Logger) http.Handler {
+	return newApidProxyWithGate(target, next, logsHandler, nil, log)
+}
+
+// newApidProxyWithGate is the full Tier A9 constructor: same
+// surface as newApidProxyWithLogs plus the optional writeGate
+// handler. writeGate is consulted for every apid-bound request
+// BEFORE the proxy hop; nil disables the gate. The split
+// exists so single-node tests that don't care about the gate
+// don't have to thread a no-op handler through every
+// constructor call.
+func newApidProxyWithGate(target string, next, logsHandler, writeGate http.Handler, log *slog.Logger) http.Handler {
 	if target == "" || log == nil {
 		return next
 	}
@@ -91,8 +111,17 @@ func newApidProxyWithLogs(target string, next http.Handler, logsHandler http.Han
 		log.Warn("apid proxy target invalid; passing through", "target", target, "err", err)
 		return next
 	}
-	log.Info("apid proxy armed", "target", u.String())
-	return &apidProxy{target: u, next: next, logsHandler: logsHandler, log: log}
+	log.Info("apid proxy armed",
+		"target", u.String(),
+		"write_gate", writeGate != nil,
+	)
+	return &apidProxy{
+		target:      u,
+		next:        next,
+		logsHandler: logsHandler,
+		writeGate:   writeGate,
+		log:         log,
+	}
 }
 
 // ServeHTTP routes isApidPath requests to apid. The rest falls
@@ -114,6 +143,18 @@ func (a *apidProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isApidPath(r.URL.Path) {
+		// Tier A9 / ADR-084: route every apid-bound
+		// request through the standby write-redirect
+		// gate BEFORE the proxy hop. The gate's
+		// bypass / same_box paths forward to next,
+		// which is the apid loopback proxy — so
+		// the proxy hop is unchanged for steady-
+		// state traffic. Standby writes are
+		// intercepted here.
+		if a.writeGate != nil {
+			a.writeGate.ServeHTTP(w, r)
+			return
+		}
 		a.proxyToApid(w, r)
 		return
 	}
@@ -169,6 +210,11 @@ func isApidLogsPath(p string) bool {
 // prefix followed by "/", or prefix followed by "/" and then more
 // path. This prevents accidental shadowing like "/v1.zip" matching
 // "/v1" — review finding #6 from the dashboard era.
+//
+// DEPRECATED: the live predicate is now `apid.IsApidPath` (see
+// `pkg/apid/router.go`); this wrapper is preserved only for any
+// future local matcher that wants to share the same anti-shadowing
+// discipline. New code MUST call `apid.IsApidPath` directly.
 func hasApidPrefix(p, prefix string) bool {
 	if p == prefix || p == prefix+"/" {
 		return true
@@ -200,51 +246,20 @@ func hasApidPrefix(p, prefix string) bool {
 // here. The /auth/verify root (legacy magic-link consume) was already
 // present from M7.5; the new /auth/reset sits next to it as a sibling
 // anchored root, so /auth/reset/anything is also proxied.
+// isApidPath is the local proxy-side wrapper that forwards to the
+// shared `pkg/apid.IsApidPath` matcher. Keeping a thin local
+// indirection preserves the existing call sites (see
+// newApidProxyWithLogs below) without rippling an import rename
+// through every consumer; the matcher itself was promoted to
+// `pkg/apid/router.go` during PR-B / Tier A9 / ADR-084 so the
+// standby write-gate can consume the same predicate as the proxy.
+//
+// Anchor discipline, anchored-root anti-shadowing, and the /oauth/*
+// subtree-only behaviour are all pinned in
+// `pkg/apid/router_test.go::TestIsApidPath`.
 func isApidPath(p string) bool {
-	// Anchored roots: each matched as exact + "/" subtree.
-	for _, root := range []string{
-		apidRootV1,
-		apidRootDashboard,
-		apidRootLogin,
-		apidRootSignup,
-		apidRootLoginForgot,
-		apidRootAuthVerify,
-		apidRootAuthReset,
-		apidRootLogout,
-		apidRootStatus,
-		apidRootHealthz,
-		apidRootCliAuth,
-	} {
-		if hasApidPrefix(p, root) {
-			return true
-		}
-	}
-	// /oauth/* — only the subtree form. Deliberately no exact
-	// /oauth match: apid has no /oauth route today (only
-	// /oauth/callback is mounted), so a bare /oauth request would
-	// 404 on apid's mux either way. Pinning this in tests
-	// ({"/oauth", false}) defends against an accidental future
-	// expansion that would steal what should be a 404 path.
-	return strings.HasPrefix(p, apidRootOAuthPrefix)
+	return apid.IsApidPath(p)
 }
-
-// Anchored root paths used by isApidPath. Lifted to constants so
-// the path table reads as data and goconst stops nagging (one of
-// these appears four times in the matcher alone).
-const (
-	apidRootV1          = "/v1"
-	apidRootDashboard   = "/dashboard"
-	apidRootOAuthPrefix = "/oauth/"
-	apidRootLogin       = "/login"
-	apidRootSignup      = "/signup"
-	apidRootLoginForgot = "/login/forgot"
-	apidRootAuthVerify  = "/auth/verify"
-	apidRootAuthReset   = "/auth/reset"
-	apidRootLogout      = "/logout"
-	apidRootStatus      = "/status"
-	apidRootHealthz     = "/healthz"
-	apidRootCliAuth     = "/cli-auth"
-)
 
 // proxyToApid builds a one-shot httputil.ReverseProxy and serves
 // the request through it.

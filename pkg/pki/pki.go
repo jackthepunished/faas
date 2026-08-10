@@ -145,6 +145,23 @@ func ProductionSANs(cn string) AltNames {
 	}
 }
 
+// MergeProductionSANs returns an AltNames whose DNSNames is the
+// concatenation of ProductionSANs(cnA).DNSNames and
+// ProductionSANs(cnB).DNSNames. Used by Tier A9 / ADR-084 to
+// bind the cross-box leader hop: the server leaf carries both
+// its own CN and the dialer's CN (and vice-versa) so RFC 6125
+// SAN matching succeeds in both directions.
+//
+// Duplicates are not de-duplicated; in practice the two CNs
+// are distinct (server vs client) and de-dup would mask a
+// future accidental self-reference — leave the caller to
+// reason about duplicates if they ever arise.
+func MergeProductionSANs(cnA, cnB string) AltNames {
+	return AltNames{
+		DNSNames: append(append([]string{}, cnA), cnB),
+	}
+}
+
 // Roles returns the canonical set of leaves every box on the fleet
 // needs. The list is intentionally redundant across roles (every box
 // gets a schedd server leaf even if it doesn't run schedd) because the
@@ -170,6 +187,17 @@ func Roles() []Role {
 		{CommonName: "apid.faas", Kind: KindServer, Directory: "apid", Filename: "advisory", AltNames: ProductionSANs("apid.faas")},
 		{CommonName: "githubd.faas", Kind: KindServer, Directory: "githubd", Filename: "server", AltNames: ProductionSANs("githubd.faas")},
 		{CommonName: "meterd.faas", Kind: KindServer, Directory: "meterd", Filename: "server", AltNames: ProductionSANs("meterd.faas")},
+		// Tier A9 / ADR-084: the cross-box standby write-
+		// redirect hop lands on the LEADER box's
+		// gatewayd-public listener over an mTLS-only port
+		// (separate from the public CertMagic edge — public
+		// TLS is for browsers, not for inter-node traffic).
+		// The leaf is mounted at Directory="gatewayd-public",
+		// Filename="leader-server" so the on-disk path is
+		// /etc/faas/tls/gatewayd-public/leader-server.{crt,key}.
+		// The CN matches the client leaf's SAN so RFC 6125
+		// SAN matching succeeds on both sides of the hop.
+		{CommonName: "gatewayd-public.faas", Kind: KindServer, Directory: "gatewayd-public", Filename: "leader-server", AltNames: MergeProductionSANs("gatewayd-public.faas", "gatewayd-internal-public.faas")},
 	}
 
 	// Per-daemon outbound client leaves. vmmd dials schedd + apid;
@@ -177,6 +205,20 @@ func Roles() []Role {
 	// apid dials githubd. Builderd and schedd dials only vmmd (covered
 	// by the per-daemon TOML that points at vmmd's "server" leaf as
 	// the CA-trustable remote).
+	//
+	// Tier A9 / ADR-084 (PR-B sub-task B5) adds the
+	// `leader-client` leaf: gatewayd-internal uses it to dial
+	// the LEADER box's gatewayd-public listener for the
+	// standby write-redirect cross-box hop. The leaf is
+	// mounted at Directory="gatewayd-internal-public",
+	// Filename="leader-client" so the on-disk path is
+	// /etc/faas/tls/gatewayd-internal-public/leader-client.{crt,key}.
+	// CN="gatewayd-internal-public.faas" matches the SAN the
+	// gatewayd-public server leaf presents (the
+	// gatewayd-public "server" leaf already covers
+	// ProductionSANs("gatewayd-public.faas"); we add the
+	// matching SAN to the client leaf so RFC 6125 SAN
+	// matching succeeds in both directions).
 	clientRoles := []Role{
 		{CommonName: "vmmd.faas", Kind: KindClient, Directory: "vmmd", Filename: "schedd-client", AltNames: ProductionSANs("vmmd.faas")},
 		{CommonName: "vmmd.faas", Kind: KindClient, Directory: "vmmd", Filename: "apid-client", AltNames: ProductionSANs("vmmd.faas")},
@@ -187,6 +229,7 @@ func Roles() []Role {
 		{CommonName: "apid.faas", Kind: KindClient, Directory: "apid", Filename: "githubd-client", AltNames: ProductionSANs("apid.faas")},
 		{CommonName: "builderd.faas", Kind: KindClient, Directory: "builderd", Filename: "vmmd-client", AltNames: ProductionSANs("builderd.faas")},
 		{CommonName: "schedd.faas", Kind: KindClient, Directory: "schedd", Filename: "vmmd-client", AltNames: ProductionSANs("schedd.faas")},
+		{CommonName: "gatewayd-internal-public.faas", Kind: KindClient, Directory: "gatewayd-internal-public", Filename: "leader-client", AltNames: MergeProductionSANs("gatewayd-internal-public.faas", "gatewayd-public.faas")},
 	}
 
 	all := make([]Role, 0, len(serverRoles)+len(clientRoles))

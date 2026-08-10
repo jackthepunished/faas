@@ -771,17 +771,18 @@ func TestApidProxy_LogsCarveOutDisabledWhenHandlerNil(t *testing.T) {
 }
 
 // TestApidPathReservations_Documented is the drift-protection guard
-// for spec §4.1.1: every apidRoot* constant declared in
-// cmd/gatewayd/proxy.go (the matcher source-of-truth) must appear
-// verbatim in docs/faas_implementation_spec.md so customer-facing
-// docs match the platform's reservation list.
+// for spec §4.1.1: every ApidRoot* constant declared in
+// pkg/apid/router.go (the matcher source-of-truth, promoted from
+// cmd/gatewayd-internal/proxy.go during PR-B / Tier A9 / ADR-084)
+// must appear verbatim in docs/faas_implementation_spec.md so
+// customer-facing docs match the platform's reservation list.
 //
 // The matcher is the source of truth; the spec is documentation
-// that must match. If a future change adds a new apidRoot* constant
+// that must match. If a future change adds a new ApidRoot* constant
 // without updating the spec, this test fails. The test reads the
-// spec from the repo root relative to this file (the cmd/gatewayd/
-// test binary is built and run from the repo root, so the relative
-// path resolves to the repo-root copy of the spec).
+// spec from the repo root relative to this file (the cmd/gatewayd-
+// internal test binary is built and run from the repo root, so the
+// relative path resolves to the repo-root copy of the spec).
 //
 // The reverse direction (spec mentions a path the matcher doesn't
 // cover) is NOT pinned here — the spec might intentionally document
@@ -811,13 +812,13 @@ func TestApidPathReservations_Documented(t *testing.T) {
 	}
 	section := body[idx:end]
 
-	// Pulled from cmd/gatewayd/proxy.go's apidRoot* const block
-	// (proxy.go:233-246). Keep in sync with that block — this test
+	// Pulled from pkg/apid/router.go's ApidRoot* const block
+	// (router.go:43-56). Keep in sync with that block — this test
 	// IS the guard that catches drift.
 	wantConsts := []string{
 		"/v1",
 		"/dashboard",
-		"/oauth/", // the matcher has apidRootOAuthPrefix = "/oauth/"; the spec subsection says "/oauth/... subtree (NOT bare /oauth)"
+		"/oauth/", // the matcher has ApidRootOAuthPrefix = "/oauth/"; the spec subsection says "/oauth/... subtree (NOT bare /oauth)"
 		"/login",
 		"/signup",
 		"/login/forgot",
@@ -830,7 +831,7 @@ func TestApidPathReservations_Documented(t *testing.T) {
 	}
 	for _, want := range wantConsts {
 		if !strings.Contains(section, want) {
-			t.Errorf("spec §4.1.1 missing apidRoot constant %q — update the docs in the same PR that adds the constant", want)
+			t.Errorf("spec §4.1.1 missing ApidRoot constant %q — update the docs in the same PR that adds the constant", want)
 		}
 	}
 }

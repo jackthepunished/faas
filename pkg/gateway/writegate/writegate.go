@@ -46,6 +46,8 @@ package writegate
 import (
 	"net/http"
 	"strings"
+
+	"github.com/onebox-faas/faas/pkg/apid"
 )
 
 // LoopGuardSentinel is the header name the writeGate sets on the
@@ -339,91 +341,38 @@ func IsLoopAttempt(r *http.Request) bool {
 // carve-out allowlist is checked at the proxy call site, not
 // in this predicate.
 //
-// NOTE: the path predicate `apidPathMatch` is a placeholder
-// for PR-A — it returns true on a simple anchored prefix match
-// matching the existing isApidPath. PR-B refines the match
-// (the current `isApidPath` has subtle anchored-root cases like
-// `/v1.zip` being excluded; those regressions are pinned by
-// writegate_test.go). DO NOT remove the test coverage when
-// swapping in the full predicate.
+// NOTE: the path predicate was lifted from a writegate-local
+// duplicate (`apidPathMatch`) to the shared `pkg/apid.IsApidPath`
+// in PR-B / Tier A9 / ADR-084. The two implementations share
+// the same anchored-root discipline and were verified
+// equivalent via the regression table at
+// `pkg/apid/router_test.go::TestIsApidPath` and the parallel
+// table at `writegate_test.go::TestIsWriteRequest_Mutations`.
+//
+// The handler constructor (`newWriteGate` in
+// cmd/gatewayd-internal/write_gate.go, PR-B sub-task B6)
+// receives the path predicate as an injected `func(string)
+// bool` so any future caller can route the gate through a
+// different matcher without re-touching `pkg/gateway/writegate`.
 func IsWriteRequest(r *http.Request) bool {
 	if !IsWriteMethod(r.Method) {
 		return false
 	}
-	return apidPathMatch(r.URL.Path)
+	return apid.IsApidPath(r.URL.Path)
 }
-
-// apidRoot constants mirror the production `isApidPath` anchored
-// roots at cmd/gatewayd-internal/proxy.go:235-247. The list is
-// exhaustive for the apid public surface (issue #85) — anything
-// outside falls through to the wake/proxy path (which 404s for
-// legitimate apid traffic, so missing entries are loud bugs that
-// tests will catch immediately). PR-A intentionally mirrors the
-// full list, not a placeholder, so the writeGate is correct on
-// day one — PR-B will switch to importing the production
-// constants directly (a subsequent refactor; both files share
-// the constant values verbatim so the switch is a one-line
-// import).
-const (
-	apidRootV1          = "/v1"
-	apidRootDashboard   = "/dashboard"
-	apidRootOAuthPrefix = "/oauth/"
-	apidRootLogin       = "/login"
-	apidRootSignup      = "/signup"
-	apidRootLoginForgot = "/login/forgot"
-	apidRootAuthVerify  = "/auth/verify"
-	apidRootAuthReset   = "/auth/reset"
-	apidRootLogout      = "/logout"
-	apidRootStatus      = "/status"
-	apidRootHealthz     = "/healthz"
-	apidRootCliAuth     = "/cli-auth"
-)
 
 // hasApidPrefix reports whether p begins with prefix anchored at
 // the trailing slash — p matches if it is exactly prefix, or
 // prefix followed by "/", or prefix followed by "/" and then
 // more path. This prevents accidental shadowing like "/v1.zip"
 // matching "/v1" — review finding #6 from the dashboard era.
-// Mirrors cmd/gatewayd-internal/proxy.go:172-177 verbatim; PR-B
-// will switch this to a direct import.
+//
+// DEPRECATED: kept only for any future caller inside this
+// package that wants the local anchored-root discipline. New
+// code MUST call `apid.IsApidPath` directly.
 func hasApidPrefix(p, prefix string) bool {
 	if p == prefix || p == prefix+"/" {
 		return true
 	}
 	return strings.HasPrefix(p, prefix+"/")
-}
-
-// apidPathMatch mirrors cmd/gatewayd-internal/proxy.go:203-229
-// `isApidPath`. The 11 anchored roots cover every apid-bound
-// surface (dashboard, OAuth callbacks, the §4.2 REST API,
-// login/signup/magic-link/password-reset, logout, status,
-// healthz, cli-auth). The /oauth/* prefix is the subtree form
-// only — bare `/oauth` is intentionally rejected (apid 404s
-// either way, but pinning the rejection in tests defends against
-// an accidental future expansion).
-//
-// PR-B replaces this function with the production one — both
-// share the same constant block so the switch is a one-line
-// import. Until then, the duplication is intentional (PR-A
-// ships the predicate in a fully-correct form so the writeGate
-// is right from day one; review finding #3 of PR #761).
-func apidPathMatch(p string) bool {
-	for _, root := range []string{
-		apidRootV1,
-		apidRootDashboard,
-		apidRootLogin,
-		apidRootSignup,
-		apidRootLoginForgot,
-		apidRootAuthVerify,
-		apidRootAuthReset,
-		apidRootLogout,
-		apidRootStatus,
-		apidRootHealthz,
-		apidRootCliAuth,
-	} {
-		if hasApidPrefix(p, root) {
-			return true
-		}
-	}
-	return strings.HasPrefix(p, apidRootOAuthPrefix)
 }
