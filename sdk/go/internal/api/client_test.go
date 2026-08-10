@@ -827,6 +827,9 @@ func TestSweep_PostAuthSignup(t *testing.T) {
 	if resp.AccountID != "acc_X" {
 		t.Errorf("account_id = %q, want acc_X", resp.AccountID)
 	}
+	if resp.Email != "alice@example.com" {
+		t.Errorf("email = %q, want alice@example.com (PR #793 drift fix: SDK struct must mirror pkg/api's Email field)", resp.Email)
+	}
 	if resp.APIKey.Plaintext != "fp_live_abc123" {
 		t.Errorf("api_key.plaintext = %q, want fp_live_abc123", resp.APIKey.Plaintext)
 	}
@@ -857,6 +860,9 @@ func TestSweep_PostAuthLogin(t *testing.T) {
 	}
 	if resp.APIKey.ID != "key_01HABC" {
 		t.Errorf("api_key.id = %q, want key_01HABC", resp.APIKey.ID)
+	}
+	if resp.Email != "bob@example.com" {
+		t.Errorf("email = %q, want bob@example.com (PR #793 drift fix: SDK struct must mirror pkg/api's Email field)", resp.Email)
 	}
 }
 
