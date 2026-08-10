@@ -2396,8 +2396,18 @@ type AppSecret struct {
 	AppID      string
 	Key        string
 	Ciphertext []byte
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Kid is the age-1... recipient string of the host identity
+	// that sealed this row's ciphertext. Set by the apid PUT
+	// handler (cmd/apid/handlers_secrets.go::setSecret) and by
+	// pkg/rekey.Replayer at every re-seal. Rows sealed before
+	// migration 00166 (ADR-089 PR-A) have Kid = "" until the
+	// rekey pass or a subsequent PUT stamps it.
+	//
+	// Operators reading the kid column answer "what key sealed
+	// this row?" without parsing the ciphertext blob.
+	Kid       string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // AccountAppSecret is the per-row shape returned by

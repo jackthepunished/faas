@@ -2630,8 +2630,24 @@ type Store interface {
 	// UpsertAppSecret writes-or-replaces the (app_id, key) row. accountID is
 	// passed for ownership verification (the handler must own the app before
 	// it can set a secret on it); the row also stores account_id for audit
-	// and for the account-scoped delete path.
+	// and for the account-scoped delete path. ADR-089 PR-A: the kid column
+	// is stamped via UpsertAppSecretWithKid; UpsertAppSecret is preserved
+	// for backward compatibility with existing call sites that don't track
+	// the kid (e.g. webhook secrets in pkg/webhook).
 	UpsertAppSecret(ctx context.Context, accountID, appID, key string, ciphertext []byte) error
+	// UpsertAppSecretWithKid is the kid-stamping sibling of UpsertAppSecret
+	// (ADR-089 PR-A / migration 00166). The kid column records which host
+	// identity sealed the row, so operators can answer "what key sealed
+	// this row?" without parsing the ciphertext blob. New callers (the
+	// rotate handler in PR-B, the rekey package in PR-A) should use this
+	// variant; old call sites keep UpsertAppSecret which writes kid = "".
+	UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error
+	// GetAppSecret returns the (account_id, app_id, key) row including
+	// ciphertext + kid + timestamps. Returns ErrNotFound if the row does
+	// not exist. Used by the per-secret rotate handler (PR-B) to
+	// distinguish first-time set (emits secret.set audit kind) from
+	// rotation (emits secret.rotated).
+	GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error)
 	// DeleteAppSecret removes the (app_id, key) row. Returns ErrNotFound if
 	// the row doesn't exist — handlers render 400 CodeSecretNotFound (not a
 	// 404) because the URL resource IS the secret name, by design.
@@ -2648,6 +2664,15 @@ type Store interface {
 	// dashboard's account-wide secrets page so one call replaces N
 	// per-app fan-outs.
 	ListAppSecretsForAccount(ctx context.Context, accountID string, limit int, before string) ([]AccountAppSecret, error)
+	// ListAppSecretsForRekey is the global paginated walk consumed by
+	// pkg/rekey.Replayer.Run (ADR-089 PR-A). Order is
+	// (account_id ASC, app_id ASC, key ASC) so a cursor based on the
+	// last visited tuple yields a deterministic continuation across
+	// daemon restarts. The cursor is the encoded "<account_id>|<app_id>|<key>"
+	// from RekeyProgress.LastID; an empty cursor starts from the
+	// beginning. limit is the page size (matches RekeyConfig.BatchSize;
+	// default 50).
+	ListAppSecretsForRekey(ctx context.Context, limit int, cursor string) ([]AppSecret, error)
 	// CountAppSecrets is the quota check helper. apid calls it before
 	// UpsertAppSecret to enforce Limits.SecretCountMax.
 	CountAppSecrets(ctx context.Context, accountID, appID string) (int, error)
