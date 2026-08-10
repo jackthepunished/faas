@@ -1,11 +1,11 @@
 //go:build !no_pg
 
-// Migration-apply test for 00174_app_secrets_kid.sql
+// Migration-apply test for 00184_app_secrets_kid.sql
 // (ADR-089 PR-A / per-secret rotation surface).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00174 (no goose
+//  1. Migration set applies cleanly through 00184 (no goose
 //     duplicate-version panic against main's
 //     00166_reserve_slot.sql fence + 00167_apps_overflow_node.sql).
 //  2. app_secrets.kid column exists, is nullable TEXT, and is the
@@ -29,14 +29,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00174_AppSecretsKid(t *testing.T) {
+func TestMigrations_00184_AppSecretsKid(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
 	// Column shape: must be text, nullable. kid is the age-1...
 	// recipient string of the host identity that sealed the row
 	// (ADR-089 D4). Nullable because rows sealed before migration
-	// 00174 have no kid recorded; the migration's best-effort
+	// 00184 have no kid recorded; the migration's best-effort
 	// backfill only stamps rows that unseal under the loaded
 	// identity set (corrupt / historical-keyed rows stay NULL).
 	rows, err := pool.Query(ctx, `
