@@ -47,12 +47,12 @@ func fakeSignupServer(t *testing.T, signupStatus int, magicLinkStatus int) (*htt
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"account_id":"acc_signup_test","plan":"free","api_key":{"plaintext":"`+signupPlaintext+`","prefix":"fp_live_","id":"key_signup_test"}}`)
+			_, _ = io.WriteString(w, `{"account_id":"acc_signup_test","email":"alice@example.com","plan":"free","api_key":{"plaintext":"`+signupPlaintext+`","prefix":"fp_live_","id":"key_signup_test"}}`)
 		case "/v1/auth/login":
 			atomic.AddInt32(&c.login, 1)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `{"account_id":"acc_signup_test","plan":"free","api_key":{"plaintext":"`+signupPlaintext+`","prefix":"fp_live_","id":"key_signup_test"}}`)
+			_, _ = io.WriteString(w, `{"account_id":"acc_signup_test","email":"alice@example.com","plan":"free","api_key":{"plaintext":"`+signupPlaintext+`","prefix":"fp_live_","id":"key_signup_test"}}`)
 		case "/v1/auth/signup/magic-link":
 			atomic.AddInt32(&c.magicLink, 1)
 			w.Header().Set("Content-Type", "application/json")

@@ -1733,8 +1733,16 @@ type PasswordSignupRequest struct {
 // The two endpoints differ only in semantics — signup is
 // create-or-idempotent-on-existing; login is just sign-in. Wire
 // shape is identical.
+//
+// Email is echoed back so the CLI's finalizeLogin step can render
+// "Logged in as <email> (<plan> plan)" without an extra Whoami
+// round-trip. The cookie /signup and /login paths leave Email
+// out because the dashboard already knows the email of the
+// session owner; the programmatic path has no session, so we
+// stamp the request email onto the response.
 type ProgrammaticAuthResponse struct {
 	AccountID string             `json:"account_id"`
+	Email     string             `json:"email"`
 	Plan      string             `json:"plan"`
 	APIKey    ProgrammaticAPIKey `json:"api_key"`
 }

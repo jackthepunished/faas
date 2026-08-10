@@ -5600,10 +5600,15 @@ components:
         can use the result without a dashboard round-trip. The
         plaintext is returned ONCE; the caller persists it via
         `saveToken()` before this response is dropped.
+
+        Email is echoed back so the CLI's finalizeLogin step can
+        render "Logged in as <email> (<plan> plan)" without an
+        extra Whoami round-trip.
       type: object
-      required: [account_id, plan, api_key]
+      required: [account_id, email, plan, api_key]
       properties:
         account_id: { type: string, description: "Account UUID." }
+        email: { type: string, format: email, description: "Email the client sent in the POST body. Echoed back so the CLI can render the success line without a Whoami round-trip." }
         plan: { type: string, enum: [free, hobby, pro, scale] }
         api_key:
           $ref: '#/components/schemas/ProgrammaticAPIKey'

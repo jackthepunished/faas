@@ -750,6 +750,9 @@ func TestV1AuthSignup_NewEmail_MintsAccountAndKey(t *testing.T) {
 	if body.AccountID == "" {
 		t.Errorf("account_id = empty")
 	}
+	if body.Email != email {
+		t.Errorf("email = %q, want %q (echoed back so finalizeLogin can render the success line)", body.Email, email)
+	}
 	if body.Plan != "free" {
 		t.Errorf("plan = %q, want free", body.Plan)
 	}
@@ -972,6 +975,9 @@ func TestV1AuthLogin_ExistingAccount_ReturnsKey(t *testing.T) {
 	if body.AccountID != acct.ID {
 		t.Errorf("account_id = %q, want %q", body.AccountID, acct.ID)
 	}
+	if body.Email != "alice@example.com" {
+		t.Errorf("email = %q, want alice@example.com (echoed back)", body.Email)
+	}
 	if !strings.HasPrefix(body.APIKey.Plaintext, api.APIKeyPrefix) {
 		t.Errorf("api_key.plaintext = %q, missing prefix", body.APIKey.Plaintext)
 	}
@@ -1116,6 +1122,15 @@ func TestV1AuthSignupMagicLink_UnboundEmail_CreatesAccountAndMailsToken(t *testi
 // pre-existing account. The handler does NOT create a duplicate
 // account; it mints a fresh login token and re-mails the verify
 // link. Idempotent on the account side; new token each request.
+//
+// Pins the state.ErrConflict race closure in
+// postV1AuthSignupMagicLink (cmd/apid/handlers_auth_login.go ~719).
+// The conflict branch re-fetches via AccountByEmail and lands the
+// same `acct.ID != ""` → sendMagicLinkEmail code path exercised
+// here. Asserting the mailer-send count therefore protects both
+// shapes: a regression in the conflict closure that drops the
+// mailer send will break this assertion (the bound branch was the
+// only path that previously hit it).
 func TestV1AuthSignupMagicLink_BoundEmail_DoesNotCreateAccount(t *testing.T) {
 	srv, mailer, store := v1AuthTestHarness(t)
 	h := srv.handler()

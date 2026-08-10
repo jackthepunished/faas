@@ -187,7 +187,7 @@ func (f *fixture) handler() http.Handler {
 	// fixture. The plaintext is a deterministic string suffixed with
 	// the request path so a test can assert which route was hit.
 	programmaticAuthBody := func(route string) []byte {
-		return fmt.Appendf(nil, `{"account_id":"acc_fixture_311","plan":"free","api_key":{"plaintext":"fp_live_fixture_%s","prefix":"fp_live_","id":"key_fixture_311"}}`, route)
+		return fmt.Appendf(nil, `{"account_id":"acc_fixture_311","email":"alice@example.com","plan":"free","api_key":{"plaintext":"fp_live_fixture_%s","prefix":"fp_live_","id":"key_fixture_311"}}`, route)
 	}
 	mux.HandleFunc("/v1/auth/signup", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

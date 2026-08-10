@@ -390,7 +390,7 @@ func TestSweep_DoMarshalFailure(t *testing.T) {
 // client methods round-trip the wire shape end-to-end through an
 // httptest server.
 func TestSweep_PostV1AuthSignup(t *testing.T) {
-	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_X","plan":"free","api_key":{"plaintext":"fp_live_abc123","prefix":"fp_live_","id":"key_01HXYZ"}}`)
+	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_X","email":"alice@example.com","plan":"free","api_key":{"plaintext":"fp_live_abc123","prefix":"fp_live_","id":"key_01HXYZ"}}`)
 	c := NewClient(srv.URL, "fp_test")
 	resp, err := c.ProgrammaticSignup(context.Background(), "alice@example.com", "correct-horse-battery-staple")
 	if err != nil {
@@ -405,7 +405,7 @@ func TestSweep_PostV1AuthSignup(t *testing.T) {
 }
 
 func TestSweep_PostV1AuthLogin(t *testing.T) {
-	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_Y","plan":"hobby","api_key":{"plaintext":"fp_live_def456","prefix":"fp_live_","id":"key_01HABC"}}`)
+	srv, _ := newSweepServer(t, 200, `{"account_id":"acc_Y","email":"bob@example.com","plan":"hobby","api_key":{"plaintext":"fp_live_def456","prefix":"fp_live_","id":"key_01HABC"}}`)
 	c := NewClient(srv.URL, "fp_test")
 	resp, err := c.ProgrammaticLogin(context.Background(), "bob@example.com", "correct-horse-battery-staple")
 	if err != nil {

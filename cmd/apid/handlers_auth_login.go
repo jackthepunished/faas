@@ -603,8 +603,12 @@ func (s *server) postV1AuthSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acct, err := s.store.AccountByEmail(r.Context(), email)
-	if err != nil {
+	// Look up the email up front — used by the create branch (line
+	// ~613) to detect the unbound case and by verifyPasswordOrPad
+	// in the bound branch (line ~669) to short-circuit the
+	// AccountPasswordByAccountID read.
+	_, lookupErr := s.store.AccountByEmail(r.Context(), email)
+	if lookupErr != nil {
 		// Email unbound — create the account, set the password, mint
 		// a fresh api_key. Mirrors the postSignup race-closure: a
 		// concurrent signup returns ErrConflict which we collapse to
@@ -625,7 +629,7 @@ func (s *server) postV1AuthSignup(w http.ResponseWriter, r *http.Request) {
 					api.WriteProblem(w, api.ErrInvalidCredentials())
 					return
 				}
-				s.mintAndWriteV1AuthJSON(w, r, existing)
+				s.mintAndWriteV1AuthJSON(w, r, existing, email)
 				return
 			}
 			email = strings.ReplaceAll(email, "\r", "")
@@ -649,15 +653,17 @@ func (s *server) postV1AuthSignup(w http.ResponseWriter, r *http.Request) {
 				"internal_error", "Internal Error", "failed to set password"))
 			return
 		}
-		s.mintAndWriteV1AuthJSON(w, r, created)
+		s.mintAndWriteV1AuthJSON(w, r, created, email)
 		return
 	}
 
-	// Email is bound. Two sub-cases — same as the postSignup path.
-	hash, err := s.store.AccountPasswordByAccountID(r.Context(), acct.ID)
-	if err != nil {
-		// Bound account with no password row (OAuth-only): pad.
-		_, _ = auth.Verify(auth.DummyPHC, password)
+	// Email is bound. Funnel through verifyPasswordOrPad so the
+	// Argon2id timing pad (spec §11) and the no-password-row branch
+	// (OAuth-only accounts) stay aligned with postV1AuthLogin and
+	// postLoginEmail. Otherwise the duplicate Argon2id-verify here
+	// would drift from the canonical helper.
+	existing, hit := s.verifyPasswordOrPad(r.Context(), email, password)
+	if !hit {
 		s.audit.EmitFailedLogin(
 			middleware.ClientIP(r),
 			auth.HashEmail(email),
@@ -665,16 +671,7 @@ func (s *server) postV1AuthSignup(w http.ResponseWriter, r *http.Request) {
 		api.WriteProblem(w, api.ErrInvalidCredentials())
 		return
 	}
-	ok, err = auth.Verify(hash, password)
-	if err != nil || !ok {
-		s.audit.EmitFailedLogin(
-			middleware.ClientIP(r),
-			auth.HashEmail(email),
-			r.UserAgent())
-		api.WriteProblem(w, api.ErrInvalidCredentials())
-		return
-	}
-	s.mintAndWriteV1AuthJSON(w, r, acct)
+	s.mintAndWriteV1AuthJSON(w, r, existing, email)
 }
 
 // postV1AuthLogin is the JSON-only POST /v1/auth/login. Same response
@@ -695,7 +692,7 @@ func (s *server) postV1AuthLogin(w http.ResponseWriter, r *http.Request) {
 		api.WriteProblem(w, api.ErrInvalidCredentials())
 		return
 	}
-	s.mintAndWriteV1AuthJSON(w, r, acct)
+	s.mintAndWriteV1AuthJSON(w, r, acct, email)
 }
 
 // postV1AuthSignupMagicLink is the JSON-only POST /v1/auth/signup/magic-link.
@@ -719,10 +716,20 @@ func (s *server) postV1AuthSignupMagicLink(w http.ResponseWriter, r *http.Reques
 			})
 			if createErr == nil {
 				acct = res.Account
-			} else if !errors.Is(createErr, state.ErrConflict) {
-				email = strings.ReplaceAll(email, "\r", "")
-				email = strings.ReplaceAll(email, "\n", "")
-				s.log.Error("v1auth_signup_magic.create_account", "err", createErr, "email", email)
+			} else if errors.Is(createErr, state.ErrConflict) {
+				// Concurrent signup race: a parallel request just
+				// bound the email. Re-fetch so we still mint a
+				// magic-link for the now-bound account. Mirrors the
+				// conflict branch in postV1AuthSignup (line ~619).
+				if existing, lookErr := s.store.AccountByEmail(r.Context(), email); lookErr == nil {
+					acct = existing
+				} else {
+					safeEmail := strings.ReplaceAll(strings.ReplaceAll(email, "\r", ""), "\n", "")
+					s.log.Error("v1auth_signup_magic.conflict_refetch", "err", lookErr, "email", safeEmail)
+				}
+			} else {
+				safeEmail := strings.ReplaceAll(strings.ReplaceAll(email, "\r", ""), "\n", "")
+				s.log.Error("v1auth_signup_magic.create_account", "err", createErr, "email", safeEmail)
 			}
 		}
 		if acct.ID != "" {
@@ -743,7 +750,7 @@ func (s *server) postV1AuthSignupMagicLink(w http.ResponseWriter, r *http.Reques
 // provenance columns (created_ip, created_ua) are stamped on the
 // row so a SOC 2 auditor can answer "who minted this key from which
 // UA" without joining through Loki (R2 risk).
-func (s *server) mintAndWriteV1AuthJSON(w http.ResponseWriter, r *http.Request, acct state.Account) {
+func (s *server) mintAndWriteV1AuthJSON(w http.ResponseWriter, r *http.Request, acct state.Account, requestEmail string) {
 	plaintext, hash, err := api.GenerateAPIKey()
 	if err != nil {
 		s.log.Error("v1auth_signup.generate_key", "err", err)
@@ -774,14 +781,26 @@ func (s *server) mintAndWriteV1AuthJSON(w http.ResponseWriter, r *http.Request, 
 			"internal_error", "Internal Error", "could not create api key"))
 		return
 	}
-	writeV1AuthJSON(w, acct, plaintext, k)
+	writeV1AuthJSON(w, acct, requestEmail, plaintext, k)
 }
 
 // writeV1AuthJSON writes the ProgrammaticAuthResponse with the
 // freshly-minted api_key payload. The plaintext is returned ONCE;
 // the caller (gregale CLI) persists via saveToken() before this
 // response is dropped.
-func writeV1AuthJSON(w http.ResponseWriter, acct state.Account, plaintext string, k state.APIKey) {
+// writeV1AuthJSON writes the ProgrammaticAuthResponse with the
+// freshly-minted api_key payload. The plaintext is returned ONCE;
+// the caller (gregale CLI) persists via saveToken() before this
+// response is dropped.
+//
+// requestEmail is the email the client sent in the POST body —
+// the CLI needs it for "Logged in as <email>" (issue #311 R1
+// fix: empty Email made the success line render as
+// "Logged in as  (free plan)"). state.Account.Email would work
+// too, but threading the request value keeps the writer
+// signature stable for the conflict branch where acct may
+// already be populated from the verifyPasswordOrPad path.
+func writeV1AuthJSON(w http.ResponseWriter, acct state.Account, requestEmail, plaintext string, k state.APIKey) {
 	prefix := api.APIKeyPrefix
 	if len(plaintext) >= len(api.APIKeyPrefix)+8 {
 		prefix = plaintext[:len(api.APIKeyPrefix)+8]
@@ -790,6 +809,7 @@ func writeV1AuthJSON(w http.ResponseWriter, acct state.Account, plaintext string
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(api.ProgrammaticAuthResponse{
 		AccountID: acct.ID,
+		Email:     requestEmail,
 		Plan:      string(acct.Plan),
 		APIKey: api.ProgrammaticAPIKey{
 			Plaintext: plaintext,

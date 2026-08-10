@@ -94,8 +94,9 @@ func signupInteractive() int {
 		return printErr("Signup failed", err)
 	}
 	return finalizeLogin(ctx, c, resp.APIKey.Plaintext, api.AccountResponse{
-		ID:   resp.AccountID,
-		Plan: resp.Plan,
+		ID:    resp.AccountID,
+		Email: resp.Email,
+		Plan:  resp.Plan,
 	})
 }
 
