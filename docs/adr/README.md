@@ -137,6 +137,7 @@ Files carrying the banner:
 - docs/adr/081-durable-execution-workflows.md
 - docs/adr/083-active-passive-ha-topology.md
 - docs/adr/084-traffic-splitting-pr-c.md
+- docs/adr/090-named-envs.md (named envs / `app_envs.scope` + scope-aware wake-time overlay; cluster outlined in `docs/adr/090-pr-cluster-outline.md`)
 
 ADR-070 itself is the source of truth for the split and carries an end-of-file
 note instead of the banner.
