@@ -40,6 +40,8 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: edge_rules
+    description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip) per app.
   - name: deployments
     description: Deployments & build status.
   - name: instances
@@ -3119,6 +3121,148 @@ paths:
                 webhook_secret_sealed_masked: "***"
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/AlertRuleInvalid' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ─── Edge rules (ADR-089, planned) ────────────────────────────────────────
+  # Customer-configurable resource that runs in pkg/gateway BEFORE
+  # host→app resolution. One table, kind-tagged action union
+  # (Route / Rewrite / Redirect / Headers / CORS / JWT / IP).
+  # JWT and IP are plan-gated to Hobby+. The "action" object
+  # shape on the wire is open-ended: the kind-specific schema
+  # under components/schemas documents the per-kind shape; an
+  # unknown property is rejected with 422.
+  /v1/edge-rules:
+    get:
+      tags: [edge_rules]
+      operationId: listEdgeRules
+      summary: List every edge rule owned by the caller.
+      description: |
+        Account-wide listing. The dashboard overview pane uses this;
+        the CLI uses it for `gregale edge-rules list`. Free plans only
+        see rule kinds their plan unlocks — the server still lists
+        them.
+      responses:
+        '200':
+          description: Every edge rule owned by the caller.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EdgeRuleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/edge-rules:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [edge_rules]
+      operationId: listEdgeRulesForApp
+      summary: List every edge rule bound to one app.
+      responses:
+        '200':
+          description: Edge rules for this app, ordered by priority ASC.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EdgeRuleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [edge_rules]
+      operationId: createEdgeRule
+      summary: Create an edge rule on an app.
+      description: |
+        Kind is one of {route, rewrite, redirect, headers, cors, jwt, ip}.
+        `action` is a kind-tagged jsonb body — the per-kind shape is
+        documented under components/schemas. Plan-kind gate: jwt/ip
+        return 402 plan_edge_rule_kind_not_allowed on Free. Per-app
+        quota returns 402 plan_limit_edge_rules once EdgeRulesPerApp
+        is reached.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEdgeRuleRequest' }
+            example:
+              kind: rewrite
+              match_host: api.example.com
+              match_path: /api/*
+              priority: 100
+              enabled: true
+              action:
+                from: /api
+                to: /v1
+      responses:
+        '201':
+          description: Rule created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeRuleResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: Plan-kind or per-app quota rejected the rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/EdgeRuleConflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/edge-rules/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [edge_rules]
+      operationId: getEdgeRule
+      summary: Fetch one edge rule by id.
+      responses:
+        '200':
+          description: The edge rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeRuleResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    patch:
+      tags: [edge_rules]
+      operationId: updateEdgeRule
+      summary: Partial-update an edge rule.
+      description: |
+        Every field is optional. `kind` is NOT patchable — rotating
+        kind mid-life would break the action union. To change kind,
+        delete and recreate. `action` replaces the jsonb column
+        whole (no partial-update shape).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateEdgeRuleRequest' }
+      responses:
+        '200':
+          description: Updated rule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EdgeRuleResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [edge_rules]
+      operationId: deleteEdgeRule
+      summary: Delete an edge rule.
+      responses:
+        '204':
+          description: Deleted.
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -8191,6 +8335,224 @@ components:
         rotated_at: { type: string, format: date-time, example: "2026-07-28T12:00:00Z" }
         webhook_secret_sealed_masked: { type: string, example: "***" }
 
+    # ─── Edge rules (ADR-089, planned) ────────────────────────────────────────
+
+    EdgeRuleResponse:
+      description: |
+        A customer-configurable edge rule. The `action` blob is a
+        kind-tagged union — the shape varies by `kind`. See
+        CreateEdgeRuleRequest.action for the per-kind shape.
+      type: object
+      required:
+        - id
+        - account_id
+        - app_id
+        - match_host
+        - match_path
+        - match_methods
+        - priority
+        - enabled
+        - kind
+        - action
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        account_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        app_id: { type: string, pattern: '^[a-f0-9]{32}$' }
+        match_host:
+          type: string
+          maxLength: 253
+          description: 'Host glob. `*` matches any; `*.example.com` matches any subdomain.'
+          example: api.example.com
+        match_path:
+          type: string
+          maxLength: 2048
+          description: 'Path glob. Trailing `*` matches anything beneath.'
+          example: /api/*
+        match_methods:
+          type: array
+          items: { type: string }
+          description: 'Empty array = match any method.'
+          example: [GET, POST]
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          default: 100
+        enabled: { type: boolean, default: true }
+        kind:
+          type: string
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip]
+        action:
+          description: 'Kind-tagged union — shape varies by `kind`.'
+          oneOf:
+            - { $ref: '#/components/schemas/EdgeRuleRouteAction' }
+            - { $ref: '#/components/schemas/EdgeRuleRewriteAction' }
+            - { $ref: '#/components/schemas/EdgeRuleRedirectAction' }
+            - { $ref: '#/components/schemas/EdgeRuleHeadersAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
+            - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
+            - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateEdgeRuleRequest:
+      description: 'Body shape for POST /v1/apps/{slug}/edge-rules.'
+      type: object
+      required: [match_host, kind, action]
+      properties:
+        match_host: { type: string, maxLength: 253 }
+        match_path: { type: string, maxLength: 2048, default: "/" }
+        match_methods:
+          type: array
+          items: { type: string }
+        priority: { type: integer, minimum: 0, maximum: 10000, default: 100 }
+        enabled: { type: boolean, default: true }
+        kind:
+          type: string
+          enum: [route, rewrite, redirect, headers, cors, jwt, ip]
+        action:
+          description: 'Kind-tagged action body — shape depends on `kind`.'
+          oneOf:
+            - { $ref: '#/components/schemas/EdgeRuleRouteAction' }
+            - { $ref: '#/components/schemas/EdgeRuleRewriteAction' }
+            - { $ref: '#/components/schemas/EdgeRuleRedirectAction' }
+            - { $ref: '#/components/schemas/EdgeRuleHeadersAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
+            - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
+            - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+
+    UpdateEdgeRuleRequest:
+      description: 'Partial update — every field optional. Kind is not patchable.'
+      type: object
+      properties:
+        match_host: { type: string, maxLength: 253 }
+        match_path: { type: string, maxLength: 2048 }
+        match_methods:
+          type: array
+          items: { type: string }
+        priority: { type: integer, minimum: 0, maximum: 10000 }
+        enabled: { type: boolean }
+        action:
+          description: 'Replaces the jsonb column whole.'
+          oneOf:
+            - { $ref: '#/components/schemas/EdgeRuleRouteAction' }
+            - { $ref: '#/components/schemas/EdgeRuleRewriteAction' }
+            - { $ref: '#/components/schemas/EdgeRuleRedirectAction' }
+            - { $ref: '#/components/schemas/EdgeRuleHeadersAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCORSAction' }
+            - { $ref: '#/components/schemas/EdgeRuleJWTAction' }
+            - { $ref: '#/components/schemas/EdgeRuleIPAction' }
+
+    EdgeRuleRouteAction:
+      description: 'Re-targets the matched request to another app owned by the same account.'
+      type: object
+      required: [target_app_slug]
+      properties:
+        target_app_slug: { type: string, maxLength: 40, example: legacy-api }
+
+    EdgeRuleRewriteAction:
+      description: 'Mutates the request path before forwarding.'
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string, maxLength: 2048, example: /api }
+        to: { type: string, maxLength: 2048, example: /v1 }
+
+    EdgeRuleRedirectAction:
+      description: '3xx short-circuit.'
+      type: object
+      required: [status_code, to]
+      properties:
+        status_code: { type: integer, enum: [301, 302, 307, 308] }
+        to: { type: string, maxLength: 2048 }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: 'Headers stamped on the redirect response.'
+
+    EdgeRuleHeaderOp:
+      description: 'One header mutation. `action` ∈ {add,set,remove}.'
+      type: object
+      required: [name, action]
+      properties:
+        name: { type: string, maxLength: 64 }
+        value: { type: string, maxLength: 4096 }
+        action:
+          type: string
+          enum: [add, set, remove]
+
+    EdgeRuleHeadersAction:
+      description: 'Mutates request + response headers. The gateway enforces a hard-coded blacklist (Host, Content-Length, Transfer-Encoding, Connection, x-faas-*).'
+      type: object
+      properties:
+        request_headers:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/EdgeRuleHeaderOp' }
+        response_headers:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/EdgeRuleHeaderOp' }
+
+    EdgeRuleCORSAction:
+      description: 'Stamps CORS headers + handles preflight in-process.'
+      type: object
+      required: [allow_origins, allow_methods]
+      properties:
+        allow_origins:
+          type: array
+          minItems: 1
+          items: { type: string }
+        allow_methods:
+          type: array
+          minItems: 1
+          items: { type: string }
+        allow_headers:
+          type: array
+          items: { type: string }
+        expose_headers:
+          type: array
+          items: { type: string }
+        allow_credentials: { type: boolean, default: false }
+        max_age_seconds: { type: integer, minimum: 0 }
+
+    EdgeRuleJWTAction:
+      description: 'Validates an inbound Bearer JWT against a JWKS endpoint.'
+      type: object
+      required: [issuer, jwks_url, algorithms]
+      properties:
+        issuer: { type: string, example: "https://idp.example.com/" }
+        audience:
+          type: array
+          items: { type: string }
+        jwks_url:
+          type: string
+          maxLength: 2048
+          pattern: '^https://'
+          example: "https://idp.example.com/.well-known/jwks.json"
+        algorithms:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum: [RS256, RS384, RS512, ES256, ES384, ES512, HS256, HS384, HS512]
+        required_claims:
+          type: object
+          additionalProperties: { type: string }
+
+    EdgeRuleIPAction:
+      description: 'CIDR allow/deny evaluator. Deny is checked AFTER allow so a single-IP deny wins.'
+      type: object
+      properties:
+        allow:
+          type: array
+          items: { type: string, format: cidr }
+        deny:
+          type: array
+          items: { type: string, format: cidr }
+
     # ─── API keys ─────────────────────────────────────────────────────────
 
     APIKeyResponse:
@@ -10274,6 +10636,12 @@ components:
 
     AlertRuleInvalid:
       description: 'code: alert_rule_invalid | plan_alert_rules_not_allowed | plan_alert_rule_quota | image_egress_denied'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    EdgeRuleConflict:
+      description: 'code: edge_rule_conflict — duplicate or overlapping rule state rejected.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

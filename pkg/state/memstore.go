@@ -129,6 +129,12 @@ type MemStore struct {
 	// idempotency key — even at a strictly later at — lose the
 	// second attempt; a fresh key with a later bucket time wins.
 	alertClaimKeys map[string]time.Time
+	// edgeRules mirrors edge_rules for handler tests (ADR-089). Keyed
+	// by ruleID. The single-process m.mu serialises the count +
+	// insert in CreateEdgeRuleIfUnderQuota; no separate TOCTOU fence
+	// is needed. Soft-delete semantics (apps.status='deleted') are
+	// mirrored by the per-app lookup in the quota-check branch.
+	edgeRules map[string]EdgeRule
 	// invocations is the Move 1 event-shaped queue (async_invoke,
 	// queue, delayed_task, cron). MemStore mirrors PgStore's `select
 	// ... for update skip locked` semantics by serialising every access
@@ -483,6 +489,7 @@ func NewMemStore() *MemStore {
 		appWebhooks:          map[string]AppWebhook{},
 		appWebhookDeliveries: map[string]AppWebhookDelivery{},
 		alertClaimKeys:       map[string]time.Time{},
+		edgeRules:            map[string]EdgeRule{},
 		invocations:          map[string]Invocation{},
 		instances:            map[string]Instance{},
 		loginTokens:          map[string]LoginToken{},
@@ -8741,6 +8748,236 @@ func (m *MemStore) ListEnabledAlertRules(_ context.Context) ([]AlertRule, error)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].AccountID < out[j].AccountID })
 	return out, nil
+}
+
+// ----------------------------------------------------------------------------
+// Edge rules (ADR-089). MemStore mirrors the pgstore contract for
+// the 8 methods. The single-process m.mu serialises the count +
+// insert in CreateEdgeRuleIfUnderQuota, so the FOR UPDATE row lock
+// in pgstore is unnecessary here. Action is round-tripped by value
+// (jsonb-equivalent semantics) — the MemStore doesn't need
+// encoding/json because the action struct is in-process.
+//
+// Account-wide rules do not exist for edge_rules (per-app scope
+// only), so the quota branch is single-axis (per-app) — no per-
+// account count.
+// ----------------------------------------------------------------------------
+
+func (m *MemStore) CreateEdgeRule(_ context.Context, in CreateEdgeRuleParams) (EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if in.MatchMethods == nil {
+		in.MatchMethods = []string{}
+	}
+	now := time.Now()
+	r := EdgeRule{
+		ID:           newID(),
+		AccountID:    in.AccountID,
+		AppID:        in.AppID,
+		MatchHost:    in.MatchHost,
+		MatchPath:    in.MatchPath,
+		MatchMethods: in.MatchMethods,
+		Priority:     in.Priority,
+		Enabled:      in.Enabled,
+		Kind:         in.Kind,
+		Action:       in.Action,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	m.edgeRules[r.ID] = r
+	return r, nil
+}
+
+// CreateEdgeRuleIfUnderQuota — per-app cap only. AppID lookup
+// mirrors the pgstore's `where id = $1 and status <> 'deleted'`
+// predicate: a soft-deleted app is treated as missing so the
+// customer can't smuggle rules into a dead app.
+func (m *MemStore) CreateEdgeRuleIfUnderQuota(_ context.Context, in CreateEdgeRuleParams, limits api.Limits) (EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[in.AppID]
+	if !ok || app.Status == AppDeleted {
+		return EdgeRule{}, ErrNotFound
+	}
+	appCount := 0
+	for _, r := range m.edgeRules {
+		if r.AppID == in.AppID {
+			appCount++
+		}
+	}
+	if appCount >= limits.EdgeRulesPerApp {
+		return EdgeRule{}, &EdgeRuleQuotaError{
+			Limit:    limits.EdgeRulesPerApp,
+			Observed: appCount,
+		}
+	}
+	if in.MatchMethods == nil {
+		in.MatchMethods = []string{}
+	}
+	now := time.Now()
+	r := EdgeRule{
+		ID:           newID(),
+		AccountID:    in.AccountID,
+		AppID:        in.AppID,
+		MatchHost:    in.MatchHost,
+		MatchPath:    in.MatchPath,
+		MatchMethods: in.MatchMethods,
+		Priority:     in.Priority,
+		Enabled:      in.Enabled,
+		Kind:         in.Kind,
+		Action:       in.Action,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	m.edgeRules[r.ID] = r
+	return r, nil
+}
+
+func (m *MemStore) ListEdgeRulesForAccount(_ context.Context, accountID string) ([]EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []EdgeRule
+	for _, r := range m.edgeRules {
+		if r.AccountID == accountID {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority < out[j].Priority
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (m *MemStore) ListEdgeRulesForApp(_ context.Context, appID string) ([]EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []EdgeRule
+	for _, r := range m.edgeRules {
+		if r.AppID == appID {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority < out[j].Priority
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (m *MemStore) GetEdgeRuleByID(_ context.Context, id string) (EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.edgeRules[id]
+	if !ok {
+		return EdgeRule{}, ErrNotFound
+	}
+	return r, nil
+}
+
+// UpdateEdgeRule mirrors the pgstore nil-skip semantics. Action
+// replacement is whole-struct (no partial jsonb merge in MemStore).
+func (m *MemStore) UpdateEdgeRule(_ context.Context, id string, p UpdateEdgeRuleParams) (EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.edgeRules[id]
+	if !ok {
+		return EdgeRule{}, ErrNotFound
+	}
+	if p.MatchHost != nil {
+		r.MatchHost = *p.MatchHost
+	}
+	if p.MatchPath != nil {
+		r.MatchPath = *p.MatchPath
+	}
+	if p.MatchMethods != nil {
+		cp := make([]string, len(*p.MatchMethods))
+		copy(cp, *p.MatchMethods)
+		r.MatchMethods = cp
+	}
+	if p.Priority != nil {
+		r.Priority = *p.Priority
+	}
+	if p.Enabled != nil {
+		r.Enabled = *p.Enabled
+	}
+	if p.Action != nil {
+		r.Action = *p.Action
+	}
+	r.UpdatedAt = time.Now()
+	m.edgeRules[id] = r
+	return r, nil
+}
+
+func (m *MemStore) DeleteEdgeRule(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.edgeRules[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.edgeRules, id)
+	return nil
+}
+
+func (m *MemStore) CountEdgeRulesForApp(_ context.Context, appID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, r := range m.edgeRules {
+		if r.AppID == appID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// MatchEdgeRulesForHost is the gateway hot-path read (same shape
+// as pgstore). The host glob is re-checked in Go to mirror the
+// Postgres LIKE; "*" matches every host; "*.<suffix>" matches any
+// subdomain of suffix; exact hosts match themselves. Disabled rules
+// are skipped (the gateway must never see a disabled rule on the
+// hot path).
+func (m *MemStore) MatchEdgeRulesForHost(_ context.Context, host string) ([]EdgeRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []EdgeRule
+	for _, r := range m.edgeRules {
+		if !r.Enabled {
+			continue
+		}
+		if matchHostPattern(r.MatchHost, host) {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority < out[j].Priority
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+// matchHostPattern mirrors the pgstore LIKE: "*" → every host;
+// "*.<suffix>" → any subdomain of suffix; exact hosts match
+// themselves. The two stores MUST stay aligned — a drift here
+// surfaces as "rule matches in test, fails in prod".
+func matchHostPattern(pattern, host string) bool {
+	switch pattern {
+	case "*":
+		return true
+	case host:
+		return true
+	}
+	if len(pattern) > 2 && pattern[:2] == "*." {
+		suffix := pattern[1:] // ".example.com"
+		return len(host) > len(suffix) && host[len(host)-len(suffix):] == suffix
+	}
+	return false
 }
 
 // ClaimAlertFire mirrors the Postgres CTE shape: a duplicate

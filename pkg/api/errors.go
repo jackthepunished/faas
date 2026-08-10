@@ -1442,6 +1442,24 @@ func ErrPlanLogArchiveNotAllowed(p Plan) *Problem {
 // out-of-vocabulary event, oversize webhook_secret, etc.
 const CodeAppWebhookInvalid = "app_webhook_invalid"
 
+// Edge rules (ADR-089). Each code maps to one wire-level failure
+// mode so the CLI can surface a stable, machine-readable error.
+// Naming follows the alert_rules / webhooks convention
+// (`<resource>_<verb>_<state>`).
+const (
+	CodeEdgeRuleNotFound           = "edge_rule_not_found"
+	CodeEdgeRuleConflict           = "edge_rule_conflict"
+	CodePlanLimitEdgeRules         = "plan_limit_edge_rules"
+	CodePlanEdgeRuleKindNotAllowed = "plan_edge_rule_kind_not_allowed"
+	CodeCORSOriginNotAllowed       = "cors_origin_not_allowed"
+	CodeJWTMissingToken            = "jwt_missing_token"
+	CodeJWTMissingIssuer           = "jwt_missing_issuer"
+	CodeJWTAudienceMismatch        = "jwt_audience_mismatch"
+	CodeJWTSignatureInvalid        = "jwt_signature_invalid"
+	CodeIPDenied                   = "ip_denied"
+	CodeHeaderMutationForbidden    = "header_mutation_forbidden"
+)
+
 // ErrPlanCronsNotAllowed is returned by apid's createCron handler
 // when the customer's plan has CronLimitPerApp == 0 (Free today).
 // Fires BEFORE the store is touched so a Free customer gets a clean
@@ -2564,4 +2582,114 @@ func ErrInvalidOverflowNode(name string) *Problem {
 		"Invalid overflow_node",
 		fmt.Sprintf("no active compute_node named %q; check the operator-supplied spill target name and try again.", name)).
 		WithDocs(docsBase + "/apps#overflow_node")
+}
+
+// ----------------------------------------------------------------------------
+// Edge rule errors (ADR-089). Mirrors the alert_rules / webhook
+// helper shape so the CLI can render all four 402/403/404/422
+// flavours uniformly.
+// ----------------------------------------------------------------------------
+
+// ErrEdgeRuleNotFound is the 404 returned by getEdgeRule /
+// updateEdgeRule / deleteEdgeRule when the rule id doesn't exist
+// OR belongs to another account.
+func ErrEdgeRuleNotFound(id string) *Problem {
+	return NewProblem(http.StatusNotFound, CodeEdgeRuleNotFound,
+		"Edge rule not found",
+		fmt.Sprintf("no edge rule with id %q belongs to your account.", id))
+}
+
+// ErrEdgeRuleConflict is the 409 returned on a UNIQUE violation
+// (no UNIQUE constraints today, but the seam stays so a future
+// per-account name uniqueness lands without an API rename).
+func ErrEdgeRuleConflict(reason string) *Problem {
+	return NewProblem(http.StatusConflict, CodeEdgeRuleConflict,
+		"Edge rule conflict", reason)
+}
+
+// ErrPlanLimitEdgeRules is the 403 returned when
+// CreateEdgeRuleIfUnderQuota surfaces a *state.EdgeRuleQuotaError.
+// Per-app scope only — there's no account-wide flavour. 403 (not
+// 402) because the plan DOES unlock the cheap kinds.
+func ErrPlanLimitEdgeRules(plan Plan, limit, observed int) *Problem {
+	return NewProblem(http.StatusForbidden, CodePlanLimitEdgeRules,
+		"Edge rule limit reached",
+		fmt.Sprintf("%s plan caps edge rules at %d per app; you have %d. Delete one to add another.",
+			plan, limit, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#edge-rules")
+}
+
+// ErrPlanEdgeRuleKindNotAllowed is the 402 returned when a Free
+// customer posts kind=jwt or kind=ip. Hobby+ unlocks both.
+func ErrPlanEdgeRuleKindNotAllowed(plan Plan, kind string) *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodePlanEdgeRuleKindNotAllowed,
+		"Edge rule kind unavailable on this plan",
+		fmt.Sprintf("the %s plan does not include edge rule kind %q; upgrade to Hobby or above to use it.", plan, kind)).
+		WithDocs(docsBase + "/plans#edge-rules")
+}
+
+// ErrCORSOriginNotAllowed is the 403 returned when a CORS rule's
+// allow_origins list rejects the request's Origin header.
+func ErrCORSOriginNotAllowed(origin string) *Problem {
+	return NewProblem(http.StatusForbidden, CodeCORSOriginNotAllowed,
+		"CORS origin not allowed",
+		fmt.Sprintf("origin %q is not in the allowlist for this route.", origin))
+}
+
+// ErrJWTMissingToken is the 401 returned when a kind=jwt rule
+// matches but the request has no Bearer token. Carries the
+// WWW-Authenticate header via WithHeader so browsers / SDKs can
+// prompt for credentials.
+func ErrJWTMissingToken() *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeJWTMissingToken,
+		"JWT bearer token required",
+		"this route requires a Bearer token; supply one in the Authorization header.").
+		WithHeader("WWW-Authenticate", `Bearer realm="gregale"`)
+}
+
+// ErrJWTMissingIssuer is the 401 returned when the JWT's `iss`
+// claim doesn't match the rule's expected issuer.
+func ErrJWTMissingIssuer(want string) *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeJWTMissingIssuer,
+		"JWT issuer mismatch",
+		fmt.Sprintf("this route requires tokens issued by %q.", want)).
+		WithHeader("WWW-Authenticate", `Bearer realm="gregale", error="invalid_issuer"`)
+}
+
+// ErrJWTAudienceMismatch is the 401 returned when the JWT's `aud`
+// claim isn't in the rule's audience list.
+func ErrJWTAudienceMismatch(want []string) *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeJWTAudienceMismatch,
+		"JWT audience mismatch",
+		fmt.Sprintf("this route requires tokens whose audience is one of %v.", want)).
+		WithHeader("WWW-Authenticate", `Bearer realm="gregale", error="invalid_audience"`)
+}
+
+// ErrJWTSignatureInvalid is the 401 returned when JWKS
+// verification fails (bad signature, unknown kid, expired token).
+// The detail carries the underlying reason for log search.
+func ErrJWTSignatureInvalid(reason string) *Problem {
+	return NewProblem(http.StatusUnauthorized, CodeJWTSignatureInvalid,
+		"JWT signature invalid",
+		reason).
+		WithHeader("WWW-Authenticate", `Bearer realm="gregale", error="invalid_token"`)
+}
+
+// ErrIPDenied is the 403 returned when a kind=ip rule's allow/deny
+// evaluator rejects the client IP.
+func ErrIPDenied(ip string) *Problem {
+	return NewProblem(http.StatusForbidden, CodeIPDenied,
+		"IP address not allowed",
+		fmt.Sprintf("client IP %s is not in the allowlist and matched the deny list for this route.", ip))
+}
+
+// ErrHeaderMutationForbidden is the 422 returned when a kind=headers
+// rule tries to mutate a forbidden header (Host, Content-Length,
+// Transfer-Encoding, Connection, or any x-faas-*). Per-app
+// configurability of the blacklist is deferred to v2.
+func ErrHeaderMutationForbidden(name string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeHeaderMutationForbidden,
+		"Header mutation forbidden",
+		fmt.Sprintf("the header %q is reserved and cannot be mutated by edge rules.", name))
 }

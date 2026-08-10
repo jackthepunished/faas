@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+    from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
+    from ..models.edge_rule_ip_action import EdgeRuleIPAction
+    from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+    from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
+    from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
+    from ..models.edge_rule_route_action import EdgeRuleRouteAction
+
+
+T = TypeVar("T", bound="UpdateEdgeRuleRequest")
+
+
+@_attrs_define
+class UpdateEdgeRuleRequest:
+    """Partial update — every field optional. Kind is not patchable."""
+
+    match_host: str | Unset = UNSET
+    match_path: str | Unset = UNSET
+    match_methods: list[str] | Unset = UNSET
+    priority: int | Unset = UNSET
+    enabled: bool | Unset = UNSET
+    action: (
+        EdgeRuleCORSAction
+        | EdgeRuleHeadersAction
+        | EdgeRuleIPAction
+        | EdgeRuleJWTAction
+        | EdgeRuleRedirectAction
+        | EdgeRuleRewriteAction
+        | EdgeRuleRouteAction
+        | Unset
+    ) = UNSET
+    """Replaces the jsonb column whole."""
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
+        from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+        from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
+        from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
+        from ..models.edge_rule_route_action import EdgeRuleRouteAction
+
+        match_host = self.match_host
+
+        match_path = self.match_path
+
+        match_methods: list[str] | Unset = UNSET
+        if not isinstance(self.match_methods, Unset):
+            match_methods = self.match_methods
+
+        priority = self.priority
+
+        enabled = self.enabled
+
+        action: dict[str, Any] | Unset
+        if isinstance(self.action, Unset):
+            action = UNSET
+        elif isinstance(self.action, EdgeRuleRouteAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleRewriteAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleRedirectAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleHeadersAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleCORSAction):
+            action = self.action.to_dict()
+        elif isinstance(self.action, EdgeRuleJWTAction):
+            action = self.action.to_dict()
+        else:
+            action = self.action.to_dict()
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update({})
+        if match_host is not UNSET:
+            field_dict["match_host"] = match_host
+        if match_path is not UNSET:
+            field_dict["match_path"] = match_path
+        if match_methods is not UNSET:
+            field_dict["match_methods"] = match_methods
+        if priority is not UNSET:
+            field_dict["priority"] = priority
+        if enabled is not UNSET:
+            field_dict["enabled"] = enabled
+        if action is not UNSET:
+            field_dict["action"] = action
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.edge_rule_cors_action import EdgeRuleCORSAction
+        from ..models.edge_rule_headers_action import EdgeRuleHeadersAction
+        from ..models.edge_rule_ip_action import EdgeRuleIPAction
+        from ..models.edge_rule_jwt_action import EdgeRuleJWTAction
+        from ..models.edge_rule_redirect_action import EdgeRuleRedirectAction
+        from ..models.edge_rule_rewrite_action import EdgeRuleRewriteAction
+        from ..models.edge_rule_route_action import EdgeRuleRouteAction
+
+        d = dict(src_dict)
+        match_host = d.pop("match_host", UNSET)
+
+        match_path = d.pop("match_path", UNSET)
+
+        match_methods = cast(list[str], d.pop("match_methods", UNSET))
+
+        priority = d.pop("priority", UNSET)
+
+        enabled = d.pop("enabled", UNSET)
+
+        def _parse_action(
+            data: object,
+        ) -> (
+            EdgeRuleCORSAction
+            | EdgeRuleHeadersAction
+            | EdgeRuleIPAction
+            | EdgeRuleJWTAction
+            | EdgeRuleRedirectAction
+            | EdgeRuleRewriteAction
+            | EdgeRuleRouteAction
+            | Unset
+        ):
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_0 = EdgeRuleRouteAction.from_dict(data)
+
+                return action_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_1 = EdgeRuleRewriteAction.from_dict(data)
+
+                return action_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_2 = EdgeRuleRedirectAction.from_dict(data)
+
+                return action_type_2
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_3 = EdgeRuleHeadersAction.from_dict(data)
+
+                return action_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_4 = EdgeRuleCORSAction.from_dict(data)
+
+                return action_type_4
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                action_type_5 = EdgeRuleJWTAction.from_dict(data)
+
+                return action_type_5
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            action_type_6 = EdgeRuleIPAction.from_dict(data)
+
+            return action_type_6
+
+        action = _parse_action(d.pop("action", UNSET))
+
+        update_edge_rule_request = cls(
+            match_host=match_host,
+            match_path=match_path,
+            match_methods=match_methods,
+            priority=priority,
+            enabled=enabled,
+            action=action,
+        )
+
+        update_edge_rule_request.additional_properties = d
+        return update_edge_rule_request
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties

@@ -48,6 +48,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-045 (#396): alert rules — Free gated to 402, so the limits
 			// surface is 0/0 to fail-closed by default.
 			AlertRuleLimitPerApp: 0, AlertRuleLimitPerAccount: 0,
+			// ADR-089 (planned): edge rules — Free gets 5 rules
+			// (route|rewrite|redirect|headers|cors) but jwt/ip stay
+			// plan-gated to Hobby+. The limits surface reflects only
+			// what the create handler will accept (5 rules total).
+			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
 			WebhookPerApp: 0, WebhookPerAccount: 0,
@@ -136,6 +141,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: false,
 			// ADR-045 (#396): Hobby gets 3 per-app and 10 per-account.
 			AlertRuleLimitPerApp: 3, AlertRuleLimitPerAccount: 10,
+			// ADR-089 (planned): edge rules — Hobby unlocks 25 rules
+			// AND the jwt|ip kinds. The plan-kind gate surface
+			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
+			// 402 response in handlers_edge_rules.go for Free.
+			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Hobby tracks KeysMax
 			// (10) one-to-one. Pending invitations = members/2
 			// because the default 7d TTL keeps the live set small.
@@ -221,6 +231,10 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: true,
 			// ADR-045 (#396): Pro gets 10 per-app and 30 per-account.
 			AlertRuleLimitPerApp: 10, AlertRuleLimitPerAccount: 30,
+			// ADR-089 (planned): edge rules — Pro unlocks 100 rules
+			// AND jwt|ip. Same surface as Hobby; the gate only
+			// flips the Free arm of the kind-switch.
+			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Pro tracks KeysMax
 			// (50) one-to-one — every team member can hold a key
 			// for their own deploy target. Financial model is
@@ -311,6 +325,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			PublicAuthBearerAllowed: true, PublicAuthBasicAllowed: true,
 			// ADR-045 (#396): Scale gets 25 per-app and 100 per-account.
 			AlertRuleLimitPerApp: 25, AlertRuleLimitPerAccount: 100,
+			// ADR-089 (planned): edge rules — Scale unlocks 500 rules
+			// (5× Pro) AND jwt|ip. The 500 cap is the practical upper
+			// bound the LRU + per-host matcher budget tolerates before
+			// per-host invalidation becomes load-bearing.
+			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true,
 			// IAM-6 / ADR-061 PR-2 (issue #190): Scale tracks KeysMax
 			// (200) one-to-one — SaaS-scale multi-team + rotating-CI.
 			// Financial model is authoritative — derived value,

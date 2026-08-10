@@ -74,11 +74,7 @@ func (s *server) requireMFA(next accountHandler) accountHandler {
 // every successful TOTP verify (see reissueSessionCookie in
 // handlers_mfa.go).
 func (s *server) requireStepUp(ttl time.Duration) func(accountHandler) accountHandler {
-	return func(next accountHandler) accountHandler {
-		pkgNext := middleware.AccountHandler(next)
-		pkgHandler := s.authMw.RequireStepUp(ttl)(pkgNext)
-		return authAccountHandler(pkgHandler)
-	}
+	return s.requireStepUpVariant(ttl, s.authMw.RequireStepUp)
 }
 
 // requireStepUpStrict is the PR-9 §4 twin of requireStepUp: same
@@ -89,10 +85,20 @@ func (s *server) requireStepUp(ttl time.Duration) func(accountHandler) accountHa
 // The remaining 8 requireStepUp mounts keep the documented bypass
 // pending per-route audit.
 func (s *server) requireStepUpStrict(ttl time.Duration) func(accountHandler) accountHandler {
+	return s.requireStepUpVariant(ttl, s.authMw.RequireStepUpStrict)
+}
+
+// requireStepUpVariant is the shared body of requireStepUp /
+// requireStepUpStrict — the only difference is which middleware
+// function is invoked. The chain parameter matches the
+// `func(time.Duration) func(middleware.AccountHandler) middleware.AccountHandler`
+// signature of both RequireStepUp and RequireStepUpStrict.
+func (s *server) requireStepUpVariant(
+	ttl time.Duration,
+	chain func(time.Duration) func(middleware.AccountHandler) middleware.AccountHandler,
+) func(accountHandler) accountHandler {
 	return func(next accountHandler) accountHandler {
-		pkgNext := middleware.AccountHandler(next)
-		pkgHandler := s.authMw.RequireStepUpStrict(ttl)(pkgNext)
-		return authAccountHandler(pkgHandler)
+		return authAccountHandler(chain(ttl)(middleware.AccountHandler(next)))
 	}
 }
 

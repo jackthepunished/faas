@@ -70,24 +70,22 @@ func TestPublicAuthE2E_StateSeam_RoundTrip(t *testing.T) {
 		t.Fatalf("CreateApp: %v", err)
 	}
 
-	// 1. Column default — empty string mirrors
-	// apps.public_auth_mode's "no row written" state
-	// when CreateApp runs without a SetPublicAuth
-	// flip. The apid handler reads empty == 'open'
-	// (the same way pgstore::scanAppInto + the SQL
-	// column default resolve the unset case). The
-	// mode-stamping happens at PATCH time, not at
-	// Create time — CreateApp is intentionally a
-	// no-op for PublicAuth so the apid CreateApp
-	// path stays symmetric with the existing
-	// require_authn / streaming_enabled family.
+	// 1. CreateApp stamps the per-plan default mode on the
+	// row directly (pgstore writes public_auth_mode verbatim
+	// since issue-695 / commit 32f40e65; memstore mirrors
+	// the same floor in pkg/state/memstore.go:2005). The
+	// 'empty == open' interpretation belongs to the apid
+	// patch path that builds an App struct without setting
+	// PublicAuthMode — not to the store layer. CreateApp
+	// here is called without that field, so the empty-string
+	// floor in both pgstore + memstore resolves to 'open'.
 	got, err := st.AppByID(context.Background(), app.ID)
 	if err != nil {
 		t.Fatalf("AppByID: %v", err)
 	}
-	if got.PublicAuthMode != "" {
-		t.Fatalf("default PublicAuthMode = %q; want \"\" (unset → apid treats as open)",
-			got.PublicAuthMode)
+	if got.PublicAuthMode != api.AppPublicAuthModeOpen {
+		t.Fatalf("default PublicAuthMode = %q; want %q (CreateApp floors empty → open per issue-695)",
+			got.PublicAuthMode, api.AppPublicAuthModeOpen)
 	}
 	if len(got.PublicAuthBasicSealed) != 0 {
 		t.Fatalf("default PublicAuthBasicSealed = %d bytes; want empty",

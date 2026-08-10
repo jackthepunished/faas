@@ -5686,6 +5686,312 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 	return scanAlertRules(rows)
 }
 
+// ----------------------------------------------------------------------------
+// Edge rules (ADR-089, planned). Schema: migrations/00192_edge_rules.sql.
+// apid is the only writer; gatewayd-internal reads via
+// MatchEdgeRulesForHost. Per-app scope only — there is no
+// account-wide flavour. The action column is jsonb (kind-tagged
+// union); see EdgeRuleAction in types.go for the per-kind shapes.
+//
+// All write paths emit db.NotifyEdgeRuleChanged so the gatewayd LRU
+// (pkg/gateway/edge_rule_cache.go, lands in PR 8) drops its cached
+// host→rules snapshot. The cache stays advisory — the gatewayd
+// matcher re-reads on every miss anyway, so a stale snapshot only
+// widens the cache-hit window, never causes a wrong rule to fire.
+// ----------------------------------------------------------------------------
+
+const edgeRuleSelectCols = `id, account_id, app_id, match_host, match_path,
+       match_methods, priority, enabled, kind, action,
+       created_at, updated_at`
+
+// scanEdgeRule reads a single row. ErrNotFound on no-rows; raw error
+// otherwise. The kind column comes back as text; Action comes back
+// as raw bytes (jsonb round-trips through encoding/json in
+// scanEdgeRuleCols).
+func scanEdgeRule(row pgx.Row) (EdgeRule, error) {
+	r, err := scanEdgeRuleCols(row.Scan)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return EdgeRule{}, ErrNotFound
+		}
+		return EdgeRule{}, err
+	}
+	return r, nil
+}
+
+// scanEdgeRules reads every row from a Rows iterator. The caller
+// owns the rows.Close() lifetime — this helper only walks the
+// iterator.
+func scanEdgeRules(rows pgx.Rows) ([]EdgeRule, error) {
+	var out []EdgeRule
+	for rows.Next() {
+		r, err := scanEdgeRuleCols(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// scanEdgeRuleCols is the single source of column order for
+// edge_rules. The select clause above is the contract — every
+// SELECT against edge_rules lists these columns in this order, and
+// the SELECT statement binds Scan's positional arguments against
+// this list. A future column add lands here first, in the same
+// commit, so a SELECT-write drift cannot silently swallow a column.
+func scanEdgeRuleCols(scan func(...any) error) (EdgeRule, error) {
+	var (
+		r            EdgeRule
+		kind         string
+		matchMethods []string
+		actionBytes  []byte
+	)
+	if err := scan(
+		&r.ID, &r.AccountID, &r.AppID, &r.MatchHost, &r.MatchPath,
+		&matchMethods, &r.Priority, &r.Enabled, &kind, &actionBytes,
+		&r.CreatedAt, &r.UpdatedAt,
+	); err != nil {
+		return EdgeRule{}, err
+	}
+	r.Kind = EdgeRuleKind(kind)
+	r.MatchMethods = matchMethods
+	if len(actionBytes) > 0 {
+		if err := json.Unmarshal(actionBytes, &r.Action); err != nil {
+			return EdgeRule{}, fmt.Errorf("state: decode edge_rules.action for %s: %w", r.ID, err)
+		}
+	}
+	return r, nil
+}
+
+// CreateEdgeRule is the un-capped insert path used by tests. The
+// customer-facing handler always calls CreateEdgeRuleIfUnderQuota.
+func (s *PgStore) CreateEdgeRule(ctx context.Context, in CreateEdgeRuleParams) (EdgeRule, error) {
+	actionBytes, err := json.Marshal(in.Action)
+	if err != nil {
+		return EdgeRule{}, fmt.Errorf("state: marshal edge_rule.action: %w", err)
+	}
+	methods := in.MatchMethods
+	if methods == nil {
+		methods = []string{}
+	}
+	row := s.pool.QueryRow(ctx, `
+		insert into edge_rules (
+			account_id, app_id, match_host, match_path,
+			match_methods, priority, enabled, kind, action
+		) values (
+			$1, $2, $3, $4,
+			$5, $6, $7, $8, $9::jsonb
+		)
+		returning `+edgeRuleSelectCols,
+		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
+		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
+	)
+	r, err := scanEdgeRule(row)
+	if err != nil {
+		return EdgeRule{}, mapErr(err)
+	}
+	return r, nil
+}
+
+// CreateEdgeRuleIfUnderQuota — see Store interface. Returns:
+//   - (EdgeRule{}, *EdgeRuleQuotaError) when the per-app cap trips
+//   - (EdgeRule{}, ErrNotFound) when the parent app row is missing
+//   - (EdgeRule{}, ErrConflict) on FK violation (account gone)
+//
+// The FOR UPDATE row lock on the apps row is the TOCTOU defence:
+// concurrent inserts serialise on the apps row before reading the
+// count, so a burst of N parallel inserts can't race past the cap
+// by N-1.
+func (s *PgStore) CreateEdgeRuleIfUnderQuota(ctx context.Context, in CreateEdgeRuleParams, limits api.Limits) (EdgeRule, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return EdgeRule{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+
+	var locked int
+	if err := tx.QueryRow(ctx,
+		`select 1 from apps where id = $1 and status <> 'deleted' for update`, in.AppID,
+	).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return EdgeRule{}, ErrNotFound
+		}
+		return EdgeRule{}, fmt.Errorf("state: lock app %s: %w", in.AppID, err)
+	}
+
+	var appCount int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from edge_rules where app_id = $1`, in.AppID,
+	).Scan(&appCount); err != nil {
+		return EdgeRule{}, fmt.Errorf("state: count edge_rules for app %s: %w", in.AppID, err)
+	}
+	if appCount >= limits.EdgeRulesPerApp {
+		return EdgeRule{}, &EdgeRuleQuotaError{
+			Limit:    limits.EdgeRulesPerApp,
+			Observed: appCount,
+		}
+	}
+
+	actionBytes, err := json.Marshal(in.Action)
+	if err != nil {
+		return EdgeRule{}, fmt.Errorf("state: marshal edge_rule.action: %w", err)
+	}
+	methods := in.MatchMethods
+	if methods == nil {
+		methods = []string{}
+	}
+	row := tx.QueryRow(ctx, `
+		insert into edge_rules (
+			account_id, app_id, match_host, match_path,
+			match_methods, priority, enabled, kind, action
+		) values (
+			$1, $2, $3, $4,
+			$5, $6, $7, $8, $9::jsonb
+		)
+		returning `+edgeRuleSelectCols,
+		in.AccountID, in.AppID, in.MatchHost, in.MatchPath,
+		methods, in.Priority, in.Enabled, string(in.Kind), actionBytes,
+	)
+	r, err := scanEdgeRule(row)
+	if err != nil {
+		return EdgeRule{}, mapErr(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return EdgeRule{}, fmt.Errorf("state: commit create edge rule: %w", err)
+	}
+	return r, nil
+}
+
+func (s *PgStore) ListEdgeRulesForAccount(ctx context.Context, accountID string) ([]EdgeRule, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+edgeRuleSelectCols+` from edge_rules
+		 where account_id = $1 order by priority asc, created_at desc`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdgeRules(rows)
+}
+
+func (s *PgStore) ListEdgeRulesForApp(ctx context.Context, appID string) ([]EdgeRule, error) {
+	rows, err := s.pool.Query(ctx,
+		`select `+edgeRuleSelectCols+` from edge_rules
+		 where app_id = $1 order by priority asc, created_at desc`, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdgeRules(rows)
+}
+
+func (s *PgStore) GetEdgeRuleByID(ctx context.Context, id string) (EdgeRule, error) {
+	row := s.pool.QueryRow(ctx,
+		`select `+edgeRuleSelectCols+` from edge_rules where id = $1`, id)
+	return scanEdgeRule(row)
+}
+
+// UpdateEdgeRule coalesces the optional fields onto edge_rules. The
+// nil-skip pattern is identical to UpdateAlertRule; Action uses the
+// `case when $N then $N+1::jsonb else action end` shape so a nil
+// pointer leaves the jsonb column untouched. The kind column is
+// NOT on UpdateEdgeRuleParams — rotating kind mid-life would break
+// the action union (a 'cors' action has no fields a 'route' rule
+// expects); the customer deletes + recreates instead.
+func (s *PgStore) UpdateEdgeRule(ctx context.Context, id string, p UpdateEdgeRuleParams) (EdgeRule, error) {
+	var (
+		hostArg, pathArg any
+		methodsArg       any
+		actionArg        any
+	)
+	if p.MatchHost != nil {
+		hostArg = *p.MatchHost
+	}
+	if p.MatchPath != nil {
+		pathArg = *p.MatchPath
+	}
+	if p.MatchMethods != nil {
+		methodsArg = *p.MatchMethods
+	}
+	if p.Action != nil {
+		bytes, err := json.Marshal(*p.Action)
+		if err != nil {
+			return EdgeRule{}, fmt.Errorf("state: marshal edge_rule.action: %w", err)
+		}
+		actionArg = bytes
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		update edge_rules set
+			match_host    = coalesce($2, match_host),
+			match_path    = coalesce($3, match_path),
+			match_methods = coalesce($4, match_methods),
+			priority      = coalesce($5, priority),
+			enabled       = coalesce($6, enabled),
+			action        = case when $7 then $8::jsonb else action end
+		where id = $1
+		returning `+edgeRuleSelectCols,
+		id, hostArg, pathArg, methodsArg, p.Priority, p.Enabled,
+		p.Action != nil, actionArg,
+	)
+	r, err := scanEdgeRule(row)
+	if err != nil {
+		return EdgeRule{}, mapErr(err)
+	}
+	return r, nil
+}
+
+func (s *PgStore) DeleteEdgeRule(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `delete from edge_rules where id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PgStore) CountEdgeRulesForApp(ctx context.Context, appID string) (int, error) {
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`select count(*) from edge_rules where app_id = $1`, appID,
+	).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// MatchEdgeRulesForHost is the gateway hot-path read (ADR-089 §8).
+// Returns every enabled rule whose match_host matches `host` (or
+// "*"), ordered by priority ASC. The gatewayd matcher iterates in
+// priority order and short-circuits on first match — the ORDER BY
+// is the load-bearing detail.
+//
+// The host-pattern matching uses LIKE on the match_host column
+// served by the partial B-tree on text_pattern_ops
+// (edge_rules_match_host_pattern_idx). "*" maps to "%";
+// "*.example.com" maps to "%.example.com"; exact hosts match as
+// themselves. The gateway's Compile() pass re-checks the full glob
+// in Go for correctness — the LIKE is the index-friendly proxy.
+func (s *PgStore) MatchEdgeRulesForHost(ctx context.Context, host string) ([]EdgeRule, error) {
+	rows, err := s.pool.Query(ctx, `
+		select `+edgeRuleSelectCols+` from edge_rules
+		 where enabled = true
+		   and (
+		   	match_host = $1
+		   	or match_host = '*'
+		   	or $1 like replace(replace(match_host, '*', '%'), '?', '_')
+		   )
+		 order by priority asc, created_at asc
+	`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEdgeRules(rows)
+}
+
 // ClaimAlertFire: rides the alert_rules row itself rather than a
 // separate dedupe table. idempotencyKey is the bucket
 // (rule_id + ':' + floor(epoch/cooldown_seconds)); last_fired_at is
@@ -12936,7 +13242,7 @@ func (s *PgStore) ListOrgInvitationsForOrg(ctx context.Context, orgID string) ([
 // key encoded by pkg/cursor. The SQL filter switches to a tuple
 // predicate on the (created_at, id::text) row, partitioned by
 // the decoded cursor. When `before` is empty (first page) the
-// filter is elided via the $5 flag.
+// cursor parameters bind as SQL NULL and the predicate short-circuits.
 //
 // limit is clamped to [1, 100]; out-of-range resolves to 25. The
 // before="" case is the first page (no filter). No JOIN: invitations
@@ -12951,11 +13257,8 @@ func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string
 	// the handler can surface a 400 validation_failed (the v1
 	// cursor silently returned 0 rows on malformed input, which
 	// made broken clients silently fall behind — DO NOT regress).
-	var (
-		cursorTS  time.Time
-		cursorID  string
-		hasCursor bool
-	)
+	var cursorTS *time.Time
+	var cursorID string
 	if before != "" {
 		k, err := cursor.Decode(before)
 		if err != nil {
@@ -12966,26 +13269,18 @@ func (s *PgStore) ListOrgInvitationsForOrgPage(ctx context.Context, orgID string
 			// multi-error wrap (Go 1.20+).
 			return nil, errors.Join(ErrInvalidCursor, err)
 		}
-		cursorTS = k.CreatedAt
+		cursorTS = &k.CreatedAt
 		cursorID = k.ID
-		hasCursor = true
-	}
-	// Tie the cursor predicates to the empty-case flag so the
-	// planner can short-circuit the first-page query without a
-	// NULL-aware anchor CTE.
-	emptyFlag := ""
-	if hasCursor {
-		emptyFlag = "x"
 	}
 	rows, err := s.pool.Query(ctx, `
 		select id, org_id, email::text, role, token_hash, invited_by_account_id,
 		       expires_at, consumed_at, revoked_at, accepting_account_id, created_at
 		  from org_invitations
 		 where org_id = $1
-		   and ($5 = '' or (created_at, id::text) < ($3::timestamptz, $4))
+		   and ($3::timestamptz is null or (created_at, id::text) < ($3::timestamptz, $4))
 		 order by created_at desc, id::text desc
 		 limit $2
-	`, orgID, limit, cursorTS, cursorID, emptyFlag)
+	`, orgID, limit, cursorTS, cursorID)
 	if err != nil {
 		return nil, fmt.Errorf("state: list org invitations paged: %w", err)
 	}

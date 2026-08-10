@@ -204,6 +204,19 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
 	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
 
+	// ADR-089 (planned) — edge rules. The auto-derivation would
+	// produce Swagger-style names ("GetAppsSlugEdge-rules",
+	// "GetEdge-rules", "PostAppsSlugEdge-rules") because the path
+	// uses a literal hyphen; the SDK names methods after the
+	// resource noun (EdgeRule) — same convention as crons and
+	// alerts above.
+	"GET /v1/edge-rules":              "ListEdgeRules",
+	"GET /v1/apps/{slug}/edge-rules":  "ListEdgeRulesForApp",
+	"POST /v1/apps/{slug}/edge-rules": "CreateEdgeRule",
+	"GET /v1/edge-rules/{id}":         "GetEdgeRule",
+	"PATCH /v1/edge-rules/{id}":       "UpdateEdgeRule",
+	"DELETE /v1/edge-rules/{id}":      "DeleteEdgeRule",
+
 	// Issue #476 / ADR-076 — outbound webhook subscriptions. Same
 	// pattern as alerts: the SDK names the methods after the resource
 	// noun (AppWebhook / AppWebhookDelivery) rather than the path

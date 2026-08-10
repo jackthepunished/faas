@@ -405,6 +405,21 @@ type Limits struct {
 	// read in pkg/state.CreateAlertRuleIfUnderQuota.
 	AlertRuleLimitPerAccount int
 
+	// EdgeRulesPerApp caps how many edge rules (ADR-089) an app may
+	// hold. Per-app scope only — there is no account-wide edge rule
+	// flavour. The cap defends against a noisy customer pinning
+	// hundreds of rules on a hot app (the gateway's compiled-rules
+	// slice iterates in priority order at request time, so the per-
+	// request cost is O(rules_per_app) — bounded by this cap).
+	EdgeRulesPerApp int
+	// EdgeRulesJWTAllowed gates kind='jwt' rules on the plan.
+	// Hobby/Pro/Scale opt in; Free stays off (the apid handler
+	// returns 402 CodePlanEdgeRuleKindNotAllowed before insert).
+	EdgeRulesJWTAllowed bool
+	// EdgeRulesIPAllowed gates kind='ip' rules on the plan. Same
+	// Hobby+ opt-in shape as EdgeRulesJWTAllowed.
+	EdgeRulesIPAllowed bool
+
 	// WebhookPerApp caps how many outbound webhook subscriptions a
 	// single app may register (issue #476 / ADR-076). The plan gate
 	// is enforced in pkg/state.CreateAppWebhookIfUnderQuota under an
@@ -744,6 +759,12 @@ var planLimits = map[Plan]Limits{
 		// — the value is informational here for fail-closed accessors.
 		AlertRuleLimitPerApp:     0,
 		AlertRuleLimitPerAccount: 0,
+		// Edge rules (ADR-089): Free gets 5/app — the 5 cheap
+		// kinds (route, rewrite, redirect, headers, cors). JWT and
+		// IP stay Hobby+ only (paid-only security primitives).
+		EdgeRulesPerApp:     5,
+		EdgeRulesJWTAllowed: false,
+		EdgeRulesIPAllowed:  false,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
@@ -945,6 +966,11 @@ var planLimits = map[Plan]Limits{
 		// account-wide rules.
 		AlertRuleLimitPerApp:     3,
 		AlertRuleLimitPerAccount: 10,
+		// Edge rules (ADR-089): Hobby gets 25/app and unlocks the
+		// JWT + IP kinds.
+		EdgeRulesPerApp:     25,
+		EdgeRulesJWTAllowed: true,
+		EdgeRulesIPAllowed:  true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     3,
@@ -1138,6 +1164,10 @@ var planLimits = map[Plan]Limits{
 		// Pro app budget (25 apps vs Hobby's 5).
 		AlertRuleLimitPerApp:     10,
 		AlertRuleLimitPerAccount: 30,
+		// Edge rules (ADR-089): Pro gets 100/app with JWT + IP.
+		EdgeRulesPerApp:     100,
+		EdgeRulesJWTAllowed: true,
+		EdgeRulesIPAllowed:  true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     10,
@@ -1326,6 +1356,10 @@ var planLimits = map[Plan]Limits{
 		// the per-account figure absorbs the fan-out.
 		AlertRuleLimitPerApp:     25,
 		AlertRuleLimitPerAccount: 100,
+		// Edge rules (ADR-089): Scale gets 500/app with JWT + IP.
+		EdgeRulesPerApp:     500,
+		EdgeRulesJWTAllowed: true,
+		EdgeRulesIPAllowed:  true,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
 		WebhookPerApp:     25,
