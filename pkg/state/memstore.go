@@ -359,10 +359,16 @@ type secretKey struct {
 	Key   string
 }
 
-// envKey mirrors the app_envs PRIMARY KEY (app_id, key). Mirrors
-// secretKey by intent — same ownership shape, different value type.
+// envKey mirrors the app_envs PRIMARY KEY (app_id, scope, key)
+// post-ADR-090-PR-A (migration 00198). Pre-PR the PK was
+// (app_id, key); the Scope field is always 'default' for the flat
+// methods (UpsertAppEnv / DeleteAppEnv / ListAppEnv / CountAppEnv)
+// and is the caller-supplied value for the …InScope variants. The
+// scope literal is the same one the schema's fast-default picks for
+// pre-00198 rows.
 type envKey struct {
 	AppID string
+	Scope string
 	Key   string
 }
 
@@ -8270,17 +8276,21 @@ func (m *MemStore) MarkAppRegistryCredentialUsed(_ context.Context, accountID, a
 // ciphertext column. Plaintext values live only in this map; never
 // logged by MemStore.
 
-// UpsertAppEnv inserts or replaces the (account_id, app_id, key) row.
-// updated_at is bumped on every call so schedd's wake staging observes
-// a fresh mtime on every write.
+// UpsertAppEnv inserts or replaces the (account_id, app_id, scope=
+// 'default', key) row. updated_at is bumped on every call so schedd's
+// wake staging observes a fresh mtime on every write.
+//
+// ADR-090 PR-A: hardcodes scope='default' at the map key site. Use
+// UpsertAppEnvInScope for non-default scopes.
 func (m *MemStore) UpsertAppEnv(_ context.Context, accountID, appID, key, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := envKey{AppID: appID, Key: key}
+	scope := "default"
+	k := envKey{AppID: appID, Scope: scope, Key: key}
 	existing, ok := m.envs[k]
 	now := time.Now()
 	if !ok {
-		m.envs[k] = AppEnv{AccountID: accountID, AppID: appID, Key: key, Value: value, CreatedAt: now, UpdatedAt: now}
+		m.envs[k] = AppEnv{AccountID: accountID, AppID: appID, Scope: scope, Key: key, Value: value, CreatedAt: now, UpdatedAt: now}
 		return nil
 	}
 	if existing.AccountID != accountID {
@@ -8292,13 +8302,15 @@ func (m *MemStore) UpsertAppEnv(_ context.Context, accountID, appID, key, value 
 	return nil
 }
 
-// DeleteAppEnv removes the (account_id, app_id, key) row. Returns
-// ErrNotFound when no row matches — same semantics as PgStore so the
-// handler renders 400 CodeEnvVarNotFound.
+// DeleteAppEnv removes the (account_id, app_id, scope='default', key)
+// row. Returns ErrNotFound when no row matches — same semantics as
+// PgStore so the handler renders 400 CodeEnvVarNotFound.
+//
+// ADR-090 PR-A: hardcodes scope='default' (see UpsertAppEnv).
 func (m *MemStore) DeleteAppEnv(_ context.Context, accountID, appID, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := envKey{AppID: appID, Key: key}
+	k := envKey{AppID: appID, Scope: "default", Key: key}
 	row, ok := m.envs[k]
 	if !ok || row.AccountID != accountID {
 		return ErrNotFound
@@ -8307,29 +8319,109 @@ func (m *MemStore) DeleteAppEnv(_ context.Context, accountID, appID, key string)
 	return nil
 }
 
-// ListAppEnv returns every env row on the app, scoped to accountID.
-// Order: by key ASC (matches PgStore ORDER BY).
+// ListAppEnv returns every env row on the app where scope='default',
+// scoped to accountID. Order: by scope ASC, key ASC (matches
+// PgStore ORDER BY).
 func (m *MemStore) ListAppEnv(_ context.Context, accountID, appID string) ([]AppEnv, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []AppEnv
 	for _, e := range m.envs {
-		if e.AppID != appID || e.AccountID != accountID {
+		if e.AppID != appID || e.AccountID != accountID || e.Scope != "default" {
 			continue
 		}
 		out = append(out, e)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+		return out[i].Key < out[j].Key
+	})
 	return out, nil
 }
 
-// CountAppEnv is the quota helper. Mirrors PgStore.CountAppEnv.
+// CountAppEnv is the quota helper. Counts ALL scope values for the
+// app per ADR-090 D6 (EnvVarsMax is per-app, not per-scope). Mirrors
+// PgStore.CountAppEnv.
 func (m *MemStore) CountAppEnv(_ context.Context, accountID, appID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := 0
 	for _, e := range m.envs {
 		if e.AppID == appID && e.AccountID == accountID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// UpsertAppEnvInScope is the scope-aware sibling of UpsertAppEnv.
+// Mirrors the shape of the pgstore implementation so handler tests
+// exercise the same composite-key shape the production store
+// enforces.
+func (m *MemStore) UpsertAppEnvInScope(_ context.Context, accountID, appID, scope, key, value string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := envKey{AppID: appID, Scope: scope, Key: key}
+	existing, ok := m.envs[k]
+	now := time.Now()
+	if !ok {
+		m.envs[k] = AppEnv{AccountID: accountID, AppID: appID, Scope: scope, Key: key, Value: value, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}
+	if existing.AccountID != accountID {
+		return ErrNotFound
+	}
+	existing.Value = value
+	existing.UpdatedAt = now
+	m.envs[k] = existing
+	return nil
+}
+
+// DeleteAppEnvInScope is the scope-aware sibling of DeleteAppEnv.
+func (m *MemStore) DeleteAppEnvInScope(_ context.Context, accountID, appID, scope, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := envKey{AppID: appID, Scope: scope, Key: key}
+	row, ok := m.envs[k]
+	if !ok || row.AccountID != accountID {
+		return ErrNotFound
+	}
+	delete(m.envs, k)
+	return nil
+}
+
+// ListAppEnvInScope is the scope-aware sibling of ListAppEnv. Order:
+// by scope ASC, key ASC for deterministic staging.
+func (m *MemStore) ListAppEnvInScope(_ context.Context, accountID, appID, scope string) ([]AppEnv, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []AppEnv
+	for _, e := range m.envs {
+		if e.AppID != appID || e.AccountID != accountID || e.Scope != scope {
+			continue
+		}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out, nil
+}
+
+// CountAppEnvInScope is the scope-aware sibling of CountAppEnv.
+// Reserved for future per-scope caps (ADR-091 follow-up); PR-A does
+// not call it.
+func (m *MemStore) CountAppEnvInScope(_ context.Context, accountID, appID, scope string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, e := range m.envs {
+		if e.AppID == appID && e.AccountID == accountID && e.Scope == scope {
 			n++
 		}
 	}

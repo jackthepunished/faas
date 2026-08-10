@@ -2574,10 +2574,24 @@ type AccountAppSecret struct {
 // distinct audit kinds env.set vs secret.set.
 //
 // AccountID is the row's owning account. Both PgStore and MemStore filter
-// on (AccountID, AppID, Key) so cross-account access returns ErrNotFound.
+// on (AccountID, AppID, Scope, Key) so cross-account access returns
+// ErrNotFound.
+//
+// Scope is the multi-scope identifier from ADR-090 (Phase 2 of the
+// 2026-08-10 secrets+envs roadmap). Mirrors the schema's
+// `app_envs.scope` column added by migration 00198; the default is
+// the literal string "default" for pre-00198 rows and for the
+// flat-shape writers (UpsertAppEnv / DeleteAppEnv / ListAppEnv /
+// CountAppEnv) which hardcode scope='default' at the SQL boundary.
+// Scope-aware writers (UpsertAppEnvInScope and its siblings) set
+// this field from the caller-supplied scope. The shape must match
+// the validSlug regex from cmd/apid/handlers.go:600 — lowercase
+// alnum + dash, 3..40 chars — and the app_envs_scope_shape CHECK
+// enforces this server-side.
 type AppEnv struct {
 	AccountID string
 	AppID     string
+	Scope     string
 	Key       string
 	Value     string
 	CreatedAt time.Time
