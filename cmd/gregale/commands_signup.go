@@ -21,8 +21,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -35,22 +37,39 @@ const dispatchSignup = "signup"
 
 // cmdSignup is the dispatch entry point. Mirrors the `dispatchLogin`
 // pattern: a flag.NewFlagSet, positional-arg count check, then route
-// to the interactive or magic-link helper.
+// to one of three helpers:
+//
+//   - signupInteractive (default): email + password + confirm.
+//   - signupFromStdin  (--password-stdin): email + password, no
+//     confirm prompt — single-shot read for CI.
+//   - signupMagicLink  (--email-only EMAIL): passwordless, server
+//     emits a magic link.
+//
+// --email-only and --password-stdin are mutually exclusive: the former
+// is server-rendered (no password ever crosses the wire in the CLI),
+// the latter is a CI-shape mirror of the interactive flow.
 func cmdSignup(args []string) int {
 	fs := flag.NewFlagSet("signup", flag.ContinueOnError)
 	fs.Usage = func() {
-		PrintUsage(os.Stderr, "usage: gregale signup [--email-only EMAIL]", "auth")
+		PrintUsage(os.Stderr, "usage: gregale signup [--email-only EMAIL | --password-stdin]", "auth")
 	}
 	emailOnly := fs.String("email-only", "", "send a one-time signup link to this email (no password prompt)")
+	passwordStdin := fs.Bool("password-stdin", false, "read password from stdin (CI; mutually exclusive with --email-only)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		PrintUsage(os.Stderr, "usage: gregale signup [--email-only EMAIL]", "auth")
+		PrintUsage(os.Stderr, "usage: gregale signup [--email-only EMAIL | --password-stdin]", "auth")
 		return 1
+	}
+	if *emailOnly != "" && *passwordStdin {
+		return printErr("Invalid flags", fmt.Errorf("--email-only and --password-stdin are mutually exclusive"))
 	}
 	if *emailOnly != "" {
 		return signupMagicLink(*emailOnly)
+	}
+	if *passwordStdin {
+		return signupFromStdin()
 	}
 	return signupInteractive()
 }
@@ -98,6 +117,64 @@ func signupInteractive() int {
 	defer cancel()
 	c := NewClient(apiBase(), "")
 	resp, err := c.PostAuthSignup(ctx, email, pw1)
+	if err != nil {
+		return printErr("Signup failed", err)
+	}
+	return finalizeLogin(ctx, c, resp.APIKey.Plaintext, api.AccountResponse{
+		ID:    resp.AccountID,
+		Email: resp.Email,
+		Plan:  resp.Plan,
+	})
+}
+
+// signupFromStdin is the CI / build-pipeline shape. Reads email +
+// password from stdin, no confirm prompt — a single-shot read is the
+// whole point. Skipping the confirm step is a deliberate trade: a CI
+// job that wants to type the password twice would have to feed the
+// same secret to two consecutive lines, doubling the surface for
+// leaks and doubling the orchestration cost for no real benefit (the
+// server-side validation already catches typos via the 401 path).
+//
+// The "drain remaining stdin" read uses io.ReadAll on the same
+// bufio.Reader the email read already wrapped, then trims the trailing
+// \r\n. We DO NOT consult stdinIsTTY() — a user running
+// `gregale signup --password-stdin` on a real TTY is opting into
+// CI-shape behaviour (e.g. piping from a secret store). Mirrors
+// cmdMfaDisable's `--password` flag shape (commands_mfa.go:235-246)
+// but strips the interactive prompt so the pipe contract is one
+// line in, one line out.
+func signupFromStdin() int {
+	br := bufio.NewReader(osStdin)
+
+	emailRaw, err := br.ReadString('\n')
+	if err != nil {
+		return printErr("Could not read email", err)
+	}
+	email := strings.ToLower(strings.TrimSpace(emailRaw))
+	if !looksLikeCLIEmail(email) {
+		return printErr("Invalid email", fmt.Errorf("email must look like local@domain.tld"))
+	}
+
+	// Drain the rest of stdin past the email's newline. io.ReadAll
+	// returns io.EOF at clean stream end; that's not an error here.
+	// errors.Is (NOT ==) because golangci-lint's errorlint flags
+	// direct comparison against sentinels (the value can be wrapped).
+	rest, err := io.ReadAll(br)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return printErr("Could not read password", err)
+	}
+	pw := strings.TrimRight(string(rest), "\r\n")
+	if pw == "" {
+		return printErr("Could not read password", fmt.Errorf("stdin closed before password byte"))
+	}
+	if err := auth.Validate(pw); err != nil {
+		return printErr("Password too weak", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := NewClient(apiBase(), "")
+	resp, err := c.PostAuthSignup(ctx, email, pw)
 	if err != nil {
 		return printErr("Signup failed", err)
 	}

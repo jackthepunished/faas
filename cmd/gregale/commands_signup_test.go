@@ -296,6 +296,116 @@ func TestCmdSignup_Interactive_PipeReadsPlain(t *testing.T) {
 	}
 }
 
+// TestCmdSignup_PasswordStdin_HappyPath: pipe email + password (no
+// confirm), counter.signup == 1, token file written, exit 0. This is
+// the CI-shape smoke.
+func TestCmdSignup_PasswordStdin_HappyPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	pipeStdin(t, "alice@example.com\ncorrect-horse-battery-staple\n")
+
+	if got := cmdSignup([]string{"--password-stdin"}); got != 0 {
+		t.Fatalf("cmdSignup --password-stdin exit = %d, want 0", got)
+	}
+	if c := atomic.LoadInt32(&counter.signup); c != 1 {
+		t.Errorf("/v1/auth/signup hit %d times, want 1", c)
+	}
+	if c := atomic.LoadInt32(&counter.magicLink); c != 0 {
+		t.Errorf("/v1/auth/signup/magic-link hit %d times, want 0", c)
+	}
+	if got := readSavedToken(t); got != signupPlaintext {
+		t.Errorf("saved token = %q, want %q", got, signupPlaintext)
+	}
+}
+
+// TestCmdSignup_PasswordStdin_RejectsShortPassword: auth.Validate
+// fires pre-HTTP. The CI shape is single-shot — a 6-char password
+// hits the same client-side guard as the interactive path. counter.signup
+// must stay at 0.
+func TestCmdSignup_PasswordStdin_RejectsShortPassword(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	rd, restore := captureStderr(t)
+	pipeStdin(t, "alice@example.com\nshort\n")
+	if got := cmdSignup([]string{"--password-stdin"}); got == 0 {
+		t.Errorf("cmdSignup --password-stdin exit = 0, want non-zero (weak password)")
+	}
+	restore()
+	if c := atomic.LoadInt32(&counter.signup); c != 0 {
+		t.Errorf("/v1/auth/signup hit %d times, want 0 (rejected pre-HTTP)", c)
+	}
+	if !strings.Contains(rd.String(), "weak") {
+		t.Errorf("stderr = %q, want 'weak' marker", rd.String())
+	}
+}
+
+// TestCmdSignup_PasswordStdin_MutuallyExclusiveWithEmailOnly: passing
+// both flags must short-circuit before any HTTP call. Neither signup
+// nor magic-link counter may increment.
+func TestCmdSignup_PasswordStdin_MutuallyExclusiveWithEmailOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	rd, restore := captureStderr(t)
+	// No stdin write — neither branch should reach a reader.
+	if got := cmdSignup([]string{"--email-only", "alice@example.com", "--password-stdin"}); got == 0 {
+		t.Errorf("cmdSignup --email-only --password-stdin exit = 0, want non-zero (mutex violation)")
+	}
+	restore()
+	if c := atomic.LoadInt32(&counter.signup); c != 0 {
+		t.Errorf("/v1/auth/signup hit %d times, want 0 (mutex short-circuited)", c)
+	}
+	if c := atomic.LoadInt32(&counter.magicLink); c != 0 {
+		t.Errorf("/v1/auth/signup/magic-link hit %d times, want 0 (mutex short-circuited)", c)
+	}
+	if !strings.Contains(rd.String(), "mutually exclusive") {
+		t.Errorf("stderr = %q, want 'mutually exclusive' marker", rd.String())
+	}
+}
+
+// TestCmdSignup_PasswordStdin_EmptyStdin: email line closes the email
+// read; the password drain then sees EOF with no bytes. signupFromStdin
+// must reject this pre-HTTP rather than POST an empty password.
+func TestCmdSignup_PasswordStdin_EmptyStdin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("FAAS_TOKEN", "")
+	setFakeKeyring(t)
+
+	srv, counter := fakeSignupServer(t, http.StatusOK, http.StatusOK)
+	t.Setenv("FAAS_API", srv.URL)
+
+	rd, restore := captureStderr(t)
+	pipeStdin(t, "alice@example.com\n")
+	if got := cmdSignup([]string{"--password-stdin"}); got == 0 {
+		t.Errorf("cmdSignup --password-stdin exit = 0, want non-zero (empty password)")
+	}
+	restore()
+	if c := atomic.LoadInt32(&counter.signup); c != 0 {
+		t.Errorf("/v1/auth/signup hit %d times, want 0 (empty stdin rejected)", c)
+	}
+	if !strings.Contains(rd.String(), "password") {
+		t.Errorf("stderr = %q, want 'password' marker", rd.String())
+	}
+}
+
 // TestReadInteractivePassword_FallsBackOnNonFile: the helper's TTY
 // gate is `if f, ok := osStdin.(*os.File); ok && term.IsTerminal(int(f.Fd()))`.
 // When osStdin is a non-file reader (pipe, bytes.Buffer, …) the type

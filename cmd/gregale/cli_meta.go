@@ -377,8 +377,11 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "signup",
 		DocSlug: "auth",
-		Short:   "Create a new account (signup [--email-only EMAIL])",
-		Flags:   []cliFlag{{Name: "email-only", Short: "send a one-time signup link to this email (no password prompt)"}},
+		Short:   "Create a new account (signup [--email-only EMAIL | --password-stdin])",
+		Flags: []cliFlag{
+			{Name: "email-only", Short: "send a one-time signup link to this email (no password prompt)"},
+			{Name: "password-stdin", Short: "read password from stdin (CI; mutually exclusive with --email-only)"},
+		},
 	},
 	{
 		Name:    "logs",
