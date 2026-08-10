@@ -10069,7 +10069,7 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	// walk — see pkg/rekey/rekey.go for the cursor semantics.
 	if cursor == "" {
 		rows, err := s.pool.Query(ctx,
-			`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+			`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 			 from app_secrets
 			 order by account_id asc, app_id asc, key asc
 			 limit $1`,
@@ -10094,7 +10094,7 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	}
 	curAcct, curApp, curKey := parts[0], parts[1], parts[2]
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 		 from app_secrets
 		 where (account_id, app_id, key) >= ($1::uuid, $2::uuid, $3)
 		 order by account_id asc, app_id asc, key asc

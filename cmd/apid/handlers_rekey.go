@@ -52,17 +52,41 @@ import (
 // /v1/admin/* route uses; see handlers_admin_obs.go for the
 // pattern).
 //
-// When s.rekeyRunner is nil (FAAS_REKEY_ENABLED unset), the
-// handler returns 503 with code="rekey_disabled". We do NOT
-// synthesise a zero-progress response — the operator's action
-// depends on knowing the runner is off, and 200 + zeros would
-// be ambiguous with "runner is on and the table is empty".
+// When s.rekeyRunner is nil, the handler distinguishes two
+// misconfigurations via the rekeyRunnerOptedIn flag set at boot
+// (cmd/apid/main.go, MarkRekeyRunnerOptedIn):
+//
+//   - optedIn=false → FAAS_REKEY_ENABLED was unset. Detail tells
+//     the operator to set the flag and restart.
+//   - optedIn=true → FAAS_REKEY_ENABLED=true was set, but no host
+//     age identities loaded (mfaIdentities() was empty). Detail
+//     tells the operator to set FAAS_HOST_AGE_IDENTITY_PATH
+//     alongside the flag — the misleading "set FAAS_REKEY_ENABLED
+//     and restart" hint is replaced with the actual misconfig
+//     (PR #825 review fix).
+//
+// In both cases we return 503, not 200+zeros, so a dashboard
+// distinguishes "feature is off / misconfigured" from "feature is
+// on and the table is empty".
 func (s *server) getRekeyProgress(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if allowed, prob := s.adminAllows(acct); !allowed {
 		api.WriteProblem(w, prob)
 		return
 	}
 	if s.rekeyRunner == nil {
+		if s.rekeyRunnerOptedIn {
+			api.WriteProblem(w, api.NewProblem(
+				http.StatusServiceUnavailable,
+				api.CodeRekeyNoIdentities,
+				"Background re-seal is opted in (FAAS_REKEY_ENABLED=true) but no host "+
+					"age identities are loaded. Set FAAS_HOST_AGE_IDENTITY_PATH=<host.age> "+
+					"(and FAAS_HOST_AGE_PREVIOUS_PATH=<host.age.previous> for the "+
+					"overlap window) alongside the flag, then restart apid. "+
+					"See docs/ops/host-age-rotation.md for the full procedure.",
+				"",
+			))
+			return
+		}
 		api.WriteProblem(w, api.NewProblem(
 			http.StatusServiceUnavailable,
 			api.CodeRekeyDisabled,

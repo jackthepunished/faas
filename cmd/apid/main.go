@@ -939,6 +939,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// bakes the actor into the Auditor instance at construction
 	// (pkg/audit/audit.go:72) — every Emit call carries it.
 	if rekeyEnabledFromEnv(deps.getenv) {
+		// Mark opted-in BEFORE the runner construction so the HTTP
+		// handler returns rekey_no_identities (not the misleading
+		// rekey_disabled) if identities are empty. PR #825 follow-up
+		// — the operator DID set the flag; the misconfig is the
+		// missing identity path.
+		srv.MarkRekeyRunnerOptedIn()
 		identities := mfaIdentities()
 		if len(identities) == 0 {
 			log.Warn("FAAS_REKEY_ENABLED=true but no host age identities loaded — background re-seal disabled")
