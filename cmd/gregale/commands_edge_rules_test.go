@@ -402,6 +402,56 @@ func TestCmdEdgeRulesUpdate_EnableFlag_SendsTruePointer(t *testing.T) {
 	}
 }
 
+func TestCmdEdgeRulesUpdate_PriorityZero_SendsPointer(t *testing.T) {
+	// Regression: --priority 0 is a valid priority (DB CHECK
+	// `BETWEEN 0 AND 10000` per migrations/00192_edge_rules.sql:46,
+	// "lower wins"). The prior `&& *priority != 0` guard silently
+	// dropped the highest-precedence update; fs.Visit alone should
+	// decide whether to send the field.
+	resetJSONEnv(t)
+	var gotBody api.UpdateEdgeRuleRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(sampleEdgeRuleResponse(edgeRuleTestID))
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdEdgeRulesUpdate([]string{"--priority", "0", edgeRuleTestID}); code != 0 {
+		t.Errorf("update --priority 0 = %d, want 0", code)
+	}
+	if gotBody.Priority == nil {
+		t.Fatalf("priority = nil, want pointer to 0")
+	}
+	if *gotBody.Priority != 0 {
+		t.Errorf("priority = %d, want 0", *gotBody.Priority)
+	}
+}
+
+func TestCmdEdgeRulesUpdate_PriorityOmitted_NoPointer(t *testing.T) {
+	// Counterpart: when --priority is not passed, the field must
+	// remain nil so the server preserves the existing priority.
+	resetJSONEnv(t)
+	var gotBody api.UpdateEdgeRuleRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(sampleEdgeRuleResponse(edgeRuleTestID))
+	}))
+	defer srv.Close()
+
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdEdgeRulesUpdate([]string{"--enable", edgeRuleTestID}); code != 0 {
+		t.Errorf("update no-priority = %d, want 0", code)
+	}
+	if gotBody.Priority != nil {
+		t.Errorf("priority = %v, want nil when --priority not passed", *gotBody.Priority)
+	}
+}
+
 func TestCmdEdgeRulesUpdate_MutuallyExclusiveFlags(t *testing.T) {
 	resetJSONEnv(t)
 	called := false

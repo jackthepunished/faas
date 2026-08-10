@@ -387,7 +387,12 @@ func cmdEdgeRulesUpdate(args []string) int {
 		m := []string(matchMethods)
 		req.MatchMethods = &m
 	}
-	if visited["priority"] && *priority != 0 {
+	if visited["priority"] {
+		// Send even when the user passed --priority 0; 0 is a legal
+		// priority (DB CHECK `BETWEEN 0 AND 10000` per
+		// migrations/00192_edge_rules.sql:46, "lower wins"), so the
+		// previous `&& *priority != 0` guard silently dropped a
+		// legitimate highest-precedence update.
 		p := *priority
 		req.Priority = &p
 	}
