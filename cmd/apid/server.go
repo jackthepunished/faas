@@ -174,6 +174,14 @@ type server struct {
 	// nil-safe: the rotate handler queries the store directly when
 	// the cache is nil (the dev/test boot path).
 	graceWindowCache *graceWindowCache
+	// rekeyRunner is the background re-seal walker (ADR-089 PR-C).
+	// Wired only when FAAS_REKEY_ENABLED=true; nil on daemons
+	// where the operator hasn't enabled the feature. The HTTP
+	// handler reads Progress() through this field; a nil value
+	// produces a 503 with code="rekey_disabled" so the operator's
+	// dashboard distinguishes "feature is off" from "feature is
+	// on and the table is empty".
+	rekeyRunner *Runner
 	// audit is the IAM-4 (ADR-035) seam that auth-relevant handlers
 	// call to record a security event. The seam wraps
 	// state.Store.AppendEvent with best-effort failure semantics
@@ -328,6 +336,20 @@ func (s *server) WithSBOMRoot(root string) *server {
 // (the legacy stripe.VerifySignature + BillingPortalURL template).
 func (s *server) WithBillingProvider(p billing.Provider) *server {
 	s.billingProvider = p
+	return s
+}
+
+// WithRekeyRunner attaches the background re-seal walker
+// (ADR-089 PR-C). nil is the documented default — the
+// /v1/admin/secrets/rekey-progress handler returns 503
+// code="rekey_disabled" when this field is nil. The setter
+// returns *server so production wiring can chain
+//
+//	srv := newServer(...).WithRekeyRunner(runner)
+//
+// matching the WithOpsMetrics / WithBillingProvider style.
+func (s *server) WithRekeyRunner(r *Runner) *server {
+	s.rekeyRunner = r
 	return s
 }
 
@@ -1067,6 +1089,18 @@ func (s *server) handler() http.Handler {
 	//     at session issue time.
 	mux.HandleFunc("GET /v1/audit-log", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAuditLog))))
 	mux.HandleFunc("GET /v1/audit-log/all", s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.listAuditLogAll)))
+
+	// ADR-089 PR-C — background re-seal progress (operator-only,
+	// FAAS_REKEY_ENABLED opt-in). Same gate as /v1/audit-log/all
+	// (admin scope, no MFA — the operator session is already
+	// MFA-gated upstream). The handler returns 503
+	// code="rekey_disabled" when the runner is nil (the flag is
+	// unset on this host), so the route stays mounted and the
+	// operator's dashboard distinguishes "feature is off" from
+	// "feature is on and the table is empty". See
+	// handlers_rekey.go for the handler body.
+	mux.HandleFunc("GET /v1/admin/secrets/rekey-progress",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.getRekeyProgress)))
 
 	// Issue #517 / PR-C / ADR-064: customer-facing wake-timeline
 	// surface. Sub-resource of /v1/apps/{slug} — same auth chain

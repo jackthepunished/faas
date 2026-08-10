@@ -24,7 +24,7 @@ T = TypeVar("T", bound="CreateEdgeRuleRequest")
 
 @_attrs_define
 class CreateEdgeRuleRequest:
-    """Create an edge rule on an app."""
+    """Body shape for POST /v1/apps/{slug}/edge-rules."""
 
     match_host: str
     kind: CreateEdgeRuleRequestKind

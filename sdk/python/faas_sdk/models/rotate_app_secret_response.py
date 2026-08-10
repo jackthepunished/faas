@@ -9,27 +9,31 @@ from attrs import field as _attrs_field
 
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="AppSecretResponse")
+T = TypeVar("T", bound="RotateAppSecretResponse")
 
 
 @_attrs_define
-class AppSecretResponse:
-    """A sealed secret envelope: key name, sealed ciphertext (server can't read it), version, and timestamps."""
+class RotateAppSecretResponse:
+    """Response from `POST /v1/apps/{slug}/secrets/{key}/rotate`. The
+    `kid` is the age-1... recipient string of the host identity that
+    sealed the new envelope (ADR-089 D4); `rotated_at` is
+    RFC3339Nano so two rotates in the same second produce distinct
+    timestamps. Empty `kid` means the row was rotated but the kid
+    was not stampable (rare — happens only if apid started without
+    host.age.pub, which the handler 503s for instead).
+
+    """
 
     key: str
-    created_at: datetime.datetime
-    updated_at: datetime.datetime
+    rotated_at: datetime.datetime
     kid: str | Unset = UNSET
-    """age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before
-    migration 00166."""
+    """age-1... recipient string of the host identity that sealed this row. Empty if kid was not stampable."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         key = self.key
 
-        created_at = self.created_at.isoformat()
-
-        updated_at = self.updated_at.isoformat()
+        rotated_at = self.rotated_at.isoformat()
 
         kid = self.kid
 
@@ -38,8 +42,7 @@ class AppSecretResponse:
         field_dict.update(
             {
                 "key": key,
-                "created_at": created_at,
-                "updated_at": updated_at,
+                "rotated_at": rotated_at,
             }
         )
         if kid is not UNSET:
@@ -52,21 +55,18 @@ class AppSecretResponse:
         d = dict(src_dict)
         key = d.pop("key")
 
-        created_at = datetime.datetime.fromisoformat(d.pop("created_at"))
-
-        updated_at = datetime.datetime.fromisoformat(d.pop("updated_at"))
+        rotated_at = datetime.datetime.fromisoformat(d.pop("rotated_at"))
 
         kid = d.pop("kid", UNSET)
 
-        app_secret_response = cls(
+        rotate_app_secret_response = cls(
             key=key,
-            created_at=created_at,
-            updated_at=updated_at,
+            rotated_at=rotated_at,
             kid=kid,
         )
 
-        app_secret_response.additional_properties = d
-        return app_secret_response
+        rotate_app_secret_response.additional_properties = d
+        return rotate_app_secret_response
 
     @property
     def additional_keys(self) -> list[str]:

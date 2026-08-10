@@ -9987,7 +9987,7 @@ func (s *PgStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, 
 func (s *PgStore) GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error) {
 	var out AppSecret
 	err := s.pool.QueryRow(ctx,
-		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 		 from app_secrets
 		 where account_id = $1 and app_id = $2 and key = $3`,
 		accountID, appID, key).Scan(
@@ -10035,20 +10035,43 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	var (
-		curAcct, curApp, curKey string
-	)
-	if cursor != "" {
-		parts := strings.SplitN(cursor, "|", 3)
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("pgstore: malformed rekey cursor %q", cursor)
+	// Postgres parameter casts ($1::uuid) are evaluated at plan time, NOT
+	// per-row — so an `$1 = '' or $1::uuid` short-circuit is impossible:
+	// the planner tries to cast the empty string and 22P02s before the
+	// OR runs. Branch the query instead: empty cursor → no WHERE clause;
+	// non-empty cursor → composite >= with explicit uuid casts. The
+	// composite-uuid text ordering is what gives us a stable, restartable
+	// walk — see pkg/rekey/rekey.go for the cursor semantics.
+	if cursor == "" {
+		rows, err := s.pool.Query(ctx,
+			`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+			 from app_secrets
+			 order by account_id asc, app_id asc, key asc
+			 limit $1`,
+			limit)
+		if err != nil {
+			return nil, err
 		}
-		curAcct, curApp, curKey = parts[0], parts[1], parts[2]
+		defer rows.Close()
+		var out []AppSecret
+		for rows.Next() {
+			var r AppSecret
+			if err := rows.Scan(&r.AccountID, &r.AppID, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		return out, rows.Err()
 	}
+	parts := strings.SplitN(cursor, "|", 3)
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("pgstore: malformed rekey cursor %q", cursor)
+	}
+	curAcct, curApp, curKey := parts[0], parts[1], parts[2]
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
 		 from app_secrets
-		 where ($1 = '' or (account_id, app_id, key) >= ($1, $2, $3))
+		 where (account_id, app_id, key) >= ($1::uuid, $2::uuid, $3)
 		 order by account_id asc, app_id asc, key asc
 		 limit $4`,
 		curAcct, curApp, curKey, limit)

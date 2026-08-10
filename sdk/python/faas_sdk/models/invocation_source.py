@@ -1,12 +1,13 @@
 from typing import Literal
 
-InvocationSource = Literal["async_invoke", "cron", "delayed_task", "queue"]
+InvocationSource = Literal["async_invoke", "cron", "delayed_task", "queue", "replay"]
 
 INVOCATION_SOURCE_VALUES: set[InvocationSource] = {
     "async_invoke",
     "cron",
     "delayed_task",
     "queue",
+    "replay",
 }
 
 

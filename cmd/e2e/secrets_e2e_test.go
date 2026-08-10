@@ -58,14 +58,21 @@ func TestSecretsMatrixPg(t *testing.T) {
 		t.Run(string(plan), func(t *testing.T) {
 			// Each plan boots a fresh apid with a fresh host age recipient,
 			// all in a shared per-plan tempdir. The harness adds cleanup.
+			// Both recipient and identity paths are required after PR-089 PR-C
+			// added kid-stamping on the PUT path: the recipient is the public
+			// half apid seals against, the identity is the private half
+			// apid uses to compute the kid fingerprint (see
+			// memory/cmd-apid-test-recipient-identity-pair.md).
 			tmpDir := t.TempDir()
 			recipientPath := filepath.Join(tmpDir, "host.age.pub")
+			identityPath := recipientPath + ".priv"
 			if err := writeTestRecipient(recipientPath); err != nil {
 				t.Fatalf("write recipient: %v", err)
 			}
 
 			h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
 				"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientPath,
+				"FAAS_HOST_AGE_IDENTITY_PATH=" + identityPath,
 			})
 			key := h.SeedAccount(context.Background(), plan)
 			limits := api.MustLimitsFor(plan)
@@ -173,11 +180,13 @@ func TestSecretsCrossAccountIsolation(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	recipientPath := filepath.Join(tmpDir, "host.age.pub")
+	identityPath := recipientPath + ".priv"
 	if err := writeTestRecipient(recipientPath); err != nil {
 		t.Fatal(err)
 	}
 	h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
 		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientPath,
+		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityPath,
 	})
 
 	keyA := h.SeedAccount(context.Background(), api.PlanHobby, "a")
@@ -227,11 +236,13 @@ func TestSecretsDeleteNotFound(t *testing.T) {
 	}
 	tmpDir := t.TempDir()
 	recipientPath := filepath.Join(tmpDir, "host.age.pub")
+	identityPath := recipientPath + ".priv"
 	if err := writeTestRecipient(recipientPath); err != nil {
 		t.Fatal(err)
 	}
 	h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
 		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientPath,
+		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityPath,
 	})
 	key := h.SeedAccount(context.Background(), api.PlanHobby)
 	if code := statusOnly(t, h, key, http.MethodPost, "/v1/apps",
@@ -246,16 +257,33 @@ func TestSecretsDeleteNotFound(t *testing.T) {
 
 // --- helpers ---------------------------------------------------------------
 
-// writeTestRecipient generates a fresh host age identity and writes only
-// the public half to path. apid uses this to seal; vmmd would need to
-// hold the private half to unseal, but the e2e doesn't run vmmd — the
-// store-side check (encrypted blob, not plaintext) is what we're after.
+// writeTestRecipient generates a fresh host age identity and writes BOTH
+// the public half to path AND the full identity to <path>.priv. apid
+// uses the public half to seal (FAAS_HOST_AGE_RECIPIENT_PATH) and the
+// full identity to compute kid fingerprints for the app_secrets.kid
+// column (FAAS_HOST_AGE_IDENTITY_PATH). The store-side check (encrypted
+// blob, not plaintext) is what the e2e is after; vmmd is not in the
+// loop, so unsealing doesn't matter.
+//
+// The pair-write shape is the same one TestSecretsRotatePg uses via
+// startHostedRecipient (secrets_rotate_e2e_test.go:58); we keep the
+// two helpers separate because the public-only path is the simpler
+// case for tests that don't trigger the kid-stamping path. After
+// PR-089 PR-C added kid-stamping on the PUT path, every test that
+// PUTs a secret needs both files, so writeTestRecipient now writes
+// both — the cost is an extra 256 bytes per .priv file and the
+// guarantee that the 503 "host age identities not loaded" path
+// doesn't fire on a test that only intended to check the seal.
 func writeTestRecipient(path string) error {
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(id.Recipient().String()), 0o444)
+	if err := os.WriteFile(path, []byte(id.Recipient().String()), 0o444); err != nil {
+		return err
+	}
+	privPath := path + ".priv"
+	return os.WriteFile(privPath, []byte(id.String()), 0o400)
 }
 
 // keyNameForQuota returns unique valid secret names for the i-th fill of

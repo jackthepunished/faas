@@ -3591,3 +3591,21 @@ type UpdateEdgeRuleRequest struct {
 	Enabled      *bool            `json:"enabled,omitempty"`
 	Action       *json.RawMessage `json:"action,omitempty"`
 }
+
+// RekeyProgress is the response body of
+// GET /v1/admin/secrets/rekey-progress (ADR-089 PR-C). It mirrors
+// pkg/rekey.RekeyProgress exactly — same field names, same JSON tags,
+// same int64 widths — so the on-disk FAAS_REKEY_PROGRESS_FILE and
+// the admin response can share a decoder without a parallel type.
+//
+// The conversion (pkg/rekey.RekeyProgress → api.RekeyProgress) is a
+// straight field-copy in cmd/apid/handlers_rekey.go::getRekeyProgress.
+// Counters are cumulative across the walk and only grow; LastID is
+// the resume cursor in (account_id|app_id|key) form.
+type RekeyProgress struct {
+	Total   int64  `json:"total"`
+	Rekeyed int64  `json:"rekeyed"`
+	Skipped int64  `json:"skipped"`
+	Failed  int64  `json:"failed"`
+	LastID  string `json:"last_id,omitempty"`
+}

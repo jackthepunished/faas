@@ -111,7 +111,7 @@ def sync_detailed(
 
     Args:
         slug (str):
-        body (CreateEdgeRuleRequest): Create an edge rule on an app.
+        body (CreateEdgeRuleRequest): Body shape for POST /v1/apps/{slug}/edge-rules.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -150,7 +150,7 @@ def sync(
 
     Args:
         slug (str):
-        body (CreateEdgeRuleRequest): Create an edge rule on an app.
+        body (CreateEdgeRuleRequest): Body shape for POST /v1/apps/{slug}/edge-rules.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -184,7 +184,7 @@ async def asyncio_detailed(
 
     Args:
         slug (str):
-        body (CreateEdgeRuleRequest): Create an edge rule on an app.
+        body (CreateEdgeRuleRequest): Body shape for POST /v1/apps/{slug}/edge-rules.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -221,7 +221,7 @@ async def asyncio(
 
     Args:
         slug (str):
-        body (CreateEdgeRuleRequest): Create an edge rule on an app.
+        body (CreateEdgeRuleRequest): Body shape for POST /v1/apps/{slug}/edge-rules.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

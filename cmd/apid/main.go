@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/auth"
 	"github.com/onebox-faas/faas/pkg/authcode"
 	billingloader "github.com/onebox-faas/faas/pkg/billing/loader"
@@ -91,6 +92,31 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// rekeyEnabledFromEnv reads FAAS_REKEY_ENABLED via the test seam
+// (deps.getenv) and parses the canonical truthy spellings.
+// Default false preserves the v1 no-op posture — operators who
+// have not yet rotated the host identity see exactly zero rekey
+// activity (no file write, no goroutine, no audit noise).
+//
+// Why a dedicated helper (vs os.LookupEnv in main.go): the flag
+// is consumed at boot to decide whether to construct a Runner,
+// and the parsing rules need to live in one place so a unit test
+// for the parsing can pin the truthy set without booting the
+// daemon. Same shape as graceIntervalFromEnv (line 529).
+//
+// The truthy spelling set lives in rekey_runner.go as
+// rekeyTruthyLiterals — name-spaced there so goconst doesn't tie
+// this subsystem to deploy_inputs.go's checkbox literals.
+func rekeyEnabledFromEnv(getenv func(string) string) bool {
+	v := strings.ToLower(strings.TrimSpace(getenv(rekeyEnabledEnvVar)))
+	for _, lit := range rekeyTruthyLiterals {
+		if v == lit {
+			return true
+		}
+	}
+	return false
 }
 
 // firstNonEmpty returns the first non-empty string among the
@@ -320,6 +346,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 	deps.store = func() state.Store { return state.NewPgStore(pool) }
 	deps.notif = func() Notifier { return pgNotifier{pool: pool} }
 	deps.bgBefore = func(ctx context.Context, log *slog.Logger, srv *server) {
+		// ADR-089 PR-C — background re-seal runner. The runner is
+		// nil when FAAS_REKEY_ENABLED is unset (or when identities
+		// failed to load); we skip the goroutine launch in that
+		// case so the boot path is a no-op on the default deploy.
+		// Mirrors the launch pattern of every other background
+		// worker below (`go func() { _ = thing.Run(ctx) }()`)
+		// — error is discarded at the goroutine boundary, the
+		// run blocks until ctx.Done() (Runner.Run signature,
+		// rekey_runner.go).
+		if srv.rekeyRunner != nil {
+			go func() { _ = srv.rekeyRunner.Run(ctx) }()
+		}
 		// Move 3 (M7.5 prep): bridge pg_notify → in-process broadcaster.
 		// Runs as a background goroutine for the daemon's lifetime; the
 		// SubscribeWithReconnect wrapper reconnects across Postgres
@@ -889,6 +927,55 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// loader is the canonical gate, but the second check here
 		// closes a foot-gun class of bugs.
 		return fmt.Errorf("apid: set recovery HMAC secret: %w", err)
+	}
+
+	// ADR-089 PR-C — background re-seal runner. Opt-in via
+	// FAAS_REKEY_ENABLED; default false. When enabled, the
+	// runner walks app_secrets and re-seals every row under the
+	// current host identity (pkg/rekey.Replayer wrapped by
+	// cmd/apid/rekey_runner.go::Runner). The runner is set on
+	// the server BEFORE deps.bgBefore runs so the goroutine
+	// launch below can call its Run() method without a nil check
+	// inside the closure.
+	//
+	// The runner needs the multi-identity slice loaded earlier
+	// (mfaIdentities() — line 800). When the identity path is
+	// unset we skip construction (the runner's identities field
+	// would be empty); this is consistent with the rest of the
+	// identity-dependent surfaces (MFA /confirm, rotate handler)
+	// that 503 when no identity is loaded.
+	//
+	// The audit actor "rekey" is distinct from the apid default
+	// "apid" so dashboards filtering on the audit table can
+	// separate user-driven rotates (PR-B, actor="apid") from
+	// background re-seals (PR-C, actor="rekey"). pkg/audit.New
+	// bakes the actor into the Auditor instance at construction
+	// (pkg/audit/audit.go:72) — every Emit call carries it.
+	if rekeyEnabledFromEnv(deps.getenv) {
+		identities := mfaIdentities()
+		if len(identities) == 0 {
+			log.Warn("FAAS_REKEY_ENABLED=true but no host age identities loaded — background re-seal disabled")
+		} else {
+			rekeyAudit := audit.New(store, log, nil, "rekey")
+			progressPath := envOr(rekeyProgressEnvVar, rekeyProgressPathDefault)
+			runner, err := NewRunner(RunnerOpts{
+				Store:        store,
+				Audit:        rekeyAudit,
+				Identities:   identities,
+				ProgressPath: progressPath,
+				Log:          log,
+			})
+			if err != nil {
+				return fmt.Errorf("apid: build rekey runner: %w", err)
+			}
+			srv.WithRekeyRunner(runner)
+			log.Info("background re-seal enabled",
+				"progress_path", progressPath,
+				"identity_count", len(identities),
+			)
+		}
+	} else {
+		log.Info("background re-seal disabled; set FAAS_REKEY_ENABLED=true to opt in (see docs/ops/host-age-rotation.md)")
 	}
 
 	// Optional pre-listen hook (DNS poller in production; nil in tests).

@@ -313,12 +313,14 @@ func TestE2E_ListSecretsForAccount_PlaintextInvariant(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	recipientPath := tmpDir + "/host.age.pub"
+	identityPath := recipientPath + ".priv"
 	if err := writeTestRecipient(recipientPath); err != nil {
 		t.Fatal(err)
 	}
 
 	h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
 		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientPath,
+		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityPath,
 	})
 	ctx := context.Background()
 
@@ -387,11 +389,13 @@ func TestE2E_ListSecretsForAccount_CrossAccountIsolation(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	recipientPath := tmpDir + "/host.age.pub"
+	identityPath := recipientPath + ".priv"
 	if err := writeTestRecipient(recipientPath); err != nil {
 		t.Fatal(err)
 	}
 	h := e2etest.StartWithEnv(t, pool, e2etest.APID, []string{
 		"FAAS_HOST_AGE_RECIPIENT_PATH=" + recipientPath,
+		"FAAS_HOST_AGE_IDENTITY_PATH=" + identityPath,
 	})
 	ctx := context.Background()
 
