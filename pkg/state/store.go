@@ -231,6 +231,35 @@ func clampLogLimit(limit int) int {
 	return limit
 }
 
+// PaddleOverageDedupeSchemaResult is the read-only snapshot of the
+// paddle_overage_dedupe table that the B4 pre-flight surfaces. The
+// bools are derived from information_schema.columns (PgStore) or
+// from a structural check of the rows held in memory (MemStore);
+// the counts are the per-state row totals the same call replaces.
+// Returned by state.Store.PaddleOverageDedupeSchema.
+type PaddleOverageDedupeSchemaResult struct {
+	// TableExists is true if the paddle_overage_dedupe table is
+	// present (00034+). False means "no Paddle overage flushes have
+	// ever happened against this DB" — the operator needs migrations
+	// 00034 then 00041 applied in order.
+	TableExists bool
+	// HasWindowStart / HasState / HasClaimedAt / HasClaimedBy are
+	// the four columns added by migration 00041. All four must be
+	// true for the meterd overage pusher to land; a partial
+	// (HasWindowStart but !HasState) tripwire means the migration
+	// was interrupted mid-flight and the DB is in a degraded state
+	// the operator must resolve before any further push.
+	HasWindowStart bool
+	HasState       bool
+	HasClaimedAt   bool
+	HasClaimedBy   bool
+	// PendingRows / CompletedRows are the per-state row totals.
+	// Surfaced so the same CLI call replaces a manual
+	// `select count(*) filter (where state = …)` query.
+	PendingRows   int64
+	CompletedRows int64
+}
+
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
 // The production implementation is Postgres via the embedded SQL queries in
 // pkg/state/queries.sql; MemStore backs unit tests. Keeping this interface
@@ -2670,6 +2699,20 @@ type Store interface {
 	// production code paths call them.
 	HasPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) (bool, error)
 	RecordPaddleOverageMonth(ctx context.Context, accountID string, month time.Time) error
+
+	// PaddleOverageDedupeSchema describes the column shape of the
+	// paddle_overage_dedupe table. Read-only probe consumed by the
+	// `faas billing reconcile-paddle-overage` pre-flight (B4 / Tier 1
+	// follow-up to PR #802). Operators on a fresh install see this
+	// return TableExists=true but all the per-window bools=false
+	// until migration 00041 is applied; that mismatch is the
+	// tripwire. PendingRows + CompletedRows are useful as a dashboard
+	//-shaped read so the same call replaces a manual
+	// `select count(*) … state=…` query. PgStore probes
+	// information_schema.columns; MemStore derives the bools from any
+	// rows it holds and reports zeros for the missing-table case
+	// (the pre-flight maps zeros to "table missing" the same way).
+	PaddleOverageDedupeSchema(ctx context.Context) (PaddleOverageDedupeSchemaResult, error)
 
 	// WebhookReplayDedup is the dedupe gate for the three webhook
 	// ingresses on the box (GitHub via gatewayd-internal, Stripe + Paddle via

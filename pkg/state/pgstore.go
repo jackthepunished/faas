@@ -9694,6 +9694,88 @@ func (s *PgStore) RecordPaddleOverageMonth(ctx context.Context, accountID string
 	return err
 }
 
+// PaddleOverageDedupeSchema probes information_schema.columns for
+// the four migration-00041 columns + counts the per-state rows in
+// one round-trip. Read-only; consumed by the B4 pre-flight
+// (`GET /v1/admin/billing-paddle-overage/preflight`).
+//
+// TableExists is derived from a separate to_regclass probe so a
+// freshly-installed box without migrations 00034 applied at all
+// reports TableExists=false (with the count fields zero) — the
+// pre-flight maps the missing-table case to "apply 00034 then
+// 00041". A box with 00034 but no 00041 reports TableExists=true
+// and the four HasX=false — the pre-flight maps that to "apply
+// 00041".
+//
+// The single-query COUNT(*) FILTER shape (rather than two COUNTs)
+// keeps this to one DB round-trip; the four columns come back as
+// rows that we pivot into a bool map.
+func (s *PgStore) PaddleOverageDedupeSchema(ctx context.Context) (PaddleOverageDedupeSchemaResult, error) {
+	var out PaddleOverageDedupeSchemaResult
+	var tableName *string
+	if err := s.pool.QueryRow(ctx, `select to_regclass('public.paddle_overage_dedupe')::text`).Scan(&tableName); err != nil {
+		return out, fmt.Errorf("probe paddle_overage_dedupe table: %w", err)
+	}
+	if tableName == nil || *tableName == "" {
+		return out, nil // TableExists stays false; the pre-flight maps this to the missing-table error.
+	}
+	out.TableExists = true
+
+	// Pull the four migration-00041 columns in one query. Anything
+	// the DB doesn't know about is silently absent — we don't
+	// require the column to be NOT NULL or to have a specific
+	// default, only that it exists. The state column has a CHECK
+	// constraint but its presence is the gate, not its constraint
+	// shape — that's a separate concern for the pusher, not the
+	// pre-flight.
+	rows, err := s.pool.Query(ctx, `
+		select column_name
+		from information_schema.columns
+		where table_schema = 'public'
+		  and table_name = 'paddle_overage_dedupe'
+		  and column_name in ('window_start', 'state', 'claimed_at', 'claimed_by')
+	`)
+	if err != nil {
+		return out, fmt.Errorf("probe paddle_overage_dedupe columns: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return out, fmt.Errorf("scan column name: %w", err)
+		}
+		switch col {
+		case "window_start":
+			out.HasWindowStart = true
+		case "state":
+			out.HasState = true
+		case "claimed_at":
+			out.HasClaimedAt = true
+		case "claimed_by":
+			out.HasClaimedBy = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("iterate paddle_overage_dedupe columns: %w", err)
+	}
+
+	// Per-state row counts. The state column is nullable on
+	// legacy rows (pre-00041 default 'completed' was backfilled
+	// for legacy rows but new INSERTs are constrained); the
+	// FILTERs treat NULL as "neither pending nor completed" and
+	// exclude it from both totals. That's the right shape — the
+	// pre-flight reports what the meterd pusher sees.
+	if err := s.pool.QueryRow(ctx, `
+		select
+		  count(*) filter (where state = 'pending'),
+		  count(*) filter (where state = 'completed')
+		from paddle_overage_dedupe
+	`).Scan(&out.PendingRows, &out.CompletedRows); err != nil {
+		return out, fmt.Errorf("count paddle_overage_dedupe states: %w", err)
+	}
+	return out, nil
+}
+
 // CheckWebhookReplay returns ErrReplay if (provider, delivery_id) has
 // a dedupe row received on or after cutoff. The PgStore implementation
 // translates a found-row into ErrReplay so callers can branch on a

@@ -1036,6 +1036,8 @@ func (s *server) handler() http.Handler {
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.resetPaddleCatalog)))
 	mux.HandleFunc("POST /v1/admin/billing-reconcile/{id}",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.reconcileAccount)))
+	mux.HandleFunc("GET /v1/admin/billing-paddle-overage/preflight",
+		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.paddleOveragePreflight)))
 
 	// Operator observability backend (issue #777 / ADR-091). The
 	// /v1/admin/obs/* surface gives the platform owner read-only

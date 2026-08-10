@@ -7227,6 +7227,39 @@ func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string,
 	return nil
 }
 
+// PaddleOverageDedupeSchema reports the in-memory mirror of the
+// paddle_overage_dedupe table. Mirrors the pgstore probe but does
+// not query information_schema — the memstore can't lie about
+// schema, only about contents. We report TableExists=true iff
+// paddleOverageWindows is non-empty OR paddleOverageMonths is
+// non-empty (an init memstore has neither); on a fresh memstore
+// this returns the "table missing" surface the pre-flight maps
+// to the 00034-then-00041 hint. The Has* flags are hardcoded to
+// true for memstore — the in-process map tracks all four columns
+// by construction, so any memstore that has rows "has" the 00041
+// shape. This matches production semantics: a memstore without
+// those columns cannot exist by definition.
+func (m *MemStore) PaddleOverageDedupeSchema(_ context.Context) (PaddleOverageDedupeSchemaResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out PaddleOverageDedupeSchemaResult
+	if len(m.paddleOverageMonths) > 0 || len(m.paddleOverageWindows) > 0 {
+		out.TableExists = true
+		out.HasWindowStart = true
+		out.HasState = true
+		out.HasClaimedAt = true
+		out.HasClaimedBy = true
+	}
+	for _, r := range m.paddleOverageWindows {
+		if r.completed {
+			out.CompletedRows++
+		} else {
+			out.PendingRows++
+		}
+	}
+	return out, nil
+}
+
 // CheckWebhookReplay returns true when (provider, delivery_id) has a
 // dedupe row whose received_at >= cutoff. The MemStore drops
 // expired rows inline at read time (PgStore has the apid sweep

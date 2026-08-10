@@ -5363,6 +5363,39 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/admin/billing-paddle-overage/preflight:
+    get:
+      tags: [admin]
+      operationId: getBillingPaddleOveragePreflight
+      summary: Read the paddle_overage_dedupe schema probe (admin-only).
+      description: |
+        Operator-side guard for the Paddle overage pusher's
+        per-window claim state machine (migration 00041). Returns
+        which of the four new columns are present + the per-state
+        row counts so an operator can verify the meterd loop will
+        not crash on a 42703 (column missing) error before any
+        customer-facing push is attempted.
+
+        Returned by the B4 pre-flight CLI subcommand. A response
+        with table_exists=true and any of has_window_start /
+        has_state / has_claimed_at / has_claimed_by=false means
+        migration 00041 was not (fully) applied. A response with
+        table_exists=false means migrations 00034 + 00041 are
+        both unapplied (the table has never been created).
+      responses:
+        '200':
+          description: Schema probe result. Booleans reflect the current DB shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BillingPaddleOveragePreflightResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required — GET /v1/admin/billing-paddle-overage/preflight requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/admin/billing-reconcile/{id}:
     post:
       tags: [admin]
@@ -7627,6 +7660,31 @@ components:
         entries:
           type: array
           items: { $ref: '#/components/schemas/BillingCatalogEntry' }
+
+    BillingPaddleOveragePreflightResponse:
+      description: |
+        Wire shape for GET /v1/admin/billing-paddle-overage/preflight
+        (B4 / Tier 1 follow-up to PR #802). Operator-side guard that
+        probes information_schema.columns for the four migration-00041
+        columns + counts the per-state rows in a single round-trip.
+
+        table_exists is false when the paddle_overage_dedupe table is
+        entirely absent (migrations 00034 + 00041 both unapplied).
+        has_window_start / has_state / has_claimed_at / has_claimed_by
+        each correspond to one of the four columns added by
+        migration 00041; all four must be true for the meterd
+        overage pusher to land. pending_rows / completed_rows are
+        the per-state row totals (a single SQL filter pair).
+      type: object
+      required: [table_exists, has_window_start, has_state, has_claimed_at, has_claimed_by, pending_rows, completed_rows]
+      properties:
+        table_exists:    { type: boolean, description: 'true if the paddle_overage_dedupe table is present (00034+).' }
+        has_window_start: { type: boolean, description: 'true if the migration-00041 window_start column exists.' }
+        has_state:       { type: boolean, description: 'true if the migration-00041 state column exists.' }
+        has_claimed_at:  { type: boolean, description: 'true if the migration-00041 claimed_at column exists.' }
+        has_claimed_by:  { type: boolean, description: 'true if the migration-00041 claimed_by column exists.' }
+        pending_rows:    { type: integer, minimum: 0, description: 'count(*) where state = pending.' }
+        completed_rows:  { type: integer, minimum: 0, description: 'count(*) where state = completed.' }
 
     BuildProvenanceResponse:
       description: |

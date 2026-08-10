@@ -68,6 +68,8 @@ func cmdBilling(args []string) int {
 		return cmdBillingPriceCatalog(args[1:])
 	case billingSubReconcile:
 		return cmdBillingReconcile(args[1:])
+	case billingSubReconcilePaddleOverage:
+		return cmdBillingReconcilePaddleOverage(args[1:])
 	case billingSubWebhookTest:
 		return cmdBillingWebhookTest(args[1:])
 	case billingSubHelp, flagHelpShort, flagHelpLong:
@@ -95,6 +97,8 @@ func printBillingUsage(w io.Writer) {
 		"                      (--watch N  re-poll every 5 s for N seconds; --json  emit JSON)\n"+
 		"  price-catalog       list | sync | reset the Paddle price + product catalog\n"+
 		"  reconcile <id>      run a single-account reconcile via the active billing Provider\n"+
+		"  reconcile-paddle-overage\n"+
+		"                      pre-flight the paddle_overage_dedupe schema for migration 00041\n"+
 		"  webhook-test        signed round-trip POST to a webhook URL (operator-only)\n"+
 		"                      (faas billing webhook-test paddle --url … --secret …)\n"+
 		"\n"+

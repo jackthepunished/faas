@@ -215,6 +215,55 @@ func (s *server) resetPaddleCatalog(w http.ResponseWriter, r *http.Request, acct
 	})
 }
 
+// paddleOveragePreflight handles GET
+// /v1/admin/billing-paddle-overage/preflight (B4 / Tier 1
+// follow-up to PR #802). Probes the paddle_overage_dedupe table
+// for the four migration-00041 columns + per-state row counts
+// and returns the snapshot as JSON. The CLI subcommand
+// `faas billing reconcile-paddle-overage` is the only consumer;
+// it maps each missing column to a clear "apply migration 00041"
+// hint so an operator on a partially-applied DB doesn't see the
+// failure as a generic meterd-loop 42703.
+//
+// The handler is always 200 — there is no error path the
+// operator can fix from the box. A connection-level failure
+// (Postgres down) bubbles up the standard 500 / 504 path. The
+// pre-flight is intentionally cheap (single QueryRow for
+// to_regclass + two SELECTs for columns + counts), so it can be
+// safely called from CI / cron without rate-limiting concerns.
+func (s *server) paddleOveragePreflight(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if allowed, prob := s.adminAllows(acct); !allowed {
+		api.WriteProblem(w, prob)
+		return
+	}
+	if s.store == nil {
+		// Same fail-closed posture as the reconcile handler when
+		// billingProvider is nil: 501 with a stable code, not 500.
+		// Pre-fix boxes that boot apid without a store (e.g. a
+		// stateless admin tooling path) can still hit this route
+		// and learn it's unreachable, rather than panicking.
+		api.WriteProblem(w, api.NewProblem(http.StatusNotImplemented, "billing_unavailable",
+			"State store not initialised",
+			"apid booted without a state store; pre-flight is not reachable"))
+		return
+	}
+	res, err := s.store.PaddleOverageDedupeSchema(r.Context())
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusBadGateway, "billing_preflight_failed",
+			"Schema probe failed", err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, api.BillingPaddleOveragePreflightResponse{
+		TableExists:    res.TableExists,
+		HasWindowStart: res.HasWindowStart,
+		HasState:       res.HasState,
+		HasClaimedAt:   res.HasClaimedAt,
+		HasClaimedBy:   res.HasClaimedBy,
+		PendingRows:    res.PendingRows,
+		CompletedRows:  res.CompletedRows,
+	})
+}
+
 // reconcileAccount handles POST /v1/admin/billing-reconcile/{id}.
 // Loads the account, then calls s.billingProvider.ReconcileUsage.
 // Stripe implements it (ADR-049 §B.1); Paddle returns

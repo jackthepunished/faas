@@ -72,3 +72,31 @@ type BillingCatalogResponse struct {
 	SyncedAt string                `json:"synced_at"`
 	Entries  []BillingCatalogEntry `json:"entries"`
 }
+
+// BillingPaddleOveragePreflightResponse is the wire shape for GET
+// /v1/admin/billing-paddle-overage/preflight. Operator-only;
+// consumed by `faas billing reconcile-paddle-overage`. Mirrors
+// state.PaddleOverageDedupeSchemaResult's booleans but lives
+// here so the JSON wire shape is decoupled from the store's
+// in-process shape — the pre-flight is a CLI concern, not a
+// state.Store concern, even though the probe reuses the
+// store's read path.
+//
+// TableExists is false when no Paddle overage flushes have ever
+// run against this DB (migrations 00034 + 00041 both unapplied).
+// The four HasX columns are the migration-00041 additions;
+// the CLI reports each missing column by name so an operator on
+// a partially-applied DB sees exactly what to fix.
+//
+// PendingRows / CompletedRows are informational (per-state
+// counts) — useful as a dashboard-shape read and a way to see
+// whether the meterd loop has any in-flight claims to reap.
+type BillingPaddleOveragePreflightResponse struct {
+	TableExists    bool  `json:"table_exists"`
+	HasWindowStart bool  `json:"has_window_start"`
+	HasState       bool  `json:"has_state"`
+	HasClaimedAt   bool  `json:"has_claimed_at"`
+	HasClaimedBy   bool  `json:"has_claimed_by"`
+	PendingRows    int64 `json:"pending_rows"`
+	CompletedRows  int64 `json:"completed_rows"`
+}
