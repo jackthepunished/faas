@@ -2418,8 +2418,12 @@ func (e *Engine) RebalanceOrphanedApps(ctx context.Context, deadNodeID string) e
 // single pressured app to a peer schedd's fleet when the
 // owner-of-record is at sustained capacity-refusal pressure.
 // The cheap path (this method) only handles the parked-only
-// case; the policy-gated live-instance migration rides
-// alongside via maybeMigrateLiveInstancesFor.
+// case; the policy-gated live-instance migration hook was
+// removed in the Tier A10 follow-up PR (see the comment at the
+// ReassignAppOwner call site below) — peer-to-peer live
+// migration on the pressure path is a Tier A10.1 follow-up
+// pending a real peer-to-peer migrator (ADR-066's four-phase
+// handoff only supports destination = local schedd).
 //
 // Triggered by the pressure-rebalancer (pkg/sched/pressure_rebalancer.go)
 // on every sweep where the app's sliding-window AtCapacity
@@ -2545,15 +2549,23 @@ func (e *Engine) RebalancePressuredApps(ctx context.Context, appID string) error
 			e.observeOverflowSpill("fallback_used")
 		}
 	}
-	// Policy-gated live-instance migration. The cheap path
-	// (parked-only) runs unconditionally; the expensive path
-	// (live migration via ADR-066) only runs when the policy
-	// opens the live window AND the app has live instances on
-	// the owner. Skip is a no-op for the cheap path — the
-	// cheap path already returns migrated on success.
-	if migrated := e.maybeMigrateLiveInstancesFor(ctx, app, peer); migrated {
-		e.observePressure("peer_live_migrated")
-	}
+	// Live-instance migration hook (Tier A10 follow-up):
+	// previously called e.maybeMigrateLiveInstancesFor here and
+	// bumped observePressure("peer_live_migrated") on success.
+	// That helper always no-op'd because MigrateLiveInstances
+	// self-skips when deadNodeID == e.ownerNodeID (engine.go:2944
+	// in pkg/sched/engine.go), and ADR-066's four-phase handoff
+	// only supports destination = local schedd (active-passive HA,
+	// ADR-083) — peer-to-peer live migration on the pressure path
+	// is a Tier A10.1 follow-up. Until that ships, the pressure
+	// rebalancer's effective policy is `skip_live`: only parked
+	// apps are reassigned; apps with live instances on the owner
+	// stay pinned (the customer's wake fails until the instances
+	// drain). The migration policy knob keeps the closed set
+	// {skip_live, migrate_after_1, migrate_after_2} so a future
+	// PR can wire the policy to a real peer-to-peer migrator
+	// without churn on the API surface.
+	//
 	// Atomic reassign of apps.node_id. RowsAffected==0 (the
 	// peer-claim race) is the only conflict path; the engine
 	// sees ErrConflict and increments the conflict metric.
@@ -2717,55 +2729,6 @@ func (e *Engine) findOverflowPeerWithHeadroom(ctx context.Context, app state.App
 		return "", nil
 	}
 	return n.ID, nil
-}
-
-// maybeMigrateLiveInstancesFor returns true iff the policy gate
-// opened the live-migration window AND a live instance was
-// routed through Engine.MigrateLiveInstances on the owner.
-// skip_live: never migrates live instances.
-// migrate_after_1: migrates on the first sustained sweep.
-// migrate_after_2 (default): migrates only on the second
-// sustained sweep within the window. The consecutive-sweep
-// counter is incremented by the watcher BEFORE the
-// RebalancePressuredApps call, so the policy gate reads the
-// current sweep count.
-func (e *Engine) maybeMigrateLiveInstancesFor(ctx context.Context, app state.App, peer string) bool {
-	policy := e.pressureMigrationPolicy
-	if policy == "" {
-		policy = api.PressureMigrationPolicy
-	}
-	if policy == "skip_live" {
-		return false
-	}
-	sweepCount := e.pressureSweepCounterValue(app.ID)
-	threshold := 2
-	if policy == "migrate_after_1" {
-		threshold = 1
-	}
-	if sweepCount < threshold {
-		return false
-	}
-	// ComputeNodeByID(read-only) is the only pre-flight we
-	// need before delegating to the four-phase handoff. The
-	// handoff itself handles lease dance, snapshot upload,
-	// and the per-instance outcome metric.
-	if _, err := e.store.ComputeNodeByID(ctx, peer); err != nil {
-		e.log.Warn("sched: pressure rebalance: peer lookup failed (live migration skipped)",
-			"app_id", app.ID, "peer", peer, "err", err)
-		return false
-	}
-	// The handoff is ownerNodeID-scoped: the dying node is the
-	// current owner. The new owner is the peer — the handoff
-	// reads/drops state correctly even when the destination is
-	// one of several live peers (the consumer's
-	// active-passive flip is the same path as the dead-node
-	// path).
-	if _, err := e.MigrateLiveInstances(ctx, e.ownerNodeID); err != nil {
-		e.log.Warn("sched: pressure rebalance: live migration failed",
-			"app_id", app.ID, "owner", e.ownerNodeID, "err", err)
-		return false
-	}
-	return true
 }
 
 // pressureSweepCounterValue is the read-only accessor for the
