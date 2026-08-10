@@ -104,13 +104,18 @@ func envOr(key, fallback string) string {
 // and the parsing rules need to live in one place so a unit test
 // for the parsing can pin the truthy set without booting the
 // daemon. Same shape as graceIntervalFromEnv (line 529).
+//
+// The truthy spelling set lives in rekey_runner.go as
+// rekeyTruthyLiterals — name-spaced there so goconst doesn't tie
+// this subsystem to deploy_inputs.go's checkbox literals.
 func rekeyEnabledFromEnv(getenv func(string) string) bool {
-	switch strings.ToLower(strings.TrimSpace(getenv("FAAS_REKEY_ENABLED"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
+	v := strings.ToLower(strings.TrimSpace(getenv(rekeyEnabledEnvVar)))
+	for _, lit := range rekeyTruthyLiterals {
+		if v == lit {
+			return true
+		}
 	}
+	return false
 }
 
 // firstNonEmpty returns the first non-empty string among the

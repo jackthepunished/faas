@@ -68,6 +68,22 @@ const rekeyProgressPathDefault = "/var/lib/faas/rekey-progress.json"
 // operators with non-standard state directories.
 const rekeyProgressEnvVar = "FAAS_REKEY_PROGRESS_FILE"
 
+// rekeyEnabledEnvVar is the opt-in toggle. The constant lives here
+// (next to the file-path env var) so an operator scanning the source
+// for `FAAS_REKEY_*` finds both in one place — same convention as
+// auditHMACKeyEnvVar (cmd/apid/main.go:1153) and sourceSpoolRootEnv
+// (cmd/apid/deploy_inputs.go:34).
+const rekeyEnabledEnvVar = "FAAS_REKEY_ENABLED"
+
+// rekeyTruthyLiterals are the case-insensitive truthy spellings the
+// runner accepts for FAAS_REKEY_ENABLED. Name-spaced (NOT a global
+// `truthyFlagLiterals`) because goconst matches literal text across
+// the whole package, and reusing deploy_inputs.go's literal would
+// tie two unrelated subsystems together — same rationale as the
+// memory note on multi-resource goconst hits. A future "off"/"no"
+// value addition is one line here.
+var rekeyTruthyLiterals = []string{"1", "true", "yes", "on"}
+
 // Runner is the apid-side owner of the rekey background goroutine.
 // Constructed once at boot when FAAS_REKEY_ENABLED=true; nil
 // otherwise. Held on *server so the HTTP handler
@@ -181,8 +197,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		// writeProgress updates lastProg (in-process snapshot for
 		// the HTTP handler) and, when a file path is configured,
 		// atomically renames a fresh JSON file. See the comment
-		// on writeProgress for the failure-mode contract.
-		r.writeProgress(p)
+		// on writeProgress for the failure-mode contract — the
+		// returned error is intentionally swallowed (logged inside
+		// writeProgress itself) because crashing the walk over a
+		// disk hiccup would lose progress; the next batch tick
+		// re-attempts the rename with a fresh snapshot.
+		_ = r.writeProgress(p)
 	})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		r.log.Warn("rekey: walk returned", "err", err)
