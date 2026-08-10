@@ -238,6 +238,121 @@ func Roles() []Role {
 	return all
 }
 
+// RolesForBox returns the subset of Roles() that a box running with
+// `faas_box_role = role` actually needs on disk. Gate-B cross-box mTLS
+// hardening (issue #297 / ADR-025 §Tier 2) — issuing every leaf on every
+// box works (it's the pre-Gate-B posture; pkg/pki.Roles() is still
+// canonical for that shape), but on a multi-box fleet the per-host
+// cert footprint shrinks to what the box actually dials and listens on.
+//
+// The filter is Directory-based; each per-daemon subdirectory under
+// /etc/faas/tls/ is either wholly owned by a single box role or wholly
+// absent on that box. The mapping mirrors the role-to-daemon table in
+// pkg/role/role.go (allowed roles per daemon) and the per-box ansible
+// host_vars (deploy/ansible/host_vars/faas-fsn-{1,2}.yml). Adding a
+// new daemon or a new dial relationship means updating Roles() and
+// possibly one of the per-role sets below; the test
+// TestRolesForBoxIsSubsetOfRoles (pkg/pki/pki_test.go) pins the
+// invariant that every per-role set is a subset of Roles().
+//
+// RoleSingleBox returns Roles() verbatim — the legacy back-compat
+// posture for dev/lima, where one box runs every daemon.
+//
+// Unknown roles return an empty slice (fail-closed — the operator sees
+// "0 leaves written" rather than a silent full-fleet issuance).
+func RolesForBox(role string) []Role {
+	switch role {
+	case "control-plane":
+		return rolesForControlPlane()
+	case "compute-only":
+		return rolesForComputeOnly()
+	case "single-box", "":
+		return Roles()
+	default:
+		return nil
+	}
+}
+
+// rolesForControlPlane returns the leaves fsn-1 (control-plane box)
+// needs. fsn-1 runs apid + schedd + meterd + gatewayd-public + githubd,
+// so it needs:
+//
+//   - server leaves for the five daemons it runs
+//   - the client leaves fsn-1 itself dials: meterd → schedd,
+//     meterd → egress (these live in the meterd/ directory because
+//     the CLIENT-side dir mirrors the dialer's home dir, not the
+//     server's — see pkg/pki.Roles() comment at the egress-client
+//     entry), apid → githubd (lives in apid/)
+//   - the gatewayd-public/leader-server leaf (the LEADER box's
+//     listener side per ADR-084)
+//
+// What fsn-1 does NOT need: the egress/egress server leaf (lives
+// on fsn-2 — gatewayd-internal is the listener) and the
+// gatewayd-internal-public/leader-client leaf (fsn-2's outbound
+// dialer; not fsn-1's). The directory-based filter below is
+// correct because each per-daemon directory either wholly lives on
+// fsn-1 or wholly lives on fsn-2 — there is no mixed ownership
+// because pkg/pki.Roles() puts the client leaf next to the
+// dialer's home dir.
+func rolesForControlPlane() []Role {
+	keep := map[string]bool{
+		// server + client dirs that live on fsn-1:
+		"schedd":          true, // schedd/server + schedd/vmmd-client (dialer)
+		"apid":            true, // apid/advisory + apid/githubd-client (dialer)
+		"meterd":          true, // meterd/server + meterd/{schedd-client,egress-client}
+		"githubd":         true, // githubd/server (apid dials it from this box)
+		"gatewayd-public": true, // leader-server (fsn-1's listener)
+	}
+	return filterRolesByDirectory(keep)
+}
+
+// rolesForComputeOnly returns the leaves fsn-2 (compute-only box)
+// needs. fsn-2 runs vmmd + gatewayd-internal + builderd + imaged, so
+// it needs:
+//
+//   - server leaves for the daemons it runs (vmmd + builderd + imaged)
+//   - the gatewayd/egress server leaf (gatewayd-internal's listener
+//     side per cmd/gatewayd-internal/config.go:87 — leaf path is
+//     /etc/faas/tls/gatewayd/egress.crt)
+//   - the egress/egress server leaf (consumed by gatewayd-internal
+//     on fsn-2; meterd's egress-client mirror on fsn-1 lives in
+//     meterd/, not here)
+//   - the gatewayd-internal-public/leader-client leaf (fsn-2's
+//     standby dialer for ADR-084)
+//   - client leaves this box dials: vmmd → schedd, vmmd → apid
+//     (both live under vmmd/), builderd → vmmd (lives under
+//     builderd/), gatewayd → schedd, gatewayd → vmmd (both live
+//     under gatewayd/)
+//
+// imaged's server leaf (Directory="imaged") is part of the vmmd ↔
+// imaged parent-mount hop (ADR-053 slice-3); it lives on fsn-2.
+func rolesForComputeOnly() []Role {
+	keep := map[string]bool{
+		// server + client dirs that live on fsn-2:
+		"vmmd":                     true, // vmmd/server + vmmd/{schedd-client,apid-client}
+		"builderd":                 true, // builderd/server + builderd/vmmd-client
+		"imaged":                   true, // imaged/server (vmmd↔imaged parent-mount)
+		"gatewayd":                 true, // gatewayd-internal's listener + dialer leaves
+		"egress":                   true, // egress/egress server (gatewayd-internal listener)
+		"gatewayd-internal-public": true, // fsn-2's standby dialer (ADR-084)
+	}
+	return filterRolesByDirectory(keep)
+}
+
+// filterRolesByDirectory returns the subset of Roles() whose Directory
+// is in keep. The map value is unused — Go's map[string]bool is the
+// canonical set type. Centralised so a future filter (e.g. by Kind)
+// reuses the same loop.
+func filterRolesByDirectory(keep map[string]bool) []Role {
+	out := make([]Role, 0, len(keep))
+	for _, r := range Roles() {
+		if keep[r.Directory] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // LeafPaths returns the absolute cert + key paths for role, rooted at
 // rootDir (typically DefaultRootDir). The cert is named "<Filename>.crt"
 // and the key is "<Filename>.key" inside
