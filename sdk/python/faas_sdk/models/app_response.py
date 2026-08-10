@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar, cast
+from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -96,6 +97,10 @@ class AppResponse:
     """Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The
     reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why
     is my app evicted_cold?' without grepping the audit log."""
+    overflow_node: None | Unset | UUID = UNSET
+    """Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from
+    the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps
+    before the A9 fallback; falls through to A9 when the target is inactive or full."""
     public_auth: PublicAuthStatus | Unset = UNSET
     """Read-only per-app public-URL auth shape on AppResponse (issue #477 / ADR-077). Mirrors the row contents
     without the plaintext credentials. The redaction posture is a load-bearing invariant — see ADR-077 §Decision
@@ -196,6 +201,14 @@ class AppResponse:
         else:
             parked_deployment = self.parked_deployment
 
+        overflow_node: None | str | Unset
+        if isinstance(self.overflow_node, Unset):
+            overflow_node = UNSET
+        elif isinstance(self.overflow_node, UUID):
+            overflow_node = str(self.overflow_node)
+        else:
+            overflow_node = self.overflow_node
+
         public_auth: dict[str, Any] | Unset = UNSET
         if not isinstance(self.public_auth, Unset):
             public_auth = self.public_auth.to_dict()
@@ -256,6 +269,8 @@ class AppResponse:
             field_dict["require_authn"] = require_authn
         if parked_deployment is not UNSET:
             field_dict["parked_deployment"] = parked_deployment
+        if overflow_node is not UNSET:
+            field_dict["overflow_node"] = overflow_node
         if public_auth is not UNSET:
             field_dict["public_auth"] = public_auth
         if auth_default_flipped_at is not UNSET:
@@ -402,6 +417,23 @@ class AppResponse:
 
         parked_deployment = _parse_parked_deployment(d.pop("parked_deployment", UNSET))
 
+        def _parse_overflow_node(data: object) -> None | Unset | UUID:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                overflow_node_type_0 = UUID(data)
+
+                return overflow_node_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | Unset | UUID, data)
+
+        overflow_node = _parse_overflow_node(d.pop("overflow_node", UNSET))
+
         _public_auth = d.pop("public_auth", UNSET)
         public_auth: PublicAuthStatus | Unset
         if isinstance(_public_auth, Unset):
@@ -454,6 +486,7 @@ class AppResponse:
             eviction_priority=eviction_priority,
             require_authn=require_authn,
             parked_deployment=parked_deployment,
+            overflow_node=overflow_node,
             public_auth=public_auth,
             auth_default_flipped_at=auth_default_flipped_at,
         )

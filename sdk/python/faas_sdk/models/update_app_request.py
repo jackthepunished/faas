@@ -84,6 +84,11 @@ class UpdateAppRequest:
     """Per-app public-URL auth configuration (issue #477 / ADR-077). Omitted → no change. When present, mode is the
     closed enum {open, bearer, basic}; basic_user + basic_pass are required when mode='basic' and the apid seal step
     encrypts them under the APP_BASIC_AUTH secretbox namespace before persistence."""
+    overflow_node: None | str | Unset = UNSET
+    """Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the
+    human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty
+    string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist
+    the UUID. 404 on unknown name; 422 on inactive node."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -200,6 +205,12 @@ class UpdateAppRequest:
         else:
             public_auth = self.public_auth
 
+        overflow_node: None | str | Unset
+        if isinstance(self.overflow_node, Unset):
+            overflow_node = UNSET
+        else:
+            overflow_node = self.overflow_node
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -237,6 +248,8 @@ class UpdateAppRequest:
             field_dict["require_authn"] = require_authn
         if public_auth is not UNSET:
             field_dict["public_auth"] = public_auth
+        if overflow_node is not UNSET:
+            field_dict["overflow_node"] = overflow_node
 
         return field_dict
 
@@ -448,6 +461,15 @@ class UpdateAppRequest:
 
         public_auth = _parse_public_auth(d.pop("public_auth", UNSET))
 
+        def _parse_overflow_node(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        overflow_node = _parse_overflow_node(d.pop("overflow_node", UNSET))
+
         update_app_request = cls(
             ram_mb=ram_mb,
             idle_timeout_s=idle_timeout_s,
@@ -466,6 +488,7 @@ class UpdateAppRequest:
             eviction_priority=eviction_priority,
             require_authn=require_authn,
             public_auth=public_auth,
+            overflow_node=overflow_node,
         )
 
         update_app_request.additional_properties = d

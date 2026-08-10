@@ -1,10 +1,11 @@
 from typing import Literal
 
-InvocationState = Literal["cancelled", "completed", "dispatching", "failed", "pending"]
+InvocationState = Literal["cancelled", "completed", "dead_letter", "dispatching", "failed", "pending"]
 
 INVOCATION_STATE_VALUES: set[InvocationState] = {
     "cancelled",
     "completed",
+    "dead_letter",
     "dispatching",
     "failed",
     "pending",

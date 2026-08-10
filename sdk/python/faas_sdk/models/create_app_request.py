@@ -48,6 +48,10 @@ class CreateAppRequest:
     """Per-app eviction tier (issue #475). 'best_effort' (default) keeps the pre-#475 LRU-by-last_request_at reaper
     behaviour; 'reserved' protects the app from cross-account RAM-pressure eviction. Omitted at create-time → apid
     applies the schema default 'best_effort'."""
+    overflow_node: str | Unset = UNSET
+    """Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is
+    compute_nodes.name (resolved server-side). Omitted → no preference; empty string at create-time is rejected with
+    422 invalid_overflow_node because the column starts NULL and there is no 'clear' path at create-time."""
     require_authn: bool | Unset = UNSET
     """Per-deployment token-gate flag (issue #560). Omitted at create-time → apid applies the plan default (false).
     Pro/Scale only."""
@@ -84,6 +88,8 @@ class CreateAppRequest:
         if not isinstance(self.eviction_priority, Unset):
             eviction_priority = self.eviction_priority
 
+        overflow_node = self.overflow_node
+
         require_authn = self.require_authn
 
         field_dict: dict[str, Any] = {}
@@ -115,6 +121,8 @@ class CreateAppRequest:
             field_dict["warm_snapshot_min_ms"] = warm_snapshot_min_ms
         if eviction_priority is not UNSET:
             field_dict["eviction_priority"] = eviction_priority
+        if overflow_node is not UNSET:
+            field_dict["overflow_node"] = overflow_node
         if require_authn is not UNSET:
             field_dict["require_authn"] = require_authn
 
@@ -162,6 +170,8 @@ class CreateAppRequest:
         else:
             eviction_priority = check_create_app_request_eviction_priority(_eviction_priority)
 
+        overflow_node = d.pop("overflow_node", UNSET)
+
         require_authn = d.pop("require_authn", UNSET)
 
         create_app_request = cls(
@@ -177,6 +187,7 @@ class CreateAppRequest:
             warm_snapshot_min_requests=warm_snapshot_min_requests,
             warm_snapshot_min_ms=warm_snapshot_min_ms,
             eviction_priority=eviction_priority,
+            overflow_node=overflow_node,
             require_authn=require_authn,
         )
 

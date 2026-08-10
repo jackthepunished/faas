@@ -59,7 +59,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[BillingPortalResponse | Problem]:
-    """Get the operator-configured Stripe billing portal URL.
+    """Get the operator-configured billing portal URL (and the card-on-file summary).
 
      Returns the URL the customer should be sent to in order to
     manage their subscription (update card, view invoices,
@@ -68,6 +68,12 @@ def sync_detailed(
     does NOT call Stripe's `BillingPortal.Session` SDK on this
     path (issue #253 acceptance #3 partial — a follow-up PR will
     add the SDK call once the spec defines the contract).
+
+    The response also carries a `payment_method` block (issue
+    #242) — the card-on-file summary (brand, last-4, expiry).
+    The CLI's `faas billing payment-method` renders from this
+    field; the dashboard's billing page does the same. The
+    field is omitempty so no-card-on-file responses stay clean.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -90,7 +96,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> BillingPortalResponse | Problem | None:
-    """Get the operator-configured Stripe billing portal URL.
+    """Get the operator-configured billing portal URL (and the card-on-file summary).
 
      Returns the URL the customer should be sent to in order to
     manage their subscription (update card, view invoices,
@@ -99,6 +105,12 @@ def sync(
     does NOT call Stripe's `BillingPortal.Session` SDK on this
     path (issue #253 acceptance #3 partial — a follow-up PR will
     add the SDK call once the spec defines the contract).
+
+    The response also carries a `payment_method` block (issue
+    #242) — the card-on-file summary (brand, last-4, expiry).
+    The CLI's `faas billing payment-method` renders from this
+    field; the dashboard's billing page does the same. The
+    field is omitempty so no-card-on-file responses stay clean.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -117,7 +129,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[BillingPortalResponse | Problem]:
-    """Get the operator-configured Stripe billing portal URL.
+    """Get the operator-configured billing portal URL (and the card-on-file summary).
 
      Returns the URL the customer should be sent to in order to
     manage their subscription (update card, view invoices,
@@ -126,6 +138,12 @@ async def asyncio_detailed(
     does NOT call Stripe's `BillingPortal.Session` SDK on this
     path (issue #253 acceptance #3 partial — a follow-up PR will
     add the SDK call once the spec defines the contract).
+
+    The response also carries a `payment_method` block (issue
+    #242) — the card-on-file summary (brand, last-4, expiry).
+    The CLI's `faas billing payment-method` renders from this
+    field; the dashboard's billing page does the same. The
+    field is omitempty so no-card-on-file responses stay clean.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -146,7 +164,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> BillingPortalResponse | Problem | None:
-    """Get the operator-configured Stripe billing portal URL.
+    """Get the operator-configured billing portal URL (and the card-on-file summary).
 
      Returns the URL the customer should be sent to in order to
     manage their subscription (update card, view invoices,
@@ -155,6 +173,12 @@ async def asyncio(
     does NOT call Stripe's `BillingPortal.Session` SDK on this
     path (issue #253 acceptance #3 partial — a follow-up PR will
     add the SDK call once the spec defines the contract).
+
+    The response also carries a `payment_method` block (issue
+    #242) — the card-on-file summary (brand, last-4, expiry).
+    The CLI's `faas billing payment-method` renders from this
+    field; the dashboard's billing page does the same. The
+    field is omitempty so no-card-on-file responses stay clean.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
