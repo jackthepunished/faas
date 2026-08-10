@@ -146,11 +146,33 @@ func (s *server) setSecret(w http.ResponseWriter, r *http.Request, acct state.Ac
 // setSecret. Pulled out so the handler itself reads as a sequence of
 // guards, each calling a single check. Returns nil on success or a
 // ready-to-write *api.Problem on failure.
+//
+// ADR-089 PR-A added app_secrets.kid; PR-C discovered that the PUT
+// path was leaving kid = NULL because it called UpsertAppSecret
+// (no-kid) instead of UpsertAppSecretWithKid. The rotate handler
+// reads kid back via GetAppSecret, and pgx v5 cannot scan NULL
+// into a Go string — so a row written by the PUT path 500s the
+// rotate handler. This helper now stamps kid alongside ciphertext
+// so the PUT path is self-consistent with the rotate path and
+// pkg/rekey.Replayer can reseal rows without first unsealing NULL.
+//
+// The kid is computed from mfaIdentities()[0] (the current host
+// identity). If identities are not loaded we refuse to seal (same
+// posture as the rotate handler — a typo'd env var shouldn't
+// silently degrade to "no kid, no problem").
 func (s *server) sealAndPersist(c stdctx, acct state.Account, app state.App, key, value string, limits api.Limits) *api.Problem {
 	recipient := setSecretRecipient()
 	if recipient == nil {
 		// Apid started without a host.age.pub; refuse to accept plaintext.
 		return api.ErrCapacity("host age recipient not loaded — refusing to seal")
+	}
+	idents := mfaIdentities()
+	if len(idents) == 0 {
+		return api.ErrCapacity("host age identities not loaded — refusing to seal")
+	}
+	kid, err := secretbox.IdentityFingerprint(idents)
+	if err != nil {
+		return api.ErrCapacity("could not resolve kid: " + err.Error())
 	}
 	ciphertext, err := secretbox.SealOne(recipient, key, value, limits.SecretValueMaxBytes)
 	if err != nil {
@@ -160,7 +182,7 @@ func (s *server) sealAndPersist(c stdctx, acct state.Account, app state.App, key
 		}
 		return api.ErrCapacity("could not seal secret")
 	}
-	if err := s.store.UpsertAppSecret(c, acct.ID, app.ID, key, ciphertext); err != nil {
+	if err := s.store.UpsertAppSecretWithKid(c, acct.ID, app.ID, key, kid, ciphertext); err != nil {
 		return api.ErrCapacity("could not persist secret")
 	}
 	return nil

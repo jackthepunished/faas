@@ -10012,7 +10012,7 @@ func (s *PgStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, 
 func (s *PgStore) GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error) {
 	var out AppSecret
 	err := s.pool.QueryRow(ctx,
-		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		`select account_id, app_id, key, ciphertext, COALESCE(kid, ''), created_at, updated_at
 		 from app_secrets
 		 where account_id = $1 and app_id = $2 and key = $3`,
 		accountID, appID, key).Scan(
