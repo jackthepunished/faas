@@ -321,10 +321,11 @@ var methodRouteMap = map[string]string{
 	// ReconcileAccount) so the explicit map drops the path-separator
 	// noise and keeps the SDK surface cohesive with the CLI
 	// (`faas billing status|price-catalog ...`).
-	"GET /v1/admin/billing-paddle-catalog":       "ListPaddleCatalog",
-	"DELETE /v1/admin/billing-paddle-catalog":    "ResetPaddleCatalog",
-	"POST /v1/admin/billing-paddle-catalog/sync": "SyncPaddleCatalog",
-	"POST /v1/admin/billing-reconcile/{id}":      "ReconcileAccount",
+	"GET /v1/admin/billing-paddle-catalog":           "ListPaddleCatalog",
+	"DELETE /v1/admin/billing-paddle-catalog":        "ResetPaddleCatalog",
+	"POST /v1/admin/billing-paddle-catalog/sync":     "SyncPaddleCatalog",
+	"POST /v1/admin/billing-reconcile/{id}":          "ReconcileAccount",
+	"GET /v1/admin/billing-paddle-overage/preflight": "GetBillingPaddleOveragePreflight",
 
 	// ADR-089 PR-C — background re-seal progress. The auto-derivation
 	// would produce "GetAdminSecretsRekey-progress" (the dash survives

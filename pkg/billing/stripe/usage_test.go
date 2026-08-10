@@ -82,7 +82,7 @@ func TestPushUsageRecord_DedupeGateSkipsSecondCall(t *testing.T) {
 //
 // Asserts the SDK returned a usage record with a non-empty ID prefixed
 // "mbur_" (Stripe's usage-record prefix). On CI this runs under
-// .github/workflows/sandbox.yml (workflow_dispatch only); see PR #59.
+// .github/workflows/stripex-sandbox.yml (workflow_dispatch only); see PR #59.
 func TestPushUsageRecord_PostsToStripeSandbox(t *testing.T) {
 	key := os.Getenv("STRIPE_API_KEY")
 	sub := os.Getenv("FATEST_STRIPE_SUB_ITEM")

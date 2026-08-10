@@ -2292,12 +2292,13 @@ func (c *Client) GetMyOrg(ctx context.Context) (OrgMeResponse, error) {
 
 // --- PR-P3 admin billing surface -------------------------------------------
 //
-// Four methods backing the operator-facing CLI subcommands:
+// Five methods backing the operator-facing CLI subcommands:
 //
-//	ListPaddleCatalog  — GET    /v1/admin/billing-paddle-catalog
-//	SyncPaddleCatalog  — POST   /v1/admin/billing-paddle-catalog/sync
-//	ResetPaddleCatalog — DELETE /v1/admin/billing-paddle-catalog
-//	ReconcileAccount   — POST   /v1/admin/billing-reconcile/{id}
+//	ListPaddleCatalog                 — GET    /v1/admin/billing-paddle-catalog
+//	SyncPaddleCatalog                 — POST   /v1/admin/billing-paddle-catalog/sync
+//	ResetPaddleCatalog                — DELETE /v1/admin/billing-paddle-catalog
+//	ReconcileAccount                  — POST   /v1/admin/billing-reconcile/{id}
+//	GetBillingPaddleOveragePreflight  — GET    /v1/admin/billing-paddle-overage/preflight (B4 / Tier 1)
 //
 // Auth: admin-scoped API key + email in FAAS_ADMIN_EMAILS allowlist.
 // The handlers return 501 with code billing_op_unsupported when the
@@ -2352,6 +2353,18 @@ func (c *Client) ResetPaddleCatalog(ctx context.Context) (BillingCatalogResponse
 func (c *Client) ReconcileAccount(ctx context.Context, accountID string) (BillingReconcileResponse, error) {
 	var out BillingReconcileResponse
 	return out, c.do(ctx, "POST", "/v1/admin/billing-reconcile/"+accountID, nil, &out)
+}
+
+// GetBillingPaddleOveragePreflight runs the B4 pre-flight probe
+// against the paddle_overage_dedupe table. Returns 200 +
+// BillingPaddleOveragePreflightResponse on success; the handler
+// is admin-only and the JSON shape always includes the four
+// HasX bools + the per-state row counts so the CLI can render
+// either a green-light or a "missing column X" hint without a
+// second round-trip.
+func (c *Client) GetBillingPaddleOveragePreflight(ctx context.Context) (BillingPaddleOveragePreflightResponse, error) {
+	var out BillingPaddleOveragePreflightResponse
+	return out, c.do(ctx, "GET", "/v1/admin/billing-paddle-overage/preflight", nil, &out)
 }
 
 // --- ADR-089 PR-C rekey progress -------------------------------------------

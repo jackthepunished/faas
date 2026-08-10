@@ -4,6 +4,7 @@
 /* eslint-disable */
 import type { AccountCreditResponse } from '../models/AccountCreditResponse.js';
 import type { BillingCatalogResponse } from '../models/BillingCatalogResponse.js';
+import type { BillingPaddleOveragePreflightResponse } from '../models/BillingPaddleOveragePreflightResponse.js';
 import type { BillingReconcileResponse } from '../models/BillingReconcileResponse.js';
 import type { ConsumeInvoiceResponse } from '../models/ConsumeInvoiceResponse.js';
 import type { RekeyProgress } from '../models/RekeyProgress.js';
@@ -165,6 +166,39 @@ export class AdminService {
         `,
         501: `code: billing_op_unsupported — active provider does not advertise paddle.OpProvider; the type assertion at the dispatcher fails.`,
         502: `code: billing_sync_failed — Paddle SDK round-trip failed.`,
+      },
+    });
+  }
+  /**
+   * Read the paddle_overage_dedupe schema probe (admin-only).
+   * Operator-side guard for the Paddle overage pusher's
+   * per-window claim state machine (migration 00041). Returns
+   * which of the four new columns are present + the per-state
+   * row counts so an operator can verify the meterd loop will
+   * not crash on a 42703 (column missing) error before any
+   * customer-facing push is attempted.
+   *
+   * Returned by the B4 pre-flight CLI subcommand. A response
+   * with table_exists=true and any of has_window_start /
+   * has_state / has_claimed_at / has_claimed_by=false means
+   * migration 00041 was not (fully) applied. A response with
+   * table_exists=false means migrations 00034 + 00041 are
+   * both unapplied (the table has never been created).
+   *
+   * @returns BillingPaddleOveragePreflightResponse Schema probe result. Booleans reflect the current DB shape.
+   * @throws ApiError
+   */
+  public static getBillingPaddleOveragePreflight(): CancelablePromise<BillingPaddleOveragePreflightResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/admin/billing-paddle-overage/preflight',
+      errors: {
+        401: `code: unauthorized`,
+        403: `code: admin_required — GET /v1/admin/billing-paddle-overage/preflight requires a Bearer with the admin scope AND an email in FAAS_ADMIN_EMAILS.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
       },
     });
   }

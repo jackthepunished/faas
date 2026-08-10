@@ -7227,6 +7227,49 @@ func (m *MemStore) RecordPaddleOverageMonth(_ context.Context, accountID string,
 	return nil
 }
 
+// PaddleOverageDedupeSchema reports the in-memory mirror of the
+// paddle_overage_dedupe table. Mirrors the pgstore probe but does
+// not query information_schema — the memstore can't lie about
+// schema, only about contents. We report TableExists=true iff
+// paddleOverageWindows is non-empty (an init memstore has
+// nothing); on a fresh memstore this returns the "table missing"
+// surface the pre-flight maps to the 00034-then-00041 hint.
+//
+// Notably the probe ignores paddleOverageMonths: that map is
+// populated by the legacy monthly dedupe path (RecordPaddleOverageMonth),
+// which is *not* what the B4 pre-flight is guarding. The pre-flight
+// exists to certify the per-window pusher (ClaimPaddleOverageWindow /
+// CompletePaddleOverageWindow) is wired to a table that has the
+// 00041 columns. Months-only rows in a memstore would mean the
+// window pusher has never been exercised — emitting a green "table
+// exists, columns=ok" for that path would lie to the operator.
+//
+// The Has* flags are hardcoded to true once paddleOverageWindows has
+// any rows — the in-process map tracks all four columns by
+// construction, so any memstore that has window rows "has" the
+// 00041 shape. This matches production semantics: a memstore
+// without those columns cannot exist by definition.
+func (m *MemStore) PaddleOverageDedupeSchema(_ context.Context) (PaddleOverageDedupeSchemaResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out PaddleOverageDedupeSchemaResult
+	if len(m.paddleOverageWindows) > 0 {
+		out.TableExists = true
+		out.HasWindowStart = true
+		out.HasState = true
+		out.HasClaimedAt = true
+		out.HasClaimedBy = true
+	}
+	for _, r := range m.paddleOverageWindows {
+		if r.completed {
+			out.CompletedRows++
+		} else {
+			out.PendingRows++
+		}
+	}
+	return out, nil
+}
+
 // CheckWebhookReplay returns true when (provider, delivery_id) has a
 // dedupe row whose received_at >= cutoff. The MemStore drops
 // expired rows inline at read time (PgStore has the apid sweep
