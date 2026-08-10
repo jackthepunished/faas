@@ -1,8 +1,8 @@
 name: stripex sandbox
 
-# Manual-only acceptance job for the Stripe sandbox live POST (issue #52,
-# §14 M7 acceptance). Runs pkg/stripex's sandbox tests against a real
-# sk_test_… key and a sandbox subscription_item:
+# Manual-only acceptance job for the Stripe sandbox live POST
+# (issue #52, §14 M7 acceptance). Runs pkg/stripex's sandbox tests
+# against a real sk_test_… key and a sandbox subscription_item:
 #
 #   - TestPushUsageRecord_PostsToStripeSandbox asserts record.ID is
 #     non-empty and prefixed "mbur_" (Stripe's usage-record prefix).
@@ -17,7 +17,11 @@ name: stripex sandbox
 #
 # Triggered by 'Run workflow' from the Actions UI. NOT a PR gate —
 # Stripe availability must not block merges. Mirrors the
-# workflow_dispatch gating the existing metal job uses.
+# workflow_dispatch gating the existing metal job uses. The
+# filename was sandbox.yml until the Tier 1 billing cleanup (PR
+# release/billing-tier1-preflight-and-sandbox-rename) renamed it
+# to match the workflow's logical scope and to make the eventual
+# paddle-sandbox.yml layer obvious.
 #
 # Required repo secrets:
 #   - STRIPE_API_KEY        (sk_test_… key from Stripe dashboard)
