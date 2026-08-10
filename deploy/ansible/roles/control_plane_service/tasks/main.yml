@@ -1,8 +1,12 @@
-# control_plane_service — install systemd units + example TOMLs for apid,
-# schedd, imaged, and meterd (spec §4.1, §4.3, §4.6, §4.7). All four
-# daemons are non-root and share the same /etc/faas directory +
-# sealed.env EnvironmentFile pattern (gap G2 — secrets sealed at rest,
-# decrypted only at boot by systemd).
+# control_plane_service — install systemd units + example TOMLs for the
+# control-plane daemons that live on fsn-1 (spec §4.1, §4.3, §4.7):
+# apid, schedd, meterd. imaged moved to the new compute_only_service role
+# (Gate-B cross-box mTLS hardening, issue #297 / ADR-025 §Tier 2) so the
+# imaged runtime dirs + the cosign sign-keypair tripwires travel with it.
+#
+# All three remaining daemons are non-root and share the same /etc/faas
+# directory + sealed.env EnvironmentFile pattern (gap G2 — secrets sealed
+# at rest, decrypted only at boot by systemd).
 #
 # Like vmmd_service, this role does NOT enable or start the daemons: the
 # operator does that once the binaries are deployed and the sealed.env file
@@ -10,6 +14,15 @@
 #
 # Idempotency: each copy uses `mode:` to keep state predictable; `daemon_reload`
 # fires only when the unit file actually changed.
+#
+# Cross-cutting tripwires that live here (not in compute_only_service):
+#   - session.key (apid reads it via LoadCredential)
+#   - host.age + host.age.previous (apid + githubd on fsn-1)
+#   - archive-creds.json + apid log-archive drop-in (issue #562)
+#   - trusted-publishers/ (apid writes per-publisher PEMs)
+#   - /etc/faas/tls/ca/ + per-daemon leaves (Tier 1)
+# imaged's tripwires (sign.key, sign-pub.pem, imaged's ReadWritePaths=,
+# /srv/fc/snap, /srv/fc/sigs) are now in compute_only_service.
 
 - name: control_plane_service — ensure per-daemon users exist (non-root, no shell)
   ansible.builtin.user:
@@ -21,7 +34,6 @@
   loop:
     - faas-apid
     - faas-schedd
-    - faas-imaged
     - faas-meterd
 
 - name: control_plane_service — drop example TOMLs (operator copies to *.toml)
@@ -34,7 +46,6 @@
   loop:
     - { src: "apid.toml.example",    dest: "/etc/faas/apid.toml.example" }
     - { src: "schedd.toml.example",  dest: "/etc/faas/schedd.toml.example" }
-    - { src: "imaged.toml.example",  dest: "/etc/faas/imaged.toml.example" }
     - { src: "meterd.toml.example",  dest: "/etc/faas/meterd.toml.example" }
 
 - name: control_plane_service — install systemd units
@@ -47,7 +58,6 @@
   loop:
     - { src: "faas-apid.service",    dest: "/etc/systemd/system/faas-apid.service" }
     - { src: "faas-schedd.service",  dest: "/etc/systemd/system/faas-schedd.service" }
-    - { src: "faas-imaged.service",  dest: "/etc/systemd/system/faas-imaged.service" }
     - { src: "faas-meterd.service",  dest: "/etc/systemd/system/faas-meterd.service" }
   register: cp_units
 
@@ -88,7 +98,7 @@
     daemon_reload: true
   when: cp_units.changed
 
-- name: control_plane_service — create runtime dirs (logs, spool, snapshots)
+- name: control_plane_service — create runtime dirs (logs, spool, statuspage)
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
@@ -98,13 +108,10 @@
   loop:
     - { path: "/var/log/faas",   user: "faas-apid" }
     - { path: "/var/spool/faas", user: "faas-apid" }
-    - { path: "/srv/fc/snap",    user: "faas-imaged" }
-    # ADR-038 build attestations. Must exist before faas-imaged starts:
-    # a ReadWritePaths= target that does not exist makes systemd fail the
-    # mount-namespace setup, so creating the dir and listing it in the unit
-    # are a pair. /srv/fc/base is created by the firecracker role.
-    - { path: "/srv/fc/sigs",    user: "faas-imaged" }
     - { path: "/etc/faas/statuspage", user: "faas-apid" }
+  # imaged-owned dirs (/srv/fc/snap, /srv/fc/sigs) moved to
+  # compute_only_service — those travel with the imaged unit and its
+  # ReadWritePaths= assert so the tripwire pair stays in one role.
 
 # Status page HTML (spec §12, M8 acceptance). apid reads this file at
 # /status; without it the handler returns the embedded "source
@@ -123,12 +130,14 @@
   ansible.builtin.debug:
     msg: >-
       cp daemons installed but NOT enabled. Operator runs:
-        systemctl enable --now faas-apid faas-schedd faas-imaged faas-meterd
+        systemctl enable --now faas-apid faas-schedd faas-meterd
       once /etc/faas/sealed.env has DATABASE_URL (and STRIPE_API_KEY plus
       FAAS_SCHEDD_ADDR=/run/faas/schedd.sock for meterd — meterd refuses to
       start without FAAS_SCHEDD_ADDR per issue #52's strict-exit rule) and
       the binaries are installed at
-      /opt/faas/bin/{apid,schedd,imaged,meterd}.
+      /opt/faas/bin/{apid,schedd,meterd}.
+      imaged is no longer installed by this role — see
+      compute_only_service (Gate-B, issue #297 / ADR-025 §Tier 2).
 
 # Security review A4: scope FAAS_SESSION_KEY to apid via systemd
 # LoadCredential. The role does NOT create the secret file — the
@@ -259,42 +268,6 @@
     mode: "0644"
   register: faas_log_archive_dropin
 
-# Tier 3 / ADR-038 §Phase 3 — cosign sign-keypair (build attestation).
-# imaged reads /etc/faas/secrets/sign.key at startup
-# (cmd/imaged/main.go:103-109 fail-loud os.Stat). The file MUST be
-# 0440 root:faas because faas-imaged runs as User=faas-imaged
-# Group=faas (deploy/systemd/faas-imaged.service) and reads the
-# key via group access; 0400 root:root would be unreadable to a
-# non-root daemon. schedd reads the public side (sign-pub.pem,
-# 0444 root:root) — world-readable is intentional, the public key
-# is non-secret (ADR-038 §Consequences Compatibility). The Go-side
-# loader (pkg/cosign/keys.go:50-61) accepts both 0400 and 0440 for
-# the private side; the canonical DigitalOcean install is 0440
-# root:faas. Mirrors the host.age / session.key fail-loud shape:
-# the role fails the playbook BEFORE systemd daemon-reload so a
-# drift on a fresh box never reaches production.
-- name: control_plane_service — assert sign.key mode is 0440 root:faas (Tier 3)
-  ansible.builtin.stat:
-    path: /etc/faas/secrets/sign.key
-  register: faas_sign_key_stat
-  failed_when:
-    - >-
-      not faas_sign_key_stat.stat.exists
-      or faas_sign_key_stat.stat.mode != "0440"
-      or faas_sign_key_stat.stat.pw_name != "root"
-      or faas_sign_key_stat.stat.gr_name != "faas"
-
-- name: control_plane_service — assert sign-pub.pem mode is 0444 root:root (Tier 3)
-  ansible.builtin.stat:
-    path: /etc/faas/secrets/sign-pub.pem
-  register: faas_sign_pub_stat
-  failed_when:
-    - >-
-      not faas_sign_pub_stat.stat.exists
-      or faas_sign_pub_stat.stat.mode != "0444"
-      or faas_sign_pub_stat.stat.pw_name != "root"
-      or faas_sign_pub_stat.stat.gr_name != "root"
-
 # Issue #472 / ADR-058 — per-app cosign trusted-publisher directory.
 # imaged reads /etc/faas/secrets/trusted-publishers/ at startup and
 # on every pg_notify('trusted_signer_changed'). The dir is created
@@ -374,40 +347,12 @@
   register: faas_pki_leaf_stat
   failed_when: not faas_pki_leaf_stat.stat.exists
 
-# Spec §11 — ProtectSystem=strict: every ReadWritePaths= target
-# MUST exist and be writable by the unit's User= before systemd
-# activates the unit, or the mount-namespace setup fails and the
-# daemon enters a crash-loop. The 2026-07-31 cd-controlplane
-# failure on the EX44 exposed a related but distinct gap: a
-# Process could not create a temp file at the root of a whitelisted
-# prefix (e.g. /srv/fc/runner-builder-amd64.ext4.tmp.*) because
-# only the subdirectories were whitelisted, not /srv/fc/ itself.
-# That code-level fix lives in pkg/storage/local.go::Put; this
-# assert is the deployment-side belt-and-braces — it pins every
-# ReadWritePaths= path to the same list as the unit, so a future
-# tighten of the unit that omits a dir the role doesn't create
-# fails the playbook rather than crash-looping the daemon on
-# the box.
-#
-# The list is read from the unit file (not hardcoded) so a unit
-# edit does not silently drift from the role's mkdir list.
-- name: control_plane_service — assert imaged ReadWritePaths= targets exist (spec §11)
-  ansible.builtin.stat:
-    path: "{{ item }}"
-  loop: "{{ faas_imaged_rwp_paths }}"
-  vars:
-    # Parse the unit file's ReadWritePaths= line into a list. The
-    # value lives in faas-imaged.service (deploy/ansible/.../files)
-    # as a single space-separated line; split + filter empty.
-    faas_imaged_rwp_raw: >-
-      {{ lookup('file', role_path + '/files/faas-imaged.service')
-         | regex_search('ReadWritePaths=([^\n]+)', '\\1')
-         | first }}
-    faas_imaged_rwp_paths: "{{ faas_imaged_rwp_raw.split() }}"
-  register: faas_imaged_rwp_stat
-  failed_when: not faas_imaged_rwp_stat.stat.exists
-  loop_control:
-    label: "{{ item }}"
+# Spec §11 — ProtectSystem=strict ReadWritePaths= assert moved to
+# compute_only_service (Gate-B). imaged now lives on fsn-2; the
+# tripwire travels with the daemon it protects so the role's mkdir
+# list + the unit's ReadWritePaths= stay in one place.
+# (Original block referenced faas-imaged.service; see the matching
+# task in compute_only_service/tasks/main.yml.)
 
 # PR-P4 — soft assert on Paddle provider secrets (operator warning).
 # When FAAS_BILLING_PROVIDER=paddle is in /etc/faas/sealed.env, the

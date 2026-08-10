@@ -159,6 +159,12 @@ jobs:
           cd deploy/ansible
           ansible-galaxy collection install -r requirements.yml
           ansible-playbook --syntax-check site.yml
+          # Gate-B PR-2: also syntax-check the new per-box bootstrap
+          # playbook so the three plays (control_plane, compute_nodes,
+          # box) parse before any operator can `make bootstrap-control-plane`
+          # against a half-baked inventory. site.yml stays as the legacy
+          # single-box shape pinned for the existing daemons.
+          ansible-playbook --syntax-check bootstrap.yml
 
       # Daemon smoke: every cmd/<daemon>/main.go is a one-box binary that wires
       # through pkg/wire.Daemon. `--help` must exit 0 with non-empty usage text

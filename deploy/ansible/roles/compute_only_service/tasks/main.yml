@@ -1,0 +1,177 @@
+# compute_only_service — install systemd unit + example TOML for
+# imaged, plus the imaged-specific secret/PKI tripwires (Gate-B,
+# issue #297 / ADR-025 §Tier 2).
+#
+# This role is the single source of truth for the fsn-2 (compute-only)
+# imaged install. vmmd + gatewayd-internal + builderd each have their
+# own role (vmmd_service, gatewayd_internal_service, builderd is out of
+# scope today — see docs/runbooks/gate-b.md PR-4); imaged's tripwires
+# travel with the imaged unit so a future unit edit that drops a
+# ReadWritePaths= target fails the playbook on the box the daemon
+# actually runs on, rather than firing a false positive on fsn-1.
+#
+# The role does NOT enable or start imaged: the operator does that
+# once /srv/fc/base is populated (firecracker role) and the binary
+# is at /opt/faas/bin/imaged. Idempotency: each copy uses `mode:` and
+# the user-create is `state: present` no-op when the uid exists.
+
+- name: compute_only_service — assert role is invoked on a compute-only box (Gate-B)
+  ansible.builtin.assert:
+    that:
+      - faas_box_role in ['compute-only', 'single-box']
+    fail_msg: >-
+      compute_only_service was invoked on a {{ faas_box_role | default('unset') }}
+      box. This role is for fsn-2 only — control-plane boxes run
+      control_plane_service instead. The per-box role dispatch is in
+      deploy/ansible/bootstrap.yml; verify host_vars/faas-fsn-N.yml
+      sets faas_box_role correctly for this host.
+
+- name: compute_only_service — ensure faas-imaged user exists (non-root, no shell)
+  ansible.builtin.user:
+    name: faas-imaged
+    group: faas
+    shell: /usr/sbin/nologin
+    system: true
+    create_home: false
+
+- name: compute_only_service — drop example TOML (operator copies to imaged.toml)
+  ansible.builtin.copy:
+    src: imaged.toml.example
+    dest: /etc/faas/imaged.toml.example
+    owner: root
+    group: faas
+    mode: "0640"
+
+- name: compute_only_service — install systemd unit
+  ansible.builtin.copy:
+    src: faas-imaged.service
+    dest: /etc/systemd/system/faas-imaged.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: imaged_unit
+
+- name: compute_only_service — systemctl daemon-reload (idempotent, after new unit file)
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: imaged_unit.changed
+
+# ADR-038 build attestations. Must exist before faas-imaged starts:
+# a ReadWritePaths= target that does not exist makes systemd fail the
+# mount-namespace setup, so creating the dir and listing it in the unit
+# are a pair. /srv/fc/base is created by the firecracker role.
+- name: compute_only_service — create imaged runtime dirs (snapshots, sigs)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: faas-imaged
+    group: faas
+    mode: "0750"
+  loop:
+    - /srv/fc/snap
+    - /srv/fc/sigs
+
+# Tier 3 / ADR-038 §Phase 3 — cosign sign-keypair (build attestation).
+# imaged reads /etc/faas/secrets/sign.key at startup
+# (cmd/imaged/main.go:103-109 fail-loud os.Stat). The file MUST be
+# 0440 root:faas because faas-imaged runs as User=faas-imaged
+# Group=faas (deploy/systemd/faas-imaged.service) and reads the
+# key via group access; 0400 root:root would be unreadable to a
+# non-root daemon. schedd reads the public side (sign-pub.pem,
+# 0444 root:root) — world-readable is intentional, the public key
+# is non-secret (ADR-038 §Consequences Compatibility). The Go-side
+# loader (pkg/cosign/keys.go:50-61) accepts both 0400 and 0440 for
+# the private side; the canonical DigitalOcean install is 0440
+# root:faas. Mirrors the host.age / session.key fail-loud shape:
+# the role fails the playbook BEFORE systemd daemon-reload so a
+# drift on a fresh box never reaches production.
+#
+# Gate-B (issue #297 / ADR-025 §Tier 2): moved from control_plane_service
+# so the tripwire travels with the imaged daemon it protects. apid does
+# NOT read sign.key, so a false-positive failure on fsn-1 would be a
+# bug, not a signal.
+- name: compute_only_service — assert sign.key mode is 0440 root:faas (Tier 3)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/sign.key
+  register: faas_sign_key_stat
+  failed_when:
+    - >-
+      not faas_sign_key_stat.stat.exists
+      or faas_sign_key_stat.stat.mode != "0440"
+      or faas_sign_key_stat.stat.pw_name != "root"
+      or faas_sign_key_stat.stat.gr_name != "faas"
+
+- name: compute_only_service — assert sign-pub.pem mode is 0444 root:root (Tier 3)
+  ansible.builtin.stat:
+    path: /etc/faas/secrets/sign-pub.pem
+  register: faas_sign_pub_stat
+  failed_when:
+    - >-
+      not faas_sign_pub_stat.stat.exists
+      or faas_sign_pub_stat.stat.mode != "0444"
+      or faas_sign_pub_stat.stat.pw_name != "root"
+      or faas_sign_pub_stat.stat.gr_name != "root"
+
+# Spec §11 — ProtectSystem=strict: every ReadWritePaths= target
+# MUST exist and be writable by the unit's User= before systemd
+# activates the unit, or the mount-namespace setup fails and the
+# daemon enters a crash-loop. The 2026-07-31 cd-controlplane
+# failure on the EX44 exposed a related but distinct gap: a
+# Process could not create a temp file at the root of a whitelisted
+# prefix (e.g. /srv/fc/runner-builder-amd64.ext4.tmp.*) because
+# only the subdirectories were whitelisted, not /srv/fc/ itself.
+# That code-level fix lives in pkg/storage/local.go::Put; this
+# assert is the deployment-side belt-and-braces — it pins every
+# ReadWritePaths= path to the same list as the unit, so a future
+# tighten of the unit that omits a dir the role doesn't create
+# fails the playbook rather than crash-looping the daemon on
+# the box.
+#
+# Gate-B: moved from control_plane_service. The list is read from
+# the unit file (not hardcoded) so a unit edit does not silently
+# drift from the role's mkdir list. The role_path lookup resolves
+# to compute_only_service/files/ on fsn-2.
+#
+# The list is read from the unit file (not hardcoded) so a unit
+# edit does not silently drift from the role's mkdir list.
+- name: compute_only_service — assert imaged ReadWritePaths= targets exist (spec §11)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ faas_imaged_rwp_paths }}"
+  vars:
+    faas_imaged_rwp_raw: >-
+      {{ lookup('file', role_path + '/files/faas-imaged.service')
+         | regex_search('ReadWritePaths=([^\n]+)', '\\1')
+         | first }}
+    faas_imaged_rwp_paths: "{{ faas_imaged_rwp_raw.split() }}"
+  register: faas_imaged_rwp_stat
+  failed_when: not faas_imaged_rwp_stat.stat.exists
+  loop_control:
+    label: "{{ item }}"
+
+# Tier 1 control-plane mTLS (ADR-052). imaged is a Tier 1 server
+# (Tier A10 PR-B runtime surface; ADR-053 slice-3 parent-base
+# loopback mount exchanges a client leaf with vmmd). The
+# compute_only role asserts the imaged server leaf + the
+# vmmd-client leaf are laid out under /etc/faas/tls/imaged/. The
+# matching `gregale pki init --box-role=compute-only` lands these
+# (PR-3); on a single-box legacy install, gregale pki init issues
+# every leaf.
+- name: compute_only_service — assert imaged PKI leaves exist (Tier 1)
+  ansible.builtin.stat:
+    path: "/etc/faas/tls/imaged/{{ item }}.crt"
+  loop:
+    - server
+    - vmmd-client
+  register: faas_pki_imaged_leaf_stat
+  failed_when: not faas_pki_imaged_leaf_stat.stat.exists
+
+- name: compute_only_service — note for operators (NOT auto-enabled)
+  ansible.builtin.debug:
+    msg: >-
+      imaged installed but NOT enabled. Operator runs:
+        systemctl enable --now faas-imaged
+      once /srv/fc/base is populated and the binary is at
+      /opt/faas/bin/imaged. The role does not enable imaged
+      because it cannot assume the firecracker role ran first on
+      the same host.
