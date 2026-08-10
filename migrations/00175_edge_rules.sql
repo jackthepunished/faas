@@ -51,10 +51,10 @@ CREATE TABLE IF NOT EXISTS edge_rules (
 );
 
 ALTER TABLE edge_rules
-    ADD CONSTRAINT edge_rules_account_id_fkey
+    ADD CONSTRAINT IF NOT EXISTS edge_rules_account_id_fkey
         FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE;
 ALTER TABLE edge_rules
-    ADD CONSTRAINT edge_rules_app_id_fkey
+    ADD CONSTRAINT IF NOT EXISTS edge_rules_app_id_fkey
         FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE;
 
 CREATE INDEX IF NOT EXISTS edge_rules_enabled_match_host_idx
