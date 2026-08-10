@@ -133,9 +133,27 @@ var controlAddr = envOrGateway("FAAS_GATEWAY_CONTROL_LISTEN", "127.0.0.1:9090")
 // cmd/e2e/streaming_metal_test.go flips this on via the harness's
 // extraEnv parameter; the metal build tag keeps the streaming test
 // off the default unit/e2e lane.
+// streamingEnabledTruthy is the closed set of FAAS_GATEWAY_STREAMING
+// values that turn the streaming path on. Mirrors the env-tristate
+// convention used elsewhere (e.g. faasFlagTruthy in pkg/wire); the
+// slice is package-local so the linter's goconst check stays quiet.
+const (
+	streamingFlagTrue  = "true"
+	streamingFlagOne   = "1"
+	streamingFlagYes   = "yes"
+	streamingFlagFalse = "false"
+)
+
+var streamingEnabledTruthy = []string{streamingFlagOne, streamingFlagTrue, streamingFlagYes}
+
 func streamingEnabledFromEnv() bool {
-	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", "false")))
-	return v == "1" || v == "true" || v == "yes"
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", streamingFlagFalse)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
 }
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd

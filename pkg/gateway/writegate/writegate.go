@@ -360,19 +360,3 @@ func IsWriteRequest(r *http.Request) bool {
 	}
 	return apid.IsApidPath(r.URL.Path)
 }
-
-// hasApidPrefix reports whether p begins with prefix anchored at
-// the trailing slash — p matches if it is exactly prefix, or
-// prefix followed by "/", or prefix followed by "/" and then
-// more path. This prevents accidental shadowing like "/v1.zip"
-// matching "/v1" — review finding #6 from the dashboard era.
-//
-// DEPRECATED: kept only for any future caller inside this
-// package that wants the local anchored-root discipline. New
-// code MUST call `apid.IsApidPath` directly.
-func hasApidPrefix(p, prefix string) bool {
-	if p == prefix || p == prefix+"/" {
-		return true
-	}
-	return strings.HasPrefix(p, prefix+"/")
-}

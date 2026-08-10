@@ -256,8 +256,10 @@ func TestMTLSLeaderClient_HopByHopHeadersStripped(t *testing.T) {
 	for _, h := range append([]string{"Connection"}, hopByHop...) {
 		req.Header.Set(h, "x")
 	}
-	if _, err := client.Relay(context.Background(), leaderURL(), req); err != nil {
+	if resp, err := client.Relay(context.Background(), leaderURL(), req); err != nil {
 		t.Fatalf("Relay: %v", err)
+	} else {
+		_ = resp.Body.Close()
 	}
 	for _, h := range hopByHop {
 		if seen[h] {
@@ -305,7 +307,8 @@ func TestMTLSLeaderClient_ResponseHeaderTimeout(t *testing.T) {
 
 	client := newTestClient(t, bundle, 50*time.Millisecond) // tight timeout
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	if _, err := client.Relay(context.Background(), leaderURL(), req); err == nil {
+	if resp, err := client.Relay(context.Background(), leaderURL(), req); err == nil {
+		_ = resp.Body.Close()
 		t.Fatalf("Relay succeeded; want timeout error")
 	}
 }
@@ -326,8 +329,9 @@ func TestMTLSLeaderClient_TLSHandshakeFailure(t *testing.T) {
 
 	client := newTestClient(t, trustedBundle, 5*time.Second)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, err := client.Relay(context.Background(), untrustedServer.URL, req)
+	resp, err := client.Relay(context.Background(), untrustedServer.URL, req)
 	if err == nil {
+		_ = resp.Body.Close()
 		t.Fatalf("Relay succeeded; want TLS handshake failure")
 	}
 	if !strings.Contains(err.Error(), "tls") && !strings.Contains(err.Error(), "certificate") {
@@ -366,11 +370,10 @@ func TestMTLSLeaderClient_RejectsNonHTTPS(t *testing.T) {
 	bundle := newMTLSBundle(t)
 	client := newTestClient(t, bundle, 5*time.Second)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, err := client.Relay(context.Background(), "http://leader.example.com/v1", req)
-	if err == nil {
+	if resp, err := client.Relay(context.Background(), "http://leader.example.com/v1", req); err == nil {
+		_ = resp.Body.Close()
 		t.Fatalf("Relay succeeded; want non-HTTPS rejection")
-	}
-	if !strings.Contains(err.Error(), "https") {
+	} else if !strings.Contains(err.Error(), "https") {
 		t.Errorf("error %q should mention https", err.Error())
 	}
 }
@@ -379,8 +382,8 @@ func TestMTLSLeaderClient_RejectsEmptyHost(t *testing.T) {
 	bundle := newMTLSBundle(t)
 	client := newTestClient(t, bundle, 5*time.Second)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, err := client.Relay(context.Background(), "https:///v1", req)
-	if err == nil {
+	if resp, err := client.Relay(context.Background(), "https:///v1", req); err == nil {
+		_ = resp.Body.Close()
 		t.Fatalf("Relay succeeded; want empty-host rejection")
 	}
 }
@@ -389,8 +392,8 @@ func TestMTLSLeaderClient_RejectsUserinfo(t *testing.T) {
 	bundle := newMTLSBundle(t)
 	client := newTestClient(t, bundle, 5*time.Second)
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, err := client.Relay(context.Background(), "https://user:pass@leader.example.com/v1", req)
-	if err == nil {
+	if resp, err := client.Relay(context.Background(), "https://user:pass@leader.example.com/v1", req); err == nil {
+		_ = resp.Body.Close()
 		t.Fatalf("Relay succeeded; want userinfo rejection")
 	}
 }

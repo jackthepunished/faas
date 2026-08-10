@@ -191,7 +191,7 @@ func TestStandbyWriteRedirect_AllEightArtifactsPresent(t *testing.T) {
 		"deploy/lima/run-ha-write-redirect.sh",
 		"tests/property/write_redirect_test.go",
 		"cmd/e2e/standby_write_redirect_e2e_test.go",
-		"migrations/00166_compute_nodes_public_ip.sql",
+		"migrations/00168_compute_nodes_public_ip.sql",
 		"pkg/gateway/writegate/writegate.go",
 	}
 	missing := []string{}
