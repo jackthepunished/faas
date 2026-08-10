@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc/peer"
 
 	"github.com/onebox-faas/faas/pkg/pki"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
 
@@ -230,4 +231,54 @@ func (s *mtlsHealthServer) Check(_ context.Context, _ *healthgrpc.HealthCheckReq
 		return nil, nil
 	}
 	return &healthgrpc.HealthCheckResponse{Status: healthgrpc.HealthCheckResponse_SERVING}, nil
+}
+
+// TestMTLSE2E_RoleGateRefusesWrongBox pins the per-daemon role gate
+// (ADR-092 / Gate-B PR-1). Each row exercises one box-shape refusal:
+// running a control-plane-only daemon under the compute-only role must
+// be rejected, and the inverse must also be rejected. Single-box dev
+// (RoleSingleBox) must keep being accepted on every allow-list — this
+// is the default-local back-compat path that keeps `make bootstrap`
+// against 127.0.0.1 working unchanged.
+//
+// The table also covers one shared-box row (apid + gatewayd-public
+// both keep RoleSingleBox in their allow-list), and the case where
+// RoleSingleBox is NOT in the allow-list (a degenerate future shape,
+// not used today; pinned here so a future refactor cannot silently
+// strip single-box back-compat without surfacing it).
+func TestMTLSE2E_RoleGateRefusesWrongBox(t *testing.T) {
+	skipUnlessMTLS(t)
+
+	cases := []struct {
+		daemon string
+		allow  []role.Role
+		bad    role.Role
+		good   role.Role
+	}{
+		// Control-plane-only daemons (live on fsn-1).
+		{"apid", []role.Role{role.RoleSingleBox, role.RoleControlPlane}, role.RoleComputeOnly, role.RoleControlPlane},
+		{"schedd", []role.Role{role.RoleSingleBox, role.RoleControlPlane}, role.RoleComputeOnly, role.RoleControlPlane},
+
+		// Compute-only daemons (live on fsn-2).
+		{"vmmd", []role.Role{role.RoleSingleBox, role.RoleComputeOnly}, role.RoleControlPlane, role.RoleComputeOnly},
+		{"builderd", []role.Role{role.RoleSingleBox, role.RoleComputeOnly}, role.RoleControlPlane, role.RoleComputeOnly},
+	}
+
+	for _, c := range cases {
+		t.Run(c.daemon+"_rejects_"+string(c.bad), func(t *testing.T) {
+			if err := role.Require(c.daemon, c.bad, c.allow...); err == nil {
+				t.Fatalf("%s: bad role %q accepted (allow=%v), want refusal", c.daemon, c.bad, c.allow)
+			}
+		})
+		t.Run(c.daemon+"_accepts_"+string(c.good), func(t *testing.T) {
+			if err := role.Require(c.daemon, c.good, c.allow...); err != nil {
+				t.Fatalf("%s: good role %q refused (allow=%v): %v", c.daemon, c.good, c.allow, err)
+			}
+		})
+		t.Run(c.daemon+"_accepts_single_box", func(t *testing.T) {
+			if err := role.Require(c.daemon, role.RoleSingleBox, c.allow...); err != nil {
+				t.Fatalf("%s: single-box dev refused (allow=%v): %v — single-box back-compat must stay accepted", c.daemon, c.allow, err)
+			}
+		})
+	}
 }
