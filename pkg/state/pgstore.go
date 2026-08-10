@@ -1623,7 +1623,7 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::uuid)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1648,10 +1648,10 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
-		// UUID). derefString coerces a nil pointer to '' which
-		// becomes SQL NULL via the $24::uuid cast (matches the
-		// NodeID pattern above — empty → NULL).
-		derefString(app.OverflowNode))
+		// UUID). nullString coerces a nil pointer or empty
+		// string to SQL NULL; Postgres infers the UUID type
+		// from the column, same as NodeID above.
+		nullString(derefString(app.OverflowNode)))
 	return scanApp(row)
 }
 
@@ -1789,7 +1789,7 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// ON DELETE SET NULL (migration 00167) enforce the
 	// integrity contract downstream.
 	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23::uuid)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1810,10 +1810,10 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
 		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
 		// Tier A10 / ADR-088: overflow_node preference (nullable
-		// UUID). derefString coerces a nil pointer to '' which
-		// becomes SQL NULL via the $23::uuid cast (matches the
-		// NodeID pattern above — empty → NULL).
-		derefString(app.OverflowNode))
+		// UUID). nullString coerces a nil pointer or empty
+		// string to SQL NULL; Postgres infers the UUID type
+		// from the column, same as NodeID above.
+		nullString(derefString(app.OverflowNode)))
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2658,7 +2658,7 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- with ON DELETE SET NULL (migration 00167)
 			   -- enforce the integrity contract; the store
 			   -- is a plain column write.
-			   overflow_node = case when $47 then $48::uuid else overflow_node end
+			   overflow_node = case when $47 then $48 else overflow_node end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2729,11 +2729,12 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled),
 		// Tier A10 / ADR-088: overflow_node preference. The
 		// Set bit controls the CASE; the value slot is a
-		// nullable UUID — derefString coerces a nil pointer
-		// to "" which is harmless because pgx maps the empty
-		// string to SQL NULL via the $48::uuid cast (empty
-		// string → NULL is the explicit-clear path).
-		p.SetOverflowNode, derefString(p.OverflowNode))
+		// nullable UUID — nullString coerces nil/empty to
+		// SQL NULL, and Postgres infers the UUID type from
+		// the column. The Set bit distinguishes "don't
+		// touch" (don't run the SET clause) from "explicit
+		// NULL" (clear — back to A9 fallback).
+		p.SetOverflowNode, nullString(derefString(p.OverflowNode)))
 	return scanApp(row)
 }
 
