@@ -2760,7 +2760,7 @@ type Store interface {
 	// allowed to complete; a foreign caller sees 0 rows updated
 	// and gets ErrClaimLost so the meterd can decide whether to
 	// alert or silently drop. mb_seconds is stamped on the row
-	// (column pushed_mb_seconds, added in migration 00198) so ops
+	// (column pushed_mb_seconds, added in migration 00200) so ops
 	// can read the wire value directly; the Paddle merchant
 	// dashboard's line item Quantity + CustomData["mb_seconds"]
 	// carry the same value at the merchant side.

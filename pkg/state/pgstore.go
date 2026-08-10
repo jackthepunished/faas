@@ -9915,7 +9915,7 @@ func (s *PgStore) ClaimPaddleOverageWindow(ctx context.Context, accountID string
 // foreign caller (or one whose lease expired and the row was
 // reaped+re-claimed) sees 0 rows updated and gets ErrClaimLost so
 // the caller can decide how to react. mb_seconds is stamped on the
-// row (column added in migration 00198) so ops reconciliation can
+// row (column added in migration 00200) so ops reconciliation can
 // read the integer wire value directly without joining against
 // usage_minutes; the Paddle merchant dashboard's line item
 // Quantity + CustomData["mb_seconds"] carry the same value at the
