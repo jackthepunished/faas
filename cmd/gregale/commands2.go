@@ -37,7 +37,7 @@ const (
 	// switches in commands2/3.go. Per-resource dispatch sites that
 	// want stronger typing keep their own name-spaced const
 	// (subHostAgeRotate / subPKIRotate / etc.).
-	subRotate = "rotate"
+	subRotate  = "rotate"
 	subSummary = "summary"
 	// subLogsTail is the inner-subcommand name for `gregale logs
 	// tail <slug>` (issue #315 / tier-2 DX). Lifted from the
