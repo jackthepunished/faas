@@ -77,8 +77,8 @@ func TestRekeyRunnerPg(t *testing.T) {
 		totalSecrets   = numAccounts * secretsPerAcct
 	)
 	for i := 0; i < numAccounts; i++ {
-		key := h1.SeedAccount(context.Background(), api.PlanHobby, "rekey-"+string(rune('A'+i)))
-		slug := "rekey-app-" + string(rune('A'+i))
+		key := h1.SeedAccount(context.Background(), api.PlanHobby, "rekey-"+string(rune('a'+i)))
+		slug := "rekey-app-" + string(rune('a'+i))
 		if code := statusOnly(t, h1, key, http.MethodPost, "/v1/apps",
 			api.CreateAppRequest{Slug: slug}); code != http.StatusCreated {
 			t.Fatalf("phase1: create %s: %d", slug, code)
