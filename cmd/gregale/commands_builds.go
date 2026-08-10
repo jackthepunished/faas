@@ -41,7 +41,7 @@ func cmdBuild(args []string) int {
 		return 1
 	}
 	switch args[0] {
-	case "status":
+	case statusLiteral:
 		return cmdBuildStatus(args[1:])
 	case "provenance":
 		return cmdBuildProvenance(args[1:])

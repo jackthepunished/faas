@@ -72,6 +72,25 @@ const (
 	// terminalExitForDeployment branch.
 	statusLive = "live"
 
+	// Build status enum values from /v1/builds/{id} (DEPLOY-PROV-6
+	// / ADR-089, issue #741). 4-state enum per schema.sql CHECK
+	// constraint — matches BuildStatus constants in pkg/state.
+	// Lifted out so the SSE polling fallback in streamDeployLogs +
+	// terminalExitForBuild don't trip goconst when the same
+	// string appears 3+ times across the file.
+	buildStatusSucceeded = "succeeded"
+	buildStatusFailed    = "failed"
+
+	// Deployment status enum value (DEPLOY-PROV-6 sibling).
+	// Lifted out so the SSE decoder branch + pollDeploymentFinal
+	// + terminalExitForDeployment don't trip goconst once
+	// buildStatusFailed exists — goconst cross-file matching is
+	// by literal value, so we need two name-spaced constants even
+	// though they're the same string semantically. (The build
+	// status enum is a different 4-state set with `succeeded`/`failed`
+	// vs deployment's `live`/`failed`.)
+	deploymentStatusFailed = "failed"
+
 	// streamEventError is the SSE event name emitted by the build
 	// log stream when the upstream closes (5xx mid-stream, network
 	// reset, etc.). Mirrors the `event:` field of the build-log
@@ -2284,7 +2303,7 @@ streamLoop:
 					Status string `json:"status"`
 				}
 				if json.Unmarshal([]byte(e.Data), &status) == nil &&
-					(status.Status == statusLive || status.Status == "failed") {
+					(status.Status == statusLive || status.Status == deploymentStatusFailed) {
 					if status.Status == statusLive {
 						PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", dep.AppID)
 						printDeployColdWakeSentence()
@@ -2348,7 +2367,7 @@ func pollDeploymentFinal(c *Client, dep api.DeploymentResponse) (api.DeploymentR
 	if err != nil {
 		return api.DeploymentResponse{}, false
 	}
-	if got.Status == statusLive || got.Status == "failed" {
+	if got.Status == statusLive || got.Status == deploymentStatusFailed {
 		return got, true
 	}
 	return api.DeploymentResponse{}, false
@@ -2380,7 +2399,7 @@ func pollBuildStatus(c *Client, dep api.DeploymentResponse, deadline time.Durati
 	backoff := 1 * time.Second
 	for time.Now().Before(end) {
 		b, err := c.GetBuildsId(context.Background(), dep.BuildID)
-		if err == nil && (b.Status == "succeeded" || b.Status == "failed") {
+		if err == nil && (b.Status == buildStatusSucceeded || b.Status == buildStatusFailed) {
 			return b, true
 		}
 		// Jitter ±20% of the current backoff so N concurrent CI
@@ -2416,7 +2435,7 @@ func terminalExitForDeployment(d api.DeploymentResponse) int {
 // failure_class=…" block and exit 2 (same exit-code convention as
 // terminalExitForDeployment's renderDeployFailure path).
 func terminalExitForBuild(b api.BuildResponse, appID string) int {
-	if b.Status == "succeeded" {
+	if b.Status == buildStatusSucceeded {
 		PrintOK(osStdout, "Deployed. https://%s.apps.gregale.dev", appID)
 		printDeployColdWakeSentence()
 		return 0
