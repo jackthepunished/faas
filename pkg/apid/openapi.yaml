@@ -40,6 +40,8 @@ tags:
     description: Account & billing (self-service, GDPR, plan).
   - name: apps
     description: App lifecycle (create, update, delete, wake, park).
+  - name: edge_rules
+    description: Edge rules (route, rewrite, redirect, headers, cors, jwt, ip) per app.
   - name: deployments
     description: Deployments & build status.
   - name: instances
@@ -8282,7 +8284,7 @@ components:
         updated_at: { type: string, format: date-time }
 
     CreateEdgeRuleRequest:
-      description: 'Create an edge rule on an app.'
+      description: 'Body shape for POST /v1/apps/{slug}/edge-rules.'
       type: object
       required: [match_host, kind, action]
       properties:

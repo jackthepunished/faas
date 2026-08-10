@@ -25,6 +25,21 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
+// Audit-map JSON keys (ADR-089). The literal `"app_id"` etc. also
+// appear in the pg_notify payload below; promoting to consts here
+// keeps goconst quiet without sacrificing readability of the
+// audit map literal.
+const (
+	auditKeyRuleID       = "rule_id"
+	auditKeyAppID        = "app_id"
+	auditKeyMatchHost    = "match_host"
+	auditKeyMatchPath    = "match_path"
+	auditKeyMatchMethods = "match_methods"
+	auditKeyPriority     = "priority"
+	auditKeyEnabled      = "enabled"
+	auditKeyKind         = "kind"
+)
+
 // edgeRuleResponse builds the wire shape. Action is re-marshalled
 // verbatim — the kind-specific struct has already been validated
 // and round-tripped through jsonb on the read path.
@@ -248,14 +263,14 @@ func (s *server) createEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		"priority", row.Priority,
 	)
 	s.audit.Emit(r.Context(), "edge_rule.created", &acct.ID, map[string]any{
-		"rule_id":       row.ID,
-		"app_id":        row.AppID,
-		"match_host":    row.MatchHost,
-		"match_path":    row.MatchPath,
-		"match_methods": row.MatchMethods,
-		"priority":      row.Priority,
-		"enabled":       row.Enabled,
-		"kind":          row.Kind,
+		auditKeyRuleID:       row.ID,
+		auditKeyAppID:        row.AppID,
+		auditKeyMatchHost:    row.MatchHost,
+		auditKeyMatchPath:    row.MatchPath,
+		auditKeyMatchMethods: row.MatchMethods,
+		auditKeyPriority:     row.Priority,
+		auditKeyEnabled:      row.Enabled,
+		auditKeyKind:         row.Kind,
 	})
 	writeJSON(w, http.StatusCreated, edgeRuleResponse(row))
 }
@@ -446,11 +461,11 @@ func (s *server) updateEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		"kind", logsanitize.Field(string(updated.Kind)),
 	)
 	s.audit.Emit(r.Context(), "edge_rule.updated", &acct.ID, map[string]any{
-		"rule_id":  updated.ID,
-		"app_id":   updated.AppID,
-		"kind":     updated.Kind,
-		"priority": updated.Priority,
-		"enabled":  updated.Enabled,
+		auditKeyRuleID:   updated.ID,
+		auditKeyAppID:    updated.AppID,
+		auditKeyKind:     updated.Kind,
+		auditKeyPriority: updated.Priority,
+		auditKeyEnabled:  updated.Enabled,
 	})
 	writeJSON(w, http.StatusOK, edgeRuleResponse(updated))
 }
@@ -502,9 +517,9 @@ func (s *server) deleteEdgeRule(w http.ResponseWriter, r *http.Request, acct sta
 		"kind", logsanitize.Field(string(row.Kind)),
 	)
 	s.audit.Emit(r.Context(), "edge_rule.deleted", &acct.ID, map[string]any{
-		"rule_id": id,
-		"app_id":  row.AppID,
-		"kind":    row.Kind,
+		auditKeyRuleID: id,
+		auditKeyAppID:  row.AppID,
+		auditKeyKind:   row.Kind,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
