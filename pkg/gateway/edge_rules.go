@@ -36,6 +36,7 @@ import (
 	"net"
 	"path"
 	"sync"
+	"time"
 )
 
 // pathMatch is the stdlib path.Match wrapper — aliased here so the
@@ -507,6 +508,37 @@ type EdgeRuleMatcher interface {
 // `pkg/gateway/handler.go:194-204`).
 type EdgeRuleAuditor interface {
 	Emit(ctx context.Context, kind string, subject *string, data map[string]any)
+}
+
+// JWTVerifier (ADR-091 / issue #561 PR 5) is the narrow surface
+// pkg/gateway uses for kind=jwt verification. The cmd-side wires the
+// pkg/edgejwks.Verifier via a thin adapter that conforms to this
+// interface; pkg/gateway itself never imports pkg/edgejwks, so
+// the dep direction stays one-way (gateway is a leaf, like
+// pkg/auth.Middleware being consumed by the daemons but not
+// importing cmd-side state types).
+//
+// rawToken is the stripped bearer suffix (no "Bearer " prefix) —
+// handler.go does strings.TrimPrefix before calling. The verifier
+// looks up the rule's JWKSURL in its per-URL cache, fetches the
+// keyset if needed, picks the right key by kid, verifies the
+// signature + exp + iss + aud + required_claims, and returns the
+// parsed claims. Errors are package sentinels (edgejwks.ErrJWT*)
+// so handler.go can map them to distinct audit + metric outcomes.
+type JWTVerifier interface {
+	Verify(ctx context.Context, rawToken string, rule *EdgeRuleJWTResolved) (claims *JWTClaims, err error)
+}
+
+// JWTClaims is the parsed subset pkg/gateway cares about. Mirrors
+// pkg/edgejwks.Claims (same field set; pkg/gateway doesn't import
+// pkg/edgejwks so the struct is duplicated here — drift would
+// surface as a mismatch when the cmd-side adapter copies the
+// fields over, which is intentional).
+type JWTClaims struct {
+	Subject string
+	Issuer  string
+	Aud     []string
+	Exp     time.Time
 }
 
 // noOpEdgeRuleMatcher is the default Embedding target the matcher

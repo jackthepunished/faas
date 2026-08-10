@@ -317,6 +317,12 @@ type runDeps struct {
 	// newGatewaydEdgeRules in run() so the cache + state.Store
 	// loader share the same instance.
 	edgeRulesMatcher *gatewaydEdgeRules
+	// edgeJWKSAdapter (ADR-091 PR 5) is the JWT verifier handle
+	// consulted by applyEdgeRuleJWT. nil = JWT kind disabled
+	// (pre-PR-5 + dev posture; matches edgeRulesAudit nil
+	// allowance). Production wires a real adapter backed by
+	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
+	edgeJWKSAdapter *edgeJWKSAdapter
 	// edgeRulesAudit (ADR-089 PR 3) is the audit thin wrapper
 	// the handler's edge_rule.route_matched / edge_rule.route_blocked
 	// rows go through. nil = audit-disabled (matches the
@@ -771,6 +777,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// below.
 	deps.edgeRulesMatcher = newGatewaydEdgeRules(pgStore, log)
 	deps.edgeRulesAudit = newGatewaydEdgeRulesAud(newGatewaydAuditor(deps.pgStore, log))
+	// Issue #561 / ADR-091 PR 5 — build the per-URL JWKS cache
+	// + JWT verifier that applyEdgeRuleJWT consults. Lazy
+	// registration on first match; the cache uses an HTTP client
+	// with a 5s fetch timeout so an IdP outage can't block the
+	// gateway hot path.
+	deps.edgeJWKSAdapter = newEdgeJWKSAdapter(log)
 	// Issue #477 / ADR-079: build the unsealed basic-auth
 	// credential cache + the secretbox unsealer closure.
 	// The cache is shared between the Handler (read path)
@@ -961,6 +973,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			NodeID:           app.NodeID,
 		}, true
 	}, deps.edgeRulesAudit)
+	// Issue #561 / ADR-091 PR 5 — arm the per-rule JWT verifier.
+	// nil-safe: deps.edgeJWKSAdapter nil falls through
+	// (applyEdgeRuleJWT short-circuits, matching pre-PR-5 + dev
+	// posture). Production wires a real adapter backed by
+	// pkg/edgejwks.NewCache + pkg/edgejwks.NewVerifier.
+	if deps.edgeJWKSAdapter != nil {
+		handler.WithJWTVerifier(deps.edgeJWKSAdapter)
+	}
 	// Issue #477 / ADR-079: per-app public_auth (open|bearer|basic).
 	// The 60s cache lives on the Handler (production wires
 	// deps.publicAuthCache below); the secretbox unseal goes
