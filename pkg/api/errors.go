@@ -605,6 +605,17 @@ const (
 	// reserved" without conflating them.
 	CodePlanEvictionPriorityReservedQuota = "plan_eviction_priority_reserved_quota"
 
+	// Tier A10 / ADR-088 — per-app overflow_node preference. 422
+	// returned when (a) the wire name does not resolve via
+	// Store.ComputeNodeByName (404→422 mapping, mirrors the
+	// soft-404→404 surface at compute_nodes.go:267) or
+	// (b) the named compute_nodes row is active=false. Distinct
+	// code from the per-app column-set gates so the CLI can
+	// render "spill target not found" / "spill target offline"
+	// along the existing 422-family copy without conflating them
+	// in telemetry.
+	CodeInvalidOverflowNode = "invalid_overflow_node"
+
 	// Issue #471 PR-B (the meat) — emitted when an active stream
 	// exceeds the per-plan MaxResponseBodyBytes cap (Hobby+: 100 MB;
 	// Free: 25 MB). 413 + this code so the client sees a distinct
@@ -2520,4 +2531,16 @@ func ErrOrgAPIKeyRequiresOrg() *Problem {
 		"API key must be bound to an organization",
 		"this legacy API key has no organization binding; create a new key via /v1/orgs/{slug}/keys.").
 		WithDocs(docsBase + "/orgs#api-keys")
+}
+
+// ErrInvalidOverflowNode is the 422 returned when the
+// overflow_node PATCH or create-time value does not resolve
+// to a real, active compute_node (Tier A10 / ADR-088). Names
+// the offending value back to the customer so dashboards can
+// surface "spill target X not found" without grepping logs.
+func ErrInvalidOverflowNode(name string) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeInvalidOverflowNode,
+		"Invalid overflow_node",
+		fmt.Sprintf("no active compute_node named %q; check the operator-supplied spill target name and try again.", name)).
+		WithDocs(docsBase + "/apps#overflow_node")
 }

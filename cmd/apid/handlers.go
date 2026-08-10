@@ -20,6 +20,61 @@ func (s *server) whoami(w http.ResponseWriter, r *http.Request, acct state.Accou
 	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), acct, r))
 }
 
+// nilStringPtr returns a *string pointing at the given value, or
+// nil when s is "". Lets the create-time path stamp an
+// optional UUID onto state.App without leaking a string-shaped
+// sentinel into the column (Tier A10 / ADR-088).
+func nilStringPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	cp := s
+	return &cp
+}
+
+// resolveOverflowNode resolves a wire `overflow_node` value (a
+// compute_nodes.name) to the underlying UUID. Returns the UUID
+// string (or "" when unset/empty) and a *Problem on rejection
+// (Tier A10 / ADR-088). The resolver is shared between
+// createApp + validateUpdateApp so the wire contract is one
+// source of truth.
+//
+//   - wire == nil     → ("", nil)              — no preference
+//   - wire == ""      → ("", nil) if !strict   — at PATCH time
+//                     → ("", prob) if strict   — at CREATE time
+//                       (no "clear" path for a fresh row)
+//   - wire non-empty  → Store.ComputeNodeByName(name)
+//       · ErrNotFound  → 422 invalid_overflow_node
+//       · active=false → 422 invalid_overflow_node
+//       · ok           → (row.ID, nil)
+func (s *server) resolveOverflowNode(ctx context.Context, wire *string, strictEmpty bool) (string, *api.Problem) {
+	if wire == nil {
+		return "", nil
+	}
+	if *wire == "" {
+		if strictEmpty {
+			return "", api.NewProblem(http.StatusUnprocessableEntity, api.CodeInvalidOverflowNode,
+				"Invalid overflow_node",
+				"overflow_node = '' is not allowed at create-time; the column starts NULL. Use a real compute_node.name or omit the field to leave the preference unset.")
+		}
+		return "", nil
+	}
+	row, err := s.store.ComputeNodeByName(ctx, *wire)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			return "", api.ErrInvalidOverflowNode(*wire)
+		}
+		return "", api.NewProblem(http.StatusInternalServerError, api.CodeCapacity,
+			"Capacity", fmt.Sprintf("lookup overflow_node %q: %v", *wire, err))
+	}
+	if !row.Active {
+		return "", api.NewProblem(http.StatusUnprocessableEntity, api.CodeInvalidOverflowNode,
+			"Invalid overflow_node",
+			fmt.Sprintf("compute_node %q exists but is active=false; pick an active peer.", *wire))
+	}
+	return row.ID, nil
+}
+
 func (s *server) listApps(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	apps, err := s.store.ListApps(r.Context(), acct.ID)
 	if err != nil {
@@ -40,12 +95,34 @@ func (s *server) createApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation, "Bad request", err.Error()))
 		return
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// Resolve the wire name → UUID server-side before buildApp
+	// runs, so the resulting state.App carries the resolved
+	// UUID (the column-shape integrity contract — the column
+	// is uuid NULL, never text). The resolver returns:
+	//   - (uuid, nil) on a real, active compute_node
+	//   - ("", nil)   when OverflowNode == nil (no preference)
+	//   - ("", nil)   when OverflowNode == "" (create-time
+	//     "clear" is rejected per the DTO contract — see
+	//     validateCreateOverflowNode; buildApp receives a
+	//     state.App with OverflowNode == nil)
+	//   - ("", prob)  on ErrNotFound or active=false
+	overflowUUID, prob := s.resolveOverflowNode(r.Context(), req.OverflowNode, false /*create=true → reject ""*/)
+	if prob != nil {
+		api.WriteProblem(w, prob)
+		return
+	}
 	limits := api.MustLimitsFor(acct.Plan)
 	app, prob := s.buildApp(acct, req, limits)
 	if prob != nil {
 		api.WriteProblem(w, prob)
 		return
 	}
+	// Stamp the resolved UUID (or nil) onto the App before the
+	// store layer sees it. The store writes the column verbatim
+	// — see pkg/state/pgstore.go::CreateAppIfUnderQuota +
+	// pgstore.go::CreateApp for the new overflow_node column.
+	app.OverflowNode = nilStringPtr(overflowUUID)
 	// Phase 2 / Gate A: leave node_id NULL — schedd's
 	// PlacementClaimSubscriber stamps the owner (see emitAppCreated
 	// for the full architectural rationale + docs/adr/055).
@@ -411,6 +488,16 @@ func (s *server) appResponse(a state.App, plan api.Plan) api.AppResponse {
 		WarmSnapshotEnabled:     a.WarmSnapshotEnabled,
 		WarmSnapshotMinRequests: a.WarmSnapshotMinRequests,
 		WarmSnapshotMinMs:       a.WarmSnapshotMinMs,
+		// Tier A10 / ADR-088: resolved UUID of the per-app
+		// overflow_node preference. NULL on the wire when the
+		// customer has not pinned a spill target — the
+		// `omitempty` on the DTO drops the field so dashboards
+		// can branch on field-absence rather than a sentinel
+		// string. Server-side resolution (wire name → UUID)
+		// happens at create/PATCH time in handlers.go /
+		// handlers_ext.go, so the value is always UUID-shaped
+		// (never the operator-readable name).
+		OverflowNode: a.OverflowNode,
 	}
 }
 

@@ -71,6 +71,16 @@ type CreateAppRequest struct {
 	// streaming pattern from issue #471 — same fail-closed
 	// contract, same Plan.WebSocketEnabled() accessor.
 	WebSocketEnabled *bool `json:"websocket_enabled,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
+	// preferred spill target for cross-node pressure rebalance.
+	// Wire type is the human-readable compute_nodes.name; apid
+	// resolves the name to the UUID server-side via
+	// Store.ComputeNodeByName. nil at create time = "no
+	// preference" (default A9 fallback). Empty-string "" at
+	// create time is rejected with 422 invalid_overflow_node —
+	// create-time has no "clear" path because the column starts
+	// NULL.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 }
 
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
@@ -215,6 +225,16 @@ type UpdateAppRequest struct {
 	// the reserved tier is unlocked) — the cap is over APPS, not
 	// instances, so flipping down always frees a slot.
 	EvictionPriority *string `json:"eviction_priority,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) is the customer's per-app
+	// preferred spill target for cross-node pressure rebalance.
+	// Tri-state: nil = no change, "" = clear (back to A9 default
+	// fallback), non-empty = resolve server-side (404 on unknown
+	// name → 422 invalid_overflow_node; 422 on inactive node).
+	// Resolution is `Store.ComputeNodeByName(name)` → the FK on
+	// apps.overflow_node (migration 00165). Engine consults the
+	// resolved UUID on the next pressured sweep; falls through to
+	// A9 if the peer has no headroom or is inactive.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 	// RootDir, WorkloadName, StartCommand mirror the apps table
 	// columns added in Phase 1 (migration 00074). The customer-facing
 	// PATCH handler (cmd/apid/handlers_ext.go) ignores them today —
@@ -573,6 +593,16 @@ type AppResponse struct {
 	// deployment-state only at the explicit ref — mirrors the
 	// per-deployment override pattern at DeploymentResponse.
 	ParkedDeployment *ParkedDeploymentRef `json:"parked_deployment,omitempty"`
+	// OverflowNode (Tier A10 / ADR-088) echoes the resolved UUID
+	// of the customer's per-app preferred spill target. NULL
+	// when no preference is set (the default A9 fallback).
+	// Dashboards branch on `null` to render the "no spill
+	// target" pill. The wire DTO is UUID-shaped (not name) so
+	// the value is unambiguous across operator-deployed fleets
+	// with non-unique names — apid always resolves the wire
+	// `name` to a `compute_nodes.id` server-side before
+	// persisting or returning.
+	OverflowNode *string `json:"overflow_node,omitempty"`
 }
 
 // ParkedDeploymentRef is the reference shape returned in

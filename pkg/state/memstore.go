@@ -2987,6 +2987,24 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	if p.ClearAuthDefaultFlippedAt {
 		a.AuthDefaultFlippedAt = nil
 	}
+	// Tier A10 / ADR-088: per-app overflow_node preference.
+	// Set bit controls the write — "don't touch" by default,
+	// "explicit NULL" (clear → A9 fallback) when Set is true
+	// with a nil pointer, and "set" when Set is true with a
+	// non-nil pointer. Apid has already validated the UUID
+	// against the empty-uuid CHECK + FK with ON DELETE SET
+	// NULL (migration 00165) before reaching this path; the
+	// store is a plain column write. Memstore mirrors the
+	// pgstore shape so every test that exercises UpdateApp
+	// sees the same behaviour regardless of backend.
+	if p.SetOverflowNode {
+		if p.OverflowNode == nil {
+			a.OverflowNode = nil
+		} else {
+			s := *p.OverflowNode
+			a.OverflowNode = &s
+		}
+	}
 	m.apps[id] = a
 	return a, nil
 }

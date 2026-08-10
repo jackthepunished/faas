@@ -1612,8 +1612,18 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	// Issue #676 / PR-3: websocket_enabled is also written explicitly
 	// (same Set-bit-aware shape) so the per-plan default doesn't get
 	// shadowed by the schema DEFAULT.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+	//
+	// Tier A10 / ADR-088: overflow_node preference is in the
+	// column list so the App struct's value is written verbatim
+	// at create time. apid resolved the wire name → UUID
+	// server-side via Store.ComputeNodeByName before reaching
+	// this path; the store is a plain write. NULL preference
+	// (the A9 default fallback) round-trips via nullString
+	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
+	// ON DELETE SET NULL (migration 00165) enforce the
+	// integrity contract downstream.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, egress_allowlist, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::cidr[], $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::uuid)
 		 returning ` + appsSelectColumns
 	// status: pull from app.Status when non-empty (the API surfaces it on
 	// update / restore paths); fall back to 'active' on the Go zero so the
@@ -1636,7 +1646,12 @@ func (s *PgStore) CreateApp(ctx context.Context, app App) (App, error) {
 	}
 	row := s.pool.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, cidrPrefixesToArray(app.EgressAllowlist), app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		// Tier A10 / ADR-088: overflow_node preference (nullable
+		// UUID). derefString coerces a nil pointer to '' which
+		// becomes SQL NULL via the $24::uuid cast (matches the
+		// NodeID pattern above — empty → NULL).
+		derefString(app.OverflowNode))
 	return scanApp(row)
 }
 
@@ -1763,8 +1778,18 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	// the per-plan default).
 	//
 	// Issue #676 / PR-3: websocket_enabled follows the same shape.
-	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled)
-		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	//
+	// Tier A10 / ADR-088: overflow_node preference is in the
+	// column list so the App struct's value is written verbatim
+	// at create time. apid resolved the wire name → UUID
+	// server-side via Store.ComputeNodeByName before reaching
+	// this path; the store is a plain write. NULL preference
+	// (the A9 default fallback) round-trips via nullString
+	// ("" → SQL NULL). The empty-uuid CHECK + the FK with
+	// ON DELETE SET NULL (migration 00165) enforce the
+	// integrity contract downstream.
+	insertAppSQL := `insert into apps (account_id, slug, type, runtime, ram_mb, idle_timeout_s, max_concurrency, status, manifest, min_instances, streaming_enabled, project_id, root_dir, workload_name, node_id, warm_snapshot_enabled, warm_snapshot_min_requests, warm_snapshot_min_ms, eviction_priority, require_authn, public_auth_mode, websocket_enabled, overflow_node)
+		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23::uuid)
 		 returning ` + appsSelectColumns
 	// status: same fallback as CreateApp above — empty Go Status would
 	// trip 23514 on the CHECK constraint, so coerce to AppActive. The
@@ -1783,7 +1808,12 @@ func (s *PgStore) CreateAppIfUnderQuota(ctx context.Context, app App, limits api
 	}
 	row := tx.QueryRow(ctx, insertAppSQL,
 		app.AccountID, app.Slug, string(appType), runtime, ramMB, idle, maxConcurrency, string(statusValue), manifestBytes, app.MinInstances, app.StreamingEnabled, nullString(app.ProjectID), app.RootDir, app.WorkloadName, nullString(app.NodeID),
-		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled)
+		app.WarmSnapshotEnabled, warmMinRequests, warmMinMs, evictionPriority, app.RequireAuthn, publicAuthMode, app.WebSocketEnabled,
+		// Tier A10 / ADR-088: overflow_node preference (nullable
+		// UUID). derefString coerces a nil pointer to '' which
+		// becomes SQL NULL via the $23::uuid cast (matches the
+		// NodeID pattern above — empty → NULL).
+		derefString(app.OverflowNode))
 	created, err := scanApp(row)
 	if err != nil {
 		return App{}, err
@@ -2618,7 +2648,17 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 			   -- above; apid gates PATCH-true through
 			   -- Plan.WebSocketResponseAllowed() (Free → 403
 			   -- plan_websocket_not_allowed).
-			   websocket_enabled = case when $45 then $46 else websocket_enabled end
+			   websocket_enabled = case when $45 then $46 else websocket_enabled end,
+			   -- Tier A10 / ADR-088: per-app overflow_node
+			   -- preference. Same Set-bit convention as the
+			   -- surrounding fields — SetOverflowNode
+			   -- distinguishes "don't touch" (default)
+			   -- from "explicit NULL" (clear — back to A9
+			   -- fallback). The empty-uuid CHECK + the FK
+			   -- with ON DELETE SET NULL (migration 00165)
+			   -- enforce the integrity contract; the store
+			   -- is a plain column write.
+			   overflow_node = case when $47 then $48::uuid else overflow_node end
 		 where id = $1
 		 returning ` + appsSelectColumns
 	// `policyMinInstances` is the value to push into the legacy
@@ -2686,7 +2726,14 @@ func (s *PgStore) UpdateApp(ctx context.Context, id string, p UpdateAppParams) (
 		p.ClearAuthDefaultFlippedAt,
 		// Issue #676 / PR-3: per-app raw-bytes Upgrade bridge.
 		// Same Set*/optional-pointer pattern as streaming_enabled.
-		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled))
+		p.SetWebSocketEnabled, boolOrFalse(p.WebSocketEnabled),
+		// Tier A10 / ADR-088: overflow_node preference. The
+		// Set bit controls the CASE; the value slot is a
+		// nullable UUID — derefString coerces a nil pointer
+		// to "" which is harmless because pgx maps the empty
+		// string to SQL NULL via the $48::uuid cast (empty
+		// string → NULL is the explicit-clear path).
+		p.SetOverflowNode, derefString(p.OverflowNode))
 	return scanApp(row)
 }
 
@@ -10043,6 +10090,11 @@ func scanAppInto(a *App, row pgx.Row) error {
 	var allowlistText string
 	var workloadClassStr string
 	var scalingPolicyBytes []byte
+	// Tier A10 / ADR-088: scratch sink for the overflow_node
+	// projection. coalesce(overflow_node::text, '') returns
+	// '' for the NULL-preference case, which we promote to
+	// App.OverflowNode == nil below.
+	var overflowNodeStr string
 	if err := row.Scan(&a.ID, &a.AccountID, &a.Slug, &typeStr, &a.Runtime, &a.RAMMB, &a.IdleTimeoutS,
 		&a.MaxConcurrency, &statusStr, &manifestBytes, &a.CreatedAt, &a.MinInstances, &allowlistText,
 		&a.AutoscaleTargetRPS, &a.AutoscaleTargetCPUPct,
@@ -10074,8 +10126,21 @@ func scanAppInto(a *App, row pgx.Row) error {
 		// Issue #676 / PR-3: per-app websocket_enabled flag.
 		// NOT NULL DEFAULT false (migration 00155); plain bool
 		// scan is safe.
-		&a.WebSocketEnabled); err != nil {
+		&a.WebSocketEnabled,
+		// Tier A10 / ADR-088: per-app overflow_node preference.
+		// Scanned into a scratch string then conditionally
+		// promoted to *string so NULL round-trips as Go-nil —
+		// nil = "no preference" (back to A9 fallback). The
+		// pgx string → Go nil promotion mirrors how the
+		// column-list normalisation handles other nullable
+		// string-shaped values like RootDir / WorkloadName
+		// (see below).
+		&overflowNodeStr); err != nil {
 		return mapErr(err)
+	}
+	if overflowNodeStr != "" {
+		s := overflowNodeStr
+		a.OverflowNode = &s
 	}
 	a.Type = AppType(typeStr)
 	a.Status = AppStatus(statusStr)
@@ -10148,7 +10213,16 @@ const appsSelectColumns = `
 	-- Boolean NOT NULL DEFAULT false (migration 00155); apid applies
 	-- Plan.WebSocketEnabled() at CreateApp time and gates PATCH
 	-- writes through Plan.WebSocketResponseAllowed().
-	websocket_enabled`
+	websocket_enabled,
+	-- Tier A10 / ADR-088: per-app overflow_node preference.
+	-- Nullable UUID; FK to compute_nodes(id) with ON DELETE SET
+	-- NULL cascades the preference to NULL on operator-side
+	-- compute_node deletion (migration 00165). The empty-uuid
+	-- CHECK is a tripwire against buggy INSERT paths. NULL
+	-- coerces to the empty string via coalesce so the pgx
+	-- scan sees a string target — the App.OverflowNode field
+	-- is *string (nil = no preference = default A9 fallback).
+	coalesce(overflow_node::text, '')`
 
 // Compile-time anchor: the const is interpolated only inside SQL raw-string
 // literals (the 9 SELECT/RETURNING sites), which golangci-lint's `unused`

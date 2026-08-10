@@ -6271,6 +6271,19 @@ components:
             - type: 'null'
           description: "Most-recently parked deployment for this app, or null if never parked (issue #554 / ADR-079 follow-up). The reference surfaces the closed-set parking reason + timestamp on GET /v1/apps/{slug} so operators can answer 'why is my app evicted_cold?' without grepping the audit log."
 
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Resolved UUID (not the wire name) — apid resolves the
+        # wire name to the UUID server-side before persisting,
+        # so the read-back is unambiguous across
+        # operator-deployed fleets with non-unique names. NULL
+        # when no preference is set (default A9 fallback;
+        # random first peer with headroom).
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Resolved UUID from the customer's named compute_nodes.name preference (null when unset). Consulted by Engine.RebalancePressuredApps before the A9 fallback; falls through to A9 when the target is inactive or full."
+          type: [string, "null"]
+          format: uuid
+          example: "00000000-0000-0000-0000-000000000000"
+
         # Issue #477 / ADR-077: per-app public-URL auth
         # configuration. Mirrors the read-side
         # PublicAuthStatus shape — `has_basic_creds` is true
@@ -6345,6 +6358,17 @@ components:
           type: string
           enum: [best_effort, reserved]
           example: best_effort
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Wire form is the human-readable compute_nodes.name;
+        # apid resolves to the UUID server-side via
+        # Store.ComputeNodeByName before persisting. 404 on
+        # unknown name; 422 on inactive node. Omitted at
+        # create-time → default A9 fallback (no preference).
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is compute_nodes.name (resolved server-side). Omitted → no preference; empty string at create-time is rejected with 422 invalid_overflow_node because the column starts NULL and there is no 'clear' path at create-time."
+          type: string
+          minLength: 1
+          example: "box-eu-1"
         # Issue #560 + issue #695 / ADR-080: optional at
         # create-time. Omitted → apid applies the per-plan
         # default (Free=false, Hobby=true, Pro=true, Scale=true).
@@ -6520,6 +6544,17 @@ components:
           oneOf:
             - type: "null"
             - $ref: '#/components/schemas/PublicAuthBlock'
+        # Tier A10 / ADR-088: per-app overflow_node preference.
+        # Wire type is the human-readable compute_nodes.name;
+        # apid resolves to the UUID server-side. Tri-state:
+        # omitted → no change; "" → clear (back to A9
+        # fallback); non-empty → resolve via
+        # Store.ComputeNodeByName and store the UUID. 404 on
+        # unknown name; 422 on inactive node.
+        overflow_node:
+          description: "Per-app preferred spill target for cross-node pressure rebalance (Tier A10 / ADR-088). Wire form is the human-readable compute_nodes.name; apid resolves to UUID server-side. Tri-state: omitted → no change; empty string → clear (back to A9 fallback); non-empty → resolve name → UUID via Store.ComputeNodeByName and persist the UUID. 404 on unknown name; 422 on inactive node."
+          type: [string, "null"]
+          example: "box-eu-1"
 
     RenameAppRequest:
       description: "Rename payload: new slug. Old slug returns 404 immediately on the next request."
