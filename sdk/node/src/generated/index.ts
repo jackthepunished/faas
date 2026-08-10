@@ -51,6 +51,7 @@ export type { BillingPortalResponse } from './models/BillingPortalResponse.js';
 export type { BillingReconcileResponse } from './models/BillingReconcileResponse.js';
 export type { BuildExportResponse } from './models/BuildExportResponse.js';
 export type { BuildProvenanceResponse } from './models/BuildProvenanceResponse.js';
+export type { BuildResponse } from './models/BuildResponse.js';
 export type { ChangeMemberRoleRequest } from './models/ChangeMemberRoleRequest.js';
 export type { ChangePlanRequest } from './models/ChangePlanRequest.js';
 export type { ConsumedCreditRow } from './models/ConsumedCreditRow.js';
