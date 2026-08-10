@@ -1095,6 +1095,42 @@ type BuildProvenanceResponse struct {
 	FrameworkVer   string `json:"framework_version"`
 }
 
+// BuildResponse is the public surface of a builds row (DEPLOY-PROV-6 /
+// ADR-089, issue #741). Companion to BuildProvenanceResponse (post-
+// mortem export, ADR-038) and the /sbom route (post-mortem blob,
+// ADR-038 Phase 3): BuildResponse is the LIFECYCLE surface — status,
+// timestamps, failure_class, server-computed duration.
+//
+// Status mirrors builds.status, a 4-state enum (queued|running|
+// succeeded|failed) — schema.sql:662 CHECK constraint. 'cancelled'
+// from the original issue example is intentionally absent; the
+// schema doesn't support it and no transition code exists. Adding
+// it requires a separate migration + builderd path.
+//
+// failure_class is empty unless status='failed'; the failure_class
+// CHECK constraint is oom|timeout|user_error|infra (schema.sql:660).
+// error_message is NOT in this response — the detailed per-failure
+// string lives on deployments.error_message; clients that need it
+// should call GetDeployment(deployment_id). ADR-089 §4.
+//
+// duration_seconds is server-computed (FinishedAt-StartedAt) only
+// when both timestamps are set; the field is omitted otherwise so a
+// queued/running build stays minimal. CI scripts shouldn't have to
+// parse RFC3339 to compute elapsed time.
+type BuildResponse struct {
+	ID              string `json:"id"`
+	DeploymentID    string `json:"deployment_id"`
+	Kind            string `json:"kind"` // railpack|dockerfile|tarball|github
+	SourceBytes     int64  `json:"source_bytes"`
+	Status          string `json:"status"` // queued|running|succeeded|failed
+	FailureClass    string `json:"failure_class,omitempty"`
+	LogPath         string `json:"log_path,omitempty"`
+	EnqueuedAt      string `json:"enqueued_at"`
+	StartedAt       string `json:"started_at,omitempty"`
+	FinishedAt      string `json:"finished_at,omitempty"`
+	DurationSeconds int    `json:"duration_seconds,omitempty"`
+}
+
 // DeploymentResponse is a deployment as returned by the API.
 type DeploymentResponse struct {
 	ID          string `json:"id"`

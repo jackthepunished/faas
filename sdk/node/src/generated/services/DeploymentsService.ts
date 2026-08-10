@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { BuildProvenanceResponse } from '../models/BuildProvenanceResponse.js';
+import type { BuildResponse } from '../models/BuildResponse.js';
 import type { CreateDeploymentRequest } from '../models/CreateDeploymentRequest.js';
 import type { DeploymentListResponse } from '../models/DeploymentListResponse.js';
 import type { DeploymentResponse } from '../models/DeploymentResponse.js';
@@ -381,6 +382,56 @@ export class DeploymentsService {
       errors: {
         401: `code: unauthorized`,
         404: `Deployment row missing, cross-account probe, or scan has not run yet.`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+      },
+    });
+  }
+  /**
+   * Get build status.
+   * Returns the lifecycle row for a build id — current status,
+   * enqueued/started/finished timestamps, failure_class (when
+   * status='failed'), and a server-computed duration_seconds
+   * (only set when both started_at and finished_at are
+   * populated). Companion to /v1/builds/{id}/provenance (post-
+   * mortem export) and /v1/builds/{id}/sbom (post-mortem
+   * blob); this one is the LIFECYCLE surface CI scripts call
+   * to fail-fast on build error without scraping SSE.
+   *
+   * The status enum is `queued|running|succeeded|failed` (the
+   * builds_status_check CHECK constraint; no 'cancelled' value).
+   * failure_class, when present, is one of `oom|timeout|
+   * user_error|infra` (the builds_failure_class_check CHECK
+   * constraint). error_message is intentionally NOT in the
+   * response — it lives on deployments; call GET
+   * /v1/deployments/{id} for the per-failure string.
+   *
+   * @returns BuildResponse Build lifecycle row.
+   * @throws ApiError
+   */
+  public static getBuild({
+    id,
+  }: {
+    /**
+     * 32-hex-char opaque ID (NOT canonical UUID).
+     */
+    id: string,
+  }): CancelablePromise<BuildResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/builds/{id}',
+      path: {
+        'id': id,
+      },
+      errors: {
+        401: `code: unauthorized`,
+        404: `\`404 Not Found\` — the build id does not exist OR
+        belongs to another account. Stable code
+        \`build_not_found\`. The 404 surface is uniform so
+        cross-account probes can't enumerate.
+        `,
         429: `429. Two response shapes:
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).

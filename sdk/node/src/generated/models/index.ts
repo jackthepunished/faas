@@ -47,6 +47,7 @@ export type { BillingReconcileResponse } from './BillingReconcileResponse.js';
 export type { BillingRetryResponse } from './BillingRetryResponse.js';
 export type { BuildExportResponse } from './BuildExportResponse.js';
 export type { BuildProvenanceResponse } from './BuildProvenanceResponse.js';
+export type { BuildResponse } from './BuildResponse.js';
 export type { ChangeMemberRoleRequest } from './ChangeMemberRoleRequest.js';
 export type { ChangePlanRequest } from './ChangePlanRequest.js';
 export type { ConsumeInvoiceResponse } from './ConsumeInvoiceResponse.js';

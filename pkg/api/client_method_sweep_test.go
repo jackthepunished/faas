@@ -129,6 +129,25 @@ func TestSweep_GetBuildsIdSbom(t *testing.T) {
 	}
 }
 
+func TestSweep_GetBuildsId(t *testing.T) {
+	// DEPLOY-PROV-6 / ADR-089 (issue #741): the /v1/builds/{id}
+	// lifecycle surface. Body pins the field set so the
+	// json.Unmarshal-side stays covered by the sweep — when the
+	// DTO adds a field, this test pins the wire name as the
+	// sweep-server mock so a rename doesn't silently deserialise
+	// into the zero value.
+	body := `{"id":"b1","deployment_id":"d1","kind":"railpack","source_bytes":12345,"status":"running","enqueued_at":"2026-08-10T12:34:56Z","started_at":"2026-08-10T12:34:58Z"}`
+	srv, _ := newSweepServer(t, 200, body)
+	c := NewClient(srv.URL, "fp_test")
+	got, err := c.GetBuildsId(context.Background(), "b1")
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.ID != "b1" || got.Status != "running" || got.Kind != "railpack" {
+		t.Errorf("got = %+v", got)
+	}
+}
+
 func TestSweep_GetEgressAllowlistExtra(t *testing.T) {
 	srv, _ := newSweepServer(t, 200, `{}`)
 	c := NewClient(srv.URL, "fp_test")

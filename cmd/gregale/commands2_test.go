@@ -1539,3 +1539,243 @@ func TestCmdAppsRm_TypedConfirmation_Mismatch(t *testing.T) {
 		t.Errorf("method = %q, want empty (DELETE was not sent)", method)
 	}
 }
+
+// pollBuildStatus tests (DEPLOY-PROV-6 / ADR-089, issue #741).
+// Whitebox — `package main` so the unexported pollBuildStatus
+// helper is reachable. Test seams:
+//
+//   - httptest.NewServer wires the SDK Client base via FAAS_API
+//     + t.Setenv, same pattern as TestCmdOpen_ColdAppWaitsForWarm.
+//   - The build id on the dep fixture comes from
+//     api.DeploymentResponse (the polling caller already extracts
+//     dep.BuildID). Tests below pass that id through so the
+//     server's path mux sees the GET request land on the
+//     expected /v1/builds/{id} URL.
+//
+// Backoff pinning is intentionally loose: the function uses a
+// 1s base + jitter, so test timing assertions have to allow
+// for ±20% jitter and at least one sleep before resolving.
+
+// pollBuildStubCounting builds a deployment + build row, returns
+// the dep + a count of GETs so a test can assert how many
+// iterations the loop took before resolving.
+func pollBuildStubCounting(t *testing.T, statuses ...string) (*httptest.Server, api.DeploymentResponse, *int32) {
+	t.Helper()
+	var calls int32
+	if len(statuses) == 0 {
+		statuses = []string{"queued", "running", "running", "succeeded"}
+	}
+	idx := int32(0)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		i := atomic.AddInt32(&idx, 1) - 1
+		if i >= int32(len(statuses)) {
+			i = int32(len(statuses)) - 1
+		}
+		status := statuses[i]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"id":"build-abc","deployment_id":"dep-xyz","kind":"railpack","source_bytes":1,"status":%q,"enqueued_at":"2026-08-10T12:00:00Z","started_at":"2026-08-10T12:00:05Z","finished_at":"2026-08-10T12:00:10Z","duration_seconds":5}`, status))
+	}))
+	t.Cleanup(srv.Close)
+	dep := api.DeploymentResponse{
+		ID:      "dep-xyz",
+		AppID:   "hello",
+		BuildID: "build-abc",
+	}
+	return srv, dep, &calls
+}
+
+// TestPollBuildStatus_HappyPath pins: with a sequence that
+// terminates in "succeeded", pollBuildStatus returns (build, true)
+// and the returned status matches the server's last response.
+// We use the smallest possible backoff budget (deadline 4s) so
+// the test settles in well under 10s.
+func TestPollBuildStatus_HappyPath(t *testing.T) {
+	srv, dep, calls := pollBuildStubCounting(t, "queued", "running", "succeeded")
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	c := api.NewClient(srv.URL, "fp_live_x")
+	b, ok := pollBuildStatus(c, dep, 4*time.Second)
+	if !ok {
+		t.Fatalf("pollBuildStatus = (_, false), want (_, true) on terminal status")
+	}
+	if b.Status != "succeeded" {
+		t.Errorf("status = %q, want succeeded", b.Status)
+	}
+	if atomic.LoadInt32(calls) < 3 {
+		t.Errorf("calls = %d, want >= 3 (queued → running → succeeded)", atomic.LoadInt32(calls))
+	}
+}
+
+// TestPollBuildStatus_FailedBranch pins: a terminal "failed"
+// build returns (build, true) just like "succeeded" — the
+// loop exits on either terminal value. terminalExitForBuild
+// renders the exit 2 path; that's a separate concern.
+func TestPollBuildStatus_FailedBranch(t *testing.T) {
+	srv, dep, _ := pollBuildStubCounting(t, "queued", "running", "failed")
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	c := api.NewClient(srv.URL, "fp_live_x")
+	b, ok := pollBuildStatus(c, dep, 4*time.Second)
+	if !ok {
+		t.Fatalf("pollBuildStatus = (_, false), want (_, true) on failed status")
+	}
+	if b.Status != "failed" {
+		t.Errorf("status = %q, want failed", b.Status)
+	}
+}
+
+// TestPollBuildStatus_DeadlineElapses pins: when the server
+// never returns a terminal status, pollBuildStatus returns
+// (zero, false) after the deadline. The 200ms deadline is
+// tight enough to make the test fast (still allowing for the
+// 1s base backoff + jitter, so the loop has at most a couple
+// of iterations). We don't bound the upper iteration count —
+// only the elapsed wall-clock — because the jitter can delay
+// the loop past one deadline tick.
+func TestPollBuildStatus_DeadlineElapses(t *testing.T) {
+	srv, dep, _ := pollBuildStubCounting(t /* never terminates */, "running", "running", "running", "running", "running")
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	c := api.NewClient(srv.URL, "fp_live_x")
+	start := time.Now()
+	b, ok := pollBuildStatus(c, dep, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatalf("pollBuildStatus = (%+v, true), want (_, false) on deadline elapse", b)
+	}
+	// 200ms deadline + jitter/scheduling overhead: <2s is the
+	// generous bound the existing test for cmdOpen uses.
+	if elapsed > 2*time.Second {
+		t.Errorf("elapsed = %v, want <2s", elapsed)
+	}
+}
+
+// TestPollBuildStatus_NoBuildID pins the safety net: a
+// deployment with BuildID == "" (predates PROV-6) returns
+// (_, false) immediately so the SSE fallback can fall through
+// to pollDeploymentFinal instead of looping forever on a
+// known-broken pointer.
+func TestPollBuildStatus_NoBuildID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("server hit; pollBuildStatus should skip when BuildID is empty")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	c := api.NewClient(srv.URL, "fp_live_x")
+	dep := api.DeploymentResponse{ID: "dep-no-build", AppID: "hello", BuildID: ""}
+	if _, ok := pollBuildStatus(c, dep, time.Second); ok {
+		t.Fatal("pollBuildStatus = (_, true); want false on empty BuildID")
+	}
+}
+
+// TestTerminalExitForBuild_Succeeded pins the exit-code contract:
+// a succeeded build row renders the cold-wake banner + returns 0.
+// Mirrors terminalExitForDeployment's happy path (issue #64 D4).
+func TestTerminalExitForBuild_Succeeded(t *testing.T) {
+	var stdout bytes.Buffer
+	old := osStdout
+	osStdout = &stdout
+	defer func() { osStdout = old }()
+	code := terminalExitForBuild(api.BuildResponse{ID: "b", DeploymentID: "d", Status: "succeeded"}, "hello")
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "Deployed.") {
+		t.Errorf("missing success banner; got: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "scales to zero when idle") {
+		t.Errorf("missing cold-wake sentence; got: %s", stdout.String())
+	}
+}
+
+// TestTerminalExitForBuild_Failed pins: a failed build returns
+// exit 2 (same convention as terminalExitForDeployment's
+// renderDeployFailure path). The banner goes through PrintWarn
+// → os.Stderr directly (not the osStderr seam — same pattern as
+// every other PrintWarn(os.Stderr, ...) call in this file), so
+// the test pipes os.Stderr to a buffer via os.Pipe and reads it
+// back rather than swapping a seam variable.
+func TestTerminalExitForBuild_Failed(t *testing.T) {
+	origStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = origStderr }()
+
+	code := terminalExitForBuild(api.BuildResponse{
+		ID: "b", DeploymentID: "d", Status: "failed", FailureClass: "timeout",
+	}, "hello")
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+
+	if code != 2 {
+		t.Errorf("code = %d, want 2", code)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "build b failed") {
+		t.Errorf("missing failure banner on stderr; got: %s", got)
+	}
+	if !strings.Contains(got, "gregale logs --deployment d") {
+		t.Errorf("missing log-hint; got: %s", got)
+	}
+}
+
+// TestPollBuildStatus_HungServerHonoursDeadline pins the
+// context.WithTimeout fix (review finding #4): the loop must
+// return (_, false) within the deadline even when the server
+// accepts the connection and stalls indefinitely without
+// responding. Pre-fix, the loop called context.Background()
+// so the per-call context never cancelled; the SDK's 30s
+// http.Client timeout was the only safety net, which meant
+// the loop's worst-case wall-clock was unbounded if a hung
+// socket consumed that 30s budget.
+//
+// This test serves a request that sleeps far longer than the
+// deadline, returning 200 only after 5s — well past the test's
+// 500ms budget. Pre-fix, the client request would block until
+// the SDK's 30s http.Client.Timeout fired (or the server
+// returned); post-fix, the per-call context.WithTimeout
+// derived inside pollBuildStatus cancels the request when the
+// remaining deadline budget runs out.
+func TestPollBuildStatus_HungServerHonoursDeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Sleep longer than the deadline so the only thing
+		// protecting the wall-clock budget is the per-call
+		// context.WithTimeout. Returning 200 + JSON keeps the
+		// handler goroutine finite (no goroutine leak on
+		// httptest.Server.Close), unlike a `<-chan` block.
+		time.Sleep(5 * time.Second)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"b","deployment_id":"d","kind":"tarball","source_bytes":0,"status":"running","enqueued_at":"2026-08-10T12:00:00Z"}`)
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	c := api.NewClient(srv.URL, "fp_live_x")
+	dep := api.DeploymentResponse{
+		ID: "dep-hung", AppID: "hello", BuildID: "build-hung",
+	}
+	start := time.Now()
+	_, ok := pollBuildStatus(c, dep, 500*time.Millisecond)
+	elapsed := time.Since(start)
+	if ok {
+		t.Fatalf("pollBuildStatus = (_, true); want (_, false) on stalled server")
+	}
+	// 500ms deadline + scheduling overhead. Pre-fix this took
+	// ≥30s because the SDK's http.Client.Timeout was the only
+	// cap and the per-call ctx never fired.
+	if elapsed > 2*time.Second {
+		t.Errorf("elapsed = %v, want <2s (deadline budget; pre-fix this took ~30s)", elapsed)
+	}
+}

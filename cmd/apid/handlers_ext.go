@@ -2968,6 +2968,46 @@ func (s *server) buildProvenanceResponse(p state.BuildProvenance) api.BuildProve
 	}
 }
 
+// buildResponse projects a state.Build into the wire BuildResponse
+// (DEPLOY-PROV-6 / ADR-089, issue #741). state.Build is the
+// in-memory shape (string IDs, plain time.Time) — the sqlc
+// pgtype.Timestamptz values are translated to time.Time by the
+// store layer. We treat the zero time as "unset" (queued builds
+// have no started_at; running builds have no finished_at) and
+// rely on the omitempty tags on BuildResponse so the JSON stays
+// minimal.
+//
+// duration_seconds is server-computed: only set when BOTH
+// StartedAt and FinishedAt are non-zero — a CI script can always
+// rely on its presence meaning "the build reached a terminal
+// state and elapsed N wall-clock seconds."
+func (s *server) buildResponse(b state.Build) api.BuildResponse {
+	out := api.BuildResponse{
+		ID:           b.ID,
+		DeploymentID: b.DeploymentID,
+		Kind:         string(b.Kind),
+		SourceBytes:  b.SourceBytes,
+		Status:       string(b.Status),
+	}
+	if b.FailureClass != "" {
+		out.FailureClass = string(b.FailureClass)
+	}
+	if b.LogPath != "" {
+		out.LogPath = b.LogPath
+	}
+	if !b.StartedAt.IsZero() {
+		out.StartedAt = b.StartedAt.UTC().Format(time.RFC3339)
+	}
+	if !b.FinishedAt.IsZero() {
+		out.FinishedAt = b.FinishedAt.UTC().Format(time.RFC3339)
+	}
+	if !b.StartedAt.IsZero() && !b.FinishedAt.IsZero() {
+		out.DurationSeconds = int(b.FinishedAt.Sub(b.StartedAt).Seconds())
+	}
+	out.EnqueuedAt = b.EnqueuedAt.UTC().Format(time.RFC3339)
+	return out
+}
+
 // instanceResponse projects a state.Instance into the wire
 // InstanceResponse. The minInstancesTarget parameter carries the
 // parent app's effective min_instances (issue #557 / ADR-071) so
@@ -3539,6 +3579,45 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 	}
 }
 
+// getBuild returns the lifecycle row for a build id (DEPLOY-PROV-6
+// / ADR-089, issue #741). Companion to the ADR-038
+// /v1/builds/{id}/provenance (post-mortem export) and
+// /v1/builds/{id}/sbom (post-mortem blob) routes — this one is
+// the LIFECYCLE surface (status, timestamps, failure_class,
+// duration). CI scripts call this to fail-fast on build error
+// without scraping SSE; the CLI's streamDeployLogs fallback
+// (pollBuildStatus in commands2.go) also loops on it.
+//
+// IDOR chain mirrors getBuildProvenance: BuildByID →
+// DeploymentByID → AppByID, comparing App.AccountID against the
+// requesting account. Every negative path renders 404 with
+// code=build_not_found so cross-account probes can't enumerate.
+// The "no such build" envelope is shared with the other
+// /v1/builds/{id}/* routes.
+//
+// Per ADR-034 rev2 the route is gated by api.ScopesReadSurface
+// (the same chain as getBuildProvenance / getBuildSbom; see
+// cmd/apid/server.go:803).
+func (s *server) getBuild(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	id := r.PathValue("id")
+	build, err := s.store.BuildByID(r.Context(), id)
+	if err != nil {
+		api.WriteProblem(w, api.ErrBuildNotFound())
+		return
+	}
+	dep, err := s.store.DeploymentByID(r.Context(), build.DeploymentID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrBuildNotFound())
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), dep.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		api.WriteProblem(w, api.ErrBuildNotFound())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.buildResponse(build))
+}
+
 // getBuildProvenance returns the ADR-038 provenance row for a build
 // (Tier 3 / issue #197 B3.10-read half). Two-step ownership check:
 // BuildByID → DeploymentByID → AppByID, comparing App.AccountID against
@@ -3551,7 +3630,6 @@ func writeLogEvent(w http.ResponseWriter, flusher http.Flusher, e state.LogEntry
 // inside builderd.recordProvenance) renders 404 with code
 // build_provenance_not_found — distinct from "no such build"
 // so the customer can branch on the difference.
-//
 // Per ADR-034 rev2 the route is gated by the same `build:read`
 // scope the rest of the build surface uses.
 func (s *server) getBuildProvenance(w http.ResponseWriter, r *http.Request, acct state.Account) {
