@@ -10,7 +10,7 @@ import type { EdgeRuleRedirectAction } from './EdgeRuleRedirectAction.js';
 import type { EdgeRuleRewriteAction } from './EdgeRuleRewriteAction.js';
 import type { EdgeRuleRouteAction } from './EdgeRuleRouteAction.js';
 /**
- * Create an edge rule on an app.
+ * Body shape for POST /v1/apps/{slug}/edge-rules.
  */
 export type CreateEdgeRuleRequest = {
   match_host: string;
