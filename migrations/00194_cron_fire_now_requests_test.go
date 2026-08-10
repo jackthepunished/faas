@@ -1,13 +1,13 @@
 //go:build !no_pg
 
-// Migration-apply test for 00193_cron_fire_now_requests.sql
+// Migration-apply test for 00194_cron_fire_now_requests.sql
 // (ADR-090 PR-C / fire-now request queue).
 //
 // Pins:
 //
-//  1. Migration set applies cleanly through 00193 (no goose
+//  1. Migration set applies cleanly through 00194 (no goose
 //     duplicate-version panic against main's 00191 fence +
-//     00192 reserve slot fence).
+//     00192 edge_rules + 00193 reserve slot fence).
 //  2. cron_fire_now_requests table exists with the 5-column CHECK
 //     shape (status enum: pending|running|succeeded|failed|cancelled).
 //  3. The cron_id column has a FOREIGN KEY to crons(id) with
@@ -29,7 +29,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 )
 
-func TestMigrations_00193_CronFireNowRequests(t *testing.T) {
+func TestMigrations_00194_CronFireNowRequests(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.Open(t)
 
