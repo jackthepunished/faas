@@ -2499,8 +2499,17 @@ type QueueDeadLetterResponse struct {
 // timeline. The kind taxonomy is documented in
 // docs/adr/035-auth-audit-events.md; common values include
 // "auth.login", "auth.logout", "key.created", "key.deleted",
-// "secret.set", "secret.deleted", "account.plan_changed",
+// "secret.set", "secret.deleted", "secret.rotated",
+// "account.plan_changed",
 // "account.deletion_scheduled", "account.deletion_restored".
+//
+// ADR-089 PR-A: "secret.rotated" joins the kind vocabulary. It is
+// emitted by the per-secret rotate handler (PR-B) when the row
+// already had a value (rotation, not first-time set) and by
+// pkg/rekey.Replayer when the background re-seal pass rewrites a
+// row's ciphertext. The two cases are distinguished by the
+// audit_log.actor column ("apid" for user-initiated, "rekey"
+// for background) — see ADR-089 D2.
 //
 // Subject is the account_id the event was recorded against (string,
 // not the raw uuid UUID type — pkg/api stays string-typed for wire

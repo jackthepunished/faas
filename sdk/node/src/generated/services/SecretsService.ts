@@ -6,6 +6,8 @@ import type { AppSecretListResponse } from '../models/AppSecretListResponse.js';
 import type { AppSecretResponse } from '../models/AppSecretResponse.js';
 import type { ListSecretsForAccountResponse } from '../models/ListSecretsForAccountResponse.js';
 import type { PutAppSecretRequest } from '../models/PutAppSecretRequest.js';
+import type { RotateAppSecretRequest } from '../models/RotateAppSecretRequest.js';
+import type { RotateAppSecretResponse } from '../models/RotateAppSecretResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -119,6 +121,57 @@ export class SecretsService {
         - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
         - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
         `,
+      },
+    });
+  }
+  /**
+   * Re-seal a sealed secret under the current host identity.
+   * Re-seals the `(app_id, key)` row under the current host X25519
+   * recipient and stamps the kid column. Emits `secret.rotated`
+   * audit kind when the row already had a value; emits `secret.set`
+   * when the row was previously empty (first-time rotation). The
+   * same byte cap as PUT applies (`SecretValueMaxBytes`).
+   *
+   * @returns RotateAppSecretResponse The rotated sealed-secret envelope.
+   * @throws ApiError
+   */
+  public static rotateAppSecret({
+    slug,
+    key,
+    requestBody,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Secret key. Must start with a letter; A-Z, 0-9, underscore.
+     */
+    key: string,
+    /**
+     * New plaintext value. Sealed at rest server-side; plaintext never returned.
+     */
+    requestBody: RotateAppSecretRequest,
+  }): CancelablePromise<RotateAppSecretResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/secrets/{key}/rotate',
+      path: {
+        'slug': slug,
+        'key': key,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
+        413: `code: secret_value_too_large`,
+        429: `429. Two response shapes:
+        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
+        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        `,
+        503: `code: capacity_unavailable — no host headroom (alerting; should be near-impossible).`,
       },
     });
   }

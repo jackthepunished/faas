@@ -1049,6 +1049,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/secrets", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listSecretsForAccount))))
 	mux.HandleFunc("PUT /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.setSecret))))
 	mux.HandleFunc("DELETE /v1/apps/{slug}/secrets/{key}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.deleteSecret))))
+	// Per-secret rotation (ADR-089 PR-B). Distinct verb from PUT so
+	// dashboards filtering on audit kind='secret.rotated' see
+	// value-replacement events but not first-time sets. Same
+	// scope + MFA posture as secrets:write — losing the new
+	// plaintext is the loss-bearing case; the old plaintext was
+	// never in a loss position because the row being overwritten
+	// is already in the customer's hand.
+	mux.HandleFunc("POST /v1/apps/{slug}/secrets/{key}/rotate", s.authLimited(s.requireMFA(s.requireScope(api.ScopesSecretsWriteSurface...)(s.rotateAppSecret))))
 
 	// Per-app private-registry Basic Auth (issue #461 / ADR-062).
 	// Password is sealed server-side under namespace "registry_creds";

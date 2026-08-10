@@ -1926,6 +1926,54 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Per-secret rotation (ADR-089 PR-B) ──────────────────────────────────
+  # Distinct verb from PUT so dashboards filtering on the
+  # audit kind 'secret.rotated' see value-replacement events but
+  # not first-time sets. Same scope + MFA posture as
+  # secrets:write — losing the new plaintext is the loss-bearing
+  # case; the old plaintext was never in a loss position because
+  # the row being overwritten is already in the customer's hand.
+  # Any previously-parked snapshot still holds the prior
+  # plaintext until the next wake (drive1's cleartext env is
+  # frozen at park time).
+
+  /v1/apps/{slug}/secrets/{key}/rotate:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - $ref: '#/components/parameters/SecretKey'
+    post:
+      tags: [secrets]
+      operationId: rotateAppSecret
+      summary: Re-seal a sealed secret under the current host identity.
+      description: |
+        Re-seals the `(app_id, key)` row under the current host X25519
+        recipient and stamps the kid column. Emits `secret.rotated`
+        audit kind when the row already had a value; emits `secret.set`
+        when the row was previously empty (first-time rotation). The
+        same byte cap as PUT applies (`SecretValueMaxBytes`).
+      requestBody:
+        required: true
+        description: "New plaintext value. Sealed at rest server-side; plaintext never returned."
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RotateAppSecretRequest'
+              example: {"value":"sk_live_newvalue"}
+      responses:
+        '200':
+          description: The rotated sealed-secret envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateAppSecretResponse'
+                example: {"key":"STRIPE_KEY","rotated_at":"2026-08-10T11:37:52.123Z","kid":"age1q..."}
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/SecretValueTooLarge' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/CapacityUnavailable' }
+
   # ─── Per-app private-registry credentials (issue #461 / ADR-062) ────────
   # Sealed Basic Auth per (app, registry_host). Free plan returns 403
   # (RegistryCredentialMax == 0). Password is never returned; DELETE
@@ -8495,6 +8543,34 @@ components:
       properties:
         value: { type: string, description: 'Plaintext. Sealed server-side; never persisted in plaintext.' , example: "sk_test_secret_value"}
 
+    RotateAppSecretRequest:
+      description: |
+        Rotate a secret: new plaintext value (ADR-089 PR-B). Same wire
+        shape as `PutAppSecretRequest`; the rotate verb is distinct so
+        the server can emit the `secret.rotated` audit kind (vs
+        `secret.set` on PUT). Byte cap is the per-plan
+        `SecretValueMaxBytes`.
+      type: object
+      required: [value]
+      properties:
+        value: { type: string, description: 'New plaintext. Sealed server-side; never persisted in plaintext.', example: "sk_test_new_value" }
+
+    RotateAppSecretResponse:
+      description: |
+        Response from `POST /v1/apps/{slug}/secrets/{key}/rotate`. The
+        `kid` is the age-1... recipient string of the host identity that
+        sealed the new envelope (ADR-089 D4); `rotated_at` is
+        RFC3339Nano so two rotates in the same second produce distinct
+        timestamps. Empty `kid` means the row was rotated but the kid
+        was not stampable (rare — happens only if apid started without
+        host.age.pub, which the handler 503s for instead).
+      type: object
+      required: [key, rotated_at]
+      properties:
+        key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128, example: "DATABASE_URL" }
+        rotated_at: { type: string, format: date-time, example: "2026-08-10T11:37:52.123Z" }
+        kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row. Empty if kid was not stampable.", example: "age1q..." }
+
     AppSecretResponse:
       description: "A sealed secret envelope: key name, sealed ciphertext (server can't read it), version, and timestamps."
       type: object
@@ -8503,6 +8579,7 @@ components:
         key: { type: string, pattern: '^[A-Z][A-Z0-9_]*$', maxLength: 128 , example: "DATABASE_URL"}
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        kid: { type: string, description: "age-1... recipient string of the host identity that sealed this row (ADR-089). Empty for rows sealed before migration 00166.", example: "age1q..." }
 
     AppSecretListResponse:
       description: "Paginated list of sealed-secret envelopes (no plaintext)."

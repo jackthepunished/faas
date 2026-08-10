@@ -1499,6 +1499,17 @@ func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
 }
 
+// RotateSecret (ADR-089 PR-B) re-seals the (slug, key) row under
+// the current host identity. Distinct verb from SetSecret so the
+// server can emit the secret.rotated audit kind (vs secret.set).
+// Returns the RotateAppSecretResponse so the CLI can render the
+// rotated_at timestamp and the kid.
+func (c *Client) RotateSecret(ctx context.Context, slug, key, value string) (RotateAppSecretResponse, error) {
+	var out RotateAppSecretResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/secrets/"+key+"/rotate",
+		RotateAppSecretRequest{Value: value}, &out)
+}
+
 // Per-app private-registry Basic Auth (issue #461 / ADR-062). Password
 // is sealed at rest server-side; the SDK only carries plaintext in the
 // PUT body and never sees the ciphertext. Hosts MUST be supplied with

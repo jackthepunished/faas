@@ -7786,6 +7786,9 @@ func (m *MemStore) ListDeploymentLogs(_ context.Context, deploymentID string, be
 // updated_at is bumped on every call so schedd's wake staging observes a
 // fresh mtime even when the ciphertext is identical (rotation flows
 // re-seal with the same plaintext).
+//
+// ADR-089 PR-A: preserves the pre-PR-A wire shape (no kid stamp)
+// for backward compatibility. New callers use UpsertAppSecretWithKid.
 func (m *MemStore) UpsertAppSecret(_ context.Context, accountID, appID, key string, ciphertext []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -7805,6 +7808,45 @@ func (m *MemStore) UpsertAppSecret(_ context.Context, accountID, appID, key stri
 	return nil
 }
 
+// UpsertAppSecretWithKid is the kid-stamping sibling of
+// UpsertAppSecret (ADR-089 PR-A). Mirrors the pgstore impl — see
+// pkg/state/pgstore.go::UpsertAppSecretWithKid for the rationale.
+func (m *MemStore) UpsertAppSecretWithKid(_ context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := secretKey{AppID: appID, Key: key}
+	existing, ok := m.secrets[k]
+	now := time.Now()
+	if !ok {
+		m.secrets[k] = AppSecret{AccountID: accountID, AppID: appID, Key: key, Ciphertext: ciphertext, Kid: kid, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}
+	if existing.AccountID != accountID {
+		return ErrNotFound
+	}
+	existing.Ciphertext = ciphertext
+	existing.Kid = kid
+	existing.UpdatedAt = now
+	m.secrets[k] = existing
+	return nil
+}
+
+// GetAppSecret returns the (account_id, app_id, key) row.
+// Returns ErrNotFound when no row matches — same semantics as
+// PgStore so the rotate handler (PR-B) renders 400
+// CodeSecretNotFound for missing keys.
+func (m *MemStore) GetAppSecret(_ context.Context, accountID, appID, key string) (*AppSecret, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := secretKey{AppID: appID, Key: key}
+	row, ok := m.secrets[k]
+	if !ok || row.AccountID != accountID {
+		return nil, ErrNotFound
+	}
+	cp := row
+	return &cp, nil
+}
+
 // DeleteAppSecret removes the (account_id, app_id, key) row. Returns
 // ErrNotFound when no row matches — same semantics as PgStore so the
 // handler renders 400 CodeSecretNotFound.
@@ -7818,6 +7860,50 @@ func (m *MemStore) DeleteAppSecret(_ context.Context, accountID, appID, key stri
 	}
 	delete(m.secrets, k)
 	return nil
+}
+
+// ListAppSecretsForRekey is the global paginated walk consumed by
+// pkg/rekey.Replayer.Run (ADR-089 PR-A). Order is
+// (account_id ASC, app_id ASC, key ASC) so the cursor walk is
+// monotonic — see pkg/state/pgstore.go::ListAppSecretsForRekey for
+// the SQL counterpart.
+func (m *MemStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor string) ([]AppSecret, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var curAcct, curApp, curKey string
+	if cursor != "" {
+		parts := strings.SplitN(cursor, "|", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("memstore: malformed rekey cursor %q", cursor)
+		}
+		curAcct, curApp, curKey = parts[0], parts[1], parts[2]
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var all []AppSecret
+	for _, s := range m.secrets {
+		if curAcct != "" {
+			cmp := strings.Compare(s.AccountID, curAcct)
+			if cmp < 0 || (cmp == 0 && (s.AppID < curApp || (s.AppID == curApp && s.Key <= curKey))) {
+				continue
+			}
+		}
+		all = append(all, s)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].AccountID != all[j].AccountID {
+			return all[i].AccountID < all[j].AccountID
+		}
+		if all[i].AppID != all[j].AppID {
+			return all[i].AppID < all[j].AppID
+		}
+		return all[i].Key < all[j].Key
+	})
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
 }
 
 // ListAppSecrets returns every secret on the app, scoped to accountID.

@@ -9654,6 +9654,14 @@ func (s *PgStore) PutIdempotent(ctx context.Context, accountID, key string, stat
 // updated_at is bumped on conflict so schedd's "freshest per app" cache
 // can re-stage drive1 even if the value didn't change (matters for
 // rotation flows that re-seal with the same plaintext).
+//
+// ADR-089 PR-A: this method preserves the pre-PR-A wire shape (no kid
+// stamp) for backward compatibility with existing call sites that
+// don't track the sealing identity — webhook secret stores, the
+// alert-rule dispatcher, etc. New callers (the per-secret rotate
+// handler in PR-B, the rekey.Replayer in PR-A) use
+// UpsertAppSecretWithKid which stamps kid alongside the new
+// ciphertext.
 func (s *PgStore) UpsertAppSecret(ctx context.Context, accountID, appID, key string, ciphertext []byte) error {
 	_, err := s.pool.Exec(ctx,
 		`insert into app_secrets (account_id, app_id, key, ciphertext)
@@ -9663,6 +9671,119 @@ func (s *PgStore) UpsertAppSecret(ctx context.Context, accountID, appID, key str
 		       updated_at = now()`,
 		accountID, appID, key, ciphertext)
 	return err
+}
+
+// UpsertAppSecretWithKid is the kid-stamping sibling of
+// UpsertAppSecret (ADR-089 PR-A / migration 00166). The kid column
+// records which host identity sealed the row so operators can
+// answer "what key sealed this row?" without parsing the
+// ciphertext blob.
+//
+// ADR-089 D4: the kid is stamped at every Seal, both the user-
+// initiated rotate handler (PR-B) and the rekey.Replayer (PR-A).
+// Rows sealed before this PR stay with kid = "" until a subsequent
+// Seal (re-key, re-seal, or new PUT) stamps them. The rekey pass
+// walks every row and re-seals anything with kid != current, so
+// after Replayer.Run completes the entire app_secrets table has
+// kid = current.
+func (s *PgStore) UpsertAppSecretWithKid(ctx context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+	_, err := s.pool.Exec(ctx,
+		`insert into app_secrets (account_id, app_id, key, ciphertext, kid)
+		 values ($1, $2, $3, $4, $5)
+		 on conflict (app_id, key) do update
+		   set ciphertext = excluded.ciphertext,
+		       kid = excluded.kid,
+		       updated_at = now()`,
+		accountID, appID, key, ciphertext, kid)
+	return err
+}
+
+// GetAppSecret returns the (account_id, app_id, key) row including
+// ciphertext, kid, and timestamps. Returns ErrNotFound when no
+// row matches the (account_id, app_id, key) triple. Used by the
+// per-secret rotate handler (PR-B) to distinguish first-time set
+// (emits secret.set audit kind) from rotation (emits secret.rotated).
+func (s *PgStore) GetAppSecret(ctx context.Context, accountID, appID, key string) (*AppSecret, error) {
+	var out AppSecret
+	err := s.pool.QueryRow(ctx,
+		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		 from app_secrets
+		 where account_id = $1 and app_id = $2 and key = $3`,
+		accountID, appID, key).Scan(
+		&out.AccountID, &out.AppID, &out.Key, &out.Ciphertext, &out.Kid, &out.CreatedAt, &out.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListAppSecretsForRekey is the global paginated walk consumed by
+// pkg/rekey.Replayer.Run (ADR-089 PR-A). Order is
+// (account_id ASC, app_id ASC, key ASC) so a cursor based on the
+// last visited tuple yields a deterministic continuation across
+// daemon restarts.
+//
+// The cursor is "<account_id>|<app_id>|<key>" from
+// RekeyProgress.LastID; an empty cursor starts from the
+// beginning. limit is clamped to [1, 200] — values outside this
+// range are silently coerced to 50, matching RekeyConfig.BatchSize
+// default. Tests use small limits (≤10) to drive deterministic
+// walks.
+//
+// CRASH-SAFETY: the WHERE clause uses COMPOSITE greater-than-or-
+// equal. This pairs with pkg/rekey/Replayer.Run's
+// per-row cursor advance + per-run seen-set dedupe: every row is
+// visited at least once per Run (the >= fence brings back rows
+// whose persist failed on a previous Run), but the seen-set
+// prevents redundant re-processing within a single Run. A row
+// whose persist fails mid-Run is retried in the next Run —
+// after `gregale host-age prune-previous` the previous-key
+// envelope would otherwise become permanently unreadable on a
+// skipped row.
+//
+// Cross-account: this query intentionally returns rows across
+// every account. The Replayer is an operator-driven background
+// pass (FAAS_REKEY_ENABLED=true), not a customer-facing API; the
+// pgx role already has read access to every account's app_secrets
+// rows because vmmd unseals every customer's envelopes at wake
+// time. The rekey pass is the same trust perimeter.
+func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor string) ([]AppSecret, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var (
+		curAcct, curApp, curKey string
+	)
+	if cursor != "" {
+		parts := strings.SplitN(cursor, "|", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("pgstore: malformed rekey cursor %q", cursor)
+		}
+		curAcct, curApp, curKey = parts[0], parts[1], parts[2]
+	}
+	rows, err := s.pool.Query(ctx,
+		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
+		 from app_secrets
+		 where ($1 = '' or (account_id, app_id, key) >= ($1, $2, $3))
+		 order by account_id asc, app_id asc, key asc
+		 limit $4`,
+		curAcct, curApp, curKey, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AppSecret
+	for rows.Next() {
+		var r AppSecret
+		if err := rows.Scan(&r.AccountID, &r.AppID, &r.Key, &r.Ciphertext, &r.Kid, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // DeleteAppSecret removes the (app_id, key) row scoped to accountID.
@@ -9687,9 +9808,17 @@ func (s *PgStore) DeleteAppSecret(ctx context.Context, accountID, appID, key str
 // rotated order of upserts doesn't shuffle the env map on every wake).
 // Returns nil slice (not error) when the app has no secrets — schedd
 // treats that as "no env file to write".
+//
+// ADR-089 PR-A: select list widened to include the new kid column
+// (migration 00166). schedd's wake-time reader (pkg/sched/engine.go
+// loadSealedEnvFor) does NOT consume kid — it only needs (key,
+// ciphertext) to hand to vmmd — but reading the column keeps the
+// AppSecret struct symmetric with UpsertAppSecretWithKid and avoids
+// the "kid missing on read but present on write" inconsistency
+// surfaced in PR review of issue #736.
 func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) ([]AppSecret, error) {
 	rows, err := s.pool.Query(ctx,
-		`select account_id, app_id, key, ciphertext, created_at, updated_at
+		`select account_id, app_id, key, ciphertext, coalesce(kid, '') as kid, created_at, updated_at
 		 from app_secrets
 		 where account_id = $1 and app_id = $2
 		 order by key asc`,
@@ -9701,7 +9830,7 @@ func (s *PgStore) ListAppSecrets(ctx context.Context, accountID, appID string) (
 	var out []AppSecret
 	for rows.Next() {
 		var s AppSecret
-		if err := rows.Scan(&s.AccountID, &s.AppID, &s.Key, &s.Ciphertext, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.AccountID, &s.AppID, &s.Key, &s.Ciphertext, &s.Kid, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

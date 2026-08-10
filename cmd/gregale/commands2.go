@@ -25,11 +25,19 @@ import (
 // Subcommand names — lifted to constants so goconst stops flagging the
 // repeated "list"/"add"/"rm" string literals in the dispatch tables below.
 const (
-	subList    = "list"
-	subAdd     = "add"
-	subUpdate  = "update"
-	subRm      = "rm"
-	subRuns    = "runs"
+	subList   = "list"
+	subAdd    = "add"
+	subUpdate = "update"
+	subRm     = "rm"
+	subRuns   = "runs"
+	// subRotate is reused across every resource's `… rotate …`
+	// subcommand literal (host-age, keys, pki, secrets, sign-keys,
+	// node-key, etc.) so goconst stops flagging the repeated
+	// "rotate" string in the cli_meta.go manifest + the dispatch
+	// switches in commands2/3.go. Per-resource dispatch sites that
+	// want stronger typing keep their own name-spaced const
+	// (subHostAgeRotate / subPKIRotate / etc.).
+	subRotate  = "rotate"
 	subSummary = "summary"
 	// subLogsTail is the inner-subcommand name for `gregale logs
 	// tail <slug>` (issue #315 / tier-2 DX). Lifted from the
@@ -1467,7 +1475,7 @@ func cmdKeys(args []string) int {
 		}
 		PrintOK(osStdout, "Removed")
 		return 0
-	case "rotate":
+	case subRotate:
 		return cmdKeysRotate(args[1:])
 	case "grace-window":
 		return cmdKeysGraceWindow(args[1:])
