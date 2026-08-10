@@ -18,18 +18,21 @@ type Config struct {
 	// Loaded from FAAS_PADDLE_SANDBOX env ("1" / "true" → true).
 	// Default false (production).
 	Sandbox bool `toml:"sandbox"`
+	// ToleranceSeconds is the replay-protection window applied
+	// symmetrically (rejects future-dated timestamps too). Mirrors
+	// stripe.Config.ToleranceSeconds. PR-P4 introduced the operator
+	// knob; pre-PR-P4 the value was hard-coded to 5*time.Minute in
+	// the apid handler. Defaults to webhookDefaultToleranceSeconds
+	// (300s, matching Stripe) when <= 0 — the verifier in
+	// pkg/billing/paddle/webhook.go clamps to the default at zero
+	// so a misconfigured 0 doesn't disable replay protection.
+	ToleranceSeconds int `toml:"webhook_tolerance_seconds"`
 }
 
 // Defaults fills in working defaults for missing fields. Idempotent —
 // a second call leaves populated fields untouched. Kept as a method
 // (not inlined into LoadBillingConfig) so a future Paddle field with
 // a default can fill in here without churning call sites.
-//
-// Today every field either defaults to its zero value (APIKey,
-// WebhookSecret empty; Sandbox false) or is required-environment-set
-// (the env-overlay in pkg/billing/loader/config.go handles the latter).
-// The method exists purely for shape-parity with stripe.Config so the
-// loader treats both providers identically.
 func (c *Config) Defaults() {
 	// No-op today. See method doc.
 }

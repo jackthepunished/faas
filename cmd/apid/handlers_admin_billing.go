@@ -246,22 +246,29 @@ func (s *server) reconcileAccount(w http.ResponseWriter, r *http.Request, acct s
 			"apid booted without a billing provider; reconcile is not reachable"))
 		return
 	}
-	target, err := s.store.AccountByID(r.Context(), targetID)
-	if err != nil {
-		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
-			"Account not found", err.Error()))
-		return
-	}
+
 	// Capability gate. Stripe's ReconcileUsage is a stub returning
 	// ErrNotImplemented (pkg/billing/stripe/client.go) and Stripe's
 	// Capabilities bitmask does NOT include CapUsageReconcile. Without
 	// this check an operator on Stripe sees a misleading 501 citing
 	// "ADR-049 §B.1" even though that capability is absent. Mirror the
 	// reconciler's gate (pkg/billing/reconciler/reconciler.go).
+	//
+	// PR-P4 review finding #2: this gate MUST fire before
+	// s.store.AccountByID — otherwise every Stripe reconcile hits
+	// Postgres then 501s. Capability-gate before DB hit is the
+	// standard ordering across all admin endpoints (see the gate
+	// at handlers_admin.go for /v1/admin/users).
 	if !s.billingProvider.Capabilities().Has(billing.CapUsageReconcile) {
 		api.WriteProblem(w, api.NewProblem(http.StatusNotImplemented, "billing_reconcile_unsupported",
 			"Billing provider does not support reconcile",
 			providerName(s.billingProvider)+" does not advertise CapUsageReconcile; reconcile is unavailable on this provider"))
+		return
+	}
+	target, err := s.store.AccountByID(r.Context(), targetID)
+	if err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound,
+			"Account not found", err.Error()))
 		return
 	}
 	// [start, end) window: rolling 30 days. The reconciler

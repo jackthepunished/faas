@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
@@ -193,19 +194,44 @@ func Providers() []ProviderMeta {
 				if cfg != nil {
 					paddleCfg = cfg.Paddle
 				}
-				tomlAPIKey, tomlSecret, tomlSandbox := "", "", false
+				tomlAPIKey, tomlSecret, tomlSandbox, tomlTolerance := "", "", false, 0
 				if paddleCfg != nil {
 					tomlAPIKey = paddleCfg.APIKey
 					tomlSecret = paddleCfg.WebhookSecret
 					tomlSandbox = paddleCfg.Sandbox
+					tomlTolerance = paddleCfg.ToleranceSeconds
 				}
 				sandbox := resolveSandbox(env("FAAS_PADDLE_SANDBOX"), tomlSandbox)
-				return paddle.NewProvider(
+				p := paddle.NewProvider(
 					resolveSecret(env("FAAS_PADDLE_API_KEY"), tomlAPIKey),
 					resolveSecret(env("FAAS_PADDLE_WEBHOOK_SECRET"), tomlSecret),
 					sandbox,
 					log,
-				), nil
+				)
+				// PR-P4 — install the operator-configured webhook
+				// tolerance. The single source of truth is
+				// tomlTolerance (cfg.Paddle.ToleranceSeconds), already
+				// populated by ApplyBillingEnvOverlay with the
+				// env-vs-TOML precedence applied (env wins; bad
+				// parse is silently dropped — see
+				// TestApplyBillingEnvOverlay_FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS).
+				//
+				// PR-P4 review finding #3: an earlier revision also
+				// read env("FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS")
+				// here and re-parsed it. That duplicated the
+				// overlay's parser and created two paths that could
+				// drift if one was updated and the other wasn't.
+				// Removed; if you need to change the parser, edit
+				// ApplyBillingEnvOverlay in config.go.
+				//
+				// A value <= 0 leaves p.webhookTolerance at 0, which
+				// WebhookTolerance() clamps to the default —
+				// pre-PR-P4 behaviour is preserved when the operator
+				// has not configured the knob.
+				if tomlTolerance > 0 {
+					p.SetWebhookTolerance(time.Duration(tomlTolerance) * time.Second)
+				}
+				return p, nil
 			},
 			BuildMeterd: func(cfg *RootBillingConfig, env func(string) string, store state.Store, log *slog.Logger) (any, error) {
 				var paddleCfg *paddle.Config

@@ -84,6 +84,14 @@ type Provider struct {
 	// the catalog map updates in ensureProducts); reads hold the
 	// RLock via the snapshot helpers.
 	lastSyncAt time.Time
+	// webhookTolerance is the replay-protection window applied
+	// during VerifyWebhook. PR-P4 introduced the operator knob
+	// (FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS); pre-PR-P4 the value
+	// was hard-coded at the apid handler call-site. Zero value
+	// means "use the verifier's clamp-to-default behaviour" —
+	// WebhookTolerance() resolves this to webhookDefaultTolerance
+	// so callers don't have to special-case 0.
+	webhookTolerance time.Duration
 }
 
 // paddleOverageLease is the lease window for a ClaimPaddleOverageWindow
@@ -91,6 +99,31 @@ type Provider struct {
 // < 30s); short enough that a crashed pod's claim is reaped within
 // one boot-cycle of any peer. Configurable later via env if needed.
 const paddleOverageLease = 5 * time.Minute
+
+// WebhookTolerance returns the configured replay-protection window,
+// clamped to webhookDefaultTolerance when unset / <= 0. Operators
+// configure via FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS or
+// [billing.paddle].webhook_tolerance_seconds in TOML (PR-P4); the
+// apid handler reads this rather than the literal `5*time.Minute`
+// the pre-PR-P4 code path used.
+func (p *Provider) WebhookTolerance() time.Duration {
+	if p.webhookTolerance <= 0 {
+		return webhookDefaultTolerance
+	}
+	return p.webhookTolerance
+}
+
+// SetWebhookTolerance installs the configured replay-protection
+// window. Called by the loader once after NewProvider so the
+// constructor signature stays stable for the existing test suite.
+// Safe to call before any VerifyWebhook call.
+func (p *Provider) SetWebhookTolerance(d time.Duration) {
+	if d <= 0 {
+		p.webhookTolerance = 0 // WebhookTolerance() clamps to default.
+		return
+	}
+	p.webhookTolerance = d
+}
 
 // claimedBy returns the per-process identity stamp used to mark
 // paddle_overage_dedupe rows in the claimed_by column. Falls back

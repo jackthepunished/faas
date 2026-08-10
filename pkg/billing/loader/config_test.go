@@ -274,6 +274,46 @@ func TestApplyBillingEnvOverlay_FAAS_PADDLE_SANDBOX_AcceptsTrueVariants(t *testi
 	}
 }
 
+// TestApplyBillingEnvOverlay_FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS (PR-P4).
+// Validates that the operator knob propagates into cfg.Paddle.ToleranceSeconds,
+// that a bad parse (non-integer) is silently dropped (matching the
+// "stale TOML is safer than a noisy Warn" rationale), and that env wins
+// over TOML (matching every other ApplyBillingEnvOverlay case).
+func TestApplyBillingEnvOverlay_FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS(t *testing.T) {
+	cases := []struct {
+		name    string
+		envVal  string
+		tomlVal int
+		want    int
+	}{
+		{name: "env overrides TOML", envVal: "120", tomlVal: 300, want: 120},
+		{name: "env alone", envVal: "60", tomlVal: 0, want: 60},
+		{name: "TOML alone", envVal: "", tomlVal: 600, want: 600},
+		{name: "neither", envVal: "", tomlVal: 0, want: 0},
+		{name: "bad parse silently dropped", envVal: "not-a-number", tomlVal: 300, want: 300},
+		{name: "zero is preserved (operator opted out)", envVal: "0", tomlVal: 300, want: 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := func(k string) string {
+				if k == "FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS" {
+					return c.envVal
+				}
+				return ""
+			}
+			cfg := &RootBillingConfig{
+				Stripe: &stripe.Config{},
+				Paddle: &paddle.Config{ToleranceSeconds: c.tomlVal},
+			}
+			cfg = ApplyBillingEnvOverlay(cfg, env)
+			if cfg.Paddle.ToleranceSeconds != c.want {
+				t.Errorf("got ToleranceSeconds=%d, want %d (env=%q, toml=%d)",
+					cfg.Paddle.ToleranceSeconds, c.want, c.envVal, c.tomlVal)
+			}
+		})
+	}
+}
+
 func TestApplyBillingEnvOverlay_FAAS_BILLING_PROVIDER_OverridesTOML(t *testing.T) {
 	// TOML provider = "stripe" + env FAAS_BILLING_PROVIDER="paddle" →
 	// cfg.Provider must be "paddle" (env wins).

@@ -67,6 +67,31 @@ check "faas-apid.service uses LoadCredential=" bash -c '
   grep -q "^LoadCredential=faas_session_key:" /etc/systemd/system/faas-apid.service
 '
 
+# 6. PR-P4 — billing provider mode.
+# When FAAS_BILLING_PROVIDER=paddle, FAAS_PADDLE_API_KEY MUST be set
+# (apid refuses to boot otherwise). When sandbox=1, the key MUST
+# start with pdl_sandbox_; otherwise it MUST start with pdl_live_.
+# When FAAS_BILLING_PROVIDER is unset or "stripe", this check
+# skips (the default path is unchanged).
+if [[ -f /etc/faas/sealed.env ]] \
+   && grep -q "^FAAS_BILLING_PROVIDER=paddle" /etc/faas/sealed.env; then
+  check "sealed.env has FAAS_PADDLE_API_KEY when provider=paddle" bash -c '
+    grep -q "^FAAS_PADDLE_API_KEY=pdl_" /etc/faas/sealed.env
+  '
+  if grep -qE "^FAAS_PADDLE_SANDBOX=(1|true)" /etc/faas/sealed.env; then
+    check "FAAS_PADDLE_API_KEY starts with pdl_sandbox_ when sandbox=1" bash -c '
+      grep -q "^FAAS_PADDLE_API_KEY=pdl_sandbox_" /etc/faas/sealed.env
+    '
+  else
+    check "FAAS_PADDLE_API_KEY starts with pdl_live_ when sandbox=0" bash -c '
+      grep -q "^FAAS_PADDLE_API_KEY=pdl_live_" /etc/faas/sealed.env
+    '
+  fi
+  check "sealed.env has FAAS_PADDLE_WEBHOOK_SECRET when provider=paddle" bash -c '
+    grep -q "^FAAS_PADDLE_WEBHOOK_SECRET=whk_" /etc/faas/sealed.env
+  '
+fi
+
 echo
 echo "Summary: ${pass} passed, ${fail} failed"
 if [[ "${fail}" -ne 0 ]]; then

@@ -117,5 +117,14 @@ verification.
 - PR #3 (this ADR's landing PR) — rewires apid + meterd to dispatch
   through the same Provider interface, adds the 5th method
   (`CreateUpgradeTransaction`), and ships the operator runbook.
-- PR #4 (deferred) — dashboard + CLI surface for `paddle_checkout_url`
-  rendering; column rename to `provider_customer_id`.
+- PR #4 (operator runbook + secrets + webhook hardening) — does NOT
+  rename the column; the rename `accounts.stripe_customer_id → accounts.provider_customer_id`
+  shipped in migration **00040**, well before this PR. PR #4 adds the
+  operator runbook, sealed.env fix, `FAAS_PADDLE_WEBHOOK_TOLERANCE_SECONDS`,
+  the verify-fail + replay-suppressed log/counter pair, and un-skips
+  tests 2 + 3 of the sandbox walk. The dashboard + CLI surface for
+  `paddle_checkout_url` rendering remains deferred and is re-numbered
+  to **PR #5** below.
+- PR #5 (deferred, post-PR-4) — dashboard + CLI surface for
+  `paddle_checkout_url` rendering. Independent of PR #4 (no shared
+  code paths).

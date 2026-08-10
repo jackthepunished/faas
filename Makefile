@@ -169,6 +169,11 @@ check-state-coverage: ## Assert pkg/state coverage ≥ 70% from existing profile
 migrations-check: ## Static migration-contiguity check (no Postgres needed) — PR #93 follow-up
 	$(GO) test -tags no_pg -race -count=1 -run 'TestMigrations' ./migrations/...
 
+.PHONY: verify-secrets
+verify-secrets: ## PR-P4: assert /etc/faas/sealed.env (or the file passed via SECRETS_FILE) is shaped correctly. CI runs this on every PR.
+	@test -x deploy/scripts/verify-secrets.sh || (echo "deploy/scripts/verify-secrets.sh missing or not executable" ; exit 1)
+	@SECRETS_FILE=$${SECRETS_FILE:-/etc/faas/sealed.env} bash deploy/scripts/verify-secrets.sh
+
 .PHONY: test-load
 test-load: ## Hot-path load test (1k rps, //go:build load) — spec §14 M4 row 2. Needs ≥ 2 vCPU.
 	$(GO) test -tags=load -race -count=1 -v -timeout=10m ./pkg/gateway/...
@@ -203,6 +208,18 @@ e2e-sandbox: ## Live Paddle sandbox walk (operator-only; PR-P3). Reads secrets f
 	# is exported. The build tag keeps the file out of `go test ./...`
 	# CI runs. The secrets file is gitignored.
 	FAAS_PADDLE_SANDBOX_E2E=1 $(GO) test -tags paddle_sandbox_e2e -race -count=1 -run=PaddleSandbox -timeout=10m ./cmd/e2e/...
+
+.PHONY: doctor-paddle
+doctor-paddle: ## PR-P4 operator smoke: run `gregale billing status --watch` for 60s + tail faas-apid journal for paddle_webhook.verify_failed lines. Operator-only.
+	@test -x ./bin/gregale || (echo "./bin/gregale missing; run \`make build\` first" ; exit 1)
+	@echo "→ Watching billing status for 60s (Ctrl-C to exit early)…"
+	@timeout 60 ./bin/gregale billing status --watch || true
+	@echo "→ Tailing faas-apid journal for paddle_webhook.verify_failed (last 5 min)…"
+	@if command -v journalctl >/dev/null 2>&1; then \
+		journalctl -u faas-apid --since "5 min ago" --no-pager | grep paddle_webhook.verify_failed || echo "no verify_failed lines in last 5 min"; \
+	else \
+		echo "journalctl not on PATH; on a Mac dev box, run \`make doctor-paddle\` on the actual control-plane node"; \
+	fi
 
 .PHONY: backup-pg
 backup-pg: ## Take a Postgres base backup into /var/lib/pgsql/basebackup/basebackup-<UTC>/ (spec §14 M8)

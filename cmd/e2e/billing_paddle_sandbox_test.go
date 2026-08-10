@@ -70,6 +70,100 @@ import (
 // FAAS_PADDLE_SANDBOX_WEBHOOK_SECRET — whk_… from the same Dashboard
 const sandboxSecretsPath = "secrets/.env.sandbox"
 
+// sandboxHandoffPath is the /tmp/ JSON file Test 1 writes after a
+// successful checkout-URL round-trip so tests 2 and 3 can chain. The
+// file is created with mode 0600 and deleted via t.Cleanup so a
+// stale handoff from a prior failed run never leaks into a fresh
+// one. /tmp/ is OS-managed and not in .gitignore (not needed — the
+// directory is wiped on reboot on most Linux distros).
+//
+// PR-P4 replaced the t.Skip placeholders with real implementations
+// that read this handoff. Pre-PR-P4 the file did not exist and the
+// two follow-on tests were stubs.
+const sandboxHandoffPath = "/tmp/faas-paddle-sandbox-handoff.json"
+
+// sandboxHarnessPtr is a package-level handle to the harness booted
+// by Test 1, set immediately after StartWithEnv returns. Tests 2 + 3
+// read it via getSandboxHarness() to issue the same state.NewPgStore
+// reads that account_scoped_e2e_test.go:46 uses. Lives in the same
+// Go test process as the three PaddleSandbox_ tests, so the Go
+// runtime guarantees the visibility.
+//
+// Set by Test 1, read by Tests 2/3. No mutex needed because
+// `go test` runs the three tests serially in source order when
+// invoked as `go test -run TestPaddleSandbox` — parallel-mode is
+// opt-in via `t.Parallel()` and none of the three call it. An
+// operator who re-runs tests 2/3 standalone must have populated
+// the handoff file by hand; in that case getSandboxHarness() skips
+// the test (the standalone path never boots a harness).
+var sandboxHarnessPtr *e2etest.Harness
+
+// sandboxHandoff is the JSON shape on disk. Field tags use
+// snake_case so an operator who runs `cat` on the file gets the
+// same names they see in the Paddle dashboard.
+type sandboxHandoff struct {
+	CheckoutURL    string `json:"checkout_url"`
+	TxID           string `json:"tx_id"`
+	CustomerID     string `json:"customer_id"`
+	SubscriptionID string `json:"subscription_id"`
+	AccountID      string `json:"account_id"`
+	APIDURL        string `json:"apid_url"`
+	WebhookSecret  string `json:"webhook_secret"`
+}
+
+// getSandboxHarness returns the harness booted by Test 1 or skips
+// the calling test. Standalone re-runs of tests 2/3 never have a
+// harness in scope (Test 1 didn't run), so we skip instead of
+// failing — that's the same contract readSandboxHandoff uses for
+// the JSON file.
+func getSandboxHarness(t *testing.T) *e2etest.Harness {
+	t.Helper()
+	if sandboxHarnessPtr == nil {
+		t.Skip("no sandbox harness in memory; run TestPaddleSandbox_ChangePlanReturnsCheckoutURL first")
+	}
+	return sandboxHarnessPtr
+}
+
+// writeSandboxHandoff atomically writes the handoff struct as JSON.
+// Mode 0600 keeps the webhook_secret out of group/world-readable
+// state; the file lives in /tmp/ so a leaked permission is still
+// limited to the local host.
+func writeSandboxHandoff(t *testing.T, h sandboxHandoff) {
+	t.Helper()
+	b, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal handoff: %v", err)
+	}
+	if err := os.WriteFile(sandboxHandoffPath, b, 0o600); err != nil {
+		t.Fatalf("write handoff %s: %v", sandboxHandoffPath, err)
+	}
+	t.Cleanup(func() {
+		// Best-effort delete — the next run overwrites anyway, but
+		// a stale handoff on a developer's box is a footgun.
+		_ = os.Remove(sandboxHandoffPath)
+	})
+}
+
+// readSandboxHandoff reads + validates the handoff file. Skips the
+// test (rather than failing) when the handoff is missing — that's
+// the contract that lets an operator re-run a single follow-on
+// test without re-running Test 1, by populating the file manually.
+func readSandboxHandoff(t *testing.T) sandboxHandoff {
+	t.Helper()
+	b, err := os.ReadFile(sandboxHandoffPath)
+	if err != nil {
+		t.Skipf("missing handoff %s: %v — run TestPaddleSandbox_ChangePlanReturnsCheckoutURL first", sandboxHandoffPath, err)
+	}
+	var h sandboxHandoff
+	if err := json.Unmarshal(b, &h); err != nil {
+		t.Fatalf("parse handoff %s: %v", sandboxHandoffPath, err)
+	}
+	if h.CustomerID == "" || h.CheckoutURL == "" || h.APIDURL == "" || h.WebhookSecret == "" {
+		t.Skipf("handoff %s missing required fields; re-run TestPaddleSandbox_ChangePlanReturnsCheckoutURL", sandboxHandoffPath)
+	}
+	return h
+}
+
 // loadSandboxSecrets reads secrets/.env.sandbox. Returns the (apiKey,
 // webhookSecret) pair or skips the test if the file is missing.
 // Operator opt-in: the test only runs when both the env var AND the
@@ -149,6 +243,7 @@ func TestPaddleSandbox_ChangePlanReturnsCheckoutURL(t *testing.T) {
 		t.Fatalf("MigrateUp: %v", err)
 	}
 	h := startAPIDForPaddleSandbox(t, pool, apiKey, webhookSecret)
+	sandboxHarnessPtr = h // exposed for Tests 2/3 (no public CurrentHarness())
 
 	// Sign up via the apid harness.
 	signupBody, _ := json.Marshal(map[string]any{
@@ -208,6 +303,41 @@ func TestPaddleSandbox_ChangePlanReturnsCheckoutURL(t *testing.T) {
 		t.Errorf("billing_portal_url = %q, want empty on Paddle path", prob.BillingPortalURL)
 	}
 	t.Logf("changePlan: ctm_url=%s tx_id=%s", prob.PaddleCheckoutURL, prob.TxID)
+
+	// Read back the customer_id minted by the Paddle sidecar so the
+	// follow-on tests (subscription.created / transaction.completed)
+	// can chain without a second CreateCustomer round-trip. The pgstore
+	// stamps acct.ProviderCustomerID when the sidecar returns 201; this
+	// Read is the tripwire that proves the sidecar's persistence path
+	// matches the sign-up row. AccountByID returns ErrNotFound on a
+	// missing row — we surface that as a hard fail, not a t.Skip,
+	// because it would indicate the sidecar's 201 was a no-op.
+	st := state.NewPgStore(h.Pool)
+	acct, err := st.AccountByID(ctx, signup.Account.ID)
+	if err != nil {
+		t.Fatalf("AccountByID(%s) post-sidecar: %v", signup.Account.ID, err)
+	}
+	if acct.ProviderCustomerID == "" {
+		t.Fatalf("acct.ProviderCustomerID is empty after free→hobby 402; sidecar 201 likely never stamped the row")
+	}
+
+	// Subscription id is optional — the sandbox-sidecar may mint one
+	// alongside the customer id or defer it to subscription.created.
+	// Either way, write whatever we have so tests 2/3 can choose the
+	// right payload shape.
+	subscriptionID := ""
+	// We don't have a direct handle to the sub_id in the 402 problem
+	// body; the webhook in test 2 will assert sub_id from the event.
+
+	writeSandboxHandoff(t, sandboxHandoff{
+		CheckoutURL:    prob.PaddleCheckoutURL,
+		TxID:           prob.TxID,
+		CustomerID:     acct.ProviderCustomerID,
+		SubscriptionID: subscriptionID,
+		AccountID:      signup.Account.ID,
+		APIDURL:        h.APIDURL,
+		WebhookSecret:  webhookSecret,
+	})
 }
 
 // TestPaddleSandbox_SubscriptionCreatedStampsCustomerID POSTs a
@@ -216,13 +346,71 @@ func TestPaddleSandbox_ChangePlanReturnsCheckoutURL(t *testing.T) {
 // via the existing webhook logic (subscription.created's
 // data.customer_id round-trip). Asserts the round-trip persisted.
 //
-// In a sequential CI run the test would chain against Test 1 via
-// a file; in standalone mode (a developer re-running just this test)
-// it self-seeds by calling EnsurePlanProducts + CreateCustomer
-// directly through the apid harness — out of scope for this PR-P3
-// commit. The standalone path is documented but not auto-discovered.
+// Sequenced via /tmp/faas-paddle-sandbox-handoff.json: Test 1 writes
+// {checkout_url, tx_id, customer_id, account_id, apid_url,
+// webhook_secret}; this test reads it and posts the signed event
+// against handoff.APIDURL. The harness pointer stashed in
+// sandboxHarnessPtr lets us read the account row post-webhook via
+// the same pgxpool the booted apid uses — no second pool needed.
 func TestPaddleSandbox_SubscriptionCreatedStampsCustomerID(t *testing.T) {
-	t.Skip("sequential dependency on TestPaddleSandbox_ChangePlanReturnsCheckoutURL; documented for operator re-runs")
+	_, _ = loadSandboxSecrets(t) // gate on secrets-file + env var; webhookSecret comes via handoff
+
+	handoff := readSandboxHandoff(t)
+	h := getSandboxHarness(t)
+	ctx := context.Background()
+
+	// Build a synthetic subscription.created payload whose
+	// data.customer_id matches the sidecar-minted customer. The
+	// subscription id is fresh — the sandbox-sidecar mints it on
+	// the first event, not on the free→hobby 402 path.
+	subID := fmt.Sprintf("sub_test_%d", time.Now().UnixNano())
+	body := []byte(fmt.Sprintf(`{
+  "event_id": "evt_test_sub_%d",
+  "event_type": "subscription.created",
+  "occurred_at": %q,
+  "data": {
+    "id": %q,
+    "customer_id": %q,
+    "status": "active",
+    "items": [{"price": {"id": "pri_test_local_cli"}}]
+  }
+}`, time.Now().UnixNano(), time.Now().UTC().Format(time.RFC3339), subID, handoff.CustomerID))
+
+	// Sign with the operator's sandbox webhook_secret so the
+	// verifier on the server side accepts it (the secret in
+	// sealed.env is the one registered on the Paddle dashboard's
+	// webhook endpoint). SignForTestForTest's doubled suffix is a
+	// "do not call from prod code" tripwire — test-only signature.
+	sig := paddle.SignForTestForTest(body, handoff.WebhookSecret, time.Now())
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		handoff.APIDURL+"/v1/webhooks/paddle", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Paddle-Signature", sig)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST subscription.created: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("subscription.created: status=%d body=%s", resp.StatusCode, respBody)
+	}
+
+	// Re-read the account row via the harness's pool; the handler
+	// stamps acct.ProviderCustomerID on subscription.created. The
+	// column has carried that name since migration 00040 (the rename
+	// predates PR-P4); the expectation is unchanged: the customer
+	// id is on the row.
+	st := state.NewPgStore(h.Pool)
+	acct, err := st.AccountByID(ctx, handoff.AccountID)
+	if err != nil {
+		t.Fatalf("AccountByID(%s) post-subscription.created: %v", handoff.AccountID, err)
+	}
+	if acct.ProviderCustomerID != handoff.CustomerID {
+		t.Errorf("acct.ProviderCustomerID = %q, want %q (subscription.created must stamp the sidecar-minted id)", acct.ProviderCustomerID, handoff.CustomerID)
+	}
+	t.Logf("subscription.created: account=%s provider_customer_id=%s", acct.ID, acct.ProviderCustomerID)
 }
 
 // TestPaddleSandbox_TransactionCompletedIsNoop POSTs a signed
@@ -238,16 +426,65 @@ func TestPaddleSandbox_SubscriptionCreatedStampsCustomerID(t *testing.T) {
 // flips transaction.completed to EventPaymentFailed would land on
 // the wrong branch and break the dunning state machine.
 func TestPaddleSandbox_TransactionCompletedIsNoop(t *testing.T) {
-	t.Skip("sequential dependency on TestPaddleSandbox_ChangePlanReturnsCheckoutURL; documented for operator re-runs")
+	handoff := readSandboxHandoff(t)
+	h := getSandboxHarness(t)
+	ctx := context.Background()
+
+	// Build a synthetic transaction.completed payload whose
+	// data.id matches the tx_id from the free→hobby 402. The
+	// transaction id is the operator-visible billing handle; Paddle
+	// uses it for refunds and for the customer portal "Recent
+	// activity" view.
+	body := []byte(fmt.Sprintf(`{
+  "event_id": "evt_test_tx_%d",
+  "event_type": "transaction.completed",
+  "occurred_at": %q,
+  "data": {
+    "id": %q,
+    "customer_id": %q,
+    "status": "completed",
+    "items": [{"price": {"id": "pri_test_local_cli"}}]
+  }
+}`, time.Now().UnixNano(), time.Now().UTC().Format(time.RFC3339), handoff.TxID, handoff.CustomerID))
+
+	sig := paddle.SignForTestForTest(body, handoff.WebhookSecret, time.Now())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		handoff.APIDURL+"/v1/webhooks/paddle", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Paddle-Signature", sig)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST transaction.completed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("transaction.completed: status=%d body=%s", resp.StatusCode, respBody)
+	}
+
+	// Read the account row + assert dunning state is unchanged.
+	// transaction.completed is informational (no state flip) — the
+	// acct.Status guard inside EventPaymentSucceeded should keep it
+	// on the active path. If a future refactor accidentally maps
+	// transaction.completed to EventPaymentFailed, the dunning
+	// status would flip and this assertion would fail.
+	st := state.NewPgStore(h.Pool)
+	acct, err := st.AccountByID(ctx, handoff.AccountID)
+	if err != nil {
+		t.Fatalf("AccountByID(%s) post-transaction.completed: %v", handoff.AccountID, err)
+	}
+	if string(acct.Status) != "active" {
+		t.Errorf("acct.Status = %q, want \"active\" (transaction.completed is informational; must not flip dunning state)", acct.Status)
+	}
+	t.Logf("transaction.completed: account=%s status=%s", acct.ID, acct.Status)
 }
 
 // _ pins the paddle package import — used by the signing helper
-// (paddle.SignForTestForTest) we would reuse in the
-// subscription.created / transaction.completed tests when the
-// sequential dependency is unwound.
+// (paddle.SignForTestForTest) in the subscription.created /
+// transaction.completed tests.
 var _ = paddle.SignForTestForTest
 
 // _ pins the state package import for AccountByID access in the
-// test body. The full sequential test will assert against the
-// MemStore.PgStore account row post-webhook.
+// test bodies above. The full sequential tests assert against the
+// pgstore account row post-webhook.
 var _ state.Account

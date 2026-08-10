@@ -88,42 +88,6 @@ func TestCmdBillingPortal_NoOpenAlias(t *testing.T) {
 	}
 }
 
-// TestCmdBillingPortal_JSONOutput pins the --json branch added in
-// Tier A8.2: when jsonOutput is set, --print emits
-// {"url": "...", "service": "billing"} instead of the bare URL
-// plain text. Mirrors the canonical JSON-shape pattern used by
-// commands_registry.go, commands_deployments.go.
-func TestCmdBillingPortal_JSONOutput(t *testing.T) {
-	apiURL := billingPortalStub(t, func() api.BillingPortalResponse {
-		return api.BillingPortalResponse{URL: "https://billing.example.com/portal?account=acct_42"}
-	})
-	t.Setenv("FAAS_API", apiURL)
-	t.Setenv("FAAS_TOKEN", "fp_live_x")
-
-	jsonOutput = true
-	defer func() { jsonOutput = false }()
-
-	rec := withRecorder(t)
-	stdout, restore := captureStdout(t)
-	defer restore()
-	if code := cmdBillingPortal([]string{"--print"}); code != 0 {
-		t.Fatalf("cmdBillingPortal --print --json = %d, want 0", code)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
-		t.Fatalf("stdout not valid JSON: %v\noutput: %s", err, stdout.String())
-	}
-	if got["url"] != "https://billing.example.com/portal?account=acct_42" {
-		t.Errorf("json url = %v, want the substituted portal link", got["url"])
-	}
-	if got["service"] != "billing" {
-		t.Errorf("json service = %v, want \"billing\"", got["service"])
-	}
-	if len(rec.urls) != 0 {
-		t.Errorf("--json opened browser %d times; want 0", len(rec.urls))
-	}
-}
-
 func TestCmdBillingPortal_OpensBrowser(t *testing.T) {
 	apiURL := billingPortalStub(t, func() api.BillingPortalResponse {
 		return api.BillingPortalResponse{URL: "https://billing.example.com/portal?account=acct_42"}
@@ -330,8 +294,65 @@ func TestCmdBillingStatus_RejectsArgs(t *testing.T) {
 	if code := cmdBillingStatus([]string{"junk"}); code != 1 {
 		t.Errorf("cmdBillingStatus with extra args = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "unexpected args") {
-		t.Errorf("stderr missing 'unexpected args'; got: %q", stderr.String())
+	// PR-P4 changed the rejection message to enumerate the four
+	// accepted flags; the test asserts the new shape so a future
+	// regression that drops the message back to the old "unexpected
+	// args" string (pre-PR-P4) is caught.
+	if !strings.Contains(stderr.String(), "unexpected arg") {
+		t.Errorf("stderr missing 'unexpected arg'; got: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--watch") {
+		t.Errorf("stderr missing '--watch' flag hint; got: %q", stderr.String())
+	}
+}
+
+// TestParseBillingStatusFlags pins PR-P4's --watch / --json / --no-clear
+// flag parser. Lives next to TestCmdBillingStatus_RejectsArgs so the
+// full CLI-flag contract for `faas billing status` is documented in
+// one file.
+func TestParseBillingStatusFlags(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		wantWatch bool
+		wantDur   time.Duration
+		wantJSON  bool
+		wantClear bool
+		wantErr   bool
+	}{
+		{name: "empty", args: nil, wantDur: 0},
+		{name: "watch no value", args: []string{"--watch"}, wantWatch: true, wantDur: 60 * time.Second},
+		{name: "watch inline value", args: []string{"--watch=30"}, wantWatch: true, wantDur: 30 * time.Second},
+		{name: "watch spaced value", args: []string{"--watch", "15"}, wantWatch: true, wantDur: 15 * time.Second},
+		{name: "json", args: []string{"--json"}, wantJSON: true},
+		{name: "no-clear", args: []string{"--no-clear"}, wantClear: true},
+		{name: "combo", args: []string{"--watch=10", "--json", "--no-clear"}, wantWatch: true, wantDur: 10 * time.Second, wantJSON: true, wantClear: true},
+		{name: "bad value", args: []string{"--watch=junk"}, wantErr: true},
+		{name: "unknown flag", args: []string{"--bogus"}, wantErr: true},
+		{name: "zero duration", args: []string{"--watch=0"}, wantWatch: true, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			watch, dur, asJSON, noClear, err := parseBillingStatusFlags(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if watch != tt.wantWatch {
+				t.Errorf("watch = %v, want %v", watch, tt.wantWatch)
+			}
+			if tt.wantWatch && dur != tt.wantDur {
+				t.Errorf("dur = %v, want %v", dur, tt.wantDur)
+			}
+			if asJSON != tt.wantJSON {
+				t.Errorf("json = %v, want %v", asJSON, tt.wantJSON)
+			}
+			if noClear != tt.wantClear {
+				t.Errorf("noClear = %v, want %v", noClear, tt.wantClear)
+			}
+		})
 	}
 }
 

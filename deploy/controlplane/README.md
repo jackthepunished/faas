@@ -181,6 +181,13 @@ GITHUB_CLIENT_SECRET=<oauth-app-client-secret>
 ```
 
 After editing `/etc/faas/sealed.env`, restart apid: `sudo systemctl restart faas-apid`.
+
+For the Paddle-specific cutover (flipping `FAAS_BILLING_PROVIDER` from `stripe` to `paddle`, rotating `FAAS_PADDLE_API_KEY`, hardening the webhook tolerance), see the operator runbook:
+
+- [`docs/ops/billing-provider-switch.md`](../../docs/ops/billing-provider-switch.md) — canonical Stripe ↔ Paddle cutover procedure (PR-P4).
+- [`docs/ops/secrets-rotation.md`](../../docs/ops/secrets-rotation.md) — cadence + per-secret rotation steps.
+- [`make verify-secrets`](../../Makefile) — static + content gate against `/etc/faas/sealed.env`; safe to run on a control-plane node.
+
 Verify with:
 
 ```bash

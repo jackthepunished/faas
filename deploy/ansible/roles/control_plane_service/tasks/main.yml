@@ -408,3 +408,31 @@
   failed_when: not faas_imaged_rwp_stat.stat.exists
   loop_control:
     label: "{{ item }}"
+
+# PR-P4 — soft assert on Paddle provider secrets (operator warning).
+# When FAAS_BILLING_PROVIDER=paddle is in /etc/faas/sealed.env, the
+# apid daemon refuses to boot without FAAS_PADDLE_API_KEY, so a
+# missing key already fails loud at the daemon level — we surface
+# it here too as a belt-and-braces so the operator sees it BEFORE
+# the systemd daemon-reload attempts the apid start. Soft assert:
+# not failed_when, because (a) the env may not be populated yet on
+# a fresh box where the operator intends to fill it post-bootstrap
+# and (b) the actual fail-closed is the daemon's own boot error.
+# The debug line is only emitted when the provider selector is set
+# to paddle — a Stripe-default install reports nothing.
+- name: control_plane_service — soft assert FAAS_PADDLE_API_KEY present when provider=paddle (PR-P4)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if grep -qE '^FAAS_BILLING_PROVIDER=paddle$' /etc/faas/sealed.env 2>/dev/null; then
+      if ! grep -qE '^FAAS_PADDLE_API_KEY=pdl_' /etc/faas/sealed.env; then
+        echo "WARNING: FAAS_BILLING_PROVIDER=paddle set but FAAS_PADDLE_API_KEY is missing or empty; apid will refuse to boot. Fill in /etc/faas/sealed.env before restarting the daemon."
+        exit 0
+      fi
+      echo "Paddle billing provider selected — FAAS_PADDLE_API_KEY present (mode-tripwire deferred to verify-secrets.sh + daemon-level fail-closed)."
+    fi
+  changed_when: false
+  register: faas_paddle_soft_assert
+- name: control_plane_service — debug Paddle soft assert
+  ansible.builtin.debug:
+    msg: "{{ faas_paddle_soft_assert.stdout }}"
+  when: faas_paddle_soft_assert.stdout != ""

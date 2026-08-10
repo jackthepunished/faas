@@ -1,14 +1,17 @@
 // commands_billing.go — `faas billing …` family (issue #253).
 //
-//   faas billing                 dispatch help (prints subcommand list)
-//   faas billing portal          open the Stripe billing portal in your browser
-//                                (or print the URL when --print is set / DISPLAY
-//                                is unavailable)
-//   faas billing status          read the active billing Provider's cached
-//                                catalog (PR-P3)
-//   faas billing price-catalog   list | sync | reset the Paddle catalog (PR-P3)
-//   faas billing reconcile       run a single-account reconcile via the active
-//                                billing Provider (PR-P3)
+//   faas billing                       dispatch help (prints subcommand list)
+//   faas billing portal                open the Stripe billing portal in your browser
+//                                      (or print the URL when --print is set / DISPLAY
+//                                      is unavailable)
+//   faas billing status                read the active billing Provider's cached
+//                                      catalog (PR-P3)
+//   faas billing status --watch N     re-poll the catalog every 5 s for N seconds (PR-P4)
+//   faas billing price-catalog         list | sync | reset the Paddle catalog (PR-P3)
+//   faas billing reconcile             run a single-account reconcile via the active
+//                                      billing Provider (PR-P3)
+//   faas billing webhook-test          signed round-trip POST to a webhook URL (PR-P4,
+//                                      operator-only; mirrors the production signer)
 //
 // This is the CLI companion to GET /dashboard/billing's "Open Stripe
 // billing portal" button. Same URL, same auth chain (Bearer via
@@ -56,6 +59,8 @@ func cmdBilling(args []string) int {
 		return cmdBillingPriceCatalog(args[1:])
 	case billingSubReconcile:
 		return cmdBillingReconcile(args[1:])
+	case billingSubWebhookTest:
+		return cmdBillingWebhookTest(args[1:])
 	case billingSubHelp, flagHelpShort, flagHelpLong:
 		printBillingUsage(osStdout)
 		return 0
@@ -73,8 +78,11 @@ func printBillingUsage(w io.Writer) {
 		"  portal              open the Stripe billing portal in your browser\n"+
 		"                      (--print  print URL to stdout only; --no-open  skip browser)\n"+
 		"  status              read the active billing Provider's cached catalog (Paddle-only)\n"+
+		"                      (--watch N  re-poll every 5 s for N seconds; --json  emit JSON)\n"+
 		"  price-catalog       list | sync | reset the Paddle price + product catalog\n"+
 		"  reconcile <id>      run a single-account reconcile via the active billing Provider\n"+
+		"  webhook-test        signed round-trip POST to a webhook URL (operator-only)\n"+
+		"                      (faas billing webhook-test paddle --url … --secret …)\n"+
 		"\n"+
 		"Run 'faas billing help' for this message.\n")
 }
