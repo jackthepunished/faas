@@ -900,6 +900,44 @@ type OpsMetrics struct {
 	// be present so /metrics doesn't show a 404 for cmd/<other>
 	// scrapes that incidentally probe the prefix).
 	rebalanceDecisions *prometheus.CounterVec
+	// appAtCapacityTotal: Tier A9 / ADR-087 capacity-pressure
+	// trigger observability. Counter labelled by (app, kind)
+	// where kind ∈ {wake, admit, scaleup, floor} — the closed set
+	// of engine return sites that can produce
+	// WakeResult{AtCapacity: true}. The `app` label is bounded by
+	// the running app set on the owning schedd (AtCapacity is a
+	// hot-app signal; the per-app series churns out as the app
+	// cools). The metric is the §12 dashboard panel for the
+	// pressure-rebalancer trigger rate; a sustained non-zero rate
+	// per app is the indicator that the fleet needs tuning
+	// (consider raising capacity on the owner schedd, or
+	// spreading the customer across multi-app deployments).
+	// Single-registry: registered on every daemon (mirrors the
+	// rebalanceDecisions pattern); only schedd increments via
+	// AppAtCapacityTotal (the engine callsite stamps
+	// `app=appID, kind=branch`). Pre-instantiated in
+	// NewOpsMetrics below — kind labels are pre-instantiated at
+	// boot, app labels populate lazily on first wake.
+	appAtCapacityTotal *prometheus.CounterVec
+	// pressureReassignmentsTotal: Tier A9 / ADR-087
+	// pressure-rebalancer observability. Counter labelled by
+	// outcome ∈ {migrated, peer_live_migrated, conflict,
+	// no_headroom, no_eligibility, no_peer} — the closed set
+	// the pressure-rebalancer's batch loop can land in once per
+	// app per sweep. `migrated` is the §12 dashboard panel
+	// (sum over 5m for the rate); `peer_live_migrated` is the
+	// tripwire for the four-phase live handoff firing on the
+	// pressure path (a non-zero rate means the policy gate
+	// opened the live migration window); `no_headroom` is the
+	// tripwire for sustained full-cluster pressure (call the
+	// operator). `no_peer` fires when the only active compute
+	// node is the owner (single-box mode or fleet-wide drain).
+	// Single-registry: registered on every daemon (mirrors the
+	// rebalanceDecisions / liveMigrationDecisions pattern);
+	// only schedd increments via PressureReassignments. Pre-
+	// instantiated at boot so the rows surface in /metrics from
+	// the moment schedd starts.
+	pressureReassignmentsTotal *prometheus.CounterVec
 	// migratingReconcileDecisions: Tier A6 / ADR-067
 	// migrating-instance watchdog observability. Counter labelled
 	// by outcome ∈ {reinvited, hard_deleted, conflict, error} —
@@ -1153,6 +1191,38 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_rebalance_decisions_total",
 		Help: "Count of per-app decisions the Tier A4 cross-node rebalancer made on a drain event (ADR-064), labelled by outcome ∈ {migrated, conflict, no_headroom, cooldown, no_eligibility}. The migrated counter is the §12 rebalance-rate panel.",
 	}, []string{"outcome"})
+	// ADR-087 / Tier A9: per-(app, kind) AtCapacity trigger counter.
+	// Labelled by (app, kind); kind is pre-instantiated at boot so the
+	// kind=* rows surface in /metrics from the moment schedd starts
+	// (matching the precedent at the requestTotal / requestFailures
+	// counter initialiser pattern). The app label is populated lazily
+	// on first wake — the per-app series churns out as the app cools,
+	// keeping the active series count bounded by the per-schedd live
+	// app set. Single-registry: registered on every daemon (mirrors
+	// rebalanceDecisions); only schedd increments via
+	// AppAtCapacityTotal.
+	appAtCapacityTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_at_capacity_total",
+		Help: "Count of WakeResult{AtCapacity: true} returns the engine produced, labelled by app id and the engine branch that returned the no-op (kind ∈ {wake, admit, scaleup, floor}). The per-app rate is the §12 dashboard panel for the pressure-rebalancer trigger (ADR-087); a sustained non-zero rate per app means the customer's wake load is bumping the owner's max_concurrency ceiling. Single-registry: registered on every daemon (mirrors rebalanceDecisions); only schedd increments via AppAtCapacityTotal.",
+	}, []string{"app", "kind"})
+	for _, kind := range []string{"wake", "admit", "scaleup", "floor"} {
+		appAtCapacityTotal.WithLabelValues("__none__", kind)
+	}
+	// ADR-087 / Tier A9: pressure-rebalancer decision counter.
+	// Labelled by outcome ∈ {migrated, peer_live_migrated, conflict,
+	// no_headroom, no_eligibility, no_peer}. The closed set is
+	// pre-instantiated at boot so the rows surface in /metrics from
+	// the moment schedd starts (matching the rebalanceDecisions /
+	// liveMigrationDecisions precedent). Single-registry: registered
+	// on every daemon (mirrors rebalanceDecisions); only schedd
+	// increments via PressureReassignments.
+	pressureReassignmentsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_pressure_reassignments_total",
+		Help: "Cross-node capacity-pressure rebalance decisions (Tier A9 / ADR-087), labelled by outcome ∈ {migrated, peer_live_migrated, conflict, no_headroom, no_eligibility, no_peer}. `migrated` is the §12 dashboard panel (sum over 5m for the rate); `peer_live_migrated` is the tripwire for the policy gate opening the four-phase live handoff (ADR-066) on the pressure path; `no_headroom` is the tripwire for sustained full-cluster pressure (call the operator). Single-registry: registered on every daemon (mirrors rebalanceDecisions / liveMigrationDecisions); only schedd increments via PressureReassignments.",
+	}, []string{"outcome"})
+	for _, outcome := range []string{"migrated", "peer_live_migrated", "conflict", "no_headroom", "no_eligibility", "no_peer"} {
+		pressureReassignmentsTotal.WithLabelValues(outcome)
+	}
 	eventsWriteFail := prometheus.NewCounter(prometheus.CounterOpts{
 		Name: prefix + "_events_write_failures_total",
 		Help: "Count of state-transitions whose events audit-log row could not be written. The transition itself succeeded; this is observation-only (the state row is the source of truth).",
@@ -1915,6 +1985,16 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Help: "Dead-node billing reconciler decisions, labelled by outcome ∈ {failed, conflict, error}. `failed` counts RUNNING instances terminated because their compute_node stopped heartbeating past the staleness window — each one was billing the customer for a VM that no longer existed and holding §6.2-2 RAM ceiling. A sustained non-zero `failed` rate is an incident signal (a vmmd is dying without transitioning its rows), not routine repair. `conflict` is the benign peer-wins/node-recovered path.",
 	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors, deadNodeReconcileDecisions)
+	// ADR-087 / Tier A9: pressure-rebalancer decision counter.
+	// Single-registry: registered on every daemon (mirrors
+	// deadNodeReconcileDecisions); only schedd increments via
+	// PressureReassignments in production.
+	commonCollectors = append(commonCollectors, pressureReassignmentsTotal)
+	// ADR-087 / Tier A9: per-(app, kind) AtCapacity trigger counter.
+	// Single-registry: registered on every daemon (mirrors
+	// deadNodeReconcileDecisions); only schedd increments via
+	// AppAtCapacityTotal in production.
+	commonCollectors = append(commonCollectors, appAtCapacityTotal)
 	// ADR-062 / issue #461: registry-credential mark-used failure
 	// counter. Unlabelled Counter (no cardinality risk); pre-
 	// instantiated at boot so the row surfaces in /metrics from
@@ -2342,6 +2422,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		liveMigrationDecisions:             liveMigrationDecisions,
 		rebalanceDecisions:                 rebalanceDecisions,
 		migratingReconcileDecisions:        migratingReconcileDecisions,
+		appAtCapacityTotal:                 appAtCapacityTotal,
+		pressureReassignmentsTotal:         pressureReassignmentsTotal,
 		activePassiveFailoversTotal:        activePassiveFailoversTotal,
 		standbyState:                       standbyState,
 		standbyStateValue:                  StandbyStateWarming, // mirrors the gauge.Set(StandbyStateWarming) above
@@ -2562,6 +2644,38 @@ func (m *OpsMetrics) TailCapReached(plan string) prometheus.Counter {
 // WatchdogKills — the returned Counter is safe to retain.
 func (m *OpsMetrics) RebalanceDecisions(outcome string) prometheus.Counter {
 	return m.rebalanceDecisions.WithLabelValues(outcome)
+}
+
+// AppAtCapacityTotal returns the per-(app, kind) counter the
+// engine increments at every WakeResult{AtCapacity: true} return
+// site (Tier A9 / ADR-087). app is the customer app id; kind ∈
+// {wake, admit, scaleup, floor} is the engine branch that
+// produced the no-op. The per-app rate is the §12 dashboard
+// panel for the pressure-rebalancer trigger. Same caching rules
+// as RebalanceDecisions — the returned Counter is safe to retain.
+// Nil-safe on receiver so a unit test without metrics keeps
+// building.
+func (m *OpsMetrics) AppAtCapacityTotal(app, kind string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.appAtCapacityTotal.WithLabelValues(app, kind)
+}
+
+// PressureReassignments returns the per-(outcome) counter the
+// Tier A9 / ADR-087 pressure-rebalancer increments once per app
+// per sweep. outcome ∈ {migrated, peer_live_migrated, conflict,
+// no_headroom, no_eligibility, no_peer}. `migrated` is the §12
+// dashboard panel; `peer_live_migrated` is the tripwire for the
+// policy gate opening the four-phase live handoff (ADR-066);
+// `no_headroom` is the tripwire for sustained full-cluster
+// pressure (call the operator). Same caching rules as
+// RebalanceDecisions — the returned Counter is safe to retain.
+func (m *OpsMetrics) PressureReassignments(outcome string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.pressureReassignmentsTotal.WithLabelValues(outcome)
 }
 
 // LiveMigrationDecisions returns the labelled counter for the
