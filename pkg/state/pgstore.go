@@ -5687,7 +5687,7 @@ func (s *PgStore) ListEnabledAlertRules(ctx context.Context) ([]AlertRule, error
 }
 
 // ----------------------------------------------------------------------------
-// Edge rules (ADR-089, planned). Schema: migrations/00175_edge_rules.sql.
+// Edge rules (ADR-089, planned). Schema: migrations/00191_edge_rules.sql.
 // apid is the only writer; gatewayd-internal reads via
 // MatchEdgeRulesForHost. Per-app scope only — there is no
 // account-wide flavour. The action column is jsonb (kind-tagged
