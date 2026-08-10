@@ -834,19 +834,34 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// column on state.Instance + the RunningInstanceForApp query,
 		// which is overkill for synth traffic.
 		var port int
-		// deploymentID (issue #556 / PR-B) is the live deployment id
-		// the gateway caches on Target so the per-deployment weighted
-		// picker routes subsequent requests to the right bucket. Read
-		// alongside OverridePort — same LiveDeployment lookup, no extra
-		// round-trip. Empty on a LiveDeployment read failure (the
-		// gateway treats empty as "single-deployment legacy mode").
-		var deploymentID string
+		// resolvedDeploymentID (issue #556 / PR-C) is the per-deployment
+		// wake-fan-out target the gateway caches on Target so the
+		// weighted picker routes subsequent requests to the right
+		// bucket. Preference order:
+		//
+		//  1. Caller-supplied non-empty deploymentID wins — the gateway
+		//     passed the deployment id it cached on Target; that
+		//     wins over any concurrent redeploy. (Shadowing guard:
+		//     do NOT name this local `deploymentID` — Go would silently
+		//     rebind the parameter, and a regression that did so would
+		//     drop the gateway's hint on the floor. Pin via TestEngineWake_HonorsCallerDeploymentID.)
+		//  2. Otherwise resolve from LiveDeployment — legacy
+		//     single-deployment behaviour, unchanged.
+		//
+		// The LiveDeployment lookup also feeds `port` (OverridePort);
+		// when the caller passes a non-empty deploymentID we still
+		// need the lookup unless port defaults are acceptable. vmmd
+		// defaults to 8080 when port=0, so a transient lookup failure
+		// here is benign; we surface it via slog and carry on.
+		resolvedDeploymentID := deploymentID
 		if dep, depErr := e.store.LiveDeployment(ctx, appID); depErr == nil {
 			port = dep.OverridePort
-			deploymentID = dep.ID
+			if resolvedDeploymentID == "" {
+				resolvedDeploymentID = dep.ID
+			}
 		} else {
-			e.log.Warn("sched: wake: live deployment lookup for port/deployment_id failed; falling through with 0/\"\"",
-				"app", appID, "err", depErr)
+			e.log.Warn("sched: wake: live deployment lookup for port/deployment_id failed; falling through with caller hint (or empty)",
+				"app", appID, "caller_deployment_id", deploymentID, "err", depErr)
 		}
 		release()
 		// Surface the existing row's wake_id so a Phase-1 fast-path
@@ -855,7 +870,7 @@ func (e *Engine) Wake(ctx context.Context, appID, deploymentID string) (WakeResu
 		// brought the instance up; an operator tailing a warm request
 		// can still pin it back to the schedd slog line that stamped
 		// it (gaps analysis 2026-07-23 review finding #1).
-		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port, DeploymentID: deploymentID}, nil
+		return WakeResult{InstanceID: ins.ID, NodeID: ins.NodeID, Method: vmmdpb.WakeMethod_WAKE_RESTORE, WakeID: ins.WakeID, Port: port, DeploymentID: resolvedDeploymentID}, nil
 	} else if !errors.Is(err, state.ErrNotFound) {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: running lookup: %w", err)
