@@ -15,7 +15,7 @@
 //   - IsWriteRequest: composition of method + apid path; reads
 //     always false; carve-out paths handled by the caller (this
 //     predicate does NOT exclude them — see docs).
-//   - apidPathMatch: anchored-root regression for `/v1.zip`
+//   - apid.IsApidPath: anchored-root regression for `/v1.zip`
 //     (the existing cmd/gatewayd-internal/proxy.go `isApidPath`
 //     rejects this; PR-B refines the placeholder; the test
 //     pins the regression so PR-B doesn't accidentally
@@ -29,6 +29,8 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+
+	"github.com/onebox-faas/faas/pkg/apid"
 )
 
 // -----------------------------------------------------------------------------
@@ -373,16 +375,18 @@ func TestIsWriteRequest_NonApidPathsFalse(t *testing.T) {
 // Anchored-root regression — the existing
 // cmd/gatewayd-internal/proxy.go `isApidPath` predicate
 // explicitly rejects `/v1.zip` (an nginx-style filename
-// collision). PR-A's `apidPathMatch` mirrors the production
-// `hasApidPrefix` discipline (writegate.go:299-308), so this
-// regression is now closed at the source. The test pins it so
-// a future refactor that strips the anchor discipline is
-// caught at `go test` time.
+// collision). The `apid.IsApidPath` helper (PR-B / Tier A9 /
+// ADR-084) now lives in `pkg/apid/router.go` and is the
+// single source of truth — this test pins the predicate from
+// the writegate consumer's side so a future refactor that
+// strips the anchor discipline is caught at `go test` time.
 //
-// This test now asserts (not t.Skip) — the previous
-// t.Skip-based tripwire was a known anti-pattern (review
-// finding #1 of PR #761). PR-B's refinement is already in
-// PR-A via the full `hasApidPrefix` copy.
+// This test asserts (not t.Skip) — the previous t.Skip-based
+// tripwire was a known anti-pattern (review finding #1 of
+// PR #761). The pkg/apid/router_test.go table is the canonical
+// fixture; this table is the in-package regression that
+// catches writegate-specific regressions where the proxy
+// routes start to drift from the apid route table.
 func TestIsWriteRequest_AnchoredRootRegression(t *testing.T) {
 	cases := []struct {
 		path string
@@ -418,7 +422,11 @@ func TestIsWriteRequest_AnchoredRootRegression(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// apidPathMatch — exhaustive coverage of the placeholder branches.
+// apid.IsApidPath — exhaustive coverage of the placeholder branches.
+// PR-B / Tier A9 / ADR-084 promoted the matcher to pkg/apid/router.go;
+// this regression table remains here as an in-package guard so a
+// future writegate-side change that breaks the apid-bound predicate
+// is caught without first walking to pkg/apid.
 // -----------------------------------------------------------------------------
 
 func TestApidPathMatch_AllBranches(t *testing.T) {
@@ -453,12 +461,12 @@ func TestApidPathMatch_AllBranches(t *testing.T) {
 		{"/metrics", false},
 		{"/v1.zip", false}, // anchored-root regression
 		{"/auth/login", false},
-		{"/oauth", false}, // bare /oauth — see comment in apidPathMatch
+		{"/oauth", false}, // bare /oauth — see pkg/apid/router.go
 		{"", false},
 	}
 	for _, c := range cases {
-		if got := apidPathMatch(c.path); got != c.want {
-			t.Errorf("apidPathMatch(%q) = %v, want %v", c.path, got, c.want)
+		if got := apid.IsApidPath(c.path); got != c.want {
+			t.Errorf("apid.IsApidPath(%q) = %v, want %v", c.path, got, c.want)
 		}
 	}
 }

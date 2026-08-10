@@ -38,8 +38,10 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apid"
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
@@ -48,6 +50,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/gateway"
 	"github.com/onebox-faas/faas/pkg/gateway/egressgrpc"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
+	"github.com/onebox-faas/faas/pkg/gateway/writegate"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/logarchive"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -130,9 +133,27 @@ var controlAddr = envOrGateway("FAAS_GATEWAY_CONTROL_LISTEN", "127.0.0.1:9090")
 // cmd/e2e/streaming_metal_test.go flips this on via the harness's
 // extraEnv parameter; the metal build tag keeps the streaming test
 // off the default unit/e2e lane.
+// streamingEnabledTruthy is the closed set of FAAS_GATEWAY_STREAMING
+// values that turn the streaming path on. Mirrors the env-tristate
+// convention used elsewhere (e.g. faasFlagTruthy in pkg/wire); the
+// slice is package-local so the linter's goconst check stays quiet.
+const (
+	streamingFlagTrue  = "true"
+	streamingFlagOne   = "1"
+	streamingFlagYes   = "yes"
+	streamingFlagFalse = "false"
+)
+
+var streamingEnabledTruthy = []string{streamingFlagOne, streamingFlagTrue, streamingFlagYes}
+
 func streamingEnabledFromEnv() bool {
-	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", "false")))
-	return v == "1" || v == "true" || v == "yes"
+	v := strings.ToLower(strings.TrimSpace(envOrGateway("FAAS_GATEWAY_STREAMING", streamingFlagFalse)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
 }
 
 // synthAdapter implements gateway.SynthDispatcher on top of the schedd
@@ -195,6 +216,19 @@ type runDeps struct {
 	// top-N sampler share the same registry. Tests leave it nil; every
 	// downstream consumer accepts nil safely.
 	metrics *gateway.Metrics
+	// opsMetrics is the *wire.OpsMetrics instance — a separate
+	// Prometheus registry from `metrics` because it carries
+	// daemon-wide labels (`gatewayd_*_total`) that the
+	// per-process registry should not. Constructed in run()
+	// (line ~635) after pgStore opens; passed into runWithDeps
+	// so the Tier A9 standby write-redirect gate (B7) can
+	// share the daemon-wide bundle. nil in tests.
+	opsMetrics *wire.OpsMetrics
+	// pool is the *pgxpool.Pool — the Tier A9
+	// LeaderURLPublisher (B4) needs it to subscribe to
+	// compute_node_changed via db.SubscribeWithReconnect.
+	// nil in tests.
+	pool *pgxpool.Pool
 	// controlAddr is the loopback control-plane bind (default
 	// 127.0.0.1:9090). Tests inject a free-port value via "127.0.0.1:0"
 	// + the resolved listener so two tests in the same package don't race
@@ -634,6 +668,15 @@ func run(ctx context.Context, log *slog.Logger) error {
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	go deps.nodeCache.WatchEvictions(ctx, pool)
 	deps.pgStore = pgStore
+	// Tier A9 / ADR-084 (PR-B sub-task B7): expose the
+	// daemon-wide *wire.OpsMetrics to runWithDeps so the
+	// standby write-redirect gate can increment the
+	// gatewayd_internal_write_redirect_total counter
+	// alongside the other daemons' bundles. The pool is
+	// likewise needed by the gate's LeaderURLPublisher
+	// (B4) — subscribe to compute_node_changed.
+	deps.opsMetrics = gatewayOps
+	deps.pool = pool
 	// Issue #471 / ADR-047 (PR-A): merge the per-process streaming
 	// opt-in from TOML + env. Either source flips the bit. Production
 	// default is false (no streaming — the legacy buffered path).
@@ -1013,7 +1056,61 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		})
 		logsHandler = logsMux
 	}
-	apidHandler := newApidProxyWithLogs(apidTarget, handler, logsHandler, log)
+
+	// Tier A9 / ADR-084: standby write-redirect gate. The gate
+	// sits in front of every apid-bound mutating request; on a
+	// two-node fleet, standby writes are either relayed to the
+	// leader over mTLS (bearer / anonymous) or 307-redirected to
+	// the leader's public URL (cookie). When the resolver has
+	// no leader, the gate emits 503 with a 60-second Retry-After.
+	//
+	// We construct the resolver + client + gate ONLY when:
+	//   - pgStore is available (the resolver needs the leader
+	//     store + the publisher needs a pool for pg_notify),
+	//   - mTLS material is on disk (the certs are operator-
+	//     deployed; missing material means the standby can
+	//     never relay successfully anyway).
+	// Single-node builds (the macOS dev loop, Lima unit tests)
+	// omit both, so the gate is silently bypassed and writes
+	// land on the local apid as before.
+	var writeGate http.Handler
+	if deps.pgStore != nil && osGetenv("FAAS_LEADER_REDIRECT_TLS_CERT") != "" {
+		refresh := make(chan struct{}, 1)
+		resolver := writegate.NewCachedLeaderResolver(
+			newLeaderStoreAdapter(deps.pgStore),
+			osGetenv("FAAS_NODE_NAME"),
+			time.Duration(api.StandbyWriteLeaderURLCacheTTLSeconds)*time.Second,
+			refresh,
+		)
+		client, err := writegate.NewMTLSLeaderClient(
+			osGetenv("FAAS_LEADER_REDIRECT_TLS_CERT"),
+			osGetenv("FAAS_LEADER_REDIRECT_TLS_KEY"),
+			osGetenv("FAAS_LEADER_REDIRECT_TLS_CA"),
+			time.Duration(api.StandbyWriteRedirectTimeoutMS)*time.Millisecond,
+		)
+		if err != nil {
+			return fmt.Errorf("gatewayd-internal: build writeGate mTLS client: %w", err)
+		}
+		writeGate = newWriteGate(
+			nil, // next is set by apidProxy; the gate's bypass forwards to it
+			resolver, client,
+			apid.IsApidPath,
+			osGetenv("FAAS_NODE_NAME"),
+			deps.opsMetrics, log,
+		)
+		go func() {
+			if err := runLeaderURLPublisher(ctx, log, deps.pool, refresh, osGetenv("FAAS_NODE_NAME")); err != nil {
+				log.Error("gatewayd-internal: leader url publisher exited", "err", err.Error())
+			}
+		}()
+		log.Info("gatewayd-internal: standby write-redirect gate armed",
+			"node", osGetenv("FAAS_NODE_NAME"),
+			"cache_ttl_s", api.StandbyWriteLeaderURLCacheTTLSeconds,
+			"timeout_ms", api.StandbyWriteRedirectTimeoutMS,
+		)
+	}
+
+	apidHandler := newApidProxyWithGate(apidTarget, handler, logsHandler, writeGate, log)
 
 	// Slice 7: githubd webhook HMAC-verify at the edge, then proxy
 	// to githubd's loopback listener (ADR-012, §11 single-public-
