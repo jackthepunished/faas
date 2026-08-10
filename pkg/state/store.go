@@ -2907,7 +2907,7 @@ type Store interface {
 	// ListAppEnv returns every env row on the app where scope =
 	// 'default', scoped to accountID. Order: by scope ASC, key ASC
 	// for deterministic wake staging (the flat reader sees the same
-	// ordering as pre-00199 because all its rows share
+	// ordering as pre-00200 because all its rows share
 	// scope='default'). Returns nil slice (not error) when the app
 	// has no env rows — schedd treats that as "no env.json to
 	// write". Use ListAppEnvInScope for non-default scopes.

@@ -1,0 +1,42 @@
+-- +goose Up
+-- +goose StatementBegin
+--
+-- 00199_reserve_slot.sql — slot reservation placeholder
+-- (ADR-041 / cross-PR gate carve-out).
+--
+-- This file is a deliberate no-op kept only to satisfy the
+-- migrations/embed_test.go::TestMigrationsContiguous requirement
+-- that the embedded migration set is exactly {1, 2, …, N} with
+-- no gaps. It carries no schema change and does not appear in any
+-- apply path beyond goose writing a row to goose_db_version. The
+-- replay-safety gate in ci.yml drops files whose basename matches
+-- the reservation regex from its "added migration versions"
+-- computation (see scripts/ci/check_migration_slots.sh ::
+-- reserved_from_paths), so this file is carved out of the
+-- cross-PR overlap check.
+--
+-- Context: PR-A (ADR-090 / app_envs.scope PK widening) renumbered
+-- 00198 → 00199 → 00200 because PR #819 (open since
+-- 2026-08-10T16:52:56Z) holds slot 00198 for
+-- webhook_event_allowlist_cron_fired_manually and PR #826 (open
+-- since 2026-08-10T18:33:41Z) holds slot 00199 for
+-- compute_node_heartbeats_stats. PR #826 is senior on 00199; PR-A
+-- moved to 00200. The matching 00198_reserve_slot.sql on this
+-- branch and this 00199_reserve_slot.sql preserve
+-- TestMigrationsContiguous on the branch tip. When PR #819 and
+-- PR #826 land first (the senior claims), both fences become
+-- duplicate-version collisions against the real migrations at
+-- the same slots and must be removed in a follow-up commit on
+-- this branch.
+--
+-- Body: `select 1;` — executes against the live DB at apply time
+-- but produces no schema change.
+--
+select 1;
+
+-- +goose StatementEnd
+
+-- +goose Down
+-- +goose StatementBegin
+-- No-op: nothing to reverse (the Up body is a deliberate select 1;).
+-- +goose StatementEnd
