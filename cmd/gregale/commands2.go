@@ -47,6 +47,7 @@ const (
 	subLogsTail = "tail"
 	subInfo     = "info"
 	subGet      = "get"
+	subCreate   = "create"
 
 	statusPending  = "pending"
 	statusVerified = "verified"

@@ -1,0 +1,756 @@
+package main
+
+// `gregale edge-rules <list|create|get|update|delete> ...` —
+// customer-facing CLI for the Edge Rules resource (ADR-089, issue #561).
+// PR 1 of the rollout shipped the schema, state, apid CRUD, SDK, and
+// OpenAPI surface (PR #799). PR 2 (this file) ships the CLI wrapper
+// around the same SDK methods so customers (and the e2e tests in
+// PR 9) can drive the surface from a shell.
+//
+// Mirrors `commands_alerts.go` for the dispatcher shape and
+// `commands_crons_runs.go` for the test idiom (httptest server +
+// osStdout swap). Verb-name constants come from commands2.go so
+// the `--quiet` short-flag dispatch and zsh completion see the
+// same name space. All per-kind action validation is delegated
+// to the server-side `Validate() *Problem` methods on the PR 1
+// DTO structs in pkg/api — the CLI reuses them client-side to
+// surface a malformed action locally instead of round-tripping
+// a 422.
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+
+	"github.com/onebox-faas/faas/pkg/api"
+)
+
+// edgeRuleKindVocab mirrors the closed `kind` set in
+// migrations/00192_edge_rules.sql's CHECK constraint. Surfacing a
+// typo locally avoids a 400 round-trip on every `edge-rules create`
+// call (same posture as webhookClosedVocab in commands_webhooks.go).
+var edgeRuleKindVocab = []string{
+	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
+}
+
+// edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
+// Mirrors pkg/api.EdgeRuleJWTAction.Validate() so the typo case
+// fails fast.
+var edgeRuleJWTAlgVocab = []string{
+	"RS256", "RS384", "RS512",
+	"ES256", "ES384", "ES512",
+	"HS256", "HS384", "HS512",
+}
+
+// isEdgeRuleKind reports whether k is in the closed kind vocabulary.
+// Used by every leaf's local pre-validation step.
+func isEdgeRuleKind(k string) bool {
+	for _, v := range edgeRuleKindVocab {
+		if v == k {
+			return true
+		}
+	}
+	return false
+}
+
+// cmdEdgeRules dispatches `gregale edge-rules <sub>` to the right
+// leaf. Mirrors the `cmdWebhooks` / `cmdAlerts` shape: parent
+// validates there's at least one subcommand, looks up the cliCommand
+// for `suggestSubcommand`, then hands off to the leaf.
+func cmdEdgeRules(args []string) int {
+	parent, _ := lookupCliCommand("edge-rules")
+	if len(args) == 0 {
+		PrintUsage(os.Stderr, "usage: gregale edge-rules <list|create|get|update|delete> [args]", "edge-rules")
+		return 1
+	}
+	switch args[0] {
+	case subList:
+		return cmdEdgeRulesList(args[1:])
+	case subCreate:
+		return cmdEdgeRulesCreate(args[1:])
+	case subGet:
+		return cmdEdgeRulesGet(args[1:])
+	case subUpdate:
+		return cmdEdgeRulesUpdate(args[1:])
+	case subRm:
+		return cmdEdgeRulesRm(args[1:])
+	}
+	fmt.Fprintf(os.Stderr, "unknown edge-rules subcommand %q\n", args[0])
+	if sug, _ := suggestSubcommand(args[0], parent); sug != "" {
+		maybeSuggestSub(sug)
+	}
+	return 1
+}
+
+// cmdEdgeRulesList lists edge rules for the current account or for
+// a specific app (when --app is provided). Without --app it hits the
+// account-wide endpoint; with --app it hits the per-app endpoint.
+// Both produce the same DTO shape; the JSON envelope is identical.
+func cmdEdgeRulesList(args []string) int {
+	fs := flag.NewFlagSet("edge-rules list", flag.ContinueOnError)
+	slug := fs.String("app", "", "filter to a single app slug")
+	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *kind != "" && !isEdgeRuleKind(*kind) {
+		return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	var items []api.EdgeRuleResponse
+	if *slug != "" {
+		items, err = client.ListEdgeRulesForApp(context.Background(), *slug)
+	} else {
+		items, err = client.ListEdgeRules(context.Background())
+	}
+	if err != nil {
+		return printErr("List failed", err)
+	}
+	if *kind != "" {
+		filtered := items[:0]
+		for _, it := range items {
+			if it.Kind == *kind {
+				filtered = append(filtered, it)
+			}
+		}
+		items = filtered
+	}
+	if jsonOutput {
+		return jsonOut(writeNDJSON(items))
+	}
+	if len(items) == 0 {
+		_, _ = fmt.Fprintln(osStdout, "(no edge rules)")
+		return 0
+	}
+	_, _ = fmt.Fprintf(osStdout, "%-36s %-12s %-9s %-32s %s\n", "ID", "KIND", "PRIORITY", "MATCH HOST", "MATCH PATH")
+	for _, it := range items {
+		enabled := "on"
+		if !it.Enabled {
+			enabled = "off"
+		}
+		_, _ = fmt.Fprintf(osStdout, "%-36s %-12s %-9d %-32s %s  [%s]\n",
+			it.ID, it.Kind, it.Priority, truncate(it.MatchHost, 32), it.MatchPath, enabled)
+	}
+	return 0
+}
+
+// cmdEdgeRulesCreate builds a CreateEdgeRuleRequest from the per-kind
+// flags, validates the action shape locally via the PR 1 Validate()
+// methods, then POSTs to /v1/apps/{slug}/edge-rules. Each per-kind
+// flag set is declared up-front; only the set matching --kind is
+// marshaled into the action struct. Reject mismatched-kind flags
+// before the round-trip (e.g. --rewrite-from passed with
+// --kind=cors).
+func cmdEdgeRulesCreate(args []string) int {
+	fs := flag.NewFlagSet("edge-rules create", flag.ContinueOnError)
+	slug := fs.String("app", "", "app slug (required)")
+	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip (required)")
+	matchHost := fs.String("match-host", "", "host to match (required)")
+	matchPath := fs.String("match-path", "/", "path to match")
+	var matchMethods multiFlag
+	fs.Var(&matchMethods, "match-method", "HTTP method (repeat for multiple)")
+	priority := fs.Int("priority", 100, "match priority (lower wins; default 100)")
+	enabled := fs.Bool("enabled", true, "whether the rule is enabled (default true)")
+
+	// route
+	routeTarget := fs.String("route-target-slug", "", "kind=route: target app slug (required)")
+
+	// rewrite
+	rewriteFrom := fs.String("rewrite-from", "", "kind=rewrite: from path (required)")
+	rewriteTo := fs.String("rewrite-to", "", "kind=rewrite: to path (required)")
+
+	// redirect
+	redirectStatus := fs.Int("redirect-status", 0, "kind=redirect: status code (301|302|307|308; required)")
+	redirectTo := fs.String("redirect-to", "", "kind=redirect: Location URL (required)")
+	var redirectHeaders multiFlag
+	fs.Var(&redirectHeaders, "redirect-header", "kind=redirect: extra header (Name:Value; repeat)")
+
+	// headers
+	var headersReqAdd, headersReqSet multiFlag
+	var headersReqRm multiFlag
+	var headersResAdd, headersResSet multiFlag
+	var headersResRm multiFlag
+	fs.Var(&headersReqAdd, "headers-request-add", "kind=headers: request header to add (Name:Value; repeat)")
+	fs.Var(&headersReqSet, "headers-request-set", "kind=headers: request header to set (Name:Value; repeat)")
+	fs.Var(&headersReqRm, "headers-request-remove", "kind=headers: request header to remove (Name; repeat)")
+	fs.Var(&headersResAdd, "headers-response-add", "kind=headers: response header to add (Name:Value; repeat)")
+	fs.Var(&headersResSet, "headers-response-set", "kind=headers: response header to set (Name:Value; repeat)")
+	fs.Var(&headersResRm, "headers-response-remove", "kind=headers: response header to remove (Name; repeat)")
+
+	// cors
+	var corsOrigins, corsMethods, corsHeaders, corsExpose multiFlag
+	fs.Var(&corsOrigins, "cors-allow-origin", "kind=cors: allowed origin (repeat)")
+	fs.Var(&corsMethods, "cors-allow-method", "kind=cors: allowed method (repeat)")
+	fs.Var(&corsHeaders, "cors-allow-header", "kind=cors: allowed header (repeat)")
+	fs.Var(&corsExpose, "cors-expose-header", "kind=cors: exposed header (repeat)")
+	corsCreds := fs.Bool("cors-allow-credentials", false, "kind=cors: allow credentials")
+	corsMaxAge := fs.Int("cors-max-age-seconds", 0, "kind=cors: preflight max age (default 0)")
+
+	// jwt
+	jwtIssuer := fs.String("jwt-issuer", "", "kind=jwt: token issuer (required)")
+	jwtJWKS := fs.String("jwt-jwks-url", "", "kind=jwt: JWKS URL (required; must be https://)")
+	var jwtAudience, jwtAlgorithms multiFlag
+	fs.Var(&jwtAudience, "jwt-audience", "kind=jwt: required audience (repeat)")
+	fs.Var(&jwtAlgorithms, "jwt-algorithm", "kind=jwt: allowed algorithm (RS256|ES256|HS256|...; repeat)")
+	var jwtClaims multiFlag
+	fs.Var(&jwtClaims, "jwt-required-claim", "kind=jwt: required claim (Name=Value; repeat)")
+
+	// ip
+	var ipAllow, ipDeny multiFlag
+	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR (repeat)")
+	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR (repeat)")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *slug == "" || *kind == "" || *matchHost == "" {
+		PrintUsage(os.Stderr, "usage: gregale edge-rules create --app <slug> --kind <K> --match-host <H> [--match-path <P>] [--match-method M]... [--priority N] [--enabled] <kind-specific flags>", "edge-rules")
+		return 1
+	}
+	if !isEdgeRuleKind(*kind) {
+		return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
+	}
+	actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
+		RouteTarget:     *routeTarget,
+		RewriteFrom:     *rewriteFrom,
+		RewriteTo:       *rewriteTo,
+		RedirectStatus:  *redirectStatus,
+		RedirectTo:      *redirectTo,
+		RedirectHeaders: redirectHeaders,
+		HeadersReqAdd:   headersReqAdd,
+		HeadersReqSet:   headersReqSet,
+		HeadersReqRm:    headersReqRm,
+		HeadersResAdd:   headersResAdd,
+		HeadersResSet:   headersResSet,
+		HeadersResRm:    headersResRm,
+		CORSOrigins:     corsOrigins,
+		CORSMethods:     corsMethods,
+		CORSHeaders:     corsHeaders,
+		CORSExpose:      corsExpose,
+		CORSCreds:       *corsCreds,
+		CORSMaxAge:      *corsMaxAge,
+		JWTIssuer:       *jwtIssuer,
+		JWTJWKS:         *jwtJWKS,
+		JWTAudience:     jwtAudience,
+		JWTAlgorithms:   jwtAlgorithms,
+		JWTClaims:       jwtClaims,
+		IPAllow:         ipAllow,
+		IPDeny:          ipDeny,
+	})
+	if err != nil {
+		return printErr("Invalid flags for --kind="+*kind, err)
+	}
+	req := api.CreateEdgeRuleRequest{
+		MatchHost:    *matchHost,
+		MatchPath:    *matchPath,
+		MatchMethods: matchMethods,
+		Priority:     priority,
+		Enabled:      enabled,
+		Kind:         *kind,
+		Action:       actionBytes,
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	out, err := client.CreateEdgeRule(context.Background(), *slug, req)
+	if err != nil {
+		return printErr("Create failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(out))
+	}
+	PrintOK(osStdout, "Edge rule %s created for app %s (kind=%s, priority=%d).", out.ID, *slug, out.Kind, out.Priority)
+	return 0
+}
+
+// cmdEdgeRulesGet fetches a single edge rule by ID.
+func cmdEdgeRulesGet(args []string) int {
+	fs := flag.NewFlagSet("edge-rules get", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale edge-rules get <id>", "edge-rules")
+		return 1
+	}
+	id := fs.Arg(0)
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	out, err := client.GetEdgeRule(context.Background(), id)
+	if err != nil {
+		return printErr("Get failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(out))
+	}
+	_, _ = fmt.Fprintf(osStdout, "ID:          %s\n", out.ID)
+	_, _ = fmt.Fprintf(osStdout, "Account:     %s\n", out.AccountID)
+	_, _ = fmt.Fprintf(osStdout, "App:         %s\n", out.AppID)
+	_, _ = fmt.Fprintf(osStdout, "Match host:  %s\n", out.MatchHost)
+	_, _ = fmt.Fprintf(osStdout, "Match path:  %s\n", out.MatchPath)
+	if len(out.MatchMethods) > 0 {
+		_, _ = fmt.Fprintf(osStdout, "Methods:     %s\n", strings.Join(out.MatchMethods, ", "))
+	}
+	_, _ = fmt.Fprintf(osStdout, "Priority:    %d\n", out.Priority)
+	_, _ = fmt.Fprintf(osStdout, "Enabled:     %t\n", out.Enabled)
+	_, _ = fmt.Fprintf(osStdout, "Kind:        %s\n", out.Kind)
+	_, _ = fmt.Fprintf(osStdout, "Action:      %s\n", string(out.Action))
+	_, _ = fmt.Fprintf(osStdout, "Created:     %s\n", out.CreatedAt.Format("2006-01-02 15:04:05 MST"))
+	_, _ = fmt.Fprintf(osStdout, "Updated:     %s\n", out.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
+	return 0
+}
+
+// cmdEdgeRulesUpdate sends a partial PATCH. Uses fs.Visit to
+// distinguish "flag not passed" (omit from request) from "flag
+// passed with empty value" (send zero value). The triple-state
+// enabled flag is tracked via an enabledSet boolean.
+func cmdEdgeRulesUpdate(args []string) int {
+	fs := flag.NewFlagSet("edge-rules update", flag.ContinueOnError)
+	matchHost := fs.String("match-host", "", "new host to match")
+	matchPath := fs.String("match-path", "", "new path to match")
+	var matchMethods multiFlag
+	fs.Var(&matchMethods, "match-method", "new method set (repeat)")
+	priority := fs.Int("priority", 0, "new priority (0 = unset)")
+	enable := fs.Bool("enable", false, "enable the rule")
+	disable := fs.Bool("disable", false, "disable the rule")
+	// Per-kind action re-marshaling on PATCH. PATCHing the action
+	// requires the full new action shape — no partial sub-keys.
+	kind := fs.String("kind", "", "rule kind (required when patching --*-action flags)")
+	routeTarget := fs.String("route-target-slug", "", "kind=route: target app slug")
+	rewriteFrom := fs.String("rewrite-from", "", "kind=rewrite: from path")
+	rewriteTo := fs.String("rewrite-to", "", "kind=rewrite: to path")
+	redirectStatus := fs.Int("redirect-status", 0, "kind=redirect: status code")
+	redirectTo := fs.String("redirect-to", "", "kind=redirect: Location URL")
+	var redirectHeaders multiFlag
+	fs.Var(&redirectHeaders, "redirect-header", "kind=redirect: extra header (Name:Value; repeat)")
+	var headersReqAdd, headersReqSet, headersReqRm multiFlag
+	var headersResAdd, headersResSet, headersResRm multiFlag
+	fs.Var(&headersReqAdd, "headers-request-add", "kind=headers: request header to add")
+	fs.Var(&headersReqSet, "headers-request-set", "kind=headers: request header to set")
+	fs.Var(&headersReqRm, "headers-request-remove", "kind=headers: request header to remove")
+	fs.Var(&headersResAdd, "headers-response-add", "kind=headers: response header to add")
+	fs.Var(&headersResSet, "headers-response-set", "kind=headers: response header to set")
+	fs.Var(&headersResRm, "headers-response-remove", "kind=headers: response header to remove")
+	var corsOrigins, corsMethods, corsHeaders, corsExpose multiFlag
+	fs.Var(&corsOrigins, "cors-allow-origin", "kind=cors: allowed origin")
+	fs.Var(&corsMethods, "cors-allow-method", "kind=cors: allowed method")
+	fs.Var(&corsHeaders, "cors-allow-header", "kind=cors: allowed header")
+	fs.Var(&corsExpose, "cors-expose-header", "kind=cors: exposed header")
+	corsCreds := fs.Bool("cors-allow-credentials", false, "kind=cors: allow credentials")
+	corsMaxAge := fs.Int("cors-max-age-seconds", 0, "kind=cors: preflight max age")
+	jwtIssuer := fs.String("jwt-issuer", "", "kind=jwt: token issuer")
+	jwtJWKS := fs.String("jwt-jwks-url", "", "kind=jwt: JWKS URL")
+	var jwtAudience, jwtAlgorithms multiFlag
+	fs.Var(&jwtAudience, "jwt-audience", "kind=jwt: required audience")
+	fs.Var(&jwtAlgorithms, "jwt-algorithm", "kind=jwt: allowed algorithm")
+	var jwtClaims multiFlag
+	fs.Var(&jwtClaims, "jwt-required-claim", "kind=jwt: required claim")
+	var ipAllow, ipDeny multiFlag
+	fs.Var(&ipAllow, "ip-allow", "kind=ip: allow CIDR")
+	fs.Var(&ipDeny, "ip-deny", "kind=ip: deny CIDR")
+
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale edge-rules update <id> [--match-host H] [--match-path P] [--match-method M]... [--priority N] [--enable|--disable] [kind-specific flags]", "edge-rules")
+		return 1
+	}
+	if *enable && *disable {
+		return printErr("Invalid flags", fmt.Errorf("--enable and --disable are mutually exclusive"))
+	}
+
+	id := fs.Arg(0)
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	req := api.UpdateEdgeRuleRequest{}
+	if visited["match-host"] {
+		s := *matchHost
+		req.MatchHost = &s
+	}
+	if visited["match-path"] {
+		s := *matchPath
+		req.MatchPath = &s
+	}
+	if visited["match-method"] {
+		m := []string(matchMethods)
+		req.MatchMethods = &m
+	}
+	if visited["priority"] && *priority != 0 {
+		p := *priority
+		req.Priority = &p
+	}
+	if *enable {
+		t := true
+		req.Enabled = &t
+	} else if *disable {
+		f := false
+		req.Enabled = &f
+	}
+
+	// Per-kind action re-marshal. Only attempt if at least one
+	// per-kind flag was visited; otherwise leave req.Action nil so
+	// the server preserves the existing jsonb.
+	if anyKindFlagVisited(visited) {
+		if *kind == "" {
+			return printErr("Invalid flags", fmt.Errorf("--kind is required when patching action fields"))
+		}
+		if !isEdgeRuleKind(*kind) {
+			return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
+		}
+		actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
+			RouteTarget:     *routeTarget,
+			RewriteFrom:     *rewriteFrom,
+			RewriteTo:       *rewriteTo,
+			RedirectStatus:  *redirectStatus,
+			RedirectTo:      *redirectTo,
+			RedirectHeaders: redirectHeaders,
+			HeadersReqAdd:   headersReqAdd,
+			HeadersReqSet:   headersReqSet,
+			HeadersReqRm:    headersReqRm,
+			HeadersResAdd:   headersResAdd,
+			HeadersResSet:   headersResSet,
+			HeadersResRm:    headersResRm,
+			CORSOrigins:     corsOrigins,
+			CORSMethods:     corsMethods,
+			CORSHeaders:     corsHeaders,
+			CORSExpose:      corsExpose,
+			CORSCreds:       *corsCreds,
+			CORSMaxAge:      *corsMaxAge,
+			JWTIssuer:       *jwtIssuer,
+			JWTJWKS:         *jwtJWKS,
+			JWTAudience:     jwtAudience,
+			JWTAlgorithms:   jwtAlgorithms,
+			JWTClaims:       jwtClaims,
+			IPAllow:         ipAllow,
+			IPDeny:          ipDeny,
+		})
+		if err != nil {
+			return printErr("Invalid flags for --kind="+*kind, err)
+		}
+		req.Action = &actionBytes
+	}
+
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	out, err := client.UpdateEdgeRule(context.Background(), id, req)
+	if err != nil {
+		return printErr("Update failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(out))
+	}
+	PrintOK(osStdout, "Edge rule %s updated.", out.ID)
+	return 0
+}
+
+// cmdEdgeRulesRm deletes an edge rule by ID. Requires interactive
+// typed confirmation ("delete edge rule") unless --quiet is passed
+// for CI/scripted paths (issue #312 pattern). Returns 1 if the
+// user cancels (per requireTyped semantics).
+func cmdEdgeRulesRm(args []string) int {
+	fs := flag.NewFlagSet("edge-rules delete", flag.ContinueOnError)
+	quiet := fs.Bool("quiet", false, "skip the typed confirmation (for scripts)")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() != 1 {
+		PrintUsage(os.Stderr, "usage: gregale edge-rules delete <id> [--quiet]", "edge-rules")
+		return 1
+	}
+	id := fs.Arg(0)
+	if !*quiet {
+		_, _ = fmt.Fprintf(osStderr, "About to delete edge rule %s.\n", id)
+		if !requireTyped("delete edge rule") {
+			return 1
+		}
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	if err := client.DeleteEdgeRule(context.Background(), id); err != nil {
+		return printErr("Delete failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(map[string]string{"id": id, "status": "deleted"}))
+	}
+	PrintOK(osStdout, "Edge rule %s deleted.", id)
+	return 0
+}
+
+// edgeRuleActionInputs bundles the per-kind flag values passed by
+// the caller. Every leaf passes the same struct so buildEdgeRuleAction
+// has a single signature and the per-kind switch is the only source
+// of branching.
+type edgeRuleActionInputs struct {
+	// route
+	RouteTarget string
+	// rewrite
+	RewriteFrom, RewriteTo string
+	// redirect
+	RedirectStatus  int
+	RedirectTo      string
+	RedirectHeaders []string
+	// headers
+	HeadersReqAdd, HeadersReqSet []string
+	HeadersReqRm                 []string
+	HeadersResAdd, HeadersResSet []string
+	HeadersResRm                 []string
+	// cors
+	CORSOrigins, CORSMethods []string
+	CORSHeaders, CORSExpose  []string
+	CORSCreds                bool
+	CORSMaxAge               int
+	// jwt
+	JWTIssuer                  string
+	JWTJWKS                    string
+	JWTAudience, JWTAlgorithms []string
+	JWTClaims                  []string
+	// ip
+	IPAllow, IPDeny []string
+}
+
+// buildEdgeRuleAction marshals the per-kind inputs into the matching
+// PR 1 action struct (or returns a validation error before the
+// round-trip). Every kind has a closed shape; closed-set and
+// structural validation runs against the same predicates as
+// pkg/api.*Action.Validate() so the user gets the same error
+// locally that the server would return over the wire.
+func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage, error) {
+	switch kind {
+	case "route":
+		a := api.EdgeRuleRouteAction{TargetAppSlug: in.RouteTarget}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "rewrite":
+		a := api.EdgeRuleRewriteAction{From: in.RewriteFrom, To: in.RewriteTo}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "redirect":
+		headers, err := parseKVList(in.RedirectHeaders, "redirect-header")
+		if err != nil {
+			return nil, err
+		}
+		a := api.EdgeRuleRedirectAction{StatusCode: in.RedirectStatus, To: in.RedirectTo, Headers: headers}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "headers":
+		req, err := parseHeaderOps(in.HeadersReqAdd, in.HeadersReqSet, in.HeadersReqRm, "request")
+		if err != nil {
+			return nil, err
+		}
+		res, err := parseHeaderOps(in.HeadersResAdd, in.HeadersResSet, in.HeadersResRm, "response")
+		if err != nil {
+			return nil, err
+		}
+		a := api.EdgeRuleHeadersAction{RequestHeaders: req, ResponseHeaders: res}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "cors":
+		a := api.EdgeRuleCORSAction{
+			AllowOrigins:     in.CORSOrigins,
+			AllowMethods:     in.CORSMethods,
+			AllowHeaders:     in.CORSHeaders,
+			ExposeHeaders:    in.CORSExpose,
+			AllowCredentials: in.CORSCreds,
+			MaxAgeSeconds:    in.CORSMaxAge,
+		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "jwt":
+		for _, alg := range in.JWTAlgorithms {
+			if !strInSlice(alg, edgeRuleJWTAlgVocab) {
+				return nil, fmt.Errorf("jwt algorithm %q must be one of %s", alg, strings.Join(edgeRuleJWTAlgVocab, ","))
+			}
+		}
+		claims, err := parseKVList(in.JWTClaims, "jwt-required-claim")
+		if err != nil {
+			return nil, err
+		}
+		a := api.EdgeRuleJWTAction{
+			Issuer:         in.JWTIssuer,
+			Audience:       in.JWTAudience,
+			JWKSURL:        in.JWTJWKS,
+			Algorithms:     in.JWTAlgorithms,
+			RequiredClaims: claims,
+		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "ip":
+		for _, cidr := range in.IPAllow {
+			if _, _, err := net.ParseCIDR(cidr); err != nil {
+				return nil, fmt.Errorf("ip-allow %q: not a valid CIDR (%w)", cidr, err)
+			}
+		}
+		for _, cidr := range in.IPDeny {
+			if _, _, err := net.ParseCIDR(cidr); err != nil {
+				return nil, fmt.Errorf("ip-deny %q: not a valid CIDR (%w)", cidr, err)
+			}
+		}
+		a := api.EdgeRuleIPAction{Allow: in.IPAllow, Deny: in.IPDeny}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	}
+	return nil, fmt.Errorf("unknown kind %q", kind)
+}
+
+// marshalAction encodes a into json.RawMessage. Errors are
+// returned to the caller; only json.TypeError is expected (e.g.
+// unmarshalable types), and the action structs are all simple
+// value types so the call cannot fail in practice.
+func marshalAction(a interface{}) (json.RawMessage, error) {
+	b, err := json.Marshal(a)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(b), nil
+}
+
+// errToError extracts a Go error from a *api.Problem's Detail field.
+// The PR 1 Validate() methods return *Problem (a struct, not error);
+// unwrap the Detail so it surfaces through printErr with the same
+// wording the server would emit.
+func errToError(p *api.Problem) error {
+	if p == nil {
+		return nil
+	}
+	return fmt.Errorf("%s", p.Detail)
+}
+
+// parseKVList splits each entry on the first `:` into Name/Value.
+// Used by --redirect-header (map[string]string) and
+// --jwt-required-claim (map[string]string). Returns nil map for
+// empty input.
+func parseKVList(items []string, flagName string) (map[string]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(items))
+	for _, raw := range items {
+		idx := strings.IndexByte(raw, ':')
+		if idx < 0 {
+			return nil, fmt.Errorf("%s %q: expected Name:Value (no ':' found)", flagName, raw)
+		}
+		name := raw[:idx]
+		value := raw[idx+1:]
+		if name == "" {
+			return nil, fmt.Errorf("%s %q: Name is empty", flagName, raw)
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("%s: duplicate name %q", flagName, name)
+		}
+		out[name] = value
+	}
+	return out, nil
+}
+
+// parseHeaderOps converts the three flag sets (add H:V, set H:V,
+// remove H) into []EdgeRuleHeaderOp. Validates each op against
+// pkg/api.EdgeRuleHeaderOp.Validate() so the user gets the same
+// forbidden-header error locally.
+func parseHeaderOps(add, set, rm []string, dir string) ([]api.EdgeRuleHeaderOp, error) {
+	var out []api.EdgeRuleHeaderOp
+	seen := map[string]string{} // name → action ("add"|"set"|"remove")
+	check := func(action, raw string) (api.EdgeRuleHeaderOp, error) {
+		var op api.EdgeRuleHeaderOp
+		op.Action = action
+		if action == "remove" {
+			op.Name = raw
+		} else {
+			idx := strings.IndexByte(raw, ':')
+			if idx < 0 {
+				return op, fmt.Errorf("headers-%s-%s %q: expected Name:Value (no ':' found)", dir, action, raw)
+			}
+			op.Name = raw[:idx]
+			op.Value = raw[idx+1:]
+			if op.Name == "" {
+				return op, fmt.Errorf("headers-%s-%s %q: Name is empty", dir, action, raw)
+			}
+		}
+		if prev, dup := seen[op.Name]; dup {
+			return op, fmt.Errorf("headers-%s: %q specified for both %s and %s", dir, op.Name, prev, action)
+		}
+		seen[op.Name] = action
+		if err := op.Validate(); err != nil {
+			return op, fmt.Errorf("headers-%s: %w", dir, errToError(err))
+		}
+		return op, nil
+	}
+	for _, raw := range add {
+		op, err := check("add", raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	for _, raw := range set {
+		op, err := check("set", raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	for _, raw := range rm {
+		op, err := check("remove", raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	return out, nil
+}
+
+// anyKindFlagVisited returns true if at least one per-kind action
+// flag was passed to the update command. Used to decide whether
+// the action jsonb should be re-marshaled or left untouched.
+func anyKindFlagVisited(visited map[string]bool) bool {
+	kindFlagNames := []string{
+		"route-target-slug",
+		"rewrite-from", "rewrite-to",
+		"redirect-status", "redirect-to", "redirect-header",
+		"headers-request-add", "headers-request-set", "headers-request-remove",
+		"headers-response-add", "headers-response-set", "headers-response-remove",
+		"cors-allow-origin", "cors-allow-method", "cors-allow-header", "cors-expose-header",
+		"cors-allow-credentials", "cors-max-age-seconds",
+		"jwt-issuer", "jwt-jwks-url", "jwt-audience", "jwt-algorithm", "jwt-required-claim",
+		"ip-allow", "ip-deny",
+	}
+	for _, name := range kindFlagNames {
+		if visited[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// truncate is implemented in commands_webhooks.go:420 — re-used here
+// so the edge-rules list table column widths line up with the
+// webhooks table.

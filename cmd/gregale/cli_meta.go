@@ -291,6 +291,25 @@ var cliCommands = []cliCommand{
 		Short:   "Manage custom domains",
 	},
 	{
+		Name:    "edge-rules",
+		DocSlug: "edge-rules",
+		Short:   "Per-app edge rules (edge-rules list|create|get|update|delete --app <slug>)",
+		Subcommands: []cliSub{
+			{Name: subList, Short: "List edge rules", Flags: []cliFlag{
+				{Name: "app", Short: "filter to a single app slug"},
+				{Name: "kind", Short: "filter to a single kind", ClosedSet: edgeRuleKindVocab},
+			}},
+			{Name: subCreate, Short: "Add an edge rule"},
+			{Name: subGet, Short: "Show one edge rule"},
+			{Name: subUpdate, Short: "Update one edge rule"},
+			{Name: subRm, Short: "Delete one edge rule"},
+		},
+		Flags: []cliFlag{
+			{Name: "app", Short: "app slug", Req: true},
+			{Name: "kind", Short: "rule kind", ClosedSet: edgeRuleKindVocab},
+		},
+	},
+	{
 		Name:    "env",
 		DocSlug: "env",
 		Short:   "Pull/push .env <-> sealed secrets (--app <slug>)",
