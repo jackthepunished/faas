@@ -2184,7 +2184,12 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 			Status: http.StatusPaymentRequired,
 			Code:   api.CodePayment,
 			Title:  "Billing subscription required",
-			Detail: "plan upgrades to " + string(plan) + " require an active subscription; complete checkout to upgrade",
+			// The "faas billing retry" hint matches the dunning
+			// email copy at pkg/mail/account.go:107,150 so a
+			// customer who lands here from a failed-charge path
+			// (vs a clean free→paid path) sees the same command
+			// the mailer told them to run. Issue #242.
+			Detail: "plan upgrades to " + string(plan) + " require an active subscription; run `faas billing retry` to recover from a failed charge, or complete checkout to upgrade",
 		}
 		// Provider dispatch: if the active provider has a real upgrade
 		// path (Paddle), call CreateUpgradeTransaction and surface the

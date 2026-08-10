@@ -1521,12 +1521,60 @@ func (c *Client) ListDeployments(ctx context.Context, before string, limit int) 
 // friendly hint instead of opening the browser to "". The endpoint
 // is authenticated via the standard Bearer / API-key chain (same
 // surface as usage reads).
+//
+// Issue #242: this signature is preserved for callers that only
+// care about the URL (cmdBillingPortal). New callers that need
+// the payment-method summary should use GetBillingPortalFull.
 func (c *Client) GetBillingPortal(ctx context.Context) (string, error) {
-	var out BillingPortalResponse
-	if err := c.do(ctx, "GET", "/v1/billing/portal", nil, &out); err != nil {
+	full, err := c.GetBillingPortalFull(ctx)
+	if err != nil {
 		return "", err
 	}
-	return out.URL, nil
+	return full.URL, nil
+}
+
+// GetBillingPortalFull returns both the portal URL AND the
+// card-on-file summary (issue #242). The CLI's `faas billing
+// payment-method` subcommand renders from this method; the
+// dashboard's billing page does the same. PaymentMethod is the
+// zero value when the account has no card on file — the CLI
+// branches on the empty brand to print a "no payment method on
+// file" hint.
+func (c *Client) GetBillingPortalFull(ctx context.Context) (BillingPortalResponse, error) {
+	var out BillingPortalResponse
+	if err := c.do(ctx, "GET", "/v1/billing/portal", nil, &out); err != nil {
+		return BillingPortalResponse{}, err
+	}
+	return out, nil
+}
+
+// PostBillingRetry retries the latest unpaid invoice / transaction
+// for the authenticated account (issue #242). Closes the
+// customer-trust lie in pkg/mail/account.go:107,150 — the dunning
+// email promises `faas billing retry`; this is what it calls.
+// Returns the apId-side attempt id + the provider-side reference
+// id + a status string ("pending_provider_confirmation" today).
+func (c *Client) PostBillingRetry(ctx context.Context) (BillingRetryResponse, error) {
+	var out BillingRetryResponse
+	if err := c.do(ctx, "POST", "/v1/billing/retry", nil, &out); err != nil {
+		return BillingRetryResponse{}, err
+	}
+	return out, nil
+}
+
+// PostBillingCancel sets cancel_at_period_end on the authenticated
+// account's subscription (issue #242). Account keeps running
+// until period end then downgrades to Free (spec §4.7). The
+// destructive nature is gated on the CLI side (typed-confirm from
+// PR #782: "cancel subscription"); apid itself does not gate.
+// Returns the effective-at timestamp so the CLI can print
+// "your apps will stop on <date>".
+func (c *Client) PostBillingCancel(ctx context.Context) (BillingCancelResponse, error) {
+	var out BillingCancelResponse
+	if err := c.do(ctx, "POST", "/v1/billing/cancel", nil, &out); err != nil {
+		return BillingCancelResponse{}, err
+	}
+	return out, nil
 }
 
 // ListInvoices returns a single page of the authenticated account's

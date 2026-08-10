@@ -1042,6 +1042,23 @@ func (s *server) handler() http.Handler {
 	// to Stripe with 2FA on their side.
 	mux.HandleFunc("GET /v1/billing/portal", s.authLimited(s.requireScope(api.ScopesUsageReadSurface...)(s.getBillingPortal)))
 
+	// Billing retry (issue #242). Closes the customer-trust lie in
+	// pkg/mail/account.go:107,150 (the dunning email promises
+	// `faas billing retry`; this is what it calls). Session-cookie
+	// auth + usage:read scope; the destructive nature of retry is
+	// bounded (a single charge attempt against the saved card).
+	// MFA-gated for parity with changePlan — retry touches money.
+	mux.HandleFunc("POST /v1/billing/retry", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.postBillingRetry))))
+
+	// Billing cancel (issue #242). Sets cancel_at_period_end on
+	// the account's subscription; account keeps running until
+	// period end then downgrades to Free (spec §4.7). Destructive
+	// but session-cookie-only — the CLI front-loads the typed-
+	// confirm gate from PR #782 ("cancel subscription"). Headless
+	// callers can wire their own confirm. MFA-gated for parity
+	// with changePlan.
+	mux.HandleFunc("POST /v1/billing/cancel", s.authLimited(s.requireMFA(s.requireScope(api.ScopesUsageReadSurface...)(s.postBillingCancel))))
+
 	// Credit consumption reducer (issue #279 PR-C). Admin-only +
 	// MFA-gated — operator action that mutates money (spec §11). The
 	// `idempotent` middleware replays a prior 200 on duplicate
