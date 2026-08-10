@@ -282,6 +282,27 @@ type Querier interface {
 	// PR #2 does NOT add it (single-box posture; multi-host moves to
 	// PromQL per ADR-091 §3.6).
 	TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateParams) ([]TrafficAnomalyAggregateRow, error)
+	// PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+	// TrafficAnomalyAggregate. Joins usage_minutes to instances to
+	// recover the hosting node_id, then groups by
+	// (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+	// the baseline. The current_pool also groups by node_id so the
+	// "today" anomaly is per-node, not per-app-wide.
+	//
+	// Why a separate query and not a sqlc parameter on the existing
+	// one: the baseline math is identical, but the GROUP BY keys
+	// differ by one column, and trying to thread that through a
+	// nullable WHERE filter would either lose the per-node grain
+	// (NULL filter collapses the group) or return the wrong rollup
+	// (a per-node "current" against an app-wide baseline reports
+	// spurious anomalies when the fleet is unevenly loaded). A
+	// separate query keeps each path simple and self-contained.
+	//
+	// Index path: same as TrafficAnomalyAggregate — usage_minutes
+	// primary key (instance_id, minute) is fine for the 24h current
+	// window in single-box posture. The instances.node_id lookup
+	// is by PK; the join is O(matches) on the PK.
+	TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error)
 	UpdateAccountPlan(ctx context.Context, db DBTX, arg UpdateAccountPlanParams) error
 	UpdateAccountStatus(ctx context.Context, db DBTX, arg UpdateAccountStatusParams) error
 	UpdateApp(ctx context.Context, db DBTX, arg UpdateAppParams) (UpdateAppRow, error)

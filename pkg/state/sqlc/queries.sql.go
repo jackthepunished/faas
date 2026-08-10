@@ -2909,6 +2909,151 @@ func (q *Queries) TrafficAnomalyAggregate(ctx context.Context, db DBTX, arg Traf
 	return items, nil
 }
 
+const trafficAnomalyAggregateByNode = `-- name: TrafficAnomalyAggregateByNode :many
+with baseline as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           extract(hour from um.minute) as hour_of_day,
+           avg(um.mb_seconds)::float8 as mean_mb_seconds,
+           coalesce(stddev_pop(um.mb_seconds), 0)::float8 as stddev_mb_seconds,
+           count(*)::int as sample_count
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $2
+      and um.minute <  $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, extract(hour from um.minute)
+),
+current_pool as (
+    select um.account_id,
+           um.app_id,
+           n.id as node_id,
+           um.minute,
+           sum(um.mb_seconds)::float8 as current_mb_seconds
+    from usage_minutes um
+    join instances i on i.id = um.instance_id
+    join compute_nodes n on n.id = i.node_id
+    where um.minute >= $1
+      and um.mb_seconds > 0
+    group by um.account_id, um.app_id, n.id, um.minute
+),
+scored as (
+    select c.account_id,
+           c.app_id,
+           c.node_id,
+           c.minute,
+           c.current_mb_seconds,
+           b.mean_mb_seconds,
+           b.stddev_mb_seconds,
+           b.sample_count,
+           case
+               when b.sample_count < 3 then null
+               when b.stddev_mb_seconds < 1.0 and c.current_mb_seconds >= 5.0 * b.mean_mb_seconds
+                   and b.mean_mb_seconds > 0 then (c.current_mb_seconds - b.mean_mb_seconds) / 5.0
+               when b.stddev_mb_seconds >= 1.0
+                   and c.current_mb_seconds >= b.mean_mb_seconds + 3.0 * b.stddev_mb_seconds then
+                   (c.current_mb_seconds - b.mean_mb_seconds) / b.stddev_mb_seconds
+               else null
+           end as z_score,
+           case
+               when b.stddev_mb_seconds < 1.0 then 'raw_z'
+               else 'hour_of_day'
+           end as reason
+    from current_pool c
+    join baseline b
+      on c.account_id = b.account_id
+     and c.app_id    = b.app_id
+     and c.node_id   = b.node_id
+     and extract(hour from c.minute) = b.hour_of_day
+)
+select account_id,
+       app_id,
+       node_id,
+       minute,
+       current_mb_seconds,
+       mean_mb_seconds,
+       stddev_mb_seconds,
+       sample_count,
+       z_score,
+       reason
+from scored
+where z_score is not null
+order by z_score desc
+limit $3::int8
+`
+
+type TrafficAnomalyAggregateByNodeParams struct {
+	Minute   pgtype.Timestamptz
+	Minute_2 pgtype.Timestamptz
+	Column3  int64
+}
+
+type TrafficAnomalyAggregateByNodeRow struct {
+	AccountID        pgtype.UUID
+	AppID            pgtype.UUID
+	NodeID           pgtype.UUID
+	Minute           pgtype.Timestamptz
+	CurrentMbSeconds float64
+	MeanMbSeconds    float64
+	StddevMbSeconds  float64
+	SampleCount      int32
+	ZScore           interface{}
+	Reason           string
+}
+
+// PR #4 (ADR-092 §3.4 amendment) — per-node variant of
+// TrafficAnomalyAggregate. Joins usage_minutes to instances to
+// recover the hosting node_id, then groups by
+// (account_id, app_id, node_id, EXTRACT(HOUR FROM minute)) for
+// the baseline. The current_pool also groups by node_id so the
+// "today" anomaly is per-node, not per-app-wide.
+//
+// Why a separate query and not a sqlc parameter on the existing
+// one: the baseline math is identical, but the GROUP BY keys
+// differ by one column, and trying to thread that through a
+// nullable WHERE filter would either lose the per-node grain
+// (NULL filter collapses the group) or return the wrong rollup
+// (a per-node "current" against an app-wide baseline reports
+// spurious anomalies when the fleet is unevenly loaded). A
+// separate query keeps each path simple and self-contained.
+//
+// Index path: same as TrafficAnomalyAggregate — usage_minutes
+// primary key (instance_id, minute) is fine for the 24h current
+// window in single-box posture. The instances.node_id lookup
+// is by PK; the join is O(matches) on the PK.
+func (q *Queries) TrafficAnomalyAggregateByNode(ctx context.Context, db DBTX, arg TrafficAnomalyAggregateByNodeParams) ([]TrafficAnomalyAggregateByNodeRow, error) {
+	rows, err := db.Query(ctx, trafficAnomalyAggregateByNode, arg.Minute, arg.Minute_2, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TrafficAnomalyAggregateByNodeRow{}
+	for rows.Next() {
+		var i TrafficAnomalyAggregateByNodeRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.AppID,
+			&i.NodeID,
+			&i.Minute,
+			&i.CurrentMbSeconds,
+			&i.MeanMbSeconds,
+			&i.StddevMbSeconds,
+			&i.SampleCount,
+			&i.ZScore,
+			&i.Reason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateAccountPlan = `-- name: UpdateAccountPlan :exec
 update accounts set plan = $2 where id = $1
 `

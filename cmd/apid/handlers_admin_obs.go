@@ -40,13 +40,16 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -194,6 +197,14 @@ func (s *server) obsGetTenant(w http.ResponseWriter, r *http.Request, acct state
 // /v1/compute-nodes but with cursor pagination + the obs
 // wire shape (ObsNodeListResponse). include_inactive=1
 // surfaces drained rows (cmd/apid/compute_nodes.go precedent).
+//
+// PR #4 (ADR-092) extends the response with per-node live
+// utilization: live instance counts, RAMUsedMB (the §6.2
+// invariant #2 derivative), AdmissionMarginMB, and the
+// latest heartbeat's CPU%/disk. The two aggregates are
+// fetched in parallel goroutines — they don't share state
+// and a 200ms tail on either is fine for an operator dashboard
+// tile (not a customer-facing hot path).
 func (s *server) obsListNodes(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	if allowed, prob := s.adminAllows(acct); !allowed {
 		api.WriteProblem(w, prob)
@@ -206,12 +217,51 @@ func (s *server) obsListNodes(w http.ResponseWriter, r *http.Request, acct state
 		return
 	}
 	includeInactive := r.URL.Query().Get("include_inactive") == "1"
-	rows, err := s.store.ListComputeNodes(r.Context(), includeInactive)
+	ctx := r.Context()
+	rows, err := s.store.ListComputeNodes(ctx, includeInactive)
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not list compute nodes"))
 		return
 	}
-	items, nextCursor := paginateNodes(rows, limit)
+	// Fetch both aggregates in parallel. errgroup isn't
+	// warranted — two queries, bounded count, simple wait.
+	type liveResult struct {
+		live []state.PerNodeStats
+		err  error
+	}
+	type hbResult struct {
+		hb  []state.ComputeNodeHeartbeatStats
+		err error
+	}
+	liveCh := make(chan liveResult, 1)
+	hbCh := make(chan hbResult, 1)
+	go func() {
+		live, err := s.store.PerNodeLiveStats(ctx)
+		liveCh <- liveResult{live: live, err: err}
+	}()
+	go func() {
+		hb, err := s.store.LatestHeartbeatStats(ctx)
+		hbCh <- hbResult{hb: hb, err: err}
+	}()
+	var liveStats []state.PerNodeStats
+	var hbStats []state.ComputeNodeHeartbeatStats
+	for i := 0; i < 2; i++ {
+		select {
+		case lr := <-liveCh:
+			if lr.err != nil {
+				api.WriteProblem(w, api.ErrCapacity("could not aggregate per-node live stats"))
+				return
+			}
+			liveStats = lr.live
+		case hr := <-hbCh:
+			if hr.err != nil {
+				api.WriteProblem(w, api.ErrCapacity("could not aggregate latest heartbeat stats"))
+				return
+			}
+			hbStats = hr.hb
+		}
+	}
+	items, nextCursor := paginateNodes(rows, limit, liveStats, hbStats)
 	writeJSON(w, http.StatusOK, api.ObsNodeListResponse{
 		Items:      items,
 		NextCursor: nextCursor,
@@ -306,5 +356,93 @@ func emitPIIAccessed(r *http.Request, s *server, caller state.Account, endpoint 
 	s.audit.Emit(r.Context(), "pii.accessed", &cid, map[string]any{
 		"endpoint": endpoint,
 		"actor":    caller.ID,
+	})
+}
+
+// obsNodeWakeLatency handles GET /v1/admin/obs/nodes/wake-latency
+// (PR #4 / ADR-092 §3.6). Surfaces per-node wake-latency
+// quantiles (p50, p95, p99) over a 5-minute window by PromQL-
+// evaluating the new labelled histogram
+// `gateway_wake_latency_seconds_by_node`. Also emits the fleet
+// p95 from the existing unlabeled histogram so the operator can
+// compare per-node against the §12 fleet number in the same
+// scrape. The handler uses the same histogramQuantile helper
+// the per-app latency handler uses, just keyed by node_id
+// instead of app. The "__unknown" bucket (wake that lost its
+// target) is filtered out so the per-node rows don't include
+// stranded observations.
+//
+// nil-safe: if s.promqlClient is nil (single-node dev / no
+// Prometheus sidecar) we return an empty Quantiles slice +
+// fleet_p95_ms=0 instead of 500 — the dashboard tile shows
+// "no data" rather than a red error banner.
+func (s *server) obsNodeWakeLatency(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	if allowed, prob := s.adminAllows(acct); !allowed {
+		api.WriteProblem(w, prob)
+		return
+	}
+	const window = "5m"
+	now := time.Now().UTC()
+	if s.promqlClient == nil {
+		writeJSON(w, http.StatusOK, api.ObsNodeWakeLatencyResponse{
+			Window: window,
+			AsOf:   now,
+		})
+		return
+	}
+	// Per-node buckets: one QueryBuckets call returns
+	// map[node_id]map[le]cum. PromQL aggregates by node_id so we
+	// don't have to iterate per node.
+	nodeBuckets, err := s.promqlClient.QueryBuckets(r.Context(),
+		fmt.Sprintf(`sum by (node_id, le)(rate(gateway_wake_latency_seconds_by_node_bucket{node_id!="__unknown"}[%s]))`, window))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not evaluate per-node wake latency"))
+		return
+	}
+	// Fleet p95 — same window so the per-node numbers are
+	// directly comparable to the fleet number.
+	fleetV, err := s.promqlClient.QueryScalar(r.Context(),
+		fmt.Sprintf(`histogram_quantile(0.95, sum by (le)(rate(gateway_wake_latency_seconds_bucket[%s]))) * 1000`, window))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not evaluate fleet wake p95"))
+		return
+	}
+	// Resolve node_id → node_name. ListComputeNodes is bounded
+	// (tens of nodes); we walk the list once.
+	rows, err := s.store.ListComputeNodes(r.Context(), true)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list compute nodes for wake-latency resolution"))
+		return
+	}
+	idToName := make(map[string]string, len(rows))
+	for _, n := range rows {
+		idToName[n.ID] = n.Name
+	}
+	out := make([]api.ObsWakeLatencyQuantile, 0, len(nodeBuckets))
+	for nodeID, buckets := range nodeBuckets {
+		var sampleCount int64
+		for _, cum := range buckets {
+			if int64(cum) > sampleCount {
+				sampleCount = int64(cum)
+			}
+		}
+		out = append(out, api.ObsWakeLatencyQuantile{
+			NodeID:      nodeID,
+			NodeName:    idToName[nodeID],
+			P50MS:       appmetrics.SafeFloat(histogramQuantile(0.50, buckets) * 1000),
+			P95MS:       appmetrics.SafeFloat(histogramQuantile(0.95, buckets) * 1000),
+			P99MS:       appmetrics.SafeFloat(histogramQuantile(0.99, buckets) * 1000),
+			SampleCount: sampleCount,
+		})
+	}
+	// Sort by node name asc so the operator UI doesn't reorder
+	// rows between scrapes (it currently groups by name
+	// alphabetically in the dashboard tile).
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeName < out[j].NodeName })
+	writeJSON(w, http.StatusOK, api.ObsNodeWakeLatencyResponse{
+		Window:     window,
+		Quantiles:  out,
+		FleetP95MS: appmetrics.SafeFloat(fleetV),
+		AsOf:       now,
 	})
 }
