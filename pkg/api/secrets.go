@@ -39,6 +39,14 @@ type AppSecretResponse struct {
 	Key       string `json:"key"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	// Kid is the age-1... recipient string of the host identity
+	// that sealed this row's ciphertext (ADR-089). Returns ""
+	// for rows sealed before migration 00166 — those rows have
+	// kid = NULL in PG; the JSON wire shape uses "" instead of
+	// null for forward-compatibility with older SDKs that don't
+	// handle null. Dashboards rendering "last rotated at" use
+	// kid to filter on the host-key epoch.
+	Kid string `json:"kid,omitempty"`
 }
 
 // AppSecretListResponse is the wrapped GET response: the secrets slice plus
@@ -101,4 +109,43 @@ func ValidateSecretKey(key string) *Problem {
 		return ErrSecretInvalidKey("must start with a letter and contain only A-Z, 0-9, underscore")
 	}
 	return nil
+}
+
+// RotateAppSecretRequest is the body of POST /v1/apps/{slug}/secrets/{key}
+// /rotate (ADR-089). Same wire shape as PutAppSecretRequest — a single
+// plaintext VALUE field. The byte cap is enforced here AND inside
+// pkg/secretbox.SealOne (defense in depth — see PutAppSecretRequest).
+//
+// The "rotate" verb is intentionally distinct from PUT. Both endpoints
+// write-or-replace the (app_id, key) row, but rotate is gated behind
+// admin scope + MFA (matching secrets:write) and emits the secret.rotated
+// audit kind when the row already had a value. PUT emits secret.set
+// unconditionally. Dashboards filtering on kind='secret.rotated' see
+// rotation events but not first-time sets.
+type RotateAppSecretRequest struct {
+	Value string `json:"value"`
+}
+
+// Validate enforces the byte cap against maxBytes. Same contract as
+// PutAppSecretRequest.Validate so the rotate and PUT paths share the
+// pre-seal cap enforcement.
+func (r RotateAppSecretRequest) Validate(maxBytes int) *Problem {
+	if maxBytes > 0 && len(r.Value) > maxBytes {
+		return ErrSecretValueTooLarge(Limits{SecretValueMaxBytes: maxBytes}, len(r.Value))
+	}
+	return nil
+}
+
+// RotateAppSecretResponse is the success envelope for POST /v1/apps/{slug}
+// /secrets/{key}/rotate. Returns the rotated key, RFC3339 timestamp, and
+// the kid of the host identity that sealed the new envelope.
+//
+// kid lets dashboards render "rotated under <kid>" without a follow-up
+// GET. Empty string means the row was rotated but the kid was not yet
+// stampable (rare — happens only if apid started without host.age.pub,
+// which the handler returns a 503 for instead).
+type RotateAppSecretResponse struct {
+	Key       string `json:"key"`
+	RotatedAt string `json:"rotated_at"`
+	Kid       string `json:"kid,omitempty"`
 }

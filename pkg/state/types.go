@@ -2498,8 +2498,18 @@ type AppSecret struct {
 	AppID      string
 	Key        string
 	Ciphertext []byte
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// Kid is the age-1... recipient string of the host identity
+	// that sealed this row's ciphertext. Set by the apid PUT
+	// handler (cmd/apid/handlers_secrets.go::setSecret) and by
+	// pkg/rekey.Replayer at every re-seal. Rows sealed before
+	// migration 00166 (ADR-089 PR-A) have Kid = "" until the
+	// rekey pass or a subsequent PUT stamps it.
+	//
+	// Operators reading the kid column answer "what key sealed
+	// this row?" without parsing the ciphertext blob.
+	Kid       string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // AccountAppSecret is the per-row shape returned by
@@ -2926,4 +2936,219 @@ type CreateAccountWithPersonalOrgParams struct {
 type CreateAccountWithPersonalOrgResult struct {
 	Account     Account
 	PersonalOrg Org
+}
+
+// ----------------------------------------------------------------------------
+// Edge rules (ADR-089, planned)
+//
+// A customer-configurable resource that runs in pkg/gateway BEFORE
+// host→app resolution. One table + jsonb action + closed-kind
+// vocabulary unifies seven per-kind surfaces (route / rewrite /
+// redirect / headers / cors / jwt / ip) into a single priority-ordered
+// matcher. See docs/adr/089-edge-rules.md for the design decisions;
+// this file is the Go type half.
+//
+// Why jsonb: seven per-kind tables would multiply the Store
+// interface by ~5× for the same CRUD. The schema CHECK on `kind` +
+// per-kind Validate() in pkg/api/dto.go is the validation tripwire.
+// ----------------------------------------------------------------------------
+
+// EdgeRuleKind is the closed vocabulary for edge_rules.kind. The
+// gateway matcher's Kind switch is the compile-time guard against a
+// stray string landing in a default switch arm. Mirrors the schema
+// CHECK in migrations/00192_edge_rules.sql.
+type EdgeRuleKind string
+
+const (
+	EdgeRuleKindRoute    EdgeRuleKind = "route"
+	EdgeRuleKindRewrite  EdgeRuleKind = "rewrite"
+	EdgeRuleKindRedirect EdgeRuleKind = "redirect"
+	EdgeRuleKindHeaders  EdgeRuleKind = "headers"
+	EdgeRuleKindCORSA    EdgeRuleKind = "cors"
+	EdgeRuleKindJWT      EdgeRuleKind = "jwt"
+	EdgeRuleKindIP       EdgeRuleKind = "ip"
+)
+
+// IsValid reports whether k is a closed-set kind. New kinds land via
+// ADR; this guard is the compile-time tripwire for a stale gateway
+// switch.
+func (k EdgeRuleKind) IsValid() bool {
+	switch k {
+	case EdgeRuleKindRoute, EdgeRuleKindRewrite, EdgeRuleKindRedirect,
+		EdgeRuleKindHeaders, EdgeRuleKindCORSA, EdgeRuleKindJWT,
+		EdgeRuleKindIP:
+		return true
+	}
+	return false
+}
+
+// IsPaidOnly reports whether the kind is Hobby+ gated (ADR-089 §7).
+// The apid handler enforces this before insert; the gatewayd matcher
+// does NOT — a paid-only rule for a Free customer fails at create
+// time, never at request time.
+func (k EdgeRuleKind) IsPaidOnly() bool {
+	return k == EdgeRuleKindJWT || k == EdgeRuleKindIP
+}
+
+// EdgeRuleRouteAction re-targets the request to another app owned by
+// the same account. The target slug is resolved by the gatewayd
+// matcher against the per-account app lookup; cross-account routing
+// is deferred to a future ADR.
+type EdgeRuleRouteAction struct {
+	TargetAppSlug string `json:"target_app_slug"`
+}
+
+// EdgeRuleRewriteAction mutates the request path before forwarding.
+// From is a glob prefix; To is the replacement. A trailing "*" on
+// From captures the tail and exposes it as $1 in To — mirrors the
+// nginx/CloudFront rewrite shape so customer config is portable.
+type EdgeRuleRewriteAction struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// EdgeRuleRedirectAction is a 3xx short-circuit. StatusCode is one of
+// {301,302,307,308}. To is a URL or path (with $1 capture from the
+// path glob). Headers are stamped on the redirect response.
+type EdgeRuleRedirectAction struct {
+	StatusCode int               `json:"status_code"`
+	To         string            `json:"to"`
+	Headers    map[string]string `json:"headers,omitempty"`
+}
+
+// EdgeRuleHeaderOp is one mutation. Action ∈ {add,set,remove}; Value
+// is empty for "remove". The gatewayd matcher enforces a hard-coded
+// blacklist (Host, Content-Length, Transfer-Encoding, Connection,
+// x-faas-*) at apply time.
+type EdgeRuleHeaderOp struct {
+	Name   string `json:"name"`
+	Value  string `json:"value,omitempty"`
+	Action string `json:"action"`
+}
+
+// EdgeRuleHeadersAction mutates request headers BEFORE auth and
+// response headers AFTER streaming. RequestHeaders and
+// ResponseHeaders are independent; the gateway applies each side at
+// the matching hook.
+type EdgeRuleHeadersAction struct {
+	RequestHeaders  []EdgeRuleHeaderOp `json:"request_headers,omitempty"`
+	ResponseHeaders []EdgeRuleHeaderOp `json:"response_headers,omitempty"`
+}
+
+// EdgeRuleCORSAction stamps CORS response headers and handles
+// preflight in-process. AllowOrigins is the closed allowlist
+// (["https://app.example.com"] or ["*"]); AllowMethods is required;
+// AllowCredentials toggles the credentials header; MaxAgeSeconds
+// stamps Access-Control-Max-Age on preflight responses.
+type EdgeRuleCORSAction struct {
+	AllowOrigins     []string `json:"allow_origins"`
+	AllowMethods     []string `json:"allow_methods"`
+	AllowHeaders     []string `json:"allow_headers,omitempty"`
+	ExposeHeaders    []string `json:"expose_headers,omitempty"`
+	AllowCredentials bool     `json:"allow_credentials"`
+	MaxAgeSeconds    int      `json:"max_age_seconds"`
+}
+
+// EdgeRuleJWTAction validates an inbound Bearer JWT against a JWKS
+// endpoint (ADR-089 §6). Issuer is required; Audience is optional
+// (empty = skip aud check); Algorithms is the closed set of allowed
+// algs. RequiredClaims enforces a key=value check on top of the
+// standard iss/aud/exp/nbf validation.
+type EdgeRuleJWTAction struct {
+	Issuer         string            `json:"issuer"`
+	Audience       []string          `json:"audience,omitempty"`
+	JWKSURL        string            `json:"jwks_url"`
+	Algorithms     []string          `json:"algorithms"`
+	RequiredClaims map[string]string `json:"required_claims,omitempty"`
+}
+
+// EdgeRuleIPAction is a CIDR allow/deny evaluator. Allow empty =
+// "no allowlist, only the deny list applies". Deny is evaluated AFTER
+// allow so a single-IP deny sticks even when the allow list is broad.
+type EdgeRuleIPAction struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// EdgeRuleAction is the kind-tagged union stored in edge_rules.action
+// as jsonb. The wire shape lives in pkg/api/dto.go (one struct per
+// kind); the state-side mirror is intentionally minimal — the
+// gatewayd matcher only reads Kind + the kind-specific subset it
+// needs.
+type EdgeRuleAction struct {
+	Kind     EdgeRuleKind            `json:"kind"`
+	Route    *EdgeRuleRouteAction    `json:"route,omitempty"`
+	Rewrite  *EdgeRuleRewriteAction  `json:"rewrite,omitempty"`
+	Redirect *EdgeRuleRedirectAction `json:"redirect,omitempty"`
+	Headers  *EdgeRuleHeadersAction  `json:"headers,omitempty"`
+	CORS     *EdgeRuleCORSAction     `json:"cors,omitempty"`
+	JWT      *EdgeRuleJWTAction      `json:"jwt,omitempty"`
+	IP       *EdgeRuleIPAction       `json:"ip,omitempty"`
+}
+
+// EdgeRule is the in-memory row mirrored from edge_rules.
+type EdgeRule struct {
+	ID           string
+	AccountID    string
+	AppID        string
+	MatchHost    string
+	MatchPath    string
+	MatchMethods []string
+	Priority     int
+	Enabled      bool
+	Kind         EdgeRuleKind
+	Action       EdgeRuleAction
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// CreateEdgeRuleParams is the input bundle for CreateEdgeRule and
+// CreateEdgeRuleIfUnderQuota. Action is marshalled to jsonb at the
+// pgstore boundary.
+type CreateEdgeRuleParams struct {
+	AccountID    string
+	AppID        string
+	MatchHost    string
+	MatchPath    string
+	MatchMethods []string
+	Priority     int
+	Enabled      bool
+	Kind         EdgeRuleKind
+	Action       EdgeRuleAction
+}
+
+// UpdateEdgeRuleParams carries the optional fields of
+// UpdateEdgeRule. Every field is a pointer; nil = "leave alone".
+// Action is *EdgeRuleAction because a nil means "do not touch the
+// jsonb column"; a non-nil replaces it wholesale (the kind-tagged
+// union has no partial-update shape — the customer re-sends the
+// full action body).
+type UpdateEdgeRuleParams struct {
+	MatchHost    *string
+	MatchPath    *string
+	MatchMethods *[]string
+	Priority     *int
+	Enabled      *bool
+	Action       *EdgeRuleAction
+}
+
+// EdgeRuleQuotaError is returned by CreateEdgeRuleIfUnderQuota when
+// the per-app cap is reached. Mirrors AlertRuleQuotaError's shape;
+// only the per-app scope exists today because edge rules are
+// per-app (an account-wide variant is not a v1 surface).
+type EdgeRuleQuotaError struct {
+	Limit    int
+	Observed int
+}
+
+func (e *EdgeRuleQuotaError) Error() string {
+	return fmt.Sprintf("state: edge rule quota exceeded (limit=%d, observed=%d)", e.Limit, e.Observed)
+}
+
+// Is lets errors.As match the quota error type across the apid
+// handler boundary (mirrors AlertRuleQuotaError.Is at types.go:1382
+// for the cron sibling).
+func (e *EdgeRuleQuotaError) Is(target error) bool {
+	_, ok := target.(*EdgeRuleQuotaError)
+	return ok
 }

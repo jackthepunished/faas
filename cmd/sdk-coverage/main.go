@@ -135,29 +135,30 @@ var sdkMethodExclude = map[string]bool{
 //
 // Key = "<METHOD> <path>"; value = SDK method name.
 var methodRouteMap = map[string]string{
-	"DELETE /v1/keys/{id}":                     "DeleteKey",
-	"POST /v1/keys/{id}/rotate":                "RotateKey",
-	"PATCH /v1/account/keys/grace_window_days": "SetGraceWindow",
-	"GET /v1/account/keys/grace_window_days":   "GetGraceWindow",
-	"DELETE /v1/domains/{domain}":              "DeleteDomain",
-	"DELETE /v1/crons/{id}":                    "DeleteCron",
-	"DELETE /v1/apps/{slug}":                   "DeleteApp",
-	"DELETE /v1/apps/{slug}/secrets/{key}":     "UnsetSecret",
-	"PUT /v1/apps/{slug}/secrets/{key}":        "SetSecret",
-	"PATCH /v1/apps/{slug}":                    "UpdateApp",
-	"POST /v1/apps/{slug}/rename":              "RenameApp",
-	"GET /v1/apps/{slug}":                      "GetApp",
-	"GET /v1/apps/{slug}/instances":            "ListInstances",
-	"POST /v1/apps/{slug}/park":                "Park",
-	"POST /v1/apps/{slug}/wake":                "Wake",
-	"POST /v1/apps/{slug}/rollback":            "Rollback",
-	"POST /v1/apps/{slug}/deployments":         "Deploy",
-	"GET /v1/account/export":                   "ExportAccount",
-	"DELETE /v1/account":                       "DeleteAccount",
-	"PATCH /v1/account/plan":                   "ChangePlan",
-	"GET /v1/account":                          "Whoami",
-	"POST /v1/account/restore":                 "RestoreAccount",
-	"POST /v1/account/overage-cap":             "RaiseOverageCap", // issue #561 spend cap
+	"DELETE /v1/keys/{id}":                      "DeleteKey",
+	"POST /v1/keys/{id}/rotate":                 "RotateKey",
+	"PATCH /v1/account/keys/grace_window_days":  "SetGraceWindow",
+	"GET /v1/account/keys/grace_window_days":    "GetGraceWindow",
+	"DELETE /v1/domains/{domain}":               "DeleteDomain",
+	"DELETE /v1/crons/{id}":                     "DeleteCron",
+	"DELETE /v1/apps/{slug}":                    "DeleteApp",
+	"DELETE /v1/apps/{slug}/secrets/{key}":      "UnsetSecret",
+	"PUT /v1/apps/{slug}/secrets/{key}":         "SetSecret",
+	"POST /v1/apps/{slug}/secrets/{key}/rotate": "RotateSecret",
+	"PATCH /v1/apps/{slug}":                     "UpdateApp",
+	"POST /v1/apps/{slug}/rename":               "RenameApp",
+	"GET /v1/apps/{slug}":                       "GetApp",
+	"GET /v1/apps/{slug}/instances":             "ListInstances",
+	"POST /v1/apps/{slug}/park":                 "Park",
+	"POST /v1/apps/{slug}/wake":                 "Wake",
+	"POST /v1/apps/{slug}/rollback":             "Rollback",
+	"POST /v1/apps/{slug}/deployments":          "Deploy",
+	"GET /v1/account/export":                    "ExportAccount",
+	"DELETE /v1/account":                        "DeleteAccount",
+	"PATCH /v1/account/plan":                    "ChangePlan",
+	"GET /v1/account":                           "Whoami",
+	"POST /v1/account/restore":                  "RestoreAccount",
+	"POST /v1/account/overage-cap":              "RaiseOverageCap", // issue #561 spend cap
 	// Issue #679 / PR-B / ADR-082 — per-account additive budget on
 	// top of the plan's apps.egress_allowlist cap. The auto-derivation
 	// would concat "Account" + "Egress_allowlist_extra" (the literal
@@ -202,6 +203,19 @@ var methodRouteMap = map[string]string{
 	"PATCH /v1/apps/{slug}/alerts/{id}":              "UpdateAlertRule",
 	"DELETE /v1/apps/{slug}/alerts/{id}":             "DeleteAlertRule",
 	"POST /v1/apps/{slug}/alerts/{id}/rotate-secret": "RotateAlertRuleSecret",
+
+	// ADR-089 (planned) — edge rules. The auto-derivation would
+	// produce Swagger-style names ("GetAppsSlugEdge-rules",
+	// "GetEdge-rules", "PostAppsSlugEdge-rules") because the path
+	// uses a literal hyphen; the SDK names methods after the
+	// resource noun (EdgeRule) — same convention as crons and
+	// alerts above.
+	"GET /v1/edge-rules":              "ListEdgeRules",
+	"GET /v1/apps/{slug}/edge-rules":  "ListEdgeRulesForApp",
+	"POST /v1/apps/{slug}/edge-rules": "CreateEdgeRule",
+	"GET /v1/edge-rules/{id}":         "GetEdgeRule",
+	"PATCH /v1/edge-rules/{id}":       "UpdateEdgeRule",
+	"DELETE /v1/edge-rules/{id}":      "DeleteEdgeRule",
 
 	// Issue #476 / ADR-076 — outbound webhook subscriptions. Same
 	// pattern as alerts: the SDK names the methods after the resource

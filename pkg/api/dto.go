@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"sort"
@@ -2499,8 +2500,17 @@ type QueueDeadLetterResponse struct {
 // timeline. The kind taxonomy is documented in
 // docs/adr/035-auth-audit-events.md; common values include
 // "auth.login", "auth.logout", "key.created", "key.deleted",
-// "secret.set", "secret.deleted", "account.plan_changed",
+// "secret.set", "secret.deleted", "secret.rotated",
+// "account.plan_changed",
 // "account.deletion_scheduled", "account.deletion_restored".
+//
+// ADR-089 PR-A: "secret.rotated" joins the kind vocabulary. It is
+// emitted by the per-secret rotate handler (PR-B) when the row
+// already had a value (rotation, not first-time set) and by
+// pkg/rekey.Replayer when the background re-seal pass rewrites a
+// row's ciphertext. The two cases are distinguished by the
+// audit_log.actor column ("apid" for user-initiated, "rekey"
+// for background) — see ADR-089 D2.
 //
 // Subject is the account_id the event was recorded against (string,
 // not the raw uuid UUID type — pkg/api stays string-typed for wire
@@ -3251,4 +3261,280 @@ type AccountEgressAllowlistExtraResponse struct {
 	Extra    int `json:"extra"`
 	PlanCap  int `json:"plan_cap"`
 	MaxExtra int `json:"max_extra"`
+}
+
+// ----------------------------------------------------------------------------
+// Edge rules (ADR-089). Seven per-kind action shapes share one
+// EdgeRuleResponse; the action column is jsonb in the schema and
+// json.RawMessage on the wire so the SDK / Node / Python
+// generators don't need to model every kind. A typed SDK that
+// unmarshals into one of seven structs based on Kind is a
+// follow-up ergonomic PR.
+//
+// Every per-kind *Action has a Validate() *Problem method so the
+// apid handler can short-circuit on bad input before the store
+// is touched. The validator is the canonical "closed enum + size
+// bounds" shape used by PublicAuthBlock.Validate and
+// CreateDeploymentOverrides.Validate.
+// ----------------------------------------------------------------------------
+
+// EdgeRuleRouteAction re-targets the request to another app owned
+// by the same account.
+type EdgeRuleRouteAction struct {
+	TargetAppSlug string `json:"target_app_slug"`
+}
+
+func (a *EdgeRuleRouteAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("route action is required")
+	}
+	if a.TargetAppSlug == "" {
+		return ErrValidation("route action requires target_app_slug")
+	}
+	if len(a.TargetAppSlug) > 40 {
+		return ErrValidation(fmt.Sprintf("route action target_app_slug exceeds 40 chars (got %d)", len(a.TargetAppSlug)))
+	}
+	return nil
+}
+
+// EdgeRuleRewriteAction mutates the request path before forwarding.
+type EdgeRuleRewriteAction struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+func (a *EdgeRuleRewriteAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("rewrite action is required")
+	}
+	if !strings.HasPrefix(a.From, "/") {
+		return ErrValidation("rewrite action From must start with '/'")
+	}
+	if a.To == "" {
+		return ErrValidation("rewrite action To is required")
+	}
+	return nil
+}
+
+// EdgeRuleRedirectAction is a 3xx short-circuit.
+type EdgeRuleRedirectAction struct {
+	StatusCode int               `json:"status_code"`
+	To         string            `json:"to"`
+	Headers    map[string]string `json:"headers,omitempty"`
+}
+
+func (a *EdgeRuleRedirectAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("redirect action is required")
+	}
+	switch a.StatusCode {
+	case 301, 302, 307, 308:
+	default:
+		return ErrValidation(fmt.Sprintf("redirect action status_code must be one of 301,302,307,308 (got %d)", a.StatusCode))
+	}
+	if a.To == "" {
+		return ErrValidation("redirect action To is required")
+	}
+	return nil
+}
+
+// EdgeRuleHeaderOp is one mutation. Action ∈ {add,set,remove}.
+type EdgeRuleHeaderOp struct {
+	Name   string `json:"name"`
+	Value  string `json:"value,omitempty"`
+	Action string `json:"action"`
+}
+
+// edgeRuleHeaderForbidden is the hard-coded blacklist of header
+// names a kind=headers rule cannot mutate (ADR-089 §Decision).
+// Per-app configurability is deferred to v2; the closed list ships
+// in v1 as a wire-bypass backstop.
+var edgeRuleHeaderForbidden = map[string]struct{}{
+	"Host":              {},
+	"Content-Length":    {},
+	"Transfer-Encoding": {},
+	"Connection":        {},
+}
+
+func (op *EdgeRuleHeaderOp) Validate() *Problem {
+	if op == nil {
+		return ErrValidation("header op is required")
+	}
+	if op.Name == "" {
+		return ErrValidation("header op name is required")
+	}
+	switch op.Action {
+	case "add", "set", "remove":
+	default:
+		return ErrValidation(fmt.Sprintf("header op action must be one of add,set,remove (got %q)", op.Action))
+	}
+	if _, bad := edgeRuleHeaderForbidden[op.Name]; bad {
+		return ErrHeaderMutationForbidden(op.Name)
+	}
+	if strings.HasPrefix(strings.ToLower(op.Name), "x-faas-") {
+		return ErrHeaderMutationForbidden(op.Name)
+	}
+	return nil
+}
+
+// EdgeRuleHeadersAction mutates request + response headers.
+type EdgeRuleHeadersAction struct {
+	RequestHeaders  []EdgeRuleHeaderOp `json:"request_headers,omitempty"`
+	ResponseHeaders []EdgeRuleHeaderOp `json:"response_headers,omitempty"`
+}
+
+func (a *EdgeRuleHeadersAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("headers action is required")
+	}
+	if len(a.RequestHeaders) == 0 && len(a.ResponseHeaders) == 0 {
+		return ErrValidation("headers action requires at least one request_headers or response_headers op")
+	}
+	for i := range a.RequestHeaders {
+		if p := a.RequestHeaders[i].Validate(); p != nil {
+			return p
+		}
+	}
+	for i := range a.ResponseHeaders {
+		if p := a.ResponseHeaders[i].Validate(); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+// EdgeRuleCORSAction stamps CORS headers + handles preflight.
+type EdgeRuleCORSAction struct {
+	AllowOrigins     []string `json:"allow_origins"`
+	AllowMethods     []string `json:"allow_methods"`
+	AllowHeaders     []string `json:"allow_headers,omitempty"`
+	ExposeHeaders    []string `json:"expose_headers,omitempty"`
+	AllowCredentials bool     `json:"allow_credentials"`
+	MaxAgeSeconds    int      `json:"max_age_seconds"`
+}
+
+func (a *EdgeRuleCORSAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("cors action is required")
+	}
+	if len(a.AllowOrigins) == 0 {
+		return ErrValidation("cors action requires at least one allow_origin")
+	}
+	if len(a.AllowMethods) == 0 {
+		return ErrValidation("cors action requires at least one allow_method")
+	}
+	if a.MaxAgeSeconds < 0 {
+		return ErrValidation("cors action max_age_seconds must be >= 0")
+	}
+	return nil
+}
+
+// edgeRuleJWTAllowedAlgs is the closed algorithm vocabulary the
+// gateway's verifier accepts. HS* is included because some IdPs
+// still issue HMAC-signed JWTs for service-to-service auth.
+var edgeRuleJWTAllowedAlgs = map[string]struct{}{
+	"RS256": {}, "RS384": {}, "RS512": {},
+	"ES256": {}, "ES384": {}, "ES512": {},
+	"HS256": {}, "HS384": {}, "HS512": {},
+}
+
+// EdgeRuleJWTAction validates an inbound Bearer JWT.
+type EdgeRuleJWTAction struct {
+	Issuer         string            `json:"issuer"`
+	Audience       []string          `json:"audience,omitempty"`
+	JWKSURL        string            `json:"jwks_url"`
+	Algorithms     []string          `json:"algorithms"`
+	RequiredClaims map[string]string `json:"required_claims,omitempty"`
+}
+
+func (a *EdgeRuleJWTAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("jwt action is required")
+	}
+	if a.Issuer == "" {
+		return ErrValidation("jwt action requires issuer")
+	}
+	if !strings.HasPrefix(a.JWKSURL, "https://") {
+		return ErrValidation("jwt action jwks_url must start with https://")
+	}
+	if len(a.Algorithms) == 0 {
+		return ErrValidation("jwt action requires at least one algorithm")
+	}
+	for _, alg := range a.Algorithms {
+		if _, ok := edgeRuleJWTAllowedAlgs[alg]; !ok {
+			return ErrValidation(fmt.Sprintf("jwt action algorithm %q is not in the closed vocabulary", alg))
+		}
+	}
+	return nil
+}
+
+// EdgeRuleIPAction is a CIDR allow/deny evaluator.
+type EdgeRuleIPAction struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+func (a *EdgeRuleIPAction) Validate() *Problem {
+	if a == nil {
+		return ErrValidation("ip action is required")
+	}
+	if len(a.Allow) == 0 && len(a.Deny) == 0 {
+		return ErrValidation("ip action requires at least one allow or deny entry")
+	}
+	for _, cidr := range a.Allow {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return ErrValidation(fmt.Sprintf("ip action allow entry %q is not a valid CIDR: %v", cidr, err))
+		}
+	}
+	for _, cidr := range a.Deny {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return ErrValidation(fmt.Sprintf("ip action deny entry %q is not a valid CIDR: %v", cidr, err))
+		}
+	}
+	return nil
+}
+
+// EdgeRuleResponse is the wire shape for an edge rule. Action is
+// kept as json.RawMessage so the generated Node/Python SDKs don't
+// need seven per-kind models today; a typed SDK unmarshals into
+// one of the seven structs based on Kind (deferred to a
+// separate SDK ergonomics PR).
+type EdgeRuleResponse struct {
+	ID           string          `json:"id"`
+	AccountID    string          `json:"account_id"`
+	AppID        string          `json:"app_id"`
+	MatchHost    string          `json:"match_host"`
+	MatchPath    string          `json:"match_path"`
+	MatchMethods []string        `json:"match_methods"`
+	Priority     int             `json:"priority"`
+	Enabled      bool            `json:"enabled"`
+	Kind         string          `json:"kind"`
+	Action       json.RawMessage `json:"action"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+}
+
+// CreateEdgeRuleRequest is the wire shape for POST /v1/apps/{slug}/edge-rules.
+// Priority and Enabled are *int/*bool so the unset-vs-explicit
+// distinction survives (the DTO is what reaches the store layer
+// after pointer coercion).
+type CreateEdgeRuleRequest struct {
+	MatchHost    string          `json:"match_host"`
+	MatchPath    string          `json:"match_path"`
+	MatchMethods []string        `json:"match_methods,omitempty"`
+	Priority     *int            `json:"priority,omitempty"`
+	Enabled      *bool           `json:"enabled,omitempty"`
+	Kind         string          `json:"kind"`
+	Action       json.RawMessage `json:"action"`
+}
+
+// UpdateEdgeRuleRequest is the wire shape for PATCH /v1/edge-rules/{id}.
+// All fields are optional; nil = "leave alone".
+type UpdateEdgeRuleRequest struct {
+	MatchHost    *string          `json:"match_host,omitempty"`
+	MatchPath    *string          `json:"match_path,omitempty"`
+	MatchMethods *[]string        `json:"match_methods,omitempty"`
+	Priority     *int             `json:"priority,omitempty"`
+	Enabled      *bool            `json:"enabled,omitempty"`
+	Action       *json.RawMessage `json:"action,omitempty"`
 }

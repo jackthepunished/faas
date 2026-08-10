@@ -249,6 +249,17 @@ const (
 	//   is informational — consumers can re-read the row to defend
 	//   against notify loss.
 	NotifyWarmHintPublished = "warm_hint_published"
+	// NotifyEdgeRuleChanged {"app_id":uuid, "rule_id":uuid,
+	//                        "op":"created|updated|deleted"}
+	//   apid → gatewayd-internal: the per-host LRU mirroring the
+	//   edge_rules table was just mutated. The listener triggers a
+	//   wholesale cache flush for the affected host (one-box scale
+	//   assumption per spec §4.3; per-host key invalidation
+	//   deferred — wholesale is the safer v1 default). The payload
+	//   is informational; the consumer re-reads the row to defend
+	//   against notify loss. Consumed by cmd/gatewayd-internal/
+	//   backend.go (PR 8).
+	NotifyEdgeRuleChanged = "edge_rule_changed"
 )
 
 // Subscribe holds a dedicated connection on the pool in LISTEN state for the

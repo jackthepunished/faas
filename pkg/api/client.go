@@ -943,6 +943,59 @@ func (c *Client) RotateAlertRuleSecret(ctx context.Context, slug, id string) (Ro
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/alerts/"+id+"/rotate-secret", nil, &out)
 }
 
+// --- Edge rules (ADR-089, planned) ----------------------------------------
+
+// ListEdgeRules returns every edge rule owned by the authenticated
+// account across all apps. The dashboard uses this for the "Edge
+// Rules" overview pane; the CLI uses it for `gregale edge-rules list`.
+// Empty account → empty slice (NOT an error). Free plans only see
+// rule kinds their plan unlocks — the server still lists them.
+func (c *Client) ListEdgeRules(ctx context.Context) ([]EdgeRuleResponse, error) {
+	var out []EdgeRuleResponse
+	return out, c.do(ctx, "GET", "/v1/edge-rules", nil, &out)
+}
+
+// ListEdgeRulesForApp returns every edge rule bound to one app,
+// ordered by priority ASC (gateway match order). Empty list when the
+// app has no rules.
+func (c *Client) ListEdgeRulesForApp(ctx context.Context, slug string) ([]EdgeRuleResponse, error) {
+	var out []EdgeRuleResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/edge-rules", nil, &out)
+}
+
+// CreateEdgeRule attaches a new rule to the slug's app. Plan-kind
+// gate (jwt|ip → 402 plan_edge_rule_kind_not_allowed) and per-app
+// quota (402 plan_limit_edge_rules) surface on this call. Action is
+// a kind-tagged json.RawMessage — the SDK doesn't constrain which
+// kinds pair with which shapes; that's the server's job. The
+// response is the row the gateway matcher will see.
+func (c *Client) CreateEdgeRule(ctx context.Context, slug string, req CreateEdgeRuleRequest) (EdgeRuleResponse, error) {
+	var out EdgeRuleResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/edge-rules", req, &out)
+}
+
+// GetEdgeRule fetches one rule by id. IDOR-safe: a foreign account's
+// rule id returns 404, not 403 — same convention as GetAlertRule.
+func (c *Client) GetEdgeRule(ctx context.Context, id string) (EdgeRuleResponse, error) {
+	var out EdgeRuleResponse
+	return out, c.do(ctx, "GET", "/v1/edge-rules/"+id, nil, &out)
+}
+
+// UpdateEdgeRule applies a partial update. Pointer-everything
+// optionals mirror UpdateAlertRule. Kind is NOT patchable (rotating
+// kind mid-life would break the action union); the customer must
+// delete + recreate. Action is *json.RawMessage — nil leaves the
+// existing jsonb column untouched; non-nil replaces it whole.
+func (c *Client) UpdateEdgeRule(ctx context.Context, id string, req UpdateEdgeRuleRequest) (EdgeRuleResponse, error) {
+	var out EdgeRuleResponse
+	return out, c.do(ctx, "PATCH", "/v1/edge-rules/"+id, req, &out)
+}
+
+// DeleteEdgeRule removes the rule and returns nil on 204.
+func (c *Client) DeleteEdgeRule(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/edge-rules/"+id, nil, nil)
+}
+
 // --- Event-driven surface (Move 2) -----------------------------------------
 //
 // The 10 routes exposed under /v1/apps/{slug}/invoke[/async],
@@ -1497,6 +1550,17 @@ func (c *Client) SetSecret(ctx context.Context, slug, key, value string) error {
 }
 func (c *Client) UnsetSecret(ctx context.Context, slug, key string) error {
 	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/secrets/"+key, nil, nil)
+}
+
+// RotateSecret (ADR-089 PR-B) re-seals the (slug, key) row under
+// the current host identity. Distinct verb from SetSecret so the
+// server can emit the secret.rotated audit kind (vs secret.set).
+// Returns the RotateAppSecretResponse so the CLI can render the
+// rotated_at timestamp and the kid.
+func (c *Client) RotateSecret(ctx context.Context, slug, key, value string) (RotateAppSecretResponse, error) {
+	var out RotateAppSecretResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/secrets/"+key+"/rotate",
+		RotateAppSecretRequest{Value: value}, &out)
 }
 
 // Per-app private-registry Basic Auth (issue #461 / ADR-062). Password
