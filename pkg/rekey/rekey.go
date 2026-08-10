@@ -97,6 +97,22 @@ type RekeyProgress struct {
 // Construct a fresh Replayer after a daemon restart; the
 // persisted RekeyProgress.LastID lets the operator resume the
 // walk from where the previous incarnation left off.
+//
+// WALK MODEL (ADR-089 crash-safety invariant):
+//
+//	p.LastID advances PER-ROW before any unseal/seal/persist
+//	attempt. pgstore.ListAppSecretsForRekey uses COMPOSITE
+//	greater-than-or-equal on (account_id, app_id, key) — paired
+//	with a per-run seen-set that drops duplicates. This gives
+//	the "walk every row at least once per run, retry failures
+//	only across separate daemon runs" semantic.
+//
+//	CRITICAL: with the per-row cursor advance + ≥ fence +
+//	seen-set dedupe, a row whose persist fails (or whose
+//	unseal/re-seal throws) is RE-FETCHED on the next run —
+//	not silently skipped. After `gregale host-age
+//	prune-previous` the previous-key envelope would otherwise
+//	become permanently unreadable on a skipped row.
 type Replayer struct {
 	store      Store
 	active     *age.X25519Recipient
@@ -182,8 +198,32 @@ func (r *Replayer) Run(
 	if progress == nil {
 		progress = func(RekeyProgress) {}
 	}
+	// Crash-safety model (ADR-089). Two invariants:
+	//
+	//   1. Cursor pin: p.LastID is the cursor of the FIRST
+	//      row that failed in the current Run (if any), held
+	//      for the rest of Run. On daemon restart, the next
+	//      Run re-fetches the pinned row (via the >= fence)
+	//      and re-attempts.
+	//
+	//   2. Seen-set: in-Run dedupe of rows the previous batch
+	//      already processed. Without this the per-row cursor
+	//      advance + >= fence would loop forever on a clean
+	//      batch (the cursor row keeps re-matching >=). The
+	//      seen-set lets the walk terminate.
+	//
+	// These two together ensure a row whose persist fails is
+	// NEVER silently skipped — after `gregale host-age
+	// prune-previous` the previous-key envelope would
+	// otherwise become permanently unreadable.
 	var p RekeyProgress
 	p.LastID = cursor
+	seen := make(map[string]struct{})
+	// pinnedCursor holds the cursor of the FIRST row in this
+	// Run that failed; once set, we never advance past it.
+	// On Run completion p.LastID == pinnedCursor, signalling
+	// "the operator needs to retry from this point".
+	var pinnedCursor string
 
 	// Pace the walk: cfg.RowsPerSecond rows/sec. We sleep at the
 	// bottom of each batch loop so a small cfg.BatchSize doesn't
@@ -199,32 +239,54 @@ func (r *Replayer) Run(
 		if err != nil {
 			return fmt.Errorf("rekey: list batch: %w", err)
 		}
-		if len(batch) == 0 {
-			// Clean completion — every row visited.
+
+		// Filter the batch against the in-Run seen-set so a
+		// row the previous batch already processed doesn't get
+		// re-processed here. The >= fence always returns the
+		// cursor row + later rows; the seen-set drops the
+		// cursor row on subsequent batches so the walk
+		// terminates when the table has been fully visited.
+		var fresh []state.AppSecret
+		for _, row := range batch {
+			ck := encodeCursor(row.AccountID, row.AppID, row.Key)
+			if _, ok := seen[ck]; ok {
+				continue
+			}
+			fresh = append(fresh, row)
+		}
+		if len(fresh) == 0 {
 			progress(p)
 			return nil
 		}
 
-		for _, row := range batch {
+		var batchLastSuccessCursor string
+
+		for _, row := range fresh {
 			p.Total++
-			p.LastID = encodeCursor(row.AccountID, row.AppID, row.Key)
+			rowCursor := encodeCursor(row.AccountID, row.AppID, row.Key)
+			seen[rowCursor] = struct{}{}
 
 			if row.Kid == r.currentKid {
 				// Already under current identity — skip.
 				p.Skipped++
+				// Last-success-row tracking for the
+				// post-batch cursor decision.
+				batchLastSuccessCursor = rowCursor
 				continue
 			}
 
 			// Unseal with the loaded identity set (OpenMulti
 			// semantics — accepts current or previous).
 			openCtx, cancel := context.WithTimeout(ctx, r.cfg.OpenTimeout)
-			_ = openCtx // ctx is plumbed through to future readers;
-			// for now Open doesn't accept a ctx, so we
-			// only use cancel() to bound the wait.
+			_ = openCtx // Open doesn't accept a ctx; cancel()
+			// is the only handle we have today.
 			env, openErr := secretbox.OpenMulti(r.identities, row.Ciphertext)
 			cancel()
 			if openErr != nil {
 				p.Failed++
+				if pinnedCursor == "" {
+					pinnedCursor = rowCursor
+				}
 				continue
 			}
 
@@ -232,18 +294,39 @@ func (r *Replayer) Run(
 			sealed, sealErr := secretbox.Seal(r.active, env)
 			if sealErr != nil {
 				p.Failed++
+				if pinnedCursor == "" {
+					pinnedCursor = rowCursor
+				}
 				continue
 			}
 
-			// Persist. ADR-089 D4: the kid column is stamped
-			// alongside the new ciphertext so the operator's
-			// "what key sealed this row?" answer is correct
-			// post-rekey.
+			// Persist. ADR-089 D4: kid column is stamped
+			// alongside the new ciphertext.
 			if err := r.store.UpsertAppSecretWithKid(ctx, row.AccountID, row.AppID, row.Key, r.currentKid, sealed); err != nil {
 				p.Failed++
+				if pinnedCursor == "" {
+					pinnedCursor = rowCursor
+				}
 				continue
 			}
 			p.Rekeyed++
+			batchLastSuccessCursor = rowCursor
+		}
+
+		// POST-BATCH CURSOR.
+		//
+		// pinnedCursor takes precedence: if ANY row in this
+		// Run has failed, we leave the cursor pinned to the
+		// first failure so the next Run re-attempts from
+		// there. Resume (>=) brings back the pinned row
+		// specifically; rows past it are picked up normally.
+		//
+		// When the walk is fully clean, cursor advances past
+		// the last successfully-processed row in this batch.
+		if pinnedCursor == "" && batchLastSuccessCursor != "" {
+			p.LastID = batchLastSuccessCursor
+		} else if pinnedCursor != "" {
+			p.LastID = pinnedCursor
 		}
 
 		progress(p)

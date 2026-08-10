@@ -57,7 +57,13 @@ func (s *fakeStore) ListAppSecretsForRekey(_ context.Context, limit int, cursor 
 	}
 	var out []state.AppSecret
 	for _, r := range s.rows {
-		if curA != "" && lessOrEqTriples(r.AccountID, r.AppID, r.Key, curA, curB, curC) {
+		// Crash-safety: pgstore uses COMPOSITE >= so a row
+		// whose cursor matches the current row is included
+		// (matching cursor returns the row; seen-set inside
+		// Replayer dedupes). The lessOrEqTriples helper
+		// encodes the strict-less filter; >= semantics map
+		// to "less than the cursor" being excluded.
+		if curA != "" && lessTriples(r.AccountID, r.AppID, r.Key, curA, curB, curC) {
 			continue
 		}
 		out = append(out, r)
@@ -108,16 +114,6 @@ func lessTriples(a1, a2, a3, b1, b2, b3 string) bool {
 		return a2 < b2
 	}
 	return a3 < b3
-}
-
-func lessOrEqTriples(a1, a2, a3, b1, b2, b3 string) bool {
-	if a1 != b1 {
-		return a1 < b1
-	}
-	if a2 != b2 {
-		return a2 < b2
-	}
-	return a3 <= b3
 }
 
 // sealUnder is a one-shot seal helper using pkg/secretbox.Seal so
@@ -235,8 +231,15 @@ func TestRun_Idempotent(t *testing.T) {
 	}
 }
 
-// TestRun_CursorResumes: a non-empty cursor starts the walk past
-// the cursor tuple — useful for daemon-restart resumption.
+// TestRun_CursorResumes: a non-empty cursor starts the walk AT OR
+// AFTER the cursor tuple. With the >= fence, the cursor row is
+// returned in the next batch but the per-Run seen-set drops it
+// as "already visited" — so on resume only strictly-after rows
+// are newly processed. Mirrors daemon-restart resumption: the
+// new Run starts with an empty seen-set, so its first batch
+// picks up exactly the cursor row + everything after, and
+// processes rows-after-cursor (the cursor row itself is deduped
+// to "we visited this in the previous Run, kid is current").
 func TestRun_CursorResumes(t *testing.T) {
 	previous := mustIdentity(t)
 	current := mustIdentity(t)
@@ -255,13 +258,19 @@ func TestRun_CursorResumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Start past "B" — only C should be visited.
+	// Start AT B — the >= fence brings back [B, C] (a row
+	// whose cursor matches is included). The seen-set starts
+	// empty in this Run, so B and C are both processed for
+	// the first time in this Run. Real daemon-restart
+	// semantics: the cursor is just a "start from here or
+	// later" hint, while the in-Run seen-set prevents the
+	// per-row advance + >= fence from looping forever.
 	var last RekeyProgress
 	if err := r.Run(context.Background(), encodeCursor("acct-1", "app-1", "B"), func(p RekeyProgress) { last = p }); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if last.Total != 1 || last.Rekeyed != 1 {
-		t.Fatalf("cursor walk: got %+v, want Total=1 Rekeyed=1 (only C)", last)
+	if last.Total != 2 || last.Rekeyed != 2 {
+		t.Fatalf("cursor walk: got %+v, want Total=2 Rekeyed=2 (B + C)", last)
 	}
 }
 
@@ -303,4 +312,132 @@ func mustIdentity(t *testing.T) *age.X25519Identity {
 		t.Fatalf("generate identity: %v", err)
 	}
 	return id
+}
+
+// failingFakeStore wraps fakeStore and forces UpsertAppSecretWithKid
+// to fail for a specific cursor-encoded row. Used by
+// TestRun_CrashMidRow to pin the crash-safety contract:
+//
+// On a persist failure, the cursor MUST NOT advance past the failed
+// row — otherwise the next daemon invocation skips the row that
+// still needs re-sealing. After prune-previous on the previous
+// identity, the unrekeyed row's envelope becomes permanently
+// unreadable.
+//
+// The fault key is expressed as a full cursor string so callers
+// don't need to know the (account_id, app_id, key) tuple shape.
+type failingFakeStore struct {
+	*fakeStore
+	faultCursor string
+}
+
+func (s *failingFakeStore) UpsertAppSecretWithKid(_ context.Context, accountID, appID, key, kid string, ciphertext []byte) error {
+	if s.faultCursor != "" && encodeCursor(accountID, appID, key) == s.faultCursor {
+		return context.DeadlineExceeded // sentinel "persist failed"
+	}
+	return s.fakeStore.UpsertAppSecretWithKid(context.Background(), accountID, appID, key, kid, ciphertext)
+}
+
+// TestRun_CrashMidRow pins the cursor-pin-on-failure + >=
+// fence + per-Run seen-set contract. Forces the middle row's
+// persist to fail and asserts:
+//   - the failed row pins the cursor (LastID == cursor-of-B)
+//   - on daemon restart with an empty seen-set, B is
+//     re-fetched and re-attempted (Total > 0 on resume)
+//   - rows past the failure (C in this fixture) are also
+//     visited in the resume Run via the seen-set reset
+//   - B's row state (kid = previous) is preserved across the
+//     failed persist.
+//
+// The whole point: a row whose persist fails is NEVER
+// silently skipped.
+func TestRun_CrashMidRow(t *testing.T) {
+	previous := mustIdentity(t)
+	current := mustIdentity(t)
+
+	inner := newFakeStore()
+	faultRow := encodeCursor("acct-1", "app-1", "B")
+	store := &failingFakeStore{fakeStore: inner, faultCursor: faultRow}
+
+	for _, key := range []string{"A", "B", "C"} {
+		inner.put(state.AppSecret{
+			AccountID:  "acct-1",
+			AppID:      "app-1",
+			Key:        key,
+			Ciphertext: sealUnder(t, previous.Recipient(), key, "v"),
+			Kid:        previous.Recipient().String(),
+		})
+	}
+
+	r, err := New(store, []*age.X25519Identity{current, previous},
+		RekeyConfig{RowsPerSecond: 5000, BatchSize: 50})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var last RekeyProgress
+	if err := r.Run(context.Background(), "", func(p RekeyProgress) { last = p }); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Counters: A succeeded (Rekeyed=1), B failed, C succeeded (Rekeyed=2).
+	if last.Total != 3 {
+		t.Errorf("Total = %d, want 3", last.Total)
+	}
+	if last.Rekeyed != 2 {
+		t.Errorf("Rekeyed = %d, want 2 (A, C)", last.Rekeyed)
+	}
+	if last.Failed != 1 {
+		t.Errorf("Failed = %d, want 1 (B)", last.Failed)
+	}
+	if last.Skipped != 0 {
+		t.Errorf("Skipped = %d, want 0", last.Skipped)
+	}
+
+	// LastID is PINNED to the first failed row (B), not the
+	// last success — so the next Run re-attempts B via >=
+	// fence instead of skipping past it.
+	wantLast := encodeCursor("acct-1", "app-1", "B")
+	if last.LastID != wantLast {
+		t.Errorf("LastID = %q, want %q (Pinned to first failure so resume re-attempts B)", last.LastID, wantLast)
+	}
+
+	// B's row was NOT updated by the failed persist — still
+	// under the previous identity.
+	b := inner.rows[encodeCursor("acct-1", "app-1", "B")]
+	if b.Kid != previous.Recipient().String() {
+		t.Errorf("B's kid = %q, want %q (pre-rekey; persist failed before UPDATE)",
+			b.Kid, previous.Recipient().String())
+	}
+
+	// Sanity: simulate the daemon restart. New Replayer
+	// instance, empty seen-set, cursor=B. The >= fence
+	// brings back B + rows-after-B (= C). The fault still
+	// fires (the fixture fails B every time), so Failed=1
+	// AND C is processed (kid = current → Skipped). This
+	// proves B was RE-VISITED, not skipped — the row gets
+	// repeatedly attempted until the operator fixes the
+	// underlying failure (or runs an escape-hatch UPDATE on
+	// the kid column).
+	r2, err := New(store, []*age.X25519Identity{current, previous},
+		RekeyConfig{RowsPerSecond: 5000, BatchSize: 50})
+	if err != nil {
+		t.Fatalf("New (resume): %v", err)
+	}
+	var last2 RekeyProgress
+	if err := r2.Run(context.Background(), last.LastID, func(p RekeyProgress) { last2 = p }); err != nil {
+		t.Fatalf("resume Run: %v", err)
+	}
+	if last2.Failed != 1 {
+		t.Errorf("resume: Failed = %d, want 1 (B re-attempted via >= fence, failed again)", last2.Failed)
+	}
+	// On the resume, listing returns >= B = [B, C]. seen-set
+	// starts empty → both are processed: B fails (Failed=1),
+	// C is skipped (Skipped=1, kid already current). Total=2.
+	if last2.Total != 2 {
+		t.Errorf("resume: Total = %d, want 2 (B re-fetched + C)", last2.Total)
+	}
+	if last2.Skipped != 1 {
+		t.Errorf("resume: Skipped = %d, want 1 (C idempotent — kid=current)", last2.Skipped)
+	}
 }

@@ -9627,6 +9627,17 @@ func (s *PgStore) GetAppSecret(ctx context.Context, accountID, appID, key string
 // default. Tests use small limits (≤10) to drive deterministic
 // walks.
 //
+// CRASH-SAFETY: the WHERE clause uses COMPOSITE greater-than-or-
+// equal. This pairs with pkg/rekey/Replayer.Run's
+// per-row cursor advance + per-run seen-set dedupe: every row is
+// visited at least once per Run (the >= fence brings back rows
+// whose persist failed on a previous Run), but the seen-set
+// prevents redundant re-processing within a single Run. A row
+// whose persist fails mid-Run is retried in the next Run —
+// after `gregale host-age prune-previous` the previous-key
+// envelope would otherwise become permanently unreadable on a
+// skipped row.
+//
 // Cross-account: this query intentionally returns rows across
 // every account. The Replayer is an operator-driven background
 // pass (FAAS_REKEY_ENABLED=true), not a customer-facing API; the
@@ -9650,7 +9661,7 @@ func (s *PgStore) ListAppSecretsForRekey(ctx context.Context, limit int, cursor 
 	rows, err := s.pool.Query(ctx,
 		`select account_id, app_id, key, ciphertext, kid, created_at, updated_at
 		 from app_secrets
-		 where ($1 = '' or (account_id, app_id, key) > ($1, $2, $3))
+		 where ($1 = '' or (account_id, app_id, key) >= ($1, $2, $3))
 		 order by account_id asc, app_id asc, key asc
 		 limit $4`,
 		curAcct, curApp, curKey, limit)

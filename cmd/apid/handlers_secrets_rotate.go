@@ -85,12 +85,24 @@ func (s *server) rotateAppSecret(w http.ResponseWriter, r *http.Request, acct st
 	// row). GetAppSecret returns ErrNotFound when the row does not
 	// exist; that's the "first-time rotate" case which we treat as
 	// a set for audit purposes.
+	//
+	// CONTRACT pinned at the handler boundary: GetAppSecret's
+	// three-state result must be either (row, nil), (nil,
+	// ErrNotFound), or (nil, err) — never (nil, nil). If a future
+	// refactor relaxes GetAppSecret to (nil, nil) on an empty
+	// result, we want the handler to 5xx loudly rather than
+	// silently emit secret.set for a row that may already have a
+	// value (which would understate rotations in the audit log).
 	prev, err := s.store.GetAppSecret(r.Context(), acct.ID, app.ID, key)
-	if err != nil && !errors.Is(err, state.ErrNotFound) {
+	switch {
+	case err == nil && prev == nil:
+		api.WriteProblem(w, api.ErrCapacity("GetAppSecret returned (nil, nil) — store contract broken"))
+		return
+	case err != nil && !errors.Is(err, state.ErrNotFound):
 		api.WriteProblem(w, api.ErrCapacity("could not read previous secret"))
 		return
 	}
-	isRotation := err == nil && prev != nil
+	isRotation := err == nil
 
 	// Resolve the current kid before sealing so the seal + kid
 	// stamp land in the same UpsertAppSecretWithKid call. Failure
